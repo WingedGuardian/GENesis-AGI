@@ -914,8 +914,9 @@ admission checks still apply before readiness and native execution. Standalone
 callers retain their existing environment behavior. The optional private runtime
 capsule transports closed top-level objects but supplies no launch or recovery
 authority: source-only queue/shell/availability roles refuse runtime-bearing
-capsules, and diagnostics never print their values. Full owner/monitor wiring
-and supervised recovery remain unfinished and separately qualified.
+capsules, and diagnostics never print their values. The private owner/monitor
+endpoint below remains separate from unfinished timer/provider integration and
+supervised recovery.
 
 The private CBM reporter role now checks the complete runtime source, provider
 pin, effective policy and environment recipe. It consumes a bounded atomic
@@ -929,9 +930,105 @@ excluded from native subprocess inheritance.
 
 The shared policy identity includes watchdog, CPU and I/O settings; a partial
 full-policy value cannot silently become the earlier five-field recipe. These
-reporter checks do not create the physical owner or monitor, enable automatic
-readiness, qualify native containment, or implement the GitNexus runtime adapter.
-Existing standalone indexing behavior remains unchanged.
+reporter checks do not enable automatic readiness or qualify native containment.
+
+The captured runner now exposes a private initial-owner endpoint for CBM. It
+validates the inherited canonical runner lock, takes the existing repository
+flock itself, and commits its actual process identity before creating workload
+children. Only the first acknowledged reservation releases its sealed runtime.
+For inherited routing, the original boot/PID/start snapshot brackets the actual
+owner-slice lookup and remains bound through the reservation checks. It does
+not exclude arbitrary external cgroup migration; the child and reporter still
+independently verify their original parent, route and scope before preparation.
+The owner installs its monitor and output handling, samples the original scope,
+then checks both children again before sending the one startup ACK. A manager
+read cannot turn an earlier alive check into permission for a dead monitor.
+Pressure requests received during a transient startup observation keep the
+latest desired pause state; the validated owner applies it before ACK. Every
+first stop cause uses the same transition: control the original observed scope,
+or cancel only the actual unacknowledged child when no scope is established.
+Buffered pause requests cannot revive stopping work or replace its first stop.
+The first stop reason is intent, separate from a resolved physical action.
+Failed validation or stop dispatch remains pending in the same child/output
+draining loop and retries within the original final deadline. Accepted stops
+are not resent when journal publication fails; the retained stop fact travels
+with closure. Original quiescence resolves the request without inventing a stop.
+An unreaped child's zombie identity can retain its original birth for a raw
+wait; default scope/reporter proof still requires a live subject. A terminal
+birth is not native completion, scope registration or cleanup proof.
+
+Before a startup header exists, first stop intent fixes a two-second local
+drain grace, clipped to the original work deadline. Accepted TERM does not
+certify exit, and repeated attempts do not extend that grace. Late wait or group
+absence cannot close it. Unknown lifetime remains open on bounded return.
+After registration, cleanup file-read errors retry within the same final
+budget; every read invalidates cached proof. Only fresh resolved cleanup can
+close control. Structural identity failures retain their existing refusal.
+
+The initial scope requests the frozen wall through `RuntimeMaxSec`, zero
+`RuntimeRandomizedExtraSec` and `FinalKillSignal=SIGKILL`. Its actual owner
+validates the corresponding typed effective properties before ACK, alongside
+the existing memory, swap, identity and stop policy. Generic scope readers keep
+their prior default contract. The manager's runtime begins at scope activation
+and initiates stop/escalation independently after the finite owner returns or
+dies. It does not prove physical absence at the wall, extend cleanup's original
+deadline or authorize retry. Manager/kernel failure, unkillable tasks and
+deliberate trusted-manager abandonment remain limits; evidence stays open.
+Native platform, frozen-scope escalation and owner-loss qualification are still
+required before activation; scratch fixtures establish wiring and refusal only.
+
+This canonical launcher reuses the captured literal-argument helper, probing
+the exact `/usr/bin/systemd-run` it will execute with the launch environment
+basis. It omits the expansion option only on the existing definite-refusal
+or absent-binary outcomes; unknown probe failures retain it. Older systemd
+scope arguments remain literal without accepting a PATH substitute for this
+canonical binary. The shared helper's ordinary default callers are unchanged.
+
+The owner performs original-scope control before blocking journal publication.
+Its monitor only requests actions; retirement closes the owner's sole private
+stdin-pipe writer, without a signal trap. Policy and retirement interval waits
+wake on that EOF without changing standalone watchdog intervals. A stalled
+sampler can still exhaust the fixed cleanup budget and leave control open; the owner fences
+late action requests. Original kernel and reporter samples keep separate ordered
+histories. Work expiry enters the existing stop transition before an exhausted
+final cleanup budget can return with an open obligation. Separate observations
+and delayed delivery cannot replace the first baseline or erase stronger
+owned OOM evidence. Clean control requires actual owned waits, output EOF,
+monitor-group absence and original-scope cleanup. An unresolved lifetime leaves
+the control obligation open. A launched child without registration remains
+uncertain even when it exits zero. A transport success is not indexing success.
+Freeze/thaw client waits observe owner cancellation before work expiry, then
+enter the original-scope stop transition. The stop client ignores an already
+pending cancellation flag. Actual manager-client waits also constrain closure;
+an unavailable wait cannot be replaced by a successful process status. Existing
+bounded manager observations can still delay signal handling.
+Manager replies must be observed within their original operation deadline;
+physical closure proof must arrive within the established final cleanup budget.
+A late reply or proof cannot extend that budget or certify closure.
+Validation and subsequent name-based manager action are not an atomic
+compare-and-act on InvocationID. The user manager remains trusted: deliberate
+same-name replacement by an administrator between those operations is outside
+this guarantee. Observed invocation, object or original-subtree changes still
+refuse control. Reserved claim-derived names differ from standalone PID names.
+
+The standalone manual index entrypoint keeps its existing locking policy and
+does not consult the new queue hold. This endpoint does not establish global
+physical exclusion; that remains a separate series qualification gate.
+
+Sample selection preserves one actual snapshot, prioritizing hierarchical kill
+evidence, then local kills and observation time; the original baseline never
+changes. A late local-only kill that historical resource accounting does not
+represent leaves existing startup/controller uncertainty, even after successful
+waits. Retiring the monitor forbids late physical actions; it does not clear
+this safety hold. Native completion accounting remains independent.
+
+This endpoint is exercised through the actual queued factory and accepted
+harmless executable descriptor with real locks, processes, pipes and scratch
+SQL, including successful and failed native completion. The fixture substitutes
+its manager, kernel, resource-admission input and provider. It does not
+qualify native containment. Ordinary timer dispatch, the GitNexus adapter and
+positive supervised recovery remain separate; automatic readiness stays fenced.
+Existing standalone indexing policy remains unchanged.
 
 ## Verification
 

@@ -1837,8 +1837,8 @@ the shared banner is not an assertion about all concurrent sessions.
   original ancestor chain. Collector read failures retain the affected physical
   hold without aborting unrelated reconciliation; publication failures propagate.
   Intent callback RuntimeError refuses child creation
-  with private diagnostics. Automatic readiness stays fenced; actual scope creation, watchdog/
-  runner wiring and recovery remain unfinished. Synthetic fixtures do not
+  with private diagnostics. Automatic readiness stays fenced; typed timer
+  dispatch and supervised recovery remain unfinished. Synthetic fixtures do not
   establish native kernel or production acceptance.
   `scripts/lib/code_intel_source.py` provides explicit captured-source diagnostics
   and a finite assembly API: Python and shell buffers match one immutable Git
@@ -1849,17 +1849,49 @@ the shared banner is not an assertion about all concurrent sessions.
   only the canonical runner lock crosses its entry handoff. Optional queued
   inputs freeze the native environment with one registered invocation slot,
   preserving process-control environment and managed config/path/admission
-  checks. Private runtime transport is not launch authority. The physical
-  owner, monitor and recovery caller remain separate, and automatic readiness
-  stays fenced.
+  checks. Private runtime transport is not launch authority; automatic
+  readiness stays fenced and
+  the supervised recovery caller remains separate.
   The private CBM reporter consumes its bounded startup ACK before worker entry,
   verifies its actual live parent and original scope, and rechecks ownership at
   registration and native intent. Original counter baselines and fresh startup
   OOM observations survive the handoff; either hierarchical or local sampled
   kills refuse startup. The existing private output carries framed control
   data, with provider output routed to logging. Watchdog/CPU/IO policy binds
-  the same source identity. Physical owner integration, GitNexus's runtime
-  adapter and native qualification remain separate gates.
+  the same source identity. The private initial-owner endpoint takes the
+  canonical locks, reserves its actual self once, owns scoped reporter and
+  monitor children, and sends ACK only after fresh child checks. Its sole
+  private cancellation-pipe writer retires the monitor through EOF. Required
+  physical control precedes blocking publication; raw waits, producer EOF,
+  monitor-group absence and original cleanup independently constrain closure.
+  Work expiry first enters the existing stop transition; final cleanup expiry
+  retains an open obligation rather than certifying completion.
+  Pending startup pressure precedes ACK, and every first stop chooses the
+  observed scope or the actual unacknowledged child. Monitor interval waits
+  wake on private EOF; manager-client cancellation and actual reaps remain
+  owned, and an unavailable client wait keeps closure open.
+  First stop intent is distinct from resolved action: failed validated attempts
+  retry inside the same original budget while children and output drain.
+  Terminal child identity retains raw wait authority without allowing terminal
+  subjects into default live scope proof. The canonical launcher reuses captured
+  literal-argument compatibility with its exact executable/environment basis.
+  Synchronous manager observations and non-atomic name-based actions retain
+  their documented trusted-manager boundaries.
+  Pre-startup stop intent fixes a two-second local drain bound clipped to work
+  expiry; accepted TERM and late group proof cannot certify closure. Transient
+  cleanup reads retry within the fixed final budget, requiring fresh proof.
+  The initial scope also requests the frozen runtime cap, zero randomized extra
+  and final SIGKILL; only its actual producer requires these effective typed
+  properties before ACK. Generic readers retain their existing contract.
+  Manager runtime enforcement survives ordinary owner return/death, but is not
+  a cleanup receipt or native qualification. Kernel/manager failure and explicit
+  trusted-manager abandonment remain limits; activation is still fenced.
+  Separate producer histories retain the first baseline and one strongest
+  actual sample across delayed delivery. Unknown closure stays open; unregistered
+  launches stay uncertain. A retained local-only kill leaves uncertainty even
+  after successful waits, without changing historical resource accounting or
+  inventing an accepted stop. Timer dispatch, GitNexus's runtime adapter, supervised
+  recovery and native qualification remain separate gates.
   `index_marker_recovery.py` adds explicit transaction-only schema-5 storage,
   original-owner control completion, persistent provider holds and an exact
   terminal/control/source acceptance-watermark reader on the same queue.
