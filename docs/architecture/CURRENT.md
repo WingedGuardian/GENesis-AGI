@@ -1620,7 +1620,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: 5a3de4eee 2026-11-08
+verified: e34ba4e4f 2026-11-08
 ```
 
 Scoped verification covers `mcp/shared_http` composition. It receives
@@ -1635,6 +1635,14 @@ listener/SDK/registry cleanup path. Both installers render four inert
 `Type=notify` templates without enabling them. Actual manager readiness, measured
 start/stop settings, native clients and rollout remain separate. Ordinary session
 selection remains unchanged. See `docs/reference/shared-mcp-http.md`.
+The explicit `scripts/genesis_mcp_forwarder.py` consumer reads existing P3
+credentials and forwards shared-only RPC through the qualified SDK dispatcher.
+It preserves request IDs, reports uncertain outcomes without resending tools,
+retires failed generations for later requests and handles stdin EOF with
+cancellable pipe output. This remains inert groundwork: caller-path integration,
+the local/bookmark union, per-tool stages, native-client checks and matched
+measurements still gate registration changes. See
+`docs/reference/mcp-shared-forwarder.md`.
 This stamp does not
 requalify the other channels/interfaces subsystems.
 
@@ -3965,7 +3973,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py, caller_context.py, caller_credentials.py]
-verified: 5a3de4eee 2026-11-08
+verified: e34ba4e4f 2026-11-08
 ```
 
 Scoped verification covers the request-ownership prerequisite below and the
@@ -3973,6 +3981,12 @@ caller/activity boundary. Shared mode refuses process-environment identity
 through both accessors, including after environment drift; validated requests
 use `caller_context()`. Legacy reads remain raw and per-call. Other platform
 descriptions retain their individually cited dates. No shared activation.
+
+The explicit stdio forwarder now has a read-only P3 header consumer in
+`caller_credentials.forwarder_headers`. It reuses existing identity and
+credential-file validation, creates/repairs nothing and excludes non-null
+caller profiles. Native caller-label integration remains a closing gate on
+the stack; this does not activate routing.
 
 Shared validator-health also has a request-local automatic activity-write opt-out
 around the entire message boundary. It preserves memory counters and the

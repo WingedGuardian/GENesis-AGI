@@ -173,5 +173,7 @@ are still required. They set no startup/stop timeouts, so manager defaults apply
 Before enabling a unit, qualify and select measured start/stop settings against
 the configured grace and actual physical settlement behavior; no portable
 hard-stop budget is established here. Do not enable services merely because a
-template exists. Shared routing remains off while thin forwarding, the local
-capability/bookmark union and matched measurements are completed.
+template exists. The explicit [forwarder transport](mcp-shared-forwarder.md)
+does not change registrations. Shared routing remains off while caller-path
+integration, the local capability/bookmark union, stage routing and matched
+measurements are completed.

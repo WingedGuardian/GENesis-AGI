@@ -129,8 +129,10 @@ request-owned resources. Explicit `--shared-service` startup constructs the owne
 factories; ordinary session launch keeps its existing selection. Four inert
 `Type=notify` unit templates and bind-before-READY notification are available;
 rendering does not enable them. Qualify actual manager readiness and measured
-start/stop settings before activation. The stdio adapter, local catalog/bookmark
-union and matched measurements remain rollout prerequisites; constructing the
+start/stop settings before activation. The explicit
+[shared-only transport](mcp-shared-forwarder.md) is available for qualification;
+caller-path integration, the local catalog/bookmark union, per-tool stage routing
+and matched measurements remain rollout prerequisites. Constructing the
 HTTP app or rendering a unit alone is not activation evidence.
 
 Before any of these: the service calls `genesis.caller_context.enter_shared_service()`

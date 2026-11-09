@@ -255,8 +255,8 @@ def mcp_credentials_dir() -> Path:
 
     Holds the static forwarder secret and one credential per external-client
     profile, each mode 0600 in a 0700 directory. Written only by
-    ``genesis.caller_credentials.ensure_caller_credentials`` and read only by
-    its resolver. Composed from ``genesis_home()`` so tests redirect it.
+    ``genesis.caller_credentials.ensure_caller_credentials`` and read by its
+    resolver and explicit forwarder. Composed from ``genesis_home()`` so tests redirect it.
     """
     return genesis_home() / "mcp_credentials"
 
