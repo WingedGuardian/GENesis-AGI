@@ -421,15 +421,16 @@ async def test_supersede_does_not_burn_a_retry(monitor, inbox_dir, db):
         "SELECT id, status, retry_count FROM inbox_items WHERE file_path = ?",
         (str(f),),
     )
-    # The superseded row is recycled for the fresh delta (reuse_as_pending),
-    # evaluated, and completed — ONE row, retry budget untouched.
-    assert len(rows) == 1, [dict(r) for r in rows]
-    assert rows[0]["status"] == "completed"
-    assert rows[0]["retry_count"] == 0
+    # Missing identity is retained as history; reconstructed work starts fresh.
+    assert len(rows) == 2, [dict(r) for r in rows]
+    history = next(row for row in rows if row["id"] == "stale-pending")
+    rebuilt = next(row for row in rows if row["id"] != "stale-pending")
+    assert history["status"] == "failed" and history["retry_count"] == 0
+    assert rebuilt["status"] == "completed" and rebuilt["retry_count"] == 0
 
 
 @pytest.mark.asyncio
-async def test_supersede_near_retry_cap_still_recycles(monitor, inbox_dir, db):
+async def test_supersede_preserves_unknown_history_near_retry_cap(monitor, inbox_dir, db):
     """At max_retries-1, a supersede must not push the row over the cap.
 
     Before the fix, supersession incremented retry_count to the cap, the row
@@ -457,9 +458,11 @@ async def test_supersede_near_retry_cap_still_recycles(monitor, inbox_dir, db):
         "SELECT id, status, retry_count FROM inbox_items WHERE file_path = ?",
         (str(f),),
     )
-    assert len(rows) == 1, [dict(r) for r in rows]
-    assert rows[0]["status"] == "completed"
-    assert rows[0]["retry_count"] == 2
+    assert len(rows) == 2, [dict(r) for r in rows]
+    history = next(row for row in rows if row["id"] == "worn-pending")
+    rebuilt = next(row for row in rows if row["id"] != "worn-pending")
+    assert history["status"] == "failed" and history["retry_count"] == 2
+    assert rebuilt["status"] == "completed" and rebuilt["retry_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -907,24 +910,24 @@ async def test_partial_drop_creation_crash_rebuilds_every_item(
     f = inbox_dir / "links.md"
     urls = [f"https://example.com/item-{index}" for index in range(3)]
     f.write_text("\n".join(urls))
-    original_create = inbox_items.create
+    original_create = inbox_items.create_pending_if_retriable
     pending_creates = 0
 
     async def crash_after_first_pending(*args, **kwargs):
         nonlocal pending_creates
         result = await original_create(*args, **kwargs)
-        if kwargs.get("status") == "pending":
+        if result:
             pending_creates += 1
             if pending_creates == 1:
                 raise asyncio.CancelledError
         return result
 
-    monkeypatch.setattr(inbox_items, "create", crash_after_first_pending)
+    monkeypatch.setattr(inbox_items, "create_pending_if_retriable", crash_after_first_pending)
     with pytest.raises(asyncio.CancelledError):
         await monitor.check_once()
     assert len(await inbox_items.query_pending(db)) == 1
 
-    monkeypatch.setattr(inbox_items, "create", original_create)
+    monkeypatch.setattr(inbox_items, "create_pending_if_retriable", original_create)
     result = await monitor.check_once()
 
     assert result.batches_dispatched == 3
@@ -992,16 +995,82 @@ async def test_pending_recovery_rebuilds_a_missing_durable_payload(
 
     result = await monitor.check_once()
 
-    rebuilt = await inbox_items.get_by_id(db, "malformed")
+    history = await inbox_items.get_by_id(db, "malformed")
+    assert history["batch_items"] == "" and history["retry_count"] == 2
+    assert history["status"] == "failed"
+    rows = await db.execute_fetchall(
+        "SELECT * FROM inbox_items WHERE file_path=? AND id != 'malformed'", (str(f),),
+    )
+    assert len(rows) == 1
+    rebuilt = dict(rows[0])
     assert rebuilt["status"] == "completed"
     assert inbox_items.batch_items_for_dispatch(rebuilt["batch_items"]) == (
         "https://example.com/current"
     )
     assert rebuilt["drop_id"] != "drop"
-    assert rebuilt["retry_count"] == 2
+    assert rebuilt["retry_count"] == 0
     assert result.items_new == 1
     assert result.batches_dispatched == 1
     mock_invoker.run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["completed", "exhausted"])
+async def test_reconstructed_batch_keeps_one_bounded_budget(
+    monitor, inbox_dir, db, mock_invoker, outcome,
+):
+    """Unknown history stays intact; repeated scans never reset its replacement."""
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.scanner import compute_hash
+
+    source = inbox_dir / "reconstructed.md"
+    url = "https://example.com/reconstructed"
+    source.write_text(url)
+    await inbox_items.create(
+        db, id="unknown-history", file_path=str(source), content_hash=compute_hash(source),
+        status="failed", created_at="2026-01-01T00:00:00+00:00",
+        batch_items="inbox-items-v2:broken", retry_count=2,
+        error_message="batch_items_corrupt_restart",
+    )
+    mock_invoker.run.return_value = (
+        _success_output(
+            f"# Inbox Evaluation\n\n**Source:** {url}\n\n"
+            "This synthetic evaluation confirms that the reconstructed item was "
+            "processed and its response was retained. The fixture exercises only "
+            "local row ownership and response persistence; it makes no claim "
+            "about a real source. Its recommendation is to retain the current "
+            "implementation and make no external changes."
+        ) if outcome == "completed"
+        else _error_output("synthetic evaluation failure")
+    )
+    replacement_id = None
+    attempts = 1 if outcome == "completed" else monitor.config.max_retries
+    for attempt in range(1, attempts + 1):
+        await monitor.check_once()
+        rows = await db.execute_fetchall("SELECT * FROM inbox_items ORDER BY rowid")
+        assert len(rows) == 2
+        history, replacement = map(dict, rows)
+        assert history["id"] == "unknown-history"
+        assert history["batch_items"] == "inbox-items-v2:broken"
+        assert history["retry_count"] == 2
+        assert replacement["id"] != history["id"]
+        if replacement_id is not None:
+            assert replacement["id"] == replacement_id
+        replacement_id = replacement["id"]
+        assert replacement["retry_count"] == (0 if outcome == "completed" else attempt)
+        assert mock_invoker.run.await_count == attempt
+    await monitor.check_once()
+    await monitor.check_once()
+    assert mock_invoker.run.await_count == attempts
+    assert await inbox_items.get_retriable_failure_files(db) == []
+    history = await inbox_items.get_by_id(db, "unknown-history")
+    assert history["retry_count"] == 2
+    assert history["batch_items"] == "inbox-items-v2:broken"
+    assert history["error_message"].startswith(inbox_items.APPROVAL_INVALIDATED_PREFIX)
+    if outcome == "completed":
+        replacement = await inbox_items.get_by_id(db, replacement_id)
+        assert Path(replacement["response_path"]).exists()
+        assert url in await inbox_items.get_evaluated_content(db, str(source))
 
 
 @pytest.mark.asyncio
@@ -3181,19 +3250,18 @@ async def test_resume_corrupt_v2_batch_rederives_without_full_file_replay(
     assert result.batches_dispatched == 0
     mock_invoker.run.assert_not_awaited()
     corrupt = await inbox_items.get_by_id(db, "row-req-corrupt")
-    assert corrupt["status"] == "processing"
-    assert corrupt["error_message"] == (
-        f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-fresh"
-    )
+    assert corrupt["status"] == "failed"
+    assert corrupt["error_message"] == "batch_items_corrupt_restart"
     assert corrupt["retry_count"] == min(stored_retries, active_cap - 1)
-    assert inbox_items.batch_items_for_dispatch(corrupt["batch_items"]) == "first item"
+    assert corrupt["batch_items"] == corrupt_payload
     dispatcher.approval_gate.mark_consumed.assert_awaited_once_with("req-corrupt")
     rows = await db.execute_fetchall(
-        "SELECT id, status, error_message, batch_items FROM inbox_items "
-        "WHERE file_path = ? ORDER BY rowid",
-        (str(path),),
+        "SELECT id, status, error_message, batch_items, retry_count FROM inbox_items "
+        "WHERE file_path = ? AND id != ? ORDER BY rowid",
+        (str(path), "row-req-corrupt"),
     )
     assert len(rows) == 2
+    assert all(row["retry_count"] == 0 for row in rows)
     assert all(row["status"] == "processing" for row in rows)
     assert all(
         row["error_message"] == f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-fresh"
@@ -3287,8 +3355,16 @@ async def test_corrupt_parked_batch_retries_after_healthy_sibling_completes(
     assert second.items_retried == 1
     assert second.batches_dispatched == 0
     mock_invoker.run.assert_not_awaited()
-    recovered = await inbox_items.get_by_id(db, corrupt_id)
+    assert await inbox_items.get_by_id(db, corrupt_id) == corrupt
+    assert await inbox_items.get_by_id(db, healthy_id) == healthy
+    rebuilt = await db.execute_fetchall(
+        "SELECT * FROM inbox_items WHERE file_path = ? AND id NOT IN (?, ?)",
+        (str(path), corrupt_id, healthy_id),
+    )
+    assert len(rebuilt) == 1
+    recovered = dict(rebuilt[0])
     assert recovered["status"] == "processing"
+    assert recovered["retry_count"] == 0
     assert recovered["error_message"] == (
         f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-siblings-fresh"
     )

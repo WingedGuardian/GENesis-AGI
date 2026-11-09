@@ -19,8 +19,8 @@ item blocks suppress duplicate deltas, but do not enter the completed baseline.
 An unreadable held payload blocks dispatch for that source file, including
 after an edit; unrelated source files can still run. An owner alert identifies
 the held batch without exposing URL query strings or raw diagnostic text.
-If failed-row reuse loses its eligibility race, the entire in-memory drop is
-discarded, not just that batch. The next scan recovers any earlier durable
+If a new-row insertion or failed-row reuse loses its eligibility race, the entire
+in-memory drop is discarded, not just that batch. The next scan recovers any earlier durable
 pending rows and rebuilds the delta with the hold excluded.
 
 ## Inspect and deliberately release one batch
@@ -48,6 +48,27 @@ Repeating the command does not release it again. There is no bulk release or
 force flag; changed-source or corrupt-payload cases need a separately reviewed
 operator repair, not an automatic guess at item boundaries.
 
+## Retry ownership
+
+Retry counts follow the complete ordered batch of logical item texts, using the
+queue's existing tracking-parameter normalization. Inserting or reordering items
+cannot assign a different batch's failures to new work. An unchanged batch reuses
+its own row and retry count; regrouped batches start fresh. Annotations and item
+boundaries remain part of identity, rather than matching URL alone.
+
+Missing, corrupt or ambiguous legacy identities are retained as history while
+reconstructed batches get new rows and bounded retry budgets through normal
+approval. A legacy single-line item can still match. Subsequent unchanged retries
+reuse the reconstructed rows, so they do not get a new budget on every scan.
+Once replacement work completes, exhausts its budget or is removed, the existing
+empty-delta cleanup removes obsolete retry eligibility while retaining history.
+
+Both insertion and reuse atomically check that every still-unused selected retry
+row remains eligible, including unmatched history. Reuse also checks its exact
+stored payload. Losing either write discards the whole in-memory drop; earlier
+committed rows remain recoverable on restart. This preserves the selection-to-write
+boundary, not a global content claim or protection from a hold written afterward.
+
 ## Corrupt payloads during approval resume
 
 A corrupt versioned payload encountered while resuming an approved batch is
@@ -61,7 +82,10 @@ different file could reuse that same grant. A healthy sibling can still resume
 if its own consumption succeeds. No new persistent hold is created.
 
 After successful retirement, item boundaries are re-derived under fresh
-approval, rather than replaying the whole file as a legacy batch. Consumption
+approval into new rows with fresh bounded budgets; the corrupt historical row
+is not repurposed. Existing lowered-cap normalization of that historical row
+still applies. This does not change the legacy approval-resume fallback or
+gate-disabled behavior. Consumption
 committed before an interrupted row update is safe to observe again on the
 next scan. The row claim still precedes the evaluator call.
 This recovery does not release `replay_unsafe:` holds; unreadable held payloads

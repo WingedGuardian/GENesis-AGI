@@ -1696,6 +1696,7 @@ async def test_queue_drop_losing_reuse_cas_does_not_append_or_create_fallback(
     await inbox_items.create(
         db, id="raced", file_path=source, content_hash="old", status="failed",
         created_at="2026-06-30T11:00:00+00:00", error_message="ordinary failure",
+        batch_items=inbox_items.serialize_batch_items(["https://example.com/a"]),
     )
     real_reuse = inbox_items.reuse_as_pending
 
@@ -1726,20 +1727,23 @@ async def test_queue_drop_reuse_race_discards_whole_stale_drop(
     source = inbox_dir / "Genesis.md"
     urls = [f"https://example.com/{name}" for name in ("a", "b", "c")]
     source.write_text("\n\n".join(urls))
-    # The held identity can have moved earlier OR later in the newly computed
-    # delta. Positional row reuse does not establish identity correspondence.
+    # A competing writer can change the held identity to earlier/later content
+    # after selection. Neither the target snapshot nor the whole drop is valid.
     held_url = urls[1 if loss_index == 0 else 0]
     for idx in range(loss_index + 1):
         await inbox_items.create(
             db, id=f"raced-{idx}", file_path=str(source), content_hash="old", status="failed",
             created_at=f"2026-06-30T11:00:0{idx}+00:00", error_message="ordinary failure",
-            batch_items=inbox_items.serialize_batch_items([held_url if idx == loss_index else urls[idx]]),
+            batch_items=inbox_items.serialize_batch_items([urls[idx]]),
         )
     real_reuse = inbox_items.reuse_as_pending
 
     async def racing_reuse(conn, item_id, **kwargs):
         if item_id == f"raced-{loss_index}":
-            await conn.execute("UPDATE inbox_items SET error_message='replay_unsafe: raced' WHERE id=?", (item_id,))
+            await conn.execute(
+                "UPDATE inbox_items SET error_message='replay_unsafe: raced', batch_items=? WHERE id=?",
+                (inbox_items.serialize_batch_items([held_url]), item_id),
+            )
             await conn.commit()
         return await real_reuse(conn, item_id, **kwargs)
 

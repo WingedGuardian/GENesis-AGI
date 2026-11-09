@@ -35,6 +35,18 @@ _REPLAY_HOLD_SQL = (
     f" = '{REPLAY_UNSAFE_PREFIX}'"
 )
 
+# Both queue writers must notice a selected row becoming ineligible, including
+# unmatched history that is retained instead of rearmed. One statement closes
+# the selection-to-write race without owning the shared connection's transaction.
+_RETRIABLE_SELECTION_SQL = f"""NOT EXISTS (
+    SELECT 1 FROM json_each(?) selected
+    LEFT JOIN inbox_items prior ON prior.id = selected.value
+    WHERE prior.id IS NULL OR prior.status != 'failed' OR prior.retry_count >= ?
+      OR substr(COALESCE(prior.error_message, ''), 1, {len(REPLAY_UNSAFE_PREFIX)})
+         = '{REPLAY_UNSAFE_PREFIX}'
+      OR prior.error_message LIKE ? || '%'
+)"""
+
 # Prefix marking a row that has been CLAIMED for an in-flight dispatch (the CC
 # call is about to run / is running).  The resume pass flips a parked row from
 # ``awaiting_approval:`` to ``dispatching:`` via ``claim_for_dispatch`` BEFORE
@@ -858,6 +870,35 @@ async def mark_file_failures_abandoned(
     return cursor.rowcount
 
 
+async def create_pending_if_retriable(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    file_path: str,
+    drop_id: str,
+    batch_items: str,
+    content_hash: str,
+    created_at: str,
+    expected_retry_ids: list[str],
+    max_retries: int,
+) -> bool:
+    """Create a fresh batch only while the queue's unused retry rows remain eligible.
+
+    Old unmatched history stays intact. False discards the in-memory drop just
+    like a lost rearm; earlier committed siblings remain restart-recoverable.
+    """
+    cursor = await db.execute(
+        f"""INSERT INTO inbox_items
+            (id, file_path, content_hash, status, created_at, drop_id, batch_items)
+            SELECT ?, ?, ?, 'pending', ?, ?, ?
+            WHERE {_RETRIABLE_SELECTION_SQL}""",
+        (id, file_path, content_hash, created_at, drop_id, batch_items,
+         json.dumps(expected_retry_ids), max_retries, APPROVAL_INVALIDATED_PREFIX),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def reuse_as_pending(
     db: aiosqlite.Connection,
     id: str,
@@ -866,6 +907,9 @@ async def reuse_as_pending(
     batch_items: str,
     content_hash: str,
     created_at: str,
+    expected_batch_items: str | None,
+    expected_retry_ids: list[str],
+    max_retries: int,
 ) -> bool:
     """Re-arm a retriable failed row as a fresh pending batch.
 
@@ -880,14 +924,19 @@ async def reuse_as_pending(
     an ancient created_at and broke all of those (the baseline reads switched
     to processed_at ordering for completion-keyed correctness; this fixes the
     created_at-keyed consumers at the source).
+    The caller matches logical item identity first. The exact stored payload and
+    eligibility of every still-unused selected row are checked again atomically;
+    a newly held unmatched row must also prevent this stale drop from dispatching.
     """
     cursor = await db.execute(
         f"""UPDATE inbox_items
            SET status = 'pending', error_message = NULL,
                drop_id = ?, batch_items = ?, content_hash = ?,
                created_at = ?
-           WHERE id = ? AND status = 'failed' AND NOT ({_REPLAY_HOLD_SQL})""",
-        (drop_id, batch_items, content_hash, created_at, id),
+           WHERE id = ? AND batch_items IS ?
+             AND {_RETRIABLE_SELECTION_SQL}""",
+        (drop_id, batch_items, content_hash, created_at, id, expected_batch_items,
+         json.dumps([id, *expected_retry_ids]), max_retries, APPROVAL_INVALIDATED_PREFIX),
     )
     await db.commit()
     return cursor.rowcount > 0

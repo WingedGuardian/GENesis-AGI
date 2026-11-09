@@ -1420,7 +1420,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: 1b79527b5c7 2026-11-08
+verified: 2f01bcd63 2026-11-09
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -1488,7 +1488,8 @@ verified: 1b79527b5c7 2026-11-08
   can carry share tokens — while a storm alert names the file only. The retry-lane storm site
   abandons only URL-failure rows. An approval that ends unanswered (`approval_ended:`)
   does not spend a retry and leaves the row an ordinary retriable failure, so
-  the same row is asked about again; with `resilience.parking_mode:
+  an identifiable unchanged batch keeps its retry budget when asked about again;
+  with `resilience.parking_mode:
   live`, a network outage (`CCNetworkOfflineError`) does not spend retries. Follow-up and
   build-lane durable writes finish before the completed baseline commits, so a
   cancellation cannot permanently hide their absence. On restart every
@@ -1496,6 +1497,12 @@ verified: 1b79527b5c7 2026-11-08
   complete outstanding work is re-derived from the current source and completed
   baseline, so a crash during multi-row creation cannot silently lose the
   never-created tail or leave pending rows suppressing the file forever.
+  Retry reuse matches the complete ordered logical batch, with the queue's
+  existing tracking normalization and preserved annotations. Missing, corrupt
+  or regrouped identities get fresh bounded rows through normal approval while
+  old history remains. Both creation and reuse atomically reject newly ineligible
+  selected history, including unmatched rows; lost writes discard the whole
+  in-memory drop, leaving partial durable rows for restart recovery.
   Replay-unsafe batches persist a hold independent of the retry cap; readable
   held blocks are excluded from future deltas without becoming completed
   baseline content, while unreadable holds block their source file. The
