@@ -1804,6 +1804,12 @@ the shared banner is not an assertion about all concurrent sessions.
   locks. This does not activate the service or establish production capacity
   or unattended resource-failure readiness. See
   `docs/reference/codebase-managed.md`.
+  The prepared typed timer tail calls the captured original owner and accepts
+  only complete, context-bound native outcomes. GitNexus selection captures
+  Node/package metadata before reservation and confirms the pinned installation
+  only after original scope registration and admission. It uses the shared
+  native-intent seam; imported vendor files remain trusted installed inputs.
+  This wiring preserves negative readiness and does not activate indexing.
   The queue's `scripts/lib/index_marker_legacy.py` isolates malformed legacy
   artifacts in retained import receipts without replacing business failures;
   real filesystem/SQLite errors remain visible. Schema 3 atomically fans requests
@@ -1818,7 +1824,7 @@ the shared banner is not an assertion about all concurrent sessions.
   fences every automatic reconciliation/claim/launch until the later protocol
   completes. There is no readiness setter. Behind that fence, the checked
   consumer validates complete NUL list/claim/escalation acknowledgements and
-  actual child status, dispatches one provider from its authoritative claim and
+  transport status, dispatches one provider from its authoritative typed claim and
   settles the complete context. Entrypoint and freeze repository normalization
   preserve trailing newlines and collapse Linux root aliases before lock hashing.
   Retained terminal decisions replay without

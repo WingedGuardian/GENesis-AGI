@@ -11,7 +11,7 @@ import stat
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -112,35 +112,40 @@ def reserve_runtime(snapshot, modules, context, run_mode, settings_path, selecte
         raise ValueError('initial runtime requires the original actual owner')
     context = native.context(context, queue._legs, queue.marker_hash)
     selected = modules['queued'].effective_policy(selected, native, full=True)
-    if context['provider'] != 'cbm' or not snapshot.current_matches():
-        raise ValueError('initial runtime requires the current captured CBM adapter')
-    persistence = os.environ.get('CODE_INTEL_INDEX_PERSISTENCE') or 'true'
-    if persistence not in ('true', 'false'):
-        raise ValueError('invalid persistence policy')
+    if not snapshot.current_matches():
+        raise ValueError('initial runtime requires its current captured provider adapter')
     reserved = dict(unit=native.expected_unit(context), run_mode=run_mode,
         owner=owner, cap_bytes=8 * 1024**3,
         **{key: selected[key] for key in ('route', 'slice', 'wall_seconds')})
-    with managed.lifecycle_lock(shared=True):
-        documents = []
-        path = modules['unit'].config_path(settings_path)
-        config = managed.runtime_config(path, capture=documents.append)
-        if (len(documents) != 1 or type(documents[0]) is not bytes
-                or Path(config['main']) != snapshot.root or config['main'] != context['repo_path']):
-            raise ValueError('initial runtime requires its one immutable primary configuration')
-        with managed.verified_binary(Path(config['binary'])):
-            pass  # Read/hash/access checks only; no provider process before reservation.
+    with managed.lifecycle_lock(shared=True) if context['provider'] == 'cbm' else nullcontext():
         control = modules['owner'].control_environment(reserved, selected, modules['unit'])
-        environment = managed.native_env(config, environment=control)
-        environment.pop('INVOCATION_ID', None)
-        recipe = dict(frozen=environment, registration_slots={'INVOCATION_ID': 'scope.invocation_id'})
-        accepted = modules['queued'].NativeEnvironment(recipe, native)
-        args = SimpleNamespace(repo_path=context['repo_path'], mode=run_mode, persistence=persistence)
-        reserved['source'] = modules['queued'].cbm_source(snapshot=snapshot, worker=modules['worker'],
-            config=config, args=args, cap=reserved['cap_bytes'], settings=documents[0],
-            environment=accepted.frozen, policy=selected, registration_slots=recipe['registration_slots'])
+        if context['provider'] == 'gitnexus':
+            options, recipe, reserved['source'] = modules['gitnexus'].freeze(
+                snapshot, modules, context, reserved, selected, control)
+        else:
+            persistence = os.environ.get('CODE_INTEL_INDEX_PERSISTENCE') or 'true'
+            if persistence not in ('true', 'false'):
+                raise ValueError('invalid persistence policy')
+            documents = []
+            path = modules['unit'].config_path(settings_path)
+            config = managed.runtime_config(path, capture=documents.append)
+            if (len(documents) != 1 or type(documents[0]) is not bytes
+                    or Path(config['main']) != snapshot.root or config['main'] != context['repo_path']):
+                raise ValueError('initial runtime requires its one immutable primary configuration')
+            with managed.verified_binary(Path(config['binary'])):
+                pass  # Read/hash/access only; no provider process before reservation.
+            environment = managed.native_env(config, environment=control)
+            environment.pop('INVOCATION_ID', None)
+            recipe = dict(frozen=environment, registration_slots={'INVOCATION_ID': 'scope.invocation_id'})
+            accepted = modules['queued'].NativeEnvironment(recipe, native)
+            args = SimpleNamespace(repo_path=context['repo_path'], mode=run_mode, persistence=persistence)
+            reserved['source'] = modules['queued'].cbm_source(snapshot=snapshot, worker=modules['worker'],
+                config=config, args=args, cap=reserved['cap_bytes'], settings=documents[0],
+                environment=accepted.frozen, policy=selected, registration_slots=recipe['registration_slots'])
+            options = dict(managed_config=str(path), persistence=persistence)
         native.reservation(reserved, context)
         runtime = dict(context=context, reservation=reserved, policy=selected,
-            provider_options=dict(managed_config=str(path), persistence=persistence), environment_recipe=recipe)
+            provider_options=options, environment_recipe=recipe)
         bound = snapshot.with_runtime(runtime)
         modules['queued'].runtime_inputs(bound, modules)
         if owner != queue._recovery.owner_identity():

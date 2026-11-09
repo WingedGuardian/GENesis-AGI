@@ -45,6 +45,7 @@ MODULES = (
     ("cli", "_genesis_index_marker_cli", "scripts/lib/index_marker_cli.py"),
     ("queue", "_genesis_index_marker", "scripts/lib/index_marker.py"),
     ("queued", "_genesis_code_intel_queued_worker", "scripts/lib/code_intel_queued_worker.py"),
+    ("gitnexus", "_genesis_code_intel_gitnexus", "scripts/lib/code_intel_gitnexus.py"),
     ("owner", "_genesis_code_intel_owner", "scripts/lib/code_intel_owner.py"),
     ("owner_admission", "_genesis_code_intel_owner_admission", "scripts/lib/code_intel_owner_admission.py"),
     ("managed", "_genesis_codebase_managed", "scripts/codebase_managed.py"),
