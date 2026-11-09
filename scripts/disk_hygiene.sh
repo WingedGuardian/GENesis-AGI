@@ -21,6 +21,8 @@
 #      (WS-5 Discord observe-only gate log; bounds the shadow store)
 #   8. Retention prune of session_ledger_shadow_* (>45d) → scripts/prune_ledger_shadow.py
 #      (session-manager PR-3 ambient extractor shadow store; runs + events)
+#   8a. Retention prune of client_tool_calls (default 180d) → scripts/prune_client_tool_calls.py
+#      (labelled-client tool-call log, e.g. owner-mode Codex)
 #   8b. Retention prune of ~/.genesis/sessions/<id>/ (>60d, whole dirs)
 #      (per-session state + SessionStart context mirrors; age far exceeds any
 #      live session, which rewrites last_prompt_time every prompt)
@@ -60,6 +62,9 @@
 #      → rotate_log (mcp_health.log, turnstile_debug.log; the first is held open
 #      by every session's MCP server, so both are copied and truncated, never
 #      renamed)
+#  17. Reset failed TRANSIENT user units (failed >24h) → reset_failed_transient_units
+#      (ad-hoc `systemd-run` launches without --collect stay listed as failed
+#      forever; never a genesis-* unit, never a persistent unit)
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -89,6 +94,8 @@ fi
 
 # shellcheck source=scripts/lib/tmp_liveness.sh
 . "$SCRIPT_DIR/lib/tmp_liveness.sh"
+# shellcheck source=lib/secrets_path.sh
+. "$SCRIPT_DIR/lib/secrets_path.sh"
 
 # prune_tmp DIR [AGE_MIN] — delete direct children of DIR not modified for more
 # than AGE_MIN minutes (default: the historical `-mtime +7`), EXCLUDING
@@ -588,6 +595,8 @@ rotate_mcp_logs() {
 # one place on the box that holds every credential.
 _load_store_knob() {
     local key="$1"
+    # The checkout's file, not the resolver's: the hook-audit stores' writers
+    # read their directories from it, and this must read the same one.
     local file="${2:-$REPO_DIR/secrets.env}"
     local line=""
     local val
@@ -606,15 +615,101 @@ _load_store_knob() {
 
 # The Camoufox cache the browser tools use can come from secrets.env, which this
 # unit does not load: the provisioner installs where XDG_CACHE_HOME there points.
-# It is read by name from the file the runtime reads (genesis.env.secrets_path:
-# SECRETS_PATH with a leading ~ expanded, else the checkout's), in a subshell so it
-# reaches no later step. The engine override the decider reads itself.
+# It is read by name from the file the runtime reads (genesis_secrets_path, the
+# twin of genesis.env.secrets_path), in a subshell so it reaches no later step.
+# The engine override the decider reads itself.
 prune_camoufox_engines_step() {
     (
-        secrets="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
-        _load_store_knob XDG_CACHE_HOME "${secrets/#\~/$HOME}"
+        # An unresolvable override loads nothing: never the checkout's file instead.
+        local _secrets
+        if _secrets="$(genesis_secrets_path "$REPO_DIR")"; then
+            _load_store_knob XDG_CACHE_HOME "$_secrets"
+        fi
         prune_browser_engines "${XDG_CACHE_HOME:-$HOME/.cache}/camoufox"
     )
+}
+
+# reset_failed_transient_units [MIN_AGE_S] — `systemctl --user reset-failed` each
+# FAILED transient unit whose failure is older than MIN_AGE_S (default 24h). A
+# `systemd-run` launch without --collect is left loaded as failed after it
+# exits non-zero, and nothing else ever clears it, so the failed list fills
+# with old jobs and a new failure is harder to see among them. That includes
+# Genesis's OWN unnamed scopes, not only ad-hoc session commands: the CC
+# session launcher (cc/invoker.py), the code-intel indexer and the dashboard
+# update route all start `run-u*` scopes without --collect, deliberately, so a
+# scope killed by its MemoryMax stays visible. This stage NEVER resets a unit
+# whose Result is oom-kill (owner ruling 2026-11-07: a memory kill is a real
+# alarm and stays listed until someone looks). Any other failure stays visible
+# for a day, is logged with its Result when reset, and stays in the journal.
+#
+# "Transient" is systemd's own `Transient=yes`, not the unit's name or an empty
+# FragmentPath. MEASURED on systemd 255: a transient unit's FragmentPath is NOT
+# empty, it is <runtime dir>/systemd/transient/<name>; and a persistent unit
+# whose file was removed (LoadState=not-found) reports an EMPTY FragmentPath
+# with Transient=no. So the gate is Transient=yes AND a FragmentPath that is
+# empty or under a systemd/transient/ directory. A persistent unit's failure is
+# a real alarm and is never reset, and neither is any genesis-* unit.
+#
+# The age is the unit's StateChangeTimestamp in Unix seconds
+# (`--timestamp=unix`), a wall-clock value. The *Monotonic fields are not
+# usable here: inside a container they count the HOST's monotonic clock, which
+# MEASURED ran far ahead of the container's /proc/uptime. A unit whose time
+# cannot be read is kept. Each unit is logged before it is reset. A box with no
+# systemctl, or with no reachable user manager, skips the stage.
+reset_failed_transient_units() {
+    local min_age="${1:-86400}" listing unit props key val now
+    local transient fragment state ts result
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "transient unit reset SKIPPED: systemctl not found"
+        return 0
+    fi
+    if ! listing="$(systemctl --user list-units --state=failed --all --no-legend --plain 2>/dev/null)"; then
+        echo "transient unit reset SKIPPED: the systemd user manager is unreachable"
+        return 0
+    fi
+    now="$(date +%s)"
+    while read -r unit _; do
+        [ -n "$unit" ] || continue
+        case "$unit" in genesis-*) continue ;; esac
+        if ! props="$(systemctl --user show --timestamp=unix \
+                -p Transient -p FragmentPath -p ActiveState -p StateChangeTimestamp \
+                -p Result -- "$unit" 2>/dev/null)"; then
+            echo "transient unit reset: kept $unit (its properties could not be read)"
+            continue
+        fi
+        transient="" fragment="" state="" ts="" result=""
+        while IFS='=' read -r key val; do
+            case "$key" in
+                Transient) transient="$val" ;;
+                FragmentPath) fragment="$val" ;;
+                ActiveState) state="$val" ;;
+                StateChangeTimestamp) ts="$val" ;;
+                Result) result="$val" ;;
+            esac
+        done <<< "$props"
+        [ "$state" = failed ] || continue
+        [ "$transient" = yes ] || continue
+        case "$fragment" in
+            ""|*/systemd/transient/*) ;;
+            *) continue ;;
+        esac
+        ts="${ts#@}"
+        if ! [[ "$ts" =~ ^[0-9]+$ ]]; then
+            echo "transient unit reset: kept $unit (no readable failure time)"
+            continue
+        fi
+        [ $((now - ts)) -gt "$min_age" ] || continue
+        if [ "$result" = oom-kill ]; then
+            # Owner ruling: a scope killed by its memory limit is a real alarm,
+            # so it stays in the failed list until someone looks at it.
+            echo "transient unit reset: kept $unit (result=oom-kill is never auto-reset)"
+            continue
+        fi
+        echo "transient unit reset: $unit (failed $(( (now - ts) / 3600 ))h ago, result=${result:-unknown})"
+        systemctl --user reset-failed -- "$unit" 2>/dev/null \
+            || echo "transient unit reset failed for $unit"
+    done <<< "$listing"
+    return 0
 }
 
 hygiene_stage() {
@@ -717,6 +812,10 @@ maintenance_main() {
     echo "--- ledger shadow retention prune (>45d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_ledger_shadow.py" --days 45 \
         || echo "prune_ledger_shadow exited $?"
+
+    echo "--- client tool-call log retention prune (default window) ---"
+    "$VENV_PY" "$REPO_DIR/scripts/prune_client_tool_calls.py" \
+        || echo "prune_client_tool_calls exited $?"
 
     echo "--- repo pulse retention prune (>45d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_repo_pulse.py" --days 45 \
@@ -854,6 +953,9 @@ maintenance_main() {
     # Appended to every 5 minutes by scripts/inbox_sync.sh and never rotated
     # before: MEASURED 31.8 MB on a live install. Same bounds as the MCP logs.
     rotate_log "${GENESIS_INBOX_SYNC_LOG:-$REPO_DIR/logs/inbox_sync.log}" 10000000 2
+
+    echo "--- failed transient unit reset (>24h; never genesis-*, never persistent) ---"
+    reset_failed_transient_units 86400
 
     echo "=== genesis-disk-hygiene done ==="
     return "$disk_reclaim_rc"

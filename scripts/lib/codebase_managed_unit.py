@@ -538,9 +538,10 @@ def validate_provider_paths(config: dict) -> None:
             raise ValueError(f"pinned provider does not support backslash in {key} paths")
 
 
-def native_env(config: dict) -> dict[str, str]:
+def native_env(config: dict, *, environment=None) -> dict[str, str]:
     validate_provider_paths(config)
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CBM_")}
+    selected = os.environ if environment is None else environment
+    env = {k: v for k, v in selected.items() if not k.startswith("CBM_")}
     env.update(
         CBM_CACHE_DIR=config["cache"],
         CBM_RUNTIME_DIR=config["runtime"],

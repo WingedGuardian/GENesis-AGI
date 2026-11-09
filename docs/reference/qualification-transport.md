@@ -133,6 +133,33 @@ by a later receipt. Missing or contradictory observed generation IDs refuse.
 Receipt-only recovery requires explicit independently verified attempt/request
 association, never an inferred latest generation. A settled lost answer needs
 an explicit answer-loss acknowledgement and is never resent.
+
+Unsuccessful HTTP lookups and network/cancellation failures are retained as
+`receipt_lookup` events, separate from financial receipts. They bind the exact
+attempt, request hash and generation, participate in generation ownership, and
+never release a reservation. Only a verified200 receipt can settle cost.
+Read-only reconstruction validates the same lookup schema as the writer.
+Financial reports retain lookup failure counts by status (or `network`), even
+when a later receipt resolves expense. Historical invalid billing records,
+including404s written by older code, remain invalid; no migration or automatic
+acknowledgement reinterprets them. A later availability failure does not negate
+an already verified same-generation expense.
+
+Transport bindings and every scheduled attempt may explicitly freeze
+`receipt_policy: "wait_404"`; absent means `"single"`. Values and effective policy
+must agree before credential access. This option stays local and does not alter
+the completion body. Single performs one GET. Opt-in wait_404 permits only
+metadata GETs after a durably recorded404, with a shared600-second monotonic
+timeout over requests and sleeps,30-second intervals, at most21 GETs including
+the first, and30-second per-request HTTPX timeouts. The deadline can stop the
+operation before its21st read; durable filesystem operations are outside that
+network wait promise. These are engineering limits, not provider readiness
+guarantees. Other HTTP statuses, request errors, malformed200 receipts, identity
+or cost errors and cancellation stop immediately. An uncertain lookup append
+also stops before another GET. Completion requests still have one attempt.
+An interrupted run never resumes this wait automatically: explicit GET-only
+reconciliation remains separate from failure or answer-loss acknowledgement.
+
 Body and response-header generation identities are retained separately; a
 contradiction stays unresolved. An ID captured from this response's header may
 support expense recovery when the body ID is absent, but cannot qualify an
@@ -158,3 +185,20 @@ Every live acceptance and retained replay rechecks the raw routing evidence.
 Expense settlement and failure acknowledgement cannot qualify a cached,
 transformed, retried or otherwise invalid response. Recovery remains explicit
 GET-only; rejected answers never trigger another completion.
+
+## Exact model namespaces
+
+A transport and each scheduled attempt can freeze `backend_model` and
+`receipt_model` separately from the gateway `model`. The public response model
+and routing `requested` field must still match `model`. The selected endpoint
+and optional attempt-history model must match `backend_model`; the generation
+GET model must match `receipt_model`. Each absent optional pin defaults to
+`model`, preserving strict historical behavior. Present null, blank or nonstring
+pins refuse. Transport and attempt effective identities must agree before
+credentials are accessed.
+
+Use evidence for each exact identifier; no suffix stripping or inferred alias
+mapping occurs. Raw response and receipt identities remain in the journal; only
+verified identities map to the canonical gateway model for accounting. Changing
+pins changes the consent-bound plan. Old stopped campaigns are not migrated,
+acknowledged or resent by this feature.

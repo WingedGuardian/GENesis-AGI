@@ -978,13 +978,28 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             unit_id           TEXT NOT NULL,
             accessor_context  TEXT,
             accessed_at       TEXT NOT NULL,
-            query_match_score REAL
+            query_match_score REAL,
+            client            TEXT
         )
     """,
     # NOTE: intentionally NO foreign key to knowledge_units. Audit rows
     # outlive the entries they describe — deleting a reference entry (e.g.
     # password rotation: delete + re-store) must not cascade away the
     # access history.  The unit_id is a soft reference only.
+    # Append-only log of the MCP tool calls a labelled client makes (owner-mode
+    # Codex): never the arguments. New-Store justification + retention in
+    # migration 20261108071709_client_tool_calls; DDL byte-identical to it.
+    "client_tool_calls": """
+    CREATE TABLE IF NOT EXISTS client_tool_calls (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        client      TEXT NOT NULL,
+        server      TEXT NOT NULL,
+        tool        TEXT NOT NULL,
+        called_at   TEXT NOT NULL,
+        outcome     TEXT NOT NULL CHECK (outcome IN ('returned', 'raised', 'cancelled')),
+        result_ref  TEXT
+    )
+    """,
     "knowledge_uploads": """
         CREATE TABLE IF NOT EXISTS knowledge_uploads (
             id            TEXT PRIMARY KEY,
@@ -2619,6 +2634,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_memory_links_target ON memory_links(target_id)",
     # credential access log (audit trail for reference store credential lookups)
     "CREATE INDEX IF NOT EXISTS idx_credential_access_unit ON credential_access_log(unit_id, accessed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_client_tool_calls_client_time ON client_tool_calls(client, called_at)",
     # inbox items
     "CREATE INDEX IF NOT EXISTS idx_inbox_items_status ON inbox_items(status)",
     "CREATE INDEX IF NOT EXISTS idx_inbox_items_file_path ON inbox_items(file_path)",

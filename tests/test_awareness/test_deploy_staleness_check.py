@@ -954,6 +954,27 @@ async def test_td19_a_live_repair_report_raises_its_own_wording_then_resolves(db
     assert len(await _rows(db, resolved=1)) == 1
 
 
+async def test_a_restore_that_refused_parts_is_named_with_the_way_back(db, monkeypatch):
+    """#3492 B2b (review SF-E, L-4, L-5, NOTE-3): a report whose last restore
+    refused parts says so, says how a part it can never write goes back (by
+    hand, then --dismiss), what an exit 2 means, and which untracked restores
+    block a deploy."""
+    ts = "20261104T000000Z-9"
+    snap = _snap(["live_repair_saved:2"])
+    snap["live_repairs"] = _repairs({**_repair(ts, 2), "restore_refused": 3})
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert "Its last restore refused 3 part(s)" in content, content
+    assert f"/home/u/.genesis/deploy-backups/{ts}-live-move-repair/tree" in content, content
+    assert f"then --dismiss {ts}" in content, content
+    assert "an exit 2 saying restoring is not available yet" in content, content
+    assert "only under src/, config/ or pyproject.toml" in content, content
+    snap["live_repairs"] = _repairs(_repair(ts, 2))
+    assert "refused" not in loop._deploy_repair_paragraph(snap["live_repairs"])
+
+
 async def test_only_undismissed_reports_with_saved_paths_are_named(db, monkeypatch):
     shown, dismissed, empty = "20261028T000000Z-3", "20261027T000000Z-2", "20261026T000000Z-1"
     snap = _snap(["live_repair_saved:1"])
