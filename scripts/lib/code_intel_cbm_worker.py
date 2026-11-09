@@ -218,6 +218,9 @@ def main(argv: list[str] | None = None, *, queued_factory=None, queued_native_en
         return _execute_stock_worker(Path(args.managed_config), args, cap,
                                      queued_factory=queued_factory)
     except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as exc:
+        if queued_native_environment is not None:
+            # The private captured reporter owns class-only error diagnostics.
+            raise
         print(f"code-intel: stock worker refused/failed: {exc}", file=sys.stderr)
         return 111
 

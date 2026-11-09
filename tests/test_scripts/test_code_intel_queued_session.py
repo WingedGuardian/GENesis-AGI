@@ -102,7 +102,7 @@ def test_register_intent_actual_child_terminal_and_replay_are_one_use(session, q
         report = run.native(command(executable.fileno(), output), executable,
                             after_spawn=lambda: order.append("released"), pass_fds=(executable.fileno(),))
     assert report["outcome"] == "complete" and output.read_text() == "once\n"
-    assert order == ["registration", "admission", "released"]
+    assert order == ["registration", "registration", "admission", "released"]
     run.terminal(provider_ok=True)
     assert queue.apply_native(claimed["context"]) == "consumed"
     assert queue.apply_native(claimed["context"]) == "consumed"

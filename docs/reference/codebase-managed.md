@@ -917,6 +917,22 @@ authority: source-only queue/shell/availability roles refuse runtime-bearing
 capsules, and diagnostics never print their values. Full owner/monitor wiring
 and supervised recovery remain unfinished and separately qualified.
 
+The private CBM reporter role now checks the complete runtime source, provider
+pin, effective policy and environment recipe. It consumes a bounded atomic
+startup ACK before entering the worker, then brackets its own identity, its live
+original parent, manager invocation and original kernel facts. Registration
+retains the owner's first counter baseline; fresh ownership is checked again
+before registration and native intent. Fresh owned OOM facts are relayed on the
+existing private output before preparation is refused. Provider output goes to
+the log rather than the control channel, and the private output descriptor is
+excluded from native subprocess inheritance.
+
+The shared policy identity includes watchdog, CPU and I/O settings; a partial
+full-policy value cannot silently become the earlier five-field recipe. These
+reporter checks do not create the physical owner or monitor, enable automatic
+readiness, qualify native containment, or implement the GitNexus runtime adapter.
+Existing standalone indexing behavior remains unchanged.
+
 ## Verification
 
 The transitional SQLite contention fixture explicitly drives real claim,
