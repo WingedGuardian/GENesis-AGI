@@ -86,16 +86,20 @@ def mount_digest(path: Path) -> str:
     return hashlib.sha256("\n".join(sorted(mounts)).encode()).hexdigest()
 
 
-def _process_state(directory: Path, pid: int):
+def _process_state(directory: Path, pid: int, *, allow_zombie=False):
     """PID, start and parent: proc_pid_stat(5), fields1,22,4.
 
+    Only an actual OwnedChild may retain Z identity; default live scope proof
+    still refuses it. Identity alone never supplies a terminal wait result.
     https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
     """
+    if type(allow_zombie) is not bool:
+        raise ValueError("invalid owned zombie identity selection")
     process = (directory / "stat").read_text()
     tail = process.rpartition(") ")[2].split()
     if _NUMBER(process.split(" ", 1)[0], "reporter pid") != pid or len(tail) < 20:
         raise ValueError("reporter process identity mismatch or start unavailable")
-    if tail[0] in ("Z", "X", "x"):
+    if tail[0] in ("X", "x") or (tail[0] == "Z" and not allow_zombie):
         raise ValueError("scope subject has already ended")
     return pid, _NUMBER(tail[19], "reporter start"), _NUMBER(tail[1], "reporter parent")
 

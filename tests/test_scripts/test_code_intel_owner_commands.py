@@ -4,6 +4,7 @@ import runpy
 import shlex
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,6 +25,7 @@ def prepared(tmp_path, monkeypatch):
 
 def test_scope_command_is_one_literal_exec_with_closed_full_policy(tmp_path, monkeypatch):
     snapshot, modules, value, owner = prepared(tmp_path, monkeypatch)
+    monkeypatch.setattr(modules['systemd'], 'literal_scope_args', lambda **kwargs: ['--expand-environment=no'])
     command = owner['scope_command'](snapshot, modules, 7)
     assert command[:5] == ['/bin/bash', '--noprofile', '--norc', '-p', '-c']
     tokens = shlex.split(command[5])
@@ -35,6 +37,27 @@ def test_scope_command_is_one_literal_exec_with_closed_full_policy(tmp_path, mon
     assert tokens[tokens.index('--') + 1:] == snapshot.resume_command('reporter', '7')
     assert value['environment_recipe']['frozen']['SYNTHETIC_RUNTIME_VALUE'] not in repr(command)
     assert not any(token in tokens for token in ('eval', 'source', '|', '&', '-s'))
+
+
+@pytest.mark.parametrize('status', [0, 1, 126, -9])
+def test_scope_command_probes_its_canonical_binary_and_launch_environment(tmp_path, monkeypatch, status):
+    snapshot, modules, _, owner = prepared(tmp_path, monkeypatch)
+    environment = {'PATH': '/synthetic/bin', 'SYNTHETIC_CONTROL_ENV': 'owned'}
+    monkeypatch.setattr(modules['unit'], 'systemctl_env', lambda: dict(environment))
+    calls = []
+
+    def probe(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(returncode=status)
+
+    monkeypatch.setattr(modules['systemd'].subprocess, 'run', probe)
+    command = owner['scope_command'](snapshot, modules, 7)
+    assert calls == [(['/usr/bin/systemd-run', '--expand-environment=no', '--version'],
+                      dict(capture_output=True, timeout=10, env=environment))]
+    tokens = shlex.split(command[5])
+    assert tokens[:5] == ['exec', '/usr/bin/systemd-run', '--user', '--scope', '--quiet']
+    assert ('--expand-environment=no' in tokens) == (status != 1)
+    assert tokens[tokens.index('--') + 1:] == snapshot.resume_command('reporter', '7')
 
 
 @pytest.mark.parametrize('descriptor', [0, 1, 2, True, -1, '7'])

@@ -31,8 +31,10 @@ def scope_command(snapshot, modules, ack_fd):
         raise ValueError('startup ACK must use a private descriptor')
     reserved, policy = value['reservation'], value['policy']
     route = '--slice-inherit' if reserved['route'] == 'inherit' else '--slice=' + reserved['slice']
+    literal_scope_args = modules['systemd'].literal_scope_args
     argv = ['/usr/bin/systemd-run', '--user', '--scope', '--quiet', '--no-ask-password',
-            '--expand-environment=no', route, '--unit=' + reserved['unit'],
+            *literal_scope_args(executable='/usr/bin/systemd-run', env=modules['unit'].systemctl_env()),
+            route, '--unit=' + reserved['unit'],
             '-p', 'MemoryMax=' + str(reserved['cap_bytes']), '-p', 'MemorySwapMax=0',
             '-p', 'IOWeight=' + policy['io_weight'], '-p', 'CPUQuota=' + policy['cpu_quota'],
             '--', *snapshot.resume_command('reporter', str(ack_fd))]
@@ -156,10 +158,10 @@ class OwnedChild:
 
     def _read(self):
         process = Path('/proc') / str(self.child.pid)
-        before = self.proof._process_state(process, self.child.pid)
+        before = self.proof._process_state(process, self.child.pid, allow_zombie=True)
         boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
         if (before[2] != os.getpid()
-                or self.proof._process_state(process, self.child.pid) != before
+                or self.proof._process_state(process, self.child.pid, allow_zombie=True) != before
                 or Path('/proc/sys/kernel/random/boot_id').read_text().strip() != boot):
             raise ValueError("original owned child birth or parent changed")
         return dict(pid=before[0], start_ticks=before[1], boot_id=boot)
@@ -185,6 +187,8 @@ class OwnedChild:
             return False
         if self._read() != self._identity:
             raise ValueError("original owned child birth changed")
+        if self.status() is not None:
+            return False  # A terminal birth is retained identity, not a signal target.
         if group:
             if os.getpgid(self.child.pid) != self.child.pid or os.getsid(self.child.pid) != self.child.pid:
                 raise ValueError("monitor does not own its isolated process group")
@@ -237,22 +241,30 @@ class PhysicalOwner:
         monitor_read = monitor_write = None
         monitor = None
         records = OwnerRecords(self)
-        ended = acknowledged = failed = stopping = monitor_stopped = False
+        ended = acknowledged = failed = monitor_stopped = False
         cancelled = self.cancelled
-        pending_pause = None
+        stopping = pending_pause = None
+        stop_resolved = False
         previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
         for sig in previous:
             signal.signal(sig, lambda number, frame: cancelled.append(number))
 
         def request_stop(reason):
-            nonlocal stopping, pending_pause
-            if stopping:
+            nonlocal stopping, pending_pause, stop_resolved
+            if stopping is None:
+                stopping, pending_pause = reason, None
+            if stop_resolved:
                 return
-            stopping, pending_pause = True, None
-            if self.startup is not None:
-                self.control('stop', reason=reason)
-            elif self.foreground is not None:
-                self.foreground.terminate()
+            try:
+                if self.startup is not None:
+                    self.control('stop', reason=stopping)
+                    stop_resolved = True  # Accepted action or original physical end.
+                elif self.foreground is not None:
+                    self.foreground.terminate()
+                    stop_resolved = True
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                self.diagnostics.append(type(error).__name__)
+                # The intent remains pending; retry inside the same draining loop/budget.
 
         cleanup = None
         try:
@@ -284,9 +296,9 @@ class PhysicalOwner:
                         # A retained first sample (including OOM) is not retried.
                         if self.startup is not None or self.startup_error:
                             failed = True
-                if (cancelled or failed or monitor_rc is not None and not monitor_stopped
-                        or self.clock() >= self.work_deadline) and not stopping:
-                    reason = 'wall' if self.clock() >= self.work_deadline else 'cancellation'
+                if (stopping or cancelled or failed or monitor_rc is not None and not monitor_stopped
+                        or self.clock() >= self.work_deadline):
+                    reason = stopping or ('wall' if self.clock() >= self.work_deadline else 'cancellation')
                     request_stop(reason)
                 if (not stopping and pending_pause is not None and self.startup is not None
                         and foreground_rc is None and monitor_rc is None):

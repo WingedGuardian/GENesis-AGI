@@ -1870,6 +1870,13 @@ the shared banner is not an assertion about all concurrent sessions.
   observed scope or the actual unacknowledged child. Monitor interval waits
   wake on private EOF; manager-client cancellation and actual reaps remain
   owned, and an unavailable client wait keeps closure open.
+  First stop intent is distinct from resolved action: failed validated attempts
+  retry inside the same original budget while children and output drain.
+  Terminal child identity retains raw wait authority without allowing terminal
+  subjects into default live scope proof. The canonical launcher reuses captured
+  literal-argument compatibility with its exact executable/environment basis.
+  Synchronous manager observations and non-atomic name-based actions retain
+  their documented trusted-manager boundaries.
   Separate producer histories retain the first baseline and one strongest
   actual sample across delayed delivery. Unknown closure stays open; unregistered
   launches stay uncertain. A retained local-only kill leaves uncertainty even

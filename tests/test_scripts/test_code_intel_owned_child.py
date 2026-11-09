@@ -1,4 +1,5 @@
 """Actual toy children: raw wait ownership is cached, never inferred from Popen."""
+import os
 import runpy
 import signal
 import subprocess
@@ -83,8 +84,8 @@ def test_changed_birth_never_signals_a_matching_pid(toy, evidence, monkeypatch):
     calls = []
     monkeypatch.setattr(namespace['os'], 'kill', lambda *args: calls.append(args))
     process = owned.proof._process_state
-    def changed(*args):
-        pid, start, parent = process(*args)
+    def changed(*args, **kwargs):
+        pid, start, parent = process(*args, **kwargs)
         return pid, start + 1, parent
     monkeypatch.setattr(owned.proof, '_process_state', changed)
     with pytest.raises(ValueError):
@@ -96,3 +97,44 @@ def test_changed_birth_never_signals_a_matching_pid(toy, evidence, monkeypatch):
 def test_foreign_process_is_not_owned_even_with_a_popen_shaped_value(evidence):
     with pytest.raises((ValueError, TypeError)):
         wrap(SimpleNamespace(pid=__import__('os').getpid(), returncode=None), evidence)
+
+
+@pytest.mark.parametrize('when', ['before', 'between'])
+def test_waitable_terminal_birth_is_retained_until_actual_wait(toy, evidence, monkeypatch, when):
+    original = evidence['_process_state']
+    expected = original(Path('/proc') / str(toy.pid), toy.pid)
+    calls = []
+    if when == 'before':
+        toy.stdin.close()
+        assert os.waitid(os.P_PID, toy.pid, os.WEXITED | os.WNOWAIT).si_pid == toy.pid
+
+    def read(*args, **kwargs):
+        value = original(*args, **kwargs)
+        calls.append(value)
+        if when == 'between' and len(calls) == 1:
+            toy.stdin.close()
+            assert os.waitid(os.P_PID, toy.pid, os.WEXITED | os.WNOWAIT).si_pid == toy.pid
+        return value
+
+    monkeypatch.setitem(evidence, '_process_state', read)
+    assert toy.returncode is None, 'fixture must not reap or manufacture a Popen result'
+    owned = wrap(toy, evidence)
+    assert len(calls) == 2 and all(value == expected for value in calls)
+    assert owned.identity['pid'] == toy.pid and owned.identity['start_ticks'] == expected[1]
+    assert owned.status() == 0 and owned.status() == 0
+
+
+def test_exit_during_terminate_identity_is_raw_wait_not_a_signal(toy, evidence, monkeypatch):
+    owned = wrap(toy, evidence)
+    original, signals = owned.proof._process_state, []
+
+    def ended(*args, **kwargs):
+        if not toy.stdin.closed:
+            toy.stdin.close()
+        assert os.waitid(os.P_PID, toy.pid, os.WEXITED | os.WNOWAIT).si_pid == toy.pid
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owned.proof, '_process_state', ended)
+    monkeypatch.setattr(os, 'kill', lambda *args: signals.append(args))
+    assert owned.terminate() is False
+    assert owned.status() == 0 and signals == []

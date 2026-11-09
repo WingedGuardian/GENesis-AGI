@@ -948,6 +948,21 @@ latest desired pause state; the validated owner applies it before ACK. Every
 first stop cause uses the same transition: control the original observed scope,
 or cancel only the actual unacknowledged child when no scope is established.
 Buffered pause requests cannot revive stopping work or replace its first stop.
+The first stop reason is intent, separate from a resolved physical action.
+Failed validation or stop dispatch remains pending in the same child/output
+draining loop and retries within the original final deadline. Accepted stops
+are not resent when journal publication fails; the retained stop fact travels
+with closure. Original quiescence resolves the request without inventing a stop.
+An unreaped child's zombie identity can retain its original birth for a raw
+wait; default scope/reporter proof still requires a live subject. A terminal
+birth is not native completion, scope registration or cleanup proof.
+
+This canonical launcher reuses the captured literal-argument helper, probing
+the exact `/usr/bin/systemd-run` it will execute with the launch environment
+basis. It omits the expansion option only on the existing definite-refusal
+or absent-binary outcomes; unknown probe failures retain it. Older systemd
+scope arguments remain literal without accepting a PATH substitute for this
+canonical binary. The shared helper's ordinary default callers are unchanged.
 
 The owner performs original-scope control before blocking journal publication.
 Its monitor only requests actions; retirement closes the owner's sole private
@@ -970,6 +985,11 @@ bounded manager observations can still delay signal handling.
 Manager replies must be observed within their original operation deadline;
 physical closure proof must arrive within the established final cleanup budget.
 A late reply or proof cannot extend that budget or certify closure.
+Validation and subsequent name-based manager action are not an atomic
+compare-and-act on InvocationID. The user manager remains trusted: deliberate
+same-name replacement by an administrator between those operations is outside
+this guarantee. Observed invocation, object or original-subtree changes still
+refuse control. Reserved claim-derived names differ from standalone PID names.
 
 The standalone manual index entrypoint keeps its existing locking policy and
 does not consult the new queue hold. This endpoint does not establish global
