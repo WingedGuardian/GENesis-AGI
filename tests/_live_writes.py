@@ -78,11 +78,13 @@ _EVENTS = frozenset(
 
 class _State:
     installed = False
+    disarmed = ""  # why install() left the audit off; the summary says so
     real_home = ""
     allowed_roots: tuple[str, ...] = ()
     allowed_files: frozenset[str] = frozenset()
     classes: tuple[tuple[str, str], ...] = ()  # (root, label), most specific first
     credential_files: frozenset[str] = frozenset()
+    credential_inodes: frozenset[tuple[int, int]] = frozenset()
     hits: dict[tuple[str, str, str, str], None] = {}  # insertion-ordered set
 
 
@@ -167,6 +169,16 @@ def _sqlite_target(database) -> str | None:
     return _absolute(path)
 
 
+def _reopens_unchanged(flags, target: str) -> bool:
+    """An ``os.open`` that only creates (``O_CREAT`` without a write, truncate or
+    append flag) changes nothing when the target already exists."""
+    return (
+        isinstance(flags, int)
+        and not flags & (os.O_TRUNC | os.O_APPEND | os.O_WRONLY | os.O_RDWR)
+        and os.path.exists(target)
+    )
+
+
 def _judge(event: str, args: tuple) -> None:
     if event == "open":
         path, mode, flags = args[0], args[1], args[2]
@@ -180,22 +192,17 @@ def _judge(event: str, args: tuple) -> None:
             # against the cwd, but label it so a reader knows it is a guess.
             if writes:
                 guess = _absolute(name)
-                if guess and _label(guess) and not os.path.exists(guess):
+                if guess and _label(guess) and not _reopens_unchanged(flags, guess):
                     _record("relative os.open (dir_fd unknown; judged against cwd)", "write", guess)
             return
         target = _absolute(path)
         if target is None:
             return
         if not writes:
-            if target in _S.credential_files:
+            if target in _S.credential_files or _is_credential_file(target):
                 _record("credential file read", "read", target)
             return
-        if (
-            mode is None
-            and isinstance(flags, int)
-            and not flags & (os.O_TRUNC | os.O_APPEND | os.O_WRONLY | os.O_RDWR)
-            and os.path.exists(target)
-        ):
+        if mode is None and _reopens_unchanged(flags, target):
             return  # O_CREAT|O_RDONLY on an existing file: nothing changes
         label = _label(target)
         if label:
@@ -230,18 +237,36 @@ def _no_op(event: str, index: int, target: str) -> bool:
     the system call, so an attempt the kernel refuses (or that is a no-op, such
     as ``mkdir(exist_ok=True)`` or ``unlink(missing_ok=True)``) is not a write."""
     if event == "os.mkdir":
-        return os.path.isdir(target)
+        # Any existing name, directory or not (a file, a dangling symlink): EEXIST.
+        return os.path.lexists(target)
     if event in ("os.remove", "os.rmdir", "shutil.rmtree") or (
         event == "os.rename" and index == 0
     ):
         if not os.path.lexists(target):
             return True
-        if event == "os.rmdir" and os.path.isdir(target):
+        is_dir = os.path.isdir(target) and not os.path.islink(target)
+        if event in ("os.rmdir", "shutil.rmtree") and not is_dir:
+            return True  # ENOTDIR/OSError: neither removes a file or a symlink
+        if event == "os.remove" and is_dir:
+            return True  # EISDIR/EPERM: unlink never removes a directory
+        if event == "os.rmdir":
             try:
                 return bool(os.listdir(target))
             except OSError:
                 return True
     return False
+
+
+def _is_credential_file(name: str) -> bool:
+    """Whether ``name`` is one of the credential files under another name (a
+    symlink or hard link): one ``stat``, compared by device and inode."""
+    if not _S.credential_inodes:
+        return False
+    try:
+        st = os.stat(name)
+    except (OSError, ValueError):
+        return False
+    return (st.st_dev, st.st_ino) in _S.credential_inodes
 
 
 def _hook(event: str, args: tuple) -> None:
@@ -253,12 +278,15 @@ def _hook(event: str, args: tuple) -> None:
             mode is None and isinstance(flags, int) and not flags & _WRITE_FLAGS
         )
         # Cheapest exit first: an import or ordinary read is not a write, and
-        # only a credential file's name is worth resolving on a read.
+        # only a credential file is worth resolving on a read: by its name, or
+        # by device and inode when it is reached under another name.
         if reads:
             name = _fspath(args[0])
-            if not name or not name.endswith((
+            if not name:
+                return
+            if not name.endswith((
                 "secrets.env", ".credentials.json", "hosts.yml", "cc_oauth_token.env",
-            )):  # fmt: skip
+            )) and not _is_credential_file(name):  # fmt: skip
                 return
     _busy.on = True
     try:
@@ -273,9 +301,24 @@ def install(config) -> None:
     """Arm the write audit. Idempotent: an audit hook cannot be removed."""
     if _S.installed:
         return
-    from tests import _live_closure
+    from tests import _live_closure, _live_fence
 
-    home = os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
+    # The fence (installed first in the suite) owns the real home. Without it
+    # (a run that arms only this audit), resolve it the way the fence does: the
+    # passwd entry, else an absolute HOME (numeric-UID containers need not have
+    # an /etc/passwd entry). With no known home there is nothing to judge
+    # writes against, so the audit stays off rather than aborting the run, and
+    # the terminal summary says it was off (no hits is not the same as unwatched).
+    home = _live_fence._S.real_home
+    if not _live_fence._S.installed:
+        try:
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except KeyError:
+            home = os.environ.get("HOME")
+    if not home or not os.path.isabs(home):
+        _S.disarmed = "no real home known"
+        return
+    home = os.path.realpath(home)
     _S.real_home = home
     roots = {os.path.realpath(tempfile.gettempdir())}
     # basetemp, its per-process leaf, and the closure's test HOME when the closure
@@ -314,12 +357,22 @@ def install(config) -> None:
             ".genesis/cc_oauth_token.env",
         )
     )
+    inodes = set()
+    for path in _S.credential_files:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        inodes.add((st.st_dev, st.st_ino))
+    _S.credential_inodes = frozenset(inodes)
     sys.addaudithook(_hook)
     _S.installed = True
 
 
 def pytest_terminal_summary(terminalreporter):
     if not _S.installed:
+        if _S.disarmed:
+            terminalreporter.write_line(f"live writes: disarmed ({_S.disarmed})", yellow=True)
         return
     tr = terminalreporter
     if _S.hits:
@@ -334,6 +387,9 @@ def pytest_terminal_summary(terminalreporter):
     report = os.environ.get("GENESIS_LIVE_WRITES_REPORT")
     if report:
         try:
-            Path(report).write_text("".join("\t".join(key) + "\n" for key in _S.hits))
-        except OSError as exc:  # report-only: a bad report path never fails a run
+            # surrogateescape: a path os.fsdecode() could not decode is written back
+            # as its original bytes instead of failing the run.
+            text = "".join("\t".join(key) + "\n" for key in _S.hits)
+            Path(report).write_bytes(text.encode("utf-8", "surrogateescape"))
+        except (OSError, UnicodeError) as exc:  # report-only: never fails a run
             tr.write_line(f"live writes: could not write the report {report}: {exc}", yellow=True)
