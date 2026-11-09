@@ -1125,11 +1125,26 @@ def test_the_picker_accounts_for_every_non_closing_verdict():
     """The picker's vocabulary must not drift from VERDICTS: a new non-closing
     verdict either joins the candidate map or is excluded on purpose, never
     silently left unpicked."""
-    non_closing = set(verif_crud.VERDICTS) - set(verif_crud.PASS_VERDICTS)
+    # Passing measurements can remain OPEN while tracking is pending.
+    non_closing = set(verif_crud.VERDICTS)
     picked = {v for v in verif_crud._CANDIDATE_TIERS if v is not None}
     assert picked | verif_crud._NEVER_PICKED == non_closing
     assert not picked & verif_crud._NEVER_PICKED
     assert picked >= verif_crud._DELAYED_VERDICTS
+
+
+@pytest.mark.parametrize("verdict", verif_crud.PASS_VERDICTS)
+@pytest.mark.asyncio
+async def test_passing_measurement_pending_routing_is_visible_and_recoverable(db, verdict):
+    await _open(db, 299)
+    await verif_crud.record_attempt(
+        db, repo=REPO, pr_number=299, verdict=verdict, now=PICK_NOW,
+        note="TRACKING PENDING: findings/0 needs an issue", evidence='{"measurement":"retained"}',
+        tracking_pending=True,
+    )
+    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
+    assert [(r["pr_number"], r["tier"], r["verdict"]) for r in rows] == [(299, 0, verdict)]
+    assert (await verif_crud.list_open(db))[0]["status"] == "open"
 
 
 @pytest.mark.asyncio

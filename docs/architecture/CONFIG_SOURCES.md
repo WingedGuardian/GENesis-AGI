@@ -216,7 +216,8 @@ names, so an overlay of a read-only file is editable (#2446).
   `GENESIS_DB_PATH`, `GENESIS_HOME`, `VENV_PATH`, `CLAUDE_HOME`, `GENESIS_PLANS_DIR`,
   `GENESIS_OUTPUT_DIR`, `GENESIS_CC_PROJECT_ID`; tuning — `GENESIS_DB_BUSY_TIMEOUT_MS`
   (MCP children default it to 15000), read-pool sizes, `GENESIS_RECALL_RERANK_RPM`,
-  `GENESIS_SQLITE_SLOW_MS` (slow-statement log threshold, default 1000, `0` = off).
+  `GENESIS_SQLITE_SLOW_MS` (slow-statement log threshold, default 1000, `0` = off),
+  `GENESIS_SQLITE_TXN_HOLD_MS` (held-write-transaction log threshold, default 1000, `0` = off).
   All in `src/genesis/env.py`. They reach a process via the unit, `secrets.env`, or the parent.
   Outside `env.py`: `GENESIS_MCP_LOG_DIR`, the directory of `mcp_health.log` and
   `turnstile_debug.log` (default `~/tmp`), read when `genesis/mcp/health/browser.py` is

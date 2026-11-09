@@ -54,24 +54,14 @@ async def generate_deterministic(db: aiosqlite.Connection) -> str:
         f"Store: {memory_count} memories | {obs_count} observations"
     )
 
-    # System state: ego focus + active sessions
+    # System state: ego focus. Live sessions and what they are working on are
+    # NOT here: this file is written at a session's END and read at the next
+    # one's start, so they would describe an earlier moment. The in-flight
+    # block (memory/open_loops.py) computes them at session start.
     ego_focus = await _ego_focus(db)
-    active_sessions = await _active_session_count(db)
-    state_lines: list[str] = []
     if ego_focus:
-        state_lines.append(f"- Ego focus: {ego_focus}")
-    if active_sessions > 0:
-        state_lines.append(f"- Active sessions: {active_sessions}")
-    if state_lines:
         parts.append("\n### System State")
-        parts.extend(state_lines)
-
-    # Active work: most recent pivot per active session (last 4h)
-    active_work = await _active_session_pivots(db)
-    if active_work:
-        parts.append("\n### Active Work (now)")
-        for line in active_work:
-            parts.append(f"- {line}")
+        parts.append(f"- Ego focus: {ego_focus}")
 
     # Active context: recent session topics (last 7 days)
     sessions = await _recent_session_topics(db, days=7)
@@ -167,42 +157,6 @@ async def _count_observations(db: aiosqlite.Connection) -> int:
         return row[0] if row else 0
     except Exception:
         return 0
-
-
-async def _active_session_pivots(db: aiosqlite.Connection) -> list[str]:
-    """Get the most recent conversation pivot per session active in last 4h.
-
-    Provides a real-time "what's happening right now" snapshot without LLM.
-    Groups by session, takes most recent pivot per session, returns top 5.
-    """
-    try:
-        cursor = await db.execute(
-            "SELECT source, content, MAX(created_at) as latest "  # noqa: S608 - SAFE_ORIGIN_SQL is a module constant literal, no user input
-            "FROM observations "
-            "WHERE type = 'conversation_pivot' "
-            "AND created_at > datetime('now', '-4 hours') "
-            # WS-3: exclude external/unknown-origin rows from the L1 file
-            # (fail-closed; NULL excluded). Own-session pivots stamp `owner`.
-            f"AND {SAFE_ORIGIN_SQL} "
-            "GROUP BY source "
-            "ORDER BY latest DESC LIMIT 5"
-        )
-        rows = await cursor.fetchall()
-        results = []
-        for row in rows:
-            content = row[1] or ""
-            # Strip the "Conversation pivot: " prefix if present
-            if content.startswith("Conversation pivot:"):
-                content = content[len("Conversation pivot:"):].strip()
-            # Extract trigger text (more useful than the summary slug)
-            if "Trigger:" in content:
-                trigger = content.split("Trigger:", 1)[1].strip()
-                results.append(trigger[:120])
-            else:
-                results.append(content[:120])
-        return results
-    except Exception:
-        return []
 
 
 def _safe_origin_values() -> tuple[str, ...]:
@@ -478,18 +432,6 @@ async def _ego_focus(db: aiosqlite.Connection) -> str | None:
         return None
 
 
-async def _active_session_count(db: aiosqlite.Connection) -> int:
-    """Count currently active CC sessions."""
-    try:
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM cc_sessions WHERE status = 'active'"
-        )
-        row = await cursor.fetchone()
-        return row[0] if row else 0
-    except Exception:
-        return 0
-
-
 async def _wing_stats(db: aiosqlite.Connection) -> dict[str, int]:
     """Count memories per wing from memory_metadata (canonical wings only).
 
@@ -512,7 +454,6 @@ async def _wing_stats(db: aiosqlite.Connection) -> dict[str, int]:
         return {row[0]: row[1] for row in rows if row[0] in WINGS}
     except Exception:
         return {}
-
 
 
 async def _upcoming_events(

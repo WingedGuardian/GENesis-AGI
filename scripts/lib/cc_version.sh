@@ -85,6 +85,14 @@ CC_CONTAINER_SETTINGS_DEFAULTS=(
     "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH=${CC_MCP_DESCRIPTION_LIMIT}"
 )
 
+# Shared client policy, opt-in until setup/alignment callers pass this array.
+# Retention is a floor (or an explicitly selected exact override); attribution
+# remains set-if-absent. Both use the existing atomic settings writer.
+CC_CLIENT_SETTINGS_POLICY=(
+    "retention:cleanupPeriodDays=180"
+    'top:attribution={"commit":"","pr":"","sessionUrl":false}'
+)
+
 # The claude.ai sync opt-outs — `syncClaudeAiSkills` / `syncClaudeAiPlugins` =
 # false, top-level JSON booleans (CC 2.1.275+) — are NOT in the list above,
 # because turning one off is not free on an install that is already syncing. CC's
@@ -225,6 +233,10 @@ _cc_supp_persist_outcome() {
 # shellcheck disable=SC2120  # optional args by design (settings path + extra defaults)
 cc_ensure_updater_suppressed() {
     local _rc=0
+    local _check_only=0 _arg
+    for _arg in "$@"; do
+        [ "$_arg" != "--check-only" ] || _check_only=1
+    done
     # DID THIS RUN CREATE THE FILE, or merely modify one that was already there?
     #
     # `repaired` answers neither: it is set for ANY successful modification. A
@@ -245,17 +257,21 @@ cc_ensure_updater_suppressed() {
     # shellcheck disable=SC2034  # cross-file: update.sh folds this into HOST_CC_DEGRADED
     CC_SUPPRESSION_BREADCRUMB_LOST=0
     _cc_ensure_updater_suppressed_inner "$@" || _rc=$?
-    # A run that did not end in `repaired` wrote nothing, so it created nothing.
+    # Creation is independent of full-policy success: a Python-less host can
+    # create verified suppression-only settings but leave typed policy unverified.
+    # Host setup must still hand that newly created file back to its operator.
     # shellcheck disable=SC2034  # cross-file: host-setup.sh reads this, the linter
     # only sees this file (same blindness already noted for CC_SUPPRESSION_STATE)
-    [ "${CC_SUPPRESSION_STATE:-}" = "repaired" ] || CC_SUPPRESSION_CREATED=0
+    [ -n "${CC_SUPPRESSION_WRITTEN:-}" ] || CC_SUPPRESSION_CREATED=0
     # `|| true` is REQUIRED, not defensive: this now returns non-zero when the
     # breadcrumb cannot be written, and install.sh/bootstrap.sh/host-setup.sh all
     # run `set -euo pipefail`. A bare failing call here would abort the installer
     # over a REPORTING failure, after the suppression itself succeeded. The
     # failure is already surfaced by its own warning and by
     # CC_SUPPRESSION_BREADCRUMB_LOST; it must not also change control flow.
-    _cc_supp_persist_outcome || true
+    if [ "$_check_only" -eq 0 ]; then
+        _cc_supp_persist_outcome || true
+    fi
     return "$_rc"
 }
 
@@ -550,6 +566,15 @@ _cc_ensure_updater_suppressed_inner() {
     # credential-bearing file doubles the lost-update window for no benefit and
     # duplicates the write contract (mode/xattr carry-over, CAS, fsync).
     local -a extra_defaults=("$@")
+    # --check-only uses the same predicates without writing settings or outcome
+    # breadcrumbs. It is for readers that do not hold the settings write lock.
+    local _check_only=0 _typed_policy=0 _arg
+    for _arg in "${extra_defaults[@]}"; do
+        case "$_arg" in
+            --check-only) _check_only=1 ;;
+            top:*|retention:*) _typed_policy=1 ;;
+        esac
+    done
     # Outcome for callers that surface health (update.sh folds a non-ok value into
     # HOST_CC_DEGRADED -> update_history -> deploy health). `ok` | `defaults` |
     # `repaired` | `failed` | `contended` | `unverified`. `ok` and `defaults`
@@ -566,8 +591,8 @@ _cc_ensure_updater_suppressed_inner() {
     # not-ok. Fail closed by construction, not by review.
     CC_SUPPRESSION_STATE=unverified
     # The keys this call WROTE and verified by re-reading — set only in the
-    # python branch's success arm below, so a failed or partial write leaves it
-    # empty. Readers (the sync notice) announce from this, never from a guess.
+    # verified-write arms below. A partial suppression-only creation reports
+    # only its two verified keys, never the unapplied typed policy.
     CC_SUPPRESSION_WRITTEN=""
 
     # Create the directory BEFORE the python3 gate: install.sh used to do this
@@ -578,7 +603,8 @@ _cc_ensure_updater_suppressed_inner() {
     # the wrong cause entirely.
     local settings_dir
     settings_dir="$(dirname "$settings_file")"
-    if ! mkdir -p "$settings_dir" 2>/dev/null && [ ! -d "$settings_dir" ]; then
+    if [ "$_check_only" -eq 0 ] &&
+       ! mkdir -p "$settings_dir" 2>/dev/null && [ ! -d "$settings_dir" ]; then
         CC_SUPPRESSION_STATE=failed
         echo "  WARNING: cc_ensure_updater_suppressed: cannot create $settings_dir" \
              "(is \$HOME writable?) — CC auto-updater suppression not verified" >&2
@@ -586,6 +612,10 @@ _cc_ensure_updater_suppressed_inner() {
     fi
 
     if ! command -v python3 >/dev/null 2>&1; then
+        if [ "$_check_only" -eq 1 ]; then
+            echo "  WARNING: python3 unavailable — settings policy NOT verified read-only" >&2
+            return 1
+        fi
         # python3 is NOT guaranteed on every caller's machine. install.sh is a
         # Python installer so the container always has it, and cc_settings_align.sh
         # gets it from the unit's PATH — but host-setup.sh installs python3 with
@@ -716,6 +746,7 @@ _cc_ensure_updater_suppressed_inner() {
                 # merge foreign content.
                 umask "$_umask_prev"
                 CC_SUPPRESSION_STATE=repaired
+                CC_SUPPRESSION_WRITTEN="DISABLE_AUTOUPDATER DISABLE_UPDATES"
                 echo "  ! CC auto-updater suppression was MISSING in $settings_file —" \
                      "created it without python3 (both keys set, verified by re-read)" >&2
                 # This branch writes ONLY the two suppression keys. Any
@@ -726,6 +757,10 @@ _cc_ensure_updater_suppressed_inner() {
                     echo "    (no python3: the set-if-absent default(s)" \
                          "${extra_defaults[*]} were NOT applied — re-run once" \
                          "python3 is available)" >&2
+                fi
+                if [ "$_typed_policy" -eq 1 ]; then
+                    CC_SUPPRESSION_STATE=unverified
+                    return 1
                 fi
                 return 0
             fi
@@ -742,6 +777,7 @@ _cc_ensure_updater_suppressed_inner() {
             return 1
         fi
         CC_SUPPRESSION_STATE=failed
+        [ "$_typed_policy" -eq 0 ] || CC_SUPPRESSION_STATE=unverified
         echo "  WARNING: cc_ensure_updater_suppressed: python3 not found and $settings_file" \
              "already exists — cannot merge safely, left untouched. Add" \
              "DISABLE_AUTOUPDATER=1 and DISABLE_UPDATES=1 by hand, or CC may" \
@@ -815,7 +851,23 @@ REQUIRED = {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}
 # suppression.
 DEFAULTS = {}
 TOP_DEFAULTS = {}
+CHECK_ONLY = "--check-only" in sys.argv[2:]
+RETENTION = None
+RETENTION_EXACT = False
 for _arg in sys.argv[2:]:
+    if _arg == "retention:cleanupPeriodDays=180":
+        RETENTION = 180
+        _override = os.environ.get("GENESIS_CC_RETENTION_DAYS")
+        if _override is not None:
+            try:
+                if not _override.isascii() or not _override.isdecimal() or int(_override) <= 0:
+                    raise ValueError
+                RETENTION = int(_override)
+                RETENTION_EXACT = True
+            except ValueError:
+                print("GENESIS_CC_RETENTION_DAYS is not a positive integer — "
+                      "using the 180-day floor", file=sys.stderr)
+        continue
     if _arg.startswith("top:"):
         _k, _sep, _raw = _arg[len("top:"):].partition("=")
         _shown = _arg if len(_arg) <= 120 else _arg[:120] + "…"
@@ -846,6 +898,14 @@ for _arg in sys.argv[2:]:
         if _k:
             DEFAULTS[_k] = _v
 ATTEMPTS = 3
+
+
+def retention_ok(settings):
+    if RETENTION is None:
+        return True
+    value = settings.get("cleanupPeriodDays")
+    return (type(value) is int and value > 0
+            and (value == RETENTION if RETENTION_EXACT else value >= RETENTION))
 
 
 def fail(reason):
@@ -923,8 +983,12 @@ for _attempt in range(ATTEMPTS):
     # `not in`, never a falsy test: an operator's explicit `false`/`null` IS a
     # value, and set-if-absent must not treat it as absence.
     missing_top = [k for k in TOP_DEFAULTS if k not in data]
-    if not repaired and not missing_defaults and not missing_top:
+    retention_repair = [] if retention_ok(data) else ["cleanupPeriodDays"]
+    if not repaired and not missing_defaults and not missing_top and not retention_repair:
         sys.exit(0)          # already correct — no write, nothing to report
+    if CHECK_ONLY:
+        print("requested settings policy is not satisfied (read-only)", file=sys.stderr)
+        sys.exit(5)
 
     for k in repaired:
         env[k] = REQUIRED[k]
@@ -932,6 +996,8 @@ for _attempt in range(ATTEMPTS):
         env[k] = DEFAULTS[k]
     for k in missing_top:
         data[k] = TOP_DEFAULTS[k]
+    if retention_repair:
+        data["cleanupPeriodDays"] = RETENTION
 
     # The RESOLVED target's directory may not exist: a dangling symlink into a
     # dotfiles tree (settings.json -> ../dotfiles/claude/settings.json) resolves
@@ -1069,8 +1135,14 @@ for _attempt in range(ATTEMPTS):
     try:
         with open(path, encoding="utf-8") as f:
             final = json.load(f)
-        final_env = final.get("env") or {}
+        if not isinstance(final, dict) or not isinstance(final.get("env"), dict):
+            raise ValueError("settings shape changed during write")
+        final_env = final["env"]
         still = [k for k, v in REQUIRED.items() if final_env.get(k) != v]
+        # The entire enforced policy, including a previously valid higher value,
+        # must survive a write made for some other setting.
+        if not retention_ok(final):
+            still.append("cleanupPeriodDays")
         # Defaults this run WROTE are part of the write being verified — a
         # clobber that ate the default but spared the suppression keys would
         # otherwise pass, and the caller would print "applied" for a key that
@@ -1102,13 +1174,18 @@ for _attempt in range(ATTEMPTS):
     # suppression repairs made a defaults-only write produce rc 0 with EMPTY
     # stdout — byte-identical to "file already correct, nothing written" — so
     # the caller reported `ok` (untouched) for a run that modified the file.
-    print(" ".join(sorted(repaired + missing_defaults + missing_top)))
+    print(" ".join(sorted(set(repaired + missing_defaults + missing_top + retention_repair))))
     sys.exit(0)
 
 _exhausted("settings.json kept changing under us (%d attempts) — left untouched rather "
      "than revert a concurrent writer" % ATTEMPTS)
 PYEOF
     )" || rc=$?
+
+    if [ "$rc" -eq 5 ]; then
+        CC_SUPPRESSION_STATE=unverified
+        return 1
+    fi
 
     if [ "$rc" -eq 3 ] || [ "$rc" -eq 4 ]; then
         # Both are contention, and both leave the effective state unsuppressed, so
@@ -1161,9 +1238,9 @@ PYEOF
         # The two EXACT names, space-delimited — a glob on `DISABLE_` would also
         # fire for any default whose name merely contains it.
         case " $out " in
-            *" DISABLE_AUTOUPDATER "*|*" DISABLE_UPDATES "*)
+            *" DISABLE_AUTOUPDATER "*|*" DISABLE_UPDATES "*|*" cleanupPeriodDays "*)
                 CC_SUPPRESSION_STATE=repaired
-                echo "  ! CC auto-updater suppression was MISSING in $settings_file — restored: $out" >&2
+                echo "  ! CC settings policy was MISSING or incorrect in $settings_file — restored: $out" >&2
                 ;;
             *)
                 CC_SUPPRESSION_STATE=defaults

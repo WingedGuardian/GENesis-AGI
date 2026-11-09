@@ -186,6 +186,8 @@ async def test_detail_route_offloads_slot_enumeration(app, db, monkeypatch):
     )
     enum = MagicMock(return_value=[])
     monkeypatch.setattr(cc_slots_mod, "enumerate_cc_slots", enum)
+    head = MagicMock(return_value="a" * 40)
+    monkeypatch.setattr(mod, "read_runtime_head", head)
 
     dispatched = []
     real_to_thread = mod.asyncio.to_thread
@@ -205,6 +207,8 @@ async def test_detail_route_offloads_slot_enumeration(app, db, monkeypatch):
 
     assert enum in dispatched  # enumeration dispatched through to_thread
     enum.assert_called_once()
+    assert head in dispatched
+    head.assert_called_once()
 
 
 # ── Helper level (real db fixture, injected slots) ───────────────────────────
@@ -225,6 +229,8 @@ async def test_slot_merge_by_pid(db, monkeypatch):
         "started_at": None,
         "stale_code": False,
         "deploy_commit": None,
+        "recorded_revision": "unknown",
+        "checkout_commit": None,
     }
     assert row["flags"] == []
     assert [s["pid"] for s in result["unmatched_slots"]] == [200]
@@ -778,3 +784,44 @@ async def test_unmatched_slot_carries_identity_staleness(db, monkeypatch):
     assert unmatched[0]["stale_code"] is True
     assert unmatched[0]["deploy_commit"] == _DEPLOY[1]
     assert result["stats"]["stale_code"] == 1
+
+
+@pytest.mark.parametrize("matched", [False, True])
+@pytest.mark.parametrize(
+    "launch,current,relation",
+    [
+        ("a" * 40, "a" * 40, "same_recorded_revision"),
+        ("a" * 40, "b" * 40, "different_recorded_revision"),
+        ("b" * 40, "a" * 40, "different_recorded_revision"),
+        (None, "a" * 40, "unknown"),
+        ("a" * 40, None, "unknown"),
+    ],
+)
+async def test_recorded_revision_does_not_require_deploy_history(
+    db, monkeypatch, matched, launch, current, relation
+):
+    await _seed_charter_tables(db)
+    if matched:
+        await _seed_session(db, sid="s1", pid=100)
+    _patch_spawn(monkeypatch, {("1", 100): (launch, _NOW.isoformat())} if launch else {})
+    result = await _collect_detail(
+        db, [_slot("1", 100)], now=_NOW, deploy=None, checkout_commit=current
+    )
+    live = result["sessions"][0]["live"] if matched else result["unmatched_slots"][0]
+    assert live["recorded_revision"] == relation
+    assert live["checkout_commit"] == current
+    assert live["stale_code"] is False
+    assert live["deploy_commit"] is None
+
+
+async def test_unmatched_recorded_revision_validates_process_start(db, monkeypatch):
+    import genesis.dashboard.routes.cc_sessions as mod
+
+    await _seed_charter_tables(db)
+    slot = _slot("1", 100)
+    slot["started_at"] = _NOW.isoformat()
+    reader = MagicMock(return_value=None)  # production reader refused recycled PID
+    monkeypatch.setattr(mod, "read_spawn_identity", reader)
+    result = await _collect_detail(db, [slot], now=_NOW, checkout_commit="a" * 40)
+    reader.assert_called_once_with("1", 100, _NOW.isoformat())
+    assert result["unmatched_slots"][0]["recorded_revision"] == "unknown"

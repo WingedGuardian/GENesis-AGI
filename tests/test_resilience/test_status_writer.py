@@ -100,6 +100,44 @@ class TestStatusFileWriter:
         assert "normal" in data["human_summary"].lower()
         assert "failing_jobs" not in data
 
+    async def test_writes_surplus_success_pulse(self, sm, tmp_path):
+        """#4072: the in-memory surplus_dispatch last_success reaches status.json,
+        so the standalone health MCP (no runtime of its own) can judge liveness."""
+        from unittest.mock import MagicMock
+
+        rt = MagicMock()
+        rt.job_health = {
+            "surplus_dispatch": {
+                "last_run": "2026-01-01T00:05:00+00:00",
+                "last_success": "2026-01-01T00:00:00+00:00",
+                "consecutive_failures": 1,
+            },
+        }
+        path = tmp_path / "status.json"
+        writer = StatusFileWriter(state_machine=sm, runtime=rt, path=str(path))
+        await writer.write()
+        data = json.loads(path.read_text())
+        # last_success, NOT last_run: a failed dispatch also sets last_run.
+        assert data["liveness_pulses"] == {"surplus_dispatch": "2026-01-01T00:00:00+00:00"}
+        # The watchdog's key is untouched.
+        assert data["scheduler_heartbeats"]["surplus"] == "2026-01-01T00:05:00+00:00"
+
+    async def test_failure_only_surplus_entry_writes_no_pulse(self, sm, tmp_path):
+        from unittest.mock import MagicMock
+
+        rt = MagicMock()
+        rt.job_health = {
+            "surplus_dispatch": {
+                "last_run": "2026-01-01T00:05:00+00:00",
+                "consecutive_failures": 3,
+            },
+        }
+        path = tmp_path / "status.json"
+        writer = StatusFileWriter(state_machine=sm, runtime=rt, path=str(path))
+        await writer.write()
+        data = json.loads(path.read_text())
+        assert "liveness_pulses" not in data
+
     async def test_no_runtime_is_safe(self, sm, tmp_path):
         """StatusFileWriter works without runtime (backward compat)."""
         path = tmp_path / "status.json"

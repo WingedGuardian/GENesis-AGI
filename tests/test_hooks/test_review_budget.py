@@ -818,22 +818,149 @@ def test_an_unimportable_reviewer_list_makes_the_budget_unknown(monkeypatch):
     assert got["status"] == "unknown" and "review_findings_unimportable" in got["errors"]
 
 
-def test_graphql_comment_landing_between_reads_is_unknown(monkeypatch):
+@pytest.mark.parametrize("author", [
+    {"login": "someone", "__typename": "User"},
+    {"login": "coderabbitai", "__typename": "Bot"},
+    {"login": "github-actions", "__typename": "Bot"},
+    None,
+])
+@pytest.mark.parametrize("remove", [False, True])
+def test_graphql_comment_landing_between_reads_is_unknown(monkeypatch, author, remove):
     """The re-read covers issue comments as well as reviews: a clean-review or
     confirmation comment is budget evidence too."""
     _no_seams(monkeypatch)
-    late = {"body": "late", "author": {"login": "someone", "__typename": "User"}}
+    late = {
+        "body": rb.confirmation_marker(H5),
+        "author": author,
+    }
     base = _graphql_server(files=_FILES, commits=_COMMITS)
     grown = _graphql_server(comments=[late], files=_FILES, commits=_COMMITS)
+    stable = rb.evaluate_pr("owner/repo", 7, runner=grown, external_identity_templates=())
+    assert stable["status"] == "ok" and stable["confirmation_requested"] is True
+    before, after = (grown, base) if remove else (base, grown)
     calls = []
 
     def serve(argv, *, timeout):
         calls.append(argv)
-        return (base if len(calls) == 1 else grown)(argv, timeout=timeout)
+        return (before if len(calls) == 1 else after)(argv, timeout=timeout)
 
     got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
     assert got["status"] == "unknown", got
     assert "evidence_changed_during_evaluation" in got["errors"], got
+
+
+@pytest.mark.parametrize("login,kind", [
+    ("someone", "User"), ("coderabbitai", "Bot"), ("github-actions", "Bot"),
+])
+@pytest.mark.parametrize("change", ["add", "edit", "delete"])
+def test_graphql_irrelevant_comment_change_preserves_full_policy_result(monkeypatch, login, kind, change):
+    """Comment churn that changes no policy fact must not manufacture an ask."""
+    _no_seams(monkeypatch)
+    old = {"body": "Generic progress note.", "author": {"login": login, "__typename": kind}}
+    new = {**old, "body": "Updated generic progress note."}
+    before_comments, after_comments = {
+        "add": ([], [new]), "edit": ([old], [new]), "delete": ([old], []),
+    }[change]
+    before = _graphql_server(comments=before_comments, files=_FILES, commits=_COMMITS)
+    after = _graphql_server(comments=after_comments, files=_FILES, commits=_COMMITS)
+    calls = []
+
+    def moving(argv, *, timeout):
+        calls.append(argv)
+        return (before if len(calls) == 1 else after)(argv, timeout=timeout)
+
+    expected = rb.evaluate_pr("owner/repo", 7, runner=after, external_identity_templates=())
+    assert expected["status"] == "ok" and expected["approval_required"] is False
+    got = rb.evaluate_pr("owner/repo", 7, runner=moving, external_identity_templates=())
+    assert got == expected
+    assert len(calls) == 2, "semantic comparison must not add network retries"
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_neutral_churn_preserves_both_budget_and_body_race(monkeypatch, terminal):
+    _no_seams(monkeypatch)
+    reviews = [_gql_review(h) for h in (H1, H2, H3, H4)] if terminal else []
+    first = _graphql_server(files=_FILES, commits=_COMMITS, reviews=reviews, body="before")
+    second = _graphql_server(
+        files=_FILES, commits=_COMMITS, reviews=reviews, body="after",
+        comments=[{"body": "Progress", "author": {"login": "owner", "__typename": "User"}}],
+    )
+    calls = []
+
+    def moving(argv, *, timeout):
+        calls.append(argv)
+        return (first if len(calls) == 1 else second)(argv, timeout=timeout)
+
+    got = rb.evaluate_pr("owner/repo", 7, runner=moving, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert got["approval_required"] is terminal
+    assert got["commit_approval_required"] is terminal
+    assert got["body_changed"] is True and got["body"] is None
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("change", [
+    "add", "delete", "edit_time", "edit_author", "identity", "finding", "finding_key",
+])
+def test_comment_policy_facts_change_even_when_approval_does_not(monkeypatch, change):
+    _no_seams(monkeypatch)
+    clean = {
+        "fullDatabaseId": "9",
+        "body": f"Codex Review: Didn't find any major issues.\nReviewed commit: `{H5[:10]}`",
+        "createdAt": "2026-10-05T01:00:00Z",
+        "updatedAt": "2026-10-05T01:00:00Z",
+        "author": {"login": "chatgpt-codex-connector", "__typename": "Bot"},
+    }
+    finding = {
+        **clean,
+        "body": f"![P2 Badge] Finding https://github.com/owner/repo/blob/{H5}/src/x.py#L1",
+    }
+    before, after = {
+        "add": ([], [clean]),
+        "delete": ([clean], []),
+        "edit_time": ([clean], [{**clean, "updatedAt": "2026-10-05T02:00:00Z"}]),
+        "edit_author": ([clean], [{**clean, "author": {"login": "owner", "__typename": "User"}}]),
+        "identity": ([], [{**clean, "body": f"external report head={H5}", "author": None}]),
+        "finding": ([], [finding]),
+        "finding_key": ([finding], [{**finding, "fullDatabaseId": "10", "body": finding["body"] + "\n"}]),
+    }[change]
+    options = {"external_identity_templates": ("external report head={head}",)}
+    servers = [_graphql_server(files=_FILES, commits=_COMMITS, comments=c) for c in (before, after)]
+    stable = [rb.evaluate_pr("owner/repo", 7, runner=s, **options) for s in servers]
+    assert all(r["status"] == "ok" and r["approval_required"] is False for r in stable)
+    assert stable[0] != stable[1], "fixture must change a fact beyond the approval boolean"
+    calls = []
+
+    def moving(argv, *, timeout):
+        calls.append(argv)
+        return servers[min(len(calls) - 1, 1)](argv, timeout=timeout)
+
+    got = rb.evaluate_pr("owner/repo", 7, runner=moving, **options)
+    assert got["status"] == "unknown", got
+    assert "evidence_changed_during_evaluation" in got["errors"]
+    assert len(calls) == 2
+
+
+def test_changed_comments_with_equal_unknown_results_are_never_accepted(monkeypatch):
+    _no_seams(monkeypatch)
+    # Both timestamps are malformed in the same way: equality of unknown
+    # projections is not permission to accept either snapshot.
+    comments = [
+        {"body": body, "createdAt": "invalid", "author": None}
+        for body in ("before", "after")
+    ]
+    servers = [_graphql_server(files=_FILES, commits=_COMMITS, comments=[c]) for c in comments]
+    stable = [rb.evaluate_pr("owner/repo", 7, runner=s, external_identity_templates=()) for s in servers]
+    assert stable[0] == stable[1] and stable[0]["status"] == "unknown"
+    calls = []
+
+    def moving(argv, *, timeout):
+        calls.append(argv)
+        return servers[min(len(calls) - 1, 1)](argv, timeout=timeout)
+
+    got = rb.evaluate_pr("owner/repo", 7, runner=moving, external_identity_templates=())
+    assert got["status"] == "unknown", got
+    assert "evidence_changed_during_evaluation" in got["errors"]
 
 
 def test_a_copied_file_on_a_later_page_still_triggers_the_rest_fallback(monkeypatch):
