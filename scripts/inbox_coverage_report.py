@@ -89,9 +89,7 @@ def _row_item_urls(
     from genesis.inbox.scanner import strip_tracking_params
     from genesis.inbox.url_coverage import _coverage_url_occurrences
 
-    if not isinstance(batch_items, str) or not batch_items.startswith(
-        BATCH_ITEMS_V2_PREFIX
-    ):
+    if not isinstance(batch_items, str) or not batch_items.startswith(BATCH_ITEMS_V2_PREFIX):
         return None
     try:
         items = json.loads(batch_items.removeprefix(BATCH_ITEMS_V2_PREFIX))
@@ -127,9 +125,7 @@ def _entry(url: str, cls: str, response="", covered="", reason="") -> dict:
 def _attributed(rows: list[RowInput], url: str, statuses: tuple[str, ...]) -> list[RowInput]:
     """Rows in *statuses* whose decoded item URLs contain *url*."""
     return [
-        r
-        for r in rows
-        if r.status in statuses and r.item_urls is not None and url in r.item_urls
+        r for r in rows if r.status in statuses and r.item_urls is not None and url in r.item_urls
     ]
 
 
@@ -170,9 +166,7 @@ def _classify_url(
 
     failed = _attributed(rows, url, ("failed",))
     if failed:
-        return _entry(
-            url, "failed", reason=(_newest(failed).error_message or "").split(":", 1)[0]
-        )
+        return _entry(url, "failed", reason=(_newest(failed).error_message or "").split(":", 1)[0])
 
     if has_legacy_completed:
         return _entry(url, "unattributable")
@@ -191,12 +185,9 @@ def build_report(
             report.no_url_notes.append(note.rel)
             continue
         rows = rows_by_file.get(note.path, [])
-        has_legacy_completed = any(
-            r.status == "completed" and r.item_urls is None for r in rows
-        )
+        has_legacy_completed = any(r.status == "completed" and r.item_urls is None for r in rows)
         entries = [
-            _classify_url(url, rows, has_legacy_completed, read_response)
-            for url in note.urls
+            _classify_url(url, rows, has_legacy_completed, read_response) for url in note.urls
         ]
         counts = {cls: 0 for cls in CLASSES}
         for entry in entries:
@@ -278,33 +269,82 @@ def _note_urls(text: str) -> list[str]:
     return urls
 
 
-def _scan_notes(inbox: Path, file_name: str | None) -> list[NoteInput]:
+def _note_paths(inbox: Path) -> list[Path]:
+    """Eligible note paths, without reading unselected note bodies."""
     from genesis.inbox.scanner import RESPONSE_SUFFIX
 
+    def on_error(error: OSError) -> None:
+        raise error
+
+    paths: list[Path] = []
+    # rglob silently suppresses directory errors, hiding protected identities.
+    # Do not follow directory symlinks; hidden subtrees are outside eligibility.
+    for directory, subdirs, names in os.walk(inbox, onerror=on_error):
+        subdirs[:] = [name for name in subdirs if not name.startswith(".")]
+        for name in names:
+            path = Path(directory) / name
+            if not path.is_file() or not name.endswith(".md"):
+                continue
+            if name.endswith(RESPONSE_SUFFIX) or ".sync-conflict-" in name:
+                continue
+            if any(part.startswith(".") for part in path.relative_to(inbox).parts):
+                continue
+            paths.append(path)
+    return sorted(paths)
+
+
+def _scan_notes(inbox: Path, file_name: str | None) -> list[NoteInput]:
     notes: list[NoteInput] = []
-    for path in sorted(inbox.rglob("*")):
-        if not path.is_file() or not path.name.endswith(".md"):
-            continue
-        if path.name.endswith(RESPONSE_SUFFIX):
-            continue
-        # Sync-conflict and temp files are artifacts, never notes.
-        if ".sync-conflict-" in path.name or path.name.endswith(".tmp"):
-            continue
-        rel = path.relative_to(inbox)
+    for path in _note_paths(inbox):
         if file_name is not None and path.name != file_name:
-            continue
-        if any(part.startswith(".") for part in rel.parts):
             continue
         # The monitor's read_content decodes with errors="replace"; a note
         # carrying non-UTF-8 bytes must not abort the whole report.
         notes.append(
             NoteInput(
                 str(path),
-                str(rel),
+                str(path.relative_to(inbox)),
                 _note_urls(path.read_text(encoding="utf-8", errors="replace")),
             )
         )
     return notes
+
+
+def _file_identity(path: Path) -> tuple[int, int] | None:
+    """Follow links; only expected absence means there is no identity."""
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return None
+    return info.st_dev, info.st_ino
+
+
+def _output_is_safe(out: Path, inbox: Path, protected: list[Path]) -> bool:
+    """One guard, used before DB access and again once responses are known."""
+    from genesis.inbox.scanner import RESPONSE_SUFFIX
+
+    try:
+        out_resolved = out.resolve()
+        protected_targets = {path.resolve() for path in protected}
+        protected_ids = {_file_identity(path) for path in protected} - {None}
+        refused = (
+            out.absolute().is_relative_to(inbox)
+            or out_resolved.is_relative_to(inbox.resolve())
+            or out_resolved in protected_targets
+            or _file_identity(out) in protected_ids
+            or (out_resolved.name.endswith(RESPONSE_SUFFIX) and out_resolved.exists())
+        )
+    except (OSError, RuntimeError) as exc:
+        print(f"cannot establish report output safety: {exc}", file=sys.stderr)
+        return False
+    if refused:
+        print(
+            f"refusing to write the report over inbox/response file: {out}",
+            file=sys.stderr,
+        )
+        return False
+
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -315,9 +355,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--file", default=None)
     args = parser.parse_args(argv)
 
-    inbox = args.inbox or Path(
-        os.environ.get("GENESIS_INBOX_PATH", str(Path.home() / "inbox"))
-    )
+    inbox = args.inbox or Path(os.environ.get("GENESIS_INBOX_PATH", str(Path.home() / "inbox")))
     if not inbox.is_dir():
         print(f"inbox directory not found: {inbox}", file=sys.stderr)
         return 2
@@ -331,10 +369,34 @@ def main(argv: list[str] | None = None) -> int:
     # (`/x/link/../inbox` != `/x/../inbox` when link is a symlink), and
     # resolve() rewrites the spelling entirely — either misses the rows.
     inbox = inbox.absolute()
-    notes = _scan_notes(inbox, args.file)
+    generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+    default_name = f"inbox-coverage-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}.md"
+    out = args.out or (Path.home() / ".genesis" / "output" / default_name)
+    if out.is_dir():
+        out = out / default_name
+
+    database = args.db.resolve()
+    database_targets = [
+        database,
+        *(database.with_name(database.name + suffix) for suffix in ("-wal", "-shm", "-journal")),
+    ]
+    if not _output_is_safe(out, inbox, database_targets):
+        return 2
+
+    try:
+        notes = _scan_notes(inbox, args.file)
+    except (OSError, RuntimeError) as exc:
+        print(f"cannot establish inbox inventory: {exc}", file=sys.stderr)
+        return 2
 
     rows_by_file: dict[str, list[RowInput]] = {}
     with closing(connect_readonly(args.db)) as conn:
+        response_targets = [
+            Path(row[0])
+            for row in conn.execute(
+                "SELECT DISTINCT response_path FROM inbox_items WHERE response_path IS NOT NULL"
+            )
+        ]
         for note in notes:
             rows_by_file[note.path] = [
                 RowInput(
@@ -354,14 +416,6 @@ def main(argv: list[str] | None = None) -> int:
                 for decoded in [_row_item_urls(r[5])]
             ]
 
-    generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
-    out = args.out or (
-        Path.home()
-        / ".genesis"
-        / "output"
-        / f"inbox-coverage-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}.md"
-    )
-
     def _read_response(path: str) -> str | None:
         try:
             return Path(path).read_text(encoding="utf-8", errors="replace")
@@ -370,30 +424,12 @@ def main(argv: list[str] | None = None) -> int:
 
     report = build_report(notes, rows_by_file, _read_response)
 
-    # The output is the report's ONLY write, so it must never land on the
-    # read-only corpus: an inbox note or a *.genesis.md response named by
-    # --out would be truncated. Resolve first so symlinks cannot smuggle a
-    # target inside the inbox.
-    out_resolved = out.resolve()
-    from genesis.inbox.scanner import RESPONSE_SUFFIX
-
-    # A note may itself be a symlink to an external file; --out naming that
-    # target would still truncate what the report just read.
-    note_targets = {Path(note.path).resolve() for note in notes}
-    if (
-        # Unresolved: an --out spelled inside the inbox (including a symlink
-        # sitting in the inbox whose target lies outside it) is refused.
-        out.absolute().is_relative_to(inbox)
-        # Resolved: an --out spelled outside that resolves inside the inbox.
-        or out_resolved.is_relative_to(inbox.resolve())
-        or out_resolved in note_targets
-        or out_resolved == args.db.resolve()
-        or (out_resolved.name.endswith(RESPONSE_SUFFIX) and out_resolved.exists())
-    ):
-        print(
-            f"refusing to write the report over inbox/response file: {out}",
-            file=sys.stderr,
-        )
+    try:
+        protected = [*database_targets, *_note_paths(inbox), *response_targets]
+    except (OSError, RuntimeError) as exc:
+        print(f"cannot establish inbox inventory: {exc}", file=sys.stderr)
+        return 2
+    if not _output_is_safe(out, inbox, protected):
         return 2
 
     out.parent.mkdir(parents=True, exist_ok=True)

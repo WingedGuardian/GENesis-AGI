@@ -1474,6 +1474,9 @@ verified: a6528dab2 2026-11-09
   and matching backtick runs. Literal terminal punctuation and repeated tokens in different
   contexts retain their own identities. The read-only coverage report retains
   these occurrences too; it does not reconstruct coverage from normalized URLs.
+  Its output guard protects eligible notes, retained response targets and the
+  database and its SQLite companions by resolved path and existing file identity, independently of report
+  selection; an existing output directory receives a generated report filename.
   An ordered proof finds the first source-frame closure; ambiguous tokens stay
   raw and cannot supply wrapper context for later URLs.
   The wrapper correction is scoped to this URL path; the entry's existing
