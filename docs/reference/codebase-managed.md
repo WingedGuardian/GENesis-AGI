@@ -532,9 +532,15 @@ re-resolved against the live filesystem, so a queued repository that later moves
 (or gains a symlink) cannot stop the list. A request spooled while the queue was
 busy is still resolved when it is imported.
 
-The consumer checks actual child status, framing and every listed row before
+The consumer checks transport status, framing and every listed row before
 claiming anything. It dispatches only the claimed provider, using that claim's
 mode and opaque context, and rechecks Codebase disablement after claiming.
+It uses `claim-native`; disabled-after-claim and escalation-observation refusals
+reconcile only structurally unstarted typed claims. The captured original owner
+returns six NUL-terminated fields: `1,native-outcome,hash,provider,context,state`,
+where state is `consumed`, `pending` or `failed` after journal application. Every
+field and the original context must match. Missing/failed transport stops the
+tick without scalar settlement; an exit code never consumes or charges work.
 GitNexus full requests do not change Codebase full-index clocks. A malformed
 or failed queue observation stops the tick with 76. The headerless list trusts
 the same-install producer to include the complete population; it cannot detect
@@ -890,11 +896,16 @@ and entry helpers use the held source buffers. Captured Bash ignores inherited
 startup files, shell functions and shell options. The runner-to-entry handoff
 preserves only its canonical runner-lock descriptor; missing, foreign or
 competing lock identity refuses. Scope/watchdog definitions are included in the
-source closure. Physical queued supervision and positive automatic readiness
-remain separate integration work; this startup path preserves the readiness
+source closure. Typed queue dispatch uses the original owner before that owner
+takes the repository lock. Positive automatic readiness remains separate work;
+this startup path preserves the readiness
 fence and does not activate either provider.
 
 Existing units that invoke `scripts/code_intel_runner.sh` remain supported.
+If readiness later permits consumption, that shell restarts through captured
+startup before reconciliation or claiming, releasing its raw runner lock so
+the captured child acquires the canonical lock itself. Incomplete readiness
+still defers before that handoff.
 An authorized full update through `scripts/update.sh` rerenders the unit with
 the new source entry and explicit runner role. A code-only deployment does not
 install those new unit arguments.
@@ -915,10 +926,10 @@ callers retain their existing environment behavior. The optional private runtime
 capsule transports closed top-level objects but supplies no launch or recovery
 authority: source-only queue/shell/availability roles refuse runtime-bearing
 capsules, and diagnostics never print their values. The private owner/monitor
-endpoint below remains separate from unfinished timer/provider integration and
-supervised recovery.
+endpoint below supplies typed provider dispatch; supervised recovery remains
+separate.
 
-The private CBM reporter role now checks the complete runtime source, provider
+The private reporter role checks the complete runtime source, provider
 pin, effective policy and environment recipe. It consumes a bounded atomic
 startup ACK before entering the worker, then brackets its own identity, its live
 original parent, manager invocation and original kernel facts. Registration
@@ -932,7 +943,7 @@ The shared policy identity includes watchdog, CPU and I/O settings; a partial
 full-policy value cannot silently become the earlier five-field recipe. These
 reporter checks do not enable automatic readiness or qualify native containment.
 
-The captured runner now exposes a private initial-owner endpoint for CBM. It
+The captured runner exposes a private initial-owner endpoint for both providers. It
 validates the inherited canonical runner lock, takes the existing repository
 flock itself, and commits its actual process identity before creating workload
 children. Only the first acknowledged reservation releases its sealed runtime.
@@ -1026,9 +1037,34 @@ This endpoint is exercised through the actual queued factory and accepted
 harmless executable descriptor with real locks, processes, pipes and scratch
 SQL, including successful and failed native completion. The fixture substitutes
 its manager, kernel, resource-admission input and provider. It does not
-qualify native containment. Ordinary timer dispatch, the GitNexus adapter and
-positive supervised recovery remain separate; automatic readiness stays fenced.
+qualify native containment. Typed timer dispatch and the GitNexus adapter use
+this owner; positive supervised recovery remains separate, and automatic
+readiness stays fenced.
 Existing standalone indexing policy remains unchanged.
+
+### Pinned GitNexus typed adapter
+
+Before reservation, selection reads metadata only: the selected Node inode and
+one packaged GitNexus entry must be identifiable without running Node, npm or
+provider version commands. After startup ACK and durable registration, the
+captured stock resolver and Node compatibility gates confirm that same choice.
+The accepted pin remains GitNexus 1.6.12 and Node `^22.18.0 || >=24.11.0`.
+An implicit unknown npm prefix, several distinct installations, a wrapper or an
+unpackaged executable may refuse even when the standalone resolver could run it.
+Use the existing explicit `GITNEXUS_BIN` and `GITNEXUS_NODE_BIN` selections when
+needed; the typed adapter does not rewrite npm configuration or install tools.
+
+The source identity binds Node's executable digest, the exact package/ESM-entry
+metadata and bytes, caller resolution directory, environment, resource policy
+and fixed `analyze` arguments. Only the registered invocation fills its reserved
+environment slot. The initial Node executable is held through descriptor-based
+spawn; the native working directory is the claimed physical repository. Imported
+vendor files and provider-created respawns remain trusted installed inputs;
+entry/package hashing does not seal the whole dependency tree or pin every
+descendant executable. No new `--force`, `--quiet`, heap setting or mode-specific
+provider argument is added. Full 8 GiB/zero-swap containment and existing reserves,
+watchdog and cleanup obligations remain unchanged. This integration neither
+enables automatic readiness nor establishes production resource capacity.
 
 ## Verification
 
