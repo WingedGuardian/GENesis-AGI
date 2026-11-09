@@ -169,7 +169,7 @@ def main(snapshot, modules, raw_context, run_mode, settings_path):
             reserved = bound.runtime_value['reservation']
             # Admission time never subtracts from the selected workload window.
             manager = modules['scope'].ScopeManager(modules['unit'].bus_call, modules['unit'].typed_property,
-                deadline=time.monotonic() + selected['wall_seconds'])
+                deadline=time.monotonic() + selected['wall_seconds'], require_runtime_limit=True)
             probe = modules['proof'].ScopeProbe(reserved['unit'], reserved['cap_bytes'],
                                                route=(selected['route'], selected['slice']))
             owner = modules['owner'].PhysicalOwner(modules, context, reserved, probe, manager)

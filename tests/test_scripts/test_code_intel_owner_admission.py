@@ -220,3 +220,53 @@ def test_policy_lookup_is_bracketed_by_original_owner_birth(queue, tmp_path, mon
     assert namespace['main'](snapshot, modules, json.dumps(claimed['context']), 'fast', str(settings)) == 76
     assert calls == ['lookup']
     assert queue.execution_status(claimed['context'])['launch_reservation'] is None
+
+
+@pytest.mark.parametrize('fault', [None, 'runtime', 'random', 'signal'])
+def test_actual_producer_enables_runtime_validation_without_changing_generic_lookup(
+        queue, tmp_path, monkeypatch, fault):
+    from tests.test_scripts.test_code_intel_scope_manager import CLAIM, UNIT, variant
+    from tests.test_scripts.test_code_intel_scope_runtime import runtime_bus
+    from tests.test_scripts.test_index_marker_execution import _facts
+
+    namespace, snapshot, modules, claimed, settings, selected, _ = runtime_case(queue, tmp_path, monkeypatch)
+    constructor = modules['scope'].ScopeManager
+    managers, allowed, refused = [], [], []
+
+    def observed_constructor(bus_call, property_value, **kwargs):
+        bus = runtime_bus(selected['wall_seconds'])
+        if fault is not None:
+            name, value = {'runtime': ('RuntimeMaxUSec', variant('t', 2**64 - 1)),
+                'random': ('RuntimeRandomizedExtraUSec', variant('t', 1)),
+                'signal': ('FinalKillSignal', variant('i', 15))}[fault]
+            bus.scope[name] = value
+        operation = constructor(bus, property_value,
+            **{**kwargs, 'deadline': 1, 'clock': lambda: bus.now})
+        managers.append(operation)
+        return operation
+
+    def physical_owner(modules, context, reserved, probe, manager):
+        def run(bound):
+            # Caller sensitivity, not native qualification: execute the real
+            # manager contract selected by the actual producer main.
+            try:
+                manager.registration(UNIT, _facts(CLAIM), wall_seconds=selected['wall_seconds'])
+            except ValueError:
+                refused.append(True)
+                return None
+            allowed.append(True)
+            return None
+        return SimpleNamespace(run=run)
+
+    globals_ = namespace['main'].__globals__
+    monkeypatch.setitem(globals_, 'repository_lock', lambda *args: nullcontext())
+    monkeypatch.setitem(globals_, 'policy', lambda *args: selected)
+    monkeypatch.setattr(modules['scope'], 'ScopeManager', observed_constructor)
+    monkeypatch.setattr(modules['owner'], 'PhysicalOwner', physical_owner)
+    assert namespace['main'](snapshot, modules, json.dumps(claimed['context']), 'fast', str(settings)) == 76
+    assert len(managers) == 2
+    assert managers[0].require_runtime_limit is False and managers[1].require_runtime_limit is True
+    assert bool(allowed) is (fault is None) and bool(refused) is (fault is not None)
+    state = modules['queue'].execution_status(claimed['context'])
+    assert state['launch_reservation'] is not None
+    assert state['native_intent'] is state['control_closure'] is None

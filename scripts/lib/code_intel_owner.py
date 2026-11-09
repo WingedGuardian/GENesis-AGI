@@ -37,6 +37,8 @@ def scope_command(snapshot, modules, ack_fd):
             route, '--unit=' + reserved['unit'],
             '-p', 'MemoryMax=' + str(reserved['cap_bytes']), '-p', 'MemorySwapMax=0',
             '-p', 'IOWeight=' + policy['io_weight'], '-p', 'CPUQuota=' + policy['cpu_quota'],
+            '-p', 'RuntimeMaxSec=' + str(policy['wall_seconds']),
+            '-p', 'RuntimeRandomizedExtraSec=0', '-p', 'FinalKillSignal=SIGKILL',
             '--', *snapshot.resume_command('reporter', str(ack_fd))]
     return ['/bin/bash', '--noprofile', '--norc', '-p', '-c', 'exec ' + shlex.join(argv)]
 
@@ -245,14 +247,17 @@ class PhysicalOwner:
         cancelled = self.cancelled
         stopping = pending_pause = None
         stop_resolved = False
+        prestartup_deadline = None
         previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
         for sig in previous:
             signal.signal(sig, lambda number, frame: cancelled.append(number))
 
         def request_stop(reason):
-            nonlocal stopping, pending_pause, stop_resolved
+            nonlocal stopping, pending_pause, stop_resolved, prestartup_deadline
             if stopping is None:
                 stopping, pending_pause = reason, None
+                if self.startup is None:
+                    prestartup_deadline = min(self.work_deadline, self.clock() + 2)
             if stop_resolved:
                 return
             try:
@@ -265,6 +270,10 @@ class PhysicalOwner:
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
                 self.diagnostics.append(type(error).__name__)
                 # The intent remains pending; retry inside the same draining loop/budget.
+
+        def drain_deadline():
+            bound = self.final_deadline if self.final_deadline is not None else self.work_deadline
+            return bound if prestartup_deadline is None else min(bound, prestartup_deadline)
 
         cleanup = None
         try:
@@ -335,21 +344,26 @@ class PhysicalOwner:
                         os.close(monitor_write)
                         monitor_write = None
                     if self.startup is not None:
-                        cleanup = self.modules['scope'].cleanup_observation(self.startup['scope'],
-                            self.native.digest(self.startup['scope']), self.proof, owned_wait=True)
-                        if 'facts' in cleanup:
+                        cleanup = None  # A failed fresh read cannot reuse a previous proof.
+                        try:
+                            cleanup = self.modules['scope'].cleanup_observation(self.startup['scope'],
+                                self.native.digest(self.startup['scope']), self.proof, owned_wait=True)
+                        except OSError as error:
+                            self.diagnostics.append(type(error).__name__)
+                        if cleanup is not None and 'facts' in cleanup:
                             self._retain_facts(cleanup['facts'])
-                        if cleanup['state'] == 'unresolved' and not stopping:
+                        if cleanup is not None and cleanup['state'] == 'unresolved' and not stopping:
                             request_stop('cancellation')
                     if (ended and monitor_rc is not None and self._control_clients_drained()
-                            and (cleanup is None or cleanup['state'] != 'unresolved')):
+                            and (self.startup is None or cleanup is not None
+                                 and cleanup['state'] != 'unresolved')):
                         try:
                             os.killpg(monitor.identity['pid'], 0)
                         except ProcessLookupError:
-                            if self.final_deadline is not None and self.clock() >= self.final_deadline:
+                            if self.clock() >= drain_deadline():
                                 return None  # Late physical proof cannot close the original budget.
                             break  # Actual group absence plus EOF, not leader exit alone.
-                deadline = self.final_deadline if self.final_deadline is not None else self.work_deadline
+                deadline = drain_deadline()
                 remaining = deadline - self.clock()
                 if remaining <= 0:
                     if self.final_deadline is None and not stopping:

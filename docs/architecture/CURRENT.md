@@ -1877,6 +1877,15 @@ the shared banner is not an assertion about all concurrent sessions.
   literal-argument compatibility with its exact executable/environment basis.
   Synchronous manager observations and non-atomic name-based actions retain
   their documented trusted-manager boundaries.
+  Pre-startup stop intent fixes a two-second local drain bound clipped to work
+  expiry; accepted TERM and late group proof cannot certify closure. Transient
+  cleanup reads retry within the fixed final budget, requiring fresh proof.
+  The initial scope also requests the frozen runtime cap, zero randomized extra
+  and final SIGKILL; only its actual producer requires these effective typed
+  properties before ACK. Generic readers retain their existing contract.
+  Manager runtime enforcement survives ordinary owner return/death, but is not
+  a cleanup receipt or native qualification. Kernel/manager failure and explicit
+  trusted-manager abandonment remain limits; activation is still fenced.
   Separate producer histories retain the first baseline and one strongest
   actual sample across delayed delivery. Unknown closure stays open; unregistered
   launches stay uncertain. A retained local-only kill leaves uncertainty even

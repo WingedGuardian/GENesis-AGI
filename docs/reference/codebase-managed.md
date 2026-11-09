@@ -957,6 +957,26 @@ An unreaped child's zombie identity can retain its original birth for a raw
 wait; default scope/reporter proof still requires a live subject. A terminal
 birth is not native completion, scope registration or cleanup proof.
 
+Before a startup header exists, first stop intent fixes a two-second local
+drain grace, clipped to the original work deadline. Accepted TERM does not
+certify exit, and repeated attempts do not extend that grace. Late wait or group
+absence cannot close it. Unknown lifetime remains open on bounded return.
+After registration, cleanup file-read errors retry within the same final
+budget; every read invalidates cached proof. Only fresh resolved cleanup can
+close control. Structural identity failures retain their existing refusal.
+
+The initial scope requests the frozen wall through `RuntimeMaxSec`, zero
+`RuntimeRandomizedExtraSec` and `FinalKillSignal=SIGKILL`. Its actual owner
+validates the corresponding typed effective properties before ACK, alongside
+the existing memory, swap, identity and stop policy. Generic scope readers keep
+their prior default contract. The manager's runtime begins at scope activation
+and initiates stop/escalation independently after the finite owner returns or
+dies. It does not prove physical absence at the wall, extend cleanup's original
+deadline or authorize retry. Manager/kernel failure, unkillable tasks and
+deliberate trusted-manager abandonment remain limits; evidence stays open.
+Native platform, frozen-scope escalation and owner-loss qualification are still
+required before activation; scratch fixtures establish wiring and refusal only.
+
 This canonical launcher reuses the captured literal-argument helper, probing
 the exact `/usr/bin/systemd-run` it will execute with the launch environment
 basis. It omits the expansion option only on the existing definite-refusal

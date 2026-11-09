@@ -107,11 +107,14 @@ def cleanup_observation(registration, registration_sha256, proof, *, owned_wait,
 class ScopeManager:
     """Read existing identities using the shared typed bus primitives; no actions."""
 
-    def __init__(self, bus, property_value, *, deadline, clock=time.monotonic):
+    def __init__(self, bus, property_value, *, deadline, clock=time.monotonic, require_runtime_limit=False):
         if type(deadline) not in (int, float) or not math.isfinite(deadline):
             raise ValueError("invalid manager observation deadline")
+        if type(require_runtime_limit) is not bool:
+            raise ValueError("invalid runtime policy requirement")
         self.bus, self.property = bus, property_value
         self.deadline, self.clock = deadline, clock
+        self.require_runtime_limit = require_runtime_limit
 
     def _call(self, path, interface, method, *args):
         remaining = self.deadline - self.clock()
@@ -220,4 +223,10 @@ class ScopeManager:
                 or self.property(properties, "KillMode", "s") != "control-group"
                 or self.property(properties, "SendSIGKILL", "b") is not True):
             raise ValueError("scope identity or supported stop policy mismatch")
+        if self.require_runtime_limit:
+            runtime = self.property(properties, "RuntimeMaxUSec", "t")
+            if (runtime == 2**64 - 1 or runtime != wall_seconds * 1_000_000
+                    or self.property(properties, "RuntimeRandomizedExtraUSec", "t") != 0
+                    or self.property(properties, "FinalKillSignal", "i") != 9):
+                raise ValueError("scope effective runtime policy mismatch")
         return {"unit": unit, "invocation_id": identity[1], "facts": deepcopy(facts), "stop_usec": stop}
