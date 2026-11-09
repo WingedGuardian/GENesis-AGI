@@ -19,11 +19,11 @@ import logging
 import math
 import os
 import re
-import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from genesis.util.codex_cli import codex_available, codex_child_env, codex_exec_argv
 from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 if TYPE_CHECKING:
@@ -404,7 +404,7 @@ class TaskReviewer:
         """Run the tool-capable adversarial verification chain.
 
         First-success semantics (same pattern as contribution/review.py):
-        1. Codex (GPT, cross-vendor, full tools) -- ``shutil.which`` guard
+        1. Codex (GPT, cross-vendor, full tools) -- ``codex_available`` guard
         2. CC invoker (Sonnet, same-vendor fallback, full tools)
         3. API call site 20 (last resort, text-only)
 
@@ -452,7 +452,7 @@ class TaskReviewer:
         *worktree_path*: when set, Codex runs with ``cwd`` pointing to the
         worktree so it can read the actual changed files rather than main.
         """
-        if shutil.which("codex") is None:
+        if not codex_available():
             logger.info("review: codex not on PATH -- skipping codex link")
             return None
 
@@ -476,15 +476,21 @@ class TaskReviewer:
             # multi-threaded server (a deadlock there would hang before our
             # wait_for timeout is even armed).
             proc = await asyncio.create_subprocess_exec(
-                "codex", "exec", "-",
-                "-c", 'model_reasoning_effort="medium"',
-                "--json",
-                "--dangerously-bypass-approvals-and-sandbox",
+                *codex_exec_argv(
+                    "-",
+                    "-c", 'model_reasoning_effort="medium"',
+                    "--json",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                ),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
                 start_new_session=True,
+                # Marks this unattended run as dispatched. Inert until the Codex
+                # project config forwards the marker to Genesis's MCP launcher,
+                # which then keeps such a run on the external floor.
+                env=codex_child_env(),
             )
         except FileNotFoundError:
             return None

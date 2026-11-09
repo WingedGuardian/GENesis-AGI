@@ -46,3 +46,9 @@ unprivileged, read-only, network-disabled disposable CI boundary. Source hashes,
 container metadata and reports are retained; a passing report is required before
 claiming qualification. Review and exact-head contained results remain separate
 from source presence or local tests.
+
+The fourteen jq-backed host cases require the `$end` binding supported by jq 1.7.
+A session-scoped, independent feature probe skips only those cases when jq is
+missing or incompatible; the config lifecycle cases still run. A compatible jq
+does not turn errors in the redaction programs into skips. The contained image
+checks the same binding during its build and must execute the redaction controls.

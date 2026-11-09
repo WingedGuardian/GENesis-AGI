@@ -217,7 +217,7 @@ def test_not_yet_done_beats_a_newer_untouched_row(tmp_path, repo, capsys):
     prs = [_pr(1, "2026-10-10T00:00:00Z", s["c1"]), _pr(2, "2026-10-12T00:00:00Z", s["c2"])]
     out = _pick(db, repo, _runner(prs), capsys)
     assert _picked(out) == 1, out
-    assert "tier: not-yet-done" in out
+    assert "tier: unfinished work or tracking" in out
 
 
 def test_an_untouched_row_beats_a_newer_reattempt(tmp_path, repo, capsys):

@@ -125,7 +125,9 @@ fi
 SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_PATH="${VENV_PATH:-$REPO_DIR/.venv}"
-SECRETS_FILE="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
+# shellcheck source=lib/secrets_path.sh
+. "$SCRIPT_DIR/lib/secrets_path.sh"
+SECRETS_FILE="$(genesis_secrets_path "$REPO_DIR")"
 SETUP_WARNINGS=0
 # Every setter of SETUP_WARNINGS goes through setup_warn, so the flag can name
 # its own causes. The flag alone made a strict-mode failure undiagnosable: the
