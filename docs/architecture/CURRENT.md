@@ -1430,7 +1430,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: 1b79527b5c7 2026-11-08
+verified: a6528dab2 2026-11-09
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -1461,7 +1461,10 @@ verified: 1b79527b5c7 2026-11-08
   detect → create → dispatch;
   `approval_key_stable=True` (ONE
   site-level approval key). Resume consumes an approved grant before releasing
-  its awaiting row. A lookup/retirement failure preserves that row and defers
+  its awaiting row. Resume state transitions require the row to retain its
+  original `processing` status and exact awaiting-approval marker; a concurrent
+  claim, completion, supersession or new approval marker wins over the stale
+  transition. A lookup/retirement failure preserves that row and defers
   all new/modified/retry site work for the scan, while healthy approved siblings
   can resume after successful consumption. The refresh path folds parked files into the
   batch so approvals fire once (#914). A pending approval is HELD until the
@@ -5171,7 +5174,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 702274dfe 2026-11-05
+verified: 81bbdb0a9 2026-11-08
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -5239,6 +5242,11 @@ verified: 702274dfe 2026-11-05
   evidence, and returns control to the user without native approval or Genesis
   lifecycle registration. It does not enforce the future reflection gates or
   cover arbitrary indirect execution. See `docs/reference/codex-review-stop.md`.
+  The shared budget accepts issue-comment churn between its two reads only when
+  both complete policy projections are successful and identical. Counts,
+  confirmation consumption, findings, reflection keys, marks and reviewer
+  attribution participate; real policy changes still return unknown, and an
+  exhausted budget still requires approval. Head/review/ancestry checks remain.
   A separate, inactive `scripts/hooks/codex-validator-adapter` translates native
   validator calls to the existing guards concurrently. It requires an absolute
   Bash cd/exit opener terminated by a newline, confines patches to validator
@@ -5266,6 +5274,14 @@ verified: 702274dfe 2026-11-05
   Explicit login accepts `--device-auth` for headless authentication.
   Inspection/run disable account-connected Apps through fixed CLI arguments
   and verify that effective setting, retaining the exact two-server boundary.
+  A contained compatibility workflow extends the existing native fixture driver
+  for explicitly handled app-server requests and freezes its source/binary/case
+  manifest before execution. It checks native command approval, canonical guard
+  ask versus denial, resume, required MCP failure, dispatched provenance and
+  ready-descendant cleanup with synthetic loopback responses and harmless
+  effects. Independent copied-artifact readback refuses incomplete or stale
+  evidence; no production provider, native auth, lifecycle enrollment or live
+  policy is added. See `docs/reference/codex-native-harness.md`.
   Interactive native qualification records a Codex0.166.0 reference binary.
   The launcher warns on other recognizable versions and retains its startup
   inspection/refusal checks; those inspect state, not actual tool denial.
