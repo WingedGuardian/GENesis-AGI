@@ -25,6 +25,7 @@ from tests.test_scripts.test_index_marker_native_replay import _terminal
 def test_late_owned_kill_retains_actual_sample_and_provider_hold(
         queue, tmp_path, evidence, monkeypatch, hierarchical, local, phase):
     owner, snapshot, marker, claimed, namespace = prepared(queue, tmp_path, evidence, monkeypatch)
+    original_attempts = queue.execution_status(claimed['context'])['attempts']
     sent, deferred, actions, children = [], [], [], []
     release = tmp_path / 'release-frame'
     original_send = owner.modules['queued'].StartupGate.send
@@ -114,7 +115,12 @@ pathlib.Path(sys.argv[2]).write_text('entered')
     assert startup['scope']['facts']['local_events']['oom_kill'] == 0
     if hierarchical or local:
         assert status['safety_kind'] in ('resource', 'uncertainty')
+        if local and not hierarchical:
+            assert status['safety_kind'] == 'uncertainty'
         assert actual['events']['oom_kill'] == hierarchical
         assert actual['local_events']['oom_kill'] == local
     else:
         assert status['safety_kind'] is None and result['state'] == 'clean'
+    if phase == 'preintent':
+        assert queue.apply_native(claimed['context']) == 'pending'
+        assert queue.execution_status(claimed['context'])['typed_charged_attempts'] == original_attempts

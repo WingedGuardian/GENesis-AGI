@@ -29,11 +29,21 @@ def monitors(tmp_path, monkeypatch, toy):
             'wall': "_wall_cap() { printf 'phase\\n' >&2; command sleep .03; printf 14400; }\n",
             'load': "pressure_loadavg1() { printf 'phase\\n' >&2; command sleep .03; printf 0; }\n",
             'iowait': "pressure_iowait_pct() { printf 'phase\\n' >&2; command sleep .03; printf 0; }\n",
-            'sleep': "sleep() { printf 'phase\\n' >&2; command sleep \"$@\"; }\n",
         }
         if phase:
             assert command[5].count('_wd_send ready\n') == 1
-            command[5] = command[5].replace('_wd_send ready\n', hooks[phase] + '_wd_send ready\n')
+            if phase in ('sleep', 'retirement'):
+                boundary = "_wd_wait() {\n    local status=0 byte=''\n"
+                assert command[5].count(boundary) == 1
+                observed = ("_wd_wait() {\n"
+                    "    if [ \"${_FIXTURE_PHASE_SENT:-0}\" = 0 ]; then\n"
+                    "        printf 'phase\\n' >&2; _FIXTURE_PHASE_SENT=1\n"
+                    "    fi\n    local status=0 byte=''\n")
+                command[5] = command[5].replace(boundary, observed)
+                hook = '_watchdog() { return 0; }\n' if phase == 'retirement' else ''
+            else:
+                hook = hooks[phase]
+            command[5] = command[5].replace('_wd_send ready\n', hook + '_wd_send ready\n')
         reader, writer = os.pipe()
         if payload:
             os.write(writer, payload)
@@ -91,7 +101,7 @@ def test_default_interval_drains_under_its_existing_policy(monitors):
     ready(run)
     assert run['child'].stderr.readline() == b'phase\n'
     retire(run)
-    completed(run, timeout=20)  # The measured foreground sleep can take15s.
+    completed(run, timeout=2)  # Default policy stays15s; private EOF interrupts the wait.
 
 
 def test_open_pipe_and_leaked_writer_are_not_retirement(monitors):

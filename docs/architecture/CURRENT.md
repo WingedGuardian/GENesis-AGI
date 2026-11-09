@@ -1863,6 +1863,10 @@ the shared banner is not an assertion about all concurrent sessions.
   monitor-group absence and original cleanup independently constrain closure.
   Work expiry first enters the existing stop transition; final cleanup expiry
   retains an open obligation rather than certifying completion.
+  Pending startup pressure precedes ACK, and every first stop chooses the
+  observed scope or the actual unacknowledged child. Monitor interval waits
+  wake on private EOF; manager-client cancellation and actual reaps remain
+  owned, and an unavailable client wait keeps closure open.
   Separate producer histories retain the first baseline and one strongest
   actual sample across delayed delivery. Unknown closure stays open; unregistered
   launches stay uncertain. A retained local-only kill leaves uncertainty even

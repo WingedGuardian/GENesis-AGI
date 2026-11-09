@@ -943,11 +943,17 @@ independently verify their original parent, route and scope before preparation.
 The owner installs its monitor and output handling, samples the original scope,
 then checks both children again before sending the one startup ACK. A manager
 read cannot turn an earlier alive check into permission for a dead monitor.
+Pressure requests received during a transient startup observation keep the
+latest desired pause state; the validated owner applies it before ACK. Every
+first stop cause uses the same transition: control the original observed scope,
+or cancel only the actual unacknowledged child when no scope is established.
+Buffered pause requests cannot revive stopping work or replace its first stop.
 
 The owner performs original-scope control before blocking journal publication.
 Its monitor only requests actions; retirement closes the owner's sole private
-stdin-pipe writer, without a signal trap. The current sample/iteration drains
-under the existing fixed cleanup budget; the owner fences
+stdin-pipe writer, without a signal trap. Policy and retirement interval waits
+wake on that EOF without changing standalone watchdog intervals. A stalled
+sampler can still exhaust the fixed cleanup budget and leave control open; the owner fences
 late action requests. Original kernel and reporter samples keep separate ordered
 histories. Work expiry enters the existing stop transition before an exhausted
 final cleanup budget can return with an open obligation. Separate observations
@@ -956,6 +962,18 @@ owned OOM evidence. Clean control requires actual owned waits, output EOF,
 monitor-group absence and original-scope cleanup. An unresolved lifetime leaves
 the control obligation open. A launched child without registration remains
 uncertain even when it exits zero. A transport success is not indexing success.
+Freeze/thaw client waits observe owner cancellation before work expiry, then
+enter the original-scope stop transition. The stop client ignores an already
+pending cancellation flag. Actual manager-client waits also constrain closure;
+an unavailable wait cannot be replaced by a successful process status. Existing
+bounded manager observations can still delay signal handling.
+Manager replies must be observed within their original operation deadline;
+physical closure proof must arrive within the established final cleanup budget.
+A late reply or proof cannot extend that budget or certify closure.
+
+The standalone manual index entrypoint keeps its existing locking policy and
+does not consult the new queue hold. This endpoint does not establish global
+physical exclusion; that remains a separate series qualification gate.
 
 Sample selection preserves one actual snapshot, prioritizing hierarchical kill
 evidence, then local kills and observation time; the original baseline never

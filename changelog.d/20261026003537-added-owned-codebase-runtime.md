@@ -1,1 +1,1 @@
-- Adds the private Codebase startup owner and pressure-monitor lifecycle, retaining uncertain cleanup and original resource evidence while automatic indexing remains disabled pending integration and qualification.
+- Adds the private Codebase startup owner and pressure-monitor lifecycle, handling startup, stop and cancellation without abandoning owned children and retaining uncertain cleanup and original resource evidence while automatic indexing remains disabled pending integration and qualification.

@@ -67,6 +67,15 @@ _wd_cancelled() {
 }
 _wd_send() { _wd_cancelled && return 0; printf '%s\n' "$1" || exit 125; }
 _wd_alive() { ! _wd_cancelled && builtin kill -0 "$1" 2>/dev/null; }
+_wd_wait() {
+    local status=0 byte=''
+    LC_ALL=C IFS= builtin read -r -t "$1" -n 1 -d '' byte && exit 125 || status=$?
+    [ -z "$byte" ] || exit 125
+    case "$status" in
+        1) return 0 ;;  # EOF; the next cancellation check retires.
+        *) [ "$status" -gt 128 ] || exit 125 ;;  # Only timeout continues.
+    esac
+}
 _wd_pause() { _wd_send freeze; }
 _wd_resume() { _wd_send thaw; }
 _wd_kill() {
@@ -79,8 +88,8 @@ _wd_send ready
 '''
     program += '_watchdog scope ' + shlex.quote(reserved['unit']) + ' ' + str(child_pid) + ' || exit "$?"\n'
     # Even a completed policy request waits for owner-requested retirement.
-    # EOF retires after current samples/sleep; no signal trap reenters Bash.
-    program += 'while ! _wd_cancelled; do sleep "$_WD_INTERVAL"; done\n'
+    # EOF interrupts policy/retirement waits; a sampler remains a live producer.
+    program += 'while ! _wd_cancelled; do _wd_wait "$_WD_INTERVAL"; done\n'
     return ['/bin/bash', '--noprofile', '--norc', '-p', '-c', program]
 
 
@@ -208,6 +217,8 @@ class PhysicalOwner:
         self.launched = False
         self.first_facts, self.startup_error = None, False
         self.owner_facts = self.owner_observed_ns = None
+        self.cancelled, self.control_clients = [], []
+        self.control_wait_lost = False
 
     def run(self, snapshot):
         """Own both real children, release ACK once, then publish proved closure.
@@ -227,10 +238,22 @@ class PhysicalOwner:
         monitor = None
         records = OwnerRecords(self)
         ended = acknowledged = failed = stopping = monitor_stopped = False
-        cancelled = []
+        cancelled = self.cancelled
+        pending_pause = None
         previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
         for sig in previous:
             signal.signal(sig, lambda number, frame: cancelled.append(number))
+
+        def request_stop(reason):
+            nonlocal stopping, pending_pause
+            if stopping:
+                return
+            stopping, pending_pause = True, None
+            if self.startup is not None:
+                self.control('stop', reason=reason)
+            elif self.foreground is not None:
+                self.foreground.terminate()
+
         cleanup = None
         try:
             with snapshot.sealed() as capsule:
@@ -264,11 +287,19 @@ class PhysicalOwner:
                 if (cancelled or failed or monitor_rc is not None and not monitor_stopped
                         or self.clock() >= self.work_deadline) and not stopping:
                     reason = 'wall' if self.clock() >= self.work_deadline else 'cancellation'
-                    stopping = True
-                    if self.startup is not None:
-                        self.control('stop', reason=reason)
-                    elif foreground_rc is None:
-                        self.foreground.terminate()
+                    request_stop(reason)
+                if (not stopping and pending_pause is not None and self.startup is not None
+                        and foreground_rc is None and monitor_rc is None):
+                    try:
+                        self.control(pending_pause)
+                        pending_pause = None
+                    except InterruptedError:
+                        if not cancelled:
+                            failed = True
+                    except (OSError, ValueError, subprocess.SubprocessError):
+                        failed = True
+                    if cancelled or failed or self.clock() >= self.work_deadline:
+                        continue  # Enter the common stop transition before ACK.
                 if (not stopping and records.ready and not acknowledged and self.startup is not None
                         and foreground_rc is None and monitor_rc is None):
                     # Manager/kernel observation above can block. Its earlier
@@ -276,6 +307,8 @@ class PhysicalOwner:
                     foreground_rc, monitor_rc = self.foreground.status(), monitor.status()
                     if foreground_rc is not None or monitor_rc is not None:
                         failed = True
+                        continue
+                    if cancelled or self.clock() >= self.work_deadline:
                         continue
                     # Owner output/cancellation/monitor handling is installed.
                     writer, ack_write = ack_write, None
@@ -295,12 +328,14 @@ class PhysicalOwner:
                         if 'facts' in cleanup:
                             self._retain_facts(cleanup['facts'])
                         if cleanup['state'] == 'unresolved' and not stopping:
-                            stopping = True
-                            self.control('stop', reason='cancellation')
-                    if ended and monitor_rc is not None and (cleanup is None or cleanup['state'] != 'unresolved'):
+                            request_stop('cancellation')
+                    if (ended and monitor_rc is not None and self._control_clients_drained()
+                            and (cleanup is None or cleanup['state'] != 'unresolved')):
                         try:
                             os.killpg(monitor.identity['pid'], 0)
                         except ProcessLookupError:
+                            if self.final_deadline is not None and self.clock() >= self.final_deadline:
+                                return None  # Late physical proof cannot close the original budget.
                             break  # Actual group absence plus EOF, not leader exit alone.
                 deadline = self.final_deadline if self.final_deadline is not None else self.work_deadline
                 remaining = deadline - self.clock()
@@ -321,10 +356,16 @@ class PhysicalOwner:
                                 if monitor_stopped:
                                     continue  # Samples were retained; late actions cannot act.
                                 if event in ('freeze', 'thaw'):
-                                    self.control(event)
+                                    if not stopping:
+                                        if not acknowledged:
+                                            pending_pause = event
+                                        else:
+                                            self.control(event)
                                 elif event in ('wall', 'pressure_stop', 'owned_oom'):
-                                    stopping = True
-                                    self.control('stop', reason='pressure_stop' if event == 'owned_oom' else event)
+                                    request_stop('pressure_stop' if event == 'owned_oom' else event)
+                    except InterruptedError:
+                        if not cancelled:
+                            failed = True
                     except (OSError, ValueError, subprocess.SubprocessError):
                         failed = True
                 elif ended:
@@ -357,14 +398,12 @@ class PhysicalOwner:
             self.diagnostics.append(type(error).__name__)
             if self.foreground is not None:
                 try:
-                    if self.startup is not None:
-                        self.control('stop', reason='cancellation')
-                    else:
-                        self.foreground.terminate()
+                    request_stop('cancellation')
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as stop_error:
                     self.diagnostics.append(type(stop_error).__name__)
             return None
         finally:
+            self._control_clients_drained()  # Nonblocking; an unknown wait never grants closure.
             for fd in (monitor_read, monitor_write):
                 if fd is not None:
                     os.close(fd)  # Retire on every failure/return; EOF is not completion proof.
@@ -464,10 +503,52 @@ class PhysicalOwner:
         if rank > previous:
             self.startup.update(facts=json.loads(self.native.encode(facts)), observed_ns=observed_ns)
 
+    def _control_status(self, child):
+        if child.returncode is not None:
+            return child.returncode
+        try:
+            return self.proof._payload_status(child)
+        except ChildProcessError:
+            self.control_wait_lost = True
+            raise
+
+    def _control_clients_drained(self):
+        for child in self.control_clients[:]:
+            try:
+                if self._control_status(child) is not None:
+                    self.control_clients.remove(child)
+            except OSError as error:
+                self.control_wait_lost = True
+                self.diagnostics.append(type(error).__name__)
+        return not self.control_clients and not self.control_wait_lost
+
     def _systemctl(self, action, unit, remaining):
-        subprocess.run(['/usr/bin/systemctl', '--user', action, unit + '.scope'],
-                       check=True, timeout=remaining, close_fds=True,
-                       env=self.modules['unit'].systemctl_env())
+        # Retain actual wait authority even if a cancelled client cannot be
+        # reaped immediately. It cannot disappear from clean closure proof.
+        absolute = self.final_deadline if action == 'stop' else self.work_deadline
+        deadline = min(absolute, self.clock() + remaining)
+        command = ['/usr/bin/systemctl', '--user', action, unit + '.scope']
+        child = subprocess.Popen(command, close_fds=True, env=self.modules['unit'].systemctl_env())
+        self.control_clients.append(child)
+        try:
+            while True:
+                if action != 'stop' and self.cancelled:
+                    raise InterruptedError('owner cancelled its manager wait')
+                status = self._control_status(child)
+                remaining = deadline - self.clock()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, 0)
+                if status is not None:
+                    if status:
+                        raise subprocess.CalledProcessError(status, command)
+                    return
+                time.sleep(min(.05, remaining))
+        finally:
+            if self._control_status(child) is None:
+                # An unreaped direct child cannot have its PID reused here.
+                # Never block the required scope stop on this client's reap.
+                os.kill(child.pid, signal.SIGKILL)
+            self._control_clients_drained()
 
     def control(self, action, *, reason=None):
         if self.startup is None or action not in ('freeze', 'thaw', 'stop'):

@@ -90,6 +90,7 @@ _wd_kill()   {
 # _watchdog <kind> <target> <job_pid>: babysit a running index; pause under
 # pressure, resume when calm, kill a run that can't make headway.
 _wd_alive() { kill -0 "$1" 2>/dev/null; }
+_wd_wait() { sleep "$1"; }
 _watchdog() {
     local kind="$1" target="$2" job_pid="$3"
     local wall start now bad=0 paused=0 pause_start=0 _WD_STOP_REASON=''
@@ -129,7 +130,7 @@ _watchdog() {
                 fi
             fi
         fi
-        sleep "$interval"
+        _wd_wait "$interval"
     done
     return 0
 }
