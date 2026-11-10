@@ -4497,11 +4497,16 @@ def _analyze_bounded(
     splits: list[int] = []
     openers: list[int] = []
     starts: list[int] = []
-    ranges, targets = ([] if _policy is not None else None), ([] if _policy is not None else None)
+    ranges: list[tuple[int, int, bool]] = []
+    targets = [] if _policy is not None else None
     parsed = parse_segments(command, _splits=splits, _openers=openers, _starts=starts,
                             _ranges=ranges, _targets=targets)
-    visible_ranges = iter((b, e) for b, e, visible in ranges or [] if visible)
-    for begin, end, visible in ranges or []:
+    visible_ranges = iter((b, e) for b, e, visible in ranges if visible)
+    # Process substitution bodies, read in this level's text: parse_segments drops
+    # the `<`/`>` and leaves `(body)` in raw, where it reads as a word.
+    process_spans = _process_substitution_spans(command) if "(" in command else []
+    level_spans: list[tuple[int, int]] | None = None
+    for begin, end, visible in ranges if _policy is not None else []:
         redirections = tuple((op, target) for at, op, target in targets if begin <= at < end)
         if not visible and redirections:
             _policy.append(PolicySegment("", [], False, "", depth=_depth,
@@ -4555,7 +4560,7 @@ def _analyze_bounded(
                 verb_unresolved=_verb_unresolved(argv),
             )
         )
-        begin, end = next(visible_ranges) if _policy is not None else (0, 0)
+        begin, end = next(visible_ranges)
         if _policy is not None:
             _policy.append(PolicySegment(**(vars(out[-1]) | {"depth": _depth}),
                 position=_scope + (begin,),
@@ -4587,6 +4592,23 @@ def _analyze_bounded(
             nested.extend((raw[a:b], (source, offset + a), True, "substitution") for a, b in spans)
         else:
             added = set()
+        # Bash runs a process substitution's body; the legacy scan never saw one, so
+        # each is added work.
+        for a, b in process_spans:
+            if begin <= a < end:
+                added.add(len(nested))
+                nested.append((command[a:b], (here[0], here[1] + a), True, "substitution"))
+        # A redirect rewrote raw, so its bodies lost the `<`/`>` of any process
+        # substitution inside them (`$(cat <(…))` reached the next level as
+        # `cat  (…)`). Read the same bodies again in this level's own text.
+        if not command.startswith(raw, start) and "(" in raw:
+            if level_spans is None:
+                level_spans = _substitution_spans(command)
+            cut = {raw[a:b] for a, b in spans}
+            for a, b in level_spans:
+                if begin <= a < end and command[a:b] not in cut:
+                    added.add(len(nested))
+                    nested.append((command[a:b], (here[0], here[1] + a), True, "substitution"))
         if not nested:
             continue
         # Past the bound, STOP DESCENDING — and SAY SO. Every scanner below runs
@@ -4742,10 +4764,19 @@ def _substitution_span_sets(text: str) -> tuple[list[tuple[int, int]], set[tuple
     return sorted(legacy | set(_quoted_substitution_spans(text))), legacy
 
 
-def _quoted_substitution_spans(text: str) -> list[tuple[int, int]]:
+def _process_substitution_spans(text: str) -> list[tuple[int, int]]:
+    """Bodies of ``<(…)`` and ``>(…)`` outside quotes, which bash runs. Read generously:
+    a ``(`` after an unquoted ``<`` or ``>`` counts even where bash would reject the
+    line, since reading too much only refuses."""
+    return _quoted_substitution_spans(text, process=True)
+
+
+def _quoted_substitution_spans(text: str, *, process: bool = False) -> list[tuple[int, int]]:
     """Substitution bodies under bash's quoting: single quotes block expansion, double
     quotes do not, and a backslash escapes the next character outside single quotes
-    (inside ``$'…'`` too, where ``\\'`` does not close the span)."""
+    (inside ``$'…'`` too, where ``\\'`` does not close the span). With ``process``,
+    the bodies of ``<(…)`` and ``>(…)`` instead, outside quotes only; ``$(…)`` and
+    backtick bodies are then skipped whole, as their own level reads them."""
     subs: list[tuple[int, int]] = []
     i, n = 0, len(text)
     quote: str | None = None  # "'", '"' or "$'" (ANSI-C)
@@ -4776,8 +4807,16 @@ def _quoted_substitution_spans(text: str) -> list[tuple[int, int]]:
             quote = None if quote == '"' else '"'
             i += 1
             continue
+        if process and quote is None and c in "<>" and i + 1 < n and text[i + 1] == "(":
+            end = _command_sub_end(text, i, n)
+            subs.append((i + 2, end - 1))
+            i = end
+            continue
         if c == "$" and i + 1 < n and text[i + 1] == "(":
             end = _command_sub_end(text, i, n)
+            if process:
+                i = end
+                continue
             # Cut as the legacy scan cuts (an unterminated body loses its last
             # character), so the two readings agree on every body they both find.
             # An unclosed `$(` is a syntax error to bash, which runs none of it.
@@ -4787,7 +4826,8 @@ def _quoted_substitution_spans(text: str) -> list[tuple[int, int]]:
         if c == "`":
             j = text.find("`", i + 1)
             if j != -1:
-                subs.append((i + 1, j))
+                if not process:
+                    subs.append((i + 1, j))
                 i = j + 1
                 continue
         i += 1

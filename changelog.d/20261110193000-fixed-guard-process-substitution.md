@@ -1,0 +1,1 @@
+- **Guards now see commands inside a process substitution.** `cat <(…)` and `> >(…)` run their contents, but the parser kept `(…)` as an ordinary word, so a push or an `rm` there reached neither the push guard nor the destructive-command and protected-paths guards. Those bodies are now read like any other substitution and checked, and a quoted `"<(…)"` stays plain text.
