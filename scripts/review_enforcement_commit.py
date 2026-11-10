@@ -1127,6 +1127,13 @@ def _reflection_problem(
             return "the round of the owed keys it names cannot be placed, so it would credit nothing"
         return "the reflection does not pass its grammar: " + "; ".join(problems[:5])
     if parsed.head != budget.get("current_head"):
+        held = budget.get("held_open")
+        if isinstance(held, dict):
+            return (
+                f"the reflection names head {str(parsed.head)[:12]}, but this round is held "
+                f"open at its reviewed head {str(budget.get('current_head'))[:12]} (the PR head "
+                f"{str(held.get('pr_head'))[:12]} fixes nothing since it): name that head"
+            )
         return f"the reflection names head {str(parsed.head)[:12]}, not the PR head {str(budget.get('current_head'))[:12]}"
     return None
 
@@ -1141,6 +1148,13 @@ def _owed_message(state: dict, budget: dict, rr) -> str:
         f"BLOCKED: review round {round_n} of PR #{budget.get('pr')} owes a round "
         f"reflection before any further commit. Owed: {owed}.",
     ]
+    held = budget.get("held_open")
+    if isinstance(held, dict):
+        lines.append(
+            f"Nothing between the reviewed head {str(budget.get('current_head'))[:12]} and the "
+            f"PR head {str(held.get('pr_head'))[:12]} is a fix (only merges of main or empty "
+            "commits), so that round is still open: the reflection names the reviewed head."
+        )
     if not state.get("settled") and state.get("settle_until"):
         lines.append(
             f"Findings may still arrive until {str(state['settle_until'])[:16]} UTC. A "
@@ -1193,6 +1207,11 @@ def _reflection_rule(
         slice_s = min(_REFLECTION_SLICE, remaining - _REFLECTION_RESERVE)
         if hook_deadline is None or slice_s <= 0:
             raise TimeoutError("no time left in the hook budget")
+        owed_deadline = time.monotonic() + slice_s
+        # A round the head moved off only by a merge of main stays open at its
+        # own head: debt, admission and the deny all read this one view.
+        with rr.deadline_scope(owed_deadline):
+            budget = dict(rr.held_open(cwd or ".", budget))
         state = rr.owed_from_budget(
             cwd or ".",
             budget,
@@ -1200,7 +1219,7 @@ def _reflection_rule(
             pr,
             now=datetime.now(UTC),
             cutover=rr.REFLECTION_CUTOVER_ISO,
-            deadline=time.monotonic() + slice_s,
+            deadline=owed_deadline,
         )
     except Exception as exc:  # noqa: BLE001 — unknown is not owed (owner ruling a34481ca)
         _ADVISORIES.append(
@@ -1217,6 +1236,7 @@ def _reflection_rule(
         )
         return "continue", None
     if not owed:
+        _note_unreflected_round(cwd, budget, rr, owed_deadline)
         return "continue", None
     if (
         repo.casefold() == REFLECTION_EXEMPT_REPO.casefold()
@@ -1247,6 +1267,30 @@ def _reflection_rule(
         _ADVISORIES.append("reflection gate (advisory mode, NOT enforced): " + message)
         return "continue", None
     return "deny", message
+
+
+def _note_unreflected_round(cwd: str | None, budget: dict, rr, deadline: float) -> None:
+    """With nothing owed, say so when the newest round behind the head was
+    never reflected on: a fix moved past it, so its keys are owed by no round
+    the gate can still see. Advisory only, and best effort: a failure to read
+    adds nothing, because nothing is being decided here."""
+    pr, repo = budget.get("pr"), str(budget.get("repo") or "")
+    if repo.casefold() == REFLECTION_EXEMPT_REPO.casefold() and pr in REFLECTION_EXEMPT_PRS:
+        return
+    try:
+        with rr.deadline_scope(deadline):
+            behind = rr.unreflected_round_behind(
+                cwd or ".", budget, cutover=rr.REFLECTION_CUTOVER_ISO
+            )
+    except Exception:  # noqa: BLE001 — an advisory never turns an allow into anything else
+        return
+    if behind:
+        _ADVISORIES.append(
+            f"reflection gate: review round head {behind[:12]} has no reflection, and a "
+            "commit after it moved the PR past it, so its findings are owed by no open "
+            "round. Reflect before fixing next time; this round can no longer be answered "
+            "here."
+        )
 
 
 def _opened_before_cutover(state: dict, cutover: str | None) -> bool:
