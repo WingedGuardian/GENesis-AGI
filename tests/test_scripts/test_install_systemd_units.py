@@ -118,7 +118,17 @@ _PATH_DIRECTIVES = ("ExecStart", "ExecStartPre", "ExecStartPost", "ExecStop",
 #   %h/.genesis/         the per-user DATA home, not the checkout. Templates
 #                        already reach it as __HOME__/.genesis; %h is the same
 #                        location without a rendered $HOME to quote or escape.
-_ALLOWED_ROOT_PREFIXES = ("/bin/", "/usr/", "/sbin/", "%h/.local/share/", "%h/.genesis/")
+#   %h/.config/genesis/  the home of the credentials file outside every checkout
+#                        (genesis.secrets_location), loaded as an optional
+#                        EnvironmentFile.
+_ALLOWED_ROOT_PREFIXES = (
+    "/bin/",
+    "/usr/",
+    "/sbin/",
+    "%h/.local/share/",
+    "%h/.genesis/",
+    "%h/.config/genesis/",
+)
 
 
 def _path_tokens(value: str) -> list[str]:
