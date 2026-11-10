@@ -14,7 +14,6 @@ import httpx
 import pytest
 
 import genesis.caller_context as identity
-from genesis.bookmark.manager import BookmarkManager
 from genesis.caller_credentials import CallerResolver
 from genesis.mcp.shared_http import SharedHTTPConfig, build_http_app
 from tests.test_mcp.test_request_service_tool_bodies import database as database
@@ -53,6 +52,8 @@ async def lifespan(app):
 
 @pytest.fixture
 async def bookmark_app(database, memory_service, monkeypatch, tmp_path):
+    from genesis.bookmark.manager import BookmarkManager
+
     server, memory, tracker = memory_service
     for name in identity.IDENTITY_ENV_VARS:
         monkeypatch.setenv(name, "fixture")
