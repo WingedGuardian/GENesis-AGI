@@ -725,45 +725,48 @@ class CCUpdateAnalyzer:
             body += f"\n\n## Raw changelog\n{changelog}"
 
         try:
-            qdrant_id = await self._memory_store.store(
-                body,
-                f"cc_update:{new_version}",
-                memory_type="knowledge",
-                collection="knowledge_base",
-                tags=tags,
-                confidence=0.85,
-                auto_link=False,
-                source_pipeline="recon",
-            )
+            from genesis.knowledge.lifetime import writer
 
-            from genesis.db.crud import knowledge as knowledge_crud
-            from genesis.memory.provenance import derive_origin_class
+            async with writer(self._db):
+                qdrant_id = await self._memory_store.store(
+                    body,
+                    f"cc_update:{new_version}",
+                    memory_type="knowledge",
+                    collection="knowledge_base",
+                    tags=tags,
+                    confidence=0.85,
+                    auto_link=False,
+                    source_pipeline="recon",
+                )
 
-            # Use upsert so re-analysis of the same CC release version
-            # replaces the stale row instead of failing on the
-            # UNIQUE(project_type, domain, concept) constraint.  The concept
-            # is derived from summary[:200] which is stable per-version.
-            # WS-3: mirror the store() call's provenance — the ON CONFLICT
-            # SET would otherwise regress a backfilled origin_class to NULL
-            # on re-analysis.
-            _uid, inserted = await knowledge_crud.upsert(
-                self._db,
-                project_type="genesis-infra",
-                domain="claude-code",
-                source_doc=f"cc-release-{new_version}",
-                concept=summary[:200],
-                body=body,
-                tags=json.dumps(tags),
-                confidence=0.85,
-                qdrant_id=qdrant_id,
-                embedding_model=getattr(
-                    self._memory_store._embeddings, "model_name", None,
-                ),
-                source_pipeline="recon",
-                origin_class=derive_origin_class(
-                    source_pipeline="recon", collection="knowledge_base",
-                ),
-            )
+                from genesis.db.crud import knowledge as knowledge_crud
+                from genesis.memory.provenance import derive_origin_class
+
+                # Use upsert so re-analysis of the same CC release version
+                # replaces the stale row instead of failing on the
+                # UNIQUE(project_type, domain, concept) constraint.  The concept
+                # is derived from summary[:200] which is stable per-version.
+                # WS-3: mirror the store() call's provenance — the ON CONFLICT
+                # SET would otherwise regress a backfilled origin_class to NULL
+                # on re-analysis.
+                _uid, inserted = await knowledge_crud.upsert(
+                    self._db,
+                    project_type="genesis-infra",
+                    domain="claude-code",
+                    source_doc=f"cc-release-{new_version}",
+                    concept=summary[:200],
+                    body=body,
+                    tags=json.dumps(tags),
+                    confidence=0.85,
+                    qdrant_id=qdrant_id,
+                    embedding_model=getattr(
+                        self._memory_store._embeddings, "model_name", None,
+                    ),
+                    source_pipeline="recon",
+                    origin_class=derive_origin_class(
+                        source_pipeline="recon", collection="knowledge_base",
+                    ),
+                )
             logger.info(
                 "CC update %s %s knowledge base",
                 new_version, "ingested to" if inserted else "refreshed in",

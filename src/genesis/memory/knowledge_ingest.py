@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from genesis.db.crud import knowledge as knowledge_crud
+from genesis.knowledge.lifetime import unreferenced, writer
 from genesis.security.sanitizer import ContentSanitizer, ContentSource
 
 if TYPE_CHECKING:
@@ -102,95 +103,97 @@ async def ingest_knowledge_unit(
     if provenance and provenance.get("source_doc"):
         source_doc = provenance["source_doc"]
 
-    existing = await knowledge_crud.find_by_unique_key(
-        db, project_type=project, domain=domain, concept=resolved_concept,
-    )
-    unit_id = existing["id"] if existing else str(uuid.uuid4())
-    old_qdrant_id = existing.get("qdrant_id") if existing else None
+    async with writer(db):
+        existing = await knowledge_crud.find_by_unique_key(
+            db, project_type=project, domain=domain, concept=resolved_concept,
+        )
+        unit_id = existing["id"] if existing else str(uuid.uuid4())
+        old_qdrant_id = existing.get("qdrant_id") if existing else None
 
-    source_pipeline_val = (provenance or {}).get("source_pipeline", "knowledge_ingest")
-    source_session_id = (provenance or {}).get("session_id")
-    # WS-3: derive ONCE and pass the same value to both stores below — the
-    # same both-stores-consistent discipline as the source_pipeline mirror.
-    from genesis.memory.provenance import derive_origin_class
+        source_pipeline_val = (provenance or {}).get("source_pipeline", "knowledge_ingest")
+        source_session_id = (provenance or {}).get("session_id")
+        # WS-3: derive ONCE and pass the same value to both stores below — the
+        # same both-stores-consistent discipline as the source_pipeline mirror.
+        from genesis.memory.provenance import derive_origin_class
 
-    resolved_origin = derive_origin_class(
-        origin_class=origin_class,
-        source_pipeline=source_pipeline_val,
-        collection=collection,
-    )
-    qdrant_memory_id = await store.store(
-        content,
-        f"knowledge:{project}/{domain}",
-        memory_type=memory_type,
-        collection=collection,
-        tags=[domain, project, authority],
-        confidence=confidence,
-        auto_link=False,
-        source_pipeline=source_pipeline_val,
-        memory_class=memory_class,
-        source_session_id=source_session_id,
-        force_fts5_only=force_fts5_only,
-        project_type=project,
-        origin_class=resolved_origin,
-    )
+        resolved_origin = derive_origin_class(
+            origin_class=origin_class,
+            source_pipeline=source_pipeline_val,
+            collection=collection,
+        )
+        qdrant_memory_id = await store.store(
+            content,
+            f"knowledge:{project}/{domain}",
+            memory_type=memory_type,
+            collection=collection,
+            tags=[domain, project, authority],
+            confidence=confidence,
+            auto_link=False,
+            source_pipeline=source_pipeline_val,
+            memory_class=memory_class,
+            source_session_id=source_session_id,
+            force_fts5_only=force_fts5_only,
+            project_type=project,
+            origin_class=resolved_origin,
+        )
 
-    # If we replaced an existing entry whose Qdrant point ID differs from
-    # the new one, the old point is now orphaned — delete it so Qdrant
-    # stays in sync with the knowledge_units row of record. store.delete()
-    # handles metadata, FTS5, Qdrant, links, and pending_embeddings cascade.
-    if old_qdrant_id and old_qdrant_id != qdrant_memory_id:
-        try:
-            res = await store.delete(old_qdrant_id)
-            if res.get("deferred"):
-                # Vector store unavailable → store.delete() touched nothing, so
-                # the replaced memory is still fully alive (point + metadata +
-                # FTS) alongside its successor — and unlike a ghost, no cleanup
-                # can classify it as an offender (it has a metadata row). No
-                # sweep retries this delete either, so log LOUDLY: this is the
-                # knowledge-unit stale-pair case for a cross-store reconcile.
+        embedding_model = getattr(store._embeddings, "model_name", "qwen3-embedding:0.6b-fp16")
+        resolved_tags = tags_json or json.dumps([domain, project, authority])
+        actual_id, inserted = await knowledge_crud.upsert(
+            db,
+            id=unit_id,
+            project_type=project,
+            domain=domain,
+            source_doc=source_doc,
+            concept=resolved_concept,
+            body=content,
+            tags=resolved_tags,
+            ingested_at=now_iso,
+            qdrant_id=qdrant_memory_id,
+            confidence=confidence,
+            source_platform=provenance.get("platform") if provenance else None,
+            section_title=provenance.get("section_title") if provenance else None,
+            source_date=provenance.get("source_date") if provenance else None,
+            embedding_model=embedding_model,
+            # Mirror the Qdrant write's default (audit D12): never leave the SQLite
+            # knowledge_units pipeline NULL while the vector payload has a value —
+            # provenance must be consistent across both stores.
+            source_pipeline=source_pipeline_val,
+            purpose=json.dumps(purpose) if purpose else None,
+            ingestion_source=ingestion_source,
+            origin_class=resolved_origin,
+        )
+
+        # If we replaced an existing entry whose Qdrant point ID differs from
+        # the new one, the old point is now orphaned — delete it so Qdrant
+        # stays in sync with the knowledge_units row of record. store.delete()
+        # handles metadata, FTS5, Qdrant, links, and pending_embeddings cascade.
+        if (old_qdrant_id and old_qdrant_id != qdrant_memory_id
+                and await unreferenced(db, [old_qdrant_id])):
+            try:
+                res = await store.delete(old_qdrant_id)
+                if res.get("deferred"):
+                    # Vector store unavailable → store.delete() touched nothing, so
+                    # the replaced memory is still fully alive (point + metadata +
+                    # FTS) alongside its successor — and unlike a ghost, no cleanup
+                    # can classify it as an offender (it has a metadata row). No
+                    # sweep retries this delete either, so log LOUDLY: this is the
+                    # knowledge-unit stale-pair case for a cross-store reconcile.
+                    logger.error(
+                        "Stale-point cleanup deferred for %s while upserting "
+                        "knowledge unit %s: vector store unavailable — the replaced "
+                        "memory remains recallable alongside its successor until "
+                        "reconciled", old_qdrant_id, unit_id,
+                    )
+            except Exception:
                 logger.error(
-                    "Stale-point cleanup deferred for %s while upserting "
-                    "knowledge unit %s: vector store unavailable — the replaced "
-                    "memory remains recallable alongside its successor until "
-                    "reconciled", old_qdrant_id, unit_id,
+                    "Failed to clean up stale Qdrant point %s while upserting "
+                    "knowledge unit %s", old_qdrant_id, unit_id, exc_info=True,
                 )
-        except Exception:
-            logger.error(
-                "Failed to clean up stale Qdrant point %s while upserting "
-                "knowledge unit %s", old_qdrant_id, unit_id, exc_info=True,
-            )
 
-    embedding_model = getattr(store._embeddings, "model_name", "qwen3-embedding:0.6b-fp16")
-    resolved_tags = tags_json or json.dumps([domain, project, authority])
-    actual_id, inserted = await knowledge_crud.upsert(
-        db,
-        id=unit_id,
-        project_type=project,
-        domain=domain,
-        source_doc=source_doc,
-        concept=resolved_concept,
-        body=content,
-        tags=resolved_tags,
-        ingested_at=now_iso,
-        qdrant_id=qdrant_memory_id,
-        confidence=confidence,
-        source_platform=provenance.get("platform") if provenance else None,
-        section_title=provenance.get("section_title") if provenance else None,
-        source_date=provenance.get("source_date") if provenance else None,
-        embedding_model=embedding_model,
-        # Mirror the Qdrant write's default (audit D12): never leave the SQLite
-        # knowledge_units pipeline NULL while the vector payload has a value —
-        # provenance must be consistent across both stores.
-        source_pipeline=source_pipeline_val,
-        purpose=json.dumps(purpose) if purpose else None,
-        ingestion_source=ingestion_source,
-        origin_class=resolved_origin,
-    )
-
-    logger.info(
-        "Knowledge unit %s (project=%s, domain=%s)",
-        "ingested" if inserted else "updated",
-        project, domain,
-    )
-    return actual_id
+        logger.info(
+            "Knowledge unit %s (project=%s, domain=%s)",
+            "ingested" if inserted else "updated",
+            project, domain,
+        )
+        return actual_id

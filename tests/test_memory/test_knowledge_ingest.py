@@ -9,10 +9,25 @@ detect-and-log only; ingestion is never blocked, and a scan error is fail-open.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from genesis.memory.knowledge_ingest import ingest_knowledge_unit
+
+
+@pytest.fixture(autouse=True)
+def _mock_lifetime_for_mock_database(monkeypatch):
+    """These are stub-only tests; real ownership is tested with owned storage."""
+    @contextlib.asynccontextmanager
+    async def writer(_db):
+        yield
+    monkeypatch.setattr("genesis.memory.knowledge_ingest.writer", writer)
+    monkeypatch.setattr("genesis.memory.knowledge_ingest.unreferenced", AsyncMock(
+        side_effect=lambda db, ids: ids,
+    ))
 
 
 def _mock_store() -> MagicMock:
