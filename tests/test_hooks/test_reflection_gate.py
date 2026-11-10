@@ -580,7 +580,12 @@ def _late_reflection_problem(repo, monkeypatch, tmp_path, *, owed, names, late_r
     msg = _write_reflection(tmp_path, _reflection(head, keys=tuple(names)))
     command = f"git commit --allow-empty --cleanup=verbatim -F {msg}"
     segs, _ = _gate.analyze_checked(command)
-    state = {"owed": list(owed), "late_keys": ["c11"], "cutover": "2026-01-01T00:00:00+00:00"}
+    state = {
+        "owed": list(owed),
+        "late_keys": ["c11"],
+        "cutover": "2026-01-01T00:00:00+00:00",
+        "held_rounds": [],
+    }
     budget = _budget(count=2, current_head=head)
     return _gate._reflection_problem(
         segs, command, str(repo), budget, rr, deadline=time.monotonic() + 30, state=state
@@ -1152,6 +1157,220 @@ def test_an_older_round_reviewed_after_the_merge_stays_owed(repo, monkeypatch):
     )
     assert state["held_round"] == second
     assert sorted(state["owed"]) == ["c11", "c22"]
+
+
+def _reviews_on(monkeypatch, *rounds, start=None):
+    """One Codex finding review per ``(sha, key)``, a minute apart, in order."""
+    start = start or datetime.now(UTC) - timedelta(hours=2)
+    rows = [
+        {
+            "id": n,
+            "login": CODEX,
+            "commit_id": sha,
+            "state": "COMMENTED",
+            "submitted_at": (start + timedelta(minutes=n)).isoformat().replace("+00:00", "Z"),
+            "body": "",
+            "top_level": [P2],
+            "top_level_ids": [key],
+        }
+        for n, (sha, key) in enumerate(rounds, 1)
+    ]
+    monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "\n".join(json.dumps(r) for r in rows))
+
+
+def _merge_main(repo: Path) -> str:
+    _git(repo, "checkout", "-q", "main")
+    (repo / "other.py").write_text(f"other = {_head(repo)[:6]!r}\n")
+    _git(repo, "add", "other.py")
+    _git(repo, "commit", "-qm", "main moves on")
+    _git(repo, "update-ref", "refs/remotes/origin/main", _head(repo))
+    _git(repo, "checkout", "-q", "feature/reflection")
+    _git(repo, "merge", "-q", "--no-ff", "--no-edit", "main")
+    return _head(repo)
+
+
+def _owed(repo: Path) -> dict:
+    import review_budget
+
+    budget = review_budget.evaluate_pr("owner/repo", 99)
+    return rr.owed_from_budget(
+        str(repo), budget, "owner/repo", 99, now=datetime.now(UTC),
+        cutover=rr.REFLECTION_CUTOVER_ISO,
+    )
+
+
+def test_a_second_empty_push_keeps_the_older_held_round_owed(repo, monkeypatch):
+    """#4316 shape: H reviewed (c11), an empty commit E reviewed (c22), then a
+    second empty push E2 (a CI re-trigger). Nothing fixed either round, so both
+    stay held and both keys owed; holding only the newest dropped c11."""
+    first = _open_round(monkeypatch, repo)
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "nothing to fix yet")
+    second = _head(repo)
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "retrigger CI")
+    _point_budget_at(monkeypatch, repo)
+    _reviews_on(monkeypatch, (first, 11), (second, 22))
+    state = _owed(repo)
+    assert sorted(state["owed"]) == ["c11", "c22"]
+    assert state["held_rounds"] == [second, first] and state["held_round"] == second
+
+
+def test_an_unreviewed_merge_of_main_keeps_the_older_held_round_owed(repo, monkeypatch):
+    """#4316 shape: H (c11), an empty E reviewed (c22), then a merge of main
+    nobody reviewed yet. Both rounds are held."""
+    first = _open_round(monkeypatch, repo)
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "nothing to fix yet")
+    second = _head(repo)
+    _merge_main(repo)
+    _point_budget_at(monkeypatch, repo)
+    _reviews_on(monkeypatch, (first, 11), (second, 22))
+    state = _owed(repo)
+    assert sorted(state["owed"]) == ["c11", "c22"]
+    assert state["held_rounds"] == [second, first]
+
+
+def test_a_partial_reflection_keeps_the_older_held_round_owed(repo, monkeypatch, tmp_path):
+    """#4316, Codex 4521791514: H (c11), a merge of main M reviewed (c33), then
+    a reflection naming only c33. M moving behind the tip no longer releases H."""
+    first = _open_round(monkeypatch, repo)
+    merge = _merge_main(repo)
+    msg = _write_reflection(tmp_path, _reflection(merge, keys=("c33",)))
+    _git(repo, "commit", "-q", "--allow-empty", "--cleanup=verbatim", "-F", str(msg))
+    _point_budget_at(monkeypatch, repo)
+    _reviews_on(monkeypatch, (first, 11), (merge, 33))
+    state = _owed(repo)
+    assert "c11" in state["owed"]
+    assert state["held_rounds"] == [merge, first]
+
+
+def test_the_deny_names_every_held_round(repo, home, monkeypatch):
+    first = _open_round(monkeypatch, repo)
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "nothing to fix yet")
+    second = _head(repo)
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "retrigger CI")
+    _point_budget_at(monkeypatch, repo)
+    _reviews_on(monkeypatch, (first, 11), (second, 22))
+    _stage_fix(repo)
+    _mark(repo, home)
+    res = _run('git commit -m "fix"', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "c11" in res.stderr and "c22" in res.stderr
+    assert first[:12] in res.stderr and second[:12] in res.stderr
+
+
+def test_a_fix_between_two_rounds_holds_only_the_newer(repo, monkeypatch):
+    """Control: H (c11), a real fix F reviewed (c22), then an empty push. F's
+    round is held; H's is not (F fixed it), and its key was reviewed before the
+    fix, so nothing of H's is owed."""
+    first = _open_round(monkeypatch, repo)
+    (repo / "f.py").write_text("value = 5\n")
+    _git(repo, "commit", "-qam", "round one's fix")
+    second = _head(repo)
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "retrigger CI")
+    _point_budget_at(monkeypatch, repo)
+    _reviews_on(monkeypatch, (first, 11), (second, 22))
+    state = _owed(repo)
+    assert state["owed"] == ["c22"]
+    assert state["held_rounds"] == [second]
+
+
+_PREMISE_SOUND = (
+    "Design-premise: SOUND\n"
+    "Expected before checking: the bound is the right place\n"
+    "P1 TRUE — the bound is checked in one place · read · 90% · falsified by a second reader\n"
+    "P2 TRUE — the one helper covers both callers · read · 90% · falsified by a third caller\n"
+)
+
+
+def test_one_reflection_at_the_tip_clears_every_held_round(repo, home, monkeypatch, tmp_path):
+    """Holding more rounds is no dead end: one reflection at the tip, valid for
+    the newest held round (round 2 owes the premise check), clears both."""
+    first = _open_round(monkeypatch, repo)
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "nothing to fix yet")
+    second = _head(repo)
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "retrigger CI")
+    tip = _head(repo)
+    _reviews_on(monkeypatch, (first, 11), (second, 22))
+    (home / "premise-check.txt").write_text(_PREMISE_SOUND)
+    monkeypatch.setenv("HOME", str(home))
+    msg = _write_reflection(tmp_path, _reflection(tip, keys=("c11", "c22"), premise_round=True))
+    _git(repo, "commit", "-q", "--allow-empty", "--cleanup=verbatim", "-F", str(msg))
+    _point_budget_at(monkeypatch, repo)
+    assert _owed(repo)["owed"] == []
+
+
+def test_an_older_round_already_answered_stays_credited(repo, monkeypatch, tmp_path):
+    """Control: H's own reflection R, then E reviewed (c22), then a second empty
+    push. H is held again, but R still credits c11; only c22 is owed."""
+    first = _open_round(monkeypatch, repo)
+    msg = _write_reflection(tmp_path, _reflection(first))
+    _git(repo, "commit", "-q", "--allow-empty", "--cleanup=verbatim", "-F", str(msg))
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "nothing to fix yet")
+    second = _head(repo)
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "retrigger CI")
+    _point_budget_at(monkeypatch, repo)
+    _reviews_on(monkeypatch, (first, 11), (second, 22))
+    assert _owed(repo)["owed"] == ["c22"]
+
+
+def test_the_default_branch_line_is_read_once_per_walk(repo, monkeypatch):
+    """Cost: every held round's fix_rows judges the merge of main against the
+    default branch's first-parent line; that line is read once, not per round."""
+    import review_budget
+    import review_late
+
+    rounds = [(_open_round(monkeypatch, repo), 11)]
+    for n in range(4):
+        _git(repo, "commit", "-q", "--allow-empty", "-m", f"empty {n}")
+        rounds.append((_head(repo), 20 + n))
+    _merge_main(repo)
+    _point_budget_at(monkeypatch, repo)
+    _reviews_on(monkeypatch, *rounds)
+    budget = review_budget.evaluate_pr("owner/repo", 99)
+    reads = []
+    real = rr._run
+
+    def counting(argv, *args, **kwargs):
+        if "--first-parent" in argv:
+            reads.append(argv)
+        return real(argv, *args, **kwargs)
+
+    monkeypatch.setattr(rr, "_run", counting)
+    rr._MAINLINE_CACHE.clear()
+    assert len(review_late.held_rounds(str(repo), budget)) == 5
+    assert len(reads) == 1
+
+
+def test_held_must_be_a_collection():
+    import review_late
+
+    with pytest.raises(TypeError):
+        review_late.late_findings({"status": "ok"}, "2026-01-01T00:00:00+00:00", held="abc")
+
+
+def test_rounds_behind_a_fixed_round_are_not_walked_again(repo, monkeypatch):
+    """Cost: a fix after the newest round also lies after every round behind
+    it, so the walk reads git once, not once per round (Rule R's slice is 1 s)."""
+    import review_budget
+    import review_late
+
+    first = _open_round(monkeypatch, repo)
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "nothing to fix yet")
+    second = _head(repo)
+    (repo / "f.py").write_text("value = 5\n")
+    _git(repo, "commit", "-qam", "the fix")
+    _point_budget_at(monkeypatch, repo)
+    _reviews_on(monkeypatch, (first, 11), (second, 22))
+    budget = review_budget.evaluate_pr("owner/repo", 99)
+    calls = []
+    real = rr.fix_rows
+
+    def counting(*args, **kwargs):
+        calls.append(args[1])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(rr, "fix_rows", counting)
+    assert review_late.held_rounds(str(repo), budget) == []
+    assert calls == [second]
 
 
 def test_a_late_finding_after_the_held_round_is_answerable(repo, home, monkeypatch, tmp_path):

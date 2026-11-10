@@ -980,10 +980,22 @@ def _mainline(cwd: str) -> frozenset[str]:
     default = _default_branch(cwd)
     if default is None:
         return frozenset()
-    code, out, err = _run(["git", "-C", cwd, "rev-list", "--first-parent", default])
+    # Keyed by the tip it was read at, so a cached line is never stale: the
+    # held-round walk reads it once per round, inside Rule R's 1 s slice.
+    code, out, err = _run(["git", "-C", cwd, "rev-parse", "-q", "--verify", f"{default}^{{commit}}"])
+    tip = out.strip() if code == 0 else ""
+    if tip and (cwd, tip) in _MAINLINE_CACHE:
+        return _MAINLINE_CACHE[(cwd, tip)]
+    code, out, err = _run(["git", "-C", cwd, "rev-list", "--first-parent", tip or default])
     if code != 0:
         raise Refused(f"git rev-list --first-parent {default} failed: {err.strip()[:300]}")
-    return frozenset(out.split())
+    line = frozenset(out.split())
+    if tip:
+        _MAINLINE_CACHE[(cwd, tip)] = line
+    return line
+
+
+_MAINLINE_CACHE: dict[tuple[str, str], frozenset[str]] = {}
 
 
 def _merge_is_no_fix(
@@ -1324,7 +1336,7 @@ def unreflected_round_behind(
         if named == round_head:
             return None
         # A held round is answered by a reflection naming the PR head, which
-        # the PR reached from the round by no fix (review_late.held_round).
+        # the PR reached from the round by no fix (review_late.held_rounds).
         try:
             if fix_rows(cwd, round_head, named, main_merges=True) == []:
                 return None
@@ -1343,13 +1355,14 @@ def owed_state(
     cutover: str | None = None,
     fix_time: Any = None,
     late_covered: Iterable[str] = (),
-    held: str | None = None,
+    held: Sequence[str] = (),
 ) -> dict[str, Any]:
     """What is owed, from a ``review_budget`` result: the open round's keys less
     ``covered`` (``covered_keys``). With ``cutover`` None that is all, and pure.
     With a cutover, the late keys from it on (``review_late.late_owed``) less
-    ``late_covered`` are owed too, including a ``held`` round's
-    (``review_late.held_round``: the PR moved past it by no fix). The two are
+    ``late_covered`` are owed too, including every ``held`` round's
+    (``review_late.held_rounds``, newest first: the PR moved past them by no
+    fix). The two are
     subtracted apart, so a reflection judged under the open round never clears
     a late key, which only its own round's context can. ``fix_time``
     (``review_late.fix_time_reader``) reads local git and may raise
@@ -1372,8 +1385,10 @@ def owed_state(
         "cutover": cutover,
         # None (unknown) until a cutover's late findings have been read.
         "late_keys": [] if cutover is None else None,
-        # The round head the PR moved past by no fix, whose keys stay owed.
-        "held_round": held,
+        # The round heads the PR moved past by no fix, newest first, whose
+        # keys stay owed; ``held_round`` is the newest, for older readers.
+        "held_rounds": list(held),
+        "held_round": held[0] if held else None,
     }
     if budget.get("status") != "ok":
         return state

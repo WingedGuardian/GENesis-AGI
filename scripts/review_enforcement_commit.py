@@ -1042,7 +1042,9 @@ def _key_rounds(
 
         with rr.deadline_scope(deadline):
             fix_time = review_late.fix_time_reader(cwd or ".", str(budget.get("current_head")))
-            held = review_late.held_round(cwd or ".", budget)
+            held = state.get("held_rounds")
+            if not isinstance(held, list):
+                raise rr.Refused("the owed state carries no held rounds")
             late = review_late.late_findings(budget, state.get("cutover"), fix_time, held=held)
         if late is None:
             raise rr.Refused("the late findings could not be read")
@@ -1142,12 +1144,14 @@ def _owed_message(state: dict, budget: dict, rr) -> str:
         f"BLOCKED: review round {round_n} of PR #{budget.get('pr')} owes a round "
         f"reflection before any further commit. Owed: {owed}.",
     ]
-    held = state.get("held_round")
-    if isinstance(held, str):
+    held = [h for h in state.get("held_rounds") or [] if isinstance(h, str)]
+    if held:
+        heads = ", ".join(h[:12] for h in held)
         lines.append(
-            f"Nothing after the reviewed head {held[:12]} is a fix (only merges of main or "
-            "empty commits), so that round's findings are still owed; the reflection names "
-            "the PR head, as for any owed key."
+            f"Nothing after the reviewed head{'s' if len(held) > 1 else ''} {heads} is a fix "
+            "(only merges of main or empty commits), so "
+            + ("those rounds'" if len(held) > 1 else "that round's")
+            + " findings are still owed; the reflection names the PR head, as for any owed key."
         )
     if not state.get("settled") and state.get("settle_until"):
         lines.append(
