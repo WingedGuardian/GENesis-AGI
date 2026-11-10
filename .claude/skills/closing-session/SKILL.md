@@ -772,13 +772,13 @@ diff, not just the section.
   exception — measured: PR #1541's originating session had died and the work sat
   unowned. Ownership lives with the queue, not with the author.
 - **It does not open new work.** If it finds an UNRELATED bug, it files it and
-  moves on — **routed by OWNER, per CLAUDE.md's "Where deferred work goes"**.
-  An unrelated defect in Genesis itself is repo work, so it becomes a **GitHub
-  issue**, scrubbed to technical detail only; that is what lets another
-  contributor pick it up instead of leaving it install-local and invisible to
-  the project queue. `follow_up_create` is for user-owned work and state purely
-  local to this box, not for a repo bug. A security defect is never filed
-  publicly before it is fixed. Note this is a deliberate narrowing of
+  moves on — **public by default, per CLAUDE.md's "Where deferred work goes"**.
+  File/reuse a safely described GitHub issue even for install-local or
+  security-related work, then verify its receipt. Private supporting evidence
+  does not force a private task. Use `follow_up_create` for the whole item only
+  when useful public wording necessarily reveals protected information or enables
+  concrete exploit/cost/harm; state that harm and why redaction cannot avoid it.
+  Note this is a deliberate narrowing of
   CLAUDE.md's "bias = FIX NOW" default, not an exemption from it: a closing
   session is the standing case (3) of that rule — fixing unrelated things in
   place is how it turns back into a build session and stops closing anything. A
@@ -902,12 +902,13 @@ Devin-built PR starts a paid Devin session unless its first line is `(aside)`.
 On a PR Devin did not build, `(aside)` changes nothing; leave it off.
 
 **Public comments.** Scrub the audit for public-artifact privacy (no install paths,
-hosts or personal context) before posting. Keep security-class findings out: a gap
-already live on `main` that would hand a capability to someone with less access
-(secrets, private data, an approval or privacy gate) goes to a private follow-up,
-never a comment or issue. For a security-class defect the PR itself introduces,
-describe its effect at class level without exploit strings; the detail can follow
-once it is fixed.
+hosts or personal context) before posting. Keep out only a flaw an outside
+attacker could exploit, under the same test as issues ("Keep the PR the PR",
+below): one already live on `main` goes to a private follow-up, never a comment
+or issue; for one the PR itself introduces, describe its effect at class level
+without exploit strings, and let the detail follow once it is fixed. A guard or
+hook gap is usually not that kind of flaw, and then the audit reports it like
+any other finding.
 
 ## Ordering between PRs
 
@@ -986,6 +987,29 @@ neither blocks opening).
 
    Check the triage by how few bucket-3 decisions the owner reverses: a reversal
    means that kind of call belongs in bucket 4.
+
+### Standing mode (Claude Code only)
+
+When the owner starts a closing session to keep working the queue on a pace
+(`/loop` with ScheduleWakeup, at the interval the owner sets and can change), the
+one-closing-session precondition above holds for the whole life of that session.
+Each pass reads the queue with ONE listing (`gh pr list --state open --json
+number,isDraft,updatedAt,headRefOid,statusCheckRollup`, with a limit above the
+queue size, reconciled against an independent count as step 1 says; drafts stay
+out of the closing set) and acts only on PRs that changed since the previous
+wake: `updatedAt` later than it (a new head or review), or a check that finished
+after it (a check run's `completedAt`, a commit status's `startedAt` in
+`statusCheckRollup`). Finished checks do not move `updatedAt`: MEASURED
+2026-11-08, a check completed at 01:30:58Z on a PR whose `updatedAt` stayed
+01:01:05Z. The listing is the cheap read; what it rules out is the
+unprompted per-PR watching that "When to DRIVE a Merge" defines, and re-requesting
+review with nothing new pushed. Owner questions are still batched across PRs
+(step 3 above). Merge, gate and deploy rules are unchanged, including the deploy
+owed after merging a host-path PR. The validator's standing-mode limits
+(validating-merges, "Standing mode") do not apply here. A second opinion inside
+a pass is a fresh-context review subagent, never a workflow runner that spawns
+its own sessions outside the approval gate; the round-1 two-reviewer rule for
+hook-surface PRs is unchanged.
 
 ### Two reviewers pushing opposite values
 
@@ -1733,24 +1757,25 @@ names, hosts, IPs, paths embedding a username, anything about the user's
 real-world life — so the issue carries technical detail only. Borderline, in
 either direction? Ask. See CLAUDE.md, "Where deferred work goes".
 
-**The exception that is NEVER waived: a security defect is not filed publicly
-before it is fixed.** It goes to a private record under `~/.genesis/output/`
-plus a `follow_up_create` row, and nothing about it reaches a public surface —
-the relaxed filing rule above does not touch this one.
+**The one kind of flaw kept private until it is fixed: one an outside
+attacker could exploit.** CLAUDE.md, "Where deferred work goes", is the rule:
+the issue is public unless a useful description necessarily hands someone
+outside the install a path to exploit it, such as an active internet-reachable
+hole, or necessarily reveals protected information. Only then does the whole
+item go to a `follow_up_create` row, with its evidence under
+`~/.genesis/output/`, and nothing about it reaches a public surface until the
+fix lands.
 
-**The test is WHO GAINS, not the word "bypass"** (see CLAUDE.md, "Where
-deferred work goes", for the full rule this mirrors). Security-class means
-disclosure hands someone a capability they do not already have: a credential
-exposure, an auth or privilege bypass, an injection path, anything reachable by
-a party with LESS access than it grants. A fail-open in a LOCAL development
-guard is usually not that — it runs only where an install wires it, whoever can
-trigger it already has commit access to that checkout, and the worst case is
-typically an under-reviewed change reaching a PR that still waits on maintainer
-approval. Apply the test rather than the label; the catch-all phrasing this
-replaces swept in most of what this repo builds. The exception the test catches
-and the label does not: a guard whose job is stopping a SECRET or PRIVATE DATA
-from reaching a public surface is security-class however local it is, because a
-branch on a public repo is public the moment it is pushed, merged or not.
+**The test is who could exploit it, never the label** (owner ruling,
+2026-11-08). A gap in a guard or hook is usually not that, and a guard that
+keeps secrets or private data off the public repo is no exception: those
+guards stop a session's own unwanted behaviour rather than an outside
+attacker, they run only where an install wires them, and whoever can trigger
+one already has commit access to that checkout. File such a gap publicly at
+class level, and keep the specific input that slips past in a private
+evidence file under `~/.genesis/output/`. A guard with an input an outside
+party can reach is the exception the test catches. Calling something a security flaw, a bypass, a leak guard or a
+compliance gap decides nothing on its own.
 
 Write the issue while the context is in your head — the measurement, the
 file:line, the falsifier, and why it was out of scope for the PR. An issue that

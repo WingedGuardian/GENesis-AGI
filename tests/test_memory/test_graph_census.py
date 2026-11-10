@@ -637,7 +637,9 @@ def test_the_default_secrets_file_is_main_checkouts(proc_root, repo, tmp_path, m
     secrets.env, which the census proves by its ctime against the start."""
     r, _, _ = repo
     (r / "secrets.env").write_text("OTHER=1\n")
-    env = {"GENESIS_DB_PATH": str(tmp_path / "live.db")}
+    # A server always carries HOME; one with no home-config file loads the checkout file.
+    (tmp_path / "server-home").mkdir()
+    env = {"GENESIS_DB_PATH": str(tmp_path / "live.db"), "HOME": str(tmp_path / "server-home")}
     p = _census_one(proc_root, repo, tmp_path, main_venv, env, secrets=False)
     assert p["telemetry_off"] is False
     # Changed after the server started (a fresh /proc with an earlier start): unknown.

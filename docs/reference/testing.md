@@ -405,6 +405,37 @@ IPv6 link-local scope id, which `/proc/net/tcp6` does not record, so two
 listeners with the same link-local address on different interfaces are judged
 as one.
 
+### The write audit: writes into the real home are reported
+
+`tests/_live_writes.py`, armed last, reports (never fails) the writes a test
+makes into the real home outside its temp dirs, for the operations it hooks: `open` with write intent,
+`os.remove`/`rename`/`replace`/`mkdir`/`rmdir`/`truncate`/`symlink`/`link`,
+`shutil.rmtree`, and an SQLite connect to a file that is not opened read-only.
+It also reports reads of the real credential files (the deployed `secrets.env`,
+`~/.claude/.credentials.json`, `~/.config/gh/hosts.yml`,
+`~/.genesis/cc_oauth_token.env`).
+
+- Allowed, so never reported: `tempfile.gettempdir()`, pytest's basetemp, the
+  box lock file, `/dev`, and `__pycache__` / `.pytest_cache` directories.
+- Each write is classed by where it lands (the deployed checkout, this checkout,
+  `~/.genesis`, `~/.claude`, elsewhere in the home) and attributed to the test.
+- The run summary counts tests per class under "writes outside the test's temp
+  dirs"; `GENESIS_LIVE_WRITES_REPORT=<file>` writes one tab-separated line per
+  (test, class, operation, path), on every run.
+- A hit is a write that happens: an attempt the kernel refuses or that changes
+  nothing (`mkdir(exist_ok=True)` on an existing directory, `unlink` of a missing
+  file, reopening an existing file without writing) is not recorded. A relative
+  `os.open` is judged against the cwd and labelled so (its audit event carries no
+  `dir_fd`). Writes during collection count as "outside any test".
+- Not covered: writes made by child processes, writes without an audit event,
+  metadata changes (`chmod`, `utime`, `setxattr`, `touch` of an existing file),
+  `mkfifo`/`mknod`, SQLite writes through an already-open connection, and
+  `file://localhost` or percent-encoded SQLite URIs. The OS-level sandbox is the
+  boundary there.
+
+The list it produces is the to-do list for moving each such test under its own
+`tmp_path`; once it is empty, the audit can refuse instead of report.
+
 ## Integration Tests
 
 Integration tests in `tests/integration/` require running external services
@@ -423,3 +454,24 @@ When adding a new subsystem or feature:
 2. Add subsystem-specific fixtures in `tests/test_<subsystem>/conftest.py`.
 3. Mock external dependencies; do not require live services for unit tests.
 4. Verify the new tests pass in isolation: `pytest -v tests/test_<subsystem>/`.
+
+## Request-owned resource coverage
+
+Shutdown grace and actual synchronous completion are covered by
+`tests/test_db/test_request_database_drain.py`,
+`tests/test_db/test_request_database_drain_states.py`,
+`tests/test_db/test_physical_work.py`, and
+`tests/test_db/test_physical_work_states.py`. These cover real owned-file use,
+queued/running executor cancellation, ambiguous submission, joined children,
+context propagation and legacy cancellation. The connection budget is tested
+separately from the number of physical operations. Fault fixtures release and
+join their real workers; an import failure or unrelated timeout is not evidence
+of forbidden resource use. Production factories and shared activation remain
+separate qualifications.
+
+`tests/test_memory/test_resource_thread_ownership.py` exercises all nine migrated
+memory boundaries with gated real file I/O, cancellation and a real scratch
+database lease. `tests/test_memory/test_tag_index_ownership.py` covers independent
+background admission, physical scan drain, refusal/creation failure, prestart
+cancellation, retriever propagation and the body-completed/done-callback gap.
+`tests/test_memory/test_tag_index_swr.py` retains legacy stale-query behavior.

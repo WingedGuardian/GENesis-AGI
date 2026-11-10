@@ -28,6 +28,68 @@ def invoker():
     return CCInvoker(claude_path="/usr/bin/claude")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("error,kind", [
+    ("usage limit reached", "CCQuotaExhaustedError"),
+    ("MCP server failed", "CCMCPError"), ("unknown failure", "CCProcessError"),
+])
+async def test_external_oom_evidence_stops_before_provider_health(
+    invoker, monkeypatch, streaming, error, kind,
+):
+    from genesis.cc import oom
+    from genesis.cc.exceptions import CCMemoryPressureError
+
+    _no_host_syscalls(monkeypatch)
+    evidence = oom.OOMEvidence("/synthetic/memory.events", (1, 2), (1, 2), 4, 5, -9)
+    monkeypatch.setattr(oom, "capture_baseline", lambda **kw: object())
+    monkeypatch.setattr(oom, "capture_finish", lambda *a, **kw: evidence)
+    if streaming:
+        proc = _streaming_proc(b"")
+        proc.stderr = _make_mock_stderr(error.encode())
+    else:
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(b"", error.encode()))
+    proc.returncode = -9
+    proc.pid = 424207
+    monkeypatch.setattr("genesis.cc.invoker._get_scope_args", AsyncMock(return_value=[]))
+    monkeypatch.setattr("asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+    invoker._notify_status_change = AsyncMock()
+    with pytest.raises(CCMemoryPressureError) as raised:
+        await _call(invoker, "run_streaming" if streaming else "run", CCInvocation(prompt="x"))
+    assert raised.value.evidence is evidence
+    assert type(raised.value.__cause__).__name__ == kind
+    invoker._notify_status_change.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("states,overage,rejected", [
+    (["rejected"], False, True), (["rejected", "allowed"], False, False),
+    (["allowed", "rejected"], False, True), (["rejected"], True, False),
+    (["allowed_warning"], False, False),
+])
+async def test_pressure_keeps_effective_structured_limit_cause(invoker, monkeypatch, states, overage, rejected):
+    from genesis.cc import oom
+    from genesis.cc.exceptions import CCMemoryPressureError, CCRateLimitError
+
+    _no_host_syscalls(monkeypatch)
+    monkeypatch.setattr(oom, "capture_baseline", lambda **kw: object())
+    monkeypatch.setattr(oom, "capture_finish", lambda *a, **kw: oom.OOMEvidence("synthetic", (1, 2), (1, 2), 4, 5, -9))
+    events = [{"type": "rate_limit_event", "rate_limit_info": {"status": state, "isUsingOverage": overage}} for state in states]
+    proc = _streaming_proc(_make_stream_lines(*events))
+    proc.pid, proc.returncode = 424211, -9
+    monkeypatch.setattr("genesis.cc.invoker._get_scope_args", AsyncMock(return_value=[]))
+    monkeypatch.setattr("asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+    invoker._notify_status_change = AsyncMock()
+    with pytest.raises(CCMemoryPressureError) as raised:
+        await _call(invoker, "run_streaming", CCInvocation(prompt="synthetic"))
+    cause = raised.value.__cause__
+    assert isinstance(cause, CCRateLimitError) == rejected
+    if rejected:
+        assert cause.raw_event == events[-1]
+    invoker._notify_status_change.assert_not_awaited()
+
+
 def test_build_args_defaults(invoker):
     inv = CCInvocation(prompt="hello")
     args = invoker._build_args(inv)

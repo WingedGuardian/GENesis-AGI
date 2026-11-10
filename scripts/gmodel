@@ -97,12 +97,10 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 # ZAI_CODING_API_KEY) resolve for roster.overrides_for. The child's env is built
 # explicitly below — we never blanket-forward every secret, and ANTHROPIC_API_KEY
 # is dropped from a native child and pinned empty in a routed one.
-# SECRETS_PATH wins, as in genesis.env.secrets_path() (not importable yet here).
-_SECRETS = (
-    Path(os.environ["SECRETS_PATH"]).expanduser()
-    if os.environ.get("SECRETS_PATH")
-    else _REPO_ROOT / "secrets.env"
-)
+# Resolved as genesis.env.secrets_path() resolves it (src is on sys.path above).
+from genesis.secrets_location import resolve as _resolve_secrets  # noqa: E402
+
+_SECRETS = _resolve_secrets(environ=os.environ, repo_root=_REPO_ROOT)  # pragma: allowlist secret
 if _SECRETS.is_file():
     try:
         from dotenv import load_dotenv

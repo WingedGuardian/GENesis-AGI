@@ -194,6 +194,9 @@ def test_the_record_command_targets_the_database_the_row_came_from(tmp_path, rep
     record = next(line for line in out.splitlines() if line.lstrip().startswith("record:"))
     argv = shlex.split(record.split("record:", 1)[1].split("(then again")[0])
     assert argv[argv.index("--db-path") + 1] == str(db), record
+    # A bare `python3` may lack aiosqlite, which pr_verification.py needs. Read the
+    # whole output: a quoted interpreter path is not confined to one line.
+    assert f"record: {shlex.quote(sys.executable)} scripts/pr_verification.py close" in out
 
 
 def test_the_newest_planned_pr_wins(tmp_path, repo, capsys):
