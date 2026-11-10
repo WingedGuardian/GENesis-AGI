@@ -157,8 +157,10 @@ class _Writer:
     meanwhile is never replaced); judge the aside again (review L-2; a run
     killed before it leaves that to the judge of the next, Judge._landed); record.
     A refused part whose aside holds something the restore did not move there
-    stays in flight, and then nothing else is written this run or the next
-    (Judge.unresolved); the repair's own as-left copy there holds nothing back.
+    stays in flight, and then no part at its path, below it or above it is
+    written this run or the next (Judge.unresolved, runs.held_covers; an
+    old-form folder stops every part); the repair's own as-left copy there
+    holds nothing back.
     Then the index parts in one update-index call, the flags, a refresh, and a
     second judge that must read already-restored for every part written."""
 
@@ -180,7 +182,7 @@ class _Writer:
         self.called = set()  # every path whose entries the index call replaced
         # The in-flight record kept for the next run: an aside still holding what
         # a refused in-flight part left there (#3986 review). While it is held
-        # nothing else is written, since the record has one slot.
+        # no part it covers is written (runs.held_covers).
         self.hold = list(judge.inflight) if judge.held else None
 
     def run(self) -> int:
@@ -197,14 +199,15 @@ class _Writer:
         self.repo_fd = os.open(self.repo, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             for row in nodes:
-                if self.hold:
-                    break
-                self._node(row)
+                if self.chk.held_stops_all(self._holds()):
+                    break  # an old-form hold stops every part
+                if (row["path"], "node") not in self.out:  # refused by a hold set this run
+                    self._node(row)
             for (p, k), v in self.verdict.items():
                 if k == "entry" and v == "as-left":
                     self.out[(p, k)] = self.out[(j.entry_of[p], "node")]
             _step("index")
-            if not self.hold:
+            if not self.chk.held_stops_all(self._holds()):
                 self._index()
                 self._flags()
             if self.wrote:
@@ -320,7 +323,7 @@ class _Writer:
         finally:
             if staged is not None:
                 os.close(staged)
-        if held is not None:  # kept in flight, and nothing else written (#3986 review)
+        if held is not None:  # kept in flight; what it covers is not written (#3986 review)
             self.hold = [held, p, "node"]
             unresolved = self.chk.unresolved_note(self._aside(p, held))
             for (q, k), v in self.verdict.items():
@@ -330,12 +333,19 @@ class _Writer:
                 # is not), so that is tested first.
                 if v != "as-left" or (q, k) in self.out:
                     continue
+                if not self.chk.held_covers([self.hold], q):  # this hold's path only
+                    continue
                 if k == "entry" and (j.entry_of[q], "node") in self.out:
                     continue
                 self._refuse(q, k, self.chk.INFLIGHT_UNRESOLVED, unresolved)
         if flying:
             self._save(self.hold)
         self.flight = None
+
+    def _holds(self) -> list:
+        """Every hold this run knows: the judge's (the slot's and every held
+        aside the run folders show) and one set this run (runs.held_covers)."""
+        return self.j.holds + ([self.hold] if self.hold else [])
 
     def _aside(self, p: str, run: str) -> str:
         return os.path.join(self.ctx.shown, run, "aside", p)
@@ -535,7 +545,8 @@ class _Writer:
         that stages between that read and the call, milliseconds; git has no
         compare-and-swap for the index."""
         j, rp = self.j, self.rp
-        todo = sorted(p for (p, k), v in self.verdict.items() if k == "index" and v == "as-left")
+        todo = sorted(p for (p, k), v in self.verdict.items()
+                      if k == "index" and v == "as-left" and (p, k) not in self.out)  # fmt: skip
         if not todo:
             return
         rows = {r["path"]: r for r in j.rows}
@@ -641,6 +652,8 @@ class _Writer:
             again = v == "already-restored" and self.out.get((p, "index")) == "restored"
             if k != "flag" or (v != "as-left" and not again):
                 continue
+            if self.out.get((p, k), "").startswith("refused:"):
+                continue  # a hold set this run refused it first
             if not self._back(p, "index"):
                 self._refuse(p, "flag", "row-refused")
                 continue
