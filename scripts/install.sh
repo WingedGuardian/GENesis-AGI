@@ -1473,6 +1473,12 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
                 echo "    + $timer_name enabled + started" || true
         fi
     done
+    # Arm the graph engine step 6 verified, as bootstrap.sh does: enable, and
+    # start it when not running (lib/falkordb_install.sh, falkordb_enable_unit).
+    # Defined only when step 6 sourced the lib.
+    if declare -F falkordb_enable_unit >/dev/null; then
+        falkordb_enable_unit "$SYSTEMD_USER_DIR/genesis-falkordb.service"
+    fi
 fi
 
 # The browser stack: the Camoufox engine and the Chromium the browser packages pin,

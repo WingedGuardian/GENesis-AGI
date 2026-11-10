@@ -260,3 +260,56 @@ class TestCriticalFailureProbeWiring:
 
             assert len(probes) == 3
             assert any(p is probe_ollama for p in probes)
+
+
+class TestFalkordbProbeWiring:
+    """``probe_falkordb`` joins the steady-state critical_failure probes exactly
+    when the engine's unit is enabled (D3). Built through the REAL builder, so
+    deleting the wiring fails here rather than in a copy of the list."""
+
+    @staticmethod
+    def _probes(unit_present: bool) -> list:
+        from unittest.mock import patch
+
+        from genesis.learning.signals.critical_failure import CriticalFailureCollector
+        from genesis.runtime.init.learning import build_learning_collectors
+
+        with patch(
+            "genesis.memory.graphstore_config.engine_unit_present",
+            return_value=unit_present,
+        ):
+            collectors = build_learning_collectors(MagicMock())
+        [cf] = [c for c in collectors if isinstance(c, CriticalFailureCollector)]
+        return cf._probes
+
+    def test_included_when_the_unit_exists(self):
+        from genesis.observability.health import probe_falkordb
+
+        assert any(p is probe_falkordb for p in self._probes(True))
+
+    def test_excluded_when_the_unit_is_absent(self):
+        from genesis.observability.health import probe_falkordb
+
+        assert not any(p is probe_falkordb for p in self._probes(False))
+
+
+class TestCriticalFailureOmitsNotApplicableProbes:
+    """A probe answering None ("not applicable": probe_falkordb on an engine that
+    is neither armed nor selected) is omitted, never read as a result."""
+
+    def test_a_none_answer_is_omitted(self):
+        import asyncio
+
+        from genesis.learning.signals.critical_failure import CriticalFailureCollector
+        from genesis.observability.types import ProbeResult, ProbeStatus
+
+        async def _healthy():
+            return ProbeResult(
+                name="db", status=ProbeStatus.HEALTHY, latency_ms=1.0, checked_at="t"
+            )
+
+        async def _not_applicable():
+            return None
+
+        reading = asyncio.run(CriticalFailureCollector([_healthy, _not_applicable]).collect())
+        assert reading.value == 0.0

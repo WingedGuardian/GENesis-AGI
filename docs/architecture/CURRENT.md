@@ -269,8 +269,25 @@ snapshot is fixed at the first SELECT step, so stamping afterwards can pin a
 projection that is missing a mid-load commit (MEASURED 2026-09-06). That preparation is now
 used: `graphstore_falkor.FalkorGraphStore` is the second implementation, a
 long-lived FalkorDB server reached over a unix socket, selected by
-`config/graphstore.yaml` (`mode: networkx|falkordb`, default **networkx**, so
-the lever is inert until moved). It carries its own projection of
+`config/graphstore.yaml` (`mode: networkx|falkordb`, shipped default
+**falkordb** since the cutover bar was met: 14 days on a live install with zero
+fallbacks). The default applies **where present only**:
+`graphstore_config.selection()` keeps reads on NetworkX QUIETLY when `falkordb`
+comes from the shipped file alone (no overlay sets `mode`) and no
+`genesis-falkordb.service` unit is rendered and enabled (its `default.target.wants` link), publishing the selection with
+`quiet_reason="engine_not_provisioned"` and no error, so the telemetry row is
+neither a fallback nor a clock break (`graph_cutover.is_quiet_row`; a row only
+partly quiet still breaks). An overlay `mode: falkordb`, and a unit that exists
+but is stopped or failed, stay loud. `probe_falkordb` joins the steady-state
+critical-failure probes exactly when the unit is enabled
+(`runtime/init/learning.py`, decided at server start). Bootstrap and install
+arm the unit after rendering it from a verified engine (`falkordb_enable_unit`):
+`enable --now` when it is inactive or failed, a plain `enable` when it is
+running and disabled (a running engine is never started or restarted), nothing
+when masked or listed in `~/.genesis/config/disabled_timers`; a failed start is
+one WARNING line, never a failed bootstrap. The graphstore dashboard save
+writes only the keys that changed, so an unrelated save never pins `mode`
+into the overlay. It carries its own projection of
 `memory_links` and applies the SAME visibility predicate — but at QUERY time,
 over mirrored `invalid_epoch`/`deprecated` node properties, which closes the
 future-`invalid_at` gap the NetworkX store states below. That closes the TIME
@@ -312,7 +329,9 @@ then rolls back when bootstrap refuses). The unit is `Type=simple` with a PING r
 poll, because the wheel's redis has no libsystemd to notify with, and a deploy
 moves an engine onto a different module only when systemd reports it inactive
 or failed (a running engine, or one whose state cannot be read, keeps its unit)
-or `GENESIS_FALKORDB_SWITCH=1` asks for it.
+or `GENESIS_FALKORDB_SWITCH=1` asks for it (on a running install through
+`update.sh --take-template genesis-falkordb.service`, since bootstrap refuses
+under a live server; then restart the unit).
 The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
 (`memory/graphstore_project.py`); that schedule is its staleness bound. The
 engine keeps no data on disk, so its unit also (re)starts the projector on

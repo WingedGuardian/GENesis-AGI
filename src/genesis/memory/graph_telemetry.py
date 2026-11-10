@@ -114,6 +114,8 @@ class _Tally:
     outcomes: Counter = field(default_factory=Counter)
     served: Counter = field(default_factory=Counter)
     configured: Counter = field(default_factory=Counter)
+    #: Traversals whose networkx selection was quiet, by ``quiet_reason``.
+    quiet: Counter = field(default_factory=Counter)
     events: list[dict] = field(default_factory=list)
     #: Primary traversals' latency, per store that answered: bucket -> count.
     primary_ms: dict[str, Counter] = field(default_factory=dict)
@@ -129,11 +131,14 @@ class _Tally:
         final_reason: str | None,
         diag: dict | None = None,
         elapsed_ms: float | None = None,
+        quiet_reason: str | None = None,
     ) -> None:
         self.traversals += 1
         self.outcomes[outcome] += 1
         self.served[served_by] += 1
         self.configured[configured] += 1
+        if quiet_reason is not None:
+            self.quiet[quiet_reason] += 1
         if outcome in _CLOCK_BREAKING:
             event = {
                 "outcome": outcome,
@@ -157,12 +162,11 @@ _TALLY: contextvars.ContextVar[_Tally | None] = contextvars.ContextVar(
     "graph_traversal_tally",
     default=None,
 )
-#: ``(effective_mode, selection_error_class)`` published by ``_traversal_store``
-#: for the ``traverse`` call that just asked it. ``traverse`` resets it first, so
-#: a stale value from an earlier call can never be read.
-_SELECTION: contextvars.ContextVar[tuple[str, str | None] | None] = contextvars.ContextVar(
-    "graph_store_selection",
-    default=None,
+#: ``(effective_mode, selection_error_class, quiet_reason)`` published by
+#: ``_traversal_store`` for the ``traverse`` call that just asked it. ``traverse``
+#: resets it first, so a stale value from an earlier call can never be read.
+_SELECTION: contextvars.ContextVar[tuple[str, str | None, str | None] | None] = (
+    contextvars.ContextVar("graph_store_selection", default=None)
 )
 
 
@@ -172,14 +176,24 @@ def reset_selection() -> None:
     _SELECTION.set(None)
 
 
-def publish_selection(mode: str, error: str | None) -> None:
-    _SELECTION.set((mode, error))
+def publish_selection(mode: str, error: str | None, *, quiet_reason: str | None = None) -> None:
+    """``quiet_reason`` names a networkx selection that is neither a fallback
+    nor an error (``graphstore_config.ENGINE_NOT_PROVISIONED``). It must never
+    ride with an ``error``: an error is a clock break, a quiet reason is not."""
+    _SELECTION.set((mode, error, None if error else quiet_reason))
 
 
 def read_selection() -> tuple[str, str | None]:
     """``(effective_mode, selection_error_class)`` for the current traversal;
     ``("unknown", None)`` when the store was chosen without the lever (tests)."""
-    return _SELECTION.get() or ("unknown", None)
+    mode, error, _ = _SELECTION.get() or ("unknown", None, None)
+    return mode, error
+
+
+def read_quiet_reason() -> str | None:
+    """Why the current traversal's networkx selection is quiet, or ``None``."""
+    selected = _SELECTION.get()
+    return selected[2] if selected else None
 
 
 #: Set by a store that answered only after retrying a stale pooled connection
@@ -370,6 +384,10 @@ async def _write_tally(
             "events": tally.events,
             "prior_write_failures": carried,
         }
+        if tally.quiet:
+            # Only when present, so a row with no quiet traversal keeps the
+            # shape every reader already knows.
+            metrics["quiet"] = dict(tally.quiet)
         if tally.primary_ms:
             metrics["primary_ms"] = {k: dict(v) for k, v in tally.primary_ms.items()}
             metrics["primary_ms_max"] = tally.primary_ms_max

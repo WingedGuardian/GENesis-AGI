@@ -70,6 +70,24 @@ async def _notify_gate_disabled() -> None:
         logger.warning("Gate-disable Telegram notice failed", exc_info=True)
 
 
+#: Domains whose PUT persists only the keys the user changed. The editor submits
+#: the WHOLE current config, so a plain merge copies every shipped default into
+#: the overlay. For graphstore that pins `mode`: an unrelated save would make
+#: the shipped falkordb default an explicit choice, and an explicit choice is
+#: loud where the shipped default stays quiet (graphstore_config.selection).
+_CHANGED_KEYS_ONLY = frozenset({"graphstore"})
+
+_MISSING = object()
+
+
+def _changed_keys(config_filename: str, submitted: dict) -> dict:
+    """The submitted keys whose value differs from the current merged config.
+    A key the overlay already holds needs no special case: the write merges
+    into the existing overlay, so a dropped unchanged key keeps its value."""
+    current = _load_yaml_merged(config_filename)
+    return {k: v for k, v in submitted.items() if current.get(k, _MISSING) != v}
+
+
 def _strip_hidden(domain, data: dict) -> dict:
     """Remove hidden_fields from a config dict before serving to UI."""
     for field in domain.hidden_fields:
@@ -136,6 +154,9 @@ async def settings_update(domain_name: str):
     # Strict identity check: bool("false") is True — a client serializing
     # booleans as strings must NEVER accidentally satisfy the confirmation.
     confirm_gate = changes.pop("confirm_disable_approval_gate", None) is True
+
+    if domain_name in _CHANGED_KEYS_ONLY:
+        changes = _changed_keys(domain.config_filename, changes)
 
     # Validate
     validator = _DOMAIN_VALIDATORS.get(domain_name)
