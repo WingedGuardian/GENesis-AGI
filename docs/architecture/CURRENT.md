@@ -73,8 +73,20 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 2ece179f9ebc 2026-10-28
+verified: 5a3de4eee 2026-11-07
 ```
+
+The 2026-11-07 verification covers the request-owned memory thread boundaries
+below; other memory descriptions retain their individually cited verification dates.
+
+**Shared-owner prerequisite (not activated):** nine thread boundaries in
+`memory/store.py`, `retrieval.py`, `intent.py` and `proactive.py` retain actual
+physical completion through their RequestDatabase unit. Legacy connections keep
+ordinary thread cancellation. The retriever forwards the facade to tag expansion;
+tag scans run in independently admitted background units, with accepted-task
+completion as the single-flight release. Pressure or draining serves the stale
+query. Other maintenance threads and shared provider closers still need factory
+qualification; this is not a shared-service activation.
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
 `memory_fts`) and Qdrant share no transaction, so drift (orphaned "ghost"
@@ -1480,6 +1492,10 @@ verified: f62608045437 2026-11-09
   and matching backtick runs. Literal terminal punctuation and repeated tokens in different
   contexts retain their own identities. The read-only coverage report retains
   these occurrences too; it does not reconstruct coverage from normalized URLs.
+  It separately reports stored input, baseline-only membership, whole logical
+  items, response presence and Source/mention evidence; strict decoding rejects
+  corrupt v2 inputs as a whole. These are retained-evidence facts, not proof of
+  source acquisition or model judgment; see `docs/reference/inbox-coverage-evidence.md`.
   An ordered proof finds the first source-frame closure; ambiguous tokens stay
   raw and cannot supply wrapper context for later URLs.
   The wrapper correction is scoped to this URL path; the entry's existing
@@ -1798,6 +1814,12 @@ the shared banner is not an assertion about all concurrent sessions.
   locks. This does not activate the service or establish production capacity
   or unattended resource-failure readiness. See
   `docs/reference/codebase-managed.md`.
+  The prepared typed timer tail calls the captured original owner and accepts
+  only complete, context-bound native outcomes. GitNexus selection captures
+  Node/package metadata before reservation and confirms the pinned installation
+  only after original scope registration and admission. It uses the shared
+  native-intent seam; imported vendor files remain trusted installed inputs.
+  This wiring preserves negative readiness and does not activate indexing.
   The queue's `scripts/lib/index_marker_legacy.py` isolates malformed legacy
   artifacts in retained import receipts without replacing business failures;
   real filesystem/SQLite errors remain visible. Schema 3 atomically fans requests
@@ -1812,7 +1834,7 @@ the shared banner is not an assertion about all concurrent sessions.
   fences every automatic reconciliation/claim/launch until the later protocol
   completes. There is no readiness setter. Behind that fence, the checked
   consumer validates complete NUL list/claim/escalation acknowledgements and
-  actual child status, dispatches one provider from its authoritative claim and
+  transport status, dispatches one provider from its authoritative typed claim and
   settles the complete context. Entrypoint and freeze repository normalization
   preserve trailing newlines and collapse Linux root aliases before lock hashing.
   Retained terminal decisions replay without
@@ -1843,8 +1865,8 @@ the shared banner is not an assertion about all concurrent sessions.
   original ancestor chain. Collector read failures retain the affected physical
   hold without aborting unrelated reconciliation; publication failures propagate.
   Intent callback RuntimeError refuses child creation
-  with private diagnostics. Automatic readiness stays fenced; actual scope creation, watchdog/
-  runner wiring and recovery remain unfinished. Synthetic fixtures do not
+  with private diagnostics. Automatic readiness stays fenced; typed timer
+  dispatch and supervised recovery remain unfinished. Synthetic fixtures do not
   establish native kernel or production acceptance.
   `scripts/lib/code_intel_source.py` provides explicit captured-source diagnostics
   and a finite assembly API: Python and shell buffers match one immutable Git
@@ -1855,17 +1877,49 @@ the shared banner is not an assertion about all concurrent sessions.
   only the canonical runner lock crosses its entry handoff. Optional queued
   inputs freeze the native environment with one registered invocation slot,
   preserving process-control environment and managed config/path/admission
-  checks. Private runtime transport is not launch authority. The physical
-  owner, monitor and recovery caller remain separate, and automatic readiness
-  stays fenced.
+  checks. Private runtime transport is not launch authority; automatic
+  readiness stays fenced and
+  the supervised recovery caller remains separate.
   The private CBM reporter consumes its bounded startup ACK before worker entry,
   verifies its actual live parent and original scope, and rechecks ownership at
   registration and native intent. Original counter baselines and fresh startup
   OOM observations survive the handoff; either hierarchical or local sampled
   kills refuse startup. The existing private output carries framed control
   data, with provider output routed to logging. Watchdog/CPU/IO policy binds
-  the same source identity. Physical owner integration, GitNexus's runtime
-  adapter and native qualification remain separate gates.
+  the same source identity. The private initial-owner endpoint takes the
+  canonical locks, reserves its actual self once, owns scoped reporter and
+  monitor children, and sends ACK only after fresh child checks. Its sole
+  private cancellation-pipe writer retires the monitor through EOF. Required
+  physical control precedes blocking publication; raw waits, producer EOF,
+  monitor-group absence and original cleanup independently constrain closure.
+  Work expiry first enters the existing stop transition; final cleanup expiry
+  retains an open obligation rather than certifying completion.
+  Pending startup pressure precedes ACK, and every first stop chooses the
+  observed scope or the actual unacknowledged child. Monitor interval waits
+  wake on private EOF; manager-client cancellation and actual reaps remain
+  owned, and an unavailable client wait keeps closure open.
+  First stop intent is distinct from resolved action: failed validated attempts
+  retry inside the same original budget while children and output drain.
+  Terminal child identity retains raw wait authority without allowing terminal
+  subjects into default live scope proof. The canonical launcher reuses captured
+  literal-argument compatibility with its exact executable/environment basis.
+  Synchronous manager observations and non-atomic name-based actions retain
+  their documented trusted-manager boundaries.
+  Pre-startup stop intent fixes a two-second local drain bound clipped to work
+  expiry; accepted TERM and late group proof cannot certify closure. Transient
+  cleanup reads retry within the fixed final budget, requiring fresh proof.
+  The initial scope also requests the frozen runtime cap, zero randomized extra
+  and final SIGKILL; only its actual producer requires these effective typed
+  properties before ACK. Generic readers retain their existing contract.
+  Manager runtime enforcement survives ordinary owner return/death, but is not
+  a cleanup receipt or native qualification. Kernel/manager failure and explicit
+  trusted-manager abandonment remain limits; activation is still fenced.
+  Separate producer histories retain the first baseline and one strongest
+  actual sample across delayed delivery. Unknown closure stays open; unregistered
+  launches stay uncertain. A retained local-only kill leaves uncertainty even
+  after successful waits, without changing historical resource accounting or
+  inventing an accepted stop. Timer dispatch, GitNexus's runtime adapter, supervised
+  recovery and native qualification remain separate gates.
   `index_marker_recovery.py` adds explicit transaction-only schema-5 storage,
   original-owner control completion, persistent provider holds and an exact
   terminal/control/source acceptance-watermark reader on the same queue.
@@ -2794,8 +2848,12 @@ verified: c712f1bde 2026-11-06
   (`scripts/pr_verification.py`, with its doctrine in the `validating-merges`
   skill and its readers on `repo_pulse_worker.py`). Its picker,
   `repo_pulse_worker.py --next-for-validation`, names the ONE row to work next:
-  not-yet-done, then never-attempted, then a parked row past 7 days, never
-  fail-intent; deployed rows with an `E2E:` plan first, newest merge first. Deploy
+  not-yet-done and passing rows awaiting tracking, then never-attempted, then a
+  parked row past 7 days, never fail-intent. A not-yet-done row whose stored
+  evidence declares `no_progress` (the validator's judgment that its remaining
+  steps are the previous attempt's) waits 7 days after that attempt once its
+  tracking is complete (a `TRACKING PENDING:` last note is offered at once), then
+  returns to the front; deployed rows with an `E2E:` plan first, newest merge first. Deploy
   is merge-commit ancestry of the serving commit, except a stacked PR, which is
   kept and labelled because ancestry cannot prove it either way. It fails closed
   (picks nothing) when GitHub or git cannot answer. The verdict is DERIVED from the
@@ -4243,8 +4301,9 @@ Refusing a proposed update preserves a previously valid opt-in.
   release. Ambiguous submission/canceled-before-start work retains its claim and
   fails shutdown; dependent provider closure requires positive settlement.
   `run_resource_thread` preserves ordinary legacy thread cancellation. These are
-  internal prerequisites; memory-consumer migration and shared factory wiring
-  remain separate. Lease budgets bound database connections, not executor items.
+  internal prerequisites; the nine memory-consumer thread boundaries use them,
+  while shared factory wiring remains separate. Lease budgets bound database
+  connections, not executor items.
   Activity, embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
   legacy connections keep ordinary task scheduling. Internal
   `initialize_request_service` bootstraps memory/health/recon/outreach with
@@ -4632,9 +4691,14 @@ Refusing a proposed update preserves a previously valid opt-in.
   check under it and remove a marker only when its holder is dead or theirs.
   Exception: `bootstrap.sh`'s crash recovery still removes it unconditionally.
   `secrets_path()` delegates to the stdlib-only `secrets_location.py`, mirrored
-  by `scripts/lib/secrets_path.sh`: `SECRETS_PATH` if set, else the checkout's
-  `secrets.env` (unchanged). Disk hygiene's store knobs, bootstrap and the eval
-  loaders keep their own rules for now.
+  by `scripts/lib/secrets_path.sh`: `SECRETS_PATH` wins; otherwise an existing
+  `~/.config/genesis/secrets.env` wins over the checkout and `~/genesis`
+  legacy files. With no file, the default is still the checkout's file; the
+  default switch, the unit files and creating the home config are the
+  migration's. Missing credentials at startup queue a critical alert. Guardian
+  check/restore and passphrase resolution, the graph census proof, disk
+  hygiene's store knobs and the eval loaders all take that one answer, and the
+  secrets guard protects the home-config file, its folder and their aliases.
 - **Managed systemd user units** (deploy scripts, no `src/genesis` module):
   `bootstrap.sh` renders `scripts/systemd/*.template` and `setup-vnc.sh`
   renders `scripts/systemd/vnc/` into `~/.config/systemd/user`, both through

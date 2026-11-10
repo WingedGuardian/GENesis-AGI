@@ -243,7 +243,19 @@ SCHEMA_TEMPLATE = {
         {"kind": "accepted_limit", "target": "gaps/0",
          "rationale": "why this method limit needs no further work"},
     ],
+    "no_progress": False,
 }
+
+
+def _no_progress_line(at: str) -> str:
+    """When the picker offers a not-yet-done row whose document declares
+    ``no_progress`` again: ``at`` is the ``last_attempt_at`` this run just wrote."""
+    from datetime import datetime, timedelta
+
+    from genesis.db.crud.pr_verifications import REATTEMPT_DAYS
+
+    after = datetime.fromisoformat(at).astimezone(UTC) + timedelta(days=REATTEMPT_DAYS)
+    return f"declared no progress: offered again after {after.strftime('%Y-%m-%d %H:%M')} UTC"
 
 
 async def _close_schema_refusal(db, rechecks: list[dict]) -> str | None:
@@ -442,6 +454,8 @@ async def _write(
                 f"pr_verification: {target}#{pr_number} STAYS OPEN — {verdict} recorded "
                 f"at {now}. The obligation is not discharged."
             )
+            if verdict == "not-yet-done" and doc.no_progress:
+                print(f"  {_no_progress_line(now)}")
             if verdict == "fail-intent":
                 print(
                     "  This is a FAILED verification: bring it to the user as a "
