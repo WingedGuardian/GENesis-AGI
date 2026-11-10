@@ -5,6 +5,8 @@ hold, and the budgets one check may spend."""
 
 from __future__ import annotations
 
+import bisect
+import hashlib
 import json
 import os
 import re
@@ -242,3 +244,170 @@ def problem(loaded: dict, budget: int, parents) -> str | None:
 
 def _raise(exc: OSError) -> None:
     raise exc
+
+
+def under(keys: list[str], p: str) -> list[str]:
+    """The sorted ``keys`` strictly below ``p``."""
+    i, out = bisect.bisect_left(keys, p + "/"), []
+    while i < len(keys) and keys[i].startswith(p + "/"):
+        out.append(keys[i])
+        i += 1
+    return out
+
+
+def footprint(rows, todo, back, refused, refuse, blobs, state, judged, sets_again, parents):
+    """The index call's rule, one implementation for the writer (_Writer._index,
+    with what it reads right before the call) and the judge (check, with what it
+    read; #4025 item 3: --check names the refusal --restore makes).
+
+    ``rows``: {path: row}; ``todo``: the sorted paths whose index part reads
+    as-left; ``back(p)``: its node part (and a covering directory's) written or
+    already restored; ``refused``: the entries with a refused part, which
+    ``refuse(p, kind, why, note="")`` adds to; ``blobs(row)``: why a saved blob
+    cannot be given to git, or ""; ``state()``: the index and its flags, read
+    after the parts above are settled and so right before the call (the
+    writer's read; the judge passes its own); ``judged``: the index the judge
+    read; ``sets_again(q, go, flags)``: is q's flag set again after the call;
+    ``parents``: the repair's _parents.
+
+    What git drops is its directory/file rule: a stage-0 record drops every
+    entry at and under its path and any file entry at a parent; any record, the
+    entries at its path. A part whose footprint holds an entry that is not one
+    of this report's rows as the judge read it is refused
+    ``changed-during-restore``; one whose footprint holds a flag the call drops
+    and nothing sets again, ``other:flag-changed``; a stage-0 part above a
+    refused row, ``child-refused`` (a fixpoint: a refusal can cascade up).
+    Returns ({p: the paths its record drops} for the parts that go in the
+    call, the index ``state()`` read)."""
+    paths = sorted(rows)
+
+    def stage0(p: str) -> bool:  # a record that drops what is below it
+        return any(e[2] == "0" for e in rows[p]["index"])
+
+    go = []
+    for p in todo:
+        if not back(p):
+            refuse(p, "index", "row-refused")
+        elif stage0(p) and not refused.isdisjoint(under(paths, p)):  # SF-5
+            refuse(p, "index", "child-refused")
+        elif bad := blobs(rows[p]):
+            refuse(p, "index", "other:hash-mismatch", bad)
+        else:
+            go.append(p)
+    pre, flags = state()
+    keys, feet = sorted(pre), {}
+    for p in go:
+        drop = [p]
+        if stage0(p):
+            drop += under(keys, p) + [d for d in parents(p) if d in pre]
+        # A parent's entry is checked for any record (an unmerged one too: unmeasured).
+        look = drop + [d for d in parents(p) if d in pre and d not in drop]
+        stray = [q for q in look if q not in rows or q in refused
+                 or pre.get(q, []) != judged.get(q, [])]  # fmt: skip
+        flagged = [q for q in drop if q in flags and not sets_again(q, go, flags)]
+        if stray:
+            why = f"{json.dumps(stray[0])[:200]} changed since it was judged"
+            refuse(p, "index", "changed-during-restore", why)
+        elif flagged:
+            q = flagged[0]
+            why = f"{json.dumps(q)[:200]} holds a flag ({flags[q]}) the index call would drop"
+            refuse(p, "index", "other:flag-changed", why)
+        else:
+            feet[p] = drop
+    while dropped := [p for p in feet if stage0(p) and not refused.isdisjoint(under(paths, p))]:
+        for p in dropped:
+            del feet[p]
+            refuse(p, "index", "child-refused")
+    return feet, pre
+
+
+def as_the_writer_would(rp, judge, parts) -> list:
+    """The parts as the writer would refuse them in its index call and flags
+    (#4025 item 3): footprint, the one rule _Writer._index runs, on the index
+    the judge read, then _Writer._flags's cascade (a flag part whose index part
+    is refused is refused ``row-refused``). A refusal here reads exactly as the
+    writer prints it after ``refused:``. What only the write itself can show (a
+    node write failing, a session staging in between) stays the writer's."""
+    ok = ("as-left", "already-restored")
+    verdict = {(p, k): v for p, k, v in parts}
+    decided: dict[tuple[str, str], str] = {}
+    refused = {judge.entry_of.get(p, p) for (p, _k), v in verdict.items() if v not in ok}
+
+    def outcome(key) -> str:  # the writer's out[key]: as-left parts are written
+        if key in decided:
+            return "refused"
+        v = verdict.get(key, "as-left")
+        return "restored" if v == "as-left" else v
+
+    def back(p: str, *kinds: str) -> bool:  # _Writer._back
+        keys = [(q, "node") for q in (p, *rp._parents(p))] + [(p, k) for k in kinds]
+        return all(outcome(key) in ("restored", "already-restored") for key in keys)
+
+    def refuse(p: str, kind: str, why: str, note: str = "") -> None:  # _Writer._refuse
+        decided[(p, kind)] = why
+        refused.add(judge.entry_of.get(p, p))
+        if note:
+            judge.notes[(p, kind)] = note
+
+    def sets_again(q: str, go: list[str], flags: dict) -> bool:
+        v = verdict.get((q, "flag"))
+        return v == "as-left" or (v == "already-restored" and q in go)
+
+    todo = sorted(p for (p, k), v in verdict.items() if k == "index" and v == "as-left")
+    if todo:
+        rows = {r["path"]: r for r in judge.rows}
+        state = lambda: (judge.index, judge.flags)  # noqa: E731 - what the judge read
+        footprint(rows, todo, back, refused, refuse, lambda row: "", state,
+                  judge.index, sets_again, rp._parents)  # fmt: skip
+    for (p, k), v in sorted(verdict.items()):
+        written = verdict.get((p, "index")) == "as-left" and (p, "index") not in decided
+        if k != "flag" or (v != "as-left" and not (v == "already-restored" and written)):
+            continue
+        if not back(p, "index"):
+            refuse(p, "flag", "row-refused")
+    return [(p, k, decided.get((p, k), v)) for p, k, v in parts]
+
+
+def damage_of(records: dict, backup: str, budget, rel: str) -> str | None:
+    """Why the restore's staging (_Writer._stage_one) refuses the saved copy at
+    ``rel`` against its SAVED.json record, or None; reads it under ``budget``
+    (TooLarge when spent)."""
+    rec, full = records.get(rel), os.path.join(backup, rel)
+    if rec is None:
+        return "no-hash"
+    try:
+        st = os.lstat(full)
+    except OSError:
+        return "not-saved"
+    try:
+        if rec["type"] == "symlink":
+            ok = stat.S_ISLNK(st.st_mode) and os.readlink(full) == rec["target"]
+            return None if ok else "hash-mismatch"
+        if rec["type"] == "fifo":
+            return None if stat.S_ISFIFO(st.st_mode) else "hash-mismatch"
+        if rec["sha256"] is None:
+            return "too-large"
+        fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            st, h = os.fstat(fd), hashlib.sha256()
+            if not stat.S_ISREG(st.st_mode):
+                return "hash-mismatch"
+            budget(st.st_size)
+            while chunk := os.read(fd, 1 << 20):
+                h.update(chunk)
+        finally:
+            os.close(fd)
+    except OSError:
+        return "hash-mismatch"
+    return None if h.hexdigest() == rec["sha256"] else "hash-mismatch"
+
+
+def damage_note(rel: str, why: str) -> str:
+    """The writer's staging note for the same refusal (_Writer._stage_one)."""
+    if why == "no-hash":
+        return f"SAVED.json records no {rel}"
+    if why == "not-saved":
+        return f"{rel} is gone"
+    if why == "too-large":
+        return f"{rel} was over the hash budget"
+    return f"{rel} is not what SAVED.json records"

@@ -525,6 +525,40 @@ def test_a_copy_that_does_not_match_its_record_is_refused_and_nothing_moves(w, d
     assert not any((run / "aside").exists() for run in _runs(w)), "something was moved aside"
 
 
+@pytest.mark.parametrize("damage", ["copy-edited", "record-removed", "hash-null", "dir-entry-edited"])
+def test_check_names_the_refusal_the_restore_makes_for_a_damaged_copy(w, damage):
+    """#4025 item 3: --check reads a saved copy the restore's staging refuses
+    exactly as the restore does (rc 1, the same reason), never as-left."""
+    make = _foreign_inside_dir if damage == "dir-entry-edited" else _foreign_edit
+    ts = _repaired(w, make)
+    path = "P" if damage == "dir-entry-edited" else "sub/s1"
+    if damage == "copy-edited":
+        (w.backups()[-1] / "tree" / "sub" / "s1").write_text("not what was saved\n")
+    elif damage == "dir-entry-edited":
+        (w.backups()[-1] / "tree" / "P" / "mine.txt").write_text("not the notes\n")
+    elif damage == "record-removed":
+        _saved_json(w, lambda d: (d["files"].pop("tree/sub/s1"), d.update(complete=False)))
+    else:
+        _saved_json(w, lambda d: d["files"]["tree/sub/s1"].update(sha256=None))
+    c = _restore(w, ts, "--check")
+    r = _restore(w, ts)
+    assert c.returncode == 1 and r.returncode == 1, c.stdout + r.stdout
+    said, did = _parts(c)[(path, "node")], _parts(r)[(path, "node")]
+    assert said.startswith("other:") and did == f"refused:{said}", (c.stdout, r.stdout)
+
+
+def test_a_damaged_copy_behind_a_changed_checkout_reads_changed_in_both(w):
+    """#4025 review S2: the writer never stages a part that is not as-left, so
+    a damaged copy under a path edited since the repair is refused `changed`
+    by --restore, and --check says the same, not the damage."""
+    ts = _repaired(w, _foreign_edit)
+    (w.backups()[-1] / "tree" / "sub" / "s1").write_text("not what was saved\n")
+    (w.root / "sub" / "s1").write_text("edited since the repair\n")
+    c, r = _restore(w, ts, "--check"), _restore(w, ts)
+    assert _parts(c)[("sub/s1", "node")] == "other:changed", c.stdout
+    assert _parts(r)[("sub/s1", "node")] == "refused:other:changed", r.stdout
+
+
 def test_a_report_without_the_integrity_record_is_refused_whole(w):
     """Review N-3: a report from before SAVED.json is refused whole
     (`other:no-integrity`); nothing is written, REPAIR.json included."""
@@ -1363,6 +1397,35 @@ def test_an_index_part_already_back_keeps_its_entries_under_a_file_written_later
     assert r.returncode == 0, r.stdout + r.stderr
     assert _parts(r)[("sub", "index")] == "restored", r.stdout
     _converged(w, ts)
+
+
+def _check_said_what_restore_did(c, r) -> None:
+    """Every part: as-left is written, already-restored stays, and any other
+    verdict is the reason the restore prints after ``refused:`` (#4025 item 3)."""
+    said, did = _parts(c), _parts(r)
+    assert said.keys() == did.keys(), (c.stdout, r.stdout)
+    for key, v in said.items():
+        want = {"as-left": "restored", "already-restored": "already-restored"}.get(v, f"refused:{v}")
+        assert did[key] == want, (key, c.stdout, r.stdout)
+
+
+@pytest.mark.parametrize("case", ["flag-after-repair", "child-refused"])
+def test_check_names_the_index_calls_refusals(w, case):
+    """#4025 item 3: --check runs the index call's own rule (footprint) and the
+    flag cascade on what it read, so it names every refusal the restore makes
+    there: a flag the call would drop, a stage-0 parent above a refused child."""
+    if case == "flag-after-repair":
+        ts, _path, _ = _fresh(w, _foreign_staged)
+        _git(w.root, "update-index", "--skip-worktree", "A")
+    else:
+        ts = _repaired(w, _ancestor_file_child_edit)
+        (w.root / "sub" / "s1").write_text("edited since\n")
+    c = _check(w, ts)
+    r = _restore(w, ts)
+    assert c.returncode == 1 and r.returncode == 1, c.stdout + r.stdout
+    _check_said_what_restore_did(c, r)
+    key = ("A", "index") if case == "flag-after-repair" else ("sub", "index")
+    assert _parts(c)[key] == ("other:flag-changed" if case == "flag-after-repair" else "child-refused")
 
 
 def test_a_flagged_entry_already_back_in_a_footprint_still_refuses(w, mod, monkeypatch, capsys):
