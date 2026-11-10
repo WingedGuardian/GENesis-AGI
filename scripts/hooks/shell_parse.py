@@ -4663,8 +4663,26 @@ def _analyze_bounded(
     _ancestors: tuple[tuple[str, str | None], ...] = (),
     _kind: str = "root",
     _env_depth: int = 0,
+    _added_work: list[int] | None = None,
+    _in_added: bool = False,
 ) -> _AnalysisResult:
-    """Parse once, retaining diagnostics and structural facts from every visited level."""
+    """Parse once, retaining diagnostics and structural facts from every visited level.
+
+    ``_added_work`` is ``[used, budget]``, shared by every level of one parse: the
+    characters descended into through a substitution body the legacy scan does not
+    find (see :func:`_substitution_spans`), or anywhere beneath one. The legacy
+    descents are never counted, so a command the legacy scan reads costs what it
+    did. Past the budget the parse stops descending and reports the over-nested
+    bound, the same fail-closed signal as the depth bound. The budget is two passes
+    over the command: a real missed substitution, and one more level inside it, fit,
+    while a crafted command that stacks bodies level on level would multiply the work
+    (MEASURED 2026-11-10, ``analyze_checked`` on crafted commands near the length
+    cap: 6.28s against 0.73s on main without this budget, at most 1.45s against
+    1.00s with it). The cost is that a chain of nested substitutions whose bodies
+    add up to more than twice the command, behind a quote only the legacy scan
+    misreads, is refused as over-nested (measured: six levels at 70 characters)."""
+    if _added_work is None:
+        _added_work = [0, 2 * len(command)]
     # Past the cap, parse NOTHING. Not a prefix: truncating a command mid-string flips
     # the quoting state for everything after the cut, so a prefix parse is not a
     # partial answer, it is a confidently wrong one — and the guards match on the
@@ -4789,14 +4807,20 @@ def _analyze_bounded(
         nested.extend(
             (script, None, False, "embedded") for script in _embedded_commands(_argv(seg.argv_src))
         )
-        spans = _substitution_spans(raw)
+        spans, legacy_spans = _substitution_span_sets(raw)
         if spans:
             if command.startswith(raw, start):
                 # raw is a plain slice: read its bodies in the outermost text
                 source, offset = here[0], here[1] + start
             else:
                 source, offset = _HeredocLines(raw), 0  # a redirect rewrote raw
+            added_from = len(nested)
+            added = {
+                added_from + k for k, span in enumerate(spans) if span not in legacy_spans
+            }
             nested.extend((raw[a:b], (source, offset + a), True, "substitution") for a, b in spans)
+        else:
+            added = set()
         if not nested:
             continue
         # Past the bound, STOP DESCENDING — and SAY SO. Every scanner below runs
@@ -4811,6 +4835,14 @@ def _analyze_bounded(
             if _depth + env_depth >= MAX_SUBSTITUTION_DEPTH:
                 truncated = True
                 continue
+            in_added = _in_added or nested_index in added
+            if in_added:
+                # Charged only when performed: the descent that would cross the
+                # budget is refused, so the work done never exceeds it.
+                if _added_work[0] + len(script) > _added_work[1]:
+                    truncated = True
+                    continue
+                _added_work[0] += len(script)
             inner = _analyze_bounded(
                 script, _depth=_depth + 1, _decision_text=_decision_text,
                 _origin=origin, _in_substitution=in_substitution,
@@ -4818,6 +4850,8 @@ def _analyze_bounded(
                 _ancestors=_ancestors + (() if in_substitution else tuple(contexts or ())),
                 _kind=kind,
                 _env_depth=env_depth,
+                _added_work=_added_work,
+                _in_added=in_added,
             )
             truncated = truncated or inner.bound_reason == "depth"
             heredoc = heredoc or inner.heredoc_incomplete
@@ -4938,7 +4972,78 @@ def _substitutions(text: str) -> list[str]:
 def _substitution_spans(text: str) -> list[tuple[int, int]]:
     """:func:`_substitutions` as ``(start, end)`` offsets of each body in ``text``, so
     the here-doc check can read a body the extraction cut against the text it was
-    cut from."""
+    cut from.
+
+    The union of two readings, so extraction never shrinks below the legacy scan:
+    :func:`_legacy_substitution_spans` tracks single quotes only, so an apostrophe
+    inside ``"don't"`` or an escaped one (``\\'``, ``$'it\\'s'``) opened a span bash
+    never sees and every substitution after it went unseen.
+    :func:`_quoted_substitution_spans` follows bash's quoting. A body either reading
+    finds is extracted.
+    """
+    return _substitution_span_sets(text)[0]
+
+
+def _substitution_span_sets(text: str) -> tuple[list[tuple[int, int]], set[tuple[int, int]]]:
+    """The union :func:`_substitution_spans` returns, and the legacy spans within it."""
+    legacy = set(_legacy_substitution_spans(text))
+    return sorted(legacy | set(_quoted_substitution_spans(text))), legacy
+
+
+def _quoted_substitution_spans(text: str) -> list[tuple[int, int]]:
+    """Substitution bodies under bash's quoting: single quotes block expansion, double
+    quotes do not, and a backslash escapes the next character outside single quotes
+    (inside ``$'…'`` too, where ``\\'`` does not close the span)."""
+    subs: list[tuple[int, int]] = []
+    i, n = 0, len(text)
+    quote: str | None = None  # "'", '"' or "$'" (ANSI-C)
+    while i < n:
+        c = text[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if quote == "$'":
+            if c == "'":
+                quote = None
+            i += 1
+            continue
+        if quote is None and c == "'":
+            quote = "'"
+            i += 1
+            continue
+        if quote is None and c == "$" and text.startswith("$'", i):
+            quote = "$'"
+            i += 2
+            continue
+        if c == '"':
+            quote = None if quote == '"' else '"'
+            i += 1
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "(":
+            end = _command_sub_end(text, i, n)
+            # Cut as the legacy scan cuts (an unterminated body loses its last
+            # character), so the two readings agree on every body they both find.
+            # An unclosed `$(` is a syntax error to bash, which runs none of it.
+            subs.append((i + 2, end - 1))
+            i = end
+            continue
+        if c == "`":
+            j = text.find("`", i + 1)
+            if j != -1:
+                subs.append((i + 1, j))
+                i = j + 1
+                continue
+        i += 1
+    return subs
+
+
+def _legacy_substitution_spans(text: str) -> list[tuple[int, int]]:
+    """The original scan: only single quotes block extraction."""
     subs: list[tuple[int, int]] = []
     i, n = 0, len(text)
     in_sq = False
