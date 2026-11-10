@@ -1,4 +1,4 @@
-"""The session observer records nothing for a subagent type it must never observe.
+"""The session observer records nothing for an agent type it must never observe.
 
 Some subagents handle text that must not reach memory: a writer of hidden
 evaluation scenarios is the case this exists for, because anything the observer
@@ -14,6 +14,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 REPO_DIR = Path(__file__).resolve().parent.parent.parent
 HOOK = REPO_DIR / "scripts" / "hooks" / "session_observer_hook.py"
@@ -72,18 +74,20 @@ def test_main_session_is_still_observed(tmp_path: Path):
     assert _SECRET_TEXT in _raw_jsonl(tmp_path)
 
 
-def test_agent_type_without_agent_id_is_still_observed(tmp_path: Path):
-    """agent_type alone is not a subagent: a main session started with
-    --agent carries the type but no agent_id, and must keep being observed."""
-    _run(_payload(agent_id="", agent_type="holdout-writer"), tmp_path)
-    assert _SECRET_TEXT in _raw_jsonl(tmp_path)
+def test_main_session_started_as_the_writer_writes_nothing(tmp_path: Path):
+    """A main session started with --agent carries agent_type and no agent_id
+    key at all. It is the same writer, so it must not be observed either."""
+    result = _run(_payload(agent_type="holdout-writer"), tmp_path)
+    assert result.returncode == 0
+    assert _raw_jsonl(tmp_path) == ""
 
 
-def test_parent_agent_call_for_unobserved_type_writes_nothing(tmp_path: Path):
-    """The parent's Agent call has no agent_id, yet its result carries the
-    subagent's prompt and final report."""
+@pytest.mark.parametrize("tool_name", ["Agent", "Task"])
+def test_parent_agent_call_for_unobserved_type_writes_nothing(tmp_path: Path, tool_name: str):
+    """The parent's Agent call (Task in older Claude Code) has no agent_id,
+    yet it carries the subagent's prompt and final report."""
     payload = {
-        "tool_name": "Agent",
+        "tool_name": tool_name,
         "session_id": _SID,
         "tool_input": {"subagent_type": "holdout-writer", "prompt": _SECRET_TEXT},
         "tool_response": {"content": [{"type": "text", "text": _SECRET_TEXT}]},
@@ -93,9 +97,10 @@ def test_parent_agent_call_for_unobserved_type_writes_nothing(tmp_path: Path):
     assert _raw_jsonl(tmp_path) == ""
 
 
-def test_parent_agent_call_for_other_type_is_still_observed(tmp_path: Path):
+@pytest.mark.parametrize("tool_name", ["Agent", "Task"])
+def test_parent_agent_call_for_other_type_is_still_observed(tmp_path: Path, tool_name: str):
     payload = {
-        "tool_name": "Agent",
+        "tool_name": tool_name,
         "session_id": _SID,
         "tool_input": {"subagent_type": "Explore", "prompt": "look around"},
         "tool_response": {"content": [{"type": "text", "text": _SECRET_TEXT}]},

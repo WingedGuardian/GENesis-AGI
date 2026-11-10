@@ -57,14 +57,14 @@ _SKIP_TOOLS = frozenset(
     }
 )
 
-# Subagent types whose tool activity is never recorded. Everything this hook
+# Agent types whose tool activity is never recorded. Everything this hook
 # captures is extracted into memories that proactive recall shows to other
-# sessions, so a subagent handling text that must stay out of recall (a writer
-# of hidden evaluation scenarios, which builders must never see) is skipped
-# whole. Matched only together with a non-empty agent_id: a main session
-# started with --agent carries agent_type too, and stays observed. This closes
-# the observer only: the parent session later reading the subagent's files
-# with its own tools is observed as usual.
+# sessions, so an agent handling text that must stay out of recall (a writer of
+# hidden evaluation scenarios, which builders must never see) is skipped whole.
+# Keyed on agent_type alone, with or without an agent_id: a main session started
+# with --agent carries the type too, and it is the same writer, so observing it
+# would leak the same text. This closes the observer only: the parent session
+# later reading the agent's files with its own tools is observed as usual.
 _UNOBSERVED_AGENT_TYPES = frozenset({"holdout-writer"})
 
 # Max chars to capture from tool output
@@ -236,7 +236,7 @@ def _process(data: dict) -> None:
     if tool_name in _SKIP_TOOLS:
         return
 
-    if data.get("agent_id") and data.get("agent_type") in _UNOBSERVED_AGENT_TYPES:
+    if data.get("agent_type") in _UNOBSERVED_AGENT_TYPES:
         return
 
     tool_input = data.get("tool_input") or {}
