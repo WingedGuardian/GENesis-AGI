@@ -990,6 +990,11 @@ neither blocks opening).
 
 ### Standing mode (Claude Code only)
 
+Only the owner starts or restarts this loop, by explicit instruction at that
+moment. A session never starts one on its own: not from an earlier yes, a plan
+step or a ledger row, and not after the loop stops. Once started, it paces
+itself until the owner stops it or the loop's maximum duration ends it.
+
 When the owner starts a closing session to keep working the queue on a pace
 (`/loop` with ScheduleWakeup, at the interval the owner sets and can change), the
 one-closing-session precondition above holds for the whole life of that session.
@@ -1005,7 +1010,7 @@ after it (a check run's `completedAt`, a commit status's `startedAt` in
 unprompted per-PR watching that "When to DRIVE a Merge" defines, and re-requesting
 review with nothing new pushed. Owner questions are still batched across PRs
 (step 3 above). Merge, gate and deploy rules are unchanged, including the deploy
-owed after merging a host-path PR. The validator's standing-mode limits
+owed after merging a host-path PR. The validator's per-pass limits
 (validating-merges, "Standing mode") do not apply here. A second opinion inside
 a pass is a fresh-context review subagent, never a workflow runner that spawns
 its own sessions outside the approval gate; the round-1 two-reviewer rule for
@@ -1308,6 +1313,16 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   |---|---|---|---|
   | gate | round 1 | round 2 and later | round 2 |
   | ordinary | round 3 (the class sweep) | round 2 and later | round 4 |
+
+  A merge of main does not end a round. When nothing after the reviewed head is a
+  fix (only merges of main that carry nothing else, or empty commits such as a
+  pushed reflection), that round's keys stay owed (as late keys, under the round's
+  own context), even when the merge then draws findings of its own and opens
+  the next round; the reflection names the PR head as for any owed key. A real commit after
+  the review does complete the round; when the newest such round (opened after
+  the go-live cutover) has no reflection naming it, the gate says so in an
+  advisory. A rebase or force-push that drops the reviewed head from the PR still
+  ends the round silently.
 
   An unreadable review budget keeps the gate's existing path (the round-approval
   ask in the foreground, a deny when dispatched). Anything else Rule R cannot read

@@ -277,6 +277,7 @@
         // ── Settings hub state ────────────────────────────────────
         settingsDomains: null,
         settingsData: {},         // domain_name → config object
+        settingsShown: {},        // domain_name → config as loaded (sent back as __shown on save)
         settingsEditing: null,    // domain being edited
         settingsViewing: null,    // readonly domain being viewed
         systemTimezone: null,     // current tz from /api/genesis/settings/timezone
@@ -2469,6 +2470,9 @@
             if (resp && resp.ok) {
               const d = await resp.json();
               this.settingsData[domain] = d.config;
+              // What the editor showed, sent back on save so the server can
+              // tell a change the user made from a value merely shown.
+              this.settingsShown[domain] = JSON.parse(JSON.stringify(d.config));
             }
           } catch (e) { console.warn(`Settings fetch ${domain} failed:`, e); }
         },
@@ -2477,6 +2481,7 @@
           try {
             const payload = { ...this.settingsData[domain] };
             if (confirmGateDisable) { payload.confirm_disable_approval_gate = true; }
+            if (this.settingsShown[domain]) { payload.__shown = this.settingsShown[domain]; }
             const resp = await fetchApi(`/api/genesis/settings/${domain}`, {
               method: "PUT",
               headers: { "Content-Type": "application/json" },
@@ -2496,6 +2501,7 @@
             if (resp && resp.ok) {
               const d = await resp.json();
               this.settingsData[domain] = d.config;
+              this.settingsShown[domain] = JSON.parse(JSON.stringify(d.config));
               this.settingsEditing = null;
               if (domain === "autonomous_cli_policy") {
                 this.fetchAutonomousCliPolicy();
