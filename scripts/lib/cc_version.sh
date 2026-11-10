@@ -85,7 +85,7 @@ CC_CONTAINER_SETTINGS_DEFAULTS=(
     "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH=${CC_MCP_DESCRIPTION_LIMIT}"
 )
 
-# Shared client policy, opt-in until setup/alignment callers pass this array.
+# Shared client policy for container reconciliation and host setup.
 # Retention is a floor (or an explicitly selected exact override); attribution
 # remains set-if-absent. Both use the existing atomic settings writer.
 CC_CLIENT_SETTINGS_POLICY=(
@@ -396,13 +396,13 @@ sys.exit(0 if kind in lines else 10)
 #     that as "never synced" and turn sync off (review, Devin #2579).
 #   * anything that cannot be established (synced/ or the record unreadable):
 #     nothing written, so the key stays absent and sync stays on.
-# Every value is set-if-absent: an operator's own choice is never replaced.
+# Container defaults are set-if-absent; shared retention uses its floor/exact policy.
 # MEASURED on Claude Code 2.1.280: once sync has run, <kind>/synced holds the
 # account's `.bucket-<id>` marker and its `<id>/` folder whatever the item
 # count, so a syncing install is decided on its first run.
 cc_resolve_container_defaults() {
     local claude_dir="${1:-$HOME/.claude}" pair kind key n rec
-    CC_CONTAINER_DEFAULTS_EFFECTIVE=("${CC_CONTAINER_SETTINGS_DEFAULTS[@]}")
+    CC_CONTAINER_DEFAULTS_EFFECTIVE=("${CC_CONTAINER_SETTINGS_DEFAULTS[@]}" "${CC_CLIENT_SETTINGS_POLICY[@]}")
     CC_SYNC_OPTOUT_WITHHELD=()
     for pair in "${CC_CLAUDE_AI_SYNC_OPTOUTS[@]}"; do
         kind="${pair%%:*}"
