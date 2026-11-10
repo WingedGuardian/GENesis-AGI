@@ -368,24 +368,25 @@ def test_a_tag_loses_the_value_even_inside_a_longer_word():
 # ─── review round 1 (#3898) ──────────────────────────────────────────────────
 
 
-async def test_the_concept_loses_the_value_too(db):
+async def test_an_identifier_carrying_the_value_is_refused(db):
     """An extraction with no entities derives the identifier from its own text,
-    which can carry the password; the concept is indexed in knowledge_fts."""
+    which can carry the password. The identifier is the entry key, so scrubbing
+    it would file the entry under another key (4527738751): the write is
+    refused, before any store, and the message never carries the value."""
     store = _store()
-    unit_id = await ingest_knowledge_unit(
-        store=store,
-        db=db,
-        content=_body(),
-        project=ro.REFERENCE_PROJECT,
-        domain="reference.credentials",
-        concept=f"router login {_PASSWORD}",
-    )
-    row = await kc.get(db, unit_id)
-    fts = await db.execute_fetchall(
-        "SELECT concept FROM knowledge_fts WHERE unit_id = ?", (unit_id,)
-    )
-    assert _PASSWORD not in row["concept"] and _PASSWORD not in fts[0][0]
-    assert await _secret(db, unit_id) == _VALUE
+    with pytest.raises(ValueError, match="identifier must not contain its value") as refused:
+        await ingest_knowledge_unit(
+            store=store,
+            db=db,
+            content=_body(),
+            project=ro.REFERENCE_PROJECT,
+            domain="reference.credentials",
+            concept=f"router login {_PASSWORD}",
+        )
+    assert _PASSWORD not in str(refused.value)
+    store.store.assert_not_awaited()
+    assert await db.execute_fetchall("SELECT 1 FROM knowledge_units") == []
+    assert await _secret_rows(db) == 0
 
 
 async def test_the_db_layer_refuses_a_second_value_line_after_the_placeholder(db):

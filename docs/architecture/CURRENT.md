@@ -176,7 +176,15 @@ Easy-to-forget mechanisms:
   secret-shaped token of it. A credential write never shares a vector point
   (`MemoryStore.store(..., dedup=False)`), and a point it created that no unit
   names when the write ends (refused, failed or cancelled) is deleted, so no
-  stale-point cleanup can delete a point a unit names.
+  stale-point cleanup can delete a point a unit names. The credential upsert
+  is a compare-and-swap against the ingest's own earlier read of the key
+  (`knowledge_crud.KeyObservation`: absent, or the secret and point it named),
+  checked inside the one statement that writes the unit, so a same-key writer
+  in another process that commits in between makes it write nothing
+  (`CredentialKeyChanged`); the ingest then re-reads and runs once more, and
+  a second change reaches the caller. A credential whose identifier contains
+  its value is refused: the identifier is the entry key, and scrubbing it
+  would file the entry under another one.
   Only `reference_ops.resolve_value` and `compose_body` read the value:
   `reference_lookup` (behind its audit log) and the dashboard's reveal. When a
   unit was repointed after its row was read, both re-read the unit's current

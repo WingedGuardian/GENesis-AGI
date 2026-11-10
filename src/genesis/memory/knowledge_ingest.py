@@ -87,6 +87,49 @@ async def ingest_knowledge_unit(
     ``knowledge_crud.CredentialKeyTaken`` and writes nothing, so the caller
     tries another key. A user-typed ``reference_store`` keeps upsert semantics.
     """
+    # A credential write is a compare-and-swap against its own read of the key
+    # (``knowledge_crud.KeyObservation``): if a same-key writer, in this process
+    # or another, commits between that read and the unit's statement, nothing is
+    # written and the whole ingest runs again ONCE from a fresh read (a new
+    # stored secret to scrub with, a new point). A second change raises
+    # ``CredentialKeyChanged`` to the caller.
+    kwargs = dict(
+        store=store, db=db, content=content, project=project, domain=domain,
+        authority=authority, provenance=provenance, memory_class=memory_class,
+        concept=concept, tags_json=tags_json, force_fts5_only=force_fts5_only,
+        purpose=purpose, ingestion_source=ingestion_source, collection=collection,
+        memory_type=memory_type, confidence=confidence, origin_class=origin_class,
+        insert_only=insert_only,
+    )
+    try:
+        return await _ingest_once(**kwargs)
+    except knowledge_crud.CredentialKeyChanged:
+        logger.info("Credential key changed while the ingest ran; retrying once from a fresh read")
+        return await _ingest_once(**kwargs)
+
+
+async def _ingest_once(
+    *,
+    store: MemoryStore,
+    db: aiosqlite.Connection,
+    content: str,
+    project: str,
+    domain: str,
+    authority: str = "unknown",
+    provenance: dict | None = None,
+    memory_class: str | None = None,
+    concept: str | None = None,
+    tags_json: str | None = None,
+    force_fts5_only: bool = False,
+    purpose: list[str] | None = None,
+    ingestion_source: str | None = None,
+    collection: str = "knowledge_base",
+    memory_type: str = "knowledge",
+    confidence: float = 0.85,
+    origin_class: str | None = None,
+    insert_only: bool = False,
+) -> str:
+    """One ingest attempt (see ``ingest_knowledge_unit``)."""
     # A credential's value is held out of every indexed store (#2426) HERE, at the
     # chokepoint every writer passes through (the reference_store and
     # knowledge_ingest MCP tools, the extraction job, migrate_reference_data):
@@ -102,31 +145,52 @@ async def ingest_knowledge_unit(
     if (project or "").strip().lower() == reference_ops.REFERENCE_PROJECT:
         project = reference_ops.REFERENCE_PROJECT
     secret_value: str | None = None
+    observed: knowledge_crud.KeyObservation | None = None
     credential = reference_ops.holds_secret(project, domain)
     if credential:
         # One spelling for the credential domain too: the lookup's audit log and
         # the readers compare it exactly, so a mixed-case row would be revealed
         # with no audit row.
         domain = knowledge_crud.CREDENTIAL_DOMAIN
+        if concept is None or not concept.strip():
+            # The identifier is the entry's key. Derived from the body, it would
+            # be the SCRUBBED body, so two credentials whose bodies differ only
+            # in their values would share a key and the second would overwrite
+            # the first.
+            raise ValueError(
+                "a credential reference needs an explicit identifier (concept); "
+                "refusing the write (#2426)"
+            )
         raw_content, raw_tags, raw_concept = content, tags_json, concept
         content, secret_value, tags_json, concept = reference_ops.split_secret(
             content, tags_json, concept,
         )
         known_secret = secret_value
+        lookup_concept = concept if concept is not None else content[:200]
         if secret_value is None:
             # A re-ingest carrying only the placeholder: the secret the key
             # already holds is what its description, tags and concept may still
             # repeat, so they are scrubbed with THAT value, exactly as with a
             # supplied one. (check_credential_write below refuses the write when
-            # no secret is stored for the key.)
-            known_secret = await knowledge_crud.stored_credential_value(
-                db, project_type=project, domain=domain,
-                concept=concept if concept is not None else content[:200],
+            # no secret is stored for the key.) The same read is the
+            # observation the upsert compare-and-swaps against, so the secret
+            # scrubbed with is the one the commit retains.
+            observed = await knowledge_crud.observe_credential_key(
+                db, project_type=project, domain=domain, concept=lookup_concept,
             )
+            known_secret = observed.value
             if known_secret is not None:
                 content, _, tags_json, concept = reference_ops.split_secret(
                     raw_content, raw_tags, raw_concept, stored_value=known_secret,
                 )
+        # The identifier is the key of the entry: a scrub that changed it would
+        # file this credential under another key (two identifiers that each
+        # carry their own value both read "x [redacted]"), so it is refused.
+        if concept != raw_concept:
+            raise ValueError(
+                "a credential identifier must not contain its value; refusing "
+                "the write (#2426)"
+            )
         if known_secret is not None:
             # The free-text fields stored beside the body (the authority, which
             # also reaches the vector payload's tags, and the provenance's
@@ -159,9 +223,13 @@ async def ingest_knowledge_unit(
     # A credential write that upsert would refuse (no value to hold, or no
     # reference_secrets table) is refused HERE, before store.store puts a
     # vector and a memory_fts row in place that no unit would name.
+    if credential and observed is None:
+        observed = await knowledge_crud.observe_credential_key(
+            db, project_type=project, domain=domain, concept=resolved_concept,
+        )
     held_by = await knowledge_crud.check_credential_write(
         db, project_type=project, domain=domain, concept=resolved_concept,
-        secret_value=secret_value, insert_only=insert_only,
+        secret_value=secret_value, insert_only=insert_only, observed=observed,
     )
     if insert_only and held_by is not None:
         # The key already holds this very value: nothing to write, and no
@@ -195,11 +263,17 @@ async def ingest_knowledge_unit(
     if provenance and provenance.get("source_doc"):
         source_doc = provenance["source_doc"]
 
-    existing = await knowledge_crud.find_by_unique_key(
-        db, project_type=project, domain=domain, concept=resolved_concept,
-    )
-    unit_id = existing["id"] if existing else str(uuid.uuid4())
-    old_qdrant_id = existing.get("qdrant_id") if existing else None
+    if observed is not None:
+        # The observation is the predecessor the compare-and-swap commits
+        # against, so its point is the one this write really displaces.
+        unit_id = observed.unit_id or str(uuid.uuid4())
+        old_qdrant_id = observed.qdrant_id
+    else:
+        existing = await knowledge_crud.find_by_unique_key(
+            db, project_type=project, domain=domain, concept=resolved_concept,
+        )
+        unit_id = existing["id"] if existing else str(uuid.uuid4())
+        old_qdrant_id = existing.get("qdrant_id") if existing else None
 
     source_pipeline_val = (provenance or {}).get("source_pipeline", "knowledge_ingest")
     source_session_id = (provenance or {}).get("session_id")
@@ -275,6 +349,7 @@ async def ingest_knowledge_unit(
         ingestion_source=ingestion_source,
         origin_class=resolved_origin,
         secret_value=secret_value,
+        expected=observed,
     )
     try:
         actual_id, inserted = await knowledge_crud.upsert(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import secrets
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
@@ -48,17 +49,63 @@ class CredentialKeyTaken(ValueError):  # noqa: N818 - names the state, not an er
     would add an entry, never replace one)."""
 
 
+class CredentialKeyChanged(ValueError):  # noqa: N818 - names the state, not an error kind
+    """A credential write found its key no longer in the state it observed
+    (``KeyObservation``): another writer, in this process or another, changed
+    the key in between. Nothing was written; the caller re-reads and retries."""
+
+
+@dataclass(frozen=True)
+class KeyObservation:
+    """What a credential write read of its key before it stored its vector:
+    the row's id, the secret and the point it named, and that secret's value.
+    ``unit_id`` None means the key was absent. ``upsert(expected=...)`` applies
+    the write only while the key still matches this (compare-and-swap)."""
+
+    unit_id: str | None
+    secret_ref: str | None
+    qdrant_id: str | None
+    value: str | None
+
+    @property
+    def absent(self) -> bool:
+        return self.unit_id is None
+
+
 async def _credential_row(
     db: aiosqlite.Connection, project_type: str, domain: str, concept: str,
-) -> tuple[str, str | None, str | None] | None:
-    """(id, secret_ref, the value it names or None) of the row holding the key."""
+) -> tuple[str, str | None, str | None, str | None] | None:
+    """(id, secret_ref, the value it names or None, qdrant_id) of the row
+    holding the key."""
     rows = await db.execute_fetchall(
-        "SELECT k.id, k.secret_ref, s.value FROM knowledge_units k "
+        "SELECT k.id, k.secret_ref, s.value, k.qdrant_id FROM knowledge_units k "
         "LEFT JOIN reference_secrets s ON s.id = k.secret_ref "
         "WHERE k.project_type = ? AND k.domain = ? AND k.concept = ?",
         (project_type, domain, concept),
     )
-    return (rows[0][0], rows[0][1], rows[0][2]) if rows else None
+    return (rows[0][0], rows[0][1], rows[0][2], rows[0][3]) if rows else None
+
+
+async def observe_credential_key(
+    db: aiosqlite.Connection, *, project_type: str, domain: str, concept: str,
+) -> KeyObservation | None:
+    """The key's current state, for a credential write to compare-and-swap
+    against; None for a row that is not a credential reference."""
+    if not holds_secret(project_type, domain):
+        return None
+    project_type, domain = _canonical_key(project_type, domain)
+    row = await _credential_row(db, project_type, domain, concept)
+    if row is None:
+        return KeyObservation(None, None, None, None)
+    return KeyObservation(row[0], row[1], row[3], row[2])
+
+
+def _still_observed(row: tuple | None, expected: KeyObservation) -> bool:
+    if expected.absent:
+        return row is None
+    return row is not None and row[0] == expected.unit_id and row[1] == expected.secret_ref and (
+        row[3] == expected.qdrant_id
+    )
 
 
 async def check_credential_write(
@@ -69,6 +116,7 @@ async def check_credential_write(
     concept: str,
     secret_value: str | None,
     insert_only: bool = False,
+    observed: KeyObservation | None = None,
 ) -> str | None:
     """Raise ValueError when a credential row could not commit with its value;
     otherwise return the id of the row already holding this key, or None.
@@ -80,11 +128,18 @@ async def check_credential_write(
     table fails here too. With ``insert_only``, a key already holding a
     different value raises ``CredentialKeyTaken``; a returned id then means the
     key already holds this very value. A no-op (None) for every other row.
+    ``observed`` (the caller's own read of the key) is used instead of reading
+    it again, so the check and the compare-and-swap agree on one read.
     """
     if not holds_secret(project_type, domain):
         return None
     project_type, domain = _canonical_key(project_type, domain)
-    existing = await _credential_row(db, project_type, domain, concept)
+    if observed is not None:
+        existing = None if observed.absent else (
+            observed.unit_id, observed.secret_ref, observed.value, observed.qdrant_id,
+        )
+    else:
+        existing = await _credential_row(db, project_type, domain, concept)
     if secret_value is None and not (existing and existing[2] is not None):
         raise ValueError(
             "refusing a credential reference with no value to hold: its body "
@@ -95,19 +150,6 @@ async def check_credential_write(
             "this credential key already holds a different value (#2426)"
         )
     return existing[0] if existing else None
-
-
-async def stored_credential_value(
-    db: aiosqlite.Connection, *, project_type: str, domain: str, concept: str,
-) -> str | None:
-    """The value already held for a credential key, or None (no such key, no
-    secret stored for it, or not a credential). A re-ingest that carries only
-    the placeholder scrubs its indexed fields with this value (#2426)."""
-    if not holds_secret(project_type, domain):
-        return None
-    project_type, domain = _canonical_key(project_type, domain)
-    existing = await _credential_row(db, project_type, domain, concept)
-    return existing[2] if existing else None
 
 
 async def get_reference_pair(
@@ -468,6 +510,7 @@ async def upsert(
     origin_class: str | None = None,
     secret_value: str | None = None,
     insert_only: bool = False,
+    expected: KeyObservation | None = None,
     _commit: bool = True,
 ) -> tuple[str, bool]:
     """Insert or update a knowledge unit keyed on (project_type, domain, concept).
@@ -486,6 +529,16 @@ async def upsert(
     retire the secret a unit stops naming. None keeps the row's current secret
     (a re-ingest of a held-out body); passing one for a row that is not a
     credential reference is a ValueError.
+
+    ``expected`` (a credential write's own earlier read of its key, which
+    ``ingest_knowledge_unit`` takes before it stores the vector): the write is
+    applied only while the key still matches it, checked inside the ONE
+    statement that writes the unit, so a same-key writer in another process
+    that committed in between makes this call raise ``CredentialKeyChanged``
+    with nothing written (its fresh secret row retired). An absent observation
+    inserts only if the key is still absent; a present one updates only the row
+    still naming the observed secret and point. Ignored with ``insert_only``,
+    which never changes an existing row anyway.
 
     ``insert_only`` (for auto-capture; no writer passes it yet): a credential key that already exists is
     never changed. If it holds the same value the call is a no-op that returns
@@ -527,6 +580,10 @@ async def upsert(
         # reference_secrets, so a database whose schema init has not created it
         # fails here, with nothing written.
         existing = await _credential_row(db, project_type, domain, concept)
+        if expected is not None and not insert_only and not _still_observed(existing, expected):
+            raise CredentialKeyChanged(
+                "this credential key changed since the write read it (#2426)"
+            )
         if secret_value is None:
             if not (existing and existing[2] is not None):
                 raise ValueError(
@@ -553,7 +610,8 @@ async def upsert(
                 (secret_ref, secret_value, datetime.now(UTC).isoformat()),
             )
 
-    if insert_only:
+    cas = credential and expected is not None and not insert_only
+    if insert_only or (cas and expected.absent):
         on_conflict = "DO NOTHING"
     else:
         # A new secret repoints the row (the repoint trigger retires the old
@@ -580,6 +638,23 @@ async def upsert(
                    purpose         = excluded.purpose,
                    ingestion_source = excluded.ingestion_source,
                    origin_class    = excluded.origin_class{repoint}"""
+    # Compare-and-swap (``expected`` present): the row is written only while it
+    # still exists and names the observed secret and point. INSERT ... SELECT
+    # with an EXISTS guard, so a row deleted since the read is not re-created,
+    # and a WHERE on the update, so a row repointed since is not overwritten.
+    cas_present = cas and not expected.absent
+    if cas_present:
+        on_conflict += (
+            "\n               WHERE knowledge_units.id = ? AND knowledge_units.secret_ref IS ?"
+            " AND knowledge_units.qdrant_id IS ?"
+        )
+    source = (
+        "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
+        "WHERE EXISTS (SELECT 1 FROM knowledge_units WHERE project_type = ? "
+        "AND domain = ? AND concept = ?)"
+        if cas_present
+        else "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
     try:
         cursor = await db.execute(
             f"""INSERT INTO knowledge_units
@@ -587,7 +662,7 @@ async def upsert(
                 concept, body, relationships, caveats, tags, confidence,
                 source_date, ingested_at, qdrant_id, embedding_model,
                 source_pipeline, purpose, ingestion_source, origin_class, secret_ref)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               {source}
                ON CONFLICT(project_type, domain, concept) {on_conflict}""",  # noqa: S608 - fixed fragments, values bound
             (
                 unit_id,
@@ -611,6 +686,11 @@ async def upsert(
                 ingestion_source,
                 origin_class,
                 secret_ref,
+                *(
+                    (project_type, domain, concept,
+                     expected.unit_id, expected.secret_ref, expected.qdrant_id)
+                    if cas_present else ()
+                ),
             ),
         )
     except aiosqlite.IntegrityError as exc:
@@ -620,6 +700,20 @@ async def upsert(
             "refusing a credential reference with no value to hold: the secret "
             "it names was deleted or repointed while this write ran (#2426)"
         ) from exc
+
+    if cas and not cursor.rowcount:
+        # The key changed between the caller's read and this statement, which
+        # therefore wrote nothing. A secret row this call inserted is named by
+        # no unit (its id is ours alone): retire it, then say so.
+        if secret_value is not None and secret_ref is not None:
+            await db.execute(
+                "DELETE FROM reference_secrets WHERE id = ? AND NOT EXISTS "
+                "(SELECT 1 FROM knowledge_units WHERE secret_ref = ?)",
+                (secret_ref, secret_ref),
+            )
+        if _commit:
+            await db.commit()
+        raise CredentialKeyChanged("this credential key changed while the write ran (#2426)")
 
     if insert_only and not cursor.rowcount:
         # Another writer inserted the key between the check and this
