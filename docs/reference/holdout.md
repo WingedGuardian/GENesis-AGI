@@ -132,7 +132,12 @@ the holdout (`scripts/hooks/holdout_fence.py`, added separately): "not
 installed in this checkout" until that hook exists, then the count of exposures
 it recorded in `$GENESIS_HOME/logs/holdout-exposures.jsonl` (reads, writes,
 accesses and content; never rotated), or that the log is missing or unreadable. The
-"installed" test is the hook file's presence in the checkout. A scenario
+"installed" test is the hook file's presence in the checkout. Accesses by an
+agent declaring itself `holdout-writer` are counted separately, with the latest
+time, for the owner to match against writer runs they ordered: the writer is
+known only by the name an agent declares, so any session could claim it. The
+fence and the count catch honest mistakes; "no exposures" is not proof that the
+set is still hidden. A scenario
 written before an exposure may be spoiled; tell the owner. It also keeps
 `$GENESIS_HOME/.ignore` listing `holdout/`, so ripgrep-based searches of the
 Genesis home skip the directory.

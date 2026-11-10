@@ -864,3 +864,18 @@ def test_the_runner_imports_without_the_venv(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.startswith("holdout: none")
+
+
+def test_writer_accesses_are_counted_separately(repo, fake_gh, install_holdout, capsys):
+    log = install_holdout / "logs" / "holdout-exposures.jsonl"
+    log.parent.mkdir()
+    rows = [
+        {"at": "2026-11-03T00:00:00Z", "kind": "allowed"},
+        {"at": "2026-11-04T00:00:00Z", "kind": "allowed"},
+    ]
+    log.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    _, out = _run_install(
+        repo, install_holdout, _scenario("H-01", steps=_call("g"), expect="gamma"), capsys
+    )
+    assert "holdout fence: no exposures logged" in out
+    assert "2 access(es) declaring the holdout-writer agent, latest 2026-11-04T00:00:00Z" in out

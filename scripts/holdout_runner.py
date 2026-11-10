@@ -674,6 +674,7 @@ def _print_exposures(out) -> None:
         print("holdout fence: no exposures logged (no exposure log yet)", file=out)
         return
     count, bad, times = 0, 0, []
+    writer, writer_times = 0, []
     try:
         with open(EXPOSURE_LOG, encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -687,12 +688,24 @@ def _print_exposures(out) -> None:
                 if not isinstance(row, dict):
                     bad += 1
                     continue
+                if row.get("kind") == "allowed":
+                    # The writer is known only by the name an agent declares, so
+                    # these are counted for the owner to match against writer
+                    # runs they ordered, never treated as harmless.
+                    writer += 1
+                    writer_times.append(str(row.get("at") or ""))
+                    continue
                 count += 1
                 times.append(str(row.get("at") or ""))
     except OSError as exc:
         print(f"holdout fence: exposure log unreadable ({exc}); treat as unknown", file=out)
         return
     tail = f"; {bad} unreadable line(s)" if bad else ""
+    if writer:
+        tail += (
+            f"; {writer} access(es) declaring the holdout-writer agent, latest "
+            f"{max(writer_times)}: confirm each was a writer run you ordered"
+        )
     if not count:
         print(f"holdout fence: no exposures logged{tail}", file=out)
         return
