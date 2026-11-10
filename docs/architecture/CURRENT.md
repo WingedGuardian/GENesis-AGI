@@ -399,7 +399,13 @@ census does not read is carried: each row records `secrets_digest`, a hash of
 the six keys it reads, and the next census proves a changed file whose current
 values hash the same for the same pid and start (`carried: true`; the latest
 census row only; never when the file names `SECRETS_PATH` or
-`GENESIS_REPO_ROOT`)), and its database
+`GENESIS_REPO_ROOT`); the file is the one the resolver picks now, and a
+fallback past an absent `~/.config/genesis/secrets.env` counts only when that
+directory and every symlink on its path are unchanged by ctime since the server
+started, since a changed one may have held the file it loaded (#4278), and a
+fallback from another checkout's file to `~/genesis/secrets.env` is unknown;
+nothing else in `~/.config` is read),
+and its database
 scope (the primary database is fixed at import from the exec env or the root
 default, and a path in the file becomes a second one; `foreign` only when every
 one of them differs from the live database by `(st_dev, st_ino)`, no symlink on
