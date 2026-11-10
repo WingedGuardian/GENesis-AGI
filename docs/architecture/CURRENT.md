@@ -4189,6 +4189,18 @@ Refusing a proposed update preserves a previously valid opt-in.
   `python -m genesis.trash list|restore`. Callers: cognitive rollback, the
   orphan task-worktree reset, and the dashboard's file-browser and memory-file
   deletes (`docs/reference/trash.md`). Stdlib only.
+- **Worktree reaper trash** (`scripts/worktree_lifecycle.py`, outside `src/`;
+  read at 26218b962, 2026-11-10): the daily hygiene run archives stale
+  worktrees into `~/.genesis/worktree-trash`. An entry has two forms: a
+  `<entry>.tar.gz` with a `<entry>.meta.json` sidecar and a locked, directory-less
+  registration (the anchor that keeps its commits reachable), or a compacted
+  `<entry>.compacted.json` stub whose head is pinned under `refs/archived/` and
+  carried in a `<entry>.compacted.bundle`; each compaction run re-pins a lost pin.
+  Nothing deletes or compacts on a schedule yet. `--expire-trash` (merged,
+  content-proven redundant: `worktree_redundancy.py`, #2504) and
+  `--compact-trash` (unmerged, every file equal to its head:
+  `worktree_compaction.py`) are manual, and #4160 tracks scheduling them.
+  `--recover` restores either form; a stub comes back detached at its pin.
 - **hostmetrics/**: stdlib-only resource readings (container cgroup memory and
   CPU, PSI, disks, and the host's headroom through the guardian gateway) and the
   `preflight`/`status` CLI that admits or refuses a heavy job against the
