@@ -345,7 +345,12 @@ def _prior_labels(
     return rr._class_labels(rows, prior_heads)
 
 
-def covered_late_keys(
+def covered_late_keys(cwd: str, budget: Mapping[str, Any], late: Sequence[Mapping[str, Any]], **context) -> set[str]:
+    """Compatibility set view of the same fully validated late coverage."""
+    return set(coverage_details(cwd, budget, late, **context))
+
+
+def coverage_details(
     cwd: str,
     budget: Mapping[str, Any],
     late: Sequence[Mapping[str, Any]],
@@ -355,7 +360,7 @@ def covered_late_keys(
     deadline: float | None = None,
     repo: str | None = None,
     number: int | None = None,
-) -> set[str]:
+) -> dict[str, rr.Disposition]:
     """Late keys answered by committed reflections. A reflection R naming head
     N, committed at T, credits late key k (reviewed on head H at time S) only
     when ALL hold:
@@ -400,7 +405,7 @@ def covered_late_keys(
     refuses. Raises ``Refused`` when git cannot be read: unknown, never
     nothing owed."""
     with rr.deadline_scope(deadline):
-        return _covered_late_keys(
+        return _coverage_details(
             cwd, budget, late, gate_lane=gate_lane, acceptance=acceptance, deadline=deadline,
             repo=repo, number=number,
         )
@@ -425,7 +430,7 @@ def _before_every_fix(
     return True
 
 
-def _covered_late_keys(
+def _coverage_details(
     cwd: str,
     budget: Mapping[str, Any],
     late: Sequence[Mapping[str, Any]],
@@ -435,7 +440,7 @@ def _covered_late_keys(
     deadline: float | None,
     repo: str | None,
     number: int | None,
-) -> set[str]:
+) -> dict[str, rr.Disposition]:
     current = budget.get("current_head")
     in_graph, ancestors = _ancestry(budget)
     log = rr._log_reflections(cwd)
@@ -443,7 +448,7 @@ def _covered_late_keys(
     checked: dict[tuple[str, RoundContext], bool] = {}
     fix_times: dict[tuple[str, str], datetime | None] = {}
     tip_rows: dict[str, list[rr.Fix]] = {}
-    covered: set[str] = set()
+    covered: dict[str, rr.Disposition] = {}
     citation_cache: dict[str, dict] = {}
     for sha, kind, body, made_at in log:
         if deadline is not None and time.monotonic() > deadline:

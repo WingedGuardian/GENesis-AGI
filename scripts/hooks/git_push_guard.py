@@ -5632,7 +5632,16 @@ def _format_rounds(result: dict) -> str:
     if counts:
         trend = result.get("trend")
         mark = {"rising": " (RISING)", "falling": " (falling)", "flat": " (flat)"}.get(trend, "")
-        parts.append("findings per round " + "→".join(str(c) for c in counts) + mark)
+        parts.append("raw findings per round " + "→".join(str(c) for c in counts) + mark)
+    remaining = result.get("remaining_report") or {}
+    if remaining.get("status") == "ok":
+        rows = remaining["rounds"]
+        parts.append("no-defect per round " + "→".join(str(r["no_defect"]) for r in rows))
+        trend = remaining.get("trend")
+        suffix = f" ({trend})" if trend else ""
+        parts.append("remaining findings per round " + "→".join(str(r["remaining_findings"]) for r in rows) + suffix)
+    else:
+        parts.append("remaining findings UNKNOWN (local coverage not validated)")
     legacy = int(result.get("legacy_heads") or 0)
     if legacy:
         parts.append(f"{legacy} head(s) counted by the pre-cutover rule")
@@ -5672,6 +5681,13 @@ def _rounds_row(pr_num: str, repo: str | None = None) -> str:
         result = _review_budget.evaluate_pr(target, pr_num, timeout_for=_gh_timeout)
     except Exception:  # noqa: BLE001 - an advisory row never takes the report down.
         return "unreadable (lookup failed)"
+    if result.get("status") == "ok":
+        import review_remaining  # noqa: PLC0415
+
+        result["remaining_report"] = review_remaining.remaining_report(
+            os.getcwd(), target, int(pr_num), result,
+            deadline=time.monotonic() + _gh_timeout(8.0),
+        )
     return _format_rounds(result)
 
 
