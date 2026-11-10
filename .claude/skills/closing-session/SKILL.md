@@ -1311,8 +1311,9 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
 
   A merge of main does not end a round. When nothing after the reviewed head is a
   fix (only merges of main that carry nothing else, or empty commits such as a
-  pushed reflection), the round is still open at the reviewed head: its keys stay
-  owed, and the reflection names that head, not the PR head. A real commit after
+  pushed reflection), that round's keys stay owed (as late keys, under the round's
+  own context), even when the merge then draws findings of its own and opens
+  the next round; the reflection names the PR head as for any owed key. A real commit after
   the review does complete the round; when the newest such round (opened after
   the go-live cutover) has no reflection naming it, the gate says so in an
   advisory. A rebase or force-push that drops the reviewed head from the PR still

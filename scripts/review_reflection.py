@@ -1294,73 +1294,6 @@ def _newest_round_behind(budget: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return newest[0] if len(newest) == 1 else None
 
 
-def pr_head(budget: Mapping[str, Any]) -> str:
-    """The PR's real head, also under a ``held_open`` view (whose
-    ``current_head`` is the held round's head). The owe side's "was this head
-    fixed since" horizon is always the real head: a merge of main above a held
-    round is no fix of that round, but it IS one of an older round's head."""
-    held = budget.get("held_open")
-    if isinstance(held, Mapping) and isinstance(held.get("pr_head"), str):
-        return held["pr_head"]
-    return str(budget.get("current_head"))
-
-
-def held_open(cwd: str, budget: Mapping[str, Any]) -> Mapping[str, Any]:
-    """The budget as the reflection gate reads it: unchanged, except when the
-    head moved off the newest round head by NO FIX at all (``fix_rows`` with
-    ``main_merges``, the credit side's reading of "no fix"): only merges of the
-    default branch that carry nothing else, and commits that keep their
-    parent's tree (a pushed reflection, an empty commit). That round has not
-    been answered; nothing was fixed. So the view holds it open AT ITS OWN
-    HEAD: ``current_head`` is that round head, its keys are the open keys, and
-    a reflection names it. ``held_open`` records the PR's real head.
-
-    The producer's ``round_state`` (complete) is untouched, so counts, the
-    rounds row and the trend do not change. Without this, a merge of main
-    pushed after a review made the round complete, its keys owed by nobody,
-    and the next fix commit was admitted silently (#4133, item 6). A pushed
-    reflection that failed its full check no longer completes the round
-    either: its keys stay owed until a reflection that passes.
-
-    Idempotent and read once: whatever it decided after a git walk, the
-    result carries ``held_open`` (None when nothing is held), and a second call
-    returns it unchanged. The owe side's fix horizon stays the real head
-    (``pr_head``). Residual: a rebase or force-push drops the reviewed head out
-    of the commit graph, and nothing is held (as before).
-
-    Raises ``Refused`` when git cannot relate the two heads (an unfetched
-    head): unknown, never "nothing owed"."""
-    if "held_open" in budget:
-        return budget  # already read: a second call costs no second git walk
-    if budget.get("status") != "ok" or budget.get("round_state") != "complete":
-        return budget
-    entry = _newest_round_behind(budget)
-    if entry is None:
-        return budget
-    round_head, head = str(entry.get("head")), str(budget.get("current_head"))
-    if fix_rows(cwd, round_head, head, main_merges=True) != []:
-        return {**budget, "held_open": None}
-    seen: dict[str, None] = {}
-    known = not entry.get("legacy")
-    for source in entry.get("reviews") or []:
-        for key in source.get("finding_keys") or []:
-            if isinstance(key, str):
-                seen.setdefault(key)
-            else:
-                known = False
-    return {
-        **budget,
-        "current_head": round_head,
-        "round_state": "open",
-        "open_keys": list(seen),
-        "reflection_keys": "ok" if known else "unknown",
-        # The budget does not say who reviewed the round head clean, so the
-        # settle window for a held round is the time window alone.
-        "expected_reviewers": [],
-        "held_open": {"pr_head": head, "round_head": round_head},
-    }
-
-
 def unreflected_round_behind(
     cwd: str, budget: Mapping[str, Any], *, cutover: str | None
 ) -> str | None:
@@ -1382,8 +1315,20 @@ def unreflected_round_behind(
     round_head = str(entry.get("head"))
     for _sha, _kind, body, _at in _log_reflections(cwd):
         match = HEADER_RE.match(body.split("\n", 1)[0])
-        if match and match.group(2) == round_head:
+        # Only a reflection that passes its grammar answered the round: one
+        # that fails it must not silence the advisory.
+        if not match or parse(body).problems:
+            continue
+        named = match.group(2)
+        if named == round_head:
             return None
+        # A held round is answered by a reflection naming the PR head, which
+        # the PR reached from the round by no fix (review_late.held_round).
+        try:
+            if fix_rows(cwd, round_head, named, main_merges=True) == []:
+                return None
+        except Refused:
+            continue
     return round_head
 
 
@@ -1395,14 +1340,17 @@ def owed_state(
     cutover: str | None = None,
     fix_time: Any = None,
     late_covered: Iterable[str] = (),
+    held: str | None = None,
 ) -> dict[str, Any]:
     """What is owed, from a ``review_budget`` result: the open round's keys less
     ``covered`` (``covered_keys``). With ``cutover`` None that is all, and pure.
     With a cutover, the late keys from it on (``review_late.late_owed``) less
-    ``late_covered`` are owed too. The two are subtracted apart, so a
-    reflection judged under the open round never clears a late key, which only
-    its own round's context can. ``fix_time`` (``review_late.fix_time_reader``)
-    reads local git and may raise ``Refused``."""
+    ``late_covered`` are owed too, including a ``held`` round's
+    (``review_late.held_round``: the PR moved past it by no fix). The two are
+    subtracted apart, so a reflection judged under the open round never clears
+    a late key, which only its own round's context can. ``fix_time``
+    (``review_late.fix_time_reader``) reads local git and may raise
+    ``Refused``."""
     state: dict[str, Any] = {
         "status": budget.get("status"),
         "round": budget.get("count"),
@@ -1421,9 +1369,8 @@ def owed_state(
         "cutover": cutover,
         # None (unknown) until a cutover's late findings have been read.
         "late_keys": [] if cutover is None else None,
-        # Set when ``held_open`` holds a round open across a merge of main:
-        # ``head`` is then the round head and this names the PR's real head.
-        "held_open": budget.get("held_open"),
+        # The round head the PR moved past by no fix, whose keys stay owed.
+        "held_round": held,
     }
     if budget.get("status") != "ok":
         return state
@@ -1432,7 +1379,7 @@ def owed_state(
         import review_late  # noqa: PLC0415
 
         state["late_keys"], late_owed = review_late.late_owed(
-            budget, late_covered, cutover=cutover, fix_time=fix_time
+            budget, late_covered, cutover=cutover, fix_time=fix_time, held=held
         )
     if budget.get("round_state") != "open":
         state["owed"] = late_owed
@@ -1544,7 +1491,6 @@ def owed_from_budget(
     it this raises ``Refused``, as it does when git cannot be read: a caller
     must treat either as unknown, never as nothing owed."""
     with deadline_scope(deadline):
-        budget = held_open(cwd, budget)
         if cutover is not None:
             import review_late  # noqa: PLC0415
 

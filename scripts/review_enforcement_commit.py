@@ -1041,8 +1041,9 @@ def _key_rounds(
         import review_late  # noqa: PLC0415 — lazy, like review_reflection
 
         with rr.deadline_scope(deadline):
-            fix_time = review_late.fix_time_reader(cwd or ".", rr.pr_head(budget))
-            late = review_late.late_findings(budget, state.get("cutover"), fix_time)
+            fix_time = review_late.fix_time_reader(cwd or ".", str(budget.get("current_head")))
+            held = review_late.held_round(cwd or ".", budget)
+            late = review_late.late_findings(budget, state.get("cutover"), fix_time, held=held)
         if late is None:
             raise rr.Refused("the late findings could not be read")
         _, ancestors = review_late._ancestry(budget)
@@ -1127,13 +1128,6 @@ def _reflection_problem(
             return "the round of the owed keys it names cannot be placed, so it would credit nothing"
         return "the reflection does not pass its grammar: " + "; ".join(problems[:5])
     if parsed.head != budget.get("current_head"):
-        held = budget.get("held_open")
-        if isinstance(held, dict):
-            return (
-                f"the reflection names head {str(parsed.head)[:12]}, but this round is held "
-                f"open at its reviewed head {str(budget.get('current_head'))[:12]} (the PR head "
-                f"{str(held.get('pr_head'))[:12]} fixes nothing since it): name that head"
-            )
         return f"the reflection names head {str(parsed.head)[:12]}, not the PR head {str(budget.get('current_head'))[:12]}"
     return None
 
@@ -1148,12 +1142,12 @@ def _owed_message(state: dict, budget: dict, rr) -> str:
         f"BLOCKED: review round {round_n} of PR #{budget.get('pr')} owes a round "
         f"reflection before any further commit. Owed: {owed}.",
     ]
-    held = budget.get("held_open")
-    if isinstance(held, dict):
+    held = state.get("held_round")
+    if isinstance(held, str):
         lines.append(
-            f"Nothing between the reviewed head {str(budget.get('current_head'))[:12]} and the "
-            f"PR head {str(held.get('pr_head'))[:12]} is a fix (only merges of main or empty "
-            "commits), so that round is still open: the reflection names the reviewed head."
+            f"Nothing after the reviewed head {held[:12]} is a fix (only merges of main or "
+            "empty commits), so that round's findings are still owed; the reflection names "
+            "the PR head, as for any owed key."
         )
     if not state.get("settled") and state.get("settle_until"):
         lines.append(
@@ -1208,10 +1202,6 @@ def _reflection_rule(
         if hook_deadline is None or slice_s <= 0:
             raise TimeoutError("no time left in the hook budget")
         owed_deadline = time.monotonic() + slice_s
-        # A round the head moved off only by a merge of main stays open at its
-        # own head: debt, admission and the deny all read this one view.
-        with rr.deadline_scope(owed_deadline):
-            budget = dict(rr.held_open(cwd or ".", budget))
         state = rr.owed_from_budget(
             cwd or ".",
             budget,

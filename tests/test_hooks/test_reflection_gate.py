@@ -792,24 +792,71 @@ def test_a_merge_of_main_pushed_after_the_review_keeps_the_round_owed(repo, home
     res = _run('git commit -m "fix"', repo, home)
     assert res.returncode == 2, res.stdout + res.stderr
     assert "Owed: c11." in res.stderr
-    assert head[:12] in res.stderr  # names the reviewed head the reflection must name
+    assert head[:12] in res.stderr  # names the reviewed head that is held
 
 
-def test_a_held_open_round_admits_a_reflection_naming_the_reviewed_head(
-    repo, home, monkeypatch, tmp_path
-):
+def test_a_held_round_admits_a_reflection_naming_the_pr_head(repo, home, monkeypatch, tmp_path):
+    """The held round's keys are owed like any late key: the reflection names
+    the PR head (the merge), as on main, never the older reviewed head."""
     head, merge = _merge_main_after_the_review(monkeypatch, repo)
-    msg = _write_reflection(tmp_path, _reflection(head))
+    wrong = _write_reflection(tmp_path, _reflection(head))
+    res = _run(f"git commit --allow-empty --cleanup=verbatim -F {wrong}", repo, home)
+    assert res.returncode == 2 and "not the PR head" in res.stderr, res.stdout + res.stderr
+    msg = _write_reflection(tmp_path, _reflection(merge))
     res = _run(f"git commit --allow-empty --cleanup=verbatim -F {msg}", repo, home)
     assert res.returncode == 0, res.stdout + res.stderr
-    wrong = _write_reflection(tmp_path, _reflection(merge))
-    res = _run(f"git commit --allow-empty --cleanup=verbatim -F {wrong}", repo, home)
-    assert res.returncode == 2 and head[:12] in res.stderr, res.stdout + res.stderr
 
 
-def test_after_the_reflection_the_held_open_fix_passes(repo, home, monkeypatch, tmp_path):
-    head, _ = _merge_main_after_the_review(monkeypatch, repo)
-    msg = _write_reflection(tmp_path, _reflection(head))
+def test_after_the_reflection_the_held_fix_passes(repo, home, monkeypatch, tmp_path):
+    _, merge = _merge_main_after_the_review(monkeypatch, repo)
+    msg = _write_reflection(tmp_path, _reflection(merge))
+    _git(repo, "commit", "-q", "--allow-empty", "--cleanup=verbatim", "-F", str(msg))
+    _stage_fix(repo)
+    _mark(repo, home)
+    res = _run('git commit -m "fix"', repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "owes a round reflection" not in res.stdout + res.stderr
+    # The reflection named the PR head, as the deny says: the round counts as
+    # answered, so no "round has no reflection" advisory either.
+    assert "no reflection" not in res.stdout + res.stderr
+
+
+def test_a_reviewed_merge_still_owes_the_round_behind_it(repo, home, monkeypatch, tmp_path):
+    """The merge of main draws findings of its own (c33), so round 2 opens at
+    it. That does not answer round 1: c11 stays owed beside c33, and ONE
+    reflection naming the merge credits both."""
+    head, merge = _merge_main_after_the_review(monkeypatch, repo)
+    old = datetime.now(UTC) - timedelta(hours=3)
+
+    def review(n, sha, ids, minutes):
+        return {
+            "id": n,
+            "login": CODEX,
+            "commit_id": sha,
+            "state": "COMMENTED",
+            "submitted_at": (old + timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z"),
+            "body": "",
+            "top_level": [P2] * len(ids),
+            "top_level_ids": ids,
+        }
+
+    reviews = [review(1, head, [11], 0), review(2, merge, [33], 30)]
+    monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "\n".join(json.dumps(r) for r in reviews))
+    _stage_fix(repo)
+    _mark(repo, home)
+    res = _run('git commit -m "fix"', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "c11" in res.stderr and "c33" in res.stderr
+    _git(repo, "reset", "-q")
+    (home / "premise-check.txt").write_text(
+        "Design-premise: SOUND\n"
+        "Expected before checking: the bound is the right place\n"
+        "P1 TRUE — the bound is checked in one place · read · 90% · falsified by a second reader\n"
+        "P2 TRUE — the one helper covers both callers · read · 90% · falsified by a third caller\n"
+    )
+    msg = _write_reflection(tmp_path, _reflection(merge, keys=("c11", "c33"), premise_round=True))
+    res = _run(f"git commit --allow-empty --cleanup=verbatim -F {msg}", repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
     _git(repo, "commit", "-q", "--allow-empty", "--cleanup=verbatim", "-F", str(msg))
     _stage_fix(repo)
     _mark(repo, home)
@@ -877,8 +924,8 @@ def test_a_reflected_round_behind_the_head_stays_silent(repo, home, monkeypatch,
 
 
 def test_status_holds_the_round_open_too(repo, monkeypatch):
-    """``status`` and the gate share ``owed_from_budget``, so the round held open
-    across a merge of main is owed there too, naming the reviewed head."""
+    """``status`` and the gate share ``owed_from_budget``, so the round held
+    across a merge of main is owed there too; the head stays the PR head."""
     import review_budget
 
     head, merge = _merge_main_after_the_review(monkeypatch, repo)
@@ -893,7 +940,7 @@ def test_status_holds_the_round_open_too(repo, monkeypatch):
         cutover=rr.REFLECTION_CUTOVER_ISO,  # the path status and the gate both take
     )
     assert state["owed"] == ["c11"]
-    assert state["head"] == head and state["held_open"]["pr_head"] == merge
+    assert state["head"] == merge and state["held_round"] == head
 
 
 def test_the_newest_of_two_rounds_is_held_open(repo, home, monkeypatch):
@@ -1078,23 +1125,83 @@ def test_an_older_round_reviewed_after_the_merge_stays_owed(repo, monkeypatch):
         str(repo), budget, "owner/repo", 99, now=soon + timedelta(hours=1),
         cutover=rr.REFLECTION_CUTOVER_ISO,
     )
-    assert state["held_open"]["round_head"] == second
+    assert state["held_round"] == second
     assert sorted(state["owed"]) == ["c11", "c22"]
 
 
-def test_held_open_reads_git_once(repo, monkeypatch):
-    """Rule R reads the view, then owed_from_budget reads it again: the second
-    read must not repeat the git walk (it runs inside the 1 s slice)."""
-    import review_budget
+def test_a_late_finding_after_the_held_round_is_answerable(repo, home, monkeypatch, tmp_path):
+    """Round 1 of #4294 (Codex P2, Devin severe): H reviewed with c11, an empty
+    commit E, a merge of main M, a clean review of M, then findings c22 on E
+    (late: M was reviewed first). H is held and E's finding is late; ONE
+    reflection naming the PR head credits both, and the fix then passes."""
+    head = _open_round(monkeypatch, repo)
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "nothing to fix yet")
+    empty = _head(repo)
+    _git(repo, "checkout", "-q", "main")
+    (repo / "other.py").write_text("other = 1\n")
+    _git(repo, "add", "other.py")
+    _git(repo, "commit", "-qm", "main moves on")
+    _git(repo, "update-ref", "refs/remotes/origin/main", _head(repo))
+    _git(repo, "checkout", "-q", "feature/reflection")
+    _git(repo, "merge", "-q", "--no-ff", "--no-edit", "main")
+    merge = _point_budget_at(monkeypatch, repo)
+    old = datetime.now(UTC) - timedelta(hours=3)
 
-    _open_round(monkeypatch, repo)
+    def review(n, sha, ids, minutes):
+        when = (old + timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z")
+        top = [P2] * len(ids)
+        return {
+            "id": n,
+            "login": CODEX,
+            "commit_id": sha,
+            "state": "COMMENTED",
+            "submitted_at": when,
+            "body": "",
+            "top_level": top,
+            "top_level_ids": ids,
+        }
+
+    reviews = [review(1, head, [11], 0), review(3, empty, [22], 60)]
+    monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "\n".join(json.dumps(r) for r in reviews))
+    clean = {  # a clean Codex review of M, before E's findings: they are late
+        "login": CODEX,
+        "type": "Bot",
+        "body": f"Codex Review: Didn't find any major issues.\nReviewed commit: `{merge[:10]}`",
+        "created_at": (old + timedelta(minutes=30)).isoformat().replace("+00:00", "Z"),
+    }
+    monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", json.dumps(clean))
+    _stage_fix(repo)
+    _mark(repo, home)
+    res = _run('git commit -m "fix"', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "c11" in res.stderr and "c22" in res.stderr
+    _git(repo, "reset", "-q")
+    msg = _write_reflection(tmp_path, _reflection(merge, keys=("c11", "c22")))
+    res = _run(f"git commit --allow-empty --cleanup=verbatim -F {msg}", repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+    _git(repo, "commit", "-q", "--allow-empty", "--cleanup=verbatim", "-F", str(msg))
+    _stage_fix(repo)
+    _mark(repo, home)
+    res = _run('git commit -m "fix"', repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "owes a round reflection" not in res.stdout + res.stderr
+
+
+def test_a_reflection_that_fails_its_grammar_does_not_silence_the_advisory(
+    repo, home, monkeypatch, tmp_path
+):
+    """A header naming the round head is not an answer when the reflection
+    fails its grammar: the advisory still names the unanswered round."""
+    head = _open_round(monkeypatch, repo)
+    broken = _reflection(head).replace("Escalate: no\n", "")
+    msg = _write_reflection(tmp_path, broken)
+    _git(repo, "commit", "-q", "--allow-empty", "--cleanup=verbatim", "-F", str(msg))
     (repo / "f.py").write_text("value = 5\n")
-    _git(repo, "commit", "-qam", "a real fix")
+    _git(repo, "commit", "-qam", "the fix")
     _point_budget_at(monkeypatch, repo)
-    budget = review_budget.evaluate_pr("owner/repo", 99)
-    calls = []
-    real = rr.fix_rows
-    monkeypatch.setattr(rr, "fix_rows", lambda *a, **k: calls.append(a) or real(*a, **k))
-    view = rr.held_open(str(repo), budget)
-    assert view["held_open"] is None and len(calls) == 1
-    assert rr.held_open(str(repo), view) is view and len(calls) == 1
+    _stage_fix(repo)
+    _mark(repo, home)
+    res = _run('git commit -m "more"', repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+    context = json.loads(res.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "no reflection" in context and head[:12] in context
