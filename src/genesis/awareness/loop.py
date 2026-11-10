@@ -1905,8 +1905,9 @@ def _deploy_repair_paragraph(repairs: dict) -> str:
             + " Restoring puts the saved files back as uncommitted edits: tracked ones make "
             "deploy_code_only.sh and update.sh refuse to deploy until they are committed "
             "(on a branch, as a PR), moved out, or removed; untracked ones block "
-            "deploy_code_only.sh only under src/, config/ or pyproject.toml. Backups are "
-            "pruned 90 days after the last write to their folder."
+            "deploy_code_only.sh only under src/, config/ or pyproject.toml. A report "
+            "nobody restored or dismissed is never pruned; a restored or dismissed one, "
+            "and other backups, are pruned 90 days after the last write to their folder."
         )
     refused = repairs.get("refused") or 0
     if refused:
@@ -1918,8 +1919,8 @@ def _deploy_repair_paragraph(repairs: dict) -> str:
     if unread:
         parts.append(
             f"{unread} older live-move repair report dir(s) not read, dismissed ones included "
-            "(only the newest are read); this is informational, and they are pruned with "
-            "their backups."
+            "(only the newest are read); one nobody restored or dismissed is kept with "
+            "its backups, the others are pruned 90 days after their last write."
         )
     if repairs.get("unresolved"):
         parts.append(

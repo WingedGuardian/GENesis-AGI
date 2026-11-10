@@ -946,6 +946,7 @@ async def test_td19_a_live_repair_report_raises_its_own_wording_then_resolves(db
     assert "deploy_code_only.sh and update.sh refuse to deploy" in content, content
     assert "committed (on a branch, as a PR), moved out, or removed" in content, content
     assert "90 days after the last write" in content, content
+    assert "nobody restored or dismissed is never pruned" in content, content
     assert "did not finish" in content and "run scripts/update.sh" not in content, content
     assert "says why" not in content, content  # a run killed partway wrote no reason
     _patch_snapshot(monkeypatch, _snap([]))

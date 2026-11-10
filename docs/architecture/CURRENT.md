@@ -5018,8 +5018,13 @@ logger or unrelated exceptions with copied text and no provenance.
   "not available yet" means an older kit) and `--dismiss <ts>`, says a
   restore leaves uncommitted edits (tracked ones block deploy_code_only.sh and
   update.sh, untracked ones deploy_code_only.sh only under `src/`, `config/` or
-  `pyproject.toml`), that backups are pruned 90 days after the last write to
-  their folder, and, for a report whose last restore refused parts, that its
+  `pyproject.toml`), that a report nobody restored or dismissed is never
+  pruned (disk_hygiene's deploy-backups prune asks
+  `scripts/lib/repair_report_keep.py`, which keeps exactly what this count
+  still counts, the restore run folder holding such a report's in-flight
+  aside, and any report it cannot read) while a restored or dismissed report
+  and other backups are pruned 90 days after the last write to their folder,
+  and, for a report whose last restore refused parts, that its
   output names each and that a part it can never write goes back by hand from
   the folder's `tree/`, then `--dismiss`; the guardian's diagnosis shows the
   newest report's `restore.restored_at` and `restore.refused`, quoted; it escapes any text a database
