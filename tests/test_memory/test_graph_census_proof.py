@@ -245,10 +245,26 @@ def test_a_reason_never_carries_an_environment_value(tree):
 # ── secrets file and kill switch ──────────────────────────────────────────
 
 
-def test_the_secrets_file_is_chosen_the_way_genesis_env_chooses_it(tree):
+def test_the_secrets_file_is_chosen_the_way_genesis_env_chooses_it(tree, tmp_path):
     main = tree["main"]
-    assert proof.secrets_file({}, main_root=main) == main / "secrets.env"
-    assert proof.secrets_file({"GENESIS_REPO_ROOT": "/r"}, main_root=main) == Path("/r/secrets.env")
+    home = tmp_path / "server-home"
+    home.mkdir()
+    h = {"HOME": str(home)}
+    # No file anywhere: the checkout default, as the resolver gives it.
+    assert proof.secrets_file(h, main_root=main) == main / "secrets.env"
+    (main / "secrets.env").write_text("K=v\n")
+    assert proof.secrets_file(h, main_root=main) == main / "secrets.env"
+    other = tmp_path / "r"
+    other.mkdir()
+    (other / "secrets.env").write_text("K=v\n")
+    env = {**h, "GENESIS_REPO_ROOT": str(other)}
+    assert proof.secrets_file(env, main_root=main) == other / "secrets.env"
+    # That process's own home config outranks both checkouts.
+    (home / ".config/genesis").mkdir(parents=True)
+    (home / ".config/genesis/secrets.env").write_text("K=v\n")
+    assert proof.secrets_file(h, main_root=main) == home / ".config/genesis/secrets.env"
+    # Its HOME is required to know that, so none means unprovable.
+    assert proof.secrets_file({}, main_root=main) is None
     env = {"GENESIS_REPO_ROOT": "/r", "SECRETS_PATH": "/s/x.env"}
     assert proof.secrets_file(env, main_root=main) == Path("/s/x.env")
     env = {"SECRETS_PATH": "~/s.env", "HOME": "/home/other"}
