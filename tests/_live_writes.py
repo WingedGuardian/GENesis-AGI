@@ -303,27 +303,36 @@ def _is_credential_file(name: str) -> bool:
     return (st.st_dev, st.st_ino) in _S.credential_inodes
 
 
+def _ordinary_read(args: tuple) -> bool:
+    """Whether an ``open`` event is a read of anything but a credential file.
+
+    Cheapest exit first: an import or ordinary read is not a write, and only a
+    credential file is worth resolving on a read: by its name, or by device and
+    inode when it is reached under another name."""
+    mode, flags = args[1], args[2]
+    reads = (isinstance(mode, str) and not any(c in mode for c in "wax+")) or (
+        mode is None and isinstance(flags, int) and not flags & _WRITE_FLAGS
+    )
+    if not reads:
+        return False
+    name = _fspath(args[0])
+    if not name:
+        return True
+    return not name.endswith((
+        "secrets.env", ".credentials.json", "hosts.yml", "cc_oauth_token.env",
+    )) and not _is_credential_file(name)  # fmt: skip
+
+
 def _hook(event: str, args: tuple) -> None:
     if event not in _EVENTS or getattr(_busy, "on", False):
         return
-    if event == "open":
-        mode, flags = args[1], args[2]
-        reads = (isinstance(mode, str) and not any(c in mode for c in "wax+")) or (
-            mode is None and isinstance(flags, int) and not flags & _WRITE_FLAGS
-        )
-        # Cheapest exit first: an import or ordinary read is not a write, and
-        # only a credential file is worth resolving on a read: by its name, or
-        # by device and inode when it is reached under another name.
-        if reads:
-            name = _fspath(args[0])
-            if not name:
-                return
-            if not name.endswith((
-                "secrets.env", ".credentials.json", "hosts.yml", "cc_oauth_token.env",
-            )) and not _is_credential_file(name):  # fmt: skip
-                return
+    # Everything past the event check runs under the guard and the exception
+    # boundary, the read-side credential lookup included: its os.stat can raise
+    # (a test that patches it) and is itself an audited open.
     _busy.on = True
     try:
+        if event == "open" and _ordinary_read(args):
+            return
         _judge(event, args)
     except Exception:  # noqa: BLE001, S110 - an audit fault must never break the code under test
         pass
