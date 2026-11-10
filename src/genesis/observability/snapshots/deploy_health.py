@@ -70,6 +70,10 @@ TIER2_PATHS = (
     "scripts/bootstrap.sh",
     "scripts/update.sh",
     "scripts/lib/cc_version.sh",
+    "scripts/cc_settings_align.sh",
+    "scripts/setup_claude_config.py",
+    "config/cc-global-settings.yaml",
+    ".claude/settings.json",
     "scripts/hooks",
     "pyproject.toml",
 )
