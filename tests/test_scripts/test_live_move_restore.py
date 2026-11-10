@@ -461,15 +461,19 @@ def test_a_ts_that_names_no_report_is_refused(w, ts):
 
 
 def test_dismiss_reads_through_the_loader(w):
-    """A report the loader refuses (another checkout's) is not dismissed."""
+    """A report the loader refuses (another checkout's) is never edited: it is
+    dismissed with DISMISSED.json beside it (#4331 owner ruling), so its alert
+    has a way out through Genesis."""
     ts = _repaired(w, _foreign_edit)
     path = w.backups()[-1] / "REPAIR.json"
     path.write_text(json.dumps({**json.loads(path.read_text()), "repo": "/elsewhere"}))
+    before = path.read_bytes()
     r = subprocess.run(
         ["python3", "-I", "-S", str(MODULE), "--dismiss", ts, str(w.state), str(w.root)],
         capture_output=True, text=True, env=w.env(),
     )  # fmt: skip
-    assert r.returncode == 1 and json.loads(path.read_text())["dismissed_at"] is None
+    assert r.returncode == 0 and path.read_bytes() == before, r.stderr
+    assert "not this checkout" in json.loads((path.parent / "DISMISSED.json").read_text())["unread"]
 
 
 def test_an_unreadable_tag_refuses_the_whole_report(w):

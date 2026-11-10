@@ -990,6 +990,11 @@ neither blocks opening).
 
 ### Standing mode (Claude Code only)
 
+Only the owner starts or restarts this loop, by explicit instruction at that
+moment. A session never starts one on its own: not from an earlier yes, a plan
+step or a ledger row, and not after the loop stops. Once started, it paces
+itself until the owner stops it or the loop's maximum duration ends it.
+
 When the owner starts a closing session to keep working the queue on a pace
 (`/loop` with ScheduleWakeup, at the interval the owner sets and can change), the
 one-closing-session precondition above holds for the whole life of that session.
@@ -1005,7 +1010,7 @@ after it (a check run's `completedAt`, a commit status's `startedAt` in
 unprompted per-PR watching that "When to DRIVE a Merge" defines, and re-requesting
 review with nothing new pushed. Owner questions are still batched across PRs
 (step 3 above). Merge, gate and deploy rules are unchanged, including the deploy
-owed after merging a host-path PR. The validator's standing-mode limits
+owed after merging a host-path PR. The validator's per-pass limits
 (validating-merges, "Standing mode") do not apply here. A second opinion inside
 a pass is a fresh-context review subagent, never a workflow runner that spawns
 its own sessions outside the approval gate; the round-1 two-reviewer rule for

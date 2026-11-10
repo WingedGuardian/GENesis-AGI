@@ -2881,9 +2881,10 @@ verified: c712f1bde 2026-11-06
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
   one is age-based and passive. `session_awareness/repo_pulse*.py`.
 - **Post-merge verification obligations** (shipped; producer automatic; consumer
-  the standing validator session, owner-started and self-paced per the
-  validating-merges skill's "Standing mode", or any manual validator; nothing
-  dispatches one automatically — issue #1718):
+  the standing validator session, started only on the owner's explicit
+  instruction and self-paced once started, per the validating-merges skill's
+  "Standing mode", or any manual validator; nothing dispatches or restarts one
+  automatically — issue #1718):
   the pulse worker's verification lane opens one `pr_verifications` row per
   MERGED PR, so "run the E2E after merge" survives the merge instead of living
   in someone's memory. A documentation-only diff is auto-closed with the reason
@@ -5061,8 +5062,13 @@ logger or unrelated exceptions with copied text and no provenance.
   "not available yet" means an older kit) and `--dismiss <ts>`, says a
   restore leaves uncommitted edits (tracked ones block deploy_code_only.sh and
   update.sh, untracked ones deploy_code_only.sh only under `src/`, `config/` or
-  `pyproject.toml`), that backups are pruned 90 days after the last write to
-  their folder, and, for a report whose last restore refused parts, that its
+  `pyproject.toml`), that a report nobody restored or dismissed is never
+  pruned (disk_hygiene's deploy-backups prune asks
+  `scripts/lib/repair_report_keep.py`, which keeps exactly what this count
+  still counts, the restore run folder holding such a report's in-flight
+  aside, and any report it cannot read) while a restored or dismissed report
+  and other backups are pruned 90 days after the last write to their folder,
+  and, for a report whose last restore refused parts, that its
   output names each and that a part it can never write goes back by hand from
   the folder's `tree/`, then `--dismiss`; the guardian's diagnosis shows the
   newest report's `restore.restored_at` and `restore.refused`, quoted; it escapes any text a database
@@ -5080,7 +5086,11 @@ logger or unrelated exceptions with copied text and no provenance.
   rule accepts (`report_ts`; anything else exits 2 before a path is built) and
   read the report through `load_report`; `--dismiss` rewrites `REPAIR.json`
   only under update.lock (30 s wait by default; still held, exit 1 and
-  nothing written), so it cannot race a restore's own rewrite. `scripts/
+  nothing written), so it cannot race a restore's own rewrite. A report
+  `load_report` refuses (unreadable, or another checkout's) is dismissed with
+  `DISMISSED.json` beside it, only in a real directory of this user's, and
+  `REPAIR.json` is left as it is; deploy health, the guardian's pick and the
+  deploy-backups prune all skip a folder holding it. `scripts/
   deploy_candidates repair-move --restore TS [--check]` passes through to the
   kit. `live_move_repair.py --restore TS
   --check` (#3492 PR B1) is the read-only judge of what a restore would
