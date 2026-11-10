@@ -1117,3 +1117,19 @@ def test_the_check_never_runs_the_repositorys_fsmonitor(w, tmp_path):
     r = _check(w, ts)
     assert r.returncode == 0, r.stdout + r.stderr
     assert not marker.exists(), "the check ran the repository's fsmonitor"
+
+
+def test_every_module_the_restore_loads_beside_it_ships_in_the_kit():
+    """The restore loads its row rules and run-folder rules by path from its own
+    directory, so a kit missing one of them cannot load at all. Every such file
+    must be in KIT_FILES, the list the test harness copies into its kit (the
+    kit installer, #3492 D2, must ship the same files)."""
+    import re
+
+    from tests.test_scripts._live_repair_world import KIT_FILES
+
+    loaded = set()
+    for name in ("live_move_restore.py", "live_move_restore_runs.py", "live_move_restore_rows.py"):
+        loaded |= set(re.findall(r'_sibling\("([^"]+)"\)', (LIB / name).read_text()))
+    assert loaded == {"live_move_restore_rows.py", "live_move_restore_runs.py"}
+    assert loaded <= set(KIT_FILES)

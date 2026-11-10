@@ -5085,7 +5085,11 @@ logger or unrelated exceptions with copied text and no provenance.
   kit. `live_move_repair.py --restore TS
   --check` (#3492 PR B1) is the read-only judge of what a restore would
   write, in a second kit source, `scripts/lib/live_move_restore.py`, loaded
-  from the kit's own directory like the guard. It takes the repair's locks in
+  from the kit's own directory like the guard. Its report and row rules and
+  read budgets live in `live_move_restore_rows.py`, and its run-folder and
+  origin rules in `live_move_restore_runs.py`, which loads the rows module;
+  both are loaded by path from the same directory, so they ship in the kit
+  beside it. It takes the repair's locks in
   the repair's order with a short wait (30 s; `--wait` honoured) and exits 1
   while any is held (naming the pid the update state records, if any), or
   while the guard calls the checkout `mixed_tree` or `guards`. It reaches
