@@ -12,11 +12,13 @@ hash-free child may still gain the repair even when its parent contains `#`.
 Backslash-newline retains the existing continuation handling. No input rewriting,
 new tokenizer, larger limit or generic tokenization exemption is added.
 
-This is a partial repair: #3257 and #3264 remain open for their broader
-hash/escape and substitution classes. A separate, later validator change is
-planned to refuse commands containing both literal `#` and backslash before
-parsing; nothing in this tree does so yet, and ordinary clients would not acquire
-that refusal. Use body files for data; the parser does not claim complete Bash
+This is a partial repair, completed for the escaped-quote case by refusal: in
+hash-bearing text an escaped quote outside quotes now refuses (#3713, below),
+so it no longer hides the next command. The broader substitution class (#3264)
+is refused rather than read until the shared lexer lands. A separate, later
+validator change is planned to refuse commands containing both literal `#` and
+backslash before parsing; nothing in this tree does so yet, and ordinary clients
+would not acquire that refusal. Use body files for data; the parser does not claim complete Bash
 grammar or process isolation.
 
 One new refusal follows from the repair, in the fail-closed direction. The
@@ -108,10 +110,11 @@ Tests retain both the current heredoc protections and nested-completeness cases,
 plus combined-state recovery and the accepted extra-refusal boundary.
 Real Bash shim tests cover escaped quotes, operators and word characters across
 direct/nested scripts and command separators. The hash-free escaped-word
-property is positive; the broader property retains its strict known hash-case
-failure with an explicit witness. Comment/quote witnesses retain actual owned
+property is positive, and the broader hash-bearing property now holds too: such
+text is refused rather than read (#3713). Comment/quote witnesses retain actual owned
 execution receipts. One former escaped-double-quote substitution reproduction
 also now surfaces its suffix; this does not establish that every substitution
 quote case is fixed. The paired opposite-quote case is now refused rather than
-parsed (#3713); the generator's quote-bearing words remain excluded until the
-shared lexer can read it.
+parsed (#3713), and the Bash differential's generator draws quote-bearing words
+again: across 10 seeds of 1,500 commands it finds no command bash runs that the
+parse neither shows nor refuses.
