@@ -1764,6 +1764,11 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         _redis_cli_esc=$(_sed_repl_esc "$(_falkordb_redis_cli_bin 2>/dev/null || true)")
         _falkordb_mod_esc=$(_sed_repl_esc "$(_falkordb_module_path 2>/dev/null || true)")
         _falkordb_digests_esc=$(_sed_repl_esc "$(_falkordb_digests_path 2>/dev/null || true)")
+        # Resolved again here, not reused from $SECRETS_FILE above, so a step that
+        # moved the file earlier in this run renders the unit to where it now is.
+        # `%` doubled: systemd expands specifiers in EnvironmentFile=, so a bare `%`
+        # would make the unit load a different file than the resolver picked.
+        _secrets_file_esc=$(_sed_repl_esc "$(genesis_secrets_path "$GENESIS_ROOT" | sed -e 's/%/%%/g')")
         sed -e "s|__HOME__|$_home_esc|g" \
             -e "s|__HOME_EXEC__|$_home_exec_esc|g" \
             -e "s|__REPO_EXEC__|$_repo_exec_esc|g" \
@@ -1777,6 +1782,7 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
             -e "s|__REDIS_CLI__|$_redis_cli_esc|g" \
             -e "s|__FALKORDB_MODULE__|$_falkordb_mod_esc|g" \
             -e "s|__FALKORDB_DIGESTS__|$_falkordb_digests_esc|g" \
+            -e "s|__SECRETS_FILE__|$_secrets_file_esc|g" \
             "$template" > "$_mu_render"
         # Written only when the installed unit is Genesis's own render; a unit
         # edited by hand is kept and named (lib/managed_units.sh).

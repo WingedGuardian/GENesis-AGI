@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -70,24 +71,94 @@ def test_missing_secrets_queues_a_critical_startup_alert(tmp_path, monkeypatch):
     assert entries[0][1]["severity"] == "critical"
 
 
-def test_dashboard_can_create_at_the_new_location(tmp_path, monkeypatch):
+def test_dashboard_edits_but_never_creates_the_file(tmp_path, monkeypatch):
     from genesis.dashboard.routes import secrets as route
 
     destination = tmp_path / ".config/genesis/secrets.env"
     monkeypatch.setattr(route, "secrets_path", lambda: destination)
+    with pytest.raises(route.SecretsFileMissingError):
+        route._update_secrets_file({"SYNTHETIC_KEY": "value"})
+    assert not destination.exists()
+    assert not destination.parent.exists()
+
+    destination.parent.mkdir(mode=0o700, parents=True)
+    destination.write_text("OTHER=1\n")
     route._update_secrets_file({"SYNTHETIC_KEY": "value"})
     assert "SYNTHETIC_KEY=value" in destination.read_text()
     assert destination.stat().st_mode & 0o777 == 0o600
-    assert destination.parent.stat().st_mode & 0o777 == 0o700
 
 
-def test_units_load_only_the_checkout_file_until_migration():
-    # Loading two files lets a key cleared in one survive from the other; the
-    # units stay on main's single file until the migration renders them anew.
+def test_a_file_deleted_after_the_check_is_still_a_missing_file(monkeypatch):
+    from genesis.dashboard.routes import secrets as route
+
+    class Vanishing:
+        def exists(self):
+            return True
+
+        def read_text(self):
+            raise FileNotFoundError("gone between the check and the read")
+
+    monkeypatch.setattr(route, "secrets_path", lambda: Vanishing())
+    with pytest.raises(route.SecretsFileMissingError):
+        route._update_secrets_file({"SYNTHETIC_KEY": "value"})
+
+
+def test_the_dashboard_route_answers_a_missing_file_with_409(tmp_path, monkeypatch):
+    from flask import Flask
+
+    from genesis.dashboard._blueprint import blueprint
+    from genesis.dashboard.routes import secrets as route
+
+    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
+    destination = tmp_path / ".config/genesis/secrets.env"
+    monkeypatch.setattr(route, "secrets_path", lambda: destination)
+    app = Flask(__name__)
+    app.secret_key = "test-secret-key"
+    app.register_blueprint(blueprint)
+
+    resp = app.test_client().put(
+        "/api/genesis/secrets", json={"keys": {"OLLAMA_URL": "http://new.invalid:11434"}}
+    )
+    assert resp.status_code == 409, resp.get_data(as_text=True)
+    assert "bootstrap" in resp.get_json()["error"]
+    assert not destination.parent.exists()
+
+
+def test_units_load_one_file_the_resolver_picks_at_render_time():
+    # Loading two files lets a key cleared in one survive from the other, so each
+    # unit names exactly one, rendered from genesis_secrets_path. The `-` keeps a
+    # missing file from stopping the unit (the server alerts and self-heals).
     for name in ("genesis-server", "agent-zero"):
         text = (REPO / f"scripts/systemd/{name}.service.template").read_text()
         lines = [line for line in text.splitlines() if line.startswith("EnvironmentFile=")]
-        assert lines == ["EnvironmentFile=__REPO_DIR__/secrets.env"]
+        assert lines == ["EnvironmentFile=-__SECRETS_FILE__"]
+
+
+@pytest.mark.parametrize("renderer", ["bootstrap.sh", "install.sh"])
+def test_each_renderer_resolves_the_secrets_file_at_render_time(renderer, tmp_path):
+    # Re-resolved in the render block, not reused from $SECRETS_FILE, so a move
+    # earlier in the same run renders the unit to the file's new place. The real
+    # line is extracted and run, with a path holding sed and systemd specials.
+    text = (REPO / "scripts" / renderer).read_text()
+    line = re.search(r"^\s*(_secrets_file_esc=\$\(_sed_repl_esc .*)$", text, re.M)
+    assert line, renderer
+    esc = re.search(r"^\s*(_sed_repl_esc\(\) \{.*\})\s*$", text, re.M)
+    assert esc, renderer
+    assert '-e "s|__SECRETS_FILE__|$_secrets_file_esc|g"' in text, renderer
+    target = tmp_path / "a %h & | b" / "secrets.env"
+    template = REPO / "scripts/systemd/genesis-server.service.template"
+    script = (
+        f". {REPO}/scripts/lib/secrets_path.sh\n{esc.group(1)}\n"
+        f"GENESIS_ROOT={tmp_path}; REPO_DIR={tmp_path}\n{line.group(1)}\n"
+        f'sed -e "s|__SECRETS_FILE__|$_secrets_file_esc|g" {template}\n'
+    )
+    out = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", script],
+        env={**os.environ, "SECRETS_PATH": str(target), "HOME": str(tmp_path)},
+        capture_output=True, text=True, check=True,
+    ).stdout
+    rendered = [x for x in out.splitlines() if x.startswith("EnvironmentFile=")]
+    assert rendered == [f"EnvironmentFile=-{str(target).replace('%', '%%')}"]
 
 
 def test_guardian_checks_the_new_file_before_the_legacy_file(tmp_path, monkeypatch):

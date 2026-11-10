@@ -17,7 +17,11 @@ StartLimitIntervalSec=120
 Type=simple
 WorkingDirectory=__REPO_DIR__
 ExecStart=__VENV__/bin/python -m genesis serve --host 0.0.0.0 --port 5000
-EnvironmentFile=__REPO_DIR__/secrets.env
+# One file, the one the resolver picks at render time (scripts/lib/secrets_path.sh).
+# Two files would let a key cleared in one survive from the other. The `-` turns
+# a missing file into the server's CRITICAL alert (and a restore, when a backup
+# exists), not a unit that will not start.
+EnvironmentFile=-__SECRETS_FILE__
 Restart=on-failure
 RestartSec=10
 

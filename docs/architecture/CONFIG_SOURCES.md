@@ -26,9 +26,12 @@ otherwise prefer an existing `~/.config/genesis/secrets.env`, then
 `<repo_root>/secrets.env`, then `~/genesis/secrets.env`. If none exists, the
 default is still `<repo_root>/secrets.env`: nothing creates the home-config
 file until the migration moves an install's file there, so no install holds two
-files the services would have to choose between. Until then the systemd units
-load only the checkout file, so a home-config file created by hand splits the
-units from the Python and shell readers. Legacy fallback is permanent.
+files the services would have to choose between. The systemd units load ONE
+file, the one `genesis_secrets_path` picks when bootstrap or install renders them
+(`EnvironmentFile=-__SECRETS_FILE__`), so a home-config file created by hand is
+picked up by the units at the next bootstrap. The dashboard edits the file but
+never creates it (409, "run bootstrap"); only bootstrap, install and restore
+create it. Legacy fallback is permanent.
 `repo_root()` is `GENESIS_REPO_ROOT` or the checkout the imported `genesis` package
 lives in, never the CWD. Gitignored; seeded from `secrets.env.example`.
 
@@ -36,8 +39,8 @@ lives in, never the CWD. Gitignored; seeded from `secrets.env.example`.
 
 | Process | Mechanism | Inherited env vs file |
 |---|---|---|
-| `genesis-server` (systemd) | `EnvironmentFile=<repo>/secrets.env` in `scripts/systemd/genesis-server.service.template` **and** `load_dotenv(..., override=True)` in `src/genesis/runtime/init/secrets.py` during bootstrap (runs after the credential-integrity self-heal step, before DB init/migrations) | **file wins** |
-| `agent-zero` unit | `EnvironmentFile=` in its template | file (systemd) |
+| `genesis-server` (systemd) | `EnvironmentFile=-<the resolved file at render time>` in `scripts/systemd/genesis-server.service.template` (a missing file does not stop the unit; the Python load below alerts) **and** `load_dotenv(..., override=True)` in `src/genesis/runtime/init/secrets.py` during bootstrap (runs after the credential-integrity self-heal step, before DB init/migrations) | **file wins** |
+| `agent-zero` unit | the same rendered `EnvironmentFile=-` line, then `load_dotenv(secrets_path(), override=True)` in `az_plugins/genesis/extensions/agent_init/_10_initialize_genesis.py` | file wins |
 | `genesis-bridge` (legacy fallback) | no `EnvironmentFile=`; runtime `load_dotenv(override=True)` | file wins |
 | MCP children (`scripts/genesis_mcp_server.py`) | `main()` copies an **allowlist** (`_MCP_VARS`) and only for keys NOT already in the env; then the health/memory/outreach/recon lifespans call `create_standalone_router()`, whose builder runs `load_dotenv(override=True)` on the **whole** file (`src/genesis/routing/standalone.py`) | net effect: **file wins, whole file** (discord-bot: allowlist only) — EXCEPT values read at module import, before either load: the database path (`_DEFAULT_DB` via `genesis_db_path()`) is fixed then, so a `GENESIS_DB_PATH` that exists only in `secrets.env` never reaches the MCP servers of a foreground session (an MCP child of a server-dispatched session inherits it from the server's environment) |
 | Dispatched CC sessions | `CCInvoker._build_env` (`src/genesis/cc/invoker.py`) copies the server's `os.environ` | inherit the server's snapshot |
