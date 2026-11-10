@@ -140,33 +140,57 @@ def test_units_load_one_file_the_resolver_picks_at_render_time():
         assert lines == lines_expected, name
 
 
-@pytest.mark.parametrize("renderer", ["bootstrap.sh", "install.sh"])
-def test_each_renderer_resolves_the_secrets_file_at_render_time(renderer, tmp_path):
-    # Re-resolved in the render block, not reused from $SECRETS_FILE, so a move
-    # earlier in the same run renders the unit to the file's new place. The real
-    # lines are extracted and run, with a path holding sed and systemd specials.
+def _render(renderer, tmp_path, *, manager_secrets_path, shell_secrets_path):
     text = (REPO / "scripts" / renderer).read_text()
-    resolve = re.search(r"^\s*(_secrets_file=\$\(genesis_secrets_path .*\))$", text, re.M)
+    override = re.search(r"^\s*(_secrets_override=.*)$", text, re.M)
+    resolve = re.search(r"^\s*(_secrets_file=\$\(SECRETS_PATH=.*genesis_secrets_path .*\))$", text, re.M)
     escape = re.search(r"^\s*(_secrets_file_esc=\$\(_sed_repl_esc .*)$", text, re.M)
     sed_esc = re.search(r"^\s*(_sed_repl_esc\(\) \{.*\})\s*$", text, re.M)
-    assert resolve and escape and sed_esc, renderer
+    assert override and resolve and escape and sed_esc, renderer
     assert '-e "s|__SECRETS_FILE__|$_secrets_file_esc|g"' in text, renderer
-    target = tmp_path / "a %h & | b" / "secrets.env"
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir(exist_ok=True)
+    systemctl = fakebin / "systemctl"
+    line = f"SECRETS_PATH={manager_secrets_path}" if manager_secrets_path else "PATH=/usr/bin"
+    systemctl.write_text(f"#!/bin/sh\nprintf '%s\\n' 'LANG=C' {shlex.quote(line)}\n")
+    systemctl.chmod(0o755)
     template = REPO / "scripts/systemd/genesis-server.service.template"
     q = shlex.quote
     script = (
         f". {q(str(REPO / 'scripts/lib/secrets_path.sh'))}\n{sed_esc.group(1)}\n"
         f"GENESIS_ROOT={q(str(tmp_path))}; REPO_DIR={q(str(tmp_path))}\n"
-        f"{resolve.group(1)}\n{escape.group(1)}\n"
+        f"{override.group(1)}\n{resolve.group(1)}\n{escape.group(1)}\n"
         f'sed -e "s|__SECRETS_FILE__|$_secrets_file_esc|g" {q(str(template))}\n'
     )
+    env = {**os.environ, "HOME": str(tmp_path), "PATH": f"{fakebin}:{os.environ['PATH']}"}
+    env.pop("SECRETS_PATH", None)
+    if shell_secrets_path:
+        env["SECRETS_PATH"] = shell_secrets_path
     out = subprocess.run(
-        ["bash", "-euo", "pipefail", "-c", script],
-        env={**os.environ, "SECRETS_PATH": str(target), "HOME": str(tmp_path)},
-        capture_output=True, text=True, check=True,
+        ["bash", "-euo", "pipefail", "-c", script], env=env, capture_output=True, text=True, check=True
     ).stdout
-    rendered = [x for x in out.splitlines() if x.startswith("EnvironmentFile=")]
-    assert rendered == [f"EnvironmentFile=-{str(target).replace('%', '%%')}"]
+    return [x for x in out.splitlines() if x.startswith("EnvironmentFile=")]
+
+
+@pytest.mark.parametrize("renderer", ["bootstrap.sh", "install.sh"])
+def test_each_renderer_renders_the_file_the_server_will_load(renderer, tmp_path):
+    # Resolved in the render block (so a move earlier in the same run renders the
+    # new place), with the SECRETS_PATH the server will inherit: the systemd user
+    # manager's. The real lines are extracted and run against a fake systemctl.
+    target = tmp_path / "a %h & | b" / "secrets.env"
+    assert _render(renderer, tmp_path, manager_secrets_path=str(target), shell_secrets_path=None) == [
+        f"EnvironmentFile=-{str(target).replace('%', '%%')}"
+    ]
+
+
+@pytest.mark.parametrize("renderer", ["bootstrap.sh", "install.sh"])
+def test_a_shell_only_secrets_path_does_not_reach_the_unit(renderer, tmp_path):
+    # The server's Python never sees a SECRETS_PATH set only in the shell running
+    # bootstrap, so the unit must not load that file either (two files loaded).
+    rendered = _render(
+        renderer, tmp_path, manager_secrets_path=None, shell_secrets_path=str(tmp_path / "custom.env")
+    )
+    assert rendered == [f"EnvironmentFile=-{tmp_path}/secrets.env"]
 
 
 class _FakeAdapter:
@@ -185,9 +209,9 @@ class _FakeAdapter:
         self.calls.append("shutdown")
 
 
-@pytest.mark.parametrize("present", [False, True])
+@pytest.mark.parametrize("state", ["missing", "unreadable", "present"])
 def test_serve_fails_closed_when_the_file_is_missing_after_the_restore(
-    present, tmp_path, monkeypatch
+    state, tmp_path, monkeypatch
 ):
     # The dashboard's password lives in the secrets file and no password means
     # auth disabled, so `genesis serve` must exit before serving when the file is
@@ -203,14 +227,18 @@ def test_serve_fails_closed_when_the_file_is_missing_after_the_restore(
         made.append(_FakeAdapter(**kw))
         return made[-1]
 
+    if state == "unreadable" and os.geteuid() == 0:
+        pytest.skip("root reads a mode-000 file")
     path = tmp_path / "secrets.env"
-    if present:
+    if state != "missing":
         path.write_text("OTHER=1\n")
+    if state == "unreadable":
+        path.chmod(0)
     monkeypatch.setattr(standalone, "StandaloneAdapter", factory)
     monkeypatch.setattr(env, "secrets_path", lambda: path)
     args = SimpleNamespace(host="127.0.0.1", port=0, no_telegram=True)
 
-    if present:
+    if state == "present":
         asyncio.run(entry._serve(args))
         assert made[0].calls == ["bootstrap", "serve", "shutdown"]
     else:
@@ -220,12 +248,18 @@ def test_serve_fails_closed_when_the_file_is_missing_after_the_restore(
         assert made[0].calls == ["bootstrap", "shutdown"]
 
 
-def test_missing_secrets_file_names_the_path_only_when_absent(tmp_path, monkeypatch):
+def test_unloadable_secrets_file_names_a_missing_or_unreadable_file(tmp_path, monkeypatch):
     path = tmp_path / "secrets.env"
     monkeypatch.setattr(env, "secrets_path", lambda: path)
-    assert startup.missing_secrets_file() == path
-    path.write_text("")
-    assert startup.missing_secrets_file() is None
+    assert startup.unloadable_secrets_file() == path
+    path.write_text("OTHER=1\n")
+    assert startup.unloadable_secrets_file() is None
+    if os.geteuid() != 0:  # root reads a mode-000 file anyway
+        path.chmod(0)
+        try:
+            assert startup.unloadable_secrets_file() == path
+        finally:
+            path.chmod(0o600)
 
 
 def test_guardian_checks_the_new_file_before_the_legacy_file(tmp_path, monkeypatch):

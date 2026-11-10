@@ -12,18 +12,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger("genesis.runtime")
 
 
-def missing_secrets_file() -> Path | None:
-    """The secrets file's path when it is still missing, else None.
+def unloadable_secrets_file() -> Path | None:
+    """The secrets file's path when it cannot be loaded, else None.
 
     `genesis serve` asks this after bootstrap, once the startup credential
-    restore has run, and exits rather than serve when it is missing: the
-    dashboard's password lives in this file, and no password means auth is
-    disabled. A missing file is not the choice to run without one.
+    restore has run, and exits rather than serve when the file is missing or
+    cannot be read: the dashboard's password lives in this file, and no
+    password means auth is disabled. Neither is the choice to run without one.
+    The unit's `EnvironmentFile=-` ignores read errors as well as a missing
+    file, so the read is attempted here.
     """
     from genesis.env import secrets_path
 
     path = secrets_path()
-    return None if path.is_file() else path
+    try:
+        if not path.is_file():
+            return path
+        with path.open("rb") as fh:
+            fh.read(1)
+    except OSError:
+        return path
+    return None
 
 
 def load(rt: GenesisRuntime) -> None:
