@@ -990,6 +990,10 @@ neither blocks opening).
 
 ### Standing mode (Claude Code only)
 
+Only the owner starts or restarts this loop, by explicit instruction at that
+moment; a session never starts one on its own, from an earlier yes, or after the
+loop stops. Once started, it paces itself.
+
 When the owner starts a closing session to keep working the queue on a pace
 (`/loop` with ScheduleWakeup, at the interval the owner sets and can change), the
 one-closing-session precondition above holds for the whole life of that session.

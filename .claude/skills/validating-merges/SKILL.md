@@ -238,6 +238,11 @@ count says anything about the other.
 
 ## Standing mode (Claude Code only)
 
+**Only the owner starts one.** A session never starts or restarts a standing
+loop on its own: not from an earlier yes, a plan step or a ledger row, and not
+after the loop stops. Each start needs the owner's explicit instruction at that
+moment. Once started, the loop paces itself until a stop rule below ends it.
+
 A standing validator is a session the owner starts, in a tmux slot, to work the
 backlog one PR at a time. Start it with `/loop` (no interval) so it can pace
 itself with ScheduleWakeup; it also uses `outreach_send`, so it is a Claude Code
