@@ -79,7 +79,16 @@ def _make_dispatcher(**kwargs):
         defaults["db"].execute = AsyncMock()
         defaults["db"].commit = AsyncMock()
 
-    return SentinelDispatcher(**defaults)
+    d = SentinelDispatcher(**defaults)
+    # A dispatcher built with NO approval mechanism (no gate, no outreach
+    # pipeline) used to dispatch anyway, so tests of the dispatch flow itself
+    # relied on that hole. Dispatch now refuses in that state unless manual
+    # approval is turned off, so those tests state that precondition: they model
+    # the owner's explicit "manual approval not required" switch.
+    # TestApprovalFailsClosed covers the refusal with _require_approval = True.
+    if defaults.get("approval_gate") is None and defaults.get("outreach_pipeline") is None:
+        d._require_approval = False
+    return d
 
 
 class TestGates:
@@ -1521,3 +1530,125 @@ class TestAlarmClearedHysteresis:
         gate.resolve_request.assert_awaited_once()
         ready, _reason = d._backoff_ready("direct:guardian_dialogue")
         assert ready is True
+
+
+class TestApprovalFailsClosed:
+    """No approval, no action. An error in the approval step, or any status
+    other than "approved", must never run the proposed actions (Phase 3) or
+    start the remediation session (Phase 1). Origin: an exception raised by the
+    Phase 3 approval was logged and the actions then ran without approval."""
+
+    async def _dispatch(self, gate, mock_execute):
+        d = _make_dispatcher(approval_gate=gate)
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        d._invoker.run = AsyncMock(return_value=_proposed_actions_output())
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"), \
+             patch.object(d, "_execute_approved_actions", mock_execute):
+            result = await d.dispatch(SentinelRequest(
+                trigger_source="test", trigger_reason="test alarm", tier=2,
+            ))
+        return d, result
+
+    @pytest.mark.asyncio
+    async def test_action_approval_exception_never_executes(self):
+        async def _ensure(**kwargs):
+            if kwargs.get("policy_id") == "sentinel_action":
+                raise RuntimeError("database is locked")
+            return ("approved", "req-dispatch", "test")
+
+        gate = MagicMock()
+        gate.ensure_approval = AsyncMock(side_effect=_ensure)
+        mock_execute = AsyncMock(return_value=[])
+        d, result = await self._dispatch(gate, mock_execute)
+
+        # Guard the guard: the approval step really was reached and raised.
+        assert len(_action_policy_calls(gate)) == 1
+        mock_execute.assert_not_awaited()
+        assert result.resolved is False
+        assert result.actions_taken == []
+        assert "approval" in result.reason.lower()
+        assert d._state.state == SentinelState.ESCALATED
+
+    @pytest.mark.asyncio
+    async def test_unknown_action_status_never_executes(self):
+        gate = _policy_gate("expired", "req-x")
+        mock_execute = AsyncMock(return_value=[])
+        _d, result = await self._dispatch(gate, mock_execute)
+
+        assert len(_action_policy_calls(gate)) == 1
+        mock_execute.assert_not_awaited()
+        assert result.resolved is False
+
+    @pytest.mark.asyncio
+    async def test_approved_action_still_executes(self):
+        """Control: the fail-closed paths must not block a real approval."""
+        gate = _policy_gate("approved", "req-ok")
+        mock_execute = AsyncMock(return_value=[])
+        _d, _result = await self._dispatch(gate, mock_execute)
+        mock_execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unknown_dispatch_status_never_starts_a_session(self):
+        gate = MagicMock()
+        gate.ensure_approval = AsyncMock(return_value=("expired", "req-d", "test"))
+        mock_execute = AsyncMock(return_value=[])
+        d, result = await self._dispatch(gate, mock_execute)
+
+        d._invoker.run.assert_not_awaited()
+        mock_execute.assert_not_awaited()
+        assert result.dispatched is False
+        assert d._state.pending_request_id == ""
+
+    @pytest.mark.asyncio
+    async def test_no_approval_mechanism_refuses_dispatch(self):
+        """Approval required, but neither a gate nor an outreach pipeline is
+        wired (a degraded boot): no remediation session may start."""
+        d = _make_dispatcher()
+        d._approval_gate = None
+        d._outreach_pipeline = None
+        d._require_approval = True
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"):
+            result = await d.dispatch(SentinelRequest(
+                trigger_source="test", trigger_reason="test alarm", tier=2,
+            ))
+        d._invoker.run.assert_not_awaited()
+        assert result.dispatched is False
+        assert "no approval mechanism" in result.reason.lower()
+        # The refusal is loud, not silent: an event names it.
+        assert any(
+            "sentinel.dispatch_refused" in str(c)
+            for c in d._event_bus.emit.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_approval_disabled_by_config_still_dispatches(self):
+        """Control: the owner's explicit off switch (manual approval not
+        required) is honoured, not treated as a missing mechanism."""
+        d = _make_dispatcher()
+        d._approval_gate = None
+        d._outreach_pipeline = None
+        d._require_approval = False
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"):
+            await d.dispatch(SentinelRequest(
+                trigger_source="test", trigger_reason="test alarm", tier=2,
+            ))
+        d._invoker.run.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_resume_with_non_approved_status_never_executes(self):
+        d = _make_dispatcher()
+        _setup_pending_action(d)
+        mock_execute = AsyncMock(return_value=[])
+        with patch.object(d, "_execute_approved_actions", mock_execute):
+            await d.resume_from_approval("req-action-1", "expired")
+        mock_execute.assert_not_awaited()
+        assert d._state.state == SentinelState.HEALTHY
+        assert not d._state.pending_request_id
