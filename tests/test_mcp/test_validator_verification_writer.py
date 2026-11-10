@@ -170,6 +170,24 @@ async def test_missing_mapping_does_not_prevent_recording_an_incomplete_attempt(
     assert row(path)["status"] == "open"
 
 
+@pytest.mark.parametrize("declared", [True, False, None])
+async def test_the_result_echoes_the_documents_no_progress(recording, monkeypatch, declared):
+    from genesis.mcp.health import validator_writes
+
+    path, _, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    monkeypatch.setattr(
+        validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: run the timer")
+    )
+    over = {} if declared is None else {"no_progress": declared}
+    doc = _doc(gaps=[{"kind": "not_yet_done", "detail": "not run", "command": "run timer"}], **over)
+    result = await call(doc)
+    assert result["recorded"] and result["no_progress"] is bool(declared)
+    assert json.loads(row(path)["evidence"])["no_progress"] is bool(declared)
+    preview = await call(doc, dry_run=True)
+    assert preview["recorded"] is False and preview["no_progress"] is bool(declared)
+
+
 async def test_existing_mcp_close_stores_rechecks_without_a_new_caller_argument(recording):
     path, _, config = recording
     config.with_suffix(".local.yaml").write_text("dry_run_only: false")

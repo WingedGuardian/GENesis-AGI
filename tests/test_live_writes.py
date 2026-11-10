@@ -342,6 +342,29 @@ def test_a_credential_file_read_under_another_name_is_recorded(home, tmp_path, m
     assert ("credential file read", "read", "copy-of-creds") in _hits()
 
 
+def test_a_fault_in_the_credential_lookup_never_breaks_a_read(home, tmp_path, monkeypatch):
+    """The read-side credential lookup runs inside the hook's guard: a test that
+    makes os.stat raise (as tests/test_hooks/test_push_publish_ask_switch.py
+    does) still opens its file, and the lookup's own stat is not re-audited."""
+    secrets = home / "genesis" / "secrets.env"
+    secrets.write_text("K=v\n")
+    st = os.stat(secrets)
+    monkeypatch.setattr(audit._S, "credential_inodes", frozenset({(st.st_dev, st.st_ino)}))
+    body = tmp_path / "body.txt"
+    body.write_text("x")
+    real_stat = os.stat
+
+    def refusing_stat(*args, **kwargs):
+        raise AssertionError("stat by path")
+
+    os.stat = refusing_stat
+    try:
+        fd = os.open(body, os.O_RDONLY)
+    finally:
+        os.stat = real_stat
+    os.close(fd)
+
+
 def test_install_records_the_credential_files_by_inode(tmp_path, monkeypatch):
     """The inode set is what lets a read under another name be recognised."""
     fake = tmp_path / "home"
