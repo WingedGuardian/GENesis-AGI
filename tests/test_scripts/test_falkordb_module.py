@@ -13,6 +13,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from tests.test_scripts.falkordb_stubs import (
     BOOTSTRAP,
     INSTALL,
@@ -1344,3 +1346,131 @@ def test_a_rebuilt_tampered_copy_is_reported_not_silent(tmp_path):
     assert "restart it" in second.stdout
     third = _run(_provisioned(), env)
     assert "WARNING: the graph engine copy" not in third.stdout, "a matching copy is reused quietly"
+
+
+# --- arming the unit after the render (D3) -----------------------------------
+#
+# bootstrap.sh's own enable step, sliced out verbatim and run after the real
+# render loop, against the stubbed systemctl (owner ruling 2026-11-09): a
+# verified engine that is not running is enabled AND started; a running one is
+# never started or restarted; anything else is left alone.
+
+_ENABLE_HEAD = "    if declare -F falkordb_enable_unit >/dev/null; then"
+
+
+def _bootstrap_enable_step() -> str:
+    lines = BOOTSTRAP.read_text().splitlines()
+    starts = [i for i, line in enumerate(lines) if line == _ENABLE_HEAD]
+    assert len(starts) == 1, f"expected one enable step, found {len(starts)}"
+    end = next(i for i in range(starts[0] + 1, len(lines)) if lines[i] == "    fi")
+    return "\n".join(lines[starts[0] : end + 1])
+
+
+def _systemctl_calls(env: dict) -> list[str]:
+    log = Path(env["SYSTEMCTL_LOG"])
+    return log.read_text().splitlines() if log.exists() else []
+
+
+_ENABLE_NOW = "--user enable --now genesis-falkordb.service"
+_ENABLE_ONLY = "--user enable genesis-falkordb.service"
+
+
+def _starts(calls: list[str]) -> list[str]:
+    """Every call that could start or restart the engine."""
+    return [c for c in calls if "--now" in c or c.split()[1:2] in (["start"], ["restart"])]
+
+
+@pytest.mark.parametrize("state", ["inactive", "failed"])
+@pytest.mark.parametrize("enabled", ["disabled", "enabled"])
+def test_a_verified_engine_that_is_not_running_is_enabled_and_started(tmp_path, state, enabled):
+    env = _stage(tmp_path)
+    env["ENGINE_STATE"] = state
+    env["ENGINE_ENABLED"] = enabled
+    result, unit = _render_falkordb_unit(tmp_path, env, after=_bootstrap_enable_step())
+    assert result.returncode == 0, result.stderr
+    assert unit.exists()
+    calls = _systemctl_calls(env)
+    assert _ENABLE_NOW in calls, calls
+    assert "+ genesis-falkordb.service enabled + started" in result.stdout
+
+
+@pytest.mark.parametrize("state", ["active", "activating", ""])
+def test_a_running_or_unreadable_engine_is_never_started(tmp_path, state):
+    """The never-switch-a-running-engine rule: no start, no restart."""
+    env = _stage(tmp_path)
+    env["ENGINE_STATE"] = state
+    if state == "active":
+        # A running engine already on another module keeps its unit; give the
+        # render loop a unit to keep, as the existing keep tests do.
+        (tmp_path / "units").mkdir()
+        (tmp_path / "units" / "genesis-falkordb.service").write_text(_stamped(_DEPS_UNIT))
+    result, _ = _render_falkordb_unit(tmp_path, env, after=_bootstrap_enable_step())
+    assert result.returncode == 0, result.stderr
+    calls = _systemctl_calls(env)
+    assert _starts(calls) == [], calls
+    assert _ENABLE_ONLY in calls, "a disabled unit is still enabled, for the next boot"
+
+
+def test_a_running_enabled_engine_is_left_untouched(tmp_path):
+    env = _stage(tmp_path)
+    env["ENGINE_STATE"] = "active"
+    env["ENGINE_ENABLED"] = "enabled"
+    (tmp_path / "units").mkdir()
+    (tmp_path / "units" / "genesis-falkordb.service").write_text(_stamped(_DEPS_UNIT))
+    result, _ = _render_falkordb_unit(tmp_path, env, after=_bootstrap_enable_step())
+    assert result.returncode == 0, result.stderr
+    calls = _systemctl_calls(env)
+    assert not [c for c in calls if " enable" in c], calls
+
+
+def test_an_unverified_engine_s_unit_is_neither_enabled_nor_started(tmp_path):
+    env = _stage(tmp_path)
+    env["PIP_RC"] = "1"
+    (tmp_path / "units").mkdir()
+    (tmp_path / "units" / "genesis-falkordb.service").write_text("LAST-WORKING-UNIT\n")
+    result, _ = _render_falkordb_unit(tmp_path, env, after=_bootstrap_enable_step())
+    assert result.returncode == 0, result.stderr
+    assert not [c for c in _systemctl_calls(env) if " enable" in c]
+
+
+@pytest.mark.parametrize("state", ["masked", "", "linked"])
+def test_a_unit_file_state_other_than_disabled_or_enabled_is_left_alone(tmp_path, state):
+    env = _stage(tmp_path)
+    env["ENGINE_ENABLED"] = state
+    result, _ = _render_falkordb_unit(tmp_path, env, after=_bootstrap_enable_step())
+    assert result.returncode == 0, result.stderr
+    assert not [c for c in _systemctl_calls(env) if " enable" in c]
+
+
+def test_an_operator_opt_out_keeps_the_unit_disabled_and_stopped(tmp_path):
+    env = _stage(tmp_path)
+    opt_out = Path(env["HOME"]) / ".genesis" / "config" / "disabled_timers"
+    opt_out.parent.mkdir(parents=True)
+    opt_out.write_text("genesis-falkordb.service  # standing down\n")
+    result, _ = _render_falkordb_unit(tmp_path, env, after=_bootstrap_enable_step())
+    assert result.returncode == 0, result.stderr
+    assert not [c for c in _systemctl_calls(env) if " enable" in c]
+    assert "not enabled (listed in" in result.stdout
+
+
+def test_a_failed_start_is_one_warning_and_never_aborts(tmp_path):
+    env = _stage(tmp_path)
+    env["ENABLE_RC"] = "1"
+    result, _ = _render_falkordb_unit(
+        tmp_path, env, after=_bootstrap_enable_step() + "\necho AFTER-ENABLE"
+    )
+    assert result.returncode == 0, result.stderr
+    warnings = [line for line in result.stdout.splitlines() if "WARNING" in line]
+    assert len(warnings) == 1, warnings
+    assert "could not start genesis-falkordb.service" in warnings[0]
+    assert "AFTER-ENABLE" in result.stdout, "bootstrap must continue"
+def test_both_installers_enable_after_their_unit_render():
+    """Order, not just presence: the enable must follow the render (and, in
+    bootstrap, the daemon-reload) or there is no unit for it to arm."""
+    boot = BOOTSTRAP.read_text()
+    assert boot.index(_ENABLE_HEAD) > boot.index("systemctl --user daemon-reload")
+    assert boot.index(_ENABLE_HEAD) > boot.index(_RENDER_LOOP_HEAD)
+    inst = INSTALL.read_text()
+    call = 'falkordb_enable_unit "$SYSTEMD_USER_DIR/genesis-falkordb.service"'
+    assert inst.count(call) == 1
+    assert inst.index(call) > inst.index('elif [ "$svc_name" = "genesis-falkordb.service" ]')

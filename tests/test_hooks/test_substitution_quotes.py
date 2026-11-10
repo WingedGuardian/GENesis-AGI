@@ -15,7 +15,6 @@ import json
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -207,15 +206,20 @@ def _amplifying(depth: int, fan: int, leaf: str) -> str:
 def test_phantom_bodies_cannot_multiply_the_parse_cost() -> None:
     """Each level's phantom bodies differ from its real ones, so without the budget the
     work doubled per level (MEASURED 6.28s against 0.73s on main at 37K characters).
-    The guards share a 5s clock across three of them, and a killed guard permits."""
+    The guards share a 5s clock across three of them, and a killed guard permits.
+    Asserted on the work counted, not the time taken: the parse stops at the budget,
+    so the work it does never exceeds the budget."""
     leaf = "true"
     while len(_amplifying(5, 5, leaf + "y")) < sp.MAX_COMMAND_CHARS - 64:
         leaf += "y"
     command = _amplifying(5, 5, leaf)
-    started = time.monotonic()
-    sp.analyze_checked(command)
-    elapsed = time.monotonic() - started
-    assert elapsed < 3.0, f"took {elapsed:.2f}s on {len(command)} characters"
+    unbounded = [0, 10**12]
+    sp._analyze_bounded(command, _added_work=unbounded)
+    assert unbounded[0] > 2 * len(command), "control: the shape must amplify"
+    work = [0, 2 * len(command)]
+    result = sp._analyze_bounded(command, _added_work=work)
+    assert result.bound_reason == "depth"
+    assert 0 < work[0] <= work[1] < unbounded[0], (work, unbounded[0], len(command))
 
 
 def test_unterminated_and_trailing_forms_do_not_crash() -> None:

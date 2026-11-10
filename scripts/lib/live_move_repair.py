@@ -658,8 +658,9 @@ def _load_guard():
 
 
 def _load_kit(name: str):
-    """A kit source beside this one (the guard; live_move_restore.py and
-    live_move_restore_write.py)."""
+    """A kit source beside this one (the guard; live_move_restore.py, which
+    loads live_move_restore_rows.py and live_move_restore_runs.py beside it,
+    and live_move_restore_write.py)."""
     path = os.path.join(_LIB, name)
     spec = importlib.util.spec_from_file_location(f"_live_repair_{name[:-3]}", path)
     if spec is None or spec.loader is None:
