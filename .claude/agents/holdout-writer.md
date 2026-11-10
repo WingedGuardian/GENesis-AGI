@@ -49,6 +49,12 @@ Rules:
   from a hard-coded path or another interpreter.
 - A step prints the value it OBSERVED, never the value it checks against: a
   failing run's output is shown to the validator.
+- Every `Expect` line is under 40 characters (count after collapsing runs of
+  whitespace), or a value the step derives from what it observed, such as a
+  sha256 of the observed output. The holdout fence treats a longer line in any
+  tool result as an exposure, and the code under test, or a correct
+  implementation of an intent, prints its own output to builders too. A step
+  may print short observed lines beside the hash so a failure stays readable.
 - Number new scenarios after the highest existing id, and never reuse an id.
   Never edit or loosen an existing scenario; if one is wrong, say so in your
   report. Deleting is allowed only when retiring one as above.

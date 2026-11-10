@@ -85,6 +85,13 @@ exact standard output
 - A failing run's standard output is shown (up to 400 characters); standard
   error never is. So a step must never print the value it checks against, only
   the value it observed.
+- Every `Expect` line is under 40 characters, or is a value the step derives
+  from what it observed (a sha256 of the observed output, say). The holdout
+  fence treats an `Expect` line of 40 or more characters, whitespace collapsed,
+  anywhere in a tool result as an exposure. A long line the code under test
+  prints would therefore flag a builder who only ran that code, and an intent
+  scenario's line would flag the builder who implements it. A builder never
+  sees the steps, so it cannot produce a derived line by chance.
 - Any heading that is not a scenario heading ends the scenario above it, and
   fenced blocks outside a `Steps` or `Expect` slot are ignored. A line starting
   `## H-` always starts a scenario, even inside such a block, so never write one
