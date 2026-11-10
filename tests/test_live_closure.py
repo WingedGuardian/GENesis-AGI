@@ -443,12 +443,16 @@ def test_the_box_lock_and_basetemp_keep_their_real_home_locations(request):
     home = Path(closure._S.home)
     basetemp = Path(request.config._tmp_path_factory.getbasetemp())
     assert home not in basetemp.parents and basetemp != home
+    # The lock is placed through HOME as the run started (the closure restores
+    # it for placement), which passwd only stands in for when it was unset.
+    start = closure._S.home_before
+    start_home = start if start and os.path.isabs(start) else _REAL_HOME
     lock = request.config._genesis_pytest_lock
     if lock.acquired:
         path = Path(lock._path)
         assert home not in path.parents
-        if not os.environ.get(pytest_lock.PATH_ENV) and _REAL_HOME:
-            assert Path(_REAL_HOME, ".genesis") in path.parents, path
+        if not os.environ.get(pytest_lock.PATH_ENV) and start_home:
+            assert Path(start_home, ".genesis") in path.parents, path
         return
     # Placed under the private home (no .genesis there), the lock path would be
     # None and the run would silently take no lock at all.
@@ -457,7 +461,7 @@ def test_the_box_lock_and_basetemp_keep_their_real_home_locations(request):
         for name in (pytest_lock.HELD_ENV, pytest_lock.DISABLE_ENV, pytest_lock.PATH_ENV)
         if os.environ.get(name)
     ]
-    if excused or not _REAL_HOME or not Path(_REAL_HOME, ".genesis").is_dir():
+    if excused or not start_home or not Path(start_home, ".genesis").is_dir():
         pytest.skip(f"no lock expected here ({excused or 'no install'})")
     pytest.fail("an install exists and nothing excused the box lock, yet none was taken")
 
