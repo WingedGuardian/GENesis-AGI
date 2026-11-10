@@ -34,7 +34,9 @@ then once the issue's intent is final and before it goes to a builder, spawn the
 `holdout-writer` subagent IN THE FOREGROUND with the issue number and "intent".
 It adds scenarios that fail on the default branch until the change lands, and
 reports only their ids and `Protects` lines. Keep the scenarios out of the issue
-and the spec. `docs/reference/holdout.md` has the rules.
+and the spec, and put this line in the issue: "The PR for this issue must say
+`Closes #N`." An intent scenario is judged only against a PR that links its
+issue. `docs/reference/holdout.md` has the rules.
 
 ### Plan documents carry a structured header
 

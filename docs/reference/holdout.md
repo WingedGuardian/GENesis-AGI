@@ -8,7 +8,7 @@ it. A check that the builder could not read cannot be tuned that way.
 Three parts:
 
 - **The scenarios** live on the install, outside the repository:
-  `~/.genesis/holdout/HOLDOUT.md`. They are never committed, never pasted into a
+  `$GENESIS_HOME/holdout/HOLDOUT.md` (`~/.genesis` when unset). They are never committed, never pasted into a
   PR, an issue, a comment or a prompt, and never read by a session that builds.
 - **The writer** is the `holdout-writer` subagent
   (`.claude/agents/holdout-writer.md`). It is the only agent that writes or reads
@@ -33,7 +33,7 @@ An install with no `HOLDOUT.md` has no holdout: the runner prints
   is judged only against a PR that links issue N (GitHub lists it as closed by
   the PR, or the body says `closes`, `fixes`, `resolves`, `implements` or `part of`), so an
   unrelated PR touching the same files is never charged with it. A plain mention
-  of `#N` does not link. A linked PR runs the scenario whatever files it touched.
+  of `#N` does not link, nor does a closing reference to another repository's issue. A linked PR runs the scenario whatever files it touched.
   Once it is `DELIVERED`, the writer retires it and adds a regression scenario
   for the same behaviour in its place.
 
@@ -107,7 +107,8 @@ worktrees, and prints one line per scenario:
 | `DELIVERED` | intent scenario for a linked issue: fails before, passes after | a `controls` entry; then the writer retires it into a regression scenario |
 | `REGRESSED` | passed before this merge, fails after | a failed claim at `MEASURED`: `fail-intent` |
 | `NOT-DELIVERED` | intent scenario for a linked issue fails at the merge | a failed claim at `MEASURED`: `fail-intent` |
-| `PENDING` | intent scenario for an issue this PR does not link; still fails | nothing: not this PR's work |
+| `PENDING` | intent scenario for an issue this PR does not link; still fails, and the issue is open | nothing: not this PR's work |
+| `CLOSED-NOT-DELIVERED` | as `PENDING`, but the issue is closed | a finding for the owner: work landed without linking the issue and missed the intent, the issue was closed as not planned, or the scenario is wrong |
 | `DELIVERED-UNLINKED` | intent scenario for an issue this PR does not link now passes | a finding: the work landed without naming the issue |
 | `FIXED` | failed before, passes after | a finding |
 | `BROKEN-BEFORE` | fails at both | a finding and an issue about the default branch, not this PR |
@@ -121,6 +122,14 @@ completed (it says why: not merged, merged into another branch, a git or `gh`
 error, an unreadable file). The parent arm is the merge commit's first parent,
 which is the default branch before the merge under squash merges, the only
 method this repository allows.
+
+For the install's own holdout, the runner also prints one line counting the
+exposures the holdout fence recorded in `$GENESIS_HOME/logs/holdout-exposures.jsonl`
+(reads, writes, accesses and content seen by anyone but the writer; that file is
+never rotated), or saying the log is missing or unreadable. A scenario
+written before an exposure may be spoiled; tell the owner. It also keeps
+`$GENESIS_HOME/.ignore` listing `holdout/`, so ripgrep-based searches of the
+Genesis home skip the directory.
 
 `--at-path DIR [--scenario H-NN ...]` runs scenarios against a directory and
 prints `PASS` or `FAIL` per id. The writer uses it to check a new scenario on the

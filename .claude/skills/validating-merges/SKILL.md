@@ -581,11 +581,14 @@ Record it:
   scenario.
 - `PASS` is a finding, never a control: nothing had to come out the other way.
 - `PENDING` needs nothing: the scenario belongs to another issue's work.
-- `BROKEN-BEFORE`, `STALE-INTENT`, `FIXED`, `DELIVERED-UNLINKED` and `MALFORMED`
+- `BROKEN-BEFORE`, `STALE-INTENT`, `FIXED`, `DELIVERED-UNLINKED`,
+  `CLOSED-NOT-DELIVERED` and `MALFORMED`
   are findings about the default branch or the scenario, never this row's
   verdict. File or reuse an issue for `BROKEN-BEFORE`, and tell the owner about
   the rest.
 - Exit 3 (the run could not be completed) is a gap naming the reason it printed.
+- A `holdout fence:` line counting exposures goes to the owner when it is not
+  zero: a scenario seen by someone other than its writer may be spoiled.
 
 Never open, list or quote `~/.genesis/holdout/` yourself, and never ask what a
 scenario checks beyond its printed `Protects` line: reading it spoils it.

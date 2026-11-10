@@ -4,7 +4,7 @@
 A holdout is a small set of exact behavioural checks that builders never see,
 so a builder cannot make its own tests agree with its code instead of with the
 intent. The scenarios live outside the repository, by default in
-``~/.genesis/holdout/HOLDOUT.md``; ``docs/reference/holdout.md`` documents the
+``$GENESIS_HOME/holdout/HOLDOUT.md`` (``~/.genesis`` when unset); ``docs/reference/holdout.md`` documents the
 format and the rules. This script is the only reader a validator needs: it
 prints scenario ids, verdicts and each scenario's one-line ``Protects`` text,
 never its steps or its expected output, so running it does not spoil the set.
@@ -70,15 +70,32 @@ import signal
 import subprocess
 import sys
 import tempfile
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_HOLDOUT = Path.home() / ".genesis" / "holdout" / "HOLDOUT.md"
+
+def genesis_home() -> Path:
+    """``$GENESIS_HOME``, else ``~/.genesis``; the holdout fence resolves it the same way."""
+    value = os.environ.get("GENESIS_HOME")
+    return Path(value) if value else Path.home() / ".genesis"
+
+
+DEFAULT_HOLDOUT = genesis_home() / "holdout" / "HOLDOUT.md"
+# The holdout fence writes only real exposures (reads, writes, accesses and
+# content seen by anyone but the writer) here, and never rotates it.
+EXPOSURE_LOG = genesis_home() / "logs" / "holdout-exposures.jsonl"
 
 # A holdout step is a deterministic, local check that normally finishes in
 # well under a second. 120 s is two orders of magnitude above that; past it the
 # step is hung, and a hung step must not hold a validator pass indefinitely.
 STEP_TIMEOUT_S = 120
+
+# gh: the same bound gh_pr_metadata uses (pr_recording.py) for one read query.
+GH_TIMEOUT_S = 120
+# git: a fetch of one commit or a worktree checkout of this repository finishes in
+# seconds; ten minutes is far past that and still ends a hung network read.
+GIT_TIMEOUT_S = 600
 
 # Observed output from a failing arm is shown so the failure can be acted on.
 # It is bounded, and the omission is stated, never silent.
@@ -149,7 +166,9 @@ def parse_holdout(text: str) -> list[Scenario]:
     fence: str | None = None  # the open fence, when inside a code block
     keep_block = False  # whether the open block is a Steps/Expect body
     block: list[str] = []
-    for line in text.splitlines():
+    # Split on "\n" only: str.splitlines() also breaks on form feeds, NEL and
+    # Unicode separators, which a scenario may need to carry literally.
+    for line in (ln[:-1] if ln.endswith("\r") else ln for ln in text.split("\n")):
         if fence is not None and not keep_block and _SCENARIO_LIKE.match(line):
             # A stray fence never closed: end it here rather than let it swallow
             # this scenario, and mark the scenario it sat in.
@@ -247,9 +266,11 @@ class Arm:
     note: str = ""
 
 
-def step_env(root: Path, home: Path, tmp: Path) -> dict[str, str]:
+def step_env(root: Path, home: Path, tmp: Path, marker: str = "") -> dict[str, str]:
     """The environment a step runs in: the code under test, nothing live."""
     env = {k: os.environ[k] for k in _INHERITED_ENV if k in os.environ}
+    if marker:
+        env[_MARKER_ENV] = marker
     interpreter = Path(sys.executable)
     base_path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
     env.update(
@@ -281,11 +302,12 @@ def run_scenario(sc: Scenario, root: Path) -> Arm:
         script = holder / "steps.sh"
         script.write_text(f"ulimit -f {STEP_FILE_LIMIT_KIB}\n{sc.steps}\n")
         out_path = holder / "stdout"
+        marker = uuid.uuid4().hex
         with open(out_path, "wb") as out_file:
             proc = subprocess.Popen(
                 ["bash", str(script)],
                 cwd=str(root),
-                env=step_env(root, home, tmp),
+                env=step_env(root, home, tmp, marker),
                 stdin=subprocess.DEVNULL,
                 stdout=out_file,
                 stderr=subprocess.DEVNULL,
@@ -297,7 +319,8 @@ def run_scenario(sc: Scenario, root: Path) -> Arm:
                 _kill_group(proc)
                 return Arm(False, None, "", False, f"timed out after {STEP_TIMEOUT_S}s")
             finally:
-                _kill_group(proc)  # whatever the step left running
+                _kill_group(proc)  # whatever the step left running in its group
+                _kill_marked(marker)  # and anything that left the group
         with open(out_path, "rb") as fh:
             raw = fh.read(STDOUT_LIMIT_BYTES + 1)
         if len(raw) > STDOUT_LIMIT_BYTES:
@@ -316,6 +339,45 @@ def _kill_group(proc: subprocess.Popen) -> None:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(proc.pid, signal.SIGKILL)
     proc.wait()
+
+
+_MARKER_ENV = "HOLDOUT_STEP_MARKER"
+
+
+def _kill_marked(marker: str) -> None:
+    """Kill every process still carrying this step's marker in its environment.
+
+    A descendant that starts its own session (``start_new_session=True``, which
+    code in this repository does) leaves the step's process group, so the group
+    kill misses it. It still inherits the environment, so it is found by the
+    marker. One that clears its environment on purpose is not found; that is
+    outside what a scenario's code does by accident.
+    """
+    needle = f"{_MARKER_ENV}={marker}".encode()
+    me = os.getpid()
+    for _ in range(3):  # a child may fork while the first sweep runs
+        found = False
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            return
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid <= 1 or pid == me:
+                continue
+            try:
+                with open(f"/proc/{pid}/environ", "rb") as fh:
+                    environ = fh.read()
+            except OSError:
+                continue
+            if needle in environ.split(b"\0"):
+                found = True
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(pid, signal.SIGKILL)
+        if not found:
+            return
 
 
 def describe_failed_arm(arm: Arm) -> str:
@@ -353,27 +415,68 @@ def judge(sc: Scenario, parent: Arm, merge: Arm, linked: set[int]) -> tuple[str,
 ATTRIBUTABLE_FAILURES = frozenset({"REGRESSED", "NOT-DELIVERED"})
 
 
+def issue_closed(issue: int, repo: str | None, root: Path) -> bool | None:
+    """Whether the issue is closed: True, False, or None when it cannot be read."""
+    try:
+        info = gh_json(
+            ["issue", "view", str(issue), *(["--repo", repo] if repo else []), "--json", "state"],
+            root,
+        )
+    except (RunnerError, ValueError):
+        return None
+    state = str(info.get("state") or "").upper()
+    return {"CLOSED": True, "OPEN": False}.get(state)
+
+
 def touched(sc: Scenario, files: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(f, pat) for pat in sc.touches for f in files)
 
 
 def _scratch_base() -> str:
+    """The disk-backed scratch root, ``~/tmp``, created when missing.
+
+    Two full worktree checkouts land here, so it must never fall back to the
+    default temp location, which may be a small tmpfs or a session's quota-capped
+    working temp. If it cannot be created, the run stops instead.
+    """
     base = Path.home() / "tmp"
-    return str(base) if base.is_dir() else tempfile.gettempdir()
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RunnerError(f"cannot create the scratch directory {base}: {exc}") from exc
+    return str(base)
 
 
 def _git(root: Path, *args: str) -> str:
-    proc = subprocess.run(
-        ["git", "-C", str(root), *args], capture_output=True, text=True, check=False
-    )
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            encoding="utf-8",
+            errors="surrogateescape",  # a path's bytes survive whatever the locale
+            check=False,
+            timeout=GIT_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RunnerError(f"git {' '.join(args)} timed out after {GIT_TIMEOUT_S}s") from exc
     if proc.returncode != 0:
         raise RunnerError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
-    return proc.stdout.strip()
+    return proc.stdout
 
 
 def gh_json(args: list[str], cwd: Path) -> dict:
     """Run a read-only ``gh`` query in ``cwd`` and parse its JSON. Tests replace this."""
-    proc = subprocess.run(["gh", *args], capture_output=True, text=True, check=False, cwd=str(cwd))
+    try:
+        proc = subprocess.run(
+            ["gh", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(cwd),
+            timeout=GH_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RunnerError(f"gh {' '.join(args[:2])} timed out after {GH_TIMEOUT_S}s") from exc
     if proc.returncode != 0:
         raise RunnerError(f"gh {' '.join(args[:2])} failed: {proc.stderr.strip()}")
     return json.loads(proc.stdout)
@@ -402,21 +505,39 @@ def resolve_merge(pr: int, repo: str | None, root: Path) -> tuple[str, set[int]]
     if info.get("state") != "MERGED" or not (info.get("mergeCommit") or {}).get("oid"):
         raise RunnerError(f"PR #{pr} is not merged")
     default = gh_json(
-        ["repo", "view", *([repo] if repo else []), "--json", "defaultBranchRef"], root
+        ["repo", "view", *([repo] if repo else []), "--json", "defaultBranchRef,nameWithOwner"],
+        root,
     )
     default_name = (default.get("defaultBranchRef") or {}).get("name")
+    this_repo = str(default.get("nameWithOwner") or "").lower()
     if info.get("baseRefName") != default_name:
         raise RunnerError(
             f"PR #{pr} merged into {info.get('baseRefName')}, not the default branch "
             f"{default_name}: its first parent is not the state it was built against"
         )
+    # A closing reference can name another repository's issue (Closes owner/other#5);
+    # its number must not link a same-numbered issue here.
     linked = {
         int(ref["number"])
         for ref in info.get("closingIssuesReferences") or []
-        if isinstance(ref, dict) and str(ref.get("number", "")).isdigit()
+        if isinstance(ref, dict)
+        and str(ref.get("number", "")).isdigit()
+        and this_repo
+        and _ref_repo(ref).lower() == this_repo
     }
     linked |= {int(n) for n in _CLOSING_REF.findall(info.get("body") or "")}
     return info["mergeCommit"]["oid"], linked
+
+
+def _ref_repo(ref: dict) -> str:
+    """``owner/name`` of a ``closingIssuesReferences`` entry, or '' if malformed.
+
+    The same shape ``session_awareness/repo_pulse.py`` reads.
+    """
+    repository = ref.get("repository") or {}
+    owner = (repository.get("owner") or {}).get("login") or ""
+    name = repository.get("name") or ""
+    return f"{owner}/{name}" if owner and name else ""
 
 
 class _Worktree:
@@ -449,16 +570,21 @@ def cmd_pr(pr: int, repo: str | None, root: Path, holdout: Path, out=None) -> in
     if scenarios is None:
         print("no holdout on this install", file=out)
         return 0
+    if holdout.resolve() == DEFAULT_HOLDOUT.resolve():
+        # Only for the install's own holdout, never a file passed for testing.
+        _ensure_ignore(holdout.parent)
+        _print_exposures(out)
     merge, linked = resolve_merge(pr, repo, root)
     try:
         _git(root, "cat-file", "-e", f"{merge}^{{commit}}")
     except RunnerError:
         _git(root, "fetch", "--quiet", "origin", merge)
-    parent = _git(root, "rev-parse", f"{merge}^1")
+    parent = _git(root, "rev-parse", f"{merge}^1").strip()
     # --no-renames: a moved file lists both paths, so a scenario on the old
-    # path still runs when its code is moved away.
-    changed = _git(root, "diff", "--name-only", "--no-renames", parent, merge)
-    files = [f for f in changed.splitlines() if f]
+    # path still runs when its code is moved away. -z: names come unquoted and
+    # NUL-separated, so a name with non-ASCII bytes or a newline stays intact.
+    changed = _git(root, "diff", "--name-only", "-z", "--no-renames", parent, merge)
+    files = [f for f in changed.split("\0") if f]
     for sc in scenarios:
         if sc.problem:
             print(f"{sc.sid} MALFORMED — {sc.problem}", file=out)
@@ -488,6 +614,11 @@ def cmd_pr(pr: int, repo: str | None, root: Path, holdout: Path, out=None) -> in
                 verdict, failed = judge(
                     sc, run_scenario(sc, p_root), run_scenario(sc, m_root), linked
                 )
+                if verdict == "PENDING" and issue_closed(sc.issue, repo, root):
+                    # Its issue was closed without any linked PR delivering it:
+                    # an unlinked build that missed the intent, or a wrong
+                    # scenario. Not attributable to this PR.
+                    verdict = "CLOSED-NOT-DELIVERED"
                 line = f"{sc.sid} {verdict} — {sc.protects}"
                 if failed is not None:
                     line += f" — observed {describe_failed_arm(failed)}"
@@ -501,6 +632,66 @@ def cmd_pr(pr: int, repo: str | None, root: Path, holdout: Path, out=None) -> in
             ["git", "-C", str(root), "worktree", "prune"], capture_output=True, check=False
         )
     return worst
+
+
+def _ensure_ignore(holdout_dir: Path) -> None:
+    """Keep ripgrep-based searches (rg, the Grep tool) out of the holdout.
+
+    ripgrep reads ``.ignore`` files in the directories it searches, so a search
+    of ``~/.genesis`` or ``~`` skips a directory listed there. Idempotent; a
+    failure to write it is not a reason to stop judging.
+    """
+    ignore = holdout_dir.parent / ".ignore"
+    entry = f"{holdout_dir.name}/"
+    try:  # OSError, or ValueError for a file that is not UTF-8
+        lines = ignore.read_text(encoding="utf-8").splitlines() if ignore.exists() else []
+        if entry not in (ln.strip() for ln in lines):
+            with open(ignore, "a", encoding="utf-8") as fh:
+                if lines and not ignore.read_text(encoding="utf-8").endswith("\n"):
+                    fh.write("\n")
+                fh.write(entry + "\n")
+    except (OSError, ValueError):
+        pass
+
+
+def _print_exposures(out) -> None:
+    """Always one line: how many exposures the holdout fence has recorded.
+
+    Silence would read as "none", so a missing or unreadable log says so, and
+    lines that do not parse are counted rather than ending the count.
+    """
+    if not EXPOSURE_LOG.exists():
+        print("holdout fence: no exposures logged (no exposure log yet)", file=out)
+        return
+    count, bad, times = 0, 0, []
+    try:
+        with open(EXPOSURE_LOG, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    bad += 1
+                    continue
+                if not isinstance(row, dict):
+                    bad += 1
+                    continue
+                count += 1
+                times.append(str(row.get("at") or ""))
+    except OSError as exc:
+        print(f"holdout fence: exposure log unreadable ({exc}); treat as unknown", file=out)
+        return
+    tail = f"; {bad} unreadable line(s)" if bad else ""
+    if not count:
+        print(f"holdout fence: no exposures logged{tail}", file=out)
+        return
+    print(
+        f"holdout fence: {count} exposure(s), first {min(times)}, latest {max(times)}{tail} "
+        f"(see {EXPOSURE_LOG}); a scenario written before an exposure may be spoiled: "
+        "tell the owner",
+        file=out,
+    )
 
 
 def cmd_at_path(root: Path, holdout: Path, ids: list[str], out=None) -> int:
@@ -543,12 +734,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.at_path is not None:
             return cmd_at_path(args.at_path.resolve(), args.holdout, args.scenario)
         root = (args.root or Path.cwd()).resolve()
-        root = Path(_git(root, "rev-parse", "--show-toplevel"))
+        root = Path(_git(root, "rev-parse", "--show-toplevel").strip())
         return cmd_pr(args.pr, args.repo, root, args.holdout)
     except RunnerError as exc:
         print(f"holdout: cannot run: {exc}", file=sys.stdout)
         return 3
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except Exception as exc:  # noqa: BLE001
         # Exit 1 means an attributable failure, so nothing else may end with it.
         print(f"holdout: cannot run: {type(exc).__name__}: {exc}", file=sys.stdout)
         return 3
