@@ -31,6 +31,17 @@ fti = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fti)
 
 
+@pytest.fixture(autouse=True)
+def private_tracker_home(tmp_path):
+    """Keep real tracker locks and snapshots inside this test's tree."""
+    home = tmp_path / "tracker-home"
+    home.mkdir()
+    # A test may undo its own patches or temporarily select a different HOME.
+    # It cannot undo the module's outer isolation and expose the real install.
+    with pytest.MonkeyPatch.context() as isolation:
+        isolation.setenv("HOME", str(home))
+        yield
+
 
 class _PathWithFailingMkdir(Path):
     """Scoped stand-in: only THIS class fails, not pathlib.Path process-wide."""
@@ -1484,15 +1495,23 @@ def test_a_snapshot_interrupted_mid_write_leaves_nothing_behind(tmp_path, monkey
     assert after == before, f"an interrupted snapshot leaked: {after - before}"
 
 
-def test_the_snapshot_is_never_world_readable_even_briefly(tmp_path):
+def test_the_snapshot_is_never_world_readable_even_briefly(tmp_path, monkeypatch):
     """Created 0600 by os.open, not written-then-chmod'd.
 
     A write-then-chmod leaves the body readable for the width of that window.
     The 0700 directory makes it unreachable to other users, but the file mode
     is the thing under test and defence in depth is the point of a 0600 here.
     """
+    monkeypatch.undo()
+    # Fail before either writer can create anything outside the test tree.
+    assert Path.home() == tmp_path / "tracker-home"
+    with fti.tracker_lock("Synthetic/Isolation"):
+        lock = fti._lock_path("Synthetic/Isolation")
+        assert lock.is_relative_to(Path.home())
+        assert lock.is_file()
     d, path = fti._snapshot(b"sensitive body")
     try:
+        assert Path(d).is_relative_to(Path.home() / "tmp")
         assert Path(path).stat().st_mode & 0o777 == 0o600
         assert Path(d).stat().st_mode & 0o777 == 0o700
         assert Path(path).read_bytes() == b"sensitive body"
