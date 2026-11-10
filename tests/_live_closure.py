@@ -13,6 +13,9 @@ closure too:
   under its ``tmp_path``, so a script that WRITES to ``SECRETS_PATH``
   (``restore.sh``) cannot leave a file the next test loads. The session-wide
   value, set at import, covers what loads at collection time.
+- ``GUARDIAN_SECRETS`` likewise names a separate nonexistent file at import,
+  configure and per-test setup, preventing Guardian's own default-home loader
+  from reaching installed credentials. Live opt-in preserves it.
 - Credential-shaped variables are removed: ``SSH_AUTH_SOCK``, ``GH_TOKEN``,
   ``GITHUB_TOKEN``, ``GIT_ASKPASS``, ``SSH_ASKPASS``, a bare ``API_KEY``, names
   starting ``VSCODE_GIT_`` (an IDE terminal's route to its own GitHub login), and
@@ -53,10 +56,10 @@ closure too:
   ``tests._live_fence.real_home()`` names the real home for tests that must;
   ``PLAYWRIGHT_BROWSERS_PATH`` keeps naming the real browser cache.
 
-Everything but ``SECRETS_PATH``, ``GENESIS_DB_PATH`` and ``HOME`` is set in
-``pytest_configure``: a ``tests/test*/conftest.py`` that read a credential, ran
-git, or imported the memory hook or the health MCP's browser module would see
-the real values first (none does).
+Everything but ``SECRETS_PATH``, ``GUARDIAN_SECRETS``, ``GENESIS_DB_PATH`` and
+``HOME`` is set in ``pytest_configure``: a ``tests/test*/conftest.py`` that read
+a credential, ran git, or imported the memory hook or the health MCP's browser
+module would see the real values first (none does).
 
 A test that sets its own value (``monkeypatch.setenv``) still wins: the closure
 is applied before any test runs. With ``GENESIS_LIVE_E2E=1`` the opt-in live
@@ -265,9 +268,11 @@ _S.base = tempfile.mkdtemp(prefix="genesis-live-closure-")
 atexit.register(lambda: _S.installed or shutil.rmtree(_S.base, ignore_errors=True))
 _IMPORT_TIME_DB = str(Path(_S.base) / "import-time-genesis.db")
 _NO_SECRETS = str(Path(_S.base) / "no-secrets.env")
+_NO_GUARDIAN_SECRETS = str(Path(_S.base) / "no-guardian-secrets.env")
 os.environ["GENESIS_DB_PATH"] = _IMPORT_TIME_DB
 if os.environ.get("GENESIS_LIVE_E2E") != "1":
     os.environ["SECRETS_PATH"] = _NO_SECRETS
+    os.environ["GUARDIAN_SECRETS"] = _NO_GUARDIAN_SECRETS
 _S.real_home = _live_fence.real_home()
 _inherited = (
     os.environ.get(_SHARED_HOME, "")
@@ -319,6 +324,7 @@ def install(config) -> None:
     _S.live_e2e = os.environ.get("GENESIS_LIVE_E2E") == "1"
     if not _S.live_e2e:
         os.environ["SECRETS_PATH"] = _NO_SECRETS
+        os.environ["GUARDIAN_SECRETS"] = _NO_GUARDIAN_SECRETS
         names = credential_names(os.environ)
         for name in names:
             del os.environ[name]
@@ -375,6 +381,7 @@ def _live_closure_secrets_path(tmp_path):
     mp = pytest.MonkeyPatch()
     if _S.installed and not _S.live_e2e:
         mp.setenv("SECRETS_PATH", str(tmp_path / "no-secrets.env"))
+        mp.setenv("GUARDIAN_SECRETS", str(tmp_path / "no-guardian-secrets.env"))
     try:
         yield
     finally:

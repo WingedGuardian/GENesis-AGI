@@ -833,6 +833,34 @@ def _isolate_override_log(tmp_path):
     mp.undo()
 
 
+# ── Safety: a REAL awareness tick must not touch the live repo or Guardian ────
+@pytest.fixture()
+def quiet_live_tick():
+    """For a test that runs a real ``AwarenessLoop._on_tick()``: the tick's git
+    steps act on the live install, not on anything the test owns. The cheap git
+    health check writes the Guardian's ``git_health.json`` verdict (under
+    ``~/.genesis/shared``) and a probe file into the repository's shared ``.git``;
+    the bundle publish replaces the Guardian's recovery bundle with this
+    checkout's HEAD; the deep check runs fsck. Each becomes a no-op here. Their
+    own tests (``tests/test_awareness/test_git_health_check.py``,
+    ``tests/test_guardian/test_repo_bundle*.py``) drive them against temp repos."""
+    import genesis.awareness.loop as loop_mod
+
+    async def _no_check(*_a, **_k):
+        return None
+
+    # A fixture-owned MonkeyPatch, as the other safety fixtures here use: a test's
+    # own monkeypatch.undo() must not lift this protection mid-test.
+    mp = pytest.MonkeyPatch()
+    mp.setattr(loop_mod, "_check_git_health", _no_check)
+    mp.setattr(loop_mod, "_publish_repo_bundle_if_due", _no_check)
+    mp.setattr(loop_mod, "_dispatch_git_health_deep", lambda *_a, **_k: None)
+    try:
+        yield
+    finally:
+        mp.undo()
+
+
 # ── Safety: prevent tests from writing to the REAL genesis.db ────────────────
 @pytest.fixture(autouse=True)
 def _isolate_genesis_db_path(tmp_path):
