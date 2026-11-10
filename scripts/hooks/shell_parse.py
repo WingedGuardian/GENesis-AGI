@@ -984,7 +984,8 @@ def parse_segments(
     ``raw`` (so ``_substitutions`` still sees the nested command a substitution redirect
     target EXECUTES) but EXCLUDED from ``argv_src`` — so it can no longer leak into argv
     and spoof ``git_subcommand``/``commit_skips_hooks`` (the push/commit fail-open this
-    split closes). Process substitution ``<(…)``/``>(…)`` stays in BOTH (documented gap).
+    split closes). Process substitution ``<(…)``/``>(…)`` keeps its ``(body)`` in BOTH views, as a
+    word; :func:`_process_substitution_spans` reads the body for the guards.
     ``raw`` stays byte-identical to the historical ``split_segments`` output for every
     ordinary command (the cwd/occurrence consumers match ``Segment.raw`` against a fresh
     re-split; locked by a golden test over a broad corpus). ONE intentional difference
@@ -4720,7 +4721,7 @@ def _analyze_bounded(
     # the `<`/`>` and leaves `(body)` in raw, where it reads as a word.
     process_spans = _process_substitution_spans(command) if "(" in command else []
     level_spans: list[tuple[int, int]] | None = None
-    for begin, end, visible in ranges if _policy is not None else []:
+    for begin, end, visible in ranges if _policy is not None else ():
         redirections = tuple((op, target) for at, op, target in targets if begin <= at < end)
         if not visible and redirections:
             _policy.append(PolicySegment("", [], False, "", depth=_depth,
@@ -4840,7 +4841,8 @@ def _analyze_bounded(
                 level_spans = _substitution_spans(command)
             cut = {raw[a:b] for a, b in spans}
             for a, b in level_spans:
-                if begin <= a < end and command[a:b] not in cut:
+                body = command[a:b]
+                if begin <= a < end and body not in cut and ("<(" in body or ">(" in body):
                     added.add(len(nested))
                     nested.append((command[a:b], (here[0], here[1] + a), True, "substitution"))
         if not nested:
@@ -4982,7 +4984,8 @@ def _substitutions(text: str) -> list[str]:
     shared ``_command_sub_end`` — a ``)`` inside a quoted operand of the body is
     DATA, so the body is extracted to its TRUE close (the same scanner the redirect-
     target boundary uses, so the two never disagree on where a ``$()`` ends).
-    Best-effort: exotic forms (process substitution ``<(…)``, ANSI-C ``$'…'``
+    Best-effort: exotic forms (process substitution ``<(…)``, which
+    :func:`_process_substitution_spans` reads instead, ANSI-C ``$'…'``
     scripts, shell aliases/functions) are NOT parsed —
     this guard is an approval/friction layer, not a sandbox, and fails toward
     over-matching on the common forms rather than pretending to cover every shell
@@ -5015,7 +5018,8 @@ def _substitution_span_sets(text: str) -> tuple[list[tuple[int, int]], set[tuple
 def _process_substitution_spans(text: str) -> list[tuple[int, int]]:
     """Bodies of ``<(…)`` and ``>(…)`` outside quotes, which bash runs. Read generously:
     a ``(`` after an unquoted ``<`` or ``>`` counts even where bash would reject the
-    line, since reading too much only refuses."""
+    line, since reading too much only over-blocks (a ``<(`` in a ``#`` comment is read
+    too, as the ``$(`` scan reads one)."""
     return _quoted_substitution_spans(text, process=True)
 
 

@@ -118,6 +118,11 @@ HIDDEN_PUSH = {
     "nested in backticks": "echo `cat <(" + PUSH + ")`",
     "output form nested": "echo $(echo x > >(" + PUSH + "))",
     "two levels deep": "echo $(echo $(cat <(" + PUSH + ")))",
+    "nested in another process substitution": "cat <(cat <(" + PUSH + "))",
+    "inside a bash -c script": "bash -c 'cat <(" + PUSH + ")'",
+    "after a separator in the body": "cat <(true; " + PUSH + ")",
+    "after a separator, nested": "echo $(cat <(true; " + PUSH + "))",
+    "after arithmetic": "echo $((1 + 1)) <(" + PUSH + ")",
 }
 
 
