@@ -1117,7 +1117,7 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             # rendered faithfully (systemd shell-quotes it, and a relative path is not a
             # valid EnvironmentFile), so either one is named in a warning instead.
             _secrets_file=$(SECRETS_PATH= genesis_secrets_path "$REPO_DIR")
-            if [[ -n "${SECRETS_PATH:-}" ]] || { systemctl --user show-environment 2>/dev/null || true; } | grep '^SECRETS_PATH=' >/dev/null; then
+            if [[ -n "$(printenv SECRETS_PATH || true)" ]] || { systemctl --user show-environment 2>/dev/null || true; } | grep '^SECRETS_PATH=' >/dev/null; then
                 echo "  WARNING: SECRETS_PATH is set, but the units load $_secrets_file; the server may load another file" >&2
             fi
             if [[ -z "$_secrets_file" ]]; then

@@ -145,7 +145,7 @@ def _render(renderer, root, *, manager_secrets_path=None, shell_secrets_path=Non
     systemctl that reports ``manager_secrets_path`` in the user manager's env."""
     text = (REPO / "scripts" / renderer).read_text()
     resolve = re.search(r"^\s*(_secrets_file=\$\(SECRETS_PATH= genesis_secrets_path .*\))$", text, re.M)
-    warn = re.search(r"^(\s*if \[\[ -n \"\$\{SECRETS_PATH:-\}\" \]\].*?\n\s*fi)$", text, re.M | re.S)
+    warn = re.search(r"^(\s*if \[\[ -n \"\$\(printenv SECRETS_PATH \|\| true\)\" \]\].*?\n\s*fi)$", text, re.M | re.S)
     escape = re.search(r"^\s*(_secrets_file_esc=\$\(_sed_repl_esc .*)$", text, re.M)
     sed_esc = re.search(r"^\s*(_sed_repl_esc\(\) \{.*\})\s*$", text, re.M)
     assert resolve and warn and escape and sed_esc, renderer
