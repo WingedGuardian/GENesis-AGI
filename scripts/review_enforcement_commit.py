@@ -1041,7 +1041,7 @@ def _key_rounds(
         import review_late  # noqa: PLC0415 — lazy, like review_reflection
 
         with rr.deadline_scope(deadline):
-            fix_time = review_late.fix_time_reader(cwd or ".", str(budget.get("current_head")))
+            fix_time = review_late.fix_time_reader(cwd or ".", rr.pr_head(budget))
             late = review_late.late_findings(budget, state.get("cutover"), fix_time)
         if late is None:
             raise rr.Refused("the late findings could not be read")

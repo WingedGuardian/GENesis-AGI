@@ -559,7 +559,8 @@ def _late_status(
     deadline: float | None,
 ) -> dict[str, Any]:
     ok = budget.get("status") == "ok"
-    fix_time = fix_time_reader(cwd, str(budget.get("current_head"))) if ok else None
+    # The real PR head, also when the round is held open at an earlier head.
+    fix_time = fix_time_reader(cwd, rr.pr_head(budget)) if ok else None
     state = rr.owed_state(budget, (), now=now, cutover=cutover, fix_time=fix_time)
     is_open = ok and state["round_state"] == "open"
     late = late_findings(budget, cutover, fix_time) if ok else []

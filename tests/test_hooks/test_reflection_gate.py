@@ -1036,3 +1036,65 @@ def test_the_advisory_ignores_a_round_from_before_the_cutover(repo, monkeypatch)
     later = (datetime.now(UTC) + timedelta(days=1)).isoformat()
     assert live == head
     assert rr.unreflected_round_behind(str(repo), budget, cutover=later) is None
+
+
+def test_an_older_round_reviewed_after_the_merge_stays_owed(repo, monkeypatch):
+    """Rounds at A (c11) and B (c22), an empty commit between them, then a merge
+    of main M; A's review lands after M. The held view holds B open, and A's key
+    is still owed as a late key: the owe side's fix horizon is the real head M,
+    not the held round's head (a merge of main is no fix of B, but it is one of
+    A's head). Secondary review finding on this PR."""
+    import review_budget
+
+    first = _open_round(monkeypatch, repo)
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "nothing to fix yet")
+    second = _head(repo)
+    _git(repo, "checkout", "-q", "main")
+    (repo / "other.py").write_text("other = 1\n")
+    _git(repo, "add", "other.py")
+    _git(repo, "commit", "-qm", "main moves on")
+    _git(repo, "update-ref", "refs/remotes/origin/main", _head(repo))
+    _git(repo, "checkout", "-q", "feature/reflection")
+    _git(repo, "merge", "-q", "--no-ff", "--no-edit", "main")
+    _point_budget_at(monkeypatch, repo)
+    soon = datetime.now(UTC) + timedelta(minutes=1)
+    reviews = [
+        {
+            "id": n,
+            "login": CODEX,
+            "commit_id": sha,
+            "state": "COMMENTED",
+            "submitted_at": (soon + timedelta(minutes=n)).isoformat().replace("+00:00", "Z"),
+            "body": "",
+            "top_level": [P2],
+            "top_level_ids": [key],
+        }
+        for n, sha, key in ((1, first, 11), (2, second, 22))
+    ]
+    monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "\n".join(json.dumps(r) for r in reviews))
+    budget = review_budget.evaluate_pr("owner/repo", 99)
+    assert budget["round_state"] == "complete"
+    state = rr.owed_from_budget(
+        str(repo), budget, "owner/repo", 99, now=soon + timedelta(hours=1),
+        cutover=rr.REFLECTION_CUTOVER_ISO,
+    )
+    assert state["held_open"]["round_head"] == second
+    assert sorted(state["owed"]) == ["c11", "c22"]
+
+
+def test_held_open_reads_git_once(repo, monkeypatch):
+    """Rule R reads the view, then owed_from_budget reads it again: the second
+    read must not repeat the git walk (it runs inside the 1 s slice)."""
+    import review_budget
+
+    _open_round(monkeypatch, repo)
+    (repo / "f.py").write_text("value = 5\n")
+    _git(repo, "commit", "-qam", "a real fix")
+    _point_budget_at(monkeypatch, repo)
+    budget = review_budget.evaluate_pr("owner/repo", 99)
+    calls = []
+    real = rr.fix_rows
+    monkeypatch.setattr(rr, "fix_rows", lambda *a, **k: calls.append(a) or real(*a, **k))
+    view = rr.held_open(str(repo), budget)
+    assert view["held_open"] is None and len(calls) == 1
+    assert rr.held_open(str(repo), view) is view and len(calls) == 1

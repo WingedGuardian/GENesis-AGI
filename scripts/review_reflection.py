@@ -1294,6 +1294,17 @@ def _newest_round_behind(budget: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return newest[0] if len(newest) == 1 else None
 
 
+def pr_head(budget: Mapping[str, Any]) -> str:
+    """The PR's real head, also under a ``held_open`` view (whose
+    ``current_head`` is the held round's head). The owe side's "was this head
+    fixed since" horizon is always the real head: a merge of main above a held
+    round is no fix of that round, but it IS one of an older round's head."""
+    held = budget.get("held_open")
+    if isinstance(held, Mapping) and isinstance(held.get("pr_head"), str):
+        return held["pr_head"]
+    return str(budget.get("current_head"))
+
+
 def held_open(cwd: str, budget: Mapping[str, Any]) -> Mapping[str, Any]:
     """The budget as the reflection gate reads it: unchanged, except when the
     head moved off the newest round head by NO FIX at all (``fix_rows`` with
@@ -1311,12 +1322,16 @@ def held_open(cwd: str, budget: Mapping[str, Any]) -> Mapping[str, Any]:
     reflection that failed its full check no longer completes the round
     either: its keys stay owed until a reflection that passes.
 
-    Idempotent: the view's ``round_state`` is open, so a second call returns
-    it unchanged. Residual: a rebase or force-push drops the reviewed head out
+    Idempotent and read once: whatever it decided after a git walk, the
+    result carries ``held_open`` (None when nothing is held), and a second call
+    returns it unchanged. The owe side's fix horizon stays the real head
+    (``pr_head``). Residual: a rebase or force-push drops the reviewed head out
     of the commit graph, and nothing is held (as before).
 
     Raises ``Refused`` when git cannot relate the two heads (an unfetched
     head): unknown, never "nothing owed"."""
+    if "held_open" in budget:
+        return budget  # already read: a second call costs no second git walk
     if budget.get("status") != "ok" or budget.get("round_state") != "complete":
         return budget
     entry = _newest_round_behind(budget)
@@ -1324,7 +1339,7 @@ def held_open(cwd: str, budget: Mapping[str, Any]) -> Mapping[str, Any]:
         return budget
     round_head, head = str(entry.get("head")), str(budget.get("current_head"))
     if fix_rows(cwd, round_head, head, main_merges=True) != []:
-        return budget
+        return {**budget, "held_open": None}
     seen: dict[str, None] = {}
     known = not entry.get("legacy")
     for source in entry.get("reviews") or []:
