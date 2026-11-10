@@ -29,6 +29,42 @@ def _offline(*args):
     raise LookupError("offline: live public receipt readback still required")
 
 
+_LEGACY_ENTRIES = "Legacy evidence: {n} entries in the retired scope_limits field have no gap kind; "
+_LEGACY_EMPTY = "Legacy evidence: written with the retired scope_limits field (empty); "
+# What a validator can do next depends on the row: an open one is re-recorded in the
+# current schema; a closed one can never be amended, so the routing goes elsewhere.
+_LEGACY_NEXT = {
+    "open": "re-record it with gaps, choosing each entry's kind (method, event_gated, owner_only, not_yet_done)",
+    "closed": "closed rows are never amended: classify each entry's gap kind in the run log "
+              "and file or reuse tracking for any actionable one",
+}
+
+
+def _legacy_pending(entries: int, status: str) -> str:
+    head = _LEGACY_ENTRIES.format(n=entries) if entries else _LEGACY_EMPTY
+    return head + _LEGACY_NEXT.get(status, _LEGACY_NEXT["closed"])
+
+
+def _legacy_document(data):
+    """Read evidence written before ``scope_limits`` was replaced by ``gaps``, for this report only.
+
+    Returns ``(document, entry_count)`` when *data* is otherwise a valid evidence
+    document carrying a ``scope_limits`` list of strings, else ``None``. The entries
+    are counted, never mapped to gap kinds: the kind decides the verdict, so the
+    writers still refuse ``scope_limits`` and a row read this way is never complete.
+    """
+    if not isinstance(data, dict) or "gaps" in data:
+        return None  # a document with gaps was written after the change: not legacy
+    limits = data.get("scope_limits")
+    if not isinstance(limits, list) or not all(isinstance(entry, str) for entry in limits):
+        return None
+    try:
+        doc = parse_evidence({key: value for key, value in data.items() if key != "scope_limits"})
+    except EvidenceError:
+        return None
+    return doc, len(limits)
+
+
 async def audit(db, repo: str, prs: list[int] | None, *, offline: bool = False) -> dict:
     """Include closed legacy debt. Close SELECT cursors before network reads.
 
@@ -53,21 +89,31 @@ async def audit(db, repo: str, prs: list[int] | None, *, offline: bool = False) 
             results.append(item | {"pending": ["No verification row exists"]})
             continue
         item.update(status=row[0], verdict=row[1])
+        legacy = None
         try:
             raw = row[2]
             if not isinstance(raw, str) or not raw:
                 raise ValueError("no evidence")
             if len(raw.encode("utf-8")) > MAX_EVIDENCE_BYTES:
                 raise ValueError("over evidence cap")
-            doc = parse_evidence(json.loads(raw, object_pairs_hook=_no_duplicates))
+            data = json.loads(raw, object_pairs_hook=_no_duplicates)
+            try:
+                doc = parse_evidence(data)
+            except EvidenceError:
+                if (legacy := _legacy_document(data)) is None:
+                    raise
+                doc = legacy[0]
             if doc.repo != repo or doc.pr != pr:
                 raise ValueError("evidence does not belong to this row")
         except (ValueError, TypeError, RecursionError, EvidenceError):
             # Never dump private evidence, schema inputs or exception messages.
             results.append(item | {"pending": ["Missing, malformed or mismatched historical evidence; manual classification required"]})
             continue
-        report = await assess_tracking(doc, db=db, read_public=_offline if offline else None)
-        results.append(item | report.as_dict())
+        report = (await assess_tracking(doc, db=db, read_public=_offline if offline else None)).as_dict()
+        if legacy is not None:
+            report |= {"complete": False, "legacy_scope_limits": legacy[1],
+                       "pending": [_legacy_pending(legacy[1], row[0]), *report["pending"]]}
+        results.append(item | report)
     return {"complete": all(item["complete"] for item in results), "rows": results,
             "read_only": True, "offline": offline, "snapshot": "per row"}
 

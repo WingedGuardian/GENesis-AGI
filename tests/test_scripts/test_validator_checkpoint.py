@@ -68,6 +68,63 @@ def test_legacy_malformed_records_are_classified_without_echoing_private_inputs(
     assert _row(path) == before
 
 
+def _legacy(limits):
+    """Evidence as written before ``gaps`` replaced ``scope_limits``: no ``gaps`` key."""
+    doc = _doc()
+    del doc["gaps"]
+    return doc | {"scope_limits": limits}
+
+
+@pytest.mark.parametrize(("limits", "expected"), [
+    (["synthetic private limit text"], "Legacy evidence: 1 entries"),
+    ([], "Legacy evidence: written with the retired scope_limits field (empty)"),
+])
+@pytest.mark.parametrize(("closed", "next_step"), [
+    (True, "closed rows are never amended"),
+    (False, "re-record it with gaps"),
+])
+def test_legacy_scope_limits_evidence_is_read_but_never_complete(
+    tmp_path, capsys, limits, expected, closed, next_step
+):
+    path = seed_evidence(tmp_path, _legacy(limits), closed=closed)
+    before = _row(path)
+    assert call(path, command="audit") == 4
+    output = capsys.readouterr().out
+    row = json.loads(output)["rows"][0]
+    assert row["complete"] is False and row["legacy_scope_limits"] == len(limits)
+    assert row["pending"][0].startswith(expected) and next_step in row["pending"][0]
+    assert "manual classification" not in output and "synthetic private" not in output
+    assert _row(path) == before
+
+
+def test_a_complete_document_does_not_become_complete_by_being_legacy(tmp_path, capsys):
+    # Control: the same document in the current schema audits complete, so the legacy
+    # line alone is what keeps the legacy one open.
+    (tmp_path / "modern").mkdir()
+    assert call(seed_evidence(tmp_path / "modern", _doc(), closed=True), command="audit") == 0
+    capsys.readouterr()
+    path = seed_evidence(tmp_path, _legacy([]), closed=True)
+    assert call(path, command="audit") == 4
+    assert json.loads(capsys.readouterr().out)["rows"][0]["pending"] == [
+        _tool._legacy_pending(0, "closed")]
+
+
+@pytest.mark.parametrize("bad", [
+    {"scope_limits": [{"kind": "method"}]},   # not the legacy shape: entries were strings
+    {"scope_limits": "one string"},
+    {"scope_limits": [], "claims": []},      # the rest of the document is invalid too
+    {"scope_limits": [], "pr": 8},           # belongs to another row
+    {"scope_limits": [], "repo": "other/repo"},  # belongs to another repository
+    {"scope_limits": [], "gaps": []},        # written after gaps existed: not legacy
+])
+def test_anything_but_a_valid_legacy_document_stays_manual(tmp_path, capsys, bad):
+    doc = _legacy([]) | bad
+    path = seed_evidence(tmp_path, doc, closed=True)
+    assert call(path, command="audit") == 4
+    row = json.loads(capsys.readouterr().out)["rows"][0]
+    assert "manual classification" in row["pending"][0] and "legacy_scope_limits" not in row
+
+
 def test_mismatched_row_identity_and_missing_selected_row_do_not_pass(tmp_path, capsys):
     path = seed_evidence(tmp_path, _doc(pr=8))
     assert call(path, "--pr", "99") == 4
