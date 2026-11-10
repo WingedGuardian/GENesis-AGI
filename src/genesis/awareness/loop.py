@@ -1913,7 +1913,10 @@ def _deploy_repair_paragraph(repairs: dict) -> str:
     if refused:
         parts.append(
             f"{refused} live-move repair report(s) under ~/.genesis/deploy-backups/ could "
-            "not be read; they are named in the server log."
+            "not be read; they are named in the server log, and each is kept with its "
+            "saved files until `scripts/deploy_candidates repair-move --dismiss <ts>` "
+            "dismisses it (once the installed repair kit includes it; an older kit "
+            "refuses an unreadable report)."
         )
     unread = repairs.get("unread_older") or 0
     if unread:

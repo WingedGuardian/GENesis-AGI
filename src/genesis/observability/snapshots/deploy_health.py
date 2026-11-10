@@ -1009,7 +1009,10 @@ def collect_live_repairs(
     (a symlinked dir, a REPAIR.json that is not a regular file within the byte
     cap, not a JSON object, over the row cap, or naming another checkout), or
     one that fails in any other way, counts in ``refused`` and is named once in
-    the server log; it never costs the other reports.
+    the server log; it never costs the other reports. A dir holding the repair's
+    DISMISS_MARK (--dismiss of a report no reader can read, #4331) is skipped:
+    it takes its read slot and counts in ``unread_older`` like a dismissed one,
+    and never counts as refused.
 
     ``reports`` (newest first): per report its ``ts``, ``backup_dir``,
     ``saved`` (its foreign rows: every dict row of class "foreign", no other
@@ -1046,6 +1049,7 @@ def collect_live_repairs(
         repair = _script(_REPAIR_SCRIPT)
         report_ts, load_report, bad = repair.report_ts, repair.load_report, repair.BadReport
         report_order, future_s = repair.report_order, repair.REPORT_FUTURE_S
+        marked = repair.dismiss_marked
     except Exception:  # noqa: BLE001 - unloadable: no report can be read
         logger.warning("live-move repair module could not be loaded", exc_info=True)
         out["refused"] = len(names)
@@ -1069,6 +1073,8 @@ def collect_live_repairs(
         # One boundary per report: a fault no check foresaw costs that report,
         # never the rest of the snapshot.
         try:
+            if marked(str(backups / name)):
+                continue  # dismissed though no reader can read it (DISMISS_MARK)
             loaded = load_report(str(backups / name), repo)
             if loaded is None:
                 continue

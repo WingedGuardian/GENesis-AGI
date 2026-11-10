@@ -248,3 +248,15 @@ def test_a_reader_that_crashes_keeps_the_folder(tmp_path):
     assert "could not be judged (exit 1)" in r.stdout, r.stdout
     _prune_main(root)
     assert not d.exists(), "control: the real reader lets a report with nothing saved go"
+
+
+def test_a_dismissed_unreadable_report_is_pruned_at_ninety_days(tmp_path):
+    """--dismiss TS on a report no reader can read writes DISMISSED.json; the
+    prune then lets it go like any dismissed report, and its run folder."""
+    root = tmp_path / "home" / ".genesis" / "deploy-backups"
+    d = _report(root, _TS, 120, b"{not json")
+    (d / "DISMISSED.json").write_text('{"dismissed_at": "2026-01-03T00:00:00Z", "unread": "not JSON"}')
+    _age(d / "DISMISSED.json", 120)
+    _age(d, 120)
+    r = _prune_main(root)
+    assert not d.exists(), r.stdout

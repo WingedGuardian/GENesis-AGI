@@ -1039,7 +1039,10 @@ async def test_refused_reports_have_their_own_wording(db, monkeypatch):
     content = row["content"]
     assert row["priority"] == "high" and "update.sh" not in content, content
     assert "2 live-move repair report(s)" in content and "could not be read" in content
-    assert "named in the server log" in content and "--dismiss" not in content, content
+    # --dismiss now takes a report no reader can read (DISMISSED.json, #4331),
+    # so it is the way out this text names.
+    assert "named in the server log" in content, content
+    assert "repair-move --dismiss <ts>" in content, content
 
 
 async def test_unread_older_reports_alone_raise_nothing(db, monkeypatch):

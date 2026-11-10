@@ -5042,7 +5042,11 @@ logger or unrelated exceptions with copied text and no provenance.
   rule accepts (`report_ts`; anything else exits 2 before a path is built) and
   read the report through `load_report`; `--dismiss` rewrites `REPAIR.json`
   only under update.lock (30 s wait by default; still held, exit 1 and
-  nothing written), so it cannot race a restore's own rewrite. `scripts/
+  nothing written), so it cannot race a restore's own rewrite. A report
+  `load_report` refuses (unreadable, or another checkout's) is dismissed with
+  `DISMISSED.json` beside it, only in a real directory of this user's, and
+  `REPAIR.json` is left as it is; deploy health, the guardian's pick and the
+  deploy-backups prune all skip a folder holding it. `scripts/
   deploy_candidates repair-move --restore TS [--check]` passes through to the
   kit. `live_move_repair.py --restore TS
   --check` (#3492 PR B1) is the read-only judge of what a restore would

@@ -11,7 +11,8 @@ A report folder holds the only saved copy of edits a live-move repair moved out
 of the checkout. It is kept while deploy health would still count its saved
 paths: not dismissed, not cleared by a restore (the rule of deploy_health
 ``_restore_counts``, held equal by a test), and holding at least one foreign
-row. A report this reader cannot read is kept too, and named: losing a saved
+row. A report this reader cannot read is kept too, and named, until --dismiss
+writes DISMISS_MARK beside it (a dismissed report goes like any other): losing a saved
 edit is the outcome a prune must never produce in silence. So is the restore
 run folder a kept report's in-flight record names (``restore.inflight[0]``):
 its ``aside/`` can hold the only copy of content a held restore did not write
@@ -34,6 +35,8 @@ import sys
 REPORT_NAME = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9]+-live-move-repair")
 #: A restore run's folder name (live_move_restore_runs.RUN_NAME).
 RUN_NAME = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9]+-live-move-restore")
+#: live_move_repair.DISMISS_MARK: --dismiss's record for a report no reader reads.
+DISMISS_MARK = "DISMISSED.json"
 #: Exit codes: keep, and may prune (never 1, which an uncaught exception exits with).
 KEEP, PRUNE = 0, 3
 #: live_move_repair.REPORT_BYTES: a larger REPAIR.json is not the writer's.
@@ -81,6 +84,8 @@ def _held_by(root: str, run: str) -> str | None:
     except OSError as exc:
         return f"its reports cannot be listed ({exc.strerror})"
     for name in names:
+        if _marked(os.path.join(root, name)):
+            continue
         report = _read(os.path.join(root, name))
         if isinstance(report, str):
             continue  # an unreadable report is kept itself; it names no run here
@@ -91,7 +96,16 @@ def _held_by(root: str, run: str) -> str | None:
     return None
 
 
+def _marked(folder: str) -> bool:
+    try:
+        return stat.S_ISREG(os.lstat(os.path.join(folder, DISMISS_MARK)).st_mode)
+    except OSError:
+        return False
+
+
 def _report_keep(folder: str) -> str | None:
+    if _marked(folder):
+        return None  # dismissed though unreadable: goes like any dismissed report
     report = _read(folder)
     if report is None:
         return None
