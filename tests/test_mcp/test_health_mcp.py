@@ -1,8 +1,12 @@
 """Tests for health-mcp server — verify all tools are registered."""
 
+import json
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 import genesis.mcp.health_mcp as health_mcp_mod
+from genesis.cc import session_cache
 from genesis.mcp.health_mcp import (
     _impl_health_alerts,
     _impl_health_status,
@@ -10,6 +14,15 @@ from genesis.mcp.health_mcp import (
     _impl_session_set_model,
     mcp,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolated_session_config(tmp_path):
+    # HOME isolation cannot move the path already bound by session_cache.
+    # Own this patch so a test's monkeypatch.undo() cannot expose the live file.
+    with pytest.MonkeyPatch.context() as isolation:
+        isolation.setattr(session_cache, "_SESSION_CONFIG", tmp_path / "session_config.json")
+        yield
 
 
 async def test_all_tools_registered():
@@ -486,7 +499,10 @@ async def test_session_set_model_no_service():
         health_mcp_mod._service = old
 
 
-async def test_session_set_model_success():
+async def test_session_set_model_success(tmp_path, monkeypatch):
+    monkeypatch.undo()
+    # Check isolation before a successful call can reach the real sidecar.
+    assert tmp_path / "session_config.json" == session_cache._SESSION_CONFIG
     mock_svc = AsyncMock()
     mock_svc._db = AsyncMock()
     old = health_mcp_mod._service
@@ -496,6 +512,7 @@ async def test_session_set_model_success():
             result = await _impl_session_set_model("sess-1", "opus")
             assert result["success"] is True
             assert result["model"] == "opus"
+            assert json.loads(session_cache._SESSION_CONFIG.read_text()) == {"model": "opus"}
             mock_update.assert_awaited_once_with(
                 mock_svc._db, "sess-1", model="opus",
             )
@@ -517,7 +534,8 @@ async def test_session_set_model_not_found():
         health_mcp_mod._service = old
 
 
-async def test_session_set_effort_success():
+async def test_session_set_effort_success(tmp_path):
+    assert tmp_path / "session_config.json" == session_cache._SESSION_CONFIG
     mock_svc = AsyncMock()
     mock_svc._db = AsyncMock()
     old = health_mcp_mod._service
@@ -527,6 +545,7 @@ async def test_session_set_effort_success():
             result = await _impl_session_set_effort("sess-1", "high")
             assert result["success"] is True
             assert result["effort"] == "high"
+            assert json.loads(session_cache._SESSION_CONFIG.read_text()) == {"effort": "high"}
             mock_update.assert_awaited_once_with(
                 mock_svc._db, "sess-1", effort="high",
             )
