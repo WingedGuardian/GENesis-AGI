@@ -690,10 +690,12 @@ def test_every_removed_entry_is_named_with_its_size(tmp_path):
     f = d / "old.log"
     f.write_text("x")
     _age(f, 10)
+    # What the filesystem stores for the fixture (directory blocks on ext4,
+    # compression on btrfs) decides the number, so measure it the same way.
+    want = subprocess.run(["du", "-smx", "--", str(job)], capture_output=True, text=True,
+                          check=True).stdout.split()[0]  # fmt: skip
     r = _run_prune(d)
     assert not job.exists() and not f.exists()
-    # du -sm rounds up and counts the directory's own blocks: 3 on btrfs (a
-    # directory holds none), 4 on ext4 (one 4 KiB block).
     sizes = re.findall(rf"tmp prune: removed {re.escape(str(job))} \((\d+) MB\)", r.stdout)
-    assert sizes in (["3"], ["4"]), r.stdout
+    assert sizes == [want], r.stdout
     assert f"tmp prune: removed {f} (" in r.stdout, r.stdout
