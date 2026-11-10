@@ -416,14 +416,78 @@ def test_every_vnc_template_token_is_substituted_by_setup_vnc():
     assert not offenders, "VNC template tokens setup-vnc.sh never substitutes:\n  " + "\n  ".join(offenders)
 
 
-def test_the_graph_projection_timer_runs_once_soon_after_it_starts():
-    """Devin 4521703262: a fresh install starts the engine before genesis-server
-    has created the database; the timer's OnActiveSec run is the projection that
-    finds data, instead of reads falling back until the next hourly run."""
-    from pathlib import Path as _P
+_INSTALL_SH = Path(__file__).resolve().parents[2] / "scripts" / "install.sh"
 
-    text = (_P(__file__).resolve().parents[2] / "scripts" / "systemd"
-            / "genesis-graph-project.timer.template").read_text()
-    timer = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
-    assert "OnCalendar=hourly" in timer
-    assert "OnActiveSec=5min" in timer
+
+def _first_projection_block() -> tuple[str, str]:
+    """(the shell text before the first-projection block's readiness script,
+    that embedded Python script)."""
+    text = _INSTALL_SH.read_text()
+    start = text.index("# First graph projection.")
+    script = text[text.index("<<'PY'", start):]
+    script = script[script.index("\n") + 1:script.index("\nPY\n")]
+    return text[:start], script
+
+
+def test_install_projects_once_after_the_server_starts():
+    """Devin 4521703262 / Codex 4526468559: install.sh starts the engine before
+    genesis-server creates the database, and its browser-stack install can take
+    longer than any fixed delay. The first projection is started after the server
+    start, not by a timer offset."""
+    before, _ = _first_projection_block()
+    text = _INSTALL_SH.read_text()
+    assert "systemctl --user start genesis-server" in before
+    assert text.index("systemctl --user start --no-block genesis-graph-project.service") > len(before)
+    timer = (_INSTALL_SH.parent / "systemd" / "genesis-graph-project.timer.template").read_text()
+    assert "OnActiveSec" not in timer
+
+
+@pytest.mark.parametrize(
+    ("tables", "ready"),
+    [((), False), (("memory_links",), False), (("memory_links", "memory_metadata"), True)],
+)
+def test_the_first_projection_waits_for_the_tables_not_the_file(tmp_path, tables, ready):
+    """The server creates the database file before its tables, so the readiness
+    check opens it read-only and needs both tables the projector reads."""
+    import os
+    import sqlite3
+    import subprocess
+    import sys
+
+    db = tmp_path / "genesis.db"
+    con = sqlite3.connect(db)
+    for name in tables:
+        con.execute(f"CREATE TABLE {name} (x)")
+    con.commit()
+    con.close()
+    _, script = _first_projection_block()
+    env = {**os.environ, "GENESIS_DB_PATH": str(db), "GENESIS_FIRST_PROJECTION_WAIT_S": "0"}
+    rc = subprocess.run([sys.executable, "-c", script], env=env, timeout=60).returncode
+    assert (rc == 0) is ready
+
+
+def test_the_first_projection_wait_never_creates_a_missing_database(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    db = tmp_path / "absent.db"
+    _, script = _first_projection_block()
+    env = {**os.environ, "GENESIS_DB_PATH": str(db), "GENESIS_FIRST_PROJECTION_WAIT_S": "0"}
+    assert subprocess.run([sys.executable, "-c", script], env=env, timeout=60).returncode == 1
+    assert not db.exists()
+
+
+def test_the_first_projection_wait_reports_an_unusable_interpreter_apart(tmp_path):
+    """An interpreter that cannot import genesis exits 2, which install.sh reports
+    as a failed readiness check, not as a database that was not ready."""
+    import os
+    import subprocess
+    import sys
+
+    _, script = _first_projection_block()
+    env = {**os.environ, "GENESIS_DB_PATH": str(tmp_path / "x.db"), "GENESIS_FIRST_PROJECTION_WAIT_S": "0"}
+    # -I -S: no PYTHONPATH and no site-packages, so genesis is not importable.
+    rc = subprocess.run([sys.executable, "-I", "-S", "-c", script], env=env, cwd=tmp_path, timeout=60).returncode
+    assert rc == 2
+    assert '"$_first_proj_rc" -eq 1' in _INSTALL_SH.read_text()

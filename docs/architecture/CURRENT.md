@@ -337,12 +337,13 @@ or `GENESIS_FALKORDB_SWITCH=1` asks for it (on a running install through
 `update.sh --take-template genesis-falkordb.service`, since bootstrap refuses
 under a live server; then restart the unit).
 The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
-(`memory/graphstore_project.py`); that schedule is its staleness bound. The
-timer also runs once 5 minutes after it starts (`OnActiveSec`), because
+(`memory/graphstore_project.py`); that schedule is its staleness bound. Because
 `install.sh` starts the engine before genesis-server has created the database
-(bootstrap seeds it first). That run wins the race only when the server's
-first start takes under about 5 minutes; otherwise the next hourly run
-projects. The graph-engine probe membership is decided at server start, so a
+(bootstrap seeds it first), `install.sh` projects once after it starts the
+server, when the engine is active: it waits up to 120 s for the two tables
+the projector reads, then starts `genesis-graph-project.service`; a timeout
+leaves it to the hourly run. The graph-engine probe membership is decided at
+server start, so a
 `mode` change made live joins or leaves the critical-failure probes at the
 next restart. The
 engine keeps no data on disk, so its unit also (re)starts the projector on

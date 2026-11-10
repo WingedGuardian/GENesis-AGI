@@ -1607,6 +1607,58 @@ if [ -f "$SYSTEMD_USER_DIR/genesis-server.service" ]; then
     fi
 fi
 
+# First graph projection. This script starts the graph engine before
+# genesis-server has created the memory database, so the engine's own
+# start-time projection found nothing to read. Once the server runs, wait
+# (bounded) for the two tables the projector reads, then project once; the
+# server creates the database file before its tables, so the file existing is
+# not enough. A timeout or a failed start is a NOTE: the hourly timer projects.
+if [ -f "$SYSTEMD_USER_DIR/genesis-graph-project.service" ] \
+    && systemctl --user is-active --quiet genesis-server 2>/dev/null \
+    && systemctl --user is-active --quiet genesis-falkordb 2>/dev/null; then
+    _first_proj_rc=0
+    "$VENV_PATH/bin/python" - <<'PY' 2>/dev/null || _first_proj_rc=$?
+import os
+import sqlite3
+import sys
+import time
+from urllib.parse import quote
+
+try:
+    from genesis.env import genesis_db_path
+except Exception:
+    sys.exit(2)
+
+uri = "file:" + quote(str(genesis_db_path()), safe="/") + "?mode=ro"
+deadline = time.monotonic() + float(os.environ.get("GENESIS_FIRST_PROJECTION_WAIT_S", "120"))
+while True:
+    try:
+        con = sqlite3.connect(uri, uri=True, timeout=2)
+        try:
+            con.execute("SELECT 1 FROM memory_links LIMIT 0")
+            con.execute("SELECT 1 FROM memory_metadata LIMIT 0")
+            sys.exit(0)
+        finally:
+            con.close()
+    except sqlite3.Error:
+        pass
+    if time.monotonic() >= deadline:
+        sys.exit(1)
+    time.sleep(2)
+PY
+    if [ "$_first_proj_rc" -eq 0 ]; then
+        if systemctl --user start --no-block genesis-graph-project.service 2>/dev/null; then
+            echo "    + first graph projection started"
+        else
+            echo "    NOTE: could not start the first graph projection; the hourly run will project"
+        fi
+    elif [ "$_first_proj_rc" -eq 1 ]; then
+        echo "    NOTE: the memory database was not ready in time; the hourly graph projection will run instead"
+    else
+        echo "    NOTE: could not run the database readiness check (exit $_first_proj_rc); the hourly graph projection will run instead"
+    fi
+fi
+
 # --- Memory resilience (systemd-oomd pressure-kill + swap invariant + PID ceiling) ---
 # Fresh-install parity with bootstrap.sh/update.sh: without this block a fresh
 # container install sat unprotected against the OOM-thrash / fork-exhaustion
