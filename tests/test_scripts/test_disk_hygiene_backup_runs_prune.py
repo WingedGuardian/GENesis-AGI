@@ -260,3 +260,24 @@ def test_a_dismissed_unreadable_report_is_pruned_at_ninety_days(tmp_path):
     _age(d, 120)
     r = _prune_main(root)
     assert not d.exists(), r.stdout
+
+
+def test_a_restore_run_named_for_its_report_lives_as_long_as_the_report(tmp_path):
+    """#4011: a run folder carries its report's ts, so it is kept while that
+    report's folder exists (the report itself is kept while unresolved), and
+    pruned as before once the report is gone."""
+    root = tmp_path / "home" / ".genesis" / "deploy-backups"
+    ts = _TS[: -len("-live-move-repair")]
+    report = _report(root, _TS, 10, {"repo": "/x", "paths": [_FOREIGN]})
+    run = root / f"20260102T000000Z-77-{ts}-live-move-restore"
+    orphan = root / "20260102T000000Z-78-20250101T000000Z-1-live-move-restore"
+    for d in (run, orphan):
+        (d / "aside").mkdir(parents=True)
+        (d / "aside" / "a.txt").write_text("newer content a held restore did not write\n")
+        _age(d / "aside" / "a.txt", 120)
+        _age(d / "aside", 120)
+        _age(d, 120)
+    r = _prune_main(root)
+    assert run.exists() and report.exists(), r.stdout
+    assert f"keeping {run} (a restore run of the report {_TS}, kept while it is)" in r.stdout
+    assert not orphan.exists(), "a run whose report is gone prunes as before"

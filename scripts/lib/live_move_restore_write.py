@@ -11,6 +11,7 @@ import errno
 import hashlib
 import json
 import os
+import shutil
 import signal
 import stat
 import time
@@ -186,6 +187,7 @@ class _Writer:
             _step("post-judge")
             self._post()
             self._finish()
+            self._drop_unused_run()
         except _Stop as exc:
             self._report()
             self.say(str(exc))
@@ -219,11 +221,12 @@ class _Writer:
             ) from None
 
     def _run(self) -> str:
-        """The run folder, made at the first write (review NOTE-2), 0700."""
+        """The run folder, made at the first write (review NOTE-2), 0700, named
+        for this report's ts too (#4011), so every later run finds it."""
         if self.run_name is None:
             name = (
                 time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-                + f"-{os.getpid()}{self.chk.RUN_SUFFIX}"
+                + f"-{os.getpid()}-{self.ctx.ts}{self.chk.RUN_SUFFIX}"
             )
             try:
                 os.mkdir(name, 0o700, dir_fd=self.ctx.bfd)
@@ -631,6 +634,23 @@ class _Writer:
             if check and again.get(key) != "already-restored":
                 self._refuse(*key, "post-check", f"the judge now reads {again.get(key, 'nothing')}")
 
+    def _drop_unused_run(self) -> None:
+        """A run folder holding no aside and no index-before.txt keeps nothing
+        a later run or a person needs: only staging, put in or refused, whose
+        source is the report's own copy. It is removed, so refused reruns never
+        pile folders up against RUNS_CAP (#4025 review SF-6)."""
+        if self.run_fd is None:
+            return
+        try:
+            if set(os.listdir(self.run_fd)) - {"new"}:
+                return
+            if "new" in os.listdir(self.run_fd):
+                shutil.rmtree("new", dir_fd=self.run_fd)
+            os.rmdir(self.run_name, dir_fd=self.ctx.bfd)
+        except OSError:
+            return  # kept: a folder it cannot judge or remove stays for the next run
+        self.run_name = None
+
     def _finish(self) -> None:
         """restored_at only when nothing was refused (review SF-4); a re-run
         that changes nothing writes nothing. The in-flight record is cleared
@@ -668,7 +688,7 @@ class _Writer:
             )
         if self.run_name:
             folder = os.path.join(self.ctx.shown, self.run_name)
-            say(f"What the restore replaced is in {folder}, pruned 90 days after its last write.")
+            say(f"What the restore replaced is in {folder}, kept while its report is.")
         if self.extras:
             named = ", ".join(json.dumps(q) for q in self.extras[:50])
             say(f"Moved aside with their directory (git ignores them): {named}")

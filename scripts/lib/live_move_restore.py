@@ -120,6 +120,7 @@ _Whole = runs._Whole
 _mine = runs._mine
 _anchor = runs._anchor
 _origin = runs._origin
+aside_parts, run_ts, RUNS_CAP = runs.aside_parts, runs.run_ts, runs.RUNS_CAP
 
 
 class _Paths:
@@ -250,7 +251,10 @@ class Judge:
         self.complete = complete
         self.fds = () if fd is None else (fd,)
         self.record_keys = sorted(self.records)  # _dir's per-row range, by bisect
-        block = restore_block(report)
+        # The report's ts (its folder name): its restore runs carry it (#4011).
+        self.ts = rp.report_ts(os.path.basename(os.path.normpath(backup)))
+        self.runs_budget = _Budget(rp)  # runs.aside_parts' reads of every run's aside
+        block = restore_block(report, self.ts)
         self.inflight = block["inflight"] if block else None
         self.notes, self.dirs, self.entry_of, self.resumed = {}, {}, {}, None
         self.held = None  # the unresolved in-flight aside, shown (set by _judged)
@@ -934,6 +938,10 @@ def _judged(rp, repo: str, ctx, say, write: bool, nothing: str):
                 parts[n] = (p, k, INFLIGHT_UNRESOLVED)
                 judge.notes[(p, k)] = unresolved_note(where)
     judge.held = where
+    try:
+        parts += aside_parts(judge)
+    except _Whole as exc:
+        return str(exc)
     if not write and not where:  # held, the writer makes no index call, sets no flag
         parts = as_the_writer_would(rp, judge, parts)
     return judge, parts, loaded, ctx
