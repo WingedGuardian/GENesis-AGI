@@ -213,7 +213,7 @@ class _FakeAdapter:
         self.calls.append("shutdown")
 
 
-@pytest.mark.parametrize("state", ["missing", "unreadable", "present"])
+@pytest.mark.parametrize("state", ["missing", "unreadable", "undecodable", "present"])
 def test_serve_fails_closed_when_the_file_is_missing_after_the_restore(
     state, tmp_path, monkeypatch
 ):
@@ -236,6 +236,8 @@ def test_serve_fails_closed_when_the_file_is_missing_after_the_restore(
     path = tmp_path / "secrets.env"
     if state != "missing":
         path.write_text("OTHER=1\n")
+    if state == "undecodable":
+        path.write_bytes(b"OTHER=\xff\n")
     if state == "unreadable":
         path.chmod(0)
     monkeypatch.setattr(standalone, "StandaloneAdapter", factory)
@@ -258,6 +260,9 @@ def test_unloadable_secrets_file_names_a_missing_or_unreadable_file(tmp_path, mo
     assert startup.unloadable_secrets_file() == path
     path.write_text("OTHER=1\n")
     assert startup.unloadable_secrets_file() is None
+    path.write_bytes(b"DASHBOARD_PASSWORD=x\nOTHER=\xff\n")  # not UTF-8: loads no keys
+    assert startup.unloadable_secrets_file() == path
+    path.write_text("OTHER=1\n")
     if os.geteuid() != 0:  # root reads a mode-000 file anyway
         path.chmod(0)
         try:
@@ -521,3 +526,32 @@ def test_ordinary_genesis_words_stay_quiet_from_the_checkout(tmp_path, monkeypat
     (checkout / "genesis").mkdir(parents=True)
     monkeypatch.chdir(checkout)
     assert not _guard(monkeypatch).touches_secrets(command=command)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(b"", id="empty"),
+        pytest.param(b"# only a comment\n", id="no-keys"),
+        pytest.param(b"A=1\nDASHBOARD_PASSWORD=a\x00b\nC=3\n", id="nul-byte"),
+        pytest.param(b"\xef\xbb\xbfDASHBOARD_PASSWORD=x\nB=2\n", id="byte-order-mark"),
+        pytest.param(b'DASHBOARD_PASSWORD="abc\nB=2\n', id="unterminated-quote"),
+        pytest.param(b"!!! not an assignment\nB=2\n", id="unparseable-line"),
+        pytest.param(b"OTHER=\xff\n", id="not-utf8"),
+    ],
+)
+def test_a_present_file_whose_keys_cannot_load_is_unloadable(content, tmp_path, monkeypatch):
+    # Each of these is present and readable yet loads no password through the
+    # server's own loader, so the server must refuse to serve on it.
+    path = tmp_path / "secrets.env"
+    path.write_bytes(content)
+    monkeypatch.setattr(env, "secrets_path", lambda: path)
+    assert startup.unloadable_secrets_file() == path
+
+
+def test_the_shipped_template_is_loadable(tmp_path, monkeypatch):
+    # A fresh install's file is a copy of the template; it must pass the check.
+    path = tmp_path / "secrets.env"
+    path.write_bytes((REPO / "secrets.env.example").read_bytes())
+    monkeypatch.setattr(env, "secrets_path", lambda: path)
+    assert startup.unloadable_secrets_file() is None
