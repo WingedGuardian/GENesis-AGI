@@ -240,8 +240,10 @@ async def test_ingest_classified_extraction(db_with_schema, mock_store):
     assert row[0] == "reference"
     assert row[1] == "reference.credentials"
     assert row[2] == "HobbyForum"
-    assert "ForumUser42" in row[3]  # the login stays searchable
-    assert "Passw0rd!x9z" not in row[3]  # the password is held out (#2426)
+    # The description and the value are held out together (#2426): the body
+    # carries the identifier, the placeholders and the trailer only.
+    assert "Passw0rd!x9z" not in row[3]
+    assert "[description held in the reference secret store]" in row[3]
     assert "reference.credentials" in row[3]  # header salt
     assert "credentials" in row[4]
     assert "reference" in row[4]

@@ -5,10 +5,8 @@ A. A credential write never reuses a vector point, and a point a write created
    point a unit names and no refused write leaves a recallable orphan.
 B. A reader returns a body and a value of the same write, even when the unit
    was repointed after its row was read.
-C. The hold-out scrubs with the stored secret when a re-ingest carries only the
-   placeholder, an identifier label exempts only its own first token, and a
-   postcondition independent of the parser refuses a write whose indexed
-   fields still carry the value.
+(C, the description scrub, was replaced: the description is now held out with
+the value; see test_reference_description_held.py.)
 
 Fake credentials and example.org hosts only, never real secrets.
 """
@@ -16,7 +14,6 @@ Fake credentials and example.org hosts only, never real secrets.
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from types import SimpleNamespace
 
@@ -176,7 +173,7 @@ async def test_a_credential_never_reuses_and_never_deletes_a_plain_memory(db, mo
     credential gets a point of its own, and its refusal deletes only that one."""
     store = _PointStore()
     body = _body("Example portal login", "password: Plain!Fake6")
-    held, _, _, _ = ro.split_secret(body)
+    held = ro.split_secret(body).body
     plain_id, _ = await store.store_reporting_creation(held, "elsewhere")
 
     async def _refuse(*_a, **_k):
@@ -254,137 +251,14 @@ async def test_control_no_repoint_composes_the_rows_own_pair(db):
 async def test_get_reference_pair_reads_body_and_value_together(db):
     store = _PointStore()
     unit = await _ingest(db, store, _body("Example portal login", "password: Pair!Fake9"))
-    body, value = await kc.get_reference_pair(db, unit)
+    body, value, detail = await kc.get_reference_pair(db, unit)
     assert ro.SECRET_PLACEHOLDER in body
     assert value == "password: Pair!Fake9"
+    assert detail == "Example portal login"
     assert await kc.get_reference_pair(db, "no-such-unit") is None
 
 
 # ─── C: the hold-out uses the stored secret and checks its own result ───────
-
-
-@pytest.mark.parametrize(
-    "value",
-    [
-        "user: admin password: Shape!Fake10",
-        "username=admin password=Shape!Fake10",
-        "email: ops@example.org pass Shape!Fake10",
-    ],
-)
-def test_an_identifier_label_exempts_only_its_own_first_token(value):
-    """4521822679: what follows the identifier in the segment is scanned too."""
-    assert "Shape!Fake10" in ro.secret_fragments(value)
-    held, _, tags, concept = ro.split_secret(
-        _body("sign in with Shape!Fake10", value),
-        json.dumps(["portal", "Shape!Fake10"]),
-        "portal Shape!Fake10",
-    )
-    for text in (held, tags, concept):
-        assert "Shape!Fake10" not in text
-
-
-def test_the_identifier_itself_stays_searchable():
-    held, _, _, _ = ro.split_secret(
-        _body("portal user example-admin", "user: example-admin password: Ident!Fake11")
-    )
-    assert "portal user example-admin" in held
-
-
-async def test_a_placeholder_re_ingest_scrubs_with_the_stored_secret(db):
-    """4521795647: a re-ingest carrying only the placeholder whose description,
-    tags, trailer and authority repeat the stored password indexes none of it."""
-    store = _PointStore()
-    stored = "user: example-admin, password: Stored!Fake12"
-    unit = await _ingest(db, store, _body("Example portal login", stored))
-    held = _body(
-        "rotated note: Stored!Fake12",
-        ro.SECRET_PLACEHOLDER,
-        tags=["portal", "Stored!Fake12"],
-    )
-    again = await _ingest(
-        db,
-        store,
-        held,
-        tags_json=json.dumps(["portal", "Stored!Fake12"]),
-        authority="note Stored!Fake12",
-        provenance={"source_doc": "doc Stored!Fake12"},
-    )
-    assert again == unit
-    row = await kc.get(db, unit)
-    fts = await db.execute_fetchall(
-        "SELECT body, tags FROM knowledge_fts WHERE unit_id = ?", (unit,)
-    )
-    payload = store.calls[-1]
-    for text in (
-        row["body"],
-        row["tags"],
-        row["concept"],
-        row["source_doc"],
-        fts[0][0],
-        fts[0][1],
-        payload["content"],
-        json.dumps(payload["tags"]),
-    ):
-        assert "Stored!Fake12" not in text, text
-    assert await kc.get_reference_secret(db, unit) == stored
-
-
-def test_split_secret_scrubs_a_placeholder_body_with_the_stored_value():
-    held, value, tags, concept = ro.split_secret(
-        _body("note Stored!Fake13", ro.SECRET_PLACEHOLDER),
-        json.dumps(["Stored!Fake13"]),
-        "portal Stored!Fake13",
-        stored_value="password: Stored!Fake13",
-    )
-    assert value is None
-    for text in (held, tags, concept):
-        assert "Stored!Fake13" not in text
-    assert f"Value: {ro.SECRET_PLACEHOLDER}" in held
-
-
-@pytest.mark.parametrize(
-    ("field", "kwargs", "description"),
-    [
-        ("body", {}, "sign in with Missed!Fake14"),
-        ("tags", {"tags_json": json.dumps(["Missed!Fake14"])}, "Example portal login"),
-        ("authority", {"authority": "via Missed!Fake14"}, "Example portal login"),
-        ("provenance", {"provenance": {"platform": "Missed!Fake14"}}, "Example portal login"),
-    ],
-)
-async def test_the_postcondition_refuses_what_the_parser_missed(
-    db,
-    monkeypatch,
-    field,
-    kwargs,
-    description,
-):
-    """With the parser blinded (no fragments), the value still in an indexed
-    field refuses the write before any store is touched; the message names the
-    field, never the value."""
-    monkeypatch.setattr(
-        ro,
-        "_fragments",
-        lambda _v: ro._Fragments([], frozenset(), frozenset()),
-    )
-    store = _PointStore()
-    with pytest.raises(ValueError, match=field) as refused:
-        await _ingest(db, store, _body(description, "password: Missed!Fake14"), **kwargs)
-    assert "Missed!Fake14" not in str(refused.value)
-    assert store.calls == []
-    assert store.points == {}
-    for table in ("knowledge_units", "knowledge_fts", "reference_secrets"):
-        assert await db.execute_fetchall(f"SELECT 1 FROM {table}") == []  # noqa: S608
-
-
-async def test_the_postcondition_lets_an_identifier_through(db):
-    """No false refusal: a description naming the login is not a leak."""
-    store = _PointStore()
-    unit = await _ingest(
-        db,
-        store,
-        _body("portal user example-admin", "user: example-admin, password: Ok!Fake15"),
-    )
-    assert "example-admin" in (await kc.get(db, unit))["body"]
 
 
 # ─── security review: identifier positions, query secrets, normalisation ────
@@ -399,48 +273,3 @@ _IDENTIFIER_POSITION_SHAPES = [
 ]
 
 
-@pytest.mark.parametrize(("value", "secret"), _IDENTIFIER_POSITION_SHAPES)
-def test_a_secret_in_an_identifier_position_is_held(value, secret):
-    held, _, tags, _ = ro.split_secret(
-        _body(f"sign in with {secret}", value), json.dumps([secret]),
-    )
-    assert secret not in held
-    assert secret not in tags
-
-
-@pytest.mark.parametrize(("value", "secret"), _IDENTIFIER_POSITION_SHAPES)
-async def test_the_postcondition_catches_an_identifier_position_secret(
-    db, monkeypatch, value, secret,
-):
-    monkeypatch.setattr(ro, "_fragments", lambda _v: ro._Fragments([], frozenset(), frozenset()))
-    store = _PointStore()
-    with pytest.raises(ValueError, match="body"):
-        await _ingest(db, store, _body(f"sign in with {secret}", value))
-    assert store.points == {}
-
-
-@pytest.mark.parametrize(
-    "variant",
-    [
-        "Ｎｏｒｍ！Ｆａｋｅ２２",  # fullwidth
-        "Norm!­Fake22",  # soft hyphen inserted
-        "Norm!Fa​ke22",  # zero-width space inserted
-    ],
-)
-async def test_the_postcondition_matches_normalised_text(db, variant):
-    """A fullwidth, soft-hyphenated or zero-width-split repeat of the password
-    is the password: the write is refused rather than indexed."""
-    store = _PointStore()
-    with pytest.raises(ValueError, match="body"):
-        await _ingest(db, store, _body(f"sign in with {variant}", "password: Norm!Fake22"))
-    assert store.points == {}
-
-
-@pytest.mark.parametrize(
-    "value",
-    ["ForumUser42 / Pair!Fake23", "login: ForumUser42, password: Pair!Fake23"],
-)
-async def test_a_plain_login_in_an_identifier_position_stays_searchable(db, value):
-    store = _PointStore()
-    unit = await _ingest(db, store, _body("forum login ForumUser42", value))
-    assert "forum login ForumUser42" in (await kc.get(db, unit))["body"]

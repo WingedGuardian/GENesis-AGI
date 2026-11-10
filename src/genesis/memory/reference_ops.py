@@ -33,17 +33,18 @@ leaking an unparsed secret into a non-reveal payload.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import unicodedata
 from typing import TYPE_CHECKING, Any, NamedTuple
+from urllib.parse import unquote
 
 from genesis.db.crud.knowledge import CREDENTIAL_DOMAIN as _CREDENTIAL_DOMAIN
+from genesis.db.crud.knowledge import DETAIL_PLACEHOLDER as _CRUD_DETAIL_PLACEHOLDER
 from genesis.db.crud.knowledge import SECRET_PLACEHOLDER as _CRUD_PLACEHOLDER
 from genesis.db.crud.knowledge import (
     get_reference_pair,
-    get_secret,
+    get_secret_row,
     holds_secret,  # noqa: F401 - one rule, shared with the db layer
 )
 
@@ -113,56 +114,40 @@ def parse_reference_body(body: str | None) -> dict[str, str]:
     return {"description": description, "value": value}
 
 
-# ─── Credential values live outside the indexed body (#2426) ──────────────────
+
+# ─── Credential values and descriptions live outside the indexed body (#2426) ─
 #
 # A credential's VALUE is the one part of a reference no recall surface needs:
-# lookup goes by identifier and description, and leaving the value out of the
-# indexed text does not cost identifier recall on either the vector or the
-# keyword path. Every store that indexes a body
-# (knowledge_units + knowledge_fts, memory_fts, the Qdrant payload and its
-# embedding) therefore gets the body with the value replaced by
-# SECRET_PLACEHOLDER, and the value goes to ``reference_secrets``, a table no
-# recall path reads. ``resolve_value`` is its only reader.
+# lookup goes by identifier, and leaving the value out of the indexed text does
+# not cost identifier recall on either the vector or the keyword path. Its
+# free-text DESCRIPTION is held out WITH it: a description can repeat the value
+# in any spelling or position, and no parser scrubs free text of it reliably
+# (owner ruling, every review round found another way through). Every store
+# that indexes a body (knowledge_units + knowledge_fts, memory_fts, the Qdrant
+# payload and its embedding) therefore gets only the header (the identifier),
+# DETAIL_PLACEHOLDER, the SECRET_PLACEHOLDER value line and the Tags/Captured
+# trailer. The value and the description go to ONE ``reference_secrets`` row
+# (``value``, ``detail``), a table no recall path reads. The other indexed
+# fields (identifier, tags, authority, provenance) are not scrubbed: a write
+# whose field carries the value is refused (``refuse_value_in_fields``).
 
 #: Domains whose value is held out. Identifier kinds (url, network, account,
 #: fact) are not: their value is the thing a lookup searches for.
 SECRET_DOMAINS = frozenset({_CREDENTIAL_DOMAIN})
-# The placeholder lives with the db layer's fail-closed check (crud/knowledge.py).
+# The placeholders live with the db layer's fail-closed check (crud/knowledge.py).
 SECRET_PLACEHOLDER = _CRUD_PLACEHOLDER
-#: What a fragment of the value reads as wherever else the body repeated it.
-REDACTED = "[redacted]"
+DETAIL_PLACEHOLDER = _CRUD_DETAIL_PLACEHOLDER
 
-# A labelled segment inside a credential value (a label, a colon, a value) whose label names an
-# IDENTIFIER stays searchable; every other segment counts as secret.
-_IDENTIFIER_LABELS = frozenset({
-    "user", "username", "login", "email", "account", "userprofile", "host", "url",
-})
-_SEGMENT_SPLIT = re.compile(r"[,;]\s*|\s+/\s+|\s+\|\s+")
-_LABELLED = re.compile(r"^([A-Za-z _-]{1,20})[:=]\s*(.+)$")
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-#: The password in a URL's userinfo (a scheme and "://", then the user, a
-#: colon, the password and an at-sign before the host): the shape a connection
-#: string carries its secret in. Shared with ``reference_extraction``.
-URL_USERINFO_PATTERN = re.compile(
-    # The scheme is bounded: an unbounded one scans quadratically on a long run
-    # of scheme characters with no "://" after it.
-    # The password runs to the LAST at-sign before the host, so one that carries
-    # an unencoded at-sign is held whole.
-    r"\b[A-Za-z][A-Za-z0-9+.\-]{0,31}://(?P<user>[^\s/:@]*):(?P<pw>[^\s/]+)@",
-)
-# Shorter fragments are left alone: an unlabelled 5-character token is as often
-# an ordinary word ("admin") as a secret, and scrubbing it would redact prose.
-# A secret shorter than this that is secret by its LABEL is still held out, but
-# only where it stands as a word (see ``scrub``).
-_MIN_LABELLED = 4
-_MIN_UNLABELLED = 6
+_MIN_TOKEN = 4
+_TOKEN_EDGE = ".,;:!?()[]{}\"'"  # noqa: S105 - punctuation, not a secret
 
 
 def _secret_token(token: str) -> bool:
     """A whitespace token that reads as a secret rather than a word: at least
     four characters, letters or digits mixed with a digit or a symbol. Plain
-    words ("password", "Router") never qualify, so prose is not redacted."""
-    if len(token) < _MIN_LABELLED or _EMAIL.match(token):
+    words ("password", "Router") and email addresses never qualify."""
+    if len(token) < _MIN_TOKEN or _EMAIL.match(token):
         return False
     has_digit = any(c.isdigit() for c in token)
     has_symbol = any(not c.isalnum() for c in token)
@@ -170,284 +155,103 @@ def _secret_token(token: str) -> bool:
     return (has_digit or has_symbol) and (has_alpha or (has_digit and has_symbol))
 
 
-#: Punctuation an identifier (a login, a handle, an email) ordinarily carries.
-_IDENTIFIER_PUNCT = frozenset("-_.@+")
+def _normalise(text: str) -> str:
+    """``text`` as the refusal check compares it: NFKC (a fullwidth or other
+    compatibility variant reads as its plain form), every format character
+    (Unicode category Cf: zero-width spaces and joiners, the soft hyphen)
+    removed, then casefolded."""
+    folded = unicodedata.normalize("NFKC", text)
+    return "".join(c for c in folded if unicodedata.category(c) != "Cf").casefold()
 
 
-def secret_shaped_identifier(token: str) -> bool:
-    """True when a token in an IDENTIFIER position (after ``user:``/``login:``,
-    or the first part of "login / secret") looks like a secret, so it is held
-    and probed rather than exempted: a secret-shaped token carrying punctuation
-    no login carries ("Leak!Fake20"), or a long run of mixed letters and digits
-    (an API key). A login such as "example-admin" or "ForumUser42" is not one,
-    and neither is an email or a URL (a URL's own secrets are held through its
-    userinfo and its query parameters)."""
-    if not _secret_token(token) or "://" in token:
-        return False
-    if any(not c.isalnum() and c not in _IDENTIFIER_PUNCT for c in token):
-        return True
-    has_digit = any(c.isdigit() for c in token)
-    has_alpha = any(c.isalpha() for c in token)
-    return len(token) >= 16 and has_digit and has_alpha
+def _decoded(text: str) -> set[str]:
+    """``text`` and its percent-decoded forms, up to three rounds."""
+    forms = {text}
+    for _ in range(3):
+        text = unquote(text)
+        forms.add(text)
+    return forms
 
 
-#: A URL query parameter whose key names a secret; its value is held out
-#: wherever the URL appears, an identifier label or not.
-URL_SECRET_PARAM = re.compile(
-    r"(?i)[?&;](?:token|key|api_key|apikey|secret|password|sig|access_token)=(?P<v>[^&#;\s]+)",
-)
-
-
-def secret_fragments(value: str) -> list[str]:
-    """The parts of ``value`` that must appear nowhere else in the body, longest
-    first: the whole value, each segment that is not an identifier, and every
-    secret-looking token inside them.
-
-    A credential body often repeats a segment of its value in the description
-    or tags, most often the one labelled ``password``, and rarely the whole
-    value, so holding out only the ``Value:`` line is not enough. Tokens count too, because a
-    prose value ("log in as x with password y") is one segment whose repeat in
-    the description is usually just the password.
-    """
-    return _fragments(value).all
-
-
-class _Fragments(NamedTuple):
-    #: Every fragment, longest first.
-    all: list[str]
-    #: Secret BY LABEL or by position: redacted even glued to other text.
-    glued: frozenset[str]
-    #: Too short to redact inside other text (a 1-3 character labelled secret,
-    #: a 1-character pair secret): redacted only where it stands as a word.
-    bounded: frozenset[str]
-
-
-def _secret_label(match: re.Match[str] | None) -> tuple[str, str] | None:
-    """(label, value) of a ``label: value`` match whose label names a SECRET, or
-    None. An identifier label (``user``, ``email``) is no secret, whatever its
-    value looks like; a URL scheme (``postgres://...``) is not a label at all."""
-    if match is None:
-        return None
-    label, rhs = match.group(1).strip().lower(), match.group(2).strip()
-    if label in _IDENTIFIER_LABELS or rhs.startswith("//"):
-        return None
-    return label, rhs
-
-
-_QUOTE_CHARS = "\"'`"
-
-
-def _strip_quotes(text: str) -> str:
-    """``text`` without the matched quote pairs around it."""
-    text = text.strip()
-    while len(text) > 1 and text[0] in _QUOTE_CHARS and text[-1] == text[0]:
-        text = text[1:-1].strip()
-    return text
-
-
-def _fragments(value: str) -> _Fragments:
+def _value_probes(value: str, *, login_exempt: bool = False) -> list[tuple[str, bool]]:
+    """(probe, whole-word only) for the refusal check: the whole value and every
+    secret-shaped token of it, each with its percent-decoded forms, normalised.
+    A whole value that is all letters or shorter than four characters counts
+    only as a whole word, so an ordinary word inside another is no match."""
     whole = value.strip()
-    fragments = {whole} if whole else set()
-    glued: set[str] = set()
-    bounded: set[str] = set()
-    if whole and len(whole) < _MIN_LABELLED:
-        bounded.add(whole)
-
-    def _hold_short(secret: str) -> None:
-        fragments.add(secret)
-        bounded.add(secret)
-
-    # "login / secret" (a common value shape): by convention the
-    # first part is the login, an identifier the description legitimately
-    # names, and the second part is the secret, however short.
-    pair = [part.strip() for part in whole.split(" / ")] if whole.count(" / ") == 1 else []
-    login = None
-    if len(pair) == 2 and not any(_LABELLED.match(p) for p in pair):
-        # The first part is exempted as the login only when it does not look
-        # like a secret itself ("Leak!Fake21 / forumuser" is held whole).
-        login = None if secret_shaped_identifier(pair[0]) else pair[0]
-        if len(pair[1]) >= 2:
-            fragments.add(pair[1])
-            glued.add(pair[1])
-        elif pair[1]:
-            _hold_short(pair[1])
-    # A connection string's password, which sits inside the URL's userinfo with
-    # nothing around it to split on.
-    for userinfo in URL_USERINFO_PATTERN.finditer(value):
-        pw = userinfo.group("pw")
-        if len(pw) >= _MIN_LABELLED:
-            fragments.add(pw)
-            glued.add(pw)
-        else:
-            _hold_short(pw)
-    for param in URL_SECRET_PARAM.finditer(value):
-        if len(param.group("v")) >= _MIN_LABELLED:
-            fragments.add(param.group("v"))
-            glued.add(param.group("v"))
-        else:
-            _hold_short(param.group("v"))
-    held: list[tuple[str, bool]] = []  # (part, came from a secret label)
-    segments = [
-        segment for line in value.splitlines() for segment in _SEGMENT_SPLIT.split(line.strip())
-    ]
-    while segments:
-        segment = segments.pop(0).strip()
-        if not segment or segment == login:
+    probes: dict[str, bool] = {}
+    for form in _decoded(whole) if whole else ():
+        probes.setdefault(_normalise(form), form.isalpha() or len(form) < _MIN_TOKEN)
+    # "login / secret" is the shape the capture writers format: with
+    # ``login_exempt`` (the identifier only, which names the account) the
+    # exact login half is not probed. Every other field is probed with the
+    # tokens of both halves.
+    login, sep, secret = whole.partition(" / ")
+    exempt = login.strip().strip(_TOKEN_EDGE) if login_exempt and sep and secret.strip() else None
+    for raw in whole.split():
+        token = raw.strip(_TOKEN_EDGE)
+        if token == exempt:
             continue
-        match = _LABELLED.match(segment)
-        labelled = _secret_label(match)
-        if labelled:
-            # Email-shaped or not, a value under a SECRET label is secret,
-            # and its quotes are not part of it: a description repeating a
-            # quoted multi-word secret repeats it unquoted.
-            rhs = _strip_quotes(labelled[1])
-            if len(rhs) < _MIN_LABELLED:
-                _hold_short(rhs)
-                continue
-            held.append((rhs, True))
-        elif match and match.group(1).strip().lower() in _IDENTIFIER_LABELS:
-            # An identifier label exempts ONLY its own first token: whatever
-            # follows it in the segment (a second, secret label among them) is
-            # scanned again as a segment of its own, by the same rules. The
-            # first token itself is exempted only when it does not look like a
-            # secret (secret_shaped_identifier).
-            rest = match.group(2).strip().split(None, 1)
-            first = rest[0].strip(_TOKEN_EDGE) if rest else ""
-            if first and secret_shaped_identifier(first):
-                held.append((first, True))
-            if len(rest) == 2:
-                segments.insert(0, rest[1])
-        elif not _EMAIL.match(segment):
-            held.append((segment, False))
-    for part, labelled in held:
-        # A labelled secret is held whatever its shape; a short unlabelled
-        # segment ("admin") only through its secret-looking tokens.
-        if labelled or len(part) >= _MIN_UNLABELLED or _secret_token(part):
-            fragments.add(part)
-        if labelled:
-            # A labelled multi-word secret (a passphrase of several words) is
-            # secret word by word: a description repeating two of its words repeats it.
-            words = {w for w in part.split() if len(w) >= _MIN_LABELLED}
-            fragments.update(words)
-            glued.update(words | {part})
-        for token in part.split():
-            token = token.strip(".,;:!?()[]{}\"'")
-            if token != login and _secret_token(token):
-                fragments.add(token)
-            # Two label=value pairs on one line: the second pair is a token of
-            # the first's value, and its own value is just as secret.
-            inner = _secret_label(_LABELLED.match(token))
-            if inner and inner[1]:
-                if len(inner[1]) >= _MIN_LABELLED:
-                    fragments.add(inner[1])
-                else:
-                    _hold_short(inner[1])
-    fragments.discard("")
-    return _Fragments(
-        sorted(fragments, key=len, reverse=True),
-        frozenset(glued - {""}),
-        frozenset(bounded - {""}),
-    )
+        if _secret_token(token):
+            for form in _decoded(token):
+                probes.setdefault(_normalise(form), False)
+    probes.pop("", None)
+    return list(probes.items())
 
 
-# Case-insensitive throughout: a description that repeats the value in another
-# case (all capitals, say) repeats it all the same.
-def _bounded_sub(fragment: str, text: str) -> str:
-    return re.sub(
-        r"(?<![A-Za-z0-9])" + re.escape(fragment) + r"(?![A-Za-z0-9])", REDACTED, text,
-        flags=re.IGNORECASE,
-    )
+def refuse_value_in_fields(
+    value: str, fields: dict[str, str | None], *, message: str | None = None,
+    login_exempt: bool = False,
+) -> None:
+    """Fail closed: raise ValueError when the value, or any secret-shaped token
+    of it (in their normalised and percent-decoded forms), occurs in one of the
+    indexed ``fields``. Nothing is scrubbed. The message names the field, never
+    the value; ``message`` replaces it (the identifier refusal). The body's own
+    placeholder lines are no leak and are left out of the check."""
+    patterns = [
+        re.compile(
+            (r"(?<![^\W_])" + re.escape(probe) + r"(?![^\W_])") if as_word else re.escape(probe),
+        )
+        for probe, as_word in _value_probes(value, login_exempt=login_exempt)
+    ]
+    for name, text in fields.items():
+        if not text:
+            continue
+        held_out = text.replace(SECRET_PLACEHOLDER, "").replace(DETAIL_PLACEHOLDER, "")
+        haystacks = {_normalise(form) for form in _decoded(held_out)}
+        if any(pattern.search(h) for pattern in patterns for h in haystacks):
+            raise ValueError(
+                message or (
+                    f"refusing a credential reference whose {name} carries its "
+                    "value; keep the value out of that field (#2426)"
+                )
+            )
 
 
-def _glued_sub(fragment: str, text: str) -> str:
-    return re.sub(re.escape(fragment), REDACTED, text, flags=re.IGNORECASE)
+class HeldCredential(NamedTuple):
+    """What ``split_secret`` takes out of a credential body."""
+
+    #: The indexed body: header, DETAIL_PLACEHOLDER, the value placeholder line, trailer.
+    body: str
+    #: The value, or None when the body carried the value placeholder (a re-ingest).
+    value: str | None
+    #: The description, or None when the body carried DETAIL_PLACEHOLDER.
+    detail: str | None
 
 
-def scrub(
-    text: str,
-    fragments: list[str],
-    glued: frozenset[str] = frozenset(),
-    bounded: frozenset[str] = frozenset(),
-) -> str:
-    """``text`` with every fragment replaced by REDACTED, longest first.
+def split_secret(body: str) -> HeldCredential:
+    """Take the value and the free-text description out of a credential body.
 
-    A fragment carrying a digit or a symbol, or one in ``glued`` (secret by its
-    label, such as an all-letter password), is replaced wherever it occurs, even
-    glued to other text (run into the words on either side). Any other purely alphabetic
-    fragment is replaced only where it stands alone, because inside a longer word
-    ("active" in "inactive") it is that word. A fragment in ``bounded`` (too
-    short to be told apart from part of a word) is replaced only where it stands
-    alone, whatever it carries.
-    """
-    for fragment in fragments:
-        if fragment in bounded or (fragment.isalpha() and fragment not in glued):
-            text = _bounded_sub(fragment, text)
-        else:
-            text = _glued_sub(fragment, text)
-    return text
-
-
-def scrub_value(text: str, value: str) -> str:
-    """``text`` with every fragment of the credential ``value`` redacted, by the
-    rules ``split_secret`` applies to the body (for the free-text fields stored
-    beside it: the authority and the source names)."""
-    frags = _fragments(value)
-    return scrub(text, frags.all, frags.glued, frags.bounded)
-
-
-def _scrub_tag(tag: str, fragments: list[str], bounded: frozenset[str] = frozenset()) -> str:
-    # A tag is a label, not prose: any occurrence goes, even inside a longer
-    # word (a tag can carry a password that way),
-    # since over-redacting a tag costs nothing a lookup needs. A fragment too
-    # short to tell from part of a word goes only where it stands alone.
-    for fragment in fragments:
-        tag = _bounded_sub(fragment, tag) if fragment in bounded else _glued_sub(fragment, tag)
-    return tag
-
-
-def _scrub_tags(
-    tags_json: str | None, fragments: list[str], bounded: frozenset[str] = frozenset(),
-) -> str | None:
-    if not tags_json:
-        return tags_json
-    try:
-        tags = json.loads(tags_json)
-    except ValueError:
-        return _scrub_tag(tags_json, fragments, bounded)
-    if not isinstance(tags, list):
-        return _scrub_tag(tags_json, fragments, bounded)
-    return json.dumps(
-        [_scrub_tag(t, fragments, bounded) if isinstance(t, str) else t for t in tags]
-    )
-
-
-def split_secret(
-    body: str,
-    tags_json: str | None = None,
-    concept: str | None = None,
-    *,
-    stored_value: str | None = None,
-) -> tuple[str, str | None, str | None, str | None]:
-    """(body with the value held out, the value or None, tags scrubbed, concept
-    scrubbed).
-
-    The concept is the unit's identifier, indexed in knowledge_fts beside the
-    body; an extraction with no entities derives it from its own text, which can
-    carry the password, so it is scrubbed with the same fragments.
-
-    The value line becomes ``Value: SECRET_PLACEHOLDER``, and every fragment of
-    the value is redacted from the rest of the body and from the tags. A body
-    whose value already IS the placeholder (a re-ingest of a held-out body)
-    returns None for the value: there is nothing new to hold, and the secret
-    already stored stays; its value line is rewritten to the canonical
-    placeholder line, whatever spacing it arrived with, so the readers that
-    look for that exact line find it. Its description, trailer, tags and
-    concept are scrubbed with ``stored_value`` (the secret the key already
-    holds, which ``ingest_knowledge_unit`` reads) exactly as a supplied value
-    scrubs them, so a re-ingest repeating the stored password indexes none of
-    it. Raises ValueError, before anything is written, when the
-    value cannot be located or carries a payment card number: a credential whose
-    value cannot be found cannot be kept out of the index.
+    The body is ``[reference.credentials] {identifier}``, a blank line, the
+    description, a blank line, ``Value: {value}`` and the Tags/Captured trailer,
+    the layout every credential writer formats (the reference_store and
+    knowledge_ingest MCP tools, the extraction job, migrate_reference_data).
+    The returned body keeps the header line and the trailer, with
+    DETAIL_PLACEHOLDER where the description stood and the canonical value
+    placeholder line. A body that already carries a placeholder (a re-ingest of
+    a held body) returns None for that part, so the stored one stays. Raises
+    ValueError, before anything is written, when the value cannot be located or
+    a payment card number is in the value or the description.
     """
     from genesis.security.card_shapes import contains_card_number
 
@@ -465,128 +269,33 @@ def split_secret(
             "a credential reference must carry exactly one 'Value:' line; "
             "refusing a body whose description contains one too"
         )
-    trailer = _trailer(body[idx + len(_VALUE_MARKER):])
-    if value == SECRET_PLACEHOLDER:
-        if not stored_value:
-            return _held_body(body[:idx], trailer), None, tags_json, concept
-        held, tags_json, concept = _scrub_held(body[:idx], trailer, tags_json, concept, stored_value)
-        return held, None, tags_json, concept
-    if contains_card_number(value):
+    head = body[:idx]
+    header, _, description = head.partition("\n")
+    description = description.strip()
+    if contains_card_number(value) or contains_card_number(description):
         raise ValueError(
             "a credential reference carries a payment card number; cards are "
             "never stored as references"
         )
-    held, tags_json, concept = _scrub_held(body[:idx], trailer, tags_json, concept, value)
-    return held, value, tags_json, concept
-
-
-def _scrub_held(
-    head: str, trailer: list[str], tags_json: str | None, concept: str | None, value: str,
-) -> tuple[str, str | None, str | None]:
-    """(the canonical held body, tags, concept), every fragment of ``value``
-    redacted from the description, the trailer, the tags and the concept."""
-    frags = _fragments(value)
-    fragments, glued, bounded = frags.all, frags.glued, frags.bounded
-    trailer = [
-        _scrub_tag(line, fragments, bounded) if line.startswith("Tags: ")
-        else scrub(line, fragments, glued, bounded)
-        for line in trailer
-    ]
-    return (
-        _held_body(scrub(head, fragments, glued, bounded), trailer),
-        _scrub_tags(tags_json, fragments, bounded),
-        scrub(concept, fragments, glued, bounded) if concept is not None else None,
+    held = _held_body(
+        header + "\n\n" + DETAIL_PLACEHOLDER, _trailer(body[idx + len(_VALUE_MARKER):]),
+    )
+    return HeldCredential(
+        held,
+        None if value == SECRET_PLACEHOLDER else value,
+        None if description == DETAIL_PLACEHOLDER else description,
     )
 
 
-#: The labels whose value is an identifier, for ``assert_value_held_out``'s own
-#: reading of the raw value (independent of ``_fragments``).
-_IDENTIFIER_VALUE = re.compile(
-    r"(?i)(?<![A-Za-z])(?:" + "|".join(sorted(_IDENTIFIER_LABELS)) + r")\s*[:=]\s*(\S+)"
-)
-_TOKEN_EDGE = ".,;:!?()[]{}\"'"  # noqa: S105 - punctuation, not a secret
-
-
-def _leak_probes(value: str) -> list[tuple[str, bool]]:
-    """What must not survive anywhere indexed, each with whether it counts only
-    as a whole word: the raw value (a whole word when it is all letters or
-    shorter than four characters, the scrub's own boundary rule), and every
-    secret-shaped token of it, or the right side of a ``label=token`` pair,
-    other than an identifier (a token right after an identifier label, or the
-    login of a single "login / secret" pair) that is not itself secret-shaped
-    (``secret_shaped_identifier``), plus every URL userinfo password and
-    secret-keyed query value. Deliberately NOT ``_fragments``: this is the
-    check on that parser, so it shares none of its segmenting."""
-    whole = value.strip()
-    exempt = {
-        ident for m in _IDENTIFIER_VALUE.finditer(value)
-        if not secret_shaped_identifier(ident := m.group(1).strip(_TOKEN_EDGE))
-    }
-    pair = [p.strip() for p in whole.split(" / ")] if whole.count(" / ") == 1 else []
-    if (
-        len(pair) == 2
-        and not any(_LABELLED.match(p) for p in pair)
-        and not secret_shaped_identifier(pair[0])
-    ):
-        exempt.add(pair[0])
-    exempt = {_normalise(e) for e in exempt}
-    probes: dict[str, bool] = {}
-    if whole:
-        probes[whole] = whole.isalpha() or len(whole) < _MIN_LABELLED
-    for raw in whole.split():
-        token = raw.strip(_TOKEN_EDGE)
-        labelled = _LABELLED.match(token)
-        if labelled and not labelled.group(2).startswith("//"):
-            rhs = labelled.group(2).strip(_TOKEN_EDGE)
-            if labelled.group(1).strip().lower() in _IDENTIFIER_LABELS:
-                if secret_shaped_identifier(rhs):
-                    probes.setdefault(rhs, False)
-                continue  # "user=admin": an identifier, glued to its label
-            candidates = [token, rhs]
-        else:
-            candidates = [token]
-        for cand in candidates:
-            if _normalise(cand) not in exempt and _secret_token(cand):
-                probes.setdefault(cand, False)
-    for userinfo in URL_USERINFO_PATTERN.finditer(value):
-        if _secret_token(userinfo.group("pw")):
-            probes.setdefault(userinfo.group("pw"), False)
-    for param in URL_SECRET_PARAM.finditer(value):
-        v = param.group("v")
-        probes.setdefault(v, v.isalpha() or len(v) < _MIN_LABELLED)
-    return sorted(probes.items(), key=lambda item: len(item[0]), reverse=True)
-
-
-def _normalise(text: str) -> str:
-    """``text`` as the postcondition compares it: NFKC (a fullwidth or other
-    compatibility variant reads as its plain form), every format character
-    (Unicode category Cf: zero-width spaces and joiners, the soft hyphen)
-    removed, then casefolded."""
-    folded = unicodedata.normalize("NFKC", text)
-    return "".join(c for c in folded if unicodedata.category(c) != "Cf").casefold()
-
-
-def assert_value_held_out(value: str, fields: dict[str, str | None]) -> None:
-    """Fail closed after the scrub: raise ValueError when the raw ``value``, or
-    any secret-shaped token of it, still occurs (in any case) in one of the
-    indexed ``fields``. The message names the field, never the value. The body's
-    own placeholder line is no leak and is left out of the check."""
-    patterns = [
-        re.compile(
-            (r"(?<![^\W_])" + re.escape(norm) + r"(?![^\W_])") if as_word else re.escape(norm),
+def refuse_trailer_shaped_value(value: str) -> None:
+    """A value line starting like a body trailer (``Tags: ``, ``Captured: ``)
+    would be read back as trailer: the value truncated and its tail indexed.
+    Writers refuse such a value before formatting the body (#2426)."""
+    if any(line.startswith(_TRAILER_PREFIXES) for line in value.split("\n")[1:]):
+        raise ValueError(
+            "a credential value must not contain a line starting 'Tags: ' or "
+            "'Captured: '; refusing the write (#2426)"
         )
-        for probe, as_word in _leak_probes(value)
-        if (norm := _normalise(probe))
-    ]
-    for name, text in fields.items():
-        if not text:
-            continue
-        haystack = _normalise(text.replace(SECRET_PLACEHOLDER, ""))
-        if any(pattern.search(haystack) for pattern in patterns):
-            raise ValueError(
-                f"refusing a credential reference whose {name} still carries part "
-                "of its value after the hold-out (#2426)"
-            )
 
 
 def _trailer(after_marker: str) -> list[str]:
@@ -595,36 +304,56 @@ def _trailer(after_marker: str) -> list[str]:
     trailer: list[str] = []
     while lines and lines[-1].startswith(_TRAILER_PREFIXES):
         trailer.insert(0, lines.pop())
+    prefixes = [next(p for p in _TRAILER_PREFIXES if line.startswith(p)) for line in trailer]
+    if len(prefixes) != len(set(prefixes)):
+        # Writers emit each trailer line once; a repeated one means part of a
+        # multi-line value was read as trailer.
+        raise ValueError(
+            "a credential body repeats a 'Tags:' or 'Captured:' line; refusing "
+            "a value that cannot be split safely (#2426)"
+        )
     return trailer
 
 
 def _held_body(head: str, trailer: list[str], value: str = SECRET_PLACEHOLDER) -> str:
-    """The canonical body: the description, ONE value line, then the trailer."""
+    """The canonical body: the head, ONE value line, then the trailer."""
     body = head + _VALUE_MARKER + value
     return body + "\n" + "\n".join(trailer) if trailer else body
 
 
-async def _held_pair(db: aiosqlite.Connection, row: dict) -> tuple[str, str | None]:
-    """(body, value) of a held-out credential row, as ONE writer's pair.
+def _put_detail_back(head: str, detail: str | None) -> str:
+    """``head`` (header and description block) with a held-out description in
+    place of DETAIL_PLACEHOLDER; unchanged when it carries no placeholder (a
+    row written before the description was held out) or nothing is stored."""
+    header, sep, rest = head.partition("\n\n")
+    if detail is None or rest.strip() != DETAIL_PLACEHOLDER:
+        return head
+    return header + sep + detail
 
-    The value the row snapshot's ``secret_ref`` names is read first: secret rows
-    are never updated, so that value is the very one written beside the
-    snapshot's body. When the snapshot names no secret any more (the unit was
-    repointed since it was read, retiring the secret it named) or carries no
-    ``secret_ref`` at all, the unit's CURRENT body and value are read by one
-    statement (``get_reference_pair``); the current value is never put beside
-    the snapshot's stale body. The value is None when no secret is stored for
-    the unit (a partial restore, a hand edit), or the unit is gone.
+
+async def _held_pair(
+    db: aiosqlite.Connection, row: dict,
+) -> tuple[str, str | None, str | None]:
+    """(body, value, detail) of a held-out credential row, as ONE writer's set.
+
+    The secret row the snapshot's ``secret_ref`` names is read first: secret
+    rows are never updated, so its value and detail are the very ones written
+    beside the snapshot's body. When the snapshot names no secret any more (the
+    unit was repointed since it was read, retiring the secret it named) or
+    carries no ``secret_ref`` at all, the unit's CURRENT body, value and detail
+    are read by one statement (``get_reference_pair``); the current secret is
+    never put beside the snapshot's stale body. The value is None when no secret
+    is stored for the unit (a partial restore, a hand edit), or the unit is gone.
     """
     body = row.get("body") or ""
     if row.get("secret_ref"):
-        secret = await get_secret(db, row["secret_ref"])
+        secret = await get_secret_row(db, row["secret_ref"])
         if secret is not None:
-            return body, secret
+            return body, secret[0], secret[1]
     pair = await get_reference_pair(db, row["id"])
     if pair is None:
-        return body, None
-    return pair[0] or "", pair[1]
+        return body, None, None
+    return pair[0] or "", pair[1], pair[2]
 
 
 async def resolve_value(db: aiosqlite.Connection, row: dict) -> str | None:
@@ -638,30 +367,44 @@ async def resolve_value(db: aiosqlite.Connection, row: dict) -> str | None:
     credential names no stored secret, which only a partial restore or a hand
     edit can produce: logged as an error, never guessed at.
     """
-    value = parse_reference_body(row.get("body"))["value"]
-    if value != SECRET_PLACEHOLDER or not holds_secret(row.get("project_type"), row.get("domain")):
-        return value
-    body, secret = await _held_pair(db, row)
+    return (await reveal_reference(db, row))[0]
+
+
+async def reveal_reference(db: aiosqlite.Connection, row: dict) -> tuple[str | None, str]:
+    """(value, description) of a reference row: for a held-out credential both
+    come from one ``reference_secrets`` row (``_held_pair``); every other row
+    parses both from its body. The value is None when a held-out value is
+    missing (logged as an error)."""
+    parsed = parse_reference_body(row.get("body"))
+    if parsed["value"] != SECRET_PLACEHOLDER or not holds_secret(
+        row.get("project_type"), row.get("domain"),
+    ):
+        return parsed["value"], parsed["description"]
+    body, secret, detail = await _held_pair(db, row)
+    current = parse_reference_body(body)
     if secret is None:
-        current = parse_reference_body(body)["value"]
-        if current and current != SECRET_PLACEHOLDER:
+        if current["value"] and current["value"] != SECRET_PLACEHOLDER:
             # The unit's current body carries its value inline (a row written
             # before #2426): that body's own value, never a guess.
-            return current
+            return current["value"], current["description"]
         logger.error("reference %s holds its value out, but no secret is stored for it", row["id"])
-    return secret
+        return None, current["description"]
+    description = current["description"]
+    if detail is not None and description == DETAIL_PLACEHOLDER:
+        description = detail
+    return secret, description
 
 
 async def compose_body(db: aiosqlite.Connection, row: dict) -> tuple[str, bool]:
-    """(the row's body with a held-out value put back, whether it was missing).
+    """(the row's body with its held-out description and value put back,
+    whether the value was missing).
 
     For ``reference_lookup``, the one reader that returns a whole body. The
-    description stays as stored, so a fragment redacted there stays redacted.
-    The placeholder is recognised by the value it parses to (the rule
+    placeholder is recognised by the value it parses to (the rule
     ``resolve_value`` and ``split_secret`` use), not by one exact spelling of
-    its line, and the value goes back on a canonical value line. Body and value
-    are one write's pair (``_held_pair``): when the unit was repointed after
-    ``row`` was read, the CURRENT body comes back with the current value.
+    its line, and the value goes back on a canonical value line. Body, value and
+    description are one write's set (``_held_pair``): when the unit was
+    repointed after ``row`` was read, the CURRENT body comes back with them.
     """
     body = row.get("body") or ""
     idx = body.find(_VALUE_MARKER)
@@ -671,7 +414,7 @@ async def compose_body(db: aiosqlite.Connection, row: dict) -> tuple[str, bool]:
         or parse_reference_body(body)["value"] != SECRET_PLACEHOLDER
     ):
         return body, False
-    body, value = await _held_pair(db, row)
+    body, value, detail = await _held_pair(db, row)
     idx = body.find(_VALUE_MARKER)
     if idx == -1 or parse_reference_body(body)["value"] != SECRET_PLACEHOLDER:
         # The current body is not a held-out one (no marker, or a value inline):
@@ -680,7 +423,8 @@ async def compose_body(db: aiosqlite.Connection, row: dict) -> tuple[str, bool]:
     if value is None:
         logger.error("reference %s holds its value out, but no secret is stored for it", row["id"])
         return body, True
-    return _held_body(body[:idx], _trailer(body[idx + len(_VALUE_MARKER):]), value), False
+    head = _put_detail_back(body[:idx], detail)
+    return _held_body(head, _trailer(body[idx + len(_VALUE_MARKER):]), value), False
 
 
 async def delete_reference_entry(

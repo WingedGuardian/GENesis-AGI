@@ -2,8 +2,9 @@
 
 WHY THIS TABLE EXISTS. A credential reference's body is indexed by every
 recall surface (knowledge_units + knowledge_fts, memory_fts, the vector payload
-and its embedding). The value now lives here instead, and the body carries a
-placeholder line. ``memory/reference_ops.resolve_value`` is the only reader.
+and its embedding). The value now lives here instead, with the free-text
+description beside it (``detail``), and the body carries a placeholder line for
+each. ``memory/reference_ops.resolve_value`` is the only reader.
 
 WHY NOT AN EXISTING STORE (the New-Store Gate). A knowledge_units value column
 would ride into every recall row, because recall reads that table with SELECT *;
@@ -45,6 +46,7 @@ TABLES = {
         CREATE TABLE IF NOT EXISTS reference_secrets (
             id         TEXT PRIMARY KEY,
             value      TEXT NOT NULL,
+            detail     TEXT,
             created_at TEXT NOT NULL
         )
     """,
@@ -110,6 +112,12 @@ SECRET_REF_TRIGGERS = (
 async def up(db: aiosqlite.Connection) -> None:
     for ddl in TABLES.values():
         await db.execute(ddl)
+    secret_columns = {
+        r[1] for r in await db.execute_fetchall("PRAGMA table_info(reference_secrets)")
+    }
+    if "detail" not in secret_columns:
+        # A table this migration created before the description was held out.
+        await db.execute("ALTER TABLE reference_secrets ADD COLUMN detail TEXT")
     rows = await db.execute_fetchall(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_units'"
     )

@@ -147,14 +147,20 @@ Easy-to-forget mechanisms:
   (`memory/corrective.py`), which runs inside those tools — so the internal
   runtime stack and the hermetic LongMemEval harness (both pass explicit
   `rerank` kwargs) are unaffected.
-- **A credential reference's value is held out of its own indexes** (#2426).
-  For `reference.credentials`, `ingest_knowledge_unit` (the one chokepoint every
-  reference writer passes) puts `Value: [held in the reference secret store; read it with reference_lookup]` in
-  the body and redacts fragments of the value wherever the body, tags,
-  identifier, authority or provenance repeat them (`reference_ops.split_secret`),
-  so the unit's knowledge_units and knowledge_fts rows, its memory_fts row, the
-  Qdrant payload and the embedding never see it. The value goes to an
-  insert-only `reference_secrets` row under a fresh random id, and ONE statement
+- **A credential reference's value and description are held out of its own
+  indexes** (#2426). For `reference.credentials`, `ingest_knowledge_unit` (the
+  one chokepoint every reference writer passes) indexes only the header (the
+  identifier), `[description held in the reference secret store]`,
+  `Value: [held in the reference secret store; read it with reference_lookup]`
+  and the Tags/Captured trailer (`reference_ops.split_secret`), so the unit's
+  knowledge_units and knowledge_fts rows, its memory_fts row, the Qdrant payload
+  and the embedding never see the value or the free-text description (no
+  scrub of free text: owner ruling, every spelling was another way through).
+  The identifier, tags, authority and provenance are not scrubbed: a write
+  whose field carries the value, or a secret-shaped token of it (normalised,
+  percent-decoded), is refused (`reference_ops.refuse_value_in_fields`), the
+  identifier with its own message. The value and the description (`detail`)
+  go to one insert-only `reference_secrets` row under a fresh random id, and ONE statement
   then writes the unit naming it in `knowledge_units.secret_ref`, so a body and
   the secret it names are always one writer's pair on a connection that
   serializes statements, not transactions. The `knowledge_units_secret_ref_*`
@@ -169,11 +175,10 @@ Easy-to-forget mechanisms:
   Two `knowledge_units` triggers refuse a
   credential body without exactly one placeholder line, whichever process
   writes it (text on a later line only the Python check sees).
-  A re-ingest carrying only the placeholder is scrubbed with the secret the key
-  already holds, and after every scrub `reference_ops.assert_value_held_out`
-  (a check independent of the fragment parser) refuses the write, before any
-  store is touched, when an indexed field still carries the value or a
-  secret-shaped token of it. A credential write never shares a vector point
+  A re-ingest carrying a placeholder keeps what the key already holds for it:
+  both placeholders keep the secret row; a new description with the value
+  placeholder writes a new row with the stored value; a new value with the
+  description placeholder keeps the stored description. A credential write never shares a vector point
   (`MemoryStore.store(..., dedup=False)`), and a point it created that no unit
   names when the write ends (refused, failed or cancelled) is deleted, so no
   stale-point cleanup can delete a point a unit names. The credential upsert
@@ -182,14 +187,15 @@ Easy-to-forget mechanisms:
   checked inside the one statement that writes the unit, so a same-key writer
   in another process that commits in between makes it write nothing
   (`CredentialKeyChanged`); the ingest then re-reads and runs once more, and
-  a second change reaches the caller. A credential whose identifier contains
-  its value is refused: the identifier is the entry key, and scrubbing it
-  would file the entry under another one.
-  Only `reference_ops.resolve_value` and `compose_body` read the value:
-  `reference_lookup` (behind its audit log) and the dashboard's reveal. When a
-  unit was repointed after its row was read, both re-read the unit's current
-  body and value with one statement (`knowledge_crud.get_reference_pair`), so a
-  body never comes back beside another write's value. Identifier kinds (url, network,
+  a second change reaches the caller.
+  Only `reference_ops` reads the secret row: `compose_body` puts the value and
+  the description back for `reference_lookup` (behind its audit log),
+  `reveal_reference` returns both for the dashboard's reveal, and
+  `resolve_value` the value alone. When a unit was repointed after its row was
+  read, they re-read the unit's current body, value and description with one
+  statement (`knowledge_crud.get_reference_pair`), so a body never comes back
+  beside another write's secret. A credential is therefore found by its
+  identifier and tags only; the dashboard list shows the description placeholder. Identifier kinds (url, network,
   account, fact) keep their value in the body, because it is what their lookups
   search for. NOT covered yet: the episodic memory the extraction job stores
   for the same conversation text, which still carries an auto-captured value.

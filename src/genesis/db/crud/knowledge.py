@@ -18,6 +18,10 @@ from genesis.db.crud._fts import fetch_fts
 # never imports memory/.
 CREDENTIAL_DOMAIN = "reference.credentials"
 SECRET_PLACEHOLDER = "[held in the reference secret store; read it with reference_lookup]"  # noqa: S105 - a marker, not a secret
+#: Where a credential body's free-text description stood. The description is
+#: held out WITH the value, in the same reference_secrets row (``detail``):
+#: free text cannot be scrubbed of a value reliably (owner ruling, #2426).
+DETAIL_PLACEHOLDER = "[description held in the reference secret store]"
 
 
 _VALUE_MARKER = "\n\nValue: "
@@ -66,6 +70,8 @@ class KeyObservation:
     secret_ref: str | None
     qdrant_id: str | None
     value: str | None
+    #: The held-out description beside that value (None: none stored).
+    detail: str | None = None
 
     @property
     def absent(self) -> bool:
@@ -74,16 +80,16 @@ class KeyObservation:
 
 async def _credential_row(
     db: aiosqlite.Connection, project_type: str, domain: str, concept: str,
-) -> tuple[str, str | None, str | None, str | None] | None:
-    """(id, secret_ref, the value it names or None, qdrant_id) of the row
-    holding the key."""
+) -> tuple[str, str | None, str | None, str | None, str | None] | None:
+    """(id, secret_ref, the value it names or None, qdrant_id, the held-out
+    description or None) of the row holding the key."""
     rows = await db.execute_fetchall(
-        "SELECT k.id, k.secret_ref, s.value, k.qdrant_id FROM knowledge_units k "
+        "SELECT k.id, k.secret_ref, s.value, k.qdrant_id, s.detail FROM knowledge_units k "
         "LEFT JOIN reference_secrets s ON s.id = k.secret_ref "
         "WHERE k.project_type = ? AND k.domain = ? AND k.concept = ?",
         (project_type, domain, concept),
     )
-    return (rows[0][0], rows[0][1], rows[0][2], rows[0][3]) if rows else None
+    return tuple(rows[0][:5]) if rows else None
 
 
 async def observe_credential_key(
@@ -97,7 +103,7 @@ async def observe_credential_key(
     row = await _credential_row(db, project_type, domain, concept)
     if row is None:
         return KeyObservation(None, None, None, None)
-    return KeyObservation(row[0], row[1], row[3], row[2])
+    return KeyObservation(row[0], row[1], row[3], row[2], row[4])
 
 
 def _still_observed(row: tuple | None, expected: KeyObservation) -> bool:
@@ -154,27 +160,30 @@ async def check_credential_write(
 
 async def get_reference_pair(
     db: aiosqlite.Connection, unit_id: str,
-) -> tuple[str, str | None] | None:
+) -> tuple[str, str | None, str | None] | None:
     """(body, the held-out value it names or None) of the unit ``unit_id``, read
     by ONE statement, so the two are always one writer's pair; None when no
     such unit exists. The value is None for a unit naming no secret (a row
     written before #2426, or any non-credential row)."""
     rows = await db.execute_fetchall(
-        "SELECT k.body, s.value FROM knowledge_units k "
+        "SELECT k.body, s.value, s.detail FROM knowledge_units k "
         "LEFT JOIN reference_secrets s ON s.id = k.secret_ref WHERE k.id = ?",
         (unit_id,),
     )
-    return (rows[0][0], rows[0][1]) if rows else None
+    return (rows[0][0], rows[0][1], rows[0][2]) if rows else None
 
 
-async def get_secret(db: aiosqlite.Connection, secret_ref: str | None) -> str | None:
-    """The value of the reference_secrets row ``secret_ref``, or None."""
+async def get_secret_row(
+    db: aiosqlite.Connection, secret_ref: str | None,
+) -> tuple[str, str | None] | None:
+    """(value, detail) of the reference_secrets row ``secret_ref``, or None.
+    Secret rows are never updated, so the two are always one write."""
     if not secret_ref:
         return None
     rows = await db.execute_fetchall(
-        "SELECT value FROM reference_secrets WHERE id = ?", (secret_ref,),
+        "SELECT value, detail FROM reference_secrets WHERE id = ?", (secret_ref,),
     )
-    return rows[0][0] if rows else None
+    return (rows[0][0], rows[0][1]) if rows else None
 
 
 async def get_reference_secret(db: aiosqlite.Connection, unit_id: str) -> str | None:
@@ -509,6 +518,7 @@ async def upsert(
     ingestion_source: str | None = None,
     origin_class: str | None = None,
     secret_value: str | None = None,
+    secret_detail: str | None = None,
     insert_only: bool = False,
     expected: KeyObservation | None = None,
     _commit: bool = True,
@@ -516,8 +526,9 @@ async def upsert(
     """Insert or update a knowledge unit keyed on (project_type, domain, concept).
 
     ``secret_value`` is a credential reference's value, held out of ``body``
-    (#2426, ``reference_ops.split_secret``). It goes into a NEW
-    ``reference_secrets`` row under a fresh random id, and then ONE statement
+    (#2426, ``reference_ops.split_secret``), and ``secret_detail`` its held-out
+    description. Both go into ONE new ``reference_secrets`` row under a fresh
+    random id, and then ONE statement
     writes the unit row naming that id in ``secret_ref``. The body and the
     secret it names are therefore always one writer's pair, however this
     shared connection interleaves other coroutines' statements: the connection
@@ -570,6 +581,9 @@ async def upsert(
     credential = holds_secret(project_type, domain)
     if secret_value is not None and not credential:
         raise ValueError("secret_value is only held for a credential reference (#2426)")
+    if secret_detail is not None and secret_value is None:
+        # A detail is only ever written with a value, in the same new row.
+        raise ValueError("secret_detail is held only beside a secret_value (#2426)")
     project_type, domain = _canonical_key(project_type, domain)
     unit_id = id or str(uuid.uuid4())
     now_iso = ingested_at or datetime.now(UTC).isoformat()
@@ -606,8 +620,9 @@ async def upsert(
         else:
             secret_ref = secrets.token_hex(16)
             await db.execute(
-                "INSERT INTO reference_secrets (id, value, created_at) VALUES (?, ?, ?)",
-                (secret_ref, secret_value, datetime.now(UTC).isoformat()),
+                "INSERT INTO reference_secrets (id, value, detail, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (secret_ref, secret_value, secret_detail, datetime.now(UTC).isoformat()),
             )
 
     cas = credential and expected is not None and not insert_only

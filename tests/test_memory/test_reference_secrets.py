@@ -96,8 +96,9 @@ async def test_no_indexed_store_receives_the_value(db):
     for text in (indexed, row["body"], fts[0][0]):
         assert _PASSWORD not in text, text
         assert f"Value: {ro.SECRET_PLACEHOLDER}" in text
-    # The description's repeat of the password is redacted; the prose stays.
-    assert f"Router login, password is {ro.REDACTED}" in row["body"]
+        # The description is held out with the value, whatever it says.
+        assert "Router login" not in text
+        assert f"\n\n{ro.DETAIL_PLACEHOLDER}\n\n" in text
     assert await _secret(db, unit_id) == _VALUE
 
 
@@ -145,48 +146,7 @@ async def test_an_identifier_kind_keeps_its_value_in_the_body(db):
     assert await _secret(db, unit_id) is None
 
 
-async def test_the_tags_lose_the_value_too(db):
-    store = _store()
-    unit_id = await _ingest(
-        db, store, _body(tags=["router", _PASSWORD]), tags=["router", _PASSWORD]
-    )
-    row = await kc.get(db, unit_id)
-    assert _PASSWORD not in row["tags"]
-    assert _PASSWORD not in row["body"]
-    assert json.loads(row["tags"]) == ["router", ro.REDACTED]
-
-
 # ─── which fragments are secret ──────────────────────────────────────────────
-
-
-def test_identifiers_inside_a_value_stay_searchable():
-    frags = ro.secret_fragments(
-        "user: example-admin, email: ops@example.org, password: Hunter2!xyz-fake"
-    )
-    assert "Hunter2!xyz-fake" in frags
-    assert "example-admin" not in frags
-    assert "ops@example.org" not in frags
-
-
-def test_a_short_unlabelled_token_is_not_scrubbed_from_prose():
-    """'admin / Hunter2!xyz': redacting 'admin' would redact 'router admin panel'."""
-    held, value, _, _ = ro.split_secret(
-        _body(value="admin / Hunter2!xyz", description="Router admin panel")
-    )
-    assert value == "admin / Hunter2!xyz"
-    assert "Router admin panel" in held
-
-
-def test_a_login_slash_secret_value_keeps_the_login_searchable():
-    frags = ro.secret_fragments("ForumUser42 / hunter2-fake")
-    assert "hunter2-fake" in frags
-    assert "ForumUser42" not in frags
-    # Three parts is not the convention: every long enough part is held out.
-    assert "ForumUser42" in ro.secret_fragments("ForumUser42 / hunter2-fake / 4242-fake")
-
-
-def test_the_whole_value_is_always_a_fragment():
-    assert ro.secret_fragments("abc")[0] == "abc"
 
 
 # ─── refusals and re-ingest ──────────────────────────────────────────────────
@@ -289,34 +249,6 @@ async def test_no_recall_row_carries_the_value(db):
 # ─── review round fixes ──────────────────────────────────────────────────────
 
 
-def test_a_password_inside_a_prose_value_is_redacted_from_the_description():
-    held, _, _, _ = ro.split_secret(
-        _body(
-            value="log in as example-admin with password k9!Lp-fake",
-            description="Router login; the password k9!Lp-fake was rotated",
-        )
-    )
-    assert "k9!Lp-fake" not in held
-    assert "the password [redacted] was rotated" in held
-
-
-def test_space_separated_pairs_and_a_short_slash_secret_are_held():
-    frags = ro.secret_fragments("password=Abc123!x token=Zz9_fake")
-    assert {"Abc123!x", "Zz9_fake"} <= set(frags)
-    assert "k9!Lp" in ro.secret_fragments("opsbot / k9!Lp")
-
-
-def test_a_fragment_inside_a_longer_word_is_left_alone():
-    assert ro.scrub("the inactive flag", ["active"]) == "the inactive flag"
-    assert ro.scrub("is active now", ["active"]) == f"is {ro.REDACTED} now"
-
-
-def test_plain_words_in_a_prose_value_are_never_redacted():
-    frags = ro.secret_fragments("log in as admin with password k9!Lp-fake")
-    for word in ("password", "with", "admin"):
-        assert word not in frags
-
-
 async def test_a_raw_delete_still_takes_the_secret(db):
     """A process on pre-#2426 code, or raw SQL, deletes only the unit: the
     trigger retires the secret anyway."""
@@ -352,17 +284,6 @@ async def test_the_db_layer_refuses_a_credential_body_that_carries_its_value(db)
 async def test_an_odd_domain_spelling_is_held_out_not_refused(db):
     unit_id = await _ingest(db, _store(), _body(), domain="Reference.Credentials")
     assert await _secret(db, unit_id) == _VALUE
-
-
-def test_a_tag_loses_the_value_even_inside_a_longer_word():
-    """Prose keeps word boundaries; a tag does not need them (a live tag carried
-    its password that way)."""
-    held, _, tags, _ = ro.split_secret(
-        _body(tags=[f"pw{_PASSWORD}x"]),
-        json.dumps([f"pw{_PASSWORD}x"]),
-    )
-    assert _PASSWORD not in tags
-    assert _PASSWORD not in held
 
 
 # ─── review round 1 (#3898) ──────────────────────────────────────────────────
@@ -469,17 +390,6 @@ async def test_a_refused_write_leaves_nothing_for_another_commit(db):
     assert await db.execute_fetchall("SELECT 1 FROM knowledge_fts") == []
 
 
-def test_glued_short_and_multiword_secrets_are_all_held():
-    assert "xy" in ro.secret_fragments("operator / xy")
-    assert ro.scrub("prefixHunter2!xyzsuffix", ["Hunter2!xyz"]) == f"prefix{ro.REDACTED}suffix"
-    frags = ro.secret_fragments("password: blue moon river")
-    assert {"blue", "moon", "river"} <= set(frags)
-    held, _, _, _ = ro.split_secret(
-        _body(value="password: blue moon river", description="the blue moon one")
-    )
-    assert "blue moon" not in held
-
-
 async def test_a_point_another_unit_still_names_is_not_deleted(db):
     store = _store()
     a = await ingest_knowledge_unit(
@@ -494,16 +404,6 @@ async def test_a_point_another_unit_still_names_is_not_deleted(db):
     )
     store.delete.assert_not_awaited()
     assert (await kc.get(db, a))["qdrant_id"] == "qid-2"
-
-
-def test_a_labelled_all_letter_password_is_redacted_even_glued():
-    """A labelled secret IS the secret: word boundaries protect prose words
-    ("inactive"), never a password run into other text."""
-    held, _, _, _ = ro.split_secret(
-        _body(value="password: sunshinefake", description="old: xsunshinefakes")
-    )
-    assert "sunshinefake" not in held
-    assert "inactive" in ro.scrub("inactive", ["active"])
 
 
 # ── Round 2: every captured secret, every reference kind, checks before any store ──
@@ -619,31 +519,6 @@ async def _credential_units_without_a_secret(db) -> list:
     )
 
 
-def test_a_connection_string_password_is_its_own_fragment():
-    """R2: the URL's userinfo password is held out on its own, so a description
-    naming just the password loses it."""
-    url = "postgres://app:Pw9fakesecret@db.example.org/app"
-    frags = ro.secret_fragments(url)
-    assert "Pw9fakesecret" in frags
-    held, _, _, _ = ro.split_secret(
-        _body(value=url, description="the app password is Pw9fakesecret")
-    )
-    assert "Pw9fakesecret" not in held
-
-
-def test_an_email_shaped_password_is_held_but_an_email_login_is_not():
-    """R2: the email-shaped exclusion applies to identifier labels only."""
-    frags = ro.secret_fragments("email: ops@example.org, password: fakepass@example.org")
-    assert "fakepass@example.org" in frags
-    assert "ops@example.org" not in frags
-    held, _, _, _ = ro.split_secret(
-        _body(
-            value="password: fakepass@example.org", description="sign in with fakepass@example.org"
-        )
-    )
-    assert "fakepass@example.org" not in held
-
-
 async def test_the_database_refuses_a_raw_credential_body_that_carries_its_value(db):
     """b13ee875: a writer that runs no current code (raw SQL here) is refused by
     the knowledge_units triggers, on insert and on an update of the body."""
@@ -725,7 +600,7 @@ async def test_an_odd_spaced_placeholder_is_normalised_on_write_and_read(db):
     """4476130420: the canonical placeholder line is what is written and read."""
     unit = await _ingest(db, _store(), _body())
     odd = (await kc.get(db, unit))["body"].replace("Value: ", "Value:   ")
-    held, value, _, _ = ro.split_secret(odd)
+    held, value, _ = ro.split_secret(odd)
     assert value is None
     assert f"\n\nValue: {kc.SECRET_PLACEHOLDER}" in held
     kc.refuse_inline_secret("reference", "reference.credentials", held)
@@ -735,59 +610,6 @@ async def test_an_odd_spaced_placeholder_is_normalised_on_write_and_read(db):
     body, missing = await ro.compose_body(db, row)
     assert missing is False
     assert f"\n\nValue: {_VALUE}" in body
-
-
-def test_a_short_labelled_secret_is_redacted_only_as_a_word():
-    """4476136578: a 1-3 character labelled secret, or a 1-character pair
-    secret, is held out, but never cut out of longer text."""
-    held, _, tags, _ = ro.split_secret(
-        _body(value="user: bob, password: x9z", description="pin x9z, not ax9zb"),
-        json.dumps(["x9z", "tax9zone"]),
-    )
-    assert "pin [redacted], not ax9zb" in held
-    assert json.loads(tags) == [ro.REDACTED, "tax9zone"]
-    held, _, _, _ = ro.split_secret(_body(value="bob / q", description="bob, q, quick"))
-    assert "bob, [redacted], quick" in held
-
-
-async def test_the_authority_and_provenance_lose_the_value_too(db):
-    """3dccd364: captured_via goes into authority, source_doc and
-    source_platform, and authority reaches the vector payload's tags."""
-    store = _store()
-    via = f"chat {_PASSWORD}"
-    unit = await ingest_knowledge_unit(
-        store=store,
-        db=db,
-        content=_body(source={"captured_via": via}),
-        project=ro.REFERENCE_PROJECT,
-        domain="reference.credentials",
-        concept="Lab router admin",
-        authority=via,
-        provenance={
-            "source_doc": f"reference_store:{via}",
-            "platform": via,
-            "source_pipeline": "reference_store",
-        },
-    )
-    row = await kc.get(db, unit)
-    for text in (
-        row["source_doc"],
-        row["source_platform"],
-        row["body"],
-        *store.store.await_args.kwargs["tags"],
-    ):
-        assert _PASSWORD not in (text or ""), text
-    assert row["source_doc"] == f"reference_store:chat {ro.REDACTED}"
-
-
-def test_a_repeat_of_the_value_in_another_case_is_redacted_too():
-    """Review finding: the repeat redaction ignored case."""
-    held, _, tags, _ = ro.split_secret(
-        _body(value="password: Hunter2!fake", description="pw HUNTER2!FAKE, also sunflower"),
-        json.dumps(["hunter2!fake"]),
-    )
-    assert "hunter2!fake" not in held.lower()
-    assert json.loads(tags) == [ro.REDACTED]
 
 
 async def test_a_direct_upsert_stores_the_credential_key_canonically(db):
@@ -841,22 +663,3 @@ async def test_a_failed_body_write_leaves_the_stored_pair_and_one_orphan(db, exi
     assert await _credential_units_without_a_secret(db) == []
 
 
-def test_a_connection_string_password_with_an_at_sign_is_held_whole():
-    url = "postgres://app:p@ss-fake9@db.example.org/x"
-    assert "p@ss-fake9" in ro.secret_fragments(url)
-    held, _, _, _ = ro.split_secret(_body(value=url, description="pw p@ss-fake9"))
-    assert "ss-fake9" not in held
-
-
-def test_a_quoted_labelled_secret_is_held_without_its_quotes():
-    held, _, _, _ = ro.split_secret(
-        _body(value='user: bob, secret: "two words"', description="it is two words long"),
-    )
-    assert "two words" not in held
-
-
-def test_the_userinfo_scheme_scan_is_bounded():
-    """Review finding: an unbounded scheme scanned quadratically on a long run
-    of scheme characters. The scheme is bounded, so a long run never matches."""
-    assert ro.URL_USERINFO_PATTERN.search("a" * 40 + "://u:pw9fake@h") is None
-    assert ro.URL_USERINFO_PATTERN.search("postgres://u:pw9fake@h").group("pw") == "pw9fake"

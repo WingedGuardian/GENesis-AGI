@@ -3,10 +3,11 @@
 1. A credential upsert is a compare-and-swap against the ingest's own read of
    its key (secret and point, or absent). A same-key writer in another process
    that commits in between makes the write apply nothing; the ingest re-reads
-   and runs once more. So a placeholder re-ingest scrubs with the secret the
-   commit retains, and the old-point cleanup deletes the real predecessor.
+   and runs once more. So a placeholder re-ingest pairs its description with
+   the secret the commit retains, and the old-point cleanup deletes the real
+   predecessor.
 2. A credential whose identifier contains its value is refused: the identifier
-   is the entry key, and scrubbing it would file the entry under another key.
+   is the entry key, so it is refused, never filed under another key.
 
 Fake credentials and example.org hosts only, never real secrets.
 """
@@ -40,15 +41,16 @@ async def db():
 
 
 class _PausingStore(_PointStore):
-    """Pauses the first store call whose content contains ``marker`` until
-    ``resume`` is set; ``entered`` is set when it pauses."""
+    """Pauses the first store call made while ``armed`` until ``resume`` is
+    set; ``entered`` is set when it pauses. (Bodies of one key are now alike:
+    the description is held out, so the call is picked by order, not content.)"""
 
-    def __init__(self, marker: str):
+    def __init__(self, armed: bool = True):
         super().__init__()
-        self.marker, self.entered, self.resume = marker, asyncio.Event(), asyncio.Event()
+        self.armed, self.entered, self.resume = armed, asyncio.Event(), asyncio.Event()
 
     async def store_reporting_creation(self, content, source, **kwargs):
-        if self.marker in content and not self.entered.is_set():
+        if self.armed and not self.entered.is_set():
             self.entered.set()
             await self.resume.wait()
         return await super().store_reporting_creation(content, source, **kwargs)
@@ -72,11 +74,12 @@ async def _assert_one_named_point(db, store) -> None:
 # ─── 1. compare-and-swap ────────────────────────────────────────────────────
 
 
-async def test_a_placeholder_re_ingest_racing_a_rotation_scrubs_with_the_retained_secret(db):
+async def test_a_placeholder_re_ingest_racing_a_rotation_pairs_with_the_retained_secret(db):
     """4527738739: A reads Old, pauses in store.store; B rotates the key to New;
     A resumes. A placeholder body whose note repeats New must not index it."""
-    store = _PausingStore(marker="note")
+    store = _PausingStore(armed=False)
     unit = await _ingest(db, store, _body("Example portal login", "password: Old!Fake123"))
+    store.armed = True
     writer_a = asyncio.create_task(
         _ingest(db, store, _body("note New!Fake456", ro.SECRET_PLACEHOLDER)),
     )
@@ -86,6 +89,10 @@ async def test_a_placeholder_re_ingest_racing_a_rotation_scrubs_with_the_retaine
     assert await writer_a == unit
 
     assert await kc.get_reference_secret(db, unit) == "password: New!Fake456"
+    # The new description of A, paired with the value the commit retains.
+    assert await ro.reveal_reference(db, await kc.get(db, unit)) == (
+        "password: New!Fake456", "note New!Fake456",
+    )
     for text in await _indexed_texts(db, store, unit):
         assert "New!Fake456" not in text, text
     await _assert_one_named_point(db, store)
@@ -94,7 +101,7 @@ async def test_a_placeholder_re_ingest_racing_a_rotation_scrubs_with_the_retaine
 async def test_a_writer_that_read_an_absent_key_never_orphans_the_winners_point(db):
     """4527738743: B reads an absent key and pauses in store.store; A inserts the
     key; B resumes. B must displace A's point, not leave it recallable."""
-    store = _PausingStore(marker="from B")
+    store = _PausingStore()
     writer_b = asyncio.create_task(
         _ingest(db, store, _body("Example portal login from B", "password: B!Fake789")),
     )
@@ -258,7 +265,7 @@ async def test_a_credential_without_an_identifier_is_refused(db):
 
 async def test_a_placeholder_re_ingest_whose_identifier_carries_the_stored_value_is_refused(db):
     """A key written before this rule (directly, so its identifier carries the
-    value): a placeholder re-ingest would scrub that identifier into another
+    value): a placeholder re-ingest pairing with it would keep that identifier as a
     key, so it is refused, and the old entry keeps its secret."""
     legacy = "router Kept!Fake5"
     unit, _ = await kc.upsert(

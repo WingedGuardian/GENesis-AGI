@@ -988,7 +988,8 @@ CREATE TABLE IF NOT EXISTS peer_grants (
     # password rotation: delete + re-store) must not cascade away the
     # access history.  The unit_id is a soft reference only.
     #
-    # reference_secrets: the value of a credential reference (#2426), held OUT of every indexed
+    # reference_secrets: the value of a credential reference (#2426), and its
+    # free-text description (``detail``, held out with it), held OUT of every indexed
     # store: knowledge_units.body carries a placeholder instead, so neither
     # knowledge_fts, memory_fts, the Qdrant payload nor the embedding sees it.
     # Its own table rather than a knowledge_units column because recall reads
@@ -1009,6 +1010,7 @@ CREATE TABLE IF NOT EXISTS peer_grants (
         CREATE TABLE IF NOT EXISTS reference_secrets (
             id         TEXT PRIMARY KEY,
             value      TEXT NOT NULL,
+            detail     TEXT,
             created_at TEXT NOT NULL
         )
     """,

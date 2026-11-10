@@ -473,6 +473,10 @@ def _format_reference_body(
     The description appears next because semantic retrieval weights the
     start of the content most heavily.
     """
+    if kind == "credentials":
+        from genesis.memory.reference_ops import refuse_trailer_shaped_value
+
+        refuse_trailer_shaped_value(value)
     lines = [
         f"[reference.{kind}] {identifier}",
         "",
@@ -519,7 +523,7 @@ async def reference_store(
     identifier across re-stores to get upsert semantics.
 
     ``value`` is the raw value (password, URL string, IP address, file path,
-    etc.). Stored plaintext (a credential's value outside the search index), so an entry holding
+    etc.). Stored plaintext (a credential's value and description outside the search index, so a credential is found by its identifier and tags, which must not contain the value), so an entry holding
     a payment card number in any field is refused (the planned card vault
     is tracked in #3172).
 

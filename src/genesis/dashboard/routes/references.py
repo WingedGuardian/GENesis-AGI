@@ -32,7 +32,7 @@ from genesis.memory.reference_ops import (
     ReferenceStoreUnavailable,
     delete_reference_entry,
     parse_reference_body,
-    resolve_value,
+    reveal_reference,
 )
 
 logger = logging.getLogger(__name__)
@@ -216,7 +216,7 @@ async def references_detail(unit_id: str):
 @blueprint.route("/api/genesis/references/<unit_id>/reveal", methods=["POST"])
 @_async_route
 async def references_reveal(unit_id: str):
-    """Return the secret value for one reference. Auth-gated, no audit (single-user)."""
+    """Return the value (and, for a credential, its held-out description) of one reference. Auth-gated, no audit (single-user)."""
     if (resp := _auth_or_403()) is not None:
         return resp
     from genesis.db.crud import knowledge
@@ -230,12 +230,13 @@ async def references_reveal(unit_id: str):
         row = await knowledge.get(rt.db, unit_id)
         if row is None or row.get("project_type") != REFERENCE_PROJECT:
             return jsonify({"error": "Reference not found"}), 404
-        # A credential's value is held out of the body (#2426): resolve_value
-        # reads it from reference_secrets, and parses every other row as before.
-        value = await resolve_value(rt.db, row)
+        # A credential's value and description are held out of the body
+        # (#2426): reveal_reference reads both from one reference_secrets row,
+        # and parses every other row as before.
+        value, description = await reveal_reference(rt.db, row)
         if value is None:
             return jsonify({"error": "This reference's value is missing"}), 409
-        return jsonify({"id": unit_id, "value": value})
+        return jsonify({"id": unit_id, "value": value, "description": description})
     except Exception:
         logger.exception("Reference reveal failed")
         return jsonify({"error": "Reveal failed"}), 500

@@ -134,3 +134,34 @@ async def test_a_migrated_legacy_row_keeps_updating_its_counters():
         )
         rows = await db.execute_fetchall("SELECT retrieved_count, secret_ref FROM knowledge_units")
     assert [tuple(r) for r in rows] == [(1, None)]
+
+
+async def _secret_columns(db) -> list[str]:
+    return [r[1] for r in await db.execute_fetchall("PRAGMA table_info(reference_secrets)")]
+
+
+async def test_both_build_paths_carry_the_detail_column():
+    """The held-out description (``detail``) sits in the same immutable row as
+    the value, on a fresh install and after the migration alone."""
+    async with aiosqlite.connect(":memory:") as fresh:
+        await create_all_tables(fresh)
+        assert await _secret_columns(fresh) == ["id", "value", "detail", "created_at"]
+    async with aiosqlite.connect(":memory:") as migrated:
+        await MIG.up(migrated)
+        assert await _secret_columns(migrated) == ["id", "value", "detail", "created_at"]
+
+
+async def test_a_secrets_table_from_before_the_detail_column_gains_it():
+    """A reference_secrets table this unmerged migration created earlier, with no
+    detail column: the migration adds it, idempotently, keeping its rows."""
+    async with aiosqlite.connect(":memory:") as db:
+        await db.execute(
+            "CREATE TABLE reference_secrets (id TEXT PRIMARY KEY, value TEXT NOT NULL, "
+            "created_at TEXT NOT NULL)"
+        )
+        await db.execute("INSERT INTO reference_secrets VALUES ('s1', 'fake-1', 'now')")
+        await MIG.up(db)
+        await MIG.up(db)
+        assert "detail" in await _secret_columns(db)
+        rows = await db.execute_fetchall("SELECT id, value, detail FROM reference_secrets")
+        assert [tuple(r) for r in rows] == [("s1", "fake-1", None)]

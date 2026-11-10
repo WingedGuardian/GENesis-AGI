@@ -27,10 +27,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-#: Provenance fields that are free text and stored, so a credential's value is
-#: scrubbed from them (#2426).
-_FREE_TEXT_PROVENANCE = frozenset({"source_doc", "platform", "section_title", "source_date"})
-
 # Module-level singleton (load_default_patterns() does filesystem I/O).
 _SANITIZER = ContentSanitizer()
 
@@ -91,7 +87,7 @@ async def ingest_knowledge_unit(
     # (``knowledge_crud.KeyObservation``): if a same-key writer, in this process
     # or another, commits between that read and the unit's statement, nothing is
     # written and the whole ingest runs again ONCE from a fresh read (a new
-    # stored secret to scrub with, a new point). A second change raises
+    # stored secret to pair with, a new point). A second change raises
     # ``CredentialKeyChanged`` to the caller.
     kwargs = dict(
         store=store, db=db, content=content, project=project, domain=domain,
@@ -133,11 +129,13 @@ async def _ingest_once(
     # A credential's value is held out of every indexed store (#2426) HERE, at the
     # chokepoint every writer passes through (the reference_store and
     # knowledge_ingest MCP tools, the extraction job, migrate_reference_data):
-    # from this line on, `content` and `tags_json` carry a placeholder and
-    # redactions, and the value travels only to knowledge_crud.upsert, which
-    # writes it to reference_secrets before the unit's own row. Refuses
-    # (ValueError) a credential whose value cannot be located, before anything
-    # is written. Every other reference kind keeps its value in the body.
+    # from this line on, `content` carries the header, a placeholder for the
+    # description and one for the value, and the trailer; the value and the
+    # description travel only to knowledge_crud.upsert, which writes them to one
+    # reference_secrets row before the unit's own row. Refuses (ValueError) a
+    # credential whose value cannot be located, or whose identifier, tags,
+    # authority or provenance carries its value, before anything is written.
+    # Every other reference kind keeps its value in the body.
     from genesis.memory import reference_ops
 
     # One spelling for the reference project, so every reader (lookup, delete,
@@ -145,6 +143,7 @@ async def _ingest_once(
     if (project or "").strip().lower() == reference_ops.REFERENCE_PROJECT:
         project = reference_ops.REFERENCE_PROJECT
     secret_value: str | None = None
+    secret_detail: str | None = None
     observed: knowledge_crud.KeyObservation | None = None
     credential = reference_ops.holds_secret(project, domain)
     if credential:
@@ -154,65 +153,51 @@ async def _ingest_once(
         domain = knowledge_crud.CREDENTIAL_DOMAIN
         if concept is None or not concept.strip():
             # The identifier is the entry's key. Derived from the body, it would
-            # be the SCRUBBED body, so two credentials whose bodies differ only
-            # in their values would share a key and the second would overwrite
-            # the first.
+            # be the HELD body (header and placeholders), so two credentials
+            # whose bodies differ only in their description and value would
+            # share a key and the second would overwrite the first.
             raise ValueError(
                 "a credential reference needs an explicit identifier (concept); "
                 "refusing the write (#2426)"
             )
-        raw_content, raw_tags, raw_concept = content, tags_json, concept
-        content, secret_value, tags_json, concept = reference_ops.split_secret(
-            content, tags_json, concept,
+        # The value AND the free-text description come out of the body; both go
+        # to one reference_secrets row. The body keeps only the header, the
+        # two placeholders and the Tags/Captured trailer.
+        content, secret_value, secret_detail = reference_ops.split_secret(content)
+        # One read of the key: the stored secret (for a re-ingest that carries
+        # a placeholder) and the observation the upsert compare-and-swaps
+        # against, so what this write keeps is what the commit retains.
+        observed = await knowledge_crud.observe_credential_key(
+            db, project_type=project, domain=domain, concept=concept,
         )
-        known_secret = secret_value
-        lookup_concept = concept if concept is not None else content[:200]
         if secret_value is None:
-            # A re-ingest carrying only the placeholder: the secret the key
-            # already holds is what its description, tags and concept may still
-            # repeat, so they are scrubbed with THAT value, exactly as with a
-            # supplied one. (check_credential_write below refuses the write when
-            # no secret is stored for the key.) The same read is the
-            # observation the upsert compare-and-swaps against, so the secret
-            # scrubbed with is the one the commit retains.
-            observed = await knowledge_crud.observe_credential_key(
-                db, project_type=project, domain=domain, concept=lookup_concept,
-            )
-            known_secret = observed.value
-            if known_secret is not None:
-                content, _, tags_json, concept = reference_ops.split_secret(
-                    raw_content, raw_tags, raw_concept, stored_value=known_secret,
-                )
-        # The identifier is the key of the entry: a scrub that changed it would
-        # file this credential under another key (two identifiers that each
-        # carry their own value both read "x [redacted]"), so it is refused.
-        if concept != raw_concept:
-            raise ValueError(
-                "a credential identifier must not contain its value; refusing "
-                "the write (#2426)"
-            )
+            if secret_detail is not None and observed.value is not None:
+                # A new description with the value placeholder: the stored value
+                # and the new description, together, as a new secret row.
+                secret_value = observed.value
+        elif secret_detail is None:
+            # A new value with the description placeholder: the stored
+            # description stays beside it, in the new secret row.
+            secret_detail = observed.detail
+        known_secret = secret_value if secret_value is not None else observed.value
         if known_secret is not None:
-            # The free-text fields stored beside the body (the authority, which
-            # also reaches the vector payload's tags, and the provenance's
-            # source doc, platform, section and date) can repeat the value as
-            # well: they lose its fragments by the same rule. The control fields
-            # (source_pipeline, session_id) are left alone: origin and
-            # first-party checks read them.
-            authority = reference_ops.scrub_value(authority, known_secret)
-            if provenance:
-                provenance = {
-                    key: reference_ops.scrub_value(val, known_secret)
-                    if key in _FREE_TEXT_PROVENANCE and isinstance(val, str) else val
-                    for key, val in provenance.items()
-                }
-            # Fail closed on the scrub's own result, before any store write:
-            # an indexed field that still carries the value (or a secret-shaped
-            # token of it) the parser missed refuses the write.
-            reference_ops.assert_value_held_out(known_secret, {
+            # Nothing else is scrubbed: an indexed field that carries the value
+            # refuses the write, before any store. The identifier first, with
+            # its own message: it is the key of the entry.
+            reference_ops.refuse_value_in_fields(
+                known_secret, {"identifier": concept},
+                message="a credential identifier must not contain its value; refusing the write (#2426)",
+                login_exempt=True,
+            )
+            reference_ops.refuse_value_in_fields(known_secret, {
                 "body": content,
-                "concept": concept if concept is not None else content[:200],
                 "tags": tags_json,
+                # The tags as they read once decoded: JSON escapes a non-ASCII
+                # tag, which would hide a fullwidth spelling of the value.
+                "tags (decoded)": _tags_text(tags_json),
                 "authority": authority,
+                "purpose": json.dumps(purpose) if purpose else None,
+                "ingestion source": ingestion_source,
                 **{
                     f"provenance {key}": val
                     for key, val in (provenance or {}).items() if isinstance(val, str)
@@ -349,6 +334,7 @@ async def _ingest_once(
         ingestion_source=ingestion_source,
         origin_class=resolved_origin,
         secret_value=secret_value,
+        secret_detail=secret_detail,
         expected=observed,
     )
     try:
@@ -410,6 +396,18 @@ async def _ingest_once(
         project, domain,
     )
     return actual_id
+
+
+def _tags_text(tags_json: str | None) -> str | None:
+    """The tags of ``tags_json`` joined as plain text, or None when it is not a
+    JSON list (the raw string is checked on its own)."""
+    if not tags_json:
+        return None
+    try:
+        tags = json.loads(tags_json)
+    except ValueError:
+        return None
+    return " ".join(str(t) for t in tags) if isinstance(tags, list) else None
 
 
 async def _drop_unnamed_point(store: MemoryStore, db: aiosqlite.Connection, qdrant_id: str | None) -> None:

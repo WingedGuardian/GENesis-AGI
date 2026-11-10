@@ -482,11 +482,16 @@ async def test_reference_store_full_roundtrip():
             # #2426: the value is held out of the indexed body, in its own table.
             assert "hunter2" not in row["body"]
             assert "Value: [held in the reference secret store; read it with reference_lookup]" in row["body"]
-            assert "used by the ForumUser42 persona" in row["body"]
+            # The description is held out with the value, in the same row.
+            assert "used by the ForumUser42 persona" not in row["body"]
+            assert "hobby community forum" not in row["body"]
+            assert "[description held in the reference secret store]" in row["body"]
             secret = await mod.knowledge.get_reference_secret(real_db, unit_id)
             assert secret == "ForumUser42 / hunter2"
+            _body, _value, detail = await mod.knowledge.get_reference_pair(real_db, unit_id)
+            assert "used by the ForumUser42 persona" in detail
+            assert "hobby community forum" in detail
             assert "hunter2" not in mock_store.store.call_args[0][0]
-            assert "hobby community forum" in row["body"]
             assert "forum" in row["tags"]
             assert "persona:example" in row["tags"]
             assert "reference" in row["tags"]
