@@ -101,6 +101,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from genesis import secrets_location
+
 #: A row's ``source`` when ``interpreter_source`` proved the main checkout.
 SOURCE_MAIN = "main"
 #: The only environment keys the census keeps from another process.
@@ -507,14 +509,17 @@ def interpreter_source(
 
 
 def secrets_file(env: dict[str, str], *, main_root: Path) -> Path | None:
-    """The secrets file that process loads, chosen as ``genesis.env.secrets_path``
-    chooses it: ``SECRETS_PATH``, else ``GENESIS_REPO_ROOT``'s, else main's."""
+    """The secrets file that process loads, chosen as ``genesis.secrets_location``
+    chooses it for THAT process: ``SECRETS_PATH``, else the resolver's order under
+    its own ``HOME`` with ``GENESIS_REPO_ROOT`` (or main) as the checkout. None
+    when a path cannot be resolved from here, including a missing ``HOME``."""
     if env.get("SECRETS_PATH"):
         return expand_home(env["SECRETS_PATH"], env)
-    if env.get("GENESIS_REPO_ROOT"):
-        root = expand_home(env["GENESIS_REPO_ROOT"], env)
-        return None if root is None else root / "secrets.env"
-    return main_root / "secrets.env"
+    home = expand_home("~", env)
+    root = expand_home(env["GENESIS_REPO_ROOT"], env) if env.get("GENESIS_REPO_ROOT") else main_root
+    if home is None or root is None:
+        return None
+    return secrets_location.resolve(environ={}, repo_root=root, home=home)
 
 
 def _links_unchanged_since(path: Path, start: float, _depth: int = 0) -> bool:

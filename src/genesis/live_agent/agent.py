@@ -229,8 +229,12 @@ class LiveAgent:
         session_recorder: SessionRecorder | None = update_session_row,
         cli_path: str | None = None,
         environ: Mapping[str, str] | None = None,
+        output_surface: Literal["terminal", "speech"] = "terminal",
     ) -> None:
         _validate_environment(environ)
+        if output_surface not in ("terminal", "speech"):
+            raise ValueError("output_surface must be terminal or speech")
+        self._output_surface = output_surface
         self._cwd = cwd
         self._state_path = state_path
         self._steer = steer
@@ -282,7 +286,10 @@ class LiveAgent:
             resume=resume,
             # Surfaces the CLI's running / requires_action / idle frames, which
             # the SDK otherwise reads and drops (measured on 2.1.299).
-            env={"CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS": "1"},
+            env={
+                "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS": "1",
+                "GENESIS_OUTPUT_SURFACE": self._output_surface,
+            },
             stderr=self._stderr,
         )
 

@@ -125,7 +125,9 @@ fi
 SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_PATH="${VENV_PATH:-$REPO_DIR/.venv}"
-SECRETS_FILE="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
+# shellcheck source=lib/secrets_path.sh
+. "$SCRIPT_DIR/lib/secrets_path.sh"
+SECRETS_FILE="$(genesis_secrets_path "$REPO_DIR")"
 SETUP_WARNINGS=0
 # Every setter of SETUP_WARNINGS goes through setup_warn, so the flag can name
 # its own causes. The flag alone made a strict-mode failure undiagnosable: the
@@ -758,6 +760,7 @@ fi
 # secrets.env
 if [ ! -f "$SECRETS_FILE" ]; then
     if [ -f "$REPO_DIR/secrets.env.example" ]; then
+        mkdir -p -m 0700 "$(dirname "$SECRETS_FILE")"
         cp "$REPO_DIR/secrets.env.example" "$SECRETS_FILE"
         chmod 600 "$SECRETS_FILE"
         echo "    + Created secrets.env from template"
@@ -1093,6 +1096,7 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             _home_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$HOME")")
             _repo_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$REPO_DIR")")
             _venv_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$VENV_PATH")")
+            _ccbin_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$CC_BIN_DIR")")
             _home_esc=$(_sed_repl_esc "$HOME")
             _venv_esc=$(_sed_repl_esc "$VENV_PATH")
             _repo_esc=$(_sed_repl_esc "$REPO_DIR")
@@ -1106,6 +1110,7 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
                 -e "s|__HOME_EXEC__|$_home_exec_esc|g" \
                 -e "s|__REPO_EXEC__|$_repo_exec_esc|g" \
                 -e "s|__VENV_EXEC__|$_venv_exec_esc|g" \
+                -e "s|__CC_BIN_EXEC__|$_ccbin_exec_esc|g" \
                 -e "s|__VENV__|$_venv_esc|g" \
                 -e "s|__REPO_DIR__|$_repo_esc|g" \
                 -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \

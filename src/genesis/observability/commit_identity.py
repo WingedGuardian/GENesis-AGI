@@ -1,11 +1,61 @@
-"""Commit-identity staleness — a stdlib-only leaf so both the MCP guard
-(Part A, imports ``fastmcp``) and the dashboard (genesis-server, must NOT import
-``fastmcp``) share ONE verdict, provably identical, with no drift.
-"""
+"""Commit identity: deploy-based blocking and separate recorded-revision advice."""
 
 from __future__ import annotations
 
+import re
+import subprocess
 from datetime import datetime
+from pathlib import Path
+
+SAME_RECORDED_REVISION = "same_recorded_revision"
+DIFFERENT_RECORDED_REVISION = "different_recorded_revision"
+UNKNOWN = "unknown"
+_HEAD_TIMEOUT_S = 1.0
+
+
+def _full_commit(value: object) -> str | None:
+    if not isinstance(value, str) or not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", value):
+        return None
+    return value.lower() if value.strip("0") else None
+
+
+def recorded_revision(launch: object, current: object) -> str:
+    """Compare complete recorded IDs; never assert imported-source equivalence.
+
+    Unlike the existing deploy predicate, abbreviated or mixed-format IDs cannot
+    establish this relation. No history ordering or successful deploy is needed.
+    """
+    launch = _full_commit(launch)
+    current = _full_commit(current)
+    if launch is None or current is None or len(launch) != len(current):
+        return UNKNOWN
+    return SAME_RECORDED_REVISION if launch == current else DIFFERENT_RECORDED_REVISION
+
+
+def read_runtime_head() -> str | None:
+    """Bounded local read from the same root authority used by spawn capture.
+
+    Read the ref itself, without object peeling/history or a network operation.
+    An observed SHA is not a measurement of dirty, imported, or candidate bytes.
+    A root mismatch, unavailable Git, or timeout leaves the advice unknown.
+    """
+    from genesis.env import repo_root
+    from genesis.session_awareness.zero_drop_git import scrubbed_git_env
+
+    try:
+        root = repo_root().resolve()
+        result = subprocess.run(
+            ["git", "--no-optional-locks", "--no-replace-objects", "-C", str(root),
+             "rev-parse", "--show-toplevel", "--verify", "HEAD"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=_HEAD_TIMEOUT_S, env=scrubbed_git_env(),
+        )
+        lines = result.stdout.rstrip("\n").split("\n")
+        if result.returncode != 0 or len(lines) != 2 or Path(lines[0]).resolve() != root:
+            return None
+        return _full_commit(lines[1])
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+        return None
 
 
 def same_commit(a: str | None, b: str | None) -> bool:
@@ -36,8 +86,8 @@ def is_stale(
     alone would wrongly flag the ahead case.
 
     Fail-open: any missing/unparseable input yields ``False`` — never a false
-    positive. This is THE staleness verdict; Part A's guard and Part B's dashboard
-    badge both call it so they can never disagree.
+    positive. The blocking guard and retained dashboard compatibility fields use
+    this verdict; the recorded-revision advisory is independent.
     """
     if not spawn_commit or not spawn_at or not deploy_completed_at or not deploy_new_commit:
         return False

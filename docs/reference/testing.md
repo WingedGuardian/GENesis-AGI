@@ -77,9 +77,14 @@ parametrized cases make the collected item count higher still). The suite runs
 without external service dependencies -- Qdrant, Ollama, and LLM APIs are
 mocked in unit tests.
 
-**Runtime.** CI runs the suite FULLY SERIALLY. pytest-xdist is in the `[test]`
-extra (pinned in `.github/test-tools/requirements.txt`), but no CI job passes
-`-n` yet, and a local `-n` run is unsupported. MEASURED 2026-09-06 over the last 23 successful `main` runs, for
+**Runtime.** CI's `test` job runs the suite on four pytest-xdist workers
+(`-n 4 --dist=loadfile --max-worker-restart=0`; xdist is pinned in
+`.github/test-tools/requirements.txt`). MEASURED 2026-11-05 over 6 runs: the
+`Run tests` step's median was 33.35 min, against 117.0 serial, with the same
+test ids (62,766), and a 7.8 GB memory peak. A local `-n` run is unsupported:
+that peak is too much for a shared box, and the full-suite guard refuses it.
+The figures that follow are older serial ones, from a suite less than half its
+current size, MEASURED 2026-09-06 over the last 23 successful `main` runs, for
 the **`test` job specifically** (`gh api .../actions/runs/<id>/jobs`, name ==
 `test`): min 19m38s, median 29m22s, max 31m15s. Do not quote workflow-RUN
 duration here — it is ~20 minutes longer because it spans 12 sibling jobs plus
@@ -88,7 +93,9 @@ queue time, and it is not what any of the ceilings below bound.
 Two ceilings bound the suite, and they are different things:
 
 - `timeout = 600` in `pyproject.toml` is pytest-timeout's **per-test** limit —
-  one hung test is killed and the suite continues. It is NOT a suite budget.
+  with the thread method it ends the process that ran the hung test, so the
+  run stops (under `--max-worker-restart=0`, once the other workers finish
+  what they were handed). It is NOT a suite budget.
   It applies wherever `pytest-timeout` is installed: always in CI, and on an
   install once bootstrap's non-fatal step has installed the `[test]` extra
   (`install_runtime_extras`; a code-only deploy warns when it is missing).
@@ -96,8 +103,9 @@ Two ceilings bound the suite, and they are different things:
   holds the box-wide test lock until it is killed by hand.
 - `timeout-minutes: 180` on CI's `test` job bounds the whole job, for a hang
   the per-test timeout cannot catch. It must stay above (max job + one
-  per-test kill) — 31m15s + 10m ≈ 41m — or it would pre-empt the per-test
-  limit and make it dead code.
+  per-test kill), or it would pre-empt the per-test limit and make it dead
+  code. The serial job had reached 82-146 min by 2026-11-05; on four workers
+  the measured step took 31-48 min.
 
 The per-test cost of individual tests had never been measured; CI now prints
 `--durations=25` so the slowest are visible in every run's log. Read them
@@ -373,6 +381,37 @@ IPv6 link-local scope id, which `/proc/net/tcp6` does not record, so two
 listeners with the same link-local address on different interfaces are judged
 as one.
 
+### The write audit: writes into the real home are reported
+
+`tests/_live_writes.py`, armed last, reports (never fails) the writes a test
+makes into the real home outside its temp dirs, for the operations it hooks: `open` with write intent,
+`os.remove`/`rename`/`replace`/`mkdir`/`rmdir`/`truncate`/`symlink`/`link`,
+`shutil.rmtree`, and an SQLite connect to a file that is not opened read-only.
+It also reports reads of the real credential files (the deployed `secrets.env`,
+`~/.claude/.credentials.json`, `~/.config/gh/hosts.yml`,
+`~/.genesis/cc_oauth_token.env`).
+
+- Allowed, so never reported: `tempfile.gettempdir()`, pytest's basetemp, the
+  box lock file, `/dev`, and `__pycache__` / `.pytest_cache` directories.
+- Each write is classed by where it lands (the deployed checkout, this checkout,
+  `~/.genesis`, `~/.claude`, elsewhere in the home) and attributed to the test.
+- The run summary counts tests per class under "writes outside the test's temp
+  dirs"; `GENESIS_LIVE_WRITES_REPORT=<file>` writes one tab-separated line per
+  (test, class, operation, path), on every run.
+- A hit is a write that happens: an attempt the kernel refuses or that changes
+  nothing (`mkdir(exist_ok=True)` on an existing directory, `unlink` of a missing
+  file, reopening an existing file without writing) is not recorded. A relative
+  `os.open` is judged against the cwd and labelled so (its audit event carries no
+  `dir_fd`). Writes during collection count as "outside any test".
+- Not covered: writes made by child processes, writes without an audit event,
+  metadata changes (`chmod`, `utime`, `setxattr`, `touch` of an existing file),
+  `mkfifo`/`mknod`, SQLite writes through an already-open connection, and
+  `file://localhost` or percent-encoded SQLite URIs. The OS-level sandbox is the
+  boundary there.
+
+The list it produces is the to-do list for moving each such test under its own
+`tmp_path`; once it is empty, the audit can refuse instead of report.
+
 ## Integration Tests
 
 Integration tests in `tests/integration/` require running external services
@@ -391,3 +430,24 @@ When adding a new subsystem or feature:
 2. Add subsystem-specific fixtures in `tests/test_<subsystem>/conftest.py`.
 3. Mock external dependencies; do not require live services for unit tests.
 4. Verify the new tests pass in isolation: `pytest -v tests/test_<subsystem>/`.
+
+## Request-owned resource coverage
+
+Shutdown grace and actual synchronous completion are covered by
+`tests/test_db/test_request_database_drain.py`,
+`tests/test_db/test_request_database_drain_states.py`,
+`tests/test_db/test_physical_work.py`, and
+`tests/test_db/test_physical_work_states.py`. These cover real owned-file use,
+queued/running executor cancellation, ambiguous submission, joined children,
+context propagation and legacy cancellation. The connection budget is tested
+separately from the number of physical operations. Fault fixtures release and
+join their real workers; an import failure or unrelated timeout is not evidence
+of forbidden resource use. Production factories and shared activation remain
+separate qualifications.
+
+`tests/test_memory/test_resource_thread_ownership.py` exercises all nine migrated
+memory boundaries with gated real file I/O, cancellation and a real scratch
+database lease. `tests/test_memory/test_tag_index_ownership.py` covers independent
+background admission, physical scan drain, refusal/creation failure, prestart
+cancellation, retriever propagation and the body-completed/done-callback gap.
+`tests/test_memory/test_tag_index_swr.py` retains legacy stale-query behavior.

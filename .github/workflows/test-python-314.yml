@@ -21,7 +21,9 @@ permissions:
 jobs:
   test-python-314:
     runs-on: ubuntu-26.04
-    # As for `test` in ci.yml: 180 leaves room for its slowest healthy run on 26.04.
+    # The suite runs serially here (ci.yml's `test` job runs it on four workers),
+    # so this job takes about two hours; 180 leaves room for its slowest
+    # healthy run on 26.04.
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7

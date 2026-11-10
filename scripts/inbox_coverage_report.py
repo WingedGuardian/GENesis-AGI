@@ -27,6 +27,10 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from genesis.inbox.url_coverage import _CoverageUrlOccurrence
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_DIR / "src"
@@ -60,9 +64,9 @@ class RowInput:
     processed_at: str | None
     rowid: int
     item_urls: list[str] | None
-    # normalized URL -> original URL as stored, so the coverage check runs on
-    # the same token the live gate sees (matching uses the normalized form).
-    item_raw: dict[str, str] = field(default_factory=dict)
+    # Association keys may drop tracking params, but coverage retains EVERY
+    # original occurrence with its own source-proven presentation.
+    item_occurrences: dict[str, list[_CoverageUrlOccurrence]] = field(default_factory=dict)
 
 
 @dataclass
@@ -72,7 +76,9 @@ class Report:
     totals: dict[str, int] = field(default_factory=dict)
 
 
-def _row_item_urls(batch_items: object) -> tuple[list[str], dict[str, str]] | None:
+def _row_item_urls(
+    batch_items: object,
+) -> tuple[list[str], dict[str, list[_CoverageUrlOccurrence]]] | None:
     """A row's item URLs, or ``None`` when the row is legacy.
 
     Only a ``BATCH_ITEMS_V2_PREFIX`` payload decodes into item texts; anything
@@ -80,7 +86,8 @@ def _row_item_urls(batch_items: object) -> tuple[list[str], dict[str, str]] | No
     the row legacy — production decoders treat the same cases as unusable.
     """
     from genesis.db.crud.inbox_items import BATCH_ITEMS_V2_PREFIX
-    from genesis.inbox.scanner import extract_urls, strip_tracking_params
+    from genesis.inbox.scanner import strip_tracking_params
+    from genesis.inbox.url_coverage import _coverage_url_occurrences
 
     if not isinstance(batch_items, str) or not batch_items.startswith(
         BATCH_ITEMS_V2_PREFIX
@@ -94,17 +101,17 @@ def _row_item_urls(batch_items: object) -> tuple[list[str], dict[str, str]] | No
         return None
     urls: list[str] = []
     seen: set[str] = set()
-    raw_by_norm: dict[str, str] = {}
+    occurrences_by_norm: dict[str, list[_CoverageUrlOccurrence]] = {}
     for item in items:
         if not isinstance(item, str):
             continue
-        for raw in extract_urls(item):
-            url = strip_tracking_params(raw)
+        for occurrence in _coverage_url_occurrences(item):
+            url = strip_tracking_params(occurrence.display)
+            occurrences_by_norm.setdefault(url, []).append(occurrence)
             if url not in seen:
                 seen.add(url)
                 urls.append(url)
-                raw_by_norm[url] = raw
-    return urls, raw_by_norm
+    return urls, occurrences_by_norm
 
 
 def _entry(url: str, cls: str, response="", covered="", reason="") -> dict:
@@ -138,7 +145,7 @@ def _classify_url(
     read_response: Callable[[str], str | None],
 ) -> dict:
     """First-match classification for one URL, in spec order."""
-    from genesis.inbox.url_coverage import _uncovered_urls
+    from genesis.inbox.url_coverage import _uncovered_occurrences
 
     completed = _attributed(rows, url, ("completed",))
     if completed:
@@ -151,11 +158,11 @@ def _classify_url(
                 response, covered = "missing", "unknown"
             else:
                 response = "present"
-                # The live gate judges coverage on the ORIGINAL item URL —
-                # tracking params stripped for matching would wrongly convict
-                # a response that cited exactly what the item carried.
-                cited = row.item_raw.get(url, url)
-                covered = "yes" if _uncovered_urls(text, cited) == [] else "no"
+                occurrences = row.item_occurrences.get(url)
+                if not occurrences:
+                    covered = "unknown"
+                else:
+                    covered = "no" if _uncovered_occurrences(text, occurrences) else "yes"
         return _entry(url, "evaluated", response, covered)
 
     if _attributed(rows, url, ("pending", "processing")):
@@ -258,12 +265,13 @@ def connect_readonly(db_path: Path) -> sqlite3.Connection:
 
 
 def _note_urls(text: str) -> list[str]:
-    from genesis.inbox.scanner import extract_urls, strip_tracking_params
+    from genesis.inbox.scanner import strip_tracking_params
+    from genesis.inbox.url_coverage import _coverage_url_occurrences
 
     urls: list[str] = []
     seen: set[str] = set()
-    for raw in extract_urls(text):
-        url = strip_tracking_params(raw)
+    for occurrence in _coverage_url_occurrences(text):
+        url = strip_tracking_params(occurrence.display)
         if url not in seen:
             seen.add(url)
             urls.append(url)
@@ -336,7 +344,7 @@ def main(argv: list[str] | None = None) -> int:
                     processed_at=r[3],
                     rowid=r[4],
                     item_urls=decoded[0] if decoded else None,
-                    item_raw=decoded[1] if decoded else {},
+                    item_occurrences=decoded[1] if decoded else {},
                 )
                 for r in conn.execute(
                     "SELECT status, error_message, response_path, processed_at,"
