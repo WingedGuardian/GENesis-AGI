@@ -4603,10 +4603,12 @@ def _analyze_bounded(
                 continue
             in_added = _in_added or nested_index in added
             if in_added:
-                _added_work[0] += len(script)
-                if _added_work[0] > _added_work[1]:
+                # Charged only when performed: the descent that would cross the
+                # budget is refused, so the work done never exceeds it.
+                if _added_work[0] + len(script) > _added_work[1]:
                     truncated = True
                     continue
+                _added_work[0] += len(script)
             inner = _analyze_bounded(
                 script, _depth=_depth + 1, _decision_text=_decision_text,
                 _origin=origin, _in_substitution=in_substitution,
