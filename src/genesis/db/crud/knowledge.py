@@ -225,7 +225,7 @@ def credential_body_trigger_ddl() -> tuple[str, ...]:
 
 
 #: The message the secret_ref guard raises; ``upsert`` recognises it.
-_SECRET_REF_REFUSED = "refusing a credential reference that names no stored secret (#2426)"  # noqa: S105 - an error message, not a secret
+_REF_GUARD_REFUSED = "refusing a credential reference that names no stored secret (#2426)"
 
 
 def secret_ref_trigger_ddl() -> tuple[str, ...]:
@@ -242,7 +242,7 @@ def secret_ref_trigger_ddl() -> tuple[str, ...]:
     guard = (
         f"WHEN {_CREDENTIAL_ROW} AND (NEW.secret_ref IS NULL OR NOT EXISTS "
         "(SELECT 1 FROM reference_secrets s WHERE s.id = NEW.secret_ref)) "
-        f"BEGIN SELECT RAISE(ABORT, '{_SECRET_REF_REFUSED}'); END"
+        f"BEGIN SELECT RAISE(ABORT, '{_REF_GUARD_REFUSED}'); END"
     )
     retire = (
         "BEGIN DELETE FROM reference_secrets WHERE id = OLD.secret_ref AND NOT EXISTS "
@@ -585,7 +585,7 @@ async def upsert(
             ),
         )
     except aiosqlite.IntegrityError as exc:
-        if _SECRET_REF_REFUSED not in str(exc):
+        if _REF_GUARD_REFUSED not in str(exc):
             raise
         raise ValueError(
             "refusing a credential reference with no value to hold: the secret "
