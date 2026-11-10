@@ -55,6 +55,9 @@ Rules:
   tool result as an exposure, and the code under test, or a correct
   implementation of an intent, prints its own output to builders too. A step
   may print short observed lines beside the hash so a failure stays readable.
+- Every scenario carries `Author: holdout-writer, YYYY-MM-DD` with today's UTC
+  date (`date -u +%F`). The runner uses that date to tell which scenarios a
+  later exposure may have spoiled, and treats a scenario without one as spoiled.
 - Number new scenarios after the highest existing id, and never reuse an id.
   Never edit or loosen an existing scenario; if one is wrong, say so in your
   report. Deleting is allowed only when retiring one as above.

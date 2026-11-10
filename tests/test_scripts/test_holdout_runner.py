@@ -755,6 +755,146 @@ def test_exposures_are_counted_from_the_fence_log(repo, fake_gh, install_holdout
     )
 
 
+def _exposure_log(home, *ats):
+    log = home / "logs" / "holdout-exposures.jsonl"
+    log.parent.mkdir()
+    log.write_text("".join(json.dumps({"at": a, "kind": "read"}) + "\n" for a in ats))
+
+
+def _authored(sid, date):
+    extra = f"Author: holdout-writer, {date}\n" if date else ""
+    return _scenario(sid, steps=_call("g"), expect="gamma", extra=extra)
+
+
+def test_only_scenarios_written_by_the_day_after_an_exposure_are_spoiled(
+    repo, fake_gh, install_holdout, capsys
+):
+    _exposure_log(install_holdout, "2026-11-01T09:00:00Z", "2026-11-05T23:00:00Z")
+    text = (
+        _authored("H-01", "2026-11-01")
+        + _authored("H-02", "2026-11-06")
+        + _authored("H-03", "2026-11-07")
+        + _authored("H-04", None)
+    )
+    _, out = _run_install(repo, install_holdout, text, capsys)
+    line = next(ln for ln in out.splitlines() if ln.startswith("holdout fence:"))
+    assert line.endswith("possibly spoiled: H-01, H-02, H-04: tell the owner")
+
+
+def test_scenarios_written_after_every_exposure_are_not_flagged(
+    repo, fake_gh, install_holdout, capsys
+):
+    _exposure_log(install_holdout, "2026-11-01T09:00:00Z")
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-03"), capsys)
+    assert (
+        "holdout fence: 1 exposure(s), first 2026-11-01T09:00:00Z, latest "
+        "2026-11-01T09:00:00Z; every scenario was written after the latest exposure"
+    ) in out
+
+
+def _raw_log(home, *lines):
+    log = home / "logs" / "holdout-exposures.jsonl"
+    log.parent.mkdir()
+    log.write_text("".join(ln + "\n" for ln in lines))
+
+
+def _fence_line(out):
+    return next(ln for ln in out.splitlines() if ln.startswith("holdout fence:"))
+
+
+def _read_row(at, kind="read"):
+    return json.dumps({"at": at, "kind": kind})
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        [_read_row("2026-11-01T09:00:00Z"), _read_row("")],
+        [_read_row("2026-11-01T09:00:00Z"), '{"at": "2026-11-09T10:00:00Z", "kind": "re'],
+        [_read_row("2026-11-01T09:00:00Z"), "[1]"],
+        [_read_row("2026-11-01T09:00:00Z"), json.dumps({"at": 5, "kind": "read"})],
+    ],
+    ids=["empty-time", "torn-line", "not-an-object", "not-a-string"],
+)
+def test_a_last_row_of_unknown_time_spoils_every_scenario(
+    repo, fake_gh, install_holdout, capsys, lines
+):
+    _raw_log(install_holdout, *lines)
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-08"), capsys)
+    assert _fence_line(out).endswith("possibly spoiled: H-01: tell the owner")
+
+
+def test_a_row_of_unknown_time_is_bounded_by_the_next_dated_row(
+    repo, fake_gh, install_holdout, capsys
+):
+    _raw_log(
+        install_holdout,
+        _read_row(""),
+        "garbled",
+        _read_row("2026-11-01T09:00:00Z", kind="allowed"),
+    )
+    text = _authored("H-01", "2026-11-02") + _authored("H-02", "2026-11-03")
+    _, out = _run_install(repo, install_holdout, text, capsys)
+    assert _fence_line(out).endswith("possibly spoiled: H-01: tell the owner")
+
+
+@pytest.mark.parametrize(
+    "at", ["9999-12-31T23:00:00-05:00", "0001-01-01T00:00:00+05:00", "9999-12-31T00:00:00Z"]
+)
+def test_a_time_at_the_edge_of_the_calendar_does_not_stop_the_run(
+    repo, fake_gh, install_holdout, capsys, at
+):
+    _raw_log(install_holdout, _read_row(at))
+    rc, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-08"), capsys)
+    assert rc != 3 and _fence_line(out).endswith("possibly spoiled: H-01: tell the owner")
+
+
+def test_an_older_row_after_an_unknown_one_does_not_bound_it(
+    repo, fake_gh, install_holdout, capsys
+):
+    _raw_log(
+        install_holdout,
+        _read_row("2026-11-01T09:00:00Z"),
+        _read_row(""),
+        _read_row("2026-10-01T09:00:00Z", kind="allowed"),
+    )
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-08"), capsys)
+    assert _fence_line(out).endswith("possibly spoiled: H-01: tell the owner")
+
+
+def test_an_offset_time_is_judged_on_its_utc_day(repo, fake_gh, install_holdout, capsys):
+    _raw_log(install_holdout, _read_row("2026-11-05T23:30:00-05:00"))
+    text = _authored("H-01", "2026-11-07") + _authored("H-02", "2026-11-08")
+    _, out = _run_install(repo, install_holdout, text, capsys)
+    assert _fence_line(out).endswith("possibly spoiled: H-01: tell the owner")
+
+
+@pytest.mark.parametrize(
+    "author",
+    ["holdout-writer, 2026-11-01, rechecked 2026-11-09", "holdout-writer, 2026-11-09, 2026-13-45"],
+    ids=["earliest-date-counts", "a-bad-date-counts-as-none"],
+)
+def test_the_author_line_is_read_in_the_spoiling_direction(
+    repo, fake_gh, install_holdout, capsys, author
+):
+    _exposure_log(install_holdout, "2026-11-05T09:00:00Z")
+    text = _scenario("H-01", steps=_call("g"), expect="gamma", extra=f"Author: {author}\n")
+    _, out = _run_install(repo, install_holdout, text, capsys)
+    assert _fence_line(out).endswith("possibly spoiled: H-01: tell the owner")
+
+
+def test_an_author_date_past_tomorrow_counts_as_none(repo, fake_gh, install_holdout, capsys):
+    _exposure_log(install_holdout, "2026-11-05T09:00:00Z")
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2099-01-01"), capsys)
+    assert _fence_line(out).endswith("possibly spoiled: H-01: tell the owner")
+
+
+def test_an_empty_holdout_is_not_reported_as_clear(repo, fake_gh, install_holdout, capsys):
+    _exposure_log(install_holdout, "2026-11-05T09:00:00Z")
+    _, out = _run_install(repo, install_holdout, "# no scenarios yet\n", capsys)
+    assert _fence_line(out).endswith("; no scenarios to judge")
+
+
 def test_unreadable_lines_are_counted_not_fatal(repo, fake_gh, install_holdout, capsys):
     log = install_holdout / "logs" / "holdout-exposures.jsonl"
     log.parent.mkdir()

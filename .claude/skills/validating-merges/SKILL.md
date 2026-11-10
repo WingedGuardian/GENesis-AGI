@@ -588,8 +588,12 @@ Record it:
   verdict. File or reuse an issue for `BROKEN-BEFORE`, and tell the owner about
   the rest.
 - Exit 3 (the run could not be completed) is a gap naming the reason it printed.
-- A `holdout fence:` line counting exposures goes to the owner when it is not
-  zero: a scenario seen by someone other than its writer may be spoiled. A line
+- A `holdout fence:` line naming possibly spoiled scenarios goes to the owner:
+  a scenario seen by someone other than its writer may be spoiled. One that
+  names none needs no report unless it also counts unreadable lines or
+  holdout-writer accesses, which the owner confirms; the same holds for a
+  `no exposures logged` line. An `exposure log unreadable` line goes to the
+  owner too. A line
   saying the fence is not installed means exposures are not being recorded.
 
 Never open, list or quote the holdout directory (`$GENESIS_HOME/holdout/`,

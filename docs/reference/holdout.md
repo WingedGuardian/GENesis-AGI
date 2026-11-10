@@ -70,6 +70,9 @@ exact standard output
   only when one matches a file the merge changed.
 - `Expect-before` is required. `Issue` is required for `Expect-before: FAIL`
   and ignored otherwise. `Expect-exit` defaults to `0`.
+- `Author` names the writer and the UTC date the scenario was written. The
+  runner reads that date to tell which scenarios a later exposure may have
+  spoiled, and counts a scenario without one as spoiled.
 - A scenario passes when its exit status equals `Expect-exit` and its standard
   output equals the `Expect` block (trailing newlines ignored).
 - Steps run with `bash` in the checkout under test, with `HOLDOUT_ROOT` set to
@@ -144,8 +147,19 @@ agent declaring itself `holdout-writer` are counted separately, with the latest
 time, for the owner to match against writer runs they ordered: the writer is
 known only by the name an agent declares, so any session could claim it. The
 fence and the count catch honest mistakes; "no exposures" is not proof that the
-set is still hidden. A scenario
-written before an exposure may be spoiled; tell the owner. It also keeps
+set is still hidden. When there are exposures, the line names the scenarios
+they may have spoiled: those whose `Author` date (`YYYY-MM-DD`, the earliest
+one on the line; none if any of them is not a real date) is no later than the day after the latest exposure, judged in
+UTC, since dates are whole days and the extra day covers time zones. The log is
+append-only, so an exposure with no readable time, or a line that does not
+parse, is bounded by the next dated row that is not older than any before it; one
+with no such row after it counts against every scenario. The runner reads
+without the fence's lock, so a row being written at that moment can make one
+run name every scenario. So does a scenario with no `Author` date, or one dated
+after tomorrow. Tell the owner about any it names. When it names none, it says
+every scenario was written after the latest exposure (or that there are no
+scenarios to judge). This judges reads: an exposure that copied the file
+somewhere could be read later, which the log cannot see. It also keeps
 `$GENESIS_HOME/.ignore` listing `holdout/`, so ripgrep-based searches of the
 Genesis home skip the directory.
 

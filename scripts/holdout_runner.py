@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime as dt
 import fnmatch
 import json
 import os
@@ -121,6 +122,7 @@ STEP_FILE_LIMIT_KIB = 64 * 1024
 _SCENARIO_HEADING = re.compile(r"^## (H-\d+)(?:[ \t]+(.*))?$")
 _SCENARIO_LIKE = re.compile(r"^## H-\S*")
 _ANY_HEADING = re.compile(r"^#{1,6}[ \t]")
+_DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 _FIELD = re.compile(r"^([A-Z][A-Za-z-]*):[ \t]*(.*)$")
 _FENCE = re.compile(r"^(```+|~~~+)")
 # The only inherited variables a step sees. Everything else, credentials and the
@@ -161,6 +163,20 @@ class Scenario:
     @property
     def expect_exit(self) -> int:
         return int(self.fields.get("Expect-exit", "0").strip())
+
+    @property
+    def author_date(self) -> dt.date | None:
+        """The earliest YYYY-MM-DD on the Author line, or None when there is none.
+
+        The earliest, because a later date on the line cannot move back the day
+        the scenario first existed. Any date that does not parse gives None.
+        """
+        found = _DATE.findall(self.fields.get("Author", ""))
+        try:
+            dates = [dt.date.fromisoformat(d) for d in found]
+        except ValueError:
+            return None
+        return min(dates) if dates else None
 
     @property
     def issue(self) -> int:
@@ -580,7 +596,7 @@ def cmd_pr(pr: int, repo: str | None, root: Path, holdout: Path, out=None) -> in
     if holdout.resolve() == DEFAULT_HOLDOUT.resolve():
         # Only for the install's own holdout, never a file passed for testing.
         _ensure_ignore(holdout.parent)
-        _print_exposures(out)
+        _print_exposures(out, scenarios)
     merge, linked = resolve_merge(pr, repo, root)
     try:
         _git(root, "cat-file", "-e", f"{merge}^{{commit}}")
@@ -661,11 +677,31 @@ def _ensure_ignore(holdout_dir: Path) -> None:
         pass
 
 
-def _print_exposures(out) -> None:
+def _utc_day(value: object) -> dt.date | None:
+    """The UTC day of an ISO timestamp, or None when it is not one."""
+    try:
+        when = dt.datetime.fromisoformat(str(value))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=dt.UTC)
+        return when.astimezone(dt.UTC).date()
+    except (ValueError, OverflowError):
+        return None
+
+
+def _print_exposures(out, scenarios: list[Scenario]) -> None:
     """Always one line: how many exposures the holdout fence has recorded.
 
     Silence would read as "none", so a missing or unreadable log says so, and
-    lines that do not parse are counted rather than ending the count.
+    lines that do not parse are counted rather than ending the count. When there
+    are exposures, the line names the scenarios they may have spoiled: those
+    whose Author date is no later than the day after the latest exposure. Dates
+    are whole days, so that day's margin covers time zones.
+
+    The log is append-only, so a row with no readable time, or a line that does
+    not parse, happened no later than the next dated row: that row's day bounds
+    it, unless it is older than a day already seen (the clock went back). Only such a row at the end of the log has no bound, and then every
+    scenario counts as spoiled. So does a scenario with no Author date, or one
+    dated later than tomorrow, which cannot be right.
     """
     if not FENCE_HOOK.exists():
         print("holdout fence: not installed in this checkout; exposures are not recorded", file=out)
@@ -673,7 +709,8 @@ def _print_exposures(out) -> None:
     if not EXPOSURE_LOG.exists():
         print("holdout fence: no exposures logged (no exposure log yet)", file=out)
         return
-    count, bad, times = 0, 0, []
+    count, bad, times, days = 0, 0, [], []
+    unbounded = False  # an exposure of unknown time with no dated row after it yet
     writer, writer_times = 0, []
     try:
         with open(EXPOSURE_LOG, encoding="utf-8", errors="replace") as fh:
@@ -683,11 +720,16 @@ def _print_exposures(out) -> None:
                 try:
                     row = json.loads(line)
                 except ValueError:
-                    bad += 1
-                    continue
+                    row = None
                 if not isinstance(row, dict):
                     bad += 1
+                    unbounded = True
                     continue
+                day = _utc_day(row.get("at"))
+                if day is not None and unbounded and (not days or day >= max(days)):
+                    # A later dated row bounds it, unless the clock went back.
+                    days.append(day)
+                    unbounded = False
                 if row.get("kind") == "allowed":
                     # The writer is known only by the name an agent declares, so
                     # these are counted for the owner to match against writer
@@ -697,6 +739,10 @@ def _print_exposures(out) -> None:
                     continue
                 count += 1
                 times.append(str(row.get("at") or ""))
+                if day is None:
+                    unbounded = True
+                else:
+                    days.append(day)
     except OSError as exc:
         print(f"holdout fence: exposure log unreadable ({exc}); treat as unknown", file=out)
         return
@@ -706,15 +752,30 @@ def _print_exposures(out) -> None:
             f"; {writer} access(es) declaring the holdout-writer agent, latest "
             f"{max(writer_times)}: confirm each was a writer run you ordered"
         )
-    if not count:
+    if not count and not bad:
         print(f"holdout fence: no exposures logged{tail}", file=out)
         return
-    print(
-        f"holdout fence: {count} exposure(s), first {min(times)}, latest {max(times)}{tail} "
-        f"(see {EXPOSURE_LOG}); a scenario written before an exposure may be spoiled: "
-        "tell the owner",
-        file=out,
-    )
+    latest = None if unbounded or not days else max(days)
+    tomorrow = dt.datetime.now(dt.UTC).date() + dt.timedelta(days=1)
+    spoiled = [
+        sc.sid
+        for sc in scenarios
+        if latest is None
+        or sc.author_date is None
+        or sc.author_date > tomorrow
+        or sc.author_date <= (latest + dt.timedelta(days=1) if latest < dt.date.max else latest)
+    ]
+    span = f", first {min(times)}, latest {max(times)}" if times else ""
+    head = f"holdout fence: {count} exposure(s){span}{tail}"
+    if spoiled:
+        print(
+            f"{head} (see {EXPOSURE_LOG}); possibly spoiled: {', '.join(spoiled)}: tell the owner",
+            file=out,
+        )
+    elif not scenarios:
+        print(f"{head}; no scenarios to judge", file=out)
+    else:
+        print(f"{head}; every scenario was written after the latest exposure", file=out)
 
 
 def cmd_at_path(root: Path, holdout: Path, ids: list[str], out=None) -> int:
