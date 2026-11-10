@@ -189,6 +189,7 @@ def test_bound():
     )
     print("CHILD_HOME=" + child.stdout.strip())
     print("XDG_CONFIG_HOME=" + os.environ.get("XDG_CONFIG_HOME", "<unset>"))
+    print("PLAYWRIGHT_BROWSERS_PATH=" + os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "<unset>"))
     print("DB_CONST=" + str(connection.DEFAULT_DB_PATH))
     print("DB_DEFAULT=" + str(inspect.signature(connection.init_db).parameters["path"].default))
     print("TASK_DB=" + str(task_tools._DB_PATH))
@@ -232,7 +233,9 @@ def _subrun(tmp_path: Path, extra_env: dict[str, str] | None = None) -> subproce
     (sub / "conftest.py").write_text(_SUBRUN_EARLY_CONFTEST)
     (sub / "test_x.py").write_text(_SUBRUN_EARLY_TEST)
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(_REPO), str(_REPO / "src")])}
-    for name in _CLOSURE_VARS:
+    # This session's closure may have set the browser path itself; the sub-run
+    # derives its own.
+    for name in (*_CLOSURE_VARS, "PLAYWRIGHT_BROWSERS_PATH"):
         env.pop(name, None)
     # The parent's HOME is this session's private one: hand the sub-run the real
     # home, so its own redirect is what it shows.
@@ -388,6 +391,25 @@ def test_the_home_is_private_from_before_any_subdirectory_conftest(tmp_path):
     assert _value(out.stdout, "XDG_CONFIG_HOME") == str(Path(home) / ".config")
     assert "HOME redirected" in out.stdout
     assert not os.path.exists(home)  # removed at the end of that run
+
+
+@pytest.mark.parametrize("custom_cache", [True, False])
+def test_the_browser_cache_is_found_where_the_run_started(tmp_path, custom_cache):
+    """Playwright looks in XDG_CACHE_HOME, else ~/.cache. The closure replaces
+    both, so it points Playwright at the cache the run started with, read-only."""
+    run = tmp_path / "run"
+    run.mkdir()
+    env = {}
+    if custom_cache:
+        cache = tmp_path / "custom-cache" / "ms-playwright"
+        env["XDG_CACHE_HOME"] = str(cache.parent)
+    else:
+        home = tmp_path / "home"
+        cache = home / ".cache" / "ms-playwright"
+        env["HOME"] = str(home)
+    cache.mkdir(parents=True)
+    out = _subrun(run, env)
+    assert _value(out.stdout, "PLAYWRIGHT_BROWSERS_PATH") == str(cache), out.stdout
 
 
 def test_this_session_runs_with_a_private_home():

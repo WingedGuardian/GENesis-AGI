@@ -222,10 +222,15 @@ def _redirect_home() -> None:
     except OSError as exc:
         sys.stderr.write(f"genesis: test HOME not redirected ({exc}); tests use the real home\n")
         return
+    # Playwright resolves its cache as XDG_CACHE_HOME, else ~/.cache (its
+    # registry's cacheDirectory). Read both as the run started, before the
+    # private home replaces them.
     started = _starting_home()
-    if started is not None:
-        # Playwright resolves its cache from HOME, as the lock and basetemp do.
-        cache = Path(started) / ".cache" / "ms-playwright"
+    cache_root = os.environ.get("XDG_CACHE_HOME") or (
+        str(Path(started) / ".cache") if started is not None else None
+    )
+    if cache_root and os.path.isabs(cache_root):
+        cache = Path(cache_root) / "ms-playwright"
         if "PLAYWRIGHT_BROWSERS_PATH" not in os.environ and cache.is_dir():
             # Read-only use: the UI tests still find their browser.
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(cache)
