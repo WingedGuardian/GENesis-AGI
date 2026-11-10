@@ -791,6 +791,17 @@ class Judge:
             # A covered row's disk is its parent's node part (an index-only
             # write here, index == tag == HEAD, loses nothing on disk).
             if node is not None:
+                # A node --check predicts the staging refuses passed left()
+                # first (_verdict): its disk is the as-left state, so the row's
+                # index and flag parts stay eligible and as_the_writer_would
+                # refuses them row-refused, as the writer does (#4355 review).
+                # The writer judges a tag directory strictly, so that reading
+                # decides here (an extra the checkout does not ignore: changed).
+                if p in self.predicted:
+                    try:
+                        return self._left(p, strict=True)
+                    except OSError:  # unreadable below it: the writer's walk fails too
+                        return False
                 return node in ("as-left", "already-restored")
             return covered or bool(row["unreachable_through"]) or self._left(p, whole=False)
 

@@ -547,6 +547,23 @@ def test_check_names_the_refusal_the_restore_makes_for_a_damaged_copy(w, damage)
     assert said.startswith("other:") and did == f"refused:{said}", (c.stdout, r.stdout)
 
 
+@pytest.mark.parametrize(
+    ("make", "copy"), [(_foreign_staged, "A"), (_foreign_both_flags, "sub/s1")]
+)
+def test_a_damaged_copy_refuses_its_rows_index_and_flag_parts_alike_in_both(w, make, copy):
+    """#4355 review (Codex, CodeRabbit): the node part's predicted refusal is
+    not a change on disk, so --check keeps the row's index and flag parts
+    eligible and refuses them `row-refused` through the writer's own cascade,
+    as --restore does, never `other:changed`."""
+    ts, path, _ = _fresh(w, make)
+    (w.backups()[-1] / "tree" / copy).write_text("not what was saved\n")
+    c, r = _restore(w, ts, "--check"), _restore(w, ts)
+    kinds = {k for p, k in _parts(c) if p == path}
+    assert kinds > {"node"}, ("control: the row has an index or flag part", c.stdout)
+    assert _parts(c)[(path, "node")] == "other:hash-mismatch", c.stdout
+    _check_said_what_restore_did(c, r)
+
+
 def test_a_damaged_copy_behind_a_changed_checkout_reads_changed_in_both(w):
     """#4025 review S2: the writer never stages a part that is not as-left, so
     a damaged copy under a path edited since the repair is refused `changed`
