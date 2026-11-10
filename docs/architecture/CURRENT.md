@@ -135,6 +135,33 @@ Easy-to-forget mechanisms:
   (`memory/corrective.py`), which runs inside those tools — so the internal
   runtime stack and the hermetic LongMemEval harness (both pass explicit
   `rerank` kwargs) are unaffected.
+- **A credential reference's value is held out of its own indexes** (#2426).
+  For `reference.credentials`, `ingest_knowledge_unit` (the one chokepoint every
+  reference writer passes) puts `Value: [held in the reference secret store; read it with reference_lookup]` in
+  the body and redacts fragments of the value wherever the body, tags,
+  identifier, authority or provenance repeat them (`reference_ops.split_secret`),
+  so the unit's knowledge_units and knowledge_fts rows, its memory_fts row, the
+  Qdrant payload and the embedding never see it. The value goes to an
+  insert-only `reference_secrets` row under a fresh random id, and ONE statement
+  then writes the unit naming it in `knowledge_units.secret_ref`, so a body and
+  the secret it names are always one writer's pair on a connection that
+  serializes statements, not transactions. The `knowledge_units_secret_ref_*`
+  triggers refuse a credential unit naming no stored secret and delete the
+  secret a unit stops naming (repointed or deleted);
+  `knowledge_crud.sweep_orphan_secrets` (after every delete, and at boot)
+  removes secrets older than an hour that an interrupted upsert left unnamed.
+  Auto-captured credentials are written insert-only: a key holding a different
+  value is never replaced, and the capture retries under a fresh random tag.
+  Two `knowledge_units` triggers refuse a
+  credential body without exactly one placeholder line, whichever process
+  writes it (text on a later line only the Python check sees).
+  Only `reference_ops.resolve_value` reads the value: `reference_lookup` (behind
+  its audit log) and the dashboard's reveal. Identifier kinds (url, network,
+  account, fact) keep their value in the body, because it is what their lookups
+  search for. NOT covered yet: the episodic memory the extraction job stores
+  for the same conversation text, which still carries an auto-captured value.
+  Credentials stored before this change keep their value inline until the
+  follow-up migration rewrites them; both readers parse those as before.
 - **`drift_recall`** (`memory/drift.py`) is the degraded-mode fallback; its
   FTS drilldown searches every collection in `source_collections`,
   rank-merged across collections.
