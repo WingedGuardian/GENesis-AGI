@@ -309,12 +309,15 @@ prune_guard_corpus() {
 }
 
 prune_backup_runs() {
-    # prune_backup_runs <dir> <label> <days>: remove the per-run directories under
-    # a Genesis-owned backup dir once older than <days> (each is written once, so
-    # its mtime is its age), through remove_tree_one_fs, which spares a tree that
-    # is or holds a mount. A <dir> that is a symlink is refused: it points at a
-    # directory Genesis does not own, and every old directory there would go.
-    local dir="$1" label="$2" days="$3" root mounts run
+    # prune_backup_runs <dir> <label> <days> [<keep>]: remove the per-run
+    # directories under a Genesis-owned backup dir once older than <days> (each
+    # is written once, so its mtime is its age), through remove_tree_one_fs,
+    # which spares a tree that is or holds a mount. A <dir> that is a symlink is
+    # refused: it points at a directory Genesis does not own, and every old
+    # directory there would go. <keep>, when given, is a function asked about
+    # each old directory: exit 0 keeps it (its output says why), anything else
+    # lets it go.
+    local dir="$1" label="$2" days="$3" keep="${4:-}" root mounts run why
     if [ -L "$dir" ]; then
         echo "$label prune SKIPPED: $dir is a symlink; pruning would delete at its target"
         return 0
@@ -325,8 +328,32 @@ prune_backup_runs() {
         return 0
     fi
     while IFS= read -r -d '' run; do
+        if [ -n "$keep" ] && why="$("$keep" "$run")"; then
+            echo "$label prune: keeping $run ($why)"
+            continue
+        fi
         remove_tree_one_fs "$run" "$mounts" 1 || echo "$label prune failed or spared $run"
     done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -mtime +"$days" -print0 2>/dev/null)
+}
+
+keep_repair_report() {
+    # keep_repair_report <dir>: exit 0 (and say why) while <dir> is a live-move
+    # repair report folder holding saved edits nobody restored or dismissed
+    # (#4331): the folder is the only copy of them, and pruning it would also
+    # drop deploy health's alert about them. The rule lives in
+    # lib/repair_report_keep.py, which also keeps the restore run folder a kept
+    # report's in-flight record names; exit 3 there lets the prune take the
+    # folder. Any other outcome (no python3, a crash, which exits 1) keeps it:
+    # a saved edit is never lost because its report could not be judged.
+    local why rc
+    why="$(python3 -I -S "$SCRIPT_DIR/lib/repair_report_keep.py" "$1" 2>&1)"
+    rc=$?
+    case "$rc" in
+        0) echo "$why" ;;
+        3) return 1 ;;
+        *) echo "its report could not be judged (exit $rc)" ;;
+    esac
+    return 0
 }
 
 prune_browser_backups() {
@@ -919,11 +946,14 @@ maintenance_main() {
     # directory's mtime is its age.
     prune_backup_runs "$HOME/.genesis/premerge-backups" premerge-backups 45
 
-    echo "--- replaced systemd unit backup retention prune (>90d) ---"
+    echo "--- deploy backup retention prune (>90d, unresolved repair reports kept) ---"
     # update.sh --take-template / bootstrap's GENESIS_TAKE_TEMPLATES save a hand-edited
     # unit here, one directory per run, before installing its template
     # (lib/managed_units.sh). Written once, so a directory's mtime is its age.
-    prune_backup_runs "$HOME/.genesis/deploy-backups" deploy-backups 90
+    # The live-move repair writes its report folders here too
+    # (<ts>-live-move-repair), and the restore its run folders: a report is kept
+    # while it is unresolved (keep_repair_report), however old.
+    prune_backup_runs "$HOME/.genesis/deploy-backups" deploy-backups 90 keep_repair_report
 
     echo "--- hook audit store size trim (>5MB per store, newest kept) ---"
     # The two store knobs, read BY NAME out of secrets.env (`_load_store_knob`),
