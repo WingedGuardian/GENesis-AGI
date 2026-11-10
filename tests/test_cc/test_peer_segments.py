@@ -288,6 +288,44 @@ def test_failed_manager_query_is_not_an_empty_scope(peer_invocation, monkeypatch
         peer_invocation.peer_segment._stop_scope()
 
 
+_BUS = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+
+
+def test_a_server_without_bus_variables_still_reaches_the_user_manager(
+    peer_invocation, monkeypatch
+):
+    """A server started without the user-bus variables gives a contained launch
+    and its scope queries the per-uid defaults systemctl_env() supplies, so
+    systemd-run --user can start the scope and cleanup can confirm it."""
+    for name in _BUS:
+        monkeypatch.delenv(name, raising=False)
+    uid = os.getuid()
+    expected = {
+        "XDG_RUNTIME_DIR": f"/run/user/{uid}",
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus",
+    }
+    env = peer_invocation.peer_segment.environment(peer_invocation)
+    assert {name: env.get(name) for name in _BUS} == expected
+    seen = []
+
+    def systemctl(args, **kwargs):
+        seen.append(kwargs.get("env") or {})
+        return subprocess.CompletedProcess(args, 1, "", "")
+
+    monkeypatch.setattr(peer_segment.subprocess, "run", systemctl)
+    with pytest.raises(RuntimeError, match="state could not be confirmed"):
+        peer_invocation.peer_segment._show_scope()
+    assert {name: seen[-1].get(name) for name in _BUS} == expected
+
+
+def test_inherited_bus_variables_are_kept(peer_invocation, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/fixture-runtime")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/fixture-runtime/bus")
+    env = peer_invocation.peer_segment.environment(peer_invocation)
+    assert env["XDG_RUNTIME_DIR"] == "/run/fixture-runtime"
+    assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/fixture-runtime/bus"
+
+
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
 async def test_public_run_always_drains_peer_scope(

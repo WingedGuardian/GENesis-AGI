@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 from genesis.cc.exceptions import CCProcessError
 from genesis.util.proc_kill import ProcessCleanupUncertain
-from genesis.util.systemd import literal_scope_args
+from genesis.util.systemd import literal_scope_args, systemctl_env
 
 if TYPE_CHECKING:
     from genesis.cc.types import CCInvocation
@@ -253,6 +253,11 @@ class PeerSegment:
         # capability is its facade lease; it inherits no owner API credential,
         # shell startup override, external-client setting, or session identity.
         env = {key: value for key, value in os.environ.items() if key in _PROVIDER_ENV}
+        # systemd-run --user needs the user bus; a server started without these
+        # gets the same per-uid defaults every other systemctl caller uses.
+        bus = systemctl_env()
+        for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+            env.setdefault(key, bus[key])
         self.pin_environment(env, invocation.working_dir)
         from genesis.cc.roster import apply_routing_env
 
@@ -317,6 +322,7 @@ class PeerSegment:
             capture_output=True,
             text=True,
             timeout=15,
+            env=systemctl_env(),
         )
         values = dict(line.split("=", 1) for line in result.stdout.split("\n") if line)
         if result.returncode or set(values) != {"LoadState", "ActiveState", "ControlGroup"}:
@@ -341,7 +347,10 @@ class PeerSegment:
         if not control_group.startswith("/") or ".." in group.parts or group.name != self.unit_name:
             raise RuntimeError("peer scope control group could not be confirmed")
         stopped = subprocess.run(
-            [_systemctl(), "--user", "stop", self.unit_name], capture_output=True, timeout=15
+            [_systemctl(), "--user", "stop", self.unit_name],
+            capture_output=True,
+            timeout=15,
+            env=systemctl_env(),
         )
         try:
             events = dict(
