@@ -83,6 +83,8 @@ class Recommendation:
     # Context
     item_title: str = ""
     classification: str = ""  # "genesis" or "user"
+    # Evaluator explanation only; missing rationale never changes routing.
+    why_not_adopt: str | None = None
 
     @property
     def is_actionable(self) -> bool:
@@ -176,6 +178,13 @@ def parse_recommendations(evaluation_text: str) -> list[Recommendation]:
         # Extract item title from the ## heading
         title = _extract_item_title(section)
 
+        why_not_adopt = data.get("why_not_adopt")
+        why_not_adopt = (
+            why_not_adopt.strip() or None if isinstance(why_not_adopt, str) else None
+        )
+        if action.casefold() == "adapt" and why_not_adopt is None:
+            logger.warning("ADAPT recommendation missing usable why_not_adopt rationale")
+
         rec = Recommendation(
             action=action,
             next_step=next_step,
@@ -217,6 +226,7 @@ def parse_recommendations(evaluation_text: str) -> list[Recommendation]:
             ),
             item_title=title,
             classification=classification,
+            why_not_adopt=why_not_adopt,
         )
         results.append(rec)
 
