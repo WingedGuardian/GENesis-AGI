@@ -3594,7 +3594,7 @@
     },
     {
       "name": "memory_store",
-      "description": "Store memory with source metadata and type tag. Returns memory_id.\n\nArgs:\n    memory_class: Optional classification — \"rule\", \"fact\", or \"reference\".\n        Auto-classified from content if not provided.\n    wing: Structural domain (auto-classified if not provided).\n    room: Topic within the wing (auto-classified if not provided).\n    collection: Explicit Qdrant collection override. Bypasses the default\n        collection routing when provided (e.g. \"knowledge_base\").\n    supersedes: Memory ID that this new memory replaces. The old memory\n        will be marked as deprecated with a ``succeeded_by`` link to the\n        new one. Use when correcting stale facts.",
+      "description": "Store memory; return an id, or a supersession report when requested.\n\nArgs:\n    memory_class: Optional classification — \"rule\", \"fact\", or \"reference\".\n        Auto-classified from content if not provided.\n    wing: Structural domain (auto-classified if not provided).\n    room: Topic within the wing (auto-classified if not provided).\n    collection: Explicit Qdrant collection override. Bypasses the default\n        collection routing when provided (e.g. \"knowledge_base\").\n    supersedes: Memory ID that this new memory replaces. The old memory\n        is deprecated and linked to the correction. Returns memory_id,\n        superseded, and full old_id/new_id; incomplete supersession includes\n        the exact memory_supersede repair call. Blank input is no request.",
       "inputSchema": {
         "properties": {
           "content": {
@@ -3691,7 +3691,15 @@
         "description": "Generic wrapper for non-object return types.",
         "properties": {
           "result": {
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ]
           }
         },
         "required": [
@@ -3703,7 +3711,7 @@
     },
     {
       "name": "memory_supersede",
-      "description": "Deprecate a memory, recording another memory as its correction.\n\nThe supersede on its own, when the correction is ALREADY stored. Use it\nwhen you are linking two memories that both already exist, or whenever you\nknow both ids up front — it is the direct way to say \"this one replaces\nthat one\".\n\nIt does NOT say \"use this when ``memory_store(supersedes=...)`` told you the\ndeprecation failed\", because that tool cannot tell you: ``store()`` catches\na failed deprecation and still returns only the new memory's id, so no such\nreport reaches this boundary. Saying otherwise described a recovery the\ncaller can never be prompted to make.\n\nBoth arguments accept the same short ``id:<8-char>`` handles the proactive\nhook prints and ``memory_expand`` accepts; an ambiguous handle is never\nguessed.\n\nNothing is written unless every check passes, so a REJECTION costs\nnothing and is safe to retry once you have corrected the ids. It raises\nrather than returning a verdict, because there is no stored content whose\nfate you would have to interpret alongside the error — that asymmetry is\nexactly why this exists as its own tool.\n\nRejected, with nothing changed:\n  * either id naming no memory, or a prefix naming several\n  * ``old_id == new_id`` — a memory cannot replace itself\n  * a ``new_id`` that is itself deprecated OR already temporally invalid\n    (past ``invalid_at``) — normal recall filters both out, so the\n    correction would be unreachable while the target went away\n\nOne failure is NOT a rejection: ``SupersedeIncomplete`` means the SQLite\ndeprecation committed but a mirror (the Qdrant payload or the\n``succeeded_by`` link) did not. Retry with the FULL ids the error carries\n(a short handle may re-resolve elsewhere): every step is idempotent, and\nthe retry finishes the vector/graph half. It is not \"nothing happened\":\nthe old memory is already deprecated for keyword recall.\n\nArgs:\n    old_id: The memory being corrected. Marked deprecated.\n    new_id: The memory that replaces it. Must exist and be live.",
+      "description": "Deprecate a memory, recording another memory as its correction.\n\nThe supersede on its own, when the correction is ALREADY stored. Use it\nwhen you are linking two memories that both already exist, or whenever you\nknow both ids up front — it is the direct way to say \"this one replaces\nthat one\".\n\nAlso use the full ids reported when ``memory_store(supersedes=...)`` saves\nthe correction but reports superseded=False. This repairs the remaining\nsupersession work without storing another memory.\n\nBoth arguments accept the same short ``id:<8-char>`` handles the proactive\nhook prints and ``memory_expand`` accepts; an ambiguous handle is never\nguessed.\n\nNothing is written unless every check passes, so a REJECTION costs\nnothing and is safe to retry once you have corrected the ids. It raises\nrather than returning a verdict, because there is no stored content whose\nfate you would have to interpret alongside the error — that asymmetry is\nexactly why this exists as its own tool.\n\nRejected, with nothing changed:\n  * either id naming no memory, or a prefix naming several\n  * ``old_id == new_id`` — a memory cannot replace itself\n  * a ``new_id`` that is itself deprecated OR already temporally invalid\n    (past ``invalid_at``) — normal recall filters both out, so the\n    correction would be unreachable while the target went away\n\nOne failure is NOT a rejection: ``SupersedeIncomplete`` means the SQLite\ndeprecation committed but a mirror (the Qdrant payload or the\n``succeeded_by`` link) did not. Retry with the FULL ids the error carries\n(a short handle may re-resolve elsewhere): every step is idempotent, and\nthe retry finishes the vector/graph half. It is not \"nothing happened\":\nthe old memory is already deprecated for keyword recall.\n\nArgs:\n    old_id: The memory being corrected. Marked deprecated.\n    new_id: The memory that replaces it. Must exist and be live.",
       "inputSchema": {
         "properties": {
           "old_id": {
