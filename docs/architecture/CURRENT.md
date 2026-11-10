@@ -5428,6 +5428,13 @@ logger or unrelated exceptions with copied text and no provenance.
   before #4011 carry no ts and are found only through the in-flight record.
   The deploy-backups prune keeps a run folder named for its report for as
   long as that report's folder exists.
+  The files git ignores that a tag directory held when it was moved aside
+  (a server's `__pycache__`) stay in its aside: a tag directory is a node
+  part only where the repair saved a file or a link there (one whose disk node
+  is a directory, or nothing, is no node part; its files are rows), so they
+  never have a directory to go back to. Every `--restore` names them, from every as-left aside of every run
+  folder, so a run killed before naming them loses nothing; they never
+  withhold `restored_at`.
   `REPAIR.json` gets a `restore` block, `{inflight: [run, path, "node"] |
   null, refused: <int>, restored_at: <str> | null}` (no per-part list; the
   output carries those), rewritten under update.lock after a re-read;
