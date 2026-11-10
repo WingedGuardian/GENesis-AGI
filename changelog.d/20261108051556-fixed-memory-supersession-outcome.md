@@ -1,1 +1,1 @@
-Memory stores requesting supersession now report whether both the saved correction and its supersession completed. Incomplete mirror or link work returns the saved id and a repair call using full memory ids; ordinary stores still return a bare id.
+- Memory stores requesting supersession now report whether both the saved correction and its supersession completed. Incomplete mirror or link work returns the saved id and a repair call using full memory ids; ordinary stores still return a bare id.
