@@ -1304,6 +1304,16 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   does not dodge it. What the reflection must cite comes from
   `review_reflection.obligations()`:
 
+  A finding that is not a defect uses `Disposition: c<ID> no-defect reply=<ID>`
+  (a maintainer reply to that inline finding), or `Disposition: r<reviewID>:<count>
+  no-defect comment=<ID>` / `Disposition: i<ID> no-defect comment=<ID>` (a maintainer
+  issue comment on the same PR whose first line is `No-defect: <full-key>`, then
+  a nonempty rationale). The `r` key covers the entire counted review-body group.
+  The citation, including edits, must predate the reflection. `Decision: acknowledge`
+  is available only when every disposition is no-defect. Offline `validate` checks
+  syntax; online coverage verifies the citations. All existing evidence, ancestry,
+  escalation and round-budget rules still apply.
+
   | Lane | Class audit (`Audit-evidence:`) | Premise check (`Premise-evidence:`) | Terminal |
   |---|---|---|---|
   | gate | round 1 | round 2 and later | round 2 |
