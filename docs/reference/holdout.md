@@ -30,10 +30,13 @@ An install with no `HOLDOUT.md` has no holdout: the runner prints
   an issue's stated intent, before the issue goes to a builder. It must fail on
   the default branch now and pass once the change lands. This is the case a
   holdout exists for: the builder never sees what it will be judged against. It
-  is judged only against a PR that links issue N (GitHub lists it as closed by
-  the PR, or the body says `closes`, `fixes`, `resolves`, `implements` or `part of`), so an
-  unrelated PR touching the same files is never charged with it. A plain mention
-  of `#N` does not link, nor does a closing reference to another repository's issue. A linked PR runs the scenario whatever files it touched.
+  is judged only against a PR that links issue N: GitHub lists it as closed by
+  the PR, or the body uses a closing keyword (`closes`, `fixes`, `resolves`
+  `#N`). An unrelated PR touching the same files is never charged with it, and
+  neither is a PR that is only `part of #N`: under a split, only the last PR
+  delivers the intent, so it is the one that says `Closes #N`. A plain mention of
+  `#N` does not link, nor does a closing reference to another repository's
+  issue. A linked PR runs the scenario whatever files it touched.
   Once it is `DELIVERED`, the writer retires it and adds a regression scenario
   for the same behaviour in its place.
 
@@ -123,13 +126,19 @@ error, an unreadable file). The parent arm is the merge commit's first parent,
 which is the default branch before the merge under squash merges, the only
 method this repository allows.
 
-For the install's own holdout, the runner also prints one line counting the
-exposures the holdout fence recorded in `$GENESIS_HOME/logs/holdout-exposures.jsonl`
-(reads, writes, accesses and content seen by anyone but the writer; that file is
-never rotated), or saying the log is missing or unreadable. A scenario
+For the install's own holdout, the runner also prints one line about the
+holdout fence, an advisory hook that records any agent but the writer reaching
+the holdout (`scripts/hooks/holdout_fence.py`, added separately): "not
+installed in this checkout" until that hook exists, then the count of exposures
+it recorded in `$GENESIS_HOME/logs/holdout-exposures.jsonl` (reads, writes,
+accesses and content; never rotated), or that the log is missing or unreadable. The
+"installed" test is the hook file's presence in the checkout. A scenario
 written before an exposure may be spoiled; tell the owner. It also keeps
 `$GENESIS_HOME/.ignore` listing `holdout/`, so ripgrep-based searches of the
 Genesis home skip the directory.
+
+`--has-holdout` prints whether this install keeps a holdout and where, and
+reads nothing in it; skills and agents use it instead of hard-coding the path.
 
 `--at-path DIR [--scenario H-NN ...]` runs scenarios against a directory and
 prints `PASS` or `FAIL` per id. The writer uses it to check a new scenario on the
@@ -137,7 +146,8 @@ current tree and on a deliberately broken copy.
 
 ## Rules for sessions
 
-- Never open, list, search or quote `~/.genesis/holdout/`. Run the runner.
+- Never open, list, search or quote the holdout directory
+  (`$GENESIS_HOME/holdout/`, `~/.genesis/holdout/` by default). Run the runner.
 - Spawn `holdout-writer` in the FOREGROUND (not in the background). A
   background agent's final report arrives as a notification message in the
   parent's transcript, which memory extraction reads; a foreground agent's

@@ -192,11 +192,23 @@ def test_intent_verdicts_when_the_pr_closes_the_issue(repo, fake_gh, tmp_path, c
     assert rc == 1
 
 
-def test_a_body_mention_links_the_issue(repo, fake_gh, tmp_path, capsys):
-    fake_gh["body"] = f"Part of #{ISSUE}."
+def test_a_closing_keyword_in_the_body_links_the_issue(repo, fake_gh, tmp_path, capsys):
+    fake_gh["body"] = f"Fixes #{ISSUE}."
     rc, out = _run_pr(repo, _intent_set(), tmp_path, capsys)
     assert _lines(out)["H-02"].startswith("H-02 NOT-DELIVERED")
     assert rc == 1
+
+
+@pytest.mark.parametrize(
+    "body", [f"Part of #{ISSUE}.", f"Implements #{ISSUE}", f"Split: PR 1 of 3 for #{ISSUE}"]
+)
+def test_a_partial_link_never_charges_the_pr(repo, fake_gh, tmp_path, capsys, body):
+    """Under a split every PR but the last is "part of" the issue and cannot
+    deliver its intent; charging each would open a false fail-intent per PR."""
+    fake_gh["body"] = body
+    rc, out = _run_pr(repo, _intent_set(), tmp_path, capsys)
+    assert _lines(out)["H-02"] == "H-02 PENDING — protects H-02"
+    assert rc == 0
 
 
 def test_an_unlinked_pr_is_never_charged_with_an_intent_scenario(repo, fake_gh, tmp_path, capsys):
@@ -445,7 +457,7 @@ def test_long_observed_output_states_the_omission(repo, tmp_path, capsys):
 
 
 @pytest.mark.parametrize(
-    "body", [f"Closes #{ISSUE}", f"fixes #{ISSUE}.", f"Implements #{ISSUE}", f"Part of #{ISSUE}"]
+    "body", [f"Closes #{ISSUE}", f"fixes #{ISSUE}.", f"Resolves: #{ISSUE}", f"closed #{ISSUE}"]
 )
 def test_closing_keywords_link_the_issue(repo, fake_gh, tmp_path, capsys, body):
     fake_gh["body"] = body
@@ -639,6 +651,7 @@ def test_a_descendant_that_starts_its_own_session_is_killed(repo, tmp_path, caps
 
 
 def test_the_scratch_root_is_created_never_replaced_by_the_default_temp(tmp_path, monkeypatch):
+    monkeypatch.delenv("GENESIS_BIG_TMP", raising=False)
     fresh = tmp_path / "fresh-home"
     fresh.mkdir()
     monkeypatch.setenv("HOME", str(fresh))
@@ -647,6 +660,7 @@ def test_the_scratch_root_is_created_never_replaced_by_the_default_temp(tmp_path
 
 
 def test_an_uncreatable_scratch_root_stops_the_run(tmp_path, monkeypatch):
+    monkeypatch.delenv("GENESIS_BIG_TMP", raising=False)
     blocker = tmp_path / "home-file"
     blocker.write_text("not a directory")
     monkeypatch.setenv("HOME", str(blocker))
@@ -695,6 +709,10 @@ def install_holdout(tmp_path, monkeypatch):
     (home / "holdout").mkdir(parents=True)
     monkeypatch.setattr(hr, "DEFAULT_HOLDOUT", home / "holdout" / "HOLDOUT.md")
     monkeypatch.setattr(hr, "EXPOSURE_LOG", home / "logs" / "holdout-exposures.jsonl")
+    fence = tmp_path / "fence" / "holdout_fence.py"
+    fence.parent.mkdir()
+    fence.write_text("# stand-in: the fence is installed\n")
+    monkeypatch.setattr(hr, "FENCE_HOOK", fence)
     return home
 
 
@@ -788,3 +806,61 @@ def test_genesis_home_moves_the_default_holdout(monkeypatch, tmp_path):
     assert hr.genesis_home() == tmp_path / "gh"
     monkeypatch.delenv("GENESIS_HOME")
     assert hr.genesis_home() == Path.home() / ".genesis"
+
+
+def test_genesis_home_expands_a_tilde(monkeypatch):
+    monkeypatch.setenv("GENESIS_HOME", "~/elsewhere")
+    assert hr.genesis_home() == Path.home() / "elsewhere"
+
+
+def test_a_checkout_without_the_fence_says_exposures_are_not_recorded(
+    repo, fake_gh, install_holdout, capsys, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(hr, "FENCE_HOOK", tmp_path / "absent" / "holdout_fence.py")
+    _, out = _run_install(
+        repo, install_holdout, _scenario("H-01", steps=_call("g"), expect="gamma"), capsys
+    )
+    assert "holdout fence: not installed in this checkout; exposures are not recorded" in out
+
+
+def test_has_holdout_reports_presence_without_reading_it(tmp_path, capsys):
+    holdout = tmp_path / "HOLDOUT.md"
+    assert hr.main(["--has-holdout", "--holdout", str(holdout)]) == 0
+    assert capsys.readouterr().out.strip() == f"holdout: none (would be {holdout})"
+    holdout.write_text(f"## H-01 t\n{HIDDEN_EXPECT}\n")
+    assert hr.main(["--has-holdout", "--holdout", str(holdout)]) == 0
+    out = capsys.readouterr().out
+    assert out.strip() == f"holdout: present at {holdout}"
+    assert HIDDEN_EXPECT not in out
+
+
+def test_the_runner_uses_the_repository_resolvers():
+    import genesis.env
+    import genesis.util.tmp
+
+    assert hr.genesis_home is genesis.env.genesis_home
+    assert hr.big_tmp_dir is genesis.util.tmp.big_tmp_dir
+
+
+def test_the_runner_imports_without_the_venv(tmp_path):
+    """Under an interpreter with no genesis installed, the runner still imports
+    its own checkout's helpers, so it never dies with exit 1 (an attributable
+    failure) on an import error."""
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "PYTHONNOUSERSITE": "1"}
+    script = REPO_DIR / "scripts" / "holdout_runner.py"
+    proc = subprocess.run(
+        [
+            "/usr/bin/python3",
+            "-I",
+            str(script),
+            "--has-holdout",
+            "--holdout",
+            str(tmp_path / "H.md"),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.startswith("holdout: none")

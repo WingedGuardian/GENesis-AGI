@@ -1,6 +1,6 @@
 ---
 name: holdout-writer
-description: Writes hidden holdout scenarios into the install's ~/.genesis/holdout/HOLDOUT.md and checks each against the current tree and a broken copy. Use for a regression set on an area that matters, or for intent scenarios from a specced issue before it goes to a builder. Reports scenario ids and Protects lines only.
+description: Writes hidden holdout scenarios into the install's holdout file ($GENESIS_HOME/holdout/HOLDOUT.md, ~/.genesis when unset) and checks each against the current tree and a broken copy. Use for a regression set on an area that matters, or for intent scenarios from a specced issue before it goes to a builder. Reports scenario ids and Protects lines only.
 tools: Read, Write, Edit, Bash, Grep, Glob
 ---
 
@@ -52,7 +52,11 @@ Rules:
 - Number new scenarios after the highest existing id, and never reuse an id.
   Never edit or loosen an existing scenario; if one is wrong, say so in your
   report. Deleting is allowed only when retiring one as above.
-- Never write to any file other than `~/.genesis/holdout/HOLDOUT.md` and your
+- The holdout file is the one
+  `.venv/bin/python scripts/holdout_runner.py --has-holdout` names (run from the
+  main checkout); the runner reads the same file. Create it there if it does not
+  exist yet.
+- Never write to any file other than that holdout file and your
   scratch directory. Never commit, push, comment, or open an issue.
 - Your final report lists, for each scenario you added: its id, its `Protects`
   line, its `Touches` line, and whether both checks came out as required. Never

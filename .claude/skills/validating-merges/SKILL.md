@@ -580,7 +580,8 @@ Record it:
   Then spawn `holdout-writer` in the foreground to retire it into a regression
   scenario.
 - `PASS` is a finding, never a control: nothing had to come out the other way.
-- `PENDING` needs nothing: the scenario belongs to another issue's work.
+- `PENDING` needs nothing: the scenario belongs to another issue's work, or to
+  a later PR in a split of this one.
 - `BROKEN-BEFORE`, `STALE-INTENT`, `FIXED`, `DELIVERED-UNLINKED`,
   `CLOSED-NOT-DELIVERED` and `MALFORMED`
   are findings about the default branch or the scenario, never this row's
@@ -588,9 +589,11 @@ Record it:
   the rest.
 - Exit 3 (the run could not be completed) is a gap naming the reason it printed.
 - A `holdout fence:` line counting exposures goes to the owner when it is not
-  zero: a scenario seen by someone other than its writer may be spoiled.
+  zero: a scenario seen by someone other than its writer may be spoiled. A line
+  saying the fence is not installed means exposures are not being recorded.
 
-Never open, list or quote `~/.genesis/holdout/` yourself, and never ask what a
+Never open, list or quote the holdout directory (`$GENESIS_HOME/holdout/`,
+`~/.genesis/holdout/` by default) yourself, and never ask what a
 scenario checks beyond its printed `Protects` line: reading it spoils it.
 
 ---

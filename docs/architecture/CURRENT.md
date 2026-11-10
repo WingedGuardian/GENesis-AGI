@@ -2838,7 +2838,7 @@ verified: c712f1bde 2026-11-06
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
   one is age-based and passive. `session_awareness/repo_pulse*.py`.
 - **Holdout scenarios** (shipped; per-install data, none in the repo): hidden
-  exact checks that builders never see, in `~/.genesis/holdout/HOLDOUT.md`,
+  exact checks that builders never see, in `$GENESIS_HOME/holdout/HOLDOUT.md`,
   written only by the `holdout-writer` subagent (regression scenarios from
   today's behaviour, or intent scenarios from a specced issue before it is
   built). `scripts/holdout_runner.py --pr N` runs each touched scenario at the

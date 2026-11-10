@@ -25,7 +25,8 @@ Regression scenarios (``Expect-before: PASS``):
 Intent scenarios (``Expect-before: FAIL``) name the issue they were written
 for (``Issue: N``). They are judged against a PR only when that PR links the
 issue: GitHub lists it as closed by the PR, or the body says ``closes``,
-``fixes``, ``resolves``, ``implements`` or ``part of`` ``#N``. A linked intent
+``fixes`` or ``resolves`` ``#N`` (GitHub's closing keywords; ``part of`` does
+not link, because under a split only the last PR delivers the intent). A linked intent
 scenario runs whatever files the PR touched, because where the builder put the
 change is not something the writer could know. Any other PR is never charged
 with not delivering someone else's work:
@@ -74,17 +75,24 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# The repository's own resolvers, not copies of them: a copy of genesis_home lost
+# its ~ expansion and a copy of the scratch rule fell back to the default temp.
+# This checkout's src goes first (the scripts/pr_verification.py pattern), so the
+# runner imports its own copy under any interpreter: both modules are stdlib-only.
+SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
-def genesis_home() -> Path:
-    """``$GENESIS_HOME``, else ``~/.genesis``; the holdout fence resolves it the same way."""
-    value = os.environ.get("GENESIS_HOME")
-    return Path(value) if value else Path.home() / ".genesis"
-
+from genesis.env import genesis_home  # noqa: E402
+from genesis.util.tmp import big_tmp_dir  # noqa: E402
 
 DEFAULT_HOLDOUT = genesis_home() / "holdout" / "HOLDOUT.md"
 # The holdout fence writes only real exposures (reads, writes, accesses and
 # content seen by anyone but the writer) here, and never rotates it.
 EXPOSURE_LOG = genesis_home() / "logs" / "holdout-exposures.jsonl"
+# A proxy for "the fence is installed": the hook file is present in this checkout.
+# The wiring itself lives in .claude/settings.json and .codex/config.toml.
+FENCE_HOOK = Path(__file__).resolve().parent / "hooks" / "holdout_fence.py"
 
 # A holdout step is a deterministic, local check that normally finishes in
 # well under a second. 120 s is two orders of magnitude above that; past it the
@@ -118,9 +126,10 @@ _FENCE = re.compile(r"^(```+|~~~+)")
 # The only inherited variables a step sees. Everything else, credentials and the
 # SSH agent included, is dropped rather than filtered by name.
 _INHERITED_ENV = ("LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "USER", "LOGNAME", "SHELL")
-_CLOSING_REF = re.compile(
-    r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|implements?|part\s+of)[:\s]+#(\d+)\b"
-)
+# GitHub's closing keywords only. "Part of #N" and "implements #N" do not link:
+# under a split, every PR but the last is part of the issue and cannot deliver
+# its intent, and charging each would open a false fail-intent per PR.
+_CLOSING_REF = re.compile(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[:\s]+#(\d+)\b")
 
 
 class RunnerError(Exception):
@@ -433,18 +442,16 @@ def touched(sc: Scenario, files: list[str]) -> bool:
 
 
 def _scratch_base() -> str:
-    """The disk-backed scratch root, ``~/tmp``, created when missing.
+    """The disk-backed scratch root (``genesis.util.tmp.big_tmp_dir``), created when missing.
 
     Two full worktree checkouts land here, so it must never fall back to the
     default temp location, which may be a small tmpfs or a session's quota-capped
     working temp. If it cannot be created, the run stops instead.
     """
-    base = Path.home() / "tmp"
     try:
-        base.mkdir(parents=True, exist_ok=True)
+        return big_tmp_dir()
     except OSError as exc:
-        raise RunnerError(f"cannot create the scratch directory {base}: {exc}") from exc
-    return str(base)
+        raise RunnerError(f"cannot create the scratch directory: {exc}") from exc
 
 
 def _git(root: Path, *args: str) -> str:
@@ -660,6 +667,9 @@ def _print_exposures(out) -> None:
     Silence would read as "none", so a missing or unreadable log says so, and
     lines that do not parse are counted rather than ending the count.
     """
+    if not FENCE_HOOK.exists():
+        print("holdout fence: not installed in this checkout; exposures are not recorded", file=out)
+        return
     if not EXPOSURE_LOG.exists():
         print("holdout fence: no exposures logged (no exposure log yet)", file=out)
         return
@@ -700,6 +710,8 @@ def cmd_at_path(root: Path, holdout: Path, ids: list[str], out=None) -> int:
     if scenarios is None:
         print("no holdout on this install", file=out)
         return 0
+    if holdout.resolve() == DEFAULT_HOLDOUT.resolve():
+        _ensure_ignore(holdout.parent)
     chosen = [sc for sc in scenarios if not ids or sc.sid in ids]
     missing = sorted(set(ids) - {sc.sid for sc in scenarios})
     for sid in missing:
@@ -721,6 +733,11 @@ def main(argv: list[str] | None = None) -> int:
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--pr", type=int, help="judge this merged PR")
     mode.add_argument("--at-path", type=Path, help="run scenarios against this directory")
+    mode.add_argument(
+        "--has-holdout",
+        action="store_true",
+        help="print whether this install keeps a holdout, and where; reads nothing in it",
+    )
     ap.add_argument("--repo", help="owner/name (default: the checkout's own repo)")
     ap.add_argument("--root", type=Path, help="git checkout to cut worktrees from (default: cwd)")
     ap.add_argument("--holdout", type=Path, default=DEFAULT_HOLDOUT)
@@ -730,6 +747,12 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.scenario and args.at_path is None:
         ap.error("--scenario applies to --at-path only")
+    if args.has_holdout:
+        if args.holdout.is_file():
+            print(f"holdout: present at {args.holdout}")
+        else:
+            print(f"holdout: none (would be {args.holdout})")
+        return 0
     try:
         if args.at_path is not None:
             return cmd_at_path(args.at_path.resolve(), args.holdout, args.scenario)
