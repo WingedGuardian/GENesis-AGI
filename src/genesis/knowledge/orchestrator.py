@@ -575,7 +575,7 @@ class KnowledgeOrchestrator:
                     qdrant_ids.append(qdrant_id)
                     if was_created:
                         created_ids.append(qdrant_id)
-            except Exception:
+            except BaseException:
                 logger.error(
                     "Qdrant write failed after %d/%d units from %s — compensating",
                     len(qdrant_ids),
@@ -606,7 +606,7 @@ class KnowledgeOrchestrator:
                 # Post-commit connection-close reporting remains a separate boundary.
                 try:
                     own = await stack.enter_async_context(get_raw_db(genesis_db_path()))
-                except Exception:
+                except BaseException:
                     logger.error(
                         "Owned connection unavailable after %d/%d vectors from %s — compensating",
                         len(qdrant_ids),
