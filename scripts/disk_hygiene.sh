@@ -106,8 +106,8 @@ fi
 #
 # A child some process still holds OPEN is spared whatever its age. Age alone
 # cannot see a download or unpack that started days ago and is still running,
-# and the pressure mode below prunes at 2 days, where that stops being
-# hypothetical. The liveness signal and its limits (same-uid only, and a writer
+# and the pressure mode below prunes at 4 days (2 at RED), where that stops
+# being hypothetical. The liveness signal and its limits (same-uid only, and a writer
 # that closes between files is invisible) are documented in tmp_liveness.sh.
 prune_tmp() {
     local tmp_dir="${1:-$HOME/tmp}" age_min="${2:-}"
@@ -155,7 +155,15 @@ prune_tmp() {
         fi
         # The ONLY way a tree is removed: remove_tree_one_fs re-checks the
         # table this pass read at its start (not a fresh read).
-        remove_tree_one_fs "$child" "$mounts" 1 || echo "tmp prune failed or spared $child"
+        # Name every removal with its size: an unlogged removal leaves no
+        # answer when someone's work goes missing later.
+        local mb
+        mb="$(du -smx -- "$child" 2>/dev/null | cut -f1)"
+        if remove_tree_one_fs "$child" "$mounts" 1; then
+            echo "tmp prune: removed $child (${mb:-?} MB)"
+        else
+            echo "tmp prune failed or spared $child"
+        fi
     done < <(find "$tmp_dir" -mindepth 1 -maxdepth 1 \
                 ! -name bg-cc-sessions "${age_pred[@]}" -print0 2>/dev/null)
 }
@@ -218,8 +226,11 @@ reclaim_unlock() { { exec 8>&-; } 2>/dev/null || true; }
 # pressure_main [--last-resort] — the reclaim subset the tmp watchgod runs when
 # the disk itself is in trouble (its ORANGE tier; RED adds --last-resort). Only
 # the steps that FREE space, and each one more aggressive than the daily run:
-# caches regardless of the usage gate, ~/tmp at 2 days instead of 7, and at RED
-# the code-intel indexes too. Deliberately NOT the worktree reaper (it moves
+# caches regardless of the usage gate, ~/tmp at 4 days instead of 7 (2 at RED),
+# and at RED the code-intel indexes too. ORANGE can start on a disk that still
+# has room (a write burst lifts a YELLOW floor one level), so it leaves recent
+# ~/tmp work alone; RED needs at least an ORANGE floor (under 8 % free), where
+# space comes first. Deliberately NOT the worktree reaper (it moves
 # worktrees to a trash bin, which frees nothing until the purge) nor any of the
 # database retention prunes (they free megabytes and take the DB lock).
 #
@@ -228,22 +239,23 @@ reclaim_unlock() { { exec 8>&-; } 2>/dev/null || true; }
 # from overlapping the other instance or the daily run. The watchgod never
 # deletes anything itself.
 pressure_main() {
-    local last_resort="${1:-}"
+    local last_resort="${1:-}" lr=0
+    # "last-resort" is the systemd instance name (%i); "--last-resort" the CLI form.
+    case "$last_resort" in --last-resort | last-resort) lr=1 ;; esac
     # The standard (ORANGE) pass pins --last-resort-above past 100 %. That is
     # disk_reclaim.py's own default now (#2567), but it stays explicit: an
     # ORANGE pass that inherited the old 95 % default deleted the code-intel
     # indexes before RED ever fired (review finding, #2521 item 1). Only the
     # last-resort (RED) pass clears them.
     local -a reclaim=(--apply --if-above 0 --fail-above 101 --last-resort-above 101)
-    # "last-resort" is the systemd instance name (%i); "--last-resort" the CLI form.
-    if [ "$last_resort" = "--last-resort" ] || [ "$last_resort" = "last-resort" ]; then
+    if (( lr )); then
         reclaim=(--apply --if-above 0 --fail-above 101 --last-resort-above 0)
     fi
     echo "=== genesis-disk-hygiene PRESSURE ${last_resort:-} $(date -u +%FT%TZ) ==="
     # Standard waits up to one watchgod re-trigger interval and then yields —
     # the reclaim already running is doing this work. Last-resort (RED) waits
     # briefly and then runs regardless: at RED, freeing space beats ordering.
-    if [ "$last_resort" = "--last-resort" ] || [ "$last_resort" = "last-resort" ]; then
+    if (( lr )); then
         reclaim_lock "${RECLAIM_WAIT_S:-120}" \
             || echo "reclaim lock still held after ${RECLAIM_WAIT_S:-120}s — last-resort runs unserialized"
     elif ! reclaim_lock "${RECLAIM_WAIT_S:-600}"; then
@@ -256,8 +268,12 @@ pressure_main() {
         || echo "disk_reclaim exited $?"
     echo "--- background CC sandbox reaping ---"
     reap_bg_sandboxes "$HOME/tmp/bg-cc-sessions"
-    echo "--- ~/tmp age prune (>2d, live writers spared) ---"
-    prune_tmp "$HOME/tmp" 2880
+    local tmp_age_min=5760 tmp_age=4d
+    if (( lr )); then
+        tmp_age_min=2880 tmp_age=2d
+    fi
+    echo "--- ~/tmp age prune (>${tmp_age}, live writers spared) ---"
+    prune_tmp "$HOME/tmp" "$tmp_age_min"
     reclaim_unlock
     echo "=== genesis-disk-hygiene PRESSURE done ==="
 }
