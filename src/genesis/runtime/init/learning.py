@@ -458,15 +458,15 @@ def build_learning_collectors(rt: GenesisRuntime) -> list:
     ]
     if ollama_enabled():
         probes.append(probe_ollama)
-    # The graph engine is part of the memory architecture once its unit is enabled
-    # (bootstrap renders it only from an engine verified on this install). With
-    # no unit the engine was never provisioned here and reads stay quietly on
-    # networkx (graphstore_config.selection), so probing it would pin such an
-    # install at critical_failure=1.0 for a service it does not run. Decided at
-    # build time: a unit rendered later joins at the next server start.
-    from genesis.memory.graphstore_config import engine_unit_present
+    # The graph engine is part of the memory architecture when reads use it
+    # (graphstore_config.selection says falkordb, an overlay choice included) or
+    # its unit is enabled. With neither, reads stay quietly on networkx, so
+    # probing it would pin such an install at critical_failure=1.0 for a
+    # service it does not run. Decided at build time: a selection or unit that
+    # changes later takes effect at the next server start.
+    from genesis.memory.graphstore_config import engine_unit_present, selection
 
-    if engine_unit_present():
+    if engine_unit_present() or selection()[0] == "falkordb":
         from genesis.observability.health import probe_falkordb
 
         probes.append(probe_falkordb)

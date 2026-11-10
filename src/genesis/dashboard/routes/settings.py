@@ -80,12 +80,25 @@ _CHANGED_KEYS_ONLY = frozenset({"graphstore"})
 _MISSING = object()
 
 
-def _changed_keys(config_filename: str, submitted: dict) -> dict:
-    """The submitted keys whose value differs from the current merged config.
-    A key the overlay already holds needs no special case: the write merges
-    into the existing overlay, so a dropped unchanged key keeps its value."""
-    current = _load_yaml_merged(config_filename)
-    return {k: v for k, v in submitted.items() if current.get(k, _MISSING) != v}
+def _changed_keys(config_filename: str, submitted: dict, shown: dict | None = None) -> dict:
+    """The submitted keys the user changed, type included (a submitted 1 is never
+    taken for True and so never skips validation).
+
+    ``shown`` is what the editor displayed (``__shown`` in the PUT). Compared
+    against it, a key differs exactly when the user edited it, whatever the
+    shipped default says, so a value equal to the shipped one is still written
+    when the user chose it. A client that sends no snapshot is compared against
+    the current merged config; to write a value equal to it, such a client sends
+    ``__shown`` naming what it replaces (``{}`` writes every submitted key). A
+    key the overlay already holds needs no special case: the write merges into
+    the existing overlay, so a dropped unchanged key keeps its value."""
+    current = shown if isinstance(shown, dict) else _load_yaml_merged(config_filename)
+
+    def unchanged(k, v):
+        cur = current.get(k, _MISSING)
+        return cur is not _MISSING and type(cur) is type(v) and cur == v
+
+    return {k: v for k, v in submitted.items() if not unchanged(k, v)}
 
 
 def _strip_hidden(domain, data: dict) -> dict:
@@ -154,9 +167,12 @@ async def settings_update(domain_name: str):
     # Strict identity check: bool("false") is True — a client serializing
     # booleans as strings must NEVER accidentally satisfy the confirmation.
     confirm_gate = changes.pop("confirm_disable_approval_gate", None) is True
+    # What the editor showed (see fetchSettingsData): out-of-band like the flag
+    # above, never written.
+    shown = changes.pop("__shown", None)
 
     if domain_name in _CHANGED_KEYS_ONLY:
-        changes = _changed_keys(domain.config_filename, changes)
+        changes = _changed_keys(domain.config_filename, changes, shown)
 
     # Validate
     validator = _DOMAIN_VALIDATORS.get(domain_name)

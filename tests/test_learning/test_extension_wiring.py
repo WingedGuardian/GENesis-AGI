@@ -268,7 +268,7 @@ class TestFalkordbProbeWiring:
     deleting the wiring fails here rather than in a copy of the list."""
 
     @staticmethod
-    def _probes(unit_present: bool) -> list:
+    def _probes(unit_present: bool, selected: str = "networkx") -> list:
         from unittest.mock import patch
 
         from genesis.learning.signals.critical_failure import CriticalFailureCollector
@@ -277,6 +277,9 @@ class TestFalkordbProbeWiring:
         with patch(
             "genesis.memory.graphstore_config.engine_unit_present",
             return_value=unit_present,
+        ), patch(
+            "genesis.memory.graphstore_config.selection",
+            return_value=(selected, None),
         ):
             collectors = build_learning_collectors(MagicMock())
         [cf] = [c for c in collectors if isinstance(c, CriticalFailureCollector)]
@@ -291,6 +294,13 @@ class TestFalkordbProbeWiring:
         from genesis.observability.health import probe_falkordb
 
         assert not any(p is probe_falkordb for p in self._probes(False))
+
+    def test_included_when_reads_select_the_engine_without_an_enabled_unit(self):
+        """Devin 4521703343: an overlay choosing falkordb with the unit disabled
+        (engine started by hand) still has its outage reach critical_failure."""
+        from genesis.observability.health import probe_falkordb
+
+        assert any(p is probe_falkordb for p in self._probes(False, "falkordb"))
 
 
 class TestCriticalFailureOmitsNotApplicableProbes:

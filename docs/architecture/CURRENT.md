@@ -279,15 +279,19 @@ comes from the shipped file alone (no overlay sets `mode`) and no
 neither a fallback nor a clock break (`graph_cutover.is_quiet_row`; a row only
 partly quiet still breaks). An overlay `mode: falkordb`, and a unit that exists
 but is stopped or failed, stay loud. `probe_falkordb` joins the steady-state
-critical-failure probes exactly when the unit is enabled
-(`runtime/init/learning.py`, decided at server start). Bootstrap and install
+critical-failure probes when the unit is enabled or the selection says
+falkordb, an overlay choice included (`runtime/init/learning.py`, decided at
+server start). Bootstrap and install
 arm the unit after rendering it from a verified engine (`falkordb_enable_unit`):
 `enable --now` when it is inactive or failed, a plain `enable` when it is
 running and disabled (a running engine is never started or restarted), nothing
 when masked or listed in `~/.genesis/config/disabled_timers`; a failed start is
 one WARNING line, never a failed bootstrap. The graphstore dashboard save
 writes only the keys that changed, so an unrelated save never pins `mode`
-into the overlay. It carries its own projection of
+into the overlay: the editor sends back what it showed (`__shown`) and a key
+is written when it differs from that, type included; a client with no
+snapshot is compared against the merged config (`routes/settings.py`
+`_changed_keys`). It carries its own projection of
 `memory_links` and applies the SAME visibility predicate — but at QUERY time,
 over mirrored `invalid_epoch`/`deprecated` node properties, which closes the
 future-`invalid_at` gap the NetworkX store states below. That closes the TIME
@@ -334,6 +338,13 @@ or `GENESIS_FALKORDB_SWITCH=1` asks for it (on a running install through
 under a live server; then restart the unit).
 The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
 (`memory/graphstore_project.py`); that schedule is its staleness bound. The
+timer also runs once 5 minutes after it starts (`OnActiveSec`), because
+`install.sh` starts the engine before genesis-server has created the database
+(bootstrap seeds it first). That run wins the race only when the server's
+first start takes under about 5 minutes; otherwise the next hourly run
+projects. The graph-engine probe membership is decided at server start, so a
+`mode` change made live joins or leaves the critical-failure probes at the
+next restart. The
 engine keeps no data on disk, so its unit also (re)starts the projector on
 every start, restarts included; a projection already running against the
 engine that just died is stopped and run again (`ExecStartPost`, issue #3035): a restarted engine is

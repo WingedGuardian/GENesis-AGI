@@ -414,3 +414,16 @@ def test_every_vnc_template_token_is_substituted_by_setup_vnc():
         f"{t.name}: {token}" for t in templates for token in sorted(_tokens_used(t) - known)
     ]
     assert not offenders, "VNC template tokens setup-vnc.sh never substitutes:\n  " + "\n  ".join(offenders)
+
+
+def test_the_graph_projection_timer_runs_once_soon_after_it_starts():
+    """Devin 4521703262: a fresh install starts the engine before genesis-server
+    has created the database; the timer's OnActiveSec run is the projection that
+    finds data, instead of reads falling back until the next hourly run."""
+    from pathlib import Path as _P
+
+    text = (_P(__file__).resolve().parents[2] / "scripts" / "systemd"
+            / "genesis-graph-project.timer.template").read_text()
+    timer = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    assert "OnCalendar=hourly" in timer
+    assert "OnActiveSec=5min" in timer

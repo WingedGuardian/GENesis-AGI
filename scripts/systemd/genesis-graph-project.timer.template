@@ -23,6 +23,11 @@ Description=Genesis Graph Projection — hourly schedule
 # is worth a couple of minutes of slack, and 300s bought no more decorrelation
 # than 120s while widening the bound by another three minutes.
 OnCalendar=hourly
+# One run soon after the timer starts (install, boot): a fresh install starts the
+# engine before genesis-server has created the database, so the engine's own
+# start-time projection finds nothing to read. Without this, reads would fall
+# back until the next hourly run.
+OnActiveSec=5min
 # A box that was asleep or off at the top of the hour still projects on wake,
 # rather than waiting for the next one with a projection that is already stale.
 Persistent=true
