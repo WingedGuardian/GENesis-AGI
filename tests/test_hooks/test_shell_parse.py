@@ -2274,7 +2274,15 @@ def test_heredoc_second_review_reproducers_against_bash(command, how, bash_oracl
             cwd=str(sandbox / "work"), capture_output=True, text=True, timeout=30,
         ).stdout
         assert "<<E2\n'$(" + _HD_G + ")'\nE2" in out
-    assert not _hd_argv_present(command, _HD_G)
+    if command not in _HD_NOW_SHOWN:
+        assert not _hd_argv_present(command, _HD_G)
+
+
+# Rows whose push the parse now also shows, so the blind spot is no longer the only
+# thing standing between bash and the guard: the bash-quoting substitution reading
+# keeps the last character of an unterminated body (#4333), which the legacy scan cut
+# to `ORACL`. The blind spot is still required and still reported (test above).
+_HD_NOW_SHOWN = {row[1] for row in _HD_SECOND_REVIEW if row[0] == "unterminated-in-backticks"}
 
 
 # The third review's class (#3433): the delimiter word runs straight into the backtick

@@ -1,0 +1,246 @@
+"""Substitution extraction follows bash's quoting, not only single quotes.
+
+``_substitution_spans`` tracked single quotes alone, so an apostrophe inside a
+double-quoted word (``"don't"``) or an escaped one (``\\'``, ``$'it\\'s'``) opened a
+single-quoted span bash never sees. Every substitution after it was skipped, so a push
+or an ``rm`` bash runs reached no guard and no blind spot was reported.
+
+The oracle runs each command under bash with recording stand-ins for git, gh and rm,
+in a throwaway directory, so nothing real is pushed or deleted.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+HOOKS = Path(__file__).resolve().parents[2] / "scripts" / "hooks"
+sys.path.insert(0, str(HOOKS))
+import shell_parse as sp  # noqa: E402
+
+PUSH = "git " + "push --force origin main"
+PUSH_ARGV = ("git", "push", "--force", "origin", "main")
+RM = "rm -rf " + "~/.genesis"
+
+_SHIM = (
+    '#!/bin/sh\n{ printf "%s\\037" "${0##*/}" "$@"; printf "\\036"; } >> "$ORACLE_LOG"\nexit 0\n'
+)
+
+
+@pytest.fixture(scope="module")
+def sandbox(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    if shutil.which("bash") is None:
+        pytest.skip("the oracle needs bash")
+    root = tmp_path_factory.mktemp("substitution-quotes")
+    (root / "bin").mkdir()
+    for name in ("git", "gh", "rm"):
+        shim = root / "bin" / name
+        shim.write_text(_SHIM, encoding="utf-8")
+        shim.chmod(0o755)
+    (root / "work").mkdir()
+    subprocess.run(["git", "init", "-q", str(root / "repo")], check=True)
+    return root
+
+
+def _ran(command: str, sandbox: Path) -> list[tuple[str, ...]]:
+    """The argv of every stand-in bash actually executed for ``command``."""
+    log = sandbox / "oracle.log"
+    log.write_text("", encoding="utf-8")
+    # Two independent layers keep the oracle harmless: HOME is the sandbox, so `~`
+    # never names a real directory, and the stand-ins must be what bash resolves.
+    path = f"{sandbox / 'bin'}:/usr/bin:/bin"
+    for name in ("git", "gh", "rm"):
+        assert shutil.which(name, path=path) == str(sandbox / "bin" / name)
+    subprocess.run(
+        ["bash", "--noprofile", "--norc", "-c", command],
+        cwd=sandbox / "work",
+        env={
+            "PATH": path,
+            "HOME": str(sandbox / "work"),
+            "ORACLE_LOG": str(log),
+            "LC_ALL": "C",
+        },
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    data = log.read_text(encoding="utf-8")
+    return [tuple(rec.split("\x1f")[:-1]) for rec in data.split("\x1e") if rec]
+
+
+def _guard_exit(guard: str, command: str, sandbox: Path) -> int:
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "session_id": "t",
+        "cwd": str(sandbox / "repo"),
+    }
+    done = subprocess.run(
+        [sys.executable, str(HOOKS / f"{guard}.py")],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=sandbox / "repo",
+    )
+    return done.returncode
+
+
+def _shows_or_refuses(command: str, wanted: tuple[str, ...]) -> None:
+    """The operation is visible in both checked views, or nothing is and a bound says why."""
+    segments, blind = sp.analyze_checked(command)
+    policy, policy_blind = sp.analyze_policy(command)
+    if blind is not None and blind.bounds_induced:
+        assert segments == [] and policy == [] and policy_blind is not None
+        return
+    assert any(tuple(s.argv[: len(wanted)]) == wanted for s in segments), (
+        f"bash runs {wanted} and the parse neither shows it nor refuses: {blind}"
+    )
+    assert any(tuple(p.argv[: len(wanted)]) == wanted for p in policy)
+
+
+HIDDEN_PUSH = {
+    "apostrophe in a dq word before it": 'echo "don\'t" $(' + PUSH + ")",
+    "apostrophe in the same dq word": "echo \"it's $(" + PUSH + ')"',
+    "apostrophe in an assignment": 'm="it\'s" x=$(' + PUSH + ")",
+    "backtick after a dq apostrophe": 'echo "don\'t" `' + PUSH + "`",
+    "escaped dq then an apostrophe": 'echo "a\\"\'" $(' + PUSH + ")",
+    "escaped sq outside quotes": "echo \\' $(" + PUSH + ")",
+    "ansi-c escaped sq": "echo $'it\\'s' $(" + PUSH + ")",
+    "locale string apostrophe": 'echo $"don\'t" $(' + PUSH + ")",
+    "after a nested shell script": 'bash -c true "it\'s" $(' + PUSH + ")",
+    "ansi-c opener is literal inside dq": 'echo "$\'x" $(' + PUSH + ")",
+}
+
+
+@pytest.mark.parametrize("name", sorted(HIDDEN_PUSH))
+def test_a_push_after_a_misread_apostrophe_is_seen(name: str, sandbox: Path) -> None:
+    command = HIDDEN_PUSH[name]
+    assert any(a[: len(PUSH_ARGV)] == PUSH_ARGV for a in _ran(command, sandbox)), (
+        "oracle: bash must run the push"
+    )
+    _shows_or_refuses(command, ("git", "push"))
+    assert _guard_exit("git_push_guard", command, sandbox) == 2
+
+
+HIDDEN_RM = {
+    "apostrophe in a dq word before it": 'echo "don\'t" $(' + RM + ")",
+    "apostrophe in the same dq word": "echo \"it's $(" + RM + ')"',
+}
+
+
+@pytest.mark.parametrize("guard", ["destructive_command_guard", "protected_paths_guard"])
+@pytest.mark.parametrize("name", sorted(HIDDEN_RM))
+def test_an_rm_after_a_misread_apostrophe_is_refused(name: str, guard: str, sandbox: Path) -> None:
+    command = HIDDEN_RM[name]
+    assert any(a[:2] == ("rm", "-rf") for a in _ran(command, sandbox)), (
+        "oracle: bash must run the rm"
+    )
+    assert _guard_exit(guard, command, sandbox) == 2
+
+
+# Single quotes still block extraction: bash runs nothing in these.
+NOT_RUN = {
+    "plain single quotes": "echo '$(" + PUSH + ")'",
+    "dq inside single quotes": "echo '\"' '$(" + PUSH + ")'",
+    "single quotes after an escaped dq": 'echo "a\\"" \'$(' + PUSH + ")'",
+    "ansi-c body": "echo $'$(" + PUSH + ")'",
+}
+
+
+@pytest.mark.parametrize("name", sorted(NOT_RUN))
+def test_a_single_quoted_substitution_is_not_extracted(name: str, sandbox: Path) -> None:
+    command = NOT_RUN[name]
+    assert not any(a[:2] == ("git", "push") for a in _ran(command, sandbox)), (
+        "oracle: bash must not run the push"
+    )
+    assert not any("push" in body for body in sp._substitutions(command))
+
+
+def test_bodies_are_cut_where_bash_cuts_them() -> None:
+    assert sp._substitutions('echo "don\'t" $(a b)') == ["a b"]
+    assert sp._substitutions('echo "x $(a) y" `b`') == ["a", "b"]
+    assert sp._substitutions("echo $'it\\'s' $(a)") == ["a"]
+
+
+def test_extraction_never_shrinks_below_the_legacy_scan() -> None:
+    """The bash reading only adds bodies. The legacy scan's over-reads stay (``\\$(a)``
+    and ``"it's" '$(a)'`` are still extracted), so a misread escape can never hide a
+    body the legacy scan found."""
+    for text in (
+        "echo \\$(a) $(b)",
+        'echo "\\$(a)" $(b)',
+        "echo \"it's\" '$(a)'",
+        "echo \"it's $(a)\" '$(b)'",
+    ):
+        legacy = set(sp._legacy_substitution_spans(text))
+        assert legacy, text
+        assert legacy <= set(sp._substitution_spans(text)), text
+
+
+def test_past_the_added_work_budget_the_parse_fails_closed(sandbox: Path) -> None:
+    """Only the legacy scan's misread hides these bodies, so all their work is added
+    work; three nested levels exceed one pass over the command and the parse reports
+    the over-nested bound rather than descending."""
+    command = 'echo "\'" $($($(' + PUSH + ")))"
+    assert any(a[: len(PUSH_ARGV)] == PUSH_ARGV for a in _ran(command, sandbox))
+    segments, blind = sp.analyze_checked(command)
+    assert blind is not None and blind.bounds_induced and segments == []
+    assert _guard_exit("git_push_guard", command, sandbox) == 2
+
+
+def _amplifying(depth: int, fan: int, leaf: str) -> str:
+    if depth == 0:
+        return leaf
+    inner = _amplifying(depth - 1, fan, leaf)
+    return " ".join(f'"x\' $({inner})"' for _ in range(fan))
+
+
+def test_phantom_bodies_cannot_multiply_the_parse_cost() -> None:
+    """Each level's phantom bodies differ from its real ones, so without the budget the
+    work doubled per level (MEASURED 6.28s against 0.73s on main at 37K characters).
+    The guards share a 5s clock across three of them, and a killed guard permits."""
+    leaf = "true"
+    while len(_amplifying(5, 5, leaf + "y")) < sp.MAX_COMMAND_CHARS - 64:
+        leaf += "y"
+    command = _amplifying(5, 5, leaf)
+    started = time.monotonic()
+    sp.analyze_checked(command)
+    elapsed = time.monotonic() - started
+    assert elapsed < 3.0, f"took {elapsed:.2f}s on {len(command)} characters"
+
+
+def test_unterminated_and_trailing_forms_do_not_crash() -> None:
+    """An unterminated body runs to the end of the text, last character included (the
+    legacy scan drops it), and a lone trailing backslash ends the scan."""
+    assert sp._quoted_substitution_spans("echo \"it's $(a b") == [(13, 16)]
+    assert sp._quoted_substitution_spans("echo `a") == []
+    assert sp._quoted_substitution_spans("echo \\") == []
+
+
+def test_an_unclosed_body_keeps_its_last_word() -> None:
+    """The verb a guard matches on is often the last word of an unclosed body."""
+    command = 'echo "it\'s" $(git ' + "pu" + "sh"
+    assert any(body.endswith("push") for body in sp._substitutions(command))
+
+
+def test_legacy_descents_are_never_charged() -> None:
+    """A chain the legacy scan reads is parsed as before, at any depth under the bound."""
+    segments, blind = sp.analyze_checked("echo $($($($(ls))))")
+    assert blind is None and segments
+
+
+def test_a_bare_chain_behind_a_stray_quote_is_refused_as_documented() -> None:
+    """The budget's known cost: four bare levels behind a phantom quote exceed one pass.
+    Three still parse."""
+    _, blind = sp.analyze_checked("echo \"'\" $($($($(ls))))")
+    assert blind is not None and blind.bounds_induced
+    segments, blind = sp.analyze_checked("echo \"'\" $($($(ls)))")
+    assert blind is None and segments
