@@ -16,6 +16,7 @@ here" state is distinguishable from every other.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 
 import aiosqlite
@@ -523,6 +524,17 @@ def test_the_census_prints_the_verdict_the_row_CARRIES(tmp_path, capsys):
     assert len(lines) == 1
     assert lines[0].endswith("pass-with-measured-gaps")
     assert "owner/repo#4" in lines[0]
+
+
+def test_the_census_names_who_closed_a_row_and_says_nothing_when_unknown(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+    _close_one(db, pr_number=13, reason="r")
+    _close_one(db, pr_number=14, reason="r")
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE pr_verifications SET closed_by = 'codex' WHERE pr_number = 13")
+    _w._print_verification_log(str(db), None)
+    out = capsys.readouterr().out
+    assert out.count("by      : ") == 1 and "by      : codex\n" in out
 
 
 def test_the_census_reason_clip_is_DECLARED(tmp_path, capsys):
