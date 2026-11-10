@@ -381,6 +381,27 @@ IPv6 link-local scope id, which `/proc/net/tcp6` does not record, so two
 listeners with the same link-local address on different interfaces are judged
 as one.
 
+### Report-only direct-write audit
+
+`tests/_live_writes.py` is armed after the existing fence, closure and outbound
+plugins. It observes direct in-process filesystem audit events under the real
+home and checkout, excluding the configured temporary roots, pytest lock and
+cache directories. It also observes reads of the credential paths listed in
+the module. It does not fail tests or replace the existing boundaries.
+
+The terminal summary groups hits by location and test. Set
+`GENESIS_LIVE_WRITES_REPORT=<file>` to retain tab-separated test, class,
+operation and path fields. Workers hand their hits to the xdist controller;
+workers without a report are named as unknown.
+
+These are pre-operation classifications, not proof that a syscall completed.
+The inherited #4193 accuracy gaps include refused-operation false positives,
+descriptor and hardlink aliases, SQLite URI classification, report escaping
+and late lifecycle events. Child-process writes and operations without audit
+events are outside this observer. Keep it report-only while those gaps are
+corrected and remaining writers are isolated. Enforcement requires a corrected
+audit and a complete empty CI census; a selected local run cannot establish it.
+
 ## Integration Tests
 
 Integration tests in `tests/integration/` require running external services
