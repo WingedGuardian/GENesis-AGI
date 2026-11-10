@@ -64,10 +64,23 @@ after an escaped quote or in a comment opens no body to bash, so its lines are
 checked like any others. A fragment's own inert proof clears only that fragment. A substitution that never closes is not refused: bash runs nothing past
 it.
 
-The comment scans read the blanks bash does (space, tab, newline; not VT, FF or
-NBSP) and treat a backslash outside quotes as an escape. The override scan skips
-`#` inside a substitution and waives nothing after an escaped quote outside
-quotes, so it can only switch an override off.
+Two comment scans run side by side: main's, and a strict one that reads bash's
+blanks (space, tab, newline; not VT, FF or NBSP) and treats a backslash outside
+quotes as an escape. Neither is bash, so neither alone decides anything
+permissive:
+
+- argv keeps main's cut exactly, in both directions. Cutting earlier drops words
+  bash passes (`--force` after `${x:+ \' # }`), and cutting later keeps words bash
+  never passes (a `--help` that skips a gate).
+- Where main's cut drops text the strict scan says bash reads, and that text could
+  carry a flag or an expansion (`-`, `$`, a backtick), the segment refuses
+  (`git commit -m x\ # --no-verify` passes `--no-verify`).
+- An override counts only when both scans read it, so the override scan can only
+  switch an override off. The strict scan also skips a `#` inside a substitution
+  and waives nothing after an escaped quote.
+
+A `<<` inside a here-doc body already kept is that body's data and opens no body
+of its own.
 
 Still open: #3778 (a `#` inside process substitution, `${…}` or a `case`
 pattern), and the shared lexer that would let these boundaries be proven rather

@@ -1239,11 +1239,14 @@ def has_top_level_pipe(command: str, *, count_substitutions: bool = False) -> bo
 _SHELL_BLANKS = frozenset(" \t\n")
 
 
-def _comment_start(seg: str) -> int | None:
+def _comment_start(seg: str, *, strict: bool = True) -> int | None:
     """Offset of the ``#`` that starts this segment's comment, or None.
 
-    The legacy quote scan, plus backslash escapes outside quotes, which bash honours
-    (``\\'`` is a literal quote, not the start of one)."""
+    Strict: the legacy quote scan plus backslash escapes outside quotes, which bash
+    honours (``\\'`` is a literal quote, not the start of one), and bash's blanks.
+    Not strict: the scan main has always used. Neither is bash: each misreads some
+    text the other gets right, so a caller that ALLOWS anything on the answer combines
+    both in the conservative direction rather than trusting either."""
     quote: str | None = None
     prev_ws = True
     i, n = 0, len(seg)
@@ -1258,7 +1261,7 @@ def _comment_start(seg: str) -> int | None:
             prev_ws = False
             i += 1
             continue
-        if c == "\\" and i + 1 < n:
+        if strict and c == "\\" and i + 1 < n:
             prev_ws = False
             i += 2
             continue
@@ -1269,7 +1272,7 @@ def _comment_start(seg: str) -> int | None:
             continue
         if c == "#" and prev_ws:
             return i
-        prev_ws = c in _SHELL_BLANKS
+        prev_ws = c in _SHELL_BLANKS if strict else c.isspace()
         i += 1
     return None
 
@@ -1339,6 +1342,15 @@ def _segment_unproven(seg: str, escapes_modelled: bool = True) -> bool:
     cut = _comment_start(seg)
     if cut is not None and "\n" in seg[cut:]:
         return True
+    # argv drops seg[legacy:] as a comment the strict scan says bash does not read.
+    # Refuse if that text could carry a flag or an expansion (`x\ # --force` pushes
+    # with --force); text like ` #b` is only a word.
+    legacy = _comment_start(seg, strict=False)
+    dropped = "" if legacy is None or (cut is not None and cut <= legacy) else (
+        seg[legacy : len(seg) if cut is None else cut]
+    )
+    if any(ch in dropped for ch in "-$`"):
+        return True
     has_opener = "$(" in seg or "`" in seg
     quote: str | None = None
     i, n = 0, len(seg)
@@ -1395,20 +1407,34 @@ def _trusted_bodies(
     The openers come from the legacy scan, which records a ``<<`` that bash reads as
     quoted text (after ``\\'``) or as part of a comment, and those bodies hold lines
     bash runs. A body is kept only when ``_TopLevel``, the bash-like pass, places its
-    opener outside every quote and nesting, and no ``#`` precedes it on its line.
-    Dropping one only removes the relief: its lines are checked like any others."""
+    opener outside every quote and nesting, no ``#`` precedes it on its line, and it
+    does not sit inside a body already kept (there it is data). Dropping one only
+    removes the relief: its lines are checked like any others."""
     top = _TopLevel(command)
     kept: list[tuple[int, int]] = []
+    starts: list[int] = []
     for opener, start, end in sorted(bodies):
+        # Kept bodies are disjoint and ascending (an opener inside one is skipped),
+        # so a bisect finds the only one that could hold this opener.
+        k = _bisect_right(starts, opener) - 1
+        if k >= 0 and opener < kept[k][1]:
+            continue  # a `<<` inside an earlier body is that body's data, no opener
         line = command.rfind("\n", 0, opener) + 1
         if top.at(opener) and "#" not in command[line:opener]:
             kept.append((start, end))
+            starts.append(start)
     return kept
 
 
 def _strip_trailing_comment(seg: str) -> str:
-    """Remove an unquoted ``#`` comment (blank-preceded or at start) to EOL."""
-    cut = _comment_start(seg)
+    """Remove an unquoted ``#`` comment (blank-preceded or at start) to EOL.
+
+    The cut main has always made, deliberately: argv must not change in either
+    direction. A cut moved earlier drops words bash passes (``--force`` after
+    ``${x:+ \\' # }``), and one moved later keeps words bash never passes (a
+    ``--help`` that would skip a gate). Where the strict and legacy scans disagree,
+    ``_segment_unproven`` refuses instead."""
+    cut = _comment_start(seg, strict=False)
     return seg if cut is None else seg[:cut]
 
 
@@ -1476,7 +1502,17 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
     — a prose token ahead of the sigil ends the run. This keeps independent acks
     able to coexist without letting an incidental or negated prose mention waive
     the gate.
+
+    The answer is the legacy scan AND the strict one, so an override counts only
+    where main also counted it: the strict scan's own boundaries (a substitution's
+    close, read without comments) are not bash's either, and acting alone it once
+    honoured a sigil main refused (``$(true # ) # sigil`` + newline + ``)``).
     """
+    return _override_scan(seg, sigil, strict=False) and _override_scan(seg, sigil, strict=True)
+
+
+def _override_scan(seg: str, sigil: str, *, strict: bool) -> bool:
+    """One reading of :func:`_has_trailing_override`. Not strict: main's scan."""
     quote: str | None = None
     prev_ws = True
     i, n = 0, len(seg)
@@ -1491,7 +1527,7 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
             prev_ws = False
             i += 1
             continue
-        if c == "\\" and i + 1 < n:
+        if strict and c == "\\" and i + 1 < n:
             # An escaped quote outside quotes is a literal to bash, and the scan
             # cannot follow where bash's real quotes then go (`\"x" # sigil"` holds
             # no comment). Waive nothing rather than guess.
@@ -1506,11 +1542,11 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
             i += 1
             continue
         # A `#` inside a substitution is that command's comment, not this segment's.
-        if c == "$" and seg.startswith("$(", i):
+        if strict and c == "$" and seg.startswith("$(", i):
             i = _command_sub_end(seg, i, n)
             prev_ws = False
             continue
-        if c == "`":
+        if strict and c == "`":
             close = seg.find("`", i + 1)
             i = n if close == -1 else close + 1
             prev_ws = False
@@ -1523,7 +1559,7 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
                     return False  # a prose token ends the leading run of sigils
                 # else: a DIFFERENT recognized sigil — still in the run, keep scanning
             return False
-        prev_ws = c in _SHELL_BLANKS
+        prev_ws = c in _SHELL_BLANKS if strict else c.isspace()
         i += 1
     return False
 

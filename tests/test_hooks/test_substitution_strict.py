@@ -142,6 +142,53 @@ HIDDEN_PUSH = {
     "escaped sq joining segments": "echo \\' ; " + PUSH + ' "\'" #',
     "escaped dq joining segments": 'echo \\" ; ' + PUSH + " '\"' #",
     "escaped sq after a comment line": "true # c" + N + "echo \\' ; " + PUSH + ' "\'"',
+    # A `<<` inside an earlier here-doc body is data to bash; it opens no body of its
+    # own, so the lines after the earlier terminator still run.
+    "comment-quote line after a nested opener": (
+        "cat <<A" + N + "cat <<B" + N + "A" + N + 'echo # "' + N + PUSH + N + '# "' + N + "B"
+    ),
+    "escaped-quote line after a nested opener": (
+        "cat <<A" + N + "cat <<B" + N + "A" + N + "echo \\' # \"" + N + PUSH + N + '# "' + N + "B"
+    ),
+    # The same with a sibling body on the opener line, which is kept after the first.
+    "line after a nested opener beside a sibling body": (
+        "cat <<A <<S"
+        + N
+        + "cat <<B"
+        + N
+        + "A"
+        + N
+        + "s"
+        + N
+        + "S"
+        + N
+        + 'echo # "'
+        + N
+        + PUSH
+        + N
+        + '# "'
+        + N
+        + "B"
+    ),
+    "line after a quoted nested opener beside a sibling body": (
+        "cat <<A <<'S'"
+        + N
+        + "cat <<'B'"
+        + N
+        + "A"
+        + N
+        + "s"
+        + N
+        + "S"
+        + N
+        + 'echo # "'
+        + N
+        + PUSH
+        + N
+        + '# "'
+        + N
+        + "B"
+    ),
     # Only the decoded script holds the misread, so only its own check can see it.
     "inside a double-quoted bash -c": (
         'bash -c "cat <<E' + N + "x" + N + "E" + N + "echo # '" + N + PUSH + N + "# '\""
@@ -183,6 +230,8 @@ HIDDEN_FLAG = {
     "vertical tab before a hash": "git commit -m msg\v# --no-verify",
     "form feed before a hash": "git commit -m msg\f# --no-verify",
     "no-break space before a hash": "git commit -m msg # --no-verify",
+    # An escaped space keeps the `#` inside the word, so no comment starts there.
+    "escaped space before a hash": "git commit -m x\\ # --no-verify",
 }
 
 
@@ -206,8 +255,100 @@ FORGED = {
     "after a vertical tab": MERGE + " x\v# " + SIGIL,
     # The comment belongs to the command inside the substitution.
     "inside a substitution": MERGE + " --squash $(true # " + SIGIL + N + ")",
+    # The `)` in the inner comment is no close; the sigil after it is still inside.
+    "after a commented-out close": MERGE + " --squash $(true # ) # " + SIGIL + N + ")",
+    "after a commented-out close in bash -c": (
+        "bash -c '" + MERGE + " --squash $(true # ) # " + SIGIL + N + ")'"
+    ),
+    "after a commented-out close in a nested body": (
+        "cat <<A"
+        + N
+        + "cat <<'B'"
+        + N
+        + "A"
+        + N
+        + MERGE
+        + " --squash $(true # x ) # "
+        + SIGIL
+        + N
+        + ")"
+        + N
+        + "B"
+    ),
     "inside a backtick substitution": MERGE + " --squash `true # " + SIGIL + "`",
 }
+
+
+@pytest.mark.parametrize("sigil", ["review-override", "ci-override", "substitute-review"])
+def test_no_sigil_counts_where_main_did_not(sigil):
+    """Every gate's sigil goes through the same scan: one rule for all of them."""
+    raw = MERGE + " --squash $(true # ) # " + sigil
+    assert not sp.has_trailing_override(raw, sigil)
+
+
+# A word main kept in argv must not be cut away as a comment. Here the `#` is text
+# inside ${x:+ ...} to bash, and the command is untokenizable, so the segments are
+# delivered rather than withheld: argv is all a guard has.
+KEPT_FLAG = {
+    "force after a hash in a parameter expansion": (
+        "git push origin feat ${x:+ \\' # } --force # '",
+        "--force",
+    ),
+    "short no-verify after a hash in a parameter expansion": (
+        "git commit --allow-empty ${x:+ \\' # } -n -m x # '",
+        "-n",
+    ),
+}
+
+
+@pytest.mark.parametrize(("command", "flag"), KEPT_FLAG.values(), ids=KEPT_FLAG)
+def test_argv_never_loses_a_word_main_kept(command, flag, sandbox):
+    assert any(flag in argv for argv in _ran(command, sandbox)), "fixture: bash passes it"
+    segments, blind = sp.analyze_checked(command)
+    if blind is not None and blind.bounds_induced:
+        assert segments == []
+    else:
+        assert any(flag in s.argv for s in segments)
+
+
+# Nor may a word bash never passes reach argv: some words RELAX a gate. Here the `#`
+# is text in ${x:+ ...} with x unset, so bash passes no --help/--dry-run.
+NO_EXTRA_WORD = {
+    "help after an escaped space and a hash": (
+        "gh pr create --title t --body b ${x:+ \\ # --help }",
+        "--help",
+    ),
+    "dry-run after an escaped space and a hash": (
+        "git push origin feat ${x:+ \\ # --dry-run }",
+        "--dry-run",
+    ),
+}
+
+
+@pytest.mark.parametrize(("command", "word"), NO_EXTRA_WORD.values(), ids=NO_EXTRA_WORD)
+def test_argv_never_gains_a_word_bash_does_not_pass(command, word, sandbox):
+    assert not any(word in argv for argv in _ran(command, sandbox)), "fixture: bash drops it"
+    segments, blind = sp.analyze_checked(command)
+    if blind is not None and blind.bounds_induced:
+        assert segments == []
+    else:
+        assert not any(word in s.argv for s in segments)
+
+
+def test_a_force_push_in_a_nested_body_line_is_still_blocked(sandbox):
+    command = (
+        "cat <<A"
+        + N
+        + "cat <<'B'"
+        + N
+        + "A"
+        + N
+        + "git push origin feat ${x:+ \\' # } --force"
+        + N
+        + "B"
+    )
+    assert any("--force" in argv for argv in _ran(command, sandbox))
+    assert _guard_exit(command, sandbox) == 2
 
 
 def test_an_escaped_quote_never_makes_an_override_count():
