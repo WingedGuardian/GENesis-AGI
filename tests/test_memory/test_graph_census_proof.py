@@ -250,8 +250,8 @@ def test_the_secrets_file_is_chosen_the_way_genesis_env_chooses_it(tree, tmp_pat
     home = tmp_path / "server-home"
     home.mkdir()
     h = {"HOME": str(home)}
-    # No file anywhere: the home-config default, as the resolver gives it.
-    assert proof.secrets_file(h, main_root=main) == home / ".config/genesis/secrets.env"
+    # No file anywhere: the checkout default, as the resolver gives it.
+    assert proof.secrets_file(h, main_root=main) == main / "secrets.env"
     (main / "secrets.env").write_text("K=v\n")
     assert proof.secrets_file(h, main_root=main) == main / "secrets.env"
     other = tmp_path / "r"

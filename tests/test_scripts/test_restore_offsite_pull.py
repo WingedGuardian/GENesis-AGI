@@ -90,7 +90,7 @@ def _snapshot(sandbox, host: str, stamp: str, *, complete: bool = True,
 
 def _run(sandbox, *, backend="local", host_override=None, extra_args=(), force=True):
     env = dict(os.environ)
-    env.pop("SECRETS_PATH", None)  # Exercise the default resolver inside the private HOME.
+    env.pop("SECRETS_PATH", None)  # GENESIS_DIR names the secrets file, as on CI
     env.update(
         HOME=str(sandbox["home"]), GENESIS_DIR=str(sandbox["gd"]),
         GENESIS_BACKUP_PASSPHRASE="testpass", QDRANT_URL="http://127.0.0.1:1",
@@ -269,7 +269,7 @@ def test_pulls_and_rehydrates_memory_config_secrets(sandbox):
     cfg_file = sandbox["gd"] / "config" / "sample.local.yaml"
     assert cfg_file.is_file() and cfg_file.read_text() == "key: val\n", \
         f"config overlay not rehydrated from off-site:\n{proc.stdout}"
-    sec_file = sandbox["home"] / ".config/genesis/secrets.env"
+    sec_file = sandbox["gd"] / "secrets.env"
     assert sec_file.is_file() and sec_file.read_text() == "SECRET=xyz\n", \
         f"secrets not rehydrated from off-site:\n{proc.stdout}"
     assert oct(sec_file.stat().st_mode)[-3:] == "600", "secrets not chmod 0600"
@@ -387,7 +387,6 @@ def test_nonforce_retry_pins_snapshot_and_ignores_every_ambient_component(sandbo
     assert f"resuming pinned snapshot {_OLD}" in second.stdout
     assert not (sandbox["gd"] / "config" / "stale.local.yaml").exists()
     assert not (sandbox["gd"] / "secrets.env").exists()
-    assert not (sandbox["home"] / ".config/genesis/secrets.env").exists()
     assert not list((sandbox["home"] / ".genesis").rglob("stale*"))
     root = sandbox["home"] / "backups" / ".genesis-restore"
     pointer = json.loads((root / "active.json").read_text())

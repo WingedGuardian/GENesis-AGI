@@ -7,7 +7,7 @@
 #   1. $SECRETS_PATH when set (~ and ~user expanded, as Python's expanduser)
 #   2. $HOME/.config/genesis/secrets.env when it exists
 #   3. <repo_root>/secrets.env, then $HOME/genesis/secrets.env, when one exists
-#   4. otherwise $HOME/.config/genesis/secrets.env
+#   4. otherwise <repo_root>/secrets.env (the home config default is the migration's)
 # XDG_CONFIG_HOME is deliberately ignored (the systemd user manager lacks it).
 # A candidate behind a directory this process cannot search is kept, as the
 # Python resolver keeps it: the reader then fails loudly instead of silently
@@ -17,13 +17,23 @@
 # _genesis_secrets_present <path> — a regular file, or one that may exist but
 # cannot be checked because the nearest existing directory is not searchable.
 _genesis_secrets_present() {
-    local dir
-    [ -f "$1" ] && return 0
-    [ -e "$1" ] && return 1
+    local path="$1" dir
+    [ -f "$path" ] && return 0
+    [ -e "$path" ] && return 1
+    # A symlink whose target cannot be checked: walk from the TARGET, as
+    # Python's stat follows the link. Walking the link's own parent would call
+    # a candidate absent because the folder holding the link is searchable.
+    # readlink -m canonicalizes without requiring the target to exist; a
+    # self-loop comes back as itself, which then reads as absent (Python's
+    # ELOOP). GNU coreutils, which every supported (systemd) install has.
+    if [ -L "$path" ]; then
+        path="$(readlink -m -- "$path" 2>/dev/null)" || path="$1"
+        [ -n "$path" ] || path="$1"
+    fi
     # Walk up to the nearest directory that exists. A relative path ends at
     # ".", the directory it is relative to (a bare "${dir%/*}" never shortens
     # a slash-free name, so the loop must stop there itself).
-    case "$1" in */*) dir="${1%/*}" ;; *) dir="." ;; esac
+    case "$path" in */*) dir="${path%/*}" ;; *) dir="." ;; esac
     while :; do
         [ -n "$dir" ] || dir="/"
         if [ -d "$dir" ]; then
@@ -67,5 +77,5 @@ genesis_secrets_path() {
             return 0
         fi
     done
-    printf '%s\n' "$HOME/.config/genesis/secrets.env"
+    printf '%s\n' "$repo_root/secrets.env"
 }

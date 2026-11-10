@@ -16,8 +16,10 @@ Order, first match wins:
    ``$HOME/genesis/secrets.env``. The second catches a worktree or a
    non-canonical checkout whose own root holds no file. This fallback is
    permanent: an install that skips several releases still finds its keys.
-4. Nothing exists: ``$HOME/.config/genesis/secrets.env``. Bootstrap, restore
-   and the dashboard create its parent directory when needed.
+4. Nothing exists: ``<repo root>/secrets.env``, where today's writers create
+   the file. Defaulting to the home config, and moving an existing file there,
+   is the migration's job: until it lands nothing creates the home config, so
+   no install holds two files the services would have to choose between.
 
 ``XDG_CONFIG_HOME`` is deliberately ignored: the systemd user manager does
 not carry it, so honouring it would let a session and the server resolve
@@ -29,8 +31,10 @@ exist but cannot be checked (a directory on its path is not searchable). That
 keeps the reader on the file it cannot open, so it fails loudly instead of
 silently loading an older legacy copy; all three copies agree on this.
 
-The home config location lands together with the services, guard and restore
-paths that serve it, so no reader can select a file nothing yet protects.
+Readers find a home-config file and the secrets guard protects it, but the
+systemd units still load only the checkout file, and nothing creates the home
+config: the default switch and the units land with the migration. A home-config
+file created by hand before then splits the units from these readers.
 """
 
 from __future__ import annotations
@@ -79,4 +83,4 @@ def resolve(*, environ: Mapping[str, str], repo_root: Path, home: Path | None = 
     for candidate in legacy_locations(home, repo_root):
         if _present(candidate):
             return candidate
-    return preferred
+    return repo_root / BASENAME

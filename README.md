@@ -172,9 +172,9 @@ claude    # onboarding collects your API keys, profile and channels
 ```
 
 Onboarding is interactive and covers the credentials Genesis needs. If it doesn't
-start on its own, run `/setup`. New installs create
-`~/.config/genesis/secrets.env` from the template inside the container for you
-to fill in. Existing installs retain their legacy checkout file until migration.
+start on its own, run `/setup`. You can also edit `~/genesis/secrets.env` directly
+inside the container — the installer creates it from the template but leaves it to
+you to fill in.
 
 **At minimum, set one LLM provider key.** Without it the cognitive layer — routing,
 reflection, triage, memory extraction — has nothing to call, and those are the parts

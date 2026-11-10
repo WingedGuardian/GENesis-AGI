@@ -262,8 +262,7 @@ by the agent; a runtime helper only protects the call sites that use it.
 
 Genesis uses an environment-file approach for secrets:
 
-- Provider credentials live in the resolved `secrets.env`: new installs use
-  `~/.config/genesis/secrets.env`; existing checkout files remain supported.
+- All API keys and tokens live in `secrets.env` at the project root.
 - This file is gitignored and should be set to mode `0600` (owner read/write
   only).
 - The `genesis.env` module (`src/genesis/env.py`) resolves the secrets path

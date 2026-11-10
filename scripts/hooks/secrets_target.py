@@ -767,10 +767,36 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
 
     literal_globs = _db_query_literals(command)
 
+    # A shell whose cwd is inside the credentials folder reads it with no
+    # operand at all (`grep -rl KEY`, `tar cf - .`), and the folder holds
+    # nothing else, so any command from there gates. The hook's cwd is the
+    # session's, which is the cwd the command starts in. Residual, as for
+    # every relative operand here: a base set INSIDE the command (`cd .config;
+    # grep -r KEY genesis`, `tar -C .config -cf - genesis`) is not followed.
+    _, folder = _resolved_targets()
+    try:
+        here = Path.cwd().resolve()
+    except (OSError, RuntimeError):
+        here = None
+    if folder is not None and here is not None and (here == folder or folder in here.parents):
+        return True
+
+    # Bare names that resolve to a target from the right cwd: the file names,
+    # and the folder's own name (`grep -r KEY genesis` from ~/.config).
     candidate_names = {root.name for root in _candidate_roots()}
+    candidate_names.add(_dedicated_dir().name)
     for raw_tok in _tokens(scan):
-        if not _PATHY.search(raw_tok) and raw_tok not in candidate_names:
+        # An option with its path attached (`-C<dir>`, `--directory=<dir>`) is
+        # one token; resolve the attached value as well as the whole token.
+        attached = _attached_value(raw_tok)
+        if (
+            not _PATHY.search(raw_tok)
+            and raw_tok not in candidate_names
+            and attached not in candidate_names
+        ):
             continue
+        if attached and _is_secret_path(attached, inodes, allow_bare=raw_tok in unquoted):
+            return True
         # Bash brace-expands before the command ever runs, so
         # `cp ~/genesis/{secrets.env,secrets.env.bak}` opens the real file while
         # the single opaque token matches nothing. The repo already ships the
@@ -801,6 +827,18 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
                 return True
 
     return False
+
+
+def _attached_value(tok: str) -> str:
+    """The path an option token carries: ``--opt=VALUE`` or ``-XVALUE``.
+
+    Empty for anything else. Only the value's resolution is asked about, so a
+    token that is not really an option with a path costs one failed lookup."""
+    if tok.startswith("--"):
+        return tok.split("=", 1)[1] if "=" in tok else ""
+    if tok.startswith("-") and len(tok) > 2:
+        return tok[2:]
+    return ""
 
 
 def _tokens(text: str) -> list[str]:

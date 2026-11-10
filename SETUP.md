@@ -26,8 +26,7 @@ The bootstrap script handles: Python venv, pip install, Claude Code config,
 hook launchers, runtime state initialization, and plugin checks.
 
 After bootstrap:
-1. Edit the resolved secrets file with your API keys (at minimum, one LLM provider).
-   Fresh installs use `~/.config/genesis/secrets.env`; existing legacy files remain supported.
+1. Edit `secrets.env` with your API keys (at minimum, one LLM provider)
 2. Start Claude Code: `claude` in the genesis directory
 3. All hooks and MCP servers activate automatically
 

@@ -107,7 +107,7 @@ def resolve_secrets_path(home: Path) -> Path:
             return candidate
         if stat.S_ISREG(mode):
             return candidate
-    return new
+    return repo / "secrets.env"
 
 
 def credential_path(target: CredTarget, home: Path) -> Path:

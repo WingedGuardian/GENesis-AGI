@@ -341,8 +341,7 @@ locale/byte checks; final regression and recovery tests remain required.
    | `release-fingerprints.txt` | `~/.genesis/release-fingerprints.txt` |
    | `payment_vault/` | `~/.genesis/payment_vault/` (see below) |
 
-   `secrets.env` is not staged: restore §7 writes it to the resolved path,
-   defaulting to `~/.config/genesis/secrets.env` on a fresh recovery box.
+   `secrets.env` is not staged: restore §7 writes it to `~/genesis/secrets.env`.
 4. The guardian control-plane key (`genesis_guardian_ed25519`) is in the bundle,
    so the container↔host gateway is restored in the same step.
 

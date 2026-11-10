@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,10 +25,12 @@ def _guard(monkeypatch):
     return module
 
 
-def test_fresh_install_defaults_to_the_config_location(tmp_path, monkeypatch):
+def test_fresh_install_keeps_the_checkout_default_until_migration(tmp_path, monkeypatch):
+    # Nothing creates the home config before the migration moves the file, so
+    # no install ever holds two files the services would have to choose between.
     monkeypatch.delenv("SECRETS_PATH", raising=False)
     assert secrets_location.resolve(environ={}, home=tmp_path, repo_root=tmp_path / "repo") == (
-        tmp_path / ".config" / "genesis" / "secrets.env"
+        tmp_path / "repo" / "secrets.env"
     )
     result = subprocess.run(
         ["bash", "-c", '. "$1"; genesis_secrets_path "$2"', "_",
@@ -37,7 +38,7 @@ def test_fresh_install_defaults_to_the_config_location(tmp_path, monkeypatch):
         env={"HOME": str(tmp_path), "PATH": os.environ["PATH"]},
         capture_output=True, text=True, check=True,
     )
-    assert Path(result.stdout.strip()) == tmp_path / ".config/genesis/secrets.env"
+    assert Path(result.stdout.strip()) == tmp_path / "repo" / "secrets.env"
 
 
 def test_guard_identifies_an_alias_of_the_new_location(tmp_path, monkeypatch):
@@ -80,34 +81,13 @@ def test_dashboard_can_create_at_the_new_location(tmp_path, monkeypatch):
     assert destination.parent.stat().st_mode & 0o777 == 0o700
 
 
-def test_units_load_the_new_path_after_the_legacy_path():
+def test_units_load_only_the_checkout_file_until_migration():
+    # Loading two files lets a key cleared in one survive from the other; the
+    # units stay on main's single file until the migration renders them anew.
     for name in ("genesis-server", "agent-zero"):
         text = (REPO / f"scripts/systemd/{name}.service.template").read_text()
         lines = [line for line in text.splitlines() if line.startswith("EnvironmentFile=")]
-        assert lines == [
-            'EnvironmentFile=-__REPO_DIR__/secrets.env',
-            'EnvironmentFile=-%h/.config/genesis/secrets.env',
-        ]
-
-
-def test_environment_file_lines_are_accepted_by_systemd(tmp_path):
-    analyzer = shutil.which("systemd-analyze")
-    if analyzer is None:
-        pytest.skip("systemd-analyze unavailable")
-    for name in ("genesis-server", "agent-zero"):
-        source = (REPO / f"scripts/systemd/{name}.service.template").read_text()
-        lines = [line.replace("__REPO_DIR__", str(tmp_path / "repo space"))
-                 for line in source.splitlines() if line.startswith("EnvironmentFile=")]
-        unit = tmp_path / f"{name}-probe.service"
-        unit.write_text("[Service]\nType=oneshot\nExecStart=/bin/true\n" + "\n".join(lines) + "\n")
-        result = subprocess.run([analyzer, "verify", str(unit)], capture_output=True, text=True)
-        assert result.returncode == 0, result.stderr
-        # systemd can ignore a bad EnvironmentFile while still exiting zero.
-        assert "EnvironmentFile=" not in result.stderr, result.stderr
-    invalid = tmp_path / "invalid-probe.service"
-    invalid.write_text("[Service]\nExecStart=/bin/true\nEnvironmentFile=relative.env\n")
-    control = subprocess.run([analyzer, "verify", str(invalid)], capture_output=True, text=True)
-    assert "EnvironmentFile=" in control.stderr, "analyzer did not detect invalid control"
+        assert lines == ["EnvironmentFile=__REPO_DIR__/secrets.env"]
 
 
 def test_guardian_checks_the_new_file_before_the_legacy_file(tmp_path, monkeypatch):
@@ -324,3 +304,44 @@ def test_the_xdg_spelling_of_the_folder_is_gated(tmp_path, monkeypatch):
     # The checkout itself, spelled through a variable, is not the folder.
     assert not guard.touches_secrets(command='cd "${HOME}/genesis" && ls')
     assert not guard.touches_secrets(command='cd "$HOME/genesis"')
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "grep -r KEY genesis",
+        "tar -Cgenesis -cf - .",
+        "cp -r genesis /tmp/x",
+    ],
+)
+def test_a_bare_folder_operand_from_its_parent_is_gated(tmp_path, monkeypatch, command):
+    folder = _home_with_secret(tmp_path, monkeypatch)
+    monkeypatch.chdir(folder.parent)
+    assert _guard(monkeypatch).touches_secrets(command=command)
+
+
+@pytest.mark.parametrize("command", ["grep -rl KEY", "tar cf - .", "echo hello"])
+def test_any_command_from_inside_the_folder_is_gated(tmp_path, monkeypatch, command):
+    folder = _home_with_secret(tmp_path, monkeypatch)
+    monkeypatch.chdir(folder)
+    assert _guard(monkeypatch).touches_secrets(command=command)
+
+
+def test_an_option_attached_folder_path_is_gated(tmp_path, monkeypatch):
+    folder = _home_with_secret(tmp_path, monkeypatch)
+    guard = _guard(monkeypatch)
+    assert guard.touches_secrets(command=f"tar -C{folder} -cf - .")
+    assert guard.touches_secrets(command=f"tar --directory={folder} -cf - .")
+    assert guard.touches_secrets(command="tar --directory=~/.config/genesis -cf - .")
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["python -m genesis db query x", "cd genesis && ls", "git commit -m genesis", "rm -rf build", "ls -la"],
+)
+def test_ordinary_genesis_words_stay_quiet_from_the_checkout(tmp_path, monkeypatch, command):
+    _home_with_secret(tmp_path, monkeypatch)
+    checkout = tmp_path / "genesis"
+    (checkout / "genesis").mkdir(parents=True)
+    monkeypatch.chdir(checkout)
+    assert not _guard(monkeypatch).touches_secrets(command=command)

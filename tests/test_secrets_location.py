@@ -55,7 +55,7 @@ def _expected(present: set[str], override: str | None, paths: dict[str, Path]) -
     for name in ("new", "checkout", "home_legacy"):
         if name in present:
             return paths[name]
-    return paths["new"]
+    return paths["checkout"]
 
 
 def _environ(override: str | None, paths: dict[str, Path]) -> dict[str, str]:
@@ -187,7 +187,7 @@ def test_a_relative_repo_root_resolves_without_hanging(tmp_path, monkeypatch, pr
         timeout=10,
     ).stdout.strip()
     py = secrets_location.resolve(environ=env, repo_root=Path("rel"))
-    expected = Path("rel/secrets.env") if present else home / ".config/genesis/secrets.env"
+    expected = Path("rel/secrets.env")
     assert Path(out) == py == expected
 
 
@@ -285,3 +285,56 @@ def test_no_reader_rebuilds_the_secrets_location():
     assert not offenders, "use genesis.env.secrets_path() / genesis_secrets_path:\n" + "\n".join(
         offenders
     )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+@pytest.mark.parametrize(
+    ("which", "link"),
+    [
+        ("new", "absolute"),
+        ("new", "relative"),
+        ("new", "chain"),
+        ("new", "missing_target"),
+        ("checkout", "absolute"),
+    ],
+)
+def test_a_candidate_symlinked_into_an_unsearchable_dir_agrees(tmp_path, monkeypatch, which, link):
+    # Python's stat follows the link and cannot check the target, so it keeps
+    # the candidate; the bash twin must walk from the TARGET, not the link's
+    # own (searchable) parent, or it falls back to an older legacy copy.
+    from genesis.guardian.cred_integrity import resolve_secrets_path
+
+    home, checkout, paths = _layout(tmp_path, {"home_legacy"})
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    target = locked / "secrets.env"
+    if link != "missing_target":
+        target.write_text("K=v\n")
+    candidate = paths[which]
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    if link == "relative":
+        candidate.symlink_to(os.path.relpath(target, candidate.parent))
+    elif link == "chain":
+        hop = tmp_path / "hop"
+        hop.symlink_to(target)
+        candidate.symlink_to(hop)
+    else:
+        candidate.symlink_to(target)
+    locked.chmod(0)
+    try:
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("GENESIS_REPO_ROOT", str(checkout))
+        monkeypatch.delenv("SECRETS_PATH", raising=False)
+        env = {"HOME": str(home), "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        out = subprocess.run(
+            ["bash", "-c", '. "$1"; genesis_secrets_path "$2"', "_", str(BASH_TWIN), str(checkout)],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        ).stdout.strip()
+        py = secrets_location.resolve(environ=env, repo_root=checkout)
+        assert Path(out) == py == resolve_secrets_path(home) == candidate
+    finally:
+        locked.chmod(0o700)
