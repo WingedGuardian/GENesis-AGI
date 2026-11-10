@@ -9,6 +9,7 @@ already writes, so it survives a restart.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 from datetime import datetime, timedelta
@@ -47,6 +48,13 @@ _B = (
     "Genesis version changed (genesis_version_changed=1.0), indicating an "
     "upstream update; a new conversation started since the last reflection."
 )
+
+
+# Digit-free fixtures retain fuzzy thresholds; the original numeric examples
+# above remain posting regressions under the owner-approved exact-only policy.
+_FUZZY = "The ordinary worker queue remains stable and scheduled jobs keep failing during nightly synchronization."
+_FUZZY_REWORDED = "The ordinary worker queue stays stable and scheduled jobs keep failing during nightly synchronization."
+_FUZZY_LOOSE = "The ordinary worker queue remains stable but backup errors require investigation."
 
 
 # Telegram message ids are unique per chat; one counter across every fake bot
@@ -120,8 +128,8 @@ _OVER = LIGHT_NO_CHANGE_STUB_HOURS + 0.5
 
 async def test_near_duplicate_is_not_posted(db):
     tm = await _manager(db)
-    assert await _send(tm, _A) == "posted"
-    assert await _send(tm, _A_REWORDED) == "skipped"
+    assert await _send(tm, _FUZZY) == "posted"
+    assert await _send(tm, _FUZZY_REWORDED) == "skipped"
     assert tm._bot.send_message.await_count == 1
 
 
@@ -145,11 +153,11 @@ async def test_model_declared_no_change_is_not_posted(db):
 
     # Guard: the fixture really sits between the flag floor and the
     # near-duplicate line, so only the flag can suppress it.
-    score = compute_jaccard(_comparable(f"h\n\n{_A}"), _comparable(f"h\n\n{_A_LOOSE}"))
+    score = compute_jaccard(_comparable(f"h\n\n{_FUZZY}"), _comparable(f"h\n\n{_FUZZY_LOOSE}"))
     assert LIGHT_MODEL_FLAG_MIN_JACCARD <= score < LIGHT_NEAR_DUPLICATE_JACCARD
     tm = await _manager(db)
-    assert await _send(tm, _A) == "posted"
-    assert await _send(tm, _A_LOOSE, material_change=False) == "skipped"
+    assert await _send(tm, _FUZZY) == "posted"
+    assert await _send(tm, _FUZZY_LOOSE, material_change=False) == "skipped"
     assert tm._bot.send_message.await_count == 1
 
 
@@ -165,27 +173,30 @@ async def test_model_flag_cannot_hide_text_unlike_the_last_post(db):
 
 async def test_parse_failure_is_never_the_baseline(db):
     tm = await _manager(db)
-    await _send(tm, _A)
+    await _send(tm, _FUZZY)
     bad = format_topic_summary(Depth.LIGHT, CCOutput(
         session_id="s", text="tool chatter", model_used="haiku", cost_usd=0.0,
         input_tokens=1, output_tokens=1, duration_ms=1, exit_code=0,
     ))
     await send_light_topic_summary("s", bad, source_text="tool chatter", topic_manager=tm)
-    # Compared against _A (the last real summary), not the fallback.
-    assert await _send(tm, _A_REWORDED) == "skipped"
+    # Compared against _FUZZY (the last real summary), not the fallback.
+    assert await _send(tm, _FUZZY_REWORDED) == "skipped"
 
 
-async def test_other_thread_messages_do_not_reset_the_stub_clock(db):
+@pytest.mark.parametrize(("summary", "expected"), [(_FUZZY, "stub"), (_A, "posted")])
+async def test_other_thread_messages_do_not_reset_the_stub_clock(db, summary, expected):
     from genesis.db.crud.telegram_messages import store
 
     tm = await _manager(db)
-    await _send(tm, _A)
+    await _send(tm, summary)
     await _age(db, _OVER)
     await store(
         db, chat_id=_CHAT, message_id=999_999, sender="genesis",
         content="a reply in the thread", thread_id=_THREAD, direction="outbound",
     )
-    assert await _send(tm, _A) == "stub"
+    # Numeric text plus an ambiguous reply posts under the conservative policy;
+    # digit-free fuzzy comparison still proves that replies do not reset time.
+    assert await _send(tm, summary) == expected
 
 
 async def test_future_timestamp_counts_as_no_history(db):
@@ -197,14 +208,14 @@ async def test_future_timestamp_counts_as_no_history(db):
 
 async def test_duplicate_after_interval_posts_one_stub(db):
     tm = await _manager(db)
-    assert await _send(tm, _A) == "posted"
+    assert await _send(tm, _FUZZY) == "posted"
     await _age(db, _OVER)
-    assert await _send(tm, _A_REWORDED) == "stub"
+    assert await _send(tm, _FUZZY_REWORDED) == "stub"
     stub = tm._bot.send_message.await_args.kwargs["text"]
     assert "No material change since" in stub
     assert "example_sync" not in stub
     # The stub resets the liveness clock: the next duplicate is skipped.
-    assert await _send(tm, _A) == "skipped"
+    assert await _send(tm, _FUZZY) == "skipped"
     assert tm._bot.send_message.await_count == 2
 
 
@@ -222,15 +233,15 @@ async def test_duplicate_compares_against_last_full_post_not_the_stub(db):
 
 async def test_restart_does_not_repost_or_lose_the_stub(db):
     tm = await _manager(db)
-    await _send(tm, _A)
+    await _send(tm, _FUZZY)
     # A fresh manager over the same database is what a restart builds.
     tm2 = await _manager(db)
-    assert await _send(tm2, _A_REWORDED) == "skipped"
+    assert await _send(tm2, _FUZZY_REWORDED) == "skipped"
     await _age(db, _OVER)
     tm3 = await _manager(db)
-    assert await _send(tm3, _A) == "stub"
+    assert await _send(tm3, _FUZZY) == "stub"
     tm4 = await _manager(db)
-    assert await _send(tm4, _A) == "skipped"
+    assert await _send(tm4, _FUZZY) == "skipped"
     assert tm._bot.send_message.await_count == 1
     assert tm2._bot.send_message.await_count == 0
     assert tm3._bot.send_message.await_count == 1
@@ -417,7 +428,7 @@ async def test_fallback_with_trailing_reply_never_becomes_baseline(db):
     from genesis.db.crud.telegram_messages import store
 
     tm = await _manager(db)
-    await _send(tm, _A)
+    await _send(tm, _FUZZY)
     fallback = format_topic_summary(Depth.LIGHT, CCOutput(
         session_id="s", text="synthetic unparseable output", model_used="haiku", cost_usd=0.0,
         input_tokens=1, output_tokens=1, duration_ms=1, exit_code=0,
@@ -425,7 +436,7 @@ async def test_fallback_with_trailing_reply_never_becomes_baseline(db):
     await tm.send_to_category("reflection_light", fallback)
     await store(db, chat_id=_CHAT, message_id=999_998, sender="genesis",
                 content="a reply", thread_id=_THREAD, direction="outbound")
-    assert await _send(tm, _A_REWORDED) == "skipped"
+    assert await _send(tm, _FUZZY_REWORDED) == "skipped"
 
 
 async def test_window_without_the_first_chunk_posts(db):
@@ -441,3 +452,128 @@ async def test_parsed_assessment_ending_in_fallback_words_remains_the_baseline(d
     assert await _send(tm, real_update) == "posted"
     assert await _send(tm, real_update) == "skipped"
     assert await _send(tm, _A) == "posted"
+
+
+@pytest.mark.parametrize(("before", "after"), [
+    (_A, _A_REWORDED), (_A, _A_LOOSE),
+    ("queue depth 0", "queue depth 9"),
+    ("job health=0.0", "job health=1.0"),
+    ("job health=0.5", "job health=-0.5"),
+    ("job health=1e2", "job health=1e3"),
+    ("job health=０", "job health=１"),
+    ("job health=٣", "job health=٤"),
+    ("service_alpha=0 service_beta=1", "service_beta=0 service_alpha=1"),
+    ("latency 1ms", "latency 1s"),
+    ("latency > 1 ms", "latency < 1 ms"),
+    ("queue depth 1 remains stable", "queue depth 1 stays stable"),
+    ("queue depth 1 stable.", "Queue depth 1 stable!"),
+    ("queue depth 1 stable", "queue depth 1  stable"),
+    ("worker queue stable", "worker queue stable depth=1"),
+    ("worker queue stable depth=1", "worker queue stable"),
+])
+@pytest.mark.parametrize("flag", [None, False])
+@pytest.mark.parametrize("expired", [False, True])
+async def test_changed_digit_bearing_summary_posts(db, before, after, flag, expired):
+    tm = await _manager(db)
+    assert await _send(tm, before) == "posted"
+    if expired:
+        await _age(db, _OVER)
+    extra = {} if flag is None else {"material_change": flag}
+    assert await _send(tm, after, **extra) == "posted"
+    assert tm._bot.send_message.await_count == 2
+
+
+@pytest.mark.parametrize("text", ["0", "0.0", "-1", "０", _A])
+async def test_exact_numeric_repeat_survives_restart_and_stub(db, text):
+    tm = await _manager(db)
+    assert await _send(tm, text) == "posted"
+    restarted = await _manager(db)
+    assert await _send(restarted, text, material_change=False) == "skipped"
+    await _age(db, _OVER)
+    assert await _send(restarted, text) == "stub"
+    assert await _send(restarted, text) == "skipped"
+
+
+@pytest.mark.parametrize("existing", [False, True])
+async def test_concurrent_light_deliveries_share_one_history_decision(db, existing):
+    tm = await _manager(db)
+    if existing:
+        await _send(tm, _A)
+        await _age(db, _OVER)
+    first_read, release, second_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original = tm.recent_outbound
+    reads = 0
+
+    async def history(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        rows = await original(*args, **kwargs)
+        if reads == 1:
+            first_read.set()
+            await release.wait()
+        return rows
+
+    tm.recent_outbound = history
+    first = asyncio.create_task(_send(tm, _A))
+    await asyncio.wait_for(first_read.wait(), 2)
+
+    async def second_send():
+        second_started.set()
+        return await _send(tm, _A)
+
+    second = asyncio.create_task(second_send())
+    try:
+        await asyncio.wait_for(second_started.wait(), 2)
+        assert reads == 1  # The waiter must not read a stale baseline.
+    finally:
+        release.set()
+        results = await asyncio.wait_for(asyncio.gather(first, second), 2)
+    assert results == ["stub" if existing else "posted", "skipped"]
+    assert tm._bot.send_message.await_count == (2 if existing else 1)
+
+
+async def test_delivery_lock_is_stable_and_waiter_cancellation_keeps_holder(db):
+    tm = await _manager(db)
+    lock = tm.delivery_lock("reflection_light")
+    assert lock is tm.delivery_lock("reflection_light")
+    assert lock is not tm.delivery_lock("reflection_deep")
+    started = asyncio.Event()
+
+    async def waiting_send():
+        started.set()
+        return await _send(tm, _A)
+
+    async with lock:
+        waiter = asyncio.create_task(waiting_send())
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            assert not waiter.done()
+            assert await asyncio.wait_for(tm.send_to_category("reflection_deep", "other topic"), 2)
+        finally:
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+        assert lock.locked()
+    assert not lock.locked()
+    assert await asyncio.wait_for(_send(tm, _A), 2) == "posted"
+
+
+@pytest.mark.parametrize("fault", ["read", "send", "cancel"])
+async def test_delivery_lock_released_after_failed_or_cancelled_work(db, fault):
+    tm = await _manager(db)
+    lock = tm.delivery_lock("reflection_light")
+    read, send = tm.recent_outbound, tm._bot.send_message.side_effect
+    if fault == "read":
+        tm.recent_outbound = AsyncMock(side_effect=RuntimeError("synthetic read failure"))
+    else:
+        error = asyncio.CancelledError() if fault == "cancel" else RuntimeError("synthetic send failure")
+        tm._bot.send_message.side_effect = error
+    if fault == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await _send(tm, _A)
+    else:
+        assert await _send(tm, _A) == "posted"
+    assert not lock.locked()
+    tm.recent_outbound, tm._bot.send_message.side_effect = read, send
+    assert await asyncio.wait_for(_send(tm, _A), 2) == ("skipped" if fault == "read" else "posted")
+    assert await _send(tm, _A) == "skipped"

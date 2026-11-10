@@ -690,12 +690,15 @@ def _comparable(content: str) -> str:
 
 
 def _light_overlap(first: str, second: str) -> float:
-    """Local comparison: changed negated text posts, exact repeats can dedup.
+    """Changed negated or decimal-digit-bearing text posts; exact repeats dedup.
 
     Keeping 'not' as just one term still hides a polarity change under a long
     common prefix. Counts alone also miss moving 'not' to another subject.
     """
     from genesis.memory.source_verification import extract_terms
+
+    if re.search(r"\d", first) or re.search(r"\d", second):
+        return 1.0 if first == second else 0.0
 
     def negations(body: str) -> set[str]:
         words = re.findall(r"\b\w+(?:['’]\w+)*\b", body.casefold())
@@ -752,7 +755,28 @@ async def send_light_topic_summary(
     from ``telegram_messages`` (``TopicManager.recent_outbound``), so a restart
     neither re-posts nor forgets a stub. Anything that cannot be decided
     (no history, a failed read, a parse-failure fallback) is posted.
+    Changed decimal-digit-bearing bodies post even for harmless rewordings;
+    equal numeric bodies can dedup. One manager-local lock spans the history
+    read through successful send persistence, including early-post paths.
     """
+    if not topic_manager:
+        return await _send_light_topic_summary_locked(
+            session_id, text, source_text=source_text, topic_manager=topic_manager, now=now,
+        )
+    async with topic_manager.delivery_lock("reflection_light"):
+        return await _send_light_topic_summary_locked(
+            session_id, text, source_text=source_text, topic_manager=topic_manager, now=now,
+        )
+
+
+async def _send_light_topic_summary_locked(
+    session_id: str,
+    text: str,
+    *,
+    source_text: str,
+    topic_manager,
+    now: datetime | None = None,
+) -> str:
     from genesis.channels.telegram._handler_helpers import _split_for_telegram
     from genesis.util.tz import fmt, parse_utc_iso
 
