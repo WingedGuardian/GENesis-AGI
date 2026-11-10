@@ -1085,6 +1085,31 @@ def test_the_advisory_ignores_a_round_from_before_the_cutover(repo, monkeypatch)
     assert rr.unreflected_round_behind(str(repo), budget, cutover=later) is None
 
 
+def test_a_refused_read_leaves_the_advisory_unknown(repo, monkeypatch, tmp_path):
+    """A reflection naming a later head may answer the round, but when git
+    cannot relate the two (out of time, or the head not fetched) the round is
+    unknown, never "no reflection"."""
+    import review_budget
+
+    head = _open_round(monkeypatch, repo)
+    (repo / "f.py").write_text("value = 5\n")
+    _git(repo, "commit", "-qam", "a fix made before any reflection")
+    msg = _write_reflection(tmp_path, _reflection(_head(repo)))
+    _git(repo, "commit", "-q", "--allow-empty", "--cleanup=verbatim", "-F", str(msg))
+    _point_budget_at(monkeypatch, repo)
+    budget = review_budget.evaluate_pr("owner/repo", 99)
+    assert budget["round_state"] == "complete"
+    cut = rr.REFLECTION_CUTOVER_ISO
+    # Control: git can relate them, a real fix lies between, so the advisory names the round.
+    assert rr.unreflected_round_behind(str(repo), budget, cutover=cut) == head
+
+    def refused(*_a, **_k):
+        raise rr.Refused("ran out of time")
+
+    monkeypatch.setattr(rr, "fix_rows", refused)
+    assert rr.unreflected_round_behind(str(repo), budget, cutover=cut) is None
+
+
 def test_an_older_round_reviewed_after_the_merge_stays_owed(repo, monkeypatch):
     """Rounds at A (c11) and B (c22), an empty commit between them, then a merge
     of main M; A's review lands after M. The held view holds B open, and A's key

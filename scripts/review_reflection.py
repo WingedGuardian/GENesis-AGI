@@ -1313,6 +1313,7 @@ def unreflected_round_behind(
     if not any(s.get("finding_keys") for s in entry.get("reviews") or []):
         return None
     round_head = str(entry.get("head"))
+    unknown = False
     for _sha, _kind, body, _at in _log_reflections(cwd):
         match = HEADER_RE.match(body.split("\n", 1)[0])
         # Only a reflection that passes its grammar answered the round: one
@@ -1328,8 +1329,10 @@ def unreflected_round_behind(
             if fix_rows(cwd, round_head, named, main_merges=True) == []:
                 return None
         except Refused:
-            continue
-    return round_head
+            # The reflection may answer the round, but git cannot say (out
+            # of time, or the named head not fetched): unknown, never "none".
+            unknown = True
+    return None if unknown else round_head
 
 
 def owed_state(
