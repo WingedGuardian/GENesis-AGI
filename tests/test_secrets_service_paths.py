@@ -140,57 +140,61 @@ def test_units_load_one_file_the_resolver_picks_at_render_time():
         assert lines == lines_expected, name
 
 
-def _render(renderer, tmp_path, *, manager_secrets_path, shell_secrets_path):
+def _render(renderer, root, *, manager_secrets_path=None, shell_secrets_path=None):
+    """Run the renderer's real lines (resolve, warn, escape) against a fake
+    systemctl that reports ``manager_secrets_path`` in the user manager's env."""
     text = (REPO / "scripts" / renderer).read_text()
-    override = re.search(r"^\s*(_secrets_override=.*)$", text, re.M)
-    resolve = re.search(r"^\s*(_secrets_file=\$\(SECRETS_PATH=.*genesis_secrets_path .*\))$", text, re.M)
+    resolve = re.search(r"^\s*(_secrets_file=\$\(SECRETS_PATH= genesis_secrets_path .*\))$", text, re.M)
+    warn = re.search(r"^(\s*if \[\[ -n \"\$\{SECRETS_PATH:-\}\" \]\].*?\n\s*fi)$", text, re.M | re.S)
     escape = re.search(r"^\s*(_secrets_file_esc=\$\(_sed_repl_esc .*)$", text, re.M)
     sed_esc = re.search(r"^\s*(_sed_repl_esc\(\) \{.*\})\s*$", text, re.M)
-    assert override and resolve and escape and sed_esc, renderer
+    assert resolve and warn and escape and sed_esc, renderer
     assert '-e "s|__SECRETS_FILE__|$_secrets_file_esc|g"' in text, renderer
-    fakebin = tmp_path / "bin"
+    fakebin = root / "bin"
     fakebin.mkdir(exist_ok=True)
-    systemctl = fakebin / "systemctl"
-    line = f"SECRETS_PATH={manager_secrets_path}" if manager_secrets_path else "PATH=/usr/bin"
-    systemctl.write_text(f"#!/bin/sh\nprintf '%s\\n' 'LANG=C' {shlex.quote(line)}\n")
-    systemctl.chmod(0o755)
+    line = f"SECRETS_PATH={manager_secrets_path}" if manager_secrets_path else "LANG=C"
+    (fakebin / "systemctl").write_text(f"#!/bin/sh\nprintf '%s\\n' 'PATH=/usr/bin' {shlex.quote(line)}\n")
+    (fakebin / "systemctl").chmod(0o755)
     template = REPO / "scripts/systemd/genesis-server.service.template"
     q = shlex.quote
     script = (
         f". {q(str(REPO / 'scripts/lib/secrets_path.sh'))}\n{sed_esc.group(1)}\n"
-        f"GENESIS_ROOT={q(str(tmp_path))}; REPO_DIR={q(str(tmp_path))}\n"
-        f"{override.group(1)}\n{resolve.group(1)}\n{escape.group(1)}\n"
+        f"GENESIS_ROOT={q(str(root))}; REPO_DIR={q(str(root))}\n"
+        f"{resolve.group(1)}\n{warn.group(1)}\n{escape.group(1)}\n"
         f'sed -e "s|__SECRETS_FILE__|$_secrets_file_esc|g" {q(str(template))}\n'
     )
-    env = {**os.environ, "HOME": str(tmp_path), "PATH": f"{fakebin}:{os.environ['PATH']}"}
+    env = {**os.environ, "HOME": str(root), "PATH": f"{fakebin}:{os.environ['PATH']}"}
     env.pop("SECRETS_PATH", None)
     if shell_secrets_path:
         env["SECRETS_PATH"] = shell_secrets_path
-    out = subprocess.run(
+    r = subprocess.run(
         ["bash", "-euo", "pipefail", "-c", script], env=env, capture_output=True, text=True, check=True
-    ).stdout
-    return [x for x in out.splitlines() if x.startswith("EnvironmentFile=")]
-
-
-@pytest.mark.parametrize("renderer", ["bootstrap.sh", "install.sh"])
-def test_each_renderer_renders_the_file_the_server_will_load(renderer, tmp_path):
-    # Resolved in the render block (so a move earlier in the same run renders the
-    # new place), with the SECRETS_PATH the server will inherit: the systemd user
-    # manager's. The real lines are extracted and run against a fake systemctl.
-    target = tmp_path / "a %h & | b" / "secrets.env"
-    assert _render(renderer, tmp_path, manager_secrets_path=str(target), shell_secrets_path=None) == [
-        f"EnvironmentFile=-{str(target).replace('%', '%%')}"
-    ]
-
-
-@pytest.mark.parametrize("renderer", ["bootstrap.sh", "install.sh"])
-def test_a_shell_only_secrets_path_does_not_reach_the_unit(renderer, tmp_path):
-    # The server's Python never sees a SECRETS_PATH set only in the shell running
-    # bootstrap, so the unit must not load that file either (two files loaded).
-    rendered = _render(
-        renderer, tmp_path, manager_secrets_path=None, shell_secrets_path=str(tmp_path / "custom.env")
     )
+    return [x for x in r.stdout.splitlines() if x.startswith("EnvironmentFile=")], r.stderr
+
+
+@pytest.mark.parametrize("renderer", ["bootstrap.sh", "install.sh"])
+def test_each_renderer_renders_the_resolvers_file_escaped(renderer, tmp_path):
+    # Resolved in the render block (so a move earlier in the same run renders the
+    # new place); sed and systemd specials in the path survive the render.
+    root = tmp_path / "a %h & | b"
+    root.mkdir()
+    rendered, err = _render(renderer, root)
+    assert rendered == [f"EnvironmentFile=-{str(root / 'secrets.env').replace('%', '%%')}"]
+    assert "WARNING" not in err
+
+
+@pytest.mark.parametrize("renderer", ["bootstrap.sh", "install.sh"])
+@pytest.mark.parametrize("where", ["shell", "manager"])
+def test_a_set_secrets_path_is_not_followed_and_is_named(renderer, where, tmp_path):
+    # SECRETS_PATH is never rendered: a shell value never reaches the server, and
+    # a user-manager value is shell-quoted by systemd and may be relative. The
+    # unit gets the resolver's file and the run names the override.
+    custom = str(tmp_path / "private keys" / "custom.env")
+    kwargs = {"shell_secrets_path": custom} if where == "shell" else {"manager_secrets_path": custom}
+    rendered, err = _render(renderer, tmp_path, **kwargs)
     assert rendered == [f"EnvironmentFile=-{tmp_path}/secrets.env"]
+    assert "WARNING: SECRETS_PATH is set" in err
 
 
 class _FakeAdapter:

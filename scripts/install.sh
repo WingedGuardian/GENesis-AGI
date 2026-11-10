@@ -1112,11 +1112,14 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             # would make the unit load a different file than the resolver picked.
             # Its own assignment, so set -e stops the render if it fails (inside the
             # escape below the failure would be masked and render `EnvironmentFile=-`).
-            # The server inherits SECRETS_PATH only from the systemd user manager, never
-            # from this shell, so resolve with the manager's value (usually none); a
-            # shell-only SECRETS_PATH would render a file the server's Python never loads.
-            _secrets_override=$( (systemctl --user show-environment 2>/dev/null || true) | sed -n 's/^SECRETS_PATH=//p' | tail -n 1)
-            _secrets_file=$(SECRETS_PATH="$_secrets_override" genesis_secrets_path "$REPO_DIR")
+            # SECRETS_PATH is not followed here: the unit gets the resolver's own file. A
+            # shell value never reaches the server, and a user-manager value cannot be
+            # rendered faithfully (systemd shell-quotes it, and a relative path is not a
+            # valid EnvironmentFile), so either one is named in a warning instead.
+            _secrets_file=$(SECRETS_PATH= genesis_secrets_path "$REPO_DIR")
+            if [[ -n "${SECRETS_PATH:-}" ]] || { systemctl --user show-environment 2>/dev/null || true; } | grep '^SECRETS_PATH=' >/dev/null; then
+                echo "  WARNING: SECRETS_PATH is set, but the units load $_secrets_file; the server may load another file" >&2
+            fi
             if [[ -z "$_secrets_file" ]]; then
                 echo "ERROR: could not resolve the secrets file for the unit render" >&2
                 exit 1

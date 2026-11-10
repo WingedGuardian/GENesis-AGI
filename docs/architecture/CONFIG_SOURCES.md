@@ -28,7 +28,7 @@ default is still `<repo_root>/secrets.env`: nothing creates the home-config
 file until the migration moves an install's file there, so no install holds two
 files the services would have to choose between. The systemd units load ONE
 file, the one `genesis_secrets_path` picks when bootstrap or install renders them
-(`EnvironmentFile=-__SECRETS_FILE__`; only a `SECRETS_PATH` in the systemd user manager's environment counts, since the server inherits nothing from the rendering shell), so a home-config file created by hand is
+(`EnvironmentFile=-__SECRETS_FILE__`, resolved with `SECRETS_PATH` unset; when the rendering shell or the systemd user manager sets `SECRETS_PATH`, bootstrap and install warn that the units do not follow it), so a home-config file created by hand is
 picked up by the units at the next bootstrap. The dashboard edits the file but
 never creates it (409, "run bootstrap"); only bootstrap, install and restore
 create it. Legacy fallback is permanent.
