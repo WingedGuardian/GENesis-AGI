@@ -558,10 +558,20 @@ shares the OAuth-compatible readiness helper. `cc_fallback` is a non-routing
 **Fallback** observation in the neural monitor for conversations and managed
 turns; actual committed outcomes, not readiness alone, establish success.
 
+Contained native peer requests take a separate public-context constructor before
+private profile/identity/MCP builders. Explicit tools-free and exact-facade
+invocation modes share owned scopes, helper processes and the receipt deadline.
+The complete managed operation isolates provider observations and private
+diagnostics, while ordinary same-owner work keeps its current behavior. Failed
+drain retains native ownership; no contained transcript pointer is fabricated.
+This primitive does not grant foreign admission; its consumer is separate.
+See `docs/reference/peer-execution.md`.
+
 Ordinary streaming and readiness share final-effective quota classification:
 allowed/warning and explicitly usable overage are not refusals, and a later
 allowed event supersedes a rejection. Result and no-result streaming paths
 preserve usable answers, real refusal health and dropped-output replay guards.
+
 
 ```yaml subsystem-map
 entry: execution-cc
@@ -4137,6 +4147,13 @@ Validator calibration settings validate the tracked base and prospective strict
 overlay before reporting success or writing. Invalid/unreadable configuration
 refuses with a clear message; no overlay is repaired or discarded implicitly.
 Refusing a proposed update preserves a previously valid opt-in.
+
+Explicit private execution marks escaping exceptions without changing their
+types, arguments or causes. Automatic span errors inspect that provenance before
+formatting; the shared execution/span-writer diagnostic filters also cover
+marked causes, contexts and exception groups after the task-local scope exits.
+Ordinary diagnostics remain readable. This covers the named emitters, not every
+logger or unrelated exceptions with copied text and no provenance.
 
 - **payments/**: the encrypted card vault, virtual cards only.
   `python -m genesis vault init|add|list|retire|migrate|status` (`payments/cli.py`);
