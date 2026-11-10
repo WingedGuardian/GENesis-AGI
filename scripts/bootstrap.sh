@@ -1739,6 +1739,7 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         _home_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$HOME")")
         _repo_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$GENESIS_ROOT")")
         _venv_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$GENESIS_ROOT/.venv")")
+        _ccbin_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$CC_BIN_DIR")")
         _home_esc=$(_sed_repl_esc "$HOME")
         _venv_esc=$(_sed_repl_esc "$GENESIS_ROOT/.venv")
         _repo_esc=$(_sed_repl_esc "$GENESIS_ROOT")
@@ -1764,6 +1765,7 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
             -e "s|__HOME_EXEC__|$_home_exec_esc|g" \
             -e "s|__REPO_EXEC__|$_repo_exec_esc|g" \
             -e "s|__VENV_EXEC__|$_venv_exec_esc|g" \
+            -e "s|__CC_BIN_DIR_EXEC__|$_ccbin_exec_esc|g" \
             -e "s|__VENV__|$_venv_esc|g" \
             -e "s|__REPO_DIR__|$_repo_esc|g" \
             -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \

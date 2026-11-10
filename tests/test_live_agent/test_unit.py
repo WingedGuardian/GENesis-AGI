@@ -9,6 +9,10 @@ from pathlib import Path
 
 import pytest
 
+_NO_ANALYZE = pytest.mark.skipif(
+    shutil.which("systemd-analyze") is None, reason="systemd-analyze is not installed"
+)
+
 
 def test_runtime_directory_survives_failed_unit_start():
     template = Path(__file__).resolve().parents[2] / "scripts/systemd/genesis-live-agent.service.template"
@@ -19,6 +23,7 @@ def test_runtime_directory_survives_failed_unit_start():
     assert "KillMode=mixed" in text
 
 
+@_NO_ANALYZE
 @pytest.mark.parametrize("directory", ["plain", "space dir", "percent%d", 'quote"dir', r"back\dir", "dollar$UID"])
 def test_executable_path_survives_systemd_parsing(tmp_path, directory):
     venv = tmp_path / directory
@@ -79,12 +84,18 @@ def test_both_real_renderers_escape_host_executable(tmp_path, renderer, suffix):
         return str(path).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
 
     assert f'''ExecStart=:/bin/sh -c 'exec "$@"' -- "{escaped(venv)}/bin/python" -m genesis.live_agent''' in body
+    path = f"{escaped(venv)}/bin:{escaped(ccbin)}:{escaped(home)}/.npm-global/bin:{escaped(home)}/.local/bin"
+    assert f'Environment="PATH={path}:/usr/local/bin:/usr/bin:/bin"' in body
     assert "__" not in body
     assert "RuntimeDirectoryPreserve=yes" in body
 
 
-def test_complete_rendered_unit_passes_systemd_parser(tmp_path):
-    repo, venv, home = tmp_path / "repo", tmp_path / "venv", tmp_path / "home"
+@_NO_ANALYZE
+@pytest.mark.parametrize("home_name", ["home", "space home"])
+def test_complete_rendered_unit_passes_systemd_parser(tmp_path, home_name):
+    """verify exits 0 even on an invalid Environment= assignment, so its
+    output is checked too: an unquoted PATH split at a space once passed."""
+    repo, venv, home = tmp_path / "repo", tmp_path / "venv", tmp_path / home_name
     repo.mkdir()
     home.mkdir()
     (venv / "bin").mkdir(parents=True)
@@ -95,6 +106,7 @@ def test_complete_rendered_unit_passes_systemd_parser(tmp_path):
     values = {
         "__REPO_DIR__": str(repo), "__VENV__": str(venv),
         "__VENV_EXEC__": str(venv), "__HOME__": str(home), "__CC_BIN_DIR__": "/usr/bin",
+        "__HOME_EXEC__": str(home), "__CC_BIN_DIR_EXEC__": "/usr/bin",
     }
     for token, value in values.items():
         body = body.replace(token, value)
@@ -106,3 +118,4 @@ def test_complete_rendered_unit_passes_systemd_parser(tmp_path):
         env={**os.environ, "XDG_RUNTIME_DIR": str(tmp_path)}, capture_output=True, text=True,
     )
     assert proc.returncode == 0, proc.stderr
+    assert "Invalid environment assignment" not in proc.stderr, proc.stderr
