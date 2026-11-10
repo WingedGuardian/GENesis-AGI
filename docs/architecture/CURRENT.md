@@ -1486,6 +1486,10 @@ verified: a6528dab2 2026-11-09
   and matching backtick runs. Literal terminal punctuation and repeated tokens in different
   contexts retain their own identities. The read-only coverage report retains
   these occurrences too; it does not reconstruct coverage from normalized URLs.
+  It separately reports stored input, baseline-only membership, whole logical
+  items, response presence and Source/mention evidence; strict decoding rejects
+  corrupt v2 inputs as a whole. These are retained-evidence facts, not proof of
+  source acquisition or model judgment; see `docs/reference/inbox-coverage-evidence.md`.
   An ordered proof finds the first source-frame closure; ambiguous tokens stay
   raw and cannot supply wrapper context for later URLs.
   The wrapper correction is scoped to this URL path; the entry's existing
