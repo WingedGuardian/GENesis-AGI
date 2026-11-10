@@ -300,7 +300,10 @@ def test_a_sync_list_the_engine_cannot_read_keeps_its_candidate_off_live(dc, dc_
     """Valid bash the engine's list reader does not parse (`declare -a`) would
     install a hook that a later drop could never see again: the old list would
     read as unknown. The candidate is excluded, so `live` never holds such a
-    list (Codex, #3027 round 4)."""
+    list (Codex, #3027 round 4). Admission now refuses it before it is ever
+    approved, because the native pre-push helper closure cannot be qualified
+    against a list the reader cannot parse; the rebuild still excludes nothing
+    else and `live` still never holds it."""
     w = dc_ready
     sync = (w.root / "scripts" / "hooks" / "sync-hooks.sh").read_text()
     odd = sync.replace("HOOKS_TO_SYNC=(\n", "declare -a HOOKS_TO_SYNC=(\n", 1).replace(
@@ -312,12 +315,15 @@ def test_a_sync_list_the_engine_cannot_read_keeps_its_candidate_off_live(dc, dc_
         {"scripts/hooks/sync-hooks.sh": odd, "scripts/hooks/post-merge": "#!/bin/sh\nexit 0\n"},
     )
     hx = w.candidate("feat/x", {"x.txt": "x\n"})
-    assert _approve(w, dc, "feat/odd") == 0, capsys.readouterr()
+    assert _approve(w, dc, "feat/odd") != 0
+    err = capsys.readouterr().err
+    assert (
+        "feat/odd cannot go live" in err and "cannot qualify native pre-push helper closure" in err
+    ), err
     assert w.add(dc, "feat/x") == 0
     capsys.readouterr()
     assert w.run(dc, "rebuild") == 0, capsys.readouterr()
-    out = capsys.readouterr().out
-    assert "EXCLUDED: feat/odd" in out and "cannot read" in out, out
+    capsys.readouterr()
     assert w.live_merges() == [("feat/x", hx)]
     assert not (w.root / ".git" / "hooks" / "post-merge").exists()
 
