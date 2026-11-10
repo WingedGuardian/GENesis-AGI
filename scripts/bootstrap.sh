@@ -1723,10 +1723,12 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
                 echo "           the engine will not start until bootstrap verifies the graph engine."
             elif [[ "${FALKORDB_KEEP_REASON:-}" == "active" ]]; then
                 echo "  Kept: $svc_name (the running graph engine stays on its current module;"
-                echo "        switch with GENESIS_FALKORDB_SWITCH=1 scripts/bootstrap.sh, then restart the unit)"
+                echo "        switch with GENESIS_FALKORDB_SWITCH=1 scripts/update.sh --take-template $svc_name,"
+                echo "        then systemctl --user restart genesis-falkordb)"
             elif [[ "${FALKORDB_KEEP_REASON:-}" == "state_unknown" ]]; then
                 echo "  Kept: $svc_name (could not ask the user manager whether the graph engine is running,"
-                echo "        so it is not moved onto new binaries; switch with GENESIS_FALKORDB_SWITCH=1 scripts/bootstrap.sh)"
+                echo "        so it is not moved onto new binaries; switch with"
+                echo "        GENESIS_FALKORDB_SWITCH=1 scripts/update.sh --take-template $svc_name)"
             else
                 echo "  Kept: $svc_name (graph engine not verified this run; unit not re-rendered)"
             fi
@@ -1797,6 +1799,14 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     # After daemon-reload, so systemd already reads the unit this decided from.
     if declare -F falkordb_prune_engines >/dev/null; then
         falkordb_prune_engines "$SYSTEMD_USER_DIR/genesis-falkordb.service"
+    fi
+    # Arm the graph engine verified this run: enable it, and start it when it
+    # is not running; a running engine is never restarted, an operator opt-out
+    # or a masked unit is left alone, and a failed start is a WARNING
+    # (lib/falkordb_install.sh, falkordb_enable_unit). After daemon-reload, like
+    # the timer enables below.
+    if declare -F falkordb_enable_unit >/dev/null; then
+        falkordb_enable_unit "$SYSTEMD_USER_DIR/genesis-falkordb.service"
     fi
 
     # A user manager stops at logout without lingering, taking every enabled

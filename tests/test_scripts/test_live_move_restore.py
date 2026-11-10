@@ -461,15 +461,19 @@ def test_a_ts_that_names_no_report_is_refused(w, ts):
 
 
 def test_dismiss_reads_through_the_loader(w):
-    """A report the loader refuses (another checkout's) is not dismissed."""
+    """A report the loader refuses (another checkout's) is never edited: it is
+    dismissed with DISMISSED.json beside it (#4331 owner ruling), so its alert
+    has a way out through Genesis."""
     ts = _repaired(w, _foreign_edit)
     path = w.backups()[-1] / "REPAIR.json"
     path.write_text(json.dumps({**json.loads(path.read_text()), "repo": "/elsewhere"}))
+    before = path.read_bytes()
     r = subprocess.run(
         ["python3", "-I", "-S", str(MODULE), "--dismiss", ts, str(w.state), str(w.root)],
         capture_output=True, text=True, env=w.env(),
     )  # fmt: skip
-    assert r.returncode == 1 and json.loads(path.read_text())["dismissed_at"] is None
+    assert r.returncode == 0 and path.read_bytes() == before, r.stderr
+    assert "not this checkout" in json.loads((path.parent / "DISMISSED.json").read_text())["unread"]
 
 
 def test_an_unreadable_tag_refuses_the_whole_report(w):
@@ -1117,3 +1121,19 @@ def test_the_check_never_runs_the_repositorys_fsmonitor(w, tmp_path):
     r = _check(w, ts)
     assert r.returncode == 0, r.stdout + r.stderr
     assert not marker.exists(), "the check ran the repository's fsmonitor"
+
+
+def test_every_module_the_restore_loads_beside_it_ships_in_the_kit():
+    """The restore loads its row rules and run-folder rules by path from its own
+    directory, so a kit missing one of them cannot load at all. Every such file
+    must be in KIT_FILES, the list the test harness copies into its kit (the
+    kit installer, #3492 D2, must ship the same files)."""
+    import re
+
+    from tests.test_scripts._live_repair_world import KIT_FILES
+
+    loaded = set()
+    for name in ("live_move_restore.py", "live_move_restore_runs.py", "live_move_restore_rows.py"):
+        loaded |= set(re.findall(r'_sibling\("([^"]+)"\)', (LIB / name).read_text()))
+    assert loaded == {"live_move_restore_rows.py", "live_move_restore_runs.py"}
+    assert loaded <= set(KIT_FILES)

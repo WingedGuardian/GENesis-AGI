@@ -112,6 +112,33 @@ def test_a_real_repair_is_reported_by_count_until_dismissed(w, make):
     assert _dh().live_repair_findings(found) == []
 
 
+@pytest.mark.parametrize("damage", ["not-json", "other-checkout"])
+def test_dismissing_a_report_no_reader_can_read_clears_it(w, damage):
+    """#4331 review: an unreadable report, or one recorded for another checkout,
+    is kept by the deploy-backups prune and counted refused by deploy health,
+    so it needs a way out through Genesis. --dismiss TS writes DISMISSED.json
+    beside it (REPAIR.json is not edited); every reader then skips it."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _foreign_edit(w))
+    assert w.repair().returncode == 0
+    d = w.backups()[-1]
+    report = d / "REPAIR.json"
+    if damage == "not-json":
+        report.write_text("{not json")
+    else:
+        report.write_text(json.dumps({**json.loads(report.read_text()), "repo": "/elsewhere"}))
+    before = report.read_bytes()
+    assert _found(w)["refused"] == 1, "control: the report is refused"
+    _dismiss(w, d.name[: -len(SUFFIX)])
+    assert report.read_bytes() == before, "REPAIR.json itself is not edited"
+    mark = json.loads((d / "DISMISSED.json").read_text())
+    assert isinstance(mark["dismissed_at"], str) and mark["unread"], mark
+    found = _found(w)
+    assert (found["refused"], found["reports"]) == (0, []), found
+    assert _dh().live_repair_findings(found) == []
+    assert _guardian_pick(w.home) is None
+
+
 def _guardian_pick(home: Path) -> dict | None:
     """The host guardian's container-side report pick (#3627), run against this HOME."""
     from genesis.guardian import collector as gc
@@ -601,7 +628,7 @@ def test_an_unforeseen_failure_costs_only_that_report(tmp_path, monkeypatch):
     assert (found["refused"], found["saved"]) == (1, 1), found
 
 
-_REPAIR_API = ("report_ts", "report_order", "REPORT_FUTURE_S", "BadReport", "load_report")
+_REPAIR_API = ("report_ts", "report_order", "REPORT_FUTURE_S", "BadReport", "load_report", "dismiss_marked")
 
 
 @pytest.mark.parametrize("missing", _REPAIR_API)
@@ -1099,6 +1126,16 @@ def test_the_guardian_pick_shares_the_loaders_name_rule_and_caps(mod):
     assert gc._REPAIR_REPO_BYTES == mod.REPO_BYTES
     assert gc._REPAIR_FUTURE_S == mod.REPORT_FUTURE_S
     assert gc._REPAIR_READS == _dh().REPAIR_REPORTS_READ
+    assert gc._REPAIR_DISMISSED == mod.DISMISS_MARK
+    keep = importlib.util.spec_from_file_location("_keep", Path(mod.__file__).parent / "repair_report_keep.py")
+    kept = importlib.util.module_from_spec(keep)
+    keep.loader.exec_module(kept)
+    assert kept.DISMISS_MARK == mod.DISMISS_MARK
+    names = ["20260101T000000Z-42-live-move-repair", "20260101T000000Z-42-live-move-restore",
+             "20260101T000000Z-live-move-repair", "x20260101T000000Z-42-live-move-repair",
+             "20260101T000000Z-42-live-move-repair.bak", "2026010T000000Z-42-live-move-repair"]  # fmt: skip
+    for name in names:
+        assert bool(kept.REPORT_NAME.fullmatch(name)) == bool(mod.REPORT_NAME.fullmatch(name)), name
 
 
 @pytest.mark.parametrize("case", ["bad-name", "linked-dir", "nul-repo", "long-repo"])

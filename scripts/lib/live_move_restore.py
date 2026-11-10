@@ -52,242 +52,67 @@ import bisect
 import calendar
 import contextlib
 import hashlib
+import importlib.util
 import json
 import os
-import re
 import stat
 import subprocess
 import time
 import types
 
-_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
-_MODES = frozenset({"100644", "100755", "120000", "160000"})
-_DISKS = _MODES | {"absent", "dir", "other"}
-#: The `ls-files -v` tags the writer records (_index_state): S, or a lowercase one.
-_FLAGS = frozenset("Shsmrck")
-_SPECIALS = frozenset({"fifo", "socket", "char-device", "block-device", "unknown"})
-_CANNOT_MAKE = _SPECIALS - {"fifo"}
-PATH_BYTES = 4096
-#: Every key the writer's _row writes; a row missing one is not the writer's.
-ROW_KEYS = frozenset(
-    {"path", "class", "disk", "disk_changed", "tag", "other", "index", "flag", "special",
-     "saved_as", "blobs", "unsaved", "unreachable_through"}
-)  # fmt: skip
-#: What one check may read, under the locks: no file over FILE_BYTES is hashed,
-#: at most READ_BYTES in all, and at most ENTRIES nodes looked at (files hashed
-#: and directory entries walked). Over a budget a part is `other:too-large`,
-#: never a long read. A report holds at most REPORT_ROWS (20,000) rows and a
-#: few nodes per row; directory rows walk their saved copy and the checkout's
-#: directory, so ENTRIES is ten times the row cap. The writer itself copies
-#: whatever it finds; FILE_BYTES is about what a person keeps in a checkout,
-#: and a bigger foreign file is refused, never read (the safe direction).
-FILE_BYTES = 256 * 1024 * 1024
-READ_BYTES = 2 * 1024 * 1024 * 1024
-ENTRIES = 200_000
+
+def _sibling(name: str):
+    """A kit source beside this one, loaded the way live_move_repair._load_kit
+    loads the kit (by path, so the installed kit never imports from the repo)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    spec = importlib.util.spec_from_file_location(f"_live_repair_{name[:-3]}", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"{path} cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def _path(p: object, *, nested_git: bool = False) -> bool:
-    """A plain relative path outside `.git`, as git records one: no empty, `.`
-    or `..` part, no NUL, at most PATH_BYTES file-system bytes. ``nested_git``:
-    a saved copy's path below a row, where a nested checkout's `.git` is
-    saved data (#3974 item 1); only a first part `.git`, the checkout's own,
-    is refused."""
-    if not isinstance(p, str) or "\0" in p:
-        return False
-    parts = p.split("/")
-    banned = ("", ".", "..") if nested_git else ("", ".", "..", ".git")
-    if parts[0] == ".git" or any(part in banned for part in parts):
-        return False
-    try:
-        return len(os.fsencode(p)) <= PATH_BYTES
-    except UnicodeError:
-        return False
-
-
-def _entry(e: object, n: int) -> bool:
-    return (
-        isinstance(e, list)
-        and len(e) == n
-        and all(isinstance(x, str) for x in e)
-        and e[0] in _MODES
-        and _OID.fullmatch(e[1]) is not None
-    )
-
-
-def _special(s: object) -> bool:
-    return (
-        isinstance(s, dict)
-        and set(s) == {"type", "mode"}
-        and isinstance(s["type"], str)
-        and s["type"] in _SPECIALS
-        and isinstance(s["mode"], str)
-        and re.fullmatch(r"[0-7]{4}", s["mode"]) is not None
-    )
-
-
-def _row_problem(row: dict, parents) -> str | None:
-    """The first field of ``row`` the writer would not have written, else None."""
-    if missing := ROW_KEYS - row.keys():
-        return "missing " + ", ".join(sorted(missing))
-    p, index = row["path"], row.get("index")
-    # isinstance first: a list or object here is unhashable (#3965 item 3).
-    disk = row.get("disk")
-    if (
-        row.get("class") not in ("foreign", "engine")
-        or not isinstance(disk, str)
-        or disk not in _DISKS
-    ):
-        return "class or disk"
-    if not isinstance(row.get("disk_changed"), bool):
-        return "disk_changed"
-    if any(row.get(k) is not None and not _entry(row[k], 2) for k in ("tag", "other")):
-        return "tag or other entry"
-    if not isinstance(index, list) or not all(_entry(e, 3) for e in index):
-        return "index"
-    stages = [e[2] for e in index]  # one stage-0 entry, or stages 1-3 at most once each
-    if stages not in ([], ["0"]) and (
-        stages != sorted(set(stages)) or not set(stages) <= set("123")
-    ):
-        return "index stages"
-    own = {f"index-blobs/{e[1]}" for e in index if e[0] != "160000"}
-    blobs = row.get("blobs")
-    if (
-        not isinstance(blobs, list)
-        or not all(isinstance(b, str) for b in blobs)
-        or len(set(blobs)) != len(blobs)
-        or not set(blobs) <= own
-    ):
-        return "blobs"
-    saves = row["disk_changed"] and row["disk"] not in ("absent", "other")
-    if row.get("saved_as") != (f"tree/{p}" if saves else None):
-        return "saved_as"
-    through = row.get("unreachable_through")
-    if through is not None and through not in parents(p):
-        return "unreachable_through"
-    if row.get("flag") is not None and (
-        not isinstance(row["flag"], str) or row["flag"] not in _FLAGS
-    ):
-        return "flag"
-    if (row["disk"] == "other") != (row.get("special") is not None) or (
-        row.get("special") is not None and not _special(row["special"])
-    ):
-        return "special"
-    unsaved = row.get("unsaved")
-    if not isinstance(unsaved, list) or not all(
-        isinstance(u, dict) and _path(u.get("path"), nested_git=True)
-        and u["path"].startswith(p + "/")
-        and _special({k: u.get(k) for k in ("type", "mode")}) and len(u) == 3
-        for u in unsaved
-    ):  # fmt: skip
-        return "unsaved"
-    return None
-
-
-_SHA256 = re.compile(r"[0-9a-f]{64}")
-_MODE = re.compile(r"[0-7]{4}")
-
-
-def _record(r: object) -> bool:
-    """One SAVED.json record, exactly as the writer's _copy_node writes it."""
-    if not isinstance(r, dict):
-        return False
-    kind = r.get("type")
-    if kind == "file":
-        sha = r.get("sha256")
-        return (
-            set(r) == {"type", "mode", "sha256"}
-            and isinstance(r["mode"], str)
-            and _MODE.fullmatch(r["mode"]) is not None
-            and (sha is None or (isinstance(sha, str) and _SHA256.fullmatch(sha) is not None))
-        )
-    if kind == "fifo":
-        mode = r.get("mode")
-        return set(r) == {"type", "mode"} and isinstance(mode, str) and bool(_MODE.fullmatch(mode))
-    if kind == "symlink":
-        t = r.get("target")
-        if set(r) != {"type", "target"} or not isinstance(t, str) or not t or "\0" in t:
-            return False
-        try:
-            return len(os.fsencode(t)) <= PATH_BYTES
-        except UnicodeError:
-            return False
-    return False
-
-
-def saved_problem(rp, backup: str) -> str | None:
-    """Why the report's SAVED.json is not one the writer wrote, else None."""
-    return _saved(rp, backup)[0]
-
-
-def _saved(rp, backup: str) -> tuple[str | None, dict | None]:
-    """(why, None), or (None, SAVED.json) when it is the integrity record the
-    writer wrote. Opened as load_report opens REPAIR.json: no symlink followed,
-    no FIFO blocked on, a regular file of at most SAVED_BYTES, holding exactly
-    {files, complete}: `tree/<path>` keys and the writer's three record
-    shapes. Only the shape here: whether a copy still matches its record the
-    judge checks before it reads a part already-restored (Judge._kept), and the
-    restore again as it copies it."""
-    try:
-        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-        fd = os.open(os.path.join(backup, "SAVED.json"), flags)
-    except OSError as exc:
-        return f"cannot be opened ({exc.strerror})", None
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return "not a regular file", None
-        chunks, size = [], 0
-        while size <= rp.SAVED_BYTES and (chunk := os.read(fd, rp.SAVED_BYTES + 1 - size)):
-            chunks.append(chunk)
-            size += len(chunk)
-    except OSError as exc:
-        return f"cannot be read ({exc.strerror})", None
-    finally:
-        os.close(fd)
-    if size > rp.SAVED_BYTES:
-        return f"over {rp.SAVED_BYTES} bytes", None
-    try:
-        saved = json.loads(b"".join(chunks))
-    except (ValueError, RecursionError):
-        return "not JSON", None
-    if not isinstance(saved, dict) or set(saved) != {"files", "complete"}:
-        return "not {files, complete}", None
-    if not isinstance(saved["complete"], bool) or not isinstance(saved["files"], dict):
-        return "files or complete", None
-    if len(saved["files"]) > ENTRIES:
-        return f"over {ENTRIES} records", None
-    for key, r in saved["files"].items():
-        if not (
-            key.startswith("tree/") and _path(key[len("tree/") :], nested_git=True)
-        ) or not _record(r):
-            return f"record {json.dumps(key)[:200]}", None
-    return None, saved
-
-
-def problem(loaded: dict, budget: int, parents) -> str | None:
-    """Why a loaded report is not one the writer wrote, else None. Paths are
-    bounded first, Σ len(path) x depth over the rows at most ``budget``, so the
-    later parent walks stay bounded. That is not the writer's own bound (its
-    report bytes scale with length, not depth): a report of a legitimately deep
-    tree can be refused, the safe direction."""
-    report, rows = loaded["report"], loaded["rows"]
-    if len(rows) != len(report["paths"]):
-        return "a row is not an object"
-    if not all(
-        isinstance(report.get(k), str) and _OID.fullmatch(report[k]) for k in ("tag", "other")
-    ):
-        return "tag or other is not an object id"
-    spent, seen = 0, set()
-    for n, row in enumerate(rows):
-        p = row.get("path")
-        if not _path(p) or p in seen:
-            return f"row {n}: path"
-        seen.add(p)
-        spent += len(p) * (p.count("/") + 1)
-        if spent > budget:
-            return f"row {n}: over the path budget"
-        if why := _row_problem(row, parents):
-            return f"row {n}: {why}"
-    return None
+# The row rules and the run-folder rules live in two modules beside this
+# one; every name the judge, the writer, the repair and the tests reach
+# through this module is re-exported here. The runs module loads the rows
+# module, and this one takes it from there, so one copy of each exists.
+# A re-export is a copy of the binding: patching one here reaches only this
+# module's readers. READ_BYTES and FILE_BYTES are read only here (_Budget);
+# ENTRIES is read here, in rows (saved_problem) and in runs (_origin), and
+# PATH_BYTES only in rows, so a test changes those on ``rows``/``runs``.
+runs = _sibling("live_move_restore_runs.py")
+rows = runs.rows
+_OID = rows._OID
+_MODES = rows._MODES
+_DISKS = rows._DISKS
+_FLAGS = rows._FLAGS
+_SPECIALS = rows._SPECIALS
+_CANNOT_MAKE = rows._CANNOT_MAKE
+PATH_BYTES = rows.PATH_BYTES
+ROW_KEYS = rows.ROW_KEYS
+FILE_BYTES = rows.FILE_BYTES
+READ_BYTES = rows.READ_BYTES
+ENTRIES = rows.ENTRIES
+_path = rows._path
+_entry = rows._entry
+_special = rows._special
+_row_problem = rows._row_problem
+_SHA256 = rows._SHA256
+_MODE = rows._MODE
+_record = rows._record
+saved_problem = rows.saved_problem
+_saved = rows._saved
+problem = rows.problem
+_raise = rows._raise
+RUN_SUFFIX = runs.RUN_SUFFIX
+RUN_NAME = runs.RUN_NAME
+_DIR = runs._DIR
+restore_block = runs.restore_block
+_Whole = runs._Whole
+_mine = runs._mine
+_anchor = runs._anchor
+_origin = runs._origin
 
 
 class _Paths:
@@ -360,10 +185,6 @@ def _newer_paths(rp, repo: str, backups: str, ts: str) -> tuple[dict | None, str
                 return None, f"{other}: a row names no plain path"
             paths.setdefault(r["path"], other)
     return paths, ""
-
-
-def _raise(exc: OSError) -> None:
-    raise exc
 
 
 def _git_env() -> dict:
@@ -969,88 +790,10 @@ class Judge:
 
 # ── the restore (#3492 PR B2b) ──────────────────────────────────────────────
 
-RUN_SUFFIX = "-live-move-restore"
-#: A restore run's folder under deploy-backups: its UTC time, its pid.
-RUN_NAME = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9]+" + re.escape(RUN_SUFFIX))
-_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-
 
 def _fifo(mode: str) -> tuple[str, str]:
     """A FIFO's state as the restore makes it: the mode without setuid, setgid, sticky."""
     return "fifo", f"{int(mode, 8) & 0o777:04o}"
-
-
-def restore_block(report: dict) -> dict | None:
-    """REPAIR.json's `restore` block when it is exactly what restore() writes,
-    {inflight: [run, path, "node"] | None, refused: int, restored_at: str |
-    None}; else None (and a malformed one never resumes anything)."""
-    b = report.get("restore")
-    if not isinstance(b, dict) or set(b) != {"inflight", "refused", "restored_at"}:
-        return None
-    inf = b["inflight"]
-    if inf is not None and not (
-        isinstance(inf, list) and len(inf) == 3 and isinstance(inf[0], str)
-        and RUN_NAME.fullmatch(inf[0]) and _path(inf[1]) and inf[2] == "node"
-    ):  # fmt: skip
-        return None
-    if type(b["refused"]) is not int or b["refused"] < 0:
-        return None
-    return b if b["restored_at"] is None or isinstance(b["restored_at"], str) else None
-
-
-class _Whole(Exception):
-    """The whole report refused, by name, before anything is written."""
-
-
-def _mine(st: os.stat_result, link: bool = False) -> bool:
-    return st.st_uid == os.geteuid() and (link or not st.st_mode & 0o022)
-
-
-def _anchor(home: str) -> int:
-    """deploy-backups, opened without following a link from the resolved home
-    (review L-6), and this user's with no group or world write; its fd. Every
-    later read goes through it (/proc/self/fd), never through a path someone
-    who can write the home could swap."""
-    hfd = os.open(os.path.realpath(home), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    try:
-        fd = os.open("deploy-backups", _DIR, dir_fd=hfd)
-    except FileNotFoundError:
-        raise
-    except OSError as exc:
-        raise _Whole(f'other:not-owned "deploy-backups" ({exc.strerror})') from None
-    finally:
-        os.close(hfd)
-    if not _mine(os.fstat(fd)):
-        os.close(fd)
-        raise _Whole('other:not-owned "deploy-backups"')
-    return fd
-
-
-def _origin(root: str, name: str) -> None:
-    """The origin rule (owner rulings ced82b49, 73b6285d), before REPAIR.json
-    is parsed: the report dir and every node below it (never following a
-    link, at most ENTRIES of them, review N-5) are this user's, and every one
-    but a symlink (its mode means nothing) has no group or world write.
-    deploy-backups passed the same test (_anchor), so whoever can write the
-    home could only swap in a folder that fails it, or a 0700 one of this
-    user's they can never fill. A writer with this user's uid is out of scope:
-    it can already edit the checkout."""
-    top, left = os.path.join(root, name), ENTRIES
-    try:
-        st = os.lstat(top)
-    except FileNotFoundError:
-        raise _Whole("other:unreadable (no such report)") from None
-    if not stat.S_ISDIR(st.st_mode) or not _mine(st):
-        raise _Whole(f"other:not-owned {json.dumps(name)}")
-    for d, dirs, files in os.walk(top, onerror=_raise):
-        for n in dirs + files:
-            left -= 1
-            if left < 0:
-                raise _Whole(f"other:too-large (the report holds over {ENTRIES} nodes)")
-            st = os.lstat(os.path.join(d, n))
-            if not _mine(st, link=stat.S_ISLNK(st.st_mode)):
-                rel = os.path.relpath(os.path.join(d, n), root)
-                raise _Whole(f"other:not-owned {json.dumps(rel)[:200]}")
 
 
 def _open(rp, repo: str, home: str, ts: str, say, write: bool):
