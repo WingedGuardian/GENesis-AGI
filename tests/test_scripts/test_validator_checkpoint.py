@@ -112,6 +112,9 @@ def test_a_complete_document_does_not_become_complete_by_being_legacy(tmp_path, 
 @pytest.mark.parametrize("bad", [
     {"scope_limits": [{"kind": "method"}]},   # not the legacy shape: entries were strings
     {"scope_limits": "one string"},
+    {"scope_limits": [""]},                   # the retired field refused blank entries
+    {"scope_limits": ["   "]},
+    {"scope_limits": [7]},
     {"scope_limits": [], "claims": []},      # the rest of the document is invalid too
     {"scope_limits": [], "pr": 8},           # belongs to another row
     {"scope_limits": [], "repo": "other/repo"},  # belongs to another repository

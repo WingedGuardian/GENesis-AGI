@@ -19,6 +19,7 @@ from genesis.session_awareness.pr_evidence import (  # noqa: E402
     MAX_EVIDENCE_BYTES,
     EvidenceError,
     Repo,
+    Text,
     parse_evidence,
 )
 from genesis.session_awareness.pr_recording import _no_duplicates  # noqa: E402
@@ -29,6 +30,7 @@ def _offline(*args):
     raise LookupError("offline: live public receipt readback still required")
 
 
+_LEGACY_LIMITS = TypeAdapter(list[Text])
 _LEGACY_ENTRIES = "Legacy evidence: {n} entries in the retired scope_limits field have no gap kind; "
 _LEGACY_EMPTY = "Legacy evidence: written with the retired scope_limits field (empty); "
 # What a validator can do next depends on the row: an open one is re-recorded in the
@@ -56,7 +58,10 @@ def _legacy_document(data):
     if not isinstance(data, dict) or "gaps" in data:
         return None  # a document with gaps was written after the change: not legacy
     limits = data.get("scope_limits")
-    if not isinstance(limits, list) or not all(isinstance(entry, str) for entry in limits):
+    try:
+        # The retired field was ``list[Text]``: what its writer refused is malformed here too.
+        _LEGACY_LIMITS.validate_python(limits)
+    except ValidationError:
         return None
     try:
         doc = parse_evidence({key: value for key, value in data.items() if key != "scope_limits"})
