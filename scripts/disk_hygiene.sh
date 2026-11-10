@@ -595,9 +595,11 @@ rotate_mcp_logs() {
 # one place on the box that holds every credential.
 _load_store_knob() {
     local key="$1"
-    # The checkout's file, not the resolver's: the hook-audit stores' writers
-    # read their directories from it, and this must read the same one.
-    local file="${2:-$REPO_DIR/secrets.env}"
+    # The caller passes the resolver's file (genesis_secrets_path): the hook-audit
+    # stores' writers read their directories from the environment the server
+    # loads, and the server loads that file. With no file argument, nothing loads.
+    local file="${2:-}"
+    [ -n "$file" ] || return 0
     local line=""
     local val
     [ -f "$file" ] || return 0
@@ -924,9 +926,12 @@ maintenance_main() {
     prune_backup_runs "$HOME/.genesis/deploy-backups" deploy-backups 90
 
     echo "--- hook audit store size trim (>5MB per store, newest kept) ---"
-    # The two store knobs, read BY NAME out of secrets.env (`_load_store_knob`).
-    _load_store_knob GENESIS_MERGE_OVERRIDE_DIR
-    _load_store_knob GENESIS_DISCARD_SNAPSHOT_DIR
+    # The two store knobs, read BY NAME out of secrets.env (`_load_store_knob`),
+    # from the file the runtime reads. An unresolvable override loads nothing.
+    local _knob_secrets=""
+    _knob_secrets="$(genesis_secrets_path "$REPO_DIR")" || _knob_secrets=""
+    _load_store_knob GENESIS_MERGE_OVERRIDE_DIR "$_knob_secrets"
+    _load_store_knob GENESIS_DISCARD_SNAPSHOT_DIR "$_knob_secrets"
     # One file per hook flush, so the oldest whole files are deleted past the byte
     # bound. This is the shape the ghost-export note above explains an age prune
     # cannot handle for an append-forever file. Retention lives here, never on the
