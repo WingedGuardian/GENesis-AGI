@@ -25,8 +25,51 @@ a segment the scanner now keeps whole, such as `echo \`id\``, yields a
 backtick body ending in a backslash that cannot be tokenized, and the call is
 reported blind. Hash-free commands that pair an escaped quote with escaped
 backticks, for example `echo It\'s; echo \`git push\``, parsed before and are
-now refused; `echo \`id\`; curl x` alone was already refused. #3635 tracks
-giving the substitution scanner the same backslash rule.
+now refused; `echo \`id\`; curl x` alone was already refused. That refusal is
+kept on purpose (#3713, below): outside double quotes a backslash before `$(`,
+before a backtick when the segment holds another backtick, or before a quote in
+a segment holding a substitution, refuses. So does an escaped quote outside quotes
+in any command that contains a `#`, because the segmenter models escapes only in
+`#`-free text: there the quote it opens can swallow a separator and the command
+after it (`echo \' ; git push … "'" #`). A lone escaped backtick stays readable.
+
+## Unproven comment and substitution boundaries (#3713, PR 1 of 2)
+
+The segmenter, the comment stripper and the override scan each track quotes on
+their own and none of them models substitutions, so where they disagree with bash
+a command could run while the parse showed neither it nor a blind spot.
+`_segment_unproven` names the boundaries that cannot be trusted, and
+`analyze_checked` then withholds the parse with `_BLIND_STRUCTURAL`:
+
+- a segment whose comment has a newline after it: a quote in the comment carried
+  the scan past the line end (commands containing `<<` or an escaped quote, where
+  the top-level comment skip does not run);
+- a double-quoted substitution whose body holds a `"`, when the text the legacy
+  pairing then reads as unquoted holds a separator, redirection, `#`, newline,
+  backtick, backslash or unbalanced paren, or the pairing ends outside the outer
+  quote. `"$(basename "$f")"` stays readable; `"$(printf "x # note")"` does not;
+- a backtick body holding a backslash, and a decoded `-c` script holding `\$`
+  or `` \` ``.
+
+It is refusal only. Substitution extraction is unchanged, so a substitution inside
+a comment is still parsed; it never hides one. The withholding applies only where
+`analyze_checked` would otherwise report nothing or an unresolved verb: every
+existing cause keeps its class and rank, including the untokenizable cause the
+discard guard exempts. Segments inside a here-doc body the heredoc check verified
+are data and are not checked, but only when bash reads the opener as one too: at
+its top level by the bash-like pass, with no `#` before it on its line. A `<<`
+after an escaped quote or in a comment opens no body to bash, so its lines are
+checked like any others. A fragment's own inert proof clears only that fragment. A substitution that never closes is not refused: bash runs nothing past
+it.
+
+The comment scans read the blanks bash does (space, tab, newline; not VT, FF or
+NBSP) and treat a backslash outside quotes as an escape. The override scan skips
+`#` inside a substitution and waives nothing after an escaped quote outside
+quotes, so it can only switch an override off.
+
+Still open: #3778 (a `#` inside process substitution, `${…}` or a `case`
+pattern), and the shared lexer that would let these boundaries be proven rather
+than refused (#3713, PR 2).
 
 `analyze_checked` withholds segments when a length/depth bound, continuation,
 built escape, unreadable nested syntax or hidden heredoc suffix makes them
@@ -69,4 +112,6 @@ property is positive; the broader property retains its strict known hash-case
 failure with an explicit witness. Comment/quote witnesses retain actual owned
 execution receipts. One former escaped-double-quote substitution reproduction
 also now surfaces its suffix; this does not establish that every substitution
-quote case is fixed. The paired opposite-quote gap remains explicitly tracked.
+quote case is fixed. The paired opposite-quote case is now refused rather than
+parsed (#3713); the generator's quote-bearing words remain excluded until the
+shared lexer can read it.
