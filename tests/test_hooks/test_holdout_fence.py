@@ -529,3 +529,114 @@ def test_writer_rows_are_kept_in_the_exposure_log(home):
     )
     logs = home / ".genesis" / "logs"
     assert [r["kind"] for r in _log_rows(logs / "holdout-exposures.jsonl")] == ["allowed"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -c 'cd ~/.genesis && cp holdout/HOLDOUT.md /tmp/x'",
+        "sh -c 'cd ~/.genesis; cat holdout/HOLDOUT.md > /dev/null'",
+        "find ~/.genesis/holdout -name '*.md' -delete",
+        "find ~/.genesis/holdout/HOLDOUT.md -exec cat {} +",
+        "rm -rf ~/.genesis",
+        "touch ~/.genesis/holdout/HOLDOUT.md",
+        "dd if=~/.genesis/holdout/HOLDOUT.md of=/tmp/x",
+        "python3 -c \"print(open('~/.genesis/holdout/HOLDOUT.md').read())\"",
+        'cat "$GENESIS_HOME/holdout/HOLDOUT.md"',
+        "echo $((1 << N))\ncat ~/.genesis/holdout/HOLDOUT.md",
+    ],
+)
+def test_review_round_one_shapes_are_exposures(home, command):
+    payload = _pre("Bash", {"command": command})
+    out, rows = _run(home, "pre", payload)
+    assert "HOLDOUT FENCE" in _note(out), command
+    assert [r["kind"] for r in rows] == ["access"]
+
+
+def test_an_unexported_genesis_home_spelling_still_resolves(home):
+    env = {**_env(home)}
+    env.pop("GENESIS_HOME")
+    payload = _pre("Bash", {"command": 'cat "$GENESIS_HOME/holdout/HOLDOUT.md"'})
+    proc = subprocess.run(
+        [sys.executable, str(HOOK), "pre"],
+        input=json.dumps(payload),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert "HOLDOUT FENCE" in _note(proc.stdout)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "kept in ``$GENESIS_HOME/holdout/`` (default ``~/.genesis/holdout``)",
+        "Never open, list, search or quote `~/.genesis/holdout/`. Run the runner.",
+    ],
+)
+def test_reading_the_holdout_docs_or_this_hook_is_not_an_exposure(home, text):
+    _, rows = _run(
+        home,
+        "post",
+        _post("Read", {"content": text}, {"file_path": "/repo/docs/reference/holdout.md"}),
+    )
+    assert rows == []
+
+
+def test_a_single_interpreter_segment_is_not_exempt(home):
+    _, rows = _run(
+        home, "post", _post("Bash", {"stdout": EXPECT_LINE}, {"command": "python3 -c 'print(1)'"})
+    )
+    assert rows and rows[0]["kind"] == "content"
+
+
+def test_the_log_exemption_uses_the_payload_cwd(home):
+    logs = home / ".genesis" / "logs"
+    payload = _post(
+        "Read",
+        {"content": str(home / ".genesis" / "holdout")},
+        {"file_path": "holdout-exposures.jsonl"},
+    )
+    payload["cwd"] = str(logs)
+    _, rows = _run(home, "post", payload)
+    assert rows == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd ~/.genesis/holdout && rg approval_gate",
+        "cd ~/.genesis/holdout && grep -rn approval_gate",
+        "cd ~/.genesis/holdout && find . -name '*.md' -exec cat {} +",
+        "rg -f ~/.genesis/holdout/HOLDOUT.md src/",
+    ],
+)
+def test_searches_of_the_current_directory_and_pattern_files_are_exposures(home, command):
+    out, rows = _run(home, "pre", _pre("Bash", {"command": command}))
+    assert "HOLDOUT FENCE" in _note(out), command
+    assert [r["kind"] for r in rows] == ["access"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rg -e '~/.genesis/holdout' docs/",
+        "rg --regexp='~/.genesis/holdout' docs/",
+        "grep -rn -e '~/.genesis/holdout' docs/",
+        "grep -E 'holdout|~/.genesis/holdout' docs/x.md",
+    ],
+)
+def test_a_pattern_given_by_option_is_a_mention(home, command):
+    out, rows = _run(home, "pre", _pre("Bash", {"command": command}))
+    assert out.strip() == "", command
+    assert [r["kind"] for r in rows] == ["mention"]
+
+
+def test_a_json_encoded_mcp_result_is_decoded_before_matching(home):
+    quoted = 'print("the exact expected output line that is well over forty characters")'
+    md = home / ".genesis" / "holdout" / "HOLDOUT.md"
+    md.write_text(md.read_text().replace(EXPECT_LINE, quoted))
+    response = json.dumps({"result": quoted})  # escaped quotes in the serialized string
+    _, rows = _run(home, "post", _post("mcp__genesis-memory__memory_recall", response))
+    assert rows and rows[0]["kind"] == "content"

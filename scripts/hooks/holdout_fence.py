@@ -109,16 +109,46 @@ MENTION_VERBS = frozenset(
 #: in the activity log with no note.
 LISTING_VERBS = frozenset(
     {
-        "ls", "du", "stat", "file", "tree", "touch", "chmod", "chown", "readlink",
-        "realpath", "find", "fd", "mkdir", "basename", "dirname", "wc",
+        "ls", "du", "stat", "file", "tree", "readlink", "realpath", "find", "fd",
+        "basename", "dirname",
     }
 )  # fmt: skip
 #: Searchers: their first positional is a PATTERN (a mention), the rest are paths.
 SEARCHERS = frozenset({"rg", "grep", "egrep", "fgrep", "ag", "ack"})
+#: Options whose VALUE is the next word, per command family: a pattern (a
+#: mention), a file read for patterns (an operand), or anything else (dropped).
+#: From `rg --help` and `grep --help`; the "=value" spellings are split apart.
+PATTERN_OPTIONS = frozenset({"-e", "--regexp"})
+PATTERN_FILE_OPTIONS = frozenset({"-f", "--file"})
+#: Value-taking options that are neither, per family: the same letter differs
+#: (rg -E/-r take an encoding/replacement; grep -E/-r are plain flags).
+RG_VALUE_OPTIONS = frozenset(
+    {
+        "-r", "--replace", "-g", "--glob", "--iglob", "-t", "--type", "-T", "--type-not",
+        "-m", "--max-count", "-A", "-B", "-C", "--after-context", "--before-context",
+        "--context", "-M", "--max-columns", "-j", "--threads", "-E", "--encoding",
+        "-d", "--max-depth",
+    }
+)  # fmt: skip
+GREP_VALUE_OPTIONS = frozenset(
+    {
+        "-m", "--max-count", "-A", "-B", "-C", "--after-context", "--before-context",
+        "--context", "--include", "--exclude", "--exclude-dir", "-d", "--directories",
+        "-D", "--devices", "--label",
+    }
+)  # fmt: skip
+#: Commands that read the current directory when given no path operand.
+CWD_DEFAULT_VERBS = frozenset({"rg", "ag", "ack", "find", "fd", "ls", "du", "tree"})
 #: ripgrep-based searchers honour $GENESIS_HOME/.ignore, which lists holdout/.
 RG_BASED = frozenset({"rg"})
 RECURSIVE_VERBS = frozenset({"rg", "ag", "ack", "find", "fd", "tree", "du", "tar", "zip", "rsync"})
 INTERPRETERS = frozenset({"python", "python3", "bash", "sh", "zsh", "node", "perl", "ruby"})
+#: find actions that delete, run a command on, or print the contents of a match:
+#: with one of these, find is no longer a listing.
+FIND_ACTIONS = frozenset({"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fls"})
+#: Commands that, run recursively on a directory ABOVE the holdout, destroy or
+#: move it: an access, not a broad search.
+DESTRUCTIVE_VERBS = frozenset({"rm", "rmdir", "shred", "mv"})
 
 PRE_NOTE = (
     "HOLDOUT FENCE: this tool call reaches {where}, the install's hidden holdout "
@@ -190,6 +220,10 @@ def main(argv: list[str]) -> int:
 
 
 def _abs(path: str, base: str) -> str:
+    # The hook may run without GENESIS_HOME exported; the spelling still means it.
+    for form in ("${GENESIS_HOME}", "$GENESIS_HOME"):
+        if path.startswith(form):
+            path = genesis_home() + path[len(form) :]
     expanded = os.path.expandvars(os.path.expanduser(path))
     if not os.path.isabs(expanded):
         expanded = os.path.join(base, expanded)
@@ -395,20 +429,35 @@ def _shell_hits(command: str, cwd: str, roots: list[str], holdout: str) -> list[
         verb = os.path.basename(seg.exe or argv[0])
         args = argv[1:]
         if verb == "cd":
-            if seg.depth == 0:
-                base = _abs(next((a for a in args if not a.startswith("-")), "~"), base)
+            base = _abs(next((a for a in args if not a.startswith("-")), "~"), base)
             continue
-        positionals = [a for a in args if not a.startswith("-")]
+        if verb in INTERPRETERS and any(_mentions(a, roots) for a in args):
+            hits.append(("access", command))  # python3 -c, perl -e, bash -c text
+        positionals, patterns, pattern_files = _split_args(verb, args)
+        # A value after "=" is an operand too: dd if=PATH. Option spellings
+        # (--file=PATH) were split above.
+        positionals += [
+            a.split("=", 1)[1]
+            for a in args
+            if "=" in a and not a.startswith("-") and a.split("=", 1)[1]
+        ]
+        for pattern in patterns:
+            if _mentions(pattern, roots):
+                hits.append(("mention", command))
+        positionals += pattern_files
         recursive = verb in RECURSIVE_VERBS or _has_recursive_flag(verb, args)
         if verb in MENTION_VERBS or (verb == "git" and "--no-index" not in args):
             if any(_mentions(a, roots) or _best(a, base, roots) == "exact" for a in args):
                 hits.append(("mention", command))
             continue
-        if verb in SEARCHERS and positionals and not _pattern_given_by_flag(args):
+        if verb in SEARCHERS and positionals and not patterns:
             pattern = positionals.pop(0)
             if _mentions(pattern, roots):
                 hits.append(("mention", command))
-        exact_kind = "listing" if verb in LISTING_VERBS else "access"
+        if not positionals and (verb in CWD_DEFAULT_VERBS or (verb in SEARCHERS and recursive)):
+            positionals = ["."]  # it reads the current directory
+        lists_only = verb in LISTING_VERBS and not (verb == "find" and FIND_ACTIONS & set(args))
+        exact_kind = "listing" if lists_only else "access"
         for operand in positionals:
             how = _best(operand, base, roots)
             if how == "exact":
@@ -420,6 +469,12 @@ def _shell_hits(command: str, cwd: str, roots: list[str], holdout: str) -> list[
                     hits.append(("broad", command))
                 else:
                     hits.append((exact_kind, command))
+            elif (
+                how == "above"
+                and recursive
+                and (verb in DESTRUCTIVE_VERBS or (verb == "find" and "-delete" in args))
+            ):
+                hits.append(("access", command))  # removing a parent removes the holdout
             elif how == "broad" or (
                 how == "above"
                 and recursive
@@ -440,6 +495,8 @@ def _strip_heredocs(command: str) -> tuple[str, list[tuple[str, str]]]:
         out.append(line)
         i += 1
         for m in _HEREDOC_START.finditer(line):
+            if _in_arithmetic(line, m.start()):
+                continue  # $(( a << b )) or (( a << b )) is a shift
             word = m.group(2)
             body: list[str] = []
             while i < len(lines) and lines[i].strip() != word:
@@ -454,6 +511,12 @@ def _strip_heredocs(command: str) -> tuple[str, list[tuple[str, str]]]:
                     break
             bodies.append((verb, "\n".join(body)))
     return "\n".join(out), bodies
+
+
+def _in_arithmetic(line: str, index: int) -> bool:
+    """Whether ``index`` sits inside an open ``((`` on this line."""
+    before = line[:index]
+    return before.count("((") > before.count("))")
 
 
 def _rg_ignores(holdout: str) -> bool:
@@ -501,6 +564,46 @@ def _has_recursive_flag(verb: str, args: list[str]) -> bool:
     return False
 
 
+def _split_args(verb: str, args: list[str]) -> tuple[list[str], list[str], list[str]]:
+    """(path operands, pattern values, pattern-file values) of one command.
+
+    Option values are consumed with their option, so ``rg -e PATTERN docs/``
+    leaves ``docs/`` as the only path and ``PATTERN`` as a mention.
+    """
+    positionals: list[str] = []
+    patterns: list[str] = []
+    pattern_files: list[str] = []
+    takes_values = verb in SEARCHERS
+    other_values = RG_VALUE_OPTIONS if verb in ("rg", "ag") else GREP_VALUE_OPTIONS
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            positionals.extend(args[i + 1 :])
+            break
+        if takes_values and a.startswith("--") and "=" in a:
+            name, value = a.split("=", 1)
+            if name in PATTERN_OPTIONS:
+                patterns.append(value)
+            elif name in PATTERN_FILE_OPTIONS:
+                pattern_files.append(value)
+            i += 1
+            continue
+        if takes_values and a in PATTERN_OPTIONS | PATTERN_FILE_OPTIONS | other_values:
+            if i + 1 < len(args):
+                value = args[i + 1]
+                if a in PATTERN_OPTIONS:
+                    patterns.append(value)
+                elif a in PATTERN_FILE_OPTIONS:
+                    pattern_files.append(value)
+            i += 2
+            continue
+        if not a.startswith("-"):
+            positionals.append(a)
+        i += 1
+    return positionals, patterns, pattern_files
+
+
 def _pattern_given_by_flag(args: list[str]) -> bool:
     return any(
         a in ("-e", "-f", "--regexp", "--file") or a.startswith(("--regexp=", "--file="))
@@ -541,13 +644,16 @@ def _post(payload: dict, holdout: str) -> str | None:
     if payload.get("agent_type") in ALLOWED_AGENT_TYPES:
         return None
     ti = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
-    if _post_exempt(str(payload.get("tool_name") or ""), ti):
+    cwd = str(payload.get("cwd") or os.getcwd())
+    if _post_exempt(str(payload.get("tool_name") or ""), ti, cwd):
         return None
     text = _collapse(_result_text(payload.get("tool_response")))
     if not text:
         return None
     hits = sorted({sid for line, sid in _fingerprints(holdout) if line in text})
-    if not hits and _mentions(text, _roots(holdout)):
+    # Only the absolute path: the ~ and $GENESIS_HOME spellings appear in the
+    # holdout's own docs, skills and this file, which agents read routinely.
+    if not hits and any(_names_component(text, r) for r in _roots(holdout)):
         hits = ["directory path"]
     if not hits:
         return None
@@ -555,7 +661,7 @@ def _post(payload: dict, holdout: str) -> str | None:
     return POST_NOTE.format(ids=", ".join(hits))
 
 
-def _post_exempt(tool: str, ti: dict) -> bool:
+def _post_exempt(tool: str, ti: dict, cwd: str) -> bool:
     """The runner's own output, or a read of the fence's logs, and nothing else.
 
     The runner prints only ids and verdicts; the logs name paths by design. Both
@@ -565,7 +671,7 @@ def _post_exempt(tool: str, ti: dict) -> bool:
     logs = {os.path.normpath(exposure_log()), os.path.normpath(activity_log())}
     if tool == "Read":
         fp = ti.get("file_path")
-        return isinstance(fp, str) and _abs(fp, os.getcwd()) in logs
+        return isinstance(fp, str) and _abs(fp, cwd) in logs
     command = ti.get("command") if isinstance(ti.get("command"), str) else ""
     if tool != "Bash" or not command:
         return False
@@ -584,7 +690,7 @@ def _post_exempt(tool: str, ti: dict) -> bool:
     ):
         return True
     operands = [a for a in argv[1:] if not a.startswith("-")]
-    return bool(operands) and all(_abs(a, os.getcwd()) in logs for a in operands)
+    return bool(operands) and all(_abs(a, cwd) in logs for a in operands)
 
 
 def _result_text(resp: object) -> str:
@@ -594,6 +700,10 @@ def _result_text(resp: object) -> str:
     while stack and size < RESULT_SCAN_BYTES:
         node = stack.pop()
         if isinstance(node, str):
+            decoded = _json_container(node)
+            if decoded is not None:
+                stack.append(decoded)  # an MCP result is a JSON string; walk its text
+                continue
             parts.append(node)
             size += len(node)
         elif isinstance(node, dict):
@@ -601,6 +711,20 @@ def _result_text(resp: object) -> str:
         elif isinstance(node, list):
             stack.extend(reversed(node))
     return "\n".join(parts)[:RESULT_SCAN_BYTES]
+
+
+def _json_container(text: str):
+    """The decoded object or list a string holds, else None (bounded)."""
+    stripped = text.lstrip()
+    if not stripped or stripped[0] not in "{[" or len(text) > RESULT_SCAN_BYTES:
+        return None
+    try:
+        import json
+
+        value = json.loads(text)
+    except ValueError:
+        return None
+    return value if isinstance(value, (dict, list)) else None
 
 
 def _collapse(text: str) -> str:
