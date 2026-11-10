@@ -44,6 +44,7 @@ import contextlib
 import errno
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -78,6 +79,42 @@ class CredTarget:
     required_keys: tuple[str, ...] = ()
     min_keys: int = 0         # dotenv only — a truncation/zeroing guard
     file_mode: int = 0o600
+
+
+def resolve_secrets_path(home: Path) -> Path:
+    """Standalone twin of secrets_location.resolve, using the target home.
+
+    Keep an unreadable preferred candidate so validation reports unreadable,
+    rather than treating it as missing and restoring over a live file.
+    """
+    override = os.environ.get("SECRETS_PATH")
+    if override:
+        if override == "~":
+            return home
+        if override.startswith("~/"):
+            return home / override[2:]
+        return Path(override).expanduser()
+    new = home / ".config" / "genesis" / "secrets.env"
+    repo = Path(os.environ.get("GENESIS_REPO_ROOT") or home / "genesis").expanduser()
+    for candidate in (new, repo / "secrets.env", home / "genesis" / "secrets.env"):
+        try:
+            mode = os.stat(candidate).st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                continue
+            return candidate
+        if stat.S_ISREG(mode):
+            return candidate
+    return repo / "secrets.env"
+
+
+def credential_path(target: CredTarget, home: Path) -> Path:
+    """Secrets use the resolver; other credential paths stay HOME-relative."""
+    if target.name == "secrets_env" and target.path == "genesis/secrets.env":
+        return resolve_secrets_path(home)
+    return home / target.path
 
 
 # secrets.env deliberately carries NO required_keys and min_keys=1: requiring a
@@ -267,7 +304,7 @@ def validate_file(
     missing + backup exists → corruption ("missing"); missing + no backup →
     never provisioned ("absent", healthy — the clean degradation for installs
     without backups or without an optional file like genesis.yaml)."""
-    path = home / target.path
+    path = credential_path(target, home)
     try:
         present = _exists(path)
         has_backup = (
@@ -472,11 +509,11 @@ def restore_file(
             detail=f"decrypted backup {decrypted.status}: {decrypted.detail}",
         )
 
-    target_path = home / target.path
+    target_path = credential_path(target, home)
     tmp = target_path.with_name(f".{target_path.name}.restore-tmp-{os.getpid()}")
     aside: Path | None = None
     try:
-        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if target.kind == "ssh_key":
             os.chmod(target_path.parent, 0o700)
 
@@ -564,7 +601,7 @@ def resolve_passphrase(home: Path) -> str | None:
     if env_pass:
         return env_pass
 
-    secrets = home / "genesis/secrets.env"
+    secrets = resolve_secrets_path(home)
     try:
         raw = secrets.read_bytes()
     except OSError:
@@ -695,7 +732,7 @@ def main(argv: list[str] | None = None) -> int:
                     "ok": r.ok,
                     "status": r.status,
                     "detail": r.detail,
-                    "path": str(home / _targets_by_name()[name].path),
+                    "path": str(credential_path(_targets_by_name()[name], home)),
                     "backup_exists": backup_arg is not None
                     and _known_present(backup_dir / _targets_by_name()[name].backup_rel),
                 }

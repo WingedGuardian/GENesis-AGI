@@ -399,7 +399,13 @@ census does not read is carried: each row records `secrets_digest`, a hash of
 the six keys it reads, and the next census proves a changed file whose current
 values hash the same for the same pid and start (`carried: true`; the latest
 census row only; never when the file names `SECRETS_PATH` or
-`GENESIS_REPO_ROOT`)), and its database
+`GENESIS_REPO_ROOT`); the file is the one the resolver picks now, and a
+fallback past an absent `~/.config/genesis/secrets.env` counts only when that
+directory and every symlink on its path are unchanged by ctime since the server
+started, since a changed one may have held the file it loaded (#4278), and a
+fallback from another checkout's file to `~/genesis/secrets.env` is unknown;
+nothing else in `~/.config` is read),
+and its database
 scope (the primary database is fixed at import from the exec env or the root
 default, and a path in the file becomes a second one; `foreign` only when every
 one of them differs from the live database by `(st_dev, st_ino)`, no symlink on
@@ -558,10 +564,20 @@ shares the OAuth-compatible readiness helper. `cc_fallback` is a non-routing
 **Fallback** observation in the neural monitor for conversations and managed
 turns; actual committed outcomes, not readiness alone, establish success.
 
+Contained native peer requests take a separate public-context constructor before
+private profile/identity/MCP builders. Explicit tools-free and exact-facade
+invocation modes share owned scopes, helper processes and the receipt deadline.
+The complete managed operation isolates provider observations and private
+diagnostics, while ordinary same-owner work keeps its current behavior. Failed
+drain retains native ownership; no contained transcript pointer is fabricated.
+This primitive does not grant foreign admission; its consumer is separate.
+See `docs/reference/peer-execution.md`.
+
 Ordinary streaming and readiness share final-effective quota classification:
 allowed/warning and explicitly usable overage are not refusals, and a later
 allowed event supersedes a rejection. Result and no-result streaming paths
 preserve usable answers, real refusal health and dropped-output replay guards.
+
 
 ```yaml subsystem-map
 entry: execution-cc
@@ -1432,7 +1448,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: a6528dab2 2026-11-09
+verified: f62608045437 2026-11-09
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -1444,7 +1460,13 @@ verified: a6528dab2 2026-11-09
 - **inbox/**: file-drop monitor with approval-gated dispatch.
   `monitor.py` owns scanning, approval, retries and baseline writes;
   `batch_runner.py` executes one approved batch and post-processes its output,
-  reached through the monitor's `_run_one_batch` forwarding method. Before any
+  reached through the monitor's `_run_one_batch` forwarding method. Its manager
+  session scopes only the invoker/retry await, stamping child environment and
+  invocation-failure attribution. The prior task context is restored before
+  handlers, postprocessing and detached work; explicit follow-up transcript IDs
+  retain their namespace. This does not grant supervision or change external
+  provenance, approvals or replay policy. See `docs/reference/inbox-session-attribution.md`.
+  Before any
   DB, approval, response, or baseline mutation, it composes and validates one
   deterministic system prompt from `INBOX_EVALUATE.md`, the complete
   `evaluate` skill, the complete `user_evaluate` skill, and an explicit
@@ -1459,6 +1481,9 @@ verified: a6528dab2 2026-11-09
   a guarantee of memory correctness. Reuse and
   deliverable-backed BUILD/adoption boundaries are described in
   `docs/reference/inbox-evaluation-quality.md`.
+  ADAPT output requests an explicit `why_not_adopt` explanation; the parser
+  preserves its optional string and warns on missing usable rationale without
+  changing existing recommendation routing or build ownership.
   The phase order is prompt preflight → recover pending → resume approval →
   detect → create → dispatch;
   `approval_key_stable=True` (ONE
@@ -1486,6 +1511,10 @@ verified: a6528dab2 2026-11-09
   and matching backtick runs. Literal terminal punctuation and repeated tokens in different
   contexts retain their own identities. The read-only coverage report retains
   these occurrences too; it does not reconstruct coverage from normalized URLs.
+  It separately reports stored input, baseline-only membership, whole logical
+  items, response presence and Source/mention evidence; strict decoding rejects
+  corrupt v2 inputs as a whole. These are retained-evidence facts, not proof of
+  source acquisition or model judgment; see `docs/reference/inbox-coverage-evidence.md`.
   An ordered proof finds the first source-frame closure; ambiguous tokens stay
   raw and cannot supply wrapper context for later URLs.
   The wrapper correction is scoped to this URL path; the entry's existing
@@ -4132,6 +4161,13 @@ overlay before reporting success or writing. Invalid/unreadable configuration
 refuses with a clear message; no overlay is repaired or discarded implicitly.
 Refusing a proposed update preserves a previously valid opt-in.
 
+Explicit private execution marks escaping exceptions without changing their
+types, arguments or causes. Automatic span errors inspect that provenance before
+formatting; the shared execution/span-writer diagnostic filters also cover
+marked causes, contexts and exception groups after the task-local scope exits.
+Ordinary diagnostics remain readable. This covers the named emitters, not every
+logger or unrelated exceptions with copied text and no provenance.
+
 - **payments/**: the encrypted card vault, virtual cards only.
   `python -m genesis vault init|add|list|retire|migrate|status` (`payments/cli.py`);
   `vault_store.py` keeps `~/.genesis/payment_vault/` (0700, files 0600): an age
@@ -4682,9 +4718,14 @@ Refusing a proposed update preserves a previously valid opt-in.
   check under it and remove a marker only when its holder is dead or theirs.
   Exception: `bootstrap.sh`'s crash recovery still removes it unconditionally.
   `secrets_path()` delegates to the stdlib-only `secrets_location.py`, mirrored
-  by `scripts/lib/secrets_path.sh`: `SECRETS_PATH` if set, else the checkout's
-  `secrets.env` (unchanged). Disk hygiene's store knobs, bootstrap and the eval
-  loaders keep their own rules for now.
+  by `scripts/lib/secrets_path.sh`: `SECRETS_PATH` wins; otherwise an existing
+  `~/.config/genesis/secrets.env` wins over the checkout and `~/genesis`
+  legacy files. With no file, the default is still the checkout's file; the
+  default switch, the unit files and creating the home config are the
+  migration's. Missing credentials at startup queue a critical alert. Guardian
+  check/restore and passphrase resolution, the graph census proof, disk
+  hygiene's store knobs and the eval loaders all take that one answer, and the
+  secrets guard protects the home-config file, its folder and their aliases.
 - **Managed systemd user units** (deploy scripts, no `src/genesis` module):
   `bootstrap.sh` renders `scripts/systemd/*.template` and `setup-vnc.sh`
   renders `scripts/systemd/vnc/` into `~/.config/systemd/user`, both through
@@ -5273,7 +5314,9 @@ verified: 81bbdb0a9 2026-11-08
   pairs as word data. Hash-containing calls keep the earlier backslash handling
   to avoid a comment/quote regression; generic #3257/#3264 remain partial/open.
   A `#` that starts a word at bash's top level opens a comment the scanner skips
-  (#3473), except in commands containing `<<`.
+  (#3473), except in commands containing `<<`. Comment and double-quoted
+  substitution boundaries the legacy scans may misread are refused, never
+  accepted (#3713 PR 1; same reference doc).
   Existing continuation, heredoc proof, size bounds and nested refusals remain.
   Codex's local CLI also has a budget-only shell action hook in
   `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the

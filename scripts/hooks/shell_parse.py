@@ -1233,18 +1233,27 @@ def has_top_level_pipe(command: str, *, count_substitutions: bool = False) -> bo
     return False
 
 
-def _strip_trailing_comment(seg: str) -> str:
-    """Remove an unquoted ``#`` comment (whitespace-preceded or at start) to EOL."""
-    out: list[str] = []
+#: The blanks before which bash starts a comment. Python's ``isspace`` also counts
+#: CR, VT, FF, NEL and NBSP, which bash reads as word characters: ``msg<VT># x``
+#: passes ``# x`` on as arguments.
+_SHELL_BLANKS = frozenset(" \t\n")
+
+
+def _comment_start(seg: str, *, strict: bool = True) -> int | None:
+    """Offset of the ``#`` that starts this segment's comment, or None.
+
+    Strict: the legacy quote scan plus backslash escapes outside quotes, which bash
+    honours (``\\'`` is a literal quote, not the start of one), and bash's blanks.
+    Not strict: the scan main has always used. Neither is bash: each misreads some
+    text the other gets right, so a caller that ALLOWS anything on the answer combines
+    both in the conservative direction rather than trusting either."""
     quote: str | None = None
-    prev_ws = True  # start-of-string counts as preceding whitespace
+    prev_ws = True
     i, n = 0, len(seg)
     while i < n:
         c = seg[i]
         if quote:
-            out.append(c)
             if quote == '"' and c == "\\" and i + 1 < n:
-                out.append(seg[i + 1])
                 i += 2
                 continue
             if c == quote:
@@ -1252,18 +1261,181 @@ def _strip_trailing_comment(seg: str) -> str:
             prev_ws = False
             i += 1
             continue
+        if strict and c == "\\" and i + 1 < n:
+            prev_ws = False
+            i += 2
+            continue
         if c in ("'", '"'):
             quote = c
-            out.append(c)
             prev_ws = False
             i += 1
             continue
         if c == "#" and prev_ws:
-            break  # comment to end of segment
-        out.append(c)
-        prev_ws = c.isspace()
+            return i
+        prev_ws = c in _SHELL_BLANKS if strict else c.isspace()
         i += 1
-    return "".join(out)
+    return None
+
+
+#: Text the legacy scans act on outside quotes: separators, redirections, a comment
+#: start, a line end, a backtick.
+_LEGACY_METAS = frozenset("#;&|<>\n`")
+
+
+def _dq_body_misread(seg: str, i: int, end: int) -> bool:
+    """Whether the legacy scans misread a double-quoted substitution ``seg[i:end]``.
+
+    They do not model substitutions, so a ``"`` in the body closes the outer quote
+    early and the next one reopens it. That is harmless only when the text they then
+    see as unquoted holds nothing they act on, and the pairing ends back inside the
+    outer quote, as bash does (``"$(basename "$f")"``). Otherwise the misread can hide
+    a separator or forge a comment (``"$(printf "x # review-override")"``)."""
+    if '"' not in seg[i:end]:
+        return False
+    quote: str | None = '"'
+    parens = 0
+    j = i
+    while j < end:
+        c = seg[j]
+        if quote == '"':
+            if c == "\\":
+                j += 2
+                continue
+            if c == '"':
+                quote = None
+        elif quote == "'":
+            if c == "'":
+                quote = None
+        elif c in ("'", '"'):
+            quote = c
+        elif c == "\\" or c in _LEGACY_METAS:
+            return True
+        elif c in "({":
+            parens += 1
+        elif c in ")}":
+            parens -= 1
+        j += 1
+    return quote != '"' or parens != 0
+
+
+def _segment_unproven(seg: str, escapes_modelled: bool = True) -> bool:
+    """Whether a boundary in this segment is one the legacy scans cannot be trusted on.
+
+    Refusal only: a True never makes anything readable, and extraction is unchanged,
+    so a substitution is still parsed wherever it was. Each case was measured against
+    bash with a command main showed neither run nor refused (#3713):
+
+    - the segment's comment has a newline after it: a quote in the comment carried the
+      scan past the line end, so the lines after it were cut off with the comment;
+    - outside double quotes, a backslash before ``$(``, before a backtick when another
+      backtick is in the segment, or before a quote in a segment holding a
+      substitution (#3635); and before any quote when the segmenter is not modelling
+      escapes (``escapes_modelled``: it does only for text with no ``#``), since the
+      quote it then opens can swallow a separator and the command after it;
+    - a backtick body holding a backslash;
+    - a double-quoted substitution the legacy scans misread (``_dq_body_misread``).
+
+    A body containing ``<<`` is left to ``_heredoc_hidden_suffixes``, which owns
+    here-doc bodies; the scan here would read the body as shell. A substitution that
+    never closes is not refused: bash runs nothing from that line on, and the lines
+    before it are segments already."""
+    cut = _comment_start(seg)
+    if cut is not None and "\n" in seg[cut:]:
+        return True
+    # argv drops seg[legacy:] as a comment the strict scan says bash does not read.
+    # Refuse if that text could carry a flag or an expansion (`x\ # --force` pushes
+    # with --force); text like ` #b` is only a word.
+    legacy = _comment_start(seg, strict=False)
+    dropped = "" if legacy is None or (cut is not None and cut <= legacy) else (
+        seg[legacy : len(seg) if cut is None else cut]
+    )
+    if any(ch in dropped for ch in "-$`"):
+        return True
+    has_opener = "$(" in seg or "`" in seg
+    quote: str | None = None
+    i, n = 0, len(seg)
+    while i < n:
+        c = seg[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            nxt = seg[i + 1]
+            # A lone escaped backtick has nothing to pair with; beside another one the
+            # extraction pairs them and misses the real substitution.
+            if quote is None and (
+                seg.startswith("$(", i + 1)
+                or (nxt == "`" and seg.count("`") > 1)
+                or (has_opener and nxt == "'")
+                or (not escapes_modelled and nxt in ("'", '"'))
+            ):
+                return True
+            i += 2
+            continue
+        if c in ("'", '"'):
+            quote = None if quote == c else (quote or c)
+            i += 1
+            continue
+        if c == "$" and seg.startswith("$(", i):
+            end = _command_sub_end(seg, i, n)
+            if "<<" not in seg[i:end] and quote == '"' and _dq_body_misread(seg, i, end):
+                return True
+            i = end
+            continue
+        if c == "`":
+            close = seg.find("`", i + 1)
+            if close == -1:
+                return False
+            body = seg[i + 1 : close]
+            if "<<" not in body and (
+                "\\" in body or (quote == '"' and _dq_body_misread(seg, i, close + 1))
+            ):
+                return True
+            i = close + 1
+            continue
+        i += 1
+    return False
+
+
+def _trusted_bodies(
+    command: str, bodies: list[tuple[int, int, int]]
+) -> list[tuple[int, int]]:
+    """The here-doc bodies whose lines are data to bash, as ``(start, end)``.
+
+    The openers come from the legacy scan, which records a ``<<`` that bash reads as
+    quoted text (after ``\\'``) or as part of a comment, and those bodies hold lines
+    bash runs. A body is kept only when ``_TopLevel``, the bash-like pass, places its
+    opener outside every quote and nesting, no ``#`` precedes it on its line, and it
+    does not sit inside a body already kept (there it is data). Dropping one only
+    removes the relief: its lines are checked like any others."""
+    top = _TopLevel(command)
+    kept: list[tuple[int, int]] = []
+    starts: list[int] = []
+    for opener, start, end in sorted(bodies):
+        # Kept bodies are disjoint and ascending (an opener inside one is skipped),
+        # so a bisect finds the only one that could hold this opener.
+        k = _bisect_right(starts, opener) - 1
+        if k >= 0 and opener < kept[k][1]:
+            continue  # a `<<` inside an earlier body is that body's data, no opener
+        line = command.rfind("\n", 0, opener) + 1
+        if top.at(opener) and "#" not in command[line:opener]:
+            kept.append((start, end))
+            starts.append(start)
+    return kept
+
+
+def _strip_trailing_comment(seg: str) -> str:
+    """Remove an unquoted ``#`` comment (blank-preceded or at start) to EOL.
+
+    The cut main has always made, deliberately: argv must not change in either
+    direction. A cut moved earlier drops words bash passes (``--force`` after
+    ``${x:+ \\' # }``), and one moved later keeps words bash never passes (a
+    ``--help`` that would skip a gate). Where the strict and legacy scans disagree,
+    ``_segment_unproven`` refuses instead."""
+    cut = _comment_start(seg, strict=False)
+    return seg if cut is None else seg[:cut]
 
 
 # The recognized ack/override sigils. A trailing comment may carry several of these
@@ -1330,7 +1502,17 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
     — a prose token ahead of the sigil ends the run. This keeps independent acks
     able to coexist without letting an incidental or negated prose mention waive
     the gate.
+
+    The answer is the legacy scan AND the strict one, so an override counts only
+    where main also counted it: the strict scan's own boundaries (a substitution's
+    close, read without comments) are not bash's either, and acting alone it once
+    honoured a sigil main refused (``$(true # ) # sigil`` + newline + ``)``).
     """
+    return _override_scan(seg, sigil, strict=False) and _override_scan(seg, sigil, strict=True)
+
+
+def _override_scan(seg: str, sigil: str, *, strict: bool) -> bool:
+    """One reading of :func:`_has_trailing_override`. Not strict: main's scan."""
     quote: str | None = None
     prev_ws = True
     i, n = 0, len(seg)
@@ -1345,10 +1527,29 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
             prev_ws = False
             i += 1
             continue
+        if strict and c == "\\" and i + 1 < n:
+            # An escaped quote outside quotes is a literal to bash, and the scan
+            # cannot follow where bash's real quotes then go (`\"x" # sigil"` holds
+            # no comment). Waive nothing rather than guess.
+            if seg[i + 1] in ("'", '"'):
+                return False
+            prev_ws = False
+            i += 2
+            continue
         if c in ("'", '"'):
             quote = c
             prev_ws = False
             i += 1
+            continue
+        # A `#` inside a substitution is that command's comment, not this segment's.
+        if strict and c == "$" and seg.startswith("$(", i):
+            i = _command_sub_end(seg, i, n)
+            prev_ws = False
+            continue
+        if strict and c == "`":
+            close = seg.find("`", i + 1)
+            i = n if close == -1 else close + 1
+            prev_ws = False
             continue
         if c == "#" and prev_ws:
             for tok in seg[i + 1 :].split():
@@ -1358,7 +1559,7 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
                     return False  # a prose token ends the leading run of sigils
                 # else: a DIFFERENT recognized sigil — still in the run, keep scanning
             return False
-        prev_ws = c.isspace()
+        prev_ws = c in _SHELL_BLANKS if strict else c.isspace()
         i += 1
     return False
 
@@ -2467,6 +2668,7 @@ def _heredoc_hidden_suffixes(
     origin: tuple[_HeredocLines, int] | None = None,
     in_substitution: bool = False,
     _inert: list[bool] | None = None,
+    _bodies: list[tuple[int, int, int]] | None = None,
 ) -> list[tuple[int, str, int]]:
     """``(opener, why, at)`` for each here-doc in ``text`` whose body the parse cannot
     be trusted past. ``splits`` and ``openers`` come from the parse of ``text`` itself
@@ -2521,6 +2723,10 @@ def _heredoc_hidden_suffixes(
     fired on 93 real commands at depth 1 and on none was anything hidden, since a
     ``"$(cat <<'EOF'`` body with an apostrophe hands the nested parse a script ending
     ``EOF`` newline ``)``, and a closing paren runs nothing.
+
+    ``_bodies``, when passed, receives ``(opener, start, end)`` in ``text`` for each body
+    whose terminator this check found. That is only as good as the openers, which
+    come from the legacy scan; ``_trusted_bodies`` keeps the ones bash agrees are real.
 
     LINEAR, deliberately: the index is built once per text, and each opener costs a
     constant number of bisects. This runs on a hook path, where a hook killed by its
@@ -2613,6 +2819,8 @@ def _heredoc_hidden_suffixes(
             queued = unknown
             continue
         terminator = lines.ends[primary]  # in the original text
+        if _bodies is not None:
+            _bodies.append((opener, start - base, terminator - base))  # in `text`
         if (
             in_substitution
             and quoted
@@ -2919,6 +3127,11 @@ def analyze_checked(command: str, *, _policy=None) -> tuple[list[Segment], Blind
     non-bounds result remains intact unless a nested source could not be tokenized.
     Every withholding cause has ``bounds_induced`` set: a consumer that trusts the
     returned segments must not receive a partial list.
+
+    An unproven comment or substitution boundary (:func:`_segment_unproven`) ranks
+    below all of these: it reports the structural cause only where nothing else, or
+    only an unresolved verb, would be reported, so it adds refusals without moving
+    any existing one.
 
     Structural incompleteness is retained independently of the selected diagnostic.
     A higher-priority bound, continuation, or built escape can win the message while
@@ -4438,6 +4651,7 @@ class _AnalysisResult:
     structural_incomplete: bool
     decision_text: str
     heredoc_incomplete: bool
+    boundary_unproven: bool = False  # see _segment_unproven; applied at depth 0 only
 
 
 def _analyze_bounded(
@@ -4497,13 +4711,19 @@ def _analyze_bounded(
     # grammar admits none).
     openers = [o for o in openers if o > proven_line]
     inert: list[bool] = []
+    bodies: list[tuple[int, int, int]] = []
     carried = False
     try:
-        reports = _heredoc_hidden_suffixes(command, splits, openers, here, _in_substitution, inert)
+        reports = _heredoc_hidden_suffixes(
+            command, splits, openers, here, _in_substitution, inert, bodies
+        )
         heredoc = bool(reports)
         carried = any(reason == "carried" for _, reason, _ in reports)
     except Exception:  # noqa: BLE001 — never raise inside the parse; unread is reported
         heredoc = True
+    data_lines = _trusted_bodies(command, bodies)
+    body_starts = [b0 for b0, _ in data_lines]
+    escapes_modelled = "#" not in command  # parse_segments' own switch for this text
     # Only the canonical traversal's whole-fragment proof grants relief. An empty
     # report list is NOT proof; decoded scripts never inherit an outer proof.
     structural_incomplete = structural_incomplete and not inert
@@ -4513,6 +4733,10 @@ def _analyze_bounded(
     # closes. Counted on the segment SOURCE text outside quotes and comments, so a
     # paren inside a quoted argument is never mistaken for a subshell.
     carried_open = 0
+    # A boundary the legacy scans may have misread (_segment_unproven). This
+    # fragment's own whole-body proof clears it; nothing else does, and a proof in a
+    # nested fragment never reaches this one.
+    boundary_unproven = False
     for seg, start in zip(parsed, starts, strict=True):
         raw = seg.raw
         override = _has_trailing_override(raw)
@@ -4524,6 +4748,14 @@ def _analyze_bounded(
         argv = _strip_wrappers(tokens, carried_open, _contexts=contexts, _env=env_state)
         structural_incomplete = structural_incomplete or env_state.unresolved
         structural_message = structural_message or env_state.unresolved
+        if not boundary_unproven and not inert:
+            # Bodies are disjoint and ordered, so a bisect finds the one that could
+            # hold this segment: linear overall, not segments x bodies (a hook killed
+            # by its clock permits).
+            k = _bisect_right(body_starts, start) - 1
+            in_body = k >= 0 and start < data_lines[k][1]
+            if not in_body and _segment_unproven(raw, escapes_modelled):
+                boundary_unproven = True
         truncated = truncated or env_state.exhausted
         carried_open = max(0, carried_open + _net_subshell_depth(seg.argv_src))
         exe = _basename(argv[0]) if argv else ""
@@ -4550,6 +4782,8 @@ def _analyze_bounded(
         if exe in _NESTED:
             script = _nested_script(argv, exe)
             if script:
+                # Decoded, `\$` and `` \` `` are escapes the nested scan does not model.
+                boundary_unproven = boundary_unproven or "\\$" in script or "\\`" in script
                 nested.append((script, None, False, "shell"))
 
         nested.extend(
@@ -4592,6 +4826,7 @@ def _analyze_bounded(
             continuation = continuation or inner.diagnostic is _BLIND_CONTINUATION
             built_escape = built_escape or inner.diagnostic is _BLIND_BUILT_ESCAPE
             bash53_substitution = bash53_substitution or inner.diagnostic is _BLIND_BASH53_SUBSTITUTION
+            boundary_unproven = boundary_unproven or inner.boundary_unproven
             for inner_segment in inner.segments:
                 out.append(
                     Segment(
@@ -4629,8 +4864,19 @@ def _analyze_bounded(
         diagnostic = _BLIND_UNRESOLVED_VERB
     else:
         diagnostic = None
+    # An unproven boundary withholds the parse, but only where nothing above already
+    # spoke: every existing cause keeps its class and rank, including the
+    # untokenizable one the discard guard exempts by measured decision.
+    if (
+        _depth == 0
+        and boundary_unproven
+        and (diagnostic is None or diagnostic in (_BLIND_UNRESOLVED_VERB, _BLIND_UNCLASSIFIED_OPTION))
+    ):
+        diagnostic = _BLIND_STRUCTURAL
+        structural_incomplete = True
     return _AnalysisResult(
-        out, bound_reason, diagnostic, structural_incomplete, _decision_text, heredoc
+        out, bound_reason, diagnostic, structural_incomplete, _decision_text, heredoc,
+        boundary_unproven,
     )
 
 

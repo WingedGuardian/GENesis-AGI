@@ -1136,11 +1136,14 @@ echo
 
 # --- Secrets ---
 echo "--- Checking secrets ---"
-SECRETS_FILE="$GENESIS_ROOT/secrets.env"
+# shellcheck source=lib/secrets_path.sh
+. "$SCRIPT_DIR/lib/secrets_path.sh"
+SECRETS_FILE="$(genesis_secrets_path "$GENESIS_ROOT")"
 if [[ -f "$SECRETS_FILE" ]]; then
     echo "  secrets.env exists"
 else
     if [[ -f "$GENESIS_ROOT/secrets.env.example" ]]; then
+        mkdir -p -m 0700 "$(dirname "$SECRETS_FILE")"
         cp "$GENESIS_ROOT/secrets.env.example" "$SECRETS_FILE"
         chmod 600 "$SECRETS_FILE"
         echo "  Copied secrets.env.example -> secrets.env"
@@ -1865,8 +1868,8 @@ fi
 # tmp-watchgod is now a template in scripts/systemd/ — handled by the loop above.
 
 # Check smbclient for Tier 2 backup (optional — only if NAS configured in secrets.env)
-if [ -f "$GENESIS_ROOT/secrets.env" ]; then
-    if grep -q 'GENESIS_BACKUP_NAS=' "$GENESIS_ROOT/secrets.env" 2>/dev/null; then
+if [ -f "$SECRETS_FILE" ]; then
+    if grep -q 'GENESIS_BACKUP_NAS=' "$SECRETS_FILE" 2>/dev/null; then
         if ! command -v smbclient >/dev/null 2>&1; then
             echo "  WARNING: smbclient not installed — Tier 2 backup to NAS won't work"
             echo "  Install with: sudo apt-get install -y smbclient"

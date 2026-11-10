@@ -1314,6 +1314,16 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   | gate | round 1 | round 2 and later | round 2 |
   | ordinary | round 3 (the class sweep) | round 2 and later | round 4 |
 
+  A merge of main does not end a round. When nothing after the reviewed head is a
+  fix (only merges of main that carry nothing else, or empty commits such as a
+  pushed reflection), that round's keys stay owed (as late keys, under the round's
+  own context), even when the merge then draws findings of its own and opens
+  the next round; the reflection names the PR head as for any owed key. A real commit after
+  the review does complete the round; when the newest such round (opened after
+  the go-live cutover) has no reflection naming it, the gate says so in an
+  advisory. A rebase or force-push that drops the reviewed head from the PR still
+  ends the round silently.
+
   An unreadable review budget keeps the gate's existing path (the round-approval
   ask in the foreground, a deny when dispatched). Anything else Rule R cannot read
   (owed keys unknown, git unreadable, hook out of time) ALLOWS the commit with an
