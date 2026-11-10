@@ -57,6 +57,16 @@ _SKIP_TOOLS = frozenset(
     }
 )
 
+# Subagent types whose tool activity is never recorded. Everything this hook
+# captures is extracted into memories that proactive recall shows to other
+# sessions, so a subagent handling text that must stay out of recall (a writer
+# of hidden evaluation scenarios, which builders must never see) is skipped
+# whole. Matched only together with a non-empty agent_id: a main session
+# started with --agent carries agent_type too, and stays observed. This closes
+# the observer only: the parent session later reading the subagent's files
+# with its own tools is observed as usual.
+_UNOBSERVED_AGENT_TYPES = frozenset({"holdout-writer"})
+
 # Max chars to capture from tool output
 _OUTPUT_CAP = 2000
 # Max chars to capture from tool input
@@ -226,13 +236,24 @@ def _process(data: dict) -> None:
     if tool_name in _SKIP_TOOLS:
         return
 
-    # Validate session_id as safe path component
-    if "/" in session_id or "\\" in session_id or ".." in session_id:
+    if data.get("agent_id") and data.get("agent_type") in _UNOBSERVED_AGENT_TYPES:
         return
 
     tool_input = data.get("tool_input") or {}
     if not isinstance(tool_input, dict):
         tool_input = {}
+
+    # The parent's own Agent call carries no agent_id, but its result holds the
+    # subagent's prompt and final report.
+    if (
+        tool_name in ("Agent", "Task")
+        and tool_input.get("subagent_type") in _UNOBSERVED_AGENT_TYPES
+    ):
+        return
+
+    # Validate session_id as safe path component
+    if "/" in session_id or "\\" in session_id or ".." in session_id:
+        return
 
     # Tool result travels in the stdin payload (CC PostToolUse contract); the
     # old CLAUDE_TOOL_USE_RESULT env var is no longer set.
