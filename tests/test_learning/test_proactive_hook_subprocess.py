@@ -206,10 +206,8 @@ def test_stub_server_mode_server(fts_db: Path, tmp_path: Path):
     assert _FTS_ID in ws["entries"]
 
 
-def test_server_path_includes_code_index_hints(fts_db: Path, tmp_path: Path):
-    """The server path still surfaces local ``[Code]`` structural hints — the
-    engine does semantic memory only, so the hook keeps the code_symbols lane the
-    fork fused (Codex #1169)."""
+def _seed_code_symbol(fts_db: Path) -> None:
+    """A public symbol whose name the prompt below names exactly."""
     import sqlite3
 
     conn = sqlite3.connect(str(fts_db))
@@ -232,60 +230,50 @@ def test_server_path_includes_code_index_hints(fts_db: Path, tmp_path: Path):
     conn.commit()
     conn.close()
 
+
+@pytest.mark.parametrize("path", ["server", "degraded"])
+def test_no_code_hints_on_either_path(fts_db: Path, tmp_path: Path, path: str):
+    """The [Code] lane is removed: of 15,412 hints sessions received over 30
+    days, 34 were followed by a touch of the hinted file. A prompt naming a real
+    indexed symbol gets no code hint on the server path or the degraded fallback.
+    Both assertions matter: the degraded renderer strips the "[Code] " prefix,
+    so only the signature check catches a hint there."""
+    _seed_code_symbol(fts_db)
     home = tmp_path / "home"
     home.mkdir()
-    response = {
-        "status": "ok",
-        "lines": ["[Memory | 1d | id:aaaaaaaa] a semantic memory"],
-        "results": [],
-        "procedure": None,
-        "shadow": {},
-        "budget": {},
-        "embedding": None,
-        "timings_ms": {},
-        "engine": {},
-    }
-    with _stub_server(response) as base_url:
+    env = {"GENESIS_DB_PATH": str(fts_db), "GENESIS_PROACTIVE_HOOK_MODE": "server"}
+    prompt = "what did we decide about recall_reranker in the retrieval module"
+    if path == "server":
+        response = {
+            "status": "ok",
+            "lines": ["[Memory | 1d | id:aaaaaaaa] a semantic memory"],
+            "results": [],
+            "procedure": None,
+            "shadow": {},
+            "budget": {},
+            "embedding": None,
+            "timings_ms": {},
+            "engine": {},
+        }
+        with _stub_server(response) as base_url:
+            result = _run_hook(
+                prompt, "codesess", {**env, "GENESIS_PROACTIVE_HOOK_URL": base_url}, home
+            )
+        assert "[Memory | 1d | id:aaaaaaaa]" in result.stdout  # recall still lands
+    else:
         result = _run_hook(
-            "what did we decide about the recall reranker",
-            "codesess",
-            {
-                "GENESIS_DB_PATH": str(fts_db),
-                "GENESIS_PROACTIVE_HOOK_URL": base_url,
-                "GENESIS_PROACTIVE_HOOK_MODE": "server",
-            },
-            home,
+            prompt, "codesess", {**env, "GENESIS_PROACTIVE_HOOK_URL": "http://127.0.0.1:9"}, home
         )
+        assert _only_phase_line(result.stderr)["path"] == "degraded"
+        assert f"id:{_FTS_ID[:8]}" in result.stdout  # FTS still fills the fallback
     assert result.returncode == 0, result.stderr[:2000]
-    assert "[Code]" in result.stdout  # structural hint surfaced on the server path
-    assert "recall_reranker" in result.stdout
+    assert "[Code]" not in result.stdout
+    assert "def recall_reranker" not in result.stdout
 
 
 def test_disabled_status_suppresses_all_injection(fts_db: Path, tmp_path: Path):
-    """status='disabled' (the config kill switch) → inject NOTHING, including the
-    local [Code] hints — disabled is a clean silence, not a degraded fallback."""
-    import sqlite3
-
-    conn = sqlite3.connect(str(fts_db))
-    conn.execute(
-        "INSERT INTO code_modules (path, package, module_name, loc, file_mtime, last_indexed_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ("src/genesis/memory/retrieval.py", "genesis.memory", "retrieval", 100, 0.0, "2026-07-01"),
-    )
-    conn.execute(
-        "INSERT INTO code_symbols (module_path, name, symbol_type, line_start, signature, is_public) "
-        "VALUES (?, ?, ?, ?, ?, 1)",
-        (
-            "src/genesis/memory/retrieval.py",
-            "recall_reranker",
-            "function",
-            10,
-            "def recall_reranker(q)",
-        ),
-    )
-    conn.commit()
-    conn.close()
-
+    """status='disabled' (the config kill switch) → inject NOTHING — disabled is a
+    clean silence, not a degraded fallback."""
     home = tmp_path / "home"
     home.mkdir()
     response = {
@@ -311,7 +299,6 @@ def test_disabled_status_suppresses_all_injection(fts_db: Path, tmp_path: Path):
             home,
         )
     assert result.returncode == 0, result.stderr[:2000]
-    assert "[Code]" not in result.stdout  # code hints suppressed under disabled
     assert "[Memory" not in result.stdout
     assert "degraded" not in result.stdout.lower()  # disabled is not degraded
 

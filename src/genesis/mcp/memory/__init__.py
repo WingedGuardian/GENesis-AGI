@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from fastmcp import FastMCP
 
+from genesis.caller_context import caller_context
 from genesis.db.crud import (
     knowledge as knowledge_crud,
 )
@@ -101,10 +102,14 @@ def init(
     honor the ``reranker`` config mode + ``GENESIS_MEMORY_RERANK_OFF`` kill.
     """
     from genesis.bookmark.manager import BookmarkManager
+    from genesis.db.request_database import RequestDatabase
     from genesis.memory.linker import MemoryLinker
     from genesis.memory.retrieval import HybridRetriever
     from genesis.memory.store import MemoryStore
     from genesis.memory.user_model import UserModelEvolver
+
+    if isinstance(db, RequestDatabase) and read_pool is not None:
+        raise ValueError("Request-owned memory must use read_pool=None")
 
     # Resolve providers — support both old and new calling conventions
     store_emb = storage_embedding_provider or embedding_provider
@@ -150,17 +155,23 @@ def init(
         db=db,
     )
 
-    if activity_tracker is not None:
-        from genesis.observability.mcp_middleware import InstrumentationMiddleware
+    from genesis.observability.mcp_middleware import install_instrumentation
 
-        mcp.add_middleware(InstrumentationMiddleware(activity_tracker, "memory", db=db))
+    install_instrumentation(mcp, activity_tracker, "memory", db)
 
 
 def _require_init() -> None:
     if _store is None or _retriever is None or _db is None:
         raise RuntimeError("memory-mcp not initialized — call init() first")
 
-    if _process_pending_bookmarks and _PLAN_BOOKMARK_PENDING.exists():
+    # A labelled client (owner-mode Codex) never writes the pending marker, so
+    # its calls must not consume a Claude session's: the same protection the
+    # external profile gets through process_pending_bookmarks=False (#3068).
+    if (
+        _process_pending_bookmarks
+        and not caller_context().profile
+        and _PLAN_BOOKMARK_PENDING.exists()
+    ):
         from genesis.db.request_database import DatabaseScopeError, spawn_database_task
 
         # The marker is consumed only by an accepted job; retry next call.

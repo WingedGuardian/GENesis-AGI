@@ -48,11 +48,9 @@ class StandaloneHealthDataService:
         ignored: this reads a small file on every call, so there is nothing to
         cache and no in-flight compute to coalesce.
 
-        Parity here is hygiene, not a fix for an observed break — this class has
-        no production instantiation today, so nothing currently passes the
-        argument to it. It is declared so the two implementations of this
-        informal interface cannot drift into a TypeError if one is ever
-        substituted for the other.
+        The standalone MCP launcher uses this implementation for both stdio and
+        HTTP. Signature parity lets shared health consumers request a maximum
+        age without requiring the runtime implementation's cache or task sharing.
         """
         if not self._status_path.exists():
             return {
@@ -100,10 +98,25 @@ class StandaloneHealthDataService:
             "reflex": {"ingestor": data.get("reflex")} if data.get("reflex") else {},
         }
 
+        # The server's in-memory surplus pulse, carried through this file because
+        # this process has no runtime; surplus_status validates every field.
+        from genesis.observability.snapshots.surplus import StatusFilePulse
+
+        pulses = data.get("liveness_pulses")
+        paused_state = data.get("paused_state")
+        status_file_pulse = StatusFilePulse(
+            last_success=pulses.get("surplus_dispatch") if isinstance(pulses, dict) else None,
+            paused=paused_state.get("is_paused") if isinstance(paused_state, dict) else None,
+            written_at=data.get("timestamp"),
+        )
+
         # Enrich from DB where possible (capped at 5s to avoid stalling CC)
         if self._db:
             try:
-                await asyncio.wait_for(self._enrich_from_db(result), timeout=5.0)
+                await asyncio.wait_for(
+                    self._enrich_from_db(result, status_file_pulse=status_file_pulse),
+                    timeout=5.0,
+                )
             except TimeoutError:
                 logger.warning("Standalone health enrichment timed out after 5s", exc_info=True)
             except Exception:
@@ -124,7 +137,7 @@ class StandaloneHealthDataService:
 
         return result
 
-    async def _enrich_from_db(self, result: dict) -> None:
+    async def _enrich_from_db(self, result: dict, *, status_file_pulse=None) -> None:
         """Enrich snapshot with real data from the shared DB."""
         # CC sessions — real counts, costs, durations from cc_sessions table
         try:
@@ -214,7 +227,11 @@ class StandaloneHealthDataService:
         try:
             from genesis.observability.snapshots.surplus import surplus_status
 
-            result["surplus"] = await surplus_status(self._db, None)
+            result["surplus"] = await surplus_status(
+                self._db,
+                None,
+                status_file_pulse=status_file_pulse,
+            )
         except Exception:
             logger.warning("Surplus snapshot failed in standalone mode", exc_info=True)
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -16,6 +15,7 @@ from genesis.db.crud._id_resolve import AMBIGUOUS as _AMBIGUOUS
 from genesis.db.crud._id_resolve import NOT_FOUND as _NOT_FOUND
 from genesis.db.crud._id_resolve import PASSTHROUGH as _PASSTHROUGH
 from genesis.db.crud._id_resolve import normalize_id
+from genesis.db.request_database import run_resource_thread
 from genesis.memory._locks import memory_id_lock
 from genesis.memory.classification import classify_memory
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
@@ -385,19 +385,13 @@ class MemoryStore:
                     f"got {life_domain!r}"
                 )
 
-        # Dedup: skip if exact content already stored (any collection)
-        try:
-            existing = await memory_crud.find_exact_duplicate(
-                self._db, content=content,
-            )
-            if existing:
-                logger.debug("Skipping duplicate memory store: %s", existing)
-                # NOT created by this call: the caller must not compensate it.
-                return (existing, False)
-        except Exception:
-            # Dedup check is best-effort — never block a store on lookup failure
-            logger.warning("Dedup check failed, proceeding with store", exc_info=True)
-
+        # Invalid correction handles are preconditions, including on dedup.
+        # Resolve before any lookup catch or write can hide the rejection.
+        resolved_supersedes = (
+            await self._resolve_supersede_target(supersedes)
+            if supersedes and supersedes.strip() else None
+        )
+        raw_content = content
         # Surface form normalization: expand known aliases before embedding
         try:
             from genesis.memory.entity_resolution import normalize_content
@@ -405,6 +399,37 @@ class MemoryStore:
             content = normalize_content(content)
         except Exception:
             pass  # best-effort — never block a store on normalization failure
+
+        # Dedup normalized identity first; retain legacy raw-text compatibility.
+        existing = None
+        try:
+            existing = await memory_crud.find_exact_duplicate(
+                self._db, content=content, source_subsystem=source_subsystem,
+            )
+            if existing is None and content != raw_content:
+                existing = await memory_crud.find_exact_duplicate(
+                    self._db, content=raw_content, source_subsystem=source_subsystem,
+                )
+        except Exception:
+            # Dedup check is best-effort — never block a store on lookup failure
+            logger.warning("Dedup check failed, proceeding with store", exc_info=True)
+
+        if existing:
+            if resolved_supersedes:
+                try:
+                    # Full ids retain the standalone validation, ordered locks,
+                    # and repair path; invalid pairs must not become new stores.
+                    await self.supersede(resolved_supersedes, existing)
+                except SupersedeUnresolved:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "Failed to mark memory %s as superseded by %s",
+                        resolved_supersedes, existing, exc_info=True,
+                    )
+            logger.debug("Skipping duplicate memory store: %s", existing)
+            # NOT created by this call: the caller must not compensate it.
+            return (existing, False)
 
         # Confidence gate: low-confidence → FTS5 only, skip Qdrant
         # Deferred import to break circular: memory.store ↔ perception
@@ -429,16 +454,6 @@ class MemoryStore:
         is_subsystem_write = source_subsystem is not None
         if is_subsystem_write:
             force_fts5_only = True
-
-        # Resolve the supersede target BEFORE anything is written. An
-        # unresolvable target then costs nothing and leaves nothing behind, and
-        # the raise reaches the caller with no half-done operation attached.
-        # It also has to be before ``create_metadata``: resolving afterwards let
-        # a short prefix match the row this call had just written, deprecating
-        # the new memory as its own successor.
-        resolved_supersedes = (
-            await self._resolve_supersede_target(supersedes) if supersedes else None
-        )
 
         memory_id = str(uuid.uuid4())
         now_iso = datetime.now(UTC).isoformat()
@@ -583,7 +598,8 @@ class MemoryStore:
                     # round-trip on this hot store() path doesn't stall every
                     # other coroutine (background paths already do this; see
                     # memory/health.py, dream_cycle.py, entity_resolution.py).
-                    await asyncio.to_thread(
+                    await run_resource_thread(
+                        self._db,
                         upsert_point,
                         self._qdrant,
                         collection=resolved_collection,
@@ -1035,7 +1051,8 @@ class MemoryStore:
             try:
                 present: list[str] = []
                 for coll in ("episodic_memory", "knowledge_base"):
-                    got = await asyncio.to_thread(
+                    got = await run_resource_thread(
+                        self._db,
                         self._qdrant.retrieve,
                         collection_name=coll,
                         ids=[old_id],
@@ -1045,7 +1062,8 @@ class MemoryStore:
                     if got:
                         present.append(coll)
                 for coll in present:
-                    await asyncio.to_thread(
+                    await run_resource_thread(
+                        self._db,
                         update_payload,
                         self._qdrant,
                         collection=coll,
@@ -1152,7 +1170,8 @@ class MemoryStore:
         try:
             present: list[str] = []
             for coll in ("episodic_memory", "knowledge_base"):
-                got = await asyncio.to_thread(
+                got = await run_resource_thread(
+                    self._db,
                     self._qdrant.retrieve,
                     collection_name=coll,
                     ids=[memory_id],
@@ -1162,8 +1181,8 @@ class MemoryStore:
                 if got:
                     present.append(coll)
             for coll in present:  # atomic on the point's real collection
-                await asyncio.to_thread(
-                    delete_point, self._qdrant, collection=coll, point_id=memory_id,
+                await run_resource_thread(
+                    self._db, delete_point, self._qdrant, collection=coll, point_id=memory_id,
                 )
         except Exception:
             logger.error(

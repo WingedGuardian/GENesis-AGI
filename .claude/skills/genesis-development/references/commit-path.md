@@ -280,7 +280,10 @@ Verify before any commit:
   and says so. `preflight` checks without running. It is not a way around the
   full-suite rule: test targets must still be named, and do not count on the
   full-suite guard to see inside the wrapper. Guide:
-  `docs/reference/resource-budget.md`.
+  `docs/reference/resource-budget.md`. An ad-hoc `systemd-run` launch must pass
+  `--collect` (or go through `genesis.hostmetrics run`, which does), because a
+  failed transient unit is otherwise never unloaded and they pile up in the
+  failed list.
 - **Deleting user or project data goes through the trash, not `rm`.** A file or
   directory you did not create in this session (memory and plans, config, a
   deliverable, notes) goes to `… -m genesis.trash put PATH --reason R`, which

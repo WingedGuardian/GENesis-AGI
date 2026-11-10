@@ -27,6 +27,7 @@ from genesis.db.crud._fts import (
 from genesis.db.request_database import (
     BackgroundTaskCapacityError,
     DatabaseScopeError,
+    run_resource_thread,
     spawn_database_task,
 )
 from genesis.memory.activation import compute_activation
@@ -689,6 +690,10 @@ class HybridRetriever:
         rerank_gate: ProviderRateGate | None = None,
         rerank_breaker: CircuitBreaker | None = None,
     ) -> None:
+        from genesis.db.request_database import RequestDatabase
+
+        if isinstance(db, RequestDatabase) and read_pool is not None:
+            raise ValueError("Request-owned retrieval must use read_pool=None")
         self._embeddings = embedding_provider
         self._qdrant = qdrant_client
         self._db = db
@@ -1386,9 +1391,10 @@ class HybridRetriever:
             # stays ON the event loop wrapping the await, so per-collection
             # "qdrant.search" telemetry (the provider:qdrant_unreachable signal in
             # mcp/health/errors.py) is byte-identical to the inline version, and
-            # asyncio.to_thread re-raises so a Qdrant error propagates unchanged.
+            # The resource helper re-raises Qdrant errors after settlement.
             with track_operation(self._embeddings.tracker, "qdrant.search"):
-                hits = await asyncio.to_thread(
+                hits = await run_resource_thread(
+                    self._db,
                     qdrant_ops.search,
                     self._qdrant,
                     collection=coll,
@@ -1480,6 +1486,7 @@ class HybridRetriever:
                     self._qdrant,
                     collections,
                     max_expansions=5,
+                    db=self._db,
                 )
             except Exception:
                 logger.warning("Query expansion failed, using original", exc_info=True)
@@ -1927,7 +1934,7 @@ class HybridRetriever:
                         exc_info=True,
                     )
 
-        await asyncio.to_thread(_write_qdrant_counts)
+        await run_resource_thread(self._db, _write_qdrant_counts)
 
         # 11b. Sync observation retrieved_count in SQLite
         #       Extract obs:<uuid> tags from Qdrant payloads to find linked observations

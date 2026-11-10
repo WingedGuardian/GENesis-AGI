@@ -1,12 +1,4 @@
-"""Tests for the MCP stale-code nudge in genesis_urgent_alerts.
-
-The nudge fires on EVERY prompt but must be SILENT unless this session's MCP
-subprocesses run code OLDER than the last deploy — so the omission matrix
-(fresh / ahead / no deploy / no spawn record / throttled / no session pid) is
-the contract that keeps it free, and it must reuse the SAME commit_identity
-verdict the dashboard badge uses (a session ahead of the deploy is never
-flagged). Fail-open throughout.
-"""
+"""Recorded-revision nudge plus the existing cooldown, path and SQLite controls."""
 
 from __future__ import annotations
 
@@ -27,8 +19,9 @@ SID = "sid-stale-1"
 PID = 424242
 PROC_START = "2026-08-15T00:00:00+00:00"
 SPAWN_AT = "2026-08-15T00:00:05+00:00"  # a beat after the process start
-SPAWN_COMMIT = "176f5b3b8bfd1e11907fafc92967fe1e956330b1"  # full SHA (rev-parse)
+SPAWN_COMMIT = "a" * 40
 DEPLOY_COMMIT = "87590955"  # short SHA (update_history.new_commit)
+CURRENT_COMMIT = "b" * 40
 DEPLOY_AT = "2026-08-21T19:48:50+00:00"  # AFTER spawn → behind → stale
 NOW = datetime(2026, 8, 25, 12, 0, 0, tzinfo=UTC)
 
@@ -36,35 +29,33 @@ NOW = datetime(2026, 8, 25, 12, 0, 0, tzinfo=UTC)
 # ── _staleness_message (pure verdict + wording, no IO) ──────────────────────
 
 
-def test_message_stale_session_behind_deploy():
-    msg = _ua._staleness_message(SPAWN_COMMIT, SPAWN_AT, (DEPLOY_AT, DEPLOY_COMMIT))
+def test_message_recorded_revision_differs():
+    msg = _ua._staleness_message(SPAWN_COMMIT, CURRENT_COMMIT)
     assert msg is not None
-    assert "stale" in msg.lower()
-    assert "2026-08-21" in msg  # deploy date
-    assert DEPLOY_COMMIT[:8] in msg
+    assert "recorded launch revision differs" in msg.lower()
+    assert CURRENT_COMMIT[:8] in msg
+    assert "older" not in msg.lower() and "restart" not in msg.lower()
+    assert "loaded bytes unverified" in msg.lower()
     assert msg.startswith("[") and msg.endswith("]")
 
 
 def test_message_fresh_same_commit_silent():
-    # spawn commit == deploy commit (prefix match via same_commit) → not stale
-    assert _ua._staleness_message(DEPLOY_COMMIT, SPAWN_AT, (DEPLOY_AT, DEPLOY_COMMIT)) is None
+    assert _ua._staleness_message(CURRENT_COMMIT, CURRENT_COMMIT) is None
 
 
-def test_message_session_ahead_of_deploy_silent():
-    # spawn_at AFTER the deploy completed → session is ahead (manual git pull),
-    # NOT stale, even though commits differ.
-    ahead_spawn = "2026-08-22T00:00:00+00:00"
-    assert _ua._staleness_message(SPAWN_COMMIT, ahead_spawn, (DEPLOY_AT, DEPLOY_COMMIT)) is None
+def test_message_rollback_is_the_same_nondirectional_notice():
+    assert _ua._staleness_message(CURRENT_COMMIT, SPAWN_COMMIT) is not None
 
 
-def test_message_no_deploy_silent():
-    assert _ua._staleness_message(SPAWN_COMMIT, SPAWN_AT, None) is None
+def test_message_unknown_head_silent():
+    assert _ua._staleness_message(SPAWN_COMMIT, None) is None
 
 
 def test_message_nonhex_commit_silent():
     # defense-in-depth: a malformed new_commit must never reach LLM-visible context
-    assert _ua._staleness_message(SPAWN_COMMIT, SPAWN_AT, (DEPLOY_AT, "not-a-sha!!")) is None
-    assert _ua._staleness_message(SPAWN_COMMIT, SPAWN_AT, (DEPLOY_AT, "")) is None
+    assert _ua._staleness_message(SPAWN_COMMIT, "not-a-sha!!") is None
+    assert _ua._staleness_message(SPAWN_COMMIT, "") is None
+    assert _ua._staleness_message("not-a-sha!!", CURRENT_COMMIT) is None
 
 
 # ── _last_successful_deploy (read-only sqlite) ──────────────────────────────
@@ -199,6 +190,7 @@ def _wire(monkeypatch, tmp_path, *, pid, slots, ident, deploy_rows):
     """Point every IO seam at fakes/tmp. `slots` = enumerate_spawn_slots result;
     `ident` = read_spawn_identity result."""
     import genesis.observability.cc_slots as cc_slots
+    import genesis.observability.commit_identity as commit_identity
     import genesis.observability.mcp_spawn_store as sp
 
     monkeypatch.setattr(_ua, "_GENESIS_DIR", tmp_path)
@@ -206,6 +198,7 @@ def _wire(monkeypatch, tmp_path, *, pid, slots, ident, deploy_rows):
     monkeypatch.setattr(sp, "enumerate_spawn_slots", lambda: slots)
     monkeypatch.setattr(sp, "read_spawn_identity", lambda *a, **k: ident)
     monkeypatch.setattr(cc_slots, "read_proc_start_iso", lambda _p: PROC_START)
+    monkeypatch.setattr(commit_identity, "read_runtime_head", lambda: CURRENT_COMMIT)
     root = _make_update_db(tmp_path, deploy_rows)
     monkeypatch.setenv("GENESIS_REPO_ROOT", str(root))
 
@@ -224,7 +217,7 @@ def test_emit_stale_prints_and_records(monkeypatch, capsys, tmp_path):
     )
     _ua._emit_staleness_nudge(SID, NOW)
     out = capsys.readouterr().out
-    assert "stale" in out.lower() and DEPLOY_COMMIT[:8] in out
+    assert "recorded launch revision differs" in out.lower() and CURRENT_COMMIT[:8] in out
     # marker recorded → second call within cooldown is silent
     _ua._emit_staleness_nudge(SID, NOW)
     assert capsys.readouterr().out == ""
@@ -236,7 +229,7 @@ def test_emit_fresh_silent(monkeypatch, capsys, tmp_path):
         tmp_path,
         pid=PID,
         slots=[("1", PID, SPAWN_AT)],
-        ident=(DEPLOY_COMMIT, SPAWN_AT),  # same commit as deploy → not stale
+        ident=(CURRENT_COMMIT, SPAWN_AT),
         deploy_rows=_STALE_ROWS,
     )
     _ua._emit_staleness_nudge(SID, NOW)
@@ -310,3 +303,23 @@ def test_emit_suppressed_when_marker_unwritable(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(_ua, "_record_staleness_nudge", lambda *a, **k: False)
     _ua._emit_staleness_nudge(SID, NOW)
     assert capsys.readouterr().out == ""
+
+
+def test_emit_without_deploy_history(monkeypatch, capsys, tmp_path):
+    _wire(monkeypatch, tmp_path, pid=PID, slots=[("1", PID, SPAWN_AT)],
+          ident=(SPAWN_COMMIT, SPAWN_AT), deploy_rows=[])
+    monkeypatch.setattr(_ua, "_last_successful_deploy", lambda *a: (_ for _ in ()).throw(
+        AssertionError("advisory must not read deploy history")))
+    _ua._emit_staleness_nudge(SID, NOW)
+    assert "recorded launch revision differs" in capsys.readouterr().out
+
+
+def test_emit_unknown_head_does_not_consume_cooldown(monkeypatch, capsys, tmp_path):
+    import genesis.observability.commit_identity as commit_identity
+
+    _wire(monkeypatch, tmp_path, pid=PID, slots=[("1", PID, SPAWN_AT)],
+          ident=(SPAWN_COMMIT, SPAWN_AT), deploy_rows=[])
+    monkeypatch.setattr(commit_identity, "read_runtime_head", lambda: None)
+    _ua._emit_staleness_nudge(SID, NOW)
+    assert capsys.readouterr().out == ""
+    assert not _ua._staleness_throttled(SID, NOW)

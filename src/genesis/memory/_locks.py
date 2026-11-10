@@ -27,7 +27,8 @@ Covers the delete-vs-{re-embed, reconcile-requeue} triad — the paths that can
 RESURRECT a deleted vector — plus the standalone ``MemoryStore.supersede()``,
 which holds BOTH its ids from validation through the mirror writes so a
 concurrent delete or supersession of the successor cannot commit between its
-check and its write. The ``store(supersedes=...)`` path's ``_mark_superseded``
+check and its write. Deduplicated stores use that same path. A fresh
+``store(supersedes=...)`` path's ``_mark_superseded``
 remains deliberately NOT wrapped: it cannot resurrect a vector (a
 ``set_payload`` on a missing point is a no-op), and its one residual race — a
 dangling ``succeeded_by`` link for a concurrently-deleted memory — needs an
@@ -38,7 +39,7 @@ Deadlock-free by construction: every holder takes at most ONE id-lock at a
 time and never nests — with a single sanctioned exception: ``supersede()``
 takes exactly TWO, always acquired in sorted-id order, and a fixed total
 acquisition order cannot form a cycle (it also rejects an equal pair before
-locking, so it never nests the SAME lock). ``store()`` takes no lock, and the
+locking, so it never nests the SAME lock). Fresh ``store()`` takes no lock, and the
 slow embed happens OUTSIDE the worker's locked section.
 
 What a lock IS held across is the Qdrant mirror call — ``delete()`` has always

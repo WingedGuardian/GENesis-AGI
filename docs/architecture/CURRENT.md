@@ -73,8 +73,20 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 2ece179f9ebc 2026-10-28
+verified: 5a3de4eee 2026-11-07
 ```
+
+The 2026-11-07 verification covers the request-owned memory thread boundaries
+below; other memory descriptions retain their individually cited verification dates.
+
+**Shared-owner prerequisite (not activated):** nine thread boundaries in
+`memory/store.py`, `retrieval.py`, `intent.py` and `proactive.py` retain actual
+physical completion through their RequestDatabase unit. Legacy connections keep
+ordinary thread cancellation. The retriever forwards the facade to tag expansion;
+tag scans run in independently admitted background units, with accepted-task
+completion as the single-flight release. Pressure or draining serves the stale
+query. Other maintenance threads and shared provider closers still need factory
+qualification; this is not a shared-service activation.
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
 `memory_fts`) and Qdrant share no transaction, so drift (orphaned "ghost"
@@ -388,7 +400,12 @@ commit the main checkout has held since it started (read by
 on a reflog gap, a move in the start second, a clock step back or git's expiry
 cutoff), whether ALL of them contain the telemetry module (a module imported
 after start loads whatever is on disk then), plus whether HEAD has the module
-and whether `src/genesis/memory/` is dirty. Git runs with `--no-optional-locks`,
+and whether the graph-read path is dirty (`graph_census._RUNTIME_PATHS`: the
+graph and graph-store modules, their callers, direct pressure/DB telemetry
+helpers, the environment and config
+loaders, `config/graphstore.yaml` and the two entry scripts; owner ruling
+47bd37e025174c66 narrowed it from all of `src/`, so an early local run of
+unrelated code does not cost the clock). Git runs with `--no-optional-locks`,
 so the hourly read never takes the index lock a deploy needs. Since schema 2
 ("conservative unknowns", rules in `memory/graph_census_proof.py`) a server's row
 is clean only when three more things are PROVEN, each derived the way that
@@ -431,7 +448,11 @@ only memory servers:
   loaded;
 - any other python process on main's venv (found by its absolute interpreter
   path, or by resolving a bare `python` through its own PATH): history and
-  database scope only (owner ruling);
+  database scope only (owner ruling). One that is unprovable only because it
+  runs under another Genesis home or its interpreter cannot be resolved
+  (another session's test run or one-off job) does not hold the clock while
+  its reported start is at least 2s inside the 2h30m history lookback (owner ruling
+  9931626424ee4c6c); an older one still does;
 - replay, listed as excluded because it is not live traffic (owner ruling);
 - another bridge or server beside the host, always dirty.
 
@@ -966,8 +987,9 @@ verified: a8fa35a35 2026-10-23
   `emit_bugfix_audit`) stamp origin inline. Migration 0085 backfills historical rows. On the
   READ side, the LAUNDERING-CRITICAL surfaces now EXCLUDE external/unknown-origin content
   (fail-closed: `origin_class IN ('owner','first_party')`, NULL excluded) —
-  `essential_knowledge._recent_decisions` + `_active_session_pivots` (the always-loaded L1
-  file), `reflection.gather_evaluation_context` (×4) + `_recent_observations` +
+  `essential_knowledge._recent_decisions` (the always-loaded L1 file; its old
+  `_active_session_pivots` reader is gone, since live sessions are now shown only in the
+  session-start in-flight block, `memory/open_loops.py`, which skips external-origin rows), `reflection.gather_evaluation_context` (×4) + `_recent_observations` +
   `gather_for_calibration`, and `perception.context._build_memory_hits` + `_build_light_chain`
   (the deep-reflection/perception prompt pipeline) — severing the external→reflection→
   `first_party`-stamped-delta laundering path, with a deep-reflection prompt-rule belt and a
@@ -1437,7 +1459,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: b0867170e 2026-10-02
+verified: a6528dab2 2026-11-09
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -1456,10 +1478,24 @@ verified: b0867170e 2026-10-02
   precedence footer. A missing, unreadable, or empty component fails the scan
   closed without caching a partial prompt; a successful composite is reused
   byte-for-byte by the approval route, CC invocation, and prompt-version hash.
+  Evaluations request one model-reported Evidence section per item, preserving
+  source claims, acquired quotations or acquisition limits, current mechanism/
+  user evidence, and labelled uncertainty. The existing optional output-memory
+  extractor is unchanged and may still lose qualifications or introduce an
+  unsupported claim; evaluator evidence is not mechanical source grounding or
+  a guarantee of memory correctness. Reuse and
+  deliverable-backed BUILD/adoption boundaries are described in
+  `docs/reference/inbox-evaluation-quality.md`.
   The phase order is prompt preflight → recover pending → resume approval →
   detect → create → dispatch;
   `approval_key_stable=True` (ONE
-  site-level approval key). The refresh path folds parked files into the
+  site-level approval key). Resume consumes an approved grant before releasing
+  its awaiting row. Resume state transitions require the row to retain its
+  original `processing` status and exact awaiting-approval marker; a concurrent
+  claim, completion, supersession or new approval marker wins over the stale
+  transition. A lookup/retirement failure preserves that row and defers
+  all new/modified/retry site work for the scan, while healthy approved siblings
+  can resume after successful consumption. The refresh path folds parked files into the
   batch so approvals fire once (#914). A pending approval is HELD until the
   user resolves it (no re-ask, no age-based cancel) and is auto-cancelled only
   when *orphaned* — no live inbox row (`awaiting_approval:`/`dispatching:`)
@@ -1467,11 +1503,20 @@ verified: b0867170e 2026-10-02
   4h staleness cancel that re-detected unchanged files and nagged. Three checks
   sit between a response and the baseline: a coherence check (annotates, never
   blocks), a give-up-LANGUAGE URL-failure check, and a URL-COVERAGE check
-  requiring every scanner-recognized input URL's parsed identity to appear in
+  requiring every recognized input URL occurrence's parsed identity to appear in
   the response — that last one catches SILENT omission, which the language
   check cannot see by construction. Scheme and host case plus one leading
   `www.` are presentation variants; authority, path, query, and fragment
-  identity remain exact. Coverage
+  identity remain exact. Prompt and coverage share source-aware URL occurrences:
+  only matching unmatched wrappers in the same-line source context justify
+  removing closing delimiters, including prose parentheticals, quoted links
+  and matching backtick runs. Literal terminal punctuation and repeated tokens in different
+  contexts retain their own identities. The read-only coverage report retains
+  these occurrences too; it does not reconstruct coverage from normalized URLs.
+  An ordered proof finds the first source-frame closure; ambiguous tokens stay
+  raw and cannot supply wrapper context for later URLs.
+  The wrapper correction is scoped to this URL path; the entry's existing
+  verification stamp remains the basis for its other claims. Coverage
   is ENFORCED by default (`url_coverage_mode`, `config/inbox_monitor.yaml`;
   `shadow` observes without acting): an uncovered URL re-queues its item
   through the bounded retry lane, logging only stable opaque URL ids. It
@@ -1633,7 +1678,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: 973a0e6 2026-10-30
+verified: 6b4f275 2026-11-08
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -1763,7 +1808,11 @@ the shared banner is not an assertion about all concurrent sessions.
   discord-bot) + external codebase-memory; profile→server allowlist lives in
   `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool
   modules). `standalone_health.py` serves from `~/.genesis/status.json` when no
-  live runtime (stale-but-functional).
+  live runtime (stale-but-functional). Surplus liveness there comes from the
+  server's in-memory `surplus_dispatch` success pulse, which the status writer
+  carries in `liveness_pulses` (verified 2026-11-08): it is trusted only while the
+  file is at most 300s old (`snapshots/surplus.py` `STATUS_FILE_MAX_AGE_S`), and
+  any stale, future-dated or mistyped field reads `liveness_error`, never green.
   The optional fixed-main Serena services qualify provider 2.1.0 and MCP 2.2
   readiness; they select classic tools and reject switching or REPL capability.
   Their existing locking, per-profile limits and native stdio worktree routing
@@ -1782,6 +1831,12 @@ the shared banner is not an assertion about all concurrent sessions.
   locks. This does not activate the service or establish production capacity
   or unattended resource-failure readiness. See
   `docs/reference/codebase-managed.md`.
+  The prepared typed timer tail calls the captured original owner and accepts
+  only complete, context-bound native outcomes. GitNexus selection captures
+  Node/package metadata before reservation and confirms the pinned installation
+  only after original scope registration and admission. It uses the shared
+  native-intent seam; imported vendor files remain trusted installed inputs.
+  This wiring preserves negative readiness and does not activate indexing.
   The queue's `scripts/lib/index_marker_legacy.py` isolates malformed legacy
   artifacts in retained import receipts without replacing business failures;
   real filesystem/SQLite errors remain visible. Schema 3 atomically fans requests
@@ -1796,7 +1851,7 @@ the shared banner is not an assertion about all concurrent sessions.
   fences every automatic reconciliation/claim/launch until the later protocol
   completes. There is no readiness setter. Behind that fence, the checked
   consumer validates complete NUL list/claim/escalation acknowledgements and
-  actual child status, dispatches one provider from its authoritative claim and
+  transport status, dispatches one provider from its authoritative typed claim and
   settles the complete context. Entrypoint and freeze repository normalization
   preserve trailing newlines and collapse Linux root aliases before lock hashing.
   Retained terminal decisions replay without
@@ -1827,15 +1882,61 @@ the shared banner is not an assertion about all concurrent sessions.
   original ancestor chain. Collector read failures retain the affected physical
   hold without aborting unrelated reconciliation; publication failures propagate.
   Intent callback RuntimeError refuses child creation
-  with private diagnostics. Automatic readiness stays fenced; actual scope creation, watchdog/
-  runner wiring and recovery remain unfinished. Synthetic fixtures do not
+  with private diagnostics. Automatic readiness stays fenced; typed timer
+  dispatch and supervised recovery remain unfinished. Synthetic fixtures do not
   establish native kernel or production acceptance.
   `scripts/lib/code_intel_source.py` provides explicit captured-source diagnostics
   and a finite assembly API: Python and shell buffers match one immutable Git
   tree, and Python compilation/hashing use those same bytes with original origins.
   Private sealed handoff checks its caller-bound digest before entry compilation;
-  cached local modules refuse. This is not yet the queued shell/watchdog caller
-  and supplies no new launch, recovery or automatic-readiness authority.
+  cached local modules refuse. Service startup enters captured runner and
+  entry helpers, including the queue/availability and scope/watchdog closure;
+  only the canonical runner lock crosses its entry handoff. Optional queued
+  inputs freeze the native environment with one registered invocation slot,
+  preserving process-control environment and managed config/path/admission
+  checks. Private runtime transport is not launch authority; automatic
+  readiness stays fenced and
+  the supervised recovery caller remains separate.
+  The private CBM reporter consumes its bounded startup ACK before worker entry,
+  verifies its actual live parent and original scope, and rechecks ownership at
+  registration and native intent. Original counter baselines and fresh startup
+  OOM observations survive the handoff; either hierarchical or local sampled
+  kills refuse startup. The existing private output carries framed control
+  data, with provider output routed to logging. Watchdog/CPU/IO policy binds
+  the same source identity. The private initial-owner endpoint takes the
+  canonical locks, reserves its actual self once, owns scoped reporter and
+  monitor children, and sends ACK only after fresh child checks. Its sole
+  private cancellation-pipe writer retires the monitor through EOF. Required
+  physical control precedes blocking publication; raw waits, producer EOF,
+  monitor-group absence and original cleanup independently constrain closure.
+  Work expiry first enters the existing stop transition; final cleanup expiry
+  retains an open obligation rather than certifying completion.
+  Pending startup pressure precedes ACK, and every first stop chooses the
+  observed scope or the actual unacknowledged child. Monitor interval waits
+  wake on private EOF; manager-client cancellation and actual reaps remain
+  owned, and an unavailable client wait keeps closure open.
+  First stop intent is distinct from resolved action: failed validated attempts
+  retry inside the same original budget while children and output drain.
+  Terminal child identity retains raw wait authority without allowing terminal
+  subjects into default live scope proof. The canonical launcher reuses captured
+  literal-argument compatibility with its exact executable/environment basis.
+  Synchronous manager observations and non-atomic name-based actions retain
+  their documented trusted-manager boundaries.
+  Pre-startup stop intent fixes a two-second local drain bound clipped to work
+  expiry; accepted TERM and late group proof cannot certify closure. Transient
+  cleanup reads retry within the fixed final budget, requiring fresh proof.
+  The initial scope also requests the frozen runtime cap, zero randomized extra
+  and final SIGKILL; only its actual producer requires these effective typed
+  properties before ACK. Generic readers retain their existing contract.
+  Manager runtime enforcement survives ordinary owner return/death, but is not
+  a cleanup receipt or native qualification. Kernel/manager failure and explicit
+  trusted-manager abandonment remain limits; activation is still fenced.
+  Separate producer histories retain the first baseline and one strongest
+  actual sample across delayed delivery. Unknown closure stays open; unregistered
+  launches stay uncertain. A retained local-only kill leaves uncertainty even
+  after successful waits, without changing historical resource accounting or
+  inventing an accepted stop. Timer dispatch, GitNexus's runtime adapter, supervised
+  recovery and native qualification remain separate gates.
   `index_marker_recovery.py` adds explicit transaction-only schema-5 storage,
   original-owner control completion, persistent provider holds and an exact
   terminal/control/source acceptance-watermark reader on the same queue.
@@ -2041,8 +2142,10 @@ the shared banner is not an assertion about all concurrent sessions.
   skills and MCP servers like a terminal and registers as an owner foreground
   session. The host updates its initialized model and checkpoints existing rows
   after disconnect only when the recorded child is confirmed dead; failures
-  remain visible and leave the existing reaper as fallback. Phase 0 host:
-  `scripts/live_agent_cli.py`; only the `owner_cli`
+  remain visible and leave the existing reaper as fallback.
+  Hosts can declare `output_surface="speech"`; identity injection
+  then requests direct spoken replies without terminal model/effort headers.
+  Phase 0 host: `scripts/live_agent_cli.py`; only the `owner_cli`
   initiator may call `turn()` until model-initiated turns pass the
   autonomous-CLI approval gate. Turns the session injects itself
   (background-task notifications, peer or scheduled messages) still run, as in
@@ -2196,7 +2299,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 25f3ad876 2026-11-03
+verified: 4721e0d93 2026-11-07
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -2207,6 +2310,14 @@ verified: 25f3ad876 2026-11-03
   host reconcilers that share its version probe run on any branch).
   Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **Delivered-alert history (development candidate)**: host `alert/sent_log.py`
+  records successful alert deliveries as displayed text, with two bounded JSONL
+  generations. The read-only `sent-log` gateway and existing container ingestor
+  use a terminal success/count protocol; an unreadable generation fails the
+  whole page. Locked appends sequence timestamps within a 300-second future
+  window; inadmissible clock outliers remain on disk until eligible, with a
+  new bounded stream after a large clock reset. Host redeploy and installed
+  conversation-history verification remain outstanding.
 - **Snapshot deletion window** (`guardian/deletion_window.py`): routine
   snapshot deletions (the superseded healthy snapshot, prune, and what incus
   would expire before the next window) wait for `snapshots.deletion_window`,
@@ -2736,8 +2847,10 @@ verified: c712f1bde 2026-11-06
   idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
   one is age-based and passive. `session_awareness/repo_pulse*.py`.
-- **Post-merge verification obligations** (shipped; producer automatic, consumer
-  manual-invoke only — nothing dispatches a validator yet — issue #1718):
+- **Post-merge verification obligations** (shipped; producer automatic; consumer
+  the standing validator session, owner-started and self-paced per the
+  validating-merges skill's "Standing mode", or any manual validator; nothing
+  dispatches one automatically — issue #1718):
   the pulse worker's verification lane opens one `pr_verifications` row per
   MERGED PR, so "run the E2E after merge" survives the merge instead of living
   in someone's memory. A documentation-only diff is auto-closed with the reason
@@ -2752,8 +2865,12 @@ verified: c712f1bde 2026-11-06
   (`scripts/pr_verification.py`, with its doctrine in the `validating-merges`
   skill and its readers on `repo_pulse_worker.py`). Its picker,
   `repo_pulse_worker.py --next-for-validation`, names the ONE row to work next:
-  not-yet-done, then never-attempted, then a parked row past 7 days, never
-  fail-intent; deployed rows with an `E2E:` plan first, newest merge first. Deploy
+  not-yet-done and passing rows awaiting tracking, then never-attempted, then a
+  parked row past 7 days, never fail-intent. A not-yet-done row whose stored
+  evidence declares `no_progress` (the validator's judgment that its remaining
+  steps are the previous attempt's) waits 7 days after that attempt once its
+  tracking is complete (a `TRACKING PENDING:` last note is offered at once), then
+  returns to the front; deployed rows with an `E2E:` plan first, newest merge first. Deploy
   is merge-commit ancestry of the serving commit, except a stacked PR, which is
   kept and labelled because ancestry cannot prove it either way. It fails closed
   (picks nothing) when GitHub or git cannot answer. The verdict is DERIVED from the
@@ -3122,9 +3239,30 @@ verified: c712f1bde 2026-11-06
   a short floor (`FAILED_RETRY_FLOOR_MINUTES`) rather than the full interval —
   exempting it entirely was worse than the behaviour it replaced, since the
   uncaught raise (an unreadable DB) happens AFTER both expensive legs run.
-  Each class reconciles inside its own SAVEPOINT, so a class that raises
-  mid-DML cannot leave partial writes for the next commit on the shared
-  connection to flush while the record reports that class as not applied.
+  Each class reconciles in its own transaction, opened with `BEGIN IMMEDIATE`
+  and rolled back whole on failure, so a class that raises mid-DML cannot
+  leave partial writes for the next commit on the connection to flush while
+  the record reports that class as not applied. IMMEDIATE, not a deferred
+  SAVEPOINT: the class reads its prior rows and then writes, and a deferred
+  transaction's upgrade loses AT ONCE while the server is writing (SQLITE_BUSY,
+  or SQLITE_BUSY_SNAPSHOT once it has committed; no busy handler either way,
+  so only elapsed time separates this from a long-held writer). MEASURED
+  2026-11-07: 0 ms to the error; 24-33 runs per class frozen on "database is
+  locked", all 86 class tracebacks at a write after the read. Taking the
+  writer slot first makes the server's write wait instead (measured hold for
+  a 421-row class: median 87 ms, max 151 ms, against the 5 s busy_timeout; it
+  grows roughly linearly with rows). A class or the blindness alert that
+  still loses the lock is retried whole (3 attempts, the connection layer's
+  delays); each lost attempt is logged with its SQLite error name and timing,
+  `applied[cls].lock_retries` records retries that succeeded, and a unit that
+  gives up writes a lock-holder snapshot (`db/lock_holders.py`) and records
+  its `writer_pids` under `lock_evidence` in `last_run.json` (never in
+  `degraded`, whose text feeds the blindness alert's hash). The blindness
+  alert's own losses are a different cause: single-statement writes DO wait
+  out busy_timeout, so a loss there means a writer held the slot past 5 s.
+  A class whose rollback itself fails leaves the connection in
+  a transaction; the worker then discards that connection, skips the classes
+  not yet reconciled, and finishes the run on a fresh one.
   Untrusted text reaching a MODEL: a branch identity is the ack key and is
   emitted VERBATIM, paired with a neutralised `branch_display` and an
   `identity_unrenderable` flag. `check-ref-format` bans control characters but
@@ -3201,7 +3339,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 3e27b4794 2026-10-23
+verified: 5be8573a5 2026-11-07
 ```
 
 - **eval/ego_runtime**: opt-in canonical proposal-operation probes using fresh
@@ -3245,7 +3383,13 @@ verified: 3e27b4794 2026-10-23
   Status reads confined snapshot metadata and reports individual source stat or
   fingerprint errors while continuing; bounded SQL previews and streaming CSV
   preserve full query counts without retaining every result row in Python.
-  Scheduling arrives in a dependent change. Additional backup
+  Source evidence validates the selected original block's ID/hash and reports
+  ambiguous reused IDs without choosing an owner. Its regular-file reader bounds
+  physical records at 1 MiB, withholds oversized/recursive context and reports
+  oversized targets unavailable while retaining search rows and original files.
+  Applicable result envelopes retain their hash eligibility and are scrubbed.
+  Scheduling arrives in a
+  dependent change. Additional backup
   and recovery integration is deferred independently of collection and search.
   Unknown historical content is excluded from content metrics. Views version 24
   preserves missing call/result hashes as unknown and admits ownership from the
@@ -3438,7 +3582,10 @@ verified: 3e27b4794 2026-10-23
   See `docs/reference/qualification-corpus.md`.
   Qualification's pinned transport supplies a caller-provided adapter router
   through the production delegate, a shared one-egress wire guard, response-hook
-  durability and exact lexical Decimal GET billing. Documented selected-route
+  durability and exact lexical Decimal GET billing. Frozen gateway `model`,
+  optional `backend_model` and `receipt_model` keep namespace-specific exact
+  matching; omitted pins retain strict legacy IDs, with no inferred aliases or
+  migration of stopped campaigns. Documented selected-route
   metadata is checked on live acceptance and replay; gateway response caching
   is explicitly disabled. Contradictory served identities retain unresolved
   liability, while expense settlement cannot qualify invalid routing evidence.
@@ -3538,6 +3685,11 @@ verified: 3e27b4794 2026-10-23
   pinned monolith invocation, retaining outer context/probe/backoff/wake code.
   Thirteen cases/fifteen wakes/thirteen native sessions plus reader correlations
   require actual state, bytes, run attribution, context and pacing evidence.
+  Command cleanup is measured through task-local group-closure records for
+  version discovery, setup, appends, wakes, history and correlation readers;
+  missing, live or unverifiable scopes cannot pass. Verified container init
+  identity and before/after census additionally reject unexpected survivors.
+  This stamp refresh covers that developer-evaluation cleanup slice only.
   Integration requires its actual post-review CI report. Tiered memory is off,
   deterministic related context remains on, and only the protected MCP effect is
   exposed; no full runtime, dispatcher or capability parity follows. See
@@ -3948,14 +4100,50 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
-          env.py, _config_overlay.py, caller_context.py, caller_credentials.py]
-verified: 973a0e6 2026-10-30
+          env.py, secrets_location.py, _config_overlay.py, caller_context.py, caller_credentials.py]
+verified: 5a3de4eee 2026-11-08
 ```
+
+Scoped verification: the caller identity boundary only. Shared mode refuses
+process-environment identity through both accessors, including after environment
+drift; validated requests use `caller_context()`. Legacy reads remain raw and
+per-call. This does not requalify the remaining platform/data subsystems or
+activate shared MCP.
+
+A 2026-11-07 verification at the same commit covers the request-ownership
+prerequisite below; the other platform descriptions retain their individually
+cited verification dates.
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
 provider/model/outcome. Failed historical attempts render as a warning, not an
 inferred current provider outage. The readiness worker uses the shared
 tool-disabled CC probe without changing its schedule or routing authority.
+
+`util/codex_cli.py` is the only place under `src/genesis` that names the Codex
+CLI. Its `codex_exec_argv`/`codex_child_env` give every Codex run Genesis
+starts unattended (the executor's adversarial verifier, the contribution
+reviewer) a child environment from `caller_context.dispatched_child_env`:
+`GENESIS_CC_SESSION=1`, supervised marker dropped, origin kept.
+`tests/test_codex_dispatch_marker.py` fails on a `codex` literal anywhere else.
+The marker is inert until the Codex project config forwards it to the Genesis
+MCP launcher; it exists so an unmarked Codex run can mean the owner's own
+client, as an unmarked Claude Code session does.
+
+Tool calls from a labelled client (`GENESIS_CALLER_PROFILE`, read into
+`CallerContext.profile`; owner-mode Codex sets `codex`) are logged to
+`client_tool_calls` by `observability/client_call_log.py`, which
+`install_instrumentation` puts on all four servers and which reads
+`caller_context()` per call: client, server, tool, start time, `outcome`
+(`returned`/`raised`/`cancelled` — how the call ended, not whether the tool
+succeeded), and the written row's id for an allowlisted set of writer tools.
+Never the arguments. The write runs after the call on its own connection,
+shielded from cancellation; a failed or skipped write (no database file, table
+not migrated yet) is a warning that never changes the tool result. Credential
+lookups stamp the same label into `credential_access_log.client` server-side.
+Retention: `scripts/prune_client_tool_calls.py` (default 180 days) from disk
+hygiene. Unlabelled calls, which include every Claude Code session, log nothing.
+Credential values returned through `knowledge_recall`/`memory_recall` are still
+not in `credential_access_log` (#3983 removes them from those paths).
 
 Fresh dedicated validator-health trackers disable new activity persistence
 before DB attachment, retaining memory metrics and historical provider SELECTs.
@@ -4123,9 +4311,29 @@ Refusing a proposed update preserves a previously valid opt-in.
   foreground-only construction allocates neither. Background admission is
   separate from foreground capacity; recall queue pressure falls back inline
   while shutdown refuses new resource work (source checked 2026-11-06).
+  `begin_draining`/explicit-grace `drain` extend the same registry; `close`
+  initiates zero-grace shutdown and concurrent callers join the first policy.
+  `run_in_thread` retains actual synchronous completion independently of an
+  asyncio proxy, including joined-child work, before DB finalization/admission
+  release. Ambiguous submission/canceled-before-start work retains its claim and
+  fails shutdown; dependent provider closure requires positive settlement.
+  `run_resource_thread` preserves ordinary legacy thread cancellation. These are
+  internal prerequisites; the nine memory-consumer thread boundaries use them,
+  while shared factory wiring remains separate. Lease budgets bound database
+  connections, not executor items.
   Activity, embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
-  legacy connections keep ordinary task scheduling. Service integration remains
-  a separate prerequisite before shared activation. See
+  legacy connections keep ordinary task scheduling. Internal
+  `initialize_request_service` bootstraps memory/health/recon/outreach with
+  mandatory request middleware even without metrics, awaits outreach schema,
+  and refuses a separate memory read pool, an omitted memory bookmark policy,
+  a dependency holding another database, and detached work (memory or a
+  persisting tracker) without background budgets. Its tracker is bound and optionally
+  warmed once by the owning bootstrap; registration cannot rebind pending flushes
+  or duplicate history. Scoped health supports the standalone status-file service,
+  rejecting runtime snapshot sharing before changing registration. Reinitialization
+  replaces obsolete instrumentation in either DB mode. No CLI or transport
+  selects it yet; caller identity, bookmark policy and shared activation remain
+  separate work. See
   `docs/reference/request-database.md` for lifecycle and failure semantics.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Every
@@ -4137,6 +4345,21 @@ Refusing a proposed update preserves a previously valid opt-in.
   the run (run includes SQLite's busy-timeout wait and lock-retry backoff), the
   outcome (ok / cancelled / error) and what it was stuck behind — rate-limited
   per label and outcome to one line per 60 s unless a repeat is twice as slow.
+  The GAP between statements is timed separately by `db/_txn_hold.py`: a
+  `SerializedConnection` write transaction held open at least
+  `GENESIS_SQLITE_TXN_HOLD_MS` (default 1000, `0` = off) from its first write
+  to its commit or rollback logs `sqlite txn held: …` naming the opening
+  statement, the crud site and the non-`genesis.db` origin that issued it, the
+  asyncio task, what closed it, and `loop_lag=yes|no` (same rate limit). It
+  tests the hypothesis that such gaps are how the server holds the writer slot
+  past other processes' 5 s busy_timeout while every statement is fast:
+  MEASURED 2026-11-07, the server was the only process holding the slot for
+  0.5 s or more (96 of 96 holds in 20 min, max 2.55 s), and its event loop
+  stalled 5 s or more 13 times in two days. Under `loop_lag=yes` the opener is
+  a bystander and the stalled frame in the `loop-stall` log is the cause.
+  Coverage is `SerializedConnection` only: owned `get_raw_db` connections
+  (e.g. the knowledge batch's `BEGIN IMMEDIATE` envelope) are not observed, so
+  no line does not clear them.
   When a lock outlives the retry budget (`DB lock persisted through N attempts
   … giving up`, or a lock error on the unretried `executescript`),
   `db/lock_holders.py` records local failure context, then samples the kernel
@@ -4484,7 +4707,15 @@ Refusing a proposed update preserves a previously valid opt-in.
   marker only while holding `locks/update.lock`; the routes also run the `live`
   check under it and remove a marker only when its holder is dead or theirs.
   Exception: `bootstrap.sh`'s crash recovery still removes it unconditionally.
-  `secrets_path()` is repo-relative unless SECRETS_PATH set.
+  `secrets_path()` delegates to the stdlib-only `secrets_location.py`, mirrored
+  by `scripts/lib/secrets_path.sh`: `SECRETS_PATH` wins; otherwise an existing
+  `~/.config/genesis/secrets.env` wins over the checkout and `~/genesis`
+  legacy files. With no file, the default is still the checkout's file; the
+  default switch, the unit files and creating the home config are the
+  migration's. Missing credentials at startup queue a critical alert. Guardian
+  check/restore and passphrase resolution, the graph census proof, disk
+  hygiene's store knobs and the eval loaders all take that one answer, and the
+  secrets guard protects the home-config file, its folder and their aliases.
 - **Managed systemd user units** (deploy scripts, no `src/genesis` module):
   `bootstrap.sh` renders `scripts/systemd/*.template` and `setup-vnc.sh`
   renders `scripts/systemd/vnc/` into `~/.config/systemd/user`, both through
@@ -4681,8 +4912,8 @@ Refusing a proposed update preserves a previously valid opt-in.
   `update_refused.json`.
   The rebuilt tip is recorded in the "merging" row as soon as it is adopted.
   **The live-move repair** (`scripts/lib/live_move_repair.py`, #3492 PR D1;
-  `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS] [--explain]`;
-  the module itself also takes `--restore TS --check`, below
+  `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS | --restore TS
+  [--check]] [--explain]`; `--restore`, below
   runs the copy bootstrap installs under `~/.genesis/lib/live-repair/current`,
   never the checkout's; installing that kit, and running the repair at every
   server start, is PR D2, not yet built; `--explain` needs no kit: with none
@@ -4696,7 +4927,11 @@ Refusing a proposed update preserves a previously valid opt-in.
   a process holds it, then saved into the backup's `git/` and removed by one
   step, on every path that ends healed; a same-user process whose open files
   cannot be read counts as a holder only if it is a git or the lock is under
-  30 s old, so a non-git process that cannot be inspected and holds a lock
+  30 s old, is not exiting (the kernel's PF_EXITING flag: such a process
+  runs no user code again), and stays the same process, still unreadable,
+  across three re-checks about 0.15 s apart, so a git that is passing through
+  does not keep a stale lock (#4001; `stale_index_lock.py` applies the same
+  rule); a non-git process that cannot be inspected and holds a lock
   longer than that has it judged stale), every path of the two-dot diff, plus
   a symlink or non-directory parent of one (nothing is read or removed through
   such a parent), plus every index entry under one of those and every index
@@ -4720,8 +4955,7 @@ Refusing a proposed update preserves a previously valid opt-in.
   recorded by type and mode. The writer generates NO shell (#3868, #3869,
   #3492 B2a): `reapply` stays `[]` for older readers, and the report, its
   output and its alert name `scripts/deploy_candidates repair-move --restore
-  <ts>` (`--check` first), which puts nothing back until the restore lands
-  (B2b). Every saved copy is recorded in `SAVED.json` beside `REPAIR.json`
+  <ts>` (`--check` first), the restore below (#3492 B2b). Every saved copy is recorded in `SAVED.json` beside `REPAIR.json`
   (which names it as `integrity`): a regular file's sha256 (computed while
   copying; `null` over 256 MiB, the restore check's per-file budget) and the
   mode the checkout had, a symlink's target, a FIFO's mode; bounded at
@@ -4775,15 +5009,23 @@ Refusing a proposed update preserves a previously valid opt-in.
   counts, flag-only and deleted ones too; no other row field is read), a result enum (`healed`,
   `healed-kept`, `unresolved`, `superseded`, `unfinished`, else `unknown`: no
   report string reaches the snapshot, the alert text or the alert key),
-  `dismissed` and `unresolved`; `live_repair_saved:<n>` sums the reports not
-  `--dismiss`ed. It loads the repair's module once per snapshot when any
+  `dismissed`, `unresolved` and `restore_refused` (the parts its last restore
+  refused); `live_repair_saved:<n>` sums the reports neither `--dismiss`ed nor
+  cleared by a restore (its `restore.restored_at` a string and
+  `restore.refused` an int, never a bool, of 0). It loads the repair's module once per snapshot when any
   report dir exists (a module that cannot load, or lacks a name the reader
   uses, reads every report as refused and blanks nothing), and a linked worktree reads none. The awareness paragraph
   names, per undismissed report with saved paths, its backup folder,
   `scripts/deploy_candidates repair-move --restore <ts>` (once both the
-  installed repair kit and `scripts/deploy_candidates` include it) and `--dismiss <ts>`, says a restore leaves
-  uncommitted edits the deploy scripts refuse, and that backups are pruned 90
-  days after the last write to their folder; it escapes any text a database
+  installed repair kit and `scripts/deploy_candidates` include it; an exit 2
+  "not available yet" means an older kit) and `--dismiss <ts>`, says a
+  restore leaves uncommitted edits (tracked ones block deploy_code_only.sh and
+  update.sh, untracked ones deploy_code_only.sh only under `src/`, `config/` or
+  `pyproject.toml`), that backups are pruned 90 days after the last write to
+  their folder, and, for a report whose last restore refused parts, that its
+  output names each and that a part it can never write goes back by hand from
+  the folder's `tree/`, then `--dismiss`; the guardian's diagnosis shows the
+  newest report's `restore.restored_at` and `restore.refused`, quoted; it escapes any text a database
   column cannot hold rather than losing the alert, and is replaced whenever
   the reports it names change. `GET /api/genesis/health` reduces
   `live_repairs` to an allow-list of its counts for a caller without the
@@ -4801,23 +5043,19 @@ Refusing a proposed update preserves a previously valid opt-in.
   nothing written), so it cannot race a restore's own rewrite. `scripts/
   deploy_candidates repair-move --restore TS [--check]` passes through to the
   kit. `live_move_repair.py --restore TS
-  --check` (#3492 PR B1; restoring itself is PR B2, and until then `--restore`
-  without `--check` exits 2) is the read-only judge of what a restore would
+  --check` (#3492 PR B1) is the read-only judge of what a restore would
   write, in a second kit source, `scripts/lib/live_move_restore.py`, loaded
   from the kit's own directory like the guard. It takes the repair's locks in
   the repair's order with a short wait (30 s; `--wait` honoured) and exits 1
-  while any is held, or while the guard calls the checkout `mixed_tree`. It
-  reaches `deploy-backups` by an fd opened from the resolved home without following
+  while any is held (naming the pid the update state records, if any), or
+  while the guard calls the checkout `mixed_tree` or `guards`. It reaches
+  `deploy-backups` by an fd opened from the resolved home without following
   a link and reads everything after through that fd; that folder and every
   node of the report dir (at most 200,000, never through a link) must be
   this user's, and every one but a symlink without group or world write,
   else the whole report is `other:not-owned <path>`, before `REPAIR.json` is
   parsed (a writer with this user's uid is out of scope: it can already edit
-  the checkout). A report with a node part below another (the writer never
-  writes one) is `other:bad-report`, and one with no integrity record is
-  judged with a note that a restore refuses it. Every git call of the repair
-  and the check runs with `core.fsmonitor=false` and
-  `core.hooksPath=/dev/null`. It
+  the checkout). It
   first refuses the whole report if a row is not exactly what the writer
   writes (relative paths outside `.git`, at most 4,096 bytes, the sum of
   length x depth over the rows within the report byte cap; git modes and
@@ -4837,31 +5075,161 @@ Refusing a proposed update preserves a previously valid opt-in.
   every foreign row (its node, only where the repair changed and could reach
   it; its index entries, only where they differ from the tag's; its flag) is
   printed as `as-left` (the tag's state: the repair's), `already-restored`
-  (the saved state) or `other:<reason>`. An as-left part counts as restorable
+  (the saved state, every saved copy it compares still the one `SAVED.json`
+  records) or `other:<reason>`. A saved copy stands for its record's mode,
+  the one the restore writes (a file's executable bit read as the repair reads
+  it, S_IXUSR; a FIFO's without setuid, setgid and sticky), never the copy's
+  own, so a copy chmodded after the repair changes no verdict. An as-left part counts as restorable
   only while HEAD's entries at, below and above the path equal the tag's
   (`changed-upstream`), the index there equals the tag's except at rows
   already restored (`index-changed`), no index entry sits at a parent, no
   parent is a symlink or a non-directory, and no newer report holds an
   overlapping path. A parent that is this report's own row, already put
-  back, refuses none of these for its child (the writer's steps run parents
-  first, so a restore killed between them still converges). A symlinked or
+  back, refuses none of these for its child (so a restore stopped between
+  them still converges); nor does an index entry at a parent that is the
+  tag's, as the repair left it, on a row that saved something else there (the
+  restore's one index call replaces it, under the footprint check below), or
+  a directory row's path still holding the tag's non-directory, for a row it
+  covers (index and flag parts only; the restore writes the directory first). A symlinked or
   non-directory parent is decided before anything below it is read, and no
   directory, in the checkout or the backup, is walked through a link. A tag
   directory is compared on the tag's own paths only (an untracked cache in it
-  changes no part), and only for a node part. An index part whose blob is
+  changes no part), and only for a node part; the restore's own gate is
+  stricter (it moves the whole directory aside): every other file there must
+  be one git ignores (once moved aside, by the rules that moved with it: a
+  rule inside the directory decides, read in the aside, else the checkout's
+  outside it; and, as git does, nothing below a directory excluded by either
+  is re-included by a rule inside it, each directory asked with `--no-index`,
+  since one holding tracked files matches no rule otherwise, MEASURED on git
+  2.43). A restored directory with extras git ignores (the
+  server's `__pycache__`) still reads already-restored. An index part whose blob is
   neither saved (a regular `index-blobs/<oid>` hashing to it) nor in the
   object store is `other:not-saved`. Every file is hashed in 1 MiB chunks
   from an fd opened without following a link or blocking on a FIFO, and only
   while it is still the file its lstat saw. One check hashes no file over
   256 MiB, at most 2 GiB in all, and looks at most at 200,000 nodes; a part
   that would read past that is `other:too-large`. A symlinked or non-regular
-  lock file is refused by name, never followed. A directory row is never restored whole:
-  its `entry` parts are the saved files whose bytes are not the move target's
-  (only the foreign rows themselves when the target cannot be read); sockets
-  and devices are `other:cannot-make`. Exit 0 only when every part is as-left
+  lock file is refused by name, never followed. A directory row's `entry`
+  parts are the saved files whose bytes are not the move target's, or whose
+  copy is not the one `SAVED.json` records (so a copy changed to the target's
+  bytes is staged, and refused, never left out as the update's); only the
+  foreign rows themselves when the target cannot be read; sockets
+  and devices are `other:cannot-make`. A saved directory whose `SAVED.json`
+  says `complete: false` is `other:no-hash`, a part that goes back by hand: a
+  copy it never recorded and the backup lost since cannot be seen, so the
+  directory could be built without it. Exit 0 only when every part is as-left
   or already-restored. It writes no report and no backup; like the repair, it
   creates `locks/update.lock` and `.git/genesis-checkout.lock` when they are
   missing.
+  **The restore** (`--restore TS` without `--check`, #3492 PR B2b, a
+  third kit source, `scripts/lib/live_move_restore_write.py`, which uses the
+  check's judge; the check stays in `live_move_restore.py`) passes the same gates (and refuses a report
+  with no `SAVED.json` whole, `other:no-integrity`, and one with a node part
+  below another, `bad-report`), judges every part once under the held locks
+  with the stricter gate, and writes only parts judged `as-left`; it never
+  restarts anything. Each node part, the one `REPAIR.json` names in flight
+  first: STAGE the saved node in a run folder
+  `deploy-backups/<UTC time>-<pid>-live-move-restore/new/<path>` (made 0700 at
+  the first write; each file copied with its sha256 checked against
+  `SAVED.json`, else `other:hash-mismatch`, a missing record
+  `other:no-hash`, a null hash `other:too-large`; its mode the record's &
+  0o777, so setuid, setgid and sticky never come back; a directory row built
+  whole without the update's own files; a FIFO from its row's or record's
+  mode); record the part in flight; move what is at the path to
+  `<run>/aside/<path>` (folders made 0700); judge the aside again, each such
+  read on a budget of its own, never the one judging every row spent (a write
+  since the judge is put back and the part refused
+  `changed-during-restore`); put the staged node in with
+  `renameat2(RENAME_NOREPLACE)` through ctypes (the one move it makes, for
+  every kind and the put-back, so nothing that appeared meanwhile is ever
+  replaced); judge the aside once more (a write through an open fd is named);
+  clear the in-flight record. A run killed between the put-in and that
+  judgment leaves it to the next: the part `REPAIR.json` names in flight
+  reads already-restored only while its aside is still what was moved there,
+  else `other:changed`, naming the aside (`--check` too). The in-flight
+  record is cleared only once its part is back or its aside holds nothing
+  the restore did not move there: while the in-flight part's aside holds
+  anything else (a write after the move, through an open fd), unless that
+  part read already-restored or as-left by the resume rule (both judged the
+  aside itself), the record is kept, and since it has one slot no other part
+  is written (`other:inflight-unresolved`, naming the aside, in `--check`
+  too; the in-flight part too, when its path holds the tag's state again), so
+  every run names it and exits 1 until what is there is moved out. An aside
+  still holding the repair's own as-left copy (the part refused by a gate
+  after a kill, or a put-back that failed) holds nothing back; that one read
+  has its own budget. Moving the content out releases the other parts, and
+  the in-flight path is then judged by what it holds: the saved node a kill
+  after the put-in left there reads already-restored; a path a kill after
+  the aside left empty, or one holding whatever appeared there after a failed
+  put-back, goes back by hand, or the report is `--dismiss`ed. Every checkout-side call goes through directory
+  fds opened one component at a time without following a link; a missing
+  parent is made with `mkdir`, one at a time. `EXDEV` refuses the part
+  `other:cross-device` and an unsupported RENAME_NOREPLACE (`EINVAL`,
+  `ENOSYS`) `other:no-noreplace`, at the aside or the put-in, with nothing
+  moved; there is no copy fallback. Then the index parts whose node (if any)
+  is back go in ONE `git update-index -z --index-info` call: the saved blobs
+  the object store lacks are written back first (each must hash to its
+  name), and the whole index is read once right before the call; a part
+  whose footprint (its path; for a stage-0 entry also every entry below it
+  and a file entry at a parent, git's directory/file rule, MEASURED) holds an
+  entry that is not one of this report's rows as the judge read it is
+  refused `changed-during-restore`, a stage-0 part with a refused row below
+  it `child-refused`, one whose footprint holds a flag (read with the index)
+  that the restore does not set again after the call `other:flag-changed`
+  (the call re-creates entries unflagged), and the footprint is dropped explicitly. A row
+  whose index part is already back can sit in that footprint (an unmerged entry
+  below a stage-0 file, which git keeps beside it, MEASURED on git 2.43): its
+  saved entries are written again in the same call, never dropped. After the call
+  the WHOLE index must be the one expected (those entries included), else every index part
+  `index-skipped`, naming `<run>/index-before.txt`, where the footprint's
+  entries from before the call were written (0600, `ls-files -s -z` records)
+  before it ran; an index part runs only when the node part of its path and of
+  every parent is back (`row-refused` otherwise, so a covered child waits for
+  its directory row); a failing call (a session's git holding `index.lock`)
+  refuses them `index-locked`. Flags go after the call (S skip-worktree, a
+  lowercase tag assume-unchanged, s both: skip-worktree first, so the S a run
+  killed between the two leaves reads as-left; a failure `flag-failed`), each
+  only on the entry the judge read or the index call wrote, the index read
+  once right before them (one a session staged since is `changed-during-restore`,
+  never flagged; the same milliseconds residual as the index call), then one
+  `update-index -q --refresh`, then a second judge that must read
+  already-restored for every part written, and for a flag or an index part
+  already restored whose entry the index call replaced (else `post-check`).
+  `REPAIR.json` gets a `restore` block, `{inflight: [run, path, "node"] |
+  null, refused: <int>, restored_at: <str> | null}` (no per-part list; the
+  output carries those), rewritten under update.lock after a re-read;
+  `restored_at` only when nothing was refused, and a re-run that changes
+  nothing writes nothing. A failure to write it stops the run, naming the
+  part in flight and the run folder. The resume rule lives in the judge, so
+  `--check` agrees: a node part reads `as-left (interrupted restore ...)`
+  when the in-flight record names it, its path is absent, the run folder and
+  every folder the restore made under its `aside/` are this user's with mode
+  0700 (the aside itself, the checkout's own node, only owned), and the aside
+  is the as-left state; an aside that is not names where that newer content
+  is. The output gives one line per part (`restored`, `already-restored` or
+  `refused:<reason>`, with a note where things are), a summary, the restored
+  paths and what they now block (tracked edits: deploy_code_only.sh and
+  update.sh; untracked ones: deploy_code_only.sh, only under `src/`,
+  `config/` or `pyproject.toml`), the run folder (pruned 90 days after its
+  last write), the ignored files a directory moved aside held, and for a
+  part it can never write (`cannot-make`, `target-unreadable`, `too-large`,
+  `no-hash`) to put it back by hand from the report's `tree/`, then
+  `--dismiss`. Exit 0 when nothing was refused, else 1. Residuals, named: a
+  session's git that stages in the milliseconds between that full index
+  read and the call (git has no compare-and-swap for the index; owner
+  ruling: accepted); disk_hygiene's prune takes no lock, so a report over 90
+  days old can vanish mid-restore (reads then fail, each part checks its
+  staged copy first, nothing half-written); a same-uid writer can forge a
+  report; a filesystem without RENAME_NOREPLACE, or a home on another
+  filesystem than the checkout, refuses every node part by name; a resume can
+  undo a deletion a person made between the put-in and its record; a
+  restored `.gitignore` of `*` hides extras in its directory from the
+  already-restored check; a saved directory's empty subdirectories are not
+  rebuilt (they stay in `tree/`); a server importing from a directory moved
+  aside fails there until it restarts; every git call of the repair and the
+  restore runs with `core.fsmonitor=false` and `core.hooksPath=/dev/null`, but
+  a clean filter a `.git/config` driver and `.gitattributes` name still runs on
+  the closing `--refresh`, as in any git call in that checkout.
   `--post-merge` on `live` never runs the engine. What is recorded and sent to
   the host guardian is the origin/main commit `live` is built on.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
@@ -4876,7 +5244,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 702274dfe 2026-11-05
+verified: 81bbdb0a9 2026-11-08
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -4944,6 +5312,11 @@ verified: 702274dfe 2026-11-05
   evidence, and returns control to the user without native approval or Genesis
   lifecycle registration. It does not enforce the future reflection gates or
   cover arbitrary indirect execution. See `docs/reference/codex-review-stop.md`.
+  The shared budget accepts issue-comment churn between its two reads only when
+  both complete policy projections are successful and identical. Counts,
+  confirmation consumption, findings, reflection keys, marks and reviewer
+  attribution participate; real policy changes still return unknown, and an
+  exhausted budget still requires approval. Head/review/ancestry checks remain.
   A separate, inactive `scripts/hooks/codex-validator-adapter` translates native
   validator calls to the existing guards concurrently. It requires an absolute
   Bash cd/exit opener terminated by a newline, confines patches to validator
@@ -4971,6 +5344,14 @@ verified: 702274dfe 2026-11-05
   Explicit login accepts `--device-auth` for headless authentication.
   Inspection/run disable account-connected Apps through fixed CLI arguments
   and verify that effective setting, retaining the exact two-server boundary.
+  A contained compatibility workflow extends the existing native fixture driver
+  for explicitly handled app-server requests and freezes its source/binary/case
+  manifest before execution. It checks native command approval, canonical guard
+  ask versus denial, resume, required MCP failure, dispatched provenance and
+  ready-descendant cleanup with synthetic loopback responses and harmless
+  effects. Independent copied-artifact readback refuses incomplete or stale
+  evidence; no production provider, native auth, lifecycle enrollment or live
+  policy is added. See `docs/reference/codex-native-harness.md`.
   Interactive native qualification records a Codex0.166.0 reference binary.
   The launcher warns on other recognizable versions and retains its startup
   inspection/refusal checks; those inspect state, not actual tool denial.
@@ -4978,13 +5359,19 @@ verified: 702274dfe 2026-11-05
   It supplies no service/timer wiring, copied credentials, deploy authority or
   lifecycle enrollment. See `docs/reference/codex-validator-launcher.md` for
   operator commands, source inventory, permitted MCP startup effects and races.
-  Codex has a separate external-client adapter in `.codex/config.toml`: it
-  starts the existing standalone health and memory MCP servers through a
-  launcher that scrubs inherited Genesis session identity, provenance,
-  supervision, slot, and trace context, then allowlists health plus explicit
-  recall tools. The launcher also selects `--external-client`; memory initialization
-  then disables processing of Claude's pending plan-bookmark file. Ordinary
-  Genesis memory initialization keeps that processing enabled by default.
+  Codex's project config (`.codex/config.toml`) starts all four Genesis MCP
+  servers through `scripts/codex_owner_mcp.py`, which reuses the external
+  launcher's environment scrub and main-checkout resolution. An unmarked Codex
+  run is the owner's: the ordinary bootstrap, every tool, labelled
+  `GENESIS_CALLER_PROFILE=codex` (calls logged to `client_tool_calls`); read
+  tools are pre-approved in the config and every other tool prompts, new ones
+  included. A run Genesis starts unattended (`util/codex_cli.py` sets
+  `GENESIS_CC_SESSION=1`, forwarded through `env_vars`) gets
+  `--external-client` and the health/recall floor, and no outreach or recon
+  server. Memory initialization skips Claude's pending plan-bookmark file for
+  both: the external profile through `process_pending_bookmarks=False`, a
+  labelled caller per call. Ordinary Claude Code memory initialization keeps
+  that processing enabled.
   The standalone server enforces the `external` or `validator` tool profile
   during discovery and direct calls. External retains its health/recall floor;
   validator additionally admits memory_store, eligible private follow-up CRUD

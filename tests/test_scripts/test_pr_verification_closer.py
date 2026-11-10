@@ -28,6 +28,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import shlex
+import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -59,6 +63,8 @@ def _no_real_github(monkeypatch):
         return PrMetadata(MERGE_SHA, "")
 
     monkeypatch.setattr(_prv, "gh_pr_metadata", fake)
+    from genesis.session_awareness import pr_tracking
+    monkeypatch.setattr(pr_tracking, "public_receipt", lambda *a: "synthetic task covers concern")
     return calls
 
 
@@ -169,7 +175,33 @@ def _row(db_path: Path, *, repo: str = REPO, pr: int = 7) -> dict | None:
     return asyncio.run(go())
 
 
-def _run(tmp_path: Path, doc: dict, *extra: str, pr: int = 7) -> int:
+def _with_tracking(doc: dict) -> dict:
+    """Existing verdict tests supply routed work; routing tests opt out explicitly.
+
+    The public transport is mocked separately; actual receipt identity/content
+    failure cases live in test_pr_tracking and the unlinked writer regressions.
+    """
+    from genesis.session_awareness.pr_evidence import EvidenceError, parse_evidence
+    from genesis.session_awareness.pr_tracking import concerns
+
+    if "tracking" not in doc:
+        try:
+            owed = concerns(parse_evidence(doc))
+        except EvidenceError:
+            return doc  # Let the writer report the malformed request itself.
+        doc["tracking"] = [
+            dict(kind="accepted_limit", target=target, rationale="Accepted test measurement limit")
+            if concern.accepts_limit else
+            dict(kind="public", target=target, url="https://github.com/owner/repo/issues/12",
+                 quote="synthetic task covers concern", rationale="Synthetic task covers this test concern")
+            for target, concern in owed.items()
+        ]
+    return doc
+
+
+def _run(tmp_path: Path, doc: dict, *extra: str, pr: int = 7, route: bool = True) -> int:
+    if route:
+        _with_tracking(doc)
     ev = tmp_path / "evidence.json"
     ev.write_text(json.dumps(doc))
     return _prv.main(
@@ -187,6 +219,26 @@ def _run(tmp_path: Path, doc: dict, *extra: str, pr: int = 7) -> int:
 
 
 # ── print-schema ─────────────────────────────────────────────────────────
+
+
+def test_unlinked_finding_saves_measurement_without_completing_tracking(tmp_path, capsys):
+    _seed(tmp_path / "genesis.db")
+    doc = _doc(findings=[{"summary": "a reachable timer defect", "disposition": "reported in chat"}])
+    assert _run(tmp_path, doc, route=False) == 4
+    stored = _row(tmp_path / "genesis.db")
+    assert stored["status"] == "open"
+    assert stored["verdict"] == "pass-mechanical"
+    assert json.loads(stored["evidence"])["findings"] == doc["findings"]
+    assert "TRACKING PENDING" in stored["last_attempt_note"]
+    assert "TRACKING PENDING" in capsys.readouterr().out
+
+
+def test_pending_tracking_retains_measurement_before_close_only_e2e_gate(tmp_path, monkeypatch):
+    _seed(tmp_path / "genesis.db")
+    monkeypatch.setattr(_prv, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: run timer"))
+    doc = _doc(findings=[dict(summary="timer defect", disposition="not yet filed")])
+    assert _run(tmp_path, doc, route=False) == 4
+    assert _row(tmp_path / "genesis.db")["verdict"] == "pass-mechanical"
 
 
 def test_existing_cli_close_stores_rechecks_without_a_new_caller_argument(tmp_path):
@@ -330,6 +382,8 @@ def test_no_open_row_refuses_and_points_at_the_backlog_reader():
         _prv.resolve_repo([], 7, None)
     assert "no OPEN row for PR #7" in str(exc.value)
     assert "--verification-backlog" in str(exc.value)
+    # A bare `python3` may lack aiosqlite, which the backlog reader needs.
+    assert shlex.quote(sys.executable) + " scripts/repo_pulse_worker.py" in str(exc.value)
 
 
 # ── the verdict/note couplings, all before any read ──────────────────────
@@ -1016,7 +1070,7 @@ def test_the_cap_is_enforced_on_the_bytes_that_get_STORED(tmp_path, capsys):
     assert len(raw) < _prv.MAX_EVIDENCE_BYTES < len(inflated.encode()), (
         "the fixture must sit BETWEEN the two sizes or it tests the old check"
     )
-    assert _run(tmp_path, doc) == 2
+    assert _run(tmp_path, doc, route=False) == 2
     assert "serialises to" in capsys.readouterr().err
 
 
@@ -1215,6 +1269,77 @@ def test_a_not_yet_done_document_stays_open_with_the_command_as_its_note(tmp_pat
     out = capsys.readouterr().out
     assert "STAYS OPEN" in out and "run the commands above" in out
     assert "None" not in row["last_attempt_note"]
+
+
+def _candidates(db_path: Path) -> list[int]:
+    """Picker result at the instant of the row's last attempt."""
+    now = _row(db_path)["last_attempt_at"]
+
+    async def go() -> list[int]:
+        from genesis.db.crud import pr_verifications as crud
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            rows = await crud.list_validation_candidates(conn, now=now)
+            return [r["pr_number"] for r in rows]
+
+    return asyncio.run(go())
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_the_schema_accepts_a_boolean_no_progress(value):
+    validate_evidence = _prv.validate_evidence
+
+    assert validate_evidence(_doc(gaps=[UNDONE_GAP], no_progress=value)).no_progress is value
+    assert validate_evidence(_doc(gaps=[UNDONE_GAP])).no_progress is False
+
+
+@pytest.mark.parametrize("value", ["true", 1, None, "yes"])
+def test_the_schema_refuses_a_non_boolean_no_progress(tmp_path, value):
+    from genesis.session_awareness.pr_evidence import EvidenceError
+
+    with pytest.raises(EvidenceError, match="no_progress"):
+        _prv.validate_evidence(_doc(gaps=[UNDONE_GAP], no_progress=value))
+    _seed(tmp_path / "genesis.db")
+    assert _run(tmp_path, _doc(gaps=[UNDONE_GAP], no_progress=value)) == 2
+
+
+def test_print_schema_carries_no_progress_as_a_real_bool(capsys):
+    assert _prv.main(["print-schema"]) == 0
+    assert json.loads(capsys.readouterr().out)["no_progress"] is False
+
+
+def test_a_declared_no_progress_says_when_the_row_is_offered_again(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    assert _run(tmp_path, _doc(gaps=[UNDONE_GAP], no_progress=True)) == 0
+    out = capsys.readouterr().out
+    after = re.search(r"declared no progress: offered again after (\S+ \S+) UTC", out)
+    assert after, out
+    last = datetime.fromisoformat(_row(db)["last_attempt_at"])
+    assert after.group(1) == (last + timedelta(days=7)).astimezone(UTC).strftime("%Y-%m-%d %H:%M")
+    assert _candidates(db) == []
+
+
+def test_an_undeclared_not_yet_done_prints_no_wait_and_stays_eligible(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    assert _run(tmp_path, _doc(gaps=[UNDONE_GAP])) == 0
+    assert "declared no progress" not in capsys.readouterr().out
+    assert _candidates(db) == [7]
+
+
+def test_the_routing_re_record_carries_the_declaration(tmp_path, capsys):
+    """Standing flow: record with tracking pending (exit 4), route, record the same
+    document again. Eligible while pending; waiting once routing completes."""
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    assert _run(tmp_path, _doc(gaps=[UNDONE_GAP], no_progress=True), route=False) == 4
+    assert _candidates(db) == [7]
+    capsys.readouterr()
+    assert _run(tmp_path, _doc(gaps=[UNDONE_GAP], no_progress=True)) == 0
+    assert "declared no progress: offered again after" in capsys.readouterr().out
+    assert _candidates(db) == []
 
 
 def test_a_note_on_not_yet_done_is_appended_after_the_commands(tmp_path):
