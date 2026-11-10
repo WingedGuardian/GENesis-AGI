@@ -4459,15 +4459,16 @@ def _analyze_bounded(
     find (see :func:`_substitution_spans`), or anywhere beneath one. The legacy
     descents are never counted, so a command the legacy scan reads costs what it
     did. Past the budget the parse stops descending and reports the over-nested
-    bound, the same fail-closed signal as the depth bound. The budget is one pass
-    over the command: a real missed substitution costs its body length, while the
-    phantom bodies a crafted command stacks level on level would multiply the work
-    (MEASURED 2026-11-10, ``analyze_checked`` on a crafted 37K-character command:
-    6.28s against 0.73s without this budget, 1.35s at most with it). The cost of the
-    tight budget is that a bare chain of four or more substitutions behind a stray
-    quote, such as ``echo "'" $($($($(ls))))``, is refused as over-nested."""
+    bound, the same fail-closed signal as the depth bound. The budget is two passes
+    over the command: a real missed substitution, and one more level inside it, fit,
+    while a crafted command that stacks bodies level on level would multiply the work
+    (MEASURED 2026-11-10, ``analyze_checked`` on crafted commands near the length
+    cap: 6.28s against 0.73s on main without this budget, at most 1.45s against
+    1.00s with it). The cost is that a chain of nested substitutions whose bodies
+    add up to more than twice the command, behind a quote only the legacy scan
+    misreads, is refused as over-nested (measured: six levels at 70 characters)."""
     if _added_work is None:
-        _added_work = [0, len(command)]
+        _added_work = [0, 2 * len(command)]
     # Past the cap, parse NOTHING. Not a prefix: truncating a command mid-string flips
     # the quoting state for everything after the cut, so a prefix parse is not a
     # partial answer, it is a confidently wrong one — and the guards match on the
@@ -4777,10 +4778,10 @@ def _quoted_substitution_spans(text: str) -> list[tuple[int, int]]:
             continue
         if c == "$" and i + 1 < n and text[i + 1] == "(":
             end = _command_sub_end(text, i, n)
-            # An unterminated body runs to the end of the text with its last
-            # character, unless that character is a `)`, which reads as the close.
-            closed = end > i + 2 and text[end - 1] == ")"
-            subs.append((i + 2, end - 1 if closed else end))
+            # Cut as the legacy scan cuts (an unterminated body loses its last
+            # character), so the two readings agree on every body they both find.
+            # An unclosed `$(` is a syntax error to bash, which runs none of it.
+            subs.append((i + 2, end - 1))
             i = end
             continue
         if c == "`":
