@@ -1,1 +1,1 @@
-Fixed: Ordinary tests isolate Guardian credential paths at collection and per-test setup.
+- Ordinary tests isolate Guardian credential paths at collection and per-test setup.
