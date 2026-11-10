@@ -3,12 +3,27 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from genesis.runtime._core import GenesisRuntime
 
 logger = logging.getLogger("genesis.runtime")
+
+
+def missing_secrets_file() -> Path | None:
+    """The secrets file's path when it is still missing, else None.
+
+    `genesis serve` asks this after bootstrap, once the startup credential
+    restore has run, and exits rather than serve when it is missing: the
+    dashboard's password lives in this file, and no password means auth is
+    disabled. A missing file is not the choice to run without one.
+    """
+    from genesis.env import secrets_path
+
+    path = secrets_path()
+    return None if path.is_file() else path
 
 
 def load(rt: GenesisRuntime) -> None:

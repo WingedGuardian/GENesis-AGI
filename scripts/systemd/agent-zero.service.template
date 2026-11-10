@@ -10,11 +10,10 @@ Type=simple
 WorkingDirectory=__AZ_ROOT__
 ExecStart=__VENV__/bin/python run_ui.py
 # One file, the one the resolver picks at render time (scripts/lib/secrets_path.sh).
-# Two files would let a key cleared in one survive from the other. The `-` turns
-# a missing file into a start without keys: genesis-server reads the same file and
-# raises the CRITICAL alert (and restores it, when a backup exists), so this unit
-# need not refuse.
-EnvironmentFile=-__SECRETS_FILE__
+# Two files would let a key cleared in one survive from the other. No `-`: a
+# missing file stops this unit, because its own authentication has not been
+# shown to fail closed without the keys.
+EnvironmentFile=__SECRETS_FILE__
 Restart=on-failure
 RestartSec=10
 MemoryMax=80%

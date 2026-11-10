@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import shlex
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -126,31 +127,38 @@ def test_the_dashboard_route_answers_a_missing_file_with_409(tmp_path, monkeypat
 
 def test_units_load_one_file_the_resolver_picks_at_render_time():
     # Loading two files lets a key cleared in one survive from the other, so each
-    # unit names exactly one, rendered from genesis_secrets_path. The `-` keeps a
-    # missing file from stopping the unit (the server alerts and self-heals).
-    for name in ("genesis-server", "agent-zero"):
+    # unit names exactly one, rendered from genesis_secrets_path. Only the server
+    # takes the `-`: it restores the file at start and then fails closed itself;
+    # agent-zero keeps the hard stop.
+    expected = {
+        "genesis-server": ["EnvironmentFile=-__SECRETS_FILE__"],
+        "agent-zero": ["EnvironmentFile=__SECRETS_FILE__"],
+    }
+    for name, lines_expected in expected.items():
         text = (REPO / f"scripts/systemd/{name}.service.template").read_text()
         lines = [line for line in text.splitlines() if line.startswith("EnvironmentFile=")]
-        assert lines == ["EnvironmentFile=-__SECRETS_FILE__"]
+        assert lines == lines_expected, name
 
 
 @pytest.mark.parametrize("renderer", ["bootstrap.sh", "install.sh"])
 def test_each_renderer_resolves_the_secrets_file_at_render_time(renderer, tmp_path):
     # Re-resolved in the render block, not reused from $SECRETS_FILE, so a move
     # earlier in the same run renders the unit to the file's new place. The real
-    # line is extracted and run, with a path holding sed and systemd specials.
+    # lines are extracted and run, with a path holding sed and systemd specials.
     text = (REPO / "scripts" / renderer).read_text()
-    line = re.search(r"^\s*(_secrets_file_esc=\$\(_sed_repl_esc .*)$", text, re.M)
-    assert line, renderer
-    esc = re.search(r"^\s*(_sed_repl_esc\(\) \{.*\})\s*$", text, re.M)
-    assert esc, renderer
+    resolve = re.search(r"^\s*(_secrets_file=\$\(genesis_secrets_path .*\))$", text, re.M)
+    escape = re.search(r"^\s*(_secrets_file_esc=\$\(_sed_repl_esc .*)$", text, re.M)
+    sed_esc = re.search(r"^\s*(_sed_repl_esc\(\) \{.*\})\s*$", text, re.M)
+    assert resolve and escape and sed_esc, renderer
     assert '-e "s|__SECRETS_FILE__|$_secrets_file_esc|g"' in text, renderer
     target = tmp_path / "a %h & | b" / "secrets.env"
     template = REPO / "scripts/systemd/genesis-server.service.template"
+    q = shlex.quote
     script = (
-        f". {REPO}/scripts/lib/secrets_path.sh\n{esc.group(1)}\n"
-        f"GENESIS_ROOT={tmp_path}; REPO_DIR={tmp_path}\n{line.group(1)}\n"
-        f'sed -e "s|__SECRETS_FILE__|$_secrets_file_esc|g" {template}\n'
+        f". {q(str(REPO / 'scripts/lib/secrets_path.sh'))}\n{sed_esc.group(1)}\n"
+        f"GENESIS_ROOT={q(str(tmp_path))}; REPO_DIR={q(str(tmp_path))}\n"
+        f"{resolve.group(1)}\n{escape.group(1)}\n"
+        f'sed -e "s|__SECRETS_FILE__|$_secrets_file_esc|g" {q(str(template))}\n'
     )
     out = subprocess.run(
         ["bash", "-euo", "pipefail", "-c", script],
@@ -159,6 +167,65 @@ def test_each_renderer_resolves_the_secrets_file_at_render_time(renderer, tmp_pa
     ).stdout
     rendered = [x for x in out.splitlines() if x.startswith("EnvironmentFile=")]
     assert rendered == [f"EnvironmentFile=-{str(target).replace('%', '%%')}"]
+
+
+class _FakeAdapter:
+    def __init__(self, **_):
+        self.calls = []
+        self._shutdown_event = None
+        self._runtime = None
+
+    async def bootstrap(self):
+        self.calls.append("bootstrap")
+
+    async def serve(self):
+        self.calls.append("serve")
+
+    async def shutdown(self):
+        self.calls.append("shutdown")
+
+
+@pytest.mark.parametrize("present", [False, True])
+def test_serve_fails_closed_when_the_file_is_missing_after_the_restore(
+    present, tmp_path, monkeypatch
+):
+    # The dashboard's password lives in the secrets file and no password means
+    # auth disabled, so `genesis serve` must exit before serving when the file is
+    # still missing after bootstrap (whose startup restore ran). Control: present.
+    import asyncio
+
+    import genesis.__main__ as entry
+    from genesis.hosting import standalone
+
+    made = []
+
+    def factory(**kw):
+        made.append(_FakeAdapter(**kw))
+        return made[-1]
+
+    path = tmp_path / "secrets.env"
+    if present:
+        path.write_text("OTHER=1\n")
+    monkeypatch.setattr(standalone, "StandaloneAdapter", factory)
+    monkeypatch.setattr(env, "secrets_path", lambda: path)
+    args = SimpleNamespace(host="127.0.0.1", port=0, no_telegram=True)
+
+    if present:
+        asyncio.run(entry._serve(args))
+        assert made[0].calls == ["bootstrap", "serve", "shutdown"]
+    else:
+        with pytest.raises(SystemExit) as exc:
+            asyncio.run(entry._serve(args))
+        assert exc.value.code == 1
+        assert made[0].calls == ["bootstrap", "shutdown"]
+
+
+def test_missing_secrets_file_names_the_path_only_when_absent(tmp_path, monkeypatch):
+    path = tmp_path / "secrets.env"
+    monkeypatch.setattr(env, "secrets_path", lambda: path)
+    assert startup.missing_secrets_file() == path
+    path.write_text("")
+    assert startup.missing_secrets_file() is None
 
 
 def test_guardian_checks_the_new_file_before_the_legacy_file(tmp_path, monkeypatch):

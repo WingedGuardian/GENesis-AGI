@@ -1768,7 +1768,14 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         # moved the file earlier in this run renders the unit to where it now is.
         # `%` doubled: systemd expands specifiers in EnvironmentFile=, so a bare `%`
         # would make the unit load a different file than the resolver picked.
-        _secrets_file_esc=$(_sed_repl_esc "$(genesis_secrets_path "$GENESIS_ROOT" | sed -e 's/%/%%/g')")
+        # Its own assignment, so set -e stops the render if it fails (inside the
+        # escape below the failure would be masked and render `EnvironmentFile=-`).
+        _secrets_file=$(genesis_secrets_path "$GENESIS_ROOT")
+        if [[ -z "$_secrets_file" ]]; then
+            echo "ERROR: could not resolve the secrets file for the unit render" >&2
+            exit 1
+        fi
+        _secrets_file_esc=$(_sed_repl_esc "$(printf '%s' "$_secrets_file" | sed -e 's/%/%%/g')")
         sed -e "s|__HOME__|$_home_esc|g" \
             -e "s|__HOME_EXEC__|$_home_exec_esc|g" \
             -e "s|__REPO_EXEC__|$_repo_exec_esc|g" \

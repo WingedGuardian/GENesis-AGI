@@ -124,6 +124,23 @@ async def _serve(args: argparse.Namespace) -> None:
         loop.add_signal_handler(sig, _signal_handler)
 
     await adapter.bootstrap()
+
+    # Fail closed on a missing secrets file. The unit loads it with `-`, so the
+    # startup restore inside bootstrap gets its chance first; if the file is
+    # still missing, serving would run the dashboard with no password, which is
+    # auth disabled. Exit 1: systemd retries it, and the restore with it, up to
+    # the unit's StartLimitBurst, then leaves the unit failed. A stopped server
+    # is the intended end state; the CRITICAL alert already queued names the cause.
+    from genesis.runtime.init.secrets import missing_secrets_file
+
+    missing = missing_secrets_file()
+    if missing is not None:
+        logging.getLogger("genesis.runtime").critical(
+            "Refusing to serve: secrets file missing at %s after the startup restore", missing
+        )
+        await adapter.shutdown()
+        raise SystemExit(1)
+
     await adapter.serve()
 
     # Orderly shutdown after serve() returns (event was set by signal handler)
