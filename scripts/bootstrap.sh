@@ -1765,7 +1765,7 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
             -e "s|__HOME_EXEC__|$_home_exec_esc|g" \
             -e "s|__REPO_EXEC__|$_repo_exec_esc|g" \
             -e "s|__VENV_EXEC__|$_venv_exec_esc|g" \
-            -e "s|__CC_BIN_DIR_EXEC__|$_ccbin_exec_esc|g" \
+            -e "s|__CC_BIN_EXEC__|$_ccbin_exec_esc|g" \
             -e "s|__VENV__|$_venv_esc|g" \
             -e "s|__REPO_DIR__|$_repo_esc|g" \
             -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \

@@ -22,6 +22,24 @@ def _monitor(prompt_dir: Path, *, watch_dir: Path | None = None) -> InboxMonitor
     )
 
 
+def test_shipped_composite_requests_calibrated_evidence() -> None:
+    """Supplemental contract guard; model replay qualifies actual compliance."""
+    from genesis.env import repo_root
+
+    prompt = _monitor(repo_root() / "src/genesis/identity")._load_system_prompt()
+    policy = prompt.split("## Skill: evaluate", 1)[0]
+    # The new section belongs to the output template, after the existing
+    # machine contract and before overlap/lenses; standalone templates are
+    # subordinate to the inbox footer and must not add duplicate sections.
+    output = policy.split("### Output Format", 1)[1]
+    assert output.index("### Recommendation") < output.index("### Evidence")
+    assert output.index("### Evidence") < output.index("### Overlap Comparison")
+    assert "not buried hedges" not in policy
+    assert "this shows the user is interested" not in policy
+    assert "attention, not agreement" in policy
+    assert "model-reported" in output
+
+
 def test_system_prompt_composes_policy_then_both_skills(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

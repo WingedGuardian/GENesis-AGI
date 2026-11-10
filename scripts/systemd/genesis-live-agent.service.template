@@ -12,7 +12,7 @@ ExecStart=:/bin/sh -c 'exec "$@"' -- "__VENV_EXEC__/bin/python" -m genesis.live_
 EnvironmentFile=__REPO_DIR__/secrets.env
 # Quoted with the _EXEC escapes: an unquoted value splits at a space into
 # invalid assignments, which systemd-analyze verify reports but exits 0 on.
-Environment="PATH=__VENV_EXEC__/bin:__CC_BIN_DIR_EXEC__:__HOME_EXEC__/.npm-global/bin:__HOME_EXEC__/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PATH=__VENV_EXEC__/bin:__CC_BIN_EXEC__:__HOME_EXEC__/.npm-global/bin:__HOME_EXEC__/.local/bin:/usr/local/bin:/usr/bin:/bin"
 RuntimeDirectory=genesis-live-agent
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes

@@ -106,7 +106,7 @@ def test_complete_rendered_unit_passes_systemd_parser(tmp_path, home_name):
     values = {
         "__REPO_DIR__": str(repo), "__VENV__": str(venv),
         "__VENV_EXEC__": str(venv), "__HOME__": str(home), "__CC_BIN_DIR__": "/usr/bin",
-        "__HOME_EXEC__": str(home), "__CC_BIN_DIR_EXEC__": "/usr/bin",
+        "__HOME_EXEC__": str(home), "__CC_BIN_EXEC__": "/usr/bin",
     }
     for token, value in values.items():
         body = body.replace(token, value)

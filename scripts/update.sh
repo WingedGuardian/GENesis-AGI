@@ -2582,7 +2582,8 @@ PYEOF
 _tier2_pending_since_baseline() {
     local _baseline="" _rc=0 _activated=""
     local -a _tier2=(scripts/systemd scripts/bootstrap.sh scripts/update.sh
-        scripts/lib/cc_version.sh scripts/hooks pyproject.toml)
+        scripts/lib/cc_version.sh scripts/cc_settings_align.sh scripts/setup_claude_config.py
+        config/cc-global-settings.yaml .claude/settings.json scripts/hooks pyproject.toml)
     if [ "${ON_LIVE:-0}" = 1 ] \
         && _activated="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'refs/genesis/live-activated^{commit}' 2>/dev/null)" \
         && [ -n "$_activated" ] \
