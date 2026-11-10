@@ -225,9 +225,10 @@ def held_rounds(cwd: str, budget: Mapping[str, Any]) -> list[str]:
         if any(head in behind[done] for done in fixed):
             continue
         rows = rr.fix_rows(cwd, head, tip, main_merges=True)
-        if rows is None:
-            # The budget puts the round behind the tip; local git disagrees.
-            raise rr.Refused(f"git cannot relate round {head[:12]} to the tip")
+        # None: the budget puts the round behind the tip and local git
+        # disagrees (a shallow or diverged clone). It is not held, as before,
+        # rather than refusing the whole state: a Refused here makes Rule R
+        # allow the commit, dropping the open round's deny with it.
         if rows == []:
             held.append(head)
         else:
