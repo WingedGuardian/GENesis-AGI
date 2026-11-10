@@ -760,6 +760,7 @@ fi
 # secrets.env
 if [ ! -f "$SECRETS_FILE" ]; then
     if [ -f "$REPO_DIR/secrets.env.example" ]; then
+        mkdir -p -m 0700 "$(dirname "$SECRETS_FILE")"
         cp "$REPO_DIR/secrets.env.example" "$SECRETS_FILE"
         chmod 600 "$SECRETS_FILE"
         echo "    + Created secrets.env from template"

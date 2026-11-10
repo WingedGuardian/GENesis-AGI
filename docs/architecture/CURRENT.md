@@ -4686,9 +4686,14 @@ Refusing a proposed update preserves a previously valid opt-in.
   check under it and remove a marker only when its holder is dead or theirs.
   Exception: `bootstrap.sh`'s crash recovery still removes it unconditionally.
   `secrets_path()` delegates to the stdlib-only `secrets_location.py`, mirrored
-  by `scripts/lib/secrets_path.sh`: `SECRETS_PATH` if set, else the checkout's
-  `secrets.env` (unchanged). Disk hygiene's store knobs, bootstrap and the eval
-  loaders keep their own rules for now.
+  by `scripts/lib/secrets_path.sh`: `SECRETS_PATH` wins; otherwise an existing
+  `~/.config/genesis/secrets.env` wins over the checkout and `~/genesis`
+  legacy files. With no file, the default is still the checkout's file; the
+  default switch, the unit files and creating the home config are the
+  migration's. Missing credentials at startup queue a critical alert. Guardian
+  check/restore and passphrase resolution, the graph census proof, disk
+  hygiene's store knobs and the eval loaders all take that one answer, and the
+  secrets guard protects the home-config file, its folder and their aliases.
 - **Managed systemd user units** (deploy scripts, no `src/genesis` module):
   `bootstrap.sh` renders `scripts/systemd/*.template` and `setup-vnc.sh`
   renders `scripts/systemd/vnc/` into `~/.config/systemd/user`, both through

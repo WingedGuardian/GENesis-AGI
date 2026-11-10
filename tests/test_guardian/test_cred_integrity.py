@@ -28,6 +28,20 @@ from genesis.guardian.cred_integrity import (
 _HAS_GPG = shutil.which("gpg") is not None
 _PASS = "test-passphrase-1234"  # noqa: S105 — synthetic test value
 
+
+@pytest.fixture(autouse=True)
+def _private_home_paths(_live_closure_secrets_path):
+    """These filesystem tests supply private homes; exercise their legacy files.
+
+    The suite's absent override would otherwise mask those synthetic files.
+    A fixture-owned patch preserves the live-closure teardown order.
+    """
+    patch = pytest.MonkeyPatch()
+    patch.delenv("SECRETS_PATH", raising=False)
+    patch.delenv("GENESIS_REPO_ROOT", raising=False)
+    yield
+    patch.undo()
+
 # ── validate_bytes: per-kind × corruption modes ─────────────────────────────
 
 

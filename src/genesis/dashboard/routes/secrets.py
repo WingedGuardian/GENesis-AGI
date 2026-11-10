@@ -215,6 +215,7 @@ def _update_secrets_file(updates: dict[str, str]) -> None:
 
     path = secrets_path()
     if not path.exists():
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         # Create from example if missing
         example = repo_root() / "secrets.env.example"
         if example.exists():
