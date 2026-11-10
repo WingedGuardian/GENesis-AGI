@@ -130,6 +130,13 @@ _XDG_ROOTS = {
     "XDG_STATE_HOME": ".local/state",
 }
 
+# The controller's private home and its starting HOME, for xdist workers.
+_SHARED_HOME = "GENESIS_TEST_PRIVATE_HOME"
+_SHARED_START = "GENESIS_TEST_HOME_BEFORE"
+# The process that made the home. Only its direct children (xdist workers) adopt
+# it; a run a test starts in turn makes its own, as before.
+_SHARED_OWNER = "GENESIS_TEST_HOME_OWNER"
+
 
 class _State:
     installed = False
@@ -137,6 +144,9 @@ class _State:
     live_e2e = False
     removed: tuple[str, ...] = ()
     home = ""  # the session's test HOME, "" when not redirected
+    # False in an xdist worker, which adopts the controller's home: only the
+    # controller removes it.
+    home_owned = True
     real_home: str | None = None
     # HOME as the run started (None when unset). The box lock and basetemp are
     # placed from this, as Path.home() places them without the closure.
@@ -223,6 +233,22 @@ def _redirect_home() -> None:
     for name, rel in _XDG_ROOTS.items():
         os.environ[name] = str(home / rel)
     _S.home = str(home)
+    # xdist starts its workers after this import, with this environment: they
+    # adopt this home and the starting HOME (see _adopt_home).
+    os.environ[_SHARED_HOME] = str(home)
+    os.environ[_SHARED_START] = _S.home_before or ""
+    os.environ[_SHARED_OWNER] = str(os.getpid())
+
+
+def _adopt_home(home: str) -> None:
+    """An xdist worker uses the controller's private home, so every process
+    derives the same paths, and the same test ids, from ``Path.home()``. The
+    controller created it and is the only process that removes it."""
+    os.environ["HOME"] = home
+    for name, rel in _XDG_ROOTS.items():
+        os.environ[name] = str(Path(home) / rel)
+    _S.home = home
+    _S.home_owned = False
 
 
 # Set when this plugin is IMPORTED, not in install(): see the module docstring.
@@ -238,9 +264,22 @@ os.environ["GENESIS_DB_PATH"] = _IMPORT_TIME_DB
 if os.environ.get("GENESIS_LIVE_E2E") != "1":
     os.environ["SECRETS_PATH"] = _NO_SECRETS
 _S.real_home = _live_fence.real_home()
-_S.home_before = os.environ.get("HOME")
-if os.environ.get("GENESIS_LIVE_E2E") != "1":
-    _redirect_home()
+_inherited = (
+    os.environ.get(_SHARED_HOME, "")
+    if os.environ.get("PYTEST_XDIST_WORKER")
+    and os.environ.get(_SHARED_OWNER) == str(os.getppid())
+    and os.environ.get("GENESIS_LIVE_E2E") != "1"
+    else ""
+)
+if _inherited and os.path.isdir(_inherited):
+    # HOME here is already the controller's private home; the starting one
+    # travels separately ("" when it was unset).
+    _S.home_before = os.environ.get(_SHARED_START) or None
+    _adopt_home(_inherited)
+else:
+    _S.home_before = os.environ.get("HOME")
+    if os.environ.get("GENESIS_LIVE_E2E") != "1":
+        _redirect_home()
 # Taken after the redirect, so a genesis import made while placing it counts too.
 _S.genesis_at_import = tuple(
     sorted(m for m in sys.modules if m == "genesis" or m.startswith("genesis."))
@@ -252,7 +291,10 @@ if _S.genesis_at_import:
     )
 # The same fallback as the closure's own directory; tests/conftest.py removes it
 # in pytest_unconfigure (read-only trees such as git objects need its forced form).
-atexit.register(lambda: _S.installed or not _S.home or shutil.rmtree(_S.home, ignore_errors=True))
+atexit.register(
+    lambda: _S.installed or not _S.home or not _S.home_owned
+    or shutil.rmtree(_S.home, ignore_errors=True)
+)
 
 
 def credential_names(environ) -> list[str]:
@@ -303,7 +345,7 @@ def install(config) -> None:
     os.environ["GENESIS_MCP_LOG_DIR"] = str(Path(_S.base) / "no-mcp-log")
     config._genesis_live_closure_dir = _S.base
     if _S.home:
-        config._genesis_live_home_cleanup = _S.home
+        config._genesis_live_home_cleanup = _S.home if _S.home_owned else None
     _S.installed = True
 
 

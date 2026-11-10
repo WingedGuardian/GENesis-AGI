@@ -367,7 +367,17 @@ def _is_xdist_controller(config) -> bool:
 
 # HOME as the run started. tests/_live_closure.py imports this module before it
 # redirects HOME, so this is never the session's private home.
-_HOME_AT_IMPORT = os.environ.get("HOME")
+# An xdist worker starts with the controller's environment, whose HOME the live
+# closure has already redirected; the closure passes HOME as the run started
+# down separately ("" when it was unset), see tests/_live_closure.py.
+_HOME_AT_IMPORT = (
+    (os.environ.get("GENESIS_TEST_HOME_BEFORE") or None)
+    if os.environ.get("PYTEST_XDIST_WORKER")
+    and os.environ.get("GENESIS_TEST_PRIVATE_HOME")
+    and os.environ.get("GENESIS_TEST_HOME_OWNER") == str(os.getppid())
+    and os.environ.get("GENESIS_LIVE_E2E") != "1"
+    else os.environ.get("HOME")
+)
 
 
 def real_home() -> str | None:
