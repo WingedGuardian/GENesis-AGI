@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from genesis.cc import final_status, rate_limit_park, roster
-from genesis.cc.exceptions import CCQuotaExhaustedError, CCRateLimitError
+from genesis.cc.exceptions import CCMemoryPressureError, CCQuotaExhaustedError, CCRateLimitError
 from genesis.cc.session_config import _USER_SCOPED_MCP_WILDCARDS
 from genesis.cc.types import (
     CCInvocation,
@@ -1646,6 +1646,15 @@ class DirectSessionRunner:
             # Not in _finalize_failure: the rate-limit path above reuses it
             # after park_direct_session already recorded these calls.
             await self._record_resumed_calls(request, inventory)
+            if isinstance(exc, CCMemoryPressureError):
+                # An existing resume claim must not become replayable when
+                # stale-claim recovery runs. Preserve its inventory first.
+                from genesis.db.crud import cc_rate_limit_parks as parks
+
+                db = getattr(self._rt, "_db", None)
+                park_id = rate_limit_park.parse_park_id(request.caller_context)
+                if db is not None and park_id is not None:
+                    await parks.mark_terminal(db, park_id, "cancelled")
             await self._finalize_failure(session_id, request, exc, telemetry, start)
 
         finally:

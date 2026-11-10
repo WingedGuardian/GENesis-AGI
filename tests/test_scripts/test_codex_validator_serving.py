@@ -47,7 +47,9 @@ def runtime(tmp_path, script):
 
 
 async def wait_ready(task, ready):
-    async with asyncio.timeout(2):
+    # A bound against a hung fixture, not a speed requirement: it must outlast
+    # the 2.0 s collection timeout the non-cancel readiness wait runs under.
+    async with asyncio.timeout(10):
         while not ready():
             if task.done():
                 await task  # Surface launch failure instead of waiting on a dead task.
@@ -307,7 +309,9 @@ async def test_timeout_and_cancellation_kill_only_owned_child(tmp_path, monkeypa
         return proc
 
     monkeypatch.setattr(serving.asyncio, "create_subprocess_exec", spawn)
-    monkeypatch.setattr(serving, "COLLECTION_TIMEOUT", 0.1)
+    # A cancelled run ends by cancellation, so its timeout must not fire first
+    # while the child is still starting on a loaded runner.
+    monkeypatch.setattr(serving, "COLLECTION_TIMEOUT", 30 if cancel else 0.1)
     root = runtime(tmp_path, "exec /usr/bin/sleep 30\n")
     task = asyncio.create_task(serving._capture(root, None))
     if cancel:
@@ -334,7 +338,12 @@ async def test_owned_grandchild_cannot_keep_output_pipe_open(
         return proc
 
     monkeypatch.setattr(serving.asyncio, "create_subprocess_exec", spawn)
-    monkeypatch.setattr(serving, "COLLECTION_TIMEOUT", 0.3)
+    # The timeout starts at spawn, and readiness (bash forks the sleeper and
+    # writes its pid) must come first. MEASURED 2026-11-06 under CPU and git
+    # load: readiness took up to 432 ms (p99 210 ms), past the old 0.3 s, which
+    # failed one parallel CI run. A cancelled run ends by cancellation, so its
+    # timeout is set out of the way; otherwise 2.0 s, about 4.6x that worst case.
+    monkeypatch.setattr(serving, "COLLECTION_TIMEOUT", 30 if cancel else 2.0)
     marker = tmp_path / "owned-child.pid"
     root = runtime(
         tmp_path,

@@ -2232,6 +2232,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             f"cc_sessions.{_col}",
         )
 
+    # Which labelled client a credentials lookup came from. Mirrored in
+    # migration 20261108071709 for the standalone runner (schema_both_build_paths).
+    await _try_alter(
+        db,
+        "ALTER TABLE credential_access_log ADD COLUMN client TEXT",
+        "credential_access_log.client",
+    )
+
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
     """Rebuild cognitive_state if CHECK constraint lacks 'resilience_degradation'.

@@ -1,5 +1,16 @@
 # Testing Guide
 
+The standalone rollout CLI and captured deploy source are exercised with real
+`python -I -S` subprocesses in `tests/test_scripts/test_mcp_rollout_config.py`,
+`test_mcp_rollout_failures.py`, and `test_mcp_rollout_repair.py`. Run them with
+`tests/test_scripts/test_mcp_rollout.py`, `test_shared_mcp_units.py`, and
+`test_deploy_code_only_modes.py` (all under `tests/test_scripts/`). Systemd
+calls use fixture shims. Coverage includes missing/incomplete captured source,
+future imports and namespace isolation, source replacement, exact launch argv,
+UTF-8 under an ASCII locale when available, post-sync CLI arrival, and the
+candidate gate's pure classifier. It never executes the candidate operator.
+No unused `src/` configuration reader is installed by this change.
+
 ## Running Tests
 
 All tests run from the genesis project root using pytest:
@@ -25,11 +36,17 @@ ruff check . && pytest -v
 ## Test Suite Overview
 
 For the opt-in request-owned database primitive, run
-`pytest -q tests/test_db/test_request_database.py tests/test_db/test_request_database_lifecycle.py`.
+`pytest -q tests/test_db/test_request_database.py tests/test_db/test_request_database_lifecycle.py tests/test_db/test_request_database_tasks.py tests/test_db/test_background_admission.py`.
 These use scratch SQLite databases, including independent readers, cancellation,
 WAL cursor release and process-death recovery. Four explicit outcome comparisons
 keep the actual legacy middleware as the negative control. Shared MCP service E2E
 qualification is separate from this primitive coverage.
+
+`tests/test_db/test_request_database_tasks.py` exercises detached ownership,
+parent rollback, caller ContextVars, cancellation before start and during work,
+shutdown admission, and real activity/heartbeat persistence on scratch SQLite.
+It also checks deferred-recall and procedure-refresh bookkeeping when a job
+never enters its body. Providers and vector services are not called.
 
 Scoped graph selection and SQL identity parity are covered by
 `tests/test_memory/test_graph_request_database.py` and
@@ -38,15 +55,36 @@ production table definitions, compare ordered traversal fields against NetworkX,
 and check own pending writes and selected-backend fallback. The FalkorDB boundary
 is simulated; these tests do not claim a live-engine or shared-service E2E run.
 
+For the service boundary, run the named files
+`tests/test_mcp/test_request_database_service.py`,
+`tests/test_mcp/test_request_service_initialization.py`,
+`tests/test_mcp/test_request_service_tool_bodies.py`, and
+`tests/test_mcp/test_request_standalone_health.py`. They use real FastMCP
+clients and service initializers with scratch SQLite, testing concurrent calls,
+protocol cancellation, finalization errors, durable explicit commits, restart,
+and real detached database writers. Standalone health status/alerts assert seeded
+SQL results across success, cancellation, enrichment error and shutdown; guard
+tests reject unsupported runtime health injection without mutating registration.
+Initialization also checks one bootstrap-owned history load, pending-flush
+ownership and scoped/legacy transitions. Bootstrap commit/cleanup failures across
+all four services preserve registration; bootstrap inside the current task's
+active unit is rejected before mutation. External host/provider/vector calls are stubbed;
+HTTP/UDS deployment and caller credentials need separate activation checks.
+
 Genesis v3 has **~21,000 test functions** across **~1,345 files** (counted
 2026-09-06 by `grep -rEh "^\s*(async )?def test_" tests/ --include=*.py | wc -l`;
 parametrized cases make the collected item count higher still). The suite runs
 without external service dependencies -- Qdrant, Ollama, and LLM APIs are
 mocked in unit tests.
 
-**Runtime.** CI runs the suite FULLY SERIALLY. pytest-xdist is in the `[test]`
-extra (pinned in `.github/test-tools/requirements.txt`), but no CI job passes
-`-n` yet, and a local `-n` run is unsupported. MEASURED 2026-09-06 over the last 23 successful `main` runs, for
+**Runtime.** CI's `test` job runs the suite on four pytest-xdist workers
+(`-n 4 --dist=loadfile --max-worker-restart=0`; xdist is pinned in
+`.github/test-tools/requirements.txt`). MEASURED 2026-11-05 over 6 runs: the
+`Run tests` step's median was 33.35 min, against 117.0 serial, with the same
+test ids (62,766), and a 7.8 GB memory peak. A local `-n` run is unsupported:
+that peak is too much for a shared box, and the full-suite guard refuses it.
+The figures that follow are older serial ones, from a suite less than half its
+current size, MEASURED 2026-09-06 over the last 23 successful `main` runs, for
 the **`test` job specifically** (`gh api .../actions/runs/<id>/jobs`, name ==
 `test`): min 19m38s, median 29m22s, max 31m15s. Do not quote workflow-RUN
 duration here — it is ~20 minutes longer because it spans 12 sibling jobs plus
@@ -55,7 +93,9 @@ queue time, and it is not what any of the ceilings below bound.
 Two ceilings bound the suite, and they are different things:
 
 - `timeout = 600` in `pyproject.toml` is pytest-timeout's **per-test** limit —
-  one hung test is killed and the suite continues. It is NOT a suite budget.
+  with the thread method it ends the process that ran the hung test, so the
+  run stops (under `--max-worker-restart=0`, once the other workers finish
+  what they were handed). It is NOT a suite budget.
   It applies wherever `pytest-timeout` is installed: always in CI, and on an
   install once bootstrap's non-fatal step has installed the `[test]` extra
   (`install_runtime_extras`; a code-only deploy warns when it is missing).
@@ -63,8 +103,9 @@ Two ceilings bound the suite, and they are different things:
   holds the box-wide test lock until it is killed by hand.
 - `timeout-minutes: 180` on CI's `test` job bounds the whole job, for a hang
   the per-test timeout cannot catch. It must stay above (max job + one
-  per-test kill) — 31m15s + 10m ≈ 41m — or it would pre-empt the per-test
-  limit and make it dead code.
+  per-test kill), or it would pre-empt the per-test limit and make it dead
+  code. The serial job had reached 82-146 min by 2026-11-05; on four workers
+  the measured step took 31-48 min.
 
 The per-test cost of individual tests had never been measured; CI now prints
 `--durations=25` so the slowest are visible in every run's log. Read them
@@ -358,3 +399,24 @@ When adding a new subsystem or feature:
 2. Add subsystem-specific fixtures in `tests/test_<subsystem>/conftest.py`.
 3. Mock external dependencies; do not require live services for unit tests.
 4. Verify the new tests pass in isolation: `pytest -v tests/test_<subsystem>/`.
+
+## Request-owned resource coverage
+
+Shutdown grace and actual synchronous completion are covered by
+`tests/test_db/test_request_database_drain.py`,
+`tests/test_db/test_request_database_drain_states.py`,
+`tests/test_db/test_physical_work.py`, and
+`tests/test_db/test_physical_work_states.py`. These cover real owned-file use,
+queued/running executor cancellation, ambiguous submission, joined children,
+context propagation and legacy cancellation. The connection budget is tested
+separately from the number of physical operations. Fault fixtures release and
+join their real workers; an import failure or unrelated timeout is not evidence
+of forbidden resource use. Production factories and shared activation remain
+separate qualifications.
+
+`tests/test_memory/test_resource_thread_ownership.py` exercises all nine migrated
+memory boundaries with gated real file I/O, cancellation and a real scratch
+database lease. `tests/test_memory/test_tag_index_ownership.py` covers independent
+background admission, physical scan drain, refusal/creation failure, prestart
+cancellation, retriever propagation and the body-completed/done-callback gap.
+`tests/test_memory/test_tag_index_swr.py` retains legacy stale-query behavior.

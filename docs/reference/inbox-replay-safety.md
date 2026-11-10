@@ -48,6 +48,35 @@ Repeating the command does not release it again. There is no bulk release or
 force flag; changed-source or corrupt-payload cases need a separately reviewed
 operator repair, not an automatic guess at item boundaries.
 
+## Corrupt payloads during approval resume
+
+A corrupt versioned payload encountered while resuming an approved batch is
+marked `batch_items_corrupt_restart`. Its retry count is kept below the active
+`max_retries`, including when that cap was lowered while approval was pending.
+Approval resume consumes the old site grant before releasing the durable
+awaiting marker, whether the row will dispatch or be invalidated. If lookup or
+consumption fails, the row, retry count and payload stay parked. All new,
+modified and retry work for the inbox site waits for another scan; otherwise a
+different file could reuse that same grant. A healthy sibling can still resume
+if its own consumption succeeds. No new persistent hold is created.
+
+After successful retirement, item boundaries are re-derived under fresh
+approval, rather than replaying the whole file as a legacy batch. Consumption
+committed before an interrupted row update is safe to observe again on the
+next scan. The row claim still precedes the evaluator call.
+This recovery does not release `replay_unsafe:` holds; unreadable held payloads
+still need deliberate operator repair as described above.
+
+Resume transitions update only a row still in `processing` with the exact
+`awaiting_approval:` marker read by that pass. If another process claims,
+completes, supersedes or reparks the row first, the stale transition leaves its
+state and retry count untouched. This covers rejection, ended approval, source
+changes/disappearance and corrupt payload recovery. Grant retirement still
+precedes the conditional row update; losing that update does not undo retirement.
+
+This does not add atomic retirement for a pending approval resolved concurrently
+with source deletion.
+
 ## Limits
 
 Unknown or unusable turn counts remain retryable by explicit accepted policy.

@@ -1117,17 +1117,29 @@ def test_serve_refuses_an_overlay_missing_changed_or_replaced(
     os.chmod(own_overlay, 0o600)  # a chmod or touch changes nothing that is compared
     os.utime(own_overlay)
     H.check_overlay(state, wt, main)
-    for change in ("edited", "replaced", "deleted"):
-        if change == "replaced":  # another file with the same text: a different inode
-            spare = own_overlay.with_name("spare.yaml")
-            spare.write_text(text)
-            os.replace(spare, own_overlay)
-        else:
-            own_overlay.unlink()
-        if change == "edited":
-            own_overlay.write_text(text + "# edited\n")
-        with pytest.raises(H.Refused, match="^R10: .* missing or changed since setup"):
-            H.check_overlay(state, wt, main)
+    # Keep the original inode allocated. "replaced" needs a file with the same text
+    # and a DIFFERENT inode, and a freed inode is reused: under concurrent file
+    # churn (3 processes creating and deleting files in the same directory) the
+    # spare landed on the original inode in 426 of 3000 trials, and in 0 of 3000
+    # with this link held (MEASURED 2026-11-06). That made check_overlay rightly
+    # pass and failed one parallel CI run. The overlay check compares inode and
+    # text, not the link count.
+    held = own_overlay.with_name("held-original.yaml")
+    os.link(own_overlay, held)
+    try:
+        for change in ("edited", "replaced", "deleted"):
+            if change == "replaced":  # another file with the same text: a different inode
+                spare = own_overlay.with_name("spare.yaml")
+                spare.write_text(text)
+                os.replace(spare, own_overlay)
+            else:
+                own_overlay.unlink()
+            if change == "edited":
+                own_overlay.write_text(text + "# edited\n")
+            with pytest.raises(H.Refused, match="^R10: .* missing or changed since setup"):
+                H.check_overlay(state, wt, main)
+    finally:
+        held.unlink(missing_ok=True)
 
 
 async def test_a_failing_approver_shutdown_still_stops_the_vault(built):

@@ -41,9 +41,15 @@ _LIB = os.path.dirname(os.path.abspath(__file__))
 BOOT_BUDGET_S = 60  # every wait at boot, inside systemd's default 90 s start timeout
 _POLL_S = 1.0
 LOCK_FRESH_S = 30  # see _held_open; under BOOT_BUDGET_S, so a boot just after a kill still heals
+# _held_open re-checks a holder it found only through an unreadable fd table
+# this many times, this far apart (about 0.45 s, and only when one exists).
+_CONFIRM_SCANS, _CONFIRM_STEP_S = 3, 0.15
 _PROC = "/proc"
 SUFFIX = "-live-move-repair"
 _now, _sleep = time.monotonic, time.sleep  # a test's fake clock replaces both
+# _confirmed's wait is real time even under a fake clock: the processes it
+# re-checks run on the real one.
+_settle = time.sleep
 _changed = False  # set when the checkout itself starts to change (_apply)
 
 
@@ -333,6 +339,25 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
+def _exiting(pid: int) -> bool:
+    """Is PF_EXITING (0x4, field 9 of /proc/<pid>/stat) set? The process is in
+    the kernel's exit path and runs no user code again, so it can neither commit
+    nor remove a lock. The kernel sets it before releasing the memory map, which
+    is what makes an exiting process's fds unreadable (MEASURED 2026-11-07, six
+    `git status` loops for 20 s: 484 of 484 unreadable sightings had it). It is the main thread's flag;
+    git never ends its main thread first. False when the stat cannot be read."""
+    try:
+        with open(f"{_PROC}/{pid}/stat") as fh:
+            return bool(int(fh.read().rsplit(")", 1)[1].split()[6]) & 0x4)
+    except (OSError, IndexError, ValueError):
+        return False
+
+
+def _may_hold(pid: int) -> bool:
+    """Could ``pid`` still hold a lock: alive, not a zombie, not exiting."""
+    return _pid_alive(pid) and not _exiting(pid)
+
+
 def _flock(path: str, deadline: float) -> int | None:
     """flock, as every other holder of update.lock takes it; None if still held at ``deadline``.
     A lock path that is a symlink (never followed) or not a regular file is refused."""
@@ -359,7 +384,8 @@ def _flock(path: str, deadline: float) -> int | None:
 def _held_open(path: str) -> bool:
     """Does a process hold ``path`` open (git holds index.lock open from creation)?
     Readable fd tables are matched exactly. Other users' fds are never readable
-    here (MEASURED: /proc/1/fd is EACCES), nor is a zombie's (it holds nothing).
+    here (MEASURED: /proc/1/fd is EACCES), nor is a zombie's or an exiting
+    process's (neither holds anything: _may_hold).
     A live process of this user whose fds cannot be read (non-dumpable: (sd-pam),
     gpg-agent, tailscaled, MEASURED on a systemd-user install) counts only if it
     is a git (its comm stays readable) or the lock is younger than LOCK_FRESH_S
@@ -368,11 +394,13 @@ def _held_open(path: str) -> bool:
     longer than that has it judged stale. A ref lock's fd is closed once its
     value is written, so a ref transaction in flight is seen only through the
     same freshness bound; update.lock and genesis-checkout.lock, held here,
-    keep Genesis's own movers out."""
+    keep Genesis's own movers out. An unreadable process counts only once
+    _confirmed has seen it last."""
     try:
         fresh = time.time() - os.lstat(path).st_mtime < LOCK_FRESH_S
     except OSError:
         fresh = False
+    suspects: dict[int, str | None] = {}  # unreadable: confirmed by _confirmed
     for pid in os.listdir(_PROC):
         if not pid.isdigit() or int(pid) == os.getpid():
             continue
@@ -384,16 +412,70 @@ def _held_open(path: str) -> bool:
             comm = ""
             with contextlib.suppress(OSError), open(f"{_PROC}/{pid}/comm") as fh:
                 comm = fh.read()
-            if (fresh or comm.startswith("git")) and _pid_alive(int(pid)):
-                return True
+            if (fresh or comm.startswith("git")) and _may_hold(int(pid)):
+                suspects[int(pid)] = _start_time(int(pid))
             continue
         except OSError:
             continue
-        for fd in fds:
-            with contextlib.suppress(OSError):
-                if os.readlink(f"{_PROC}/{pid}/fd/{fd}") == path:
-                    return True
+        if _fd_names(pid, path, fds):
+            return True
+    return _confirmed(suspects, path)
+
+
+def _fd_names(pid, path: str, fds: list[str] | None = None) -> bool:
+    """Does process ``pid`` have ``path`` open? False when its fds cannot be read."""
+    if fds is None:
+        try:
+            fds = os.listdir(f"{_PROC}/{pid}/fd")
+        except OSError:
+            return False
+    for fd in fds:
+        with contextlib.suppress(OSError):
+            if os.readlink(f"{_PROC}/{pid}/fd/{fd}") == path:
+                return True
     return False
+
+
+def _start_time(pid: int) -> str | None:
+    """Field 22 of /proc/<pid>/stat (start time in clock ticks), or None."""
+    try:
+        with open(f"{_PROC}/{pid}/stat") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def _confirmed(suspects: dict[int, str | None], path: str) -> bool:
+    """Is any unreadable suspect a lasting holder rather than a passing one?
+
+    A process whose fd table is unreadable only for a moment, counted from one
+    scan, made a stale lock look held, and the heal left it (#4001; on a box
+    running many git sessions, and between pytest-xdist workers). An exiting
+    process, the measured case, is dropped at the scan (_may_hold); this re-check
+    covers any other passing one. A suspect still counts only if it is the same
+    process (same start time), still able to hold, and still unreadable after each of
+    _CONFIRM_SCANS re-checks _CONFIRM_STEP_S apart; if its fds become readable
+    it is judged on them. A real holder stays, so this stays on the safe side.
+    """
+    for _ in range(_CONFIRM_SCANS):
+        if not suspects:
+            return False
+        _settle(_CONFIRM_STEP_S)
+        for pid, start in list(suspects.items()):
+            if not _may_hold(pid) or _start_time(pid) != start:
+                del suspects[pid]
+                continue
+            try:
+                os.listdir(f"{_PROC}/{pid}/fd")
+            except PermissionError:
+                continue  # still unreadable: still a suspect
+            except OSError:
+                del suspects[pid]
+                continue
+            if _fd_names(pid, path):
+                return True
+            del suspects[pid]
+    return bool(suspects)
 
 
 def _fsync_dir(path: str) -> None:
@@ -576,7 +658,8 @@ def _load_guard():
 
 
 def _load_kit(name: str):
-    """A kit source beside this one (the guard; live_move_restore.py)."""
+    """A kit source beside this one (the guard; live_move_restore.py and
+    live_move_restore_write.py)."""
     path = os.path.join(_LIB, name)
     spec = importlib.util.spec_from_file_location(f"_live_repair_{name[:-3]}", path)
     if spec is None or spec.loader is None:
@@ -613,9 +696,9 @@ class Repair:
         else:
             print(msg, flush=True)
 
-    def run(self, restore: str | None = None) -> int:
+    def run(self, restore: str | None = None, write: bool = False) -> int:
         try:
-            return self._check_restore(restore) if restore is not None else self._run()
+            return self._restore(restore, write) if restore is not None else self._run()
         finally:
             for fd in self._fds:
                 os.close(fd)
@@ -661,26 +744,32 @@ class Repair:
             _sleep(_POLL_S)
         return locks
 
-    def _check_restore(self, ts: str) -> int:
-        """--restore TS --check, under the repair's own locks in its order (a
-        short wait): what a restore of that report would write, judged now;
-        writes nothing."""
+    def _restore(self, ts: str, write: bool) -> int:
+        """--restore TS [--check], under the repair's own locks in its order (a
+        short wait); never while the guard calls the checkout half-written or
+        its update unfinished (MIXED_TREE, GUARDS: review LOW-1). --check
+        judges what a restore would write and writes nothing; without it the
+        restore writes (live_move_restore.restore)."""
+        nothing = "nothing was written" if write else "nothing was judged"
         deadline = _now() + self.wait
         if self._hold(self._update_lock(), deadline) is None:
-            self._say(
-                "update.lock is still held after the wait (an update runs); nothing was judged"
-            )
+            pid = (_load(self.state_path) or {}).get("pid")
+            who = f"; the update state names pid {pid}" if isinstance(pid, int) else ""
+            self._say(f"update.lock is still held after the wait (an update runs{who}); {nothing}")
             return 1
         if self._checkout_locks(deadline) is None:
             return 1
         verdict, reason = self.guard.verdict(self.state_path, self.repo)
-        if verdict == self.guard.MIXED_TREE:
-            self._say(
-                f"the checkout is half-written ({reason}); repair it first, nothing was judged"
-            )
+        if verdict in (self.guard.MIXED_TREE, self.guard.GUARDS):
+            what = "half-written" if verdict == self.guard.MIXED_TREE else "mid-update"
+            self._say(f"the checkout is {what} ({reason}); repair or finish it first, {nothing}")
             return 1
-        kit = _load_kit("live_move_restore.py")
-        return kit.check(types.SimpleNamespace(**globals()), self.repo, self.home, ts, self._say)
+        kit = _load_kit("live_move_restore.py")  # the check and the judge
+        rp = types.SimpleNamespace(**globals())
+        if not write:
+            return kit.check(rp, self.repo, self.home, ts, self._say)
+        writes = _load_kit("live_move_restore_write.py")
+        return writes.restore(rp, kit, self.repo, self.home, ts, self._say)
 
     def _state(self) -> tuple[bytes | None, dict | None]:
         """The state file's bytes and its object, through the guard's bounded
@@ -943,7 +1032,9 @@ class Repair:
         a gc would then delete them), and the new directory's entries up to
         the Genesis home."""
         for older, m in manifests(self.backups):
-            if m.get("result") is None and os.path.dirname(older) != backup:
+            # A report a restore holds in flight is never superseded (B2b §7).
+            flying = isinstance(m.get("restore"), dict) and m["restore"].get("inflight")
+            if m.get("result") is None and not flying and os.path.dirname(older) != backup:
                 write_json(older, {**m, "result": "superseded"}, private=True)  # killed partway
         # A directory row is copied whole; a row inside it is saved by that copy.
         whole = {r["path"] for r in manifest["paths"] if r["disk"] == "dir" and r["disk_changed"]}
@@ -1236,19 +1327,20 @@ def main(argv: list[str]) -> int:
     if ts is not None and report_ts(ts + SUFFIX) != ts:  # #3733: never a path from an unchecked ts
         _log(f"{ts!r} is not a repair report's ts")
         return 2
-    if args.restore is not None and not args.check:
-        _log("restoring is not available yet; --restore TS --check judges what it would restore")
-        return 2
     repo = os.path.abspath(args.repo)
     if args.dismiss is not None:  # REPAIR.json's readers stop reporting a dismissed repair's saves
         return _dismiss(args.state, repo, args.dismiss, 30 if args.wait is None else args.wait)
     wait = args.wait if args.wait is not None else 30 if args.restore is not None else 7200
     try:
-        return Repair(args.state, repo, args.boot, wait).run(args.restore)
+        return Repair(args.state, repo, args.boot, wait).run(args.restore, not args.check)
     except Exception as exc:  # noqa: BLE001 - every failure is named; at boot it sets the exit
         if args.boot and not _changed:  # a failed backup changed nothing in the checkout
             _log(f"skipped; nothing was changed ({type(exc).__name__}: {exc})")
             return 0
+        if args.restore is not None and not args.check:
+            _log(f"the restore failed ({type(exc).__name__}: {exc}); REPAIR.json's `restore`"
+                 " block names any part in flight, and a re-run finishes it")  # fmt: skip
+            return 1
         _log(f"failed ({type(exc).__name__}: {exc}); the update state is kept")
         return 1
 

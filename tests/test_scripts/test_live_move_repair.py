@@ -58,15 +58,17 @@ from tests.test_scripts._live_repair_world import (
     _lock_aside,
     _lock_aside_if_any,
     _retarget,
-    _run_steps,
     _skip_worktree_desc,
     _staged_desc,
     age_locks,
     assert_healed,
+    foreign_rows,
     killed_rollback,
     killed_tag_side,
-    reapply_steps,
+    restore,
+    restore_all,
     tag_snapshot,
+    update_bytes,
 )
 
 pytestmark = pytest.mark.skipif(sys.platform.startswith("win"), reason="git + bash")
@@ -94,7 +96,7 @@ def test_td1_a_switch_killed_on_the_tag_side_is_healed_and_saved(w, victim):
     assert_healed(w, before)
     assert _git(w.root, "rev-parse", "HEAD") == w.tag
     assert (w.backups()[-1] / "git" / "index.lock").exists() is lock_left
-    assert reapply_steps(w) == [], "the update's own files were reported as foreign"
+    assert foreign_rows(w) == [], "the update's own files were reported as foreign"
 
 
 def test_td2_a_rollback_killed_partway_is_left_to_the_forward_repair(w):
@@ -133,7 +135,7 @@ def test_td2_a_rollback_killed_partway_is_left_to_the_forward_repair(w):
 def test_td3_a_foreign_path_is_saved_healed_and_reported(w, make):
     """T-D3: something the update did not write, on a path the switch writes.
     The repair saves it, heals the tree anyway, lists the path as foreign, and
-    the step it prints puts the node and its index entries back exactly,
+    the restore it prints puts the node and its index entries back exactly,
     whatever the node's kind."""
     killed_tag_side(w, "Z3")
     # The edit is made with the killed switch's stale index.lock moved aside
@@ -143,7 +145,8 @@ def test_td3_a_foreign_path_is_saved_healed_and_reported(w, make):
     path = make(w)
     lock.with_name("held").rename(lock)
     node_before = w.snapshot().get(path)
-    sub_before = {k: v for k, v in w.snapshot().items() if k.startswith(path + "/")}
+    sub_before = {k: v for k, v in w.snapshot().items()
+                  if k.startswith(path + "/") and not update_bytes(w, k, v)}  # fmt: skip
     index_before = _git(w.root, "ls-files", "-s", "--", path)
     flags_before = _git(w.root, "ls-files", "-v", "--", path)
     before = w.snapshot()
@@ -152,17 +155,16 @@ def test_td3_a_foreign_path_is_saved_healed_and_reported(w, make):
     assert_healed(w, before)
     rows = {row["path"]: row for row in w.report()["paths"]}
     assert rows[path]["class"] == "foreign", rows[path]
-    steps = reapply_steps(w)
-    assert len(steps) == 1, steps
+    assert len(foreign_rows(w)) == 1, foreign_rows(w)
     ts = w.report()["ts"]
     assert w.report()["reapply"] == [], "the writer stored a shell step (#3868)"
     assert f"scripts/deploy_candidates repair-move --restore {ts} --check" in r.stdout, r.stdout
     assert w.alerts() and all(f"repair-move --restore {ts}" in a["body"] for a in w.alerts())
     assert "rm -rf" not in r.stdout and not any("rm -rf" in a["body"] for a in w.alerts())
     assert all(a["severity"] == "critical" for a in w.alerts())
-    subprocess.run(["bash", "-c", steps[0]], check=True, env=w.env())
+    restore_all(w)
     after = w.snapshot()
-    assert after.get(path) == node_before, "the re-apply step did not restore the node"
+    assert after.get(path) == node_before, "the restore did not put the node back"
     assert {k: v for k, v in after.items() if k.startswith(path + "/")} == sub_before
     assert _git(w.root, "ls-files", "-s", "--", path) == index_before
     assert _git(w.root, "ls-files", "-v", "--", path) == flags_before
@@ -172,7 +174,7 @@ def test_r1_a_foreign_staged_blob_survives_gc_and_is_reapplied(w):
     """Codex c4385619761: staged content that differs from the worktree's is
     only in the object store; once the repair drops its index entry a
     `git gc --prune=now` deletes it. The backup holds the blob's bytes and the
-    re-apply step writes the object back before the index entry."""
+    restore writes the object back before the index entry."""
     killed_tag_side(w, "Z3")
 
     def stage():
@@ -189,8 +191,7 @@ def test_r1_a_foreign_staged_blob_survives_gc_and_is_reapplied(w):
         subprocess.run(["git", "-C", str(w.root), "cat-file", "-e", oid], env=_git_env()).returncode
         != 0
     ), "control: gc pruned the staged blob"
-    step = reapply_steps(w)[0]
-    subprocess.run(["bash", "-c", step], check=True, env=w.env())
+    restore_all(w)
     assert _git(w.root, "ls-files", "-s", "--", "A") == index_before
     assert _git(w.root, "cat-file", "blob", oid) == "staged by someone"
     assert (w.root / "A").read_text() == "then edited again\n"
@@ -198,8 +199,8 @@ def test_r1_a_foreign_staged_blob_survives_gc_and_is_reapplied(w):
 
 def test_r1_a_name_with_a_newline_reapplies_its_index_entry(tmp_path, monkeypatch):
     """Codex c4385619771 / Devin c4385592698: index records are NUL-delimited, so
-    a path with a newline neither breaks the re-apply step nor feeds git an
-    extra record; and nothing is removed before the step that can fail."""
+    a path with a newline neither breaks the restore nor feeds git an extra
+    record."""
     name = "odd\nname"
     monkeypatch.setitem(TO_FILES, name, "theirs\n")
     w = World(tmp_path)
@@ -214,9 +215,7 @@ def test_r1_a_name_with_a_newline_reapplies_its_index_entry(tmp_path, monkeypatc
     assert w.repair().returncode == 0
     rows = {row["path"]: row for row in w.report()["paths"]}
     assert rows[name]["class"] == "foreign"
-    [step] = reapply_steps(w)
-    r = subprocess.run(["bash", "-c", step], capture_output=True, text=True, env=w.env())
-    assert r.returncode == 0, r.stderr
+    restore_all(w)
     assert _git(w.root, "ls-files", "-s", "-z") == index_before
     assert (w.root / name).read_text() == "mine\n"
 
@@ -224,8 +223,8 @@ def test_r1_a_name_with_a_newline_reapplies_its_index_entry(tmp_path, monkeypatc
 @pytest.mark.parametrize("kind", ["fifo", "socket"])
 def test_r1_a_fifo_or_socket_on_a_move_path_is_recorded(w, monkeypatch, kind):
     """Devin c4385592015: a node that holds no bytes is still recorded (type
-    and mode) and reported as foreign; a FIFO's re-apply step makes it again,
-    a socket's says it is gone (its process binds it again)."""
+    and mode) and reported as foreign; the restore makes a FIFO again, and
+    refuses a socket by name (its process binds it again)."""
     import socket as socketlib
 
     killed_tag_side(w, "Z3")  # Z5 is a target-only path, unwritten
@@ -247,16 +246,18 @@ def test_r1_a_fifo_or_socket_on_a_move_path_is_recorded(w, monkeypatch, kind):
     assert row["special"]["type"] == kind, row
     if kind == "fifo":
         assert row["special"]["mode"] == "0640", row
-    [step] = reapply_steps(w)
+    assert len(foreign_rows(w)) == 1
     assert f"--restore {w.report()['ts']}" in r.stdout and "mkfifo" not in r.stdout, r.stdout
-    subprocess.run(["bash", "-c", step], check=True, env=w.env())
+    put = restore(w)
     import stat as st
 
     if kind == "fifo":
+        assert put.returncode == 0, put.stdout + put.stderr
         mode = os.lstat(w.root / "Z5").st_mode
         assert st.S_ISFIFO(mode) and st.S_IMODE(mode) == 0o640
     else:
-        assert "socket" in step and not (w.root / "Z5").exists()
+        assert put.returncode == 1 and "other:cannot-make" in put.stdout, put.stdout
+        assert not (w.root / "Z5").exists()
 
 
 def test_r1_the_backup_is_durable_in_its_parents_before_the_checkout_changes(w, mod, monkeypatch):
@@ -360,7 +361,7 @@ def test_td4_empty_prefix_and_ephemeral_paths_are_the_updates(w):
     assert_healed(w, before)
     rows = {row["path"]: row["class"] for row in w.report()["paths"]}
     assert rows["Z5"] == rows["sub/s1"] == rows["AGENTS.md"] == "engine", rows
-    assert reapply_steps(w) == []
+    assert foreign_rows(w) == []
     assert [a["severity"] for a in w.alerts()] == ["warning"]
 
 
@@ -521,7 +522,7 @@ def test_td6_an_unreadable_fd_list_of_this_user_may_hold_the_lock(mod, tmp_path,
     (entry / "fd").mkdir(parents=True)
     (entry / "stat").write_text("1 (git) S 1 1\n")
     (entry / "comm").write_text("git\n")
-    monkeypatch.setattr(mod, "_PROC", str(proc))
+    _static_proc(monkeypatch, mod, proc)
     assert mod._held_open("/x/index.lock") is False, "control: a readable, empty fd list"
     (entry / "fd").chmod(0)
     try:
@@ -875,9 +876,8 @@ def test_r2_a_row_inside_a_saved_directory_is_saved_by_it(w, make):
     for row in w.report()["paths"]:
         if row["disk_changed"] and row["disk"] not in ("absent", "other"):
             assert os.path.lexists(backup / row["saved_as"]), row
-    for step in reapply_steps(w):
-        subprocess.run(["bash", "-c", step], check=True, env=w.env())
-    if reapply_steps(w):
+    if foreign_rows(w):
+        restore_all(w)
         assert {k: v for k, v in w.snapshot().items() if k.startswith("P")} == {
             k: v for k, v in before.items() if k.startswith("P")
         }
@@ -921,13 +921,12 @@ def test_r2_a_torn_index_is_kept_and_rebuilt_from_the_tag(w, victim):
 
 def test_r2_a_mode_only_edit_reapplies_its_mode(w):
     """Codex c4385987787, the writer half: an executable-bit-only edit is
-    foreign, and its re-apply step puts the bit back."""
+    foreign, and the restore puts the bit back."""
     killed_tag_side(w, "Z3")  # sub/s1 is still the tag's bytes
     (w.root / "sub" / "s1").chmod(0o755)
     assert w.repair().returncode == 0
     assert not os.access(w.root / "sub" / "s1", os.X_OK)
-    [step] = reapply_steps(w)
-    subprocess.run(["bash", "-c", step], check=True, env=w.env())
+    restore_all(w)
     assert os.access(w.root / "sub" / "s1", os.X_OK)
 
 
@@ -1230,10 +1229,10 @@ def test_explain_survives_a_half_written_shell_lib(w, tmp_path, lib, damage):
     assert "git restore --source=<tag>" in e.stdout, e.stdout
 
 
-def test_reapply_never_stages_a_deletion_of_an_engine_row(w):
+def test_the_restore_never_stages_a_deletion_of_an_engine_row(w):
     """Audit LOW: an UNMERGED ancestor `sub` (git checks file/directory conflicts
-    per stage) beside a stage-0 sub/s1. The ancestor's step drops only rows whose
-    own steps re-add them, so no tag file is left staged for deletion."""
+    per stage) beside a stage-0 sub/s1. Restoring the ancestor's stages drops
+    nothing below it, so no tag file is left staged for deletion."""
     killed_tag_side(w, "prepared")
 
     def plant():
@@ -1249,9 +1248,7 @@ def test_reapply_never_stages_a_deletion_of_an_engine_row(w):
     _lock_aside_if_any(w, plant)
     r = w.repair()
     assert r.returncode == 0, r.stdout + r.stderr
-    for step in reapply_steps(w):
-        s = subprocess.run(["bash", "-c", step], capture_output=True, text=True, env=w.env())
-        assert s.returncode == 0, s.stderr
+    restore_all(w)
     st = _git(w.root, "status", "--porcelain")
     staged_deletions = [ln for ln in st.splitlines() if ln.startswith("D ")]
     assert staged_deletions == [], st
@@ -1295,8 +1292,9 @@ def test_low5_the_live_hint_rides_only_the_at_tag_refusal():
 def test_r4_an_index_entry_under_a_row_path_is_its_own_row(w, make):
     """Restoring P (a file in the tag) drops every index entry under P, so each
     is a row of its own: classified foreign, its blob saved, and after a
-    `git gc --prune=now` the printed re-apply steps put the entry, its flag and
-    its node back. Invariant: every pre-repair index entry the repair changed
+    `git gc --prune=now` the restore puts the entry, its flag and its node
+    back (the gc took the target, so P's own files, the update's, cannot be
+    told apart any more: those are refused by name, and only those). Invariant: every pre-repair index entry the repair changed
     has a row."""
     killed_tag_side(w, "prepared")
     path = _lock_aside_if_any(w, lambda: make(w))
@@ -1317,12 +1315,15 @@ def test_r4_an_index_entry_under_a_row_path_is_its_own_row(w, make):
         assert (w.backups()[-1] / "index-blobs" / oid).is_file(), "the staged blob was not saved"
     _git(w.root, "-c", "gc.reflogExpire=now", "-c", "gc.reflogExpireUnreachable=now", "gc", "-q",
          "--prune=now")  # fmt: skip
-    for step in reapply_steps(w):
-        r = subprocess.run(["bash", "-c", step], capture_output=True, text=True, env=w.env())
-        assert r.returncode == 0, step + "\n" + r.stderr
+    put = restore(w)
+    refused = [ln for ln in put.stdout.splitlines() if " refused:" in ln]
+    assert all("other:target-unreadable" in ln for ln in refused), put.stdout
     assert _git(w.root, "ls-files", "-s", "--", path) == entry
     assert _git(w.root, "ls-files", "-v", "--", path) == flags
-    assert w.snapshot().get(path) == node
+    if make is _gitlink_desc:  # review N-11: a saved directory's empty subdirectory
+        assert node == "dir" and w.snapshot().get(path) is None  # is not rebuilt
+    else:
+        assert w.snapshot().get(path) == node
 
 
 def test_r4_the_safe_branch_retires_a_stale_index_lock(w):
@@ -1355,6 +1356,15 @@ def test_r4_ref_locks_a_killed_transaction_left_are_retired(w):
     _git(w.root, "switch", "-q", "-c", "probe")
 
 
+def _static_proc(monkeypatch, mod, proc: Path) -> None:
+    """Point the repair at a fake /proc. Its entries never change, so the
+    re-check of an unreadable process (#4001) has nothing to wait out: its real
+    wait would only age a fresh lock past LOCK_FRESH_S on the real clock while
+    the fake clock runs out the budget."""
+    monkeypatch.setattr(mod, "_PROC", str(proc))
+    monkeypatch.setattr(mod, "_settle", lambda _s: None)
+
+
 def _fake_proc(tmp_path: Path, comm: str) -> tuple[Path, Path]:
     """A /proc with one live process of this user, ``comm``, whose fd list
     cannot be read (non-dumpable)."""
@@ -1384,7 +1394,7 @@ def test_r4_an_unreadable_process_holds_only_if_git_or_the_lock_is_fresh(
     proc, lock = _fake_proc(tmp_path, comm)
     then = time.time() - age
     os.utime(lock, (then, then))
-    monkeypatch.setattr(mod, "_PROC", str(proc))
+    _static_proc(monkeypatch, mod, proc)
     try:
         assert mod._held_open(str(lock)) is held
     finally:
@@ -1393,7 +1403,7 @@ def test_r4_an_unreadable_process_holds_only_if_git_or_the_lock_is_fresh(
 
 def test_r4_ephemeral_paths_match_whole_like_the_guard(tmp_path, monkeypatch):
     """Codex c4386510850: `notes AGENTS.md` is not the top-level AGENTS.md; a
-    foreign edit there is reported with its re-apply step."""
+    foreign edit there is reported, and restored."""
     monkeypatch.setitem(TAG_FILES, "notes AGENTS.md", "n1\n")
     monkeypatch.setitem(TO_FILES, "notes AGENTS.md", "n2\n")
     w = World(tmp_path)
@@ -1403,8 +1413,7 @@ def test_r4_ephemeral_paths_match_whole_like_the_guard(tmp_path, monkeypatch):
     assert r.returncode == 0, r.stdout + r.stderr
     rows = {row["path"]: row for row in w.report()["paths"]}
     assert rows["notes AGENTS.md"]["class"] == "foreign", rows["notes AGENTS.md"]
-    [step] = reapply_steps(w)
-    subprocess.run(["bash", "-c", step], check=True, env=w.env())
+    restore_all(w)
     assert (w.root / "notes AGENTS.md").read_text() == "FOREIGN EDIT\n"
 
 
@@ -1418,7 +1427,7 @@ def test_r4_a_fresh_ref_lock_is_waited_for_never_left_behind(w, mod, tmp_path, m
         pytest.skip("running as root: EACCES cannot be produced")
     killed_tag_side(w, "prepared")
     proc, _ = _fake_proc(tmp_path, "codex")
-    monkeypatch.setattr(mod, "_PROC", str(proc))
+    _static_proc(monkeypatch, mod, proc)
     clock = FakeClock()
     monkeypatch.setattr(mod, "_now", clock.now)
     monkeypatch.setattr(mod, "_sleep", clock.sleep)
@@ -1445,8 +1454,8 @@ def test_r4_a_fresh_ref_lock_is_waited_for_never_left_behind(w, mod, tmp_path, m
 def test_r5_an_index_ancestor_of_a_row_path_is_saved_and_reapplied(w):
     """#3657 (Codex c4390238983): the index holds a foreign file `sub` while
     the disk holds sub/; restoring sub/s1 drops that entry. It is a row of its
-    own, its blob is saved, and after `git gc --prune=now` the printed steps
-    put the staged `sub` back."""
+    own, its blob is saved, and after `git gc --prune=now` the restore puts
+    the staged `sub` back."""
     killed_tag_side(w, "Z3")
     _lock_aside(w, lambda: _ancestor_file(w))
     index_before = _git(w.root, "ls-files", "-s", "-z")
@@ -1459,17 +1468,17 @@ def test_r5_an_index_ancestor_of_a_row_path_is_saved_and_reapplied(w):
     _gc(w)
     gone = subprocess.run(["git", "-C", str(w.root), "cat-file", "-e", oid], env=_git_env())
     assert gone.returncode != 0, "control: gc pruned the staged blob"
-    _run_steps(w)
+    restore_all(w)
     assert _git(w.root, "ls-files", "-s", "-z") == index_before
     assert _git(w.root, "cat-file", "blob", oid) == "STAGED SUB"
 
 
 @pytest.mark.parametrize("ancestor", [False, True], ids=["staged-child", "ancestor-file"])
-def test_r5_no_reapply_step_reaches_through_a_restored_symlink(w, tmp_path, ancestor):
+def test_r5_no_restore_reaches_through_a_restored_symlink(w, tmp_path, ancestor):
     """#3658 (Codex c4390238996): `sub` is a foreign symlink to a directory
     outside the checkout and the index holds foreign content at sub/s1 (or,
     with #3657, a foreign file `sub`). The repair never reads through the link;
-    neither may its steps: the outside file survives them unchanged, the child
+    neither may the restore: the outside file survives it unchanged, the child
     gets only its index state back, and its row says it was not reachable."""
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -1495,14 +1504,11 @@ def test_r5_no_reapply_step_reaches_through_a_restored_symlink(w, tmp_path, ance
     if not ancestor:
         assert rows["sub/s1"]["class"] == "foreign", rows["sub/s1"]
         assert rows["sub/s1"].get("unreachable_through") == "sub", rows["sub/s1"]
-        [child] = [s for s in reapply_steps(w) if "sub/s1" in s]
-        assert "rm -rf" not in child and "cp -a" not in child, child
-        assert "not reachable through" in child, child
     _gc(w)
-    _run_steps(w)
-    assert (outside / "s1").exists(), "a re-apply step deleted a file outside the checkout"
+    restore_all(w)
+    assert (outside / "s1").exists(), "the restore deleted a file outside the checkout"
     assert (outside / "s1").read_text() == "not the checkout's\n"
-    assert sorted(p.name for p in outside.iterdir()) == ["s1"], "a step wrote outside"
+    assert sorted(p.name for p in outside.iterdir()) == ["s1"], "the restore wrote outside"
     assert os.readlink(w.root / "sub") == str(outside)
     assert _git(w.root, "ls-files", "-s", "-z") == index_before
 

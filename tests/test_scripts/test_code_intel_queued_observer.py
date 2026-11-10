@@ -91,6 +91,8 @@ def test_real_journal_gate_refusal_preserves_hold_without_starting_child(scope, 
     (proc / 'self/cgroup').write_text(membership)
     (proc / 'self/task' / str(os.getpid()) / 'cgroup').write_text(membership)
     probe.unit = unit
+    # H binds the reservation owner to the real boot; mirror it in scratch proc.
+    (proc / 'sys/kernel/random/boot_id').write_text(reserved['owner']['boot_id'])
     baseline = probe.capture()
     registered = {'unit': unit, 'invocation_id': '1' * 32, 'facts': baseline, 'stop_usec': 90_000_000}
     assert queue.reserve_launch(context, reserved) == 'reserved'
@@ -242,6 +244,8 @@ def test_release_error_preserves_real_journal_completion_and_never_resends(scope
     (proc / "self/cgroup").write_text(membership)
     (proc / "self/task" / str(os.getpid()) / "cgroup").write_text(membership)
     probe.unit = unit
+    # This journal-bound fixture represents the reservation owner's boot.
+    (proc / "sys/kernel/random/boot_id").write_text(reserved["owner"]["boot_id"])
     baseline = probe.capture()
     registered = {"unit": unit, "invocation_id": "1" * 32, "facts": baseline, "stop_usec": 90_000_000}
     assert queue.reserve_launch(context, reserved) == "reserved"

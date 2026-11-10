@@ -23,10 +23,10 @@ checkout alike, and it adds or removes no registration.
   which execs either that stdio command or the configured adapter. The final process
   is the same `python genesis_mcp_server.py …` on the stdio path, so process census
   and spawn identity see what they always saw.
-- **Never routed:** any argv other than the registered `--server <name>` form, so
-  Codex (`--external-client`, which `scripts/codex_external_mcp.py` passes; the Codex
-  switch is separate) always runs stdio; and any spawn while
-  `GENESIS_MCP_SHARED_DISABLED` is set to anything but `0`.
+- **Never routed:** any argv other than the registered `--server <name>` form
+  (the unattended Codex floor passes `--external-client`); any spawn carrying
+  `GENESIS_CALLER_PROFILE` (owner-mode Codex, whose label a shared service would not
+  see); and any spawn while `GENESIS_MCP_SHARED_DISABLED` is set to anything but `0`.
 - **On any error** (an unreadable overlay, an unknown stage name) the helper launches
   the stdio server and says why on stderr, which Claude Code keeps in its MCP log.
 
@@ -60,6 +60,28 @@ key. The shared service and the adapter use these names, or the install sets its
 in the overlay. Adapter argv placeholders: `{python}` `{root}` `{server}` `{url}`
 `{stage}`. These names and the adapter contract are provisional: the shared
 service and the adapter own them and set their own where they differ.
+
+The configuration reader remains inside the self-contained stdlib CLI,
+`scripts/lib/mcp_rollout.py`. Extraction into `src/` waits for the first actual
+runtime consumer. Overlay merges stay shallow: a server key replaces that key,
+including a complete nested `service` object. JSON is read as UTF-8 even under
+an ASCII process locale. Direct execution works with `python -I -S` and imports
+no Genesis, MCP, or provider modules. A truthy non-object `servers` value reports
+a configuration error; legacy falsy values still mean no server overrides.
+
+The deploy helper captures the complete CLI source when sourced, then compiles
+it in its own namespace and invokes its real entry point from a fixed bootstrap.
+Future imports remain legal and CLI names cannot overwrite bootstrap dispatch.
+A nonempty snapshot stays fixed through source replacement or removal, including
+when executing the snapshot fails. If startup capture was missing or empty, the
+restart invocation can capture the CLI from its supplied synchronized checkout.
+The code-only deploy sources this helper before synchronization; the full update
+sources it after pulling. Each path invokes it once. Missing entry points,
+non-integer exit status, and capture/configuration failures return nonzero before
+shared-unit actions. Systemd failures retain their existing per-unit reporting.
+
+Package floors remain FastMCP 4.1.4 and MCP 2.3.0. A dependency range does not
+qualify every later release. No service is activated or routing stage advanced.
 
 A session decides once, when Claude Code spawns its MCP servers. Changing the stage
 affects new sessions; running ones keep the command they started with.
@@ -105,6 +127,10 @@ state and what a new session would launch, with the reason.
 Before any of these: the service calls `genesis.caller_context.enter_shared_service()`
 before its first request, or work that loses its request scope reads the service's own
 environment as its caller and passes human-only gates.
+Once selected, both `caller_context()` without a request and the explicit
+`caller_context_from_env()` return the untrusted lost-scope caller, even if
+identity environment variables change later. Only `caller_context()` selects
+validated request identity; ordinary legacy environment reads remain raw.
 
 Each step runs on one session first (`GENESIS_MCP_SHARED_STAGE=<stage>` in that
 session's environment), then for the install (the overlay).
