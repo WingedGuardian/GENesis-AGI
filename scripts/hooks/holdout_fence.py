@@ -74,6 +74,9 @@ WHAT IT CANNOT SEE
 ==================
 - a path built at run time (``cat "$D/HOLDOUT.md"`` with ``D`` set earlier, an
   interpreter that opens it), until its content shows up in a result;
+- paths a command receives on stdin (``echo PATH | xargs cat``), and actions run
+  by ``find`` on a directory ABOVE the holdout (``find ~/.genesis -exec cat {} +``,
+  logged ``broad``), unless their output reaches the result;
 - an expected-output line under 40 characters, or content past the first 2 MiB;
 - clients other than Claude Code and Codex CLI, and any process outside an agent
   session.
@@ -418,8 +421,8 @@ def _shell_hits(command: str, cwd: str, roots: list[str], holdout: str) -> list[
     # Redirect targets are read off the command text: the parser drops them from
     # each segment's argv and raw text. Relative ones are judged from the cwd the
     # call started in, which a cd earlier in the line can make wrong.
-    for target in _REDIRECT_TARGET.findall(stripped):
-        if _best(target.strip("'\""), cwd, roots) == "exact":
+    for target in _redirect_targets(stripped):
+        if _best(target, cwd, roots) == "exact":
             hits.append(("access", command))
     base = cwd
     for seg in segments:
@@ -450,7 +453,7 @@ def _shell_hits(command: str, cwd: str, roots: list[str], holdout: str) -> list[
             if any(_mentions(a, roots) or _best(a, base, roots) == "exact" for a in args):
                 hits.append(("mention", command))
             continue
-        if verb in SEARCHERS and positionals and not patterns:
+        if verb in SEARCHERS and positionals and not patterns and not pattern_files:
             pattern = positionals.pop(0)
             if _mentions(pattern, roots):
                 hits.append(("mention", command))
@@ -482,6 +485,29 @@ def _shell_hits(command: str, cwd: str, roots: list[str], holdout: str) -> list[
             ):
                 hits.append(("broad", command))
     return hits
+
+
+def _redirect_targets(command: str) -> list[str]:
+    """Redirect targets outside quotes: ``> f``, ``>> f``, ``< f``, ``2> f``, ``&> f``.
+
+    Tokenised with shell quoting, so ``echo 'cat > x'`` has none. A command the
+    tokeniser cannot read falls back to the plain scan, the safe direction.
+    """
+    import shlex
+
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="<>&|;()")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return [t.strip("'\"") for t in _REDIRECT_TARGET.findall(command)]
+    targets: list[str] = []
+    for i, tok in enumerate(tokens[:-1]):
+        if tok.lstrip("&").rstrip("|") in (">", ">>", "<") and not tok.startswith("<<"):
+            nxt = tokens[i + 1]
+            if nxt and nxt[0] not in "<>&|;()":
+                targets.append(nxt)
+    return targets
 
 
 def _strip_heredocs(command: str) -> tuple[str, list[tuple[str, str]]]:
@@ -702,8 +728,7 @@ def _result_text(resp: object) -> str:
         if isinstance(node, str):
             decoded = _json_container(node)
             if decoded is not None:
-                stack.append(decoded)  # an MCP result is a JSON string; walk its text
-                continue
+                stack.append(decoded)  # an MCP result is a JSON string; walk its text too
             parts.append(node)
             size += len(node)
         elif isinstance(node, dict):

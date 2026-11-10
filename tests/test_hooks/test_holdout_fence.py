@@ -640,3 +640,35 @@ def test_a_json_encoded_mcp_result_is_decoded_before_matching(home):
     response = json.dumps({"result": quoted})  # escaped quotes in the serialized string
     _, rows = _run(home, "post", _post("mcp__genesis-memory__memory_recall", response))
     assert rows and rows[0]["kind"] == "content"
+
+
+@pytest.mark.parametrize(
+    "command", ["rg -f /tmp/patterns ~/.genesis/holdout", "grep -f /tmp/p -r ~/.genesis/holdout"]
+)
+def test_with_a_pattern_file_every_positional_is_a_path(home, command):
+    out, rows = _run(home, "pre", _pre("Bash", {"command": command}))
+    assert "HOLDOUT FENCE" in _note(out), command
+    assert [r["kind"] for r in rows] == ["access"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo 'write it with cat > ~/.genesis/holdout/HOLDOUT.md'",
+        "gh pr comment 1 --body 'Avoid cat > ~/.genesis/holdout/HOLDOUT.md'",
+    ],
+)
+def test_redirect_syntax_inside_quotes_is_a_mention(home, command):
+    out, rows = _run(home, "pre", _pre("Bash", {"command": command}))
+    assert out.strip() == "", command
+    assert [r["kind"] for r in rows] == ["mention"]
+
+
+def test_an_expected_line_that_is_json_still_matches(home):
+    json_line = (
+        '{"status": "denied", "reason": "this approval requires an explicit owner decision"}'
+    )
+    md = home / ".genesis" / "holdout" / "HOLDOUT.md"
+    md.write_text(md.read_text().replace(EXPECT_LINE, json_line))
+    _, rows = _run(home, "post", _post("Bash", {"stdout": json_line}))
+    assert rows and rows[0]["kind"] == "content"
