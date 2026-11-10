@@ -1,1 +1,1 @@
-Fixed: Vault initialization and migration refuse an unknown server service state.
+- Vault initialization and migration refuse an unknown server service state.
