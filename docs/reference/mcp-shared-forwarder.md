@@ -22,8 +22,13 @@ frontend, add no bookmark metadata or feature requirement. An opting-in memory
 peer validates its path and requires exact integer
 `plan_bookmark_pending_version: 1` from authenticated `/status` on every
 connection generation, alongside existing service/transport/catalog checks.
-Missing, mismatched or wrongly typed capability refuses before tool dispatch;
-reconnection does not bypass it. Only `tools/call` gains the reserved
+Missing, mismatched or wrongly typed capability refuses before tool dispatch
+when a logical generation is created. A modern idle HTTP peer can retain that
+generation across backend process replacement, so the check does not fence a
+rollback to a server that accepts `/mcp/v1` but lacks this bookmark contract.
+Such a server can return tool success without the bookmark effect. Consumer
+wiring is blocked until request execution is bound to the required contract;
+a separate status GET alone leaves a check/use race. Only `tools/call` gains the reserved
 `genesis/planBookmarkPending` metadata, with arguments, IDs and other metadata
 preserved. A client-supplied reserved key refuses before network activity.
 The ordinary memory frontend is the next consumer; this increment does not

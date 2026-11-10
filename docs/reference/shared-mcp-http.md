@@ -88,7 +88,11 @@ on exit/cancellation and is usable only with its captured authenticated caller.
 SDK argument validation precedes the actual memory guard and background job.
 Shared initialization remains `process_pending_bookmarks=False`, so lost scope
 never falls back to the server's pending file. Jobs capture the path and its
-sibling session directory before detaching. Ordinary memory routing is a later
+sibling session directory before detaching. Capability advertisement and the
+peer's logical-generation check do not fence an idle modern HTTP peer against
+backend replacement: a pre-contract server may still accept `/mcp/v1` and omit
+the bookmark effect. The dependent consumer remains blocked until the executing
+request is bound to this contract. Ordinary memory routing is a later
 consumer; this contract changes no registrations or rollout defaults.
 
 Targeted tests: pure `test_shared_http_settings.py`; qualified
