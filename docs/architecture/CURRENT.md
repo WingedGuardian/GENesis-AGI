@@ -5313,7 +5313,9 @@ verified: 81bbdb0a9 2026-11-08
   pairs as word data. Hash-containing calls keep the earlier backslash handling
   to avoid a comment/quote regression; generic #3257/#3264 remain partial/open.
   A `#` that starts a word at bash's top level opens a comment the scanner skips
-  (#3473), except in commands containing `<<`.
+  (#3473), except in commands containing `<<`. Comment and double-quoted
+  substitution boundaries the legacy scans may misread are refused, never
+  accepted (#3713 PR 1; same reference doc).
   Existing continuation, heredoc proof, size bounds and nested refusals remain.
   Codex's local CLI also has a budget-only shell action hook in
   `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the
