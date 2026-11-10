@@ -14,6 +14,8 @@ import pytest
 from genesis.awareness import loop
 from genesis.observability import git_health
 
+pytestmark = pytest.mark.real_git_tick
+
 
 def _report(ok: bool, failures=None):
     return git_health.GitHealthReport(

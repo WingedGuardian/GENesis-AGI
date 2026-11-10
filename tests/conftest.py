@@ -397,6 +397,9 @@ pytest_plugins = ["tests._live_fence", "tests._live_closure", "tests._live_outbo
 
 
 def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "real_git_tick: exercise git tick callbacks in an explicitly owned sandbox"
+    )
     _configure_lock_and_basetemp(config)
     # Armed AFTER the lock (a run refused by it exits above) and after basetemp is
     # placed (the fence allows fakes under it). See tests/_live_fence.py.
@@ -538,6 +541,37 @@ def pytest_unconfigure(config):
         lock = getattr(config, "_genesis_pytest_lock", None)
         if lock is not None:
             lock.release()
+
+
+@pytest.fixture(autouse=True)
+def quiet_live_tick(request):
+    """Ordinary ticks cannot replace the install's verdict or recovery bundle."""
+    if request.node.get_closest_marker("real_git_tick"):
+        yield
+        return
+
+    from genesis.awareness import loop
+
+    async def quiet_async(*args, **kwargs):
+        return None
+
+    def quiet_sync(*args, **kwargs):
+        return None
+
+    # Independent ownership survives a test undoing its own monkeypatches.
+    with pytest.MonkeyPatch.context() as isolation:
+        isolation.setattr(loop, "_check_git_health", quiet_async)
+        isolation.setattr(loop, "_publish_repo_bundle_if_due", quiet_async)
+        isolation.setattr(loop, "_dispatch_git_health_deep", quiet_sync)
+        yield
+
+
+@pytest.fixture
+def monkeypatch(quiet_live_tick):
+    # Keep pytest's normal API and lifetime, with an explicit dependency:
+    # shared callback overrides undo BEFORE quiet_live_tick restores originals.
+    with pytest.MonkeyPatch.context() as patch:
+        yield patch
 
 
 # ── Safety: prevent tests from polluting production circuit breaker state ──
