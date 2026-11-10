@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import os
 import time
-
-import litellm
+from types import ModuleType
 
 from genesis.routing.retry import daily_quota_reset_s
 from genesis.routing.types import CallResult, ProviderConfig, RoutingConfig
@@ -118,9 +118,46 @@ _CUSTOM_MODEL_COSTS: dict[str, dict] = {
     },
 }
 
-for _model, _cost in _CUSTOM_MODEL_COSTS.items():
-    if _model not in litellm.model_cost:
-        litellm.model_cost[_model] = _cost
+
+# litellm is imported on first use, not at module load. It takes several
+# seconds to import, and everything that only reads routing config or builds a
+# router (the SessionStart floor check, every standalone MCP server before it
+# answers `initialize`) imports this module without ever making a call (#3558).
+def _litellm() -> ModuleType:
+    """Return the litellm module, importing it and registering custom costs once.
+
+    A ``litellm`` already bound at module level (a test's ``patch``) is returned
+    as-is. The cost registration is idempotent, so a racing second import is
+    harmless.
+    """
+    mod = globals().get("litellm")
+    if mod is None:
+        mod = importlib.import_module("litellm")
+        for _model, _cost in _CUSTOM_MODEL_COSTS.items():
+            if _model not in mod.model_cost:
+                mod.model_cost[_model] = _cost
+        globals()["litellm"] = mod
+    return mod
+
+
+def warm() -> None:
+    """Import litellm now. The server calls this at init so its first call is not slow."""
+    _litellm()
+
+
+async def _litellm_async() -> ModuleType:
+    """``_litellm`` for the event loop: the first import runs in a worker thread."""
+    mod = globals().get("litellm")
+    if mod is not None:
+        return mod
+    return await asyncio.to_thread(_litellm)
+
+
+def __getattr__(name: str) -> ModuleType:
+    # Keeps ``litellm_delegate.litellm`` (and patching it) working before first use.
+    if name == "litellm":
+        return _litellm()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # Module-level cache for the cost-fallback profile registry: loaded ONCE and
@@ -196,6 +233,22 @@ class LiteLLMDelegate:
         self, provider: str, model_id: str, messages: list[dict], **kwargs
     ) -> CallResult:
         """Call a provider via litellm. Returns CallResult."""
+        try:
+            litellm = await _litellm_async()
+        except Exception as e:
+            # A broken install used to fail at import, before any router
+            # existed; now it surfaces here, so keep the CallResult contract.
+            # 400 classifies BAD_REQUEST: fail fast down the chain without
+            # tripping a provider's breaker for a local defect. Not cached, so
+            # a repaired install recovers on the next call.
+            if _should_log_failure(provider):
+                logger.error("litellm could not be imported", exc_info=True)
+            return CallResult(
+                success=False,
+                error=f"litellm could not be imported: {e}",
+                status_code=400,
+                reached_provider=False,
+            )
         cfg = self._config.providers[provider]
         model_string = _build_model_string(cfg)
         api_key = _resolve_api_key(cfg.provider_type)
