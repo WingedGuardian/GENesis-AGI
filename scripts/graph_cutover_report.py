@@ -156,6 +156,11 @@ def render(v) -> str:
         f"  last 14 days: {v.falkordb_traversals} served by falkordb, traffic on "
         f"{v.days_with_traffic} days, {v.cancelled} of {v.traversals} cancelled ({share})"
     )
+    if v.quiet:
+        out.append(
+            f"  {v.quiet} quiet networkx traversals (engine not provisioned): "
+            "neither traffic nor a break"
+        )
     last = v.last_census.isoformat() if v.last_census else "never"
     out.append(f"  census: {v.census_rows} rows, last {last}")
     for reason in v.reasons:
