@@ -186,8 +186,35 @@ def _contexts(
     return [context for context in contexts if context is not None]
 
 
+def held_round(cwd: str, budget: Mapping[str, Any]) -> str | None:
+    """The round head the PR moved past by NO FIX, or None: when nothing
+    between the newest round head behind the tip and the tip
+    is a fix (``fix_rows`` with ``main_merges``, the credit side's reading:
+    merges of main that carry only git's merge, and commits that keep their
+    parent's tree). That round was never answered, so its findings stay owed
+    (``late_findings`` ``held``). A real commit after it, a rebase or
+    force-push that drops it from the graph (#4280), or two newest rounds
+    leave None. Raises ``Refused`` when git cannot relate the two heads (an
+    unfetched head): unknown, never "nothing owed"."""
+    # An open round at the tip (the merge drew findings of its own) does not
+    # answer the round behind it, so that round is held either way.
+    if budget.get("status") != "ok" or budget.get("round_state") not in ("open", "complete"):
+        return None
+    entry = rr._newest_round_behind(budget)
+    if entry is None:
+        return None
+    round_head = str(entry.get("head"))
+    if rr.fix_rows(cwd, round_head, str(budget.get("current_head")), main_merges=True) != []:
+        return None
+    return round_head
+
+
 def late_findings(
-    budget: Mapping[str, Any], cutover: str | None, fix_time: Any = None
+    budget: Mapping[str, Any],
+    cutover: str | None,
+    fix_time: Any = None,
+    *,
+    held: str | None = None,
 ) -> list[dict[str, Any]] | None:
     """The finding keys owed besides the open round, one entry per key (the
     finding plus ``key`` and ``at``), from reviews submitted at or after
@@ -198,8 +225,9 @@ def late_findings(
     A late review (``late`` True) is always owed. One that opened its round
     was the open round's to answer while it was open; it is owed here only
     when it arrived after a fix to its head (``fix_time(head)``, None when
-    nothing has been fixed since). A key the open round owes is never counted
-    twice.
+    nothing has been fixed since), or when its head is ``held`` (``held_round``:
+    the PR moved past it by no fix, so the round was never answered; #4133).
+    A key the open round owes is never counted twice.
 
     None (unknown) for a budget that is not ``ok``, an unreadable cutover, an
     in-graph finding from the cutover on with an unreadable time, a key that
@@ -232,7 +260,7 @@ def late_findings(
         # Whether the finding is owed at all comes first: a finding that owes
         # nothing never makes owed unknown, even with a key that could not be
         # derived.
-        if not late:
+        if not late and head != held:
             if fix_time is None:
                 return None
             fixed = fix_time(head)
@@ -258,11 +286,12 @@ def late_owed(
     *,
     cutover: str | None,
     fix_time: Any = None,
+    held: str | None = None,
 ) -> tuple[list[str] | None, list[str] | None]:
     """``(late_keys, owed)``: every late key from ``cutover`` on, and those not
     in ``covered_late``. ``(None, None)`` when unknown, never a known empty
     next to an unknown."""
-    late = late_findings(budget, cutover, fix_time)
+    late = late_findings(budget, cutover, fix_time, held=held)
     if late is None:
         return None, None
     keys = [item["key"] for item in late]
@@ -560,9 +589,10 @@ def _late_status(
 ) -> dict[str, Any]:
     ok = budget.get("status") == "ok"
     fix_time = fix_time_reader(cwd, str(budget.get("current_head"))) if ok else None
-    state = rr.owed_state(budget, (), now=now, cutover=cutover, fix_time=fix_time)
+    held = held_round(cwd, budget) if ok else None
+    state = rr.owed_state(budget, (), now=now, cutover=cutover, fix_time=fix_time, held=held)
     is_open = ok and state["round_state"] == "open"
-    late = late_findings(budget, cutover, fix_time) if ok else []
+    late = late_findings(budget, cutover, fix_time, held=held) if ok else []
     if not (is_open or late):
         return state
     # Only the open round and late keys judged under a real round read the
@@ -591,4 +621,5 @@ def _late_status(
         cutover=cutover,
         fix_time=fix_time,
         late_covered=late_covered,
+        held=held,
     )
