@@ -28,6 +28,14 @@ A minimal skill for now; its process is designed later. Also read:
   candidate;
 - `build-session`'s "Generalizability Gate" before a spec names where code runs.
 
+**Intent scenarios, when the install keeps a holdout.** If
+`~/.genesis/holdout/HOLDOUT.md` exists (test that it exists; never open it),
+then once the issue's intent is final and before it goes to a builder, spawn the
+`holdout-writer` subagent IN THE FOREGROUND with the issue number and "intent".
+It adds scenarios that fail on the default branch until the change lands, and
+reports only their ids and `Protects` lines. Keep the scenarios out of the issue
+and the spec. `docs/reference/holdout.md` has the rules.
+
 ### Plan documents carry a structured header
 
 A plan doc that outlives one session (`~/.claude/plans/<name>.md`) opens with

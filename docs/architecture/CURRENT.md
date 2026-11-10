@@ -2837,6 +2837,17 @@ verified: c712f1bde 2026-11-06
   idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
   one is age-based and passive. `session_awareness/repo_pulse*.py`.
+- **Holdout scenarios** (shipped; per-install data, none in the repo): hidden
+  exact checks that builders never see, in `~/.genesis/holdout/HOLDOUT.md`,
+  written only by the `holdout-writer` subagent (regression scenarios from
+  today's behaviour, or intent scenarios from a specced issue before it is
+  built). `scripts/holdout_runner.py --pr N` runs each touched scenario at the
+  merge's first parent and at the merge, prints ids, verdicts and `Protects`
+  lines only, and the validating-merges skill ("The holdout check") maps the
+  verdicts into the evidence document. The session observer records nothing for
+  that subagent, so its work stays out of memory. An install without the file
+  has no holdout and the runner says so. Format and rules:
+  `docs/reference/holdout.md`.
 - **Post-merge verification obligations** (shipped; producer automatic; consumer
   the standing validator session, owner-started and self-paced per the
   validating-merges skill's "Standing mode", or any manual validator; nothing

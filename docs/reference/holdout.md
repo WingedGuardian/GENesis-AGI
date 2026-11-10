@@ -1,0 +1,145 @@
+# Holdout scenarios
+
+A holdout is a small set of exact behavioural checks that builders never see.
+A builder writes both a change and its tests, so its tests can agree with its
+code instead of with the intent, and nothing in the PR's own evidence would show
+it. A check that the builder could not read cannot be tuned that way.
+
+Three parts:
+
+- **The scenarios** live on the install, outside the repository:
+  `~/.genesis/holdout/HOLDOUT.md`. They are never committed, never pasted into a
+  PR, an issue, a comment or a prompt, and never read by a session that builds.
+- **The writer** is the `holdout-writer` subagent
+  (`.claude/agents/holdout-writer.md`). It is the only agent that writes or reads
+  the file. The session observer records nothing for it or for the parent's call
+  that spawns it, so its work does not reach memory or recall.
+- **The runner** is `scripts/holdout_runner.py`. Validators run it; it prints
+  scenario ids, verdicts and each scenario's `Protects` line, never the steps or
+  the expected output.
+
+An install with no `HOLDOUT.md` has no holdout: the runner prints
+`no holdout on this install` and exits 0.
+
+## Two kinds of scenario
+
+- **Regression** (`Expect-before: PASS`): written from today's behaviour of code
+  that matters, preferring behaviour no test pins. It must pass on the default
+  branch now. It catches a later PR that breaks it.
+- **Intent** (`Expect-before: FAIL`, with `Issue: N`): written at spec time from
+  an issue's stated intent, before the issue goes to a builder. It must fail on
+  the default branch now and pass once the change lands. This is the case a
+  holdout exists for: the builder never sees what it will be judged against. It
+  is judged only against a PR that links issue N (GitHub lists it as closed by
+  the PR, or the body says `closes`, `fixes`, `resolves`, `implements` or `part of`), so an
+  unrelated PR touching the same files is never charged with it. A plain mention
+  of `#N` does not link. A linked PR runs the scenario whatever files it touched.
+  Once it is `DELIVERED`, the writer retires it and adds a regression scenario
+  for the same behaviour in its place.
+
+## Format
+
+Each scenario is one section. Field lines are `Name: value`; `Steps:` and
+`Expect:` are each followed by a fenced block.
+
+````text
+## H-01 short title
+Protects: the intent, in one line (printed by the runner)
+Touches: scripts/hooks/example.py, scripts/hooks/other_*.py
+Expect-before: PASS
+Expect-exit: 0
+Issue: 123
+Author: holdout-writer, 2026-11-10
+Control: the mutant it was checked against, and that it failed there
+Steps:
+```sh
+"$HOLDOUT_PYTHON" - <<'PY'
+...
+PY
+```
+Expect:
+```
+exact standard output
+```
+````
+
+- `Touches` is a comma-separated list of path globs. A scenario runs for a PR
+  only when one matches a file the merge changed.
+- `Expect-before` is required. `Issue` is required for `Expect-before: FAIL`
+  and ignored otherwise. `Expect-exit` defaults to `0`.
+- A scenario passes when its exit status equals `Expect-exit` and its standard
+  output equals the `Expect` block (trailing newlines ignored).
+- Steps run with `bash` in the checkout under test, with `HOLDOUT_ROOT` set to
+  it and that checkout's `src` first on `PYTHONPATH`, so `import genesis` loads
+  the code under test. Run Python as `"$HOLDOUT_PYTHON"`, the runner's own
+  interpreter (run the runner with the checkout's `.venv/bin/python`). `HOME`,
+  `TMPDIR`, `GENESIS_HOME` and `GENESIS_DB_PATH` are temporary, `QDRANT_URL`
+  points at an unroutable address, and only locale, terminal and user-name
+  variables are inherited: no tokens, no SSH agent. There is no network isolation, so steps must not use
+  the network. They must be deterministic and write nothing outside the
+  temporary directories. A step running past 120 seconds fails, and everything it
+  started is killed.
+- A failing run's standard output is shown (up to 400 characters); standard
+  error never is. So a step must never print the value it checks against, only
+  the value it observed.
+- Any heading that is not a scenario heading ends the scenario above it, and
+  fenced blocks outside a `Steps` or `Expect` slot are ignored. A line starting
+  `## H-` always starts a scenario, even inside such a block, so never write one
+  in notes. A heading must be exactly `## H-<digits> title`; anything else is
+  reported as malformed.
+- An expected output must fit in 1 MiB, and no file a step writes may pass
+  64 MiB. Anything a step leaves running is killed when it ends.
+
+**Tighten, never loosen.** A scenario that fails is never edited to pass. If the
+failure was a real defect, the scenario has done its job; if the scenario was
+wrong, it is retired (deleted) and a new one is written. Either way the old one
+is spent, because its failure has been seen.
+
+## What the runner reports
+
+`.venv/bin/python scripts/holdout_runner.py --pr N` (from the main checkout) runs each touched scenario at the
+merge commit's first parent and at the merge commit, in detached temporary
+worktrees, and prints one line per scenario:
+
+| Verdict | Means | How a validator records it |
+|---|---|---|
+| `PASS` | regression held at both commits | a finding (information); not a control, because nothing had to come out the other way |
+| `DELIVERED` | intent scenario for a linked issue: fails before, passes after | a `controls` entry; then the writer retires it into a regression scenario |
+| `REGRESSED` | passed before this merge, fails after | a failed claim at `MEASURED`: `fail-intent` |
+| `NOT-DELIVERED` | intent scenario for a linked issue fails at the merge | a failed claim at `MEASURED`: `fail-intent` |
+| `PENDING` | intent scenario for an issue this PR does not link; still fails | nothing: not this PR's work |
+| `DELIVERED-UNLINKED` | intent scenario for an issue this PR does not link now passes | a finding: the work landed without naming the issue |
+| `FIXED` | failed before, passes after | a finding |
+| `BROKEN-BEFORE` | fails at both | a finding and an issue about the default branch, not this PR |
+| `STALE-INTENT` | intent scenario already passed before the merge | a finding: the scenario is wrong or the work landed elsewhere |
+| `MALFORMED` | the scenario cannot be parsed | a finding for the writer |
+
+A failing arm shows its exit status and up to 400 characters of its output,
+never the expected output. Exit status: 0 no attributable failure, 1 a
+`REGRESSED` or `NOT-DELIVERED` verdict, 2 usage error, 3 the run could not be
+completed (it says why: not merged, merged into another branch, a git or `gh`
+error, an unreadable file). The parent arm is the merge commit's first parent,
+which is the default branch before the merge under squash merges, the only
+method this repository allows.
+
+`--at-path DIR [--scenario H-NN ...]` runs scenarios against a directory and
+prints `PASS` or `FAIL` per id. The writer uses it to check a new scenario on the
+current tree and on a deliberately broken copy.
+
+## Rules for sessions
+
+- Never open, list, search or quote `~/.genesis/holdout/`. Run the runner.
+- Spawn `holdout-writer` in the FOREGROUND (not in the background). A
+  background agent's final report arrives as a notification message in the
+  parent's transcript, which memory extraction reads; a foreground agent's
+  report is a tool result, which it does not. Its report carries ids and
+  `Protects` lines only, but the rule keeps it that way if one slips.
+- Do not ask the writer what a scenario checks beyond its `Protects` line.
+
+## Known limits
+
+- Only Claude Code subagents are kept out of the session observer. A session in
+  another client that reads the file is not.
+- A parent session that reads the file with its own tools is observed as usual.
+- Transcript analytics stores subagent Bash commands, including the writer's;
+  that store is not shown to sessions by proactive recall.

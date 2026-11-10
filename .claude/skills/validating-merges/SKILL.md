@@ -566,6 +566,30 @@ refusal rule was tested only on its release half, and the defect was in the serv
 half; another's post-save warning was tested on one stop path, and a second path
 lacked it. Open issues named both defects, and neither was read.
 
+### The holdout check
+
+An install may keep hidden holdout scenarios that builders never see
+(`docs/reference/holdout.md`). For every row, run
+`.venv/bin/python scripts/holdout_runner.py --pr <N>` from the main checkout. It
+prints `no holdout on this install`, or one line per scenario the merge touches.
+Record it:
+
+- `REGRESSED` and `NOT-DELIVERED` are a claim that failed at `MEASURED`, so the
+  row derives `fail-intent`.
+- `DELIVERED` goes in `controls`: it failed before the merge and passes after.
+  Then spawn `holdout-writer` in the foreground to retire it into a regression
+  scenario.
+- `PASS` is a finding, never a control: nothing had to come out the other way.
+- `PENDING` needs nothing: the scenario belongs to another issue's work.
+- `BROKEN-BEFORE`, `STALE-INTENT`, `FIXED`, `DELIVERED-UNLINKED` and `MALFORMED`
+  are findings about the default branch or the scenario, never this row's
+  verdict. File or reuse an issue for `BROKEN-BEFORE`, and tell the owner about
+  the rest.
+- Exit 3 (the run could not be completed) is a gap naming the reason it printed.
+
+Never open, list or quote `~/.genesis/holdout/` yourself, and never ask what a
+scenario checks beyond its printed `Protects` line: reading it spoils it.
+
 ---
 
 ## Hard limits
