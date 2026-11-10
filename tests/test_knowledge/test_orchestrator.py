@@ -12,6 +12,15 @@ from genesis.knowledge.processors.registry import ContentProcessorRegistry
 from genesis.knowledge.processors.text import TextProcessor
 
 
+def _db_without_references():
+    """Stub the async cursor protocol for the new global reference read."""
+    db = MagicMock()
+    cursor = db.execute.return_value.__aenter__.return_value
+    cursor.fetchall.return_value = []
+    cursor.description = [("qdrant_id",)]
+    return db
+
+
 def _wire_store_mock(mock_store, *, ids=None, side_effect=None, created=True):
     """Stub BOTH store surfaces on a mocked MemoryStore.
 
@@ -21,8 +30,8 @@ def _wire_store_mock(mock_store, *, ids=None, side_effect=None, created=True):
     and compensating for it would delete their vector (Codex P1, PR #1653).
 
     ``store`` is stubbed alongside it so a test that asserts on the older
-    surface keeps working, and ``_db`` is a real AsyncMock because the
-    compensation path now removes the memory_fts and memory_metadata rows too.
+    surface keeps working, and ``_db`` models the async cursor protocol for global-reference checks
+    before compensation deletes the memory_fts and memory_metadata rows.
     """
     if side_effect is not None:
         async def _reporting(*a, **kw):
@@ -35,7 +44,7 @@ def _wire_store_mock(mock_store, *, ids=None, side_effect=None, created=True):
         mock_store.store_reporting_creation = AsyncMock(
             side_effect=[(i, created) for i in seq]
         )
-    mock_store._db = AsyncMock()
+    mock_store._db = _db_without_references()
     # Compensation delegates to MemoryStore.delete(), which is the whole
     # point: it carries the tombstone, the defer-when-Qdrant-is-down
     # behaviour and all five cascades that a hand-rolled subset missed.
@@ -204,6 +213,7 @@ async def test_store_units_rollback_on_failure(tmp_path: Path):
         yield mock_own
 
     mock_store = MagicMock()
+    mock_store._db = _db_without_references()
     # store() succeeds for first 2 calls, then the 3rd SQLite insert fails
     _wire_store_mock(mock_store, ids=["qid-0", "qid-1", "qid-2"])
     mock_store._qdrant = MagicMock()
@@ -474,6 +484,7 @@ async def test_no_qdrant_write_happens_inside_the_sqlite_transaction(tmp_path: P
         return f"qid-{len([t for t in trace if t == 'qdrant-store']) - 1}"
 
     mock_store = MagicMock()
+    mock_store._db = _db_without_references()
     _wire_store_mock(mock_store, side_effect=_store)
     mock_store._qdrant = MagicMock()
     mock_store._embeddings = MagicMock(model_name="test-model")
@@ -520,6 +531,7 @@ async def test_a_rollback_does_not_delete_the_vector_a_surviving_row_points_at(
         yield mock_own
 
     mock_store = MagicMock()
+    mock_store._db = _db_without_references()
     _wire_store_mock(mock_store, ids=["qid-new-0", "qid-new-1"])
     mock_store._qdrant = MagicMock()
     mock_store._embeddings = MagicMock(model_name="test-model")
@@ -568,6 +580,7 @@ async def test_a_successful_batch_still_drops_the_superseded_vector(tmp_path: Pa
         yield mock_own
 
     mock_store = MagicMock()
+    mock_store._db = _db_without_references()
     _wire_store_mock(mock_store, ids=["qid-new"])
     mock_store._qdrant = MagicMock()
     mock_store._embeddings = MagicMock(model_name="test-model")
@@ -624,6 +637,7 @@ async def test_a_failure_opening_the_owned_connection_still_drops_phase_one_vect
         return stored[-1]
 
     mock_store = MagicMock()
+    mock_store._db = _db_without_references()
     _wire_store_mock(mock_store, side_effect=_store)
     mock_store._qdrant = MagicMock()
     mock_store._embeddings = MagicMock(model_name="test-model")
@@ -669,9 +683,10 @@ async def test_a_deduplicated_vector_is_never_compensated(tmp_path: Path):
     outcomes = [("qid-0", True), ("qid-PREEXISTING", False), ("qid-2", True)]
 
     mock_store = MagicMock()
+    mock_store._db = _db_without_references()
     mock_store.store_reporting_creation = AsyncMock(side_effect=list(outcomes))
     mock_store.store = AsyncMock(side_effect=[i for i, _ in outcomes])
-    mock_store._db = AsyncMock()
+    mock_store._db = _db_without_references()
     mock_store._qdrant = MagicMock()
     mock_store._embeddings = MagicMock(model_name="test-model")
 
@@ -724,6 +739,7 @@ async def test_compensation_delegates_to_the_complete_delete(tmp_path: Path):
         yield  # pragma: no cover - unreachable, required to make this a CM
 
     mock_store = MagicMock()
+    mock_store._db = _db_without_references()
     _wire_store_mock(mock_store, ids=["qid-0", "qid-1"])
     mock_store._qdrant = MagicMock()
     mock_store._embeddings = MagicMock(model_name="test-model")
@@ -758,6 +774,7 @@ async def test_a_deferred_compensation_is_reported_not_swallowed(tmp_path: Path)
         yield  # pragma: no cover - unreachable, required to make this a CM
 
     mock_store = MagicMock()
+    mock_store._db = _db_without_references()
     _wire_store_mock(mock_store, ids=["qid-0"])
     mock_store._qdrant = MagicMock()
     mock_store._embeddings = MagicMock(model_name="test-model")
@@ -844,6 +861,7 @@ async def test_compensation_survives_a_cancel_scope_that_redelivers(tmp_path):
         return {"deferred": False}
 
     mock_store = MagicMock()
+    mock_store._db = _db_without_references()
     mock_store.store_reporting_creation = AsyncMock(
         side_effect=[("qid-0", True), ("qid-1", True), ("qid-2", True)]
     )
