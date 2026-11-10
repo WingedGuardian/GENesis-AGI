@@ -265,6 +265,9 @@ class SentinelResult:
     actions_taken: list[str] = field(default_factory=list)
     proposed_actions: list[dict] = field(default_factory=list)
     resolved: bool = False
+    # Per executed action: command, success, and the head of its stdout/stderr,
+    # so the observation and log say what each action actually did.
+    action_outputs: list[dict] = field(default_factory=list)
     observation_id: str = ""
     reason: str = ""  # Why dispatched or skipped
     duration_s: float = 0.0
@@ -273,6 +276,34 @@ class SentinelResult:
     # trust its self-reported resolution — including the no-action-phrase
     # heuristic in _finalize_dispatch.
     degraded: bool = False
+
+
+def _record_execution(
+    result: SentinelResult, proposed: list[dict], executed: list[dict],
+) -> None:
+    """Record what the approved actions did, and resolve only if ALL succeeded.
+
+    A dispatch used to count as resolved whenever any action ran, whatever its
+    exit code, so a failed or partial fix read as "Sentinel resolved" (#4302).
+    An action that could not even start (OSError) is missing from ``executed``,
+    which also leaves the dispatch unresolved.
+    """
+    result.actions_taken = [a["command"] for a in executed]
+    result.action_outputs = [
+        {
+            "command": a["command"],
+            "success": bool(a.get("success")),
+            "stdout": a.get("stdout", ""),
+            "stderr": a.get("stderr", ""),
+        }
+        for a in executed
+    ]
+    wanted = [a for a in proposed if a.get("command")]
+    result.resolved = (
+        bool(wanted)
+        and len(executed) == len(wanted)
+        and all(a.get("success") for a in executed)
+    )
 
 
 def _extract_pattern(request: SentinelRequest) -> str:
@@ -761,8 +792,7 @@ class SentinelDispatcher:
                 try:
                     executed = await self._approve_and_execute_actions(result)
                     if executed:
-                        result.resolved = True
-                        result.actions_taken = [a["command"] for a in executed]
+                        _record_execution(result, result.proposed_actions, executed)
                 except Exception:
                     logger.error("Sentinel action approval/execution failed", exc_info=True)
 
@@ -771,8 +801,7 @@ class SentinelDispatcher:
                 try:
                     executed = await self._execute_approved_actions(result.proposed_actions)
                     if executed:
-                        result.resolved = True
-                        result.actions_taken = [a["command"] for a in executed]
+                        _record_execution(result, result.proposed_actions, executed)
                 except Exception:
                     logger.error("Sentinel action execution failed", exc_info=True)
 
@@ -983,6 +1012,7 @@ class SentinelDispatcher:
             "resolved": result.resolved,
             "diagnosis": result.diagnosis[:200] if result.diagnosis else "",
             "actions_taken": result.actions_taken,
+            "action_outputs": result.action_outputs,
             "duration_s": round(duration, 1),
             "session_id": result.session_id,
         })
@@ -994,12 +1024,19 @@ class SentinelDispatcher:
             except Exception:
                 logger.error("Failed to create sentinel observation", exc_info=True)
 
-        # Emit completion event
+        # Emit completion event. When actions ran, say how many succeeded:
+        # a failed fix must not read like a clean one.
+        failed = [a for a in result.action_outputs if not a["success"]]
+        outcome = (
+            f" — actions: {len(result.action_outputs) - len(failed)} of "
+            f"{len(result.action_outputs)} succeeded"
+            if result.action_outputs else ""
+        )
         await self._emit_event(
             "INFO" if result.resolved else "WARNING",
             "sentinel.completed",
             f"Sentinel {'resolved' if result.resolved else 'escalated'}: "
-            f"{result.diagnosis[:100] if result.diagnosis else 'no diagnosis'}",
+            f"{result.diagnosis[:100] if result.diagnosis else 'no diagnosis'}{outcome}",
         )
 
         return result
@@ -1129,8 +1166,7 @@ class SentinelDispatcher:
                 try:
                     executed = await self._execute_approved_actions(cc_result.proposed_actions)
                     if executed:
-                        cc_result.resolved = True
-                        cc_result.actions_taken = [a["command"] for a in executed]
+                        _record_execution(cc_result, cc_result.proposed_actions, executed)
                 except Exception:
                     logger.error("Sentinel action execution failed on resume", exc_info=True)
                 return await self._finalize_dispatch(request, cc_result, pattern=pattern)
@@ -1691,6 +1727,7 @@ class SentinelDispatcher:
             "tier": request.tier,
             "diagnosis": result.diagnosis[:500] if result.diagnosis else "",
             "actions_taken": result.actions_taken,
+            "action_outputs": result.action_outputs,
             "resolved": result.resolved,
             "duration_s": round(result.duration_s, 1),
             "session_id": result.session_id,

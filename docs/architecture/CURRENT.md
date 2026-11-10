@@ -2295,7 +2295,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 4721e0d93 2026-11-07
+verified: 0aa0bf9f2 2026-11-10
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -2549,7 +2549,18 @@ verified: 4721e0d93 2026-11-07
   `"live"` is NOT implemented (dispatcher warns + downgrades); every proposed
   action requires human approval. `InfrastructureMonitor` (call site 37, free
   models) observes each awareness tick and wakes the dispatcher; state persists
-  to `~/.genesis/sentinel_state.json`.
+  to `~/.genesis/sentinel_state.json`. A dispatch counts as resolved only
+  when EVERY approved action exited 0 (`_record_execution`); per-action output
+  goes into the observation and log.
+- **sentinel/codex_mcp_stop.py** (`python -m genesis.sentinel.codex_mcp_stop`):
+  the Failure Inventory remedy for memory held by a shared Codex app-server
+  daemon's MCP servers (#4302). Dry-run by default; `--execute` only inside an
+  approved action. Resolves targets when it runs: direct children of a
+  `codex app-server --listen` process that lead their own process group with
+  pipe stdin+stdout, excluding Codex helper binaries, systemd-unit members and
+  anything under a `claude` process. Lever `codex_mcp_stop.mode` in
+  `config/sentinel.yaml` (`propose_only` | `off`) +
+  `GENESIS_CODEX_MCP_STOP_DISABLED=1`.
 - GROUNDWORK: guardian-cgroup, guardian-bidirectional, sentinel-live-autonomy.
 
 ## 9. Ambient cognition — heartbeat, reflection, attention

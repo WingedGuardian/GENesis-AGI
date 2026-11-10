@@ -1521,3 +1521,85 @@ class TestAlarmClearedHysteresis:
         gate.resolve_request.assert_awaited_once()
         ready, _reason = d._backoff_ready("direct:guardian_dialogue")
         assert ready is True
+
+
+class TestHonestActionResults:
+    """A dispatch is resolved only when EVERY approved action succeeded, and the
+    per-action outcome is recorded (#4302). It used to resolve whenever any
+    action ran, whatever its exit code."""
+
+    @staticmethod
+    def _ran(*outcomes):
+        return [
+            {"command": f"cmd{i}", "success": ok, "stdout": f"out{i}", "stderr": ""}
+            for i, ok in enumerate(outcomes)
+        ]
+
+    def test_all_succeeded_resolves(self):
+        from genesis.sentinel.dispatcher import _record_execution
+
+        r = SentinelResult(dispatched=True)
+        proposed = [{"command": "cmd0"}, {"command": "cmd1"}]
+        _record_execution(r, proposed, self._ran(True, True))
+        assert r.resolved is True
+        assert r.actions_taken == ["cmd0", "cmd1"]
+        assert [o["success"] for o in r.action_outputs] == [True, True]
+        assert r.action_outputs[0]["stdout"] == "out0"
+
+    def test_one_failure_does_not_resolve(self):
+        from genesis.sentinel.dispatcher import _record_execution
+
+        r = SentinelResult(dispatched=True)
+        _record_execution(r, [{"command": "cmd0"}, {"command": "cmd1"}], self._ran(True, False))
+        assert r.resolved is False
+        assert r.actions_taken == ["cmd0", "cmd1"]
+
+    def test_an_action_that_never_started_does_not_resolve(self):
+        """OSError leaves the action out of `executed` entirely."""
+        from genesis.sentinel.dispatcher import _record_execution
+
+        r = SentinelResult(dispatched=True)
+        _record_execution(r, [{"command": "cmd0"}, {"command": "cmd1"}], self._ran(True))
+        assert r.resolved is False
+
+    def test_empty_proposal_does_not_resolve(self):
+        from genesis.sentinel.dispatcher import _record_execution
+
+        r = SentinelResult(dispatched=True)
+        _record_execution(r, [{"command": ""}], [])
+        assert r.resolved is False
+
+    @pytest.mark.asyncio
+    async def test_failed_action_escalates_and_says_so(self):
+        """End to end through dispatch(): an approved action that exits non-zero
+        ends ESCALATED, and the completion event counts the failure."""
+        gate = _policy_gate("approved", "req-ok")
+        d = _make_dispatcher(approval_gate=gate)
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        d._invoker.run = AsyncMock(return_value=_proposed_actions_output())
+
+        async def _execute(actions):
+            return [
+                {**a, "success": i == 0, "stdout": "", "stderr": "boom" if i else ""}
+                for i, a in enumerate(actions)
+            ]
+
+        events = []
+
+        async def _emit(severity, event_type, message):
+            events.append((severity, event_type, message))
+
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"), \
+             patch.object(d, "_execute_approved_actions", side_effect=_execute), \
+             patch.object(d, "_emit_event", side_effect=_emit):
+            result = await d.dispatch(SentinelRequest(
+                trigger_source="test", trigger_reason="test alarm", tier=2,
+            ))
+
+        assert result.resolved is False
+        assert d._state.state == SentinelState.ESCALATED
+        completed = [e for e in events if e[1] == "sentinel.completed"]
+        assert completed and completed[0][0] == "WARNING"
+        assert "1 of 2 succeeded" in completed[0][2]

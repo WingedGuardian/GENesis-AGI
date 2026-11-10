@@ -39,3 +39,30 @@ thread API inventory, paginate it and record the API version, collection time,
 last cursor and any unavailable/truncated result. Keep that evidence private;
 do not publish thread titles or transcripts in a PR. Neither age nor low CPU
 establishes a leak or authorizes process cleanup.
+
+## Stopping a shared Codex daemon's MCP servers
+
+The report observes; it never stops anything. The remedy is a separate tool
+that the Sentinel proposes during a container memory alarm, and it runs only
+when the owner approves the proposed action:
+
+```bash
+python -m genesis.sentinel.codex_mcp_stop            # dry-run: list targets, signal nothing
+python -m genesis.sentinel.codex_mcp_stop --execute  # only inside an approved Sentinel action
+```
+
+- **Targets are resolved when the tool runs.** A target is a direct child of a
+  `codex app-server --listen` (shared daemon) process that leads its own process
+  group and talks over pipes on both stdin and stdout.
+- **Excluded:** Codex's own helper binaries, a chat command (Codex runs those in
+  a terminal or with stdin set to `/dev/null`), systemd-unit members, and
+  anything under a Claude Code session. Anything the tool cannot read is skipped
+  and counted.
+- **How it stops them:** each group gets SIGTERM, then SIGKILL after a 5 s grace.
+  Codex does not respawn a killed stdio server, so threads on that daemon lose
+  those tools until they are reopened.
+- **Where the build-up happens:** the daemon path, which editor clients such as
+  the VS Code extension use. A terminal `codex` runs its servers in-process
+  with the TUI, and its subagents share one set.
+- **Turning it off:** `codex_mcp_stop.mode: off` in `config/sentinel.local.yaml`,
+  or `GENESIS_CODEX_MCP_STOP_DISABLED=1`, makes `--execute` refuse (exit 4).
