@@ -1,0 +1,99 @@
+name: Native Codex MCP elicitation qualification
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/codex-elicitation.yml'
+      - '.github/workflows/ci.yml'
+      - '.github/test-tools/**'
+      - 'scripts/ci/codex_elicitation*'
+      - 'scripts/ci/codex_qualification*'
+      - 'scripts/ci/ego_owned_processes.py'
+      - 'tests/test_hooks/*codex*'
+      - 'tests/conftest.py'
+      - 'tests/test_hooks/conftest.py'
+      - 'pyproject.toml'
+      - 'src/genesis/eval/qualification/evidence.py'
+      - 'docs/reference/codex-native-harness.md'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: codex-elicitation-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  contained:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CONTAINER: codex-elicitation-${{ github.run_id }}-${{ github.run_attempt }}
+      SOURCE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+      SOURCE_BASE: ${{ github.event.pull_request.base.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_HEAD }}
+          persist-credentials: false
+      - name: Build the pinned parent image and freeze this probe separately
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          mkdir -p "$RUNNER_TEMP/elicitation-context" "$RUNNER_TEMP/elicitation-evidence"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/elicitation-context"
+          docker build --build-arg SOURCE_HEAD="$SOURCE_HEAD" --build-arg SOURCE_BASE="$SOURCE_BASE" \
+            -f scripts/ci/codex_qualification.Dockerfile -t codex-qualification "$RUNNER_TEMP/elicitation-context" \
+            2>&1 | tee "$RUNNER_TEMP/elicitation-evidence/build-parent.txt"
+          docker build --build-arg PROBE_RUN_ID="${{ github.run_id }}" --build-arg PROBE_ATTEMPT="${{ github.run_attempt }}" \
+            -f scripts/ci/codex_elicitation.Dockerfile -t codex-elicitation "$RUNNER_TEMP/elicitation-context" \
+            2>&1 | tee "$RUNNER_TEMP/elicitation-evidence/build-probe.txt"
+          docker image inspect codex-elicitation > "$RUNNER_TEMP/elicitation-evidence/image.json"
+      - name: Run without network, credentials, host mounts or capabilities
+        run: |
+          set -euo pipefail
+          docker volume create "$CONTAINER"
+          docker create --name "$CONTAINER" --init --network none --read-only \
+            --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges \
+            --pids-limit 256 --memory 3g --memory-swap 3g --cpus 2 \
+            --tmpfs /work:rw,exec,nosuid,nodev,size=1536m,mode=1777 \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=128m,mode=1777 \
+            --mount type=volume,src="$CONTAINER",dst=/evidence codex-elicitation
+          docker container inspect "$CONTAINER" > "$RUNNER_TEMP/elicitation-evidence/container.json"
+          docker cp "$CONTAINER:/fixture/elicitation-expected.json" "$RUNNER_TEMP/elicitation-evidence/expected.json"
+          docker cp "$CONTAINER:/fixture/python-packages.txt" "$RUNNER_TEMP/elicitation-evidence/python-packages.txt"
+          docker cp "$CONTAINER:/fixture/os-packages.txt" "$RUNNER_TEMP/elicitation-evidence/os-packages.txt"
+          docker start -a "$CONTAINER" > "$RUNNER_TEMP/elicitation-evidence/output.txt" 2>&1
+          test "$(docker container inspect --format '{{.State.ExitCode}}' "$CONTAINER")" = 0
+      - name: Collect raw evidence and remove only the owned resources
+        if: always()
+        run: |
+          set -euo pipefail
+          copy_status=0
+          if docker container inspect "$CONTAINER" > /dev/null 2>&1; then
+            docker cp "$CONTAINER:/evidence/." "$RUNNER_TEMP/elicitation-evidence/" || copy_status=$?
+            docker rm -f "$CONTAINER"
+            if docker container inspect "$CONTAINER" > /dev/null 2>&1; then exit 1; fi
+          fi
+          if docker volume inspect "$CONTAINER" > /dev/null 2>&1; then docker volume rm "$CONTAINER"; fi
+          test "$copy_status" = 0
+      - name: Independently read back the copied evidence
+        env:
+          PYTHONPATH: src
+        run: |
+          cp "$RUNNER_TEMP/elicitation-evidence/python-packages.txt" "$RUNNER_TEMP/elicitation-context/python-packages.txt"
+          cp "$RUNNER_TEMP/elicitation-evidence/os-packages.txt" "$RUNNER_TEMP/elicitation-context/os-packages.txt"
+          PYTHONPATH="$RUNNER_TEMP/elicitation-context/src:$RUNNER_TEMP/elicitation-context" \
+            python3 "$RUNNER_TEMP/elicitation-context/scripts/ci/codex_elicitation_readback.py" \
+            "$RUNNER_TEMP/elicitation-evidence/expected.json" "$RUNNER_TEMP/elicitation-evidence/elicitation-report.json" \
+            "$RUNNER_TEMP/elicitation-evidence/native" --head "$SOURCE_HEAD" --base "$SOURCE_BASE" \
+            --run-id "${{ github.run_id }}" --attempt "${{ github.run_attempt }}"
+      - name: Pack complete evidence
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/elicitation-evidence"
+          tar -C "$RUNNER_TEMP/elicitation-evidence" -czf "$RUNNER_TEMP/elicitation-evidence.tar.gz" .
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: codex-elicitation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/elicitation-evidence.tar.gz
+          compression-level: 0
+          if-no-files-found: error
