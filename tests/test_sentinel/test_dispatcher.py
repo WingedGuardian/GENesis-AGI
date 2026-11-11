@@ -862,21 +862,27 @@ class TestSentinelActionStalenessGuard:
         assert d._state.state == SentinelState.HEALTHY
 
     @pytest.mark.asyncio
-    async def test_root_cause_shifted_reinvestigates(self):
-        """When original alarms cleared but new alerts exist, transition to ALARM_DETECTED."""
+    async def test_root_cause_shifted_cancels_stale_actions_and_goes_healthy(self):
+        """Original alarms cleared but other alerts exist: the stale actions do
+        not run, and the Sentinel returns to HEALTHY rather than an idle
+        INVESTIGATING that no session ever leaves (Guardian waits on it)."""
         d = _make_dispatcher()
         _setup_pending_action(d)
 
         new_alerts = [{"alert_id": "different:alarm", "tier": 1}]
+        mock_execute = AsyncMock(return_value=[])
 
         with patch.object(d, "_re_verify_alarms", new_callable=AsyncMock, return_value=False), \
-             patch("genesis.mcp.health_mcp._impl_health_alerts", new_callable=AsyncMock, return_value=new_alerts):
+             patch("genesis.mcp.health_mcp._impl_health_alerts", new_callable=AsyncMock, return_value=new_alerts), \
+             patch.object(d, "_execute_approved_actions", mock_execute):
             result = await d.resume_from_approval("req-action-1", "approved")
 
         assert result is not None
         assert result.dispatched is False
-        assert "shifted" in result.reason.lower() or "re-investigating" in result.reason.lower()
-        assert d._state.state == SentinelState.INVESTIGATING
+        assert "shifted" in result.reason.lower()
+        assert d._state.state == SentinelState.HEALTHY
+        assert not d._state.pending_request_id
+        mock_execute.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_health_check_fails_proceeds_failopen(self):
@@ -1533,6 +1539,305 @@ class TestAlarmClearedHysteresis:
         gate.resolve_request.assert_awaited_once()
         ready, _reason = d._backoff_ready("direct:guardian_dialogue")
         assert ready is True
+
+
+def _alarm(tier: int) -> FireAlarm:
+    return FireAlarm(tier=tier, alert_id=f"test:tier{tier}", severity="WARNING", message=f"t{tier}")
+
+
+class TestTriggeringTierPark:
+    """A parked approval tracks only the alarms at the request's (worst) tier.
+
+    Lower-tier alarms bundled into the request rode along; a long-lived Tier 3
+    WARNING must not keep a Tier 2 park alive after the Tier 2 condition has
+    cleared, nor let a granted approval proceed on its behalf (#3845).
+    """
+
+    # --- helper unit tests -------------------------------------------------
+
+    @staticmethod
+    def _dicts(*tiers):
+        return [{"alert_id": f"test:tier{t}", "tier": t} for t in tiers]
+
+    def test_helper_returns_only_triggering_tier(self):
+        from genesis.sentinel.dispatcher import _triggering_alarm_ids
+
+        assert _triggering_alarm_ids(self._dicts(2, 3), 2) == {"test:tier2"}
+
+    def test_helper_tier1_with_tier2_bundle(self):
+        from genesis.sentinel.dispatcher import _triggering_alarm_ids
+
+        assert _triggering_alarm_ids(self._dicts(1, 2), 1) == {"test:tier1"}
+
+    def test_helper_keeps_all_alarms_at_the_triggering_tier(self):
+        from genesis.sentinel.dispatcher import _triggering_alarm_ids
+
+        alarms = [
+            {"alert_id": "test:tier2a", "tier": 2},
+            {"alert_id": "test:tier2b", "tier": 2},
+            {"alert_id": "test:tier3", "tier": 3},
+        ]
+        assert _triggering_alarm_ids(alarms, 2) == {"test:tier2a", "test:tier2b"}
+
+    def test_helper_legacy_no_request_tier(self):
+        from genesis.sentinel.dispatcher import _triggering_alarm_ids
+
+        assert _triggering_alarm_ids(self._dicts(2, 3), None) == {"test:tier2", "test:tier3"}
+
+    def test_helper_legacy_alarm_without_tier(self):
+        from genesis.sentinel.dispatcher import _triggering_alarm_ids
+
+        alarms = [{"alert_id": "test:tier2", "tier": 2}, {"alert_id": "test:tier3"}]
+        assert _triggering_alarm_ids(alarms, 2) == {"test:tier2", "test:tier3"}
+
+    def test_helper_inconsistent_falls_back(self):
+        from genesis.sentinel.dispatcher import _triggering_alarm_ids
+
+        assert _triggering_alarm_ids(self._dicts(2, 3), 1) == {"test:tier2", "test:tier3"}
+
+    def test_helper_bool_tiers_are_not_ints(self):
+        from genesis.sentinel.dispatcher import _triggering_alarm_ids
+
+        # bool is an int subclass; it must read as "unclassified", not tier 1.
+        assert _triggering_alarm_ids(self._dicts(2, 3), True) == {"test:tier2", "test:tier3"}
+        alarms = [{"alert_id": "test:tier2", "tier": 2}, {"alert_id": "test:tier3", "tier": False}]
+        assert _triggering_alarm_ids(alarms, 2) == {"test:tier2", "test:tier3"}
+
+    def test_helper_malformed_input(self):
+        from genesis.sentinel.dispatcher import _triggering_alarm_ids
+
+        assert _triggering_alarm_ids([{"alert_id": ""}, "junk", {"tier": 2}], 2) == set()
+        assert _triggering_alarm_ids(7, 2) == set()  # not a list: no ids, no raise
+        assert _triggering_alarm_ids({"alert_id": "x", "tier": 2}, 2) == set()
+
+    # --- park-cancel via check_fire_alarms ---------------------------------
+
+    def _parked(self, alarm_tiers, req_tier, state=SentinelState.AWAITING_DISPATCH_APPROVAL,
+                request_id="req-tier-1", legacy=False):
+        import json
+
+        gate = MagicMock()
+        gate.resolve_request = AsyncMock()
+        d = _make_dispatcher(approval_gate=gate)
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        d._state.pending_request_id = request_id
+        d._state.pending_policy_id = (
+            "sentinel_dispatch" if state == SentinelState.AWAITING_DISPATCH_APPROVAL else "sentinel_action"
+        )
+        d._state.pending_pattern = f"test:tier{req_tier}"
+        alarms = [
+            {"alert_id": f"test:tier{t}", "severity": "WARNING", "message": f"t{t}"}
+            if legacy else
+            {"alert_id": f"test:tier{t}", "tier": t, "severity": "WARNING", "message": f"t{t}"}
+            for t in alarm_tiers
+        ]
+        payload = {"alarms": alarms} if legacy else {"tier": req_tier, "alarms": alarms}
+        d._state.pending_request_json = json.dumps(payload)
+        d._state.transition(state, reason="test setup")
+        return d, gate
+
+    async def _ticks(self, d, sequence):
+        """``sequence`` is one list of tiers per tick: the alarms classified then."""
+        calls = [[_alarm(t) for t in tiers] for tiers in sequence]
+
+        def _classify(*args, **kwargs):
+            return calls.pop(0)
+
+        async def _alerts(*args, **kwargs):
+            return []
+
+        with patch("genesis.mcp.health_mcp._impl_health_alerts", new=_alerts), \
+             patch("genesis.sentinel.dispatcher.classify_alerts", new=_classify), \
+             patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"):
+            for _ in sequence:
+                await d.check_fire_alarms()
+        assert calls == []  # every scripted tick was consumed
+
+    @pytest.mark.asyncio
+    async def test_bundled_tier3_does_not_hold_the_park(self):
+        d, gate = self._parked([2, 3], 2)
+        await self._ticks(d, [[3]])
+        assert d._state.state == SentinelState.AWAITING_DISPATCH_APPROVAL
+        gate.resolve_request.assert_not_awaited()
+        await self._ticks(d, [[3]])
+        assert d._state.state == SentinelState.HEALTHY
+        gate.resolve_request.assert_awaited_once_with(
+            "req-tier-1", decision="cancelled", resolved_by="alarm_cleared",
+        )
+        ready, reason = d._backoff_ready("test:tier2")
+        assert ready is False and "cooldown" in reason
+
+    @pytest.mark.asyncio
+    async def test_triggering_tier2_still_active_keeps_the_park(self):
+        d, gate = self._parked([2, 3], 2)
+        await self._ticks(d, [[2, 3], [2, 3], [2, 3]])
+        assert d._state.state == SentinelState.AWAITING_DISPATCH_APPROVAL
+        gate.resolve_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_tier1_park_tracks_tier1_only(self):
+        d, gate = self._parked([1, 2], 1)
+        await self._ticks(d, [[2], [2]])
+        assert d._state.state == SentinelState.HEALTHY
+        gate.resolve_request.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_legacy_request_without_tiers_keeps_old_behaviour(self):
+        d, gate = self._parked([2, 3], 2, legacy=True)
+        await self._ticks(d, [[3], [3]])
+        assert d._state.state == SentinelState.AWAITING_DISPATCH_APPROVAL
+        gate.resolve_request.assert_not_awaited()
+        await self._ticks(d, [[], []])
+        assert d._state.state == SentinelState.HEALTHY
+        gate.resolve_request.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_action_park_uses_triggering_tier(self):
+        d, gate = self._parked([2, 3], 2, state=SentinelState.AWAITING_ACTION_APPROVAL)
+        await self._ticks(d, [[3], [3]])
+        assert d._state.state == SentinelState.HEALTHY
+        gate.resolve_request.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_live_shape_memory_park_with_job_stale_riders_clears(self):
+        """Acceptance replay of the reported shape, through the REAL classifier:
+        a Tier 2 memory action-approval park carrying two Tier 3 job_stale
+        riders. Memory clears while both riders stay active."""
+        import json
+
+        mem = {"id": "infra:container_memory_high", "severity": "CRITICAL", "message": "mem"}
+        riders = [
+            {"id": "job_stale:career_outreach_monitor", "severity": "WARNING", "message": "a"},
+            {"id": "job_stale:skill_security_scan", "severity": "WARNING", "message": "b"},
+        ]
+        from genesis.sentinel.classifier import classify_alerts
+        from genesis.sentinel.remediation_map import available_tools
+
+        parked_alarms = classify_alerts([mem, *riders], available_tools())
+        # Guard the guard: the fixture really has the bundled shape.
+        assert sorted(a.tier for a in parked_alarms) == [2, 3, 3]
+
+        gate = MagicMock()
+        gate.resolve_request = AsyncMock()
+        d = _make_dispatcher(approval_gate=gate)
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        d._state.pending_request_id = "req-live"
+        d._state.pending_policy_id = "sentinel_action"
+        d._state.pending_pattern = "infra:container_memory_high"
+        d._state.pending_request_json = json.dumps({
+            "tier": 2,
+            "alarms": [
+                {"tier": a.tier, "alert_id": a.alert_id, "severity": a.severity, "message": a.message}
+                for a in parked_alarms
+            ],
+        })
+        d._state.transition(SentinelState.AWAITING_ACTION_APPROVAL, reason="test setup")
+
+        async def _alerts(*args, **kwargs):
+            return list(riders)
+
+        with patch("genesis.mcp.health_mcp._impl_health_alerts", new=_alerts), \
+             patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"):
+            await d.check_fire_alarms()
+            assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+            await d.check_fire_alarms()
+
+        assert d._state.state == SentinelState.HEALTHY
+        gate.resolve_request.assert_awaited_once_with(
+            "req-live", decision="cancelled", resolved_by="alarm_cleared",
+        )
+
+    # --- resume re-verify --------------------------------------------------
+
+    @staticmethod
+    def _request(tier=2):
+        return SentinelRequest(
+            trigger_source="fire_alarm", trigger_reason="t", tier=tier,
+            alarms=[_alarm(2), _alarm(3)],
+        )
+
+    async def _re_verify(self, d, req, classified):
+        async def _alerts(*args, **kwargs):
+            return []
+
+        with patch("genesis.mcp.health_mcp._impl_health_alerts", new=_alerts), \
+             patch("genesis.sentinel.dispatcher.classify_alerts",
+                   return_value=[_alarm(t) for t in classified]):
+            return await d._re_verify_alarms(req)
+
+    @pytest.mark.asyncio
+    async def test_re_verify_only_tier3_active_returns_false(self):
+        assert await self._re_verify(_make_dispatcher(), self._request(), [3]) is False
+
+    @pytest.mark.asyncio
+    async def test_re_verify_triggering_active_returns_true(self):
+        assert await self._re_verify(_make_dispatcher(), self._request(), [2]) is True
+
+    @pytest.mark.asyncio
+    async def test_re_verify_request_tier_none_uses_all_ids(self):
+        assert await self._re_verify(_make_dispatcher(), self._request(tier=None), [3]) is True
+
+    @pytest.mark.asyncio
+    async def test_resume_action_with_only_rider_left_cancels_and_goes_healthy(self):
+        """The live shape, approved inside the window before the auto-cancel:
+        the triggering alarm cleared, only the Tier 3 rider is active. The
+        stale actions must not run, and the Sentinel must not be stranded in
+        an idle INVESTIGATING that Guardian waits on."""
+        import json
+
+        from genesis.sentinel.dispatcher import _serialize_request
+
+        d = _make_dispatcher()
+        d._state.pending_policy_id = "sentinel_action"
+        d._state.pending_request_id = "req-a1"
+        d._state.pending_pattern = "test:tier2"
+        d._state.pending_request_json = _serialize_request(self._request())
+        d._state.pending_cc_result_json = json.dumps({
+            "dispatched": True, "proposed_actions": [{"command": "echo stale"}],
+        })
+        d._state.transition(SentinelState.AWAITING_ACTION_APPROVAL, reason="test setup")
+        mock_execute = AsyncMock(return_value=[])
+
+        async def _alerts(*args, **kwargs):
+            return [{"id": "test:tier3", "severity": "WARNING", "message": "t3"}]
+
+        with patch("genesis.mcp.health_mcp._impl_health_alerts", new=_alerts), \
+             patch("genesis.sentinel.dispatcher.classify_alerts", return_value=[_alarm(3)]), \
+             patch.object(d, "_execute_approved_actions", mock_execute):
+            result = await d.resume_from_approval("req-a1", "approved")
+
+        assert result is not None and result.dispatched is False
+        assert d._state.state == SentinelState.HEALTHY
+        mock_execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_resume_dispatch_cancels_when_only_bundled_alarm_remains(self):
+        from genesis.sentinel.dispatcher import _serialize_request
+
+        d = _make_dispatcher()
+        d._state.pending_policy_id = "sentinel_dispatch"
+        d._state.pending_request_id = "req-r1"
+        d._state.pending_pattern = "test:tier2"
+        d._state.pending_request_json = _serialize_request(self._request())
+        d._state.transition(SentinelState.AWAITING_DISPATCH_APPROVAL, reason="test setup")
+        d._phase2_cc_and_actions = AsyncMock()
+
+        async def _alerts(*args, **kwargs):
+            return []
+
+        with patch("genesis.mcp.health_mcp._impl_health_alerts", new=_alerts), \
+             patch("genesis.sentinel.dispatcher.classify_alerts", return_value=[_alarm(3)]):
+            result = await d.resume_from_approval("req-r1", "approved")
+
+        assert result is not None
+        assert result.dispatched is False
+        assert result.reason == "Original alarms cleared during approval wait"
+        assert d._state.state == SentinelState.HEALTHY
+        d._phase2_cc_and_actions.assert_not_awaited()
 
 
 class TestApprovalFailsClosed:

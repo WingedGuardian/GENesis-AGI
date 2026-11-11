@@ -33,6 +33,8 @@ from genesis.sentinel.state import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
     from genesis.autonomy.remediation import RemediationRegistry
     from genesis.cc import AgentProvider
     from genesis.cc.session_manager import SessionManager
@@ -289,6 +291,33 @@ def _extract_pattern(request: SentinelRequest) -> str:
     return f"direct:{request.trigger_source}"
 
 
+def _is_tier(value: object) -> bool:
+    # bool is an int subclass; a True/False tier is unclassified, not tier 1/0.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _triggering_alarm_ids(alarms: Sequence[Mapping[str, Any]], tier: int | None) -> set[str]:
+    """The alert ids that justified a request: the alarms AT the request's tier.
+
+    A fire-alarm request carries every confirmed alarm, lower tiers included,
+    while its ``tier`` is the worst (lowest) of them. Only the alarms at that
+    tier define "the problem is still there"; a lower-tier rider must not hold
+    a park open or let a granted approval proceed (#3845). Every unknown or
+    inconsistent shape (no request tier, an alarm without an int tier, no
+    alarm at the request tier) falls back to ALL ids, the previous rule, which
+    can only keep a park longer, never cancel one sooner. Pure; never raises.
+    """
+    entries = [
+        a for a in (alarms if isinstance(alarms, (list, tuple)) else ())
+        if isinstance(a, dict) and isinstance(a.get("alert_id"), str) and a.get("alert_id")
+    ]
+    all_ids = {a["alert_id"] for a in entries}
+    if not _is_tier(tier) or not all(_is_tier(a.get("tier")) for a in entries):
+        return all_ids
+    triggering = {a["alert_id"] for a in entries if a["tier"] <= tier}
+    return triggering or all_ids
+
+
 class SentinelDispatcher:
     """Orchestrates Sentinel CC sessions for infrastructure incident response.
 
@@ -424,10 +453,14 @@ class SentinelDispatcher:
         """Check whether the original alarms from a pending request still exist.
 
         Called before resuming a dispatch after approval is granted.
-        Returns True if at least one original alarm is still active.
+        Returns True if at least one alarm at the request's triggering tier
+        is still active (bundled lower-tier riders do not count, #3845).
         Returns True on error (fail-open: if we can't verify, proceed).
         """
-        original_ids = {a.alert_id for a in request.alarms} if request.alarms else set()
+        original_ids = (
+            _triggering_alarm_ids([asdict(a) for a in request.alarms], request.tier)
+            if request.alarms else set()
+        )
         if not original_ids:
             return True  # No alarm IDs to check — proceed
 
@@ -1176,11 +1209,19 @@ class SentinelDispatcher:
                             ),
                         )
                     elif current_alerts:
-                        # Different alarms — root cause shifted
+                        # Different alerts — root cause shifted. Cancel the
+                        # stale actions and go back to HEALTHY: nothing would
+                        # ever start an investigation from here, and an idle
+                        # INVESTIGATING is an active state Guardian waits on
+                        # indefinitely (only a restart cleared it). A current
+                        # Tier 1/2 alarm re-dispatches through the normal
+                        # fire-alarm debounce and backoff on the next ticks;
+                        # a lower-tier rider never dispatches on its own.
                         logger.warning(
                             "Sentinel actions stale — original alarms "
-                            "cleared but new alerts present: %s. "
-                            "Cancelling stale actions, will re-investigate.",
+                            "cleared but other alerts present: %s. "
+                            "Cancelling stale actions; current alarms "
+                            "re-dispatch on their own.",
                             [
                                 a.get("alert_id", "?")
                                 if isinstance(a, dict) else getattr(a, "alert_id", "?")
@@ -1189,18 +1230,18 @@ class SentinelDispatcher:
                         )
                         self._state.clear_pending()
                         self._state.transition(
-                            SentinelState.INVESTIGATING,
+                            SentinelState.HEALTHY,
                             reason=(
                                 "root cause shifted during action approval "
-                                "wait — re-investigating"
+                                "wait — stale actions cancelled"
                             ),
                         )
                         save_state(self._state)
                         return SentinelResult(
                             dispatched=False,
                             reason=(
-                                "Root cause shifted — new alarms present, "
-                                "re-investigating"
+                                "Root cause shifted — stale actions cancelled; "
+                                "current alarms re-dispatch on their own"
                             ),
                         )
                     # current_alerts is None (health check failed) — proceed
@@ -2005,7 +2046,9 @@ class SentinelDispatcher:
         # while we're waiting for approval, cancel the pending approval and
         # go back to HEALTHY.  We check the *pending* alarm IDs specifically
         # (not all system alarms) so an unrelated WARNING doesn't keep the
-        # sentinel stuck on a resolved CRITICAL.
+        # sentinel stuck on a resolved CRITICAL. Lower-tier alarms bundled into
+        # the request are not tracked either; only alarms at the request's
+        # tier are (#3845).
         if self._state.state in (
             SentinelState.AWAITING_DISPATCH_APPROVAL,
             SentinelState.AWAITING_ACTION_APPROVAL,
@@ -2015,9 +2058,8 @@ class SentinelDispatcher:
                 try:
                     import json
                     req = json.loads(self._state.pending_request_json)
-                    pending_ids = {a.get("alert_id", "") for a in req.get("alarms", [])}
-                    pending_ids.discard("")
-                except (json.JSONDecodeError, TypeError):
+                    pending_ids = _triggering_alarm_ids(req.get("alarms", []) or [], req.get("tier"))
+                except (json.JSONDecodeError, TypeError, AttributeError):
                     pass
             # Fall back to pending_pattern (single alarm ID) if no list
             pattern = self._state.pending_pattern
