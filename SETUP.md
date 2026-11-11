@@ -96,7 +96,8 @@ check every engine file in the venv against digests committed in this repo
 (`scripts/lib/falkordb-engine-digests.txt`, generated from the pinned wheel
 files, never from the installed wheel's own record), copy the engine to
 `~/.genesis/deps/falkordb/<version>-<wheel tag>/`, re-check the copy, and write
-the `genesis-falkordb` user unit, **left disabled**, pointing at that copy. The
+the `genesis-falkordb` user unit pointing at that copy, then **enable and
+start** it (an engine that is already running is left running). The
 unit re-checks the copy's digests every time it starts. The engine never runs
 from the venv, so a later install into the venv cannot change what it runs, and
 a new pin lands in a new directory beside the running one. Copies no unit runs
@@ -114,25 +115,41 @@ before fetching. An existing install below the floor gets that refusal from the
 update after the one that ships this check: that first update still runs its old
 `update.sh`, which merges, then rolls back when the new bootstrap refuses.
 
-The memory graph uses the engine only when `config/graphstore.yaml` selects
-`mode: falkordb`; the default is `networkx`, so an install that never arms it
-loses nothing. To arm it:
+The memory graph reads from the engine by default (`config/graphstore.yaml`
+ships `mode: falkordb`). Where the unit was never rendered (the engine was not
+verified on this machine), reads stay on the in-process NetworkX projection
+quietly, with no warning and no health alert. The installers enable and start
+the unit; if the start fails they print one `WARNING` line and carry on. Check
+it with:
 
 ```bash
-systemctl --user enable --now genesis-falkordb
 systemctl --user status genesis-falkordb
 ```
+
+To keep reads off the engine, set `mode: networkx` in
+`~/.genesis/config/graphstore.local.yaml` (or
+`settings_update("graphstore", {"mode": "networkx"})`). To stop the installers
+from enabling the unit again, add `genesis-falkordb.service` to
+`~/.genesis/config/disabled_timers`, then
+`systemctl --user disable --now genesis-falkordb`.
 
 **An engine that is already running is never switched by an update.** If yours
 runs an older module (for example one an earlier Genesis fetched under
 `~/.genesis/deps`, with a `redis-server` from the upstream apt repository), the
 update keeps its unit as it is and says so. Switch it to the bundled engine
-deliberately, when it suits you:
+deliberately, when it suits you. On a running install `bootstrap.sh` refuses
+(it will not run under a live server), so go through `update.sh`, which stops
+and restarts `genesis-server` around it; `--take-template` makes it re-render
+the unit even when the checkout is already up to date, and saves the old unit
+under `~/.genesis/deploy-backups/`:
 
 ```bash
-GENESIS_FALKORDB_SWITCH=1 ./scripts/bootstrap.sh
+GENESIS_FALKORDB_SWITCH=1 ./scripts/update.sh --take-template genesis-falkordb.service
 systemctl --user restart genesis-falkordb
 ```
+
+On a stopped or fresh install, `GENESIS_FALKORDB_SWITCH=1 ./scripts/bootstrap.sh`
+does the same.
 
 After switching, a `redis-server` you installed only for Genesis is no longer
 used by it; removing it, its apt source and its key is your call.

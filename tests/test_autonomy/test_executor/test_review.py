@@ -291,11 +291,11 @@ class TestFeedbackAssessment:
         text = 'The result has "verdict": "fail" because of issues'
         assert reviewer._assess_feedback(text, None) is False
 
-    def test_no_signal_passes(self) -> None:
+    def test_no_signal_fails(self) -> None:
         reviewer = TaskReviewer(router=AsyncMock())
         assert reviewer._assess_feedback(
             "Looks good overall, nice work", None,
-        ) is True
+        ) is False
 
     def test_both_none_passes(self) -> None:
         reviewer = TaskReviewer(router=AsyncMock())
@@ -397,8 +397,12 @@ class TestVerifyViaCodex:
 
         assert result is None
 
-    async def test_codex_empty_output_returns_none(
-        self, monkeypatch: pytest.MonkeyPatch,
+    @pytest.mark.parametrize("payload", [
+        b"{}\n", b"[]\n", b'{"type":"item.completed","item":[]}',
+        b'{"type":"item.completed","item":{"type":"agent_message","text":7}}',
+    ])
+    async def test_codex_empty_output_remains_invalid(
+        self, monkeypatch: pytest.MonkeyPatch, payload,
     ) -> None:
         monkeypatch.setattr(
             "genesis.util.codex_cli.shutil.which",
@@ -406,7 +410,7 @@ class TestVerifyViaCodex:
         )
 
         fake_proc = AsyncMock()
-        fake_proc.communicate = AsyncMock(return_value=(b"{}\n", b""))
+        fake_proc.communicate = AsyncMock(return_value=(payload, b""))
         fake_proc.returncode = 0
 
         with patch(
@@ -416,7 +420,7 @@ class TestVerifyViaCodex:
             reviewer = TaskReviewer(router=AsyncMock())
             result = await reviewer._verify_via_codex("deliverable", "reqs")
 
-        assert result is None
+        assert result == ""
 
     async def test_codex_hang_times_out_and_returns_none(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -1012,3 +1016,71 @@ async def test_codex_cancel_group_kills_and_reraises(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert killpg_calls and killpg_calls[0][0] == 424244
+
+
+@pytest.mark.parametrize("feedback", ["", "garbled", "{}", "[]", "true", '{"verdict":true}',
+    '{"verdict":"PASS"}', '{"verdict":"pass","verdict":"fail"}',
+    '```json\n{"verdict":"pass"}\n```\n```json\n{"verdict":"fail"}\n```',
+    'Success: {"verdict":"pass"}'])
+def test_unreadable_feedback_never_passes(feedback):
+    reviewer = TaskReviewer(router=AsyncMock())
+    assert reviewer._assess_feedback(feedback, None) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("leg", ["fresh", "adversarial"])
+@pytest.mark.parametrize("retry", ['{"verdict":"pass"}', '{"verdict":"fail"}', "invalid", None])
+async def test_invalid_leg_retried_once_without_repeating_other(leg, retry):
+    reviewer = TaskReviewer(router=AsyncMock())
+    good = '{"verdict":"pass"}'
+    reviewer._llm_review = AsyncMock(side_effect=["invalid", retry] if leg == "fresh" else [good])
+    reviewer._tool_capable_review = AsyncMock(side_effect=["invalid", retry] if leg == "adversarial" else [good])
+    result = await reviewer.verify_deliverable("one\ntwo\nthree", "requirements")
+    assert reviewer._llm_review.await_count == (2 if leg == "fresh" else 1)
+    assert reviewer._tool_capable_review.await_count == (2 if leg == "adversarial" else 1)
+    assert result.passed is (retry == good)
+    assert bool(result.review_error) is (retry in ("invalid", None))
+    assert result.skipped_reason is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty", ["", None])
+async def test_successful_empty_router_is_invalid_not_unavailable(empty):
+    reviewer = TaskReviewer(router=_make_router(empty))
+    result = await reviewer.verify_deliverable("one\ntwo\nthree", "requirements")
+    assert result.passed is False
+    assert result.review_error
+    assert result.skipped_reason is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("other", [None, '{"verdict":"fail"}', "invalid"])
+async def test_review_error_takes_precedence_over_other_leg(other):
+    reviewer = TaskReviewer(router=AsyncMock())
+    reviewer._llm_review = AsyncMock(side_effect=["invalid", None])
+    reviewer._tool_capable_review = AsyncMock(return_value=other)
+    result = await reviewer.verify_deliverable("one\ntwo\nthree", "requirements")
+    assert result.passed is False and result.review_error
+    assert result.skipped_reason is None
+    assert reviewer._tool_capable_review.await_count == (2 if other == "invalid" else 1)
+
+
+@pytest.mark.asyncio
+async def test_invalid_retry_cancellation_propagates():
+    reviewer = TaskReviewer(router=AsyncMock())
+    reviewer._llm_review = AsyncMock(side_effect=["invalid", asyncio.CancelledError()])
+    reviewer._tool_capable_review = AsyncMock(return_value='{"verdict":"pass"}')
+    with pytest.raises(asyncio.CancelledError):
+        await reviewer.verify_deliverable("one\ntwo\nthree", "requirements")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final", ['{"verdict":"pass"}', '{"verdict":"fail"}', "", "unreadable"])
+async def test_codex_reviews_only_final_agent_message(monkeypatch, final):
+    monkeypatch.setattr("genesis.util.codex_cli.shutil.which", lambda name: "/usr/bin/codex")
+    payload = _codex_jsonl_output("Inspecting the worktree") + b"\n" + _codex_jsonl_output(final)
+    proc = AsyncMock(returncode=0)
+    proc.communicate = AsyncMock(return_value=(payload, b""))
+    with patch("genesis.autonomy.executor.review.asyncio.create_subprocess_exec", return_value=proc):
+        result = await TaskReviewer(router=AsyncMock())._verify_via_codex("deliverable", "requirements")
+    assert result == final

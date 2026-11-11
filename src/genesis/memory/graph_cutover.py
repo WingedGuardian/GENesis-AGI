@@ -19,6 +19,9 @@ caller gave up; its count and share are always reported), and every other
 outcome, including one this module has never heard of, restarts the clock.
 ``retried`` (a read that answered only after retrying a connection the engine
 dropped, #3035) is one of those: a retry spares the caller, not the clock.
+A row whose every traversal was QUIET on networkx (``quiet``:
+``engine_not_provisioned``, the where-present guard in ``graphstore_config``)
+is neither traffic nor a break; its count is reported as ``quiet``.
 
 Pure: no I/O. ``scripts/graph_cutover_report.py`` reads the rows and prints this.
 """
@@ -71,6 +74,11 @@ HISTORY_LOOKBACK = timedelta(hours=2.5)
 BOOT_TIME_MARGIN = timedelta(seconds=2)
 _CLEAN_OUTCOMES = frozenset({"primary"})
 _NEUTRAL_OUTCOMES = frozenset({"cancelled"})
+#: ``quiet_reason`` values a row may carry (``graphstore_config.ENGINE_NOT_PROVISIONED``;
+#: duplicated, not imported, to keep this evaluator pure). A row whose every
+#: traversal was quiet on networkx is neither traffic nor a break. Any other
+#: value restarts the clock, like any outcome this module has not heard of.
+_QUIET_REASONS = frozenset({"engine_not_provisioned"})
 
 
 @dataclass
@@ -84,6 +92,9 @@ class Verdict:
     days_with_traffic: int = 0
     cancelled: int = 0
     traversals: int = 0
+    #: Traversals quiet on networkx because the engine was never provisioned:
+    #: neither traffic (not in ``traversals``) nor a break.
+    quiet: int = 0
     census_rows: int = 0
     last_census: datetime | None = None
 
@@ -102,6 +113,7 @@ class Verdict:
             "days_with_traffic": self.days_with_traffic,
             "cancelled": self.cancelled,
             "traversals": self.traversals,
+            "quiet": self.quiet,
             "census_rows": self.census_rows,
             "last_census": iso(self.last_census),
         }
@@ -247,14 +259,44 @@ def traversal_breaks_clock(m: dict) -> str | None:
     pwf = m.get("prior_write_failures", 0)
     if not _is_count(pwf):
         raise ValueError("prior_write_failures is not a non-negative integer")
+    quiet = m.get("quiet", {})
+    if not isinstance(quiet, dict) or not all(_is_count(n) for n in quiet.values()):
+        raise ValueError("quiet is not a map of non-negative integers")
+    if sum(quiet.values()) > traversals:
+        raise ValueError("more quiet traversals than traversals")
     bad = set(outcomes) - _CLEAN_OUTCOMES - _NEUTRAL_OUTCOMES
     if bad:
         return "outcome " + ", ".join(sorted(bad))
+    unknown_quiet = set(quiet) - _QUIET_REASONS
+    if unknown_quiet:
+        return "quiet reason " + ", ".join(sorted(unknown_quiet))
+    if is_quiet_row(m):
+        return None
+    # A row only partly quiet falls through: its networkx traversals read as
+    # "configured networkx" and break the clock, the conservative direction.
     if set(configured) - {"falkordb"}:
         return "configured " + ", ".join(sorted(configured))
     if set(served) - {"falkordb", "none"}:
         return "served by " + ", ".join(sorted(set(served) - {"falkordb", "none"}))
     return None
+
+
+def is_quiet_row(m: dict) -> bool:
+    """Whether EVERY traversal in this row was a quiet networkx selection (the
+    engine was never provisioned on that install) and nothing else went wrong:
+    all configured and served by networkx, every outcome clean or neutral, and
+    every quiet reason a known one. Such a row is neither traffic nor a break.
+    Call only on a row ``traversal_breaks_clock`` has validated."""
+    quiet = m.get("quiet") or {}
+    traversals = m["traversals"]
+    return (
+        traversals > 0
+        and set(quiet) <= _QUIET_REASONS
+        and sum(quiet.values()) == traversals
+        and set(m["configured"]) == {"networkx"}
+        and set(m["served"]) <= {"networkx", "none"}
+        and set(m["outcomes"]) <= _CLEAN_OUTCOMES | _NEUTRAL_OUTCOMES
+    )
 
 
 def evaluate(
@@ -349,6 +391,10 @@ def evaluate(
                     "events": m.get("events"),
                 }
             )
+            continue
+        if is_quiet_row(m):
+            if t >= window_start:
+                v.quiet += m["traversals"]
             continue
         if t >= window_start:
             outcomes = Counter(m["outcomes"])

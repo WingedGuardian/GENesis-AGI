@@ -230,6 +230,65 @@ def test_reveal_returns_value(client):
     assert data["id"] == "ref-1"
 
 
+_HELD_BODY = _BODY.replace(f"Value: {_SECRET}", "Value: [held in the reference secret store; read it with reference_lookup]")
+
+
+def test_reveal_reads_a_held_out_value_from_the_secret_store(client):
+    """#2426: a credential's body carries a placeholder; reveal reads the value."""
+    db = MagicMock()
+    # The unit's body, value and detail, read as one set (get_reference_pair).
+    db.execute_fetchall = AsyncMock(return_value=[(_HELD_BODY, _SECRET, None)])
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.db.crud.knowledge.get", new=AsyncMock(return_value=_ref_row(body=_HELD_BODY))),
+    ):
+        MockRT.instance.return_value = _mock_rt(db=db)
+        resp = client.post("/api/genesis/references/ref-1/reveal")
+    assert resp.status_code == 200
+    assert resp.get_json()["value"] == _SECRET
+    assert db.execute_fetchall.await_args.args[1] == ("ref-1",)
+
+
+_DETAIL_HELD_BODY = _HELD_BODY.replace(
+    "SSH login for the lab box", "[description held in the reference secret store]",
+)
+
+
+def test_reveal_returns_the_held_out_description_with_the_value(client):
+    """The description is held out with the value (#2426): reveal returns both,
+    byte for byte, from the one secret row."""
+    db = MagicMock()
+    db.execute_fetchall = AsyncMock(
+        return_value=[(_DETAIL_HELD_BODY, _SECRET, "SSH login for the lab box")],
+    )
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch(
+            "genesis.db.crud.knowledge.get",
+            new=AsyncMock(return_value=_ref_row(body=_DETAIL_HELD_BODY)),
+        ),
+    ):
+        MockRT.instance.return_value = _mock_rt(db=db)
+        resp = client.post("/api/genesis/references/ref-1/reveal")
+    assert resp.status_code == 200
+    assert resp.get_json() == {
+        "id": "ref-1", "value": _SECRET, "description": "SSH login for the lab box",
+    }
+
+
+def test_reveal_of_a_missing_secret_says_so_never_the_placeholder(client):
+    db = MagicMock()
+    db.execute_fetchall = AsyncMock(return_value=[])
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.db.crud.knowledge.get", new=AsyncMock(return_value=_ref_row(body=_HELD_BODY))),
+    ):
+        MockRT.instance.return_value = _mock_rt(db=db)
+        resp = client.post("/api/genesis/references/ref-1/reveal")
+    assert resp.status_code == 409
+    assert "held in the reference secret store" not in resp.get_data(as_text=True)
+
+
 def test_reveal_404_for_non_reference(client):
     with (
         patch("genesis.runtime.GenesisRuntime") as MockRT,
