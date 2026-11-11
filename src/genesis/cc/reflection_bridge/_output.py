@@ -644,22 +644,16 @@ def format_topic_summary(depth, output, *, text: str | None = None) -> str:
     return "\n\n".join(parts)
 
 
-#: A light summary whose terms overlap the last full post's at or above this
-#: local overlap score (stopwords dropped, negations and numbers kept) counts as "no
-#: material change". MEASURED 2026-10-27 over one install's 85 light posts in
-#: the previous 30 days, consecutive pairs: top scores 0.62, 0.58, then 0.50.
-#: The two above this line were restatements on reading (a sub-point memory
-#: drift; the same persistent job failure restated); the 0.50 pair reported
-#: moved values. Raise it to post more; it is not meant to catch rewordings
-#: that a model judges unchanged (``material_change`` does that).
-LIGHT_NEAR_DUPLICATE_JACCARD = 0.55
-
-#: The model's ``"material_change": false`` is trusted only when the summary
-#: still shares at least this much with the last FULL post. The model compares
-#: against the previous stored finding, which may itself have gone unposted, so
-#: without a floor a chain of small drifts could hide a large change from the
-#: user indefinitely. Over the same 85 posts, 21 of 84 consecutive pairs scored
-#: at least 0.3, so the flag can act on about a quarter of them.
+#: Only the model's explicit ``"material_change": false`` suppresses a summary;
+#: an absent flag posts. Overlap alone never suppresses, and changed numbers do
+#: not force a post: MEASURED 2026-11-07, 193 of 200 light summaries carry
+#: numbers that move every run, so the model judges whether a value moved
+#: materially. The flag is trusted only when the summary still shares at least
+#: this much with the last FULL post. The model compares against the previous
+#: stored finding, which may itself have gone unposted, so without a floor a
+#: chain of small drifts could hide a large change from the user indefinitely.
+#: MEASURED 2026-11-11 over 199 consecutive pairs of one install's last 200
+#: light summaries: 21 score at least 0.3 under the negation rule below.
 LIGHT_MODEL_FLAG_MIN_JACCARD = 0.3
 
 #: While nothing changes, at most one "no material change" stub per this many
@@ -690,15 +684,15 @@ def _comparable(content: str) -> str:
 
 
 def _light_overlap(first: str, second: str) -> float:
-    """Changed negated or decimal-digit-bearing text posts; exact repeats dedup.
+    """Term overlap for the model-flag floor; changed negated text scores 0.
 
     Keeping 'not' as just one term still hides a polarity change under a long
     common prefix. Counts alone also miss moving 'not' to another subject.
     """
     from genesis.memory.source_verification import extract_terms
 
-    if re.search(r"\d", first) or re.search(r"\d", second):
-        return 1.0 if first == second else 0.0
+    if first == second:
+        return 1.0
 
     def negations(body: str) -> set[str]:
         words = re.findall(r"\b\w+(?:['’]\w+)*\b", body.casefold())
@@ -706,7 +700,7 @@ def _light_overlap(first: str, second: str) -> float:
                 or w.endswith(("n't", "n’t"))}
 
     neg_first, neg_second = negations(first), negations(second)
-    if first != second and (neg_first or neg_second):
+    if neg_first or neg_second:
         return 0.0
     terms_first = extract_terms(first) | neg_first
     terms_second = extract_terms(second) | neg_second
@@ -747,17 +741,16 @@ async def send_light_topic_summary(
 
     Returns ``"posted"``, ``"stub"`` or ``"skipped"``. Only the Telegram post is
     gated; the caller has already stored the reflection's output. A summary is
-    "no change" when it scores at least ``LIGHT_NEAR_DUPLICATE_JACCARD`` against
-    the last full post in the topic, or when the model says so
-    (``"material_change": false``) and it still scores at least
-    ``LIGHT_MODEL_FLAG_MIN_JACCARD``. Then a stub is posted if the topic has been quiet for
-    ``LIGHT_NO_CHANGE_STUB_HOURS``, and nothing otherwise. "Last posted" is read
-    from ``telegram_messages`` (``TopicManager.recent_outbound``), so a restart
-    neither re-posts nor forgets a stub. Anything that cannot be decided
-    (no history, a failed read, a parse-failure fallback) is posted.
-    Changed decimal-digit-bearing bodies post even for harmless rewordings;
-    equal numeric bodies can dedup. One manager-local lock spans the history
-    read through successful send persistence, including early-post paths.
+    "no change" only when the model says so (``"material_change": false``) and
+    it still scores at least ``LIGHT_MODEL_FLAG_MIN_JACCARD`` against the last
+    full post in the topic; an absent or true flag posts. Then a stub is posted
+    if the topic has been quiet for ``LIGHT_NO_CHANGE_STUB_HOURS``, and nothing
+    otherwise. "Last posted" is read from ``telegram_messages``
+    (``TopicManager.recent_outbound``), so a restart neither re-posts nor
+    forgets a stub. Anything that cannot be decided (no history, a failed read,
+    a parse-failure fallback) is posted. One manager-local lock spans the
+    history read through successful send persistence, including early-post
+    paths.
     """
     if not topic_manager:
         return await _send_light_topic_summary_locked(
@@ -785,7 +778,7 @@ async def _send_light_topic_summary_locked(
         await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
         return "posted"
     data = _extract_json_obj(source_text) or {}
-    if data.get("material_change") is True:
+    if data.get("material_change") is not False:
         await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
         return "posted"
     category = f"reflection_{depth.value.lower()}"
@@ -813,10 +806,7 @@ async def _send_light_topic_summary_locked(
     # Code fences can be inserted by the splitter, so that baseline is uncertain.
     uncertain = "```" in text or "```" in last_full["content"]
     score = 0.0 if uncertain or (multi and current != previous) else _light_overlap(current, previous)
-    model_unchanged = (
-        data.get("material_change") is False and score >= LIGHT_MODEL_FLAG_MIN_JACCARD
-    )
-    if not model_unchanged and score < LIGHT_NEAR_DUPLICATE_JACCARD:
+    if score < LIGHT_MODEL_FLAG_MIN_JACCARD:
         await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
         return "posted"
 
@@ -832,8 +822,8 @@ async def _send_light_topic_summary_locked(
     )
     if not quiet:
         logger.info(
-            "Light reflection not posted: no material change (model=%s, jaccard=%.2f)",
-            model_unchanged, score,
+            "Light reflection not posted: model reported no material change (jaccard=%.2f)",
+            score,
         )
         return "skipped"
     since = fmt(last_full["timestamp"], "%Y-%m-%d %H:%M %Z")

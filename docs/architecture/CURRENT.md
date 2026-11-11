@@ -1081,13 +1081,14 @@ verified: b321bb634 2026-11-07
   memory. GROUNDWORK: `reflection_bridge/_bridge.py` (v4-executor),
   `session_config.py` (hook-inheritance).
 - **Light-reflection topic repeats (development candidate)**: the bridge stores
-  every reflection output, then suppresses repeat light-topic summaries or posts
-  a periodic stub. Explicit material changes always post. The local comparison
-  preserves negation, requires exact comparison for decimal-digit-bearing text,
-  compares all observed chunks, and posts changed text when either side spans
-  multiple chunks. A manager-local Light-topic lock spans history through send
-  persistence; unrelated categories retain their independent delivery. History uses insertion order so a current
-  stub supersedes an older future-dated row. Unknown history posts; deep and
+  every reflection output, then suppresses a light-topic summary or posts a
+  periodic stub only when the model sets `material_change` false; an absent or
+  true flag posts. A local overlap floor guards that flag: changed negated text,
+  changed multi-chunk text, code fences, parse fallbacks and low overlap with
+  the last full post still post.
+  A manager-local Light-topic lock spans history through send persistence;
+  unrelated categories retain their independent delivery. History uses
+  insertion order so a current stub supersedes an older future-dated row. Unknown history posts; deep and
   strategic topic delivery retain their direct path. Installed verification is
   still outstanding.
 - **Background-wait ceiling ownership** (invoker.py): the CLI's headless
