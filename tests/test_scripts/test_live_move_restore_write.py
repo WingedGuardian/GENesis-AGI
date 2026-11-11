@@ -525,6 +525,102 @@ def test_a_copy_that_does_not_match_its_record_is_refused_and_nothing_moves(w, d
     assert not any((run / "aside").exists() for run in _runs(w)), "something was moved aside"
 
 
+@pytest.mark.parametrize("damage", ["copy-edited", "record-removed", "hash-null", "dir-entry-edited"])
+def test_check_names_the_refusal_the_restore_makes_for_a_damaged_copy(w, damage):
+    """#4025 item 3: --check reads a saved copy the restore's staging refuses
+    exactly as the restore does (rc 1, the same reason), never as-left."""
+    make = _foreign_inside_dir if damage == "dir-entry-edited" else _foreign_edit
+    ts = _repaired(w, make)
+    path = "P" if damage == "dir-entry-edited" else "sub/s1"
+    if damage == "copy-edited":
+        (w.backups()[-1] / "tree" / "sub" / "s1").write_text("not what was saved\n")
+    elif damage == "dir-entry-edited":
+        (w.backups()[-1] / "tree" / "P" / "mine.txt").write_text("not the notes\n")
+    elif damage == "record-removed":
+        _saved_json(w, lambda d: (d["files"].pop("tree/sub/s1"), d.update(complete=False)))
+    else:
+        _saved_json(w, lambda d: d["files"]["tree/sub/s1"].update(sha256=None))
+    c = _restore(w, ts, "--check")
+    r = _restore(w, ts)
+    assert c.returncode == 1 and r.returncode == 1, c.stdout + r.stdout
+    said, did = _parts(c)[(path, "node")], _parts(r)[(path, "node")]
+    assert said.startswith("other:") and did == f"refused:{said}", (c.stdout, r.stdout)
+
+
+@pytest.mark.parametrize(
+    ("make", "copy"), [(_foreign_staged, "A"), (_foreign_both_flags, "sub/s1")]
+)
+def test_a_damaged_copy_refuses_its_rows_index_and_flag_parts_alike_in_both(w, make, copy):
+    """#4355 review (Codex, CodeRabbit): the node part's predicted refusal is
+    not a change on disk, so --check keeps the row's index and flag parts
+    eligible and refuses them `row-refused` through the writer's own cascade,
+    as --restore does, never `other:changed`."""
+    ts, path, _ = _fresh(w, make)
+    (w.backups()[-1] / "tree" / copy).write_text("not what was saved\n")
+    c, r = _restore(w, ts, "--check"), _restore(w, ts)
+    kinds = {k for p, k in _parts(c) if p == path}
+    assert kinds > {"node"}, ("control: the row has an index or flag part", c.stdout)
+    assert _parts(c)[(path, "node")] == "other:hash-mismatch", c.stdout
+    _check_said_what_restore_did(c, r)
+
+
+@pytest.mark.parametrize(
+    ("make", "copy"), [(_foreign_staged, "A"), (_foreign_both_flags, "sub/s1")]
+)
+def test_a_damaged_copy_after_a_kill_at_the_aside_reads_alike_in_both(w, make, copy):
+    """#4355 review round 2: killed at the aside, the path is empty and the
+    resume rule reads it as-left; a damaged copy then refuses the node and,
+    through the writer's cascade, its index and flag parts, in both modes."""
+    ts, path, _ = _fresh(w, make)
+    assert _restore(w, ts, **{KILL_ENV: "aside"}).returncode == -9
+    assert not os.path.lexists(w.root / path), "control: the path is empty"
+    (w.backups()[-1] / "tree" / copy).write_text("not what was saved\n")
+    _check_said_what_restore_did(_restore(w, ts, "--check"), _restore(w, ts))
+
+
+@pytest.mark.parametrize("damaged", [False, True])
+def test_a_tag_directory_with_a_file_git_does_not_ignore_reads_alike_in_both(w, damaged):
+    """#4355 class audit: the writer refuses moving aside a tag directory that
+    holds a file git does not ignore (other:changed), damaged copy or not, and
+    --check names that refusal too (owner ruling: one eligibility rule)."""
+    ts, _, _ = _fresh(w, _dir_file)
+    (w.root / "sub" / "notes.txt").write_text("a session's\n")
+    if damaged:
+        (w.backups()[-1] / "tree" / "sub").write_text("not what was saved\n")
+    c, r = _restore(w, ts, "--check"), _restore(w, ts)
+    assert _parts(c)[("sub", "node")] == "other:changed", c.stdout
+    _check_said_what_restore_did(c, r)
+
+
+def test_an_unreadable_directory_below_a_tag_directory_refuses_alike_in_both(w):
+    """#4355 class audit: the writer's walk of a tag directory fails on an
+    unreadable directory below it and refuses the whole report; --check, once
+    lenient here (as-left, rc 0), now refuses it the same way."""
+    ts, _, _ = _fresh(w, _dir_file)
+    locked = w.root / "sub" / "locked"
+    locked.mkdir()
+    (locked / "x").write_text("x\n")
+    locked.chmod(0)
+    try:
+        c, r = _restore(w, ts, "--check"), _restore(w, ts)
+    finally:
+        locked.chmod(0o755)
+    assert c.returncode == r.returncode == 1, (c.stdout, r.stdout)
+    assert "other:unreadable" in c.stdout and "other:unreadable" in r.stdout, (c.stdout, r.stdout)
+
+
+def test_a_damaged_copy_behind_a_changed_checkout_reads_changed_in_both(w):
+    """#4025 review S2: the writer never stages a part that is not as-left, so
+    a damaged copy under a path edited since the repair is refused `changed`
+    by --restore, and --check says the same, not the damage."""
+    ts = _repaired(w, _foreign_edit)
+    (w.backups()[-1] / "tree" / "sub" / "s1").write_text("not what was saved\n")
+    (w.root / "sub" / "s1").write_text("edited since the repair\n")
+    c, r = _restore(w, ts, "--check"), _restore(w, ts)
+    assert _parts(c)[("sub/s1", "node")] == "other:changed", c.stdout
+    assert _parts(r)[("sub/s1", "node")] == "refused:other:changed", r.stdout
+
+
 def test_a_report_without_the_integrity_record_is_refused_whole(w):
     """Review N-3: a report from before SAVED.json is refused whole
     (`other:no-integrity`); nothing is written, REPAIR.json included."""
@@ -980,12 +1076,12 @@ def test_a_resume_from_a_folder_others_can_write_is_refused(w):
 def test_a_tag_directory_moves_aside_only_with_ignored_extras(w):
     """`sub` was a foreign file where the tag has sub/: the restore moves
     sub/ aside. A git-ignored extra there (a cache) moves with it and is
-    named; a file that is not ignored refuses the part (--check stays
-    lenient: it says as-left)."""
+    named; a file that is not ignored refuses the part, and --check says so
+    too (owner ruling 2026-11-10: one eligibility rule, #4355 review)."""
     ts, path, before = _fresh(w, _dir_file)
     (w.root / ".git" / "info" / "exclude").write_text("__pycache__/\n")
     (w.root / "sub" / "notes.txt").write_text("a session's\n")
-    assert _parts(_check(w, ts))[("sub", "node")] == "as-left"
+    assert _parts(_check(w, ts))[("sub", "node")] == "other:changed"
     r = _restore(w, ts)
     assert r.returncode == 1 and _parts(r)[("sub", "node")] == "refused:other:changed", r.stdout
     assert (w.root / "sub" / "notes.txt").read_text() == "a session's\n"
@@ -1363,6 +1459,35 @@ def test_an_index_part_already_back_keeps_its_entries_under_a_file_written_later
     assert r.returncode == 0, r.stdout + r.stderr
     assert _parts(r)[("sub", "index")] == "restored", r.stdout
     _converged(w, ts)
+
+
+def _check_said_what_restore_did(c, r) -> None:
+    """Every part: as-left is written, already-restored stays, and any other
+    verdict is the reason the restore prints after ``refused:`` (#4025 item 3)."""
+    said, did = _parts(c), _parts(r)
+    assert said.keys() == did.keys(), (c.stdout, r.stdout)
+    for key, v in said.items():
+        want = {"as-left": "restored", "already-restored": "already-restored"}.get(v, f"refused:{v}")
+        assert did[key] == want, (key, c.stdout, r.stdout)
+
+
+@pytest.mark.parametrize("case", ["flag-after-repair", "child-refused"])
+def test_check_names_the_index_calls_refusals(w, case):
+    """#4025 item 3: --check runs the index call's own rule (footprint) and the
+    flag cascade on what it read, so it names every refusal the restore makes
+    there: a flag the call would drop, a stage-0 parent above a refused child."""
+    if case == "flag-after-repair":
+        ts, _path, _ = _fresh(w, _foreign_staged)
+        _git(w.root, "update-index", "--skip-worktree", "A")
+    else:
+        ts = _repaired(w, _ancestor_file_child_edit)
+        (w.root / "sub" / "s1").write_text("edited since\n")
+    c = _check(w, ts)
+    r = _restore(w, ts)
+    assert c.returncode == 1 and r.returncode == 1, c.stdout + r.stdout
+    _check_said_what_restore_did(c, r)
+    key = ("A", "index") if case == "flag-after-repair" else ("sub", "index")
+    assert _parts(c)[key] == ("other:flag-changed" if case == "flag-after-repair" else "child-refused")
 
 
 def test_a_flagged_entry_already_back_in_a_footprint_still_refuses(w, mod, monkeypatch, capsys):

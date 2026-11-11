@@ -268,7 +268,7 @@ async def test_cancellation_is_recorded_as_neutral_and_reraised(db, monkeypatch)
 async def test_the_configured_mode_is_the_one_selection_used(db, monkeypatch):
     from genesis.memory import graphstore_config
 
-    monkeypatch.setattr(graphstore_config, "effective_mode", lambda: "falkordb")
+    monkeypatch.setattr(graphstore_config, "selection", lambda: ("falkordb", None))
     monkeypatch.setattr(graph_mod, "_falkor_store", _OkStore())
 
     await graph_mod.traverse(db, "root")
@@ -282,7 +282,7 @@ async def test_the_configured_mode_is_the_one_selection_used(db, monkeypatch):
 async def test_a_networkx_configuration_is_recorded_as_such(db, monkeypatch):
     from genesis.memory import graphstore_config
 
-    monkeypatch.setattr(graphstore_config, "effective_mode", lambda: "networkx")
+    monkeypatch.setattr(graphstore_config, "selection", lambda: ("networkx", None))
     monkeypatch.setattr(graph_mod, "_store", _OkStore(name="networkx"))
 
     await graph_mod.traverse(db, "root")
@@ -299,7 +299,7 @@ async def test_a_selection_failure_is_recorded(db, monkeypatch):
     def _broken(*a, **k):
         raise ImportError("no falkordb client")
 
-    monkeypatch.setattr(graphstore_config, "effective_mode", lambda: "falkordb")
+    monkeypatch.setattr(graphstore_config, "selection", lambda: ("falkordb", None))
     monkeypatch.setattr(graph_mod, "_falkor_store", None)
     monkeypatch.setattr(graphstore_falkor, "FalkorGraphStore", _broken)
     monkeypatch.setattr(graph_mod, "_store", _OkStore(name="networkx"))
@@ -911,3 +911,75 @@ async def test_the_retry_hook_does_not_outlive_its_traversal(db, monkeypatch):
     # A later store read in the same task: no hook may write through it.
     await telemetry.note_retry("ConnectionError")
     assert len(await _rows(db)) == before
+
+
+# ── the where-present guard's quiet selection (D3) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_selection_is_recorded_as_neither_a_fallback_nor_a_break(db, monkeypatch):
+    """Shipped falkordb on an install with no engine unit: networkx answers, the
+    row carries the quiet reason, and the cutover verdict counts it as neither
+    traffic nor a break."""
+    from genesis.memory import graph_cutover, graphstore_config
+
+    monkeypatch.setattr(
+        graphstore_config,
+        "selection",
+        lambda: ("networkx", graphstore_config.ENGINE_NOT_PROVISIONED),
+    )
+    monkeypatch.setattr(graph_mod, "_store", _OkStore(name="networkx"))
+
+    await graph_mod.traverse(db, "root")
+
+    [row] = await _rows(db)
+    assert row["outcomes"] == {"primary": 1}
+    assert row["configured"] == {"networkx": 1}
+    assert row["quiet"] == {"engine_not_provisioned": 1}
+    assert row["events"] == []
+    assert graph_cutover.traversal_breaks_clock(row) is None
+    assert graph_cutover.is_quiet_row(row)
+
+
+@pytest.mark.asyncio
+async def test_a_loud_networkx_selection_carries_no_quiet_counter(db, monkeypatch):
+    """A networkx the operator chose is not quiet: the row keeps today's shape."""
+    from genesis.memory import graphstore_config
+
+    monkeypatch.setattr(graphstore_config, "selection", lambda: ("networkx", None))
+    monkeypatch.setattr(graph_mod, "_store", _OkStore(name="networkx"))
+
+    await graph_mod.traverse(db, "root")
+
+    [row] = await _rows(db)
+    assert "quiet" not in row
+
+
+@pytest.mark.asyncio
+async def test_a_selection_failure_is_never_quiet(db, monkeypatch):
+    """An error and a quiet reason never ride together: the error wins."""
+    from genesis.memory import graph_cutover, graphstore_config, graphstore_falkor
+
+    def _broken(*a, **k):
+        raise ImportError("no falkordb client")
+
+    monkeypatch.setattr(graphstore_config, "selection", lambda: ("falkordb", None))
+    monkeypatch.setattr(graph_mod, "_falkor_store", None)
+    monkeypatch.setattr(graphstore_falkor, "FalkorGraphStore", _broken)
+    monkeypatch.setattr(graph_mod, "_store", _OkStore(name="networkx"))
+
+    await graph_mod.traverse(db, "root")
+
+    [row] = await _rows(db)
+    assert row["outcomes"] == {"selection_failed": 1}
+    assert "quiet" not in row
+    assert graph_cutover.traversal_breaks_clock(row) is not None
+
+
+def test_publish_selection_drops_a_quiet_reason_that_rides_an_error():
+    telemetry.publish_selection("falkordb", "ImportError", quiet_reason="engine_not_provisioned")
+    try:
+        assert telemetry.read_selection() == ("falkordb", "ImportError")
+        assert telemetry.read_quiet_reason() is None
+    finally:
+        telemetry.reset_selection()

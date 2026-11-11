@@ -254,7 +254,16 @@ class TestMeasuredRates:
         # non-matching strings here and the measured rate would UNDERCOUNT the
         # hook's real behaviour. A rate that measures something other than what
         # ships is worse than no rate (Codex P2, PR #1623).
-        subjects = [s for s in proc.stdout.split("\n") if s.strip()]
+        # Review-round reflection records (`git commit --allow-empty
+        # --cleanup=verbatim`, scripts/review_reflection.py) are machine grammar,
+        # not prose: their first paragraph has no blank line after it, so %s is the
+        # whole record, and a squash merge never carries them to main. On a PR
+        # branch they would be counted as subjects, and one describing a
+        # credential-read audit ("credential files are recorded") reads as framing.
+        subjects = [
+            s for s in proc.stdout.split("\n")
+            if s.strip() and not s.startswith("Round-reflection:")
+        ]
         if len(subjects) < 200:
             pytest.skip(f"shallow history ({len(subjects)} subjects); rate not meaningful")
         rx = _pattern()
