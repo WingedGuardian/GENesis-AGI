@@ -216,6 +216,15 @@ def _shell_operand(argv: list[str], *, parser=None, _tail=None) -> tuple[str | N
     noexec = sticky = False
     while i < len(argv):
         arg = argv[i]
+        if arg == "+":
+            # A LONE `+` is an empty option bundle that bash and dash skip, so
+            # option parsing continues past it (#2218, the same rule as
+            # shell_parse._first_operand). MEASURED: `bash -n + FILE` runs
+            # nothing, `bash -n + +n FILE` and `bash + FILE` run FILE. Stopping
+            # here returned `+` as the operand, so `-c + -n` lost its no-exec
+            # state and `bash + FILE` named the wrong script.
+            i += 1
+            continue
         values = (
             1 if arg in _SHELL_VALUE_OPTIONS else
             sum(c in takes_value for c in arg[1:]) if not arg.startswith("--") else 0

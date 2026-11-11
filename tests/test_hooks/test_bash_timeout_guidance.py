@@ -578,6 +578,11 @@ class TestDeployGuardFires:
         "cat <(./scripts/update.sh)",
         'printf "%s" "$(: <(./scripts/update.sh); wait)"',
         "bash -c 'cat <(./scripts/update.sh)'",
+        # #2218: a lone `+` is an empty option bundle the shell skips, so a
+        # later `+n` still clears no-exec and the file after it still runs.
+        "bash -n + +n scripts/update.sh",
+        "bash + scripts/update.sh",
+        "bash -c + -n +n scripts/update.sh",
     )
 
     @pytest.mark.parametrize("command", LAUNCHES)
@@ -596,6 +601,10 @@ class TestDeployGuardFires:
         "bash -o noexec scripts/update.sh",
         "bash +n -o noexec scripts/update.sh",
         "bash --norc -o noexec scripts/update.sh",
+        # #2218: option parsing continues past a lone `+`, so the `-n` after
+        # it keeps these syntax-check-only (MEASURED: bash and dash run nothing).
+        "bash -c + -n scripts/update.sh",
+        "bash -n + scripts/update.sh",
         "sed -n '100,140p' scripts/update.sh",
         "grep -n 'HEALTH' scripts/update.sh",
         "grep -rn 'update.sh' scripts",
