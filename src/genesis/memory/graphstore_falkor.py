@@ -1163,7 +1163,7 @@ class FalkorGraphStore:
         moving reads onto this store landed on a projection as stale as whenever
         someone last ran the projector by hand. It is now one hour by default,
         which is a cost to accept knowingly rather than an unknown. The lever
-        still defaults to `networkx` (`config/graphstore.yaml`), and the timer
+        now ships `falkordb` (`config/graphstore.yaml`), and the timer
         deliberately does NOT gate on `mode` — the projection is kept current
         whenever the engine exists, so flipping the lever lands on a current
         graph instead of creating the staleness at the moment of the flip.

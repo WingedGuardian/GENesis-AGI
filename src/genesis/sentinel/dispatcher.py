@@ -684,7 +684,30 @@ class SentinelDispatcher:
                         reason="User rejected Sentinel dispatch",
                         duration_s=time.monotonic() - start,
                     )
-                # status == "approved" — continue to Phase 2
+                if status != "approved":
+                    # Not a status this gate knows: never read it as approval
+                    # (it would start an unapproved CC session). The handler
+                    # below fails closed.
+                    raise ValueError(f"unexpected sentinel_dispatch approval status {status!r}")
+                # One approval, one dispatch (#4348): consume an approved row
+                # before using it. ensure_approval reuses approved-but-unconsumed
+                # rows, so without this one row authorised every later dispatch
+                # with the same key for up to 24h. No request id means manual
+                # approval is off by config: nothing to consume.
+                if request_id and not await self._approval_gate.mark_consumed(request_id):
+                    logger.warning(
+                        "Sentinel dispatch approval %s already used — not dispatching",
+                        request_id,
+                    )
+                    append_log({
+                        "event": "dispatch_approval_already_used",
+                        "request_id": request_id,
+                    })
+                    return SentinelResult(
+                        dispatched=False,
+                        reason="Dispatch approval already used",
+                        duration_s=time.monotonic() - start,
+                    )
                 logger.info("Sentinel dispatch approved (%s)", request_id)
                 append_log({"event": "dispatch_approved", "request_id": request_id})
             except Exception:
@@ -715,6 +738,25 @@ class SentinelDispatcher:
                     reason="Dispatch approval mechanism failed",
                     duration_s=time.monotonic() - start,
                 )
+        elif self._require_approval:
+            # Approval is required but no mechanism is wired (no gate, no
+            # outreach pipeline: a degraded boot). FAIL CLOSED: never start an
+            # unapproved remediation session.
+            logger.error(
+                "Sentinel dispatch refused: approval required but no approval "
+                "mechanism is available",
+            )
+            append_log({"event": "dispatch_refused_no_approval_mechanism"})
+            await self._emit_event(
+                "WARNING", "sentinel.dispatch_refused",
+                "Sentinel dispatch refused: approval is required but no approval "
+                "mechanism is wired (approval gate and outreach pipeline both missing)",
+            )
+            return SentinelResult(
+                dispatched=False,
+                reason="No approval mechanism available — dispatch refused",
+                duration_s=time.monotonic() - start,
+            )
 
         # ── Phase 2: CC session ─────────────────────────────────────
         return await self._phase2_cc_and_actions(request, pattern=pattern, start=start)
@@ -788,7 +830,36 @@ class SentinelDispatcher:
                         return action_result
                     # None means approved — continue to execution below
                 except Exception:
-                    logger.error("Sentinel action approval/execution failed", exc_info=True)
+                    # FAIL CLOSED: no approval means no actions. This used to
+                    # log and fall through to the execution block below, so an
+                    # error in the approval step (e.g. a locked database) ran
+                    # the proposed actions without the owner's approval.
+                    logger.error(
+                        "Sentinel action approval failed — actions NOT executed",
+                        exc_info=True,
+                    )
+                    append_log({
+                        "event": "action_approval_failed",
+                        "actions": len(result.proposed_actions),
+                    })
+                    # If the failure came after the approval request was
+                    # created, withdraw it so no stale "action required"
+                    # prompt is left waiting (best effort).
+                    orphan = self._state.pending_request_id
+                    if orphan:
+                        try:
+                            await self._approval_gate.resolve_request(
+                                orphan, decision="cancelled", resolved_by="approval_failed",
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Could not withdraw approval request %s", orphan, exc_info=True,
+                            )
+                    result.resolved = False
+                    result.reason = "Action approval mechanism failed — actions not executed"
+                    return await self._finalize_dispatch(
+                        request, result, pattern=pattern, start=start,
+                    )
             elif self._outreach_pipeline:
                 # Legacy blocking path
                 try:
@@ -818,6 +889,8 @@ class SentinelDispatcher:
 
         Returns SentinelResult if pending/rejected (caller should return it).
         Returns None if approved (caller should proceed to execute actions).
+        Raises ValueError if the approval cannot be used (unknown status, or
+        an approval already consumed); the caller fails closed.
         """
         status, request_id, reason = await self._approval_gate.ensure_approval(
             subsystem="sentinel",
@@ -866,6 +939,16 @@ class SentinelDispatcher:
                 diagnosis=result.diagnosis,
                 reason="User rejected Sentinel actions",
             )
+
+        if status != "approved":
+            # Not a status this gate knows: never read it as approval. The
+            # caller's handler fails closed (nothing executes).
+            raise ValueError(f"unexpected sentinel_action approval status {status!r}")
+
+        # One approval, one execution (#4348): consume before executing; an
+        # already-used row raises into the caller's fail-closed handler.
+        if request_id and not await self._approval_gate.mark_consumed(request_id):
+            raise ValueError(f"sentinel_action approval {request_id} already used")
 
         # Approved — return None so caller executes actions
         logger.info("Sentinel actions approved (%s)", request_id)
@@ -1046,6 +1129,11 @@ class SentinelDispatcher:
         """
         if status == "rejected":
             return await self.handle_approval_resolution(request_id, "rejected")
+        if status != "approved":
+            # Only an explicit approval resumes; anything else clears the park.
+            return await self.handle_approval_resolution(
+                request_id, status if status in ("cancelled", "expired") else "missing",
+            )
 
         async with self._lock:
             policy_id = self._state.pending_policy_id

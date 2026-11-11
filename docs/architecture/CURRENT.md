@@ -269,8 +269,29 @@ snapshot is fixed at the first SELECT step, so stamping afterwards can pin a
 projection that is missing a mid-load commit (MEASURED 2026-09-06). That preparation is now
 used: `graphstore_falkor.FalkorGraphStore` is the second implementation, a
 long-lived FalkorDB server reached over a unix socket, selected by
-`config/graphstore.yaml` (`mode: networkx|falkordb`, default **networkx**, so
-the lever is inert until moved). It carries its own projection of
+`config/graphstore.yaml` (`mode: networkx|falkordb`, shipped default
+**falkordb** since the cutover bar was met: 14 days on a live install with zero
+fallbacks). The default applies **where present only**:
+`graphstore_config.selection()` keeps reads on NetworkX QUIETLY when `falkordb`
+comes from the shipped file alone (no overlay sets `mode`) and no
+`genesis-falkordb.service` unit is rendered and enabled (its `default.target.wants` link), publishing the selection with
+`quiet_reason="engine_not_provisioned"` and no error, so the telemetry row is
+neither a fallback nor a clock break (`graph_cutover.is_quiet_row`; a row only
+partly quiet still breaks). An overlay `mode: falkordb`, and a unit that exists
+but is stopped or failed, stay loud. `probe_falkordb` joins the steady-state
+critical-failure probes when the unit is enabled or the selection says
+falkordb, an overlay choice included (`runtime/init/learning.py`, decided at
+server start). Bootstrap and install
+arm the unit after rendering it from a verified engine (`falkordb_enable_unit`):
+`enable --now` when it is inactive or failed, a plain `enable` when it is
+running and disabled (a running engine is never started or restarted), nothing
+when masked or listed in `~/.genesis/config/disabled_timers`; a failed start is
+one WARNING line, never a failed bootstrap. The graphstore dashboard save
+writes only the keys that changed, so an unrelated save never pins `mode`
+into the overlay: the editor sends back what it showed (`__shown`) and a key
+is written when it differs from that, type included; a client with no
+snapshot is compared against the merged config (`routes/settings.py`
+`_changed_keys`). It carries its own projection of
 `memory_links` and applies the SAME visibility predicate — but at QUERY time,
 over mirrored `invalid_epoch`/`deprecated` node properties, which closes the
 future-`invalid_at` gap the NetworkX store states below. That closes the TIME
@@ -312,9 +333,19 @@ then rolls back when bootstrap refuses). The unit is `Type=simple` with a PING r
 poll, because the wheel's redis has no libsystemd to notify with, and a deploy
 moves an engine onto a different module only when systemd reports it inactive
 or failed (a running engine, or one whose state cannot be read, keeps its unit)
-or `GENESIS_FALKORDB_SWITCH=1` asks for it.
+or `GENESIS_FALKORDB_SWITCH=1` asks for it (on a running install through
+`update.sh --take-template genesis-falkordb.service`, since bootstrap refuses
+under a live server; then restart the unit).
 The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
-(`memory/graphstore_project.py`); that schedule is its staleness bound. The
+(`memory/graphstore_project.py`); that schedule is its staleness bound. Because
+`install.sh` starts the engine before genesis-server has created the database
+(bootstrap seeds it first), `install.sh` projects once after it starts the
+server, when the engine is active: it waits up to 120 s for the two tables
+the projector reads, then starts `genesis-graph-project.service`; a timeout
+leaves it to the hourly run. The graph-engine probe membership is decided at
+server start, so a
+`mode` change made live joins or leaves the critical-failure probes at the
+next restart. The
 engine keeps no data on disk, so its unit also (re)starts the projector on
 every start, restarts included; a projection already running against the
 engine that just died is stopped and run again (`ExecStartPost`, issue #3035): a restarted engine is
@@ -399,7 +430,13 @@ census does not read is carried: each row records `secrets_digest`, a hash of
 the six keys it reads, and the next census proves a changed file whose current
 values hash the same for the same pid and start (`carried: true`; the latest
 census row only; never when the file names `SECRETS_PATH` or
-`GENESIS_REPO_ROOT`)), and its database
+`GENESIS_REPO_ROOT`); the file is the one the resolver picks now, and a
+fallback past an absent `~/.config/genesis/secrets.env` counts only when that
+directory and every symlink on its path are unchanged by ctime since the server
+started, since a changed one may have held the file it loaded (#4278), and a
+fallback from another checkout's file to `~/genesis/secrets.env` is unknown;
+nothing else in `~/.config` is read),
+and its database
 scope (the primary database is fixed at import from the exec env or the root
 default, and a path in the file becomes a second one; `foreign` only when every
 one of them differs from the live database by `(st_dev, st_ino)`, no symlink on
@@ -1454,7 +1491,13 @@ verified: f62608045437 2026-11-09
 - **inbox/**: file-drop monitor with approval-gated dispatch.
   `monitor.py` owns scanning, approval, retries and baseline writes;
   `batch_runner.py` executes one approved batch and post-processes its output,
-  reached through the monitor's `_run_one_batch` forwarding method. Before any
+  reached through the monitor's `_run_one_batch` forwarding method. Its manager
+  session scopes only the invoker/retry await, stamping child environment and
+  invocation-failure attribution. The prior task context is restored before
+  handlers, postprocessing and detached work; explicit follow-up transcript IDs
+  retain their namespace. This does not grant supervision or change external
+  provenance, approvals or replay policy. See `docs/reference/inbox-session-attribution.md`.
+  Before any
   DB, approval, response, or baseline mutation, it composes and validates one
   deterministic system prompt from `INBOX_EVALUATE.md`, the complete
   `evaluate` skill, the complete `user_evaluate` skill, and an explicit
@@ -2838,9 +2881,10 @@ verified: c712f1bde 2026-11-06
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
   one is age-based and passive. `session_awareness/repo_pulse*.py`.
 - **Post-merge verification obligations** (shipped; producer automatic; consumer
-  the standing validator session, owner-started and self-paced per the
-  validating-merges skill's "Standing mode", or any manual validator; nothing
-  dispatches one automatically — issue #1718):
+  the standing validator session, started only on the owner's explicit
+  instruction and self-paced once started, per the validating-merges skill's
+  "Standing mode", or any manual validator; nothing dispatches or restarts one
+  automatically — issue #1718):
   the pulse worker's verification lane opens one `pr_verifications` row per
   MERGED PR, so "run the E2E after merge" survives the merge instead of living
   in someone's memory. A documentation-only diff is auto-closed with the reason
@@ -5018,8 +5062,13 @@ logger or unrelated exceptions with copied text and no provenance.
   "not available yet" means an older kit) and `--dismiss <ts>`, says a
   restore leaves uncommitted edits (tracked ones block deploy_code_only.sh and
   update.sh, untracked ones deploy_code_only.sh only under `src/`, `config/` or
-  `pyproject.toml`), that backups are pruned 90 days after the last write to
-  their folder, and, for a report whose last restore refused parts, that its
+  `pyproject.toml`), that a report nobody restored or dismissed is never
+  pruned (disk_hygiene's deploy-backups prune asks
+  `scripts/lib/repair_report_keep.py`, which keeps exactly what this count
+  still counts, the restore run folder holding such a report's in-flight
+  aside, and any report it cannot read) while a restored or dismissed report
+  and other backups are pruned 90 days after the last write to their folder,
+  and, for a report whose last restore refused parts, that its
   output names each and that a part it can never write goes back by hand from
   the folder's `tree/`, then `--dismiss`; the guardian's diagnosis shows the
   newest report's `restore.restored_at` and `restore.refused`, quoted; it escapes any text a database
@@ -5037,12 +5086,20 @@ logger or unrelated exceptions with copied text and no provenance.
   rule accepts (`report_ts`; anything else exits 2 before a path is built) and
   read the report through `load_report`; `--dismiss` rewrites `REPAIR.json`
   only under update.lock (30 s wait by default; still held, exit 1 and
-  nothing written), so it cannot race a restore's own rewrite. `scripts/
+  nothing written), so it cannot race a restore's own rewrite. A report
+  `load_report` refuses (unreadable, or another checkout's) is dismissed with
+  `DISMISSED.json` beside it, only in a real directory of this user's, and
+  `REPAIR.json` is left as it is; deploy health, the guardian's pick and the
+  deploy-backups prune all skip a folder holding it. `scripts/
   deploy_candidates repair-move --restore TS [--check]` passes through to the
   kit. `live_move_repair.py --restore TS
   --check` (#3492 PR B1) is the read-only judge of what a restore would
   write, in a second kit source, `scripts/lib/live_move_restore.py`, loaded
-  from the kit's own directory like the guard. It takes the repair's locks in
+  from the kit's own directory like the guard. Its report and row rules and
+  read budgets live in `live_move_restore_rows.py`, and its run-folder and
+  origin rules in `live_move_restore_runs.py`, which loads the rows module;
+  both are loaded by path from the same directory, so they ship in the kit
+  beside it. It takes the repair's locks in
   the repair's order with a short wait (30 s; `--wait` honoured) and exits 1
   while any is held (naming the pid the update state records, if any), or
   while the guard calls the checkout `mixed_tree` or `guards`. It reaches
@@ -5301,7 +5358,9 @@ verified: 81bbdb0a9 2026-11-08
   pairs as word data. Hash-containing calls keep the earlier backslash handling
   to avoid a comment/quote regression; generic #3257/#3264 remain partial/open.
   A `#` that starts a word at bash's top level opens a comment the scanner skips
-  (#3473), except in commands containing `<<`.
+  (#3473), except in commands containing `<<`. Comment and double-quoted
+  substitution boundaries the legacy scans may misread are refused, never
+  accepted (#3713 PR 1; same reference doc).
   Existing continuation, heredoc proof, size bounds and nested refusals remain.
   Codex's local CLI also has a budget-only shell action hook in
   `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the

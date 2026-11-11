@@ -111,6 +111,20 @@ def test_guardian_twin_matches_the_python_resolver(tmp_path, monkeypatch, name, 
     assert resolve_secrets_path(home) == _expected(present, override, paths)
 
 
+@pytest.mark.parametrize(("name", "present", "override"), STATES, ids=[s[0] for s in STATES])
+def test_guardian_twin_with_an_explicit_repo_root_matches(tmp_path, monkeypatch, name, present, override):
+    # The in-container self-heal passes repo_root instead of GENESIS_REPO_ROOT.
+    from genesis.guardian.cred_integrity import resolve_secrets_path
+
+    home, checkout, paths = _layout(tmp_path, present)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("GENESIS_REPO_ROOT", raising=False)
+    monkeypatch.delenv("SECRETS_PATH", raising=False)
+    for key, value in _environ(override, paths).items():
+        monkeypatch.setenv(key, value)
+    assert resolve_secrets_path(home, checkout) == _expected(present, override, paths)
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
 @pytest.mark.parametrize("locked_part", [".config", ".config/genesis"])
 def test_an_unsearchable_home_config_is_kept_by_all_three(tmp_path, monkeypatch, locked_part):

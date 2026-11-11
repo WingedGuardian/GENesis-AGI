@@ -946,6 +946,7 @@ async def test_td19_a_live_repair_report_raises_its_own_wording_then_resolves(db
     assert "deploy_code_only.sh and update.sh refuse to deploy" in content, content
     assert "committed (on a branch, as a PR), moved out, or removed" in content, content
     assert "90 days after the last write" in content, content
+    assert "nobody restored or dismissed is never pruned" in content, content
     assert "did not finish" in content and "run scripts/update.sh" not in content, content
     assert "says why" not in content, content  # a run killed partway wrote no reason
     _patch_snapshot(monkeypatch, _snap([]))
@@ -1038,7 +1039,10 @@ async def test_refused_reports_have_their_own_wording(db, monkeypatch):
     content = row["content"]
     assert row["priority"] == "high" and "update.sh" not in content, content
     assert "2 live-move repair report(s)" in content and "could not be read" in content
-    assert "named in the server log" in content and "--dismiss" not in content, content
+    # --dismiss now takes a report no reader can read (DISMISSED.json, #4331),
+    # so it is the way out this text names.
+    assert "named in the server log" in content, content
+    assert "repair-move --dismiss <ts>" in content, content
 
 
 async def test_unread_older_reports_alone_raise_nothing(db, monkeypatch):
