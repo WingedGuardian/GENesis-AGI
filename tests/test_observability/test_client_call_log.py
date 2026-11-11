@@ -76,6 +76,28 @@ def _server(arguments_seen: list) -> FastMCP:
     return server
 
 
+async def test_a_supersession_report_records_the_stored_memory_id(log_db, monkeypatch):
+    """memory_store returns a report when it supersedes; the row it wrote is its
+    memory_id, not the report and not nothing."""
+    monkeypatch.setenv(PROFILE_ENV, "codex")
+    server = FastMCP("client-log-supersede-fixture")
+
+    @server.tool()
+    async def memory_store(content: str, supersedes: str | None = None) -> str | dict:
+        if supersedes:
+            return {"memory_id": UUID, "superseded": True, "old_id": supersedes, "new_id": UUID}
+        return UUID
+
+    install_instrumentation(server, Mock(), "memory", None)
+    async with Client(server) as client:
+        await client.call_tool("memory_store", {"content": "x", "supersedes": "0" * 32})
+        await client.call_tool("memory_store", {"content": "y"})
+    assert _rows(log_db) == [
+        ("codex", "memory", "memory_store", "returned", UUID),
+        ("codex", "memory", "memory_store", "returned", UUID),
+    ]
+
+
 async def test_labelled_calls_are_recorded_without_arguments(log_db, monkeypatch):
     monkeypatch.setenv(PROFILE_ENV, "codex")
     seen: list = []
