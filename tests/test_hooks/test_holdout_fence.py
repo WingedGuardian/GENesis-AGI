@@ -356,6 +356,12 @@ def _exposures(home: Path) -> list[dict]:
         (f"ls -d {GH}/holdout; find {GH} -maxdepth 1 -newermt 2026-11-01", "listing"),
         (f"cd {GH} && du -sh *", "listing"),
         (f"cd {GH}/holdout && ls -la && pwd", "listing"),
+        (f"du -sh {GH}/* | LC_ALL=C sort -h", "listing"),
+        ('echo "$GENESIS_HOME/holdout"', "mention"),
+        ("echo ${GENESIS_HOME}/holdout; ls -d $HOME/.genesis/holdout", "listing"),
+        (f"du -sh --exclude='*.pyc' {GH}/*", "listing"),
+        (f"ls -d {GH}/holdout | cut -d/ -f1-4", "listing"),
+        (f"find {GH} -maxdepth 2 | sort -t/ -k3", "broad"),
         (f"ls --full-time -d {GH}/holdout", "listing"),
         (f"find {GH} -maxdepth 2 -name '*.md'", "broad"),
         (f"du -sh {GH}/* | sort -h | tail -n 5", "listing"),
@@ -414,6 +420,28 @@ def test_a_path_printed_by_a_names_only_command_is_activity(home, command, kind)
         f"ls -d {GH}/holdout; head -n 3 notes.txt",
         f"ls -d {GH}/holdout; head -n 3 -- notes.txt",
         f"ls -d {GH}/holdout; head -- -notes",
+        # An option that writes, reads or runs something, in any spelling.
+        f"du -sh {GH}/* | sort -o{GH}/holdout/new.txt && ls -d {GH}/holdout",
+        f"du -sh {GH}/* | sort --output={GH}/holdout/new.txt && ls -d {GH}/holdout",
+        f"cd {GH}/holdout; ls | sort -ronew.txt; ls -d {GH}/holdout",
+        f"du --exclude-from={GH}/holdout/HOLDOUT.md {GH}",
+        f"du --exclude-from {GH}/holdout/HOLDOUT.md {GH}",
+        f"du -shX {GH}/holdout/HOLDOUT.md {GH}",
+        f"du -sh {GH}/* | sort -R --random-source={GH}/holdout/HOLDOUT.md",
+        f"du -sh {GH}/* | sort --compress-program=/bin/cat",
+        f"du -sh {GH}/* | sort -T {GH}/holdout",
+        f"find -files0-from {GH}/holdout/HOLDOUT.md",
+        f"fd --ignore-file {GH}/holdout/HOLDOUT.md . {GH}",
+        f"fd . {GH}/holdout -x cat",
+        f"cd {GH}/holdout; du --files0=HOLDOUT.md; ls -d {GH}/holdout",
+        f"ls -d {GH}/holdout; ls --hide=/x {GH}",
+        f"PATH=/tmp/x ls -d {GH}/holdout",
+        # An expansion that evaluates text: only a plain $NAME or ${NAME} is allowed.
+        f"printf -v X '%b' '\\x24(head -5 f)'; echo {GH}/holdout \"${{X@P}}\"",
+        f"echo {GH}/holdout $[b]",
+        f"echo {GH}/holdout ${{a[b]}}",
+        f"echo {GH}/holdout ${{HOME:b}}",
+        f"printf -v 'a[b]' x; echo {GH}/holdout",
         f"ls -d {GH}/holdout; sort -k 2 notes.txt",
         f"ls -d {GH}/holdout; sort -m - notes.txt",
     ],
@@ -449,6 +477,95 @@ def test_expected_output_from_a_listing_command_is_still_content(home):
     )
     assert "H-01" in _note(out)
     assert [(r["kind"], r["detail"]) for r in _exposures(home)] == [("content", "H-01")]
+
+
+def _listing(home: Path, stdout: str) -> tuple[str, list[dict]]:
+    return _run(
+        home, "post", _post("Bash", {"stdout": stdout}, {"command": f"ls -la {GH}/holdout"})
+    )
+
+
+def test_a_line_of_a_holdout_file_in_a_listing_result_is_content(home):
+    """The result is checked itself, whatever the command looked like."""
+    holdout = str(home / ".genesis" / "holdout")
+    out, _ = _listing(home, f"{holdout}\nProtects:   something\n")
+    assert "HOLDOUT FENCE" in _note(out)
+    assert [(r["kind"], r["detail"]) for r in _exposures(home)] == [("content", "directory path")]
+
+
+def test_a_very_short_line_of_a_holdout_file_is_not_its_text(home):
+    holdout = str(home / ".genesis" / "holdout")
+    out, rows = _listing(home, f"{holdout}\n```sh\n")
+    assert _note(out) == "" and _exposures(home) == []
+    assert [r["kind"] for r in rows] == ["listing"]
+
+
+@pytest.mark.parametrize("extra", ["subdirectory", "symlink"])
+def test_holdout_content_the_hook_cannot_vouch_for_keeps_the_exposure(home, extra):
+    holdout = home / ".genesis" / "holdout"
+    if extra == "subdirectory":
+        (holdout / "more").mkdir()
+    else:
+        (holdout / "link.md").symlink_to(home / "elsewhere.md")
+    _listing(home, f"{holdout}\n")
+    assert [r["kind"] for r in _exposures(home)] == ["content"]
+
+
+def test_every_holdout_file_is_checked_with_whitespace_collapsed(home):
+    holdout = home / ".genesis" / "holdout"
+    (holdout / "notes.md").write_text("  a second   holdout\tfile line\n")
+    _listing(home, f"{holdout}\na second holdout file line\n")
+    _listing(home, f"{holdout}\nProtects: something\n")
+    assert [r["kind"] for r in _exposures(home)] == ["content", "content"]
+
+
+def test_a_result_cut_at_the_scan_limit_keeps_the_exposure(home):
+    holdout = str(home / ".genesis" / "holdout")
+    _listing(home, f"{holdout}\n" + "x" * (2 * 1024 * 1024))
+    assert [r["kind"] for r in _exposures(home)] == ["content"]
+
+
+def _real(home: Path, command: str) -> tuple[str, list[dict]]:
+    """Run ``command`` for real in the synthetic home and give its output to the hook."""
+    done = subprocess.run(
+        ["bash", "-c", command], env=_env(home), capture_output=True, text=True, timeout=60
+    )
+    response = {"stdout": done.stdout, "stderr": done.stderr, "interrupted": False}
+    return _run(home, "post", _post("Bash", response, {"command": command}, cwd=str(home)))
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "du -sh ~/.genesis/*",
+        "du -ah ~/.genesis | sort -h | tail -n 5",
+        "find ~/.genesis -maxdepth 1",
+        "ls -la ~/.genesis/holdout; stat -c '%n %s' ~/.genesis/holdout/HOLDOUT.md",
+    ],
+)
+def test_real_listings_are_activity(home, command):
+    out, rows = _real(home, command)
+    assert _note(out) == "" and _exposures(home) == []
+    assert rows and all(r["detail"] == "directory path" for r in rows)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find ~/.genesis/holdout -type f | xargs grep -H Protects",
+        "ls -d ~/.genesis/holdout; grep -rH Protects ~/.genesis",
+        "ls -d ~/.genesis/holdout; head -3 ~/.genesis/holdout/HOLDOUT.md",
+    ],
+)
+def test_real_reads_that_print_the_path_are_content(home, command):
+    out, _ = _real(home, command)
+    assert "HOLDOUT FENCE" in _note(out)
+    assert [r["kind"] for r in _exposures(home)] == ["content"]
+
+
+def test_find_writing_a_file_is_an_access_before_it_runs(home):
+    out, rows = _run(home, "pre", _pre("Bash", {"command": f"find {GH}/holdout -fprintf out %p"}))
+    assert "HOLDOUT FENCE" in _note(out) and rows[0]["kind"] == "access"
 
 
 def test_a_sibling_directory_name_is_not_the_holdout(home):

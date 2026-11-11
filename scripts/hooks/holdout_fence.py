@@ -35,15 +35,20 @@ Two events, one file:
   use, repeat or store it, and a ``content`` row. This catches what operand
   matching cannot: a copy made elsewhere, a shell variable, a recall result.
   A result that names only the directory's path is a ``listing``, ``broad``
-  or ``mention`` row with no note instead when the call is a shell command made
-  only of commands that print names or their own arguments (``du``, ``ls``,
-  ``stat``, ``find`` with no action, ``echo``, ``printf``, ``cd``, and
-  ``sort``/``head``-style filters of their output), run directly: no wrapper
-  (``xargs``, ``env``), substitution, ``eval``, input redirect, heredoc or
-  option that reads a file, and no way it reaches the holdout is a read, a
-  write or an access. Anything else keeps the ``content`` row: a recursive
-  ``grep`` or ``find ... | xargs head`` prints scenario lines under that path,
-  and so can a call this hook cannot classify.
+  or ``mention`` row with no note instead when three things all hold. The
+  result holds no line of any file in the holdout (six characters or more,
+  whitespace collapsed), checked against the files themselves. The call is a
+  shell command made only of ``NAMES_ONLY_VERBS`` (``du``, ``ls``, ``stat``,
+  ``find`` with no action, ``echo``, ``printf``, ``cd`` and the like) and
+  ``STDIN_FILTERS`` with no file operand, each run directly: no wrapper
+  (``xargs``, ``env``), substitution, ``eval``, input redirect, heredoc,
+  expansion other than a plain ``$NAME``, or option that opens, writes or
+  runs something (``FILE_OPTIONS``). And no way it reaches the holdout that
+  this hook can see is a read, a write or an access. Anything else keeps the
+  ``content`` row: a recursive ``grep`` or ``find ... | xargs head`` prints
+  scenario lines under that path, and so can a call this hook cannot
+  classify. The shape is a list of known commands and options, written for
+  honest mistakes: it is not a proof against a command built to evade it.
   Steps are not fingerprinted, because they exercise repository code and share
   lines with it. The runner's own output, and reads of the exposure log, are
   skipped.
@@ -87,6 +92,9 @@ WHAT IT CANNOT SEE
 - paths a command receives on stdin (``echo PATH | xargs cat``), and actions run
   by ``find`` on a directory ABOVE the holdout (``find ~/.genesis -exec cat {} +``,
   logged ``broad``), unless their output reaches the result;
+- a file read or written through an option's value (``du --exclude-from=F``,
+  ``sort -oF``, ``tree --fromfile F``), or by a ``git`` or ``gh`` verb that reads
+  one, until its content or path shows up in a result;
 - an expected-output line under 40 characters, or content past the first 2 MiB;
 - clients other than Claude Code and Codex CLI, and any process outside an agent
   session.
@@ -693,15 +701,17 @@ def _post(payload: dict, holdout: str) -> str | None:
     cwd = str(payload.get("cwd") or os.getcwd())
     if _post_exempt(str(payload.get("tool_name") or ""), ti, cwd):
         return None
-    text = _collapse(_result_text(payload.get("tool_response")))
+    raw = _result_text(payload.get("tool_response"))
+    text = _collapse(raw)
     if not text:
         return None
     hits = sorted({sid for line, sid in _fingerprints(holdout) if line in text})
     # Only the absolute path: the ~ and $GENESIS_HOME spellings appear in the
     # holdout's own docs, skills and this file, which agents read routinely.
     if not hits and any(_names_component(text, r) for r in _roots(holdout)):
-        names_only = _names_only_kind(ti, payload, cwd, holdout)
-        if names_only:
+        whole = len(raw) < RESULT_SCAN_BYTES  # a cut result cannot be vouched for
+        names_only = _names_only_kind(ti, payload, cwd, holdout) if whole else None
+        if names_only and not _carries_holdout_text(text, holdout):
             # Only names or the command's own words reached the result: activity.
             _log(payload, "post", names_only, "directory path")
             return None
@@ -732,12 +742,34 @@ FILTER_VALUE_OPTIONS = {
     "uniq": frozenset({"-f", "-s", "-w"}),
     "column": frozenset({"-s", "-c"}),
 }
-#: Options by which a names-only command reads a file or runs one.
-FILE_READING_OPTIONS = ("--fromfile", "--files0-from", "-files0-from", "--from-file")
-FD_EXEC_OPTIONS = ("-x", "-X", "--exec")  # also --exec-batch, --exec=CMD, -xCMD
+#: Long options through which one of those commands opens, writes or runs
+#: something its value names. The population is their manuals: du
+#: (--files0-from, --exclude-from), sort (--files0-from, --output,
+#: --random-source, --compress-program, --temporary-directory), wc
+#: (--files0-from), fd (--exec, --exec-batch, --ignore-file), and tree's
+#: --fromfile in case it is ever admitted.
+FILE_OPTIONS = (
+    "--files0-from", "--fromfile", "--from-file", "--exclude-from", "--output",
+    "--random-source", "--compress-program", "--temporary-directory", "--ignore-file",
+    "--exec", "--exec-batch",
+)  # fmt: skip
+#: A harmless option of its own that is also a prefix of one above.
+SAFE_EXACT_OPTIONS = frozenset({"--exclude"})
+#: The same population as short option letters, per command.
+FILE_OPTION_LETTERS = {"du": "X", "sort": "oT", "fd": "xX"}
+#: Short options whose attached value is a delimiter, where "/" is ordinary.
+DELIMITER_OPTIONS = {"sort": "-t", "cut": "-d", "column": "-s"}
+#: A locale or layout assignment before a command changes its formatting only.
+_FORMAT_ASSIGNMENT = re.compile(r"^(?:LC_[A-Z]+|LANG|LANGUAGE|TZ|COLUMNS)=[\w.@:+-]*$")
+#: The shortest line of a holdout file that counts as its text in a result.
+MIN_HOLDOUT_TEXT_CHARS = 6
+MAX_HOLDOUT_FILES = 32
 #: Shell syntax that hides what a command prints: command and process
 #: substitution, input redirects and heredocs.
 _OPAQUE_SYNTAX = ("$(", "`", "<", ">(")
+#: Any "$" that is not a plain $NAME or ${NAME}: ${X@P}, $[b], ${a[b]} and
+#: ${HOME:b} evaluate text as a command or an expression.
+_NOT_A_PLAIN_VARIABLE = re.compile(r"\$(?![A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})")
 
 
 def _names_only_kind(ti: dict, payload: dict, cwd: str, holdout: str) -> str | None:
@@ -748,7 +780,9 @@ def _names_only_kind(ti: dict, payload: dict, cwd: str, holdout: str) -> str | N
     built by ``eval``, and a searcher such as ``grep`` is never names-only). And
     every way it reaches the holdout, not just the strongest: ``ls holdout;
     echo x >> holdout/HOLDOUT.md`` also holds a write. No reach at all, or an
-    error, gives None, which keeps the content row.
+    error, gives None, which keeps the content row. The caller also checks the
+    result itself (``_carries_holdout_text``): the shape is a list of known
+    commands and options, and the result is what the agent actually received.
     """
     if payload.get("tool_name") != "Bash":
         return None
@@ -768,6 +802,8 @@ def _names_only_shape(command: str) -> bool:
     """Every segment of ``command`` is a names-only command or a bare filter, run directly."""
     if not command or any(token in command for token in _OPAQUE_SYNTAX):
         return False
+    if _NOT_A_PLAIN_VARIABLE.search(command):
+        return False
     try:
         from shell_parse import analyze_checked
 
@@ -781,16 +817,18 @@ def _names_only_shape(command: str) -> bool:
         words = (seg.raw or "").split()
         if not argv or not words or seg.depth or getattr(seg, "verb_unresolved", False):
             return False
+        while len(words) > 1 and _FORMAT_ASSIGNMENT.match(words[0]):
+            words = words[1:]  # LC_ALL=C sort -h
         if os.path.basename(words[0]) != os.path.basename(argv[0]):
             return False  # run through a wrapper (xargs, env, timeout, sudo) or an assignment
         verb = os.path.basename(seg.exe or argv[0])
         args = argv[1:]
-        if any(_reads_a_file(a) for a in args):
+        if any(_opens_something(verb, a) for a in args):
             return False
         if verb == "find" and FIND_ACTIONS & set(args):
             return False
-        if verb == "fd" and any(a.startswith(FD_EXEC_OPTIONS) for a in args):
-            return False
+        if verb == "printf" and any(a.startswith("-v") for a in args):
+            return False  # it assigns a variable, which a later expansion can evaluate
         if verb in NAMES_ONLY_VERBS:
             continue
         if verb in STDIN_FILTERS and not _filter_operands(verb, args):
@@ -799,19 +837,58 @@ def _names_only_shape(command: str) -> bool:
     return True
 
 
-def _reads_a_file(arg: str) -> bool:
-    """An option word that reads a file, or one the shell may rewrite into one.
+def _opens_something(verb: str, arg: str) -> bool:
+    """An option word by which ``verb`` opens, writes or runs something.
 
     GNU tools accept any unambiguous prefix of a long option (``--files0=F``),
     and an expansion or brace inside an option word becomes other words
     (``-q${IFS}F``, ``-{-files0-from=F,s}``), so neither is taken at face value.
+    An option word carrying a path is refused whatever the option is.
     """
-    if not arg.startswith("-"):
+    if not arg.startswith("-") or arg == "-":
         return False
     if "$" in arg or "{" in arg:
         return True
-    name = arg.split("=", 1)[0]
-    return len(name) > 2 and any(opt.startswith(name) for opt in FILE_READING_OPTIONS)
+    if arg.startswith("--"):
+        name = arg.split("=", 1)[0]
+        if name in SAFE_EXACT_OPTIONS:
+            return False
+        if len(name) > 2 and any(opt.startswith(name) for opt in FILE_OPTIONS):
+            return True
+    elif verb == "find":
+        if arg == "-files0-from":
+            return True
+    else:
+        if any(letter in arg[1:] for letter in FILE_OPTION_LETTERS.get(verb, "")):
+            return True
+        if arg[:2] == DELIMITER_OPTIONS.get(verb):
+            return False
+    return "/" in arg
+
+
+def _carries_holdout_text(text: str, holdout: str) -> bool:
+    """Whether ``text`` (collapsed) holds a line of any holdout file. Unknown is True.
+
+    The check on the RESULT, independent of how the command was classified: a
+    listing prints paths and sizes, never a line of the files it lists.
+    """
+    try:
+        entries = list(os.scandir(holdout))
+        if len(entries) > MAX_HOLDOUT_FILES:
+            return True
+        for entry in entries:
+            if not entry.is_file(follow_symlinks=False):
+                return True  # a subdirectory or a link: its content cannot be vouched for
+            if entry.stat(follow_symlinks=False).st_size > RESULT_SCAN_BYTES:
+                return True
+            with open(entry.path, encoding="utf-8", errors="replace") as fh:
+                for line in fh.read().split("\n"):
+                    collapsed = _collapse(line)
+                    if len(collapsed) >= MIN_HOLDOUT_TEXT_CHARS and collapsed in text:
+                        return True
+    except OSError:
+        return True
+    return False
 
 
 def _filter_operands(verb: str, args: list[str]) -> list[str]:
