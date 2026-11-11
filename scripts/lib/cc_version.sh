@@ -119,6 +119,87 @@ CC_CLAUDE_AI_SYNC_OPTOUTS=(
 CC_PROBE_DIRS="${CC_PROBE_DIRS:-/usr/local/bin:/usr/bin:$HOME/.npm-global/bin}"
 
 
+# _cc_on_windows_mount <path> — true when <path> is on a WSL Windows drive mount.
+#
+# WSL appends the Windows PATH to every Linux shell by default, so on a box with
+# Claude Code installed on Windows and not inside the distro, `command -v claude`
+# answers with the Windows npm shim (/mnt/c/Users/<name>/AppData/Roaming/npm/claude).
+# That copy is not this install's CC: it runs as a Windows process with Windows
+# config, and its npm prefix is the Windows user's tree. Taken as installed, it
+# left the distro with no Linux CC, baked the Windows dir (with its space) into
+# every unit's PATH, and on a version mismatch cc_ensure_local reinstalled INTO
+# the Windows tree.
+#
+# MEASURED on WSL2 (Ubuntu, 2026-11): `findmnt -T /mnt/c/...` reports fstype
+# `9p` with `aname=drvfs` among its options; WSL1 reports fstype `drvfs`. Without
+# findmnt nothing is detected, which is the behaviour before this check existed.
+_cc_on_windows_mount() {
+    command -v findmnt >/dev/null 2>&1 || return 1
+    # Callers may hold IFS=':' while walking PATH; findmnt's columns are space-separated.
+    local IFS=$' \t\n' fstype opts
+    read -r fstype opts < <(findmnt -n -o FSTYPE,OPTIONS -T "$1" 2>/dev/null) || return 1
+    [ "$fstype" = "drvfs" ] && return 0
+    case "$opts" in *aname=drvfs*) return 0 ;; esac
+    return 1
+}
+
+
+# cc_resolve_claude — print the first `claude` on PATH that is not a Windows copy
+# reached through WSL interop (_cc_on_windows_mount); exit 1 when there is none.
+# Use it instead of `command -v claude` wherever the answer decides which copy is
+# THIS install's Claude Code. A skipped Windows copy is named on stderr only when
+# nothing else is found, so an ordinary WSL box (Linux copy first on PATH) is quiet.
+cc_resolve_claude() {
+    local d skipped="" _dirs=()
+    IFS=':' read -r -a _dirs <<< "$PATH"
+    for d in "${_dirs[@]}"; do
+        [ -n "$d" ] && [ -f "$d/claude" ] && [ -x "$d/claude" ] || continue
+        if _cc_on_windows_mount "$d/claude"; then
+            [ -n "$skipped" ] || skipped="$d/claude"
+            continue
+        fi
+        printf '%s\n' "$d/claude"
+        return 0
+    done
+    if [ -n "$skipped" ]; then
+        echo "  cc_resolve_claude: ignoring $skipped — a Windows Claude Code reached through WSL interop is not this install's copy" >&2
+    fi
+    return 1
+}
+
+
+# cc_find_claude — this install's `claude`: cc_resolve_claude's PATH answer, else
+# the first copy in CC_PROBE_DIRS (never a Windows one). A user-prefix install
+# (~/.npm-global, cc_ensure_local's no-sudo target) is often absent from a
+# non-interactive shell's PATH, so a PATH-only check would not see the copy the
+# same run just installed. Use it wherever a script needs to RUN this install's CC.
+cc_find_claude() {
+    cc_resolve_claude 2>/dev/null && return 0
+    local d _probe=()
+    IFS=':' read -r -a _probe <<< "$CC_PROBE_DIRS"
+    for d in "${_probe[@]}"; do
+        [ -n "$d" ] && [ -f "$d/claude" ] && [ -x "$d/claude" ] || continue
+        _cc_on_windows_mount "$d/claude" && continue
+        printf '%s\n' "$d/claude"
+        return 0
+    done
+    return 1
+}
+
+
+# _cc_sudo_ready — true when sudo can run NOW without stalling: a cached or
+# passwordless ticket, or a terminal to authenticate on first. The install runs
+# under `timeout`, which puts sudo in a background process group where a password
+# prompt cannot read the terminal and just waits out the timeout, so authenticate
+# with `sudo -v` here, in the foreground, before that.
+_cc_sudo_ready() {
+    command -v sudo >/dev/null 2>&1 || return 1
+    sudo -n true 2>/dev/null && return 0
+    [ -t 0 ] || return 1
+    sudo -v
+}
+
+
 # cc_ensure_updater_suppressed — re-assert CC auto-updater suppression.
 #
 # Ensures BOTH `DISABLE_AUTOUPDATER=1` and `DISABLE_UPDATES=1` in the USER-level
@@ -1309,7 +1390,7 @@ cc_ensure_local() {
     fi
 
     local existing current prefix p
-    existing="$(command -v claude 2>/dev/null || true)"
+    existing="$(cc_resolve_claude || true)"
     if [ -z "$existing" ]; then
         # PATH-blind check before declaring absence: a user-prefix install
         # (~/.npm-global with its PATH export in .bashrc AFTER the interactive
@@ -1348,6 +1429,20 @@ cc_ensure_local() {
         prefix="$(npm config get prefix 2>/dev/null)"
         [ -n "$prefix" ] || prefix="/usr/local"        # guard empty-but-rc-0 output
         [ "$prefix" = "/usr" ] && prefix="/usr/local"  # avoid /usr/lib misrouting
+        # A FRESH install that cannot use sudo to write the system prefix — no
+        # sudo, a password with no terminal to ask on (bootstrap under update.sh, a
+        # timer), or a refused password — goes to the user prefix rather than
+        # failing and leaving the box with no Linux CC at all. ~/.npm-global/bin
+        # is in CC_PROBE_DIRS (cc_find_claude) and in the PATH of every unit that
+        # runs Claude Code.
+        case "$prefix" in
+            /usr|/usr/local|/opt/*)
+                if [ "$(id -u)" != "0" ] && ! _cc_sudo_ready; then
+                    echo "  cc_ensure_local: cannot use sudo to write $prefix — installing to the user prefix $HOME/.npm-global instead" >&2
+                    prefix="$HOME/.npm-global"
+                fi
+                ;;
+        esac
     fi
 
     # Always pass --prefix explicitly (deterministic target). sudo only for
@@ -1357,13 +1452,13 @@ cc_ensure_local() {
     case "$prefix" in
         /usr|/usr/local|/opt/*)
             if [ "$(id -u)" != "0" ]; then
-                if command -v sudo >/dev/null 2>&1; then
+                if _cc_sudo_ready; then
                     # PATH passthrough: npm is often nvm-managed + absent from
                     # sudo's secure_path (matches host-setup.sh).
                     npm_args=(sudo env "PATH=$PATH" "${npm_args[@]}")
                 else
-                    echo "  cc_ensure_local: sudo unavailable — cannot install to $prefix (skipping)" >&2
-                    return 0
+                    echo "  cc_ensure_local: cannot use sudo to reinstall Claude Code in $prefix (skipping)" >&2
+                    return 1
                 fi
             fi
             ;;
@@ -1380,7 +1475,12 @@ cc_ensure_local() {
     # absent from PATH, which made a SUCCESSFUL install report a false
     # "PATH mismatch" warning (seen live on a parity run 2026-07-04).
     installed="$("$prefix/bin/claude" --version 2>/dev/null | awk '{print $1}')"
-    [ -n "$installed" ] || installed="$(claude --version 2>/dev/null | awk '{print $1}')"
+    if [ -z "$installed" ]; then
+        # Never a bare `claude`: on WSL it can be the Windows copy, already at the
+        # pin, reporting a Linux install that did not happen.
+        p="$(cc_resolve_claude 2>/dev/null || true)"
+        [ -n "$p" ] && installed="$("$p" --version 2>/dev/null | awk '{print $1}')"
+    fi
     if [ "$installed" = "$pin" ]; then
         echo "  + Claude Code now at pin ($pin)"
         _cc_deploy_summary "Claude Code aligned to the pin ($pin)"
@@ -1430,7 +1530,7 @@ cc_shadow_scan() {
 
     local canonical="" canon_real="" canon_pkg="" p v
     local -a _candidates=()
-    p="$(command -v claude 2>/dev/null || true)"
+    p="$(cc_resolve_claude 2>/dev/null || true)"
     [ -n "$p" ] && _candidates+=("$p")
     local _oldIFS="$IFS"
     IFS=':'

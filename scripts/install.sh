@@ -1004,8 +1004,14 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
     # real location (nvm bin, ~/.npm-global, or a system prefix) — no guessing.
     # The fallback applies only if that install failed, in which case services
     # can't spawn CC regardless; a later bootstrap.sh re-renders the units with
-    # the correct path once CC is present.
-    _cc_path="$(command -v claude 2>/dev/null || true)"
+    # the correct path once CC is present. cc_resolve_claude (lib/cc_version.sh,
+    # sourced above) skips a Windows copy reached through WSL interop, whose dir
+    # must never reach a unit's PATH.
+    if declare -F cc_resolve_claude >/dev/null; then
+        _cc_path="$(cc_resolve_claude || true)"
+    else
+        _cc_path="$(command -v claude 2>/dev/null || true)"
+    fi
     # The npm prefix is needed in BOTH branches: it is the bin dir that actually
     # receives `npm install -g` (gitnexus, and claude itself when cc_ensure_local
     # installs it). When _install_node fell back to nvm, that prefix is the nvm
@@ -1200,8 +1206,10 @@ else
     echo "    - MCP template not found (skipping)"
 fi
 
-# Register code intelligence tools as MCP servers
-if command -v claude &>/dev/null; then
+# Register code intelligence tools as MCP servers. Gate on THIS install's CC
+# (cc_find_claude skips a Windows copy reached through WSL interop).
+if { declare -F cc_find_claude >/dev/null && cc_find_claude >/dev/null; } \
+    || { ! declare -F cc_find_claude >/dev/null && command -v claude &>/dev/null; }; then
     # Shared with bootstrap.sh: registers AND drift-heals user-scope entries
     # (a re-run installer must re-point a stale registration, not skip it).
     # shellcheck source=lib/mcp_register.sh
@@ -1872,9 +1880,16 @@ else
 fi
 
 # Login guidance (interactive only)
-if should_prompt && command -v claude &>/dev/null; then
+# THIS install's CC: a Windows copy reached through WSL interop would log in the
+# Windows Claude Code, not the one Genesis runs (lib/cc_version.sh).
+if declare -F cc_find_claude >/dev/null; then
+    _cc_bin="$(cc_find_claude || true)"
+else
+    _cc_bin="$(command -v claude 2>/dev/null || true)"
+fi
+if should_prompt && [ -n "$_cc_bin" ]; then
     # Check if already logged in
-    if claude auth status &>/dev/null 2>&1; then
+    if "$_cc_bin" auth status &>/dev/null 2>&1; then
         echo "    . Claude Code already authenticated"
     else
         echo ""
@@ -1896,7 +1911,7 @@ if should_prompt && command -v claude &>/dev/null; then
         echo ""
         read -rp "    Log in now? (strongly recommended) [Y/n] " _cc_login
         if [ "${_cc_login:-Y}" != "n" ] && [ "${_cc_login:-Y}" != "N" ]; then
-            claude login || echo "    WARNING: Login failed or was skipped"
+            "$_cc_bin" login || echo "    WARNING: Login failed or was skipped"
         else
             echo "    Skipped. To log in later: cd ~/genesis && claude login"
         fi
@@ -2070,7 +2085,8 @@ else
 fi
 
 # Claude Code
-if command -v claude &>/dev/null; then
+if { declare -F cc_find_claude >/dev/null && cc_find_claude >/dev/null; } \
+    || { ! declare -F cc_find_claude >/dev/null && command -v claude &>/dev/null; }; then
     echo "    PASS  Claude Code installed"
     SMOKE_PASS=$((SMOKE_PASS + 1))
 else

@@ -792,6 +792,14 @@ if [ -f "$_cc_env" ]; then
              "and its unit goes red if it cannot"
     fi
     cc_shadow_scan || true
+    # Say it when the box ends this step with no Linux CC (a failed install, or
+    # on WSL only a Windows copy reachable through interop): every unit that
+    # starts Claude Code would otherwise just fail to find it.
+    if ! cc_find_claude >/dev/null; then
+        echo "  WARNING: no Linux Claude Code is installed — Genesis services cannot start Claude Code sessions."
+        echo "           Install it: npm install -g --prefix ~/.npm-global @anthropic-ai/claude-code@${CC_VERSION}"
+        _cc_deploy_summary "no Linux Claude Code installed — services cannot start Claude Code sessions"
+    fi
 fi
 
 # bubblewrap (sandbox for codex exec — optional)
@@ -1670,7 +1678,13 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     # Resolve the Claude Code binary dir. `dirname ""` collapses to "." and
     # exits 0 when claude isn't on PATH yet, so split the pipeline and resolve
     # the real npm prefix explicitly.
-    _cc_path="$(command -v claude 2>/dev/null || true)"
+    # cc_resolve_claude (lib/cc_version.sh, sourced above) skips a Windows copy
+    # reached through WSL interop, whose dir must never reach a unit's PATH.
+    if declare -F cc_resolve_claude >/dev/null; then
+        _cc_path="$(cc_resolve_claude || true)"
+    else
+        _cc_path="$(command -v claude 2>/dev/null || true)"
+    fi
     # Needed in both branches: the npm prefix's bin is where `npm install -g`
     # (gitnexus, and claude via cc_ensure_local in scripts/lib/cc_version.sh)
     # actually lands — nvm's bin after an nvm fallback, ~/.npm-global, or a

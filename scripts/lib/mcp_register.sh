@@ -168,11 +168,26 @@ PYCODE
     echo "  Serena: existing project registration retained"
 )
 
+# _mcp_claude_bin — the `claude` this install registers MCP servers with.
+# cc_find_claude (lib/cc_version.sh, sourced by both callers first) skips a
+# Windows copy reached through WSL interop — a bare `claude mcp add` there writes
+# Genesis's Linux launcher paths into the WINDOWS user's ~/.claude.json, where
+# every Windows session then fails to start them — and finds a user-prefix
+# install that is not on this shell's PATH.
+_mcp_claude_bin() {
+    if declare -F cc_find_claude >/dev/null; then
+        cc_find_claude
+    else
+        command -v claude
+    fi
+}
+
 _register_mcp() {
     local name="$1" scope="$2"
     shift 2
     local cmd_args=("$@")
-    if ! command -v claude &>/dev/null; then
+    local claude_bin
+    if ! claude_bin="$(_mcp_claude_bin)"; then
         echo "  WARNING: 'claude' CLI not found — skipping $name registration"
         return 0
     fi
@@ -219,7 +234,7 @@ PYEOF
         # configuration it did not create.
         if [ -n "$registered" ]; then
             echo "  $name: registered command drifted ($registered) — re-registering"
-            claude mcp remove "$name" -s "$scope" 2>/dev/null || true
+            "$claude_bin" mcp remove "$name" -s "$scope" 2>/dev/null || true
         elif [ -n "$(_mcp_entry_exists "$name")" ]; then
             echo "  WARNING: $name already exists at $scope scope with a different transport."
             echo "    Genesis has NOT modified it — it did not create that entry."
@@ -227,12 +242,12 @@ PYEOF
             return 0
         fi
     else
-        if claude mcp list 2>/dev/null | grep -q "^$name:"; then
+        if "$claude_bin" mcp list 2>/dev/null | grep -q "^$name:"; then
             echo "  $name: already registered"
             return 0
         fi
     fi
-    claude mcp add "$name" -s "$scope" -- "${cmd_args[@]}" 2>/dev/null \
+    "$claude_bin" mcp add "$name" -s "$scope" -- "${cmd_args[@]}" 2>/dev/null \
         && echo "  $name: registered ($scope)" \
         || echo "  WARNING: Failed to register $name"
     [ "$scope" = "user" ] && _warn_local_scope_shadow "$name" "${cmd_args[0]}"
@@ -282,7 +297,8 @@ _register_mcp_http() {
         fi
         return 0
     fi
-    if ! command -v claude &>/dev/null; then
+    local claude_bin
+    if ! claude_bin="$(_mcp_claude_bin)"; then
         echo "  WARNING: 'claude' CLI not found — skipping $name registration"
         return 0
     fi
@@ -396,12 +412,12 @@ PYEOF
             return 0
         fi
     else
-        if claude mcp list 2>/dev/null | grep -q "^$name:"; then
+        if "$claude_bin" mcp list 2>/dev/null | grep -q "^$name:"; then
             echo "  $name: already registered"
             return 0
         fi
     fi
-    claude mcp add --transport http "$name" -s "$scope" "$url" 2>/dev/null \
+    "$claude_bin" mcp add --transport http "$name" -s "$scope" "$url" 2>/dev/null \
         && echo "  $name: registered ($scope, http)" \
         || echo "  WARNING: Failed to register $name"
     [ "$scope" = "user" ] && _warn_local_scope_shadow "$name" "$url"
