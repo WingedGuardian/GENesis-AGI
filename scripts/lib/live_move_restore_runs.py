@@ -160,15 +160,18 @@ def aside_parts(judge) -> list:
         out.append((key, "aside", why))
 
     if inf:
+        key = f"{inf[0]}/aside/{inf[1]}"
         try:
             os.lstat(os.path.join(judge.runs, inf[0]))
         except FileNotFoundError:
-            key = f"{inf[0]}/aside/{inf[1]}"
             gone = os.path.join(judge.shown, key)
             note = (
                 f"the held aside {gone} is gone with its run folder: what it held was not restored"
             )
             part(key, "other:aside-lost", note)
+        except OSError as exc:  # cannot see it: never read as gone, nor as there (#4364 review)
+            part(key, "other:aside-unreadable",
+                 f"{os.path.join(judge.shown, key)} cannot be read ({exc.strerror})")  # fmt: skip
     try:
         names = sorted(n for n in os.listdir(judge.runs) if run_ts(n) == judge.ts)
     except OSError as exc:
@@ -181,7 +184,7 @@ def aside_parts(judge) -> list:
     for name in names:
         run, aside = os.path.join(judge.runs, name), os.path.join(judge.runs, name, "aside")
         try:
-            ok = all(_private(os.lstat(d)) for d in (run, aside) if d == run or not absent(aside, ""))
+            ok = all(_private(os.lstat(d)) for d in (run, aside) if d == run or not absent(run, "aside"))
         except FileNotFoundError:
             continue  # removed since it was listed: nothing left to judge
         except OSError as exc:  # cannot see into it: never read as nothing held

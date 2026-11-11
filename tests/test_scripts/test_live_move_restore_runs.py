@@ -254,3 +254,65 @@ def test_an_aside_the_restore_cannot_search_is_refused_never_released(w, locked)
         assert w.report()["restore"]["refused"] >= 1
     finally:
         target.chmod(0o700)
+
+
+def test_a_run_whose_move_aside_is_refused_leaves_no_folder(w):
+    """#4364 review round 2 (B1): the move aside fails (sub/ not writable),
+    leaving only the empty aside/sub/ the move made; every rerun removes its
+    own, so repeated refusals never pile folders up against RUNS_CAP."""
+    ts = _repaired(w, _foreign_edit)
+    sub = w.root / "sub"
+    sub.chmod(0o555)
+    try:
+        for _ in range(3):
+            r = _restore(w, ts)
+            assert r.returncode == 1 and _parts(r)[("sub/s1", "node")].startswith("refused:"), r.stdout
+    finally:
+        sub.chmod(0o755)
+    assert _runs(w) == [], _runs(w)
+
+
+def test_a_run_put_back_after_a_session_write_leaves_no_folder(w, mod, monkeypatch, capsys):
+    """#4364 review round 2 (B2): a session writes the path after the intent;
+    the moved node goes back and its aside/ is left empty, then removed."""
+    from tests.test_scripts.test_live_move_restore_write import _restore_in
+
+    ts = _repaired(w, _foreign_edit)
+    session = lambda: (w.root / "sub" / "s1").write_text("a session's\n")  # noqa: E731
+    rc, out = _restore_in(w, mod, monkeypatch, capsys, ts, at={"intent": session})
+    assert rc == 1, out
+    assert (w.root / "sub" / "s1").read_text() == "a session's\n"
+    assert _runs(w) == [], _runs(w)
+
+
+def test_a_stopped_run_leaves_no_folder(w):
+    """#4364 review round 2 (B3): REPAIR.json cannot be written (the report
+    folder read-only), so the run stops; it removes its staging-only folder
+    instead of leaving one per rerun, and REPAIR.json is unchanged."""
+    ts = _repaired(w, _foreign_edit)
+    report = w.backups()[-1]
+    before = (report / "REPAIR.json").read_bytes()
+    report.chmod(0o500)
+    try:
+        for _ in range(2):
+            assert _restore(w, ts).returncode == 1
+    finally:
+        report.chmod(0o700)
+    assert _runs(w) == [], _runs(w)
+    assert (report / "REPAIR.json").read_bytes() == before
+
+
+def test_an_in_flight_name_the_kernel_rejects_is_a_named_refusal(w):
+    """#4364 review round 2 (A): a run name restore_block accepts but lstat
+    rejects (ENAMETOOLONG) is named other:aside-unreadable, never a crash."""
+    import json
+
+    ts = _repaired(w, _foreign_edit)
+    path = w.backups()[-1] / "REPAIR.json"
+    report = json.loads(path.read_text())
+    long = f"20260101T000000Z-{'1' * 300}-{ts}-live-move-restore"
+    report["restore"] = {"inflight": [long, "sub/s1", "node"], "refused": 0, "restored_at": None}
+    path.write_text(json.dumps(report))
+    for r in (_check(w, ts), _restore(w, ts)):
+        assert "Traceback" not in r.stderr, r.stderr
+        assert r.returncode == 1 and "aside-unreadable" in r.stdout, r.stdout

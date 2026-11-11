@@ -92,6 +92,26 @@ def _dirfd(fd: int, rel: str, make: bool = False, mode: int = 0o777) -> int:
         raise
 
 
+def _rmdir_tree(fd: int, name: str) -> None:
+    """rmdir ``name`` below ``fd`` and every directory under it, deepest
+    first, never following a link: a directory holding anything stays
+    (ENOTEMPTY), so only empty directories the restore made can go. Each
+    level is listed through a fresh descriptor (a long-held one reads stale
+    on btrfs)."""
+    try:
+        sub = os.open(name, _DIR, dir_fd=fd)
+    except OSError:
+        return
+    try:
+        for entry in list(os.scandir(sub)):
+            if entry.is_dir(follow_symlinks=False):
+                _rmdir_tree(sub, entry.name)
+    finally:
+        os.close(sub)
+    with contextlib.suppress(OSError):
+        os.rmdir(name, dir_fd=fd)
+
+
 def _why(exc: OSError) -> str:
     if exc.errno == errno.EXDEV:
         return "other:cross-device"
@@ -151,6 +171,7 @@ class _Writer:
         self.out, self.notes, self.refused = {}, dict(judge.notes), set()
         self.prior = chk.restore_block(loaded["report"])
         self.run_name = self.run_fd = self.repo_fd = None
+        self.recorded_run = None  # the run REPAIR.json's record names after our last save
         self.wrote, self.extras, self.flight = [], [], None
         self.called = set()  # every path whose entries the index call replaced
         # The in-flight record kept for the next run: an aside still holding what
@@ -189,6 +210,7 @@ class _Writer:
             self._finish()
             self._drop_unused_run()
         except _Stop as exc:
+            self._drop_unused_run()  # a stop leaves nothing a later run needs either
             self._report()
             self.say(str(exc))
             return 1
@@ -212,6 +234,7 @@ class _Writer:
                 raise rp.BadReport("REPAIR.json is gone")
             report = {**loaded["report"], "restore": block}
             rp.write_json(os.path.join(self.ctx.backup, "REPAIR.json"), report, private=True)
+            self.recorded_run = inflight[0] if inflight else None
         except (OSError, rp.BadReport) as exc:
             part = json.dumps(self.flight) + " node" if self.flight else "no part"
             folder = os.path.join(self.ctx.shown, self.run_name) if self.run_name else "none made"
@@ -230,8 +253,13 @@ class _Writer:
             )
             try:
                 os.mkdir(name, 0o700, dir_fd=self.ctx.bfd)
+            except OSError as exc:
+                raise _Stop(f"stopped: the run folder {name} cannot be made ({exc})") from None
+            try:
                 self.run_fd = os.open(name, _DIR, dir_fd=self.ctx.bfd)
             except OSError as exc:
+                with contextlib.suppress(OSError):
+                    os.rmdir(name, dir_fd=self.ctx.bfd)  # made empty just now
                 raise _Stop(f"stopped: the run folder {name} cannot be made ({exc})") from None
             self.run_name = name
         return self.run_name
@@ -637,18 +665,22 @@ class _Writer:
     def _drop_unused_run(self) -> None:
         """A run folder holding no aside and no index-before.txt keeps nothing
         a later run or a person needs: only staging, put in or refused, whose
-        source is the report's own copy. It is removed, so refused reruns never
-        pile folders up against RUNS_CAP (#4025 review SF-6)."""
-        if self.run_fd is None:
+        source is the report's own copy, and the empty aside/ directories a
+        refused or put-back move left. It is removed on every exit, a stop
+        included, so refused reruns never pile folders up against RUNS_CAP
+        (#4025 review SF-6, #4364 review). Decided by rmdir alone, deepest
+        first (a directory holding anything stays: ENOTEMPTY), never by a
+        listing of the long-held fd, which reads stale on btrfs; and never
+        while REPAIR.json's record names this folder."""
+        if self.run_fd is None or self.recorded_run == self.run_name:
             return
+        with contextlib.suppress(OSError):
+            shutil.rmtree("new", dir_fd=self.run_fd)
+        _rmdir_tree(self.run_fd, "aside")
         try:
-            if set(os.listdir(self.run_fd)) - {"new"}:
-                return
-            if "new" in os.listdir(self.run_fd):
-                shutil.rmtree("new", dir_fd=self.run_fd)
             os.rmdir(self.run_name, dir_fd=self.ctx.bfd)
         except OSError:
-            return  # kept: a folder it cannot judge or remove stays for the next run
+            return  # kept: it holds an aside or index-before.txt
         self.run_name = None
 
     def _finish(self) -> None:

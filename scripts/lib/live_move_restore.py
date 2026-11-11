@@ -949,6 +949,8 @@ def _judged(rp, repo: str, ctx, say, write: bool, nothing: str):
         parts += aside_parts(judge)
     except _Whole as exc:
         return str(exc)
+    except OSError as exc:  # a run folder it cannot read: refused by name (#4364 review)
+        return unreadable(exc)
     if not write and not where:  # held, the writer makes no index call, sets no flag
         parts = as_the_writer_would(rp, judge, parts)
     return judge, parts, loaded, ctx

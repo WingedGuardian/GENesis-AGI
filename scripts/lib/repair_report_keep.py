@@ -75,9 +75,17 @@ def keep(folder: str) -> str | None:
     name = os.path.basename(folder.rstrip("/"))
     if m := RUN_NAME.fullmatch(name):
         root = os.path.dirname(folder.rstrip("/")) or "."
-        if m.group(1) and os.path.isdir(os.path.join(root, f"{m.group(1)}-live-move-repair")):
-            # Tied to its report by name (#4011): it lives as long as the report.
-            return f"a restore run of the report {m.group(1)}-live-move-repair, kept while it is"
+        if m.group(1):
+            report = os.path.join(root, f"{m.group(1)}-live-move-repair")
+            try:
+                there = stat.S_ISDIR(os.lstat(report).st_mode)
+            except FileNotFoundError:
+                there = False
+            except OSError:  # cannot tell: kept (#4364 review)
+                return f"a restore run of the report {m.group(1)}-live-move-repair, which cannot be read"
+            if there:
+                # Tied to its report by name (#4011): it lives as long as the report.
+                return f"a restore run of the report {m.group(1)}-live-move-repair, kept while it is"
         return _held_by(root, name)
     if not REPORT_NAME.fullmatch(name):
         return None
