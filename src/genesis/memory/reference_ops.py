@@ -194,31 +194,74 @@ def _value_probes(value: str, *, login_exempt: bool = False) -> list[tuple[str, 
     a URL scheme, or all digits (a port) is not probed. A secret that reads as
     a plain word (all letters, or under four characters) is not secret-shaped,
     so it is matched only as the whole value, and only as a whole word: an
-    ordinary word inside another is no match. That is a stated limit."""
+    ordinary word inside another is no match. That is a stated limit.
+
+    "login / secret" is the shape the capture writers format: with
+    ``login_exempt`` (the identifier only, which names the account) the exact
+    login half is not probed, unless it is part of the secret (equal to, or
+    inside, the secret or one of its fragments) or is key-shaped
+    (``login_is_key_shaped``). A fragment of the secret half is always probed,
+    even when it spells the login. Every other field is probed with the
+    fragments of both halves."""
     whole = value.strip()
     probes: dict[str, bool] = {}
     for form in _decoded(whole) if whole else ():
         probes.setdefault(_normalise(form), form.isalpha() or len(form) < _MIN_TOKEN)
-    # "login / secret" is the shape the capture writers format: with
-    # ``login_exempt`` (the identifier only, which names the account) the
-    # exact login half is not probed. Every other field is probed with the
-    # tokens of both halves.
     login, sep, secret = whole.partition(" / ")
     exempt = login.strip().strip(_TOKEN_EDGE) if login_exempt and sep and secret.strip() else None
-    for form in _decoded(whole):
+    secret_fragments: set[str] = set()
+    if exempt:
+        secret_fragments = {f for f, _ in _fragments(secret.strip())} | {
+            _normalise(form) for form in _decoded(secret.strip())
+        }
+        folded_login = _normalise(exempt)
+        if login_is_key_shaped(exempt) or any(folded_login in f for f in secret_fragments):
+            exempt = None
+    for fragment, _folded in _fragments(whole):
+        if fragment == exempt:
+            continue
+        if _secret_token(fragment):
+            probes.setdefault(_normalise(fragment), False)
+    probes.pop("", None)
+    return list(probes.items())
+
+
+def _fragments(value: str) -> list[tuple[str, str]]:
+    """(fragment, normalised fragment) for every part of ``value`` the refusal
+    check splits out (``_value_probes``), less host names, URL schemes and
+    all-digit parts (ports)."""
+    out: list[tuple[str, str]] = []
+    for form in _decoded(value):
         schemes = {m.group(1).casefold() for m in _SCHEME.finditer(form)}
         for fragment in _FRAGMENT_SPLIT.split(unicodedata.normalize("NFKC", form)):
             fragment = fragment.strip(_TOKEN_EDGE)
             folded = fragment.casefold()
             if (
-                not fragment or fragment == exempt or fragment.isdigit()
+                not fragment or fragment.isdigit()
                 or folded in schemes or _HOSTNAME.match(folded)
             ):
                 continue
-            if _secret_token(fragment):
-                probes.setdefault(_normalise(fragment), False)
-    probes.pop("", None)
-    return list(probes.items())
+            out.append((fragment, _normalise(fragment)))
+    return out
+
+
+#: How long a secret-shaped login must be to read as a key rather than an
+#: account name: the floor of the labelled-token capture (16 characters).
+_KEY_SHAPED_LOGIN = 16
+
+
+def login_is_key_shaped(login: str) -> bool:
+    """True when a login half reads as a key or token, never as an account
+    name: secret-shaped (``_secret_token``), at least sixteen characters, and
+    carrying a digit ("ghp_" plus forty characters, an "sk-" key). Shorter
+    secret-shaped logins ("admin7", "ForumUser42") are ordinary account names,
+    which is why ``_secret_token`` alone is not the test."""
+    login = login.strip().strip(_TOKEN_EDGE)
+    return (
+        len(login) >= _KEY_SHAPED_LOGIN
+        and _secret_token(login)
+        and any(c.isdigit() for c in login)
+    )
 
 
 def refuse_value_in_fields(

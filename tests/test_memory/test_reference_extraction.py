@@ -239,7 +239,9 @@ async def test_ingest_classified_extraction(db_with_schema, mock_store):
     assert row is not None
     assert row[0] == "reference"
     assert row[1] == "reference.credentials"
-    assert row[2] == "HobbyForum"
+    # The login is named in the identifier: the held-out description no
+    # longer makes it searchable (#2426 part 1b).
+    assert row[2] == "HobbyForum (ForumUser42)"
     # The description and the value are held out together (#2426): the body
     # carries the identifier, the placeholders and the trailer only.
     assert "Passw0rd!x9z" not in row[3]

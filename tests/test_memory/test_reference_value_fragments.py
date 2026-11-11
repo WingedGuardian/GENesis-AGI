@@ -245,3 +245,35 @@ def test_xml_pipe_backslash_and_fullwidth_separators_split_the_value(value):
     set, so a tag holding the bare secret passed."""
     with pytest.raises(ValueError):
         ro.refuse_value_in_fields(value, {"tags": "Zq8vLm2x"})
+
+
+_FAKE_PAT = "ghp_" + "Fk9" * 13 + "x"  # fake, 44 characters
+
+
+@pytest.mark.parametrize(
+    ("value", "identifier"),
+    [
+        # The login equals the password: the secret's fragment is never exempt.
+        ("abc123xy / abc123xy", "Lab router (abc123xy)"),
+        # The login is inside the password.
+        ("abc123xy / abc123xy!Fk", "Lab router (abc123xy)"),
+        # A token used as the login is a secret, not an account name.
+        (f"{_FAKE_PAT} / x-oauth-basic", f"Git ({_FAKE_PAT})"),
+        (f"sk-{'Fk9' * 8} / x", f"Mail (sk-{'Fk9' * 8})"),
+    ],
+)
+def test_the_login_exemption_never_exempts_a_secret(value, identifier):
+    """Security review HIGH-1 (#2426 part 1b): the exemption matched by string
+    equality, so it also exempted a secret that spelled the login."""
+    with pytest.raises(ValueError):
+        ro.refuse_value_in_fields(value, {"identifier": identifier}, login_exempt=True)
+
+
+def test_an_ordinary_login_is_still_exempt():
+    ro.refuse_value_in_fields(
+        "admin7 / First!Fake9", {"identifier": "Lab router (admin7)"}, login_exempt=True,
+    )
+    with pytest.raises(ValueError):
+        ro.refuse_value_in_fields(
+            "admin7 / First!Fake9", {"identifier": "Lab router (admin7)"},
+        )
