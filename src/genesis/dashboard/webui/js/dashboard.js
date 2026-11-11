@@ -1969,9 +1969,13 @@
           this.hideReference(id);
           try {
             await fetchApi(`/api/genesis/references/${id}`, { method: "DELETE" });
-            this._detailSeq++;
-            this._detailId = null;
-            this.referenceDetail = null;
+            // Only the deleted reference's detail is closed: another reference
+            // opened while the DELETE was pending keeps its view and request.
+            if (this._detailId === id) {
+              this._detailSeq++;
+              this._detailId = null;
+            }
+            if (this.referenceDetail && this.referenceDetail.id === id) this.referenceDetail = null;
             this.hideReference(id);
             this.referenceSearchResults = this.referenceSearchResults.filter(r => r.id !== id);
             await this.fetchReferenceList();
