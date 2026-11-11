@@ -683,7 +683,7 @@ preserve usable answers, real refusal health and dropped-output replay guards.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: a8fa35a35 2026-10-23
+verified: b321bb634 2026-11-07
 ```
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
@@ -1197,6 +1197,17 @@ verified: a8fa35a35 2026-10-23
 - `cc/context_injector.py` (memory→session injection) lives HERE, not in
   memory. GROUNDWORK: `reflection_bridge/_bridge.py` (v4-executor),
   `session_config.py` (hook-inheritance).
+- **Light-reflection topic repeats (development candidate)**: the bridge stores
+  every reflection output, then suppresses a light-topic summary or posts a
+  periodic stub only when the model sets `material_change` false; an absent or
+  true flag posts. A local overlap floor guards that flag: changed negated text,
+  changed multi-chunk text, code fences, parse fallbacks and low overlap with
+  the last full post still post.
+  A manager-local Light-topic lock spans history through send persistence;
+  unrelated categories retain their independent delivery. History uses
+  insertion order so a current stub supersedes an older future-dated row. Unknown history posts; deep and
+  strategic topic delivery retain their direct path. Installed verification is
+  still outstanding.
 - **Background-wait ceiling ownership** (invoker.py): the CLI's headless
   `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` (default 600s) SIGKILLs a dispatched
   Workflow/subagent mid-run with a partial result. `CCInvocation.bg_wait_ceiling_ms`
@@ -5333,8 +5344,10 @@ logger or unrelated exceptions with copied text and no provenance.
   with the stricter gate, and writes only parts judged `as-left`; it never
   restarts anything. Each node part, the one `REPAIR.json` names in flight
   first: STAGE the saved node in a run folder
-  `deploy-backups/<UTC time>-<pid>-live-move-restore/new/<path>` (made 0700 at
-  the first write; each file copied with its sha256 checked against
+  `deploy-backups/<UTC time>-<pid>-<report ts>-live-move-restore/new/<path>`
+  (made 0700 at the first write and named for its report, #4011, so every
+  later run of that report finds it; a run that leaves no aside and no
+  index-before.txt removes its folder; each file copied with its sha256 checked against
   `SAVED.json`, else `other:hash-mismatch`, a missing record
   `other:no-hash`, a null hash `other:too-large`; its mode the record's &
   0o777, so setuid, setgid and sticky never come back; a directory row built
@@ -5399,6 +5412,22 @@ logger or unrelated exceptions with copied text and no provenance.
   `update-index -q --refresh`, then a second judge that must read
   already-restored for every part written, and for a flag or an index part
   already restored whose entry the index call replaced (else `post-check`).
+  Every run (and `--check`) also judges every aside in every run folder
+  of the report (#4011, `runs.aside_parts`): an aside holding content the
+  restore did not put there is an `aside` part, `other:aside-held`, named and
+  counted refused on every run (so `restored_at` stays unwritten and the
+  alert stays up; one that cannot be read on its folder's own budget is
+  `other:aside-unreadable`); each part is keyed `<run>/aside/<path>`; a run
+  folder (or its `aside/`) that is not this user's alone is
+  `other:not-owned`, never skipped; a held in-flight record whose whole run
+  folder is gone is `other:aside-lost`, said once (the record is then
+  cleared), while an aside moved out by hand with its folder still there is
+  a release; over 64 run folders refuses the report whole. Each folder's asides are read on
+  their own budget (2 GiB, 200,000 entries), so `--check` on a report with many run folders
+  costs time, never a wrong verdict. Folders named
+  before #4011 carry no ts and are found only through the in-flight record.
+  The deploy-backups prune keeps a run folder named for its report for as
+  long as that report's folder exists.
   `REPAIR.json` gets a `restore` block, `{inflight: [run, path, "node"] |
   null, refused: <int>, restored_at: <str> | null}` (no per-part list; the
   output carries those), rewritten under update.lock after a re-read;
@@ -5414,8 +5443,8 @@ logger or unrelated exceptions with copied text and no provenance.
   `refused:<reason>`, with a note where things are), a summary, the restored
   paths and what they now block (tracked edits: deploy_code_only.sh and
   update.sh; untracked ones: deploy_code_only.sh, only under `src/`,
-  `config/` or `pyproject.toml`), the run folder (pruned 90 days after its
-  last write), the ignored files a directory moved aside held, and for a
+  `config/` or `pyproject.toml`), the run folder (kept while its report is),
+  the ignored files a directory moved aside held, and for a
   part it can never write (`cannot-make`, `target-unreadable`, `too-large`,
   `no-hash`) to put it back by hand from the report's `tree/`, then
   `--dismiss`. Exit 0 when nothing was refused, else 1. Residuals, named: a
