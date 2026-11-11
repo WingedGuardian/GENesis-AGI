@@ -484,7 +484,10 @@ class Judge:
         inf = self.inflight
         if not inf or inf[1] != p or self.runs is None:
             return False
-        if self.rp._link_parent(self.repo, p) or os.path.lexists(os.path.join(self.repo, p)):
+        try:
+            if self.rp._link_parent(self.repo, p) or not runs.absent(self.repo, p):
+                return False
+        except OSError:  # cannot see the path: never read as empty (#4364 review)
             return False
         aside = os.path.join(self.runs, inf[0], "aside")
         made = [os.path.dirname(aside), aside] + [
@@ -645,10 +648,13 @@ class Judge:
         if not inf or inf[1] != p or self.runs is None:
             return True
         aside = os.path.join(self.runs, inf[0], "aside")
-        if self.rp._link_parent(aside, p) is None and not os.path.lexists(os.path.join(aside, p)):
-            return True
-        if self._left(p, root=aside, strict=True):  # a link parent: never as-left
-            return True
+        try:
+            if self.rp._link_parent(aside, p) is None and runs.absent(aside, p):
+                return True
+            if self._left(p, root=aside, strict=True):  # a link parent: never as-left
+                return True
+        except OSError:  # an aside it cannot see is never read as released (#4364 review)
+            pass
         where = os.path.join(self.shown, inf[0], "aside", p)
         self.notes[(p, "node")] = f"newer content kept at {where}"
         return False
@@ -671,10 +677,11 @@ class Judge:
         if v == "already-restored" or (v == "as-left" and self.resumed == inf[1]):
             return None
         aside = os.path.join(self.runs, inf[0], "aside")
-        if self.rp._link_parent(aside, inf[1]) is None and not os.path.lexists(
-            os.path.join(aside, inf[1])
-        ):
-            return None
+        try:
+            if self.rp._link_parent(aside, inf[1]) is None and runs.absent(aside, inf[1]):
+                return None
+        except OSError:  # cannot see it: held, never released (#4364 review)
+            return os.path.join(self.shown, inf[0], "aside", inf[1])
         # Only content the restore did not move there holds the record: an aside
         # still holding the repair's own as-left copy (a gate refusing the part
         # after a kill) is what git gives back, and must not stop the rest. Read

@@ -228,3 +228,29 @@ def test_check_and_restore_agree_beside_a_held_aside_and_a_damaged_copy(w):
     for key, v in said.items():
         want = {"as-left": "restored", "already-restored": "already-restored"}.get(v, f"refused:{v}")
         assert did[key] == want, (key, c.stdout, r.stdout)
+
+
+@pytest.mark.parametrize("locked", ["aside-dir", "run-folder"])
+def test_an_aside_the_restore_cannot_search_is_refused_never_released(w, locked):
+    """#4364 review (Codex): an aside behind a directory with no search bit is
+    not absent. os.path.lexists says False there, which released a held aside
+    in silence (rc 0, restored_at written); it is now `other:aside-unreadable`,
+    refused, in both modes, and the report stays unresolved."""
+    ts = _repaired(w, _foreign_edit)
+    fd = os.open(w.root / "sub" / "s1", os.O_WRONLY)
+    try:
+        assert _restore(w, ts).returncode == 0
+        os.pwrite(fd, b"newer\n", 0)
+    finally:
+        os.close(fd)
+    [run] = _runs(w)
+    target = run / "aside" / "sub" if locked == "aside-dir" else run
+    target.chmod(0)
+    try:
+        for r in (_check(w, ts), _restore(w, ts)):
+            assert r.returncode == 1, r.stdout
+            assert "aside-unreadable" in r.stdout or "not-owned" in r.stdout, r.stdout
+        assert w.report()["restore"]["restored_at"] is None
+        assert w.report()["restore"]["refused"] >= 1
+    finally:
+        target.chmod(0o700)

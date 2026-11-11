@@ -46,6 +46,18 @@ def run_ts(name: str) -> str | None:
     return m.group(1) if m else None
 
 
+def absent(root: str, p: str) -> bool:
+    """Is nothing at ``root``/``p``? Only "no such file" reads absent: any
+    other error (a parent with no search bit, EACCES) raises OSError, since
+    the restore cannot see there (#4364 review: os.path.lexists returns False
+    then, and a held aside read as absent was released in silence)."""
+    try:
+        os.lstat(os.path.join(root, p))
+    except FileNotFoundError:
+        return True
+    return False
+
+
 _DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
@@ -169,11 +181,16 @@ def aside_parts(judge) -> list:
     for name in names:
         run, aside = os.path.join(judge.runs, name), os.path.join(judge.runs, name, "aside")
         try:
-            ok = all(_private(os.lstat(d)) for d in (run, aside) if d == run or os.path.lexists(d))
+            ok = all(_private(os.lstat(d)) for d in (run, aside) if d == run or not absent(aside, ""))
         except FileNotFoundError:
             continue  # removed since it was listed: nothing left to judge
-        except OSError:
-            ok = False
+        except OSError as exc:  # cannot see into it: never read as nothing held
+            note = (
+                f"the restore run folder {os.path.join(judge.shown, name)} cannot be read"
+                f" ({exc.strerror}), so what its aside holds cannot be judged"
+            )
+            part(name, "other:aside-unreadable", note)
+            continue
         if not ok:
             note = (
                 f"the restore run folder {os.path.join(judge.shown, name)} (or its aside/) is not"
@@ -185,11 +202,14 @@ def aside_parts(judge) -> list:
         for p in paths:
             if inf and inf[:2] == [name, p]:
                 continue  # Judge.unresolved judges the in-flight aside
-            if judge.rp._link_parent(aside, p) is None and not os.path.lexists(
-                os.path.join(aside, p)
-            ):
-                continue
             key = f"{name}/aside/{p}"
+            try:
+                if judge.rp._link_parent(aside, p) is None and absent(aside, p):
+                    continue
+            except OSError as exc:
+                note = f"{os.path.join(judge.shown, key)} cannot be read ({exc.strerror})"
+                part(key, "other:aside-unreadable", note)
+                continue
             spent, judge.budget = judge.budget, budget
             try:
                 left = judge._left(p, root=aside, strict=True)
