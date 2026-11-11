@@ -2,9 +2,9 @@
 
 Two mechanisms, both measured on this repo before they were built:
 
-  * A public branch with no open PR runs no CI and no leak-detector at all
-    (ci.yml triggers on pull_request), which is the exact state the repo's
-    publish rule exists to prevent.
+  * A public branch with no open PR runs no CI at all (ci.yml triggers on
+    pull_request; only the branch leak scan sees it), which is the exact
+    state the repo's publish rule exists to prevent.
 
 The design constraint these tests pin is the FAIL DIRECTION, per finding:
 
@@ -132,7 +132,7 @@ def test_a_pr_onto_a_non_default_base_does_not_count(monkeypatch) -> None:
     """A stacked PR contributes NO CI, so it must not silence the prompt.
 
     ci.yml filters pull_request to the default branch, so a request onto a
-    feature base runs no CI and no leak scan at all (issue #2035). Counting it
+    feature base does not run ci.yml (issue #2035). Counting it
     would report covered for a branch in exactly the state this prompt exists
     to surface.
     """
@@ -164,7 +164,7 @@ def test_our_own_fork_pr_still_counts(monkeypatch) -> None:
     where gh resolves the base repo to the upstream, EVERY PR the contributor
     opens is cross-repository — so the count would read 0 forever, the prompt
     would fire on every re-push, and it would assert something false: a fork PR
-    onto the default branch does run CI and the leak scan.
+    onto the default branch does run CI and its leak scan.
     """
     fake = FakeRun()
     _script_pr_list(fake, [_pr(7, owner="me")], owner="me")
@@ -189,7 +189,7 @@ def test_an_empty_list_is_zero_even_when_identity_is_unresolvable(monkeypatch) -
     for a result independent of it, and `_gh_timeout` floors at 1.0s once the
     budget drains, so that call is the likelier of the two to fail. The result
     was None — the silent allow — in precisely the state this prompt reports:
-    public branch, no PR, no CI, no leak scan.
+    public branch, no PR, no CI.
     """
     fake = FakeRun()
     fake.script(("gh", "pr", "list"), 0, "[]")
@@ -401,7 +401,11 @@ def test_a_republished_branch_with_no_open_pr_is_BLOCKED(
 
     rc, out, err = _run_guard_on_push(monkeypatch, tmp_path, fake, capsys)
     assert rc == 2, (rc, out, err)
-    assert "NO OPEN PR" in err and "leak detector" in err
+    assert "NO OPEN PR" in err and "CI never runs on it" in err
+    # The leak scan DOES run on a PR-less branch (every branch push is
+    # scanned server-side), so the block must not claim otherwise.
+    assert "branch leak scan" in err, err
+    assert "detector never" not in " ".join(err.split()), err
     assert "gh pr create" in err, "the block must name the way out, not just refuse"
     assert not out.strip(), (
         "a block writes to stderr and returns 2; emitting hook JSON as well would "
@@ -528,6 +532,7 @@ def test_a_pr_close_in_the_same_command_cancels_the_silent_allow(
     reason = doc["hookSpecificOutput"]["permissionDecisionReason"]
     assert doc["hookSpecificOutput"]["permissionDecision"] == "ask", out
     assert "CLOSES a pull request" in reason, reason
+    assert "leak scan" not in reason, reason
 
 
 @pytest.mark.parametrize(
@@ -734,7 +739,11 @@ def test_the_block_does_not_fire_off_the_public_repo_end_to_end(
     # changes behaviour on the public repo only.
     doc = json.loads(out)
     assert doc["hookSpecificOutput"]["permissionDecision"] == "ask", out
-    assert "NO OPEN PR" in doc["hookSpecificOutput"]["permissionDecisionReason"], out
+    reason = doc["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "NO OPEN PR" in reason, out
+    # Off the public repo the guard does not know what scans the destination
+    # runs, so it claims only what it can: no PR means no CI.
+    assert "leak scan" not in reason, reason
 
 
 def test_an_ordinary_repush_with_an_open_pr_is_still_silent(

@@ -14210,16 +14210,17 @@ def _open_pr_count_for_branch(
     """How many OPEN PRs have ``branch`` as their head, or None if unknowable.
 
     Distinguishing 0 from None is the point of the return type: 0 is a measured
-    "this public branch has no PR" — the state where CI and the leak-detector
-    never run, since ci.yml triggers on pull_request — while None is "the
+    "this public branch has no PR" — the state where CI never runs, since
+    ci.yml triggers on pull_request (only the branch leak scan sees such a
+    branch, on each push) — while None is "the
     question could not be answered" (no gh, no network, no auth). Callers treat
     None as the status quo, never as 0: this feeds a HYGIENE prompt, not a
     security verdict, and the first-push approval it modulates already happened.
 
     COUNTS ONLY PRs TARGETING THE DEFAULT BRANCH, because the question is "does
     CI run on this branch" and `ci.yml` triggers on `pull_request` filtered to
-    `main`. A PR onto a non-default base contributes no CI and no leak scan at
-    all (issue #2035), so counting it would silence the prompt in exactly the
+    `main`. A PR onto a non-default base does not run ci.yml (issue
+    #2035), so counting it would silence the prompt in exactly the
     state the prompt exists to report.
 
     AND ONLY PRs FROM THIS REPOSITORY. `gh pr list --head` matches a bare branch
@@ -14340,10 +14341,11 @@ def _no_open_pr_deny_message(cur: str | None) -> str:
     """The no-open-PR BLOCK text, shared by the plain and close-compound arms."""
     return (
         f"BLOCKED: re-push to '{cur}' — this branch is "
-        f"PUBLIC but has NO OPEN PR, so CI and the leak "
-        f"detector never run on it (ci.yml triggers on "
-        f"pull_request; a branch with no PR matches no "
-        f"trigger).\n"
+        f"PUBLIC but has NO OPEN PR, so CI never runs on it "
+        f"and nothing reviews it (ci.yml triggers on "
+        f"pull_request; a branch with no PR matches none "
+        f"of its triggers). Only the branch leak scan runs on its "
+        f"pushes.\n"
         f"Open its PR first — `gh pr create` — then push "
         f"again. Or close the branch out if it is "
         f"finished with. Both leave the branch in a state "
@@ -14358,8 +14360,9 @@ def _no_pr_block_applies(urls: set[str]) -> bool:
     ``github.user``/``github.public_repo`` in ``~/.genesis/config/genesis.yaml``,
     the same source ``_scheduled_gate_applies`` uses. The reason it has to be
     scoped at all is that the thing being enforced is not a property of branches
-    in general: ``ci.yml`` and the leak detector live in THIS repo and trigger on
-    ``pull_request`` to ITS default branch. On a private fork, on the backups
+    in general: ``ci.yml`` lives in THIS repo and triggers on ``pull_request``
+    to ITS default branch (the branch leak scan runs on every branch push, but
+    it is a leak scan only: no tests, no review). On a private fork, on the backups
     repo, on the voice repo, on any unrelated checkout a session wanders into,
     "this branch has no open PR" is an ordinary state with no consequence — and
     blocking it would refuse routine work for a reason that does not exist there.
@@ -16061,8 +16064,8 @@ def _run_merge_and_push_gates() -> int:
                             )
                     # A RE-PUSH earns its silence by having been approved at
                     # first publication — but a public branch with NO OPEN PR is
-                    # outside CI and the leak-detector (ci.yml triggers on
-                    # pull_request), so its silence is the state this repo's
+                    # outside CI (ci.yml triggers on pull_request; only the
+                    # branch leak scan sees it), so its silence is the state this repo's
                     # standing rule forbids: published, unchecked, and quietly
                     # growing. Downgrade the silent allow to an ASK naming the
                     # gap. A lookup that cannot answer (None) keeps the status
@@ -16095,8 +16098,8 @@ def _run_merge_and_push_gates() -> int:
                             ask_reason = (
                                 f"re-push to '{cur}': an earlier step in this command "
                                 f"CLOSES a pull request, so the push that follows may "
-                                f"land on a branch with no open PR — outside CI and "
-                                f"the leak scan. Run the close and the push as "
+                                f"land on a branch with no open PR — outside CI. "
+                                f"Run the close and the push as "
                                 f"separate commands so each is judged on the state it "
                                 f"actually runs in."
                             )
@@ -16134,7 +16137,7 @@ def _run_merge_and_push_gates() -> int:
                             routine_dests.append((push_remote, urls, pcwd, cur))
                             ask_reason = (
                                 f"re-push to '{cur}': this branch is PUBLIC but has "
-                                f"NO OPEN PR, so CI and the leak scan never run on "
+                                f"NO OPEN PR, so CI never runs on "
                                 f"it. Approve to push, then open its PR "
                                 f"(gh pr create) — or close the branch out."
                             )
