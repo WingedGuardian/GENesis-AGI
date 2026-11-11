@@ -30,6 +30,9 @@ if [ -z "${HOME:-}" ]; then
 fi
 
 G="$HOME/genesis"
+# shellcheck source=../lib/secrets_path.sh
+. "$G/scripts/lib/secrets_path.sh"
+SECRETS_FILE="$(genesis_secrets_path "$G")"
 CI_ROOT="$HOME/ci"
 CI_EV="${CI_EV:-$CI_ROOT/evidence}"
 PY="$G/.venv/bin/python"
@@ -126,7 +129,7 @@ setup)
     git init -q --bare "$CI_ROOT/backups.git"
     pass="$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
     echo "::add-mask::$pass"
-    "$PY" -I - "$G/secrets.env" "$pass" "file://$CI_ROOT/backups.git" <<'PY'
+    "$PY" -I - "$SECRETS_FILE" "$pass" "file://$CI_ROOT/backups.git" <<'PY'
 import sys
 path, passphrase, repo = sys.argv[1:4]
 lines = open(path).read().splitlines() if __import__("os").path.exists(path) else []

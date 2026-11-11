@@ -33,6 +33,8 @@ from genesis.sentinel.state import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
     from genesis.autonomy.remediation import RemediationRegistry
     from genesis.cc import AgentProvider
     from genesis.cc.session_manager import SessionManager
@@ -289,6 +291,33 @@ def _extract_pattern(request: SentinelRequest) -> str:
     return f"direct:{request.trigger_source}"
 
 
+def _is_tier(value: object) -> bool:
+    # bool is an int subclass; a True/False tier is unclassified, not tier 1/0.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _triggering_alarm_ids(alarms: Sequence[Mapping[str, Any]], tier: int | None) -> set[str]:
+    """The alert ids that justified a request: the alarms AT the request's tier.
+
+    A fire-alarm request carries every confirmed alarm, lower tiers included,
+    while its ``tier`` is the worst (lowest) of them. Only the alarms at that
+    tier define "the problem is still there"; a lower-tier rider must not hold
+    a park open or let a granted approval proceed (#3845). Every unknown or
+    inconsistent shape (no request tier, an alarm without an int tier, no
+    alarm at the request tier) falls back to ALL ids, the previous rule, which
+    can only keep a park longer, never cancel one sooner. Pure; never raises.
+    """
+    entries = [
+        a for a in (alarms if isinstance(alarms, (list, tuple)) else ())
+        if isinstance(a, dict) and isinstance(a.get("alert_id"), str) and a.get("alert_id")
+    ]
+    all_ids = {a["alert_id"] for a in entries}
+    if not _is_tier(tier) or not all(_is_tier(a.get("tier")) for a in entries):
+        return all_ids
+    triggering = {a["alert_id"] for a in entries if a["tier"] <= tier}
+    return triggering or all_ids
+
+
 class SentinelDispatcher:
     """Orchestrates Sentinel CC sessions for infrastructure incident response.
 
@@ -424,10 +453,14 @@ class SentinelDispatcher:
         """Check whether the original alarms from a pending request still exist.
 
         Called before resuming a dispatch after approval is granted.
-        Returns True if at least one original alarm is still active.
+        Returns True if at least one alarm at the request's triggering tier
+        is still active (bundled lower-tier riders do not count, #3845).
         Returns True on error (fail-open: if we can't verify, proceed).
         """
-        original_ids = {a.alert_id for a in request.alarms} if request.alarms else set()
+        original_ids = (
+            _triggering_alarm_ids([asdict(a) for a in request.alarms], request.tier)
+            if request.alarms else set()
+        )
         if not original_ids:
             return True  # No alarm IDs to check — proceed
 
@@ -651,7 +684,30 @@ class SentinelDispatcher:
                         reason="User rejected Sentinel dispatch",
                         duration_s=time.monotonic() - start,
                     )
-                # status == "approved" — continue to Phase 2
+                if status != "approved":
+                    # Not a status this gate knows: never read it as approval
+                    # (it would start an unapproved CC session). The handler
+                    # below fails closed.
+                    raise ValueError(f"unexpected sentinel_dispatch approval status {status!r}")
+                # One approval, one dispatch (#4348): consume an approved row
+                # before using it. ensure_approval reuses approved-but-unconsumed
+                # rows, so without this one row authorised every later dispatch
+                # with the same key for up to 24h. No request id means manual
+                # approval is off by config: nothing to consume.
+                if request_id and not await self._approval_gate.mark_consumed(request_id):
+                    logger.warning(
+                        "Sentinel dispatch approval %s already used — not dispatching",
+                        request_id,
+                    )
+                    append_log({
+                        "event": "dispatch_approval_already_used",
+                        "request_id": request_id,
+                    })
+                    return SentinelResult(
+                        dispatched=False,
+                        reason="Dispatch approval already used",
+                        duration_s=time.monotonic() - start,
+                    )
                 logger.info("Sentinel dispatch approved (%s)", request_id)
                 append_log({"event": "dispatch_approved", "request_id": request_id})
             except Exception:
@@ -682,6 +738,25 @@ class SentinelDispatcher:
                     reason="Dispatch approval mechanism failed",
                     duration_s=time.monotonic() - start,
                 )
+        elif self._require_approval:
+            # Approval is required but no mechanism is wired (no gate, no
+            # outreach pipeline: a degraded boot). FAIL CLOSED: never start an
+            # unapproved remediation session.
+            logger.error(
+                "Sentinel dispatch refused: approval required but no approval "
+                "mechanism is available",
+            )
+            append_log({"event": "dispatch_refused_no_approval_mechanism"})
+            await self._emit_event(
+                "WARNING", "sentinel.dispatch_refused",
+                "Sentinel dispatch refused: approval is required but no approval "
+                "mechanism is wired (approval gate and outreach pipeline both missing)",
+            )
+            return SentinelResult(
+                dispatched=False,
+                reason="No approval mechanism available — dispatch refused",
+                duration_s=time.monotonic() - start,
+            )
 
         # ── Phase 2: CC session ─────────────────────────────────────
         return await self._phase2_cc_and_actions(request, pattern=pattern, start=start)
@@ -755,7 +830,36 @@ class SentinelDispatcher:
                         return action_result
                     # None means approved — continue to execution below
                 except Exception:
-                    logger.error("Sentinel action approval/execution failed", exc_info=True)
+                    # FAIL CLOSED: no approval means no actions. This used to
+                    # log and fall through to the execution block below, so an
+                    # error in the approval step (e.g. a locked database) ran
+                    # the proposed actions without the owner's approval.
+                    logger.error(
+                        "Sentinel action approval failed — actions NOT executed",
+                        exc_info=True,
+                    )
+                    append_log({
+                        "event": "action_approval_failed",
+                        "actions": len(result.proposed_actions),
+                    })
+                    # If the failure came after the approval request was
+                    # created, withdraw it so no stale "action required"
+                    # prompt is left waiting (best effort).
+                    orphan = self._state.pending_request_id
+                    if orphan:
+                        try:
+                            await self._approval_gate.resolve_request(
+                                orphan, decision="cancelled", resolved_by="approval_failed",
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Could not withdraw approval request %s", orphan, exc_info=True,
+                            )
+                    result.resolved = False
+                    result.reason = "Action approval mechanism failed — actions not executed"
+                    return await self._finalize_dispatch(
+                        request, result, pattern=pattern, start=start,
+                    )
             elif self._outreach_pipeline:
                 # Legacy blocking path
                 try:
@@ -785,6 +889,8 @@ class SentinelDispatcher:
 
         Returns SentinelResult if pending/rejected (caller should return it).
         Returns None if approved (caller should proceed to execute actions).
+        Raises ValueError if the approval cannot be used (unknown status, or
+        an approval already consumed); the caller fails closed.
         """
         status, request_id, reason = await self._approval_gate.ensure_approval(
             subsystem="sentinel",
@@ -833,6 +939,16 @@ class SentinelDispatcher:
                 diagnosis=result.diagnosis,
                 reason="User rejected Sentinel actions",
             )
+
+        if status != "approved":
+            # Not a status this gate knows: never read it as approval. The
+            # caller's handler fails closed (nothing executes).
+            raise ValueError(f"unexpected sentinel_action approval status {status!r}")
+
+        # One approval, one execution (#4348): consume before executing; an
+        # already-used row raises into the caller's fail-closed handler.
+        if request_id and not await self._approval_gate.mark_consumed(request_id):
+            raise ValueError(f"sentinel_action approval {request_id} already used")
 
         # Approved — return None so caller executes actions
         logger.info("Sentinel actions approved (%s)", request_id)
@@ -1013,6 +1129,11 @@ class SentinelDispatcher:
         """
         if status == "rejected":
             return await self.handle_approval_resolution(request_id, "rejected")
+        if status != "approved":
+            # Only an explicit approval resumes; anything else clears the park.
+            return await self.handle_approval_resolution(
+                request_id, status if status in ("cancelled", "expired") else "missing",
+            )
 
         async with self._lock:
             policy_id = self._state.pending_policy_id
@@ -1088,11 +1209,19 @@ class SentinelDispatcher:
                             ),
                         )
                     elif current_alerts:
-                        # Different alarms — root cause shifted
+                        # Different alerts — root cause shifted. Cancel the
+                        # stale actions and go back to HEALTHY: nothing would
+                        # ever start an investigation from here, and an idle
+                        # INVESTIGATING is an active state Guardian waits on
+                        # indefinitely (only a restart cleared it). A current
+                        # Tier 1/2 alarm re-dispatches through the normal
+                        # fire-alarm debounce and backoff on the next ticks;
+                        # a lower-tier rider never dispatches on its own.
                         logger.warning(
                             "Sentinel actions stale — original alarms "
-                            "cleared but new alerts present: %s. "
-                            "Cancelling stale actions, will re-investigate.",
+                            "cleared but other alerts present: %s. "
+                            "Cancelling stale actions; current alarms "
+                            "re-dispatch on their own.",
                             [
                                 a.get("alert_id", "?")
                                 if isinstance(a, dict) else getattr(a, "alert_id", "?")
@@ -1101,18 +1230,18 @@ class SentinelDispatcher:
                         )
                         self._state.clear_pending()
                         self._state.transition(
-                            SentinelState.INVESTIGATING,
+                            SentinelState.HEALTHY,
                             reason=(
                                 "root cause shifted during action approval "
-                                "wait — re-investigating"
+                                "wait — stale actions cancelled"
                             ),
                         )
                         save_state(self._state)
                         return SentinelResult(
                             dispatched=False,
                             reason=(
-                                "Root cause shifted — new alarms present, "
-                                "re-investigating"
+                                "Root cause shifted — stale actions cancelled; "
+                                "current alarms re-dispatch on their own"
                             ),
                         )
                     # current_alerts is None (health check failed) — proceed
@@ -1917,7 +2046,9 @@ class SentinelDispatcher:
         # while we're waiting for approval, cancel the pending approval and
         # go back to HEALTHY.  We check the *pending* alarm IDs specifically
         # (not all system alarms) so an unrelated WARNING doesn't keep the
-        # sentinel stuck on a resolved CRITICAL.
+        # sentinel stuck on a resolved CRITICAL. Lower-tier alarms bundled into
+        # the request are not tracked either; only alarms at the request's
+        # tier are (#3845).
         if self._state.state in (
             SentinelState.AWAITING_DISPATCH_APPROVAL,
             SentinelState.AWAITING_ACTION_APPROVAL,
@@ -1927,9 +2058,8 @@ class SentinelDispatcher:
                 try:
                     import json
                     req = json.loads(self._state.pending_request_json)
-                    pending_ids = {a.get("alert_id", "") for a in req.get("alarms", [])}
-                    pending_ids.discard("")
-                except (json.JSONDecodeError, TypeError):
+                    pending_ids = _triggering_alarm_ids(req.get("alarms", []) or [], req.get("tier"))
+                except (json.JSONDecodeError, TypeError, AttributeError):
                     pass
             # Fall back to pending_pattern (single alarm ID) if no list
             pattern = self._state.pending_pattern

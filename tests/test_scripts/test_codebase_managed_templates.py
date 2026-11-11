@@ -75,6 +75,7 @@ def render(tmp_path):
             [
                 "/bin/bash",
                 "-euc",
+                f". {ROOT / 'scripts/lib/secrets_path.sh'}\n"
                 "_falkordb_redis_server_bin() { printf /opt/e/redis-server; }\n"
                 "_falkordb_redis_cli_bin() { printf /opt/e/redis-cli; }\n"
                 "_falkordb_module_path() { printf /opt/e/falkordb.so; }\n"

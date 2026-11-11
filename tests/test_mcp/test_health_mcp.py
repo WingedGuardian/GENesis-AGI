@@ -476,6 +476,15 @@ async def test_cc_quota_exhausted_is_warning_not_critical():
 # ── session_set_model / session_set_effort tests ─────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _private_session_config(tmp_path, monkeypatch):
+    """A successful set persists the model/effort sidecar the SessionStart hook
+    reads; it must land in this test's tmp_path, never the live one."""
+    monkeypatch.setattr(
+        "genesis.cc.session_cache._SESSION_CONFIG", tmp_path / "session_config.json"
+    )
+
+
 async def test_session_set_model_invalid():
     result = await _impl_session_set_model("sess-1", "gpt4")
     assert "error" in result
