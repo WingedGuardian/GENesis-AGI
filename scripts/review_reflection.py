@@ -147,6 +147,11 @@ FIELDS: dict[str, tuple[re.Pattern[str], int, int | None]] = {
         0,
         None,
     ),
+    "Prediction": (
+        re.compile(rf"^Prediction: merges at round ([1-9][0-9]?) because ({_TEXT})$"), 0, 1
+    ),
+    "Confidence": (re.compile(rf"^Confidence: ([0-9]{{1,3}})% falsified-by ({_TEXT})$"), 0, 1),
+    "Prediction-held": (re.compile(rf"^Prediction-held: (yes|no) ({_TEXT})$"), 0, 1),
     "Escalate": (re.compile(r"^Escalate: (yes|no)$"), 1, 1),
 }
 _FIELD_NAME_RE = re.compile(r"^([A-Za-z-]{1,20}): ")
@@ -182,6 +187,14 @@ class Reflection:
     #: ``Premise-check`` claims by number: what the reflection says the cited
     #: premise check concluded, bound to that file by ``evidence_problem``.
     premise_claims: dict[str, str] = field(default_factory=dict)
+    #: The past-round-4 lines (``past_terminal_problems``).
+    prediction_round: int | None = None
+    confidence: int | None = None
+    held: str | None = None
+    #: Whether any disposition fixes now (``fix-now``), rather than filing,
+    #: and which keys it fixes now.
+    fix_now: bool = False
+    fix_now_keys: set[str] = field(default_factory=set)
     problems: list[str] = field(default_factory=list)
 
     @property
@@ -202,6 +215,211 @@ def obligations(round_number: int, gate_lane: bool) -> tuple[bool, bool]:
     if gate_lane:
         return round_number == 1, round_number >= 2
     return round_number == 3, round_number >= 2
+
+
+#: Past-round-4 rules (#4133 PR 1b-i) bind rounds opened from here on. A round
+#: opened earlier keeps the rules it was answered under, so reflections already
+#: committed on open PRs past round 4 stay valid. It must lie AFTER the deploy:
+#: a round opened between this time and the deploy would be bound after the
+#: fact, and its reflections, written to the old rules, owed again.
+PAST_TERMINAL_CUTOVER_ISO = "2026-11-13T00:00:00+00:00"
+#: The ordinary lane's terminal round; the rules start after it.
+PREDICT_FROM = 4
+JUDGE_FROM = 5
+MIN_CONFIDENCE = 95
+
+
+@dataclass(frozen=True)
+class RoundRecord:
+    """One review round as the past-round-4 rules read it, from the budget:
+    its number, its opening time, and its findings ``(submitted_at, blocking,
+    key)``, late joiners included."""
+
+    head: str
+    number: int
+    opened_at: datetime | None
+    findings: tuple[tuple[datetime, bool | None, str | None], ...]
+
+    @property
+    def keys(self) -> set[str]:
+        return {str(k) for _, _, k in self.findings if k is not None}
+
+    @property
+    def settle_at(self) -> datetime | None:
+        """30 minutes after its first finding review; None with no timed one."""
+        times = [when for when, _, _ in self.findings]
+        return min(times) + SETTLE if times else None
+
+    def blocking(self, at: datetime) -> tuple[bool | None, list[str]]:
+        """Whether a finding submitted at or before ``at`` is at the floor:
+        True (with its keys), None when none is and one cannot be read, else
+        False. A finding after ``at`` never changes an answer given at ``at``."""
+        seen = [(b, k) for when, b, k in self.findings if when <= at]
+        hit = sorted(str(k) for b, k in seen if b is True)
+        if hit:
+            return True, hit
+        return (None if any(b is None for b, _ in seen) else False), []
+
+
+def past_terminal(round_number: int, gate_lane: bool) -> tuple[bool, bool]:
+    """``(predict, judge)`` owed past the ordinary lane's terminal round: a
+    Prediction from round 4, the held judgement and the end-now rule from
+    round 5. Never on the gate lane: its rounds past 2 need the owner already."""
+    if gate_lane:
+        return False, False
+    return round_number >= PREDICT_FROM, round_number >= JUDGE_FROM
+
+
+def _bound(record: RoundRecord, cutover: str | None) -> bool:
+    start = _parse_when(cutover)
+    return (
+        start is not None
+        and record.opened_at is not None
+        and record.opened_at >= start
+    )
+
+
+def next_round(records: Mapping[str, RoundRecord], at: datetime) -> int:
+    """The round the PR is in after ``at``: one more than the rounds opened by
+    then (a round with no opening time is a legacy one, opened before)."""
+    return 1 + sum(1 for r in records.values() if r.opened_at is None or r.opened_at <= at)
+
+
+def prediction_failures(
+    records: Mapping[str, RoundRecord], at: datetime, cutover: str | None
+) -> int:
+    """Rounds from round 5 on, bound by the rules and opened by ``at``, that
+    drew a floor finding by their settle time (or by ``at``, when earlier): each
+    is a prediction that should have said it would not hold. From the budget
+    alone, so no reflection can reset it; an unreadable level is not counted."""
+    count = 0
+    for record in records.values():
+        if record.number < JUDGE_FROM or not _bound(record, cutover):
+            continue
+        if record.opened_at is None or record.opened_at > at:
+            continue
+        settle = record.settle_at
+        upto = at if settle is None else min(at, settle)
+        if record.blocking(upto)[0] is True:
+            count += 1
+    return count
+
+
+def past_terminal_problems(
+    parsed: Reflection,
+    record: RoundRecord | None,
+    records: Mapping[str, RoundRecord],
+    *,
+    gate_lane: bool,
+    made_at: datetime | None,
+    cutover: str | None = None,
+) -> list[str]:
+    """The past-round-4 rules for a reflection answering ``record``'s keys
+    (owner rulings 132a2135, e951d5a9). Nothing when the round is unknown, on
+    the gate lane, or opened before the cutover. Send-back with
+    ``Prediction-held: no`` passes every rule in every state, so no state
+    leaves the session without an admissible reflection."""
+    cutover = PAST_TERMINAL_CUTOVER_ISO if cutover is None else cutover
+    sent_back = parsed.decision == "send-back"
+    opened = [
+        r
+        for r in records.values()
+        if made_at is not None and (r.opened_at is None or r.opened_at <= made_at)
+    ]
+    newest = max(opened, key=lambda r: r.number) if opened else None
+    if (
+        parsed.fix_now
+        and not sent_back
+        and made_at is not None
+        and (record is None or newest is None or record.head != newest.head)
+        and loop_ended(records, gate_lane=gate_lane, now=made_at, cutover=cutover)
+    ):
+        # A key from an older round, answered after the loop ended: fixing it
+        # now would be admitted here and then refused at the commit.
+        return [
+            "the review loop is over (the newest round past round 4 drew no floor "
+            "finding): file each finding as an issue or send the PR back; no fix-now"
+        ]
+    if record is None or not _bound(record, cutover):
+        return []
+    predict, judge = past_terminal(record.number, gate_lane)
+    if not predict:
+        return []
+    if made_at is None:
+        return ["the reflection's commit time cannot be read, so the round-4 rules cannot be checked"]
+    problems: list[str] = []
+    if parsed.fix_now and not sent_back:
+        want = next_round(records, made_at)
+        if parsed.prediction_round != want:
+            problems.append(
+                f"past round {PREDICT_FROM - 1}, fixing again needs "
+                f"'Prediction: merges at round {want} because <why>'"
+            )
+        if parsed.confidence is None or parsed.confidence < MIN_CONFIDENCE:
+            problems.append(
+                f"fixing again past round {PREDICT_FROM - 1} needs "
+                f"'Confidence: <{MIN_CONFIDENCE}-100>% falsified-by <what would show it wrong>'"
+            )
+    if not judge:
+        return problems
+    blocking, keys = record.blocking(made_at)
+    if parsed.held is None:
+        problems.append(
+            "round 5 on carries 'Prediction-held: yes|no <why>': did the last prediction hold?"
+        )
+    elif parsed.held == "yes":
+        settle = record.settle_at
+        if blocking is True:
+            problems.append(
+                "'Prediction-held: yes' is wrong: round "
+                f"{record.number} drew floor findings ({', '.join(keys)})"
+            )
+        elif blocking is None:
+            problems.append(
+                "'Prediction-held: yes' cannot be verified (a finding's level is unreadable); "
+                "write 'no'"
+            )
+        elif settle is None or made_at < settle:
+            problems.append(
+                "'Prediction-held: yes' needs the round settled: wait until "
+                f"{str(settle.isoformat() if settle else '?')[:16]} UTC, or write 'no'"
+            )
+    if blocking is False and parsed.fix_now_keys & record.keys and not sent_back:
+        problems.append(
+            f"round {record.number} drew no floor finding, so the review loop ends here: "
+            "file each finding as an issue (merge-and-file) or send the PR back; no fix-now"
+        )
+    if not sent_back and prediction_failures(records, made_at, cutover) >= 2:
+        problems.append(
+            "two predictions past round 4 failed: the only decision left is 'send-back'"
+        )
+    return problems
+
+
+def loop_ended(
+    records: Mapping[str, RoundRecord] | None,
+    *,
+    gate_lane: bool,
+    now: datetime,
+    cutover: str | None = None,
+) -> bool | None:
+    """Whether the review loop is over: the newest round is 5 or later, bound
+    by the rules, and drew no floor finding. Its answer could then only end the
+    loop (``past_terminal_problems``), so a content commit after it is refused.
+    None when it cannot be told (fails open); a floor finding keeps it open."""
+    cutover = PAST_TERMINAL_CUTOVER_ISO if cutover is None else cutover
+    if records is None:
+        return None
+    # The newest round opened by ``now``: a round opened later (it is in the
+    # budget, read after the fact) did not exist when a reflection was made.
+    opened = [r for r in records.values() if r.opened_at is None or r.opened_at <= now]
+    if gate_lane or not opened:
+        return False
+    newest = max(opened, key=lambda r: r.number)
+    if newest.number < JUDGE_FROM or not _bound(newest, cutover):
+        return False
+    blocking, _ = newest.blocking(now)
+    return None if blocking is None else not blocking
 
 
 def _normalize(text: str) -> str:
@@ -283,6 +501,16 @@ def parse(
         result.verdict = seen["Premise"][0].group(1)
     if seen["Decision"]:
         result.decision = seen["Decision"][0].group(1)
+    if seen["Prediction"]:
+        result.prediction_round = int(seen["Prediction"][0].group(1))
+    if seen["Confidence"]:
+        result.confidence = int(seen["Confidence"][0].group(1))
+    if seen["Prediction-held"]:
+        result.held = seen["Prediction-held"][0].group(1)
+    result.fix_now_keys = {
+        m.group(1) for m in seen["Disposition"] if m.group(2).startswith("fix-now")
+    }
+    result.fix_now = bool(result.fix_now_keys)
     if seen["Audit-evidence"]:
         result.audit_evidence = seen["Audit-evidence"][0].group(1)
     if seen["Premise-evidence"]:
@@ -967,15 +1195,28 @@ def check(
     round_started: object,
     made_at: object,
     cwd: str,
+    round_record: RoundRecord | None,
+    round_records: Mapping[str, RoundRecord],
 ) -> Reflection:
     """Every local rule a reflection must meet for this round, in one place.
-    ``cwd`` is the repository: a relative evidence path is read from there."""
+    ``cwd`` is the repository: a relative evidence path is read from there.
+    ``round_record`` is the round the keys belong to, for the past-round-4
+    rules (``past_terminal_problems``); None leaves them off."""
     parsed = parse(
         body,
         round_number=round_number,
         gate_lane=gate_lane,
         acceptance=acceptance,
         previous_classes=previous_classes,
+    )
+    parsed.problems.extend(
+        past_terminal_problems(
+            parsed,
+            round_record,
+            round_records,
+            gate_lane=gate_lane,
+            made_at=made_at if isinstance(made_at, datetime) else _parse_when(made_at),
+        )
     )
     if parsed.head != head:
         parsed.problems.append(
@@ -1239,6 +1480,7 @@ def covered_keys(
     gate_lane: bool,
     prior_heads: Sequence[str],
     key_rounds: Mapping[str, frozenset[str]],
+    round_records: Mapping[str, RoundRecord] | None,
     acceptance: Sequence[str] | None,
     round_started: object,
     reviewed_at: Mapping[str, datetime | None] | None = None,
@@ -1284,6 +1526,7 @@ def covered_keys(
             gate_lane=gate_lane,
             prior_heads=prior_heads,
             key_rounds=key_rounds,
+            round_records=round_records or {},
             acceptance=acceptance,
             round_started=round_started,
             reviewed_at=reviewed_at or {},
@@ -1298,6 +1541,7 @@ def _covered_keys(
     gate_lane: bool,
     prior_heads: Sequence[str],
     key_rounds: Mapping[str, frozenset[str]],
+    round_records: Mapping[str, RoundRecord],
     acceptance: Sequence[str] | None,
     round_started: object,
     reviewed_at: Mapping[str, datetime | None],
@@ -1336,6 +1580,8 @@ def _covered_keys(
             round_started=round_started,
             made_at=committed_at,
             cwd=cwd,
+            round_record=round_records.get(head),
+            round_records=round_records,
         )
         if result.ok:
             covered.update(k for k in result.keys if clears(clock, reviewed_at.get(k)))
@@ -1538,6 +1784,12 @@ def _open_review_times(budget: Mapping[str, Any]) -> dict[str, datetime | None]:
     return times
 
 
+def _round_records(budget: Mapping[str, Any]) -> dict[str, RoundRecord] | None:
+    import review_late  # noqa: PLC0415 - review_late imports this module
+
+    return review_late.round_records(budget)
+
+
 def _open_covered(
     cwd: str,
     budget: Mapping[str, Any],
@@ -1558,6 +1810,7 @@ def _open_covered(
             if r.get("head") != state["head"]
         ],
         key_rounds=key_rounds(budget),
+        round_records=_round_records(budget),
         acceptance=acceptance,
         round_started=state["round_started"],
         reviewed_at=_open_review_times(budget),

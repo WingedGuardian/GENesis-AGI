@@ -608,7 +608,14 @@ def test_an_open_round_keys_each_finding_by_its_comment_id():
     assert got["open_keys"] == ["c111", "c113"]
     assert got["reflection_keys"] == "ok"
     assert got["rounds"][-1]["reviews"] == [
-        {"id": 11, "login": CODEX, "submitted_at": AFTER, "finding_keys": ["c111", "c113"]}
+        {
+            "id": 11,
+            "login": CODEX,
+            "submitted_at": AFTER,
+            "finding_keys": ["c111", "c113"],
+            # Parallel to the keys: the P2 is below the floor, the P1 at it.
+            "blocking": [False, True],
+        }
     ]
 
 
@@ -993,6 +1000,7 @@ def test_a_finding_on_an_ancestor_after_a_descendant_was_reviewed_opens_no_round
             "submitted_at": _z(T3),
             "login": DEVIN,
             "keys": ["c70"],
+            "blocking": [False],  # Devin's yellow marker is below the floor
             "round_head": None,
             "late": True,
         }

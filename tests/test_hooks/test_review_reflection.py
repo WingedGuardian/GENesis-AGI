@@ -448,6 +448,7 @@ def _covered(path, head, **kw):
     kw.setdefault("gate_lane", False)
     kw.setdefault("prior_heads", [])
     kw.setdefault("key_rounds", {})
+    kw.setdefault("round_records", {})
     kw.setdefault("acceptance", None)
     kw.setdefault("round_started", T0 - timedelta(days=3650))
     return rr.covered_keys(str(path), head, **kw)
@@ -732,6 +733,7 @@ def _smuggled_is_a_fix(path: Path, tmp_path: Path, head: str, cwd: Path | None =
         gate_lane=False,
         prior_heads=[],
         key_rounds={},
+        round_records={},
         acceptance=None,
         round_started=T0 - timedelta(days=3650),
         reviewed_at={"c1": _at(0), "c2": _at(0)},
@@ -1300,6 +1302,44 @@ def test_class_history_probes_only_rows_sharing_a_judged_class(repo, tmp_path, m
     log = rr._log_reflections(str(path))
     got = rr._class_labels(log, [first], judged=judged, cwd=str(path), relevant=["beta"])
     assert got == ["beta"] and len(probes) == 1
+
+
+def test_a_round_five_fix_now_with_no_floor_finding_is_not_covered(repo, tmp_path, monkeypatch):
+    """#4133 1b-i rule E end to end through covered_keys: round 5 drew no floor
+    finding, so a fix-now answer credits nothing; filing every finding does."""
+    path, head = repo
+    opened = datetime.now(UTC) - timedelta(hours=3)
+    monkeypatch.setattr(rr, "PAST_TERMINAL_CUTOVER_ISO", (opened - timedelta(days=1)).isoformat())
+    earlier = {
+        f"{n:040x}": rr.RoundRecord(f"{n:040x}", n, opened - timedelta(hours=10 - n), ())
+        for n in range(1, 5)
+    }
+    records = {**earlier, head: rr.RoundRecord(head, 5, opened, ((opened, False, "c1"),))}
+    kw = dict(round_number=5, round_records=records, round_started=opened - timedelta(days=1))
+    held = "Prediction-held: yes the round drew only minor findings again"
+    predicted = (
+        "Prediction: merges at round 6 because the class is closed now",
+        "Confidence: 99% falsified-by any new finding in that class",
+    )
+    # Every other rule passes, so only the end-now rule refuses it.
+    sound = "SOUND-BUT-INFERIOR"
+    fixing = _reflection(
+        head=head, premise=sound, extra=(*_round_two(tmp_path), *predicted, held)
+    )
+    _commit_reflection(path, tmp_path, fixing)
+    real = rr.check
+    seen = []
+    monkeypatch.setattr(rr, "check", lambda *a, **k: seen.append(real(*a, **k)) or seen[-1])
+    assert _covered(path, head, **kw) == set()
+    assert [p for p in seen[-1].problems if "loop ends here" not in p] == []
+    filed = _reflection(
+        head=head,
+        premise=sound,
+        dispositions=("Disposition: c1 file issue=#12", "Disposition: c2 file issue=#13"),
+        extra=(*_round_two(tmp_path), held),
+    )
+    _commit_reflection(path, tmp_path, filed)
+    assert _covered(path, head, **kw) == {"c1", "c2"}
 
 
 def test_key_rounds_reads_round_reviews_and_joined_findings():
@@ -2243,6 +2283,7 @@ def test_unreadable_git_is_refused_never_nothing_owed(tmp_path):
             gate_lane=False,
             prior_heads=[],
             key_rounds={},
+            round_records={},
             acceptance=None,
             round_started=T0,
         )

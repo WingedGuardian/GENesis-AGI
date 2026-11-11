@@ -1115,13 +1115,21 @@ def _reflection_problem(
     # reader judges it under (review_late.covered_late_keys for a late key, the
     # current round for an open one); which keys it credits is still that
     # reader's call. A late key whose round cannot be placed admits nothing.
+    # The past-round-4 rules need the round's facts, which admission reads
+    # from the budget it already holds, so a refused fix-now is a named deny
+    # here, never a key that silently stays owed after an admitted commit.
+    records = rr._round_records(budget) or {}
+    by_number = {record.number: record for record in records.values()}
+    now = datetime.now(UTC)
     problems: list[str] = []
     for key in sorted(rounds):
-        failed = [
-            problem
-            for round_n in rounds[key]
-            for problem in rr.parse(text, round_number=round_n, gate_lane=gate_lane).problems
-        ]
+        failed = []
+        for round_n in rounds[key]:
+            parsed_n = rr.parse(text, round_number=round_n, gate_lane=gate_lane)
+            failed += parsed_n.problems
+            failed += rr.past_terminal_problems(
+                parsed_n, by_number.get(round_n), records, gate_lane=gate_lane, made_at=now
+            )
         if not failed:
             break
         problems = problems or failed
@@ -1164,6 +1172,17 @@ def _owed_message(state: dict, budget: dict, rr) -> str:
         needs.append("an Audit-evidence: line citing a fresh-context class audit of this round")
     if premise:
         needs.append("a Premise-evidence: line citing an independent premise check")
+    predict, judge = rr.past_terminal(round_n, gate_lane)
+    if predict:
+        needs.append(
+            "if it fixes now: 'Prediction: merges at round <next> because <why>' and "
+            "'Confidence: <95-100>% falsified-by <what would show it wrong>'"
+        )
+    if judge:
+        needs.append(
+            "'Prediction-held: yes|no <why>'; with no floor finding this round, no fix-now "
+            "(file each finding, or send the PR back)"
+        )
     lines += [
         f"This round ({'gate' if gate_lane else 'ordinary'} lane) needs "
         + ("; ".join(needs) if needs else "the reflection alone")
@@ -1230,6 +1249,13 @@ def _reflection_rule(
         )
         return "continue", None
     if not owed:
+        ended = _loop_ended(budget, rr)
+        if ended and not (len(commit_segs) == 1 and _concludes_merge_of_main(cwd, rr, segs)):
+            message = _ended_message(budget)
+            if _reflection_gate_mode() == "advisory":
+                _ADVISORIES.append("reflection gate (advisory mode, NOT enforced): " + message)
+                return "continue", None
+            return "deny", message
         _note_unreflected_round(cwd, budget, rr, owed_deadline)
         return "continue", None
     if (
@@ -1261,6 +1287,65 @@ def _reflection_rule(
         _ADVISORIES.append("reflection gate (advisory mode, NOT enforced): " + message)
         return "continue", None
     return "deny", message
+
+
+def _loop_ended(budget: dict, rr) -> bool:
+    """Whether the review loop is over (``review_reflection.loop_ended``). Any
+    failure to tell is False: unknown never refuses (owner ruling a34481ca)."""
+    try:
+        return bool(
+            rr.loop_ended(
+                rr._round_records(budget),
+                gate_lane=bool(budget.get("gate_surface")),
+                now=datetime.now(UTC),
+            )
+        )
+    except Exception:  # noqa: BLE001 - unknown is not a refusal
+        return False
+
+
+def _concludes_merge_of_main(cwd: str | None, rr, segs: list) -> bool:
+    """A commit concluding a merge of the default branch that carries nothing
+    else: no staging in the same command, exactly one MERGE_HEAD, and the
+    staged tree passes ``review_reflection._merge_is_no_fix`` (git's own merge
+    result, or a difference only in the files that conflicted). The same
+    reading the review owe side uses, so a fix cannot ride in on the merge."""
+    if _commit_may_add_content(segs):
+        return False
+    d = cwd or "."
+    try:
+        code, out, _ = rr._run(["git", "-C", d, "rev-parse", "-q", "--verify", "HEAD"])
+        head = out.strip() if code == 0 else ""
+        path_code, path, _ = rr._run(["git", "-C", d, "rev-parse", "--git-path", "MERGE_HEAD"])
+        if not head or path_code != 0:
+            return False
+        merge_file = Path(path.strip())
+        if not merge_file.is_absolute():
+            merge_file = Path(d) / merge_file
+        heads = merge_file.read_text().split()
+        if len(heads) != 1:
+            return False  # none, or an octopus merge
+        tree_code, tree, _ = rr._run(["git", "-C", d, "write-tree"])
+        if tree_code != 0:
+            return False
+        return rr._merge_is_no_fix(d, tree.strip(), [head, heads[0]], rr._mainline(d), {head})
+    except Exception:  # noqa: BLE001 - not provably a merge of main
+        return False
+
+
+def _ended_message(budget: dict) -> str:
+    return "\n".join(
+        [
+            f"BLOCKED: the review loop of PR #{budget.get('pr')} is over. Round "
+            f"{budget.get('count')} drew no floor finding past round 4, so its answer "
+            "ended the loop (each finding filed as an issue, or a send-back).",
+            "Merge the PR (the merge gate decides), or send it back for a rework. A "
+            "merge of the default branch to resolve a conflict or refresh CI is allowed; "
+            "a new review round with a floor finding reopens fixing.",
+            "A real defect found now goes into a new PR (or ask the owner for an "
+            "exception); do not work around this.",
+        ]
+    )
 
 
 def _note_unreflected_round(cwd: str | None, budget: dict, rr, deadline: float) -> None:

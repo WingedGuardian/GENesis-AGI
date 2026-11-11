@@ -1308,6 +1308,38 @@ def test_a_correction_in_the_same_round_is_not_earlier_history(pr, tmp_path):
     assert _credit(path, budget) == {"c9"}
 
 
+def test_a_late_key_is_judged_by_its_own_rounds_past_round_4_rules(pr, tmp_path, monkeypatch):
+    """#4133 1b-i on the late path: c9 belongs to round F. When F's record is a
+    round 5 with no floor finding, the fix-now answer credits nothing (rule E)."""
+    path, base, head, fix = pr
+    budget, second, answer = _two_round_answer(path, tmp_path, base, head, fix)
+    held = "Prediction-held: no round five only drew minor findings again"
+    answer = answer.replace("Escalate: no", f"{held}\nEscalate: no")
+    answer = answer.replace(
+        "Escalate: no",
+        "Prediction: merges at round 7 because the class is closed now\n"
+        "Confidence: 99% falsified-by any new finding in that class\nEscalate: no",
+    )
+    _reflect(path, tmp_path, answer, T0 + timedelta(minutes=120))
+    assert _credit(path, budget) == {"c9"}  # rules off: round F is round 2
+    opened = T0 + timedelta(minutes=70)
+    records = {
+        **{
+            f"{n:040x}": rr.RoundRecord(f"{n:040x}", n, opened - timedelta(hours=5 - n), ())
+            for n in range(1, 5)
+        },
+        fix: rr.RoundRecord(fix, 5, opened, ((T0 + timedelta(minutes=110), False, "c9"),)),
+        # A newer round 6 with a floor finding keeps the loop open, so only the
+        # key's own round (5, no floor finding) can refuse the fix-now.
+        "6" * 40: rr.RoundRecord(
+            "6" * 40, 6, opened + timedelta(minutes=5), ((opened + timedelta(minutes=6), True, "c8"),)
+        ),
+    }
+    monkeypatch.setattr(rl, "round_records", lambda budget: records)
+    monkeypatch.setattr(rr, "PAST_TERMINAL_CUTOVER_ISO", (T0 - timedelta(days=1)).isoformat())
+    assert _credit(path, budget) == set()
+
+
 def test_an_unreadable_ancestry_probe_refuses(monkeypatch):
     """S3: git's exit 0 is an ancestor, 1 is not; anything else is unknown."""
     monkeypatch.setattr(rr, "_run", lambda argv, cwd=None: (128, "", "fatal"))
