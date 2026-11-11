@@ -605,31 +605,82 @@ def _log_reflections(cwd: str) -> list[tuple[str, str, str, datetime | None]]:
     return found
 
 
-def previous_class_labels(cwd: str, prior_heads: Sequence[str]) -> list[str]:
-    """Class labels of every earlier round of this PR: the classes of every
-    valid empty reflection naming one of ``prior_heads`` (the round heads
-    ``review_budget`` reports before the current one). A reflection naming any
-    other head is ignored, so a stray or mistyped one cannot stand in for the
-    previous round. Drafts never count: an invalid or escalating reflection
-    was never accepted as its round's answer."""
-    if not prior_heads:
-        return []
-    return _class_labels(_log_reflections(cwd), prior_heads)
+def key_rounds(budget: Mapping[str, Any]) -> dict[str, frozenset[str]]:
+    """Each finding key's round head(s), from the budget: the keys of every
+    round's reviews (``rounds[].reviews[].finding_keys``) and of every finding
+    that joined a round (``findings[].round_head``). A key that joined no round
+    (a late finding with no earlier round) is absent."""
+    owners: dict[str, set[str]] = {}
+    for entry in budget.get("rounds") or []:
+        head = entry.get("head") if isinstance(entry, Mapping) else None
+        if not isinstance(head, str):
+            continue
+        for review in entry.get("reviews") or []:
+            keys = review.get("finding_keys") if isinstance(review, Mapping) else None
+            for key in keys if isinstance(keys, list) else []:
+                if isinstance(key, str):
+                    owners.setdefault(key, set()).add(head)
+    for item in budget.get("findings") or []:
+        head = item.get("round_head") if isinstance(item, Mapping) else None
+        keys = item.get("keys") if isinstance(item, Mapping) else None
+        if isinstance(head, str) and isinstance(keys, list):
+            for key in keys:
+                if isinstance(key, str):
+                    owners.setdefault(key, set()).add(head)
+    return {key: frozenset(heads) for key, heads in owners.items()}
 
 
 def _class_labels(
-    log: Sequence[tuple[str, str, str, datetime | None]], prior_heads: Sequence[str]
+    log: Sequence[tuple[str, str, str, datetime | None]],
+    prior_heads: Sequence[str],
+    *,
+    owners: Mapping[str, frozenset[str]] | None = None,
+    judged: str | None = None,
+    cwd: str | None = None,
+    relevant: Iterable[str] | None = None,
 ) -> list[str]:
-    """``previous_class_labels`` over reflection rows already read
-    (``_log_reflections``' shape), so a caller can choose which rows count."""
+    """Class labels of every earlier round of this PR, over reflection rows
+    already read (``_log_reflections``' shape): the classes of every valid
+    empty reflection belonging to one of ``prior_heads`` (the round heads
+    before the one judged). One rule for every reader (#4310). Drafts never
+    count: an invalid or escalating reflection was never accepted as its
+    round's answer, and a reflection naming a head that is no earlier round
+    (stray, mistyped) and owning no key stands in for nothing.
+
+    A reflection belongs to the round(s) that own its header keys (``owners``,
+    from ``key_rounds``): the gate makes every reflection name the PR head, so
+    the head it names says only where the tip was, and a commit it names may
+    open a round of its own later. Only when no header key has an owner does
+    the named head decide: earlier history when it is one of ``prior_heads``.
+    It is earlier history only when every
+    round it belongs to is in ``prior_heads``, so a first reflection never
+    counts against the one correcting it in the same round. With ``judged``
+    (the reflection being checked; ``cwd`` is then required) only strict git
+    ancestors of it count, never it and never one a merge brought in later;
+    ancestry is probed only for rows that qualify otherwise, and an unreadable
+    history raises ``Refused``. ``relevant`` (the judged reflection's classes)
+    skips, unprobed, a row sharing none of them: the recurring-class rule
+    reads only that overlap, and the probe costs a git call in Rule R's slice."""
     wanted = set(prior_heads)
     classes: list[str] = []
     if not wanted:
         return classes
-    for _, kind, body, _ in log:
+    if judged is not None and not cwd:
+        raise ValueError("a judged reflection needs the repository it is in")
+    keep = None if relevant is None else {_normalize(c) for c in relevant}
+    for sha, kind, body, _ in log:
         parsed = parse(body)
-        if kind == "empty" and parsed.ok and not parsed.escalate and parsed.head in wanted:
-            classes.extend(c for c in parsed.classes if c not in classes)
+        if kind != "empty" or not parsed.ok or parsed.escalate:
+            continue
+        mine = {head for key in parsed.keys for head in (owners or {}).get(key, ())}
+        prior = mine <= wanted if mine else parsed.head in wanted
+        if not prior or sha == judged:
+            continue
+        if keep is not None and not keep & set(parsed.classes):
+            continue
+        if judged is not None and not _is_ancestor(str(cwd), sha, judged):
+            continue
+        classes.extend(c for c in parsed.classes if c not in classes)
     return classes
 
 
@@ -1187,6 +1238,7 @@ def covered_keys(
     round_number: int,
     gate_lane: bool,
     prior_heads: Sequence[str],
+    key_rounds: Mapping[str, frozenset[str]],
     acceptance: Sequence[str] | None,
     round_started: object,
     reviewed_at: Mapping[str, datetime | None] | None = None,
@@ -1202,7 +1254,9 @@ def covered_keys(
     commit as a fix, so leaving ``reviewed_at`` out is the strictest check),
     and ``check`` passes it:
     the grammar, the round's obligations, the recurring-class rule against
-    every earlier round head (``prior_heads``), readable evidence files
+    every earlier round (``prior_heads``; a reflection naming no round head
+    belongs to the rounds of its keys, ``key_rounds``, and only one that is a
+    strict git ancestor of the reflection judged counts), readable evidence files
     (an adversarial audit, a premise check) written between ``round_started``
     and the reflection's commit where cited or owed, no escalation, and the
     acceptance points (None only when the PR declares none). Every argument is
@@ -1229,6 +1283,7 @@ def covered_keys(
             round_number=round_number,
             gate_lane=gate_lane,
             prior_heads=prior_heads,
+            key_rounds=key_rounds,
             acceptance=acceptance,
             round_started=round_started,
             reviewed_at=reviewed_at or {},
@@ -1242,18 +1297,35 @@ def _covered_keys(
     round_number: int,
     gate_lane: bool,
     prior_heads: Sequence[str],
+    key_rounds: Mapping[str, frozenset[str]],
     acceptance: Sequence[str] | None,
     round_started: object,
     reviewed_at: Mapping[str, datetime | None],
 ) -> set[str]:
-    previous = previous_class_labels(cwd, prior_heads)
+    log = _log_reflections(cwd)
     covered: set[str] = set()
-    for sha, kind, body, committed_at in _log_reflections(cwd):
+    for sha, kind, body, committed_at in log:
         if kind != "empty":
             continue
         clock = fix_clock(cwd, head, sha)
         if clock is NEVER:
             continue
+        parsed = parse(body)
+        # The recurring-class rule refuses only a fix-instances decision with
+        # classes, so the history (an ancestry probe per earlier reflection
+        # sharing one of those classes) is read only then.
+        previous = (
+            _class_labels(
+                log,
+                prior_heads,
+                owners=key_rounds,
+                judged=sha,
+                cwd=cwd,
+                relevant=parsed.classes,
+            )
+            if parsed.decision == "fix-instances" and parsed.classes
+            else []
+        )
         result = check(
             body,
             head=head,
@@ -1485,6 +1557,7 @@ def _open_covered(
             for r in budget.get("rounds") or []
             if r.get("head") != state["head"]
         ],
+        key_rounds=key_rounds(budget),
         acceptance=acceptance,
         round_started=state["round_started"],
         reviewed_at=_open_review_times(budget),

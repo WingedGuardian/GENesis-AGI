@@ -385,25 +385,6 @@ def _descendants(cwd: str, sha: str, current: str) -> set[str]:
     return set(out.split())
 
 
-def _prior_labels(
-    cwd: str,
-    log: Sequence[tuple[str, str, str, datetime | None]],
-    prior_heads: Sequence[str],
-    sha: str,
-) -> list[str]:
-    """The earlier rounds' classes as reflection ``sha`` saw them: only
-    reflections that are strict git ancestors of it count, never one that
-    reached the history later through a merge. Ancestry is probed only for
-    rows naming one of ``prior_heads``."""
-    wanted = set(prior_heads)
-    rows = [
-        row
-        for row in log
-        if row[0] != sha and rr.parse(row[2]).head in wanted and rr._is_ancestor(cwd, row[0], sha)
-    ]
-    return rr._class_labels(rows, prior_heads)
-
-
 def covered_late_keys(
     cwd: str,
     budget: Mapping[str, Any],
@@ -493,6 +474,7 @@ def _covered_late_keys(
     current = budget.get("current_head")
     in_graph, ancestors = _ancestry(budget)
     log = rr._log_reflections(cwd)
+    owners = rr.key_rounds(budget)
     labels: dict[tuple[tuple[str, ...], str], list[str]] = {}
     checked: dict[tuple[str, RoundContext], bool] = {}
     fix_times: dict[tuple[str, str], datetime | None] = {}
@@ -555,8 +537,18 @@ def _covered_late_keys(
                     checked[(sha, context)] = parsed.ok and not parsed.escalate
                 if (sha, context) not in checked:
                     if (context.prior_heads, sha) not in labels:
-                        labels[(context.prior_heads, sha)] = _prior_labels(
-                            cwd, log, context.prior_heads, sha
+                        # Only a fix-instances decision with classes can recur.
+                        labels[(context.prior_heads, sha)] = (
+                            rr._class_labels(
+                                log,
+                                context.prior_heads,
+                                owners=owners,
+                                judged=sha,
+                                cwd=cwd,
+                                relevant=parsed.classes,
+                            )
+                            if parsed.decision == "fix-instances" and parsed.classes
+                            else []
                         )
                     checked[(sha, context)] = rr.check(
                         body,
