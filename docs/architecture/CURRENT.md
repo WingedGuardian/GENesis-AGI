@@ -5261,7 +5261,9 @@ logger or unrelated exceptions with copied text and no provenance.
   `other:not-owned`, never skipped; a held in-flight record whose whole run
   folder is gone is `other:aside-lost`, said once (the record is then
   cleared), while an aside moved out by hand with its folder still there is
-  a release; over 64 run folders refuses the report whole. Folders named
+  a release; over 64 run folders refuses the report whole. Each folder's asides are read on
+  their own budget (2 GiB, 200,000 entries), so `--check` on a report with many run folders
+  costs time, never a wrong verdict. Folders named
   before #4011 carry no ts and are found only through the in-flight record.
   The deploy-backups prune keeps a run folder named for its report for as
   long as that report's folder exists.

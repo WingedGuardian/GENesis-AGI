@@ -199,3 +199,32 @@ def test_an_in_flight_record_naming_another_report_is_not_read():
     assert kit.restore_block({"restore": block}, other) == block
     old = {**block, "inflight": ["20260102T000000Z-9-live-move-restore", "a", "node"]}
     assert kit.restore_block({"restore": old}, mine) == old, "a folder named before #4011"
+
+
+def test_check_and_restore_agree_beside_a_held_aside_and_a_damaged_copy(w):
+    """#4011 rebase review LOW-1: an aside part and a --check prediction in
+    one report. sub/s1's aside is held (a write through an open fd after its
+    run), and Z5's saved copy is not what SAVED.json records: --check names
+    exactly what --restore refuses, part for part."""
+    from tests.test_scripts._live_repair_world import _foreign_untracked
+    from tests.test_scripts.test_live_move_restore_write import _repaired
+
+    def both(w):
+        _foreign_edit(w)
+        return _foreign_untracked(w)
+
+    ts = _repaired(w, both)
+    (w.backups()[-1] / "tree" / "Z5").write_text("not what was saved\n")
+    fd = os.open(w.root / "sub" / "s1", os.O_WRONLY)
+    try:
+        assert _restore(w, ts).returncode == 1  # Z5 refused; sub/s1 restored
+        os.pwrite(fd, b"newer\n", 0)
+    finally:
+        os.close(fd)
+    c, r = _check(w, ts), _restore(w, ts)
+    said, did = _parts(c), _parts(r)
+    assert "other:hash-mismatch" in said.values() and "other:aside-held" in said.values(), c.stdout
+    assert said.keys() == did.keys(), (c.stdout, r.stdout)
+    for key, v in said.items():
+        want = {"as-left": "restored", "already-restored": "already-restored"}.get(v, f"refused:{v}")
+        assert did[key] == want, (key, c.stdout, r.stdout)
