@@ -138,6 +138,8 @@ _REPAIRS = {
     "saved": 3,
     "refused": 1,
     "unread_older": 2,
+    "hooks_pending": 1,
+    "hooks_saved": 1,
     "unresolved": False,
     "a_future_key": "/srv/install/private",
 }
@@ -252,7 +254,14 @@ async def test_an_untrusted_peer_gets_live_repair_counts_only(monkeypatch):
     `reports` nor a key added later; the cached snapshot keeps the detail."""
     body, cached = await _health_as("198.51.100.7", monkeypatch=monkeypatch)
     repairs = body["deploy_health"]["live_repairs"]
-    assert repairs == {"saved": 3, "refused": 1, "unread_older": 2, "unresolved": False}, repairs
+    assert repairs == {
+        "saved": 3,
+        "refused": 1,
+        "unread_older": 2,
+        "hooks_pending": 1,
+        "hooks_saved": 1,
+        "unresolved": False,
+    }, repairs
     assert "/srv/install" not in str(body) and "20260101T000000Z-1" not in str(body), body
     assert cached["deploy_health"]["live_repairs"]["reports"] == _REPAIRS["reports"]
 

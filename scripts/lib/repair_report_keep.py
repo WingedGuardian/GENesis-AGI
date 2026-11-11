@@ -11,7 +11,11 @@ A report folder holds the only saved copy of edits a live-move repair moved out
 of the checkout. It is kept while deploy health would still count its saved
 paths: not dismissed, not cleared by a restore (the rule of deploy_health
 ``_restore_counts``, held equal by a test), and holding at least one foreign
-row. A report this reader cannot read is kept too, and named, until --dismiss
+row; or while it is not dismissed and its git hooks are still pending (a
+forward repair's retry, which deploy health counts, reads that record) or it
+holds hooks the repair replaced (``hooks_before``: hooks-before/ may hold the
+only copy of a hand-edited hook; deploy health counts it too). A
+report this reader cannot read is kept too, and named, until --dismiss
 writes DISMISS_MARK beside it (a dismissed report goes like any other): losing a saved
 edit is the outcome a prune must never produce in silence. So is the restore
 run folder a kept report's in-flight record names (``restore.inflight[0]``):
@@ -49,6 +53,10 @@ def reason(report: object) -> str | None:
         return "its REPAIR.json is not a JSON object"
     if report.get("dismissed_at"):
         return None
+    if report.get("hooks") == "pending":  # the writer's only record of the retry it owes
+        return "a live-move repair whose git hooks are not put back yet"
+    if report.get("hooks_before"):  # the only copy of a hook it replaced (a hand edit's)
+        return "a live-move repair report holding git hooks the repair replaced (hooks-before/)"
     block = report.get("restore")
     if (
         isinstance(block, dict)

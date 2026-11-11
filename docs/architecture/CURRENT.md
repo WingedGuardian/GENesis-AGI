@@ -4923,12 +4923,16 @@ logger or unrelated exceptions with copied text and no provenance.
   count there, one anywhere else (the rebuild having moved nothing) `holds`. A "merging"
   row on `live` whose record update.sh already dropped (it adopted the tip,
   own_head is that tip) is judged the same way toward own_head, so a rollback
-  killed partway after adoption is caught too. The remedy follows HEAD: on a
-  live row at the tag, the repair (`scripts/deploy_candidates repair-move`,
-  below), then the by-hand steps for when its kit is not installed; at the update's new code (main's merge or the rebuilt tip), put the
-  paths back and finish with `--post-merge` (Dismissing there leaves code
-  bootstrap never ran on); a main row at the tag keeps the by-hand text (save,
-  restore, Dismiss). The dashboard's progress poll returns the guard's remedy
+  killed partway after adoption is caught too. On a live row the remedy is the
+  repair (`scripts/deploy_candidates repair-move`, below) whichever end HEAD is
+  at: at the tag, followed by the by-hand steps for when its kit is not
+  installed; on `live` at the rebuilt tip (a rollback killed partway), it
+  finishes that rollback toward the tag, with `repair-move --explain` as the
+  by-hand steps, and never `--post-merge` (Dismissing there leaves code
+  bootstrap never ran on). At main's merge, put the paths back and finish with
+  `--post-merge`; a main row at the tag keeps the by-hand text (save, restore,
+  Dismiss). Both live texts name `repair-move --restore <ts>` as the way back
+  for a path that was not the update's. The dashboard's progress poll returns the guard's remedy
   (`guard_remedy`) and the update card shows it. `deploy_code_only.sh` and the live engine refuse to
   restart or move the checkout while it guards; a plain `update.sh` exits 5
   (before tagging or writing anything), and the dashboard's `/apply` answers
@@ -5041,9 +5045,9 @@ logger or unrelated exceptions with copied text and no provenance.
   server start, is PR D2, not yet built; `--explain` needs no kit: with none
   installed it runs the module as HEAD committed it, from memory, never the
   working tree's copy, which may itself be half-written) heals a live row's `mixed_tree`
-  with HEAD at the rollback tag, toward the tag, never toward the target (HEAD
-  at the target, a rollback killed partway, is refused with exit 1 and nothing
-  changed: finishing that rollback is a later PR, D1f): under update.lock and
+  toward the rollback tag, never toward the target (with HEAD on `live` at the
+  target, a rollback killed partway, PR D1f also finishes that rollback, below;
+  HEAD anywhere else off the tag is refused with exit 1): under update.lock and
   genesis-checkout.lock (every git lock a killed switch leaves, `index.lock`,
   `HEAD.lock`, the branch's ref lock and `packed-refs.lock`, is waited for while
   a process holds it, then saved into the backup's `git/` and removed by one
@@ -5093,7 +5097,53 @@ logger or unrelated exceptions with copied text and no provenance.
   never from the copy). The alert body is cut at 16 KiB, with how much was
   left out and a pointer to `REPAIR.json`, because one argv or environment
   string of 128 KiB or more is E2BIG (MEASURED); a queue that fails is
-  logged and never changes the exit code. A failure before the checkout itself changes (a
+  logged and never changes the exit code. With HEAD on `live` at the target
+  (D1f), after that restore (a prefix of the tag's bytes counting as the
+  rollback's own interrupted write) `REPAIR.json` records `hooks: "pending"`,
+  then `live` moves from the target to the tag by compare-and-swap (`git
+  update-ref`, old value the target; a lost swap is `unresolved`, exit 1, the
+  ref untouched), then the tag's own `scripts/deploy_candidates.py
+  restore-hooks <target> <tag>` runs with update.lock's fd and under the
+  checkout lock, as update.sh's rollback runs it (`hooks` becomes `ok`; a
+  failure leaves it `pending`, said in the output, and the alert is
+  critical). When restore-hooks fails and the moved-from commit's
+  `scripts/hooks` cannot be read (the commit, a tree or a blob there gone: no
+  retry could ever restore from it), the repair reinstalls the tag's hooks
+  instead: every installed regular-file hook the tag's sync-hooks.sh lists
+  whose bytes are not the tag's (a candidate's, or a hand-edited one; a
+  symlinked or unlisted hook, or one already the tag's, is left alone) is
+  copied into the report's `hooks-before/` (0600, never over an earlier copy,
+  made durable; the report dir and `hooks-before/` must be this user's 0700
+  directories, on the retry path too, or nothing is touched), the names are
+  written to REPAIR.json's `hooks_before` with a note naming the folder ("not
+  reinstalled yet"), and only then removed; then the tag's own `restore-hooks
+  <tag> <tag>` has sync-hooks.sh install them fresh and judges them as
+  readiness does. Between that removal and the install no such hook is
+  installed (seconds; accepted: a failure there leaves the record, and the
+  next run converges). On its exit 0 `hooks` is `reinstalled` (not pending:
+  the hooks count and keep no longer apply), `hooks_note` says so, and the
+  output and an alert (critical when hooks were moved aside) name the folder.
+  A report whose `hooks_before` is set is kept by the prune and counted in
+  `live_repair_hooks_saved:<n>` until `--dismiss` (it may hold a hand edit's
+  only copy). A hook only the moved-from commit listed stays installed. With core.hooksPath
+  pointing away from `$GIT_COMMON_DIR/hooks` nothing is touched and the hooks
+  stay pending (readiness names that setting). Every later run first re-reads
+  each pending report (through `load_report`; a DISMISS_MARK folder is
+  skipped) under both locks and retries it while the branch `live` is still
+  its tag and HEAD is on `live` (HEAD elsewhere: left pending; an entry whose
+  commits are not full commit ids: left as it is), marks it `superseded` once
+  `live` itself moved, and writes back only `hooks` (0600); a report
+  dismissed with `dismissed_at` is still retried while its folder exists
+  (dismissal ends only its count and its keep). One report's retry failing
+  (its write, say) is logged and never stops the heal that follows.
+  `--dismiss` and a restore take update.lock too, so neither's field is lost
+  (every REPAIR.json writer holds it); with no state file and update.lock
+  held it exits 0 at once. The restore-hooks run is not bounded by the boot budget;
+  that is PR D2's, which wires `--boot`. With the target's objects gone in
+  the forward case, the whole-tree fallback and a torn index's rebuild read
+  the tag, never HEAD (the target). After a forward heal HEAD is the tag on
+  `live`, so `--restore <ts>` judges its foreign paths as after any other
+  repair. A failure before the checkout itself changes (a
   failed backup included) exits 0 at `--boot`. The guard then judges
   again and only its SAFE removes the state (byte-identical re-read); `guards`
   or `holds` (an edit off the move's paths) keeps it, its result naming the
@@ -5102,7 +5152,7 @@ logger or unrelated exceptions with copied text and no provenance.
   `holds`, not `mixed_tree` again; anything
   else is `unresolved` (exit 1). A target whose objects are
   gone (its root tree, or any subtree or blob classification reads) is healed
-  by the whole tree against HEAD and cleared by a clean-tree
+  by the whole tree against the tag and cleared by a clean-tree
   check. A main row is out of scope (exit 3; 0 at `--boot`). The engine
   writes its merges with `core.fsync=committed`. Each repair prints its report
   (the restore command included) and queues an alert (critical when anything was
@@ -5146,8 +5196,10 @@ logger or unrelated exceptions with copied text and no provenance.
   `pyproject.toml`), that a report nobody restored or dismissed is never
   pruned (disk_hygiene's deploy-backups prune asks
   `scripts/lib/repair_report_keep.py`, which keeps exactly what this count
-  still counts, the restore run folder holding such a report's in-flight
-  aside, and any report it cannot read) while a restored or dismissed report
+  still counts, an undismissed report whose `hooks` is still `pending` or
+  whose `hooks_before` names hooks it replaced, the
+  restore run folder holding such a report's in-flight aside, and any report
+  it cannot read) while a restored or dismissed report
   and other backups are pruned 90 days after the last write to their folder,
   and, for a report whose last restore refused parts, that its
   output names each and that a part it can never write goes back by hand from
@@ -5156,7 +5208,19 @@ logger or unrelated exceptions with copied text and no provenance.
   column cannot hold rather than losing the alert, and is replaced whenever
   the reports it names change. `GET /api/genesis/health` reduces
   `live_repairs` to an allow-list of its counts for a caller without the
-  internal bearer or a verified session. `live_repair_unresolved` needs the
+  internal bearer or a verified session. `live_repair_hooks_pending:<n>`
+  counts the read, undismissed reports whose `hooks` is exactly `pending` and
+  whose `tag` is where the branch `live` points (the writer's own rule: `live`
+  moved on means superseded); one `git rev-parse --verify -q
+  refs/heads/live^{commit}`, bounded at 10 s, runs per snapshot and only when
+  such a report exists, and a timeout or a failing git keeps the count. It has
+  its own awareness line (readiness refuses every rebuild until the hooks are
+  back) and is in the health route's counts; `live_repair_hooks_saved:<n>`
+  counts the read, undismissed reports with a `hooks_before`, its awareness
+  line naming each `hooks-before/` folder and `--dismiss <ts>`; each enters the
+  alert's identity only when non-zero. A pending report whose commits are not full commit ids
+  (a hand edit), or one older than the newest eight reports the reader reads,
+  is kept by the prune and counted by no reader (accepted). `live_repair_unresolved` needs the
   newest report to say so (or to have no result after an hour) AND the
   shared guard, run at read time and only then, to call the update state
   `mixed_tree`: a run killed after its restore and before its result leaves
