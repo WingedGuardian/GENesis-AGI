@@ -147,6 +147,76 @@ Easy-to-forget mechanisms:
   (`memory/corrective.py`), which runs inside those tools — so the internal
   runtime stack and the hermetic LongMemEval harness (both pass explicit
   `rerank` kwargs) are unaffected.
+- **A credential reference's value and description are held out of its own
+  indexes** (#2426). For `reference.credentials`, `ingest_knowledge_unit` (the
+  one chokepoint every reference writer passes) indexes only the header (the
+  identifier), `[description held in the reference secret store]`,
+  `Value: [held in the reference secret store; read it with reference_lookup]`
+  and the Tags/Captured trailer (`reference_ops.split_secret`), so the unit's
+  knowledge_units and knowledge_fts rows, its memory_fts row, the Qdrant payload
+  and the embedding never see the value or the free-text description (no
+  scrub of free text: owner ruling, every spelling was another way through).
+  The identifier, tags, authority and provenance are not scrubbed. The value is
+  probed whole and by its fragments: percent-decoded, NFKC-normalised, split on
+  whitespace and `: / @ ? & = # ; , | \ < > " ' ( ) { } [ ]` (so a URL, DSN,
+  key=value, XML or pipe-separated password is a fragment of its own), leaving out host names, URL schemes and ports, and keeping each
+  secret-shaped fragment; matching is normalised (NFKC, format characters
+  removed, casefolded) and percent-decoded. An identifier, body header, or
+  ANY other caller field that can reach a store (authority, memory class,
+  purpose, ingestion source, and every provenance value, nested or not, each
+  read as text by `knowledge_ingest.field_text` and leaf by leaf) that carries
+  a probe refuses the write (`reference_ops.refuse_value_in_fields`; the
+  identifier with its own message, and the `[reference.credentials] {identifier}`
+  header by the identifier rule only when it is exactly that header). A caller
+  tag that carries a probe is dropped whole, from the tags and the body's Tags
+  line, and the write goes on (`reference_ops.drop_value_tags`), so a heuristic
+  match on an ordinary tag costs that tag, never the capture. Stated limits: a
+  secret that reads as a plain word (all letters, or under four characters) is
+  matched only as the whole value, and so is a fragment that is all digits or
+  shaped like a host name (dotted labels ending in letters). A credential's memory class becomes an
+  indexed tag, so it must be None or a known class (`classification.CLASS_WEIGHTS`).
+  The value and the description (`detail`)
+  go to one insert-only `reference_secrets` row under a fresh random id, and ONE statement
+  then writes the unit naming it in `knowledge_units.secret_ref`, so a body and
+  the secret it names are always one writer's pair on a connection that
+  serializes statements, not transactions. The `knowledge_units_secret_ref_*`
+  triggers refuse a credential unit naming no stored secret and delete the
+  secret a unit stops naming (repointed or deleted);
+  `knowledge_crud.sweep_orphan_secrets` (after every delete, and at boot)
+  removes secrets older than an hour that an interrupted upsert left unnamed.
+  `ingest_knowledge_unit(insert_only=True)` and `knowledge_crud.upsert(insert_only=True)`
+  never change an existing credential key (a different value raises
+  `CredentialKeyTaken`); no writer passes it yet: it is the mechanism a later
+  change wires the extraction job's auto-capture to.
+  Two `knowledge_units` triggers refuse a
+  credential body without exactly one placeholder line, whichever process
+  writes it (text on a later line only the Python check sees).
+  A re-ingest carrying a placeholder keeps what the key already holds for it:
+  both placeholders keep the secret row; a new description with the value
+  placeholder writes a new row with the stored value; a new value with the
+  description placeholder keeps the stored description. A credential write never shares a vector point
+  (`MemoryStore.store(..., dedup=False)`), and a point it created that no unit
+  names when the write ends (refused, failed or cancelled) is deleted, so no
+  stale-point cleanup can delete a point a unit names. The credential upsert
+  is a compare-and-swap against the ingest's own earlier read of the key
+  (`knowledge_crud.KeyObservation`: absent, or the secret and point it named),
+  checked inside the one statement that writes the unit, so a same-key writer
+  in another process that commits in between makes it write nothing
+  (`CredentialKeyChanged`); the ingest then re-reads and runs once more, and
+  a second change reaches the caller.
+  Only `reference_ops` reads the secret row: `compose_body` puts the value and
+  the description back for `reference_lookup` (behind its audit log),
+  `reveal_reference` returns both for the dashboard's reveal, and
+  `resolve_value` the value alone. When a unit was repointed after its row was
+  read, they re-read the unit's current body, value and description with one
+  statement (`knowledge_crud.get_reference_pair`), so a body never comes back
+  beside another write's secret. A credential is therefore found by its
+  identifier and tags only; the dashboard list shows the description placeholder. Identifier kinds (url, network,
+  account, fact) keep their value in the body, because it is what their lookups
+  search for. NOT covered yet: the episodic memory the extraction job stores
+  for the same conversation text, which still carries an auto-captured value.
+  Credentials stored before this change keep their value inline until the
+  follow-up migration rewrites them; both readers parse those as before.
 - **`drift_recall`** (`memory/drift.py`) is the degraded-mode fallback; its
   FTS drilldown searches every collection in `source_collections`,
   rank-merged across collections.
