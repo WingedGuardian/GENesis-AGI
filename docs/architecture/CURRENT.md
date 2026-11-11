@@ -161,9 +161,11 @@ Easy-to-forget mechanisms:
   whitespace and `: / @ ? & = # ; , | \ < > " ' ( ) { } [ ]` (so a URL, DSN,
   key=value, XML or pipe-separated password is a fragment of its own), leaving out host names, URL schemes and ports, and keeping each
   secret-shaped fragment; matching is normalised (NFKC, format characters
-  removed, casefolded) and percent-decoded. An identifier, body header,
-  authority, purpose, ingestion source or provenance field that carries a
-  probe refuses the write (`reference_ops.refuse_value_in_fields`; the
+  removed, casefolded) and percent-decoded. An identifier, body header, or
+  ANY other caller field that can reach a store (authority, memory class,
+  purpose, ingestion source, and every provenance value, nested or not, each
+  read as text by `knowledge_ingest.field_text` and leaf by leaf) that carries
+  a probe refuses the write (`reference_ops.refuse_value_in_fields`; the
   identifier with its own message, and the `[reference.credentials] {identifier}`
   header by the identifier rule only when it is exactly that header). A caller
   tag that carries a probe is dropped whole, from the tags and the body's Tags
@@ -171,7 +173,9 @@ Easy-to-forget mechanisms:
   match on an ordinary tag costs that tag, never the capture. Stated limits: a
   secret that reads as a plain word (all letters, or under four characters) is
   matched only as the whole value, and so is a fragment that is all digits or
-  shaped like a host name (dotted labels ending in letters). The value and the description (`detail`)
+  shaped like a host name (dotted labels ending in letters). A credential's memory class becomes an
+  indexed tag, so it must be None or a known class (`classification.CLASS_WEIGHTS`).
+  The value and the description (`detail`)
   go to one insert-only `reference_secrets` row under a fresh random id, and ONE statement
   then writes the unit naming it in `knowledge_units.secret_ref`, so a body and
   the secret it names are always one writer's pair on a connection that

@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from genesis.db.crud import knowledge as knowledge_crud
+from genesis.memory.classification import CLASS_WEIGHTS
 from genesis.security.sanitizer import ContentSanitizer, ContentSource
 
 if TYPE_CHECKING:
@@ -205,20 +206,39 @@ async def _ingest_once(
                     known_secret, {"body header": header}, login_exempt=True,
                 )
                 body_text = rest
-            reference_ops.refuse_value_in_fields(known_secret, {
+            # EVERY other caller field that can reach a store, whatever its
+            # type, is checked, each as text (``field_text``) and leaf by leaf,
+            # so a nested or non-string value hides nothing. The kwargs left out
+            # are no caller surface for a credential: project and domain are
+            # canonical here, origin_class is checked against its enum, and
+            # collection, memory_type and confidence come only from internal
+            # callers (the knowledge_ingest and reference_store tools expose
+            # none of them).
+            fields: dict[str, str | None] = {
                 "body": body_text,
                 "tags": tags_json,
                 # The tags as they read once decoded: JSON escapes a non-ASCII
                 # tag, which would hide a fullwidth spelling of the value.
                 "tags (decoded)": _tags_text(tags_json),
-                "authority": authority,
-                "purpose": json.dumps(purpose) if purpose else None,
-                "ingestion source": ingestion_source,
-                **{
-                    f"provenance {key}": val
-                    for key, val in (provenance or {}).items() if isinstance(val, str)
-                },
-            })
+            }
+            for name, val in (
+                ("authority", authority),
+                ("provenance", provenance),
+                ("memory class", memory_class),
+                ("purpose", purpose),
+                ("ingestion source", ingestion_source),
+            ):
+                fields[name] = field_text(val)
+                for i, leaf in enumerate(_leaves(val)):
+                    fields[f"{name} [{i}]"] = leaf
+            reference_ops.refuse_value_in_fields(known_secret, fields)
+        if memory_class is not None and memory_class not in CLASS_WEIGHTS:
+            # A credential's memory class becomes a tag the store indexes
+            # ("class:..."): only a known class name, never free text.
+            raise ValueError(
+                "refusing a credential reference whose memory class is not a known "
+                f"class (one of {sorted(CLASS_WEIGHTS)}) (#2426)"
+            )
 
     resolved_concept = concept if concept is not None else content[:200]
     # A credential write that upsert would refuse (no value to hold, or no
@@ -287,8 +307,10 @@ async def _ingest_once(
         source_pipeline=source_pipeline_val,
         collection=collection,
     )
+    # memory_type is passed by name at each call below, not in this dict: the
+    # store-subsystem coverage test finds memory writers by their keywords
+    # (tests/test_memory/test_store_subsystem_coverage.py).
     store_kwargs = dict(
-        memory_type=memory_type,
         collection=collection,
         tags=[domain, project, authority],
         confidence=confidence,
@@ -313,16 +335,17 @@ async def _ingest_once(
         # dedup=False: the id always names a memory this call created (the
         # store's contract), so ``created`` is known without asking.
         qdrant_memory_id = await store.store(
-            content, f"knowledge:{project}/{domain}", dedup=False, **store_kwargs,
+            content, f"knowledge:{project}/{domain}", memory_type=memory_type, dedup=False,
+            **store_kwargs,
         )
         created = True
     elif insert_only:
         qdrant_memory_id, created = await store.store_reporting_creation(
-            content, f"knowledge:{project}/{domain}", **store_kwargs,
+            content, f"knowledge:{project}/{domain}", memory_type=memory_type, **store_kwargs,
         )
     else:
         qdrant_memory_id = await store.store(
-            content, f"knowledge:{project}/{domain}", **store_kwargs,
+            content, f"knowledge:{project}/{domain}", memory_type=memory_type, **store_kwargs,
         )
 
     embedding_model = getattr(store._embeddings, "model_name", "qwen3-embedding:0.6b-fp16")
@@ -412,6 +435,34 @@ async def _ingest_once(
         project, domain,
     )
     return actual_id
+
+
+def field_text(value: object) -> str | None:
+    """A caller field as the credential check reads it: a str as is, None
+    skipped, anything else as JSON (non-ASCII kept as written, so a fullwidth
+    spelling is not hidden behind an escape)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _leaves(value: object):
+    """Every string (and other scalar) inside a nested dict or list, keys
+    included: JSON escapes a quote or a backslash, so each leaf is checked as
+    written too."""
+    if isinstance(value, dict):
+        for key, val in value.items():
+            yield from _leaves(key)
+            yield from _leaves(val)
+    elif isinstance(value, (list, tuple, set)):
+        for val in value:
+            yield from _leaves(val)
+    elif value is not None and not isinstance(value, str):
+        yield str(value)
+    elif isinstance(value, str):
+        yield value
 
 
 def _tags_text(tags_json: str | None) -> str | None:
