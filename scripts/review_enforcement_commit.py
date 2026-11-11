@@ -1173,6 +1173,15 @@ def _owed_message(state: dict, budget: dict, rr) -> str:
     if premise:
         needs.append("a Premise-evidence: line citing an independent premise check")
     predict, judge = rr.past_terminal(round_n, gate_lane)
+    try:
+        records = rr._round_records(budget) or {}
+        bound = any(
+            r.number == round_n and rr._bound(r, rr.PAST_TERMINAL_CUTOVER_ISO)
+            for r in records.values()
+        )
+    except Exception:  # noqa: BLE001 - the hint is text only
+        bound = False
+    predict, judge = predict and bound, judge and bound
     if predict:
         needs.append(
             "if it fixes now: 'Prediction: merges at round <next> because <why>' and "
@@ -1250,7 +1259,9 @@ def _reflection_rule(
         return "continue", None
     if not owed:
         ended = _loop_ended(budget, rr)
-        if ended and not (len(commit_segs) == 1 and _concludes_merge_of_main(cwd, rr, segs)):
+        if ended and not (
+            len(commit_segs) == 1 and _concludes_merge_of_main(cwd, rr, segs, owed_deadline)
+        ):
             message = _ended_message(budget)
             if _reflection_gate_mode() == "advisory":
                 _ADVISORIES.append("reflection gate (advisory mode, NOT enforced): " + message)
@@ -1304,12 +1315,14 @@ def _loop_ended(budget: dict, rr) -> bool:
         return False
 
 
-def _concludes_merge_of_main(cwd: str | None, rr, segs: list) -> bool:
+def _concludes_merge_of_main(cwd: str | None, rr, segs: list, deadline: float | None = None) -> bool:
     """A commit concluding a merge of the default branch that carries nothing
     else: no staging in the same command, exactly one MERGE_HEAD, and the
     staged tree passes ``review_reflection._merge_is_no_fix`` (git's own merge
     result, or a difference only in the files that conflicted). The same
-    reading the review owe side uses, so a fix cannot ride in on the merge."""
+    reading the review owe side uses, so a fix cannot ride in on the merge.
+    Every git call runs under ``deadline``; running out refuses the exemption,
+    so the deny stands rather than the hook overrunning (which fails open)."""
     if _commit_may_add_content(segs):
         return False
     d = cwd or "."
@@ -1325,10 +1338,13 @@ def _concludes_merge_of_main(cwd: str | None, rr, segs: list) -> bool:
         heads = merge_file.read_text().split()
         if len(heads) != 1:
             return False  # none, or an octopus merge
-        tree_code, tree, _ = rr._run(["git", "-C", d, "write-tree"])
-        if tree_code != 0:
-            return False
-        return rr._merge_is_no_fix(d, tree.strip(), [head, heads[0]], rr._mainline(d), {head})
+        with rr.deadline_scope(deadline):
+            tree_code, tree, _ = rr._run(["git", "-C", d, "write-tree"])
+            if tree_code != 0:
+                return False
+            return rr._merge_is_no_fix(
+                d, tree.strip(), [head, heads[0]], rr._mainline(d), {head}
+            )
     except Exception:  # noqa: BLE001 - not provably a merge of main
         return False
 

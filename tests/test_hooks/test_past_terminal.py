@@ -541,3 +541,8 @@ def test_a_round_opened_after_the_reflection_is_not_its_newest():
     late6 = {**with_floor, r6.head: r6}
     assert rr.loop_ended(late6, gate_lane=False, now=_late(5), cutover=CUT) is False
     assert rr.loop_ended(late6, gate_lane=False, now=r6.opened_at + timedelta(hours=1), cutover=CUT) is True
+
+
+def test_confidence_is_a_percentage():
+    assert not _reflection(prediction=5, confidence=101).ok
+    assert _reflection(prediction=5, confidence=100).ok

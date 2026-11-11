@@ -150,7 +150,9 @@ FIELDS: dict[str, tuple[re.Pattern[str], int, int | None]] = {
     "Prediction": (
         re.compile(rf"^Prediction: merges at round ([1-9][0-9]?) because ({_TEXT})$"), 0, 1
     ),
-    "Confidence": (re.compile(rf"^Confidence: ([0-9]{{1,3}})% falsified-by ({_TEXT})$"), 0, 1),
+    "Confidence": (
+        re.compile(rf"^Confidence: ([0-9]{{1,2}}|100)% falsified-by ({_TEXT})$"), 0, 1
+    ),
     "Prediction-held": (re.compile(rf"^Prediction-held: (yes|no) ({_TEXT})$"), 0, 1),
     "Escalate": (re.compile(r"^Escalate: (yes|no)$"), 1, 1),
 }

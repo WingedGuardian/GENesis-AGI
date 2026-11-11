@@ -162,9 +162,10 @@ def round_records(budget: Mapping[str, Any]) -> dict[str, rr.RoundRecord] | None
     """Every round, keyed by head: its number and opening time
     (``round_context``) and its findings with their floor flags, late joiners
     included (``findings[].round_head``). None when the budget carries no
-    opening times, or when any round's place is undetermined (two untimed
-    legacy rounds, a tie): the round count and which round is newest are then
-    unknown, so the past-round-4 rules stay off for the PR (fails open)."""
+    opening times, or when any round's place is undetermined (an untimed
+    legacy round, a tie): the round count and which round is newest are then
+    unknown, so the past-round-4 rules stay off for the PR (fails open). Such
+    PRs predate the round rule's cutover by construction."""
     times = _round_times(budget)
     if times is None:
         return None
