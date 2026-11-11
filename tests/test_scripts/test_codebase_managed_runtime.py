@@ -270,6 +270,36 @@ def test_native_status_can_use_remaining_startup_deadline(runtime, tmp_path, mon
     runtime.ready(dict(binary=str(binary), main=str(tmp_path), cache=str(tmp_path), runtime=str(tmp_path)))
 
 
+def test_readiness_uses_frozen_native_values_without_replacing_control_environment(runtime, tmp_path, monkeypatch):
+    binary = tmp_path / "binary"
+    binary.write_bytes(b"fixture")
+    namespace = runtime.ready.__globals__
+    monkeypatch.setitem(namespace, "require_enabled", Mock())
+    monkeypatch.setitem(namespace, "check_backend", lambda *a, **kw: "123")
+    monkeypatch.setitem(namespace, "verified_binary", lambda *a: binary.open("rb"))
+    monkeypatch.setattr(namespace["time"], "monotonic", lambda: 0)
+    monkeypatch.setenv("SYNTHETIC_SELECTED_VALUE", "later-control-value")
+    monkeypatch.setenv("SYNTHETIC_UNSELECTED_VALUE", "control-only-value")
+    selected = dict(PATH="/frozen/bin", SYNTHETIC_SELECTED_VALUE="selected-native-value",
+                    INVOCATION_ID="1" * 32)
+    observed = []
+
+    def rpc(argv, **kwargs):
+        keys = ("PATH", "SYNTHETIC_SELECTED_VALUE", "INVOCATION_ID", "CBM_CACHE_DIR",
+                "CBM_RUNTIME_DIR", "CBM_ALLOWED_ROOT", "SYNTHETIC_UNSELECTED_VALUE")
+        observed.append({key: kwargs["env"].get(key) for key in keys})
+        return SimpleNamespace(returncode=0, stdout="daemon: active (permanent)\n  pid: 123\n")
+
+    monkeypatch.setattr(namespace["subprocess"], "run", rpc)
+    runtime.ready(dict(binary=str(binary), main=str(tmp_path), cache=str(tmp_path), runtime=str(tmp_path)),
+                  environment=selected)
+    assert observed == [{**selected, "CBM_CACHE_DIR": str(tmp_path), "CBM_RUNTIME_DIR": str(tmp_path),
+                         "CBM_ALLOWED_ROOT": str(tmp_path), "SYNTHETIC_UNSELECTED_VALUE": None}]
+    assert namespace["os"].environ["SYNTHETIC_SELECTED_VALUE"] == "later-control-value"
+    assert selected == dict(PATH="/frozen/bin", SYNTHETIC_SELECTED_VALUE="selected-native-value",
+                            INVOCATION_ID="1" * 32)
+
+
 def test_readiness_does_not_start_rpc_after_deadline(runtime, tmp_path, monkeypatch):
     binary = tmp_path / "binary"
     binary.write_bytes(b"fixture")

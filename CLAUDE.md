@@ -443,8 +443,9 @@ recall taxonomy, health debugging escalation).
 ## Reference Capture
 
 Credentials, URLs, IPs, and identifiers shared in conversation are
-auto-stored via `reference_store`. Retrieve with `reference_lookup` or
-`knowledge_recall(domain='reference.*')`. Human view: the dashboard
+auto-stored via `reference_store`. Retrieve with `reference_lookup`: a
+credential reference's value is held out of that reference's own search
+entries, which show a placeholder for it. Human view: the dashboard
 **References** tab (browse/search/reveal/delete, live against the store).
 
 **Real-time capture is your responsibility.** When you create an account,
@@ -895,7 +896,9 @@ gate works, its exemption categories, and the unit rules for size bounds:
   courtesy, not an approval gate). Background/dispatched: never post; record it
   per your profile and state it in your returned output so the foreground files
   it (`.claude/docs/mcp-tools-guide.md`, "Dispatched / background sessions").
-  The privacy scrub and security-defect limit in "Where deferred work goes" apply.
+  The privacy scrub and the disclosure-harm limit in "Where deferred work
+  goes" (keep an item private only when its useful description necessarily
+  reveals protected information or enables exploitation) apply.
 - **Data repair is not a fix.** If a mechanism failed to write or propagate
   something, hand-writing the missing artifact (memory, directive, row, flag)
   repairs ONE instance on ONE install. Label it "data repair", and fix the

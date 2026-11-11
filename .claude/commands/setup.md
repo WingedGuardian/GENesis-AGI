@@ -66,6 +66,11 @@ python scripts/setup_claude_config.py          # .mcp.json only
 python scripts/setup_claude_config.py --global  # also update ~/.claude/settings.json
 ```
 
+The `--global` configurator applies its existing manifest settings. Transcript
+retention uses the shared shell writer during container install/bootstrap/update
+and the daily settings timer, or during host setup; host version alignment does
+not reapply retention. See `docs/reference/cc-compatibility.md` for that policy.
+
 For a full install/config + service re-render (this also finishes an interrupted
 install), run `./scripts/bootstrap.sh`. It refuses to run while genesis-server is
 live — a safety guard, because its crash-recovery path can `git reset --hard` the

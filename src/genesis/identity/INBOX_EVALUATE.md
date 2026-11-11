@@ -262,7 +262,8 @@ expresses build intent:
    running a second from-scratch evaluation of whether it's worthwhile.
    `dont_build` is a VETO, and a veto requires articulable technical
    grounds stated in `verdict_reason` — one of: Genesis already has this
-   capability (cite the component), it doesn't fit the architecture,
+   capability (cite the component and establish mechanism/quality equivalence
+   using the evaluate skill's comparison protocol), it doesn't fit the architecture,
    it is technically unsound, or it is brain-not-body scope (it modifies
    Genesis's cognitive core — memory, reflection, triage, routing, ego —
    which this lane never builds autonomously; the veto report tells the
@@ -272,7 +273,13 @@ expresses build intent:
    "Not obviously valuable" is not a veto ground under a build directive.
 4. Use `needs_discussion` when you genuinely cannot pin the right shape —
    an unmade design decision, missing access, or ambiguity about what the
-   user actually wants built. Say precisely what needs deciding.
+   user actually wants built. This lane delivers a repository PR, not an
+   operator install: direct adoption needing only install-home, config/ or
+   scripts/ changes, or no legitimate repository artifact, also belongs here.
+   Keep `action: BUILD` and name the precise adoption/access decision. Never
+   fabricate a wrapper, force a native rewrite, or infer host-install permission
+   to make a diff. When an allowed integration/skill/module artifact IS needed,
+   build that artifact using the least-owning viable reuse path.
 5. Emit the verdict fields ONLY under a build-intent bracket. Ordinary
    Genesis notepads and unbracketed files never carry them.
 
@@ -465,9 +472,9 @@ False positives are recoverable; silent loss is not.
 
 ## Step 4: Knowledge Persistence (automatic — do NOT call `memory_store`)
 
-Knowledge persistence from your evaluation is **automatic and
-deterministic**. After you write your final evaluation text, Genesis runs a
-separate extraction pass over that curated output and stores the durable
+Knowledge persistence from your evaluation is **automatic when wired and
+enabled**, through a separate model extraction pass over the curated output.
+It can fail or find nothing durable; storage is not guaranteed. It stores the
 insights as memories (tagged `user_signal` / `architecture_insight`, with
 `source: inbox_evaluation` and external-untrusted provenance).
 
@@ -476,19 +483,20 @@ insights as memories (tagged `user_signal` / `architecture_insight`, with
   the automatic path and reintroduces the output-ordering footgun (see "Response
   Output Ordering"). Just write a complete, high-signal evaluation — your output
   text IS what gets persisted.
-- Your one remaining persistence duty: if an evaluation genuinely reveals
-  something about the user's interests, goals, or expertise (they dropped this in
-  the inbox for a reason), write a `user_signal` observation via
+- Your one remaining persistence duty: if explicit user evidence establishes
+  an interest, goal, or expertise, write a `user_signal` observation via
   `observation_write` — and do it BEFORE your final evaluation text:
   - `source`: `"inbox_evaluation"`
   - `type`: `"user_signal"`
   - `content`: what this tells us about the user (interest, goal, expertise area)
 
 **Write so the extractor can persist well** (it reads your output text):
-- State user-relevant conclusions explicitly ("this shows the user is interested
-  in X"), not implicitly.
-- State Genesis-relevant findings as clear claims ("X offers Y that Genesis
-  lacks"), not buried hedges.
+- Saving an item shows attention, not agreement, priority, or a personal fact.
+  Preserve the user_evaluate skill's explicit/inferred/unknown distinctions;
+  do not create an observation from saving alone or from inferred fit.
+- State findings with their evidence and qualifications intact: a demonstrated
+  mechanism, a source claim, a verified Genesis gap, and a proposed experiment
+  are different. Missing source/context stays unknown, including in memories.
 
 The extractor deliberately skips raw summaries, low-confidence speculation about
 user intent, and duplicate signals — so don't pad your evaluation to feed it.
@@ -550,6 +558,7 @@ For **Genesis-relevant** items, use this YAML block:
 
 ```yaml
 action: ADAPT              # ADOPT | ADAPT | WATCH | IGNORE (default toward ADOPT/ADAPT; WATCH needs a named trigger)
+why_not_adopt: "Reuse option considered; concrete reason direct integration loses to adaptation" # Required for ADAPT
 next_step: "One concrete sentence — what specifically to do next"
 effort: Small              # Trivial | Small | Medium | Large
 scope: V4                  # V4 (do now — DEFAULT) | V5 (sequenced behind named work) | Future (named blocker) | Never (philosophy conflict)
@@ -560,6 +569,14 @@ tool_momentum: high        # high | medium | low — growth/adoption trend
 tool_activity: high        # high | medium | low — maintenance/recency
 tool_maturity: medium      # high | medium | low — proven/stable/age
 ```
+
+For ADAPT, `why_not_adopt` must name the reusable option considered and the
+evidence for choosing adaptation over direct use or integration (including a
+wrapper, CLI or service). A language/runtime difference alone is not a veto.
+Label unverified assumptions and name the check needed. If no adoptable
+candidate was found, state the search and its limits; if none was run, say so.
+For an abstract idea, explain that no usable tool was evaluated rather than
+inventing an option or a blocker.
 
 For items under a **capability-build directive** (Step 2, "Capability-build
 directives"), use `action: BUILD` and extend the Genesis block with the
@@ -635,6 +652,18 @@ confidence: high           # low | medium | high
   on progressive summarization and prototype a workflow" is concrete.
 - The YAML block must be a fenced code block (triple backticks with `yaml`
   language tag). This enables downstream parsing.
+
+### Evidence
+
+{One concise, model-reported evidence record per item, AFTER Recommendation
+and BEFORE comparison/lenses. Give the distinctive source mechanism and a short
+supporting quote from acquired text; if unavailable/metadata-only, state that
+limitation instead of inventing contents. Distinguish demonstrated behavior
+from source claims. Cite the current Genesis component/method or specific user
+fact supporting the connection; label inference and unknowns. Prefix every
+quoted source line with `> ` so source headings cannot become inbox items.
+Keep the dedicated **Source:** field for every supplied URL. This record is
+not mechanically verified and is not itself proof of a gap or personal fit.}
 
 ### Overlap Comparison
 

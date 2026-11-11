@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from fastmcp import FastMCP
 
+from genesis.caller_context import caller_context
 from genesis.db.crud import (
     knowledge as knowledge_crud,
 )
@@ -163,7 +164,14 @@ def _require_init() -> None:
     if _store is None or _retriever is None or _db is None:
         raise RuntimeError("memory-mcp not initialized — call init() first")
 
-    if _process_pending_bookmarks and _PLAN_BOOKMARK_PENDING.exists():
+    # A labelled client (owner-mode Codex) never writes the pending marker, so
+    # its calls must not consume a Claude session's: the same protection the
+    # external profile gets through process_pending_bookmarks=False (#3068).
+    if (
+        _process_pending_bookmarks
+        and not caller_context().profile
+        and _PLAN_BOOKMARK_PENDING.exists()
+    ):
         from genesis.db.request_database import DatabaseScopeError, spawn_database_task
 
         # The marker is consumed only by an accepted job; retry next call.

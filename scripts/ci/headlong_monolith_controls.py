@@ -1,6 +1,8 @@
 """Pinned monolith with an explicit native inner invocation; contained CI only."""
 
 import asyncio
+import contextlib
+import contextvars
 import hashlib
 import importlib.metadata
 import json
@@ -12,6 +14,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import aiosqlite
+import ego_owned_processes as processes
 import headlong_native_controls as native
 from ego_runtime_cases import CONFLICTS, FAULTS, SCENARIOS, TWO_WAKES, kind_for, manifest
 from headlong_controls import dependency_inventory, environment, preflight, read_jsonl, tree_hash
@@ -23,6 +26,48 @@ CROSSING = "aaaaaaaa-1234-4567-8912-bbbbbbbb4111"
 MARKERS = ("fixture-identity-marker", "fixture-goal-marker", "fixture-skill-marker", "fixture-memory-marker", "fixture-stream-marker")
 MENTION_CONTENT = "fixture-mention-content-should-not-expand"
 RECEIPT = "fixture receipt proposal=proposal effect=" + hashlib.sha256(native.EFFECT).hexdigest()
+_COMMAND_RECORDS = contextvars.ContextVar("headlong_command_records", default=None)
+
+
+@contextlib.contextmanager
+def command_records():
+    """Collect command closure in this task without changing shared callers."""
+    records = []
+    token = _COMMAND_RECORDS.set(records)
+    try:
+        yield records
+    finally:
+        _COMMAND_RECORDS.reset(token)
+
+
+def closed_commands(records):
+    fields = {"argv", "pgid", "returncode", "timed_out", "group_closed", "probe_error"}
+    return bool(records) and all(
+        isinstance(row, dict) and set(row) == fields
+        and isinstance(row["argv"], list) and bool(row["argv"])
+        and all(isinstance(arg, str) and bool(arg) for arg in row["argv"])
+        and type(row.get("pgid")) is int and row["pgid"] > 1
+        and type(row.get("returncode")) is int and row.get("timed_out") is False
+        and row.get("group_closed") is True and row.get("probe_error") is None
+        for row in records)
+
+
+def record_command(process, argv, result):
+    records = _COMMAND_RECORDS.get()
+    if records is None:
+        return
+    record = {"argv": list(argv), "pgid": process.pid, "returncode": result["returncode"],
+              "timed_out": result["timed_out"], "group_closed": False, "probe_error": None}
+    try:
+        record["group_closed"] = not processes.group_alive(process.pid)
+        if not record["group_closed"]:
+            # The fresh Popen created this session/group. A later successful
+            # cleanup never changes the recorded failure into a clean command.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+    except OSError as exc:
+        record["probe_error"] = type(exc).__name__
+    records.append(record)
 
 
 def patched_source(source, patch):
@@ -170,13 +215,25 @@ def json_artifact(path, errors):
 def command(argv, env, root, data=None, timeout=100):
     with subprocess.Popen(argv, env=env, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, text=True, start_new_session=True) as process:
+        timed_out = False
         try:
             stdout, stderr = process.communicate(data, timeout=timeout)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            stdout, stderr = process.communicate()
-            return {"returncode": -9, "stdout": stdout, "stderr": stderr, "timed_out": True}
-    return {"returncode": process.returncode, "stdout": stdout, "stderr": stderr, "timed_out": False}
+            timed_out = True
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                # A writer outside the outer group can keep a pipe open. Retain
+                # diagnostics and refuse qualification instead of hanging here.
+                stdout, stderr = exc.output or b"", exc.stderr or b""
+                stdout = stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout
+                stderr = stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr
+        result = {"returncode": -9 if timed_out else process.returncode,
+                  "stdout": stdout, "stderr": stderr, "timed_out": timed_out}
+        record_command(process, argv, result)
+    return result
 
 
 def append(record, env, root):
@@ -187,6 +244,14 @@ def append(record, env, root):
 
 
 async def run_scenario(root, name):
+    with command_records() as commands:
+        result = await _run_scenario(root, name)
+    result.update(commands=commands, cleanup_confirmed=closed_commands(commands))
+    result["control_passed"] = result["control_passed"] and result["cleanup_confirmed"]
+    return result
+
+
+async def _run_scenario(root, name):
     from headlong_prompt_references import canonical_id, publish_config
 
     root.mkdir()
@@ -287,6 +352,14 @@ async def run_scenario(root, name):
 
 
 def correlation_controls(root):
+    with command_records() as commands:
+        result = _correlation_controls(root)
+    result.update(commands=commands, cleanup_confirmed=closed_commands(commands))
+    result["passed"] = result["passed"] and result["cleanup_confirmed"]
+    return result
+
+
+def _correlation_controls(root):
     """Actual readers on disposable records; no responder model or delivery process."""
     root.mkdir()
     env = environment(root)
@@ -322,9 +395,17 @@ async def main():
     import claude_agent_sdk
     from headlong_reference_patch import adapt_common
 
+    init = processes.init_identity(controller="/fixture/headlong_monolith_controls.py")
+    before = processes.census()
+    if set(before) != {1, os.getpid()}:
+        raise processes.OwnershipError("unexpected process in fresh B container")
     cli = Path(claude_agent_sdk.__file__).parent / "_bundled/claude"
+    with command_records() as version_commands:
+        version = command([str(cli), "--version"], os.environ.copy(), Path("/work"), timeout=10)
+    if version["returncode"] or version["timed_out"]:
+        raise ValueError("native version command failed")
     binary = {"sha256": hashlib.sha256(cli.read_bytes()).hexdigest(),
-              "version": subprocess.check_output([str(cli), "--version"], text=True, timeout=10).strip()}
+              "version": version["stdout"].strip()}
     patch = json.loads(Path("/fixture/headlong_bridge_patch.json").read_text())
     if set(patch) != {"before", "after", "prompt_before", "prompt_after"}:
         raise ValueError("incomplete bridge adaptation specification")
@@ -339,10 +420,20 @@ async def main():
         cases = [await run_scenario(Path(directory) / name, name) for name in SCENARIOS + FAULTS + CONFLICTS]
         joins = correlation_controls(Path(directory) / "correlations")
     unchanged = sources == {name: tree_hash(Path(path)) for name, path in {"headlong": "/headlong", "derived": "/headlong-b", "fixtures": "/fixture", "genesis": "/genesis-src"}.items()}
-    passed = unchanged and joins["passed"] and all(case["control_passed"] for case in cases)
+    after = processes.census()
+    survivors = sorted(set(after) - set(before))
+    logs = [version_commands, *[case["commands"] for case in cases], joins["commands"]]
+    cleanup = {"init": init, "before": {str(pid): row for pid, row in before.items()},
+               "after": {str(pid): row for pid, row in after.items()}, "survivors": survivors}
+    stable = set(before) == set(after) and all(
+        before[pid][field] == after[pid][field]
+        for pid in before for field in ("pid", "ppid", "pgid", "sid", "start"))
+    clean = stable and all(closed_commands(commands) for commands in logs)
+    passed = unchanged and clean and joins["passed"] and all(case["control_passed"] for case in cases)
     print(json.dumps({"schema": "headlong-native-monolith/v1", "status": "pass" if passed else "incomplete", "cases": cases,
                       "comparison_manifest": manifest(),
-                      "sources": sources, "sources_unchanged": unchanged, "cleanup_confirmed": True, "correlations": joins,
+                      "sources": sources, "sources_unchanged": unchanged, "cleanup_confirmed": clean,
+                      "cleanup": cleanup, "version_commands": version_commands, "correlations": joins,
                       "sdk": importlib.metadata.version("claude-agent-sdk"), "dependencies": dependency_inventory(),
                       "native_binary": binary,
                       "patch_sha256": hashlib.sha256(Path("/fixture/headlong_bridge_patch.json").read_bytes()).hexdigest(),

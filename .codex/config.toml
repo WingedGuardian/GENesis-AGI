@@ -19,40 +19,139 @@ matcher = "^Bash$"
 type = "command"
 command = 'top=$(git rev-parse --show-toplevel 2>/dev/null) || top=""; guard="$top/scripts/hooks/codex-review-stop"; [ -n "$top" ] && [ -f "$guard" ] || { printf "%s\n" "BLOCKED: review guard unavailable; stop and handoff to the user." >&2; exit 2; }; rc=0; out=$(bash "$guard" 3>&1 1>/dev/null) || rc=$?; [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 2 ] && [ "$out" = "deny" ] && exit 2; printf "%s\n" "BLOCKED: review guard failed (exit $rc); stop and handoff to the user." >&2; exit 2'
 
+# Advisory holdout fence (scripts/hooks/holdout_fence.py): logs and notes any
+# shell access to the install's hidden holdout scenarios. It never blocks, so
+# any failure to find or run it simply exits 0; its stdout is advisory JSON.
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '[ -d "${GENESIS_HOME:-$HOME/.genesis}/holdout" ] || exit 0; top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; f="$top/scripts/hooks/holdout_fence.py"; [ -f "$f" ] || exit 0; python3 "$f" pre || true'
+timeout = 10
+
+[[hooks.PostToolUse]]
+matcher = "^Bash$"
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = '[ -d "${GENESIS_HOME:-$HOME/.genesis}/holdout" ] || exit 0; top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; f="$top/scripts/hooks/holdout_fence.py"; [ -f "$f" ] || exit 0; python3 "$f" post || true'
+timeout = 10
+
+# Genesis MCP servers for Codex. Owner ruling (2026-11-08): an owner-operated
+# Codex session gets the same Genesis tools a Claude Code session gets. The
+# launcher (scripts/codex_owner_mcp.py) starts the ordinary server, labelled
+# `codex` so calls are recorded in client_tool_calls. A Codex run Genesis starts
+# unattended (genesis.util.codex_cli sets GENESIS_CC_SESSION=1) keeps the
+# external 13-tool health/memory floor and gets no outreach or recon server;
+# `env_vars` forwards that marker, since Codex passes an MCP child nothing else.
+#
+# Approvals (owner ruling 2026-11-08): reads run without a prompt; anything that
+# writes, sends, spends or spawns asks first. The server default is `prompt` and
+# only the read tools listed below are pre-approved, so a NEW tool asks until it
+# is classified here. tests/test_scripts/test_codex_owner_mcp.py checks every
+# listed name is a registered tool. "Spends" means a spend the CALLER can
+# request: recall's internal corrective grading is not one, so recall tools are
+# pre-approved, while web_search/web_fetch (a paid backend is one argument
+# away; approval is per tool, not per argument) and resume_review (paid model
+# calls on any local file) prompt. health_errors/health_alerts are blind to
+# dead letters and breakers in the standalone server, for Claude Code too (#3152).
+#
+# The prompt tier holds only under an approval policy that can ask. Measured on
+# codex-cli 0.166.0: under --dangerously-bypass-approvals-and-sandbox a prompt
+# tool runs without asking, and under approval_policy="never" it is refused.
+
 [mcp_servers.genesis-health]
 command = "python3"
-args = ["scripts/codex_external_mcp.py", "--server", "health"]
+args = ["scripts/codex_owner_mcp.py", "--server", "health"]
 cwd = "."
 startup_timeout_sec = 30
-enabled_tools = [
-  "health_status",
-  "bootstrap_manifest",
-  "subsystem_heartbeats",
-  "job_health",
-  "provider_activity",
-]
-# NOT here: `health_errors` and `health_alerts`. Both are real tools, but in the
-# STANDALONE server this config starts they cannot honour the schemas they
-# advertise. `StandaloneHealthDataService` leaves `_dead_letter`, `_breakers`
-# and `_routing_config` as None, so `health_errors` skips both its pending
-# dead-letter query and its open-circuit-breaker loop; and its reconstructed
-# call-site states are only active/idle/stale/unknown, so `health_alerts` can
-# never reach the down/degraded branches that report a provider outage.
-#
-# A tool that silently omits the failures it promises to report is worse than an
-# absent one: absence is visible, and a clean answer from a blind tool is read
-# as "no failures". The floor for this surface is that a tool means what its
-# schema says. Restoring them means wiring those three sources into the
-# standalone service, not re-adding these lines.
-# NOT here: `infrastructure_profile`. An allowlist grants the TOOL, not its
-# ARGUMENTS, and `refresh=true` persists profile files, emits DB drift
-# observations and renders shared documents — so admitting it would put the one
-# write in an otherwise entirely read-only surface, and the tool's own
-# empty-state hint ("pass refresh=true") actively invites that call. The value
-# here is that this list is auditable by inspection. Restoring machine-facts
-# visibility means splitting the tool into a read-only view plus a separate
-# refresh, not re-adding this line.
-default_tools_approval_mode = "approve"
+env_vars = ["GENESIS_CC_SESSION", "GENESIS_SESSION_ORIGIN"]
+default_tools_approval_mode = "prompt"
+tools.bench_status.approval_mode = "approve"
+tools.board_item.approval_mode = "approve"
+tools.board_status.approval_mode = "approve"
+tools.bootstrap_manifest.approval_mode = "approve"
+tools.browser_sessions.approval_mode = "approve"
+tools.browser_snapshot.approval_mode = "approve"
+tools.build_lane_status.approval_mode = "approve"
+tools.calibration_status.approval_mode = "approve"
+tools.campaign_list.approval_mode = "approve"
+tools.campaign_status.approval_mode = "approve"
+tools.codebase_navigate.approval_mode = "approve"
+tools.cognitive_modification_status.approval_mode = "approve"
+tools.db_schema.approval_mode = "approve"
+tools.direct_session_list.approval_mode = "approve"
+tools.direct_session_status.approval_mode = "approve"
+tools.ego_calibration_status.approval_mode = "approve"
+tools.ego_goal_list.approval_mode = "approve"
+tools.experiment_status.approval_mode = "approve"
+tools.follow_up_list.approval_mode = "approve"
+tools.health_alerts.approval_mode = "approve"
+tools.health_errors.approval_mode = "approve"
+tools.health_status.approval_mode = "approve"
+tools.immunity_status.approval_mode = "approve"
+tools.inbox_digest.approval_mode = "approve"
+tools.job_health.approval_mode = "approve"
+tools.loop_closure_status.approval_mode = "approve"
+tools.module_list.approval_mode = "approve"
+tools.open_question_list.approval_mode = "approve"
+tools.provider_activity.approval_mode = "approve"
+tools.reflex_status.approval_mode = "approve"
+tools.session_address.approval_mode = "approve"
+tools.session_charter.approval_mode = "approve"
+tools.settings_get.approval_mode = "approve"
+tools.settings_list.approval_mode = "approve"
+tools.skill_usage_status.approval_mode = "approve"
+tools.subsystem_heartbeats.approval_mode = "approve"
+tools.task_detail.approval_mode = "approve"
+tools.task_list.approval_mode = "approve"
+tools.update_history_recent.approval_mode = "approve"
+tools.zero_drop_status.approval_mode = "approve"
+
+[mcp_servers.genesis-memory]
+command = "python3"
+args = ["scripts/codex_owner_mcp.py", "--server", "memory"]
+cwd = "."
+startup_timeout_sec = 30
+env_vars = ["GENESIS_CC_SESSION", "GENESIS_SESSION_ORIGIN"]
+default_tools_approval_mode = "prompt"
+tools.conversation_history.approval_mode = "approve"
+tools.entity_adjudication_list.approval_mode = "approve"
+tools.knowledge_recall.approval_mode = "approve"
+tools.knowledge_status.approval_mode = "approve"
+tools.locate.approval_mode = "approve"
+tools.memory_core_facts.approval_mode = "approve"
+tools.memory_expand.approval_mode = "approve"
+tools.memory_proactive.approval_mode = "approve"
+tools.memory_recall.approval_mode = "approve"
+tools.memory_stats.approval_mode = "approve"
+tools.observation_query.approval_mode = "approve"
+tools.procedure_recall.approval_mode = "approve"
+tools.reference_export.approval_mode = "approve"
+tools.reference_lookup.approval_mode = "approve"
+
+[mcp_servers.genesis-outreach]
+command = "python3"
+args = ["scripts/codex_owner_mcp.py", "--server", "outreach"]
+cwd = "."
+startup_timeout_sec = 30
+env_vars = ["GENESIS_CC_SESSION", "GENESIS_SESSION_ORIGIN"]
+default_tools_approval_mode = "prompt"
+tools.marketing_prospects_list.approval_mode = "approve"
+tools.outreach_digest.approval_mode = "approve"
+tools.outreach_pending.approval_mode = "approve"
+tools.outreach_queue.approval_mode = "approve"
+
+[mcp_servers.genesis-recon]
+command = "python3"
+args = ["scripts/codex_owner_mcp.py", "--server", "recon"]
+cwd = "."
+startup_timeout_sec = 30
+env_vars = ["GENESIS_CC_SESSION", "GENESIS_SESSION_ORIGIN"]
+default_tools_approval_mode = "prompt"
+tools.recon_findings.approval_mode = "approve"
+tools.recon_github_read.approval_mode = "approve"
+tools.recon_github_search.approval_mode = "approve"
+tools.recon_run_github_discovery.approval_mode = "approve"
 
 # Shared pinned launcher; no install-specific paths or npm downloads at startup.
 # GitNexus is snapshot-based. Availability does not imply a fresh index or
@@ -78,22 +177,5 @@ enabled_tools = [
   "shape_check",
   "tool_map",
   "trace",
-]
-default_tools_approval_mode = "approve"
-
-[mcp_servers.genesis-memory]
-command = "python3"
-args = ["scripts/codex_external_mcp.py", "--server", "memory"]
-cwd = "."
-startup_timeout_sec = 30
-enabled_tools = [
-  "memory_recall",
-  "memory_expand",
-  "memory_core_facts",
-  "memory_stats",
-  "knowledge_recall",
-  "knowledge_status",
-  "procedure_recall",
-  "observation_query",
 ]
 default_tools_approval_mode = "approve"
