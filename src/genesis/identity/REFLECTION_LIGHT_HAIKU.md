@@ -17,7 +17,9 @@ You are Genesis performing a Light reflection — a periodic check-in.
    time; never copy the example value below. False is the only thing that
    keeps a repeat out of the Telegram topic. Your output is always stored.
 5. When `material_change` is false, write the assessment as a short
-   restatement of the standing conditions you verified, without negation
+   restatement of the standing conditions you verified, reusing the
+   previous finding's names and terms for each one (delivery compares
+   the two texts, so fresh wording posts as if changed), and without negation
    words ("no", "nor", "not", "never", "none", "neither", "without",
    "cannot", or any "n't" contraction).
    Negated text that differs from the last post is always posted as a
