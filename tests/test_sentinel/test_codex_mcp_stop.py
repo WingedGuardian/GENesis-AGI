@@ -438,6 +438,124 @@ def test_unreadable_candidates_with_nothing_stopped_is_not_done(fake_proc, monke
     assert "could not be read" in capsys.readouterr().out
 
 
+def _stops_everything(groups, **_k):
+    return list(groups), []
+
+
+def test_unreadable_candidate_beside_a_stopped_group_is_partial(fake_proc, monkeypatch, capsys):
+    """Readable groups stopping cleanly does not make the run done while another
+    candidate was never classified (fixture pid 107: stdio unreadable)."""
+    monkeypatch.setattr(mod, "load_mode", lambda: mod.MODE_PROPOSE_ONLY)
+    monkeypatch.setattr(mod, "stop", _stops_everything)
+    assert mod.main(["--execute"]) == mod.EXIT_PARTIAL
+    assert "1 candidate(s) could not be read and were not stopped" in capsys.readouterr().out
+
+
+def test_every_candidate_readable_and_stopped_is_ok(fake_proc, monkeypatch):
+    # Control for the test above: the same run without the unreadable candidate.
+    import shutil
+
+    shutil.rmtree(fake_proc / "107")
+    monkeypatch.setattr(mod, "load_mode", lambda: mod.MODE_PROPOSE_ONLY)
+    monkeypatch.setattr(mod, "stop", _stops_everything)
+    assert mod.main(["--execute"]) == mod.EXIT_OK
+
+
+def test_unlistable_proc_is_never_done(tmp_path, monkeypatch, capsys):
+    """An unlistable /proc must not read as "no app-server, nothing to stop"."""
+    monkeypatch.setattr(proc_io, "_PROC", str(tmp_path / "absent"))
+    monkeypatch.setattr(mod, "load_mode", lambda: mod.MODE_PROPOSE_ONLY)
+    calls = []
+    monkeypatch.setattr(mod, "stop", lambda *a, **k: calls.append(a) or ([], []))
+    assert mod.main([]) == mod.EXIT_PARTIAL
+    assert mod.main(["--execute"]) == mod.EXIT_PARTIAL
+    assert calls == []
+    assert "could not be listed" in capsys.readouterr().out
+
+
+def test_unlistable_proc_during_the_stop_is_partial(fake_proc, monkeypatch, capsys):
+    def _raises(groups, **_k):
+        raise OSError("listing failed")
+
+    monkeypatch.setattr(mod, "load_mode", lambda: mod.MODE_PROPOSE_ONLY)
+    monkeypatch.setattr(mod, "stop", _raises)
+    assert mod.main(["--execute"]) == mod.EXIT_PARTIAL
+    assert "outcome unknown" in capsys.readouterr().out
+
+
+def test_group_alive_raises_when_proc_is_unlistable(tmp_path, monkeypatch):
+    # An empty listing would make every signalled group read as stopped.
+    monkeypatch.setattr(proc_io, "_PROC", str(tmp_path / "absent"))
+    with pytest.raises(OSError):
+        mod._group_alive(101)
+
+
+def test_scan_skips_an_app_server_whose_group_is_unreadable(fake_proc, monkeypatch):
+    real_pgid = mod._pgid
+    monkeypatch.setattr(mod, "_pgid", lambda pid: None if pid == APP else real_pgid(pid))
+    found = mod.scan()
+    assert found.groups == []
+    assert f"app-server {APP} (process group unreadable)" in found.skipped
+
+
+def test_scan_counts_an_unreadable_child_group_as_uncertain(fake_proc, monkeypatch):
+    real_pgid = mod._pgid
+    monkeypatch.setattr(mod, "_pgid", lambda pid: None if pid == 101 else real_pgid(pid))
+    found = mod.scan()
+    assert [g.pgid for g in found.groups] == []
+    assert any(s.startswith("101 ") and "process group unreadable" in s for s in found.uncertain)
+
+
+def test_a_process_named_unreadable_is_not_uncertain(fake_proc):
+    # The uncertain count is structured, not a substring of free-text reasons.
+    _write_proc(
+        fake_proc, 109, comm="unreadable", ppid=APP, pgid=109,
+        argv=["unreadable"], stdio=("/dev/pts/3", "/dev/pts/3"),
+    )
+    found = mod.scan()
+    assert any(s.startswith("109 unreadable") for s in found.skipped)
+    assert not any(s.startswith("109 ") for s in found.uncertain)
+
+
+def test_a_process_named_unreadable_does_not_make_the_run_partial(fake_proc, monkeypatch):
+    import shutil
+
+    shutil.rmtree(fake_proc / "107")  # the fixture's genuinely unreadable candidate
+    _write_proc(
+        fake_proc, 109, comm="unreadable", ppid=APP, pgid=109,
+        argv=["unreadable"], stdio=("/dev/pts/3", "/dev/pts/3"),
+    )
+    monkeypatch.setattr(mod, "load_mode", lambda: mod.MODE_PROPOSE_ONLY)
+    monkeypatch.setattr(mod, "stop", _stops_everything)
+    assert mod.main(["--execute"]) == mod.EXIT_OK
+
+
+def test_null_section_in_overlay_turns_the_tool_off(tmp_path, monkeypatch):
+    monkeypatch.delenv("GENESIS_CODEX_MCP_STOP_DISABLED", raising=False)
+    cfg = _cfg(tmp_path, "codex_mcp_stop:\n  mode: propose_only\n")
+    (tmp_path / "sentinel.local.yaml").write_text("codex_mcp_stop:\n  # mode: off\n")
+    assert mod.load_mode(cfg) == mod.MODE_OFF
+
+
+@pytest.mark.parametrize("overlay", ["codex_mcp_stop: [unclosed\n", "- a list\n"])
+def test_broken_owner_overlay_turns_the_tool_off(tmp_path, monkeypatch, overlay):
+    """A malformed overlay must not fall back to the shipped propose_only."""
+    monkeypatch.delenv("GENESIS_CODEX_MCP_STOP_DISABLED", raising=False)
+    cfg = _cfg(tmp_path, "codex_mcp_stop:\n  mode: propose_only\n")
+    (tmp_path / "sentinel.local.yaml").write_text(overlay)
+    assert mod.load_mode(cfg) == mod.MODE_OFF
+
+
+def test_valid_owner_overlay_is_read(tmp_path, monkeypatch):
+    # Control: the overlay above is the file the loader reads.
+    monkeypatch.delenv("GENESIS_CODEX_MCP_STOP_DISABLED", raising=False)
+    cfg = _cfg(tmp_path, "codex_mcp_stop:\n  mode: propose_only\n")
+    (tmp_path / "sentinel.local.yaml").write_text("codex_mcp_stop:\n  mode: off\n")
+    assert mod.load_mode(cfg) == mod.MODE_OFF
+    (tmp_path / "sentinel.local.yaml").write_text("other: 1\n")
+    assert mod.load_mode(cfg) == mod.MODE_PROPOSE_ONLY
+
+
 def test_scan_skips_unreadable_cgroup(fake_proc):
     (fake_proc / "101" / "cgroup").unlink()
     found = mod.scan()

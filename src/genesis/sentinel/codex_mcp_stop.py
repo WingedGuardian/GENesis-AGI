@@ -33,9 +33,11 @@ group gets SIGTERM, then SIGKILL if any member is left after the grace period
 lose those servers until they are reopened: Codex does not respawn a killed
 stdio server.
 
-Exit codes: 0 everything targeted is gone (or nothing to do), 3 partial or a
-signal was refused, 4 the lever is ``off`` (dry-run and ``--execute`` alike, so
-a session that only runs the dry-run sees it).
+Exit codes: 0 everything targeted is gone (or nothing to do), 3 partial: a
+signal was refused, a candidate could not be read, or ``/proc`` could not be
+listed, 4 the lever is ``off`` (dry-run and ``--execute`` alike, so a session
+that only runs the dry-run sees it). Nothing the tool cannot read ever counts
+as done.
 
 Lever: ``codex_mcp_stop.mode`` in ``config/sentinel.yaml`` (+ the
 ``sentinel.local.yaml`` overlay): ``propose_only`` (default) or ``off``. An
@@ -101,6 +103,13 @@ class Scan:
     app_servers: list[int] = field(default_factory=list)
     groups: list[Group] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)  # unreadable or excluded, with why
+    # Candidates that could not be classified: a structured list, never a
+    # substring of the free-text reasons (a process could be named "unreadable").
+    uncertain: list[str] = field(default_factory=list)
+
+    def unreadable(self, entry: str) -> None:
+        self.skipped.append(entry)
+        self.uncertain.append(entry)
 
 
 def load_mode(path: Path | None = None) -> str:
@@ -114,13 +123,19 @@ def load_mode(path: Path | None = None) -> str:
         from genesis._config_overlay import merge_local_overlay
 
         raw = yaml.safe_load(cfg_path.read_text()) if cfg_path.exists() else {}
-        raw = merge_local_overlay(raw or {}, cfg_path)
+        # strict: a broken owner overlay raises into the handler below (off),
+        # instead of falling back to the shipped propose_only.
+        raw = merge_local_overlay(raw or {}, cfg_path, strict=True)
     except Exception:
         logger.warning("Failed to load %s; codex_mcp_stop is off", cfg_path, exc_info=True)
         return MODE_OFF
-    section = raw.get("codex_mcp_stop") if isinstance(raw, dict) else None
-    if section is None:
+    if not isinstance(raw, dict):
+        return MODE_OFF
+    if "codex_mcp_stop" not in raw:
         return MODE_PROPOSE_ONLY  # shipped default when the key is absent
+    # Present but null (an overlay that left `codex_mcp_stop:` with its mode
+    # commented out) is a present section with no valid mode: off.
+    section = raw["codex_mcp_stop"]
     mode = section.get("mode") if isinstance(section, dict) else None
     return mode if mode in (MODE_PROPOSE_ONLY, MODE_OFF) else MODE_OFF
 
@@ -190,10 +205,10 @@ def _same_uid(pid: int) -> bool | None:
 
 
 def _all_pids() -> list[int]:
-    try:
-        return [int(p.name) for p in _proc().iterdir() if p.name.isdigit()]
-    except OSError:
-        return []
+    """Every pid in ``/proc``. Raises ``OSError`` when it cannot be listed: an
+    empty list would read as "no app-server" in the scan and as "every group
+    gone" after a stop."""
+    return [int(p.name) for p in _proc().iterdir() if p.name.isdigit()]
 
 
 def _is_daemon_app_server(argv: list[str]) -> bool:
@@ -237,13 +252,20 @@ def scan() -> Scan:
 
     for app in result.app_servers:
         app_pgid = _pgid(app)
+        if app_pgid is None:
+            # Without it the same-group exclusion below cannot be applied.
+            result.unreadable(f"app-server {app} (process group unreadable)")
+            continue
         for pid, (_comm, _state, ppid, _threads, starttime) in sorted(stats.items()):
             if ppid != app:
                 continue
             argv = _argv(pid) or []
             label = f"{pid} {_safe_label(argv)}"
             pg = _pgid(pid)
-            if pg is None or pg != pid:
+            if pg is None:
+                result.unreadable(f"{label} (process group unreadable)")
+                continue
+            if pg != pid:
                 result.skipped.append(f"{label} (not its own process group)")
                 continue
             if pg <= 1 or pg == app_pgid:
@@ -251,7 +273,7 @@ def scan() -> Scan:
                 continue
             owner = _same_uid(pid)
             if owner is None:
-                result.skipped.append(f"{label} (owner unreadable)")
+                result.unreadable(f"{label} (owner unreadable)")
                 continue
             if not owner:
                 result.skipped.append(f"{label} (another user's process)")
@@ -259,14 +281,14 @@ def scan() -> Scan:
             try:
                 exe = os.readlink(_proc() / str(pid) / "exe")
             except OSError:
-                result.skipped.append(f"{label} (executable unreadable)")
+                result.unreadable(f"{label} (executable unreadable)")
                 continue
             if os.path.realpath(exe.removesuffix(" (deleted)")).startswith(codex_homes) or exe.startswith(codex_homes):
                 result.skipped.append(f"{label} (Codex helper)")
                 continue
             stdin_pipe, stdout_pipe = _is_pipe(pid, 0), _is_pipe(pid, 1)
             if stdin_pipe is None or stdout_pipe is None:
-                result.skipped.append(f"{label} (stdio unreadable)")
+                result.unreadable(f"{label} (stdio unreadable)")
                 continue
             if not (stdin_pipe and stdout_pipe):
                 result.skipped.append(f"{label} (stdio is not pipes: not an MCP server)")
@@ -276,7 +298,7 @@ def scan() -> Scan:
                 continue
             unit = proc_io.systemd_unit(pid)
             if unit is None:
-                result.skipped.append(f"{label} (cgroup unreadable)")
+                result.unreadable(f"{label} (cgroup unreadable)")
                 continue
             if unit.endswith(".service"):
                 result.skipped.append(f"{label} (systemd unit {unit})")
@@ -391,7 +413,11 @@ def main(argv: list[str] | None = None) -> int:
         print("codex_mcp_stop: disabled (codex_mcp_stop.mode is off); nothing signalled")
         return EXIT_DISABLED
 
-    found = scan()
+    try:
+        found = scan()
+    except OSError as exc:
+        print(f"codex_mcp_stop: FAILED: /proc could not be listed ({exc}); nothing signalled")
+        return EXIT_PARTIAL
     total_mb = sum(g.rss_kb for g in found.groups) / 1024
     if not found.app_servers:
         print("codex_mcp_stop: no shared Codex app-server running; nothing to stop")
@@ -415,13 +441,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  skipped {s}")
         return EXIT_OK
 
-    uncertain = [s for s in found.skipped if "unreadable" in s]
+    uncertain = found.uncertain
     if not found.groups and uncertain:
         # Nothing stopped AND some candidates could not be classified: never
         # report this as done (the dispatch would read as resolved).
         print(f"  FAILED: {len(uncertain)} candidate(s) could not be read; nothing stopped")
         return EXIT_PARTIAL
-    stopped, failures = stop(found.groups)
+    try:
+        stopped, failures = stop(found.groups)
+    except OSError as exc:
+        # The liveness check could not list /proc: what was signalled is unknown.
+        print(f"  FAILED: /proc could not be listed during the stop ({exc}); outcome unknown")
+        return EXIT_PARTIAL
     freed_mb = sum(g.rss_kb for g in stopped) / 1024
     print(
         f"codex_mcp_stop: stopped {len(stopped)} of {len(found.groups)} group(s), "
@@ -431,7 +462,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     for f in failures:
         print(f"  FAILED {f}")
-    return EXIT_OK if not failures else EXIT_PARTIAL
+    if uncertain:
+        # Readable groups stopped, but these were never classified: they may
+        # still hold the memory, so the dispatch must not read as resolved.
+        print(f"  FAILED: {len(uncertain)} candidate(s) could not be read and were not stopped")
+    return EXIT_OK if not (failures or uncertain) else EXIT_PARTIAL
 
 
 if __name__ == "__main__":
