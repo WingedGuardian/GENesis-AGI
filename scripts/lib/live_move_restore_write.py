@@ -95,9 +95,9 @@ def _dirfd(fd: int, rel: str, make: bool = False, mode: int = 0o777) -> int:
 def _rmdir_tree(fd: int, name: str) -> None:
     """rmdir ``name`` below ``fd`` and every directory under it, deepest
     first, never following a link: a directory holding anything stays
-    (ENOTEMPTY), so only empty directories the restore made can go. Each
-    level is listed through a fresh descriptor (a long-held one reads stale
-    on btrfs)."""
+    (ENOTEMPTY). It cannot tell whose an empty directory is, so the caller
+    runs it only where every directory is the restore's own. Each level is
+    listed through a fresh descriptor (a long-held one reads stale on btrfs)."""
     try:
         sub = os.open(name, _DIR, dir_fd=fd)
     except OSError:
@@ -172,6 +172,7 @@ class _Writer:
         self.prior = chk.restore_block(loaded["report"])
         self.run_name = self.run_fd = self.repo_fd = None
         self.recorded_run = None  # the run REPAIR.json's record names after our last save
+        self.kept = set()  # paths this run moved into its aside and did not put back
         self.wrote, self.extras, self.flight = [], [], None
         self.called = set()  # every path whose entries the index call replaced
         # The in-flight record kept for the next run: an aside still holding what
@@ -345,8 +346,10 @@ class _Writer:
             try:
                 if to_aside:
                     _renameat2(here, name, there, name, "aside")
+                    self.kept.add(p)
                 else:
                     _renameat2(there, name, here, name, "put-back")
+                    self.kept.discard(p)
             finally:
                 os.close(there)
         except OSError:
@@ -666,7 +669,9 @@ class _Writer:
         """A run folder holding no aside and no index-before.txt keeps nothing
         a later run or a person needs: only staging, put in or refused, whose
         source is the report's own copy, and the empty aside/ directories a
-        refused or put-back move left. It is removed on every exit, a stop
+        refused or put-back move left. aside/ is cleaned only while no node
+        this run moved there is still in it: an empty directory inside a moved
+        node is the person's, never the restore's (#4364 review round 3). It is removed on every exit, a stop
         included, so refused reruns never pile folders up against RUNS_CAP
         (#4025 review SF-6, #4364 review). Decided by rmdir alone, deepest
         first (a directory holding anything stays: ENOTEMPTY), never by a
@@ -676,7 +681,8 @@ class _Writer:
             return
         with contextlib.suppress(OSError):
             shutil.rmtree("new", dir_fd=self.run_fd)
-        _rmdir_tree(self.run_fd, "aside")
+        if not self.kept:
+            _rmdir_tree(self.run_fd, "aside")
         try:
             os.rmdir(self.run_name, dir_fd=self.ctx.bfd)
         except OSError:

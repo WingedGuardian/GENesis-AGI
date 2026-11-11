@@ -226,7 +226,9 @@ def test_check_and_restore_agree_beside_a_held_aside_and_a_damaged_copy(w):
     assert "other:hash-mismatch" in said.values() and "other:aside-held" in said.values(), c.stdout
     assert said.keys() == did.keys(), (c.stdout, r.stdout)
     for key, v in said.items():
-        want = {"as-left": "restored", "already-restored": "already-restored"}.get(v, f"refused:{v}")
+        want = {"as-left": "restored", "already-restored": "already-restored"}.get(
+            v, f"refused:{v}"
+        )
         assert did[key] == want, (key, c.stdout, r.stdout)
 
 
@@ -266,7 +268,9 @@ def test_a_run_whose_move_aside_is_refused_leaves_no_folder(w):
     try:
         for _ in range(3):
             r = _restore(w, ts)
-            assert r.returncode == 1 and _parts(r)[("sub/s1", "node")].startswith("refused:"), r.stdout
+            assert r.returncode == 1 and _parts(r)[("sub/s1", "node")].startswith("refused:"), (
+                r.stdout
+            )
     finally:
         sub.chmod(0o755)
     assert _runs(w) == [], _runs(w)
@@ -316,3 +320,52 @@ def test_an_in_flight_name_the_kernel_rejects_is_a_named_refusal(w):
     for r in (_check(w, ts), _restore(w, ts)):
         assert "Traceback" not in r.stderr, r.stderr
         assert r.returncode == 1 and "aside-unreadable" in r.stdout, r.stdout
+
+
+def _empty_ignored_dir(w):
+    """A repaired `sub` directory holding an ignored, empty sub/e/nested."""
+    from tests.test_scripts._live_repair_world import _dir_becomes_file
+
+    ts = _repaired(w, _dir_becomes_file)
+    (w.root / ".git" / "info" / "exclude").write_text("e/\n")
+    nested = w.root / "sub" / "e" / "nested"
+    nested.mkdir(parents=True)
+    nested.chmod(0o751)
+    return ts
+
+
+def _kept_nested(w):
+    """The run folders whose aside still holds sub/e/nested, mode 0751."""
+    return [
+        run
+        for run in _runs(w)
+        if (run / "aside" / "sub" / "e" / "nested").is_dir()
+        and (run / "aside" / "sub" / "e" / "nested").stat().st_mode & 0o777 == 0o751
+    ]
+
+
+def test_an_empty_directory_inside_a_moved_aside_node_is_kept(w):
+    """#4364 review round 3: the cleanup removes only what the restore made;
+    an empty directory inside a node it moved aside is the person's, kept in
+    the aside with its mode."""
+    ts = _empty_ignored_dir(w)
+    r = _restore(w, ts)
+    assert r.returncode == 0 and _parts(r)[("sub", "node")] == "restored", r.stdout
+    assert (w.root / "sub").is_file()
+    assert _kept_nested(w), [sorted(p for p in run.rglob("*")) for run in _runs(w)]
+
+
+def test_a_node_kept_aside_by_a_failed_put_back_keeps_its_empty_directories(
+    w, mod, monkeypatch, capsys
+):
+    """#4364 review round 3: a path re-made after the move fails the put-in and
+    the put-back, so the node stays in the aside; its empty directories stay
+    with it."""
+    from tests.test_scripts.test_live_move_restore_write import _restore_in
+
+    ts = _empty_ignored_dir(w)
+    session = lambda: (w.root / "sub").write_text("a session's\n")  # noqa: E731
+    rc, out = _restore_in(w, mod, monkeypatch, capsys, ts, at={"aside": session})
+    assert rc == 1, out
+    assert (w.root / "sub").read_text() == "a session's\n"
+    assert _kept_nested(w), [sorted(p for p in run.rglob("*")) for run in _runs(w)]
