@@ -1,0 +1,1 @@
+- Qualification campaigns retain unavailable receipt lookups separately from billing, allowing a later verified receipt to settle expense without erasing failed attempts. New campaigns can explicitly opt into bounded404 metadata waiting; completions are never retried and historical invalid billing remains unresolved.

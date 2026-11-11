@@ -17,7 +17,9 @@ _LITERAL_ARGUMENTS = "--expand-environment=no"
 _REFUSED_AN_OPTION = 1  # systemd-run's exit status for an option it does not know
 
 
-def _systemd_run_refuses_literal_arguments() -> bool:
+def _systemd_run_refuses_literal_arguments(
+    *, executable: str = "systemd-run", env: dict[str, str] | None = None,
+) -> bool:
     """Only a definite refusal counts: systemd-run reads its options in order and
     stops at one it does not know before it reaches ``--version``.
 
@@ -25,8 +27,11 @@ def _systemd_run_refuses_literal_arguments() -> bool:
     own scope probe fails and each launcher's existing fallback or refusal takes over.
     """
     try:
+        kwargs = {"capture_output": True, "timeout": 10}
+        if env is not None:
+            kwargs["env"] = env
         probe = subprocess.run(
-            ["systemd-run", _LITERAL_ARGUMENTS, "--version"], capture_output=True, timeout=10
+            [executable, _LITERAL_ARGUMENTS, "--version"], **kwargs
         )
     except FileNotFoundError:
         return True  # nothing will start a scope
@@ -40,13 +45,19 @@ def _systemd_run_refuses_literal_arguments() -> bool:
     return probe.returncode == _REFUSED_AN_OPTION
 
 
-def literal_scope_args() -> list[str]:
+def literal_scope_args(
+    *, executable: str = "systemd-run", env: dict[str, str] | None = None,
+) -> list[str]:
     """What makes ``systemd-run --scope`` pass its command's arguments as written.
 
     Empty only where systemd-run refuses the option (older than 254) or is absent.
     Asked each time: every caller is about to start a process.
     """
-    return [] if _systemd_run_refuses_literal_arguments() else [_LITERAL_ARGUMENTS]
+    # Preserve the zero-argument default seam used by ordinary launchers.
+    refused = (_systemd_run_refuses_literal_arguments()
+               if executable == "systemd-run" and env is None
+               else _systemd_run_refuses_literal_arguments(executable=executable, env=env))
+    return [] if refused else [_LITERAL_ARGUMENTS]
 
 
 def systemctl_env() -> dict[str, str]:

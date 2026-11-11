@@ -12,6 +12,7 @@ import importlib
 import json
 import os
 import sqlite3
+import subprocess
 import warnings
 from contextlib import closing
 from datetime import UTC, datetime
@@ -23,6 +24,8 @@ from pyrage import passphrase as age_passphrase
 from genesis.payments import cli
 from genesis.payments import vault_migrate as vm
 from genesis.payments import vault_store as vs
+
+_REAL_SERVER_UNIT_ACTIVE = cli._server_unit_active
 
 PASSPHRASE = "quartz lantern ember noodle 41"  # only a legacy (sealed) vault has one
 VISA = "4242" * 4
@@ -728,3 +731,57 @@ def test_a_key_is_unsealed_only_while_the_server_runs_current_code(
         assert code == 2 and "restart it" in capsys.readouterr().err.lower()
         assert not (_vault(_home) / vs.IDENTITY).exists()
 
+
+
+@pytest.mark.parametrize("command", ["init", "migrate"])
+@pytest.mark.parametrize(("rc", "state", "allowed"), [
+    (0, "active\n", False), (0, "reloading\n", False),
+    (3, "inactive\n", True), (4, "inactive\n", True),
+    (1, "", False), (3, "failed\n", False), (3, "activating\n", False),
+    (3, "deactivating\n", False), (-15, "inactive\n", False),
+    (3, "", False), (0, "inactive\n", False), (4, "unknown\n", False),
+    (3, "inactive\nactive\n", False),
+])
+def test_vault_requires_confirmed_inactive_unit(tty, monkeypatch, command, rc, state, allowed):
+    monkeypatch.setattr(cli, "_service", lambda request: None)
+    monkeypatch.setattr(cli, "_server_unit_active", _REAL_SERVER_UNIT_ACTIVE)
+    calls = []
+    def query(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, rc, state, "synthetic systemd error")
+    monkeypatch.setattr(cli.subprocess, "run", query)
+    monkeypatch.setattr(vs, "check_can_init", lambda: None)
+    init = MagicMock()
+    migrate = MagicMock(return_value={})
+    monkeypatch.setattr(vs, "init_vault", init)
+    monkeypatch.setattr(vm, "migration_state", lambda: "needed")
+    monkeypatch.setattr(vm, "migrate_vault", migrate)
+    monkeypatch.setattr(vm, "pre_migrate_copies", lambda: [])
+    prompt = MagicMock(return_value="synthetic")
+    monkeypatch.setattr(getpass, "getpass", prompt)
+    code = _run([command])
+    assert code == (0 if allowed else 2)
+    assert init.called is (allowed and command == "init")
+    assert migrate.called is (allowed and command == "migrate")
+    assert prompt.called is (allowed and command == "migrate")
+    assert calls[0][0] == ["systemctl", "--user", "is-active", "genesis-server"]
+    assert calls[0][1] == dict(timeout=10, check=False, capture_output=True, text=True)
+
+
+@pytest.mark.parametrize("error, expected", [
+    (FileNotFoundError(), False), (PermissionError(), None),
+    (OSError(), None), (subprocess.TimeoutExpired("systemctl", 10), None),
+])
+def test_server_state_query_errors_are_unknown_except_missing_binary(monkeypatch, error, expected):
+    def query(*a, **kw):
+        raise error
+    monkeypatch.setattr(cli.subprocess, "run", query)
+    assert _REAL_SERVER_UNIT_ACTIVE() is expected
+
+
+def test_current_vault_status_does_not_query_systemd(monkeypatch):
+    monkeypatch.setattr(cli, "_service", lambda request: {"ok": True, "loaded_at": None})
+    query = MagicMock(side_effect=AssertionError("must not query systemd"))
+    monkeypatch.setattr(cli, "_server_unit_active", query)
+    cli._require_current_server()
+    query.assert_not_called()

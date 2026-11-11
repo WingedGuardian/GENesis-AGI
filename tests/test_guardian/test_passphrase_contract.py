@@ -10,6 +10,16 @@ from genesis.guardian import cred_integrity as ci
 from genesis.guardian import credential_bridge as bridge
 
 
+@pytest.fixture(autouse=True)
+def _private_home_paths(_live_closure_secrets_path):
+    """The file-reader cases supply private homes, independent of the suite override."""
+    patch = pytest.MonkeyPatch()
+    patch.delenv("SECRETS_PATH", raising=False)
+    patch.delenv("GENESIS_REPO_ROOT", raising=False)
+    yield
+    patch.undo()
+
+
 @pytest.mark.parametrize("password", ["prefix\nsuffix", "prefix\0suffix", "prefix\n"])
 def test_decryption_rejects_terminators_before_spawning(tmp_path, monkeypatch, password):
     calls = []

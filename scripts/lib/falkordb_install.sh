@@ -203,9 +203,13 @@ falkordb_unit_loaded_module() {
 #   - the unit exists, the engine is ACTIVE, the unit loads a different module
 #     than the wheel's, and GENESIS_FALKORDB_SWITCH is not 1. A deploy must not
 #     move a running engine onto new binaries (owner ruling): the rewrite would
-#     land at its next restart or reboot, unannounced. Switching is the
-#     explicit step `GENESIS_FALKORDB_SWITCH=1 scripts/bootstrap.sh`, followed
-#     by a restart of the engine.
+#     land at its next restart or reboot, unannounced. Switching is an explicit
+#     step. On a running install bootstrap.sh refuses (the live-system guard),
+#     so it is `GENESIS_FALKORDB_SWITCH=1 scripts/update.sh --take-template
+#     genesis-falkordb.service` (it stops and restarts genesis-server and keeps
+#     the old unit under ~/.genesis/deploy-backups/), followed by
+#     `systemctl --user restart genesis-falkordb`. On a stopped or fresh
+#     install, `GENESIS_FALKORDB_SWITCH=1 scripts/bootstrap.sh` does it.
 # Otherwise render: there is no unit yet, the engine is not running, it already
 # loads the wheel's module, or the switch was asked for.
 falkordb_unit_keep_existing() {
@@ -233,6 +237,62 @@ falkordb_unit_keep_existing() {
     FALKORDB_KEEP_REASON="active"
     # shellcheck disable=SC2034  # read by the renderers' "Kept:" message
     [ -n "$state" ] || FALKORDB_KEEP_REASON="state_unknown"
+    return 0
+}
+
+# falkordb_enable_unit <rendered unit path> — arm the engine's unit after the
+# render (owner ruling 2026-11-09): enable it, and start it when it is not
+# running. Acts only when ALL hold:
+#   - the engine was verified this run (there is a unit worth arming);
+#   - the unit file exists;
+#   - it is not listed in ~/.genesis/config/disabled_timers (the operator's
+#     standing opt-out, lib/managed_units.sh genesis_timer_opted_out, when that
+#     helper is loaded);
+#   - `is-enabled` answers `disabled` or `enabled`. Anything else is left
+#     alone: masked/linked/static are deliberate states, and an empty answer
+#     (no user manager) or not-found is a state this cannot read.
+# Then by `is-active`:
+#   - inactive or failed: `enable --now`, which also starts it. A failure is
+#     one WARNING line, never a failed bootstrap.
+#   - anything else (active, activating, reloading, unreadable): never started
+#     or restarted, which keeps the never-switch-a-running-engine rule above;
+#     a disabled unit is only enabled. Always returns 0.
+falkordb_enable_unit() {
+    local unit="$1" name enabled active
+    name="${unit##*/}"
+    _falkordb_engine_verified || return 0
+    [ -f "$unit" ] || return 0
+    if declare -F genesis_timer_opted_out >/dev/null \
+        && genesis_timer_opted_out "$name"; then
+        echo "  - $name not enabled (listed in ${GENESIS_DISABLED_TIMERS:-disabled_timers})"
+        return 0
+    fi
+    enabled="$($FALKORDB_SYSTEMCTL --user is-enabled "$name" 2>/dev/null || true)"
+    case "$enabled" in
+        disabled|enabled) ;;
+        *)
+            echo "  NOTE: $name not armed (systemctl is-enabled said '${enabled:-nothing}');" \
+                "graph reads stay on networkx until it is enabled"
+            return 0 ;;
+    esac
+    active="$($FALKORDB_SYSTEMCTL --user is-active "$name" 2>/dev/null || true)"
+    case "$active" in
+        inactive|failed)
+            if $FALKORDB_SYSTEMCTL --user enable --now "$name" >/dev/null 2>&1; then
+                echo "  + $name enabled + started (the graph engine)"
+            else
+                echo "  WARNING: could not start $name (journalctl --user -u $name -n 30); bootstrap continues"
+            fi
+            ;;
+        *)
+            [ "$enabled" = "disabled" ] || return 0
+            if $FALKORDB_SYSTEMCTL --user enable "$name" >/dev/null 2>&1; then
+                echo "  + $name enabled (already running; not restarted)"
+            else
+                echo "  WARNING: could not enable $name; bootstrap continues"
+            fi
+            ;;
+    esac
     return 0
 }
 

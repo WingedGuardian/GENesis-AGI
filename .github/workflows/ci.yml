@@ -778,7 +778,12 @@ jobs:
         # mocked-turn opt-in cases, measured on the PR's runner, 552 -> 563.
         # Launcher discovery: two opt-in native cases; Git destinations: eighteen.
         # Inherit the current runner ceiling and add exactly twenty identities.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 583
+        # Compatibility qualification (#4126): fifteen contained-only cases,
+        # measured in run42514975072's JUnit; all fifteen pass in native CI.
+        # Native peer containment (#3575): five real-CLI cases that skip on a
+        # runner with no Claude binary (test_peer_native x4, test_contained_native
+        # x1), measured in run 42667838123 at 603 skipped, 598 -> 603.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 603
 
   test-ubuntu-2404:
     # ubuntu-latest is moving to 26.04, so `test` alone stops showing a break on

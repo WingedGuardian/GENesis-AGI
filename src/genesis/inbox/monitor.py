@@ -571,18 +571,21 @@ class InboxMonitor:
                         f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}source file vanished"
                     ),
                     processed_at=now_iso,
+                    expected_approval_marker=marker,
                 )
                 continue
 
             if approval_status == "rejected":
-                await inbox_items.update_status(
+                if not await inbox_items.update_status(
                     self._db,
                     row_id,
                     status="failed",
                     error_message=(f"autonomous_cli_fallback rejected (approval {request_id})"),
                     processed_at=now_iso,
                     retry_count=self._config.max_retries,
-                )
+                    expected_approval_marker=marker,
+                ):
+                    continue
                 logger.info(
                     "Inbox row %s rejected by user (approval %s) — "
                     "marked permanently failed (retry_count=%d)",
@@ -606,7 +609,7 @@ class InboxMonitor:
                 # reuses that row; unknown identity retains history and gets a
                 # fresh row. The retry count never bounded re-asking anyway — the
                 # approval request's own lifetime does (MEASURED, 2026-09-27).
-                await inbox_items.mark_failed_keeping_retries(
+                if not await inbox_items.mark_failed_keeping_retries(
                     self._db,
                     row_id,
                     error_message=(
@@ -615,7 +618,9 @@ class InboxMonitor:
                     ),
                     processed_at=now_iso,
                     retriable_below=self._config.max_retries,
-                )
+                    expected_approval_marker=marker,
+                ):
+                    continue
                 logger.info(
                     "Inbox row %s returned to retry: approval %s ended (%s)",
                     row_id,
@@ -660,6 +665,7 @@ class InboxMonitor:
                     status="superseded",
                     error_message=(f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}content changed"),
                     processed_at=now_iso,
+                    expected_approval_marker=marker,
                 )
                 continue
             try:
@@ -673,6 +679,7 @@ class InboxMonitor:
                         f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}source file vanished"
                     ),
                     processed_at=now_iso,
+                    expected_approval_marker=marker,
                 )
                 continue
             # Re-dispatch the EXACT delta this batch owns (persisted in
@@ -689,7 +696,7 @@ class InboxMonitor:
                 # legacy full-file replay, which would dispatch the whole file
                 # once per parked batch. Invalidate and re-derive under a fresh
                 # approval instead.
-                await inbox_items.mark_failed_keeping_retries(
+                if not await inbox_items.mark_failed_keeping_retries(
                     self._db,
                     row_id,
                     # This remains retryable.  ``approval_invalidated:`` rows
@@ -702,7 +709,9 @@ class InboxMonitor:
                     # row below the active cap even if that cap was lowered
                     # while approval was pending.
                     retriable_below=self._config.max_retries,
-                )
+                    expected_approval_marker=marker,
+                ):
+                    continue
                 logger.error(
                     "Inbox row %s has corrupt versioned batch_items; "
                     "queued for safe re-derivation",

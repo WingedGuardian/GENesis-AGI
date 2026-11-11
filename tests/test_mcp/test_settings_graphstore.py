@@ -27,10 +27,20 @@ def test_graphstore_domain_registered():
     assert "graphstore" in _DOMAIN_VALIDATORS
 
 
-def _stored(monkeypatch, cfg: dict) -> None:
-    """Pin what the CURRENT persisted config says."""
+def _stored(monkeypatch, cfg: dict, *, overlay_mode: bool = True, unit: bool = False) -> None:
+    """Pin what the CURRENT persisted config says. ``overlay_mode``: the install
+    overlay itself sets ``mode`` (a stored choice, the default here); False is
+    the shipped default alone. ``unit``: the engine's unit is rendered and enabled."""
     monkeypatch.setattr(
         "genesis.memory.graphstore_config.load_config", lambda: dict(cfg), raising=True
+    )
+    monkeypatch.setattr(
+        "genesis.memory.graphstore_config.mode_set_by_overlay",
+        lambda: overlay_mode,
+        raising=True,
+    )
+    monkeypatch.setattr(
+        "genesis.memory.graphstore_config.engine_unit_present", lambda: unit, raising=True
     )
 
 
@@ -107,3 +117,32 @@ def test_a_networkx_install_never_consults_the_socket(monkeypatch, tmp_path):
 
     assert _validate_graphstore({"enabled": False}) == []
     assert _validate_graphstore({"mode": "networkx"}) == []
+
+
+def test_the_shipped_default_on_an_unprovisioned_install_needs_no_socket(monkeypatch, tmp_path):
+    """The where-present guard keeps such an install quietly on networkx, so a
+    save that never names `mode` must not be refused for want of an engine the
+    install never had: that would refuse every graphstore save there.
+    """
+    _stored(monkeypatch, {"enabled": False, "mode": "falkordb"}, overlay_mode=False)
+    _socket(monkeypatch, present=False, tmp_path=tmp_path)
+
+    assert _validate_graphstore({"enabled": True}) == []
+
+
+def test_the_shipped_default_with_a_unit_still_needs_the_socket(monkeypatch, tmp_path):
+    """With the unit rendered the shipped default really selects the engine."""
+    _stored(monkeypatch, {"enabled": False, "mode": "falkordb"}, overlay_mode=False, unit=True)
+    _socket(monkeypatch, present=False, tmp_path=tmp_path)
+
+    errors = _validate_graphstore({"enabled": True})
+    assert errors and "not armed" in errors[0]
+
+
+def test_writing_falkordb_into_the_overlay_still_needs_the_socket(monkeypatch, tmp_path):
+    """Naming `mode` writes it to the overlay, which is loud: unchanged."""
+    _stored(monkeypatch, {"enabled": True, "mode": "falkordb"}, overlay_mode=False)
+    _socket(monkeypatch, present=False, tmp_path=tmp_path)
+
+    errors = _validate_graphstore({"mode": "falkordb"})
+    assert errors and "not armed" in errors[0]

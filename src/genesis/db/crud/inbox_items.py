@@ -450,6 +450,7 @@ async def update_status(
     error_message: str | None = None,
     evaluated_content: str | None = None,
     retry_count: int | None = None,
+    expected_approval_marker: str | None = None,
 ) -> bool:
     """Update an inbox_items row's status and related fields.
 
@@ -464,32 +465,34 @@ async def update_status(
     change, eliminating the race window where a concurrent reader
     could see ``failed`` with ``retry_count < max_retries`` and
     re-detect the file.
+
+    With ``expected_approval_marker``, update only a still-parked row carrying
+    that exact marker. False means the row disappeared or another writer won;
+    callers must not report the stale transition as completed.
     """
     if retry_count is not None:
-        cursor = await db.execute(
-            """UPDATE inbox_items
+        sql = """UPDATE inbox_items
                SET status = ?, processed_at = ?, error_message = ?,
                    retry_count = ?
-               WHERE id = ?""",
-            (status, processed_at, error_message, retry_count, id),
-        )
+               WHERE id = ?"""
+        params = (status, processed_at, error_message, retry_count, id)
     elif status == "failed":
         # Increment retry_count on failure (default)
-        cursor = await db.execute(
-            """UPDATE inbox_items
+        sql = """UPDATE inbox_items
                SET status = ?, processed_at = ?, error_message = ?,
                    retry_count = retry_count + 1
-               WHERE id = ?""",
-            (status, processed_at, error_message, id),
-        )
+               WHERE id = ?"""
+        params = (status, processed_at, error_message, id)
     else:
-        cursor = await db.execute(
-            """UPDATE inbox_items
+        sql = """UPDATE inbox_items
                SET status = ?, processed_at = ?, error_message = ?,
                    evaluated_content = COALESCE(?, evaluated_content)
-               WHERE id = ?""",
-            (status, processed_at, error_message, evaluated_content, id),
-        )
+               WHERE id = ?"""
+        params = (status, processed_at, error_message, evaluated_content, id)
+    if expected_approval_marker is not None:
+        sql += " AND status = 'processing' AND error_message = ?"
+        params += (expected_approval_marker,)
+    cursor = await db.execute(sql, params)
     await db.commit()
     return cursor.rowcount > 0
 
@@ -830,6 +833,7 @@ async def mark_failed_keeping_retries(
     error_message: str,
     processed_at: str | None = None,
     retriable_below: int | None = None,
+    expected_approval_marker: str | None = None,
 ) -> bool:
     """Fail a row WITHOUT spending its retry budget, in one UPDATE.
 
@@ -843,6 +847,9 @@ async def mark_failed_keeping_retries(
     sits at or above that cap. A row whose count predates a LOWERED cap would
     otherwise land at the cap, where nothing retries it and its never-evaluated
     content counts as handled (#2447 review).
+
+    ``expected_approval_marker`` has the same conditional-update contract as
+    :func:`update_status`; ordinary failure callers can omit it.
     """
     if retriable_below is None:
         sql = """UPDATE inbox_items
@@ -855,6 +862,9 @@ async def mark_failed_keeping_retries(
                retry_count = MIN(retry_count, ?)
            WHERE id = ?"""
         params = (processed_at, error_message, max(retriable_below - 1, 0), id)
+    if expected_approval_marker is not None:
+        sql += " AND status = 'processing' AND error_message = ?"
+        params += (expected_approval_marker,)
     cursor = await db.execute(sql, params)
     await db.commit()
     return cursor.rowcount > 0
