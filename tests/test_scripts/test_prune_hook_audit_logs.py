@@ -235,7 +235,7 @@ def test_the_hygiene_groom_reads_the_store_knobs_without_executing_secrets_env()
     assert not any(ln.startswith("EnvironmentFile") for ln in directives), (
         "loading secrets.env here overrides the unit's own pinned PATH (systemd 255)"
     )
-    assert any(ln.startswith("Environment=PATH=") for ln in directives), (
+    assert any(ln.startswith(("Environment=PATH=", 'Environment="PATH=')) for ln in directives), (
         "the pinned PATH this test protects is gone, so the assertion above guards nothing"
     )
 

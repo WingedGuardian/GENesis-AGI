@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 SYSTEMD = Path(__file__).resolve().parents[2] / "scripts" / "systemd"
-CC_TMP = ("__HOME__/.genesis/cc-tmp", "%h/.genesis/cc-tmp")
+CC_TMP = ("__HOME__/.genesis/cc-tmp", "%h/.genesis/cc-tmp", "__HOME_EXEC__/.genesis/cc-tmp")
 
 
 def _assignments(text: str) -> list[tuple[str, str]]:
@@ -77,9 +77,10 @@ def test_the_known_units_are_in_scope():
 def test_sqlite_temp_files_go_to_the_big_disk(path):
     text = path.read_text()
     lines = text.splitlines()
-    assert [v for n, v in _assignments(text) if n == "SQLITE_TMPDIR"] == ["__HOME__/tmp"], path.name
-    # Quoted whole, so a home directory with a space stays one assignment.
-    assert 'Environment="SQLITE_TMPDIR=__HOME__/tmp"' in lines, path.name
+    assert [v for n, v in _assignments(text) if n == "SQLITE_TMPDIR"] == ["__HOME_EXEC__/tmp"], path.name
+    # Quoted whole and systemd-escaped, so a home directory with a space, `"` or `%`
+    # stays one assignment.
+    assert 'Environment="SQLITE_TMPDIR=__HOME_EXEC__/tmp"' in lines, path.name
     # The directory must exist and be writable, or SQLite falls back to TMPDIR: the
     # pre-start step creates it and warns when it is unusable, never refusing to start.
     pre = [line for line in lines if line.startswith("ExecStartPre=") and "SQLITE_TMPDIR" in line]
@@ -88,7 +89,7 @@ def test_sqlite_temp_files_go_to_the_big_disk(path):
     # It reads the directory systemd resolved for SQLite from the environment; no
     # install value appears in the Exec line, where systemd and the shell would
     # each parse it.
-    assert "__HOME__" not in pre[0] and '"$$SQLITE_TMPDIR"' in pre[0], path.name
+    assert "__HOME" not in pre[0] and '"$$SQLITE_TMPDIR"' in pre[0], path.name
 
 
 def test_the_pre_start_step_warns_on_an_unusable_directory(tmp_path):

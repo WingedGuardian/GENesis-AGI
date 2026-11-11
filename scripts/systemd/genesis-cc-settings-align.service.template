@@ -26,7 +26,7 @@ ExecStart=/bin/bash __REPO_DIR__/scripts/cc_settings_align.sh
 TimeoutStartSec=7200
 # Needs python3 (the reconciler's merge helper) and flock, both in /usr/bin. No
 # npm, no sudo, no ssh.
-Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+Environment="PATH=__VENV_EXEC__/bin:/usr/local/bin:/usr/bin:/bin"
 StandardOutput=journal
 StandardError=journal
 # SANDBOX SCOPE IS LOAD-BEARING — read before tightening.

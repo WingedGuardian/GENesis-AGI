@@ -122,7 +122,7 @@ def test_the_unit_quotes_its_path_and_loads_no_environment_file():
     EnvironmentFile= would hand every secret to the downloaders and override the
     unit's own PATH (measured on systemd 255, genesis-disk-hygiene's template)."""
     unit = (_SCRIPT.parent / "systemd" / "genesis-browser-stack.service.template").read_text()
-    assert 'Environment="PATH=__VENV__/bin:' in unit
+    assert 'Environment="PATH=__VENV_EXEC__/bin:' in unit
     assert "EnvironmentFile" not in unit
 
 

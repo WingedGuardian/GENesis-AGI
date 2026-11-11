@@ -12,7 +12,7 @@ TimeoutStartSec=900
 # Needs ssh + flock (/usr/bin) and the venv python (called by absolute path).
 # No npm/sudo here — the host-side update-cc/update-node verbs own their privilege,
 # so NoNewPrivileges + ProtectSystem=strict are safe (unlike a container-CC align).
-Environment=PATH=__VENV__/bin:__CC_BIN_DIR__:__HOME__/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment="PATH=__VENV_EXEC__/bin:__CC_BIN_EXEC__:__HOME_EXEC__/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
 StandardOutput=journal
 StandardError=journal
 # Home-scoped: the only file it writes is the single-flight lock under ~/.genesis.

@@ -14,9 +14,9 @@ ExecStart=/bin/bash __REPO_DIR__/scripts/inbox_sync.sh
 TimeoutStartSec=1800
 # rclone, flock, find, sed and awk live in /usr/bin on supported installs; the
 # venv's interpreter reads Genesis config and runs genesis.trash.
-Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+Environment="PATH=__VENV_EXEC__/bin:/usr/local/bin:/usr/bin:/bin"
 # The script's own default is the checkout's .venv, which VENV_PATH can move.
-Environment=GENESIS_PYTHON=__VENV__/bin/python
+Environment="GENESIS_PYTHON=__VENV_EXEC__/bin/python"
 StandardOutput=journal
 StandardError=journal
 # Writes only under $HOME: the inbox, ~/.genesis (trash, state), the repo's

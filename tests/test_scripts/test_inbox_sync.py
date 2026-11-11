@@ -878,7 +878,7 @@ def test_the_pull_stays_on_the_inboxs_filesystem(tmp_path):
 def test_the_service_names_the_installed_interpreter():
     repo = Path(__file__).resolve().parents[2]
     unit = (repo / "scripts/systemd/genesis-inbox-sync.service.template").read_text()
-    assert "Environment=GENESIS_PYTHON=__VENV__/bin/python" in unit
+    assert 'Environment="GENESIS_PYTHON=__VENV_EXEC__/bin/python"' in unit
 
 
 def test_a_directory_at_the_record_path_is_not_an_ok_cycle(tmp_path):

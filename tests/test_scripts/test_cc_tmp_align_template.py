@@ -51,7 +51,10 @@ def test_service_explicitly_enabled_on_fresh_and_existing_installs():
 
 
 def test_only_supported_render_placeholders():
-    supported = {"__HOME__", "__VENV__", "__REPO_DIR__", "__CC_BIN_DIR__"}
+    supported = {
+        "__HOME__", "__VENV__", "__REPO_DIR__", "__CC_BIN_DIR__",
+        "__HOME_EXEC__", "__VENV_EXEC__", "__REPO_EXEC__", "__CC_BIN_EXEC__",
+    }
     for tmpl in (SVC, TIMER):
         for ph in re.findall(r"__[A-Z_]+__", tmpl.read_text()):
             assert ph in supported, f"unsupported render placeholder {ph} in {tmpl.name}"

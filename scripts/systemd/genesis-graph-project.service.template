@@ -38,7 +38,7 @@ ExecStart=/bin/bash __REPO_DIR__/scripts/graph_project_runner.sh
 TimeoutStartSec=1800
 # Only the venv interpreter, flock, mkdir and the shell. No node, no npm prefix
 # — this unit runs one Python module and takes no path through the CC tooling.
-Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+Environment="PATH=__VENV_EXEC__/bin:/usr/local/bin:/usr/bin:/bin"
 StandardOutput=journal
 StandardError=journal
 # Writes only under $HOME: the runner lock under ~/.genesis/locks, and the

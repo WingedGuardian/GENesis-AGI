@@ -9,7 +9,7 @@ ExecStart=/bin/bash __REPO_DIR__/scripts/disk_hygiene.sh --worktrees-only
 # Observed: 45 archives took over 15 minutes before the old 20-minute limit
 # interrupted the next compression. Use the project's two-hour job default.
 TimeoutStartSec=7200
-Environment=PATH=__VENV__/bin:__CC_BIN_DIR__:__HOME__/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment="PATH=__VENV_EXEC__/bin:__CC_BIN_EXEC__:__HOME_EXEC__/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
 StandardOutput=journal
 StandardError=journal
 NoNewPrivileges=yes

@@ -20,7 +20,7 @@ TimeoutStartSec=120
 # Needs ssh + flock (/usr/bin) and the venv python (absolute path). No sudo/npm —
 # the host-side cc-tmp-apply verb owns its own incus privilege — so a hardened
 # NoNewPrivileges/ProtectSystem=strict sandbox is safe.
-Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+Environment="PATH=__VENV_EXEC__/bin:/usr/local/bin:/usr/bin:/bin"
 StandardOutput=journal
 StandardError=journal
 # Home-scoped: writes only the single-flight lock + the apply marker under ~/.genesis.

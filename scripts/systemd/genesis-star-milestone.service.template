@@ -20,7 +20,7 @@ ExecStart=__VENV__/bin/python __REPO_DIR__/scripts/star_milestone_check.py
 # cost of a generous bound is an idle process; the cost of a tight one is a
 # missed wake-up, which is the only thing this unit does.
 TimeoutStartSec=7200
-Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+Environment="PATH=__VENV_EXEC__/bin:/usr/local/bin:/usr/bin:/bin"
 StandardOutput=journal
 StandardError=journal
 # Writes exactly two things: the observation (the database) and its own state

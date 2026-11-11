@@ -22,7 +22,7 @@ ExecStart=/bin/bash __REPO_DIR__/scripts/disk_hygiene.sh --maintenance-only
 TimeoutStartSec=7200
 # `gh` (squash-merge detection) + `git` may live in /usr/bin, CC_BIN_DIR, or
 # npm-global — list all so the reaper doesn't silently fall back to git-only.
-Environment=PATH=__VENV__/bin:__CC_BIN_DIR__:__HOME__/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment="PATH=__VENV_EXEC__/bin:__CC_BIN_EXEC__:__HOME_EXEC__/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
 StandardOutput=journal
 StandardError=journal
 # Home-scoped: reaper trashes under ~/.genesis, reclaim clears ~/.cache & ~/.npm.

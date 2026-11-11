@@ -16,7 +16,7 @@ ExecStart=/bin/bash __REPO_DIR__/scripts/disk_hygiene.sh --pressure %i
 # the work itself, plus the bounded reclaim_lock wait in front of it (600s at
 # most for standard, 120s for last-resort — see disk_hygiene.sh).
 TimeoutStartSec=1800
-Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+Environment="PATH=__VENV_EXEC__/bin:/usr/local/bin:/usr/bin:/bin"
 StandardOutput=journal
 StandardError=journal
 NoNewPrivileges=yes

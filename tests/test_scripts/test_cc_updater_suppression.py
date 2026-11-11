@@ -1632,7 +1632,10 @@ class TestUnitTemplateShape:
     test: a typo'd placeholder renders literally and the unit fails at start."""
 
     _UNIT_DIR = _REPO_ROOT / "scripts" / "systemd"
-    _SUPPORTED = {"__HOME__", "__VENV__", "__REPO_DIR__", "__CC_BIN_DIR__"}
+    _SUPPORTED = {
+        "__HOME__", "__VENV__", "__REPO_DIR__", "__CC_BIN_DIR__",
+        "__HOME_EXEC__", "__VENV_EXEC__", "__REPO_EXEC__", "__CC_BIN_EXEC__",
+    }
 
     def _templates(self):
         for name in (

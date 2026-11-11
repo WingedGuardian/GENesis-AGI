@@ -57,7 +57,13 @@ RENDERERS = ("install.sh", "bootstrap.sh")
 #: assertion would be vacuous on an empty template list, and the suite would go
 #: green while checking nothing. A derived set that can legitimately be a subset
 #: of the truth needs an independent denominator; this is that denominator.
-_MINIMUM_SHARED_TOKENS = frozenset({"__HOME__", "__VENV__", "__REPO_DIR__", "__CC_BIN_DIR__"})
+#: The `_EXEC` forms are the same four paths escaped for systemd's quoted
+#: Environment=/Exec syntax; every unit's PATH line uses them so a space in
+#: one of those paths cannot split the assignment.
+_MINIMUM_SHARED_TOKENS = frozenset({
+    "__HOME__", "__VENV__", "__REPO_DIR__", "__CC_BIN_DIR__",
+    "__HOME_EXEC__", "__VENV_EXEC__", "__REPO_EXEC__", "__CC_BIN_EXEC__",
+})
 
 #: Leading `[A-Z0-9]` rather than `[A-Z]`: a token is not required to start
 #: with a letter, and matching only letter-initial ones would silently exempt
