@@ -1284,6 +1284,30 @@ def test_a_reflection_merged_in_after_the_answer_never_counts(pr, tmp_path):
     assert _credit(path, budget) == set()
 
 
+def test_a_reflection_naming_no_round_head_counts_for_its_keys_round(pr, tmp_path):
+    """#4310: a round-1 answer naming G (no round head, as an answer after a
+    fix or at a merge of main must) belongs to the round of its key c1, so its
+    class is earlier history and the round-2 fix-instances answer is refused.
+    It used to count only when its head was a round head, so it was dropped."""
+    path, base, head, fix = pr
+    budget, second, answer = _two_round_answer(path, tmp_path, base, head, fix)
+    _reflect(path, tmp_path, _block(["c1"], second), T0 + timedelta(minutes=116))
+    _reflect(path, tmp_path, answer, T0 + timedelta(minutes=120))
+    assert _credit(path, budget) == set()
+
+
+def test_a_correction_in_the_same_round_is_not_earlier_history(pr, tmp_path):
+    """Plan BLOCKER 1: a first answer to round 2's key c9 that fails its full
+    check (no premise evidence) belongs to round 2, the round being judged, so
+    its class never makes the corrected second answer a recurrence."""
+    path, base, head, fix = pr
+    budget, second, answer = _two_round_answer(path, tmp_path, base, head, fix)
+    first_try = _block(["c9"], second).replace("Decision: close-class", "Decision: fix-instances")
+    _reflect(path, tmp_path, first_try, T0 + timedelta(minutes=116))
+    _reflect(path, tmp_path, answer, T0 + timedelta(minutes=120))
+    assert _credit(path, budget) == {"c9"}
+
+
 def test_an_unreadable_ancestry_probe_refuses(monkeypatch):
     """S3: git's exit 0 is an ancestor, 1 is not; anything else is unknown."""
     monkeypatch.setattr(rr, "_run", lambda argv, cwd=None: (128, "", "fatal"))

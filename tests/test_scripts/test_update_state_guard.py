@@ -708,16 +708,30 @@ def forward_message_is_true(text: str) -> None:
             assert "bootstrap never ran on" in s, s
 
 
-def test_sf1_a_forward_mixed_tree_is_finished_with_post_merge(guard, live):
+def live_forward_message_is_true(text: str) -> None:
+    """HEAD on `live` at the rebuilt tip, a rollback killed partway: the remedy
+    is the repair, which finishes that rollback TOWARD THE TAG (#3492 PR D1f;
+    never toward the tip, which bootstrap never ran on). It never recommends
+    --post-merge, and never offers Dismiss without saying the checkout then
+    holds code bootstrap never ran on (SF1)."""
+    assert "scripts/deploy_candidates repair-move" in text, text
+    assert "finishes the rollback that was killed" in text, text
+    assert not post_merge_advice(text), text
+    for s in _sentences(text):
+        if "Dismiss" in s:
+            assert "bootstrap never ran on" in s, s
+
+
+def test_sf1_a_forward_mixed_tree_on_live_is_repaired_toward_the_tag(guard, live):
     """SF1: HEAD at the target, a tag-side file written by a rollback killed
-    partway. Restoring to HEAD puts the FORWARD tree back, so the remedy is to
-    finish with --post-merge; a bare Dismiss would drop the only guard against
-    restarting onto code bootstrap never ran on."""
+    partway. The remedy is the repair, which puts the paths back toward the tag
+    and moves `live` back to it; a bare Dismiss would drop the only guard
+    against restarting onto code bootstrap never ran on."""
     _git(live["root"], "checkout", "-q", "-B", "live", live["new"])
     (live["root"] / "O").write_text("o\n")
     r = _cli(live, _state(live, live_row(live, "done")))
     assert r.returncode == 4, r.stdout + r.stderr
-    forward_message_is_true(r.stdout)
+    live_forward_message_is_true(r.stdout)
 
 
 def test_sf1_a_tag_side_mixed_tree_never_recommends_post_merge(guard, live):
@@ -813,7 +827,7 @@ def test_sf4_a_rollback_killed_after_adoption_is_a_mixed_tree(guard, live):
     assert verdict == "mixed_tree" and "  ?? O" in reason, reason
     r = _cli(live, live["home"] / "update_state.json")
     assert r.returncode == 4
-    forward_message_is_true(r.stdout)
+    live_forward_message_is_true(r.stdout)
 
 
 def test_sf4_a_clean_adopted_row_reads_as_before(guard, live):

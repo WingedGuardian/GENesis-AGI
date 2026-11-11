@@ -8,10 +8,14 @@ first. A node the update did not write is restored too (leaving it would leave
 the tree mixed) and reported, with the restore command that puts it back
 (never a shell step: #3868). The path set,
 the two-dot diff a switch writes, contains everything the guard counts as
-residue, and only the guard's SAFE afterwards clears the state; a target whose
-objects a power loss took cannot be judged, so the whole tree is restored to
-HEAD and a clean tree clears it. Run from a kit outside the checkout (the
-checkout is what may be half-written): python3 -I -S, standard library only.
+residue, and only the guard's SAFE afterwards clears the state. With HEAD on
+`live` at the target (a rollback killed partway, PR D1f) the repair finishes
+that rollback: the files, then `live` moved back to the tag by compare-and-swap,
+then the git hooks restored (retried by every later run while HEAD is the tag
+on `live`). A target whose objects a power loss took cannot be judged, so the
+whole tree is restored to the tag and a clean tree clears it. Run from a kit
+outside the checkout (the checkout is what may be half-written): python3 -I -S,
+standard library only.
 Exit 1 only where a start would run a half-written tree; at boot every failure
 before the checkout itself changes exits 0 (the server starts as it did before),
 a failed backup included. A main row is out of scope (QD3): exit 3 by command, 0
@@ -617,6 +621,22 @@ def load_report(path: str, repo: str) -> dict | None:
 REPO_BYTES = 4096
 
 
+#: Written beside a REPAIR.json no reader can read (load_report refuses it) by
+#: --dismiss TS, which then cannot record dismissed_at inside it. Every reader
+#: (deploy health, the guardian's pick, the deploy-backups prune) skips a report
+#: folder holding it as a regular file (#4331 review): the report's alert
+#: clears and the prune takes the folder 90 days after its last write.
+DISMISS_MARK = "DISMISSED.json"
+
+
+def dismiss_marked(path: str) -> bool:
+    """Does the report dir ``path`` hold DISMISS_MARK as a regular file?"""
+    try:
+        return stat.S_ISREG(os.lstat(os.path.join(path, DISMISS_MARK)).st_mode)
+    except OSError:
+        return False
+
+
 def same_repo(named, repo: str) -> bool:
     """Whether a report's ``repo`` field names ``repo``. The field is untrusted:
     it must be a str with no NUL whose file-system bytes (os.fsencode: a
@@ -658,8 +678,9 @@ def _load_guard():
 
 
 def _load_kit(name: str):
-    """A kit source beside this one (the guard; live_move_restore.py and
-    live_move_restore_write.py)."""
+    """A kit source beside this one (the guard; live_move_restore.py, which
+    loads live_move_restore_rows.py and live_move_restore_runs.py beside it,
+    and live_move_restore_write.py)."""
     path = os.path.join(_LIB, name)
     spec = importlib.util.spec_from_file_location(f"_live_repair_{name[:-3]}", path)
     if spec is None or spec.loader is None:
@@ -683,6 +704,8 @@ class Repair:
         self.backups_warning: str | None = None
         self.guard = _load_guard()
         self._fds: list[int] = []
+        self.update_fd: int | None = None  # update.lock's, handed to restore-hooks
+        self.forward = False  # HEAD on `live` at the target: finishing a rollback
 
     def _hold(self, path: str, deadline: float) -> int | None:
         fd = _flock(path, deadline)
@@ -707,24 +730,41 @@ class Repair:
         return _update_lock(self.home)
 
     def _run(self) -> int:
-        if not os.path.lexists(self.state_path):
+        pending = self._pending_hooks()
+        if not os.path.lexists(self.state_path) and not pending:
             self._say("nothing to repair: there is no update state")
             return 0
         deadline = _now() + (BOOT_BUDGET_S if self.boot else self.wait)
         lock = self._update_lock()
-        if self._hold(lock, 0) is None:
+        self.update_fd = self._hold(lock, 0)
+        if self.update_fd is None:
+            if not os.path.lexists(self.state_path):
+                return 0  # a deploy restarting its server under the lock; a later run retries
             pid = (self._state()[1] or {}).get("pid")
             if self.boot and isinstance(pid, int) and pid > 1 and _pid_alive(pid):
                 # update.sh or a deploy starts its own server under the lock; a
                 # failure here would only send it to its degraded fallback.
                 _log(f"update.lock is held and its update (pid {pid}) runs; it starts the server")
                 return 0
-            if self._hold(lock, deadline) is None:
+            self.update_fd = self._hold(lock, deadline)
+            if self.update_fd is None:
                 verdict, _ = self.guard.verdict(self.state_path, self.repo)
                 self._say(f"update.lock is still held after the wait; the checkout is {verdict}")
                 return 1 if verdict == self.guard.MIXED_TREE else 0
+        # The checkout lock before the hooks retry too: restore-hooks runs under
+        # it in the forward heal, as in update.sh's rollback.
         locks = self._checkout_locks(deadline)
-        return self._judge_state(locks[0]) if locks else 1
+        if locks is None:
+            return 1 if os.path.lexists(self.state_path) else 0  # no state: a later run retries
+        for path in pending:
+            try:
+                self._retry_hooks(path)
+            except (OSError, RepairError) as exc:  # one report never stops the heal below
+                _log(f"the git hooks retry for {path} was not recorded ({exc})")
+        if not os.path.lexists(self.state_path):
+            self._say("nothing to repair: there is no update state")
+            return 0
+        return self._judge_state(locks[0])
 
     def _checkout_locks(self, deadline: float) -> list[str] | None:
         """genesis-checkout.lock, then no process holding a git lock; the git
@@ -802,15 +842,17 @@ class Repair:
         if not to:
             self._say("a half-written checkout on main is not repaired here; only `live` rows are")
             return 0 if self.boot else 3
+        # Judged by HEAD and the branch, as the guard's live rule judges them,
+        # never by the guard's wording: off the tag, the guard calls a live row
+        # half-written only with HEAD on `live` at the target (a rollback killed
+        # partway), which the repair finishes (D1f).
         head = _out(self.repo, "rev-parse", "--verify", "-q", "HEAD^{commit}", check=False)
         if head != self.guard._tag_commit(state, self.repo):
-            # HEAD off the tag (on `live` at the target: a rollback killed partway).
-            # Finishing it (moving `live` back, restoring the hooks) is the forward
-            # repair, D1f. C2 does not arm `live` before D1f lands, so no real install
-            # reaches this state until then, and PR C's message stays its remedy.
-            # Judged by HEAD, never by the guard's wording.
-            self._say("forward case: needs the forward repair (D1f); nothing changed")
-            return 1
+            branch = _out(self.repo, "symbolic-ref", "-q", "HEAD", check=False)
+            if head != to or branch != "refs/heads/live":
+                self._say("the checkout is neither at its rollback tag nor on `live` at the target")
+                return 1
+            self.forward = True
         return self._heal(state, raw, to, index_lock)
 
     def _live_target(self, state: object) -> str | None:
@@ -823,8 +865,8 @@ class Repair:
     def _heal(self, state: dict, raw: bytes, to: str, index_lock: str) -> int:
         repo = self.repo
         self.tag = tag = self.guard._tag_commit(state, repo)
-        if _out(repo, "rev-parse", "--verify", "HEAD^{commit}") != tag:
-            raise RepairError("HEAD is not the rollback tag")
+        if _out(repo, "rev-parse", "--verify", "HEAD^{commit}") != (to if self.forward else tag):
+            raise RepairError("HEAD moved while the repair judged it")
         self.fmt = _out(repo, "rev-parse", "--show-object-format")
         backup = self._backup_dir()
         ts = os.path.basename(backup)[: -len(SUFFIX)]
@@ -841,10 +883,25 @@ class Repair:
         rows = rows if readable else self._rows(None, index, flags)
         manifest = {"ts": ts, "repo": repo, "state_row": state, "tag": tag, "other": to}
         # `reapply` stays [] (#3868: no generated shell) so older readers stay valid.
-        manifest.update(result=None, paths=rows, reapply=[], dismissed_at=None, index_rebuilt=torn)
-        manifest["integrity"] = "SAVED.json"
+        manifest.update(result=None, paths=rows, reapply=[], dismissed_at=None, hooks=None)
+        manifest.update(index_rebuilt=torn, integrity="SAVED.json")
         self._save(backup, manifest)
         self._apply(rows, index)
+        if self.forward:
+            # Recorded before the ref moves, so a kill after it leaves the hooks
+            # to the next run's retry (which supersedes it if `live` never moved).
+            manifest["hooks"] = "pending"
+            # Every writer of a REPAIR.json holds update.lock (_run, _dismiss,
+            # _restore): _retry_hooks writes back what it read under it.
+            write_json(os.path.join(backup, "REPAIR.json"), manifest, private=True)
+            msg = f"live-move repair: finish the rollback to {tag[:12]}"
+            cas = _git(repo, "update-ref", "-m", msg, "refs/heads/live", tag, to, check=False)
+            if cas.returncode != 0:
+                manifest["hooks"] = None
+                why = cas.stderr.decode(errors="replace").strip()
+                result = f"unresolved: `live` could not be moved from {to[:12]} to the tag ({why})"
+                return self._finish(backup, manifest, result, 1)
+            manifest["hooks"] = self._put_hooks_back(backup, manifest, to, tag)
         _git(repo, "update-index", "-q", "--refresh", check=False)
         return self._after(backup, manifest, state, raw, readable, index_lock)
 
@@ -913,8 +970,9 @@ class Repair:
         """Copy .git/index byte for byte into the backup before anything
         changes (its locks are kept by _retire_locks). A torn index (its trailing checksum fails: git
         reads one without checking it, then cannot write it back) is rebuilt
-        from HEAD, the tag; its staged entries cannot be read, so its bytes are
-        the record. Returns whether it was rebuilt."""
+        from the tag (HEAD at the tag; in the forward case HEAD is the target,
+        whose trees a power loss may have taken); its staged entries cannot be
+        read, so its bytes are the record. Returns whether it was rebuilt."""
         index = _out(self.repo, "rev-parse", "--path-format=absolute", "--git-path", "index")
         self._report_dir(backup)
         os.mkdir(os.path.join(backup, "git"))
@@ -928,18 +986,21 @@ class Repair:
             return False
         self._sync(backup)
         self._retire_locks(backup)
-        _git(self.repo, "read-tree", "HEAD")
+        _git(self.repo, "read-tree", self.tag)
         return True
 
     def _rows(self, to: str | None, index: dict, flags: dict) -> list[dict]:
         """The rows of the move's paths toward ``to``; with None (the target
-        cannot be read), of every change against HEAD (the tag)."""
+        cannot be read), of every change against the tag, in the worktree and
+        in the index (in the forward case HEAD is the unreadable target)."""
         repo = self.repo
         self.other = _tree(repo, to) if to else {}
         self.tag_dirs = {d for p in self.want for d in _parents(p)}
-        revs = (self.tag, to) if to else ("HEAD",)
+        revs = (self.tag, to) if to else (self.tag,)
         paths = set(_z(_git(repo, "diff", "-z", "--no-renames", "--name-only", *revs).stdout))
-        if not to:  # flagged and untracked paths included
+        if not to:  # staged, flagged and untracked paths included
+            cached = ("diff", "-z", "--no-renames", "--name-only", "--cached", self.tag)
+            paths |= set(_z(_git(repo, *cached).stdout))
             paths |= set(_z(_git(repo, "ls-files", "-z", "--others", "--exclude-standard").stdout))
             paths |= set(flags)
         # A symlink or non-directory parent of ANY path: its own row (in a tag
@@ -982,7 +1043,7 @@ class Repair:
             or special is not None  # never the switch's: it writes files, links, dirs
             or "160000" in (w or ("",))[:1] + (o or ("",))[:1]
             or entries not in (_as_index(w), _as_index(o))
-            or (disk_changed and not self._engine_wrote(p, node, o))
+            or (disk_changed and not self._engine_wrote(p, node, o, w))
         )
         return {
             "path": p,
@@ -1001,10 +1062,11 @@ class Repair:
             "unreachable_through": _link_parent(self.repo, p),
         }
 
-    def _engine_wrote(self, p: str, node, o) -> bool:
+    def _engine_wrote(self, p: str, node, o, w=None) -> bool:
         """The switch's doing: the target's bytes; a path git unlinked before
-        writing; an interrupted write (empty, or a prefix of the target's
-        bytes); an ephemeral path (matched whole, as the guard does); a
+        writing; an interrupted write (empty, or a prefix of the bytes the
+        switch was writing: the target's, or the tag's when a rollback was
+        killed, ``w``); an ephemeral path (matched whole, as the guard does); a
         directory of target files. os.walk lists a directory symlink among the
         subdirectories (and never follows it), so those are judged with the files."""
         if node is None or node == o or re.fullmatch(f"(?:{self.ephemeral})", " " + p):
@@ -1017,11 +1079,16 @@ class Repair:
                 for name in files + [d for d in subdirs if os.path.islink(os.path.join(top, d))]
                 for rel in (os.path.relpath(os.path.join(top, name), self.repo),)
             )
-        if node[0] not in ("100644", "100755") or not o or o[0] not in ("100644", "100755"):
+        writing = w if self.forward else o
+        if (
+            node[0] not in ("100644", "100755")
+            or not writing
+            or writing[0] not in ("100644", "100755")
+        ):
             return False
         with open(full, "rb") as fh:
             have = fh.read()
-        blob = _git(self.repo, "cat-file", "blob", o[1]).stdout
+        blob = _git(self.repo, "cat-file", "blob", writing[1]).stdout
         return len(have) < len(blob) and blob.startswith(have)
 
     def _save(self, backup: str, manifest: dict) -> None:
@@ -1173,7 +1240,8 @@ class Repair:
             # the move's (HOLD: a tracked edit off its paths, the state a person
             # keeps or Dismisses, #3532). The start policy for it is the guard's
             # callers', not this repair's (#3373). GUARDS is unreachable here:
-            # HEAD is at the tag (checked above), where the guard's live rule
+            # HEAD is at the tag (checked above, or moved there by the forward
+            # case's compare-and-swap), where the guard's live rule
             # answers only MIXED_TREE, HOLD or SAFE; the arm is kept as a pin in
             # case that rule ever grows one.
             if partial:
@@ -1182,6 +1250,16 @@ class Repair:
                 # operator back here, a new backup each run.
                 self._rewrite(raw, judged)
             kept = f"the move's paths were restored; what still holds: {reason}"
+            if self.forward:
+                # The guard's HOLD remedy says the update never changed the
+                # checkout: here it did, and the repair moved `live` back.
+                why = reason.split(". ", 1)[0]
+                kept = (
+                    "the rollback was finished (the move's paths restored, `live` moved back "
+                    f"to the tag); what still holds: {why}. Save that edit if you want it (it "
+                    "may be another session's), then Dismiss the update on the dashboard's "
+                    "update card and run scripts/update.sh again"
+                )
             return self._finish(backup, manifest, f"healed, state kept: {kept}", 0)
         return self._finish(backup, manifest, f"unresolved: {verdict}: {reason}", 1)
 
@@ -1222,12 +1300,22 @@ class Repair:
                 f" {foreign} path(s) were not the update's. To see what putting them back"
                 f" would write: {cmd} --check. To put them back: {cmd}."
             )
+        hooks_pending = manifest.get("hooks") == "pending"
+        if hooks_pending:
+            body += " The git hooks are not put back yet; the next repair run retries."
+        if manifest.get("hooks_note"):
+            body += f" {manifest['hooks_note']}"
         if self.backups_warning:
             body += f" WARNING: {self.backups_warning}."
         self._say(body)
         severity = (
             "critical"
-            if foreign or manifest["index_rebuilt"] or rc or self.backups_warning
+            if foreign
+            or manifest["index_rebuilt"]
+            or rc
+            or self.backups_warning
+            or hooks_pending
+            or manifest.get("hooks_before")
             else "warning"
         )
         self._alert(severity, body, f"live_move_repair:{manifest['ts']}", backup)
@@ -1259,20 +1347,286 @@ class Repair:
         if p.returncode != 0:
             _log(f"the alert was not queued (exit {p.returncode})")
 
+    def _restore_hooks(self, before: str, after: str) -> bool:
+        """The engine's restore-hooks, as update.sh's rollback runs it: the
+        checkout's own engine (the tag's, now on disk), handed update.lock's fd.
+        No timeout: it runs sync-hooks (up to 120 s) outside BOOT_BUDGET_S. No
+        --boot caller exists yet; bounding it inside a server start is PR D2's,
+        which wires --boot."""
+        env = {
+            **os.environ,
+            "DEPLOY_CANDIDATES_LOCK_FD": str(self.update_fd),
+            "DEPLOY_CANDIDATES_EPHEMERAL_RE": _ephemeral(),
+        }
+        engine = os.path.join(self.repo, "scripts", "deploy_candidates.py")
+        p = subprocess.run(
+            ["python3", "-I", "-S", engine, "restore-hooks", before, after],
+            env=env,
+            pass_fds=(self.update_fd,),
+            capture_output=True,
+            text=True,
+        )
+        if p.returncode != 0:
+            _log(f"restore-hooks failed (exit {p.returncode}): {p.stderr.strip()[-2000:]}")
+        return p.returncode == 0
+
+    def _report(self, path: str) -> dict | None:
+        """The REPAIR.json at ``path`` through load_report, the readers' one
+        bounded, no-follow way in, pinned to this checkout; None for anything
+        it refuses or that is not there."""
+        try:
+            loaded = load_report(os.path.dirname(path), self.repo)
+        except BadReport:
+            return None
+        return loaded["report"] if loaded else None
+
+    def _pending_hooks(self) -> list[str]:
+        """The REPAIR.json path of every report whose hooks are pending."""
+        try:
+            names = sorted(n for n in os.listdir(self.backups) if n.endswith(SUFFIX))
+        except OSError:
+            return []
+        kept = [n for n in names if not dismiss_marked(os.path.join(self.backups, n))]
+        found = [os.path.join(self.backups, n, "REPAIR.json") for n in kept]
+        return [p for p in found if (self._report(p) or {}).get("hooks") == "pending"]
+
+    def _retry_hooks(self, path: str) -> None:
+        """A forward repair's hooks not yet put back. Superseded once
+        `refs/heads/live` itself left that repair's tag (whatever moved it owns
+        the hooks now); retried while `live` is there and HEAD is on it; with
+        HEAD elsewhere (detached, another branch) left pending for a later run.
+        The report is read here, under update.lock, which every other writer of
+        REPAIR.json takes too (--dismiss, a restore), and only its `hooks` key
+        is changed, so a dismissal or a restore record is never undone. REPAIR.json is
+        user-writable, so its commits must be full commit ids before they reach
+        restore-hooks' argv; an entry whose are not is left as it is. Read
+        through load_report: a report it refuses (another checkout's, a symlink,
+        a name the repair never writes, over its caps) is never retried."""
+        manifest = self._report(path)
+        if manifest is None or manifest.get("hooks") != "pending":
+            return
+        tag, other = manifest.get("tag"), manifest.get("other")
+        if not all(isinstance(c, str) and _COMMIT.fullmatch(c) for c in (tag, other)):
+            return
+        live = _out(
+            self.repo, "rev-parse", "--verify", "-q", "refs/heads/live^{commit}", check=False
+        )
+        branch = _out(self.repo, "symbolic-ref", "-q", "HEAD", check=False)
+        if live != tag:
+            hooks = "superseded"
+        elif branch != "refs/heads/live":  # HEAD on `live` is then the tag too
+            return
+        else:
+            note = manifest.get("hooks_note")
+            hooks = self._put_hooks_back(os.path.dirname(path), manifest, other, tag)
+            if manifest.get("hooks_note") != note:  # hooks moved aside: say where
+                severity = "critical" if manifest.get("hooks_before") else "warning"
+                key = f"live_move_repair:{manifest.get('ts')}:hooks"
+                self._alert(severity, manifest["hooks_note"], key, os.path.dirname(path))
+            if hooks == "pending":
+                return
+        write_json(path, {**manifest, "hooks": hooks}, private=True)
+        _log(f"the git hooks of {path} are {hooks}")
+
+    def _put_hooks_back(self, backup: str, manifest: dict, before: str, after: str) -> str:
+        """restore-hooks from ``before`` to ``after`` (the tag): "ok", or
+        "pending" (a later run retries). When the moved-from commit's hook
+        sources cannot be read (its objects are gone), no retry can ever
+        restore from it, so the tag's hooks are reinstalled instead:
+        "reinstalled". ``hooks_note`` then says so, naming hooks-before/ when
+        any hook was moved there (``hooks_before``)."""
+        if self._restore_hooks(before, after):
+            return "ok"
+        if self._hook_sources_readable(before) or not self._reinstall_hooks(
+            backup, manifest, after
+        ):
+            return "pending"
+        saved = (
+            f"; every installed hook that differed from the tag's (a hand-edited one included) "
+            f"is kept in {backup}/hooks-before ({', '.join(manifest['hooks_before'])})"
+            if manifest.get("hooks_before")
+            else ""
+        )
+        manifest["hooks_note"] = (
+            f"The moved-from commit {before[:12]} cannot be read, so the git hooks the tag's "
+            f"sync-hooks.sh lists were reinstalled from the tag {after[:12]}{saved}. A hook "
+            "only the moved-from commit listed is left installed."
+        )
+        return "reinstalled"
+
+    def _hook_sources_readable(self, commit: str) -> bool:
+        """Can restore-hooks read ``commit``'s scripts/hooks (the commit, its
+        trees down there, and every blob in them)?"""
+        if _git(self.repo, "cat-file", "-e", f"{commit}^{{commit}}", check=False).returncode:
+            return False
+        ls = _git(self.repo, "ls-tree", "-r", "-z", "--full-tree", commit, "--", "scripts/hooks",
+                  check=False)  # fmt: skip
+        if ls.returncode:
+            return False
+        blobs = [rec.split("\t", 1)[0].split()[2] for rec in _z(ls.stdout)]
+        check = _git(self.repo, "cat-file", "--batch-check", check=False,
+                     data=b"".join(o.encode() + b"\n" for o in blobs))  # fmt: skip
+        return check.returncode == 0 and b" missing" not in check.stdout
+
+    def _reinstall_hooks(self, backup: str, manifest: dict, tag: str) -> bool:
+        """Install the tag's git hooks over whatever is installed, through the
+        tag's own engine. Each installed regular-file hook the tag's
+        sync-hooks.sh lists whose bytes are not the tag's is copied into
+        <backup>/hooks-before/ (0600, never overwriting an earlier copy, made
+        durable), its name recorded in REPAIR.json's ``hooks_before`` (with a
+        note naming the folder), and only then removed; restore-hooks <tag>
+        <tag> then has sync-hooks.sh install them fresh (a same-directory temp
+        file renamed over, executable) and judges the result as readiness does.
+        Between the removal and that install no such hook is installed (seconds;
+        a failure there leaves the record, and the next run converges). Installs
+        where sync-hooks.sh does, $GIT_COMMON_DIR/hooks: with core.hooksPath
+        pointing elsewhere nothing is touched (readiness names that setting).
+        The report dir, and hooks-before in it, must be this user's 0700
+        directories (the heal's _report_dir rule; the retry passes a dir only
+        load_report checked): otherwise nothing is touched."""
+        common = _out(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        hooks = os.path.join(common, "hooks")
+        # Where git runs hooks from, read without GIT_C's own core.hooksPath
+        # override (rev-parse runs no hook).
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        where = subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", "-C", self.repo, "rev-parse",
+             "--path-format=absolute", "--git-path", "hooks"],
+            capture_output=True, env=env,
+        )  # fmt: skip
+        runs = os.fsdecode(where.stdout.strip())
+        if where.returncode or os.path.realpath(runs) != os.path.realpath(hooks):
+            _log(f"core.hooksPath points git at {runs}; the git hooks were not reinstalled")
+            return False
+        aside = os.path.join(backup, "hooks-before")
+        if not _private_dir(backup) or (os.path.lexists(aside) and not _private_dir(aside)):
+            _log(
+                f"{backup} is not this user's private report dir; the git hooks were not reinstalled"
+            )
+            return False
+        listed = _git(self.repo, "show", f"{tag}:scripts/hooks/sync-hooks.sh", check=False)
+        text = listed.stdout.decode(errors="replace") if listed.returncode == 0 else ""
+        moved: list[tuple[str, str]] = []  # (installed name, the copy's name)
+        for name in sorted(os.listdir(hooks)) if os.path.isdir(hooks) else []:
+            dst = os.path.join(hooks, name)
+            if not _sync_listed(text, name) or not stat.S_ISREG(os.lstat(dst).st_mode):
+                continue
+            entry = _out(self.repo, "ls-tree", tag, "--", f"scripts/hooks/{name}", check=False)
+            want = entry.split()[2] if entry.split()[1:2] == ["blob"] else None
+            if want is None or want == _out(self.repo, "hash-object", "--no-filters", "--", dst):
+                continue
+            if not os.path.lexists(aside):
+                os.mkdir(aside, 0o700)
+            moved.append((name, _copy_private(dst, aside, name)))
+        if moved:
+            self._sync(backup)  # the only copy of a hand edit, durable before it goes
+            prior = manifest.get("hooks_before")
+            prior = prior if isinstance(prior, list) else []
+            manifest["hooks_before"] = [*prior, *(copy for _, copy in moved)]
+            manifest["hooks_note"] = (
+                f"The git hooks {', '.join(n for n, _ in moved)} were moved to {aside} to "
+                f"reinstall the tag {tag[:12]}'s, and are not reinstalled yet; the next "
+                "repair run retries."
+            )
+            write_json(os.path.join(backup, "REPAIR.json"), manifest, private=True)
+        for name, _copy in moved:
+            os.unlink(os.path.join(hooks, name))
+        return self._restore_hooks(tag, tag)
+
+
+def _sync_listed(text: str, name: str) -> bool:
+    """Is ``name`` one sync-hooks.sh ``text`` lists? Its arrays quote each
+    name on a line of its own, and nothing else in it is a quoted hook name
+    (pinned against the engine's parser, gate.sync_hook_names, by a test)."""
+    return f'"{name}"' in text
+
+
+def _private_dir(path: str) -> bool:
+    """A directory of this user's (never a link) that no one else can enter."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077
+
+
+def _copy_private(src: str, folder: str, name: str) -> str:
+    """Copy ``src`` into ``folder`` as a new 0600 file, never following or
+    replacing a node already there: ``name``, else ``name.2``, ``name.3``...
+    Returns the name used."""
+    with open(src, "rb") as fh:
+        data = fh.read()
+    for n in range(1, 1000):
+        used = name if n == 1 else f"{name}.{n}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            fd = os.open(os.path.join(folder, used), flags, 0o600)
+        except FileExistsError:
+            continue
+        with open(fd, "wb") as out:
+            out.write(data)
+        return used
+    raise RepairError(f"{folder} holds too many copies of {name}")
+
+
+_COMMIT = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 EXPLAIN = """The repair's steps, by hand, for when it cannot run:
-1. Copy aside every path `git diff --name-only <rollback tag> <live_move.to>` lists
-   (untracked files there included) and a .git/index.lock no git process holds.
+1. Copy aside every path `git diff --name-only <rollback tag> <target>` lists (the
+   target is live_move.to, or own_head for a row without a move record; untracked
+   files there included) and a .git/index.lock no git process holds.
 2. git restore --source=<tag> --staged --worktree -- <those the tag or the index has>;
    delete the others.
-3. Once scripts/lib/update_state_guard.py <state> <repo> exits 10, remove the state."""
+3. HEAD on `live` at the target (a rollback killed partway): then
+   git update-ref refs/heads/live <tag> <target>. The git hooks the rebuild
+   installed are put back by restore-hooks <target> <tag>, which needs update.lock
+   held for it, and no by-hand route takes it: once the kit is installed,
+   re-run scripts/deploy_candidates repair-move (it retries pending hooks).
+4. Once scripts/lib/update_state_guard.py <state> <repo> exits 10, remove the state."""
+
+
+def _dismiss_unread(backup: str, why: str) -> int:
+    """--dismiss for a report no reader can read: DISMISS_MARK, or 1 when the
+    dir itself is not one the repair writes (a link, a file, another user's)."""
+    try:
+        st = os.lstat(backup)
+    except OSError as exc:
+        _log(
+            f"the repair report in {backup} is not read: {why}; nothing was dismissed ({exc.strerror})"
+        )
+        return 1
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        _log(
+            f"the repair report in {backup} is not read: {why}; it is not this user's directory, so nothing was dismissed"
+        )
+        return 1
+    stamp = time.strftime("%FT%TZ", time.gmtime())
+    try:
+        write_json(
+            os.path.join(backup, DISMISS_MARK),
+            {"dismissed_at": stamp, "unread": why[:300]},
+            private=True,
+        )
+    except OSError as exc:
+        _log(
+            f"the repair report in {backup} is not read: {why}; {DISMISS_MARK} cannot be"
+            f" written ({exc.strerror}), so nothing was dismissed"
+        )
+        return 1
+    _log(
+        f"the repair report in {backup} is not read ({why}); dismissed with {DISMISS_MARK} beside it"
+    )
+    return 0
 
 
 def _dismiss(state: str, repo: str, ts: str, wait: int) -> int:
     """--dismiss TS: rewrite REPAIR.json with dismissed_at, only under
     update.lock (review SF-7: a restore rewrites it too, and an unlocked
     load-then-write would lose the other's field); still held after ``wait``,
-    nothing is written."""
+    nothing is written. A report load_report refuses (unreadable, or recorded
+    for another checkout) is dismissed with DISMISS_MARK beside it instead,
+    when its dir is a real directory of this user's: REPAIR.json is left as it
+    is, and every reader skips the dir."""
     home = os.path.dirname(os.path.abspath(state))
     backup = os.path.join(home, "deploy-backups", ts + SUFFIX)
     try:
@@ -1289,8 +1643,7 @@ def _dismiss(state: str, repo: str, ts: str, wait: int) -> int:
         try:
             loaded = load_report(backup, repo)
         except BadReport as exc:
-            _log(f"the repair report in {backup} is not read: {exc}")
-            return 1
+            return _dismiss_unread(backup, str(exc))
         if loaded is None:
             _log(f"no repair report in {backup}")
             return 1

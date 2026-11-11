@@ -1413,6 +1413,7 @@ _ADVISORY_BY_DESIGN = {
     "hooks/capped_read_advisory.py": "ADVISORY ONLY.",
     "hooks/credential_surface_hook.py": "Exit 0 always — advisory, never blocks.",
     "hooks/deploy_timeout_advisory.py": "ADVISORY ONLY. It never blocks and never asks",
+    "hooks/holdout_fence.py": "ADVISORY ONLY. It never blocks, never asks and always exits 0",
     "hooks/pipe_status_guard.py": "ADVISORY, never blocking:",
     "hooks/pr_close_advisory.py": "Say so; never block it.",
     "hooks/pre_push_privacy_review.py": "NON-BLOCKING.",
@@ -1430,6 +1431,11 @@ _ADVISORY_BY_DESIGN = {
 #: production cannot run, and resolving it would have this test exercise a guard the
 #: real configuration never reaches.
 _LAUNCHER = "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook"
+
+#: Exact shell prefixes allowed in front of the launcher. Each only exits 0 when
+#: the hook has nothing to watch, so a guard behind one is still the guard run
+#: below. Matched as whole text, never as a pattern.
+_PRESENCE_GATES = ('[ -d "${GENESIS_HOME:-$HOME/.genesis}/holdout" ] || exit 0;',)
 
 #: A tripwire, not a count. If the enumeration collapses — a renamed key, a
 #: reshaped settings file — pytest reports an EMPTY parametrize list as SKIPPED,
@@ -1496,6 +1502,13 @@ def _resolve_bash_hook(command: str) -> tuple[str, str | None, list[str]]:
     # Every one of those failure modes is the same shape: the test exercised a guard
     # the configured command would never reach. So the launcher must be the path the
     # settings actually support; anything else is unresolvable and FAILS.
+    # One shell prefix is recognised, by its exact text: a presence gate that exits
+    # 0 before the launcher when the hook has nothing to watch on this install
+    # (holdout_fence.py). What follows it must still be the supported launcher.
+    for gate in _PRESENCE_GATES:
+        if command.startswith(gate + " "):
+            tokens = command[len(gate) + 1 :].split()
+            break
     if len(tokens) > 1 and tokens[0] == _LAUNCHER:
         rel = tokens[1]
         return rel, rel, tokens[2:]
