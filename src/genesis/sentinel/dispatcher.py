@@ -656,6 +656,25 @@ class SentinelDispatcher:
                     # (it would start an unapproved CC session). The handler
                     # below fails closed.
                     raise ValueError(f"unexpected sentinel_dispatch approval status {status!r}")
+                # One approval, one dispatch (#4348): consume an approved row
+                # before using it. ensure_approval reuses approved-but-unconsumed
+                # rows, so without this one row authorised every later dispatch
+                # with the same key for up to 24h. No request id means manual
+                # approval is off by config: nothing to consume.
+                if request_id and not await self._approval_gate.mark_consumed(request_id):
+                    logger.warning(
+                        "Sentinel dispatch approval %s already used — not dispatching",
+                        request_id,
+                    )
+                    append_log({
+                        "event": "dispatch_approval_already_used",
+                        "request_id": request_id,
+                    })
+                    return SentinelResult(
+                        dispatched=False,
+                        reason="Dispatch approval already used",
+                        duration_s=time.monotonic() - start,
+                    )
                 logger.info("Sentinel dispatch approved (%s)", request_id)
                 append_log({"event": "dispatch_approved", "request_id": request_id})
             except Exception:
@@ -837,6 +856,8 @@ class SentinelDispatcher:
 
         Returns SentinelResult if pending/rejected (caller should return it).
         Returns None if approved (caller should proceed to execute actions).
+        Raises ValueError if the approval cannot be used (unknown status, or
+        an approval already consumed); the caller fails closed.
         """
         status, request_id, reason = await self._approval_gate.ensure_approval(
             subsystem="sentinel",
@@ -890,6 +911,11 @@ class SentinelDispatcher:
             # Not a status this gate knows: never read it as approval. The
             # caller's handler fails closed (nothing executes).
             raise ValueError(f"unexpected sentinel_action approval status {status!r}")
+
+        # One approval, one execution (#4348): consume before executing; an
+        # already-used row raises into the caller's fail-closed handler.
+        if request_id and not await self._approval_gate.mark_consumed(request_id):
+            raise ValueError(f"sentinel_action approval {request_id} already used")
 
         # Approved — return None so caller executes actions
         logger.info("Sentinel actions approved (%s)", request_id)

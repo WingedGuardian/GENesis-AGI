@@ -1110,6 +1110,9 @@ def _policy_gate(action_status, request_id):
 
     gate = MagicMock()
     gate.ensure_approval = AsyncMock(side_effect=_ensure)
+    # The real gate's consume is async and atomic; an approval is consumed
+    # before it is used (#4348).
+    gate.mark_consumed = AsyncMock(return_value=True)
     return gate
 
 
@@ -1560,6 +1563,7 @@ class TestApprovalFailsClosed:
 
         gate = MagicMock()
         gate.ensure_approval = AsyncMock(side_effect=_ensure)
+        gate.mark_consumed = AsyncMock(return_value=True)
         mock_execute = AsyncMock(return_value=[])
         d, result = await self._dispatch(gate, mock_execute)
 
@@ -1652,3 +1656,75 @@ class TestApprovalFailsClosed:
         mock_execute.assert_not_awaited()
         assert d._state.state == SentinelState.HEALTHY
         assert not d._state.pending_request_id
+
+
+class TestApprovalIsConsumedOnUse:
+    """An approval authorises ONE dispatch and ONE action set (#4348). When the
+    gate returns an existing approved row, the dispatcher consumes it before
+    acting; if it was already consumed, nothing happens."""
+
+    def _gate(self, *, dispatch_id="req-d", action_id="req-a", consumed_ok=True):
+        async def _ensure(**kwargs):
+            if kwargs.get("policy_id") == "sentinel_action":
+                return ("approved", action_id, "existing approval found")
+            return ("approved", dispatch_id, "existing approval found")
+
+        gate = MagicMock()
+        gate.ensure_approval = AsyncMock(side_effect=_ensure)
+        gate.mark_consumed = AsyncMock(return_value=consumed_ok)
+        return gate
+
+    async def _dispatch(self, gate):
+        d = _make_dispatcher(approval_gate=gate)
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        d._invoker.run = AsyncMock(return_value=_proposed_actions_output())
+        mock_execute = AsyncMock(return_value=[])
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"), \
+             patch.object(d, "_execute_approved_actions", mock_execute):
+            result = await d.dispatch(SentinelRequest(
+                trigger_source="test", trigger_reason="test alarm", tier=2,
+            ))
+        return d, result, mock_execute
+
+    @pytest.mark.asyncio
+    async def test_reused_approvals_are_consumed_before_use(self):
+        gate = self._gate()
+        d, _result, mock_execute = await self._dispatch(gate)
+        consumed = [c.args[0] for c in gate.mark_consumed.await_args_list]
+        assert consumed == ["req-d", "req-a"]
+        d._invoker.run.assert_awaited()
+        mock_execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_already_consumed_dispatch_approval_starts_nothing(self):
+        gate = self._gate(consumed_ok=False)
+        d, result, mock_execute = await self._dispatch(gate)
+        d._invoker.run.assert_not_awaited()
+        mock_execute.assert_not_awaited()
+        assert result.dispatched is False
+
+    @pytest.mark.asyncio
+    async def test_already_consumed_action_approval_executes_nothing(self):
+        gate = self._gate()
+        calls = {"n": 0}
+
+        async def _consume(rid):
+            calls["n"] += 1
+            return rid == "req-d"  # the dispatch row consumes; the action row was used
+
+        gate.mark_consumed = AsyncMock(side_effect=_consume)
+        d, result, mock_execute = await self._dispatch(gate)
+        d._invoker.run.assert_awaited()
+        mock_execute.assert_not_awaited()
+        assert result.resolved is False
+
+    @pytest.mark.asyncio
+    async def test_config_off_switch_approval_has_nothing_to_consume(self):
+        """('approved', None, ...) is the manual-approval-off path: no row."""
+        gate = self._gate(dispatch_id=None, action_id=None)
+        d, _result, mock_execute = await self._dispatch(gate)
+        gate.mark_consumed.assert_not_awaited()
+        d._invoker.run.assert_awaited()
+        mock_execute.assert_awaited_once()
