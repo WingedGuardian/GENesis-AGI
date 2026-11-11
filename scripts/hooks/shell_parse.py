@@ -5150,9 +5150,8 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
         #
         # `+` WAS in this set, added with `-`/`--` to answer a review finding
         # about the lone-hyphen case; the hyphen half was right and the plus
-        # half was not. `_first_operand` still treats a lone `+` as a
-        # terminator AFTER the selector, deliberately — see the non-mirror
-        # note there. The shell parses the two positions differently.
+        # half was not. The same holds AFTER the selector: `_first_operand`
+        # skips a lone `+` too (#2218).
         if tok in {"-", "--"}:
             break
         if not (tok[:1] in ("-", "+") and len(tok) > 1):
@@ -5180,24 +5179,18 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
             continue
 
         options = tok[1:]
-        if "c" not in options or tok[0] != "-":
+        if "c" not in options:
             # A bundle that does not select the script still carries option
             # state, and an invalid one makes the shell refuse the whole
             # invocation.
             #
-            # ⚠ `+c` IS A SELECTOR and this branch declines it anyway. MEASURED:
-            # `bash +c 'echo X'` and `dash +c 'echo X'` both print X, so the
-            # payload runs while nothing here reports it — a live fail-open in
-            # the `+` spelling. It PRE-DATES this change (the previous scan
-            # skipped `+` tokens entirely and missed it too), and closing it
-            # means deciding what a `+` bundle does to the operand scan, which
-            # is its own measured question rather than a character deleted from
-            # a condition. Tracked as its own issue; NOT closed here, because
-            # widening a gate-surface diff to chase a spelling nothing emits is
-            # how the round budget gets spent. An earlier revision of this
-            # comment asserted the opposite ("`+` DISABLES, so it can never
-            # introduce the command string") — that was false and is the reason
-            # the claim is now stated with its measurement attached.
+            # The SIGN of a bundle does not decide whether it selects: `+c`
+            # selects exactly like `-c` (#2218). MEASURED on bash 5.2 and dash
+            # across 2,256 argv shapes per shell: every shape whose bundle is
+            # `+c`, `+cn`, `+nc`, `+cx`, `+xc` or `+ce` runs its operand, and
+            # those were the ONLY misses this scan had. So the selector test
+            # reads the letter, and the sign only decides what the bundle's
+            # OTHER letters do to the no-exec state.
             if not set(options) - takes_value <= allowed:
                 return ""  # the shell refuses this invocation; nothing runs
             n_values = sum(1 for ch in options if ch in takes_value)
@@ -5230,7 +5223,11 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
             v in _C_NO_EXEC_OPTION_VALUES
             for v in argv[i + 1 : i + 1 + n_values]
         ):
-            state_noexec = True
+            # The sign decides, as in every other bundle: `-cn CMD` parses and
+            # runs nothing, `+cn CMD` RUNS (MEASURED, bash and dash) because
+            # `+n` clears no-exec. Setting it unconditionally here would hide
+            # a command that runs now that `+` bundles reach this branch.
+            state_noexec = tok[0] == "-"
         start = i + 1 + n_values
 
         # ONCE A VALID `-c` BUNDLE OWNS SELECTION, its resolution is final.
@@ -5290,13 +5287,25 @@ def _first_operand(
     j = start
     while j < len(argv):
         tok = argv[j]
-        if tok in ("-", "--", "+"):
+        if tok == "+":
+            # A LONE `+` IS AN EMPTY BUNDLE, NOT A TERMINATOR, after the
+            # selector exactly as before it (#2218). The shell skips it and
+            # keeps parsing options. MEASURED on bash 5.2 and dash: `-c + -n
+            # CMD` runs NOTHING (the `-n` after `+` is an option, so no-exec is
+            # on) and `-c + +n CMD` runs CMD. Treating `+` as a terminator
+            # returned `+n` as the script and hid CMD from every guard: all
+            # 872 bash and 792 dash misses in a 3-token sweep (80,160 shapes
+            # per shell) had a lone `+` after the selector, and none remain
+            # with this skip. `-c + CMD` still resolves to CMD either way.
+            j += 1
+            continue
+        if tok in ("-", "--"):
             # END of option processing. The very next token IS the command
             # string even when it looks like an option: `bash -c -- '-x' CMD`
             # runs `-x` and makes CMD merely `$0`. Resuming the option scan here
             # reported CMD as the script and blocked a command that never ran.
-            # A LONE `-` or `+` terminates the same way: MEASURED, `bash -c - cmd`
-            # and `bash -c + cmd` both run cmd (bash and dash).
+            # A LONE `-` terminates the same way: MEASURED, `bash -c - cmd` runs
+            # cmd (bash and dash).
             j += 1
             if j < len(argv):
                 return (True, argv[j], state_noexec, sticky_noexec)

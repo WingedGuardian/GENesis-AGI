@@ -1200,12 +1200,29 @@ _EXECUTING_C_SHAPES = [
     # consumes a value exactly like `-o`.
     "bash -c +e 'PAYLOAD'",
     "bash -c +o pipefail 'PAYLOAD'",
-    # A lone `-` (and a lone `+`) ends option processing like `--`.
+    # A lone `-` ends option processing like `--`. A lone `+` does NOT: it is
+    # an empty bundle the shell skips (#2218), so the operand after it is
+    # still the script.
     "bash -c - 'PAYLOAD'",
     "bash -c + 'PAYLOAD'",
     "sh -c -- 'PAYLOAD'",
     "sh -c - 'PAYLOAD'",
     "sh -c +e 'PAYLOAD'",
+    # `+c` selects exactly like `-c` (#2218): the sign of the bundle does not
+    # decide whether it selects, only what its other letters do.
+    "bash +c 'PAYLOAD'",
+    "bash +cx 'PAYLOAD'",
+    "bash +xc 'PAYLOAD'",
+    "bash +ce 'PAYLOAD'",
+    "sh +c 'PAYLOAD'",
+    "bash +c -- 'PAYLOAD'",
+    # `+n` inside the selecting bundle CLEARS no-exec, so these run.
+    "bash +cn 'PAYLOAD'",
+    "sh +nc 'PAYLOAD'",
+    # A lone `+` after the selector is skipped and option parsing continues.
+    "bash -c + +n 'PAYLOAD'",
+    "bash +c + 'PAYLOAD'",
+    "sh -c + +e 'PAYLOAD'",
 ]
 
 
@@ -1522,6 +1539,23 @@ _NO_EXEC_MATRIX = [
     (["+", "+n", "-c", "PAYLOAD"], True),                        # + skipped, +n enables
     (["-", "-c", "PAYLOAD"], False),                             # - DOES terminate
     (["--", "-c", "PAYLOAD"], False),                            # -- DOES terminate
+    # #2218: `+c` SELECTS like `-c`, and the bundle's sign only decides what
+    # its OTHER letters do. Before the fix every `+c` row that runs was a
+    # BYPASS: the parser reported no nested command at all.
+    (["+c", "PAYLOAD"], True),                                   # +c selects
+    (["+cn", "PAYLOAD"], True),                                  # +n in it clears
+    (["-cn", "PAYLOAD"], False),                                 # -n in it sets
+    (["-n", "+c", "PAYLOAD"], False),                            # earlier -n holds
+    (["-n", "+cn", "PAYLOAD"], True),                            # +cn clears it
+    (["+c", "-n", "PAYLOAD"], False),                            # later -n holds
+    # #2218: a lone `+` AFTER the selector is the same empty bundle as before
+    # it, not a terminator. MEASURED: `-c + -n CMD` runs nothing, which is
+    # only possible if option parsing continued past the `+`.
+    (["-c", "+", "PAYLOAD"], True),
+    (["-c", "+", "+n", "PAYLOAD"], True),                        # issue's shape
+    (["-c", "+", "-n", "PAYLOAD"], False),                       # + not a terminator
+    (["-c", "+", "+", "PAYLOAD"], True),
+    (["+c", "+", "-x", "PAYLOAD"], True),
 ]
 
 
