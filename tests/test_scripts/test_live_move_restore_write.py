@@ -564,6 +564,51 @@ def test_a_damaged_copy_refuses_its_rows_index_and_flag_parts_alike_in_both(w, m
     _check_said_what_restore_did(c, r)
 
 
+@pytest.mark.parametrize(
+    ("make", "copy"), [(_foreign_staged, "A"), (_foreign_both_flags, "sub/s1")]
+)
+def test_a_damaged_copy_after_a_kill_at_the_aside_reads_alike_in_both(w, make, copy):
+    """#4355 review round 2: killed at the aside, the path is empty and the
+    resume rule reads it as-left; a damaged copy then refuses the node and,
+    through the writer's cascade, its index and flag parts, in both modes."""
+    ts, path, _ = _fresh(w, make)
+    assert _restore(w, ts, **{KILL_ENV: "aside"}).returncode == -9
+    assert not os.path.lexists(w.root / path), "control: the path is empty"
+    (w.backups()[-1] / "tree" / copy).write_text("not what was saved\n")
+    _check_said_what_restore_did(_restore(w, ts, "--check"), _restore(w, ts))
+
+
+@pytest.mark.parametrize("damaged", [False, True])
+def test_a_tag_directory_with_a_file_git_does_not_ignore_reads_alike_in_both(w, damaged):
+    """#4355 class audit: the writer refuses moving aside a tag directory that
+    holds a file git does not ignore (other:changed), damaged copy or not, and
+    --check names that refusal too (owner ruling: one eligibility rule)."""
+    ts, _, _ = _fresh(w, _dir_file)
+    (w.root / "sub" / "notes.txt").write_text("a session's\n")
+    if damaged:
+        (w.backups()[-1] / "tree" / "sub").write_text("not what was saved\n")
+    c, r = _restore(w, ts, "--check"), _restore(w, ts)
+    assert _parts(c)[("sub", "node")] == "other:changed", c.stdout
+    _check_said_what_restore_did(c, r)
+
+
+def test_an_unreadable_directory_below_a_tag_directory_refuses_alike_in_both(w):
+    """#4355 class audit: the writer's walk of a tag directory fails on an
+    unreadable directory below it and refuses the whole report; --check, once
+    lenient here (as-left, rc 0), now refuses it the same way."""
+    ts, _, _ = _fresh(w, _dir_file)
+    locked = w.root / "sub" / "locked"
+    locked.mkdir()
+    (locked / "x").write_text("x\n")
+    locked.chmod(0)
+    try:
+        c, r = _restore(w, ts, "--check"), _restore(w, ts)
+    finally:
+        locked.chmod(0o755)
+    assert c.returncode == r.returncode == 1, (c.stdout, r.stdout)
+    assert "other:unreadable" in c.stdout and "other:unreadable" in r.stdout, (c.stdout, r.stdout)
+
+
 def test_a_damaged_copy_behind_a_changed_checkout_reads_changed_in_both(w):
     """#4025 review S2: the writer never stages a part that is not as-left, so
     a damaged copy under a path edited since the repair is refused `changed`
@@ -1031,12 +1076,12 @@ def test_a_resume_from_a_folder_others_can_write_is_refused(w):
 def test_a_tag_directory_moves_aside_only_with_ignored_extras(w):
     """`sub` was a foreign file where the tag has sub/: the restore moves
     sub/ aside. A git-ignored extra there (a cache) moves with it and is
-    named; a file that is not ignored refuses the part (--check stays
-    lenient: it says as-left)."""
+    named; a file that is not ignored refuses the part, and --check says so
+    too (owner ruling 2026-11-10: one eligibility rule, #4355 review)."""
     ts, path, before = _fresh(w, _dir_file)
     (w.root / ".git" / "info" / "exclude").write_text("__pycache__/\n")
     (w.root / "sub" / "notes.txt").write_text("a session's\n")
-    assert _parts(_check(w, ts))[("sub", "node")] == "as-left"
+    assert _parts(_check(w, ts))[("sub", "node")] == "other:changed"
     r = _restore(w, ts)
     assert r.returncode == 1 and _parts(r)[("sub", "node")] == "refused:other:changed", r.stdout
     assert (w.root / "sub" / "notes.txt").read_text() == "a session's\n"

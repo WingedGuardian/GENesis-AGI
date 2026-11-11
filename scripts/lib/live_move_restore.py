@@ -223,8 +223,11 @@ class Judge:
     None for a report written before it, which only --check judges).
     ``runs``: deploy-backups as read (restore run folders, for the resume rule),
     ``shown`` as named in output; ``fd`` the descriptor ``runs`` names, handed
-    to git when it reads an aside. ``strict``: the restore's write gate (a tag
-    directory moved aside may hold no extra file git does not ignore)."""
+    to git when it reads an aside. ``strict``: the restore's own judge, which
+    makes no --check prediction (_staging_refuses, as_the_writer_would). Both
+    modes judge eligibility by the writer's rule (_as_left; owner ruling
+    2026-11-10, #4355 review): a tag directory moved aside may hold no extra
+    file git does not ignore."""
 
     def __init__(self, rp, repo: str, backup: str, loaded: dict, newer: dict, *, records=None,
                  runs=None, shown=None, strict=False, fd=None, complete=True) -> None:  # fmt: skip
@@ -597,8 +600,8 @@ class Judge:
         copies ``rels`` (#4025 item 3), noted on ``p``'s node part. A copy over
         this prediction's own budget is not predicted (the writer's staging has
         no budget and hashes it whole, so --check can read as-left a part whose
-        copy --restore then refuses: the one disagreement left), and a
-        prediction never makes a part other:too-large."""
+        copy --restore then refuses), and a prediction never makes a part
+        other:too-large."""
         for rel in rels:
             try:
                 why = self._damaged(rel, self.predict_budget)
@@ -706,7 +709,9 @@ class Judge:
         return self.damage[rel]
 
     def _as_left(self, p: str) -> bool:
-        return self._left(p, strict=self.strict) or self._resume(p)
+        # The writer's eligibility, in --check too (#4355 review: one rule, so
+        # every reader downstream, disk_ok and the hold sweep, agrees with it).
+        return self._left(p, strict=True) or self._resume(p)
 
     def _dir(self, row: dict, link, gate: str | None) -> list[tuple[str, str, str]]:
         """A directory row: its node, then each saved entry the restore would write."""
@@ -791,18 +796,11 @@ class Judge:
             # A covered row's disk is its parent's node part (an index-only
             # write here, index == tag == HEAD, loses nothing on disk).
             if node is not None:
-                # A node --check predicts the staging refuses passed left()
-                # first (_verdict): its disk is the as-left state, so the row's
-                # index and flag parts stay eligible and as_the_writer_would
+                # A node --check predicts the staging refuses passed the
+                # writer's eligibility first (_verdict, _as_left): the row's
+                # index and flag parts stay eligible, and as_the_writer_would
                 # refuses them row-refused, as the writer does (#4355 review).
-                # The writer judges a tag directory strictly, so that reading
-                # decides here (an extra the checkout does not ignore: changed).
-                if p in self.predicted:
-                    try:
-                        return self._left(p, strict=True)
-                    except OSError:  # unreadable below it: the writer's walk fails too
-                        return False
-                return node in ("as-left", "already-restored")
+                return node in ("as-left", "already-restored") or p in self.predicted
             return covered or bool(row["unreachable_through"]) or self._left(p, whole=False)
 
         def left(ok) -> bool:

@@ -503,9 +503,12 @@ def test_an_unreadable_target_restores_only_foreign_rows_of_a_directory(w):
 def test_an_untracked_file_under_a_tag_directory_changes_no_part(w, make, edit, part):
     """Review SF1: the repair never removes an untracked file under a tag
     directory that is not a row (a cache the server writes), so the directory
-    is compared on the tag's own paths only. Control: one of those paths
-    edited is still `other:changed`."""
+    is compared on the tag's own paths only, plus, for a node part (which
+    moves the directory aside), every other file being one git ignores: the
+    restore's rule, which --check now uses too (#4355 review). Control: one of
+    the tag's paths edited is still `other:changed`."""
     ts = _repaired(w, make)
+    (w.root / ".git" / "info" / "exclude").write_text("__pycache__/\n")
     (w.root / "sub" / "__pycache__").mkdir()
     (w.root / "sub" / "__pycache__" / "x.pyc").write_bytes(b"cache")
     r = _check(w, ts)
