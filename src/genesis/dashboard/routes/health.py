@@ -167,7 +167,14 @@ def _redact_checkout_paths(snapshot: dict) -> None:
 
 
 #: The live_repairs keys an untrusted caller sees (deploy_health.collect_live_repairs).
-_REPAIR_COUNTS = ("saved", "refused", "unread_older", "unresolved")
+_REPAIR_COUNTS = (
+    "saved",
+    "refused",
+    "unread_older",
+    "hooks_pending",
+    "hooks_saved",
+    "unresolved",
+)
 
 
 @blueprint.route("/api/genesis/health")

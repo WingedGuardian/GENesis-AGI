@@ -209,6 +209,7 @@ class _Writer:
             if loaded is None:
                 raise rp.BadReport("REPAIR.json is gone")
             report = {**loaded["report"], "restore": block}
+            # Under update.lock, as every REPAIR.json writer (Repair._retry_hooks relies on it).
             rp.write_json(os.path.join(self.ctx.backup, "REPAIR.json"), report, private=True)
         except (OSError, rp.BadReport) as exc:
             part = json.dumps(self.flight) + " node" if self.flight else "no part"

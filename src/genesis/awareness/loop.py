@@ -1844,6 +1844,8 @@ _DEPLOY_REPAIR_CLASSES = frozenset(
         "live_repair_unread_older",
         "live_repair_unresolved",
         "live_repair_refused",
+        "live_repair_hooks_pending",
+        "live_repair_hooks_saved",
     }
 )
 #: Classes that alone are routine (a medium observation, not a blocker).
@@ -1864,6 +1866,9 @@ def _deploy_repair_identity(repairs: dict) -> str:
         "refused": repairs.get("refused"),
         "unread_older": repairs.get("unread_older"),
     }
+    for key in ("hooks_pending", "hooks_saved"):  # only when set: a deploy must not
+        if repairs.get(key):  # re-raise every standing alert
+            named[key] = repairs[key]
     return hashlib.sha256(json.dumps(named, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
@@ -1926,6 +1931,30 @@ def _deploy_repair_paragraph(repairs: dict) -> str:
             f"{unread} older live-move repair report dir(s) not read, dismissed ones included "
             "(only the newest are read); one nobody restored or dismissed is kept with "
             "its backups, the others are pruned 90 days after their last write."
+        )
+    hooks = repairs.get("hooks_pending") or 0
+    if hooks:
+        parts.append(
+            f"{hooks} live-move repair(s) finished a killed rollback but could not put the "
+            "git hooks back yet (readiness refuses every rebuild until it does); every later "
+            "run of scripts/deploy_candidates repair-move retries."
+        )
+    replaced = [
+        r
+        for r in repairs.get("reports") or []
+        if isinstance(r, dict) and r.get("hooks_saved") and not r.get("dismissed")
+    ]
+    if replaced:
+        parts.append(
+            "A live-move repair reinstalled the git hooks of the code that ran before the "
+            "update and moved the installed ones that differed aside (a hand-edited hook's "
+            "only copy may be among them): "
+            + " ".join(
+                f"repair {r['ts']}: {r['backup_dir']}/hooks-before; once you have what you "
+                f"want from it, scripts/deploy_candidates repair-move --dismiss {r['ts']}."
+                for r in replaced
+            )
+            + " The report is kept until it is dismissed."
         )
     if repairs.get("unresolved"):
         parts.append(
