@@ -567,7 +567,9 @@ _FALKORDB_STAND_DOWN = (
     "~/.genesis/config/graphstore.local.yaml) — while `mode: falkordb` is "
     "selected, memory-graph reads depend on the engine, every recall falls back "
     "to NetworkX with a warning, and the health probe reports it DOWN — then "
-    "`systemctl --user disable --now genesis-falkordb`. This alert reads the "
+    "`systemctl --user disable --now genesis-falkordb`, and list "
+    "`genesis-falkordb.service` in ~/.genesis/config/disabled_timers so the "
+    "installers do not enable it again. This alert reads the "
     "infrastructure profile, refreshed at boot and daily, so after either fix "
     "take a refresh (`infrastructure_profile(refresh=true)`) and it clears at "
     "the next hourly posture check"
@@ -918,10 +920,10 @@ def _infra_missing_protections(profile: dict) -> list[str]:
             missing.append("cc_tmp_apply_blocked_on_cc")
         else:
             missing.append("cc_tmp_shared_fs")
-    # Graph engine. An unselected, disabled or stopped engine is the deliberate
-    # default (reads use the in-process NetworkX projection), so it stays
-    # silent — alerting there would fire on every install that has simply not
-    # adopted it. Three states are wrong. Active-without-a-socket: systemd
+    # Graph engine. An unselected engine (no unit, so the shipped falkordb
+    # default reads quietly from NetworkX; or an overlay pinning networkx) stays
+    # silent when disabled or stopped — alerting there would fire on every
+    # install that never provisioned it. Three states are wrong. Active-without-a-socket: systemd
     # reports the service healthy while every reader would fail to connect.
     # Armed-and-failed: the unit is Type=notify, so a module that will not load
     # (or a redis that never signals readiness) never reaches `active` at all —
@@ -1905,21 +1907,25 @@ def _deploy_repair_paragraph(repairs: dict) -> str:
             + " Restoring puts the saved files back as uncommitted edits: tracked ones make "
             "deploy_code_only.sh and update.sh refuse to deploy until they are committed "
             "(on a branch, as a PR), moved out, or removed; untracked ones block "
-            "deploy_code_only.sh only under src/, config/ or pyproject.toml. Backups are "
-            "pruned 90 days after the last write to their folder."
+            "deploy_code_only.sh only under src/, config/ or pyproject.toml. A report "
+            "nobody restored or dismissed is never pruned; a restored or dismissed one, "
+            "and other backups, are pruned 90 days after the last write to their folder."
         )
     refused = repairs.get("refused") or 0
     if refused:
         parts.append(
             f"{refused} live-move repair report(s) under ~/.genesis/deploy-backups/ could "
-            "not be read; they are named in the server log."
+            "not be read; they are named in the server log, and each is kept with its "
+            "saved files until `scripts/deploy_candidates repair-move --dismiss <ts>` "
+            "dismisses it (once the installed repair kit includes it; an older kit "
+            "refuses an unreadable report)."
         )
     unread = repairs.get("unread_older") or 0
     if unread:
         parts.append(
             f"{unread} older live-move repair report dir(s) not read, dismissed ones included "
-            "(only the newest are read); this is informational, and they are pruned with "
-            "their backups."
+            "(only the newest are read); one nobody restored or dismissed is kept with "
+            "its backups, the others are pruned 90 days after their last write."
         )
     if repairs.get("unresolved"):
         parts.append(

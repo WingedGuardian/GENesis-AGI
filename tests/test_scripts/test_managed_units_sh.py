@@ -226,6 +226,7 @@ def test_a_bootstrap_refusal_keeps_a_summary_file_it_did_not_create(world):
 
 # The graph-engine helpers step 6 defines when it sources lib/falkordb_install.sh.
 _FALKORDB_STUBS = (
+    f". {REPO / 'scripts/lib/secrets_path.sh'}\n"
     "_falkordb_redis_server_bin() { echo /opt/e/redis-server; }\n"
     "_falkordb_redis_cli_bin() { echo /opt/e/redis-cli; }\n"
     "_falkordb_module_path() { echo /opt/e/falkordb.so; }\n"

@@ -735,7 +735,12 @@ def backup_config_set():
     if not is_authenticated():
         return jsonify({"error": "authentication required"}), 401
 
-    from genesis.dashboard.routes.secrets import _key_value, _update_secrets_file
+    from genesis.dashboard.routes.secrets import (
+        _MISSING_FILE_MESSAGE,
+        SecretsFileMissingError,
+        _key_value,
+        _update_secrets_file,
+    )
 
     data = request.get_json(silent=True) or {}
     errors: list[str] = []
@@ -846,6 +851,9 @@ def backup_config_set():
             _update_secrets_file(env_updates)
             for k, v in env_updates.items():
                 os.environ[k] = v
+        except SecretsFileMissingError:
+            logger.warning("Backup secrets update refused: the file does not exist")
+            return jsonify({"error": _MISSING_FILE_MESSAGE}), 409
         except Exception:
             logger.error("Failed to write backup secrets", exc_info=True)
             return jsonify({"error": "Failed to write secrets.env"}), 500

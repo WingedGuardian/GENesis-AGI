@@ -980,10 +980,22 @@ def _mainline(cwd: str) -> frozenset[str]:
     default = _default_branch(cwd)
     if default is None:
         return frozenset()
-    code, out, err = _run(["git", "-C", cwd, "rev-list", "--first-parent", default])
+    # Keyed by the tip it was read at, so a cached line is never stale: the
+    # held-round walk reads it once per round, inside Rule R's 1 s slice.
+    code, out, err = _run(["git", "-C", cwd, "rev-parse", "-q", "--verify", f"{default}^{{commit}}"])
+    tip = out.strip() if code == 0 else ""
+    if tip and (cwd, tip) in _MAINLINE_CACHE:
+        return _MAINLINE_CACHE[(cwd, tip)]
+    code, out, err = _run(["git", "-C", cwd, "rev-list", "--first-parent", tip or default])
     if code != 0:
         raise Refused(f"git rev-list --first-parent {default} failed: {err.strip()[:300]}")
-    return frozenset(out.split())
+    line = frozenset(out.split())
+    if tip:
+        _MAINLINE_CACHE[(cwd, tip)] = line
+    return line
+
+
+_MAINLINE_CACHE: dict[tuple[str, str], frozenset[str]] = {}
 
 
 def _merge_is_no_fix(
@@ -1273,6 +1285,68 @@ def _open_round(budget: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return own[0] if len(own) == 1 else None
 
 
+def _newest_round_behind(budget: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The round entry whose head is the newest round head behind the current
+    head, by the budget's own commit graph. None when no round head is behind
+    it, when ancestry is unknown, or when two are newest (the two sides of a
+    merge both opened rounds): there is then no single round to hold open."""
+    import review_late  # noqa: PLC0415
+
+    head = budget.get("current_head")
+    _, ancestors = review_late._ancestry(budget)
+    behind_head = ancestors(str(head)) if isinstance(head, str) else None
+    if behind_head is None:
+        return None
+    behind = [r for r in budget.get("rounds") or [] if r.get("head") in behind_head]
+    newest = [
+        r
+        for r in behind
+        if not any(r.get("head") in (ancestors(str(o.get("head"))) or ()) for o in behind)
+    ]
+    return newest[0] if len(newest) == 1 else None
+
+
+def unreflected_round_behind(
+    cwd: str, budget: Mapping[str, Any], *, cutover: str | None
+) -> str | None:
+    """The newest round head behind the current head when that round drew keyed
+    findings, opened from ``cutover`` on, and no reflection commit names it: a
+    round a fix moved past unanswered. Read only to WORD an advisory, never to
+    owe anything (a later round's reflection may have dealt with it). None
+    when there is none, or when it cannot be told."""
+    if budget.get("status") != "ok" or budget.get("round_state") != "complete":
+        return None
+    entry = _newest_round_behind(budget)
+    if entry is None or entry.get("legacy"):
+        return None
+    opened, start = _parse_when(entry.get("opened_at")), _parse_when(cutover)
+    if start is not None and (opened is None or opened < start):
+        return None  # a round from before the gate went live owes nothing
+    if not any(s.get("finding_keys") for s in entry.get("reviews") or []):
+        return None
+    round_head = str(entry.get("head"))
+    unknown = False
+    for _sha, _kind, body, _at in _log_reflections(cwd):
+        match = HEADER_RE.match(body.split("\n", 1)[0])
+        # Only a reflection that passes its grammar answered the round: one
+        # that fails it must not silence the advisory.
+        if not match or parse(body).problems:
+            continue
+        named = match.group(2)
+        if named == round_head:
+            return None
+        # A held round is answered by a reflection naming the PR head, which
+        # the PR reached from the round by no fix (review_late.held_rounds).
+        try:
+            if fix_rows(cwd, round_head, named, main_merges=True) == []:
+                return None
+        except Refused:
+            # The reflection may answer the round, but git cannot say (out
+            # of time, or the named head not fetched): unknown, never "none".
+            unknown = True
+    return None if unknown else round_head
+
+
 def owed_state(
     budget: Mapping[str, Any],
     covered: Iterable[str],
@@ -1281,14 +1355,18 @@ def owed_state(
     cutover: str | None = None,
     fix_time: Any = None,
     late_covered: Iterable[str] = (),
+    held: Sequence[str] = (),
 ) -> dict[str, Any]:
     """What is owed, from a ``review_budget`` result: the open round's keys less
     ``covered`` (``covered_keys``). With ``cutover`` None that is all, and pure.
     With a cutover, the late keys from it on (``review_late.late_owed``) less
-    ``late_covered`` are owed too. The two are subtracted apart, so a
-    reflection judged under the open round never clears a late key, which only
-    its own round's context can. ``fix_time`` (``review_late.fix_time_reader``)
-    reads local git and may raise ``Refused``."""
+    ``late_covered`` are owed too, including every ``held`` round's
+    (``review_late.held_rounds``, newest first: the PR moved past them by no
+    fix). The two are
+    subtracted apart, so a reflection judged under the open round never clears
+    a late key, which only its own round's context can. ``fix_time``
+    (``review_late.fix_time_reader``) reads local git and may raise
+    ``Refused``."""
     state: dict[str, Any] = {
         "status": budget.get("status"),
         "round": budget.get("count"),
@@ -1307,6 +1385,10 @@ def owed_state(
         "cutover": cutover,
         # None (unknown) until a cutover's late findings have been read.
         "late_keys": [] if cutover is None else None,
+        # The round heads the PR moved past by no fix, newest first, whose
+        # keys stay owed; ``held_round`` is the newest, for older readers.
+        "held_rounds": list(held),
+        "held_round": held[0] if held else None,
     }
     if budget.get("status") != "ok":
         return state
@@ -1315,7 +1397,7 @@ def owed_state(
         import review_late  # noqa: PLC0415
 
         state["late_keys"], late_owed = review_late.late_owed(
-            budget, late_covered, cutover=cutover, fix_time=fix_time
+            budget, late_covered, cutover=cutover, fix_time=fix_time, held=held
         )
     if budget.get("round_state") != "open":
         state["owed"] = late_owed
