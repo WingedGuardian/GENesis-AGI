@@ -10,6 +10,7 @@ build paths that drift is two schemas diverging with nothing to notice.
 
 from __future__ import annotations
 
+import json
 import re
 
 import aiosqlite
@@ -1114,6 +1115,115 @@ async def test_an_unparseable_attempt_time_makes_a_parked_row_ineligible(db):
     assert await verif_crud.list_validation_candidates(db, now=PICK_NOW) == []
 
 
+# ── a not-yet-done whose validator declared no progress (owner ruling 2026-11-09)
+# The validator judges it and writes ``no_progress`` into the document it already
+# records; the picker reads it from the stored evidence at pick time.
+
+
+def _nyd_doc(no_progress=None):
+    doc = {"pr": 1, "gaps": [{"kind": "not_yet_done", "detail": "d", "command": "c"}]}
+    if no_progress is not None:
+        doc["no_progress"] = no_progress
+    return json.dumps(doc)
+
+
+async def _nyd(db, n, at, *, no_progress=None, pending=False):
+    await verif_crud.record_attempt(
+        db,
+        repo=REPO,
+        pr_number=n,
+        verdict="not-yet-done",
+        note="TRACKING PENDING: findings/0 needs an issue — n" if pending else "n",
+        now=at,
+        evidence=_nyd_doc(no_progress),
+        tracking_pending=pending,
+    )
+
+
+def _picked(rows):
+    return [(r["pr_number"], r["tier"]) for r in rows]
+
+
+@pytest.mark.asyncio
+async def test_a_declared_no_progress_inside_the_window_is_excluded(db):
+    await _open(db, 300, merged="2026-09-01T00:00:00Z")
+    await _open(db, 301, merged="2026-09-20T00:00:00Z")  # never attempted
+    await _nyd(db, 300, "2026-10-20T11:59:00+00:00", no_progress=True)
+    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
+    assert _picked(rows) == [(301, 1)]
+
+
+@pytest.mark.asyncio
+async def test_a_declared_no_progress_past_the_window_is_back_at_tier_0(db):
+    await _open(db, 302, merged="2026-09-01T00:00:00Z")
+    await _open(db, 303, merged="2026-09-20T00:00:00Z")
+    await _nyd(db, 302, "2026-10-13T11:00:00Z", no_progress=True)  # 7d 1h ago
+    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
+    assert _picked(rows) == [(302, 0), (303, 1)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declared", [None, False])
+async def test_an_undeclared_or_false_no_progress_is_eligible_at_once(db, declared):
+    await _open(db, 304)
+    await _nyd(db, 304, "2026-10-20T11:59:00+00:00", no_progress=declared)
+    assert _picked(await verif_crud.list_validation_candidates(db, now=PICK_NOW)) == [(304, 0)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["true", 1, "yes"])
+async def test_only_a_literal_true_is_a_declaration(db, value):
+    """The writers' model refuses any other type; a stored oddity is not a wait."""
+    await _open(db, 305)
+    await _nyd(db, 305, "2026-10-20T11:59:00+00:00", no_progress=value)
+    assert _picked(await verif_crud.list_validation_candidates(db, now=PICK_NOW)) == [(305, 0)]
+
+
+@pytest.mark.asyncio
+async def test_a_tracking_pending_no_progress_is_eligible_and_its_routing_re_record_waits(db):
+    """An interrupted routing is not hidden; the re-record carries the same document,
+    so the declaration carries with it and the wait starts once routing completes."""
+    await _open(db, 306)
+    await _nyd(db, 306, "2026-10-20T11:00:00+00:00", no_progress=True, pending=True)
+    assert _picked(await verif_crud.list_validation_candidates(db, now=PICK_NOW)) == [(306, 0)]
+    await _nyd(db, 306, "2026-10-20T11:05:00+00:00", no_progress=True)
+    assert await verif_crud.list_validation_candidates(db, now=PICK_NOW) == []
+
+
+@pytest.mark.asyncio
+async def test_an_unparseable_stamp_on_a_declared_no_progress_is_ineligible(db):
+    await _open(db, 307)
+    await _nyd(db, 307, "2026-01-01T00:00:00+00:00", no_progress=True)
+    await db.execute(
+        "UPDATE pr_verifications SET last_attempt_at = 'garbage' WHERE pr_number = 307"
+    )
+    await db.commit()
+    assert await verif_crud.list_validation_candidates(db, now=PICK_NOW) == []
+
+
+@pytest.mark.asyncio
+async def test_unparseable_stored_evidence_is_undeclared(db):
+    await _open(db, 308)
+    await verif_crud.record_attempt(
+        db, repo=REPO, pr_number=308, verdict="not-yet-done", note="n",
+        now="2026-10-20T11:59:00+00:00", evidence="{not json",
+    )
+    assert _picked(await verif_crud.list_validation_candidates(db, now=PICK_NOW)) == [(308, 0)]
+
+
+@pytest.mark.asyncio
+async def test_no_progress_on_another_verdict_does_not_delay_it(db):
+    """Only a not-yet-done row waits on the declaration; cannot-verify keeps its own
+    window and a never-delayed verdict stays undelayed."""
+    await _open(db, 309)
+    await verif_crud.record_attempt(
+        db, repo=REPO, pr_number=309, verdict="pass-mechanical",
+        note="TRACKING PENDING: findings/0 needs an issue", now="2026-10-20T11:59:00+00:00",
+        evidence=_nyd_doc(True), tracking_pending=True,
+    )
+    assert _picked(await verif_crud.list_validation_candidates(db, now=PICK_NOW)) == [(309, 0)]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bad", [0, -1])
 async def test_a_sub_one_day_reattempt_window_is_refused(db, bad):
@@ -1125,11 +1235,26 @@ def test_the_picker_accounts_for_every_non_closing_verdict():
     """The picker's vocabulary must not drift from VERDICTS: a new non-closing
     verdict either joins the candidate map or is excluded on purpose, never
     silently left unpicked."""
-    non_closing = set(verif_crud.VERDICTS) - set(verif_crud.PASS_VERDICTS)
+    # Passing measurements can remain OPEN while tracking is pending.
+    non_closing = set(verif_crud.VERDICTS)
     picked = {v for v in verif_crud._CANDIDATE_TIERS if v is not None}
     assert picked | verif_crud._NEVER_PICKED == non_closing
     assert not picked & verif_crud._NEVER_PICKED
     assert picked >= verif_crud._DELAYED_VERDICTS
+
+
+@pytest.mark.parametrize("verdict", verif_crud.PASS_VERDICTS)
+@pytest.mark.asyncio
+async def test_passing_measurement_pending_routing_is_visible_and_recoverable(db, verdict):
+    await _open(db, 299)
+    await verif_crud.record_attempt(
+        db, repo=REPO, pr_number=299, verdict=verdict, now=PICK_NOW,
+        note="TRACKING PENDING: findings/0 needs an issue", evidence='{"measurement":"retained"}',
+        tracking_pending=True,
+    )
+    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
+    assert [(r["pr_number"], r["tier"], r["verdict"]) for r in rows] == [(299, 0, verdict)]
+    assert (await verif_crud.list_open(db))[0]["status"] == "open"
 
 
 @pytest.mark.asyncio

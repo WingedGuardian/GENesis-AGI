@@ -642,6 +642,31 @@ elif { [ -e "$STATE_FILE" ] || [ -L "$STATE_FILE" ]; }; then
     fi
 fi
 # END prior-state-guard
+# BEGIN os-floor (extracted by tests/test_scripts/test_update_os_floor.py)
+# Below the supported OS floor (glibc 2.38 on x86_64 or aarch64) the update
+# would merge code whose bootstrap then refuses (pyproject.toml declares the
+# graph engine's wheel, built for nothing else), leaving merged code nothing
+# activates. So refuse first, before anything is fetched or merged, using the
+# floor from THIS checkout's lib, run in its own shell so sourcing it changes
+# nothing here. No lib (an older checkout): no check, as before. --post-merge
+# finishes a merge that already happened, so it is not refused here.
+_os_floor_lib="$SCRIPT_DIR/lib/falkordb_install.sh"
+if [[ "$POST_MERGE" != "true" ]] && [ -f "$_os_floor_lib" ]; then
+    _os_floor_rc=0
+    _os_floor_msg="$(bash -c 'source "$1" && { falkordb_os_floor_ok || { falkordb_os_floor_message; exit 7; }; }' \
+        os-floor "$_os_floor_lib" 2>/dev/null)" || _os_floor_rc=$?
+    if [ "$_os_floor_rc" -eq 7 ]; then
+        echo "REFUSED: ${_os_floor_msg}."
+        echo "         Nothing was changed."
+        # 5, not 1: the supervised update reads 1 as a script error to retry
+        # and escalate, and nothing a session does can change the OS.
+        exit 5
+    elif [ "$_os_floor_rc" -ne 0 ]; then
+        echo "  WARNING: could not check the supported OS floor (exit $_os_floor_rc); bootstrap checks it again."
+    fi
+fi
+unset _os_floor_lib _os_floor_rc _os_floor_msg
+# END os-floor
 # A crashed run's state that the guard let through is about to be overwritten.
 # If it says that run stopped genesis-server, it may be the only evidence left
 # (an updater from before restart-owed, or a bootstrap that could not write the
@@ -2557,7 +2582,8 @@ PYEOF
 _tier2_pending_since_baseline() {
     local _baseline="" _rc=0 _activated=""
     local -a _tier2=(scripts/systemd scripts/bootstrap.sh scripts/update.sh
-        scripts/lib/cc_version.sh scripts/hooks pyproject.toml)
+        scripts/lib/cc_version.sh scripts/cc_settings_align.sh scripts/setup_claude_config.py
+        config/cc-global-settings.yaml .claude/settings.json scripts/hooks pyproject.toml)
     if [ "${ON_LIVE:-0}" = 1 ] \
         && _activated="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'refs/genesis/live-activated^{commit}' 2>/dev/null)" \
         && [ -n "$_activated" ] \

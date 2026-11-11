@@ -946,12 +946,34 @@ async def test_td19_a_live_repair_report_raises_its_own_wording_then_resolves(db
     assert "deploy_code_only.sh and update.sh refuse to deploy" in content, content
     assert "committed (on a branch, as a PR), moved out, or removed" in content, content
     assert "90 days after the last write" in content, content
+    assert "nobody restored or dismissed is never pruned" in content, content
     assert "did not finish" in content and "run scripts/update.sh" not in content, content
     assert "says why" not in content, content  # a run killed partway wrote no reason
     _patch_snapshot(monkeypatch, _snap([]))
     await loop._check_deploy_staleness(db)
     assert await _rows(db) == []
     assert len(await _rows(db, resolved=1)) == 1
+
+
+async def test_a_restore_that_refused_parts_is_named_with_the_way_back(db, monkeypatch):
+    """#3492 B2b (review SF-E, L-4, L-5, NOTE-3): a report whose last restore
+    refused parts says so, says how a part it can never write goes back (by
+    hand, then --dismiss), what an exit 2 means, and which untracked restores
+    block a deploy."""
+    ts = "20261104T000000Z-9"
+    snap = _snap(["live_repair_saved:2"])
+    snap["live_repairs"] = _repairs({**_repair(ts, 2), "restore_refused": 3})
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert "Its last restore refused 3 part(s)" in content, content
+    assert f"/home/u/.genesis/deploy-backups/{ts}-live-move-repair/tree" in content, content
+    assert f"then --dismiss {ts}" in content, content
+    assert "an exit 2 saying restoring is not available yet" in content, content
+    assert "only under src/, config/ or pyproject.toml" in content, content
+    snap["live_repairs"] = _repairs(_repair(ts, 2))
+    assert "refused" not in loop._deploy_repair_paragraph(snap["live_repairs"])
 
 
 async def test_only_undismissed_reports_with_saved_paths_are_named(db, monkeypatch):
@@ -1017,7 +1039,10 @@ async def test_refused_reports_have_their_own_wording(db, monkeypatch):
     content = row["content"]
     assert row["priority"] == "high" and "update.sh" not in content, content
     assert "2 live-move repair report(s)" in content and "could not be read" in content
-    assert "named in the server log" in content and "--dismiss" not in content, content
+    # --dismiss now takes a report no reader can read (DISMISSED.json, #4331),
+    # so it is the way out this text names.
+    assert "named in the server log" in content, content
+    assert "repair-move --dismiss <ts>" in content, content
 
 
 async def test_unread_older_reports_alone_raise_nothing(db, monkeypatch):

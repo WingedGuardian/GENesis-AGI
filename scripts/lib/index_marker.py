@@ -67,6 +67,12 @@ _legacy = _load_sibling(
         "_genesis_index_marker_legacy", Path(__file__).with_name("index_marker_legacy.py")
     ),
 )
+_recovery = _load_sibling(
+    "_genesis_index_marker_recovery",
+    importlib.util.spec_from_file_location(
+        "_genesis_index_marker_recovery", Path(__file__).with_name("index_marker_recovery.py")
+    ),
+)
 _legs = _load_sibling(
     "_genesis_index_marker_legs",
     importlib.util.spec_from_file_location(
@@ -306,11 +312,9 @@ def _conversion_gate(db: sqlite3.Connection, *, allow_convert: bool) -> int:
 
 def _initialize(db: sqlite3.Connection, *, allow_convert: bool = False) -> None:
     """Create/upgrade the database once, serialized across fresh CLI processes."""
-    version = _conversion_gate(db, allow_convert=allow_convert)
-    if version == SCHEMA_VERSION:
+    _conversion_gate(db, allow_convert=allow_convert)
+    if _recovery.compatible_schema(db, SCHEMA_VERSION, _native):
         return
-    if version > SCHEMA_VERSION:
-        raise RuntimeError(f"index queue schema {version} is newer than supported {SCHEMA_VERSION}")
     lock_path = marker_dir() / ".queue-db-init.lock"
     with lock_path.open("a") as lock:
         deadline = time.monotonic() + OUTCOME_LOCK_WAIT_S
@@ -327,13 +331,9 @@ def _initialize(db: sqlite3.Connection, *, allow_convert: bool = False) -> None:
                 time.sleep(min(0.01, remaining))
         # Re-check under the lock: another writer may have created the queue
         # at an older schema between the first check and the lock.
-        version = _conversion_gate(db, allow_convert=allow_convert)
-        if version == SCHEMA_VERSION:
+        _conversion_gate(db, allow_convert=allow_convert)
+        if _recovery.compatible_schema(db, SCHEMA_VERSION, _native):
             return
-        if version > SCHEMA_VERSION:
-            raise RuntimeError(
-                f"index queue schema {version} is newer than supported {SCHEMA_VERSION}"
-            )
         mode = db.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
         if str(mode).lower() != "delete":
             raise RuntimeError(f"index queue refused rollback journal mode: {mode}")
@@ -407,7 +407,7 @@ def _publisher(*, wait_s: float = LOCK_WAIT_S, legacy_requests: bool = False):
                 raise
             # Busy can precede the schema gate. Only requests have a format
             # readable by older code; outcomes need proof of the current schema.
-            if not legacy_requests and _header_version() != SCHEMA_VERSION:
+            if not legacy_requests and _header_version() not in (SCHEMA_VERSION, _recovery.SCHEMA_VERSION):
                 raise
         with _legacy._lock(marker_dir(), OUTCOME_LOCK_WAIT_S, shared=True):
             yield db
@@ -417,16 +417,18 @@ def _publisher(*, wait_s: float = LOCK_WAIT_S, legacy_requests: bool = False):
 
 
 @contextmanager
-def _queue_gate():
+def _queue_gate(*, native=False, admission=None):
     """Initialize first, then drain and decide under one exclusive barrier."""
     db = _connect(OUTCOME_LOCK_WAIT_S)
     try:
         with _legacy._lock(marker_dir(), OUTCOME_LOCK_WAIT_S):
             with _transaction(db):
-                if db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
-                    raise RuntimeError("queue schema changed before admission")
+                _recovery.admission_schema(db, SCHEMA_VERSION, _native, require_native=native)
                 imported = _legacy.drain(marker_dir(), db, _import_one, _fsync_dir)
-                native_imported = _native.drain(marker_dir(), db, _legs, _proof, marker_hash)
+                residual = []
+                native_imported = _native.drain(marker_dir(), db, _legs, _proof, marker_hash, residual=residual)
+                if admission is not None:
+                    _recovery.refuse_unrepresented(db, residual, admission)
                 yield db
             _legacy.retire(marker_dir(), imported, _fsync_dir)
             _legacy.retire(marker_dir(), native_imported, _fsync_dir)
@@ -536,6 +538,7 @@ def _parse_scalar_event(data: dict) -> dict:
     return _legs.scalar_event(context, data["action"], data["recorded_at"], marker_hash)
 
 
+@_recovery.legacy_import("pending")
 def _import_pending(db, h, data, *, legacy=True):
     try:
         _coalesce_pending(db, h, data, legacy=legacy)
@@ -543,6 +546,7 @@ def _import_pending(db, h, data, *, legacy=True):
         raise _legacy.LegacyArtifactInvalid("repository-identity-conflict") from exc
 
 
+@_recovery.legacy_import("failed")
 def _import_failed(db, h, data, raw, artifact_identity):
     try:
         _legs.legacy_failed(db, h, data, raw=raw, artifact_identity=artifact_identity)
@@ -550,6 +554,7 @@ def _import_failed(db, h, data, raw, artifact_identity):
         raise _legacy.LegacyArtifactInvalid("repository-identity-conflict") from exc
 
 
+@_recovery.legacy_import("claim")
 def _import_claim(db, h, data, raw, artifact_identity):
     try:
         _legs.legacy_claim(db, h, data, raw=raw, artifact_identity=artifact_identity)
@@ -610,7 +615,7 @@ def write_marker(repo_path: str, tools: str, mode: str) -> Path:
     with _publisher(legacy_requests=True) as db:
         def spool() -> Path:
             return _write_spool(
-                h, data, legacy_body=not (db is not None or _header_version() == SCHEMA_VERSION)
+                h, data, legacy_body=not (db is not None or _header_version() in (SCHEMA_VERSION, _recovery.SCHEMA_VERSION))
             )
 
         if db is None:
@@ -645,9 +650,38 @@ def list_markers() -> list[dict]:
         db.close()
 
 
+def _spool_native_event(event):
+    context = event["context"]
+    return _write_durable_event(
+        final_name=f".execution-spool-{context['hash']}-{context['claim_id']}-{secrets.token_hex(16)}.spool",
+        temp_prefix=".execution-tmp-", data=event)
+
+
+def _fresh_gate(db):
+    return lambda row: _fresh_cleanup(db, row)
+
+
+def _fresh_cleanup(db, row, *, proc=Path("/proc")) -> bool:
+    """Re-read a disputed lifetime using the admitted queue decision transaction."""
+    if (row["scope_registration"] is None or row["cleanup_proof"] is None
+            or row["completion_kind"] == "unbound" or row["launch_permission"] not in ("spent", "cancelled")):
+        return False
+    scope = _load_sibling(
+        "_genesis_code_intel_scope",
+        importlib.util.spec_from_file_location(
+            "_genesis_code_intel_scope", Path(__file__).with_name("code_intel_scope.py")),
+    )
+    retained = (json.loads(path.read_bytes(), object_pairs_hook=_proof._unique)
+                for path in marker_dir().glob(f".execution-spool-{row['hash']}-{row['claim_id']}-*.spool"))
+    return _native.retain_fresh_cleanup(
+        db, row, _legs, _proof, collect=scope.cleanup_observation, proc=proc,
+        clock=time.time, retained=retained, publish=_spool_native_event,
+    )
+
+
 def claim(h: str, *, provider: str) -> dict | None:
-    with _queue_gate() as db:
-        if _native.blocked(db, h, provider):
+    with _queue_gate(admission=(h, provider)) as db:
+        if _native.blocked(db, h, provider, fresh_cleanup=_fresh_gate(db)):
             return None
         result = _legs.claim(db, h, provider)
         if result is not None:
@@ -659,8 +693,8 @@ def claim_native(h: str, *, provider: str) -> dict | None:
     h = _machine_hash(h)
     if provider not in _legs.PROVIDERS:
         raise ValueError("provider must be cbm or gitnexus")
-    with _queue_gate() as db:
-        result = _native.claim(db, h, provider, _legs)
+    with _queue_gate(native=True, admission=(h, provider)) as db:
+        result = _native.claim(db, h, provider, _legs, fresh_cleanup=_fresh_gate(db))
         if result is not None:
             _native.context(result["context"], _legs, marker_hash)
         return result
@@ -714,14 +748,14 @@ def repend_stale_inflight() -> list[str]:
 
 def reconcile_native() -> list[str]:
     with _queue_gate() as db:
-        return _native.reconcile(db, _legs)
+        return _native.reconcile(db, _legs, fresh_cleanup=_fresh_gate(db))
 
 
 def reserve_launch(context: dict, data: dict) -> str:
     context = _native.context(context, _legs, marker_hash)
     data = _native.reservation(data, context)
-    with _queue_gate() as db:
-        state = _native.reserve(db, context, data, _legs)
+    with _queue_gate(native=True, admission=(context["hash"], context["provider"])) as db:
+        state = _native.reserve(db, context, data, _legs, fresh_cleanup=_fresh_gate(db))
     if state in ("conflict", "held"):
         raise RuntimeError("native reservation refused: " + state)
     return state
@@ -735,8 +769,8 @@ def cancel_launch(context: dict) -> str:
 
 def _native_gate(context, data, operation):
     context = _native.context(context, _legs, marker_hash)
-    with _queue_gate() as db:
-        state = operation(db, context, data, _legs, _proof)
+    with _queue_gate(native=True, admission=(context["hash"], context["provider"])) as db:
+        state = operation(db, context, data, _legs, _proof, fresh_cleanup=_fresh_gate(db))
     if state in ("conflict", "resource", "held"):
         raise RuntimeError("native launch refused: " + state)
     return state
@@ -753,25 +787,22 @@ def begin_native(context: dict, data: dict) -> str:
 def remember_native_event(context: dict, kind: str, data: dict, *, recorded_at=None) -> Path:
     context = _native.context(context, _legs, marker_hash)
     event = _native.event(context, kind, data, time.time() if recorded_at is None else recorded_at, _proof)
-    def spool():
-        return _write_durable_event(
-            final_name=f".execution-spool-{context['hash']}-{context['claim_id']}-{secrets.token_hex(16)}.spool",
-            temp_prefix=".execution-tmp-", data=event,
-        )
     with _publisher(wait_s=OUTCOME_LOCK_WAIT_S) as db:
+        if kind == "control-closure":
+            _recovery.fresh_control(db, context, event, _native, _legs, _proof)
         state = "waiting"
         if db is not None:
             try:
                 with _transaction(db):
                     state = _native.record(db, context, event, _legs, _proof)
             except TimeoutError:
-                return spool()
+                return _spool_native_event(event)
             except sqlite3.OperationalError as exc:
                 if not _is_busy(exc):
                     raise
-                return spool()
+                return _spool_native_event(event)
         if state in ("waiting", "retained"):
-            path = spool()
+            path = _spool_native_event(event)
             if state == "retained":
                 raise RuntimeError("additional native conflict retained: " + str(path))
             return path
@@ -783,12 +814,13 @@ def remember_native_event(context: dict, kind: str, data: dict, *, recorded_at=N
 def apply_native(context: dict) -> str | None:
     context = _native.context(context, _legs, marker_hash)
     with _queue_gate() as db:
-        return _native.apply(db, context, _legs)
+        return _native.apply(db, context, _legs, fresh_cleanup=_fresh_gate(db))
 
 
 def execution_status(context: dict) -> dict:
     context = _native.context(context, _legs, marker_hash)
     result = _legacy.import_status(database_path(), limit=0,
+                                   schema_check=lambda db: _recovery.validate_schema(db, _native),
                                    observe=lambda db: _native.status(db, context, _legs))
     result["evidence_pending"] = any(marker_dir().glob(".execution-spool-*.spool"))
     return result  # Observation only; never an admission decision or repair.
@@ -896,17 +928,7 @@ def _machine_hash(value: str) -> str:
 
 
 def _pending_record(row: dict) -> tuple[str, ...]:
-    h = _machine_hash(row["hash"])
-    repo, provider, age = row["repo_path"], row["provider"], row["age_s"]
-    if (
-        not _legs.stored_repo(repo)
-        or _legs.stored_hash(repo) != h
-        or provider not in _legs.PROVIDERS
-        or type(age) is not int
-        or not 0 <= age <= _legs.INTEGER_MAX
-    ):
-        raise ValueError("invalid machine pending snapshot")
-    return "1", "pending", h, repo, provider, str(age)
+    return _cli.pending_record(row, _machine_hash, _legs)
 
 
 def _claim_record(row: dict, h: str, provider: str, *, protocol=2) -> tuple[str, ...]:

@@ -34,6 +34,10 @@ SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+# The interpreter running this reader, for the commands it prints: those need
+# the same packages (aiosqlite), which a bare `python3` may lack.
+_PY = shlex.quote(sys.executable)
+
 
 def _print_verification_backlog(db_path: str | None) -> None:
     """The pr_verifications day-one reader: open obligations in BACKLOG order —
@@ -41,6 +45,11 @@ def _print_verification_backlog(db_path: str | None) -> None:
     oldest merge first within each (``list_open``'s ORDER BY: an established failure
     is a finding the user must see, so no cap may hide it; after that a validator
     should reach an untouched row before one a colleague already tried).
+
+    Then "Rechecks due": closed rows whose event-gated gap is due for re-measurement
+    (``list_rechecks_due``), each with the exact ``--index`` the ``recheck`` command
+    takes, its latest result and how many attempts it has had. Skipped with a
+    one-line note before the ``rechecks`` column exists.
 
     Read-only, no worker run, no debounce — usable while the Wave-3 validator
     session (the eventual consumer) does not exist yet. Prints one line per
@@ -75,7 +84,9 @@ def _print_verification_backlog(db_path: str | None) -> None:
         print("pr_verifications: database quarantined — skipped")
         return
 
-    async def _read() -> tuple[list[dict], dict]:
+    from datetime import UTC, datetime
+
+    async def _read() -> tuple[list[dict], dict, list[dict] | None]:
         import aiosqlite
 
         # mode=ro, not a plain path: this command only REPORTS. A read-write
@@ -95,14 +106,19 @@ def _print_verification_backlog(db_path: str | None) -> None:
         async with aiosqlite.connect(uri, uri=True, timeout=10) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             db.row_factory = aiosqlite.Row
-            return await verif_crud.list_open(db), await verif_crud.counts(db)
+            due = None
+            if await verif_crud._rechecks_column_available(db):
+                # "Today" in UTC, the timezone every stored timestamp here is in.
+                today = datetime.now(UTC).date().isoformat()
+                due = await verif_crud.list_rechecks_due(db, today=today)
+            return await verif_crud.list_open(db), await verif_crud.counts(db), due
 
     # Exit 0 is this module's contract, and a file that is not a database raised
     # straight through it — a traceback and exit 1 (MEASURED; issue #2603). An
     # unreadable database is a state of its own, distinct from "no database" and
     # "no rows", so it is reported as one.
     try:
-        rows, histogram = _asyncio.run(_read())
+        rows, histogram, due = _asyncio.run(_read())
     except (sqlite3.Error, OSError) as exc:
         print(f"pr_verifications: database unreadable at {resolved} — {exc}")
         return
@@ -145,13 +161,58 @@ def _print_verification_backlog(db_path: str | None) -> None:
             f"{open_total - len(rows)} not shown — close some, or query "
             f"pr_verifications directly for the full set>"
         )
+    _print_rechecks_due(due, db_path=resolved)
     print(f"pr_verifications: {open_total} open, {histogram.get('closed', 0)} closed ({resolved})")
     print(
-        "  close one: python3 scripts/pr_verification.py close --pr <N> "
+        f"  close one: {_PY} scripts/pr_verification.py close --pr <N> "
         "--evidence-file <doc.json> [--note <why>]  (the verdict is derived from the "
         "document; run `pr_verification.py print-schema` for a template)   "
         "(--verification-log --pr <N> shows what was decided, on any row)"
     )
+
+
+def _print_rechecks_due(due: list[dict] | None, *, db_path: Path | str | None = None) -> None:
+    """The "Rechecks due" section: owed re-measurements on CLOSED rows.
+
+    Each line carries the whole command to record a result, with the exact
+    ``--index``: that index counts the row's stored rechecks, not the document's
+    gaps, and a validator who had to work it out would get it wrong. The recheck
+    command is printed whole — a clipped command is one nobody can run.
+    """
+    from shlex import quote
+
+    if due is None:
+        print("Rechecks due: skipped — the rechecks column is not present yet (pre-migration)")
+        return
+    print(f"Rechecks due: {len(due)}")
+    for r in due:
+        key = f"{r['repo']}#{r['pr_number']}"
+        target_db = (
+            f" --db-path {quote(str(Path(db_path).resolve()))}" if db_path is not None else ""
+        )
+        if r.get("malformed"):
+            print(
+                f"RECHECK  {key}  malformed rechecks or result history — read it with "
+                f"--verification-log --pr {r['pr_number']}{target_db}"
+            )
+            continue
+        latest = r.get("latest") or {}
+        last = (
+            f"latest {latest.get('result')} {str(latest.get('at') or '')[:10]}, "
+            f"{r['attempts']} attempt(s)"
+            if latest
+            else "never rechecked"
+        )
+        print(
+            f"RECHECK  {key}  trigger {r['trigger']}  closed "
+            f"{str(r.get('closed_at') or '')[:10]}  ({last})"
+        )
+        print(f"      {r.get('detail')}")
+        print(f"      recheck: {r.get('recheck')}")
+        print(
+            f"      record : {_PY} scripts/pr_verification.py recheck --pr {r['pr_number']} "
+            f"--index {r['index']} --result-file <result.json>{target_db}"
+        )
 
 
 def _clip(text: str, limit: int, pr_number: object) -> str:
@@ -173,6 +234,26 @@ def _clip(text: str, limit: int, pr_number: object) -> str:
 #: Rows one `--verification-log` run will show. Named rather than inline so the
 #: truncation disclosure below cannot drift from the value it describes.
 _LOG_LIMIT = 500
+
+
+def _render_verification_record(raw_record: dict) -> str:
+    """A structured record, or its faithful raw snapshot if rendering is unsafe."""
+    record = raw_record.copy()
+    # Both JSON columns go back into structure. A stored string that is not
+    # JSON is still the record: keep it as is.
+    for col in ("evidence", "rechecks"):
+        if isinstance(record.get(col), str):
+            from genesis.session_awareness.pr_recording import _no_duplicates
+
+            with contextlib.suppress(ValueError, RecursionError):
+                record[col] = json.loads(record[col], object_pairs_hook=_no_duplicates)
+    try:
+        rendered = json.dumps(record, indent=2, sort_keys=True, ensure_ascii=True, default=str)
+    except RecursionError:
+        # Decoding and indented encoding have different depth limits.
+        # Preserve the flat raw row rather than lose it or later rows.
+        rendered = json.dumps(raw_record, indent=2, sort_keys=True, ensure_ascii=True, default=str)
+    return rendered
 
 
 def _print_verification_log(db_path: str | None, pr_number: int | None) -> None:
@@ -264,13 +345,7 @@ def _print_verification_log(db_path: str | None, pr_number: int | None) -> None:
         # count printed under a row reading OPEN, silent clips, a cap notice for a
         # query with no cap — and a faithful dump has no formatting to get wrong.
         for row in rows:
-            record = dict(row)
-            evidence = record.get("evidence")
-            if isinstance(evidence, str):
-                # A stored string that is not JSON is still the record: keep it as is.
-                with contextlib.suppress(ValueError):
-                    record["evidence"] = json.loads(evidence)
-            print(json.dumps(record, indent=2, sort_keys=True, ensure_ascii=True, default=str))
+            print(_render_verification_record(dict(row)))
         n_open = sum(1 for r in rows if r.get("status") != "closed")
         print(
             f"pr_verifications: {len(rows)} row(s) for PR #{pr_number} — "
@@ -322,7 +397,7 @@ _NEXT_WINDOW_LIMIT = 1000
 #: deployment, the body carries the `E2E:` plan.
 _NEXT_FIELDS = "number,title,body,mergedAt,baseRefName,mergeCommit"
 
-_NEXT_TIER_LABEL = {0: "not-yet-done", 1: "never-attempted", 2: "cannot-verify, re-attempt"}
+_NEXT_TIER_LABEL = {0: "unfinished work or tracking", 1: "never-attempted", 2: "cannot-verify, re-attempt"}
 
 
 def _load_sibling(name: str):
@@ -365,9 +440,10 @@ def _print_next_for_validation(
 ) -> None:
     """The ONE open obligation a standing validator should work next, or why none.
 
-    Candidates come from ``list_validation_candidates`` (not-yet-done, then
-    never-attempted, then a parked row past its re-attempt window; fail-intent
-    never). This reader then asks GitHub, in 8-day windows stepping 7 days back
+    Candidates come from ``list_validation_candidates`` (not-yet-done, unless
+    its stored evidence declares ``no_progress`` and its last attempt is inside
+    the re-attempt window; then never-attempted, then a parked row past its
+    re-attempt window; fail-intent never). This reader then asks GitHub, in 8-day windows stepping 7 days back
     from today, for each candidate's base branch, merge commit and body, and ranks
     within a tier: deployed with an ``E2E:`` plan, deployed without one, then
     deploy-unproven; newest merge first inside each.
@@ -448,7 +524,8 @@ def _print_next_for_validation(
     if not candidates:
         print(
             f"pr_verifications: no open row is eligible to pick ({open_total} open). "
-            f"Failed rows are the owner's, and parked rows wait out their re-attempt window."
+            f"Failed rows are the owner's; parked rows, and not-yet-done rows whose last "
+            f"attempt declared no progress, wait out their re-attempt window."
         )
         return
 
@@ -646,7 +723,7 @@ def _print_next_for_validation(
     # The database the row was read from, so recording lands on the same ledger
     # (without it, close falls back to genesis_db_path(), another file or none).
     print(
-        f"  record: python3 scripts/pr_verification.py close --pr {n} "
+        f"  record: {_PY} scripts/pr_verification.py close --pr {n} "
         f"--db-path {shlex.quote(resolved)} "
         f"--evidence-file <doc.json> --dry-run   (then again without --dry-run)"
     )
@@ -729,7 +806,8 @@ def main() -> None:
         "--next-for-validation",
         action="store_true",
         help="print the ONE open obligation a standing validator should work next "
-        "(not-yet-done, then never-attempted, then parked past 7 days; deployed with an "
+        "(not-yet-done, which waits 7 days only when its evidence declares no_progress, "
+        "then never-attempted, then parked past 7 days; deployed with an "
         "E2E plan first, newest merge first) or why none, and exit — reads GitHub and "
         "git, writes nothing, fails closed",
     )

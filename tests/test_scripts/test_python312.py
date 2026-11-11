@@ -309,6 +309,18 @@ def _block(script: Path, first: str, last: str) -> str:
     return text[start:end]
 
 
+def _bootstrap_venv_block() -> str:
+    """Bootstrap's venv block up to the editable install, without the graph-engine
+    provisioning between them: that block sources a lib from $SCRIPT_DIR and has
+    its own tests (test_falkordb_module.py)."""
+    text = _block(BOOTSTRAP, "# --- Python venv ---", "# Worktree guard + editable install")
+    graph = _block(
+        BOOTSTRAP, "# --- Graph engine (FalkorDB) provisioning ---", 'echo "  Syncing dependencies..."'
+    )
+    assert graph in text
+    return text.replace(graph, "")
+
+
 def _install_block() -> str:
     return _block(
         INSTALL,
@@ -831,7 +843,7 @@ def _run_bootstrap_venv_block(host: _Host, root: Path, summary: str = "") -> sub
         f'GENESIS_DEPLOY_SUMMARY="{summary or host.home / "summary"}"\n'
         f'. "{LIB}"\n'
         "PYTHON_BIN=/nonexistent\n"
-        + _block(BOOTSTRAP, "# --- Python venv ---", "# Worktree guard + editable install")
+        + _bootstrap_venv_block()
         + 'echo "REACHED THE INSTALL"\n'
     )
     return host.run(script)
@@ -866,7 +878,7 @@ def test_bootstrap_says_when_uv_moved_or_could_not(host, tmp_path):
 def test_bootstrap_says_when_the_pin_has_aged(host, tmp_path):
     _running_venv(host, tmp_path / "root")
     host.fake_uv(host.bin / "uv")
-    text = _block(BOOTSTRAP, "# --- Python venv ---", "# Worktree guard + editable install")
+    text = _bootstrap_venv_block()
     script = (
         "set -euo pipefail\n"
         f'GENESIS_ROOT="{tmp_path / "root"}"\n'

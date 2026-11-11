@@ -11,8 +11,10 @@ The EFFECTIVE stage is the lowest of three: the stage requested
 (``GENESIS_MCP_SHARED_STAGE``, else the config), the code ceiling
 ``MAX_STAGE``, and what the server's unit can serve (installed, enabled,
 running). A server outside the effective stage, or whose unit is not ready,
-runs stdio. Codex (``--external-client``) and the kill switch
-``GENESIS_MCP_SHARED_DISABLED=1`` always run stdio: Codex's switch is its own.
+runs stdio. Codex always runs stdio: the unattended floor passes
+``--external-client``, and owner mode carries ``GENESIS_CALLER_PROFILE``, a label
+a shared service would not see. So does any spawn under the kill switch
+``GENESIS_MCP_SHARED_DISABLED=1``.
 
 Fail direction: any error here (an unreadable overlay, an unknown stage)
 launches the stdio server and says why on stderr. Stdio is not a degraded mode;
@@ -32,6 +34,69 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import NamedTuple
+
+
+def _parse_args(argv=None):
+    """One argument contract for launch and inspection commands."""
+    parser = argparse.ArgumentParser(prog="mcp_rollout")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    for name in ("launch", "units", "status"):
+        sub.add_parser(name).add_argument("--root", required=True)
+    args, rest = parser.parse_known_args(argv)
+    if args.cmd == "launch":
+        if not rest or rest[0] != "--" or len(rest) < 2:
+            parser.error("launch needs -- <stdio command>")
+        rest = rest[1:]
+    elif rest:
+        parser.error(f"unexpected arguments: {rest}")
+    return args, rest
+
+
+CONFIG_NAME = "mcp_shared.json"
+
+
+class RolloutError(Exception):
+    """The shared-MCP configuration cannot be read as written."""
+
+
+def overlay_path(env):
+    home = env.get("GENESIS_HOME") or str(Path(env.get("HOME") or Path.home()) / ".genesis")
+    path = Path(home).expanduser()
+    if not path.is_absolute():
+        raise RolloutError(f"GENESIS_HOME must be an absolute path (got {home!r})")
+    return path / "config" / CONFIG_NAME
+
+
+def _read(path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise RolloutError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RolloutError(f"{path}: expected a JSON object")
+    return data
+
+
+def load_config(root, env):
+    """Tracked defaults plus the install overlay, merged shallowly per key."""
+    config = {"stage": "off", "adapter": {"argv": []}, "servers": {}}
+    for layer in (_read(Path(root) / "config" / CONFIG_NAME), _read(overlay_path(env))):
+        if not layer:
+            continue
+        if "stage" in layer:
+            config["stage"] = layer["stage"]
+        if isinstance(layer.get("adapter"), dict):
+            config["adapter"] = {**config["adapter"], **layer["adapter"]}
+        servers = layer.get("servers") or {}
+        if not isinstance(servers, dict):
+            raise RolloutError("servers: expected a JSON object")
+        for name, spec in servers.items():
+            if not isinstance(spec, dict):
+                raise RolloutError(f"servers.{name}: expected an object")
+            config["servers"][name] = {**config["servers"].get(name, {}), **spec}
+    return config
 
 STAGES = ("off", "memory-floor", "health-reads", "writes")
 STAGE_SERVERS = {
@@ -53,13 +118,6 @@ MAX_STAGE = "off"
 
 KILL_SWITCH = "GENESIS_MCP_SHARED_DISABLED"
 STAGE_ENV = "GENESIS_MCP_SHARED_STAGE"
-CONFIG_NAME = "mcp_shared.json"
-
-
-class RolloutError(Exception):
-    """The rollout configuration cannot be used as written."""
-
-
 class Decision(NamedTuple):
     argv: list
     shared: bool
@@ -70,43 +128,6 @@ def _stage(value, where):
     if not isinstance(value, str) or value not in STAGES:
         raise RolloutError(f"{where}: stage {value!r} is not one of {', '.join(STAGES)}")
     return value
-
-
-def overlay_path(env):
-    home = env.get("GENESIS_HOME") or str(Path(env.get("HOME") or Path.home()) / ".genesis")
-    path = Path(home).expanduser()
-    if not path.is_absolute():
-        raise RolloutError(f"GENESIS_HOME must be an absolute path (got {home!r})")
-    return path / "config" / CONFIG_NAME
-
-
-def _read(path):
-    try:
-        data = json.loads(path.read_text())
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError) as exc:
-        raise RolloutError(f"cannot read {path}: {exc}") from exc
-    if not isinstance(data, dict):
-        raise RolloutError(f"{path}: expected a JSON object")
-    return data
-
-
-def load_config(root, env):
-    """The tracked defaults under <root>/config, with the user overlay merged per key."""
-    config = {"stage": "off", "adapter": {"argv": []}, "servers": {}}
-    for layer in (_read(Path(root) / "config" / CONFIG_NAME), _read(overlay_path(env))):
-        if not layer:
-            continue
-        if "stage" in layer:
-            config["stage"] = layer["stage"]
-        if isinstance(layer.get("adapter"), dict):
-            config["adapter"] = {**config["adapter"], **layer["adapter"]}
-        for name, spec in (layer.get("servers") or {}).items():
-            if not isinstance(spec, dict):
-                raise RolloutError(f"servers.{name}: expected an object")
-            config["servers"][name] = {**config["servers"].get(name, {}), **spec}
-    return config
 
 
 def _run(argv):
@@ -189,6 +210,10 @@ def decide(argv, *, config, env, ready, ceiling, python, root):
     stdio = list(argv)
     if "--external-client" in stdio:
         return Decision(stdio, False, "external client: never routed by this switch")
+    if env.get("GENESIS_CALLER_PROFILE"):
+        # Owner-mode Codex: the label rides this process's environment, which a
+        # shared service never sees, so its calls would go unattributed there.
+        return Decision(stdio, False, "labelled client: the shared service cannot carry the label")
     if kill_switch_on(env):
         return Decision(stdio, False, f"{KILL_SWITCH} is set")
     requested = (
@@ -310,18 +335,10 @@ def status(root):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="mcp_rollout")
-    sub = parser.add_subparsers(dest="cmd", required=True)
-    for name in ("launch", "units", "status"):
-        sub.add_parser(name).add_argument("--root", required=True)
-    args, rest = parser.parse_known_args(argv)
+    args, stdio = _parse_args(argv)
     root = Path(args.root)
     if args.cmd == "launch":
-        if not rest or rest[0] != "--" or len(rest) < 2:
-            parser.error("launch needs -- <stdio command>")
-        launch(root, rest[1:])
-    elif rest:
-        parser.error(f"unexpected arguments: {rest}")
+        launch(root, stdio)
     elif args.cmd == "units":
         for unit in units(load_config(root, dict(os.environ))):
             print(unit)

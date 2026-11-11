@@ -90,3 +90,79 @@ async def test_find_exact_duplicate_returns_first_match(db):
     )
     # Should return one of them (which one depends on rowid order)
     assert result in ("first-m1", "second-m2")
+
+
+@pytest.mark.parametrize("scope,stored,metadata,expected", [
+    (None, None, True, True), (None, None, False, True),
+    (None, "worker", True, False), ("worker", "worker", True, True),
+    ("worker", "other", True, False), ("worker", None, True, False),
+    ("worker", None, False, False), ("", "", True, True), ("", None, True, False),
+])
+async def test_duplicate_visibility(db, scope, stored, metadata, expected):
+    await memory.create(db, memory_id="scoped", content="scope fixture")
+    if metadata:
+        await memory.create_metadata(db, memory_id="scoped", created_at="2020-01-01T00:00:00+00:00", source_subsystem=stored)
+    assert await memory.find_exact_duplicate(db, content="scope fixture", source_subsystem=scope) == ("scoped" if expected else None)
+
+
+@pytest.mark.parametrize("field,value,expected", [
+    ("deprecated", 1, False), ("deprecated", 0, True),
+    ("invalid_at", "2000-01-01T00:00:00+00:00", False),
+    ("invalid_at", "9999-01-01T00:00:00+00:00", True),
+    ("expires_at", "2000-01-01T00:00:00+00:00", True),
+])
+async def test_duplicate_recall_lifecycle(db, field, value, expected):
+    await memory.create(db, memory_id="lifecycle", content="lifecycle fixture")
+    await memory.create_metadata(db, memory_id="lifecycle", created_at="2020-01-01T00:00:00+00:00")
+    await db.execute(f"UPDATE memory_metadata SET {field} = ? WHERE memory_id = ?", (value, "lifecycle"))
+    assert await memory.find_exact_duplicate(db, content="lifecycle fixture") == ("lifecycle" if expected else None)
+
+
+@pytest.mark.parametrize("status,exclude", [("pending", True), ("processing", True), ("completed", False), ("failed", False)])
+async def test_duplicate_uses_canonical_delete_intent(db, status, exclude):
+    from genesis.memory.delete_tombstones import enqueue_tombstone
+
+    await memory.create(db, memory_id="deleting", content="delete fixture")
+    assert await enqueue_tombstone(db, memory_id="deleting", reason="synthetic")
+    await db.execute("UPDATE deferred_work_queue SET status = ?", (status,))
+    assert await memory.find_exact_duplicate(db, content="delete fixture") == (None if exclude else "deleting")
+
+
+@pytest.mark.parametrize("payload,exclude", [
+    ('{"topic":"candidate","category":"memory_delete"}', True),
+    ('{"topic":"candidate","category":"memory_delete","signal_type":""}', True),
+    ('{"topic":"candidate","category":"other"}', False),
+    ('{"topic":"candidate","category":"memory_delete","signal_type":"other"}', False),
+    ('{"memory_id":"candidate"}', False), ('invalid json', False),
+])
+async def test_duplicate_delete_identity_and_corrupt_payload(db, payload, exclude):
+    from genesis.memory.delete_tombstones import enqueue_tombstone, has_open_tombstone
+
+    await memory.create(db, memory_id="candidate", content="identity fixture")
+    assert await enqueue_tombstone(db, memory_id="candidate", reason="synthetic")
+    await db.execute("UPDATE deferred_work_queue SET payload_json = ?", (payload,))
+    assert await has_open_tombstone(db, memory_id="candidate") is exclude
+    assert await memory.find_exact_duplicate(db, content="identity fixture") == (None if exclude else "candidate")
+
+
+async def test_duplicate_filters_before_candidate_limit(db):
+    for i in range(205):
+        mid = f"hidden-{i}"
+        await memory.create(db, memory_id=mid, content="repeated content")
+        await memory.create_metadata(db, memory_id=mid, created_at="2020-01-01T00:00:00+00:00", source_subsystem="worker")
+    await memory.create(db, memory_id="visible", content="repeated content")
+    assert await memory.find_exact_duplicate(db, content="repeated content") == "visible"
+
+
+async def test_duplicate_exact_identity_before_candidate_limit(db):
+    for i in range(205):
+        await memory.create(db, memory_id=f"collision-{i}", content="x" * 200 + f"{i:03}")
+    target = "x" * 200 + "end"
+    await memory.create(db, memory_id="exact", content=target)
+    assert await memory.find_exact_duplicate(db, content=target) == "exact"
+
+
+@pytest.mark.parametrize("text", ["élan 東京", "a\x00b", "a\nb"])
+async def test_duplicate_full_text_identity(db, text):
+    await memory.create(db, memory_id="exact", content=text)
+    assert await memory.find_exact_duplicate(db, content=text) == "exact"

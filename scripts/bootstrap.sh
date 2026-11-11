@@ -1030,6 +1030,50 @@ fi
 if [ -n "${GENESIS_UV_PIN_STALE:-}" ]; then
     echo "The pinned uv ($GENESIS_UV_VERSION) is over $GENESIS_UV_PIN_MAX_AGE_DAYS days old, so hosts on uv's Python may lag on patches. It moves by a reviewed change to scripts/lib/python312.sh; an edit on this host would stop the next update." >> "$GENESIS_DEPLOY_SUMMARY" || true
 fi
+
+# --- Graph engine (FalkorDB) provisioning ---
+# BEFORE the editable install: pyproject.toml declares the same falkordblite
+# pin, so installing the hash-pinned wheel first is what makes the editable
+# install find it satisfied instead of fetching it on TLS alone. Except for the
+# two refusals below (the OS floor, and a hash-pinned wheel that did not
+# install), the same guarded-source contract as the resilience libs:
+# provisioning itself never aborts bootstrap. The engine (redis-server,
+# redis-cli and the module) lands in the venv, is verified against the digests
+# committed in lib/falkordb-engine-digests.txt, and is copied to the
+# version-tag dir under ~/.genesis/deps/falkordb that the unit runs; nothing
+# about the system changes. The unit rendered below is
+# left DISABLED, so a box where the engine check fails (after the hashed wheel
+# installed) is fully functional — the memory graph keeps using its in-process
+# NetworkX projection.
+echo "--- Graph engine (optional) ---"
+if [[ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]]; then
+    # shellcheck source=lib/falkordb_install.sh
+    source "$SCRIPT_DIR/lib/falkordb_install.sh"
+    # The one hard stop here (owner ruling): below the OS floor the editable
+    # install below cannot succeed, because pyproject.toml declares the wheel and
+    # pip would fall back to compiling the engine from source. Refuse in one
+    # line instead, before the package install changes anything.
+    if ! falkordb_os_floor_ok; then
+        echo "  ERROR: $(falkordb_os_floor_message)." >&2
+        echo "         Stopping before the package install." >&2
+        exit 1
+    fi
+    falkordb_provision "$VENV_DIR"
+    # The second hard stop (owner ruling): the hash-pinned wheel was refused, and
+    # the editable install below would fetch the same mandatory wheel with no
+    # hash check. A network failure stops here exactly as that install would.
+    if [[ "${FALKORDB_PIP_REFUSED:-}" == "1" ]]; then
+        echo "  ERROR: the graph engine's hash-pinned wheel did not install (see above)." >&2
+        echo "         Stopping before the package install, which would fetch it unverified." >&2
+        exit 1
+    fi
+else
+    echo "  WARNING: lib/falkordb_install.sh missing — skipping graph-engine provisioning"
+    # Nothing could be verified, so the unit is neither rendered nor rewritten.
+    falkordb_unit_keep_existing() { FALKORDB_KEEP_REASON="unverified"; return 0; }
+fi
+echo
+
 echo "  Syncing dependencies..."
 # Worktree guard + editable install + import verification — shared with
 # install.sh so the guard can't drift between the two entry points.
@@ -1092,11 +1136,14 @@ echo
 
 # --- Secrets ---
 echo "--- Checking secrets ---"
-SECRETS_FILE="$GENESIS_ROOT/secrets.env"
+# shellcheck source=lib/secrets_path.sh
+. "$SCRIPT_DIR/lib/secrets_path.sh"
+SECRETS_FILE="$(genesis_secrets_path "$GENESIS_ROOT")"
 if [[ -f "$SECRETS_FILE" ]]; then
     echo "  secrets.env exists"
 else
     if [[ -f "$GENESIS_ROOT/secrets.env.example" ]]; then
+        mkdir -p -m 0700 "$(dirname "$SECRETS_FILE")"
         cp "$GENESIS_ROOT/secrets.env.example" "$SECRETS_FILE"
         chmod 600 "$SECRETS_FILE"
         echo "  Copied secrets.env.example -> secrets.env"
@@ -1595,27 +1642,18 @@ else
 fi
 echo
 
-# --- Graph engine (FalkorDB) provisioning ---
-# Same guarded-source contract as the resilience libs. Fetches and verifies the
-# engine MODULE under ~/.genesis/deps and stops there — no system change; the
-# redis-server that loads it is an operator step (SETUP.md). The unit rendered
-# below is left DISABLED, so a box where this skips entirely is fully
-# functional — the memory graph keeps using its in-process NetworkX projection.
-echo "--- Graph engine (optional) ---"
-if [[ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]]; then
-    # shellcheck source=lib/falkordb_install.sh
-    source "$SCRIPT_DIR/lib/falkordb_install.sh"
-    falkordb_provision
-else
-    echo "  WARNING: lib/falkordb_install.sh missing — skipping graph-engine provisioning"
-    # Nothing could be verified, so an existing unit must not be re-rendered.
-    falkordb_unit_keep_existing() { [[ -f "$1" ]]; }
-fi
-echo
-
 # --- Systemd service sync ---
 echo "--- Syncing systemd service files ---"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+# A session without the user manager's env vars (a CC session, an ssh shell)
+# gets no answer from `systemctl --user`, and the graph engine's keep check
+# reads no answer as "state unknown": an INACTIVE engine's unit would then be
+# kept on its old binaries for good. Seed them the way update.sh does, the bus
+# only when its socket is there.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -S "$XDG_RUNTIME_DIR/bus" ]]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+fi
 SYSTEMD_TEMPLATE_DIR="$GENESIS_ROOT/scripts/systemd"
 SERVICES_UPDATED=0
 
@@ -1666,27 +1704,39 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
                     exit 1
                 fi ;;
         esac
-        # The graph engine's unit only advances to a module that is verified on
-        # disk. Provisioning above returns 0 when it skips or fails, so without
-        # this a failed or unpinned provision would point a working unit at a
-        # missing .so, breaking the engine at its next restart.
+        # The graph engine's unit is rendered only from an engine verified this
+        # run, and never moves an ACTIVE engine onto new binaries unasked
+        # (lib/falkordb_install.sh, falkordb_unit_keep_existing). Provisioning
+        # returns 0 when it skips or fails, so without this a failed provision
+        # would render a unit with no engine paths at all.
         if [[ "$svc_name" == "genesis-falkordb.service" ]] \
             && falkordb_unit_keep_existing "$target"; then
-            # Keeping the unit does not keep its module: provisioning removes (or,
-            # failing that, de-executes) a cached module it cannot authenticate,
-            # which may be the very file this unit loads. Say which one this is.
+            if [[ ! -f "$target" ]]; then
+                echo "  Skipped: $svc_name not rendered (graph engine not verified)"
+                continue
+            fi
+            # Keeping the unit does not keep what it loads: say whether that
+            # module is still on disk and executable.
             _kept_module="$(falkordb_unit_loaded_module "$target" 2>/dev/null || true)"
             if [[ -n "$_kept_module" && ! -x "$_kept_module" ]]; then
                 echo "  WARNING: kept $svc_name, but the module it loads is missing or not executable ($_kept_module):"
-                echo "           the engine will not start until bootstrap verifies a module."
+                echo "           the engine will not start until bootstrap verifies the graph engine."
+            elif [[ "${FALKORDB_KEEP_REASON:-}" == "active" ]]; then
+                echo "  Kept: $svc_name (the running graph engine stays on its current module;"
+                echo "        switch with GENESIS_FALKORDB_SWITCH=1 scripts/update.sh --take-template $svc_name,"
+                echo "        then systemctl --user restart genesis-falkordb)"
+            elif [[ "${FALKORDB_KEEP_REASON:-}" == "state_unknown" ]]; then
+                echo "  Kept: $svc_name (could not ask the user manager whether the graph engine is running,"
+                echo "        so it is not moved onto new binaries; switch with"
+                echo "        GENESIS_FALKORDB_SWITCH=1 scripts/update.sh --take-template $svc_name)"
             else
-                echo "  Kept: $svc_name (FalkorDB module ${FALKORDB_VERSION:-unknown} not verified on disk; unit not re-rendered)"
+                echo "  Kept: $svc_name (graph engine not verified this run; unit not re-rendered)"
             fi
             continue
         fi
         # Escape every replacement for the `s|...|...|` grammar (`\`, `&`, `|`)
-        # the same way install.sh's renderer does: a `&` in $HOME or a `|` in an
-        # overridden FALKORDB_VERSION would corrupt the expression or make sed
+        # the same way install.sh's renderer does: a `&` in $HOME or a `|` in a
+        # resolved engine path would corrupt the expression or make sed
         # fail outright, and a failing render aborts bootstrap — the UPDATE
         # path — under set -e.
         _sed_repl_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
@@ -1694,6 +1744,7 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         _home_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$HOME")")
         _repo_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$GENESIS_ROOT")")
         _venv_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$GENESIS_ROOT/.venv")")
+        _ccbin_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$CC_BIN_DIR")")
         _home_esc=$(_sed_repl_esc "$HOME")
         _venv_esc=$(_sed_repl_esc "$GENESIS_ROOT/.venv")
         _repo_esc=$(_sed_repl_esc "$GENESIS_ROOT")
@@ -1707,22 +1758,47 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         # install). Parity with install.sh is pinned by
         # tests/test_scripts/test_systemd_template_placeholders.py.
         _az_root_esc=$(_sed_repl_esc "${AZ_ROOT:-$HOME/agent-zero}")
-        # FALKORDB_VERSION is set by lib/falkordb_install.sh, sourced just above (the
-        # source of truth for the pin); the literal fallback keeps the render
-        # working when that lib is absent, in which case the unit is inert
-        # anyway because no module was installed.
-        _falkordb_ver_esc=$(_sed_repl_esc "${FALKORDB_VERSION:-4.20.4}")
-        _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)")
+        # The graph engine's four paths, as the engine check placed them in
+        # falkordb_provision above (already escaped for the unit's quotes). When
+        # that lib is absent or the engine is unverified they are empty, and the
+        # falkordb unit never reaches this render (the keep check above).
+        _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || true)")
+        _redis_cli_esc=$(_sed_repl_esc "$(_falkordb_redis_cli_bin 2>/dev/null || true)")
+        _falkordb_mod_esc=$(_sed_repl_esc "$(_falkordb_module_path 2>/dev/null || true)")
+        _falkordb_digests_esc=$(_sed_repl_esc "$(_falkordb_digests_path 2>/dev/null || true)")
+        # Resolved again here, not reused from $SECRETS_FILE above, so a step that
+        # moved the file earlier in this run renders the unit to where it now is.
+        # `%` doubled: systemd expands specifiers in EnvironmentFile=, so a bare `%`
+        # would make the unit load a different file than the resolver picked.
+        # Its own assignment, so set -e stops the render if it fails (inside the
+        # escape below the failure would be masked and render `EnvironmentFile=-`).
+        # SECRETS_PATH is not followed here: the unit gets the resolver's own file. A
+        # shell value never reaches the server, and a user-manager value cannot be
+        # rendered faithfully (systemd shell-quotes it, and a relative path is not a
+        # valid EnvironmentFile), so either one is named in a warning instead.
+        _secrets_file=$(SECRETS_PATH= genesis_secrets_path "$GENESIS_ROOT")
+        if [[ -n "$(printenv SECRETS_PATH || true)" ]] || { systemctl --user show-environment 2>/dev/null || true; } | grep '^SECRETS_PATH=' >/dev/null; then
+            echo "  WARNING: SECRETS_PATH is set, but the units load $_secrets_file; the server may load another file" >&2
+        fi
+        if [[ -z "$_secrets_file" ]]; then
+            echo "ERROR: could not resolve the secrets file for the unit render" >&2
+            exit 1
+        fi
+        _secrets_file_esc=$(_sed_repl_esc "$(printf '%s' "$_secrets_file" | sed -e 's/%/%%/g')")
         sed -e "s|__HOME__|$_home_esc|g" \
             -e "s|__HOME_EXEC__|$_home_exec_esc|g" \
             -e "s|__REPO_EXEC__|$_repo_exec_esc|g" \
             -e "s|__VENV_EXEC__|$_venv_exec_esc|g" \
+            -e "s|__CC_BIN_EXEC__|$_ccbin_exec_esc|g" \
             -e "s|__VENV__|$_venv_esc|g" \
             -e "s|__REPO_DIR__|$_repo_esc|g" \
             -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
             -e "s|__AZ_ROOT__|$_az_root_esc|g" \
-            -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \
             -e "s|__REDIS_SERVER__|$_redis_bin_esc|g" \
+            -e "s|__REDIS_CLI__|$_redis_cli_esc|g" \
+            -e "s|__FALKORDB_MODULE__|$_falkordb_mod_esc|g" \
+            -e "s|__FALKORDB_DIGESTS__|$_falkordb_digests_esc|g" \
+            -e "s|__SECRETS_FILE__|$_secrets_file_esc|g" \
             "$template" > "$_mu_render"
         # Written only when the installed unit is Genesis's own render; a unit
         # edited by hand is kept and named (lib/managed_units.sh).
@@ -1736,6 +1812,21 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     systemctl --user daemon-reload 2>/dev/null || true
     if [[ "$SERVICES_UPDATED" = "1" ]]; then
         echo "  systemd daemon reloaded (units changed)"
+    fi
+    # Retire graph engine copies no unit runs: everything under the deps dir
+    # except this run's verified copy and the one the unit (as it now stands,
+    # rendered or kept) loads. Never prunes when the unit's module is unreadable.
+    # After daemon-reload, so systemd already reads the unit this decided from.
+    if declare -F falkordb_prune_engines >/dev/null; then
+        falkordb_prune_engines "$SYSTEMD_USER_DIR/genesis-falkordb.service"
+    fi
+    # Arm the graph engine verified this run: enable it, and start it when it
+    # is not running; a running engine is never restarted, an operator opt-out
+    # or a masked unit is left alone, and a failed start is a WARNING
+    # (lib/falkordb_install.sh, falkordb_enable_unit). After daemon-reload, like
+    # the timer enables below.
+    if declare -F falkordb_enable_unit >/dev/null; then
+        falkordb_enable_unit "$SYSTEMD_USER_DIR/genesis-falkordb.service"
     fi
 
     # A user manager stops at logout without lingering, taking every enabled
@@ -1807,8 +1898,8 @@ fi
 # tmp-watchgod is now a template in scripts/systemd/ — handled by the loop above.
 
 # Check smbclient for Tier 2 backup (optional — only if NAS configured in secrets.env)
-if [ -f "$GENESIS_ROOT/secrets.env" ]; then
-    if grep -q 'GENESIS_BACKUP_NAS=' "$GENESIS_ROOT/secrets.env" 2>/dev/null; then
+if [ -f "$SECRETS_FILE" ]; then
+    if grep -q 'GENESIS_BACKUP_NAS=' "$SECRETS_FILE" 2>/dev/null; then
         if ! command -v smbclient >/dev/null 2>&1; then
             echo "  WARNING: smbclient not installed — Tier 2 backup to NAS won't work"
             echo "  Install with: sudo apt-get install -y smbclient"

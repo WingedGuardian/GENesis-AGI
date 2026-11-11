@@ -67,6 +67,7 @@ __all__ = [
     "RecheckResult",
     "Refusal",
     "decide",
+    "check_e2e_coverage",
     "derive",
     "parse_evidence",
     "parse_recheck_result",
@@ -187,6 +188,41 @@ class Finding(BaseModel):
     disposition: Text
 
 
+class PublicReceipt(BaseModel):
+    model_config = _CONFIG
+
+    kind: Literal["public"]
+    target: Text
+    url: Text
+    quote: Text
+    rationale: Text
+
+
+class PrivateReceipt(BaseModel):
+    model_config = _CONFIG
+
+    kind: Literal["private"]
+    target: Text
+    id: Text
+    quote: Text
+    rationale: Text
+    disclosure_harm: Text
+    redaction_insufficient: Text
+
+
+class AcceptedLimit(BaseModel):
+    model_config = _CONFIG
+
+    kind: Literal["accepted_limit"]
+    target: Text
+    rationale: Text
+
+
+TrackingDisposition = Annotated[
+    PublicReceipt | PrivateReceipt | AcceptedLimit, Field(discriminator="kind")
+]
+
+
 class MethodGap(BaseModel):
     """A limit of HOW this was verified, accepted as it stands."""
 
@@ -259,6 +295,22 @@ class NotYetDoneGap(BaseModel):
 Gap = Annotated[MethodGap | OwnerGap | EventGatedGap | NotYetDoneGap, Field(discriminator="kind")]
 
 
+class E2ECoverage(BaseModel):
+    """An explicit coverage assertion; meaning stays with the validator."""
+
+    model_config = _CONFIG
+
+    step: Text
+    claim: StrictInt | None = Field(default=None, ge=0)
+    gap: StrictInt | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _one_target(self) -> E2ECoverage:
+        if (self.claim is None) == (self.gap is None):
+            raise ValueError("each E2E step needs exactly one claim or gap index")
+        return self
+
+
 class EvidenceDocument(BaseModel):
     """The whole evidence document. ``extra="forbid"``: an unknown key is almost
     always a typo of a real one (``control`` for ``controls``), and dropping it
@@ -278,6 +330,24 @@ class EvidenceDocument(BaseModel):
     controls: list[Text] = []
     gaps: list[Gap] = []
     findings: list[Finding] = []
+    # Missing on historical evidence: parse it, but assess tracking separately.
+    tracking: list[TrackingDisposition] = []
+    # Optional for historical documents; the close checks against the live PR body.
+    e2e: list[E2ECoverage] = []
+    # The validator's own judgment that this attempt made no progress: its remaining
+    # steps are the same as the stored previous attempt's. On a not-yet-done row the
+    # picker then waits the re-attempt window. Absent or false: offered at once.
+    no_progress: StrictBool = False
+
+    @model_validator(mode="after")
+    def _coverage_targets_exist(self) -> EvidenceDocument:
+        for i, item in enumerate(self.e2e):
+            for key in ("claim", "gap"):
+                index = getattr(item, key)
+                targets = self.claims if key == "claim" else self.gaps
+                if index is not None and index >= len(targets):
+                    raise ValueError(f"e2e[{i}].{key}: index {index} is out of range")
+        return self
 
     @field_validator("repo", mode="before")
     @classmethod
@@ -424,7 +494,8 @@ def derive(doc: EvidenceDocument) -> Derivation:
     total — a document that established something but named no gap and ran no
     control is not "incomplete with nothing to say", it is a pass with one measured
     gap, and now it says so. ``pass-mechanical`` therefore means established,
-    controlled, and nothing left out, by construction.
+    controlled, and gap-free within the document. Close writers separately check
+    the document's E2E coverage against the PR body before discharging its row.
     """
     if not doc.deploy.established:
         undeployed = [
@@ -497,6 +568,30 @@ class Refusal:
 
     code: int
     message: str
+
+
+def check_e2e_coverage(doc: EvidenceDocument, body: str) -> Refusal | None:
+    """Check declaration identities before a close; never match prose semantically.
+
+    Targets already participate in derive/rechecks. A mapping cannot hide a gap
+    or promote an inferred/unverified claim. Multiple mappings may decompose a
+    compound declaration; each mapping asserts coverage of that declaration.
+    """
+    from genesis.session_awareness.e2e_declaration import e2e_steps
+
+    steps = e2e_steps(body)
+    mapped = {item.step.strip() for item in doc.e2e}
+    missing = [step for step in steps if step not in mapped]
+    stale = sorted(mapped - set(steps))
+    if missing or stale:
+        return Refusal(
+            2,
+            "E2E coverage is incomplete; add evidence.e2e entries with the exact "
+            "declaration text in step and a zero-based claim or gap index."
+            + _listing("missing E2E step", tuple(missing))
+            + _listing("not a declared E2E step", tuple(stale)),
+        )
+    return None
 
 
 def _listing(label: str, items: tuple[str, ...]) -> str:

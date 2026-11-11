@@ -5,8 +5,10 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from contextlib import closing
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
@@ -14,7 +16,17 @@ from tests.test_scripts.test_index_marker_legs import SCRIPT
 from tests.test_scripts.test_index_marker_legs import queue as queue  # noqa: F401
 
 
+def _schema5(queue):
+    """Explicit scratch cutover for new typed-authority tests; never startup."""
+    queue._prepare()
+    with closing(queue._connect()) as db:
+        if db.execute("PRAGMA user_version").fetchone()[0] == 4:
+            with queue._transaction(db):
+                queue._recovery.upgrade(db, queue._legs, queue._native)
+
+
 def _claim(queue, tmp_path, *, provider="cbm", mode="fast"):
+    _schema5(queue)
     repo = str(tmp_path / "repo with space 雪\n")
     queue.write_marker(repo, "both", mode)
     operation = getattr(queue, "claim_native", None)
@@ -32,8 +44,9 @@ def _reservation(claimed):
     value = claimed["context"]
     return {"unit": f"code-intel-{value['hash'][:12]}-{value['provider']}-{2**128 + int(value['claim_id'], 16)}",
             "run_mode": claimed["mode"], "source": _source(),
-            "owner": {"pid": os.getpid(), "start_ticks": 1,
-                      "boot_id": "00000000-0000-0000-0000-000000000001"},
+            "owner": {"pid": os.getpid(),
+                      "start_ticks": int(Path("/proc/self/stat").read_text().rpartition(")")[2].split()[19]),
+                      "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()},
             "cap_bytes": 8 * 1024**3, "route": "workload",
             "slice": "genesis-workload.slice", "wall_seconds": 3600}
 
@@ -81,6 +94,23 @@ def _begin(queue, claimed, data=None):
     return operation(claimed["context"], data or _intent(queue, claimed))
 
 
+def _finish_control(queue, claimed):
+    """Model completed fixture controller children separately from payload status."""
+    status = queue.execution_status(claimed["context"])
+    if status["launch_reservation"] is None or status["control_closure"] is not None:
+        return
+    reservation = status["launch_reservation"]
+    data = {"state": "clean", "reason": "normal", "reservation_sha256": queue._native.digest(reservation),
+            "observer": reservation["owner"], "observed_ns": time.monotonic_ns(),
+            "foreground": None, "monitor": None, "stop": None}
+    if status["scope_registration"] is not None:
+        for name, delta in (("foreground", 1), ("monitor", 2)):
+            data[name] = {"identity": {**reservation["owner"], "pid": reservation["owner"]["pid"] + delta}, "returncode": 0}
+    else:
+        queue.cancel_launch(claimed["context"])
+    queue.remember_native_event(claimed["context"], "control-closure", data)
+
+
 def test_current_schema_has_typed_execution_contract_and_still_refuses_automatic(queue):
     queue._prepare()
     with closing(sqlite3.connect(queue.database_path())) as db:
@@ -126,6 +156,7 @@ def test_native_claim_with_no_launch_reservation_recovers_neutrally_once(queue, 
 
 
 def test_actual_cli_native_claim_carries_complete_nul_context(queue, tmp_path):
+    _schema5(queue)
     repo = str(tmp_path / "literal$()'\n")
     queue.write_marker(repo, "both", "fast")
     result = subprocess.run([sys.executable, "-I", str(SCRIPT), "claim-native", "--hash",
@@ -172,6 +203,9 @@ def test_cancelled_reservation_cannot_be_reopened_by_replay(queue, tmp_path):
     assert _reserve(queue, claimed, data) == "reserved"
     assert queue.cancel_launch(claimed["context"]) == "cancelled"
     assert _reserve(queue, claimed, data) == "cancelled"
+    queue.reconcile_native()
+    assert queue.get_inflight(claimed["context"]["hash"]) is not None
+    _finish_control(queue, claimed)
     queue.reconcile_native()
     assert queue.get_inflight(claimed["context"]["hash"]) is None
     assert {row["attempts"] for row in queue.list_markers()} == {0}

@@ -500,3 +500,152 @@ def test_an_excluded_replay_and_a_foreign_generic_process_hold_nothing():
         ],
     )
     assert cut.evaluate(_daily_traffic(14), census, [], NOW).status == "PASS"
+
+
+# ── Owner ruling 9931626424ee4c6c: a young unprovable generic process ─────────
+def _generic(unknown: str, started: datetime) -> dict:
+    return {
+        "pid": 7, "role": "venv-generic", "started_at": started.isoformat(),
+        "commit": "c", "held": ["c"], "telemetry": None, "unknown": unknown,
+        "foreign": False, "db_identity": [1, 2],
+    }
+
+
+@pytest.mark.parametrize("unknown", ["other_genesis_home", "interpreter_unresolved"])
+def test_a_young_unprovable_generic_process_does_not_hold_the_clock(unknown):
+    row = _census_metrics(procs=[_proc(), _generic(unknown, NOW - timedelta(seconds=5))])
+    assert cut.census_dirt(row, NOW) is None
+    # The row's history check vouches for it; without that the excuse is void.
+    assert cut.census_dirt({**row, "head_history_telemetry": False}, NOW) is not None
+
+
+@pytest.mark.parametrize("unknown", ["other_genesis_home", "interpreter_unresolved"])
+def test_an_unprovable_generic_process_older_than_the_lookback_still_holds_it(unknown):
+    old = _generic(unknown, NOW - cut.HISTORY_LOOKBACK - timedelta(seconds=1))
+    edge = _generic(unknown, NOW - cut.HISTORY_LOOKBACK)
+    assert "may run old code" in cut.census_dirt(_census_metrics(procs=[old]), NOW)
+    assert "may run old code" in cut.census_dirt(_census_metrics(procs=[edge]), NOW)
+
+
+@pytest.mark.parametrize("unknown", ["other_genesis_home", "interpreter_unresolved"])
+@pytest.mark.parametrize(
+    ("inside_us", "clean"),
+    [(0, False), (1_999_999, False), (2_000_000, True), (2_000_001, True)],
+)
+def test_generic_history_boundary_reserves_the_boot_time_error(unknown, inside_us, clean):
+    started = NOW - cut.HISTORY_LOOKBACK + timedelta(microseconds=inside_us)
+    row = _census_metrics(procs=[_generic(unknown, started)])
+    assert (cut.census_dirt(row, NOW) is None) is clean
+
+
+def test_the_excuse_needs_the_row_time_a_start_and_a_named_reason():
+    young = _generic("other_genesis_home", NOW - timedelta(seconds=5))
+    assert cut.census_dirt(_census_metrics(procs=[young])) is not None  # no row time
+    no_start = {**young, "started_at": None}
+    assert cut.census_dirt(_census_metrics(procs=[no_start]), NOW) is not None
+    future = _generic("other_genesis_home", NOW + timedelta(seconds=5))
+    assert cut.census_dirt(_census_metrics(procs=[future]), NOW) is not None
+    other = _generic("started_on_old_code", NOW - timedelta(seconds=5))
+    assert cut.census_dirt(_census_metrics(procs=[other]), NOW) is not None
+
+
+@pytest.mark.parametrize("unknown", [["other_genesis_home"], {"x": 1}])
+def test_an_unhashable_unknown_reads_dirty_and_never_aborts_the_report(unknown):
+    p = {**_generic("other_genesis_home", NOW - timedelta(seconds=5)), "unknown": unknown}
+    assert cut.census_dirt(_census_metrics(procs=[p]), NOW) is not None
+
+
+@pytest.mark.parametrize("role", ["mcp-memory", "ambient"])
+def test_a_traversal_producer_gets_no_such_excuse(role):
+    p = {**_generic("other_genesis_home", NOW - timedelta(seconds=5)), "role": role}
+    p.update(unknown_reasons=["other_genesis_home"], source=None, telemetry_off=False)
+    assert cut.census_dirt(_census_metrics(procs=[p]), NOW) is not None
+
+
+def test_evaluate_passes_each_row_time_so_young_jobs_never_reset_the_clock():
+    rows = []
+    t = NOW - timedelta(days=15)
+    while t <= NOW:
+        procs = [_proc(), _generic("other_genesis_home", t - timedelta(seconds=3))]
+        rows.append((_ts(t), json.dumps(_census_metrics(procs=procs))))
+        t += timedelta(hours=1)
+    v = cut.evaluate(_daily_traffic(14), rows, [], NOW)
+    assert v.status == "PASS", v.reasons
+
+
+def test_the_verdict_lookback_is_the_writer_lookback():
+    from genesis.memory import graph_census
+
+    assert timedelta(seconds=graph_census.HISTORY_LOOKBACK_S) == cut.HISTORY_LOOKBACK
+    assert timedelta(seconds=graph_census._BOOT_TOLERANCE_S) == cut.BOOT_TIME_MARGIN
+
+
+# ── quiet rows: the where-present guard (D3) ──────────────────────────────
+
+
+def _quiet(t: datetime, n: int = 3, **over) -> tuple[str, str]:
+    """A row as graph_telemetry writes it for a quiet networkx selection."""
+    base = {
+        "outcomes": {"primary": n},
+        "served": {"networkx": n},
+        "configured": {"networkx": n},
+        "quiet": {"engine_not_provisioned": n},
+    }
+    base.update(over)
+    return _trav(t, primary=n, **base)
+
+
+def test_a_quiet_row_is_neither_traffic_nor_a_break():
+    trav, census = _passing_inputs()
+    trav.append(_quiet(NOW - timedelta(days=2)))
+    v = cut.evaluate(trav, census, [], NOW)
+    assert v.status == "PASS", v.reasons
+    assert v.resets == []
+    assert v.quiet == 3
+    assert v.traversals == 14 * 12, "quiet traversals are not traffic"
+    assert v.to_json()["quiet"] == 3
+
+
+def test_a_partly_quiet_row_still_breaks_the_clock():
+    row = _quiet(NOW - timedelta(days=2), n=3, quiet={"engine_not_provisioned": 2})
+    m = json.loads(row[1])
+    assert not cut.is_quiet_row(m)
+    assert cut.traversal_breaks_clock(m) == "configured networkx"
+
+
+def test_an_unknown_quiet_reason_breaks_the_clock():
+    m = json.loads(_quiet(NOW, quiet={"something_new": 3})[1])
+    assert cut.traversal_breaks_clock(m) == "quiet reason something_new"
+
+
+def test_a_quiet_row_whose_traversal_fell_back_still_breaks():
+    m = json.loads(
+        _quiet(NOW, outcomes={"fallback": 3}, served={"cte": 3})[1]
+    )
+    assert cut.traversal_breaks_clock(m) == "outcome fallback"
+
+
+def test_a_loud_selection_failure_still_breaks_the_clock():
+    trav, census = _passing_inputs()
+    trav.append(
+        _trav(
+            NOW - timedelta(days=2),
+            primary=0,
+            traversals=1,
+            outcomes={"selection_failed": 1},
+            served={"networkx": 1},
+            configured={"falkordb": 1},
+        )
+    )
+    v = cut.evaluate(trav, census, [], NOW)
+    assert v.status == "NOT_YET"
+    assert any(r["why"] == "outcome selection_failed" for r in v.resets)
+
+
+@pytest.mark.parametrize(
+    "quiet", [[1], {"engine_not_provisioned": -1}, {"engine_not_provisioned": 9}]
+)
+def test_a_malformed_quiet_counter_is_unreadable(quiet):
+    m = json.loads(_quiet(NOW, quiet=quiet)[1])
+    with pytest.raises(ValueError):
+        cut.traversal_breaks_clock(m)

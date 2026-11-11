@@ -14,6 +14,7 @@ from tests.test_scripts.test_index_marker_execution import (
     _begin,
     _claim,
     _facts,
+    _finish_control,
     _register,
     _registration,
     _reservation,
@@ -58,6 +59,7 @@ def _cleanup(queue, claimed, *, oom=0):
 def _apply(queue, claimed):
     operation = getattr(queue, "apply_native", None)
     assert callable(operation), "terminal facts need atomic exact-execution accounting"
+    _finish_control(queue, claimed)
     return operation(claimed["context"])
 
 
@@ -100,6 +102,9 @@ def test_commit_busy_retains_native_event_after_transaction_rollback(
     monkeypatch.setattr(queue._native, "record", record)
     # The reader is held until the call returns, so no timing race is involved.
     api = queue.remember_native_event.__globals__
+    # These synthetic prior-boot rows isolate durable publication, not fresh
+    # kernel ownership. A different real boot is otherwise valid G proof.
+    monkeypatch.setitem(api, "_fresh_cleanup", lambda db, row: False)
     monkeypatch.setitem(api, "OUTCOME_LOCK_WAIT_S", 0.1)
     real_sync = api["_fsync_dir"]
 
@@ -126,7 +131,10 @@ def test_commit_busy_retains_native_event_after_transaction_rollback(
     assert queue.execution_status(claimed["context"])[slot] is None
     assert retained.name.startswith(".execution-spool-") and retained.suffix == ".spool"
     assert json.loads(retained.read_bytes())["kind"] == kind
-    # Restore only this seam; undo() would also remove fixture GENESIS_HOME.
+    # Target-event fault injection is complete. H's separate control completion
+    # is not another instance of that event; keep its normal reducer for replay.
+    monkeypatch.setattr(queue._native, "record", original)
+    # Restore only these seams; undo() would also remove fixture GENESIS_HOME.
     monkeypatch.setitem(api, "_fsync_dir", real_sync)
     assert _apply(queue, claimed) == ("pending" if kind == "stop" else "consumed")
     status = queue.execution_status(claimed["context"])
@@ -202,7 +210,9 @@ def test_duplicate_receipt_timestamp_is_not_a_conflicting_terminal(queue, tmp_pa
     assert status["terminal"]["recorded_at"] == 1000
 
 
-def test_late_disproof_never_refunds_or_reapplies_completed_work(queue, tmp_path):
+def test_late_disproof_never_refunds_or_reapplies_completed_work(queue, tmp_path, monkeypatch):
+    # No current original-kernel proof is supplied by this journal fixture.
+    monkeypatch.setitem(queue.claim_native.__globals__, "_fresh_cleanup", lambda db, row: False)
     claimed = _started(queue, tmp_path, mode="full")
     original = _terminal(claimed)
     _event(queue, claimed, "terminal", original)
@@ -333,6 +343,12 @@ def test_actual_cli_journal_e2e_never_reissues_permit_or_replays_native_work(que
     assert run("remember-native-event", _terminal(claimed), kind="terminal").returncode == 0
     assert json.loads(run("apply-native").stdout) == "consumed"
     assert run("remember-native-event", _cleanup(queue, claimed), kind="cleanup").returncode == 0
+    assert json.loads(run("apply-native").stdout) == "consumed"
+    assert queue.get_inflight(claimed["context"]["hash"]) is not None
+    _finish_control(queue, claimed)  # The original live owner publishes its own control completion.
+    closure = queue.execution_status(claimed["context"])["control_closure"]["data"]
+    foreign = run("remember-native-event", closure, kind="control-closure")
+    assert foreign.returncode == 2 and b"original live owner" in foreign.stderr
     assert json.loads(run("apply-native").stdout) == "consumed"
     status = json.loads(run("execution-status").stdout)
     assert status["completion_kind"] == "success" and not status["evidence_pending"]

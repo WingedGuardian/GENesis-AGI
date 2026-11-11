@@ -1634,7 +1634,7 @@ def _evaluate_pr_inner(
     # The final read pins the head AND the mutable evidence: a review or a
     # confirmation comment posted after the first read but before the head check
     # leaves the head unchanged while the snapshot under-counts the budget. One
-    # query re-reads both and the snapshots must agree -- the race window
+    # query re-reads both and their policy evidence must agree -- the race window
     # shrinks to the last call rather than the whole fetch block. (Neither API
     # offers a point-in-time read; this narrows, not closes, it.)
     final_head = os.environ.get("_TEST_REVIEW_BUDGET_HEAD_AFTER")
@@ -1654,6 +1654,7 @@ def _evaluate_pr_inner(
             final_head = str(second["head"]).strip()
     if final_head != test_head:
         return _unknown("head_changed_during_evaluation", current_head=final_head)
+    comments_changed = False
     for item in mutable:
         again = (second or {}).get(item)
         if item == "reviews":
@@ -1664,7 +1665,9 @@ def _evaluate_pr_inner(
             # Ids never decide the count, so they never decide this either (see
             # _review_digest): a repost between the reads is not a new unknown.
             same = _without_ids(again) == _without_ids(fetched[item])
-        if not same:
+        if item == "comments":
+            comments_changed = not same
+        elif not same:
             return _unknown("evidence_changed_during_evaluation", current_head=final_head)
 
     commit_heads: list[str | dict[str, Any]] = []
@@ -1677,15 +1680,26 @@ def _evaluate_pr_inner(
             {"sha": sha, "parents": item["parents"]} if item.get("parents") is not None else sha
         )
 
-    result = evaluate_evidence(
-        current_head=test_head,
-        commit_heads=commit_heads,
-        reviews=fetched["reviews"],
-        issue_comments=fetched["comments"],
-        changed_files=fetched["files"],
-        external_identity_templates=external_identity_templates,
-        primary_login=primary_login,
-    )
+    def evaluate(comments: list[dict[str, Any]]) -> dict[str, Any]:
+        return evaluate_evidence(
+            current_head=test_head,
+            commit_heads=commit_heads,
+            reviews=fetched["reviews"],
+            issue_comments=comments,
+            changed_files=fetched["files"],
+            external_identity_templates=external_identity_templates,
+            primary_login=primary_login,
+        )
+
+    result = evaluate(fetched["comments"])
+    if comments_changed:
+        # Unrelated comment churn need not manufacture an approval boundary.
+        # Delegate relevance to the complete policy, including reflection keys,
+        # marks and reviewer attribution -- not only count or approval. Unknown
+        # projections cannot establish stability, even when they match.
+        again_result = evaluate((second or {}).get("comments") or [])
+        if result["status"] != "ok" or again_result["status"] != "ok" or result != again_result:
+            return _unknown("evidence_changed_during_evaluation", current_head=final_head)
     # The PR body, for the reflection's acceptance points. It is not evidence
     # the count rests on, so a body edited between the two reads leaves the
     # count standing; but acceptance must bind the body as it now is, so the

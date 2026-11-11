@@ -133,6 +133,8 @@ EXEMPT: dict[tuple[str, str], str] = {
     ("observability/snapshots/deploy_health.py", "scripts/guardian-gateway.sh"): _TIER2,
     ("observability/snapshots/deploy_health.py", "scripts/lib/host_swap.sh"): _TIER2,
     ("observability/snapshots/deploy_health.py", "scripts/lib/cc_tmp_volume.sh"): _TIER2,
+    ("observability/snapshots/deploy_health.py", "scripts/cc_settings_align.sh"): _TIER2,
+    ("observability/snapshots/deploy_health.py", "scripts/setup_claude_config.py"): _TIER2,
     ("observability/snapshots/deploy_health.py", "scripts/deploy_candidates"): (
         "run (`list --json`, read-only) per snapshot for what the deploy manifest lists "
         "and what `live` holds, for the non-paging `live_*` advisories; no validated "
@@ -558,8 +560,10 @@ _RELOAD = (
     "scripts/lib/index_marker_cli.py",
     "scripts/lib/index_marker_legacy.py",
     "scripts/lib/index_marker_legs.py",
+    "scripts/lib/index_marker_recovery.py",
     "scripts/lib/index_marker_execution.py",
     "scripts/lib/code_intel_execution.py",
+    "scripts/lib/code_intel_scope.py",
     "scripts/lib/code_intel_cbm_admission.py",
     "scripts/hooks/worktree_claim.py",
     "scripts/hooks/secret_scrub.py",

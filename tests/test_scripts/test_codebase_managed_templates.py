@@ -53,7 +53,7 @@ def render(tmp_path):
     for name in UNITS:
         shutil.copy2(ROOT / "scripts/systemd" / (name + ".template"), templates)
 
-    def run(renderer, home=None, *, take="", tier="0", with_post=False):
+    def run(renderer, home=None, *, take="", tier="0", with_post=False, cc_bin_dir="/usr/bin"):
         env = dict(
             os.environ,
             SYSTEMD_TEMPLATE_DIR=str(templates),
@@ -62,10 +62,9 @@ def render(tmp_path):
             REPO_DIR=str(home or tmp_path),
             GENESIS_ROOT=str(home or tmp_path),
             VENV_PATH=str(tmp_path / 'venv=$%&|λ" '),
-            CC_BIN_DIR="/usr/bin",
+            CC_BIN_DIR=cc_bin_dir,
             SERVICES_GENERATED="0",
             SERVICES_UPDATED="0",
-            FALKORDB_VERSION="4.20.4",
             GENESIS_TAKE_TEMPLATES=take,
             GENESIS_UPDATE_TIER=tier,
             GENESIS_DEPLOY_SUMMARY=str(tmp_path / "summary"),
@@ -76,7 +75,11 @@ def render(tmp_path):
             [
                 "/bin/bash",
                 "-euc",
-                "_falkordb_redis_server_bin() { printf /usr/bin/redis-server; }\n"
+                f". {ROOT / 'scripts/lib/secrets_path.sh'}\n"
+                "_falkordb_redis_server_bin() { printf /opt/e/redis-server; }\n"
+                "_falkordb_redis_cli_bin() { printf /opt/e/redis-cli; }\n"
+                "_falkordb_module_path() { printf /opt/e/falkordb.so; }\n"
+                "_falkordb_digests_path() { printf /opt/e/engine.sha256; }\n"
                 'systemctl() { printf "%s\\n" "$*" >> "$TEST_MANAGER_LOG"; }\n'
                 'loginctl() { printf "Linger=yes\\n"; }\n'
                 + prelude(tmp_path)

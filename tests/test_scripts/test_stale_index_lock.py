@@ -1,8 +1,9 @@
 """scripts/lib/stale_index_lock.py: a dead git's index.lock is retired, a live one never (#3792).
 
-Runs against a real temporary checkout and the real /proc: "held" is a child
-process keeping the lock open, because ``_held_open`` deliberately ignores the
-process that asks.
+Runs against a real temporary checkout and /proc: "held" is a child process
+keeping the lock open, because ``_held_open`` deliberately ignores the process
+that asks. /proc lists only this test's own processes (tests/_own_processes.py),
+so another pytest-xdist worker's git cannot count as a holder.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._own_processes import CLI_STUB, own_processes_only
+
 ROOT = Path(__file__).resolve().parents[2]
 _SPEC = importlib.util.spec_from_file_location(
     "stale_index_lock", ROOT / "scripts" / "lib" / "stale_index_lock.py"
@@ -26,6 +29,13 @@ sil = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(sil)
 
 OLD = 3 * 3600
+
+
+@pytest.fixture(autouse=True)
+def _own_processes(monkeypatch):
+    # The heal scans every same-user process; another pytest-xdist worker's git
+    # would otherwise count as a holder here. See tests/_own_processes.py.
+    own_processes_only(monkeypatch)
 
 
 @pytest.fixture
@@ -226,9 +236,10 @@ def test_old_backups_are_pruned_and_others_kept(repo, home):
 
 def test_the_cli_exit_code_and_line(repo, home):
     _lock(repo, age=OLD)
+    # Run as its own process, as the deploy scripts do, with the same /proc view.
     proc = subprocess.run(
-        [sys.executable, "-I", "-S", str(ROOT / "scripts/lib/stale_index_lock.py"), str(repo),
-         "--home", str(home)],
+        [sys.executable, "-I", "-S", "-c", CLI_STUB, str(ROOT / "tests/_own_processes.py"),
+         str(ROOT / "scripts/lib/stale_index_lock.py"), str(repo), "--home", str(home)],
         capture_output=True, text=True, check=False,
     )  # fmt: skip
     assert proc.returncode == 3  # never 2: python itself exits 2 when the script is missing
@@ -458,3 +469,51 @@ def test_a_relative_git_dir_after_a_relative_dash_c_counts(tmp_path, monkeypatch
     monkeypatch.setattr(sil, "_PROC", str(proc))
     places = sil._git_places("77")
     assert os.path.normpath(str(work / "r" / ".git")) in [os.path.normpath(x) for x in places]
+
+
+def _unreadable_git(tmp_path: Path, seconds: float) -> subprocess.Popen:
+    """A live process of this user named git whose cwd, arguments and fds cannot
+    be read (non-dumpable), for ``seconds``; started once that is so."""
+    fake = tmp_path / "bin" / "git"
+    fake.parent.mkdir()
+    fake.write_bytes(Path(os.path.realpath(sys.executable)).read_bytes())
+    fake.chmod(0o755)
+    code = f"import ctypes, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); time.sleep({seconds})"
+    proc = subprocess.Popen([str(fake), "-c", code])
+    deadline = time.monotonic() + 30
+    while True:
+        assert time.monotonic() < deadline, "the process never became unreadable"
+        try:
+            os.listdir(f"/proc/{proc.pid}/fd")
+        except PermissionError:
+            return proc
+        time.sleep(0.02)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="running as root: EACCES cannot be produced")
+def test_a_lasting_unreadable_git_counts_as_working_here(tmp_path):
+    """#4001: a git whose cwd and arguments cannot be read is a suspect, and one
+    that lasts through the re-checks still counts (fail toward leaving the
+    lock); what heal passes as ``alive`` (live_move_repair._may_hold) keeps it."""
+    proc = _unreadable_git(tmp_path, 60)
+    try:
+        found = sil._git_in_repo({str(tmp_path / "checkout" / ".git")}, sil._repair()._may_hold)
+    finally:
+        proc.kill()
+        proc.wait()
+    assert found == proc.pid
+
+
+def test_heal_judges_gits_with_may_hold_so_an_exiting_one_holds_nothing(repo, home, monkeypatch):
+    """#4001: an exiting git (PF_EXITING) has unreadable fds and holds nothing.
+    heal hands _git_in_repo live_move_repair's _may_hold, which drops it."""
+    _lock(repo, age=OLD)
+    seen = []
+
+    def spy(targets, alive):
+        seen.append(alive.__name__)
+        return None
+
+    monkeypatch.setattr(sil, "_git_in_repo", spy)
+    rc, _line = sil.heal(str(repo), str(home))
+    assert seen == ["_may_hold"] and rc == sil.RETIRED

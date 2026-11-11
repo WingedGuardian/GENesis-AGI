@@ -21,6 +21,7 @@ the schema authority; nothing here creates tables. ``now`` is always injected
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import aiosqlite
@@ -326,8 +327,13 @@ async def record_attempt(
     note: str,
     now: str,
     evidence: str | None = None,
+    tracking_pending: bool = False,
 ) -> str:
-    """Record a NON-closing validation attempt. ``"recorded" | "missing" | "unavailable"``.
+    """Record a non-closing measurement. ``"recorded" | "missing" | "unavailable"``.
+
+    A passing measurement may stay OPEN with ``tracking_pending=True`` and an
+    explicit pending note/evidence. Measurement verdict and routing completion
+    are separate; the candidate reader includes these rows for recovery.
 
     The row STAYS OPEN — ``status`` is deliberately absent from the SET list, so
     the "keep it open" rule is enforced by the SQL rather than by every caller
@@ -354,12 +360,14 @@ async def record_attempt(
         raise ValueError(
             f"record_attempt: verdict must be one of {list(VERDICTS)}, got {verdict!r}"
         )
-    if verdict in PASS_VERDICTS:
+    if verdict in PASS_VERDICTS and not tracking_pending:
         raise ValueError(
             f"record_attempt refuses {verdict!r}: a PASS discharges the obligation and "
             f"must go through close_verification, so exactly one writer moves the row "
             f"to 'closed'."
         )
+    if tracking_pending and (not evidence or not tracking_pending_note(note)):
+        raise ValueError("pending tracking requires evidence and a TRACKING PENDING note")
     _check_evidence_size(evidence)
     if not note or not note.strip():
         raise ValueError(
@@ -499,9 +507,8 @@ async def list_open(db: aiosqlite.Connection, *, limit: int = 500) -> list[dict]
     review caught this; the class did not exist before the attempt record did,
     so the ordering is part of that change rather than an unrelated fix.
 
-    The verdict is the discriminator and it is exact on an open row: a PASS
-    verdict closes the row, so an OPEN row carries a verdict only after a recorded
-    non-closing attempt — ``fail-intent``, ``not-yet-done`` or ``cannot-verify``.
+    Passing measurements awaiting task receipts sort with unfinished work.
+    They retain their measured verdict while the row stays OPEN.
 
     Assumes a Row factory. Empty pre-migration — and on a pre-migration database
     the ordering degrades to plain oldest-first rather than failing, because the
@@ -511,7 +518,8 @@ async def list_open(db: aiosqlite.Connection, *, limit: int = 500) -> list[dict]
         return []
     lim = max(1, min(int(limit), 2000))
     order = (
-        "CASE WHEN verdict = 'fail-intent' THEN 0 WHEN verdict = 'not-yet-done' THEN 1 "
+        "CASE WHEN verdict = 'fail-intent' THEN 0 "
+        "WHEN verdict IN ('not-yet-done', 'pass-mechanical', 'pass-with-measured-gaps') THEN 1 "
         "WHEN verdict IS NULL THEN 2 ELSE 3 END ASC, merged_at ASC"
         if await _verdict_columns_available(db)
         else "merged_at ASC"
@@ -529,23 +537,69 @@ async def list_open(db: aiosqlite.Connection, *, limit: int = 500) -> list[dict]
 #: re-attempt check below are built from it, and a test pins that every
 #: non-closing verdict in :data:`VERDICTS` is either here or in
 #: :data:`_NEVER_PICKED`, so a new verdict cannot silently go unpicked.
-_CANDIDATE_TIERS = {"not-yet-done": 0, None: 1, "cannot-verify": 2}
+_CANDIDATE_TIERS = {
+    "not-yet-done": 0, "pass-mechanical": 0, "pass-with-measured-gaps": 0,
+    None: 1, "cannot-verify": 2,
+}
 
 #: Picked only once their last attempt is older than the re-attempt window.
+#: (A ``not-yet-done`` row waits the same window only when its stored evidence
+#: declares ``no_progress``; see :func:`list_validation_candidates`.)
 _DELAYED_VERDICTS = frozenset({"cannot-verify"})
 
 #: Never picked: a failure is the owner's to act on, never the loop's to retry.
 _NEVER_PICKED = frozenset({"fail-intent"})
 
+#: Days a delayed row waits before the picker offers it again. The picker's default
+#: and the CLI's "offered again after" line both read it.
+REATTEMPT_DAYS = 7
+
+#: The note prefix a tracking-pending attempt must carry (see :func:`record_attempt`).
+TRACKING_PENDING_PREFIX = "TRACKING PENDING:"
+
+
+def tracking_pending_note(note: object) -> bool:
+    """Does a stored ``last_attempt_note`` mark its attempt's routing unfinished?
+
+    The one test of that marker: :func:`record_attempt` refuses a pending write
+    whose note fails it, and the picker reads it."""
+    return isinstance(note, str) and note.startswith(TRACKING_PENDING_PREFIX)
+
+
+def declares_no_progress(evidence: object) -> bool:
+    """Does a stored evidence document declare ``no_progress: true``?
+
+    Read straight from the JSON rather than through the evidence model, so a
+    historical document that no longer parses is simply undeclared (False, no
+    wait). Only the literal ``true`` counts; the writers' model refuses any other
+    type, so anything else here is not a declaration."""
+    if not isinstance(evidence, str) or not evidence:
+        return False
+    try:
+        doc = json.loads(evidence)
+    except ValueError:
+        return False
+    return isinstance(doc, dict) and doc.get("no_progress") is True
+
 
 async def list_validation_candidates(
-    db: aiosqlite.Connection, *, now: str, reattempt_days: int = 7
+    db: aiosqlite.Connection, *, now: str, reattempt_days: int = REATTEMPT_DAYS
 ) -> list[dict]:
     """Open rows a validator may pick next, best first. Each carries a ``tier``.
 
-    Eligibility (owner ruling, 2026-10-29): ``not-yet-done`` always, with no
-    delay, because the commands that finish it are named and runnable now
-    (tier 0); never attempted (tier 1); ``cannot-verify`` only once its last
+    Eligibility (owner ruling 2026-10-29, amended 2026-11-09): ``not-yet-done``
+    with no delay, because the commands that finish it are named and runnable now
+    (tier 0), UNLESS its stored evidence declares ``no_progress`` (the validator
+    judged that this attempt's remaining steps are the previous attempt's) and its
+    routing is complete: then it waits until its last attempt is at least
+    ``reattempt_days`` old and returns to tier 0. Such a row's step usually needs
+    an action a standing validator may not take (push, deploy, merge); without the
+    wait every pass re-picked it and the rest of the ledger was never reached. A
+    last note marked ``TRACKING PENDING:`` is offered at once, so an interrupted
+    routing is not hidden; the routing re-record carries the same document, and
+    with it the declaration. Passing measurements awaiting routing are tier 0
+    with no wait; never attempted
+    (tier 1); ``cannot-verify`` only once its last
     attempt is at least ``reattempt_days`` old (tier 2), so a precondition gets
     time to become reachable; ``fail-intent`` never. Within a tier, NEWEST merge
     first: a standing validator works recent merges while their context is warm,
@@ -559,7 +613,7 @@ async def list_validation_candidates(
     The re-attempt window compares parsed INSTANTS in Python, not strings in
     SQL: writers store ISO stamps in more than one spelling (``Z`` and
     ``+00:00``), and those sort differently as text. A stamp that does not parse
-    leaves the row out, since an unknown age is not "old enough".
+    leaves a waiting row out, since an unknown age is not "old enough".
 
     Before the verdict columns exist no attempt could have been recorded, so
     every open row is never-attempted. Assumes a Row factory. Empty
@@ -595,7 +649,12 @@ async def list_validation_candidates(
     for raw in await cursor.fetchall():
         row = dict(raw)
         verdict = row.get("verdict")
-        if verdict in _DELAYED_VERDICTS:
+        stuck = (
+            verdict == "not-yet-done"
+            and declares_no_progress(row.get("evidence"))
+            and not tracking_pending_note(row.get("last_attempt_note"))
+        )
+        if verdict in _DELAYED_VERDICTS or stuck:
             try:
                 last = datetime.fromisoformat(str(row.get("last_attempt_at")))
             except ValueError:

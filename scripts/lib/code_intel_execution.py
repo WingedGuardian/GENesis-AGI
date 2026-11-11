@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import runpy
 import signal
 import stat
@@ -20,9 +21,13 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
-_ADMISSION = runpy.run_path(str(Path(__file__).with_name("code_intel_cbm_admission.py")))
+_ADMISSION = globals().get("_CAPTURED_ADMISSION")
+if _ADMISSION is None:
+    _ADMISSION = runpy.run_path(str(Path(__file__).with_name("code_intel_cbm_admission.py")))
 _NUMBER = _ADMISSION["number"]
 _MAX = _ADMISSION["MAX_NUMBER"]
 _EVENTS = {"low", "high", "max", "oom", "oom_kill"}
@@ -67,56 +72,105 @@ def _identity(path: Path) -> dict:
     return {"path": str(path), "device": info.st_dev, "inode": info.st_ino}
 
 
+def mount_digest(path: Path) -> str:
+    mounts = []
+    for row in path.read_text().splitlines():
+        _, separator, right = row.partition(" - ")
+        parts = right.split()
+        if separator and parts and parts[0] == "cgroup2":
+            if len(parts) != 3 or "memory_localevents" in parts[2].split(","):
+                raise ValueError("hierarchical memory events unavailable")
+            mounts.append(row)
+    if not mounts:
+        raise ValueError("hierarchical v2 proof required")
+    return hashlib.sha256("\n".join(sorted(mounts)).encode()).hexdigest()
+
+
+def _process_state(directory: Path, pid: int, *, allow_zombie=False):
+    """PID, start and parent: proc_pid_stat(5), fields1,22,4.
+
+    Only an actual OwnedChild may retain Z identity; default live scope proof
+    still refuses it. Identity alone never supplies a terminal wait result.
+    https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
+    """
+    if type(allow_zombie) is not bool:
+        raise ValueError("invalid owned zombie identity selection")
+    process = (directory / "stat").read_text()
+    tail = process.rpartition(") ")[2].split()
+    if _NUMBER(process.split(" ", 1)[0], "reporter pid") != pid or len(tail) < 20:
+        raise ValueError("reporter process identity mismatch or start unavailable")
+    if tail[0] in ("X", "x") or (tail[0] == "Z" and not allow_zombie):
+        raise ValueError("scope subject has already ended")
+    return pid, _NUMBER(tail[19], "reporter start"), _NUMBER(tail[1], "reporter parent")
+
+
 class ScopeProbe:
     """Read actual scope proof; proc injection is a Python fixture seam only."""
 
-    def __init__(self, unit: str, cap: int, *, proc: Path = Path("/proc")):
-        self.unit, self.cap, self.proc = unit, cap, proc
+    def __init__(self, unit: str, cap: int, *, proc: Path = Path("/proc"), route=None):
+        self.unit, self.cap, self.proc, self.route = unit, cap, proc, route
+        if route is not None:
+            if (type(route) is not tuple or len(route) != 2
+                    or not all(isinstance(value, str) for value in route)
+                    or re.fullmatch(r"[A-Za-z0-9_.\\-]+\.slice", route[1]) is None
+                    or cap != 8 * 1024**3):
+                raise ValueError("invalid queued scope route or cap")
+            expected = re.fullmatch(r"code-intel-[a-f0-9]{12}-(cbm|gitnexus)-[0-9]+", unit)
+            if expected is None or not (
+                route == ("workload", "genesis-workload.slice")
+                or (route == ("capped", "app-capped.slice") and expected[1] == "gitnexus")
+                or (route[0] == "inherit" and expected[1] == "cbm")
+            ):
+                raise ValueError("queued route does not match provider")
 
-    def capture(self) -> dict:
-        member_path, mount_path = self.proc / "self/cgroup", self.proc / "self/mountinfo"
-        _ADMISSION["verify_workload_scope"](
-            self.unit,
-            self_path=member_path,
-            mountinfo_path=mount_path,
-        )
+    def capture(self, *, pid=None) -> dict:
+        if pid is not None and (type(pid) is not int or not 0 < pid < 2**32):
+            raise ValueError("invalid explicit scope subject")
+        subject = self.proc / ("self" if pid is None else str(pid))
+        actual_pid = os.getpid() if pid is None else pid
+        process = _process_state(subject, actual_pid)
+        if pid is not None and process[2] != os.getpid():
+            raise ValueError("scope subject is not the original owner's direct child")
+        boot_path = self.proc / "sys/kernel/random/boot_id"
+        boot = str(uuid.UUID(boot_path.read_text().strip()))
+        member_path, mount_path = subject / "cgroup", subject / "mountinfo"
+        membership = member_path.read_text()
+        if self.route is None:
+            _ADMISSION["verify_workload_scope"](
+                self.unit,
+                self_path=member_path,
+                mountinfo_path=mount_path,
+            )
         leaf, root, version = _ADMISSION["resolve_cgroup"](member_path, mount_path)
-        mounts = []
-        for row in mount_path.read_text().splitlines():
-            _, separator, right = row.partition(" - ")
-            parts = right.split()
-            if separator and parts and parts[0] == "cgroup2":
-                if len(parts) != 3 or "memory_localevents" in parts[2].split(","):
-                    raise ValueError("hierarchical memory events unavailable")
-                mounts.append(row)
-        if not mounts or version != 2:
+        if self.route is not None and (leaf == root or leaf.name != self.unit + ".scope"
+                                       or leaf.parent.name != self.route[1]):
+            raise ValueError("batch is outside its explicitly reserved slice and scope")
+        mounts_sha256 = mount_digest(mount_path)
+        if pid is not None and mounts_sha256 != mount_digest(self.proc / "self/mountinfo"):
+            raise ValueError("scope subject has another visible cgroup mount mapping")
+        if version != 2:
             raise ValueError("hierarchical v2 proof required")
         leaf_identity = _identity(leaf)
+        root_identity = _identity(root)
+        if pid is not None:
+            _, owner_root, owner_version = _ADMISSION["resolve_cgroup"](self.proc / "self/cgroup", self.proc / "self/mountinfo")
+            if owner_version != version or _identity(owner_root) != root_identity:
+                raise ValueError("scope subject has another visible cgroup root")
         memory_max = _NUMBER((leaf / "memory.max").read_text(), "memory.max")
         swap_max = _NUMBER((leaf / "memory.swap.max").read_text(), "memory.swap.max")
-        adjustment = int((self.proc / "self/oom_score_adj").read_text())
+        adjustment = int((subject / "oom_score_adj").read_text())
         if memory_max != self.cap or swap_max != 0 or not -1000 <= adjustment < 1000:
             raise ValueError("scope limit or reporter protection mismatch")
-        process = (self.proc / "self/stat").read_text()
-        if _NUMBER(process.split(" ", 1)[0], "reporter pid") != os.getpid():
-            raise ValueError("reporter process identity mismatch")
-        tail = process.rpartition(") ")[2].split()
-        if len(tail) < 20:
-            raise ValueError("reporter process start unavailable")
         reporter = {
-            "pid": os.getpid(),
-            "start_ticks": _NUMBER(tail[19], "reporter start"),
-            "boot_id": str(
-                uuid.UUID((self.proc / "sys/kernel/random/boot_id").read_text().strip())
-            ),
+            "pid": actual_pid, "start_ticks": process[1], "boot_id": boot,
         }
         result = {
             "version": version,
             "leaf": leaf_identity,
-            "root": _identity(root),
+            "root": root_identity,
             "reporter": reporter,
-            "membership": member_path.read_text(),
-            "mounts_sha256": hashlib.sha256("\n".join(sorted(mounts)).encode()).hexdigest(),
+            "membership": membership,
+            "mounts_sha256": mounts_sha256,
             "memory_max": memory_max,
             "swap_max": swap_max,
             "oom_score_adj": adjustment,
@@ -135,8 +189,11 @@ class ScopeProbe:
             if parent == root:
                 break
             parent = parent.parent
-        if _identity(leaf) != leaf_identity:
-            raise ValueError("scope identity changed while sampling")
+        if (_identity(leaf) != leaf_identity or _identity(root) != root_identity
+                or _process_state(subject, actual_pid) != process
+                or str(uuid.UUID(boot_path.read_text().strip())) != boot
+                or member_path.read_text() != membership or mount_digest(mount_path) != mounts_sha256):
+            raise ValueError("scope subject or kernel identity changed while sampling")
         return result
 
     def _threads(self, facts: dict) -> list[int]:
@@ -150,6 +207,8 @@ class ScopeProbe:
         return threads
 
     def finality(self, facts: dict) -> dict | None:
+        if facts["reporter"]["pid"] != os.getpid():
+            raise ValueError("finality requires the current reporter")
         leaf = Path(facts["leaf"]["path"])
         if _identity(leaf) != facts["leaf"]:
             raise ValueError("scope identity changed")
@@ -346,8 +405,50 @@ def _payload_status(child: subprocess.Popen) -> int | None:
     return child.returncode
 
 
+@dataclass(frozen=True)
+class QueuedLaunch:
+    """Internal queued seam; caller retains diagnostics separately from facts."""
+
+    baseline: dict
+    before_spawn: Callable[[dict], str]
+    after_spawn: Callable[[], None]
+    pass_fds: tuple[int, ...] = ()
+    env: dict[str, str] | None = None
+    cwd: str | None = None
+    diagnostics: list[str] = field(default_factory=list)
+
+    @classmethod
+    def _checked(cls, launch, before):
+        if not isinstance(launch, cls) or not _facts(launch.baseline):
+            raise ValueError("invalid registered baseline")
+        _complete(launch.baseline, before)
+        return launch
+
+    def _spawn(self, command, before, deadline):
+        try:
+            acknowledgement = self.before_spawn(before)
+        except RuntimeError as error:
+            self.diagnostics.append(f"native_intent_callback_failed: {type(error).__name__}: {error}")
+            raise ValueError("native intent callback did not authorize launch") from error
+        if acknowledgement != "started":
+            raise ValueError("first committed native intent not acknowledged")
+        if time.monotonic() >= deadline:
+            raise ValueError("deadline reached after native intent")
+        return subprocess.Popen(command, close_fds=True, pass_fds=self.pass_fds,
+                                env=self.env, cwd=self.cwd)
+
+    def _released(self):
+        try:
+            self.after_spawn()
+        except Exception as error:
+            # observe already owns the child and records its creation. A release
+            # failure stays diagnostic while actual completion is still observed.
+            self.diagnostics.append(f"admission_release_failed: {type(error).__name__}: {error}")
+
+
 def observe(
-    probe: ScopeProbe, command: list[str], *, seconds: float, report_limit: int = _LIMIT
+    probe: ScopeProbe, command: list[str], *, seconds: float, report_limit: int = _LIMIT,
+    launch: QueuedLaunch | None = None,
 ) -> dict:
     """Produce facts, never classify a signal/exit code as OOM or claim cleanup.
 
@@ -375,6 +476,8 @@ def observe(
         before = probe.capture()
         if not _facts(before):
             raise ValueError("invalid scope facts")
+        if launch is not None:
+            launch = QueuedLaunch._checked(launch, before)
         finality = probe.finality(before)
         if finality is None:
             raise ValueError("scope already contains other tasks")
@@ -402,8 +505,11 @@ def observe(
             raise ValueError("complete report cannot fit")
         if time.monotonic() >= deadline:
             raise ValueError("deadline reached before launch")
-        child = subprocess.Popen(command, close_fds=True)
+        child = (subprocess.Popen(command, close_fds=True) if launch is None
+                 else launch._spawn(command, before, deadline))
         report.update(payload_started=True, outcome="uncertain")
+        if launch is not None:
+            launch._released()
         while True:
             status = _payload_status(child)
             if status is not None:

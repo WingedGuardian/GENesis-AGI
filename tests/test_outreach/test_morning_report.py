@@ -17,6 +17,9 @@ async def db():
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
     await create_all_tables(conn)
+    # create_all_tables leaves its transaction open; zero_drop.apply_sweep
+    # refuses to run inside one (it would commit the caller's work).
+    await conn.commit()
     yield conn
     await conn.close()
 

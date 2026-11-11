@@ -6,14 +6,14 @@ directly — and the harness FILES a hook entry over ``HOOK_STDOUT_CAP`` behind 
 ~2 KB preview with no error and no exit-code change. A breach here is silent and
 costs the window its peer list and its prompt-injection safety directive.
 
-Four surfaces were unbounded, and they fail differently, which is why each gets
-its own bound rather than one blanket cap:
+Four surfaces were unbounded, and they fail differently, which is why each got
+its own bound rather than one blanket cap (the code hint has since been removed
+with the [Code] lane itself; the other three remain):
 
 * the keyword window  — ``prompt`` is arbitrary user text and every keyword was
   length-unbounded, so ONE pasted alphanumeric run became one token;
 * the trail LINE      — bounded keywords still allow fifty wide labels;
-* the code hint       — ``code_symbols.signature`` has no cap, and this is the
-  largest surface MEASURED on real data rather than on a pasted worst case;
+* the code hint       — ``code_symbols.signature`` had no cap (lane removed);
 * the peer block      — ``get_active_sync`` had no ``LIMIT``.
 
 Every number asserted here is derived in the docstring of the function that owns
@@ -217,77 +217,18 @@ def test_a_trail_with_only_out_of_window_history_still_debounces() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. the code hint — the largest surface on real data
+# 4. the SIZE bounds are measured in the unit the harness bills
 # ---------------------------------------------------------------------------
-
-
-def test_a_long_signature_is_clipped_but_the_location_survives_whole() -> None:
-    """``loc`` is the ACTIONABLE half: a bounded pointer to a real file beats a
-    whole signature with a mangled path."""
-    loc = "src/genesis/memory/retrieval.py:MemoryStore"
-    line = pmh._render_code_hint("def f(" + "a: int, " * 300 + ")", loc)
-
-    assert len(line) <= pmh._MAX_CODE_HINT_CHARS
-    assert line.endswith(f" — {loc}"), "the location must not be clipped"
-    assert "…" in line, "a clipped signature must not read as a complete one"
-    assert line.startswith("[Code] def f(")
-
-
-def test_a_normal_signature_is_rendered_unchanged() -> None:
-    """p99 of the live index is 365 chars — the common case must not move."""
-    line = pmh._render_code_hint("def get_active_sync(db_path: str) -> list[dict]", "a/b.py")
-    assert line == "[Code] def get_active_sync(db_path: str) -> list[dict] — a/b.py"
-    assert "…" not in line
-
-
-def test_the_line_is_bounded_even_when_the_location_alone_overflows() -> None:
-    """There is no room to clip the signature INTO, so the line is clipped.
-
-    Without this branch the signature's room goes negative and the slice silently
-    inverts — bounding nothing on exactly the pathological input the bound exists
-    for.
-    """
-    line = pmh._render_code_hint("def f()", "x" * 5000)
-    assert len(line) <= pmh._MAX_CODE_HINT_CHARS
-
-
-def test_six_hints_cannot_dominate_the_budget() -> None:
-    """The SQL returns at most 6 rows; this pins what that costs at worst."""
-    worst = pmh._render_code_hint("s" * 10_000, "m" * 10_000)
-    assert 6 * emit_cost(worst) < HOOK_STDOUT_CAP // 2
-
-
-# ---------------------------------------------------------------------------
-# 4b. the SIZE bounds are measured in the unit the harness bills
-# ---------------------------------------------------------------------------
-# REGRESSION CLASS. Both size bounds below billed in UTF-16 (clip_to_cost) while
+# REGRESSION CLASS. The code-hint and trail size bounds billed in UTF-16 (clip_to_cost) while
 # DECIDING in codepoints (len), so an astral value short enough in codepoints to
-# clear the guard was never bounded at all. The extremes hide it — a huge astral
+# clear the guard was never bounded at all. The code hint is gone; the trail
+# test below keeps the class pinned. The extremes hide it — a huge astral
 # value trips the guard and clips correctly — so these fixtures sit in the MIDDLE
 # of the range, which is the only place the defect is visible. The original
 # battery had no astral fixture at all and could not see this.
 
 _ASTRAL = "\U0001f600"  # 1 codepoint, 2 UTF-16 units
 _ASTRAL_ALNUM = "\U00020000"  # astral CJK: str.isalnum() is True, so a prompt can carry it
-
-
-@pytest.mark.parametrize("n", [100, 150, 200, 250, 300, 383, 500, 1000])
-def test_a_code_hint_holds_its_bound_in_utf16_at_every_astral_width(n: int) -> None:
-    """Sweep the width, because ONE sample would have reported clean.
-
-    At n=2000 this passed before the fix; the breach lives around n=200-383,
-    where `room < len(sig)` is False and no clipping happens at all.
-    """
-    line = pmh._render_code_hint(_ASTRAL * n, "src/genesis/memory/retrieval.py")
-    assert emit_cost(line) - 1 <= pmh._MAX_CODE_HINT_CHARS, (
-        f"{n} astral chars rendered {emit_cost(line) - 1} UTF-16 units against a "
-        f"stated ceiling of {pmh._MAX_CODE_HINT_CHARS}"
-    )
-
-
-def test_an_astral_location_cannot_push_the_hint_over() -> None:
-    line = pmh._render_code_hint("def f()", _ASTRAL * 200)
-    assert emit_cost(line) - 1 <= pmh._MAX_CODE_HINT_CHARS
 
 
 def test_the_trail_line_holds_its_bound_in_utf16() -> None:
@@ -640,7 +581,7 @@ def test_a_cut_is_announced_even_when_the_budget_is_exactly_spent() -> None:
     async def _flood(prompt: str, session_id: str = "", **_kwargs: object) -> None:
         out = pmh._writer()
         out.emit("x" * (ceiling - 1), block="server-recall")
-        out.emit("y" * 500, block="code-hints")
+        out.emit("y" * 500, block="degraded-recall")
 
     buf = io.StringIO()
     real_run, real_stdin, real_stdout = pmh._run, sys.stdin, sys.stdout
@@ -680,7 +621,6 @@ def test_the_cut_notice_fits_the_reserve_it_declares() -> None:
             "concurrent",
             "concurrent-directive",
             "server-recall",
-            "code-hints",
             "degraded-recall",
             "session-metadata",
         ],
@@ -823,7 +763,7 @@ def test_delivery_bookkeeping_counts_only_what_the_writer_accepted() -> None:
     out.emit("x" * pmh.DEFAULT_BUDGET, block="server-recall")
     assert out.closed, "fixture did not close the writer"
 
-    assert pmh._emit_tracked(out, "dropped", "code-hints") is False, (
+    assert pmh._emit_tracked(out, "dropped", "degraded-recall") is False, (
         "a block offered to a closed writer must NOT be reported as delivered"
     )
 
@@ -889,15 +829,6 @@ def test_a_cut_during_recall_does_not_mark_unseen_rows_surfaced(monkeypatch) -> 
         monkeypatch.setattr(pmh, name, lambda *a, **k: None)
     monkeypatch.setattr(pmh, "_load_recent_files", lambda *a, **k: [])
     monkeypatch.setattr(pmh, "_compute_suppress_ids", lambda *a, **k: [])
-    # A code hint too, so this test covers BOTH bookkeeping sites. Without it
-    # the code-hints call site could record unconditionally and still pass:
-    # asserting on `_emit_tracked` alone proves the helper works, not that the
-    # call site uses it.
-    monkeypatch.setattr(
-        pmh,
-        "_search_code_index",
-        lambda *a, **k: [{"content": "[Code] f — a.py", "memory_id": "c1"}],
-    )
     monkeypatch.setattr(pmh, "_DB_PATH", Path(__file__))  # only existence is checked
 
     import asyncio
@@ -908,17 +839,17 @@ def test_a_cut_during_recall_does_not_mark_unseen_rows_surfaced(monkeypatch) -> 
     assert pmh._writer().cut is not None, "fixture did not produce a cut"
     assert measured[0] == [], (
         "rows were marked surfaced after a cut swallowed the recall block — "
-        f"neither the server results nor the code hint reached the model: {measured[0]}"
+        f"the server results never reached the model: {measured[0]}"
     )
 
 
 def test_the_degraded_path_records_nothing_when_its_blob_is_dropped(monkeypatch) -> None:
-    """The third bookkeeping site, and the unambiguous one.
+    """The second bookkeeping site, and the unambiguous one.
 
     `_format_degraded` renders the whole result set as ONE blob, so if that
     single emit does not land, NOTHING in `fused` was shown — unlike the server
     path, where a partial cut leaves the mapping unknown. Needs its own test:
-    the other two sites can be fixed while this one still records blind.
+    the server site can be fixed while this one still records blind.
     """
     measured: list[list[dict]] = []
 
@@ -933,7 +864,6 @@ def test_the_degraded_path_records_nothing_when_its_blob_is_dropped(monkeypatch)
             {"memory_id": "d1", "content": "a degraded recall hit", "collection": "episodic_memory"}
         ],
     )
-    monkeypatch.setattr(pmh, "_search_code_index", lambda *a, **k: [])
     monkeypatch.setattr(
         pmh,
         "_ws_measure",
@@ -987,7 +917,7 @@ def test_a_cut_says_so_in_band() -> None:
 
 @pytest.mark.parametrize(
     "name",
-    ["_MAX_KEYWORD_CHARS", "_MAX_TRAIL_LINE_CHARS", "_MAX_CODE_HINT_CHARS", "_MAX_PEERS_SHOWN"],
+    ["_MAX_KEYWORD_CHARS", "_MAX_TRAIL_LINE_CHARS", "_MAX_PEERS_SHOWN"],
 )
 def test_each_bound_is_a_positive_int(name: str) -> None:
     """Cheap, but it is the assertion that would have caught a bound set to 0 or

@@ -16,6 +16,25 @@ from code_intel_cbm_admission import _mount_path, number, resolve_cgroup
 from managed_units import stamp
 
 
+def read_document(path: Path, *, open_flags: int, capture=None) -> dict:
+    fd = os.open(path, os.O_RDONLY | open_flags)
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("managed settings must be regular")
+        payload = stream.read(65537)
+    if len(payload) > 65536:
+        raise ValueError("managed settings exceed 64 KiB")
+    try:
+        value = json.loads(payload)
+    except RecursionError as error:
+        raise ValueError("managed JSON nesting exceeds parser limit") from error
+    if not isinstance(value, dict):
+        raise ValueError("managed settings must be an object")
+    if capture is not None:
+        capture(payload)
+    return value
+
+
 def systemctl_env() -> dict[str, str]:
     """The user-manager environment from src/genesis/util/systemd.py.
 
@@ -23,6 +42,9 @@ def systemctl_env() -> dict[str, str]:
     started with no XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS cannot reach the
     user manager, and every systemctl --user call fails.
     """
+    captured = globals().get("_CAPTURED_SYSTEMCTL_ENV")
+    if captured is not None:
+        return captured()
     spec = importlib.util.spec_from_file_location(
         "_genesis_util_systemd",
         Path(__file__).resolve().parents[2] / "src/genesis/util/systemd.py",
@@ -35,11 +57,11 @@ def systemctl_env() -> dict[str, str]:
 
 
 
-def bus_call(path: str, interface: str, method: str, *args: str) -> dict:
+def bus_call(path: str, interface: str, method: str, *args: str, timeout: float = 30) -> dict:
     result = subprocess.run(
         ["/usr/bin/busctl", "--user", "--json=short", "call", "org.freedesktop.systemd1",
          path, interface, method, *args],
-        capture_output=True, text=True, check=True, timeout=30, env=systemctl_env(),
+        capture_output=True, text=True, check=True, timeout=timeout, env=systemctl_env(),
     )
     value = json.loads(result.stdout)
     if not isinstance(value, dict) or set(value) != {"type", "data"}:
@@ -516,9 +538,10 @@ def validate_provider_paths(config: dict) -> None:
             raise ValueError(f"pinned provider does not support backslash in {key} paths")
 
 
-def native_env(config: dict) -> dict[str, str]:
+def native_env(config: dict, *, environment=None) -> dict[str, str]:
     validate_provider_paths(config)
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CBM_")}
+    selected = os.environ if environment is None else environment
+    env = {k: v for k, v in selected.items() if not k.startswith("CBM_")}
     env.update(
         CBM_CACHE_DIR=config["cache"],
         CBM_RUNTIME_DIR=config["runtime"],

@@ -282,10 +282,17 @@ def test_native_prefix_openers_never_convert_existing_queue(queue, tmp_path, ver
 def test_busy_before_schema_proof_never_publishes_outcomes(
     queue, tmp_path, monkeypatch, kind, version, unknown_header
 ):
-    from tests.test_scripts.test_index_marker_execution import _claim, _reservation
+    from tests.test_scripts.test_index_marker_execution import _reservation
 
     if kind == "native":
-        claimed = _claim(queue, tmp_path)
+        # Model a native claim retained from the schema4 prefix. New H native
+        # authority correctly requires5; using its helper would change this
+        # historical queue instead of testing rollback-compatible publication.
+        repo = str(tmp_path / "repo")
+        queue.write_marker(repo, "both", "fast")
+        with closing(queue._connect()) as db, queue._transaction(db):
+            claimed = queue._legs.claim(db, queue.marker_hash(repo), "cbm", protocol=3)
+        assert _version(queue) == 4
     else:
         repo = str(tmp_path / "repo")
         queue.write_marker(repo, "cbm", "fast")

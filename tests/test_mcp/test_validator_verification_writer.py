@@ -12,7 +12,8 @@ from genesis.db.connection import SerializedConnection
 from genesis.db.crud import pr_verifications
 from genesis.db.schema import create_all_tables, seed_data
 from genesis.mcp.external_profiles import ExternalProfileMiddleware
-from tests.test_scripts.test_pr_verification_closer import MERGE_SHA, _doc, _doc_for
+from genesis.session_awareness.pr_recording import PrMetadata
+from tests.test_scripts.test_pr_verification_closer import MERGE_SHA, _doc, _doc_for, _with_tracking
 
 
 @pytest.fixture
@@ -39,7 +40,9 @@ async def recording(tmp_path, monkeypatch):
     monkeypatch.setattr(_config_overlay, "_user_config_dir", lambda: user)
     monkeypatch.setattr(codex_validator_config, "_base_path", lambda: config)
     monkeypatch.setattr(follow_up_tools, "_get_db", lambda: shared)
-    monkeypatch.setattr(validator_writes, "gh_merge_commit", lambda repo, pr: MERGE_SHA)
+    monkeypatch.setattr(validator_writes, "gh_pr_metadata", lambda repo, pr: PrMetadata(MERGE_SHA, ""))
+    from genesis.session_awareness import pr_tracking
+    monkeypatch.setattr(pr_tracking, "public_receipt", lambda *a: "synthetic task covers concern")
     try:
         yield path, shared, config
     finally:
@@ -52,9 +55,11 @@ def row(path):
         return dict(db.execute("SELECT * FROM pr_verifications WHERE pr_number=7").fetchone())
 
 
-async def call(doc, **over):
+async def call(doc, *, route=True, **over):
     from genesis.mcp.health import mcp
 
+    if route:
+        _with_tracking(doc)
     tools = {tool.name: tool for tool in await mcp.list_tools()}
     assert "pr_verification_close" in tools, "actual health MCP writer must be registered"
     owned = FastMCP("owned recording")
@@ -64,6 +69,123 @@ async def call(doc, **over):
         return (await client.call_tool("pr_verification_close", dict(
             evidence_json=json.dumps(doc), pr=7,
         ) | over)).data
+
+
+async def test_unlinked_finding_records_measurement_but_reports_pending(recording):
+    path, _, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    doc = _doc(findings=[{"summary": "reachable defect", "disposition": "reported in chat"}])
+    result = await call(doc, route=False)
+    assert result["recorded"] is True
+    assert result["tracking_complete"] is False
+    assert result["would_close"] is False
+    assert row(path)["status"] == "open"
+    assert row(path)["verdict"] == "pass-mechanical"
+    assert json.loads(row(path)["evidence"])["findings"] == doc["findings"]
+
+
+async def test_pending_tracking_retains_measurement_before_close_only_e2e_gate(recording, monkeypatch):
+    from genesis.mcp.health import validator_writes
+    path, _, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    monkeypatch.setattr(validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: run timer"))
+    result = await call(_doc(findings=[dict(summary="timer defect", disposition="unfiled")]), route=False)
+    assert result["recorded"] and not result["would_close"]
+    assert row(path)["verdict"] == "pass-mechanical"
+
+
+@pytest.mark.parametrize("preview", [False, True])
+@pytest.mark.parametrize("failure", [False, True])
+async def test_pending_readback_preserves_measurement_or_previews_without_writing(recording, preview, failure):
+    path, _, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    doc = _doc_for("fail-intent") if failure else _doc()
+    doc.update(findings=[dict(summary="defect", disposition="filed")], tracking=[
+        dict(kind="public", target="findings/0", url="https://github.com/owner/repo/issues/12",
+             quote="unrelated quote", rationale="Claimed coverage, but receipt does not substantiate it")])
+    before = row(path)
+    result = await call(doc, route=False, dry_run=preview, **({"note": "failure measured"} if failure else {}))
+    assert result["tracking_complete"] is False and result["would_close"] is False
+    if preview:
+        assert row(path) == before
+    else:
+        stored = row(path)
+        assert stored["status"] == "open" and stored["verdict"] == result["verdict"]
+        assert json.loads(stored["evidence"])["claims"] == doc["claims"]
+
+
+@pytest.mark.parametrize("inactive", [False, True])
+async def test_private_receipt_reads_actual_eligible_follow_up(recording, inactive):
+    from genesis.db.crud import follow_ups
+
+    path, shared, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    identifier = await follow_ups.create_private(
+        shared, request_key="private-receipt", content="Synthetic private acceptance task",
+        reason="Synthetic disclosure decision", work_state="ready",
+    )
+    if inactive:
+        await follow_ups.update_private(shared, identifier, status="completed")
+    doc = _doc(findings=[dict(summary="private acceptance task", disposition="private")], tracking=[
+        dict(kind="private", target="findings/0", id=identifier,
+             quote="Synthetic private acceptance task", rationale="Task covers the acceptance measurement",
+             disclosure_harm="The task necessarily identifies a private individual",
+             redaction_insufficient="Removing identity removes the decision target")])
+    result = await call(doc, route=False)
+    assert result["tracking_complete"] is not inactive
+    assert row(path)["status"] == ("open" if inactive else "closed")
+
+
+@pytest.mark.parametrize("preview", [False, True])
+@pytest.mark.parametrize("covered", [False, True])
+async def test_mcp_enforces_e2e_mapping_before_preview_or_write(recording, monkeypatch, preview, covered):
+    from genesis.mcp.health import validator_writes
+
+    path, _, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    before = row(path)
+    step = "restart the timer and measure its next run"
+    monkeypatch.setattr(validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: " + step))
+    doc = _doc(e2e=[{"step": step, "claim": 0}]) if covered else _doc()
+    if covered:
+        result = await call(doc, dry_run=preview)
+        assert result["would_close"] and result["verdict"] == "pass-mechanical"
+        assert result["recorded"] is not preview
+    else:
+        with pytest.raises(ToolError, match=step):
+            await call(doc, dry_run=preview)
+    if preview or not covered:
+        assert row(path) == before
+
+
+async def test_missing_mapping_does_not_prevent_recording_an_incomplete_attempt(recording, monkeypatch):
+    from genesis.mcp.health import validator_writes
+
+    path, _, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    monkeypatch.setattr(validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: run the timer"))
+    doc = _doc(gaps=[{"kind": "not_yet_done", "detail": "not run", "command": "run timer"}])
+    result = await call(doc)
+    assert result["verdict"] == "not-yet-done" and result["recorded"]
+    assert row(path)["status"] == "open"
+
+
+@pytest.mark.parametrize("declared", [True, False, None])
+async def test_the_result_echoes_the_documents_no_progress(recording, monkeypatch, declared):
+    from genesis.mcp.health import validator_writes
+
+    path, _, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    monkeypatch.setattr(
+        validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: run the timer")
+    )
+    over = {} if declared is None else {"no_progress": declared}
+    doc = _doc(gaps=[{"kind": "not_yet_done", "detail": "not run", "command": "run timer"}], **over)
+    result = await call(doc)
+    assert result["recorded"] and result["no_progress"] is bool(declared)
+    assert json.loads(row(path)["evidence"])["no_progress"] is bool(declared)
+    preview = await call(doc, dry_run=True)
+    assert preview["recorded"] is False and preview["no_progress"] is bool(declared)
 
 
 async def test_existing_mcp_close_stores_rechecks_without_a_new_caller_argument(recording):

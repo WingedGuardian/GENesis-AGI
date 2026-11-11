@@ -19,6 +19,9 @@ caller gave up; its count and share are always reported), and every other
 outcome, including one this module has never heard of, restarts the clock.
 ``retried`` (a read that answered only after retrying a connection the engine
 dropped, #3035) is one of those: a retry spares the caller, not the clock.
+A row whose every traversal was QUIET on networkx (``quiet``:
+``engine_not_provisioned``, the where-present guard in ``graphstore_config``)
+is neither traffic nor a break; its count is reported as ``quiet``.
 
 Pure: no I/O. ``scripts/graph_cutover_report.py`` reads the rows and prints this.
 """
@@ -53,8 +56,29 @@ _ROLE_NAMES = {
     "bridge": "bridge",
     "venv-generic": "venv process",
 }
+#: Why a generic venv process may be unprovable: in every measured case another
+#: session's test run or one-off job. Owner rulings ba877469 (a generic process
+#: is judged on main's history and its database scope only) and
+#: 9931626424ee4c6c (these two reasons never reset the clock) excuse it. The
+#: excuse holds only inside the writer's history lookback, where the row's
+#: ``head_history_telemetry`` (checked in ``census_dirt``) covers main's commits;
+#: a stored row cannot say more about an older process.
+_GENERIC_UNPROVABLE = frozenset({"other_genesis_home", "interpreter_unresolved"})
+#: The census writer's history lookback (graph_census.HISTORY_LOOKBACK_S; a test
+#: pins the two equal).
+HISTORY_LOOKBACK = timedelta(hours=2.5)
+#: The writer permits this much boot-time error. A reported start at the old
+#: lower edge may actually predate the history proof; reserve that uncertainty.
+#: A contract test pins this to graph_census._BOOT_TOLERANCE_S without importing
+#: the I/O census writer into this pure evaluator.
+BOOT_TIME_MARGIN = timedelta(seconds=2)
 _CLEAN_OUTCOMES = frozenset({"primary"})
 _NEUTRAL_OUTCOMES = frozenset({"cancelled"})
+#: ``quiet_reason`` values a row may carry (``graphstore_config.ENGINE_NOT_PROVISIONED``;
+#: duplicated, not imported, to keep this evaluator pure). A row whose every
+#: traversal was quiet on networkx is neither traffic nor a break. Any other
+#: value restarts the clock, like any outcome this module has not heard of.
+_QUIET_REASONS = frozenset({"engine_not_provisioned"})
 
 
 @dataclass
@@ -68,6 +92,9 @@ class Verdict:
     days_with_traffic: int = 0
     cancelled: int = 0
     traversals: int = 0
+    #: Traversals quiet on networkx because the engine was never provisioned:
+    #: neither traffic (not in ``traversals``) nor a break.
+    quiet: int = 0
     census_rows: int = 0
     last_census: datetime | None = None
 
@@ -86,6 +113,7 @@ class Verdict:
             "days_with_traffic": self.days_with_traffic,
             "cancelled": self.cancelled,
             "traversals": self.traversals,
+            "quiet": self.quiet,
             "census_rows": self.census_rows,
             "last_census": iso(self.last_census),
         }
@@ -122,8 +150,9 @@ def _is_count(n: object) -> bool:
     return type(n) is int and n >= 0
 
 
-def census_dirt(m: dict | None) -> str | None:
-    """Why a census row is NOT clean, or ``None`` when it is."""
+def census_dirt(m: dict | None, at: datetime | None = None) -> str | None:
+    """Why a census row is NOT clean, or ``None`` when it is. ``at`` is the row's
+    timestamp; without it no generic process is excused."""
     if m is None:
         return "unreadable census row"
     schema, reasons = m.get("v"), m.get("reasons")
@@ -146,7 +175,7 @@ def census_dirt(m: dict | None) -> str | None:
     if m.get("head_telemetry") is not True:
         return "the checkout's HEAD does not contain the telemetry module"
     if m.get("head_dirty") is not False:
-        return "the checkout's runtime code (src/ or an entry script) is dirty"
+        return "the checkout's graph-read code (graph_census._RUNTIME_PATHS) is dirty"
     if m.get("head_history_telemetry") is not True:
         return "HEAD held code without telemetry in the last 2h30m (or its history is unreadable)"
     procs = m.get("procs")
@@ -166,6 +195,13 @@ def census_dirt(m: dict | None) -> str | None:
             continue  # a bench process on a scratch DB: its traversals are not ours
         if role == "venv-generic":
             # Owner ruling: history and scope only, no source or switch proof.
+            unknown = p.get("unknown")
+            if (
+                isinstance(unknown, str)
+                and unknown in _GENERIC_UNPROVABLE
+                and _within_lookback(p, at)
+            ):
+                continue
             if p.get("telemetry") is not True:
                 why = p.get("unknown") or "started on, or has seen, code without telemetry"
                 return f"{who} may run old code ({why})"
@@ -194,6 +230,18 @@ def census_dirt(m: dict | None) -> str | None:
     return None
 
 
+def _within_lookback(p: dict, at: datetime | None) -> bool:
+    """Whether the process started inside the row's history lookback, where
+    ``head_history_telemetry`` covers every commit main's checkout held."""
+    raw = p.get("started_at")
+    started = parse_ts(raw) if isinstance(raw, str) else None
+    return (
+        at is not None
+        and started is not None
+        and at - HISTORY_LOOKBACK + BOOT_TIME_MARGIN <= started <= at
+    )
+
+
 def traversal_breaks_clock(m: dict) -> str | None:
     """Why this traversal row restarts the clock, or ``None`` when it does not.
     Raises ``ValueError`` for a row whose shape cannot be trusted."""
@@ -211,14 +259,44 @@ def traversal_breaks_clock(m: dict) -> str | None:
     pwf = m.get("prior_write_failures", 0)
     if not _is_count(pwf):
         raise ValueError("prior_write_failures is not a non-negative integer")
+    quiet = m.get("quiet", {})
+    if not isinstance(quiet, dict) or not all(_is_count(n) for n in quiet.values()):
+        raise ValueError("quiet is not a map of non-negative integers")
+    if sum(quiet.values()) > traversals:
+        raise ValueError("more quiet traversals than traversals")
     bad = set(outcomes) - _CLEAN_OUTCOMES - _NEUTRAL_OUTCOMES
     if bad:
         return "outcome " + ", ".join(sorted(bad))
+    unknown_quiet = set(quiet) - _QUIET_REASONS
+    if unknown_quiet:
+        return "quiet reason " + ", ".join(sorted(unknown_quiet))
+    if is_quiet_row(m):
+        return None
+    # A row only partly quiet falls through: its networkx traversals read as
+    # "configured networkx" and break the clock, the conservative direction.
     if set(configured) - {"falkordb"}:
         return "configured " + ", ".join(sorted(configured))
     if set(served) - {"falkordb", "none"}:
         return "served by " + ", ".join(sorted(set(served) - {"falkordb", "none"}))
     return None
+
+
+def is_quiet_row(m: dict) -> bool:
+    """Whether EVERY traversal in this row was a quiet networkx selection (the
+    engine was never provisioned on that install) and nothing else went wrong:
+    all configured and served by networkx, every outcome clean or neutral, and
+    every quiet reason a known one. Such a row is neither traffic nor a break.
+    Call only on a row ``traversal_breaks_clock`` has validated."""
+    quiet = m.get("quiet") or {}
+    traversals = m["traversals"]
+    return (
+        traversals > 0
+        and set(quiet) <= _QUIET_REASONS
+        and sum(quiet.values()) == traversals
+        and set(m["configured"]) == {"networkx"}
+        and set(m["served"]) <= {"networkx", "none"}
+        and set(m["outcomes"]) <= _CLEAN_OUTCOMES | _NEUTRAL_OUTCOMES
+    )
 
 
 def evaluate(
@@ -243,7 +321,7 @@ def evaluate(
         if t is None:
             integrity.append("a census row has no readable timestamp")
         elif t <= now:
-            parsed.append((t, census_dirt(m) is not None, m))
+            parsed.append((t, census_dirt(m, t) is not None, m))
     census = sorted(parsed, key=lambda r: (r[0], r[1]))
     census_clock: datetime | None = None
     prev: datetime | None = None
@@ -257,7 +335,7 @@ def evaluate(
                     {"at": prev.isoformat(), "why": f"census gap until {t.isoformat()}"}
                 )
             census_clock = None
-        dirt = census_dirt(m)
+        dirt = census_dirt(m, t)
         if dirt is None:
             census_clock = census_clock or t
         else:
@@ -313,6 +391,10 @@ def evaluate(
                     "events": m.get("events"),
                 }
             )
+            continue
+        if is_quiet_row(m):
+            if t >= window_start:
+                v.quiet += m["traversals"]
             continue
         if t >= window_start:
             outcomes = Counter(m["outcomes"])

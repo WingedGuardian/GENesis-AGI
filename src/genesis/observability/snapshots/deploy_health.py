@@ -70,6 +70,10 @@ TIER2_PATHS = (
     "scripts/bootstrap.sh",
     "scripts/update.sh",
     "scripts/lib/cc_version.sh",
+    "scripts/cc_settings_align.sh",
+    "scripts/setup_claude_config.py",
+    "config/cc-global-settings.yaml",
+    ".claude/settings.json",
     "scripts/hooks",
     "pyproject.toml",
 )
@@ -1005,15 +1009,20 @@ def collect_live_repairs(
     (a symlinked dir, a REPAIR.json that is not a regular file within the byte
     cap, not a JSON object, over the row cap, or naming another checkout), or
     one that fails in any other way, counts in ``refused`` and is named once in
-    the server log; it never costs the other reports.
+    the server log; it never costs the other reports. A dir holding the repair's
+    DISMISS_MARK (--dismiss of a report no reader can read, #4331) is skipped:
+    it takes its read slot and counts in ``unread_older`` like a dismissed one,
+    and never counts as refused.
 
     ``reports`` (newest first): per report its ``ts``, ``backup_dir``,
     ``saved`` (its foreign rows: every dict row of class "foreign", no other
-    field read), ``result`` (the stored result as an enum, by prefix: healed,
-    healed-kept, unresolved, superseded, unfinished, else unknown),
+    field read; 0 once a restore cleared it, see _restore_counts),
+    ``restore_refused`` (the parts its last restore refused), ``result`` (the
+    stored result as an enum, by prefix: healed, healed-kept, unresolved,
+    superseded, unfinished, else unknown),
     ``dismissed``, and ``unresolved`` (the report says so, or has had no result
     for REPAIR_UNFINISHED_S, and is not dismissed). ``saved``: the sum over
-    reports not dismissed. ``unresolved``: the newest READ report is (a
+    reports neither dismissed nor cleared. ``unresolved``: the newest READ report is (a
     dismissed or superseded newest one included: by design this differs from
     the guardian's pick, which shows the newest ELIGIBLE report), while the
     update state's guard still calls the checkout half-written (a repair
@@ -1040,6 +1049,7 @@ def collect_live_repairs(
         repair = _script(_REPAIR_SCRIPT)
         report_ts, load_report, bad = repair.report_ts, repair.load_report, repair.BadReport
         report_order, future_s = repair.report_order, repair.REPORT_FUTURE_S
+        marked = repair.dismiss_marked
     except Exception:  # noqa: BLE001 - unloadable: no report can be read
         logger.warning("live-move repair module could not be loaded", exc_info=True)
         out["refused"] = len(names)
@@ -1063,6 +1073,8 @@ def collect_live_repairs(
         # One boundary per report: a fault no check foresaw costs that report,
         # never the rest of the snapshot.
         try:
+            if marked(str(backups / name)):
+                continue  # dismissed though no reader can read it (DISMISS_MARK)
             loaded = load_report(str(backups / name), repo)
             if loaded is None:
                 continue
@@ -1070,6 +1082,7 @@ def collect_live_repairs(
             result, dismissed = _repair_result(m.get("result")), bool(m.get("dismissed_at"))
             stale = result == "unfinished" and now - loaded["mtime"] > REPAIR_UNFINISHED_S
             saved = sum(1 for r in loaded["rows"] if r.get("class") == "foreign")
+            refused, cleared = _restore_counts(m.get("restore"))
         except Exception as exc:  # noqa: BLE001 - see the boundary comment above
             _refused(name, str(exc) if isinstance(exc, bad) else type(exc).__name__)
             out["refused"] += 1
@@ -1078,16 +1091,28 @@ def collect_live_repairs(
             {
                 "ts": ts,
                 "backup_dir": str(backups / name),
-                "saved": saved,
+                "saved": 0 if cleared else saved,
+                "restore_refused": refused,
                 "result": result,
                 "dismissed": dismissed,
                 "unresolved": (result == "unresolved" or stale) and not dismissed,
             }
         )
-        out["saved"] += 0 if dismissed else saved
+        out["saved"] += 0 if dismissed or cleared else saved
     if out["reports"] and out["reports"][0]["unresolved"]:
         out["unresolved"] = _mixed(genesis_home_dir, repo)
     return out
+
+
+def _restore_counts(block: object) -> tuple[int, bool]:
+    """(parts the last restore refused, has it cleared the report) from a
+    report's `restore` block (live_move_restore.restore). Cleared only when
+    `restored_at` is a str and `refused` is an int (never a bool) of 0: a
+    restore that refused a part leaves the report's saved paths counted."""
+    if not isinstance(block, dict) or type(block.get("refused")) is not int:
+        return 0, False
+    refused = max(block["refused"], 0)
+    return refused, block["refused"] == 0 and isinstance(block.get("restored_at"), str)
 
 
 def _mixed(genesis_home_dir: Path, repo: str | None) -> bool:

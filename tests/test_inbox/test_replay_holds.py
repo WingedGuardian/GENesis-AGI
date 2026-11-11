@@ -27,6 +27,46 @@ async def held(db, *, storage=None, error="replay_unsafe: after tools"):
 
 
 @pytest.mark.asyncio
+async def test_pressure_failure_keeps_manual_release_hold_and_specific_notice(db, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    from genesis.cc.exceptions import CCMemoryPressureError, CCQuotaExhaustedError
+    from genesis.cc.oom import OOMEvidence
+    from genesis.inbox import batch_runner
+
+    await held(db)
+    error = CCMemoryPressureError(
+        OOMEvidence("synthetic", (1, 2), (1, 2), 4, 5, -9),
+        cause=CCQuotaExhaustedError("usage limit"),
+    )
+    run = AsyncMock(side_effect=error)
+    monkeypatch.setattr(batch_runner, "run_with_overload_retry", run)
+    manager = SimpleNamespace(
+        create_background=AsyncMock(return_value={"id": "owned-test-session"}),
+        fail=AsyncMock(side_effect=RuntimeError("bookkeeping unavailable")),
+    )
+    monitor = SimpleNamespace(
+        _db=db, _session_manager=manager, _invoker=object(),
+        _build_prompt=MagicMock(return_value="synthetic input"),
+        _build_invocation=MagicMock(return_value=object()), _alert_parked=MagicMock(),
+    )
+    errors = []
+    completed = await batch_runner.run_one_batch(
+        monitor, SimpleNamespace(id="held", file_path="/inbox/a.md", content="synthetic input"),
+        model="synthetic", effort="low", system_prompt=None, now_iso="now", errors=errors,
+    )
+    assert not completed
+    run.assert_awaited_once()
+    row = await inbox_items.get_by_id(db, "held")
+    assert row["error_message"].startswith(inbox_items.REPLAY_UNSAFE_PREFIX)
+    assert row["retry_count"] == 1
+    assert await inbox_items.get_retriable_failure_files(db, max_retries=100) == []
+    assert "memory pressure" in monitor._alert_parked.call_args.kwargs["detail"]
+    assert "explicitly releasing" in monitor._alert_parked.call_args.kwargs["detail"]
+
+
+@pytest.mark.asyncio
 async def test_hold_excluded_from_all_retry_readers_even_with_raised_cap(db):
     await held(db)
     assert await inbox_items.get_retriable_failed(db, "/inbox/a.md", max_retries=100) is None

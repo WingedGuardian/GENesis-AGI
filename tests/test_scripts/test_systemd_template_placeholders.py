@@ -259,6 +259,27 @@ def test_the_graph_projection_units_use_only_shared_tokens():
         )
 
 
+#: The graph engine's own tokens: the four paths inside the version-tag copy
+#: the engine check places (three binaries and the copy's digest file). The
+#: version-pinned deps path token (`__FALKORDB_VERSION__`) is retired with the
+#: GitHub download.
+_FALKORDB_TOKENS = frozenset(
+    {"__REDIS_SERVER__", "__REDIS_CLI__", "__FALKORDB_MODULE__", "__FALKORDB_DIGESTS__"}
+)
+
+
+def test_the_graph_engine_unit_uses_exactly_its_engine_tokens():
+    """Pinned by name, beyond the sweep: the sweep proves every token used is
+    substituted, not that a retired one stopped being used, nor that a
+    renderer stopped substituting it."""
+    unit = TEMPLATE_DIR / "genesis-falkordb.service.template"
+    assert _tokens_used(unit) == _FALKORDB_TOKENS, sorted(_tokens_used(unit))
+    for renderer in RENDERERS:
+        found = _substituted_tokens(renderer)
+        assert found >= _FALKORDB_TOKENS, (renderer, sorted(_FALKORDB_TOKENS - found))
+        assert "__FALKORDB_VERSION__" not in found, f"{renderer} still renders the deps path"
+
+
 def test_a_token_named_only_in_a_comment_does_not_count_as_substituted(tmp_path, monkeypatch):
     """LOCKS the comment strip, which is the difference between this module
     checking behaviour and checking documentation.
@@ -393,3 +414,80 @@ def test_every_vnc_template_token_is_substituted_by_setup_vnc():
         f"{t.name}: {token}" for t in templates for token in sorted(_tokens_used(t) - known)
     ]
     assert not offenders, "VNC template tokens setup-vnc.sh never substitutes:\n  " + "\n  ".join(offenders)
+
+
+_INSTALL_SH = Path(__file__).resolve().parents[2] / "scripts" / "install.sh"
+
+
+def _first_projection_block() -> tuple[str, str]:
+    """(the shell text before the first-projection block's readiness script,
+    that embedded Python script)."""
+    text = _INSTALL_SH.read_text()
+    start = text.index("# First graph projection.")
+    script = text[text.index("<<'PY'", start):]
+    script = script[script.index("\n") + 1:script.index("\nPY\n")]
+    return text[:start], script
+
+
+def test_install_projects_once_after_the_server_starts():
+    """Devin 4521703262 / Codex 4526468559: install.sh starts the engine before
+    genesis-server creates the database, and its browser-stack install can take
+    longer than any fixed delay. The first projection is started after the server
+    start, not by a timer offset."""
+    before, _ = _first_projection_block()
+    text = _INSTALL_SH.read_text()
+    assert "systemctl --user start genesis-server" in before
+    assert text.index("systemctl --user start --no-block genesis-graph-project.service") > len(before)
+    timer = (_INSTALL_SH.parent / "systemd" / "genesis-graph-project.timer.template").read_text()
+    assert "OnActiveSec" not in timer
+
+
+@pytest.mark.parametrize(
+    ("tables", "ready"),
+    [((), False), (("memory_links",), False), (("memory_links", "memory_metadata"), True)],
+)
+def test_the_first_projection_waits_for_the_tables_not_the_file(tmp_path, tables, ready):
+    """The server creates the database file before its tables, so the readiness
+    check opens it read-only and needs both tables the projector reads."""
+    import os
+    import sqlite3
+    import subprocess
+    import sys
+
+    db = tmp_path / "genesis.db"
+    con = sqlite3.connect(db)
+    for name in tables:
+        con.execute(f"CREATE TABLE {name} (x)")
+    con.commit()
+    con.close()
+    _, script = _first_projection_block()
+    env = {**os.environ, "GENESIS_DB_PATH": str(db), "GENESIS_FIRST_PROJECTION_WAIT_S": "0"}
+    rc = subprocess.run([sys.executable, "-c", script], env=env, timeout=60).returncode
+    assert (rc == 0) is ready
+
+
+def test_the_first_projection_wait_never_creates_a_missing_database(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    db = tmp_path / "absent.db"
+    _, script = _first_projection_block()
+    env = {**os.environ, "GENESIS_DB_PATH": str(db), "GENESIS_FIRST_PROJECTION_WAIT_S": "0"}
+    assert subprocess.run([sys.executable, "-c", script], env=env, timeout=60).returncode == 1
+    assert not db.exists()
+
+
+def test_the_first_projection_wait_reports_an_unusable_interpreter_apart(tmp_path):
+    """An interpreter that cannot import genesis exits 2, which install.sh reports
+    as a failed readiness check, not as a database that was not ready."""
+    import os
+    import subprocess
+    import sys
+
+    _, script = _first_projection_block()
+    env = {**os.environ, "GENESIS_DB_PATH": str(tmp_path / "x.db"), "GENESIS_FIRST_PROJECTION_WAIT_S": "0"}
+    # -I -S: no PYTHONPATH and no site-packages, so genesis is not importable.
+    rc = subprocess.run([sys.executable, "-I", "-S", "-c", script], env=env, cwd=tmp_path, timeout=60).returncode
+    assert rc == 2
+    assert '"$_first_proj_rc" -eq 1' in _INSTALL_SH.read_text()

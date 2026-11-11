@@ -1416,9 +1416,12 @@ async def _proactive_impl(
     # (follow-up ac27b693); the MCP tool (defer_side_effects=False) keeps it
     # inline — byte-for-byte unchanged. Best-effort either way.
     if defer_side_effects:
-        from genesis.util.tasks import tracked_task
+        from genesis.db.request_database import DatabaseScopeError, spawn_database_task
 
-        tracked_task(_would_block, name="proactive_would_block")
+        try:
+            spawn_database_task(memory_mod._db, _would_block, name="proactive_would_block")
+        except DatabaseScopeError:
+            logger.debug("Proactive observation refused by database admission")
     else:
         await _would_block
     return out

@@ -6,8 +6,8 @@ Every case is a REAL repair in the scratch world (tests/test_scripts/
 _live_repair_world.py), judged afterwards. A part is `as-left` (the path holds
 what the repair left: the tag's), `already-restored` (it holds what the repair
 saved) or `other:<reason>`; only a run where every part is one of the first two
-exits 0. Restoring "by hand" below runs the test oracle's re-apply steps
-(_live_repair_world.reapply_step, the writer's old shell steps, #3868).
+exits 0. Restoring below runs the real restore (`--restore TS`, #3492 B2b;
+its own suite is test_live_move_restore_write.py).
 """
 
 from __future__ import annotations
@@ -46,10 +46,9 @@ from tests.test_scripts._live_repair_world import (
     _git,
     _hash,
     _lock_aside,
-    _run_steps,
     age_locks,
     killed_tag_side,
-    reapply_steps,
+    restore_all,
 )
 
 pytestmark = pytest.mark.skipif(sys.platform.startswith("win"), reason="git + bash")
@@ -138,20 +137,44 @@ def _newer_dir(w, ts: str) -> Path:
 
 
 @pytest.mark.parametrize("make", KINDS)
-def test_a_fresh_repair_is_as_left_then_already_restored_by_hand(w, make):
+def test_a_fresh_repair_is_as_left_then_already_restored(w, make):
     """Right after the repair every foreign part holds what the repair left;
-    once the writer's own steps put the saved state back, every part holds
-    what was saved."""
+    once the restore puts the saved state back, every part holds what was
+    saved."""
     ts = _repaired(w, make)
     r = _check(w, ts)
     parts = _parts(r)
     assert r.returncode == 0, r.stdout + r.stderr
     assert parts and set(parts.values()) == {"as-left"}, parts
-    _run_steps(w)
+    restore_all(w)
     r = _check(w, ts)
     parts = _parts(r)
     assert r.returncode == 0, r.stdout + r.stderr
     assert set(parts.values()) == {"already-restored"}, parts
+
+
+def _foreign_group_writable_fifo_inside_dir(w):
+    os.mkfifo(w.root / "P" / "pipe")
+    os.chmod(w.root / "P" / "pipe", 0o662)
+    return "P"
+
+
+def test_a_saved_fifo_is_judged_by_its_recorded_mode(w):
+    """#3974 item 3: the saved FIFO loses group/world write (0662 is saved as
+    0640), so an entry is judged against the mode SAVED.json records: the
+    restore puts it back at 0662 and the check then reads already-restored;
+    left at the copy's 0640 it would not."""
+    ts = _repaired(w, _foreign_group_writable_fifo_inside_dir)
+    saved = json.loads((w.backups()[-1] / "SAVED.json").read_text())["files"]
+    assert saved["tree/P/pipe"] == {"type": "fifo", "mode": "0662"}, saved
+    restore_all(w)
+    pipe = w.root / "P" / "pipe"
+    assert stat.S_IMODE(os.lstat(pipe).st_mode) == 0o662
+    r = _check(w, ts)
+    assert r.returncode == 0 and set(_parts(r).values()) == {"already-restored"}, r.stdout
+    os.chmod(pipe, 0o640)
+    r = _check(w, ts)
+    assert _parts(r).get(("P/pipe", "entry")) != "already-restored", r.stdout
 
 
 def test_a_directory_row_lists_only_the_entries_the_update_did_not_write(w):
@@ -438,24 +461,19 @@ def test_a_ts_that_names_no_report_is_refused(w, ts):
 
 
 def test_dismiss_reads_through_the_loader(w):
-    """A report the loader refuses (another checkout's) is not dismissed."""
+    """A report the loader refuses (another checkout's) is never edited: it is
+    dismissed with DISMISSED.json beside it (#4331 owner ruling), so its alert
+    has a way out through Genesis."""
     ts = _repaired(w, _foreign_edit)
     path = w.backups()[-1] / "REPAIR.json"
     path.write_text(json.dumps({**json.loads(path.read_text()), "repo": "/elsewhere"}))
+    before = path.read_bytes()
     r = subprocess.run(
         ["python3", "-I", "-S", str(MODULE), "--dismiss", ts, str(w.state), str(w.root)],
         capture_output=True, text=True, env=w.env(),
     )  # fmt: skip
-    assert r.returncode == 1 and json.loads(path.read_text())["dismissed_at"] is None
-
-
-def test_restore_without_check_is_not_available_yet(w):
-    ts = _repaired(w, _foreign_edit)
-    r = subprocess.run(
-        ["python3", "-I", "-S", str(MODULE), "--restore", ts, str(w.state), str(w.root)],
-        capture_output=True, text=True, env=w.env(),
-    )  # fmt: skip
-    assert r.returncode == 2 and "not available yet" in r.stderr, r.stderr
+    assert r.returncode == 0 and path.read_bytes() == before, r.stderr
+    assert "not this checkout" in json.loads((path.parent / "DISMISSED.json").read_text())["unread"]
 
 
 def test_an_unreadable_tag_refuses_the_whole_report(w):
@@ -489,9 +507,12 @@ def test_an_unreadable_target_restores_only_foreign_rows_of_a_directory(w):
 def test_an_untracked_file_under_a_tag_directory_changes_no_part(w, make, edit, part):
     """Review SF1: the repair never removes an untracked file under a tag
     directory that is not a row (a cache the server writes), so the directory
-    is compared on the tag's own paths only. Control: one of those paths
-    edited is still `other:changed`."""
+    is compared on the tag's own paths only, plus, for a node part (which
+    moves the directory aside), every other file being one git ignores: the
+    restore's rule, which --check now uses too (#4355 review). Control: one of
+    the tag's paths edited is still `other:changed`."""
     ts = _repaired(w, make)
+    (w.root / ".git" / "info" / "exclude").write_text("__pycache__/\n")
     (w.root / "sub" / "__pycache__").mkdir()
     (w.root / "sub" / "__pycache__" / "x.pyc").write_bytes(b"cache")
     r = _check(w, ts)
@@ -611,26 +632,33 @@ def _ancestor_file_child_edit(w):
 )
 def test_a_parent_this_report_restored_does_not_refuse_its_own_child(w, make, child, blocked):
     """Review SF4 (MEASURED with the real writer): a report holds a parent and
-    a child that both need a write, and once the parent is back (the writer's
-    own steps run parents first) the parent itself is a non-directory or an
-    index entry above the child. A restore killed between the two must still
-    converge: that parent does not refuse this report's own child."""
+    a child that both need a write, and once the parent is back (put back by
+    hand here, parent first) the parent itself is a non-directory or an index
+    entry above the child. A restore stopped between the two must still
+    converge: that parent does not refuse this report's own child, and the
+    real restore then finishes."""
     ts = _repaired(w, make)
     report = w.report()
     assert sorted(r["path"] for r in report["paths"] if r["class"] == "foreign")[:2] == [
         "sub",
         "sub/s1",
     ], "control: the report holds the parent and the child"
-    first, *rest = reapply_steps(w)  # the parent's step: parents first
-    subprocess.run(["bash", "-c", first], check=True, capture_output=True, env=w.env())
+    parent = next(r for r in report["paths"] if r["path"] == "sub")
+    if make is _staged_child_type_change:  # the parent's node: the file `sub`
+        shutil.rmtree(w.root / "sub")
+        shutil.copy2(w.backups()[-1] / parent["saved_as"], w.root / "sub")
+        (w.root / "sub").chmod(0o644)
+    else:  # the parent's index entry: the file `sub` over sub/
+        _git(w.root, "update-index", "--force-remove", "sub/s1", "sub/t")
+        mode, oid, _ = parent["index"][0]
+        _git(w.root, "update-index", "--add", "--cacheinfo", f"{mode},{oid},sub")
     r = _check(w, ts)
     parts = _parts(r)
     assert parts[("sub", "node" if make is _staged_child_type_change else "index")] == (
         "already-restored"
     ), parts
     assert parts[child] == "as-left", f"{child} would read {blocked} forever: {parts}"
-    for step in rest:
-        subprocess.run(["bash", "-c", step], check=True, capture_output=True, env=w.env())
+    restore_all(w)
     r = _check(w, ts)
     assert r.returncode == 0 and set(_parts(r).values()) == {"already-restored"}, r.stdout
 
@@ -1036,6 +1064,34 @@ def test_a_report_another_user_owns_is_refused(w, mod, monkeypatch, capsys):
     assert rc == 1 and "other:not-owned" in out, out
 
 
+def test_the_integrity_check_never_spends_the_walks_read_budget(w, mod, monkeypatch, capsys):
+    """#3986 review: a directory row is read by the walk of its saved copy and of
+    the checkout, then each saved copy again against SAVED.json. That third read
+    has its own budget, so a directory the two walks can afford still reads
+    already-restored instead of other:too-large."""
+    big = 4 * 1024 * 1024
+
+    def foreign(w):
+        (w.root / "P" / "mine.txt").write_text("notes\n")
+        (w.root / "P" / "big.bin").write_bytes(b"x" * big)
+        return "P"
+
+    ts = _repaired(w, foreign)
+    shutil.rmtree(w.root / "P") if (w.root / "P").is_dir() else (w.root / "P").unlink()
+    shutil.copytree(w.backups()[-1] / "tree" / "P", w.root / "P", symlinks=True)
+    spec = importlib.util.spec_from_file_location("_restore_kit", LIB / "live_move_restore.py")
+    kit = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(kit)
+    monkeypatch.setattr(kit, "READ_BYTES", 2 * big + 1024 * 1024)  # two walks, not three
+    load = mod._load_kit
+    monkeypatch.setattr(mod, "_load_kit", lambda n: kit if n == "live_move_restore.py" else load(n))
+    capsys.readouterr()
+    rc = mod.main(["--restore", ts, "--check", str(w.state), str(w.root)])
+    out = capsys.readouterr().out
+    assert "too-large" not in out, out
+    assert '"P" node already-restored' in out, (rc, out)
+
+
 def test_a_node_part_below_another_refuses_the_report(w):
     """Review LOW-2: the writer never writes a node part below another (a
     directory row covers its children; a non-directory parent makes them
@@ -1068,3 +1124,19 @@ def test_the_check_never_runs_the_repositorys_fsmonitor(w, tmp_path):
     r = _check(w, ts)
     assert r.returncode == 0, r.stdout + r.stderr
     assert not marker.exists(), "the check ran the repository's fsmonitor"
+
+
+def test_every_module_the_restore_loads_beside_it_ships_in_the_kit():
+    """The restore loads its row rules and run-folder rules by path from its own
+    directory, so a kit missing one of them cannot load at all. Every such file
+    must be in KIT_FILES, the list the test harness copies into its kit (the
+    kit installer, #3492 D2, must ship the same files)."""
+    import re
+
+    from tests.test_scripts._live_repair_world import KIT_FILES
+
+    loaded = set()
+    for name in ("live_move_restore.py", "live_move_restore_runs.py", "live_move_restore_rows.py"):
+        loaded |= set(re.findall(r'_sibling\("([^"]+)"\)', (LIB / name).read_text()))
+    assert loaded == {"live_move_restore_rows.py", "live_move_restore_runs.py"}
+    assert loaded <= set(KIT_FILES)

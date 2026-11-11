@@ -1,0 +1,1 @@
+- Verification closes now require explicit claim or gap coverage for declared E2E plans, including previews, so omitted checks cannot silently produce a clean pass.

@@ -139,6 +139,55 @@ _SECRET_BASENAMES = ("secrets.env",)
 _SECRETS_PATH_ENV = ("SECRETS_PATH", "GENESIS_SECRETS_PATH")
 
 
+#: The runtime's own location rule (``genesis/secrets_location.py``). It is
+#: stdlib-only by contract, so this hook loads it by path, as the session-context
+#: script does, instead of keeping its own list of where the file may live.
+_RESOLVER = Path(__file__).resolve().parents[2] / "src" / "genesis" / "secrets_location.py"
+_resolver_module: list = []
+
+
+def _locations():
+    """The loaded resolver module, or None when it cannot be loaded.
+
+    None is not a pass: the caller falls back to the same locations written
+    out, because a hook that raises here exits non-zero, and Claude Code runs
+    the tool anyway. ``test_the_guard_fallback_matches_the_resolver`` keeps that
+    fallback equal to the module's answer.
+    """
+    if not _resolver_module:
+        module = None
+        try:
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location("_guard_secrets_location", _RESOLVER)
+            if spec is not None and spec.loader is not None:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+        except Exception:  # noqa: BLE001 - unloadable: use the written-out fallback
+            module = None
+        _resolver_module.append(module)
+    return _resolver_module[0]
+
+
+def _home_config_and_legacy(home: Path, repo_root: Path) -> list[Path]:
+    """The resolver's non-override candidates: home config, then the legacy files."""
+    module = _locations()
+    if module is not None:
+        # Loading is not enough: an older or newer resolver next to this hook (a
+        # hook file copied ahead of its PR, a later signature change) raises
+        # HERE, and a raise is a fail-open. Any surprise uses the list below.
+        try:
+            found = [module.home_config_location(home), *module.legacy_locations(home, repo_root)]
+        except Exception:  # noqa: BLE001 - version skew: use the written-out list
+            found = []
+        if found and all(isinstance(path, Path) for path in found):
+            return found
+    fallback = [home / ".config" / "genesis" / "secrets.env", repo_root / "secrets.env"]
+    if home / "genesis" / "secrets.env" not in fallback:
+        fallback.append(home / "genesis" / "secrets.env")
+    return fallback
+
+
 def _candidate_roots() -> list[Path]:
     """Where a real secrets.env plausibly lives on this install."""
     roots = []
@@ -146,11 +195,65 @@ def _candidate_roots() -> list[Path]:
         explicit = os.environ.get(name)
         if explicit:
             roots.append(Path(explicit).expanduser())
-    roots.append(Path.home() / "genesis" / "secrets.env")
+    home = Path.home()
     repo = os.environ.get("CLAUDE_PROJECT_DIR")
-    if repo:
-        roots.append(Path(repo) / "secrets.env")
+    # legacy_locations keeps ~/genesis/secrets.env too, so a session in another
+    # checkout still protects the canonical one.
+    roots.extend(_home_config_and_legacy(home, Path(repo) if repo else home / "genesis"))
     return roots
+
+
+def _dedicated_dir() -> Path:
+    """The folder that exists only to hold the credentials file.
+
+    A directory read of it (``grep -r``, ``cp -r``, ``tar``, a Grep tool
+    ``path``) opens the file without ever naming it, so the folder itself is
+    gated. Only this exact folder: ``~/genesis`` and ``~`` hold everything else
+    too, and gating them would prompt on routine work.
+    """
+    return _home_config_and_legacy(Path.home(), Path.home() / "genesis")[0].parent
+
+
+_TARGET_CACHE: dict[tuple, tuple[frozenset[Path], Path | None]] = {}
+
+
+def _resolved_targets() -> tuple[frozenset[Path], Path | None]:
+    """The candidate roots and the dedicated folder, resolved once per environment.
+
+    ``_is_secret_path`` runs once per glob hit, and a glob walk that outruns
+    ``_GLOB_BUDGET_S`` GATES. Resolving every root on every hit pushed ordinary
+    globs such as ``tests/test_scripts/*.py`` past that budget: MEASURED 87 new
+    false gates in a 34,677-command replay, 86 cleared by resolving once (the
+    other is an intended gate). The key is every environment input the answer
+    depends on, so a changed ``HOME`` or override is never served a stale answer.
+
+    Not keyed on the filesystem: a symlink at a root that changes inside one
+    process is not seen until the key changes. Each hook process judges one
+    command, so that cannot happen live; a test that swaps symlinks under a fixed
+    environment must clear ``_TARGET_CACHE`` itself.
+    """
+    names = (*_SECRETS_PATH_ENV, "CLAUDE_PROJECT_DIR", "HOME")
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = ""
+    key = (tuple(os.environ.get(n) for n in names), cwd)
+    hit = _TARGET_CACHE.get(key)
+    if hit is None:
+        roots: set[Path] = set()
+        for root in _candidate_roots():
+            try:
+                roots.add(root.resolve())
+            except (OSError, ValueError, RuntimeError):
+                continue
+        try:
+            folder: Path | None = _dedicated_dir().resolve()
+        except (OSError, ValueError, RuntimeError):
+            folder = None
+        hit = (frozenset(roots), folder)
+        _TARGET_CACHE.clear()
+        _TARGET_CACHE[key] = hit
+    return hit
 
 
 def _secret_inodes() -> set[tuple[int, int]]:
@@ -165,7 +268,7 @@ def _secret_inodes() -> set[tuple[int, int]]:
         try:
             st = p.resolve().stat()
             out.add((st.st_dev, st.st_ino))
-        except OSError:
+        except (OSError, ValueError, RuntimeError):
             continue
     return out
 
@@ -189,6 +292,13 @@ def _is_secret_path(raw: str, inodes: set[tuple[int, int]], *, allow_bare: bool 
         return False
     try:
         p = Path(os.path.expanduser(raw))
+        # Identity still protects aliases of existing files. Normalized paths
+        # additionally protect configured destinations that do not exist yet.
+        normalized = p.resolve()
+        roots, folder = _resolved_targets()
+        if normalized in roots or normalized == folder:
+            stripped = raw.rstrip("/")
+            return allow_bare or (os.sep in stripped or stripped.startswith("~"))
         # NOTE: there is deliberately no `.example` test here. An earlier
         # version short-circuited on the UNRESOLVED name before the inode
         # compare below, which made a filename outrank file identity: a symlink
@@ -225,7 +335,7 @@ def _is_secret_path(raw: str, inodes: set[tuple[int, int]], *, allow_bare: bool 
             return False
         stripped = raw.rstrip("/")
         return allow_bare or (os.sep in stripped or stripped.startswith("~"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         # Cannot stat: fall back to the NAME, so a path that does not exist yet
         # (a `cp … secrets.env` destination) is still recognised.
         stripped = raw.rstrip("/")
@@ -246,6 +356,11 @@ _PATHY = re.compile(r"[/~*?\[\]$`]|secret", re.IGNORECASE)
 #: next to secrets-ish wording. Cannot be resolved without running the shell, so
 #: it is reported and the caller decides (we gate).
 _SUSPICIOUS = re.compile(r"(\$\{?\w+|`|\$\()", re.IGNORECASE)
+#: A token that ENDS at the dedicated credentials folder (``_dedicated_dir``).
+#: Paired with ``_SUSPICIOUS`` in the token loop, it catches the folder spelled
+#: through a variable inside quotes, ``"$HOME/.config/genesis"``, which bash
+#: expands and the command-level arm cannot see (it reads unquoted text only).
+_DEDICATED_TAIL = re.compile(r"(?:^|/)\.config\}?/genesis/?$")
 
 #: Does this command mention a secrets FILE, as opposed to the word "secret"?
 #:
@@ -285,8 +400,14 @@ _SUSPICIOUS = re.compile(r"(\$\{?\w+|`|\$\()", re.IGNORECASE)
 #: suffix by parameter expansion and misses. That is an exotic instance of the
 #: shell-variable residual this arm already declares, not a new class — recorded
 #: on #2230 rather than chased with a wider pattern.
+#:
+#: The dedicated credentials folder (``.config/genesis``, see ``_dedicated_dir``)
+#: counts as secrets wording too, so ``grep -r KEY $HOME/.config/genesis`` meets
+#: the variable arm the way ``cat $HOME/secrets.env`` does. The lookahead keeps
+#: neighbours such as ``.config/genesis-voice`` out.
 _SECRETISH = re.compile(
-    r"(?<![\w-])secrets?\.(?:env\b(?!\.example)|[*?\[])|(?<![\w-])secrets?(?![\w.-])",
+    r"(?<![\w-])secrets?\.(?:env\b(?!\.example)|[*?\[])|(?<![\w-])secrets?(?![\w.-])"
+    r"|\.config/genesis(?![\w.-])",
     re.IGNORECASE,
 )
 
@@ -671,15 +792,44 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "", _depth
     if _joined_word_hits(shell_text, inodes, deadline, _depth):
         return True
 
+    # A shell whose cwd is inside the credentials folder reads it with no
+    # operand at all (`grep -rl KEY`, `tar cf - .`), and the folder holds
+    # nothing else, so any command from there gates. The hook's cwd is the
+    # session's, which is the cwd the command starts in. Residual, as for
+    # every relative operand here: a base set INSIDE the command (`cd .config;
+    # grep -r KEY genesis`, `tar -C .config -cf - genesis`) is not followed.
+    _, folder = _resolved_targets()
+    try:
+        here = Path.cwd().resolve()
+    except (OSError, RuntimeError):
+        here = None
+    if folder is not None and here is not None and (here == folder or folder in here.parents):
+        return True
+
+    # Bare names that resolve to a target from the right cwd: the file names,
+    # and the folder's own name (`grep -r KEY genesis` from ~/.config).
+    candidate_names = {root.name for root in _candidate_roots()}
+    candidate_names.add(_dedicated_dir().name)
     for raw_tok in _tokens(scan):
         if time.monotonic() > deadline:
             return True
-        # A brace word can spell the name with no other sign (`{s,x}ecrets.env`).
-        if not _PATHY.search(raw_tok) and "{" not in raw_tok:
-            continue
         if raw_tok.count("[") > _MAX_BRACKETS:
             # fnmatch is quadratic in unmatched `[`, and one call cannot be
             # interrupted by the deadline (MEASURED: 18 s for 20,000).
+            return True
+        # An option with its path attached (`-C<dir>`, `--directory=<dir>`) is
+        # one token; resolve the attached value as well as the whole token. An
+        # excluding option's value names a file to skip, never to open.
+        attached = "" if _excluding(raw_tok) else _attached_value(raw_tok)
+        # A brace word can spell the name with no other sign (`{s,x}ecrets.env`).
+        if (
+            not _PATHY.search(raw_tok)
+            and "{" not in raw_tok
+            and raw_tok not in candidate_names
+            and attached not in candidate_names
+        ):
+            continue
+        if attached and _is_secret_path(attached, inodes, allow_bare=raw_tok in unquoted):
             return True
         # Bash brace-expands before the command ever runs, so
         # `cp ~/genesis/{secrets.env,secrets.env.bak}` opens the real file while
@@ -706,6 +856,11 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "", _depth
                 if _is_secret_path(piece, inodes, allow_bare=bare_tok):
                     return True
             if bare_tok and _pattern_piece_hits(tok):
+                return True
+            # The credentials folder through a variable. A path with a separator
+            # gates whether quoted or not (see `unquoted` above), so a quoted
+            # `"$HOME/.config/genesis"` does too.
+            if _SUSPICIOUS.search(tok) and _DEDICATED_TAIL.search(tok):
                 return True
             # Expand globs against the real filesystem — this is what catches
             # `secrets.*`, `secrets.e*`, `s*.env` without enumerating spellings.
@@ -1013,6 +1168,18 @@ def _joined_word_hits(scan: str, inodes, deadline: float, depth: int = 0) -> boo
                 if touches_secrets(command=script, _depth=depth + 1):
                     return True
     return False
+
+
+def _attached_value(tok: str) -> str:
+    """The path an option token carries: ``--opt=VALUE`` or ``-XVALUE``.
+
+    Empty for anything else. Only the value's resolution is asked about, so a
+    token that is not really an option with a path costs one failed lookup."""
+    if tok.startswith("--"):
+        return tok.split("=", 1)[1] if "=" in tok else ""
+    if tok.startswith("-") and len(tok) > 2:
+        return tok[2:]
+    return ""
 
 
 def _tokens(text: str) -> list[str]:

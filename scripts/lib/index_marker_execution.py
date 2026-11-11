@@ -10,8 +10,11 @@ import hashlib
 import json
 import math
 import re
+import sys
 import uuid
 from pathlib import PurePosixPath
+
+import _genesis_index_marker_recovery as recovery
 
 INTEGER_MAX = 2**63 - 1
 FIELDS = (
@@ -34,7 +37,7 @@ def digest(value) -> str:
 
 
 def _identifier(value: str) -> str:
-    if not re.fullmatch(r"[a-z_]+", value):
+    if not re.fullmatch(r"[a-z_][a-z_0-9]*", value):
         raise RuntimeError("unexpected retained queue column")
     return '"' + value + '"'
 
@@ -156,7 +159,7 @@ def reservation(value, claimed):
     if route == "capped" and claimed["provider"] == "gitnexus" and parent == "app-capped.slice":
         return value
     if route == "inherit" and claimed["provider"] == "cbm":
-        return value  # The actual caller Unit.Slice is independently checked at registration.
+        return value  # The trusted producer must independently bind the actual owner's Unit.Slice.
     raise ValueError("native route does not match the reservation")
 
 
@@ -167,7 +170,8 @@ def _conflict(db, row, raw):
     return "conflict"
 
 
-def reserve(db, value, data, legs):
+@recovery.safety_transition
+def reserve(db, value, data, legs, *, fresh_cleanup=None):
     row = execution(db, value, legs)
     raw = encode(data)
     if row["launch_reservation"] is not None:
@@ -177,7 +181,7 @@ def reserve(db, value, data, legs):
     if row["typed_applied_state"] is not None or row["launch_permission"] == "cancelled":
         return "cancelled"
     _owns(db, row)
-    if blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"]):
+    if blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"], fresh_cleanup=fresh_cleanup):
         return "held"
     if ("fast", "moderate", "full").index(data["run_mode"]) < legs.MODES.index(row["mode"]):
         raise ValueError("reservation cannot narrow the claimed workload")
@@ -212,10 +216,20 @@ def _bound_facts(facts, reserved, proof):
         raise ValueError("scope facts do not match reserved kernel ownership")
 
 
-def register(db, value, data, legs, proof):
+def registration_data(data, proof):
+    """One complete shape for live registration and retained startup observations."""
     _object(data, ("unit", "invocation_id", "facts", "stop_usec"), "scope registration")
+    _text(data["unit"], "scope unit")
     _hex(data["invocation_id"], 32, "scope invocation")
     _integer(data["stop_usec"], "scope stop budget", positive=True)
+    if not proof._facts(data["facts"]):
+        raise ValueError("invalid native scope facts")
+    return data
+
+
+@recovery.safety_transition
+def register(db, value, data, legs, proof, *, fresh_cleanup=None):
+    registration_data(data, proof)
     row = execution(db, value, legs)
     _owns(db, row)
     if row["launch_permission"] != "reserved":
@@ -227,13 +241,14 @@ def register(db, value, data, legs, proof):
     raw = encode(data)
     if row["scope_registration"] is not None:
         return "already_registered" if bytes(row["scope_registration"]) == raw else _conflict(db, row, raw)
-    if blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"]):
+    if blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"], fresh_cleanup=fresh_cleanup):
         return "held"
     db.execute("UPDATE executions SET scope_registration=? WHERE execution_seq=?", (raw, row["execution_seq"]))
     return "registered"
 
 
-def begin(db, value, data, legs, proof):
+@recovery.safety_transition
+def begin(db, value, data, legs, proof, *, fresh_cleanup=None):
     _object(data, ("source", "executable", "facts", "registration_sha256", "before_ns"), "native intent")
     source_identity(data["source"])
     _integer(data["before_ns"], "native start observation", positive=True)
@@ -260,7 +275,7 @@ def begin(db, value, data, legs, proof):
         db.execute("UPDATE executions SET safety_kind='resource',first_typed_conflict="
                    "coalesce(first_typed_conflict,?) WHERE execution_seq=?", (raw, row["execution_seq"]))
         return "resource"  # Preparation OOM is durable; no indexing intent/debt is fabricated.
-    if blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"]):
+    if blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"], fresh_cleanup=fresh_cleanup):
         return "held"
     db.execute("UPDATE executions SET native_intent=?,launch_permission='spent' WHERE execution_seq=?",
                (raw, row["execution_seq"]))
@@ -279,7 +294,8 @@ def cancel(db, value, legs):
 def status(db, value, legs):
     row = execution(db, value, legs)
     for name in ("launch_reservation", "scope_registration", "native_intent", "terminal",
-                 "first_stop", "cleanup_first_failure", "cleanup_proof", "first_typed_conflict"):
+                 "first_stop", "cleanup_first_failure", "cleanup_proof", "first_typed_conflict",
+                 *(("control_closure",) if "control_closure" in row else ())):
         if row[name] is not None:
             try:
                 row[name] = json.loads(row[name])
@@ -318,6 +334,8 @@ def event(value, kind, data, recorded_at, proof):
         source_identity(data["source"])
         if type(data["provider_ok"]) is not bool:
             raise ValueError("provider validation must be explicit")
+    elif kind == "control-closure":
+        recovery.control_data(data, sys.modules[__name__], proof)
     elif kind == "stop":
         _object(data, ("reason", "observed_ns", "boot_id", "unit"), "native stop")
         if data["reason"] not in ("pressure_stop", "wall", "cancellation"):
@@ -370,6 +388,8 @@ def _binding(row, item, proof):
     data, kind = item["data"], item["kind"]
     if reserved is None:
         return False  # Keep an out-of-order spool; it is not completion authority.
+    if kind == "control-closure":
+        return recovery.bind_control(row, item, sys.modules[__name__], proof)
     if kind == "stop":
         if data["unit"] != reserved["unit"] or data["boot_id"] != reserved["owner"]["boot_id"]:
             raise ValueError("stop does not name the reserved scope")
@@ -453,6 +473,65 @@ def _cleanup_disproved(row):
     return False
 
 
+def owned_oom(data):
+    """Largest validated owned counter; absence never invents a resource cause."""
+    if "startup" in data:
+        startup = data["startup"]
+        return max(owned_oom(startup["scope"]), startup["facts"]["events"]["oom_kill"])
+    facts = (data["report"]["before"], data["report"]["after"]) if "report" in data else (data.get("facts"),)
+    return max((value["events"]["oom_kill"] for value in facts if value is not None), default=0)
+
+
+def _known_owned_oom(row, legs, proof, retained):
+    """Interpret represented and retained facts for one exact historical subject."""
+    counts = [owned_oom(json.loads(row["scope_registration"]))]
+    if row["native_intent"]:
+        counts.append(owned_oom(json.loads(row["native_intent"])))
+    events = [json.loads(row[key]) for key in ("terminal", "cleanup_proof", "cleanup_first_failure", "first_typed_conflict", "control_closure")
+              if key in row and row[key] is not None]
+    value = {key: row[key] for key in legs.CONTEXT}
+    for item in retained:
+        if item["context"] != value:
+            raise ValueError("retained resource evidence has another execution")
+        checked = event(value, item["kind"], item["data"], item["recorded_at"], proof)
+        if not _binding(row, checked, proof):
+            raise ValueError("retained resource evidence lacks its original binding")
+        events.append(checked)
+    counts.extend(owned_oom(item["data"]) for item in events
+                  if item.get("kind") in ("terminal", "cleanup", "cleanup-disproof", "control-closure"))
+    return max(counts)
+
+
+def retain_fresh_cleanup(db, row, legs, proof, *, collect, proc, clock, retained, publish):
+    """Re-read the lifetime and retain owned OOM before any physical release.
+
+    Physical proof is never cached as a recovery override. First proof, completion,
+    debt and invalidation remain unchanged. The facade owns the exclusive barrier
+    and supplies its collector, retained artifacts and durable publisher on this
+    admitted connection; no opener or nested lock belongs here.
+    """
+    registered = json.loads(row["scope_registration"])
+    previous = json.loads(row["cleanup_proof"])["data"]
+    registration_sha256 = digest(registered)
+    owned_wait = previous.get("owned_wait") is True
+    try:
+        data = collect(registered, registration_sha256, proof, owned_wait=owned_wait, proc=proc)
+    except (OSError, ValueError):
+        # Unavailable proof holds this execution while unrelated recovery continues.
+        return False
+    value = {key: row[key] for key in legs.CONTEXT}
+    item = event(value, "cleanup", data, clock(), proof)
+    if not _binding(row, item, proof):
+        return False
+    data, value = item["data"], item["context"]
+    if owned_oom(data) > _known_owned_oom(row, legs, proof, retained):
+        publish(item)
+        record(db, value, item, legs, proof)
+    if data["state"] not in ("quiescent", "removed", "rebooted"):
+        return False
+    return _cleanup_valid({**row, "cleanup_invalidated": 0, "cleanup_proof": encode(item)})
+
+
 def _classification(row):
     terminal = json.loads(row["terminal"]) if row["terminal"] else None
     stop = json.loads(row["first_stop"]) if row["first_stop"] else None
@@ -461,16 +540,18 @@ def _classification(row):
     ) else None
     if row["cleanup_first_failure"]:
         safety = safety or "uncertainty"
+    if "control_closure" in row and row["control_closure"] and json.loads(row["control_closure"])["data"]["state"] != "clean":
+        safety = safety or "uncertainty"
     if row["completion_kind"] == "unbound":
         return "unbound", safety or "uncertainty"
     resource = stop and stop["data"]["reason"] == "pressure_stop"
     if terminal:
         report, sealed = terminal["data"]["report"], terminal["data"]["sealed_ns"]
         registered = json.loads(row["scope_registration"])
-        after = report["after"]
-        resource = resource or (after is not None and after["events"]["oom_kill"] > registered["facts"]["events"]["oom_kill"])
+        owned_resource = owned_oom(terminal["data"]) > registered["facts"]["events"]["oom_kill"]
+        resource = resource or owned_resource
         clean = (report["outcome"] == "complete" and report["payload_returncode"] == 0
-                 and terminal["data"]["provider_ok"] and not (after and after["events"]["oom_kill"] > registered["facts"]["events"]["oom_kill"]))
+                 and terminal["data"]["provider_ok"] and not owned_resource)
         before_stop = stop is None or sealed < stop["data"]["observed_ns"]
         if not report["payload_started"] and row["native_intent"] is None:
             completion = "unstarted"
@@ -491,7 +572,14 @@ def _classification(row):
     return completion, safety
 
 
+@recovery.safety_transition
 def record(db, value, item, legs, proof):
+    if item["kind"] == "control-closure":
+        return recovery.record_control(db, value, item, legs, proof, sys.modules[__name__])
+    return _record(db, value, item, legs, proof)
+
+
+def _record(db, value, item, legs, proof):
     row = execution(db, value, legs)
     if not _binding(row, item, proof):
         # Do not invent an absent reservation/registration/intent, and do not
@@ -501,6 +589,9 @@ def record(db, value, item, legs, proof):
         db.execute("UPDATE executions SET completion_kind='unbound' WHERE execution_seq=?", (row["execution_seq"],))
         return "conflict" if represented else "retained"
     kind, raw = item["kind"], encode(item)
+    if kind == "stop" and item["data"]["reason"] == "pressure_stop":
+        db.execute("UPDATE executions SET safety_kind='resource' WHERE execution_seq=?", (row["execution_seq"],))
+        row["safety_kind"] = "resource"
     facts = item["data"].get("facts")
     if kind in ("cleanup", "cleanup-disproof") and facts is not None:
         baseline = json.loads(row["scope_registration"])["facts"]
@@ -540,7 +631,18 @@ def record(db, value, item, legs, proof):
     return "recorded"
 
 
-def apply(db, value, legs):
+def _ownership_clear(row, fresh_cleanup=None):
+    if recovery.control_pending(row):
+        return False
+    if ("control_closure" in row and row["scope_registration"] is None
+            and row["native_intent"] is None and row["launch_permission"] == "cancelled"):
+        return True  # Structural no-future-native permission, not kernel emptiness.
+    if row["cleanup_invalidated"]:
+        return fresh_cleanup is not None and fresh_cleanup(row) is True
+    return _cleanup_valid(row)
+
+
+def apply(db, value, legs, *, fresh_cleanup=None):
     row = execution(db, value, legs)
     if row["completion_kind"] == "unbound":
         return None
@@ -567,23 +669,23 @@ def apply(db, value, legs):
                    "completion_kind=?,safety_kind=? WHERE execution_seq=?",
                    (state, disposition, charged, completion, safety, row["execution_seq"]))
         row = execution(db, value, legs)
-    if _cleanup_valid(row):
+    if _ownership_clear(row, fresh_cleanup):
         db.execute("DELETE FROM inflight WHERE hash=? AND execution_seq=? AND claim_id=?",
                    (row["hash"], row["execution_seq"], row["claim_id"]))
     return row["typed_applied_state"]
 
 
-def drain(directory, db, legs, proof, hash_repo):
+def drain(directory, db, legs, proof, hash_repo, *, residual=None):
     """Called only with the facade's exclusive barrier and active transaction."""
     pending = sorted(directory.glob(".execution-spool-*.spool"))
     retired = []
     # First publish all representable facts/proofs. Then interpret still-raw
     # hazards against that complete snapshot before any decision can release
     # ownership. Publishers are excluded throughout; no new spool can arrive.
-    for _ in range(2):
+    for phase in range(2):
         retained = []
         for path in pending:
-            state = _drain_one(path, db, legs, proof, hash_repo)
+            state = _drain_one(path, db, legs, proof, hash_repo, residual=residual if phase == 1 else None)
             if state in ("waiting", "retained"):
                 retained.append(path)
             else:
@@ -592,7 +694,7 @@ def drain(directory, db, legs, proof, hash_repo):
     return retired
 
 
-def _drain_one(path, db, legs, proof, hash_repo):
+def _drain_one(path, db, legs, proof, hash_repo, *, residual=None):
     name = re.fullmatch(r"\.execution-spool-([0-9a-f]{16})-([0-9a-f]{32})-[0-9a-f]{32}\.spool", path.name)
     if name is None:
         raise ValueError("invalid native spool filename")
@@ -604,32 +706,49 @@ def _drain_one(path, db, legs, proof, hash_repo):
     if (value["hash"], value["claim_id"]) != name.groups():
         raise ValueError("native spool filename does not own its context")
     checked = event(value, item["kind"], item["data"], item["recorded_at"], proof)
-    return record(db, value, checked, legs, proof)
+    state = record(db, value, checked, legs, proof)
+    if residual is not None and state in ("waiting", "retained"):
+        identity = {key: checked[key] for key in ("version", "kind", "context", "data")}
+        residual.append((value["hash"], value["provider"], checked["kind"], digest(identity)))
+    return state
 
-def blocked(db, h: str, provider: str, *, exclude=0) -> bool:
-    # Q3 has no recovery override. Q4 adds the approved acceptance watermark;
-    # unresolved repo ownership remains independent of any provider acceptance.
+def _provider_blocked(db, h, provider):
+    if db.execute("PRAGMA user_version").fetchone()[0] == recovery.SCHEMA_VERSION:
+        return recovery.provider_blocked(db, h, provider, sys.modules[__name__])
     rows = db.execute(
         "SELECT 1 FROM executions WHERE hash=? AND protocol=3 AND ("
-        "cleanup_invalidated=1 OR completion_kind='unbound' OR "
+        "completion_kind='unbound' OR "
         "(provider=? AND (safety_kind IS NOT NULL OR first_typed_conflict IS NOT NULL))) LIMIT 1",
         (h, provider),
     )
-    if rows.fetchone() is not None:
+    return rows.fetchone() is not None
+
+
+def blocked(db, h: str, provider: str, *, exclude=0, fresh_cleanup=None) -> bool:
+    # Physical cleanup cannot release the independent provider safety hold.
+    if recovery.control_blocked(db, h, exclude) or _provider_blocked(db, h, provider):
         return True
-    return any(
-        not _cleanup_valid(dict(row))
-        for row in db.execute(
-            "SELECT * FROM executions WHERE hash=? AND protocol=3 AND execution_seq<>? AND "
+    invalidated = []
+    for record in db.execute(
+            "SELECT * FROM executions WHERE hash=? AND protocol=3 AND (cleanup_invalidated=1 OR (execution_seq<>? AND "
             "(scope_registration IS NOT NULL OR native_intent IS NOT NULL OR "
-            "(launch_reservation IS NOT NULL AND launch_permission IS NOT 'cancelled'))",
+            "(launch_reservation IS NOT NULL AND launch_permission IS NOT 'cancelled'))))",
             (h, exclude),
-        )
-    )
+    ):
+        row = dict(record)
+        if row["cleanup_invalidated"]:
+            invalidated.append(row)
+        elif not _cleanup_valid(row):
+            return True
+    # Finish the SELECT before callbacks retain newly observed resource facts on
+    # these rows. Re-read the safety predicate after those writes as well.
+    if any(not _ownership_clear(row, fresh_cleanup) for row in invalidated):
+        return True
+    return _provider_blocked(db, h, provider)
 
 
-def claim(db, h: str, provider: str, legs):
-    if blocked(db, h, provider):
+def claim(db, h: str, provider: str, legs, *, fresh_cleanup=None):
+    if blocked(db, h, provider, fresh_cleanup=fresh_cleanup):
         return None
     return legs.claim(db, h, provider, protocol=3)
 
@@ -643,7 +762,7 @@ def _finish_pointer(db, row):
         raise RuntimeError("native execution does not own current inflight")
 
 
-def reconcile(db, legs):
+def reconcile(db, legs, *, fresh_cleanup=None):
     """Only unreserved native claims have structural proof of no launch."""
     restored = []
     rows = list(db.execute(
@@ -656,20 +775,24 @@ def reconcile(db, legs):
         if row["completion_kind"] == "unbound":
             continue
         if row["terminal"] is not None or row["first_stop"] is not None or row["cleanup_proof"] is not None:
-            apply(db, value, legs)
+            apply(db, value, legs, fresh_cleanup=fresh_cleanup)
             continue
         if row["typed_applied_state"] is not None:
+            if _ownership_clear(row, fresh_cleanup):
+                _finish_pointer(db, row)
             continue
         if row["launch_reservation"] is not None and row["launch_permission"] != "cancelled":
             continue  # Reservation/intent recovery requires its bound facts.
         state, disposition, charged = legs._restore(db, row, False)
-        if row["scope_registration"] is None or _cleanup_valid(row):
+        if not recovery.control_pending(row) and (row["scope_registration"] is None or _ownership_clear(row, fresh_cleanup)):
             _finish_pointer(db, row)
+        before = execution(db, value, legs)  # Fresh-cleanup callbacks may already have retained safety.
         db.execute(
             "UPDATE executions SET completion_kind='unstarted',typed_applied_state=?,"
             "disposition=?,typed_charged_attempts=?,safety_kind=coalesce(safety_kind,?) WHERE execution_seq=?",
             (state, disposition, charged, "uncertainty" if row["scope_registration"] else None, row["execution_seq"]),
         )
+        recovery.note_transition(db, before, execution(db, value, legs))
         restored.append(row["hash"])
     return restored
 
@@ -685,7 +808,7 @@ def add_commands(sub):
         if name in ("reserve-launch", "register-scope", "begin-native", "remember-native-event"):
             parser.add_argument("--data", required=True)
         if name == "remember-native-event":
-            parser.add_argument("--kind", choices=("terminal", "stop", "cleanup", "cleanup-disproof"), required=True)
+            parser.add_argument("--kind", choices=("terminal", "stop", "cleanup", "cleanup-disproof", "control-closure"), required=True)
 
 
 def dispatch(args, api, proof):

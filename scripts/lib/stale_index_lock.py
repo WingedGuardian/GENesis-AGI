@@ -60,6 +60,10 @@ KEEP_DAYS = 30
 SUFFIX = "-stale-index-lock"
 RETIRED = 3
 _PROC = "/proc"
+# An unreadable git is re-checked this many times, this far apart, before it
+# counts (live_move_repair._held_open uses the same pair).
+_CONFIRM_SCANS, _CONFIRM_STEP_S = 3, 0.15
+_settle = time.sleep  # the re-check's wait; a test replaces it
 
 
 def _repair():
@@ -186,9 +190,13 @@ def _git_in_repo(targets: set[str], alive) -> int | None:
     Other names never count: long-lived helpers such as ``gitstatusd`` would
     block the heal forever. Daemons are skipped for the same reason. A git whose
     cwd, arguments or environment cannot be read counts (fail toward leaving the
-    lock). A zombie (``alive`` false) holds nothing: a killed git its parent never
+    lock) if it stays the same process, still unreadable, across _CONFIRM_SCANS
+    re-checks: counted from one scan, a passing one kept a stale lock (#4001). A
+    zombie or an exiting git (``alive`` false: heal passes
+    live_move_repair._may_hold) holds nothing: a killed git its parent never
     reaped is the very leftover this heals. A git in a nested linked worktree
     governs a different index and does not."""
+    suspects: dict[int, str | None] = {}  # unreadable gits: confirmed below
     for pid in os.listdir(_PROC):
         if not pid.isdigit() or int(pid) == os.getpid():
             continue
@@ -213,16 +221,55 @@ def _git_in_repo(targets: set[str], alive) -> int | None:
         places = _git_places(pid)
         if places is None:
             if os.path.exists(f"{_PROC}/{pid}"):
-                return int(pid)
+                suspects[int(pid)] = _start_time(pid)
             continue  # exited while we looked
-        for place in places:
-            real = os.path.realpath(place)
-            if any(real == t or real.startswith(t + os.sep) for t in targets):
-                return int(pid)
-            owner = _owning_git_dir(place)
-            if owner is not None and os.path.realpath(owner) in targets:
-                return int(pid)
-    return None
+        if _works_in(places, targets):
+            return int(pid)
+    return _confirmed_git(suspects, targets, alive)
+
+
+def _works_in(places: list[str], targets: set[str]) -> bool:
+    for place in places:
+        real = os.path.realpath(place)
+        if any(real == t or real.startswith(t + os.sep) for t in targets):
+            return True
+        owner = _owning_git_dir(place)
+        if owner is not None and os.path.realpath(owner) in targets:
+            return True
+    return False
+
+
+def _start_time(pid) -> str | None:
+    """Field 22 of /proc/<pid>/stat (start time in clock ticks), or None."""
+    try:
+        with open(f"{_PROC}/{pid}/stat") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def _confirmed_git(suspects: dict[int, str | None], targets: set[str], alive) -> int | None:
+    """An unreadable git counts only if it lasts (#4001): a git that is exiting
+    has unreadable cwd and arguments for milliseconds, and one scan read that as
+    a git working here. Each suspect must stay the same live process (same start
+    time) and stay unreadable across _CONFIRM_SCANS re-checks _CONFIRM_STEP_S
+    apart; one that becomes readable is judged on where it works. A real git
+    stays, so a lasting unreadable one still keeps the lock."""
+    for _ in range(_CONFIRM_SCANS):
+        if not suspects:
+            return None
+        _settle(_CONFIRM_STEP_S)
+        for pid, start in list(suspects.items()):
+            if not alive(pid) or _start_time(pid) != start:
+                del suspects[pid]
+                continue
+            places = _git_places(str(pid))
+            if places is None:
+                continue  # still unreadable: still a suspect
+            if _works_in(places, targets):
+                return pid
+            del suspects[pid]
+    return next(iter(suspects), None)
 
 
 def _checkout_git_dir(entry: str) -> str | None:
@@ -289,7 +336,7 @@ def heal(repo: str, home: str, *, now: float | None = None) -> tuple[int, str]:
         return 0, f"stale-index-lock: {lock} is {age:.0f}s old, left for its writer"
     if lmr._held_open(lock):
         return 0, f"stale-index-lock: {lock} is held by a running process, left alone"
-    git_pid = _git_in_repo({os.path.realpath(entry), os.path.realpath(git_dir)}, lmr._pid_alive)
+    git_pid = _git_in_repo({os.path.realpath(entry), os.path.realpath(git_dir)}, lmr._may_hold)
     if git_pid is not None:
         return 0, f"stale-index-lock: git (pid {git_pid}) is working in {repo}, left alone"
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now)) + f"-{os.getpid()}"

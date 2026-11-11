@@ -125,7 +125,9 @@ fi
 SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_PATH="${VENV_PATH:-$REPO_DIR/.venv}"
-SECRETS_FILE="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
+# shellcheck source=lib/secrets_path.sh
+. "$SCRIPT_DIR/lib/secrets_path.sh"
+SECRETS_FILE="$(genesis_secrets_path "$REPO_DIR")"
 SETUP_WARNINGS=0
 # Every setter of SETUP_WARNINGS goes through setup_warn, so the flag can name
 # its own causes. The flag alone made a strict-mode failure undiagnosable: the
@@ -193,6 +195,22 @@ elif [ -n "$home_avail_kb" ] && [ "$home_avail_kb" -lt "$_WARN_DISK_KB" ] 2>/dev
     echo "    WARN  Disk: $(df -h "$HOME" | tail -1 | awk '{print $4}') free (10GB+ recommended)"
 else
     echo "    OK    Disk: $(df -h "$HOME" | tail -1 | awk '{print $4}') free"
+fi
+
+# OS floor: glibc 2.38 (Ubuntu 24.04+) on x86_64 or aarch64. pyproject.toml
+# declares the graph engine's wheel, built for nothing else, so off the floor
+# the package install in step 6 would fail after pip tried to compile the
+# engine from source. The floor lives in lib/falkordb_install.sh, which
+# bootstrap.sh and update.sh check too.
+if [ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]; then
+    # shellcheck source=lib/falkordb_install.sh
+    source "$SCRIPT_DIR/lib/falkordb_install.sh"
+    if falkordb_os_floor_ok; then
+        echo "    OK    OS: $(getconf GNU_LIBC_VERSION 2>/dev/null) on $("$FALKORDB_UNAME" -m 2>/dev/null)"
+    else
+        echo "    FAIL  OS: $(falkordb_os_floor_message)"
+        PREFLIGHT_OK=0
+    fi
 fi
 
 # RAM
@@ -742,6 +760,7 @@ fi
 # secrets.env
 if [ ! -f "$SECRETS_FILE" ]; then
     if [ -f "$REPO_DIR/secrets.env.example" ]; then
+        mkdir -p -m 0700 "$(dirname "$SECRETS_FILE")"
         cp "$REPO_DIR/secrets.env.example" "$SECRETS_FILE"
         chmod 600 "$SECRETS_FILE"
         echo "    + Created secrets.env from template"
@@ -882,12 +901,30 @@ echo "  [6/$TOTAL_STEPS] Installing Genesis package..."
 
 _genesis_installed=0  # the browser stack step (step 11) needs Genesis importable
 if [ -d "$VENV_PATH" ]; then
+    # The graph engine's hash-pinned wheel, BEFORE the editable install:
+    # pyproject.toml declares the same falkordblite pin, and installed first it is
+    # what the editable install finds satisfied, rather than a copy fetched on
+    # TLS alone. Never fatal (rc 0 by contract), but a refused wheel skips the
+    # editable install below; the resolved engine paths it exports feed the unit
+    # render in step 7. bootstrap.sh runs the same call.
+    if [[ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]]; then
+        # shellcheck source=lib/falkordb_install.sh
+        source "$SCRIPT_DIR/lib/falkordb_install.sh"
+        # Not piped: a pipeline would run it in a subshell and drop its exports.
+        falkordb_provision "$VENV_PATH"
+    fi
     # Worktree guard + editable install + import verification — shared with
     # bootstrap.sh so the guard can't drift between the two entry points.
     # shellcheck source=lib/venv_setup.sh
     . "$SCRIPT_DIR/lib/venv_setup.sh"
     _ei_rc=0
-    editable_install_guarded "$REPO_DIR" "$VENV_PATH" || _ei_rc=$?
+    if [ "${FALKORDB_PIP_REFUSED:-}" = "1" ]; then
+        # The hash-pinned wheel was refused: the editable install would fetch the
+        # same mandatory wheel with no hash check, so it does not run.
+        _ei_rc=3
+    else
+        editable_install_guarded "$REPO_DIR" "$VENV_PATH" || _ei_rc=$?
+    fi
     case $_ei_rc in
         0)
             echo "    + Genesis installed in editable mode"
@@ -909,6 +946,11 @@ if [ -d "$VENV_PATH" ]; then
         1)
             # Blocked (worktree) — guard already printed the reason; the
             # install continues, matching the previous inline behavior.
+            ;;
+        3)
+            echo "    FAIL  the graph engine's hash-pinned wheel did not install (see above);"
+            echo "          Genesis was not installed, so nothing fetched it unverified."
+            setup_warn "Genesis not installed: the graph engine's hash-pinned wheel did not install (re-run scripts/install.sh)"
             ;;
         *)
             echo "    FAIL  pip install completed but Genesis is not importable."
@@ -983,14 +1025,18 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         CC_BIN_DIR="$CC_BIN_DIR:$_cc_prefix/bin"
     fi
 
-    # genesis-falkordb.service.template carries two placeholders beyond the
-    # shared five: __FALKORDB_VERSION__ and __REDIS_SERVER__. The resolver and
-    # the version pin live in the same lib bootstrap provisions from — sourced
-    # here for the render only; provisioning stays in bootstrap.sh. With the
-    # lib absent the literals below still produce a parseable (if inert) unit.
-    if [[ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]]; then
-        # shellcheck source=lib/falkordb_install.sh
-        source "$SCRIPT_DIR/lib/falkordb_install.sh"
+    # genesis-falkordb.service.template carries four placeholders beyond the
+    # shared ones: __REDIS_SERVER__, __REDIS_CLI__, __FALKORDB_MODULE__ and
+    # __FALKORDB_DIGESTS__, the engine-copy paths falkordb_provision placed in
+    # step 6. NOT re-sourced here:
+    # sourcing the lib resets those results. When step 6 never provisioned (no
+    # venv, or the lib is absent) the unit is not rendered at all.
+    if ! declare -F falkordb_unit_keep_existing >/dev/null; then
+        falkordb_unit_keep_existing() { FALKORDB_KEEP_REASON="unverified"; return 0; }
+        _falkordb_redis_server_bin() { :; }
+        _falkordb_redis_cli_bin() { :; }
+        _falkordb_module_path() { :; }
+        _falkordb_digests_path() { :; }
     fi
 
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template "$SYSTEMD_TEMPLATE_DIR"/*.slice.template; do
@@ -1014,6 +1060,11 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             echo "    . $svc_name is a symlink or not a regular file (masked?) — kept"
         elif [ -f "$target" ]; then
             echo "    . $svc_name already exists (not overwriting)"
+        elif [ "$svc_name" = "genesis-falkordb.service" ] \
+            && falkordb_unit_keep_existing "$target"; then
+            # No unit exists here, so the only keep reason is an engine step 6
+            # did not verify: there are no engine paths to render with.
+            echo "    . $svc_name not rendered (graph engine not verified)"
         else
             # __AZ_ROOT__ (agent-zero.service.template's WorkingDirectory) was
             # absent from this list, so that unit shipped with a literal
@@ -1045,23 +1096,49 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             _home_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$HOME")")
             _repo_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$REPO_DIR")")
             _venv_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$VENV_PATH")")
+            _ccbin_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$CC_BIN_DIR")")
             _home_esc=$(_sed_repl_esc "$HOME")
             _venv_esc=$(_sed_repl_esc "$VENV_PATH")
             _repo_esc=$(_sed_repl_esc "$REPO_DIR")
             _ccbin_esc=$(_sed_repl_esc "$CC_BIN_DIR")
             _az_root_esc=$(_sed_repl_esc "${AZ_ROOT:-$HOME/agent-zero}")
-            _falkordb_ver_esc=$(_sed_repl_esc "${FALKORDB_VERSION:-4.20.4}")
-            _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)")
+            _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || true)")
+            _redis_cli_esc=$(_sed_repl_esc "$(_falkordb_redis_cli_bin 2>/dev/null || true)")
+            _falkordb_mod_esc=$(_sed_repl_esc "$(_falkordb_module_path 2>/dev/null || true)")
+            _falkordb_digests_esc=$(_sed_repl_esc "$(_falkordb_digests_path 2>/dev/null || true)")
+            # Resolved again here, not reused from $SECRETS_FILE above, so a step that
+            # moved the file earlier in this run renders the unit to where it now is.
+            # `%` doubled: systemd expands specifiers in EnvironmentFile=, so a bare `%`
+            # would make the unit load a different file than the resolver picked.
+            # Its own assignment, so set -e stops the render if it fails (inside the
+            # escape below the failure would be masked and render `EnvironmentFile=-`).
+            # SECRETS_PATH is not followed here: the unit gets the resolver's own file. A
+            # shell value never reaches the server, and a user-manager value cannot be
+            # rendered faithfully (systemd shell-quotes it, and a relative path is not a
+            # valid EnvironmentFile), so either one is named in a warning instead.
+            _secrets_file=$(SECRETS_PATH= genesis_secrets_path "$REPO_DIR")
+            if [[ -n "$(printenv SECRETS_PATH || true)" ]] || { systemctl --user show-environment 2>/dev/null || true; } | grep '^SECRETS_PATH=' >/dev/null; then
+                echo "  WARNING: SECRETS_PATH is set, but the units load $_secrets_file; the server may load another file" >&2
+            fi
+            if [[ -z "$_secrets_file" ]]; then
+                echo "ERROR: could not resolve the secrets file for the unit render" >&2
+                exit 1
+            fi
+            _secrets_file_esc=$(_sed_repl_esc "$(printf '%s' "$_secrets_file" | sed -e 's/%/%%/g')")
             sed -e "s|__HOME__|$_home_esc|g" \
                 -e "s|__HOME_EXEC__|$_home_exec_esc|g" \
                 -e "s|__REPO_EXEC__|$_repo_exec_esc|g" \
                 -e "s|__VENV_EXEC__|$_venv_exec_esc|g" \
+                -e "s|__CC_BIN_EXEC__|$_ccbin_exec_esc|g" \
                 -e "s|__VENV__|$_venv_esc|g" \
                 -e "s|__REPO_DIR__|$_repo_esc|g" \
                 -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
                 -e "s|__AZ_ROOT__|$_az_root_esc|g" \
-                -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \
                 -e "s|__REDIS_SERVER__|$_redis_bin_esc|g" \
+                -e "s|__REDIS_CLI__|$_redis_cli_esc|g" \
+                -e "s|__FALKORDB_MODULE__|$_falkordb_mod_esc|g" \
+                -e "s|__FALKORDB_DIGESTS__|$_falkordb_digests_esc|g" \
+                -e "s|__SECRETS_FILE__|$_secrets_file_esc|g" \
                 "$template" > "$target.render"
             # Stamped like every bootstrap render (scripts/lib/managed_units.py),
             # so a hand edit is recognised from the first update on. Unstamped,
@@ -1416,6 +1493,12 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
                 echo "    + $timer_name enabled + started" || true
         fi
     done
+    # Arm the graph engine step 6 verified, as bootstrap.sh does: enable, and
+    # start it when not running (lib/falkordb_install.sh, falkordb_enable_unit).
+    # Defined only when step 6 sourced the lib.
+    if declare -F falkordb_enable_unit >/dev/null; then
+        falkordb_enable_unit "$SYSTEMD_USER_DIR/genesis-falkordb.service"
+    fi
 fi
 
 # The browser stack: the Camoufox engine and the Chromium the browser packages pin,
@@ -1541,6 +1624,58 @@ if [ -f "$SYSTEMD_USER_DIR/genesis-server.service" ]; then
             echo "    WARNING: could not start genesis-server"
             setup_warn "genesis-server did not start (journalctl --user -u genesis-server)"
         fi
+    fi
+fi
+
+# First graph projection. This script starts the graph engine before
+# genesis-server has created the memory database, so the engine's own
+# start-time projection found nothing to read. Once the server runs, wait
+# (bounded) for the two tables the projector reads, then project once; the
+# server creates the database file before its tables, so the file existing is
+# not enough. A timeout or a failed start is a NOTE: the hourly timer projects.
+if [ -f "$SYSTEMD_USER_DIR/genesis-graph-project.service" ] \
+    && systemctl --user is-active --quiet genesis-server 2>/dev/null \
+    && systemctl --user is-active --quiet genesis-falkordb 2>/dev/null; then
+    _first_proj_rc=0
+    "$VENV_PATH/bin/python" - <<'PY' 2>/dev/null || _first_proj_rc=$?
+import os
+import sqlite3
+import sys
+import time
+from urllib.parse import quote
+
+try:
+    from genesis.env import genesis_db_path
+except Exception:
+    sys.exit(2)
+
+uri = "file:" + quote(str(genesis_db_path()), safe="/") + "?mode=ro"
+deadline = time.monotonic() + float(os.environ.get("GENESIS_FIRST_PROJECTION_WAIT_S", "120"))
+while True:
+    try:
+        con = sqlite3.connect(uri, uri=True, timeout=2)
+        try:
+            con.execute("SELECT 1 FROM memory_links LIMIT 0")
+            con.execute("SELECT 1 FROM memory_metadata LIMIT 0")
+            sys.exit(0)
+        finally:
+            con.close()
+    except sqlite3.Error:
+        pass
+    if time.monotonic() >= deadline:
+        sys.exit(1)
+    time.sleep(2)
+PY
+    if [ "$_first_proj_rc" -eq 0 ]; then
+        if systemctl --user start --no-block genesis-graph-project.service 2>/dev/null; then
+            echo "    + first graph projection started"
+        else
+            echo "    NOTE: could not start the first graph projection; the hourly run will project"
+        fi
+    elif [ "$_first_proj_rc" -eq 1 ]; then
+        echo "    NOTE: the memory database was not ready in time; the hourly graph projection will run instead"
+    else
+        echo "    NOTE: could not run the database readiness check (exit $_first_proj_rc); the hourly graph projection will run instead"
     fi
 fi
 

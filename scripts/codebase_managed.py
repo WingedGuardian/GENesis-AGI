@@ -26,7 +26,10 @@ import uuid
 from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+SCRIPT = globals().get("_CAPTURED_SCRIPT")
+if SCRIPT is None:
+    SCRIPT = Path(__file__).resolve()
+sys.path.insert(0, str(SCRIPT.parent / "lib"))
 from code_intel_cbm_admission import (  # noqa: E402
     _host_available,
     _working_charge,
@@ -64,8 +67,10 @@ from codebase_managed_unit import (  # noqa: E402,F401
 from codebase_managed_unit import (  # noqa: E402
     parse_arguments as native_parse_arguments,
 )
+from codebase_managed_unit import (  # noqa: E402
+    read_document as _read_document,
+)
 
-SCRIPT = Path(__file__).resolve()
 BACKEND = "genesis-cbm-query.service"
 SLICE = "genesis-cbm-query-clients.slice"
 DISABLED_KEYS = ("auto_index", "auto_watch", "watcher_enabled")
@@ -293,8 +298,8 @@ def retire_managed():
     return sources
 
 
-def runtime_config(path: Path) -> dict:
-    config = read_settings(path)
+def runtime_config(path: Path, *, capture=None) -> dict:
+    config = read_settings(path, capture=capture)
     validate_provider_paths(config)
     main = absolute(config["main"]).resolve(strict=True)
     if main != SCRIPT.parent.parent or not (main / ".git").is_dir():
@@ -487,25 +492,12 @@ def uninstall(arguments: list[str]) -> None:
         )
 
 
-def read_document(path: Path) -> dict:
-    fd = os.open(path, os.O_RDONLY | OPEN_FLAGS)
-    with os.fdopen(fd, "rb") as stream:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise ValueError("managed settings must be regular")
-        payload = stream.read(65537)
-    if len(payload) > 65536:
-        raise ValueError("managed settings exceed 64 KiB")
-    try:
-        value = json.loads(payload)
-    except RecursionError as error:
-        raise ValueError("managed JSON nesting exceeds parser limit") from error
-    if not isinstance(value, dict):
-        raise ValueError("managed settings must be an object")
-    return value
+def read_document(path: Path, *, capture=None) -> dict:
+    return _read_document(path, open_flags=OPEN_FLAGS, capture=capture)
 
 
-def read_settings(path: Path, *, require_build: bool = True) -> dict:
-    value = read_document(path)
+def read_settings(path: Path, *, require_build: bool = True, capture=None) -> dict:
+    value = read_document(path, capture=capture)
     return validate_settings(value, require_build=require_build)
 
 
@@ -851,7 +843,7 @@ def check_backend(config: dict, *, starting: bool = False, timeout: float = 30) 
     return pid
 
 
-def ready(config: dict) -> None:
+def ready(config: dict, *, environment=None) -> None:
     validate_provider_paths(config)
     deadline = time.monotonic() + 120
     native_deadline = None
@@ -875,7 +867,8 @@ def ready(config: dict) -> None:
                     break
                 response = subprocess.run(
                     [f"/proc/self/fd/{executable.fileno()}", "daemon", "status"],
-                    env=native_env(config),
+                    env=(native_env(config) if environment is None else
+                         native_env(config, environment=environment)),
                     pass_fds=(executable.fileno(),),
                     capture_output=True,
                     text=True,

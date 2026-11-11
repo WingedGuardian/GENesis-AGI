@@ -20,6 +20,9 @@ import pytest
 from genesis.guardian.remote import GuardianRemote
 from genesis.guardian.sent_log_ingest import ingest_guardian_sent_log
 
+# Real awareness ticks here: keep their git-health and bundle steps off the live install.
+pytestmark = pytest.mark.usefixtures("quiet_live_tick")
+
 _CHAT = -1000000000001  # synthetic
 
 
@@ -65,6 +68,95 @@ async def _rows(db) -> list[dict]:
         "FROM telegram_messages ORDER BY message_id",
     )
     return [dict(r) for r in await cur.fetchall()]
+
+
+@pytest.fixture
+def real_host_log(tmp_path, monkeypatch):
+    """Actual producer, CLI and remote formatting; only SSH/config/clock are fake."""
+    import io
+    import time
+    from contextlib import redirect_stdout
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    from genesis.guardian import __main__ as cli
+    from genesis.guardian import sent_log_ingest as consumer
+    from genesis.guardian.alert import sent_log
+    from genesis.guardian.config import GuardianConfig
+
+    clock = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.fromtimestamp(clock[0], tz)
+
+    monkeypatch.setattr(consumer, "datetime", Clock)
+    config = GuardianConfig()
+    config.state_dir = str(tmp_path)
+    monkeypatch.setattr("genesis.guardian.config.load_config", lambda: config)
+    log = tmp_path / "alerts" / "sent_log.jsonl"
+    remote = GuardianRemote.__new__(GuardianRemote)
+
+    async def ssh(command, **kwargs):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            result = cli._sent_log(["guardian", "--sent-log", command.split()[-1]])
+        return result == 0, out.getvalue()
+
+    remote._ssh_command = ssh
+
+    def append(i):
+        return sent_log.append_sent(log, chat_id=_CHAT, thread_id=7, message_id=i, text=f"alert {i}")
+
+    return SimpleNamespace(clock=clock, log=log, append=append, remote=remote)
+
+
+@pytest.mark.asyncio
+async def test_real_host_cli_consecutive_ingests_survive_clock_reset_and_read_failure(db, real_host_log):
+    host = real_host_log
+    assert host.append(1)
+    assert await ingest_guardian_sent_log(db, remote=host.remote) == 1
+    host.clock[0] -= 30
+    assert host.append(2)
+    assert await ingest_guardian_sent_log(db, remote=host.remote) == 1
+    host.clock[0] -= 3600
+    assert host.append(3)
+    assert await ingest_guardian_sent_log(db, remote=host.remote) == 1
+    host.clock[0] += 1
+    assert host.append(4)
+    original = Path.read_bytes
+
+    def unreadable(path):
+        if path.name.endswith(".1"):
+            raise PermissionError("synthetic unreadable generation")
+        return original(path)
+
+    with patch.object(Path, "read_bytes", unreadable):
+        assert await ingest_guardian_sent_log(db, remote=host.remote) == 0
+    assert [row["message_id"] for row in await _rows(db)] == [1, 2, 3]
+    assert await ingest_guardian_sent_log(db, remote=host.remote) == 1
+    assert await ingest_guardian_sent_log(db, remote=host.remote) == 0
+    assert [row["message_id"] for row in await _rows(db)] == [1, 2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_cap_recovery_pages_past_one_hundred_real_entries(db, real_host_log):
+    host = real_host_log
+    baseline = host.clock[0]
+    cap = baseline + 300
+    host.clock[0] = cap - 1e-6
+    assert host.append(1)
+    host.clock[0] = baseline
+    assert host.append(2)
+    assert not host.append(3)  # computed next stamp has no room under the cap
+    for i in range(3, 105):
+        host.clock[0] = baseline + i * 0.001
+        assert host.append(i)
+    host.clock[0] = cap + 1
+    assert [await ingest_guardian_sent_log(db, remote=host.remote) for _ in range(3)] == [100, 4, 0]
+    assert [row["message_id"] for row in await _rows(db)] == list(range(1, 105))
 
 
 class TestIngest:
