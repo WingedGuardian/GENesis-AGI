@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -75,7 +76,9 @@ def test_both_real_renderers_escape_host_executable(tmp_path, renderer, suffix):
         "FALKORDB_VERSION": "4.20.4", "GENESIS_UPDATE_TIER": "0", "GENESIS_TAKE_TEMPLATES": "",
         "GENESIS_DEPLOY_SUMMARY": str(tmp_path / "summary"),
     }
-    script = '_falkordb_redis_server_bin() { printf /usr/bin/redis-server; }\nsystemctl() { :; }\n'
+    # The renderers call genesis_secrets_path, which the real scripts source from here.
+    script = f". {shlex.quote(str(ROOT / 'scripts/lib/secrets_path.sh'))}\n"
+    script += '_falkordb_redis_server_bin() { printf /usr/bin/redis-server; }\nsystemctl() { :; }\n'
     proc = subprocess.run(["/bin/bash", "-euc", script + prelude(tmp_path) + loop(renderer)], env=env, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     body = (units / name).read_text()
