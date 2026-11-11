@@ -1017,8 +1017,10 @@ async def test_a_new_report_refreshes_the_alert(db, monkeypatch):
         lambda r: r["reports"][0].update(saved=5),
         lambda r: r.update(refused=1),
         lambda r: r.update(unread_older=3),
+        lambda r: r.update(hooks_pending=1),
+        lambda r: r.update(hooks_saved=1),
     ],
-    ids=["dismissed", "saved", "refused", "unread_older"],
+    ids=["dismissed", "saved", "refused", "unread_older", "hooks_pending", "hooks_saved"],
 )
 def test_the_alert_identity_follows_every_named_field(change):
     import copy
@@ -1103,3 +1105,44 @@ async def test_commits_behind_with_another_drift_class_stays_high(db, monkeypatc
     )
     await loop._check_deploy_staleness(db)
     assert [r["priority"] for r in await _rows(db)] == ["high"]
+
+
+async def test_d1f_hooks_pending_has_its_own_line(db, monkeypatch):
+    """D1f: git hooks a forward repair could not put back get their own line,
+    no update.sh advice, high (never critical)."""
+    snap = _snap(["live_repair_hooks_pending:1"])
+    snap["live_repairs"] = {**_repairs(), "hooks_pending": 1}
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert "1 live-move repair(s) finished a killed rollback" in content, content
+    assert "git hooks back yet" in content and "repair-move retries" in content, content
+    assert "update.sh" not in content and row["priority"] == "high", row
+
+
+def test_a_zero_hooks_pending_leaves_the_alert_identity_as_it_was():
+    """LOW-4 (owner): `hooks_pending` enters the identity only when non-zero, so
+    a deploy that adds the key (0) does not re-raise every standing alert."""
+    base = _repairs(_repair("20261027T000000Z-1", 1))
+    assert loop._deploy_repair_identity({**base, "hooks_pending": 0, "hooks_saved": 0}) == (
+        loop._deploy_repair_identity(base)
+    )
+    assert loop._deploy_repair_identity({**base, "hooks_pending": 1}) != (
+        loop._deploy_repair_identity(base)
+    )
+
+
+async def test_sf_a_replaced_hooks_name_their_folder(db, monkeypatch):
+    """SF-A: a report holding git hooks the repair replaced names its
+    hooks-before folder and --dismiss, and never pages."""
+    ts = "20261110T000000Z-5"
+    snap = _snap(["live_repair_hooks_saved:1"])
+    snap["live_repairs"] = {**_repairs({**_repair(ts, 0), "hooks_saved": True}), "hooks_saved": 1}
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert f"/home/u/.genesis/deploy-backups/{ts}-live-move-repair/hooks-before" in content, content
+    assert f"scripts/deploy_candidates repair-move --dismiss {ts}" in content, content
+    assert "update.sh" not in content and row["priority"] == "high", row

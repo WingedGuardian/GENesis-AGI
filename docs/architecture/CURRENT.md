@@ -147,6 +147,76 @@ Easy-to-forget mechanisms:
   (`memory/corrective.py`), which runs inside those tools — so the internal
   runtime stack and the hermetic LongMemEval harness (both pass explicit
   `rerank` kwargs) are unaffected.
+- **A credential reference's value and description are held out of its own
+  indexes** (#2426). For `reference.credentials`, `ingest_knowledge_unit` (the
+  one chokepoint every reference writer passes) indexes only the header (the
+  identifier), `[description held in the reference secret store]`,
+  `Value: [held in the reference secret store; read it with reference_lookup]`
+  and the Tags/Captured trailer (`reference_ops.split_secret`), so the unit's
+  knowledge_units and knowledge_fts rows, its memory_fts row, the Qdrant payload
+  and the embedding never see the value or the free-text description (no
+  scrub of free text: owner ruling, every spelling was another way through).
+  The identifier, tags, authority and provenance are not scrubbed. The value is
+  probed whole and by its fragments: percent-decoded, NFKC-normalised, split on
+  whitespace and `: / @ ? & = # ; , | \ < > " ' ( ) { } [ ]` (so a URL, DSN,
+  key=value, XML or pipe-separated password is a fragment of its own), leaving out host names, URL schemes and ports, and keeping each
+  secret-shaped fragment; matching is normalised (NFKC, format characters
+  removed, casefolded) and percent-decoded. An identifier, body header, or
+  ANY other caller field that can reach a store (authority, memory class,
+  purpose, ingestion source, and every provenance value, nested or not, each
+  read as text by `knowledge_ingest.field_text` and leaf by leaf) that carries
+  a probe refuses the write (`reference_ops.refuse_value_in_fields`; the
+  identifier with its own message, and the `[reference.credentials] {identifier}`
+  header by the identifier rule only when it is exactly that header). A caller
+  tag that carries a probe is dropped whole, from the tags and the body's Tags
+  line, and the write goes on (`reference_ops.drop_value_tags`), so a heuristic
+  match on an ordinary tag costs that tag, never the capture. Stated limits: a
+  secret that reads as a plain word (all letters, or under four characters) is
+  matched only as the whole value, and so is a fragment that is all digits or
+  shaped like a host name (dotted labels ending in letters). A credential's memory class becomes an
+  indexed tag, so it must be None or a known class (`classification.CLASS_WEIGHTS`).
+  The value and the description (`detail`)
+  go to one insert-only `reference_secrets` row under a fresh random id, and ONE statement
+  then writes the unit naming it in `knowledge_units.secret_ref`, so a body and
+  the secret it names are always one writer's pair on a connection that
+  serializes statements, not transactions. The `knowledge_units_secret_ref_*`
+  triggers refuse a credential unit naming no stored secret and delete the
+  secret a unit stops naming (repointed or deleted);
+  `knowledge_crud.sweep_orphan_secrets` (after every delete, and at boot)
+  removes secrets older than an hour that an interrupted upsert left unnamed.
+  `ingest_knowledge_unit(insert_only=True)` and `knowledge_crud.upsert(insert_only=True)`
+  never change an existing credential key (a different value raises
+  `CredentialKeyTaken`); no writer passes it yet: it is the mechanism a later
+  change wires the extraction job's auto-capture to.
+  Two `knowledge_units` triggers refuse a
+  credential body without exactly one placeholder line, whichever process
+  writes it (text on a later line only the Python check sees).
+  A re-ingest carrying a placeholder keeps what the key already holds for it:
+  both placeholders keep the secret row; a new description with the value
+  placeholder writes a new row with the stored value; a new value with the
+  description placeholder keeps the stored description. A credential write never shares a vector point
+  (`MemoryStore.store(..., dedup=False)`), and a point it created that no unit
+  names when the write ends (refused, failed or cancelled) is deleted, so no
+  stale-point cleanup can delete a point a unit names. The credential upsert
+  is a compare-and-swap against the ingest's own earlier read of the key
+  (`knowledge_crud.KeyObservation`: absent, or the secret and point it named),
+  checked inside the one statement that writes the unit, so a same-key writer
+  in another process that commits in between makes it write nothing
+  (`CredentialKeyChanged`); the ingest then re-reads and runs once more, and
+  a second change reaches the caller.
+  Only `reference_ops` reads the secret row: `compose_body` puts the value and
+  the description back for `reference_lookup` (behind its audit log),
+  `reveal_reference` returns both for the dashboard's reveal, and
+  `resolve_value` the value alone. When a unit was repointed after its row was
+  read, they re-read the unit's current body, value and description with one
+  statement (`knowledge_crud.get_reference_pair`), so a body never comes back
+  beside another write's secret. A credential is therefore found by its
+  identifier and tags only; the dashboard list shows the description placeholder. Identifier kinds (url, network,
+  account, fact) keep their value in the body, because it is what their lookups
+  search for. NOT covered yet: the episodic memory the extraction job stores
+  for the same conversation text, which still carries an auto-captured value.
+  Credentials stored before this change keep their value inline until the
+  follow-up migration rewrites them; both readers parse those as before.
 - **`drift_recall`** (`memory/drift.py`) is the degraded-mode fallback; its
   FTS drilldown searches every collection in `source_collections`,
   rank-merged across collections.
@@ -2880,6 +2950,17 @@ verified: c712f1bde 2026-11-06
   idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
   one is age-based and passive. `session_awareness/repo_pulse*.py`.
+- **Holdout scenarios** (shipped; per-install data, none in the repo): hidden
+  exact checks that builders never see, in `$GENESIS_HOME/holdout/HOLDOUT.md`,
+  written only by the `holdout-writer` subagent (regression scenarios from
+  today's behaviour, or intent scenarios from a specced issue before it is
+  built). `scripts/holdout_runner.py --pr N` runs each touched scenario at the
+  merge's first parent and at the merge, prints ids, verdicts and `Protects`
+  lines only, and the validating-merges skill ("The holdout check") maps the
+  verdicts into the evidence document. The session observer records nothing for
+  that subagent, so its work stays out of memory. An install without the file
+  has no holdout and the runner says so. Format and rules:
+  `docs/reference/holdout.md`.
 - **Post-merge verification obligations** (shipped; producer automatic; consumer
   the standing validator session, started only on the owner's explicit
   instruction and self-paced once started, per the validating-merges skill's
@@ -4842,12 +4923,16 @@ logger or unrelated exceptions with copied text and no provenance.
   count there, one anywhere else (the rebuild having moved nothing) `holds`. A "merging"
   row on `live` whose record update.sh already dropped (it adopted the tip,
   own_head is that tip) is judged the same way toward own_head, so a rollback
-  killed partway after adoption is caught too. The remedy follows HEAD: on a
-  live row at the tag, the repair (`scripts/deploy_candidates repair-move`,
-  below), then the by-hand steps for when its kit is not installed; at the update's new code (main's merge or the rebuilt tip), put the
-  paths back and finish with `--post-merge` (Dismissing there leaves code
-  bootstrap never ran on); a main row at the tag keeps the by-hand text (save,
-  restore, Dismiss). The dashboard's progress poll returns the guard's remedy
+  killed partway after adoption is caught too. On a live row the remedy is the
+  repair (`scripts/deploy_candidates repair-move`, below) whichever end HEAD is
+  at: at the tag, followed by the by-hand steps for when its kit is not
+  installed; on `live` at the rebuilt tip (a rollback killed partway), it
+  finishes that rollback toward the tag, with `repair-move --explain` as the
+  by-hand steps, and never `--post-merge` (Dismissing there leaves code
+  bootstrap never ran on). At main's merge, put the paths back and finish with
+  `--post-merge`; a main row at the tag keeps the by-hand text (save, restore,
+  Dismiss). Both live texts name `repair-move --restore <ts>` as the way back
+  for a path that was not the update's. The dashboard's progress poll returns the guard's remedy
   (`guard_remedy`) and the update card shows it. `deploy_code_only.sh` and the live engine refuse to
   restart or move the checkout while it guards; a plain `update.sh` exits 5
   (before tagging or writing anything), and the dashboard's `/apply` answers
@@ -4960,9 +5045,9 @@ logger or unrelated exceptions with copied text and no provenance.
   server start, is PR D2, not yet built; `--explain` needs no kit: with none
   installed it runs the module as HEAD committed it, from memory, never the
   working tree's copy, which may itself be half-written) heals a live row's `mixed_tree`
-  with HEAD at the rollback tag, toward the tag, never toward the target (HEAD
-  at the target, a rollback killed partway, is refused with exit 1 and nothing
-  changed: finishing that rollback is a later PR, D1f): under update.lock and
+  toward the rollback tag, never toward the target (with HEAD on `live` at the
+  target, a rollback killed partway, PR D1f also finishes that rollback, below;
+  HEAD anywhere else off the tag is refused with exit 1): under update.lock and
   genesis-checkout.lock (every git lock a killed switch leaves, `index.lock`,
   `HEAD.lock`, the branch's ref lock and `packed-refs.lock`, is waited for while
   a process holds it, then saved into the backup's `git/` and removed by one
@@ -5012,7 +5097,53 @@ logger or unrelated exceptions with copied text and no provenance.
   never from the copy). The alert body is cut at 16 KiB, with how much was
   left out and a pointer to `REPAIR.json`, because one argv or environment
   string of 128 KiB or more is E2BIG (MEASURED); a queue that fails is
-  logged and never changes the exit code. A failure before the checkout itself changes (a
+  logged and never changes the exit code. With HEAD on `live` at the target
+  (D1f), after that restore (a prefix of the tag's bytes counting as the
+  rollback's own interrupted write) `REPAIR.json` records `hooks: "pending"`,
+  then `live` moves from the target to the tag by compare-and-swap (`git
+  update-ref`, old value the target; a lost swap is `unresolved`, exit 1, the
+  ref untouched), then the tag's own `scripts/deploy_candidates.py
+  restore-hooks <target> <tag>` runs with update.lock's fd and under the
+  checkout lock, as update.sh's rollback runs it (`hooks` becomes `ok`; a
+  failure leaves it `pending`, said in the output, and the alert is
+  critical). When restore-hooks fails and the moved-from commit's
+  `scripts/hooks` cannot be read (the commit, a tree or a blob there gone: no
+  retry could ever restore from it), the repair reinstalls the tag's hooks
+  instead: every installed regular-file hook the tag's sync-hooks.sh lists
+  whose bytes are not the tag's (a candidate's, or a hand-edited one; a
+  symlinked or unlisted hook, or one already the tag's, is left alone) is
+  copied into the report's `hooks-before/` (0600, never over an earlier copy,
+  made durable; the report dir and `hooks-before/` must be this user's 0700
+  directories, on the retry path too, or nothing is touched), the names are
+  written to REPAIR.json's `hooks_before` with a note naming the folder ("not
+  reinstalled yet"), and only then removed; then the tag's own `restore-hooks
+  <tag> <tag>` has sync-hooks.sh install them fresh and judges them as
+  readiness does. Between that removal and the install no such hook is
+  installed (seconds; accepted: a failure there leaves the record, and the
+  next run converges). On its exit 0 `hooks` is `reinstalled` (not pending:
+  the hooks count and keep no longer apply), `hooks_note` says so, and the
+  output and an alert (critical when hooks were moved aside) name the folder.
+  A report whose `hooks_before` is set is kept by the prune and counted in
+  `live_repair_hooks_saved:<n>` until `--dismiss` (it may hold a hand edit's
+  only copy). A hook only the moved-from commit listed stays installed. With core.hooksPath
+  pointing away from `$GIT_COMMON_DIR/hooks` nothing is touched and the hooks
+  stay pending (readiness names that setting). Every later run first re-reads
+  each pending report (through `load_report`; a DISMISS_MARK folder is
+  skipped) under both locks and retries it while the branch `live` is still
+  its tag and HEAD is on `live` (HEAD elsewhere: left pending; an entry whose
+  commits are not full commit ids: left as it is), marks it `superseded` once
+  `live` itself moved, and writes back only `hooks` (0600); a report
+  dismissed with `dismissed_at` is still retried while its folder exists
+  (dismissal ends only its count and its keep). One report's retry failing
+  (its write, say) is logged and never stops the heal that follows.
+  `--dismiss` and a restore take update.lock too, so neither's field is lost
+  (every REPAIR.json writer holds it); with no state file and update.lock
+  held it exits 0 at once. The restore-hooks run is not bounded by the boot budget;
+  that is PR D2's, which wires `--boot`. With the target's objects gone in
+  the forward case, the whole-tree fallback and a torn index's rebuild read
+  the tag, never HEAD (the target). After a forward heal HEAD is the tag on
+  `live`, so `--restore <ts>` judges its foreign paths as after any other
+  repair. A failure before the checkout itself changes (a
   failed backup included) exits 0 at `--boot`. The guard then judges
   again and only its SAFE removes the state (byte-identical re-read); `guards`
   or `holds` (an edit off the move's paths) keeps it, its result naming the
@@ -5021,7 +5152,7 @@ logger or unrelated exceptions with copied text and no provenance.
   `holds`, not `mixed_tree` again; anything
   else is `unresolved` (exit 1). A target whose objects are
   gone (its root tree, or any subtree or blob classification reads) is healed
-  by the whole tree against HEAD and cleared by a clean-tree
+  by the whole tree against the tag and cleared by a clean-tree
   check. A main row is out of scope (exit 3; 0 at `--boot`). The engine
   writes its merges with `core.fsync=committed`. Each repair prints its report
   (the restore command included) and queues an alert (critical when anything was
@@ -5065,8 +5196,10 @@ logger or unrelated exceptions with copied text and no provenance.
   `pyproject.toml`), that a report nobody restored or dismissed is never
   pruned (disk_hygiene's deploy-backups prune asks
   `scripts/lib/repair_report_keep.py`, which keeps exactly what this count
-  still counts, the restore run folder holding such a report's in-flight
-  aside, and any report it cannot read) while a restored or dismissed report
+  still counts, an undismissed report whose `hooks` is still `pending` or
+  whose `hooks_before` names hooks it replaced, the
+  restore run folder holding such a report's in-flight aside, and any report
+  it cannot read) while a restored or dismissed report
   and other backups are pruned 90 days after the last write to their folder,
   and, for a report whose last restore refused parts, that its
   output names each and that a part it can never write goes back by hand from
@@ -5075,7 +5208,19 @@ logger or unrelated exceptions with copied text and no provenance.
   column cannot hold rather than losing the alert, and is replaced whenever
   the reports it names change. `GET /api/genesis/health` reduces
   `live_repairs` to an allow-list of its counts for a caller without the
-  internal bearer or a verified session. `live_repair_unresolved` needs the
+  internal bearer or a verified session. `live_repair_hooks_pending:<n>`
+  counts the read, undismissed reports whose `hooks` is exactly `pending` and
+  whose `tag` is where the branch `live` points (the writer's own rule: `live`
+  moved on means superseded); one `git rev-parse --verify -q
+  refs/heads/live^{commit}`, bounded at 10 s, runs per snapshot and only when
+  such a report exists, and a timeout or a failing git keeps the count. It has
+  its own awareness line (readiness refuses every rebuild until the hooks are
+  back) and is in the health route's counts; `live_repair_hooks_saved:<n>`
+  counts the read, undismissed reports with a `hooks_before`, its awareness
+  line naming each `hooks-before/` folder and `--dismiss <ts>`; each enters the
+  alert's identity only when non-zero. A pending report whose commits are not full commit ids
+  (a hand edit), or one older than the newest eight reports the reader reads,
+  is kept by the prune and counted by no reader (accepted). `live_repair_unresolved` needs the
   newest report to say so (or to have no result after an hour) AND the
   shared guard, run at read time and only then, to call the update state
   `mixed_tree`: a run killed after its restore and before its result leaves

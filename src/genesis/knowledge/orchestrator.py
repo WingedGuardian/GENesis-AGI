@@ -436,6 +436,18 @@ class KnowledgeOrchestrator:
         memory_mod._require_init()
         assert memory_mod._store is not None  # noqa: S101 - type-narrowing invariant
 
+        # #2426: a credential reference is never written by distillation. The
+        # vectors below are stored BEFORE the database rows, so the db layer's
+        # refusal would come after the value had already reached the vector
+        # store: refuse the whole batch here, before anything is written.
+        from genesis.db.crud.knowledge import holds_secret
+
+        if any(holds_secret(project_type, unit.domain) for unit in units):
+            raise ValueError(
+                "refusing to distil credential references: write them with "
+                "reference_store, which holds the value out (#2426)"
+            )
+
         unit_ids: list[str] = []
         qdrant_ids: list[str] = []  # Track for compensation on failure
         purpose_json = json.dumps(purpose) if purpose else None
