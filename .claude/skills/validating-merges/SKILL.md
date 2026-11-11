@@ -596,7 +596,8 @@ Record it:
 - A `holdout fence:` line naming possibly spoiled scenarios goes to the owner:
   a scenario seen by someone other than its writer may be spoiled. One that
   names none needs no report unless it also counts unreadable lines or
-  holdout-writer accesses, which the owner confirms; the same holds for a
+  says to confirm holdout-writer accesses (those made since the newest
+  scenario was written), which the owner confirms; the same holds for a
   `no exposures logged` line. An `exposure log unreadable` line goes to the
   owner too. A line
   saying the fence is not installed means exposures are not being recorded.

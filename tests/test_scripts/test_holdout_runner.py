@@ -7,6 +7,7 @@ the two read-only ``gh`` queries are replaced. The scenarios are synthetic.
 
 from __future__ import annotations
 
+import datetime as dt
 import importlib.util
 import json
 import os
@@ -1006,16 +1007,103 @@ def test_the_runner_imports_without_the_venv(tmp_path):
     assert proc.stdout.startswith("holdout: none")
 
 
-def test_writer_accesses_are_counted_separately(repo, fake_gh, install_holdout, capsys):
-    log = install_holdout / "logs" / "holdout-exposures.jsonl"
-    log.parent.mkdir()
-    rows = [
-        {"at": "2026-11-03T00:00:00Z", "kind": "allowed"},
-        {"at": "2026-11-04T00:00:00Z", "kind": "allowed"},
-    ]
-    log.write_text("".join(json.dumps(r) + "\n" for r in rows))
+def _allowed(at):
+    return _read_row(at, kind="allowed")
+
+
+def test_writer_accesses_with_no_dated_scenario_go_to_the_owner(
+    repo, fake_gh, install_holdout, capsys
+):
+    _raw_log(install_holdout, _allowed("2026-11-03T00:00:00Z"), _allowed("2026-11-04T00:00:00Z"))
     _, out = _run_install(
         repo, install_holdout, _scenario("H-01", steps=_call("g"), expect="gamma"), capsys
     )
     assert "holdout fence: no exposures logged" in out
-    assert "2 access(es) declaring the holdout-writer agent, latest 2026-11-04T00:00:00Z" in out
+    assert (
+        "2 of 2 access(es) declaring the holdout-writer agent and no dated scenario, "
+        "latest 2026-11-04T00:00:00Z: confirm each was a writer run you ordered"
+    ) in out
+
+
+def test_writer_accesses_up_to_the_newest_scenario_are_only_counted(
+    repo, fake_gh, install_holdout, capsys
+):
+    _raw_log(
+        install_holdout,
+        _allowed("2026-10-01T09:00:00Z"),
+        _allowed("2026-11-05T09:00:00Z"),
+        _allowed("2026-11-06T23:00:00Z"),
+    )
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-05"), capsys)
+    line = _fence_line(out)
+    assert line == (
+        "holdout fence: no exposures logged; 3 holdout-writer access(es), none later than "
+        "the newest scenario"
+    )
+
+
+def test_only_writer_accesses_after_the_newest_scenario_are_reported(
+    repo, fake_gh, install_holdout, capsys
+):
+    _raw_log(
+        install_holdout,
+        _allowed("2026-11-03T12:00:00Z"),
+        _allowed("2026-11-11T09:00:00Z"),
+        _allowed("2026-11-12T00:00:00Z"),
+        _allowed(""),
+    )
+    text = _authored("H-01", "2026-11-10") + _authored("H-02", "2026-11-05")
+    _, out = _run_install(repo, install_holdout, text, capsys)
+    assert (
+        "2 of 4 access(es) declaring the holdout-writer agent since the newest scenario "
+        "was written, latest 2026-11-12T00:00:00Z: confirm each was a writer run you ordered"
+    ) in _fence_line(out)
+
+
+def test_a_writer_access_with_no_readable_time_is_reported(repo, fake_gh, install_holdout, capsys):
+    _raw_log(install_holdout, _allowed("2026-11-05T09:00:00Z"), _allowed(""))
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-05"), capsys)
+    assert (
+        "1 of 2 access(es) declaring the holdout-writer agent since the newest scenario "
+        "was written, time unreadable: confirm"
+    ) in _fence_line(out)
+
+
+@pytest.mark.parametrize(
+    "author",
+    ["holdout-writer, 2026-11-01, rechecked 2026-11-09", "holdout-writer, 2026-11-09, 2026-13-45"],
+    ids=["latest-date-on-the-line", "valid-dates-beside-a-bad-one"],
+)
+def test_the_newest_date_is_taken_over_every_date_on_every_author_line(
+    repo, fake_gh, install_holdout, capsys, author
+):
+    _raw_log(install_holdout, _allowed("2026-11-10T09:00:00Z"))
+    text = _scenario("H-01", steps=_call("g"), expect="gamma", extra=f"Author: {author}\n")
+    _, out = _run_install(repo, install_holdout, text, capsys)
+    assert "1 holdout-writer access(es), none later than the newest scenario" in _fence_line(out)
+
+
+def test_an_author_date_past_tomorrow_does_not_silence_writer_accesses(
+    repo, fake_gh, install_holdout, capsys
+):
+    _raw_log(install_holdout, _allowed("2026-11-05T09:00:00Z"))
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2099-01-01"), capsys)
+    assert "1 of 1 access(es) declaring the holdout-writer agent and no dated scenario" in out
+
+
+def test_a_scenario_dated_tomorrow_still_counts_as_the_newest(
+    repo, fake_gh, install_holdout, capsys
+):
+    """The writer's UTC date can be a day ahead of the fence's timestamp."""
+    today = dt.datetime.now(dt.UTC).date()
+    _raw_log(install_holdout, _allowed(f"{today.isoformat()}T09:00:00Z"))
+    text = _authored("H-01", (today + dt.timedelta(days=1)).isoformat())
+    _, out = _run_install(repo, install_holdout, text, capsys)
+    assert "1 holdout-writer access(es), none later than the newest scenario" in out
+
+
+def test_a_malformed_scenario_still_dates_the_writer(repo, fake_gh, install_holdout, capsys):
+    _raw_log(install_holdout, _allowed("2026-11-05T09:00:00Z"))
+    text = "## H-01 no steps\nProtects: x\nTouches: calc.py\nAuthor: holdout-writer, 2026-11-05\n"
+    _, out = _run_install(repo, install_holdout, text, capsys)
+    assert "1 holdout-writer access(es), none later than the newest scenario" in out
