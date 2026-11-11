@@ -19,6 +19,23 @@ matcher = "^Bash$"
 type = "command"
 command = 'top=$(git rev-parse --show-toplevel 2>/dev/null) || top=""; guard="$top/scripts/hooks/codex-review-stop"; [ -n "$top" ] && [ -f "$guard" ] || { printf "%s\n" "BLOCKED: review guard unavailable; stop and handoff to the user." >&2; exit 2; }; rc=0; out=$(bash "$guard" 3>&1 1>/dev/null) || rc=$?; [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 2 ] && [ "$out" = "deny" ] && exit 2; printf "%s\n" "BLOCKED: review guard failed (exit $rc); stop and handoff to the user." >&2; exit 2'
 
+# Advisory holdout fence (scripts/hooks/holdout_fence.py): logs and notes any
+# shell access to the install's hidden holdout scenarios. It never blocks, so
+# any failure to find or run it simply exits 0; its stdout is advisory JSON.
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '[ -d "${GENESIS_HOME:-$HOME/.genesis}/holdout" ] || exit 0; top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; f="$top/scripts/hooks/holdout_fence.py"; [ -f "$f" ] || exit 0; python3 "$f" pre || true'
+timeout = 10
+
+[[hooks.PostToolUse]]
+matcher = "^Bash$"
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = '[ -d "${GENESIS_HOME:-$HOME/.genesis}/holdout" ] || exit 0; top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; f="$top/scripts/hooks/holdout_fence.py"; [ -f "$f" ] || exit 0; python3 "$f" post || true'
+timeout = 10
+
 # Genesis MCP servers for Codex. Owner ruling (2026-11-08): an owner-operated
 # Codex session gets the same Genesis tools a Claude Code session gets. The
 # launcher (scripts/codex_owner_mcp.py) starts the ordinary server, labelled

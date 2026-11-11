@@ -617,6 +617,22 @@ def load_report(path: str, repo: str) -> dict | None:
 REPO_BYTES = 4096
 
 
+#: Written beside a REPAIR.json no reader can read (load_report refuses it) by
+#: --dismiss TS, which then cannot record dismissed_at inside it. Every reader
+#: (deploy health, the guardian's pick, the deploy-backups prune) skips a report
+#: folder holding it as a regular file (#4331 review): the report's alert
+#: clears and the prune takes the folder 90 days after its last write.
+DISMISS_MARK = "DISMISSED.json"
+
+
+def dismiss_marked(path: str) -> bool:
+    """Does the report dir ``path`` hold DISMISS_MARK as a regular file?"""
+    try:
+        return stat.S_ISREG(os.lstat(os.path.join(path, DISMISS_MARK)).st_mode)
+    except OSError:
+        return False
+
+
 def same_repo(named, repo: str) -> bool:
     """Whether a report's ``repo`` field names ``repo``. The field is untrusted:
     it must be a str with no NUL whose file-system bytes (os.fsencode: a
@@ -658,8 +674,9 @@ def _load_guard():
 
 
 def _load_kit(name: str):
-    """A kit source beside this one (the guard; live_move_restore.py and
-    live_move_restore_write.py)."""
+    """A kit source beside this one (the guard; live_move_restore.py, which
+    loads live_move_restore_rows.py and live_move_restore_runs.py beside it,
+    and live_move_restore_write.py)."""
     path = os.path.join(_LIB, name)
     spec = importlib.util.spec_from_file_location(f"_live_repair_{name[:-3]}", path)
     if spec is None or spec.loader is None:
@@ -1268,11 +1285,48 @@ EXPLAIN = """The repair's steps, by hand, for when it cannot run:
 3. Once scripts/lib/update_state_guard.py <state> <repo> exits 10, remove the state."""
 
 
+def _dismiss_unread(backup: str, why: str) -> int:
+    """--dismiss for a report no reader can read: DISMISS_MARK, or 1 when the
+    dir itself is not one the repair writes (a link, a file, another user's)."""
+    try:
+        st = os.lstat(backup)
+    except OSError as exc:
+        _log(
+            f"the repair report in {backup} is not read: {why}; nothing was dismissed ({exc.strerror})"
+        )
+        return 1
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        _log(
+            f"the repair report in {backup} is not read: {why}; it is not this user's directory, so nothing was dismissed"
+        )
+        return 1
+    stamp = time.strftime("%FT%TZ", time.gmtime())
+    try:
+        write_json(
+            os.path.join(backup, DISMISS_MARK),
+            {"dismissed_at": stamp, "unread": why[:300]},
+            private=True,
+        )
+    except OSError as exc:
+        _log(
+            f"the repair report in {backup} is not read: {why}; {DISMISS_MARK} cannot be"
+            f" written ({exc.strerror}), so nothing was dismissed"
+        )
+        return 1
+    _log(
+        f"the repair report in {backup} is not read ({why}); dismissed with {DISMISS_MARK} beside it"
+    )
+    return 0
+
+
 def _dismiss(state: str, repo: str, ts: str, wait: int) -> int:
     """--dismiss TS: rewrite REPAIR.json with dismissed_at, only under
     update.lock (review SF-7: a restore rewrites it too, and an unlocked
     load-then-write would lose the other's field); still held after ``wait``,
-    nothing is written."""
+    nothing is written. A report load_report refuses (unreadable, or recorded
+    for another checkout) is dismissed with DISMISS_MARK beside it instead,
+    when its dir is a real directory of this user's: REPAIR.json is left as it
+    is, and every reader skips the dir."""
     home = os.path.dirname(os.path.abspath(state))
     backup = os.path.join(home, "deploy-backups", ts + SUFFIX)
     try:
@@ -1289,8 +1343,7 @@ def _dismiss(state: str, repo: str, ts: str, wait: int) -> int:
         try:
             loaded = load_report(backup, repo)
         except BadReport as exc:
-            _log(f"the repair report in {backup} is not read: {exc}")
-            return 1
+            return _dismiss_unread(backup, str(exc))
         if loaded is None:
             _log(f"no repair report in {backup}")
             return 1

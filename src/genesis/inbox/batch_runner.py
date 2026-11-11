@@ -21,6 +21,7 @@ from genesis.inbox.url_coverage import (
     _has_url_failures,
     _uncovered_urls,
 )
+from genesis.observability.session_context import session_scope
 
 if TYPE_CHECKING:
     from genesis.inbox.monitor import InboxMonitor
@@ -188,7 +189,8 @@ async def run_one_batch(
         return False
 
     try:
-        output = await run_with_overload_retry(monitor._invoker, invocation)
+        with session_scope(session_id):
+            output = await run_with_overload_retry(monitor._invoker, invocation)
     except CCReplayUnsafeError as exc:
         err = f"{inbox_items.REPLAY_UNSAFE_PREFIX} CC work may already have run: {exc}"
         errors.append(err)

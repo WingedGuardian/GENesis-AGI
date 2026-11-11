@@ -667,6 +667,10 @@ def note_failure(peer: str, exc: BaseException) -> bool:
     Synchronous (roster read, lock, tempfile, fsync, replace) — call via
     ``asyncio.to_thread`` from async code; it sits on the async failover path.
     """
+    from genesis.cc.provider_readiness import contained_provider
+
+    if contained_provider():
+        return False  # Before private error parsing or diagnostic logging.
     # Through the PUBLIC alias, which owns the never-raises guard. Two copies of
     # that guard is how one of them came to be missing: the caller that skipped
     # it was the one added last.
@@ -889,6 +893,10 @@ def _record(
     reset_at: str = "",
     limit_kind: str = "",
 ) -> bool:
+    from genesis.cc.provider_readiness import contained_provider
+
+    if contained_provider():
+        return False
     if not peer:
         return False
     try:
