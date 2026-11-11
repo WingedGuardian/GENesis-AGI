@@ -151,12 +151,17 @@ holdout or on a directory above it: `ls`, `du`, `stat`, `readlink`, `realpath`,
 `pwd`, and the filters `sort`, `head`, `tail`, `wc`, `uniq`, `cut`, `column` and
 `tr` when they read only their input. A command using an option that opens,
 writes or runs something (`--files0-from`, `--exclude-from`, `sort -o`, and the
-like) does not qualify. From any other call the result is an exposure: a
-recursive `grep`, `find … | xargs head`, a wrapper, a substitution, `eval`, an
-input redirect, `tree`, `git` or `gh`, or another tool's result can print
-scenario lines under that path. A read that prints nothing, or a write through a
-command not listed here, is the PreToolUse half's to catch, and its known gaps
-are in the hook's "WHAT IT CANNOT SEE". The
+like) does not qualify. Nor does one with a redirect to anything but
+`/dev/null` or a descriptor, an expansion other than `$HOME` and
+`$GENESIS_HOME`, or a command given by a path outside the system directories:
+a names-only command writes no file, and a redirect's target cannot be resolved
+from the command's text once a `cd`, `$PWD` or a symlink is involved. From any
+other call the result is an exposure: a recursive `grep`, `find … | xargs head`,
+a wrapper, a substitution, `eval`, `tree`, `git` or `gh`, or another tool's
+result can print scenario lines under that path. A read or a write that leaves
+no path or scenario text in a result is seen only if the PreToolUse half
+classifies the command, and that half's known gaps are listed in the hook's
+"WHAT IT CANNOT SEE". The
 "installed" test is the hook file's presence in the checkout. Accesses by an
 agent declaring itself `holdout-writer` are counted separately, with the latest
 time, for the owner to match against writer runs they ordered: the writer is

@@ -41,9 +41,13 @@ Two events, one file:
   shell command made only of ``NAMES_ONLY_VERBS`` (``du``, ``ls``, ``stat``,
   ``find`` with no action, ``echo``, ``printf``, ``cd`` and the like) and
   ``STDIN_FILTERS`` with no file operand, each run directly: no wrapper
-  (``xargs``, ``env``), substitution, ``eval``, input redirect, heredoc,
-  expansion other than a plain ``$NAME``, or option that opens, writes or
-  runs something (``FILE_OPTIONS``). And no way it reaches the holdout that
+  (``xargs``, ``env``) or command path outside the system directories, no
+  substitution, ``eval`` or heredoc, no redirect except to ``/dev/null``, the
+  terminal or a descriptor, no expansion other than ``$HOME`` and ``$GENESIS_HOME``, and no
+  option that opens, writes or runs something (``FILE_OPTIONS``). A redirect
+  is refused whatever its target, because a target that is relative after a
+  ``cd``, or goes through ``$PWD`` or a symlink, cannot be resolved from the
+  command text. And no way it reaches the holdout that
   this hook can see is a read, a write or an access. Anything else keeps the
   ``content`` row: a recursive ``grep`` or ``find ... | xargs head`` prints
   scenario lines under that path, and so can a call this hook cannot
@@ -95,6 +99,12 @@ WHAT IT CANNOT SEE
 - a file read or written through an option's value (``du --exclude-from=F``,
   ``sort -oF``, ``tree --fromfile F``), or by a ``git`` or ``gh`` verb that reads
   one, until its content or path shows up in a result;
+- before the tool runs, a redirect whose target is relative after a ``cd``
+  (every ``cd`` is assumed to succeed, and only the starting directory is
+  used for redirects), goes through ``$PWD`` or a symlink, or is spelled
+  ``>&`` or after a ``#`` inside a word;
+- a glob that expands to a file planted earlier and named like an option
+  (``find H *`` beside a file called ``-delete``);
 - an expected-output line under 40 characters, or content past the first 2 MiB;
 - clients other than Claude Code and Codex CLI, and any process outside an agent
   session.
@@ -767,9 +777,14 @@ MAX_HOLDOUT_FILES = 32
 #: Shell syntax that hides what a command prints: command and process
 #: substitution, input redirects and heredocs.
 _OPAQUE_SYNTAX = ("$(", "`", "<", ">(")
-#: Any "$" that is not a plain $NAME or ${NAME}: ${X@P}, $[b], ${a[b]} and
-#: ${HOME:b} evaluate text as a command or an expression.
-_NOT_A_PLAIN_VARIABLE = re.compile(r"\$(?![A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})")
+#: Any "$" other than $HOME and $GENESIS_HOME, which this hook resolves itself.
+#: Another variable can hold an option or a path ($_, $PWD, $OLDPWD), and
+#: ${X@P}, $[b], ${a[b]} and ${HOME:b} evaluate text as a command or expression.
+_UNRESOLVED = re.compile(r"\$(?!(?:HOME|GENESIS_HOME)(?![A-Za-z0-9_])|\{(?:HOME|GENESIS_HOME)\})")
+#: Redirect targets that are the terminal or nothing, not a file.
+SINKS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
+#: Where a command given by path may live; any other path can be any program.
+SYSTEM_BIN_DIRS = frozenset({"/bin", "/usr/bin", "/usr/local/bin"})
 
 
 def _names_only_kind(ti: dict, payload: dict, cwd: str, holdout: str) -> str | None:
@@ -802,7 +817,9 @@ def _names_only_shape(command: str) -> bool:
     """Every segment of ``command`` is a names-only command or a bare filter, run directly."""
     if not command or any(token in command for token in _OPAQUE_SYNTAX):
         return False
-    if _NOT_A_PLAIN_VARIABLE.search(command):
+    if _UNRESOLVED.search(command):
+        return False
+    if _redirects_to_a_file(command):
         return False
     try:
         from shell_parse import analyze_checked
@@ -819,11 +836,14 @@ def _names_only_shape(command: str) -> bool:
             return False
         while len(words) > 1 and _FORMAT_ASSIGNMENT.match(words[0]):
             words = words[1:]  # LC_ALL=C sort -h
-        if os.path.basename(words[0]) != os.path.basename(argv[0]):
+        program = words[0].strip("\"'")
+        if os.path.basename(program) != os.path.basename(argv[0]):
             return False  # run through a wrapper (xargs, env, timeout, sudo) or an assignment
+        if "/" in program and os.path.dirname(program) not in SYSTEM_BIN_DIRS:
+            return False  # ./du is whatever program that file is
         verb = os.path.basename(seg.exe or argv[0])
         args = argv[1:]
-        if any(_opens_something(verb, a) for a in args):
+        if any(_opens_something(verb, a) or _brace_makes_an_option(a) for a in args):
             return False
         if verb == "find" and FIND_ACTIONS & set(args):
             return False
@@ -835,6 +855,39 @@ def _names_only_shape(command: str) -> bool:
             continue
         return False
     return True
+
+
+def _redirects_to_a_file(command: str) -> bool:
+    """Any redirect other than to /dev/null or a descriptor. Unknown is True.
+
+    Read from the repository parser's per-segment targets, and refused without
+    resolving the target: a names-only command writes no file at all.
+    """
+    try:
+        from shell_parse import analyze_policy
+
+        segments, blind = analyze_policy(command)
+    except Exception:  # noqa: BLE001 - unreadable is not names-only
+        return True
+    if blind:
+        return True
+    for seg in segments:
+        for op, target in seg.targets:
+            word = (target or "").strip("\"'")
+            if word in SINKS or (op.endswith("&") and (word.isdigit() or word == "-")):
+                continue
+            return True
+    return False
+
+
+def _brace_makes_an_option(arg: str) -> bool:
+    """A brace expansion with an alternative that is an option: ``{,}-delete``."""
+    if "{" not in arg:
+        return False
+    alternatives = _braces(arg)
+    if len(alternatives) >= EXPANSION_LIMIT or arg.startswith("{-"):
+        return True  # too many to judge, or an option before any expansion
+    return any(alt.startswith("-") for alt in alternatives)
 
 
 def _opens_something(verb: str, arg: str) -> bool:

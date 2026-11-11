@@ -357,6 +357,18 @@ def _exposures(home: Path) -> list[dict]:
         (f"cd {GH} && du -sh *", "listing"),
         (f"cd {GH}/holdout && ls -la && pwd", "listing"),
         (f"du -sh {GH}/* | LC_ALL=C sort -h", "listing"),
+        (f"du -sh {GH}/* 2>/dev/null | sort -h", "listing"),
+        (f"ls -d {GH}/holdout 2>&1", "listing"),
+        (f"ls -d {GH}/holdout &>/dev/null; echo {GH}/holdout", "listing"),
+        (f'ls -d {GH}/holdout 2>"/dev/null"', "listing"),
+        (f"ls -d {GH}/holdout 2>&-", "listing"),
+        (f"/bin/ls -d {GH}/holdout", "listing"),
+        (f"/usr/bin/du -sh {GH}/*", "listing"),
+        (f'"/bin/ls" -d {GH}/holdout', "listing"),
+        (f"ls -d {GH}/holdout >/dev/stderr; echo {GH}/holdout", "listing"),
+        (f"ls -d {GH}/{{logs,holdout,config}}", "listing"),
+        (f"ls -d {GH}/holdout; printf '%s,-%s\\n' a b", "listing"),
+        (f"find {GH} -maxdepth 1 -printf '%p -> %l\\n'", "broad"),
         ('echo "$GENESIS_HOME/holdout"', "mention"),
         ("echo ${GENESIS_HOME}/holdout; ls -d $HOME/.genesis/holdout", "listing"),
         (f"du -sh --exclude='*.pyc' {GH}/*", "listing"),
@@ -436,6 +448,27 @@ def test_a_path_printed_by_a_names_only_command_is_activity(home, command, kind)
         f"cd {GH}/holdout; du --files0=HOLDOUT.md; ls -d {GH}/holdout",
         f"ls -d {GH}/holdout; ls --hide=/x {GH}",
         f"PATH=/tmp/x ls -d {GH}/holdout",
+        # A redirect to a file, wherever it points: its target cannot be resolved.
+        f"cd {GH}/holdout; printf 'new' > HOLDOUT.md; ls -d {GH}/holdout",
+        f"cd {GH} && echo x >> holdout/HOLDOUT.md && find {GH} -maxdepth 1 -type d",
+        f"ls -d {GH}/holdout; echo x > link/HOLDOUT.md",
+        f"ls -d {GH}/holdout; echo x >& out.txt",
+        f"ls -d {GH}/holdout; echo a#b > out.txt",
+        f"ls -d {GH}/holdout >| out.txt; ls -d {GH}/holdout",
+        f"du -sh {GH}/* | sort -h > sizes.txt; ls -d {GH}/holdout",
+        f"ls -d {GH}/holdout 2> errors.txt",
+        # An option or a path that only an expansion or a brace produces.
+        f"find {GH}/holdout {{-mindepth,1,-delete}}",
+        f"du {{-s,-X,HOLDOUT.md}} {GH}/holdout",
+        f"ls -d {GH}/holdout; find {GH}/holdout -mindepth 1 {{,}}-delete",
+        f"cd {GH}/holdout; du -s {{,}}--exclude-from=HOLDOUT.md .; ls -d {GH}/holdout",
+        f"ls -d {GH}/holdout; find {GH}/holdout -maxdepth 0 {{,}}''-delete",
+        f"ls -d {GH}/holdout; echo -delete; find {GH}/holdout -mindepth 1 $_",
+        f"echo $USER; du -sh {GH}/*",
+        f"ls -d {GH}/holdout; ls -d $PWD",
+        # A command given by a path outside the system directories.
+        f"./du; ls -d {GH}/holdout",
+        f"/tmp/x/ls -d {GH}/holdout",
         # An expansion that evaluates text: only a plain $NAME or ${NAME} is allowed.
         f"printf -v X '%b' '\\x24(head -5 f)'; echo {GH}/holdout \"${{X@P}}\"",
         f"echo {GH}/holdout $[b]",
@@ -559,6 +592,17 @@ def test_real_listings_are_activity(home, command):
 )
 def test_real_reads_that_print_the_path_are_content(home, command):
     out, _ = _real(home, command)
+    assert "HOLDOUT FENCE" in _note(out)
+    assert [r["kind"] for r in _exposures(home)] == ["content"]
+
+
+def test_a_real_write_through_a_relative_redirect_is_content(home):
+    """The file is overwritten and only its directory's path is printed."""
+    scenario = home / ".genesis" / "holdout" / "HOLDOUT.md"
+    out, _ = _real(
+        home, "cd ~/.genesis/holdout; printf 'new\\n' > HOLDOUT.md; ls -d ~/.genesis/holdout"
+    )
+    assert scenario.read_text() == "new\n"
     assert "HOLDOUT FENCE" in _note(out)
     assert [r["kind"] for r in _exposures(home)] == ["content"]
 
