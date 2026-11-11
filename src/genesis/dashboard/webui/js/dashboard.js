@@ -253,6 +253,10 @@
         // that arrives after a hide (or a newer reveal) is discarded.
         revealTokens: {},
         _revealSeq: 0,
+        // The latest detail request: a response that arrives after the detail
+        // view closed (or after another reference was opened) is discarded.
+        _detailSeq: 0,
+        _detailId: null,
         // Why a reveal failed (the server's own message, e.g. a missing value).
         revealErrors: {},
 
@@ -1896,12 +1900,22 @@
         },
         async viewReferenceDetail(id) {
           // Opening another reference forgets what the open one revealed.
-          const prev = this.referenceDetail && this.referenceDetail.id;
+          const prev = this._detailId ?? (this.referenceDetail && this.referenceDetail.id);
           if (prev && prev !== id) { this.hideReference(prev); }
+          const seq = ++this._detailSeq;
+          this._detailId = id;
           try {
             const resp = await fetchApi(`/api/genesis/references/${id}`);
-            if (resp && resp.ok) { this.referenceDetail = (await resp.json()).reference; }
+            if (seq !== this._detailSeq) return;  // closed or superseded meanwhile
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              if (seq !== this._detailSeq) return;
+              this.referenceDetail = data.reference;
+              return;
+            }
           } catch (e) { console.warn("Reference detail failed:", e); }
+          // A failed load leaves the shown reference (if any) as the open one.
+          if (seq === this._detailSeq) this._detailId = this.referenceDetail ? this.referenceDetail.id : null;
         },
         async revealReference(id) {
           const token = ++this._revealSeq;
@@ -1935,6 +1949,9 @@
         },
         closeReferenceDetail() {
           if (this.referenceDetail) this.hideReference(this.referenceDetail.id);
+          if (this._detailId) this.hideReference(this._detailId);
+          this._detailSeq++;
+          this._detailId = null;
           this.referenceDetail = null;
         },
         async copyReferenceValue(id) {
@@ -1952,6 +1969,8 @@
           this.hideReference(id);
           try {
             await fetchApi(`/api/genesis/references/${id}`, { method: "DELETE" });
+            this._detailSeq++;
+            this._detailId = null;
             this.referenceDetail = null;
             this.hideReference(id);
             this.referenceSearchResults = this.referenceSearchResults.filter(r => r.id !== id);
