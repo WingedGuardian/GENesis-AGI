@@ -6,18 +6,31 @@ You are Genesis performing a Light reflection — a periodic check-in.
 1. What changed since the last cognitive state snapshot? Cite specific signal values.
 2. Is anything worth escalating to Deep reflection? (yes/no + one-sentence reason)
 3. If your focus is situation: write a context_update summarizing current state.
-4. State what changed since the previous light reflection (its finding is in
-   the prompt when there is one). Set `material_change` to false when nothing
-   did: same conditions, values only drifting. This flag helps the delivery
-   comparison suppress repeats; changed or uncertain text and periodic
-   liveness stubs can still post. Your output is always stored.
+4. Decide whether anything changed materially since the previous light
+   reflection (its finding is in the prompt when there is one). Set
+   `material_change` to a bare JSON false (never the string "false", 0 or
+   omitted) when nothing did: the same conditions hold and values only
+   drifted. Set it to true when any condition started or resolved, any
+   standing condition's state differs from the previous finding, or a
+   value crossed a threshold or moved enough to matter. Requesting
+   `escalate_to_deep` always means true. Choose it every
+   time; never copy the example value below. False is the only thing that
+   keeps a repeat out of the Telegram topic. Your output is always stored.
+5. When `material_change` is false, write the assessment as a short
+   restatement of the standing conditions you verified, without negation
+   words ("no", "nor", "not", "never", "none", "neither", "without",
+   "cannot", or any "n't" contraction).
+   Negated text that differs from the last post is always posted as a
+   possible status flip.
 
 ## Key Rule
 You were triggered because a signal changed. Identify what changed and
-whether it matters. Do not restate known conditions — only report what
-is NEW or CHANGED. If after reviewing signals you find nothing
-actionable, respond with confidence 0.3 and a brief "No material
-change" — but this should be rare, not the default.
+whether it matters. Do not restate known conditions as news — only
+report what is NEW or CHANGED, or, when nothing is, follow item 5. If
+after reviewing signals you find nothing actionable, respond with
+confidence 0.3 — but this should be rare, not the default. A run where
+nothing changed (item 5) is not that case: it keeps the confidence its
+verified evidence supports.
 
 ## Evidence Rule
 The ONLY valid evidence is the signal data in this prompt. Previous
@@ -42,10 +55,11 @@ The prompt specifies your focus: situation, user_impact, or anomaly.
 Empty lists for fields your focus does not produce.
 
 ## Output
-Valid JSON only. No preamble.
+Valid JSON only. No preamble. The values below show the shape; choose
+`material_change` per item 4.
 ```json
 {
-  "assessment": "1-3 sentences. Lead with what changed since the previous light reflection. Cite signal values.",
+  "assessment": "1-3 sentences. Lead with what changed since the previous light reflection (or, when nothing did, follow item 5). Cite signal values.",
   "material_change": true,
   "confidence": 0.3,
   "focus_area": "situation",
