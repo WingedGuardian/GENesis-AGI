@@ -447,6 +447,7 @@ def _covered(path, head, **kw):
     kw.setdefault("round_number", 1)
     kw.setdefault("gate_lane", False)
     kw.setdefault("prior_heads", [])
+    kw.setdefault("key_rounds", {})
     kw.setdefault("acceptance", None)
     kw.setdefault("round_started", T0 - timedelta(days=3650))
     return rr.covered_keys(str(path), head, **kw)
@@ -730,6 +731,7 @@ def _smuggled_is_a_fix(path: Path, tmp_path: Path, head: str, cwd: Path | None =
         round_number=1,
         gate_lane=False,
         prior_heads=[],
+        key_rounds={},
         acceptance=None,
         round_started=T0 - timedelta(days=3650),
         reviewed_at={"c1": _at(0), "c2": _at(0)},
@@ -1118,7 +1120,7 @@ def test_a_stray_reflection_cannot_stand_in_for_the_previous_round(repo, tmp_pat
     second = _git(path, "rev-parse", "HEAD").strip()
     decoy = _reflection(head="0" * 40, classes=("decoy class = 1",))
     _commit_reflection(path, tmp_path, decoy)
-    assert rr.previous_class_labels(str(path), [first]) == ["unchecked subprocess result"]
+    assert _labels(path, [first]) == ["unchecked subprocess result"]
     owed = _round_two(tmp_path)
     sound = "SOUND-BUT-INFERIOR"
     repeat = _reflection(head=second, premise=sound, decision="fix-instances", extra=owed)
@@ -1138,7 +1140,180 @@ def test_a_class_from_any_earlier_round_recurs(repo, tmp_path):
     _fix(path, "two\n")
     second = _git(path, "rev-parse", "HEAD").strip()
     _commit_reflection(path, tmp_path, _reflection(head=second, classes=("beta = 1",)))
-    assert sorted(rr.previous_class_labels(str(path), [first, second])) == ["alpha", "beta"]
+    assert sorted(_labels(path, [first, second])) == ["alpha", "beta"]
+
+
+def _labels(path, prior_heads):
+    return rr._class_labels(rr._log_reflections(str(path)), prior_heads)
+
+
+def _repeat_at(path, tmp_path, second, decision):
+    owed = _round_two(tmp_path)
+    text = _reflection(
+        keys=("c4",), head=second, premise="SOUND-BUT-INFERIOR", decision=decision, extra=owed
+    )
+    _commit_reflection(path, tmp_path, text)
+
+
+def test_an_answer_at_a_fix_head_counts_for_its_keys_round(repo, tmp_path):
+    """#4310, main's late-key path: a late finding c3 on round head H, answered
+    after the fix F moved the tip, so the answer names F, no round head. It
+    belongs to H by its key, so round 2 repeating its class with
+    fix-instances is refused (it was dropped from round 2's history)."""
+    path, first = repo
+    _fix(path, "fix\n")
+    fixed = _git(path, "rev-parse", "HEAD").strip()
+    _commit_reflection(path, tmp_path, _reflection(keys=("c3",), head=fixed))
+    _fix(path, "two\n")
+    second = _git(path, "rev-parse", "HEAD").strip()
+    owners = {"c3": frozenset({first}), "c4": frozenset({second})}
+    kw = dict(round_number=2, prior_heads=[first], key_rounds=owners)
+    _repeat_at(path, tmp_path, second, "fix-instances")
+    assert _covered(path, second, **kw) == set()
+    _repeat_at(path, tmp_path, second, "close-class")
+    assert _covered(path, second, **kw) == {"c4"}
+
+
+def test_an_answer_at_a_head_that_later_opens_a_round_stays_its_keys_round(repo, tmp_path):
+    """Pre-PR audit SF1: the late answer at F names F, and F's own review then
+    makes F round 2's head. The answer still answers H's key c3, so it is
+    round 1's history, and round 2 repeating its class with fix-instances is
+    refused."""
+    path, first = repo
+    _fix(path, "fix\n")
+    fixed = _git(path, "rev-parse", "HEAD").strip()
+    _commit_reflection(path, tmp_path, _reflection(keys=("c3",), head=fixed))
+    owners = {"c3": frozenset({first}), "c4": frozenset({fixed})}
+    kw = dict(round_number=2, prior_heads=[first], key_rounds=owners)
+    _repeat_at(path, tmp_path, fixed, "fix-instances")
+    assert _covered(path, fixed, **kw) == set()
+    _repeat_at(path, tmp_path, fixed, "close-class")
+    assert _covered(path, fixed, **kw) == {"c4"}
+
+
+def test_an_answer_at_a_merge_of_main_counts_for_the_held_round(repo, tmp_path):
+    """#4310, the held-round path: H's only answer names the merge of main M,
+    which is no round head. Its key c1 is H's, so its class is earlier
+    history for the round after the fix."""
+    path, first = repo
+    _git(path, "checkout", "-q", "main")
+    (path / "g.txt").write_text("main\n")
+    _git(path, "add", "g.txt")
+    _git(path, "commit", "-q", "-m", "main moves")
+    _git(path, "checkout", "-q", "feat/x")
+    _git(path, "merge", "-q", "--no-ff", "--no-edit", "main")
+    merged = _git(path, "rev-parse", "HEAD").strip()
+    _commit_reflection(path, tmp_path, _reflection(keys=("c1",), head=merged))
+    _fix(path, "two\n")
+    second = _git(path, "rev-parse", "HEAD").strip()
+    owners = {"c1": frozenset({first}), "c4": frozenset({second})}
+    _repeat_at(path, tmp_path, second, "fix-instances")
+    assert _covered(path, second, round_number=2, prior_heads=[first], key_rounds=owners) == set()
+
+
+def test_a_reflection_made_after_the_answer_is_not_its_history(repo, tmp_path):
+    """The ancestor filter now on this path too: an answer for round 1 made
+    AFTER round 2's answer is not that answer's history, so it cannot turn a
+    credited fix-instances answer into a recurrence. On the old path it did,
+    so owed can go down on an open PR; that relaxation is intended (#4133)."""
+    path, first = repo
+    _fix(path, "two\n")
+    second = _git(path, "rev-parse", "HEAD").strip()
+    _repeat_at(path, tmp_path, second, "fix-instances")
+    owners = {"c4": frozenset({second})}
+    kw = dict(round_number=2, prior_heads=[first], key_rounds=owners)
+    assert _covered(path, second, **kw) == {"c4"}
+    _commit_reflection(path, tmp_path, _reflection(head=first))
+    assert _covered(path, second, **kw) == {"c4"}
+
+
+def test_an_answer_owning_current_keys_is_not_earlier_history(repo, tmp_path):
+    """Control: a reflection naming no round head belongs to the NEWEST round
+    its keys own. With one key of round 1 and one of round 2 it is round 2's,
+    the round judged, so its class is never earlier history."""
+    path, first = repo
+    _fix(path, "two\n")
+    second = _git(path, "rev-parse", "HEAD").strip()
+    _commit_reflection(path, tmp_path, _reflection(keys=("c3", "c4"), head="0" * 40))
+    owners = {"c3": frozenset({first}), "c4": frozenset({second})}
+    _repeat_at(path, tmp_path, second, "fix-instances")
+    assert _covered(path, second, round_number=2, prior_heads=[first], key_rounds=owners) == {"c4"}
+
+
+def test_owed_from_budget_reads_the_keys_rounds_from_the_budget(repo, tmp_path):
+    """End to end on the open path: the round 1 answer at the fix F names no
+    round head; the budget's round 1 review owns its key c3, so round 2's
+    fix-instances repeat answers nothing and c4 stays owed."""
+    path, first = repo
+    _fix(path, "fix\n")
+    fixed = _git(path, "rev-parse", "HEAD").strip()
+    _commit_reflection(path, tmp_path, _reflection(keys=("c3",), head=fixed))
+    _fix(path, "two\n")
+    second = _git(path, "rev-parse", "HEAD").strip()
+    rounds = [
+        {"head": first, "reviews": [{"submitted_at": T0.isoformat(), "finding_keys": ["c3"]}]},
+        {
+            "head": second,
+            "reviews": [
+                {
+                    "submitted_at": (T0 + timedelta(minutes=5)).isoformat(),
+                    "finding_keys": ["c4"],
+                }
+            ],
+        },
+    ]
+    budget = _budget(current_head=second, count=2, open_keys=["c4"], rounds=rounds, body="")
+
+    def owed():
+        later = T0 + timedelta(hours=1)
+        return rr.owed_from_budget(str(path), budget, "o/r", 7, now=later, cutover=None)["owed"]
+
+    _repeat_at(path, tmp_path, second, "fix-instances")
+    assert owed() == ["c4"]
+    _repeat_at(path, tmp_path, second, "close-class")
+    assert owed() == []
+
+
+def test_class_history_never_counts_the_judged_reflection(repo, tmp_path):
+    """Audit note 3: a reflection owning an earlier round's key is history for
+    every later one, but never for itself."""
+    path, first = repo
+    sha = _commit_reflection(path, tmp_path, _reflection(keys=("c3",), head="0" * 40))
+    log, owners = rr._log_reflections(str(path)), {"c3": frozenset({first})}
+    kw = dict(owners=owners, cwd=str(path))
+    assert rr._class_labels(log, [first], **kw) == ["unchecked subprocess result"]
+    assert rr._class_labels(log, [first], judged=sha, **kw) == []
+    with pytest.raises(ValueError):
+        rr._class_labels(log, [first], owners=owners, judged=sha)
+
+
+def test_class_history_probes_only_rows_sharing_a_judged_class(repo, tmp_path, monkeypatch):
+    """Audit SF2: the recurring rule reads only the overlap with the judged
+    reflection's classes, so a row sharing none is skipped without a git probe."""
+    path, first = repo
+    _commit_reflection(path, tmp_path, _reflection(head=first, classes=("alpha = 1",)))
+    _commit_reflection(path, tmp_path, _reflection(head=first, classes=("beta = 1",)))
+    judged = _commit_reflection(path, tmp_path, _reflection(head=first, classes=("beta = 1",)))
+    probes = []
+    real = rr._is_ancestor
+    monkeypatch.setattr(rr, "_is_ancestor", lambda *a: probes.append(a) or real(*a))
+    log = rr._log_reflections(str(path))
+    got = rr._class_labels(log, [first], judged=judged, cwd=str(path), relevant=["beta"])
+    assert got == ["beta"] and len(probes) == 1
+
+
+def test_key_rounds_reads_round_reviews_and_joined_findings():
+    budget = {
+        "rounds": [{"head": "a" * 40, "reviews": [{"finding_keys": ["c1", 7]}]}],
+        "findings": [
+            {"keys": ["c2"], "round_head": "b" * 40},
+            {"keys": ["c3"], "round_head": None},
+        ],
+    }
+    assert rr.key_rounds(budget) == {
+        "c1": frozenset({"a" * 40}),
+        "c2": frozenset({"b" * 40}),
+    }
 
 
 def test_an_invalid_or_content_reflection_adds_no_previous_class(repo, tmp_path):
@@ -1150,7 +1325,7 @@ def test_an_invalid_or_content_reflection_adds_no_previous_class(repo, tmp_path)
     _commit_reflection(path, tmp_path, draft)
     content = _reflection(head=first, classes=("loaded = 1",))
     _commit_reflection(path, tmp_path, content, empty=False)
-    assert rr.previous_class_labels(str(path), [first]) == []
+    assert _labels(path, [first]) == []
 
 
 def test_a_control_byte_in_the_prose_cannot_hide_an_escalation(repo, tmp_path):
@@ -1237,7 +1412,7 @@ def test_only_reflection_commits_count_toward_the_cap(repo, tmp_path, monkeypatc
     for n in range(5):
         _git(path, "commit", "-q", "--allow-empty", "-m", f"ordinary {n}")
     _commit_reflection(path, tmp_path, _reflection(head=head))
-    assert rr.previous_class_labels(str(path), [head]) == ["unchecked subprocess result"]
+    assert _labels(path, [head]) == ["unchecked subprocess result"]
 
 
 def test_git_replace_cannot_swap_out_a_fix(repo, tmp_path):
@@ -1267,7 +1442,7 @@ def test_the_previous_round_combines_every_reflection_on_its_head(repo, tmp_path
     _commit_reflection(path, tmp_path, one)
     _commit_reflection(path, tmp_path, two)
     _fix(path, "fix\n")
-    labels = rr.previous_class_labels(str(path), [first])
+    labels = _labels(path, [first])
     assert sorted(labels) == ["alpha", "beta"]
 
 
@@ -1280,10 +1455,10 @@ def test_previous_classes_come_only_from_the_named_earlier_heads(repo, tmp_path)
     _git(path, "checkout", "-q", "feat/x")
     _git(path, "rebase", "-q", "main")
     head = _git(path, "rev-parse", "HEAD").strip()
-    assert rr.previous_class_labels(str(path), [head]) == []
+    assert _labels(path, [head]) == []
     _commit_reflection(path, tmp_path, _reflection(head="b" * 40, classes=("old class = 1",)))
     _commit_reflection(path, tmp_path, _reflection(head=head, classes=("this round = 1",)))
-    assert rr.previous_class_labels(str(path), ["b" * 40]) == ["old class"]
+    assert _labels(path, ["b" * 40]) == ["old class"]
 
 
 def test_cited_audit_evidence_is_checked(repo, tmp_path):
@@ -2067,6 +2242,7 @@ def test_unreadable_git_is_refused_never_nothing_owed(tmp_path):
             round_number=1,
             gate_lane=False,
             prior_heads=[],
+            key_rounds={},
             acceptance=None,
             round_started=T0,
         )

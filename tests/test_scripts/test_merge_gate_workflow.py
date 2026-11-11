@@ -9,6 +9,8 @@ pin that shape, since a later edit restoring either half brings the duplicate ba
 
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 
 import yaml
@@ -64,3 +66,31 @@ def test_the_job_entry_stays_excluded_by_the_gate():
 
 def test_the_workflow_may_write_check_runs():
     assert _workflow()["permissions"]["checks"] == "write"
+
+
+_PUBLISHER = _WORKFLOW.with_name("merge-gate-publish.yml")
+
+
+def _handoff_events() -> set[str]:
+    run = _step("Publish the verdict on the PR head")["run"]
+    arms = re.findall(r"^\s*([a-z_|]+)\)\s*$", run, re.MULTILINE)
+    assert len(arms) == 1, f"expected one handoff case arm, found {arms}"
+    return set(arms[0].split("|"))
+
+
+def _publisher_events() -> set[str]:
+    cond = yaml.safe_load(_PUBLISHER.read_text())["jobs"]["publish"]["if"]
+    lists = re.findall(r"fromJSON\('(\[.*?\])'\)", cond)
+    assert len(lists) == 1, f"expected one fromJSON event list in the if:, found {lists}"
+    return set(json.loads(lists[0]))
+
+
+def test_the_publisher_starts_for_every_handoff_event():
+    """merge-gate-publish skips every run whose event is not in its `if:` list
+    (#4261), so an event added to the handoff `case` alone would never publish."""
+    assert _handoff_events() == _publisher_events()
+    assert _handoff_events() == {
+        "pull_request",
+        "pull_request_review",
+        "pull_request_review_comment",
+    }

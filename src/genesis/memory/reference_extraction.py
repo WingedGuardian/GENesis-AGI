@@ -517,6 +517,10 @@ def _format_reference_body(
     formatter so content extracted automatically has the same shape as
     content stored manually.
     """
+    if kind == "credentials":
+        from genesis.memory.reference_ops import refuse_trailer_shaped_value
+
+        refuse_trailer_shaped_value(value)
     lines = [
         f"[reference.{kind}] {identifier}",
         "",

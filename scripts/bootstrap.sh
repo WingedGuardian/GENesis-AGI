@@ -1723,10 +1723,12 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
                 echo "           the engine will not start until bootstrap verifies the graph engine."
             elif [[ "${FALKORDB_KEEP_REASON:-}" == "active" ]]; then
                 echo "  Kept: $svc_name (the running graph engine stays on its current module;"
-                echo "        switch with GENESIS_FALKORDB_SWITCH=1 scripts/bootstrap.sh, then restart the unit)"
+                echo "        switch with GENESIS_FALKORDB_SWITCH=1 scripts/update.sh --take-template $svc_name,"
+                echo "        then systemctl --user restart genesis-falkordb)"
             elif [[ "${FALKORDB_KEEP_REASON:-}" == "state_unknown" ]]; then
                 echo "  Kept: $svc_name (could not ask the user manager whether the graph engine is running,"
-                echo "        so it is not moved onto new binaries; switch with GENESIS_FALKORDB_SWITCH=1 scripts/bootstrap.sh)"
+                echo "        so it is not moved onto new binaries; switch with"
+                echo "        GENESIS_FALKORDB_SWITCH=1 scripts/update.sh --take-template $svc_name)"
             else
                 echo "  Kept: $svc_name (graph engine not verified this run; unit not re-rendered)"
             fi
@@ -1764,6 +1766,25 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         _redis_cli_esc=$(_sed_repl_esc "$(_falkordb_redis_cli_bin 2>/dev/null || true)")
         _falkordb_mod_esc=$(_sed_repl_esc "$(_falkordb_module_path 2>/dev/null || true)")
         _falkordb_digests_esc=$(_sed_repl_esc "$(_falkordb_digests_path 2>/dev/null || true)")
+        # Resolved again here, not reused from $SECRETS_FILE above, so a step that
+        # moved the file earlier in this run renders the unit to where it now is.
+        # `%` doubled: systemd expands specifiers in EnvironmentFile=, so a bare `%`
+        # would make the unit load a different file than the resolver picked.
+        # Its own assignment, so set -e stops the render if it fails (inside the
+        # escape below the failure would be masked and render `EnvironmentFile=-`).
+        # SECRETS_PATH is not followed here: the unit gets the resolver's own file. A
+        # shell value never reaches the server, and a user-manager value cannot be
+        # rendered faithfully (systemd shell-quotes it, and a relative path is not a
+        # valid EnvironmentFile), so either one is named in a warning instead.
+        _secrets_file=$(SECRETS_PATH= genesis_secrets_path "$GENESIS_ROOT")
+        if [[ -n "$(printenv SECRETS_PATH || true)" ]] || { systemctl --user show-environment 2>/dev/null || true; } | grep '^SECRETS_PATH=' >/dev/null; then
+            echo "  WARNING: SECRETS_PATH is set, but the units load $_secrets_file; the server may load another file" >&2
+        fi
+        if [[ -z "$_secrets_file" ]]; then
+            echo "ERROR: could not resolve the secrets file for the unit render" >&2
+            exit 1
+        fi
+        _secrets_file_esc=$(_sed_repl_esc "$(printf '%s' "$_secrets_file" | sed -e 's/%/%%/g')")
         sed -e "s|__HOME__|$_home_esc|g" \
             -e "s|__HOME_EXEC__|$_home_exec_esc|g" \
             -e "s|__REPO_EXEC__|$_repo_exec_esc|g" \
@@ -1777,6 +1798,7 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
             -e "s|__REDIS_CLI__|$_redis_cli_esc|g" \
             -e "s|__FALKORDB_MODULE__|$_falkordb_mod_esc|g" \
             -e "s|__FALKORDB_DIGESTS__|$_falkordb_digests_esc|g" \
+            -e "s|__SECRETS_FILE__|$_secrets_file_esc|g" \
             "$template" > "$_mu_render"
         # Written only when the installed unit is Genesis's own render; a unit
         # edited by hand is kept and named (lib/managed_units.sh).
@@ -1797,6 +1819,14 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     # After daemon-reload, so systemd already reads the unit this decided from.
     if declare -F falkordb_prune_engines >/dev/null; then
         falkordb_prune_engines "$SYSTEMD_USER_DIR/genesis-falkordb.service"
+    fi
+    # Arm the graph engine verified this run: enable it, and start it when it
+    # is not running; a running engine is never restarted, an operator opt-out
+    # or a masked unit is left alone, and a failed start is a WARNING
+    # (lib/falkordb_install.sh, falkordb_enable_unit). After daemon-reload, like
+    # the timer enables below.
+    if declare -F falkordb_enable_unit >/dev/null; then
+        falkordb_enable_unit "$SYSTEMD_USER_DIR/genesis-falkordb.service"
     fi
 
     # A user manager stops at logout without lingering, taking every enabled

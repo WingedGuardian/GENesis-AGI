@@ -28,6 +28,16 @@ A minimal skill for now; its process is designed later. Also read:
   candidate;
 - `build-session`'s "Generalizability Gate" before a spec names where code runs.
 
+**Intent scenarios, when the install keeps a holdout.** If
+`.venv/bin/python scripts/holdout_runner.py --has-holdout` (from the main
+checkout) prints `holdout: present`, then once the issue's intent is final and before it goes to a builder, spawn the
+`holdout-writer` subagent IN THE FOREGROUND with the issue number and "intent".
+It adds scenarios that fail on the default branch until the change lands, and
+reports only their ids and `Protects` lines. Keep the scenarios out of the issue
+and the spec, and put this line in the issue: "The PR that finishes this issue
+must say `Closes #N`; if the work is split, earlier PRs say `Part of #N`." An
+intent scenario is judged only against a PR that closes its issue. `docs/reference/holdout.md` has the rules.
+
 ### Plan documents carry a structured header
 
 A plan doc that outlives one session (`~/.claude/plans/<name>.md`) opens with

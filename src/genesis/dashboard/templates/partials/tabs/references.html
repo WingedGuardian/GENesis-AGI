@@ -70,13 +70,14 @@
                     </button>
                   </div>
                 </div>
-                <div style="font-size: .85em; color: var(--color-text-secondary); margin-top: .25rem;" x-text="ref.description"></div>
+                <div style="font-size: .85em; color: var(--color-text-secondary); margin-top: .25rem;" x-text="$store.genesisDashboard.revealedDescriptions[ref.id] ?? ref.description"></div>
                 <template x-if="$store.genesisDashboard.revealedValues[ref.id] !== undefined">
                   <div style="display:flex; align-items:center; gap:.5rem; margin-top:.4rem; background:var(--color-panel); border-radius:4px; padding:.4rem .6rem;">
                     <code style="flex:1; word-break:break-all; font-size:.85em;" x-text="$store.genesisDashboard.revealedValues[ref.id] || '(no value found)'"></code>
                     <button class="btn-sm" style="padding:.15rem .4rem;" @click="$store.genesisDashboard.copyReferenceValue(ref.id)">copy</button>
                   </div>
                 </template>
+                <div x-show="$store.genesisDashboard.revealErrors[ref.id]" style="font-size:.85em; color:var(--color-error-text); margin-top:.4rem;" x-text="$store.genesisDashboard.revealErrors[ref.id]"></div>
               </div>
             </template>
           </div>
@@ -109,13 +110,14 @@
                     </button>
                   </div>
                 </div>
-                <div style="font-size: .85em; color: var(--color-text-secondary); margin-top: .25rem;" x-text="ref.description"></div>
+                <div style="font-size: .85em; color: var(--color-text-secondary); margin-top: .25rem;" x-text="$store.genesisDashboard.revealedDescriptions[ref.id] ?? ref.description"></div>
                 <template x-if="$store.genesisDashboard.revealedValues[ref.id] !== undefined">
                   <div style="display:flex; align-items:center; gap:.5rem; margin-top:.4rem; background:var(--color-panel); border-radius:4px; padding:.4rem .6rem;">
                     <code style="flex:1; word-break:break-all; font-size:.85em;" x-text="$store.genesisDashboard.revealedValues[ref.id] || '(no value found)'"></code>
                     <button class="btn-sm" style="padding:.15rem .4rem;" @click="$store.genesisDashboard.copyReferenceValue(ref.id)">copy</button>
                   </div>
                 </template>
+                <div x-show="$store.genesisDashboard.revealErrors[ref.id]" style="font-size:.85em; color:var(--color-error-text); margin-top:.4rem;" x-text="$store.genesisDashboard.revealErrors[ref.id]"></div>
               </div>
             </template>
           </div>
@@ -125,7 +127,7 @@
       <!-- Detail Modal -->
       <template x-if="$store.genesisDashboard.referenceDetail">
         <div style="position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100; display: flex; align-items: center; justify-content: center;"
-             @click.self="$store.genesisDashboard.referenceDetail = null">
+             @click.self="$store.genesisDashboard.closeReferenceDetail()">
           <div style="background: var(--color-panel); border: 1px solid var(--color-border); border-radius: 8px; padding: 1.5rem; max-width: 640px; width: 90%; max-height: 80vh; overflow-y: auto;">
             <h3 x-text="$store.genesisDashboard.referenceDetail.concept"></h3>
             <div style="margin: .75rem 0; font-size: .9em; color: var(--color-text-secondary);">
@@ -134,7 +136,7 @@
               <span x-text="'Confidence: ' + ($store.genesisDashboard.referenceDetail.confidence ?? '—')"></span> |
               <span x-text="$store.genesisDashboard.referenceDetail.ingested_at?.substring(0,10)"></span>
             </div>
-            <div style="margin-bottom: .75rem;" x-text="$store.genesisDashboard.referenceDetail.description"></div>
+            <div style="margin-bottom: .75rem;" x-text="$store.genesisDashboard.revealedDescriptions[$store.genesisDashboard.referenceDetail.id] ?? $store.genesisDashboard.referenceDetail.description"></div>
             <!-- Reveal value -->
             <div style="margin: .75rem 0;">
               <template x-if="$store.genesisDashboard.revealedValues[$store.genesisDashboard.referenceDetail.id] === undefined">
@@ -149,10 +151,11 @@
                   <button class="btn-sm" style="padding:.15rem .4rem; opacity:.7;" @click="$store.genesisDashboard.hideReference($store.genesisDashboard.referenceDetail.id)">hide</button>
                 </div>
               </template>
+              <div x-show="$store.genesisDashboard.revealErrors[$store.genesisDashboard.referenceDetail.id]" style="color:var(--color-error-text); margin-top:.4rem;" x-text="$store.genesisDashboard.revealErrors[$store.genesisDashboard.referenceDetail.id]"></div>
             </div>
             <div style="display: flex; gap: .5rem; justify-content: space-between; margin-top: 1rem;">
               <button class="btn-sm btn-danger" @click="$store.genesisDashboard.deleteReference($store.genesisDashboard.referenceDetail.id)">Delete</button>
-              <button class="btn-sm" @click="$store.genesisDashboard.referenceDetail = null">Close</button>
+              <button class="btn-sm" @click="$store.genesisDashboard.closeReferenceDetail()">Close</button>
             </div>
           </div>
         </div>
