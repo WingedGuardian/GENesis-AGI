@@ -30,7 +30,8 @@ This snapshot makes that drift visible:
   read as undeployed merges
 - ``live_repairs`` — what the live-move repair (scripts/lib/live_move_repair.py)
   reported after healing a half-written `live` checkout: per report, how many
-  paths it saved that were not the update's; an unresolved repair
+  paths it saved that were not the update's; an unresolved repair; how many
+  finished rollbacks still owe their git hooks
 
 The awareness tick's ``_check_deploy_staleness`` consumes the same collectors
 to raise a dashboard/morning-report observation. Everything is best-effort:
@@ -1009,7 +1010,10 @@ def collect_live_repairs(
     (a symlinked dir, a REPAIR.json that is not a regular file within the byte
     cap, not a JSON object, over the row cap, or naming another checkout), or
     one that fails in any other way, counts in ``refused`` and is named once in
-    the server log; it never costs the other reports.
+    the server log; it never costs the other reports. A dir holding the repair's
+    DISMISS_MARK (--dismiss of a report no reader can read, #4331) is skipped:
+    it takes its read slot and counts in ``unread_older`` like a dismissed one,
+    and never counts as refused.
 
     ``reports`` (newest first): per report its ``ts``, ``backup_dir``,
     ``saved`` (its foreign rows: every dict row of class "foreign", no other
@@ -1024,11 +1028,22 @@ def collect_live_repairs(
     the guardian's pick, which shows the newest ELIGIBLE report), while the
     update state's guard still calls the checkout half-written (a repair
     killed after its restore leaves no result; only the tree says whether it
-    healed). The guard loads only then; nothing else runs in the checkout."""
+    healed). The guard loads only then. ``hooks_pending``: the read reports,
+    not dismissed, whose ``hooks`` is exactly "pending" (a forward repair that
+    has not put the git hooks back yet) and whose ``tag`` is where
+    ``refs/heads/live`` points, as the writer's retry judges it (`live` moved
+    on: superseded); one bounded rev-parse runs, only when such a report
+    exists, and doubt (a timeout, a git that fails) keeps the report's word.
+    ``hooks_saved`` (per report, and their count): not dismissed, and holding
+    hooks the repair replaced to reinstall the tag's (``hooks_before``, any
+    true value: the prune's keep rule), whose hooks-before/ may hold a hand
+    edit's only copy.
+    Nothing else runs in the checkout."""
     now = time.time() if now is None else now
     repo = str(repo_dir)
     backups = genesis_home_dir / "deploy-backups"
     out: dict = {"reports": [], "saved": 0, "refused": 0, "unread_older": 0, "unresolved": False}
+    out["hooks_pending"] = out["hooks_saved"] = 0
     try:
         names = [n for n in os.listdir(backups) if n.endswith(_REPAIR_SUFFIX)]
     except FileNotFoundError:
@@ -1046,6 +1061,7 @@ def collect_live_repairs(
         repair = _script(_REPAIR_SCRIPT)
         report_ts, load_report, bad = repair.report_ts, repair.load_report, repair.BadReport
         report_order, future_s = repair.report_order, repair.REPORT_FUTURE_S
+        marked = repair.dismiss_marked
     except Exception:  # noqa: BLE001 - unloadable: no report can be read
         logger.warning("live-move repair module could not be loaded", exc_info=True)
         out["refused"] = len(names)
@@ -1065,10 +1081,13 @@ def collect_live_repairs(
             out["refused"] += 1
     named.sort(reverse=True)
     out["unread_older"] = max(0, len(named) - REPAIR_REPORTS_READ)
+    pending_tags: list[object] = []
     for _, ts, name in named[:REPAIR_REPORTS_READ]:
         # One boundary per report: a fault no check foresaw costs that report,
         # never the rest of the snapshot.
         try:
+            if marked(str(backups / name)):
+                continue  # dismissed though no reader can read it (DISMISS_MARK)
             loaded = load_report(str(backups / name), repo)
             if loaded is None:
                 continue
@@ -1077,6 +1096,9 @@ def collect_live_repairs(
             stale = result == "unfinished" and now - loaded["mtime"] > REPAIR_UNFINISHED_S
             saved = sum(1 for r in loaded["rows"] if r.get("class") == "foreign")
             refused, cleared = _restore_counts(m.get("restore"))
+            if not dismissed and m.get("hooks") == "pending":
+                pending_tags.append(m.get("tag"))
+            hooks_saved = bool(m.get("hooks_before")) and not dismissed
         except Exception as exc:  # noqa: BLE001 - see the boundary comment above
             _refused(name, str(exc) if isinstance(exc, bad) else type(exc).__name__)
             out["refused"] += 1
@@ -1090,11 +1112,22 @@ def collect_live_repairs(
                 "result": result,
                 "dismissed": dismissed,
                 "unresolved": (result == "unresolved" or stale) and not dismissed,
+                "hooks_saved": hooks_saved,
             }
         )
+        out["hooks_saved"] += hooks_saved
         out["saved"] += 0 if dismissed or cleared else saved
     if out["reports"] and out["reports"][0]["unresolved"]:
         out["unresolved"] = _mixed(genesis_home_dir, repo)
+    if pending_tags:
+        rc, live, _ = _run_git(
+            Path(repo), "rev-parse", "--verify", "-q", f"{_LIVE_REF}^{{commit}}",
+            timeout=_CHEAP_TIMEOUT_S,
+        )  # fmt: skip
+        if rc == 0:
+            out["hooks_pending"] = sum(1 for t in pending_tags if t == live.strip())
+        elif rc != 1:  # 1: no `live` branch, so the writer supersedes them
+            out["hooks_pending"] = len(pending_tags)
     return out
 
 
@@ -1133,6 +1166,10 @@ def live_repair_findings(repairs: dict | None) -> list[str]:
         found.append(f"live_repair_unread_older:{repairs['unread_older']}")
     if repairs.get("unresolved"):
         found.append("live_repair_unresolved")
+    if repairs.get("hooks_pending"):
+        found.append(f"live_repair_hooks_pending:{repairs['hooks_pending']}")
+    if repairs.get("hooks_saved"):
+        found.append(f"live_repair_hooks_saved:{repairs['hooks_saved']}")
     if repairs.get("refused"):
         found.append(f"live_repair_refused:{repairs['refused']}")
     return found

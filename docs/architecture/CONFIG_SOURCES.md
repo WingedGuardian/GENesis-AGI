@@ -7,7 +7,7 @@ right and this page is stale.
 
 | Kind of setting | Lives in | Primary reader |
 |---|---|---|
-| API keys, tokens, env-style toggles | `secrets.env` (repo root) | process environment |
+| API keys, tokens, env-style toggles | resolved `secrets.env` (the checkout file; a home-config file is read first when present) | process environment |
 | Per-install identity (timezone, GitHub, local-inference URLs, a few flags) | `~/.genesis/config/genesis.yaml` | `genesis.env` helpers |
 | Subsystem policy (levers, modes, knobs) | `config/<name>.yaml` + a `<name>.local.yaml` overlay | per-domain config modules |
 | Peer mode, identities, grants, legacy allowance field and service URL | `genesis.db` peer tables | local `genesis peers` CLI / `genesis.peers.registry` |
@@ -21,7 +21,17 @@ right and this page is stale.
 
 ## 1. `secrets.env`
 
-Path: `genesis.env.secrets_path()` — `SECRETS_PATH` if set, else `<repo_root>/secrets.env`.
+Path: `genesis.env.secrets_path()` — nonempty `SECRETS_PATH` is exclusive;
+otherwise prefer an existing `~/.config/genesis/secrets.env`, then
+`<repo_root>/secrets.env`, then `~/genesis/secrets.env`. If none exists, the
+default is still `<repo_root>/secrets.env`: nothing creates the home-config
+file until the migration moves an install's file there, so no install holds two
+files the services would have to choose between. The systemd units load ONE
+file, the one `genesis_secrets_path` picks when bootstrap or install renders them
+(`EnvironmentFile=-__SECRETS_FILE__`, resolved with `SECRETS_PATH` unset; when the rendering shell or the systemd user manager sets `SECRETS_PATH`, bootstrap and install warn that the units do not follow it), so a home-config file created by hand is
+picked up by the units at the next bootstrap. The dashboard edits the file but
+never creates it (409, "run bootstrap"); only bootstrap, install and restore
+create it. Legacy fallback is permanent.
 `repo_root()` is `GENESIS_REPO_ROOT` or the checkout the imported `genesis` package
 lives in, never the CWD. Gitignored; seeded from `secrets.env.example`.
 
@@ -29,22 +39,27 @@ lives in, never the CWD. Gitignored; seeded from `secrets.env.example`.
 
 | Process | Mechanism | Inherited env vs file |
 |---|---|---|
-| `genesis-server` (systemd) | `EnvironmentFile=<repo>/secrets.env` in `scripts/systemd/genesis-server.service.template` **and** `load_dotenv(..., override=True)` in `src/genesis/runtime/init/secrets.py` during bootstrap (runs after the credential-integrity self-heal step, before DB init/migrations) | **file wins** |
-| `agent-zero` unit | `EnvironmentFile=` in its template | file (systemd) |
+| `genesis-server` (systemd) | `EnvironmentFile=-<the resolved file at render time>` in `scripts/systemd/genesis-server.service.template` (a missing file does not stop the unit, so the startup credential restore can run; if after bootstrap the file is missing, unreadable, or present but unloadable (Guardian's `validate_bytes`: empty, NUL bytes, not UTF-8, no key; or a byte-order mark or any line python-dotenv cannot parse), the server entrypoint exits 1 before serving, because the dashboard's password lives in this file and no password means auth disabled) **and** `load_dotenv(..., override=True)` in `src/genesis/runtime/init/secrets.py` during bootstrap (runs after the credential-integrity self-heal step, before DB init/migrations) | **file wins** |
+| `agent-zero` unit | the same rendered file, with no `-` (a missing file stops the unit), then `load_dotenv(secrets_path(), override=True)` in `az_plugins/genesis/extensions/agent_init/_10_initialize_genesis.py` | file wins |
 | `genesis-bridge` (legacy fallback) | no `EnvironmentFile=`; runtime `load_dotenv(override=True)` | file wins |
 | MCP children (`scripts/genesis_mcp_server.py`) | `main()` copies an **allowlist** (`_MCP_VARS`) and only for keys NOT already in the env; then the health/memory/outreach/recon lifespans call `create_standalone_router()`, whose builder runs `load_dotenv(override=True)` on the **whole** file (`src/genesis/routing/standalone.py`) | net effect: **file wins, whole file** (discord-bot: allowlist only) — EXCEPT values read at module import, before either load: the database path (`_DEFAULT_DB` via `genesis_db_path()`) is fixed then, so a `GENESIS_DB_PATH` that exists only in `secrets.env` never reaches the MCP servers of a foreground session (an MCP child of a server-dispatched session inherits it from the server's environment) |
 | Dispatched CC sessions | `CCInvoker._build_env` (`src/genesis/cc/invoker.py`) copies the server's `os.environ` | inherit the server's snapshot |
-| CC hooks (`proactive_memory_hook.py`, `genesis_session_context.py`, `genesis_urgent_alerts.py`) and `scripts/gmodel` | at import, before `genesis` is importable: `load_dotenv($SECRETS_PATH or <their own checkout>/secrets.env)`, default `override=False` | **inherited env wins** |
-| `eval` harnesses (`reflection_golden_set`, `longmemeval.client`) | `secrets_path()`, then `~/genesis/secrets.env` as a worktree fallback that is skipped when `SECRETS_PATH` is set; `os.environ.setdefault` | inherited env wins |
+| CC hooks (`proactive_memory_hook.py`, `genesis_session_context.py`, `genesis_urgent_alerts.py`) and `scripts/gmodel` | shared stdlib path resolver, then `load_dotenv(...)`, default `override=False` | **inherited env wins** |
+| `eval` harnesses (`reflection_golden_set`, `longmemeval.client`) | `secrets_path()` includes the worktree fallback; `os.environ.setdefault` | inherited env wins |
 | One-off scripts (`reindex_fts_to_qdrant`, `backfill_session_memories`, `migrate_reference_data`, `mine_references_from_history`, `eval` CLI) | `load_dotenv(override=True)` | file wins |
 | `wing_backfill`, `wing_payload_resync`, `ambient_replay` | `load_dotenv(...)`, default | inherited env wins |
 | Inbox sync (`scripts/inbox_sync.sh`, through `genesis.inbox.sync_config`) | `secrets_path()`, only `GENESIS_INBOX_PATH` and `GENESIS_HOME`, so `rclone` inherits no secrets | file wins, as for the server |
 | Shell (`backup.sh`, `restore.sh`) | `scripts/lib/load_secrets.sh` — literal, never expanded or executed | exported |
 | Guardian credential bridge (`credential_bridge.py`, awareness tick) | reads `secrets_path()` by name to propagate the Telegram, provisioning and backup credentials to the shared mount | not loaded into the env |
-| Credential-integrity check (`guardian/cred_integrity.py`, `cred_selfheal.py`) | `$HOME/genesis/secrets.env`, home-relative **by design** (the targets are shared with the host Guardian); isolate it with `HOME` / `--home`, not `SECRETS_PATH` | not loaded into the env |
-| `scripts/disk_hygiene.sh` store knobs (`_load_store_knob`) | the checkout's `secrets.env` by name; only the browser settings follow `SECRETS_PATH` | exported to that run |
+| Credential-integrity check (`guardian/cred_integrity.py`, `cred_selfheal.py`) | standalone stdlib copy of the same order under the target `--home`, defaulting to `$HOME/genesis/secrets.env` (or `GENESIS_REPO_ROOT`'s) as before; explicit `SECRETS_PATH` remains exclusive | not loaded into the env |
+| `scripts/disk_hygiene.sh` store knobs (`_load_store_knob`) | shared Bash path resolver, read by name | exported to that run |
 | `python -m genesis.db.migrations --apply` (update path) | does **not** load it (see `db/migrations/0086_seed_timezone_config.py` docstring) | — |
+
 | Host guardian | its own file: `GUARDIAN_SECRETS` (`src/genesis/guardian/config.py`) | separate |
+
+Guardian path overrides must be present in its target command's environment.
+The host check uses `su -` inside the container and does not automatically
+receive a server-only `SECRETS_PATH` or `GENESIS_REPO_ROOT` setting.
 
 ### When a change takes effect
 
@@ -211,6 +226,13 @@ names, so an overlay of a read-only file is editable (#2446).
 ---
 
 ## 4. Other sources
+
+- **Contained peer CLI environment** — `cc/peer_segment.py` filters inherited
+  values to provider identity and connectivity, including proxy/bypass and CA
+  paths. The invoker reapplies instruction, memory and attachment suppression
+  plus an absolute PATH outside the peer cwd after login fallback. GitHub
+  credential variables stay present and empty under the existing launch guard.
+  Fixed auth/version helpers use the same policy; no configuration file is changed.
 
 - **Process env only** (no file layer): paths — `GENESIS_REPO_ROOT`, `SECRETS_PATH`,
   `GENESIS_DB_PATH`, `GENESIS_HOME`, `VENV_PATH`, `CLAUDE_HOME`, `GENESIS_PLANS_DIR`,

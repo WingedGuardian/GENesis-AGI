@@ -40,7 +40,9 @@ from tests.test_scripts._live_repair_world import (
     _killed_mid_repair,
     _lock_aside,
     _retarget,
+    killed_rollback,
     killed_tag_side,
+    restore,
     tag_snapshot,
 )
 
@@ -102,6 +104,7 @@ def test_a_real_repair_is_reported_by_count_until_dismissed(w, make):
         "result": entry["result"],
         "dismissed": False,
         "unresolved": False,
+        "hooks_saved": False,
     }, entry
     assert entry["result"] in ("healed", "healed-kept"), entry
     assert (found["saved"], found["refused"], found["unread_older"]) == (foreign, 0, 0), found
@@ -110,6 +113,33 @@ def test_a_real_repair_is_reported_by_count_until_dismissed(w, make):
     found = _found(w)
     assert found["saved"] == 0 and found["reports"][0]["dismissed"] is True, found
     assert _dh().live_repair_findings(found) == []
+
+
+@pytest.mark.parametrize("damage", ["not-json", "other-checkout"])
+def test_dismissing_a_report_no_reader_can_read_clears_it(w, damage):
+    """#4331 review: an unreadable report, or one recorded for another checkout,
+    is kept by the deploy-backups prune and counted refused by deploy health,
+    so it needs a way out through Genesis. --dismiss TS writes DISMISSED.json
+    beside it (REPAIR.json is not edited); every reader then skips it."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _foreign_edit(w))
+    assert w.repair().returncode == 0
+    d = w.backups()[-1]
+    report = d / "REPAIR.json"
+    if damage == "not-json":
+        report.write_text("{not json")
+    else:
+        report.write_text(json.dumps({**json.loads(report.read_text()), "repo": "/elsewhere"}))
+    before = report.read_bytes()
+    assert _found(w)["refused"] == 1, "control: the report is refused"
+    _dismiss(w, d.name[: -len(SUFFIX)])
+    assert report.read_bytes() == before, "REPAIR.json itself is not edited"
+    mark = json.loads((d / "DISMISSED.json").read_text())
+    assert isinstance(mark["dismissed_at"], str) and mark["unread"], mark
+    found = _found(w)
+    assert (found["refused"], found["reports"]) == (0, []), found
+    assert _dh().live_repair_findings(found) == []
+    assert _guardian_pick(w.home) is None
 
 
 def _guardian_pick(home: Path) -> dict | None:
@@ -601,7 +631,7 @@ def test_an_unforeseen_failure_costs_only_that_report(tmp_path, monkeypatch):
     assert (found["refused"], found["saved"]) == (1, 1), found
 
 
-_REPAIR_API = ("report_ts", "report_order", "REPORT_FUTURE_S", "BadReport", "load_report")
+_REPAIR_API = ("report_ts", "report_order", "REPORT_FUTURE_S", "BadReport", "load_report", "dismiss_marked")
 
 
 @pytest.mark.parametrize("missing", _REPAIR_API)
@@ -1099,6 +1129,16 @@ def test_the_guardian_pick_shares_the_loaders_name_rule_and_caps(mod):
     assert gc._REPAIR_REPO_BYTES == mod.REPO_BYTES
     assert gc._REPAIR_FUTURE_S == mod.REPORT_FUTURE_S
     assert gc._REPAIR_READS == _dh().REPAIR_REPORTS_READ
+    assert gc._REPAIR_DISMISSED == mod.DISMISS_MARK
+    keep = importlib.util.spec_from_file_location("_keep", Path(mod.__file__).parent / "repair_report_keep.py")
+    kept = importlib.util.module_from_spec(keep)
+    keep.loader.exec_module(kept)
+    assert kept.DISMISS_MARK == mod.DISMISS_MARK
+    names = ["20260101T000000Z-42-live-move-repair", "20260101T000000Z-42-live-move-restore",
+             "20260101T000000Z-live-move-repair", "x20260101T000000Z-42-live-move-repair",
+             "20260101T000000Z-42-live-move-repair.bak", "2026010T000000Z-42-live-move-repair"]  # fmt: skip
+    for name in names:
+        assert bool(kept.REPORT_NAME.fullmatch(name)) == bool(mod.REPORT_NAME.fullmatch(name)), name
 
 
 @pytest.mark.parametrize("case", ["bad-name", "linked-dir", "nul-repo", "long-repo"])
@@ -1216,3 +1256,185 @@ def test_a_name_rule_that_raises_anything_is_a_refusal(tmp_path, monkeypatch):
     monkeypatch.setattr(dh, "_script", changed)
     found = dh.collect_live_repairs(tmp_path, tmp_path)
     assert found["refused"] == 1
+
+
+# ── D1f: the forward repair's reports ───────────────────────────────────────
+
+
+def _restore_parts(r: subprocess.CompletedProcess) -> dict[tuple[str, str], str]:
+    """(path, part) -> verdict from `--restore TS --check`'s per-part lines."""
+    out = {}
+    for line in r.stdout.splitlines():
+        if line.startswith('"'):
+            path, end = json.JSONDecoder().raw_decode(line)
+            part, verdict = line[end:].split()[:2]
+            out[(path, part)] = verdict
+    return out
+
+
+def test_d1f_a_forward_repairs_foreign_path_is_restorable(w):
+    """After the forward repair HEAD is the report's tag on `live`, the
+    restore's precondition: --restore TS --check reads its foreign part
+    as-left, the restore puts it back, and the reader's count then clears."""
+    killed_rollback(w, "P")
+    (w.root / "sub" / "s1").write_text("mine\n")  # the rollback had not reached it
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _git(w.root, "rev-parse", "HEAD") == w.tag == w.report()["tag"]
+    assert _git(w.root, "rev-parse", "live") == w.tag
+    ts = w.report()["ts"]
+    assert _found(w)["saved"] == 1, "control: the reader counts the saved path"
+    check = restore(w, ts, "--check")
+    parts = _restore_parts(check)
+    assert check.returncode == 0, check.stdout + check.stderr
+    assert parts and set(parts.values()) == {"as-left"}, parts
+    assert any(path == "sub/s1" for path, _ in parts), parts
+    put = restore(w, ts)
+    assert put.returncode == 0, put.stdout + put.stderr
+    assert (w.root / "sub" / "s1").read_text() == "mine\n"
+    assert _found(w)["saved"] == 0
+
+
+def test_td19_hooks_pending_are_reported_until_the_retry_puts_them_back(w):
+    dh = _dh()
+    killed_rollback(w, "P")
+    assert w.repair(SPY_RC="1").returncode == 0
+    found = _found(w)
+    assert found["hooks_pending"] == 1, found
+    assert dh.live_repair_findings(found) == ["live_repair_hooks_pending:1"]
+    assert w.repair(mode="--boot").returncode == 0  # the retry puts them back
+    found = _found(w)
+    assert found["hooks_pending"] == 0 and dh.live_repair_findings(found) == [], found
+
+
+def test_td19_hooks_pending_after_live_moved_or_dismissed_are_not_reported(w):
+    """Once `live` left the tag the writer supersedes the entry on its next
+    run; the reader does not wait for that run. A dismissed report is not
+    reported."""
+    killed_rollback(w, "P")
+    assert w.repair(SPY_RC="1").returncode == 0
+    _git(w.root, "commit", "-q", "--allow-empty", "-m", "the next update")
+    assert _found(w)["hooks_pending"] == 0
+    _git(w.root, "reset", "-q", "--hard", w.tag)
+    assert _found(w)["hooks_pending"] == 1, "control: `live` is back at the tag"
+    _dismiss(w, w.report()["ts"])
+    assert _found(w)["hooks_pending"] == 0
+
+
+def test_td19_hooks_pending_follow_the_live_ref_not_head(w):
+    """SF-2: the writer supersedes an entry only once `refs/heads/live` left
+    the tag, and waits while HEAD is merely elsewhere; the reader counts the
+    same: HEAD detached elsewhere with `live` at the tag still counts, `live`
+    moved with HEAD detached at the tag does not."""
+    killed_rollback(w, "P")
+    assert w.repair(SPY_RC="1").returncode == 0
+    _git(w.root, "checkout", "-q", "--detach", w.to)
+    assert _found(w)["hooks_pending"] == 1
+    _git(w.root, "checkout", "-q", "--detach", w.tag)
+    other = _git(w.root, "commit-tree", "-m", "the next update", f"{w.tag}^{{tree}}")
+    _git(w.root, "update-ref", "refs/heads/live", other)
+    assert _found(w)["hooks_pending"] == 0
+
+
+def _live_repo(tmp_path: Path) -> tuple[Path, str]:
+    """A checkout with one commit and `live` at it: (repo, that commit)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "one")
+    _git(repo, "branch", "live")
+    return repo, _git(repo, "rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize(
+    "hooks", ["pending", "pending ", "PENDING", 1, True, ["pending"], {"x": 1}, None, "ok",
+              "superseded", "reinstalled"],
+)  # fmt: skip
+def test_td19_only_an_exact_pending_counts(tmp_path, hooks):
+    """REPAIR.json is user-writable: only the writer's exact "pending", with
+    `live` at the report's tag, counts; any other value counts 0 and nothing
+    raises (the reader validates nothing else about the field)."""
+    repo, head = _live_repo(tmp_path)
+    _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(repo), tag=head,
+               paths=[], hooks=hooks)  # fmt: skip
+    found = _collect_bounded(tmp_path, repo)
+    assert found["refused"] == 0, found
+    assert found["hooks_pending"] == int(hooks == "pending"), found
+
+
+@pytest.mark.parametrize("tag", ["0" * 40, 5, None, ["x"]])
+def test_td19_a_pending_report_whose_tag_is_not_live_counts_0(tmp_path, tag):
+    repo, _ = _live_repo(tmp_path)
+    _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(repo), tag=tag,
+               paths=[], hooks="pending")  # fmt: skip
+    assert _collect_bounded(tmp_path, repo)["hooks_pending"] == 0
+
+
+def _spy_git(monkeypatch, answer=None) -> list[tuple[str, ...]]:
+    """Every _run_git call deploy health makes (``answer``: replace its result)."""
+    dh = _dh()
+    calls: list[tuple[str, ...]] = []
+    real = dh._run_git
+
+    def spy(repo, *args, timeout):
+        calls.append(args)
+        return answer if answer is not None else real(repo, *args, timeout=timeout)
+
+    monkeypatch.setattr(dh, "_run_git", spy)
+    return calls
+
+
+def test_td19_the_live_ref_is_read_only_when_a_pending_report_exists(tmp_path, monkeypatch):
+    """One bounded rev-parse per snapshot, and none at all unless a read,
+    undismissed report has hooks pending."""
+    calls = _spy_git(monkeypatch)
+    repo, head = _live_repo(tmp_path)
+    _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(repo), tag=head,
+               paths=[], hooks="ok")  # fmt: skip
+    _report_at(tmp_path, "20260101T000001Z-2", result="healed", repo=str(repo), tag=head,
+               paths=[], hooks="pending", dismissed_at="2026-01-02T00:00:00Z")  # fmt: skip
+    assert _dh().collect_live_repairs(tmp_path, repo)["hooks_pending"] == 0
+    assert calls == [], calls
+    for i in (3, 4):
+        _report_at(tmp_path, f"20260101T00000{i}Z-{i}", result="healed", repo=str(repo),
+                   tag=head, paths=[], hooks="pending")  # fmt: skip
+    assert _dh().collect_live_repairs(tmp_path, repo)["hooks_pending"] == 2
+    assert calls == [("rev-parse", "--verify", "-q", "refs/heads/live^{commit}")], calls
+
+
+@pytest.mark.parametrize(("answer", "want"), [((-1, "", "timeout"), 1), ((-2, "", "gone"), 1),
+                                              ((128, "", "fatal"), 1), ((1, "", ""), 0)])  # fmt: skip
+def test_td19_doubt_keeps_the_reports_word(tmp_path, monkeypatch, answer, want):
+    """A git that stalls or fails keeps the count (as _mixed keeps
+    "unresolved"); exit 1 (no `live` branch: the writer supersedes) is 0."""
+    _spy_git(monkeypatch, answer)
+    repo, head = _live_repo(tmp_path)
+    _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(repo), tag=head,
+               paths=[], hooks="pending")  # fmt: skip
+    assert _dh().collect_live_repairs(tmp_path, repo)["hooks_pending"] == want
+
+
+def test_td19_no_live_branch_counts_0(tmp_path):
+    repo, head = _live_repo(tmp_path)
+    _git(repo, "branch", "-D", "live")
+    _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(repo), tag=head,
+               paths=[], hooks="pending")  # fmt: skip
+    assert _collect_bounded(tmp_path, repo)["hooks_pending"] == 0
+
+
+@pytest.mark.parametrize("before", [["pre-push"], [], None])
+def test_sf_a_a_report_holding_replaced_hooks_is_counted_until_dismissed(tmp_path, before):
+    """SF-A: a reinstall that moved hooks aside (``hooks_before``) holds their
+    only copy: counted in ``hooks_saved`` (its own finding) while not
+    dismissed, the report's entry saying so, as the prune keeps it."""
+    dh = _dh()
+    repo, head = _live_repo(tmp_path)
+    d = _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(repo), tag=head,
+                   paths=[], hooks="reinstalled", hooks_before=before)  # fmt: skip
+    found = _collect_bounded(tmp_path, repo)
+    want = int(bool(before))
+    assert found["hooks_saved"] == want and found["reports"][0]["hooks_saved"] is bool(want)
+    assert ("live_repair_hooks_saved:1" in dh.live_repair_findings(found)) is bool(want)
+    report = json.loads((d / "REPAIR.json").read_text())
+    (d / "REPAIR.json").write_text(json.dumps({**report, "dismissed_at": "2026-01-02T00:00:00Z"}))
+    assert _collect_bounded(tmp_path, repo)["hooks_saved"] == 0

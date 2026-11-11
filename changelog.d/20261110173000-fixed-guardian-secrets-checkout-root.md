@@ -1,0 +1,1 @@
+- **The in-container credential self-heal finds secrets.env in the checkout it runs from.** The self-heal now passes the server's own repo root to the credential checks, so on a checkout outside `~/genesis` it no longer reports the live secrets file missing and restores a backup elsewhere. The host Guardian, which knows no repo root, behaves as before.

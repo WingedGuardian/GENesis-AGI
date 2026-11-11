@@ -51,6 +51,7 @@ EXPECTED_TABLES = [
     "task_steps",
     "memory_metadata",
     "credential_access_log",
+    "reference_secrets",
     "session_heartbeats",
     "ego_intentions",
     "entity_resolution_audit",
