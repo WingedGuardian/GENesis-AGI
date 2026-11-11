@@ -2382,3 +2382,44 @@ def test_a_complete_round_names_no_round_head():
     open there is no head-owned round to name."""
     got = rr.owed_state(_budget(round_state="complete"), [], now=T0)
     assert got["round_head"] is None and got["owed"] == []
+def test_a_committed_file_all_answer_ends_the_loop_for_later_fixes(repo, tmp_path, monkeypatch):
+    """#4368 round 1 end to end through covered_keys: round 5 drew floor
+    findings; a reflection filing both ends the loop (owner a90139c6), so a
+    later fix-now answer fails its check with the loop's end, even with its
+    Prediction. The keys stay credited by the filing answer."""
+    path, head = repo
+    opened = datetime.now(UTC) - timedelta(hours=3)
+    monkeypatch.setattr(rr, "PAST_TERMINAL_CUTOVER_ISO", (opened - timedelta(days=1)).isoformat())
+    earlier = {
+        f"{n:040x}": rr.RoundRecord(f"{n:040x}", n, opened - timedelta(hours=10 - n), ())
+        for n in range(1, 5)
+    }
+    floor = ((opened, True, "c1"), (opened, True, "c2"))
+    records = {**earlier, head: rr.RoundRecord(head, 5, opened, floor)}
+    kw = dict(round_number=5, round_records=records, round_started=opened - timedelta(days=1))
+    held = "Prediction-held: no the round drew floor findings"
+    sound = "SOUND-BUT-INFERIOR"
+    filed = _reflection(
+        head=head,
+        premise=sound,
+        dispositions=("Disposition: c1 file issue=#12", "Disposition: c2 file issue=#13"),
+        extra=(*_round_two(tmp_path), held),
+    )
+    _commit_reflection(path, tmp_path, filed)
+    fixing = _reflection(
+        head=head,
+        premise=sound,
+        extra=(
+            *_round_two(tmp_path),
+            "Prediction: merges at round 6 because the class is closed now",
+            "Confidence: 99% falsified-by any new finding in that class",
+            held,
+        ),
+    )
+    _commit_reflection(path, tmp_path, fixing)
+    real = rr.check
+    seen = []
+    monkeypatch.setattr(rr, "check", lambda *a, **k: seen.append(real(*a, **k)) or seen[-1])
+    assert _covered(path, head, **kw) == {"c1", "c2"}
+    fix_results = [r for r in seen if r.fix_now]
+    assert fix_results and all(any("loop is over" in p for p in r.problems) for r in fix_results)

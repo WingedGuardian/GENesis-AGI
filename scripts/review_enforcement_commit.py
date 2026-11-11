@@ -1070,36 +1070,61 @@ def _reflection_problem(
     text passes the reflection grammar for this round and names the current
     head. Whether it credits anything is judged later, by the same reader that
     owes the keys; an empty commit adds no content either way."""
+    problem, text = _reflection_form_problem(segs, command, cwd, budget, rr, deadline=deadline)
+    if problem is not None or text is None:
+        return problem or "the reflection could not be read"
+    gate_lane = bool(budget.get("gate_surface"))
+    parsed = rr.parse(text, gate_lane=gate_lane)  # the grammar alone, and its keys
+    return _reflection_rounds_problem(
+        text, parsed, cwd, budget, rr, deadline=deadline, state=state
+    )
+
+
+def _reflection_form_problem(
+    segs, command: str, cwd: str | None, budget: dict, rr, *, deadline: float | None
+) -> tuple[str | None, str | None]:
+    """``(problem, text)``: why this commit is not an empty reflection commit
+    in the one admitted form whose message passes the reflection grammar, or
+    ``(None, message text)`` when it is. Shared by admission and by the ended
+    loop, which admits such a commit because it carries no content."""
     if not _exemption_shape_ok(segs, command):
         return (
             "run the reflection commit as one plain `git commit` (or `git -C <dir> commit`) "
             "command, nothing chained and no env prefix"
-        )
+        ), None
     path = _reflection_message_file(segs[0])
     if path is None:
         return (
             "the reflection form is exactly "
             "`git commit --allow-empty --cleanup=verbatim -F <file>` (no -m, -a, "
             "--amend or pathspec)"
-        )
+        ), None
     staged = _staged_files(cwd, deadline=deadline)
     if staged is None:
-        return "the staged set could not be read"
+        return "the staged set could not be read", None
     if staged:
-        return f"files are staged ({len(staged)}): unstage them; a reflection carries no content"
+        return f"files are staged ({len(staged)}): unstage them; a reflection carries no content", None
     if _integration_in_progress(cwd, deadline=deadline) is not False:
-        return "a merge, rebase, cherry-pick or revert is in progress (or unreadable): finish or abort it first"
+        return "a merge, rebase, cherry-pick or revert is in progress (or unreadable): finish or abort it first", None
     # Non-blocking open, type from the opened descriptor: a path swapped for a
     # FIFO between any check and the read is refused, never waited on.
     text, _, why = rr._read_evidence(path, cwd or ".")
     if text is None:
-        return f"{path} {why}"
+        return f"{path} {why}", None
     if len(text.encode("utf-8")) > _REFLECTION_FILE_LIMIT:
-        return f"{path} is larger than {_REFLECTION_FILE_LIMIT} bytes"
-    gate_lane = bool(budget.get("gate_surface"))
-    parsed = rr.parse(text, gate_lane=gate_lane)  # the grammar alone, and its keys
+        return f"{path} is larger than {_REFLECTION_FILE_LIMIT} bytes", None
+    parsed = rr.parse(text, gate_lane=bool(budget.get("gate_surface")))
     if parsed.problems:
-        return "the reflection does not pass its grammar: " + "; ".join(parsed.problems[:5])
+        return "the reflection does not pass its grammar: " + "; ".join(parsed.problems[:5]), None
+    return None, text
+
+
+def _reflection_rounds_problem(
+    text: str, parsed, cwd: str | None, budget: dict, rr, *, deadline: float, state: dict | None
+) -> str | None:
+    """Admission's round half: the owed keys the reflection names, judged
+    under every round the debt reader judges them under."""
+    gate_lane = bool(budget.get("gate_surface"))
     if state is None:  # no owed state (direct callers): the current round, as before
         rounds = {k: [int(budget.get("count") or 0)] for k in parsed.keys}
     else:
@@ -1116,11 +1141,14 @@ def _reflection_problem(
     # current round for an open one); which keys it credits is still that
     # reader's call. A late key whose round cannot be placed admits nothing.
     # The past-round-4 rules need the round's facts, which admission reads
-    # from the budget it already holds, so a refused fix-now is a named deny
-    # here, never a key that silently stays owed after an admitted commit.
+    # from the budget it already holds, plus the committed reflections' answers
+    # once the PR is past round 4 (the loop's end). A reflection refused for
+    # every named key is a named deny here; one admitted for some key but not
+    # another leaves that other key owed, and the next commit names it.
     records = rr._round_records(budget) or {}
     by_number = {record.number: record for record in records.values()}
     now = datetime.now(UTC)
+    declared = _declared_answers(cwd, budget, rr, records, now, deadline)
     problems: list[str] = []
     for key in sorted(rounds):
         failed = []
@@ -1128,7 +1156,12 @@ def _reflection_problem(
             parsed_n = rr.parse(text, round_number=round_n, gate_lane=gate_lane)
             failed += parsed_n.problems
             failed += rr.past_terminal_problems(
-                parsed_n, by_number.get(round_n), records, gate_lane=gate_lane, made_at=now
+                parsed_n,
+                by_number.get(round_n),
+                records,
+                gate_lane=gate_lane,
+                made_at=now,
+                declared=declared,
             )
         if not failed:
             break
@@ -1258,10 +1291,8 @@ def _reflection_rule(
         )
         return "continue", None
     if not owed:
-        ended = _loop_ended(budget, rr)
-        if ended and not (
-            len(commit_segs) == 1 and _concludes_merge_of_main(cwd, rr, segs, owed_deadline)
-        ):
+        ended = _loop_ended(cwd, budget, rr, owed_deadline)
+        if ended and not _ended_commit_ok(segs, command, cwd, budget, rr, owed_deadline):
             message = _ended_message(budget)
             if _reflection_gate_mode() == "advisory":
                 _ADVISORIES.append("reflection gate (advisory mode, NOT enforced): " + message)
@@ -1300,19 +1331,57 @@ def _reflection_rule(
     return "deny", message
 
 
-def _loop_ended(budget: dict, rr) -> bool:
-    """Whether the review loop is over (``review_reflection.loop_ended``). Any
-    failure to tell is False: unknown never refuses (owner ruling a34481ca)."""
+def _declared_answers(
+    cwd: str | None, budget: dict, rr, records: dict | None, now: datetime, deadline: float | None
+) -> tuple:
+    """The committed reflections' answers (``review_reflection.answers``),
+    read from git only once the PR is past round 4 under the rules, inside
+    ``deadline``; empty otherwise, so no other PR pays for the log read."""
+    gate_lane = bool(budget.get("gate_surface"))
+    if not rr.ending_possible(records, gate_lane=gate_lane, now=now):
+        return ()
+    with rr.deadline_scope(deadline):
+        return rr.answers(rr._log_reflections(cwd or "."))
+
+
+def _loop_ended(cwd: str | None, budget: dict, rr, deadline: float | None = None) -> bool:
+    """Whether the review loop is over (``review_reflection.loop_ended``, with
+    the committed reflections' answers). Any failure to tell is False: unknown
+    never refuses (owner ruling a34481ca)."""
     try:
+        records = rr._round_records(budget)
+        now = datetime.now(UTC)
         return bool(
             rr.loop_ended(
-                rr._round_records(budget),
+                records,
                 gate_lane=bool(budget.get("gate_surface")),
-                now=datetime.now(UTC),
+                now=now,
+                declared=_declared_answers(cwd, budget, rr, records, now, deadline),
             )
         )
-    except Exception:  # noqa: BLE001 - unknown is not a refusal
+    except Exception as exc:  # noqa: BLE001 - unknown is not a refusal
+        _ADVISORIES.append(
+            f"reflection gate: whether the review loop has ended could not be read "
+            f"({type(exc).__name__}: {str(exc)[:120]}), so the commit is not refused for it."
+        )
         return False
+
+
+def _ended_commit_ok(
+    segs: list, command: str, cwd: str | None, budget: dict, rr, deadline: float | None
+) -> bool:
+    """The commits an ended loop still admits, each one plain ``git commit``
+    the gate can see whole (``_exemption_shape_ok``: one segment, at most one
+    ``-C``, no env prefix, nothing chained to stage a fix after the hook reads
+    the index): an empty reflection commit in its one form, which carries no
+    content, or the conclusion of a merge of the default branch."""
+    if not _exemption_shape_ok(segs, command):
+        return False
+    try:
+        problem, _text = _reflection_form_problem(segs, command, cwd, budget, rr, deadline=deadline)
+    except Exception:  # noqa: BLE001 - not provably an empty reflection commit
+        problem = "unreadable"
+    return problem is None or _concludes_merge_of_main(cwd, rr, segs, deadline)
 
 
 def _concludes_merge_of_main(cwd: str | None, rr, segs: list, deadline: float | None = None) -> bool:
@@ -1321,24 +1390,23 @@ def _concludes_merge_of_main(cwd: str | None, rr, segs: list, deadline: float | 
     staged tree passes ``review_reflection._merge_is_no_fix`` (git's own merge
     result, or a difference only in the files that conflicted). The same
     reading the review owe side uses, so a fix cannot ride in on the merge.
-    Every git call runs under ``deadline``; running out refuses the exemption,
-    so the deny stands rather than the hook overrunning (which fails open)."""
+    Every git call and the MERGE_HEAD read run under ``deadline`` (the read is
+    non-blocking, regular files only); running out refuses the exemption, so
+    the deny stands rather than the hook overrunning (which fails open)."""
     if _commit_may_add_content(segs):
         return False
     d = cwd or "."
     try:
-        code, out, _ = rr._run(["git", "-C", d, "rev-parse", "-q", "--verify", "HEAD"])
-        head = out.strip() if code == 0 else ""
-        path_code, path, _ = rr._run(["git", "-C", d, "rev-parse", "--git-path", "MERGE_HEAD"])
-        if not head or path_code != 0:
-            return False
-        merge_file = Path(path.strip())
-        if not merge_file.is_absolute():
-            merge_file = Path(d) / merge_file
-        heads = merge_file.read_text().split()
-        if len(heads) != 1:
-            return False  # none, or an octopus merge
         with rr.deadline_scope(deadline):
+            code, out, _ = rr._run(["git", "-C", d, "rev-parse", "-q", "--verify", "HEAD"])
+            head = out.strip() if code == 0 else ""
+            path_code, path, _ = rr._run(["git", "-C", d, "rev-parse", "--git-path", "MERGE_HEAD"])
+            if not head or path_code != 0:
+                return False
+            text, _, _ = rr._read_evidence(path.strip(), d)
+            heads = (text or "").split()
+            if len(heads) != 1:
+                return False  # none, unreadable, or an octopus merge
             tree_code, tree, _ = rr._run(["git", "-C", d, "write-tree"])
             if tree_code != 0:
                 return False
@@ -1352,12 +1420,12 @@ def _concludes_merge_of_main(cwd: str | None, rr, segs: list, deadline: float | 
 def _ended_message(budget: dict) -> str:
     return "\n".join(
         [
-            f"BLOCKED: the review loop of PR #{budget.get('pr')} is over. Round "
-            f"{budget.get('count')} drew no floor finding past round 4, so its answer "
-            "ended the loop (each finding filed as an issue, or a send-back).",
+            f"BLOCKED: the review loop of PR #{budget.get('pr')} is over. Past round 4, "
+            f"round {budget.get('count')} drew no floor finding, or was answered by a "
+            "send-back or with every finding filed, and that ends the loop.",
             "Merge the PR (the merge gate decides), or send it back for a rework. A "
-            "merge of the default branch to resolve a conflict or refresh CI is allowed; "
-            "a new review round with a floor finding reopens fixing.",
+            "merge of the default branch to resolve a conflict or refresh CI, and an "
+            "empty reflection commit, are allowed; a new review round reopens fixing.",
             "A real defect found now goes into a new PR (or ask the owner for an "
             "exception); do not work around this.",
         ]

@@ -235,12 +235,12 @@ MIN_CONFIDENCE = 95
 class RoundRecord:
     """One review round as the past-round-4 rules read it, from the budget:
     its number, its opening time, and its findings ``(submitted_at, blocking,
-    key)``, late joiners included."""
+    key)``, late joiners included. An unreadable ``submitted_at`` is None."""
 
     head: str
     number: int
     opened_at: datetime | None
-    findings: tuple[tuple[datetime, bool | None, str | None], ...]
+    findings: tuple[tuple[datetime | None, bool | None, str | None], ...]
 
     @property
     def keys(self) -> set[str]:
@@ -248,19 +248,57 @@ class RoundRecord:
 
     @property
     def settle_at(self) -> datetime | None:
-        """30 minutes after its first finding review; None with no timed one."""
+        """30 minutes after its first finding review; None with no timed one,
+        or when any finding's time is unreadable (it cannot be placed)."""
         times = [when for when, _, _ in self.findings]
-        return min(times) + SETTLE if times else None
+        if not times or any(when is None for when in times):
+            return None
+        return min(t for t in times if t is not None) + SETTLE
 
     def blocking(self, at: datetime) -> tuple[bool | None, list[str]]:
         """Whether a finding submitted at or before ``at`` is at the floor:
         True (with its keys), None when none is and one cannot be read, else
-        False. A finding after ``at`` never changes an answer given at ``at``."""
-        seen = [(b, k) for when, b, k in self.findings if when <= at]
+        False. A finding after ``at`` never changes an answer given at ``at``;
+        an untimed one counts at every time."""
+        seen = [(b, k) for when, b, k in self.findings if when is None or when <= at]
         hit = sorted(str(k) for b, k in seen if b is True)
         if hit:
             return True, hit
         return (None if any(b is None for b, _ in seen) else False), []
+
+
+@dataclass(frozen=True)
+class Answer:
+    """What one committed reflection declared, for the loop's end: the keys it
+    names, whether it sends the PR back, whether any disposition fixes now,
+    and when it was made."""
+
+    keys: frozenset[str]
+    sent_back: bool
+    fix_now: bool
+    made_at: datetime | None
+    fix_now_keys: frozenset[str] = frozenset()
+
+
+def answers(log: Iterable[tuple[str, str, str, datetime | None]]) -> tuple[Answer, ...]:
+    """The declarations of every reflection in ``log`` (``_log_reflections``'
+    shape) whose header names keys. Grammar alone: a declaration here can only
+    END the loop, the restrictive direction, so a reflection that fails its
+    full check still counts against its own author."""
+    found = []
+    for _sha, _kind, body, made_at in log:
+        parsed = parse(body)
+        if parsed.keys:
+            found.append(
+                Answer(
+                    frozenset(parsed.keys),
+                    parsed.decision == "send-back",
+                    parsed.fix_now,
+                    made_at,
+                    frozenset(parsed.fix_now_keys),
+                )
+            )
+    return tuple(found)
 
 
 def past_terminal(round_number: int, gate_lane: bool) -> tuple[bool, bool]:
@@ -287,13 +325,46 @@ def next_round(records: Mapping[str, RoundRecord], at: datetime) -> int:
     return 1 + sum(1 for r in records.values() if r.opened_at is None or r.opened_at <= at)
 
 
+def _newest(records: Mapping[str, RoundRecord], at: datetime) -> RoundRecord | None:
+    """The newest round opened by ``at``: a round opened later (it is in the
+    budget, read after the fact) did not exist when a reflection was made."""
+    opened = [r for r in records.values() if r.opened_at is None or r.opened_at <= at]
+    return max(opened, key=lambda r: r.number) if opened else None
+
+
+def _past_terminal_pr(
+    records: Mapping[str, RoundRecord], at: datetime, gate_lane: bool, cutover: str | None
+) -> RoundRecord | None:
+    """The newest round when the PR itself is past its terminal round at
+    ``at``: ordinary lane, round 4 or later, opened under the rules. Else None.
+    The PR-wide rules read this, never the round of the key being judged."""
+    newest = None if gate_lane else _newest(records, at)
+    if newest is None or newest.number < PREDICT_FROM or not _bound(newest, cutover):
+        return None
+    return newest
+
+
+def ending_possible(
+    records: Mapping[str, RoundRecord] | None,
+    *,
+    gate_lane: bool,
+    now: datetime,
+    cutover: str | None = None,
+) -> bool:
+    """Whether ``loop_ended`` can be True at all, before anything is read
+    from git: callers skip the reflection log for every PR not past round 4."""
+    cutover = PAST_TERMINAL_CUTOVER_ISO if cutover is None else cutover
+    return bool(records) and _past_terminal_pr(records, now, gate_lane, cutover) is not None
+
+
 def prediction_failures(
     records: Mapping[str, RoundRecord], at: datetime, cutover: str | None
 ) -> int:
     """Rounds from round 5 on, bound by the rules and opened by ``at``, that
-    drew a floor finding by their settle time (or by ``at``, when earlier): each
-    is a prediction that should have said it would not hold. From the budget
-    alone, so no reflection can reset it; an unreadable level is not counted."""
+    drew a floor finding by their settle time (or by ``at``, when earlier or
+    unknown): each is a prediction that should have said it would not hold.
+    From the budget alone, so no reflection can reset it; an unreadable level
+    is not counted."""
     count = 0
     for record in records.values():
         if record.number < JUDGE_FROM or not _bound(record, cutover):
@@ -315,42 +386,50 @@ def past_terminal_problems(
     gate_lane: bool,
     made_at: datetime | None,
     cutover: str | None = None,
+    declared: Iterable[Answer] = (),
 ) -> list[str]:
     """The past-round-4 rules for a reflection answering ``record``'s keys
-    (owner rulings 132a2135, e951d5a9). Nothing when the round is unknown, on
-    the gate lane, or opened before the cutover. Send-back with
+    (owner rulings 132a2135, e951d5a9, a90139c6). Nothing on the gate lane or
+    while the PR is not yet past round 4 under the rules.
+
+    Two phases, so no early return can skip a rule about the whole PR. The
+    PR-wide phase reads the PR's newest round, whatever round the key is
+    from: the end of the loop (``loop_ended``, with the committed
+    ``declared`` answers), the two-failure rule, and the Prediction and
+    Confidence a fix-now owes. The per-round phase reads the key's own round:
+    ``Prediction-held`` and the end-now rule (from round 5). Send-back with
     ``Prediction-held: no`` passes every rule in every state, so no state
     leaves the session without an admissible reflection."""
     cutover = PAST_TERMINAL_CUTOVER_ISO if cutover is None else cutover
     sent_back = parsed.decision == "send-back"
-    opened = [
-        r
-        for r in records.values()
-        if made_at is not None and (r.opened_at is None or r.opened_at <= made_at)
-    ]
-    newest = max(opened, key=lambda r: r.number) if opened else None
-    if (
-        parsed.fix_now
-        and not sent_back
-        and made_at is not None
-        and (record is None or newest is None or record.head != newest.head)
-        and loop_ended(records, gate_lane=gate_lane, now=made_at, cutover=cutover)
-    ):
-        # A key from an older round, answered after the loop ended: fixing it
-        # now would be admitted here and then refused at the commit.
-        return [
-            "the review loop is over (the newest round past round 4 drew no floor "
-            "finding): file each finding as an issue or send the PR back; no fix-now"
-        ]
-    if record is None or not _bound(record, cutover):
-        return []
-    predict, judge = past_terminal(record.number, gate_lane)
-    if not predict:
-        return []
     if made_at is None:
-        return ["the reflection's commit time cannot be read, so the round-4 rules cannot be checked"]
+        if not gate_lane and any(
+            r.number >= PREDICT_FROM and _bound(r, cutover) for r in records.values()
+        ):
+            return ["the reflection's commit time cannot be read, so the round-4 rules cannot be checked"]
+        return []
+    newest = _past_terminal_pr(records, made_at, gate_lane, cutover)
+    if newest is None:
+        return []
     problems: list[str] = []
+    # The key's own no-floor round, when it is the newest: the per-round end-now
+    # rule below says so with its round, so the PR-wide refusal steps aside.
+    own_end = (
+        record is not None
+        and record.head == newest.head
+        and newest.number >= JUDGE_FROM
+        and record.blocking(made_at)[0] is False
+    )
     if parsed.fix_now and not sent_back:
+        if not own_end and loop_ended(
+            records, gate_lane=gate_lane, now=made_at, cutover=cutover, declared=declared
+        ):
+            # Fixing now would be admitted here and then refused at the commit.
+            return [
+                "the review loop is over (the newest round past round 4 drew no floor "
+                "finding, or was answered by a send-back or with no fix-now): file each "
+                "finding as an issue or send the PR back; no fix-now"
+            ]
         want = next_round(records, made_at)
         if parsed.prediction_round != want:
             problems.append(
@@ -362,7 +441,11 @@ def past_terminal_problems(
                 f"fixing again past round {PREDICT_FROM - 1} needs "
                 f"'Confidence: <{MIN_CONFIDENCE}-100>% falsified-by <what would show it wrong>'"
             )
-    if not judge:
+    if not sent_back and prediction_failures(records, made_at, cutover) >= 2:
+        problems.append(
+            "two predictions past round 4 failed: the only decision left is 'send-back'"
+        )
+    if record is None or not _bound(record, cutover) or not past_terminal(record.number, gate_lane)[1]:
         return problems
     blocking, keys = record.blocking(made_at)
     if parsed.held is None:
@@ -391,10 +474,6 @@ def past_terminal_problems(
             f"round {record.number} drew no floor finding, so the review loop ends here: "
             "file each finding as an issue (merge-and-file) or send the PR back; no fix-now"
         )
-    if not sent_back and prediction_failures(records, made_at, cutover) >= 2:
-        problems.append(
-            "two predictions past round 4 failed: the only decision left is 'send-back'"
-        )
     return problems
 
 
@@ -404,24 +483,57 @@ def loop_ended(
     gate_lane: bool,
     now: datetime,
     cutover: str | None = None,
+    declared: Iterable[Answer] = (),
 ) -> bool | None:
-    """Whether the review loop is over: the newest round is 5 or later, bound
-    by the rules, and drew no floor finding. Its answer could then only end the
-    loop (``past_terminal_problems``), so a content commit after it is refused.
-    None when it cannot be told (fails open); a floor finding keeps it open."""
+    """Whether the review loop is over at ``now`` (spec rev 3, owner rulings
+    e951d5a9 and a90139c6). The PR is past round 4 under the rules (ordinary
+    lane), and its newest round R:
+
+    - was answered by a send-back made after R opened (a committed
+      reflection naming any key of the PR); or
+    - had every one of its findings seen by ``now`` answered without a fix
+      (filed): a floor finding arriving after the answers is unanswered, so
+      fixing it stays open; or
+    - is round 5 or later and drew no floor finding.
+
+    Monotone over ``declared``: a later reflection cannot reopen it; a newer
+    round does. The last two also lift while a floor finding that landed on
+    an older round after R opened is not yet filed: fixing it is allowed (E
+    is per key), and needs the loop open. None when it cannot be told (fails
+    open)."""
     cutover = PAST_TERMINAL_CUTOVER_ISO if cutover is None else cutover
     if records is None:
         return None
-    # The newest round opened by ``now``: a round opened later (it is in the
-    # budget, read after the fact) did not exist when a reflection was made.
-    opened = [r for r in records.values() if r.opened_at is None or r.opened_at <= now]
-    if gate_lane or not opened:
+    newest = _past_terminal_pr(records, now, gate_lane, cutover)
+    if newest is None:
         return False
-    newest = max(opened, key=lambda r: r.number)
-    if newest.number < JUDGE_FROM or not _bound(newest, cutover):
-        return False
-    blocking, _ = newest.blocking(now)
-    return None if blocking is None else not blocking
+    pr_keys = set().union(*(r.keys for r in records.values()))
+    made = [
+        a for a in declared
+        if a.made_at is not None and a.made_at <= now
+        and newest.opened_at is not None and a.made_at >= newest.opened_at
+    ]
+    if any(a.sent_back and a.keys & pr_keys for a in made):
+        return True
+    filed = {k for a in made for k in a.keys - a.fix_now_keys}
+    seen = {
+        str(k) for when, _flag, k in newest.findings
+        if k is not None and (when is None or when <= now)
+    }
+    ended: bool | None = bool(seen) and seen <= filed
+    if not ended and newest.number >= JUDGE_FROM:
+        blocking, _ = newest.blocking(now)
+        ended = None if blocking is None else not blocking
+    if not ended:
+        return ended
+    for record in records.values():
+        if record is newest or not _bound(record, cutover):
+            continue
+        for when, flag, key in record.findings:
+            late_floor = flag is True and when is not None and newest.opened_at <= when <= now
+            if late_floor and str(key) not in filed:
+                return False
+    return True
 
 
 def _normalize(text: str) -> str:
@@ -789,7 +901,25 @@ def _header_time(line: bytes) -> datetime | None:
         return None
 
 
+_LOG_MEMO: dict[tuple[str, str], list[tuple[str, str, str, datetime | None]]] = {}
+
+
 def _log_reflections(cwd: str) -> list[tuple[str, str, str, datetime | None]]:
+    """``_read_log_reflections``, read once per repository and HEAD in a
+    process: one hook call reads it from several rules, and inside Rule R's
+    slice each read costs a few hundred milliseconds on a long history. The
+    answer depends only on HEAD's history, so a new commit is a new key."""
+    code, out, _ = _run(["git", "-C", cwd, "rev-parse", "-q", "--verify", "HEAD"])
+    head = out.strip() if code == 0 else ""
+    if not head:
+        return _read_log_reflections(cwd)
+    key = (os.path.realpath(cwd), head)
+    if key not in _LOG_MEMO:
+        _LOG_MEMO[key] = _read_log_reflections(cwd)
+    return list(_LOG_MEMO[key])
+
+
+def _read_log_reflections(cwd: str) -> list[tuple[str, str, str, datetime | None]]:
     """``(sha, "empty"|"content", body, committed_at)`` for each commit whose
     message starts with the header, newest first. Only commits carrying a
     header line are read, and a read that reaches ``LOG_DEPTH`` of them
@@ -1199,11 +1329,13 @@ def check(
     cwd: str,
     round_record: RoundRecord | None,
     round_records: Mapping[str, RoundRecord],
+    declared: Iterable[Answer] = (),
 ) -> Reflection:
     """Every local rule a reflection must meet for this round, in one place.
     ``cwd`` is the repository: a relative evidence path is read from there.
     ``round_record`` is the round the keys belong to, for the past-round-4
-    rules (``past_terminal_problems``); None leaves them off."""
+    rules (``past_terminal_problems``), with the PR's committed ``declared``
+    answers for the loop's end; a None record leaves the per-round rules off."""
     parsed = parse(
         body,
         round_number=round_number,
@@ -1218,6 +1350,7 @@ def check(
             round_records,
             gate_lane=gate_lane,
             made_at=made_at if isinstance(made_at, datetime) else _parse_when(made_at),
+            declared=declared,
         )
     )
     if parsed.head != head:
@@ -1549,6 +1682,7 @@ def _covered_keys(
     reviewed_at: Mapping[str, datetime | None],
 ) -> set[str]:
     log = _log_reflections(cwd)
+    declared = answers(log)
     covered: set[str] = set()
     for sha, kind, body, committed_at in log:
         if kind != "empty":
@@ -1584,6 +1718,7 @@ def _covered_keys(
             cwd=cwd,
             round_record=round_records.get(head),
             round_records=round_records,
+            declared=declared,
         )
         if result.ok:
             covered.update(k for k in result.keys if clears(clock, reviewed_at.get(k)))

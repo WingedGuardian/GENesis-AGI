@@ -170,19 +170,18 @@ def round_records(budget: Mapping[str, Any]) -> dict[str, rr.RoundRecord] | None
     if times is None:
         return None
     far = datetime.max.replace(tzinfo=UTC)
-    unread = datetime.min.replace(tzinfo=UTC)
     out: dict[str, rr.RoundRecord] = {}
     for head, opened in times.items():
         context = round_context(budget, head, far)
         if context is None:
             return None
-        found: list[tuple[datetime, bool | None, str | None]] = []
+        found: list[tuple[datetime | None, bool | None, str | None]] = []
         for item in budget.get("findings") or []:
             if not isinstance(item, Mapping) or item.get("round_head") != head:
                 continue
-            # An unreadable time counts from the start: it can only make a
-            # level unknown or a floor finding known early, never hide one.
-            when = rr._parse_when(item.get("submitted_at")) or unread
+            # An unreadable time stays None: the finding counts as seen at
+            # every time, and its round's settle time is unknown.
+            when = rr._parse_when(item.get("submitted_at"))
             keys = item.get("keys") if isinstance(item.get("keys"), list) else []
             flags = item.get("blocking")
             if not isinstance(flags, list) or len(flags) != len(keys):
@@ -511,6 +510,7 @@ def _covered_late_keys(
     current = budget.get("current_head")
     in_graph, ancestors = _ancestry(budget)
     log = rr._log_reflections(cwd)
+    declared = rr.answers(log)
     owners = rr.key_rounds(budget)
     records = round_records(budget) or {}
     labels: dict[tuple[tuple[str, ...], str], list[str]] = {}
@@ -600,6 +600,7 @@ def _covered_late_keys(
                         cwd=cwd,
                         round_record=records.get(str(context.round_head)),
                         round_records=records,
+                        declared=declared,
                     ).ok
                 passed = passed and checked[(sha, context)]
             if passed:
