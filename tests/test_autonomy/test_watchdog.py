@@ -964,6 +964,66 @@ class TestLegacyReasonNormalisation:
             is WatchdogAction.RESTART
         )
 
+    @pytest.mark.parametrize(
+        "bad_ts",
+        [
+            10**309, -(10**309), float("inf"), float("-inf"), float("nan"),
+            1e300, time.time() + 365 * 86400,
+        ],
+        ids=["huge-int", "huge-negative-int", "inf", "-inf", "nan", "1e300", "next-year"],
+    )
+    def test_an_unusable_numeric_timestamp_is_dropped(
+        self, tmp_path: Path, stale_status: Path, bad_ts: object,
+    ):
+        """A number can still break the flap arithmetic.
+
+        JSON round-trips an integer too large for a float (``now - ts`` raises
+        OverflowError) and ``Infinity`` (an infinite ``last_ts`` keeps the flap
+        backoff deadline in the future forever, so the target is never
+        restarted). A finite far-future timestamp does the same: ``now - ts`` is
+        negative, so the flap window counts it on every tick. Three same-reason
+        entries put each on the decision path.
+        """
+        self._write(tmp_path, {
+            "consecutive_failures": 0,
+            "next_attempt_after": None,
+            "restart_history": [
+                {"ts": bad_ts, "reason": "target_inactive"} for _ in range(3)
+            ],
+        })
+        checker = _make_checker(tmp_path, stale_status, flap_threshold=3, backoff_max_s=10)
+        state = checker._load_state()
+        assert state["restart_history"] == []
+        assert (
+            checker._restart_if_allowed(state, reason="target_inactive")
+            is WatchdogAction.RESTART
+        )
+
+    @pytest.mark.parametrize("bad_reason", [[], {"r": 1}], ids=["list", "dict"])
+    def test_an_unhashable_history_reason_does_not_raise(
+        self, tmp_path: Path, bad_reason: object,
+    ):
+        self._write(tmp_path, {
+            "consecutive_failures": 0,
+            "next_attempt_after": None,
+            "restart_history": [{"ts": time.time() - 5, "reason": bad_reason}],
+        })
+        checker = _make_checker(tmp_path, tmp_path / "status.json")
+        state = checker._load_state()
+        assert state["restart_history"][0]["reason"] == bad_reason
+        assert (
+            checker._restart_if_allowed(state, reason="target_inactive")
+            is WatchdogAction.RESTART
+        )
+
+    @pytest.mark.parametrize("bad_reason", [[], {"r": 1}], ids=["list", "dict"])
+    def test_an_unhashable_last_reason_does_not_raise(
+        self, tmp_path: Path, bad_reason: object,
+    ):
+        self._write(tmp_path, {"last_reason": bad_reason})
+        checker = _make_checker(tmp_path, tmp_path / "status.json")
+        assert checker._load_state()["last_reason"] == bad_reason
+
     def test_a_malformed_neighbour_does_not_discard_real_history(
         self, tmp_path: Path, stale_status: Path,
     ):
