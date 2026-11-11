@@ -201,6 +201,64 @@ async def test_generated_catalog_drives_hook_and_executor(catalog, tmp_path, mon
 
 
 @pytest.mark.parametrize("mode", ["yaml", "no_yaml", "oversized", "malformed"])
+@pytest.mark.parametrize("value,wanted", [("true", True), ("false", False)])
+def test_manual_flag_survives_crlf_frontmatter(monkeypatch, mode, value, wanted):
+    if mode == "no_yaml":
+        monkeypatch.setattr(gen, "yaml", None)
+    elif mode == "oversized":
+        monkeypatch.setattr(gen, "_MAX_FRONTMATTER_CHARS", 1)
+    content = f"---\r\nname: review\r\ndisable-model-invocation: {value}\r\n"
+    if mode == "malformed":
+        content += "broken: [\r\n"
+    content += "---\r\nbody\r\n"
+    assert gen._parse_frontmatter(content).get("disable-model-invocation", False) is wanted
+
+
+_FLAG_SPELLINGS = [
+    ("disable-model-invocation: true", True),
+    ("disable-model-invocation: TRUE", True),
+    ("disable-model-invocation: ' true '", True),
+    ('"disable-model-invocation": true', True),
+    ("disable-model-invocation : true", True),
+    ("disable-model-invocation:   true   # why", True),
+    ("disable-model-invocation: !!bool yes", True),
+    ("disable-model-invocation: !!bool on", True),
+    ("disable-model-invocation: !!str true", True),
+    ("disable-model-invocation: |\n  true", True),
+    ("disable-model-invocation:\n  true", True),
+    ("disable-model-invocation: yes", False),
+    ("disable-model-invocation: on", False),
+    ("disable-model-invocation: 1", False),
+    ("disable-model-invocation: !!int 1", False),
+    ("disable-model-invocation: null", False),
+    ("disable-model-invocation:", False),
+    ("disable-model-invocation: !!bool false", False),
+    ("  disable-model-invocation: true", False),
+]
+
+
+@pytest.mark.parametrize("mode", ["yaml", "no_yaml", "oversized"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize("bom", ["", "﻿"], ids=["no-bom", "bom"])
+@pytest.mark.parametrize("line,wanted", _FLAG_SPELLINGS)
+def test_fallback_reads_every_flag_spelling_as_yaml_does(
+    monkeypatch, mode, newline, bom, line, wanted
+):
+    """The fallback parser gives the YAML path's answer for every spelling.
+
+    ``wanted`` is what the YAML path returns for the line on clean text (an
+    indented key is a nested one, not the top-level flag). A byte-order mark
+    or CRLF endings must not change any answer on any path.
+    """
+    if mode == "no_yaml":
+        monkeypatch.setattr(gen, "yaml", None)
+    elif mode == "oversized":
+        monkeypatch.setattr(gen, "_MAX_FRONTMATTER_CHARS", 1)
+    content = bom + f"---\nname: review\n{line}\n---\nbody\n".replace("\n", newline)
+    assert gen._parse_frontmatter(content).get("disable-model-invocation", False) is wanted
+
+
+@pytest.mark.parametrize("mode", ["yaml", "no_yaml", "oversized", "malformed"])
 def test_embedded_separator_does_not_hide_manual_metadata(monkeypatch, mode):
     if mode == "no_yaml":
         monkeypatch.setattr(gen, "yaml", None)
