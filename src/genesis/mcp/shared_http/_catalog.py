@@ -39,6 +39,10 @@ def _ancestry(tool, service):
         if id(current) in visited or type(current) not in {FunctionTool, TransformedTool}:
             raise ValueError("Unqualified shared tool ancestry")
         visited.add(id(current))
+        # A versioned call dispatches get_tool(name, version=...), which is not
+        # the object this catalog captured, so no version can be qualified.
+        if getattr(current, "version", None) is not None:
+            raise ValueError("Unqualified shared tool: versioned tools are not supported")
         capabilities.add(current.name)
         if current.task_config.supports_tasks() or current.auth is not None:
             raise ValueError("Unqualified shared tool execution policy")
@@ -68,6 +72,7 @@ class _Entry:
     location: str
     capabilities: frozenset[str]
     schema: dict
+    tool: object
 
 
 class Catalog:
@@ -82,7 +87,7 @@ class Catalog:
                 raise ValueError("Ambiguous shared protocol name")
             location, capabilities = _ancestry(tool, service)
             schema = tool.to_mcp_tool(name=tool.name).model_dump(mode="json", by_alias=True, exclude_none=True)
-            entries[tool.name] = _Entry(location, capabilities, schema)
+            entries[tool.name] = _Entry(location, capabilities, schema, tool)
         # Current Genesis exposes tools only. Do not accidentally expose new
         # resource/prompt/task surfaces without their own qualification.
         if (await server.list_resources(run_middleware=False)
@@ -101,6 +106,11 @@ class Catalog:
         if caller.profile not in {"external", "validator"} or self.service not in {"health", "memory"}:
             return False
         return entry.capabilities <= profile_tools(self.service, caller.profile)
+
+    def binds(self, name, tool):
+        """Only the qualified object itself; a same-name replacement is not it."""
+        entry = self.entries.get(name)
+        return entry is not None and entry.tool is tool
 
     def revision(self, caller, *, enabled=True):
         schemas = [entry.schema for name, entry in sorted(self.entries.items())
