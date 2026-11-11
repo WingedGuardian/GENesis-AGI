@@ -192,6 +192,25 @@ def round_records(budget: Mapping[str, Any]) -> dict[str, rr.RoundRecord] | None
     return out
 
 
+def key_flags(budget: Mapping[str, Any]) -> dict[str, bool | None]:
+    """Each finding key's floor flag over EVERY budget finding, whatever its
+    round head, time or level (``rr.merge_flags``): the loop's end reads a key
+    by what it is, never by which round it was filed under, so a finding on a
+    commit that opened no round is seen like any other."""
+    pairs = []
+    for item in budget.get("findings") or []:
+        if not isinstance(item, Mapping):
+            continue
+        keys = item.get("keys") if isinstance(item.get("keys"), list) else []
+        found = item.get("blocking")
+        if not isinstance(found, list) or len(found) != len(keys):
+            found = [None] * len(keys)
+        for key, flag in zip(keys, found, strict=True):
+            if key is not None:
+                pairs.append((str(key), flag if isinstance(flag, bool) else None))
+    return rr.merge_flags(pairs)
+
+
 def _contexts(
     budget: Mapping[str, Any], item: Mapping[str, Any], at: datetime, ancestors: Ancestors
 ) -> list[RoundContext] | None:
@@ -511,6 +530,7 @@ def _covered_late_keys(
     in_graph, ancestors = _ancestry(budget)
     log = rr._log_reflections(cwd)
     declared = rr.answers(log)
+    flags = key_flags(budget)
     owners = rr.key_rounds(budget)
     records = round_records(budget) or {}
     labels: dict[tuple[tuple[str, ...], str], list[str]] = {}
@@ -601,6 +621,7 @@ def _covered_late_keys(
                         round_record=records.get(str(context.round_head)),
                         round_records=records,
                         declared=declared,
+                        key_flags=flags,
                     ).ok
                 passed = passed and checked[(sha, context)]
             if passed:

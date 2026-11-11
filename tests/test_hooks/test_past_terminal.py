@@ -557,8 +557,10 @@ def _ans(keys, *, at, sent_back=False, fix_now=False, fixes=None):
     return rr.Answer(frozenset(keys), sent_back, bool(fixes) or fix_now, at, fixes)
 
 
-def _ended(records, at, declared=()):
-    return rr.loop_ended(records, gate_lane=False, now=at, cutover=CUT, declared=declared)
+def _ended(records, at, declared=(), flags=None):
+    return rr.loop_ended(
+        records, gate_lane=False, now=at, cutover=CUT, declared=declared, flags=flags
+    )
 
 
 def test_a_send_back_answering_the_newest_round_ends_the_loop():
@@ -638,27 +640,6 @@ def test_the_prediction_is_owed_pr_wide():
     assert any("Prediction: merges at round 6" in p for p in got)
     assert _problems(_reflection(prediction=6, confidence=97), r2, records, at=at) == []
 
-
-def test_a_late_floor_finding_on_an_older_round_keeps_the_loop_open():
-    """C2.4: Devin files a floor finding on round 5's head after round 6 opened
-    clean; fixing it is allowed (E is per key), so the loop stays open."""
-    r5_open = T0 + 8 * timedelta(hours=2)
-    r6_open = r5_open + timedelta(hours=2)
-    earlier = [_rec(i, opened=T0 + (i - 1) * timedelta(hours=2)) for i in range(1, 5)]
-    r5 = rr.RoundRecord(
-        "5" * 40,
-        5,
-        r5_open,
-        ((r5_open, False, "c5"), (r6_open + timedelta(minutes=10), True, "c7")),
-    )
-    r6 = rr.RoundRecord("6" * 40, 6, r6_open, ((r6_open, False, "c6"),))
-    records = _records(*earlier, r5, r6)
-    before = r6_open + timedelta(minutes=5)
-    after = r6_open + timedelta(minutes=50)
-    assert _ended(records, before) is True
-    assert _ended(records, after) is False
-    fixing = _reflection(prediction=7, confidence=99, held="no")
-    assert not any("loop is over" in p for p in _problems(fixing, r5, records, at=after))
 
 
 def test_an_untimed_finding_leaves_the_settle_time_unknown():
@@ -894,21 +875,6 @@ def test_a_mixed_answer_files_one_key_and_keeps_fixing_open():
     assert _ended(records, at, [mixed]) is False
 
 
-def test_a_filed_late_floor_finding_no_longer_lifts_the_end():
-    """Fix audit SF-2: the lift holds only until the late floor finding is
-    answered; filing it ends the loop again."""
-    r5_open = T0 + 8 * timedelta(hours=2)
-    r6_open = r5_open + timedelta(hours=2)
-    earlier = [_rec(i, opened=T0 + (i - 1) * timedelta(hours=2)) for i in range(1, 5)]
-    r5 = rr.RoundRecord(
-        "5" * 40, 5, r5_open, ((r5_open, False, "c5"), (r6_open + timedelta(minutes=10), True, "c7"))
-    )
-    r6 = rr.RoundRecord("6" * 40, 6, r6_open, ((r6_open, False, "c6"),))
-    records = _records(*earlier, r5, r6)
-    after = r6_open + timedelta(minutes=50)
-    assert _ended(records, after) is False
-    assert _ended(records, after, [_ans({"c7"}, at=after - timedelta(minutes=1))]) is True
-
 
 @pytest.mark.parametrize("old", ["round2", "precutover"])
 def test_a_send_back_on_any_key_of_the_pr_ends_the_loop(old):
@@ -943,3 +909,210 @@ def test_the_reflection_log_is_read_once_per_head(tmp_path, monkeypatch):
     _git(repo, "commit", "-q", "--allow-empty", "-m", "next")
     rr._log_reflections(str(repo))
     assert len(reads) == 2
+
+
+def _late_floor_records(*, round_head=True, flag=True, timed=True):
+    """Rounds 1-6 bound, round 6 newest and clean, and a late finding c7 that
+    landed after round 6 opened: on round 5's head, or on no round at all."""
+    r5_open = T0 + 8 * timedelta(hours=2)
+    r6_open = r5_open + timedelta(hours=2)
+    earlier = [_rec(i, opened=T0 + (i - 1) * timedelta(hours=2)) for i in range(1, 5)]
+    when = r6_open + timedelta(minutes=10) if timed else None
+    late = ((when, flag, "c7"),) if round_head else ()
+    r5 = rr.RoundRecord("5" * 40, 5, r5_open, ((r5_open, False, "c5"), *late))
+    r6 = rr.RoundRecord("6" * 40, 6, r6_open, ((r6_open, False, "c6"),))
+    records = _records(*earlier, r5, r6)
+    flags = {**rr._record_flags(records), "c7": flag}
+    return records, flags, r5, r6_open + timedelta(minutes=50)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        {"round_head": True},  # C2.4: a late floor finding on an older round
+        {"round_head": False},  # round 2 (Codex): on a commit that opened no round
+        {"round_head": True, "flag": None},  # an unreadable level
+        {"round_head": True, "timed": False},  # no time
+    ],
+)
+def test_a_late_floor_finding_can_be_fixed_whatever_its_round(shape):
+    """The lift reads the declared fix and the key's flag over every budget
+    finding: a fix-now of a late floor (or unreadable) key outside the newest
+    round is admitted, and once declared it keeps the loop open; filing it
+    instead ends the loop."""
+    records, flags, r5, after = _late_floor_records(**shape)
+    assert _ended(records, after, flags=flags) is True  # nothing declared yet: still ended
+    fixing = _reflection(prediction=7, confidence=99, held="no")
+    fixing.fix_now_keys = {"c7"}
+    record = r5 if shape["round_head"] else None
+    got = rr.past_terminal_problems(
+        fixing, record, records, gate_lane=False, made_at=after, cutover=CUT, flags=flags
+    )
+    assert not any("loop is over" in p for p in got), got
+    fixed = _ans({"c7"}, at=after - timedelta(minutes=1), fix_now=True)
+    assert _ended(records, after, [fixed], flags=flags) is False
+    filed = _ans({"c7"}, at=after - timedelta(minutes=1))
+    assert _ended(records, after, [filed], flags=flags) is True
+
+
+def test_a_late_below_floor_fix_is_still_refused():
+    records, flags, r5, after = _late_floor_records(flag=False)
+    fixing = _reflection(prediction=7, confidence=99, held="no")
+    fixing.fix_now_keys = {"c7"}
+    got = rr.past_terminal_problems(
+        fixing, r5, records, gate_lane=False, made_at=after, cutover=CUT, flags=flags
+    )
+    assert any("loop is over" in p for p in got)
+    fixed = _ans({"c7"}, at=after - timedelta(minutes=1), fix_now=True)
+    assert _ended(records, after, [fixed], flags=flags) is True
+
+
+def test_a_keyless_newest_finding_keeps_the_filing_end_off():
+    """S5: a newest-round finding with no key cannot be answered, so filing
+    the keyed ones does not end the loop."""
+    _, records = _ladder(3)
+    r4 = rr.RoundRecord("4" * 40, 4, _late(4), ((_late(4), False, "c1"), (_late(4), True, None)))
+    records = {**records, r4.head: r4}
+    at = _late(4) + timedelta(hours=1)
+    assert _ended(records, at, [_ans({"c1"}, at=at)]) is False
+
+
+def test_key_flags_read_every_budget_finding():
+    budget = {
+        "findings": [
+            {"round_head": None, "keys": ["c1", "c2"], "blocking": [True, False]},
+            {"round_head": "a" * 40, "keys": ["c2"], "blocking": [None]},
+            {"round_head": "b" * 40, "keys": ["c3"], "blocking": "bad"},
+        ]
+    }
+    assert rl.key_flags(budget) == {"c1": True, "c2": None, "c3": None}
+@pytest.mark.parametrize("floor", [True, False])
+def test_admission_fixes_a_late_floor_finding_that_opened_no_round(monkeypatch, tmp_path, floor):
+    """Round 2 (Codex): five bound rounds, round 5 clean, then a P1 on a commit
+    that opened no round (round_head None in the budget). Through the real
+    round_records and key_flags, a fix-now of it is not refused by the end."""
+    import time
+
+    budget, cutover = _ended_budget()
+    budget["findings"].append(
+        {
+            "round_head": None,
+            "submitted_at": datetime.now(UTC).isoformat(),
+            "keys": ["c99"],
+            "blocking": [floor],
+        }
+    )
+    monkeypatch.setattr(rr, "PAST_TERMINAL_CUTOVER_ISO", cutover)
+    head = budget["current_head"]
+    lines = [
+        f"Round-reflection: keys=c99 head={head}",
+        "Class: unchecked subprocess result = 1",
+        "Premise: LEAD",
+        "Premise-why: the change routes around an existing helper that already exists",
+        "Impossible: route every call through one checked helper and delete the rest",
+        "Scope: covered: the key round-trips (tests/test_x.py)",
+        "Decision: fix-instances",
+        "Decision-why: the same mistake appears twice in two different files",
+        "Disposition: c99 fix-now test=1",
+        "Prediction: merges at round 6 because the class is closed now",
+        "Confidence: 99% falsified-by any new finding in that class",
+        "Prediction-held: no a floor finding arrived late",
+        "Escalate: no",
+    ]
+    message = tmp_path / "reflection.md"
+    message.write_text("\n".join(lines) + "\n")
+    monkeypatch.setattr(_gate, "_exemption_shape_ok", lambda *a: True)
+    monkeypatch.setattr(_gate, "_reflection_message_file", lambda seg: str(message))
+    monkeypatch.setattr(_gate, "_staged_files", lambda *a, **k: [])
+    monkeypatch.setattr(_gate, "_integration_in_progress", lambda *a, **k: False)
+    monkeypatch.setattr(rr, "_log_reflections", lambda cwd: [])
+    assert (
+        rr.loop_ended(
+            rr._round_records(budget), gate_lane=False, now=datetime.now(UTC), cutover=cutover
+        )
+        is True
+    )
+    problem = _gate._reflection_problem(
+        [["git"]], "git commit", str(tmp_path), budget, rr, deadline=time.monotonic() + 9
+    )
+    if floor:
+        assert not problem or "loop is over" not in problem, problem
+    else:  # a late below-floor finding is filed, never fixed, once the loop ended
+        assert problem and "loop is over" in problem, problem
+
+
+def test_open_coverage_reads_every_budget_finding_flag(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(rr, "covered_keys", lambda *a, **k: seen.update(k) or set())
+    budget = {
+        "rounds": [],
+        "findings": [{"round_head": None, "keys": ["c9"], "blocking": [False]}],
+    }
+    state = {"head": HEAD, "round": 5, "gate_lane": False, "round_started": None}
+    rr._open_covered(".", budget, state, None)
+    assert seen["key_flags"] == {"c9": False}
+@pytest.mark.parametrize("key", ["c404", "c7"])
+def test_declaring_an_old_or_unknown_key_never_reopens_the_loop(key):
+    """Fix audit F1: once the loop ended, an empty reflection declaring
+    fix-now on a key no finding has (c404), or on a floor key already
+    answered before the newest round opened (c7), keeps it ended and is
+    refused."""
+    records, flags, _r5, after = _late_floor_records(round_head=False)
+    r6 = max(records.values(), key=lambda r: r.number)
+    early = _ans({"c7"}, at=r6.opened_at - timedelta(minutes=5), fix_now=True)
+    reopen = _ans({key}, at=after - timedelta(minutes=1), fix_now=True)
+    assert _ended(records, after, [early], flags=flags) is True
+    assert _ended(records, after, [early, reopen], flags=flags) is True
+    fixing = _reflection(prediction=7, confidence=99, held="no")
+    fixing.fix_now_keys = {key}
+    got = rr.past_terminal_problems(
+        fixing, None, records, gate_lane=False, made_at=after, cutover=CUT,
+        declared=[early], flags=flags,
+    )
+    assert any("loop is over" in p for p in got)
+
+
+def test_fixing_then_filing_a_late_key_ends_the_loop():
+    """Fix audit F2: the newest answer for a key decides it."""
+    records, flags, _r5, after = _late_floor_records()
+    fixed = _ans({"c7"}, at=after - timedelta(minutes=5), fix_now=True)
+    filed = _ans({"c7"}, at=after - timedelta(minutes=1))
+    assert _ended(records, after, [fixed], flags=flags) is False
+    assert _ended(records, after, [fixed, filed], flags=flags) is True
+
+
+def test_the_gate_reads_every_budget_finding_for_the_end(monkeypatch):
+    """Fix audit F3: Rule R's own end check takes the flags from the whole
+    budget. A P1 with no round head, declared fix-now after the newest round
+    opened, keeps content commits open; unknown to the budget, it would not."""
+    budget, cutover = _ended_budget()
+    budget["findings"].append(
+        {
+            "round_head": None,
+            "submitted_at": datetime.now(UTC).isoformat(),
+            "keys": ["c99"],
+            "blocking": [True],
+        }
+    )
+    fixing = (
+        f"Round-reflection: keys=c99 head={'e' * 40}\n"
+        "Class: unchecked subprocess result = 1\nPremise: LEAD\n"
+        "Premise-why: the change routes around an existing helper that already exists\n"
+        "Impossible: route every call through one checked helper and delete the rest\n"
+        "Scope: covered: the key round-trips (tests/test_x.py)\nDecision: fix-instances\n"
+        "Decision-why: the same mistake appears twice in two different files\n"
+        "Disposition: c99 fix-now test=1\n"
+        "Prediction: merges at round 6 because the class is closed now\n"
+        "Confidence: 99% falsified-by any new finding in that class\n"
+        "Prediction-held: no a floor finding arrived late\nEscalate: no\n"
+    )
+    log = [("f" * 40, "empty", fixing, datetime.now(UTC) - timedelta(minutes=1))]
+    assert _rule(monkeypatch, budget, cutover, log=log)[0] == "continue"
+    monkeypatch.setattr(rr, "_key_flags", lambda budget: {})
+    assert _rule(monkeypatch, budget, cutover, log=log)[0] == "deny"
+
+
+def test_merge_flags_floor_wins_then_unknown():
+    assert rr.merge_flags([("a", False), ("a", True), ("a", None)]) == {"a": True}
+    assert rr.merge_flags([("b", False), ("b", None)]) == {"b": None}
+    assert rr.merge_flags([("c", False), ("c", False)]) == {"c": False}

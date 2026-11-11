@@ -1314,7 +1314,8 @@ def test_a_round_five_fix_now_with_no_floor_finding_is_not_covered(repo, tmp_pat
         f"{n:040x}": rr.RoundRecord(f"{n:040x}", n, opened - timedelta(hours=10 - n), ())
         for n in range(1, 5)
     }
-    records = {**earlier, head: rr.RoundRecord(head, 5, opened, ((opened, False, "c1"),))}
+    clean = ((opened, False, "c1"), (opened, False, "c2"))
+    records = {**earlier, head: rr.RoundRecord(head, 5, opened, clean)}
     kw = dict(round_number=5, round_records=records, round_started=opened - timedelta(days=1))
     held = "Prediction-held: yes the round drew only minor findings again"
     predicted = (

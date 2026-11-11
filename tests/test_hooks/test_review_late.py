@@ -1413,3 +1413,32 @@ def test_status_never_lets_the_open_rounds_coverage_clear_a_late_key(pr, monkeyp
     monkeypatch.setattr(rr, "covered_keys", lambda *a, **k: {"c2", "c9"})
     monkeypatch.setattr(rl, "covered_late_keys", lambda *a, **k: set())
     assert rr.status(str(path), now=T0, cutover=CUT)["owed"] == ["c9"]
+def test_a_late_floor_key_that_opened_no_round_is_credited_on_the_late_path(
+    pr, tmp_path, monkeypatch
+):
+    """#4368 round 2 on the late path: rounds 1-6 bound, round 6 newest and
+    clean, and c9 a floor finding no round record carries (round_head None in
+    the budget). Its fix-now answer, with its Prediction, is credited: the
+    flags come from every budget finding."""
+    path, base, head, fix = pr
+    budget, second, answer = _two_round_answer(path, tmp_path, base, head, fix)
+    answer = answer.replace(
+        "Escalate: no",
+        "Prediction-held: no a floor finding arrived late\n"
+        "Prediction: merges at round 7 because the class is closed now\n"
+        "Confidence: 99% falsified-by any new finding in that class\nEscalate: no",
+    )
+    _reflect(path, tmp_path, answer, T0 + timedelta(minutes=120))
+    opened = T0 + timedelta(minutes=70)
+    records = {
+        f"{n:040x}": rr.RoundRecord(f"{n:040x}", n, opened - timedelta(hours=6 - n), ())
+        for n in range(1, 6)
+    }
+    r6 = rr.RoundRecord("6" * 40, 6, opened, ((opened + timedelta(minutes=1), False, "c8"),))
+    records[r6.head] = r6
+    monkeypatch.setattr(rl, "round_records", lambda budget: records)
+    monkeypatch.setattr(rl, "key_flags", lambda budget: {"c9": True, "c8": False})
+    monkeypatch.setattr(rr, "PAST_TERMINAL_CUTOVER_ISO", (T0 - timedelta(days=1)).isoformat())
+    assert _credit(path, budget) == {"c9"}
+    monkeypatch.setattr(rl, "key_flags", lambda budget: {"c8": False})  # c9 unknown to the budget
+    assert _credit(path, budget) == set()

@@ -301,6 +301,52 @@ def answers(log: Iterable[tuple[str, str, str, datetime | None]]) -> tuple[Answe
     return tuple(found)
 
 
+def merge_flags(pairs: Iterable[tuple[str, bool | None]]) -> dict[str, bool | None]:
+    """``{key: floor flag}`` from ``(key, flag)`` pairs: True when any is at
+    the floor, None when none is and one cannot be read, else False."""
+    seen: dict[str, list[bool | None]] = {}
+    for key, flag in pairs:
+        seen.setdefault(str(key), []).append(flag)
+    return {k: True if True in v else None if None in v else False for k, v in seen.items()}
+
+
+def _record_flags(records: Mapping[str, RoundRecord]) -> dict[str, bool | None]:
+    return merge_flags(
+        (str(k), b) for r in records.values() for _w, b, k in r.findings if k is not None
+    )
+
+
+def _open_late_fix(
+    keys: Iterable[str],
+    newest: RoundRecord,
+    flags: Mapping[str, bool | None],
+    earlier: Iterable[str] = (),
+) -> bool:
+    """Whether fixing ``keys`` is fixing a late floor (or unreadable) finding
+    outside the newest round: E is per key, so that fix stays open whatever
+    ended the newest round. Each key must be a finding the budget carries
+    (``flags``) and must not have been answered before the newest round
+    opened (``earlier``): naming an old, already answered key, or a key no
+    finding has, never reopens the loop."""
+    keys, earlier = set(keys), set(earlier)
+    return (
+        bool(keys)
+        and not keys & newest.keys
+        and not keys & earlier
+        and all(k in flags and flags[k] is not False for k in keys)
+    )
+
+
+def _answered_before(declared: Iterable[Answer], newest: RoundRecord) -> set[str]:
+    """Keys a committed reflection named before ``newest`` opened."""
+    if newest.opened_at is None:
+        return set()
+    return {
+        k for a in declared if a.made_at is not None and a.made_at < newest.opened_at
+        for k in a.keys
+    }
+
+
 def past_terminal(round_number: int, gate_lane: bool) -> tuple[bool, bool]:
     """``(predict, judge)`` owed past the ordinary lane's terminal round: a
     Prediction from round 4, the held judgement and the end-now rule from
@@ -387,6 +433,7 @@ def past_terminal_problems(
     made_at: datetime | None,
     cutover: str | None = None,
     declared: Iterable[Answer] = (),
+    flags: Mapping[str, bool | None] | None = None,
 ) -> list[str]:
     """The past-round-4 rules for a reflection answering ``record``'s keys
     (owner rulings 132a2135, e951d5a9, a90139c6). Nothing on the gate lane or
@@ -396,7 +443,9 @@ def past_terminal_problems(
     PR-wide phase reads the PR's newest round, whatever round the key is
     from: the end of the loop (``loop_ended``, with the committed
     ``declared`` answers), the two-failure rule, and the Prediction and
-    Confidence a fix-now owes. The per-round phase reads the key's own round:
+    Confidence a fix-now owes. A fix-now of floor (or unreadable) keys outside
+    the newest round is never refused by the end: ``flags`` (by key, over every
+    budget finding, ``review_late.key_flags``) says which. The per-round phase reads the key's own round:
     ``Prediction-held`` and the end-now rule (from round 5). Send-back with
     ``Prediction-held: no`` passes every rule in every state, so no state
     leaves the session without an admissible reflection."""
@@ -419,10 +468,17 @@ def past_terminal_problems(
         and record.head == newest.head
         and newest.number >= JUDGE_FROM
         and record.blocking(made_at)[0] is False
+        and parsed.fix_now_keys <= record.keys
+    )
+    flags = _record_flags(records) if flags is None else flags
+    declared = tuple(declared)
+    late_fix = _open_late_fix(
+        parsed.fix_now_keys, newest, flags, _answered_before(declared, newest)
     )
     if parsed.fix_now and not sent_back:
-        if not own_end and loop_ended(
-            records, gate_lane=gate_lane, now=made_at, cutover=cutover, declared=declared
+        if not own_end and not late_fix and loop_ended(
+            records, gate_lane=gate_lane, now=made_at, cutover=cutover, declared=declared,
+            flags=flags,
         ):
             # Fixing now would be admitted here and then refused at the commit.
             return [
@@ -484,6 +540,7 @@ def loop_ended(
     now: datetime,
     cutover: str | None = None,
     declared: Iterable[Answer] = (),
+    flags: Mapping[str, bool | None] | None = None,
 ) -> bool | None:
     """Whether the review loop is over at ``now`` (spec rev 3, owner rulings
     e951d5a9 and a90139c6). The PR is past round 4 under the rules (ordinary
@@ -493,20 +550,26 @@ def loop_ended(
       reflection naming any key of the PR); or
     - had every one of its findings seen by ``now`` answered without a fix
       (filed): a floor finding arriving after the answers is unanswered, so
-      fixing it stays open; or
+      fixing it stays open; a finding with no key cannot be answered, so it
+      keeps this end off; or
     - is round 5 or later and drew no floor finding.
 
-    Monotone over ``declared``: a later reflection cannot reopen it; a newer
-    round does. The last two also lift while a floor finding that landed on
-    an older round after R opened is not yet filed: fixing it is allowed (E
-    is per key), and needs the loop open. None when it cannot be told (fails
-    open)."""
+    A newer round reopens it. The last two also lift while an answer made
+    after R opened fixes now a floor (or unreadable) key outside R that the
+    budget carries and no answer named before R opened, and no later answer
+    filed it (``_open_late_fix``): E is per key, so that fix needs the loop
+    open. The
+    lift reads what the reflections declared and each key's flag over every
+    budget finding (``flags``), never an enumeration of findings by round or
+    time, so no finding can fall outside it. None when it cannot be told
+    (fails open)."""
     cutover = PAST_TERMINAL_CUTOVER_ISO if cutover is None else cutover
     if records is None:
         return None
     newest = _past_terminal_pr(records, now, gate_lane, cutover)
     if newest is None:
         return False
+    declared = tuple(declared)
     pr_keys = set().union(*(r.keys for r in records.values()))
     made = [
         a for a in declared
@@ -516,24 +579,26 @@ def loop_ended(
     if any(a.sent_back and a.keys & pr_keys for a in made):
         return True
     filed = {k for a in made for k in a.keys - a.fix_now_keys}
-    seen = {
-        str(k) for when, _flag, k in newest.findings
-        if k is not None and (when is None or when <= now)
-    }
-    ended: bool | None = bool(seen) and seen <= filed
+    current = [(when, k) for when, _flag, k in newest.findings if when is None or when <= now]
+    seen = {str(k) for _when, k in current if k is not None}
+    keyless = any(k is None for _when, k in current)
+    ended: bool | None = bool(seen) and not keyless and seen <= filed
     if not ended and newest.number >= JUDGE_FROM:
         blocking, _ = newest.blocking(now)
         ended = None if blocking is None else not blocking
     if not ended:
         return ended
-    for record in records.values():
-        if record is newest or not _bound(record, cutover):
-            continue
-        for when, flag, key in record.findings:
-            late_floor = flag is True and when is not None and newest.opened_at <= when <= now
-            if late_floor and str(key) not in filed:
-                return False
-    return True
+    flags = _record_flags(records) if flags is None else flags
+    # The newest answer naming a key decides it: fixing it, then filing it,
+    # leaves it filed.
+    fixing: dict[str, bool] = {}
+    for a in sorted(made, key=lambda a: a.made_at or newest.opened_at):
+        for k in a.keys:
+            fixing[k] = k in a.fix_now_keys
+    earlier = _answered_before(declared, newest)
+    return not any(
+        fix and _open_late_fix({k}, newest, flags, earlier) for k, fix in fixing.items()
+    )
 
 
 def _normalize(text: str) -> str:
@@ -1330,6 +1395,7 @@ def check(
     round_record: RoundRecord | None,
     round_records: Mapping[str, RoundRecord],
     declared: Iterable[Answer] = (),
+    key_flags: Mapping[str, bool | None] | None = None,
 ) -> Reflection:
     """Every local rule a reflection must meet for this round, in one place.
     ``cwd`` is the repository: a relative evidence path is read from there.
@@ -1351,6 +1417,7 @@ def check(
             gate_lane=gate_lane,
             made_at=made_at if isinstance(made_at, datetime) else _parse_when(made_at),
             declared=declared,
+            flags=key_flags,
         )
     )
     if parsed.head != head:
@@ -1620,6 +1687,7 @@ def covered_keys(
     round_started: object,
     reviewed_at: Mapping[str, datetime | None] | None = None,
     deadline: float | None = None,
+    key_flags: Mapping[str, bool | None] | None = None,
 ) -> set[str]:
     """Keys answered at ``head`` by committed reflections. THE coverage check.
 
@@ -1665,6 +1733,7 @@ def covered_keys(
             acceptance=acceptance,
             round_started=round_started,
             reviewed_at=reviewed_at or {},
+            key_flags=key_flags,
         )
 
 
@@ -1680,6 +1749,7 @@ def _covered_keys(
     acceptance: Sequence[str] | None,
     round_started: object,
     reviewed_at: Mapping[str, datetime | None],
+    key_flags: Mapping[str, bool | None] | None = None,
 ) -> set[str]:
     log = _log_reflections(cwd)
     declared = answers(log)
@@ -1719,6 +1789,7 @@ def _covered_keys(
             round_record=round_records.get(head),
             round_records=round_records,
             declared=declared,
+            key_flags=key_flags,
         )
         if result.ok:
             covered.update(k for k in result.keys if clears(clock, reviewed_at.get(k)))
@@ -1927,6 +1998,12 @@ def _round_records(budget: Mapping[str, Any]) -> dict[str, RoundRecord] | None:
     return review_late.round_records(budget)
 
 
+def _key_flags(budget: Mapping[str, Any]) -> dict[str, bool | None]:
+    import review_late  # noqa: PLC0415 - review_late imports this module
+
+    return review_late.key_flags(budget)
+
+
 def _open_covered(
     cwd: str,
     budget: Mapping[str, Any],
@@ -1948,6 +2025,7 @@ def _open_covered(
         ],
         key_rounds=key_rounds(budget),
         round_records=_round_records(budget),
+        key_flags=_key_flags(budget),
         acceptance=acceptance,
         round_started=state["round_started"],
         reviewed_at=_open_review_times(budget),

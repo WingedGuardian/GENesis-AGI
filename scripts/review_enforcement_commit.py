@@ -1149,6 +1149,7 @@ def _reflection_rounds_problem(
     by_number = {record.number: record for record in records.values()}
     now = datetime.now(UTC)
     declared = _declared_answers(cwd, budget, rr, records, now, deadline)
+    flags = rr._key_flags(budget)
     problems: list[str] = []
     for key in sorted(rounds):
         failed = []
@@ -1162,6 +1163,7 @@ def _reflection_rounds_problem(
                 gate_lane=gate_lane,
                 made_at=now,
                 declared=declared,
+                flags=flags,
             )
         if not failed:
             break
@@ -1357,6 +1359,7 @@ def _loop_ended(cwd: str | None, budget: dict, rr, deadline: float | None = None
                 gate_lane=bool(budget.get("gate_surface")),
                 now=now,
                 declared=_declared_answers(cwd, budget, rr, records, now, deadline),
+                flags=rr._key_flags(budget),
             )
         )
     except Exception as exc:  # noqa: BLE001 - unknown is not a refusal
