@@ -27,7 +27,7 @@ _CLOSURE_VARS = (
     "PYTEST_CURRENT_TEST", "GENESIS_LIVE_E2E", "GENESIS_DB_PATH", "SECRETS_PATH",
     "GENESIS_PROACTIVE_HOOK_URL", "GENESIS_MCP_LOG_DIR", "GH_CONFIG_DIR",
     "GIT_TERMINAL_PROMPT", "GIT_SSH_COMMAND", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM",
-    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_SYSTEM", "GUARDIAN_SECRETS",
 )  # fmt: skip
 
 
@@ -147,6 +147,7 @@ import genesis.mcp.health.task_tools  # noqa: F401
 
 print("EARLY_ENV=" + os.environ.get("GENESIS_DB_PATH", "<unset>"))
 print("EARLY_SECRETS=" + os.environ.get("SECRETS_PATH", "<unset>"))
+print("EARLY_GUARDIAN=" + os.environ.get("GUARDIAN_SECRETS", "<unset>"))
 if os.environ.get("CLOSURE_PROBE_RESET_DB"):
     # Something resetting the variable between the plugin's import and configure.
     os.environ["GENESIS_DB_PATH"] = os.environ["CLOSURE_PROBE_RESET_DB"]
@@ -349,3 +350,74 @@ def test_git_askpass_helpers_and_inherited_config_are_removed(tmp_path):
     ):  # fmt: skip
         assert _value(out.stdout, name) == "<absent>", out.stdout
     assert _value(out.stdout, "GIT_HELPER") == "", out.stdout
+
+
+@_SECRETS_HALF_OFF
+def test_guardian_isolated_from_test_monkeypatch_undo(tmp_path, monkeypatch):
+    from genesis.guardian.config import load_secrets
+
+    isolated = tmp_path / "no-guardian-secrets.env"
+    assert os.environ.get("GUARDIAN_SECRETS") == str(isolated)
+    assert not isolated.exists()
+    assert load_secrets() == {}
+    fixture = tmp_path / "explicit.env"
+    fixture.write_text("TEST_ONLY=synthetic\n")
+    monkeypatch.setenv("GUARDIAN_SECRETS", str(fixture))
+    assert load_secrets() == {"TEST_ONLY": "synthetic"}
+    monkeypatch.undo()
+    assert os.environ["GUARDIAN_SECRETS"] == str(isolated)
+    child = subprocess.run(
+        [sys.executable, "-c", "from genesis.guardian.config import load_secrets; assert load_secrets() == {}"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert child.returncode == 0, child.stderr
+
+
+@pytest.mark.parametrize("inherited", [False, True])
+@pytest.mark.parametrize("live", [False, True])
+def test_guardian_import_and_install_isolation(tmp_path, inherited, live, monkeypatch):
+    # Even the RED run can reach only files owned by this test.
+    owned_home = tmp_path / "home"
+    default = owned_home / ".local/share/genesis-guardian/secrets.env"
+    default.parent.mkdir(parents=True)
+    default.write_text("TEST_ONLY=default\n")
+    explicit = tmp_path / "inherited.env"
+    explicit.write_text("TEST_ONLY=inherited\n")
+    env = {"HOME": str(owned_home)}
+    if inherited:
+        env["GUARDIAN_SECRETS"] = str(explicit)
+    if live:
+        env["GENESIS_LIVE_E2E"] = "1"
+    probe = _SUBRUN_EARLY_TEST + """
+
+def test_guardian_first(tmp_path, monkeypatch):
+    from genesis.guardian.config import load_secrets
+    expected = os.environ.get("CLOSURE_EXPECTED")
+    assert load_secrets() == ({"TEST_ONLY": expected} if expected else {})
+    if not expected:
+        path = os.environ["GUARDIAN_SECRETS"]
+        assert path == str(tmp_path / "no-guardian-secrets.env")
+        monkeypatch.setenv("GUARDIAN_SECRETS", "owned-override")
+        monkeypatch.undo()
+        assert os.environ["GUARDIAN_SECRETS"] == path
+        from pathlib import Path
+        Path(path).write_text("TEST_ONLY=contamination\\n")
+
+
+def test_guardian_second():
+    from genesis.guardian.config import load_secrets
+    expected = os.environ.get("CLOSURE_EXPECTED")
+    assert load_secrets() == ({"TEST_ONLY": expected} if expected else {})
+"""
+    monkeypatch.setattr(sys.modules[__name__], "_SUBRUN_EARLY_TEST", probe)
+    if live:
+        env["CLOSURE_EXPECTED"] = "inherited" if inherited else "default"
+    run = tmp_path / "run"
+    run.mkdir()
+    out = _subrun(run, env)
+    expected = (str(explicit) if inherited else "<unset>") if live else str(
+        Path(_value(out.stdout, "BASE")) / "no-guardian-secrets.env"
+    )
+    assert _value(out.stdout, "EARLY_GUARDIAN") == expected
+    assert default.read_text() == "TEST_ONLY=default\n"
+    assert explicit.read_text() == "TEST_ONLY=inherited\n"

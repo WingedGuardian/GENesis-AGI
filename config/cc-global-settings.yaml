@@ -3,6 +3,14 @@
 # Documents the intended ~/.claude/settings.json configuration.
 # Applied via: python scripts/setup_claude_config.py --global
 #
+# Retention/attribution are applied separately by CC_CLIENT_SETTINGS_POLICY in
+# scripts/lib/cc_version.sh through the shared atomic settings writer. Retention
+# has a 180-day minimum; a valid positive GENESIS_CC_RETENTION_DAYS selects an
+# exact value, and existing attribution choices are preserved. Container
+# install/bootstrap/update and the daily settings timer reapply this policy.
+# The host applies it during host setup only, not recurring version alignment.
+# These comments document the policy; this manifest adds no retention writer.
+#
 # For non-Genesis use (public repo): sonnet is a viable, lower-cost starter model.
 
 model: "opus[1m]"

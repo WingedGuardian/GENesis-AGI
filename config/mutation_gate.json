@@ -44,6 +44,51 @@
       "why": "deleting a protected directory must be refused, and this is the single decision point that refuses it"
     },
     {
+      "label": "inbox report salvages corrupt versioned input",
+      "path": "scripts/inbox_coverage_report.py",
+      "anchor": "_decode_v2_items(batch_items)",
+      "replacement": "[\"https://example.com/a\"]",
+      "validator": "python",
+      "test": "tests/test_scripts/test_inbox_report_items.py::test_corrupt_versioned_input_never_falls_back_to_partial_membership[mixed]",
+      "why": "One invalid element makes the entire retained v2 input unknown; no valid-looking URL may be salvaged as evaluated."
+    },
+    {
+      "label": "inbox report promotes cumulative baseline to dispatched input",
+      "path": "scripts/inbox_coverage_report.py",
+      "anchor": "and url in r.item_urls",
+      "replacement": "and (url in r.item_urls or url in r.baseline_urls)",
+      "validator": "python",
+      "test": "tests/test_scripts/test_inbox_report_items.py::test_versioned_baseline_only_membership_remains_unknown",
+      "why": "The cumulative baseline may include text appended after dispatch; membership must not create evaluated status."
+    },
+    {
+      "label": "inbox report equates item identity with URL-only identity",
+      "path": "scripts/inbox_coverage_report.py",
+      "anchor": "return normalize_url_line(text.strip())",
+      "replacement": "return tuple(_note_urls(text))",
+      "validator": "python",
+      "test": "tests/test_scripts/test_inbox_report_items.py::test_changed_annotation_is_not_an_exact_item_match",
+      "why": "A stored URL does not prove a changed annotation or whole logical item was handled; all report victims are disposable fixtures."
+    },
+    {
+      "label": "inbox report drops lossy text baseline uncertainty",
+      "path": "scripts/inbox_coverage_report.py",
+      "anchor": "normalize_url_line(line.strip()) in baseline_lines",
+      "replacement": "False",
+      "validator": "python",
+      "test": "tests/test_scripts/test_inbox_report_items.py::test_lossy_baseline_lines_preserve_text_history_uncertainty[sorted]",
+      "why": "Sorted cumulative lines retain historical appearance without input boundaries; their text-only uncertainty must survive."
+    },
+    {
+      "label": "inbox report treats unknown noncompleted input as never",
+      "path": "scripts/inbox_coverage_report.py",
+      "anchor": "row.item_urls is None or url in row.item_urls",
+      "replacement": "url in (row.item_urls or [])",
+      "validator": "python",
+      "test": "tests/test_scripts/test_inbox_report_items.py::test_unknown_input_history_is_not_proof_of_never[missing-failed]",
+      "why": "Missing failed-row input cannot prove that a URL was never dispatched; the fixture has no baseline to mask the fallback."
+    },
+    {
       "label": "inbox rulings drops exact tag filtering",
       "path": "scripts/inbox_review_rulings.py",
       "anchor": "if \"inbox_disposition\" not in tags.split():",

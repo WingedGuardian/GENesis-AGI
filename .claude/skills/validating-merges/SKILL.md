@@ -238,14 +238,34 @@ count says anything about the other.
 
 ## Standing mode (Claude Code only)
 
+**Only the owner starts one.** A session never starts or restarts a standing
+loop on its own: not from an earlier yes, a plan step or a ledger row, and not
+after the loop stops. Each start needs the owner's explicit instruction at that
+moment. Once started, the loop paces itself until a stop rule below ends it.
+
 A standing validator is a session the owner starts, in a tmux slot, to work the
-backlog one PR at a time. Start it with `/loop` (no interval) so it can pace
+backlog one PR at a time. The owner starts it with `/loop` (no interval) so it can pace
 itself with ScheduleWakeup; it also uses `outreach_send`, so it is a Claude Code
 mode, and the Codex validator above does not run it. **Run one per install:** the
 picker has no lease, so two would pick the same row and report the same failure
 twice. Everything else in this skill applies to each pass, except that the
 picker's order (unfinished work first, then newest merge) replaces the backlog
-order in "Triage by risk".
+order in "Triage by risk". "Unfinished work" is a `not-yet-done` row, offered
+at once unless its stored document declares `"no_progress": true`; then it waits
+7 days after that attempt and returns to the front, so a row whose step needs a
+push, deploy or merge costs one pass, not every pass.
+
+**Declaring no progress.** Before recording a `not-yet-done` on a row that already
+has one, read its previous attempt (`--verification-log --pr <N>`: the note and
+the stored document). Set the document's `"no_progress": true` only when this
+attempt's remaining steps are the same work as that attempt's: nothing you did
+moved them. Set it to `false` when you finished a step, a step changed, or the
+row had no earlier `not-yet-done`. A document copied from the stored record may
+already say `true` from an earlier wait, so set the value on every attempt and
+never inherit it. The flag is your judgment, not a text match: a
+reworded step that is the same work is no progress. While the record's tracking
+is pending the row is still offered at once; the routing re-record (step 5)
+carries the same document, so the wait starts once routing completes.
 
 **Once per session:** run the tracking preflight (above), from the main checkout,
 whose `.venv/bin/python` the commands below use (a linked worktree has no `.venv`).
@@ -314,12 +334,15 @@ the tool derives `cannot-verify`, and pass
 `--note "not in the serving tree: <sha>; standing mode does not deploy"`. Its
 `deploy` concern needs an issue like any other; one "awaiting deploy of <sha>"
 issue can carry several rows. This is deliberate: `not-yet-done` is offered
-again at once, while `cannot-verify` waits out the 7-day re-attempt window.
+again at once (unless it declares no progress), while `cannot-verify` waits out
+the 7-day re-attempt window.
 
 **Stop and ask the owner** after any of:
 - 3 consecutive `cannot-verify` results with the same cause;
-- 3 consecutive passes picking the same `not-yet-done` row (it is offered again
-  with no delay);
+- 3 consecutive passes picking the same `not-yet-done` row (a declared no
+  progress makes the row wait, so a third pick means either each attempt made
+  progress or `no_progress` was missed: read the last two attempts before
+  asking);
 - 3 consecutive picker faults with the same cause;
 - routing that cannot complete (the filer refused, an indeterminate result, or
   GitHub unreachable): step 4 already stored the open verdict or saved the
@@ -547,6 +570,40 @@ passes (2 of 14 rows) came from this. One PR's
 refusal rule was tested only on its release half, and the defect was in the serve
 half; another's post-save warning was tested on one stop path, and a second path
 lacked it. Open issues named both defects, and neither was read.
+
+### The holdout check
+
+An install may keep hidden holdout scenarios that builders never see
+(`docs/reference/holdout.md`). For every row, run
+`.venv/bin/python scripts/holdout_runner.py --pr <N>` from the main checkout. It
+prints `no holdout on this install`, or one line per scenario the merge touches.
+Record it:
+
+- `REGRESSED` and `NOT-DELIVERED` are a claim that failed at `MEASURED`, so the
+  row derives `fail-intent`.
+- `DELIVERED` goes in `controls`: it failed before the merge and passes after.
+  Then spawn `holdout-writer` in the foreground to retire it into a regression
+  scenario.
+- `PASS` is a finding, never a control: nothing had to come out the other way.
+- `PENDING` needs nothing: the scenario belongs to another issue's work, or to
+  a later PR in a split of this one.
+- `BROKEN-BEFORE`, `STALE-INTENT`, `FIXED`, `DELIVERED-UNLINKED`,
+  `CLOSED-NOT-DELIVERED` and `MALFORMED`
+  are findings about the default branch or the scenario, never this row's
+  verdict. File or reuse an issue for `BROKEN-BEFORE`, and tell the owner about
+  the rest.
+- Exit 3 (the run could not be completed) is a gap naming the reason it printed.
+- A `holdout fence:` line naming possibly spoiled scenarios goes to the owner:
+  a scenario seen by someone other than its writer may be spoiled. One that
+  names none needs no report unless it also counts unreadable lines or
+  holdout-writer accesses, which the owner confirms; the same holds for a
+  `no exposures logged` line. An `exposure log unreadable` line goes to the
+  owner too. A line
+  saying the fence is not installed means exposures are not being recorded.
+
+Never open, list or quote the holdout directory (`$GENESIS_HOME/holdout/`,
+`~/.genesis/holdout/` by default) yourself, and never ask what a
+scenario checks beyond its printed `Protects` line: reading it spoils it.
 
 ---
 

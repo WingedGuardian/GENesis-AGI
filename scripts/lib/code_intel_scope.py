@@ -107,11 +107,14 @@ def cleanup_observation(registration, registration_sha256, proof, *, owned_wait,
 class ScopeManager:
     """Read existing identities using the shared typed bus primitives; no actions."""
 
-    def __init__(self, bus, property_value, *, deadline, clock=time.monotonic):
+    def __init__(self, bus, property_value, *, deadline, clock=time.monotonic, require_runtime_limit=False):
         if type(deadline) not in (int, float) or not math.isfinite(deadline):
             raise ValueError("invalid manager observation deadline")
+        if type(require_runtime_limit) is not bool:
+            raise ValueError("invalid runtime policy requirement")
         self.bus, self.property = bus, property_value
         self.deadline, self.clock = deadline, clock
+        self.require_runtime_limit = require_runtime_limit
 
     def _call(self, path, interface, method, *args):
         remaining = self.deadline - self.clock()
@@ -183,6 +186,23 @@ class ScopeManager:
         identity, properties, path = self._snapshot("GetUnit", ("s", unit + ".scope"), "Scope")
         if reporter_unit != path or self._object("GetUnitByPID", "u", str(pid)) != path:
             raise ValueError("named scope does not own the actual reporter")
+        return self._registration(unit, facts, identity, properties, wall_seconds)
+
+    def original(self, registration, facts, *, object_path, wall_seconds, proof):
+        """Observe an original subtree after foreground exit; grant no action."""
+        if (type(wall_seconds) is not int or not 0 < wall_seconds <= 2**63 - 1
+                or not proof._facts(registration["facts"]) or not proof._facts(facts)):
+            raise ValueError("invalid original scope facts or wall cap")
+        proof._complete(registration["facts"], facts)
+        unit = registration["unit"]
+        identity, properties, path = self._snapshot("GetUnit", ("s", unit + ".scope"), "Scope")
+        current = self._registration(unit, facts, identity, properties, wall_seconds)
+        if (path != object_path or current["invocation_id"] != registration["invocation_id"]
+                or current["stop_usec"] != registration["stop_usec"]):
+            raise ValueError("original scope invocation, object or stop policy changed")
+        return current
+
+    def _registration(self, unit, facts, identity, properties, wall_seconds):
         leaf = PurePosixPath(facts["leaf"]["path"])
         group = self.property(properties, "ControlGroup", "s")
         target = PurePosixPath(group)
@@ -203,4 +223,10 @@ class ScopeManager:
                 or self.property(properties, "KillMode", "s") != "control-group"
                 or self.property(properties, "SendSIGKILL", "b") is not True):
             raise ValueError("scope identity or supported stop policy mismatch")
+        if self.require_runtime_limit:
+            runtime = self.property(properties, "RuntimeMaxUSec", "t")
+            if (runtime == 2**64 - 1 or runtime != wall_seconds * 1_000_000
+                    or self.property(properties, "RuntimeRandomizedExtraUSec", "t") != 0
+                    or self.property(properties, "FinalKillSignal", "i") != 9):
+                raise ValueError("scope effective runtime policy mismatch")
         return {"unit": unit, "invocation_id": identity[1], "facts": deepcopy(facts), "stop_usec": stop}

@@ -64,12 +64,18 @@ def test_load_secrets_does_not_overwrite_existing(monkeypatch, tmp_path):
     assert os.environ["API_KEY_OPENROUTER"] == "already-set"
 
 
-def test_candidate_secret_paths_includes_maintree_fallback(monkeypatch):
-    from pathlib import Path
-
+def test_candidate_secret_paths_is_the_resolver_answer_only(monkeypatch, tmp_path):
+    # A worktree run with no checkout file: the resolver itself falls back to
+    # the main tree's file, so the loader adds no second fallback of its own.
+    home = tmp_path / "home"
+    (home / "genesis").mkdir(parents=True)
+    (home / "genesis" / "secrets.env").write_text("K=v\n")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
     monkeypatch.delenv("SECRETS_PATH", raising=False)
-    paths = client_mod._candidate_secret_paths()
-    assert Path.home() / "genesis" / "secrets.env" in paths
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(worktree))
+    assert client_mod._candidate_secret_paths() == [home / "genesis" / "secrets.env"]
 
 
 def test_secrets_path_is_the_only_candidate_when_set(monkeypatch, tmp_path):

@@ -280,7 +280,7 @@ def effective_policy(value, native, *, full=False):
 
 
 def runtime_inputs(snapshot, modules):
-    """Decode complete private CBM inputs without opening the queue or spawning."""
+    """Decode complete private provider inputs without queue or process I/O."""
     value = snapshot.runtime_value
     if snapshot.profile != 'runner' or value is None:
         raise ValueError('executable runtime role requires its private runner capsule')
@@ -293,14 +293,15 @@ def runtime_inputs(snapshot, modules):
     if (reserved['source']['commit'] != snapshot.commit or reserved['source']['files'] != dict(snapshot.files)
             or any(policy[key] != reserved[key] for key in ('route', 'slice', 'wall_seconds'))):
         raise ValueError('runtime source or policy differs from its reservation')
-    if context['provider'] != 'cbm':
-        raise ValueError('runtime provider adapter is not yet supported')
-    options = native._object(value['provider_options'], ('managed_config', 'persistence'), 'CBM runtime options')
-    modules['unit'].absolute(options['managed_config'])
-    if (options['persistence'] not in ('true', 'false')
-            or reserved['source']['provider_digest'] != modules['worker'].BUILD
-            or reserved['source']['provider_version'] != 'v0.11.0-stock-worker'):
-        raise ValueError('runtime provider inputs differ from the accepted worker')
+    if context['provider'] == 'gitnexus':
+        modules['gitnexus'].validate(snapshot, modules, value)
+    else:
+        options = native._object(value['provider_options'], ('managed_config', 'persistence'), 'CBM runtime options')
+        modules['unit'].absolute(options['managed_config'])
+        if (options['persistence'] not in ('true', 'false')
+                or reserved['source']['provider_digest'] != modules['worker'].BUILD
+                or reserved['source']['provider_version'] != 'v0.11.0-stock-worker'):
+            raise ValueError('runtime provider inputs differ from the accepted worker')
     return value, NativeEnvironment(value['environment_recipe'], native)
 
 
@@ -342,6 +343,9 @@ def reporter(snapshot, modules, ack_fd):
                 raise ValueError('startup scope has an owned OOM')
 
         live()
+        if context['provider'] == 'gitnexus':
+            return modules['gitnexus'].run(snapshot, modules, value, environment,
+                                          startup=ack['scope'], observe=observe, verify=live)
         factory = cbm_factory(snapshot, modules, context, value['policy'], environment_recipe=environment)
 
         def bound_factory(*args):
