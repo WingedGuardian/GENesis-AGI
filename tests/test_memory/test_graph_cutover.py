@@ -578,3 +578,74 @@ def test_the_verdict_lookback_is_the_writer_lookback():
 
     assert timedelta(seconds=graph_census.HISTORY_LOOKBACK_S) == cut.HISTORY_LOOKBACK
     assert timedelta(seconds=graph_census._BOOT_TOLERANCE_S) == cut.BOOT_TIME_MARGIN
+
+
+# ── quiet rows: the where-present guard (D3) ──────────────────────────────
+
+
+def _quiet(t: datetime, n: int = 3, **over) -> tuple[str, str]:
+    """A row as graph_telemetry writes it for a quiet networkx selection."""
+    base = {
+        "outcomes": {"primary": n},
+        "served": {"networkx": n},
+        "configured": {"networkx": n},
+        "quiet": {"engine_not_provisioned": n},
+    }
+    base.update(over)
+    return _trav(t, primary=n, **base)
+
+
+def test_a_quiet_row_is_neither_traffic_nor_a_break():
+    trav, census = _passing_inputs()
+    trav.append(_quiet(NOW - timedelta(days=2)))
+    v = cut.evaluate(trav, census, [], NOW)
+    assert v.status == "PASS", v.reasons
+    assert v.resets == []
+    assert v.quiet == 3
+    assert v.traversals == 14 * 12, "quiet traversals are not traffic"
+    assert v.to_json()["quiet"] == 3
+
+
+def test_a_partly_quiet_row_still_breaks_the_clock():
+    row = _quiet(NOW - timedelta(days=2), n=3, quiet={"engine_not_provisioned": 2})
+    m = json.loads(row[1])
+    assert not cut.is_quiet_row(m)
+    assert cut.traversal_breaks_clock(m) == "configured networkx"
+
+
+def test_an_unknown_quiet_reason_breaks_the_clock():
+    m = json.loads(_quiet(NOW, quiet={"something_new": 3})[1])
+    assert cut.traversal_breaks_clock(m) == "quiet reason something_new"
+
+
+def test_a_quiet_row_whose_traversal_fell_back_still_breaks():
+    m = json.loads(
+        _quiet(NOW, outcomes={"fallback": 3}, served={"cte": 3})[1]
+    )
+    assert cut.traversal_breaks_clock(m) == "outcome fallback"
+
+
+def test_a_loud_selection_failure_still_breaks_the_clock():
+    trav, census = _passing_inputs()
+    trav.append(
+        _trav(
+            NOW - timedelta(days=2),
+            primary=0,
+            traversals=1,
+            outcomes={"selection_failed": 1},
+            served={"networkx": 1},
+            configured={"falkordb": 1},
+        )
+    )
+    v = cut.evaluate(trav, census, [], NOW)
+    assert v.status == "NOT_YET"
+    assert any(r["why"] == "outcome selection_failed" for r in v.resets)
+
+
+@pytest.mark.parametrize(
+    "quiet", [[1], {"engine_not_provisioned": -1}, {"engine_not_provisioned": 9}]
+)
+def test_a_malformed_quiet_counter_is_unreadable(quiet):
+    m = json.loads(_quiet(NOW, quiet=quiet)[1])
+    with pytest.raises(ValueError):
+        cut.traversal_breaks_clock(m)

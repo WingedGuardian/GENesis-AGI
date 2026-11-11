@@ -1654,7 +1654,7 @@ if [ -f "$SECRETS_SRC" ]; then
         if $DRY_RUN; then
             log "Secrets: would decrypt → $SECRETS_FILE"
         elif confirm "Decrypt secrets → $SECRETS_FILE?"; then
-            mkdir -p "$(dirname "$SECRETS_FILE")"
+            mkdir -p -m 0700 "$(dirname "$SECRETS_FILE")"
             if decrypt_file "$SECRETS_SRC" "$SECRETS_FILE"; then
                 chmod 0600 "$SECRETS_FILE"
                 _SECRETS_RESTORED=true

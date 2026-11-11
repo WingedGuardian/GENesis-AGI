@@ -246,6 +246,15 @@
         referenceStats: null,
         referenceDetail: null,
         revealedValues: {},
+        // A credential's description is held out with its value (#2426):
+        // the reveal returns it, and it is shown only while revealed.
+        revealedDescriptions: {},
+        // One token per reference for its latest reveal request: a response
+        // that arrives after a hide (or a newer reveal) is discarded.
+        revealTokens: {},
+        _revealSeq: 0,
+        // Why a reveal failed (the server's own message, e.g. a missing value).
+        revealErrors: {},
 
         // ── Confirm modal state ──────────────────────────────────
         confirmModal: { show: false, title: '', message: '', _resolve: null },
@@ -277,6 +286,7 @@
         // ── Settings hub state ────────────────────────────────────
         settingsDomains: null,
         settingsData: {},         // domain_name → config object
+        settingsShown: {},        // domain_name → config as loaded (sent back as __shown on save)
         settingsEditing: null,    // domain being edited
         settingsViewing: null,    // readonly domain being viewed
         systemTimezone: null,     // current tz from /api/genesis/settings/timezone
@@ -1885,24 +1895,47 @@
           } catch (e) { console.warn("Reference search failed:", e); }
         },
         async viewReferenceDetail(id) {
+          // Opening another reference forgets what the open one revealed.
+          const prev = this.referenceDetail && this.referenceDetail.id;
+          if (prev && prev !== id) { this.hideReference(prev); }
           try {
             const resp = await fetchApi(`/api/genesis/references/${id}`);
             if (resp && resp.ok) { this.referenceDetail = (await resp.json()).reference; }
           } catch (e) { console.warn("Reference detail failed:", e); }
         },
         async revealReference(id) {
+          const token = ++this._revealSeq;
+          this.revealTokens = { ...this.revealTokens, [id]: token };
+          const errors = { ...this.revealErrors };
+          delete errors[id];
+          this.revealErrors = errors;
           try {
             const resp = await fetchApi(`/api/genesis/references/${id}/reveal`, { method: "POST" });
+            if (this.revealTokens[id] !== token) return;  // hidden or superseded meanwhile
             if (resp && resp.ok) {
               const data = await resp.json();
+              if (this.revealTokens[id] !== token) return;
               this.revealedValues = { ...this.revealedValues, [id]: data.value ?? "" };
+              this.revealedDescriptions = { ...this.revealedDescriptions, [id]: data.description ?? "" };
+            } else if (resp && resp.status === 409) {
+              const data = await resp.json().catch(() => ({}));
+              if (this.revealTokens[id] !== token) return;
+              this.revealErrors = { ...this.revealErrors, [id]: data.error || "This reference's value is missing" };
             }
           } catch (e) { console.warn("Reference reveal failed:", e); }
         },
         hideReference(id) {
-          const copy = { ...this.revealedValues };
-          delete copy[id];
-          this.revealedValues = copy;
+          // Everything the reveal holds for this reference goes, including a
+          // request still in flight (its token no longer matches).
+          for (const key of ["revealedValues", "revealedDescriptions", "revealTokens", "revealErrors"]) {
+            const copy = { ...this[key] };
+            delete copy[id];
+            this[key] = copy;
+          }
+        },
+        closeReferenceDetail() {
+          if (this.referenceDetail) this.hideReference(this.referenceDetail.id);
+          this.referenceDetail = null;
         },
         async copyReferenceValue(id) {
           const v = this.revealedValues[id];
@@ -1916,6 +1949,7 @@
             "This permanently removes the entry and its vector. This cannot be undone.",
           );
           if (!ok) return;
+          this.hideReference(id);
           try {
             await fetchApi(`/api/genesis/references/${id}`, { method: "DELETE" });
             this.referenceDetail = null;
@@ -2469,6 +2503,9 @@
             if (resp && resp.ok) {
               const d = await resp.json();
               this.settingsData[domain] = d.config;
+              // What the editor showed, sent back on save so the server can
+              // tell a change the user made from a value merely shown.
+              this.settingsShown[domain] = JSON.parse(JSON.stringify(d.config));
             }
           } catch (e) { console.warn(`Settings fetch ${domain} failed:`, e); }
         },
@@ -2477,6 +2514,7 @@
           try {
             const payload = { ...this.settingsData[domain] };
             if (confirmGateDisable) { payload.confirm_disable_approval_gate = true; }
+            if (this.settingsShown[domain]) { payload.__shown = this.settingsShown[domain]; }
             const resp = await fetchApi(`/api/genesis/settings/${domain}`, {
               method: "PUT",
               headers: { "Content-Type": "application/json" },
@@ -2496,6 +2534,7 @@
             if (resp && resp.ok) {
               const d = await resp.json();
               this.settingsData[domain] = d.config;
+              this.settingsShown[domain] = JSON.parse(JSON.stringify(d.config));
               this.settingsEditing = null;
               if (domain === "autonomous_cli_policy") {
                 this.fetchAutonomousCliPolicy();
