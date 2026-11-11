@@ -587,7 +587,7 @@ def _render_falkordb_unit(
     # file) sits just above the sliced loop in bootstrap.sh, so it is re-created
     # here; the checker is the real one, this repo's copy.
     script = (
-        f'set -euo pipefail; source "{LIB}"; {prefix}\n'
+        f'set -euo pipefail; source "{LIB}"; source "{REPO_ROOT / "scripts/lib/secrets_path.sh"}"; {prefix}\n'
         f'SYSTEMD_TEMPLATE_DIR="{templates}"; SYSTEMD_USER_DIR="{user_dir}"\n'
         f'GENESIS_ROOT="{tmp_path / "repo"}"; CC_BIN_DIR=/usr/local/bin\n'
         f'source "{MU_LIB}"; GENESIS_MU_PY="{MU_PY}"; GENESIS_MU_PREV=""\n'
