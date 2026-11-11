@@ -33,6 +33,7 @@ leaking an unparsed secret into a non-reveal payload.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import unicodedata
@@ -173,11 +174,27 @@ def _decoded(text: str) -> set[str]:
     return forms
 
 
+#: Where a structured value (a URL, a DSN, a key=value line, a header, XML,
+#: a pipe- or backslash-separated record) splits into its parts, applied to the
+#: NFKC form so fullwidth punctuation splits too. One generic fragmentation, no
+#: per-format parser.
+_FRAGMENT_SPLIT = re.compile(r"[\s:/@?&=#;,|\\<>\"'`(){}\[\]]+")
+#: A host name: dotted labels ending in an alphabetic top-level label.
+_HOSTNAME = re.compile(r"^(?:[a-z0-9-]+\.)+[a-z]{2,}$")
+_SCHEME = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]{0,31})://")
+
+
 def _value_probes(value: str, *, login_exempt: bool = False) -> list[tuple[str, bool]]:
-    """(probe, whole-word only) for the refusal check: the whole value and every
-    secret-shaped token of it, each with its percent-decoded forms, normalised.
-    A whole value that is all letters or shorter than four characters counts
-    only as a whole word, so an ordinary word inside another is no match."""
+    """(probe, whole-word only) for the refusal check: the whole value, and
+    every secret-shaped fragment of it, normalised. The value is percent-decoded
+    (up to three rounds), NFKC-normalised and split on whitespace and
+    ``: / @ ? & = # ; , | \\ < > " ' ` ( ) { } [ ]``, so
+    the password, token or key inside a connection URL, a DSN or a
+    ``key=value`` line is a fragment of its own; a fragment that is a host name,
+    a URL scheme, or all digits (a port) is not probed. A secret that reads as
+    a plain word (all letters, or under four characters) is not secret-shaped,
+    so it is matched only as the whole value, and only as a whole word: an
+    ordinary word inside another is no match. That is a stated limit."""
     whole = value.strip()
     probes: dict[str, bool] = {}
     for form in _decoded(whole) if whole else ():
@@ -188,13 +205,18 @@ def _value_probes(value: str, *, login_exempt: bool = False) -> list[tuple[str, 
     # tokens of both halves.
     login, sep, secret = whole.partition(" / ")
     exempt = login.strip().strip(_TOKEN_EDGE) if login_exempt and sep and secret.strip() else None
-    for raw in whole.split():
-        token = raw.strip(_TOKEN_EDGE)
-        if token == exempt:
-            continue
-        if _secret_token(token):
-            for form in _decoded(token):
-                probes.setdefault(_normalise(form), False)
+    for form in _decoded(whole):
+        schemes = {m.group(1).casefold() for m in _SCHEME.finditer(form)}
+        for fragment in _FRAGMENT_SPLIT.split(unicodedata.normalize("NFKC", form)):
+            fragment = fragment.strip(_TOKEN_EDGE)
+            folded = fragment.casefold()
+            if (
+                not fragment or fragment == exempt or fragment.isdigit()
+                or folded in schemes or _HOSTNAME.match(folded)
+            ):
+                continue
+            if _secret_token(fragment):
+                probes.setdefault(_normalise(fragment), False)
     probes.pop("", None)
     return list(probes.items())
 
@@ -208,24 +230,71 @@ def refuse_value_in_fields(
     indexed ``fields``. Nothing is scrubbed. The message names the field, never
     the value; ``message`` replaces it (the identifier refusal). The body's own
     placeholder lines are no leak and are left out of the check."""
-    patterns = [
-        re.compile(
-            (r"(?<![^\W_])" + re.escape(probe) + r"(?![^\W_])") if as_word else re.escape(probe),
-        )
-        for probe, as_word in _value_probes(value, login_exempt=login_exempt)
-    ]
+    patterns = _probe_patterns(value, login_exempt=login_exempt)
     for name, text in fields.items():
-        if not text:
-            continue
-        held_out = text.replace(SECRET_PLACEHOLDER, "").replace(DETAIL_PLACEHOLDER, "")
-        haystacks = {_normalise(form) for form in _decoded(held_out)}
-        if any(pattern.search(h) for pattern in patterns for h in haystacks):
+        if _carries(patterns, text):
             raise ValueError(
                 message or (
                     f"refusing a credential reference whose {name} carries its "
                     "value; keep the value out of that field (#2426)"
                 )
             )
+
+
+def _probe_patterns(value: str, *, login_exempt: bool = False) -> list[re.Pattern[str]]:
+    return [
+        re.compile(
+            (r"(?<![^\W_])" + re.escape(probe) + r"(?![^\W_])") if as_word else re.escape(probe),
+        )
+        for probe, as_word in _value_probes(value, login_exempt=login_exempt)
+    ]
+
+
+def _carries(patterns: list[re.Pattern[str]], text: str | None) -> bool:
+    """Whether ``text`` (normalised, and percent-decoded) carries a probe. The
+    body placeholders are no leak and are left out."""
+    if not text:
+        return False
+    held_out = text.replace(SECRET_PLACEHOLDER, "").replace(DETAIL_PLACEHOLDER, "")
+    haystacks = {_normalise(form) for form in _decoded(held_out)}
+    return any(pattern.search(h) for pattern in patterns for h in haystacks)
+
+
+def drop_value_tags(value: str, tags_json: str | None, body: str) -> tuple[str | None, str]:
+    """(tags_json, body) with every caller tag that carries the value removed
+    WHOLE, from the tags list and from the body's ``Tags:`` trailer line; the
+    other tags stay. A tag is a label, not prose: dropping the whole element
+    leaves no part of it behind, so this is not a scrub. Tags are dropped
+    rather than refused because a shape heuristic will flag an ordinary tag
+    now and then (a database name, a region), and the cost of that should be
+    one tag, never the whole capture. Unparseable tags are left as they are,
+    for the strict check to refuse."""
+    patterns = _probe_patterns(value)
+    if tags_json:
+        try:
+            tags = json.loads(tags_json)
+        except ValueError:
+            tags = None
+        if isinstance(tags, list):
+            kept = [t for t in tags if not (isinstance(t, str) and _carries(patterns, t))]
+            if len(kept) != len(tags):
+                tags_json = json.dumps(kept)
+    idx = body.find(_VALUE_MARKER)
+    if idx != -1:
+        trailer = _trailer(body[idx + len(_VALUE_MARKER):])
+        rebuilt = []
+        for line in trailer:
+            if line.startswith("Tags: "):
+                kept_tags = [t for t in line[len("Tags: "):].split(", ") if not _carries(patterns, t)]
+                if kept_tags:
+                    rebuilt.append("Tags: " + ", ".join(kept_tags))
+            else:
+                rebuilt.append(line)
+        if rebuilt != trailer:
+            after = body[idx + len(_VALUE_MARKER):]
+            value_line = after[: len(after) - len("\n".join(trailer))].rstrip("\n")
+            body = _held_body(body[:idx], rebuilt, value_line)
+    return tags_json, body
 
 
 class HeldCredential(NamedTuple):

@@ -34,10 +34,12 @@ async def db():
     await conn.close()
 
 
-def _body(description: str, value: str, *, tags=None) -> str:
+def _body(description: str, value: str, *, tags=None, identifier: str = _KEY) -> str:
+    """A credential body whose header names ``identifier``: pass the test's
+    concept, so the header is the one the ingest expects for it."""
     return fmt(
         kind="credentials",
-        identifier=_KEY,
+        identifier=identifier,
         description=description,
         value=value,
         tags=tags,
@@ -142,11 +144,26 @@ async def test_a_new_value_with_the_description_placeholder_keeps_the_descriptio
 
 
 @pytest.mark.parametrize(
+    "tag",
+    [
+        "Field!Fake5",
+        "Field%21Fake5",  # percent-encoded
+        "Ｆｉｅｌｄ！Ｆａｋｅ５",  # fullwidth
+    ],
+)
+async def test_a_tag_carrying_the_value_is_dropped_whole(db, tag):
+    """Owner ruling 1817a5c4: the tag goes, the write does not."""
+    store = _PointStore()
+    unit = await _ingest(
+        db, store, _body("Example portal", "password: Field!Fake5"),
+        tags_json=json.dumps(["portal", tag]),
+    )
+    assert json.loads((await kc.get(db, unit))["tags"]) == ["portal"]
+
+
+@pytest.mark.parametrize(
     ("field", "kwargs"),
     [
-        ("tags", {"tags_json": json.dumps(["portal", "Field!Fake5"])}),
-        ("tags", {"tags_json": json.dumps(["Field%21Fake5"])}),  # percent-encoded
-        ("tags", {"tags_json": json.dumps(["Ｆｉｅｌｄ！Ｆａｋｅ５"])}),  # fullwidth
         ("authority", {"authority": "pasted Field!Fake5"}),
         ("provenance", {"provenance": {"source_doc": "notes Field!Fake5"}}),
     ],
@@ -179,13 +196,14 @@ async def test_an_identifier_naming_the_login_of_a_login_secret_pair_is_not_refu
     and tags; the secret half still may not."""
     store = _PointStore()
     unit = await _ingest(
-        db, store, _body("Forum account", "ForumUser42 / Fk9!pass77"),
+        db, store, _body("Forum account", "ForumUser42 / Fk9!pass77", identifier="forum ForumUser42"),
         concept="forum ForumUser42",
     )
-    assert unit
+    # The header names the login too, and is checked by the same rule (4531815540).
+    assert (await kc.get(db, unit))["body"].startswith("[reference.credentials] forum ForumUser42\n")
     with pytest.raises(ValueError, match="identifier"):
         await _ingest(
-            db, store, _body("Forum account", "ForumUser43 / Fk9!pass88"),
+            db, store, _body("Forum account", "ForumUser43 / Fk9!pass88", identifier="forum Fk9!pass88"),
             concept="forum Fk9!pass88",
         )
 
@@ -203,9 +221,14 @@ def test_a_value_line_shaped_like_a_trailer_is_refused():
 @pytest.mark.parametrize("value", ["hunter2xyz / admin", "Fk3a9Zq / w0rd#9"])
 async def test_the_first_half_of_a_pair_is_probed_in_tags(db, value):
     """Security review MEDIUM-2: the login-half exemption covers only the exact
-    login in the identifier; tags are probed with the tokens of both halves."""
+    login in the identifier; tags are probed with the fragments of both halves.
+    A tag that matches is dropped whole (owner ruling 1817a5c4), not refused."""
     store = _PointStore()
     first = value.split(" / ")[0]
-    # The Tags trailer line sits in the indexed body too, which is checked first.
-    with pytest.raises(ValueError, match="carries its value"):
-        await _ingest(db, store, _body("acct", value, tags=[first]), concept="acct portal")
+    unit = await _ingest(
+        db, store, _body("acct", value, tags=[first, "portal"], identifier="acct portal"),
+        concept="acct portal",
+    )
+    body = (await kc.get(db, unit))["body"]
+    assert body.endswith("\nTags: portal")
+    assert first not in body

@@ -246,6 +246,9 @@
         referenceStats: null,
         referenceDetail: null,
         revealedValues: {},
+        // A credential's description is held out with its value (#2426):
+        // the reveal returns it, and it is shown only while revealed.
+        revealedDescriptions: {},
 
         // ── Confirm modal state ──────────────────────────────────
         confirmModal: { show: false, title: '', message: '', _resolve: null },
@@ -1896,6 +1899,7 @@
             if (resp && resp.ok) {
               const data = await resp.json();
               this.revealedValues = { ...this.revealedValues, [id]: data.value ?? "" };
+              this.revealedDescriptions = { ...this.revealedDescriptions, [id]: data.description ?? "" };
             }
           } catch (e) { console.warn("Reference reveal failed:", e); }
         },
@@ -1903,6 +1907,9 @@
           const copy = { ...this.revealedValues };
           delete copy[id];
           this.revealedValues = copy;
+          const descriptions = { ...this.revealedDescriptions };
+          delete descriptions[id];
+          this.revealedDescriptions = descriptions;
         },
         async copyReferenceValue(id) {
           const v = this.revealedValues[id];

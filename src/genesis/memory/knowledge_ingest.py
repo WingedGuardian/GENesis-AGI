@@ -189,8 +189,24 @@ async def _ingest_once(
                 message="a credential identifier must not contain its value; refusing the write (#2426)",
                 login_exempt=True,
             )
+            # A caller tag that carries the value is dropped whole, from the
+            # tags and from the body's Tags line; the write goes on. A tag is a
+            # label, and the cost of a shape heuristic flagging an ordinary one
+            # (a database name, a region) must be that tag, never the capture.
+            tags_json, content = reference_ops.drop_value_tags(known_secret, tags_json, content)
+            # The body header is "[reference.credentials] {identifier}": when it
+            # is exactly that, it is checked by the identifier rule (a login
+            # named there is not refused), and the rest of the body strictly.
+            # Any other first line is checked strictly with the rest.
+            header, _, rest = content.partition("\n")
+            body_text = content
+            if header == f"[{knowledge_crud.CREDENTIAL_DOMAIN}] {concept}":
+                reference_ops.refuse_value_in_fields(
+                    known_secret, {"body header": header}, login_exempt=True,
+                )
+                body_text = rest
             reference_ops.refuse_value_in_fields(known_secret, {
-                "body": content,
+                "body": body_text,
                 "tags": tags_json,
                 # The tags as they read once decoded: JSON escapes a non-ASCII
                 # tag, which would hide a fullwidth spelling of the value.
