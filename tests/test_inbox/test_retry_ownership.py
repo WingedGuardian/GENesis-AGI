@@ -41,7 +41,7 @@ async def test_inserted_item_cannot_inherit_failed_items_budget(system):
     await seed(db, "old-C", [c])
     pending = []
     await monitor._queue_drop(
-        "source.md", f"{d}\n\n{c}", "new-hash", datetime.now(UTC).isoformat(), pending,
+        "source.md", f"{d}\n\n{c}", "new-hash", datetime.now(UTC).isoformat(), pending, held_ids=[],
     )
     old = await inbox_items.get_by_id(db, "old-C")
     assert inbox_items.stored_item_texts(old["batch_items"]) == [c]
@@ -90,7 +90,7 @@ async def test_unmatched_history_becoming_held_discards_drop(
     monkeypatch.setattr(inbox_items, "get_retriable_failed_rows", selected_then_held)
     pending = []
     await monitor._queue_drop(
-        "source.md", c, "new-hash", datetime.now(UTC).isoformat(), pending,
+        "source.md", c, "new-hash", datetime.now(UTC).isoformat(), pending, held_ids=[],
     )
     assert pending == []
     assert await inbox_items.get_by_id(db, "old-CD") == winner
@@ -144,7 +144,7 @@ async def test_batch_identity_controls_retry_ownership(system, stored, source, s
         originals[row_id] = await inbox_items.get_by_id(db, row_id)
     pending = []
     await monitor._queue_drop(
-        "source.md", "\n\n".join(source), "new-hash", datetime.now(UTC).isoformat(), pending,
+        "source.md", "\n\n".join(source), "new-hash", datetime.now(UTC).isoformat(), pending, held_ids=[],
     )
     assert len(pending) == len(owners)
     for item, owner in zip(pending, owners, strict=True):
@@ -248,3 +248,49 @@ async def test_rearm_rechecks_own_snapshot_even_without_selected_ids(system, cha
         expected_retry_ids=[], max_retries=3,
     )
     assert await inbox_items.get_by_id(db, "target") == winner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["retry", "modified"])
+@pytest.mark.parametrize("first", ["reused", "inserted"])
+async def test_hold_after_delta_snapshot_discards_drop(system, monkeypatch, lane, first):
+    """A hold written between the delta read and selection is never armed.
+
+    The held row is already absent from retry selection, so only the hold set
+    read before the snapshot can tell either arming write that it went stale.
+    """
+    db, monitor, db_path = system
+    c, d = "https://example.com/C", "https://example.com/D"
+    source = db_path.parent / "inbox-source.md"
+    source.write_text(f"{c}\n\n{d}" if first == "reused" else f"{d}\n\n{c}")
+    for row_id, text in (("old-C", c), ("old-D", d)):
+        await inbox_items.create(
+            db, id=row_id, file_path=str(source), content_hash="old-hash",
+            status="failed", created_at="2026-01-01T00:00:00+00:00",
+            batch_items=inbox_items.serialize_batch_items([text]), retry_count=1,
+            error_message="synthetic transient failure",
+        )
+    snapshot = inbox_items.get_handled_batch_content
+
+    async def snapshot_then_held(*args, **kwargs):
+        handled = await snapshot(*args, **kwargs)
+        async with aiosqlite.connect(db_path) as other:
+            await other.execute(
+                "UPDATE inbox_items SET error_message='replay_unsafe: synthetic' WHERE id='old-D'",
+            )
+            await other.commit()
+        return handled
+
+    monkeypatch.setattr(inbox_items, "get_handled_batch_content", snapshot_then_held)
+    files = {"modified": [source] if lane == "modified" else [],
+             "retry": [source] if lane == "retry" else []}
+    now = datetime.now(UTC)
+    pending, _ = await monitor._phase_create_records(
+        [], files["modified"], files["retry"], now, now.isoformat(),
+    )
+    assert pending == []
+    cursor = await db.execute("SELECT COUNT(*) FROM inbox_items WHERE status='pending'")
+    assert (await cursor.fetchone())[0] == 0
+    held = await inbox_items.get_by_id(db, "old-D")
+    assert held["status"] == "failed"
+    assert held["error_message"] == "replay_unsafe: synthetic"

@@ -1707,7 +1707,7 @@ async def test_queue_drop_losing_reuse_cas_does_not_append_or_create_fallback(
 
     monkeypatch.setattr(inbox_items, "reuse_as_pending", racing_reuse)
     pending = []
-    await mon._queue_drop(source, "https://example.com/a", "new", mon._clock().isoformat(), pending)
+    await mon._queue_drop(source, "https://example.com/a", "new", mon._clock().isoformat(), pending, held_ids=[])
     assert pending == []
     assert (await (await db.execute("SELECT COUNT(*) FROM inbox_items")).fetchone())[0] == 1
     row = await inbox_items.get_by_id(db, "raced")
@@ -1750,7 +1750,7 @@ async def test_queue_drop_reuse_race_discards_whole_stale_drop(
     monkeypatch.setattr(inbox_items, "reuse_as_pending", racing_reuse)
     unrelated = object()
     pending = [unrelated]
-    await mon._queue_drop(str(source), source.read_text(), compute_hash(source), mon._clock().isoformat(), pending)
+    await mon._queue_drop(str(source), source.read_text(), compute_hash(source), mon._clock().isoformat(), pending, held_ids=[])
     assert pending == [unrelated]
     assert (await (await db.execute("SELECT COUNT(*) FROM inbox_items")).fetchone())[0] == loss_index + 1
     # Durable earlier rows are recovered on the next scan, not dispatched from

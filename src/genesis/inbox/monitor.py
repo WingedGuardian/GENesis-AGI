@@ -8,7 +8,7 @@ import logging
 import re
 import uuid
 from collections import defaultdict, deque
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -977,12 +977,15 @@ class InboxMonitor:
             # under one drop. Failed batches retry via the delta path next
             # cycle (their lines stay un-baselined), so the old
             # get_retriable_failed single-row reuse is no longer needed.
+            # A file with any replay hold is already known, so it is never
+            # new: detection is this path's snapshot and its hold set is empty.
             await self._queue_drop(
                 str(f),
                 content,
                 h,
                 now_iso,
                 pending_items,
+                held_ids=[],
             )
 
         cooldown = timedelta(seconds=self._config.evaluation_cooldown_seconds)
@@ -1022,6 +1025,8 @@ class InboxMonitor:
             # the file is not re-detected as "modified" on every scan (the
             # detection storm — a stale known hash never caught up because the
             # cooldown branch used to `continue` before writing any row).
+            # Holds are read BEFORE the snapshot: a later one makes arming stale.
+            held_ids = await inbox_items.get_replay_held_ids(self._db, str(f))
             prev_content = await inbox_items.get_evaluated_content(
                 self._db,
                 str(f),
@@ -1151,6 +1156,7 @@ class InboxMonitor:
                 h,
                 now_iso,
                 pending_items,
+                held_ids=held_ids,
             )
 
         # --- Partial-failure auto-retry (PR-2c) ---
@@ -1273,6 +1279,8 @@ class InboxMonitor:
                         ),
                     )
                 continue
+            # Holds are read BEFORE the snapshot: a later one makes arming stale.
+            held_ids = await inbox_items.get_replay_held_ids(self._db, str(f))
             prev_content = await inbox_items.get_evaluated_content(
                 self._db,
                 str(f),
@@ -1302,7 +1310,9 @@ class InboxMonitor:
                 )
                 continue
             before = len(pending_items)
-            await self._queue_drop(str(f), delta, h, now_iso, pending_items)
+            await self._queue_drop(
+                str(f), delta, h, now_iso, pending_items, held_ids=held_ids,
+            )
             if len(pending_items) > before:
                 retried += 1
 
@@ -1315,6 +1325,8 @@ class InboxMonitor:
         content_hash: str,
         now_iso: str,
         pending_items: list[InboxItem],
+        *,
+        held_ids: Sequence[str],
     ) -> None:
         """Segment a file's delta into items, group into batches of
         ``items_per_eval``, and create one pending row per batch under a shared
@@ -1329,6 +1341,8 @@ class InboxMonitor:
         """
         from genesis.db.crud import inbox_items
 
+        # ``held_ids`` is the file's replay-hold set, read by the caller before
+        # its delta snapshot; both arming writes refuse any hold outside it.
         # Deduplicate whole logical items, not URLs. The same bare URL pasted
         # twice is redundant, but two different annotations attached to that
         # URL are distinct user intent and both must retain their source
@@ -1386,6 +1400,7 @@ class InboxMonitor:
                     expected_batch_items=row["batch_items"],
                     expected_retry_ids=list(unused),
                     max_retries=self._config.max_retries,
+                    expected_held_ids=held_ids,
                 )
                 if armed:
                     del unused[row_id]
@@ -1401,6 +1416,7 @@ class InboxMonitor:
                     batch_items=stored_batch,
                     expected_retry_ids=list(unused),
                     max_retries=self._config.max_retries,
+                    expected_held_ids=held_ids,
                 )
             if not armed:
                 # A selected row changed after the delta was read. Discard the
