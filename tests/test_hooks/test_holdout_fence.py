@@ -338,6 +338,119 @@ def test_a_listing_naming_the_directory_is_logged(home):
     assert rows[0]["detail"] == "directory path"
 
 
+def _exposures(home: Path) -> list[dict]:
+    return _log_rows(home / ".genesis" / "logs" / "holdout-exposures.jsonl")
+
+
+@pytest.mark.parametrize(
+    ("command", "kind"),
+    [
+        (f"du -sh {GH}/*", "listing"),
+        (f"ls -d {GH}/holdout", "listing"),
+        (f"stat {GH}/holdout", "listing"),
+        (f"echo {GH}/holdout", "mention"),
+        (f"printf '%s\\n' {GH}/holdout", "mention"),
+        (f"du -sh {GH}/* | sort -h", "listing"),
+        (f"du -h --max-depth=1 {GH}", "broad"),
+        (f"find {GH} -maxdepth 1", "broad"),
+        (f"ls -d {GH}/holdout; find {GH} -maxdepth 1 -newermt 2026-11-01", "listing"),
+        (f"cd {GH} && du -sh *", "listing"),
+        (f"cd {GH}/holdout && ls -la && pwd", "listing"),
+        (f"ls --full-time -d {GH}/holdout", "listing"),
+        (f"find {GH} -maxdepth 2 -name '*.md'", "broad"),
+        (f"du -sh {GH}/* | sort -h | tail -n 5", "listing"),
+        (f"ls -d {GH}/holdout | cut -d / -f 1-6 | tr a-z A-Z", "listing"),
+        (f"echo checking; ls -d {GH}/holdout", "listing"),
+    ],
+)
+def test_a_path_printed_by_a_names_only_command_is_activity(home, command, kind):
+    holdout = str(home / ".genesis" / "holdout")
+    out, rows = _run(
+        home, "post", _post("Bash", {"stdout": f"4.0K\t{holdout}\n"}, {"command": command})
+    )
+    assert _note(out) == "" and _exposures(home) == []
+    assert [(r["event"], r["kind"], r["detail"]) for r in rows] == [
+        ("post", kind, "directory path")
+    ]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"grep -rn needle {GH}",
+        f"find {GH} -maxdepth 1 -exec head -3 {{}} +",
+        f"ls -d {GH}/holdout; echo x >> {GH}/holdout/HOLDOUT.md",
+        f"ls -d {GH}/holdout; grep -rl needle {GH}",
+        # An abbreviated long option, or an option word the shell rewrites.
+        f"ls -d {GH}/holdout; du --files0={GH}/holdout/HOLDOUT.md",
+        f"ls -d {GH}/holdout; du --fi={GH}/holdout/HOLDOUT.md",
+        f"ls -d {GH}/holdout | wc --files0={GH}/holdout/HOLDOUT.md",
+        f"cd {GH}; du --files0=holdout/HOLDOUT.md; ls -d {GH}/holdout",
+        f"ls -d {GH}/holdout; du -{{-files0-from={GH}/holdout/HOLDOUT.md,s}}",
+        f"ls -d {GH}/holdout; du -s${{IFS}}--files0-from={GH}/holdout/HOLDOUT.md",
+        f"ls -d {GH}/holdout; ls | head -v${{IFS}}{GH}/holdout/HOLDOUT.md",
+        f"ls -d {GH}/holdout; cd {GH}/holdout; ls | head -q${{IFS}}HOLDOUT.md",
+        f"ls -d {GH}/holdout; cd {GH}/holdout; ls | head -n4${{IFS}}HOLDOUT.md",
+        # Names-only in shape, but nothing shows where the path came from.
+        'printf "%s\\n" "$X"',
+        'echo "$SOMEWHERE"',
+        f"ls {GH}/holdout; grep -r needle {GH}",
+        f"cat {GH}/holdout/HOLDOUT.md",
+        'cat "$D/HOLDOUT.md"',
+        # A path the operand matcher cannot see: piped to xargs, built by eval,
+        # read by substitution, a redirect or a file-reading option.
+        f"find {GH}/holdout -type f | xargs head -5",
+        f"find {GH}/holdout -type f -print0 | xargs -0 tail -n +1",
+        f"find {GH}/holdout -type f | xargs grep -H Protects",
+        f"ls -1 {GH}/holdout/*.md | xargs -n1 -I{{}} sh -c 'echo {{}}; cat {{}}'",
+        f"tree --fromfile {GH}/holdout/HOLDOUT.md",
+        f"echo {GH}/holdout $(< {GH}/holdout/HOLDOUT.md)",
+        f'echo {GH}/holdout; eval "head -5 {GH}/holdout/HOLDOUT.md"',
+        f"echo {GH}/holdout/HOLDOUT.md | xargs -t head -5",
+        f"git diff /dev/null {GH}/holdout/HOLDOUT.md",
+        f"du --files0-from={GH}/holdout/HOLDOUT.md; echo {GH}/holdout",
+        f'echo {GH}/holdout; sort < "$F"',
+        f"env X=1 ls -d {GH}/holdout",
+        f"ls -d {GH}/holdout; head -n 3 notes.txt",
+        f"ls -d {GH}/holdout; head -n 3 -- notes.txt",
+        f"ls -d {GH}/holdout; head -- -notes",
+        f"ls -d {GH}/holdout; sort -k 2 notes.txt",
+        f"ls -d {GH}/holdout; sort -m - notes.txt",
+    ],
+)
+def test_a_path_from_any_other_call_stays_an_exposure(home, command):
+    holdout = str(home / ".genesis" / "holdout")
+    stdout = f"{holdout}/HOLDOUT.md:Protects: a short line\n"
+    out, rows = _run(home, "post", _post("Bash", {"stdout": stdout}, {"command": command}))
+    assert "HOLDOUT FENCE" in _note(out)
+    assert [(r["kind"], r["detail"]) for r in _exposures(home)] == [("content", "directory path")]
+
+
+@pytest.mark.parametrize(
+    ("tool", "ti"),
+    [
+        ("mcp__genesis-memory__memory_recall", {"query": "x"}),
+        ("mcp__some-server__run", {"command": f"ls -d {GH}/holdout"}),
+        ("Agent", {"subagent_type": "Explore", "prompt": f"ls {GH}/holdout"}),
+    ],
+)
+def test_a_path_in_a_result_this_hook_cannot_classify_stays_an_exposure(home, tool, ti):
+    holdout = str(home / ".genesis" / "holdout")
+    _run(home, "post", _post(tool, f"see {holdout}/HOLDOUT.md", ti))
+    assert [r["kind"] for r in _exposures(home)] == ["content"]
+
+
+def test_expected_output_from_a_listing_command_is_still_content(home):
+    holdout = str(home / ".genesis" / "holdout")
+    out, _ = _run(
+        home,
+        "post",
+        _post("Bash", {"stdout": f"{holdout}\n{EXPECT_LINE}\n"}, {"command": f"ls {GH}/holdout"}),
+    )
+    assert "H-01" in _note(out)
+    assert [(r["kind"], r["detail"]) for r in _exposures(home)] == [("content", "H-01")]
+
+
 def test_a_sibling_directory_name_is_not_the_holdout(home):
     _, rows = _run(home, "post", _post("Bash", {"stdout": str(home / ".genesis" / "holdout-old")}))
     assert rows == []

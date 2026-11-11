@@ -34,6 +34,16 @@ Two events, one file:
   directory's path as a whole component, gets a note telling the agent not to
   use, repeat or store it, and a ``content`` row. This catches what operand
   matching cannot: a copy made elsewhere, a shell variable, a recall result.
+  A result that names only the directory's path is a ``listing``, ``broad``
+  or ``mention`` row with no note instead when the call is a shell command made
+  only of commands that print names or their own arguments (``du``, ``ls``,
+  ``stat``, ``find`` with no action, ``echo``, ``printf``, ``cd``, and
+  ``sort``/``head``-style filters of their output), run directly: no wrapper
+  (``xargs``, ``env``), substitution, ``eval``, input redirect, heredoc or
+  option that reads a file, and no way it reaches the holdout is a read, a
+  write or an access. Anything else keeps the ``content`` row: a recursive
+  ``grep`` or ``find ... | xargs head`` prints scenario lines under that path,
+  and so can a call this hook cannot classify.
   Steps are not fingerprinted, because they exercise repository code and share
   lines with it. The runner's own output, and reads of the exposure log, are
   skipped.
@@ -108,7 +118,7 @@ SCENARIO_FILE = "HOLDOUT.md"
 MENTION_VERBS = frozenset(
     {"echo", "printf", "gh", "true", ":", "test", "[", "export", "alias", "type", "which"}
 )
-#: Commands that show names or metadata, never contents: a "listing", recorded
+#: Commands that show names or metadata of their operands: a "listing", recorded
 #: in the activity log with no note.
 LISTING_VERBS = frozenset(
     {
@@ -148,7 +158,9 @@ RECURSIVE_VERBS = frozenset({"rg", "ag", "ack", "find", "fd", "tree", "du", "tar
 INTERPRETERS = frozenset({"python", "python3", "bash", "sh", "zsh", "node", "perl", "ruby"})
 #: find actions that delete, run a command on, or print the contents of a match:
 #: with one of these, find is no longer a listing.
-FIND_ACTIONS = frozenset({"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fls"})
+FIND_ACTIONS = frozenset(
+    {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"}
+)
 #: Commands that, run recursively on a directory ABOVE the holdout, destroy or
 #: move it: an access, not a broad search.
 DESTRUCTIVE_VERBS = frozenset({"rm", "rmdir", "shred", "mv"})
@@ -361,6 +373,16 @@ _RANK = {"write": 6, "read": 5, "access": 5, "listing": 3, "broad": 2, "mention"
 
 def _classify(tool: str, ti: dict, cwd: str, roots: list[str], holdout: str):
     """(kind, detail) for the strongest way this call reaches the holdout, or None."""
+    hits = _reaches(tool, ti, cwd, roots, holdout)
+    if not hits:
+        return None
+    return max(hits, key=lambda h: _RANK[h[0]])
+
+
+def _reaches(
+    tool: str, ti: dict, cwd: str, roots: list[str], holdout: str
+) -> list[tuple[str, str]]:
+    """Every (kind, detail) by which this call reaches the holdout."""
     hits: list[tuple[str, str]] = []
 
     def path_hit(path: str, base: str, exact_kind: str, *, recursive: bool, rg: bool = False):
@@ -395,9 +417,7 @@ def _classify(tool: str, ti: dict, cwd: str, roots: list[str], holdout: str):
     command = ti.get("command") if isinstance(ti.get("command"), str) else ""
     if command:
         hits.extend(_shell_hits(command, cwd, roots, holdout))
-    if not hits:
-        return None
-    return max(hits, key=lambda h: _RANK[h[0]])
+    return hits
 
 
 def _shell_hits(command: str, cwd: str, roots: list[str], holdout: str) -> list[tuple[str, str]]:
@@ -680,11 +700,138 @@ def _post(payload: dict, holdout: str) -> str | None:
     # Only the absolute path: the ~ and $GENESIS_HOME spellings appear in the
     # holdout's own docs, skills and this file, which agents read routinely.
     if not hits and any(_names_component(text, r) for r in _roots(holdout)):
+        names_only = _names_only_kind(ti, payload, cwd, holdout)
+        if names_only:
+            # Only names or the command's own words reached the result: activity.
+            _log(payload, "post", names_only, "directory path")
+            return None
         hits = ["directory path"]
     if not hits:
         return None
     _log(payload, "post", "content", ", ".join(hits))
     return POST_NOTE.format(ids=", ".join(hits))
+
+
+#: The reaches a names-only command may have. ``broad`` is one: ``du`` or
+#: ``find`` over a directory above the holdout names it without opening it.
+NAMES_ONLY_KINDS = frozenset({"listing", "broad", "mention"})
+#: Commands whose output is names, metadata or their own arguments. A subset of
+#: the listing and mention verbs: ``tree --fromfile``, ``file -f``, and ``gh`` or
+#: ``git`` (which read files they are given) are left out.
+NAMES_ONLY_VERBS = (LISTING_VERBS - {"tree", "file"}) | {"echo", "printf", "cd", "pwd"}
+#: Filters that are names-only when they take no file operand: they then only
+#: reshape the output of the names-only commands before them.
+STDIN_FILTERS = frozenset({"sort", "head", "tail", "wc", "uniq", "cut", "column", "tr"})
+#: Their options whose VALUE is the next word (a count, a key, a delimiter), so
+#: that word is not a file operand. ``tr`` takes sets, never a file.
+FILTER_VALUE_OPTIONS = {
+    "head": frozenset({"-n", "-c"}),
+    "tail": frozenset({"-n", "-c"}),
+    "sort": frozenset({"-k", "-t", "-S"}),
+    "cut": frozenset({"-d", "-f", "-c", "-b"}),
+    "uniq": frozenset({"-f", "-s", "-w"}),
+    "column": frozenset({"-s", "-c"}),
+}
+#: Options by which a names-only command reads a file or runs one.
+FILE_READING_OPTIONS = ("--fromfile", "--files0-from", "-files0-from", "--from-file")
+FD_EXEC_OPTIONS = ("-x", "-X", "--exec")  # also --exec-batch, --exec=CMD, -xCMD
+#: Shell syntax that hides what a command prints: command and process
+#: substitution, input redirects and heredocs.
+_OPAQUE_SYNTAX = ("$(", "`", "<", ">(")
+
+
+def _names_only_kind(ti: dict, payload: dict, cwd: str, holdout: str) -> str | None:
+    """The activity kind when this call can only have printed names, else None.
+
+    Two tests, both required. The command's SHAPE: every segment a names-only
+    verb run directly (operand matching cannot see a path piped to ``xargs`` or
+    built by ``eval``, and a searcher such as ``grep`` is never names-only). And
+    every way it reaches the holdout, not just the strongest: ``ls holdout;
+    echo x >> holdout/HOLDOUT.md`` also holds a write. No reach at all, or an
+    error, gives None, which keeps the content row.
+    """
+    if payload.get("tool_name") != "Bash":
+        return None
+    command = ti.get("command") if isinstance(ti.get("command"), str) else ""
+    if not _names_only_shape(command):
+        return None
+    try:
+        kinds = {k for k, _ in _reaches("Bash", ti, cwd, _roots(holdout), holdout)}
+    except Exception:  # noqa: BLE001 - unknown is not names-only
+        return None
+    if not kinds or not kinds <= NAMES_ONLY_KINDS:
+        return None
+    return max(kinds, key=_RANK.__getitem__)
+
+
+def _names_only_shape(command: str) -> bool:
+    """Every segment of ``command`` is a names-only command or a bare filter, run directly."""
+    if not command or any(token in command for token in _OPAQUE_SYNTAX):
+        return False
+    try:
+        from shell_parse import analyze_checked
+
+        segments, blind = analyze_checked(command)
+    except Exception:  # noqa: BLE001 - unreadable is not names-only
+        return False
+    if blind or not segments:
+        return False
+    for seg in segments:
+        argv = list(seg.argv or [])
+        words = (seg.raw or "").split()
+        if not argv or not words or seg.depth or getattr(seg, "verb_unresolved", False):
+            return False
+        if os.path.basename(words[0]) != os.path.basename(argv[0]):
+            return False  # run through a wrapper (xargs, env, timeout, sudo) or an assignment
+        verb = os.path.basename(seg.exe or argv[0])
+        args = argv[1:]
+        if any(_reads_a_file(a) for a in args):
+            return False
+        if verb == "find" and FIND_ACTIONS & set(args):
+            return False
+        if verb == "fd" and any(a.startswith(FD_EXEC_OPTIONS) for a in args):
+            return False
+        if verb in NAMES_ONLY_VERBS:
+            continue
+        if verb in STDIN_FILTERS and not _filter_operands(verb, args):
+            continue
+        return False
+    return True
+
+
+def _reads_a_file(arg: str) -> bool:
+    """An option word that reads a file, or one the shell may rewrite into one.
+
+    GNU tools accept any unambiguous prefix of a long option (``--files0=F``),
+    and an expansion or brace inside an option word becomes other words
+    (``-q${IFS}F``, ``-{-files0-from=F,s}``), so neither is taken at face value.
+    """
+    if not arg.startswith("-"):
+        return False
+    if "$" in arg or "{" in arg:
+        return True
+    name = arg.split("=", 1)[0]
+    return len(name) > 2 and any(opt.startswith(name) for opt in FILE_READING_OPTIONS)
+
+
+def _filter_operands(verb: str, args: list[str]) -> list[str]:
+    """The words of a filter's arguments that could name a file to read."""
+    if verb == "tr":
+        return []
+    takes_value = FILTER_VALUE_OPTIONS.get(verb, frozenset())
+    operands: list[str] = []
+    skip = False
+    for i, arg in enumerate(args):
+        if skip:
+            skip = False
+        elif arg == "--":
+            operands += args[i + 1 :]
+            break
+        elif arg in takes_value:
+            skip = True
+        elif not arg.startswith("-"):  # a lone "-" is stdin
+            operands.append(arg)
+    return operands
 
 
 def _post_exempt(tool: str, ti: dict, cwd: str) -> bool:

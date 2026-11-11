@@ -138,10 +138,18 @@ method this repository allows.
 
 For the install's own holdout, the runner also prints one line about the
 holdout fence, an advisory hook that records any agent but the writer reaching
-the holdout (`scripts/hooks/holdout_fence.py`, added separately): "not
-installed in this checkout" until that hook exists, then the count of exposures
-it recorded in `$GENESIS_HOME/logs/holdout-exposures.jsonl` (reads, writes,
-accesses and content; never rotated), or that the log is missing or unreadable. The
+the holdout (`scripts/hooks/holdout_fence.py`): "not installed in this
+checkout" when that hook is absent, otherwise the count of exposures it recorded
+in `$GENESIS_HOME/logs/holdout-exposures.jsonl` (reads, writes, accesses and
+content; never rotated), or that the log is missing or unreadable. A result that
+only names the directory is recorded as activity, not an exposure, when the call
+is a shell command made only of commands that print names or their own arguments
+(`du`, `ls`, `stat`, `find` with no action, `echo`, `printf`, and `sort`- or
+`head`-style filters of their output), run directly, on the holdout or on a
+directory above it. From any other call it is an exposure: a recursive
+`grep`, `find … | xargs head`, a wrapper, a substitution, `eval`, an input
+redirect, `git` or `gh`, or another tool's result can print scenario lines under
+that path. The
 "installed" test is the hook file's presence in the checkout. Accesses by an
 agent declaring itself `holdout-writer` are counted separately, with the latest
 time, for the owner to match against writer runs they ordered: the writer is
