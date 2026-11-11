@@ -199,6 +199,9 @@ async def record_verification(
             "server_dry_run_only": forced,
             "recorded": False,
             "rechecks": rechecks,
+            # The document's own declaration. On a recorded not-yet-done whose
+            # tracking is complete, the picker waits the re-attempt window after it.
+            "no_progress": doc.no_progress,
         }
         if preview:
             return result
