@@ -121,6 +121,8 @@ GIT_TIMEOUT_S = 600
 # Observed output from a failing arm is shown so the failure can be acted on.
 # It is bounded, and the omission is stated, never silent.
 OBSERVED_CHARS = 400
+STEP_LINE_MIN = 6
+MASKED_STEP_LINE = "[a line of this scenario's steps]"
 
 # Port 9 (discard) on loopback: a Qdrant client gets a refused connection
 # instead of the live collection.
@@ -426,14 +428,39 @@ def _kill_marked(marker: str) -> None:
             return
 
 
-def describe_failed_arm(arm: Arm) -> str:
-    """Say what a FAILING arm did, without ever echoing the expected output."""
+def _mask_steps(text: str, steps: str | None) -> str:
+    """Replace each output line that echoes a line of the scenario's own steps.
+
+    The step script sits in the scratch directory beside ``$TMPDIR``, so code
+    under test can read it and print it; this line is then shown to validators
+    where the fence does not scan. An output line is masked when it holds a
+    whole step line of ``STEP_LINE_MIN`` characters or more, whitespace
+    collapsed. A fragment of a step line is not masked: steps print their own
+    labels and values, and masking those would hide the result. It catches a
+    verbatim whole-line echo of the script only; an escaped (JSON, repr),
+    encoded, wrapped or partial copy passes, and the script stays readable
+    (beside ``$TMPDIR``, and through the step's own command line).
+    """
+    pieces = [" ".join(ln.split()) for ln in (steps or "").splitlines()]
+    pieces = [p for p in pieces if len(p) >= STEP_LINE_MIN]
+    if not pieces:
+        return text
+    lines = []
+    for line in text.split("\n"):
+        flat = " ".join(line.split())
+        echoed = len(flat) >= STEP_LINE_MIN and any(p in flat for p in pieces)
+        lines.append(MASKED_STEP_LINE if echoed else line)
+    return "\n".join(lines)
+
+
+def describe_failed_arm(arm: Arm, steps: str | None = None) -> str:
+    """Say what a FAILING arm did, without ever echoing the expected output or the steps."""
     if arm.note:
         return arm.note
     if arm.stdout_matched:
         # The stdout equals the expectation here, so printing it would reveal it.
         return f"stdout as expected, exit={arm.exit_code} (wrong exit status)"
-    out = arm.stdout.rstrip("\n")
+    out = _mask_steps(arm.stdout.rstrip("\n"), steps)
     if len(out) > OBSERVED_CHARS:
         omitted = len(out) - OBSERVED_CHARS
         out = out[:OBSERVED_CHARS] + f" [{omitted} more chars omitted]"
@@ -665,7 +692,7 @@ def cmd_pr(pr: int, repo: str | None, root: Path, holdout: Path, out=None) -> in
                     verdict = "CLOSED-NOT-DELIVERED"
                 line = f"{sc.sid} {verdict} — {sc.protects}"
                 if failed is not None:
-                    line += f" — observed {describe_failed_arm(failed)}"
+                    line += f" — observed {describe_failed_arm(failed, sc.steps)}"
                 print(line, file=out)
                 if verdict in ATTRIBUTABLE_FAILURES:
                     worst = 1
@@ -956,7 +983,7 @@ def cmd_at_path(root: Path, holdout: Path, ids: list[str], out=None) -> int:
         if arm.passed:
             print(f"{sc.sid} PASS", file=out)
         else:
-            print(f"{sc.sid} FAIL — observed {describe_failed_arm(arm)}", file=out)
+            print(f"{sc.sid} FAIL — observed {describe_failed_arm(arm, sc.steps)}", file=out)
     return 2 if missing else 0
 
 
@@ -1069,7 +1096,12 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument(
         "--has-holdout",
         action="store_true",
-        help="print whether this install keeps a holdout, and where; reads nothing in it",
+        help="print whether this install keeps a holdout; reads nothing in it, names no path",
+    )
+    mode.add_argument(
+        "--holdout-path",
+        action="store_true",
+        help="print the holdout file's path, for the holdout writer; run it as its own command",
     )
     ap.add_argument("--repo", help="owner/name (default: the checkout's own repo)")
     ap.add_argument("--root", type=Path, help="git checkout to cut worktrees from (default: cwd)")
@@ -1101,10 +1133,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.overlay is not None and args.at_ref is None:
         ap.error("--overlay applies to --at-ref only")
     if args.has_holdout:
-        if args.holdout.is_file():
-            print(f"holdout: present at {args.holdout}")
-        else:
-            print(f"holdout: none (would be {args.holdout})")
+        # No path: this line is safe inside any compound command, where the
+        # fence would count a printed holdout path as an exposure.
+        print("holdout: present" if args.holdout.is_file() else "holdout: none")
+        return 0
+    if args.holdout_path:
+        print(args.holdout.resolve())
         return 0
     try:
         with _signals_exit():
