@@ -18,6 +18,11 @@ it on every Claude Code child, and stdio MCP servers inherit it:
   client's launcher (``codex`` for owner-mode Codex). Read into
   :attr:`CallerContext.profile`; it labels what the client did and never grants
   anything.
+- ``CLAUDECODE``: set by Claude Code in the shells and MCP servers it starts.
+- ``CODEX_THREAD_ID``: set by Codex in the shells it runs commands in (not in
+  its MCP servers, which get a filtered environment).
+
+The last two feed :func:`client_kind`, a label for records, never a permission.
 
 Code must not read those variables itself. It calls :func:`caller_context`,
 and a test fails on any direct read under ``src/`` outside this module. The
@@ -79,6 +84,8 @@ LEGACY_SESSION_ID_ENV = "CLAUDE_SESSION_ID"
 # The client a stdio server is serving, set by that client's launcher (``codex``
 # for owner-mode Codex). A record of which client acted, never a permission.
 PROFILE_ENV = "GENESIS_CALLER_PROFILE"
+CLAUDE_CODE_ENV = "CLAUDECODE"
+CODEX_THREAD_ENV = "CODEX_THREAD_ID"
 
 IDENTITY_ENV_VARS = frozenset(
     {
@@ -89,6 +96,8 @@ IDENTITY_ENV_VARS = frozenset(
         TRANSCRIPT_ID_ENV,
         LEGACY_SESSION_ID_ENV,
         PROFILE_ENV,
+        CLAUDE_CODE_ENV,
+        CODEX_THREAD_ENV,
     }
 )
 
@@ -116,6 +125,8 @@ class CallerContext:
     transcript_id: str | None = None
     legacy_session_id: str | None = None
     profile: str | None = None
+    claude_code: str | None = None
+    codex_thread: str | None = None
 
     @property
     def unsupervised_dispatched(self) -> bool:
@@ -139,7 +150,10 @@ def enter_shared_service() -> None:
     Rewrites the identity variables as well, so a child process, which inherits
     the environment and not this flag, reads the lost-scope caller too unless a
     tool passes it the real caller. Bootstrap clears the origin variable, so
-    call this after the runtime is initialised.
+    call this after the runtime is initialised. The agent-shell markers go
+    too, so a child no longer reads as running inside an agent's shell: a
+    command-line tool that refuses there (the browser-stack install) needs the
+    caller passed to it like any other identity.
     """
     global _shared_service
     _shared_service = True
@@ -166,10 +180,21 @@ def caller_context_from_env() -> CallerContext:
         transcript_id=env.get(TRANSCRIPT_ID_ENV),
         legacy_session_id=env.get(LEGACY_SESSION_ID_ENV),
         profile=env.get(PROFILE_ENV) or None,
+        claude_code=env.get(CLAUDE_CODE_ENV),
+        codex_thread=env.get(CODEX_THREAD_ENV),
     )
 
 
-_CLIENT_SESSION_NAMES = {"codex": "Codex session"}
+_CODEX_LABEL = "codex"
+_CLIENT_SESSION_NAMES = {_CODEX_LABEL: "Codex session"}
+# client_kind's label for each caller profile: owner-mode Codex's stdio label and
+# the external-client profiles a stdio server or a shared-service credential sets.
+_PROFILE_KINDS = {
+    _CODEX_LABEL: _CODEX_LABEL,
+    "interactive": _CODEX_LABEL,
+    "validator": "codex-sealed",
+    "external": "codex-external",
+}
 
 
 def client_session_name() -> str:
@@ -179,6 +204,40 @@ def client_session_name() -> str:
     to restart a Claude Code session; Claude Code's wording stays unchanged.
     """
     return _CLIENT_SESSION_NAMES.get(caller_context().profile or "", "Claude Code session")
+
+
+def client_kind(external_profile: str | None = None) -> str:
+    """Which agent client made the current call, as a label for records.
+
+    *external_profile* is the MCP external-client profile a stdio server put in
+    force for the call, if any (``"validator"`` for the sealed Codex validator);
+    a caller outside an MCP tool passes nothing. In order:
+
+    - the profile, *external_profile* or else :attr:`CallerContext.profile`:
+      ``"codex-sealed"`` (validator), ``"codex-external"`` (external), ``"codex"``
+      (owner-mode Codex: the ``codex`` stdio label or the ``interactive``
+      credential);
+    - ``"codex"``: ``CODEX_THREAD_ID`` is set (a Codex command shell);
+    - ``"claude"``: ``CLAUDECODE`` is set;
+    - ``"unknown"``: none of these, or a profile this table does not know.
+
+    The Codex thread id is checked before ``CLAUDECODE`` because Codex passes
+    its parent's environment to its shells, so Codex started from a Claude
+    Code shell carries both. Claude Code started from a Codex shell would carry
+    both too and reads as ``codex``: a known limit of a label that only sees
+    the environment.
+
+    This is a label for records. Nothing may grant or refuse anything on it.
+    """
+    ctx = caller_context()
+    profile = external_profile or ctx.profile
+    if profile:
+        return _PROFILE_KINDS.get(profile, "unknown")
+    if ctx.codex_thread:
+        return _CODEX_LABEL
+    if ctx.claude_code:
+        return "claude"
+    return "unknown"
 
 
 def drop_client_label(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
