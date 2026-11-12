@@ -258,6 +258,7 @@ class Judge:
         self.inflight = block["inflight"] if block else None
         self.notes, self.dirs, self.entry_of, self.resumed = {}, {}, {}, None
         self.held = None  # the unresolved in-flight aside, shown (set by _judged)
+        self.asides_left: list = []  # (run, path) of every as-left aside (runs.aside_parts)
         self.fmt = rp._out(repo, "rev-parse", "--show-object-format")
         self.head = rp._tree(repo, "HEAD")
         self.tag = rp._tree(repo, report["tag"])

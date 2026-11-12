@@ -173,7 +173,10 @@ class _Writer:
         self.run_name = self.run_fd = self.repo_fd = None
         self.recorded_run = None  # the run REPAIR.json's record names after our last save
         self.kept = set()  # paths this run moved into its aside and did not put back
-        self.wrote, self.extras, self.flight = [], [], None
+        self.wrote, self.flight = [], None
+        # _kept_aside: this run's moves (run, path), and the ignored files
+        # every as-left aside still holds, named.
+        self.moved_now, self.kept_aside = [], []
         self.called = set()  # every path whose entries the index call replaced
         # The in-flight record kept for the next run: an aside still holding what
         # a refused in-flight part left there (#3986 review). While it is held
@@ -208,6 +211,7 @@ class _Writer:
                 self.rp._git(self.repo, "update-index", "-q", "--refresh", check=False)
             _step("post-judge")
             self._post()
+            self._name_kept_aside()
             self._finish()
             self._drop_unused_run()
         except _Stop as exc:
@@ -286,7 +290,6 @@ class _Writer:
                     _step("aside")
                     if not self._still_left(p, moved):
                         raise _Part("changed-during-restore", "it changed after it was judged")
-                    self._extras(p, moved)
             if staged is not None:
                 d, name = os.path.split(p)
                 dst = _dirfd(self.repo_fd, d, make=True)
@@ -301,6 +304,8 @@ class _Writer:
                     raise _Part("changed-during-restore", f"written after it was moved to {where}")
             self.out[(p, "node")] = "restored"
             self.wrote.append(p)
+            if moved is not None:
+                self.moved_now.append((moved, p))
         except (_Part, OSError) as exc:
             reason = exc.reason if isinstance(exc, _Part) else _why(exc)
             note = exc.note if isinstance(exc, _Part) else f"{exc.filename or ''}: {exc.strerror}"
@@ -309,6 +314,8 @@ class _Writer:
                 # Held only for content the restore did not move there: the
                 # repair's own as-left copy is what git gives back (#3986 review).
                 held = None if self._still_left(p, moved) else moved
+                if held is None:  # as-left there: its ignored files are named this run
+                    self.moved_now.append((moved, p))
             self._refuse(p, "node", reason, note)
         finally:
             if staged is not None:
@@ -375,15 +382,35 @@ class _Writer:
         finally:
             j.budget = spent
 
-    def _extras(self, p: str, run: str) -> None:
-        """Review SF-D: ignored files a tag directory moved aside held, to name."""
+    # ── ignored files kept aside (#4025 item 4) ─────────────────────────────
+
+    def _name_kept_aside(self) -> None:
+        """The files git ignores (a server's __pycache__) that a tag directory
+        held when it was moved aside stay in its aside: a tag directory is a
+        node part only where the repair saved a file or a link there (one whose
+        disk node is a directory, or nothing, is no node part, its files are
+        rows: live_move_repair.Repair._row), so they never have a directory to
+        go back to. They are named on every
+        run, from every as-left aside (this run's, the in-flight one and every
+        earlier run's, runs.aside_parts), so a run killed before naming them
+        loses nothing; they never withhold restored_at."""
         j = self.j
-        if p in j.tag or p not in j.tag_dirs:
-            return
-        with contextlib.suppress(OSError, self.rp.TooLarge):
-            tagged = j._tag_below(p)
-            have = j._walk(os.path.join(self.ctx.root, run, "aside"), p)
-            self.extras += [f"{p}/{q}" for q in sorted(have) if q not in tagged]
+        cands = [*self.moved_now, *j.asides_left]
+        if j.inflight and not j.held:
+            cands.append((j.inflight[0], j.inflight[1]))
+        for run, p in dict.fromkeys(cands):
+            if p in j.tag or p not in j.tag_dirs or not self._still_left(p, run):
+                continue
+            spent, j.budget = j.budget, self.chk._Budget(self.rp)
+            try:
+                tagged = j._tag_below(p)
+                have = j._walk(os.path.join(self.ctx.root, run, "aside"), p)
+            except (OSError, self.rp.TooLarge):
+                continue  # the next run reads it again
+            finally:
+                j.budget = spent
+            where = self._aside(p, run)
+            self.kept_aside += [json.dumps(f"{where}/{q}") for q in sorted(have) if q not in tagged]
 
     # ── staging in <run>/new ────────────────────────────────────────────────
 
@@ -728,9 +755,13 @@ class _Writer:
         if self.run_name:
             folder = os.path.join(self.ctx.shown, self.run_name)
             say(f"What the restore replaced is in {folder}, kept while its report is.")
-        if self.extras:
-            named = ", ".join(json.dumps(q) for q in self.extras[:50])
-            say(f"Moved aside with their directory (git ignores them): {named}")
+        if self.kept_aside:
+            more = f" and {len(self.kept_aside) - 50} more" if len(self.kept_aside) > 50 else ""
+            say(
+                "Kept aside with their directory (git ignores them): "
+                + ", ".join(self.kept_aside[:50])
+                + more
+            )
         if lost := sum(1 for *_, o in out if o[len("refused:") :] in _PERMANENT):
             say(
                 f"{lost} part(s) the restore cannot write: put them back by hand from {shown}/tree"

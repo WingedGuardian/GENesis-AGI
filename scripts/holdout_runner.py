@@ -183,6 +183,15 @@ class Scenario:
         return min(dates) if dates else None
 
     @property
+    def author_dates(self) -> list[dt.date]:
+        """Every real YYYY-MM-DD on the Author line: days the writer worked on it."""
+        dates = []
+        for found in _DATE.findall(self.fields.get("Author", "")):
+            with contextlib.suppress(ValueError):
+                dates.append(dt.date.fromisoformat(found))
+        return dates
+
+    @property
     def issue(self) -> int:
         return int(self.fields.get("Issue", "").strip().lstrip("#"))
 
@@ -703,9 +712,19 @@ def _print_exposures(out, scenarios: list[Scenario]) -> None:
 
     The log is append-only, so a row with no readable time, or a line that does
     not parse, happened no later than the next dated row: that row's day bounds
-    it, unless it is older than a day already seen (the clock went back). Only such a row at the end of the log has no bound, and then every
-    scenario counts as spoiled. So does a scenario with no Author date, or one
-    dated later than tomorrow, which cannot be right.
+    it, unless it is older than a day already seen (the clock went back). Only
+    such a row at the end of the log has no bound, and then every scenario counts
+    as spoiled. So does a scenario with no Author date, or one dated later than
+    tomorrow, which cannot be right.
+
+    An access declaring the holdout-writer agent is only counted when it is no
+    later than the day after the newest Author date in the file: the writer has
+    written a scenario since. A later one, one with no readable time, or any at
+    all when no scenario carries a date, is reported for the owner to confirm,
+    because the writer is known only by the name an agent declares. So the
+    message clears itself the next time the writer writes a scenario, for as
+    long as that scenario stays in the file. A row with no readable time never
+    clears; the fence always writes one.
     """
     if not FENCE_HOOK.exists():
         print("holdout fence: not installed in this checkout; exposures are not recorded", file=out)
@@ -715,7 +734,7 @@ def _print_exposures(out, scenarios: list[Scenario]) -> None:
         return
     count, bad, times, days = 0, 0, [], []
     unbounded = False  # an exposure of unknown time with no dated row after it yet
-    writer, writer_times = 0, []
+    writer_rows: list[tuple[str, dt.date | None]] = []
     try:
         with open(EXPOSURE_LOG, encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -736,10 +755,9 @@ def _print_exposures(out, scenarios: list[Scenario]) -> None:
                     unbounded = False
                 if row.get("kind") == "allowed":
                     # The writer is known only by the name an agent declares, so
-                    # these are counted for the owner to match against writer
-                    # runs they ordered, never treated as harmless.
-                    writer += 1
-                    writer_times.append(str(row.get("at") or ""))
+                    # these are matched against the scenarios below, never
+                    # treated as harmless outright.
+                    writer_rows.append((str(row.get("at") or ""), day))
                     continue
                 count += 1
                 times.append(str(row.get("at") or ""))
@@ -751,16 +769,31 @@ def _print_exposures(out, scenarios: list[Scenario]) -> None:
         print(f"holdout fence: exposure log unreadable ({exc}); treat as unknown", file=out)
         return
     tail = f"; {bad} unreadable line(s)" if bad else ""
-    if writer:
+    tomorrow = dt.datetime.now(dt.UTC).date() + dt.timedelta(days=1)
+    # A date past tomorrow cannot be right, and would silence every later access.
+    written = [d for sc in scenarios for d in sc.author_dates if d <= tomorrow]
+    newest = max(written) if written else None
+    unmatched = [
+        (at, day)
+        for at, day in writer_rows
+        if day is None or newest is None or day > newest + dt.timedelta(days=1)
+    ]
+    if unmatched:
+        dated = [at for at, day in unmatched if day is not None]
+        when = f"latest {max(dated)}" if dated else "time unreadable"
+        since = "since the newest scenario was written" if newest else "and no dated scenario"
         tail += (
-            f"; {writer} access(es) declaring the holdout-writer agent, latest "
-            f"{max(writer_times)}: confirm each was a writer run you ordered"
+            f"; {len(unmatched)} of {len(writer_rows)} access(es) declaring the holdout-writer "
+            f"agent {since}, {when}: confirm each was a writer run you ordered"
+        )
+    elif writer_rows:
+        tail += (
+            f"; {len(writer_rows)} holdout-writer access(es), none later than the newest scenario"
         )
     if not count and not bad:
         print(f"holdout fence: no exposures logged{tail}", file=out)
         return
     latest = None if unbounded or not days else max(days)
-    tomorrow = dt.datetime.now(dt.UTC).date() + dt.timedelta(days=1)
     spoiled = [
         sc.sid
         for sc in scenarios
