@@ -18,9 +18,11 @@ the filesystem nor the database; only ``main`` performs I/O.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import sqlite3
+import stat
 import sys
 from collections.abc import Callable
 from contextlib import closing
@@ -269,28 +271,44 @@ def _note_urls(text: str) -> list[str]:
     return urls
 
 
-def _note_paths(inbox: Path) -> list[Path]:
-    """Eligible note paths, without reading unselected note bodies."""
-    from genesis.inbox.scanner import RESPONSE_SUFFIX
+def _inbox_files(inbox: Path) -> list[Path]:
+    """Every file the monitor may evaluate, of any type, without reading bodies."""
+    from genesis.inbox.scanner import RESPONSE_SUFFIX, is_excluded_parent_dir
 
     def on_error(error: OSError) -> None:
         raise error
 
     paths: list[Path] = []
     # rglob silently suppresses directory errors, hiding protected identities.
-    # Do not follow directory symlinks; hidden subtrees are outside eligibility.
+    # Do not follow directory symlinks. Prune the folders a recursive inbox
+    # scan never reads below: exact for the default response folder, and for
+    # any other name this only keeps more files protected.
     for directory, subdirs, names in os.walk(inbox, onerror=on_error):
-        subdirs[:] = [name for name in subdirs if not name.startswith(".")]
+        subdirs[:] = [name for name in subdirs if not is_excluded_parent_dir(name)]
         for name in names:
-            path = Path(directory) / name
-            if not path.is_file() or not name.endswith(".md"):
+            if name.startswith("."):
                 continue
             if name.endswith(RESPONSE_SUFFIX) or ".sync-conflict-" in name:
                 continue
-            if any(part.startswith(".") for part in path.relative_to(inbox).parts):
+            path = Path(directory) / name
+            # Path.is_file hides every OSError on Python 3.14; only absence
+            # may drop a note, any other metadata error refuses the inventory.
+            try:
+                info = path.stat()
+            except FileNotFoundError:
                 continue
-            paths.append(path)
+            except OSError as exc:
+                if exc.errno != errno.ELOOP:  # a symlink loop names no file
+                    raise
+                continue
+            if stat.S_ISREG(info.st_mode):
+                paths.append(path)
     return sorted(paths)
+
+
+def _note_paths(inbox: Path) -> list[Path]:
+    """Eligible markdown notes: the files the coverage listing reports on."""
+    return [path for path in _inbox_files(inbox) if path.name.endswith(".md")]
 
 
 def _scan_notes(inbox: Path, file_name: str | None) -> list[NoteInput]:
@@ -425,7 +443,7 @@ def main(argv: list[str] | None = None) -> int:
     report = build_report(notes, rows_by_file, _read_response)
 
     try:
-        protected = [*database_targets, *_note_paths(inbox), *response_targets]
+        protected = [*database_targets, *_inbox_files(inbox), *response_targets]
     except (OSError, RuntimeError) as exc:
         print(f"cannot establish inbox inventory: {exc}", file=sys.stderr)
         return 2

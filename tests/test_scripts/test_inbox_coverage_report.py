@@ -630,3 +630,138 @@ def test_unreadable_inventory_is_unknown_not_empty(tmp_path, monkeypatch, hidden
         ]
     ) == (0 if hidden else 2)
     assert victim.read_text() == "retain entire note"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory search permission")
+def test_unstattable_note_cannot_allow_overwrite(tmp_path, monkeypatch):
+    # Python 3.14 implements Path.is_file as os.path.isfile, which hides every
+    # OSError; emulate it so the gap shows on every supported interpreter.
+    monkeypatch.setattr(Path, "is_file", lambda path, **_: os.path.isfile(path))
+    inbox, db, _, _ = _run(tmp_path, note_text=URL)
+    directory = inbox / "restricted"
+    directory.mkdir()
+    victim = directory / "other.md"
+    victim.write_text("retain entire note")
+    output = tmp_path / "alias.md"
+    output.hardlink_to(victim)
+    directory.chmod(0o600)  # listable, not searchable: names visible, stat fails
+    try:
+        rc = _rep.main(
+            ["--inbox", str(inbox), "--db", str(db), "--file", "note.md", "--out", str(output)]
+        )
+    finally:
+        directory.chmod(0o700)
+    assert rc == 2
+    assert victim.read_text() == "retain entire note"
+
+
+def test_unreadable_scanner_excluded_directory_does_not_block(tmp_path, monkeypatch):
+    inbox, db, _, _ = _run(tmp_path, note_text=URL)
+    directory = inbox / "_genesis"
+    directory.mkdir()
+    original = os.scandir
+
+    def scan(path):
+        if Path(path) == directory:
+            raise PermissionError("synthetic inaccessible excluded subtree")
+        return original(path)
+
+    monkeypatch.setattr(os, "scandir", scan)
+    output = tmp_path / "report.md"
+    assert (
+        _rep.main(
+            ["--inbox", str(inbox), "--db", str(db), "--file", "note.md", "--out", str(output)]
+        )
+        == 0
+    )
+    assert "Inbox URL coverage report" in output.read_text()
+
+
+def _report_rc(inbox: Path, db: Path, output: Path) -> int:
+    return _rep.main(
+        ["--inbox", str(inbox), "--db", str(db), "--file", "note.md", "--out", str(output)]
+    )
+
+
+def test_unreadable_tilde_directory_refuses(tmp_path, monkeypatch):
+    # The scanner skips a tilde ENTRY but still descends into its folder.
+    inbox, db, _, _ = _run(tmp_path, note_text=URL)
+    directory = inbox / "~archive"
+    directory.mkdir()
+    original = os.scandir
+
+    def scan(path):
+        if Path(path) == directory:
+            raise PermissionError("synthetic inaccessible eligible subtree")
+        return original(path)
+
+    monkeypatch.setattr(os, "scandir", scan)
+    output = tmp_path / "report.md"
+    assert _report_rc(inbox, db, output) == 2
+    assert not output.exists()
+
+
+def test_note_under_tilde_directory_is_protected(tmp_path):
+    inbox, db, _, _ = _run(tmp_path, note_text=URL)
+    victim = inbox / "~archive" / "kept.md"
+    victim.parent.mkdir()
+    victim.write_text("retain entire note")
+    output = tmp_path / "alias.md"
+    output.hardlink_to(victim)
+    assert _report_rc(inbox, db, output) == 2
+    assert victim.read_text() == "retain entire note"
+
+
+def test_every_scanned_note_is_in_the_inventory(tmp_path):
+    from genesis.inbox.scanner import scan_folder
+
+    inbox = tmp_path / "inbox"
+    for rel in (
+        "note.md",
+        "a/b.md",
+        "~archive/kept.md",
+        "a/~sub/deep.md",
+        "_genesis/r.genesis.md",
+        "_private/y.md",
+        ".hidden/z.md",
+        "c.sync-conflict-1.md",
+        "notes.txt",
+        "a/~sub/clip.txt",
+    ):
+        path = inbox / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(URL)
+    scanned = set(scan_folder(inbox, recursive=True))
+    assert {inbox / "~archive" / "kept.md", inbox / "notes.txt"} <= scanned
+    assert scanned <= set(_rep._inbox_files(inbox))
+    assert {path for path in scanned if path.suffix == ".md"} <= set(_rep._note_paths(inbox))
+    assert inbox / "notes.txt" not in _rep._note_paths(inbox)
+
+
+def test_self_referential_symlink_note_does_not_block(tmp_path):
+    inbox, db, _, _ = _run(tmp_path, note_text=URL)
+    loop = inbox / "loop.md"
+    loop.symlink_to(loop)
+    output = tmp_path / "report.md"
+    assert _report_rc(inbox, db, output) == 0
+    assert "Inbox URL coverage report" in output.read_text()
+
+
+def test_hardlink_to_inbox_text_file_is_refused(tmp_path):
+    # The monitor evaluates every file type, not only markdown notes.
+    inbox, db, _, _ = _run(tmp_path, note_text=URL)
+    victim = inbox / "clip.txt"
+    victim.write_text("retain entire file")
+    output = tmp_path / "alias.md"
+    output.hardlink_to(victim)
+    assert _report_rc(inbox, db, output) == 2
+    assert victim.read_text() == "retain entire file"
+
+
+def test_inbox_text_symlink_target_is_refused(tmp_path):
+    inbox, db, _, _ = _run(tmp_path, note_text=URL)
+    victim = tmp_path / "outside.data"
+    victim.write_text("retain entire file")
+    (inbox / "linked.txt").symlink_to(victim)
+    assert _report_rc(inbox, db, victim) == 2
+    assert victim.read_text() == "retain entire file"

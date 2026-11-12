@@ -5,11 +5,13 @@ An existing `--out` directory receives a generated `inbox-coverage-*.md` file;
 an ordinary file path keeps the existing report-overwrite behavior.
 
 The destination is checked after choosing its final filename. It cannot name
-the database (including its WAL, SHM and rollback-journal companions), an eligible
-inbox note, or any response referenced by retained
+the database (including its WAL, SHM and rollback-journal companions), any inbox
+file the monitor may evaluate (of any type, not only markdown notes), or any response referenced by retained
 inbox history. Protection includes unselected notes and response references
 outside `--file` selection, resolved symlinks and existing hardlink identities.
-An eligible-subtree enumeration or identity lookup error refuses publication;
+An eligible-subtree enumeration, file metadata or identity lookup error refuses
+publication; hidden and underscore-prefixed directories, which a recursive inbox scan
+never reads below, are outside eligibility and cannot block a report;
 a missing protected file keeps
 its path protection. Unselected note bodies are not read for these checks.
 
