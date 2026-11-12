@@ -282,20 +282,24 @@ class Answer:
 
 def answers(log: Iterable[tuple[str, str, str, datetime | None]]) -> tuple[Answer, ...]:
     """The declarations of every reflection in ``log`` (``_log_reflections``'
-    shape) whose header names keys. Grammar alone: a declaration here can only
-    END the loop, the restrictive direction, so a reflection that fails its
-    full check still counts against its own author."""
+    shape) whose header names keys. Grammar alone for what can only END the
+    loop (a send-back, a filing), the restrictive direction, so a reflection
+    that fails its full check still counts against its own author. A fix-now
+    can reopen the loop, so it counts only from an EMPTY commit, the one
+    form the commit gate checks in full; a reflection header in a merge or
+    content commit message counts as filing."""
     found = []
-    for _sha, _kind, body, made_at in log:
+    for _sha, kind, body, made_at in log:
         parsed = parse(body)
         if parsed.keys:
+            fixes = frozenset(parsed.fix_now_keys) if kind == "empty" else frozenset()
             found.append(
                 Answer(
                     frozenset(parsed.keys),
                     parsed.decision == "send-back",
-                    parsed.fix_now,
+                    bool(fixes),
                     made_at,
-                    frozenset(parsed.fix_now_keys),
+                    fixes,
                 )
             )
     return tuple(found)
@@ -570,7 +574,10 @@ def loop_ended(
     if newest is None:
         return False
     declared = tuple(declared)
-    pr_keys = set().union(*(r.keys for r in records.values()))
+    flags = _record_flags(records) if flags is None else flags
+    # Every finding key of the PR: the round records' and the budget's, so a
+    # finding on a commit that opened no round counts for a send-back too.
+    pr_keys = set().union(*(r.keys for r in records.values())) | set(flags)
     made = [
         a for a in declared
         if a.made_at is not None and a.made_at <= now
@@ -588,7 +595,6 @@ def loop_ended(
         ended = None if blocking is None else not blocking
     if not ended:
         return ended
-    flags = _record_flags(records) if flags is None else flags
     # The newest answer naming a key decides it: fixing it, then filing it,
     # leaves it filed.
     fixing: dict[str, bool] = {}

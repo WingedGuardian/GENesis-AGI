@@ -1116,3 +1116,104 @@ def test_merge_flags_floor_wins_then_unknown():
     assert rr.merge_flags([("a", False), ("a", True), ("a", None)]) == {"a": True}
     assert rr.merge_flags([("b", False), ("b", None)]) == {"b": None}
     assert rr.merge_flags([("c", False), ("c", False)]) == {"c": False}
+def test_a_send_back_on_a_key_that_opened_no_round_ends_the_loop():
+    """CodeRabbit Major (confirmation round): a send-back naming only a key
+    the budget carries but no round record does ends the loop."""
+    _, records = _ladder(5, blocking_at={5})
+    at = _late(5)
+    flags = {**rr._record_flags(records), "c99": True}
+    send_back = _ans({"c99"}, at=at, sent_back=True)
+    assert _ended(records, at, flags=flags) is False
+    assert _ended(records, at, [send_back], flags=flags) is True
+
+
+def _late_floor_budget():
+    budget, cutover = _ended_budget()
+    budget["findings"].append(
+        {
+            "round_head": None,
+            "submitted_at": datetime.now(UTC).isoformat(),
+            "keys": ["c99"],
+            "blocking": [True],
+        }
+    )
+    return budget, cutover
+
+
+_FULL_ROUND_FIVE = [
+    "Class: unchecked subprocess result = 1",
+    "Premise: SOUND-BUT-INFERIOR",
+    "Premise-why: the change routes around an existing helper that already exists",
+    "Impossible: route every call through one checked helper and delete the rest",
+    "Scope: covered: the key round-trips (tests/test_x.py)",
+    "Decision: fix-instances",
+    "Decision-why: the same mistake appears twice in two different files",
+    "Disposition: c99 fix-now test=1",
+    "Premise-evidence: ~/.genesis/review_evidence/x.txt SOUND-BUT-INFERIOR",
+    "Premise-check: P1 TRUE the claim holds under the probe",
+    "Premise-check: P2 TRUE the second claim holds as well",
+]
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_the_ended_branch_checks_a_fix_now_reflection_in_full(monkeypatch, complete):
+    """CodeRabbit Major (confirmation round): once the loop ended, an empty
+    reflection that fixes now is admitted only when it passes this round's
+    grammar and the past-round-4 rules, since its declaration can reopen the
+    loop. One without its Prediction and Confidence is refused."""
+    budget, cutover = _late_floor_budget()
+    monkeypatch.setattr(rr, "PAST_TERMINAL_CUTOVER_ISO", cutover)
+    lines = [f"Round-reflection: keys=c99 head={budget['current_head']}", *_FULL_ROUND_FIVE]
+    if complete:
+        lines += [
+            "Prediction: merges at round 6 because the class is closed now",
+            "Confidence: 99% falsified-by any new finding in that class",
+        ]
+    lines += ["Prediction-held: no a floor finding arrived late", "Escalate: no"]
+    text = "\n".join(lines) + "\n"
+    monkeypatch.setattr(_gate, "_exemption_shape_ok", lambda *a: True)
+    monkeypatch.setattr(_gate, "_reflection_form_problem", lambda *a, **k: (None, text))
+    monkeypatch.setattr(_gate, "_concludes_merge_of_main", lambda *a, **k: False)
+    monkeypatch.setattr(rr, "_log_reflections", lambda cwd: [])
+    problem = _gate._ended_commit_problem([], "git commit", ".", budget, rr, None)
+    if complete:
+        assert problem is None, problem
+    else:
+        assert problem and "Prediction" in problem, problem
+
+
+def test_the_ended_branch_admits_a_filing_reflection_unchecked(monkeypatch):
+    """A reflection that fixes nothing can only keep the loop ended, so its
+    form is enough."""
+    budget, cutover = _ended_budget()
+    monkeypatch.setattr(rr, "PAST_TERMINAL_CUTOVER_ISO", cutover)
+    text = (
+        f"Round-reflection: keys=c5 head={budget['current_head']}\n"
+        "Class: unchecked subprocess result = 1\nPremise: LEAD\n"
+        "Premise-why: the change routes around an existing helper that already exists\n"
+        "Impossible: route every call through one checked helper and delete the rest\n"
+        "Scope: covered: the key round-trips (tests/test_x.py)\nDecision: fix-instances\n"
+        "Decision-why: the same mistake appears twice in two different files\n"
+        "Disposition: c5 file issue=#12\nEscalate: no\n"
+    )
+    monkeypatch.setattr(_gate, "_exemption_shape_ok", lambda *a: True)
+    monkeypatch.setattr(_gate, "_reflection_form_problem", lambda *a, **k: (None, text))
+    assert _gate._ended_commit_problem([], "git commit", ".", budget, rr, None) is None
+@pytest.mark.parametrize("kind", ["empty", "content"])
+def test_a_fix_now_counts_only_from_an_empty_reflection_commit(kind):
+    """Fix audit (round-3 fix): a reflection header in a merge-of-main or
+    content commit message is never checked in full, so its fix-now counts
+    as filing; only an empty reflection commit can declare a fix."""
+    body = (
+        f"Round-reflection: keys=c7 head={HEAD}\n"
+        "Class: unchecked subprocess result = 1\nPremise: LEAD\n"
+        "Premise-why: the change routes around an existing helper that already exists\n"
+        "Impossible: route every call through one checked helper and delete the rest\n"
+        "Scope: covered: the key round-trips (tests/test_x.py)\nDecision: fix-instances\n"
+        "Decision-why: the same mistake appears twice in two different files\n"
+        "Disposition: c7 fix-now test=1\nEscalate: no\n"
+    )
+    (answer,) = rr.answers([("f" * 40, kind, body, T0)])
+    assert answer.keys == {"c7"}
+    assert answer.fix_now is (kind == "empty")
+    assert answer.fix_now_keys == ({"c7"} if kind == "empty" else frozenset())

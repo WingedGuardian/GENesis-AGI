@@ -1294,8 +1294,13 @@ def _reflection_rule(
         return "continue", None
     if not owed:
         ended = _loop_ended(cwd, budget, rr, owed_deadline)
-        if ended and not _ended_commit_ok(segs, command, cwd, budget, rr, owed_deadline):
-            message = _ended_message(budget)
+        refusal = (
+            _ended_commit_problem(segs, command, cwd, budget, rr, owed_deadline)
+            if ended
+            else None
+        )
+        if refusal is not None:
+            message = _ended_message(budget) + "\nThis commit: " + refusal + "."
             if _reflection_gate_mode() == "advisory":
                 _ADVISORIES.append("reflection gate (advisory mode, NOT enforced): " + message)
                 return "continue", None
@@ -1373,18 +1378,66 @@ def _loop_ended(cwd: str | None, budget: dict, rr, deadline: float | None = None
 def _ended_commit_ok(
     segs: list, command: str, cwd: str | None, budget: dict, rr, deadline: float | None
 ) -> bool:
-    """The commits an ended loop still admits, each one plain ``git commit``
-    the gate can see whole (``_exemption_shape_ok``: one segment, at most one
-    ``-C``, no env prefix, nothing chained to stage a fix after the hook reads
-    the index): an empty reflection commit in its one form, which carries no
-    content, or the conclusion of a merge of the default branch."""
+    return _ended_commit_problem(segs, command, cwd, budget, rr, deadline) is None
+
+
+def _ended_commit_problem(
+    segs: list, command: str, cwd: str | None, budget: dict, rr, deadline: float | None
+) -> str | None:
+    """Why an ended loop refuses this commit, or None when it admits it. It
+    admits only one plain ``git commit`` the gate can see whole
+    (``_exemption_shape_ok``: one segment, at most one ``-C``, no env prefix,
+    nothing chained to stage a fix after the hook reads the index): an empty
+    reflection commit in its one form, or the conclusion of a merge of the
+    default branch. A reflection that fixes now must also pass this round's
+    grammar and the past-round-4 rules (its Prediction and Confidence, the
+    loop's end): its declaration can reopen the loop, so it is checked as
+    fully as admission checks one."""
     if not _exemption_shape_ok(segs, command):
-        return False
+        return "the commit is not one plain `git commit`"
     try:
-        problem, _text = _reflection_form_problem(segs, command, cwd, budget, rr, deadline=deadline)
+        problem, text = _reflection_form_problem(segs, command, cwd, budget, rr, deadline=deadline)
     except Exception:  # noqa: BLE001 - not provably an empty reflection commit
-        problem = "unreadable"
-    return problem is None or _concludes_merge_of_main(cwd, rr, segs, deadline)
+        problem, text = "unreadable", None
+    if problem is None and text is not None:
+        return _ended_reflection_problem(text, cwd, budget, rr, deadline)
+    if _concludes_merge_of_main(cwd, rr, segs, deadline):
+        return None
+    return "it is neither an empty reflection commit nor a merge of the default branch"
+
+
+def _ended_reflection_problem(
+    text: str, cwd: str | None, budget: dict, rr, deadline: float | None
+) -> str | None:
+    """None for a reflection an ended loop may take: one that fixes nothing
+    (it can only keep the loop ended), or one that passes this round's grammar
+    and the past-round-4 rules. Unreadable state refuses (the deny stands)."""
+    gate_lane = bool(budget.get("gate_surface"))
+    try:
+        parsed = rr.parse(text, gate_lane=gate_lane)
+    except Exception as exc:  # noqa: BLE001 - not provably a reflection that fixes nothing
+        return f"it could not be checked ({type(exc).__name__})"
+    if not parsed.fix_now:
+        return None
+    try:
+        round_n = int(budget.get("count") or 0)
+        full = rr.parse(text, round_number=round_n, gate_lane=gate_lane)
+        records = rr._round_records(budget) or {}
+        now = datetime.now(UTC)
+        problems = list(full.problems) + rr.past_terminal_problems(
+            full,
+            None,
+            records,
+            gate_lane=gate_lane,
+            made_at=now,
+            declared=_declared_answers(cwd, budget, rr, records, now, deadline),
+            flags=rr._key_flags(budget),
+        )
+    except Exception as exc:  # noqa: BLE001 - not provably a complete reflection
+        problems = [f"it could not be checked ({type(exc).__name__})"]
+    if problems:
+        return "a reflection that fixes now must pass its full check: " + "; ".join(problems[:4])
+    return None
 
 
 def _concludes_merge_of_main(cwd: str | None, rr, segs: list, deadline: float | None = None) -> bool:
