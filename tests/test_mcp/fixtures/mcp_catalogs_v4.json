@@ -1696,7 +1696,7 @@
           "resolution_notes": {
             "default": "",
             "type": "string",
-            "description": "Notes on resolution or progress. Appended context for future sessions."
+            "description": "Notes on resolution or progress. Appended to any existing notes\n(after a blank line); earlier notes are never replaced."
           },
           "blocked_reason": {
             "default": "",
