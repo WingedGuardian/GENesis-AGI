@@ -207,8 +207,9 @@ never a row recorded later, so none can be made in advance. A row with no
 readable time cannot be dismissed. A dismissal row, and a dismissed exposure,
 are dated rows like any other: they still bound an unreadable row before them
 and still count when the runner checks whether the clock went back. Any
-session can run the command; the visible count and reason on every run are the
-check, and a session runs it only on the owner's ruling about that row.
+session can run the command, so the check is the visible count and time on every
+run, which a validator reports to the owner for confirmation; a session runs it
+only on the owner's ruling about that row.
 
 `--has-holdout` prints whether this install keeps a holdout and where, and
 reads nothing in it; skills and agents use it instead of hard-coding the path.
