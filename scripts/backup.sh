@@ -232,6 +232,7 @@ _on_exit() {
     # candidate) must not outlive the script if it died mid-section.
     rm -f "${_SQL_COUNT:-}" "${_SQL_ARTIFACT_TMP:-}" 2>/dev/null || true
     rm -f "${_EXTRA_TAR_TMP:-}" "${_EXTRA_TAR_ERR:-}" 2>/dev/null || true  # §6f plaintext tar + its file-name diagnostics
+    rm -f "${_ENCRYPT_PARTIAL:-}" "${_ENCRYPT_ERR_TMP:-}" 2>/dev/null || true  # encrypt_file's in-flight partial + gpg stderr
     if [ -n "${_VERIFY_DB:-}" ]; then
         rm -f "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm" 2>/dev/null || true
     fi
@@ -415,6 +416,7 @@ _pick_verify_mode() {
 # to a private repo is not acceptable).
 _BACKUP_PASSPHRASE="${GENESIS_BACKUP_PASSPHRASE:-}"
 _ENCRYPT_READY=false
+_ENCRYPT_PARTIAL="" _ENCRYPT_ERR_TMP=""  # encrypt_file's in-flight files, for _on_exit
 if [ -f "$SECRETS_FILE" ] && ! backup_passphrase_file_valid "$SECRETS_FILE"; then
     die "Backup secrets file is unreadable or contains NUL"
 fi
@@ -424,12 +426,70 @@ if [ -n "$_BACKUP_PASSPHRASE" ]; then
 fi
 
 # encrypt_file <src> <dst> — encrypt file contents to <dst> (e.g. *.gpg).
+#
+# The source is read through a pipe, never by name. Given a file name, gpg
+# records the file's size up front and fails ("Input/output error") when the
+# file grows while it reads, which a live session transcript does (#4391). A
+# pipe has no size, so gpg encrypts what it reads to EOF. The passphrase
+# arrives on fd 3, as in encrypt_stream.
+#
+# gpg writes a dot-prefixed partial beside <dst>, renamed over it only on
+# success, so a failed run keeps the previous copy: gpg deletes its output on
+# failure, which used to be <dst> itself. A partial a killed run leaves behind
+# is swept before the commit (§7). On failure the last line of gpg's stderr is
+# logged to stderr; the caller still logs its own WARNING.
+#
+# The copy is stamped 1 ns past the source's mtime from just before the read,
+# so the callers' `[ "$dst" -nt "$src" ]` skip holds while the source is
+# unchanged and fails once anything is appended after the read began. A
+# source written in the last second or two (whole seconds are compared), or
+# with an mtime ahead of the clock, is stamped at exactly its mtime instead: an
+# append inside the same timestamp tick would not move its mtime, so the next
+# run re-encrypts it rather than trusting the stamp.
 encrypt_file() {
     local src="$1"
     local dst="$2"
     backup_passphrase_valid "$_BACKUP_PASSPHRASE" || return 1
-    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --no-symkey-cache --passphrase-fd 0 \
-        --symmetric --cipher-algo AES256 -o "$dst" "$src" 2>/dev/null
+    local tmp mtime secs nsec stamp
+    local -a st
+    tmp="$(dirname -- "$dst")/.$(basename -- "$dst").partial.$$"
+    mtime="$(stat -L -c %.9Y -- "$src")" || return 1
+    _ENCRYPT_ERR_TMP="$(mktemp -p "$GENESIS_BIG_TMP" encrypt.XXXXXX.err)" || return 1
+    _ENCRYPT_PARTIAL="$tmp"
+    if cat -- "$src" 2>>"$_ENCRYPT_ERR_TMP" \
+        | gpg --batch --yes --no-symkey-cache --passphrase-fd 3 \
+            --symmetric --cipher-algo AES256 -o "$tmp" \
+            3< <(printf '%s' "$_BACKUP_PASSPHRASE") 2>>"$_ENCRYPT_ERR_TMP"; then
+        st=("${PIPESTATUS[@]}")
+    else
+        st=("${PIPESTATUS[@]}")
+    fi
+    if [ "${st[0]}" = 0 ] && [ "${st[1]}" = 0 ]; then
+        secs="${mtime%.*}"
+        nsec=$((10#${mtime#*.}))
+        if [ $(( $(date +%s) - secs )) -ge 2 ]; then
+            nsec=$((nsec + 1))
+            if [ "$nsec" -ge 1000000000 ]; then
+                secs=$((secs + 1))
+                nsec=$((nsec - 1000000000))
+            fi
+        fi
+        printf -v stamp '@%s.%09d' "$secs" "$nsec"
+        touch -d "$stamp" -- "$tmp" 2>/dev/null || true
+        # -T: a directory at <dst> is a failure, never a place to move into.
+        if mv -f -T -- "$tmp" "$dst"; then
+            rm -f -- "$_ENCRYPT_ERR_TMP"
+            _ENCRYPT_ERR_TMP="" _ENCRYPT_PARTIAL=""
+            return 0
+        fi
+    fi
+    rm -f -- "$tmp"
+    # stderr, not stdout: a caller may capture stdout as its own result
+    # (backup_payment_vault's one-line verdict is read from it).
+    log "  gpg: $(tail -n1 "$_ENCRYPT_ERR_TMP" 2>/dev/null | tr -cd '[:print:]' | cut -c1-200)" >&2
+    rm -f -- "$_ENCRYPT_ERR_TMP"
+    _ENCRYPT_ERR_TMP="" _ENCRYPT_PARTIAL=""
+    return 1
 }
 
 # encrypt_stream <dst> — encrypt stdin to <dst>, same cipher and passphrase as
@@ -1825,6 +1885,25 @@ if ! grep -qx 'creds/\*\*/\.\*\.tmp' .gitignore 2>/dev/null; then
     printf 'creds/**/.*.tmp\n' >> .gitignore
     log "Added the credential staging names to the .gitignore exclusions"
 fi
+# encrypt_file's partials and the SQL dump's staged artifact
+# (.<name>.partial.<pid>): a run killed mid-encrypt leaves one. Never commit
+# one, and sweep every one this run did not make: the backup-restore lock taken
+# at the top admits one run per GENESIS_HOME, so any other pid's partial is a
+# dead run's (#4391). (Two runs sharing this repo under different GENESIS_HOME
+# values could sweep each other's: the victim's rename then fails and its
+# previous copy stays, so nothing is lost.) A partial's name
+# ends in its pid's digits and an encrypted copy's in `.gpg`, so a real dotfile
+# such as `.notes.partial.2024.md`, backed up as `….md.gpg`, is neither
+# ignored nor swept: the second .gitignore line re-includes it.
+if ! grep -qxF '.*.partial.[0-9]*' .gitignore 2>/dev/null; then
+    if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then printf '\n' >> .gitignore; fi
+    printf '.*.partial.[0-9]*\n!.*.partial.*.gpg\n' >> .gitignore
+    log "Added the encryption partials to the .gitignore exclusions"
+fi
+while IFS= read -r -d '' _partial; do
+    rm -f -- "$_partial" && log "Removed an encryption partial left by an interrupted run: $_partial"
+done < <(find transcripts memory eval data secrets creds -type f -regextype posix-extended \
+    -regex '.*/\.[^/]+\.partial\.[0-9]+' ! -name "*.partial.$$" -print0 2>/dev/null)
 
 # --- Commit and push (Tier 1 only) ---
 log "Committing backup..."
