@@ -738,3 +738,18 @@ async def test_a_closed_connection_after_a_cached_build_is_unavailability(tmp_pa
 
     with pytest.raises(GraphUnavailableError):
         await store.centrality(db, top_n=5)
+
+async def test_centrality_is_reproducible_for_sampled_betweenness(tmp_path):
+    """Repeated sampled centrality calls must return identical rankings."""
+    path = tmp_path / "centrality.db"
+    links = [(f"node-{i}", f"node-{i + 1}") for i in range(204)]
+    await _seed(path, links)
+
+    store = NetworkxGraphStore()
+    db = await aiosqlite.connect(str(path))
+    try:
+        first = await store.centrality(db, top_n=None)
+        second = await store.centrality(db, top_n=None)
+        assert first == second
+    finally:
+        await db.close()

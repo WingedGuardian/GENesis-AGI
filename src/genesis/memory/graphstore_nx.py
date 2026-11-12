@@ -38,6 +38,8 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+_BETWEENNESS_SEED = 42
+
 try:
     import networkx as nx
 
@@ -525,6 +527,6 @@ class NetworkxGraphStore:
         # Use approximate betweenness for large graphs to avoid blocking
         n_nodes = G.number_of_nodes()
         k = min(200, n_nodes) if n_nodes > 200 else None
-        scores = nx.betweenness_centrality(G, k=k)
+        scores = nx.betweenness_centrality(G, k=k, seed=_BETWEENNESS_SEED)
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return ranked if top_n is None else ranked[:top_n]
