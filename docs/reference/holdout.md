@@ -72,7 +72,8 @@ exact standard output
   and ignored otherwise. `Expect-exit` defaults to `0`.
 - `Author` names the writer and the UTC date the scenario was written. The
   runner reads that date to tell which scenarios a later exposure may have
-  spoiled, and counts a scenario without one as spoiled.
+  spoiled, and counts a scenario without one as spoiled. The newest such date
+  in the file also decides which writer accesses it reports (below).
 - A scenario passes when its exit status equals `Expect-exit` and its standard
   output equals the `Expect` block (trailing newlines ignored).
 - Steps run with `bash` in the checkout under test, with `HOLDOUT_ROOT` set to
@@ -163,9 +164,16 @@ no path or scenario text in a result is seen only if the PreToolUse half
 classifies the command, and that half's known gaps are listed in the hook's
 "WHAT IT CANNOT SEE". The
 "installed" test is the hook file's presence in the checkout. Accesses by an
-agent declaring itself `holdout-writer` are counted separately, with the latest
-time, for the owner to match against writer runs they ordered: the writer is
-known only by the name an agent declares, so any session could claim it. The
+agent declaring itself `holdout-writer` are counted separately. One that is no
+later than the day after the newest `Author` date in the file is only counted:
+the writer has written a scenario since. A later one, one with no readable time,
+or any at all when no scenario carries a date, is reported with the latest time,
+for the owner to match against writer runs they ordered. So the message clears
+itself the next time the writer writes a scenario, for as long as that scenario
+stays in the file. An `Author` date later than tomorrow is ignored here, and a
+row with no readable time is always reported. The writer is known only by
+the name an agent declares, so any session could claim it, and a false claim
+made before the writer's latest scenario is not reported. The
 fence and the count catch honest mistakes; "no exposures" is not proof that the
 set is still hidden. When there are exposures, the line names the scenarios
 they may have spoiled: those whose `Author` date (`YYYY-MM-DD`, the earliest
