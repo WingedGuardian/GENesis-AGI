@@ -5566,6 +5566,11 @@ verified: 81bbdb0a9 2026-11-08
   under propose-only; the apply/resolve path that would create one is a
   follow-up (future WS1 `enforce`).
   Voice-master exemplars are on the contribution FORBIDDEN list.
+  Manual-only catalog entries (`disable-model-invocation: true`) receive no
+  hook nudge or executor suggestion/assigned/delegated body injection, while
+  explicit foreground lookup and the inventory remain available. Usage retains
+  them as not nudge-eligible. Activation requires explicit catalog regeneration
+  and restarting cached consumers; see `docs/reference/manual-only-skills.md`.
   Cross-tool export: `scripts/export_agents_md.py` writes a body-scope
   inventory (skills + action tools, never memory/brain) into a managed
   `<!-- genesis:skills -->` block in `AGENTS.md` for Cursor/Codex/other
