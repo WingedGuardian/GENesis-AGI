@@ -1,5 +1,5 @@
 {
   "name": "genesis-secret-redact",
   "version": "0.1.0",
-  "description": "Keeps this install's secrets.env values out of everything a Claude Code session reads or stores: tool results, transcript rows, persisted output, Monitor and background output, and typed prompts. Needs Claude Code 2.1.287 or later (mods)."
+  "description": "Keeps this install's secrets.env values out of what a Claude Code session reads and stores: tool results, transcript rows, saved large outputs and typed prompts. Needs Claude Code 2.1.287 or later (mods)."
 }
