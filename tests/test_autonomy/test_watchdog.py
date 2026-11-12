@@ -968,9 +968,9 @@ class TestLegacyReasonNormalisation:
         "bad_ts",
         [
             10**309, -(10**309), float("inf"), float("-inf"), float("nan"),
-            1e300, time.time() + 365 * 86400,
+            1e300, 4_102_444_800.0,  # 2100-01-01 UTC: finite and far in the future
         ],
-        ids=["huge-int", "huge-negative-int", "inf", "-inf", "nan", "1e300", "next-year"],
+        ids=["huge-int", "huge-negative-int", "inf", "-inf", "nan", "1e300", "year-2100"],
     )
     def test_an_unusable_numeric_timestamp_is_dropped(
         self, tmp_path: Path, stale_status: Path, bad_ts: object,
