@@ -2681,7 +2681,7 @@ class InboxMonitor:
 
         from genesis.autonomy.build_lane import BuildLane, build_spec_usable
         from genesis.db.crud import build_candidates, follow_ups
-        from genesis.inbox.recommendation import parse_recommendations
+        from genesis.inbox.recommendation import normalise_action, parse_recommendations
 
         recs = parse_recommendations(evaluation_text)
         created = 0
@@ -2690,7 +2690,7 @@ class InboxMonitor:
         build_lane_live = self._build_lane_live()
 
         for rec in recs:
-            action_key = rec.action.lower().replace("_", " ").strip()
+            action_key = normalise_action(rec.action)
             build_fallback = action_key == "build" and not build_lane_live
             if not rec.is_actionable and not build_fallback:
                 continue
