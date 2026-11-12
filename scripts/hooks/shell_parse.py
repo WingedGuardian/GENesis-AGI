@@ -1706,6 +1706,37 @@ def _argv(seg: str) -> list[str]:
         return core.split()
 
 
+def words_with_quoting(seg: str) -> list[tuple[str, bool]] | None:
+    """Each shell word of one segment, with whether bash saw it quoted WHOLE.
+
+    ``("x=a b", True)`` for ``'x=a b'``; ``("--in=a", False)`` for
+    ``--in="a"``, whose prefix is unquoted. The word is :func:`_argv`'s; "quoted
+    whole" comes from a second, quote-keeping tokenization of the same text, and
+    only when that token is one quote pair whose inside is exactly the word.
+    Anything else (an escape inside the quotes, a quote pair mid-word) reads as
+    not quoted whole, which a caller treats as an operand. None when the two
+    tokenizations disagree on the word count, or either fails: the caller then
+    knows nothing about quoting and must fail toward checking.
+    """
+    core = _strip_trailing_comment(_decode_escape_free_ansi_c(seg))
+    try:
+        words = shlex.split(core)
+        lex = shlex.shlex(core, posix=False)
+        lex.whitespace_split = True
+        lex.commenters = ""
+        raws = list(lex)
+    except ValueError:
+        return None
+    if len(raws) != len(words):
+        return None
+    out = []
+    for word, raw in zip(words, raws, strict=True):
+        q = raw[:1]
+        whole = len(raw) >= 2 and q in ("'", '"') and raw[-1] == q and raw[1:-1] == word
+        out.append((word, whole and q not in raw[1:-1]))
+    return out
+
+
 def untokenizable(command: str) -> bool:
     """True when ``shlex`` cannot cleanly tokenize the command.
 
