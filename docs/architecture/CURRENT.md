@@ -5148,13 +5148,20 @@ logger or unrelated exceptions with copied text and no provenance.
   pointing away from `$GIT_COMMON_DIR/hooks` nothing is touched and the hooks
   stay pending (readiness names that setting). Every later run first re-reads
   each pending report (through `load_report`; a DISMISS_MARK folder is
-  skipped) under both locks and retries it while the branch `live` is still
-  its tag and HEAD is on `live` (HEAD elsewhere: left pending; an entry whose
-  commits are not full commit ids: left as it is), marks it `superseded` once
-  `live` itself moved, and writes back only `hooks` (0600); a report
+  skipped) under both locks, before its heal, and judges it against the refs
+  as it found them: `superseded` once `live` itself left the report's tag;
+  owed while `live` is that tag and HEAD is on `live` (HEAD elsewhere: left
+  pending; an entry whose commits are not full commit ids: left as it is).
+  An owed report's restore-hooks runs only after the heal, and only when the
+  tree then reads SAFE (no state, or one the guard calls SAFE), judged again
+  first since the heal may have moved `live` (#4367): restore-hooks runs the
+  checkout's engine and sync-hooks.sh, which a half-written tree may hold
+  another commit's bytes for and a held one a hand edit. A forward heal's own
+  restore-hooks runs inside the heal, once the files are the tag's, as
+  before. Each retry writes back only `hooks` (0600); a report
   dismissed with `dismissed_at` is still retried while its folder exists
   (dismissal ends only its count and its keep). One report's retry failing
-  (its write, say) is logged and never stops the heal that follows.
+  (its write, say) is logged and never stops another report's retry.
   `--dismiss` and a restore take update.lock too, so neither's field is lost
   (every REPAIR.json writer holds it); with no state file and update.lock
   held it exits 0 at once. The restore-hooks run is not bounded by the boot budget;

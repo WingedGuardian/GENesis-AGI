@@ -126,6 +126,9 @@ def test_td2_a_rollback_killed_partway_finishes_toward_the_tag(w, victim):
             "held": True,
             "ephemeral_re": True,
             "checkout_locked": True,
+            # The heal's own call runs before it clears the state (the files are
+            # the tag's by then); only an older report's retry waits for SAFE.
+            "state_left": True,
         }
     ]
     assert w.report()["hooks"] == "ok"
@@ -1269,6 +1272,43 @@ def test_td18_hooks_pending_while_head_is_merely_detached_wait(w):
     assert w.repair(mode="--boot").returncode == 0
     assert w.report()["hooks"] == "pending" and len(w.hook_calls()) == 1
     _git(w.root, "checkout", "-q", "live")
+    assert w.repair(mode="--boot").returncode == 0
+    assert w.report()["hooks"] == "ok" and len(w.hook_calls()) == 2
+
+
+def test_td18_the_retry_waits_while_the_tree_is_half_written(w):
+    """#4367 item 1: a pending report at the tag T; a later update from `live`
+    at T is killed on the tag side toward U, so HEAD is `live` at T while part
+    of the tree holds U's bytes. restore-hooks would run the checkout's engine
+    and sync-hooks.sh from that tree, so the retry waits until the heal ends
+    with the tree SAFE, then runs in the same run (plan review F1, F2)."""
+    killed_rollback(w, "P")
+    assert w.repair(SPY_RC="1").returncode == 0
+    assert w.report()["hooks"] == "pending" and len(w.hook_calls()) == 1
+    pending = w.backups()[-1]
+    killed_tag_side(w, "Z3")
+    assert w.guard_rc() == 4, "control: the tree reads half-written (MIXED_TREE)"
+    healed = w.repair(mode="--boot")
+    assert healed.returncode == 0 and not w.state.exists(), healed.stdout + healed.stderr
+    calls = w.hook_calls()
+    assert len(calls) == 2 and not calls[-1]["state_left"], "the retry ran before the heal"
+    assert json.loads((pending / "REPAIR.json").read_text())["hooks"] == "ok"
+
+
+def test_td18_the_retry_waits_while_the_state_holds(w):
+    """Plan review F2: the retry runs the checkout's engine, so it runs only on
+    a SAFE tree. A state the repair leaves held (a tracked edit the move does
+    not write: HOLD) keeps the entry pending; once the state is gone it retries."""
+    killed_rollback(w, "P")
+    assert w.repair(SPY_RC="1").returncode == 0
+    assert w.report()["hooks"] == "pending" and len(w.hook_calls()) == 1
+    (w.root / "K").write_text("someone's edit\n")
+    w.write_state(w.row("clean"))
+    assert w.guard_rc() == 6, "control: the state reads HOLD"
+    assert w.repair(mode="--boot").returncode == 0
+    assert w.state.exists() and len(w.hook_calls()) == 1, "the retry ran on a held tree"
+    assert w.report()["hooks"] == "pending"
+    w.state.unlink()
     assert w.repair(mode="--boot").returncode == 0
     assert w.report()["hooks"] == "ok" and len(w.hook_calls()) == 2
 
