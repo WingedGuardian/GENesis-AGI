@@ -1213,3 +1213,60 @@ class TestOpenDurationCapByCategory:
         assert self._tripped_cap(ErrorCategory.NOT_ENTITLED) > self._tripped_cap(
             ErrorCategory.PERMANENT
         )
+
+
+class TestRegistryToggleAfterTheOpenWindow:
+    """`toggle` must not decide from `.state`, which mutates as it reads.
+
+    Reading `.state` on an OPEN breaker whose window has passed moves it to
+    HALF_OPEN. A toggle that branched on that read sent an "enable" click on an
+    expired operator hold down the disable branch and force-opened it again.
+    """
+
+    @staticmethod
+    def _held(tmp_path):
+        t = [0.0]
+        reg = CircuitBreakerRegistry(
+            {"p": _provider("p")}, state_file=tmp_path / "s.json", clock=lambda: t[0],
+        )
+        assert reg.toggle("p") is ProviderState.OPEN
+        cb = reg.get("p")
+        assert cb._failure_cause == "operator"
+        # Expire the hold by the breaker's own window rather than a constant.
+        t[0] = cb._effective_open_duration() + 1
+        return reg, cb
+
+    def test_toggle_enables_an_expired_operator_hold(self, tmp_path):
+        reg, cb = self._held(tmp_path)
+        assert cb._state is ProviderState.OPEN, "fixture: nothing has read .state yet"
+        assert reg.toggle("p") is ProviderState.CLOSED
+        assert cb._failure_cause is None
+
+    def test_enable_intent_wins_after_a_reader_moved_it_half_open(self, tmp_path):
+        reg, cb = self._held(tmp_path)
+        assert cb.state is ProviderState.HALF_OPEN  # what the routing poll does
+        assert reg.toggle("p", enable=True) is ProviderState.CLOSED
+        assert cb._failure_cause is None
+
+    def test_disable_intent_on_half_open_forces_open(self, tmp_path):
+        reg, cb = self._held(tmp_path)
+        assert cb.state is ProviderState.HALF_OPEN
+        assert reg.toggle("p", enable=False) is ProviderState.OPEN
+        assert cb._failure_cause == "operator"
+        assert cb._opened_by_call is True
+
+    def test_no_intent_on_half_open_disables(self, tmp_path):
+        # The documented limit of the no-intent path: once a reader has moved
+        # the breaker HALF_OPEN, a client that sends no intent gets "disable",
+        # which is the button a fresh dashboard shows for HALF_OPEN.
+        reg, cb = self._held(tmp_path)
+        assert cb.state is ProviderState.HALF_OPEN
+        assert reg.toggle("p") is ProviderState.OPEN
+
+    def test_intent_is_idempotent(self, tmp_path):
+        reg = CircuitBreakerRegistry({"p": _provider("p")}, state_file=tmp_path / "s.json")
+        assert reg.toggle("p", enable=True) is ProviderState.CLOSED
+        assert reg.get("p")._failure_cause is None
+        assert reg.toggle("p", enable=False) is ProviderState.OPEN
+        assert reg.toggle("p", enable=False) is ProviderState.OPEN
+        assert reg.get("p")._failure_cause == "operator"
