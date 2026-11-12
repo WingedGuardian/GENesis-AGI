@@ -415,6 +415,7 @@ def test_wrapped_command_runs_end_to_end(secrets_file, tmp_path):
 def test_plugin_manifest_wires_the_mod_and_the_wrap():
     hooks = json.loads((BIN.parent / "hooks" / "hooks.json").read_text())
     assert hooks["modules"] == ["./register.ts"]
-    (entry,) = hooks["hooks"]["PreToolUse"]
+    (entry,) = [
+        e for e in hooks["hooks"]["PreToolUse"] if "bin/stream_wrap.py" in e["hooks"][0]["command"]
+    ]
     assert entry["matcher"] == "^(Monitor|Bash)$"
-    assert "bin/stream_wrap.py" in entry["hooks"][0]["command"]

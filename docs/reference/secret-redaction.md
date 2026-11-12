@@ -29,6 +29,16 @@ file it reads is the one `src/genesis/secrets_location.py` resolves for the sess
 python-dotenv (the runtime's own parser) from the install's venv, or a fallback parser without `${VAR}`
 expansion where there is no venv.
 
+## Publishing guard
+
+`bin/publish_guard.py`, a second PreToolUse hook in the plugin, refuses a Bash or Monitor command that runs `gh` (directly or through a wrapper such as `timeout` or `bash -c`) when a
+known value appears in the command text or in an existing file of up to 1 MB that the command names (any token,
+or the part after `=` in a token, is tried as a path, so `--body-file f`, `-F body=@f` and every other spelling
+are covered without modelling gh's flags). `gh secret` and `gh auth` are exempt: sending a value to GitHub's
+secret store or logging in is their job. The refusal names the variable and where it was found, never the value.
+If the check cannot run it lets the command through and says so on stderr. Pushed commits are left to the
+repository's pre-push scan.
+
 ## Behaviour worth knowing
 
 - **Writing to the secrets file.** A placeholder the session copied from a redacted read is turned back into
