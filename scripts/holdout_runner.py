@@ -787,8 +787,14 @@ def cmd_dismiss(at: str, reason: str, out=None) -> int:
                 "rows": len(matches),
                 "reason": reason,
             }
+            torn = False
+            with open(EXPOSURE_LOG, "rb") as tail:
+                if tail.seek(0, os.SEEK_END) > 0:
+                    tail.seek(-1, os.SEEK_END)
+                    torn = tail.read(1) != b"\n"
             with open(EXPOSURE_LOG, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(row) + "\n")
+                # A torn last line (or a row with no newline) would swallow it.
+                fh.write(("\n" if torn else "") + json.dumps(row) + "\n")
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
     print(f"holdout: dismissed {len(matches)} exposure(s) recorded at {at}", file=out)

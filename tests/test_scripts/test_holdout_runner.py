@@ -1311,3 +1311,20 @@ def test_a_dismissal_row_with_an_unreadable_time_prints_no_raw_text(
         "(latest dismissal time unreadable; reasons in the log)"
     ]
     assert "quoted scenario text" not in out
+
+
+@pytest.mark.parametrize(
+    "last", ['{"at": "2026-11-06T09:00:00Z", "kind": "rea', _read_row("2026-11-06T09:00:00Z")]
+)
+def test_a_dismissal_starts_on_its_own_line_after_an_unterminated_tail(
+    install_holdout, capsys, last
+):
+    log = install_holdout / "logs" / "holdout-exposures.jsonl"
+    log.parent.mkdir()
+    log.write_text(_read_row("2026-11-05T09:00:00Z") + "\n" + last)
+    assert hr.main(["--dismiss", "2026-11-05T09:00:00Z", "--reason", REASON]) == 0
+    capsys.readouterr()
+    assert log == hr.EXPOSURE_LOG
+    rows = hr._log_rows()
+    assert rows[-1] is not None and rows[-1]["kind"] == "dismissed"
+    assert len(rows) == 3 and rows[0]["kind"] == "read"
