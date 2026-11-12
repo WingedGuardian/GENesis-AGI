@@ -1,0 +1,1 @@
+- A live-move restore now names, on every run, the files git ignores (a server's `__pycache__`, for example) that it moved aside with a directory and could not put back, including after a restore that was killed partway. Before, they were named once at most and never again. They do not keep the report from clearing.

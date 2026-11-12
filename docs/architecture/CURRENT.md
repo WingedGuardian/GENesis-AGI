@@ -2974,7 +2974,10 @@ verified: c712f1bde 2026-11-06
   merge's first parent and at the merge, prints ids, verdicts and `Protects`
   lines only, and the validating-merges skill ("The holdout check") maps the
   verdicts into the evidence document. The session observer records nothing for
-  that subagent, so its work stays out of memory. An install without the file
+  that subagent, so its work stays out of memory. An advisory hook,
+  `scripts/hooks/holdout_fence.py`, records any other agent reaching the
+  directory or receiving its text, and the runner names the scenarios those
+  exposures may have spoiled. An install without the file
   has no holdout and the runner says so. Format and rules:
   `docs/reference/holdout.md`.
 - **Post-merge verification obligations** (shipped; producer automatic; consumer
@@ -5428,6 +5431,13 @@ logger or unrelated exceptions with copied text and no provenance.
   before #4011 carry no ts and are found only through the in-flight record.
   The deploy-backups prune keeps a run folder named for its report for as
   long as that report's folder exists.
+  The files git ignores that a tag directory held when it was moved aside
+  (a server's `__pycache__`) stay in its aside: a tag directory is a node
+  part only where the repair saved a file or a link there (one whose disk node
+  is a directory, or nothing, is no node part; its files are rows), so they
+  never have a directory to go back to. Every `--restore` names them, from every as-left aside of every run
+  folder, so a run killed before naming them loses nothing; they never
+  withhold `restored_at`.
   `REPAIR.json` gets a `restore` block, `{inflight: [run, path, "node"] |
   null, refused: <int>, restored_at: <str> | null}` (no per-part list; the
   output carries those), rewritten under update.lock after a re-read;
