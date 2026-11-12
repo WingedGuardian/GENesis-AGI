@@ -1,5 +1,17 @@
 # Testing Guide
 
+Internal shared HTTP qualification uses the exact upgraded-stack interpreter and
+explicit files `tests/test_mcp/test_shared_http_admission.py`,
+`tests/test_mcp/test_shared_http_policy.py`,
+`tests/test_mcp/test_shared_http_runtime.py`, and
+`tests/test_observability/test_activity_persistence_scope.py`. Runtime tests own
+the real manager lifespan in one task, use actual SDK dispatch/SQLite and
+synthetic tools, and cover authentication, profiles/local refusal, activity
+suppression, tool/session/body limits, idle expiration and freshness rollback.
+Persistence assertions explicitly settle existing asynchronous batches; they
+are not an immediate-durability guarantee. These fixtures do not replace owned
+loopback progress/cancellation qualification, independent review or landed E2E.
+
 The standalone rollout CLI and captured deploy source are exercised with real
 `python -I -S` subprocesses in `tests/test_scripts/test_mcp_rollout_config.py`,
 `test_mcp_rollout_failures.py`, and `test_mcp_rollout_repair.py`. Run them with
@@ -411,6 +423,33 @@ It also reports reads of the real credential files (the deployed `secrets.env`,
 
 The list it produces is the to-do list for moving each such test under its own
 `tmp_path`; once it is empty, the audit can refuse instead of report.
+
+## Shared MCP qualification environments
+
+Ordinary CI keeps its existing runtime dependency ranges. The shared-only
+protocol suites require the exact versions admitted by
+`genesis.mcp.shared_http._settings.require_qualified_stack`; an unsupported
+ordinary environment explicitly skips those three modules before SDK imports.
+Pure configuration and missing/later-version refusal tests remain ordinary
+tests in `tests/test_mcp/test_shared_http_settings.py`.
+
+`.github/workflows/shared-mcp-qualification.yml` installs the separate
+`.github/shared-mcp/requirements.txt` constraints alongside the existing test-tool
+pins. It runs for relevant PRs across base branches, including stacked PRs, with
+read-only permissions. `GENESIS_REQUIRE_SHARED_MCP_QUALIFICATION=1` is test-only:
+qualification refusal becomes a collection error in this job. No production
+version, feature, credential or rollout gate changes.
+
+The protocol step names the admission, policy and actual HTTP modules explicitly.
+Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
+and a floor of 91 cases. Installation, collection, test or report-check failure
+fails the job; missing or filtered workflow runs do not qualify a PR. Closing
+checks its actual head/base result. Ordinary skip-budget changes require observed
+skip identities; this workflow does not raise that budget automatically.
+
+For a local run, use an already qualified isolated interpreter and the same
+strict test flag, then run the workflow's report check. Changing installed
+packages or enabling shared services is not part of that test command.
 
 ## Integration Tests
 
