@@ -48,6 +48,7 @@ from hook_deadline import (  # noqa: E402
     written_units,
 )
 from hook_phases import PhaseClock  # noqa: E402
+from secret_values import redact as redact_secret_values  # noqa: E402
 
 # Per-step timings, written to stderr once per run (hook_phases.py). Created
 # before the hard stop is armed so a stop that fires during the imports below
@@ -265,7 +266,10 @@ def _emit_tracked(out: BoundedStdout, text: str, block: str) -> bool:
     global _RECALL_LANDED
     if out.closed:
         return False
-    out.emit(text, block=block)
+    # Every recalled line passes here, from the server engine and the local fallback alike. Claude Code keeps this
+    # hook's output as its own record of the turn, where the secret-redaction plugin cannot reach it, so known
+    # secrets.env values (a credential captured into memory, say) are replaced here, at the source.
+    out.emit(redact_secret_values(text), block=block)
     _RECALL_LANDED = True
     return True
 
@@ -2003,7 +2007,9 @@ def _heartbeat_read_and_inject(
             tag_parts.append(f"{sid_short} {address}" if address else sid_short)
             tag = " | ".join(tag_parts)
 
-            out.emit(f"[{tag}] {detail}" if detail else f"[{tag}]", block="concurrent")
+            # Peer summaries and their recent commands can quote a value too.
+            line = f"[{tag}] {detail}" if detail else f"[{tag}]"
+            out.emit(redact_secret_values(line), block="concurrent")
 
         if active:
             out.emit(_peer_closing_line(hidden), block="concurrent-directive")
@@ -2068,7 +2074,7 @@ async def _run(prompt: str, session_id: str = "", *, process_age_s: float = 0.0)
         _PHASES.mark("flush")
         out = _writer()
         for line in deferred_lines:
-            out.emit(line, block="session-metadata")
+            out.emit(redact_secret_values(line), block="session-metadata")  # trail keywords, recent commands
 
     deadline = time.monotonic() + max(0.0, _RUN_DEADLINE_S - process_age_s)
     _RUN_DEADLINE_AT = deadline

@@ -33,6 +33,8 @@ from secret_scrub import (  # noqa: E402
     scrub,
     scrub_info,
 )
+from secret_values import redact as redact_secret_values  # noqa: E402
+from secret_values import redact_deep as redact_secret_values_deep  # noqa: E402
 
 # Tools that produce low-signal observations — not worth capturing
 _SKIP_TOOLS = frozenset(
@@ -155,7 +157,9 @@ def _summarize_output(tool_name: str, tool_input: dict, output_raw: str) -> str:
         return "[skipped: command reads a secret-bearing file]"
     if _is_credential_tool(tool_name):
         return "[skipped: credential-store tool]"
-    return scrub(_truncate_output(output_raw))
+    # Known secrets.env values first, and before truncating: a cut through a value would leave a prefix no exact
+    # match can find. Then the pattern scrub for secret shapes that are not in the file.
+    return scrub(_truncate_output(redact_secret_values(output_raw)))
 
 
 def main() -> None:
@@ -264,7 +268,9 @@ def _process(data: dict) -> None:
         "ts": time.time(),
         "session_id": session_id,
         "tool_name": tool_name,
-        "key_info": _extract_key_info(tool_name, tool_input),
+        # Values first, on the whole input: key info truncates commands and arguments, and a cut value no longer
+        # matches.
+        "key_info": _extract_key_info(tool_name, redact_secret_values_deep(tool_input)),
         "output_summary": _summarize_output(tool_name, tool_input, output_raw),
     }
 
