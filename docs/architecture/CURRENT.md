@@ -2523,7 +2523,10 @@ verified: 4721e0d93 2026-11-07
   specific scheduler on a stale `scheduler_heartbeats` entry (`awareness`/`surplus`,
   `job_health.last_run` age > 900s) — the "zombie scheduler, alive but not dispatching"
   case. Restart is deferred while `heavy_workload` is set (dream cycle), during a boot
-  stabilization window, or a network outage; repeated restarts (flap) or max-restarts
+  stabilization window, or a network outage; a target in its first start attempt
+  (a start step, no automatic restart yet, under 300 s) is left to systemd's own
+  start timeout, so a start that times out every time still escalates, and a target that is activating, inactive or failed is STARTED, never
+  restarted, so a running start step (ExecStartPre) is never SIGTERMed; repeated restarts (flap) or max-restarts
   escalate to a durable owner/Telegram alert. This is why a wedged/dead surplus needs no
   `subsystem_stale` alert (§9): it is detected and self-healed here at 900s.
   Each tick also reads the container's `io.pressure`; above full avg10 25% it
