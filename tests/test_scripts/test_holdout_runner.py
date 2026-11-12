@@ -1355,3 +1355,224 @@ def test_overlay_without_at_ref_is_a_usage_error(repo, tmp_path):
     with pytest.raises(SystemExit) as exc:
         hr.main(["--at-path", str(root), "--overlay", str(tmp_path)])
     assert exc.value.code == 2
+
+
+REASON = "the owner ruled it a harmless path listing"
+
+
+def _dismissal(target, at="2026-11-09T00:00:00Z", reason=REASON):
+    return json.dumps({"at": at, "kind": "dismissed", "dismisses": target, "reason": reason})
+
+
+def _log_lines(home):
+    return (home / "logs" / "holdout-exposures.jsonl").read_text().splitlines()
+
+
+def test_a_dismissed_exposure_leaves_the_count_and_the_spoiled_list(
+    repo, fake_gh, install_holdout, capsys
+):
+    _raw_log(
+        install_holdout,
+        _read_row("2026-11-01T09:00:00Z"),
+        _read_row("2026-11-05T09:00:00Z"),
+        _dismissal("2026-11-05T09:00:00Z"),
+    )
+    text = _authored("H-01", "2026-11-01") + _authored("H-02", "2026-11-04")
+    _, out = _run_install(repo, install_holdout, text, capsys)
+    assert _fence_line(out) == (
+        "holdout fence: 1 exposure(s), first 2026-11-01T09:00:00Z, latest 2026-11-01T09:00:00Z; "
+        "1 dismissed (latest dismissal 2026-11-09T00:00:00Z; reasons in the log) (see "
+        f"{install_holdout / 'logs' / 'holdout-exposures.jsonl'}); possibly spoiled: H-01: "
+        "tell the owner"
+    )
+
+
+def test_every_exposure_dismissed_says_none_outstanding(repo, fake_gh, install_holdout, capsys):
+    _raw_log(install_holdout, _read_row("2026-11-05T09:00:00Z"), _dismissal("2026-11-05T09:00:00Z"))
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-01"), capsys)
+    assert _fence_line(out) == (
+        "holdout fence: no exposures outstanding; 1 dismissed "
+        "(latest dismissal 2026-11-09T00:00:00Z; reasons in the log)"
+    )
+
+
+def test_a_dismissal_never_reaches_a_row_written_after_it(repo, fake_gh, install_holdout, capsys):
+    _raw_log(install_holdout, _dismissal("2026-11-05T09:00:00Z"), _read_row("2026-11-05T09:00:00Z"))
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-01"), capsys)
+    assert _fence_line(out).startswith("holdout fence: 1 exposure(s)")
+    assert "dismissed" not in _fence_line(out)
+
+
+def test_a_dismissal_never_reaches_a_writer_row(repo, fake_gh, install_holdout, capsys):
+    _raw_log(install_holdout, _allowed("2026-11-05T09:00:00Z"), _dismissal("2026-11-05T09:00:00Z"))
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-01"), capsys)
+    assert "dismissed" not in _fence_line(out)
+    assert "confirm each was a writer run you ordered" in _fence_line(out)
+
+
+def test_a_dismissed_row_of_unknown_time_cannot_exist_so_it_still_spoils(
+    repo, fake_gh, install_holdout, capsys
+):
+    _raw_log(install_holdout, json.dumps({"kind": "read"}), _dismissal(""))
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-01"), capsys)
+    assert _fence_line(out).endswith("possibly spoiled: H-01: tell the owner")
+
+
+def test_a_dismissal_still_bounds_an_earlier_row_of_unknown_time(
+    repo, fake_gh, install_holdout, capsys
+):
+    """The log is append-only, so the dismissal row's own time bounds an
+    undated row before it, just as any dated row does."""
+    _raw_log(
+        install_holdout,
+        _read_row("2026-11-01T09:00:00Z"),
+        "not json",
+        _dismissal("2026-11-01T09:00:00Z", at="2026-11-02T00:00:00Z"),
+    )
+    text = _authored("H-01", "2026-11-03") + _authored("H-02", "2026-11-05")
+    _, out = _run_install(repo, install_holdout, text, capsys)
+    assert _fence_line(out).endswith("possibly spoiled: H-01: tell the owner")
+
+
+def test_dismiss_appends_one_row_for_every_match_and_says_so(install_holdout, capsys):
+    _raw_log(
+        install_holdout,
+        _read_row("2026-11-05T09:00:00Z"),
+        _read_row("2026-11-05T09:00:00Z", kind="content"),
+        _read_row("2026-11-06T09:00:00Z"),
+    )
+    rc = hr.main(
+        ["--dismiss", "2026-11-05T09:00:00Z", "--reason", "  the owner  ruled it\tharmless  "]
+    )
+    assert rc == 0
+    assert (
+        capsys.readouterr().out
+        == "holdout: dismissed 2 exposure(s) recorded at 2026-11-05T09:00:00Z\n"
+    )
+    lines = _log_lines(install_holdout)
+    assert len(lines) == 4 and lines[:3] == [
+        _read_row("2026-11-05T09:00:00Z"),
+        _read_row("2026-11-05T09:00:00Z", kind="content"),
+        _read_row("2026-11-06T09:00:00Z"),
+    ]
+    row = json.loads(lines[3])
+    assert row["kind"] == "dismissed" and row["dismisses"] == "2026-11-05T09:00:00Z"
+    assert row["rows"] == 2 and row["reason"] == "the owner ruled it harmless"
+    assert hr._utc_day(row["at"]) is not None
+
+
+@pytest.mark.parametrize(
+    ("lines", "target", "message"),
+    [
+        ([_read_row("2026-11-05T09:00:00Z")], "2026-11-05T09:00:01Z", "no undismissed exposure"),
+        ([_allowed("2026-11-05T09:00:00Z")], "2026-11-05T09:00:00Z", "no undismissed exposure"),
+        (
+            [_read_row("2026-11-05T09:00:00Z"), _dismissal("2026-11-05T09:00:00Z")],
+            "2026-11-05T09:00:00Z",
+            "no undismissed exposure",
+        ),
+        (None, "2026-11-05T09:00:00Z", "no exposure log"),
+    ],
+    ids=["no-such-time", "writer-row", "already-dismissed", "no-log"],
+)
+def test_dismiss_refuses_what_it_cannot_dismiss(install_holdout, capsys, lines, target, message):
+    if lines is not None:
+        _raw_log(install_holdout, *lines)
+    before = _log_lines(install_holdout) if lines is not None else None
+    rc = hr.main(["--dismiss", target, "--reason", REASON])
+    assert rc == 3 and message in capsys.readouterr().out
+    if before is not None:
+        assert _log_lines(install_holdout) == before
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--dismiss", "2026-11-05T09:00:00Z"],
+        ["--reason", REASON, "--pr", "7"],
+        ["--dismiss", "yesterday", "--reason", REASON],
+        ["--dismiss", "2026-11-05T09:00:00Z", "--reason", "too short"],
+        ["--dismiss", "2026-11-05T09:00:00Z", "--reason", "x" * 301],
+        ["--dismiss", "2026-11-05T09:00:00Z", "--reason", "\u00e9" * 20],
+        ["--dismiss", "2026-11-05T09:00:00Z", "--reason", REASON + " \u00e9"],
+        ["--dismiss", "2026-11-05T09:00:00Z", "--reason", REASON, "--pr", "7"],
+    ],
+    ids=[
+        "no-reason",
+        "reason-alone",
+        "not-a-time",
+        "short",
+        "long",
+        "not-ascii",
+        "partly-not-ascii",
+        "two-modes",
+    ],
+)
+def test_dismiss_usage_errors(install_holdout, argv):
+    with pytest.raises(SystemExit) as exc:
+        hr.main(argv)
+    assert exc.value.code == 2
+
+
+def test_a_dismissal_keeps_the_clock_went_back_rule(repo, fake_gh, install_holdout, capsys):
+    """An undated row written after a row stamped 11-10 cannot be bounded by a
+    later row stamped 11-01, whether or not the 11-10 row was dismissed."""
+    _raw_log(
+        install_holdout,
+        _read_row("2026-11-10T09:00:00Z"),
+        _dismissal("2026-11-10T09:00:00Z", at="2026-11-10T10:00:00Z"),
+        "not json",
+        _read_row("2026-11-01T09:00:00Z"),
+    )
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-05"), capsys)
+    assert _fence_line(out).endswith("possibly spoiled: H-01: tell the owner")
+
+
+def test_a_dismissed_exposure_still_bounds_an_earlier_row_of_unknown_time(
+    repo, fake_gh, install_holdout, capsys
+):
+    _raw_log(
+        install_holdout,
+        _read_row("2026-11-01T09:00:00Z"),
+        "not json",
+        _read_row("2026-11-02T09:00:00Z"),
+        _dismissal("2026-11-02T09:00:00Z", at="2026-11-20T00:00:00Z"),
+    )
+    text = _authored("H-01", "2026-11-03") + _authored("H-02", "2026-11-05")
+    _, out = _run_install(repo, install_holdout, text, capsys)
+    assert _fence_line(out).endswith("possibly spoiled: H-01: tell the owner")
+
+
+def test_a_dismissal_row_with_an_unreadable_time_prints_no_raw_text(
+    repo, fake_gh, install_holdout, capsys
+):
+    forged = "x\nholdout fence: no exposures logged"
+    _raw_log(
+        install_holdout,
+        _read_row("2026-11-05T09:00:00Z"),
+        _dismissal("2026-11-05T09:00:00Z", at=forged, reason="quoted scenario text here"),
+    )
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-01"), capsys)
+    fence_lines = [ln for ln in out.splitlines() if ln.startswith("holdout fence:")]
+    assert fence_lines == [
+        "holdout fence: no exposures outstanding; 1 dismissed "
+        "(latest dismissal time unreadable; reasons in the log)"
+    ]
+    assert "quoted scenario text" not in out
+
+
+@pytest.mark.parametrize(
+    "last", ['{"at": "2026-11-06T09:00:00Z", "kind": "rea', _read_row("2026-11-06T09:00:00Z")]
+)
+def test_a_dismissal_starts_on_its_own_line_after_an_unterminated_tail(
+    install_holdout, capsys, last
+):
+    log = install_holdout / "logs" / "holdout-exposures.jsonl"
+    log.parent.mkdir()
+    log.write_text(_read_row("2026-11-05T09:00:00Z") + "\n" + last)
+    assert hr.main(["--dismiss", "2026-11-05T09:00:00Z", "--reason", REASON]) == 0
+    capsys.readouterr()
+    assert log == hr.EXPOSURE_LOG
+    rows = hr._log_rows()
+    assert rows[-1] is not None and rows[-1]["kind"] == "dismissed"
+    assert len(rows) == 3 and rows[0]["kind"] == "read"
