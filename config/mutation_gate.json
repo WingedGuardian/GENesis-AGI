@@ -116,6 +116,24 @@
       "why": "A later fixture WAL writer must not change the active history reader's snapshot; no live store is reachable."
     },
     {
+      "label": "manual-only generator drops normal YAML flag",
+      "path": "scripts/generate_skill_catalog.py",
+      "anchor": "                manual = loaded.get(\"disable-model-invocation\")\n                if manual is True or (isinstance(manual, str) and manual.strip().lower() == \"true\"):",
+      "replacement": "                manual = loaded.get(\"disable-model-invocation\")\n                if False:",
+      "validator": "python",
+      "test": "tests/test_scripts/test_manual_only_skill_flow.py::test_generated_catalog_drives_hook_and_executor",
+      "why": "The actual generator-to-hook/executor flow must not suggest or inject a manual-only skill; all catalog/skill files and hook state are isolated."
+    },
+    {
+      "label": "manual-only step guard ignores delegated target",
+      "path": "src/genesis/autonomy/executor/resources.py",
+      "anchor": "for name in (skill_name.lower(), delegated_name) if name",
+      "replacement": "for name in (skill_name.lower(),) if name",
+      "validator": "python",
+      "test": "tests/test_scripts/test_manual_only_skill_flow.py::test_assigned_and_delegated_manual_bodies_are_not_injected[web-research]",
+      "why": "An ordinary assigned research skill cannot inject a manual-only delegated method; ordinary unmarked delegation remains a positive control."
+    },
+    {
       "label": "inbox report ignores hardlink identities",
       "path": "scripts/inbox_coverage_report.py",
       "anchor": "            or _file_identity(out) in protected_ids",

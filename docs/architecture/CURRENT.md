@@ -1813,6 +1813,14 @@ modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
 verified: 6b4f275 2026-11-08
 ```
 
+Scoped verification: internal `mcp/shared_http` composition only. It receives
+initialized request-owned resources and supplies SDK transport limits, app-wide
+authority/authentication, per-message caller/profile binding, shared/local
+ancestry admission, nonblocking tool capacity and authenticated version/catalog
+status. No launcher selects it; owned bootstrap, native clients and rollout
+remain separate. See `docs/reference/shared-mcp-http.md`. That scoped check
+(5a3de4eee, 2026-11-08) does not requalify the other channels/interfaces subsystems.
+
 The neural monitor includes the non-routing **Fallback** observation, and the
 dashboard labels the shared fallback indicator as last successful/observed use.
 Individual managed provider selection remains scoped to its native receipt;
@@ -2561,6 +2569,20 @@ verified: 4721e0d93 2026-11-07
   `live_repair_unresolved` reads the newest READ one, and
   Telegram alert fields are cut before escaping. Residual: a container that
   fakes git's own output can still pass the probe.
+- **`RESTART_SERVICES` waits for systemd's own start** (#3492 D2): it reads
+  genesis-server's `ActiveState`, `SubState` and `InvocationID` first. A unit
+  still `activating` gets no command, because its start step may be the boot
+  repair healing the checkout, and a restart would SIGTERM it. A `failed` or
+  `inactive` unit gets `start --no-block`, an active one `restart --no-block`.
+  The result is then judged by the unit, polled every 5 s for up to 200 s by the clock (a
+  stop, a start step and RestartSec at the unit's 90 + 90 + 10 s): success
+  only once a new invocation is `active`, since just after a `--no-block`
+  restart the old process can still read active. Three unreadable reads in a
+  row end the wait, and a unit at its start limit (`Result=start-limit-hit`)
+  is reported at once with that named. A client timeout on the
+  command is not a failure in itself. A unit that fails or never comes up is
+  reported with its state and the boot repair's newest `live-move repair:`
+  journal line (cut to 400), and that report is the recovery-failed page.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
   `scripts/update.sh` / `guardian-gateway.sh` (the host-deploy gate in the dev
   skill). Known wart: the watchdog's stale-alert wording inverts when the
@@ -4276,6 +4298,12 @@ A 2026-11-07 verification at the same commit covers the request-ownership
 prerequisite below; the other platform descriptions retain their individually
 cited verification dates.
 
+Shared validator-health also has a request-local automatic activity-write opt-out
+around the entire message boundary. It preserves memory counters and the
+construction-time persistence hard opt-out, without suppressing queued ordinary
+flushes or validator-memory records. This does not strengthen batch durability
+or make the service read-only.
+
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
 provider/model/outcome. Failed historical attempts render as a warning, not an
 inferred current provider outage. The readiness worker uses the shared
@@ -5555,6 +5583,11 @@ verified: 81bbdb0a9 2026-11-08
   under propose-only; the apply/resolve path that would create one is a
   follow-up (future WS1 `enforce`).
   Voice-master exemplars are on the contribution FORBIDDEN list.
+  Manual-only catalog entries (`disable-model-invocation: true`) receive no
+  hook nudge or executor suggestion/assigned/delegated body injection, while
+  explicit foreground lookup and the inventory remain available. Usage retains
+  them as not nudge-eligible. Activation requires explicit catalog regeneration
+  and restarting cached consumers; see `docs/reference/manual-only-skills.md`.
   Cross-tool export: `scripts/export_agents_md.py` writes a body-scope
   inventory (skills + action tools, never memory/brain) into a managed
   `<!-- genesis:skills -->` block in `AGENTS.md` for Cursor/Codex/other

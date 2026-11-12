@@ -9,6 +9,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- Internal shared MCP HTTP composition with qualified SDK limits, validated
+  per-message caller roles, shared/local tool admission and authenticated status.
+  Shared validator-health suppresses its automatic activity writes per message
+  while retaining memory counters. No launcher activates the new path yet.
+
 ## [v3.0b19] - 2026-10-24
 
 ### Added

@@ -5,6 +5,11 @@ services that retain a database object while concurrent requests need separate
 transactions. This prerequisite does not activate a shared MCP service or change
 existing stdio/in-process initialization.
 
+The read-only `foreground_limit` property exposes the configured foreground unit
+budget to the internal shared HTTP builder. The builder requires an exact match
+with its declared database budget and bounds tool concurrency by that budget.
+It does not alter background job or connection admission.
+
 `genesis.mcp.request_service.initialize_request_service` is the internal opt-in
 bootstrap for memory, health, recon and outreach. Supply the facade and the
 service's ordinary dependencies. It awaits outreach table preparation inside
