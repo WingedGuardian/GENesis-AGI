@@ -2,6 +2,7 @@
 
 import importlib.util
 import io
+import json
 import os
 import tarfile
 from pathlib import Path
@@ -285,6 +286,35 @@ def test_verify_reports_each_member_swap_would_refuse(tmp_path, capsysbinary, ba
     cap = capsysbinary.readouterr()
     assert cap.out == b"w/s\n"
     assert bad[0].encode() in cap.err and b"refused member" in cap.err
+
+
+def test_verify_ends_with_a_summary_of_refusals_by_class(tmp_path, capsysbinary):
+    """#4304: backup's status file names each partial dir with a count per reason
+    class. The summary is the last stderr line; stdout stays the root alone."""
+    t = _tar_file(
+        tmp_path,
+        [
+            ("w/s", "dir", None),
+            ("w/s/f", "file", b"x"),
+            ("w/s/a", "sym", "/etc/passwd"),
+            ("w/s/b", "sym", "/etc/hostname"),
+            ("w/s/up", "sym", "../../x"),
+        ],
+    )
+    assert er.cmd_verify(str(t), str(tmp_path)) == 4
+    cap = capsysbinary.readouterr()
+    assert cap.out == b"w/s\n"
+    lines = cap.err.decode().splitlines()
+    assert lines[-1].startswith("REFUSED-SUMMARY ")
+    summary = json.loads(lines[-1].split(" ", 1)[1])
+    assert summary == {"count": 3, "classes": {"AbsoluteLinkError": 2, "LinkLeavesRoot": 1}}
+    assert sum(1 for ln in lines if ln.startswith("refused member ")) == 3
+
+
+def test_verify_prints_no_summary_when_nothing_is_refused(tmp_path, capsysbinary):
+    t = _tar_file(tmp_path, [("w/s", "dir", None), ("w/s/f", "file", b"x")])
+    assert er.cmd_verify(str(t), str(tmp_path)) == 0
+    assert b"REFUSED-SUMMARY" not in capsysbinary.readouterr().err
 
 
 def test_verify_reports_a_special_file(tmp_path, capsysbinary):

@@ -126,6 +126,7 @@ _TRANSCRIPT_COUNT=0
 _MEMORY_COUNT=0
 _EXTRA_SKIP_LABELS=()  # declared before the EXIT trap can fire: its status write reads it
 _EXTRA_PARTIAL_LABELS=()
+_EXTRA_PARTIAL_DETAIL=()  # "<label>\t<REFUSED-SUMMARY json>" per partial dir, for the status file
 # What this run's off-site alert block actually ANNOUNCED (or carried forward from a
 # run that did). A run that dies before the alert block records nothing announced, so
 # the next run alerts instead of assuming the earlier one did.
@@ -189,9 +190,41 @@ _write_status() {
         _offsite_core_complete=true
     fi
     if [ $((${_EXTRA_SKIPPED:-0} + ${_EXTRA_UPLOAD_FAILED:-0} + ${_EXTRA_PARTIAL:-0})) -gt 0 ]; then _extras_complete=false; fi
+    # Which extra dirs are partial, and why (#4304): built by json.dumps, never by
+    # splicing labels into this heredoc, so any label stays valid JSON. Ten at most.
+    # Any failure leaves an empty list rather than a broken status file.
+    local _partial_detail='[]'
+    if [ "${#_EXTRA_PARTIAL_DETAIL[@]}" -gt 0 ]; then
+        _partial_detail="$(printf '%s\0' "${_EXTRA_PARTIAL_DETAIL[@]}" | python3 -I -c '
+import json, sys
+out = []
+for entry in sys.stdin.buffer.read().split(b"\0"):
+    if not entry or len(out) >= 10:
+        continue
+    label, _, summary = entry.decode("utf-8", "replace").partition("\t")
+    try:
+        parsed = json.loads(summary)
+    except ValueError:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+    count = parsed.get("count")
+    if not isinstance(count, int) or isinstance(count, bool):
+        count = None
+    classes = parsed.get("classes")
+    classes = {
+        str(k)[:60]: v
+        for k, v in (classes.items() if isinstance(classes, dict) else [])
+        if isinstance(v, int) and not isinstance(v, bool)
+    }
+    out.append({"dir": label[:200], "refused": count, "classes": dict(list(classes.items())[:10])})
+print(json.dumps(out, ensure_ascii=True, separators=(",", ":")))
+' 2>/dev/null)" || _partial_detail='[]'
+        [ -n "$_partial_detail" ] || _partial_detail='[]'
+    fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"payment_vault":"${_PV_STATUS:-skipped}","payment_vault_copies":${_PV_COPIES:-null},"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_dirs_partial_detail":$_partial_detail,"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"payment_vault":"${_PV_STATUS:-skipped}","payment_vault_copies":${_PV_COPIES:-null},"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
 
@@ -1019,6 +1052,7 @@ _EXTRA_BUILT=()        # names archived THIS run: the only ones uploaded
 _EXTRA_SKIP_LABELS=()  # listed entries not archived this run (recorded in COMPLETE)
 _EXTRA_PARTIAL=0       # archived, but a restore will refuse some of their members
 _EXTRA_PARTIAL_LABELS=()
+_EXTRA_PARTIAL_DETAIL=()
 _extra_prev=0
 if mkdir -p extra 2>/dev/null; then
     _extra_prev="$(find extra -maxdepth 1 -type f -name '*.tar.gpg' 2>/dev/null | wc -l || true)"
@@ -1183,11 +1217,34 @@ else
         fi
         _EXTRA_TAR_ERR="$_tar_err"
         _gpg_tmp="extra/.${_name}.partial.$$"
+        # A Python virtualenv under the directory, whatever it is named (the default
+        # excludes catch only `.venv` and `venv`): any directory holding pyvenv.cfg.
+        # Its bin/python* interpreter links are absolute, so a restore refuses them and
+        # the whole directory is reported partial (#4304). Only those links are
+        # excluded: everything else in the venv, and any project files beside it in an
+        # in-place venv, is archived as before. Found below the root only, so a root
+        # that is itself a venv keeps its links, and not inside a directory the default
+        # excludes already drop. Each pattern is anchored to the venv's member path,
+        # with tar's wildcard characters escaped so a name like `a[1]` means itself.
+        _venv_ex=()
+        _venv_prune=()
+        for _x in "${_EXTRA_DEFAULT_EXCLUDES[@]}"; do _venv_prune+=(-name "$_x" -o); done
+        # One -mindepth only: find applies the last one globally, which would stop the
+        # prune at depth 1 (measured). The root's own pyvenv.cfg is skipped below.
+        while IFS= read -r -d '' _venv; do
+            [ "$_venv" = "$_abs" ] && continue
+            _venv_rel="${_venv#"$_home_real"/}"
+            _venv_ex+=("--exclude=$(printf '%s' "$_venv_rel" | sed 's/[][\\*?]/\\&/g')/bin/python*")
+            log "Excluded a Python virtualenv's interpreter links from ~/$_rel: ~/$_venv_rel/bin/python*"
+        done < <(find "$_abs" -mindepth 1 -type d \( "${_venv_prune[@]}" -false \) -prune \
+            -o -type f -name pyvenv.cfg -printf '%h\0' 2>/dev/null)
         _tar_rc=0
         # --hard-dereference: a hard link is stored as file content, so restore never
         # meets a hard-link member. Symlinks are kept as links; restore accepts the
         # ones that stay inside the restored directory.
-        tar -C "$_home_real" --hard-dereference "${_extra_ex_args[@]}" -cf "$_tar_tmp" -- "$_rel" 2>"$_tar_err" || _tar_rc=$?
+        tar -C "$_home_real" --hard-dereference "${_extra_ex_args[@]}" \
+            --anchored "${_venv_ex[@]+"${_venv_ex[@]}"}" --no-anchored \
+            -cf "$_tar_tmp" -- "$_rel" 2>"$_tar_err" || _tar_rc=$?
         # GNU tar exit 1 = some files changed while being read: the archive is written,
         # but a file that was changing may be torn. 2+ = fatal.
         _tar_head="$(head -3 "$_tar_err" | tr '\n' ' ')"
@@ -1205,11 +1262,14 @@ else
         # member filter restore uses (never by parsing `tar -t`, which escapes
         # backslashes and, under a C locale, non-ASCII names), so backup keeps exactly
         # what restore will accept.
-        _tar_root="" _tar_root_why="" _tar_verify_rc=0
+        _tar_root="" _tar_root_why="" _tar_summary="" _tar_verify_rc=0
         if _tar_root_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
             _EXTRA_TAR_ERR="$_tar_root_err"
             _tar_root="$(python3 "$_SCRIPT_DIR/lib/extra_restore.py" verify "$_tar_tmp" "$GENESIS_BIG_TMP" 2>"$_tar_root_err")" || _tar_verify_rc=$?
-            _tar_root_why="$(cat "$_tar_root_err")"
+            # verify's last line counts the refusals by class (exit 4 only): kept for
+            # the status file, and left out of the WARNING, which stays prose.
+            _tar_summary="$(grep -m1 '^REFUSED-SUMMARY ' "$_tar_root_err" | cut -d' ' -f2-)" || _tar_summary=""
+            _tar_root_why="$(grep -v '^REFUSED-SUMMARY ' "$_tar_root_err")" || true
             rm -f "$_tar_root_err"
             _EXTRA_TAR_ERR=""
         else
@@ -1239,6 +1299,7 @@ else
                 log "WARNING: extra dir archived without members a restore would refuse (exclude them with GENESIS_BACKUP_EXTRA_EXCLUDES): $_d: $_tar_root_why"
                 _EXTRA_PARTIAL=$((_EXTRA_PARTIAL + 1))
                 _EXTRA_PARTIAL_LABELS+=("$(LC_ALL=C printf '%q' "$_rel" | cut -c1-200)")
+                _EXTRA_PARTIAL_DETAIL+=("${_EXTRA_PARTIAL_LABELS[-1]}"$'\t'"$_tar_summary")
             fi
         else
             rm -f "$_gpg_tmp"

@@ -263,8 +263,12 @@ Each directory becomes one encrypted archive, `extra/<name>.tar.gpg`. It goes to
 the off-site tier only, never the git tier. Every run builds these archives from
 scratch: a snapshot holds only what that run archived, and nothing is carried
 over from an earlier run. Rebuildable caches (`.venv`, `node_modules`,
-`__pycache__`, …) are always excluded, and `GENESIS_BACKUP_EXTRA_EXCLUDES` adds
-more tar exclude patterns (wildcards allowed), matched at any depth.
+`__pycache__`, …) are always excluded. For any other Python virtualenv below the
+listed directory, whatever it is named (any directory holding `pyvenv.cfg`), only
+its `bin/python*` interpreter links are left out: they are absolute links a
+restore refuses. The rest of the venv is kept, and the log names each one.
+`GENESIS_BACKUP_EXTRA_EXCLUDES` adds more tar exclude patterns (wildcards
+allowed), matched at any depth.
 
 A listed directory is skipped with a warning when it:
 - is relative, or outside your home directory;
@@ -296,8 +300,11 @@ archives that list names: a leftover archive in `extra/` is never restored. Back
 test-extracts each archive the way restore will (file contents left out), so it
 knows which members a restore would refuse, such as a symlink that leads outside
 the directory or a FIFO. Such a directory is still archived, but recorded as
-partial: the off-site copy is reported incomplete and the alert names it. Exclude
-those members with `GENESIS_BACKUP_EXTRA_EXCLUDES`. A file that changes while it is being archived (tar exit 1)
+partial: the off-site copy is reported incomplete and the alert names it. The
+status file records each partial directory with its count of refused members by
+reason, and the dashboard's backup warning names them to a signed-in operator
+(never on the unauthenticated status route). Exclude those members with
+`GENESIS_BACKUP_EXTRA_EXCLUDES`. A file that changes while it is being archived (tar exit 1)
 is kept but may be torn, and the log says so; stop a writer whose files must be
 consistent, or exclude them. Without an off-site tier the archives stay local
 only, in the backups checkout, and no off-site alert applies.
