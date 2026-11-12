@@ -898,9 +898,8 @@ _MAX_BRACKETS = 64
 
 #: Fewest literal characters a pattern piece needs before it is matched against
 #: the secrets file's name: `*.env` names it, a bare `*` names everything.
-#: Declared residue: shorter patterns that still match (`--include=s*`,
-#: `--include=*.e*`) are not gated, because at that length they name nearly
-#: every file and gating them would prompt on routine searches.
+#: Shorter patterns are not gated: at that length they name nearly every file,
+#: and gating them would prompt on routine searches.
 _PATTERN_MIN_LITERALS = 3
 #: A joint, optional quotes and path, then a secrets file's name: the fallback
 #: for a command the parser cannot split into words.
