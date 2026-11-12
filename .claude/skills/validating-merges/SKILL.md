@@ -601,6 +601,13 @@ Record it:
   `no exposures logged` line. An `exposure log unreadable` line goes to the
   owner too. A line
   saying the fence is not installed means exposures are not being recorded.
+  A `dismissed` count on the line needs no report: the owner ruled on those
+  rows. Dismiss a row only when the owner rules it harmless in the
+  conversation:
+  `.venv/bin/python scripts/holdout_runner.py --dismiss <its at> --reason "<why>"`,
+  run as its own command, with a reason that never quotes scenario text. Check
+  that the count it prints equals the rows the owner ruled on; one time can
+  match several rows.
 
 Never open, list or quote the holdout directory (`$GENESIS_HOME/holdout/`,
 `~/.genesis/holdout/` by default) yourself, and never ask what a
