@@ -39,8 +39,11 @@ with not delivering someone else's work:
     no      fail    fail    PENDING          not this PR's work
 
 ``--at-path DIR`` runs scenarios against a directory and prints PASS or FAIL
-per id. A scenario writer uses it to check that a new scenario passes on the
-current tree and fails on a deliberately broken copy.
+per id. ``--at-ref REF`` does the same against a temporary worktree of a commit,
+which it creates and removes itself; ``--overlay DIR`` copies that directory's
+files over the worktree first. A scenario writer uses the two to check that a
+new scenario passes on the current tree and fails on a deliberately broken copy,
+without ever holding a worktree of its own.
 
 Steps run with ``bash`` in the checkout under test (``HOLDOUT_ROOT``), with
 that checkout's ``src`` first on ``PYTHONPATH`` so ``import genesis`` loads the
@@ -72,6 +75,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -177,6 +181,15 @@ class Scenario:
         except ValueError:
             return None
         return min(dates) if dates else None
+
+    @property
+    def author_dates(self) -> list[dt.date]:
+        """Every real YYYY-MM-DD on the Author line: days the writer worked on it."""
+        dates = []
+        for found in _DATE.findall(self.fields.get("Author", "")):
+            with contextlib.suppress(ValueError):
+                dates.append(dt.date.fromisoformat(found))
+        return dates
 
     @property
     def issue(self) -> int:
@@ -699,9 +712,19 @@ def _print_exposures(out, scenarios: list[Scenario]) -> None:
 
     The log is append-only, so a row with no readable time, or a line that does
     not parse, happened no later than the next dated row: that row's day bounds
-    it, unless it is older than a day already seen (the clock went back). Only such a row at the end of the log has no bound, and then every
-    scenario counts as spoiled. So does a scenario with no Author date, or one
-    dated later than tomorrow, which cannot be right.
+    it, unless it is older than a day already seen (the clock went back). Only
+    such a row at the end of the log has no bound, and then every scenario counts
+    as spoiled. So does a scenario with no Author date, or one dated later than
+    tomorrow, which cannot be right.
+
+    An access declaring the holdout-writer agent is only counted when it is no
+    later than the day after the newest Author date in the file: the writer has
+    written a scenario since. A later one, one with no readable time, or any at
+    all when no scenario carries a date, is reported for the owner to confirm,
+    because the writer is known only by the name an agent declares. So the
+    message clears itself the next time the writer writes a scenario, for as
+    long as that scenario stays in the file. A row with no readable time never
+    clears; the fence always writes one.
     """
     if not FENCE_HOOK.exists():
         print("holdout fence: not installed in this checkout; exposures are not recorded", file=out)
@@ -711,7 +734,7 @@ def _print_exposures(out, scenarios: list[Scenario]) -> None:
         return
     count, bad, times, days = 0, 0, [], []
     unbounded = False  # an exposure of unknown time with no dated row after it yet
-    writer, writer_times = 0, []
+    writer_rows: list[tuple[str, dt.date | None]] = []
     try:
         with open(EXPOSURE_LOG, encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -732,10 +755,9 @@ def _print_exposures(out, scenarios: list[Scenario]) -> None:
                     unbounded = False
                 if row.get("kind") == "allowed":
                     # The writer is known only by the name an agent declares, so
-                    # these are counted for the owner to match against writer
-                    # runs they ordered, never treated as harmless.
-                    writer += 1
-                    writer_times.append(str(row.get("at") or ""))
+                    # these are matched against the scenarios below, never
+                    # treated as harmless outright.
+                    writer_rows.append((str(row.get("at") or ""), day))
                     continue
                 count += 1
                 times.append(str(row.get("at") or ""))
@@ -747,16 +769,31 @@ def _print_exposures(out, scenarios: list[Scenario]) -> None:
         print(f"holdout fence: exposure log unreadable ({exc}); treat as unknown", file=out)
         return
     tail = f"; {bad} unreadable line(s)" if bad else ""
-    if writer:
+    tomorrow = dt.datetime.now(dt.UTC).date() + dt.timedelta(days=1)
+    # A date past tomorrow cannot be right, and would silence every later access.
+    written = [d for sc in scenarios for d in sc.author_dates if d <= tomorrow]
+    newest = max(written) if written else None
+    unmatched = [
+        (at, day)
+        for at, day in writer_rows
+        if day is None or newest is None or day > newest + dt.timedelta(days=1)
+    ]
+    if unmatched:
+        dated = [at for at, day in unmatched if day is not None]
+        when = f"latest {max(dated)}" if dated else "time unreadable"
+        since = "since the newest scenario was written" if newest else "and no dated scenario"
         tail += (
-            f"; {writer} access(es) declaring the holdout-writer agent, latest "
-            f"{max(writer_times)}: confirm each was a writer run you ordered"
+            f"; {len(unmatched)} of {len(writer_rows)} access(es) declaring the holdout-writer "
+            f"agent {since}, {when}: confirm each was a writer run you ordered"
+        )
+    elif writer_rows:
+        tail += (
+            f"; {len(writer_rows)} holdout-writer access(es), none later than the newest scenario"
         )
     if not count and not bad:
         print(f"holdout fence: no exposures logged{tail}", file=out)
         return
     latest = None if unbounded or not days else max(days)
-    tomorrow = dt.datetime.now(dt.UTC).date() + dt.timedelta(days=1)
     spoiled = [
         sc.sid
         for sc in scenarios
@@ -802,11 +839,106 @@ def cmd_at_path(root: Path, holdout: Path, ids: list[str], out=None) -> int:
     return 2 if missing else 0
 
 
+def _copy_overlay(overlay: Path, tree: Path) -> int:
+    """Copy every file under ``overlay`` onto ``tree`` at the same relative path.
+
+    Contents only: a file that already exists keeps its mode, and a new file
+    takes the overlay file's. Refused: a link in the overlay, a path under
+    ``.git``, and a path that is, or passes through, a link in the tree (the
+    copy would land wherever the link points). So an overlay changes files
+    inside the tree under test and nothing else.
+    """
+    if not overlay.is_dir():
+        raise RunnerError(f"overlay is not a directory: {overlay}")
+    count = 0
+    for src in sorted(overlay.rglob("*")):
+        rel = src.relative_to(overlay)
+        if src.is_symlink():
+            raise RunnerError(f"overlay holds a link: {rel}")
+        if src.is_dir():
+            continue
+        if rel.parts[0] == ".git":
+            raise RunnerError(f"overlay may not write under .git: {rel}")
+        for depth in range(1, len(rel.parts) + 1):
+            if (tree / Path(*rel.parts[:depth])).is_symlink():
+                raise RunnerError(f"overlay path crosses a link in the tree: {rel}")
+        target = tree / rel
+        is_new = not target.exists()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, target)
+        if is_new:
+            shutil.copymode(src, target)
+        count += 1
+    if not count:
+        raise RunnerError(f"overlay holds no files: {overlay}")
+    return count
+
+
+def cmd_at_ref(
+    ref: str, overlay: Path | None, root: Path, holdout: Path, ids: list[str], out=None
+) -> int:
+    """Run scenarios against a temporary worktree of ``ref``, removed afterwards.
+
+    The runner owns the worktree from creation to removal, so a caller that may
+    not remove worktrees itself (an agent session in this repository) never
+    holds one. ``overlay`` is copied over the tree first: the changed arm of a
+    writer's check.
+    """
+    out = out or sys.stdout
+    if not holdout.is_file():
+        # Before the checkout: a worktree is not worth making to say this.
+        print("no holdout on this install", file=out)
+        return 0
+    sha = _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").strip()
+    holder = Path(tempfile.mkdtemp(prefix="holdout-ref-", dir=_scratch_base()))
+    try:
+        with _Worktree(root, sha, holder, "tree") as tree:
+            changed = _copy_overlay(overlay, tree) if overlay is not None else 0
+            note = f", {changed} file(s) overlaid" if overlay is not None else ""
+            print(f"holdout: {ref} at {sha[:12]}{note}", file=out)
+            return cmd_at_path(tree, holdout, ids, out)
+    finally:
+        shutil.rmtree(holder, ignore_errors=True)
+        # A removal that failed leaves a registration whose directory is gone.
+        subprocess.run(
+            ["git", "-C", str(root), "worktree", "prune"], capture_output=True, check=False
+        )
+        if holder.exists():
+            # A step made something here unremovable: say so, never silently.
+            print(f"holdout: could not remove {holder}", file=out)
+
+
+@contextlib.contextmanager
+def _signals_exit():
+    """Turn SIGTERM and SIGHUP into ``SystemExit`` so every ``finally`` runs.
+
+    A run killed by its caller (a tool timeout, a closed terminal) would
+    otherwise leave its worktrees, its scratch and a running step behind.
+    """
+
+    def _exit(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    previous = {}
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            previous[sig] = signal.signal(sig, _exit)
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--pr", type=int, help="judge this merged PR")
     mode.add_argument("--at-path", type=Path, help="run scenarios against this directory")
+    mode.add_argument(
+        "--at-ref",
+        help="run scenarios against a temporary worktree of this commit, removed afterwards",
+    )
     mode.add_argument(
         "--has-holdout",
         action="store_true",
@@ -816,11 +948,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--root", type=Path, help="git checkout to cut worktrees from (default: cwd)")
     ap.add_argument("--holdout", type=Path, default=DEFAULT_HOLDOUT)
     ap.add_argument(
-        "--scenario", action="append", default=[], help="with --at-path: only these ids"
+        "--scenario",
+        action="append",
+        default=[],
+        help="with --at-path or --at-ref: only these ids",
+    )
+    ap.add_argument(
+        "--overlay",
+        type=Path,
+        help="with --at-ref: copy this directory's files over the worktree before running",
     )
     args = ap.parse_args(argv)
-    if args.scenario and args.at_path is None:
-        ap.error("--scenario applies to --at-path only")
+    if args.scenario and args.at_path is None and args.at_ref is None:
+        ap.error("--scenario applies to --at-path and --at-ref only")
+    if args.overlay is not None and args.at_ref is None:
+        ap.error("--overlay applies to --at-ref only")
     if args.has_holdout:
         if args.holdout.is_file():
             print(f"holdout: present at {args.holdout}")
@@ -828,11 +970,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"holdout: none (would be {args.holdout})")
         return 0
     try:
-        if args.at_path is not None:
-            return cmd_at_path(args.at_path.resolve(), args.holdout, args.scenario)
-        root = (args.root or Path.cwd()).resolve()
-        root = Path(_git(root, "rev-parse", "--show-toplevel").strip())
-        return cmd_pr(args.pr, args.repo, root, args.holdout)
+        with _signals_exit():
+            if args.at_path is not None:
+                return cmd_at_path(args.at_path.resolve(), args.holdout, args.scenario)
+            root = (args.root or Path.cwd()).resolve()
+            root = Path(_git(root, "rev-parse", "--show-toplevel").strip())
+            if args.at_ref is not None:
+                overlay = args.overlay.resolve() if args.overlay is not None else None
+                return cmd_at_ref(args.at_ref, overlay, root, args.holdout, args.scenario)
+            return cmd_pr(args.pr, args.repo, root, args.holdout)
     except RunnerError as exc:
         print(f"holdout: cannot run: {exc}", file=sys.stdout)
         return 3

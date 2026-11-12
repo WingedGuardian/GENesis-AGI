@@ -451,3 +451,57 @@ def test_an_ignored_file_is_named_and_an_ignored_empty_directory_kept(w):
         assert kept.is_dir() and kept.stat().st_mode & 0o777 == 0o751, sorted(run.rglob("*"))
     assert "x.pyc" not in _check(w, ts).stdout
     assert isinstance(w.report()["restore"]["restored_at"], str)
+
+
+@pytest.mark.parametrize(
+    ("q", "covered"),
+    [
+        ("sub/s1", True),  # the held path
+        ("sub", True),  # above it
+        ("sub/s1/inner", True),  # below it
+        ("sub/t", False),  # a sibling
+        ("sub/s10", False),  # a name sharing its prefix
+        ("", False),  # nothing named: the whole run is not stopped
+    ],
+)
+def test_a_hold_covers_its_path_above_and_below_only(q, covered):
+    from tests.test_scripts.test_live_move_restore_write import _kit
+
+    kit = _kit()
+    hold = ["20260101T000000Z-9-20260101T000000Z-1-live-move-restore", "sub/s1", "node"]
+    assert kit.held_covers([hold], q) is covered
+    old = ["20260101T000000Z-9-live-move-restore", "sub/s1", "node"]  # before #4011
+    assert kit.held_covers([hold, old], q) is True, "an old-form hold stops every part"
+    assert kit.held_stops_all([old]) and not kit.held_stops_all([hold])
+    assert kit.held_covers([], q) is False
+
+
+def test_an_aside_it_cannot_read_still_holds_its_path(w):
+    """PR3 port review: an aside the restore cannot read holds its path like a
+    held one. Here the in-flight slot is empty (the last run finished), the
+    aside under sub/ was written after its run and then made unsearchable,
+    and the checkout's sub/s1 is as the repair left it: nothing is written
+    there, the report stays unresolved, and --check agrees."""
+    import subprocess
+
+    ts = _repaired(w, _foreign_edit)
+    fd = os.open(w.root / "sub" / "s1", os.O_WRONLY)
+    try:
+        assert _restore(w, ts).returncode == 0
+        os.pwrite(fd, b"newer\n", 0)
+    finally:
+        os.close(fd)
+    [run] = _runs(w)
+    assert w.report()["restore"]["inflight"] is None
+    subprocess.run(["git", "-C", str(w.root), "checkout", "--", "sub/s1"], check=True)
+    left = (w.root / "sub" / "s1").read_bytes()
+    (run / "aside" / "sub").chmod(0)
+    try:
+        c, r = _check(w, ts), _restore(w, ts)
+        for out in (c, r):
+            assert out.returncode == 1, out.stdout
+            assert _parts(out)[("sub/s1", "node")].endswith("other:inflight-unresolved"), out.stdout
+        assert (w.root / "sub" / "s1").read_bytes() == left
+        assert w.report()["restore"]["restored_at"] is None
+    finally:
+        (run / "aside" / "sub").chmod(0o700)

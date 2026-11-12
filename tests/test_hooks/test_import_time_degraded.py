@@ -722,6 +722,12 @@ _NOT_WIRED = {
     # this launcher. test_launcher_sibling_import_failure_stops_before_startup
     # measures both sibling failures aborting before profile/session startup.
     "codex_validator_launcher.py": "a standalone CLI; import failure aborts startup, not a hook decision",
+    # Not a hook: the inbox-review skill tells a session to run this read-only
+    # reader by hand. Its `return 2` is "ruling history unavailable" (a database
+    # or JSON error), and a failed import exiting 1 is the right CLI answer.
+    # MEASURED 2026-11-11: 0 references in .claude/settings.json or scripts/hooks/;
+    # its only .claude/ mention is the skill's instruction to run it.
+    "inbox_review_rulings.py": "a read-only CLI run by hand, not a hook: wired nowhere in .claude/settings.json",
 }
 
 
