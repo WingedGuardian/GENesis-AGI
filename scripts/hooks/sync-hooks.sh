@@ -23,9 +23,21 @@ set -u
 set -o pipefail
 
 QUIET=0
-if [[ "${1:-}" == "--quiet" ]]; then
-    QUIET=1
-fi
+CHAIN_PRE_PUSH=0
+RESTORE_PRE_PUSH=0
+HOOK_REPO=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --quiet) QUIET=1 ;;
+        --chain-pre-push) CHAIN_PRE_PUSH=1 ;;
+        --restore-pre-push) RESTORE_PRE_PUSH=1 ;;
+        --hook-repo)
+            [[ $# -ge 2 ]] || exit 1
+            HOOK_REPO="$2"; shift ;;
+        *) echo "Unknown hook sync option" >&2; exit 1 ;;
+    esac
+    shift
+done
 
 _log() {
     [[ $QUIET -eq 1 ]] && return 0
@@ -40,6 +52,12 @@ _warn() {
 SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 HOOKS_SRC="$SCRIPT_DIR"
+
+# Installation names its source and target explicitly. Inherited hook location
+# overrides must not redirect either; retain protected configuration channels.
+for _git_var in "${!GIT_@}"; do
+    [[ "$_git_var" == GIT_CONFIG* ]] || unset "$_git_var"
+done
 
 # Find .git/hooks for this repo, handling worktrees (where .git is a file,
 # not a dir). git rev-parse --git-common-dir points at the shared dir.
@@ -103,6 +121,8 @@ HOOKS_TO_SYNC=(
 HELPERS_TO_SYNC=(
     "emit_bugfix_audit.py"
     "db_admission_check.py"
+    "pre_push_chain.py"
+    "pre_push_gates.sh"
 )
 
 MODIFIED_FOUND=0
@@ -217,19 +237,45 @@ _sync_helper() {
     SYNCED=$((SYNCED + 1))
 }
 
-for h in "${HOOKS_TO_SYNC[@]}"; do
-    _sync_one "$h"
-done
+# Resolve the effective pre-push location in the named repository, while only
+# this main checkout supplies the installed code. A shared hooksPath enrolls
+# only this common gitdir; other repositories retain their original hook.
+_python="$REPO_ROOT/.venv/bin/python"
+[[ -x "$_python" ]] || _python="$(command -v python3)"
+_chain_args=(--install --source "$HOOKS_SRC" --repo "${HOOK_REPO:-$REPO_ROOT}")
+[[ $CHAIN_PRE_PUSH -eq 0 ]] || _chain_args+=(--opt-in)
+[[ $RESTORE_PRE_PUSH -eq 0 ]] || _chain_args+=(--restore)
+_chain_status=0
+"$_python" "$HOOKS_SRC/pre_push_chain.py" "${_chain_args[@]}" || _chain_status=$?
+# Only declined custom-hook opt-in allows unrelated updates. Ownership damage,
+# helper collisions and missing shared-repository enrollment still stop here.
+[[ $_chain_status -eq 0 || $_chain_status -eq 3 ]] || exit 2
 
-for h in "${HELPERS_TO_SYNC[@]}"; do
-    _sync_helper "$h"
-done
+_chain_helpers=$("$_python" "$HOOKS_SRC/pre_push_chain.py" --list-helpers) || exit 2
+declare -A CHAIN_HELPERS=()
+while IFS= read -r _helper; do
+    CHAIN_HELPERS["$_helper"]=1
+done <<< "$_chain_helpers"
+
+if [[ $RESTORE_PRE_PUSH -eq 0 ]]; then
+    # Helper closure must exist before any executable hook is published.
+    for h in "${HELPERS_TO_SYNC[@]}"; do
+        # Declared for deployment ownership/readiness; the chain installer
+        # validates and publishes these together with its private manifest.
+        [[ -n "${CHAIN_HELPERS[$h]:-}" ]] && continue
+        _sync_helper "$h" || exit 1
+    done
+    for h in "${HOOKS_TO_SYNC[@]}"; do
+        [[ "$h" == "pre-push" ]] && continue
+        _sync_one "$h" || exit 1
+    done
+fi
 
 if [[ $SYNCED -gt 0 ]]; then
     _log "synced $SYNCED file(s) to $HOOKS_DST"
 fi
 
-if [[ $MODIFIED_FOUND -eq 1 ]]; then
+if [[ $MODIFIED_FOUND -eq 1 || $_chain_status -ne 0 ]]; then
     exit 2
 fi
 

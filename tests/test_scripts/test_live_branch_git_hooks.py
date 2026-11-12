@@ -15,12 +15,28 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 _HOOKS = Path(__file__).resolve().parents[2] / "scripts" / "hooks"
 _HOOK_NAMES = ("pre-commit", "pre-merge-commit", "pre-push")
+
+
+def _install_hooks(repo, hooks, env):
+    """Install the actual wrapper and its owned closure in this scratch repo."""
+    source = repo / "scripts/hooks"
+    shutil.copytree(_HOOKS, source)
+    for name in _HOOK_NAMES:
+        if name != "pre-push":
+            shutil.copy2(source / name, hooks / name)
+    subprocess.run([
+        sys.executable, str(source / "pre_push_chain.py"), "--install",
+        "--source", str(source), "--repo", str(repo),
+    ], env=env, cwd=repo, check=True, capture_output=True)
+    # Source is fixture infrastructure, not part of any publication under test.
+    (repo / ".git/info/exclude").write_text("/scripts/\n")
 
 
 def _env(home: Path) -> dict[str, str]:
@@ -56,8 +72,6 @@ def setup(tmp_path: Path):
     env = _env(home)
     hooks = tmp_path / "hooks"
     hooks.mkdir()
-    for name in _HOOK_NAMES:
-        shutil.copy2(_HOOKS / name, hooks / name)
     origin = tmp_path / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], env=env, check=True)
     repo = tmp_path / "repo"
@@ -71,6 +85,7 @@ def setup(tmp_path: Path):
     _git(repo, env, "push", "-q", "origin", "main")
     # Hooks go live only AFTER the fixture's own commits and push to main.
     _git(repo, env, "config", "core.hooksPath", str(hooks))
+    _install_hooks(repo, hooks, env)
     _git(repo, env, "checkout", "-q", "-b", "live")
     _git(repo, env, "checkout", "-q", "-b", "feature", "main")
     # The manifest is what declares that this install runs an integration branch.
@@ -730,7 +745,6 @@ def test_branch_deletion_push_is_allowed_on_a_sha256_repository(tmp_path):
     env = _env(home)
     hooks = tmp_path / "hooks"
     hooks.mkdir()
-    shutil.copy2(_HOOKS / "pre-push", hooks / "pre-push")
     origin = tmp_path / "origin.git"
     subprocess.run(
         ["git", "init", "-q", "--bare", "--object-format=sha256", "-b", "main", str(origin)],
@@ -748,6 +762,7 @@ def test_branch_deletion_push_is_allowed_on_a_sha256_repository(tmp_path):
     _git(repo, env, "add", "a.txt")
     _git(repo, env, "commit", "-q", "-m", "base")
     _git(repo, env, "config", "core.hooksPath", str(hooks))
+    _install_hooks(repo, hooks, env)
     _git(repo, env, "checkout", "-q", "-b", "feature")
     _git(repo, env, "push", "-q", "origin", "feature")
     assert len(_git(repo, env, "rev-parse", "HEAD").stdout.strip()) == 64  # guard

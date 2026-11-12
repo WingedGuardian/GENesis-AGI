@@ -37,7 +37,7 @@ HOOK_NAMES = (
     "pre-push",
     "pre-merge-commit",
 )
-HELPER_NAMES = ("emit_bugfix_audit.py", "db_admission_check.py")
+HELPER_NAMES = ("emit_bugfix_audit.py", "db_admission_check.py", "pre_push_chain.py", "pre_push_gates.sh")
 LOCKED = ("add", "drop", "rebuild")
 
 
@@ -98,6 +98,8 @@ class World:
         }
         for name in HOOK_NAMES + HELPER_NAMES:
             files[f"scripts/hooks/{name}"] = f"#!/bin/sh\n# {name}\nexit 0\n"
+        for name in ("pre-push", "pre_push_chain.py"):
+            files[f"scripts/hooks/{name}"] = (SCRIPTS / "hooks" / name).read_text()
         self.commit(self.up, files, "base")
         self.git(self.up, "push", "-q", "origin", "main")
         subprocess.run(
@@ -108,9 +110,17 @@ class World:
         )
         # The installed hook copies equal their sources: readiness's hooks check passes.
         for name in HOOK_NAMES + HELPER_NAMES:
+            if name in ("pre-push", "pre_push_chain.py", "pre_push_gates.sh"):
+                continue  # the actual installer publishes the owned chain below
             dst = self.root / ".git" / "hooks" / name
             shutil.copy2(self.root / "scripts" / "hooks" / name, dst)
             dst.chmod(0o755)
+        subprocess.run(
+            [sys.executable, str(self.root / "scripts/hooks/pre_push_chain.py"),
+             "--install", "--source", str(self.root / "scripts/hooks"),
+             "--repo", str(self.root)],
+            env=self.env, check=True, capture_output=True,
+        )
 
     # ── git helpers ──────────────────────────────────────────────────────
     def git(self, repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:

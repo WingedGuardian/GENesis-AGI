@@ -785,27 +785,16 @@ echo ""
 echo "  [1/$TOTAL_STEPS] Installing git hooks..."
 
 HOOKS_SRC="$REPO_DIR/scripts/hooks"
-# Handle both regular repos (.git/hooks) and worktrees (.git is a file)
-GIT_COMMON_DIR=$(cd "$REPO_DIR" && _gcd=$(git rev-parse --git-common-dir 2>/dev/null) && cd "$_gcd" && pwd || echo "")
-if [ -n "$GIT_COMMON_DIR" ] && [ -d "$GIT_COMMON_DIR/hooks" ]; then
-    HOOKS_DST="$GIT_COMMON_DIR/hooks"
-elif [ -d "$REPO_DIR/.git/hooks" ]; then
-    HOOKS_DST="$REPO_DIR/.git/hooks"
+# The canonical installer owns the wrapper, helper closure and private record.
+# It also preserves custom hooks unless the owner explicitly opts into chaining.
+if [ -f "$HOOKS_SRC/sync-hooks.sh" ]; then
+    if bash "$HOOKS_SRC/sync-hooks.sh" --quiet; then
+        echo "    + hooks synced via sync-hooks.sh"
+    else
+        echo "    WARNING: hooks remain unqualified; sync-hooks.sh did not complete"
+    fi
 else
-    echo "    WARNING: .git/hooks not found (not a git repo?) — skipping"
-    HOOKS_DST=""
-fi
-
-if [ -n "$HOOKS_DST" ]; then
-    for hook in pre-commit pre-push pre-merge-commit; do
-        if [ -f "$HOOKS_SRC/$hook" ]; then
-            cp "$HOOKS_SRC/$hook" "$HOOKS_DST/$hook"
-            chmod +x "$HOOKS_DST/$hook"
-            echo "    + $hook installed"
-        else
-            echo "    - $hook source not found (skipping)"
-        fi
-    done
+    echo "    WARNING: sync-hooks.sh missing; hooks were not installed"
 fi
 
 

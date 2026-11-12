@@ -16,8 +16,12 @@ Flat sibling of deploy_candidates.py (see that file for the commands).
 
 from __future__ import annotations
 
+import ast
+import hashlib
+import json
 import os
 import re
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -56,7 +60,7 @@ REQUIRED_MERGED: tuple[tuple[str, str], ...] = (
 PR_C_MARKER = "scripts/lib/deploy_live.sh"
 SYNC_HOOKS = "scripts/hooks/sync-hooks.sh"
 _SYNC_ARRAYS = ("HOOKS_TO_SYNC", "HELPERS_TO_SYNC")
-# The helpers: sync-hooks.sh overwrites these whatever their bytes.
+# Installed helpers, including the native chain's separately owned closure.
 HELPER_ARRAYS = ("HELPERS_TO_SYNC",)
 
 # ── Admission (v1) ────────────────────────────────────────────────────────
@@ -313,10 +317,135 @@ def hook_install_failures(repo: Repo) -> list[str]:
             # git skips a hook that is not executable ("ignored because it's not
             # set as executable", MEASURED git 2.43), so the guard is off.
             fails.append(f"the installed git hook {dst} is not executable (chmod +x {dst})")
+    chain_failure = native_chain_failure(repo, names)
+    if chain_failure:
+        fails.append(chain_failure)
     return fails
 
 
+def native_chain_contract(repo: Repo, ref: str, names: list[str]) -> dict | None:
+    """Read immutable protocol declarations as data, never execute target code."""
+    wrapper = repo.show(ref, "scripts/hooks/pre-push") or ""
+    if "pre_push_chain.py" not in names and "pre_push_chain.py" not in wrapper:
+        return None
+    source = repo.show(ref, "scripts/hooks/pre_push_chain.py")
+    if source is None:
+        raise ValueError("missing chain source")
+    tree = ast.parse(source)
+    constants = {}
+    for key in ("HELPERS", "MANIFEST", "ORIGINAL"):
+        assignments = [node for node in tree.body if isinstance(node, ast.Assign)
+                       and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                       and node.targets[0].id == key]
+        writes = [node for node in ast.walk(tree) if isinstance(node, ast.Name)
+                  and node.id == key and isinstance(node.ctx, (ast.Store, ast.Del))]
+        if len(assignments) != 1 or len(writes) != 1:
+            raise ValueError("ambiguous chain declaration")
+        constants[key] = ast.literal_eval(assignments[0].value)
+    helpers = constants["HELPERS"]
+    if not isinstance(helpers, tuple) or not helpers or len(set(helpers)) != len(helpers):
+        raise ValueError("invalid chain closure")
+    for name in (*helpers, constants["MANIFEST"], constants["ORIGINAL"]):
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", name) or name in (".", ".."):
+            raise ValueError("invalid chain filename")
+    if not {"pre-push", *helpers}.issubset(names):
+        raise ValueError("chain closure missing from sync declarations")
+    return constants
+
+
+def native_chain_record(repo: Repo, constants: dict, *, target_exact: bool = True) -> dict:
+    """Read prior ownership independently from exact target readiness."""
+    directory = repo.hooks_dir()
+    record = directory / constants["MANIFEST"]
+    if record.is_symlink() or not record.is_file():
+        raise ValueError("missing regular chain record")
+    state = json.loads(record.read_bytes())
+    keys = {"version", "phase", "repos", "original", "run_original_for_enrolled", "closure", "helpers", "wrapper_sha256"}
+    if (not isinstance(state, dict) or set(state) != keys or type(state.get("version")) is not int
+            or state["version"] != 1 or state.get("phase") != "active"
+            or not isinstance(state.get("repos"), dict)
+            or state["repos"].get(repo.common_dir()) != str(repo.root.resolve())
+            or any(not isinstance(v, str) or not os.path.isabs(v) for pair in state["repos"].items() for v in pair)
+            or type(state.get("run_original_for_enrolled")) is not bool):
+        raise ValueError("inactive or mismatched chain record")
+    closure = state["closure"]
+    if (not isinstance(closure, list) or closure[:2] != ["pre_push_chain.py", "pre_push_gates.sh"]
+            or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", name)
+                   or name in (".", "..", "pre-push", constants["MANIFEST"], constants["ORIGINAL"]) for name in closure)
+            or len(set(closure)) != len(closure) or not isinstance(state["helpers"], dict)
+            or set(state["helpers"]) != set(closure)):
+        raise ValueError("invalid recorded helper closure")
+    target = list(constants["HELPERS"])
+    if (target_exact and closure != target) or target[:len(closure)] != closure:
+        raise ValueError("target helper closure differs")
+    for digest in [state["wrapper_sha256"], *state["helpers"].values()]:
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("invalid recorded digest")
+    original = state["original"]
+    path = directory / constants["ORIGINAL"]
+    if original is None and (path.exists() or path.is_symlink()):
+        raise ValueError("unrecorded preserved original")
+    if original is not None and (
+            not isinstance(original, dict) or set(original) != {"sha256", "mode"}
+            or not isinstance(original["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", original["sha256"])
+            or type(original["mode"]) is not int or not 0 <= original["mode"] <= 0o7777
+            or state["run_original_for_enrolled"] or path.is_symlink() or not path.is_file()
+            or hashlib.sha256(path.read_bytes()).hexdigest() != original["sha256"]
+            or stat.S_IMODE(path.stat().st_mode) != original["mode"]):
+        raise ValueError("custom or changed preserved original")
+    return state
+
+
+def native_chain_failure(repo: Repo, names: list[str]) -> str | None:
+    """Qualify installed bytes and private state without executing push consumers."""
+    try:
+        constants = native_chain_contract(repo, "HEAD", names)
+        if constants is None:
+            return None
+        state = native_chain_record(repo, constants)
+        helpers = constants["HELPERS"]
+        directory = repo.hooks_dir()
+        for name in ("pre-push", *helpers):
+            path = directory / name
+            content = repo.show("HEAD", f"scripts/hooks/{name}")
+            digest = state["wrapper_sha256"] if name == "pre-push" else state["helpers"][name]
+            if (content is None or path.is_symlink() or not path.is_file()
+                    or not os.access(path, os.X_OK)
+                    or hashlib.sha256(content.encode("utf-8", "surrogateescape")).hexdigest() != digest
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != digest):
+                raise ValueError("native wrapper/helper closure differs")
+    except (OSError, ValueError, TypeError, KeyError, SyntaxError) as exc:
+        return f"native pre-push chain is not ready ({exc})"
+    return None
+
+
 # ── admission ─────────────────────────────────────────────────────────────
+def native_closure_change(repo: Repo, before: str, after: str) -> str | None:
+    """Native candidate closure changes cannot be undone by the current installer."""
+    try:
+        contracts = [native_chain_contract(repo, ref, sync_hook_names(repo.show(ref, SYNC_HOOKS) or ""))
+                     for ref in (before, after)]
+        if all(contracts) and contracts[0]["HELPERS"] != contracts[1]["HELPERS"]:
+            return "changes the native pre-push helper closure; candidate rollback cannot contract or reorder it"
+    except (ValueError, TypeError, KeyError, SyntaxError, Refusal) as exc:
+        return f"cannot qualify native pre-push helper closure ({exc})"
+    return None
+
+
+def native_move_failure(repo: Repo, tip: str) -> str | None:
+    """Before moving, the installed native closure must fit the target prefix."""
+    try:
+        current, target = [native_chain_contract(repo, ref, sync_hook_names(repo.show(ref, SYNC_HOOKS) or ""))
+                           for ref in ("HEAD", tip)]
+        if target:
+            record = repo.hooks_dir() / target["MANIFEST"]
+            if current or record.exists() or record.is_symlink():
+                native_chain_record(repo, target, target_exact=False)
+    except (OSError, ValueError, TypeError, KeyError, SyntaxError, Refusal) as exc:
+        return f"native pre-push transition is unqualified before checkout movement ({exc})"
+    return None
+
+
 def path_refusal(path: str, hooks_approved: bool = False) -> str | None:
     """Why a changed path keeps a candidate off `live`, or None.
     ``hooks_approved`` skips ONLY the hook rule: every other rule still applies
@@ -407,6 +536,9 @@ def admission_failures(repo: Repo, base: str, head: str, hooks_approved: bool = 
     hook rule only (see path_refusal)."""
     fails: list[str] = []
     changed = changed_paths(repo, base, head)
+    closure_failure = native_closure_change(repo, base, head)
+    if closure_failure:
+        fails.append(closure_failure)
     for path in changed:
         why = path_refusal(path, hooks_approved)
         if why:
@@ -657,6 +789,13 @@ def hook_ownership_failures(
     # and the next pass judges the tip built without it.
     if out:
         return out
+    closure_failure = native_closure_change(repo, base, tip)
+    if closure_failure:
+        for path in (SYNC_HOOKS, "scripts/hooks/pre_push_chain.py"):
+            for branch in owned.get(path, []):
+                out[branch] = closure_failure
+        if out:
+            return out
     bad = listed_non_files(repo, tip)
     if bad:
         try:

@@ -144,7 +144,7 @@ def test_the_rebuild_trailer_is_a_real_trailer_and_pre_push_refuses_it(dc, dc_re
     # The pre-push hook, invoked directly with git's stdin ref lines, refuses
     # publishing that commit; a branch without it is the control.
     zero = "0" * 40
-    hook = SCRIPTS / "hooks" / "pre-push"
+    hook = SCRIPTS / "hooks" / "pre_push_gates.sh"
 
     def publish(ref: str, sha: str) -> subprocess.CompletedProcess:
         return subprocess.run(
