@@ -10,6 +10,25 @@ transcripts, backups and anything published from them. It is not a sandbox again
 value, and it does not stop a command from using one (`curl -H "Authorization: Bearer $KEY"` still runs with
 the real key; only what is shown and stored is redacted).
 
+## Install, upgrade and off-switch
+
+`scripts/bootstrap.sh` and `scripts/update.sh` run `scripts/cc_plugins.py apply`, which registers the checkout's
+`plugins/` folder as the Claude Code marketplace `genesis` at user scope and installs `genesis-secret-redact`.
+Every session on the install then loads it: foreground, subagents and dispatched `claude -p` sessions, except
+sessions launched with `--bare` or `--safe-mode` (readiness probes, eval benches), which load no plugins. The plugin
+loads in place from the checkout, so a later deploy updates it at the next session start with no reinstall.
+
+- **Off:** set `cc_plugins.secret_redact: off` in `~/.genesis/config/genesis.yaml`; the next bootstrap or update
+  uninstalls it. `claude plugin disable genesis-secret-redact@genesis` also works and is kept: `apply` never
+  re-enables a plugin that is installed.
+- **Check:** `scripts/cc_plugins.py check` prints the state and exits 3 when it does not match the lever (for
+  example, disabled while the lever is on, the marketplace pointing at a checkout that moved, or a lever value
+  that is neither `on` nor `off`), and 2 when it cannot tell (no `claude`, unreadable `genesis.yaml`). Nothing
+  reports this to Genesis's health surfaces yet; that wiring is tracked separately.
+- Only the main checkout registers itself; a linked worktree is refused. A checkout that moved is re-pointed on
+  the next run, keeping a disabled plugin disabled.
+- No `claude` on PATH: the step reports it and is re-attempted on the next update.
+
 ## What is redacted
 
 | Surface | How |
@@ -40,6 +59,9 @@ expansion where there is no venv.
   heredoc in Bash) gets no restore, so a placeholder there would replace the value with literal text.
 - **Errored tool calls** (a non-zero exit, an MCP tool raising) whose error text holds a value are answered with
   the same text redacted, which the model reads as the call's error result, exactly as it would have.
+- **Using a value.** A placeholder is display text, not the value: a command that needs a key reads it from the
+  environment or the file (`set -a; . <secrets file>; set +a`, or a tool that loads it), never by pasting
+  `[secrets.env:VAR]` into the command line.
 - **Rotation.** Only current values are redacted. After a key is replaced in the secrets file, the old value is
   no longer this install's secret and is shown as it is.
 - **Short secrets** (under 16 characters) are not redacted: matching them would rewrite ordinary text.
