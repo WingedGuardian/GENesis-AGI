@@ -366,7 +366,11 @@ def _without_ids(rows: object) -> object:
 
 
 def _round_source(
-    item: Mapping[str, object], login: str, flagged: Sequence[int], in_body: int
+    item: Mapping[str, object],
+    login: str,
+    flagged: Sequence[int],
+    in_body: int,
+    top_level: Sequence[str] = (),
 ) -> dict[str, Any]:
     """One review's place in a round, keyed for the round reflection.
 
@@ -380,24 +384,36 @@ def _round_source(
     hook (PR #3040, round 1). A key whose id is missing is None: the round still
     counts, it just cannot be discharged by key, which ``reflection_keys``
     reports.
+
+    ``blocking`` runs parallel to ``finding_keys``: whether each finding is at
+    the always-fix floor (``review_findings.is_blocking``), None when its level
+    cannot be read. A body key is False: the merge gate never scores body
+    findings (owner ruling), so they never block there either.
     """
+    # A sibling too old to know the floor reads unknown, never "not blocking".
+    read = getattr(_findings_module(), "is_blocking", None)
     review_id = item.get("id")
     ids = item.get("top_level_ids")
     keys: list[str | None] = []
+    blocking: list[bool | None] = []
     for index in flagged:
         comment_id = ids[index] if isinstance(ids, list) and index < len(ids) else None
         keys.append(f"c{comment_id}" if _is_id(comment_id) else None)
+        text = top_level[index] if index < len(top_level) else None
+        blocking.append(read(login, text) if read and isinstance(text, str) else None)
     if in_body:
         # Bounded before it is formatted: a sum of several maximal sections
         # passes int() and then overflows str() (4,300 digits), which would turn
         # the whole lookup unknown. Past the bound the key is unknown instead.
         bounded = 0 < in_body < 10**9
         keys.append(f"r{review_id}:{in_body}" if _is_id(review_id) and bounded else None)
+        blocking.append(False)
     return {
         "id": review_id if _is_id(review_id) else None,
         "login": login,
         "submitted_at": item.get("submitted_at"),
         "finding_keys": keys,
+        "blocking": blocking,
     }
 
 
@@ -644,7 +660,7 @@ def evaluate_evidence(
                     "when": when,
                     "login": login,
                     "findings": findings,
-                    "source": _round_source(item, login, flagged, in_body),
+                    "source": _round_source(item, login, flagged, in_body, top_level),
                 }
             )
         elif not top_level and review_findings.declares_findings(login, body):
@@ -736,6 +752,12 @@ def evaluate_evidence(
                         "submitted_at": item.get("created_at"),
                         # A findings comment has no review object; its own id keys it.
                         "finding_keys": [f"i{comment_id}" if _is_id(comment_id) else None],
+                        # Its badge is in the comment itself.
+                        "blocking": [
+                            review_findings.is_blocking(login, body)
+                            if hasattr(review_findings, "is_blocking")
+                            else None
+                        ],
                     },
                 }
             )
@@ -974,6 +996,7 @@ def evaluate_evidence(
                 "submitted_at": _iso(event["when"], event["source"]["submitted_at"]),
                 "login": event["login"],
                 "keys": keys,
+                "blocking": list(event["source"].get("blocking") or [None] * len(keys)),
                 "round_head": round_of(event["sha"]),
                 "late": event["late"],
             }

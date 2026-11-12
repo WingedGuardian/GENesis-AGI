@@ -1314,6 +1314,36 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   | gate | round 1 | round 2 and later | round 2 |
   | ordinary | round 3 (the class sweep) | round 2 and later | round 4 |
 
+  Past round 4 on the ordinary lane (rounds opened from
+  `review_reflection.PAST_TERMINAL_CUTOVER_ISO` on), the reflection also carries
+  the past-round-4 lines (`past_terminal_problems`). Every rule is read from the
+  budget's per-finding floor flag: Codex P1, Devin severe, CodeRabbit
+  Critical/Major.
+  - **From round 4:** a reflection that still fixes something, for a key of any
+    round, states `Prediction: merges at round <next> because <why>` and
+    `Confidence: <95-100>% falsified-by <what would show it wrong>`.
+  - **The loop ends** when the PR's newest round (from round 4) is answered by
+    a send-back, or has every one of its findings filed, or is round 5 or later
+    and drew no floor finding. From then on the commit gate denies content
+    commits on the PR, and a fix-now for any key is refused. A merge of the
+    default branch, an empty reflection commit, merge and close still pass. A
+    new review round reopens fixing, and so does a floor finding arriving after
+    the answers, until it too is answered. So file a finding only when it
+    really waits: filing every finding ends the loop.
+  - **From round 5:**
+    - every reflection says `Prediction-held: yes|no <why>`. An honest `no` is
+      always accepted. `yes` needs a round with no floor finding that has
+      settled (30 min after its first review);
+    - when the round drew no floor finding, every finding is filed as an issue
+      (merge-and-file), or the PR is sent back; a fix-now is refused;
+    - two rounds that drew floor findings leave send-back as the only decision.
+  - **Consequence (owner, accepted):** a real defect found past that point,
+    including CI red caused by the PR's own code, is not fixed in this PR. It
+    goes to a rework PR, or to the owner for an exception. Send-back with
+    `Prediction-held: no` passes in every state, so the gate never leaves no way
+    out. Pushes and review requests on an ended PR are refused only once the
+    request and push checks land (#4133).
+
   A merge of main does not end a round. When nothing after the reviewed head is a
   fix (only merges of main that carry nothing else, or empty commits such as a
   pushed reflection), that round's keys stay owed (as late keys, under the round's

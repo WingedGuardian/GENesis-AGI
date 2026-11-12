@@ -505,6 +505,46 @@ def is_finding(login: str, body: str) -> bool:
     return headers == 0
 
 
+def is_blocking(login: str, body: str) -> bool | None:
+    """Whether one finding comment by ``login`` is at the always-fix floor:
+    Codex P1, a Devin severe marker (🔴 🟥), or a CodeRabbit Critical or Major
+    header on any of its header lines. False when it is readable and below the
+    floor; None when its level cannot be read (an unknown format, a comment
+    with no badge or marker, an unreadable header). MEASURED 2026-11-11: 0 of
+    557 finding comments over 180 PRs read None. Read by the past-round-4 rules
+    of ``review_reflection`` through ``review_budget``'s per-key flags."""
+    # Method for the figure above: every top-level inline comment on the open
+    # and 100 latest merged PRs that ``is_finding`` counts, read with this
+    # function (REST pulls/<n>/comments).
+    fmt = _format_of(login)
+    if fmt is None or fmt.surface_only:
+        return None
+    if fmt.parser == "codex-badge":
+        if INLINE_P1_RE.search(body):
+            return True
+        if INLINE_P2_RE.search(body) or INLINE_P3_RE.search(body):
+            return False
+        return None
+    if fmt.parser == "devin-marker":
+        level = devin_finding(body)[1]
+        return None if level is None else level == "floor"
+    levels: list[str] = []
+    unread = False
+    for line in body.split("\n"):
+        if not line.strip():
+            continue
+        level, seen = cr_severity(line)
+        if not seen or _CR_SOURCE_FOOTER_RE.fullmatch(line.strip()):
+            continue
+        if level is None:
+            unread = True
+        else:
+            levels.append(level)
+    if any(level in ("critical", "major") for level in levels):
+        return True
+    return None if unread or not levels else False
+
+
 def body_finding_count(login: str, body: str) -> int:
     """Findings a known reviewer delivered in its review BODY (CodeRabbit's
     outside-diff and duplicate sections). Zero for every other format."""

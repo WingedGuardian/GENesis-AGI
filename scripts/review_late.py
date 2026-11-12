@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -42,6 +42,8 @@ class RoundContext:
     round_number: int
     round_started: str | None
     prior_heads: tuple[str, ...]
+    #: The round's own head, for the past-round-4 rules; not part of identity.
+    round_head: str | None = field(default=None, compare=False)
 
 
 def _ancestry(budget: Mapping[str, Any]) -> tuple[set[str], Ancestors]:
@@ -153,7 +155,60 @@ def round_context(budget: Mapping[str, Any], round_head: str, at: datetime) -> R
             return None
         if before:
             prior.append(head)
-    return RoundContext(len(prior) + 1, own.isoformat(), tuple(sorted(prior)))
+    return RoundContext(len(prior) + 1, own.isoformat(), tuple(sorted(prior)), round_head)
+
+
+def round_records(budget: Mapping[str, Any]) -> dict[str, rr.RoundRecord] | None:
+    """Every round, keyed by head: its number and opening time
+    (``round_context``) and its findings with their floor flags, late joiners
+    included (``findings[].round_head``). None when the budget carries no
+    opening times, or when any round's place is undetermined (an untimed
+    legacy round, a tie): the round count and which round is newest are then
+    unknown, so the past-round-4 rules stay off for the PR (fails open). Such
+    PRs predate the round rule's cutover by construction."""
+    times = _round_times(budget)
+    if times is None:
+        return None
+    far = datetime.max.replace(tzinfo=UTC)
+    out: dict[str, rr.RoundRecord] = {}
+    for head, opened in times.items():
+        context = round_context(budget, head, far)
+        if context is None:
+            return None
+        found: list[tuple[datetime | None, bool | None, str | None]] = []
+        for item in budget.get("findings") or []:
+            if not isinstance(item, Mapping) or item.get("round_head") != head:
+                continue
+            # An unreadable time stays None: the finding counts as seen at
+            # every time, and its round's settle time is unknown.
+            when = rr._parse_when(item.get("submitted_at"))
+            keys = item.get("keys") if isinstance(item.get("keys"), list) else []
+            flags = item.get("blocking")
+            if not isinstance(flags, list) or len(flags) != len(keys):
+                flags = [None] * len(keys)
+            for key, flag in zip(keys, flags, strict=True):
+                found.append((when, flag if isinstance(flag, bool) else None, key))
+        out[head] = rr.RoundRecord(head, context.round_number, opened, tuple(found))
+    return out
+
+
+def key_flags(budget: Mapping[str, Any]) -> dict[str, bool | None]:
+    """Each finding key's floor flag over EVERY budget finding, whatever its
+    round head, time or level (``rr.merge_flags``): the loop's end reads a key
+    by what it is, never by which round it was filed under, so a finding on a
+    commit that opened no round is seen like any other."""
+    pairs = []
+    for item in budget.get("findings") or []:
+        if not isinstance(item, Mapping):
+            continue
+        keys = item.get("keys") if isinstance(item.get("keys"), list) else []
+        found = item.get("blocking")
+        if not isinstance(found, list) or len(found) != len(keys):
+            found = [None] * len(keys)
+        for key, flag in zip(keys, found, strict=True):
+            if key is not None:
+                pairs.append((str(key), flag if isinstance(flag, bool) else None))
+    return rr.merge_flags(pairs)
 
 
 def _contexts(
@@ -474,7 +529,10 @@ def _covered_late_keys(
     current = budget.get("current_head")
     in_graph, ancestors = _ancestry(budget)
     log = rr._log_reflections(cwd)
+    declared = rr.answers(log)
+    flags = key_flags(budget)
     owners = rr.key_rounds(budget)
+    records = round_records(budget) or {}
     labels: dict[tuple[tuple[str, ...], str], list[str]] = {}
     checked: dict[tuple[str, RoundContext], bool] = {}
     fix_times: dict[tuple[str, str], datetime | None] = {}
@@ -560,6 +618,10 @@ def _covered_late_keys(
                         round_started=context.round_started,
                         made_at=made_at,
                         cwd=cwd,
+                        round_record=records.get(str(context.round_head)),
+                        round_records=records,
+                        declared=declared,
+                        key_flags=flags,
                     ).ok
                 passed = passed and checked[(sha, context)]
             if passed:
