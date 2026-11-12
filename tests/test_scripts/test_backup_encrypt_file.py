@@ -76,7 +76,7 @@ def _decrypt(tmp_path: Path, enc: Path) -> bytes:
 
 
 def _leftovers(directory: Path) -> list[str]:
-    return sorted(p.name for p in directory.iterdir() if ".partial." in p.name)
+    return sorted(p.name for p in directory.iterdir() if "partial." in p.name)
 
 
 def test_a_source_growing_during_encryption_is_backed_up(tmp_path):
@@ -126,6 +126,47 @@ def _failing_gpg(tmp_path: Path) -> str:
     )
     stub.chmod(0o700)
     return str(binary) + ":"
+
+
+def test_a_long_destination_name_still_encrypts(tmp_path):
+    """The partial's name must not grow with the destination's: a destination
+    name at the directory's own length limit still encrypts, where a partial
+    named after it could not exist. Sized from the filesystem, which differs
+    between test sandboxes."""
+    name_max = os.pathconf(tmp_path, "PC_NAME_MAX")
+    src = tmp_path / ("m" * (name_max - 4))
+    src.write_text("memory\n")
+    dst = tmp_path / ("m" * (name_max - 4) + ".gpg")
+    proc = _run_encrypt(tmp_path, src, dst)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _decrypt(tmp_path, dst) == b"memory\n"
+    assert _leftovers(tmp_path) == []
+
+
+def test_a_partial_removed_mid_run_never_replaces_the_copy(tmp_path):
+    """Another run's sweep may delete this run's partial while gpg writes it. The
+    stamp step must not recreate it empty and move that over the good copy."""
+    binary = tmp_path / "fakebin"
+    binary.mkdir()
+    stub = binary / "gpg"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'out=""; prev=""\n'
+        'for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done\n'
+        "cat >/dev/null\n"
+        'printf "ciphertext" > "$out"\n'
+        'rm -f "$out"\n'  # a concurrent sweep removed it
+        "exit 0\n"
+    )
+    stub.chmod(0o700)
+    src = tmp_path / "session.jsonl"
+    src.write_text("content\n")
+    dst = tmp_path / "session.jsonl.gpg"
+    dst.write_bytes(b"previous good copy")
+    proc = _run_encrypt(tmp_path, src, dst, path_prefix=str(binary) + ":")
+    assert dst.read_bytes() == b"previous good copy", "an empty partial replaced the copy"
+    assert proc.returncode != 0
+    assert _leftovers(tmp_path) == []
 
 
 def test_a_failed_encryption_keeps_the_previous_copy_and_names_the_cause(tmp_path):

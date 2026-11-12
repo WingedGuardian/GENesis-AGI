@@ -433,11 +433,15 @@ fi
 # pipe has no size, so gpg encrypts what it reads to EOF. The passphrase
 # arrives on fd 3, as in encrypt_stream.
 #
-# gpg writes a dot-prefixed partial beside <dst>, renamed over it only on
-# success, so a failed run keeps the previous copy: gpg deletes its output on
-# failure, which used to be <dst> itself. A partial a killed run leaves behind
-# is swept before the commit (§7). On failure the last line of gpg's stderr is
-# logged to stderr; the caller still logs its own WARNING.
+# gpg writes a partial beside <dst>, renamed over it only on success, so a
+# failed run keeps the previous copy: gpg deletes its output on failure, which
+# used to be <dst> itself. The partial is `.genesis-partial.<pid>.XXXXXX` from
+# mktemp: short whatever <dst> is called (a name built from <dst> can exceed the
+# 255-byte limit where <dst> fits), and carrying the pid so the sweep before the
+# commit (§7) can tell a dead run's partial from a live one's. The stamp uses
+# `touch -c`, so a partial removed meanwhile is never recreated empty and moved
+# over the copy. On failure the last line of gpg's stderr is logged to stderr;
+# the caller still logs its own WARNING.
 #
 # The copy is stamped 1 ns past the source's mtime from just before the read,
 # so the callers' `[ "$dst" -nt "$src" ]` skip holds while the source is
@@ -452,9 +456,14 @@ encrypt_file() {
     backup_passphrase_valid "$_BACKUP_PASSPHRASE" || return 1
     local tmp mtime secs nsec stamp
     local -a st
-    tmp="$(dirname -- "$dst")/.$(basename -- "$dst").partial.$$"
     mtime="$(stat -L -c %.9Y -- "$src")" || return 1
     _ENCRYPT_ERR_TMP="$(mktemp -p "$GENESIS_BIG_TMP" encrypt.XXXXXX.err)" || return 1
+    if ! tmp="$(mktemp -p "$(dirname -- "$dst")" ".genesis-partial.$$.XXXXXX")"; then
+        log "  cannot create a partial file beside $dst" >&2
+        rm -f -- "$_ENCRYPT_ERR_TMP"
+        _ENCRYPT_ERR_TMP=""
+        return 1
+    fi
     _ENCRYPT_PARTIAL="$tmp"
     if cat -- "$src" 2>>"$_ENCRYPT_ERR_TMP" \
         | gpg --batch --yes --no-symkey-cache --passphrase-fd 3 \
@@ -475,7 +484,7 @@ encrypt_file() {
             fi
         fi
         printf -v stamp '@%s.%09d' "$secs" "$nsec"
-        touch -d "$stamp" -- "$tmp" 2>/dev/null || true
+        touch -c -d "$stamp" -- "$tmp" 2>/dev/null || true
         # -T: a directory at <dst> is a failure, never a place to move into.
         if mv -f -T -- "$tmp" "$dst"; then
             rm -f -- "$_ENCRYPT_ERR_TMP"
@@ -1885,25 +1894,34 @@ if ! grep -qx 'creds/\*\*/\.\*\.tmp' .gitignore 2>/dev/null; then
     printf 'creds/**/.*.tmp\n' >> .gitignore
     log "Added the credential staging names to the .gitignore exclusions"
 fi
-# encrypt_file's partials and the SQL dump's staged artifact
-# (.<name>.partial.<pid>): a run killed mid-encrypt leaves one. Never commit
-# one, and sweep every one this run did not make: the backup-restore lock taken
-# at the top admits one run per GENESIS_HOME, so any other pid's partial is a
-# dead run's (#4391). (Two runs sharing this repo under different GENESIS_HOME
-# values could sweep each other's: the victim's rename then fails and its
-# previous copy stays, so nothing is lost.) A partial's name
-# ends in its pid's digits and an encrypted copy's in `.gpg`, so a real dotfile
-# such as `.notes.partial.2024.md`, backed up as `….md.gpg`, is neither
-# ignored nor swept: the second .gitignore line re-includes it.
-if ! grep -qxF '.*.partial.[0-9]*' .gitignore 2>/dev/null; then
+# encrypt_file's partials (.genesis-partial.<pid>.XXXXXX) and the SQL dump's
+# staged artifact (data/.genesis.sql.gpg.partial.<pid>): a run killed
+# mid-encrypt leaves one. Never commit one, and sweep those whose writer is
+# gone (#4391). The backup-restore lock admits one run per GENESIS_HOME; the
+# sweep also leaves a partial whose pid is alive, but the plaintext purges in
+# §4, §5 and §6f do not. Two runs sharing this repo under different GENESIS_HOME
+# values are not supported: one can remove the other's partial, which costs the
+# victim a WARNING and keeps its previous copy (`touch -c` and `mv -T` then fail).
+# The .gitignore lines ignore such FILES only: the second re-includes a directory
+# of that name, whose contents git could otherwise never commit, and the third an
+# encrypted copy (a partial's name never ends in .gpg).
+if ! grep -qxF '.genesis-partial.*' .gitignore 2>/dev/null; then
     if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then printf '\n' >> .gitignore; fi
-    printf '.*.partial.[0-9]*\n!.*.partial.*.gpg\n' >> .gitignore
+    printf '.genesis-partial.*\n!.genesis-partial.*/\n!.genesis-partial.*.gpg\n' >> .gitignore
     log "Added the encryption partials to the .gitignore exclusions"
 fi
 while IFS= read -r -d '' _partial; do
+    _pbase="${_partial##*/}"
+    case "$_pbase" in
+        .genesis-partial.*) _ppid="${_pbase#.genesis-partial.}"; _ppid="${_ppid%%.*}" ;;
+        *) _ppid="${_pbase##*.partial.}" ;;
+    esac
+    case "$_ppid" in ''|*[!0-9]*) continue ;; esac
+    [ "$_ppid" = "$$" ] && continue
+    kill -0 "$_ppid" 2>/dev/null && continue
     rm -f -- "$_partial" && log "Removed an encryption partial left by an interrupted run: $_partial"
-done < <(find transcripts memory eval data secrets creds -type f -regextype posix-extended \
-    -regex '.*/\.[^/]+\.partial\.[0-9]+' ! -name "*.partial.$$" -print0 2>/dev/null)
+done < <(find transcripts memory eval data secrets creds -type f \( -name '.genesis-partial.*' \
+    ! -name '*.gpg' -o -path 'data/.genesis.sql.gpg.partial.*' \) -print0 2>/dev/null)
 
 # --- Commit and push (Tier 1 only) ---
 log "Committing backup..."
