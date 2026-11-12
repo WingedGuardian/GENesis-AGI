@@ -2451,7 +2451,10 @@ verified: 4721e0d93 2026-11-07
   whole page. Locked appends sequence timestamps within a 300-second future
   window; inadmissible clock outliers remain on disk until eligible, with a
   new bounded stream after a large clock reset. Host redeploy and installed
-  conversation-history verification remain outstanding.
+  conversation-history verification remain outstanding. The `test-alert`
+  gateway verb (`--test-alert`) sends one INFO test alert through the same
+  dispatcher, never queued, and prints one JSON line, so a delivery can be
+  triggered on demand and its history row checked.
 - **Snapshot deletion window** (`guardian/deletion_window.py`): routine
   snapshot deletions (the superseded healthy snapshot, prune, and what incus
   would expire before the next window) wait for `snapshots.deletion_window`,
