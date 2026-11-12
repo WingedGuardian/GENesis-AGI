@@ -129,7 +129,7 @@ def test_an_open_pr_is_counted(monkeypatch) -> None:
 
 
 def test_a_pr_onto_a_non_default_base_does_not_count(monkeypatch) -> None:
-    """A stacked PR contributes NO CI, so it must not silence the prompt.
+    """A stacked PR does not run ci.yml, so it must not silence the prompt.
 
     ci.yml filters pull_request to the default branch, so a request onto a
     feature base does not run ci.yml (issue #2035). Counting it
@@ -401,11 +401,17 @@ def test_a_republished_branch_with_no_open_pr_is_BLOCKED(
 
     rc, out, err = _run_guard_on_push(monkeypatch, tmp_path, fake, capsys)
     assert rc == 2, (rc, out, err)
-    assert "NO OPEN PR" in err and "CI never runs on it" in err
-    # The leak scan DOES run on a PR-less branch (every branch push is
-    # scanned server-side), so the block must not claim otherwise.
+    assert "NO OPEN PR" in err and "ci.yml never runs on it" in err
+    # The leak scan DOES run on a PR-less branch (branch pushes are scanned
+    # server-side where the branch carries the workflow), so the block must not
+    # claim otherwise.
     assert "branch leak scan" in err, err
     assert "detector never" not in " ".join(err.split()), err
+    # The count covers only PRs into the default branch, so a branch with a PR
+    # onto another base also reads 0: the block names what was counted and
+    # claims nothing about review, which such a PR can still get.
+    assert "into the default branch" in " ".join(err.split()), err
+    assert "nothing reviews" not in " ".join(err.split()), err
     assert "gh pr create" in err, "the block must name the way out, not just refuse"
     assert not out.strip(), (
         "a block writes to stderr and returns 2; emitting hook JSON as well would "
@@ -741,9 +747,14 @@ def test_the_block_does_not_fire_off_the_public_repo_end_to_end(
     assert doc["hookSpecificOutput"]["permissionDecision"] == "ask", out
     reason = doc["hookSpecificOutput"]["permissionDecisionReason"]
     assert "NO OPEN PR" in reason, out
-    # Off the public repo the guard does not know what scans the destination
-    # runs, so it claims only what it can: no PR means no CI.
+    # Off the public repo the guard does not know what the destination runs on
+    # a branch push, so it claims neither a leak scan nor an absence of CI.
     assert "leak scan" not in reason, reason
+    assert "CI never runs" not in " ".join(reason.split()), reason
+    # The count covers only PRs into the default branch, and off the public repo
+    # the guard does not know the branch is public either.
+    assert "into the default branch" in " ".join(reason.split()), reason
+    assert "PUBLIC" not in reason, reason
 
 
 def test_an_ordinary_repush_with_an_open_pr_is_still_silent(

@@ -14210,8 +14210,9 @@ def _open_pr_count_for_branch(
     """How many OPEN PRs have ``branch`` as their head, or None if unknowable.
 
     Distinguishing 0 from None is the point of the return type: 0 is a measured
-    "this public branch has no PR" — the state where CI never runs, since
-    ci.yml triggers on pull_request (only the branch leak scan sees such a
+    "no open PR from this repository into the default branch" — the state where
+    ci.yml never runs, since it triggers on pull_request into that branch (of the
+    push-triggered workflows only the branch leak scan sees such a
     branch, on each push) — while None is "the
     question could not be answered" (no gh, no network, no auth). Callers treat
     None as the status quo, never as 0: this feeds a HYGIENE prompt, not a
@@ -14341,11 +14342,12 @@ def _no_open_pr_deny_message(cur: str | None) -> str:
     """The no-open-PR BLOCK text, shared by the plain and close-compound arms."""
     return (
         f"BLOCKED: re-push to '{cur}' — this branch is "
-        f"PUBLIC but has NO OPEN PR, so CI never runs on it "
-        f"and nothing reviews it (ci.yml triggers on "
-        f"pull_request; a branch with no PR matches none "
-        f"of its triggers). Only the branch leak scan runs on its "
-        f"pushes.\n"
+        f"PUBLIC but has NO OPEN PR into the default branch, so "
+        f"ci.yml never runs on it (it triggers on pull_request "
+        f"into the default branch; a PR onto another base does "
+        f"not count). Of the workflows a branch push triggers, "
+        f"only the branch leak scan runs, where the branch "
+        f"carries it.\n"
         f"Open its PR first — `gh pr create` — then push "
         f"again. Or close the branch out if it is "
         f"finished with. Both leave the branch in a state "
@@ -14361,7 +14363,7 @@ def _no_pr_block_applies(urls: set[str]) -> bool:
     the same source ``_scheduled_gate_applies`` uses. The reason it has to be
     scoped at all is that the thing being enforced is not a property of branches
     in general: ``ci.yml`` lives in THIS repo and triggers on ``pull_request``
-    to ITS default branch (the branch leak scan runs on every branch push, but
+    to ITS default branch (the branch leak scan runs on branch pushes that carry it, but
     it is a leak scan only: no tests, no review). On a private fork, on the backups
     repo, on the voice repo, on any unrelated checkout a session wanders into,
     "this branch has no open PR" is an ordinary state with no consequence — and
@@ -16064,8 +16066,8 @@ def _run_merge_and_push_gates() -> int:
                             )
                     # A RE-PUSH earns its silence by having been approved at
                     # first publication — but a public branch with NO OPEN PR is
-                    # outside CI (ci.yml triggers on pull_request; only the
-                    # branch leak scan sees it), so its silence is the state this repo's
+                    # outside ci.yml (it triggers on pull_request; of the push-
+                    # triggered workflows only the branch leak scan sees it), so its silence is the state this repo's
                     # standing rule forbids: published, unchecked, and quietly
                     # growing. Downgrade the silent allow to an ASK naming the
                     # gap. A lookup that cannot answer (None) keeps the status
@@ -16136,9 +16138,11 @@ def _run_merge_and_push_gates() -> int:
                             ask_routine = True
                             routine_dests.append((push_remote, urls, pcwd, cur))
                             ask_reason = (
-                                f"re-push to '{cur}': this branch is PUBLIC but has "
-                                f"NO OPEN PR, so CI never runs on "
-                                f"it. Approve to push, then open its PR "
+                                f"re-push to '{cur}': this branch has "
+                                f"NO OPEN PR into the default branch, so CI gated on "
+                                f"such a PR does not run on it (this guard does not "
+                                f"read this repository's workflows, so other CI may "
+                                f"still run). Approve to push, then open its PR "
                                 f"(gh pr create) — or close the branch out."
                             )
                     # Ordered AFTER the no-PR arm: that arm denies on the public
