@@ -369,3 +369,85 @@ def test_a_node_kept_aside_by_a_failed_put_back_keeps_its_empty_directories(
     assert rc == 1, out
     assert (w.root / "sub").read_text() == "a session's\n"
     assert _kept_nested(w), [sorted(p for p in run.rglob("*")) for run in _runs(w)]
+
+
+# ── ignored files kept aside with a tag directory (#4025 item 4) ────────────
+
+
+def _dir_file_with_cache(w) -> str:
+    """`sub` was a foreign file where the tag has sub/; the server then writes
+    a cache git ignores into the tag's sub/, so the restore moves the cache
+    aside with the directory and puts the file `sub` back: the cache has
+    nowhere to go back to."""
+    from tests.test_scripts.test_live_move_restore_write import _dir_file, _fresh
+
+    ts, _, _ = _fresh(w, _dir_file)
+    (w.root / ".git" / "info" / "exclude").write_text("__pycache__/\n")
+    (w.root / "sub" / "__pycache__").mkdir()
+    (w.root / "sub" / "__pycache__" / "x.pyc").write_bytes(b"cache")
+    return ts
+
+
+def test_an_ignored_file_kept_aside_is_named_on_every_run(w):
+    ts = _dir_file_with_cache(w)
+    for _ in range(3):
+        r = _restore(w, ts)
+        assert r.returncode == 0, r.stdout + r.stderr
+        [run] = _runs(w)
+        assert r.stdout.count(str(run / "aside" / "sub" / "__pycache__" / "x.pyc")) == 1, r.stdout
+        assert "Kept aside with their directory" in r.stdout
+        assert "x.pyc" not in _check(w, ts).stdout, "--check names verdicts only"
+    assert isinstance(w.report()["restore"]["restored_at"], str), "it never withholds"
+    assert (run / "aside" / "sub" / "__pycache__" / "x.pyc").read_bytes() == b"cache"
+
+
+@pytest.mark.parametrize("step", ["aside", "put-in"])
+def test_a_run_killed_before_naming_them_loses_nothing(w, step):
+    """#4025 item 4 (probe map): killed at `aside` or at `put-in`, the next
+    runs used to name neither the file nor its folder."""
+    ts = _dir_file_with_cache(w)
+    assert _restore(w, ts, **{KILL_ENV: step}).returncode == -9
+    for _ in range(2):
+        r = _restore(w, ts)
+        assert r.returncode == 0, r.stdout + r.stderr
+        [run] = _runs(w)
+        assert r.stdout.count(str(run / "aside" / "sub" / "__pycache__" / "x.pyc")) == 1, r.stdout
+
+
+def test_a_held_aside_is_named_held_not_kept(w):
+    ts = _dir_file_with_cache(w)
+    assert _restore(w, ts).returncode == 0
+    [run] = _runs(w)
+    (run / "aside" / "sub" / "notes.txt").write_text("written after the run\n")  # not ignored
+    r = _restore(w, ts)
+    assert r.returncode == 1 and _parts(r)[(f"{run.name}/aside/sub", "aside")] == (
+        "refused:other:aside-held"
+    ), r.stdout
+    assert "Kept aside with their directory" not in r.stdout, r.stdout
+
+
+def test_an_ignored_file_is_named_and_an_ignored_empty_directory_kept(w):
+    """#4364 round 3 with #4025 item 4: a tag directory moved aside holding an
+    ignored file and an ignored empty directory. On every run the file is
+    named once and kept, the empty directory survives with its mode, one run
+    folder holds both, and --check names nothing."""
+    from tests.test_scripts.test_live_move_restore_write import _dir_file, _fresh
+
+    ts, _, _ = _fresh(w, _dir_file)
+    (w.root / ".git" / "info" / "exclude").write_text("__pycache__/\ne/\n")
+    (w.root / "sub" / "__pycache__").mkdir()
+    (w.root / "sub" / "__pycache__" / "x.pyc").write_bytes(b"cache")
+    nested = w.root / "sub" / "e" / "nested"
+    nested.mkdir(parents=True)
+    nested.chmod(0o751)
+    for _ in range(3):
+        r = _restore(w, ts)
+        assert r.returncode == 0, r.stdout + r.stderr
+        [run] = _runs(w)
+        pyc = run / "aside" / "sub" / "__pycache__" / "x.pyc"
+        assert r.stdout.count(str(pyc)) == 1, r.stdout
+        assert pyc.read_bytes() == b"cache"
+        kept = run / "aside" / "sub" / "e" / "nested"
+        assert kept.is_dir() and kept.stat().st_mode & 0o777 == 0o751, sorted(run.rglob("*"))
+    assert "x.pyc" not in _check(w, ts).stdout
+    assert isinstance(w.report()["restore"]["restored_at"], str)

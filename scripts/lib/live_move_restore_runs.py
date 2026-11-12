@@ -223,9 +223,11 @@ def aside_parts(judge) -> list:
                 continue
             finally:
                 judge.budget = spent
-            if not left:
-                where = os.path.join(judge.shown, key)
-                part(key, "other:aside-held", f"newer content kept at {where}: it was not restored")
+            if left:
+                judge.asides_left.append((name, p))  # _Writer._name_kept_aside reads it
+                continue
+            where = os.path.join(judge.shown, key)
+            part(key, "other:aside-held", f"newer content kept at {where}: it was not restored")
     return out
 
 
