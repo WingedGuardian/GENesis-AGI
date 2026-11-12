@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from genesis.cc import final_status, rate_limit_park, roster
-from genesis.cc.exceptions import CCQuotaExhaustedError, CCRateLimitError
+from genesis.cc.exceptions import CCMemoryPressureError, CCQuotaExhaustedError, CCRateLimitError
 from genesis.cc.session_config import _USER_SCOPED_MCP_WILDCARDS
 from genesis.cc.types import (
     CCInvocation,
@@ -887,8 +887,15 @@ class DirectSessionRequest:
     origin_session_id: str | None = None
     # Server-owned prepared receipt mode, never reconstructed from queue payloads.
     managed: bool = False
+    contained_peer: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.contained_peer) is not bool or self.contained_peer and (
+            not self.managed or self.profile != "observe" or self.skills
+            or self.planning_instruction or not isinstance(self.system_prompt, str)
+            or not self.system_prompt.strip()
+        ):
+            raise ValueError("Invalid contained peer request")
         if self.managed and (
             self.profile not in {"observe", "interact"}
             or self.tool_exceptions
@@ -1313,7 +1320,12 @@ class DirectSessionRunner:
             self._semaphore.release()
 
     async def _invoke_in_slot(self, request, session_id, on_event) -> CCOutput:
-        invocation = self._build_invocation(request, session_id)
+        if request.contained_peer:
+            from genesis.cc.peer_segment import native_invocation
+
+            invocation = await native_invocation(self._session_manager.db, request, session_id)
+        else:
+            invocation = self._build_invocation(request, session_id)
         if request.managed:
             invocation = replace(
                 invocation,
@@ -1646,6 +1658,15 @@ class DirectSessionRunner:
             # Not in _finalize_failure: the rate-limit path above reuses it
             # after park_direct_session already recorded these calls.
             await self._record_resumed_calls(request, inventory)
+            if isinstance(exc, CCMemoryPressureError):
+                # An existing resume claim must not become replayable when
+                # stale-claim recovery runs. Preserve its inventory first.
+                from genesis.db.crud import cc_rate_limit_parks as parks
+
+                db = getattr(self._rt, "_db", None)
+                park_id = rate_limit_park.parse_park_id(request.caller_context)
+                if db is not None and park_id is not None:
+                    await parks.mark_terminal(db, park_id, "cancelled")
             await self._finalize_failure(session_id, request, exc, telemetry, start)
 
         finally:
@@ -2173,7 +2194,7 @@ class DirectSessionRunner:
         # dot of ~/.genesis) as '-', so use cc_project_key — a bare
         # .replace("/", "-") leaves the dot and yields a wrong path.
         transcript_path = ""
-        if result.cc_session_id:
+        if result.cc_session_id and not request.contained_peer:
             project_key = cc_project_key(background_session_dir())
             transcript_path = str(
                 Path.home() / ".claude" / "projects" / project_key / f"{result.cc_session_id}.jsonl"

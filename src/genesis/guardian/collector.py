@@ -511,7 +511,9 @@ _REPAIR_JOURNAL = (
 # _backup_dir names it (_REPAIR_NAME, the writer's REPORT_NAME), never a
 # symlinked dir, the same byte cap (REPORT_BYTES), the same repo compare
 # (same_repo, REPO_BYTES), the same order (report_order), future skew
-# (REPORT_FUTURE_S) and read count (REPAIR_REPORTS_READ); a parity test holds
+# (REPORT_FUTURE_S) and read count (REPAIR_REPORTS_READ), and it skips a dir
+# holding the loader's DISMISS_MARK (a report dismissed though no reader can
+# read it, #4331), as it skips a dismissed_at one; a parity test holds
 # the constants equal and a cross-reader test runs both readers on one dir set.
 _REPAIR_TS = r"[0-9]{8}T[0-9]{6}Z-[0-9]+"
 _REPAIR_NAME = "(" + _REPAIR_TS + r")\-live\-move\-repair"
@@ -525,6 +527,7 @@ _REPAIR_WINDOW_S = 6 * 3600  # the journal read's window
 _REPAIR_FUTURE_S = 300  # the loader's REPORT_FUTURE_S
 _REPAIR_READS = 8  # deploy health's REPAIR_REPORTS_READ
 _REPAIR_MARK = "REPAIR.json\n"  # a login shell may print first
+_REPAIR_DISMISSED = "DISMISSED.json"  # the loader's DISMISS_MARK
 _REPAIR_PICK = (
     r"""
 import calendar, errno, json, os, re, stat, sys, time
@@ -554,6 +557,11 @@ def read(name):  # (raw, tail) of its REPAIR.json; raw None: unreadable; None: s
     path = os.path.join(root, name)
     if not stat.S_ISDIR(os.lstat(path).st_mode):
         return None
+    try:  # dismissed though no reader can read it (the loader's DISMISS_MARK)
+        if stat.S_ISREG(os.lstat(os.path.join(path, @DISMISSED@)).st_mode):
+            return None
+    except OSError:
+        pass
     try:
         fd = os.open(os.path.join(path, "REPAIR.json"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -627,6 +635,7 @@ for (seconds, _), name in names:
     .replace("@FUTURE@", str(_REPAIR_FUTURE_S))
     .replace("@READS@", str(_REPAIR_READS))
     .replace("@MARK@", repr(_REPAIR_MARK))
+    .replace("@DISMISSED@", repr(_REPAIR_DISMISSED))
     .encode()
 )
 _REPAIR_FIELD_CAP = 2000
@@ -679,6 +688,12 @@ async def _collect_live_repair(config: GuardianConfig) -> str:
             )
             + f"{saved} saved path(s) in its folder"
         )
+        block = report.get("restore")
+        if isinstance(block, dict):  # its last restore (live_move_restore.restore)
+            lines.append(
+                f"newest report's restore: restored_at {_quoted(block.get('restored_at'), 40)},"
+                f" refused {_quoted(block.get('refused'), 20)}"
+            )
         if foreign:  # last, so the field cap cuts paths before anything else
             more = f" (+{len(foreign) - 10} more)" if len(foreign) > 10 else ""
             tail = [f"newest report, not the update's{more}: {shown}"]

@@ -1252,8 +1252,8 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             # so the rebuild is retry-safe (mirrors ego_proposals_rebuild).
             await db.execute("DROP TABLE IF EXISTS knowledge_units_new")
             # Rebuild target mirrors the canonical knowledge_units CREATE in
-            # _tables.py (all 21 columns incl. source_pipeline/purpose/
-            # ingestion_source/origin_class) so no column data is dropped; the
+            # _tables.py (all 22 columns incl. source_pipeline/purpose/
+            # ingestion_source/origin_class/secret_ref) so no column data is dropped; the
             # row copy is a runtime column-name intersection with OR IGNORE dedup
             # (first row per (project_type,domain,concept) wins). A drift canary
             # in _intersection_copy logs any live column this target lacks.
@@ -1280,6 +1280,7 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
                     purpose          TEXT,
                     ingestion_source TEXT,
                     origin_class     TEXT,
+                    secret_ref       TEXT,
                     UNIQUE(project_type, domain, concept)
                 )
             """)
@@ -1753,6 +1754,32 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
              WHERE token = NEW.intake_token;
         END
     """)
+
+    # #2426: a credential unit names its held-out value by secret_ref (a random
+    # id of a reference_secrets row). The column is added here as well as in
+    # migration 20261105043443_reference_secrets because INDEXES (built right
+    # after this function) indexes it, and the triggers below read it.
+    await _try_alter(db,
+        "ALTER TABLE knowledge_units ADD COLUMN secret_ref TEXT",
+        "knowledge_units.secret_ref")
+    # A reference_secrets table created before the description was held out.
+    await _try_alter(db,
+        "ALTER TABLE reference_secrets ADD COLUMN detail TEXT",
+        "reference_secrets.detail")
+    # The secret_ref triggers: no credential unit without its secret row, and a
+    # secret row dies when no unit names it any more, however the unit is
+    # deleted or repointed (a raw SQL delete, a cleanup script). Triggers, not a
+    # foreign key: MCP connections run with foreign_keys off.
+    from genesis.db.crud.knowledge import credential_body_trigger_ddl, secret_ref_trigger_ddl
+
+    for ddl in secret_ref_trigger_ddl():
+        await db.execute(ddl)
+    # #2426: and a credential body that carries its value is refused by the
+    # database itself, so a writer that runs no current code (a process started
+    # before this change, a script, raw SQL) cannot index it. The same DDL ships
+    # in migration 20261105043443_reference_secrets; tests pin the two in parity.
+    for ddl in credential_body_trigger_ddl():
+        await db.execute(ddl)
 
     # Fix: user_goal_staleness was seeded with ["Micro","Light"] but is a
     # strategic-level signal that generates noise at Micro depth (72 identical
@@ -2231,6 +2258,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             f"ALTER TABLE cc_sessions ADD COLUMN {_col} TEXT",
             f"cc_sessions.{_col}",
         )
+
+    # Which labelled client a credentials lookup came from. Mirrored in
+    # migration 20261108071709 for the standalone runner (schema_both_build_paths).
+    await _try_alter(
+        db,
+        "ALTER TABLE credential_access_log ADD COLUMN client TEXT",
+        "credential_access_log.client",
+    )
 
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:

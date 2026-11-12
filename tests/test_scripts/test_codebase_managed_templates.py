@@ -30,12 +30,16 @@ def loop(renderer, with_post=False):
 
 def prelude(scratch):
     """What both scripts set up before their render loops: SCRIPT_DIR (install's
-    unit stamp) and bootstrap's managed-unit writer with its render file. The
-    writer is sourced against this repository, then GENESIS_ROOT is restored to
-    the test's literal home so the Exec path substitutions stay under test."""
+    unit stamp), the secrets-file resolver (both source lib/secrets_path.sh
+    before the loop, which calls genesis_secrets_path for a unit that loads
+    the secrets file) and bootstrap's managed-unit writer with its render
+    file. The writer is sourced against this repository, then GENESIS_ROOT is
+    restored to the test's literal home so the Exec path substitutions stay
+    under test."""
     scripts = shlex.quote(str(ROOT / "scripts"))
     return (
         f"SCRIPT_DIR={scripts}\n"
+        '. "$SCRIPT_DIR/lib/secrets_path.sh"\n'
         '_test_root="$GENESIS_ROOT"\n'
         f"GENESIS_ROOT={shlex.quote(str(ROOT))}\n"
         '. "$SCRIPT_DIR/lib/managed_units.sh"\n'
@@ -53,7 +57,7 @@ def render(tmp_path):
     for name in UNITS:
         shutil.copy2(ROOT / "scripts/systemd" / (name + ".template"), templates)
 
-    def run(renderer, home=None, *, take="", tier="0", with_post=False):
+    def run(renderer, home=None, *, take="", tier="0", with_post=False, cc_bin_dir="/usr/bin"):
         env = dict(
             os.environ,
             SYSTEMD_TEMPLATE_DIR=str(templates),
@@ -62,7 +66,7 @@ def render(tmp_path):
             REPO_DIR=str(home or tmp_path),
             GENESIS_ROOT=str(home or tmp_path),
             VENV_PATH=str(tmp_path / 'venv=$%&|λ" '),
-            CC_BIN_DIR="/usr/bin",
+            CC_BIN_DIR=cc_bin_dir,
             SERVICES_GENERATED="0",
             SERVICES_UPDATED="0",
             GENESIS_TAKE_TEMPLATES=take,
@@ -75,6 +79,7 @@ def render(tmp_path):
             [
                 "/bin/bash",
                 "-euc",
+                f". {ROOT / 'scripts/lib/secrets_path.sh'}\n"
                 "_falkordb_redis_server_bin() { printf /opt/e/redis-server; }\n"
                 "_falkordb_redis_cli_bin() { printf /opt/e/redis-cli; }\n"
                 "_falkordb_module_path() { printf /opt/e/falkordb.so; }\n"

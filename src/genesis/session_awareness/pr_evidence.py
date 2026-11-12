@@ -188,6 +188,41 @@ class Finding(BaseModel):
     disposition: Text
 
 
+class PublicReceipt(BaseModel):
+    model_config = _CONFIG
+
+    kind: Literal["public"]
+    target: Text
+    url: Text
+    quote: Text
+    rationale: Text
+
+
+class PrivateReceipt(BaseModel):
+    model_config = _CONFIG
+
+    kind: Literal["private"]
+    target: Text
+    id: Text
+    quote: Text
+    rationale: Text
+    disclosure_harm: Text
+    redaction_insufficient: Text
+
+
+class AcceptedLimit(BaseModel):
+    model_config = _CONFIG
+
+    kind: Literal["accepted_limit"]
+    target: Text
+    rationale: Text
+
+
+TrackingDisposition = Annotated[
+    PublicReceipt | PrivateReceipt | AcceptedLimit, Field(discriminator="kind")
+]
+
+
 class MethodGap(BaseModel):
     """A limit of HOW this was verified, accepted as it stands."""
 
@@ -295,8 +330,14 @@ class EvidenceDocument(BaseModel):
     controls: list[Text] = []
     gaps: list[Gap] = []
     findings: list[Finding] = []
+    # Missing on historical evidence: parse it, but assess tracking separately.
+    tracking: list[TrackingDisposition] = []
     # Optional for historical documents; the close checks against the live PR body.
     e2e: list[E2ECoverage] = []
+    # The validator's own judgment that this attempt made no progress: its remaining
+    # steps are the same as the stored previous attempt's. On a not-yet-done row the
+    # picker then waits the re-attempt window. Absent or false: offered at once.
+    no_progress: StrictBool = False
 
     @model_validator(mode="after")
     def _coverage_targets_exist(self) -> EvidenceDocument:

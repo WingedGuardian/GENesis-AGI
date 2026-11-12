@@ -9,12 +9,12 @@ until a validator records what it concluded. The READER shipped with the table
 ``close_verification``, so 217 obligations were open and ``evidence`` was NULL on
 all 258 rows. A validator could validate and could not record.
 
-USAGE
+USAGE (with the checkout's venv: this imports aiosqlite, which a bare python3 may lack)
 
-    python3 scripts/pr_verification.py print-schema
-    python3 scripts/pr_verification.py close --pr 2273 \\
+    .venv/bin/python scripts/pr_verification.py print-schema
+    .venv/bin/python scripts/pr_verification.py close --pr 2273 \\
         --evidence-file ~/.genesis/output/prv-2273.json
-    python3 scripts/pr_verification.py close --pr 1573 \\
+    .venv/bin/python scripts/pr_verification.py close --pr 1573 \\
         --note "needs an install with no graph engine" \\
         --evidence-file ~/.genesis/output/prv-1573.json
 
@@ -112,7 +112,9 @@ returns a false "not deployed" while the code is live and behaving correctly. Re
 live thing was observed doing it); ``ancestry`` is a fast positive path and never a
 negative verdict.
 
-EXIT CODES. 0 wrote (or dry-ran); 1 the ledger declined (no such open row, a race,
+EXIT CODES. 0 wrote (or dry-ran) with complete tracking; 4 measurement recorded
+(or previewed) but tracking pending, row OPEN. Re-read before retrying a 4: the
+measurement write succeeded. 1 the ledger declined (no such open row, a race,
 an absent or quarantined database); 2 the request was malformed (bad evidence, a
 missing or discarded note, a PR mismatch, a --verdict/--park the document does not
 support, a merge commit that cannot be resolved); 3 refused on policy (a failing
@@ -232,8 +234,28 @@ SCHEMA_TEMPLATE = {
             "command": "what to run to do it",
         },
     ],
-    "findings": [{"summary": "what you found", "disposition": "issue #N | note | none"}],
+    "findings": [{"summary": "what you found", "disposition": "see structured tracking"}],
+    "tracking": [
+        {"kind": "public", "target": "findings/0",
+         "url": "https://github.com/owner/repo/issues/123",
+         "quote": "exact excerpt read back from that open issue or its referenced comment",
+         "rationale": "how this task covers this concern"},
+        {"kind": "accepted_limit", "target": "gaps/0",
+         "rationale": "why this method limit needs no further work"},
+    ],
+    "no_progress": False,
 }
+
+
+def _no_progress_line(at: str) -> str:
+    """When the picker offers a not-yet-done row whose document declares
+    ``no_progress`` again: ``at`` is the ``last_attempt_at`` this run just wrote."""
+    from datetime import datetime, timedelta
+
+    from genesis.db.crud.pr_verifications import REATTEMPT_DAYS
+
+    after = datetime.fromisoformat(at).astimezone(UTC) + timedelta(days=REATTEMPT_DAYS)
+    return f"declared no progress: offered again after {after.strftime('%Y-%m-%d %H:%M')} UTC"
 
 
 async def _close_schema_refusal(db, rechecks: list[dict]) -> str | None:
@@ -297,11 +319,12 @@ async def _write(
     from genesis.db.connection import connect_aiosqlite_rw
 
     pr_number = doc.pr
-    rechecks = rechecks_for(doc) if decision.closing else []
+    rechecks = []
     # Set the moment a writer COMMITS. Anything that fails after that (the success
     # print, the connection's close) must not be reported as "nothing recorded" —
     # a retry would then meet a closed row and a message that contradicts it.
     committed: str | None = None
+    committed_code = 0
     try:
         async with connect_aiosqlite_rw(resolved, timeout=10) as db:
             await db.execute("PRAGMA busy_timeout=5000")
@@ -334,10 +357,18 @@ async def _write(
                 print(f"pr_verification: {mismatch}", file=sys.stderr)
                 return 3
 
-            coverage = check_e2e_coverage(doc, actual.body) if decision.closing else None
+            from genesis.session_awareness.pr_tracking import assess_tracking
+
+            tracking = await assess_tracking(doc, db=db)
+            closing = decision.closing and tracking.complete
+            coverage = check_e2e_coverage(doc, actual.body) if closing else None
             if coverage:
                 return _refuse(coverage.message, coverage.code)
-
+            rechecks = rechecks_for(doc) if closing else []
+            if rechecks:
+                schema_error = await _close_schema_refusal(db, rechecks)
+                if schema_error:
+                    return _refuse(schema_error, 1)
             verdict = decision.verdict
             reason = build_reason(doc, decision)
             # An open row's note is the validator's own words, with two kinds of
@@ -350,27 +381,29 @@ async def _write(
             # is a judgment the note must own up to. On not-yet-done the note is
             # optional, so the prefix may be all there is — never "None" in its place.
             rendered_note = attempt_note(decision, note)
+            if not tracking.complete:
+                rendered_note = tracking.note(rendered_note)
 
             if dry_run:
                 print("pr_verification: DRY RUN — nothing written.")
                 print(f"  target   : {target}#{pr_number}")
                 print(
                     f"  verdict  : {verdict}  "
-                    f"({'CLOSES the row' if decision.closing else 'row STAYS OPEN'})"
+                    f"({'CLOSES the row' if closing else 'row STAYS OPEN'})"
                 )
-                if decision.closing:
+                if closing:
                     print(f"  reason   : {reason}")
                 else:
                     print(f"  note     : {rendered_note}")
                 _print_recheck_plan(rechecks)
                 print(f"  evidence : {len(payload.encode('utf-8'))} bytes")
-                return 0
+                return 0 if tracking.complete else 4
 
             from datetime import datetime
 
             now = datetime.now(UTC).isoformat()
 
-            if decision.closing:
+            if closing:
                 changed = await crud.close_verification(
                     db,
                     repo=target,
@@ -403,6 +436,7 @@ async def _write(
                 note=rendered_note,
                 now=now,
                 evidence=payload,
+                tracking_pending=not tracking.complete,
             )
             if outcome != "recorded":
                 print(
@@ -412,10 +446,16 @@ async def _write(
                 )
                 return 1
             committed = f"{verdict} recorded on {target}#{pr_number}, row still OPEN"
+            if not tracking.complete:
+                committed_code = 4
+                print(f"pr_verification: {committed}. {rendered_note}")
+                return 4
             print(
                 f"pr_verification: {target}#{pr_number} STAYS OPEN — {verdict} recorded "
                 f"at {now}. The obligation is not discharged."
             )
+            if verdict == "not-yet-done" and doc.no_progress:
+                print(f"  {_no_progress_line(now)}")
             if verdict == "fail-intent":
                 print(
                     "  This is a FAILED verification: bring it to the user as a "
@@ -441,7 +481,7 @@ async def _write(
                     "  A failure was SUSPECTED but not established. Measure it if you "
                     "can; until then it is a named gap on an open row, not a finding."
                 )
-            return 0
+            return committed_code
     except DatabaseIntegrityError as exc:
         print(f"pr_verification: refusing to write — {exc}", file=sys.stderr)
         return 1
@@ -456,7 +496,7 @@ async def _write(
                 f"{pr_number}`.",
                 file=sys.stderr,
             )
-            return 0
+            return committed_code
         # A lock held past busy_timeout, a malformed file, a full disk: the ledger
         # declined, which is exit 1 by this tool's contract — not a traceback. Each
         # writer commits in one statement, and none had committed, so nothing was

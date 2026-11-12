@@ -239,6 +239,7 @@ def _target_patterns() -> list[tuple[str, ...]]:
     ghome = os.path.expanduser(os.environ.get("GENESIS_HOME") or "~/.genesis")
     bases = [(base, _CLAUDE_TARGETS) for base in claude_bases]
     bases.append((ghome, _GENESIS_HOME_TARGETS))
+    bases.append((os.path.join(home, ".config", "genesis"), ("secrets.env",)))
     patterns: set[tuple[str, ...]] = set()
 
     def literal(path: str) -> tuple[str, ...]:

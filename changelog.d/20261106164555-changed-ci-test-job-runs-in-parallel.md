@@ -1,0 +1,1 @@
+- CI's `test` job runs the suite on four pytest-xdist workers (`-n 4 --dist=loadfile --max-worker-restart=0`). In 6 measured runs the test step's median was 33 minutes, against 117 serially, with the same tests run. The job keeps its name, its single junit report and the skip ceiling.

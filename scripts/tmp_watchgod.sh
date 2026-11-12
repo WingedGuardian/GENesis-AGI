@@ -21,11 +21,12 @@
 #   YELLOW  log attribution once per episode: who is writing, and where the
 #           space went.
 #   ORANGE  reclaim: on the $HOME filesystem start genesis-disk-hygiene-
-#           pressure@standard (caches, ~/tmp older than 2 days, live writers
+#           pressure@standard (caches, ~/tmp older than 4 days, live writers
 #           spared); on cc-tmp's, run the retention sweep at 2 days. Page a
 #           WARNING.
 #   RED     release the reserve file, start genesis-disk-hygiene-pressure@
-#           last-resort, page EMERGENCY with attribution. On cc-tmp's own
+#           last-resort (~/tmp older than 2 days), page EMERGENCY with
+#           attribution. On cc-tmp's own
 #           volume, release its small reserve (CC_RESERVE_NAME) instead, a
 #           poll later when the runaway response has just emptied a file
 #           there (that RED was measured before the emptying freed the space).

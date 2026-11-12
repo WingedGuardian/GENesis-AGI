@@ -86,6 +86,24 @@ def mount_digest(path: Path) -> str:
     return hashlib.sha256("\n".join(sorted(mounts)).encode()).hexdigest()
 
 
+def _process_state(directory: Path, pid: int, *, allow_zombie=False):
+    """PID, start and parent: proc_pid_stat(5), fields1,22,4.
+
+    Only an actual OwnedChild may retain Z identity; default live scope proof
+    still refuses it. Identity alone never supplies a terminal wait result.
+    https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
+    """
+    if type(allow_zombie) is not bool:
+        raise ValueError("invalid owned zombie identity selection")
+    process = (directory / "stat").read_text()
+    tail = process.rpartition(") ")[2].split()
+    if _NUMBER(process.split(" ", 1)[0], "reporter pid") != pid or len(tail) < 20:
+        raise ValueError("reporter process identity mismatch or start unavailable")
+    if tail[0] in ("X", "x") or (tail[0] == "Z" and not allow_zombie):
+        raise ValueError("scope subject has already ended")
+    return pid, _NUMBER(tail[19], "reporter start"), _NUMBER(tail[1], "reporter parent")
+
+
 class ScopeProbe:
     """Read actual scope proof; proc injection is a Python fixture seam only."""
 
@@ -105,8 +123,18 @@ class ScopeProbe:
             ):
                 raise ValueError("queued route does not match provider")
 
-    def capture(self) -> dict:
-        member_path, mount_path = self.proc / "self/cgroup", self.proc / "self/mountinfo"
+    def capture(self, *, pid=None) -> dict:
+        if pid is not None and (type(pid) is not int or not 0 < pid < 2**32):
+            raise ValueError("invalid explicit scope subject")
+        subject = self.proc / ("self" if pid is None else str(pid))
+        actual_pid = os.getpid() if pid is None else pid
+        process = _process_state(subject, actual_pid)
+        if pid is not None and process[2] != os.getpid():
+            raise ValueError("scope subject is not the original owner's direct child")
+        boot_path = self.proc / "sys/kernel/random/boot_id"
+        boot = str(uuid.UUID(boot_path.read_text().strip()))
+        member_path, mount_path = subject / "cgroup", subject / "mountinfo"
+        membership = member_path.read_text()
         if self.route is None:
             _ADMISSION["verify_workload_scope"](
                 self.unit,
@@ -118,33 +146,30 @@ class ScopeProbe:
                                        or leaf.parent.name != self.route[1]):
             raise ValueError("batch is outside its explicitly reserved slice and scope")
         mounts_sha256 = mount_digest(mount_path)
+        if pid is not None and mounts_sha256 != mount_digest(self.proc / "self/mountinfo"):
+            raise ValueError("scope subject has another visible cgroup mount mapping")
         if version != 2:
             raise ValueError("hierarchical v2 proof required")
         leaf_identity = _identity(leaf)
+        root_identity = _identity(root)
+        if pid is not None:
+            _, owner_root, owner_version = _ADMISSION["resolve_cgroup"](self.proc / "self/cgroup", self.proc / "self/mountinfo")
+            if owner_version != version or _identity(owner_root) != root_identity:
+                raise ValueError("scope subject has another visible cgroup root")
         memory_max = _NUMBER((leaf / "memory.max").read_text(), "memory.max")
         swap_max = _NUMBER((leaf / "memory.swap.max").read_text(), "memory.swap.max")
-        adjustment = int((self.proc / "self/oom_score_adj").read_text())
+        adjustment = int((subject / "oom_score_adj").read_text())
         if memory_max != self.cap or swap_max != 0 or not -1000 <= adjustment < 1000:
             raise ValueError("scope limit or reporter protection mismatch")
-        process = (self.proc / "self/stat").read_text()
-        if _NUMBER(process.split(" ", 1)[0], "reporter pid") != os.getpid():
-            raise ValueError("reporter process identity mismatch")
-        tail = process.rpartition(") ")[2].split()
-        if len(tail) < 20:
-            raise ValueError("reporter process start unavailable")
         reporter = {
-            "pid": os.getpid(),
-            "start_ticks": _NUMBER(tail[19], "reporter start"),
-            "boot_id": str(
-                uuid.UUID((self.proc / "sys/kernel/random/boot_id").read_text().strip())
-            ),
+            "pid": actual_pid, "start_ticks": process[1], "boot_id": boot,
         }
         result = {
             "version": version,
             "leaf": leaf_identity,
-            "root": _identity(root),
+            "root": root_identity,
             "reporter": reporter,
-            "membership": member_path.read_text(),
+            "membership": membership,
             "mounts_sha256": mounts_sha256,
             "memory_max": memory_max,
             "swap_max": swap_max,
@@ -164,8 +189,11 @@ class ScopeProbe:
             if parent == root:
                 break
             parent = parent.parent
-        if _identity(leaf) != leaf_identity:
-            raise ValueError("scope identity changed while sampling")
+        if (_identity(leaf) != leaf_identity or _identity(root) != root_identity
+                or _process_state(subject, actual_pid) != process
+                or str(uuid.UUID(boot_path.read_text().strip())) != boot
+                or member_path.read_text() != membership or mount_digest(mount_path) != mounts_sha256):
+            raise ValueError("scope subject or kernel identity changed while sampling")
         return result
 
     def _threads(self, facts: dict) -> list[int]:
@@ -179,6 +207,8 @@ class ScopeProbe:
         return threads
 
     def finality(self, facts: dict) -> dict | None:
+        if facts["reporter"]["pid"] != os.getpid():
+            raise ValueError("finality requires the current reporter")
         leaf = Path(facts["leaf"]["path"])
         if _identity(leaf) != facts["leaf"]:
             raise ValueError("scope identity changed")

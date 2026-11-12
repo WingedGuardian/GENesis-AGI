@@ -305,6 +305,26 @@ def test_set_rejects_bad_repo(client):
     assert resp.status_code == 422
 
 
+def test_a_missing_secrets_file_is_refused_with_409_and_never_created(client, tmp_path):
+    """The dashboard edits secrets.env but never creates it: only bootstrap,
+    install and restore do. The backup route must surface that as 409."""
+    absent = tmp_path / ".config/genesis/secrets.env"
+    with (
+        patch(f"{_SEC}._key_value", return_value=""),
+        patch(f"{_SEC}.secrets_path", return_value=absent),
+        patch(f"{_BK}._set_timer_enabled", return_value=True) as en,
+        patch.dict("os.environ", {}, clear=False),
+    ):
+        resp = client.post(
+            "/api/genesis/backup/config",
+            json={"repo": "https://github.com/u/backups.git", "tier2_backend": "none"},
+        )
+    assert resp.status_code == 409, resp.get_data(as_text=True)
+    assert "bootstrap" in resp.get_json()["error"]
+    assert not absent.parent.exists()
+    en.assert_not_called()
+
+
 # ── POST happy paths ──────────────────────────────────────────────────
 def test_set_writes_env_and_enables_timer(client):
     with (

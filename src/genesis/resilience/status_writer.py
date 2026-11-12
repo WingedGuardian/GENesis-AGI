@@ -184,6 +184,20 @@ class StatusFileWriter:
         if scheduler_heartbeats:
             data["scheduler_heartbeats"] = scheduler_heartbeats
 
+        # Liveness pulses for the standalone health MCP, which has no runtime of
+        # its own (snapshots/surplus.py). This is last_SUCCESS, the value the
+        # in-process liveness check reads; scheduler_heartbeats above carries
+        # last_run, which a failed dispatch also sets. Only real strings are
+        # written, so a mock runtime never reaches json.dumps.
+        try:
+            rt_inst = self._runtime
+            if rt_inst is not None:
+                pulse = rt_inst.job_health.get("surplus_dispatch", {}).get("last_success")
+                if isinstance(pulse, str):
+                    data["liveness_pulses"] = {"surplus_dispatch": pulse}
+        except Exception:
+            pass
+
         # Reflex-arc ingestor counters — lets the standalone health MCP (a
         # separate process reading this file) surface live nerve state. The
         # isinstance guard is load-bearing: a non-dict (absent ingestor, mock

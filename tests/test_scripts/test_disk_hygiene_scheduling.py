@@ -35,6 +35,7 @@ prune_guard_corpus() { :; }
 prune_browser_backups() { :; }
 prune_camoufox_engines_step() { :; }
 rotate_mcp_logs() { :; }
+reset_failed_transient_units() { :; }
 main "$MODE"
 '''
     result = subprocess.run(

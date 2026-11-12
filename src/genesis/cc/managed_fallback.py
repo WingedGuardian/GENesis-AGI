@@ -9,6 +9,7 @@ from html import escape
 
 from genesis.cc import fallback_recovery, fallback_state, peer_availability, roster
 from genesis.cc.exceptions import (
+    CCMemoryPressureError,
     CCProcessError,
     CCQuotaExhaustedError,
     CCRateLimitError,
@@ -31,6 +32,10 @@ async def database_path(db) -> str:
 
 async def _observe_home(runner, home, provider, error=None):
     """Forward current-home evidence; callers already classify refusals."""
+    from genesis.cc.provider_readiness import contained_provider
+
+    if contained_provider():
+        return
     if provider != home or roster.active_model() != home:
         return
     observer = getattr(runner._rt, "_cc_invoker", None)
@@ -125,7 +130,10 @@ def _refusal(error):
         seen.add(id(error))
         chain.append(error)
         error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
-    if any(peer_availability._mentions_mcp(exc) for exc in chain):
+    if any(
+        isinstance(exc, CCMemoryPressureError) or peer_availability._mentions_mcp(exc)
+        for exc in chain
+    ):
         return None
     return next((exc for exc in chain if peer_availability.is_provider_refusal(exc)), None)
 
@@ -199,6 +207,10 @@ async def execute_selected(runner, request, sid, invocation, on_event):
 
 async def record_fallback(db, provider, model, *, success):
     """Non-routing last observation; no task/response/provider-error content."""
+    from genesis.cc.provider_readiness import contained_provider
+
+    if contained_provider():
+        return
     try:
         async with get_raw_db(await database_path(db)) as owned:
             await record_last_run(
@@ -216,6 +228,10 @@ async def record_fallback(db, provider, model, *, success):
 async def record_managed_outcome(runner, sid, result):
     """Called only after native classification and terminal receipt commit."""
     from genesis.cc.managed_session import metadata
+    from genesis.cc.provider_readiness import contained_provider
+
+    if contained_provider():
+        return
 
     try:
         db = runner._session_manager.db

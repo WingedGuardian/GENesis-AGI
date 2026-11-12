@@ -115,7 +115,7 @@ def test_late_control_conflict_at_accepted_trial_revokes_safety_without_reaccoun
     old, claimed, reservation, registration, closure = _accepted(queue, tmp_path)
     before = queue.execution_status(claimed["context"])
     with pytest.raises(RuntimeError, match="conflict"):
-        control._publish(queue, claimed, {**closure, "observed_ns": registration["stop_usec"] + closure["observed_ns"]})
+        control._publish(queue, claimed, {**closure, "observed_ns": time.monotonic_ns()})
     assert _held(queue, claimed)
     after = queue.execution_status(claimed["context"])
     for field in ("terminal", "typed_applied_state", "typed_charged_attempts", "disposition"):
