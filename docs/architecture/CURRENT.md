@@ -2974,7 +2974,10 @@ verified: c712f1bde 2026-11-06
   merge's first parent and at the merge, prints ids, verdicts and `Protects`
   lines only, and the validating-merges skill ("The holdout check") maps the
   verdicts into the evidence document. The session observer records nothing for
-  that subagent, so its work stays out of memory. An install without the file
+  that subagent, so its work stays out of memory. An advisory hook,
+  `scripts/hooks/holdout_fence.py`, records any other agent reaching the
+  directory or receiving its text, and the runner names the scenarios those
+  exposures may have spoiled. An install without the file
   has no holdout and the runner says so. Format and rules:
   `docs/reference/holdout.md`.
 - **Post-merge verification obligations** (shipped; producer automatic; consumer

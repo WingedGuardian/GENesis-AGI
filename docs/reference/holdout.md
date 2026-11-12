@@ -139,10 +139,30 @@ method this repository allows.
 
 For the install's own holdout, the runner also prints one line about the
 holdout fence, an advisory hook that records any agent but the writer reaching
-the holdout (`scripts/hooks/holdout_fence.py`, added separately): "not
-installed in this checkout" until that hook exists, then the count of exposures
-it recorded in `$GENESIS_HOME/logs/holdout-exposures.jsonl` (reads, writes,
-accesses and content; never rotated), or that the log is missing or unreadable. The
+the holdout (`scripts/hooks/holdout_fence.py`): "not installed in this
+checkout" when that hook is absent, otherwise the count of exposures it recorded
+in `$GENESIS_HOME/logs/holdout-exposures.jsonl` (reads, writes, accesses and
+content; never rotated), or that the log is missing or unreadable. A result that
+only names the directory is recorded as activity, not an exposure, when two
+things hold. The result contains no line (six characters or more) of any file in
+the holdout, checked against the files. And the call is a shell command made
+only of commands that print names or their own arguments, run directly, on the
+holdout or on a directory above it: `ls`, `du`, `stat`, `readlink`, `realpath`,
+`basename`, `dirname`, `find` or `fd` with no action, `echo`, `printf`, `cd`,
+`pwd`, and the filters `sort`, `head`, `tail`, `wc`, `uniq`, `cut`, `column` and
+`tr` when they read only their input. A command using an option that opens,
+writes or runs something (`--files0-from`, `--exclude-from`, `sort -o`, and the
+like) does not qualify. Nor does one with a redirect to anything but
+`/dev/null` or a descriptor, an expansion other than `$HOME` and
+`$GENESIS_HOME`, or a command given by a path outside the system directories:
+a names-only command writes no file, and a redirect's target cannot be resolved
+from the command's text once a `cd`, `$PWD` or a symlink is involved. From any
+other call the result is an exposure: a recursive `grep`, `find … | xargs head`,
+a wrapper, a substitution, `eval`, `tree`, `git` or `gh`, or another tool's
+result can print scenario lines under that path. A read or a write that leaves
+no path or scenario text in a result is seen only if the PreToolUse half
+classifies the command, and that half's known gaps are listed in the hook's
+"WHAT IT CANNOT SEE". The
 "installed" test is the hook file's presence in the checkout. Accesses by an
 agent declaring itself `holdout-writer` are counted separately. One that is no
 later than the day after the newest `Author` date in the file is only counted:
