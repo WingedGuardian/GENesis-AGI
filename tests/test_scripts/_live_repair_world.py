@@ -10,6 +10,7 @@ in this directory's conftest.py.
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import json
 import os
@@ -35,6 +36,16 @@ KIT_FILES = (
     "deploy_marker.sh",
     "alert_queue.sh",
 )
+
+
+@functools.cache
+def _installer():
+    """scripts/lib/live_repair_kit.py, loaded by path (it is run as a script)."""
+    spec = importlib.util.spec_from_file_location("_live_repair_kit", LIB / "live_repair_kit.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _git_env(home: Path | None = None) -> dict[str, str]:
@@ -182,6 +193,8 @@ class World:
         kit.mkdir(parents=True, exist_ok=True)
         for name in KIT_FILES:
             shutil.copy2(LIB / name, kit / name)
+        # KIT.json as the installer writes it, through its own hasher (#3492 D2a).
+        (kit / "KIT.json").write_text(json.dumps(_installer().describe(str(kit), KIT_FILES)))
         return kit
 
     def repair(

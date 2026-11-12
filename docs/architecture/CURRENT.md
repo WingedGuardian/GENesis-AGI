@@ -5069,9 +5069,23 @@ logger or unrelated exceptions with copied text and no provenance.
   **The live-move repair** (`scripts/lib/live_move_repair.py`, #3492 PR D1;
   `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS | --restore TS
   [--check]] [--explain]`; `--restore`, below
-  runs the copy bootstrap installs under `~/.genesis/lib/live-repair/current`,
-  never the checkout's; installing that kit, and running the repair at every
-  server start, is PR D2, not yet built; `--explain` needs no kit: with none
+  runs the installed kit, never the checkout's copy: `scripts/lib/live_repair_kit.py
+  install <repo> <home>` (#3492 D2a) writes the files named by `KIT_SOURCES` (one
+  literal tuple in the repair module, read with ast) from HEAD's blobs on main or
+  `live` into `~/.genesis/lib/live-repair.d/<kit_id>/` with a `KIT.json` of their
+  object ids, swaps the `live-repair/current` link by rename, and keeps two kits
+  (the prune skips one whose KIT.json is flocked; the repair takes that shared
+  hold from D2a-2 on); `status` reports ok,
+  missing, foreign, corrupt, partial or stale. bootstrap, `deploy_code_only.sh`
+  (past its update-state refusal) and the update's rollback (when the code restore
+  succeeded) install it, never fatally: the installed kit is HEAD's at the last
+  successful install, so it can be newer than the code that wrote the update state
+  (an update killed after its bootstrap; a rollback to a tag from before the
+  installer, whose install fails and keeps the newer kit), and it must read the
+  previous release's state. repair-move resolves `current` physically and runs
+  `python3 -I -S -B`, and the module's own directory is a realpath, so a run stays on
+  the kit it started from. Running the repair at every server start is D2a-2, not
+  yet built; `--explain` needs no kit: with none
   installed it runs the module as HEAD committed it, from memory, never the
   working tree's copy, which may itself be half-written) heals a live row's `mixed_tree`
   toward the rollback tag, never toward the target (with HEAD on `live` at the

@@ -41,7 +41,22 @@ import sys
 import time
 import types
 
-_LIB = os.path.dirname(os.path.abspath(__file__))
+# realpath: a run through the kit's `current` link stays on the versioned kit it
+# started from, even if an install swaps `current` meanwhile (#3492 D2).
+_LIB = os.path.dirname(os.path.realpath(__file__))
+#: Every file the kit loads from _LIB, this one included: the one list the
+#: installer (live_repair_kit.py, which reads it with ast) installs.
+KIT_SOURCES = (
+    "live_move_repair.py",
+    "update_state_guard.py",
+    "deploy_checkout.sh",
+    "deploy_marker.sh",
+    "alert_queue.sh",
+    "live_move_restore.py",
+    "live_move_restore_runs.py",
+    "live_move_restore_rows.py",
+    "live_move_restore_write.py",
+)
 BOOT_BUDGET_S = 60  # every wait at boot, inside systemd's default 90 s start timeout
 _POLL_S = 1.0
 LOCK_FRESH_S = 30  # see _held_open; under BOOT_BUDGET_S, so a boot just after a kill still heals
