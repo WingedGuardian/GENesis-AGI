@@ -756,15 +756,46 @@ class Repair:
         locks = self._checkout_locks(deadline)
         if locks is None:
             return 1 if os.path.lexists(self.state_path) else 0  # no state: a later run retries
+        # Each pending entry is judged against the refs as this run found them
+        # (superseded is written now); restore-hooks, which runs the checkout
+        # code, waits for the heal (#4367).
+        owed = [path for path in pending if self._judge_pending(path)]
+        if not os.path.lexists(self.state_path):
+            self._retry_pending(owed)
+            self._say("nothing to repair: there is no update state")
+            return 0
+        rc = self._judge_state(locks[0])
+        self._retry_pending(owed)
+        return rc
+
+    def _judge_pending(self, path: str) -> bool:
+        try:
+            return self._retry_hooks(path, act=False)
+        except (OSError, RepairError) as exc:  # one report never stops the heal below
+            _log(f"the git hooks retry for {path} was not recorded ({exc})")
+            return False
+
+    def _retry_pending(self, pending: list[str]) -> None:
+        """The pending hooks retries, after the heal and only on a SAFE tree
+        (#4367): restore-hooks runs the checkout's engine and sync-hooks.sh,
+        which a half-written tree may hold part of another commit's bytes for,
+        and a tree a held state still guards a hand edit. A later run retries
+        them. Each entry is judged again first (the heal may have moved
+        `live`). A forward heal's own restore-hooks is not one of these: it runs
+        inside the heal once the files are the tag's."""
+        if not pending:
+            return
+        if os.path.lexists(self.state_path):
+            verdict, _ = self.guard.verdict(self.state_path, self.repo)
+            if verdict != self.guard.SAFE:
+                for path in pending:
+                    _log(f"the git hooks retry for {path} waits: the checkout is {verdict}")
+                return
         for path in pending:
             try:
                 self._retry_hooks(path)
-            except (OSError, RepairError) as exc:  # one report never stops the heal below
+            except (OSError, RepairError) as exc:  # one report never stops another
                 _log(f"the git hooks retry for {path} was not recorded ({exc})")
-        if not os.path.lexists(self.state_path):
-            self._say("nothing to repair: there is no update state")
-            return 0
-        return self._judge_state(locks[0])
 
     def _checkout_locks(self, deadline: float) -> list[str] | None:
         """genesis-checkout.lock, then no process holding a git lock; the git
@@ -1390,7 +1421,7 @@ class Repair:
         found = [os.path.join(self.backups, n, "REPAIR.json") for n in kept]
         return [p for p in found if (self._report(p) or {}).get("hooks") == "pending"]
 
-    def _retry_hooks(self, path: str) -> None:
+    def _retry_hooks(self, path: str, act: bool = True) -> bool:
         """A forward repair's hooks not yet put back. Superseded once
         `refs/heads/live` itself left that repair's tag (whatever moved it owns
         the hooks now); retried while `live` is there and HEAD is on it; with
@@ -1401,13 +1432,15 @@ class Repair:
         user-writable, so its commits must be full commit ids before they reach
         restore-hooks' argv; an entry whose are not is left as it is. Read
         through load_report: a report it refuses (another checkout's, a symlink,
-        a name the repair never writes, over its caps) is never retried."""
+        a name the repair never writes, over its caps) is never retried.
+        With ``act`` false the entry is judged as above (superseded is
+        written) but restore-hooks is not run: True says it is owed now."""
         manifest = self._report(path)
         if manifest is None or manifest.get("hooks") != "pending":
-            return
+            return False
         tag, other = manifest.get("tag"), manifest.get("other")
         if not all(isinstance(c, str) and _COMMIT.fullmatch(c) for c in (tag, other)):
-            return
+            return False
         live = _out(
             self.repo, "rev-parse", "--verify", "-q", "refs/heads/live^{commit}", check=False
         )
@@ -1415,7 +1448,9 @@ class Repair:
         if live != tag:
             hooks = "superseded"
         elif branch != "refs/heads/live":  # HEAD on `live` is then the tag too
-            return
+            return False
+        elif not act:
+            return True
         else:
             note = manifest.get("hooks_note")
             hooks = self._put_hooks_back(os.path.dirname(path), manifest, other, tag)
@@ -1424,9 +1459,10 @@ class Repair:
                 key = f"live_move_repair:{manifest.get('ts')}:hooks"
                 self._alert(severity, manifest["hooks_note"], key, os.path.dirname(path))
             if hooks == "pending":
-                return
+                return False
         write_json(path, {**manifest, "hooks": hooks}, private=True)
         _log(f"the git hooks of {path} are {hooks}")
+        return False
 
     def _put_hooks_back(self, backup: str, manifest: dict, before: str, after: str) -> str:
         """restore-hooks from ``before`` to ``after`` (the tag): "ok", or
