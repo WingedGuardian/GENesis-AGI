@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import secrets
 import uuid
@@ -36,6 +37,34 @@ def holds_secret(project_type: str | None, domain: str | None) -> bool:
     )
 
 
+def _reference_row(project_type: str | None, domain: str | None) -> bool:
+    """A row of the reference store (any ``reference.*`` kind)."""
+    return (project_type or "").strip().lower() == "reference" and (
+        (domain or "").strip().lower().startswith("reference.")
+    )
+
+
+async def _insert_secret(
+    db: aiosqlite.Connection, value: str, detail: str | None, meta: str | None = None,
+) -> str:
+    """Insert one reference_secrets row under a fresh random id; return the id."""
+    secret_ref = secrets.token_hex(16)
+    await db.execute(
+        "INSERT INTO reference_secrets (id, value, detail, created_at, meta) VALUES (?, ?, ?, ?, ?)",
+        (secret_ref, value, detail, datetime.now(UTC).isoformat(), meta),
+    )
+    return secret_ref
+
+
+async def get_secret_meta(db: aiosqlite.Connection, secret_ref: str | None) -> str | None:
+    """The caller metadata (JSON text) held in the reference_secrets row
+    ``secret_ref``, or None."""
+    if not secret_ref:
+        return None
+    rows = await db.execute_fetchall("SELECT meta FROM reference_secrets WHERE id = ?", (secret_ref,))
+    return rows[0][0] if rows else None
+
+
 def _canonical_key(project_type: str, domain: str) -> tuple[str, str]:
     """A credential row's project and domain in their one stored spelling, so
     every reader that compares them exactly (the lookup, delete, the audit log)
@@ -49,7 +78,7 @@ class CredentialKeyTaken(ValueError):  # noqa: N818 - names the state, not an er
     """An insert-only credential write found its key holding a different value.
 
     Nothing was written. The caller picks another key and tries again
-    (for auto-capture, which a later change wires to it: a rotated password
+    (for uploads and distillation, ``ingest_untrusted_credential``: a rotated password
     would add an entry, never replace one)."""
 
 
@@ -72,6 +101,8 @@ class KeyObservation:
     value: str | None
     #: The held-out description beside that value (None: none stored).
     detail: str | None = None
+    #: The caller metadata held beside them (JSON text, None: none stored).
+    meta: str | None = None
 
     @property
     def absent(self) -> bool:
@@ -84,12 +115,12 @@ async def _credential_row(
     """(id, secret_ref, the value it names or None, qdrant_id, the held-out
     description or None) of the row holding the key."""
     rows = await db.execute_fetchall(
-        "SELECT k.id, k.secret_ref, s.value, k.qdrant_id, s.detail FROM knowledge_units k "
+        "SELECT k.id, k.secret_ref, s.value, k.qdrant_id, s.detail, s.meta FROM knowledge_units k "
         "LEFT JOIN reference_secrets s ON s.id = k.secret_ref "
         "WHERE k.project_type = ? AND k.domain = ? AND k.concept = ?",
         (project_type, domain, concept),
     )
-    return tuple(rows[0][:5]) if rows else None
+    return tuple(rows[0][:6]) if rows else None
 
 
 async def observe_credential_key(
@@ -103,7 +134,7 @@ async def observe_credential_key(
     row = await _credential_row(db, project_type, domain, concept)
     if row is None:
         return KeyObservation(None, None, None, None)
-    return KeyObservation(row[0], row[1], row[3], row[2], row[4])
+    return KeyObservation(row[0], row[1], row[3], row[2], row[4], row[5])
 
 
 def _still_observed(row: tuple | None, expected: KeyObservation) -> bool:
@@ -156,6 +187,61 @@ async def check_credential_write(
             "this credential key already holds a different value (#2426)"
         )
     return existing[0] if existing else None
+
+
+async def find_masked_key(
+    db: aiosqlite.Connection, *, project_type: str, domain: str, base: str,
+    identifier: str | None = None,
+) -> str | None:
+    """The key ``"{base} #xxxxxx"`` (the tag ``ingest_knowledge_unit`` adds to
+    a masked identifier) of an existing credential, or None. The masked
+    identifier is the entry's identity: a write under it updates that entry,
+    with the same value or a rotated one (#2426, owner ruling).
+
+    ``identifier`` (an identifier that had to be cut): only an entry whose
+    held meta records this same full identifier (line breaks read as spaces)
+    matches, so two identifiers cut to the same text stay two entries. Only
+    rows sharing ``base`` are read."""
+    project_type, domain = _canonical_key(project_type, domain)
+    escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    rows = await db.execute_fetchall(
+        "SELECT k.concept, s.meta FROM knowledge_units k LEFT JOIN reference_secrets s "
+        "ON s.id = k.secret_ref WHERE k.project_type = ? AND k.domain = ? "
+        "AND k.concept LIKE ? ESCAPE '\\' ORDER BY k.ingested_at",
+        (project_type, domain, escaped + " #%"),
+    )
+    tag = re.compile(re.escape(base) + r" #[0-9a-f]{6}")
+    for concept, meta in rows:
+        if not tag.fullmatch(concept):
+            continue
+        if identifier is None or _meta_identifier(meta) == identifier:
+            return concept
+    return None
+
+
+def _meta_identifier(meta: str | None) -> str | None:
+    """The full identifier a secret row's meta records, flattened."""
+    try:
+        given = json.loads(meta).get("identifier") if meta else None
+    except (ValueError, AttributeError):
+        return None
+    return " ".join(given.splitlines()) if isinstance(given, str) else None
+
+
+async def masked_key_rows(
+    db: aiosqlite.Connection, *, project_type: str, domain: str,
+) -> list[tuple[str, str, str | None]]:
+    """(concept, value, detail) of every credential stored under a masked
+    identifier's key (``"... #xxxxxx"``, the tag ``ingest_knowledge_unit``
+    adds), for resolving which entry an identifier names."""
+    project_type, domain = _canonical_key(project_type, domain)
+    rows = await db.execute_fetchall(
+        "SELECT k.concept, s.value, s.detail FROM knowledge_units k JOIN reference_secrets s "
+        "ON s.id = k.secret_ref WHERE k.project_type = ? AND k.domain = ? AND k.concept LIKE '% #______'",
+        (project_type, domain),
+    )
+    tagged = re.compile(r".* #[0-9a-f]{6}", re.DOTALL)
+    return [(r[0], r[1], r[2]) for r in rows if tagged.fullmatch(r[0])]
 
 
 async def get_reference_pair(
@@ -519,6 +605,7 @@ async def upsert(
     origin_class: str | None = None,
     secret_value: str | None = None,
     secret_detail: str | None = None,
+    secret_meta: str | None = None,
     insert_only: bool = False,
     expected: KeyObservation | None = None,
     _commit: bool = True,
@@ -527,7 +614,8 @@ async def upsert(
 
     ``secret_value`` is a credential reference's value, held out of ``body``
     (#2426, ``reference_ops.split_secret``), and ``secret_detail`` its held-out
-    description. Both go into ONE new ``reference_secrets`` row under a fresh
+    description, and ``secret_meta`` the caller metadata held with them. All go
+    into ONE new ``reference_secrets`` row under a fresh
     random id, and then ONE statement
     writes the unit row naming that id in ``secret_ref``. The body and the
     secret it names are therefore always one writer's pair, however this
@@ -538,8 +626,10 @@ async def upsert(
     restored, and nothing is mispaired. The triggers of
     ``secret_ref_trigger_ddl`` refuse a credential row that names no secret and
     retire the secret a unit stops naming. None keeps the row's current secret
-    (a re-ingest of a held-out body); passing one for a row that is not a
-    credential reference is a ValueError.
+    (a re-ingest of a held-out body). Another reference kind may pass one too
+    (its caller holds the value out, ``ingest_knowledge_unit(held_value=...)``):
+    the same secret row is written and named; a row that is not a reference
+    passing one is a ValueError.
 
     ``expected`` (a credential write's own earlier read of its key, which
     ``ingest_knowledge_unit`` takes before it stores the vector): the write is
@@ -551,7 +641,7 @@ async def upsert(
     still naming the observed secret and point. Ignored with ``insert_only``,
     which never changes an existing row anyway.
 
-    ``insert_only`` (for auto-capture; no writer passes it yet): a credential key that already exists is
+    ``insert_only`` (uploads and distillation): a credential key that already exists is
     never changed. If it holds the same value the call is a no-op that returns
     ``(existing_id, False)``; if it holds a different one, ``CredentialKeyTaken``
     is raised and nothing is written, so the caller tries another key.
@@ -579,8 +669,8 @@ async def upsert(
     """
     refuse_inline_secret(project_type, domain, body)
     credential = holds_secret(project_type, domain)
-    if secret_value is not None and not credential:
-        raise ValueError("secret_value is only held for a credential reference (#2426)")
+    if secret_value is not None and not _reference_row(project_type, domain):
+        raise ValueError("secret_value is only held for a reference row (#2426)")
     if secret_detail is not None and secret_value is None:
         # A detail is only ever written with a value, in the same new row.
         raise ValueError("secret_detail is held only beside a secret_value (#2426)")
@@ -618,22 +708,25 @@ async def upsert(
                 )
             return existing[0], False
         else:
-            secret_ref = secrets.token_hex(16)
-            await db.execute(
-                "INSERT INTO reference_secrets (id, value, detail, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (secret_ref, secret_value, secret_detail, datetime.now(UTC).isoformat()),
-            )
+            secret_ref = await _insert_secret(db, secret_value, secret_detail, secret_meta)
+    elif secret_value is not None:
+        # Another reference kind with a held-out value: the same one-row secret,
+        # named by secret_ref. None of the credential invariants (the triggers,
+        # the compare-and-swap) apply; one statement still pairs body and secret.
+        secret_ref = await _insert_secret(db, secret_value, secret_detail, secret_meta)
 
     cas = credential and expected is not None and not insert_only
     if insert_only or (cas and expected.absent):
         on_conflict = "DO NOTHING"
     else:
         # A new secret repoints the row (the repoint trigger retires the old
-        # secret); without one the row keeps the secret it names.
+        # secret); without one a credential keeps the secret it names. Any other
+        # row is repointed always: a write without a held value clears a stale
+        # secret_ref (retired by the trigger), so no reader pairs the new body
+        # with an old secret.
         repoint = (
             ",\n                   secret_ref      = excluded.secret_ref"
-            if secret_value is not None
+            if secret_value is not None or not credential
             else ""
         )
         on_conflict = f"""DO UPDATE SET

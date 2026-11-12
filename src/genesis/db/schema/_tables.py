@@ -1011,7 +1011,8 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             id         TEXT PRIMARY KEY,
             value      TEXT NOT NULL,
             detail     TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            meta       TEXT
         )
     """,
     # Append-only log of the MCP tool calls a labelled client makes (owner-mode

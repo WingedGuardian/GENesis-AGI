@@ -228,53 +228,55 @@ async def test_the_statement_itself_refuses_a_change_after_the_read(db, monkeypa
 
 
 async def test_identifiers_carrying_their_values_never_collide(db):
-    """4527738751: identifiers each containing their own value would both read
-    "router [redacted]" and the second would overwrite the first. Both are
-    refused, and an entry already filed under the redacted key stays intact."""
+    """4527738751, reworked by the owner ruling on #2426 PR A: identifiers each
+    containing their own value both read "router [held]". That masked text is
+    the entry's identity, so the second (a rotation) updates the first under
+    its tagged key, and an entry filed under the bare masked text stays intact."""
     store = _PointStore()
     seeded = await _ingest(
         db,
         store,
         _body("Example router", "password: Seed!Fake0"),
-        concept="router [redacted]",
+        concept="router [held]",
     )
-    for concept, value in (
-        ("router Alpha!Fake1", "Alpha!Fake1"),
-        ("router Beta!Fake2", "Beta!Fake2"),
-    ):
-        with pytest.raises(ValueError, match="identifier must not contain its value") as refused:
-            await _ingest(db, store, _body("Example router", f"password: {value}"), concept=concept)
-        assert value not in str(refused.value)
-    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 1
+    units = [
+        await _ingest(db, store, _body("Example router", f"password: {value}"), concept=f"router {value}")
+        for value in ("Alpha!Fake1", "Beta!Fake2")
+    ]
+    assert units[0] == units[1] and units[0] != seeded
+    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 2
     assert await kc.get_reference_secret(db, seeded) == "password: Seed!Fake0"
-    await _assert_one_named_point(db, store)
+    assert await kc.get_reference_secret(db, units[1]) == "password: Beta!Fake2"
+    assert "Fake" not in (await kc.get(db, units[1]))["concept"]
 
 
-async def test_a_credential_without_an_identifier_is_refused(db):
-    """With no concept the key would be derived from the SCRUBBED body, so two
+async def test_a_credential_without_an_identifier_gets_a_minted_key(db):
+    """With no concept the key would be derived from the HELD body, so two
     credentials differing only in their values would share it (security review
-    of 4527738751's fix). Such a write is refused before any store write."""
+    of 4527738751's fix). Each gets a minted key of its own (#2426 PR A)."""
     store = _PointStore()
-    for value in ("Alpha!Fake1", "Beta!Fake2"):
-        with pytest.raises(ValueError, match="needs an explicit identifier") as refused:
-            await _ingest(db, store, _body("router", f"password: {value}"), concept=None)
-        assert value not in str(refused.value)
-    assert await db.execute_fetchall("SELECT 1 FROM knowledge_units") == []
-    assert store.points == {}
+    units = [
+        await _ingest(db, store, _body("router", f"password: {value}"), concept=None)
+        for value in ("Alpha!Fake1", "Beta!Fake2")
+    ]
+    concepts = {(await kc.get(db, u))["concept"] for u in units}
+    assert len(concepts) == 2 and all(c.startswith("credential #") for c in concepts)
+    assert await kc.get_reference_secret(db, units[1]) == "password: Beta!Fake2"
 
 
-async def test_a_placeholder_re_ingest_whose_identifier_carries_the_stored_value_is_refused(db):
+async def test_a_placeholder_re_ingest_whose_identifier_carries_the_stored_value_moves_to_a_masked_key(db):
     """A key written before this rule (directly, so its identifier carries the
-    value): a placeholder re-ingest pairing with it would keep that identifier as a
-    key, so it is refused, and the old entry keeps its secret."""
+    value): a placeholder re-ingest is stored under the masked identifier with
+    the stored value carried over, and the old entry keeps its secret."""
     legacy = "router Kept!Fake5"
     unit, _ = await kc.upsert(
         db, project_type="reference", domain="reference.credentials", source_doc="x",
         concept=legacy, body=_body("Example router", ro.SECRET_PLACEHOLDER),
         qdrant_id="p-legacy", secret_value="password: Kept!Fake5",
     )
-    with pytest.raises(ValueError, match="identifier must not contain its value"):
-        await _ingest(
-            db, _PointStore(), _body("Example router", ro.SECRET_PLACEHOLDER), concept=legacy,
-        )
+    moved = await _ingest(
+        db, _PointStore(), _body("Example router", ro.SECRET_PLACEHOLDER), concept=legacy,
+    )
+    assert moved != unit and (await kc.get(db, moved))["concept"].startswith("router [held] #")
+    assert await kc.get_reference_secret(db, moved) == "password: Kept!Fake5"
     assert await kc.get_reference_secret(db, unit) == "password: Kept!Fake5"

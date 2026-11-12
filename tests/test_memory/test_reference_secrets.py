@@ -152,14 +152,16 @@ async def test_an_identifier_kind_keeps_its_value_in_the_body(db):
 # ─── refusals and re-ingest ──────────────────────────────────────────────────
 
 
-async def test_a_credential_without_a_value_line_is_refused_before_any_write(db):
+async def test_a_credential_without_a_value_line_holds_its_whole_remainder_out(db):
+    """No 'Value:' line: nothing tells the value from the description, so the
+    whole text after the header is held out as the value (#2426 PR A)."""
     store = _store()
-    with pytest.raises(ValueError, match="Value:"):
-        await _ingest(
-            db, store, f"[reference.credentials] Lab router admin\n\npassword {_PASSWORD}"
-        )
-    store.store.assert_not_awaited()
-    assert await db.execute_fetchall("SELECT 1 FROM knowledge_units") == []
+    unit_id = await _ingest(
+        db, store, f"[reference.credentials] Lab router admin\n\npassword {_PASSWORD}"
+    )
+    assert _PASSWORD not in store.store.await_args.args[0]
+    assert _PASSWORD not in (await kc.get(db, unit_id))["body"]
+    assert await _secret(db, unit_id) == f"password {_PASSWORD}"
 
 
 async def test_a_card_number_is_refused(db):
@@ -289,25 +291,24 @@ async def test_an_odd_domain_spelling_is_held_out_not_refused(db):
 # ─── review round 1 (#3898) ──────────────────────────────────────────────────
 
 
-async def test_an_identifier_carrying_the_value_is_refused(db):
+async def test_an_identifier_carrying_the_value_is_masked_under_a_tagged_key(db):
     """An extraction with no entities derives the identifier from its own text,
-    which can carry the password. The identifier is the entry key, so scrubbing
-    it would file the entry under another key (4527738751): the write is
-    refused, before any store, and the message never carries the value."""
+    which can carry the password. The identifier is stored with the value masked
+    and a random tag, so two such entries never share a key (#2426 PR A)."""
     store = _store()
-    with pytest.raises(ValueError, match="identifier must not contain its value") as refused:
-        await ingest_knowledge_unit(
-            store=store,
-            db=db,
-            content=_body(),
-            project=ro.REFERENCE_PROJECT,
-            domain="reference.credentials",
-            concept=f"router login {_PASSWORD}",
-        )
-    assert _PASSWORD not in str(refused.value)
-    store.store.assert_not_awaited()
-    assert await db.execute_fetchall("SELECT 1 FROM knowledge_units") == []
-    assert await _secret_rows(db) == 0
+    unit_id = await ingest_knowledge_unit(
+        store=store,
+        db=db,
+        content=_body(),
+        project=ro.REFERENCE_PROJECT,
+        domain="reference.credentials",
+        concept=f"router login {_PASSWORD}",
+    )
+    row = await kc.get(db, unit_id)
+    assert row["concept"].startswith("router login [held] #")
+    assert unit_id.concept == row["concept"]
+    assert _PASSWORD not in store.store.await_args.args[0]
+    assert await _secret(db, unit_id) == _VALUE
 
 
 async def test_the_db_layer_refuses_a_second_value_line_after_the_placeholder(db):
@@ -333,25 +334,27 @@ async def test_the_db_layer_refuses_a_second_value_line_after_the_placeholder(db
         )
 
 
-def test_a_description_carrying_the_value_marker_is_refused():
-    with pytest.raises(ValueError, match="exactly one"):
-        ro.split_secret(_body(description="note\n\nValue: tail-fake"))
+def test_a_description_carrying_the_value_marker_holds_out_more():
+    """Both this split and parse_reference_body cut at the FIRST marker: the
+    rest of the body, the description's tail included, is held as the value."""
+    held = ro.split_secret(_body(description="note\n\nValue: tail-fake"))
+    assert "tail-fake" not in held.body and _PASSWORD not in held.body
+    assert held.value == f"tail-fake\n\nValue: {_VALUE}" and held.detail == "note"
 
 
-async def test_a_new_credential_with_no_value_to_hold_is_refused(db):
-    """A held-out body under a NEW identifier (or a value equal to the
-    placeholder) brings no secret: refused, nothing written."""
+async def test_a_new_credential_with_no_value_to_hold_is_stored_held_empty(db):
+    """A held-out body under a NEW identifier brings no secret: stored with an
+    empty held value, never refused (#2426 PR A, owner ruling c91c5b74)."""
     held = _body().replace(f"Value: {_VALUE}", f"Value: {kc.SECRET_PLACEHOLDER}")
-    with pytest.raises(ValueError, match="no value to hold"):
-        await ingest_knowledge_unit(
-            store=_store(),
-            db=db,
-            content=held,
-            project=ro.REFERENCE_PROJECT,
-            domain="reference.credentials",
-            concept="brand new",
-        )
-    assert await db.execute_fetchall("SELECT 1 FROM knowledge_units") == []
+    unit = await ingest_knowledge_unit(
+        store=_store(),
+        db=db,
+        content=held,
+        project=ro.REFERENCE_PROJECT,
+        domain="reference.credentials",
+        concept="brand new",
+    )
+    assert await _secret(db, unit) == ""
 
 
 async def test_the_secret_lands_on_the_row_that_survives_the_key_conflict(db):
@@ -409,21 +412,18 @@ async def test_a_point_another_unit_still_names_is_not_deleted(db):
 # ── Round 2: every captured secret, every reference kind, checks before any store ──
 
 
-async def test_a_refused_credential_stores_no_vector(db):
-    """The refusal runs before store.store, so no orphaned point or memory_fts
-    row names a unit that was never written."""
+async def test_a_credential_with_no_value_to_hold_stores_its_vector_with_its_row(db):
     store = _store()
     held = _body().replace(f"Value: {_VALUE}", f"Value: {kc.SECRET_PLACEHOLDER}")
-    with pytest.raises(ValueError, match="no value to hold"):
-        await ingest_knowledge_unit(
-            store=store,
-            db=db,
-            content=held,
-            project=ro.REFERENCE_PROJECT,
-            domain="reference.credentials",
-            concept="brand new",
-        )
-    store.store.assert_not_awaited()
+    unit = await ingest_knowledge_unit(
+        store=store,
+        db=db,
+        content=held,
+        project=ro.REFERENCE_PROJECT,
+        domain="reference.credentials",
+        concept="brand new",
+    )
+    assert (await kc.get(db, unit))["qdrant_id"] == "qid-1"
 
 
 def test_the_project_is_case_folded_like_the_domain():
@@ -463,53 +463,62 @@ def memory_mcp_store(monkeypatch):
 
 
 @pytest.mark.parametrize("domain", ["reference.credentials", "Reference.Credentials"])
-async def test_distillation_refuses_a_credential_unit_before_any_vector(
+async def test_distillation_holds_a_credential_unit_out_before_any_vector(
     memory_mcp_store,
     tmp_path,
     domain,
+    db,
+    monkeypatch,
 ):
-    """4476130424: behaviour, not source order."""
+    """4476130424: behaviour, not source order. The unit goes through the
+    hold-out chokepoint, never refused (#2426 PR A)."""
+    import genesis.mcp.memory_mcp as memory_mod
+    from genesis.knowledge.distillation import KnowledgeUnit
     from genesis.knowledge.manifest import ManifestManager
     from genesis.knowledge.orchestrator import KnowledgeOrchestrator
 
+    monkeypatch.setattr(memory_mod, "_db", db)
     orch = KnowledgeOrchestrator(
         registry=MagicMock(),
         distillation=MagicMock(),
         manifest=ManifestManager(root=tmp_path / "knowledge"),
     )
-    unit = MagicMock()
-    unit.domain = domain
-    with pytest.raises(ValueError, match="credential"):
-        await orch._store_units(
-            [unit],
-            project_type="reference",
-            source="notes.md",
-            content=MagicMock(),
-            purpose=None,
-        )
-    memory_mcp_store.store.assert_not_awaited()
+    unit = KnowledgeUnit(concept="Lab router", body=f"password {_PASSWORD}", domain=domain)
+    ids = await orch._store_units(
+        [unit],
+        project_type="reference",
+        source="notes.md",
+        content=MagicMock(),
+        purpose=None,
+    )
+    assert _PASSWORD not in memory_mcp_store.store.await_args.args[0]
+    assert await _secret(db, ids[0]) == f"password {_PASSWORD}"
 
 
 @pytest.mark.parametrize("domain", ["reference.credentials", "Reference.Credentials"])
-async def test_an_upload_refuses_a_credential_domain_before_any_vector(
+async def test_an_upload_to_a_credential_domain_is_held_out_before_any_vector(
     memory_mcp_store,
     tmp_path,
     domain,
+    db,
+    monkeypatch,
 ):
+    import genesis.mcp.memory_mcp as memory_mod
     from genesis.knowledge.ingest_upload import _store_as_is
 
+    monkeypatch.setattr(memory_mod, "_db", db)
     upload = tmp_path / "creds.txt"
-    upload.write_text("some uploaded text")
-    with pytest.raises(ValueError, match="credential"):
-        await _store_as_is(
-            str(upload),
-            "creds.txt",
-            project_type="reference",
-            domain=domain,
-            purpose=None,
-            context="",
-        )
-    memory_mcp_store.store.assert_not_awaited()
+    upload.write_text(f"router password {_PASSWORD}")
+    ids = await _store_as_is(
+        str(upload),
+        "creds.txt",
+        project_type="reference",
+        domain=domain,
+        purpose=None,
+        context="",
+    )
+    assert _PASSWORD not in memory_mcp_store.store.await_args.args[0]
+    assert await _secret(db, ids[0]) == f"router password {_PASSWORD}"
 
 
 async def _credential_units_without_a_secret(db) -> list:

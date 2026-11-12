@@ -128,9 +128,11 @@ def parse_reference_body(body: str | None) -> dict[str, str]:
 # payload and its embedding) therefore gets only the header (the identifier),
 # DETAIL_PLACEHOLDER, the SECRET_PLACEHOLDER value line and the Tags/Captured
 # trailer. The value and the description go to ONE ``reference_secrets`` row
-# (``value``, ``detail``), a table no recall path reads. The other indexed
-# fields (identifier, tags, authority, provenance) are not scrubbed: a write
-# whose field carries the value is refused (``refuse_value_in_fields``).
+# (``value``, ``detail``), a table no recall path reads. In the other indexed
+# fields (identifier, tags, authority, provenance) every span of the value is
+# MASKED with ``HELD_MASK`` (``mask_value_spans``) and the write goes on: no
+# capture is refused or degraded to keep a secret out of the index (owner
+# ruling, #2426), since the original is already held in reference_secrets.
 
 #: Domains whose value is held out. Identifier kinds (url, network, account,
 #: fact) are not: their value is the thing a lookup searches for.
@@ -138,10 +140,18 @@ SECRET_DOMAINS = frozenset({_CREDENTIAL_DOMAIN})
 # The placeholders live with the db layer's fail-closed check (crud/knowledge.py).
 SECRET_PLACEHOLDER = _CRUD_PLACEHOLDER
 DETAIL_PLACEHOLDER = _CRUD_DETAIL_PLACEHOLDER
+#: What a masked span of a held-out value reads as in an indexed field. Short,
+#: fixed, and no credential keyword, so it is no secret-scanner hit.
+HELD_MASK = "[held]"
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _MIN_TOKEN = 4
 _TOKEN_EDGE = ".,;:!?()[]{}\"'"  # noqa: S105 - punctuation, not a secret
+
+
+_ASCII_DIGIT = re.compile(r"[0-9]")
+_ASCII_ALPHA = re.compile(r"[A-Za-z]")
+_ASCII_SYMBOL = re.compile(r"[^0-9A-Za-z]")
 
 
 def _secret_token(token: str) -> bool:
@@ -150,6 +160,12 @@ def _secret_token(token: str) -> bool:
     words ("password", "Router") and email addresses never qualify."""
     if len(token) < _MIN_TOKEN or _EMAIL.match(token):
         return False
+    if token.isascii():
+        # The same three tests on ASCII, in C (an upload holds out megabytes).
+        has_digit = _ASCII_DIGIT.search(token) is not None
+        has_symbol = _ASCII_SYMBOL.search(token) is not None
+        has_alpha = _ASCII_ALPHA.search(token) is not None
+        return (has_digit or has_symbol) and (has_alpha or (has_digit and has_symbol))
     has_digit = any(c.isdigit() for c in token)
     has_symbol = any(not c.isalnum() for c in token)
     has_alpha = any(c.isalpha() for c in token)
@@ -161,6 +177,9 @@ def _normalise(text: str) -> str:
     compatibility variant reads as its plain form), every format character
     (Unicode category Cf: zero-width spaces and joiners, the soft hyphen)
     removed, then casefolded."""
+    if text.isascii():
+        # NFKC leaves ASCII as it is, and no ASCII character is a format one.
+        return text.casefold()
     folded = unicodedata.normalize("NFKC", text)
     return "".join(c for c in folded if unicodedata.category(c) != "Cf").casefold()
 
@@ -207,7 +226,8 @@ def _value_probes(value: str, *, login_exempt: bool = False) -> list[tuple[str, 
     exempt = login.strip().strip(_TOKEN_EDGE) if login_exempt and sep and secret.strip() else None
     for form in _decoded(whole):
         schemes = {m.group(1).casefold() for m in _SCHEME.finditer(form)}
-        for fragment in _FRAGMENT_SPLIT.split(unicodedata.normalize("NFKC", form)):
+        # Each distinct fragment once (the same output; a long value repeats).
+        for fragment in dict.fromkeys(_FRAGMENT_SPLIT.split(unicodedata.normalize("NFKC", form))):
             fragment = fragment.strip(_TOKEN_EDGE)
             folded = fragment.casefold()
             if (
@@ -221,77 +241,361 @@ def _value_probes(value: str, *, login_exempt: bool = False) -> list[tuple[str, 
     return list(probes.items())
 
 
-def refuse_value_in_fields(
-    value: str, fields: dict[str, str | None], *, message: str | None = None,
-    login_exempt: bool = False,
-) -> None:
-    """Fail closed: raise ValueError when the value, or any secret-shaped token
-    of it (in their normalised and percent-decoded forms), occurs in one of the
-    indexed ``fields``. Nothing is scrubbed. The message names the field, never
-    the value; ``message`` replaces it (the identifier refusal). The body's own
-    placeholder lines are no leak and are left out of the check."""
-    patterns = _probe_patterns(value, login_exempt=login_exempt)
-    for name, text in fields.items():
-        if _carries(patterns, text):
-            raise ValueError(
-                message or (
-                    f"refusing a credential reference whose {name} carries its "
-                    "value; keep the value out of that field (#2426)"
-                )
-            )
+#: Probes up to this long are looked up by every substring length present;
+#: longer ones by their first ``_SHORT`` characters, then verified.
+_SHORT = 32
+#: A run of the value a mask may grow over is at most this long, so growing
+#: costs a bounded check however large the value is.
+_RUN_MAX = 256
+_RUNS_PER_PROBE = 64
+#: Matches spanning more whitespace tokens than this are masked with the whole
+#: field (only a percent-encoded copy of a long multi-word value can need it).
+_WINDOW_MAX = 16
+_TERM_JOINER = re.compile(r"[-_.]")
 
 
-def _probe_patterns(value: str, *, login_exempt: bool = False) -> list[re.Pattern[str]]:
-    return [
-        re.compile(
-            (r"(?<![^\W_])" + re.escape(probe) + r"(?![^\W_])") if as_word else re.escape(probe),
-        )
-        for probe, as_word in _value_probes(value, login_exempt=login_exempt)
-    ]
-
-
-def _carries(patterns: list[re.Pattern[str]], text: str | None) -> bool:
-    """Whether ``text`` (normalised, and percent-decoded) carries a probe. The
-    body placeholders are no leak and are left out."""
-    if not text:
+def _term_shaped(fragment: str) -> bool:
+    """A technical term rather than a secret: parts joined by ``-``, ``_`` or
+    ``.``, each all letters, all digits or at most four characters
+    (``wpa2-psk``, ``5ghz-band``, ``802.11ac``)."""
+    if not _TERM_JOINER.search(fragment) or not all(c.isalnum() or c in "-_." for c in fragment):
         return False
-    held_out = text.replace(SECRET_PLACEHOLDER, "").replace(DETAIL_PLACEHOLDER, "")
-    haystacks = {_normalise(form) for form in _decoded(held_out)}
-    return any(pattern.search(h) for pattern in patterns for h in haystacks)
+    return all(p.isalpha() or p.isdigit() or len(p) <= 4 for p in _TERM_JOINER.split(fragment) if p)
 
 
-def drop_value_tags(value: str, tags_json: str | None, body: str) -> tuple[str | None, str]:
-    """(tags_json, body) with every caller tag that carries the value removed
-    WHOLE, from the tags list and from the body's ``Tags:`` trailer line; the
-    other tags stay. A tag is a label, not prose: dropping the whole element
-    leaves no part of it behind, so this is not a scrub. Tags are dropped
-    rather than refused because a shape heuristic will flag an ordinary tag
-    now and then (a database name, a region), and the cost of that should be
-    one tag, never the whole capture. Unparseable tags are left as they are,
-    for the strict check to refuse."""
-    patterns = _probe_patterns(value)
+class ValueMask:
+    """Every probe of one held value (``_value_probes``), built ONCE per write
+    and reused for every field it masks, with a matcher whose cost is linear in
+    the field: probes are looked up by substring in hash sets. The fields it
+    masks are small (an identifier, capped tags): caller metadata is held out
+    with the value, never masked (owner ruling c91c5b74).
+
+    ``captured``: (probe, whole-word) of every secret the capture rules
+    recognise in the value and the description
+    (``reference_extraction.captured_secrets``: "password: X", "pin: 4821", a
+    known key prefix, ...). They are always probes, a plain-word or all-digit
+    one as a whole word.
+
+    ``prose``: the value is free text the writer did not delimit (a credential
+    body with no ``Value:`` line, a distilled unit, an uploaded file). Its whole
+    text is a probe, and so is every secret-shaped fragment that is not
+    term-shaped (``_term_shaped``). A term-shaped fragment (``WPA2-PSK``) is
+    probed only when a capture rule took it: otherwise it is an ordinary word
+    of the prose, and masking it in a label would only lose the label. A
+    writer-delimited value probes every secret-shaped fragment. Stated limit:
+    an UNLABELLED term-shaped password in free prose that a tag or the name
+    repeats stays visible there; nothing tells it from a label."""
+
+    def __init__(
+        self, value: str, *, login_exempt: bool = False, prose: bool = False,
+        probes: list[tuple[str, bool]] | None = None,
+        captured: list[tuple[str, bool]] | None = None,
+    ):
+        whole = {_normalise(form) for form in _decoded(value.strip())} if value.strip() else set()
+        self.short: dict[int, set[str]] = {}
+        self.long: dict[str, list[str]] = {}
+        self.words: set[str] = set()
+        if probes is None:
+            probes = _value_probes(value, login_exempt=login_exempt)
+        captured = captured or []
+        taken = {probe for probe, _ in captured}
+        for probe, as_word in [*probes, *captured]:
+            if prose and probe not in whole and probe not in taken and (
+                "-" in probe or "_" in probe or "." in probe
+            ) and _term_shaped(probe):
+                continue
+            if as_word:
+                self.words.add(probe)
+            if len(probe) <= _SHORT:
+                self.short.setdefault(len(probe), set()).add(probe)
+            else:
+                self.long.setdefault(probe[:_SHORT], []).append(probe)
+        self.lengths = sorted(self.short)
+        self._whole = whole
+        self._runs: dict[str, list[str]] = {}
+        self.window = max((len(p.split()) for p in whole), default=1)
+
+    def runs(self, probe: str) -> list[str]:
+        """The short whitespace-delimited runs of the value that hold ``probe``,
+        so a match can grow over a secret that spans a separator
+        ("Demo@Fake123"). Found by ``str.find`` on first use, at most
+        ``_RUNS_PER_PROBE`` of them, so a megabyte value costs no full pass."""
+        if probe not in self._runs:
+            found: list[str] = []
+            for form in self._whole:
+                at = form.find(probe)
+                while at != -1 and len(found) < _RUNS_PER_PROBE:
+                    start = max(form.rfind(" ", 0, at), form.rfind("\n", 0, at), form.rfind("\t", 0, at)) + 1
+                    stop = len(form)
+                    for sep in (" ", "\n", "\t"):
+                        end = form.find(sep, at + len(probe))
+                        if end != -1:
+                            stop = min(stop, end)
+                    if stop - start <= _RUN_MAX and form[start:stop] not in found:
+                        found.append(form[start:stop])
+                    at = form.find(probe, stop)
+            self._runs[probe] = found
+        return self._runs[probe]
+
+    def _bounded(self, text: str, start: int, stop: int, probe: str) -> bool:
+        if probe not in self.words:
+            return True
+        return not (start and text[start - 1].isalnum()) and not (
+            stop < len(text) and text[stop].isalnum()
+        )
+
+    def _matches(self, text: str):
+        """(start, stop, probe) of every probe occurrence in normalised ``text``."""
+        if not self.lengths and not self.long:
+            return
+        for i in range(len(text)):
+            for length in self.lengths:
+                if i + length > len(text):
+                    break
+                sub = text[i : i + length]
+                if sub in self.short[length] and self._bounded(text, i, i + length, sub):
+                    yield i, i + length, sub
+            for probe in self.long.get(text[i : i + _SHORT], ()):
+                if text.startswith(probe, i) and self._bounded(text, i, i + len(probe), probe):
+                    yield i, i + len(probe), probe
+
+    def carries(self, text: str | None) -> bool:
+        """Whether ``text`` (normalised, and percent-decoded) carries a probe.
+        The body placeholders and the mask are no leak and are left out (the
+        mask as a separator, so the text around it never joins into a match)."""
+        if not text:
+            return False
+        held_out = text.replace(SECRET_PLACEHOLDER, "").replace(DETAIL_PLACEHOLDER, "")
+        held_out = held_out.replace(HELD_MASK, "\x00")
+        return any(next(self._matches(_normalise(form)), None) for form in _decoded(held_out))
+
+    def mask(self, text: str) -> str:
+        """``text`` with every span of the value replaced by ``HELD_MASK``, in
+        the ORIGINAL text: a fullwidth or zero-width spelling is mapped back to
+        the characters it came from, and a match grows over every adjacent
+        character, short of whitespace, that keeps it a run of the value. A
+        spelling that cannot be mapped (percent-encoded) masks the whole token
+        that carries it, in one pass. Unchanged when nothing matches."""
+        if not text or not self.carries(text):
+            return text
+        normalised, origins = _normalised_with_origins(text)
+        spans = []
+        for start, stop, probe in self._matches(normalised):
+            runs = self.runs(probe)
+            while (
+                start
+                and not normalised[start - 1].isspace()
+                and any(normalised[start - 1 : stop] in run for run in runs)
+            ):
+                start -= 1
+            while (
+                stop < len(normalised)
+                and not normalised[stop].isspace()
+                and any(normalised[start : stop + 1] in run for run in runs)
+            ):
+                stop += 1
+            spans.append((origins[start], origins[stop - 1] + 1))
+        text = _mask_spans(text, spans)
+        for width in range(1, self.window + 1):
+            if not self.carries(text):
+                return text
+            if width > _WINDOW_MAX:
+                break
+            text = self._mask_token_runs(text, width)
+        return text if not self.carries(text) else HELD_MASK
+
+    def _mask_token_runs(self, text: str, width: int) -> str:
+        """``text`` with every run of ``width`` whitespace-delimited tokens that
+        carries a probe masked whole, left to right in one pass."""
+        parts = re.split(r"(\s+)", text)
+        i = 0
+        while i + 2 * (width - 1) < len(parts):
+            hi = i + 2 * width - 1
+            if self.carries("".join(parts[i:hi])):
+                parts[i:hi] = [HELD_MASK]
+            i += 2
+        return "".join(parts)
+
+    def mask_field(self, field: object) -> object:
+        """``field`` with every string inside it masked (dict keys included),
+        its structure and other types kept. A non-string scalar whose text
+        carries the value has nothing else to keep: it becomes the mask."""
+        if field is None:
+            return None
+        if isinstance(field, str):
+            return self.mask(field)
+        if isinstance(field, dict):
+            return {self.mask_field(k): self.mask_field(v) for k, v in field.items()}
+        if isinstance(field, (list, tuple, set)):
+            return type(field)(self.mask_field(v) for v in field)
+        return HELD_MASK if self.carries(str(field)) else field
+
+
+def _captured_probes(texts: list[str | None]) -> list[tuple[str, bool]]:
+    """(probe, whole-word) of every secret the capture rules recognise in
+    ``texts``: the secret whole (a plain word or digits as a whole word) and
+    its secret-shaped fragments."""
+    # Imported here: reference_extraction imports knowledge_ingest, whose
+    # credential path imports this module.
+    from genesis.memory.reference_extraction import captured_secrets
+
+    probes: list[tuple[str, bool]] = []
+    for secret in captured_secrets([t for t in texts if t]):
+        probes += [(_normalise(form), not _secret_token(form)) for form in _decoded(secret.strip())]
+        probes += _value_probes(secret)
+    return probes
+
+
+def value_masks(
+    value: str, *, prose: bool = False, detail: str | None = None,
+    also: tuple[tuple[str | None, str | None], ...] = (),
+) -> tuple[ValueMask, ValueMask]:
+    """(the strict probe set, the identifier's) of ``value`` and the secrets the
+    capture rules find in it and in ``detail``, from ONE probe pass. ``also``:
+    (value, description) of other held secrets the write must not repeat (the
+    value it replaces, an entry its identifier names), probed the same way.
+    Only the identifier exempts the login of a "login / secret" value (it names
+    the account); the tags are probed strictly."""
+    probes = _value_probes(value) + [
+        probe for other, _ in also if other and other.strip() for probe in _value_probes(other)
+    ]
+    login, sep, secret = value.strip().partition(" / ")
+    exempt = _normalise(login.strip().strip(_TOKEN_EDGE)) if sep and secret.strip() else None
+    whole = {_normalise(form) for form in _decoded(value.strip())}
+    named = [(p, w) for p, w in probes if p != exempt or p in whole]
+    captured = _captured_probes([value, detail, *(t for pair in also for t in pair)])
+    return (
+        ValueMask(value, prose=prose, probes=probes, captured=captured),
+        ValueMask(value, prose=prose, probes=named, captured=captured),
+    )
+
+
+def _normalised_with_origins(text: str) -> tuple[str, list[int] | range]:
+    """``text`` normalised character by character as ``_normalise`` does, and
+    for each normalised character the index of the original one it came from."""
+    if text.isascii():
+        # ASCII normalises to its lower case, character for character.
+        return text.lower(), range(len(text))
+    out: list[str] = []
+    origins: list[int] = []
+    for i, char in enumerate(text):
+        for part in unicodedata.normalize("NFKC", char):
+            if unicodedata.category(part) == "Cf":
+                continue
+            for folded in part.casefold():
+                out.append(folded)
+                origins.append(i)
+    return "".join(out), origins
+
+
+def _mask_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    """``text`` with the (merged) spans replaced by the mask, in one join."""
+    merged: list[list[int]] = []
+    for start, stop in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], stop)
+        else:
+            merged.append([start, stop])
+    pieces, at = [], 0
+    for start, stop in merged:
+        pieces += [text[at:start], HELD_MASK]
+        at = stop
+    return "".join(pieces) + text[at:]
+
+
+def mask_value_spans(value: str, text: str, *, login_exempt: bool = False) -> str:
+    """``text`` with every span of ``value`` masked (``ValueMask.mask``)."""
+    if not text or not value or not value.strip():
+        return text
+    return ValueMask(value, login_exempt=login_exempt).mask(text)
+
+
+def _as_mask(value: str | ValueMask) -> ValueMask:
+    return value if isinstance(value, ValueMask) else ValueMask(value)
+
+
+def _mask_tag(mask: ValueMask, tag: object) -> object | None:
+    """A tag with its value spans masked, at any nesting. None for a tag that
+    was nothing but the value: dropping it loses nothing, it had no other
+    content."""
+    masked = mask.mask_field(tag)
+    if masked != tag and isinstance(masked, str) and not masked.replace(HELD_MASK, "").strip():
+        return None
+    return masked
+
+
+def _trailer_tag(tag: str) -> str:
+    """A tag as the body's one ``Tags:`` line can carry it: a line break in
+    it would start a line of its own (a second ``Value:`` line, say)."""
+    return " ".join(tag.splitlines())
+
+
+#: A credential's tags are capped before they are masked; the originals are
+#: held in the secret row's meta.
+MAX_TAGS = 64
+MAX_TAG_CHARS = 256
+
+
+def cap_masked(text: str, limit: int) -> str:
+    """``text`` (already masked) cut to ``limit`` characters, never through a
+    mask: a cut that would split one cuts before it. Masking runs on the WHOLE
+    text first, so the cut never leaves part of a secret."""
+    if len(text) <= limit:
+        return text
+    # The last mask that starts before the cut: when it runs past it, cut before it.
+    at = text.rfind(HELD_MASK, 0, limit + len(HELD_MASK) - 1)
+    if at != -1 and at < limit < at + len(HELD_MASK):
+        limit = at
+    return text[:limit]
+
+
+def cap_tag(tag: object) -> object:
+    """A masked tag as a credential row indexes it: at most ``MAX_TAG_CHARS``
+    (a non-string one longer than that as its capped JSON text)."""
+    if isinstance(tag, str):
+        return cap_masked(tag, MAX_TAG_CHARS)
+    text = json.dumps(tag, ensure_ascii=False, default=str)
+    return tag if len(text) <= MAX_TAG_CHARS else cap_masked(text, MAX_TAG_CHARS)
+
+
+def mask_value_tags(
+    value: str | ValueMask, tags_json: str | None, body: str,
+) -> tuple[str | None, str]:
+    """(tags_json, body) for a credential row: at most ``MAX_TAGS`` tags, each
+    masked whole and then capped (``cap_tag``), with every span of the value masked strictly
+    (strings, numbers, lists and dicts at any nesting), in the tags list and in
+    the body's ``Tags:`` trailer line, which is also checked whole (a value
+    holding ", " spans tags no piece of which matches alone). A tag that was
+    nothing but the value is dropped. A ``Captured:`` line is dropped: the
+    caller's provenance is held in the secret row's meta. Tags that are not a
+    JSON list are decoded and masked as one value."""
+    mask = _as_mask(value)
     if tags_json:
         try:
             tags = json.loads(tags_json)
         except ValueError:
-            tags = None
-        if isinstance(tags, list):
-            kept = [t for t in tags if not (isinstance(t, str) and _carries(patterns, t))]
-            if len(kept) != len(tags):
-                tags_json = json.dumps(kept)
+            tags = tags_json
+        if not isinstance(tags, list):
+            tags = [tags]
+        kept = [cap_tag(t) for t in (_mask_tag(mask, t) for t in tags[:MAX_TAGS]) if t is not None]
+        tags_json = json.dumps(kept)
     idx = body.find(_VALUE_MARKER)
     if idx != -1:
-        trailer = _trailer(body[idx + len(_VALUE_MARKER):])
+        after = body[idx + len(_VALUE_MARKER):]
+        trailer = _trailer(after)
         rebuilt = []
         for line in trailer:
-            if line.startswith("Tags: "):
-                kept_tags = [t for t in line[len("Tags: "):].split(", ") if not _carries(patterns, t)]
-                if kept_tags:
-                    rebuilt.append("Tags: " + ", ".join(kept_tags))
-            else:
-                rebuilt.append(line)
+            if not line.startswith("Tags: "):
+                continue
+            pieces = line[len("Tags: "):].split(", ")[:MAX_TAGS]
+            joined = ", ".join(t for t in (_mask_tag(mask, t) for t in pieces) if t is not None)
+            if mask.carries(joined):
+                joined = mask.mask(joined)
+            # Capped only once masked, so a cut never leaves part of a secret.
+            joined = ", ".join(cap_tag(t) for t in joined.split(", "))
+            if joined.replace(HELD_MASK, "").strip(", "):
+                rebuilt.append("Tags: " + joined)
         if rebuilt != trailer:
-            after = body[idx + len(_VALUE_MARKER):]
             value_line = after[: len(after) - len("\n".join(trailer))].rstrip("\n")
             body = _held_body(body[:idx], rebuilt, value_line)
     return tags_json, body
@@ -308,80 +612,106 @@ class HeldCredential(NamedTuple):
     detail: str | None
 
 
-def split_secret(body: str) -> HeldCredential:
+def split_secret(
+    body: str,
+    *,
+    header: str | None = None,
+    tags: list[str] | None = None,
+    value: str | None = None,
+    detail: str | None = None,
+) -> HeldCredential:
     """Take the value and the free-text description out of a credential body.
 
     The body is ``[reference.credentials] {identifier}``, a blank line, the
     description, a blank line, ``Value: {value}`` and the Tags/Captured trailer,
     the layout every credential writer formats (the reference_store and
     knowledge_ingest MCP tools, the extraction job, migrate_reference_data).
-    The returned body keeps the header line and the trailer, with
-    DETAIL_PLACEHOLDER where the description stood and the canonical value
-    placeholder line. A body that already carries a placeholder (a re-ingest of
-    a held body) returns None for that part, so the stored one stays. Raises
-    ValueError, before anything is written, when the value cannot be located or
-    a payment card number is in the value or the description.
+    ``header`` is the header line expected for the key (default: the body's own
+    first line); a first line that is not it is part of the description. The
+    returned body is that header, DETAIL_PLACEHOLDER where the description
+    stood, the canonical value placeholder line and the trailer. A body that
+    already carries a placeholder (a re-ingest of a held body) returns None for
+    that part, so the stored one stays. ``value`` and ``detail``, when a writer
+    passes them, are the value and description as it knows them (a multi-line
+    value is held out whole, whatever its lines look like).
+
+    A body whose split point is ambiguous (no ``Value:`` line, the marker twice,
+    a value line shaped like a trailer line, a repeated trailer line, or a
+    parsed value that is not the writer's) is never refused: MORE is held out.
+    Everything after the header goes to the secret (the value: the text after
+    the first marker, or the whole remainder when there is none), the
+    description before the first marker stays the detail (None when there is
+    no marker to separate it, so a stored one is kept), and the trailer is
+    rebuilt only from the structured ``tags``, so no part of the ambiguous text
+    is indexed. Raises ValueError, before anything is written, only when a
+    payment card number is in the value or the description (#3172).
     """
     from genesis.security.card_shapes import contains_card_number
 
-    idx = body.find(_VALUE_MARKER)
-    value = parse_reference_body(body)["value"] if idx != -1 else ""
-    if not value:
-        raise ValueError(
-            "a credential reference must carry its value on a 'Value:' line; "
-            "refusing to index one whose value cannot be held out"
-        )
-    if body.count(_VALUE_MARKER) != 1:
-        # A description carrying the marker would move its tail into the secret
-        # (both this split and parse_reference_body cut at the FIRST marker).
-        raise ValueError(
-            "a credential reference must carry exactly one 'Value:' line; "
-            "refusing a body whose description contains one too"
-        )
-    head = body[:idx]
-    header, _, description = head.partition("\n")
-    description = description.strip()
-    if contains_card_number(value) or contains_card_number(description):
+    first = body.partition("\n")[0]
+    header = first if header is None else header
+    rest = body[len(first):] if first == header else "\n" + body
+    idx = rest.find(_VALUE_MARKER)
+    clean = idx != -1 and rest.count(_VALUE_MARKER) == 1
+    if clean:
+        after = rest[idx + len(_VALUE_MARKER):]
+        if value is not None and value.strip() and after.startswith(value):
+            # The writer's value says exactly where the value line ends: what
+            # follows it is the trailer, whatever the value's lines look like.
+            tail = after[len(value):]
+            trailer = tail.strip("\n").split("\n") if tail.strip() else []
+            clean = tail[:1] in ("", "\n") and all(
+                line.startswith(_TRAILER_PREFIXES) for line in trailer
+            ) and _split_trailer("\n".join(trailer))[1]
+            held = value
+        else:
+            trailer, clean = _split_trailer(after)
+            held = parse_reference_body(rest)["value"]
+            value_lines = held.split("\n")[1:]
+            clean = clean and not any(
+                line.startswith(_TRAILER_PREFIXES) for line in value_lines
+            ) and (value is None or held == value.strip())
+    if clean:
+        description: str | None = rest[:idx].strip()
+    else:
+        # Hold out more: the remainder is the value, nothing of it indexed.
+        held = (rest[idx + len(_VALUE_MARKER):] if idx != -1 else rest).strip()
+        description = rest[:idx].strip() if idx != -1 else None
+        trailer = ["Tags: " + ", ".join(_trailer_tag(t) for t in tags)] if tags else []
+    if value is not None:
+        # The writer's value, exactly as given (a whitespace-only one is empty).
+        held = value if value.strip() else ""
+    if detail is not None:
+        description = detail.strip()
+    if contains_card_number(held) or contains_card_number(description or ""):
         raise ValueError(
             "a credential reference carries a payment card number; cards are "
             "never stored as references"
         )
-    held = _held_body(
-        header + "\n\n" + DETAIL_PLACEHOLDER, _trailer(body[idx + len(_VALUE_MARKER):]),
-    )
     return HeldCredential(
-        held,
-        None if value == SECRET_PLACEHOLDER else value,
+        _held_body(header + "\n\n" + DETAIL_PLACEHOLDER, trailer),
+        # An empty value is an empty value, held like any other; only the
+        # placeholder means "keep the stored one" (#2426 PR A).
+        None if held == SECRET_PLACEHOLDER else held,
         None if description == DETAIL_PLACEHOLDER else description,
     )
 
 
-def refuse_trailer_shaped_value(value: str) -> None:
-    """A value line starting like a body trailer (``Tags: ``, ``Captured: ``)
-    would be read back as trailer: the value truncated and its tail indexed.
-    Writers refuse such a value before formatting the body (#2426)."""
-    if any(line.startswith(_TRAILER_PREFIXES) for line in value.split("\n")[1:]):
-        raise ValueError(
-            "a credential value must not contain a line starting 'Tags: ' or "
-            "'Captured: '; refusing the write (#2426)"
-        )
-
-
-def _trailer(after_marker: str) -> list[str]:
-    """The trailing Tags:/Captured: lines of the text after the value marker."""
+def _split_trailer(after_marker: str) -> tuple[list[str], bool]:
+    """(the trailing Tags:/Captured: lines of the text after the value marker,
+    whether they are unambiguous). Writers emit each trailer line once; a
+    repeated one means part of a multi-line value was read as trailer."""
     lines = after_marker.split("\n")
     trailer: list[str] = []
     while lines and lines[-1].startswith(_TRAILER_PREFIXES):
         trailer.insert(0, lines.pop())
     prefixes = [next(p for p in _TRAILER_PREFIXES if line.startswith(p)) for line in trailer]
-    if len(prefixes) != len(set(prefixes)):
-        # Writers emit each trailer line once; a repeated one means part of a
-        # multi-line value was read as trailer.
-        raise ValueError(
-            "a credential body repeats a 'Tags:' or 'Captured:' line; refusing "
-            "a value that cannot be split safely (#2426)"
-        )
-    return trailer
+    return trailer, len(prefixes) == len(set(prefixes))
+
+
+def _trailer(after_marker: str) -> list[str]:
+    """The trailing Tags:/Captured: lines of the text after the value marker."""
+    return _split_trailer(after_marker)[0]
 
 
 def _held_body(head: str, trailer: list[str], value: str = SECRET_PLACEHOLDER) -> str:
@@ -425,6 +755,20 @@ async def _held_pair(
     return pair[0] or "", pair[1], pair[2]
 
 
+def _credential(row: dict) -> bool:
+    return holds_secret(row.get("project_type"), row.get("domain"))
+
+
+def _held_row(row: dict, parsed_value: str) -> bool:
+    """Whether the row's value (and description) live in reference_secrets: a
+    credential whose body carries the placeholder, or any other reference row
+    written with a held-out value (``ingest_knowledge_unit(held_value=...)``),
+    which names it by ``secret_ref``; its body's value line is masked."""
+    if _credential(row):
+        return parsed_value == SECRET_PLACEHOLDER
+    return bool(row.get("secret_ref"))
+
+
 async def resolve_value(db: aiosqlite.Connection, row: dict) -> str | None:
     """The value of a reference row, or None when a held-out value is missing.
 
@@ -445,14 +789,12 @@ async def reveal_reference(db: aiosqlite.Connection, row: dict) -> tuple[str | N
     parses both from its body. The value is None when a held-out value is
     missing (logged as an error)."""
     parsed = parse_reference_body(row.get("body"))
-    if parsed["value"] != SECRET_PLACEHOLDER or not holds_secret(
-        row.get("project_type"), row.get("domain"),
-    ):
+    if not _held_row(row, parsed["value"]):
         return parsed["value"], parsed["description"]
     body, secret, detail = await _held_pair(db, row)
     current = parse_reference_body(body)
     if secret is None:
-        if current["value"] and current["value"] != SECRET_PLACEHOLDER:
+        if _credential(row) and current["value"] and current["value"] != SECRET_PLACEHOLDER:
             # The unit's current body carries its value inline (a row written
             # before #2426): that body's own value, never a guess.
             return current["value"], current["description"]
@@ -462,6 +804,20 @@ async def reveal_reference(db: aiosqlite.Connection, row: dict) -> tuple[str | N
     if detail is not None and description == DETAIL_PLACEHOLDER:
         description = detail
     return secret, description
+
+
+async def reveal_meta(db: aiosqlite.Connection, row: dict) -> dict | None:
+    """The caller metadata held with a credential's value (#2426): the
+    authority and provenance it was written with, purpose, ingestion source,
+    relationships, caveats, and the identifier and tags as given. Read from the
+    secret row the row names; None when none is held."""
+    from genesis.db.crud.knowledge import get_secret_meta
+
+    text = await get_secret_meta(db, row.get("secret_ref"))
+    try:
+        return json.loads(text) if text else None
+    except ValueError:
+        return None
 
 
 async def compose_body(db: aiosqlite.Connection, row: dict) -> tuple[str, bool]:
@@ -477,15 +833,13 @@ async def compose_body(db: aiosqlite.Connection, row: dict) -> tuple[str, bool]:
     """
     body = row.get("body") or ""
     idx = body.find(_VALUE_MARKER)
-    if (
-        idx == -1
-        or not holds_secret(row.get("project_type"), row.get("domain"))
-        or parse_reference_body(body)["value"] != SECRET_PLACEHOLDER
-    ):
+    if idx == -1 or not _held_row(row, parse_reference_body(body)["value"]):
         return body, False
     body, value, detail = await _held_pair(db, row)
     idx = body.find(_VALUE_MARKER)
-    if idx == -1 or parse_reference_body(body)["value"] != SECRET_PLACEHOLDER:
+    if idx == -1 or (
+        _credential(row) and parse_reference_body(body)["value"] != SECRET_PLACEHOLDER
+    ):
         # The current body is not a held-out one (no marker, or a value inline):
         # it is returned as stored, its own pair.
         return body, False

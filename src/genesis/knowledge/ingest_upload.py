@@ -180,17 +180,6 @@ async def _store_as_is(
     if context:
         tags.append("user-context")
 
-    # #2426: an uploaded file is never stored as a credential reference. The
-    # vector below is written BEFORE the database row, so refuse here, before
-    # anything is written, rather than at the db layer's refusal afterwards.
-    from genesis.db.crud.knowledge import holds_secret
-
-    if holds_secret(project_type, effective_domain):
-        raise ValueError(
-            "refusing to store an upload as a credential reference: use "
-            "reference_store, which holds the value out (#2426)"
-        )
-
     # Store to Qdrant
     # WS-3: curated ingest is external_untrusted (authority tier, not
     # authorship); derived once, mirrored to both stores.
@@ -199,6 +188,38 @@ async def _store_as_is(
     resolved_origin = derive_origin_class(
         source_pipeline="curated", collection="knowledge_base",
     )
+
+    # #2426: the vector below is written BEFORE the database row, so a
+    # credential upload goes through ingest_knowledge_unit instead, the
+    # chokepoint that holds its content out, under an identifier taken from the
+    # file name. Never refused.
+    from genesis.db.crud.knowledge import holds_secret
+
+    if holds_secret(project_type, effective_domain):
+        from genesis.memory.knowledge_ingest import ingest_untrusted_credential
+
+        unit_id = await ingest_untrusted_credential(
+            store=memory_mod._store,
+            db=memory_mod._db,
+            content=file_content,
+            # The whole file, exactly, is the held value: nothing in it is read
+            # as a body (a "Value:" or "Tags:" line inside it is just text).
+            held_value=file_content,
+            held_detail="",
+            project=project_type,
+            domain=effective_domain,
+            authority="curated",
+            provenance={"source_doc": file_path, "source_pipeline": "curated"},
+            concept=filename[:200],
+            tags_json=json.dumps(tags),
+            purpose=purpose,
+            ingestion_source=file_path,
+            confidence=0.95,
+            origin_class=resolved_origin,
+            caveats=[f"User context: {context}"] if context else None,
+        )
+        logger.info("Stored credential upload as unit %s (held out)", unit_id)
+        return [unit_id]
     qdrant_id = await memory_mod._store.store(
         file_content,
         f"knowledge:{project_type}/{effective_domain}",

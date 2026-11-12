@@ -223,6 +223,34 @@ _MIN_CONTENT_LENGTH = 30
 _MIN_URL_CONTEXT_LENGTH = 20
 
 
+#: (pattern, group) of every credential pattern above whose group is a secret.
+_SECRET_GROUPS = (
+    (_CREDENTIAL_PAIR_PATTERN, "pass"),
+    (_SINGLE_CREDENTIAL_PATTERN, "value"),
+    (_EMAIL_PASSWORD_PATTERN, "pass"),
+    (_ACCOUNT_LIFECYCLE_PATTERN, "pass"),
+    (_KNOWN_KEY_PREFIX_PATTERN, "token"),
+    (_CREDENTIAL_TOKEN_PATTERN, "token"),
+    (_ENV_ASSIGNMENT_PATTERN, "val"),
+)
+
+
+def captured_secrets(texts: list[str]) -> set[str]:
+    """Every secret a credential pattern above captures in ``texts``, across
+    every match of every pattern: the secrets the capture rules recognise in
+    free prose (the hold-out masking of a prose value probes them, #2426)."""
+    found: set[str] = set()
+    for text in texts:
+        if not isinstance(text, str) or not text:
+            continue
+        for pattern, group in _SECRET_GROUPS:
+            for match in pattern.finditer(text):
+                value = (match.group(group) or "").strip().rstrip(".,;:)\"'")
+                if value:
+                    found.add(value)
+    return found
+
+
 def _looks_ephemeral(content: str) -> bool:
     """Check if content contains example/placeholder markers.
 
@@ -517,10 +545,6 @@ def _format_reference_body(
     formatter so content extracted automatically has the same shape as
     content stored manually.
     """
-    if kind == "credentials":
-        from genesis.memory.reference_ops import refuse_trailer_shaped_value
-
-        refuse_trailer_shaped_value(value)
     lines = [
         f"[reference.{kind}] {identifier}",
         "",
@@ -614,6 +638,9 @@ async def ingest_reference_from_extraction(
             collection="episodic_memory",
             memory_type="episodic",
             confidence=0.60,  # auto-captured: lower than reference_store (0.85)
+            # A credential's value and description, as captured: held out whole,
+            # so a multi-line value is never split by how its lines look (#2426).
+            **({"held_value": value, "held_detail": description} if kind == "credentials" else {}),
         )
     except Exception:
         logger.warning(
