@@ -269,10 +269,11 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         name="graphstore",
         description=(
             "Which backend answers memory-graph traversals — `enabled` plus "
-            "`mode` networkx/falkordb. networkx (default) is the in-process "
-            "projection and depends on nothing else; falkordb is a long-lived "
-            "server over a unix socket that needs the engine armed, the client "
-            "installed, and a projection built. Anything unreadable or "
+            "`mode` networkx/falkordb. falkordb (shipped default) is a "
+            "long-lived server over a unix socket that needs the engine armed "
+            "and a projection built; on an install with no engine unit the "
+            "shipped default reads quietly from networkx, the in-process "
+            "projection that depends on nothing else. Anything unreadable or "
             "unrecognised degrades to networkx, and the facade falls back to it "
             "at runtime rather than answering empty. Betweenness centrality "
             "always stays on networkx — FalkorDB cannot compute it. Read live "
@@ -1932,10 +1933,27 @@ def _validate_graphstore(changes: dict) -> list[str]:
     # entirely. The precondition belongs to the state the update RESULTS IN:
     # required only when the effective config both enables the lever and selects
     # falkordb, which also mirrors `effective_mode()`'s own `is True` test.
-    from genesis.memory.graphstore_config import load_config
+    #
+    # And judge whether the result would actually DEPEND on the engine. The
+    # shipped default is falkordb, but with no install overlay setting `mode` and
+    # no engine unit rendered, reads stay quietly on networkx (the where-present
+    # guard, graphstore_config.selection). Requiring the socket there would
+    # refuse every save on an install that never provisioned the engine. The
+    # result depends on it when this update or the stored overlay sets `mode`
+    # (written to the overlay, it is loud), or the unit is enabled.
+    from genesis.memory.graphstore_config import (
+        engine_unit_present,
+        load_config,
+        mode_set_by_overlay,
+    )
 
     effective = {**load_config(), **changes}
-    if effective.get("enabled", True) is True and effective.get("mode") == "falkordb":
+    depends = "mode" in changes or mode_set_by_overlay() or engine_unit_present()
+    if (
+        depends
+        and effective.get("enabled", True) is True
+        and effective.get("mode") == "falkordb"
+    ):
         from genesis.env import falkordb_socket_path
 
         socket_path = falkordb_socket_path()

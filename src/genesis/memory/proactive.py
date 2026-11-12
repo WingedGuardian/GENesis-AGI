@@ -431,7 +431,9 @@ async def _rebuild_procedure_cache(db: Any) -> _ProcedureCache | None:
             "AND principle_embedding IS NOT NULL "
             "ORDER BY confidence DESC LIMIT 1000"
         )
-        built = await asyncio.to_thread(_build_procedure_matrix, list(rows), now)
+        from genesis.db.request_database import run_resource_thread
+
+        built = await run_resource_thread(db, _build_procedure_matrix, list(rows), now)
     except Exception:
         logger.debug("procedure cache reload failed — keeping prior cache", exc_info=True)
         return _procedure_cache  # table absent / DB error — never block the endpoint

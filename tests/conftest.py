@@ -393,14 +393,19 @@ def _is_introspection_only(config) -> bool:
     )
 
 
-pytest_plugins = ["tests._live_fence", "tests._live_closure", "tests._live_outbound"]
+pytest_plugins = [
+    "tests._live_fence",
+    "tests._live_closure",
+    "tests._live_outbound",
+    "tests._live_writes",
+]
 
 
 def pytest_configure(config):
     _configure_lock_and_basetemp(config)
     # Armed AFTER the lock (a run refused by it exits above) and after basetemp is
     # placed (the fence allows fakes under it). See tests/_live_fence.py.
-    from tests import _live_closure, _live_fence, _live_outbound
+    from tests import _live_closure, _live_fence, _live_outbound, _live_writes
 
     _live_fence.install(config)
     # Live state paths and endpoints out of the environment, before any test runs
@@ -409,6 +414,9 @@ def pytest_configure(config):
     # In-process connects to live services on this machine, refused as on CI
     # (reads the real home the live fence resolved). See tests/_live_outbound.py.
     _live_outbound.install(config)
+    # Writes into the real home outside the test's temp dirs, reported (not
+    # failed). See tests/_live_writes.py.
+    _live_writes.install(config)
 
 
 def _configure_lock_and_basetemp(config):
@@ -772,6 +780,34 @@ def _isolate_override_log(tmp_path):
     mp.delenv("GENESIS_DISCARD_SNAPSHOT_LOG", raising=False)
     yield
     mp.undo()
+
+
+# ── Safety: a REAL awareness tick must not touch the live repo or Guardian ────
+@pytest.fixture()
+def quiet_live_tick():
+    """For a test that runs a real ``AwarenessLoop._on_tick()``: the tick's git
+    steps act on the live install, not on anything the test owns. The cheap git
+    health check writes the Guardian's ``git_health.json`` verdict (under
+    ``~/.genesis/shared``) and a probe file into the repository's shared ``.git``;
+    the bundle publish replaces the Guardian's recovery bundle with this
+    checkout's HEAD; the deep check runs fsck. Each becomes a no-op here. Their
+    own tests (``tests/test_awareness/test_git_health_check.py``,
+    ``tests/test_guardian/test_repo_bundle*.py``) drive them against temp repos."""
+    import genesis.awareness.loop as loop_mod
+
+    async def _no_check(*_a, **_k):
+        return None
+
+    # A fixture-owned MonkeyPatch, as the other safety fixtures here use: a test's
+    # own monkeypatch.undo() must not lift this protection mid-test.
+    mp = pytest.MonkeyPatch()
+    mp.setattr(loop_mod, "_check_git_health", _no_check)
+    mp.setattr(loop_mod, "_publish_repo_bundle_if_due", _no_check)
+    mp.setattr(loop_mod, "_dispatch_git_health_deep", lambda *_a, **_k: None)
+    try:
+        yield
+    finally:
+        mp.undo()
 
 
 # ── Safety: prevent tests from writing to the REAL genesis.db ────────────────

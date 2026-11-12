@@ -30,11 +30,9 @@ def _candidate_secret_paths() -> list[Path]:
         paths.append(secrets_path())
     except Exception:  # noqa: BLE001 - env resolution is best-effort here
         pass
-    # Worktree execution: repo_root() may resolve to the worktree (no
-    # secrets.env). Fall back to the canonical main-tree location, unless
-    # SECRETS_PATH names the file explicitly: then that is the only one.
-    if not os.environ.get("SECRETS_PATH"):
-        paths.append(Path.home() / "genesis" / "secrets.env")
+    # The resolver already falls back to the main tree's file for a worktree
+    # run, and keeps a home-config file it cannot check rather than skipping to
+    # an older copy. A second fallback here would undo that, so there is none.
     return paths
 
 

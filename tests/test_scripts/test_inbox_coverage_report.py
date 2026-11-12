@@ -32,7 +32,8 @@ CREATE TABLE inbox_items (
     response_path TEXT,
     processed_at TEXT,
     created_at TEXT,
-    batch_items TEXT
+    batch_items TEXT,
+    evaluated_content TEXT
 )
 """
 
@@ -223,7 +224,8 @@ def test_tracking_params_normalized(tmp_path: Path) -> None:
     assert _rep.main(["--inbox", str(inbox), "--db", str(db), "--out", str(out)]) == 0
     md = out.read_text()
     assert f"| {URL} | evaluated | present | yes |  |" in md
-    assert dirty not in md
+    assert dirty not in md.split("### Item", 1)[0]
+    assert f"<pre>\n{dirty}\n</pre>" in md
 
 
 def test_newest_completed_row_wins(tmp_path: Path) -> None:
@@ -288,11 +290,16 @@ def test_legacy_row_unattributable(tmp_path: Path) -> None:
     note.write_text(f"{URL}\n")
     db = tmp_path / "genesis.db"
     _make_db(db)
-    # Legacy plain-text batch_items: completed but carries no item boundary.
+    # Legacy input proves URL membership, not this current item's exact text.
     _insert(db, note, status="completed", batch_items=f"saw {URL}")
     out = tmp_path / "out.md"
-    assert _rep.main(["--inbox", str(inbox), "--db", str(db), "--out", str(out)]) == 0
-    assert f"| {URL} | unattributable |  |  |  |" in out.read_text()
+    assert _rep.main(
+        ["--inbox", str(inbox), "--db", str(db), "--out", str(out)]
+    ) == 0
+    md = out.read_text()
+    assert f"| {URL} | evaluated | none | unknown |  |" in md
+    assert "stored match: no" in md
+    assert "item status: unattributable" in md
 
 
 def test_never_evaluated(tmp_path: Path) -> None:
