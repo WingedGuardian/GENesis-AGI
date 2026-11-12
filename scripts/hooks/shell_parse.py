@@ -3857,6 +3857,14 @@ _C_VALUE_TAKING = {
 #: Every other supported interpreter takes `-o option` but not `-O`.
 _C_VALUE_TAKING_DEFAULT = frozenset("o")
 
+#: Shells for which a LONE `+` ENDS option processing, so the next word is the
+#: operand even when it looks like an option. The rest (bash, dash, ash and the
+#: `sh` that resolves to one of them) skip a lone `+` as an empty bundle and keep
+#: parsing (#2218). MEASURED with `<shell> + -n FILE`: zsh 5.9, ksh93u+m and
+#: mksh R59 run a script NAMED `-n`; bash 5.2, dash 0.5.12 and busybox ash run
+#: nothing because `-n` is still an option there.
+_LONE_PLUS_ENDS_OPTIONS = frozenset({"zsh", "ksh", "mksh"})
+
 #: Options that make the shell PARSE the script and not execute it. MEASURED on
 #: bash 5.2: `bash -n -c CMD`, `bash -D -c CMD` and `bash -o noexec -c CMD` all
 #: exit without running CMD. Walking past one and reporting the operand as an
@@ -5237,7 +5245,13 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
         # The first `-c` decides, and if its operand cannot be resolved the
         # answer is "nothing", not "keep looking".
         found, script, state_noexec, sticky_noexec = _first_operand(
-            argv, start, allowed, takes_value, state_noexec, sticky_noexec
+            argv,
+            start,
+            allowed,
+            takes_value,
+            state_noexec,
+            sticky_noexec,
+            plus_ends_options=interpreter in _LONE_PLUS_ENDS_OPTIONS,
         )
         if not found or state_noexec or sticky_noexec:
             return ""
@@ -5253,6 +5267,7 @@ def _first_operand(
     takes_value: frozenset[str],
     state_noexec: bool = False,
     sticky_noexec: bool = False,
+    plus_ends_options: bool = False,
 ) -> tuple[bool, str, bool, bool]:
     """``(found, script)`` for the first OPERAND at or after ``start``.
 
@@ -5287,7 +5302,7 @@ def _first_operand(
     j = start
     while j < len(argv):
         tok = argv[j]
-        if tok == "+":
+        if tok == "+" and not plus_ends_options:
             # A LONE `+` IS AN EMPTY BUNDLE, NOT A TERMINATOR, after the
             # selector exactly as before it (#2218). The shell skips it and
             # keeps parsing options. MEASURED on bash 5.2 and dash: `-c + -n
@@ -5297,9 +5312,12 @@ def _first_operand(
             # 872 bash and 792 dash misses in a 3-token sweep (80,160 shapes
             # per shell) had a lone `+` after the selector, and none remain
             # with this skip. `-c + CMD` still resolves to CMD either way.
+            # zsh, ksh and mksh DO terminate here (`_LONE_PLUS_ENDS_OPTIONS`):
+            # `zsh -c + +n CMD` runs `+n` and not CMD, so they take the
+            # terminator branch below.
             j += 1
             continue
-        if tok in ("-", "--"):
+        if tok in ("-", "--", "+"):
             # END of option processing. The very next token IS the command
             # string even when it looks like an option: `bash -c -- '-x' CMD`
             # runs `-x` and makes CMD merely `$0`. Resuming the option scan here

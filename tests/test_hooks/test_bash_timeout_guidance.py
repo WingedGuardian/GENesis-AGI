@@ -583,6 +583,10 @@ class TestDeployGuardFires:
         "bash -n + +n scripts/update.sh",
         "bash + scripts/update.sh",
         "bash -c + -n +n scripts/update.sh",
+        # zsh and ksh END option processing at a lone `+`, so `-n` is the
+        # script's NAME there: a script called `-n` runs with update.sh as $1.
+        "zsh + -n scripts/update.sh",
+        "ksh + -n scripts/update.sh",
     )
 
     @pytest.mark.parametrize("command", LAUNCHES)
@@ -605,6 +609,8 @@ class TestDeployGuardFires:
         # it keeps these syntax-check-only (MEASURED: bash and dash run nothing).
         "bash -c + -n scripts/update.sh",
         "bash -n + scripts/update.sh",
+        # `-n` comes BEFORE the `+` here, so zsh is syntax-check-only too.
+        "zsh -n + scripts/update.sh",
         "sed -n '100,140p' scripts/update.sh",
         "grep -n 'HEALTH' scripts/update.sh",
         "grep -rn 'update.sh' scripts",
