@@ -17,7 +17,9 @@ steps that need a real tar reader:
         exactly what a restore will refuse, including members refused only
         because of what an earlier member left on disk. Prints the directory;
         exit 4 (one line per member on stderr) when a restore would refuse any
-        member, 5 when a restore would fail outright.
+        member, 5 when a restore would fail outright. With exit 4, the last
+        stderr line is ``REFUSED-SUMMARY {"count": N, "classes": {...}}``: the
+        refused members counted by reason class, for backup's status file.
     extra_restore.py swap <tar> <stage> <root> <target> <aside>
         Extract into <stage> (created by the caller next to <target>, so the
         final step is a rename on one filesystem), fsync what was written, move
@@ -47,6 +49,7 @@ and its staging copy could not be deleted after a failure.
 from __future__ import annotations
 
 import copy
+import json
 import os
 import posixpath
 import sys
@@ -111,42 +114,48 @@ def _inside(path_parts: list[str], want: list[str]) -> bool:
 
 def make_filter(root: str):
     """A tarfile extraction filter confining members and link targets to ``root``.
-    ``refused`` collects one line per refused member."""
+    ``refused`` collects one line per refused member, and ``classes`` the same
+    refusals' reason classes, in the same order."""
     want = parts(root)
     refused: list[str] = []
+    classes: list[str] = []
     dir_modes: dict[str, int] = {}  # path relative to root -> archived mode, applied last
     links: set[str] = set()  # paths of symlink members seen so far
+
+    def refuse(member: tarfile.TarInfo, why: str, cls: str) -> None:
+        refused.append(f"refused member {member.name!r}: {why}")
+        classes.append(cls)
 
     def keep(member: tarfile.TarInfo, dest: str):
         p = parts(member.name)
         if not _inside(p, want):
-            refused.append(f"refused member {member.name!r}: outside {root}")
+            refuse(member, f"outside {root}", "OutsideRoot")
             return None
         # A member written THROUGH an earlier symlink member would land wherever that
         # link leads, so name-based checks below would judge the wrong place.
         if any("/".join(p[:i]) in links for i in range(1, len(p))):
-            refused.append(f"refused member {member.name!r}: its path runs through a link")
+            refuse(member, "its path runs through a link", "ThroughLink")
             return None
         if member.issym() and not member.linkname.startswith("/"):
             target = posixpath.normpath(
                 posixpath.join(posixpath.dirname("/".join(parts(member.name))), member.linkname)
             )
             if not _inside(target.split("/"), want):
-                refused.append(f"refused member {member.name!r}: link leaves {root}")
+                refuse(member, f"link leaves {root}", "LinkLeavesRoot")
                 return None
         if member.islnk() and not _inside(parts(member.linkname), want):
-            refused.append(f"refused member {member.name!r}: hard link leaves {root}")
+            refuse(member, f"hard link leaves {root}", "HardLinkLeavesRoot")
             return None
         try:
             out = tarfile.data_filter(member, dest)
         except tarfile.FilterError as e:
-            refused.append(f"refused member {member.name!r}: {type(e).__name__}")
+            refuse(member, type(e).__name__, type(e).__name__)
             return None
         except OSError as e:
             # The filter resolves the path through what earlier members put on disk
             # (a link loop, a link through a file): refuse this member, never abort
             # the whole directory.
-            refused.append(f"refused member {member.name!r}: {type(e).__name__}: {e.strerror}")
+            refuse(member, f"{type(e).__name__}: {e.strerror}", type(e).__name__)
             return None
         if out is not None and member.issym():
             links.add("/".join(p))
@@ -157,6 +166,7 @@ def make_filter(root: str):
         return out
 
     keep.refused = refused  # type: ignore[attr-defined]
+    keep.classes = classes  # type: ignore[attr-defined]
     keep.dir_modes = dir_modes  # type: ignore[attr-defined]
     return keep
 
@@ -226,6 +236,11 @@ def cmd_verify(tar: str, scratch_parent: str) -> int:
             tf.extractall(dest, filter=hollow)  # noqa: S202 — same filter as swap
     for line in keep.refused:
         _err(line)
+    if keep.refused:
+        counts: dict[str, int] = {}
+        for cls in keep.classes:
+            counts[cls] = counts.get(cls, 0) + 1
+        _err("REFUSED-SUMMARY " + json.dumps({"count": len(keep.refused), "classes": counts}))
     _out(root)
     return 4 if keep.refused else 0
 
