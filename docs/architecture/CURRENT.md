@@ -5074,8 +5074,10 @@ logger or unrelated exceptions with copied text and no provenance.
   literal tuple in the repair module, read with ast) from HEAD's blobs on main or
   `live` into `~/.genesis/lib/live-repair.d/<kit_id>/` with a `KIT.json` of their
   object ids, swaps the `live-repair/current` link by rename, and keeps two kits
-  (the prune skips one whose KIT.json is flocked; the repair takes that shared
-  hold from D2a-2 on); `status` reports ok,
+  (the prune takes only kit-id names and skips one whose KIT.json is flocked; the
+  repair takes that shared hold from D2a-2 on; a symlinked `live-repair.d` or
+  `live-repair` is moved aside, never followed; a set-aside kit or `current` is kept a week from the
+  move); `status` reports ok,
   missing, foreign, corrupt, partial or stale. bootstrap, `deploy_code_only.sh`
   (past its update-state refusal) and the update's rollback (when the code restore
   succeeded) install it, never fatally: the installed kit is HEAD's at the last

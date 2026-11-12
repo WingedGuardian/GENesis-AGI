@@ -13,7 +13,10 @@ HEAD's blob with ast: nothing of the tree is ever run. Every byte comes from the
 object store at HEAD, never the working tree, and only from a HEAD on main or
 live. A new kit is written beside the old one, verified, renamed into place, and
 `current` is swapped by rename(2), so a reader finds a whole old kit or a whole
-new one. Two versioned kits are kept. The prune skips a kit whose KIT.json is
+new one. Two versioned kits are kept, and the prune touches no name that is not
+a kit id; a symlinked live-repair.d or live-repair is moved aside before any write,
+and anything set aside (a kit that fails to verify, a `current` that is not a
+link) is kept a week from the move. The prune skips a kit whose KIT.json is
 flocked; the repair takes that shared hold from #3492 D2a-2 on (until then
 nothing holds it, and a run keeps its own files open while it runs).
 
@@ -55,6 +58,7 @@ KEEP_S = 7 * 86400  # leftovers (.tmp, .stale, a foreign `current` set aside) li
 GIT_TIMEOUT_S = 120
 _NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
 _OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_KID = re.compile(r"[0-9a-f]{16}\Z")  # only these are kits: the prune never touches another name
 _LINK = re.compile(r"\.\./live-repair\.d/([0-9a-f]{16})\Z")
 
 
@@ -245,32 +249,38 @@ def _place(repo: str, vdir: str, kid: str, commit: str, fmt: str, names, files) 
     if os.path.lexists(tmp):
         shutil.rmtree(tmp)
     os.mkdir(tmp, 0o755)
-    for name in names:
-        data = _git(repo, "cat-file", "blob", files[name])
-        if blob_oid(data, fmt) != files[name]:
-            raise KitError(f"{name}'s bytes at HEAD do not hash to its object id")
-        _write(os.path.join(tmp, name), data)
-    manifest = {**describe(tmp, names, commit, fmt), "kit_id": kid}
-    _write(os.path.join(tmp, "KIT.json"), json.dumps(manifest, indent=1).encode() + b"\n")
-    if not _good(tmp, files):
-        raise KitError("the written kit does not verify")
-    _fsync_dir(tmp)
-    _step("tmp-written")
-    if os.path.lexists(final):
-        if _good(final, files):  # another installer placed the same kit meanwhile
-            shutil.rmtree(tmp)
-            _fsync_dir(vdir)
-            _step("dir-renamed")
-            return
-        # There, but it does not verify: set aside, never deleted.
-        os.rename(final, os.path.join(vdir, f".stale-{kid}-{_ts()}"))
     try:
-        os.rename(tmp, final)
-    except OSError as e:  # a concurrent install placed the same kit first
-        if e.errno not in (errno.EEXIST, errno.ENOTEMPTY) or not _good(final, files):
-            raise
-        shutil.rmtree(tmp)
-    _fsync_dir(vdir)
+        for name in names:
+            data = _git(repo, "cat-file", "blob", files[name])
+            if blob_oid(data, fmt) != files[name]:
+                raise KitError(f"{name}'s bytes at HEAD do not hash to its object id")
+            _write(os.path.join(tmp, name), data)
+        manifest = {**describe(tmp, names, commit, fmt), "kit_id": kid}
+        _write(os.path.join(tmp, "KIT.json"), json.dumps(manifest, indent=1).encode() + b"\n")
+        if not _good(tmp, files):
+            raise KitError("the written kit does not verify")
+        _fsync_dir(tmp)
+        _step("tmp-written")
+        if os.path.lexists(final):
+            if _good(final, files):  # another installer placed the same kit meanwhile
+                shutil.rmtree(tmp)
+                _fsync_dir(vdir)
+                _step("dir-renamed")
+                return
+            # There, but it does not verify: set aside for a week, never overwritten.
+            stale = os.path.join(vdir, f".stale-{kid}-{_ts()}")
+            os.rename(final, stale)
+            os.utime(stale, follow_symlinks=False)  # its week starts now (rename keeps mtime)
+        try:
+            os.rename(tmp, final)
+        except OSError as e:  # a concurrent install placed the same kit first
+            if e.errno not in (errno.EEXIST, errno.ENOTEMPTY) or not _good(final, files):
+                raise
+            shutil.rmtree(tmp)
+        _fsync_dir(vdir)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
     _step("dir-renamed")
 
 
@@ -279,13 +289,19 @@ def _swap(ldir: str, kid: str, final: str) -> None:
     if os.path.lexists(cur) and not os.path.islink(cur):
         aside = os.path.join(ldir, f"current.foreign-{_ts()}")
         os.rename(cur, aside)
+        os.utime(aside, follow_symlinks=False)  # its week starts now (rename keeps mtime)
         _say(f"WARNING: {cur} was not a link into live-repair.d; it was moved to {aside}")
     tmp = os.path.join(ldir, f"current.tmp.{os.getpid()}")
     if os.path.lexists(tmp):
         os.unlink(tmp)
     os.symlink(f"../live-repair.d/{kid}", tmp)
-    _step("link-made")
-    os.replace(tmp, cur)
+    try:
+        _step("link-made")
+        os.replace(tmp, cur)
+    except BaseException:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        raise
     os.utime(final)  # the newest kit, for the keep-2 prune
     _fsync_dir(ldir)
 
@@ -337,7 +353,7 @@ def _prune(vdir: str, ldir: str, kid: str) -> None:
         if e.name.startswith("."):
             if e.name.startswith((".tmp-", ".stale-")) and _leftover(e.name, st.st_mtime, now):
                 _remove(e.path)
-        elif e.name != kid and stat.S_ISDIR(st.st_mode):
+        elif e.name != kid and _KID.match(e.name) and stat.S_ISDIR(st.st_mode):
             kits.append((st.st_mtime_ns, e.path))
     for _, path in sorted(kits, reverse=True)[1:]:  # keep current's and the newest other
         _remove(path)
@@ -360,8 +376,12 @@ def install(repo: str, home: str) -> int:
         kid = kit_id(files)
         root = os.path.join(home, ".genesis", "lib")
         vdir, ldir = os.path.join(root, "live-repair.d"), os.path.join(root, "live-repair")
-        os.makedirs(vdir, exist_ok=True)
-        os.makedirs(ldir, exist_ok=True)
+        for d in (vdir, ldir):  # never write into, or prune, a directory elsewhere
+            if os.path.islink(d):  # moving the link touches nothing it points to
+                aside = f"{d}.foreign-{_ts()}"
+                os.rename(d, aside)
+                _say(f"WARNING: {d} was a symlink; it was moved to {aside}")
+            os.makedirs(d, exist_ok=True)
         final, cur = os.path.join(vdir, kid), os.path.join(ldir, "current")
         current = os.path.islink(cur) and os.readlink(cur) == f"../live-repair.d/{kid}"
         if current and _good(final, files):

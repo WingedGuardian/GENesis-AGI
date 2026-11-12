@@ -223,6 +223,101 @@ def test_a_corrupted_kit_is_set_aside_and_reinstalled(kitmod, repo, home):
     assert any(p.name.startswith(f".stale-{kit.name}-") for p in _versioned(home).iterdir())
 
 
+_MONTH_AGO = 30 * 86400
+
+
+def _age(path: Path, seconds: int) -> None:
+    """Backdate a tree, so a rename that keeps st_mtime shows."""
+    t = os.stat(path).st_mtime - seconds
+    for p in [path, *path.rglob("*")]:
+        os.utime(p, (t, t), follow_symlinks=False)
+
+
+def test_an_old_foreign_current_set_aside_is_kept_a_week_from_the_move(repo, home):
+    cur = _current(home)
+    cur.mkdir(parents=True)
+    (cur / "mine.txt").write_text("someone's\n")
+    _age(cur, _MONTH_AGO)
+    assert _cli("install", str(repo), str(home)).returncode == 0
+    aside = [p for p in cur.parent.iterdir() if p.name.startswith("current.foreign-")]
+    assert len(aside) == 1, "removed by the same install that moved it aside"
+    assert (aside[0] / "mine.txt").read_text() == "someone's\n"
+
+
+def test_an_old_corrupted_kit_set_aside_is_kept_a_week_from_the_move(repo, home):
+    assert _cli("install", str(repo), str(home)).returncode == 0
+    kit = _current(home).resolve()
+    (kit / "deploy_marker.sh").write_text("# altered\n")
+    _age(kit, _MONTH_AGO)
+    assert _cli("install", str(repo), str(home)).returncode == 0
+    assert any(p.name.startswith(f".stale-{kit.name}-") for p in _versioned(home).iterdir())
+
+
+def test_the_prune_takes_only_kit_ids(repo, home):
+    assert _cli("install", str(repo), str(home)).returncode == 0
+    other = _versioned(home) / "notes"
+    other.mkdir()
+    (other / "keep.txt").write_text("mine\n")
+    for n in (1, 2, 3):
+        _bump(repo, n)
+        assert _cli("install", str(repo), str(home)).returncode == 0
+    assert (other / "keep.txt").read_text() == "mine\n"
+    assert len(_ids(home)) == 3, "two kits plus the directory that is not one"
+
+
+@pytest.mark.parametrize("which", ["live-repair.d", "live-repair"])
+def test_a_symlinked_kit_directory_is_moved_aside_never_followed(repo, home, tmp_path, which):
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "a").mkdir(parents=True)
+    (elsewhere / "b").mkdir()
+    lib = home / ".genesis" / "lib"
+    lib.mkdir()
+    (lib / which).symlink_to(elsewhere)
+    r = _cli("install", str(repo), str(home))
+    assert r.returncode == 0 and "symlink" in r.stdout + r.stderr, r.stdout + r.stderr
+    assert sorted(p.name for p in elsewhere.iterdir()) == ["a", "b"], "wrote into the target"
+    assert not (lib / which).is_symlink() and (lib / which).is_dir()
+    aside = [p for p in lib.iterdir() if p.name.startswith(f"{which}.foreign-")]
+    assert len(aside) == 1 and aside[0].is_symlink() and aside[0].resolve() == elsewhere
+    assert _cli("status", str(repo), str(home)).returncode == 0
+
+
+def _dead_pid() -> int:
+    proc = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True)
+    return int(proc.stdout)
+
+
+def test_a_killed_installs_leftovers_are_reaped_by_the_next(repo, home):
+    """What a SIGKILL leaves (no handler ran): a partial temp kit and a temp
+    link under a pid that is gone. One install converges and removes both."""
+    assert _cli("install", str(repo), str(home)).returncode == 0
+    pid = _dead_pid()
+    part = _versioned(home) / f".tmp-0123456789abcdef-{pid}"
+    part.mkdir()
+    (part / "deploy_marker.sh").write_text("# half\n")
+    link = _current(home).parent / f"current.tmp.{pid}"
+    link.symlink_to("../live-repair.d/0123456789abcdef")
+    _bump(repo, 1)
+    assert _cli("install", str(repo), str(home)).returncode == 0
+    assert not part.exists() and not os.path.lexists(link)
+
+
+@pytest.mark.parametrize("point", ["tmp-written", "link-made"])
+def test_a_failed_write_removes_its_own_temp(kitmod, repo, home, point):
+    assert kitmod.install(str(repo), str(home)) == 0
+    _bump(repo, 1)
+
+    def die(name):
+        if name == point:
+            raise OSError(f"failed at {name}")
+
+    kitmod._step = die
+    assert kitmod.install(str(repo), str(home)) == 1
+    left = [p.name for p in _versioned(home).iterdir() if p.name.startswith(".tmp-")]
+    left += [p.name for p in _current(home).parent.iterdir() if p.name.startswith("current.tmp.")]
+    assert left == [], left
+
+
 def test_status_names_every_state(kitmod, repo, home):
     st = lambda: kitmod.status(str(repo), str(home))  # noqa: E731
     assert st()["state"] == "missing"
