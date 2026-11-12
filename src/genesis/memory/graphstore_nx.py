@@ -387,7 +387,10 @@ class NetworkxGraphStore:
             raise GraphUnavailableError(
                 f"the memory database cannot be read — the graph cannot be built: {exc}"
             ) from exc
-        rows = [row for row in fetched if row[0] not in invalid and row[1] not in invalid]
+        rows = sorted(
+            (row for row in fetched if row[0] not in invalid and row[1] not in invalid),
+            key=lambda row: (row[0], row[1], row[2], row[3]),
+        )
 
         # MultiDiGraph, not DiGraph: memory_links' primary key is
         # (source_id, target_id, link_type), so one pair may legitimately carry
@@ -396,6 +399,7 @@ class NetworkxGraphStore:
         # an arbitrary survivor and the strength/link_type filters were
         # evaluated against it.
         G = nx.MultiDiGraph()
+        G.add_nodes_from(sorted({node for row in rows for node in row[:2]}))
         for source_id, target_id, link_type, strength in rows:
             G.add_edge(
                 source_id, target_id,
