@@ -10,6 +10,7 @@ cycle, and the CLI must never run. The CLI itself is covered by
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -83,3 +84,31 @@ def test_skew_guard_blocks_fallthrough(tmp_path, main_text):
     assert proc.returncode == 1
     assert "predates test-alert" in proc.stderr
     assert "ARGS:" not in proc.stdout
+
+
+def _json_lines(text: str) -> list[dict]:
+    return [json.loads(line) for line in text.splitlines() if line.startswith("{")]
+
+
+def test_guard_failures_carry_the_documented_shape(tmp_path):
+    install = _install(tmp_path, main_text=None)
+    (line,) = _json_lines(_run(tmp_path, "test-alert").stderr)
+    assert set(line) == {"ok", "action", "sent", "error"} and line["sent"] is False
+    (install / ".venv" / "bin" / "python").unlink()
+    (line,) = _json_lines(_run(tmp_path, "test-alert").stderr)
+    assert set(line) == {"ok", "action", "sent", "error"} and line["sent"] is False
+
+
+@pytest.mark.parametrize(("rc", "expect_line"), [(124, True), (1, False), (0, False)])
+def test_a_timeout_prints_one_unconfirmed_line_and_keeps_the_code(tmp_path, rc, expect_line):
+    install = _install(tmp_path)
+    (install / ".venv" / "bin" / "python").write_text(f"#!/bin/sh\nexit {rc}\n")
+    proc = _run(tmp_path, "test-alert")
+    assert proc.returncode == rc
+    lines = _json_lines(proc.stdout)
+    if expect_line:
+        assert lines == [
+            {"ok": False, "action": "test-alert", "sent": False, "error": "timed out; delivery not confirmed"}
+        ]
+    else:
+        assert lines == []
