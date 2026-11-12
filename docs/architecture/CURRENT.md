@@ -1570,6 +1570,14 @@ verified: f62608045437 2026-11-09
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
   contrast the intake bypass in entry 4.
 - **inbox/**: file-drop monitor with approval-gated dispatch.
+  Explicit owner-requested disposition review uses the manual-only Tier-1
+  `inbox-review` skill, reached by the attended-request pointer in `CLAUDE.md`.
+  Its read-only `scripts/inbox_review_rulings.py` helper enumerates exact-tagged
+  retained FTS history in a snapshot, including uncertain metadata, without
+  ranking, authority adjudication or writes. The workflow uses existing memory
+  and per-review outcomes documents; it adds no ledger or automatic evaluation.
+  Activation prerequisites and deterministic/native validation limits are in
+  `docs/reference/owner-inbox-review.md` (verified: 2026-11-09).
   `monitor.py` owns scanning, approval, retries and baseline writes;
   `batch_runner.py` executes one approved batch and post-processes its output,
   reached through the monitor's `_run_one_batch` forwarding method. Its manager
@@ -1644,7 +1652,8 @@ verified: f62608045437 2026-11-09
   can carry share tokens — while a storm alert names the file only. The retry-lane storm site
   abandons only URL-failure rows. An approval that ends unanswered (`approval_ended:`)
   does not spend a retry and leaves the row an ordinary retriable failure, so
-  the same row is asked about again; with `resilience.parking_mode:
+  an identifiable unchanged batch keeps its retry budget when asked about again;
+  with `resilience.parking_mode:
   live`, a network outage (`CCNetworkOfflineError`) does not spend retries. Follow-up and
   build-lane durable writes finish before the completed baseline commits, so a
   cancellation cannot permanently hide their absence. On restart every
@@ -1652,6 +1661,12 @@ verified: f62608045437 2026-11-09
   complete outstanding work is re-derived from the current source and completed
   baseline, so a crash during multi-row creation cannot silently lose the
   never-created tail or leave pending rows suppressing the file forever.
+  Retry reuse matches the complete ordered logical batch, with the queue's
+  existing tracking normalization and preserved annotations. Missing, corrupt
+  or regrouped identities get fresh bounded rows through normal approval while
+  old history remains. Both creation and reuse atomically reject newly ineligible
+  selected history, including unmatched rows; lost writes discard the whole
+  in-memory drop, leaving partial durable rows for restart recovery.
   Replay-unsafe batches persist a hold independent of the retry cap; readable
   held blocks are excluded from future deltas without becoming completed
   baseline content, while unreadable holds block their source file. The
@@ -4023,6 +4038,16 @@ verified: 9a95483a8e7f 2026-10-09
   (`gemini-flash-latest`) is declared but unchained: it resolved to 3.8 Flash
   (same model and quota as `gemini-free`), so it joins the chains only once it
   resolves to a different model.
+- **litellm loads on first use, not on import** (#3558): `litellm_delegate`
+  imports it inside `_litellm()` on the first `LiteLLMDelegate.call()` (in a
+  worker thread) and registers `_CUSTOM_MODEL_COSTS` then. So importing
+  `genesis.routing`, loading the routing config, the onboarding floor check and
+  building the standalone router all stay litellm-free: the SessionStart charter
+  hook and the standalone MCP servers no longer pay its multi-second import. The
+  server keeps importing it at startup (`runtime/init/router.py` calls
+  `litellm_delegate.warm()`). Patch `litellm_delegate.litellm` as before; never
+  re-add a module-level `import litellm` (locked by
+  `tests/test_routing/test_litellm_lazy.py`).
 - **Coherent routing reloads** (`Router.reload_config`,
   `LiteLLMDelegate.for_config`): requests capture config/delegate/pacing/breaker
   bindings before yielding. Replacement/rename breakers preserve holds while
@@ -5148,13 +5173,20 @@ logger or unrelated exceptions with copied text and no provenance.
   pointing away from `$GIT_COMMON_DIR/hooks` nothing is touched and the hooks
   stay pending (readiness names that setting). Every later run first re-reads
   each pending report (through `load_report`; a DISMISS_MARK folder is
-  skipped) under both locks and retries it while the branch `live` is still
-  its tag and HEAD is on `live` (HEAD elsewhere: left pending; an entry whose
-  commits are not full commit ids: left as it is), marks it `superseded` once
-  `live` itself moved, and writes back only `hooks` (0600); a report
+  skipped) under both locks, before its heal, and judges it against the refs
+  as it found them: `superseded` once `live` itself left the report's tag;
+  owed while `live` is that tag and HEAD is on `live` (HEAD elsewhere: left
+  pending; an entry whose commits are not full commit ids: left as it is).
+  An owed report's restore-hooks runs only after the heal, and only when the
+  tree then reads SAFE (no state, or one the guard calls SAFE), judged again
+  first since the heal may have moved `live` (#4367): restore-hooks runs the
+  checkout's engine and sync-hooks.sh, which a half-written tree may hold
+  another commit's bytes for and a held one a hand edit. A forward heal's own
+  restore-hooks runs inside the heal, once the files are the tag's, as
+  before. Each retry writes back only `hooks` (0600); a report
   dismissed with `dismissed_at` is still retried while its folder exists
   (dismissal ends only its count and its keep). One report's retry failing
-  (its write, say) is logged and never stops the heal that follows.
+  (its write, say) is logged and never stops another report's retry.
   `--dismiss` and a restore take update.lock too, so neither's field is lost
   (every REPAIR.json writer holds it); with no state file and update.lock
   held it exits 0 at once. The restore-hooks run is not bounded by the boot budget;
@@ -5371,13 +5403,18 @@ logger or unrelated exceptions with copied text and no provenance.
   the restore did not move there: while the in-flight part's aside holds
   anything else (a write after the move, through an open fd), unless that
   part read already-restored or as-left by the resume rule (both judged the
-  aside itself), the record is kept, and since it has one slot no other part
-  is written (`other:inflight-unresolved`, naming the aside, in `--check`
-  too; the in-flight part too, when its path holds the tag's state again), so
+  aside itself), the record is kept, and no part at that path, below it or
+  above it is written (`other:inflight-unresolved`, naming the aside, in
+  `--check` too; the in-flight part too, when its path holds the tag's state
+  again); every other part restores (#4025 item 1). Every held aside the run
+  folders show covers its path the same way, and so does an aside it cannot
+  read or judge, so a hold still covers it after a later part's intent took
+  the slot; a hold in a folder named before
+  #4011 still stops every part, since only the in-flight slot finds it. So
   every run names it and exits 1 until what is there is moved out. An aside
   still holding the repair's own as-left copy (the part refused by a gate
   after a kill, or a put-back that failed) holds nothing back; that one read
-  has its own budget. Moving the content out releases the other parts, and
+  has its own budget. Moving the content out releases the parts it covers, and
   the in-flight path is then judged by what it holds: the saved node a kill
   after the put-in left there reads already-restored; a path a kill after
   the aside left empty, or one holding whatever appeared there after a failed

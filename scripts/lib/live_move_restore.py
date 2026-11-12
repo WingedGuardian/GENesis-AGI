@@ -37,9 +37,11 @@ killed restore left half-done reads as-left by the resume rule
 entry's two writes left; the node part REPAIR.json names in flight reads
 already-restored only while its aside is still the state moved there
 (Judge._landed), and while one refused leaves its aside holding something
-the restore did not move there every other as-left part is
-``other:inflight-unresolved`` (Judge.unresolved: the record is kept, and it
-has one slot; moving that content out releases them, and the in-flight path
+the restore did not move there every as-left part at that path, below it or
+above it is ``other:inflight-unresolved`` (Judge.unresolved, runs.held_covers:
+the record is kept; every other part restores, and a hold in a folder named
+before #4011 still stops every part; moving that content out releases them,
+and the in-flight path
 is then judged by what it holds: the saved node, which a kill after the
 put-in left there, reads already-restored; a path a kill after the aside
 left empty, or one holding whatever appeared there after a failed put-back,
@@ -121,6 +123,7 @@ _mine = runs._mine
 _anchor = runs._anchor
 _origin = runs._origin
 aside_parts, run_ts, RUNS_CAP = runs.aside_parts, runs.run_ts, runs.RUNS_CAP
+held_covers, held_stops_all = runs.held_covers, runs.held_stops_all
 
 
 class _Paths:
@@ -259,6 +262,8 @@ class Judge:
         self.notes, self.dirs, self.entry_of, self.resumed = {}, {}, {}, None
         self.held = None  # the unresolved in-flight aside, shown (set by _judged)
         self.asides_left: list = []  # (run, path) of every as-left aside (runs.aside_parts)
+        self.held_asides: list = []  # [run, path, shown] of every held aside (runs.aside_parts)
+        self.holds: list = []  # every hold, the slot's first (_judged): runs.held_covers
         self.fmt = rp._out(repo, "rev-parse", "--show-object-format")
         self.head = rp._tree(repo, "HEAD")
         self.tag = rp._tree(repo, report["tag"])
@@ -664,9 +669,9 @@ class Judge:
         """The aside REPAIR.json's in-flight part left, as shown, while that
         part is neither as-left nor already-restored and its aside holds
         something that is not the state the restore moved there (#3986 review);
-        else None. The record then stays, and since it
-        has one slot, nothing else is written (live_move_restore_write) until
-        what is there is moved out: every rerun names it."""
+        else None. The record then stays, and no part at that path, below it
+        or above it is written (runs.held_covers) until what is there is moved
+        out: every rerun names it."""
         inf = self.inflight
         if not inf or self.runs is None:
             return None
@@ -938,21 +943,24 @@ def _judged(rp, repo: str, ctx, say, write: bool, nothing: str):
         parts = [part for row in judge.rows if row["class"] == "foreign" for part in judge.row(row)]
     except OSError as exc:
         return unreadable(exc)
-    if where := judge.unresolved(parts):
-        for n, (p, k, v) in enumerate(parts):
-            # A part refused only by --check's prediction is as-left to the writer.
-            predicted = k in ("node", "entry") and judge.entry_of.get(p, p) in judge.predicted
-            if v == "as-left" or predicted:
-                parts[n] = (p, k, INFLIGHT_UNRESOLVED)
-                judge.notes[(p, k)] = unresolved_note(where)
-    judge.held = where
+    judge.held = where = judge.unresolved(parts)
     try:
-        parts += aside_parts(judge)
+        asides = aside_parts(judge)
     except _Whole as exc:
         return str(exc)
     except OSError as exc:  # a run folder it cannot read: refused by name (#4364 review)
         return unreadable(exc)
-    if not write and not where:  # held, the writer makes no index call, sets no flag
+    judge.holds = ([[*judge.inflight[:2], where]] if where else []) + judge.held_asides
+    for n, (p, k, v) in enumerate(parts):
+        # A part refused only by --check's prediction is as-left to the writer.
+        predicted = k in ("node", "entry") and judge.entry_of.get(p, p) in judge.predicted
+        if (v == "as-left" or predicted) and held_covers(judge.holds, p):
+            parts[n] = (p, k, INFLIGHT_UNRESOLVED)
+            shown = next(h[2] for h in judge.holds if held_covers([h], p))
+            judge.notes[(p, k)] = unresolved_note(shown)
+    parts += asides
+    # A hold that stops every part (an old-form folder): no index call, no flag.
+    if not write and not held_stops_all(judge.holds):
         parts = as_the_writer_would(rp, judge, parts)
     return judge, parts, loaded, ctx
 
@@ -963,8 +971,9 @@ INFLIGHT_UNRESOLVED = "other:inflight-unresolved"
 
 def unresolved_note(where: str) -> str:
     return (
-        f"an interrupted restore's aside {where} holds newer content: nothing else is"
-        " written until it is moved out; its own path is then judged by what it holds"
+        f"an interrupted restore's aside {where} holds newer content: nothing at its"
+        " path, below it or above it is written until it is moved out; its own path is"
+        " then judged by what it holds"
     )
 
 

@@ -39,8 +39,11 @@ with not delivering someone else's work:
     no      fail    fail    PENDING          not this PR's work
 
 ``--at-path DIR`` runs scenarios against a directory and prints PASS or FAIL
-per id. A scenario writer uses it to check that a new scenario passes on the
-current tree and fails on a deliberately broken copy.
+per id. ``--at-ref REF`` does the same against a temporary worktree of a commit,
+which it creates and removes itself; ``--overlay DIR`` copies that directory's
+files over the worktree first. A scenario writer uses the two to check that a
+new scenario passes on the current tree and fails on a deliberately broken copy,
+without ever holding a worktree of its own.
 
 ``--dismiss TIME --reason TEXT`` appends a dismissal row to the fence's
 exposure log for the exposure row(s) recorded at exactly ``TIME``, once the
@@ -79,6 +82,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -956,11 +960,106 @@ def cmd_at_path(root: Path, holdout: Path, ids: list[str], out=None) -> int:
     return 2 if missing else 0
 
 
+def _copy_overlay(overlay: Path, tree: Path) -> int:
+    """Copy every file under ``overlay`` onto ``tree`` at the same relative path.
+
+    Contents only: a file that already exists keeps its mode, and a new file
+    takes the overlay file's. Refused: a link in the overlay, a path under
+    ``.git``, and a path that is, or passes through, a link in the tree (the
+    copy would land wherever the link points). So an overlay changes files
+    inside the tree under test and nothing else.
+    """
+    if not overlay.is_dir():
+        raise RunnerError(f"overlay is not a directory: {overlay}")
+    count = 0
+    for src in sorted(overlay.rglob("*")):
+        rel = src.relative_to(overlay)
+        if src.is_symlink():
+            raise RunnerError(f"overlay holds a link: {rel}")
+        if src.is_dir():
+            continue
+        if rel.parts[0] == ".git":
+            raise RunnerError(f"overlay may not write under .git: {rel}")
+        for depth in range(1, len(rel.parts) + 1):
+            if (tree / Path(*rel.parts[:depth])).is_symlink():
+                raise RunnerError(f"overlay path crosses a link in the tree: {rel}")
+        target = tree / rel
+        is_new = not target.exists()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, target)
+        if is_new:
+            shutil.copymode(src, target)
+        count += 1
+    if not count:
+        raise RunnerError(f"overlay holds no files: {overlay}")
+    return count
+
+
+def cmd_at_ref(
+    ref: str, overlay: Path | None, root: Path, holdout: Path, ids: list[str], out=None
+) -> int:
+    """Run scenarios against a temporary worktree of ``ref``, removed afterwards.
+
+    The runner owns the worktree from creation to removal, so a caller that may
+    not remove worktrees itself (an agent session in this repository) never
+    holds one. ``overlay`` is copied over the tree first: the changed arm of a
+    writer's check.
+    """
+    out = out or sys.stdout
+    if not holdout.is_file():
+        # Before the checkout: a worktree is not worth making to say this.
+        print("no holdout on this install", file=out)
+        return 0
+    sha = _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").strip()
+    holder = Path(tempfile.mkdtemp(prefix="holdout-ref-", dir=_scratch_base()))
+    try:
+        with _Worktree(root, sha, holder, "tree") as tree:
+            changed = _copy_overlay(overlay, tree) if overlay is not None else 0
+            note = f", {changed} file(s) overlaid" if overlay is not None else ""
+            print(f"holdout: {ref} at {sha[:12]}{note}", file=out)
+            return cmd_at_path(tree, holdout, ids, out)
+    finally:
+        shutil.rmtree(holder, ignore_errors=True)
+        # A removal that failed leaves a registration whose directory is gone.
+        subprocess.run(
+            ["git", "-C", str(root), "worktree", "prune"], capture_output=True, check=False
+        )
+        if holder.exists():
+            # A step made something here unremovable: say so, never silently.
+            print(f"holdout: could not remove {holder}", file=out)
+
+
+@contextlib.contextmanager
+def _signals_exit():
+    """Turn SIGTERM and SIGHUP into ``SystemExit`` so every ``finally`` runs.
+
+    A run killed by its caller (a tool timeout, a closed terminal) would
+    otherwise leave its worktrees, its scratch and a running step behind.
+    """
+
+    def _exit(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    previous = {}
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            previous[sig] = signal.signal(sig, _exit)
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--pr", type=int, help="judge this merged PR")
     mode.add_argument("--at-path", type=Path, help="run scenarios against this directory")
+    mode.add_argument(
+        "--at-ref",
+        help="run scenarios against a temporary worktree of this commit, removed afterwards",
+    )
     mode.add_argument(
         "--dismiss",
         metavar="TIME",
@@ -976,7 +1075,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--root", type=Path, help="git checkout to cut worktrees from (default: cwd)")
     ap.add_argument("--holdout", type=Path, default=DEFAULT_HOLDOUT)
     ap.add_argument(
-        "--scenario", action="append", default=[], help="with --at-path: only these ids"
+        "--scenario",
+        action="append",
+        default=[],
+        help="with --at-path or --at-ref: only these ids",
+    )
+    ap.add_argument(
+        "--overlay",
+        type=Path,
+        help="with --at-ref: copy this directory's files over the worktree before running",
     )
     ap.add_argument("--reason", help="with --dismiss: why the owner judged it harmless")
     args = ap.parse_args(argv)
@@ -989,8 +1096,10 @@ def main(argv: list[str] | None = None) -> int:
         lo, hi = DISMISS_REASON_CHARS
         if not lo <= len(reason) <= hi or _clean_reason(reason) != reason:
             ap.error(f"--reason must be {lo} to {hi} printable ASCII characters")
-    if args.scenario and args.at_path is None:
-        ap.error("--scenario applies to --at-path only")
+    if args.scenario and args.at_path is None and args.at_ref is None:
+        ap.error("--scenario applies to --at-path and --at-ref only")
+    if args.overlay is not None and args.at_ref is None:
+        ap.error("--overlay applies to --at-ref only")
     if args.has_holdout:
         if args.holdout.is_file():
             print(f"holdout: present at {args.holdout}")
@@ -998,13 +1107,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"holdout: none (would be {args.holdout})")
         return 0
     try:
-        if args.dismiss is not None:
-            return cmd_dismiss(args.dismiss, reason)
-        if args.at_path is not None:
-            return cmd_at_path(args.at_path.resolve(), args.holdout, args.scenario)
-        root = (args.root or Path.cwd()).resolve()
-        root = Path(_git(root, "rev-parse", "--show-toplevel").strip())
-        return cmd_pr(args.pr, args.repo, root, args.holdout)
+        with _signals_exit():
+            if args.dismiss is not None:
+                return cmd_dismiss(args.dismiss, reason)
+            if args.at_path is not None:
+                return cmd_at_path(args.at_path.resolve(), args.holdout, args.scenario)
+            root = (args.root or Path.cwd()).resolve()
+            root = Path(_git(root, "rev-parse", "--show-toplevel").strip())
+            if args.at_ref is not None:
+                overlay = args.overlay.resolve() if args.overlay is not None else None
+                return cmd_at_ref(args.at_ref, overlay, root, args.holdout, args.scenario)
+            return cmd_pr(args.pr, args.repo, root, args.holdout)
     except RunnerError as exc:
         print(f"holdout: cannot run: {exc}", file=sys.stdout)
         return 3
