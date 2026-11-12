@@ -1810,6 +1810,14 @@ modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
 verified: 6b4f275 2026-11-08
 ```
 
+Scoped verification: internal `mcp/shared_http` composition only. It receives
+initialized request-owned resources and supplies SDK transport limits, app-wide
+authority/authentication, per-message caller/profile binding, shared/local
+ancestry admission, nonblocking tool capacity and authenticated version/catalog
+status. No launcher selects it; owned bootstrap, native clients and rollout
+remain separate. See `docs/reference/shared-mcp-http.md`. That scoped check
+(5a3de4eee, 2026-11-08) does not requalify the other channels/interfaces subsystems.
+
 The neural monitor includes the non-routing **Fallback** observation, and the
 dashboard labels the shared fallback indicator as last successful/observed use.
 Individual managed provider selection remains scoped to its native receipt;
@@ -2558,6 +2566,20 @@ verified: 4721e0d93 2026-11-07
   `live_repair_unresolved` reads the newest READ one, and
   Telegram alert fields are cut before escaping. Residual: a container that
   fakes git's own output can still pass the probe.
+- **`RESTART_SERVICES` waits for systemd's own start** (#3492 D2): it reads
+  genesis-server's `ActiveState`, `SubState` and `InvocationID` first. A unit
+  still `activating` gets no command, because its start step may be the boot
+  repair healing the checkout, and a restart would SIGTERM it. A `failed` or
+  `inactive` unit gets `start --no-block`, an active one `restart --no-block`.
+  The result is then judged by the unit, polled every 5 s for up to 200 s by the clock (a
+  stop, a start step and RestartSec at the unit's 90 + 90 + 10 s): success
+  only once a new invocation is `active`, since just after a `--no-block`
+  restart the old process can still read active. Three unreadable reads in a
+  row end the wait, and a unit at its start limit (`Result=start-limit-hit`)
+  is reported at once with that named. A client timeout on the
+  command is not a failure in itself. A unit that fails or never comes up is
+  reported with its state and the boot repair's newest `live-move repair:`
+  journal line (cut to 400), and that report is the recovery-failed page.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
   `scripts/update.sh` / `guardian-gateway.sh` (the host-deploy gate in the dev
   skill). Known wart: the watchdog's stale-alert wording inverts when the
@@ -4273,6 +4295,12 @@ A 2026-11-07 verification at the same commit covers the request-ownership
 prerequisite below; the other platform descriptions retain their individually
 cited verification dates.
 
+Shared validator-health also has a request-local automatic activity-write opt-out
+around the entire message boundary. It preserves memory counters and the
+construction-time persistence hard opt-out, without suppressing queued ordinary
+flushes or validator-memory records. This does not strengthen batch durability
+or make the service read-only.
+
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
 provider/model/outcome. Failed historical attempts render as a warning, not an
 inferred current provider outage. The readiness worker uses the shared
@@ -5173,13 +5201,20 @@ logger or unrelated exceptions with copied text and no provenance.
   pointing away from `$GIT_COMMON_DIR/hooks` nothing is touched and the hooks
   stay pending (readiness names that setting). Every later run first re-reads
   each pending report (through `load_report`; a DISMISS_MARK folder is
-  skipped) under both locks and retries it while the branch `live` is still
-  its tag and HEAD is on `live` (HEAD elsewhere: left pending; an entry whose
-  commits are not full commit ids: left as it is), marks it `superseded` once
-  `live` itself moved, and writes back only `hooks` (0600); a report
+  skipped) under both locks, before its heal, and judges it against the refs
+  as it found them: `superseded` once `live` itself left the report's tag;
+  owed while `live` is that tag and HEAD is on `live` (HEAD elsewhere: left
+  pending; an entry whose commits are not full commit ids: left as it is).
+  An owed report's restore-hooks runs only after the heal, and only when the
+  tree then reads SAFE (no state, or one the guard calls SAFE), judged again
+  first since the heal may have moved `live` (#4367): restore-hooks runs the
+  checkout's engine and sync-hooks.sh, which a half-written tree may hold
+  another commit's bytes for and a held one a hand edit. A forward heal's own
+  restore-hooks runs inside the heal, once the files are the tag's, as
+  before. Each retry writes back only `hooks` (0600); a report
   dismissed with `dismissed_at` is still retried while its folder exists
   (dismissal ends only its count and its keep). One report's retry failing
-  (its write, say) is logged and never stops the heal that follows.
+  (its write, say) is logged and never stops another report's retry.
   `--dismiss` and a restore take update.lock too, so neither's field is lost
   (every REPAIR.json writer holds it); with no state file and update.lock
   held it exits 0 at once. The restore-hooks run is not bounded by the boot budget;
@@ -5396,13 +5431,18 @@ logger or unrelated exceptions with copied text and no provenance.
   the restore did not move there: while the in-flight part's aside holds
   anything else (a write after the move, through an open fd), unless that
   part read already-restored or as-left by the resume rule (both judged the
-  aside itself), the record is kept, and since it has one slot no other part
-  is written (`other:inflight-unresolved`, naming the aside, in `--check`
-  too; the in-flight part too, when its path holds the tag's state again), so
+  aside itself), the record is kept, and no part at that path, below it or
+  above it is written (`other:inflight-unresolved`, naming the aside, in
+  `--check` too; the in-flight part too, when its path holds the tag's state
+  again); every other part restores (#4025 item 1). Every held aside the run
+  folders show covers its path the same way, and so does an aside it cannot
+  read or judge, so a hold still covers it after a later part's intent took
+  the slot; a hold in a folder named before
+  #4011 still stops every part, since only the in-flight slot finds it. So
   every run names it and exits 1 until what is there is moved out. An aside
   still holding the repair's own as-left copy (the part refused by a gate
   after a kill, or a put-back that failed) holds nothing back; that one read
-  has its own budget. Moving the content out releases the other parts, and
+  has its own budget. Moving the content out releases the parts it covers, and
   the in-flight path is then judged by what it holds: the saved node a kill
   after the put-in left there reads already-restored; a path a kill after
   the aside left empty, or one holding whatever appeared there after a failed
@@ -5540,6 +5580,11 @@ verified: 81bbdb0a9 2026-11-08
   under propose-only; the apply/resolve path that would create one is a
   follow-up (future WS1 `enforce`).
   Voice-master exemplars are on the contribution FORBIDDEN list.
+  Manual-only catalog entries (`disable-model-invocation: true`) receive no
+  hook nudge or executor suggestion/assigned/delegated body injection, while
+  explicit foreground lookup and the inventory remain available. Usage retains
+  them as not nudge-eligible. Activation requires explicit catalog regeneration
+  and restarting cached consumers; see `docs/reference/manual-only-skills.md`.
   Cross-tool export: `scripts/export_agents_md.py` writes a body-scope
   inventory (skills + action tools, never memory/brain) into a managed
   `<!-- genesis:skills -->` block in `AGENTS.md` for Cursor/Codex/other

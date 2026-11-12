@@ -11,6 +11,8 @@ Exit codes:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from tests.test_hooks.conftest import run_hook
@@ -181,6 +183,14 @@ class TestBashHookRmRf:
     that uses depth-based path analysis. Paths must be at least 4 components
     deep to be allowed. Special targets (., .., /) are always blocked.
     """
+
+    @pytest.fixture(autouse=True)
+    def _a_real_home(self, monkeypatch):
+        """``~`` cases assume an ordinary (two-level) home; the live closure's
+        session HOME is deep. The guard only judges the text it is given."""
+        from tests import _live_fence
+
+        monkeypatch.setenv("HOME", _live_fence.real_home() or str(Path.home()))
 
     def test_rm_rf_root_blocked(self, rm_rf_hook_command: str) -> None:
         """rm -rf / -> BLOCKED (always-block target)."""

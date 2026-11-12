@@ -191,12 +191,44 @@ somewhere could be read later, which the log cannot see. It also keeps
 `$GENESIS_HOME/.ignore` listing `holdout/`, so ripgrep-based searches of the
 Genesis home skip the directory.
 
+`--dismiss TIME --reason TEXT` takes the exposure row(s) recorded at exactly
+`TIME` (the row's `at` value) out of that count and that list, once the owner has
+judged them harmless, for example a command that printed only the directory's
+path. It removes nothing: it appends a `dismissed` row with the time, the number
+of rows and the reason (10 to 300 printable ASCII characters), under the
+fence's lock. Every later run says how many rows are dismissed and when the
+latest dismissal was made, and says "no exposures outstanding" rather than "no
+exposures logged" when nothing else is left. It never prints the reason: the
+runner's output is exempt from the fence's content scan, so free text stays in
+the log for the owner. One time can match several rows (every exposure recorded
+in that second), and the command prints how many it dismissed. A dismissal
+reaches only exposure rows written before it, never a holdout-writer row and
+never a row recorded later, so none can be made in advance. A row with no
+readable time cannot be dismissed. A dismissal row, and a dismissed exposure,
+are dated rows like any other: they still bound an unreadable row before them
+and still count when the runner checks whether the clock went back. Any
+session can run the command, so the check is the visible count and time on every
+run, which a validator reports to the owner for confirmation; a session runs it
+only on the owner's ruling about that row.
+
 `--has-holdout` prints whether this install keeps a holdout and where, and
 reads nothing in it; skills and agents use it instead of hard-coding the path.
 
 `--at-path DIR [--scenario H-NN ...]` runs scenarios against a directory and
-prints `PASS` or `FAIL` per id. The writer uses it to check a new scenario on the
-current tree and on a deliberately broken copy.
+prints `PASS` or `FAIL` per id.
+
+`--at-ref REF [--overlay DIR] [--scenario H-NN ...]` does the same against a
+temporary detached worktree of `REF`, which the runner creates and removes
+itself. `--overlay DIR` copies every file under `DIR` over the worktree at the
+same relative path first. The copy is contents only: an existing file keeps
+its mode, a new file takes the overlay file's, and an overlay cannot delete a
+file. A link in the overlay, a path under `.git`, and a path that is or passes
+through a link in the worktree are refused. A run ended by SIGTERM or SIGHUP
+still removes its worktree and scratch, and a tree it could not remove is named
+in the output. The writer uses it to check a new scenario on the current tree, and
+then on a deliberately changed copy, without creating a worktree of its own: an
+agent session in this repository may not remove one, so a worktree the writer
+made would be left behind.
 
 ## Rules for sessions
 

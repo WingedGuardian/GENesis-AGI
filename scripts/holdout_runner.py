@@ -39,8 +39,18 @@ with not delivering someone else's work:
     no      fail    fail    PENDING          not this PR's work
 
 ``--at-path DIR`` runs scenarios against a directory and prints PASS or FAIL
-per id. A scenario writer uses it to check that a new scenario passes on the
-current tree and fails on a deliberately broken copy.
+per id. ``--at-ref REF`` does the same against a temporary worktree of a commit,
+which it creates and removes itself; ``--overlay DIR`` copies that directory's
+files over the worktree first. A scenario writer uses the two to check that a
+new scenario passes on the current tree and fails on a deliberately broken copy,
+without ever holding a worktree of its own.
+
+``--dismiss TIME --reason TEXT`` appends a dismissal row to the fence's
+exposure log for the exposure row(s) recorded at exactly ``TIME``, once the
+owner has judged them harmless. Nothing is removed: the runner then leaves those
+rows out of the exposure count and the spoiled list, and prints how many it left
+out and when the latest dismissal was made, on every run (the reason stays in
+the log).
 
 Steps run with ``bash`` in the checkout under test (``HOLDOUT_ROOT``), with
 that checkout's ``src`` first on ``PYTHONPATH`` so ``import genesis`` loads the
@@ -72,6 +82,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -91,6 +102,7 @@ DEFAULT_HOLDOUT = genesis_home() / "holdout" / "HOLDOUT.md"
 # The holdout fence writes only real exposures (reads, writes, accesses and
 # content seen by anyone but the writer) here, and never rotates it.
 EXPOSURE_LOG = genesis_home() / "logs" / "holdout-exposures.jsonl"
+DISMISS_REASON_CHARS = (10, 300)
 # A proxy for "the fence is installed": the hook file is present in this checkout.
 # The wiring itself lives in .claude/settings.json and .codex/config.toml.
 FENCE_HOOK = Path(__file__).resolve().parent / "hooks" / "holdout_fence.py"
@@ -697,6 +709,102 @@ def _utc_day(value: object) -> dt.date | None:
         return None
 
 
+def _log_rows() -> list[dict | None]:
+    """Every non-blank line of the exposure log, in order; None for one that is not a JSON object."""
+    rows: list[dict | None] = []
+    with open(EXPOSURE_LOG, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                row = None
+            rows.append(row if isinstance(row, dict) else None)
+    return rows
+
+
+def _clean_reason(value: object) -> str:
+    """A reason as one line of printable ASCII, whitespace collapsed."""
+    flat = " ".join(str(value).split())
+    return "".join(ch for ch in flat if " " <= ch <= "~")[: DISMISS_REASON_CHARS[1]]
+
+
+def _dismissals(rows: list[dict | None]) -> tuple[set[int], tuple[str, str]]:
+    """Indices of exposure rows a later ``dismissed`` row names, and the latest dismissal.
+
+    Only an exposure row (not ``allowed``, not ``dismissed``) with a time can be
+    dismissed, and only by a dismissal after it in the log.
+    """
+    dismissed: set[int] = set()
+    last = ("", "")
+    for j, row in enumerate(rows):
+        if row is None or row.get("kind") != "dismissed":
+            continue
+        target = row.get("dismisses")
+        if not isinstance(target, str) or not target:
+            continue
+        hits = {
+            i
+            for i, earlier in enumerate(rows[:j])
+            if earlier is not None
+            and earlier.get("kind") not in ("allowed", "dismissed")
+            and str(earlier.get("at") or "") == target
+        }
+        if hits - dismissed:
+            dismissed |= hits
+            last = (str(row.get("at") or ""), _clean_reason(row.get("reason", "")))
+    return dismissed, last
+
+
+def cmd_dismiss(at: str, reason: str, out=None) -> int:
+    """Append a dismissal for the undismissed exposure row(s) recorded at exactly ``at``.
+
+    Taken under the fence's own lock, so it never interleaves with a row the
+    fence is writing. Refused when no such row exists yet: a dismissal is a
+    ruling on something already seen, never a pass for something to come.
+    """
+    import fcntl
+
+    out = out or sys.stdout
+    if not EXPOSURE_LOG.exists():
+        raise RunnerError("no exposure log to dismiss from")
+    with open(f"{EXPOSURE_LOG}.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            rows = _log_rows()
+            already, _ = _dismissals(rows)
+            matches = [
+                i
+                for i, row in enumerate(rows)
+                if row is not None
+                and row.get("kind") not in ("allowed", "dismissed")
+                and str(row.get("at") or "") == at
+                and i not in already
+            ]
+            if not matches:
+                raise RunnerError(f"no undismissed exposure recorded at {at}")
+            row = {
+                "at": dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "kind": "dismissed",
+                "dismisses": at,
+                "rows": len(matches),
+                "reason": reason,
+            }
+            torn = False
+            with open(EXPOSURE_LOG, "rb") as tail:
+                if tail.seek(0, os.SEEK_END) > 0:
+                    tail.seek(-1, os.SEEK_END)
+                    torn = tail.read(1) != b"\n"
+            with open(EXPOSURE_LOG, "a", encoding="utf-8") as fh:
+                # A torn last line (or a row with no newline) would swallow it.
+                fh.write(("\n" if torn else "") + json.dumps(row) + "\n")
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    print(f"holdout: dismissed {len(matches)} exposure(s) recorded at {at}", file=out)
+    return 0
+
+
 def _print_exposures(out, scenarios: list[Scenario]) -> None:
     """Always one line: how many exposures the holdout fence has recorded.
 
@@ -721,6 +829,14 @@ def _print_exposures(out, scenarios: list[Scenario]) -> None:
     message clears itself the next time the writer writes a scenario, for as
     long as that scenario stays in the file. A row with no readable time never
     clears; the fence always writes one.
+
+    A ``dismissed`` row (written by ``--dismiss``) takes the exposure rows before
+    it whose time equals its ``dismisses`` value out of the count and the
+    spoiled list; the line says how many and when the latest was made, never
+    the reason (free text, printed where the fence does not scan). A dismissal
+    never reaches a row written after it, so none can be made in advance. Its
+    row, and a dismissed exposure, still date the log: the clock-went-back test
+    uses every dated row.
     """
     if not FENCE_HOOK.exists():
         print("holdout fence: not installed in this checkout; exposures are not recorded", file=out)
@@ -730,41 +846,49 @@ def _print_exposures(out, scenarios: list[Scenario]) -> None:
         return
     count, bad, times, days = 0, 0, [], []
     unbounded = False  # an exposure of unknown time with no dated row after it yet
+    seen: dt.date | None = None  # the latest day of ANY dated row so far, of any kind
     writer_rows: list[tuple[str, dt.date | None]] = []
     try:
-        with open(EXPOSURE_LOG, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    row = None
-                if not isinstance(row, dict):
-                    bad += 1
-                    unbounded = True
-                    continue
-                day = _utc_day(row.get("at"))
-                if day is not None and unbounded and (not days or day >= max(days)):
-                    # A later dated row bounds it, unless the clock went back.
-                    days.append(day)
-                    unbounded = False
-                if row.get("kind") == "allowed":
-                    # The writer is known only by the name an agent declares, so
-                    # these are matched against the scenarios below, never
-                    # treated as harmless outright.
-                    writer_rows.append((str(row.get("at") or ""), day))
-                    continue
-                count += 1
-                times.append(str(row.get("at") or ""))
-                if day is None:
-                    unbounded = True
-                else:
-                    days.append(day)
+        rows = _log_rows()
     except OSError as exc:
         print(f"holdout fence: exposure log unreadable ({exc}); treat as unknown", file=out)
         return
+    dismissed, last_dismissal = _dismissals(rows)
+    for i, row in enumerate(rows):
+        if row is None:
+            bad += 1
+            unbounded = True
+            continue
+        day = _utc_day(row.get("at"))
+        if day is not None and unbounded and (seen is None or day >= seen):
+            # A later dated row bounds it, unless the clock went back. Every
+            # dated row is evidence of the clock, a dismissed one included.
+            days.append(day)
+            unbounded = False
+        if day is not None:
+            seen = day if seen is None else max(seen, day)
+        if row.get("kind") == "dismissed":
+            continue
+        if row.get("kind") == "allowed":
+            # The writer is known only by the name an agent declares, so
+            # these are matched against the scenarios below, never
+            # treated as harmless outright.
+            writer_rows.append((str(row.get("at") or ""), day))
+            continue
+        if i in dismissed:
+            continue
+        count += 1
+        times.append(str(row.get("at") or ""))
+        if day is None:
+            unbounded = True
+        else:
+            days.append(day)
     tail = f"; {bad} unreadable line(s)" if bad else ""
+    if dismissed:
+        # The reason is free text, so it stays in the log for the owner: this
+        # line is exempt from the fence's content scan.
+        d_at = last_dismissal[0] if _utc_day(last_dismissal[0]) else "time unreadable"
+        tail += f"; {len(dismissed)} dismissed (latest dismissal {d_at}; reasons in the log)"
     tomorrow = dt.datetime.now(dt.UTC).date() + dt.timedelta(days=1)
     # A date past tomorrow cannot be right, and would silence every later access.
     written = [d for sc in scenarios for d in sc.author_dates if d <= tomorrow]
@@ -787,7 +911,8 @@ def _print_exposures(out, scenarios: list[Scenario]) -> None:
             f"; {len(writer_rows)} holdout-writer access(es), none later than the newest scenario"
         )
     if not count and not bad:
-        print(f"holdout fence: no exposures logged{tail}", file=out)
+        state = "no exposures outstanding" if dismissed else "no exposures logged"
+        print(f"holdout fence: {state}{tail}", file=out)
         return
     latest = None if unbounded or not days else max(days)
     spoiled = [
@@ -835,11 +960,112 @@ def cmd_at_path(root: Path, holdout: Path, ids: list[str], out=None) -> int:
     return 2 if missing else 0
 
 
+def _copy_overlay(overlay: Path, tree: Path) -> int:
+    """Copy every file under ``overlay`` onto ``tree`` at the same relative path.
+
+    Contents only: a file that already exists keeps its mode, and a new file
+    takes the overlay file's. Refused: a link in the overlay, a path under
+    ``.git``, and a path that is, or passes through, a link in the tree (the
+    copy would land wherever the link points). So an overlay changes files
+    inside the tree under test and nothing else.
+    """
+    if not overlay.is_dir():
+        raise RunnerError(f"overlay is not a directory: {overlay}")
+    count = 0
+    for src in sorted(overlay.rglob("*")):
+        rel = src.relative_to(overlay)
+        if src.is_symlink():
+            raise RunnerError(f"overlay holds a link: {rel}")
+        if src.is_dir():
+            continue
+        if rel.parts[0] == ".git":
+            raise RunnerError(f"overlay may not write under .git: {rel}")
+        for depth in range(1, len(rel.parts) + 1):
+            if (tree / Path(*rel.parts[:depth])).is_symlink():
+                raise RunnerError(f"overlay path crosses a link in the tree: {rel}")
+        target = tree / rel
+        is_new = not target.exists()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, target)
+        if is_new:
+            shutil.copymode(src, target)
+        count += 1
+    if not count:
+        raise RunnerError(f"overlay holds no files: {overlay}")
+    return count
+
+
+def cmd_at_ref(
+    ref: str, overlay: Path | None, root: Path, holdout: Path, ids: list[str], out=None
+) -> int:
+    """Run scenarios against a temporary worktree of ``ref``, removed afterwards.
+
+    The runner owns the worktree from creation to removal, so a caller that may
+    not remove worktrees itself (an agent session in this repository) never
+    holds one. ``overlay`` is copied over the tree first: the changed arm of a
+    writer's check.
+    """
+    out = out or sys.stdout
+    if not holdout.is_file():
+        # Before the checkout: a worktree is not worth making to say this.
+        print("no holdout on this install", file=out)
+        return 0
+    sha = _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").strip()
+    holder = Path(tempfile.mkdtemp(prefix="holdout-ref-", dir=_scratch_base()))
+    try:
+        with _Worktree(root, sha, holder, "tree") as tree:
+            changed = _copy_overlay(overlay, tree) if overlay is not None else 0
+            note = f", {changed} file(s) overlaid" if overlay is not None else ""
+            print(f"holdout: {ref} at {sha[:12]}{note}", file=out)
+            return cmd_at_path(tree, holdout, ids, out)
+    finally:
+        shutil.rmtree(holder, ignore_errors=True)
+        # A removal that failed leaves a registration whose directory is gone.
+        subprocess.run(
+            ["git", "-C", str(root), "worktree", "prune"], capture_output=True, check=False
+        )
+        if holder.exists():
+            # A step made something here unremovable: say so, never silently.
+            print(f"holdout: could not remove {holder}", file=out)
+
+
+@contextlib.contextmanager
+def _signals_exit():
+    """Turn SIGTERM and SIGHUP into ``SystemExit`` so every ``finally`` runs.
+
+    A run killed by its caller (a tool timeout, a closed terminal) would
+    otherwise leave its worktrees, its scratch and a running step behind.
+    """
+
+    def _exit(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    previous = {}
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            previous[sig] = signal.signal(sig, _exit)
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--pr", type=int, help="judge this merged PR")
     mode.add_argument("--at-path", type=Path, help="run scenarios against this directory")
+    mode.add_argument(
+        "--at-ref",
+        help="run scenarios against a temporary worktree of this commit, removed afterwards",
+    )
+    mode.add_argument(
+        "--dismiss",
+        metavar="TIME",
+        help="dismiss the exposure row(s) recorded at exactly this time (the row's 'at'); "
+        "needs --reason, and the owner's ruling",
+    )
     mode.add_argument(
         "--has-holdout",
         action="store_true",
@@ -849,11 +1075,31 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--root", type=Path, help="git checkout to cut worktrees from (default: cwd)")
     ap.add_argument("--holdout", type=Path, default=DEFAULT_HOLDOUT)
     ap.add_argument(
-        "--scenario", action="append", default=[], help="with --at-path: only these ids"
+        "--scenario",
+        action="append",
+        default=[],
+        help="with --at-path or --at-ref: only these ids",
     )
+    ap.add_argument(
+        "--overlay",
+        type=Path,
+        help="with --at-ref: copy this directory's files over the worktree before running",
+    )
+    ap.add_argument("--reason", help="with --dismiss: why the owner judged it harmless")
     args = ap.parse_args(argv)
-    if args.scenario and args.at_path is None:
-        ap.error("--scenario applies to --at-path only")
+    if (args.reason is not None) != (args.dismiss is not None):
+        ap.error("--dismiss and --reason go together")
+    if args.dismiss is not None:
+        if _utc_day(args.dismiss) is None:
+            ap.error("--dismiss takes the row's 'at' time, an ISO timestamp")
+        reason = " ".join(args.reason.split())
+        lo, hi = DISMISS_REASON_CHARS
+        if not lo <= len(reason) <= hi or _clean_reason(reason) != reason:
+            ap.error(f"--reason must be {lo} to {hi} printable ASCII characters")
+    if args.scenario and args.at_path is None and args.at_ref is None:
+        ap.error("--scenario applies to --at-path and --at-ref only")
+    if args.overlay is not None and args.at_ref is None:
+        ap.error("--overlay applies to --at-ref only")
     if args.has_holdout:
         if args.holdout.is_file():
             print(f"holdout: present at {args.holdout}")
@@ -861,11 +1107,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"holdout: none (would be {args.holdout})")
         return 0
     try:
-        if args.at_path is not None:
-            return cmd_at_path(args.at_path.resolve(), args.holdout, args.scenario)
-        root = (args.root or Path.cwd()).resolve()
-        root = Path(_git(root, "rev-parse", "--show-toplevel").strip())
-        return cmd_pr(args.pr, args.repo, root, args.holdout)
+        with _signals_exit():
+            if args.dismiss is not None:
+                return cmd_dismiss(args.dismiss, reason)
+            if args.at_path is not None:
+                return cmd_at_path(args.at_path.resolve(), args.holdout, args.scenario)
+            root = (args.root or Path.cwd()).resolve()
+            root = Path(_git(root, "rev-parse", "--show-toplevel").strip())
+            if args.at_ref is not None:
+                overlay = args.overlay.resolve() if args.overlay is not None else None
+                return cmd_at_ref(args.at_ref, overlay, root, args.holdout, args.scenario)
+            return cmd_pr(args.pr, args.repo, root, args.holdout)
     except RunnerError as exc:
         print(f"holdout: cannot run: {exc}", file=sys.stdout)
         return 3

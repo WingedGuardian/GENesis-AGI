@@ -242,7 +242,7 @@ def _score_skill(
       precision: "sagemaker planning" reaches the bundle's `planning` skill,
       while "planning the report" reaches no vendor skill at all.
     """
-    if not keywords:
+    if skill.get("disable-model-invocation") is True or not keywords:
         return 0.0
 
     kw_set = {kw.lower() for kw in keywords}

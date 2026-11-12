@@ -870,8 +870,8 @@ def test_a_failed_put_back_of_the_as_left_copy_never_holds_the_rest(w, mod, monk
 def test_a_hold_set_mid_run_keeps_what_that_run_already_restored(w, mod, monkeypatch, capsys):
     """#3986 review: the run restores the directory P (its entry P/mine.txt
     with it), then sub/s1's aside is written through an open fd after its
-    put-in. The hold refuses only what is still to write (sub/t): P and its
-    entry stay restored, with no hold note on them."""
+    put-in. P and its entry stay restored, with no hold note on them, and
+    sub/t, which the hold does not cover (#4025 item 1), is restored too."""
     killed_tag_side(w, "Z3")
     _lock_aside(w, lambda: (_dir_and_later_edit(w), _foreign_edit(w)))
     age_locks(w)
@@ -895,15 +895,15 @@ def test_a_hold_set_mid_run_keeps_what_that_run_already_restored(w, mod, monkeyp
 
     rc, out = _restore_in(w, mod, monkeypatch, capsys, ts, patch=write_into_s1_aside)
     parts = _parts_of(out)
-    assert rc == 1 and len(put_ins) == 2, out  # P, then sub/s1; never sub/t
+    assert rc == 1 and len(put_ins) == 3, out  # P, sub/s1, then sub/t
     assert parts[("P", "node")] == "restored" and parts[("P/mine.txt", "entry")] == "restored", out
     assert parts[("sub/s1", "node")] == "refused:changed-during-restore", out
-    assert parts[("sub/t", "node")] == "refused:other:inflight-unresolved", out
+    assert parts[("sub/t", "node")] == "restored", out
     for line in out.splitlines():
-        if line.startswith(('"P"', '"P/')):
+        if line.startswith(('"P"', '"P/', '"sub/t"')):
             assert "inflight" not in line and "newer content" not in line, line
-    assert (w.root / "sub" / "t").read_text() == "t\n"
-    assert w.report()["restore"]["inflight"][1:] == ["sub/s1", "node"]
+    assert (w.root / "sub" / "t").read_text() == "my t\n"
+    assert w.report()["restore"]["inflight"][1:] == ["sub/s1", "node"], "the hold is kept"
 
 
 def _newer_in_s1_aside(w, put_ins: list):
@@ -949,7 +949,7 @@ def test_a_hold_mid_run_beside_a_cannot_make_entry_still_reports(w, mod, monkeyp
     assert rc == 1 and "part(s):" in out, out
     assert parts[("P/sock", "entry")] == "refused:other:cannot-make", out
     assert parts[("sub/s1", "node")] == "refused:changed-during-restore", out
-    assert parts[("sub/t", "node")] == "refused:other:inflight-unresolved", out
+    assert parts[("sub/t", "node")] == "restored", out
     assert w.report()["restore"]["inflight"][1:] == ["sub/s1", "node"]
 
 
@@ -960,7 +960,8 @@ def test_an_in_flight_path_put_back_as_left_still_names_its_aside(w, step):
     the path (`git checkout --`). The path reads as-left on its own, but only
     the resume rule's as-left looked at the aside: this one did not, so the
     aside is judged, still holds, and the rerun neither writes the path again
-    (which would overwrite the record naming the aside) nor clears the report."""
+    (which would overwrite the record naming the aside) nor clears the report;
+    sub/t, which the hold does not cover, is restored (#4025 item 1)."""
     killed_tag_side(w, "Z3")
     # sub/s1 sorts first, so the kill lands on it; sub/t is the part after.
     _lock_aside(w, lambda: ((w.root / "sub" / "t").write_text("my t\n"), _foreign_edit(w)))
@@ -981,15 +982,17 @@ def test_an_in_flight_path_put_back_as_left_still_names_its_aside(w, step):
     assert aside.read_text() == "newer, through an open fd\n", "control: the fd is the aside's"
     _git(w.root, "checkout", "--", "sub/s1")  # the tag's file back at the path
     assert (w.root / "sub" / "s1").read_text() == "s1\n"
-    for r in (_check(w, ts), _restore(w, ts), _restore(w, ts)):
+    t = {}
+    for name, r in (("check", _check(w, ts)), ("one", _restore(w, ts)), ("two", _restore(w, ts))):
         parts = _parts(r)
         assert r.returncode == 1 and str(aside) in r.stdout, r.stdout
         assert parts[("sub/s1", "node")].endswith("other:inflight-unresolved"), r.stdout
         assert w.report()["restore"]["inflight"][1:] == ["sub/s1", "node"]
         assert w.report()["restore"]["restored_at"] is None
-        assert parts[("sub/t", "node")].endswith("other:inflight-unresolved"), r.stdout
+        t[name] = parts[("sub/t", "node")]
+    assert t == {"check": "as-left", "one": "restored", "two": "already-restored"}, t
     assert (w.root / "sub" / "s1").read_text() == "s1\n"
-    assert (w.root / "sub" / "t").read_text() == "t\n"
+    assert (w.root / "sub" / "t").read_text() == "my t\n"
     assert aside.read_text() == "newer, through an open fd\n"
 
 
@@ -1023,11 +1026,14 @@ def test_the_aside_read_never_spends_the_walks_budget(w, mod, monkeypatch, capsy
     assert '"sub/t" node as-left' in out and "inflight-unresolved" not in out, out
 
 
-def test_nothing_else_is_written_while_an_in_flight_aside_is_unresolved(w, tmp_path):
-    """#3986 review: REPAIR.json has one in-flight slot. While the in-flight
-    part's aside holds newer content, writing another part would overwrite
-    the record naming it, so no other part is written (`--check` says so too);
-    once that content is moved out, the rest is restored."""
+@pytest.mark.parametrize("old_form", [False, True])
+def test_an_unresolved_in_flight_aside_holds_only_what_it_covers(w, tmp_path, old_form):
+    """#3986 review, #4025 item 1: while the in-flight part's aside holds newer
+    content, that path stays refused and the record naming it is kept; every
+    run finds a held aside by its folder's name, so a part the hold does not
+    cover (sub/t) is restored. A folder named before #4011 carries no ts and
+    only the in-flight slot finds it, so such a hold still stops every part
+    (`--check` says so too) until that content is moved out."""
     killed_tag_side(w, "Z3")
 
     def both(w):
@@ -1041,6 +1047,11 @@ def test_nothing_else_is_written_while_an_in_flight_aside_is_unresolved(w, tmp_p
     assert _restore(w, ts, **{KILL_ENV: "aside"}).returncode == -9
     assert w.report()["restore"]["inflight"][1:] == ["sub/s1", "node"], "control: sub/s1 first"
     [run] = _runs(w)
+    if old_form:  # the name a run folder had before #4011: no report ts
+        old = run.with_name(run.name.replace(f"-{ts}-live-move-restore", "-live-move-restore"))
+        run.rename(old)
+        _edit_report(w, lambda m: m["restore"]["inflight"].__setitem__(0, old.name))
+        run = old
     aside = run / "aside" / "sub" / "s1"
     aside.write_text("written after the aside\n")
     other = w.root / "sub" / "t"
@@ -1048,13 +1059,17 @@ def test_nothing_else_is_written_while_an_in_flight_aside_is_unresolved(w, tmp_p
     for r in (_check(w, ts), _restore(w, ts), _restore(w, ts)):
         parts = _parts(r)
         assert r.returncode == 1 and str(aside) in r.stdout, r.stdout
-        assert parts[("sub/t", "node")].endswith("other:inflight-unresolved"), r.stdout
-        assert other.read_text() == "t\n" and os.lstat(other).st_mtime == 1_000_000_000
+        assert parts[("sub/s1", "node")].endswith("other:changed"), r.stdout  # names the aside
         assert w.report()["restore"]["inflight"][1:] == ["sub/s1", "node"]
+        if old_form:
+            assert parts[("sub/t", "node")].endswith("other:inflight-unresolved"), r.stdout
+            assert other.read_text() == "t\n" and os.lstat(other).st_mtime == 1_000_000_000
+    if not old_form:
+        assert other.read_text() == "my t\n", "the part the hold does not cover is restored"
     assert aside.read_text() == "written after the aside\n"
     shutil.move(aside, tmp_path / "dealt-with")  # what was there, moved out
     r = _restore(w, ts)
-    assert _parts(r)[("sub/t", "node")] == "restored", r.stdout
+    assert _parts(r)[("sub/t", "node")] == ("restored" if old_form else "already-restored"), r.stdout
     assert other.read_text() == "my t\n" and w.report()["restore"]["inflight"] is None
 
 
@@ -1775,3 +1790,60 @@ def test_a_report_with_a_restore_in_flight_is_never_superseded(w):
     age_locks(w)
     assert w.repair().returncode == 0 and len(w.backups()) == 2
     assert json.loads((first / "REPAIR.json").read_text())["result"] is None
+
+
+def test_a_hold_keeps_its_path_after_a_later_intent_took_the_slot(w):
+    """#4025 PR3 review: a run killed at a later part's intent leaves the slot
+    naming that part, not the hold. The held path is still covered, since its
+    aside is found by its run folder's name: the next run never writes it, and
+    the report stays unresolved."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: ((w.root / "sub" / "t").write_text("my t\n"), _foreign_edit(w)))
+    age_locks(w)
+    assert w.repair().returncode == 0
+    ts = w.backups()[-1].name[: -len(SUFFIX)]
+    fd = os.open(w.root / "sub" / "s1", os.O_WRONLY)  # opened before the restore
+    try:
+        assert _restore(w, ts, **{KILL_ENV: "aside"}).returncode == -9
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, b"newer, through an open fd\n", 0)
+    finally:
+        os.close(fd)
+    [run] = _runs(w)
+    aside = run / "aside" / "sub" / "s1"
+    _git(w.root, "checkout", "--", "sub/s1")  # the tag's file back at the path
+    assert _restore(w, ts, **{KILL_ENV: "intent"}).returncode == -9  # sub/t's intent
+    assert w.report()["restore"]["inflight"][1] == "sub/t", "control: the slot moved"
+    for r in (_check(w, ts), _restore(w, ts)):
+        parts = _parts(r)
+        assert r.returncode == 1 and parts[("sub/s1", "node")].endswith(
+            "other:inflight-unresolved"
+        ), r.stdout
+    assert (w.root / "sub" / "s1").read_text() == "s1\n", "the held path was never written"
+    assert aside.read_text() == "newer, through an open fd\n"
+    assert w.report()["restore"]["restored_at"] is None
+    assert (w.root / "sub" / "t").read_text() == "my t\n", "what it does not cover restores"
+
+
+def test_a_held_directory_keeps_its_entries_and_restores_the_rest(w):
+    """#4025 item 1: P's node is held (its aside, the tag's file P, written to
+    after the aside): P and the entry P/mine.txt below it stay refused,
+    while sub/t, which the hold does not cover, is restored."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _dir_and_later_edit(w))
+    age_locks(w)
+    assert w.repair().returncode == 0
+    ts = w.backups()[-1].name[: -len(SUFFIX)]
+    assert _restore(w, ts, **{KILL_ENV: "aside"}).returncode == -9
+    [run] = _runs(w)
+    assert w.report()["restore"]["inflight"][1] == "P", "control: P sorts first"
+    (run / "aside" / "P").write_text("written after the aside\n")
+    r = _restore(w, ts)
+    parts = _parts(r)
+    assert r.returncode == 1, r.stdout
+    # The held node names its aside (other:changed); its entry takes its verdict.
+    assert parts[("P", "node")] == "refused:other:changed", r.stdout
+    assert parts[("P/mine.txt", "entry")] == parts[("P", "node")], r.stdout
+    assert parts[("sub/t", "node")] == "restored", r.stdout
+    assert (w.root / "sub" / "t").read_text() == "my t\n"
+    assert (run / "aside" / "P").read_text() == "written after the aside\n"
