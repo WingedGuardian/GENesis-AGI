@@ -2558,6 +2558,20 @@ verified: 4721e0d93 2026-11-07
   `live_repair_unresolved` reads the newest READ one, and
   Telegram alert fields are cut before escaping. Residual: a container that
   fakes git's own output can still pass the probe.
+- **`RESTART_SERVICES` waits for systemd's own start** (#3492 D2): it reads
+  genesis-server's `ActiveState`, `SubState` and `InvocationID` first. A unit
+  still `activating` gets no command, because its start step may be the boot
+  repair healing the checkout, and a restart would SIGTERM it. A `failed` or
+  `inactive` unit gets `start --no-block`, an active one `restart --no-block`.
+  The result is then judged by the unit, polled every 5 s for up to 200 s by the clock (a
+  stop, a start step and RestartSec at the unit's 90 + 90 + 10 s): success
+  only once a new invocation is `active`, since just after a `--no-block`
+  restart the old process can still read active. Three unreadable reads in a
+  row end the wait, and a unit at its start limit (`Result=start-limit-hit`)
+  is reported at once with that named. A client timeout on the
+  command is not a failure in itself. A unit that fails or never comes up is
+  reported with its state and the boot repair's newest `live-move repair:`
+  journal line (cut to 400), and that report is the recovery-failed page.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
   `scripts/update.sh` / `guardian-gateway.sh` (the host-deploy gate in the dev
   skill). Known wart: the watchdog's stale-alert wording inverts when the
