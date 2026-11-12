@@ -425,7 +425,7 @@ if [ -n "$_BACKUP_PASSPHRASE" ]; then
     _ENCRYPT_READY=true
 fi
 
-# encrypt_file <src> <dst> — encrypt file contents to <dst> (e.g. *.gpg).
+# encrypt_file <src> <dst> [stamp] — encrypt file contents to <dst> (e.g. *.gpg).
 #
 # The source is read through a pipe, never by name. Given a file name, gpg
 # records the file's size up front and fails ("Input/output error") when the
@@ -443,20 +443,32 @@ fi
 # over the copy. On failure the last line of gpg's stderr is logged to stderr;
 # the caller still logs its own WARNING.
 #
-# The copy is stamped 1 ns past the source's mtime from just before the read,
-# so the callers' `[ "$dst" -nt "$src" ]` skip holds while the source is
-# unchanged and fails once anything is appended after the read began. A
-# source written in the last second or two (whole seconds are compared), or
-# with an mtime ahead of the clock, is stamped at exactly its mtime instead: an
-# append inside the same timestamp tick would not move its mtime, so the next
-# run re-encrypts it rather than trusting the stamp.
+# With `stamp`, which only the callers that skip on `-nt` pass, the copy's
+# mtime is set from the source's; without it the copy keeps its encryption
+# time, as other readers expect (the host credential mirror re-copies a .gpg
+# only when its size or mtime differs, so a re-encrypt under a rotated
+# passphrase must move the mtime).
+#
+# The copy is stamped one second past the source's mtime (whole seconds, read
+# with the clock just before the read), so the callers' `[ "$dst" -nt "$src" ]`
+# skip holds while the source is unchanged and fails once anything is appended
+# after the read began: the source was at least two seconds old then, so an
+# append lands past the stamp. A source younger than that, or with an mtime
+# ahead of the clock, is stamped one second BEFORE its mtime, so the next run
+# re-encrypts it rather than trust a copy an append in the same timestamp tick
+# could have outrun. Only whole seconds are used: some coreutils
+# implementations round `stat %.9Y` and `touch -d @s.ns` through a float by a
+# few hundred nanoseconds, and `%Y` itself up by one just below a second
+# boundary, which the one-second margins absorb.
 encrypt_file() {
     local src="$1"
     local dst="$2"
+    local want_stamp="${3:-}"
     backup_passphrase_valid "$_BACKUP_PASSPHRASE" || return 1
-    local tmp mtime secs nsec stamp
+    local tmp secs now stamp
     local -a st
-    mtime="$(stat -L -c %.9Y -- "$src")" || return 1
+    secs="$(stat -L -c %Y -- "$src")" || return 1
+    now="$(date +%s)"
     _ENCRYPT_ERR_TMP="$(mktemp -p "$GENESIS_BIG_TMP" encrypt.XXXXXX.err)" || return 1
     if ! tmp="$(mktemp -p "$(dirname -- "$dst")" ".genesis-partial.$$.XXXXXX")"; then
         log "  cannot create a partial file beside $dst" >&2
@@ -474,17 +486,15 @@ encrypt_file() {
         st=("${PIPESTATUS[@]}")
     fi
     if [ "${st[0]}" = 0 ] && [ "${st[1]}" = 0 ]; then
-        secs="${mtime%.*}"
-        nsec=$((10#${mtime#*.}))
-        if [ $(( $(date +%s) - secs )) -ge 2 ]; then
-            nsec=$((nsec + 1))
-            if [ "$nsec" -ge 1000000000 ]; then
-                secs=$((secs + 1))
-                nsec=$((nsec - 1000000000))
+        if [ "$want_stamp" = stamp ]; then
+            if [ $((now - secs)) -ge 2 ]; then
+                stamp="@$((secs + 1))"
+            else
+                stamp="@$((secs - 1))"
             fi
+            touch -c -d "$stamp" -- "$tmp" 2>/dev/null \
+                || { [ -e "$tmp" ] && log "  could not stamp $dst; the next run may skip a late append" >&2; }
         fi
-        printf -v stamp '@%s.%09d' "$secs" "$nsec"
-        touch -c -d "$stamp" -- "$tmp" 2>/dev/null || true
         # -T: a directory at <dst> is a failure, never a place to move into.
         if mv -f -T -- "$tmp" "$dst"; then
             rm -f -- "$_ENCRYPT_ERR_TMP"
@@ -965,7 +975,7 @@ if [ -d "$TRANSCRIPT_DIR" ]; then
             if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
                 continue
             fi
-            encrypt_file "$src" "$dst" || log "WARNING: failed to encrypt $name"
+            encrypt_file "$src" "$dst" stamp || log "WARNING: failed to encrypt $name"
         done < <(find "$TRANSCRIPT_DIR" -maxdepth 1 -name '*.jsonl' -type f -print0)
         _TRANSCRIPT_COUNT=$(find transcripts -maxdepth 1 -name '*.jsonl.gpg' 2>/dev/null | wc -l)
         log "Transcripts: $_TRANSCRIPT_COUNT files (encrypted)"
@@ -992,7 +1002,7 @@ if [ -d "$MEMORY_DIR" ]; then
             if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
                 continue
             fi
-            encrypt_file "$src" "$dst" || log "WARNING: failed to encrypt $rel"
+            encrypt_file "$src" "$dst" stamp || log "WARNING: failed to encrypt $rel"
         done < <(find "$MEMORY_DIR" -type f -print0)
         _MEMORY_COUNT=$(find memory -type f -name '*.gpg' 2>/dev/null | wc -l)
         log "Memory: $_MEMORY_COUNT files (encrypted)"
@@ -1053,7 +1063,7 @@ if [ -d "$_EVAL_DIR" ]; then
             if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
                 continue
             fi
-            encrypt_file "$src" "$dst" || log "WARNING: failed to encrypt eval/$rel"
+            encrypt_file "$src" "$dst" stamp || log "WARNING: failed to encrypt eval/$rel"
         done < <(find "$_EVAL_DIR" -type f -print0)
         _EVAL_COUNT=$(find eval -type f -name '*.gpg' 2>/dev/null | wc -l)
         log "Eval golden sets: $_EVAL_COUNT files (encrypted)"

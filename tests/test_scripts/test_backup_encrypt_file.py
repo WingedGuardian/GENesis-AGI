@@ -38,14 +38,14 @@ def _function_body(name: str) -> str:
 
 
 def _run_encrypt(
-    tmp_path: Path, src: Path, dst: Path, *, path_prefix: str = ""
+    tmp_path: Path, src: Path, dst: Path, *, path_prefix: str = "", stamp: bool = False
 ) -> subprocess.CompletedProcess:
     big_tmp = tmp_path / "bigtmp"
     big_tmp.mkdir(exist_ok=True)
     source = 'source "$1"\n'
     source += "log() { printf '%s\\n' \"$*\"; }\n"
     source += _function_body("encrypt_file")
-    source += '_BACKUP_PASSPHRASE="$2"\nencrypt_file "$3" "$4"\n'
+    source += '_BACKUP_PASSPHRASE="$2"\nencrypt_file "$3" "$4" "${@:5}"\n'
     env = dict(
         os.environ,
         GENESIS_BIG_TMP=str(big_tmp),
@@ -60,6 +60,7 @@ def _run_encrypt(
             PASSPHRASE,
             str(src),
             str(dst),
+            *(["stamp"] if stamp else []),
         ],
         input=source,
         text=True,
@@ -202,7 +203,7 @@ def test_an_unreadable_source_fails_and_keeps_the_previous_copy(tmp_path):
 
 
 def test_success_leaves_no_partial_and_the_freshness_skip_still_works(tmp_path):
-    """The copy is stamped just after the source's pre-read mtime.
+    """The copy is stamped one whole second after the source's pre-read mtime.
 
     The callers skip a file whose copy is newer than its source. An unchanged
     source must keep being skipped, and a later append must be re-encrypted.
@@ -212,13 +213,13 @@ def test_success_leaves_no_partial_and_the_freshness_skip_still_works(tmp_path):
     an_hour_ago = time.time_ns() - 3600 * 10**9
     os.utime(src, ns=(an_hour_ago, an_hour_ago))
     dst = tmp_path / "session.jsonl.gpg"
-    proc = _run_encrypt(tmp_path, src, dst)
+    proc = _run_encrypt(tmp_path, src, dst, stamp=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert _leftovers(tmp_path) == []
     assert _decrypt(tmp_path, dst) == b"line one\n"
     assert list((tmp_path / "bigtmp").iterdir()) == []
 
-    assert dst.stat().st_mtime_ns == an_hour_ago + 1
+    assert dst.stat().st_mtime_ns == (an_hour_ago // 10**9 + 1) * 10**9
     assert _newer(dst, src), "an unchanged source would be re-encrypted on every run"
     with src.open("a") as fh:
         fh.write("line two\n")
@@ -231,8 +232,8 @@ def _newer(a: Path, b: Path) -> bool:
 
 def test_a_source_written_moments_ago_is_encrypted_again_next_run(tmp_path):
     """An append within the same timestamp tick does not move the mtime, so a
-    source written moments ago gets a copy stamped at exactly its mtime, which
-    the callers' -nt skip does not trust. A source mtime ahead of the clock
+    source written moments ago gets a copy stamped a second before its mtime,
+    so the callers' -nt skip re-encrypts it. A source mtime ahead of the clock
     (skew) takes the same branch. The future mtime keeps this independent of
     how long the encryption takes on a loaded runner."""
     src = tmp_path / "session.jsonl"
@@ -240,10 +241,42 @@ def test_a_source_written_moments_ago_is_encrypted_again_next_run(tmp_path):
     future = time.time_ns() + 30 * 10**9
     os.utime(src, ns=(future, future))
     dst = tmp_path / "session.jsonl.gpg"
+    proc = _run_encrypt(tmp_path, src, dst, stamp=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert dst.stat().st_mtime_ns == (future // 10**9 - 1) * 10**9
+    assert not _newer(dst, src)
+
+
+def test_a_source_just_below_a_second_boundary_still_skips_and_still_catches_an_append(tmp_path):
+    """Some coreutils round `stat %Y` up near a second boundary; the stamp must
+    still be newer than the source, and older than any later append."""
+    src = tmp_path / "session.jsonl"
+    src.write_text("line one\n")
+    t = (time.time_ns() // 10**9 - 3600) * 10**9 + 999_999_990
+    os.utime(src, ns=(t, t))
+    dst = tmp_path / "session.jsonl.gpg"
+    proc = _run_encrypt(tmp_path, src, dst, stamp=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _newer(dst, src)
+    with src.open("a") as fh:
+        fh.write("line two\n")
+    assert not _newer(dst, src)
+
+
+def test_without_stamp_the_copy_keeps_its_encryption_time(tmp_path):
+    """Only the -nt callers ask for the stamp. Other readers (the host
+    credential mirror) re-copy a .gpg only when its size or mtime moves, so an
+    unchanged source re-encrypted under a new passphrase must get a new mtime."""
+    src = tmp_path / "secrets.env"
+    src.write_text("KEY=value\n")
+    an_hour_ago = time.time_ns() - 3600 * 10**9
+    os.utime(src, ns=(an_hour_ago, an_hour_ago))
+    dst = tmp_path / "secrets.env.gpg"
+    before = time.time_ns()
     proc = _run_encrypt(tmp_path, src, dst)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert dst.stat().st_mtime_ns == future
-    assert not _newer(dst, src)
+    assert dst.stat().st_mtime_ns >= before - 10**9
+    assert _decrypt(tmp_path, dst) == b"KEY=value\n"
 
 
 def test_a_directory_at_the_destination_is_a_failure(tmp_path):
