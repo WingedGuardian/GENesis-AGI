@@ -915,3 +915,198 @@ async def test_a_same_size_rewrite_with_a_restored_mtime_is_screened_again(roots
     r = await _impl_locate(scope="repo", within="0", contains="probe")
     assert _names(r) == {"notes.md"}
     assert "not-a-real-value-789" not in str(r)
+
+
+@pytest.mark.parametrize("have_rg", [True, False])
+async def test_a_public_file_edited_after_its_exemption_is_screened(roots, monkeypatch, have_rg):
+    # The exemption is the public blob id, not the path: a file rewritten with
+    # a credential after the exemption was computed is judged on its new bytes.
+    from genesis.mcp.memory import locate
+
+    _no_rg(monkeypatch, have_rg)
+    _secrets_file(roots, monkeypatch, "FAKE_API_KEY=not-a-real-value-123\n")
+    repo = roots["repo"]
+    fixture = _touch(repo / "fixture.md", content="probe\n")
+    _git_commit(repo, "fixture.md")
+    _publish(repo, monkeypatch)
+    real = locate._tracked_files
+
+    def then_edit(records):
+        out = real(records)
+        assert str(fixture) in out[1]
+        fixture.write_text(f"probe\n{_shaped_line()}\n")
+        return out
+
+    monkeypatch.setattr(locate, "_tracked_files", then_edit)
+    _touch(repo / "notes.md", content="probe\n")
+    r = await _impl_locate(scope="repo", within="0", contains="probe")
+    assert _names(r) == {"notes.md"}
+    assert "not-a-real-value-789" not in str(r)
+    assert r["content_skipped_credential_files"] == 1
+
+
+def test_rg_matches_only_the_screened_bytes_on_stdin(roots, monkeypatch):
+    # rg reads a file separately from the screen, so nothing it read from disk
+    # is returned: each listed file is read once, screened, and rg matches
+    # again on exactly those bytes, given on stdin (keeping rg's linear-time
+    # engine). A stale exemption never spares bytes that are not the blob.
+    import json as _json
+    import subprocess as _subprocess
+
+    from genesis.mcp.memory import locate
+
+    clean = _touch(roots["repo"] / "clean.md", content="probe one\n")
+    edited = _touch(roots["repo"] / "edited.md", content=f"probe\n{_shaped_line()}\n")
+    unlisted = _touch(roots["repo"] / "unlisted.md", content="probe two\n")
+    stale_oid = locate._blob_oid(b"probe\n", b"0" * 40)
+    stdin_seen: list[bytes] = []
+
+    def fake_rg(cmd, **kw):
+        if "-l" in cmd:
+            out = (str(clean) + "\0" + str(edited) + "\0").encode()
+            return _subprocess.CompletedProcess(cmd, 0, out, b"")
+        assert cmd[-1] == "-"
+        stdin_seen.append(kw["input"])
+        evt = {"type": "match", "data": {"line_number": 1, "lines": {"text": "IGNORED\n"}}}
+        return _subprocess.CompletedProcess(cmd, 0, (_json.dumps(evt) + "\n").encode(), b"")
+
+    monkeypatch.setattr(locate.subprocess, "run", fake_rg)
+    records = [{"path": p, "name": p.name} for p in (clean, edited, unlisted)]
+    matched, dropped = locate._content_match_rg(
+        records, "probe", False, frozenset(), {str(edited): stale_oid}, set(),
+    )
+    assert stdin_seen == [b"probe one\n"]
+    assert [m["path"] for m in matched] == [clean]
+    assert matched[0]["matches"] == [{"line": 1, "text": "probe one"}]
+    assert dropped == 1
+    assert "not-a-real-value-789" not in str(matched)
+
+
+def test_a_file_changed_during_its_read_is_dropped_and_not_cached(roots, monkeypatch):
+    # The identity is taken before and after the read; a write in between
+    # drops the file and leaves no verdict cached for the new bytes.
+    from genesis.mcp.memory import locate
+
+    monkeypatch.setattr(locate, "_shape_cache", {})
+    note = _touch(roots["repo"] / "notes.md", content="probe\n")
+    real_fstat = os.fstat
+    calls = []
+
+    def racing_fstat(fd):
+        calls.append(fd)
+        if len(calls) == 2:
+            with open(note, "a") as fh:
+                fh.write(f"{_shaped_line()}\n")
+        return real_fstat(fd)
+
+    monkeypatch.setattr(locate.os, "fstat", racing_fstat)
+    assert locate._screened_text(str(note), frozenset(), {}, set()) == (None, True)
+    monkeypatch.setattr(locate.os, "fstat", real_fstat)
+    assert locate._shape_cache == {}
+    assert locate._screened_text(str(note), frozenset(), {}, set()) == (None, True)
+
+
+@pytest.mark.parametrize("have_rg", [True, False])
+async def test_a_name_spared_public_file_edited_later_is_dropped(roots, monkeypatch, have_rg):
+    # secrets.yaml is searchable only because its bytes were the public blob;
+    # edited after that check, it is dropped even with no credential shape.
+    from genesis.mcp.memory import locate
+
+    _no_rg(monkeypatch, have_rg)
+    monkeypatch.setenv("SECRETS_PATH", str(roots["tmp"] / "absent.env"))
+    repo = roots["repo"]
+    spared = _touch(repo / "secrets.yaml", content="probe: settings live here\n")
+    _touch(repo / "notes.md", content="probe\n")
+    _git_commit(repo, "secrets.yaml", "notes.md")
+    _publish(repo, monkeypatch)
+    real = locate._tracked_files
+
+    def then_edit(records):
+        out = real(records)
+        spared.write_text("probe: hunter2-but-no-shape\n")
+        return out
+
+    monkeypatch.setattr(locate, "_tracked_files", then_edit)
+    r = await _impl_locate(scope="repo", within="0", contains="probe")
+    assert _names(r) == {"notes.md"}
+    assert "hunter2" not in str(r)
+    assert r["content_skipped_credential_files"] == 1
+
+
+@pytest.mark.parametrize("have_rg", [True, False])
+@pytest.mark.parametrize("contains", ["probe", "zzzzz"])
+async def test_non_utf8_and_bom_files_count_the_same_for_every_pattern(
+    roots, monkeypatch, have_rg, contains,
+):
+    _no_rg(monkeypatch, have_rg)
+    monkeypatch.setenv("SECRETS_PATH", str(roots["tmp"] / "absent.env"))
+    (roots["repo"] / "bom.txt").write_bytes(b"\xef\xbb\xbfprobe here\n")
+    (roots["repo"] / "latin.txt").write_bytes(b"probe caf\xe9\n")
+    r = await _impl_locate(scope="repo", within="0", contains=contains)
+    assert r["content_skipped_credential_files"] == 0
+    assert _names(r) == ({"bom.txt", "latin.txt"} if contains == "probe" else set())
+
+
+@pytest.mark.parametrize("have_rg", [True, False])
+@pytest.mark.parametrize("name", ["service-account.json", "my-secret-notes.txt", "service-account.json~"])
+async def test_the_dashboards_credential_names_are_never_searched(roots, monkeypatch, have_rg, name):
+    _no_rg(monkeypatch, have_rg)
+    monkeypatch.setenv("SECRETS_PATH", str(roots["tmp"] / "absent.env"))
+    _touch(roots["repo"] / name, content='probe {"private_key": "x"}\n')
+    _touch(roots["repo"] / "notes.md", content="probe\n")
+    r = await _impl_locate(scope="repo", within="0", contains="probe")
+    assert _names(r) == {"notes.md"}
+    assert r["content_skipped_credential_files"] == 1
+
+
+def test_locate_and_the_dashboard_share_the_exact_credential_names():
+    from genesis.dashboard.routes import files
+    from genesis.security.credential_names import CREDENTIAL_FILE_NAMES, names_a_secret
+
+    assert files._BLOCKED_NAMES is CREDENTIAL_FILE_NAMES
+    assert files._names_a_secret is names_a_secret
+    assert "service-account.json" in CREDENTIAL_FILE_NAMES
+
+
+async def test_files_over_the_content_limit_are_never_hashed_for_the_exemption(roots, monkeypatch):
+    from genesis.mcp.memory import locate
+
+    monkeypatch.setenv("SECRETS_PATH", str(roots["tmp"] / "absent.env"))
+    repo = roots["repo"]
+    big = _touch(repo / "big.txt", content="probe\n" + "x" * (locate._MAX_CONTENT_BYTES + 1))
+    _touch(repo / "notes.md", content="probe\n")
+    _git_commit(repo, "big.txt", "notes.md")
+    _publish(repo, monkeypatch)
+    seen: list[str] = []
+    real = locate._tracked_files
+
+    def recording(records):
+        seen.extend(str(rec["path"]) for rec in records)
+        return real(records)
+
+    monkeypatch.setattr(locate, "_tracked_files", recording)
+    r = await _impl_locate(scope="repo", within="0", contains="probe")
+    assert _names(r) == {"notes.md"}
+    assert str(big) not in seen
+    assert str(repo / "notes.md") in seen
+
+
+def test_a_file_replaced_after_the_walk_is_dropped(roots, monkeypatch):
+    # Name, place and inode were judged at walk time; a different file at the
+    # same path when it is read is not the file that was judged.
+    from genesis.mcp.memory import locate
+
+    note = _touch(roots["repo"] / "notes.md", content="probe\n")
+    st = os.stat(note)
+    assert locate._screened_text(str(note), frozenset(), {}, set(), (st.st_dev, st.st_ino))[1] is False
+    assert locate._screened_text(str(note), frozenset(), {}, set(), (st.st_dev, st.st_ino + 1)) == (
+        None, True,
+    )
+
+
+def test_a_nul_past_the_sniff_window_makes_the_file_binary(roots):
+    from genesis.mcp.memory import locate
+
+    late_nul = roots["repo"] / "late.txt"
+    late_nul.write_bytes(b"x" * 9000 + b"\nprobe a\n\x00\nprobe b\n")
+    assert locate._screened_text(str(late_nul), frozenset(), {}, set()) == (None, False)

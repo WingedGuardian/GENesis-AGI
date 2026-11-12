@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -27,7 +29,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from genesis import env
-from genesis.security.credential_names import is_credential_component
+from genesis.security.credential_names import (
+    CREDENTIAL_FILE_NAMES,
+    is_credential_component,
+    names_a_secret,
+)
 from genesis.security.output_scanner import LOCATION_FINDINGS, scan_outbound_normalised
 from genesis.session_awareness.zero_drop_git import scrubbed_git_env
 
@@ -380,21 +386,6 @@ def _remember_shape(key: tuple | None, verdict: bool) -> None:
     _shape_cache[key] = verdict
 
 
-def _file_has_shape(path: str) -> bool:
-    """A file's shape verdict, cached by identity; an unreadable file counts as one."""
-    key = _shape_key(path)
-    cached = _shape_cache.get(key) if key is not None else None
-    if cached is not None:
-        return cached
-    try:
-        text = _read_text_raw(path)
-    except OSError:
-        return True
-    verdict = _has_credential_shape(text)
-    _remember_shape(key, verdict)
-    return verdict
-
-
 def _files_holding_secrets(
     records: list[dict], values: frozenset[str], exempt: set[str],
 ) -> tuple[set[str], set[str]]:
@@ -488,6 +479,8 @@ def _is_locate_credential_part(part: str) -> bool:
         return True
     if name in _LOCATE_CREDENTIAL_NAMES or name.endswith(_LOCATE_CREDENTIAL_SUFFIXES):
         return True
+    if names_a_secret(name):
+        return True
     return any(
         segment and re.split(r"[_\-]+", segment)[-1] in _LOCATE_CREDENTIAL_STEMS
         for segment in name.lstrip(".").split(".")[:-1] or [name.lstrip(".")]
@@ -556,15 +549,19 @@ def _blob_oids(listing: bytes, root: Path) -> dict[str, bytes]:
     return oids
 
 
-def _tracked_files(records: list[dict]) -> tuple[set[str], set[str]]:
-    """(files holding exactly their HEAD blob's bytes, those also on the public main).
+def _tracked_files(records: list[dict]) -> tuple[set[str], dict[str, bytes]]:
+    """(files holding exactly their HEAD blob's bytes, {those also on the public main: blob id}).
 
     Only the second set exempts anything (the caller discards the first): a
     file is spared the credential-name rules and the credential-shape screen
     only when it has been through CI's leak scan, i.e. its HEAD blob equals its
     blob on the public repo's remote-tracking main (``_public_main_ref``). A
-    locally committed or unpushed file is in the first set only. Both are
-    empty on any error.
+    locally committed or unpushed file is in the first set only. An error
+    stops that root's remaining chunks, so it can only exempt less.
+
+    The second is keyed by blob id because a path is not content: a file
+    edited after this check keeps its path, so whoever relies on the exemption
+    must compare the bytes it actually reads with the id (``_screened_text``).
 
     Tracking alone says nothing about the working tree: a tracked file edited
     since the last commit holds content that is neither public nor
@@ -583,7 +580,7 @@ def _tracked_files(records: list[dict]) -> tuple[set[str], set[str]]:
     for record in records:
         by_root.setdefault(record["root"], []).append(str(record["path"]))
     tracked: set[str] = set()
-    public: set[str] = set()
+    public: dict[str, bytes] = {}
     for root, paths in by_root.items():
         ref = _public_main_ref(root)
         for i in range(0, len(paths), _RG_CHUNK):
@@ -626,7 +623,7 @@ def _tracked_files(records: list[dict]) -> tuple[set[str], set[str]]:
                 continue
             ref_oids = _blob_oids(ref_listing, root)
             public.update(
-                p for p in unchanged
+                (p, head_oids[os.path.normpath(p)]) for p in unchanged
                 if ref_oids.get(os.path.normpath(p)) == head_oids[os.path.normpath(p)]
             )
     return tracked, public
@@ -639,26 +636,36 @@ def _parts(record: dict) -> tuple[str, ...]:
         return (record["name"],)
 
 
+def _hard_denied(record: dict, secret_ids: set[tuple[int, int]]) -> bool:
+    """The name, place and inode rules no exemption lifts (see ``_holds_credentials``)."""
+    if record["file_id"] in secret_ids:
+        return True
+    return any(
+        part in _CREDENTIAL_DIRS
+        or is_credential_component(part)
+        or _normalized_name(part) in CREDENTIAL_FILE_NAMES
+        for part in _parts(record)
+    )
+
+
 def _holds_credentials(
-    record: dict, secret_ids: set[tuple[int, int]], public: set[str] | None = None,
+    record: dict, secret_ids: set[tuple[int, int]], public: dict[str, bytes] | None = None,
 ) -> bool:
     """Whether a file's content must never be searched, by name, place or inode (#4129).
 
     A content match returns the matching lines, which in a credential file are
     the secrets themselves. Such files stay findable by name; stored
     credentials are read through ``reference_lookup``, which audits each read.
-    Uses the predicate the dashboard's file routes refuse paths by, plus the
-    content-search additions above, which spare a file only when it is in
-    ``public`` (its bytes are on the public repo's main).
+    Uses every name rule the dashboard's file routes refuse paths by: its
+    structural predicate and exact names are never spared; its broad "secret"
+    word rule and the content-search additions above spare a file only when it
+    is in ``public`` (its bytes are on the public repo's main).
     """
-    if record["file_id"] in secret_ids:
-        return True
-    parts = _parts(record)
-    if any(part in _CREDENTIAL_DIRS or is_credential_component(part) for part in parts):
+    if _hard_denied(record, secret_ids):
         return True
     if public is not None and str(record["path"]) in public:
         return False
-    return any(_is_locate_credential_part(part) for part in parts)
+    return any(_is_locate_credential_part(part) for part in _parts(record))
 
 
 # ── walk ──────────────────────────────────────────────────────────────────────
@@ -753,6 +760,82 @@ def _is_text_and_small(path: Path) -> bool:
     return b"\x00" not in head
 
 
+def _blob_oid(data: bytes, like: bytes) -> bytes:
+    """The git blob id of ``data``, in the hash family of ``like`` (sha1 or sha256)."""
+    digest = hashlib.sha256 if len(like) == 64 else hashlib.sha1
+    return digest(b"blob %d\0" % len(data) + data).hexdigest().encode()
+
+
+def _screened_text(
+    path: str, values: frozenset[str], exempt: dict[str, bytes], needs_public: set[str],
+    file_id: tuple[int, int] | None = None,
+) -> tuple[str | None, bool]:
+    """(text, dropped): one read of a file, judged on exactly the bytes read.
+
+    Every content-search result comes from this read, so a write between the
+    screen and the search cannot put unscreened bytes into a result. The file
+    is opened without following a final symlink and without blocking (a FIFO
+    swapped in is refused, not waited on), and must be a regular, text, small
+    file (``None``, not dropped, otherwise). Its identity is taken before and
+    after the read: a file that changed during the read, or that is not the
+    file the walk judged by name, place and inode (``file_id``), is dropped,
+    and the shape verdict is cached under the identity of the bytes read.
+
+    The public exemption holds only when these bytes hash to the file's blob
+    on the public main. A file in ``needs_public`` was admitted only because
+    the name rules spared it as public, so any other bytes drop it; any other
+    exempt path whose bytes differ is shape-screened like the rest. A value
+    from the secrets file drops a file either way.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None, False
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            before = os.fstat(fh.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_size > _MAX_CONTENT_BYTES:
+                return None, False
+            data = fh.read(_MAX_CONTENT_BYTES + 1)
+            after = os.fstat(fh.fileno())
+    except OSError:
+        return None, False
+    ident = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+    if ident != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) or (
+        len(data) != before.st_size
+    ) or (file_id is not None and file_id != (before.st_dev, before.st_ino)):
+        return None, True
+    if b"\x00" in data:  # binary anywhere, not just in the sniff window: rg would number it differently
+        return None, False
+    text = data.decode("utf-8", errors="replace")
+    if any(value in text for value in values):
+        return None, True
+    oid = exempt.get(path)
+    if oid is not None and _blob_oid(data, oid) == oid:
+        return text, False
+    if path in needs_public:
+        return None, True
+    key = (os.path.realpath(path), *ident)
+    shaped = _shape_cache.get(key)
+    if shaped is None:
+        shaped = _has_credential_shape(text)
+        _remember_shape(key, shaped)
+    return (None, True) if shaped else (text, False)
+
+
+def _line_matches(text: str, contains: str, pattern: re.Pattern | None) -> list[dict]:
+    """The matching lines of screened ``text``, split on ``\\n`` only, as rg splits them."""
+    matches: list[dict] = []
+    for lineno, line in enumerate(text.split("\n"), start=1):
+        hit = pattern.search(line) if pattern else (contains in line)
+        if hit:
+            matches.append({"line": lineno, "text": line.strip()[:_SNIPPET_CHARS]})
+            if len(matches) >= _MAX_MATCHES_PER_FILE:
+                break
+    return matches
+
+
 def _content_match(
     records: list[dict], contains: str, regex: bool,
 ) -> tuple[list[dict], str | None, int, str, int]:
@@ -769,9 +852,12 @@ def _content_match(
     about one.
     Not covered: encoded, re-wrapped or partial copies of a secret, and secrets
     that are not in the secrets file.
-    Binary/oversize files are excluded up front (see ``_is_text_and_small``).
+    Binary/oversize files are excluded up front (see ``_is_text_and_small``),
+    before any of them is hashed for the public exemption.
     Tries rg first (fast); falls back to pure Python when rg is absent or
-    errors — identical result shape either way.
+    errors — identical result shape either way. Either way the returned lines
+    are matched in Python on the text ``_screened_text`` returned, so the two
+    backends agree on lines and line numbers.
     """
     if regex:
         try:
@@ -779,127 +865,133 @@ def _content_match(
         except re.error as exc:
             return [], f"invalid regex: {exc}", 0, "on", 0
     secret_ids = _secret_file_ids()
-    _, public = _tracked_files(records)
+    small = [
+        r for r in records
+        if not _hard_denied(r, secret_ids) and _is_text_and_small(r["path"])
+    ]
+    _, public = _tracked_files(small)
     searchable = [r for r in records if not _holds_credentials(r, secret_ids, public)]
-    eligible = [r for r in searchable if _is_text_and_small(r["path"])]
+    needs_public = {
+        str(r["path"]) for r in searchable if _holds_credentials(r, secret_ids, None)
+    }
+    small_paths = {str(r["path"]) for r in small}
+    eligible = [r for r in searchable if str(r["path"]) in small_paths]
     values, screen_off = _secret_values()
     if screen_off is None and not values:
         screen_off = "no qualifying values"
     screen = f"off: {screen_off}" if screen_off else "on"
-    holding, unscreened = _files_holding_secrets(eligible, values, public)
+    holding, unscreened = _files_holding_secrets(eligible, values, set(public))
     eligible = [r for r in eligible if str(r["path"]) not in holding | unscreened]
     skipped = len(records) - len(searchable) + len(holding) + len(unscreened)
     if _have_rg():
-        out = _content_match_rg(eligible, contains, regex, values, public)
+        out = _content_match_rg(eligible, contains, regex, values, public, needs_public)
         if out is not None:
             return out[0], None, skipped + out[1], screen, len(unscreened)
-    matched, dropped = _content_match_python(eligible, contains, regex, values, public)
+    matched, dropped = _content_match_python(
+        eligible, contains, regex, values, public, needs_public,
+    )
     return matched, None, skipped + dropped, screen, len(unscreened)
 
 
 def _content_match_rg(
-    records: list[dict], contains: str, regex: bool, values: frozenset[str], exempt: set[str],
+    records: list[dict], contains: str, regex: bool, values: frozenset[str],
+    exempt: dict[str, bytes], needs_public: set[str],
 ) -> tuple[list[dict], int] | None:
     """rg-backed content match: (matches, files dropped), or None to fall back to Python.
 
-    rg reads each file again after the value screen, so a file written in
-    between is judged again: any matched line carrying a secret value, or a
-    credential shape outside ``exempt``, drops the whole file, and so does a
-    shape anywhere in a matched file outside ``exempt`` (``_file_has_shape``,
-    which an unchanged file answers from the cache).
+    rg first nominates files (``rg -l``). Each nominated file is then read
+    once by ``_screened_text``, and rg matches again on exactly that screened
+    text, given on stdin: nothing rg read from disk is returned, so a file
+    written after the screen can only be judged on its new bytes, and the
+    pattern still runs in rg's linear-time engine rather than Python's.
     """
     by_path = {str(r["path"]): r for r in records}
     if not by_path:
         return [], 0
-    matches_by_path: dict[str, list[dict]] = {}
-    dropped: set[str] = set()
+    nominated: set[str] = set()
     paths = list(by_path.keys())
-    base = ["rg", "--json", "--max-filesize", "1M"]
+    base = ["rg", "-l", "--null", "--no-messages", "--max-filesize", "1M"]
     if not regex:
         base.append("-F")
     base += ["-e", contains, "--"]
     for i in range(0, len(paths), _RG_CHUNK):
         chunk = paths[i:i + _RG_CHUNK]
         try:
-            proc = subprocess.run(base + chunk, capture_output=True, text=True, timeout=60)
+            proc = subprocess.run(base + chunk, capture_output=True, timeout=60)
         except (subprocess.TimeoutExpired, OSError):
             return None  # fall back entirely for a consistent result
         if proc.returncode not in (0, 1):  # 0=matches, 1=no matches; >=2 = error
             return None
-        for line in proc.stdout.splitlines():
-            if not line:
-                continue
+        nominated.update(os.fsdecode(name) for name in proc.stdout.split(b"\0") if name)
+    on_text = ["rg", "--json", "-m", str(_MAX_MATCHES_PER_FILE)]
+    if not regex:
+        on_text.append("-F")
+    on_text += ["-e", contains, "-"]
+    out: list[dict] = []
+    dropped = 0
+    for p, rec in by_path.items():
+        if p not in nominated:
+            continue
+        text, was_dropped = _screened_text(p, values, exempt, needs_public, rec.get("file_id"))
+        if was_dropped:
+            dropped += 1
+            continue
+        if text is None:
+            continue
+        try:
+            proc = subprocess.run(
+                on_text, input=text.encode("utf-8"), capture_output=True, timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            continue  # this file is not returned; the screen still holds
+        except OSError:
+            return None
+        if proc.returncode not in (0, 1):
+            return None
+        lines = text.split("\n")
+        matches: list[dict] = []
+        for raw in proc.stdout.split(b"\n"):
             try:
-                evt = json.loads(line)
+                evt = json.loads(raw) if raw else None
             except ValueError:
                 continue
-            if evt.get("type") != "match":
+            if not evt or evt.get("type") != "match":
                 continue
             data = evt.get("data", {})
-            p = data.get("path", {}).get("text")
-            if p is None:
+            number = data.get("line_number")
+            if not isinstance(number, int):
                 continue
-            line_text = data.get("lines", {}).get("text") or ""
-            if any(value in line_text for value in values) or (
-                p not in exempt and _has_credential_shape(line_text)
-            ):
-                dropped.add(p)
-            lst = matches_by_path.setdefault(p, [])
-            if len(lst) >= _MAX_MATCHES_PER_FILE:
-                continue
-            lst.append({"line": data.get("line_number"), "text": line_text.strip()[:_SNIPPET_CHARS]})
-    dropped.update(
-        p for p in matches_by_path
-        if p not in dropped and p not in exempt and _file_has_shape(p)
-    )
-    return [
-        {**rec, "matches": matches_by_path[p]}
-        for p, rec in by_path.items()
-        if p in matches_by_path and p not in dropped
-    ], len(dropped & by_path.keys())
+            if 0 < number <= len(lines):
+                # The returned text is the screened line, never rg's copy of it.
+                matches.append({"line": number, "text": lines[number - 1].strip()[:_SNIPPET_CHARS]})
+        if matches:
+            out.append({**rec, "matches": matches[:_MAX_MATCHES_PER_FILE]})
+    return out, dropped
 
 
 def _content_match_python(
-    records: list[dict], contains: str, regex: bool, values: frozenset[str], exempt: set[str],
+    records: list[dict], contains: str, regex: bool, values: frozenset[str],
+    exempt: dict[str, bytes], needs_public: set[str],
 ) -> tuple[list[dict], int]:
     """Pure-Python content match fallback: (matches, files dropped).
 
-    Binary/oversize-guarded. The text matched is the text screened: a file
-    whose content carries a secret value, or a credential shape outside
-    ``exempt``, at this read is dropped whole.
+    The text matched is the text screened (``_screened_text``): a file whose
+    bytes at this read carry a secret value, or a credential shape without
+    being exactly their public blob, is dropped whole.
     """
     pattern = re.compile(contains) if regex else None
     out: list[dict] = []
     dropped = 0
     for rec in records:
-        path: Path = rec["path"]
-        key = _shape_key(str(path))
-        try:
-            if path.stat().st_size > _MAX_CONTENT_BYTES:
-                continue
-            with path.open("rb") as fh:
-                head = fh.read(_BINARY_SNIFF_BYTES)
-            if b"\x00" in head:
-                continue
-            text = _read_text_raw(path)
-        except OSError:
-            continue
-        shaped = False
-        if str(path) not in exempt:
-            shaped = _shape_cache.get(key) if key is not None else None
-            if shaped is None:
-                shaped = _has_credential_shape(text)
-                _remember_shape(key, shaped)
-        if shaped or any(value in text for value in values):
+        text, was_dropped = _screened_text(
+            str(rec["path"]), values, exempt, needs_public, rec.get("file_id"),
+        )
+        if was_dropped:
             dropped += 1
             continue
-        matches: list[dict] = []
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            hit = pattern.search(line) if pattern else (contains in line)
-            if hit:
-                matches.append({"line": lineno, "text": line.strip()[:_SNIPPET_CHARS]})
-                if len(matches) >= _MAX_MATCHES_PER_FILE:
-                    break
+        if text is None:
+            continue
+        matches = _line_matches(text, contains, pattern)
         if matches:
             out.append({**rec, "matches": matches})
     return out, dropped

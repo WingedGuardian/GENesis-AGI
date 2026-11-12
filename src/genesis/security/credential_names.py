@@ -102,3 +102,28 @@ def is_credential_component(part: str) -> bool:
         if segment and re.split(r"[_\-]+", segment)[-1] in _CREDENTIAL_STEMS:
             return True
     return False
+
+
+# Exact file names the dashboard's file routes have always refused (its
+# ``_BLOCKED_NAMES``). Most are also caught by the rules above; ``service-account.json``
+# is not, so it is listed here and shared rather than kept in one route module.
+CREDENTIAL_FILE_NAMES = frozenset(
+    {
+        "secrets.env",
+        ".env",
+        "credentials.json",
+        "service-account.json",
+    }
+)
+
+
+def names_a_secret(part: str) -> bool:
+    """Does a path component carry the word "secret"?
+
+    The dashboard refuses any component containing it, except a directory
+    named ``secrets`` or ``.secrets``. Unanchored on purpose and broad: it also
+    matches source such as ``secret_store.py``, which is why ``locate`` applies
+    it only to files that are not on the public main.
+    """
+    name = part.lower()
+    return "secret" in name and name not in ("secrets", ".secrets")

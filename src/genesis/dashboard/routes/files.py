@@ -21,7 +21,13 @@ from genesis.dashboard.auth import (
     is_authenticated,
 )
 from genesis.security.credential_names import (
+    CREDENTIAL_FILE_NAMES as _BLOCKED_NAMES,
+)
+from genesis.security.credential_names import (
     is_credential_component as _is_credential_component,
+)
+from genesis.security.credential_names import (
+    names_a_secret as _names_a_secret,
 )
 from genesis.util.resolve import resolve_refusing_loops
 
@@ -36,15 +42,8 @@ _ALLOWED_ROOTS: list[Path] = [
     _HOME / ".claude",
 ]
 
-# Files that must never be read or written via the browser
-_BLOCKED_NAMES = frozenset(
-    {
-        "secrets.env",
-        ".env",
-        "credentials.json",
-        "service-account.json",
-    }
-)
+# Files that must never be read or written via the browser: _BLOCKED_NAMES,
+# imported above from genesis.security.credential_names (shared with locate).
 
 
 
@@ -472,9 +471,8 @@ def _is_allowed(path: Path) -> bool:
     if _in_a_trash(resolved):
         return False
     # Block paths containing "secret" in any component (except dir names "secrets"/".secrets")
-    for part in below:
-        if "secret" in part.lower() and part.lower() not in ("secrets", ".secrets"):
-            return False
+    if any(_names_a_secret(part) for part in below):
+        return False
     # Same idea for credential-bearing names, anchored — see
     # ``_is_credential_component``. This half is what narrows DISCLOSURE on a
     # PASSWORDLESS install: the route gate reduces to a no-op there by design,
