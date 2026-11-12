@@ -1197,15 +1197,29 @@ verified: b321bb634 2026-11-07
 - `cc/context_injector.py` (memory→session injection) lives HERE, not in
   memory. GROUNDWORK: `reflection_bridge/_bridge.py` (v4-executor),
   `session_config.py` (hook-inheritance).
-- **Light-reflection topic repeats (development candidate)**: the bridge stores
-  every reflection output, then suppresses a light-topic summary or posts a
-  periodic stub only when the model sets `material_change` false; an absent or
-  true flag posts. A local overlap floor guards that flag: changed negated text,
-  changed multi-chunk text, code fences, parse fallbacks and low overlap with
-  the last full post still post.
+- **Light-reflection topic repeats (development candidate)**: Light is the
+  system thinking about what code cannot settle. The Light prompt carries a
+  "Changes since the previous Light finding" table computed by code
+  (`awareness/signal_format.light_signal_changes`): each signal's previous and
+  current value, labelled as a counter, an alarm started or cleared, or a band
+  crossing. The model sets `material_change` from that and its own judgment of
+  moves that cross no line. The bridge stores every reflection output, then
+  suppresses the Light-topic summary (or posts a periodic stub) only when the
+  model sets `material_change` false AND code finds no condition change
+  (`light_condition_changes`: an alarm started, cleared or rose, a band
+  crossed, a signal appeared or went away) between the run behind the last full
+  post and this run; when code does find one, the summary is posted with those
+  changes listed. That check covers the alarm signals and the signals whose
+  collector sets thresholds (`container_memory_pct` only); every other value is
+  the model's to judge. Wording is not compared. An absent or true flag, a multi-message
+  summary that differs, parse fallbacks and an unknown baseline all post. The
+  previous values come from the awareness tick whose corpus row was written up
+  to 60 s before the finding or post (`reflection_corpus.tick_written_before`).
+  `genesis_version_changed` is left out of Light's signal list, change table
+  and condition check (`LIGHT_HIDDEN_SIGNALS`).
   A manager-local Light-topic lock spans history through send persistence;
   unrelated categories retain their independent delivery. History uses
-  insertion order so a current stub supersedes an older future-dated row. Unknown history posts; deep and
+  insertion order so a current stub supersedes an older future-dated row. Deep and
   strategic topic delivery retain their direct path. Installed verification is
   still outstanding.
 - **Background-wait ceiling ownership** (invoker.py): the CLI's headless
