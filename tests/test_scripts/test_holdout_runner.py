@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -1019,3 +1020,250 @@ def test_writer_accesses_are_counted_separately(repo, fake_gh, install_holdout, 
     )
     assert "holdout fence: no exposures logged" in out
     assert "2 access(es) declaring the holdout-writer agent, latest 2026-11-04T00:00:00Z" in out
+
+
+def _at_ref(repo, text, tmp_path, capsys, *extra, ref="HEAD") -> tuple[int, str]:
+    root, _, _ = repo
+    holdout = tmp_path / "HOLDOUT.md"
+    holdout.write_text(text)
+    rc = hr.main(["--at-ref", ref, "--root", str(root), "--holdout", str(holdout), *extra])
+    return rc, capsys.readouterr().out
+
+
+def _worktrees(root) -> list[str]:
+    return [
+        ln
+        for ln in _git(root, "worktree", "list", "--porcelain").splitlines()
+        if ln[:9] == "worktree "
+    ]
+
+
+def test_at_ref_runs_on_a_worktree_it_makes_and_removes(repo, tmp_path, capsys, _scratch):
+    root, _, merge = repo
+    before = _worktrees(root)
+    text = _scenario("H-01", steps=_call("f"), expect="beta-two") + _scenario(
+        "H-02", steps=_call("f"), expect="alpha-one"
+    )
+    rc, out = _at_ref(repo, text, tmp_path, capsys)
+    assert rc == 0 and out.splitlines()[0] == f"holdout: HEAD at {merge[:12]}"
+    assert _lines(out)["H-01"] == "H-01 PASS" and _lines(out)["H-02"].startswith("H-02 FAIL")
+    assert _worktrees(root) == before
+    assert _git(root, "status", "--porcelain") == ""
+    assert list(_scratch.iterdir()) == []
+
+
+def test_at_ref_checks_out_the_commit_it_is_given(repo, tmp_path, capsys):
+    _, parent, _ = repo
+    text = _scenario("H-01", steps=_call("f"), expect="beta-two") + _scenario(
+        "H-02", steps=_call("f"), expect="alpha-one"
+    )
+    rc, out = _at_ref(repo, text, tmp_path, capsys, ref=parent)
+    assert rc == 0 and out.splitlines()[0] == f"holdout: {parent} at {parent[:12]}"
+    assert _lines(out)["H-01"].startswith("H-01 FAIL") and _lines(out)["H-02"] == "H-02 PASS"
+
+
+def test_at_ref_runs_only_the_scenarios_named(repo, tmp_path, capsys):
+    text = _scenario("H-01", steps=_call("f"), expect="beta-two") + _scenario(
+        "H-02", steps=_call("f"), expect="alpha-one"
+    )
+    rc, out = _at_ref(repo, text, tmp_path, capsys, "--scenario", "H-02")
+    assert rc == 0 and set(_lines(out)) == {"H-02"}
+
+
+def test_at_ref_without_a_holdout_makes_no_worktree(repo, tmp_path, capsys, monkeypatch):
+    root, _, _ = repo
+
+    def no_worktree(self):
+        raise AssertionError("a worktree was made with no holdout to run")
+
+    monkeypatch.setattr(hr._Worktree, "__enter__", no_worktree)
+    rc = hr.main(["--at-ref", "HEAD", "--root", str(root), "--holdout", str(tmp_path / "none.md")])
+    assert rc == 0 and capsys.readouterr().out.strip() == "no holdout on this install"
+
+
+def test_an_overlay_reaches_nested_paths_and_adds_files_with_their_mode(repo, tmp_path, capsys):
+    overlay = tmp_path / "overlay"
+    (overlay / "src" / "pkgx").mkdir(parents=True)
+    (overlay / "src" / "pkgx" / "__init__.py").write_text("VALUE = 'overlaid'\n")
+    (overlay / "tools").mkdir()
+    (overlay / "tools" / "run.sh").write_text("#!/bin/sh\necho ran\n")
+    (overlay / "tools" / "run.sh").chmod(0o755)
+    steps = '"$HOLDOUT_PYTHON" -c \'import pkgx; print(pkgx.VALUE)\'\n"$HOLDOUT_ROOT/tools/run.sh"'
+    text = _scenario("H-01", steps=steps, expect="overlaid\nran")
+    rc, out = _at_ref(repo, text, tmp_path, capsys, "--overlay", str(overlay))
+    assert rc == 0 and "2 file(s) overlaid" in out.splitlines()[0]
+    assert _lines(out)["H-01"] == "H-01 PASS"
+
+
+@pytest.mark.parametrize(
+    "rel", ["link.py", "ldir/planted.txt"], ids=["file-link", "directory-link"]
+)
+def test_an_overlay_never_writes_through_a_link_in_the_tree(repo, tmp_path, capsys, rel):
+    root, _, _ = repo
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "link.py").symlink_to(victim)
+    (root / "ldir").symlink_to(outside)
+    _git(root, "add", "link.py", "ldir")
+    _git(root, "commit", "-q", "-m", "links")
+    before = _worktrees(root)
+    overlay = tmp_path / "overlay"
+    (overlay / rel).parent.mkdir(parents=True)
+    (overlay / rel).write_text("planted\n")
+    rc, out = _at_ref(
+        repo,
+        _scenario("H-01", steps=_call("g"), expect="gamma"),
+        tmp_path,
+        capsys,
+        "--overlay",
+        str(overlay),
+    )
+    assert rc == 3 and f"overlay path crosses a link in the tree: {rel}" in out
+    assert victim.read_text() == "untouched\n" and list(outside.iterdir()) == []
+    assert _worktrees(root) == before
+
+
+def test_a_failed_removal_still_leaves_no_registration(repo, tmp_path, capsys, monkeypatch):
+    root, _, _ = repo
+    before = _worktrees(root)
+    monkeypatch.setattr(hr._Worktree, "__exit__", lambda self, *exc: None)
+    rc, out = _at_ref(repo, _scenario("H-01", steps=_call("g"), expect="gamma"), tmp_path, capsys)
+    assert rc == 0 and _lines(out)["H-01"] == "H-01 PASS"
+    assert _worktrees(root) == before
+
+
+def test_a_tree_that_cannot_be_removed_is_reported(repo, tmp_path, capsys, _scratch):
+    steps = (
+        'mkdir "$HOLDOUT_ROOT/locked" && touch "$HOLDOUT_ROOT/locked/x" '
+        '&& chmod 000 "$HOLDOUT_ROOT/locked"\necho done'
+    )
+    rc, out = _at_ref(repo, _scenario("H-01", steps=steps, expect="done"), tmp_path, capsys)
+    left = [p for p in _scratch.iterdir() if p.name.startswith("holdout-ref-")]
+    try:
+        assert rc == 0 and _lines(out)["H-01"] == "H-01 PASS"
+        assert len(left) == 1 and f"holdout: could not remove {left[0]}" in out
+    finally:
+        for holder in left:
+            (holder / "tree" / "locked").chmod(0o700)
+
+
+def test_a_terminated_run_leaves_no_worktree_and_no_scratch(repo, tmp_path):
+    """SIGTERM (a caller's timeout) must still run the cleanup: the caller may
+    be a session that cannot remove a worktree afterwards."""
+    root, _, _ = repo
+    home = tmp_path / "home"
+    home.mkdir()
+    scratch = home / "tmp"
+    holdout = tmp_path / "HOLDOUT.md"
+    holdout.write_text(_scenario("H-01", steps="sleep 60", expect="never"))
+    before = _worktrees(root)
+    env = {k: v for k, v in os.environ.items() if k != "GENESIS_BIG_TMP"}
+    env["HOME"] = str(home)
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(REPO_DIR / "scripts" / "holdout_runner.py"),
+            "--at-ref",
+            "HEAD",
+            "--root",
+            str(root),
+            "--holdout",
+            str(holdout),
+        ],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if scratch.is_dir() and any(
+                p.name.startswith("holdout-step-") for p in scratch.iterdir()
+            ):
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("the step never started")
+        assert len(_worktrees(root)) == len(before) + 1
+        proc.send_signal(signal.SIGTERM)
+        rc = proc.wait(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert rc == 128 + signal.SIGTERM
+    assert _worktrees(root) == before
+    assert list(scratch.iterdir()) == []
+
+
+def test_an_overlay_changes_the_tree_under_test_only(repo, tmp_path, capsys):
+    root, _, _ = repo
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+    (overlay / "calc.py").write_text(
+        "def f():\n    return 'changed'\n\ndef g():\n    return 'gamma'\n"
+    )
+    text = _scenario("H-01", steps=_call("f"), expect="beta-two")
+    rc, out = _at_ref(repo, text, tmp_path, capsys, "--overlay", str(overlay), "--scenario", "H-01")
+    assert rc == 0 and "1 file(s) overlaid" in out.splitlines()[0]
+    assert _lines(out)["H-01"].startswith("H-01 FAIL")
+    assert "beta-two" in (root / "calc.py").read_text()
+    assert _worktrees(root) == [ln for ln in _worktrees(root) if "holdout-ref-" not in ln]
+
+
+def test_the_worktree_is_removed_when_the_overlay_is_refused(repo, tmp_path, capsys):
+    root, _, _ = repo
+    before = _worktrees(root)
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+    (overlay / "calc.py").symlink_to(root / "other.py")
+    rc, out = _at_ref(
+        repo,
+        _scenario("H-01", steps=_call("g"), expect="gamma"),
+        tmp_path,
+        capsys,
+        "--overlay",
+        str(overlay),
+    )
+    assert rc == 3 and "overlay holds a link: calc.py" in out
+    assert _worktrees(root) == before
+
+
+@pytest.mark.parametrize(
+    ("make", "message"),
+    [
+        (lambda o: (o / ".git").mkdir() or (o / ".git" / "config").write_text("x"), "under .git"),
+        (lambda o: None, "overlay holds no files"),
+    ],
+    ids=["git-directory", "empty"],
+)
+def test_an_overlay_that_cannot_be_a_code_change_is_refused(repo, tmp_path, capsys, make, message):
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+    make(overlay)
+    rc, out = _at_ref(
+        repo,
+        _scenario("H-01", steps=_call("g"), expect="gamma"),
+        tmp_path,
+        capsys,
+        "--overlay",
+        str(overlay),
+    )
+    assert rc == 3 and message in out
+
+
+def test_at_ref_with_an_unknown_commit_cannot_run(repo, tmp_path, capsys):
+    root, _, _ = repo
+    holdout = tmp_path / "HOLDOUT.md"
+    holdout.write_text(_scenario("H-01", steps=_call("g"), expect="gamma"))
+    rc = hr.main(["--at-ref", "no-such-ref", "--root", str(root), "--holdout", str(holdout)])
+    assert rc == 3 and "cannot run" in capsys.readouterr().out
+
+
+def test_overlay_without_at_ref_is_a_usage_error(repo, tmp_path):
+    root, _, _ = repo
+    with pytest.raises(SystemExit) as exc:
+        hr.main(["--at-path", str(root), "--overlay", str(tmp_path)])
+    assert exc.value.code == 2
