@@ -164,7 +164,7 @@ def test_a_partial_removed_mid_run_never_replaces_the_copy(tmp_path):
     src.write_text("content\n")
     dst = tmp_path / "session.jsonl.gpg"
     dst.write_bytes(b"previous good copy")
-    proc = _run_encrypt(tmp_path, src, dst, path_prefix=str(binary) + ":")
+    proc = _run_encrypt(tmp_path, src, dst, path_prefix=str(binary) + ":", stamp=True)
     assert dst.read_bytes() == b"previous good copy", "an empty partial replaced the copy"
     assert proc.returncode != 0
     assert _leftovers(tmp_path) == []
@@ -277,6 +277,49 @@ def test_without_stamp_the_copy_keeps_its_encryption_time(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert dst.stat().st_mtime_ns >= before - 10**9
     assert _decrypt(tmp_path, dst) == b"KEY=value\n"
+
+
+def _shim(tmp_path: Path, name: str, body: str) -> str:
+    binary = tmp_path / f"shim-{name}"
+    binary.mkdir(exist_ok=True)
+    tool = binary / name
+    tool.write_text("#!/bin/sh\n" + body)
+    tool.chmod(0o700)
+    return str(binary) + ":"
+
+
+@pytest.mark.parametrize(("age", "offset"), [(0, -1), (1, -1), (2, 1), (5, 1)])
+def test_the_stamp_follows_the_source_age_at_the_read(tmp_path, age, offset):
+    """A source under two seconds old (every live transcript) is stamped a
+    second before its mtime, so the next run re-encrypts it; an older one a
+    second after. The clock is pinned so the boundary is tested exactly."""
+    src = tmp_path / "session.jsonl"
+    src.write_text("line one\n")
+    secs = time.time_ns() // 10**9 - 3600
+    os.utime(src, ns=(secs * 10**9 + 500_000_000,) * 2)
+    dst = tmp_path / "session.jsonl.gpg"
+    prefix = _shim(tmp_path, "date", f'echo {secs + age}\n')
+    proc = _run_encrypt(tmp_path, src, dst, path_prefix=prefix, stamp=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert dst.stat().st_mtime_ns == (secs + offset) * 10**9
+    assert _newer(dst, src) is (offset > 0)
+
+
+def test_a_failed_stamp_keeps_the_new_copy_and_says_why(tmp_path):
+    """Refusing the move would keep the previous copy for good on a filesystem
+    that will not set times; the new copy is kept and touch's error logged."""
+    src = tmp_path / "session.jsonl"
+    src.write_text("new content\n")
+    dst = tmp_path / "session.jsonl.gpg"
+    dst.write_bytes(b"previous copy")
+    prefix = _shim(tmp_path, "touch", 'echo "touch: setting times: Operation not permitted" >&2\nexit 1\n')
+    proc = _run_encrypt(tmp_path, src, dst, path_prefix=prefix, stamp=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _decrypt(tmp_path, dst) == b"new content\n"
+    assert "could not stamp" in proc.stderr
+    assert "Operation not permitted" in proc.stderr
+    assert proc.stdout == ""
+    assert _leftovers(tmp_path) == []
 
 
 def test_a_directory_at_the_destination_is_a_failure(tmp_path):

@@ -440,7 +440,7 @@ fi
 # 255-byte limit where <dst> fits), and carrying the pid so the sweep before the
 # commit (§7) can tell a dead run's partial from a live one's. The stamp uses
 # `touch -c`, so a partial removed meanwhile is never recreated empty and moved
-# over the copy. On failure the last line of gpg's stderr is logged to stderr;
+# over the copy. On failure the last line of cat's, gpg's or mv's stderr is logged to stderr;
 # the caller still logs its own WARNING.
 #
 # With `stamp`, which only the callers that skip on `-nt` pass, the copy's
@@ -492,11 +492,23 @@ encrypt_file() {
             else
                 stamp="@$((secs - 1))"
             fi
-            touch -c -d "$stamp" -- "$tmp" 2>/dev/null \
-                || { [ -e "$tmp" ] && log "  could not stamp $dst; the next run may skip a late append" >&2; }
+            # A failed stamp still moves the copy: refusing would keep the
+            # previous copy for good on a filesystem that will not set times.
+            # The copy then keeps its encryption time, so a write that landed
+            # after cat's EOF and before gpg finished waits for the source's
+            # next change; the log says when the source did change.
+            if ! touch -c -d "$stamp" -- "$tmp" 2>>"$_ENCRYPT_ERR_TMP" && [ -e "$tmp" ]; then
+                local why
+                why="$(tail -n1 "$_ENCRYPT_ERR_TMP" 2>/dev/null | tr -cd '[:print:]' | cut -c1-200)"
+                if [ "$(stat -L -c %Y -- "$src" 2>/dev/null)" != "$secs" ]; then
+                    log "  could not stamp $dst ($why); the source changed during the read, and that change may wait for its next write" >&2
+                else
+                    log "  could not stamp $dst ($why)" >&2
+                fi
+            fi
         fi
         # -T: a directory at <dst> is a failure, never a place to move into.
-        if mv -f -T -- "$tmp" "$dst"; then
+        if mv -f -T -- "$tmp" "$dst" 2>>"$_ENCRYPT_ERR_TMP"; then
             rm -f -- "$_ENCRYPT_ERR_TMP"
             _ENCRYPT_ERR_TMP="" _ENCRYPT_PARTIAL=""
             return 0
@@ -505,7 +517,7 @@ encrypt_file() {
     rm -f -- "$tmp"
     # stderr, not stdout: a caller may capture stdout as its own result
     # (backup_payment_vault's one-line verdict is read from it).
-    log "  gpg: $(tail -n1 "$_ENCRYPT_ERR_TMP" 2>/dev/null | tr -cd '[:print:]' | cut -c1-200)" >&2
+    log "  encrypt failed: $(tail -n1 "$_ENCRYPT_ERR_TMP" 2>/dev/null | tr -cd '[:print:]' | cut -c1-200)" >&2
     rm -f -- "$_ENCRYPT_ERR_TMP"
     _ENCRYPT_ERR_TMP="" _ENCRYPT_PARTIAL=""
     return 1
