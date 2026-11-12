@@ -34,8 +34,10 @@ _PLAIN_TOKEN = re.compile(r"__(?:HOME|VENV|REPO_DIR|CC_BIN_DIR)__")
 
 
 def _install_env_lines(text: str) -> list[str]:
+    # Environment= only: EnvironmentFile= takes a path, not assignments, and its
+    # quoting belongs with the Exec*= path class (#3226).
     return [line for line in text.splitlines()
-            if line.startswith("Environment") and _INSTALL_TOKEN.search(line)]
+            if line.startswith("Environment=") and _INSTALL_TOKEN.search(line)]
 
 
 def _templates() -> list[str]:
