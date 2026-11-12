@@ -5403,13 +5403,18 @@ logger or unrelated exceptions with copied text and no provenance.
   the restore did not move there: while the in-flight part's aside holds
   anything else (a write after the move, through an open fd), unless that
   part read already-restored or as-left by the resume rule (both judged the
-  aside itself), the record is kept, and since it has one slot no other part
-  is written (`other:inflight-unresolved`, naming the aside, in `--check`
-  too; the in-flight part too, when its path holds the tag's state again), so
+  aside itself), the record is kept, and no part at that path, below it or
+  above it is written (`other:inflight-unresolved`, naming the aside, in
+  `--check` too; the in-flight part too, when its path holds the tag's state
+  again); every other part restores (#4025 item 1). Every held aside the run
+  folders show covers its path the same way, and so does an aside it cannot
+  read or judge, so a hold still covers it after a later part's intent took
+  the slot; a hold in a folder named before
+  #4011 still stops every part, since only the in-flight slot finds it. So
   every run names it and exits 1 until what is there is moved out. An aside
   still holding the repair's own as-left copy (the part refused by a gate
   after a kill, or a put-back that failed) holds nothing back; that one read
-  has its own budget. Moving the content out releases the other parts, and
+  has its own budget. Moving the content out releases the parts it covers, and
   the in-flight path is then judged by what it holds: the saved node a kill
   after the put-in left there reads already-restored; a path a kill after
   the aside left empty, or one holding whatever appeared there after a failed

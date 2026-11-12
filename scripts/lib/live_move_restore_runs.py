@@ -58,6 +58,27 @@ def absent(root: str, p: str) -> bool:
     return False
 
 
+def held_covers(holds, q: str) -> bool:
+    """Does a hold among ``holds`` (each ``[run, path, ...]``: the in-flight
+    slot's unresolved aside, and every aside the run folders show held) keep
+    the part at ``q`` from being written (#4025 item 1)? Only a part at a held
+    path, below it or above it (writing one moves or replaces what the held
+    aside belongs to); every other part restores. Coverage comes from the run
+    folders as well as the slot, so a hold still covers its path after a later
+    node's intent overwrote the slot (#4025 PR3 review). An old-form hold
+    covers every part (held_stops_all)."""
+    if held_stops_all(holds):
+        return True
+    return any(q == h[1] or q.startswith(h[1] + "/") or h[1].startswith(q + "/") for h in holds)
+
+
+def held_stops_all(holds) -> bool:
+    """A hold in a folder named before #4011 carries no ts, so only the one
+    in-flight slot can find it, and the next node's intent would overwrite
+    that: it stops every part, the index call and the flags (review SF-8)."""
+    return any(run_ts(h[0]) is None for h in holds)
+
+
 _DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
@@ -212,6 +233,9 @@ def aside_parts(judge) -> list:
             except OSError as exc:
                 note = f"{os.path.join(judge.shown, key)} cannot be read ({exc.strerror})"
                 part(key, "other:aside-unreadable", note)
+                # What it holds cannot be seen, so it holds its path as a held
+                # aside does, whatever the in-flight slot names (PR3 port review).
+                judge.held_asides.append([name, p, os.path.join(judge.shown, key)])
                 continue
             spent, judge.budget = judge.budget, budget
             try:
@@ -220,6 +244,7 @@ def aside_parts(judge) -> list:
                 why = "over the read budget" if isinstance(exc, judge.rp.TooLarge) else str(exc)
                 note = f"{os.path.join(judge.shown, key)} cannot be judged ({why[:200]})"
                 part(key, "other:aside-unreadable", note)
+                judge.held_asides.append([name, p, os.path.join(judge.shown, key)])  # as above
                 continue
             finally:
                 judge.budget = spent
@@ -228,6 +253,7 @@ def aside_parts(judge) -> list:
                 continue
             where = os.path.join(judge.shown, key)
             part(key, "other:aside-held", f"newer content kept at {where}: it was not restored")
+            judge.held_asides.append([name, p, where])  # what it covers: held_covers
     return out
 
 
