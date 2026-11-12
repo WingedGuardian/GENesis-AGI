@@ -1108,11 +1108,12 @@ def test_partial_detail_stays_valid_json_for_any_directory_name(backup_env, tmp_
 
 def test_any_python_virtualenv_under_an_extra_dir_is_excluded(backup_env, tmp_path):
     """#4304: a virtualenv is found by its pyvenv.cfg, whatever it is named, and only
-    its bin/python* interpreter links are excluded: they are absolute, so a restore
-    would refuse them and report the whole directory partial. Everything else is
-    kept, including a project's own bin/ and lib/ files in an in-place venv. Names
-    with tar wildcard characters mean themselves, a venv inside an excluded cache is
-    left alone, and an extra dir that is itself a virtualenv keeps its links."""
+    the absolute links in its bin/ are excluded: a restore would refuse them and
+    report the whole directory partial. Everything else is kept, including relative
+    links and a project's own files in an in-place venv, even ones named python-*.
+    Names with tar wildcard characters mean themselves, a venv inside an excluded
+    cache is left alone, and an extra dir that is itself a virtualenv keeps its
+    links."""
     home = backup_env["home"]
     v = home / "work" / "v"
     (v / "proj" / "bin").mkdir(parents=True)  # `python -m venv .` in a project
@@ -1122,6 +1123,10 @@ def test_any_python_virtualenv_under_an_extra_dir_is_excluded(backup_env, tmp_pa
     (v / "proj" / "notes").mkdir()
     (v / "proj" / "notes" / "todo.md").write_text("mine\n")
     (v / "proj" / "bin" / "deploy.sh").write_text("#!/bin/sh\n")  # the project's own
+    (v / "proj" / "bin" / "python-report").write_text("#!/bin/sh\n")  # named like python*
+    (v / "proj" / "bin" / "python-tools").mkdir()
+    (v / "proj" / "bin" / "python-tools" / "data.txt").write_text("kept\n")
+    (v / "proj" / "bin" / "python3.12").symlink_to("python")  # relative: restorable
     (v / "proj" / "lib").mkdir()
     (v / "proj" / "lib" / "mymod.py").write_text("x = 1\n")
     (v / "odd[1]-venv" / "bin").mkdir(parents=True)
@@ -1147,20 +1152,32 @@ def test_any_python_virtualenv_under_an_extra_dir_is_excluded(backup_env, tmp_pa
     assert proc.returncode == 0, proc.stdout[-1500:]
     status = _status(backup_env)
     assert status["extra_dirs_partial"] == 0 and status["extras_complete"] is True, status
-    excluded = "interpreter links from ~/work/v: ~/work/v/odd[1]-venv/bin/python*"
-    assert excluded in proc.stdout
-    assert "~/work/v/.venv" not in proc.stdout, "a venv inside a default exclude was logged"
     extra = _repo(backup_env) / "extra"
     (v_archive,) = list(extra.glob("work_v-*.tar.gpg"))
     members = _list_extra_archive(v_archive, home)
     assert "work/v/f.txt" in members and "work/v/odd1-venv/keep.txt" in members, members
-    for kept in ("main.py", "notes/todo.md", "bin/deploy.sh", "lib/mymod.py", "pyvenv.cfg"):
+    for kept in (
+        "main.py",
+        "notes/todo.md",
+        "bin/deploy.sh",
+        "bin/python-report",
+        "bin/python-tools/data.txt",
+        "bin/python3.12",
+        "lib/mymod.py",
+        "pyvenv.cfg",
+    ):
         assert f"work/v/proj/{kept}" in members, (kept, members)
-    for venv in ("work/v/odd[1]-venv/", "work/v/deep/tool-env/", "work/v/proj/"):
-        links = [m for m in members if m.startswith(venv + "bin/python")]
-        assert not links, links
+    for link in (
+        "work/v/odd[1]-venv/bin/python3",
+        "work/v/deep/tool-env/bin/python",
+        "work/v/proj/bin/python",
+    ):
+        assert link not in members, members
     (root_archive,) = list(extra.glob("work_rootvenv-*.tar.gpg"))
     assert "work/rootvenv/pyvenv.cfg" in _list_extra_archive(root_archive, home)
+    excluded = "absolute link from ~/work/v: ~/work/v/odd[1]-venv/bin/python3"
+    assert excluded in proc.stdout
+    assert "~/work/v/.venv" not in proc.stdout, "a venv inside a default exclude was logged"
 
 
 def test_extra_restore_diagnostics_preserve_all_long_member_names(backup_env, tmp_path):

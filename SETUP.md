@@ -265,8 +265,9 @@ scratch: a snapshot holds only what that run archived, and nothing is carried
 over from an earlier run. Rebuildable caches (`.venv`, `node_modules`,
 `__pycache__`, …) are always excluded. For any other Python virtualenv below the
 listed directory, whatever it is named (any directory holding `pyvenv.cfg`), only
-its `bin/python*` interpreter links are left out: they are absolute links a
-restore refuses. The rest of the venv is kept, and the log names each one.
+every absolute symlink in its `bin/` (normally the interpreter links) is left out,
+because a restore refuses them. The rest of the venv is kept, and the log names
+each link. An absolute link elsewhere in a venv still marks the directory partial.
 `GENESIS_BACKUP_EXTRA_EXCLUDES` adds more tar exclude patterns (wildcards
 allowed), matched at any depth.
 

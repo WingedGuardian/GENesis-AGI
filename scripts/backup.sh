@@ -1219,13 +1219,14 @@ else
         _gpg_tmp="extra/.${_name}.partial.$$"
         # A Python virtualenv under the directory, whatever it is named (the default
         # excludes catch only `.venv` and `venv`): any directory holding pyvenv.cfg.
-        # Its bin/python* interpreter links are absolute, so a restore refuses them and
-        # the whole directory is reported partial (#4304). Only those links are
-        # excluded: everything else in the venv, and any project files beside it in an
-        # in-place venv, is archived as before. Found below the root only, so a root
-        # that is itself a venv keeps its links, and not inside a directory the default
-        # excludes already drop. Each pattern is anchored to the venv's member path,
-        # with tar's wildcard characters escaped so a name like `a[1]` means itself.
+        # Its interpreter links in bin/ are absolute, so a restore refuses them and the
+        # whole directory is reported partial (#4304). Exactly those links are
+        # excluded, each by its own path: every regular file and relative link in
+        # bin/, the rest of the venv, and any project files beside it in an in-place
+        # venv are archived as before. Found below the root only, so a root that is
+        # itself a venv keeps its links, and not inside a directory the default
+        # excludes already drop. Each exclude is anchored and has tar's wildcard
+        # characters escaped, so it matches that one member and nothing else.
         _venv_ex=()
         _venv_prune=()
         for _x in "${_EXTRA_DEFAULT_EXCLUDES[@]}"; do _venv_prune+=(-name "$_x" -o); done
@@ -1233,9 +1234,14 @@ else
         # prune at depth 1 (measured). The root's own pyvenv.cfg is skipped below.
         while IFS= read -r -d '' _venv; do
             [ "$_venv" = "$_abs" ] && continue
-            _venv_rel="${_venv#"$_home_real"/}"
-            _venv_ex+=("--exclude=$(printf '%s' "$_venv_rel" | sed 's/[][\\*?]/\\&/g')/bin/python*")
-            log "Excluded a Python virtualenv's interpreter links from ~/$_rel: ~/$_venv_rel/bin/python*"
+            while IFS= read -r -d '' _link; do
+                # $(...) below would drop a trailing newline and exclude a sibling
+                # instead: leave such a link in, where restore reports it partial.
+                case "$_link" in *$'\n') continue ;; esac
+                _link_rel="${_link#"$_home_real"/}"
+                _venv_ex+=("--exclude=$(printf '%s' "$_link_rel" | sed 's/[][\\*?]/\\&/g')")
+                log "Excluded a Python virtualenv's absolute link from ~/$_rel: ~/$_link_rel"
+            done < <(find "$_venv/bin" -maxdepth 1 -type l -lname '/*' -print0 2>/dev/null)
         done < <(find "$_abs" -mindepth 1 -type d \( "${_venv_prune[@]}" -false \) -prune \
             -o -type f -name pyvenv.cfg -printf '%h\0' 2>/dev/null)
         _tar_rc=0
