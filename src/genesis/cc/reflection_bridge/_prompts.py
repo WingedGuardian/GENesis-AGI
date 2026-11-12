@@ -538,7 +538,9 @@ async def build_light_prompt_enriched(
     if prior_summary:
         parts.append(
             f"\n## Previous Light Cycle Finding\n{prior_summary}\n"
-            "Do NOT repeat or rephrase this. Only report what is NEW or CHANGED."
+            "Do NOT repeat or rephrase this as news. Only report what is NEW or "
+            "CHANGED; when nothing is, set material_change to false and give "
+            "the short restatement your instructions describe."
         )
 
     if focus == "user_impact":

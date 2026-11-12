@@ -1730,11 +1730,11 @@ def test_a_disagreeing_post_write_judge_counts_as_refused(w, mod, monkeypatch, c
 def test_the_output_says_what_now_blocks_a_deploy(w):
     """NOTE-3: tracked edits block deploy_code_only.sh and update.sh; untracked
     restores only under src/, config/ or pyproject.toml; the run folder and
-    its 90-day prune are named."""
+    how long it is kept (as long as its report, #4011) are named."""
     ts, _, _ = _fresh(w, _foreign_edit)
     r = _restore(w, ts)
     assert r.returncode == 0, r.stdout
-    for text in ("deploy_code_only.sh", "update.sh", "src/", "pyproject.toml", "90 days"):
+    for text in ("deploy_code_only.sh", "update.sh", "src/", "pyproject.toml", "kept while its report is"):
         assert text in r.stdout, (text, r.stdout)
 
 
