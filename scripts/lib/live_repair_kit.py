@@ -17,8 +17,7 @@ new one. Two versioned kits are kept, and the prune touches no name that is not
 a kit id; a symlinked live-repair.d or live-repair is moved aside before any write,
 and anything set aside (a kit that fails to verify, a `current` that is not a
 link) is kept a week from the move. The prune skips a kit whose KIT.json is
-flocked; the repair takes that shared hold from #3492 D2a-2 on (until then
-nothing holds it, and a run keeps its own files open while it runs).
+flocked: every run of the repair holds it shared while it runs (#3492 D2a-2).
 
 The installed kit is HEAD's at the last successful install (bootstrap,
 deploy_code_only.sh past its state refusal, an update's rollback when its code
