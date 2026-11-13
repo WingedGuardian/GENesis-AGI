@@ -1,0 +1,1 @@
+- The live-move repair now retries a forward repair's pending git hooks only after its heal, and only when the checkout then reads safe; it no longer runs the checkout's engine and hook sync while the tree is half-written or a held update state still guards it.

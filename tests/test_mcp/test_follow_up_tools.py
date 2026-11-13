@@ -586,7 +586,51 @@ async def test_notes_only_does_not_write_stale_status(db):
 
     row = await follow_ups.get_by_id(db, fid)
     assert row["status"] == "completed"  # stale in_progress NOT written back
-    assert row["resolution_notes"] == "fg note"
+    assert row["resolution_notes"] == "ego done\n\nfg note"  # appended (#4397)
+
+
+async def test_update_appends_resolution_notes(db):
+    """#4397: resolution_notes is documented as appended; a later update must not
+    erase earlier notes, on every write path (notes-only, status, blocked)."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="keeps its history",
+            reason="r",
+            strategy="ego_judgment",
+            work_state="ready",
+        )
+        fid = created["id"]
+        await follow_up_tools._impl_follow_up_update(fid, resolution_notes="first: scope note")
+        await follow_up_tools._impl_follow_up_update(fid, resolution_notes="second: cross-link")
+        await follow_up_tools._impl_follow_up_update(
+            fid, blocked_reason="waiting", resolution_notes="third: blocked"
+        )
+        await follow_up_tools._impl_follow_up_update(
+            fid, status="completed", resolution_notes="fourth: ruling"
+        )
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "completed"
+    assert row["resolution_notes"] == (
+        "first: scope note\n\nsecond: cross-link\n\nthird: blocked\n\nfourth: ruling"
+    )
+
+
+async def test_crud_update_status_still_replaces_by_default(db):
+    """Internal callers of update_status / update_notes keep replace semantics
+    unless they opt in with append_notes=True."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="internal writer",
+            reason="r",
+            strategy="ego_judgment",
+            work_state="ready",
+        )
+    fid = created["id"]
+    await follow_ups.update_notes(db, fid, resolution_notes="old")
+    await follow_ups.update_status(db, fid, "in_progress", resolution_notes="new")
+    assert (await follow_ups.get_by_id(db, fid))["resolution_notes"] == "new"
+    await follow_ups.update_notes(db, fid, resolution_notes="newer", append_notes=True)
+    assert (await follow_ups.get_by_id(db, fid))["resolution_notes"] == "new\n\nnewer"
 
 
 # ─── H4a/H4c: short-prefix id resolution + loud failed lookups ────────────────

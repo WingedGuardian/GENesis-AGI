@@ -17,6 +17,7 @@ def init(rt: GenesisRuntime) -> None:
 
     config_path = repo_root() / "config" / "model_routing.yaml"
     try:
+        from genesis.routing import litellm_delegate
         from genesis.routing.circuit_breaker import CircuitBreakerRegistry
         from genesis.routing.config import load_config
         from genesis.routing.cost_tracker import CostTracker
@@ -30,6 +31,9 @@ def init(rt: GenesisRuntime) -> None:
 
         config = load_config(config_path)
         delegate = LiteLLMDelegate(config)
+        # The delegate imports litellm on first use; the server imports it now,
+        # as it always has, so its first routed call is not the slow one.
+        litellm_delegate.warm()
 
         # Provider failure escalation — creates observations when a
         # provider trips its breaker repeatedly without recovery.

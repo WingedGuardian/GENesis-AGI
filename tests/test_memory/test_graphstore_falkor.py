@@ -438,6 +438,8 @@ async def test_a_truthy_non_boolean_enabled_does_not_arm_the_backend(monkeypatch
         )
 
     monkeypatch.setattr(cfg, "load_config", lambda: {"enabled": True, "mode": "falkordb"})
+    # With the engine's unit present, so the where-present guard does not apply.
+    monkeypatch.setattr(cfg, "engine_unit_present", lambda: True)
     assert cfg.effective_mode() == "falkordb", "a real boolean True must still arm it"
 
 

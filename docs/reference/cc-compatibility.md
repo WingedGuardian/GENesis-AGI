@@ -31,6 +31,17 @@ Code" below).
 
 ## Updating Claude Code (host + container)
 
+User-scoped transcript retention is reconciled separately from the version pin.
+`CC_CLIENT_SETTINGS_POLICY` in `scripts/lib/cc_version.sh` applies a 180-day minimum
+through the shared settings writer, preserving a higher valid integer. A valid
+positive `GENESIS_CC_RETENTION_DAYS` selects an exact value. Attribution is seeded
+only when absent. Container install, bootstrap/update and the daily settings timer
+apply this policy; the host applies it during host setup only. The host version
+aligner and guardian `update-cc` do not enforce retention. Python-less setup may
+establish updater suppression while reporting the full policy unverified; rerun
+setup with Python available. Project or managed settings can still override user
+settings; this repository no longer supplies a project retention cap.
+
 One pin, both machines, no drift. **`origin` is the PUBLIC repo, so merging the pin *is* the
 release** — which makes the pin PR the wrong place to discover a regression. The sequence below
 is therefore the WHOLE procedure, gates first: **editing the pin is step 6, not step 1.** A bump

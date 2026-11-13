@@ -15,7 +15,9 @@ import asyncio
 import logging
 import time
 from collections import defaultdict, deque
+from collections.abc import Iterator
 from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -23,6 +25,24 @@ if TYPE_CHECKING:
     import aiosqlite
 
 logger = logging.getLogger(__name__)
+
+_SUPPRESS_ACTIVITY_PERSISTENCE: ContextVar[bool] = ContextVar(
+    "genesis_suppress_activity_persistence", default=False,
+)
+
+
+@contextmanager
+def suppress_activity_persistence() -> Iterator[None]:
+    """Retain counters while declining this scope's automatic row admission.
+
+    Already queued work and explicit writes/reap retain their existing behavior.
+    The construction-time persist_activity flag remains an independent opt-out.
+    """
+    token = _SUPPRESS_ACTIVITY_PERSISTENCE.set(True)
+    try:
+        yield
+    finally:
+        _SUPPRESS_ACTIVITY_PERSISTENCE.reset(token)
 
 
 class CallRecord(NamedTuple):
@@ -75,7 +95,7 @@ class ProviderActivityTracker:
         self._evict(provider)
 
         # Queue for DB persistence (fire-and-forget)
-        if self._db is not None and self.persist_activity:
+        if self._db is not None and self.persist_activity and not _SUPPRESS_ACTIVITY_PERSISTENCE.get():
             self._write_batch.append(
                 (provider, latency_ms, success, cache_hit, error_message),
             )
