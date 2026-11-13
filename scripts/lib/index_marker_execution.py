@@ -726,7 +726,14 @@ def _provider_blocked(db, h, provider):
 
 def blocked(db, h: str, provider: str, *, exclude=0, fresh_cleanup=None) -> bool:
     # Physical cleanup cannot release the independent provider safety hold.
-    if recovery.control_blocked(db, h, exclude) or _provider_blocked(db, h, provider):
+    if _provider_blocked(db, h, provider):
+        return True
+    return physical_blocked(db, h, exclude=exclude, fresh_cleanup=fresh_cleanup) or _provider_blocked(db, h, provider)
+
+
+def physical_blocked(db, h: str, *, exclude=0, fresh_cleanup=None) -> bool:
+    """Independent original physical/control obligations; never provider release."""
+    if recovery.control_blocked(db, h, exclude):
         return True
     invalidated = []
     for record in db.execute(
@@ -742,9 +749,7 @@ def blocked(db, h: str, provider: str, *, exclude=0, fresh_cleanup=None) -> bool
             return True
     # Finish the SELECT before callbacks retain newly observed resource facts on
     # these rows. Re-read the safety predicate after those writes as well.
-    if any(not _ownership_clear(row, fresh_cleanup) for row in invalidated):
-        return True
-    return _provider_blocked(db, h, provider)
+    return any(not _ownership_clear(row, fresh_cleanup) for row in invalidated)
 
 
 def claim(db, h: str, provider: str, legs, *, fresh_cleanup=None):
@@ -770,31 +775,40 @@ def reconcile(db, legs, *, fresh_cleanup=None):
         "WHERE e.protocol=3 ORDER BY e.execution_seq"
     ))
     for record in rows:
-        row = dict(record)
-        value = {key: row[key] for key in legs.CONTEXT}
-        if row["completion_kind"] == "unbound":
-            continue
-        if row["terminal"] is not None or row["first_stop"] is not None or row["cleanup_proof"] is not None:
-            apply(db, value, legs, fresh_cleanup=fresh_cleanup)
-            continue
-        if row["typed_applied_state"] is not None:
-            if _ownership_clear(row, fresh_cleanup):
-                _finish_pointer(db, row)
-            continue
-        if row["launch_reservation"] is not None and row["launch_permission"] != "cancelled":
-            continue  # Reservation/intent recovery requires its bound facts.
-        state, disposition, charged = legs._restore(db, row, False)
-        if not recovery.control_pending(row) and (row["scope_registration"] is None or _ownership_clear(row, fresh_cleanup)):
-            _finish_pointer(db, row)
-        before = execution(db, value, legs)  # Fresh-cleanup callbacks may already have retained safety.
-        db.execute(
-            "UPDATE executions SET completion_kind='unstarted',typed_applied_state=?,"
-            "disposition=?,typed_charged_attempts=?,safety_kind=coalesce(safety_kind,?) WHERE execution_seq=?",
-            (state, disposition, charged, "uncertainty" if row["scope_registration"] else None, row["execution_seq"]),
-        )
-        recovery.note_transition(db, before, execution(db, value, legs))
-        restored.append(row["hash"])
+        value = {key: record[key] for key in legs.CONTEXT}
+        if reconcile_execution(db, value, legs, fresh_cleanup=fresh_cleanup):
+            restored.append(record["hash"])
     return restored
+
+
+def reconcile_execution(db, value, legs, *, fresh_cleanup=None):
+    """The existing reducer for one exact row; never reconstruct its pointer."""
+    row = execution(db, value, legs)
+    if row["completion_kind"] == "unbound":
+        return False
+    if row["terminal"] is not None or row["first_stop"] is not None or row["cleanup_proof"] is not None:
+        apply(db, value, legs, fresh_cleanup=fresh_cleanup)
+        return False
+    if row["typed_applied_state"] is not None:
+        current = db.execute("SELECT 1 FROM inflight WHERE hash=? AND execution_seq=? AND claim_id=?",
+                             (row["hash"], row["execution_seq"], row["claim_id"])).fetchone()
+        if current is not None and _ownership_clear(row, fresh_cleanup):
+            _finish_pointer(db, row)
+        return False
+    if row["launch_reservation"] is not None and row["launch_permission"] != "cancelled":
+        return False  # Reservation/intent recovery requires its bound facts.
+    _owns(db, row)
+    state, disposition, charged = legs._restore(db, row, False)
+    if not recovery.control_pending(row) and (row["scope_registration"] is None or _ownership_clear(row, fresh_cleanup)):
+        _finish_pointer(db, row)
+    before = execution(db, value, legs)  # Fresh-cleanup callbacks may already have retained safety.
+    db.execute(
+        "UPDATE executions SET completion_kind='unstarted',typed_applied_state=?,"
+        "disposition=?,typed_charged_attempts=?,safety_kind=coalesce(safety_kind,?) WHERE execution_seq=?",
+        (state, disposition, charged, "uncertainty" if row["scope_registration"] else None, row["execution_seq"]),
+    )
+    recovery.note_transition(db, before, execution(db, value, legs))
+    return True
 
 
 COMMANDS = {"reserve-launch", "register-scope", "begin-native", "cancel-launch",

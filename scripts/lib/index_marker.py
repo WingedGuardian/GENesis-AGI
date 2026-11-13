@@ -30,7 +30,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from contextlib import contextmanager, suppress
+from contextlib import closing, contextmanager, suppress
 from pathlib import Path
 
 FULL_INTERVAL_S = 7 * 24 * 3600
@@ -419,21 +419,16 @@ def _publisher(*, wait_s: float = LOCK_WAIT_S, legacy_requests: bool = False):
 @contextmanager
 def _queue_gate(*, native=False, admission=None):
     """Initialize first, then drain and decide under one exclusive barrier."""
-    db = _connect(OUTCOME_LOCK_WAIT_S)
-    try:
-        with _legacy._lock(marker_dir(), OUTCOME_LOCK_WAIT_S):
-            with _transaction(db):
-                _recovery.admission_schema(db, SCHEMA_VERSION, _native, require_native=native)
-                imported = _legacy.drain(marker_dir(), db, _import_one, _fsync_dir)
-                residual = []
-                native_imported = _native.drain(marker_dir(), db, _legs, _proof, marker_hash, residual=residual)
-                if admission is not None:
-                    _recovery.refuse_unrepresented(db, residual, admission)
-                yield db
-            _legacy.retire(marker_dir(), imported, _fsync_dir)
-            _legacy.retire(marker_dir(), native_imported, _fsync_dir)
-    finally:
-        db.close()
+    with _decision_gate(native=native, admission=admission) as (db, _finalize):
+        yield db
+
+
+@contextmanager
+def _decision_gate(*, native=False, admission=None):
+    with closing(_connect(OUTCOME_LOCK_WAIT_S)) as db, _recovery.decision_gate(
+        db, globals(), native=native, admission=admission
+    ) as decision:
+        yield decision
 
 
 def _coalesce_pending(db: sqlite3.Connection, h: str, data: dict, *, legacy=False) -> None:
@@ -922,9 +917,7 @@ def _cli_context(args):
 
 
 def _machine_hash(value: str) -> str:
-    if len(value) != 16 or any(char not in "0123456789abcdef" for char in value):
-        raise ValueError("invalid machine repository hash")
-    return value
+    return _native._hex(value, 16, "machine repository hash")
 
 
 def _pending_record(row: dict) -> tuple[str, ...]:
@@ -967,8 +960,8 @@ def _write_machine(records) -> None:
     sys.stdout.buffer.flush()
 
 
-def main(argv: list[str] | None = None) -> int:
-    return _cli.main(argv, globals())
+def main(argv: list[str] | None = None, *, supervisor=None) -> int:
+    return _cli.main(argv, globals(), supervisor=supervisor)
 
 
 if __name__ == "__main__":

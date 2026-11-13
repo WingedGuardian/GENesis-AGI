@@ -1038,9 +1038,58 @@ harmless executable descriptor with real locks, processes, pipes and scratch
 SQL, including successful and failed native completion. The fixture substitutes
 its manager, kernel, resource-admission input and provider. It does not
 qualify native containment. Typed timer dispatch and the GitNexus adapter use
-this owner; positive supervised recovery remains separate, and automatic
+this owner; positive supervised retry remains separate, and automatic
 readiness stays fenced.
+
+Owner admission also observes the complete known managed-scope namespace before
+reservation. It checks stable terminal identity, no queued job and recursive
+kernel absence across the matching providers and repositories. Failed manager
+state alone does not prove tasks ended. Unknown names, unreadable population
+and identity drift refuse; the check never stops a process. This census is a
+point-in-time observation, not atomic physical exclusion or a RAM reservation.
+Global physical exclusion and production capacity remain separate gates.
+
 Existing standalone indexing policy remains unchanged.
+
+### Explicit owner-loss reconciliation
+
+The captured runner's queue endpoint accepts `reconcile-native --context` with
+the complete original protocol-3 context. Its supervisory caller must supply the
+existing canonical runner lock on descriptor8; the endpoint takes the canonical
+repository lock on descriptor9 itself. Raw queue invocation, the entry profile,
+stale source and missing or occupied coordination descriptors refuse. The
+ordinary no-argument timer reconciliation keeps its previous behavior.
+
+`scripts/lib/code_intel_supervisor.py` collects the witness itself. An original
+owner's changed boot, absent PID or validated changed birth identity can prove
+the original recorded lifetime ended. Matching terminal leader states stay
+unproved because other threads can still run. Unreadable or malformed process
+data cannot prove end; a process in uninterruptible sleep is still alive. Registered work also needs the original
+reporter's lifetime end and actual original kernel release. An existing empty
+group without an original owned wait remains unresolved. A previously retained
+valid original wait can be reused only with a fresh qualified physical
+observation. Unregistered work without native intent has the structural exception:
+cancel future permission and retain orphaned uncertainty, without inventing a
+registration, wait or kernel proof.
+
+The same admitted transaction records orphaned control, retains physical evidence
+and settles that exact execution through the existing reducers. Known success is
+not resent; applied unknown accounting and its debt remain immutable even if a
+late success arrives. Replaying a lost reply uses the original witness and cannot
+replace a newer inflight pointer. Reconciliation does not issue a grant, accept a
+trial, clear the provider hold or enable automatic work.
+
+Recovery decisions can perform one final typed drain on that same connection and
+exclusive publication barrier after fresh-cleanup callbacks. Remaining bodies
+have sorted unique semantic identities; filenames and delivery timestamps do not
+define new incidents. This sees callback-created evidence even when the provider
+revision did not change. Represented artifacts retire only after commit; retained
+conflicts remain available. The ordinary admission prefilter is unchanged.
+
+Scoped admission shares its cache-aware headroom calculation and visible
+cgroup mapping without changing the full worker cap or existing reserves.
+These observations reserve no RAM and do not qualify hidden host limits,
+sustained pressure, deployment peaks or production corpus behavior.
 
 ### Pinned GitNexus typed adapter
 
