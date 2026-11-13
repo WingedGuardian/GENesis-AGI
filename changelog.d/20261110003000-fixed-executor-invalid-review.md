@@ -1,0 +1,1 @@
+- Retry unreadable executor review verdicts once and block verification if they remain invalid.

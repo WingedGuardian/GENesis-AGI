@@ -207,6 +207,7 @@ async def fallback_env_if_login_dead(
     token_reader=read_fallback_token,
     token_is_stale=fallback_token_is_stale,
     cc_path: str = "claude",
+    use_cache: bool = True,
 ) -> dict[str, str] | None:
     """Env additions for a background CC invocation, or None (the common case).
 
@@ -229,13 +230,16 @@ async def fallback_env_if_login_dead(
     if expiry is None or expiry > datetime.now(UTC):
         return None
 
-    async with _get_probe_lock():
-        now = time.monotonic()
-        if _probe_cache is not None and now - _probe_cache[0] < _PROBE_CACHE_TTL_S:
-            confirmed_out = _probe_cache[1]
-        else:
-            confirmed_out = await probe()
-            _probe_cache = (now, confirmed_out)
+    if not use_cache:
+        confirmed_out = await probe()
+    else:
+        async with _get_probe_lock():
+            now = time.monotonic()
+            if _probe_cache is not None and now - _probe_cache[0] < _PROBE_CACHE_TTL_S:
+                confirmed_out = _probe_cache[1]
+            else:
+                confirmed_out = await probe()
+                _probe_cache = (now, confirmed_out)
     if not confirmed_out:
         return None
 
