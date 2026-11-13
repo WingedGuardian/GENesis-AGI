@@ -740,6 +740,24 @@ verified: b321bb634 2026-11-07
   per-binary hardening, which made an every-session claim depend on an invocation
   shape that, once no profile declares an allowlist, never occurs: the pin was
   written by the builder and verified by nothing.
+  **"Every dispatch" means every `CCInvoker` dispatch, plus the dashboard's
+  update sessions** (`dashboard/routes/updates.py`), which start `claude -p`
+  outside the invoker and import its set and gate instead of keeping a second
+  list. Tier 3 (`_spawn_detached_cc`) sets the four names empty as the last
+  change to the environment and passes `_assert_no_gh_credentials` before the
+  session's log is opened or a process starts; a refusal raises. Tiers 1/2 are
+  started by the generated orchestrator script, which cannot import genesis
+  while an update is replacing it: `_apply_supervised` substitutes the invoker's
+  set into the script (`GH_CREDENTIAL_ENV`) and `spawn_cc` sets those names empty
+  after the inherited environment. The orchestrator process itself keeps the
+  server's environment, and so does `update.sh` on the direct path
+  (`_apply_direct`, which starts no session); an `update.sh` a tier session runs
+  inherits that session's pins. Two limits: these sessions pass no
+  `--settings`, so the settings-level pin above does not apply to them, and the
+  script's `spawn_cc` sets the names but does not run the gate
+  (`tests/test_dashboard/test_update_template.py` runs the written script and
+  applies the gate to what the session received). A session started outside
+  both the invoker and the update routes does not go through this gate.
   **"`gh` holds no credential" is the claim; "the session is unauthenticated" is
   NOT** — tool scope decides the second, and a profile permitting `Read` with an
   outbound tool can still reach a credential FILE, which no env pin touches.
@@ -4779,7 +4797,14 @@ logger or unrelated exceptions with copied text and no provenance.
 - **security/**: prompt-injection defense + outbound scanning — sanitizer is
   LOG-ONLY for internal sources (perimeter EMAIL/INBOX can block);
   `output_scanner` = deterministic outbound secrets/IP scan (a payment card
-  number is a critical finding); `card_shapes` = the one payment-card-number
+  number is a critical finding) plus in-place credential redaction for peer
+  replies and remote diagnostics; `credential_shapes` = the shared
+  credential-shape table (vendor key prefixes, JWT, Discord webhook URL,
+  Telegram bot token; stdlib-only data, recall-first), read by
+  `output_scanner` for every shape it does not own in a tighter local form and
+  held equal to the hook scrubber's two patterns by
+  `tests/test_security/test_credential_shapes.py` until the scrubber loads it;
+  `card_shapes` = the one payment-card-number
   detector (ASCII digits, alphanumeric boundary, standard groupings, brand
   prefix + length, Luhn, UUID groups skipped; stdlib-only so scripts load it
   by path), used by the browser tool guards, `reference_store`, reference
