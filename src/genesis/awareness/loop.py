@@ -3981,6 +3981,9 @@ async def perform_tick(
                         # Recent: 27.0/day") so downstream consumers can't misread
                         # a symmetric deviation score's direction.
                         **({"baseline_note": s.baseline_note} if s.baseline_note else {}),
+                        # Additive: a collector's stub reading on error. Without
+                        # it a later comparison reads the stub as a real value.
+                        **({"failed": True} if s.failed else {}),
                     }
                     for s in signals
                 ]

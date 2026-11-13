@@ -497,3 +497,222 @@ async def test_granted_rate_limit_burst_demotes_and_holds(db):
     )
     assert decision.allow is False  # rate-limit tripped
     assert (await cg.get_cell(db, "email", "send", "standard"))["state"] == "ask"
+
+
+# --------------------------------------------------------------------------- #
+# Marketing-recipient posture: a curated prospect is never emailed autonomously
+# as a reply, when opted out, or while the marketing lever is not `live` —
+# whatever class the send classifies as.
+
+
+async def _grant_identity(db):
+    for event in (CellEvent.CLASSIFY, CellEvent.APPROVE):
+        await cg.apply_event(
+            db,
+            origin_class="first_party",
+            domain="email",
+            verb="send",
+            risk_class="identity",
+            event=event,
+            updated_at=_TS,
+        )
+
+
+async def _assert_held_without_demote(db, decision, risk):
+    assert decision.allow is False
+    pend = await pes.get_by_request(db, decision.request_id)
+    assert pend is not None and pend["status"] == "held"  # an approval card, not a drop
+    assert pend["cell_risk_class"] == risk
+    cell = await cg.get_cell(db, "email", "send", risk)
+    assert cell["state"] == "granted"  # a posture hold is not scope drift
+    assert cell["corrections"] == 0
+
+
+@pytest.mark.parametrize("mode", ["observe", "off"])
+@pytest.mark.asyncio
+async def test_granted_identity_cold_followup_to_prospect_holds_unless_live(db, monkeypatch, mode):
+    # A cold follow-up on an unanswered thread classifies IDENTITY. With that cell
+    # GRANTED it used to send autonomously in every marketing mode: the non-live
+    # hold covered BULK only.
+    monkeypatch.setattr("genesis.outreach.marketing_config.effective_mode", lambda: mode)
+    await _grant_identity(db)
+    await _add_prospect(db, email="known@example.com", status="contacted")
+    gate = _gate(db)
+    req = _req(validated_recipient="known@example.com", thread_id="t-unanswered")
+    decision = await gate.check(request=req, recipient="known@example.com", message_text="bump")
+    await _assert_held_without_demote(db, decision, "identity")
+
+
+@pytest.mark.asyncio
+async def test_granted_identity_cold_followup_to_prospect_allowed_when_live(db, marketing_live):
+    await _grant_identity(db)
+    await _add_prospect(db, email="known@example.com", status="contacted")
+    gate = _gate(db)
+    req = _req(validated_recipient="known@example.com", thread_id="t-unanswered")
+    decision = await gate.check(request=req, recipient="known@example.com", message_text="bump")
+    assert decision.allow is True
+    assert decision.reason == "granted"
+    assert await pes.list_held(db) == []
+
+
+@pytest.mark.parametrize("mode", ["observe", "off"])
+@pytest.mark.asyncio
+async def test_granted_identity_cold_to_non_prospect_is_unaffected(db, monkeypatch, mode):
+    # Control: the posture gate is scoped to curated prospects. Any other cold
+    # IDENTITY send keeps the autonomy its grant gives it.
+    monkeypatch.setattr("genesis.outreach.marketing_config.effective_mode", lambda: mode)
+    await _grant_identity(db)
+    await _add_prospect(db, email="known@example.com")
+    gate = _gate(db)
+    req = _req(validated_recipient=None, thread_id=None)
+    decision = await gate.check(request=req, recipient="colleague@example.com", message_text="hi")
+    assert decision.allow is True
+    assert decision.reason == "granted"
+
+
+@pytest.mark.asyncio
+async def test_granted_standard_reply_to_prospect_is_held_even_when_live(db, marketing_live):
+    # A prospect wrote back. The reply to them is held for the owner in every
+    # mode, including `live`, even once the known-thread reply cell is GRANTED.
+    await _grant_standard(db)
+    await _add_prospect(db, email="known@example.com", status="contacted")
+    await _add_inbound_from(db, "t1", "known@example.com")
+    gate = _gate(db)
+    req = _req(validated_recipient="known@example.com", thread_id="t1")
+    decision = await gate.check(request=req, recipient="known@example.com", message_text="re: hi")
+    await _assert_held_without_demote(db, decision, "standard")
+
+
+@pytest.mark.asyncio
+async def test_granted_bulk_labelled_reply_to_prospect_is_held_even_when_live(db, marketing_live):
+    # labeled_surplus is caller-supplied, so a reply can classify BULK. The reply
+    # hold keys on the thread having inbound mail, not on the class.
+    await _grant_bulk(db)
+    await _add_prospect(db, email="known@example.com", status="contacted")
+    await _add_inbound_from(db, "t1", "known@example.com")
+    gate = _gate(db)
+    req = _req(validated_recipient="known@example.com", thread_id="t1", labeled_surplus=True)
+    decision = await gate.check(request=req, recipient="known@example.com", message_text="re: hi")
+    await _assert_held_without_demote(db, decision, "bulk")
+
+
+@pytest.mark.asyncio
+async def test_granted_identity_send_to_opted_out_prospect_is_held_when_live(db, marketing_live):
+    # g2's opt-out guard covers BULK only. An opted-out prospect must not get an
+    # autonomous send of any class; the hold's approved-send path refuses it too.
+    await _grant_identity(db)
+    await _add_prospect(db, email="gone@example.com", opted_out=True)
+    gate = _gate(db)
+    req = _req(validated_recipient="gone@example.com", thread_id="t-unanswered")
+    decision = await gate.check(request=req, recipient="gone@example.com", message_text="bump")
+    await _assert_held_without_demote(db, decision, "identity")
+
+
+@pytest.mark.asyncio
+async def test_prospect_lookup_survives_display_name_recipient(db, monkeypatch):
+    # The posture gate must not fail open on a "Name <addr>" recipient: a missed
+    # lookup would read as "not a prospect" and send.
+    monkeypatch.setattr("genesis.outreach.marketing_config.effective_mode", lambda: "observe")
+    await _grant_identity(db)
+    await _add_prospect(db, email="known@example.com")
+    gate = _gate(db)
+    req = _req(validated_recipient=None, thread_id=None)
+    decision = await gate.check(
+        request=req, recipient="Known Person <Known@Example.com>", message_text="hi"
+    )
+    await _assert_held_without_demote(db, decision, "identity")
+
+
+@pytest.mark.asyncio
+async def test_prospect_reply_with_display_name_sender_holds_without_demote(db, marketing_live):
+    # The reply poller stores the raw From header. g1 compares it to the
+    # recipient exactly, so "Name <addr>" trips it. The reply hold is decided
+    # before the scope guards: the shared reply cell must not be demoted for a
+    # send that was held anyway.
+    await _grant_standard(db)
+    await _add_prospect(db, email="known@example.com", status="contacted")
+    await _add_inbound_from(db, "t1", "Known Person <known@example.com>")
+    gate = _gate(db)
+    req = _req(validated_recipient="known@example.com", thread_id="t1")
+    decision = await gate.check(request=req, recipient="known@example.com", message_text="re: hi")
+    await _assert_held_without_demote(db, decision, "standard")
+
+
+@pytest.mark.asyncio
+async def test_opted_out_prospect_reply_holds_without_demote(db, marketing_live):
+    await _grant_standard(db)
+    await _add_prospect(db, email="gone@example.com", opted_out=True)
+    await _add_inbound_from(db, "t1", "gone@example.com")
+    gate = _gate(db)
+    req = _req(validated_recipient="gone@example.com", thread_id="t1")
+    decision = await gate.check(request=req, recipient="gone@example.com", message_text="re: stop")
+    await _assert_held_without_demote(db, decision, "standard")
+
+
+@pytest.mark.parametrize("mode", ["observe", "off"])
+@pytest.mark.asyncio
+async def test_granted_bulk_labelled_reply_to_prospect_is_held_when_not_live(db, monkeypatch, mode):
+    monkeypatch.setattr("genesis.outreach.marketing_config.effective_mode", lambda: mode)
+    await _grant_bulk(db)
+    await _add_prospect(db, email="known@example.com", status="contacted")
+    await _add_inbound_from(db, "t1", "known@example.com")
+    gate = _gate(db)
+    req = _req(validated_recipient="known@example.com", thread_id="t1", labeled_surplus=True)
+    decision = await gate.check(request=req, recipient="known@example.com", message_text="re: hi")
+    await _assert_held_without_demote(db, decision, "bulk")
+
+
+@pytest.mark.parametrize(
+    "recipient",
+    [
+        "colleague@example.com, known@example.com",
+        "colleague@example.com;known@example.com",
+        "colleague@example.com <known@example.com",
+        "known@example.com,known@example.com,",
+        ", ".join(f"c{i}@example.com" for i in range(1200)) + ", known@example.com",
+    ],
+    ids=["comma-list", "semicolon-list", "unclosed-angle", "trailing-comma", "long-list"],
+)
+@pytest.mark.asyncio
+async def test_prospect_lookup_survives_list_and_malformed_recipients(db, monkeypatch, recipient):
+    # One prospect anywhere in the recipient string is enough to hold the send,
+    # including in forms the header parser gives up on, and in a list longer
+    # than one lookup query.
+    monkeypatch.setattr("genesis.outreach.marketing_config.effective_mode", lambda: "observe")
+    await _grant_identity(db)
+    await _add_prospect(db, email="known@example.com")
+    gate = _gate(db)
+    req = _req(validated_recipient=None, thread_id=None)
+    decision = await gate.check(request=req, recipient=recipient, message_text="hi")
+    await _assert_held_without_demote(db, decision, "identity")
+
+
+@pytest.mark.asyncio
+async def test_prospect_lookup_failure_does_not_allow_the_send(db, monkeypatch):
+    # The lookup is not wrapped: a database error propagates out of check(), so
+    # the pipeline never reaches the adapter. It must not read as "not a prospect".
+    from genesis.db.crud import marketing_prospects as mp
+
+    async def boom(_db, _recipient):
+        raise aiosqlite.OperationalError("database is locked")
+
+    monkeypatch.setattr(mp, "find_in_recipient", boom)
+    await _grant_identity(db)
+    gate = _gate(db)
+    req = _req(validated_recipient=None, thread_id=None)
+    with pytest.raises(aiosqlite.OperationalError):
+        await gate.check(request=req, recipient="colleague@example.com", message_text="hi")
+
+
+@pytest.mark.asyncio
+async def test_granted_standard_reply_to_non_prospect_still_allowed(db):
+    # Control for the reply hold: an ordinary correspondent's reply is untouched,
+    # in the default (non-live) marketing mode.
+    await _grant_standard(db)
+    await _add_prospect(db, email="known@example.com")
+    await _add_inbound_from(db, "t1", "alice@example.com")
+    gate = _gate(db)
+    req = _req(validated_recipient="alice@example.com", thread_id="t1")
+    decision = await gate.check(request=req, recipient="alice@example.com", message_text="re: hi")
+    assert decision.allow is True
+    assert decision.reason == "granted"

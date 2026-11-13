@@ -16,9 +16,14 @@ on `live`). A target whose objects a power loss took cannot be judged, so the
 whole tree is restored to the tag and a clean tree clears it. Run from a kit
 outside the checkout (the checkout is what may be half-written): python3 -I -S,
 standard library only.
-Exit 1 only where a start would run a half-written tree; at boot every failure
-before the checkout itself changes exits 0 (the server starts as it did before),
-a failed backup included. A main row is out of scope (QD3): exit 3 by command, 0
+Exit 1 only where a start would run a half-written tree. At boot (the server
+unit's start step, #3492 D2a-2) that refusal is 75 and keeps the server down,
+and every other outcome starts, with one page per state the start goes past. A
+failure there before a `live` row is judged half-written exits 0 (the server
+starts as it did before); after it, a failed backup included, 75 (owner ruling
+Q2: such a tree never starts). The boot run first checks the kit against its
+KIT.json (exit 3: start and page) and ends every child by one deadline
+(live_move_boot.py). A main row is out of scope (QD3): exit 3 by command, 0
 at boot."""
 
 from __future__ import annotations
@@ -56,6 +61,7 @@ KIT_SOURCES = (
     "live_move_restore_runs.py",
     "live_move_restore_rows.py",
     "live_move_restore_write.py",
+    "live_move_boot.py",
 )
 BOOT_BUDGET_S = 60  # every wait at boot, inside systemd's default 90 s start timeout
 _POLL_S = 1.0
@@ -70,6 +76,24 @@ _now, _sleep = time.monotonic, time.sleep  # a test's fake clock replaces both
 # re-checks run on the real one.
 _settle = time.sleep
 _changed = False  # set when the checkout itself starts to change (_apply)
+_healing = False  # set once a `live` row is judged half-written: no start after it (Q2)
+BOOT_REFUSE = 75  # the unit refuses the start on it; the command's 1
+_DEADLINE: float | None = None  # monotonic, at boot only: every child ends by it
+_BOOT = None  # live_move_boot.py, loaded once
+_KIT_FD: int | None = None  # the kit's KIT.json, held shared while any run uses the kit
+_KIT_ID: str | None = None  # its kit_id, read by the boot self-check (the repeat check's)
+# The unit whose start step runs this (its template sets it from %N): the same
+# kit runs in genesis-server's and genesis-bridge's units.
+_UNIT = os.environ.get("GENESIS_BOOT_UNIT") or "genesis-server"
+_DOWN = f"{_UNIT} stays down until a start can heal the checkout."
+_TITLES = {
+    "kept": f"{_UNIT} started past an update state that still guards",
+    "mixed": f"{_UNIT} started on a half-written checkout",
+    "refused": f"{_UNIT} stays down: the checkout is half-written",
+    "unresolved": f"{_UNIT} stays down: the checkout is half-written",
+    "failed": f"{_UNIT} stays down: the boot repair failed partway",
+    "skipped": "the boot repair could not run",
+}
 
 
 class TooLarge(Exception):
@@ -88,9 +112,21 @@ def _log(msg: str) -> None:
 GIT_C = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
 
 
+def _bounded(argv: list[str], what: str, **kw):
+    """At boot: ``argv`` through the boot runner, ended by the deadline."""
+    try:
+        return _BOOT.run(argv, until=_DEADLINE, grace=_BOOT.KILL_GRACE_S, **kw)
+    except subprocess.TimeoutExpired:
+        raise RepairError(f"{what}: stopped, the boot deadline passed") from None
+
+
 def _git(repo: str, *args: str, check: bool = True, data: bytes | None = None):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    p = subprocess.run(["git", *GIT_C, "-C", repo, *args], capture_output=True, input=data, env=env)
+    argv = ["git", *GIT_C, "-C", repo, *args]
+    if _DEADLINE is None:
+        p = subprocess.run(argv, capture_output=True, input=data, env=env)
+    else:
+        p = _bounded(argv, f"git {args[0]}", env=env, data=data)
     if check and p.returncode != 0:
         why = p.stderr.decode(errors="replace").strip()
         raise RepairError(f"git {args[0]} failed (exit {p.returncode}): {why}")
@@ -225,6 +261,7 @@ SAVED_BYTES = 32 * 1024 * 1024
 #: them together): 16 KiB each leaves room for any environment. The full text
 #: is in REPAIR.json.
 ALERT_BYTES = 16 * 1024
+_HEALED = "Genesis repaired a half-written live checkout"
 
 
 class _Saved:
@@ -777,16 +814,130 @@ def manifests(backups: str) -> list[tuple[str, dict]]:
 
 def _ephemeral() -> str:
     """EPHEMERAL_DIRTY_RE; unreadable, a pattern matching nothing (bytes then decide)."""
-    p = subprocess.run(
-        ["bash", "-c", '. "$1/deploy_marker.sh" && printf %s "$EPHEMERAL_DIRTY_RE"', "re", _LIB],
-        capture_output=True,
-        text=True,
-    )
-    return p.stdout if p.returncode == 0 and p.stdout else r"(?!)"
+    argv = ["bash", "-c", '. "$1/deploy_marker.sh" && printf %s "$EPHEMERAL_DIRTY_RE"', "re", _LIB]
+    if _DEADLINE is None:
+        p = subprocess.run(argv, capture_output=True)
+    else:
+        p = _bounded(argv, "the ephemeral pattern")
+    out = p.stdout.decode(errors="replace")
+    return out if p.returncode == 0 and out else r"(?!)"
 
 
 def _load_guard():
     return _load_kit("update_state_guard.py")
+
+
+def _boot():
+    """live_move_boot.py: the boot step's runner, deadline and page keys."""
+    global _BOOT
+    if _BOOT is None:
+        _BOOT = _load_kit("live_move_boot.py")
+    return _BOOT
+
+
+def _kit_hold() -> str | None:
+    """Hold the KIT.json beside this module shared for the process's lifetime,
+    in every mode, before the guard or any sibling loads: the installer's
+    prune skips a kit a run is using (F9), and a command run loads siblings
+    lazily, after waiting on update.lock for up to hours (review SF-A). None
+    once held, and when there is no KIT.json (a checkout's scripts/lib); else why."""
+    global _KIT_FD
+    try:
+        _KIT_FD = os.open(
+            os.path.join(_LIB, "KIT.json"),
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"KIT.json: {exc.strerror or exc}"
+    try:
+        fcntl.flock(_KIT_FD, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError as exc:
+        return f"KIT.json: not held ({exc.strerror or exc})"
+    return None
+
+
+def _kit_check() -> str | None:
+    """The boot self-check: why the kit this runs from is not the one its
+    KIT.json (held by _kit_hold) describes (a file missing, altered or of
+    another version), else None. A partial kit would judge by mixed rules (C3),
+    or read every live row half-written on a missing shell lib and hold the
+    server down (C4), so it never runs."""
+    global _KIT_ID
+    if _KIT_FD is None:
+        return "KIT.json: No such file or directory"
+    try:
+        st = os.fstat(_KIT_FD)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 64 << 10:
+            return "KIT.json: not a regular file under 64 KiB"
+        kit = json.loads(os.pread(_KIT_FD, 64 << 10, 0))
+        if not isinstance(kit, dict):  # valid JSON, not an object (#4501 review)
+            return "KIT.json: not a JSON object"
+        _KIT_ID = kit.get("kit_id")
+        names, files = kit["kit_sources"], kit["files"]
+        if not set(KIT_SOURCES) <= set(names) or set(files) != set(names):
+            return "KIT.json: its file list is not this kit's"
+        for name in names:
+            full, oid = os.path.join(_LIB, name), files[name]
+            st = os.lstat(full)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > 1 << 20:
+                return f"{name}: not a regular file under 1 MiB"
+            if _blob_id(full, st, "sha256" if len(oid) == 64 else "sha1") != oid:
+                return f"{name}: its bytes are not the ones KIT.json names"
+    except OSError as exc:
+        return f"{os.path.basename(exc.filename or 'KIT.json')}: {exc.strerror or exc}"
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        return f"KIT.json: unreadable ({type(exc).__name__})"
+    return None
+
+
+def _state_bytes(path: str) -> bytes:
+    """The state file's bytes for a page key (bounded, no link, no FIFO), or b""."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return b""
+    try:
+        return os.read(fd, 1 << 20) if stat.S_ISREG(os.fstat(fd).st_mode) else b""
+    finally:
+        os.close(fd)
+
+
+def _end_mark(repo: str) -> str:
+    try:
+        return _boot().end_mark(lambda *a: _git(repo, *a, check=False).stdout)
+    except (OSError, RepairError):
+        return "unknown"  # past the deadline: the key still names the state
+
+
+def _boot_key(cls: str, state_path: str, raw: bytes | None, mark: str) -> str:
+    """A boot page's key: the state's bytes as the run leaves them (the judged
+    bytes once cleared) and the checkout's end mark (F6, review SF2)."""
+    return _boot().key(cls, _state_bytes(state_path) or raw or b"", mark)
+
+
+def _queue(severity: str, title: str, body: str, key: str, backup: str | None) -> None:
+    """Queue the alert, its body cut to ALERT_BYTES (saying how much was
+    left out and where the full text is). A failure is logged, never
+    raised: it must not change the exit code. Whatever the text holds (a
+    `%`, a NUL, a lone surrogate), nothing here raises past the except.
+    Bounded by live_move_boot.ALERT_TIMEOUT_S, by command too."""
+    try:
+        data = body.encode("utf-8", "replace")
+        if len(data) > ALERT_BYTES:
+            where = backup + "/REPAIR.json" if backup else "the service's journal"
+            tail = " more bytes; the full text is in " + where + ")"
+            room = ALERT_BYTES - len((" ... (" + str(len(data)) + tail).encode("utf-8", "replace"))
+            kept = data[: max(room, 0)].decode("utf-8", "ignore")
+            body = kept + " ... (" + str(len(data) - len(kept.encode())) + tail
+        body = body.encode("utf-8", "replace").decode("utf-8").replace("\0", " ")
+        rc = _boot().queue_alert(_LIB, severity, title, body, key)
+    except Exception as exc:  # noqa: BLE001 - an alert never changes the exit code
+        _log(f"the alert was not queued ({exc!r})")
+        return
+    if rc != 0:
+        _log(f"the alert was not queued (exit {rc})")
 
 
 def _load_kit(name: str):
@@ -815,9 +966,13 @@ class Repair:
         self.backups = os.path.join(self.home, "deploy-backups")
         self.backups_warning: str | None = None
         self.guard = _load_guard()
+        self.guard._DEADLINE = _DEADLINE  # one boot deadline for its git too (None by command)
+        self.backup: str | None = None
+        self.raw: bytes | None = None  # the judged state bytes, once _heal starts
         self._fds: list[int] = []
         self.update_fd: int | None = None  # update.lock's, handed to restore-hooks
         self.forward = False  # HEAD on `live` at the target: finishing a rollback
+        self.start_mark: str | None = None  # at boot, the checkout as the heal found it
 
     def _hold(self, path: str, deadline: float) -> int | None:
         fd = _flock(path, deadline)
@@ -860,14 +1015,12 @@ class Repair:
                 return 0
             self.update_fd = self._hold(lock, deadline)
             if self.update_fd is None:
-                verdict, _ = self.guard.verdict(self.state_path, self.repo)
-                self._say(f"update.lock is still held after the wait; the checkout is {verdict}")
-                return 1 if verdict == self.guard.MIXED_TREE else 0
+                return self._held("update.lock", True)
         # The checkout lock before the hooks retry too: restore-hooks runs under
         # it in the forward heal, as in update.sh's rollback.
         locks = self._checkout_locks(deadline)
-        if locks is None:
-            return 1 if os.path.lexists(self.state_path) else 0  # no state: a later run retries
+        if locks is None:  # no state: a later run retries
+            return self._held("a checkout lock", False) if os.path.lexists(self.state_path) else 0
         # Each pending entry is judged against the refs as this run found them
         # (superseded is written now); restore-hooks, which runs the checkout
         # code, waits for the heal (#4367).
@@ -877,8 +1030,156 @@ class Repair:
             self._say("nothing to repair: there is no update state")
             return 0
         rc = self._judge_state(locks[0])
+        if rc == 0:
+            # Healed, or nothing to heal: a failure from here (the hooks retry)
+            # must not keep a healed tree down (#4501 round 2 class audit).
+            global _changed, _healing
+            _changed = _healing = False
         self._retry_pending(owed)
         return rc
+
+    def _held(self, what: str, judge: bool) -> int:
+        """A lock still held after the wait (rev 2 F2), the tree judged
+        read-only. At boot a `live` row judged half-written refuses (Q2); any
+        other tree starts (a main checkout's too, review SF5), paged when its
+        state guards. By command (``judge`` false) 1, the tree not judged."""
+        if not self.boot and not judge:
+            return 1
+        # One read of the state for the verdict and the target (#4501 round 2):
+        # a holder may change it between two reads.
+        if os.path.lexists(self.state_path):
+            raw, state = self._state()
+            conflicts = os.path.join(
+                os.path.dirname(os.path.abspath(self.state_path)), "update_conflicts.json"
+            )
+            verdict, reason = self.guard.state_verdict(state, self.repo, conflicts)
+        else:
+            raw, state = None, None
+            verdict, reason = self.guard.SAFE, "there is no state file"
+        self._say(f"{what} is still held after the wait; the checkout is {verdict}")
+        mixed = verdict == self.guard.MIXED_TREE
+        if not self.boot:
+            return 1 if mixed else 0
+        late = f"{what} was still held after {BOOT_BUDGET_S} s"
+        self._latch(verdict, state)  # before the lookup, which runs git (#4501 round 2)
+        if mixed and self._live_target(state):
+            self._page("refused", "critical", verdict, reason, raw, f"{late}. {_DOWN}")
+            return 1
+        if verdict != self.guard.SAFE:
+            extra = f"{late}; {_UNIT} was started anyway, and the next start retries."
+            self._page(
+                "mixed" if mixed else "kept",
+                "critical" if mixed else "warning",
+                verdict,
+                reason,
+                raw,
+                extra,
+            )
+        return 0
+
+    def _page(self, cls, severity, verdict, reason, raw, extra=None, body=None) -> None:
+        """A boot page: the guard's message (its remedy) plus what the start
+        did, keyed on the state's bytes and the checkout's end mark."""
+        if not self.boot:
+            return
+        if body is None:
+            body = self.guard.message(self.state_path, verdict, reason)
+            body += " " + (
+                extra or f"{_UNIT} was started anyway; a guarding update state never keeps it down."
+            )
+        key = _boot_key(cls, self.state_path, raw, _end_mark(self.repo))
+        _queue(severity, _TITLES[cls], body, key, None)
+
+    def _unhealed(self, state, verdict: str, reason: str, raw) -> int:
+        """S4: a half-written tree the repair does not heal starts with a
+        critical page (owner Q5): a main checkout (QD3), or a `live` rollback
+        stopped after `merging`, which the repair does not handle yet (#3722);
+        never main's --post-merge advice for the latter."""
+        branch = _out(self.repo, "symbolic-ref", "-q", "HEAD", check=False)
+        live = isinstance(state, dict) and state.get("original_branch") == "live"
+        if not live or branch != "refs/heads/live":
+            self._say("a half-written checkout on main is not repaired here; only `live` rows are")
+            self._page(
+                "mixed",
+                "critical",
+                verdict,
+                reason,
+                raw,
+                f"{_UNIT} was started anyway: "
+                "a half-written checkout on main is not repaired automatically.",
+            )
+            return 0 if self.boot else 3
+        phase = state.get("phase") if isinstance(state, dict) else None
+        self._say(
+            f"a `live` rollback stopped in phase {phase!r}; the repair does not handle that phase yet (#3722)"
+        )
+        body = (
+            f"{self.state_path} records a `live` rollback that stopped in phase {phase!r}; the "
+            "repair does not handle that phase yet (#3722), so it left the checkout half-written "
+            f"and {_UNIT} was started anyway: {reason}"
+        )
+        self._page("mixed", "critical", verdict, reason, raw, body=body)
+        return 0 if self.boot else 3
+
+    def _repeats(self, raw: bytes, judged: str) -> bool:
+        """F4: the newest repair of these state bytes ended unresolved and the
+        checkout is as it left it, so a new heal would end the same way, with
+        one more backup per start. Refused at once, with that run's page key.
+        A heal that crashed partway (or was killed before it recorded a
+        result) is retried once, then refused the same way (owner ruling);
+        its attempts are counted from the reports on disk (#4501 round 3), so
+        an end mark the deadline left unreadable never resets the count. The
+        count stops where the checkout changed from outside between two crashes
+        (a crash's end mark against the next heal's start mark, round 4): that
+        tree is owed its own retry. A heal's own half-written change never
+        stops it, since the next heal starts from the tree the crash left."""
+        self.start_mark = mark = _end_mark(self.repo)
+        try:
+            names = sorted(n for n in os.listdir(self.backups) if n.endswith(SUFFIX))
+        except OSError:
+            return False
+        # The readable reports, newest first (review LOW-4: a newer folder with
+        # no readable REPAIR.json never hides the run before it; newest 8 only).
+        reports = []
+        for candidate in reversed(names[-8:]):  # bounded, as the readers read 8
+            report = self._report(os.path.join(self.backups, candidate, "REPAIR.json"))
+            if report is not None:
+                reports.append((candidate, report))
+        if not reports:
+            return False
+        name, report = reports[0]
+        state_sha = hashlib.sha256(raw).hexdigest()
+        boot = _boot()
+        if boot.same_attempt(report, state_sha, _KIT_ID) and boot.crashed(report):
+            attempts, newer = 0, None
+            for _, older in reports:
+                if not (boot.same_attempt(older, state_sha, _KIT_ID) and boot.crashed(older)):
+                    break
+                if newer is not None and boot.changed(
+                    older.get("end_mark"), newer.get("start_mark")
+                ):
+                    break  # the checkout changed from outside before the newer heal
+                attempts, newer = attempts + 1, older
+            if attempts < 2:
+                self._say(
+                    f"the last repair of this update state crashed partway ({name}); trying once more"
+                )
+                return False
+            if boot.changed(report.get("end_mark"), mark):
+                return False  # the tree changed since: a heal may end otherwise
+        elif not boot.unresolved_repeat(report, state_sha, mark, _KIT_ID, judged):
+            return False
+        self._say(
+            "the last repair of this update state ended unresolved and nothing changed "
+            f"since ({name}); not healed again. " + _DOWN
+        )
+        result = (
+            report.get("result") or "unresolved: the repair was stopped before it recorded a result"
+        )
+        body = f"{result}. Not healed again: nothing changed since {name}. {_DOWN}"
+        key = _boot_key("unresolved", self.state_path, raw, mark)
+        _queue("critical", _TITLES["unresolved"], body, key, os.path.join(self.backups, name))
+        return True
 
     def _judge_pending(self, path: str) -> bool:
         try:
@@ -968,10 +1269,33 @@ class Repair:
             return raw, None
         return raw, data if isinstance(data, dict) else None
 
+    def _latch(self, verdict: str, state: object) -> None:
+        """Judged half-written: from here a failure keeps the service down (Q2).
+        Decided from the state alone, with no git (#4501 round 2): a MIXED_TREE
+        verdict on a merging row that names a live move (rule 6's record) or
+        came from `live` (rule 6a). A main row never sets it, so a main
+        checkout's mixed tree still starts with its page. Set before the move's
+        target is resolved, since that lookup runs git under the boot deadline."""
+        global _healing
+        _healing = (
+            verdict == self.guard.MIXED_TREE
+            and isinstance(state, dict)
+            and state.get("phase") == "merging"
+            and (
+                self.guard._move_record(state) is not None or state.get("original_branch") == "live"
+            )
+        )
+
     def _judge_state(self, index_lock: str) -> int:
+        global _healing
         raw, state = self._state()
         verdict, reason = self.guard.state_verdict(state, self.repo)
+        # Judged half-written: a failure resolving the move's target (its git
+        # call can meet the boot deadline) keeps the service down (#4501 Codex
+        # P1). Cleared below for a tree this repair never heals (a main row).
+        self._latch(verdict, state)
         to = self._live_target(state)
+        _healing = False
         if verdict == self.guard.SAFE and to:
             # A repair killed after it healed, before it cleared. Its report keeps
             # no result; readers judge "unresolved" by the guard, not by it.
@@ -981,10 +1305,12 @@ class Repair:
             return 0
         if verdict != self.guard.MIXED_TREE:
             self._say(f"nothing to repair: the checkout is not half-written ({verdict}: {reason})")
+            if verdict != self.guard.SAFE:
+                self._page("kept", "warning", verdict, reason, raw)
             return 0
         if not to:
-            self._say("a half-written checkout on main is not repaired here; only `live` rows are")
-            return 0 if self.boot else 3
+            return self._unhealed(state, verdict, reason, raw)
+        _healing = True  # judged half-written (review SF1): a failure now keeps it down
         # Judged by HEAD and the branch, as the guard's live rule judges them,
         # never by the guard's wording: off the tag, the guard calls a live row
         # half-written only with HEAD on `live` at the target (a rollback killed
@@ -994,8 +1320,11 @@ class Repair:
             branch = _out(self.repo, "symbolic-ref", "-q", "HEAD", check=False)
             if head != to or branch != "refs/heads/live":
                 self._say("the checkout is neither at its rollback tag nor on `live` at the target")
+                self._page("refused", "critical", verdict, reason, raw, _DOWN)
                 return 1
             self.forward = True
+        if self.boot and self._repeats(raw, f"{verdict}: {reason}"):
+            return 1
         return self._heal(state, raw, to, index_lock)
 
     def _live_target(self, state: object) -> str | None:
@@ -1011,7 +1340,8 @@ class Repair:
         if _out(repo, "rev-parse", "--verify", "HEAD^{commit}") != (to if self.forward else tag):
             raise RepairError("HEAD moved while the repair judged it")
         self.fmt = _out(repo, "rev-parse", "--show-object-format")
-        backup = self._backup_dir()
+        self.backup = backup = self._backup_dir()
+        self.raw = raw
         ts = os.path.basename(backup)[: -len(SUFFIX)]
         torn = self._keep_index(backup)
         self.want, self.ephemeral = _tree(repo, tag), _ephemeral()
@@ -1025,6 +1355,10 @@ class Repair:
         readable = rows is not None
         rows = rows if readable else self._rows(None, index, flags)
         manifest = {"ts": ts, "repo": repo, "state_row": state, "tag": tag, "other": to}
+        # The repeat check's (F4): these state bytes, and (at boot) the checkout as left.
+        # The kit too (review SF-B): a newly installed kit may heal what this one could not.
+        manifest.update(state_sha=hashlib.sha256(raw).hexdigest(), end_mark=None, kit_id=_KIT_ID)
+        manifest["start_mark"] = self.start_mark  # round 4: where an outside change shows
         # `reapply` stays [] (#3868: no generated shell) so older readers stay valid.
         manifest.update(result=None, paths=rows, reapply=[], dismissed_at=None, hooks=None)
         manifest.update(index_rebuilt=torn, integrity="SAVED.json")
@@ -1404,6 +1738,10 @@ class Repair:
                     "update card and run scripts/update.sh again"
                 )
             return self._finish(backup, manifest, f"healed, state kept: {kept}", 0)
+        # What the guard judged as the heal ended: the next boot heals again once
+        # it judges otherwise (#4501 Codex P2: residue outside the checkout,
+        # reached through a tracked symlink, leaves the end mark unchanged).
+        manifest["end_verdict"] = f"{verdict}: {reason}"
         return self._finish(backup, manifest, f"unresolved: {verdict}: {reason}", 1)
 
     def _rewrite(self, raw: bytes, state: dict) -> None:
@@ -1434,6 +1772,8 @@ class Repair:
         if manifest["index_rebuilt"]:
             result += "; the index was torn: rebuilt from the tag, its bytes saved as git/index"
         manifest["result"] = result
+        if self.boot:
+            manifest["end_mark"] = _end_mark(self.repo)
         write_json(os.path.join(backup, "REPAIR.json"), manifest, private=True)
         body = f"{result}. The checkout went back to {manifest['tag'][:12]}; what changed is saved in {backup}."
         foreign = sum(1 for r in manifest["paths"] if r["class"] == "foreign")
@@ -1461,56 +1801,57 @@ class Repair:
             or manifest.get("hooks_before")
             else "warning"
         )
-        self._alert(severity, body, f"live_move_repair:{manifest['ts']}", backup)
+        key = f"live_move_repair:{manifest['ts']}"  # by command: one per run
+        title = _TITLES["unresolved"] if rc and self.boot else _HEALED
+        if self.boot:  # one key per event: the next boot's page of the same state dedupes (F6)
+            cls = (
+                "unresolved"
+                if rc
+                else "kept"
+                if result.startswith("healed, state kept")
+                else "healed"
+            )
+            key = _boot_key(cls, self.state_path, self.raw, manifest["end_mark"])
+        _queue(severity, title, body, key, backup)
         return rc
 
     def _alert(self, severity: str, body: str, key: str, backup: str) -> None:
-        """Queue the alert, its body cut to ALERT_BYTES (saying how much was
-        left out and where the full text is). A failure is logged, never
-        raised: it must not change the exit code. Whatever the text holds (a
-        `%`, a NUL, a lone surrogate), nothing here raises past the except."""
-        try:
-            data = body.encode("utf-8", "replace")
-            if len(data) > ALERT_BYTES:
-                tail = " more bytes; the full text is in " + backup + "/REPAIR.json)"
-                room = ALERT_BYTES - len(
-                    (" ... (" + str(len(data)) + tail).encode("utf-8", "replace")
-                )
-                kept = data[: max(room, 0)].decode("utf-8", "ignore")
-                body = kept + " ... (" + str(len(data) - len(kept.encode())) + tail
-            body = body.encode("utf-8", "replace").decode("utf-8").replace("\0", " ")
-            p = subprocess.run(
-                ["bash", "-c", '. "$1/alert_queue.sh" && queue_alert "$2" live_move_repair "$3" "$4" "$5"',
-                 "alert", _LIB, severity, "Genesis repaired a half-written live checkout", body, key],
-                capture_output=True,
-            )  # fmt: skip
-        except Exception as exc:  # noqa: BLE001 - an alert never changes the exit code
-            _log(f"the alert was not queued ({exc!r})")
-            return
-        if p.returncode != 0:
-            _log(f"the alert was not queued (exit {p.returncode})")
+        _queue(severity, _HEALED, body, key, backup)
 
     def _restore_hooks(self, before: str, after: str) -> bool:
         """The engine's restore-hooks, as update.sh's rollback runs it: the
         checkout's own engine (the tag's, now on disk), handed update.lock's fd.
-        No timeout: it runs sync-hooks (up to 120 s) outside BOOT_BUDGET_S. No
-        --boot caller exists yet; bounding it inside a server start is PR D2's,
-        which wires --boot."""
+        By command no timeout (sync-hooks takes up to 120 s). At boot it ends
+        AFTER_S before the deadline (time left to judge the healed tree), and
+        is not started with under HOOKS_MIN_S: False either way, so the hooks
+        stay pending and the next run retries them."""
+        if _DEADLINE is not None:
+            until = _DEADLINE - _BOOT.AFTER_S
+            if until - _BOOT._now() - _BOOT.KILL_GRACE_S < _BOOT.HOOKS_MIN_S:
+                _log(
+                    "restore-hooks was not started: too little of the boot deadline is left; the next run retries"
+                )
+                return False
         env = {
             **os.environ,
             "DEPLOY_CANDIDATES_LOCK_FD": str(self.update_fd),
             "DEPLOY_CANDIDATES_EPHEMERAL_RE": _ephemeral(),
         }
         engine = os.path.join(self.repo, "scripts", "deploy_candidates.py")
-        p = subprocess.run(
-            ["python3", "-I", "-S", engine, "restore-hooks", before, after],
-            env=env,
-            pass_fds=(self.update_fd,),
-            capture_output=True,
-            text=True,
-        )
+        argv = ["python3", "-I", "-S", engine, "restore-hooks", before, after]
+        if _DEADLINE is None:
+            p = subprocess.run(argv, env=env, pass_fds=(self.update_fd,), capture_output=True)
+        else:
+            try:
+                p = _BOOT.run(
+                    argv, until=until, grace=_BOOT.KILL_GRACE_S, env=env, pass_fds=(self.update_fd,)
+                )
+            except subprocess.TimeoutExpired:
+                _log("restore-hooks was stopped at the boot deadline; the next run retries")
+                return False
         if p.returncode != 0:
-            _log(f"restore-hooks failed (exit {p.returncode}): {p.stderr.strip()[-2000:]}")
+            why = p.stderr.decode(errors="replace").strip()[-2000:]
+            _log(f"restore-hooks failed (exit {p.returncode}): {why}")
         return p.returncode == 0
 
     def _report(self, path: str) -> dict | None:
@@ -1632,16 +1973,28 @@ class Repair:
         The report dir, and hooks-before in it, must be this user's 0700
         directories (the heal's _report_dir rule; the retry passes a dir only
         load_report checked): otherwise nothing is touched."""
+        if not _hooks_time_left():  # C8: never remove hooks with no time to reinstall them
+            return False
         common = _out(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
         hooks = os.path.join(common, "hooks")
         # Where git runs hooks from, read without GIT_C's own core.hooksPath
         # override (rev-parse runs no hook).
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-        where = subprocess.run(
-            ["git", "-c", "core.fsmonitor=false", "-C", self.repo, "rev-parse",
-             "--path-format=absolute", "--git-path", "hooks"],
-            capture_output=True, env=env,
-        )  # fmt: skip
+        argv = [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+            self.repo,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "hooks",
+        ]
+        if _DEADLINE is None:
+            where = subprocess.run(argv, capture_output=True, env=env)
+        else:
+            where = _bounded(argv, "git rev-parse", env=env)
         runs = os.fsdecode(where.stdout.strip())
         if where.returncode or os.path.realpath(runs) != os.path.realpath(hooks):
             _log(f"core.hooksPath points git at {runs}; the git hooks were not reinstalled")
@@ -1666,6 +2019,10 @@ class Repair:
             if not os.path.lexists(aside):
                 os.mkdir(aside, 0o700)
             moved.append((name, _copy_private(dst, aside, name)))
+        # Again, as the hooks are about to go: the git calls above spend the
+        # same budget (#4501 review). The copies made stay in hooks-before/.
+        if moved and not _hooks_time_left():
+            return False
         if moved:
             self._sync(backup)  # the only copy of a hand edit, durable before it goes
             prior = manifest.get("hooks_before")
@@ -1680,6 +2037,21 @@ class Repair:
         for name, _copy in moved:
             os.unlink(os.path.join(hooks, name))
         return self._restore_hooks(tag, tag)
+
+
+def _hooks_time_left() -> bool:
+    """By command always; at boot, is there time to remove hooks and still
+    reinstall them before the deadline (2 x HOOKS_MIN_S past the after-heal
+    reserve)? Logs the skip when not; the next run retries."""
+    if _DEADLINE is None:
+        return True
+    left = _DEADLINE - _BOOT.AFTER_S - _BOOT._now() - _BOOT.KILL_GRACE_S
+    if left >= 2 * _BOOT.HOOKS_MIN_S:
+        return True
+    _log(
+        "the git hooks were not reinstalled: too little of the boot deadline is left; the next run retries"
+    )
+    return False
 
 
 def _sync_listed(text: str, name: str) -> bool:
@@ -1803,7 +2175,63 @@ def _dismiss(state: str, repo: str, ts: str, wait: int) -> int:
         os.close(fd)
 
 
+def _record_unresolved(repair: Repair | None, result: str) -> None:
+    """A heal that raised after the checkout began to change ends unresolved in
+    its REPAIR.json (written before the first change, _save), with the checkout
+    as it was left, so the next start's repeat check (F4) refuses at once
+    instead of healing again with one more backup per start. Best effort: the
+    refusal and its page stand whatever this write does."""
+    if repair is None or not repair.backup:
+        return
+    path = os.path.join(repair.backup, "REPAIR.json")
+    try:
+        manifest = repair._report(path)
+        if manifest is None or manifest.get("result") is not None:
+            return
+        manifest["result"] = result
+        manifest["end_mark"] = _end_mark(repair.repo)
+        write_json(path, manifest, private=True)
+    except Exception as exc:  # noqa: BLE001 - never masks the boot refusal
+        _log(f"could not record the failed heal in {path} ({type(exc).__name__}: {exc})")
+
+
+def _boot_failed(repair: Repair | None, state_path: str, exc: Exception) -> int:
+    """The boot run raised. Before a `live` row was judged half-written:
+    start (0), paged when a state file exists. Once judged (Q2), or once the
+    checkout began to change: the server stays down (75), paged critical."""
+    what = f"{type(exc).__name__}: {exc}"[:200]
+    backup = repair.backup if repair is not None else None
+    if _changed:
+        _log(
+            f"failed partway ({what}); the checkout may be half-restored, its backup is {backup}. {_DOWN}"
+        )
+        cls, rc = "failed", BOOT_REFUSE
+        body = f"The boot repair failed partway ({what}); the checkout may be half-restored. What it saved is in {backup}. {_DOWN}"
+        _record_unresolved(repair, f"unresolved: the boot repair failed partway ({what})")
+    elif _healing:
+        _log(f"the repair could not start healing ({what}); the checkout is half-written. {_DOWN}")
+        cls, rc = "refused", BOOT_REFUSE
+        body = f"The boot repair could not start healing ({what}); the checkout is half-written, and nothing in it was changed. {_DOWN}"
+    else:
+        _log(f"skipped; nothing was changed ({what})")
+        if not os.path.lexists(state_path):
+            return 0
+        cls, rc = "skipped", 0
+        body = f"The boot repair could not judge {state_path} ({what}); {_UNIT} was started without it."
+    repo = repair.repo if repair is not None else ""
+    _queue(
+        "critical",
+        _TITLES[cls],
+        body,
+        _boot_key(cls, state_path, None, _end_mark(repo) if repo else ""),
+        backup,
+    )
+    return rc
+
+
 def main(argv: list[str]) -> int:
+    global _DEADLINE
+    entered = time.monotonic()  # the boot deadline counts from here (F5)
     ap = argparse.ArgumentParser(prog="live_move_repair.py")
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--boot", action="store_true")
@@ -1829,15 +2257,30 @@ def main(argv: list[str]) -> int:
         _log(f"{ts!r} is not a repair report's ts")
         return 2
     repo = os.path.abspath(args.repo)
+    held = _kit_hold()
+    if held is not None and not args.boot:
+        _log(f"the installed kit cannot be held against a reinstall ({held}); nothing was done")
+        return 1
+    if args.boot:
+        why = held or _kit_check()
+        if why is not None:
+            _log(
+                f"the installed kit is incomplete or altered ({why[:150]}); boot repair skipped. Reinstall: "
+                f'python3 -I -S scripts/lib/live_repair_kit.py install {repo[:120]} "$HOME"'
+            )
+            return 3
+        _DEADLINE = entered + _boot().BOOT_DEADLINE_S
     if args.dismiss is not None:  # REPAIR.json's readers stop reporting a dismissed repair's saves
         return _dismiss(args.state, repo, args.dismiss, 30 if args.wait is None else args.wait)
     wait = args.wait if args.wait is not None else 30 if args.restore is not None else 7200
+    repair = None
     try:
-        return Repair(args.state, repo, args.boot, wait).run(args.restore, not args.check)
+        repair = Repair(args.state, repo, args.boot, wait)
+        rc = repair.run(args.restore, not args.check)
+        return BOOT_REFUSE if args.boot and rc == 1 else rc
     except Exception as exc:  # noqa: BLE001 - every failure is named; at boot it sets the exit
-        if args.boot and not _changed:  # a failed backup changed nothing in the checkout
-            _log(f"skipped; nothing was changed ({type(exc).__name__}: {exc})")
-            return 0
+        if args.boot:
+            return _boot_failed(repair, args.state, exc)
         if args.restore is not None and not args.check:
             _log(f"the restore failed ({type(exc).__name__}: {exc}); REPAIR.json's `restore`"
                  " block names any part in flight, and a re-run finishes it")  # fmt: skip

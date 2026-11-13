@@ -1,0 +1,1 @@
+- Shell parsing now reads `bash +c CMD` and `sh +c CMD` like `-c`, and skips a lone `+` after the selector instead of ending option parsing, so commands passed that way are visible to every Bash guard (#2218).
