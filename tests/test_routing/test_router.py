@@ -1060,3 +1060,178 @@ async def test_served_model_is_reported_and_model_id_stays_configured(
     assert result.provider_used == "free-1"
     assert result.served_model == "vendor/model-9.9"
     assert result.model_id == sample_config.providers["free-1"].model_id
+
+
+# ── An exhausted prepaid balance reported as a 400 ────────────────────────────
+
+# What the delegate returns for an empty prepaid balance: litellm's prefix and
+# the vendor body. SYNTHETIC (all-zero request id), in the recorded shape.
+_BALANCE_ERROR = (
+    'litellm.BadRequestError: DeepseekException - {"error":{"message":'
+    '"Insufficient Balance (request_id: 00000000-0000-0000-0000-000000000000)",'
+    '"type":"insufficient_balance_error","param":null,"code":"invalid_request_error"}}'
+)
+
+
+def _repeated_walk_router(first_provider_error, cost_tracker, degradation, event_bus=None):
+    """A router for walking one chain several times in a row.
+
+    Built on `_three_free_config` because its providers have NO rpm limit: the
+    shared `sample_config` gives `free-1` two requests a minute, and the router
+    builds a real rate gate from that, so a second walk there sleeps 30 seconds.
+    One same-provider retry is allowed, so "called once per walk" is evidence
+    of the fail-fast path and not of a retry budget of zero.
+    """
+    config = _three_free_config(max_total_s=None, max_retries=1)
+    assert all(p.rpm_limit is None for p in config.providers.values())
+    breakers = CircuitBreakerRegistry(config.providers)
+    delegate = MockDelegate(responses={
+        "free-1": CallResult(success=False, status_code=400, error=first_provider_error),
+    })
+    router = Router(
+        config=config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate, event_bus=event_bus,
+    )
+    return router, breakers, delegate
+
+
+def _calls_to(delegate, provider):
+    return sum(1 for c in delegate.calls if c["provider"] == provider)
+
+
+@pytest.mark.asyncio
+async def test_balance_exhausted_400_opens_the_breaker_and_is_then_skipped(
+    cost_tracker, degradation,
+):
+    """A 400 that says the prepaid balance is empty is a billing state.
+
+    BAD_REQUEST is kept away from the breaker because a 400 is normally the
+    payload's fault. This one is not: the provider answers every call the same
+    way, so without a breaker record it stays first in the chain and every
+    call pays a wasted round trip to it.
+    """
+    from unittest.mock import AsyncMock
+
+    event_bus = AsyncMock()
+    router, breakers, delegate = _repeated_walk_router(
+        _BALANCE_ERROR, cost_tracker, degradation, event_bus=event_bus,
+    )
+    messages = [{"role": "user", "content": "hi"}]
+    cb = breakers.get("free-1")
+
+    for walk in range(1, 4):
+        result = await router.route_call("site", messages)
+        assert result.success is True
+        assert result.provider_used == "free-2"
+        # Fail fast: one call per walk, although one retry is allowed.
+        assert _calls_to(delegate, "free-1") == walk
+
+    assert cb.is_available() is False
+    assert cb.last_failure_category == ErrorCategory.QUOTA_EXHAUSTED
+    assert cb.trip_count == 1
+
+    # The fourth walk skips the provider: no call reaches it.
+    result = await router.route_call("site", messages)
+    assert result.success is True
+    assert result.provider_used == "free-2"
+    assert "free-1" in result.failed_providers
+    assert _calls_to(delegate, "free-1") == 3
+
+    tripped = [c for c in event_bus.emit.call_args_list if c.args[2] == "breaker.tripped"]
+    assert len(tripped) == 1
+    assert tripped[0].kwargs["provider"] == "free-1"
+
+
+@pytest.mark.asyncio
+async def test_ordinary_400_never_opens_the_breaker(cost_tracker, degradation):
+    """Negative control over the same four walks: an ordinary 400 is still the
+    payload's fault, is never recorded, and the provider is called every time.
+    """
+    from unittest.mock import AsyncMock
+
+    event_bus = AsyncMock()
+    router, breakers, delegate = _repeated_walk_router(
+        "context window exceeded", cost_tracker, degradation, event_bus=event_bus,
+    )
+    messages = [{"role": "user", "content": "hi"}]
+    cb = breakers.get("free-1")
+
+    for walk in range(1, 5):
+        result = await router.route_call("site", messages)
+        assert result.success is True
+        assert result.provider_used == "free-2"
+        assert _calls_to(delegate, "free-1") == walk
+
+    assert cb.consecutive_failures == 0
+    assert cb.trip_count == 0
+    assert cb.is_available() is True
+    assert not [c for c in event_bus.emit.call_args_list if c.args[2] == "breaker.tripped"]
+
+
+@pytest.mark.parametrize("wire_status", [400, 402], ids=["wire-400", "wire-402"])
+@pytest.mark.asyncio
+async def test_balance_exhausted_reply_opens_the_breaker_through_the_real_delegate(
+    loopback_vendor, cost_tracker, degradation, monkeypatch, wire_status,
+):
+    """ACCEPTANCE BAR: the recorded reply, over real HTTP, through the real
+    delegate, router and breaker.
+
+    Nothing between the vendor's bytes and the breaker is typed by hand here,
+    so a fix that only works on a hand-built ``CallResult`` cannot pass. Both
+    wire statuses are covered because the one a live install received was not
+    recorded: 400 is carried by the classifier's balance token, 402 by the
+    delegate keeping the status.
+    """
+    from unittest.mock import patch
+
+    from genesis.routing.litellm_delegate import LiteLLMDelegate
+    from genesis.routing.types import CallSiteConfig, ProviderConfig, RetryPolicy, RoutingConfig
+
+    # Keeps a first litellm import in this process off the network.
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    base_url, reply = loopback_vendor
+    reply["status"] = wire_status
+    reply["body"] = {
+        "error": {
+            "message": "Insufficient Balance (request_id: 00000000-0000-0000-0000-000000000000)",
+            "type": "insufficient_balance_error",
+            "param": None,
+            "code": "invalid_request_error",
+        }
+    }
+    config = RoutingConfig(
+        providers={
+            # No rpm limit: a rate gate would sleep between the repeated walks.
+            "prepaid": ProviderConfig(
+                name="prepaid", provider_type="deepseek", model_id="deepseek-chat",
+                is_free=True, rpm_limit=None, open_duration_s=120, base_url=base_url,
+            ),
+        },
+        call_sites={"site": CallSiteConfig(id="site", chain=["prepaid"])},
+        retry_profiles={"default": RetryPolicy(max_retries=1, base_delay_ms=0, jitter_pct=0.0)},
+    )
+    breakers = CircuitBreakerRegistry(config.providers)
+    router = Router(
+        config=config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=LiteLLMDelegate(config),
+    )
+    messages = [{"role": "user", "content": "hi"}]
+    cb = breakers.get("prepaid")
+
+    with patch(
+        "genesis.routing.litellm_delegate._resolve_api_key", return_value="local-test-only",
+    ):
+        for walk in range(1, 4):
+            result = await router.route_call("site", messages, timeout=10)
+            assert result.success is False
+            # One request per walk: no same-provider retry on a billing state.
+            assert reply["hits"] == walk
+
+        assert cb.is_available() is False
+        assert cb.last_failure_category == ErrorCategory.QUOTA_EXHAUSTED
+        assert cb.trip_count == 1
+
+        # The open breaker skips the provider: no fourth request is sent.
+        result = await router.route_call("site", messages, timeout=10)
+        assert result.success is False
+        assert reply["hits"] == 3

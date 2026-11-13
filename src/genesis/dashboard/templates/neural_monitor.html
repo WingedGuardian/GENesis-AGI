@@ -1189,6 +1189,18 @@ function showDetail(item) {
             respBox.style.cssText = 'font-size: 11px; max-height: 200px; overflow-y: auto; background: #1e293b; padding: 8px; border-radius: 4px; white-space: pre-wrap; word-break: break-word; margin: 4px 0; color: #e2e8f0;';
             respSection.appendChild(respBox);
             content.appendChild(respSection);
+        } else if (item.data.last_response_hidden) {
+            // The health API withholds the text from a caller with no
+            // credential and marks the site, so say so instead of showing a
+            // site that looks like it returned nothing.
+            const respSection = el('div', 'detail-section');
+            respSection.appendChild(el('h4', null, 'Last Response'));
+            respSection.appendChild(el('div', 'detail-meta',
+                'Hidden: shown only to a signed-in dashboard session. '
+                + 'Sign in to the dashboard, then reload this page. '
+                + 'If no dashboard password is set, set one first '
+                + '(DASHBOARD_PASSWORD: dashboard Configuration, Provider Keys).'));
+            content.appendChild(respSection);
         }
     } else {
         content.appendChild(sectionRow('Last Run', 'No runs recorded'));

@@ -608,8 +608,9 @@ class CCReflectionBridge:
         # 6. Send to topic — parsed-fields summary only, never raw output.text.
         # Use the salvaged JSON (deep_text) so a prose-ended deep reflection shows
         # a real summary instead of the "not parseable" stub. A light summary
-        # that repeats the last one is not re-posted (its output was stored
-        # above); a periodic "no change" stub keeps the topic live.
+        # the model flags unchanged is not posted while no condition changed
+        # since the last full post (its output was stored above); a periodic
+        # "no change" stub keeps the topic live.
         summary = format_topic_summary(depth, output, text=deep_text)
         if depth == Depth.LIGHT:
             await send_light_topic_summary(
@@ -617,6 +618,8 @@ class CCReflectionBridge:
                 summary,
                 source_text=output.text or "",
                 topic_manager=self._topic_manager,
+                db=db,
+                tick=tick,
             )
         else:
             await send_to_topic(session_id, depth, summary, topic_manager=self._topic_manager)

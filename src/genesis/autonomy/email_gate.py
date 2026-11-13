@@ -126,11 +126,25 @@ class EmailAutonomyGate:
         state = CellState(cell["state"]) if cell else CellState.ASK
 
         if state == CellState.GRANTED:
+            # The recipient's curated marketing_prospects row, if any. Read from
+            # the DB here, like is_reply, so both survive the enqueue→drain
+            # rebuild (unlike signal_type) and neither can be steered by a
+            # caller-supplied field such as labeled_surplus.
+            prospect = await self._curated_prospect(recipient)
+            if prospect is not None and is_reply:
+                # A prospect who wrote back is answered only with the owner's
+                # approval, in every marketing mode. Decided BEFORE the scope
+                # guards: the send is held either way, and g1's exact-match on
+                # the stored sender trips on an ordinary "Name <addr>" From
+                # header, which would demote the shared reply cell for a send
+                # that was never going out on its own.
+                return await self._hold(request, message_text, classification, recipient, now)
+
             # WS-8 PR-D auto-revert net: deterministic pre-send scope guards run
-            # FIRST, in EVERY marketing posture — a trip = scope drift inside the
+            # next, in EVERY marketing posture — a trip = scope drift inside the
             # grant (uncurated/opted-out recipient, rate-limit burst) → demote
             # (record a correction, which regresses GRANTED→ASK) AND hold THIS
-            # send. This drift detector must not be short-circuited by the posture
+            # send. This drift detector must not be short-circuited by the mode
             # gate below: a bad recipient is bad regardless of observe/live.
             trip = await self._scope_guard_trip(request, recipient, domain, verb, risk)
             if trip is not None:
@@ -154,17 +168,22 @@ class EmailAutonomyGate:
                 )
                 return await self._hold(request, message_text, classification, recipient, now)
 
-            # Scope guards passed. Marketing posture gate: a GRANTED BULK cell may
-            # autonomously send ONLY when the owner has affirmatively set the
-            # marketing lever to `live`. In `observe`/`off` the cell may be granted
-            # but autonomy is withheld → HOLD each send for owner approval, WITHOUT
-            # demoting (an observe posture is a legitimate owner choice, not scope
-            # drift, so flipping to `live` later resumes autonomy with no re-grant).
-            # Keyed on `risk == BULK` (survives the enqueue→drain rebuild, unlike
-            # signal_type). BULK is marketing-only today (the sole labeled_surplus
-            # email path — see the g2 NOTE in _scope_guard_trip); a future
-            # non-marketing BULK path must add its own discriminator here.
-            if risk == RiskClass.BULK.value:
+            # Scope guards passed. Marketing posture gate. Both branches HOLD for
+            # owner approval WITHOUT demoting, like the reply hold above: a
+            # posture is a legitimate owner choice, not scope drift, so the grant
+            # survives and autonomy resumes with no re-grant.
+            if prospect is not None and prospect.get("opted_out"):
+                # An opted-out prospect never gets an autonomous send of ANY
+                # class (g2 covers BULK only); the approved-send path refuses it
+                # as well (email_gate_watcher).
+                return await self._hold(request, message_text, classification, recipient, now)
+            # A cold send to a prospect — the BULK first touch, or the IDENTITY
+            # follow-up on an unanswered thread — is autonomous ONLY when the
+            # owner has affirmatively set the marketing lever to `live`. BULK is
+            # marketing-only today (the sole labeled_surplus email path — see the
+            # g2 NOTE in _scope_guard_trip); a future non-marketing BULK path must
+            # add its own discriminator here.
+            if risk == RiskClass.BULK.value or prospect is not None:
                 from genesis.outreach.marketing_config import (
                     effective_mode as _marketing_mode,
                 )
@@ -180,6 +199,17 @@ class EmailAutonomyGate:
 
         # 4. ASK / NOT_DETERMINED / DENIED → hold for owner approval.
         return await self._hold(request, message_text, classification, recipient, now)
+
+    async def _curated_prospect(self, recipient: str) -> dict | None:
+        """The curated ``marketing_prospects`` row ``recipient`` names, or None.
+
+        Through ``find_in_recipient``, which reads display and list forms: a
+        lookup that missed on those would read as "not a prospect", and the
+        posture gate would then fail OPEN.
+        """
+        from genesis.db.crud import marketing_prospects as mp
+
+        return await mp.find_in_recipient(self._db, recipient)
 
     async def _has_inbound(self, thread_id: str | None) -> bool:
         """True iff the email thread has at least one received (inbound) message
