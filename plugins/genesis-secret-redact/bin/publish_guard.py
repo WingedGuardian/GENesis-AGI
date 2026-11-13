@@ -51,11 +51,29 @@ def _needles(root: Path) -> list[dict]:
     return known.load(known.repo_root(str(root)))["needles"]
 
 
-def _named_files(command: str, cwd: str) -> list[Path]:
+#: How deep a quoted command inside a command is split again (`sh -c "bash -c '...'"` is two levels).
+_NEST = 3
+#: Shell punctuation that can cling to a path in a word (`$(cat f)`, `<f`, `f;`), stripped as a candidate.
+_CLING = "$()<>;|&`'\""
+
+
+def _words(command: str, depth: int = _NEST) -> list[str]:
+    """Every word of ``command``, and every word of each quoted word that is itself a command line (a wrapper's
+    `bash -c '...'`, an `ssh host '...'`): the file scan must see a wrapped command's file names too."""
     try:
         tokens = shlex.split(command, comments=False)
     except ValueError:
         tokens = command.split()
+    words = list(tokens)
+    if depth > 0:
+        for token in tokens:
+            if any(c.isspace() for c in token):
+                words.extend(_words(token, depth - 1))
+    return words
+
+
+def _named_files(command: str, cwd: str) -> list[Path]:
+    tokens = _words(command)
     # A relative path may be meant from the payload's cwd or from a directory the command `cd`s into first.
     bases = [Path(cwd)]
     for target in _CD.findall(command):
@@ -63,11 +81,14 @@ def _named_files(command: str, cwd: str) -> list[Path]:
         bases.append(target_path if target_path.is_absolute() else Path(cwd) / target_path)
     paths: list[Path] = []
     for token in tokens:
+        after = token.split("=", 1)[-1]
         for candidate in {
             token,
-            token.split("=", 1)[-1],
-            token.split("=", 1)[-1].lstrip("@"),
+            after,
+            after.lstrip("@"),
             token.lstrip("@"),
+            token.strip(_CLING),
+            after.lstrip("@").strip(_CLING),
         }:
             if not candidate or candidate.startswith("-"):
                 continue

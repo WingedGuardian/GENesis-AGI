@@ -174,3 +174,18 @@ def test_monitor_gh_is_checked(env, tmp_path):
         timeout=60,
     )
     assert _denied(run)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -c 'gh pr comment 1 --body-file body.md'",
+        "sh -c \"bash -c 'gh issue comment 2 --body-file body.md'\"",
+        "timeout 60 bash -lc 'cd . && gh pr create --title t -F body=@body.md'",
+        'gh pr comment 1 --body "$(cat body.md)"',
+        'gh pr comment 1 --body "$(<body.md)"',
+    ],
+)
+def test_a_file_named_inside_a_wrapped_or_substituted_command_is_checked(env, tmp_path, command):
+    (tmp_path / "body.md").write_text(f"the key is {KEY}\n")
+    assert _denied(_decide(command, env, tmp_path))
