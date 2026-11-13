@@ -1174,8 +1174,9 @@ def key(row: dict) -> str:
 #: was in COVERAGE, not in the verdicts. `_UNSCANNED_ROOTS` records the
 #: deliberate exclusions, and a test pins that every top-level tree with Python
 #: in it appears in one list or the other -- so the next tree cannot be missed
-#: silently the way this one was.
-SCAN_ROOTS = ("src", "scripts", "az_plugins")
+#: silently the way this one was. `plugins/` joined when its first Python file
+#: did (a Claude Code plugin's loader): also zero rows.
+SCAN_ROOTS = ("src", "scripts", "az_plugins", "plugins")
 
 #: Excluded ON PURPOSE, with the reason, because absence teaches nothing.
 UNSCANNED_ROOTS = {
