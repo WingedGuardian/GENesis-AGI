@@ -783,7 +783,13 @@ jobs:
         # Native peer containment (#3575): five real-CLI cases that skip on a
         # runner with no Claude binary (test_peer_native x4, test_contained_native
         # x1), measured in run 42667838123 at 603 skipped, 598 -> 603.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 603
+        # Main measured 602 at run 43169373201's base (the old ceiling had one
+        # point of slack). Two by-design identities since, measured in main run
+        # 43298721491 (8108fc9a1) at 604: test_shared_http_admission, skipped at
+        # collection on an unqualified stack (#4058/#4095), and
+        # test_live_closure::test_the_box_lock_and_basetemp_keep_their_real_home_locations,
+        # "no lock expected here (no install)" (#3719). 602 + 2 = 604.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 604
 
   test-ubuntu-2404:
     # ubuntu-latest is moving to 26.04, so `test` alone stops showing a break on
