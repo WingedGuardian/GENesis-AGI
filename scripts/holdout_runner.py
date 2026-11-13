@@ -611,6 +611,9 @@ def _ref_repo(ref: dict) -> str:
     return f"{owner}/{name}" if owner and name else ""
 
 
+_HELD_SIGNALS = frozenset({signal.SIGTERM, signal.SIGHUP})
+
+
 class _Worktree:
     """A detached worktree at ``sha``, removed by its exact path on exit.
 
@@ -631,15 +634,29 @@ class _Worktree:
 
     def __enter__(self) -> Path:
         args = ("worktree", "add", "--detach", "--quiet", str(self.path), self.sha)
-        proc = subprocess.Popen(
-            ["git", "-C", str(self.root), *args],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            encoding="utf-8",
-            errors="surrogateescape",
-            start_new_session=True,  # its own process group, killed whole below
-        )
+        # A signal that arrived while Popen was still starting git would raise
+        # before ``proc`` exists, leaving git running with nothing to kill it.
+        # So the two signals are held for the Popen call only, git gets the
+        # caller's mask back before exec (it stays killable), and they are
+        # released as the first step inside the try below, where the cleanup
+        # can act on a held one. preexec_fn is safe here: the runner is
+        # single-threaded.
+        held = signal.pthread_sigmask(signal.SIG_BLOCK, _HELD_SIGNALS)
         try:
+            proc = subprocess.Popen(
+                ["git", "-C", str(self.root), *args],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                encoding="utf-8",
+                errors="surrogateescape",
+                start_new_session=True,  # its own process group, killed whole below
+                preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, held),
+            )
+        except BaseException:
+            signal.pthread_sigmask(signal.SIG_SETMASK, held)
+            raise
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, held)  # a held signal is raised here
             _, err = proc.communicate(timeout=GIT_TIMEOUT_S)
         except BaseException as exc:
             _kill_group(proc)

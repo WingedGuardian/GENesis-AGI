@@ -1725,3 +1725,53 @@ def test_a_signal_during_worktree_creation_leaves_nothing_behind(repo, tmp_path,
     assert _worktrees(root) == before
     assert _locked_worktrees(root) == 0
     assert list(scratch.iterdir()) == []
+
+
+def test_a_signal_while_git_is_being_started_is_acted_on_after(
+    repo, tmp_path, monkeypatch, _scratch
+):
+    """A SIGTERM that lands inside Popen, before the runner holds a handle to
+    git, must not leave git running: the runner holds it until the handle
+    exists, then kills git's group and discards the half-made worktree."""
+    root, _, _ = repo
+    real_git = shutil.which("git")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    wrapper = bindir / "git"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        'case " $* " in *" worktree add "*)\n'
+        "  for a; do path=$prev; prev=$a; done\n"
+        '  "' + str(real_git) + '" "$@" || exit $?\n'
+        '  "'
+        + str(real_git)
+        + '" -C "'
+        + str(root)
+        + '" worktree lock --reason initializing "$path"\n'
+        '  (sleep 1; mkdir -p "$path" && echo late > "$path/late-file") &\n'
+        "  sleep 2\n"
+        '  exec "' + str(real_git) + '" -C "' + str(root) + '" worktree unlock "$path";;\n'
+        "esac\n"
+        'exec "' + str(real_git) + '" "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+    real_popen = subprocess.Popen
+
+    def popen_then_signal(cmd, *a, **kw):
+        proc = real_popen(cmd, *a, **kw)
+        if "worktree" in cmd and "add" in cmd:
+            os.kill(os.getpid(), signal.SIGTERM)  # inside Popen, as far as the caller can tell
+        return proc
+
+    monkeypatch.setattr(hr.subprocess, "Popen", popen_then_signal)
+    holdout = tmp_path / "HOLDOUT.md"
+    holdout.write_text(_scenario("H-01", steps="sleep 60", expect="never"))
+    before = _worktrees(root)
+    with pytest.raises(SystemExit) as exc:
+        hr.main(["--at-ref", "HEAD", "--root", str(root), "--holdout", str(holdout)])
+    assert exc.value.code == 128 + signal.SIGTERM
+    time.sleep(3.5)  # past the wrapper's late write and its unlock
+    assert _worktrees(root) == before
+    assert _locked_worktrees(root) == 0
+    assert list(_scratch.iterdir()) == []
