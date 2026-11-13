@@ -211,8 +211,24 @@ session can run the command, so the check is the visible count and time on every
 run, which a validator reports to the owner for confirmation; a session runs it
 only on the owner's ruling about that row.
 
-`--has-holdout` prints whether this install keeps a holdout and where, and
-reads nothing in it; skills and agents use it instead of hard-coding the path.
+`--has-holdout` prints `holdout: present` or `holdout: none`, reads nothing
+in the holdout and names no path, so it is safe inside any command; skills use it
+instead of hard-coding the path. `--holdout-path` prints the holdout file's path
+for the writer, which must run it as its own command: the fence exempts the
+runner's output only when the runner is the whole command, and counts a printed
+holdout path in any other result as an exposure.
+
+A failing scenario's `observed` text replaces any output line that holds a whole
+line of the scenario's own steps (six characters or more, whitespace collapsed)
+with
+`[a line of this scenario's steps]`. It catches a verbatim, whole-line echo of
+the step script only. An escaped copy (a JSON or repr record of the file), an
+encoded one, a line wrapped across output lines, or a partial line is not
+masked. Nor is the read itself: code under test runs as a child of the script,
+which sits in the scratch directory beside `$TMPDIR` and is named on the step's
+own command line, so moving it would not hide it. A step line that is also
+output (a heredoc's data line passed through unchanged) is masked too, labelled
+as such.
 
 `--at-path DIR [--scenario H-NN ...]` runs scenarios against a directory and
 prints `PASS` or `FAIL` per id.

@@ -132,6 +132,33 @@
       "validator": "python",
       "test": "tests/test_scripts/test_manual_only_skill_flow.py::test_assigned_and_delegated_manual_bodies_are_not_injected[web-research]",
       "why": "An ordinary assigned research skill cannot inject a manual-only delegated method; ordinary unmarked delegation remains a positive control."
+    },
+    {
+      "label": "inbox report ignores hardlink identities",
+      "path": "scripts/inbox_coverage_report.py",
+      "anchor": "            or _file_identity(out) in protected_ids",
+      "replacement": "            or False",
+      "validator": "python",
+      "test": "tests/test_scripts/test_inbox_coverage_report.py::test_output_protects_all_corpus_identities[hardlink-unselected_note]",
+      "why": "A hardlink outside the inbox has a different resolved spelling; the disposable victim must remain protected by device/inode identity."
+    },
+    {
+      "label": "inbox report silently ignores inventory errors",
+      "path": "scripts/inbox_coverage_report.py",
+      "anchor": "        raise error",
+      "replacement": "        pass",
+      "validator": "python",
+      "test": "tests/test_scripts/test_inbox_coverage_report.py::test_unreadable_inventory_is_unknown_not_empty[False]",
+      "why": "A failed unselected subtree scan must refuse publication rather than omit a protected note hardlink; all victims are disposable."
+    },
+    {
+      "label": "inbox report omits database companions",
+      "path": "scripts/inbox_coverage_report.py",
+      "anchor": "for suffix in (\"-wal\", \"-shm\", \"-journal\")",
+      "replacement": "for suffix in ()",
+      "validator": "python",
+      "test": "tests/test_scripts/test_inbox_coverage_report.py::test_output_protects_all_corpus_identities[hardlink-database-wal]",
+      "why": "Database protection includes WAL companions through their aliases, not just the main database inode; the fixture is disposable and inactive."
     }
   ]
 }
