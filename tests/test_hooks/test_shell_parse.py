@@ -1223,6 +1223,11 @@ _EXECUTING_C_SHAPES = [
     "bash -c + +n 'PAYLOAD'",
     "bash +c + 'PAYLOAD'",
     "sh -c + +e 'PAYLOAD'",
+    # The value of `--rcfile` / `--init-file` is a file NAME even when it looks
+    # like a selector, so the real `-c` later still selects (Codex, PR #4383).
+    "bash --rcfile +c --norc -c 'PAYLOAD'",
+    "bash --init-file +c --posix -c 'PAYLOAD'",
+    "bash --rcfile -- -c 'PAYLOAD'",
 ]
 
 
@@ -1437,6 +1442,9 @@ _INERT_C_SHAPES = [
     "dash -c -t 'PAYLOAD'",          # dash: Illegal option
     "dash -c -h 'PAYLOAD'",
     "dash -c -r 'PAYLOAD'",
+    # `--rcfile` consumes `-c` as its FILE NAME, so no `-c` selects and the
+    # payload is only a script path that does not exist.
+    "bash --rcfile -c 'PAYLOAD'",
 ]
 
 

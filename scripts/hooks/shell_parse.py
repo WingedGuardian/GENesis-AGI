@@ -3857,6 +3857,14 @@ _C_VALUE_TAKING = {
 #: Every other supported interpreter takes `-o option` but not `-O`.
 _C_VALUE_TAKING_DEFAULT = frozenset("o")
 
+#: GNU long options that take their VALUE as the next word. MEASURED on bash 5.2:
+#: `bash --help` lists sixteen long options and only these two take a value;
+#: `bash --rcfile +c --norc -c CMD` runs CMD with `+c` as the rc FILE NAME, and
+#: only the exact spelling is accepted (`--rcfile=FILE` and `--rcf FILE` are
+#: invalid options). dash and zsh reject both names outright, so consuming the
+#: value there can only over-report an invocation that runs nothing.
+_LONG_OPTIONS_WITH_VALUE = frozenset({"--rcfile", "--init-file"})
+
 #: Shells for which a LONE `+` ENDS option processing, so the next word is the
 #: operand even when it looks like an option. The rest (bash, dash, ash and the
 #: `sh` that resolves to one of them) skip a lone `+` as an empty bundle and keep
@@ -5146,7 +5154,15 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
     state_noexec = False  # `-n` / `-o noexec`, cleared by the `+` forms
     sticky_noexec = False  # `D`, either sign, never cleared
 
+    skip_value = False
     for i, tok in enumerate(argv[1:], 1):
+        if skip_value:
+            # The value of `--rcfile` / `--init-file` is a FILE NAME, whatever
+            # it looks like: `bash --rcfile +c --norc -c CMD` runs CMD. Reading
+            # that `+c` as the selector (now that `+c` selects, #2218) resolved
+            # no script at all and hid CMD from every guard (Codex, PR #4383).
+            skip_value = False
+            continue
         # A LONE `+` IS NOT A TERMINATOR HERE, and treating it as one is a
         # BYPASS. `-` and `--` really do end option processing, so the next
         # token is the command and there is no `-c` script to find. `+` does
@@ -5184,6 +5200,12 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
             # suppress execution (`--help`, `--dump-strings`): an invocation
             # that runs nothing, reported as though it might, which is the
             # direction this module's own docstring says to err in.
+            #
+            # The one exception is ARITY, and only where it is measured: the
+            # two bash long options that take a value consume the next word
+            # (`_LONG_OPTIONS_WITH_VALUE`), so that word is never read as an
+            # option bundle, a terminator or the selector.
+            skip_value = tok in _LONG_OPTIONS_WITH_VALUE
             continue
 
         options = tok[1:]
