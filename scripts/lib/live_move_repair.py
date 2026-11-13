@@ -567,7 +567,7 @@ def report_ts(name: str) -> str | None:
 #: A report dir named more than this many seconds ahead of the reader's clock
 #: is not a report (written while the clock ran ahead, as at a boot before NTP
 #: sync): no reader takes it as the newest. Deploy health refuses it; the
-#: guardian's pick skips it (collector._REPAIR_FUTURE_S, held equal by a test).
+#: guardian's pick (newest_eligible) skips it.
 REPORT_FUTURE_S = 300
 
 
@@ -666,6 +666,103 @@ def same_repo(named, repo: str) -> bool:
         return os.path.realpath(named) == os.path.realpath(repo)
     except (UnicodeError, ValueError, OSError):
         return False
+
+
+#: Report dirs newest_eligible reads at most (deploy health's REPAIR_REPORTS_READ).
+REPORTS_READ = 8
+
+
+def _top(raw: bytes, key: bytes):
+    """A top-level scalar of the writer's indent-2 JSON (only a top-level key sits
+    two spaces in; a raw newline is never inside a string), or None. Bounded by
+    the longest repo the writer stores: six characters per escaped byte."""
+    m = re.search(rb'\n  "' + key + rb'": ([^\n]{0,%d})\n' % (6 * REPO_BYTES + 3), raw)
+    try:
+        return json.loads(m.group(1).rstrip(b",")) if m else None
+    except (ValueError, RecursionError):
+        return None
+
+
+def _pick_read(path: str, ts: str, checkout: str) -> bytes | None:
+    """What the guardian shows of one report dir, or None to skip it: the
+    REPAIR.json bytes, or for one over REPORT_BYTES, unreadable or no JSON
+    object, a stand-in naming why, unless the top-level repo, result or
+    dismissed_at the writer's layout shows make it ineligible."""
+    if not stat.S_ISDIR(os.lstat(path).st_mode) or dismiss_marked(path):
+        return None
+    try:
+        fd = os.open(os.path.join(path, "REPAIR.json"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:  # a symlinked REPAIR.json is never the writer's
+        if exc.errno == errno.ELOOP:
+            return None
+        raw = tail = b""
+    else:
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return None
+            raw = os.read(fd, REPORT_BYTES + 1)
+            tail = os.pread(fd, 4096, max(0, st.st_size - 4096)) if len(raw) > REPORT_BYTES else raw
+        except OSError:
+            raw = tail = b""
+        finally:
+            os.close(fd)
+    try:
+        report = json.loads(raw) if raw and len(raw) <= REPORT_BYTES else None
+    except (ValueError, RecursionError):
+        report = None
+    shown = raw
+    if isinstance(report, dict):
+        if not same_repo(report.get("repo"), checkout):
+            return None
+    else:
+        why = (
+            f"report too large (over {REPORT_BYTES} bytes)"
+            if len(raw) > REPORT_BYTES
+            else "report unreadable"
+        )
+        shown = json.dumps({"ts": ts, "result": why + "; not read"}).encode()
+        repo = _top(raw, b"repo")
+        if repo is not None and not same_repo(repo, checkout):  # unread: unknown, not another's
+            return None
+        report = {"result": _top(raw, b"result"), "dismissed_at": _top(tail, b"dismissed_at")}
+    if report.get("dismissed_at") or report.get("result") == "superseded":
+        return None
+    return shown
+
+
+def newest_eligible(root: str, checkout: str, now: float) -> tuple[str, bytes] | None:
+    """The guardian's report pick (#3892), run from the kit inside the container:
+    (ts, what to show) of the newest report dir under ``root`` (by report_order)
+    that is neither dismissed nor superseded and names ``checkout``, else None.
+    A name more than REPORT_FUTURE_S ahead of ``now`` is skipped; at most
+    REPORTS_READ dirs are read. By design this is the newest ELIGIBLE report,
+    while deploy health's ``unresolved`` reads the newest READ one."""
+    named = []
+    try:
+        for name in os.listdir(root):
+            ts = report_ts(name)
+            with contextlib.suppress(ValueError):  # a ts that is no date: not a report
+                if ts is not None:
+                    named.append((report_order(ts), ts, name))
+    except OSError:
+        return None
+    reads = 0
+    for (seconds, _), ts, name in sorted(named, reverse=True):
+        if seconds - now > REPORT_FUTURE_S:
+            continue
+        if reads == REPORTS_READ:
+            break
+        reads += 1
+        try:
+            shown = _pick_read(os.path.join(root, name), ts, checkout)
+        except Exception:  # noqa: BLE001 - one dir's fault costs that dir
+            continue
+        if shown is not None:
+            return ts, shown
+    return None
 
 
 def manifests(backups: str) -> list[tuple[str, dict]]:

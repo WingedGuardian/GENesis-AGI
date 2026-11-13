@@ -1146,3 +1146,33 @@ async def test_sf_a_replaced_hooks_name_their_folder(db, monkeypatch):
     assert f"/home/u/.genesis/deploy-backups/{ts}-live-move-repair/hooks-before" in content, content
     assert f"scripts/deploy_candidates repair-move --dismiss {ts}" in content, content
     assert "update.sh" not in content and row["priority"] == "high", row
+
+
+@pytest.mark.parametrize("state", ["missing", "partial", "stale", "corrupt", "foreign"])
+async def test_d2b_a_repair_kit_finding_names_the_install_command(db, monkeypatch, state):
+    """#3492 D2b: the installed repair kit's state (deploy_health's
+    live_repair_kit finding) gets its own line naming the reinstall, with
+    generic paths; no update.sh advice, high (never critical)."""
+    snap = _snap([f"live_repair_kit:{state}"])
+    snap["live_repairs"] = {**_repairs(), "kit": state}
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert "live-move repair kit under ~/.genesis/lib/live-repair/" in content, content
+    assert loop._DEPLOY_KIT_STATES[state] in content, content
+    assert "python3 -I -S <repo>/scripts/lib/live_repair_kit.py install <repo> <home>" in content, (
+        content
+    )
+    assert "update.sh" not in content and row["priority"] == "high", row
+
+
+def test_d2b_the_kit_enters_the_alert_identity_only_as_a_finding():
+    """An ok (or unread) kit leaves a standing alert's identity as it was; a kit
+    finding, or a change of it, is another alert."""
+    base = _repairs(_repair("20261027T000000Z-1", 1))
+    same = loop._deploy_repair_identity(base)
+    assert loop._deploy_repair_identity({**base, "kit": "ok"}) == same
+    assert loop._deploy_repair_identity({**base, "kit": None}) == same
+    missing = loop._deploy_repair_identity({**base, "kit": "missing"})
+    assert missing != same != loop._deploy_repair_identity({**base, "kit": "stale"}) != missing
