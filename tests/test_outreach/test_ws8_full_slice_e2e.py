@@ -245,7 +245,7 @@ async def test_granted_bulk_send_survives_stamp_failure(config, db, monkeypatch)
     async def _boom(*a, **k):
         raise RuntimeError("simulated DB error stamping the prospect post-send")
 
-    monkeypatch.setattr(mp, "mark_contacted_by_email", _boom)
+    monkeypatch.setattr(mp, "mark_contacted_in_recipient", _boom)
 
     adapter = AsyncMock()
     adapter.send_message.return_value = "<m@x>"

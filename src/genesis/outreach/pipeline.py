@@ -935,7 +935,7 @@ class OutreachPipeline:
                 try:
                     from genesis.db.crud import marketing_prospects as _mp
 
-                    await _mp.mark_contacted_by_email(self._db, recipient, contacted_at=now)
+                    await _mp.mark_contacted_in_recipient(self._db, recipient, contacted_at=now)
                 except Exception:  # noqa: BLE001 — stamp is best-effort post-send; never break the send
                     logger.warning(
                         "granted-cell prospect contact-stamp failed (post-send); "

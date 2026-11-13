@@ -177,3 +177,34 @@ async def test_mark_contacted_by_email_is_atomic_no_read_then_write(db, monkeypa
     assert await mp.mark_contacted_by_email(db, "prospect@example.com", contacted_at=_TS) is True
     assert (await mp.get_by_id(db, "p1"))["status"] == "contacted"
     assert calls == []  # atomic: no read-before-write window a concurrent flip could exploit
+
+
+@pytest.mark.asyncio
+async def test_mark_contacted_in_recipient_reads_every_recipient_form(db):
+    """The delivery paths stamp the recipient AS SENT. An exact match on a
+    display-name or list string stamps nothing, so the prospect stayed 'active'
+    and was pitched again; every address the string names is stamped now."""
+    for pid, email in (("p1", "one@example.com"), ("p2", "two@example.com")):
+        await mp.create(db, id=pid, email=email, created_at=_TS, updated_at=_TS)
+    assert await mp.mark_contacted_by_email(db, "One <one@example.com>", contacted_at=_TS) is False
+    assert await mp.mark_contacted_in_recipient(db, "One <One@Example.com>", contacted_at=_TS) == 1
+    assert (await mp.get_by_id(db, "p1"))["status"] == "contacted"
+    assert (
+        await mp.mark_contacted_in_recipient(
+            db, "One <one@example.com>, Two <two@example.com>", contacted_at=_TS
+        )
+        == 1
+    )  # p1 already contacted: only p2 moves
+    assert (await mp.get_by_id(db, "p2"))["status"] == "contacted"
+
+
+@pytest.mark.asyncio
+async def test_mark_contacted_in_recipient_never_downgrades_or_touches_others(db):
+    await mp.create(
+        db, id="r", email="replied@example.com", status="replied", created_at=_TS, updated_at=_TS
+    )
+    assert await mp.mark_contacted_in_recipient(db, "R <replied@example.com>", contacted_at=_TS) == 0
+    assert (await mp.get_by_id(db, "r"))["status"] == "replied"
+    assert await mp.mark_contacted_in_recipient(db, "Nobody <nobody@example.com>", contacted_at=_TS) == 0
+    assert await mp.mark_contacted_in_recipient(db, "", contacted_at=_TS) == 0
+    assert await mp.mark_contacted_in_recipient(db, None, contacted_at=_TS) == 0
