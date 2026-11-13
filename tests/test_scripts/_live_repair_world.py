@@ -109,7 +109,9 @@ except OSError:
     pass
 rec = {"argv": sys.argv[1:], "fd_is_update_lock": same, "held": held,
        "ephemeral_re": bool(os.environ.get("DEPLOY_CANDIDATES_EPHEMERAL_RE")),
-       "checkout_locked": checkout_locked}
+       "checkout_locked": checkout_locked,
+       # Whether the update state was still there (not yet healed and cleared).
+       "state_left": os.path.exists(os.path.join(os.environ["HOME"], ".genesis", "update_state.json"))}
 with open(os.path.join(os.environ["HOME"], "hooks_calls.jsonl"), "a") as fh:
     fh.write(json.dumps(rec) + "\\n")
 sys.exit(int(os.environ.get("SPY_RC", "0")))

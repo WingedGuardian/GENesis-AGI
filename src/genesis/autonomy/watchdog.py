@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import math
 import os
 import py_compile
 import subprocess
@@ -49,6 +50,12 @@ logger = logging.getLogger(__name__)
 # runs only while pressure is already high.
 _IO_CULPRIT_TOP_N = 5
 _IO_CULPRIT_SAMPLE_S = 1.0
+# How far ahead of now a persisted restart timestamp may sit and still count.
+# A later one (a corrupt write, or a clock that jumped forward and was then
+# corrected) makes `now - ts` negative: the flap window counts it on every tick
+# and neither prune ever removes it, so the target would never be restarted.
+# The slack absorbs ordinary clock adjustment between two writes.
+_FUTURE_TS_SLACK_S = 300.0
 
 
 def _rate(bytes_per_s: float) -> str:
@@ -968,6 +975,7 @@ class WatchdogChecker:
         """
         history = state.get("restart_history") or []
         if isinstance(history, list):
+            latest_ts = time.time() + _FUTURE_TS_SLACK_S
             kept = []
             for entry in history:
                 if not isinstance(entry, dict):
@@ -976,15 +984,30 @@ class WatchdogChecker:
                 # bool is a subclass of int; a True timestamp is not a time.
                 if isinstance(ts, bool) or not isinstance(ts, (int, float)):
                     continue
-                if entry.get("reason") in _LEGACY_REASONS:
-                    entry["reason"] = _LEGACY_REASONS[entry["reason"]]
+                # A number can still break the readers: JSON round-trips
+                # Infinity (an infinite flap deadline, so BACKOFF forever) and
+                # integers too large for a float (`now - ts` raises
+                # OverflowError). math.isfinite raises on the latter.
+                try:
+                    if not math.isfinite(ts):
+                        continue
+                except OverflowError:
+                    continue
+                # A finite timestamp in the future is just as unreadable: the
+                # flap window would count it forever (see _FUTURE_TS_SLACK_S).
+                if ts > latest_ts:
+                    continue
+                reason = entry.get("reason")
+                if isinstance(reason, str) and reason in _LEGACY_REASONS:
+                    entry["reason"] = _LEGACY_REASONS[reason]
                 kept.append(entry)
             state["restart_history"] = kept
         else:
             # Not even a list — the shape below it cannot be trusted either.
             state["restart_history"] = []
-        if state.get("last_reason") in _LEGACY_REASONS:
-            state["last_reason"] = _LEGACY_REASONS[state["last_reason"]]
+        last_reason = state.get("last_reason")
+        if isinstance(last_reason, str) and last_reason in _LEGACY_REASONS:
+            state["last_reason"] = _LEGACY_REASONS[last_reason]
         return state
 
     def _save_state(self, state: dict) -> bool:

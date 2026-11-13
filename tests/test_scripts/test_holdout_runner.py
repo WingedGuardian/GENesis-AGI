@@ -11,6 +11,7 @@ import datetime as dt
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -967,12 +968,25 @@ def test_a_checkout_without_the_fence_says_exposures_are_not_recorded(
 def test_has_holdout_reports_presence_without_reading_it(tmp_path, capsys):
     holdout = tmp_path / "HOLDOUT.md"
     assert hr.main(["--has-holdout", "--holdout", str(holdout)]) == 0
-    assert capsys.readouterr().out.strip() == f"holdout: none (would be {holdout})"
+    assert capsys.readouterr().out == "holdout: none\n"
     holdout.write_text(f"## H-01 t\n{HIDDEN_EXPECT}\n")
     assert hr.main(["--has-holdout", "--holdout", str(holdout)]) == 0
     out = capsys.readouterr().out
-    assert out.strip() == f"holdout: present at {holdout}"
-    assert HIDDEN_EXPECT not in out
+    assert out == "holdout: present\n"
+    assert HIDDEN_EXPECT not in out and str(tmp_path) not in out
+
+
+def test_holdout_path_prints_only_the_path(tmp_path, capsys):
+    holdout = tmp_path / "HOLDOUT.md"
+    holdout.write_text(f"## H-01 t\n{HIDDEN_EXPECT}\n")
+    assert hr.main(["--holdout-path", "--holdout", str(holdout)]) == 0
+    assert capsys.readouterr().out == f"{holdout.resolve()}\n"
+
+
+def test_holdout_path_prints_an_absolute_path(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert hr.main(["--holdout-path", "--holdout", "HOLDOUT.md"]) == 0
+    assert capsys.readouterr().out == f"{(tmp_path / 'HOLDOUT.md').resolve()}\n"
 
 
 def test_the_runner_uses_the_repository_resolvers():
@@ -1107,3 +1121,524 @@ def test_a_malformed_scenario_still_dates_the_writer(repo, fake_gh, install_hold
     text = "## H-01 no steps\nProtects: x\nTouches: calc.py\nAuthor: holdout-writer, 2026-11-05\n"
     _, out = _run_install(repo, install_holdout, text, capsys)
     assert "1 holdout-writer access(es), none later than the newest scenario" in out
+
+
+def _at_ref(repo, text, tmp_path, capsys, *extra, ref="HEAD") -> tuple[int, str]:
+    root, _, _ = repo
+    holdout = tmp_path / "HOLDOUT.md"
+    holdout.write_text(text)
+    rc = hr.main(["--at-ref", ref, "--root", str(root), "--holdout", str(holdout), *extra])
+    return rc, capsys.readouterr().out
+
+
+def _worktrees(root) -> list[str]:
+    return [
+        ln
+        for ln in _git(root, "worktree", "list", "--porcelain").splitlines()
+        if ln[:9] == "worktree "
+    ]
+
+
+def test_at_ref_runs_on_a_worktree_it_makes_and_removes(repo, tmp_path, capsys, _scratch):
+    root, _, merge = repo
+    before = _worktrees(root)
+    text = _scenario("H-01", steps=_call("f"), expect="beta-two") + _scenario(
+        "H-02", steps=_call("f"), expect="alpha-one"
+    )
+    rc, out = _at_ref(repo, text, tmp_path, capsys)
+    assert rc == 0 and out.splitlines()[0] == f"holdout: HEAD at {merge[:12]}"
+    assert _lines(out)["H-01"] == "H-01 PASS" and _lines(out)["H-02"].startswith("H-02 FAIL")
+    assert _worktrees(root) == before
+    assert _git(root, "status", "--porcelain") == ""
+    assert list(_scratch.iterdir()) == []
+
+
+def test_at_ref_checks_out_the_commit_it_is_given(repo, tmp_path, capsys):
+    _, parent, _ = repo
+    text = _scenario("H-01", steps=_call("f"), expect="beta-two") + _scenario(
+        "H-02", steps=_call("f"), expect="alpha-one"
+    )
+    rc, out = _at_ref(repo, text, tmp_path, capsys, ref=parent)
+    assert rc == 0 and out.splitlines()[0] == f"holdout: {parent} at {parent[:12]}"
+    assert _lines(out)["H-01"].startswith("H-01 FAIL") and _lines(out)["H-02"] == "H-02 PASS"
+
+
+def test_at_ref_runs_only_the_scenarios_named(repo, tmp_path, capsys):
+    text = _scenario("H-01", steps=_call("f"), expect="beta-two") + _scenario(
+        "H-02", steps=_call("f"), expect="alpha-one"
+    )
+    rc, out = _at_ref(repo, text, tmp_path, capsys, "--scenario", "H-02")
+    assert rc == 0 and set(_lines(out)) == {"H-02"}
+
+
+def test_at_ref_without_a_holdout_makes_no_worktree(repo, tmp_path, capsys, monkeypatch):
+    root, _, _ = repo
+
+    def no_worktree(self):
+        raise AssertionError("a worktree was made with no holdout to run")
+
+    monkeypatch.setattr(hr._Worktree, "__enter__", no_worktree)
+    rc = hr.main(["--at-ref", "HEAD", "--root", str(root), "--holdout", str(tmp_path / "none.md")])
+    assert rc == 0 and capsys.readouterr().out.strip() == "no holdout on this install"
+
+
+def test_an_overlay_reaches_nested_paths_and_adds_files_with_their_mode(repo, tmp_path, capsys):
+    overlay = tmp_path / "overlay"
+    (overlay / "src" / "pkgx").mkdir(parents=True)
+    (overlay / "src" / "pkgx" / "__init__.py").write_text("VALUE = 'overlaid'\n")
+    (overlay / "tools").mkdir()
+    (overlay / "tools" / "run.sh").write_text("#!/bin/sh\necho ran\n")
+    (overlay / "tools" / "run.sh").chmod(0o755)
+    steps = '"$HOLDOUT_PYTHON" -c \'import pkgx; print(pkgx.VALUE)\'\n"$HOLDOUT_ROOT/tools/run.sh"'
+    text = _scenario("H-01", steps=steps, expect="overlaid\nran")
+    rc, out = _at_ref(repo, text, tmp_path, capsys, "--overlay", str(overlay))
+    assert rc == 0 and "2 file(s) overlaid" in out.splitlines()[0]
+    assert _lines(out)["H-01"] == "H-01 PASS"
+
+
+@pytest.mark.parametrize(
+    "rel", ["link.py", "ldir/planted.txt"], ids=["file-link", "directory-link"]
+)
+def test_an_overlay_never_writes_through_a_link_in_the_tree(repo, tmp_path, capsys, rel):
+    root, _, _ = repo
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "link.py").symlink_to(victim)
+    (root / "ldir").symlink_to(outside)
+    _git(root, "add", "link.py", "ldir")
+    _git(root, "commit", "-q", "-m", "links")
+    before = _worktrees(root)
+    overlay = tmp_path / "overlay"
+    (overlay / rel).parent.mkdir(parents=True)
+    (overlay / rel).write_text("planted\n")
+    rc, out = _at_ref(
+        repo,
+        _scenario("H-01", steps=_call("g"), expect="gamma"),
+        tmp_path,
+        capsys,
+        "--overlay",
+        str(overlay),
+    )
+    assert rc == 3 and f"overlay path crosses a link in the tree: {rel}" in out
+    assert victim.read_text() == "untouched\n" and list(outside.iterdir()) == []
+    assert _worktrees(root) == before
+
+
+def test_a_failed_removal_still_leaves_no_registration(repo, tmp_path, capsys, monkeypatch):
+    root, _, _ = repo
+    before = _worktrees(root)
+    monkeypatch.setattr(hr._Worktree, "__exit__", lambda self, *exc: None)
+    rc, out = _at_ref(repo, _scenario("H-01", steps=_call("g"), expect="gamma"), tmp_path, capsys)
+    assert rc == 0 and _lines(out)["H-01"] == "H-01 PASS"
+    assert _worktrees(root) == before
+
+
+def test_a_tree_that_cannot_be_removed_is_reported(repo, tmp_path, capsys, _scratch):
+    steps = (
+        'mkdir "$HOLDOUT_ROOT/locked" && touch "$HOLDOUT_ROOT/locked/x" '
+        '&& chmod 000 "$HOLDOUT_ROOT/locked"\necho done'
+    )
+    rc, out = _at_ref(repo, _scenario("H-01", steps=steps, expect="done"), tmp_path, capsys)
+    left = [p for p in _scratch.iterdir() if p.name.startswith("holdout-ref-")]
+    try:
+        assert rc == 0 and _lines(out)["H-01"] == "H-01 PASS"
+        assert len(left) == 1 and f"holdout: could not remove {left[0]}" in out
+    finally:
+        for holder in left:
+            (holder / "tree" / "locked").chmod(0o700)
+
+
+def test_a_terminated_run_leaves_no_worktree_and_no_scratch(repo, tmp_path):
+    """SIGTERM (a caller's timeout) must still run the cleanup: the caller may
+    be a session that cannot remove a worktree afterwards."""
+    root, _, _ = repo
+    home = tmp_path / "home"
+    home.mkdir()
+    scratch = home / "tmp"
+    holdout = tmp_path / "HOLDOUT.md"
+    holdout.write_text(_scenario("H-01", steps="sleep 60", expect="never"))
+    before = _worktrees(root)
+    env = {k: v for k, v in os.environ.items() if k != "GENESIS_BIG_TMP"}
+    env["HOME"] = str(home)
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(REPO_DIR / "scripts" / "holdout_runner.py"),
+            "--at-ref",
+            "HEAD",
+            "--root",
+            str(root),
+            "--holdout",
+            str(holdout),
+        ],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if scratch.is_dir() and any(
+                p.name.startswith("holdout-step-") for p in scratch.iterdir()
+            ):
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("the step never started")
+        assert len(_worktrees(root)) == len(before) + 1
+        proc.send_signal(signal.SIGTERM)
+        rc = proc.wait(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert rc == 128 + signal.SIGTERM
+    assert _worktrees(root) == before
+    assert list(scratch.iterdir()) == []
+
+
+def test_an_overlay_changes_the_tree_under_test_only(repo, tmp_path, capsys):
+    root, _, _ = repo
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+    (overlay / "calc.py").write_text(
+        "def f():\n    return 'changed'\n\ndef g():\n    return 'gamma'\n"
+    )
+    text = _scenario("H-01", steps=_call("f"), expect="beta-two")
+    rc, out = _at_ref(repo, text, tmp_path, capsys, "--overlay", str(overlay), "--scenario", "H-01")
+    assert rc == 0 and "1 file(s) overlaid" in out.splitlines()[0]
+    assert _lines(out)["H-01"].startswith("H-01 FAIL")
+    assert "beta-two" in (root / "calc.py").read_text()
+    assert _worktrees(root) == [ln for ln in _worktrees(root) if "holdout-ref-" not in ln]
+
+
+def test_the_worktree_is_removed_when_the_overlay_is_refused(repo, tmp_path, capsys):
+    root, _, _ = repo
+    before = _worktrees(root)
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+    (overlay / "calc.py").symlink_to(root / "other.py")
+    rc, out = _at_ref(
+        repo,
+        _scenario("H-01", steps=_call("g"), expect="gamma"),
+        tmp_path,
+        capsys,
+        "--overlay",
+        str(overlay),
+    )
+    assert rc == 3 and "overlay holds a link: calc.py" in out
+    assert _worktrees(root) == before
+
+
+@pytest.mark.parametrize(
+    ("make", "message"),
+    [
+        (lambda o: (o / ".git").mkdir() or (o / ".git" / "config").write_text("x"), "under .git"),
+        (lambda o: None, "overlay holds no files"),
+    ],
+    ids=["git-directory", "empty"],
+)
+def test_an_overlay_that_cannot_be_a_code_change_is_refused(repo, tmp_path, capsys, make, message):
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+    make(overlay)
+    rc, out = _at_ref(
+        repo,
+        _scenario("H-01", steps=_call("g"), expect="gamma"),
+        tmp_path,
+        capsys,
+        "--overlay",
+        str(overlay),
+    )
+    assert rc == 3 and message in out
+
+
+def test_at_ref_with_an_unknown_commit_cannot_run(repo, tmp_path, capsys):
+    root, _, _ = repo
+    holdout = tmp_path / "HOLDOUT.md"
+    holdout.write_text(_scenario("H-01", steps=_call("g"), expect="gamma"))
+    rc = hr.main(["--at-ref", "no-such-ref", "--root", str(root), "--holdout", str(holdout)])
+    assert rc == 3 and "cannot run" in capsys.readouterr().out
+
+
+def test_overlay_without_at_ref_is_a_usage_error(repo, tmp_path):
+    root, _, _ = repo
+    with pytest.raises(SystemExit) as exc:
+        hr.main(["--at-path", str(root), "--overlay", str(tmp_path)])
+    assert exc.value.code == 2
+
+
+REASON = "the owner ruled it a harmless path listing"
+
+
+def _dismissal(target, at="2026-11-09T00:00:00Z", reason=REASON):
+    return json.dumps({"at": at, "kind": "dismissed", "dismisses": target, "reason": reason})
+
+
+def _log_lines(home):
+    return (home / "logs" / "holdout-exposures.jsonl").read_text().splitlines()
+
+
+def test_a_dismissed_exposure_leaves_the_count_and_the_spoiled_list(
+    repo, fake_gh, install_holdout, capsys
+):
+    _raw_log(
+        install_holdout,
+        _read_row("2026-11-01T09:00:00Z"),
+        _read_row("2026-11-05T09:00:00Z"),
+        _dismissal("2026-11-05T09:00:00Z"),
+    )
+    text = _authored("H-01", "2026-11-01") + _authored("H-02", "2026-11-04")
+    _, out = _run_install(repo, install_holdout, text, capsys)
+    assert _fence_line(out) == (
+        "holdout fence: 1 exposure(s), first 2026-11-01T09:00:00Z, latest 2026-11-01T09:00:00Z; "
+        "1 dismissed (latest dismissal 2026-11-09T00:00:00Z; reasons in the log) (see "
+        f"{install_holdout / 'logs' / 'holdout-exposures.jsonl'}); possibly spoiled: H-01: "
+        "tell the owner"
+    )
+
+
+def test_every_exposure_dismissed_says_none_outstanding(repo, fake_gh, install_holdout, capsys):
+    _raw_log(install_holdout, _read_row("2026-11-05T09:00:00Z"), _dismissal("2026-11-05T09:00:00Z"))
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-01"), capsys)
+    assert _fence_line(out) == (
+        "holdout fence: no exposures outstanding; 1 dismissed "
+        "(latest dismissal 2026-11-09T00:00:00Z; reasons in the log)"
+    )
+
+
+def test_a_dismissal_never_reaches_a_row_written_after_it(repo, fake_gh, install_holdout, capsys):
+    _raw_log(install_holdout, _dismissal("2026-11-05T09:00:00Z"), _read_row("2026-11-05T09:00:00Z"))
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-01"), capsys)
+    assert _fence_line(out).startswith("holdout fence: 1 exposure(s)")
+    assert "dismissed" not in _fence_line(out)
+
+
+def test_a_dismissal_never_reaches_a_writer_row(repo, fake_gh, install_holdout, capsys):
+    _raw_log(install_holdout, _allowed("2026-11-05T09:00:00Z"), _dismissal("2026-11-05T09:00:00Z"))
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-01"), capsys)
+    assert "dismissed" not in _fence_line(out)
+    assert "confirm each was a writer run you ordered" in _fence_line(out)
+
+
+def test_a_dismissed_row_of_unknown_time_cannot_exist_so_it_still_spoils(
+    repo, fake_gh, install_holdout, capsys
+):
+    _raw_log(install_holdout, json.dumps({"kind": "read"}), _dismissal(""))
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-01"), capsys)
+    assert _fence_line(out).endswith("possibly spoiled: H-01: tell the owner")
+
+
+def test_a_dismissal_still_bounds_an_earlier_row_of_unknown_time(
+    repo, fake_gh, install_holdout, capsys
+):
+    """The log is append-only, so the dismissal row's own time bounds an
+    undated row before it, just as any dated row does."""
+    _raw_log(
+        install_holdout,
+        _read_row("2026-11-01T09:00:00Z"),
+        "not json",
+        _dismissal("2026-11-01T09:00:00Z", at="2026-11-02T00:00:00Z"),
+    )
+    text = _authored("H-01", "2026-11-03") + _authored("H-02", "2026-11-05")
+    _, out = _run_install(repo, install_holdout, text, capsys)
+    assert _fence_line(out).endswith("possibly spoiled: H-01: tell the owner")
+
+
+def test_dismiss_appends_one_row_for_every_match_and_says_so(install_holdout, capsys):
+    _raw_log(
+        install_holdout,
+        _read_row("2026-11-05T09:00:00Z"),
+        _read_row("2026-11-05T09:00:00Z", kind="content"),
+        _read_row("2026-11-06T09:00:00Z"),
+    )
+    rc = hr.main(
+        ["--dismiss", "2026-11-05T09:00:00Z", "--reason", "  the owner  ruled it\tharmless  "]
+    )
+    assert rc == 0
+    assert (
+        capsys.readouterr().out
+        == "holdout: dismissed 2 exposure(s) recorded at 2026-11-05T09:00:00Z\n"
+    )
+    lines = _log_lines(install_holdout)
+    assert len(lines) == 4 and lines[:3] == [
+        _read_row("2026-11-05T09:00:00Z"),
+        _read_row("2026-11-05T09:00:00Z", kind="content"),
+        _read_row("2026-11-06T09:00:00Z"),
+    ]
+    row = json.loads(lines[3])
+    assert row["kind"] == "dismissed" and row["dismisses"] == "2026-11-05T09:00:00Z"
+    assert row["rows"] == 2 and row["reason"] == "the owner ruled it harmless"
+    assert hr._utc_day(row["at"]) is not None
+
+
+@pytest.mark.parametrize(
+    ("lines", "target", "message"),
+    [
+        ([_read_row("2026-11-05T09:00:00Z")], "2026-11-05T09:00:01Z", "no undismissed exposure"),
+        ([_allowed("2026-11-05T09:00:00Z")], "2026-11-05T09:00:00Z", "no undismissed exposure"),
+        (
+            [_read_row("2026-11-05T09:00:00Z"), _dismissal("2026-11-05T09:00:00Z")],
+            "2026-11-05T09:00:00Z",
+            "no undismissed exposure",
+        ),
+        (None, "2026-11-05T09:00:00Z", "no exposure log"),
+    ],
+    ids=["no-such-time", "writer-row", "already-dismissed", "no-log"],
+)
+def test_dismiss_refuses_what_it_cannot_dismiss(install_holdout, capsys, lines, target, message):
+    if lines is not None:
+        _raw_log(install_holdout, *lines)
+    before = _log_lines(install_holdout) if lines is not None else None
+    rc = hr.main(["--dismiss", target, "--reason", REASON])
+    assert rc == 3 and message in capsys.readouterr().out
+    if before is not None:
+        assert _log_lines(install_holdout) == before
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--dismiss", "2026-11-05T09:00:00Z"],
+        ["--reason", REASON, "--pr", "7"],
+        ["--dismiss", "yesterday", "--reason", REASON],
+        ["--dismiss", "2026-11-05T09:00:00Z", "--reason", "too short"],
+        ["--dismiss", "2026-11-05T09:00:00Z", "--reason", "x" * 301],
+        ["--dismiss", "2026-11-05T09:00:00Z", "--reason", "\u00e9" * 20],
+        ["--dismiss", "2026-11-05T09:00:00Z", "--reason", REASON + " \u00e9"],
+        ["--dismiss", "2026-11-05T09:00:00Z", "--reason", REASON, "--pr", "7"],
+    ],
+    ids=[
+        "no-reason",
+        "reason-alone",
+        "not-a-time",
+        "short",
+        "long",
+        "not-ascii",
+        "partly-not-ascii",
+        "two-modes",
+    ],
+)
+def test_dismiss_usage_errors(install_holdout, argv):
+    with pytest.raises(SystemExit) as exc:
+        hr.main(argv)
+    assert exc.value.code == 2
+
+
+def test_a_dismissal_keeps_the_clock_went_back_rule(repo, fake_gh, install_holdout, capsys):
+    """An undated row written after a row stamped 11-10 cannot be bounded by a
+    later row stamped 11-01, whether or not the 11-10 row was dismissed."""
+    _raw_log(
+        install_holdout,
+        _read_row("2026-11-10T09:00:00Z"),
+        _dismissal("2026-11-10T09:00:00Z", at="2026-11-10T10:00:00Z"),
+        "not json",
+        _read_row("2026-11-01T09:00:00Z"),
+    )
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-05"), capsys)
+    assert _fence_line(out).endswith("possibly spoiled: H-01: tell the owner")
+
+
+def test_a_dismissed_exposure_still_bounds_an_earlier_row_of_unknown_time(
+    repo, fake_gh, install_holdout, capsys
+):
+    _raw_log(
+        install_holdout,
+        _read_row("2026-11-01T09:00:00Z"),
+        "not json",
+        _read_row("2026-11-02T09:00:00Z"),
+        _dismissal("2026-11-02T09:00:00Z", at="2026-11-20T00:00:00Z"),
+    )
+    text = _authored("H-01", "2026-11-03") + _authored("H-02", "2026-11-05")
+    _, out = _run_install(repo, install_holdout, text, capsys)
+    assert _fence_line(out).endswith("possibly spoiled: H-01: tell the owner")
+
+
+def test_a_dismissal_row_with_an_unreadable_time_prints_no_raw_text(
+    repo, fake_gh, install_holdout, capsys
+):
+    forged = "x\nholdout fence: no exposures logged"
+    _raw_log(
+        install_holdout,
+        _read_row("2026-11-05T09:00:00Z"),
+        _dismissal("2026-11-05T09:00:00Z", at=forged, reason="quoted scenario text here"),
+    )
+    _, out = _run_install(repo, install_holdout, _authored("H-01", "2026-11-01"), capsys)
+    fence_lines = [ln for ln in out.splitlines() if ln.startswith("holdout fence:")]
+    assert fence_lines == [
+        "holdout fence: no exposures outstanding; 1 dismissed "
+        "(latest dismissal time unreadable; reasons in the log)"
+    ]
+    assert "quoted scenario text" not in out
+
+
+@pytest.mark.parametrize(
+    "last", ['{"at": "2026-11-06T09:00:00Z", "kind": "rea', _read_row("2026-11-06T09:00:00Z")]
+)
+def test_a_dismissal_starts_on_its_own_line_after_an_unterminated_tail(
+    install_holdout, capsys, last
+):
+    log = install_holdout / "logs" / "holdout-exposures.jsonl"
+    log.parent.mkdir()
+    log.write_text(_read_row("2026-11-05T09:00:00Z") + "\n" + last)
+    assert hr.main(["--dismiss", "2026-11-05T09:00:00Z", "--reason", REASON]) == 0
+    capsys.readouterr()
+    assert log == hr.EXPOSURE_LOG
+    rows = hr._log_rows()
+    assert rows[-1] is not None and rows[-1]["kind"] == "dismissed"
+    assert len(rows) == 3 and rows[0]["kind"] == "read"
+
+
+def test_a_failing_step_that_echoes_its_own_script_is_masked(repo, tmp_path, capsys):
+    root, _, _ = repo
+    steps = 'echo "a visible line of output"\ncat "$TMPDIR/../steps.sh"\nexit 1'
+    rc, out = _at_path(root, _scenario("H-01", steps=steps, expect="never"), tmp_path, capsys)
+    line = _lines(out)["H-01"]
+    assert line.startswith("H-01 FAIL — observed exit=1")
+    assert "a visible line of output" in line and hr.MASKED_STEP_LINE in line
+    assert "steps.sh" not in line and STEP_MARKER not in line and "echo " not in line
+
+
+@pytest.mark.parametrize(
+    ("stdout", "shown"),
+    [
+        ("import   calc;\tprint(calc.f())", hr.MASKED_STEP_LINE),
+        ("prefix: import calc; print(calc.f()) :suffix", hr.MASKED_STEP_LINE),
+        ("calc.f", "calc.f"),
+        ("it falls back", "it falls back"),
+    ],
+    ids=["whitespace", "holds-a-step-line", "a-fragment-is-shown", "short-step-lines-ignored"],
+)
+def test_the_step_mask_masks_output_holding_a_whole_step_line(stdout, shown):
+    arm = hr.Arm(False, 1, stdout + "\n", False)
+    steps = "import calc; print(calc.f())\nls\necho  done  here"
+    assert hr.describe_failed_arm(arm, steps) == f"exit=1, stdout={json.dumps(shown)}"
+
+
+def test_a_pr_verdict_masks_a_step_script_echo_too(repo, fake_gh, tmp_path, capsys):
+    """The merge arm's code echoes the step script only after the change."""
+    steps = (
+        "\"$HOLDOUT_PYTHON\" -c 'import calc; print(calc.f())' | grep -q beta-two "
+        '&& cat "$TMPDIR/../steps.sh"; echo done-marker'
+    )
+    _, out = _run_pr(repo, _scenario("H-01", steps=steps, expect="done-marker"), tmp_path, capsys)
+    line = _lines(out)["H-01"]
+    assert line.startswith("H-01 REGRESSED") and hr.MASKED_STEP_LINE in line
+    assert "steps.sh" not in line and STEP_MARKER not in line
+
+
+def test_at_ref_masks_a_step_script_echo_too(repo, tmp_path, capsys):
+    steps = 'cat "$TMPDIR/../steps.sh"\nexit 1'
+    rc, out = _at_ref(repo, _scenario("H-01", steps=steps, expect="never"), tmp_path, capsys)
+    line = _lines(out)["H-01"]
+    assert line.startswith("H-01 FAIL") and hr.MASKED_STEP_LINE in line
+    assert "steps.sh" not in line and STEP_MARKER not in line
+
+
+def test_an_escaped_copy_of_a_step_line_is_not_masked_as_documented():
+    """The documented limit: the mask matches a verbatim line only."""
+    steps = '"$HOLDOUT_PYTHON" -c "import calc"'
+    arm = hr.Arm(False, 1, json.dumps({"f": steps}) + "\n", False)
+    assert hr.MASKED_STEP_LINE not in hr.describe_failed_arm(arm, steps)

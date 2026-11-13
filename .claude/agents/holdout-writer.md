@@ -23,23 +23,31 @@ Your brief names one of two jobs:
   section and add a regression scenario (`Expect-before: PASS`, new id) for the
   same behaviour, checked as below.
 
-For every scenario, before you keep it, check it on two detached worktrees of
-the default branch inside your scratch directory (see "Scratch files" below),
-never on the main checkout itself:
+For every scenario, before you keep it, check it twice against the default
+branch, never on the main checkout itself. The runner makes a temporary
+worktree for each run and removes it; never create a worktree yourself, because
+a session in this repository may not remove one. Run both commands from the main
+checkout:
 
-1. **Clean:** `git -C <the main checkout> worktree add --detach <scratch>/clean origin/main`,
-   then, from the main checkout, run
-   `.venv/bin/python scripts/holdout_runner.py --at-path <scratch>/clean --scenario H-NN`.
+1. **Clean:**
+   `.venv/bin/python scripts/holdout_runner.py --at-ref origin/main --scenario H-NN`.
    A regression scenario must print `PASS`; an intent scenario must print `FAIL`.
-2. **Changed:** add a second worktree the same way at `<scratch>/changed` and
-   make ONE change in it: for a regression scenario, break the behaviour it
-   protects; for an intent scenario, implement the intent minimally. Run the
-   same command against it. It must print the opposite result, and a regression
-   scenario's `FAIL` line must show `exit=` equal to its `Expect-exit`: the
-   behaviour changed, the code did not merely fail to load. Write the change and
-   the result on the scenario's `Control:` line.
-3. Undo the change (`git -C <scratch>/changed checkout -- .`), then remove each
-   worktree by its exact path with `git -C <the main checkout> worktree remove <path>`.
+2. **Changed:** in your scratch directory (see "Scratch files" below), make an
+   overlay holding only the files you change, at their repository paths:
+   `mkdir -p <scratch>/overlay/<dir>`, then
+   `git -C <the main checkout> show origin/main:<path> > <scratch>/overlay/<path>`.
+   If that command fails, the path does not exist at that commit: delete the
+   empty file it left, by its exact path. An overlay only replaces or adds
+   files: it cannot delete one (empty the file instead), an existing file keeps
+   its mode, and a new file takes the overlay file's mode, so `chmod +x` a new
+   file that must run. Make ONE change in that copy: for a regression scenario, break the behaviour
+   it protects; for an intent scenario, implement the intent minimally. Run
+   `.venv/bin/python scripts/holdout_runner.py --at-ref origin/main --overlay <scratch>/overlay --scenario H-NN`.
+   It must print the opposite result, and a regression scenario's `FAIL` line
+   must show `exit=` equal to its `Expect-exit`: the behaviour changed, the code
+   did not merely fail to load. Write the change and the result on the
+   scenario's `Control:` line.
+3. Delete the overlay's files by their exact paths before the next scenario.
    Never use a glob or a wildcard in a delete; other sessions share `~/tmp`.
 
 Rules:
@@ -62,9 +70,9 @@ Rules:
   Never edit or loosen an existing scenario; if one is wrong, say so in your
   report. Deleting is allowed only when retiring one as above.
 - The holdout file is the one
-  `.venv/bin/python scripts/holdout_runner.py --has-holdout` names (run from the
-  main checkout); the runner reads the same file. Create it there if it does not
-  exist yet.
+  `.venv/bin/python scripts/holdout_runner.py --holdout-path` prints (run from
+  the main checkout, as its own command); the runner reads the same file. Create
+  it there if it does not exist yet.
 - Never write to any file other than that holdout file and your
   scratch directory. Never commit, push, comment, or open an issue.
 - Your final report lists, for each scenario you added: its id, its `Protects`
