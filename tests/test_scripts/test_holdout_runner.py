@@ -968,12 +968,25 @@ def test_a_checkout_without_the_fence_says_exposures_are_not_recorded(
 def test_has_holdout_reports_presence_without_reading_it(tmp_path, capsys):
     holdout = tmp_path / "HOLDOUT.md"
     assert hr.main(["--has-holdout", "--holdout", str(holdout)]) == 0
-    assert capsys.readouterr().out.strip() == f"holdout: none (would be {holdout})"
+    assert capsys.readouterr().out == "holdout: none\n"
     holdout.write_text(f"## H-01 t\n{HIDDEN_EXPECT}\n")
     assert hr.main(["--has-holdout", "--holdout", str(holdout)]) == 0
     out = capsys.readouterr().out
-    assert out.strip() == f"holdout: present at {holdout}"
-    assert HIDDEN_EXPECT not in out
+    assert out == "holdout: present\n"
+    assert HIDDEN_EXPECT not in out and str(tmp_path) not in out
+
+
+def test_holdout_path_prints_only_the_path(tmp_path, capsys):
+    holdout = tmp_path / "HOLDOUT.md"
+    holdout.write_text(f"## H-01 t\n{HIDDEN_EXPECT}\n")
+    assert hr.main(["--holdout-path", "--holdout", str(holdout)]) == 0
+    assert capsys.readouterr().out == f"{holdout.resolve()}\n"
+
+
+def test_holdout_path_prints_an_absolute_path(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert hr.main(["--holdout-path", "--holdout", "HOLDOUT.md"]) == 0
+    assert capsys.readouterr().out == f"{(tmp_path / 'HOLDOUT.md').resolve()}\n"
 
 
 def test_the_runner_uses_the_repository_resolvers():
@@ -1576,3 +1589,56 @@ def test_a_dismissal_starts_on_its_own_line_after_an_unterminated_tail(
     rows = hr._log_rows()
     assert rows[-1] is not None and rows[-1]["kind"] == "dismissed"
     assert len(rows) == 3 and rows[0]["kind"] == "read"
+
+
+def test_a_failing_step_that_echoes_its_own_script_is_masked(repo, tmp_path, capsys):
+    root, _, _ = repo
+    steps = 'echo "a visible line of output"\ncat "$TMPDIR/../steps.sh"\nexit 1'
+    rc, out = _at_path(root, _scenario("H-01", steps=steps, expect="never"), tmp_path, capsys)
+    line = _lines(out)["H-01"]
+    assert line.startswith("H-01 FAIL — observed exit=1")
+    assert "a visible line of output" in line and hr.MASKED_STEP_LINE in line
+    assert "steps.sh" not in line and STEP_MARKER not in line and "echo " not in line
+
+
+@pytest.mark.parametrize(
+    ("stdout", "shown"),
+    [
+        ("import   calc;\tprint(calc.f())", hr.MASKED_STEP_LINE),
+        ("prefix: import calc; print(calc.f()) :suffix", hr.MASKED_STEP_LINE),
+        ("calc.f", "calc.f"),
+        ("it falls back", "it falls back"),
+    ],
+    ids=["whitespace", "holds-a-step-line", "a-fragment-is-shown", "short-step-lines-ignored"],
+)
+def test_the_step_mask_masks_output_holding_a_whole_step_line(stdout, shown):
+    arm = hr.Arm(False, 1, stdout + "\n", False)
+    steps = "import calc; print(calc.f())\nls\necho  done  here"
+    assert hr.describe_failed_arm(arm, steps) == f"exit=1, stdout={json.dumps(shown)}"
+
+
+def test_a_pr_verdict_masks_a_step_script_echo_too(repo, fake_gh, tmp_path, capsys):
+    """The merge arm's code echoes the step script only after the change."""
+    steps = (
+        "\"$HOLDOUT_PYTHON\" -c 'import calc; print(calc.f())' | grep -q beta-two "
+        '&& cat "$TMPDIR/../steps.sh"; echo done-marker'
+    )
+    _, out = _run_pr(repo, _scenario("H-01", steps=steps, expect="done-marker"), tmp_path, capsys)
+    line = _lines(out)["H-01"]
+    assert line.startswith("H-01 REGRESSED") and hr.MASKED_STEP_LINE in line
+    assert "steps.sh" not in line and STEP_MARKER not in line
+
+
+def test_at_ref_masks_a_step_script_echo_too(repo, tmp_path, capsys):
+    steps = 'cat "$TMPDIR/../steps.sh"\nexit 1'
+    rc, out = _at_ref(repo, _scenario("H-01", steps=steps, expect="never"), tmp_path, capsys)
+    line = _lines(out)["H-01"]
+    assert line.startswith("H-01 FAIL") and hr.MASKED_STEP_LINE in line
+    assert "steps.sh" not in line and STEP_MARKER not in line
+
+
+def test_an_escaped_copy_of_a_step_line_is_not_masked_as_documented():
+    """The documented limit: the mask matches a verbatim line only."""
+    steps = '"$HOLDOUT_PYTHON" -c "import calc"'
+    arm = hr.Arm(False, 1, json.dumps({"f": steps}) + "\n", False)
+    assert hr.MASKED_STEP_LINE not in hr.describe_failed_arm(arm, steps)

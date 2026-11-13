@@ -43,6 +43,7 @@ P2 = "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow)</sub></sub
 P3 = "**<sub><sub>![P3 Badge](https://img.shields.io/badge/P3-grey)</sub></sub>  Style**"
 CR_MAJOR = "_🎯 Functional Correctness_ | _🟠 Major_ | _⚡ Quick win_\n\n**Wrong.**"
 CR_TRIVIAL = "_🧹 Nitpick_ | _🔵 Trivial_\n\n**Rename.**"
+CR_MINOR = "_⚠️ Potential issue_ | _🟡 Minor_\n\nbody"
 
 
 def _devin(marker: str, fid: str = "BUG_0001") -> str:
@@ -608,7 +609,16 @@ def test_an_open_round_keys_each_finding_by_its_comment_id():
     assert got["open_keys"] == ["c111", "c113"]
     assert got["reflection_keys"] == "ok"
     assert got["rounds"][-1]["reviews"] == [
-        {"id": 11, "login": CODEX, "submitted_at": AFTER, "finding_keys": ["c111", "c113"]}
+        {
+            "id": 11,
+            "login": CODEX,
+            "submitted_at": AFTER,
+            "finding_keys": ["c111", "c113"],
+            # Parallel to the keys: the P2 is below the floor, the P1 at it.
+            "blocking": [False, True],
+            # No comment path was given, so nothing is shown about the diff.
+            "off_diff": [None, None],
+        }
     ]
 
 
@@ -622,6 +632,10 @@ def test_body_findings_and_a_codex_findings_comment_have_keys():
     got = _ev(reviews=(rabbit,), comments=(bulb,))
     assert got["open_keys"] == ["r20:2", "i30"]
     assert got["reflection_keys"] == "ok"
+    flags = {k: b for f in got["findings"] for k, b in zip(f["keys"], f["blocking"], strict=True)}
+    # The merge gate never scores a body finding, so it is never at the floor;
+    # a findings comment carries its own badge.
+    assert flags == {"r20:2": False, "i30": True}
 
 
 def test_a_missing_id_makes_the_keys_unknown_and_never_the_count():
@@ -993,6 +1007,8 @@ def test_a_finding_on_an_ancestor_after_a_descendant_was_reviewed_opens_no_round
             "submitted_at": _z(T3),
             "login": DEVIN,
             "keys": ["c70"],
+            "blocking": [False],  # Devin's yellow marker is below the floor
+            "off_diff": [None],
             "round_head": None,
             "late": True,
         }
@@ -1853,3 +1869,207 @@ def test_shuffling_the_commit_list_never_moves_the_open_round():
 def test_the_row_names_the_open_round_by_the_head_under_a_permuted_list(guard):
     row = guard._format_rounds(_permuted((H2, H1)))
     assert f"open at {H2[:10]} ({DEVIN})" in row
+
+
+# -- budget facts for the past-round-4 readers -------------------------------
+
+
+@pytest.mark.parametrize(
+    "login, body, want",
+    [
+        (CODEX, P1, True),
+        (CODEX, P2, False),
+        (CODEX, "no badge here", None),
+        (DEVIN, _devin("🔴"), True),
+        (DEVIN, _devin("🟡"), False),
+        (DEVIN, _devin("🟥"), True),
+        (DEVIN, "no metadata at all", None),  # unreadable, never "below the floor"
+        (RABBIT, CR_MAJOR, True),
+        (RABBIT, "_⚠️ Potential issue_ | _🔴 Critical_\n\nbody", True),
+        (RABBIT, CR_MINOR, False),
+        # Any header line decides: a Major after a Minor is at the floor.
+        (RABBIT, CR_MINOR + "\n\n---\n\n" + CR_MAJOR, True),
+        # A source footer is not a severity header, in either number.
+        (RABBIT, CR_MINOR + "\n\n_Source: Linters/SAST tools_", False),
+        (RABBIT, CR_MINOR + "\n\n_Sources: Coding guidelines, Learnings_", False),
+        # A header whose level cannot be read makes the comment unreadable.
+        (RABBIT, CR_MINOR + "\n\n_⚠️ Potential issue_ | _🟣 Severe_", None),
+        (RABBIT, "no header", None),
+        (STRANGER, P1, None),
+    ],
+)
+def test_is_blocking_reads_the_floor(login, body, want):
+    assert rf.is_blocking(login, body) is want
+
+
+def _pathed(rv, review_id, comment_ids, paths):
+    return dict(_keyed(rv, review_id, comment_ids), top_level_paths=list(paths))
+
+
+@pytest.mark.parametrize(
+    "paths, files, off, scored",
+    [
+        # In the diff.
+        (["src/x.py", "src/x.py"], ("src/x.py",), [False, False], [False, True]),
+        # A floor comment whose file left the diff: the merge gate would not score it.
+        (["src/x.py", "other.py"], ("src/x.py",), [False, True], [False, False]),
+        # No path: nothing is shown either way.
+        (["other.py", None], ("src/x.py",), [True, None], [False, True]),
+        # An empty file set proves nothing.
+        (["other.py", "other.py"], (), [None, None], [False, True]),
+        # A renamed file's earlier path is in the diff.
+        (
+            ["old.py", "old.py"],
+            ({"filename": "new.py", "previous_filename": "old.py"},),
+            [False, False],
+            [False, True],
+        ),
+        # A path that is not a non-empty string is no path.
+        ([["other.py"], 5], ("src/x.py",), [None, None], [False, True]),
+        (["", {"a": 1}], ("src/x.py",), [None, None], [False, True]),
+    ],
+)
+def test_each_finding_says_whether_its_file_is_still_in_the_diff(paths, files, off, scored):
+    """``off_diff`` is a fact beside the level, never a change to it: the level
+    is what the reviewer wrote, and the file set moves with every push."""
+    got = _ev(
+        head=H2,
+        reviews=(_pathed(_rv(CODEX, H2, P2, P1), 11, [111, 113], paths),),
+        files=files,
+    )
+    assert got["status"] == "ok", got
+    for entry in (got["rounds"][-1]["reviews"][0], got["findings"][0]):
+        assert entry["blocking"] == [False, True]  # the P2 and the P1, as written
+        assert entry["off_diff"] == off
+        # The merge gate's reading: at the floor and not provably off the diff.
+        merged = zip(entry["blocking"], entry["off_diff"], strict=True)
+        assert [b is True and o is not True for b, o in merged] == scored
+
+
+def test_body_and_comment_keys_say_nothing_about_the_diff():
+    body = (
+        "**Actionable comments posted: 0**\n<details>\n"
+        "<summary>⚠️ Outside diff range comments (2)</summary>\n</details>"
+    )
+    rabbit = _keyed(_rv(RABBIT, H5, body=body), 20, [])
+    bulb = dict(_cm(_bulb(H5)), id=30)
+    got = _ev(reviews=(rabbit,), comments=(bulb,))
+    assert [f["off_diff"] for f in got["findings"]] == [[None], [None]]
+
+
+def test_a_reviewer_list_too_old_to_know_the_floor_reads_unknown(monkeypatch):
+    """Version skew between the two sibling modules: the count is unchanged and
+    every flag reads unknown, never "below the floor"."""
+    review = _pathed(_rv(CODEX, H5, P1), 11, [111], ["src/x.py"])
+    bulb = dict(_cm(_bulb(H4)), id=30)
+    base = _ev(reviews=(review,), comments=(bulb,))
+    monkeypatch.delattr(rf, "is_blocking")
+    got = _ev(reviews=(review,), comments=(bulb,))
+    assert got["status"] == "ok" and got["count"] == base["count"] == 2
+    assert [f["blocking"] for f in base["findings"]] == [[True], [True]]
+    assert [f["blocking"] for f in got["findings"]] == [[None], [None]]
+
+
+def test_an_unreadable_level_outside_the_diff_stays_unreadable():
+    """Where a comment sits never changes its level: unknown stays unknown."""
+    got = _ev(
+        head=H2,
+        reviews=(_pathed(_rv(CODEX, H2, "an unbadged Codex comment"), 11, [111], ["other.py"]),),
+    )
+    assert got["findings"][0]["blocking"] == [None]
+    assert got["findings"][0]["off_diff"] == [True]
+
+
+def test_commit_rows_carry_their_tree_and_commit_time():
+    tree = "a" * 40
+    rows = [
+        {"sha": H1, "parents": [], "tree": tree, "committed_at": "2026-07-01T10:00:00Z"},
+        {"sha": H2, "parents": [H1], "tree": "not a tree", "committed_at": "yesterday"},
+        H3,
+    ]
+    got = _ev(head=H3, commits=rows)
+    assert got["status"] == "ok", got
+    # A time with no offset cannot be placed, so it is not a time.
+    naive = _ev(
+        head=H1, commits=[{"sha": H1, "parents": [], "committed_at": "2026-07-01T10:00:00"}]
+    )
+    assert naive["status"] == "ok" and naive["commits"][0]["committed_at"] is None
+    assert got["commits"] == [
+        {
+            "sha": H1,
+            "parents": [],
+            "tree": tree,
+            "committed_at": "2026-07-01T10:00:00+00:00",
+        },
+        # Unreadable facts are None: they decide nothing here.
+        {"sha": H2, "parents": [H1], "tree": None, "committed_at": None},
+        {"sha": H3, "parents": None, "tree": None, "committed_at": None},
+    ]
+
+
+def test_the_new_inputs_never_change_any_existing_field():
+    """As a property: the same evidence with and without comment paths, commit
+    trees and commit times evaluates identically outside ``commits`` and the
+    ``off_diff`` flags, and the ``blocking`` flags are the same too."""
+
+    new = ("blocking", "off_diff")
+
+    def strip(result):
+        out = {k: v for k, v in result.items() if k not in ("commits", "rounds", "findings")}
+        out["rounds"] = [
+            dict(r, reviews=[{k: v for k, v in s.items() if k not in new} for s in r["reviews"]])
+            for r in result["rounds"]
+        ]
+        out["findings"] = [{k: v for k, v in f.items() if k not in new} for f in result["findings"]]
+        out["commits"] = [{"sha": c["sha"], "parents": c["parents"]} for c in result["commits"]]
+        return out
+
+    rng = random.Random(4133)
+    off_diff = 0
+    for _ in range(300):
+        reviews, comments = _random_corpus(rng, [T1, T2, T3, T4])
+        reviews = [
+            _keyed(r, i, [i * 10 + j for j in range(len(r["top_level"]))])
+            for i, r in enumerate(reviews, 1)
+        ]
+        pathed = [
+            dict(
+                r,
+                top_level_paths=[
+                    rng.choice(["src/x.py", "other.py", None]) for _ in r["top_level"]
+                ],
+            )
+            for r in reviews
+        ]
+        head = rng.choice(COMMITS)
+        plain_dag = _dag(*COMMITS)
+        rich_dag = [
+            dict(row, tree=f"{i:040x}", committed_at=rng.choice([T1, T2, None]))
+            for i, row in enumerate(plain_dag, 1)
+        ]
+        base = _ev(head=head, reviews=reviews, comments=comments, commits=plain_dag)
+        got = _ev(head=head, reviews=pathed, comments=comments, commits=rich_dag)
+        assert got["status"] == base["status"]
+        if base["status"] != "ok":
+            continue
+        assert strip(got) == strip(base)
+        # The level never depends on the new inputs.
+        assert [f["blocking"] for f in got["findings"]] == [f["blocking"] for f in base["findings"]]
+        off_diff += any(True in f["off_diff"] for f in got["findings"])
+    assert off_diff  # the corpus does place some findings off the diff
+
+
+def test_a_path_belongs_to_its_own_comment_not_its_position_among_findings():
+    """An informational comment before a finding has a path too; the flag reads
+    the path of the comment it was computed from."""
+    got = _ev(
+        head=H2,
+        reviews=(_pathed(_rv(CODEX, H2, P3, P1), 11, [111, 112], ["other.py", "src/x.py"]),),
+    )
+    assert got["findings"][0]["keys"] == ["c112"]
+    assert got["findings"][0]["off_diff"] == [False]
+    swapped = _ev(
+        head=H2,
+        reviews=(_pathed(_rv(CODEX, H2, P3, P1), 11, [111, 112], ["src/x.py", "other.py"]),),
+    )
+    assert swapped["findings"][0]["off_diff"] == [True]

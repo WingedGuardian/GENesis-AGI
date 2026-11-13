@@ -92,6 +92,20 @@ async def test_validator_update_checks_raw_authority_before_pin_normalization(re
         assert stored(path, fid) == before
 
 
+async def test_validator_cannot_replace_notes(recording):
+    """Validators only append; replacing earlier notes is refused by the tool itself
+    (matched on its own message, so an unknown-argument rejection cannot pass)."""
+    path, _, _ = recording
+    async with Client(await client_server()) as client:
+        fid = (await client.call_tool("follow_up_create", CREATE)).data["id"]
+        before = stored(path, fid)
+        with pytest.raises(ToolError, match="Validators cannot replace"):
+            await client.call_tool("follow_up_update", {
+                "follow_up_id": fid, "resolution_notes": "Synthetic", "replace_notes": True,
+            })
+        assert stored(path, fid) == before
+
+
 @pytest.mark.parametrize("name,args", [
     ("follow_up_create", CREATE), ("follow_up_list", {}),
     ("follow_up_update", {"follow_up_id": "0" * 32, "resolution_notes": "Synthetic"}),

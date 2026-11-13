@@ -393,6 +393,8 @@ def covered_late_keys(
     gate_lane: bool,
     acceptance: Sequence[str] | None,
     deadline: float | None = None,
+    repo: str | None = None,
+    number: int | None = None,
 ) -> set[str]:
     """Late keys answered by committed reflections. A reflection R naming head
     N, committed at T, credits late key k (reviewed on head H at time S) only
@@ -439,7 +441,8 @@ def covered_late_keys(
     nothing owed."""
     with rr.deadline_scope(deadline):
         return _covered_late_keys(
-            cwd, budget, late, gate_lane=gate_lane, acceptance=acceptance, deadline=deadline
+            cwd, budget, late, gate_lane=gate_lane, acceptance=acceptance, deadline=deadline,
+            repo=repo, number=number,
         )
 
 
@@ -470,6 +473,8 @@ def _covered_late_keys(
     gate_lane: bool,
     acceptance: Sequence[str] | None,
     deadline: float | None,
+    repo: str | None,
+    number: int | None,
 ) -> set[str]:
     current = budget.get("current_head")
     in_graph, ancestors = _ancestry(budget)
@@ -480,6 +485,7 @@ def _covered_late_keys(
     fix_times: dict[tuple[str, str], datetime | None] = {}
     tip_rows: dict[str, list[rr.Fix]] = {}
     covered: set[str] = set()
+    citation_cache: dict[str, dict] = {}
     for sha, kind, body, made_at in log:
         if deadline is not None and time.monotonic() > deadline:
             raise rr.Refused("the late-findings check ran out of time")
@@ -563,7 +569,11 @@ def _covered_late_keys(
                     ).ok
                 passed = passed and checked[(sha, context)]
             if passed:
-                covered.add(key)
+                valid = rr.validated_dispositions(
+                    parsed, cwd=cwd, repo=repo, number=number, made_at=made_at,
+                    cache=citation_cache, keys=[key],
+                )
+                covered.update(valid)
     return covered
 
 
@@ -623,7 +633,7 @@ def _late_status(
     acceptance = (
         rr._acceptance(budget, repo, number) if is_open or _needs_acceptance(budget, late) else None
     )
-    covered = rr._open_covered(cwd, budget, state, acceptance, deadline) if is_open else set()
+    covered = rr._open_covered(cwd, budget, state, acceptance, deadline, repo, number) if is_open else set()
     late_covered = (
         covered_late_keys(
             cwd,
@@ -632,6 +642,7 @@ def _late_status(
             gate_lane=state["gate_lane"],
             acceptance=acceptance,
             deadline=deadline,
+            repo=repo, number=number,
         )
         if late
         else set()

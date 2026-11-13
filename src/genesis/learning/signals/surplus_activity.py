@@ -54,7 +54,9 @@ class SurplusActivityCollector:
             stuck = (await cursor.fetchone())[0]
         except Exception:
             logger.error("SurplusActivityCollector DB query failed", exc_info=True)
-            return self._reading(0.0, "db_error")
+            # Not a reading: marked failed so a comparison across runs never
+            # takes this zero for "alarm cleared".
+            return self._reading(0.0, "db_error", failed=True)
 
         total = completed + failed
         if total == 0 and stuck == 0:
@@ -73,8 +75,9 @@ class SurplusActivityCollector:
         else:
             return self._reading(0.0, f"healthy_{failed}/{total}")
 
-    def _reading(self, value: float, source: str) -> SignalReading:
+    def _reading(self, value: float, source: str, *, failed: bool = False) -> SignalReading:
         return SignalReading(
+            failed=failed,
             name=self.signal_name,
             value=value,
             source=source,
