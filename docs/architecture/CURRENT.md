@@ -3511,6 +3511,15 @@ verified: 5be8573a5 2026-11-07
   and recovery state. Incremental publication follows durable append; uncertain
   publication stops derived-state reading until reconstruction. Historical
   reading never creates or truncates files; version-1 evidence cannot execute.
+  Read-only `study-check`/`study-report` validate a frozen continuation plan and
+  select the first eligible historical answer for each logical coordinate,
+  regardless of its grade. Original journals supply physical counts and costs;
+  unresolved reservations and separately bound raw receipt annotations remain
+  visible. Full current admission, exact request/source identity and finite
+  remaining allocations are checked without credentials or provider requests.
+  This tranche cannot acquire or resume requests and reports an inherited prefix
+  without claiming verified study closure. See
+  `docs/reference/qualification-lineage.md`.
   The isolated qualification CLI supplies explicit execution and reporting
   callers; it does not schedule automatic execution. Production credentials and
   accounting stores are outside this boundary. See
