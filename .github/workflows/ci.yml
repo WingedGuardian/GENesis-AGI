@@ -783,7 +783,9 @@ jobs:
         # Native peer containment (#3575): five real-CLI cases that skip on a
         # runner with no Claude binary (test_peer_native x4, test_contained_native
         # x1), measured in run 42667838123 at 603 skipped, 598 -> 603.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 603
+        # Atomic-write checker (#4436): one strict xfail recording the
+        # conditional-raise false clean, measured in run 43272668663 at 604, 603 -> 604.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 604
 
   test-ubuntu-2404:
     # ubuntu-latest is moving to 26.04, so `test` alone stops showing a break on
