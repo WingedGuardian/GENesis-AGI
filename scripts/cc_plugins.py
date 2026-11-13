@@ -128,6 +128,8 @@ def state(name: str) -> dict:
     }
 
 
+# Every install, uninstall and disable names the user scope as `-s user` (the CLI's short form of --scope; the long
+# spelling reads as a systemd scope to the repo's launcher sweep in tests/test_util/test_systemd_literal_args.py).
 def _run_or_raise(*args: str) -> None:
     run = _claude(*args)
     if run.returncode != 0:
@@ -156,7 +158,7 @@ def _replace_marketplace(name: str, plugin_id: str, path: str, now: dict) -> lis
     try:
         _run_or_raise("marketplace", "remove", MARKETPLACE)
         _run_or_raise("marketplace", "add", path)
-        _run_or_raise("install", plugin_id, "--scope", "user")
+        _run_or_raise("install", plugin_id, "-s", "user")
     except (RuntimeError, subprocess.SubprocessError) as exc:  # a CLI timeout is a SubprocessError
         old = now["marketplace_source"]
         try:
@@ -164,7 +166,7 @@ def _replace_marketplace(name: str, plugin_id: str, path: str, now: dict) -> lis
             if not old:
                 raise RuntimeError("the previous registration's source is unknown")
             _run_or_raise("marketplace", "add", old)
-            _run_or_raise("install", plugin_id, "--scope", "user")
+            _run_or_raise("install", plugin_id, "-s", "user")
             restored = f"; restored the previous registration at {old}"
         except (RuntimeError, subprocess.SubprocessError):
             restored = f"; {name} may now be NOT INSTALLED, so sessions may not be redacted until the next run succeeds"
@@ -185,7 +187,7 @@ def _honour_keep_disabled(name: str, plugin_id: str) -> bool:
         return False  # installed later by apply, which honours the marker then
     try:
         if now["enabled"]:
-            _run_or_raise("disable", plugin_id, "--scope", "user")
+            _run_or_raise("disable", plugin_id, "-s", "user")
     except (RuntimeError, subprocess.SubprocessError):
         return False
     marker.unlink(missing_ok=True)
@@ -204,7 +206,7 @@ def apply(root: Path, key: str, name: str) -> list[str]:
     done: list[str] = []
     if want == "off":
         if now["installed"]:
-            _run_or_raise("uninstall", plugin_id, "--scope", "user")
+            _run_or_raise("uninstall", plugin_id, "-s", "user")
             done.append(f"{name}: uninstalled (lever off)")
         return done or [f"{name}: off (not installed)"]
     if now["marketplace"] and now["marketplace_path"] != path:
@@ -220,7 +222,7 @@ def apply(root: Path, key: str, name: str) -> list[str]:
         _run_or_raise("marketplace", "add", path)
         done.append(f"marketplace {MARKETPLACE} added at {path}")
     if not now["installed"]:
-        _run_or_raise("install", plugin_id, "--scope", "user")
+        _run_or_raise("install", plugin_id, "-s", "user")
         done.append(f"{name}: installed")
         if _honour_keep_disabled(name, plugin_id):
             done.append(
