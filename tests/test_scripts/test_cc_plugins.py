@@ -47,7 +47,10 @@ elif a == ["list", "--json"]:
                       for i, e in st["plugins"].items()]))
 elif a[:2] == ["marketplace", "add"]:
     name = json.load(open(os.path.join(a[2], ".claude-plugin", "marketplace.json")))["name"]
-    st["mkts"][name] = a[2]; save()
+    # Measured: an add over the same name re-points a directory marketplace in place, keeping its plugins. A
+    # source the add does not replace in place is modelled with FAKE_CLAUDE_ADD_KEEPS_SOURCE.
+    if not (os.environ.get("FAKE_CLAUDE_ADD_KEEPS_SOURCE") and name in st["mkts"]):
+        st["mkts"][name] = a[2]; save()
 elif a[:2] == ["marketplace", "remove"]:
     st["mkts"].pop(a[2], None)
     st["plugins"] = {i: e for i, e in st["plugins"].items() if not i.endswith("@" + a[2])}; save()
@@ -210,7 +213,8 @@ def test_malformed_lever_never_crashes(world, yaml_text, apply_rc, check_rc, sai
 
 def test_a_failed_re_point_says_redaction_is_off(world):
     world.set_state({"mkts": {"genesis": "/old/checkout/plugins"}, "plugins": {PLUGIN: True}})
-    run = world.run("apply", FAKE_CLAUDE_FAIL="install")
+    # A source the in-place add does not re-point takes the remove-then-add fallback, whose install fails here.
+    run = world.run("apply", FAKE_CLAUDE_FAIL="install", FAKE_CLAUDE_ADD_KEEPS_SOURCE="1")
     assert run.returncode == 2 and "NOT INSTALLED" in run.stdout
 
 
@@ -221,8 +225,9 @@ def test_a_failed_re_point_restores_the_previous_registration(tmp_path, world):
         json.dumps({"name": "genesis", "plugins": []})
     )
     world.set_state({"mkts": {"genesis": str(old)}, "plugins": {PLUGIN: False}})
+    # The in-place add fails: nothing was removed, so the previous registration and the owner's disable stand.
     run = world.run("apply", FAKE_CLAUDE_FAIL_IF_ARG=str(world.root / "plugins"))
-    assert run.returncode == 2 and "restored the previous registration" in run.stdout
+    assert run.returncode == 2
     assert world.state() == {"mkts": {"genesis": str(old)}, "plugins": {PLUGIN: False}}
 
 
@@ -313,6 +318,7 @@ def test_a_timed_out_re_point_still_restores_the_previous_registration(tmp_path,
         "apply",
         FAKE_CLAUDE_HANG_IF_ARG="install " + PLUGIN,
         FAKE_CLAUDE_FAIL_IF_ARG="NO_MATCH",
+        FAKE_CLAUDE_ADD_KEEPS_SOURCE="1",
         GENESIS_CC_PLUGINS_TIMEOUT_S="2",
     )
     assert run.returncode == 2 and "restored the previous registration" in run.stdout
@@ -393,3 +399,36 @@ def test_prune_never_follows_a_symlinked_report_folder(tmp_path, world):
     (Path(world.home) / "state" / "secret-redact").symlink_to(elsewhere)
     world.run("apply")
     assert victim.exists()
+
+
+def test_a_disabled_plugin_stays_disabled_when_its_checkout_moves_in_place(tmp_path, world):
+    old = tmp_path / "old-checkout" / "plugins"
+    world.set_state({"mkts": {"genesis": str(old)}, "plugins": {PLUGIN: False}})
+    before = len(world.calls())
+    run = world.run("apply")
+    assert run.returncode == 0 and "re-pointed" in run.stdout
+    assert world.state() == {
+        "mkts": {"genesis": str(world.root / "plugins")},
+        "plugins": {PLUGIN: False},
+    }
+    assert not any("remove" in c for c in world.calls()[before:])  # nothing destructive ran
+
+
+def test_a_failed_disable_during_a_replacement_is_honoured_on_the_next_apply(world):
+    # A source the in-place add does not re-point is replaced; if the final disable fails, the written-down choice
+    # is applied by the next run.
+    world.set_state(
+        {
+            "mkts": {"genesis": {"source": "github", "repo": "someone/else"}},
+            "plugins": {PLUGIN: False},
+        }
+    )
+    first = world.run("apply", FAKE_CLAUDE_ADD_KEEPS_SOURCE="1", FAKE_CLAUDE_FAIL="disable")
+    assert world.state()["plugins"][PLUGIN] is True  # the disable failed: enabled for now
+    second = world.run("apply")
+    assert second.returncode == 0 and "disabled again" in second.stdout
+    assert world.state()["plugins"][PLUGIN] is False
+    assert not (
+        Path(world.home) / "state" / "cc_plugins" / "genesis-secret-redact.keep-disabled"
+    ).exists()
+    assert first.returncode in (0, 2)

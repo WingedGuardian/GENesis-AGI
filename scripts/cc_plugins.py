@@ -16,10 +16,11 @@ Lever: `cc_plugins.secret_redact` in `${GENESIS_HOME:-~/.genesis}/config/genesis
 `claude plugin install` WOULD re-enable it, so `apply` installs only when the plugin is absent).
 
 Only the main checkout registers itself: a linked worktree is skipped, since its directory can be archived away
-and every session would then load nothing. A checkout that moved is re-pointed: the marketplace is removed and
-added again, which uninstalls its plugins (measured), so a plugin that was disabled is disabled again after. The
-marketplace is identified by its name, `genesis`: any marketplace of that name not pointing at this checkout (for
-example the public repository added as a GitHub marketplace) is replaced, plugins and all.
+and every session would then load nothing. A checkout that moved is re-pointed in place (`marketplace add` over
+the same name keeps the install and an owner's disable, measured). The marketplace is identified by its name,
+`genesis`: one of that name that an in-place add does not re-point (another kind of source, for example the public
+repository added as a GitHub marketplace) is replaced by remove-then-add, which uninstalls its plugin, so an
+owner's disable is written down first and applied again after.
 
 Exit codes: 0 consistent / applied (an invalid lever value is applied as "change nothing" and reported),
 2 cannot run (no `claude`, not the main checkout, unreadable genesis.yaml, a CLI failure),
@@ -135,6 +136,62 @@ def _run_or_raise(*args: str) -> None:
         )
 
 
+def _keep_disabled_marker(name: str) -> Path:
+    """Where the owner's disable is written down while a destructive re-point is in flight."""
+    home = Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis")
+    return home / "state" / "cc_plugins" / f"{name}.keep-disabled"
+
+
+def _replace_marketplace(name: str, plugin_id: str, path: str, now: dict) -> list[str]:
+    """Remove-then-add, for a same-named marketplace the in-place add did not re-point (another kind of source).
+
+    Removing the marketplace uninstalls its plugin and forgets an owner's disable (measured), so that choice is
+    written down first and cleared only after a disable succeeds; `apply` honours a pending one before anything
+    else. A failure in between restores the previous registration where it can.
+    """
+    marker = _keep_disabled_marker(name)
+    if now["installed"] and not now["enabled"]:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("the owner disabled this plugin; re-disable it after a re-point\n")
+    try:
+        _run_or_raise("marketplace", "remove", MARKETPLACE)
+        _run_or_raise("marketplace", "add", path)
+        _run_or_raise("install", plugin_id, "--scope", "user")
+    except (RuntimeError, subprocess.SubprocessError) as exc:  # a CLI timeout is a SubprocessError
+        old = now["marketplace_source"]
+        try:
+            _claude("marketplace", "remove", MARKETPLACE)
+            if not old:
+                raise RuntimeError("the previous registration's source is unknown")
+            _run_or_raise("marketplace", "add", old)
+            _run_or_raise("install", plugin_id, "--scope", "user")
+            restored = f"; restored the previous registration at {old}"
+        except (RuntimeError, subprocess.SubprocessError):
+            restored = f"; {name} may now be NOT INSTALLED, so sessions may not be redacted until the next run succeeds"
+        _honour_keep_disabled(name, plugin_id)
+        raise RuntimeError(f"{exc}{restored}") from exc
+    kept = _honour_keep_disabled(name, plugin_id)
+    return [f"{name}: marketplace replaced, now at {path}" + (" (kept disabled)" if kept else "")]
+
+
+def _honour_keep_disabled(name: str, plugin_id: str) -> bool:
+    """Re-disable the plugin when the owner's disable is written down and the plugin is enabled; True if a
+    pending choice is now honoured. The marker stays until a disable succeeds."""
+    marker = _keep_disabled_marker(name)
+    if not marker.exists():
+        return False
+    now = state(name)
+    if not now["installed"]:
+        return False  # installed later by apply, which honours the marker then
+    try:
+        if now["enabled"]:
+            _run_or_raise("disable", plugin_id, "--scope", "user")
+    except (RuntimeError, subprocess.SubprocessError):
+        return False
+    marker.unlink(missing_ok=True)
+    return True
+
+
 def apply(root: Path, key: str, name: str) -> list[str]:
     """Make the install match the lever; returns what was done, one line each."""
     want = lever(key)
@@ -151,42 +208,29 @@ def apply(root: Path, key: str, name: str) -> list[str]:
             done.append(f"{name}: uninstalled (lever off)")
         return done or [f"{name}: off (not installed)"]
     if now["marketplace"] and now["marketplace_path"] != path:
-        was_disabled = now["installed"] and not now["enabled"]
-        _run_or_raise("marketplace", "remove", MARKETPLACE)
-        try:  # the shared name forces remove-then-add; a failure in between leaves the plugin uninstalled
-            _run_or_raise("marketplace", "add", path)
-            _run_or_raise("install", plugin_id, "--scope", "user")
-        except (
-            RuntimeError,
-            subprocess.SubprocessError,
-        ) as exc:  # a CLI timeout is a SubprocessError
-            # Put the previous registration back, so the failure costs the re-point and not the redaction. The
-            # new registration may already be in place under the same name: remove it first.
-            old = now["marketplace_source"]
-            try:
-                _claude("marketplace", "remove", MARKETPLACE)
-                if not old:
-                    raise RuntimeError("the previous registration's source is unknown")
-                _run_or_raise("marketplace", "add", old)
-                _run_or_raise("install", plugin_id, "--scope", "user")
-                if was_disabled:
-                    _run_or_raise("disable", plugin_id, "--scope", "user")
-                restored = f"; restored the previous registration at {old}"
-            except (RuntimeError, subprocess.SubprocessError):
-                restored = f"; {name} is now NOT INSTALLED, so sessions are not redacted until the next run succeeds"
-            raise RuntimeError(f"{exc}{restored}") from exc
-        if was_disabled:
-            _run_or_raise("disable", plugin_id, "--scope", "user")
-        return [
-            f"{name}: marketplace re-pointed to {path}"
-            + (" (kept disabled)" if was_disabled else "")
-        ]
+        # In place first: `marketplace add` over the same name re-points a directory marketplace and keeps the
+        # install and an owner's disable (measured on 2.1.299), so no step can lose the owner's choice.
+        _run_or_raise("marketplace", "add", path)
+        after = state(name)
+        if after["marketplace_path"] != path:
+            return _replace_marketplace(name, plugin_id, path, now)
+        now = after
+        done.append(f"{name}: marketplace re-pointed to {path}")
     if not now["marketplace"]:
         _run_or_raise("marketplace", "add", path)
         done.append(f"marketplace {MARKETPLACE} added at {path}")
     if not now["installed"]:
         _run_or_raise("install", plugin_id, "--scope", "user")
         done.append(f"{name}: installed")
+        if _honour_keep_disabled(name, plugin_id):
+            done.append(
+                f"{name}: disabled again (the owner's choice, kept through an earlier re-point)"
+            )
+        return done
+    if _honour_keep_disabled(name, plugin_id):
+        done.append(
+            f"{name}: disabled again (the owner's choice, kept through an earlier re-point)"
+        )
     elif not now["enabled"]:
         done.append(f"{name}: installed but disabled (owner's choice; left as is)")
     return done or [f"{name}: up to date"]
