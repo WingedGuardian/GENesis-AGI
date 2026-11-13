@@ -1,0 +1,1 @@
+- Capture code-intelligence startup code and explicit queued-worker inputs across process handoffs, preserving literal service tool paths and the existing automatic-indexing fence.

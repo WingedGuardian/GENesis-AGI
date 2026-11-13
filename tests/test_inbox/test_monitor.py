@@ -209,6 +209,41 @@ async def test_silently_omitted_url_requeues_not_baselines(
 
 
 @pytest.mark.asyncio
+async def test_literal_url_retries_then_completes_only_with_exact_citation(
+    monitor, inbox_dir, db, mock_invoker,
+):
+    """Real scan/SQLite/writer pipeline, with a controlled evaluator response."""
+    from genesis.db.crud import inbox_items
+
+    literal = "https://example.com/literal)"
+    source = inbox_dir / "literal.md"
+    source.write_text(literal)
+    monitor._create_follow_ups_from_eval = AsyncMock()
+    mock_invoker.run.return_value = _success_output(
+        "# Evaluation\n**Source:** <https://example.com/literal>\n" + "x" * 300,
+    )
+    await monitor.check_once()
+    assert f"1. {literal}" in mock_invoker.run.await_args.args[0].prompt.splitlines()
+    failed = await inbox_items.get_by_file_path(db, str(source))
+    assert failed["status"] == "failed"
+    assert failed["evaluated_content"] is None
+    monitor._create_follow_ups_from_eval.assert_not_awaited()
+
+    mock_invoker.run.return_value = _success_output(
+        f"# Evaluation\n**Source:** <{literal}>\n" + "x" * 300,
+    )
+    await monitor.check_once()
+    completed = await inbox_items.get_by_file_path(db, str(source))
+    assert completed["status"] == "completed"
+    assert completed["evaluated_content"] == literal
+    assert completed["response_path"]
+    assert literal in Path(completed["response_path"]).read_text()
+    calls = mock_invoker.run.await_count
+    await monitor.check_once()
+    assert mock_invoker.run.await_count == calls
+
+
+@pytest.mark.asyncio
 async def test_shadow_mode_logs_but_does_not_requeue(monitor, inbox_dir, db, mock_invoker, caplog):
     """Shadow mode, the contrast with the test above: compute, log, act on nothing.
 
@@ -386,15 +421,16 @@ async def test_supersede_does_not_burn_a_retry(monitor, inbox_dir, db):
         "SELECT id, status, retry_count FROM inbox_items WHERE file_path = ?",
         (str(f),),
     )
-    # The superseded row is recycled for the fresh delta (reuse_as_pending),
-    # evaluated, and completed — ONE row, retry budget untouched.
-    assert len(rows) == 1, [dict(r) for r in rows]
-    assert rows[0]["status"] == "completed"
-    assert rows[0]["retry_count"] == 0
+    # Missing identity is retained as history; reconstructed work starts fresh.
+    assert len(rows) == 2, [dict(r) for r in rows]
+    history = next(row for row in rows if row["id"] == "stale-pending")
+    rebuilt = next(row for row in rows if row["id"] != "stale-pending")
+    assert history["status"] == "failed" and history["retry_count"] == 0
+    assert rebuilt["status"] == "completed" and rebuilt["retry_count"] == 0
 
 
 @pytest.mark.asyncio
-async def test_supersede_near_retry_cap_still_recycles(monitor, inbox_dir, db):
+async def test_supersede_preserves_unknown_history_near_retry_cap(monitor, inbox_dir, db):
     """At max_retries-1, a supersede must not push the row over the cap.
 
     Before the fix, supersession incremented retry_count to the cap, the row
@@ -422,9 +458,11 @@ async def test_supersede_near_retry_cap_still_recycles(monitor, inbox_dir, db):
         "SELECT id, status, retry_count FROM inbox_items WHERE file_path = ?",
         (str(f),),
     )
-    assert len(rows) == 1, [dict(r) for r in rows]
-    assert rows[0]["status"] == "completed"
-    assert rows[0]["retry_count"] == 2
+    assert len(rows) == 2, [dict(r) for r in rows]
+    history = next(row for row in rows if row["id"] == "worn-pending")
+    rebuilt = next(row for row in rows if row["id"] != "worn-pending")
+    assert history["status"] == "failed" and history["retry_count"] == 2
+    assert rebuilt["status"] == "completed" and rebuilt["retry_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -872,24 +910,24 @@ async def test_partial_drop_creation_crash_rebuilds_every_item(
     f = inbox_dir / "links.md"
     urls = [f"https://example.com/item-{index}" for index in range(3)]
     f.write_text("\n".join(urls))
-    original_create = inbox_items.create
+    original_create = inbox_items.create_pending_if_retriable
     pending_creates = 0
 
     async def crash_after_first_pending(*args, **kwargs):
         nonlocal pending_creates
         result = await original_create(*args, **kwargs)
-        if kwargs.get("status") == "pending":
+        if result:
             pending_creates += 1
             if pending_creates == 1:
                 raise asyncio.CancelledError
         return result
 
-    monkeypatch.setattr(inbox_items, "create", crash_after_first_pending)
+    monkeypatch.setattr(inbox_items, "create_pending_if_retriable", crash_after_first_pending)
     with pytest.raises(asyncio.CancelledError):
         await monitor.check_once()
     assert len(await inbox_items.query_pending(db)) == 1
 
-    monkeypatch.setattr(inbox_items, "create", original_create)
+    monkeypatch.setattr(inbox_items, "create_pending_if_retriable", original_create)
     result = await monitor.check_once()
 
     assert result.batches_dispatched == 3
@@ -957,16 +995,82 @@ async def test_pending_recovery_rebuilds_a_missing_durable_payload(
 
     result = await monitor.check_once()
 
-    rebuilt = await inbox_items.get_by_id(db, "malformed")
+    history = await inbox_items.get_by_id(db, "malformed")
+    assert history["batch_items"] == "" and history["retry_count"] == 2
+    assert history["status"] == "failed"
+    rows = await db.execute_fetchall(
+        "SELECT * FROM inbox_items WHERE file_path=? AND id != 'malformed'", (str(f),),
+    )
+    assert len(rows) == 1
+    rebuilt = dict(rows[0])
     assert rebuilt["status"] == "completed"
     assert inbox_items.batch_items_for_dispatch(rebuilt["batch_items"]) == (
         "https://example.com/current"
     )
     assert rebuilt["drop_id"] != "drop"
-    assert rebuilt["retry_count"] == 2
+    assert rebuilt["retry_count"] == 0
     assert result.items_new == 1
     assert result.batches_dispatched == 1
     mock_invoker.run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["completed", "exhausted"])
+async def test_reconstructed_batch_keeps_one_bounded_budget(
+    monitor, inbox_dir, db, mock_invoker, outcome,
+):
+    """Unknown history stays intact; repeated scans never reset its replacement."""
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.scanner import compute_hash
+
+    source = inbox_dir / "reconstructed.md"
+    url = "https://example.com/reconstructed"
+    source.write_text(url)
+    await inbox_items.create(
+        db, id="unknown-history", file_path=str(source), content_hash=compute_hash(source),
+        status="failed", created_at="2026-01-01T00:00:00+00:00",
+        batch_items="inbox-items-v2:broken", retry_count=2,
+        error_message="batch_items_corrupt_restart",
+    )
+    mock_invoker.run.return_value = (
+        _success_output(
+            f"# Inbox Evaluation\n\n**Source:** {url}\n\n"
+            "This synthetic evaluation confirms that the reconstructed item was "
+            "processed and its response was retained. The fixture exercises only "
+            "local row ownership and response persistence; it makes no claim "
+            "about a real source. Its recommendation is to retain the current "
+            "implementation and make no external changes."
+        ) if outcome == "completed"
+        else _error_output("synthetic evaluation failure")
+    )
+    replacement_id = None
+    attempts = 1 if outcome == "completed" else monitor.config.max_retries
+    for attempt in range(1, attempts + 1):
+        await monitor.check_once()
+        rows = await db.execute_fetchall("SELECT * FROM inbox_items ORDER BY rowid")
+        assert len(rows) == 2
+        history, replacement = map(dict, rows)
+        assert history["id"] == "unknown-history"
+        assert history["batch_items"] == "inbox-items-v2:broken"
+        assert history["retry_count"] == 2
+        assert replacement["id"] != history["id"]
+        if replacement_id is not None:
+            assert replacement["id"] == replacement_id
+        replacement_id = replacement["id"]
+        assert replacement["retry_count"] == (0 if outcome == "completed" else attempt)
+        assert mock_invoker.run.await_count == attempt
+    await monitor.check_once()
+    await monitor.check_once()
+    assert mock_invoker.run.await_count == attempts
+    assert await inbox_items.get_retriable_failure_files(db) == []
+    history = await inbox_items.get_by_id(db, "unknown-history")
+    assert history["retry_count"] == 2
+    assert history["batch_items"] == "inbox-items-v2:broken"
+    assert history["error_message"].startswith(inbox_items.APPROVAL_INVALIDATED_PREFIX)
+    if outcome == "completed":
+        replacement = await inbox_items.get_by_id(db, replacement_id)
+        assert Path(replacement["response_path"]).exists()
+        assert url in await inbox_items.get_evaluated_content(db, str(source))
 
 
 @pytest.mark.asyncio
@@ -1121,6 +1225,70 @@ async def test_response_file_written(monitor, inbox_dir, writer):
     assert len(responses) == 1
     content = responses[0].read_text()
     assert "evaluation result" in content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["ADAPT", "explore", "BUILD"])
+async def test_evidence_survives_scan_delivery_and_recommendation_consumers(
+    monitor, inbox_dir, db, mock_invoker, action
+):
+    """Real isolated scan/DB/writer/baseline path; only the LLM is controlled."""
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.recommendation import parse_recommendations
+
+    source = inbox_dir / "evidence.md"
+    source.write_text("https://example.com/article")
+    if action == "BUILD":
+        evaluation = _build_eval("needs_discussion", "Decide operator access for direct adoption")
+    else:
+        classification = "Genesis-relevant" if action == "ADAPT" else "User-relevant"
+        fields = (
+            "scope: V4\narchitecture_impact: extends\n"
+            if action == "ADAPT"
+            else "timeline: Soon\nrelevance: Tangential\n"
+        )
+        evaluation = (
+            f"# Inbox Evaluation\n\n## Example\n\n**Classification:** {classification}\n"
+            "### Summary\nA bounded trial is proposed, not an established preference.\n"
+            f"### Recommendation\n```yaml\naction: {action}\n"
+            'next_step: "Try the external CLI on one synthetic document"\n'
+            f"effort: Small\nconfidence: medium\n{fields}```\n"
+        )
+    evaluation += (
+        "\n### Evidence\n\n**Source:** <https://example.com/article>\n"
+        'Source claim, not independently verified: "Offline JSON interface."\n'
+        "> ## Source heading, not an inbox item\n"
+        "Personal fit is unknown; an architectural gap is unverified.\n"
+        "### Lens 1: What This Is\nA tool with a bounded external trial.\n"
+    )
+    mock_invoker.run.return_value = _success_output(evaluation)
+
+    await monitor.check_once()
+
+    row = await inbox_items.get_by_file_path(db, str(source))
+    assert row["status"] == "completed"
+    assert row["evaluated_content"] == source.read_text()
+    responses = list(inbox_dir.glob("*.genesis.md"))
+    assert len(responses) == 1
+    delivered = responses[0].read_text()
+    assert "Personal fit is unknown; an architectural gap is unverified." in delivered
+    assert parse_recommendations(delivered) == parse_recommendations(evaluation)
+    follow_ups = await _build_follow_ups(db)
+    assert len(follow_ups) == 1
+    assert follow_ups[0]["strategy"] == "user_input_needed"
+    cursor = await db.execute("SELECT domain FROM follow_ups WHERE source='inbox_evaluation'")
+    assert (await cursor.fetchone())["domain"] == (
+        "user_world" if action == "explore" else "internal"
+    )
+    if action == "BUILD":
+        assert follow_ups[0]["content"].startswith("[BUILD: NEEDS DISCUSSION]")
+    invocation = mock_invoker.run.call_args.args[0]
+    assert invocation.system_prompt == monitor._load_system_prompt()
+    assert "### Evidence" in invocation.system_prompt
+
+    await monitor.check_once()
+    assert mock_invoker.run.await_count == 1
+    assert len(await _build_follow_ups(db)) == 1
 
 
 @pytest.mark.asyncio
@@ -1462,6 +1630,11 @@ async def test_build_prompt_enumerates_urls(monitor, inbox_dir):
         ('see "https://example.com/x", later', "https://example.com/x"),
         # A code span around a URL is likewise presentation.
         ("`https://example.com/y`.", "https://example.com/y"),
+        ("``https://example.com/y``", "https://example.com/y"),
+        ("(see https://example.com/y)", "https://example.com/y"),
+        ('"[docs](https://example.com/y)"', "https://example.com/y"),
+        # An earlier matching code delimiter makes terminal trimming unproved.
+        ("`https://example.com/a`literal`", "https://example.com/a`literal`"),
         # A URL-shaped markdown LABEL is its own token and must not absorb
         # `](https://...` -- this case reaches the bare-domain `]` stop, which
         # the `[docs](...)` cases above never do.
@@ -1512,15 +1685,15 @@ async def test_build_prompt_lists_the_url_the_writer_meant(
 def test_citing_exactly_what_the_prompt_asked_for_covers_the_url():
     """A compliant answer must be able to satisfy the gate.
 
-    The prompt shows ``_display_url(token)`` while the gate discovered
-    ``token``. If only the untrimmed form counted, every URL whose two
+    The prompt uses the source-aware display while the gate discovered
+    the raw token. If only the untrimmed form counted, every URL whose two
     renderings differ would be permanently uncoverable -- a floor under the
     shadow flag rate, which is the signal the enforce decision reads.
     """
-    from genesis.inbox.url_coverage import _display_url, _uncovered_urls
+    from genesis.inbox.url_coverage import _coverage_url_occurrences, _uncovered_urls
 
     source = '"https://example.com/q?x=1",'
-    assert _display_url('https://example.com/q?x=1",') == "https://example.com/q?x=1"
+    assert _coverage_url_occurrences(source)[0].display == "https://example.com/q?x=1"
 
     # What the prompt actually asked for.
     assert _uncovered_urls("**Source:** <https://example.com/q?x=1>", source) == []
@@ -3016,6 +3189,10 @@ async def test_resume_pass_dispatches_on_pending_to_approved_transition(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("active_cap", "stored_retries"),
+    [(1, 0), (1, 1), (1, 3), (3, 0), (3, 2), (3, 3), (3, 5), (5, 2)],
+)
+@pytest.mark.parametrize(
     "corrupt_payload",
     [
         "inbox-items-v2:not-json",
@@ -3028,10 +3205,15 @@ async def test_resume_corrupt_v2_batch_rederives_without_full_file_replay(
     mock_invoker,
     db,
     corrupt_payload,
+    active_cap,
+    stored_retries,
 ):
     """Corrupt structured storage is not the legacy full-file fallback."""
+    from dataclasses import replace
+
     from genesis.db.crud import inbox_items
 
+    monitor._config = replace(monitor._config, max_retries=active_cap)
     path, _ = await _seed_parked_row(
         db,
         inbox_dir,
@@ -3043,7 +3225,7 @@ async def test_resume_corrupt_v2_batch_rederives_without_full_file_replay(
         "UPDATE inbox_items SET batch_items = ?, retry_count = ? WHERE id = ?",
         (
             corrupt_payload,
-            monitor._config.max_retries - 1,
+            stored_retries,
             "row-req-corrupt",
         ),
     )
@@ -3068,19 +3250,18 @@ async def test_resume_corrupt_v2_batch_rederives_without_full_file_replay(
     assert result.batches_dispatched == 0
     mock_invoker.run.assert_not_awaited()
     corrupt = await inbox_items.get_by_id(db, "row-req-corrupt")
-    assert corrupt["status"] == "processing"
-    assert corrupt["error_message"] == (
-        f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-fresh"
-    )
-    assert corrupt["retry_count"] == monitor._config.max_retries - 1
-    assert inbox_items.batch_items_for_dispatch(corrupt["batch_items"]) == "first item"
+    assert corrupt["status"] == "failed"
+    assert corrupt["error_message"] == "batch_items_corrupt_restart"
+    assert corrupt["retry_count"] == min(stored_retries, active_cap - 1)
+    assert corrupt["batch_items"] == corrupt_payload
     dispatcher.approval_gate.mark_consumed.assert_awaited_once_with("req-corrupt")
     rows = await db.execute_fetchall(
-        "SELECT id, status, error_message, batch_items FROM inbox_items "
-        "WHERE file_path = ? ORDER BY rowid",
-        (str(path),),
+        "SELECT id, status, error_message, batch_items, retry_count FROM inbox_items "
+        "WHERE file_path = ? AND id != ? ORDER BY rowid",
+        (str(path), "row-req-corrupt"),
     )
     assert len(rows) == 2
+    assert all(row["retry_count"] == 0 for row in rows)
     assert all(row["status"] == "processing" for row in rows)
     assert all(
         row["error_message"] == f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-fresh"
@@ -3174,8 +3355,16 @@ async def test_corrupt_parked_batch_retries_after_healthy_sibling_completes(
     assert second.items_retried == 1
     assert second.batches_dispatched == 0
     mock_invoker.run.assert_not_awaited()
-    recovered = await inbox_items.get_by_id(db, corrupt_id)
+    assert await inbox_items.get_by_id(db, corrupt_id) == corrupt
+    assert await inbox_items.get_by_id(db, healthy_id) == healthy
+    rebuilt = await db.execute_fetchall(
+        "SELECT * FROM inbox_items WHERE file_path = ? AND id NOT IN (?, ?)",
+        (str(path), corrupt_id, healthy_id),
+    )
+    assert len(rebuilt) == 1
+    recovered = dict(rebuilt[0])
     assert recovered["status"] == "processing"
+    assert recovered["retry_count"] == 0
     assert recovered["error_message"] == (
         f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-siblings-fresh"
     )

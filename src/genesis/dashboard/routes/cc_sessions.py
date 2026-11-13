@@ -27,7 +27,7 @@ import aiosqlite
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
-from genesis.observability.commit_identity import is_stale
+from genesis.observability.commit_identity import is_stale, read_runtime_head, recorded_revision
 from genesis.observability.mcp_spawn_store import read_spawn_identity
 
 logger = logging.getLogger(__name__)
@@ -123,6 +123,7 @@ async def _collect_detail(
     slots: list[dict],
     now: datetime | None = None,
     deploy: tuple[str, str] | None = None,
+    checkout_commit: str | None = None,
 ) -> dict:
     """Assemble the modal payload. `slots` and `deploy` are passed in so tests
     inject fakes instead of scanning /proc or reading update_history.
@@ -134,21 +135,26 @@ async def _collect_detail(
     after the proc started. This is the exact `commit_identity.is_stale` verdict
     Part A's guard uses, so a session AHEAD of the last recorded deploy (main tree
     advanced by a manual `git pull`) is NOT flagged. Fail-open: unknown identity or
-    no deploy → not stale. Default None → nothing stale (empty-state)."""
+    no deploy → not stale. Default None → nothing stale (empty-state).
+
+    Separately, `checkout_commit` supplies the current configured runtime HEAD
+    for a nondirectional recorded-revision advisory, independent of deploy history.
+    Its default is unknown; this helper never starts a Git subprocess."""
     now = now or datetime.now(UTC)
     db.row_factory = aiosqlite.Row
 
-    def _slot_stale(
+    def _slot_state(
         slot: str | None, spid: int | None, proc_start: str | None = None
-    ) -> tuple[bool, str | None]:
-        """(stale, deploy_commit_to_restart_to) for a live slot proc."""
+    ) -> tuple[bool, str | None, str]:
+        """Existing deploy predicate plus independent recorded-revision relation."""
         ident = read_spawn_identity(slot, spid, proc_start)
+        relation = recorded_revision(ident[0] if ident else None, checkout_commit)
         if not ident or not deploy:
-            return False, None
+            return False, None, relation
         completed_at, new_commit = deploy
         if is_stale(ident[0], ident[1], completed_at, new_commit):
-            return True, new_commit
-        return False, None
+            return True, new_commit, relation
+        return False, None, relation
 
     cutoff = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
     cursor = await db.execute(_RECENT_WINDOW_SQL, (cutoff,))
@@ -177,7 +183,7 @@ async def _collect_detail(
         pid = row.get("pid")
         if pid in slot_by_pid and pid not in consumed:
             s = slot_by_pid[pid]
-            stale, dc = _slot_stale(s.get("slot"), s.get("pid"), s.get("started_at"))
+            stale, dc, relation = _slot_state(s.get("slot"), s.get("pid"), s.get("started_at"))
             live = {
                 "slot": s.get("slot"),
                 "pid": s.get("pid"),
@@ -191,6 +197,8 @@ async def _collect_detail(
                 "started_at": s.get("started_at"),
                 "stale_code": stale,
                 "deploy_commit": dc,
+                "recorded_revision": relation,
+                "checkout_commit": checkout_commit,
             }
             if stale:
                 stats["stale_code"] += 1
@@ -240,9 +248,11 @@ async def _collect_detail(
         if s.get("pid") is None or s["pid"] in consumed:
             continue
         d = dict(s)
-        stale, dc = _slot_stale(s.get("slot"), s.get("pid"))
+        stale, dc, relation = _slot_state(s.get("slot"), s.get("pid"), s.get("started_at"))
         d["stale_code"] = stale
         d["deploy_commit"] = dc
+        d["recorded_revision"] = relation
+        d["checkout_commit"] = checkout_commit
         if stale:
             stats["stale_code"] += 1
         unmatched_slots.append(d)
@@ -271,8 +281,9 @@ async def cc_sessions_detail():
 
     # /proc scan is ~1s of sync syscalls — keep it off the event loop.
     slots = await asyncio.to_thread(enumerate_cc_slots)
+    checkout_commit = await asyncio.to_thread(read_runtime_head)
     deploy = await last_successful_update(rt.db)  # (completed_at, new_commit) | None
-    return jsonify(await _collect_detail(rt.db, slots, deploy=deploy))
+    return jsonify(await _collect_detail(rt.db, slots, deploy=deploy, checkout_commit=checkout_commit))
 
 
 # ── per-session cockpit detail (session-manager PR-4b) ──────────────────────

@@ -62,7 +62,7 @@ def test_parse_verdict_no_verdict_line():
 
 
 def test_codex_missing_skipped():
-    with patch("genesis.contribution.review.shutil.which", return_value=None):
+    with patch("genesis.util.codex_cli.shutil.which", return_value=None):
         r = review._try_codex("diff text")
     assert r is None
 
@@ -70,7 +70,7 @@ def test_codex_missing_skipped():
 def test_codex_success_passed():
     output = _mk_codex_output("All good.\n\nVERDICT: PASS")
     with (
-        patch("genesis.contribution.review.shutil.which", return_value="/fake/codex"),
+        patch("genesis.util.codex_cli.shutil.which", return_value="/fake/codex"),
         patch("genesis.contribution.review.subprocess.Popen", return_value=_popen_mock(output)),
     ):
         r = review._try_codex("diff")
@@ -85,7 +85,7 @@ def test_codex_success_failed():
         "issue: bad import\nconcern: race condition\nVERDICT: FAIL"
     )
     with (
-        patch("genesis.contribution.review.shutil.which", return_value="/fake/codex"),
+        patch("genesis.util.codex_cli.shutil.which", return_value="/fake/codex"),
         patch("genesis.contribution.review.subprocess.Popen", return_value=_popen_mock(output)),
     ):
         r = review._try_codex("diff")
@@ -96,7 +96,7 @@ def test_codex_success_failed():
 
 def test_codex_nonzero_returncode_returns_none():
     with (
-        patch("genesis.contribution.review.shutil.which", return_value="/fake/codex"),
+        patch("genesis.util.codex_cli.shutil.which", return_value="/fake/codex"),
         patch(
             "genesis.contribution.review.subprocess.Popen",
             return_value=_popen_mock("", returncode=1),
@@ -108,7 +108,7 @@ def test_codex_nonzero_returncode_returns_none():
 
 def test_codex_empty_output_returns_none():
     with (
-        patch("genesis.contribution.review.shutil.which", return_value="/fake/codex"),
+        patch("genesis.util.codex_cli.shutil.which", return_value="/fake/codex"),
         patch("genesis.contribution.review.subprocess.Popen", return_value=_popen_mock("")),
     ):
         r = review._try_codex("diff")
@@ -117,7 +117,7 @@ def test_codex_empty_output_returns_none():
 
 def test_codex_spawn_oserror_returns_none():
     with (
-        patch("genesis.contribution.review.shutil.which", return_value="/fake/codex"),
+        patch("genesis.util.codex_cli.shutil.which", return_value="/fake/codex"),
         patch(
             "genesis.contribution.review.subprocess.Popen",
             side_effect=OSError("spawn failed"),
@@ -135,7 +135,7 @@ class TestCodexTimeoutTreeKill:
 
     def _run_timeout(self, proc: MagicMock):
         with (
-            patch("genesis.contribution.review.shutil.which", return_value="/fake/codex"),
+            patch("genesis.util.codex_cli.shutil.which", return_value="/fake/codex"),
             patch("genesis.contribution.review.subprocess.Popen", return_value=proc),
             patch("genesis.util.proc_kill.os.killpg") as killpg,
         ):
@@ -185,7 +185,7 @@ class TestCodexTimeoutTreeKill:
         proc = _popen_mock(pid=54321)
         proc.communicate.side_effect = [KeyboardInterrupt(), ("", "")]
         with (
-            patch("genesis.contribution.review.shutil.which", return_value="/fake/codex"),
+            patch("genesis.util.codex_cli.shutil.which", return_value="/fake/codex"),
             patch("genesis.contribution.review.subprocess.Popen", return_value=proc),
             patch("genesis.util.proc_kill.os.killpg") as killpg,
             pytest.raises(KeyboardInterrupt),
@@ -205,7 +205,7 @@ def test_codex_spawned_in_new_session():
         return _popen_mock(_mk_codex_output("ok\nVERDICT: PASS"))
 
     with (
-        patch("genesis.contribution.review.shutil.which", return_value="/fake/codex"),
+        patch("genesis.util.codex_cli.shutil.which", return_value="/fake/codex"),
         patch("genesis.contribution.review.subprocess.Popen", side_effect=_fake_popen),
     ):
         r = review._try_codex("diff")

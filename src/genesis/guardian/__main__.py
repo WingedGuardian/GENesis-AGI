@@ -5,6 +5,7 @@ Usage:
     python -m genesis.guardian --test        # test alert channels
     python -m genesis.guardian --check-only  # one-shot health check (no recovery)
     python -m genesis.guardian --test-approval  # E2E test the keyword-reply gate
+    python -m genesis.guardian --test-alert     # send one test alert, print one JSON line
     python -m genesis.guardian --disk-status  # print storage-pool JSON (read-only)
     python -m genesis.guardian --ram-status   # print RAM tier JSON (read-only)
     python -m genesis.guardian --sent-log <since>  # delivered alerts since <epoch s> as JSON lines (read-only)
@@ -50,6 +51,9 @@ def main() -> None:
     if "--test-approval" in sys.argv:
         asyncio.run(_test_approval())
         return
+
+    if "--test-alert" in sys.argv:
+        sys.exit(asyncio.run(_test_alert_json()))
 
     if "--disk-status" in sys.argv:
         asyncio.run(_disk_status())
@@ -123,6 +127,47 @@ async def _test_alerts() -> None:
         body="This is a test alert from the Guardian. If you see this, alerts are working.",
     ))
     print("  Test alert sent")
+
+
+async def _test_alert_json() -> int:
+    """Send one test alert and print one JSON line on stdout; return the exit code.
+
+    For the gateway's ``test-alert`` verb, whose caller parses stdout, so the
+    result is the only thing printed there (logs go to stderr). No recovery
+    runs, and a failed send is never queued for later replay. ``"send not
+    confirmed"`` means no channel reported success; it does not prove the
+    message was not delivered. ``ok`` means a channel accepted it, not that it
+    reached the sent log the container ingests (that row is the real check).
+    A config or channel-setup error is reported as a JSON line too.
+    """
+    import json
+
+    from genesis.guardian.alert.base import Alert, AlertSeverity
+    from genesis.guardian.check import _build_dispatcher
+    from genesis.guardian.config import load_config
+
+    try:
+        dispatcher = _build_dispatcher(load_config())
+    except Exception as exc:  # noqa: BLE001 — the verb contract is JSON-always
+        print(json.dumps({"ok": False, "action": "test-alert", "sent": False, "error": repr(exc)[:300]}))
+        return 1
+    error = None
+    sent = False
+    if not dispatcher.has_channels:
+        error = "no alert channel configured"
+    else:
+        sent = await dispatcher.send(
+            Alert(
+                severity=AlertSeverity.INFO,
+                title="Guardian test alert",
+                body="This is a test alert from the Guardian. If you see this, alerts are working.",
+            ),
+            allow_queue_fallback=False,
+        )
+        if not sent:
+            error = "send not confirmed"
+    print(json.dumps({"ok": sent, "action": "test-alert", "sent": sent, "error": error}))
+    return 0 if sent else 1
 
 
 async def _test_approval() -> None:

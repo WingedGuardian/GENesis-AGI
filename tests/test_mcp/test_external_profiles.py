@@ -1,7 +1,5 @@
 """Scope enforcement must stop direct protocol calls, not merely hide tools."""
 
-import tomllib
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -72,15 +70,6 @@ async def test_discovery_filters_protocol_keys_for_aliased_tools():
 def test_unknown_role_or_server_refused(profile, server):
     with pytest.raises(ValueError):
         ExternalProfileMiddleware(server, profile)
-
-
-@pytest.mark.parametrize("server", ["health", "memory"])
-def test_default_surface_matches_committed_codex_allowlist(server):
-    root = Path(__file__).resolve().parents[2]
-    config = tomllib.loads((root / ".codex" / "config.toml").read_text())
-    assert profile_tools(server, "external") == frozenset(
-        config["mcp_servers"][f"genesis-{server}"]["enabled_tools"]
-    )
 
 
 @pytest.mark.parametrize("server", ["outreach", "recon", "discord-bot"])

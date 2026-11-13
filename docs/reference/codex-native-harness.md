@@ -1,5 +1,84 @@
 # Native Codex hook harness
 
+## Contained compatibility qualification
+
+The `Native Codex compatibility qualification` workflow builds the exact PR head
+with its recorded base and the reference0.166.0 Linux x64 package. The package is
+SHA-512 checked before extraction; the executable and bundled code-mode host
+retain their package layout and have separate SHA-256 records. No installed
+native binary on the developer's host is required or launched by this workflow.
+
+Execution is inside a read-only, unprivileged container with no network, host
+bind mounts, credentials or capabilities. A unique owned Docker volume retains
+test evidence after exit; it is copied out before the container and volume are
+removed, then transported as `codex-evidence.tar.gz` to preserve hidden files and
+symbolic-link shape. Build logs remain available even when image collection
+fails. Model responses come from loopback fixtures, not a paid provider. The
+fixed CI resource limits and25-minute job ceiling bound this deterministic
+Linux qualification; they are not production agent timeouts or install defaults.
+
+The suite reuses both native hook clients and the existing adapter controls,
+then adds app-server command approval accept/decline, interruption, late replies,
+disconnect, steering with a turn-ID precondition, persistent resume, required MCP
+failure, dispatched-marker forwarding and ready-descendant cleanup. Fixture
+approvals are synthetic. A real secrets guard runs only against a scratch file
+containing synthetic text: its raw `ask` output and the existing adapter's deny
+interpretation are measured separately. This does not install a full Genesis
+Codex policy or establish an in-session canonical owner approval path.
+The six approval fixtures use `read-only` with `on-request` and explicit
+escalation, and verify the policy returned by `thread/start`. Full-access
+commands in the initial fixture ran immediately without approval, so that
+configuration cannot establish approval handling. Early approval requests are
+retained while awaiting the turn response; unexpected requests still fail by
+default in the shared driver.
+Resume uses an append-only action witness, checks its exact bytes before resume,
+and checks bytes and provider-request count after shutdown.
+
+The image installs test tools under `.github/test-tools/requirements.txt`, the
+same constraints CI uses; changes to those pins trigger fresh qualification.
+Changes to the main CI workflow, this reference or the owned-process cleanup helper
+also trigger qualification. Ordinary CI skips
+the fifteen contained-only compatibility cases; its skip ceiling includes those
+measured identities. The contained workflow requires every native case to run.
+It first runs the pure driver tests to exercise shared fixture setup and its
+Python dependencies without starting a native executable.
+Before execution, collection freezes the case census, source inventory (including
+the CI configuration and test-tool pins) and
+binary hashes into the image. Every executed case must have passed setup, call
+and teardown phases and a unique raw receipt. Independent readback after copying
+the artifacts verifies the head/base, source snapshot, manifest binding, full
+census, phase outcomes, artifact hashes and new sink witnesses. Missing,
+skipped, partial, failed or altered evidence refuses a completion verdict.
+This qualification requires both clients to select the same package executable
+named `codex`; different or renamed overrides are refused. Inherited receipts
+must match their declared action/decision or adapter case/instrument and actual
+sink bytes. Direct MCP calls unsupported by the native tool metadata remain
+transport controls with no sink. Safe canonical guard cases require silence.
+An expected incompatibility can be a completed measurement: native command
+approval is distinct from canonical guard approval, and `production_ready`
+always remains false. Read the copied `readback.json`, raw receipts and workflow
+conclusion together; fixture results do not establish native subscription login,
+live quality, production operation, arbitrary descendant containment or support
+for a different native version. Native outer-hook fail-open behavior remains the
+documented limitation described below.
+
+The local driver, collection-binding and readback unit files run without native
+execution. Native runs use the contained workflow; the older opt-in invocation
+below describes the inherited harness mechanics, not authorization to run it on
+a live install.
+
+The shared app-server driver retains an independent copy of each parsed
+`turn/completed` notification with its monotonic receipt time before enqueueing
+the message for consumers. Its raw queue and event interfaces stay unchanged;
+receipt time measures local observation, not backend emission. The loopback
+provider accepts an optional `action_plan` keyed by one-based request index.
+Appending the request and selecting its action share one lock. Omitting the
+plan preserves one action followed by final responses; an explicit empty plan
+emits only final responses, and an empty action dictionary remains an action.
+Pure driver tests cover these contracts without launching a native executable.
+
+## Inherited opt-in harness
+
 Run the opt-in integration file on a Unix host with Codex and the Genesis Python dependencies installed:
 
 ```bash

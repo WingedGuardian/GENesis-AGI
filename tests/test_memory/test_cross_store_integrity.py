@@ -6,7 +6,7 @@ cascades and COUNT queries run against actual tables.
 
 from __future__ import annotations
 
-import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -121,26 +121,22 @@ class TestFtsMetadataDrift:
 
 
 class TestHotPathOffloadedToThread:
-    """D6(b): the hot-path sync Qdrant calls run via asyncio.to_thread so a
-    slow round-trip doesn't stall the event loop."""
+    """D6(b): synchronous Qdrant calls leave the event-loop thread."""
 
     @pytest.mark.asyncio
     async def test_delete_offloads_qdrant_delete(self, db):
+        loop_thread = threading.get_ident()
         seen = []
-        orig = asyncio.to_thread
 
-        async def spy(func, *args, **kwargs):
-            seen.append(func)
-            return await orig(func, *args, **kwargs)
+        def delete(*args, **kwargs):
+            seen.append((kwargs["collection"], threading.get_ident()))
 
-        with (
-            patch.object(store_mod, "delete_point") as mock_del,
-            patch.object(store_mod.asyncio, "to_thread", spy),
-        ):
-            await _store(db).delete("mem-none")
+        with patch.object(store_mod, "delete_point", side_effect=delete):
+            result = await _store(db).delete("mem-none")
 
-        # delete_point dispatched through to_thread (both collections)
-        assert mock_del in seen
+        assert result["qdrant_deleted"] == 2
+        assert [collection for collection, _thread in seen] == ["episodic_memory", "knowledge_base"]
+        assert all(thread != loop_thread for _collection, thread in seen)
 
 
 class TestDeleteFailClosedOrdering:

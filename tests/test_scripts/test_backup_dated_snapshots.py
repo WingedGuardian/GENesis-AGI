@@ -230,6 +230,62 @@ def test_local_backend_writes_dated_snapshot_to_real_fs(backup_env, tmp_path):
     assert status["offsite_confirmed"] is True, status
 
 
+def test_a_live_transcript_backs_up_and_stale_partials_are_swept(backup_env, tmp_path):
+    """#4391: encrypt_file writes a `.genesis-partial.<pid>.XXXXXX` partial beside
+    its target and renames it on success. A run killed mid-encrypt leaves that
+    partial behind: a later run sweeps it once its pid is gone, however young,
+    keeps one whose pid is alive (a run under another GENESIS_HOME can share the
+    repo), and git never commits one. A directory with a partial-like name, and a
+    real file whose name merely contains `.partial.`, are neither swept nor
+    ignored."""
+    home = backup_env["home"]
+    repo = home / "backups" / "genesis-backups"
+    cc_dir = home / ".claude" / "projects" / str(backup_env["gd"]).replace("/", "-")
+    (cc_dir / "session-a.jsonl").write_text('{"type":"user"}\n')
+    (repo / "secrets").mkdir(exist_ok=True)
+    (repo / "data").mkdir(exist_ok=True)
+    dead = 4194301  # above any pid this test can observe alive (checked below)
+    assert not Path(f"/proc/{dead}").exists(), "fixture: the 'dead' pid is alive"
+    leftovers = [
+        repo / "secrets" / f".genesis-partial.{dead}.Ab12Cd",  # written a moment ago
+        repo / "data" / f".genesis.sql.gpg.partial.{dead}",  # the SQL dump's
+    ]
+    for leftover in leftovers:
+        leftover.write_text("half-written")
+    live = repo / "secrets" / f".genesis-partial.{os.getpid()}.Zz99Yy"
+    live.write_text("another live run's partial")
+    real = repo / "secrets" / ".notes.partial.2024.md.gpg"
+    real.write_text("a real encrypted copy")
+    # An encrypted copy of a source named like a partial: never swept or ignored.
+    real_ns = repo / "secrets" / f".genesis-partial.{dead}.x.gpg"
+    real_ns.write_text("a real encrypted copy")
+    named_dir = repo / "secrets" / ".genesis-partial.archive"
+    named_dir.mkdir()
+    (named_dir / "kept.gpg").write_text("inside a partial-like directory")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert (repo / "transcripts" / "session-a.jsonl.gpg").is_file()
+    assert "failed to encrypt" not in proc.stdout
+    for leftover in leftovers:
+        assert not leftover.exists(), f"{leftover.name} from a killed run was not swept"
+    assert real.exists(), "a real file whose name contains .partial. was swept"
+    assert live.exists(), "a live run's partial was swept"
+    assert (named_dir / "kept.gpg").exists()
+    lines = (repo / ".gitignore").read_text().splitlines()
+    assert ".genesis-partial.*" in lines and "!.genesis-partial.*/" in lines
+    tracked = subprocess.run(
+        ["git", "-C", str(repo), "ls-files"], capture_output=True, text=True, check=True
+    ).stdout.splitlines()
+    assert "secrets/.notes.partial.2024.md.gpg" in tracked
+    assert "secrets/.genesis-partial.archive/kept.gpg" in tracked
+    assert real_ns.exists() and f"secrets/{real_ns.name}" in tracked
+    assert "!.genesis-partial.*.gpg" in lines
+    assert not [t for t in tracked if "/.genesis-partial." in t and t.count("/") == 1 and not t.endswith(".gpg")], tracked
+
+
 def test_local_backend_snapshot_includes_memory_config_secrets(backup_env, tmp_path):
     """A2a: the off-site snapshot must ALSO contain memory/, config_overrides/, and
     secrets/ (previously git-Tier-1 only), so the destination is a COMPLETE copy and a
@@ -1078,6 +1134,106 @@ def test_a_directory_restore_would_refuse_members_of_is_kept_as_partial(backup_e
     marker = (snap / "COMPLETE").read_text().splitlines()
     assert "partial work/a" in marker, marker
     assert len(list((snap / "extra").glob("work_a-*.tar.gpg"))) == 1
+    # #4304: the status file names the partial dir and why, and the WARNING stays prose.
+    expected_class = "AbsoluteLinkError" if kind == "link-out" else "SpecialFileError"
+    assert status["extra_dirs_partial_detail"] == [
+        {"dir": "work/a", "refused": 1, "classes": {expected_class: 1}}
+    ], status
+    assert "REFUSED-SUMMARY" not in proc.stdout
+
+
+def test_partial_detail_stays_valid_json_for_any_directory_name(backup_env, tmp_path):
+    """#4304: the detail is built by json.dumps, never spliced into the heredoc, so a
+    directory name with a quote, a backslash or a dollar sign keeps the file parseable."""
+    home = backup_env["home"]
+    name = 'we"ird\\dir$HOME'
+    d = home / "work" / name
+    d.mkdir(parents=True)
+    (d / "f").write_text("x")
+    (d / "out").symlink_to("/etc/hostname")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": f"~/work/{name}"})
+    assert proc.returncode == 0, proc.stdout[-1500:]
+    status = _status(backup_env)  # json.loads raises if the file is broken
+    assert status["extra_dirs_partial"] == 1, status
+    detail = status["extra_dirs_partial_detail"]
+    assert len(detail) == 1 and detail[0]["refused"] == 1, detail
+    assert "we" in detail[0]["dir"] and "dir" in detail[0]["dir"], detail
+
+
+def test_any_python_virtualenv_under_an_extra_dir_is_excluded(backup_env, tmp_path):
+    """#4304: a virtualenv is found by its pyvenv.cfg, whatever it is named, and only
+    the absolute links in its bin/ are excluded: a restore would refuse them and
+    report the whole directory partial. Everything else is kept, including relative
+    links and a project's own files in an in-place venv, even ones named python-*.
+    Names with tar wildcard characters mean themselves, a venv inside an excluded
+    cache is left alone, and an extra dir that is itself a virtualenv keeps its
+    links."""
+    home = backup_env["home"]
+    v = home / "work" / "v"
+    (v / "proj" / "bin").mkdir(parents=True)  # `python -m venv .` in a project
+    (v / "proj" / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    (v / "proj" / "bin" / "python").symlink_to("/usr/bin/python3")
+    (v / "proj" / "main.py").write_text("print('mine')\n")
+    (v / "proj" / "notes").mkdir()
+    (v / "proj" / "notes" / "todo.md").write_text("mine\n")
+    (v / "proj" / "bin" / "deploy.sh").write_text("#!/bin/sh\n")  # the project's own
+    (v / "proj" / "bin" / "python-report").write_text("#!/bin/sh\n")  # named like python*
+    (v / "proj" / "bin" / "python-tools").mkdir()
+    (v / "proj" / "bin" / "python-tools" / "data.txt").write_text("kept\n")
+    (v / "proj" / "bin" / "python3.12").symlink_to("python")  # relative: restorable
+    (v / "proj" / "lib").mkdir()
+    (v / "proj" / "lib" / "mymod.py").write_text("x = 1\n")
+    (v / "odd[1]-venv" / "bin").mkdir(parents=True)
+    (v / "odd[1]-venv" / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    (v / "odd[1]-venv" / "bin" / "python3").symlink_to("/usr/bin/python3")
+    (v / "odd1-venv").mkdir()  # matches the class [1] would, but is no venv: kept
+    (v / "odd1-venv" / "keep.txt").write_text("keep\n")
+    (v / "deep" / "tool-env" / "bin").mkdir(parents=True)
+    (v / "deep" / "tool-env" / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    (v / "deep" / "tool-env" / "bin" / "python").symlink_to("/usr/bin/python3")
+    (v / "f.txt").write_text("x")
+    (v / ".venv").mkdir()  # already dropped by the default excludes: never logged
+    (v / ".venv" / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    root_venv = home / "work" / "rootvenv"
+    (root_venv / "lib").mkdir(parents=True)
+    (root_venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    (root_venv / "lib" / "m.py").write_text("x = 1\n")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(
+        backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/v:~/work/rootvenv"}
+    )
+    assert proc.returncode == 0, proc.stdout[-1500:]
+    status = _status(backup_env)
+    assert status["extra_dirs_partial"] == 0 and status["extras_complete"] is True, status
+    extra = _repo(backup_env) / "extra"
+    (v_archive,) = list(extra.glob("work_v-*.tar.gpg"))
+    members = _list_extra_archive(v_archive, home)
+    assert "work/v/f.txt" in members and "work/v/odd1-venv/keep.txt" in members, members
+    for kept in (
+        "main.py",
+        "notes/todo.md",
+        "bin/deploy.sh",
+        "bin/python-report",
+        "bin/python-tools/data.txt",
+        "bin/python3.12",
+        "lib/mymod.py",
+        "pyvenv.cfg",
+    ):
+        assert f"work/v/proj/{kept}" in members, (kept, members)
+    for link in (
+        "work/v/odd[1]-venv/bin/python3",
+        "work/v/deep/tool-env/bin/python",
+        "work/v/proj/bin/python",
+    ):
+        assert link not in members, members
+    (root_archive,) = list(extra.glob("work_rootvenv-*.tar.gpg"))
+    assert "work/rootvenv/pyvenv.cfg" in _list_extra_archive(root_archive, home)
+    excluded = "absolute link from ~/work/v: ~/work/v/odd[1]-venv/bin/python3"
+    assert excluded in proc.stdout
+    assert "~/work/v/.venv" not in proc.stdout, "a venv inside a default exclude was logged"
 
 
 def test_extra_restore_diagnostics_preserve_all_long_member_names(backup_env, tmp_path):

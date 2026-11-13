@@ -7,7 +7,9 @@ name: merge-gate-publish
 # cannot write the verdict onto the PR head. When that happens, the
 # untrusted run uploads a `merge-gate-verdict` artifact containing ONLY
 # the PR number and exits. This workflow fires on every merge-gate
-# completion with the default-branch token, checks for the artifact,
+# completion with the default-branch token; its job runs only for the
+# completions that could carry a handoff (see the job's `if:`), checks for
+# the artifact,
 # RE-EVALUATES the gate itself, and publishes the check run on the head
 # SHA. The artifact is only a pointer — an untrusted run can ask for an
 # evaluation but cannot influence the verdict or the target SHA, both of
@@ -30,17 +32,41 @@ permissions:
   statuses: read
   actions: read # read the triggering run's artifacts
 
-# Prefer serializing per PR (when the triggering run's payload carries one);
-# fall back to per triggering run otherwise. cancel-in-progress is safe either
-# way: the supersede check in the publish step is the real ordering guard — it
-# refuses to write when a NEWER merge-gate run already owns the PR, so a
-# superseded publisher can never restore a stale verdict.
-concurrency:
-  group: merge-gate-publish-${{ github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.id }}
-  cancel-in-progress: true
-
 jobs:
   publish:
+    # Start a runner only for a merge-gate run that could have left a handoff
+    # (#4261: this job used to start on EVERY merge-gate completion, most of
+    # them cancelled or comment-triggered, only to find no artifact and exit).
+    # A handoff is uploaded only by these three events, and only on a fork or
+    # Dependabot PR: see the "Publish" step's `case` in merge-gate.yml. A new
+    # handoff event added there must be added here too, or its verdicts are
+    # silently never published. `failure` and `timed_out` still run: a run can
+    # fail after its upload. A `cancelled` run can also hold an artifact (the
+    # upload is followed by post steps). Concurrency cancels it only for a NEWER
+    # run in the same PR's merge-gate group, which hands off or publishes
+    # itself; a run cancelled by hand after its upload is not published.
+    if: >-
+      github.event.workflow_run.conclusion != 'cancelled' &&
+      github.event.workflow_run.conclusion != 'skipped' &&
+      contains(fromJSON('["pull_request","pull_request_review","pull_request_review_comment"]'),
+               github.event.workflow_run.event)
+    # Concurrency is job-level, so that a run whose job is skipped above does
+    # not take part in it (inferred: GitHub's concurrency docs do not say how a
+    # skipped job is treated). The key is unchanged from before #4261: the PR
+    # number when the payload carries one, else the triggering run id, so fork
+    # publishers (whose `pull_requests` is empty) never cancel each other.
+    # No payload field identifies a fork PR safely. `head_repository` is the
+    # BASE repo on a fork PR's review runs (measured on fork PR #4228), and
+    # `head_sha` can be shared by two PRs, so keying on it would let one PR's
+    # run cancel another PR's publisher. Only the artifact names the PR, and it
+    # is read mid-job.
+    #
+    # There is NO supersede check in the publish step (#3820): it posts the
+    # verdict it evaluated, so two publishers for one fork PR can still post
+    # out of order. That race is unchanged by #4261.
+    concurrency:
+      group: merge-gate-publish-${{ github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.id }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

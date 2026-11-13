@@ -578,8 +578,10 @@ jobs:
     # sibling jobs and queue time: min 19m38s, p50 29m22s, max 31m15s.
     # The ceiling must exceed the worst LEGITIMATE case — that max plus one
     # full per-test kill (pyproject `timeout = 600`) = ~41 min — or this job
-    # would pre-empt the per-test timeout and make it dead code. 180 leaves
-    # ~139 min of growth headroom and still halves the default.
+    # would pre-empt the per-test timeout and make it dead code. 180 still
+    # halves the default. The serial job grew to 82-146 min by 2026-11-05;
+    # since then the suite runs on four workers (see the pytest step), and the
+    # measured step took 31-48 min, so this limit has room again.
     # Revisit as the suite grows — the --durations output below is the data.
     timeout-minutes: 180
     # fetch-depth: 0 because measurement tests derive a rate from this
@@ -640,7 +642,18 @@ jobs:
           # settles it in the log instead of leaving the next reader to
           # re-derive it.
           echo "TERM=[${TERM-UNSET}]"
+          # Four workers, one per runner CPU (GitHub's public-repo standard
+          # runner: 4 CPU, 16 GB). MEASURED 2026-11-05 over 6 dispatch-only runs
+          # of this exact command: `Run tests` median 33.35 min against 117.0
+          # serial, the same 62,766 test ids, peak memory 7.8 GB.
+          # --dist=loadfile keeps each file's tests together and in order on
+          # one worker. --max-worker-restart=0: a crashed worker stops the run
+          # rather than being replaced over and over (a hang under the thread
+          # timeout kills its worker); scripts/ci/failure_summary.py names the
+          # crash and says the undispatched tests never ran. The `=` forms are
+          # what full_suite_guard.py reads.
           pytest -rfE --durations=25 \
+            -n 4 --dist=loadfile --max-worker-restart=0 \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
             --ignore=tests/test_ui/ \
@@ -765,7 +778,18 @@ jobs:
         # mocked-turn opt-in cases, measured on the PR's runner, 552 -> 563.
         # Launcher discovery: two opt-in native cases; Git destinations: eighteen.
         # Inherit the current runner ceiling and add exactly twenty identities.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 583
+        # Compatibility qualification (#4126): fifteen contained-only cases,
+        # measured in run42514975072's JUnit; all fifteen pass in native CI.
+        # Native peer containment (#3575): five real-CLI cases that skip on a
+        # runner with no Claude binary (test_peer_native x4, test_contained_native
+        # x1), measured in run 42667838123 at 603 skipped, 598 -> 603.
+        # Main measured 602 at run 43169373201's base (the old ceiling had one
+        # point of slack). Two by-design identities since, measured in main run
+        # 43298721491 (8108fc9a1) at 604: test_shared_http_admission, skipped at
+        # collection on an unqualified stack (#4058/#4095), and
+        # test_live_closure::test_the_box_lock_and_basetemp_keep_their_real_home_locations,
+        # "no lock expected here (no install)" (#3719). 602 + 2 = 604.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 604
 
   test-ubuntu-2404:
     # ubuntu-latest is moving to 26.04, so `test` alone stops showing a break on

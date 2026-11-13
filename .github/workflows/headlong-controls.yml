@@ -156,6 +156,14 @@ jobs:
           expected = {'effect', 'noop', 'refusal', 'provider_error', 'handler_error', 'large_context', 'reactive_noop', 'restart_duplicate', 'reference_continuity', 'observation_failure', 'final_failure', 'reference_conflict', 'reactive_reference_conflict'}
           assert report['schema'] == 'headlong-native-monolith/v1' and report['status'] == 'pass'
           assert report['cleanup_confirmed'] is True and report['sources_unchanged'] is True
+          cleanup = report['cleanup']
+          assert cleanup['survivors'] == []
+          assert set(cleanup['before']) == set(cleanup['after']) == {'1', str(cleanup['init']['controller'])}
+          assert all(cleanup['before'][pid][field] == cleanup['after'][pid][field]
+                     for pid in cleanup['before'] for field in ('pid', 'ppid', 'pgid', 'sid', 'start'))
+          logs = [report['version_commands'], report['correlations']['commands'], *[case['commands'] for case in report['cases']]]
+          assert all(log and all(type(c['pgid']) is int and c['pgid'] > 1 and c['group_closed'] is True
+                                and c['probe_error'] is None and c['timed_out'] is False for c in log) for log in logs)
           assert len(report['cases']) == 13 and {case['scenario'] for case in report['cases']} == expected
           manifest = report['comparison_manifest']
           assert manifest['schema'] == 'ego-runtime-mechanics/v1'

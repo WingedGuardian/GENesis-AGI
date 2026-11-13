@@ -1,0 +1,1 @@
+- Warn before editing a worktree claimed by another live Claude Code session, and claim unowned worktrees after a successful file edit. Claims preserve existing locks and the feature remains advisory, with the existing settings and environment switches.

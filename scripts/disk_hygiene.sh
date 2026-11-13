@@ -21,6 +21,8 @@
 #      (WS-5 Discord observe-only gate log; bounds the shadow store)
 #   8. Retention prune of session_ledger_shadow_* (>45d) → scripts/prune_ledger_shadow.py
 #      (session-manager PR-3 ambient extractor shadow store; runs + events)
+#   8a. Retention prune of client_tool_calls (default 180d) → scripts/prune_client_tool_calls.py
+#      (labelled-client tool-call log, e.g. owner-mode Codex)
 #   8b. Retention prune of ~/.genesis/sessions/<id>/ (>60d, whole dirs)
 #      (per-session state + SessionStart context mirrors; age far exceeds any
 #      live session, which rewrites last_prompt_time every prompt)
@@ -92,6 +94,8 @@ fi
 
 # shellcheck source=scripts/lib/tmp_liveness.sh
 . "$SCRIPT_DIR/lib/tmp_liveness.sh"
+# shellcheck source=lib/secrets_path.sh
+. "$SCRIPT_DIR/lib/secrets_path.sh"
 
 # prune_tmp DIR [AGE_MIN] — delete direct children of DIR not modified for more
 # than AGE_MIN minutes (default: the historical `-mtime +7`), EXCLUDING
@@ -102,8 +106,8 @@ fi
 #
 # A child some process still holds OPEN is spared whatever its age. Age alone
 # cannot see a download or unpack that started days ago and is still running,
-# and the pressure mode below prunes at 2 days, where that stops being
-# hypothetical. The liveness signal and its limits (same-uid only, and a writer
+# and the pressure mode below prunes at 4 days (2 at RED), where that stops
+# being hypothetical. The liveness signal and its limits (same-uid only, and a writer
 # that closes between files is invisible) are documented in tmp_liveness.sh.
 prune_tmp() {
     local tmp_dir="${1:-$HOME/tmp}" age_min="${2:-}"
@@ -151,7 +155,15 @@ prune_tmp() {
         fi
         # The ONLY way a tree is removed: remove_tree_one_fs re-checks the
         # table this pass read at its start (not a fresh read).
-        remove_tree_one_fs "$child" "$mounts" 1 || echo "tmp prune failed or spared $child"
+        # Name every removal with its size: an unlogged removal leaves no
+        # answer when someone's work goes missing later.
+        local mb
+        mb="$(du -smx -- "$child" 2>/dev/null | cut -f1)"
+        if remove_tree_one_fs "$child" "$mounts" 1; then
+            echo "tmp prune: removed $child (${mb:-?} MB)"
+        else
+            echo "tmp prune failed or spared $child"
+        fi
     done < <(find "$tmp_dir" -mindepth 1 -maxdepth 1 \
                 ! -name bg-cc-sessions "${age_pred[@]}" -print0 2>/dev/null)
 }
@@ -214,8 +226,11 @@ reclaim_unlock() { { exec 8>&-; } 2>/dev/null || true; }
 # pressure_main [--last-resort] — the reclaim subset the tmp watchgod runs when
 # the disk itself is in trouble (its ORANGE tier; RED adds --last-resort). Only
 # the steps that FREE space, and each one more aggressive than the daily run:
-# caches regardless of the usage gate, ~/tmp at 2 days instead of 7, and at RED
-# the code-intel indexes too. Deliberately NOT the worktree reaper (it moves
+# caches regardless of the usage gate, ~/tmp at 4 days instead of 7 (2 at RED),
+# and at RED the code-intel indexes too. ORANGE can start on a disk that still
+# has room (a write burst lifts a YELLOW floor one level), so it leaves recent
+# ~/tmp work alone; RED needs at least an ORANGE floor (under 8 % free), where
+# space comes first. Deliberately NOT the worktree reaper (it moves
 # worktrees to a trash bin, which frees nothing until the purge) nor any of the
 # database retention prunes (they free megabytes and take the DB lock).
 #
@@ -224,22 +239,23 @@ reclaim_unlock() { { exec 8>&-; } 2>/dev/null || true; }
 # from overlapping the other instance or the daily run. The watchgod never
 # deletes anything itself.
 pressure_main() {
-    local last_resort="${1:-}"
+    local last_resort="${1:-}" lr=0
+    # "last-resort" is the systemd instance name (%i); "--last-resort" the CLI form.
+    case "$last_resort" in --last-resort | last-resort) lr=1 ;; esac
     # The standard (ORANGE) pass pins --last-resort-above past 100 %. That is
     # disk_reclaim.py's own default now (#2567), but it stays explicit: an
     # ORANGE pass that inherited the old 95 % default deleted the code-intel
     # indexes before RED ever fired (review finding, #2521 item 1). Only the
     # last-resort (RED) pass clears them.
     local -a reclaim=(--apply --if-above 0 --fail-above 101 --last-resort-above 101)
-    # "last-resort" is the systemd instance name (%i); "--last-resort" the CLI form.
-    if [ "$last_resort" = "--last-resort" ] || [ "$last_resort" = "last-resort" ]; then
+    if (( lr )); then
         reclaim=(--apply --if-above 0 --fail-above 101 --last-resort-above 0)
     fi
     echo "=== genesis-disk-hygiene PRESSURE ${last_resort:-} $(date -u +%FT%TZ) ==="
     # Standard waits up to one watchgod re-trigger interval and then yields —
     # the reclaim already running is doing this work. Last-resort (RED) waits
     # briefly and then runs regardless: at RED, freeing space beats ordering.
-    if [ "$last_resort" = "--last-resort" ] || [ "$last_resort" = "last-resort" ]; then
+    if (( lr )); then
         reclaim_lock "${RECLAIM_WAIT_S:-120}" \
             || echo "reclaim lock still held after ${RECLAIM_WAIT_S:-120}s — last-resort runs unserialized"
     elif ! reclaim_lock "${RECLAIM_WAIT_S:-600}"; then
@@ -252,8 +268,12 @@ pressure_main() {
         || echo "disk_reclaim exited $?"
     echo "--- background CC sandbox reaping ---"
     reap_bg_sandboxes "$HOME/tmp/bg-cc-sessions"
-    echo "--- ~/tmp age prune (>2d, live writers spared) ---"
-    prune_tmp "$HOME/tmp" 2880
+    local tmp_age_min=5760 tmp_age=4d
+    if (( lr )); then
+        tmp_age_min=2880 tmp_age=2d
+    fi
+    echo "--- ~/tmp age prune (>${tmp_age}, live writers spared) ---"
+    prune_tmp "$HOME/tmp" "$tmp_age_min"
     reclaim_unlock
     echo "=== genesis-disk-hygiene PRESSURE done ==="
 }
@@ -305,12 +325,15 @@ prune_guard_corpus() {
 }
 
 prune_backup_runs() {
-    # prune_backup_runs <dir> <label> <days>: remove the per-run directories under
-    # a Genesis-owned backup dir once older than <days> (each is written once, so
-    # its mtime is its age), through remove_tree_one_fs, which spares a tree that
-    # is or holds a mount. A <dir> that is a symlink is refused: it points at a
-    # directory Genesis does not own, and every old directory there would go.
-    local dir="$1" label="$2" days="$3" root mounts run
+    # prune_backup_runs <dir> <label> <days> [<keep>]: remove the per-run
+    # directories under a Genesis-owned backup dir once older than <days> (each
+    # is written once, so its mtime is its age), through remove_tree_one_fs,
+    # which spares a tree that is or holds a mount. A <dir> that is a symlink is
+    # refused: it points at a directory Genesis does not own, and every old
+    # directory there would go. <keep>, when given, is a function asked about
+    # each old directory: exit 0 keeps it (its output says why), anything else
+    # lets it go.
+    local dir="$1" label="$2" days="$3" keep="${4:-}" root mounts run why
     if [ -L "$dir" ]; then
         echo "$label prune SKIPPED: $dir is a symlink; pruning would delete at its target"
         return 0
@@ -321,8 +344,32 @@ prune_backup_runs() {
         return 0
     fi
     while IFS= read -r -d '' run; do
+        if [ -n "$keep" ] && why="$("$keep" "$run")"; then
+            echo "$label prune: keeping $run ($why)"
+            continue
+        fi
         remove_tree_one_fs "$run" "$mounts" 1 || echo "$label prune failed or spared $run"
     done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -mtime +"$days" -print0 2>/dev/null)
+}
+
+keep_repair_report() {
+    # keep_repair_report <dir>: exit 0 (and say why) while <dir> is a live-move
+    # repair report folder holding saved edits nobody restored or dismissed
+    # (#4331): the folder is the only copy of them, and pruning it would also
+    # drop deploy health's alert about them. The rule lives in
+    # lib/repair_report_keep.py, which also keeps the restore run folder a kept
+    # report's in-flight record names; exit 3 there lets the prune take the
+    # folder. Any other outcome (no python3, a crash, which exits 1) keeps it:
+    # a saved edit is never lost because its report could not be judged.
+    local why rc
+    why="$(python3 -I -S "$SCRIPT_DIR/lib/repair_report_keep.py" "$1" 2>&1)"
+    rc=$?
+    case "$rc" in
+        0) echo "$why" ;;
+        3) return 1 ;;
+        *) echo "its report could not be judged (exit $rc)" ;;
+    esac
+    return 0
 }
 
 prune_browser_backups() {
@@ -591,7 +638,11 @@ rotate_mcp_logs() {
 # one place on the box that holds every credential.
 _load_store_knob() {
     local key="$1"
-    local file="${2:-$REPO_DIR/secrets.env}"
+    # The caller passes the resolver's file (genesis_secrets_path): the hook-audit
+    # stores' writers read their directories from the environment the server
+    # loads, and the server loads that file. With no file argument, nothing loads.
+    local file="${2:-}"
+    [ -n "$file" ] || return 0
     local line=""
     local val
     [ -f "$file" ] || return 0
@@ -609,13 +660,16 @@ _load_store_knob() {
 
 # The Camoufox cache the browser tools use can come from secrets.env, which this
 # unit does not load: the provisioner installs where XDG_CACHE_HOME there points.
-# It is read by name from the file the runtime reads (genesis.env.secrets_path:
-# SECRETS_PATH with a leading ~ expanded, else the checkout's), in a subshell so it
-# reaches no later step. The engine override the decider reads itself.
+# It is read by name from the file the runtime reads (genesis_secrets_path, the
+# twin of genesis.env.secrets_path), in a subshell so it reaches no later step.
+# The engine override the decider reads itself.
 prune_camoufox_engines_step() {
     (
-        secrets="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
-        _load_store_knob XDG_CACHE_HOME "${secrets/#\~/$HOME}"
+        # An unresolvable override loads nothing: never the checkout's file instead.
+        local _secrets
+        if _secrets="$(genesis_secrets_path "$REPO_DIR")"; then
+            _load_store_knob XDG_CACHE_HOME "$_secrets"
+        fi
         prune_browser_engines "${XDG_CACHE_HOME:-$HOME/.cache}/camoufox"
     )
 }
@@ -804,6 +858,10 @@ maintenance_main() {
     "$VENV_PY" "$REPO_DIR/scripts/prune_ledger_shadow.py" --days 45 \
         || echo "prune_ledger_shadow exited $?"
 
+    echo "--- client tool-call log retention prune (default window) ---"
+    "$VENV_PY" "$REPO_DIR/scripts/prune_client_tool_calls.py" \
+        || echo "prune_client_tool_calls exited $?"
+
     echo "--- repo pulse retention prune (>45d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_repo_pulse.py" --days 45 \
         || echo "prune_repo_pulse exited $?"
@@ -904,16 +962,22 @@ maintenance_main() {
     # directory's mtime is its age.
     prune_backup_runs "$HOME/.genesis/premerge-backups" premerge-backups 45
 
-    echo "--- replaced systemd unit backup retention prune (>90d) ---"
+    echo "--- deploy backup retention prune (>90d, unresolved repair reports kept) ---"
     # update.sh --take-template / bootstrap's GENESIS_TAKE_TEMPLATES save a hand-edited
     # unit here, one directory per run, before installing its template
     # (lib/managed_units.sh). Written once, so a directory's mtime is its age.
-    prune_backup_runs "$HOME/.genesis/deploy-backups" deploy-backups 90
+    # The live-move repair writes its report folders here too
+    # (<ts>-live-move-repair), and the restore its run folders: a report is kept
+    # while it is unresolved (keep_repair_report), however old.
+    prune_backup_runs "$HOME/.genesis/deploy-backups" deploy-backups 90 keep_repair_report
 
     echo "--- hook audit store size trim (>5MB per store, newest kept) ---"
-    # The two store knobs, read BY NAME out of secrets.env (`_load_store_knob`).
-    _load_store_knob GENESIS_MERGE_OVERRIDE_DIR
-    _load_store_knob GENESIS_DISCARD_SNAPSHOT_DIR
+    # The two store knobs, read BY NAME out of secrets.env (`_load_store_knob`),
+    # from the file the runtime reads. An unresolvable override loads nothing.
+    local _knob_secrets=""
+    _knob_secrets="$(genesis_secrets_path "$REPO_DIR")" || _knob_secrets=""
+    _load_store_knob GENESIS_MERGE_OVERRIDE_DIR "$_knob_secrets"
+    _load_store_knob GENESIS_DISCARD_SNAPSHOT_DIR "$_knob_secrets"
     # One file per hook flush, so the oldest whole files are deleted past the byte
     # bound. This is the shape the ghost-export note above explains an age prune
     # cannot handle for an append-forever file. Retention lives here, never on the
