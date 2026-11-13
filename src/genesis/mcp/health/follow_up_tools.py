@@ -537,6 +537,7 @@ async def _impl_follow_up_update(
                 follow_up_id,
                 status,
                 resolution_notes=resolution_notes,
+                append_notes=True,
                 blocked_reason=blocked_reason,
             )
             if not updated:
@@ -550,6 +551,7 @@ async def _impl_follow_up_update(
                 follow_up_id,
                 "blocked",
                 resolution_notes=resolution_notes,
+                append_notes=True,
                 blocked_reason=blocked_reason,
             )
         elif resolution_notes is not None:
@@ -561,6 +563,7 @@ async def _impl_follow_up_update(
                 db,
                 follow_up_id,
                 resolution_notes=resolution_notes,
+                append_notes=True,
             )
 
         refreshed = await follow_ups.get_by_id(db, follow_up_id)
@@ -692,7 +695,8 @@ async def follow_up_update(
             (error_code='scheduled_needs_link') because it would be invisible to
             every surface. To park for later use work_state='blocked_on_trigger'
             (event) or recreate with strategy='scheduled_task' (time).
-        resolution_notes: Notes on resolution or progress. Appended context for future sessions.
+        resolution_notes: Notes on resolution or progress. Appended to any existing notes
+            (after a blank line); earlier notes are never replaced.
         blocked_reason: Why this follow-up is blocked (sets status to blocked if status not provided).
         priority: New priority (low, medium, high, critical). Empty to keep current.
         pinned: "true" to pin (ego cannot auto-resolve) or "false" to unpin. Empty to keep current.
