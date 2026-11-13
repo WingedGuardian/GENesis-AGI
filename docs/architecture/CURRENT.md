@@ -6061,7 +6061,8 @@ shipped mode is `off`.
     (`github.user`/`github.public_repo`, the repo promotions post to — never
     the checkout's own remote) via `ProjectV2.repositories`, and links it with
     `linkProjectV2ToRepository` when not (shown in the dry run first);
-  - Status columns Proposed / Ready / In Progress / In Review / Done; an
+  - Status columns Proposed / Ready / Build / In Progress / In Review / Done
+    (Build: a card there approves one builder run, read by nothing yet); an
     option outside them is ALWAYS kept, never deleted (deleting one clears it
     from every card holding it, and no read before the write can prove none
     does at the write);
