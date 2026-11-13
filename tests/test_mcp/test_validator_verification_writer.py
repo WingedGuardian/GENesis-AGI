@@ -234,6 +234,23 @@ async def test_local_opt_in_records_derived_result_and_closed_rows_are_immutable
     assert not shared.in_transaction
 
 
+@pytest.mark.parametrize("verdict", ["pass-mechanical", "cannot-verify"])
+async def test_the_sealed_validator_is_stamped_on_what_it_writes(recording, monkeypatch, verdict):
+    # Even if the server inherited a Claude Code shell's markers and transcript id,
+    # the external-client profile in force for the call decides the label, and a
+    # Codex label never carries the parent transcript as its session.
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "parent-transcript")
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    path, _shared, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    args = {"note": "Synthetic result"} if verdict != "pass-mechanical" else {}
+    assert (await call(_doc_for(verdict), **args))["recorded"] is True
+    stored = row(path)
+    by = "closed_by" if verdict == "pass-mechanical" else "last_attempt_by"
+    assert stored[by] == "codex-sealed" and stored["recorded_session"] is None
+
+
 @pytest.mark.parametrize("over", [
     {"pr": 8}, {"verdict": "fail-intent"}, {"park": True}, {"note": "Discarded note"},
     {"dry_run_only": False}, {"evidence_json": '{"pr":7,"pr":8}'},
