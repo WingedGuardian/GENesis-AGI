@@ -49,6 +49,21 @@ def engine(
     return RecoveryEngine(config, sm, snapshots, dispatcher)
 
 
+@pytest.fixture
+def unit_comes_up():
+    """genesis-server read as running, then running under a new invocation:
+    a restart that worked, for tests about what surrounds the restart."""
+    seen = []
+
+    async def fake(container):
+        seen.append(container)
+        inv = "old" if len(seen) == 1 else "new"
+        return {"ActiveState": "active", "SubState": "running", "InvocationID": inv}
+
+    with patch("genesis.guardian.recovery._server_unit", fake):
+        yield
+
+
 def _diagnosis(action: RecoveryAction = RecoveryAction.RESTART_SERVICES) -> DiagnosisResult:
     return DiagnosisResult(
         likely_cause="Test failure",
@@ -76,6 +91,7 @@ def _mock_subprocess(rc: int = 0, stdout: str = "", stderr: str = ""):
     return mock
 
 
+@pytest.mark.usefixtures("unit_comes_up")
 class TestRecoveryRestart:
 
     @pytest.mark.asyncio
@@ -116,6 +132,147 @@ class TestRecoveryRestart:
         ):
             result = await engine.execute(_diagnosis(RecoveryAction.RESTART_SERVICES))
         assert result.success is False
+
+
+def _unit(state: str, sub: str = "running", inv: str = "aaa") -> str:
+    return f"ActiveState={state}\nSubState={sub}\nInvocationID={inv}"
+
+
+def _systemd(shows: list[str], cmd_rc: tuple[int, str, str] = (0, "", "")):
+    """A fake container: each `systemctl --user show` answers the next of
+    ``shows`` (the last one repeats); any other command answers ``cmd_rc``.
+    The commands it saw are in ``.calls``."""
+    calls: list[str] = []
+
+    async def mock(*args, **kwargs):
+        cmd = args[-1]
+        calls.append(cmd)
+        if "systemctl --user show genesis-server" in cmd:
+            n = sum("systemctl --user show" in c for c in calls) - 1
+            return 0, "a login banner line\n" + shows[min(n, len(shows) - 1)], ""
+        if cmd.startswith("journalctl"):
+            return 0, "live-move repair: held: the checkout is half-written", ""
+        return cmd_rc
+
+    mock.calls = calls
+    return mock
+
+
+def _acts(calls: list[str]) -> list[str]:
+    return [c for c in calls if c.startswith("systemctl --user") and " show " not in c]
+
+
+class TestRestartWaitsForSystemdStart:
+    """D2a-g (#3492 D2 rev 3 11.3): a restart never stops a start in progress
+    (the boot repair heals in genesis-server's start step), and the result is
+    the unit's own state after the start, not the restart command's return."""
+
+    @pytest.mark.asyncio
+    async def test_a_start_in_progress_is_left_to_finish(self, engine: RecoveryEngine) -> None:
+        fake = _systemd([_unit("activating", "start-pre"), _unit("activating", "start-pre"),
+                         _unit("active")])  # fmt: skip
+        with patch("genesis.guardian.recovery._run_subprocess", fake), \
+                patch("asyncio.sleep", new_callable=AsyncMock):  # fmt: skip
+            ok, detail = await engine._restart_services("genesis")
+        assert ok, detail
+        assert _acts(fake.calls) == [], "a start in progress was restarted"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_unit_is_started_not_restarted(self, engine: RecoveryEngine) -> None:
+        fake = _systemd([_unit("failed", "failed", "old"), _unit("failed", "failed", "old"),
+                         _unit("active", "running", "new")])  # fmt: skip
+        with patch("genesis.guardian.recovery._run_subprocess", fake), \
+                patch("asyncio.sleep", new_callable=AsyncMock):  # fmt: skip
+            ok, detail = await engine._restart_services("genesis")
+        assert ok, detail
+        assert _acts(fake.calls) == ["systemctl --user start --no-block genesis-server"]
+
+    @pytest.mark.asyncio
+    async def test_the_old_process_still_running_is_not_success(self, engine: RecoveryEngine) -> None:
+        """Review SF3: after `restart --no-block` the poll can read the old
+        process, still active under its InvocationID; only a new one counts."""
+        fake = _systemd([_unit("active", "running", "old")])
+        with patch("genesis.guardian.recovery._run_subprocess", fake), \
+                patch("asyncio.sleep", new_callable=AsyncMock):  # fmt: skip
+            ok, detail = await engine._restart_services("genesis")
+        assert not ok
+        assert _acts(fake.calls) == ["systemctl --user restart --no-block genesis-server"]
+        assert "active/running" in detail and "live-move repair:" in detail, detail
+
+    @pytest.mark.asyncio
+    async def test_a_client_timeout_is_decided_by_the_unit(self, engine: RecoveryEngine) -> None:
+        fake = _systemd([_unit("active", "running", "old"), _unit("active", "running", "new")],
+                        cmd_rc=(-1, "", "timeout"))  # fmt: skip
+        with patch("genesis.guardian.recovery._run_subprocess", fake), \
+                patch("asyncio.sleep", new_callable=AsyncMock):  # fmt: skip
+            ok, detail = await engine._restart_services("genesis")
+        assert ok, detail
+
+    @pytest.mark.asyncio
+    async def test_a_new_start_that_fails_is_reported(self, engine: RecoveryEngine) -> None:
+        fake = _systemd([_unit("active", "running", "old"), _unit("failed", "failed", "new")])
+        with patch("genesis.guardian.recovery._run_subprocess", fake), \
+                patch("asyncio.sleep", new_callable=AsyncMock):  # fmt: skip
+            ok, detail = await engine._restart_services("genesis")
+        assert not ok and "failed/failed" in detail, detail
+
+    @pytest.mark.asyncio
+    async def test_the_start_limit_is_named_at_once(self, engine: RecoveryEngine) -> None:
+        """Review SF-2 (MEASURED on systemd 255): `start --no-block` exits 0 at
+        the start limit and the unit stays failed under its old invocation."""
+        hit = _unit("failed", "failed", "old") + "\nResult=start-limit-hit"
+        fake = _systemd([hit])
+        with patch("genesis.guardian.recovery._run_subprocess", fake), \
+                patch("asyncio.sleep", new_callable=AsyncMock) as slept:  # fmt: skip
+            ok, detail = await engine._restart_services("genesis")
+        assert not ok and "start limit hit" in detail, detail
+        assert slept.await_count == 0, "it waited for a start systemd refused"
+
+    @pytest.mark.asyncio
+    async def test_an_inactive_unit_is_started(self, engine: RecoveryEngine) -> None:
+        fake = _systemd([_unit("inactive", "dead", ""), _unit("active", "running", "new")])
+        with patch("genesis.guardian.recovery._run_subprocess", fake), \
+                patch("asyncio.sleep", new_callable=AsyncMock):  # fmt: skip
+            ok, detail = await engine._restart_services("genesis")
+        assert ok, detail
+        assert _acts(fake.calls) == ["systemctl --user start --no-block genesis-server"]
+
+    @pytest.mark.asyncio
+    async def test_a_container_that_stops_answering_ends_the_wait(
+        self, engine: RecoveryEngine
+    ) -> None:
+        """Review SF-1: unreadable reads end the wait after three, rather than
+        each costing its 30 s timeout for the whole poll bound."""
+        fake = _systemd(["nothing parseable"])
+        with patch("genesis.guardian.recovery._run_subprocess", fake), \
+                patch("asyncio.sleep", new_callable=AsyncMock) as slept:  # fmt: skip
+            ok, detail = await engine._restart_services("genesis")
+        assert not ok and "unreadable" in detail, detail
+        assert slept.await_count < 5, slept.await_count
+
+    @pytest.mark.asyncio
+    async def test_no_repair_line_is_quoted_when_the_journal_has_none(
+        self, engine: RecoveryEngine
+    ) -> None:
+        fake = _systemd([_unit("failed", "failed", "old"), _unit("failed", "failed", "new")])
+
+        async def no_repair(*args, **kwargs):
+            if args[-1].startswith("journalctl"):
+                return 0, "a login banner line", ""
+            return await fake(*args, **kwargs)
+
+        with patch("genesis.guardian.recovery._run_subprocess", no_repair), \
+                patch("asyncio.sleep", new_callable=AsyncMock):  # fmt: skip
+            ok, detail = await engine._restart_services("genesis")
+        assert not ok and "last line" not in detail and "banner" not in detail, detail
+
+    @pytest.mark.asyncio
+    async def test_a_command_that_cannot_run_fails_at_once(self, engine: RecoveryEngine) -> None:
+        fake = _systemd([_unit("active", "running", "old")], cmd_rc=(-1, "", "No such file"))
+        with patch("genesis.guardian.recovery._run_subprocess", fake), \
+                patch("asyncio.sleep", new_callable=AsyncMock):  # fmt: skip
+            ok, detail = await engine._restart_services("genesis")
+        assert not ok and "No such file" in detail, detail
 
 
 class TestRecoveryEscalate:
@@ -167,6 +324,7 @@ class TestRecoveryContainerRestart:
         assert result.action == RecoveryAction.RESTART_CONTAINER
 
 
+@pytest.mark.usefixtures("unit_comes_up")
 class TestRecoveryResourceClear:
 
     @pytest.mark.asyncio
@@ -246,6 +404,7 @@ def _on_main(rc: int = 0, stdout: str = "", stderr: str = ""):
     return mock
 
 
+@pytest.mark.usefixtures("unit_comes_up")
 class TestRecoveryRevertCode:
 
     @pytest.mark.asyncio

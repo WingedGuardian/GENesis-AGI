@@ -364,6 +364,15 @@ async def get_linked_active(
     return [dict(row) for row in await cursor.fetchall()]
 
 
+# Append a note to any existing resolution_notes, separated by a blank line.
+# The same expression absorb_followup / retire_by_dedup_keys use; on a row with
+# no notes yet it is just the new note.
+_APPEND_RESOLUTION_NOTES = (
+    "resolution_notes = TRIM("
+    "COALESCE(resolution_notes || char(10) || char(10), '') || ?)"
+)
+
+
 async def update_status(
     db: aiosqlite.Connection,
     id: str,
@@ -373,8 +382,13 @@ async def update_status(
     blocked_reason: str | None = None,
     verified_at: str | None = None,
     verification_notes: str | None = None,
+    append_notes: bool = False,
 ) -> bool:
-    """Update follow-up status. Sets completed_at on terminal states."""
+    """Update follow-up status. Sets completed_at on terminal states.
+
+    ``append_notes=True`` appends ``resolution_notes`` to the existing notes
+    instead of replacing them (the MCP follow_up_update contract).
+    """
     parts = ["status = ?"]
     params: list[str | None] = [status]
     if status in ("completed", "failed"):
@@ -394,7 +408,7 @@ async def update_status(
         # mis-key the row (follow-up d67c83c7). No-op when already NULL.
         parts.append("completed_at = NULL")
     if resolution_notes is not None:
-        parts.append("resolution_notes = ?")
+        parts.append(_APPEND_RESOLUTION_NOTES if append_notes else "resolution_notes = ?")
         params.append(resolution_notes)
     if blocked_reason is not None:
         parts.append("blocked_reason = ?")
@@ -420,8 +434,12 @@ async def update_notes(
     *,
     resolution_notes: str | None = None,
     blocked_reason: str | None = None,
+    append_notes: bool = False,
 ) -> bool:
     """Write resolution_notes / blocked_reason WITHOUT touching status.
+
+    ``append_notes=True`` appends ``resolution_notes`` to the existing notes
+    instead of replacing them (the MCP follow_up_update contract).
 
     A notes-only update must never re-write ``status``. The MCP follow_up_update
     previously re-applied the status it had read moments earlier; against
@@ -433,7 +451,7 @@ async def update_notes(
     parts: list[str] = []
     params: list[str | None] = []
     if resolution_notes is not None:
-        parts.append("resolution_notes = ?")
+        parts.append(_APPEND_RESOLUTION_NOTES if append_notes else "resolution_notes = ?")
         params.append(resolution_notes)
     if blocked_reason is not None:
         parts.append("blocked_reason = ?")
@@ -1024,6 +1042,8 @@ async def update_private(
 
     Eligibility is evaluated by the UPDATE, not an earlier read. Notes-only
     updates never copy a stale status. Future promotion is a separate action.
+    ``resolution_notes`` is appended to any existing notes, as the
+    follow_up_update tool documents.
     """
     if status is not None and status not in _PRIVATE_STATUSES:
         raise ValueError("Invalid private follow-up status")
@@ -1045,8 +1065,10 @@ async def update_private(
             params.extend((effective_status, _now_iso()))
         else:
             parts.append("completed_at = NULL")
-    for column, value in (("resolution_notes", resolution_notes),
-                          ("blocked_reason", blocked_reason), ("priority", priority)):
+    if resolution_notes is not None:
+        parts.append(_APPEND_RESOLUTION_NOTES)
+        params.append(resolution_notes)
+    for column, value in (("blocked_reason", blocked_reason), ("priority", priority)):
         if value is not None:
             parts.append(f"{column} = ?")
             params.append(value)
