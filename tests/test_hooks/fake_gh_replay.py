@@ -110,6 +110,18 @@ def _pr_view(args: list[str], state: dict) -> tuple[int, str, str]:
     return _answer({f: pr[f] for f in fields}, _one(opts, "--jq"))
 
 
+def _pr_status(args: list[str], state: dict) -> tuple[int, str, str]:
+    """``review_reflection.pr_identity`` (the rounds row's remaining-findings
+    report). The merge-gate workflow checks out the BASE commit, so no PR belongs
+    to the current branch: ``currentBranch`` is null, the report reads that as
+    "no local branch for this PR" and shows UNKNOWN, never a count."""
+    pos, opts = _opts(args, {"--json"})
+    _allow_only(opts, {"--json"})
+    if pos or _one(opts, "--json") != "number,state,url":
+        raise _Unrouted(f"pr status {pos} {opts}")
+    return _answer({"currentBranch": None, "createdBy": [], "needsReview": []}, None)
+
+
 def _pr_list(args: list[str], state: dict) -> tuple[int, str, str]:
     pos, opts = _opts(args, {"--repo", "--state", "--label", "--limit", "--json", "--jq"})
     _allow_only(opts, {"--repo", "--state", "--label", "--limit", "--json", "--jq"})
@@ -438,6 +450,8 @@ def _api(args: list[str], state: dict) -> tuple[int, str, str]:
 def _route(argv: list[str], state: dict) -> tuple[int, str, str]:
     if len(argv) >= 2 and argv[:2] == ["pr", "view"]:
         return _pr_view(argv[2:], state)
+    if len(argv) >= 2 and argv[:2] == ["pr", "status"]:
+        return _pr_status(argv[2:], state)
     if len(argv) >= 2 and argv[:2] == ["pr", "list"]:
         return _pr_list(argv[2:], state)
     if len(argv) >= 2 and argv[:2] == ["repo", "view"]:
