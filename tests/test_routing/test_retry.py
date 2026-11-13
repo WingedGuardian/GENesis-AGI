@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from genesis.routing.retry import classify_error, compute_delay
 from genesis.routing.types import ErrorCategory, RetryPolicy
 
@@ -187,3 +189,137 @@ def test_compute_delay_caps_an_overflowing_backoff():
         backoff_multiplier=1.0e300, jitter_pct=0.0, max_total_s=None,
     )
     assert compute_delay(policy, 3) == 30.0
+
+
+# --- an exhausted prepaid balance reported as a client error (400/422) ---
+
+# The vendor body for an exhausted prepaid balance, in the shape a live install
+# recorded it. SYNTHETIC: the request id is all zeroes, nothing here was copied
+# from a real response.
+_BALANCE_BODY = (
+    '{"error":{"message":"Insufficient Balance (request_id: '
+    '00000000-0000-0000-0000-000000000000)","type":"insufficient_balance_error",'
+    '"param":null,"code":"invalid_request_error"}}'
+)
+# What the delegate hands the router: litellm's prefix, then the body.
+_BALANCE_ERROR = f"litellm.BadRequestError: DeepseekException - {_BALANCE_BODY}"
+
+
+@pytest.mark.parametrize("status", [400, 422])
+@pytest.mark.parametrize(
+    "error_msg", [_BALANCE_ERROR, _BALANCE_BODY], ids=["litellm-prefixed", "bare-body"]
+)
+def test_balance_exhausted_400_is_quota(status, error_msg):
+    """ACCEPTANCE BAR: the recorded shape must reach the quota path.
+
+    A 400 is normally the payload's fault and is kept away from the breaker. An
+    empty balance is a billing state the same payload cannot fix, so it has to
+    classify QUOTA_EXHAUSTED or the provider is called first, forever.
+    """
+    assert classify_error(status, error_msg) == ErrorCategory.QUOTA_EXHAUSTED
+
+
+@pytest.mark.parametrize("status", [400, 422])
+@pytest.mark.parametrize(
+    "error_msg",
+    [
+        '{"error":{"message":"Invalid value for \'messages\'","type":'
+        '"invalid_request_error","param":null,"code":"invalid_request_error"}}',
+        "context window exceeded",
+        "",
+    ],
+    ids=["ordinary-invalid-request", "context-overflow", "empty"],
+)
+def test_ordinary_400_stays_bad_request(status, error_msg):
+    # Negative control: the balance carve-out must not widen BAD_REQUEST's exit.
+    assert classify_error(status, error_msg) == ErrorCategory.BAD_REQUEST
+
+
+@pytest.mark.parametrize(
+    "error_msg",
+    [
+        # A validation failure that echoes generated text naming the balance.
+        '{"error":{"message":"Failed to validate JSON. See \'failed_generation\'.",'
+        '"type":"invalid_request_error","code":"json_validate_failed",'
+        '"failed_generation":"the wallet reported insufficient balance; raise '
+        'insufficient_balance_error"}}',
+        # Balance wording in the human message, an ordinary type and code.
+        '{"error":{"message":"Insufficient Balance","type":"invalid_request_error",'
+        '"code":"invalid_request_error"}}',
+        # The token as a nested value, not the error's own type or code.
+        '{"error":{"type":"invalid_request_error","param":'
+        '{"type":"insufficient_balance_error"}}}',
+        # The token outside the `error` object.
+        '{"type":"insufficient_balance_error","error":{"type":"invalid_request_error"}}',
+        # No JSON at all.
+        "Insufficient Balance",
+        "insufficient_balance_error",
+    ],
+    ids=[
+        "echoed-generation", "message-prose", "nested-field", "outside-error",
+        "bare-prose", "bare-token",
+    ],
+)
+def test_balance_words_outside_the_error_type_do_not_classify_quota(error_msg):
+    """The marker is a FIELD, not a substring.
+
+    A 400 is the status where a body can carry request or generated text back.
+    Matching the words anywhere would let three such replies in a row open the
+    breaker on a healthy provider and label it out of credits.
+    """
+    assert classify_error(400, error_msg) == ErrorCategory.BAD_REQUEST
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (500, ErrorCategory.TRANSIENT),
+        (401, ErrorCategory.PERMANENT),
+        (404, ErrorCategory.PERMANENT),
+        (429, ErrorCategory.RATE_LIMITED),
+        (408, ErrorCategory.TIMEOUT),
+        (402, ErrorCategory.QUOTA_EXHAUSTED),
+    ],
+)
+def test_balance_body_changes_nothing_outside_400_and_422(status, expected):
+    # The check is scoped to the two client-error statuses; every other status
+    # keeps the category it had before, whatever the body says.
+    assert classify_error(status, _BALANCE_ERROR) == expected
+
+
+def test_balance_token_matches_in_either_field_and_any_case():
+    for body in (
+        '{"error":{"type":"INSUFFICIENT_BALANCE_ERROR"}}',
+        '{"error":{"type":"invalid_request_error","code":"insufficient_balance_error"}}',
+    ):
+        assert classify_error(400, body) == ErrorCategory.QUOTA_EXHAUSTED, body
+
+
+@pytest.mark.parametrize(
+    "error_msg",
+    [
+        "",
+        "{",
+        "{}",
+        "[]",
+        '{"error":null}',
+        '{"error":[]}',
+        '{"error":"insufficient_balance_error"}',
+        '{"error":{"type":5}}',
+        '{"error":{"type":null,"code":["insufficient_balance_error"]}}',
+        "x" + "[" * 100_000,
+        '{"a":' * 50_000,
+        "prefix {not json}",
+    ],
+    ids=[
+        "empty", "open-brace", "empty-object", "array", "null-error", "list-error",
+        "string-error", "int-type", "list-code", "deep-arrays", "deep-objects",
+        "not-json",
+    ],
+)
+def test_balance_check_never_raises_on_a_body_it_cannot_read(error_msg):
+    """Both router call sites call `classify_error` bare: an exception here
+    would escape the chain walk instead of falling through to the next
+    provider. Anything unreadable stays BAD_REQUEST, as before."""
+    for status in (400, 422):
+        assert classify_error(status, error_msg) == ErrorCategory.BAD_REQUEST
