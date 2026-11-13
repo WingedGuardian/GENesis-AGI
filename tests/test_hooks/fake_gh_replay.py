@@ -216,13 +216,14 @@ GRAPHQL_DOCUMENTS = {
         " $number) { headRefOid body reviews(first: 100, after: $after_reviews) {"
         " pageInfo { hasNextPage endCursor } nodes { fullDatabaseId state submittedAt"
         " body author { login __typename } commit { oid } comments(first: 100) {"
-        " pageInfo { hasNextPage } nodes { fullDatabaseId replyTo { id } body } } } }"
+        " pageInfo { hasNextPage } nodes { fullDatabaseId replyTo { id } body path } } } }"
         " comments(first: 100, after: $after_comments) { pageInfo { hasNextPage"
         " endCursor } nodes { fullDatabaseId body createdAt updatedAt author { login"
         " __typename } } } files(first: 100, after: $after_files) { pageInfo {"
         " hasNextPage endCursor } nodes { path changeType } } commits(first: 100,"
         " after: $after_commits) { pageInfo { hasNextPage endCursor } nodes { commit"
-        " { oid parents(first: 100) { totalCount nodes { oid } } } } } } } }"
+        " { oid committedDate tree { oid } parents(first: 100) { totalCount nodes {"
+        " oid } } } } } } } }"
     ),
     "review_budget_reread": (
         "query($owner: String!, $name: String!, $number: Int!, $after_reviews:"
@@ -231,12 +232,12 @@ GRAPHQL_DOCUMENTS = {
         " headRefOid body reviews(first: 100, after: $after_reviews) { pageInfo {"
         " hasNextPage endCursor } nodes { fullDatabaseId state submittedAt body"
         " author { login __typename } commit { oid } comments(first: 100) { pageInfo"
-        " { hasNextPage } nodes { fullDatabaseId replyTo { id } body } } } }"
+        " { hasNextPage } nodes { fullDatabaseId replyTo { id } body path } } } }"
         " comments(first: 100, after: $after_comments) { pageInfo { hasNextPage"
         " endCursor } nodes { fullDatabaseId body createdAt updatedAt author { login"
         " __typename } } } commits(first: 100, after: $after_commits) { pageInfo {"
-        " hasNextPage endCursor } nodes { commit { oid parents(first: 100) {"
-        " totalCount nodes { oid } } } } } } } }"
+        " hasNextPage endCursor } nodes { commit { oid committedDate tree { oid }"
+        " parents(first: 100) { totalCount nodes { oid } } } } } } } }"
     ),
 }
 
@@ -357,6 +358,7 @@ def _review_budget_answer(state: dict, connections: tuple[str, ...]) -> dict:
                         if c.get("in_reply_to_id")
                         else None,
                         "body": c["body"],
+                        "path": c.get("path"),
                     }
                     for c in inline
                     if c.get("pull_request_review_id") == r["id"]
@@ -384,6 +386,8 @@ def _review_budget_answer(state: dict, connections: tuple[str, ...]) -> dict:
         {
             "commit": {
                 "oid": c["sha"],
+                "committedDate": ((c.get("commit") or {}).get("committer") or {}).get("date"),
+                "tree": {"oid": ((c.get("commit") or {}).get("tree") or {}).get("sha")},
                 "parents": {
                     "totalCount": len(c["parents"]),
                     "nodes": [{"oid": p["sha"]} for p in c["parents"]],
