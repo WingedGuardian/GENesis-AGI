@@ -277,8 +277,7 @@ async def get_link_by_issue(
     return _link_row(await _one(cur))
 
 
-# GROUNDWORK(board-reconciler): the reconciler records the card once it adds the
-# issue to the project (the board PR after promotion).
+# Called by the board reconciler once the linked issue has a card.
 async def set_project_item(
     db: aiosqlite.Connection, *, link_id: str, project_item_id: str, now: str
 ) -> bool:
@@ -782,6 +781,45 @@ async def list_events(
     return {"items": items, "listed": len(items), "total": total}
 
 
+async def count_events_since(
+    db: aiosqlite.Connection, *, events: tuple[str, ...], since: str
+) -> int:
+    """How many *events* were recorded at or after *since* (ISO-8601 UTC, the
+    format every writer stores). The reconciler's hourly write budget."""
+    for name in events:
+        _one_of("event", name, EVENTS)
+    if not events:
+        return 0
+    marks = ",".join("?" for _ in events)
+    cur = await db.execute(
+        f"SELECT COUNT(*) FROM board_events WHERE event IN ({marks}) AND created_at >= ?",
+        (*events, since),
+    )
+    return (await cur.fetchone())[0]
+
+
+async def added_numbers(db: aiosqlite.Connection, *, repo: str) -> set[int]:
+    """Issue and PR numbers in *repo* that Genesis has ever added to the board
+    (an ``item_added`` row). The backfill adds an item once: a card the owner
+    removed afterwards stays removed (:func:`prune` never deletes these rows)."""
+    cur = await db.execute(
+        "SELECT DISTINCT issue_number FROM board_events "
+        "WHERE event = 'item_added' AND repo = ? AND issue_number IS NOT NULL",
+        ((repo or "").lower(),),
+    )
+    return {row[0] for row in await cur.fetchall()}
+
+
+async def links_without_item(db: aiosqlite.Connection, *, repo: str) -> list[dict]:
+    """``{"id", "issue_number"}`` of every link in *repo* whose project item
+    is not recorded yet."""
+    cur = await db.execute(
+        "SELECT id, issue_number FROM board_links WHERE repo = ? AND project_item_id IS NULL",
+        ((repo or "").lower(),),
+    )
+    return await _all(cur)
+
+
 # ─── retention ──────────────────────────────────────────────────────────────
 
 
@@ -794,8 +832,10 @@ async def prune(
 ) -> dict:
     """Delete CLOSED questions (and their edges) older than ``question_days``
     and events older than ``event_days``. Unverified questions and pointers are
-    never pruned — they are open work and durable fact respectively. Returns the
-    real per-table deletion counts."""
+    never pruned — they are open work and durable fact respectively — and
+    neither are ``item_added`` events: they are the backfill's only memory of
+    what it added, so pruning one would re-add a card the owner removed. Returns
+    the real per-table deletion counts."""
     for name, days in (("question_days", question_days), ("event_days", event_days)):
         if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
             raise ValueError(f"{name} must be a positive int")
@@ -812,6 +852,9 @@ async def prune(
         blocks = cur.rowcount
         cur = await db.execute(f"DELETE FROM open_questions WHERE id IN ({doomed})", (q_cutoff,))
         questions = cur.rowcount
-        cur = await db.execute("DELETE FROM board_events WHERE created_at < ?", (e_cutoff,))
+        cur = await db.execute(
+            "DELETE FROM board_events WHERE created_at < ? AND event != 'item_added'",
+            (e_cutoff,),
+        )
         events = cur.rowcount
     return {"questions": questions, "question_blocks": blocks, "events": events}

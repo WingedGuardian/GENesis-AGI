@@ -370,3 +370,183 @@ async def test_card_for_issue_raises_when_the_number_does_not_exist():
         await pv.card_for_issue(
             "o", "r", 9, runner=_runner({"data": {"repository": {"issueOrPullRequest": None}}})
         )
+
+
+# ─── reconciler writes (#4400) ──────────────────────────────────────────────
+
+_STATUS_OPTS = {name: f"opt-{i}" for i, name in enumerate(pv.STATUS_OPTIONS)}
+
+
+def _board_project():
+    status = pv.Field("F-STATUS", pv.STATUS_FIELD, "single_select", dict(_STATUS_OPTS))
+    return pv.Project("P1", 2, "Board", False, {pv.STATUS_FIELD: status})
+
+
+@pytest.mark.parametrize("to_name", ["Proposed", "In Review"])
+async def test_set_status_fills_an_empty_column_with_the_option_id(to_name):
+    run = _runner({"data": {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "I1"}}}})
+    await pv.set_status(_board_project(), "I1", None, to_name, runner=run)
+    assert len(run.calls) == 1
+    assert run.calls[0]["variables"] == {
+        "p": "P1",
+        "i": "I1",
+        "f": "F-STATUS",
+        "o": _STATUS_OPTS[to_name],
+    }
+
+
+@pytest.mark.parametrize("from_name", [None, *pv.STATUS_OPTIONS])
+async def test_set_status_never_writes_in_progress(from_name):
+    run = _runner({"data": {}})
+    with pytest.raises(pv.ProjectsError, match="In Progress"):
+        await pv.set_status(_board_project(), "I1", from_name, "In Progress", runner=run)
+    assert run.calls == []
+
+
+@pytest.mark.parametrize(
+    ("from_name", "to_name"),
+    [
+        (None, "Ready"),
+        (None, "Done"),
+        ("Proposed", "Ready"),
+        ("Ready", "Proposed"),
+        ("In Review", "Proposed"),
+        ("Done", "In Review"),
+        # Part 2's moves into In Review are not allowed until Part 2 lands.
+        ("Proposed", "In Review"),
+    ],
+)
+async def test_set_status_refuses_every_transition_outside_the_allowlist(from_name, to_name):
+    run = _runner({"data": {}})
+    with pytest.raises(pv.ProjectsError, match="not an allowed Status change"):
+        await pv.set_status(_board_project(), "I1", from_name, to_name, runner=run)
+    assert run.calls == []
+
+
+async def test_set_status_refuses_when_the_board_lacks_the_option():
+    proj = _board_project()
+    proj.fields[pv.STATUS_FIELD].options.pop("Proposed")
+    run = _runner({"data": {}})
+    with pytest.raises(pv.ProjectsError, match="no 'Proposed' option"):
+        await pv.set_status(proj, "I1", None, "Proposed", runner=run)
+    proj.fields.pop(pv.STATUS_FIELD)
+    with pytest.raises(pv.ProjectsError, match="no Status field"):
+        await pv.set_status(proj, "I1", None, "In Review", runner=run)
+    assert run.calls == []
+
+
+# GitHub GraphQL docs ("Rate limits and query limits for the GraphQL API",
+# consulted 2026-11-13): a primary limit is an error, a secondary limit comes
+# back as HTTP 200 or 403 "with an error message that indicates that you hit a
+# secondary rate limit".
+@pytest.mark.parametrize(
+    "resp",
+    [
+        {"errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}], "data": None},
+        {"errors": [{"message": "You have exceeded a secondary rate limit."}]},
+        (1, json.dumps({"message": "You have exceeded a secondary rate limit"}), "HTTP 403"),
+        (1, "", "gh: You have triggered an abuse detection mechanism (HTTP 403)"),
+        (1, "", "gh: API rate limit exceeded for user ID 1. (HTTP 403)"),
+    ],
+)
+async def test_a_rate_limit_raises_its_own_error(resp):
+    with pytest.raises(pv.RateLimited):
+        await pv.graphql("mutation { x }", runner=_runner(resp))
+
+
+@pytest.mark.parametrize(
+    "resp",
+    [
+        {"errors": [{"type": "NOT_FOUND", "message": "Could not resolve to a node"}]},
+        (1, "", "gh: Bad credentials (HTTP 401)"),
+    ],
+)
+async def test_other_errors_are_not_read_as_a_rate_limit(resp):
+    with pytest.raises(pv.ProjectsError) as caught:
+        await pv.graphql("query { x }", runner=_runner(resp))
+    assert not isinstance(caught.value, pv.RateLimited)
+
+
+# MEASURED 2026-11-13 (gh 2.101): a GraphQL error exits 1 with the errors JSON
+# on stdout; an HTTP failure exits 1 with {"message": ...} and no data/errors.
+_GRAPHQL_ERROR = (
+    1,
+    json.dumps({"data": {"node": None}, "errors": [{"type": "NOT_FOUND", "message": "nope"}]}),
+    "gh: nope",
+)
+
+
+@pytest.mark.parametrize(
+    "resp",
+    [
+        (1, json.dumps({"message": "Bad credentials", "status": "401"}), "gh: Bad credentials (HTTP 401)"),
+        (1, json.dumps({"message": "Server Error"}), "gh: Server Error (HTTP 502)"),
+        (124, "", "gh api graphql timed out after 60s"),
+        (0, "not json", ""),
+        (0, json.dumps({"no": "data"}), ""),
+    ],
+)
+async def test_a_failed_request_is_told_apart_from_an_error_about_one_item(resp):
+    with pytest.raises(pv.RequestFailed):
+        await pv.graphql("mutation { x }", runner=_runner(resp))
+
+
+async def test_an_error_about_one_item_is_not_a_failed_request():
+    with pytest.raises(pv.ProjectsError) as caught:
+        await pv.graphql("mutation { x }", runner=_runner(_GRAPHQL_ERROR))
+    assert not isinstance(caught.value, pv.RequestFailed)
+
+
+def test_a_rate_limit_is_a_failed_request():
+    assert issubclass(pv.RateLimited, pv.RequestFailed)
+
+
+def test_status_option_resolves_without_any_request():
+    assert pv.status_option(_board_project(), None, "Proposed") == ("F-STATUS", _STATUS_OPTS["Proposed"])
+    with pytest.raises(pv.ProjectsError, match="In Progress"):
+        pv.status_option(_board_project(), None, "In Progress")
+
+
+def test_the_items_read_carries_each_issue_s_open_closing_prs():
+    _, found, rest = pv._ITEMS_QUERY.partition("closedByPullRequestsReferences(")
+    assert found, "the items read must carry each issue's closing PRs"
+    block = rest[: rest.index("} }") + 3]
+    for name in ("totalCount", "number", "state", "createdAt", "isCrossRepository"):
+        assert name in block, name
+
+
+def _content_page(kind, nodes, *, total, has_next=False, cursor=None):
+    key = "issues" if kind == "Issue" else "pullRequests"
+    return {
+        "data": {
+            "repository": {
+                key: {
+                    "totalCount": total,
+                    "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                    "nodes": nodes,
+                }
+            }
+        }
+    }
+
+
+async def test_open_content_reads_every_open_issue_and_pr_to_the_end():
+    run = _runner(
+        _content_page("Issue", [{"id": "I_a", "number": 1}], total=2, has_next=True, cursor="c"),
+        _content_page("Issue", [{"id": "I_b", "number": 2}], total=2),
+        _content_page("PullRequest", [{"id": "PR_c", "number": 3}], total=1),
+    )
+    out = await pv.open_content("o", "r", runner=run)
+    assert out == [
+        {"id": "I_a", "number": 1, "kind": "Issue"},
+        {"id": "I_b", "number": 2, "kind": "Issue"},
+        {"id": "PR_c", "number": 3, "kind": "PullRequest"},
+    ]
+    assert run.calls[1]["variables"]["c"] == "c"
+    assert all(c["variables"]["o"] == "o" and c["variables"]["n"] == "r" for c in run.calls)
+
+
+async def test_open_content_short_read_raises():
+    run = _runner(_content_page("Issue", [{"id": "I_a", "number": 1}], total=4))
+    with pytest.raises(pv.ProjectsError, match="read 1 open issues but the repository reports 4"):
+        await pv.open_content("o", "r", runner=run)

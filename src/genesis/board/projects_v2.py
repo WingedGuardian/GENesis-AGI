@@ -81,6 +81,32 @@ class ProjectsError(RuntimeError):
     """A GraphQL or transport failure. Never swallowed into an empty answer."""
 
 
+class RequestFailed(ProjectsError):
+    """The REQUEST failed (an HTTP error, a timeout, unreadable output), as
+    opposed to GitHub answering with an error about the one thing asked. A
+    writer stops for the rest of its tick on this: a failure it cannot read is
+    treated as a limit it did not recognise, never retried into."""
+
+
+class RateLimited(RequestFailed):
+    """GitHub refused the call for a rate limit (recognised by type or wording;
+    the label only: :class:`RequestFailed` already stops a writer)."""
+
+
+# GitHub GraphQL docs, "Rate limits and query limits for the GraphQL API"
+# (consulted 2026-11-13): a primary limit returns an error; a secondary limit
+# returns HTTP 200 or 403 "with an error message that indicates that you hit a
+# secondary rate limit". The abuse wording is the older name for the same limit.
+_RATE_LIMIT_TEXT = ("rate limit", "abuse detection")
+
+
+def _is_rate_limit(errors: list, *texts: str) -> bool:
+    if any(isinstance(e, dict) and e.get("type") == "RATE_LIMITED" for e in errors):
+        return True
+    blob = " ".join([*texts, *(str(e.get("message", "")) for e in errors if isinstance(e, dict))])
+    return any(marker in blob.lower() for marker in _RATE_LIMIT_TEXT)
+
+
 async def _default_runner(payload: str) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         "gh",
@@ -104,19 +130,33 @@ async def _default_runner(payload: str) -> tuple[int, str, str]:
 async def graphql(
     query: str, variables: dict | None = None, *, runner: Runner | None = None
 ) -> dict:
-    """Run one query/mutation; return ``data``. Raises :class:`ProjectsError` on
-    a non-zero exit, unparseable output, or any ``errors`` entry."""
+    """Run one query/mutation; return ``data``.
+
+    Raises :class:`ProjectsError` when GitHub answered with an ``errors`` array
+    (about what was asked), and :class:`RequestFailed` when the request itself
+    failed: a non-zero exit with no GraphQL answer, a timeout, unparseable
+    output. MEASURED 2026-11-13 (gh 2.101): a GraphQL error exits 1 with the
+    errors JSON on stdout; an HTTP error exits 1 with the response body
+    (``{"message": ...}``, no ``data`` or ``errors``) on stdout and
+    "gh: <message> (HTTP <code>)" on stderr. Either becomes
+    :class:`RateLimited` when it names a rate limit."""
     payload = json.dumps({"query": query, "variables": variables or {}})
     rc, out, err = await (runner or _default_runner)(payload)
     try:
         doc = json.loads(out) if out.strip() else {}
     except ValueError as exc:
-        raise ProjectsError(f"unparseable gh output (rc={rc}): {err.strip()[:300]}") from exc
+        error = RateLimited if _is_rate_limit([], err) else RequestFailed
+        raise error(f"unparseable gh output (rc={rc}): {err.strip()[:300]}") from exc
+    if not isinstance(doc, dict):
+        doc = {}
     if doc.get("errors"):
         messages = "; ".join(str(e.get("message", e)) for e in doc["errors"])
-        raise ProjectsError(f"GraphQL error: {messages}")
+        error = RateLimited if _is_rate_limit(doc["errors"]) else ProjectsError
+        raise error(f"GraphQL error: {messages}")
     if rc != 0 or "data" not in doc:
-        raise ProjectsError(f"gh api graphql failed (rc={rc}): {err.strip()[:300]}")
+        limited = _is_rate_limit([], err, str(doc.get("message", "")))
+        error = RateLimited if limited else RequestFailed
+        raise error(f"gh api graphql failed (rc={rc}): {err.strip()[:300]}")
     return doc["data"]
 
 
@@ -265,7 +305,8 @@ async def link_repository(project_id: str, repo_id: str, *, runner: Runner | Non
     )
 
 
-# GROUNDWORK(board-reconciler-writes): see add_item.
+# GROUNDWORK(board-reconciler-writes): adding ONE issue by number. The backfill
+# takes node ids from open_content instead, so nothing calls this yet.
 async def issue_node_id(owner: str, name: str, number: int, *, runner: Runner | None = None) -> str:
     data = await graphql(
         "query($o: String!, $n: String!, $i: Int!) { repository(owner: $o, name: $n) {"
@@ -453,17 +494,52 @@ async def set_view_filter(view_id: str, filter_: str, *, runner: Runner | None =
 
 
 # ─── item operations (the reconciler's surface) ─────────────────────────────
-# list_items / repo_open_counts / card_for_issue are the read-only reconciler's
-# and board_item's reads (board.reconciler, mcp.health.board_tools).
+# list_items / repo_open_counts / open_content / card_for_issue are the
+# reconciler's and board_item's reads (board.reconciler, mcp.health.board_tools).
+# add_item and set_status are the reconciler's writes, made only in ``live``.
 # GROUNDWORK(board-reconciler-writes): set_text is the Genesis-note surface of
-# the reconciler's write half (backfill, the In Review move, the Genesis-field
-# projection), which ships behind ``live`` in the next board PR. Verified live
-# against a private sandbox project.
+# the In Review move (#4400 Part 2). Verified live against a private sandbox
+# project.
+
+#: Every Status change Genesis may make, as (from, to); from None is an empty
+#: column. Anything else is the owner's move. In Progress is never a target:
+#: starting work is the owner's decision (#4400).
+STATUS_TRANSITIONS = frozenset({(None, "Proposed"), (None, "In Review")})
 
 
-# GROUNDWORK(board-reconciler-writes): issue_node_id / add_item / item_status /
-# set_single_select are the reconciler's write half — it places every open issue
-# on the board and sets an empty Status. Promotion does not place cards.
+async def set_status(
+    project: Project,
+    item_id: str,
+    from_name: str | None,
+    to_name: str,
+    *,
+    runner: Runner | None = None,
+) -> None:
+    """The ONLY writer of a card's Status. *from_name* is the value the caller
+    read; :func:`status_option` must accept the change. Raises before any
+    request otherwise."""
+    field_id, option_id = status_option(project, from_name, to_name)
+    await set_single_select(project.id, item_id, field_id, option_id, runner=runner)
+
+
+def status_option(project: Project, from_name: str | None, to_name: str) -> tuple[str, str]:
+    """``(field_id, option_id)`` for a Status change, with no request: the
+    change must be in :data:`STATUS_TRANSITIONS` (nothing ever writes In
+    Progress) and the board must have the column. Raises otherwise, so a caller
+    can validate before it audits or spends anything."""
+    if to_name == "In Progress":
+        raise ProjectsError("Genesis never moves a card to In Progress")
+    if (from_name, to_name) not in STATUS_TRANSITIONS:
+        raise ProjectsError(f"{from_name!r} -> {to_name!r} is not an allowed Status change")
+    status = project.fields.get(STATUS_FIELD)
+    if status is None or status.kind != "single_select":
+        raise ProjectsError("the project has no Status field")
+    option_id = status.options.get(to_name)
+    if not option_id:
+        raise ProjectsError(f"the Status field has no {to_name!r} option")
+    return status.id, option_id
+
+
 async def add_item(project_id: str, content_id: str, *, runner: Runner | None = None) -> str:
     """Add an issue/PR; re-adding returns the SAME item (MEASURED), so this is
     idempotent and safe to retry."""
@@ -476,7 +552,7 @@ async def add_item(project_id: str, content_id: str, *, runner: Runner | None = 
     return data["addProjectV2ItemById"]["item"]["id"]
 
 
-# GROUNDWORK(board-reconciler-writes): see add_item.
+# The reconciler re-reads each card with this just before a Status write.
 async def item_status(item_id: str, *, runner: Runner | None = None) -> str | None:
     """The item's current Status option name, or None ONLY when the item was
     read and has no Status. An item that cannot be read raises instead, so it
@@ -496,7 +572,7 @@ async def item_status(item_id: str, *, runner: Runner | None = None) -> str | No
     return (node.get("status") or {}).get("name")
 
 
-# GROUNDWORK(board-reconciler-writes): see add_item.
+# Writes ANY single-select value; the Status field goes through set_status only.
 async def set_single_select(
     project_id: str, item_id: str, field_id: str, option_id: str, *, runner: Runner | None = None
 ) -> None:
@@ -519,6 +595,9 @@ async def set_text(
     )
 
 
+# closedByPullRequestsReferences lists only OPEN closing PRs unless
+# includeClosedPrs is set (its default is false: READ by schema introspection
+# 2026-11-13). The reconciler still checks each one's state.
 _ITEMS_QUERY = """
 query($p: ID!, $c: String) { node(id: $p) { ... on ProjectV2 { items(first: 100, after: $c) {
   totalCount
@@ -531,7 +610,8 @@ query($p: ID!, $c: String) { node(id: $p) { ... on ProjectV2 { items(first: 100,
     content {
       __typename
       ... on Issue { id number state url author { login } repository { nameWithOwner }
-                     blockedBy(first: 20) { totalCount nodes { number state repository { nameWithOwner } } } }
+                     blockedBy(first: 20) { totalCount nodes { number state repository { nameWithOwner } } }
+                     closedByPullRequestsReferences(first: 10) { totalCount nodes { number state createdAt isCrossRepository author { login } repository { nameWithOwner } } } }
       ... on PullRequest { id number state url author { login } repository { nameWithOwner } }
     }
   }
@@ -573,6 +653,47 @@ async def repo_open_counts(owner: str, name: str, *, runner: Runner | None = Non
         "issues": repo["issues"]["totalCount"],
         "pull_requests": repo["pullRequests"]["totalCount"],
     }
+
+
+_OPEN_CONTENT_QUERY = """
+query($o: String!, $n: String!, $c: String) { repository(owner: $o, name: $n) {
+  %s(states: OPEN, first: 100, after: $c) { totalCount pageInfo { hasNextPage endCursor } nodes { id number } }
+} }
+"""
+
+
+async def open_content(owner: str, name: str, *, runner: Runner | None = None) -> list[dict]:
+    """Every OPEN issue and pull request in the repo as ``{"id", "number",
+    "kind"}``, paginated to the end. Raises if what was read falls short of
+    the total GitHub reports, so a short read never looks like a complete list
+    (the backfill would otherwise skip what it never saw, silently)."""
+    out: list[dict] = []
+    for kind, conn_name, label in (
+        ("Issue", "issues", "open issues"),
+        ("PullRequest", "pullRequests", "open pull requests"),
+    ):
+        read, cursor, total = 0, None, None
+        while True:
+            data = await graphql(
+                _OPEN_CONTENT_QUERY % conn_name,
+                {"o": owner, "n": name, "c": cursor},
+                runner=runner,
+            )
+            repo = data.get("repository")
+            if not repo:
+                raise ProjectsError(f"no repository {owner}/{name}")
+            conn = repo[conn_name]
+            total = conn["totalCount"]
+            for node in conn["nodes"]:
+                if node:
+                    out.append({"id": node["id"], "number": node["number"], "kind": kind})
+                    read += 1
+            if not conn["pageInfo"]["hasNextPage"]:
+                break
+            cursor = conn["pageInfo"]["endCursor"]
+        if read != total:
+            raise ProjectsError(f"read {read} {label} but the repository reports {total}")
+    return out
 
 
 _CARD_QUERY = """
