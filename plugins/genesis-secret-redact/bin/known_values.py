@@ -4,7 +4,8 @@
 Runs under any ``python3``; callers prefer the install's venv interpreter, where python-dotenv (the parser the
 runtime itself loads this file with) is importable and is used. Without it ``_fallback_parse`` reads the file:
 a port of python-dotenv's own grammar and ``${VAR}`` interpolation (its regexes, in its order), held to it by a
-differential test. It loads ``src/genesis/secrets_location.py`` by path (that module is stdlib-only by
+differential test. Three of that grammar's rules changed in python-dotenv 1.2.3; the port asks the installed
+library which it follows (``_dialect``) and follows the newer ones where there is none. It loads ``src/genesis/secrets_location.py`` by path (that module is stdlib-only by
 contract), so the file it reads is the one every other reader resolves.
 
 What counts as a secret: a value of at least ``MIN_LEN`` characters whose variable NAME marks it
@@ -14,18 +15,24 @@ score as high as real keys), and redacting every long value would rewrite paths,
 session needs. Shorter secrets are left out: a value-match on a handful of characters would redact ordinary
 text.
 
-Every value is emitted in each spelling a tool's output can carry it in: as parsed, as the secrets file spells
-it (a quoted value keeps its escapes there), URL-encoded, JSON-escaped, and the stable middle of a base64 or
-base64url encoding at each of the three byte alignments (a value inside a larger base64 blob, such as an HTTP
-basic-auth header, lands on one of them). Each long line of a multi-line value is a needle too, with a
-placeholder of its own (``[secrets.env:VAR#2]``): a line-by-line reader delivers one line at a time.
+Every value is emitted in each spelling a tool's output can carry it in: as the secrets file spells it (a
+quoted value keeps its escapes there), as parsed, URL-encoded, HTML-escaped, in the JSON forms Python,
+JavaScript, Go and PHP encoders write, and the stable middle of a base64 or base64url encoding at each of the
+three byte alignments (a value inside a larger base64 blob, such as an HTTP basic-auth header, lands on one of
+them). The password or token inside a credential URL is a needle of its own, and so is each long line of a
+multi-line value (a line-by-line reader delivers one line at a time).
+
+Every needle TEXT has its own placeholder, so replacing can be undone exactly: the file's own spelling of a
+variable is ``[secrets.env:VAR]``, any other text of it ``[secrets.env:VAR~1]``, ``~2``..., and line ``n`` of
+a multi-line value ``[secrets.env:VAR#n]``. Two texts never share a placeholder, whichever variables they
+came from.
 
 ``--json`` prints ``{path, realpath, home, mtime_ns, size, needles, restore, overwritten}`` on stdout:
-``needles`` is ``[{var, text, placeholder}]``, longest text first; ``restore`` maps each placeholder to the text
-it stands for in the secrets file itself (what a write to that file must put back); ``overwritten`` names the
-variables whose value in the file is placeholder text (a write stored one, and that key is gone). That stdout is
-the only place a value ever goes. Exit 0 with no needles when the file is absent; exit 2 when it exists but
-cannot be read.
+``needles`` is ``[{var, text, placeholder}]``, longest text first; ``restore`` is the same list read
+backwards, placeholder -> text; ``overwritten`` names the variables whose value in the file is placeholder
+text (a write stored one, and that key is gone); ``mtime_ns`` and ``size`` are the file's identity before it
+was read, for a long-running caller to re-check. That stdout is the only place a value ever goes. Exit 0 with
+no needles when the file is absent; exit 2 when it exists but cannot be read.
 """
 
 from __future__ import annotations
@@ -33,6 +40,8 @@ from __future__ import annotations
 import argparse
 import base64
 import codecs
+import functools
+import html
 import importlib.util
 import json
 import os
@@ -85,8 +94,10 @@ _P_EXPORT = re.compile(r"(?:export[^\S\r\n]+)?")
 _P_QUOTED_KEY = re.compile(r"'([^']+)'")
 _P_KEY = re.compile(r"([^=\#\s]+)")
 _P_EQUALS = re.compile(r"(=[^\S\r\n]*)")
-_P_SINGLE = re.compile(r"'((?:\\'|[^'])*)'")
-_P_DOUBLE = re.compile(r'"((?:\\"|[^"])*)"')
+#: Quoted values, as python-dotenv reads them from 1.2.3 (a backslash escapes whatever follows it) and before
+#: (only an escaped quote is special, so ``'a\\'`` runs on to the next quote).
+_P_SINGLE = (re.compile(r"'((?:\\'|[^'])*)'"), re.compile(r"'((?:\\.|[^'\\])*)'", re.DOTALL))
+_P_DOUBLE = (re.compile(r'"((?:\\"|[^"])*)"'), re.compile(r'"((?:\\.|[^"\\])*)"', re.DOTALL))
 _P_BARE = re.compile(r"([^\r\n]*)")
 _P_COMMENT = re.compile(r"(?:[^\S\r\n]*#[^\r\n]*)?")
 _P_EOL = re.compile(r"[^\S\r\n]*(?:\r\n|\n|\r|$)")
@@ -105,6 +116,31 @@ def _interpolate(value: str, env: dict[str, str | None]) -> str:
     return _P_VARIABLE.sub(lambda m: env.get(m[1], m[2] if m[2] is not None else "") or "", value)
 
 
+@functools.cache
+def _dialect() -> tuple[bool, bool, bool]:
+    """Which of python-dotenv's 1.2.3 rules the parser in use follows: ``(a backslash escapes any character
+    inside quotes, a leading byte-order mark is dropped, KEY= # text is an empty value)``.
+
+    Asked of the installed library, one input per rule, so the port reads a file as the library that gives
+    the values does, whichever version that is. All three where there is no library.
+    """
+    try:
+        from io import StringIO
+
+        from dotenv import dotenv_values
+    except ImportError:
+        return True, True, True
+
+    def read(text: str) -> dict[str, str | None]:
+        return dotenv_values(stream=StringIO(text), interpolate=False)
+
+    return (
+        read("A='\\\\' #'").get("A") == "\\",
+        "A" in read("\ufeffA=b"),
+        read("A= #b").get("A") == "",
+    )
+
+
 def _bindings(text: str) -> list[tuple[str, str | None, str | None]]:
     """``(key, value before interpolation, the value's text as the file spells it)`` per binding, in file order.
 
@@ -112,6 +148,9 @@ def _bindings(text: str) -> list[tuple[str, str | None, str | None]]:
     a key with no ``=`` has no value (both ``None``). The third item is the matched text itself: what stands
     between the quotes, escapes included, or the bare value.
     """
+    escapes, bom, hash_is_comment = _dialect()
+    if bom:
+        text = text.removeprefix("\ufeff")
     pos = 0
 
     def take(pattern: re.Pattern[str]) -> re.Match[str]:
@@ -135,13 +174,15 @@ def _bindings(text: str) -> list[tuple[str, str | None, str | None]]:
             take(_P_SPACE)
             value = spelled = None
             if text[pos : pos + 1] == "=":
-                take(_P_EQUALS)
+                spaced = len(take(_P_EQUALS)[1]) > 1
                 first = text[pos : pos + 1]
-                if first == "'":
-                    spelled = take(_P_SINGLE)[1]
+                if hash_is_comment and spaced and first == "#":
+                    value = spelled = ""
+                elif first == "'":
+                    spelled = take(_P_SINGLE[escapes])[1]
                     value = _unescape(_P_SINGLE_ESCAPE, spelled)
                 elif first == '"':
-                    spelled = take(_P_DOUBLE)[1]
+                    spelled = take(_P_DOUBLE[escapes])[1]
                     value = _unescape(_P_DOUBLE_ESCAPE, spelled)
                 elif first in ("", "\n", "\r"):
                     value = spelled = ""
@@ -197,13 +238,22 @@ def _is_secret(var: str, value: str) -> bool:
     )
 
 
+def _json_forms(value: str) -> set[str]:
+    """``value`` as JSON encoders write it inside a string: Python (ASCII only), JavaScript and jq (non-ASCII
+    kept), Go (``&``, ``<``, ``>`` as ``\\u00XX``), and PHP or JSON-in-HTML (``/`` as ``\\/``)."""
+    plain = {json.dumps(value)[1:-1], json.dumps(value, ensure_ascii=False)[1:-1]}
+    go = {t.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e") for t in plain}
+    return plain | go | {t.replace("/", "\\/") for t in plain | go}
+
+
 def spellings(value: str) -> set[str]:
     """Every encoded form of ``value`` a tool's output can carry, each at least MIN_LEN characters."""
     forms = {
         value,
         urllib.parse.quote(value, safe=""),
         urllib.parse.quote_plus(value),
-        json.dumps(value)[1:-1],
+        html.escape(value),
+        *_json_forms(value),
     }
     data = value.encode()
     for offset in range(3):
@@ -211,42 +261,75 @@ def spellings(value: str) -> set[str]:
         chunk = chunk[: len(chunk) - len(chunk) % 3]
         core = base64.b64encode(chunk).decode()
         forms.update({core, core.replace("+", "-").replace("/", "_")})
+    if _CREDENTIAL_URL.match(value):
+        # A client that splits the URL prints the password, or the token standing in for a user, by itself.
+        try:
+            parts = urllib.parse.urlsplit(value)
+            found = (parts.password, parts.username)
+        except ValueError:  # an unbalanced `[` or a character that normalises to `/`: the whole value stays a needle
+            found = ()
+        for part in found:
+            if part:
+                forms.update({part, urllib.parse.unquote(part)})
     return {f for f in forms if len(f) >= MIN_LEN}
+
+
+def _long_lines(text: str) -> list[tuple[int, str]]:
+    """``(line number, stripped line)`` for each line of a multi-line ``text`` long enough to be a needle."""
+    lines = text.splitlines()
+    return [
+        (number, line.strip())
+        for number, line in enumerate(lines if len(lines) > 1 else [], 1)
+        if len(line.strip()) >= MIN_LEN and not _PEM_ARMOR.fullmatch(line.strip())
+    ]
 
 
 def select(pairs: dict[str, str], source: str = "") -> tuple[list[dict], dict[str, str]]:
     """``(needles, restore)`` for the parsed ``pairs`` of a secrets file whose text is ``source``.
 
     ``needles``: ``{var, text, placeholder}`` for every spelling of every secret value, longest text first.
-    ``restore``: placeholder -> the text it stands for in the file. For a whole value that is the file's own
-    spelling of it (so a line a session reads and writes back unchanged comes out byte for byte), or the
-    parsed value when ``source`` does not hold the variable.
+    ``restore``: placeholder -> text, the same list read backwards. Each text has ONE placeholder and each
+    placeholder one text, so replacing every needle in the file and then restoring gives the file back byte
+    for byte, whatever the file holds: two variables sharing a value in different quoting, an encoded copy
+    of a value in another line, one line of a multi-line value.
     """
     spelled = _file_spellings(source)
-    found: dict[str, tuple[str, str]] = {}
-    restore: dict[str, str] = {}
-    for var, value in pairs.items():
-        if not _is_secret(var, value) or _PLACEHOLDER.search(value):
-            continue
-        whole = f"[secrets.env:{var}]"
+    chosen = [
+        (var, value, re.sub(r"[\[\]\r\n]", "_", var))
+        for var, value in pairs.items()
+        if _is_secret(var, value) and not _PLACEHOLDER.search(value)
+    ]
+    owner: dict[str, tuple[str, str]] = {}  # text -> (var, placeholder)
+    used: set[str] = set()
+
+    def claim(text: str, var: str, stem: str) -> None:
+        if text in owner:
+            return
+        placeholder, n = f"[secrets.env:{stem}]", 1
+        while placeholder in used:  # only a variable NAMED like another's suffix form can collide
+            n += 1
+            placeholder = f"[secrets.env:{stem}~{n}]"
+        used.add(placeholder)
+        owner[text] = (var, placeholder)
+
+    # First what the file itself holds: those texts get the plain names.
+    for var, value, name in chosen:
         in_file, interpolated = spelled.get(var, (value, False))
-        restore[whole] = in_file
-        forms = spellings(value)
-        if not interpolated and len(in_file) >= MIN_LEN:
-            forms.add(in_file)
-        for text in forms:
-            found.setdefault(text, (var, whole))
-        # The file's lines first: where both give a line, the file's spelling is the one to restore.
-        for origin in (value,) if interpolated else (in_file, value):
-            lines = origin.splitlines()
-            for number, line in enumerate(lines if len(lines) > 1 else [], 1):
-                line = line.strip()
-                if len(line) >= MIN_LEN and not _PEM_ARMOR.fullmatch(line):
-                    placeholder = f"[secrets.env:{var}#{number}]"
-                    found.setdefault(line, (var, placeholder))
-                    restore.setdefault(placeholder, line)
-    ordered = sorted(found.items(), key=lambda kv: (-len(kv[0]), kv[0]))
-    return [{"var": v, "text": t, "placeholder": p} for t, (v, p) in ordered], restore
+        if interpolated:  # the expression is not the secret, and is not a needle
+            continue
+        if len(in_file) >= MIN_LEN:
+            claim(in_file, var, name)
+        for number, line in _long_lines(in_file):
+            claim(line, var, f"{name}#{number}")
+    # Then every other text of each value, numbered in a fixed order.
+    for var, value, name in chosen:
+        for k, text in enumerate(sorted(t for t in spellings(value) if t not in owner), 1):
+            claim(text, var, f"{name}~{k}")
+        for number, line in _long_lines(value):
+            claim(line, var, f"{name}#{number}~1")
+    ordered = sorted(owner.items(), key=lambda kv: (-len(kv[0]), kv[0]))
+    needles_ = [{"var": v, "text": t, "placeholder": p} for t, (v, p) in ordered]
+    return needles_, {n["placeholder"]: n["text"] for n in needles_}
 
 
 def needles(pairs: dict[str, str], source: str = "") -> list[dict]:
@@ -271,11 +354,12 @@ def load(root: Path) -> dict:
         st = path.stat()
     except FileNotFoundError:
         return result
-    # Values as the runtime reads them (newlines translated); the file's own spellings from the bytes as they
-    # are, so a CRLF file's multi-line value is matched and restored with its ``\r\n``.
+    # One read. The file's own spellings come from the bytes as they are, so a CRLF file's multi-line value is
+    # matched and restored with its ``\r\n``; the values come from the same text with newlines translated,
+    # which is how the runtime reads the file.
     with path.open(encoding="utf-8", errors="replace", newline="") as handle:
         raw = handle.read()
-    pairs = parse_dotenv(path.read_text(encoding="utf-8", errors="replace"))
+    pairs = parse_dotenv(raw.replace("\r\n", "\n").replace("\r", "\n"))
     selected, restore = select(pairs, raw)
     result.update(
         mtime_ns=st.st_mtime_ns,
@@ -296,6 +380,9 @@ def main(argv: list[str] | None = None) -> int:
         result = load(repo_root(args.repo_root))
     except (OSError, ImportError) as exc:
         print(f"known_values: cannot read the secrets file: {type(exc).__name__}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - the message can quote a value; only its type is printed
+        print(f"known_values: cannot select the values: {type(exc).__name__}", file=sys.stderr)
         return 2
     if args.json:
         json.dump(result, sys.stdout)

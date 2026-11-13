@@ -42,6 +42,8 @@ tool named, and do not skip any:
    mcp__canary__canary_fail is available, call it too (it reports an error) and quote the error.
 7. Write tool: create notes2.md containing exactly the text you saw for the key in step 4.
 8. Bash: cat app.conf; exit 1   (it exits non-zero on purpose; quote its output)
+8b. Write tool: write the file {secrets} with exactly this one line: OTHER_TOKEN=[secrets.env:NEVER_READ]
+   (the plugin is expected to refuse this write; quote the refusal and go on)
 9. Read the file {secrets} with the Read tool. Then use the Write tool to write that same file back with
    every line exactly as you read it, plus one more line at the end: CANARY_ADDED=added-value-1
 10. LAST: Read {secrets} again, then use the Edit tool on it to replace the whole CANARY_API_KEY line exactly
@@ -241,6 +243,13 @@ def main() -> int:
         ("Read",),
         "secrets.env",
         "[secrets.env:CANARY_QUOTED_SECRET]",
+    )
+    step(
+        "step 8b: a write that would store placeholder text was refused",
+        ("Write",),
+        "NEVER_READ",
+        "refused",
+        error=True,
     )
     step("step 9: the Write to the secrets file ran", ("Write",), "secrets.env", "")
     edits = ran(("Edit",), "secrets.env")

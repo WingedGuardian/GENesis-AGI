@@ -29,27 +29,29 @@ const { execFile } = require("child_process");
 (async () => {
   const mod = await import("data:text/javascript," + encodeURIComponent(fs.readFileSync(spec.module, "utf8")));
   const logs = [];
-  let loaderRuns = 0, failLoads = 0, failResolves = 0, truncate = 0, now = Date.now(), tick = 0;
+  let loaderRuns = 0, failLoads = 0, truncate = 0, afterLoader = null, now = Date.now(), tick = 0;
   Date.now = () => now;
   const $ = {
     plugin: { root: spec.plugin },
     ui: { log: m => logs.push(m) },
     fs: {
-      stat: async p => { const st = fs.statSync(p); return { kind: st.isFile() ? "file" : "dir", mtimeMs: st.mtimeMs, size: st.size }; },
+      stat: async (p, options) => {
+        const st = fs.statSync(p);
+        const stat = { kind: st.isFile() ? "file" : st.isDirectory() ? "dir" : "other", mtimeMs: st.mtimeMs, size: st.size };
+        return options?.resolve ? { ...stat, realPath: fs.realpathSync(p) } : stat;
+      },
       read: async p => fs.readFileSync(p, "utf8"),
       write: async (p, text) => fs.writeFileSync(p, text),
     },
     process: { run: argv => new Promise(resolve => {
-      if (argv[0] === "realpath") {
-        if (failResolves > 0) { failResolves -= 1; return resolve({ exitCode: 1, stdout: "", stderr: "" }); }
-      } else {
-        loaderRuns += 1;
-        if (failLoads > 0) { failLoads -= 1; return resolve({ exitCode: 1, stdout: "", stderr: "" }); }
-      }
+      loaderRuns += 1;
+      if (failLoads > 0) { failLoads -= 1; return resolve({ exitCode: 1, stdout: "", stderr: "" }); }
       // HOME is the scratch directory, so `~/secrets.env` names the scratch secrets file.
       execFile(argv[0], argv.slice(1), { env: { ...process.env, SECRETS_PATH: spec.secrets, HOME: spec.dir }, encoding: "utf8" },
         (err, stdout, stderr) => {
-          const cut = argv[0] !== "realpath" && truncate > 0 && (truncate -= 1, true);
+          const cut = truncate > 0 && (truncate -= 1, true);
+          const hook = afterLoader; afterLoader = null;
+          if (hook) hook();
           resolve({ exitCode: err ? (err.code ?? 1) : 0, stdout, stderr, isStdoutTruncated: cut });
         });
     }) },
@@ -65,7 +67,7 @@ const { execFile } = require("child_process");
     put: (p, text) => { fs.mkdirSync(require("path").dirname(p), { recursive: true }); fs.writeFileSync(p, text); },
     advance: ms => { now += ms; },
     failNext: n => { failLoads = n; },
-    failResolve: n => { failResolves = n; },
+    afterNextLoader: fn => { afterLoader = fn; },
     truncateNext: n => { truncate = n; },
     link: (target, p) => { fs.mkdirSync(require("path").dirname(p), { recursive: true }); fs.symlinkSync(target, p); },
     runs: () => loaderRuns,
@@ -207,7 +209,8 @@ def test_a_failing_loader_is_retried_only_after_the_back_off(tmp_path):
         return { raw, during, later, after: t.runs() };
         """,
     )
-    assert res["out"] == {"raw": {"result": KEY}, "during": 1, "later": {"result": P}, "after": 2}
+    # A first load runs the loader twice (once to learn the path, once behind its stamp).
+    assert res["out"] == {"raw": {"result": KEY}, "during": 1, "later": {"result": P}, "after": 3}
     assert len(res["logs"]) == 1 and "this session is NOT redacted" in res["logs"][0]
 
 
@@ -270,7 +273,7 @@ def test_a_saved_large_output_is_cleaned_and_no_other_file_is(tmp_path):
     res = _run(
         tmp_path,
         """
-        const saved = t.dir + "/session/tool-results/out.txt", other = t.dir + "/elsewhere/out.txt";
+        const saved = t.dir + "/0a1b2c3d-1111-4222-8333-444455556666/tool-results/out.txt", other = t.dir + "/elsewhere/out.txt";
         t.put(saved, "tail " + t.v.key); t.put(other, "tail " + t.v.key);
         await t.emit("tool.call", { tool: "Bash" }, async () => ({ result: { stdout: "head", persistedOutputPath: saved } }));
         await t.emit("tool.call", { tool: "Bash" }, async () => ({ result: { stdout: "head", persistedOutputPath: other } }));
@@ -305,8 +308,7 @@ def test_only_a_write_tool_aimed_at_the_secrets_file_itself_gets_values(tmp_path
         await write("trailing space", "Write", t.secrets + " ");
         await write("trailing newline", "Write", t.secrets + "\\n");
         await write("not a write tool", "Bash", t.secrets);
-        t.failResolve(1);
-        await write("unresolvable", "Write", t.dir + "/sub/../secrets.env");
+        await write("a new file in a new folder", "Write", t.dir + "/new/deeper/notes.md");
         return seen;
         """,
     )
@@ -318,9 +320,9 @@ def test_only_a_write_tool_aimed_at_the_secrets_file_itself_gets_values(tmp_path
         "trailing space",
         "trailing newline",
         "not a write tool",
-        "unresolvable",
+        "a new file in a new folder",
     }
-    assert sum("could not resolve" in m for m in res["logs"]) == 1
+    assert res["logs"] == []
 
 
 def test_a_refusal_that_quotes_restored_input_is_redacted(tmp_path):
@@ -342,15 +344,25 @@ def test_an_errored_calls_saved_output_is_cleaned_and_a_link_to_the_secrets_file
     res = _run(
         tmp_path,
         """
-        const saved = t.dir + "/s/tool-results/big.txt", link = t.dir + "/s/tool-results/link";
-        t.put(saved, "tail " + t.v.key);
+        const folder = t.dir + "/my project/0a1b2c3d-1111-4222-8333-444455556666/tool-results/";
+        const saved = folder + "big.txt", quoted = folder + "quoted.txt", punct = folder + "punct.txt", link = folder + "link";
+        const fixture = t.dir + "/repo/tool-results/fixture.env";
+        for (const p of [saved, quoted, punct, fixture]) t.put(p, "tail " + t.v.key);
         t.link(t.secrets, link);
-        await t.emit("tool.call", { tool: "Bash" },
-          async () => ({ isError: true, text: "Output too large, saved to: " + saved + " and " + link }));
-        return { saved: t.read(saved), secrets: t.read() };
+        // Claude Code's own notice ends the path at the end of the line; other tools quote it or punctuate.
+        const text = "Output too large. Full output saved to: " + saved + "\\n(see \\"" + quoted + "\\").\\n(kept at " + punct + ").\\nalso " + link + "\\nand " + fixture;
+        await t.emit("tool.call", { tool: "Bash" }, async () => ({ isError: true, text }));
+        return { saved: t.read(saved), quoted: t.read(quoted), punct: t.read(punct), fixture: t.read(fixture), secrets: t.read() };
         """,
     )
-    assert res["out"] == {"saved": f"tail {P}", "secrets": f"CANARY_API_KEY={KEY}\n"}
+    assert res["out"] == {
+        "saved": f"tail {P}",
+        "quoted": f"tail {P}",
+        "punct": f"tail {P}",
+        "fixture": f"tail {KEY}",  # a user's own file under some folder named tool-results
+        "secrets": f"CANARY_API_KEY={KEY}\n",
+    }
+    assert len(res["logs"]) == 2 and all("not found to clean" in m for m in res["logs"])
 
 
 def test_a_result_the_walk_cannot_read_is_redacted_through_its_json(tmp_path):
@@ -391,3 +403,174 @@ def test_cut_off_loader_output_is_a_failed_load_and_each_new_failure_is_logged(t
     assert (
         "more than Claude Code keeps" in res["logs"][0] and "keeping the values" in res["logs"][1]
     )
+
+
+def test_a_write_that_would_store_placeholder_text_as_a_value_is_refused(tmp_path):
+    res = _run(
+        tmp_path,
+        """
+        let ran = 0;
+        const next = async e => { ran += 1; return { result: "ok" }; };
+        const unknown = await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: "CANARY_API_KEY=[secrets.env:CANARY_API_KEY]\\nOTHER_TOKEN=[secrets.env:NEVER_READ]\\n" }, next);
+        const edit = await t.emit("tool.call", { tool: "Edit", file_path: t.secrets, old_string: "x", new_string: "A=[secrets.env:NEVER_READ]" }, next);
+        const known = await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: "CANARY_API_KEY=[secrets.env:CANARY_API_KEY]\\n" }, next);
+        const elsewhere = await t.emit("tool.call", { tool: "Write", file_path: t.dir + "/notes.md", content: "[secrets.env:NEVER_READ]" }, next);
+        return { unknown: unknown.deny, edit: edit.deny, known, elsewhere, ran };
+        """,
+    )
+    out = res["out"]
+    assert (
+        "[secrets.env:NEVER_READ]" in out["unknown"]
+        and "refused" in out["unknown"]
+        and KEY not in out["unknown"]
+    )
+    assert "[secrets.env:NEVER_READ]" in out["edit"]
+    assert (
+        out["known"] == {"result": "ok"}
+        and out["elsewhere"] == {"result": "ok"}
+        and out["ran"] == 2
+    )
+
+
+def test_a_file_whose_texts_share_a_value_is_written_back_byte_for_byte(tmp_path):
+    # Two variables hold one value in different quoting, and a comment keeps an encoded copy of it.
+    source = (
+        'FIRST_API_KEY="abcdefghijklmnop\\"quoted\\""\n'
+        "SECOND_API_KEY='abcdefghijklmnop\"quoted\"'\n"
+        "# was: abcdefghijklmnop%22quoted%22\n"
+    )
+    res = _run(
+        tmp_path,
+        """
+        const read = await t.emit("tool.call", { tool: "Read" }, async () => ({ result: t.read() }));
+        let written;
+        await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: read.result },
+          async e => { written = e.content; return { result: "ok" }; });
+        return { shown: read.result, written };
+        """,
+        secrets=source,
+    )
+    assert "abcdefghijklmnop" not in res["out"]["shown"]
+    assert res["out"]["written"] == source
+
+
+def test_a_rotated_out_value_keeps_a_placeholder_of_its_own(tmp_path):
+    # The old line is kept as a comment. Both values must stay redacted, under different names, or writing the
+    # file back would turn the comment into the new key.
+    res = _run(
+        tmp_path,
+        """
+        await t.emit("session.start", {});
+        t.write("# old: CANARY_API_KEY=" + t.v.key + "\\nCANARY_API_KEY=" + t.v.key2 + "\\n");
+        const read = await t.emit("tool.call", { tool: "Read" }, async () => ({ result: t.read() }));
+        let written;
+        await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: read.result },
+          async e => { written = e.content; return { result: "ok" }; });
+        return { shown: read.result, same: written === t.read() };
+        """,
+    )
+    assert res["out"] == {
+        "shown": "# old: CANARY_API_KEY=[secrets.env:CANARY_API_KEY~earlier]\nCANARY_API_KEY=[secrets.env:CANARY_API_KEY]\n",
+        "same": True,
+    }
+
+
+def test_a_change_between_the_first_read_and_its_stamp_is_not_cached_as_current(tmp_path):
+    res = _run(
+        tmp_path,
+        """
+        // The file changes right after the first loader run has read it.
+        t.afterNextLoader(() => t.write("CANARY_API_KEY=" + t.v.key2 + "\\n"));
+        await t.emit("session.start", {});
+        return await t.emit("tool.call", { tool: "Bash" }, async () => ({ result: "now " + t.v.key2 }));
+        """,
+    )
+    assert res["out"] == {"result": f"now {P}"}
+
+
+def test_the_first_event_already_sees_a_change_made_while_the_path_was_learned(tmp_path):
+    # The first load reads before the path is known, so nothing stamped that read; it reads again behind a
+    # stamp. A prompt is redacted once, with no later reload to catch up, so it shows the difference.
+    res = _run(
+        tmp_path,
+        """
+        t.afterNextLoader(() => t.write("CANARY_API_KEY=" + t.v.key2 + "\\n"));
+        const prompt = await t.emit("prompt.submit", { text: "use " + t.v.key2 });
+        return { prompt, runs: t.runs() };
+        """,
+    )
+    assert res["out"] == {"prompt": {"text": f"use {P}"}, "runs": 2}
+
+
+def test_a_value_used_as_an_object_key_is_redacted(tmp_path):
+    res = _run(
+        tmp_path,
+        'return await t.emit("tool.call", { tool: "mcp__x__y" }, async () => ({ result: { [t.v.key]: 1, plain: 2 } }));',
+    )
+    assert res["out"] == {"result": {P: 1, "plain": 2}}
+
+
+def test_a_held_value_keeps_its_name_through_a_second_rotation(tmp_path):
+    # Rotated twice: the first old key's placeholder must still mean that key, or a write of a text copied
+    # after the first rotation would store the second key in its place.
+    res = _run(
+        tmp_path,
+        """
+        await t.emit("session.start", {});
+        t.write("# a: CANARY_API_KEY=" + t.v.key + "\\nCANARY_API_KEY=" + t.v.key2 + "\\n");
+        const first = await t.emit("tool.call", { tool: "Read" }, async () => ({ result: t.read() }));
+        t.write("# a: CANARY_API_KEY=" + t.v.key + "\\n# b: CANARY_API_KEY=" + t.v.key2 + "\\nCANARY_API_KEY=" + t.v.key3 + "\\n");
+        const second = await t.emit("tool.call", { tool: "Read" }, async () => ({ result: t.read() }));
+        let written;
+        await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: second.result },
+          async e => { written = e.content; return { result: "ok" }; });
+        return { first: first.result, second: second.result, same: written === t.read() };
+        """,
+        key3="ck_" + "aa11bb22cc33dd44ee55ff6677889900",
+    )
+    held = "[secrets.env:CANARY_API_KEY~earlier]"
+    assert res["out"]["first"].startswith(f"# a: CANARY_API_KEY={held}\n")
+    assert res["out"]["second"].startswith(f"# a: CANARY_API_KEY={held}\n")
+    assert res["out"]["same"] is True
+
+
+def test_a_value_equal_to_another_variables_name_is_replaced_once(tmp_path):
+    # One pass: the placeholder minted for one value is never matched again as another value.
+    res = _run(
+        tmp_path,
+        """
+        await t.emit("session.start", {});
+        const shown = await t.emit("tool.call", { tool: "Read" }, async () => ({ result: t.read() }));
+        let written;
+        await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: shown.result },
+          async e => { written = e.content; return { result: "ok" }; });
+        return { shown: shown.result, same: written === t.read() };
+        """,
+        secrets=f"TOKEN_ENV_NAME=CANARY_SERVICE_TOKEN\nCANARY_SERVICE_TOKEN={KEY}\n",
+    )
+    assert res["out"] == {
+        # The name on line 2 is TOKEN_ENV_NAME's value, so it is replaced too: once, never inside a placeholder.
+        "shown": "TOKEN_ENV_NAME=[secrets.env:TOKEN_ENV_NAME]\n[secrets.env:TOKEN_ENV_NAME]=[secrets.env:CANARY_SERVICE_TOKEN]\n",
+        "same": True,
+    }
+
+
+def test_a_write_with_placeholder_text_is_refused_when_the_hook_failed_or_nothing_loaded(tmp_path):
+    res = _run(
+        tmp_path,
+        """
+        let ran = 0;
+        const next = async e => { ran += 1; return { result: "ok" }; };
+        // No load has succeeded yet: nothing can be restored, so the write is refused.
+        t.failNext(2);
+        const unloaded = await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: "CANARY_API_KEY=[secrets.env:CANARY_API_KEY]\\n" }, next);
+        // The hook failed before the tool ran.
+        const failed = Object.assign(async e => { ran += 1; return { result: "ok" }; }, { called: false, error: { kind: "error", message: "x" } });
+        const caught = await t.catchers["tool.call"](t.$, { tool: "Edit", file_path: t.dir + "/x", old_string: "a", new_string: "[secrets.env:CANARY_API_KEY]" }, failed);
+        const plain = await t.catchers["tool.call"](t.$, { tool: "Edit", file_path: t.dir + "/x", old_string: "a", new_string: "b" }, failed);
+        return { unloaded: unloaded.deny, caught: caught.deny, plain, ran };
+        """,
+    )
+    out = res["out"]
+    assert "refused" in out["unloaded"] and "refused" in out["caught"]
+    assert out["plain"] == {"result": "ok"} and out["ran"] == 1

@@ -11,6 +11,8 @@
 // withheld with a notice naming this plugin. An errored tool call (`isError`) whose text holds a value is
 // answered with the same text redacted (as a `deny`, the one form a hook can answer an error in).
 //
+// One refusal: a write to the secrets file that would store placeholder text as a value (see tool.call).
+//
 // Not covered here: Monitor and background Bash output also reach records Claude Code keeps itself and this mod
 // cannot rewrite (queued notifications, task output files). The `.catch` handling follows the pattern of the
 // secret-shield mod (Singh-AP/awesome-claude-mods, MIT); no code is copied from it.
@@ -18,31 +20,38 @@
 // Plain JavaScript, so tests/test_plugins/test_secret_redact_mod.py can run it under node against a fake engine.
 
 let pairs = [] // [text, placeholder], longest text first: every spelling of every value this session has held
-let restores = new Map() // placeholder -> the text it stands for in the secrets file itself
+let restores = new Map() // placeholder -> text: `pairs` read backwards (one placeholder per text, so it is exact)
 let secretsPath = ''
 let secretsReal = '' // the secrets file with symlinks resolved, for the restore-on-write target check
-let home = '' // Claude Code's file tools expand a leading `~` (measured on 2.1.299), so the target check must too
+let home = '' // Claude Code's file tools expand a leading `~` (measured on 2.1.299); the engine's stat does not
 let stamp = '' // mtimeMs:size of secretsPath, taken BEFORE the last load read it
 let warned = false
 let retryAt = 0 // no load before this time: a loader that keeps failing must not run on every event
 let reported = '' // the overwritten keys last logged, so each set is logged once
 
 const RETRY_MS = 30_000
-const WRITES = new Set(['Edit', 'Write', 'MultiEdit'])
+const WRITES = new Set(['Edit', 'Write'])
 const WITHHELD = '[genesis-secret-redact could not redact this output, so it was withheld; the plugin is failing: check `claude --debug` output]'
+const PLACEHOLDER = /\[secrets\.env:[^\]\r\n]*\]/g
+// A file a session saved: .../<session id>/tool-results/<name>, or deeper under that session's folder.
+const SAVED = /\/[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\/(?:[^/]+\/)*tool-results\/[^/]+$/
 
 function repoRoot(pluginRoot) {
   return pluginRoot.replace(/\/+$/, '').replace(/\/plugins\/[^/]+$/, '')
 }
 
+// One pass each way: text a replacement produced is never matched again (a value may equal another variable's
+// name, so a second pass would rewrite inside a placeholder). Longest text first, so the alternation takes the
+// longest needle at each position.
+let matcher = null // RegExp of every text in `pairs`, rebuilt on each load
+const byText = new Map()
+
 function redactText(s) {
-  for (const [text, placeholder] of pairs) if (s.includes(text)) s = s.split(text).join(placeholder)
-  return s
+  return matcher ? s.replace(matcher, m => byText.get(m) ?? m) : s
 }
 
 function restoreText(s) {
-  for (const [placeholder, text] of restores) if (s.includes(placeholder)) s = s.split(placeholder).join(text)
-  return s
+  return s.replace(PLACEHOLDER, m => restores.get(m) ?? m)
 }
 
 function deep(x, f) {
@@ -50,24 +59,42 @@ function deep(x, f) {
   if (Array.isArray(x)) return x.map(i => deep(i, f))
   if (x && typeof x === 'object') {
     const o = {}
-    for (const k of Object.keys(x)) o[k] = deep(x[k], f)
+    for (const k of Object.keys(x)) o[f(k)] = deep(x[k], f) // a result keyed by a value holds it in the key
     return o
   }
   return x
 }
 
-// A path as the file tools will open it: `~` expanded, then symlinks and `..` resolved. undefined when it cannot
-// be resolved. `realpath` prints the path and one newline; only that newline is removed, because a path that
-// differs from the secrets file by trailing whitespace is a different file.
-async function resolved($, target) {
-  if (home && (target === '~' || target.startsWith('~/'))) target = home + target.slice(1)
-  const run = await $.process.run(['realpath', '-m', '--', target], { timeoutMs: 5000 }).catch(() => undefined)
-  return run && run.exitCode === 0 ? run.stdout.replace(/\n$/, '') : undefined
+// `.` and `..` taken out by name, as the file tools do before they open a path.
+function tidy(path) {
+  const out = []
+  for (const part of path.split('/')) {
+    if (part === '..' && out.length && out[out.length - 1] !== '..' && out[out.length - 1] !== '') out.pop()
+    else if (part !== '.' && (part !== '' || !out.length)) out.push(part)
+  }
+  const joined = out.join('/') || (path.startsWith('/') ? '/' : '.')
+  return path.length > 1 && path.endsWith('/') && joined !== '/' ? `${joined}/` : joined
 }
 
-// Whether a write's target is the secrets file, by resolved path: a symlink (of any name) or another spelling of
-// the path that missed the check would write placeholder text over the real values. One `realpath` run per
-// Edit/Write, which is cheap next to the write itself.
+// Where a path lands, as the file tools will open it: `~` expanded (the engine's stat leaves it alone), `..`
+// taken out by name, then links resolved by the engine. A path that is not there yet lands in the nearest folder
+// that is, plus the rest. undefined when nothing on the way can be read.
+async function resolved($, target) {
+  if (home && (target === '~' || target.startsWith('~/'))) target = home + target.slice(1)
+  let path = tidy(target)
+  let rest = ''
+  for (;;) {
+    const st = await $.fs.stat(path, { resolve: true }).catch(() => undefined)
+    if (st?.realPath !== undefined) return st.realPath.replace(/\/$/, '') + rest
+    if (path === '/' || path === '.') return undefined
+    const cut = path.lastIndexOf('/')
+    rest = (cut < 0 ? `/${path}` : path.slice(cut)) + rest
+    path = cut < 0 ? '.' : cut === 0 ? '/' : path.slice(0, cut)
+  }
+}
+
+// Whether a write's target is the secrets file, by where it lands: a symlink (of any name) or another spelling
+// of the path that missed the check would write placeholder text over the real values.
 async function isSecretsFile($, target) {
   if (typeof target !== 'string' || !secretsPath) return false
   if (target === secretsPath || target === secretsReal) return true
@@ -77,21 +104,63 @@ async function isSecretsFile($, target) {
   return real === secretsReal
 }
 
-// Rewrite a large output Claude Code saved to its session's tool-results folder. Only a path that RESOLVES to
-// such a file: a tool result that merely names some other file must not get that file rewritten, and a link
-// from a tool-results folder to the secrets file must never get the values there replaced by placeholders.
+// Rewrite a large output Claude Code saved for a session; true when the file was one and is now clean. Only a
+// file that LANDS in a session's tool-results folder: a tool result that merely names some other file must not
+// get that file rewritten, and a link from such a folder to the secrets file must never get the values there
+// replaced by placeholders.
 async function cleanSaved($, path) {
-  if (!/\/tool-results\/[^/]+$/.test(path)) return
   try {
-    const real = await resolved($, path)
-    if (real === undefined || real === secretsReal || !/\/tool-results\/[^/]+$/.test(real)) return
-    const text = await $.fs.read(real)
+    const st = await $.fs.stat(path, { resolve: true })
+    if (st.kind !== 'file' || st.realPath === undefined || st.realPath === secretsReal || !SAVED.test(st.realPath)) return false
+    const text = await $.fs.read(st.realPath)
     const clean = redactText(text)
-    if (clean !== text) await $.fs.write(real, clean)
+    if (clean !== text) await $.fs.write(st.realPath, clean)
+    return true
   } catch (err) {
     // The model's copy is still redacted (and any Read of that file is redacted here); the disk copy is not.
     $.ui.log(`genesis-secret-redact: could not clean saved output ${path} (${err?.message ?? err})`)
+    return false
   }
+}
+
+// Clean the saved outputs an errored call names in its text. Claude Code ends such a path at the end of its
+// line and a folder name may hold spaces, while other tools quote a path or follow it with punctuation: so on
+// each line every place the path could start and end is tried, longest first, until one is a saved file.
+async function cleanNamed($, text) {
+  for (const line of text.split('\n')) {
+    const at = line.indexOf('/tool-results/')
+    if (at < 0) continue
+    const starts = []
+    for (let i = 0; i <= at; i++) if (line[i] === '/' && (i === 0 || /[\s"'(:=]/.test(line[i - 1]))) starts.push(i)
+    const name = at + '/tool-results/'.length
+    const stop = line.slice(name).search(/[\s"'<>]/)
+    const ends = new Set()
+    for (let end of [line.trimEnd().length, stop < 0 ? line.length : name + stop]) {
+      ends.add(end)
+      while (end > name && /[).,;:]/.test(line[end - 1])) end--
+      ends.add(end)
+    }
+    let done = false
+    for (const start of starts) {
+      for (const end of [...ends].sort((a, b) => b - a)) {
+        const candidate = line.slice(start, end)
+        if (done || !SAVED.test(candidate)) continue
+        const st = await $.fs.stat(candidate).catch(() => undefined)
+        if (st?.kind === 'file') done = await cleanSaved($, candidate)
+      }
+    }
+    if (!done) $.ui.log('genesis-secret-redact: an error named a saved output that was not found to clean; its disk copy may hold a value')
+  }
+}
+
+// Placeholder text left in what an Edit or Write would store.
+function leftover(call) {
+  const written = [call.content, call.new_string].filter(t => typeof t === 'string')
+  return [...new Set(written.flatMap(t => t.match(PLACEHOLDER) ?? []))]
+}
+
+function refusal(left) {
+  return `genesis-secret-redact refused this write to the secrets file: it would store placeholder text as a value (${left.join(', ')}). A placeholder is turned back into a value only when this session read that value. Give the real value, or use Edit on the lines you mean to change and leave that line as it is.`
 }
 
 // The fallback when a structured walk throws: redact the JSON text and parse it back.
@@ -111,21 +180,50 @@ async function python($, root) {
   return st && st.kind === 'file' ? venv : 'python3'
 }
 
-async function load($) {
+async function runLoader($) {
   const root = repoRoot($.plugin.root)
-  // Stamp first: a write that lands while the loader reads makes the next check differ and reload again.
-  const before = secretsPath ? await statStamp($, secretsPath) : ''
   const run = await $.process.run([await python($, root), '-I', `${$.plugin.root}/bin/known_values.py`, '--json', '--repo-root', root], { timeoutMs: 20000 })
   if (run.exitCode !== 0) throw new Error(`known_values exited ${run.exitCode}`)
   if (run.isStdoutTruncated) throw new Error('known_values printed more than Claude Code keeps')
-  const parsed = JSON.parse(run.stdout)
+  return JSON.parse(run.stdout)
+}
+
+async function load($) {
+  // Stamp first: a write that lands while the loader reads makes the next check differ and reload again. When
+  // the loader names a path that was not stamped (the first load, or the file moved), stamp it and read again,
+  // so the stamp is never newer than the values it stands for.
+  let before = secretsPath ? await statStamp($, secretsPath) : ''
+  let parsed = await runLoader($)
+  if (parsed.path !== secretsPath) {
+    before = await statStamp($, parsed.path)
+    parsed = await runLoader($)
+  }
   const current = parsed.needles.map(n => [n.text, n.placeholder])
   // A value this session held stays redacted after it leaves the file: a rotated-out key is usually still valid
   // where it was issued, and the very call that replaced it echoes it back in its result (measured: an Edit).
+  // Its placeholder may now name the new value, so it gets a name of its own: every placeholder keeps one text.
   const texts = new Set(current.map(([text]) => text))
-  pairs = [...current, ...pairs.filter(([text]) => !texts.has(text))].sort((a, b) => b[0].length - a[0].length)
-  restores = new Map(Object.entries(parsed.restore))
-  stamp = secretsPath === parsed.path && before ? before : await statStamp($, parsed.path)
+  const taken = new Set(current.map(([, placeholder]) => placeholder))
+  // A held value keeps the name it was already shown under, so a placeholder the session copied earlier still
+  // means the same text; only a name the current values now use is renamed.
+  const gone = pairs.filter(([text]) => !texts.has(text))
+  for (const [, placeholder] of gone) if (!taken.has(placeholder)) taken.add(placeholder)
+  const held = []
+  for (const [text, placeholder] of gone) {
+    let name = placeholder
+    if (current.some(([, p]) => p === placeholder)) {
+      for (let n = 1; taken.has(name); n++) name = placeholder.replace(/\]$/, n === 1 ? '~earlier]' : `~earlier${n}]`)
+      taken.add(name)
+    }
+    held.push([text, name])
+  }
+  pairs = [...current, ...held].sort((a, b) => b[0].length - a[0].length)
+  restores = new Map(pairs.map(([text, placeholder]) => [placeholder, text]))
+  byText.clear()
+  for (const [text, placeholder] of pairs) byText.set(text, placeholder)
+  const escaped = pairs.map(([text]) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  matcher = escaped.length ? new RegExp(escaped.join('|'), 'g') : null
+  stamp = before
   secretsPath = parsed.path
   secretsReal = parsed.realpath ?? parsed.path
   home = parsed.home ?? ''
@@ -175,10 +273,21 @@ export function register(on) {
     await fresh($)
     let call = e
     // A write to the secrets file itself (onboarding adds or replaces a key): turn placeholders the model copied
-    // from a redacted read back into the text they stood for there, so the file keeps its values. Nowhere else: a
+    // from a redacted read back into the texts they stood for, so the file keeps its values. Nowhere else: a
     // placeholder written to any other file stays literal, or docs and tests about this plugin would receive
     // real keys.
-    if (WRITES.has(e.tool) && restores.size && (await isSecretsFile($, e.file_path))) call = deep(e, restoreText)
+    if (WRITES.has(e.tool) && !secretsPath && leftover(e).length && /(^|\/)secrets\.env$/.test(String(e.file_path))) {
+      // No load has succeeded, so nothing can be restored: a placeholder written to a file named like the
+      // secrets file would replace a key with text.
+      return { deny: refusal(leftover(e)) }
+    }
+    if (WRITES.has(e.tool) && (await isSecretsFile($, e.file_path))) {
+      call = deep(e, restoreText)
+      // What is left is a placeholder this session holds no text for. Written as it is, it would become that
+      // key's value and the real one would be gone, so this one write is refused (owner ruling 2026-11-12).
+      const left = leftover(call)
+      if (left.length) return { deny: refusal(left) }
+    }
     const ran = await next(call)
     if (ran.deny !== undefined) {
       // A refusal from further down may quote the call's input, which now holds restored values.
@@ -192,14 +301,16 @@ export function register(on) {
     // A large output is saved to a file and the result carries only its head: the value may be in the tail, so
     // the file is cleaned whatever the head holds. An errored call names the file only in its error text.
     const persisted = ran.result && typeof ran.result === 'object' ? ran.result.persistedOutputPath : undefined
-    if (typeof persisted === 'string') await cleanSaved($, persisted)
+    if (typeof persisted === 'string' && !(await cleanSaved($, persisted))) {
+      $.ui.log(`genesis-secret-redact: left ${persisted} as it is (not a file in a session's tool-results folder); it may hold a value`)
+    }
     if (ran.isError === true) {
       // A hook cannot answer in the errored form, and core keeps the error text in the transcript's record of the
       // call. When that text holds a value, answer with the same text redacted as a `deny`, which the model
       // receives as the call's error result (the tool has already run; nothing is undone or repeated).
       const text = typeof ran.text === 'string' ? ran.text : typeof ran.result === 'string' ? ran.result : undefined
       if (text === undefined) return ran
-      for (const m of text.matchAll(/\/\S*\/tool-results\/[^\s"'<>]+/g)) await cleanSaved($, m[0])
+      await cleanNamed($, text)
       const clean = redactText(text)
       return clean === text ? ran : { deny: clean }
     }
@@ -216,7 +327,10 @@ export function register(on) {
     if (same) return ran // nothing to redact: core's own record
     return context === undefined ? { result } : { result, context }
   }).catch(async ($, e, next) => {
-    // The result goes through unredacted (its stored row is still redacted by session.append); say so.
+    // Failed before the tool ran: a write carrying placeholder text could not be checked, so it is refused rather
+    // than run as it is (it may be aimed at the secrets file).
+    if (!next.called && WRITES.has(e.tool) && leftover(e).length) return { deny: refusal(leftover(e)) }
+    // The result goes through unredacted; say so.
     $.ui.log(`genesis-secret-redact: could not redact a ${e.tool} result (${next.error?.kind}: ${next.error?.message ?? ''})`)
     return next(e)
   })
