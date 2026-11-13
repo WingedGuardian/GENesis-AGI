@@ -875,6 +875,7 @@ class Repair:
         self._fds: list[int] = []
         self.update_fd: int | None = None  # update.lock's, handed to restore-hooks
         self.forward = False  # HEAD on `live` at the target: finishing a rollback
+        self.retrying = False  # this boot retries a heal that crashed partway (owner: once)
 
     def _hold(self, path: str, deadline: float) -> int | None:
         fd = _flock(path, deadline)
@@ -932,6 +933,11 @@ class Repair:
             self._say("nothing to repair: there is no update state")
             return 0
         rc = self._judge_state(locks[0])
+        if rc == 0:
+            # Healed, or nothing to heal: a failure from here (the hooks retry)
+            # must not keep a healed tree down (#4501 round 2 class audit).
+            global _changed, _healing
+            _changed = _healing = False
         self._retry_pending(owed)
         return rc
 
@@ -942,13 +948,23 @@ class Repair:
         state guards. By command (``judge`` false) 1, the tree not judged."""
         if not self.boot and not judge:
             return 1
-        verdict, reason = self.guard.verdict(self.state_path, self.repo)
+        # One read of the state for the verdict and the target (#4501 round 2):
+        # a holder may change it between two reads.
+        if os.path.lexists(self.state_path):
+            raw, state = self._state()
+            conflicts = os.path.join(
+                os.path.dirname(os.path.abspath(self.state_path)), "update_conflicts.json"
+            )
+            verdict, reason = self.guard.state_verdict(state, self.repo, conflicts)
+        else:
+            raw, state = None, None
+            verdict, reason = self.guard.SAFE, "there is no state file"
         self._say(f"{what} is still held after the wait; the checkout is {verdict}")
         mixed = verdict == self.guard.MIXED_TREE
         if not self.boot:
             return 1 if mixed else 0
-        raw, state = self._state()
         late = f"{what} was still held after {BOOT_BUDGET_S} s"
+        self._latch(verdict, state)  # before the lookup, which runs git (#4501 round 2)
         if mixed and self._live_target(state):
             self._page("refused", "critical", verdict, reason, raw, f"{late}. {_DOWN}")
             return 1
@@ -1025,9 +1041,19 @@ class Repair:
                 name = candidate
                 break
         mark = _end_mark(self.repo)
-        if not _boot().unresolved_repeat(
-            report, hashlib.sha256(raw).hexdigest(), mark, _KIT_ID, judged
-        ):
+        state_sha = hashlib.sha256(raw).hexdigest()
+        if isinstance(report, dict) and report.get("retry_left"):
+            # A heal that crashed partway gets one retry (owner ruling): its
+            # failure may be a one-time one (a disk briefly full).
+            if _boot().unresolved_repeat(
+                {**report, "retry_left": 0}, state_sha, mark, _KIT_ID, judged
+            ):
+                self.retrying = True
+                self._say(
+                    f"the last repair of this update state crashed partway ({name}); trying once more"
+                )
+            return False
+        if not _boot().unresolved_repeat(report, state_sha, mark, _KIT_ID, judged):
             return False
         self._say(
             "the last repair of this update state ended unresolved and nothing changed "
@@ -1126,6 +1152,23 @@ class Repair:
             return raw, None
         return raw, data if isinstance(data, dict) else None
 
+    def _latch(self, verdict: str, state: object) -> None:
+        """Judged half-written: from here a failure keeps the service down (Q2).
+        Decided from the state alone, with no git (#4501 round 2): a MIXED_TREE
+        verdict on a merging row that names a live move (rule 6's record) or
+        came from `live` (rule 6a). A main row never sets it, so a main
+        checkout's mixed tree still starts with its page. Set before the move's
+        target is resolved, since that lookup runs git under the boot deadline."""
+        global _healing
+        _healing = (
+            verdict == self.guard.MIXED_TREE
+            and isinstance(state, dict)
+            and state.get("phase") == "merging"
+            and (
+                self.guard._move_record(state) is not None or state.get("original_branch") == "live"
+            )
+        )
+
     def _judge_state(self, index_lock: str) -> int:
         global _healing
         raw, state = self._state()
@@ -1133,7 +1176,7 @@ class Repair:
         # Judged half-written: a failure resolving the move's target (its git
         # call can meet the boot deadline) keeps the service down (#4501 Codex
         # P1). Cleared below for a tree this repair never heals (a main row).
-        _healing = verdict == self.guard.MIXED_TREE
+        self._latch(verdict, state)
         to = self._live_target(state)
         _healing = False
         if verdict == self.guard.SAFE and to:
@@ -2029,6 +2072,8 @@ def _record_unresolved(repair: Repair | None, result: str) -> None:
             return
         manifest["result"] = result
         manifest["end_mark"] = _end_mark(repair.repo)
+        # One retry at the next start, unless this run was that retry (owner ruling).
+        manifest["retry_left"] = 0 if repair.retrying else 1
         write_json(path, manifest, private=True)
     except Exception as exc:  # noqa: BLE001 - never masks the boot refusal
         _log(f"could not record the failed heal in {path} ({type(exc).__name__}: {exc})")

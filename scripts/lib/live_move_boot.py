@@ -123,4 +123,5 @@ def unresolved_repeat(
         and report.get("end_mark") == mark
         and report.get("kit_id") == kit_id
         and report.get("end_verdict", judged) == judged
+        and not report.get("retry_left")  # a crashed heal's one retry is owed
     )

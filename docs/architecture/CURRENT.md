@@ -5168,8 +5168,8 @@ logger or unrelated exceptions with copied text and no provenance.
   critical page, a failure before judging with `skipped`. Each page's key is
   its class, the state's bytes as the run leaves them and an end mark of the
   checkout (HEAD, `status -z`, index.lock), so a heal that keeps a HOLD and the
-  next boot's HOLD page once; a repeat of an unresolved heal (a heal that failed
-  partway is recorded unresolved too) with nothing
+  next boot's HOLD page once; a repeat of an unresolved heal (a heal that crashed
+  partway is recorded unresolved too, with one retry at the next start: owner ruling) with nothing
   changed refuses at once with no new backup, unless another kit is installed
   (its `kit_id` is part of the match). Every run, by command too, holds the kit's
   `KIT.json` shared until it exits, so a reinstall's prune never removes a kit in use.

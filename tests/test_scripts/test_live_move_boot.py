@@ -232,28 +232,53 @@ def test_td36_a_target_lookup_failing_after_a_mixed_verdict_stays_down(w, mod, m
     assert [a["severity"] for a in w.alerts()] == ["critical"]
 
 
-def test_td36_a_heal_that_failed_partway_is_not_healed_again(w, mod, monkeypatch):
-    """Review SF-2: a heal that raised after the checkout began to change ends
-    unresolved in its REPAIR.json, with the checkout as left, so the next start
-    refuses at once: no second backup and no second page key."""
-    killed_tag_side(w, "Z3")
-    real = mod.Repair._apply
-
+def _crash_partway(mod, monkeypatch) -> None:
     def partway(self, *a, **kw):  # fails as it starts to change the checkout
         mod._changed = True
         raise OSError(30, "Read-only file system")
 
     monkeypatch.setattr(mod.Repair, "_apply", partway)
-    assert _main(w, mod, monkeypatch) == REFUSE
-    assert len(w.backups()) == 1
-    assert w.report()["result"].startswith("unresolved: the boot repair failed partway (OSError")
-    keys = _keys(w)
-    monkeypatch.setattr(mod.Repair, "_apply", real)
+
+
+def _next_start(mod, monkeypatch) -> None:
     monkeypatch.setattr(mod, "_changed", False)
     monkeypatch.setattr(mod, "_healing", False)
+    time.sleep(1.1)  # the next heal's report dir is named by the second and this pid
+
+
+def test_td36_a_heal_that_crashed_partway_twice_is_not_healed_a_third_time(w, mod, monkeypatch):
+    """Review SF-2 + owner ruling: a heal that raised after the checkout began to
+    change ends unresolved in its REPAIR.json with one retry owed. The next start
+    retries once; a second crash refuses at every later start, with no new
+    backup, until the tree or the kit changes."""
+    killed_tag_side(w, "Z3")
+    _crash_partway(mod, monkeypatch)
     assert _main(w, mod, monkeypatch) == REFUSE
-    assert len(w.backups()) == 1, "a heal that failed partway was tried again"
+    assert len(w.backups()) == 1
+    report = w.report()
+    assert report["result"].startswith("unresolved: the boot repair failed partway (OSError")
+    assert report["retry_left"] == 1
+    _next_start(mod, monkeypatch)
+    assert _main(w, mod, monkeypatch) == REFUSE
+    assert len(w.backups()) == 2, "the one retry a crashed heal is owed did not run"
+    assert w.report()["retry_left"] == 0
+    keys = _keys(w)
+    _next_start(mod, monkeypatch)
+    assert _main(w, mod, monkeypatch) == REFUSE
+    assert len(w.backups()) == 2, "a heal that crashed twice was tried a third time"
     assert all(":unresolved:" in k for k in _keys(w)[len(keys) :]), _keys(w)
+
+
+def test_td36_a_crashed_heal_retried_once_heals(w, mod, monkeypatch):
+    """The one retry is what heals a one-time failure (a disk briefly full)."""
+    killed_tag_side(w, "Z3")
+    real = mod.Repair._apply
+    _crash_partway(mod, monkeypatch)
+    assert _main(w, mod, monkeypatch) == REFUSE
+    monkeypatch.setattr(mod.Repair, "_apply", real)
+    _next_start(mod, monkeypatch)
+    assert _main(w, mod, monkeypatch) == 0
+    assert not w.state.exists(), "the retry did not heal"
 
 
 def test_td36_a_failure_before_judging_starts_with_a_page(w, mod, monkeypatch):
@@ -442,6 +467,42 @@ def test_td21_a_lock_held_past_the_budget_is_judged_read_only(
         assert alerts == []
     else:
         assert [(a["severity"], a["dedupe_key"].split(":")[2]) for a in alerts] == [page], alerts
+
+
+def test_td21_a_held_lock_target_lookup_failing_after_a_mixed_verdict_stays_down(
+    w, mod, monkeypatch
+):
+    """#4501 round 2 (Codex P1): the held-lock path judged a `live` row
+    half-written, then resolving its target raised (git under the deadline).
+    The judgment is latched from the state before that lookup: exit 75."""
+    killed_tag_side(w, "Z3")
+    fd = _hold(w.root / ".git" / "genesis-checkout.lock")
+    clock = FakeClock()
+    monkeypatch.setattr(mod, "_now", clock.now)
+    monkeypatch.setattr(mod, "_sleep", clock.sleep)
+
+    def lookup(self, state):
+        raise mod.RepairError("the boot deadline passed (git rev-parse)")
+
+    monkeypatch.setattr(mod.Repair, "_live_target", lookup)
+    try:
+        assert _main(w, mod, monkeypatch) == REFUSE
+    finally:
+        os.close(fd)
+    assert w.backups() == [] and w.state.exists()
+
+
+def test_a_failure_after_a_successful_heal_starts(w, mod, monkeypatch):
+    """#4501 round 2 class audit: once the heal returned 0 the tree is healed,
+    so a failure in the hooks retry after it starts (with a page), never 75."""
+    killed_tag_side(w, "Z3")
+
+    def broken(self, owed):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(mod.Repair, "_retry_pending", broken)
+    assert _main(w, mod, monkeypatch) == 0
+    assert not w.state.exists(), "the heal did not run first"
 
 
 def test_a_checkout_lock_past_the_wait_by_command_refuses_without_judging(w, mod, monkeypatch):
