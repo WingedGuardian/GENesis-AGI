@@ -144,6 +144,10 @@ class _State:
     merged_workers: set[str] = set()  # xdist workers whose hits were merged
     unreported: list[str] = []  # xdist workers whose hits never arrived
     faults = 0  # unknown classifications must not look like a clean census
+    census_id: str | None = None
+    exitstatus: int | None = None
+    expected_workers: set[str] = set()
+    worker_status: dict[str, dict | None] = {}
 
 
 _S = _State()
@@ -465,6 +469,7 @@ def install(config) -> None:
     """Arm the write audit. Idempotent: an audit hook cannot be removed."""
     if _S.installed:
         return
+    _S.census_id = os.environ.get("GENESIS_LIVE_WRITES_RUN_ID")
     from tests import _live_closure, _live_fence
 
     # The fence (installed first in the suite) owns the real home. Without it
@@ -537,6 +542,8 @@ def install(config) -> None:
 def pytest_sessionfinish(session, exitstatus):
     # An xdist worker's terminal summary never reaches the run, so it hands its
     # hits to the controller (pytest_testnodedown), as the live fence does.
+    # Earlier ordinary hooks may update Session after the argument was copied.
+    _S.exitstatus = int(getattr(session, "exitstatus", exitstatus))
     if hasattr(session.config, "workeroutput"):
         session.config.workeroutput["genesis_live_writes"] = {
             # As bytes: xdist's channel refuses a str it cannot encode as UTF-8
@@ -548,6 +555,17 @@ def pytest_sessionfinish(session, exitstatus):
             "disarmed": _S.disarmed,
             "faults": _S.faults,
         }
+        if _S.census_id:
+            session.config.workeroutput["genesis_live_writes"]["census"] = _live_writes_report.observation_state(_S)
+
+
+def _worker_id(node):
+    return (getattr(node, "gateway", None) and getattr(node.gateway, "id", None)) or "a worker"
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node):
+    _S.expected_workers.add(_worker_id(node))
 
 
 @pytest.hookimpl(optionalhook=True)
@@ -555,7 +573,7 @@ def pytest_testnodedown(node, error):
     """The controller merges each worker's hits, so an xdist run reports what a
     serial one would. A worker that went down without reporting is named in the
     summary: its writes are unknown, not absent."""
-    worker = (getattr(node, "gateway", None) and getattr(node.gateway, "id", None)) or "a worker"
+    worker = _worker_id(node)
     if worker in _S.merged_workers:
         return  # xdist can report one worker down twice (an interrupted run)
     _S.merged_workers.add(worker)
@@ -563,6 +581,8 @@ def pytest_testnodedown(node, error):
     if got is None:
         _S.unreported.append(f"{worker} ({error})" if error else worker)
         return
+    census = got.get("census")
+    _S.worker_status[worker] = dict.copy(census) if isinstance(census, dict) else None
     for key in got["hits"]:
         _S.hits[tuple(field.decode("utf-8", "surrogateescape") for field in key)] = None
     if got["disarmed"]:
@@ -602,6 +622,6 @@ def pytest_terminal_summary(terminalreporter):
         try:
             # surrogateescape: a path os.fsdecode() could not decode is written back
             # as its original bytes instead of failing the run.
-            Path(report).write_bytes(_live_writes_report.encode(hits))
+            _live_writes_report.publish(report, hits, _live_writes_report.census_state(_S))
         except (OSError, UnicodeError) as exc:  # report-only: never fails a run
             tr.write_line(f"live writes: could not write the report {report}: {exc}", yellow=True)
