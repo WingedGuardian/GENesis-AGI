@@ -1,7 +1,10 @@
 """Light-reflection topic: a summary the model flags as unchanged is not re-posted.
 
 Only an explicit ``"material_change": false`` suppresses a post; an absent flag
-always posts. The stored observation is always kept; only the Telegram post is gated. A
+always posts. The flag is trusted only while code finds no condition change
+(an alarm started or cleared, a band crossed, a signal appeared or went away)
+between the run behind the last full post and this one; wording is never
+compared. The stored observation is always kept; only the Telegram post is gated. A
 short "no material change" stub goes out at most once per
 ``LIGHT_NO_CHANGE_STUB_HOURS`` so the topic still proves liveness. "Last
 posted" is read back from the outbound ``telegram_messages`` rows TopicManager
@@ -13,12 +16,13 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
-from datetime import datetime, timedelta
+import uuid
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from genesis.awareness.types import Depth, TickResult
+from genesis.awareness.types import Depth, SignalReading, TickResult
 from genesis.cc.reflection_bridge._output import (
     LIGHT_NO_CHANGE_STUB_HOURS,
     format_topic_summary,
@@ -87,7 +91,64 @@ def _raw(assessment: str, **extra) -> str:
     return json.dumps({"assessment": assessment, "observations": [], **extra})
 
 
-async def _send(tm, assessment, *, now=None, **extra):
+_QUIET = {"scheduled_job_health": 0.0, "budget_pct_consumed": 0.1}
+_RUNS = itertools.count(1)
+_BETWEEN_RUNS_HOURS = 0.05
+_STAMP = "%Y-%m-%dT%H:%M:%S.%f+00:00"
+
+
+def _reading(name, value):
+    if isinstance(value, SignalReading):
+        return value
+    return SignalReading(name=name, value=value, source="t", collected_at="2026-01-01T00:00:00+00:00")
+
+
+async def _run(tm, signals=None, *, gap=True):
+    """Record a Light run the way production does before its summary is sent:
+    the tick's stored signals and the run's corpus row. Returns ``(db, tick)``."""
+    readings = [_reading(k, v) for k, v in (_QUIET if signals is None else signals).items()]
+    tick = TickResult(
+        tick_id=f"tick-{next(_RUNS)}",
+        timestamp="2026-01-01T00:00:00+00:00",
+        source="scheduled",
+        signals=readings,
+        scores=[],
+        classified_depth=Depth.LIGHT,
+        trigger_reason="test",
+    )
+    db = tm._db
+    if db is None:
+        return None, tick
+    # Light runs are minutes apart (no two corpus rows within 120 s of each
+    # other in production), and two runs inside the lookup window read as
+    # ambiguous: let that time pass before each run (``gap=False`` for a run
+    # that overlaps the one before it).
+    if gap:
+        await _age(db, _BETWEEN_RUNS_HOURS)
+    stamp = datetime.now(UTC).strftime(_STAMP)
+    await db.execute(
+        "INSERT INTO awareness_ticks (id, source, signals_json, scores_json, created_at) "
+        "VALUES (?, 'scheduled', ?, '[]', ?)",
+        (
+            tick.tick_id,
+            json.dumps([
+                {"name": r.name, "value": r.value, "source": "t", **({"failed": True} if r.failed else {})}
+                for r in readings
+            ]),
+            stamp,
+        ),
+    )
+    await db.execute(
+        "INSERT INTO reflection_corpus (id, depth, prompt_text, response_text, tick_id, created_at) "
+        "VALUES (?, 'Light', 'p', 'r', ?, ?)",
+        (str(uuid.uuid4()), tick.tick_id, stamp),
+    )
+    await db.commit()
+    return db, tick
+
+
+async def _send(tm, assessment, *, now=None, signals=None, gap=True, **extra):
+    db, tick = await _run(tm, signals, gap=gap)
     raw = _raw(assessment, **extra)
     text = format_topic_summary(
         Depth.LIGHT,
@@ -108,17 +169,27 @@ async def _send(tm, assessment, *, now=None, **extra):
         source_text=raw,
         topic_manager=tm,
         now=now,
+        db=db,
+        tick=tick,
     )
 
 
 async def _age(db, hours: float) -> None:
-    """Move every posted message ``hours`` into the past, as time passing would."""
+    """Move every posted message, and every run's corpus row, ``hours`` into
+    the past, as time passing would."""
     cur = await db.execute("SELECT id, timestamp FROM telegram_messages")
     for row_id, ts in await cur.fetchall():
         aged = datetime.fromisoformat(ts) - timedelta(hours=hours)
         await db.execute(
             "UPDATE telegram_messages SET timestamp = ? WHERE id = ?",
             (aged.isoformat(), row_id),
+        )
+    cur = await db.execute("SELECT id, created_at FROM reflection_corpus")
+    for row_id, ts in await cur.fetchall():
+        aged = datetime.fromisoformat(ts) - timedelta(hours=hours)
+        await db.execute(
+            "UPDATE reflection_corpus SET created_at = ? WHERE id = ?",
+            (aged.strftime(_STAMP), row_id),
         )
     await db.commit()
 
@@ -150,31 +221,166 @@ async def test_changed_summary_is_posted(db):
 
 
 async def test_model_declared_no_change_is_not_posted(db):
-    """``material_change: false`` from the model counts as no change for a
-    loose rewording that still clears the overlap floor."""
-    from genesis.cc.reflection_bridge._output import (
-        LIGHT_MODEL_FLAG_MIN_JACCARD,
-        _comparable,
-        _light_overlap,
-    )
-
-    # Guard: the fixture is a loose rewording that still clears the floor.
-    score = _light_overlap(_comparable(f"h\n\n{_FUZZY}"), _comparable(f"h\n\n{_FUZZY_LOOSE}"))
-    assert score >= LIGHT_MODEL_FLAG_MIN_JACCARD
+    """``material_change: false`` from the model counts as no change while no
+    condition changed, however the summary is worded: wording is not compared."""
     tm = await _manager(db)
     assert await _send(tm, _FUZZY) == "posted"
     assert await _send(tm, _FUZZY_LOOSE, material_change=False) == "skipped"
+    assert await _send(tm, _B, material_change=False) == "skipped"
+    assert await _send(tm, "The job is not failing.", material_change=False) == "skipped"
     assert tm._bot.send_message.await_count == 1
 
 
-async def test_model_flag_cannot_hide_text_unlike_the_last_post(db):
+async def test_a_condition_change_since_the_last_post_is_posted_whatever_the_flag(db):
     """The model compares against its previous stored finding, which may not
-    have been posted; a summary sharing almost nothing with what the user last
-    saw is posted whatever the flag says."""
+    have been posted. Code compares this run's signals with the run behind the
+    last full post, and posts when a condition changed, listing what it found."""
     tm = await _manager(db)
     assert await _send(tm, _A) == "posted"
+    started = {**_QUIET, "scheduled_job_health": 0.5}
+    assert await _send(tm, _A, material_change=False, signals=started) == "posted"
+    text = tm._bot.send_message.await_args.kwargs["text"]
+    assert "Changed since the last post" in text
+    assert "scheduled_job_health: 0.0 → 0.5 (alarm STARTED)" in text
+    # The forced post is the new baseline: the same state is quiet again, and
+    # the alarm clearing is a change again.
+    assert await _send(tm, _A, material_change=False, signals=started) == "skipped"
+    assert await _send(tm, _A, material_change=False) == "posted"
+    assert "(alarm CLEARED)" in tm._bot.send_message.await_args.kwargs["text"]
+    assert tm._bot.send_message.await_count == 3
+
+
+async def test_the_baseline_is_the_last_full_post_not_the_previous_run(db):
+    """Runs that were not posted do not move the baseline: a value that creeps
+    across a band over several unposted runs is still caught."""
+    bands = {"normal_max": 0.80, "warning_threshold": 0.85, "critical_threshold": 0.90}
+
+    def memory(value):
+        return {"container_memory_pct": SignalReading(
+            name="container_memory_pct", value=value, source="t",
+            collected_at="2026-01-01T00:00:00+00:00", **bands,
+        )}
+
+    tm = await _manager(db)
+    assert await _send(tm, _A, signals=memory(0.70)) == "posted"
+    assert await _send(tm, _A, material_change=False, signals=memory(0.76)) == "skipped"
+    assert await _send(tm, _A, material_change=False, signals=memory(0.79)) == "skipped"
+    assert await _send(tm, _A, material_change=False, signals=memory(0.86)) == "posted"
+    assert "(band normal → WARNING)" in tm._bot.send_message.await_args.kwargs["text"]
+
+
+async def test_a_change_the_user_never_saw_is_posted_again(db):
+    """The baseline is the last post that reached the topic, not the previous
+    run: when the post announcing an alarm fails to send, the next run still
+    differs from what the user last saw and posts, though nothing changed
+    since the previous run."""
+    tm = await _manager(db)
+    assert await _send(tm, _A) == "posted"
+    started = {**_QUIET, "scheduled_job_health": 0.5}
+    working = tm._bot.send_message.side_effect
+    tm._bot.send_message.side_effect = RuntimeError("synthetic send failure")
+    await _send(tm, _A, material_change=False, signals=started)
+    tm._bot.send_message.side_effect = working
+    assert await _send(tm, _A, material_change=False, signals=started) == "posted"
+    assert "(alarm STARTED)" in tm._bot.send_message.await_args.kwargs["text"]
+
+
+async def test_a_post_made_while_a_collector_was_broken_is_not_a_clean_baseline(db):
+    """An alarm is active and posted; a later post goes out while its collector
+    is failing (stored as a placeholder zero); the collector then recovers and
+    reads zero. Zero against the placeholder is not "no change": the user last
+    saw the alarm active."""
+    import dataclasses
+
+    tm = await _manager(db)
+    active = {**_QUIET, "scheduled_job_health": 0.5}
+    assert await _send(tm, _A, signals=active) == "posted"
+    broken = {**_QUIET, "scheduled_job_health": dataclasses.replace(
+        _reading("scheduled_job_health", 0.0), failed=True)}
+    assert await _send(tm, _B, signals=broken) == "posted"
+    assert await _send(tm, _B, material_change=False, signals=broken) == "skipped"
     assert await _send(tm, _B, material_change=False) == "posted"
-    assert tm._bot.send_message.await_count == 2
+    assert "(reading failed in the previous run)" in tm._bot.send_message.await_args.kwargs["text"]
+
+
+async def test_a_change_note_that_would_not_fit_goes_in_the_first_message(db):
+    """A summary that fills one Telegram message cannot take the note at its
+    end: the note would land in a second message, and if that one failed the
+    first alone would become the baseline with the change never shown."""
+    tm = await _manager(db)
+    assert await _send(tm, _A) == "posted"
+    db_, tick = await _run(tm, {**_QUIET, "scheduled_job_health": 0.5})
+    text = "<b>Light Reflection</b>\n\n" + "word " * 808
+    working = tm._bot.send_message.side_effect
+    sent: list[str] = []
+
+    async def _first_only(**kwargs):
+        if sent:
+            raise RuntimeError("synthetic failure of a later message")
+        sent.append(kwargs["text"])
+        return await working(**kwargs)
+
+    tm._bot.send_message.side_effect = _first_only
+    outcome = await send_light_topic_summary(
+        "s", text, source_text=_raw("x", material_change=False), topic_manager=tm, db=db_, tick=tick,
+    )
+    tm._bot.send_message.side_effect = working
+    assert outcome == "posted"
+    assert "(alarm STARTED)" in sent[0]
+    assert sent[0].startswith("<b>Light Reflection</b>\n\n<b>Changed since the last post</b>")
+
+
+async def test_a_summary_already_several_messages_long_still_carries_the_note(db):
+    tm = await _manager(db)
+    assert await _send(tm, _A) == "posted"
+    db_, tick = await _run(tm, {**_QUIET, "scheduled_job_health": 0.5})
+    text = "<b>Light Reflection</b>\n\n" + "word " * 1200
+    assert await send_light_topic_summary(
+        "s", text, source_text=_raw("x", material_change=False), topic_manager=tm, db=db_, tick=tick,
+    ) == "posted"
+    first = tm._bot.send_message.await_args_list[1].kwargs["text"]
+    assert first.startswith("<b>Light Reflection</b>\n\n<b>Changed since the last post</b>")
+
+
+async def test_a_change_note_that_fits_stays_under_the_summary(db):
+    tm = await _manager(db)
+    assert await _send(tm, _A) == "posted"
+    assert await _send(tm, _A, material_change=False, signals={**_QUIET, "scheduled_job_health": 0.5}) == "posted"
+    text = tm._bot.send_message.await_args.kwargs["text"]
+    assert text.index("Disk usage") < text.index("Changed since the last post")
+
+
+async def test_drift_and_the_hidden_version_flag_never_force_a_post(db):
+    tm = await _manager(db)
+    assert await _send(tm, _A, signals={**_QUIET, "genesis_version_changed": 0.0}) == "posted"
+    drifted = {"scheduled_job_health": 0.0, "budget_pct_consumed": 0.9, "genesis_version_changed": 1.0}
+    assert await _send(tm, _A, material_change=False, signals=drifted) == "skipped"
+
+
+async def test_unknown_baseline_posts(db):
+    """No stored signals for the posted run, or no database or tick at all:
+    the question cannot be answered, so the summary is posted."""
+    tm = await _manager(db)
+    assert await _send(tm, _A) == "posted"
+    raw = _raw(_A, material_change=False)
+    text = format_topic_summary(Depth.LIGHT, CCOutput(
+        session_id="s", text=raw, model_used="haiku", cost_usd=0.0,
+        input_tokens=1, output_tokens=1, duration_ms=1, exit_code=0,
+    ))
+    assert await send_light_topic_summary("s", text, source_text=raw, topic_manager=tm) == "posted"
+    await db.execute("DELETE FROM awareness_ticks")
+    await db.commit()
+    assert await _send(tm, _A, material_change=False) == "posted"
+    assert tm._bot.send_message.await_count == 3
+
+
+async def test_a_long_list_of_changes_says_how_many_it_left_out(db):
+    tm = await _manager(db)
+    assert await _send(tm, _A) == "posted"
+    many = {**_QUIET, **{f"new_signal_{i:02d}": 0.5 for i in range(12)}}
+    assert await _send(tm, _A, material_change=False, signals=many) == "posted"
+    text = tm._bot.send_message.await_args.kwargs["text"]
+    assert text.count("\n• ") == 11 and "• and 2 more" in text
 
 
 async def test_parse_failure_is_never_the_baseline(db):
@@ -319,20 +525,27 @@ async def test_bridge_keeps_observation_when_post_is_skipped(db):
     bridge = CCReflectionBridge(session_manager=mgr, invoker=invoker, db=db)
     tm = await _manager(db)
     bridge.set_topic_manager(tm)
-    tick = TickResult(
-        tick_id="t",
-        timestamp="2026-03-07T12:00:00",
-        source="scheduled",
-        signals=[],
-        scores=[],
-        classified_depth=Depth.LIGHT,
-        trigger_reason="test",
-    )
     with patch(
         "genesis.cc.reflection_bridge._bridge.store_reflection_output",
         new=AsyncMock(),
     ) as store:
-        for _ in range(2):
+        for tick_id in ("t1", "t2"):
+            # The awareness loop stores each tick's signals before it reflects.
+            await db.execute(
+                "INSERT INTO awareness_ticks (id, source, signals_json, scores_json, created_at) "
+                "VALUES (?, 'scheduled', '[]', '[]', '2026-03-07T12:00:00+00:00')",
+                (tick_id,),
+            )
+            await db.commit()
+            tick = TickResult(
+                tick_id=tick_id,
+                timestamp="2026-03-07T12:00:00",
+                source="scheduled",
+                signals=[],
+                scores=[],
+                classified_depth=Depth.LIGHT,
+                trigger_reason="test",
+            )
             result = await bridge.reflect(Depth.LIGHT, tick, db=db)
             assert result.success, result.reason
     assert store.await_count == 2
@@ -353,33 +566,15 @@ async def test_material_change_true_is_never_suppressed(db):
     assert tm._bot.send_message.await_count == 2
 
 
-@pytest.mark.parametrize(("before", "after"), [
-    ("job is failing", "job is not failing"),
-    ("job is not failing", "job is failing"),
-    ("The job is failing; the backup is not failing.",
-     "The job is not failing; the backup is failing."),
-    ("The job isn't failing", "The job is failing"),
-    ("The job isn’t failing", "The job is failing"),
-    ("The job can start", "The job cannot start"),
-])
-async def test_negation_flip_is_not_a_repeat(db, before, after):
-    tm = await _manager(db)
-    assert await _send(tm, before) == "posted"
-    assert await _send(tm, after, material_change=False) == "posted"
-
-
-async def test_exact_negated_repeat_can_still_be_suppressed(db):
-    tm = await _manager(db)
-    assert await _send(tm, "job is not failing") == "posted"
-    assert await _send(tm, "job is not failing", material_change=False) == "skipped"
-
-
 def _long_summary(tail):
     return "<b>Light Reflection</b>\n\n" + "alpha beta gamma delta " * 230 + tail
 
 
 async def _send_formatted(tm, text):
-    return await send_light_topic_summary("s", text, source_text='{"material_change": false}', topic_manager=tm)
+    db, tick = await _run(tm)
+    return await send_light_topic_summary(
+        "s", text, source_text='{"material_change": false}', topic_manager=tm, db=db, tick=tick,
+    )
 
 
 async def test_change_in_a_later_chunk_is_not_suppressed(db):
@@ -458,16 +653,6 @@ async def test_flagged_unchanged_with_no_history_posts(db):
     assert tm._bot.send_message.await_count == 2
 
 
-@pytest.mark.parametrize("fenced", ["previous", "current"])
-async def test_flagged_unchanged_with_a_code_fence_posts(db, fenced):
-    """A fence makes the baseline uncertain, so even a false flag posts."""
-    fence = " See ```queue``` for detail."
-    tm = await _manager(db)
-    assert await _send(tm, _FUZZY + (fence if fenced == "previous" else "")) == "posted"
-    after = _FUZZY_REWORDED + (fence if fenced == "current" else "")
-    assert await _send(tm, after, material_change=False) == "posted"
-
-
 async def test_parsed_assessment_ending_in_fallback_words_remains_the_baseline(db):
     tm = await _manager(db)
     real_update = "New upstream deployment detected; rollout details stored for review."
@@ -503,8 +688,7 @@ async def test_absent_flag_posts_every_change(db, before, after, expired):
 ])
 async def test_model_flag_is_trusted_over_numeric_drift(db, before, after):
     """No changed-number rule: whether a moved value is material is the
-    model's call, so a false flag suppresses numeric drift inside the
-    interval like any other rewording."""
+    model's call, so a false flag suppresses numeric drift in the text."""
     tm = await _manager(db)
     assert await _send(tm, before) == "posted"
     assert await _send(tm, after, material_change=False) == "skipped"
@@ -547,7 +731,7 @@ async def test_concurrent_light_deliveries_share_one_history_decision(db, existi
 
     async def second_send():
         second_started.set()
-        return await _send(tm, _A, material_change=False)
+        return await _send(tm, _A, material_change=False, gap=False)
 
     second = asyncio.create_task(second_send())
     try:
