@@ -11,8 +11,17 @@
 # `<asset>.tar.gz.sha256` file (https://github.com/BurntSushi/ripgrep/releases).
 set -euo pipefail
 
+# HOME may be unset (a sandboxed or `env -i` caller): resolve it from the passwd
+# entry for this uid, the same source Path.home() uses, and fail closed if that
+# is unresolvable too.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "install_ripgrep: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
+    export HOME
+fi
+
 VERSION="15.1.0"
-SHA256="1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599"
+SHA256="1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599"  # pragma: allowlist secret
 ASSET="ripgrep-${VERSION}-x86_64-unknown-linux-musl"
 URL="https://github.com/BurntSushi/ripgrep/releases/download/${VERSION}/${ASSET}.tar.gz"
 
