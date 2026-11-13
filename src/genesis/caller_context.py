@@ -195,6 +195,8 @@ _PROFILE_KINDS = {
     "validator": "codex-sealed",
     "external": "codex-external",
 }
+#: Every label client_kind gives a Codex client, so a session id can follow it.
+_CODEX_KINDS = frozenset(kind for kind in _PROFILE_KINDS.values() if kind != "unknown")
 
 
 def client_session_name() -> str:
@@ -238,6 +240,24 @@ def client_kind(external_profile: str | None = None) -> str:
     if ctx.claude_code:
         return "claude"
     return "unknown"
+
+
+def record_session_id(kind: str) -> str | None:
+    """The session to name beside the :func:`client_kind` label *kind* on a record.
+
+    The id follows the label, so a record never pairs one client with another's
+    session: a Codex kind gets the Codex thread id, ``claude`` the Claude Code
+    transcript id, anything else ``None``. Codex started from a Claude Code shell
+    inherits that shell's transcript id, which names the parent session, not the
+    one acting; an MCP server Codex starts gets no session variable at all, so
+    its records carry ``None``. Like the label, it decides nothing.
+    """
+    ctx = caller_context()
+    if kind in _CODEX_KINDS:
+        return ctx.codex_thread or None
+    if kind == "claude":
+        return ctx.transcript_id or None
+    return None
 
 
 def drop_client_label(env: MutableMapping[str, str]) -> MutableMapping[str, str]:

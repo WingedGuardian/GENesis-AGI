@@ -137,6 +137,31 @@ def test_client_kind_labels_a_credential_resolved_profile(monkeypatch, profile, 
         assert cc.client_kind() == expected
 
 
+_BOTH_IDS = {"CLAUDE_CODE_SESSION_ID": "tr", "CODEX_THREAD_ID": "th"}
+
+
+@pytest.mark.parametrize(
+    ("env", "kind", "expected"),
+    [
+        ({}, "claude", None),
+        ({"CLAUDE_CODE_SESSION_ID": "tr"}, "claude", "tr"),
+        ({"CODEX_THREAD_ID": "th"}, "codex", "th"),
+        # Codex started from a Claude Code shell inherits the parent transcript id,
+        # which must never sit beside a Codex label.
+        (_BOTH_IDS, "codex", "th"),
+        ({"CLAUDE_CODE_SESSION_ID": "tr"}, "codex", None),
+        ({"CLAUDE_CODE_SESSION_ID": "tr"}, "codex-sealed", None),
+        (_BOTH_IDS, "codex-sealed", "th"),
+        (_BOTH_IDS, "unknown", None),
+        ({"CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": ""}, "claude", None),
+    ],
+)
+def test_record_session_id_follows_the_label(monkeypatch, env, kind, expected):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    assert cc.record_session_id(kind) == expected
+
+
 _GATE_SURFACES = ("autonomy", "payments", "security", "guardian", "ego")
 
 

@@ -740,6 +740,24 @@ verified: b321bb634 2026-11-07
   per-binary hardening, which made an every-session claim depend on an invocation
   shape that, once no profile declares an allowlist, never occurs: the pin was
   written by the builder and verified by nothing.
+  **"Every dispatch" means every `CCInvoker` dispatch, plus the dashboard's
+  update sessions** (`dashboard/routes/updates.py`), which start `claude -p`
+  outside the invoker and import its set and gate instead of keeping a second
+  list. Tier 3 (`_spawn_detached_cc`) sets the four names empty as the last
+  change to the environment and passes `_assert_no_gh_credentials` before the
+  session's log is opened or a process starts; a refusal raises. Tiers 1/2 are
+  started by the generated orchestrator script, which cannot import genesis
+  while an update is replacing it: `_apply_supervised` substitutes the invoker's
+  set into the script (`GH_CREDENTIAL_ENV`) and `spawn_cc` sets those names empty
+  after the inherited environment. The orchestrator process itself keeps the
+  server's environment, and so does `update.sh` on the direct path
+  (`_apply_direct`, which starts no session); an `update.sh` a tier session runs
+  inherits that session's pins. Two limits: these sessions pass no
+  `--settings`, so the settings-level pin above does not apply to them, and the
+  script's `spawn_cc` sets the names but does not run the gate
+  (`tests/test_dashboard/test_update_template.py` runs the written script and
+  applies the gate to what the session received). A session started outside
+  both the invoker and the update routes does not go through this gate.
   **"`gh` holds no credential" is the claim; "the session is unauthenticated" is
   NOT** — tool scope decides the second, and a profile permitting `Read` with an
   outbound tool can still reach a credential FILE, which no env pin touches.
@@ -1982,6 +2000,18 @@ the shared banner is not an assertion about all concurrent sessions.
   isolation is the primary control — see
   `SECURITY.md`, which is authoritative for the threat model. Consult this
   before concluding a route is protected because a password exists.
+  One open read reduces its own body: `GET /api/genesis/health` answers every
+  network (`auth._OPEN_FROM_ANY_NETWORK`), and for a caller with neither the
+  internal bearer nor a verified session (`has_verified_credential`, never true
+  without a password) `routes/health.redact_for_untrusted` drops each call
+  site's `last_response` (the text its last model call returned; a site that
+  had one carries `last_response_hidden: true`), the deploy checkout's file
+  names and probe error, and all of `live_repairs` but its counts. The Agent
+  Zero adapter's own copy of that route (`az_plugins/genesis/api_health.py`)
+  calls the same function. The in-process readers of the snapshot (the health
+  MCP tools, ego context) are not affected. Both monitor pages show a note in
+  place of a withheld Last Response, which is every browser on an install with
+  no dashboard password.
 - **mcp/**: 5 Genesis MCP servers (health, memory, outreach, recon,
   discord-bot) + external codebase-memory; profile→server allowlist lives in
   `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool
@@ -2482,7 +2512,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 4721e0d93 2026-11-07
+verified: 0aa0bf9f2 2026-11-10
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -2756,7 +2786,18 @@ verified: 4721e0d93 2026-11-07
   `"live"` is NOT implemented (dispatcher warns + downgrades); every proposed
   action requires human approval. `InfrastructureMonitor` (call site 37, free
   models) observes each awareness tick and wakes the dispatcher; state persists
-  to `~/.genesis/sentinel_state.json`.
+  to `~/.genesis/sentinel_state.json`. A dispatch counts as resolved only
+  when EVERY approved action exited 0 (`_record_execution`); per-action output
+  goes into the observation and log.
+- **sentinel/codex_mcp_stop.py** (`python -m genesis.sentinel.codex_mcp_stop`):
+  the Failure Inventory remedy for memory held by a shared Codex app-server
+  daemon's MCP servers (#4302). Dry-run by default; `--execute` only inside an
+  approved action. Resolves targets when it runs: direct children of a
+  `codex app-server --listen` process that lead their own process group with
+  pipe stdin+stdout, excluding Codex helper binaries, systemd-unit members and
+  anything under a `claude` process. Lever `codex_mcp_stop.mode` in
+  `config/sentinel.yaml` (`propose_only` | `off`) +
+  `GENESIS_CODEX_MCP_STOP_DISABLED=1`.
 - GROUNDWORK: guardian-cgroup, guardian-bidirectional, sentinel-live-autonomy.
 
 ## 9. Ambient cognition — heartbeat, reflection, attention
@@ -3112,7 +3153,11 @@ verified: c712f1bde 2026-11-06
   the recheck CLI appends failed/done measurements without reopening the row.
   Unfinished or malformed rechecks survive retention; malformed histories are
   surfaced for inspection rather than hiding later rows. Owed rechecks refuse
-  closes before migration, including CLI/MCP previews. Only a PASS verdict discharges
+  closes before migration, including CLI/MCP previews. Each close and attempt
+  records which client wrote it (`closed_by` / `last_attempt_by`, from
+  `caller_context.client_kind()`) and the session (`recorded_session`); the
+  path-rule exemption records `repo-pulse`, existing rows stay NULL, and the
+  label decides nothing. Only a PASS verdict discharges
   an obligation; the other verdicts leave the row OPEN and annotate it, so a PR
   nobody could verify says why instead of looking untouched. The one non-obvious
   invariant, because the obvious one is false: a PASS verdict implies the row is
@@ -4766,7 +4811,14 @@ logger or unrelated exceptions with copied text and no provenance.
 - **security/**: prompt-injection defense + outbound scanning — sanitizer is
   LOG-ONLY for internal sources (perimeter EMAIL/INBOX can block);
   `output_scanner` = deterministic outbound secrets/IP scan (a payment card
-  number is a critical finding); `card_shapes` = the one payment-card-number
+  number is a critical finding) plus in-place credential redaction for peer
+  replies and remote diagnostics; `credential_shapes` = the shared
+  credential-shape table (vendor key prefixes, JWT, Discord webhook URL,
+  Telegram bot token; stdlib-only data, recall-first), read by
+  `output_scanner` for every shape it does not own in a tighter local form and
+  held equal to the hook scrubber's two patterns by
+  `tests/test_security/test_credential_shapes.py` until the scrubber loads it;
+  `card_shapes` = the one payment-card-number
   detector (ASCII digits, alphanumeric boundary, standard groupings, brand
   prefix + length, Luhn, UUID groups skipped; stdlib-only so scripts load it
   by path), used by the browser tool guards, `reference_store`, reference
@@ -5181,8 +5233,8 @@ logger or unrelated exceptions with copied text and no provenance.
   literal tuple in the repair module, read with ast) from HEAD's blobs on main or
   `live` into `~/.genesis/lib/live-repair.d/<kit_id>/` with a `KIT.json` of their
   object ids, swaps the `live-repair/current` link by rename, and keeps two kits
-  (the prune takes only kit-id names and skips one whose KIT.json is flocked; the
-  repair takes that shared hold from D2a-2 on; a symlinked `live-repair.d` or
+  (the prune takes only kit-id names and skips one whose KIT.json is flocked:
+  every repair run holds it shared; a symlinked `live-repair.d` or
   `live-repair` is moved aside, never followed; a set-aside kit or `current` is kept a week from the
   move); `status` reports ok,
   missing, foreign, corrupt, partial or stale. bootstrap, `deploy_code_only.sh`
@@ -5193,8 +5245,38 @@ logger or unrelated exceptions with copied text and no provenance.
   installer, whose install fails and keeps the newer kit), and it must read the
   previous release's state. repair-move resolves `current` physically and runs
   `python3 -I -S -B`, and the module's own directory is a realpath, so a run stays on
-  the kit it started from. Running the repair at every server start is D2a-2, not
-  yet built; `--explain` needs no kit: with none
+  the kit it started from. **At every start** of genesis-server and genesis-bridge
+  (#3492 D2a-2) an `ExecStartPre` runs the kit's `live_move_repair.py --boot`
+  (`TimeoutStartSec=90`). Its 75 refuses the start, and so does a signal death
+  and the 1 of a kit from before this step (no `live_move_boot.py`, e.g. one a
+  rollback reinstalled: it exits 1 where this kit exits 75);
+  every other outcome starts, with a journal line and, while an update state
+  exists, a page keyed `live_move_repair:boot:kit:<rc>:<kit_id>` (no kit or a
+  crash). `--boot` first re-hashes the kit against its `KIT.json` (a file
+  missing, altered or of another version: exit 3, start and page), then ends
+  every child by one deadline 75 s after its start (`live_move_boot.py`: git,
+  the guard's git through its `_DEADLINE`, restore-hooks, which ends 10 s early
+  so the healed tree is judged in time; a call with no time left never starts;
+  the pin 5 + 75 + 3 + 1 + 4 <= 90 is tested, and a run past its deadline
+  ended `exit-code`, not `timeout`, in a transient unit: measured 2026-11-11
+  with a 20 s deadline; T-D34 repeats it only where a user manager exists). A `live` row judged
+  half-written that it could not heal keeps the service down (75: unresolved,
+  a failure after judging, a backup that cannot be written, the "neither" race,
+  a lock held past the budget on such a row); everything else starts (owner
+  rulings): a HOLD, GUARDS or CONFLICT_PENDING with a `kept` warning (the
+  guard's remedy), a half-written tree it never heals (a main checkout, or a
+  `live` rollback stopped after `merging`, #3722's wording) with a `mixed`
+  critical page, a failure before judging with `skipped`. Each page's key is
+  its class, the state's bytes as the run leaves them and an end mark of the
+  checkout (HEAD, `status -z`, index.lock), so a heal that keeps a HOLD and the
+  next boot's HOLD page once; a repeat of an unresolved heal (a heal that crashed
+  partway, or was killed before it recorded a result, is retried once at the next start: owner
+  ruling, its attempts counted from the reports on disk; an end mark the deadline left unreadable
+  never counts as a change) with nothing
+  changed refuses at once with no new backup, unless another kit is installed
+  (its `kit_id` is part of the match). Every run, by command too, holds the kit's
+  `KIT.json` shared until it exits, so a reinstall's prune never removes a kit in use.
+  `--explain` needs no kit: with none
   installed it runs the module as HEAD committed it, from memory, never the
   working tree's copy, which may itself be half-written) heals a live row's `mixed_tree`
   toward the rollback tag, never toward the target (with HEAD on `live` at the
@@ -5297,13 +5379,15 @@ logger or unrelated exceptions with copied text and no provenance.
   (its write, say) is logged and never stops another report's retry.
   `--dismiss` and a restore take update.lock too, so neither's field is lost
   (every REPAIR.json writer holds it); with no state file and update.lock
-  held it exits 0 at once. The restore-hooks run is not bounded by the boot budget;
-  that is PR D2's, which wires `--boot`. With the target's objects gone in
+  held it exits 0 at once. At `--boot` restore-hooks is bounded by the boot
+  deadline (above), and the reinstall below starts removing hooks only with
+  twice `HOOKS_MIN_S` left; by command it is unbounded. With the target's objects gone in
   the forward case, the whole-tree fallback and a torn index's rebuild read
   the tag, never HEAD (the target). After a forward heal HEAD is the tag on
   `live`, so `--restore <ts>` judges its foreign paths as after any other
-  repair. A failure before the checkout itself changes (a
-  failed backup included) exits 0 at `--boot`. The guard then judges
+  repair. A failure before the checkout itself changes exits 0 at `--boot`
+  only while no `live` row was judged half-written (after that, a failed backup
+  included, 75). The guard then judges
   again and only its SAFE removes the state (byte-identical re-read); `guards`
   or `holds` (an edit off the move's paths) keeps it, its result naming the
   restore before what still holds, and exits 0; a kept "partial" record is
