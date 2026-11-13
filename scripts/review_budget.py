@@ -365,8 +365,43 @@ def _without_ids(rows: object) -> object:
     ]
 
 
+def _mark_off_diff(events: Sequence[dict[str, Any]], changed: set[str]) -> None:
+    """Give each finding an ``off_diff`` fact, parallel to its keys.
+
+    True when the comment is anchored to a file the PR does not change NOW,
+    False when the file is in the diff, and None when neither can be shown: a
+    comment with no path, a body or issue-comment key, or an empty changed-file
+    set (an empty answer cannot be told from a failed one, the same reading the
+    merge gate uses). A reviewer anchors a comment to a file in the diff it
+    read, so True means the file has left the diff since.
+
+    ``blocking`` is never changed by it: for an inline or issue-comment key
+    that flag is the level as the reviewer wrote it (a body key is always False,
+    because the merge gate never scores the review-body channel), and this fact follows the current file set, so a later push can
+    change it for an earlier round. The merge gate lists a floor finding that
+    is off the diff and never scores it; a reader that wants that reading takes
+    ``blocking is True and off_diff is not True``. It is the ONE merge-gate
+    exclusion stated here: a maintainer reply and a documentation path also
+    keep a finding out of the merge gate's score, and neither is in the budget."""
+    for event in events:
+        flags = event["source"].get("blocking")
+        if not isinstance(flags, list):
+            continue
+        spots = event.get("paths")
+        off: list[bool | None] = [None] * len(flags)
+        if changed and isinstance(spots, list):
+            for index, where in enumerate(spots[: len(flags)]):
+                if isinstance(where, str) and where:
+                    off[index] = where not in changed
+        event["source"]["off_diff"] = off
+
+
 def _round_source(
-    item: Mapping[str, object], login: str, flagged: Sequence[int], in_body: int
+    item: Mapping[str, object],
+    login: str,
+    flagged: Sequence[int],
+    in_body: int,
+    top_level: Sequence[str] = (),
 ) -> dict[str, Any]:
     """One review's place in a round, keyed for the round reflection.
 
@@ -380,24 +415,36 @@ def _round_source(
     hook (PR #3040, round 1). A key whose id is missing is None: the round still
     counts, it just cannot be discharged by key, which ``reflection_keys``
     reports.
+
+    ``blocking`` runs parallel to ``finding_keys``: whether each finding is at
+    the always-fix floor (``review_findings.is_blocking``), None when its level
+    cannot be read. A body key is False: the merge gate never scores body
+    findings (owner ruling), so they never block there either.
     """
+    # A sibling too old to know the floor reads unknown, never "not blocking".
+    read = getattr(_findings_module(), "is_blocking", None)
     review_id = item.get("id")
     ids = item.get("top_level_ids")
     keys: list[str | None] = []
+    blocking: list[bool | None] = []
     for index in flagged:
         comment_id = ids[index] if isinstance(ids, list) and index < len(ids) else None
         keys.append(f"c{comment_id}" if _is_id(comment_id) else None)
+        text = top_level[index] if index < len(top_level) else None
+        blocking.append(read(login, text) if read and isinstance(text, str) else None)
     if in_body:
         # Bounded before it is formatted: a sum of several maximal sections
         # passes int() and then overflows str() (4,300 digits), which would turn
         # the whole lookup unknown. Past the bound the key is unknown instead.
         bounded = 0 < in_body < 10**9
         keys.append(f"r{review_id}:{in_body}" if _is_id(review_id) and bounded else None)
+        blocking.append(False)
     return {
         "id": review_id if _is_id(review_id) else None,
         "login": login,
         "submitted_at": item.get("submitted_at"),
         "finding_keys": keys,
+        "blocking": blocking,
     }
 
 
@@ -455,10 +502,19 @@ def evaluate_evidence(
     # date, not by parent (MEASURED on #3203: 6 of 22 neighbours are not parent
     # and child).
     parents_of: dict[str, tuple[str, ...]] = {}
+    # Each commit's tree and committer time, for readers that ask whether the
+    # PR moved between two heads. Nothing here decides the count: a value that
+    # is missing or unreadable is None.
+    tree_of: dict[str, str] = {}
+    committed_of: dict[str, datetime] = {}
     for raw in commit_heads:
         parents: tuple[str, ...] | None = None
+        tree: str | None = None
+        committed: datetime | None = None
         if isinstance(raw, Mapping):
             raw_parents = raw.get("parents")
+            tree = _full_sha(raw.get("tree"))
+            committed = _parse_time(raw.get("committed_at"))[1]
             raw = raw.get("sha")
             if raw_parents is not None:
                 if not isinstance(raw_parents, list):
@@ -474,6 +530,10 @@ def evaluate_evidence(
             commits.append(full)
         if parents is not None:
             parents_of[full] = parents
+        if tree is not None:
+            tree_of[full] = tree
+        if committed is not None:
+            committed_of[full] = committed
     if head not in commits:
         return _unknown("current_head_missing_from_commits", current_head=head)
     order = {sha: index for index, sha in enumerate(commits)}
@@ -638,13 +698,20 @@ def evaluate_evidence(
         in_body = review_findings.body_finding_count(login, body)
         findings = len(flagged) + in_body
         if findings:
+            spots = item.get("top_level_paths")
             events.append(
                 {
                     "sha": sha,
                     "when": when,
                     "login": login,
                     "findings": findings,
-                    "source": _round_source(item, login, flagged, in_body),
+                    "source": _round_source(item, login, flagged, in_body, top_level),
+                    # The file each flagged comment is anchored to, parallel to
+                    # the source's keys (a body key has none).
+                    "paths": [
+                        spots[i] if isinstance(spots, list) and i < len(spots) else None
+                        for i in flagged
+                    ],
                 }
             )
         elif not top_level and review_findings.declares_findings(login, body):
@@ -736,6 +803,12 @@ def evaluate_evidence(
                         "submitted_at": item.get("created_at"),
                         # A findings comment has no review object; its own id keys it.
                         "finding_keys": [f"i{comment_id}" if _is_id(comment_id) else None],
+                        # Its badge is in the comment itself.
+                        "blocking": [
+                            review_findings.is_blocking(login, body)
+                            if hasattr(review_findings, "is_blocking")
+                            else None
+                        ],
                     },
                 }
             )
@@ -808,6 +881,7 @@ def evaluate_evidence(
             paths.append(previous)
 
     gate_surface = any(is_hook_surface_path(path) for path in paths)
+    _mark_off_diff(events, set(paths))
     round_heads = legacy | set(found)
     heads = sorted(round_heads)
     count = len(heads)
@@ -974,6 +1048,8 @@ def evaluate_evidence(
                 "submitted_at": _iso(event["when"], event["source"]["submitted_at"]),
                 "login": event["login"],
                 "keys": keys,
+                "blocking": list(event["source"].get("blocking") or [None] * len(keys)),
+                "off_diff": list(event["source"].get("off_diff") or [None] * len(keys)),
                 "round_head": round_of(event["sha"]),
                 "late": event["late"],
             }
@@ -1003,9 +1079,15 @@ def evaluate_evidence(
         "reviewers_reported": sorted(reported.get(head, set())),
         "expected_reviewers": expected,
         # ``parents`` is None where the caller gave no ancestry, so a reader can
-        # tell "unknown" from a root commit (``[]``).
+        # tell "unknown" from a root commit (``[]``). ``tree`` and
+        # ``committed_at`` are None where the read did not carry them.
         "commits": [
-            {"sha": sha, "parents": list(parents_of[sha]) if sha in parents_of else None}
+            {
+                "sha": sha,
+                "parents": list(parents_of[sha]) if sha in parents_of else None,
+                "tree": tree_of.get(sha),
+                "committed_at": committed_of[sha].isoformat() if sha in committed_of else None,
+            }
             for sha in commits
         ],
         "marks": [{"head": sha, "at": _iso(when, raw)} for sha, when, raw in marks],
@@ -1160,7 +1242,7 @@ _GRAPHQL_CONNECTIONS = {
         "reviews(first: 100, after: $after_reviews) { pageInfo { hasNextPage endCursor } "
         "nodes { fullDatabaseId state submittedAt body author { login __typename } "
         "commit { oid } comments(first: 100) { pageInfo { hasNextPage } "
-        "nodes { fullDatabaseId replyTo { id } body } } } }"
+        "nodes { fullDatabaseId replyTo { id } body path } } } }"
     ),
     "comments": (
         "comments(first: 100, after: $after_comments) { pageInfo { hasNextPage endCursor } "
@@ -1172,7 +1254,8 @@ _GRAPHQL_CONNECTIONS = {
     ),
     "commits": (
         "commits(first: 100, after: $after_commits) { pageInfo { hasNextPage endCursor } "
-        "nodes { commit { oid parents(first: 100) { totalCount nodes { oid } } } } }"
+        "nodes { commit { oid committedDate tree { oid } "
+        "parents(first: 100) { totalCount nodes { oid } } } } }"
     ),
 }
 
@@ -1263,12 +1346,16 @@ def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]
                 raise _Truncated
             top_level = []
             top_level_ids = []
+            top_level_paths = []
             for comment in thread["nodes"]:
                 if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
                     raise ValueError(name)
                 if comment.get("replyTo") is None:
                     top_level.append(comment["body"])
                     top_level_ids.append(_node_id(comment))
+                    # The file the comment is anchored to; None when GitHub gives none.
+                    path = comment.get("path")
+                    top_level_paths.append(path if isinstance(path, str) and path else None)
             rows.append(
                 {
                     "id": _node_id(node),
@@ -1279,6 +1366,7 @@ def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]
                     "body": node.get("body"),
                     "top_level": top_level,
                     "top_level_ids": top_level_ids,
+                    "top_level_paths": top_level_paths,
                 }
             )
         elif name == "comments":
@@ -1319,7 +1407,19 @@ def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]
                 if not isinstance(parent, dict) or not isinstance(parent.get("oid"), str):
                     raise ValueError(name)
                 oids.append(parent["oid"])
-            rows.append({"sha": commit.get("oid"), "parents": oids})
+            # Facts for a reader, never for the count: a missing or odd value
+            # is None here and decides nothing in this module.
+            tree = commit.get("tree")
+            tree_oid = tree.get("oid") if isinstance(tree, dict) else None
+            committed = commit.get("committedDate")
+            rows.append(
+                {
+                    "sha": commit.get("oid"),
+                    "parents": oids,
+                    "tree": tree_oid if isinstance(tree_oid, str) else None,
+                    "committed_at": committed if isinstance(committed, str) else None,
+                }
+            )
     return rows, path_changed
 
 
@@ -1676,9 +1776,9 @@ def _evaluate_pr_inner(
         if not isinstance(sha, str):
             return _unknown("commits_malformed", current_head=test_head)
         # A seam row may omit parents; the evaluator then knows no ancestry.
-        commit_heads.append(
-            {"sha": sha, "parents": item["parents"]} if item.get("parents") is not None else sha
-        )
+        # ``tree`` and ``committed_at`` ride along when the read carried them.
+        facts = {k: item[k] for k in ("parents", "tree", "committed_at") if item.get(k) is not None}
+        commit_heads.append({"sha": sha, **facts} if facts else sha)
 
     def evaluate(comments: list[dict[str, Any]]) -> dict[str, Any]:
         return evaluate_evidence(
