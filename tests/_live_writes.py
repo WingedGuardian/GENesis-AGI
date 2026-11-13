@@ -14,8 +14,8 @@ A PEP 578 audit hook judges, in this interpreter:
   ``O_WRONLY``/``O_RDWR``/``O_CREAT``/``O_TRUNC``/``O_APPEND``);
 - ``os.remove``, ``os.rename`` (and ``os.replace``), ``os.mkdir``, ``os.rmdir``,
   ``shutil.rmtree``, ``os.truncate``, ``os.symlink``, ``os.link``;
-- ``sqlite3.connect`` to a file (it creates and writes one), unless opened
-  read-only (``mode=ro`` / ``immutable=1`` URI);
+- ``sqlite3.connect`` to a file, except recognized literal URI query forms
+  ``mode=ro``, ``mode=memory``, or ``immutable=1`` for an existing target;
 - reads of the real credential files (the deployed ``secrets.env``,
   ``~/.claude/.credentials.json``, ``~/.config/gh/hosts.yml``,
   ``~/.genesis/cc_oauth_token.env``).
@@ -36,11 +36,12 @@ Under xdist each worker hands its hits to the controller at session end
 (``workeroutput``, as the live fence does), and only the controller reports; a
 worker that never reported is named in the summary.
 
-A hit is a write that happens: an operation the kernel will refuse or that
-changes nothing (``mkdir`` of an existing directory, ``unlink`` of a missing
-file, ``rmdir`` of a non-empty one, reopening an existing file without
-truncating or writing) is not recorded. ``os.open`` of a relative name is
-judged against the cwd and labelled so (its audit event omits ``dir_fd``).
+Hits classify pre-operation events, not syscall completion. Known no-ops such
+as an existing ``mkdir``, missing ``unlink``, non-empty ``rmdir``, or an
+unchanged reopen are filtered. Other refused operations and readonly SQLite
+queries outside the recognized literal forms can still be reported.
+``os.open`` of a relative name is judged against the cwd and labelled so (its
+audit event omits ``dir_fd``).
 Attribution is by ``PYTEST_CURRENT_TEST``: a write during collection or a
 session fixture's teardown counts as "outside any test", and a background
 thread an earlier test left running is charged to the test running now.
@@ -214,36 +215,27 @@ def _record(label: str, op: str, path: str) -> None:
 
 def _sqlite_target(database) -> str | None:
     path = _fspath(database)
-    if not path or path == ":memory:" or path.startswith("file::memory:"):
+    if not path or path == ":memory:":
         return None
     if path.startswith("file:"):
-        body, _, query = path[5:].partition("?")
+        body, _, query = path[5:].partition("#")[0].partition("?")
+        if body == ":memory:":
+            return None
         target = _absolute(body)
-        if _read_only_uri(query.partition("#")[0], exists=bool(target) and os.path.lexists(target)):
+        if _read_only_uri(query, exists=bool(target) and os.path.lexists(target)):
             return None
         return target
     return _absolute(path)
 
 
 def _read_only_uri(query: str, *, exists: bool = True) -> bool:
-    """Whether SQLite opens a ``file:`` URI with this query without writing.
+    """Recognize only measured literal queries on URI-enabled SQLite.
 
-    Exact parameters, as SQLite reads them (MEASURED, CPython's sqlite3): the
-    first occurrence of a key wins, keys are case-sensitive, and ``immutable``
-    is true for yes/true/on in any case or a nonzero integer. A substring test
-    would let ``journal_mode=rollback`` pass as ``mode=ro``. ``immutable`` on a
-    missing file still creates it (MEASURED), so it is read-only only when the
-    file ``exists``.
+    Other queries are possible-write observations, including readonly forms
+    outside this set. Do not emulate SQLite's escaping, duplicate parameters
+    or integer booleans. Even literal immutable=1 creates a missing file.
     """
-    params: dict[str, str] = {}
-    for pair in query.split("&"):
-        key, _, value = pair.partition("=")
-        params.setdefault(key, value)
-    if params.get("mode", "").lower() in ("ro", "memory"):
-        return True
-    immutable = params.get("immutable", "").lower()
-    on = immutable in ("yes", "true", "on") or (immutable.isdigit() and int(immutable) != 0)
-    return on and exists
+    return query in {"mode=ro", "mode=memory"} or (query == "immutable=1" and exists)
 
 
 def _reopens_unchanged(flags, target: str) -> bool:

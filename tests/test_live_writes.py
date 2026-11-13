@@ -312,14 +312,14 @@ def test_a_sqlite_file_is_a_write_but_read_only_and_memory_are_not(home):
 @pytest.mark.parametrize(
     ("query", "read_only"),
     [
-        # Measured against CPython's sqlite3: which of these opened without writing.
+        # Deliberately narrow recognized forms, not an engine boolean parser.
         ("mode=ro", True),
         ("mode=memory", True),
         ("immutable=1", True),
-        ("immutable=TRUE", True),
-        ("immutable=on", True),
-        ("immutable=2", True),
-        ("immutable=1&immutable=0", True),
+        ("immutable=TRUE", False),
+        ("immutable=on", False),
+        ("immutable=2", False),
+        ("immutable=1&immutable=0", False),
         ("journal_mode=rollback", False),
         ("cache=shared&nomode=ro", False),
         ("immutable=0", False),
@@ -332,6 +332,105 @@ def test_a_sqlite_file_is_a_write_but_read_only_and_memory_are_not(home):
 )
 def test_a_sqlite_uri_is_read_only_only_by_its_exact_parameters(query, read_only):
     assert audit._read_only_uri(query) is read_only
+
+
+
+@pytest.mark.parametrize("query", [
+    "immutable=256", "immutable=512", "immutable=4294967297", "immutable=2147483648",
+    "immutable=²", "immutable=١", "%69mmutable=0&immutable=1",
+])
+def test_writable_sqlite_query_is_not_silently_exempted(home, query):
+    target = home / ".genesis" / "query.db"
+    sqlite3.connect(target).close()
+    audit._S.hits.clear()
+    with sqlite3.connect(f"file:{target}?{query}", uri=True) as connection:
+        connection.execute("CREATE TABLE owned(value)")
+        connection.execute("INSERT INTO owned VALUES (1)")
+    with sqlite3.connect(f"file:{target}?mode=ro", uri=True) as reader:
+        assert reader.execute("SELECT value FROM owned").fetchall() == [(1,)]
+    assert ("~/.genesis", "sqlite connect", str(target)) in {
+        (label, operation, path) for _node, label, operation, path in audit._S.hits
+    }
+    assert audit._S.faults == 0
+
+
+@pytest.mark.parametrize("suffix", ["extra", "é"])
+def test_memory_name_prefix_is_a_disk_file(home, monkeypatch, suffix):
+    directory = home / ".genesis"
+    monkeypatch.chdir(directory)
+    target = directory / f":memory:{suffix}"
+    audit._S.hits.clear()
+    with sqlite3.connect(f"file::memory:{suffix}", uri=True) as connection:
+        connection.execute("CREATE TABLE owned(value)")
+    assert target.is_file()
+    assert ("~/.genesis", "sqlite connect", str(target)) in {
+        (label, operation, path) for _node, label, operation, path in audit._S.hits
+    }
+    assert audit._S.faults == 0
+
+
+def test_sqlite_fragment_cannot_supply_a_readonly_query(home):
+    target = home / ".genesis" / "fragment.db"
+    sqlite3.connect(target).close()
+    audit._S.hits.clear()
+    with sqlite3.connect(f"file:{target}#ignored?mode=ro", uri=True) as connection:
+        connection.execute("CREATE TABLE owned(value)")
+    with sqlite3.connect(f"file:{target}?mode=ro", uri=True) as reader:
+        assert reader.execute("SELECT name FROM sqlite_master").fetchall() == [("owned",)]
+    assert ("~/.genesis", "sqlite connect", str(target)) in {
+        (label, operation, path) for _node, label, operation, path in audit._S.hits
+    }
+
+
+@pytest.mark.parametrize("uri", [
+    "file::memory:", "file::memory:?cache=shared", "file::memory:#fragment",
+    "file::memory:#ignored?mode=rw",
+])
+def test_exact_memory_uri_never_changes_a_disk_target(home, monkeypatch, uri):
+    directory = home / ".genesis"
+    monkeypatch.chdir(directory)
+    audit._S.hits.clear()
+    with sqlite3.connect(uri, uri=True) as connection:
+        connection.execute("CREATE TABLE owned(value)")
+        connection.execute("INSERT INTO owned VALUES (1)")
+        assert connection.execute("SELECT value FROM owned").fetchall() == [(1,)]
+        assert connection.execute("PRAGMA database_list").fetchone()[2] == ""
+    assert list(directory.iterdir()) == []
+    assert audit._S.hits == {}
+    assert audit._S.faults == 0
+
+
+
+@pytest.mark.parametrize("query", ["mode=ro", "immutable=1"])
+def test_plain_readonly_sqlite_form_refuses_disk_writes(home, query):
+    target = home / ".genesis" / "readonly.db"
+    with sqlite3.connect(target) as connection:
+        connection.execute("CREATE TABLE owned(value)")
+    before = target.read_bytes()
+    audit._S.hits.clear()
+    with sqlite3.connect(f"file:{target}?{query}", uri=True) as connection:
+        with pytest.raises(sqlite3.OperationalError) as failure:
+            connection.execute("INSERT INTO owned VALUES (1)")
+        assert failure.value.sqlite_errorcode == sqlite3.SQLITE_READONLY
+    assert target.read_bytes() == before
+    assert audit._S.hits == {}
+
+
+@pytest.mark.parametrize("exists", [False, True])
+def test_plain_memory_mode_uses_memory_even_for_a_disk_name(home, exists):
+    target = home / ".genesis" / "memory.db"
+    if exists:
+        with sqlite3.connect(target) as connection:
+            connection.execute("CREATE TABLE disk_only(value)")
+    before = target.read_bytes() if exists else None
+    audit._S.hits.clear()
+    with sqlite3.connect(f"file:{target}?mode=memory", uri=True) as connection:
+        connection.execute("CREATE TABLE owned(value)")
+        connection.execute("INSERT INTO owned VALUES (1)")
+        assert connection.execute("SELECT value FROM owned").fetchall() == [(1,)]
+        assert connection.execute("PRAGMA database_list").fetchone()[2] == ""
+    assert (target.read_bytes() if target.exists() else None) == before
+    assert audit._S.hits == {}
 
 
 def test_an_immutable_uri_to_a_missing_file_is_a_write(home):
