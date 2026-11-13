@@ -23,7 +23,11 @@ example the public repository added as a GitHub marketplace) is replaced, plugin
 
 Exit codes: 0 consistent / applied (an invalid lever value is applied as "change nothing" and reported),
 2 cannot run (no `claude`, not the main checkout, unreadable genesis.yaml, a CLI failure),
-3 inconsistent (check only; includes a lever value that is neither on nor off).
+3 inconsistent (check only; includes a lever value that is neither on nor off),
+4 installed as the lever says, but a session in the last day reported that it could not load the secret values
+  (it ran unredacted, or on values loaded earlier), or that the secrets file holds placeholder text as a value
+  (check only; the sessions' reports are `${GENESIS_HOME:-~/.genesis}/state/secret-redact/<session>.json`,
+  names and counts only).
 """
 
 from __future__ import annotations
@@ -37,10 +41,14 @@ import sys
 from pathlib import Path
 
 MARKETPLACE = "genesis"
-PLUGINS = {"secret_redact": "genesis-secret-redact"}
+PLUGINS = {
+    "secret_redact": "genesis-secret-redact",  # pragma: allowlist secret (a lever name and a plugin name)
+}
 #: Claude Code's plugin commands are local file operations that finish in seconds (measured); the bound only
 #: keeps a wedged CLI from holding bootstrap or update.sh forever.
-_CLI_TIMEOUT_S = 300
+_CLI_TIMEOUT_S = float(
+    os.environ.get("GENESIS_CC_PLUGINS_TIMEOUT_S") or 300
+)  # the override is for tests
 
 
 def _claude(*args: str) -> subprocess.CompletedProcess:
@@ -94,11 +102,26 @@ def is_main_checkout(root: Path) -> bool:
 
 
 def state(name: str) -> dict:
-    """What Claude Code reports: the marketplace path, and whether the plugin is installed and enabled."""
+    """What Claude Code reports for the user scope: whether a marketplace of this name exists, the folder it is
+    read from (a git or GitHub marketplace has none, measured on 2.1.299: it lists ``source`` and ``repo``),
+    what re-adds it, and whether the plugin is installed at user scope and enabled. An install at project or
+    local scope does not count: it loads only in that project."""
     mkt = next((m for m in _json("marketplace", "list") if m.get("name") == MARKETPLACE), None)
-    plugin = next((p for p in _json("list") if p.get("id") == f"{name}@{MARKETPLACE}"), None)
+    plugin = next(
+        (
+            p
+            for p in _json("list")
+            if p.get("id") == f"{name}@{MARKETPLACE}" and p.get("scope", "user") == "user"
+        ),
+        None,
+    )
+    source = None
+    if mkt:
+        source = mkt.get("path") or mkt.get("repo") or mkt.get("url")
     return {
-        "marketplace_path": mkt.get("path") if mkt else None,
+        "marketplace": mkt is not None,
+        "marketplace_path": mkt.get("path") if mkt and mkt.get("source") == "directory" else None,
+        "marketplace_source": source,
         "installed": plugin is not None,
         "enabled": bool(plugin and plugin.get("enabled")),
     }
@@ -115,6 +138,7 @@ def _run_or_raise(*args: str) -> None:
 def apply(root: Path, key: str, name: str) -> list[str]:
     """Make the install match the lever; returns what was done, one line each."""
     want = lever(key)
+    prune_reports()
     if want.startswith("invalid:"):
         return [f"{name}: lever cc_plugins.{key}={want[8:]!r} is not on/off; nothing changed"]
     plugin_id = f"{name}@{MARKETPLACE}"
@@ -123,42 +147,122 @@ def apply(root: Path, key: str, name: str) -> list[str]:
     done: list[str] = []
     if want == "off":
         if now["installed"]:
-            _run_or_raise("uninstall", plugin_id)
+            _run_or_raise("uninstall", plugin_id, "--scope", "user")
             done.append(f"{name}: uninstalled (lever off)")
         return done or [f"{name}: off (not installed)"]
-    if now["marketplace_path"] is not None and now["marketplace_path"] != path:
+    if now["marketplace"] and now["marketplace_path"] != path:
         was_disabled = now["installed"] and not now["enabled"]
         _run_or_raise("marketplace", "remove", MARKETPLACE)
         try:  # the shared name forces remove-then-add; a failure in between leaves the plugin uninstalled
             _run_or_raise("marketplace", "add", path)
-            _run_or_raise("install", plugin_id)
-        except RuntimeError as exc:
-            # Put the previous registration back, so the failure costs the re-point and not the redaction.
-            old = now["marketplace_path"]
+            _run_or_raise("install", plugin_id, "--scope", "user")
+        except (
+            RuntimeError,
+            subprocess.SubprocessError,
+        ) as exc:  # a CLI timeout is a SubprocessError
+            # Put the previous registration back, so the failure costs the re-point and not the redaction. The
+            # new registration may already be in place under the same name: remove it first.
+            old = now["marketplace_source"]
             try:
+                _claude("marketplace", "remove", MARKETPLACE)
+                if not old:
+                    raise RuntimeError("the previous registration's source is unknown")
                 _run_or_raise("marketplace", "add", old)
-                _run_or_raise("install", plugin_id)
+                _run_or_raise("install", plugin_id, "--scope", "user")
                 if was_disabled:
-                    _run_or_raise("disable", plugin_id)
+                    _run_or_raise("disable", plugin_id, "--scope", "user")
                 restored = f"; restored the previous registration at {old}"
-            except RuntimeError:
+            except (RuntimeError, subprocess.SubprocessError):
                 restored = f"; {name} is now NOT INSTALLED, so sessions are not redacted until the next run succeeds"
             raise RuntimeError(f"{exc}{restored}") from exc
         if was_disabled:
-            _run_or_raise("disable", plugin_id)
+            _run_or_raise("disable", plugin_id, "--scope", "user")
         return [
             f"{name}: marketplace re-pointed to {path}"
             + (" (kept disabled)" if was_disabled else "")
         ]
-    if now["marketplace_path"] is None:
+    if not now["marketplace"]:
         _run_or_raise("marketplace", "add", path)
         done.append(f"marketplace {MARKETPLACE} added at {path}")
     if not now["installed"]:
-        _run_or_raise("install", plugin_id)
+        _run_or_raise("install", plugin_id, "--scope", "user")
         done.append(f"{name}: installed")
     elif not now["enabled"]:
         done.append(f"{name}: installed but disabled (owner's choice; left as is)")
     return done or [f"{name}: up to date"]
+
+
+#: Sessions report here (the plugin's mod writes one file per session); `check` reads the last day of them.
+STATE_DIR = "state/secret-redact"
+#: How bad each `check` exit code is: cannot run (2) > wrongly installed (3) > a session reported trouble (4).
+_RANK = {0: 0, 4: 1, 3: 2, 2: 3}
+STATE_WINDOW_S = 24 * 3600
+
+
+def session_reports(now: float | None = None) -> tuple[int, list[str]]:
+    """(exit code, lines) from the sessions' own reports: 4 when a recent session could not load the secret
+    values (it ran unredacted) or found placeholder text stored as a value in the secrets file, else 0."""
+    import time  # noqa: PLC0415
+
+    home = Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis")
+    now = time.time() if now is None else now
+    recent = []
+    for path in sorted((home / STATE_DIR).glob("*.json")):
+        try:
+            if now - path.stat().st_mtime > STATE_WINDOW_S:
+                continue
+            report = json.loads(path.read_text())
+        except (OSError, ValueError):
+            report = None
+        if not isinstance(report, dict):
+            report = {"ok": False, "failure": "unreadable report"}
+        recent.append((path.stem, report))
+    failed = [(sid, r) for sid, r in recent if r.get("ok") is not True]
+    overwritten = sorted(
+        {
+            str(v)
+            for _, r in recent
+            if isinstance(r.get("overwritten"), list)
+            for v in r["overwritten"]
+        }
+    )
+    lines = [f"session reports (last day): {len(recent)}, failed to load: {len(failed)}"]
+    if not recent:
+        lines.append(
+            "no session reported in the last day: whether sessions redact is unknown, not confirmed"
+        )
+    for sid, r in failed:
+        state = "kept earlier values" if r.get("redacting") else "NOT redacting"
+        lines.append(
+            f"inconsistent: session {sid[:8]} could not load secret values ({r.get('failure')}); {state}"
+        )
+    if overwritten:
+        lines.append(
+            "inconsistent: the secrets file holds placeholder text, not a value, for "
+            + ", ".join(overwritten)
+            + "; restore those keys from a backup"
+        )
+    return (4 if failed or overwritten else 0), lines
+
+
+def prune_reports(now: float | None = None, keep_s: float = 7 * 24 * 3600) -> int:
+    """Remove session reports older than a week (one file per session; nothing else removes them)."""
+    import time  # noqa: PLC0415
+
+    home = Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis")
+    now = time.time() if now is None else now
+    removed = 0
+    folder = home / STATE_DIR
+    if folder.is_symlink():  # never delete in a folder this script did not make
+        return 0
+    for path in folder.glob("*.json"):
+        try:
+            if not path.is_symlink() and now - path.stat().st_mtime > keep_s:
+                path.unlink()
+                removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def check(root: Path, key: str, name: str) -> tuple[int, list[str]]:
@@ -187,7 +291,11 @@ def check(root: Path, key: str, name: str) -> tuple[int, list[str]]:
         problems.append("not installed")
     elif not now["enabled"]:
         problems.append("disabled while the lever is on (sessions are not redacted)")
-    return (3, [*lines, *(f"inconsistent: {p}" for p in problems)]) if problems else (0, lines)
+    if problems:
+        return 3, [*lines, *(f"inconsistent: {p}" for p in problems)]
+    # Installed as the lever says: whether sessions actually redact is what they report themselves.
+    code, reported = session_reports()
+    return code, [*lines, *reported]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -214,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"cc-plugins: {line}")
             else:
                 rc, lines = check(root, key, name)
-                status = max(status, rc)
+                status = max(status, rc, key=_RANK.get)
                 for line in lines:
                     print(f"cc-plugins: {line}")
         return status

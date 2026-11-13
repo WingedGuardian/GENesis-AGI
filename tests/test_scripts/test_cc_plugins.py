@@ -31,11 +31,20 @@ if os.environ.get("FAKE_CLAUDE_FAIL") and sys.argv[2:3] == [os.environ["FAKE_CLA
 a = sys.argv[2:]
 if os.environ.get("FAKE_CLAUDE_FAIL_IF_ARG") and os.environ["FAKE_CLAUDE_FAIL_IF_ARG"] in " ".join(a):
     print("simulated failure", file=sys.stderr); sys.exit(1)
+if os.environ.get("FAKE_CLAUDE_HANG_IF_ARG") and os.environ["FAKE_CLAUDE_HANG_IF_ARG"] in " ".join(a):
+    once = state_file + ".hung"
+    if not os.path.exists(once):  # hang the first matching call only
+        open(once, "w").close()
+        import time; time.sleep(30)
 def save(): json.dump(st, open(state_file, "w"))
 if a == ["marketplace", "list", "--json"]:
-    print(json.dumps([{"name": n, "source": "directory", "path": p} for n, p in st["mkts"].items()]))
+    # A string is a directory marketplace; a dict is listed as it is (a GitHub one has no path).
+    print(json.dumps([{"name": n, "source": "directory", "path": p} if isinstance(p, str) else {"name": n, **p}
+                      for n, p in st["mkts"].items()]))
 elif a == ["list", "--json"]:
-    print(json.dumps([{"id": i, "enabled": e} for i, e in st["plugins"].items()]))
+    # A bool is a user-scope install; a dict carries its own scope.
+    print(json.dumps([{"id": i, "enabled": e, "scope": "user"} if isinstance(e, bool) else {"id": i, **e}
+                      for i, e in st["plugins"].items()]))
 elif a[:2] == ["marketplace", "add"]:
     name = json.load(open(os.path.join(a[2], ".claude-plugin", "marketplace.json")))["name"]
     st["mkts"][name] = a[2]; save()
@@ -114,7 +123,7 @@ def world(tmp_path):
             return log.read_text().splitlines() if log.exists() else []
 
     w = World()
-    w.root, w.tmp, w.env = root, tmp_path, env
+    w.root, w.tmp, w.env, w.home = root, tmp_path, env, home
     return w
 
 
@@ -268,3 +277,119 @@ def test_marketplace_lists_only_the_redaction_plugin():
     manifest = json.loads((REPO / "plugins" / ".claude-plugin" / "marketplace.json").read_text())
     assert manifest["name"] == "genesis"
     assert [p["name"] for p in manifest["plugins"]] == ["genesis-secret-redact"]
+
+
+def test_a_project_scope_install_does_not_count_as_installed(world):
+    # Loaded only in that project; every other session needs the user-scope install.
+    world.set_state(
+        {
+            "mkts": {"genesis": str(world.root / "plugins")},
+            "plugins": {PLUGIN: {"enabled": True, "scope": "project"}},
+        }
+    )
+    run = world.run("apply")
+    assert run.returncode == 0 and "installed" in run.stdout
+    assert world.state()["plugins"][PLUGIN] is True
+
+
+def test_a_marketplace_of_the_same_name_from_github_is_replaced(world):
+    world.set_state(
+        {"mkts": {"genesis": {"source": "github", "repo": "someone/else"}}, "plugins": {}}
+    )
+    run = world.run("apply")
+    assert run.returncode == 0 and "re-pointed" in run.stdout
+    assert world.state()["mkts"] == {"genesis": str(world.root / "plugins")}
+    assert world.state()["plugins"] == {PLUGIN: True}
+
+
+def test_a_timed_out_re_point_still_restores_the_previous_registration(tmp_path, world):
+    old = tmp_path / "old-checkout" / "plugins"
+    (old / ".claude-plugin").mkdir(parents=True)
+    (old / ".claude-plugin" / "marketplace.json").write_text(
+        json.dumps({"name": "genesis", "plugins": []})
+    )
+    world.set_state({"mkts": {"genesis": str(old)}, "plugins": {PLUGIN: True}})
+    run = world.run(
+        "apply",
+        FAKE_CLAUDE_HANG_IF_ARG="install " + PLUGIN,
+        FAKE_CLAUDE_FAIL_IF_ARG="NO_MATCH",
+        GENESIS_CC_PLUGINS_TIMEOUT_S="2",
+    )
+    assert run.returncode == 2 and "restored the previous registration" in run.stdout
+    # The new registration was removed before the old one was put back.
+    assert world.state()["mkts"] == {"genesis": str(old)}
+
+
+def _report(world, sid, body, age_s=0):
+    folder = Path(world.home) / "state" / "secret-redact"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{sid}.json"
+    path.write_text(json.dumps(body))
+    if age_s:
+        t = path.stat().st_mtime - age_s
+        os.utime(path, (t, t))
+
+
+def test_check_exits_4_when_a_recent_session_could_not_load_values(world):
+    world.set_state({"mkts": {"genesis": str(world.root / "plugins")}, "plugins": {PLUGIN: True}})
+    _report(
+        world, "aaaaaaaa-good", {"ok": True, "redacting": True, "variables": 3, "overwritten": []}
+    )
+    assert world.run("check").returncode == 0
+    _report(
+        world, "bbbbbbbb-old", {"ok": False, "failure": "known_values exited 1"}, age_s=2 * 86400
+    )
+    assert world.run("check").returncode == 0  # older than a day: not counted
+    _report(
+        world, "cccccccc-bad", {"ok": False, "failure": "known_values exited 1", "redacting": False}
+    )
+    run = world.run("check")
+    assert run.returncode == 4 and "cccccccc" in run.stdout and "NOT redacting" in run.stdout
+
+
+def test_check_exits_4_when_a_session_found_placeholder_text_stored_as_a_value(world):
+    world.set_state({"mkts": {"genesis": str(world.root / "plugins")}, "plugins": {PLUGIN: True}})
+    _report(
+        world,
+        "dddddddd",
+        {"ok": True, "redacting": True, "variables": 2, "overwritten": ["SOME_TOKEN"]},
+    )
+    run = world.run("check")
+    assert run.returncode == 4 and "SOME_TOKEN" in run.stdout
+
+
+def test_apply_removes_session_reports_older_than_a_week(world):
+    _report(world, "eeeeeeee-old", {"ok": True}, age_s=8 * 86400)
+    _report(world, "ffffffff-new", {"ok": True})
+    assert world.run("apply").returncode == 0
+    names = sorted(p.name for p in (Path(world.home) / "state" / "secret-redact").iterdir())
+    assert names == ["ffffffff-new.json"]
+
+
+@pytest.mark.parametrize("text", ["null", "[]", '{"overwritten": 5}', '"text"', "{}"])
+def test_a_report_that_is_not_a_well_formed_object_is_a_failed_report_not_a_crash(world, text):
+    world.set_state({"mkts": {"genesis": str(world.root / "plugins")}, "plugins": {PLUGIN: True}})
+    folder = Path(world.home) / "state" / "secret-redact"
+    folder.mkdir(parents=True)
+    (folder / "abcdef01-x.json").write_text(text)
+    run = world.run("check")
+    assert run.returncode == 4 and "Traceback" not in run.stderr
+
+
+def test_no_session_report_is_said_to_be_unknown(world):
+    world.set_state({"mkts": {"genesis": str(world.root / "plugins")}, "plugins": {PLUGIN: True}})
+    run = world.run("check")
+    assert run.returncode == 0 and "unknown, not confirmed" in run.stdout
+
+
+def test_prune_never_follows_a_symlinked_report_folder(tmp_path, world):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    victim = elsewhere / "keep.json"
+    victim.write_text("{}")
+    t = victim.stat().st_mtime - 30 * 86400
+    os.utime(victim, (t, t))
+    (Path(world.home) / "state").mkdir(parents=True, exist_ok=True)
+    (Path(world.home) / "state" / "secret-redact").symlink_to(elsewhere)
+    world.run("apply")
+    assert victim.exists()

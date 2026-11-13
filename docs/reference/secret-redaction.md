@@ -23,8 +23,13 @@ loads in place from the checkout, so a later deploy updates it at the next sessi
   re-enables a plugin that is installed.
 - **Check:** `scripts/cc_plugins.py check` prints the state and exits 3 when it does not match the lever (for
   example, disabled while the lever is on, the marketplace pointing at a checkout that moved, or a lever value
-  that is neither `on` nor `off`), and 2 when it cannot tell (no `claude`, unreadable `genesis.yaml`). Nothing
-  reports this to Genesis's health surfaces yet; that wiring is tracked separately.
+  that is neither `on` nor `off`), and 2 when it cannot tell (no `claude`, unreadable `genesis.yaml`). When the
+  install matches, it reads what sessions report about themselves: each session's plugin writes
+  `~/.genesis/state/secret-redact/<session>.json` (names and counts only) after each load attempt, and `check`
+  exits 4 when a session in the last day could not load the values (it ran unredacted, or on values loaded
+  earlier) or found placeholder text stored as a value in the secrets file; a session that keeps failing
+  refreshes its report hourly. No report in the last day is said to be unknown (exit 0): `check` cannot tell
+  "no session ran" from "a session could not write its report". `apply` removes reports older than a week. Surfacing `check` in Genesis's health alerts is #4441.
 - Only the main checkout registers itself; a linked worktree is refused. A checkout that moved is re-pointed on
   the next run, keeping a disabled plugin disabled.
 - No `claude` on PATH: the step reports it and is re-attempted on the next update.
@@ -118,8 +123,8 @@ redacted once: text that already holds one passes through the next hook unchange
 ## Failure directions
 
 Apart from the one refusal above, every failure here lets the session keep working. Its record is a line in
-Claude Code's debug log (`claude --debug`); a health check that surfaces it without a debug run comes with the
-install step.
+Claude Code's debug log (`claude --debug`) and the session's report, which `scripts/cc_plugins.py check` reads
+(see "Install, upgrade and off-switch").
 
 - The values cannot be loaded: the session runs unredacted. A reload that fails later keeps the values that
   loaded earlier. After a failed load the next attempt waits 30 seconds, so a loader that keeps failing does

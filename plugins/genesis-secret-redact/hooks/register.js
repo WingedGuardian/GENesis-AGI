@@ -29,6 +29,9 @@ let stamp = '' // mtimeMs:size of each watched path, taken BEFORE the last load 
 let warned = false
 let retryAt = 0 // no load before this time: a loader that keeps failing must not run on every event
 let reported = '' // the overwritten keys last logged, so each set is logged once
+let variables = 0 // how many variables the last good load selected
+let stateLine = '' // the state last written, so a file is written only when it changes
+let stateWarned = false
 
 const RETRY_MS = 30_000
 const WRITES = new Set(['Edit', 'Write'])
@@ -206,6 +209,7 @@ async function load($) {
     parsed = await runLoader($)
     paths = parsed.watch ?? [parsed.path]
   }
+  variables = new Set(parsed.needles.map(n => n.var)).size
   const current = parsed.needles.map(n => [n.text, n.placeholder])
   // A value this session held stays redacted after it leaves the file: a rotated-out key is usually still valid
   // where it was issued, and the very call that replaced it echoes it back in its result (measured: an Edit).
@@ -249,6 +253,33 @@ async function load($) {
 
 let loading = null // one loader run at a time; concurrent events share it
 
+// What `scripts/cc_plugins.py check` reads to tell whether sessions are actually redacting: one small file per
+// session under the install's state folder, written when its content changes. Names and counts only: a
+// failure is recorded as its kind, never its message (a parse error can quote the text it read).
+async function report($, failure) {
+  try {
+    const body = { ok: failure === undefined, failure: failure ?? null, redacting: pairs.length > 0, variables, overwritten: reported ? reported.split(', ') : [] }
+    // While a failure lasts the file is rewritten once an hour, so a session that keeps failing stays inside
+    // the day `check` reads; a healthy session writes only when its state changes.
+    const line = JSON.stringify({ ...body, hour: body.ok ? 0 : Math.floor(Date.now() / 3_600_000) })
+    if (line === stateLine) return
+    const base = (await $.env.get('GENESIS_HOME')) || `${await $.env.get('HOME')}/.genesis`
+    const session = await $.session.id()
+    await $.fs.write(`${base}/state/secret-redact/${session}.json`, `${JSON.stringify({ session, at: new Date().toISOString(), ...body })}\n`)
+    stateLine = line
+  } catch (err) {
+    if (!stateWarned) {
+      stateWarned = true
+      $.ui.log(`genesis-secret-redact: could not write its state file (${err?.message ?? err}); the install's check cannot see this session`)
+    }
+  }
+}
+
+function failureKind(err) {
+  const message = String(err?.message ?? '')
+  return /^known_values (exited \d+|printed more than Claude Code keeps)$/.test(message) ? message : (err?.name ?? 'Error')
+}
+
 // Reload when the secrets file changed since the last load (a key added or rotated mid-session).
 async function fresh($) {
   try {
@@ -258,9 +289,11 @@ async function fresh($) {
         loading = null
       })
       await loading
+      await report($)
     }
   } catch (err) {
     retryAt = Date.now() + RETRY_MS
+    await report($, failureKind(err))
     // Keep the last values that loaded: they are still secrets. Without any, this session is unredacted.
     if (!warned) {
       warned = true
