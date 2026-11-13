@@ -875,6 +875,7 @@ class Repair:
         self._fds: list[int] = []
         self.update_fd: int | None = None  # update.lock's, handed to restore-hooks
         self.forward = False  # HEAD on `live` at the target: finishing a rollback
+        self.start_mark: str | None = None  # at boot, the checkout as the heal found it
 
     def _hold(self, path: str, deadline: float) -> int | None:
         fd = _flock(path, deadline)
@@ -1030,7 +1031,12 @@ class Repair:
         A heal that crashed partway (or was killed before it recorded a
         result) is retried once, then refused the same way (owner ruling);
         its attempts are counted from the reports on disk (#4501 round 3), so
-        an end mark the deadline left unreadable never resets the count."""
+        an end mark the deadline left unreadable never resets the count. The
+        count stops where the checkout changed from outside between two crashes
+        (a crash's end mark against the next heal's start mark, round 4): that
+        tree is owed its own retry. A heal's own half-written change never
+        stops it, since the next heal starts from the tree the crash left."""
+        self.start_mark = mark = _end_mark(self.repo)
         try:
             names = sorted(n for n in os.listdir(self.backups) if n.endswith(SUFFIX))
         except OSError:
@@ -1045,15 +1051,18 @@ class Repair:
         if not reports:
             return False
         name, report = reports[0]
-        mark = _end_mark(self.repo)
         state_sha = hashlib.sha256(raw).hexdigest()
         boot = _boot()
         if boot.same_attempt(report, state_sha, _KIT_ID) and boot.crashed(report):
-            attempts = 0
+            attempts, newer = 0, None
             for _, older in reports:
                 if not (boot.same_attempt(older, state_sha, _KIT_ID) and boot.crashed(older)):
                     break
-                attempts += 1
+                if newer is not None and boot.changed(
+                    older.get("end_mark"), newer.get("start_mark")
+                ):
+                    break  # the checkout changed from outside before the newer heal
+                attempts, newer = attempts + 1, older
             if attempts < 2:
                 self._say(
                     f"the last repair of this update state crashed partway ({name}); trying once more"
@@ -1252,6 +1261,7 @@ class Repair:
         # The repeat check's (F4): these state bytes, and (at boot) the checkout as left.
         # The kit too (review SF-B): a newly installed kit may heal what this one could not.
         manifest.update(state_sha=hashlib.sha256(raw).hexdigest(), end_mark=None, kit_id=_KIT_ID)
+        manifest["start_mark"] = self.start_mark  # round 4: where an outside change shows
         # `reapply` stays [] (#3868: no generated shell) so older readers stay valid.
         manifest.update(result=None, paths=rows, reapply=[], dismissed_at=None, hooks=None)
         manifest.update(index_rebuilt=torn, integrity="SAVED.json")

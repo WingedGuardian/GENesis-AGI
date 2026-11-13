@@ -297,6 +297,48 @@ def test_td36_the_one_retry_holds_when_the_crash_left_no_readable_mark(w, mod, m
     assert len(w.backups()) == 2, f"{len(w.backups())} backups: the one retry did not hold"
 
 
+def test_td36_a_crash_after_a_proven_checkout_change_gets_its_own_retry(w, mod, monkeypatch):
+    """#4501 round 4 (CodeRabbit): two crashes refuse; then the checkout changes
+    from outside, the heal runs, and crashes again. That changed tree is owed its
+    one retry: the count stops where a crash's end mark differs from the next
+    heal's start mark."""
+    killed_tag_side(w, "Z3")
+    _crash_partway(mod, monkeypatch)
+    for _ in range(3):
+        _main(w, mod, monkeypatch)
+        _next_start(mod, monkeypatch)
+    assert len(w.backups()) == 2
+    (w.root / "outside-edit.txt").write_text("changed while the server was down\n")
+    _main(w, mod, monkeypatch)  # the changed tree: a new heal, which crashes
+    _next_start(mod, monkeypatch)
+    assert len(w.backups()) == 3
+    _main(w, mod, monkeypatch)  # its one retry
+    _next_start(mod, monkeypatch)
+    assert len(w.backups()) == 4, "a crash on a changed checkout got no retry"
+    _main(w, mod, monkeypatch)
+    assert len(w.backups()) == 4, "the retry after a checkout change did not hold"
+
+
+def test_td36_crashes_that_each_changed_the_tree_still_stop_after_one_retry(w, mod, monkeypatch):
+    """A heal that crashes partway changes the checkout itself. Its own change is
+    no change from outside: each crash leaves a different tree, and still only
+    one retry runs (an end-to-end-mark boundary would retry forever)."""
+    killed_tag_side(w, "Z3")
+    runs = []
+
+    def partway(self, *a, **kw):
+        mod._changed = True
+        runs.append(1)
+        (w.root / f"half-written-{len(runs)}.txt").write_text("left by a crashed heal\n")
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(mod.Repair, "_apply", partway)
+    for _ in range(4):
+        _main(w, mod, monkeypatch)
+        _next_start(mod, monkeypatch)
+    assert len(w.backups()) == 2, f"{len(w.backups())} backups: a heal's own change reset the count"
+
+
 def test_td25_an_unresolved_heal_with_an_unknown_end_mark_is_not_healed_again(
     tmp_path, monkeypatch
 ):
@@ -883,8 +925,11 @@ def test_td34_a_boot_run_past_its_deadline_ends_as_exit_code_not_timeout(w, tmp_
     took = time.monotonic() - start
     # systemd 255: "failed because the control process exited with error code"
     # (result exit-code); a TimeoutStartSec kill reads "a timeout was exceeded".
-    assert r.returncode != 0 and "exited with error code" in out, out
-    assert "timeout was exceeded" not in out, out
+    # Newer systemd (the CI runner's) prints the result as "Finished with
+    # result: exit-code" instead.
+    assert r.returncode != 0, out
+    assert "exited with error code" in out or "result: exit-code" in out, out
+    assert "timeout was exceeded" not in out and "result: timeout" not in out, out
     assert took <= 9 + 3 + 1 + 1.5, took  # + 1.5: systemd-run and the interpreter start
 
 
