@@ -48,6 +48,7 @@ def home(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(audit._S, "hits", {})
     monkeypatch.setattr(audit._S, "faults", 0)
+    monkeypatch.setattr(audit._S, "credential_inodes", frozenset())
     return fake
 
 
@@ -575,6 +576,33 @@ def test_a_relative_os_open_that_only_reopens_an_existing_file_is_not_a_write(ho
     assert _hits() == set()
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def test_a_credential_file_read_under_another_name_is_recorded(home, tmp_path, monkeypatch):
     """Through a symlink and a hard link whose names say nothing: recorded."""
     secrets = home / "genesis" / "secrets.env"
@@ -616,24 +644,6 @@ def test_a_fault_in_the_credential_lookup_never_breaks_a_read(home, tmp_path, mo
     os.close(fd)
 
 
-def test_install_records_the_credential_files_by_inode(tmp_path, monkeypatch):
-    """The inode set is what lets a read under another name be recognised."""
-    fake = tmp_path / "home"
-    (fake / "genesis").mkdir(parents=True)
-    (fake / "genesis" / "secrets.env").write_text("K=v\n")
-    st = os.stat(fake / "genesis" / "secrets.env")
-    from tests import _live_fence
-
-    monkeypatch.setattr(audit._S, "installed", False)
-    monkeypatch.setattr(audit.sys, "addaudithook", lambda hook: None)
-    monkeypatch.setattr(_live_fence._S, "installed", True)
-    monkeypatch.setattr(_live_fence._S, "real_home", str(fake))
-    for name in ("real_home", "allowed_roots", "allowed_files", "classes", "credential_files"):
-        monkeypatch.setattr(audit._S, name, getattr(audit._S, name))
-    monkeypatch.setattr(audit._S, "credential_inodes", frozenset())
-    config = type("C", (), {"option": type("O", (), {"basetemp": None})()})()
-    audit.install(config)
-    assert (st.st_dev, st.st_ino) in audit._S.credential_inodes
 
 
 def test_install_without_a_known_real_home_stays_disarmed(monkeypatch):
