@@ -1475,7 +1475,8 @@ verified: 0164dd1f0 2026-10-14
   that converts per-action approval into a standing grant; a denylist would hand
   that conversion to every new capability by default. **Contact-stamping (loop-fix):** on a CONFIRMED
   delivery a matching prospect is advanced active → `contacted` via one
-  active-guarded CRUD (`marketing_prospects.mark_contacted_by_email`) called from
+  active-guarded CRUD (`marketing_prospects.mark_contacted_in_recipient`, which
+  stamps every prospect the recipient string names) called from
   BOTH delivery paths — the email-gate drain (`email_gate_watcher`) for a HELD →
   owner-approved send, AND `pipeline._deliver` for a GRANTED-cell autonomous send
   (which delivers inline and never touches the drain, so the fix survives
