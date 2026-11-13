@@ -125,34 +125,50 @@ def inflight_work():
     )
 
 
+def redact_for_untrusted(snapshot: dict) -> None:
+    """Reduce a health snapshot, in place, to what any caller may read.
+
+    Every implementation of ``GET /api/genesis/health`` calls this on its own
+    shallow copy before answering (this module's route and the Agent Zero
+    adapter's, ``az_plugins/genesis/api_health.py``). The route is reachable
+    from any network (``_OPEN_FROM_ANY_NETWORK``, for the host-side
+    supervisor), so the fields below go only to the internal bearer or a
+    verified dashboard session. Never to a peer by its address: behind a
+    reverse proxy (or a container proxy device) every outside caller arrives
+    from a trusted address. Verified, not ``is_authenticated``: with no
+    dashboard password there is no credential, so nothing is revealed
+    (``has_verified_credential``).
+
+    The trust decision is made once, here. The helpers below take no part in
+    it and always redact, so calling one directly can only withhold more.
+    """
+    from genesis.dashboard.auth import has_internal_bearer, has_verified_credential
+
+    if has_internal_bearer() or has_verified_credential():
+        return
+    _redact_checkout_paths(snapshot)
+    _redact_call_site_responses(snapshot)
+
+
 def _redact_checkout_paths(snapshot: dict) -> None:
     """Drop the deploy checkout's edited file names, and the probe's error
-    text, for an untrusted caller.
+    text (``redact_for_untrusted`` decides who this runs for).
 
-    This route is reachable from any network (``_OPEN_FROM_ANY_NETWORK``, for
-    the host-side supervisor), and the names can be a private fork's or this
-    install's own files; a probe error can name absolute paths on the install.
-    The status and count stay public; the names and the reason go only to
-    the internal bearer or a verified dashboard session. Never to a peer by
-    its address: behind a reverse proxy (or a container proxy device) every
-    outside caller arrives from a trusted address. Rebuilt as new dicts:
-    ``snapshot`` is a shallow copy, so its nested dicts are the cached
-    snapshot other callers read.
+    The names can be a private fork's or this install's own files; a probe
+    error can name absolute paths on the install. The status and count stay
+    public. Rebuilt as new dicts: ``snapshot`` is a shallow copy, so its
+    nested dicts are the cached snapshot other callers read.
 
     The live-move repair's reports (``live_repairs``: report names and backup
     folders under the home directory) are reduced the same way to an
     allow-list of counts (_REPAIR_COUNTS): a key added later stays private.
     """
-    from genesis.dashboard.auth import has_internal_bearer, has_verified_credential
-
     deploy = snapshot.get("deploy_health")
     if not isinstance(deploy, dict):
         return
     checkout, repairs = deploy.get("main_checkout"), deploy.get("live_repairs")
     names = isinstance(checkout, dict) and bool({"paths", "reason"} & checkout.keys())
     if not (names or repairs is not None):
-        return
-    if has_internal_bearer() or has_verified_credential():
         return
     redacted = dict(deploy)
     if names:
@@ -175,6 +191,42 @@ _REPAIR_COUNTS = (
     "hooks_saved",
     "unresolved",
 )
+
+
+def _redact_call_site_responses(snapshot: dict) -> None:
+    """Drop each call site's ``last_response`` (``redact_for_untrusted``
+    decides who this runs for).
+
+    That field is the text the site's last model call returned, as its caller
+    recorded it (``call_site_last_run.response_text``). A foreground reply and
+    a reflection are recorded whole, so it can carry whatever that call was
+    given. Everything else about a site (status, provider chain, run time,
+    token count) stays public. A site that had text gets
+    ``last_response_hidden: true`` so a page can say the text was withheld
+    instead of showing a site that never produced any.
+
+    Rebuilt as new dicts, for the reason ``_redact_checkout_paths`` gives. A
+    value that is not a site dict cannot be reduced by key, so it is served as
+    an empty one (fails closed): that covers a failed section, whose shape is
+    ``{"status": "error", "error": <exception text>}``. An empty dict, not
+    null, because the dashboard pages read ``.status`` off every value.
+    """
+    sites = snapshot.get("call_sites")
+    if sites is None:
+        return
+    if not isinstance(sites, dict):
+        snapshot["call_sites"] = {}
+        return
+    redacted: dict = {}
+    for site_id, site in sites.items():
+        if not isinstance(site, dict):
+            redacted[site_id] = {}
+            continue
+        entry = {k: v for k, v in site.items() if k != "last_response"}
+        if site.get("last_response"):
+            entry["last_response_hidden"] = True
+        redacted[site_id] = entry
+    snapshot["call_sites"] = redacted
 
 
 @blueprint.route("/api/genesis/health")
@@ -201,7 +253,7 @@ async def health_snapshot():
         pass
 
     snapshot["bridge"] = bridge_health
-    _redact_checkout_paths(snapshot)
+    redact_for_untrusted(snapshot)
 
     infra = snapshot.get("infrastructure", {})
     db_status = infra.get("genesis.db", {}).get("status", "") if isinstance(infra, dict) else ""

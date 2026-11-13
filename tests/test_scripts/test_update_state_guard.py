@@ -1430,3 +1430,52 @@ def test_the_guards_git_runs_no_fsmonitor_the_repository_names(guard, repo, tmp_
     mark.unlink()
     subprocess.run(status, capture_output=True, env=guard._env())
     assert not mark.exists(), "the guard's git environment still runs fsmonitor"
+
+
+# ── T-D35: the boot repair's absolute deadline (#3492 D2a-2) ─────────────────
+
+# SPY_*, not GIT_*: the guard's _env() drops every GIT_* variable (#4501 review).
+_SLOW_GIT = """#!/bin/sh
+echo "$@" >> "$SPY_GIT_CALLS"
+[ -n "$SPY_GIT_SLEEP" ] && exec sleep "$SPY_GIT_SLEEP"
+exec {git} "$@"
+"""
+
+
+def _spy_git(tmp_path: Path, monkeypatch, sleep: str = "") -> Path:
+    bin_dir = tmp_path / "spybin"
+    bin_dir.mkdir()
+    (bin_dir / "git").write_text(_SLOW_GIT.format(git=shutil.which("git")))
+    (bin_dir / "git").chmod(0o755)
+    calls = tmp_path / "git_calls"
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("SPY_GIT_CALLS", str(calls))
+    monkeypatch.setenv("SPY_GIT_SLEEP", sleep)
+    return calls
+
+
+def test_td35_a_deadline_already_past_starts_no_git(guard, live, tmp_path, monkeypatch):
+    """Past the boot deadline no call is started: TimeoutExpired, which every
+    caller already reads as "keep the state"."""
+    calls = _spy_git(tmp_path, monkeypatch)
+    guard._DEADLINE = time.monotonic() - 1
+    with pytest.raises(subprocess.TimeoutExpired):
+        guard.state_verdict(live_row(live), str(live["root"]))
+    assert not calls.exists(), calls.read_text()
+
+
+def test_td35_every_git_call_shares_one_deadline(guard, live, tmp_path, monkeypatch):
+    """Seven call sites each with _TIMEOUT_S would wait their sum; with the
+    deadline set they share what is left of it."""
+    calls = _spy_git(tmp_path, monkeypatch, sleep="30")
+    guard._DEADLINE = time.monotonic() + 2
+    start = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        guard.state_verdict(live_row(live), str(live["root"]))
+    assert time.monotonic() - start < 2.5
+    assert calls.exists(), "the spy git never ran: the deadline was not what stopped it"
+
+
+def test_td35_no_deadline_is_the_plain_timeout(guard):
+    assert guard._DEADLINE is None
+    assert guard._t(1) == guard._TIMEOUT_S
