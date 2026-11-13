@@ -497,7 +497,7 @@ PR unreviewed (owner, 2026-10-03). The rules:
   - Its `head=` is the `headRefOid` the scan read. Re-read `headRefOid` just
     before posting, and re-run the scan if it changed.
   - It states the lines examined, each class with its result, and that a session
-    ran it as the fallback.
+    ran it as the fallback, and whether the posting session authored the PR.
   - It ends with the explicit verdict line `VERDICT: PASS`. The gate's blocking
     patterns ignore negation, so without that line a clean marker can be refused
     on wording alone (the clean-verdict rule, Pre-Merge Gate below).
@@ -608,6 +608,10 @@ Full mechanics — findings as claims to verify and as a sample of a class, the
 round reflection gate, what counts as a round — are in "Review-loop discipline"
 below. Do not re-derive them.
 
+**A security PR that reaches the queue without the pre-review premise check**
+(build-session, "Security PRs: the premise check comes before round 1") gets
+one before its next fix round, with that section's fixed audit questions.
+
 ### 4. The merge gate
 
 **A merge needs the owner's authorization, and there are exactly two forms of
@@ -631,13 +635,30 @@ it** (owner ruling, 2026-10-19):
   - its shape is in order: from 500 to 1,000 counted lines the body carries a
     `Shape:` line, and the PR does not itself carry `needs-rework` or
     `needs-architecture-session` (the merge gate checks neither);
-  - no unmerged PR it depends on (see the PR→PR dependency paragraph below);
+  - no unmerged PR it depends on (see the PR→PR dependency paragraph below).
+    Read the BODY for this, not just the base branch: a PR whose body names
+    another PR as a prerequisite (for example a `Dependencies: #N` line) waits
+    for it even when its base is `main`. Seen 2026-11-12: #4268's body named
+    #4262 and #4260 (with #4267, already merged) as dependencies; #4268 merged
+    ahead of both, and a peer session noticed;
   - nothing on the list below applies.
 
   Merge it with the exact
   command the report printed, one PR at a time, and report each merge as you
-  go. GitHub records each such merge as an admin bypass of its approval rule;
-  that is expected (CLAUDE.md, "Code review after code changes").
+  go. **Between merges, read main's own push CI** for the merge you just made
+  (`gh run list --workflow ci.yml --branch main --event push --limit 3`), not
+  only the next PR's. The gate reads each PR's CI against the base it ran on,
+  so two PRs that are each green can turn main red together. Seen 2026-11-12:
+  #3719 (per-run HOME in test ids) broke collected-floor, and its skip with
+  #4058/#4095's by-design collection skip together broke the skip ceiling,
+  though each had merged green. Wait for that run to conclude before the next
+  merge: an in-progress run says nothing yet and a cancelled one says nothing
+  at all, so merging in a burst skips this check. If main turns red, classify it before the next merge, as for
+  the base-red NOTE in step 1: when the merge you just made caused it, or the
+  next PR touches what failed, fix main first; an unrelated flake or an
+  infrastructure failure does not hold the queue. GitHub records each such
+  merge as an admin bypass of its approval rule; that is expected (CLAUDE.md,
+  "Code review after code changes").
 - **Otherwise, a per-PR yes.** Present: what it does, what the review found, what
   you changed, its counted size
   (`python3 scripts/pr_shape.py --base origin/<PR base> --head <fetched PR ref>`),
@@ -646,7 +667,23 @@ it** (owner ruling, 2026-10-19):
 **Always the owner's call, per PR, whatever the closing request said:**
 - any override sigil (`# review-override`, `# ci-override`,
   `# stale-review-override`, `# scheduled-review-override`,
-  `# substitute-review`, `# rework-override`);
+  `# substitute-review`, `# rework-override`), including
+  `# depth-ack review-override` on a CONFLICTED merge of main into a PR branch:
+  show the owner the conflict files and the resolution, then commit on their
+  yes for that merge;
+- adding a `Collected-drop: <reason>` line (or any other line that lets a
+  failing check pass) to a PR to get past a failure the PR's own change did not
+  cause. An author declaring a deliberate drop of its own tests is the designed
+  use (build-session, "Public Repo & Release Workflow", the collected-floor
+  bullet); a closing session waiving a spurious or
+  inherited failure is a different act. Show the failing check, why it is not
+  this PR's, and the alternative (for example folding in the PR that fixes
+  it), and name the line in the merge question if it is already there
+  (#4471). It never excuses a new collection error;
+- retiring a PR outside the superseded-PR exception ("Never RETIRE a PR you are
+  not the one reviving"): only on the owner's explicit yes for that PR. Inside
+  the exception, condition 1 is the owner's decision on record, and no fresh
+  yes is needed;
 - merge-and-accept at a terminal round, or any round past it;
 - a PR that has hit a round cap (the terminal round of its lane): the cap
   voids standing approval, closing requests included, so it needs a fresh
