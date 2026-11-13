@@ -109,6 +109,8 @@
            inside the panel, with its denominator and the detector's age. -->
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'zero-drop' }"
               @click="location.hash = 'zero-drop'">Zero-Drop</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'board' }"
+              @click="location.hash = 'board'">Board</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'backup' }"
               @click="location.hash = 'backup'">Backup & Updates</button>
     </nav>

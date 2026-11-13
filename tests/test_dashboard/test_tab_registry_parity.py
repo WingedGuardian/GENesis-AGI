@@ -150,6 +150,7 @@ def _fetch_state_keys(js: str) -> set[str]:
 _FETCH_STATE_KEY = {
     "observations": "observations",
     "zero-drop": "zeroDrop",
+    "board": "board",
 }
 
 

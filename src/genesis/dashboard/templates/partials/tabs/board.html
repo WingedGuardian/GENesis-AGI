@@ -1,0 +1,129 @@
+    <!-- ═══════════════════════════════════════════════════════════
+         Panel: Board [Tab: board] (#4510)
+
+         Read-only: the work board as the reconciler last read it. The data is
+         board_status's own output (/api/genesis/board), read from stored
+         heartbeats, so this tab never calls GitHub.
+
+         Same rule as the zero-drop tab: a number is shown with what it is out
+         of and how old it is, and a value that is missing renders as
+         "unknown" (boardNum), never as 0. Every state has its own visible
+         text; none is shown by hiding another.
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="panel" data-panel="board" x-show="$store.genesisDashboard.activeTab === 'board'">
+      <div class="panel-header">
+        <span class="panel-title">Work Board</span>
+        <span class="panel-status"
+              x-text="'mode: ' + ($store.genesisDashboard.boardView?.latest?.mode ?? 'unknown')"></span>
+      </div>
+      <div style="padding:0.75rem;">
+
+        <template x-if="$store.genesisDashboard.panelState('board') === 'loading'">
+          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
+            Loading…
+          </div>
+        </template>
+        <template x-if="$store.genesisDashboard.panelState('board') === 'error'">
+          <div style="padding:1.5rem; text-align:center; color:#f0ad4e; font-size:0.75rem;">
+            Couldn't load the board's state. Will keep retrying.
+          </div>
+        </template>
+        <template x-if="$store.genesisDashboard.refreshFailing('board')">
+          <div style="padding:0.6rem; margin-bottom:0.75rem; border-radius:4px; background:rgba(240,173,78,0.12); color:#f0ad4e; font-size:0.72rem;"
+               x-text="'Refresh is failing (' + ($store.genesisDashboard.fetchState.board.error || 'unknown cause')
+                       + '). Everything below is the last state that loaded ('
+                       + Math.round((Date.now() - $store.genesisDashboard.fetchState.board.lastSuccess) / 60000)
+                       + ' min ago), not a current one.'"></div>
+        </template>
+
+        <template x-if="$store.genesisDashboard.boardView?.status === 'unavailable'">
+          <div style="padding:1.5rem; text-align:center; color:#f0ad4e; font-size:0.8rem;"
+               x-text="'Board state unavailable: ' + $store.genesisDashboard.boardView.reason + '.'"></div>
+        </template>
+        <template x-if="$store.genesisDashboard.boardView?.status === 'error'">
+          <div style="padding:1.5rem; text-align:center; color:#f0ad4e; font-size:0.8rem;"
+               x-text="'The reconciler\'s heartbeats could not be read: ' + $store.genesisDashboard.boardView.reason + '.'"></div>
+        </template>
+
+        <template x-if="$store.genesisDashboard.boardView
+                        && !['ok', 'unavailable', 'error'].includes($store.genesisDashboard.boardView.status)">
+          <div style="padding:1.5rem; text-align:center; color:#f0ad4e; font-size:0.8rem;"
+               x-text="'Unrecognised board state: ' + $store.genesisDashboard.boardView.status"></div>
+        </template>
+
+        <template x-if="$store.genesisDashboard.boardView?.status === 'ok'
+                        && ['healthy', 'refreshing', 'stale'].includes($store.genesisDashboard.panelState('board'))">
+          <div x-data="{ get v() { return $store.genesisDashboard.boardView },
+                         get d() { return $store.genesisDashboard } }"
+               style="font-size:0.78rem; display:grid; gap:0.9rem;">
+
+            <!-- ── Liveness, mode, project ── -->
+            <div>
+              <div style="font-weight:700; font-size:0.7rem; text-transform:uppercase; color:var(--color-text-secondary);">Reconciler</div>
+              <div x-text="(v.heartbeat?.status ?? 'unknown') + (v.latest?.paused ? ' (Genesis paused)' : '')
+                           + ', last pulse ' + d.boardAge(v.heartbeat?.age_seconds) + ' ago'
+                           + ' · mode ' + (v.latest?.mode ?? 'unknown')
+                           + ' · project ' + (v.latest?.project ?? v.summary?.project ?? 'unknown')"></div>
+              <div style="margin-top:0.3rem;"
+                   :style="v.latest?.last_error ? 'color:#f0ad4e;' : 'color:var(--color-text-secondary);'"
+                   x-text="'Last error: ' + (v.latest?.last_error ?? 'none')"></div>
+            </div>
+
+            <template x-if="v.latest?.mode === 'off'">
+              <div style="color:var(--color-text-secondary);">The board is off: nothing is read or written, so there are no counts to show.</div>
+            </template>
+            <template x-if="v.latest?.mode !== 'off' && v.summary == null">
+              <div style="color:var(--color-text-secondary);" x-text="v.note || 'No successful read of the board yet.'"></div>
+            </template>
+
+            <template x-if="v.latest?.mode !== 'off' && v.summary != null">
+              <div style="display:grid; gap:0.9rem;">
+                <!-- Freshness: a failing reconciler must never look current -->
+                <div x-text="'Counts as of ' + d.boardAge(v.summary.age_seconds) + ' ago'
+                             + ((typeof v.summary.age_seconds === 'number' && typeof v.heartbeat?.age_seconds === 'number'
+                                 && v.summary.age_seconds - v.heartbeat.age_seconds > 60)
+                                ? ' (the newest pulse, ' + d.boardAge(v.heartbeat.age_seconds) + ' ago, did not read the board)'
+                                : '')"
+                     :style="(v.summary.age_seconds - (v.heartbeat?.age_seconds ?? v.summary.age_seconds)) > 60 ? 'color:#f0ad4e;' : ''"></div>
+
+                <div>
+                  <div style="font-weight:700; font-size:0.7rem; text-transform:uppercase; color:var(--color-text-secondary);">Cards</div>
+                  <div x-text="d.boardNum(v.summary.items_total) + ' on the board'"></div>
+                  <template x-for="[group, counts] in [['By column', v.summary.by_status], ['By Genesis status', v.summary.by_genesis], ['By kind', v.summary.by_kind]]" :key="group">
+                    <div style="margin-top:0.3rem;"
+                         x-text="group + ': ' + (counts == null ? 'unknown'
+                                 : Object.keys(counts).length === 0 ? 'none'
+                                 : Object.entries(counts).map(([name, n]) => name + ' ' + d.boardNum(n) + ' of ' + d.boardNum(v.summary.items_total)).join(' · '))"></div>
+                  </template>
+                </div>
+
+                <div>
+                  <div style="font-weight:700; font-size:0.7rem; text-transform:uppercase; color:var(--color-text-secondary);">Coverage</div>
+                  <div x-text="v.summary.coverage?.unavailable
+                               ? 'Unavailable: ' + v.summary.coverage.unavailable
+                               : d.boardNum(v.summary.coverage?.on_board) + ' of ' + d.boardNum(v.summary.coverage?.open_in_repo)
+                                 + ' open issues and PRs in the tracker are on the board · '
+                                 + d.boardNum(v.summary.coverage?.other_repo_items) + ' cards from other repos'"></div>
+                </div>
+
+                <div>
+                  <div style="font-weight:700; font-size:0.7rem; text-transform:uppercase; color:var(--color-text-secondary);">Drags</div>
+                  <div x-text="d.boardNum(v.summary.drags?.in_progress) + ' in In Progress · '
+                               + ((v.summary.drags?.unavailable || v.summary.drags?.error)
+                                  ? 'not logged: ' + (v.summary.drags.unavailable || v.summary.drags.error)
+                                  : d.boardNum(v.summary.drags?.newly_logged) + ' newly logged')"></div>
+                </div>
+
+                <!-- #4400's writes block: a summary without one shows nothing (#4510) -->
+                <template x-if="v.summary.writes != null">
+                  <div>
+                    <div style="font-weight:700; font-size:0.7rem; text-transform:uppercase; color:var(--color-text-secondary);">Writes, last tick</div>
+                    <div x-text="d.boardWrites(v.summary.writes)"></div>
+                  </div>
+                </template>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+    </div>
