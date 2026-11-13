@@ -3153,7 +3153,11 @@ verified: c712f1bde 2026-11-06
   the recheck CLI appends failed/done measurements without reopening the row.
   Unfinished or malformed rechecks survive retention; malformed histories are
   surfaced for inspection rather than hiding later rows. Owed rechecks refuse
-  closes before migration, including CLI/MCP previews. Only a PASS verdict discharges
+  closes before migration, including CLI/MCP previews. Each close and attempt
+  records which client wrote it (`closed_by` / `last_attempt_by`, from
+  `caller_context.client_kind()`) and the session (`recorded_session`); the
+  path-rule exemption records `repo-pulse`, existing rows stay NULL, and the
+  label decides nothing. Only a PASS verdict discharges
   an obligation; the other verdicts leave the row OPEN and annotate it, so a PR
   nobody could verify says why instead of looking untouched. The one non-obvious
   invariant, because the obvious one is false: a PASS verdict implies the row is
