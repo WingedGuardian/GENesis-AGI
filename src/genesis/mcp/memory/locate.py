@@ -23,7 +23,6 @@ import re
 import shutil
 import stat
 import subprocess
-import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -229,7 +228,9 @@ _SECRET_KEY_WORDS = re.compile(
 )
 _NOT_RANDOM = re.compile(r"^[a-z][a-z0-9+.-]*://|^[/~.]|^[^@\s]+@[^@\s]+$", re.IGNORECASE)
 # The password in a URL's userinfo: the part after the colon, before the '@'.
-_URL_PASSWORD = re.compile(r"^[a-z][a-z0-9+.-]*://[^/@:\s]*:([^@/\s]+)@", re.IGNORECASE)
+# The user part stops at the authority delimiters (/ ? #), so a query or fragment
+# is never read as userinfo; the password part may hold ? and # itself.
+_URL_PASSWORD = re.compile(r"^[a-z][a-z0-9+.-]*://[^/?#@:\s]*:([^@/\s]+)@", re.IGNORECASE)
 # A generated token carries a long unbroken alphanumeric run mixing letters and
 # digits; a model name or slug (``large-v3-turbo``) has only short segments.
 _RANDOM_RUN = re.compile(r"[A-Za-z0-9]{16,}")
@@ -256,10 +257,6 @@ def _value_parts(raw: str) -> list[str]:
     return [part for part in parts if part and not part.startswith("-----")]
 
 
-_secret_cache: dict[tuple, frozenset[str]] = {}
-# The content search runs in worker threads (asyncio.to_thread), so concurrent
-# searches share this cache; one load at a time keeps the read consistent.
-_secret_lock = threading.Lock()
 # Why the value screen is off for the last load, or None when it is on.
 _SCREEN_OFF_MISSING = "no secrets file"
 _SCREEN_OFF_OVERSIZE = f"secrets file over {_SECRETS_FILE_MAX_BYTES} bytes"
@@ -274,9 +271,13 @@ def _warn_secrets_once(why: str) -> None:
 
 
 def _secret_values() -> tuple[frozenset[str], str | None]:
-    """``_load_secret_values`` under the cache lock."""
-    with _secret_lock:
-        return _load_secret_values()
+    """The secret values, read from the secrets file on every call.
+
+    Not cached: a cache keyed by the file's stat identity can keep values from
+    before an in-place rewrite that restores the mtime, and the file is at most
+    ``_SECRETS_FILE_MAX_BYTES``, so a fresh read per search costs little.
+    """
+    return _load_secret_values()
 
 
 def _load_secret_values() -> tuple[frozenset[str], str | None]:
@@ -285,8 +286,8 @@ def _load_secret_values() -> tuple[frozenset[str], str | None]:
 
     The file is read the way the runtime loads it (python-dotenv, which strips
     inline comments, ``export`` and quotes) and the way the Telegram bridge
-    reads it, and both readings are kept. Cached by the file's identity, size
-    and mtime. A missing, oversized or unreadable file yields no values and a
+    reads it, and both readings are kept. A missing, oversized or unreadable
+    file yields no values and a
     reason the response reports (also logged once): the name, directory and
     inode rules still apply.
     """
@@ -303,10 +304,6 @@ def _load_secret_values() -> tuple[frozenset[str], str | None]:
     if st.st_size > _SECRETS_FILE_MAX_BYTES:
         _warn_secrets_once(_SCREEN_OFF_OVERSIZE)
         return frozenset(), _SCREEN_OFF_OVERSIZE
-    cache_key = (str(path), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
-    cached = _secret_cache.get(cache_key)
-    if cached is not None:
-        return cached, None
     try:
         text = path.read_text(errors="replace")
         runtime = dotenv_values(path)
@@ -326,10 +323,7 @@ def _load_secret_values() -> tuple[frozenset[str], str | None]:
             password = _URL_PASSWORD.match(part)
             if password and len(password.group(1)) >= _MIN_NAMED_SECRET_LEN:
                 values.add(password.group(1))
-    result = frozenset(values)
-    _secret_cache.clear()
-    _secret_cache[cache_key] = result
-    return result, None
+    return frozenset(values), None
 
 
 def _has_credential_shape(text: str) -> bool:
@@ -344,10 +338,11 @@ def _has_credential_shape(text: str) -> bool:
     return bool(scan_outbound_normalised(text) - LOCATION_FINDINGS)
 
 
-# Shape verdicts by file identity. A verdict depends only on the file's bytes,
-# never on the pattern, so a file unchanged since its last screen is not read
-# or scanned again. Bounded by clearing, not by eviction order.
-_shape_cache: dict[tuple, bool] = {}
+# Shape verdicts by the sha256 of the bytes judged. A verdict depends only on
+# those bytes, never on the pattern or on any stand-in for them (a path, a stat
+# identity), so a cached verdict can never describe other bytes. Bounded by
+# clearing, not by eviction order.
+_shape_cache: dict[bytes, bool] = {}
 _SHAPE_CACHE_MAX = 100_000
 # Total time one content search may spend screening uncached files for
 # credential shapes. The failure mode it bounds: a root holding thousands of
@@ -359,31 +354,47 @@ _SHAPE_CACHE_MAX = 100_000
 _SHAPE_SCREEN_BUDGET_S = 60.0
 
 
-def _read_text_raw(path: str | Path) -> str:
-    """A file's text with its line endings as written. Universal-newline
-    reading turns a bare ``\\r`` into ``\\n``, which the scanner keeps, so a
-    shape split by ``\\r`` would be seen in rg's bytes and missed here."""
-    with open(path, encoding="utf-8", errors="replace", newline="") as fh:
-        return fh.read()
+def _shape_verdict(data: bytes, text: str) -> bool:
+    """Whether ``text`` (the decode of ``data``) has a credential shape, cached by its bytes."""
+    key = hashlib.sha256(data).digest()
+    verdict = _shape_cache.get(key)
+    if verdict is None:
+        verdict = _has_credential_shape(text)
+        if len(_shape_cache) >= _SHAPE_CACHE_MAX:
+            _shape_cache.clear()
+        _shape_cache[key] = verdict
+    return verdict
 
 
-def _shape_key(path: str) -> tuple | None:
+def _read_once(path: str, file_id: tuple[int, int] | None = None) -> tuple[bytes | None, bool]:
+    """(bytes, changed): one bounded read of a regular file, its identity checked.
+
+    Opened without following a final symlink and without blocking (a FIFO
+    swapped in is refused, not waited on). ``(None, False)``: not a regular
+    file, over ``_MAX_CONTENT_BYTES``, or unreadable. ``(None, True)``: the file
+    changed during the read (identity before and after differ, or fewer bytes
+    than its size), or it is not the file the walk judged (``file_id``).
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        st = os.stat(path)
+        fd = os.open(path, flags)
     except OSError:
-        return None
-    # ctime too: os.utime can restore a rewritten file's mtime, never its ctime.
-    return (
-        os.path.realpath(path), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns,
-    )
-
-
-def _remember_shape(key: tuple | None, verdict: bool) -> None:
-    if key is None:
-        return
-    if len(_shape_cache) >= _SHAPE_CACHE_MAX:
-        _shape_cache.clear()
-    _shape_cache[key] = verdict
+        return None, False
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            before = os.fstat(fh.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_size > _MAX_CONTENT_BYTES:
+                return None, False
+            data = fh.read(_MAX_CONTENT_BYTES + 1)
+            after = os.fstat(fh.fileno())
+    except OSError:
+        return None, False
+    ident = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+    if ident != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) or (
+        len(data) != before.st_size
+    ) or (file_id is not None and file_id != (before.st_dev, before.st_ino)):
+        return None, True
+    return data, False
 
 
 def _files_holding_secrets(
@@ -404,14 +415,17 @@ def _files_holding_secrets(
     the file too, whatever the pattern. ``exempt`` are files whose bytes equal
     their blob on the public repo's main (``_tracked_files``): their content is
     already public and passed CI's leak scan, so a shape there is a fixture or
-    an example, and they are not shape-checked. Each other file is read at most once, in
-    Python, for both checks; an unchanged file's shape verdict comes from the
-    cache. Files the screen cannot reach within ``_SHAPE_SCREEN_BUDGET_S`` come
-    back in the second set, and the caller skips them too.
+    an example, and they are not shape-checked. Each other file is read once
+    (``_read_once``) for both checks; a shape verdict for bytes already judged
+    comes from the cache. A file that changed during its read counts as
+    holding secrets. Files the screen cannot reach within
+    ``_SHAPE_SCREEN_BUDGET_S`` come back in the second set, and the caller
+    skips them too.
     """
     if not records:
         return set(), set()
     paths = [str(r["path"]) for r in records]
+    file_ids = {str(r["path"]): r.get("file_id") for r in records}
     by_rg = False
     found: set[str] = set()
     if values and _have_rg():
@@ -440,27 +454,21 @@ def _files_holding_secrets(
         check_shape = path not in exempt and path not in found
         if not (check_values or check_shape):
             continue
-        key = _shape_key(path) if check_shape else None
-        cached = _shape_cache.get(key) if key is not None else None
-        if cached is not None and (cached or not check_values):
-            if cached:
-                found.add(path)
-            continue
         if time.monotonic() >= deadline:
             unscreened.add(path)
             continue
-        try:
-            text = _read_text_raw(path)
-        except OSError:
+        data, changed = _read_once(path, file_ids.get(path))
+        if changed:
+            found.add(path)
             continue
+        if data is None:
+            continue
+        text = data.decode("utf-8", errors="replace")
         if check_values and any(value in text for value in values):
             found.add(path)
             continue
-        if check_shape:
-            verdict = cached if cached is not None else _has_credential_shape(text)
-            _remember_shape(key, verdict)
-            if verdict:
-                found.add(path)
+        if check_shape and _shape_verdict(data, text):
+            found.add(path)
     return found, unscreened
 
 
@@ -778,8 +786,9 @@ def _screened_text(
     swapped in is refused, not waited on), and must be a regular, text, small
     file (``None``, not dropped, otherwise). Its identity is taken before and
     after the read: a file that changed during the read, or that is not the
-    file the walk judged by name, place and inode (``file_id``), is dropped,
-    and the shape verdict is cached under the identity of the bytes read.
+    file the walk judged by name, place and inode (``file_id``), is dropped.
+    The shape verdict is cached by the hash of the bytes read
+    (``_shape_verdict``), never by a stand-in for them.
 
     The public exemption holds only when these bytes hash to the file's blob
     on the public main. A file in ``needs_public`` was admitted only because
@@ -787,25 +796,11 @@ def _screened_text(
     exempt path whose bytes differ is shape-screened like the rest. A value
     from the secrets file drops a file either way.
     """
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    try:
-        fd = os.open(path, flags)
-    except OSError:
-        return None, False
-    try:
-        with os.fdopen(fd, "rb") as fh:
-            before = os.fstat(fh.fileno())
-            if not stat.S_ISREG(before.st_mode) or before.st_size > _MAX_CONTENT_BYTES:
-                return None, False
-            data = fh.read(_MAX_CONTENT_BYTES + 1)
-            after = os.fstat(fh.fileno())
-    except OSError:
-        return None, False
-    ident = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-    if ident != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) or (
-        len(data) != before.st_size
-    ) or (file_id is not None and file_id != (before.st_dev, before.st_ino)):
+    data, changed = _read_once(path, file_id)
+    if changed:
         return None, True
+    if data is None:
+        return None, False
     if b"\x00" in data:  # binary anywhere, not just in the sniff window: rg would number it differently
         return None, False
     text = data.decode("utf-8", errors="replace")
@@ -816,18 +811,16 @@ def _screened_text(
         return text, False
     if path in needs_public:
         return None, True
-    key = (os.path.realpath(path), *ident)
-    shaped = _shape_cache.get(key)
-    if shaped is None:
-        shaped = _has_credential_shape(text)
-        _remember_shape(key, shaped)
-    return (None, True) if shaped else (text, False)
+    return (None, True) if _shape_verdict(data, text) else (text, False)
 
 
 def _line_matches(text: str, contains: str, pattern: re.Pattern | None) -> list[dict]:
     """The matching lines of screened ``text``, split on ``\\n`` only, as rg splits them."""
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()  # a final newline ends the last line; it does not start another
     matches: list[dict] = []
-    for lineno, line in enumerate(text.split("\n"), start=1):
+    for lineno, line in enumerate(lines, start=1):
         hit = pattern.search(line) if pattern else (contains in line)
         if hit:
             matches.append({"line": lineno, "text": line.strip()[:_SNIPPET_CHARS]})

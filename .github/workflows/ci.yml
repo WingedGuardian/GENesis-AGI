@@ -783,11 +783,7 @@ jobs:
         # Native peer containment (#3575): five real-CLI cases that skip on a
         # runner with no Claude binary (test_peer_native x4, test_contained_native
         # x1), measured in run 42667838123 at 603 skipped, 598 -> 603.
-        # locate content search (#4418): two rg-only cases skip because this job
-        # does not install ripgrep (test_locate.py::
-        # test_a_secret_bearing_file_with_a_line_break_in_its_name_is_skipped
-        # [\n] and [\r], "rg not on PATH"), 603 -> 605.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 605
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 603
 
   test-ubuntu-2404:
     # ubuntu-latest is moving to 26.04, so `test` alone stops showing a break on

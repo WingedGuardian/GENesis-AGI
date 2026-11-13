@@ -874,26 +874,65 @@ async def test_the_name_rule_spares_only_files_on_the_public_main(roots, monkeyp
         assert r["content_skipped_credential_files"] == 1
 
 
-def test_a_secret_cache_cleared_between_check_and_read_does_not_raise(roots, monkeypatch):
-    # The search runs in worker threads, so another call can clear the cache
-    # between this call's membership check and its read.
+def test_the_secrets_file_is_read_fresh_after_a_same_size_rewrite(roots, monkeypatch):
+    # No cache: a rewrite of the same length with its mtime put back still
+    # yields the new value, not the one from before.
     from genesis.mcp.memory import locate
 
-    _secrets_file(roots, monkeypatch, "FAKE_API_KEY=not-a-real-value-123\n")
-    monkeypatch.setattr(locate, "_secret_cache", {})
-    first = locate._secret_values()
+    path = _secrets_file(roots, monkeypatch, "FAKE_API_KEY=not-a-real-value-123\n")
+    first, _ = locate._secret_values()
+    assert "not-a-real-value-123" in first
+    st = os.stat(path)
+    path.write_text("FAKE_API_KEY=not-a-real-value-456\n")
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+    second, _ = locate._secret_values()
+    assert "not-a-real-value-456" in second
+    assert "not-a-real-value-123" not in second
 
-    class ClearedUnderfoot(dict):
-        def __contains__(self, key):
-            hit = dict.__contains__(self, key)
-            self.clear()
-            return hit
 
-        def __getitem__(self, key):
-            return dict.__getitem__(self, key)
+def test_a_shape_verdict_is_keyed_by_the_bytes_judged():
+    # A cached verdict can never describe other bytes, whatever path or file
+    # identity they arrive under.
+    from genesis.mcp.memory import locate
 
-    monkeypatch.setattr(locate, "_secret_cache", ClearedUnderfoot(locate._secret_cache))
-    assert locate._secret_values() == first
+    clean = b"probe\n" + b"x" * len(_shaped_line()) + b"\n"
+    shaped = f"probe\n{_shaped_line()}\n".encode()
+    assert locate._shape_verdict(clean, clean.decode()) is False
+    assert locate._shape_verdict(shaped, shaped.decode()) is True
+    assert locate._shape_verdict(clean, clean.decode()) is False
+
+
+@pytest.mark.parametrize("url", [
+    "https://example.invalid?next=mailto:op" + "erator@example.invalid",
+    "https://example.invalid#frag:op" + "erator@example.invalid",
+])
+def test_a_url_query_or_fragment_is_not_read_as_a_password(roots, monkeypatch, url):
+    from genesis.mcp.memory import locate
+
+    _secrets_file(roots, monkeypatch, f"SERVICE_URL={url}\n")
+    values, _ = locate._secret_values()
+    assert "operator" not in values
+
+
+@pytest.mark.parametrize("url,password", [
+    ("redis://:pa#ss1234@db.example.invalid:6379/0", "pa#ss1234"),
+    ("postgres://u:pa?ss1234@db.example.invalid/db", "pa?ss1234"),
+])
+def test_a_url_password_holding_a_delimiter_is_still_screened(roots, monkeypatch, url, password):
+    from genesis.mcp.memory import locate
+
+    _secrets_file(roots, monkeypatch, f"CACHE_URL={url}\n")
+    values, _ = locate._secret_values()
+    assert password in values
+
+
+@pytest.mark.parametrize("have_rg", [True, False])
+async def test_a_final_newline_does_not_add_a_line(roots, monkeypatch, have_rg):
+    _no_rg(monkeypatch, have_rg)
+    monkeypatch.setenv("SECRETS_PATH", str(roots["tmp"] / "absent.env"))
+    _touch(roots["repo"] / "notes.md", content="probe\n")
+    r = await _impl_locate(scope="repo", within="0", contains="^$", regex=True)
+    assert r["results"] == []
 
 
 async def test_a_same_size_rewrite_with_a_restored_mtime_is_screened_again(roots, monkeypatch):
