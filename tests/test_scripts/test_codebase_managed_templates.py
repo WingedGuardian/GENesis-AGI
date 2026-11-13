@@ -30,12 +30,16 @@ def loop(renderer, with_post=False):
 
 def prelude(scratch):
     """What both scripts set up before their render loops: SCRIPT_DIR (install's
-    unit stamp) and bootstrap's managed-unit writer with its render file. The
-    writer is sourced against this repository, then GENESIS_ROOT is restored to
-    the test's literal home so the Exec path substitutions stay under test."""
+    unit stamp), the secrets-file resolver (both source lib/secrets_path.sh
+    before the loop, which calls genesis_secrets_path for a unit that loads
+    the secrets file) and bootstrap's managed-unit writer with its render
+    file. The writer is sourced against this repository, then GENESIS_ROOT is
+    restored to the test's literal home so the Exec path substitutions stay
+    under test."""
     scripts = shlex.quote(str(ROOT / "scripts"))
     return (
         f"SCRIPT_DIR={scripts}\n"
+        '. "$SCRIPT_DIR/lib/secrets_path.sh"\n'
         '_test_root="$GENESIS_ROOT"\n'
         f"GENESIS_ROOT={shlex.quote(str(ROOT))}\n"
         '. "$SCRIPT_DIR/lib/managed_units.sh"\n'
@@ -75,6 +79,7 @@ def render(tmp_path):
             [
                 "/bin/bash",
                 "-euc",
+                f". {ROOT / 'scripts/lib/secrets_path.sh'}\n"
                 "_falkordb_redis_server_bin() { printf /opt/e/redis-server; }\n"
                 "_falkordb_redis_cli_bin() { printf /opt/e/redis-cli; }\n"
                 "_falkordb_module_path() { printf /opt/e/falkordb.so; }\n"

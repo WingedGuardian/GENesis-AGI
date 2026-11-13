@@ -637,31 +637,82 @@ def _log_reflections(cwd: str) -> list[tuple[str, str, str, datetime | None]]:
     return found
 
 
-def previous_class_labels(cwd: str, prior_heads: Sequence[str]) -> list[str]:
-    """Class labels of every earlier round of this PR: the classes of every
-    valid empty reflection naming one of ``prior_heads`` (the round heads
-    ``review_budget`` reports before the current one). A reflection naming any
-    other head is ignored, so a stray or mistyped one cannot stand in for the
-    previous round. Drafts never count: an invalid or escalating reflection
-    was never accepted as its round's answer."""
-    if not prior_heads:
-        return []
-    return _class_labels(_log_reflections(cwd), prior_heads)
+def key_rounds(budget: Mapping[str, Any]) -> dict[str, frozenset[str]]:
+    """Each finding key's round head(s), from the budget: the keys of every
+    round's reviews (``rounds[].reviews[].finding_keys``) and of every finding
+    that joined a round (``findings[].round_head``). A key that joined no round
+    (a late finding with no earlier round) is absent."""
+    owners: dict[str, set[str]] = {}
+    for entry in budget.get("rounds") or []:
+        head = entry.get("head") if isinstance(entry, Mapping) else None
+        if not isinstance(head, str):
+            continue
+        for review in entry.get("reviews") or []:
+            keys = review.get("finding_keys") if isinstance(review, Mapping) else None
+            for key in keys if isinstance(keys, list) else []:
+                if isinstance(key, str):
+                    owners.setdefault(key, set()).add(head)
+    for item in budget.get("findings") or []:
+        head = item.get("round_head") if isinstance(item, Mapping) else None
+        keys = item.get("keys") if isinstance(item, Mapping) else None
+        if isinstance(head, str) and isinstance(keys, list):
+            for key in keys:
+                if isinstance(key, str):
+                    owners.setdefault(key, set()).add(head)
+    return {key: frozenset(heads) for key, heads in owners.items()}
 
 
 def _class_labels(
-    log: Sequence[tuple[str, str, str, datetime | None]], prior_heads: Sequence[str]
+    log: Sequence[tuple[str, str, str, datetime | None]],
+    prior_heads: Sequence[str],
+    *,
+    owners: Mapping[str, frozenset[str]] | None = None,
+    judged: str | None = None,
+    cwd: str | None = None,
+    relevant: Iterable[str] | None = None,
 ) -> list[str]:
-    """``previous_class_labels`` over reflection rows already read
-    (``_log_reflections``' shape), so a caller can choose which rows count."""
+    """Class labels of every earlier round of this PR, over reflection rows
+    already read (``_log_reflections``' shape): the classes of every valid
+    empty reflection belonging to one of ``prior_heads`` (the round heads
+    before the one judged). One rule for every reader (#4310). Drafts never
+    count: an invalid or escalating reflection was never accepted as its
+    round's answer, and a reflection naming a head that is no earlier round
+    (stray, mistyped) and owning no key stands in for nothing.
+
+    A reflection belongs to the round(s) that own its header keys (``owners``,
+    from ``key_rounds``): the gate makes every reflection name the PR head, so
+    the head it names says only where the tip was, and a commit it names may
+    open a round of its own later. Only when no header key has an owner does
+    the named head decide: earlier history when it is one of ``prior_heads``.
+    It is earlier history only when every
+    round it belongs to is in ``prior_heads``, so a first reflection never
+    counts against the one correcting it in the same round. With ``judged``
+    (the reflection being checked; ``cwd`` is then required) only strict git
+    ancestors of it count, never it and never one a merge brought in later;
+    ancestry is probed only for rows that qualify otherwise, and an unreadable
+    history raises ``Refused``. ``relevant`` (the judged reflection's classes)
+    skips, unprobed, a row sharing none of them: the recurring-class rule
+    reads only that overlap, and the probe costs a git call in Rule R's slice."""
     wanted = set(prior_heads)
     classes: list[str] = []
     if not wanted:
         return classes
-    for _, kind, body, _ in log:
+    if judged is not None and not cwd:
+        raise ValueError("a judged reflection needs the repository it is in")
+    keep = None if relevant is None else {_normalize(c) for c in relevant}
+    for sha, kind, body, _ in log:
         parsed = parse(body)
-        if kind == "empty" and parsed.ok and not parsed.escalate and parsed.head in wanted:
-            classes.extend(c for c in parsed.classes if c not in classes)
+        if kind != "empty" or not parsed.ok or parsed.escalate:
+            continue
+        mine = {head for key in parsed.keys for head in (owners or {}).get(key, ())}
+        prior = mine <= wanted if mine else parsed.head in wanted
+        if not prior or sha == judged:
+            continue
+        if keep is not None and not keep & set(parsed.classes):
+            continue
+        if judged is not None and not _is_ancestor(str(cwd), sha, judged):
+            continue
+        classes.extend(c for c in parsed.classes if c not in classes)
     return classes
 
 
@@ -1075,10 +1126,22 @@ def _mainline(cwd: str) -> frozenset[str]:
     default = _default_branch(cwd)
     if default is None:
         return frozenset()
-    code, out, err = _run(["git", "-C", cwd, "rev-list", "--first-parent", default])
+    # Keyed by the tip it was read at, so a cached line is never stale: the
+    # held-round walk reads it once per round, inside Rule R's 1 s slice.
+    code, out, err = _run(["git", "-C", cwd, "rev-parse", "-q", "--verify", f"{default}^{{commit}}"])
+    tip = out.strip() if code == 0 else ""
+    if tip and (cwd, tip) in _MAINLINE_CACHE:
+        return _MAINLINE_CACHE[(cwd, tip)]
+    code, out, err = _run(["git", "-C", cwd, "rev-list", "--first-parent", tip or default])
     if code != 0:
         raise Refused(f"git rev-list --first-parent {default} failed: {err.strip()[:300]}")
-    return frozenset(out.split())
+    line = frozenset(out.split())
+    if tip:
+        _MAINLINE_CACHE[(cwd, tip)] = line
+    return line
+
+
+_MAINLINE_CACHE: dict[tuple[str, str], frozenset[str]] = {}
 
 
 def _merge_is_no_fix(
@@ -1270,6 +1333,7 @@ def covered_keys(
     round_number: int,
     gate_lane: bool,
     prior_heads: Sequence[str],
+    key_rounds: Mapping[str, frozenset[str]],
     acceptance: Sequence[str] | None,
     round_started: object,
     reviewed_at: Mapping[str, datetime | None] | None = None,
@@ -1287,7 +1351,9 @@ def covered_keys(
     commit as a fix, so leaving ``reviewed_at`` out is the strictest check),
     and ``check`` passes it:
     the grammar, the round's obligations, the recurring-class rule against
-    every earlier round head (``prior_heads``), readable evidence files
+    every earlier round (``prior_heads``; a reflection naming no round head
+    belongs to the rounds of its keys, ``key_rounds``, and only one that is a
+    strict git ancestor of the reflection judged counts), readable evidence files
     (an adversarial audit, a premise check) written between ``round_started``
     and the reflection's commit where cited or owed, no escalation, and the
     acceptance points (None only when the PR declares none). Every argument is
@@ -1314,6 +1380,7 @@ def covered_keys(
             round_number=round_number,
             gate_lane=gate_lane,
             prior_heads=prior_heads,
+            key_rounds=key_rounds,
             acceptance=acceptance,
             round_started=round_started,
             reviewed_at=reviewed_at or {},
@@ -1328,21 +1395,38 @@ def _covered_keys(
     round_number: int,
     gate_lane: bool,
     prior_heads: Sequence[str],
+    key_rounds: Mapping[str, frozenset[str]],
     acceptance: Sequence[str] | None,
     round_started: object,
     reviewed_at: Mapping[str, datetime | None],
     repo: str | None,
     number: int | None,
 ) -> set[str]:
-    previous = previous_class_labels(cwd, prior_heads)
+    log = _log_reflections(cwd)
     covered: set[str] = set()
     cache: dict[str, dict] = {}
-    for sha, kind, body, committed_at in _log_reflections(cwd):
+    for sha, kind, body, committed_at in log:
         if kind != "empty":
             continue
         clock = fix_clock(cwd, head, sha)
         if clock is NEVER:
             continue
+        parsed = parse(body)
+        # The recurring-class rule refuses only a fix-instances decision with
+        # classes, so the history (an ancestry probe per earlier reflection
+        # sharing one of those classes) is read only then.
+        previous = (
+            _class_labels(
+                log,
+                prior_heads,
+                owners=key_rounds,
+                judged=sha,
+                cwd=cwd,
+                relevant=parsed.classes,
+            )
+            if parsed.decision == "fix-instances" and parsed.classes
+            else []
+        )
         result = check(
             body,
             head=head,
@@ -1378,6 +1462,68 @@ def _open_round(budget: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return own[0] if len(own) == 1 else None
 
 
+def _newest_round_behind(budget: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The round entry whose head is the newest round head behind the current
+    head, by the budget's own commit graph. None when no round head is behind
+    it, when ancestry is unknown, or when two are newest (the two sides of a
+    merge both opened rounds): there is then no single round to hold open."""
+    import review_late  # noqa: PLC0415
+
+    head = budget.get("current_head")
+    _, ancestors = review_late._ancestry(budget)
+    behind_head = ancestors(str(head)) if isinstance(head, str) else None
+    if behind_head is None:
+        return None
+    behind = [r for r in budget.get("rounds") or [] if r.get("head") in behind_head]
+    newest = [
+        r
+        for r in behind
+        if not any(r.get("head") in (ancestors(str(o.get("head"))) or ()) for o in behind)
+    ]
+    return newest[0] if len(newest) == 1 else None
+
+
+def unreflected_round_behind(
+    cwd: str, budget: Mapping[str, Any], *, cutover: str | None
+) -> str | None:
+    """The newest round head behind the current head when that round drew keyed
+    findings, opened from ``cutover`` on, and no reflection commit names it: a
+    round a fix moved past unanswered. Read only to WORD an advisory, never to
+    owe anything (a later round's reflection may have dealt with it). None
+    when there is none, or when it cannot be told."""
+    if budget.get("status") != "ok" or budget.get("round_state") != "complete":
+        return None
+    entry = _newest_round_behind(budget)
+    if entry is None or entry.get("legacy"):
+        return None
+    opened, start = _parse_when(entry.get("opened_at")), _parse_when(cutover)
+    if start is not None and (opened is None or opened < start):
+        return None  # a round from before the gate went live owes nothing
+    if not any(s.get("finding_keys") for s in entry.get("reviews") or []):
+        return None
+    round_head = str(entry.get("head"))
+    unknown = False
+    for _sha, _kind, body, _at in _log_reflections(cwd):
+        match = HEADER_RE.match(body.split("\n", 1)[0])
+        # Only a reflection that passes its grammar answered the round: one
+        # that fails it must not silence the advisory.
+        if not match or parse(body).problems:
+            continue
+        named = match.group(2)
+        if named == round_head:
+            return None
+        # A held round is answered by a reflection naming the PR head, which
+        # the PR reached from the round by no fix (review_late.held_rounds).
+        try:
+            if fix_rows(cwd, round_head, named, main_merges=True) == []:
+                return None
+        except Refused:
+            # The reflection may answer the round, but git cannot say (out
+            # of time, or the named head not fetched): unknown, never "none".
+            unknown = True
+    return None if unknown else round_head
+
+
 def owed_state(
     budget: Mapping[str, Any],
     covered: Iterable[str],
@@ -1386,14 +1532,18 @@ def owed_state(
     cutover: str | None = None,
     fix_time: Any = None,
     late_covered: Iterable[str] = (),
+    held: Sequence[str] = (),
 ) -> dict[str, Any]:
     """What is owed, from a ``review_budget`` result: the open round's keys less
     ``covered`` (``covered_keys``). With ``cutover`` None that is all, and pure.
     With a cutover, the late keys from it on (``review_late.late_owed``) less
-    ``late_covered`` are owed too. The two are subtracted apart, so a
-    reflection judged under the open round never clears a late key, which only
-    its own round's context can. ``fix_time`` (``review_late.fix_time_reader``)
-    reads local git and may raise ``Refused``."""
+    ``late_covered`` are owed too, including every ``held`` round's
+    (``review_late.held_rounds``, newest first: the PR moved past them by no
+    fix). The two are
+    subtracted apart, so a reflection judged under the open round never clears
+    a late key, which only its own round's context can. ``fix_time``
+    (``review_late.fix_time_reader``) reads local git and may raise
+    ``Refused``."""
     state: dict[str, Any] = {
         "status": budget.get("status"),
         "round": budget.get("count"),
@@ -1412,6 +1562,10 @@ def owed_state(
         "cutover": cutover,
         # None (unknown) until a cutover's late findings have been read.
         "late_keys": [] if cutover is None else None,
+        # The round heads the PR moved past by no fix, newest first, whose
+        # keys stay owed; ``held_round`` is the newest, for older readers.
+        "held_rounds": list(held),
+        "held_round": held[0] if held else None,
     }
     if budget.get("status") != "ok":
         return state
@@ -1420,7 +1574,7 @@ def owed_state(
         import review_late  # noqa: PLC0415
 
         state["late_keys"], late_owed = review_late.late_owed(
-            budget, late_covered, cutover=cutover, fix_time=fix_time
+            budget, late_covered, cutover=cutover, fix_time=fix_time, held=held
         )
     if budget.get("round_state") != "open":
         state["owed"] = late_owed
@@ -1510,6 +1664,7 @@ def _open_covered(
             for r in budget.get("rounds") or []
             if r.get("head") != state["head"]
         ],
+        key_rounds=key_rounds(budget),
         acceptance=acceptance,
         round_started=state["round_started"],
         reviewed_at=_open_review_times(budget),

@@ -86,6 +86,8 @@ async def test_abandonment_and_cached_reuse_cannot_erase_hold(db):
     assert not await inbox_items.reuse_as_pending(
         db, "held", drop_id="new", batch_items="replacement", content_hash="new",
         created_at="2026-10-02T01:00:00+00:00",
+        expected_batch_items=(await inbox_items.get_by_id(db, "held"))["batch_items"],
+        expected_retry_ids=["held"], max_retries=100,
     )
     row = await inbox_items.get_by_id(db, "held")
     assert row["error_message"] == "replay_unsafe: after tools"

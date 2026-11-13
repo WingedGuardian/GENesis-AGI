@@ -95,6 +95,8 @@ and which reached CC as exit 1, i.e. a NON-blocking error that lets the tool run
 
 from __future__ import annotations
 
+import codecs
+import fnmatch
 import glob
 import os
 import re
@@ -137,6 +139,55 @@ _SECRET_BASENAMES = ("secrets.env",)
 _SECRETS_PATH_ENV = ("SECRETS_PATH", "GENESIS_SECRETS_PATH")
 
 
+#: The runtime's own location rule (``genesis/secrets_location.py``). It is
+#: stdlib-only by contract, so this hook loads it by path, as the session-context
+#: script does, instead of keeping its own list of where the file may live.
+_RESOLVER = Path(__file__).resolve().parents[2] / "src" / "genesis" / "secrets_location.py"
+_resolver_module: list = []
+
+
+def _locations():
+    """The loaded resolver module, or None when it cannot be loaded.
+
+    None is not a pass: the caller falls back to the same locations written
+    out, because a hook that raises here exits non-zero, and Claude Code runs
+    the tool anyway. ``test_the_guard_fallback_matches_the_resolver`` keeps that
+    fallback equal to the module's answer.
+    """
+    if not _resolver_module:
+        module = None
+        try:
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location("_guard_secrets_location", _RESOLVER)
+            if spec is not None and spec.loader is not None:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+        except Exception:  # noqa: BLE001 - unloadable: use the written-out fallback
+            module = None
+        _resolver_module.append(module)
+    return _resolver_module[0]
+
+
+def _home_config_and_legacy(home: Path, repo_root: Path) -> list[Path]:
+    """The resolver's non-override candidates: home config, then the legacy files."""
+    module = _locations()
+    if module is not None:
+        # Loading is not enough: an older or newer resolver next to this hook (a
+        # hook file copied ahead of its PR, a later signature change) raises
+        # HERE, and a raise is a fail-open. Any surprise uses the list below.
+        try:
+            found = [module.home_config_location(home), *module.legacy_locations(home, repo_root)]
+        except Exception:  # noqa: BLE001 - version skew: use the written-out list
+            found = []
+        if found and all(isinstance(path, Path) for path in found):
+            return found
+    fallback = [home / ".config" / "genesis" / "secrets.env", repo_root / "secrets.env"]
+    if home / "genesis" / "secrets.env" not in fallback:
+        fallback.append(home / "genesis" / "secrets.env")
+    return fallback
+
+
 def _candidate_roots() -> list[Path]:
     """Where a real secrets.env plausibly lives on this install."""
     roots = []
@@ -144,11 +195,65 @@ def _candidate_roots() -> list[Path]:
         explicit = os.environ.get(name)
         if explicit:
             roots.append(Path(explicit).expanduser())
-    roots.append(Path.home() / "genesis" / "secrets.env")
+    home = Path.home()
     repo = os.environ.get("CLAUDE_PROJECT_DIR")
-    if repo:
-        roots.append(Path(repo) / "secrets.env")
+    # legacy_locations keeps ~/genesis/secrets.env too, so a session in another
+    # checkout still protects the canonical one.
+    roots.extend(_home_config_and_legacy(home, Path(repo) if repo else home / "genesis"))
     return roots
+
+
+def _dedicated_dir() -> Path:
+    """The folder that exists only to hold the credentials file.
+
+    A directory read of it (``grep -r``, ``cp -r``, ``tar``, a Grep tool
+    ``path``) opens the file without ever naming it, so the folder itself is
+    gated. Only this exact folder: ``~/genesis`` and ``~`` hold everything else
+    too, and gating them would prompt on routine work.
+    """
+    return _home_config_and_legacy(Path.home(), Path.home() / "genesis")[0].parent
+
+
+_TARGET_CACHE: dict[tuple, tuple[frozenset[Path], Path | None]] = {}
+
+
+def _resolved_targets() -> tuple[frozenset[Path], Path | None]:
+    """The candidate roots and the dedicated folder, resolved once per environment.
+
+    ``_is_secret_path`` runs once per glob hit, and a glob walk that outruns
+    ``_GLOB_BUDGET_S`` GATES. Resolving every root on every hit pushed ordinary
+    globs such as ``tests/test_scripts/*.py`` past that budget: MEASURED 87 new
+    false gates in a 34,677-command replay, 86 cleared by resolving once (the
+    other is an intended gate). The key is every environment input the answer
+    depends on, so a changed ``HOME`` or override is never served a stale answer.
+
+    Not keyed on the filesystem: a symlink at a root that changes inside one
+    process is not seen until the key changes. Each hook process judges one
+    command, so that cannot happen live; a test that swaps symlinks under a fixed
+    environment must clear ``_TARGET_CACHE`` itself.
+    """
+    names = (*_SECRETS_PATH_ENV, "CLAUDE_PROJECT_DIR", "HOME")
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = ""
+    key = (tuple(os.environ.get(n) for n in names), cwd)
+    hit = _TARGET_CACHE.get(key)
+    if hit is None:
+        roots: set[Path] = set()
+        for root in _candidate_roots():
+            try:
+                roots.add(root.resolve())
+            except (OSError, ValueError, RuntimeError):
+                continue
+        try:
+            folder: Path | None = _dedicated_dir().resolve()
+        except (OSError, ValueError, RuntimeError):
+            folder = None
+        hit = (frozenset(roots), folder)
+        _TARGET_CACHE.clear()
+        _TARGET_CACHE[key] = hit
+    return hit
 
 
 def _secret_inodes() -> set[tuple[int, int]]:
@@ -163,7 +268,7 @@ def _secret_inodes() -> set[tuple[int, int]]:
         try:
             st = p.resolve().stat()
             out.add((st.st_dev, st.st_ino))
-        except OSError:
+        except (OSError, ValueError, RuntimeError):
             continue
     return out
 
@@ -187,6 +292,13 @@ def _is_secret_path(raw: str, inodes: set[tuple[int, int]], *, allow_bare: bool 
         return False
     try:
         p = Path(os.path.expanduser(raw))
+        # Identity still protects aliases of existing files. Normalized paths
+        # additionally protect configured destinations that do not exist yet.
+        normalized = p.resolve()
+        roots, folder = _resolved_targets()
+        if normalized in roots or normalized == folder:
+            stripped = raw.rstrip("/")
+            return allow_bare or (os.sep in stripped or stripped.startswith("~"))
         # NOTE: there is deliberately no `.example` test here. An earlier
         # version short-circuited on the UNRESOLVED name before the inode
         # compare below, which made a filename outrank file identity: a symlink
@@ -223,7 +335,7 @@ def _is_secret_path(raw: str, inodes: set[tuple[int, int]], *, allow_bare: bool 
             return False
         stripped = raw.rstrip("/")
         return allow_bare or (os.sep in stripped or stripped.startswith("~"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         # Cannot stat: fall back to the NAME, so a path that does not exist yet
         # (a `cp … secrets.env` destination) is still recognised.
         stripped = raw.rstrip("/")
@@ -244,6 +356,11 @@ _PATHY = re.compile(r"[/~*?\[\]$`]|secret", re.IGNORECASE)
 #: next to secrets-ish wording. Cannot be resolved without running the shell, so
 #: it is reported and the caller decides (we gate).
 _SUSPICIOUS = re.compile(r"(\$\{?\w+|`|\$\()", re.IGNORECASE)
+#: A token that ENDS at the dedicated credentials folder (``_dedicated_dir``).
+#: Paired with ``_SUSPICIOUS`` in the token loop, it catches the folder spelled
+#: through a variable inside quotes, ``"$HOME/.config/genesis"``, which bash
+#: expands and the command-level arm cannot see (it reads unquoted text only).
+_DEDICATED_TAIL = re.compile(r"(?:^|/)\.config\}?/genesis/?$")
 
 #: Does this command mention a secrets FILE, as opposed to the word "secret"?
 #:
@@ -283,8 +400,14 @@ _SUSPICIOUS = re.compile(r"(\$\{?\w+|`|\$\()", re.IGNORECASE)
 #: suffix by parameter expansion and misses. That is an exotic instance of the
 #: shell-variable residual this arm already declares, not a new class — recorded
 #: on #2230 rather than chased with a wider pattern.
+#:
+#: The dedicated credentials folder (``.config/genesis``, see ``_dedicated_dir``)
+#: counts as secrets wording too, so ``grep -r KEY $HOME/.config/genesis`` meets
+#: the variable arm the way ``cat $HOME/secrets.env`` does. The lookahead keeps
+#: neighbours such as ``.config/genesis-voice`` out.
 _SECRETISH = re.compile(
-    r"(?<![\w-])secrets?\.(?:env\b(?!\.example)|[*?\[])|(?<![\w-])secrets?(?![\w.-])",
+    r"(?<![\w-])secrets?\.(?:env\b(?!\.example)|[*?\[])|(?<![\w-])secrets?(?![\w.-])"
+    r"|\.config/genesis(?![\w.-])",
     re.IGNORECASE,
 )
 
@@ -537,7 +660,10 @@ def _glob_may_reach_secrets(tok: str) -> bool:
     one that is typed daily, and it matches what this module already does with
     any pattern it cannot walk inside its budget.
     """
-    expanded = os.path.expanduser(tok)
+    try:
+        expanded = os.path.expanduser(tok)
+    except (OSError, ValueError):
+        return True  # `~user\0…` raises; an exception would let the hook allow
     cut = next((i for i, ch in enumerate(expanded) if ch in "*?["), len(expanded))
     fixed = expanded[:cut]
     if not os.path.isabs(fixed):
@@ -574,7 +700,7 @@ def _glob_hits_secret(tok: str, inodes: set[tuple[int, int]]) -> bool:
     return False
 
 
-def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> bool:
+def touches_secrets(*, paths: list[str] | None = None, command: str = "", _depth: int = 0) -> bool:
     """True if any explicit path, or anything the command resolves to, is the secrets file.
 
     ``paths``   — from structured tools (Read/Edit/Write ``file_path``, Grep
@@ -615,6 +741,11 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
         # Heredoc bodies are data — unless the heredoc feeds an interpreter, in
         # which case the body IS the executed payload and must be scanned.
         scan = command if exec_heredoc else _HEREDOC.sub(" ", command)
+    # Bash joins a backslash-newline before anything else (`cat sec\<NL>rets.env`
+    # is `cat secrets.env`), so every arm below sees the words bash runs. (`$"..."`
+    # is handled per word in _joined_word_hits: rewriting `$"` in the text breaks
+    # the pairing of a quoted pattern ending in `$`, MEASURED on 4 real commands.)
+    scan = scan.replace("\\\n", "")
     # Quoted regions are DATA for the command-level arm too: a commit message
     # naming the file is not an operand. The declared shell-variable residual
     # (`f=secrets; cat $f.env`) is unquoted, so it survives stripping.
@@ -645,10 +776,61 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
         unquoted.update(_tokens(scan))
 
     literal_globs = _db_query_literals(command)
+    # One deadline for the whole scan. A hook that outruns its timeout lets the
+    # command run with no decision, so a scan that cannot finish in time gates.
+    deadline = time.monotonic() + _SCAN_BUDGET_S
 
+    # A quoted name joined to a prefix is one word to bash:
+    # `--files0-from="secrets.env"` hands the program `secrets.env`, but the
+    # token split above stops at the quote and sees a quoted mention. Read the
+    # parser's words instead: the pieces of any word not quoted WHOLE are
+    # operands. A word quoted whole (a commit message) stays a mention.
+    # Shell words only: an executed here-doc's body is interpreter code (the
+    # token arm below already treats it as operands), and reading it as shell
+    # words gated real commands that only edit text mentioning the path.
+    shell_text = _HEREDOC.sub(" ", scan) if exec_heredoc else scan
+    if _joined_word_hits(shell_text, inodes, deadline, _depth):
+        return True
+
+    # A shell whose cwd is inside the credentials folder reads it with no
+    # operand at all (`grep -rl KEY`, `tar cf - .`), and the folder holds
+    # nothing else, so any command from there gates. The hook's cwd is the
+    # session's, which is the cwd the command starts in. Residual, as for
+    # every relative operand here: a base set INSIDE the command (`cd .config;
+    # grep -r KEY genesis`, `tar -C .config -cf - genesis`) is not followed.
+    _, folder = _resolved_targets()
+    try:
+        here = Path.cwd().resolve()
+    except (OSError, RuntimeError):
+        here = None
+    if folder is not None and here is not None and (here == folder or folder in here.parents):
+        return True
+
+    # Bare names that resolve to a target from the right cwd: the file names,
+    # and the folder's own name (`grep -r KEY genesis` from ~/.config).
+    candidate_names = {root.name for root in _candidate_roots()}
+    candidate_names.add(_dedicated_dir().name)
     for raw_tok in _tokens(scan):
-        if not _PATHY.search(raw_tok):
+        if time.monotonic() > deadline:
+            return True
+        if raw_tok.count("[") > _MAX_BRACKETS:
+            # fnmatch is quadratic in unmatched `[`, and one call cannot be
+            # interrupted by the deadline (MEASURED: 18 s for 20,000).
+            return True
+        # An option with its path attached (`-C<dir>`, `--directory=<dir>`) is
+        # one token; resolve the attached value as well as the whole token. An
+        # excluding option's value names a file to skip, never to open.
+        attached = "" if _excluding(raw_tok) else _attached_value(raw_tok)
+        # A brace word can spell the name with no other sign (`{s,x}ecrets.env`).
+        if (
+            not _PATHY.search(raw_tok)
+            and "{" not in raw_tok
+            and raw_tok not in candidate_names
+            and attached not in candidate_names
+        ):
             continue
+        if attached and _is_secret_path(attached, inodes, allow_bare=raw_tok in unquoted):
+            return True
         # Bash brace-expands before the command ever runs, so
         # `cp ~/genesis/{secrets.env,secrets.env.bak}` opens the real file while
         # the single opaque token matches nothing. The repo already ships the
@@ -658,7 +840,27 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
         except ValueError:
             return True  # a brace bomb is unresolvable -> gate
         for tok in expansions:
+            # Each expansion may walk a glob, so the deadline is checked per
+            # expansion, not per token (1,024 expansions ran 21 s).
+            if time.monotonic() > deadline:
+                return True
             if _is_secret_path(tok, inodes, allow_bare=raw_tok in unquoted):
+                return True
+            # A name joined to a prefix (`--files0-from=secrets.env`): the program
+            # opens the part after the joint. The name/path test only: bash globs
+            # and expands the WHOLE word, never a piece of it, so the glob and
+            # suspicion arms below stay on `tok`.
+            bare_tok = raw_tok in unquoted
+            # An excluding option's value names a file to skip (`--exclude=NAME`).
+            for piece in [] if _excluding(tok) else _operand_spellings(tok)[1:]:
+                if _is_secret_path(piece, inodes, allow_bare=bare_tok):
+                    return True
+            if bare_tok and _pattern_piece_hits(tok):
+                return True
+            # The credentials folder through a variable. A path with a separator
+            # gates whether quoted or not (see `unquoted` above), so a quoted
+            # `"$HOME/.config/genesis"` does too.
+            if _SUSPICIOUS.search(tok) and _DEDICATED_TAIL.search(tok):
                 return True
             # Expand globs against the real filesystem — this is what catches
             # `secrets.*`, `secrets.e*`, `s*.env` without enumerating spellings.
@@ -674,6 +876,309 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
                 return True
 
     return False
+
+
+#: Characters that join an operand onto a prefix inside one shell word:
+#: ``--files0-from=NAME``, ``-Dk=NAME``, ``@NAME`` and ``-d@NAME`` (curl, gcc and
+#: others read the file an ``@`` names, and a short option takes its value
+#: attached), ``a:NAME`` (path lists). Programs open the part after the joint, so
+#: each part is checked as an operand of its own.
+_JOINTS = re.compile(r"[=:@]")
+
+
+#: Wall-clock budget for one command's scan. The hook's timeout is 10 s, and a
+#: timed-out hook lets the command run without a decision, so past this the scan
+#: gates. Real commands take milliseconds (the 30-day replay averaged under 10 ms).
+_SCAN_BUDGET_S = 2.0
+
+#: Most `[` one pathy token may hold before it gates unexamined: fnmatch is
+#: quadratic in unmatched `[`, and a single call cannot be cut short by the
+#: deadline. MEASURED: 18 s for 20,000 on the previous code.
+_MAX_BRACKETS = 64
+
+#: Fewest literal characters a pattern piece needs before it is matched against
+#: the secrets file's name: `*.env` names it, a bare `*` names everything.
+#: Shorter patterns are not gated: at that length they name nearly every file,
+#: and gating them would prompt on routine searches.
+_PATTERN_MIN_LITERALS = 3
+#: A joint, optional quotes and path, then a secrets file's name: the fallback
+#: for a command the parser cannot split into words.
+_JOINED_NAME = re.compile(
+    r"[=:@][\"']*(?:[^\s\"'=:@]*/)?(?:"
+    + "|".join(re.escape(n) for n in _SECRET_BASENAMES)
+    + r")(?![\w.])"
+)
+#: A pattern after one of these names files to SKIP, never to open.
+_EXCLUDING = re.compile(r"^--?(exclude|ignore)(-dir)?$")
+
+
+def _operand_spellings(tok: str) -> list[str]:
+    """``tok`` itself, then each non-empty piece a joint separates."""
+    out = [tok]
+    for piece in _JOINTS.split(tok):
+        if piece and piece not in out:
+            out.append(piece)
+    return out
+
+
+def _names_secret_pattern(piece: str) -> bool:
+    """A pattern piece the PROGRAM expands (`grep --include=s*.env`, `rsync
+    --include=...`): bash never globs part of a word, so the filesystem glob arm
+    cannot see it. Match it against the secrets file's name instead."""
+    if not any(ch in piece for ch in "*?["):
+        return False
+    base = piece.rstrip("/").rsplit("/", 1)[-1]
+    literals = _pattern_shape(base, max(len(n) for n in _SECRET_BASENAMES))
+    if literals is None or literals < _PATTERN_MIN_LITERALS:
+        return False
+    # Case-blind: `-iname`, `--iglob` and case-insensitive file systems match
+    # `SECRETS.ENV`; a false match costs a prompt, a miss costs the file.
+    return any(fnmatch.fnmatchcase(name.lower(), base.lower()) for name in _SECRET_BASENAMES)
+
+
+def _pattern_shape(pattern: str, longest: int) -> int | None:
+    """The pattern's literal count, or None when it consumes more characters
+    than ``longest`` and so cannot match any name that long.
+
+    Every character but ``*`` consumes exactly one character of the name, and a
+    closed bracket class (``[a-z_]``) consumes one and is not a literal; an
+    unclosed ``[`` is a literal to fnmatch. One linear pass, stopping as soon as
+    the bound is passed: fnmatch is quadratic on long bracket runs, and so is a
+    regex that looks for each ``]``."""
+    consumed = literals = 0
+    i, n = 0, len(pattern)
+    closes = True  # whether a `]` may still follow
+    while i < n:
+        c = pattern[i]
+        if c == "*":
+            i += 1
+            continue
+        if c == "[" and closes:
+            j = pattern.find("]", i + 1)
+            if j == -1:
+                closes = False  # no `]` after here, so none after any later `[`
+            else:
+                consumed += 1
+                i = j + 1
+                if consumed > longest:
+                    return None
+                continue
+        consumed += 1
+        if c != "?":
+            literals += 1
+        if consumed > longest:
+            return None
+        i += 1
+    return literals
+
+
+def _pattern_piece_hits(word: str) -> bool:
+    """A piece after a joint that the PROGRAM expands as a file pattern and that
+    names the secrets file. Not after an excluding option, whose pattern names
+    files to skip."""
+    parts = _JOINTS.split(word)
+    for prev, piece in zip(parts, parts[1:], strict=False):
+        if _EXCLUDING.match(prev):
+            continue
+        if _names_secret_pattern(piece):
+            return True
+    return False
+
+
+#: Options whose value is a file-name pattern the PROGRAM matches (grep, rg,
+#: find, rsync): a value naming the secrets file selects it even when quoted.
+_PATTERN_OPTS = frozenset(
+    (
+        "--include",
+        "-g",
+        "--glob",
+        "--iglob",
+        "-name",
+        "-iname",
+        "-path",
+        "-ipath",
+        "-wholename",
+        "-iwholename",
+    )
+)
+
+#: Programs that run their arguments as a shell command (`eval`, `watch`), and
+#: the option that carries a command for others (`su -c`, `env -S`). `bash -c`
+#: and `sh -c` are unpacked by shell_parse already.
+_CARRY_ALL = frozenset(("eval", "watch"))
+_CARRY_OPT = {
+    "su": ("-c", "--command"),
+    "runuser": ("-c", "--command"),
+    "script": ("-c", "--command"),
+    "flock": ("-c", "--command"),
+    "env": ("-S", "--split-string"),
+    "sh": ("-c",),
+    "bash": ("-c",),
+    "dash": ("-c",),
+    "zsh": ("-c",),
+}
+#: How deep a carried command is re-scanned.
+_MAX_CARRY_DEPTH = 3
+
+
+def _carried_scripts(argv: list[str]) -> list[str]:
+    """The command texts a segment hands to a shell: all of an `eval`/`watch`
+    segment's arguments, and the value of a carrying option anywhere in argv
+    (`find . -exec sh -c '...'`, `su -c '...'`, `env -S '...'`)."""
+    if not argv:
+        return []
+    if os.path.basename(argv[0]) in _CARRY_ALL:
+        return [" ".join(argv[1:])]
+    out = []
+    seen: set[str] = {os.path.basename(argv[0])}  # carrying programs met so far
+    for i in range(1, len(argv)):
+        word = argv[i]
+        for opt_prog in seen & _CARRY_OPT.keys():
+            for opt in _CARRY_OPT[opt_prog]:
+                if argv[i - 1] == opt:
+                    out.append(word)
+                elif word.startswith(opt + "="):
+                    out.append(word[len(opt) + 1 :])
+        name = os.path.basename(word)
+        if name in _CARRY_OPT:
+            seen.add(name)
+    return out
+
+
+def _ansi_c_names_secret(scan: str) -> bool:
+    """A `$'...'` span whose escapes spell the name (`$'sec\\x72ets.env'`).
+    shell_parse leaves escape-bearing spans undecoded on purpose; this decodes
+    them only to look for the name, never to run anything."""
+    for _s, _e, content, has_escape in shell_parse._ansi_c_spans(scan):
+        if not has_escape:
+            continue
+        try:
+            text = codecs.decode(content, "unicode_escape")
+        except (UnicodeDecodeError, ValueError):
+            continue
+        # The span must BE the operand (the name, or a path ending in it), the
+        # rule a quoted word follows everywhere else; a decoded commit message
+        # that only mentions the name is still prose.
+        value = text.strip().rstrip("/")
+        if value.rsplit("/", 1)[-1] in _SECRET_BASENAMES and (
+            value in _SECRET_BASENAMES or "/" in value
+        ):
+            return True
+    return False
+
+
+def _decode_ansi_c(text: str) -> str:
+    """``text`` with each escape-bearing `$'...'` span replaced by its decoded
+    value, single-quoted, so the word list and any carried script read what bash
+    passes (`bash -c $'cat x\\n'` runs `cat x`). shell_parse leaves those spans
+    undecoded on purpose; this decodes them only to read the words."""
+    spans = [s for s in shell_parse._ansi_c_spans(text) if s[3]]
+    if not spans:
+        return text
+    out, last = [], 0
+    for start, end, content, _has_escape in spans:
+        try:
+            value = codecs.decode(content, "unicode_escape")
+        except (UnicodeDecodeError, ValueError):
+            continue
+        out.append(text[last:start])
+        out.append(shlex.quote(value))
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _excluding(word: str) -> bool:
+    """`--exclude=NAME` and its kin name a file to SKIP: never an operand."""
+    head = _JOINTS.split(word, 1)[0]
+    return head != word and _EXCLUDING.match(head) is not None
+
+
+def _joined_word_hits(scan: str, inodes, deadline: float, depth: int = 0) -> bool:
+    """Every parser word bash did not see quoted WHOLE is an operand, whole and
+    piece by piece (`--files0-from="secrets.env"`, `--a="x":"secrets.env"`,
+    `cat ./"secrets.env"`, `(wc --files0-from="secrets.env")`); a pattern after a
+    pattern option names the file even when quoted; a carried command is scanned
+    as a command. Where the parser is blind, a narrow textual test decides."""
+    # The narrow test: a joint, then the name, with quoting and escapes removed
+    # (`--x=sec""rets.env`). Gating every blind command that merely mentions
+    # secrets gated 163 real commands in the 30-day replay (here-doc edits,
+    # mostly), so the fallback stays this narrow.
+    if _ansi_c_names_secret(scan):
+        return True
+    # shell_parse reports an escape-bearing `$'...'` as a blind spot, so decode
+    # those spans before parsing: the words, their quoting and any carried
+    # script are then read as bash passes them.
+    scan = _decode_ansi_c(scan)
+    try:
+        segments, blind = shell_parse.analyze_checked(scan)
+    except Exception:
+        segments, blind = [], True
+    if blind is not None:
+        flat = re.sub(r"[\"'\\]", "", scan)
+        return _JOINED_NAME.search(flat) is not None
+    # A shell_parse without the helper (a copy older than this module) must not
+    # raise: an exception escaping the hook lets the command run.
+    quoting = getattr(shell_parse, "words_with_quoting", None)
+    for seg in segments:
+        words = quoting(seg.raw) if quoting is not None else None
+        if words is None:
+            # The two tokenizations disagree (a word mixing quotes and spaces),
+            # so nothing is known about quoting: every word is an operand.
+            words = [(w, False) for w in seg.argv]
+        prev = ""
+        for word, whole in words:
+            if time.monotonic() > deadline:
+                return True
+            clean = word.rstrip(")")
+            if _excluding(clean) or _EXCLUDING.match(prev):
+                prev = word
+                continue
+            if prev in _PATTERN_OPTS and (
+                _names_secret_pattern(clean)
+                or clean.rsplit("/", 1)[-1].lower() in {n.lower() for n in _SECRET_BASENAMES}
+            ):
+                return True
+            if not whole:
+                if _is_secret_path(clean, inodes, allow_bare=True):
+                    return True
+                # `$"..."` is plain quoting unless a translation catalogue is
+                # installed, and shlex leaves its `$` on the word.
+                if "$" in clean and _is_secret_path(
+                    clean.replace("$", ""), inodes, allow_bare=True
+                ):
+                    return True
+                for piece in _JOINTS.split(clean):
+                    if not piece or piece == clean:
+                        continue
+                    if _is_secret_path(piece, inodes, allow_bare=True):
+                        return True
+                    if "$" in piece and _is_secret_path(
+                        piece.replace("$", ""), inodes, allow_bare=True
+                    ):
+                        return True
+                if _pattern_piece_hits(clean):
+                    return True
+            prev = word
+        if depth < _MAX_CARRY_DEPTH:
+            # The segment's own words, not seg.argv: the parser strips wrappers
+            # such as `env`, and with them the `-S` that carries the command.
+            for script in _carried_scripts([w for w, _ in words]):
+                if touches_secrets(command=script, _depth=depth + 1):
+                    return True
+    return False
+
+
+def _attached_value(tok: str) -> str:
+    """The path an option token carries: ``--opt=VALUE`` or ``-XVALUE``.
+
+    Empty for anything else. Only the value's resolution is asked about, so a
+    token that is not really an option with a path costs one failed lookup."""
+    if tok.startswith("--"):
+        return tok.split("=", 1)[1] if "=" in tok else ""
+    if tok.startswith("-") and len(tok) > 2:
+        return tok[2:]
+    return ""
 
 
 def _tokens(text: str) -> list[str]:

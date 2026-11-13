@@ -760,6 +760,7 @@ fi
 # secrets.env
 if [ ! -f "$SECRETS_FILE" ]; then
     if [ -f "$REPO_DIR/secrets.env.example" ]; then
+        mkdir -p -m 0700 "$(dirname "$SECRETS_FILE")"
         cp "$REPO_DIR/secrets.env.example" "$SECRETS_FILE"
         chmod 600 "$SECRETS_FILE"
         echo "    + Created secrets.env from template"
@@ -1105,6 +1106,25 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             _redis_cli_esc=$(_sed_repl_esc "$(_falkordb_redis_cli_bin 2>/dev/null || true)")
             _falkordb_mod_esc=$(_sed_repl_esc "$(_falkordb_module_path 2>/dev/null || true)")
             _falkordb_digests_esc=$(_sed_repl_esc "$(_falkordb_digests_path 2>/dev/null || true)")
+            # Resolved again here, not reused from $SECRETS_FILE above, so a step that
+            # moved the file earlier in this run renders the unit to where it now is.
+            # `%` doubled: systemd expands specifiers in EnvironmentFile=, so a bare `%`
+            # would make the unit load a different file than the resolver picked.
+            # Its own assignment, so set -e stops the render if it fails (inside the
+            # escape below the failure would be masked and render `EnvironmentFile=-`).
+            # SECRETS_PATH is not followed here: the unit gets the resolver's own file. A
+            # shell value never reaches the server, and a user-manager value cannot be
+            # rendered faithfully (systemd shell-quotes it, and a relative path is not a
+            # valid EnvironmentFile), so either one is named in a warning instead.
+            _secrets_file=$(SECRETS_PATH= genesis_secrets_path "$REPO_DIR")
+            if [[ -n "$(printenv SECRETS_PATH || true)" ]] || { systemctl --user show-environment 2>/dev/null || true; } | grep '^SECRETS_PATH=' >/dev/null; then
+                echo "  WARNING: SECRETS_PATH is set, but the units load $_secrets_file; the server may load another file" >&2
+            fi
+            if [[ -z "$_secrets_file" ]]; then
+                echo "ERROR: could not resolve the secrets file for the unit render" >&2
+                exit 1
+            fi
+            _secrets_file_esc=$(_sed_repl_esc "$(printf '%s' "$_secrets_file" | sed -e 's/%/%%/g')")
             sed -e "s|__HOME__|$_home_esc|g" \
                 -e "s|__HOME_EXEC__|$_home_exec_esc|g" \
                 -e "s|__REPO_EXEC__|$_repo_exec_esc|g" \
@@ -1118,6 +1138,7 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
                 -e "s|__REDIS_CLI__|$_redis_cli_esc|g" \
                 -e "s|__FALKORDB_MODULE__|$_falkordb_mod_esc|g" \
                 -e "s|__FALKORDB_DIGESTS__|$_falkordb_digests_esc|g" \
+                -e "s|__SECRETS_FILE__|$_secrets_file_esc|g" \
                 "$template" > "$target.render"
             # Stamped like every bootstrap render (scripts/lib/managed_units.py),
             # so a hand edit is recognised from the first update on. Unstamped,
@@ -1472,6 +1493,12 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
                 echo "    + $timer_name enabled + started" || true
         fi
     done
+    # Arm the graph engine step 6 verified, as bootstrap.sh does: enable, and
+    # start it when not running (lib/falkordb_install.sh, falkordb_enable_unit).
+    # Defined only when step 6 sourced the lib.
+    if declare -F falkordb_enable_unit >/dev/null; then
+        falkordb_enable_unit "$SYSTEMD_USER_DIR/genesis-falkordb.service"
+    fi
 fi
 
 # The browser stack: the Camoufox engine and the Chromium the browser packages pin,
@@ -1597,6 +1624,58 @@ if [ -f "$SYSTEMD_USER_DIR/genesis-server.service" ]; then
             echo "    WARNING: could not start genesis-server"
             setup_warn "genesis-server did not start (journalctl --user -u genesis-server)"
         fi
+    fi
+fi
+
+# First graph projection. This script starts the graph engine before
+# genesis-server has created the memory database, so the engine's own
+# start-time projection found nothing to read. Once the server runs, wait
+# (bounded) for the two tables the projector reads, then project once; the
+# server creates the database file before its tables, so the file existing is
+# not enough. A timeout or a failed start is a NOTE: the hourly timer projects.
+if [ -f "$SYSTEMD_USER_DIR/genesis-graph-project.service" ] \
+    && systemctl --user is-active --quiet genesis-server 2>/dev/null \
+    && systemctl --user is-active --quiet genesis-falkordb 2>/dev/null; then
+    _first_proj_rc=0
+    "$VENV_PATH/bin/python" - <<'PY' 2>/dev/null || _first_proj_rc=$?
+import os
+import sqlite3
+import sys
+import time
+from urllib.parse import quote
+
+try:
+    from genesis.env import genesis_db_path
+except Exception:
+    sys.exit(2)
+
+uri = "file:" + quote(str(genesis_db_path()), safe="/") + "?mode=ro"
+deadline = time.monotonic() + float(os.environ.get("GENESIS_FIRST_PROJECTION_WAIT_S", "120"))
+while True:
+    try:
+        con = sqlite3.connect(uri, uri=True, timeout=2)
+        try:
+            con.execute("SELECT 1 FROM memory_links LIMIT 0")
+            con.execute("SELECT 1 FROM memory_metadata LIMIT 0")
+            sys.exit(0)
+        finally:
+            con.close()
+    except sqlite3.Error:
+        pass
+    if time.monotonic() >= deadline:
+        sys.exit(1)
+    time.sleep(2)
+PY
+    if [ "$_first_proj_rc" -eq 0 ]; then
+        if systemctl --user start --no-block genesis-graph-project.service 2>/dev/null; then
+            echo "    + first graph projection started"
+        else
+            echo "    NOTE: could not start the first graph projection; the hourly run will project"
+        fi
+    elif [ "$_first_proj_rc" -eq 1 ]; then
+        echo "    NOTE: the memory database was not ready in time; the hourly graph projection will run instead"
+    else
+        echo "    NOTE: could not run the database readiness check (exit $_first_proj_rc); the hourly graph projection will run instead"
     fi
 fi
 

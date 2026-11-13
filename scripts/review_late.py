@@ -186,8 +186,62 @@ def _contexts(
     return [context for context in contexts if context is not None]
 
 
+def held_rounds(cwd: str, budget: Mapping[str, Any]) -> list[str]:
+    """Every round head behind the tip that the PR moved past by NO FIX,
+    newest first: nothing between it and the tip is a fix (``fix_rows`` with
+    ``main_merges``, the credit side's reading: merges of main that carry only
+    git's merge, and commits that keep their parent's tree). Those rounds were
+    never answered, so their findings stay owed (``late_findings`` ``held``).
+    All of them, not only the newest: a second no-fix push, or a reflection
+    answering only the newer round, must not release the older one (#4316).
+
+    A round with a fix before the tip is not held, and neither is any round
+    behind it: the commits after an older round include those after a newer
+    one. A rebase or force-push that drops a round from the graph (#4280)
+    leaves it out. Unknown ancestry holds nothing, as before. Raises
+    ``Refused`` when git cannot relate a round to the tip (an unfetched head):
+    unknown, never "nothing owed"."""
+    # An open round at the tip (the merge drew findings of its own) does not
+    # answer the rounds behind it, so they are held either way.
+    if budget.get("status") != "ok" or budget.get("round_state") not in ("open", "complete"):
+        return []
+    tip = str(budget.get("current_head"))
+    _, ancestors = _ancestry(budget)
+    behind_tip = ancestors(tip)
+    if behind_tip is None:
+        return []
+    heads = [str(r.get("head")) for r in budget.get("rounds") or [] if r.get("head") in behind_tip]
+    behind = {head: ancestors(head) for head in heads}
+    if any(found is None for found in behind.values()):
+        return []
+    # Newest first: a round's descendants among the rounds come before it.
+    # (``rounds`` is read before sorting: ``list.sort`` empties the list while
+    # it runs, so a key reading ``heads`` would see nothing.)
+    rounds = set(heads)
+    heads.sort(key=lambda head: len(behind[head] & rounds), reverse=True)
+    held: list[str] = []
+    fixed: list[str] = []
+    for head in heads:
+        if any(head in behind[done] for done in fixed):
+            continue
+        rows = rr.fix_rows(cwd, head, tip, main_merges=True)
+        # None: the budget puts the round behind the tip and local git
+        # disagrees (a shallow or diverged clone). It is not held, as before,
+        # rather than refusing the whole state: a Refused here makes Rule R
+        # allow the commit, dropping the open round's deny with it.
+        if rows == []:
+            held.append(head)
+        else:
+            fixed.append(head)
+    return held
+
+
 def late_findings(
-    budget: Mapping[str, Any], cutover: str | None, fix_time: Any = None
+    budget: Mapping[str, Any],
+    cutover: str | None,
+    fix_time: Any = None,
+    *,
+    held: Iterable[str] = (),
 ) -> list[dict[str, Any]] | None:
     """The finding keys owed besides the open round, one entry per key (the
     finding plus ``key`` and ``at``), from reviews submitted at or after
@@ -198,8 +252,9 @@ def late_findings(
     A late review (``late`` True) is always owed. One that opened its round
     was the open round's to answer while it was open; it is owed here only
     when it arrived after a fix to its head (``fix_time(head)``, None when
-    nothing has been fixed since). A key the open round owes is never counted
-    twice.
+    nothing has been fixed since), or when its head is in ``held`` (``held_rounds``:
+    the PR moved past it by no fix, so the round was never answered; #4133).
+    A key the open round owes is never counted twice.
 
     None (unknown) for a budget that is not ``ok``, an unreadable cutover, an
     in-graph finding from the cutover on with an unreadable time, a key that
@@ -213,6 +268,9 @@ def late_findings(
     if start is None or budget.get("status") != "ok":
         return None
     own = set(budget.get("open_keys") or []) if budget.get("round_state") == "open" else set()
+    if isinstance(held, str):  # a str would match by its characters
+        raise TypeError("held is a collection of round heads, not one head")
+    held = frozenset(held)
     in_graph, ancestors = _ancestry(budget)
     found: dict[str, dict[str, Any]] = {}
     for item in budget.get("findings") or []:
@@ -232,7 +290,7 @@ def late_findings(
         # Whether the finding is owed at all comes first: a finding that owes
         # nothing never makes owed unknown, even with a key that could not be
         # derived.
-        if not late:
+        if not late and head not in held:
             if fix_time is None:
                 return None
             fixed = fix_time(head)
@@ -258,11 +316,12 @@ def late_owed(
     *,
     cutover: str | None,
     fix_time: Any = None,
+    held: Iterable[str] = (),
 ) -> tuple[list[str] | None, list[str] | None]:
     """``(late_keys, owed)``: every late key from ``cutover`` on, and those not
     in ``covered_late``. ``(None, None)`` when unknown, never a known empty
     next to an unknown."""
-    late = late_findings(budget, cutover, fix_time)
+    late = late_findings(budget, cutover, fix_time, held=held)
     if late is None:
         return None, None
     keys = [item["key"] for item in late]
@@ -324,25 +383,6 @@ def _descendants(cwd: str, sha: str, current: str) -> set[str]:
     if code != 0:
         raise rr.Refused(f"git rev-list {sha[:12]}..{current[:12]} failed")
     return set(out.split())
-
-
-def _prior_labels(
-    cwd: str,
-    log: Sequence[tuple[str, str, str, datetime | None]],
-    prior_heads: Sequence[str],
-    sha: str,
-) -> list[str]:
-    """The earlier rounds' classes as reflection ``sha`` saw them: only
-    reflections that are strict git ancestors of it count, never one that
-    reached the history later through a merge. Ancestry is probed only for
-    rows naming one of ``prior_heads``."""
-    wanted = set(prior_heads)
-    rows = [
-        row
-        for row in log
-        if row[0] != sha and rr.parse(row[2]).head in wanted and rr._is_ancestor(cwd, row[0], sha)
-    ]
-    return rr._class_labels(rows, prior_heads)
 
 
 def covered_late_keys(
@@ -439,6 +479,7 @@ def _covered_late_keys(
     current = budget.get("current_head")
     in_graph, ancestors = _ancestry(budget)
     log = rr._log_reflections(cwd)
+    owners = rr.key_rounds(budget)
     labels: dict[tuple[tuple[str, ...], str], list[str]] = {}
     checked: dict[tuple[str, RoundContext], bool] = {}
     fix_times: dict[tuple[str, str], datetime | None] = {}
@@ -502,8 +543,18 @@ def _covered_late_keys(
                     checked[(sha, context)] = parsed.ok and not parsed.escalate
                 if (sha, context) not in checked:
                     if (context.prior_heads, sha) not in labels:
-                        labels[(context.prior_heads, sha)] = _prior_labels(
-                            cwd, log, context.prior_heads, sha
+                        # Only a fix-instances decision with classes can recur.
+                        labels[(context.prior_heads, sha)] = (
+                            rr._class_labels(
+                                log,
+                                context.prior_heads,
+                                owners=owners,
+                                judged=sha,
+                                cwd=cwd,
+                                relevant=parsed.classes,
+                            )
+                            if parsed.decision == "fix-instances" and parsed.classes
+                            else []
                         )
                     checked[(sha, context)] = rr.check(
                         body,
@@ -570,9 +621,10 @@ def _late_status(
 ) -> dict[str, Any]:
     ok = budget.get("status") == "ok"
     fix_time = fix_time_reader(cwd, str(budget.get("current_head"))) if ok else None
-    state = rr.owed_state(budget, (), now=now, cutover=cutover, fix_time=fix_time)
+    held = held_rounds(cwd, budget) if ok else []
+    state = rr.owed_state(budget, (), now=now, cutover=cutover, fix_time=fix_time, held=held)
     is_open = ok and state["round_state"] == "open"
-    late = late_findings(budget, cutover, fix_time) if ok else []
+    late = late_findings(budget, cutover, fix_time, held=held) if ok else []
     if not (is_open or late):
         return state
     # Only the open round and late keys judged under a real round read the
@@ -602,4 +654,5 @@ def _late_status(
         cutover=cutover,
         fix_time=fix_time,
         late_covered=late_covered,
+        held=held,
     )
