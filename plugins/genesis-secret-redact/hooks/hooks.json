@@ -1,14 +1,4 @@
 {
-  "description": "genesis-secret-redact: the in-process mod, and the PreToolUse stream wrap for Monitor and background Bash",
-  "modules": ["./register.ts"],
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "^(Monitor|Bash)$",
-        "hooks": [
-          {"type": "command", "command": "python3 -I \"${CLAUDE_PLUGIN_ROOT}/bin/stream_wrap.py\"", "timeout": 15}
-        ]
-      }
-    ]
-  }
+  "description": "genesis-secret-redact: the in-process mod that keeps secrets.env values out of a session",
+  "modules": ["./register.js"]
 }

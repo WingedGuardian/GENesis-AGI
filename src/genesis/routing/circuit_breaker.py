@@ -570,11 +570,28 @@ class CircuitBreakerRegistry:
             cb = self._breakers.get(provider)
             return provider_identity(cb._provider) if cb is not None else None
 
-    def toggle(self, provider: str) -> ProviderState:
-        """Apply a dashboard toggle to the current binding atomically with reload."""
+    def toggle(self, provider: str, enable: bool | None = None) -> ProviderState:
+        """Apply a dashboard toggle to the current binding atomically with reload.
+
+        ``enable`` is the action the operator chose: True re-enables
+        (`force_close`), False disables (`force_open`). The dashboard sends the
+        action its button showed, because the state it rendered can be stale:
+        reading `.state` on an OPEN breaker whose window has passed moves it to
+        HALF_OPEN, and the routing poll does exactly that between renders.
+
+        With no intent (an older client), decide from the raw `_state` field,
+        never from `.state`: `.state` turns an expired OPEN into HALF_OPEN as it
+        reads, which sent "enable" on an expired operator hold down the
+        disable branch. Raw OPEN means no reader has moved it since the window
+        passed, so the last view of it still said "open"/"enable". The limit:
+        once a reader HAS moved it to HALF_OPEN, a no-intent toggle disables,
+        which is the button a fresh dashboard shows for HALF_OPEN.
+        """
         with self._lock:
             cb = self.get(provider)
-            if cb.state == ProviderState.OPEN:
+            if enable is None:
+                enable = cb._state == ProviderState.OPEN
+            if enable:
                 cb.force_close()
             else:
                 cb.force_open()

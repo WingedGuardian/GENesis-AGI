@@ -22,6 +22,8 @@ _TEXT_ONLY = {
     "test_hooks/test_main_checkout_guard.py": "reads UPDATE_TIER_ENV and the template text",
     "test_ui/test_dashboard_e2e.py": "served by tests/test_ui/conftest.py, which calls "
     "isolate_update_routes for every dashboard it builds",
+    "test_live_closure.py": "reads the routes' import-time state paths (_REFUSED_FILE) to "
+    "check they bind under the private HOME; the sandbox would replace exactly those paths",
 }
 
 # Modules that spawn through the routes under the live fence on purpose. The

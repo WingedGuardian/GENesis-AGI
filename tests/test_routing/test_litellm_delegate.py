@@ -94,6 +94,56 @@ def _real_api_connection_error(mock_litellm, message):
     )
 
 
+def _real_bad_request_error(mock_litellm, message, status, cls_name="BadRequestError"):
+    """Put the REAL ``litellm.BadRequestError`` on the mock and return an
+    instance of it (or of the named subclass), built with a response of the
+    given HTTP status, or with no response when ``status`` is None.
+
+    The real class is required for the same reason as above: the status is an
+    attribute litellm SYNTHESIZES. It copies the response's status onto the
+    exception and falls back to 400 without one, and a stand-in has neither.
+    """
+    import httpx
+    import litellm as real_litellm
+
+    mock_litellm.BadRequestError = real_litellm.BadRequestError
+    response = None
+    if status is not None:
+        response = httpx.Response(
+            status,
+            request=httpx.Request("POST", "https://example.invalid/v1/chat/completions"),
+        )
+    return getattr(real_litellm, cls_name)(
+        message=message, model="llama-3.3-70b-versatile",
+        llm_provider="test-provider", response=response,
+    )
+
+
+# An exhausted prepaid balance, in the shape a live install recorded it.
+# SYNTHETIC: the request id is all zeroes; nothing is copied from a real reply.
+_BALANCE_BODY = {
+    "error": {
+        "message": "Insufficient Balance (request_id: 00000000-0000-0000-0000-000000000000)",
+        "type": "insufficient_balance_error",
+        "param": None,
+        "code": "invalid_request_error",
+    }
+}
+# An ordinary client error from the same vendor family: same `code`, no balance.
+_INVALID_REQUEST_BODY = {
+    "error": {
+        "message": "Invalid value for 'messages'",
+        "type": "invalid_request_error",
+        "param": None,
+        "code": "invalid_request_error",
+    }
+}
+# A payment error whose body does NOT say `invalid_request_error`.
+_PAYMENT_REQUIRED_BODY = {
+    "error": {"message": "Payment Required", "type": "payment_required", "code": 402}
+}
+
+
 # ── Model string construction ──────────────────────────────────────────────
 
 
@@ -433,6 +483,125 @@ async def test_call_bad_request_error():
 
     assert result.success is False
     assert result.status_code == 400
+
+
+async def test_call_bad_request_error_keeps_a_real_402():
+    """A ``BadRequestError`` that carries HTTP 402 is reported as 402.
+
+    litellm raises ``BadRequestError`` for a response whose body says
+    ``invalid_request_error`` whatever its HTTP status, and keeps that status
+    on the exception. Reporting it as 400 hid a payment error from the router's
+    existing 402 path.
+    """
+    import json
+
+    from genesis.routing.retry import classify_error
+    from genesis.routing.types import ErrorCategory
+
+    delegate = LiteLLMDelegate(_config())
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        _install_litellm_exceptions(mock_litellm)
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=_real_bad_request_error(
+                mock_litellm, json.dumps(_BALANCE_BODY), 402,
+            ),
+        )
+        result = await delegate.call(
+            "test-provider", "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hi"}],
+        )
+
+    assert result.success is False
+    assert result.status_code == 402
+    assert classify_error(result.status_code, result.error) == ErrorCategory.QUOTA_EXHAUSTED
+
+
+@pytest.mark.parametrize(
+    ("cls_name", "status"),
+    [
+        ("BadRequestError", 400),
+        ("BadRequestError", 403),
+        ("BadRequestError", 413),
+        ("BadRequestError", 429),
+        ("BadRequestError", 500),
+        ("BadRequestError", None),
+        ("ContextWindowExceededError", None),
+        ("ContentPolicyViolationError", None),
+    ],
+    ids=[
+        "wire-400", "wire-403", "wire-413", "wire-429", "wire-500", "no-response",
+        "context-window", "content-policy",
+    ],
+)
+async def test_call_bad_request_error_other_statuses_stay_400(cls_name, status):
+    """Control: 402 is the ONLY status carried through.
+
+    Every other ``BadRequestError`` keeps the 400 it always had, so nothing but
+    a payment error changes category: a wrapped 429 or 500 does not start
+    tripping breakers, and a context overflow stays a payload fault.
+    """
+    delegate = LiteLLMDelegate(_config())
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        _install_litellm_exceptions(mock_litellm)
+        error = _real_bad_request_error(mock_litellm, "request rejected", status, cls_name)
+        # Guard the fixture: the exception really carries the status under test.
+        assert error.status_code == (400 if status is None else status)
+        mock_litellm.acompletion = AsyncMock(side_effect=error)
+        result = await delegate.call(
+            "test-provider", "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hi"}],
+        )
+
+    assert result.success is False
+    assert result.status_code == 400
+
+
+@pytest.mark.parametrize(
+    ("wire_status", "body", "expected_status", "expected_category"),
+    [
+        (402, _BALANCE_BODY, 402, "quota_exhausted"),
+        (400, _BALANCE_BODY, 400, "quota_exhausted"),
+        (400, _INVALID_REQUEST_BODY, 400, "bad_request"),
+        (402, _PAYMENT_REQUIRED_BODY, 402, "quota_exhausted"),
+    ],
+    ids=["balance-at-402", "balance-at-400", "invalid-request-at-400", "payment-at-402"],
+)
+async def test_installed_litellm_balance_body_reaches_the_quota_path(
+    loopback_vendor, monkeypatch, wire_status, body, expected_status, expected_category,
+):
+    """CONTRACT with the INSTALLED litellm, over real HTTP on loopback.
+
+    The balance fix leans on two things litellm does, and an upgrade can change
+    either: it embeds the vendor's JSON body in ``str(exception)`` (the
+    classifier reads the error type from it), and it keeps the wire status on a
+    ``BadRequestError`` (the delegate reads 402 from it). The real delegate and
+    the real classifier are joined here, so a change in either shows up as a
+    balance error that no longer reaches the quota path.
+    """
+    from genesis.routing.retry import classify_error
+
+    # Keeps a first litellm import in this process off the network.
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    base_url, reply = loopback_vendor
+    reply["status"], reply["body"] = wire_status, body
+    delegate = LiteLLMDelegate(_config(
+        provider_type="deepseek", model_id="deepseek-chat", base_url=base_url, is_free=False,
+    ))
+
+    with patch(
+        "genesis.routing.litellm_delegate._resolve_api_key", return_value="local-test-only",
+    ):
+        result = await delegate.call(
+            "test-provider", "deepseek-chat", [{"role": "user", "content": "Hi"}], timeout=10,
+        )
+
+    # Guard the fixture: the request really went to the loopback endpoint.
+    assert reply["hits"] == 1
+    assert result.success is False
+    assert result.status_code == expected_status
+    assert classify_error(result.status_code, result.error or "").value == expected_category
 
 
 async def test_call_unprocessable_entity_error():

@@ -175,6 +175,13 @@ def collect_missing_units(template_dir: Path, unit_dir: Path) -> list[str] | Non
 _ABBREV_SHA = re.compile(r"^[0-9a-f]{4,40}$")
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
+#: _run_git's timeout and exec-failure sentinels. A git killed by SIGHUP or
+#: SIGINT also returns -1/-2, so the word can be wrong, but the check did not
+#: complete either way. "I could not check" and "it is not here" have different
+#: remedies, so at every git phase of resolve_commit they must not share a
+#: message with an absent or wrong-typed object.
+_GIT_UNCHECKED = {-1: "timed out", -2: "failed"}
+
 
 def resolve_commit(repo: Path, name: str | None) -> tuple[str | None, str]:
     """Expand a stored (abbreviated) commit name to its full 40-hex SHA.
@@ -212,11 +219,8 @@ def resolve_commit(repo: Path, name: str | None) -> tuple[str | None, str]:
     rc, out, err = _run_git(
         repo, "rev-parse", f"--disambiguate={candidate}", timeout=_CHEAP_TIMEOUT_S
     )
-    if rc in (-1, -2):
-        # _run_git's own sentinels: -1 timeout, -2 exec failure. "I could not
-        # check" and "it is not here" have different remedies, so they must not
-        # share a message.
-        return None, f"could not check {candidate} (git {'timed out' if rc == -1 else 'failed'})"
+    if rc in _GIT_UNCHECKED:
+        return None, f"could not check {candidate} (git {_GIT_UNCHECKED[rc]})"
     names = [line.strip() for line in out.splitlines() if line.strip()]
     if rc != 0 or not names:
         return (
@@ -229,6 +233,12 @@ def resolve_commit(repo: Path, name: str | None) -> tuple[str | None, str]:
     if not _FULL_SHA.match(resolved):
         return None, f"{candidate} resolved to something that is not a SHA: {resolved!r}"
     rc, kind, _ = _run_git(repo, "cat-file", "-t", resolved, timeout=_CHEAP_TIMEOUT_S)
+    if rc in _GIT_UNCHECKED:
+        return (
+            None,
+            f"{candidate} resolved to {resolved} but could not check its type"
+            f" (git {_GIT_UNCHECKED[rc]})",
+        )
     if rc != 0 or kind.strip() != "commit":
         return None, f"{candidate} names a {kind.strip() or 'missing'} object, not a commit"
     return resolved, f"{candidate} resolved to {resolved}"

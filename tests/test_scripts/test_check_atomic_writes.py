@@ -1403,6 +1403,98 @@ def write(dst, data):
 """
 
 
+_RMTREE_OF_A_TEMP_DIR_IS_CLEANUP = """
+import os
+import shutil
+
+
+def place(final):
+    tmp = final + '.tmp'
+    os.mkdir(tmp)
+    try:
+        open(os.path.join(tmp, 'f'), 'w').close()
+        os.rename(tmp, final)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+"""
+
+_RMTREE_OF_ANOTHER_DIR_IS_NOT = """
+import os
+import shutil
+
+
+def place(final, other):
+    tmp = final + '.tmp'
+    os.mkdir(tmp)
+    try:
+        os.rename(tmp, final)
+    except BaseException:
+        shutil.rmtree(other, ignore_errors=True)
+        raise
+"""
+
+_BARE_RMTREE_IS_NOT_CREDITED = """
+import os
+from shutil import rmtree
+
+
+def place(final):
+    tmp = final + '.tmp'
+    os.mkdir(tmp)
+    try:
+        os.rename(tmp, final)
+    except BaseException:
+        rmtree(tmp)
+        raise
+"""
+
+
+_CLEANUP_AFTER_A_CONDITIONAL_RAISE = """
+import errno
+import os
+import shutil
+
+
+def place(final):
+    tmp = final + '.tmp'
+    os.mkdir(tmp)
+    try:
+        os.rename(tmp, final)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
+        shutil.rmtree(tmp)
+"""
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="#4436: a handler counts as cleaning even when a conditional raise exits it first",
+)
+def test_cleanup_after_a_conditional_raise_is_not_credited():
+    """Every real failure re-raises before the rmtree, so this temp leaks. The
+    unlink spelling of the same shape is misread the same way (pre-existing)."""
+    assert _verdicts(_CLEANUP_AFTER_A_CONDITIONAL_RAISE) == ["LEAKS"]
+
+
+def test_rmtree_of_the_temp_directory_is_cleanup():
+    """A temp DIRECTORY is cleaned by `shutil.rmtree(tmp)`, not by unlink; not
+    crediting it reported the protected site as LEAKS."""
+    assert _verdicts(_RMTREE_OF_A_TEMP_DIR_IS_CLEANUP) == ["CLEANS_UP"]
+
+
+def test_rmtree_of_a_different_directory_is_not_cleanup():
+    """The same identity rule as unlink: removing some other tree leaves the temp."""
+    assert _verdicts(_RMTREE_OF_ANOTHER_DIR_IS_NOT) == ["LEAKS"]
+
+
+def test_a_bare_rmtree_name_is_not_credited():
+    """Like a bare `remove`, an unqualified `rmtree` is not credited: a false
+    flag is the direction this check may be wrong in."""
+    assert _verdicts(_BARE_RMTREE_IS_NOT_CREDITED) == ["LEAKS"]
+
+
 def test_a_list_removal_is_not_cleanup():
     """`pending_paths.remove(tmp)` drops an ELEMENT; it does not delete a file.
     Crediting it made a genuinely leaking site read CLEANS_UP -- invisible and

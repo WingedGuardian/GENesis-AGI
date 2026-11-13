@@ -547,6 +547,15 @@ if [ -z "${GENESIS_BOOTSTRAP_ALLOW_LIVE:-}" ]; then
     fi
 fi
 
+# BEGIN live-repair-kit (#3492 D2; extracted by tests/test_scripts/test_live_repair_kit.py)
+# The live-move repair kit, installed outside the checkout it may have to repair,
+# from HEAD's blobs (never the working tree). After crash recovery, which refuses
+# on a half-written tree (the old kit then stays, the version that wrote the
+# state), and after the units check, which promises no change when it refuses.
+python3 -I -S "$SCRIPT_DIR/lib/live_repair_kit.py" install "$GENESIS_ROOT" "$HOME" \
+    || echo "  WARNING: the live-move repair kit was not installed; the installed one, if any, is kept."
+# END live-repair-kit
+
 # --- Prerequisites ---
 echo "--- Checking and installing prerequisites ---"
 
