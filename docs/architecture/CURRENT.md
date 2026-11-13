@@ -1651,6 +1651,9 @@ verified: f62608045437 2026-11-09
   items, response presence and Source/mention evidence; strict decoding rejects
   corrupt v2 inputs as a whole. These are retained-evidence facts, not proof of
   source acquisition or model judgment; see `docs/reference/inbox-coverage-evidence.md`.
+  Its output guard protects every inbox file the monitor may evaluate (any type), retained response targets and the
+  database and its SQLite companions by resolved path and existing file identity, independently of report
+  selection; an existing output directory receives a generated report filename.
   An ordered proof finds the first source-frame closure; ambiguous tokens stay
   raw and cannot supply wrapper context for later URLs.
   The wrapper correction is scoped to this URL path; the entry's existing
@@ -4203,7 +4206,13 @@ verified: 9a95483a8e7f 2026-10-09
   external mutator of breaker state is the dashboard toggle
   (`dashboard/routes/providers.py`), and it goes through `force_open()` /
   `force_close()` rather than assigning private fields, so the origin flag
-  cannot drift out of step with the state. Both are COMPLETE transitions --
+  cannot drift out of step with the state. It picks between them from the
+  operator's intent (the dashboard posts `{"enabled": <bool>}`, the action its
+  button showed), and without one from the raw `_state` field: never from
+  `.state`, whose read moves an expired OPEN to HALF_OPEN and once turned an
+  "enable" on an expired hold into a fresh disable. (Known limit: with no
+  intent, a breaker a reader has already moved to HALF_OPEN is disabled, the
+  button a fresh dashboard shows for it.) Both are COMPLETE transitions --
   they notify (which is what the registry wires to `save_state`) and clear the
   qualifiers they invalidate. They are complete with respect to
   BREAKER FIELDS only — neither fires `on_recovery`, so an operator re-enable
