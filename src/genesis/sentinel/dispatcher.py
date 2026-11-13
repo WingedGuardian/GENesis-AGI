@@ -288,18 +288,22 @@ def _record_execution(
     A dispatch used to count as resolved whenever any action ran, whatever its
     exit code, so a failed or partial fix read as "Sentinel resolved" (#4302).
     An action that could not even start (OSError) is missing from ``executed``,
-    which also leaves the dispatch unresolved.
+    which also leaves the dispatch unresolved. Every call site runs this
+    whatever ``executed`` holds, so an empty one (nothing started, or the
+    owner rejected) clears any ``resolved`` the result carried in; the
+    session's own ``actions_taken`` is kept when no approved action ran.
     """
-    result.actions_taken = [a["command"] for a in executed]
-    result.action_outputs = [
-        {
-            "command": a["command"],
-            "success": bool(a.get("success")),
-            "stdout": a.get("stdout", ""),
-            "stderr": a.get("stderr", ""),
-        }
-        for a in executed
-    ]
+    if executed:
+        result.actions_taken = [a["command"] for a in executed]
+        result.action_outputs = [
+            {
+                "command": a["command"],
+                "success": bool(a.get("success")),
+                "stdout": a.get("stdout", ""),
+                "stderr": a.get("stderr", ""),
+            }
+            for a in executed
+        ]
     wanted = [a for a in proposed if a.get("command")]
     result.resolved = (
         bool(wanted)
@@ -895,8 +899,7 @@ class SentinelDispatcher:
                 # Legacy blocking path
                 try:
                     executed = await self._approve_and_execute_actions(result)
-                    if executed:
-                        _record_execution(result, result.proposed_actions, executed)
+                    _record_execution(result, result.proposed_actions, executed)
                 except Exception:
                     logger.error("Sentinel action approval/execution failed", exc_info=True)
 
@@ -904,8 +907,7 @@ class SentinelDispatcher:
             if self._approval_gate is not None and result.proposed_actions and not result.resolved:
                 try:
                     executed = await self._execute_approved_actions(result.proposed_actions)
-                    if executed:
-                        _record_execution(result, result.proposed_actions, executed)
+                    _record_execution(result, result.proposed_actions, executed)
                 except Exception:
                     logger.error("Sentinel action execution failed", exc_info=True)
 
@@ -1294,8 +1296,7 @@ class SentinelDispatcher:
                 # Execute the approved actions
                 try:
                     executed = await self._execute_approved_actions(cc_result.proposed_actions)
-                    if executed:
-                        _record_execution(cc_result, cc_result.proposed_actions, executed)
+                    _record_execution(cc_result, cc_result.proposed_actions, executed)
                 except Exception:
                     logger.error("Sentinel action execution failed on resume", exc_info=True)
                 return await self._finalize_dispatch(request, cc_result, pattern=pattern)
@@ -1709,6 +1710,13 @@ class SentinelDispatcher:
         if degraded:
             resolved = False
             actions_taken = []
+
+        # SENTINEL.md: resolved=true means no action is needed. A session that
+        # also proposes actions is not trusted on that half: whether the
+        # dispatch resolved comes only from the approved actions' outcome
+        # (_record_execution), so the gated path runs them too.
+        if proposed_actions:
+            resolved = False
 
         # Fallback: use the full text as diagnosis
         if not diagnosis and text:

@@ -65,4 +65,5 @@ python -m genesis.sentinel.codex_mcp_stop --execute  # only inside an approved S
   the VS Code extension use. A terminal `codex` runs its servers in-process
   with the TUI, and its subagents share one set.
 - **Turning it off:** `codex_mcp_stop.mode: off` in `config/sentinel.local.yaml`,
-  or `GENESIS_CODEX_MCP_STOP_DISABLED=1`, makes `--execute` refuse (exit 4).
+  or `GENESIS_CODEX_MCP_STOP_DISABLED=1`, makes the tool refuse before scanning
+  (exit 4), in the dry-run and with `--execute` alike.

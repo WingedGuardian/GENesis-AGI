@@ -179,21 +179,31 @@ def _is_pipe(pid: int, fd: int) -> bool | None:
 
 
 _SAFE_LABEL = __import__("re").compile(r"[^A-Za-z0-9._+-]")
+_INTERPRETER = __import__("re").compile(r"(?:node|nodejs|bun|deno|python(?:\d+(?:\.\d+)?)?)")
+_SCRIPT_EXTENSIONS = (".js", ".mjs", ".cjs", ".ts", ".mts", ".py")
 
 
 def _safe_label(argv: list[str]) -> str:
-    """Program (and script) basename only, sanitised.
+    """Program basename, plus the script basename after a known interpreter.
 
     The dry-run output is read by the Sentinel LLM and lands in its transcript,
     so raw argv (attacker-influenced text from third-party MCP configs, and
-    often --token/--api-key values) is never printed.
+    often --token/--api-key values) is never printed. No other argument is
+    judged by its shape: an option value or a bare positional argument can be
+    a credential whatever it looks like, so a script name prints only when
+    argv[0] is an interpreter and the argument ends in a script extension.
     """
     if not argv:
         return "?"
-    parts = [os.path.basename(argv[0])]
-    script = next((a for a in argv[1:3] if not a.startswith("-") and "." in os.path.basename(a)), None)
-    if script:
-        parts.append(os.path.basename(script))
+    program = os.path.basename(argv[0])
+    parts = [program]
+    if _INTERPRETER.fullmatch(program):
+        script = next(
+            (a for a in argv[1:4] if not a.startswith("-") and a.endswith(_SCRIPT_EXTENSIONS)),
+            None,
+        )
+        if script:
+            parts.append(os.path.basename(script))
     return " ".join(_SAFE_LABEL.sub("_", x)[:40] for x in parts)
 
 

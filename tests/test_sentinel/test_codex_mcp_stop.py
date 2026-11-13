@@ -416,6 +416,27 @@ def test_output_never_prints_raw_argv(fake_proc, monkeypatch, capsys):
     assert "node srv.js" in out
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        # An option value or a bare positional argument is never a script name,
+        # however it is shaped: either can be a credential.
+        (["mcp-server", "--api-key", "secret.api.key.123456789"], "mcp-server"),
+        (["mcp", "sk-ant.abcdef"], "mcp"),
+        (["/usr/local/bin/srv", "config.json"], "srv"),
+        # A script name prints only after a known interpreter.
+        (["node", "srv.js", "--api-key", "placeholder"], "node srv.js"),
+        (["/usr/bin/python3", "/opt/x/genesis_mcp_server.py", "--server", "m"], "python3 genesis_mcp_server.py"),
+        (["deno", "run", "--allow-net", "server.ts"], "deno server.ts"),
+        (["python3", "-m", "pkg.module"], "python3"),
+        (["node", "--api-key", "value.with.dots"], "node"),
+        ([], "?"),
+    ],
+)
+def test_safe_label_prints_no_argument_it_cannot_name_as_a_script(argv, expected):
+    assert mod._safe_label(argv) == expected
+
+
 def test_scan_skips_another_users_process(fake_proc, monkeypatch):
     real_geteuid = os.geteuid
     monkeypatch.setattr(mod.os, "geteuid", lambda: real_geteuid() + 1)

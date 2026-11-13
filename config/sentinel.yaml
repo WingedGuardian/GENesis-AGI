@@ -19,7 +19,8 @@ autonomy:
 #     approves the action, run with --execute. Genesis never schedules it on
 #     its own; the Sentinel prompt forbids the session running --execute
 #     itself (a prompt rule, not an enforcement: that session has Bash).
-#   off: --execute refuses (exit 4); the dry-run listing still works.
+#   off: the tool refuses before scanning, in dry-run and --execute alike
+#     (exit 4), so a session that only runs the dry-run sees it is off.
 # Any other value reads as off. GENESIS_CODEX_MCP_STOP_DISABLED=1 also turns
 # it off. Set per install in config/sentinel.local.yaml.
 codex_mcp_stop:
