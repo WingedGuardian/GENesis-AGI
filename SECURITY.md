@@ -122,6 +122,11 @@ isolation is still load-bearing for you — it is:
   route returns each key with an empty value and `values_withheld: true`,
   `/api/genesis/backup/status` omits `destinations.tier2.target`, and
   `/api/genesis/backup/config` omits `local_path`, `nas` and `nas_user`.
+  The health route (`/api/genesis/health`), which answers every network for
+  the host-side supervisor, does the same for the fields listed below: it
+  omits them, and marks a call site that had a response with
+  `last_response_hidden: true`. That route also serves them to a caller
+  presenting the internal API token.
 
   **This is not the whole class, and it should not be read as one.** The
   carve-out is a list of FIELDS — not a property of a route, a helper, or the
@@ -132,7 +137,10 @@ isolation is still load-bearing for you — it is:
     parsed from `secrets.env.example`), which is the whole file rather than a
     sensitive subset;
   - the backup tier-2 target;
-  - the backup local path, share and username.
+  - the backup local path, share and username;
+  - on the health route: each call site's `last_response` (the text its last
+    model call returned), the deploy checkout's edited file names and its
+    probe error text, and the live-repair reports (their counts stay).
 
   Two properties of that list are easy to get wrong. It **nests rather than
   partitions**: the backup path, share and username are themselves registry

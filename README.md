@@ -8,7 +8,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.12-blue" alt="Python 3.12">
-  <img src="https://img.shields.io/badge/LOC-298%2C000%2B-informational" alt="Lines of Code">
+  <img src="https://img.shields.io/badge/LOC-413%2C000%2B-informational" alt="Lines of Code">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
   <a href="#get-involved"><img src="https://img.shields.io/badge/contributors-welcome-brightgreen" alt="Contributors Welcome"></a>
 </p>
@@ -19,6 +19,46 @@
   <a href="https://playwright.dev"><img src="https://img.shields.io/badge/Playwright-2EAD33?logo=playwright&logoColor=white" alt="Playwright"></a>
   <a href="https://discord.com/invite/Zkc3XMQpJX"><img src="https://img.shields.io/badge/Discord-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
+
+**Run your own personal AGI.** Genesis is a complete, open cognitive architecture—clone it, run your own instance, and extend the core. What follows is the case for why that's worth doing.
+
+We have the most capable AI models ever created, and we're using them like search bars with better grammar.
+
+Every other AI agent puts you in the driver's seat—and keeps you there. YOU figure out what you need. YOU debug the failures. YOU manage the infrastructure. YOU supervise every step.
+
+But now? **This is my run at personal AGI—the most complete open-source cognitive architecture for a persistent personal agent.**
+
+Not the sci-fi version. The real one: a system that remembers everything, learns from every interaction, thinks while you sleep, earns autonomy through demonstrated competence, and gets fundamentally better every day it runs.
+
+**What we mean by AGI here**
+
+- One system works across domains. The same memory and tools handle research, code, email, browser tasks and Genesis's own infrastructure.
+- It keeps state between sessions. Memory is stored in SQLite and Qdrant and recalled on every prompt.
+- It runs without being prompted. A scheduler reads its signals every five minutes, and two ego loops propose work on their own cadence.
+- It learns from outcomes. Interactions are triaged and their outcomes classified, and an approach that keeps working becomes a stored procedure whose confidence follows later results.
+- Its autonomy is earned per action category and can be lost. Work the egos dispatch passes an approval gate before it runs.
+
+**What we do not mean**
+
+- A new kind of model. Reasoning runs on Claude Code and routed LLM providers. Genesis is the orchestration around them.
+- Human-level intelligence or consciousness.
+- Learning inside the model. Nothing in this repo trains or fine-tunes model weights. What changes over time is what Genesis has stored and how much it is trusted to do.
+- A system that rewrites its own source code. That is the V5 roadmap, and the switch for it ships off. Today its self-edits stop at cognitive config files such as skills and triage calibration, and edits are snapshotted for rollback.
+- Unsupervised operation. Every background session Genesis dispatches is rooted in your approval. The only standing grants today are for kinds of email send, earned after approved sends, and you can revoke one at any time.
+- A score on a general-intelligence benchmark. The quality measurement in this README is recall quality on one install, charted under [Memory](#memory).
+
+<details>
+<summary><i>But wait — is this really AGI?</i></summary>
+
+<br>
+
+Truthfully, no, I do not genuinely consider this to be "true" AGI. In order to get to something resembling "true" AGI, it would need to be built from first principles, which would require the orchestration (that IS Genesis) to be built into the LLM layer, the most foundational part of Genesis' compute layer itself. Nor am I of any particular belief that LLMs are necessarily the right architecture for this pursuit in the first place. But because I cannot change the LLM layer, and no better technology currently exists, this is the best I can do today. Call it "proto-AGI;" "pseudo-AGI" even.
+
+But what I can tell you is this: Genesis is far closer to AGI than anything else I've seen, and even if it's not AGI from first principles, it mimics a lot of the same outcomes and behaviours and capabilities that AGI would presumably need to exhibit. If AGI sounds like something you'd like to help contribute to, [**come build with us →**](#get-involved)
+
+</details>
+
+---
 
 ## Contents
 
@@ -38,29 +78,6 @@
 
 ---
 
-**Run your own personal AGI.** Genesis is a complete, open cognitive architecture—clone it, run your own instance, and extend the core. What follows is the case for why that's worth doing.
-
-We have the most capable AI models ever created, and we're using them like search bars with better grammar.
-
-Every other AI agent puts you in the driver's seat—and keeps you there. YOU figure out what you need. YOU debug the failures. YOU manage the infrastructure. YOU supervise every step.
-
-But now? **This is my run at personal AGI—the most complete open-source cognitive architecture for a persistent personal agent.**
-
-Not the sci-fi version. The real one: a system that remembers everything, learns from every interaction, thinks while you sleep, earns autonomy through demonstrated competence, and gets fundamentally better every day it runs. Clone it, run it; tell me I'm wrong!
-
-<details>
-<summary><i>But wait — is this really AGI?</i></summary>
-
-<br>
-
-Truthfully, no, I do not genuinely consider this to be "true" AGI. In order to get to something resembling "true" AGI, it would need to be built from first principles, which would require the orchestration (that IS Genesis) to be built into the LLM layer, the most foundational part of Genesis' compute layer itself. Nor am I of any particular belief that LLMs are necessarily the right architecture for this pursuit in the first place. But because I cannot change the LLM layer, and no better technology currently exists, this is the best I can do today. Call it "proto-AGI;" "pseudo-AGI" even.
-
-But what I can tell you is this: Genesis is far closer to AGI than anything else I've seen, and even if it's not AGI from first principles, it mimics a lot of the same outcomes and behaviours and capabilities that AGI would presumably need to exhibit. If AGI sounds like something you'd like to help contribute to, [**come build with us →**](#get-involved)
-
-</details>
-
----
-
 ## Genesis in 30 seconds
 
 Personal AI does what you tell it. Personal AGI does what you *need*.
@@ -71,7 +88,7 @@ Genesis is different:
 
 - **It knows what to do without being told** — because it's accumulated months of context about your projects, your decisions, your patterns. You never re-explain yourself.
 - **It acts between sessions** — thinking, researching, monitoring, surfacing what matters while you're not there. Not waiting for a prompt.
-- **It has judgment that improves with evidence** — earned autonomy per action category. First failure triggers demotion. Trust is rebuilt through performance, not time.
+- **It has judgment that improves with evidence** — earned autonomy per action category. A failure lowers trust in that category. A level drops when the record no longer supports it, and a standing grant drops back to ask-first on any confirmed correction. Trust is rebuilt through performance, not time.
 - **It's a fundamentally different system at month 6 than month 1** — not because of updates you installed, but because of what it learned living alongside you.
 
 With personal AI, you are the intelligence directing the tool. With personal AGI, it is an intelligence working alongside you—and the amount you need to manage shrinks over time.
@@ -79,7 +96,7 @@ With personal AI, you are the intelligence directing the tool. With personal AGI
 **How it does this:**
 
 - **Autonomous cognitive cycle** — a dual-ego architecture that wakes up, assesses the situation, proposes actions, and earns the right to execute them. Not waiting for prompts. Not following scripts. Thinking.
-- **Massive capability layer** — 60+ tools out of the box: browser automation, outreach pipeline, research, content creation, infrastructure monitoring, campaign execution. Not a framework you build on—a system that works, out of the box.
+- **Massive capability layer** — 150+ tools out of the box: browser automation, outreach pipeline, research, content creation, infrastructure monitoring, campaign execution. Not a framework you build on—a system that works, out of the box.
 - **4-layer memory** — essential knowledge, proactive recall, deep search, knowledge pipeline. Hybrid retrieval that compounds across months, not conversations.
 - **Closed-loop learning** — outcome classification, causal attribution, procedure extraction. Laplace-smoothed confidence, not vibes.
 - **Earned autonomy** — trust granted per action category through demonstrated competence. The system gets measurably better at its job, and it can show you the receipts.
@@ -87,7 +104,7 @@ With personal AI, you are the intelligence directing the tool. With personal AGI
 Day 1 — a strong generalist with full cognitive infrastructure.
 Day 30 — a personalized specialist in every domain you've touched.
 Day 90 — anticipating needs you haven't articulated yet.
-Day 180 — evolving its own architecture to serve you better.
+Day 180 — tuning its own skills and calibration from what it has learned.
 
 [**Get started →**](#getting-started)
 
@@ -99,7 +116,7 @@ Genesis is a cognitive architecture that makes the AGI claim explicitly—and ba
 
 Not a chatbot. Not an API wrapper. Not another prompt chain with a for loop.
 
-It uses [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as its reasoning engine. Genesis is what it's been missing: the mind that remembers, reflects, learns, and decides.
+It uses [Claude Code](https://code.claude.com/docs/en/overview) as its reasoning engine. Genesis is what it's been missing: the mind that remembers, reflects, learns, and decides.
 
 <p align="center">
   <img src="docs/images/tin-man.jpg" alt="The Tin Man" width="320">
@@ -107,7 +124,7 @@ It uses [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as its rea
   <i>"Claude Code already had the brain. We gave it the heart."</i>
 </p>
 
-50+ subsystems. 4 MCP servers. 2 vector databases. Every design decision made by one engineer working full-stack across infrastructure, cognition, and integration layers. That's the point. If one developer with the right cognitive infrastructure can build and run a system this complex, imagine what a team becomes capable of.
+50+ subsystems. 4 MCP servers. 2 vector collections. Every design decision made by one engineer working full-stack across infrastructure, cognition, and integration layers. That's the point. If one developer with the right cognitive infrastructure can build and run a system this complex, imagine what a team becomes capable of.
 
 <p align="center">
   <img src="docs/images/genesis-architecture.png" alt="Genesis cognitive architecture — three concentric rings" width="820">
@@ -129,7 +146,7 @@ Genesis is a full system, not a pip package. It runs best on a dedicated Linux m
 |---|---|---|---|
 | **OS** | Ubuntu 24.04+ | Ubuntu 24.04 LTS | Debian-based required for auto-install. glibc 2.38 or newer (Ubuntu 24.04+, Debian 13+) on x86_64 or aarch64: the bundled graph engine needs it, and the installer refuses anything else. |
 | **RAM** | 8 GB | 16 GB+ | Genesis + Qdrant + Claude Code + background tasks. 8 GB is tight under load. Service memory caps are percentage-based, so Genesis right-sizes itself to the box — scaling down on an 8 GB host and up on a 32 GB+ one. |
-| **Disk** | 15 GB | 40 GB+ | The installer's pre-flight check requires 15 GB free and stops below it. Fresh install ~400 MB; memory, logs, and caches grow steadily with use. |
+| **Disk** | 15 GB | 40 GB+ | The installer's pre-flight check requires 15 GB free and stops below it. Memory, logs, and caches grow steadily with use. |
 | **CPU** | 2 cores | 4-8 cores | Concurrent background tasks benefit from parallelism. |
 | **Network** | Internet access | Always-on | Cloud LLM APIs required. Offline not supported. |
 
@@ -195,20 +212,20 @@ numeric id); leave both blank to run without that channel.
 | **Self-healing infrastructure** | Guardian (host VM) + Sentinel (container)—two independent systems monitoring each other in a closed loop |
 | **Claude Code** | CLI with Genesis hooks + 4 MCP servers auto-activated per session |
 
-### Optional: local embedding
+### Optional: local models
 
-| Component | Install |
-|---|---|
-| **[Ollama](https://ollama.com)** | `curl -fsSL https://ollama.com/install.sh \| sh` |
-| **[LM Studio](https://lmstudio.ai)** | Download from [lmstudio.ai](https://lmstudio.ai) |
+| Component | Install | Used for |
+|---|---|---|
+| **[Ollama](https://ollama.com)** | `curl -fsSL https://ollama.com/install.sh \| sh` | Local embeddings |
+| **[LM Studio](https://lmstudio.ai)** | Download from [lmstudio.ai](https://lmstudio.ai) | Local inference |
 
-Without these, Genesis uses cloud embedding APIs. With them: private, faster, free.
+Both ship off, and Genesis uses cloud APIs without them. Enable Ollama with `GENESIS_ENABLE_OLLAMA=true` (add `memory.embed_local_first: true` in `genesis.yaml` to put local embeddings first) and LM Studio with `GENESIS_ENABLE_LM_STUDIO=true`.
 
 ---
 
 ## Your Genesis
 
-Your Genesis install is one operational system: the public `GENesis-AGI` codebase, your private fork for customizations, and your private encrypted backups repo. See [`.claude/docs/your-genesis.md`](.claude/docs/your-genesis.md) for the full model.
+Your Genesis install is one operational system: the public `GENesis-AGI` codebase, the public `GENesis-Voice` repo for voice and edge-device software, your private fork for customizations, and your private encrypted backups repo. See [`.claude/docs/your-genesis.md`](.claude/docs/your-genesis.md) for the full model.
 
 - **Backup** — runs every 6h via a systemd user timer (enable it once configured — see [SETUP.md](SETUP.md)). SQLite, Qdrant snapshots, memory, transcripts, secrets—GPG-encrypted before push.
 - **Restore** — `git clone <your-fork>` → `scripts/bootstrap.sh` → `scripts/restore.sh`. Back in minutes.
@@ -276,7 +293,7 @@ When Genesis isn't handling a user request, it doesn't sit idle. It researches t
 Most AI memory is a vector database with a retrieval function. Genesis runs a four-layer architecture—because "what are we working on?", "what's relevant right now?", "find everything about X", and "what does the external documentation say?" are fundamentally different operations that need different retrieval strategies.
 
 ```
-L1: Essential Knowledge (~300 tokens, injected at every session start)
+L1: Essential Knowledge (a few hundred tokens, injected at every session start)
     Pure DB queries. No LLM, no network, no latency.
     Content: active context, recent decisions, structural overview.
     → The forest view. Always available, even if everything else is down.
@@ -415,7 +432,7 @@ CORE (core)        → + Injected at session start, trigger-cached. Requires 8+ 
 
 Confidence uses Laplace smoothing: `(successes + 1) / (total + 2)`. A newly-extracted procedure starts at 50% confidence at most—the validation gate caps it—and one admitted by the novelty judge starts at zero. Evidence moves it. Demotion triggers when `failure_count >= success_count + 3` and the procedure has accumulated at least three failure-mode hits. Confidence below 30% with enough samples quarantines the procedure entirely.
 
-**Drive adaptation:** Outcomes feed back into Genesis's four behavioral drives (cooperation, competence, curiosity, preservation) via EMA updates with a small learning rate (α=0.005). It takes dozens of interactions to meaningfully shift a drive weight—no single event overcorrects. A set of protected behaviors (honesty, transparency, pushback) is defined, with the rule that weak signals must not erode them — but that rule is groundwork: it is not yet wired into the drive-update path, so today it constrains nothing.
+**Drive adaptation:** Outcomes feed back into Genesis's four behavioral drives (cooperation, competence, curiosity, preservation) via EMA updates with a small learning rate (α=0.005). It takes dozens of interactions to meaningfully shift a drive weight—no single event overcorrects. A set of protected behaviors (honesty, transparency, pushback, safety) is defined, with the rule that weak signals must not erode them — but that rule is groundwork: it is not yet wired into the drive-update path, so today it constrains nothing.
 
 This isn't "log what happened and hope the next session reads it." It's a closed loop: classify outcome → diagnose cause → extract principle → verify principle → promote or demote. The system gets measurably better at its job over time, and it can show you the receipts.
 
@@ -436,7 +453,7 @@ V5 extends this to L5-L7: system configuration, learning modification, and ident
 
 Under the hood, autonomy is tracked as a **capability-grant matrix**—a grant per *(domain, action, risk class)* cell, not one global setting. Genesis can earn the right to send a routine reply on an existing email thread on its own while a cold first email, a bulk send, or anything involving money still holds for your approval—each cell earned, demoted, and re-earned independently. Email is the first domain live on this model: every outbound message passes a deterministic authorization gate at the moment of send, autonomy for a given *kind* of email is granted only after enough approved sends, then revoked in one click the moment one goes wrong.
 
-Trust is granular, not binary. First failure in a category triggers demotion—Bayesian regression, not a fixed penalty. Earn it back through performance. The regression is always announced. Never silent.
+Trust is granular, not binary. A failure in a category recomputes its Bayesian posterior, and the level drops when the posterior crosses a threshold. A standing grant in the matrix above is stricter: any confirmed correction returns it to ask-first. Earn it back through performance. The regression is always announced. Never silent.
 
 The ego layer is where autonomy meets judgment. Two egos observe the system's state, decide what needs doing, propose actions to the user via Telegram, and execute approved work by dispatching Claude Code sessions. Every dispatch goes through an approval gate, and nothing bypasses it. Two things worth knowing about how it behaves in practice: pending requests can be approved as a batch when several have stacked up, and an approval that was granted but never consumed can be reused for a bounded window rather than re-asking. The user sees what's proposed and decides what runs.
 
@@ -462,12 +479,12 @@ The resilience layer tracks six independent failure axes—cloud availability, m
 | **Memory** | Qdrant + FTS5 operational | FTS5-only retrieval | Memory store unreachable |
 | **Embedding** | Provider responding | Writes queued for retry | Provider unavailable |
 | **CC** | Sessions dispatching normally | Deferred work queue active | All reflections deferred |
-| **Temp space** | Under half the configured budget | 50-90% used | Over 90%, or protected space breached |
+| **Temp space** | At least 15% free | Under 15% free, then under 8% | Under 3% or 3 GiB free, whichever is larger (never above 6% on a small disk) |
 | **Network** | Connectivity confirmed | Reachable but impaired | No connectivity across probe anchors |
 
 When something breaks: work gets deferred with staleness policies, routing walks the fallback chain, circuit breakers automatically test recovery, and the recovery orchestrator coordinates across the axes. Network is tracked separately and deliberately kept out of the legacy composite level, so it informs diagnosis without silently reclassifying everything else. Most systems have binary health: up or down. Genesis maps the entire space in-between.
 
-Genesis also routes LLM work across model tiers automatically—starting with the cheapest capable model, not the most expensive. Local free models handle extraction. Frontier models handle strategic reasoning. Circuit breakers and fallback chains mean the call site never fails—only individual providers do. Graceful degradation all the way down.
+Genesis also routes LLM work across model tiers automatically—starting with the cheapest capable model, not the most expensive. Free-tier cloud models handle fact extraction. Frontier models handle strategic reasoning. Circuit breakers and fallback chains mean a failing provider does not fail the call site. The call moves to the next provider in its chain. Graceful degradation all the way down.
 
 ---
 
@@ -477,7 +494,7 @@ Genesis operates in the real world through always-on channels:
 
 **Email** — Two-layer AI triage: a fast model reads and scores every email, a capable model makes final keep/discard decisions on what survives. Relevant findings get stored as searchable intelligence. Your inbox processed by a paralegal and a judge.
 
-**Inbox** — Drop anything—a markdown file, a URL, a PDF, a voice memo—into your notepad or a watched folder. Genesis evaluates the content, determines your intent, processes it through its full knowledge lens, and queues the result for your next session or digest. Drop it in your notes. Walk away.
+**Inbox** — Drop a note, a markdown file or a URL into your notepad or a watched folder. Genesis evaluates the content, determines your intent, processes it through its full knowledge lens, and queues the result for your next session or digest. Drop it in your notes. Walk away.
 
 **Telegram** — Proactive notifications, morning digests, and conversational interaction. Genesis reaches out when it has something worth saying. Not a notification firehose—calibrated outreach based on measured engagement. Voice input works too: speech gets transcribed and routed through the same pipeline as text.
 
@@ -589,7 +606,7 @@ Genesis has memory, learning, and autonomy—but until now, only through text. V
 - **Real-time voice conversation** *(live)* — talk to Genesis through a speaker the way you'd talk to Alexa, except with full memory, knowledge, and action capabilities behind it. Speech-to-speech model handles the conversation; Genesis handles the thinking. S2S sessions are live now with session management, audio output, and optimized prompting.
 - **Ambient transcription** — continuous listening, transcription, and intelligence extraction. Decisions made, action items, names mentioned, topics discussed—captured and stored without explicit commands.
 - **Proactive awareness** — Genesis speaks up when it has something valuable to contribute. Hears you mention a broken deployment? It tells you. Detects emotional escalation in a conversation? It can offer to help.
-- **Genesis HTTP Tool API** — exposes Genesis's capabilities (memory, health, knowledge, actions) over HTTP, enabling any client—speech models, Home Assistant, external agents—to call Genesis tools directly.
+- **Genesis HTTP Tool API** *(live)* — exposes Genesis's capabilities (memory, health, knowledge, actions) over HTTP, enabling any client—speech models, Home Assistant, external agents—to call Genesis tools directly.
 
 The voice interface is built on Home Assistant as the frontend (wake word, mic, speaker) with Genesis as the cognitive backend. Ambient awareness adds a passive listening mode with a dedicated memory tier, privacy filtering, and a lightweight attention system that decides what deserves Genesis's attention in real time.
 
@@ -683,7 +700,7 @@ V3 was built solo. V4 and V5 are ambitious enough to need a community. If you've
 **The contribution surface** — the core is built to be extended. The four places to dig in:
 - **Memory subsystem** — 4-layer hybrid retrieval (Qdrant vectors + SQLite FTS5 + multi-factor scoring). Start at [Memory](#memory) · deep dive: [`memory-deep-dive.md`](docs/architecture/memory-deep-dive.md)
 - **Ego architecture** — the dual-ego autonomous cycle and the earned-autonomy trust model. Start at [How it thinks](#how-it-thinks) and [Earned autonomy](#earned-autonomy) · deep dive: [`autonomy-deep-dive.md`](docs/architecture/autonomy-deep-dive.md)
-- **Skills runtime** — the pluggable capability layer agents load at runtime. Start at [Modules](#modules)
+- **Skills and modules** — skills in `src/genesis/skills/` that sessions load on demand, and capability modules. Start at [Modules](#modules)
 - **MCP layer** — the four MCP servers (memory · recon · health · outreach) that expose Genesis's tools to its reasoning engine. See the [architecture docs](docs/architecture/)
 
 **Where to start:**
@@ -699,4 +716,4 @@ MIT License. See [LICENSE](LICENSE).
 
 ---
 
-<p align="center"><i>AGI is here. Clone it. Run it. Tell me what's missing.</i></p>
+<p align="center"><i>AGI is here.</i></p>

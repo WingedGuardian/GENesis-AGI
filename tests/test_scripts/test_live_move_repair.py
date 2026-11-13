@@ -337,9 +337,11 @@ def test_r1_the_backup_is_durable_in_its_parents_before_the_checkout_changes(w, 
     assert synced.index(str(w.gen / "deploy-backups")) > synced.index(backup)
 
 
-def test_r1_a_backup_that_fails_at_boot_leaves_the_server_to_start(w):
-    """Devin c4385592320: a backup that cannot be written (a full disk, a
-    permission) changed nothing in the checkout, so --boot exits 0."""
+def test_r1_a_backup_that_fails_at_boot_keeps_a_judged_mixed_tree_down(w):
+    """Devin c4385592320, as owner ruling Q2 (#3492 D2a-2) changed it: a backup
+    that cannot be written (a full disk, a permission) changed nothing in the
+    checkout, but the tree was judged half-written, so --boot exits 75 (the
+    server stays down) with one critical page; nothing is touched."""
     if os.geteuid() == 0:
         pytest.skip("running as root: the permission cannot be refused")
     killed_tag_side(w, "Z3")
@@ -351,13 +353,17 @@ def test_r1_a_backup_that_fails_at_boot_leaves_the_server_to_start(w):
         r = w.repair(mode="--boot")
     finally:
         root.chmod(0o755)
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert "nothing was changed" in r.stderr, r.stderr
+    assert r.returncode == 75, r.stdout + r.stderr
+    assert "could not start healing" in r.stderr, r.stderr
     assert w.snapshot() == before and w.state.exists()
+    alerts = w.alerts()
+    assert [a["severity"] for a in alerts] == ["critical"], alerts
+    assert alerts[0]["dedupe_key"].startswith("live_move_repair:boot:refused:"), alerts
 
 
 def test_r1_a_failure_after_the_checkout_changed_stays_fatal_at_boot(w, mod, monkeypatch):
-    """The other side of c4385592320: once _apply began, a failure exits 1."""
+    """The other side of c4385592320: once _apply began, a failure keeps the
+    server down (75 at boot) with one critical page naming the backup."""
     killed_tag_side(w, "Z3")
     real = mod._git
 
@@ -367,7 +373,11 @@ def test_r1_a_failure_after_the_checkout_changed_stays_fatal_at_boot(w, mod, mon
         return real(repo, *args, **kw)
 
     monkeypatch.setattr(mod, "_git", fail_at_restore)
-    assert mod.main(["--boot", str(w.state), str(w.root)]) == 1
+    monkeypatch.setattr(mod, "_LIB", str(w.kit()))  # main --boot checks the kit it runs from
+    assert mod.main(["--boot", str(w.state), str(w.root)]) == 75
+    alerts = w.alerts()
+    assert [a["dedupe_key"].split(":")[2] for a in alerts] == ["failed"], alerts
+    assert alerts[0]["severity"] == "critical" and str(w.backups()[-1]) in alerts[0]["body"]
 
 
 @pytest.mark.parametrize("window", ["before_clear", "before_finish"])
@@ -812,8 +822,9 @@ def test_td9_a_main_row_is_out_of_scope(w):
 
 
 def test_td16_a_kit_without_its_guard_skips_at_boot(w, tmp_path):
-    """T-D16: the kit cannot load its guard: boot exits 0 with a journal line
-    (the server starts as it would have before D), the command exits 1."""
+    """T-D16: the kit cannot load its guard: boot's self-check exits 3 with a
+    journal line (the unit shell starts the server and pages, #3492 D2a-2),
+    the command exits 1."""
     killed_tag_side(w, "Z3")
     kit = tmp_path / "kit"
     kit.mkdir()
@@ -822,7 +833,7 @@ def test_td16_a_kit_without_its_guard_skips_at_boot(w, tmp_path):
     boot = subprocess.run(
         [*argv, "--boot", str(w.state), str(w.root)], capture_output=True, text=True, env=w.env()
     )
-    assert boot.returncode == 0 and "nothing was changed" in boot.stderr, boot.stderr
+    assert boot.returncode == 3 and "incomplete or altered" in boot.stderr, boot.stderr
     cmd = subprocess.run(
         [*argv, "--command", str(w.state), str(w.root)], capture_output=True, text=True, env=w.env()
     )
@@ -2340,8 +2351,9 @@ def test_a_fifo_at_the_state_path_never_stalls_the_repair(w, mode):
     for every update and deploy. Read through the guard's bounded reader, it
     is an unreadable state: nothing to repair, at once."""
     os.mkfifo(w.state)
+    module = w.kit() / MODULE.name if mode == "--boot" else MODULE  # boot runs the kit
     r = subprocess.run(
-        ["python3", "-I", "-S", str(MODULE), mode, str(w.state), str(w.root)],
+        ["python3", "-I", "-S", "-B", str(module), mode, str(w.state), str(w.root)],
         capture_output=True, text=True, env=w.env(), timeout=30,
     )  # fmt: skip
     assert r.returncode == 0, r.stdout + r.stderr
