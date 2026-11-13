@@ -1950,12 +1950,19 @@ the shared banner is not an assertion about all concurrent sessions.
   without a password) `routes/health.redact_for_untrusted` drops each call
   site's `last_response` (the text its last model call returned; a site that
   had one carries `last_response_hidden: true`), the deploy checkout's file
-  names and probe error, and all of `live_repairs` but its counts. The Agent
-  Zero adapter's own copy of that route (`az_plugins/genesis/api_health.py`)
+  names and probe error, and all of `live_repairs` but its counts, then
+  reduces the rest to an allow-list (`_withhold_free_text`): numbers,
+  booleans and nulls stay, a string stays only under a key listed as a
+  status, name, id, commit or timestamp and only while it has that shape, and
+  every other string (error, reason, message, detail text) is replaced by
+  `<field>_hidden: true`, with `free_text_hidden: true` on the response. A
+  string field a producer adds later is therefore withheld until listed. The
+  Agent Zero adapter's own copy of that route (`az_plugins/genesis/api_health.py`)
   calls the same function. The in-process readers of the snapshot (the health
   MCP tools, ego context) are not affected. Both monitor pages show a note in
-  place of a withheld Last Response, which is every browser on an install with
-  no dashboard password.
+  place of a withheld Last Response and of a discarded item's reason or
+  error, plus a page-level note; the dashboard header shows the same note.
+  That is every browser on an install with no dashboard password.
 - **mcp/**: 5 Genesis MCP servers (health, memory, outreach, recon,
   discord-bot) + external codebase-memory; profile→server allowlist lives in
   `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool

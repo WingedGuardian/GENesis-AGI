@@ -123,9 +123,14 @@ isolation is still load-bearing for you — it is:
   `/api/genesis/backup/status` omits `destinations.tier2.target`, and
   `/api/genesis/backup/config` omits `local_path`, `nas` and `nas_user`.
   The health route (`/api/genesis/health`), which answers every network for
-  the host-side supervisor, does the same for the fields listed below: it
-  omits them, and marks a call site that had a response with
-  `last_response_hidden: true`. That route also serves them to a caller
+  the host-side supervisor, does the same for the fields listed below, and
+  goes further: it serves no free text at all. Every number, boolean and
+  null stays, and a string stays only where an allow-list names it as a
+  status, name, id, commit or timestamp and its value still has that shape
+  (a few code-written descriptions of call sites are the exception). Each
+  withheld string is marked `<field>_hidden: true` and the response
+  `free_text_hidden: true`, so a field a producer adds later is withheld
+  until someone lists it. That route also serves everything to a caller
   presenting the internal API token.
 
   **This is not the whole class, and it should not be read as one.** The
@@ -140,7 +145,11 @@ isolation is still load-bearing for you — it is:
   - the backup local path, share and username;
   - on the health route: each call site's `last_response` (the text its last
     model call returned), the deploy checkout's edited file names and its
-    probe error text, and the live-repair reports (their counts stay).
+    probe error text, the live-repair reports (their counts stay), and every
+    other string the allow-list does not name: exception and provider error
+    text, queue items' reasons and errors, MCP server errors, probe messages
+    and details, the sentinel's trigger reason, the bridge's summary, and
+    memory tags.
 
   Two properties of that list are easy to get wrong. It **nests rather than
   partitions**: the backup path, share and username are themselves registry
