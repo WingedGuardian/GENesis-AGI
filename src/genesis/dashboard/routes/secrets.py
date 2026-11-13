@@ -192,6 +192,13 @@ def _key_value(key_name: str) -> str:
     return val
 
 
+class SecretsFileMissingError(FileNotFoundError):
+    """secrets.env does not exist; the dashboard edits it but never creates it."""
+
+
+_MISSING_FILE_MESSAGE = "secrets.env does not exist yet; run scripts/bootstrap.sh to create it"
+
+
 def _update_secrets_file(updates: dict[str, str]) -> None:
     """Update keys in secrets.env atomically. Preserves comments and structure.
 
@@ -215,16 +222,15 @@ def _update_secrets_file(updates: dict[str, str]) -> None:
 
     path = secrets_path()
     if not path.exists():
-        # Create from example if missing
-        example = repo_root() / "secrets.env.example"
-        if example.exists():
-            path.write_text(example.read_text())
-            os.chmod(path, 0o600)
-        else:
-            path.write_text("")
-            os.chmod(path, 0o600)
+        # Edit only, never create. Bootstrap, install and restore are the only
+        # creators: a writer that cannot see an existing file elsewhere would
+        # otherwise make a template-shaped one that every reader then prefers.
+        raise SecretsFileMissingError(path)
 
-    lines = path.read_text().splitlines(keepends=True)
+    try:
+        lines = path.read_text().splitlines(keepends=True)
+    except FileNotFoundError:
+        raise SecretsFileMissingError(path) from None
     seen: set[str] = set()
     new_lines: list[str] = []
 
@@ -530,6 +536,9 @@ def secrets_update():
             "cleared": cleared,
             "needs_restart": True,
         })
+    except SecretsFileMissingError:
+        logger.warning("Secrets update refused: the file does not exist")
+        return jsonify({"error": _MISSING_FILE_MESSAGE}), 409
     except Exception:
         logger.error("Failed to update secrets", exc_info=True)
         return jsonify({"error": "Failed to write secrets.env"}), 500

@@ -95,9 +95,11 @@ class CriticalFailureCollector:
         if not self._probes:
             return self._reading(0.0)
 
-        results: list[ProbeResult] = await asyncio.gather(
-            *(probe() for probe in self._probes)
-        )
+        gathered = await asyncio.gather(*(probe() for probe in self._probes))
+        # A probe may answer None for "not applicable here" (probe_falkordb, on
+        # an engine that is neither armed nor selected): omitted, as its
+        # contract says, rather than read as a result.
+        results: list[ProbeResult] = [r for r in gathered if r is not None]
 
         if any(r.status == ProbeStatus.DOWN for r in results):
             value = 1.0

@@ -50,6 +50,23 @@ VALID_VERDICTS: frozenset[str] = frozenset({
 })
 
 # ---------------------------------------------------------------------------
+# Action normalisation
+# ---------------------------------------------------------------------------
+
+
+def normalise_action(action: str) -> str:
+    """Canonical routing key for a recommendation action.
+
+    Shared by the parser's missing-``why_not_adopt`` warning,
+    ``Recommendation.is_actionable`` and InboxMonitor's follow-up routing:
+    every consumer must agree that ``adapt_``/`` ADAPT ``/``adapt`` are one
+    action, or an action can be routed one way and warned about another way
+    (#4335).
+    """
+    return action.casefold().replace("_", " ").strip()
+
+
+# ---------------------------------------------------------------------------
 # Dataclass
 # ---------------------------------------------------------------------------
 
@@ -83,11 +100,13 @@ class Recommendation:
     # Context
     item_title: str = ""
     classification: str = ""  # "genesis" or "user"
+    # Evaluator explanation only; missing rationale never changes routing.
+    why_not_adopt: str | None = None
 
     @property
     def is_actionable(self) -> bool:
         """True when this recommendation should produce a follow-up."""
-        return self.action.lower().replace("_", " ") not in _SKIP_ACTIONS
+        return normalise_action(self.action) not in _SKIP_ACTIONS
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +195,13 @@ def parse_recommendations(evaluation_text: str) -> list[Recommendation]:
         # Extract item title from the ## heading
         title = _extract_item_title(section)
 
+        why_not_adopt = data.get("why_not_adopt")
+        why_not_adopt = (
+            why_not_adopt.strip() or None if isinstance(why_not_adopt, str) else None
+        )
+        if normalise_action(action) == "adapt" and why_not_adopt is None:
+            logger.warning("ADAPT recommendation missing usable why_not_adopt rationale")
+
         rec = Recommendation(
             action=action,
             next_step=next_step,
@@ -217,6 +243,7 @@ def parse_recommendations(evaluation_text: str) -> list[Recommendation]:
             ),
             item_title=title,
             classification=classification,
+            why_not_adopt=why_not_adopt,
         )
         results.append(rec)
 

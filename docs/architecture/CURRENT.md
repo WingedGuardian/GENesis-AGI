@@ -147,6 +147,76 @@ Easy-to-forget mechanisms:
   (`memory/corrective.py`), which runs inside those tools — so the internal
   runtime stack and the hermetic LongMemEval harness (both pass explicit
   `rerank` kwargs) are unaffected.
+- **A credential reference's value and description are held out of its own
+  indexes** (#2426). For `reference.credentials`, `ingest_knowledge_unit` (the
+  one chokepoint every reference writer passes) indexes only the header (the
+  identifier), `[description held in the reference secret store]`,
+  `Value: [held in the reference secret store; read it with reference_lookup]`
+  and the Tags/Captured trailer (`reference_ops.split_secret`), so the unit's
+  knowledge_units and knowledge_fts rows, its memory_fts row, the Qdrant payload
+  and the embedding never see the value or the free-text description (no
+  scrub of free text: owner ruling, every spelling was another way through).
+  The identifier, tags, authority and provenance are not scrubbed. The value is
+  probed whole and by its fragments: percent-decoded, NFKC-normalised, split on
+  whitespace and `: / @ ? & = # ; , | \ < > " ' ( ) { } [ ]` (so a URL, DSN,
+  key=value, XML or pipe-separated password is a fragment of its own), leaving out host names, URL schemes and ports, and keeping each
+  secret-shaped fragment; matching is normalised (NFKC, format characters
+  removed, casefolded) and percent-decoded. An identifier, body header, or
+  ANY other caller field that can reach a store (authority, memory class,
+  purpose, ingestion source, and every provenance value, nested or not, each
+  read as text by `knowledge_ingest.field_text` and leaf by leaf) that carries
+  a probe refuses the write (`reference_ops.refuse_value_in_fields`; the
+  identifier with its own message, and the `[reference.credentials] {identifier}`
+  header by the identifier rule only when it is exactly that header). A caller
+  tag that carries a probe is dropped whole, from the tags and the body's Tags
+  line, and the write goes on (`reference_ops.drop_value_tags`), so a heuristic
+  match on an ordinary tag costs that tag, never the capture. Stated limits: a
+  secret that reads as a plain word (all letters, or under four characters) is
+  matched only as the whole value, and so is a fragment that is all digits or
+  shaped like a host name (dotted labels ending in letters). A credential's memory class becomes an
+  indexed tag, so it must be None or a known class (`classification.CLASS_WEIGHTS`).
+  The value and the description (`detail`)
+  go to one insert-only `reference_secrets` row under a fresh random id, and ONE statement
+  then writes the unit naming it in `knowledge_units.secret_ref`, so a body and
+  the secret it names are always one writer's pair on a connection that
+  serializes statements, not transactions. The `knowledge_units_secret_ref_*`
+  triggers refuse a credential unit naming no stored secret and delete the
+  secret a unit stops naming (repointed or deleted);
+  `knowledge_crud.sweep_orphan_secrets` (after every delete, and at boot)
+  removes secrets older than an hour that an interrupted upsert left unnamed.
+  `ingest_knowledge_unit(insert_only=True)` and `knowledge_crud.upsert(insert_only=True)`
+  never change an existing credential key (a different value raises
+  `CredentialKeyTaken`); no writer passes it yet: it is the mechanism a later
+  change wires the extraction job's auto-capture to.
+  Two `knowledge_units` triggers refuse a
+  credential body without exactly one placeholder line, whichever process
+  writes it (text on a later line only the Python check sees).
+  A re-ingest carrying a placeholder keeps what the key already holds for it:
+  both placeholders keep the secret row; a new description with the value
+  placeholder writes a new row with the stored value; a new value with the
+  description placeholder keeps the stored description. A credential write never shares a vector point
+  (`MemoryStore.store(..., dedup=False)`), and a point it created that no unit
+  names when the write ends (refused, failed or cancelled) is deleted, so no
+  stale-point cleanup can delete a point a unit names. The credential upsert
+  is a compare-and-swap against the ingest's own earlier read of the key
+  (`knowledge_crud.KeyObservation`: absent, or the secret and point it named),
+  checked inside the one statement that writes the unit, so a same-key writer
+  in another process that commits in between makes it write nothing
+  (`CredentialKeyChanged`); the ingest then re-reads and runs once more, and
+  a second change reaches the caller.
+  Only `reference_ops` reads the secret row: `compose_body` puts the value and
+  the description back for `reference_lookup` (behind its audit log),
+  `reveal_reference` returns both for the dashboard's reveal, and
+  `resolve_value` the value alone. When a unit was repointed after its row was
+  read, they re-read the unit's current body, value and description with one
+  statement (`knowledge_crud.get_reference_pair`), so a body never comes back
+  beside another write's secret. A credential is therefore found by its
+  identifier and tags only; the dashboard list shows the description placeholder. Identifier kinds (url, network,
+  account, fact) keep their value in the body, because it is what their lookups
+  search for. NOT covered yet: the episodic memory the extraction job stores
+  for the same conversation text, which still carries an auto-captured value.
+  Credentials stored before this change keep their value inline until the
+  follow-up migration rewrites them; both readers parse those as before.
 - **`drift_recall`** (`memory/drift.py`) is the degraded-mode fallback; its
   FTS drilldown searches every collection in `source_collections`,
   rank-merged across collections.
@@ -269,8 +339,29 @@ snapshot is fixed at the first SELECT step, so stamping afterwards can pin a
 projection that is missing a mid-load commit (MEASURED 2026-09-06). That preparation is now
 used: `graphstore_falkor.FalkorGraphStore` is the second implementation, a
 long-lived FalkorDB server reached over a unix socket, selected by
-`config/graphstore.yaml` (`mode: networkx|falkordb`, default **networkx**, so
-the lever is inert until moved). It carries its own projection of
+`config/graphstore.yaml` (`mode: networkx|falkordb`, shipped default
+**falkordb** since the cutover bar was met: 14 days on a live install with zero
+fallbacks). The default applies **where present only**:
+`graphstore_config.selection()` keeps reads on NetworkX QUIETLY when `falkordb`
+comes from the shipped file alone (no overlay sets `mode`) and no
+`genesis-falkordb.service` unit is rendered and enabled (its `default.target.wants` link), publishing the selection with
+`quiet_reason="engine_not_provisioned"` and no error, so the telemetry row is
+neither a fallback nor a clock break (`graph_cutover.is_quiet_row`; a row only
+partly quiet still breaks). An overlay `mode: falkordb`, and a unit that exists
+but is stopped or failed, stay loud. `probe_falkordb` joins the steady-state
+critical-failure probes when the unit is enabled or the selection says
+falkordb, an overlay choice included (`runtime/init/learning.py`, decided at
+server start). Bootstrap and install
+arm the unit after rendering it from a verified engine (`falkordb_enable_unit`):
+`enable --now` when it is inactive or failed, a plain `enable` when it is
+running and disabled (a running engine is never started or restarted), nothing
+when masked or listed in `~/.genesis/config/disabled_timers`; a failed start is
+one WARNING line, never a failed bootstrap. The graphstore dashboard save
+writes only the keys that changed, so an unrelated save never pins `mode`
+into the overlay: the editor sends back what it showed (`__shown`) and a key
+is written when it differs from that, type included; a client with no
+snapshot is compared against the merged config (`routes/settings.py`
+`_changed_keys`). It carries its own projection of
 `memory_links` and applies the SAME visibility predicate — but at QUERY time,
 over mirrored `invalid_epoch`/`deprecated` node properties, which closes the
 future-`invalid_at` gap the NetworkX store states below. That closes the TIME
@@ -312,9 +403,19 @@ then rolls back when bootstrap refuses). The unit is `Type=simple` with a PING r
 poll, because the wheel's redis has no libsystemd to notify with, and a deploy
 moves an engine onto a different module only when systemd reports it inactive
 or failed (a running engine, or one whose state cannot be read, keeps its unit)
-or `GENESIS_FALKORDB_SWITCH=1` asks for it.
+or `GENESIS_FALKORDB_SWITCH=1` asks for it (on a running install through
+`update.sh --take-template genesis-falkordb.service`, since bootstrap refuses
+under a live server; then restart the unit).
 The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
-(`memory/graphstore_project.py`); that schedule is its staleness bound. The
+(`memory/graphstore_project.py`); that schedule is its staleness bound. Because
+`install.sh` starts the engine before genesis-server has created the database
+(bootstrap seeds it first), `install.sh` projects once after it starts the
+server, when the engine is active: it waits up to 120 s for the two tables
+the projector reads, then starts `genesis-graph-project.service`; a timeout
+leaves it to the hourly run. The graph-engine probe membership is decided at
+server start, so a
+`mode` change made live joins or leaves the critical-failure probes at the
+next restart. The
 engine keeps no data on disk, so its unit also (re)starts the projector on
 every start, restarts included; a projection already running against the
 engine that just died is stopped and run again (`ExecStartPost`, issue #3035): a restarted engine is
@@ -399,7 +500,13 @@ census does not read is carried: each row records `secrets_digest`, a hash of
 the six keys it reads, and the next census proves a changed file whose current
 values hash the same for the same pid and start (`carried: true`; the latest
 census row only; never when the file names `SECRETS_PATH` or
-`GENESIS_REPO_ROOT`)), and its database
+`GENESIS_REPO_ROOT`); the file is the one the resolver picks now, and a
+fallback past an absent `~/.config/genesis/secrets.env` counts only when that
+directory and every symlink on its path are unchanged by ctime since the server
+started, since a changed one may have held the file it loaded (#4278), and a
+fallback from another checkout's file to `~/genesis/secrets.env` is unknown;
+nothing else in `~/.config` is read),
+and its database
 scope (the primary database is fixed at import from the exec env or the root
 default, and a path in the file becomes a second one; `foreign` only when every
 one of them differs from the live database by `(st_dev, st_ino)`, no symlink on
@@ -558,15 +665,25 @@ shares the OAuth-compatible readiness helper. `cc_fallback` is a non-routing
 **Fallback** observation in the neural monitor for conversations and managed
 turns; actual committed outcomes, not readiness alone, establish success.
 
+Contained native peer requests take a separate public-context constructor before
+private profile/identity/MCP builders. Explicit tools-free and exact-facade
+invocation modes share owned scopes, helper processes and the receipt deadline.
+The complete managed operation isolates provider observations and private
+diagnostics, while ordinary same-owner work keeps its current behavior. Failed
+drain retains native ownership; no contained transcript pointer is fabricated.
+This primitive does not grant foreign admission; its consumer is separate.
+See `docs/reference/peer-execution.md`.
+
 Ordinary streaming and readiness share final-effective quota classification:
 allowed/warning and explicitly usable overage are not refusals, and a later
 allowed event supersedes a rejection. Result and no-result streaming paths
 preserve usable answers, real refusal health and dropped-output replay guards.
 
+
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: a8fa35a35 2026-10-23
+verified: b321bb634 2026-11-07
 ```
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
@@ -1080,6 +1197,17 @@ verified: a8fa35a35 2026-10-23
 - `cc/context_injector.py` (memory→session injection) lives HERE, not in
   memory. GROUNDWORK: `reflection_bridge/_bridge.py` (v4-executor),
   `session_config.py` (hook-inheritance).
+- **Light-reflection topic repeats (development candidate)**: the bridge stores
+  every reflection output, then suppresses a light-topic summary or posts a
+  periodic stub only when the model sets `material_change` false; an absent or
+  true flag posts. A local overlap floor guards that flag: changed negated text,
+  changed multi-chunk text, code fences, parse fallbacks and low overlap with
+  the last full post still post.
+  A manager-local Light-topic lock spans history through send persistence;
+  unrelated categories retain their independent delivery. History uses
+  insertion order so a current stub supersedes an older future-dated row. Unknown history posts; deep and
+  strategic topic delivery retain their direct path. Installed verification is
+  still outstanding.
 - **Background-wait ceiling ownership** (invoker.py): the CLI's headless
   `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` (default 600s) SIGKILLs a dispatched
   Workflow/subagent mid-run with a partial result. `CCInvocation.bg_wait_ceiling_ms`
@@ -1432,7 +1560,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: a6528dab2 2026-11-09
+verified: f62608045437 2026-11-09
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -1442,9 +1570,23 @@ verified: a6528dab2 2026-11-09
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
   contrast the intake bypass in entry 4.
 - **inbox/**: file-drop monitor with approval-gated dispatch.
+  Explicit owner-requested disposition review uses the manual-only Tier-1
+  `inbox-review` skill, reached by the attended-request pointer in `CLAUDE.md`.
+  Its read-only `scripts/inbox_review_rulings.py` helper enumerates exact-tagged
+  retained FTS history in a snapshot, including uncertain metadata, without
+  ranking, authority adjudication or writes. The workflow uses existing memory
+  and per-review outcomes documents; it adds no ledger or automatic evaluation.
+  Activation prerequisites and deterministic/native validation limits are in
+  `docs/reference/owner-inbox-review.md` (verified: 2026-11-09).
   `monitor.py` owns scanning, approval, retries and baseline writes;
   `batch_runner.py` executes one approved batch and post-processes its output,
-  reached through the monitor's `_run_one_batch` forwarding method. Before any
+  reached through the monitor's `_run_one_batch` forwarding method. Its manager
+  session scopes only the invoker/retry await, stamping child environment and
+  invocation-failure attribution. The prior task context is restored before
+  handlers, postprocessing and detached work; explicit follow-up transcript IDs
+  retain their namespace. This does not grant supervision or change external
+  provenance, approvals or replay policy. See `docs/reference/inbox-session-attribution.md`.
+  Before any
   DB, approval, response, or baseline mutation, it composes and validates one
   deterministic system prompt from `INBOX_EVALUATE.md`, the complete
   `evaluate` skill, the complete `user_evaluate` skill, and an explicit
@@ -1459,6 +1601,9 @@ verified: a6528dab2 2026-11-09
   a guarantee of memory correctness. Reuse and
   deliverable-backed BUILD/adoption boundaries are described in
   `docs/reference/inbox-evaluation-quality.md`.
+  ADAPT output requests an explicit `why_not_adopt` explanation; the parser
+  preserves its optional string and warns on missing usable rationale without
+  changing existing recommendation routing or build ownership.
   The phase order is prompt preflight → recover pending → resume approval →
   detect → create → dispatch;
   `approval_key_stable=True` (ONE
@@ -1486,6 +1631,13 @@ verified: a6528dab2 2026-11-09
   and matching backtick runs. Literal terminal punctuation and repeated tokens in different
   contexts retain their own identities. The read-only coverage report retains
   these occurrences too; it does not reconstruct coverage from normalized URLs.
+  It separately reports stored input, baseline-only membership, whole logical
+  items, response presence and Source/mention evidence; strict decoding rejects
+  corrupt v2 inputs as a whole. These are retained-evidence facts, not proof of
+  source acquisition or model judgment; see `docs/reference/inbox-coverage-evidence.md`.
+  Its output guard protects every inbox file the monitor may evaluate (any type), retained response targets and the
+  database and its SQLite companions by resolved path and existing file identity, independently of report
+  selection; an existing output directory receives a generated report filename.
   An ordered proof finds the first source-frame closure; ambiguous tokens stay
   raw and cannot supply wrapper context for later URLs.
   The wrapper correction is scoped to this URL path; the entry's existing
@@ -1503,7 +1655,8 @@ verified: a6528dab2 2026-11-09
   can carry share tokens — while a storm alert names the file only. The retry-lane storm site
   abandons only URL-failure rows. An approval that ends unanswered (`approval_ended:`)
   does not spend a retry and leaves the row an ordinary retriable failure, so
-  the same row is asked about again; with `resilience.parking_mode:
+  an identifiable unchanged batch keeps its retry budget when asked about again;
+  with `resilience.parking_mode:
   live`, a network outage (`CCNetworkOfflineError`) does not spend retries. Follow-up and
   build-lane durable writes finish before the completed baseline commits, so a
   cancellation cannot permanently hide their absence. On restart every
@@ -1511,6 +1664,12 @@ verified: a6528dab2 2026-11-09
   complete outstanding work is re-derived from the current source and completed
   baseline, so a crash during multi-row creation cannot silently lose the
   never-created tail or leave pending rows suppressing the file forever.
+  Retry reuse matches the complete ordered logical batch, with the queue's
+  existing tracking normalization and preserved annotations. Missing, corrupt
+  or regrouped identities get fresh bounded rows through normal approval while
+  old history remains. Both creation and reuse atomically reject newly ineligible
+  selected history, including unmatched rows; lost writes discard the whole
+  in-memory drop, leaving partial durable rows for restart recovery.
   Replay-unsafe batches persist a hold independent of the retry cap; readable
   held blocks are excluded from future deltas without becoming completed
   baseline content, while unreadable holds block their source file. The
@@ -1653,6 +1812,14 @@ entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
 verified: 6b4f275 2026-11-08
 ```
+
+Scoped verification: internal `mcp/shared_http` composition only. It receives
+initialized request-owned resources and supplies SDK transport limits, app-wide
+authority/authentication, per-message caller/profile binding, shared/local
+ancestry admission, nonblocking tool capacity and authenticated version/catalog
+status. No launcher selects it; owned bootstrap, native clients and rollout
+remain separate. See `docs/reference/shared-mcp-http.md`. That scoped check
+(5a3de4eee, 2026-11-08) does not requalify the other channels/interfaces subsystems.
 
 The neural monitor includes the non-routing **Fallback** observation, and the
 dashboard labels the shared fallback indicator as last successful/observed use.
@@ -2118,7 +2285,12 @@ the shared banner is not an assertion about all concurrent sessions.
   remain visible and leave the existing reaper as fallback.
   Hosts can declare `output_surface="speech"`; identity injection
   then requests direct spoken replies without terminal model/effort headers.
-  Phase 0 host: `scripts/live_agent_cli.py`; only the `owner_cli`
+  Hosts: `scripts/live_agent_cli.py` for a direct terminal, or the opt-in
+  `genesis-live-agent.service` with a private Unix control socket and
+  `scripts/live_agent_attach.py` owner client. Detaching preserves the agent;
+  reconnect sends current state/full pending asks, not event history. Slow
+  controllers disconnect rather than accumulate unbounded delivery queues.
+  The unit renders without default enablement. Only the `owner_cli`
   initiator may call `turn()` until model-initiated turns pass the
   autonomous-CLI approval gate. Turns the session injects itself
   (background-task notifications, peer or scheduled messages) still run, as in
@@ -2290,7 +2462,10 @@ verified: 4721e0d93 2026-11-07
   whole page. Locked appends sequence timestamps within a 300-second future
   window; inadmissible clock outliers remain on disk until eligible, with a
   new bounded stream after a large clock reset. Host redeploy and installed
-  conversation-history verification remain outstanding.
+  conversation-history verification remain outstanding. The `test-alert`
+  gateway verb (`--test-alert`) sends one INFO test alert through the same
+  dispatcher, never queued, and prints one JSON line, so a delivery can be
+  triggered on demand and its history row checked.
 - **Snapshot deletion window** (`guardian/deletion_window.py`): routine
   snapshot deletions (the superseded healthy snapshot, prune, and what incus
   would expire before the next window) wait for `snapshots.deletion_window`,
@@ -2397,6 +2572,20 @@ verified: 4721e0d93 2026-11-07
   `live_repair_unresolved` reads the newest READ one, and
   Telegram alert fields are cut before escaping. Residual: a container that
   fakes git's own output can still pass the probe.
+- **`RESTART_SERVICES` waits for systemd's own start** (#3492 D2): it reads
+  genesis-server's `ActiveState`, `SubState` and `InvocationID` first. A unit
+  still `activating` gets no command, because its start step may be the boot
+  repair healing the checkout, and a restart would SIGTERM it. A `failed` or
+  `inactive` unit gets `start --no-block`, an active one `restart --no-block`.
+  The result is then judged by the unit, polled every 5 s for up to 200 s by the clock (a
+  stop, a start step and RestartSec at the unit's 90 + 90 + 10 s): success
+  only once a new invocation is `active`, since just after a `--no-block`
+  restart the old process can still read active. Three unreadable reads in a
+  row end the wait, and a unit at its start limit (`Result=start-limit-hit`)
+  is reported at once with that named. A client timeout on the
+  command is not a failure in itself. A unit that fails or never comes up is
+  reported with its state and the boot repair's newest `live-move repair:`
+  journal line (cut to 400), and that report is the recovery-failed page.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
   `scripts/update.sh` / `guardian-gateway.sh` (the host-deploy gate in the dev
   skill). Known wart: the watchdog's stale-alert wording inverts when the
@@ -2820,6 +3009,20 @@ verified: c712f1bde 2026-11-06
   idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
   one is age-based and passive. `session_awareness/repo_pulse*.py`.
+- **Holdout scenarios** (shipped; per-install data, none in the repo): hidden
+  exact checks that builders never see, in `$GENESIS_HOME/holdout/HOLDOUT.md`,
+  written only by the `holdout-writer` subagent (regression scenarios from
+  today's behaviour, or intent scenarios from a specced issue before it is
+  built). `scripts/holdout_runner.py --pr N` runs each touched scenario at the
+  merge's first parent and at the merge, prints ids, verdicts and `Protects`
+  lines only, and the validating-merges skill ("The holdout check") maps the
+  verdicts into the evidence document. The session observer records nothing for
+  that subagent, so its work stays out of memory. An advisory hook,
+  `scripts/hooks/holdout_fence.py`, records any other agent reaching the
+  directory or receiving its text, and the runner names the scenarios those
+  exposures may have spoiled. An install without the file
+  has no holdout and the runner says so. Format and rules:
+  `docs/reference/holdout.md`.
 - **Post-merge verification obligations** (shipped; producer automatic; consumer
   the standing validator session, started only on the owner's explicit
   instruction and self-paced once started, per the validating-merges skill's
@@ -3863,6 +4066,16 @@ verified: 9a95483a8e7f 2026-10-09
   (`gemini-flash-latest`) is declared but unchained: it resolved to 3.8 Flash
   (same model and quota as `gemini-free`), so it joins the chains only once it
   resolves to a different model.
+- **litellm loads on first use, not on import** (#3558): `litellm_delegate`
+  imports it inside `_litellm()` on the first `LiteLLMDelegate.call()` (in a
+  worker thread) and registers `_CUSTOM_MODEL_COSTS` then. So importing
+  `genesis.routing`, loading the routing config, the onboarding floor check and
+  building the standalone router all stay litellm-free: the SessionStart charter
+  hook and the standalone MCP servers no longer pay its multi-second import. The
+  server keeps importing it at startup (`runtime/init/router.py` calls
+  `litellm_delegate.warm()`). Patch `litellm_delegate.litellm` as before; never
+  re-add a module-level `import litellm` (locked by
+  `tests/test_routing/test_litellm_lazy.py`).
 - **Coherent routing reloads** (`Router.reload_config`,
   `LiteLLMDelegate.for_config`): requests capture config/delegate/pacing/breaker
   bindings before yielding. Replacement/rename breakers preserve holds while
@@ -3977,7 +4190,13 @@ verified: 9a95483a8e7f 2026-10-09
   external mutator of breaker state is the dashboard toggle
   (`dashboard/routes/providers.py`), and it goes through `force_open()` /
   `force_close()` rather than assigning private fields, so the origin flag
-  cannot drift out of step with the state. Both are COMPLETE transitions --
+  cannot drift out of step with the state. It picks between them from the
+  operator's intent (the dashboard posts `{"enabled": <bool>}`, the action its
+  button showed), and without one from the raw `_state` field: never from
+  `.state`, whose read moves an expired OPEN to HALF_OPEN and once turned an
+  "enable" on an expired hold into a fresh disable. (Known limit: with no
+  intent, a breaker a reader has already moved to HALF_OPEN is disabled, the
+  button a fresh dashboard shows for it.) Both are COMPLETE transitions --
   they notify (which is what the registry wires to `save_state`) and clear the
   qualifiers they invalidate. They are complete with respect to
   BREAKER FIELDS only — neither fires `on_recovery`, so an operator re-enable
@@ -4088,6 +4307,12 @@ A 2026-11-07 verification at the same commit covers the request-ownership
 prerequisite below; the other platform descriptions retain their individually
 cited verification dates.
 
+Shared validator-health also has a request-local automatic activity-write opt-out
+around the entire message boundary. It preserves memory counters and the
+construction-time persistence hard opt-out, without suppressing queued ordinary
+flushes or validator-memory records. This does not strengthen batch durability
+or make the service read-only.
+
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
 provider/model/outcome. Failed historical attempts render as a warning, not an
 inferred current provider outage. The readiness worker uses the shared
@@ -4131,6 +4356,13 @@ Validator calibration settings validate the tracked base and prospective strict
 overlay before reporting success or writing. Invalid/unreadable configuration
 refuses with a clear message; no overlay is repaired or discarded implicitly.
 Refusing a proposed update preserves a previously valid opt-in.
+
+Explicit private execution marks escaping exceptions without changing their
+types, arguments or causes. Automatic span errors inspect that provenance before
+formatting; the shared execution/span-writer diagnostic filters also cover
+marked causes, contexts and exception groups after the task-local scope exits.
+Ordinary diagnostics remain readable. This covers the named emitters, not every
+logger or unrelated exceptions with copied text and no provenance.
 
 - **payments/**: the encrypted card vault, virtual cards only.
   `python -m genesis vault init|add|list|retire|migrate|status` (`payments/cli.py`);
@@ -4682,9 +4914,14 @@ Refusing a proposed update preserves a previously valid opt-in.
   check under it and remove a marker only when its holder is dead or theirs.
   Exception: `bootstrap.sh`'s crash recovery still removes it unconditionally.
   `secrets_path()` delegates to the stdlib-only `secrets_location.py`, mirrored
-  by `scripts/lib/secrets_path.sh`: `SECRETS_PATH` if set, else the checkout's
-  `secrets.env` (unchanged). Disk hygiene's store knobs, bootstrap and the eval
-  loaders keep their own rules for now.
+  by `scripts/lib/secrets_path.sh`: `SECRETS_PATH` wins; otherwise an existing
+  `~/.config/genesis/secrets.env` wins over the checkout and `~/genesis`
+  legacy files. With no file, the default is still the checkout's file; the
+  default switch, the unit files and creating the home config are the
+  migration's. Missing credentials at startup queue a critical alert. Guardian
+  check/restore and passphrase resolution, the graph census proof, disk
+  hygiene's store knobs and the eval loaders all take that one answer, and the
+  secrets guard protects the home-config file, its folder and their aliases.
 - **Managed systemd user units** (deploy scripts, no `src/genesis` module):
   `bootstrap.sh` renders `scripts/systemd/*.template` and `setup-vnc.sh`
   renders `scripts/systemd/vnc/` into `~/.config/systemd/user`, both through
@@ -4770,12 +5007,16 @@ Refusing a proposed update preserves a previously valid opt-in.
   count there, one anywhere else (the rebuild having moved nothing) `holds`. A "merging"
   row on `live` whose record update.sh already dropped (it adopted the tip,
   own_head is that tip) is judged the same way toward own_head, so a rollback
-  killed partway after adoption is caught too. The remedy follows HEAD: on a
-  live row at the tag, the repair (`scripts/deploy_candidates repair-move`,
-  below), then the by-hand steps for when its kit is not installed; at the update's new code (main's merge or the rebuilt tip), put the
-  paths back and finish with `--post-merge` (Dismissing there leaves code
-  bootstrap never ran on); a main row at the tag keeps the by-hand text (save,
-  restore, Dismiss). The dashboard's progress poll returns the guard's remedy
+  killed partway after adoption is caught too. On a live row the remedy is the
+  repair (`scripts/deploy_candidates repair-move`, below) whichever end HEAD is
+  at: at the tag, followed by the by-hand steps for when its kit is not
+  installed; on `live` at the rebuilt tip (a rollback killed partway), it
+  finishes that rollback toward the tag, with `repair-move --explain` as the
+  by-hand steps, and never `--post-merge` (Dismissing there leaves code
+  bootstrap never ran on). At main's merge, put the paths back and finish with
+  `--post-merge`; a main row at the tag keeps the by-hand text (save, restore,
+  Dismiss). Both live texts name `repair-move --restore <ts>` as the way back
+  for a path that was not the update's. The dashboard's progress poll returns the guard's remedy
   (`guard_remedy`) and the update card shows it. `deploy_code_only.sh` and the live engine refuse to
   restart or move the checkout while it guards; a plain `update.sh` exits 5
   (before tagging or writing anything), and the dashboard's `/apply` answers
@@ -4888,9 +5129,9 @@ Refusing a proposed update preserves a previously valid opt-in.
   server start, is PR D2, not yet built; `--explain` needs no kit: with none
   installed it runs the module as HEAD committed it, from memory, never the
   working tree's copy, which may itself be half-written) heals a live row's `mixed_tree`
-  with HEAD at the rollback tag, toward the tag, never toward the target (HEAD
-  at the target, a rollback killed partway, is refused with exit 1 and nothing
-  changed: finishing that rollback is a later PR, D1f): under update.lock and
+  toward the rollback tag, never toward the target (with HEAD on `live` at the
+  target, a rollback killed partway, PR D1f also finishes that rollback, below;
+  HEAD anywhere else off the tag is refused with exit 1): under update.lock and
   genesis-checkout.lock (every git lock a killed switch leaves, `index.lock`,
   `HEAD.lock`, the branch's ref lock and `packed-refs.lock`, is waited for while
   a process holds it, then saved into the backup's `git/` and removed by one
@@ -4940,7 +5181,60 @@ Refusing a proposed update preserves a previously valid opt-in.
   never from the copy). The alert body is cut at 16 KiB, with how much was
   left out and a pointer to `REPAIR.json`, because one argv or environment
   string of 128 KiB or more is E2BIG (MEASURED); a queue that fails is
-  logged and never changes the exit code. A failure before the checkout itself changes (a
+  logged and never changes the exit code. With HEAD on `live` at the target
+  (D1f), after that restore (a prefix of the tag's bytes counting as the
+  rollback's own interrupted write) `REPAIR.json` records `hooks: "pending"`,
+  then `live` moves from the target to the tag by compare-and-swap (`git
+  update-ref`, old value the target; a lost swap is `unresolved`, exit 1, the
+  ref untouched), then the tag's own `scripts/deploy_candidates.py
+  restore-hooks <target> <tag>` runs with update.lock's fd and under the
+  checkout lock, as update.sh's rollback runs it (`hooks` becomes `ok`; a
+  failure leaves it `pending`, said in the output, and the alert is
+  critical). When restore-hooks fails and the moved-from commit's
+  `scripts/hooks` cannot be read (the commit, a tree or a blob there gone: no
+  retry could ever restore from it), the repair reinstalls the tag's hooks
+  instead: every installed regular-file hook the tag's sync-hooks.sh lists
+  whose bytes are not the tag's (a candidate's, or a hand-edited one; a
+  symlinked or unlisted hook, or one already the tag's, is left alone) is
+  copied into the report's `hooks-before/` (0600, never over an earlier copy,
+  made durable; the report dir and `hooks-before/` must be this user's 0700
+  directories, on the retry path too, or nothing is touched), the names are
+  written to REPAIR.json's `hooks_before` with a note naming the folder ("not
+  reinstalled yet"), and only then removed; then the tag's own `restore-hooks
+  <tag> <tag>` has sync-hooks.sh install them fresh and judges them as
+  readiness does. Between that removal and the install no such hook is
+  installed (seconds; accepted: a failure there leaves the record, and the
+  next run converges). On its exit 0 `hooks` is `reinstalled` (not pending:
+  the hooks count and keep no longer apply), `hooks_note` says so, and the
+  output and an alert (critical when hooks were moved aside) name the folder.
+  A report whose `hooks_before` is set is kept by the prune and counted in
+  `live_repair_hooks_saved:<n>` until `--dismiss` (it may hold a hand edit's
+  only copy). A hook only the moved-from commit listed stays installed. With core.hooksPath
+  pointing away from `$GIT_COMMON_DIR/hooks` nothing is touched and the hooks
+  stay pending (readiness names that setting). Every later run first re-reads
+  each pending report (through `load_report`; a DISMISS_MARK folder is
+  skipped) under both locks, before its heal, and judges it against the refs
+  as it found them: `superseded` once `live` itself left the report's tag;
+  owed while `live` is that tag and HEAD is on `live` (HEAD elsewhere: left
+  pending; an entry whose commits are not full commit ids: left as it is).
+  An owed report's restore-hooks runs only after the heal, and only when the
+  tree then reads SAFE (no state, or one the guard calls SAFE), judged again
+  first since the heal may have moved `live` (#4367): restore-hooks runs the
+  checkout's engine and sync-hooks.sh, which a half-written tree may hold
+  another commit's bytes for and a held one a hand edit. A forward heal's own
+  restore-hooks runs inside the heal, once the files are the tag's, as
+  before. Each retry writes back only `hooks` (0600); a report
+  dismissed with `dismissed_at` is still retried while its folder exists
+  (dismissal ends only its count and its keep). One report's retry failing
+  (its write, say) is logged and never stops another report's retry.
+  `--dismiss` and a restore take update.lock too, so neither's field is lost
+  (every REPAIR.json writer holds it); with no state file and update.lock
+  held it exits 0 at once. The restore-hooks run is not bounded by the boot budget;
+  that is PR D2's, which wires `--boot`. With the target's objects gone in
+  the forward case, the whole-tree fallback and a torn index's rebuild read
+  the tag, never HEAD (the target). After a forward heal HEAD is the tag on
+  `live`, so `--restore <ts>` judges its foreign paths as after any other
+  repair. A failure before the checkout itself changes (a
   failed backup included) exits 0 at `--boot`. The guard then judges
   again and only its SAFE removes the state (byte-identical re-read); `guards`
   or `holds` (an edit off the move's paths) keeps it, its result naming the
@@ -4949,7 +5243,7 @@ Refusing a proposed update preserves a previously valid opt-in.
   `holds`, not `mixed_tree` again; anything
   else is `unresolved` (exit 1). A target whose objects are
   gone (its root tree, or any subtree or blob classification reads) is healed
-  by the whole tree against HEAD and cleared by a clean-tree
+  by the whole tree against the tag and cleared by a clean-tree
   check. A main row is out of scope (exit 3; 0 at `--boot`). The engine
   writes its merges with `core.fsync=committed`. Each repair prints its report
   (the restore command included) and queues an alert (critical when anything was
@@ -4990,15 +5284,34 @@ Refusing a proposed update preserves a previously valid opt-in.
   "not available yet" means an older kit) and `--dismiss <ts>`, says a
   restore leaves uncommitted edits (tracked ones block deploy_code_only.sh and
   update.sh, untracked ones deploy_code_only.sh only under `src/`, `config/` or
-  `pyproject.toml`), that backups are pruned 90 days after the last write to
-  their folder, and, for a report whose last restore refused parts, that its
+  `pyproject.toml`), that a report nobody restored or dismissed is never
+  pruned (disk_hygiene's deploy-backups prune asks
+  `scripts/lib/repair_report_keep.py`, which keeps exactly what this count
+  still counts, an undismissed report whose `hooks` is still `pending` or
+  whose `hooks_before` names hooks it replaced, the
+  restore run folder holding such a report's in-flight aside, and any report
+  it cannot read) while a restored or dismissed report
+  and other backups are pruned 90 days after the last write to their folder,
+  and, for a report whose last restore refused parts, that its
   output names each and that a part it can never write goes back by hand from
   the folder's `tree/`, then `--dismiss`; the guardian's diagnosis shows the
   newest report's `restore.restored_at` and `restore.refused`, quoted; it escapes any text a database
   column cannot hold rather than losing the alert, and is replaced whenever
   the reports it names change. `GET /api/genesis/health` reduces
   `live_repairs` to an allow-list of its counts for a caller without the
-  internal bearer or a verified session. `live_repair_unresolved` needs the
+  internal bearer or a verified session. `live_repair_hooks_pending:<n>`
+  counts the read, undismissed reports whose `hooks` is exactly `pending` and
+  whose `tag` is where the branch `live` points (the writer's own rule: `live`
+  moved on means superseded); one `git rev-parse --verify -q
+  refs/heads/live^{commit}`, bounded at 10 s, runs per snapshot and only when
+  such a report exists, and a timeout or a failing git keeps the count. It has
+  its own awareness line (readiness refuses every rebuild until the hooks are
+  back) and is in the health route's counts; `live_repair_hooks_saved:<n>`
+  counts the read, undismissed reports with a `hooks_before`, its awareness
+  line naming each `hooks-before/` folder and `--dismiss <ts>`; each enters the
+  alert's identity only when non-zero. A pending report whose commits are not full commit ids
+  (a hand edit), or one older than the newest eight reports the reader reads,
+  is kept by the prune and counted by no reader (accepted). `live_repair_unresolved` needs the
   newest report to say so (or to have no result after an hour) AND the
   shared guard, run at read time and only then, to call the update state
   `mixed_tree`: a run killed after its restore and before its result leaves
@@ -5009,12 +5322,20 @@ Refusing a proposed update preserves a previously valid opt-in.
   rule accepts (`report_ts`; anything else exits 2 before a path is built) and
   read the report through `load_report`; `--dismiss` rewrites `REPAIR.json`
   only under update.lock (30 s wait by default; still held, exit 1 and
-  nothing written), so it cannot race a restore's own rewrite. `scripts/
+  nothing written), so it cannot race a restore's own rewrite. A report
+  `load_report` refuses (unreadable, or another checkout's) is dismissed with
+  `DISMISSED.json` beside it, only in a real directory of this user's, and
+  `REPAIR.json` is left as it is; deploy health, the guardian's pick and the
+  deploy-backups prune all skip a folder holding it. `scripts/
   deploy_candidates repair-move --restore TS [--check]` passes through to the
   kit. `live_move_repair.py --restore TS
   --check` (#3492 PR B1) is the read-only judge of what a restore would
   write, in a second kit source, `scripts/lib/live_move_restore.py`, loaded
-  from the kit's own directory like the guard. It takes the repair's locks in
+  from the kit's own directory like the guard. Its report and row rules and
+  read budgets live in `live_move_restore_rows.py`, and its run-folder and
+  origin rules in `live_move_restore_runs.py`, which loads the rows module;
+  both are loaded by path from the same directory, so they ship in the kit
+  beside it. It takes the repair's locks in
   the repair's order with a short wait (30 s; `--wait` honoured) and exits 1
   while any is held (naming the pid the update state records, if any), or
   while the guard calls the checkout `mixed_tree` or `guards`. It reaches
@@ -5098,8 +5419,10 @@ Refusing a proposed update preserves a previously valid opt-in.
   with the stricter gate, and writes only parts judged `as-left`; it never
   restarts anything. Each node part, the one `REPAIR.json` names in flight
   first: STAGE the saved node in a run folder
-  `deploy-backups/<UTC time>-<pid>-live-move-restore/new/<path>` (made 0700 at
-  the first write; each file copied with its sha256 checked against
+  `deploy-backups/<UTC time>-<pid>-<report ts>-live-move-restore/new/<path>`
+  (made 0700 at the first write and named for its report, #4011, so every
+  later run of that report finds it; a run that leaves no aside and no
+  index-before.txt removes its folder; each file copied with its sha256 checked against
   `SAVED.json`, else `other:hash-mismatch`, a missing record
   `other:no-hash`, a null hash `other:too-large`; its mode the record's &
   0o777, so setuid, setgid and sticky never come back; a directory row built
@@ -5120,13 +5443,18 @@ Refusing a proposed update preserves a previously valid opt-in.
   the restore did not move there: while the in-flight part's aside holds
   anything else (a write after the move, through an open fd), unless that
   part read already-restored or as-left by the resume rule (both judged the
-  aside itself), the record is kept, and since it has one slot no other part
-  is written (`other:inflight-unresolved`, naming the aside, in `--check`
-  too; the in-flight part too, when its path holds the tag's state again), so
+  aside itself), the record is kept, and no part at that path, below it or
+  above it is written (`other:inflight-unresolved`, naming the aside, in
+  `--check` too; the in-flight part too, when its path holds the tag's state
+  again); every other part restores (#4025 item 1). Every held aside the run
+  folders show covers its path the same way, and so does an aside it cannot
+  read or judge, so a hold still covers it after a later part's intent took
+  the slot; a hold in a folder named before
+  #4011 still stops every part, since only the in-flight slot finds it. So
   every run names it and exits 1 until what is there is moved out. An aside
   still holding the repair's own as-left copy (the part refused by a gate
   after a kill, or a put-back that failed) holds nothing back; that one read
-  has its own budget. Moving the content out releases the other parts, and
+  has its own budget. Moving the content out releases the parts it covers, and
   the in-flight path is then judged by what it holds: the saved node a kill
   after the put-in left there reads already-restored; a path a kill after
   the aside left empty, or one holding whatever appeared there after a failed
@@ -5164,6 +5492,29 @@ Refusing a proposed update preserves a previously valid opt-in.
   `update-index -q --refresh`, then a second judge that must read
   already-restored for every part written, and for a flag or an index part
   already restored whose entry the index call replaced (else `post-check`).
+  Every run (and `--check`) also judges every aside in every run folder
+  of the report (#4011, `runs.aside_parts`): an aside holding content the
+  restore did not put there is an `aside` part, `other:aside-held`, named and
+  counted refused on every run (so `restored_at` stays unwritten and the
+  alert stays up; one that cannot be read on its folder's own budget is
+  `other:aside-unreadable`); each part is keyed `<run>/aside/<path>`; a run
+  folder (or its `aside/`) that is not this user's alone is
+  `other:not-owned`, never skipped; a held in-flight record whose whole run
+  folder is gone is `other:aside-lost`, said once (the record is then
+  cleared), while an aside moved out by hand with its folder still there is
+  a release; over 64 run folders refuses the report whole. Each folder's asides are read on
+  their own budget (2 GiB, 200,000 entries), so `--check` on a report with many run folders
+  costs time, never a wrong verdict. Folders named
+  before #4011 carry no ts and are found only through the in-flight record.
+  The deploy-backups prune keeps a run folder named for its report for as
+  long as that report's folder exists.
+  The files git ignores that a tag directory held when it was moved aside
+  (a server's `__pycache__`) stay in its aside: a tag directory is a node
+  part only where the repair saved a file or a link there (one whose disk node
+  is a directory, or nothing, is no node part; its files are rows), so they
+  never have a directory to go back to. Every `--restore` names them, from every as-left aside of every run
+  folder, so a run killed before naming them loses nothing; they never
+  withhold `restored_at`.
   `REPAIR.json` gets a `restore` block, `{inflight: [run, path, "node"] |
   null, refused: <int>, restored_at: <str> | null}` (no per-part list; the
   output carries those), rewritten under update.lock after a re-read;
@@ -5179,8 +5530,8 @@ Refusing a proposed update preserves a previously valid opt-in.
   `refused:<reason>`, with a note where things are), a summary, the restored
   paths and what they now block (tracked edits: deploy_code_only.sh and
   update.sh; untracked ones: deploy_code_only.sh, only under `src/`,
-  `config/` or `pyproject.toml`), the run folder (pruned 90 days after its
-  last write), the ignored files a directory moved aside held, and for a
+  `config/` or `pyproject.toml`), the run folder (kept while its report is),
+  the ignored files a directory moved aside held, and for a
   part it can never write (`cannot-make`, `target-unreadable`, `too-large`,
   `no-hash`) to put it back by hand from the report's `tree/`, then
   `--dismiss`. Exit 0 when nothing was refused, else 1. Residuals, named: a
@@ -5241,6 +5592,11 @@ verified: 81bbdb0a9 2026-11-08
   under propose-only; the apply/resolve path that would create one is a
   follow-up (future WS1 `enforce`).
   Voice-master exemplars are on the contribution FORBIDDEN list.
+  Manual-only catalog entries (`disable-model-invocation: true`) receive no
+  hook nudge or executor suggestion/assigned/delegated body injection, while
+  explicit foreground lookup and the inventory remain available. Usage retains
+  them as not nudge-eligible. Activation requires explicit catalog regeneration
+  and restarting cached consumers; see `docs/reference/manual-only-skills.md`.
   Cross-tool export: `scripts/export_agents_md.py` writes a body-scope
   inventory (skills + action tools, never memory/brain) into a managed
   `<!-- genesis:skills -->` block in `AGENTS.md` for Cursor/Codex/other
@@ -5273,7 +5629,9 @@ verified: 81bbdb0a9 2026-11-08
   pairs as word data. Hash-containing calls keep the earlier backslash handling
   to avoid a comment/quote regression; generic #3257/#3264 remain partial/open.
   A `#` that starts a word at bash's top level opens a comment the scanner skips
-  (#3473), except in commands containing `<<`.
+  (#3473), except in commands containing `<<`. Comment and double-quoted
+  substitution boundaries the legacy scans may misread are refused, never
+  accepted (#3713 PR 1; same reference doc).
   Existing continuation, heredoc proof, size bounds and nested refusals remain.
   Codex's local CLI also has a budget-only shell action hook in
   `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the
