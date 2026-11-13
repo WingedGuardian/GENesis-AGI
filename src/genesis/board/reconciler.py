@@ -348,6 +348,13 @@ async def _write_phase(db, project, items: list[dict], summary: dict, now: datet
                     sent -= 1
                     out["moved"] += 1
                     continue
+                # The re-read was an await: the mode may have left live during it.
+                # Checked before the audit row (a local write), so a stop here
+                # leaves no row for a write that never happens.
+                if not board_config.writes_allowed():
+                    sent -= 1
+                    out["stopped_on"] = "mode"
+                    break
                 content = it["content"]
                 await board_crud.append_event(
                     own,

@@ -647,3 +647,21 @@ async def test_a_card_placed_during_the_tick_is_not_overwritten(db, monkeypatch)
     assert [r["project_item_id"] for r in await _events(db, "status_write")] == ["B"]
     assert summary["writes"]["moved"] == 1
     assert summary["writes"]["budget_left"] == reconciler.WRITES_PER_TICK - 1
+
+
+async def test_a_switch_out_of_live_during_the_re_read_stops_the_write(db, mode, monkeypatch):
+    """Codex #4592 round 1: the re-read is an await between the mode check and
+    the request, so the mode is checked again after it."""
+    gh = FakeGitHub([_item("A")], open_total=1).install(monkeypatch)
+
+    async def read_then_flip(item_id, *, runner=None):
+        mode["mode"] = "propose_only"
+        return None
+
+    monkeypatch.setattr(pv, "item_status", read_then_flip)
+    _, summary = await _tick(db)
+    assert gh.mutations == []
+    assert summary["writes"]["stopped_on"] == "mode"
+    assert summary["writes"]["status_set"] == 0
+    assert summary["writes"]["budget_left"] == reconciler.WRITES_PER_TICK
+    assert await _events(db, "status_write") == []
