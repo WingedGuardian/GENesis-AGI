@@ -1227,6 +1227,65 @@ def test_health_extra_dirs_malformed_counter_never_raises(backend, bad):
     assert r["code"] != "extra_dirs_incomplete"
 
 
+def test_partial_detail_is_never_on_the_unauthenticated_allowlist():
+    """#4304: directory names reach only a verified operator's banner."""
+    from genesis.dashboard.routes import backup as bk
+
+    assert "extra_dirs_partial_detail" not in bk._STATUS_SAFE_FIELDS
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (
+            [{"dir": ".genesis/output", "refused": 9, "classes": {"AbsoluteLinkError": 9}}],
+            ".genesis/output: 9 member(s) a restore would refuse (AbsoluteLinkError ×9)",
+        ),
+        ([{"dir": "a", "refused": None, "classes": {}}], "a"),
+        (
+            [{"dir": "a", "refused": 2, "classes": {}}, {"dir": "b", "refused": 1}],
+            "a: 2 member(s) a restore would refuse; b: 1 member(s) a restore would refuse",
+        ),
+        # A home path is scrubbed, and a bool is not a count.
+        (
+            [{"dir": "/home/someone/x", "refused": 1, "classes": {"E": True}}],
+            "~/x: 1 member(s) a restore would refuse",
+        ),
+        (
+            [{"dir": f"d{i}", "refused": None} for i in range(5)],
+            "d0; d1; d2; and 2 more",
+        ),
+        (None, None),
+        ("not a list", None),
+        ([1, "x", {"dir": ""}, {"refused": 3}], None),
+    ],
+)
+def test_partial_detail_text_renders_only_the_expected_shape(value, expected):
+    from genesis.dashboard.routes.backup import _partial_detail_text
+
+    assert _partial_detail_text(value) == expected
+
+
+def test_health_names_partial_dirs_only_when_given_the_detail():
+    record = _run_record("local", extra_dirs_partial=1)
+    plain = _route_health(record, "local")
+    assert plain["reason"].endswith("the backup log names them.")
+    from genesis.dashboard.routes import backup as bk
+
+    with patch(f"{_BK}.has_verified_credential", return_value=False):
+        dest = bk._destinations(record, None)
+    named = bk._backup_health(
+        record,
+        _sch(),
+        dest,
+        configured=True,
+        resolved_backend="local",
+        extras_detail=".genesis/output: 9 member(s) a restore would refuse (AbsoluteLinkError ×9)",
+    )
+    assert named["code"] == "extra_dirs_incomplete"
+    assert "Partial: .genesis/output: 9 member(s)" in named["reason"]
+
+
 def test_status_allowlist_passes_every_extras_field():
     # backup.sh writes these into backup_status.json. The status route copies only
     # allowlisted fields into what the health check reads, so a field missing here

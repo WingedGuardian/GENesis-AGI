@@ -984,7 +984,8 @@ def parse_segments(
     ``raw`` (so ``_substitutions`` still sees the nested command a substitution redirect
     target EXECUTES) but EXCLUDED from ``argv_src`` — so it can no longer leak into argv
     and spoof ``git_subcommand``/``commit_skips_hooks`` (the push/commit fail-open this
-    split closes). Process substitution ``<(…)``/``>(…)`` stays in BOTH (documented gap).
+    split closes). Process substitution ``<(…)``/``>(…)`` keeps its ``(body)`` in BOTH views, as a
+    word; :func:`_process_substitution_spans` reads the body for the guards.
     ``raw`` stays byte-identical to the historical ``split_segments`` output for every
     ordinary command (the cwd/occurrence consumers match ``Segment.raw`` against a fresh
     re-split; locked by a golden test over a broad corpus). ONE intentional difference
@@ -1703,6 +1704,37 @@ def _argv(seg: str) -> list[str]:
         return shlex.split(core)
     except ValueError:
         return core.split()
+
+
+def words_with_quoting(seg: str) -> list[tuple[str, bool]] | None:
+    """Each shell word of one segment, with whether bash saw it quoted WHOLE.
+
+    ``("x=a b", True)`` for ``'x=a b'``; ``("--in=a", False)`` for
+    ``--in="a"``, whose prefix is unquoted. The word is :func:`_argv`'s; "quoted
+    whole" comes from a second, quote-keeping tokenization of the same text, and
+    only when that token is one quote pair whose inside is exactly the word.
+    Anything else (an escape inside the quotes, a quote pair mid-word) reads as
+    not quoted whole, which a caller treats as an operand. None when the two
+    tokenizations disagree on the word count, or either fails: the caller then
+    knows nothing about quoting and must fail toward checking.
+    """
+    core = _strip_trailing_comment(_decode_escape_free_ansi_c(seg))
+    try:
+        words = shlex.split(core)
+        lex = shlex.shlex(core, posix=False)
+        lex.whitespace_split = True
+        lex.commenters = ""
+        raws = list(lex)
+    except ValueError:
+        return None
+    if len(raws) != len(words):
+        return None
+    out = []
+    for word, raw in zip(words, raws, strict=True):
+        q = raw[:1]
+        whole = len(raw) >= 2 and q in ("'", '"') and raw[-1] == q and raw[1:-1] == word
+        out.append((word, whole and q not in raw[1:-1]))
+    return out
 
 
 def untokenizable(command: str) -> bool:
@@ -4711,11 +4743,16 @@ def _analyze_bounded(
     splits: list[int] = []
     openers: list[int] = []
     starts: list[int] = []
-    ranges, targets = ([] if _policy is not None else None), ([] if _policy is not None else None)
+    ranges: list[tuple[int, int, bool]] = []
+    targets = [] if _policy is not None else None
     parsed = parse_segments(command, _splits=splits, _openers=openers, _starts=starts,
                             _ranges=ranges, _targets=targets)
-    visible_ranges = iter((b, e) for b, e, visible in ranges or [] if visible)
-    for begin, end, visible in ranges or []:
+    visible_ranges = iter((b, e) for b, e, visible in ranges if visible)
+    # Process substitution bodies, read in this level's text: parse_segments drops
+    # the `<`/`>` and leaves `(body)` in raw, where it reads as a word.
+    process_spans = _process_substitution_spans(command) if "(" in command else []
+    level_spans: list[tuple[int, int]] | None = None
+    for begin, end, visible in ranges if _policy is not None else ():
         redirections = tuple((op, target) for at, op, target in targets if begin <= at < end)
         if not visible and redirections:
             _policy.append(PolicySegment("", [], False, "", depth=_depth,
@@ -4787,7 +4824,7 @@ def _analyze_bounded(
                 verb_unresolved=_verb_unresolved(argv),
             )
         )
-        begin, end = next(visible_ranges) if _policy is not None else (0, 0)
+        begin, end = next(visible_ranges)
         if _policy is not None:
             _policy.append(PolicySegment(**(vars(out[-1]) | {"depth": _depth}),
                 position=_scope + (begin,),
@@ -4821,6 +4858,24 @@ def _analyze_bounded(
             nested.extend((raw[a:b], (source, offset + a), True, "substitution") for a, b in spans)
         else:
             added = set()
+        # Bash runs a process substitution's body; the legacy scan never saw one, so
+        # each is added work.
+        for a, b in process_spans:
+            if begin <= a < end:
+                added.add(len(nested))
+                nested.append((command[a:b], (here[0], here[1] + a), True, "substitution"))
+        # A redirect rewrote raw, so its bodies lost the `<`/`>` of any process
+        # substitution inside them (`$(cat <(…))` reached the next level as
+        # `cat  (…)`). Read the same bodies again in this level's own text.
+        if not command.startswith(raw, start) and "(" in raw:
+            if level_spans is None:
+                level_spans = _substitution_spans(command)
+            cut = {raw[a:b] for a, b in spans}
+            for a, b in level_spans:
+                body = command[a:b]
+                if begin <= a < end and body not in cut and ("<(" in body or ">(" in body):
+                    added.add(len(nested))
+                    nested.append((command[a:b], (here[0], here[1] + a), True, "substitution"))
         if not nested:
             continue
         # Past the bound, STOP DESCENDING — and SAY SO. Every scanner below runs
@@ -4960,7 +5015,8 @@ def _substitutions(text: str) -> list[str]:
     shared ``_command_sub_end`` — a ``)`` inside a quoted operand of the body is
     DATA, so the body is extracted to its TRUE close (the same scanner the redirect-
     target boundary uses, so the two never disagree on where a ``$()`` ends).
-    Best-effort: exotic forms (process substitution ``<(…)``, ANSI-C ``$'…'``
+    Best-effort: exotic forms (process substitution ``<(…)``, which
+    :func:`_process_substitution_spans` reads instead, ANSI-C ``$'…'``
     scripts, shell aliases/functions) are NOT parsed —
     this guard is an approval/friction layer, not a sandbox, and fails toward
     over-matching on the common forms rather than pretending to cover every shell
@@ -4990,10 +5046,20 @@ def _substitution_span_sets(text: str) -> tuple[list[tuple[int, int]], set[tuple
     return sorted(legacy | set(_quoted_substitution_spans(text))), legacy
 
 
-def _quoted_substitution_spans(text: str) -> list[tuple[int, int]]:
+def _process_substitution_spans(text: str) -> list[tuple[int, int]]:
+    """Bodies of ``<(…)`` and ``>(…)`` outside quotes, which bash runs. Read generously:
+    a ``(`` after an unquoted ``<`` or ``>`` counts even where bash would reject the
+    line, since reading too much only over-blocks (a ``<(`` in a ``#`` comment is read
+    too, as the ``$(`` scan reads one)."""
+    return _quoted_substitution_spans(text, process=True)
+
+
+def _quoted_substitution_spans(text: str, *, process: bool = False) -> list[tuple[int, int]]:
     """Substitution bodies under bash's quoting: single quotes block expansion, double
     quotes do not, and a backslash escapes the next character outside single quotes
-    (inside ``$'…'`` too, where ``\\'`` does not close the span)."""
+    (inside ``$'…'`` too, where ``\\'`` does not close the span). With ``process``,
+    the bodies of ``<(…)`` and ``>(…)`` instead, outside quotes only; ``$(…)`` and
+    backtick bodies are then skipped whole, as their own level reads them."""
     subs: list[tuple[int, int]] = []
     i, n = 0, len(text)
     quote: str | None = None  # "'", '"' or "$'" (ANSI-C)
@@ -5024,8 +5090,16 @@ def _quoted_substitution_spans(text: str) -> list[tuple[int, int]]:
             quote = None if quote == '"' else '"'
             i += 1
             continue
+        if process and quote is None and c in "<>" and i + 1 < n and text[i + 1] == "(":
+            end = _command_sub_end(text, i, n)
+            subs.append((i + 2, end - 1))
+            i = end
+            continue
         if c == "$" and i + 1 < n and text[i + 1] == "(":
             end = _command_sub_end(text, i, n)
+            if process:
+                i = end
+                continue
             # Cut as the legacy scan cuts (an unterminated body loses its last
             # character), so the two readings agree on every body they both find.
             # An unclosed `$(` is a syntax error to bash, which runs none of it.
@@ -5035,7 +5109,8 @@ def _quoted_substitution_spans(text: str) -> list[tuple[int, int]]:
         if c == "`":
             j = text.find("`", i + 1)
             if j != -1:
-                subs.append((i + 1, j))
+                if not process:
+                    subs.append((i + 1, j))
                 i = j + 1
                 continue
         i += 1

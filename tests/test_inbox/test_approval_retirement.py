@@ -171,8 +171,13 @@ async def test_corrupt_retirement_holds_then_requires_fresh_approval(
     fresh_id = await _fresh_request(system)
     recovered = await inbox_items.get_by_id(system.db, "corrupt")
     assert recovered["retry_count"] == min(old_retries, cap - 1)
-    assert recovered["error_message"] == f"awaiting_approval:{fresh_id}"
-    assert inbox_items.batch_items_for_dispatch(recovered["batch_items"]) == "corrupt original item"
+    assert recovered["error_message"] == "batch_items_corrupt_restart"
+    assert recovered["batch_items"] == original["batch_items"]
+    replacement = [row for row in await _rows(system) if row["id"] != "corrupt"]
+    assert len(replacement) == 1
+    assert replacement[0]["retry_count"] == 0
+    assert replacement[0]["error_message"] == f"awaiting_approval:{fresh_id}"
+    assert inbox_items.batch_items_for_dispatch(replacement[0]["batch_items"]) == "corrupt original item"
     system.monitor._dispatch_one_batch.assert_not_awaited()
     assert await system.manager.resolve(fresh_id, status="approved", resolved_by="test:fixture")
 
@@ -351,3 +356,48 @@ async def test_committed_consumption_survives_row_write_failure(system, monkeypa
 
     await _fresh_request(system)
     system.monitor._dispatch_one_batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [None, ""])
+async def test_missing_pending_identity_rebuilds_under_fresh_approval(system, payload):
+    """Unknown pending history cannot donate its budget to reconstructed work."""
+    # No unconsumed site grant exists: preserve the normal approve-once policy.
+    assert await system.gate.mark_consumed(system.request_id)
+    path = system.watch / "missing-pending.md"
+    path.write_text("https://example.com/reconstructed")
+    await inbox_items.create(
+        system.db, id="unknown-pending", file_path=str(path),
+        content_hash=compute_hash(path), status="pending",
+        created_at="2026-01-01T00:00:00+00:00", retry_count=2,
+        drop_id="old-drop", batch_items=payload,
+    )
+
+    first = await system.monitor.check_once()
+
+    assert first.batches_dispatched == 0
+    system.monitor._dispatch_one_batch.assert_not_awaited()
+    fresh_id = await _fresh_request(system)
+    history = await inbox_items.get_by_id(system.db, "unknown-pending")
+    assert history["status"] == "failed"
+    assert history["retry_count"] == 2
+    assert history["batch_items"] == payload
+    replacements = [row for row in await _rows(system) if row["id"] != "unknown-pending"]
+    assert len(replacements) == 1
+    rebuilt = replacements[0]
+    assert rebuilt["retry_count"] == 0
+    assert rebuilt["status"] == "processing"
+    assert rebuilt["error_message"] == f"awaiting_approval:{fresh_id}"
+    assert inbox_items.stored_item_texts(rebuilt["batch_items"]) == [path.read_text()]
+    assert await system.manager.resolve(fresh_id, status="approved", resolved_by="test:fixture")
+
+    await system.monitor.check_once()
+
+    system.monitor._dispatch_one_batch.assert_awaited_once()
+    dispatched = system.monitor._dispatch_one_batch.await_args.args[0]
+    assert dispatched.id == rebuilt["id"]
+    assert dispatched.approval_reqid == fresh_id
+    assert dispatched.content == path.read_text()
+    assert (await system.manager.get_by_id(fresh_id))["consumed_at"]
+    assert await inbox_items.get_by_id(system.db, "unknown-pending") == history
+    system.monitor._invoker.run.assert_not_awaited()

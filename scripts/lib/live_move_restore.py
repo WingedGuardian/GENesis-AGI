@@ -37,21 +37,27 @@ killed restore left half-done reads as-left by the resume rule
 entry's two writes left; the node part REPAIR.json names in flight reads
 already-restored only while its aside is still the state moved there
 (Judge._landed), and while one refused leaves its aside holding something
-the restore did not move there every other as-left part is
-``other:inflight-unresolved`` (Judge.unresolved: the record is kept, and it
-has one slot; moving that content out releases them, and the in-flight path
+the restore did not move there every as-left part at that path, below it or
+above it is ``other:inflight-unresolved`` (Judge.unresolved, runs.held_covers:
+the record is kept; every other part restores, and a hold in a folder named
+before #4011 still stops every part; moving that content out releases them,
+and the in-flight path
 is then judged by what it holds: the saved node, which a kill after the
 put-in left there, reads already-restored; a path a kill after the aside
 left empty, or one holding whatever appeared there after a failed put-back,
-goes back by hand or the report is dismissed). ``check`` writes nothing;
-``restore`` writes only parts judged as-left, each self-verifying (see _Writer)."""
+goes back by hand; dismissing the report stops its alert and releases
+nothing). ``check`` writes nothing, and names every refusal the restore makes
+from what the judge reads: a saved copy its staging refuses (Judge._damaged)
+and the index call's rule (rows.footprint, as_the_writer_would). Those two
+predictions run only for --check (Judge.strict false): the writer makes its
+own refusals from what it reads as it writes. ``restore``
+writes only parts judged as-left, each self-verifying (see _Writer)."""
 
 from __future__ import annotations
 
 import bisect
 import calendar
 import contextlib
-import hashlib
 import importlib.util
 import json
 import os
@@ -105,6 +111,9 @@ saved_problem = rows.saved_problem
 _saved = rows._saved
 problem = rows.problem
 _raise = rows._raise
+footprint = rows.footprint
+as_the_writer_would = rows.as_the_writer_would
+damage_of, damage_note = rows.damage_of, rows.damage_note
 RUN_SUFFIX = runs.RUN_SUFFIX
 RUN_NAME = runs.RUN_NAME
 _DIR = runs._DIR
@@ -113,6 +122,8 @@ _Whole = runs._Whole
 _mine = runs._mine
 _anchor = runs._anchor
 _origin = runs._origin
+aside_parts, run_ts, RUNS_CAP = runs.aside_parts, runs.run_ts, runs.RUNS_CAP
+held_covers, held_stops_all = runs.held_covers, runs.held_stops_all
 
 
 class _Paths:
@@ -216,8 +227,11 @@ class Judge:
     None for a report written before it, which only --check judges).
     ``runs``: deploy-backups as read (restore run folders, for the resume rule),
     ``shown`` as named in output; ``fd`` the descriptor ``runs`` names, handed
-    to git when it reads an aside. ``strict``: the restore's write gate (a tag
-    directory moved aside may hold no extra file git does not ignore)."""
+    to git when it reads an aside. ``strict``: the restore's own judge, which
+    makes no --check prediction (_staging_refuses, as_the_writer_would). Both
+    modes judge eligibility by the writer's rule (_as_left; owner ruling
+    2026-11-10, #4355 review): a tag directory moved aside may hold no extra
+    file git does not ignore."""
 
     def __init__(self, rp, repo: str, backup: str, loaded: dict, newer: dict, *, records=None,
                  runs=None, shown=None, strict=False, fd=None, complete=True) -> None:  # fmt: skip
@@ -227,7 +241,11 @@ class Judge:
         # so the integrity check never spends the walk's and turns a directory
         # that restored correctly into other:too-large.
         self.kept_budget = _Budget(rp)
+        self.damage: dict[str, str | None] = {}  # _damaged per copy: each is hashed once
         self.aside_budget = _Budget(rp)  # unresolved()'s one read of the in-flight aside
+        # --check's staging prediction reads on its own budget, so it never
+        # spends the one done() and the directory walk use (#4025 review S1).
+        self.predict_budget, self.predicted = _Budget(rp), set()
         report, self.rows = loaded["report"], loaded["rows"]
         self.records, self.runs, self.shown, self.strict = records or {}, runs, shown, strict
         self.integrity, self.git_dir = records is not None, None
@@ -236,10 +254,16 @@ class Judge:
         self.complete = complete
         self.fds = () if fd is None else (fd,)
         self.record_keys = sorted(self.records)  # _dir's per-row range, by bisect
-        block = restore_block(report)
+        # The report's ts (its folder name): its restore runs carry it (#4011).
+        self.ts = rp.report_ts(os.path.basename(os.path.normpath(backup)))
+        self.runs_budget = _Budget(rp)  # runs.aside_parts' reads of every run's aside
+        block = restore_block(report, self.ts)
         self.inflight = block["inflight"] if block else None
         self.notes, self.dirs, self.entry_of, self.resumed = {}, {}, {}, None
         self.held = None  # the unresolved in-flight aside, shown (set by _judged)
+        self.asides_left: list = []  # (run, path) of every as-left aside (runs.aside_parts)
+        self.held_asides: list = []  # [run, path, shown] of every held aside (runs.aside_parts)
+        self.holds: list = []  # every hold, the slot's first (_judged): runs.held_covers
         self.fmt = rp._out(repo, "rev-parse", "--show-object-format")
         self.head = rp._tree(repo, "HEAD")
         self.tag = rp._tree(repo, report["tag"])
@@ -466,7 +490,10 @@ class Judge:
         inf = self.inflight
         if not inf or inf[1] != p or self.runs is None:
             return False
-        if self.rp._link_parent(self.repo, p) or os.path.lexists(os.path.join(self.repo, p)):
+        try:
+            if self.rp._link_parent(self.repo, p) or not runs.absent(self.repo, p):
+                return False
+        except OSError:  # cannot see the path: never read as empty (#4364 review)
             return False
         aside = os.path.join(self.runs, inf[0], "aside")
         made = [os.path.dirname(aside), aside] + [
@@ -564,7 +591,9 @@ class Judge:
             return "index-changed"
         return None
 
-    def _verdict(self, link, done, gate, left, missing: str | None = None) -> str:
+    def _verdict(self, link, done, gate, left, missing: str | None = None, damaged=None) -> str:
+        # ``damaged`` (--check only, a callable) after the gate: the writer
+        # refuses a gated part before its staging reads the copy.
         if link:
             return f"other:{link}"
         if done():
@@ -573,7 +602,29 @@ class Judge:
             return f"other:{missing}"
         if gate:
             return f"other:{gate}"
-        return "as-left" if left() else "other:changed"
+        if not left():  # the writer never stages a part that is not as-left
+            return "other:changed"
+        if damaged is not None and (why := damaged()):
+            return f"other:{why}"
+        return "as-left"
+
+    def _staging_refuses(self, p: str, rels) -> str | None:
+        """--check's reading of what the writer's staging would refuse among the
+        copies ``rels`` (#4025 item 3), noted on ``p``'s node part. A copy over
+        this prediction's own budget is not predicted (the writer's staging has
+        no budget and hashes it whole, so --check can read as-left a part whose
+        copy --restore then refuses), and a prediction never makes a part
+        other:too-large."""
+        for rel in rels:
+            try:
+                why = self._damaged(rel, self.predict_budget)
+            except self.rp.TooLarge:
+                continue
+            if why:
+                self.notes[(p, "node")] = damage_note(rel, why)
+                self.predicted.add(p)
+                return why
+        return None
 
     def _node(self, row: dict, link, gate: str | None) -> str:
         p, special = row["path"], row.get("special")
@@ -586,7 +637,12 @@ class Judge:
         done = lambda: (  # noqa: E731
             self._state(self.repo, p) == saved and (not rel or self._kept(rel)) and self._landed(p)
         )
-        return self._verdict(link, done, gate, lambda: self._as_left(p))
+        # A copy the writer's staging would refuse reads that refusal here too
+        # (#4025 item 3), never as-left.
+        # The writer builds a FIFO from its row, never from the backup.
+        predict = rel and not self.strict and row["disk"] != "other"
+        damaged = (lambda: self._staging_refuses(p, [rel])) if predict else None
+        return self._verdict(link, done, gate, lambda: self._as_left(p), damaged=damaged)
 
     def _landed(self, p: str) -> bool:
         """The in-flight part reads already-restored only while its aside is
@@ -598,10 +654,13 @@ class Judge:
         if not inf or inf[1] != p or self.runs is None:
             return True
         aside = os.path.join(self.runs, inf[0], "aside")
-        if self.rp._link_parent(aside, p) is None and not os.path.lexists(os.path.join(aside, p)):
-            return True
-        if self._left(p, root=aside, strict=True):  # a link parent: never as-left
-            return True
+        try:
+            if self.rp._link_parent(aside, p) is None and runs.absent(aside, p):
+                return True
+            if self._left(p, root=aside, strict=True):  # a link parent: never as-left
+                return True
+        except OSError:  # an aside it cannot see is never read as released (#4364 review)
+            pass
         where = os.path.join(self.shown, inf[0], "aside", p)
         self.notes[(p, "node")] = f"newer content kept at {where}"
         return False
@@ -610,9 +669,9 @@ class Judge:
         """The aside REPAIR.json's in-flight part left, as shown, while that
         part is neither as-left nor already-restored and its aside holds
         something that is not the state the restore moved there (#3986 review);
-        else None. The record then stays, and since it
-        has one slot, nothing else is written (live_move_restore_write) until
-        what is there is moved out: every rerun names it."""
+        else None. The record then stays, and no part at that path, below it
+        or above it is written (runs.held_covers) until what is there is moved
+        out: every rerun names it."""
         inf = self.inflight
         if not inf or self.runs is None:
             return None
@@ -624,10 +683,11 @@ class Judge:
         if v == "already-restored" or (v == "as-left" and self.resumed == inf[1]):
             return None
         aside = os.path.join(self.runs, inf[0], "aside")
-        if self.rp._link_parent(aside, inf[1]) is None and not os.path.lexists(
-            os.path.join(aside, inf[1])
-        ):
-            return None
+        try:
+            if self.rp._link_parent(aside, inf[1]) is None and runs.absent(aside, inf[1]):
+                return None
+        except OSError:  # cannot see it: held, never released (#4364 review)
+            return os.path.join(self.shown, inf[0], "aside", inf[1])
         # Only content the restore did not move there holds the record: an aside
         # still holding the repair's own as-left copy (a gate refusing the part
         # after a kill) is what git gives back, and must not stop the rest. Read
@@ -649,32 +709,26 @@ class Judge:
         writer's staging check refuses it). A file recorded with no hash cannot
         be told apart, so it never is either. A report written before SAVED.json
         has nothing to check against (only --check judges one)."""
+        return self._damaged(rel) is None
+
+    def _damaged(self, rel: str, budget=None) -> str | None:
+        """Why the writer's staging would refuse the copy at ``rel``
+        (_Writer._stage_one: no-hash, not-saved, too-large, hash-mismatch), or
+        None. Read once per copy (#4025 review SF-11): a second read would
+        spend the budget again, and an over-budget copy reads other:too-large,
+        a part only a person can put back. TooLarge is never kept: the next
+        caller reads it again under the same budget."""
         if not self.integrity:
-            return True
-        rec, full = self.records.get(rel), os.path.join(self.backup, rel)
-        try:
-            if rec is None or rec["type"] == "symlink":
-                return rec is not None and os.readlink(full) == rec["target"]
-            if rec["type"] == "fifo":
-                return stat.S_ISFIFO(os.lstat(full).st_mode)
-            if rec["sha256"] is None:
-                return False
-            fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-            try:
-                st, h = os.fstat(fd), hashlib.sha256()
-                if not stat.S_ISREG(st.st_mode):
-                    return False
-                self.kept_budget(st.st_size)
-                while chunk := os.read(fd, 1 << 20):
-                    h.update(chunk)
-            finally:
-                os.close(fd)
-        except OSError:
-            return False
-        return h.hexdigest() == rec["sha256"]
+            return None
+        if rel not in self.damage:
+            got = damage_of(self.records, self.backup, budget or self.kept_budget, rel)
+            self.damage[rel] = got
+        return self.damage[rel]
 
     def _as_left(self, p: str) -> bool:
-        return self._left(p, strict=self.strict) or self._resume(p)
+        # The writer's eligibility, in --check too (#4355 review: one rule, so
+        # every reader downstream, disk_ok and the hold sweep, agrees with it).
+        return self._left(p, strict=True) or self._resume(p)
 
     def _dir(self, row: dict, link, gate: str | None) -> list[tuple[str, str, str]]:
         """A directory row: its node, then each saved entry the restore would write."""
@@ -730,7 +784,11 @@ class Judge:
             return set(extra) <= self._ignored(extra)
 
         self.dirs[p] = restore
-        v = self._verdict(link, done, gate, lambda: self._as_left(p))
+        # The writer builds the directory from every restore entry, so one copy
+        # its staging would refuse refuses the whole node (#4025 item 3).
+        rels = [f"{row['saved_as']}/{q}" for q in sorted(restore)]
+        damaged = None if self.strict else (lambda: self._staging_refuses(p, rels))
+        v = self._verdict(link, done, gate, lambda: self._as_left(p), damaged=damaged)
         self.entry_of.update((f"{p}/{q}", p) for q in restore)
         out = [(p, "node", v)] + [(f"{p}/{q}", "entry", v) for q in sorted(restore)]
         out += [(q, "entry", "other:target-unreadable") for q in sorted(unread)]
@@ -755,7 +813,11 @@ class Judge:
             # A covered row's disk is its parent's node part (an index-only
             # write here, index == tag == HEAD, loses nothing on disk).
             if node is not None:
-                return node in ("as-left", "already-restored")
+                # A node --check predicts the staging refuses passed the
+                # writer's eligibility first (_verdict, _as_left): the row's
+                # index and flag parts stay eligible, and as_the_writer_would
+                # refuses them row-refused, as the writer does (#4355 review).
+                return node in ("as-left", "already-restored") or p in self.predicted
             return covered or bool(row["unreachable_through"]) or self._left(p, whole=False)
 
         def left(ok) -> bool:
@@ -881,12 +943,25 @@ def _judged(rp, repo: str, ctx, say, write: bool, nothing: str):
         parts = [part for row in judge.rows if row["class"] == "foreign" for part in judge.row(row)]
     except OSError as exc:
         return unreadable(exc)
-    if where := judge.unresolved(parts):
-        for n, (p, k, v) in enumerate(parts):
-            if v == "as-left":
-                parts[n] = (p, k, INFLIGHT_UNRESOLVED)
-                judge.notes[(p, k)] = unresolved_note(where)
-    judge.held = where
+    judge.held = where = judge.unresolved(parts)
+    try:
+        asides = aside_parts(judge)
+    except _Whole as exc:
+        return str(exc)
+    except OSError as exc:  # a run folder it cannot read: refused by name (#4364 review)
+        return unreadable(exc)
+    judge.holds = ([[*judge.inflight[:2], where]] if where else []) + judge.held_asides
+    for n, (p, k, v) in enumerate(parts):
+        # A part refused only by --check's prediction is as-left to the writer.
+        predicted = k in ("node", "entry") and judge.entry_of.get(p, p) in judge.predicted
+        if (v == "as-left" or predicted) and held_covers(judge.holds, p):
+            parts[n] = (p, k, INFLIGHT_UNRESOLVED)
+            shown = next(h[2] for h in judge.holds if held_covers([h], p))
+            judge.notes[(p, k)] = unresolved_note(shown)
+    parts += asides
+    # A hold that stops every part (an old-form folder): no index call, no flag.
+    if not write and not held_stops_all(judge.holds):
+        parts = as_the_writer_would(rp, judge, parts)
     return judge, parts, loaded, ctx
 
 
@@ -896,8 +971,9 @@ INFLIGHT_UNRESOLVED = "other:inflight-unresolved"
 
 def unresolved_note(where: str) -> str:
     return (
-        f"an interrupted restore's aside {where} holds newer content: nothing else is"
-        " written until it is moved out; its own path is then judged by what it holds"
+        f"an interrupted restore's aside {where} holds newer content: nothing at its"
+        " path, below it or above it is written until it is moved out; its own path is"
+        " then judged by what it holds"
     )
 
 

@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from tests import _live_fence
 from tests.conftest import require_access_denied
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
@@ -35,6 +36,28 @@ _ctx_spec = importlib.util.spec_from_file_location(
 )
 _ctx = importlib.util.module_from_spec(_ctx_spec)
 _ctx_spec.loader.exec_module(_ctx)
+
+
+def _audit_reserve_at_the_real_home() -> int:
+    """``_AUDIT_LINE_RESERVE`` as production computes it. The constant embeds
+    ``Path.home()`` at import, and the live closure's test HOME is longer than a
+    real one. A throwaway copy of the module is imported with HOME set to the
+    real home and only this constant is read from it: ``_ctx`` itself stays on
+    the test home, because the module also binds state paths at import."""
+    saved = os.environ.get("HOME")
+    os.environ["HOME"] = _live_fence.real_home() or str(Path.home())
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "genesis_session_context_real_home", _SCRIPTS_DIR / "genesis_session_context.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module._AUDIT_LINE_RESERVE
+    finally:
+        if saved is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = saved
 
 
 # ── constants pin the measurement ───────────────────────────────────────
@@ -341,7 +364,13 @@ def test_charter_part_overhead_fits_the_budget():
     header = _ctx.emit_cost(
         _ctx._recovery_header(
             "charter",
-            Path.home() / ".genesis" / "sessions" / str(uuid.uuid4()) / "context-charter.md",
+            # The real home, not the live closure's deep per-session test HOME:
+            # this mirrors the production path's length.
+            Path(_live_fence.real_home() or Path.home())
+            / ".genesis"
+            / "sessions"
+            / str(uuid.uuid4())
+            / "context-charter.md",
         )
     )
     # The mis-wire alert fires ON this part, so the worst case includes it —
@@ -357,7 +386,7 @@ def test_charter_part_overhead_fits_the_budget():
         + miswire
         + dividers
         + _ctx._CHARTER_BLOCK_MAX
-        + _ctx._AUDIT_LINE_RESERVE
+        + _audit_reserve_at_the_real_home()
     )
     assert total <= _ctx._PART_BUDGET, (
         f"charter part could overrun: {total} > {_ctx._PART_BUDGET}. "

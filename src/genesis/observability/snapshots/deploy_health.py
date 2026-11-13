@@ -30,7 +30,8 @@ This snapshot makes that drift visible:
   read as undeployed merges
 - ``live_repairs`` — what the live-move repair (scripts/lib/live_move_repair.py)
   reported after healing a half-written `live` checkout: per report, how many
-  paths it saved that were not the update's; an unresolved repair
+  paths it saved that were not the update's; an unresolved repair; how many
+  finished rollbacks still owe their git hooks
 
 The awareness tick's ``_check_deploy_staleness`` consumes the same collectors
 to raise a dashboard/morning-report observation. Everything is best-effort:
@@ -174,6 +175,13 @@ def collect_missing_units(template_dir: Path, unit_dir: Path) -> list[str] | Non
 _ABBREV_SHA = re.compile(r"^[0-9a-f]{4,40}$")
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
+#: _run_git's timeout and exec-failure sentinels. A git killed by SIGHUP or
+#: SIGINT also returns -1/-2, so the word can be wrong, but the check did not
+#: complete either way. "I could not check" and "it is not here" have different
+#: remedies, so at every git phase of resolve_commit they must not share a
+#: message with an absent or wrong-typed object.
+_GIT_UNCHECKED = {-1: "timed out", -2: "failed"}
+
 
 def resolve_commit(repo: Path, name: str | None) -> tuple[str | None, str]:
     """Expand a stored (abbreviated) commit name to its full 40-hex SHA.
@@ -211,11 +219,8 @@ def resolve_commit(repo: Path, name: str | None) -> tuple[str | None, str]:
     rc, out, err = _run_git(
         repo, "rev-parse", f"--disambiguate={candidate}", timeout=_CHEAP_TIMEOUT_S
     )
-    if rc in (-1, -2):
-        # _run_git's own sentinels: -1 timeout, -2 exec failure. "I could not
-        # check" and "it is not here" have different remedies, so they must not
-        # share a message.
-        return None, f"could not check {candidate} (git {'timed out' if rc == -1 else 'failed'})"
+    if rc in _GIT_UNCHECKED:
+        return None, f"could not check {candidate} (git {_GIT_UNCHECKED[rc]})"
     names = [line.strip() for line in out.splitlines() if line.strip()]
     if rc != 0 or not names:
         return (
@@ -228,6 +233,12 @@ def resolve_commit(repo: Path, name: str | None) -> tuple[str | None, str]:
     if not _FULL_SHA.match(resolved):
         return None, f"{candidate} resolved to something that is not a SHA: {resolved!r}"
     rc, kind, _ = _run_git(repo, "cat-file", "-t", resolved, timeout=_CHEAP_TIMEOUT_S)
+    if rc in _GIT_UNCHECKED:
+        return (
+            None,
+            f"{candidate} resolved to {resolved} but could not check its type"
+            f" (git {_GIT_UNCHECKED[rc]})",
+        )
     if rc != 0 or kind.strip() != "commit":
         return None, f"{candidate} names a {kind.strip() or 'missing'} object, not a commit"
     return resolved, f"{candidate} resolved to {resolved}"
@@ -1027,11 +1038,22 @@ def collect_live_repairs(
     the guardian's pick, which shows the newest ELIGIBLE report), while the
     update state's guard still calls the checkout half-written (a repair
     killed after its restore leaves no result; only the tree says whether it
-    healed). The guard loads only then; nothing else runs in the checkout."""
+    healed). The guard loads only then. ``hooks_pending``: the read reports,
+    not dismissed, whose ``hooks`` is exactly "pending" (a forward repair that
+    has not put the git hooks back yet) and whose ``tag`` is where
+    ``refs/heads/live`` points, as the writer's retry judges it (`live` moved
+    on: superseded); one bounded rev-parse runs, only when such a report
+    exists, and doubt (a timeout, a git that fails) keeps the report's word.
+    ``hooks_saved`` (per report, and their count): not dismissed, and holding
+    hooks the repair replaced to reinstall the tag's (``hooks_before``, any
+    true value: the prune's keep rule), whose hooks-before/ may hold a hand
+    edit's only copy.
+    Nothing else runs in the checkout."""
     now = time.time() if now is None else now
     repo = str(repo_dir)
     backups = genesis_home_dir / "deploy-backups"
     out: dict = {"reports": [], "saved": 0, "refused": 0, "unread_older": 0, "unresolved": False}
+    out["hooks_pending"] = out["hooks_saved"] = 0
     try:
         names = [n for n in os.listdir(backups) if n.endswith(_REPAIR_SUFFIX)]
     except FileNotFoundError:
@@ -1069,6 +1091,7 @@ def collect_live_repairs(
             out["refused"] += 1
     named.sort(reverse=True)
     out["unread_older"] = max(0, len(named) - REPAIR_REPORTS_READ)
+    pending_tags: list[object] = []
     for _, ts, name in named[:REPAIR_REPORTS_READ]:
         # One boundary per report: a fault no check foresaw costs that report,
         # never the rest of the snapshot.
@@ -1083,6 +1106,9 @@ def collect_live_repairs(
             stale = result == "unfinished" and now - loaded["mtime"] > REPAIR_UNFINISHED_S
             saved = sum(1 for r in loaded["rows"] if r.get("class") == "foreign")
             refused, cleared = _restore_counts(m.get("restore"))
+            if not dismissed and m.get("hooks") == "pending":
+                pending_tags.append(m.get("tag"))
+            hooks_saved = bool(m.get("hooks_before")) and not dismissed
         except Exception as exc:  # noqa: BLE001 - see the boundary comment above
             _refused(name, str(exc) if isinstance(exc, bad) else type(exc).__name__)
             out["refused"] += 1
@@ -1096,11 +1122,22 @@ def collect_live_repairs(
                 "result": result,
                 "dismissed": dismissed,
                 "unresolved": (result == "unresolved" or stale) and not dismissed,
+                "hooks_saved": hooks_saved,
             }
         )
+        out["hooks_saved"] += hooks_saved
         out["saved"] += 0 if dismissed or cleared else saved
     if out["reports"] and out["reports"][0]["unresolved"]:
         out["unresolved"] = _mixed(genesis_home_dir, repo)
+    if pending_tags:
+        rc, live, _ = _run_git(
+            Path(repo), "rev-parse", "--verify", "-q", f"{_LIVE_REF}^{{commit}}",
+            timeout=_CHEAP_TIMEOUT_S,
+        )  # fmt: skip
+        if rc == 0:
+            out["hooks_pending"] = sum(1 for t in pending_tags if t == live.strip())
+        elif rc != 1:  # 1: no `live` branch, so the writer supersedes them
+            out["hooks_pending"] = len(pending_tags)
     return out
 
 
@@ -1139,6 +1176,10 @@ def live_repair_findings(repairs: dict | None) -> list[str]:
         found.append(f"live_repair_unread_older:{repairs['unread_older']}")
     if repairs.get("unresolved"):
         found.append("live_repair_unresolved")
+    if repairs.get("hooks_pending"):
+        found.append(f"live_repair_hooks_pending:{repairs['hooks_pending']}")
+    if repairs.get("hooks_saved"):
+        found.append(f"live_repair_hooks_saved:{repairs['hooks_saved']}")
     if repairs.get("refused"):
         found.append(f"live_repair_refused:{repairs['refused']}")
     return found

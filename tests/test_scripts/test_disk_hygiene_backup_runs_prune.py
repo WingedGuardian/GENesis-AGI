@@ -260,3 +260,97 @@ def test_a_dismissed_unreadable_report_is_pruned_at_ninety_days(tmp_path):
     _age(d, 120)
     r = _prune_main(root)
     assert not d.exists(), r.stdout
+
+
+def test_a_restore_run_named_for_its_report_lives_as_long_as_the_report(tmp_path):
+    """#4011: a run folder carries its report's ts, so it is kept while that
+    report's folder exists (the report itself is kept while unresolved), and
+    pruned as before once the report is gone."""
+    root = tmp_path / "home" / ".genesis" / "deploy-backups"
+    ts = _TS[: -len("-live-move-repair")]
+    report = _report(root, _TS, 10, {"repo": "/x", "paths": [_FOREIGN]})
+    run = root / f"20260102T000000Z-77-{ts}-live-move-restore"
+    orphan = root / "20260102T000000Z-78-20250101T000000Z-1-live-move-restore"
+    for d in (run, orphan):
+        (d / "aside").mkdir(parents=True)
+        (d / "aside" / "a.txt").write_text("newer content a held restore did not write\n")
+        _age(d / "aside" / "a.txt", 120)
+        _age(d / "aside", 120)
+        _age(d, 120)
+    r = _prune_main(root)
+    assert run.exists() and report.exists(), r.stdout
+    assert f"keeping {run} (a restore run of the report {_TS}, kept while it is)" in r.stdout
+    assert not orphan.exists(), "a run whose report is gone prunes as before"
+
+
+def test_a_report_whose_hooks_are_pending_is_kept(tmp_path):
+    """A forward repair's report is the only record of the hooks retry it owes
+    (deploy health counts it): kept past 90 days while not dismissed, even
+    with nothing saved; once the retry ends it (ok or superseded), or it is
+    dismissed, it prunes as before."""
+    root = tmp_path / "home" / ".genesis" / "deploy-backups"
+    d = _report(root, _TS, 120, {"repo": "/x", "paths": [], "hooks": "pending"})
+    r = _prune_main(root)
+    assert d.exists(), r.stdout
+    assert "git hooks are not put back yet" in r.stdout, r.stdout
+    (d / "REPAIR.json").write_text(json.dumps({"repo": "/x", "paths": [], "hooks": "ok"}))
+    _age(d / "REPAIR.json", 120)
+    _age(d, 120)
+    _prune_main(root)
+    assert not d.exists(), "the hooks were put back, yet the report was kept"
+    d = _report(root, _TS, 120, {"repo": "/x", "paths": [], "hooks": "reinstalled"})
+    _prune_main(root)
+    assert not d.exists(), "the hooks were reinstalled, nothing saved, yet the report was kept"
+    # SF-A: a reinstall that moved hooks aside holds their only copy (a hand
+    # edit's): kept, and named, until --dismiss.
+    d = _report(root, _TS, 120, {"repo": "/x", "paths": [], "hooks": "reinstalled",
+                                  "hooks_before": ["pre-push"]})  # fmt: skip
+    r = _prune_main(root)
+    assert d.exists(), r.stdout
+    assert "git hooks the repair replaced" in r.stdout, r.stdout
+    (d / "REPAIR.json").write_text(json.dumps({"repo": "/x", "paths": [], "hooks": "reinstalled",
+                                               "hooks_before": ["pre-push"],
+                                               "dismissed_at": "2026-01-03T00:00:00Z"}))  # fmt: skip
+    _age(d / "REPAIR.json", 120)
+    _age(d, 120)
+    _prune_main(root)
+    assert not d.exists(), "a dismissed report holding replaced hooks was kept"
+    d = _report(root, _TS, 120, {"repo": "/x", "paths": [], "hooks": "pending",
+                                  "dismissed_at": "2026-01-03T00:00:00Z"})  # fmt: skip
+    _prune_main(root)
+    assert not d.exists(), "a dismissed report with hooks pending was kept"
+
+
+def test_the_hooks_pending_rule_matches_deploy_health(tmp_path):
+    """The prune keeps a report for its hooks exactly while deploy health
+    would count it (the live ref aside, which the prune never reads): not
+    dismissed, and hooks exactly "pending"."""
+    import importlib
+    import importlib.util
+    import subprocess as sp
+
+    spec = importlib.util.spec_from_file_location("_keep", _KEEP)
+    keep = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(keep)
+    deploy_health = importlib.import_module("genesis.observability.snapshots.deploy_health")
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (("init", "-q"), ("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                                  "commit", "-q", "--allow-empty", "-m", "one"), ("branch", "live")):  # fmt: skip
+        sp.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    head = sp.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                  capture_output=True, text=True).stdout.strip()  # fmt: skip
+    home = tmp_path / "home"
+    folder = home / "deploy-backups" / "20260101T000000Z-1-live-move-repair"
+    folder.mkdir(parents=True)
+    cells = [(h, b) for h in ("pending", "pending ", "ok", "superseded", "reinstalled", None, 1,
+                              ["pending"]) for b in (None, [], ["pre-push"])]  # fmt: skip
+    for hooks, before in cells:
+        for dismissed in (None, "", "2026-01-03T00:00:00Z"):
+            report = {"repo": str(repo), "tag": head, "paths": [], "hooks": hooks,
+                      "dismissed_at": dismissed, "result": "healed", "hooks_before": before}  # fmt: skip
+            (folder / "REPAIR.json").write_text(json.dumps(report))
+            found = deploy_health.collect_live_repairs(home, repo)
+            counted = found["hooks_pending"] == 1 or found["hooks_saved"] == 1
+            assert (keep.reason(report) is not None) == counted, (hooks, before, dismissed)

@@ -11,13 +11,18 @@ A report folder holds the only saved copy of edits a live-move repair moved out
 of the checkout. It is kept while deploy health would still count its saved
 paths: not dismissed, not cleared by a restore (the rule of deploy_health
 ``_restore_counts``, held equal by a test), and holding at least one foreign
-row. A report this reader cannot read is kept too, and named, until --dismiss
+row; or while it is not dismissed and its git hooks are still pending (a
+forward repair's retry, which deploy health counts, reads that record) or it
+holds hooks the repair replaced (``hooks_before``: hooks-before/ may hold the
+only copy of a hand-edited hook; deploy health counts it too). A
+report this reader cannot read is kept too, and named, until --dismiss
 writes DISMISS_MARK beside it (a dismissed report goes like any other): losing a saved
 edit is the outcome a prune must never produce in silence. So is the restore
 run folder a kept report's in-flight record names (``restore.inflight[0]``):
 its ``aside/`` can hold the only copy of content a held restore did not write
 (live_move_restore Judge.unresolved). Any other folder (another name, or no
-REPAIR.json yet) prunes as before.
+REPAIR.json yet) prunes as before. A restore run folder named for its report
+(from #4011) is kept for as long as that report's folder exists.
 
 Stdlib only, run isolated: the prune runs it from the checkout under the daily
 groom, before any venv is known to be sound.
@@ -33,8 +38,11 @@ import sys
 
 #: The repair's report folder name (live_move_repair.REPORT_NAME).
 REPORT_NAME = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9]+-live-move-repair")
-#: A restore run's folder name (live_move_restore_runs.RUN_NAME).
-RUN_NAME = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9]+-live-move-restore")
+#: A restore run's folder name (live_move_restore_runs.RUN_NAME): from #4011 it
+#: carries its report's ts too.
+RUN_NAME = re.compile(
+    r"[0-9]{8}T[0-9]{6}Z-[0-9]+(?:-([0-9]{8}T[0-9]{6}Z-[0-9]+))?-live-move-restore"
+)
 #: live_move_repair.DISMISS_MARK: --dismiss's record for a report no reader reads.
 DISMISS_MARK = "DISMISSED.json"
 #: Exit codes: keep, and may prune (never 1, which an uncaught exception exits with).
@@ -49,6 +57,10 @@ def reason(report: object) -> str | None:
         return "its REPAIR.json is not a JSON object"
     if report.get("dismissed_at"):
         return None
+    if report.get("hooks") == "pending":  # the writer's only record of the retry it owes
+        return "a live-move repair whose git hooks are not put back yet"
+    if report.get("hooks_before"):  # the only copy of a hook it replaced (a hand edit's)
+        return "a live-move repair report holding git hooks the repair replaced (hooks-before/)"
     block = report.get("restore")
     if (
         isinstance(block, dict)
@@ -69,8 +81,20 @@ def reason(report: object) -> str | None:
 def keep(folder: str) -> str | None:
     """Why ``folder`` is kept, or None when the prune may take it."""
     name = os.path.basename(folder.rstrip("/"))
-    if RUN_NAME.fullmatch(name):
-        return _held_by(os.path.dirname(folder.rstrip("/")) or ".", name)
+    if m := RUN_NAME.fullmatch(name):
+        root = os.path.dirname(folder.rstrip("/")) or "."
+        if m.group(1):
+            report = os.path.join(root, f"{m.group(1)}-live-move-repair")
+            try:
+                there = stat.S_ISDIR(os.lstat(report).st_mode)
+            except FileNotFoundError:
+                there = False
+            except OSError:  # cannot tell: kept (#4364 review)
+                return f"a restore run of the report {m.group(1)}-live-move-repair, which cannot be read"
+            if there:
+                # Tied to its report by name (#4011): it lives as long as the report.
+                return f"a restore run of the report {m.group(1)}-live-move-repair, kept while it is"
+        return _held_by(root, name)
     if not REPORT_NAME.fullmatch(name):
         return None
     return _report_keep(folder)
