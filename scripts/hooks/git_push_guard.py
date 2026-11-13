@@ -359,6 +359,7 @@ try:
         git_subcommand,
         git_subcommand_index,
         has_trailing_override,
+        locale_candidates,
         mentions,
         push_arg_stream,
         split_segments,
@@ -15492,7 +15493,20 @@ def _run_merge_and_push_gates() -> int:
         # `_mentions_gated_op` whenever the operation is spelled, which is the
         # honest split: an unreadable program naming a publish is worth
         # refusing, an unreadable program naming nothing is a Tuesday.
-        hidden_gated_verb = any(s.verb_unresolved and s.exe in _GATED_EXES for s in segs)
+        #
+        # A segment whose program word is in `$"..."` locale quoting is the same
+        # fact one word to the left: the parser reports it and names the program
+        # the untranslated reading runs, and when that is git or gh the operation
+        # is as unestablished as a built verb leaves it. A shell handed its script
+        # (or its `-c`) in that quoting is the same fact one level down: the
+        # parser keeps the untranslated script as a candidate and
+        # `locale_candidates` names the dispatchers it mentions. Read per segment
+        # too, so neither can ride a visible push in the same command.
+        hidden_gated_verb = any(
+            (s.verb_unresolved and s.exe in _GATED_EXES)
+            or bool(locale_candidates(s) & _GATED_EXES)
+            for s in segs
+        )
         # A bounds-type blind spot withholds the segments, and this fact with them:
         # MEASURED, a continuation elsewhere in the command changed this guard's
         # verdict on an unresolved verb. Recover the fact from the command itself.
