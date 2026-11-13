@@ -204,7 +204,16 @@ try:
         INLINE_P3_RE as _INLINE_P3_RE,
     )
     from review_findings import (
+        cr_findings as _cr_findings,
+    )
+    from review_findings import (
         cr_header_fields as _cr_header_fields,
+    )
+    from review_findings import (
+        cr_markup_mask as _cr_markup_mask,
+    )
+    from review_findings import (
+        cr_masks as _cr_masks,
     )
     from review_findings import (
         cr_severity as _cr_severity,
@@ -254,6 +263,15 @@ except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate on
         raise RuntimeError(_REVIEW_FINDINGS_ERROR)
 
     def _is_cr_marker_line(line):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
+    def _cr_findings(body):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
+    def _cr_markup_mask(body):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
+    def _cr_masks(body, bq_depths=None):  # type: ignore[no-redef]
         raise RuntimeError(_REVIEW_FINDINGS_ERROR)
 
 # This module imports nothing from `review_state`. It once imported the escalation
@@ -1879,13 +1897,6 @@ def _review_bots(sets: dict[str, frozenset[str]]) -> frozenset[str]:
 # above matches and the if/elif has no else. Read, not recognised; a PR carrying
 # a Major reported `inline-findings: ok`, indistinguishable from a clean one.
 _CR_BLOCKING_SEVERITIES = frozenset({"critical", "major"})
-# CodeRabbit bundles SEVERAL findings into ONE inline comment, separated by a
-# markdown rule, when they land near each other in the diff. Each segment is
-# its own finding with its own severity.
-# At most THREE leading spaces: CommonMark reads a 4+-space-indented rule as
-# CODE, and CodeRabbit quotes markdown as indented code blocks — an indented
-# `---` inside quoted code must not become a finding boundary (Codex P2, #1677).
-_CR_FINDING_SPLIT_RE = re.compile(r"^ {0,3}-{3,}\s*$", re.M)
 # Scoring policy (2026-09-03, issue #1642): Critical and Major each score a full
 # 1.0; every other level scores 0 and is surfaced only. Deliberately fed through
 # the SAME weighted machinery as the Codex findings rather than a second blocking
@@ -2354,190 +2365,6 @@ def _safe_title(raw: str) -> str:
     # bounding it is a selection rather than an amputation — but say that a cut
     # happened, so a clipped title is never read as the whole finding.
     return safe[: _INLINE_TITLE_MAX_CHARS - 1].rstrip() + "…"
-
-
-#: An opening or closing code fence: three-or-more backticks/tildes, then an
-#: optional info string. Captured separately because CommonMark's CLOSING rule
-#: depends on both — same character, at least as long, and no info string.
-_CR_FENCE_RE = re.compile(r"^(`{3,}|~{3,})(.*)$")
-
-
-def _cr_markup_mask(body: str) -> list[bool]:
-    """Per line: True when it sits inside a fenced block OR a ``<details>`` section.
-
-    The union, for callers that treat both as quoted content. A caller that must
-    keep ``<details>`` VISIBLE — the outside-diff parser, whose findings are
-    nested two levels deep inside them by construction — takes the fence half
-    alone from ``_cr_masks``. Both halves come from one implementation on
-    purpose: fence tracking is subtle (CommonMark close rules, the four-backtick
-    suggestion case, the unclosed-fence recovery), and a second copy of it is
-    how #1677 would come back on a surface nobody re-reads.
-    """
-    fence_mask, details_mask = _cr_masks(body)
-    return [f or d for f, d in zip(fence_mask, details_mask, strict=True)]
-
-
-def _cr_masks(
-    body: str, bq_depths: list[int] | None = None
-) -> tuple[list[bool], list[bool]]:
-    """``(fence_mask, details_mask)`` per line — the two kept SEPARATE.
-
-    Per line: True when it sits inside a fenced block or a ``<details>`` section.
-
-    Shared by the splitter and the title extractor because they MUST agree about
-    what is quoted content. They did not: the title extractor skipped fences while
-    the splitter cut across them, so a horizontal rule inside a ```suggestion```
-    manufactured a finding out of quoted markdown — which the title extractor then
-    could only name by its severity header.
-
-    MEASURED before the fix, on a body CodeRabbit plausibly emits (a Minor whose
-    suggestion edits a markdown file containing a rule and an italic two-field
-    line): one Minor finding split into two, the second reading as a MAJOR, and a
-    non-blocking review blocking the merge on the strength of quoted code.
-
-    Fence lines and the ``<details>`` tags themselves count as markup — they are
-    never finding content. ``<details>`` is tracked only OUTSIDE a fence, matching
-    how a markdown renderer reads it.
-    """
-    lines = body.split("\n")
-    # Fence and <details> contributions are tracked as SEPARATE masks and OR'd
-    # at the end, because each has an unclosed-construct recovery that clears
-    # its own contribution — and clearing a single combined mask would also
-    # unmask the OTHER construct's quoted content, silently re-opening the
-    # fence bug whenever a fence sits inside an unclosed <details>.
-    fence_mask = [False] * len(lines)
-    details_mask = [False] * len(lines)
-    fence_char: str | None = None
-    fence_len = 0
-    fence_opened_at: int | None = None
-    # The blockquote depth the OPEN fence was opened at. A renderer scopes a
-    # fence to its container, so only a delimiter in the SAME container can
-    # close it; `bq_depths` is None for callers reading text that never had a
-    # quote prefix stripped, and every depth is then 0, which is exactly the
-    # previous behaviour.
-    fence_bq = 0
-    details_depth = 0
-    details_opened_at: int | None = None
-    for idx, line in enumerate(lines):
-        depth = bq_depths[idx] if bq_depths is not None and idx < len(bq_depths) else 0
-        stripped = line.strip()
-        # CommonMark gives fence DELIMITERS at most three leading spaces; a
-        # 4+-space-indented backtick run is code CONTENT. Stripping first and
-        # matching meant an indented ```` line inside a four-backtick
-        # suggestion closed the outer fence (Codex P2, #1677).
-        indent = len(line) - len(line.lstrip(" \t"))
-        fence = _CR_FENCE_RE.match(stripped) if indent <= 3 else None
-        if fence:
-            run, info = fence.group(1), fence.group(2).strip()
-            if fence_char is None:
-                fence_char, fence_len, fence_opened_at = run[0], len(run), idx
-                fence_bq = depth
-            elif (
-                depth == fence_bq
-                and run[0] == fence_char
-                and len(run) >= fence_len
-                and not info
-            ):
-                # CommonMark: a closing fence uses the SAME character, is at
-                # least as long as the opener, and carries NO info string.
-                # Toggling on any fence line broke on CodeRabbit's own output:
-                # it wraps a suggestion in FOUR backticks precisely when the
-                # suggested markdown contains a three-backtick fence, so the
-                # inner ```md closed the outer block and everything after it —
-                # a quoted `---` and a Major-shaped header — was read as real
-                # findings, blocking a merge on the strength of quoted content
-                # (Codex P2, PR #1677).
-                fence_char, fence_len, fence_opened_at = None, 0, None
-            fence_mask[idx] = True
-            continue
-        if fence_char is not None:
-            fence_mask[idx] = True
-            continue
-        low = stripped.casefold()
-        if low.startswith("<details"):
-            # Nesting is a DEPTH, not a boolean: valid nested <details> meant
-            # the INNER close unmasked the rest of the outer collapsed section,
-            # so a quoted rule + severity header there manufactured a blocking
-            # finding out of collapsed content (Codex P2, PR #1677).
-            if details_depth == 0:
-                details_opened_at = idx
-            details_depth += 1
-            details_mask[idx] = True
-            continue
-        if low.startswith("</details"):
-            details_depth = max(0, details_depth - 1)
-            if details_depth == 0:
-                details_opened_at = None
-            details_mask[idx] = True
-            continue
-        details_mask[idx] = details_depth > 0
-    if fence_opened_at is not None:
-        # An UNCLOSED fence. CommonMark says it runs to the end of the document,
-        # and masking to the end is therefore "correct" — but this mask decides
-        # what the merge gate is allowed to SEE, and hiding every finding after a
-        # stray backtick run is the fail-OPEN direction: a real Critical goes
-        # unreported and the merge proceeds. A phantom finding, the other error,
-        # blocks loudly and gets looked at. So a fence that never closes is
-        # treated as ordinary content from the line it opened on.
-        for i in range(fence_opened_at, len(lines)):
-            fence_mask[i] = False
-    if details_opened_at is not None:
-        # An UNCLOSED <details> gets the same recovery for the same reason: a
-        # stray tag must not hide a later genuine Major from the gate. Only the
-        # details CONTRIBUTION is cleared — quoted fenced content inside the
-        # section stays masked via fence_mask. A complete inner section between
-        # the unclosed opener and end-of-body is unmasked too; that is the
-        # phantom-finding direction, which blocks loudly, and is accepted for
-        # the same reason the fence recovery accepts it (Codex P2, PR #1677).
-        for i in range(details_opened_at, len(lines)):
-            details_mask[i] = False
-    return fence_mask, details_mask
-
-
-def _cr_findings(body: str) -> list[str]:
-    """Split one CodeRabbit comment into its individual findings.
-
-    ONE GitHub comment is not one finding. CodeRabbit bundles several into a
-    single inline comment, separated by a markdown rule, when they land near
-    each other in the diff. Reading only the first is the ORIGINAL BUG of this
-    feature reincarnated one level down — read, then silently dropped.
-
-    MEASURED on live PR #1647, comment id 3925021846: one comment carrying two
-    distinct Major findings. Before this split, `_cr_severity` returned the
-    first and the second existed nowhere in the gate's output. The dangerous
-    ordering is Minor-then-Major: the comment scored as `minor`, landed in the
-    advisory list, and printed "below Major, NOT counted" — a false claim about
-    a Major that was never seen at all.
-
-    A segment carrying no header is folded into the previous one rather than
-    treated as a finding: a rule inside prose is not a finding boundary, and
-    splitting on it would invent findings that do not exist. That fold is not
-    sufficient on its own — it only catches a rule whose following segment has no
-    header, and quoted markdown routinely supplies one. Rules inside fenced or
-    ``<details>`` content are therefore not boundaries at all (see
-    ``_cr_markup_mask``).
-    """
-    lines = body.split("\n")
-    markup = _cr_markup_mask(body)
-    parts: list[str] = []
-    current: list[str] = []
-    for line, is_markup in zip(lines, markup, strict=True):
-        if not is_markup and _CR_FINDING_SPLIT_RE.match(line):
-            parts.append("\n".join(current))
-            current = []
-            continue
-        current.append(line)
-    parts.append("\n".join(current))
-    out: list[str] = []
-    for part in parts:
-        if not part.strip():
-            continue
-        _, header_seen = _cr_severity(part)
-        if header_seen or not out:
-            out.append(part)
-        else:
-            out[-1] = out[-1] + "\n---\n" + part
-    return out or [body]
 
 
 def _coderabbit_title(body: str) -> str:
