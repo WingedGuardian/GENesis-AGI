@@ -50,7 +50,10 @@ nothing more, nothing less?
    [If missing: list each unaddressed requirement]
    ```
 
-This step is INFORMATIONAL — it never blocks the review.
+This step is INFORMATIONAL — it never blocks the review. It is not the
+builder's check against a spec: that is `spec-converge` (build-session,
+"Verify BEFORE the PR"), which this step does not replace and which does not
+replace it.
 
 ## Step 0.6 — Premise Check
 
@@ -166,6 +169,32 @@ skill's advisory-default rule decides WHETHER to refuse; this step prices WHAT
 the refusal is allowed to remember.
 
 Like Steps 0.5 and 0.6, this step is INFORMATIONAL — it never blocks.
+
+## Step 0.8 — Spec Analysis
+
+Step 0.5 compared the diff with the stated intent. This checks the intent
+itself: when the dispatch names a plan file, a spec, or an issue that serves
+as the spec, run the read-only pass in
+`.claude/skills/spec-session/references/spec-analyze.md` on it, with any plan
+and tickets it names. It writes nothing.
+
+Put every CRITICAL finding from it on the severity ladder below. When you are
+reviewing the plan or spec itself, it is a BLOCKER: a requirement that
+conflicts with a standing rule contradicts a non-negotiable principle. When
+you are reviewing a diff, it is a BLOCKER only if the diff implements the
+conflicting requirement; otherwise it is a SHOULD-FIX against the spec. Report
+the other findings in the pass's own table.
+
+Where this ends and the builder's pass begins: Step 0.5 stays informational at
+review time; `spec-converge.md` is the builder's own pass before its PR, and
+its `Outcome:` line belongs in the PR body's `## Testing` section. When you
+review a PR whose body or dispatch names a spec, read the body for that line:
+none is a NOTE, and `converged-with-carried` names requested items that were
+left unbuilt, which you check against the owner decision each one cites.
+Step 0.5 runs either way.
+
+When the dispatch names no plan or spec, emit one line,
+`Spec-analysis: skipped (no plan or spec named)`, and go on.
 
 ## Genesis Design Principles (Non-Negotiable)
 
