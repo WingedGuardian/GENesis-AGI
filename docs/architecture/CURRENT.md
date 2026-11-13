@@ -5169,7 +5169,9 @@ logger or unrelated exceptions with copied text and no provenance.
   its class, the state's bytes as the run leaves them and an end mark of the
   checkout (HEAD, `status -z`, index.lock), so a heal that keeps a HOLD and the
   next boot's HOLD page once; a repeat of an unresolved heal (a heal that crashed
-  partway is recorded unresolved too, with one retry at the next start: owner ruling) with nothing
+  partway, or was killed before it recorded a result, is retried once at the next start: owner
+  ruling, its attempts counted from the reports on disk; an end mark the deadline left unreadable
+  never counts as a change) with nothing
   changed refuses at once with no new backup, unless another kit is installed
   (its `kit_id` is part of the match). Every run, by command too, holds the kit's
   `KIT.json` shared until it exits, so a reinstall's prune never removes a kit in use.

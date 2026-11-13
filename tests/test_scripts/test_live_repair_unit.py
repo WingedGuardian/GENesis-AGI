@@ -181,3 +181,22 @@ def test_a_hanging_queue_lib_never_holds_the_start(scratch, template):
     r = _start(template, home, repo, FAKE_RC="3")
     assert r.returncode == 0, r.stderr
     assert time.monotonic() - start < 5
+
+
+@pytest.mark.parametrize("template", TEMPLATES)
+def test_the_page_runs_under_gnutimeout_where_there_is_one(scratch, template, tmp_path):
+    """uutils `timeout` (Ubuntu 26.04) sends its KILL to the direct child only, so a
+    hung page could outlive its bound; GNU's ships there as `gnutimeout`, and the
+    line uses it when present (as scripts/lib/gnu_timeout.sh does for the scripts)."""
+    home, repo = scratch
+    _kit(home)
+    (home / ".genesis" / "update_state.json").write_text("{}")
+    bindir = tmp_path / "gnubin"
+    bindir.mkdir()
+    calls = tmp_path / "gnu_calls"
+    (bindir / "gnutimeout").write_text(f'#!/bin/sh\necho "$*" >> {calls}\nexec timeout "$@"\n')
+    (bindir / "gnutimeout").chmod(0o755)
+    r = _start(template, home, repo, FAKE_RC="3", PATH=f"{bindir}:/usr/local/bin:/usr/bin:/bin")
+    assert r.returncode == 0, r.stderr
+    assert calls.read_text().startswith("-k 1 3 bash -c "), calls.read_text()
+    assert [q["dedupe_key"] for q in _queued(home)] == ["live_move_repair:boot:kit:3:k1"]

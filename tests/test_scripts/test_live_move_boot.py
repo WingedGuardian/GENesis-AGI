@@ -10,6 +10,7 @@ kit installed into it (World.kit), as in test_live_move_repair.py.
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
@@ -257,16 +258,63 @@ def test_td36_a_heal_that_crashed_partway_twice_is_not_healed_a_third_time(w, mo
     assert len(w.backups()) == 1
     report = w.report()
     assert report["result"].startswith("unresolved: the boot repair failed partway (OSError")
-    assert report["retry_left"] == 1
     _next_start(mod, monkeypatch)
     assert _main(w, mod, monkeypatch) == REFUSE
     assert len(w.backups()) == 2, "the one retry a crashed heal is owed did not run"
-    assert w.report()["retry_left"] == 0
     keys = _keys(w)
     _next_start(mod, monkeypatch)
     assert _main(w, mod, monkeypatch) == REFUSE
     assert len(w.backups()) == 2, "a heal that crashed twice was tried a third time"
     assert all(":unresolved:" in k for k in _keys(w)[len(keys) :]), _keys(w)
+
+
+@pytest.mark.parametrize("how", ["unknown_mark", "killed_no_result"])
+def test_td36_the_one_retry_holds_when_the_crash_left_no_readable_mark(w, mod, monkeypatch, how):
+    """#4501 round 3 (Codex P2): a heal that ran out of time records its end mark
+    as "unknown" (no git past the deadline), and a heal killed outright records
+    no result at all. Attempts are counted from the reports, and an unreadable
+    mark proves no change: two backups, then every start refuses."""
+    killed_tag_side(w, "Z3")
+    if how == "unknown_mark":
+        _crash_partway(mod, monkeypatch)
+        real_mark = mod._end_mark
+        # "unknown" only while the crash is recorded (past the deadline); the
+        # next start reads a real mark, as Codex's reproduction does.
+        monkeypatch.setattr(
+            mod, "_end_mark", lambda repo: "unknown" if mod._changed else real_mark(repo)
+        )
+    else:
+
+        def killed(self, *a, **kw):  # the run dies before any result is written
+            mod._changed = True
+            raise SystemExit(137)
+
+        monkeypatch.setattr(mod.Repair, "_apply", killed)
+    for _ in range(3):
+        with contextlib.suppress(SystemExit):
+            _main(w, mod, monkeypatch)
+        _next_start(mod, monkeypatch)
+    assert len(w.backups()) == 2, f"{len(w.backups())} backups: the one retry did not hold"
+
+
+def test_td25_an_unresolved_heal_with_an_unknown_end_mark_is_not_healed_again(
+    tmp_path, monkeypatch
+):
+    """#4501 round 3 class audit: an F4 end whose end mark the deadline left
+    unknown still refuses the next start (an unknown mark is no proof of a change)."""
+    w = _symlink_world(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "x").write_text("not the checkout's\n")
+    w.write_state(w.row("partial"))
+    assert w.repair(mode="--boot").returncode == REFUSE
+    report_path = w.backups()[-1] / "REPAIR.json"
+    data = json.loads(report_path.read_text())
+    data["end_mark"] = "unknown"
+    report_path.write_text(json.dumps(data, indent=2))
+    again = w.repair(mode="--boot")
+    assert again.returncode == REFUSE, again.stderr
+    assert len(w.backups()) == 1, "an unknown end mark reopened the heal"
 
 
 def test_td36_a_crashed_heal_retried_once_heals(w, mod, monkeypatch):

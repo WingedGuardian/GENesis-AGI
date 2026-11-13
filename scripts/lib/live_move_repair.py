@@ -875,7 +875,6 @@ class Repair:
         self._fds: list[int] = []
         self.update_fd: int | None = None  # update.lock's, handed to restore-hooks
         self.forward = False  # HEAD on `live` at the target: finishing a rollback
-        self.retrying = False  # this boot retries a heal that crashed partway (owner: once)
 
     def _hold(self, path: str, deadline: float) -> int | None:
         fd = _flock(path, deadline)
@@ -1027,39 +1026,51 @@ class Repair:
     def _repeats(self, raw: bytes, judged: str) -> bool:
         """F4: the newest repair of these state bytes ended unresolved and the
         checkout is as it left it, so a new heal would end the same way, with
-        one more backup per start. Refused at once, with that run's page key."""
+        one more backup per start. Refused at once, with that run's page key.
+        A heal that crashed partway (or was killed before it recorded a
+        result) is retried once, then refused the same way (owner ruling);
+        its attempts are counted from the reports on disk (#4501 round 3), so
+        an end mark the deadline left unreadable never resets the count."""
         try:
             names = sorted(n for n in os.listdir(self.backups) if n.endswith(SUFFIX))
         except OSError:
             return False
-        # The newest report that reads (review LOW-4): a newer folder with no
-        # readable REPAIR.json never hides the run before it (newest 8 only).
-        name, report = None, None
+        # The readable reports, newest first (review LOW-4: a newer folder with
+        # no readable REPAIR.json never hides the run before it; newest 8 only).
+        reports = []
         for candidate in reversed(names[-8:]):  # bounded, as the readers read 8
             report = self._report(os.path.join(self.backups, candidate, "REPAIR.json"))
             if report is not None:
-                name = candidate
-                break
+                reports.append((candidate, report))
+        if not reports:
+            return False
+        name, report = reports[0]
         mark = _end_mark(self.repo)
         state_sha = hashlib.sha256(raw).hexdigest()
-        if isinstance(report, dict) and report.get("retry_left"):
-            # A heal that crashed partway gets one retry (owner ruling): its
-            # failure may be a one-time one (a disk briefly full).
-            if _boot().unresolved_repeat(
-                {**report, "retry_left": 0}, state_sha, mark, _KIT_ID, judged
-            ):
-                self.retrying = True
+        boot = _boot()
+        if boot.same_attempt(report, state_sha, _KIT_ID) and boot.crashed(report):
+            attempts = 0
+            for _, older in reports:
+                if not (boot.same_attempt(older, state_sha, _KIT_ID) and boot.crashed(older)):
+                    break
+                attempts += 1
+            if attempts < 2:
                 self._say(
                     f"the last repair of this update state crashed partway ({name}); trying once more"
                 )
-            return False
-        if not _boot().unresolved_repeat(report, state_sha, mark, _KIT_ID, judged):
+                return False
+            if boot.changed(report.get("end_mark"), mark):
+                return False  # the tree changed since: a heal may end otherwise
+        elif not boot.unresolved_repeat(report, state_sha, mark, _KIT_ID, judged):
             return False
         self._say(
             "the last repair of this update state ended unresolved and nothing changed "
             f"since ({name}); not healed again. " + _DOWN
         )
-        body = f"{report['result']}. Not healed again: nothing changed since {name}. {_DOWN}"
+        result = (
+            report.get("result") or "unresolved: the repair was stopped before it recorded a result"
+        )
+        body = f"{result}. Not healed again: nothing changed since {name}. {_DOWN}"
         key = _boot_key("unresolved", self.state_path, raw, mark)
         _queue("critical", _TITLES["unresolved"], body, key, os.path.join(self.backups, name))
         return True
@@ -2072,8 +2083,6 @@ def _record_unresolved(repair: Repair | None, result: str) -> None:
             return
         manifest["result"] = result
         manifest["end_mark"] = _end_mark(repair.repo)
-        # One retry at the next start, unless this run was that retry (owner ruling).
-        manifest["retry_left"] = 0 if repair.retrying else 1
         write_json(path, manifest, private=True)
     except Exception as exc:  # noqa: BLE001 - never masks the boot refusal
         _log(f"could not record the failed heal in {path} ({type(exc).__name__}: {exc})")

@@ -104,6 +104,34 @@ def key(cls: str, state: bytes, mark: str) -> str:
     return f"live_move_repair:boot:{cls}:{digest}"
 
 
+CRASHED = "unresolved: the boot repair failed partway"  # _record_unresolved's result
+
+
+def changed(stored: object, now: object) -> bool:
+    """Did the checkout change between two end marks? Only provable when both
+    are real marks: one the deadline left "unknown" (or never written) proves
+    nothing, so it never counts as a change (#4501 round 3)."""
+    return _real_mark(stored) and _real_mark(now) and stored != now
+
+
+def _real_mark(mark: object) -> bool:
+    return isinstance(mark, str) and len(mark) == 64 and mark != "unknown"
+
+
+def same_attempt(report: dict, state_sha: str, kit_id: str | None) -> bool:
+    """A repair of these state bytes by this kit."""
+    return report.get("state_sha") == state_sha and report.get("kit_id") == kit_id
+
+
+def crashed(report: dict) -> bool:
+    """A heal that crashed partway, or one killed before it recorded a result
+    (None, or "superseded", which the next heal's _save writes over None)."""
+    result = report.get("result")
+    return result in (None, "superseded") or (
+        isinstance(result, str) and result.startswith(CRASHED)
+    )
+
+
 def unresolved_repeat(
     report: dict | None, state_sha: str, mark: str, kit_id: str | None, judged: str | None = None
 ) -> bool:
@@ -112,16 +140,15 @@ def unresolved_repeat(
     way. A newly installed kit tries again: it may be the fix. A heal that
     recorded what the guard judged as it ended (``end_verdict``) repeats only
     while the guard judges ``judged`` the same: residue outside the checkout
-    (through a tracked symlink) can go without changing the end mark."""
+    (through a tracked symlink) can go without changing the end mark. An end
+    mark nobody could read is not proof of a change."""
     if not isinstance(report, dict):
         return False
     result = report.get("result")
     return (
         isinstance(result, str)
         and result.startswith("unresolved")
-        and report.get("state_sha") == state_sha
-        and report.get("end_mark") == mark
-        and report.get("kit_id") == kit_id
+        and same_attempt(report, state_sha, kit_id)
+        and not changed(report.get("end_mark"), mark)
         and report.get("end_verdict", judged) == judged
-        and not report.get("retry_left")  # a crashed heal's one retry is owed
     )
