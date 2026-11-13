@@ -1,0 +1,4 @@
+{
+  "description": "genesis-secret-redact: the in-process mod that keeps secrets.env values out of a session",
+  "modules": ["./register.js"]
+}

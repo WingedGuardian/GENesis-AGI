@@ -5,7 +5,7 @@ A review ROUND is a commit head that drew findings (``review_budget``). Before
 fixing anything in an open round, the session reads the round as data and
 commits a reflection that answers for every finding in it: how the findings
 distribute, whether the change's premise holds, how the PR's scope fares, the
-decision, and one disposition per finding (fix now, or file it). The
+decision, and one disposition per finding (fix now, file it, or no defect). The
 reflection is an EMPTY commit whose message is the reflection, so no reviewer
 is ever triggered by it.
 
@@ -28,6 +28,15 @@ hole; a closed grammar has none of those to handle::
     Disposition: c101 fix-now test=1
     Disposition: c102 file issue=#123
     Escalate: no
+
+No-defect dispositions use ``c<ID> no-defect reply=<ID>`` for inline findings
+or ``r<reviewID>:<count> no-defect comment=<ID>`` / ``i<ID> no-defect comment=<ID>``.
+The cited maintainer reply must answer that inline finding on this PR; a cited
+issue comment must start with ``No-defect: <full-key>`` followed by a nonempty
+rationale. A review-body key covers its entire counted group, not one ordinal.
+Citations must predate the reflection (including edits). ``Decision: acknowledge``
+is allowed only for nonempty all-no-defect reflections. Offline validation checks
+syntax only; coverage validates citations online and retains every other gate.
 
 Rounds that owe more add ``Audit-evidence: <path> <label>``, or two
 ``Premise-check: P1 TRUE <text>`` lines plus ``Premise-evidence: <path>
@@ -127,11 +136,11 @@ FIELDS: dict[str, tuple[re.Pattern[str], int, int | None]] = {
     "Premise-why": (re.compile(rf"^Premise-why: ({_TEXT})$"), 1, 1),
     "Impossible": (re.compile(rf"^Impossible: ({_TEXT})$"), 1, 1),
     "Scope": (re.compile(rf"^Scope: ({_TEXT})$"), 1, None),
-    "Decision": (re.compile(r"^Decision: (fix-instances|close-class|rework|send-back)$"), 1, 1),
+    "Decision": (re.compile(r"^Decision: (fix-instances|close-class|rework|send-back|acknowledge)$"), 1, 1),
     "Decision-why": (re.compile(rf"^Decision-why: ({_TEXT})$"), 1, 1),
     "Disposition": (
         re.compile(
-            rf"^Disposition: ({_KEY}) (fix-now test=[1-4](?:,[1-4]){{0,3}}|file issue=#[1-9][0-9]{{0,6}})$"
+            rf"^Disposition: ({_KEY}) (fix-now test=[1-4](?:,[1-4]){{0,3}}|file issue=#[1-9][0-9]{{0,6}}|no-defect (?:reply|comment)=[1-9][0-9]{{0,19}})$"
         ),
         1,
         None,
@@ -166,10 +175,17 @@ class Refused(Exception):
 # -- the reflection itself ---------------------------------------------------
 
 
+@dataclass(frozen=True)
+class Disposition:
+    kind: str
+    citation: int | None = None
+
+
 @dataclass
 class Reflection:
     head: str | None = None
     keys: list[str] = field(default_factory=list)
+    dispositions: dict[str, Disposition] = field(default_factory=dict)
     classes: list[str] = field(default_factory=list)
     verdict: str | None = None
     decision: str | None = None
@@ -293,6 +309,22 @@ def parse(
         "SUSPECT",
     }:
         result.escalate = True
+
+    for match in seen["Disposition"]:
+        key, value = match.group(1, 2)
+        kind, detail = value.split(" ", 1)
+        citation = None
+        if kind == "no-defect":
+            reference, raw_id = detail.split("=")
+            if reference != ("reply" if key.startswith("c") else "comment"):
+                result.problems.append(f"wrong citation kind for {key}")
+            citation = int(raw_id)
+        result.dispositions[key] = Disposition(kind, citation)
+    if result.decision == "acknowledge" and (
+        not result.dispositions
+        or any(d.kind != "no-defect" for d in result.dispositions.values())
+    ):
+        result.problems.append("acknowledge requires a nonempty all-no-defect reflection")
 
     disposed = [m.group(1) for m in seen["Disposition"]]
     if len(set(disposed)) != len(disposed):
@@ -998,6 +1030,69 @@ def check(
     return parsed
 
 
+def validated_dispositions(
+    parsed: Reflection, *, cwd: str, repo: str | None, number: int | None,
+    made_at: object, cache: dict[str, dict], keys: Iterable[str],
+) -> dict[str, Disposition]:
+    """Validate citations under the caller's deadline; memoize only this evaluation.
+
+    Missing/wrong evidence leaves that key owed. Unreadable API evidence is
+    unknown, never coverage. Human maintainer rationale is not machine-judged.
+    """
+    valid = {}
+    eligible = set(keys)
+    for key, disposition in parsed.dispositions.items():
+        if key not in eligible:
+            continue
+        if disposition.kind != "no-defect":
+            valid[key] = disposition
+            continue
+        if not repo or number is None:
+            raise Refused("no-defect citations require repository and PR context")
+        inline = key.startswith("c")
+        route = "pulls/comments" if inline else "issues/comments"
+        endpoint = f"repos/{repo}/{route}/{disposition.citation}"
+        if endpoint not in cache:
+            code, out, _ = _run(["gh", "api", endpoint], cwd=cwd)
+            try:
+                record = json.loads(out)
+            except ValueError as exc:
+                raise Refused("unreadable no-defect citation") from exc
+            if not isinstance(record, dict):
+                raise Refused("unreadable no-defect citation")
+            if code:
+                if record.get("status") not in (404, "404"):
+                    raise Refused("cannot read no-defect citation")
+                record = {}  # an explicitly missing citation leaves this key owed
+            cache[endpoint] = record
+        record = cache[endpoint]
+        if record.get("id") != disposition.citation:
+            continue
+        if record.get("author_association") not in {"OWNER", "MEMBER", "COLLABORATOR"}:
+            continue
+        owner_field, resource = ("pull_request_url", "pulls") if inline else ("issue_url", "issues")
+        owner = record.get(owner_field)
+        expected = f"https://api.github.com/repos/{repo}/{resource}/{number}"
+        if not isinstance(owner, str) or owner.casefold() != expected.casefold():
+            continue
+        body = record.get("body")
+        if not isinstance(body, str) or not body.strip():
+            continue
+        if inline:
+            if record.get("in_reply_to_id") != int(key[1:]):
+                continue
+        else:
+            first, separator, rationale = body.partition("\n")
+            if first.removesuffix("\r") != f"No-defect: {key}" or not separator or not rationale.strip():
+                continue
+        made = _parse_when(made_at)
+        stamps = [_parse_when(record.get(name)) for name in ("created_at", "updated_at")]
+        if made is None or any(t is None or t > made + _COMMIT_CLOCK_SLACK for t in stamps):
+            continue
+        valid[key] = disposition
+    return valid
+
+
 #: ``fix_clock``'s answer when no finding can be credited: the reflection does
 #: not descend from the head, or a fix's time could not be read.
 NEVER = datetime.max.replace(tzinfo=UTC)
@@ -1243,6 +1338,8 @@ def covered_keys(
     round_started: object,
     reviewed_at: Mapping[str, datetime | None] | None = None,
     deadline: float | None = None,
+    repo: str | None = None,
+    number: int | None = None,
 ) -> set[str]:
     """Keys answered at ``head`` by committed reflections. THE coverage check.
 
@@ -1287,6 +1384,7 @@ def covered_keys(
             acceptance=acceptance,
             round_started=round_started,
             reviewed_at=reviewed_at or {},
+            repo=repo, number=number,
         )
 
 
@@ -1301,9 +1399,12 @@ def _covered_keys(
     acceptance: Sequence[str] | None,
     round_started: object,
     reviewed_at: Mapping[str, datetime | None],
+    repo: str | None,
+    number: int | None,
 ) -> set[str]:
     log = _log_reflections(cwd)
     covered: set[str] = set()
+    cache: dict[str, dict] = {}
     for sha, kind, body, committed_at in log:
         if kind != "empty":
             continue
@@ -1338,7 +1439,11 @@ def _covered_keys(
             cwd=cwd,
         )
         if result.ok:
-            covered.update(k for k in result.keys if clears(clock, reviewed_at.get(k)))
+            valid = validated_dispositions(
+                result, cwd=cwd, repo=repo, number=number, made_at=committed_at, cache=cache,
+                keys=(k for k in result.keys if k not in covered and clears(clock, reviewed_at.get(k))),
+            )
+            covered.update(valid)
     return covered
 
 
@@ -1544,6 +1649,8 @@ def _open_covered(
     state: Mapping[str, Any],
     acceptance: Sequence[str] | None,
     deadline: float | None = None,
+    repo: str | None = None,
+    number: int | None = None,
 ) -> set[str]:
     """``covered_keys`` for the open round, every argument taken from the budget."""
     return covered_keys(
@@ -1562,6 +1669,7 @@ def _open_covered(
         round_started=state["round_started"],
         reviewed_at=_open_review_times(budget),
         deadline=deadline,
+        repo=repo, number=number,
     )
 
 
@@ -1593,7 +1701,7 @@ def owed_from_budget(
         # (keys unknown, or no single round entry for the head) stays None.
         if state["status"] == "ok" and state["round_state"] == "open" and state["owed"] is not None:
             acceptance = _acceptance(budget, repo, number)
-            covered = _open_covered(cwd, budget, state, acceptance, deadline)
+            covered = _open_covered(cwd, budget, state, acceptance, deadline, repo, number)
             state["owed"] = [k for k in state["open_keys"] if k not in covered]
         return state
 
@@ -1648,6 +1756,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parsed = parse(text, round_number=args.round, gate_lane=args.gate)
         for problem in parsed.problems:
             print(f"- {problem}")
+        if parsed.ok and any(d.kind == "no-defect" for d in parsed.dispositions.values()):
+            print("Syntax valid; no-defect citations require online coverage validation.")
         return 0 if parsed.ok else 1
     except Exception as exc:  # noqa: BLE001
         # Exit 1 means "the reflection is invalid"; anything that stopped the

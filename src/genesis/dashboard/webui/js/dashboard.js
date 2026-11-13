@@ -3530,7 +3530,14 @@
 
         async toggleProvider(name) {
           try {
-            const resp = await fetchApi(`/api/genesis/providers/${name}/toggle`, { method: "POST" });
+            // Send the action the button showed: the polled state it was
+            // rendered from can be stale by the time of the click.
+            const enabled = this.breakerIsOpen(name);
+            const resp = await fetchApi(`/api/genesis/providers/${name}/toggle`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ enabled }),
+            });
             if (resp?.ok) {
               await Promise.all([this.fetchProvidersDetail(), this.fetchRoutingConfig()]);
             } else {

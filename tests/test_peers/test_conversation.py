@@ -1167,6 +1167,35 @@ async def test_approvals_page_and_task_projection_is_a_bounded_check(bridge):
     assert [a["approvalId"] for a in after] == [a["approvalId"] for a in second]
 
 
+async def test_a_shared_credential_shape_blanks_approval_details_and_tools_summary(bridge):
+    from genesis.db.crud import approval_requests
+
+    value = "nvapi-" + "a" * 40  # synthetic, built from parts
+    identity = bridge.identities["alpha"]
+    row = await settle(bridge, await bridge.service.send(identity, incoming()))
+    for n, description in enumerate(["Send the weekly note", f"Send {value} to the vendor"]):
+        await approval_requests.create(
+            bridge.db,
+            id=f"synthetic-approval-{n}",
+            action_type="email_send",
+            action_class="irreversible",
+            description=description,
+            context=json.dumps({"agent_session_id": row["id"]}),
+            created_at=f"2026-01-01T00:00:0{n}",
+        )
+    (kept, withheld), _ = await bridge.service.approvals(identity, 2)
+    assert (kept["actionType"], kept["description"]) == ("email_send", "Send the weekly note")
+    assert withheld["actionType"] == "owner_action"
+    assert withheld["description"] == "Owner action pending; details withheld"
+    meta = json.loads(row["metadata"])
+    meta["tools_summary"] = {"Bash": 3}
+    row["metadata"] = json.dumps(meta)
+    assert project(row)["metadata"]["toolsSummary"] == {"Bash": 3}
+    meta["tools_summary"] = {"Bash": 3, "note": value}
+    row["metadata"] = json.dumps(meta)
+    assert project(row)["metadata"]["toolsSummary"] == {}
+
+
 @pytest.mark.parametrize("context", ["not-a-uuid", "unowned"])
 async def test_bad_continuation_anchor_is_refused_before_identity_work(
     bridge, monkeypatch, context
