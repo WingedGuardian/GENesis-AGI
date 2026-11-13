@@ -62,12 +62,19 @@ logger = logging.getLogger(__name__)
 # A. Credential pair — broadened. Any credential-label word near a value.
 # Doesn't require BOTH user+pass — a single "password: X" is enough.
 _LABEL_WORDS = r"(?:user(?:name)?|login|pass(?:word)?|pwd|email|handle|account)"
+# Copula words a bare-whitespace separator can leave standing between a
+# label and the real value ("login is username: admin"): without this the
+# copula itself is captured as the login. Trade-off, same class as the
+# label words above: a credential literally named "is"/"were" is no longer
+# captured as a value on this path (a password literally "password" was
+# already un-capturable). Copulas are far more often separators than values.
+_COPULA_WORDS = r"(?:is|are|was|were)"
 _CREDENTIAL_PAIR_PATTERN = re.compile(
     r"\b(?:username|user|login)\s*(?:is\s+|[:=]\s*|\s+)"
-    rf"(?P<user>(?!{_LABEL_WORDS}\b)[^\s,;]+)"
+    rf"(?P<user>(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS})\b)[^\s,;]+)"
     r".{0,200}?"
     r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*)"
-    rf"(?P<pass>(?!{_LABEL_WORDS}\b)[^\s,;]+)",
+    rf"(?P<pass>(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS})\b)[^\s,;]+)",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -76,7 +83,7 @@ _CREDENTIAL_PAIR_PATTERN = re.compile(
 _SINGLE_CREDENTIAL_PATTERN = re.compile(
     r"\b(?:password|pass(?:word)?|pwd|passphrase|passcode|pin)"
     r"\s*(?:is\s+|[:=]\s*)"
-    r"(?P<value>[^\s,;]{4,})",
+    rf"(?P<value>(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS})\b)[^\s,;]{{4,}})",
     re.IGNORECASE,
 )
 
@@ -87,7 +94,7 @@ _EMAIL_PASSWORD_PATTERN = re.compile(
     r"(?P<email>[^\s,;]+@[^\s,;]+)"
     r".{0,200}?"
     r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*)"
-    r"(?P<pass>[^\s,;]{4,})",
+    rf"(?P<pass>(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS})\b)[^\s,;]{{4,}})",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -160,10 +167,10 @@ _ACCOUNT_LIFECYCLE_PATTERN = re.compile(
     r"\b(?:created|registered|signed?\s*up|set\s*up)\s+"
     r"(?:an?\s+)?(?:account|user|login)\s+"
     r"(?:for\s+|named?\s+|called?\s+)?"
-    r"(?P<account>[^\s,;]{2,})"
+    rf"(?P<account>(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS})\b)[^\s,;]{{2,}})"
     r".{0,200}?"
     r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*)"
-    r"(?P<pass>[^\s,;]{4,})",
+    rf"(?P<pass>(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS})\b)[^\s,;]{{4,}})",
     re.IGNORECASE | re.DOTALL,
 )
 

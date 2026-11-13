@@ -44,6 +44,58 @@ class TestClassifyCredentialPair:
         assert ref is not None
         assert ref["kind"] == "credentials"
 
+    @pytest.mark.parametrize("copula", ["is", "was", "are", "were"])
+    def test_repeated_label_with_copula_names_real_login(self, copula):
+        # "login is username: admin" must capture admin, not the copula.
+        ext = Extraction(
+            content=f"login {copula} username: admin, password: fakepw123",
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == "admin / fakepw123"
+
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            # Single pattern: a label word after "is" is not the password;
+            # the real value is reached through the repeated label.
+            ("the password is pass: secret123", "password: secret123"),
+            # Lifecycle pattern: "is" is not the account; no login is
+            # fabricated and the password is still captured.
+            (
+                "created account is admin with password: secret123",
+                "password: secret123",
+            ),
+            # Email pattern: same self-heal through the repeated label.
+            (
+                "email bob@example.com and password is pass: secret123",
+                "bob@example.com / secret123",
+            ),
+            # Lifecycle pass: same self-heal through the repeated label.
+            (
+                "created account admin with password is pass: secret123",
+                "admin / secret123",
+            ),
+        ],
+    )
+    def test_sibling_patterns_reject_label_or_copula_as_value(
+        self, content, expected
+    ):
+        ext = Extraction(
+            content=content,
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == expected
+
     def test_rejects_ephemeral_example(self):
         ext = Extraction(
             content="For example, the username: test password: secret would work",
