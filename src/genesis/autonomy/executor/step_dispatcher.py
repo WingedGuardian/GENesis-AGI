@@ -89,6 +89,8 @@ class StepDispatcher:
         workaround: str | None = None,
         worktree_path: Path | None = None,
         model_override: Any = None,
+        task_description: str | None = None,
+        planned_step_count: int | None = None,
     ) -> StepResult:
         """Execute and record a single step via CC session.
 
@@ -116,6 +118,8 @@ class StepDispatcher:
                 workaround=workaround,
                 worktree_path=worktree_path,
                 model_override=model_override,
+                task_description=task_description,
+                planned_step_count=planned_step_count,
             )
         except Exception as exc:
             duration = time.monotonic() - start
@@ -157,6 +161,8 @@ class StepDispatcher:
         workaround: str | None = None,
         worktree_path: Path | None = None,
         model_override: Any = None,
+        task_description: str | None = None,
+        planned_step_count: int | None = None,
     ) -> StepResult:
         """Dispatch step to a CC session or deterministic executor.
 
@@ -204,6 +210,8 @@ class StepDispatcher:
 
         prompt = _dispatch.build_step_prompt(
             step, prior_results, workaround, resources=resources,
+            task_description=task_description,
+            planned_step_count=planned_step_count,
         )
 
         # CODE steps use worktree working directory (Amendment #7)
@@ -424,6 +432,8 @@ class StepDispatcher:
         *,
         worktree_path: Path | None = None,
         model_override: Any = None,
+        task_description: str | None = None,
+        planned_step_count: int | None = None,
     ) -> StepResult | None:
         """Attempt workaround for a failed step. Returns new result or None."""
         if not self._workaround:
@@ -449,6 +459,8 @@ class StepDispatcher:
             workaround=wa_result.approach,
             worktree_path=worktree_path,
             model_override=model_override,
+            task_description=task_description,
+            planned_step_count=planned_step_count,
         )
         return retry if retry.status == "completed" else None
 
@@ -482,6 +494,8 @@ class StepDispatcher:
         *,
         worktree_path: Path | None = None,
         model_override: Any = None,
+        task_description: str | None = None,
+        planned_step_count: int | None = None,
     ) -> tuple[StepResult | None, ResearchResult | None]:
         """Dispatch research session. Returns (retry_result, research_result).
 
@@ -512,6 +526,8 @@ class StepDispatcher:
             workaround=research_result.approach,
             worktree_path=worktree_path,
             model_override=model_override,
+            task_description=task_description,
+            planned_step_count=planned_step_count,
         )
         if retry.status == "completed":
             return retry, research_result
