@@ -5,6 +5,7 @@ import importlib.util
 import json
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -139,6 +140,45 @@ def test_unreadable_or_inapplicable_evidence_is_unknown(repo, tmp_path, monkeypa
     assert "rounds" not in result  # unknown must not become a zero subtraction
 
 
+def test_open_round_is_unknown_when_the_gate_could_not_read_its_keys(repo, tmp_path, monkeypatch):
+    """owed_state credits nothing unless reflection_keys is "ok"; the report must
+    not show a no-defect credit the gate would never give."""
+    path, budget, calls = _case(repo, tmp_path, monkeypatch, "r7:3")
+    budget["reflection_keys"] = "unknown"
+    result = remaining.remaining_report(str(path), "o/r", 8, budget, deadline=time.monotonic() + 30)
+    assert result["status"] == "unknown"
+    assert "rounds" not in result
+
+
+def test_open_round_is_unknown_when_the_gate_late_debt_is_unknown(repo, tmp_path, monkeypatch):
+    """owed_state credits the open round only when the late debt is known; an
+    unknown late debt (here forced) must make the report unknown too."""
+    path, budget, calls = _case(repo, tmp_path, monkeypatch, "r7:3")
+    monkeypatch.setattr(remaining.late, "late_owed", lambda *a, **kw: (None, None))
+    result = remaining.remaining_report(str(path), "o/r", 8, budget, deadline=time.monotonic() + 30)
+    assert result["status"] == "unknown"
+    assert "rounds" not in result
+
+
+def test_open_round_is_dated_as_the_gate_dates_it(repo, tmp_path, monkeypatch):
+    """The report dates the open round from the gate's own state (owed_state),
+    never from the producer's opened_at, so the two cannot drift apart."""
+    path, budget, calls = _case(repo, tmp_path, monkeypatch, "r7:3")
+    budget["rounds"][0]["opened_at"] = "2026-10-01T00:00:00+00:00"
+    seen = []
+    real = rr.coverage_details
+
+    def spy(*args, **kw):
+        seen.append(kw["round_started"])
+        return real(*args, **kw)
+
+    monkeypatch.setattr(rr, "coverage_details", spy)
+    result = remaining.remaining_report(str(path), "o/r", 8, budget, deadline=time.monotonic() + 30)
+    assert result["status"] == "ok", result
+    gate = rr.owed_state(budget, set(), now=datetime.now(UTC), cutover=None)["round_started"]
+    assert seen == [gate] == [STAMP]
+
+
 def test_old_round_uses_its_own_validated_context(repo, tmp_path, monkeypatch):
     path, budget, calls = _case(repo, tmp_path, monkeypatch, "r7:3")
     old = budget["current_head"]
@@ -159,7 +199,7 @@ def test_old_round_uses_its_own_validated_context(repo, tmp_path, monkeypatch):
 def test_late_keys_use_the_late_coverage_result(repo, tmp_path, monkeypatch):
     path, budget, calls = _case(repo, tmp_path, monkeypatch, "r7:3")
     seen = []
-    monkeypatch.setattr(remaining.late, "late_findings", lambda *a: [{"key": "r7:3"}])
+    monkeypatch.setattr(remaining.late, "late_findings", lambda *a, **kw: [{"key": "r7:3"}])
     def covered(*a, **kw):
         seen.append(kw)
         return {"r7:3": rr.Disposition("no-defect", 41)}

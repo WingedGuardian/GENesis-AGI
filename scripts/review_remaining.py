@@ -34,14 +34,23 @@ def _remaining_report(cwd: str, repo: str, number: int, budget: dict, deadline: 
         raise rr.Refused("the current PR head is not in local history")
     rounds = budget.get("rounds") or []
     acceptance = rr._acceptance(budget, repo, number)
+    fix_time = late.fix_time_reader(cwd, current)
+    # The commit gate's own state, built as review_late._late_status builds it
+    # before coverage. Where the gate owes something unknown (unread round keys,
+    # unknown late debt, no single entry for the open round) it credits nothing,
+    # so the report shows no credit either; it also dates the open round.
+    gate = rr.owed_state(
+        budget, (), now=datetime.now(UTC), cutover=rr.REFLECTION_CUTOVER_ISO,
+        fix_time=fix_time, held=late.held_rounds(cwd, budget),
+    )
+    if gate["owed"] is None:
+        raise rr.Refused("the commit gate's debt is unknown")
     # A late-only head can inherit a reflection round without contributing to
     # its raw count. Only the producer's raw population belongs in these rows.
     round_heads = {entry["head"] for entry in rounds}
     counted = {**budget, "findings": [source for source in budget.get("findings") or []
                                     if source.get("head") in round_heads]}
-    found_late = late.late_findings(
-        counted, rr.REFLECTION_CUTOVER_ISO, late.fix_time_reader(cwd, current),
-    )
+    found_late = late.late_findings(counted, rr.REFLECTION_CUTOVER_ISO, fix_time)
     if found_late is None:
         raise rr.Refused("late finding attribution unknown")
     late_details = late.coverage_details(
@@ -75,13 +84,19 @@ def _remaining_report(cwd: str, repo: str, number: int, budget: dict, deadline: 
         if keys & attributed or sum(_weight(k) for k in keys) != raw:
             raise rr.Refused("finding attribution unknown")
         attributed.update(keys)
+        if is_open:
+            started = gate["round_started"]
+            if started is None:
+                raise rr.Refused("open round's start unknown")
+        else:
+            started = context.round_started
         normal = rr.coverage_details(
             cwd, head,
             round_number=int(budget["count"]) if is_open else context.round_number,
             gate_lane=bool(budget.get("gate_surface")),
             prior_heads=[r["head"] for r in rounds if r["head"] != head] if is_open else context.prior_heads,
             key_rounds=rr.key_rounds(budget),
-            acceptance=acceptance, round_started=entry["opened_at"],
+            acceptance=acceptance, round_started=started,
             reviewed_at=rr._open_review_times(projected), deadline=deadline,
             repo=repo, number=number, wanted_keys=keys - late_keys,
         ) if keys - late_keys else {}
