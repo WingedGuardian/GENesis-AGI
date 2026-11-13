@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import hashlib
-import json
 import logging
 import os
 import re
@@ -886,24 +885,54 @@ def _content_match(
     return matched, None, skipped + dropped, screen, len(unscreened)
 
 
+def _rg_path_lines(out: bytes) -> list[tuple[str, int]]:
+    """(path, line number) pairs from `rg -n -H --null -M 1` output.
+
+    Each record is ``path NUL number ":" marker "\\n"``. Parsed from the
+    front, not by splitting on newlines: a path may itself hold one, and the
+    NUL is the only byte it cannot hold.
+    """
+    pairs: list[tuple[str, int]] = []
+    pos = 0
+    while pos < len(out):
+        nul = out.find(b"\0", pos)
+        if nul < 0:
+            break
+        colon = out.find(b":", nul + 1)
+        end = out.find(b"\n", nul + 1)
+        if end < 0:
+            end = len(out)
+        if 0 <= colon < end and out[nul + 1:colon].isdigit():
+            pairs.append((os.fsdecode(out[pos:nul]), int(out[nul + 1:colon])))
+        pos = end + 1
+    return pairs
+
+
 def _content_match_rg(
     records: list[dict], contains: str, regex: bool, values: frozenset[str],
     exempt: dict[str, bytes], needs_public: set[str],
 ) -> tuple[list[dict], int] | None:
     """rg-backed content match: (matches, files dropped), or None to fall back to Python.
 
-    rg first nominates files (``rg -l``). Each nominated file is then read
-    once by ``_screened_text``, and rg matches again on exactly that screened
-    text, given on stdin: nothing rg read from disk is returned, so a file
-    written after the screen can only be judged on its new bytes, and the
-    pattern still runs in rg's linear-time engine rather than Python's.
+    rg only says WHERE: one search per chunk of paths yields (file, line
+    number) pairs, in rg's linear-time engine. Each file it names is then read
+    once by ``_screened_text``, and the text returned is that read's line at
+    the number, never rg's copy: rg read the file separately, so a file written
+    in between is judged on its new bytes. For a fixed string the screened line
+    must still contain it; for a regex a file that changed in between can at
+    worst return a screened line that no longer matches.
     """
     by_path = {str(r["path"]): r for r in records}
     if not by_path:
         return [], 0
-    nominated: set[str] = set()
+    hits: dict[str, list[int]] = {}
     paths = list(by_path.keys())
-    base = ["rg", "-l", "--null", "--no-messages", "--max-filesize", "1M"]
+    # Path and line number only: `-M 1` replaces every matching line's text with
+    # a short marker, so rg's output stays small however long the lines are.
+    base = [
+        "rg", "--no-config", "-n", "-H", "--null", "-M", "1",
+        "--max-filesize", "1M", "-m", str(_MAX_MATCHES_PER_FILE),
+    ]
     if not regex:
         base.append("-F")
     base += ["-e", contains, "--"]
@@ -915,15 +944,13 @@ def _content_match_rg(
             return None  # fall back entirely for a consistent result
         if proc.returncode not in (0, 1):  # 0=matches, 1=no matches; >=2 = error
             return None
-        nominated.update(os.fsdecode(name) for name in proc.stdout.split(b"\0") if name)
-    on_text = ["rg", "--json", "-m", str(_MAX_MATCHES_PER_FILE)]
-    if not regex:
-        on_text.append("-F")
-    on_text += ["-e", contains, "-"]
+        for name, number in _rg_path_lines(proc.stdout):
+            if name in by_path:
+                hits.setdefault(name, []).append(number)
     out: list[dict] = []
     dropped = 0
     for p, rec in by_path.items():
-        if p not in nominated:
+        if p not in hits:
             continue
         text, was_dropped = _screened_text(p, values, exempt, needs_public, rec.get("file_id"))
         if was_dropped:
@@ -931,34 +958,17 @@ def _content_match_rg(
             continue
         if text is None:
             continue
-        try:
-            proc = subprocess.run(
-                on_text, input=text.encode("utf-8"), capture_output=True, timeout=60,
-            )
-        except subprocess.TimeoutExpired:
-            continue  # this file is not returned; the screen still holds
-        except OSError:
-            return None
-        if proc.returncode not in (0, 1):
-            return None
         lines = text.split("\n")
         matches: list[dict] = []
-        for raw in proc.stdout.split(b"\n"):
-            try:
-                evt = json.loads(raw) if raw else None
-            except ValueError:
+        for number in hits[p][:_MAX_MATCHES_PER_FILE]:
+            if not 0 < number <= len(lines):
                 continue
-            if not evt or evt.get("type") != "match":
-                continue
-            data = evt.get("data", {})
-            number = data.get("line_number")
-            if not isinstance(number, int):
-                continue
-            if 0 < number <= len(lines):
-                # The returned text is the screened line, never rg's copy of it.
-                matches.append({"line": number, "text": lines[number - 1].strip()[:_SNIPPET_CHARS]})
+            line = lines[number - 1]
+            if not regex and contains not in line:
+                continue  # changed since rg read it
+            matches.append({"line": number, "text": line.strip()[:_SNIPPET_CHARS]})
         if matches:
-            out.append({**rec, "matches": matches[:_MAX_MATCHES_PER_FILE]})
+            out.append({**rec, "matches": matches})
     return out, dropped
 
 

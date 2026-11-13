@@ -789,7 +789,12 @@ jobs:
         # collection on an unqualified stack (#4058/#4095), and
         # test_live_closure::test_the_box_lock_and_basetemp_keep_their_real_home_locations,
         # "no lock expected here (no install)" (#3719). 602 + 2 = 604.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 604
+        # locate content search (#4418): two rg-only cases skip because this job
+        # does not install ripgrep (test_locate.py::
+        # test_a_secret_bearing_file_with_a_line_break_in_its_name_is_skipped
+        # [\n] and [\r], "rg not on PATH"), measured in run 43313729694's JUnit,
+        # 604 -> 606.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 606
 
   test-ubuntu-2404:
     # ubuntu-latest is moving to 26.04, so `test` alone stops showing a break on

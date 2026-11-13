@@ -549,7 +549,7 @@ async def test_a_tracked_file_edited_since_head_is_not_exempt(roots, monkeypatch
 async def test_a_secret_bearing_file_with_a_line_break_in_its_name_is_skipped(
     roots, monkeypatch, sep
 ):
-    # rg -l prints one path per line; a name holding a line break came back
+    # rg prints one record per line; a name holding a line break came back
     # as two fragments, neither equal to the file, so the file was searched.
     if shutil.which("rg") is None:
         pytest.skip("rg not on PATH")
@@ -984,37 +984,38 @@ async def test_a_public_file_edited_after_its_exemption_is_screened(roots, monke
     assert r["content_skipped_credential_files"] == 1
 
 
-def test_rg_matches_only_the_screened_bytes_on_stdin(roots, monkeypatch):
-    # rg reads a file separately from the screen, so nothing it read from disk
-    # is returned: each listed file is read once, screened, and rg matches
-    # again on exactly those bytes, given on stdin (keeping rg's linear-time
-    # engine). A stale exemption never spares bytes that are not the blob.
-    import json as _json
+def test_rg_only_says_where_and_results_come_from_the_screened_read(roots, monkeypatch):
+    # rg reads a file separately from the screen, so its copy of a line is
+    # never returned: it gives line numbers, and the text comes from one
+    # screened read of each file it names. One rg search covers the whole
+    # chunk (a search per file made a repo-wide query take tens of seconds).
     import subprocess as _subprocess
 
     from genesis.mcp.memory import locate
 
-    clean = _touch(roots["repo"] / "clean.md", content="probe one\n")
+    clean = _touch(roots["repo"] / "clean.md", content="probe one\nsecond\n")
+    moved = _touch(roots["repo"] / "moved.md", content="other\nprobe now\n")
     edited = _touch(roots["repo"] / "edited.md", content=f"probe\n{_shaped_line()}\n")
     unlisted = _touch(roots["repo"] / "unlisted.md", content="probe two\n")
     stale_oid = locate._blob_oid(b"probe\n", b"0" * 40)
-    stdin_seen: list[bytes] = []
+    calls: list[list[str]] = []
 
     def fake_rg(cmd, **kw):
-        if "-l" in cmd:
-            out = (str(clean) + "\0" + str(edited) + "\0").encode()
-            return _subprocess.CompletedProcess(cmd, 0, out, b"")
-        assert cmd[-1] == "-"
-        stdin_seen.append(kw["input"])
-        evt = {"type": "match", "data": {"line_number": 1, "lines": {"text": "IGNORED\n"}}}
-        return _subprocess.CompletedProcess(cmd, 0, (_json.dumps(evt) + "\n").encode(), b"")
+        calls.append(cmd)
+        marker = b"[Omitted long matching line]\n"
+        # rg saw moved.md's match on line 1; by the screened read it is on line 2.
+        out = b"".join(
+            os.fsencode(str(p)) + b"\0" + str(n).encode() + b":" + marker
+            for p, n in ((clean, 1), (moved, 1), (edited, 1))
+        )
+        return _subprocess.CompletedProcess(cmd, 0, out, b"")
 
     monkeypatch.setattr(locate.subprocess, "run", fake_rg)
-    records = [{"path": p, "name": p.name} for p in (clean, edited, unlisted)]
+    records = [{"path": p, "name": p.name} for p in (clean, moved, edited, unlisted)]
     matched, dropped = locate._content_match_rg(
         records, "probe", False, frozenset(), {str(edited): stale_oid}, set(),
     )
-    assert stdin_seen == [b"probe one\n"]
+    assert len(calls) == 1
     assert [m["path"] for m in matched] == [clean]
     assert matched[0]["matches"] == [{"line": 1, "text": "probe one"}]
     assert dropped == 1
@@ -1149,3 +1150,13 @@ def test_a_nul_past_the_sniff_window_makes_the_file_binary(roots):
     late_nul = roots["repo"] / "late.txt"
     late_nul.write_bytes(b"x" * 9000 + b"\nprobe a\n\x00\nprobe b\n")
     assert locate._screened_text(str(late_nul), frozenset(), {}, set()) == (None, False)
+
+
+def test_rg_path_lines_survive_a_newline_in_the_path():
+    from genesis.mcp.memory import locate
+
+    out = (
+        b"/r/a.txt\x001:[Omitted long matching line]\n"
+        b"/r/b\nc.txt\x0012:[Omitted long matching line]\n"
+    )
+    assert locate._rg_path_lines(out) == [("/r/a.txt", 1), ("/r/b\nc.txt", 12)]
