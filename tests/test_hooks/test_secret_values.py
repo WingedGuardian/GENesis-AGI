@@ -47,10 +47,14 @@ def test_redact_replaces_every_spelling_of_a_known_value(canary_secrets):
     assert "not-a-secret-but-long-enough" in text
 
 
-def test_redact_passes_text_through_when_values_cannot_load(tmp_path, monkeypatch):
+def test_redact_passes_text_through_when_values_cannot_load(
+    canary_secrets, tmp_path, monkeypatch, capsys
+):
+    # The secrets file holds the canary, so only a failed load can leave it in place.
     monkeypatch.setattr(secret_values, "_LOADER", tmp_path / "missing.py")
     monkeypatch.setattr(secret_values, "_pairs", None)
     assert secret_values.redact(f"value {KEY}") == f"value {KEY}"
+    assert "known values not loaded" in capsys.readouterr().err
 
 
 def test_recall_output_carries_no_known_value(canary_secrets, capsys):
@@ -117,3 +121,46 @@ def test_observer_stores_no_known_value_even_across_the_truncation_cut(tmp_path,
     assert stored, "the observer stored nothing; the test exercised nothing"
     assert KEY not in stored
     assert KEY[:head] not in stored
+
+
+@pytest.mark.parametrize("cut", [11, 20, 38])
+def test_recall_clipped_through_a_value_shows_none_of_it(canary_secrets, capsys, cut):
+    out = pmh._writer()
+    pmh._emit_tracked(
+        out, f"[Memory | 1d | infra | id:abc] the key is {KEY[:cut]}...", "server-recall"
+    )
+    emitted = capsys.readouterr().out
+    assert KEY[:cut] not in emitted and "[secrets.env:CANARY_API_KEY]" in emitted
+
+
+def test_the_partial_backstop_leaves_ordinary_text_alone(canary_secrets):
+    text = "ck_ is a prefix and 0f1e2d3c is hex, and nothing here is long enough to be a value"
+    assert secret_values.redact(text, partial=True) == text
+
+
+def test_a_value_inside_json_text_in_a_tool_response_is_not_stored(tmp_path, canary_secrets):
+    # An MCP result carries JSON text; encoding it before the filter would escape a quoted value twice.
+    secrets = canary_secrets
+    secrets.write_text(secrets.read_text() + 'QUOTED_SECRET="pa\\"ss-0123456789-abc"\n')
+    secret_values._pairs = None
+    value = 'pa"ss-0123456789-abc'
+    payload = {
+        "tool_name": "mcp__example__lookup",
+        "session_id": "test-known-values",
+        "tool_input": {"name": "x"},
+        "tool_response": [{"type": "text", "text": json.dumps({"note": value})}],
+    }
+    stored = _observe(payload, tmp_path, secrets)
+    assert stored, "the observer stored nothing; the test exercised nothing"
+    # The tail has no character JSON escapes, so it survives any escaping: it must not be stored at all.
+    assert value not in stored and "0123456789-abc" not in stored
+
+
+def test_the_partial_backstop_skips_a_url_shaped_value(canary_secrets):
+    # A URL's start is a scheme and a user other URLs share; only token-like values are matched by their start.
+    canary_secrets.write_text(
+        canary_secrets.read_text() + "DATABASE_URL=postgres://app:longpassword123456@db.example/x\n"
+    )
+    secret_values._pairs = None
+    text = "connect with postgres://app:other@host.example/y"
+    assert secret_values.redact(text, partial=True) == text

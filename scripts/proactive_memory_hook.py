@@ -269,7 +269,7 @@ def _emit_tracked(out: BoundedStdout, text: str, block: str) -> bool:
     # Every recalled line passes here, from the server engine and the local fallback alike. Claude Code keeps this
     # hook's output as its own record of the turn, where the secret-redaction plugin cannot reach it, so known
     # secrets.env values (a credential captured into memory, say) are replaced here, at the source.
-    out.emit(redact_secret_values(text), block=block)
+    out.emit(redact_secret_values(text, partial=True), block=block)
     _RECALL_LANDED = True
     return True
 
@@ -2009,7 +2009,7 @@ def _heartbeat_read_and_inject(
 
             # Peer summaries and their recent commands can quote a value too.
             line = f"[{tag}] {detail}" if detail else f"[{tag}]"
-            out.emit(redact_secret_values(line), block="concurrent")
+            out.emit(redact_secret_values(line, partial=True), block="concurrent")
 
         if active:
             out.emit(_peer_closing_line(hidden), block="concurrent-directive")

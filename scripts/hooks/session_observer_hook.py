@@ -262,7 +262,7 @@ def _process(data: dict) -> None:
     # Tool result travels in the stdin payload (CC PostToolUse contract); the
     # old CLAUDE_TOOL_USE_RESULT env var is no longer set.
     _resp = data.get("tool_response")
-    output_raw = json.dumps(_resp) if _resp else ""
+    output_raw = json.dumps(redact_secret_values_deep(_resp)) if _resp else ""
 
     observation = {
         "ts": time.time(),
