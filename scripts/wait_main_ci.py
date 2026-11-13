@@ -6,10 +6,14 @@
 
 Run it from a checkout of the repository. Exits 0 when a run containing the
 commit concluded ``success``; 1 when one concluded red (``failure``,
-``timed_out``, ``startup_failure``), with the failing jobs printed; 2 when no
-such run concluded within the ceiling; 3 when the commit cannot be checked at
-all (unknown here, or not on ``origin/main``: pass the merge commit, not the
-PR's head).
+``timed_out``, ``startup_failure``), with the failing jobs printed; 2 when main's
+CI WAS read and no run containing the commit has concluded within the ceiling;
+3 when the commit cannot be checked (unknown here, or not on ``origin/main``:
+pass the merge commit, not the PR's head) or main's CI state could not be
+established by the deadline (the last read failed, or the search ran out of
+pages before reaching a run older than the commit). Exit 2 is the closing-session
+skill's trigger for batching merges, so it is never returned on a read this
+script could not complete.
 
 WHICH RUN COUNTS. main's ``ci.yml`` push runs share one concurrency group that
 never cancels the run in progress, but a newer push replaces the run still
@@ -46,6 +50,9 @@ DEFAULT_WAIT_S = 4 * 3600
 POLL_S = 60
 WORKFLOW = "ci.yml"
 RUN_LIMIT = 30
+#: Widening windows searched for a containing verdict, newest first. A window
+#: whose oldest run still contains the commit may be hiding the deciding run.
+RUN_WINDOWS = (RUN_LIMIT, 100, 300, 1000)
 
 #: Conclusions that say nothing about the commit; must equal git_push_guard's
 #: _MAIN_CI_NO_SIGNAL (a test pins it).
@@ -86,7 +93,7 @@ def _gh(*args: str) -> str:
     ).stdout
 
 
-def _run_list_args(repo: str | None) -> list[str]:
+def _run_list_args(repo: str | None, limit: int = RUN_LIMIT) -> list[str]:
     args = [
         "run",
         "list",
@@ -97,15 +104,41 @@ def _run_list_args(repo: str | None) -> list[str]:
         "--event",
         "push",
         "--limit",
-        str(RUN_LIMIT),
+        str(limit),
         "--json",
         "databaseId,headSha,status,conclusion",
     ]
     return args + (["--repo", repo] if repo else [])
 
 
-def _runs(repo: str | None) -> list[dict]:
-    return json.loads(_gh(*_run_list_args(repo)))
+def _runs(repo: str | None, limit: int = RUN_LIMIT) -> list[dict]:
+    return json.loads(_gh(*_run_list_args(repo, limit)))
+
+
+def search(
+    repo: str | None, contains: Callable[[str], bool]
+) -> tuple[str, Mapping[str, str] | None, bool]:
+    """``decide`` over widening windows of main's push runs.
+
+    Returns ``(state, run, complete)``. ``complete`` is True when the search saw
+    every run that could hold the verdict: the window reached a run that does
+    NOT contain the commit (older runs cannot either), or held fewer runs than
+    asked for (the end of history). A window that is full and still contains
+    the commit at its oldest row is widened; if the widest one is too, the
+    search is incomplete and its "no verdict" proves nothing."""
+    for limit in RUN_WINDOWS:
+        runs = _runs(repo, limit)
+        state, run = decide(runs, contains)
+        if state == "verdict":
+            return state, run, True
+        if len(runs) < limit:
+            return "wait", None, True
+        oldest = str(runs[-1].get("headSha") or "")
+        # Only a KNOWN commit that predates the merge proves nothing older can
+        # contain it; a row with no commit id proves nothing, so keep widening.
+        if oldest and not contains(oldest):
+            return "wait", None, True
+    return "wait", None, False
 
 
 def _contains(sha: str) -> Callable[[str], bool]:
@@ -144,7 +177,12 @@ def _failed_jobs(run_id: str, repo: str | None) -> list[str]:
     return [j["name"] for j in jobs if j.get("conclusion") not in ("success", "skipped")]
 
 
-def main(argv: list[str] | None = None, *, sleep: Callable[[float], None] = time.sleep) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("sha", help="the merge commit on main")
     parser.add_argument("--wait", type=int, default=DEFAULT_WAIT_S, help="ceiling in seconds")
@@ -157,13 +195,16 @@ def main(argv: list[str] | None = None, *, sleep: Callable[[float], None] = time
         print(f"wait_main_ci: cannot check {args.sha}: {exc}", file=sys.stderr)
         return 3
     contains = _contains(sha)
-    deadline = time.monotonic() + args.wait
+    deadline = clock() + args.wait
     while True:
         try:
             _git("fetch", "-q", "origin", "main")
-            state, run = decide(_runs(args.repo), contains)
+            state, run, observed = search(args.repo, contains)
+            if not observed:
+                print("wait_main_ci: the widest run window still ends inside runs that "
+                      "contain the commit; retrying", file=sys.stderr)
         except (Unknown, subprocess.SubprocessError, OSError, ValueError) as exc:
-            state, run = "wait", None
+            state, run, observed = "wait", None, False
             print(f"wait_main_ci: could not read main's runs ({exc}); retrying", file=sys.stderr)
         if state == "verdict" and run is not None:
             conclusion = run.get("conclusion")
@@ -184,7 +225,14 @@ def main(argv: list[str] | None = None, *, sleep: Callable[[float], None] = time
             except (subprocess.SubprocessError, OSError, ValueError):
                 print("failed jobs: (could not be read)")
             return 1
-        if time.monotonic() >= deadline:
+        if clock() >= deadline:
+            if not observed:
+                print(
+                    f"wait_main_ci: main's CI state could not be established for "
+                    f"{sha[:12]} within {args.wait}s (see the read errors above)",
+                    file=sys.stderr,
+                )
+                return 3
             print(
                 f"wait_main_ci: no run containing {sha[:12]} concluded with a signal "
                 f"within {args.wait}s",

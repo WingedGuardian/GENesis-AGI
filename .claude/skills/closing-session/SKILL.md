@@ -658,8 +658,10 @@ it** (owner ruling, 2026-10-19):
   progress, but each new push replaces the run still pending, so your merge's
   own run is often never run. The verdict is the newest run that CONTAINS your
   merge and concluded as a pass or a fail; the script finds it, and it never
-  counts a cancelled run (exit 0 pass, 1 red, 2 timed out, 3 cannot check:
-  pass the merge commit, not the PR head). A replaced run is normal: the run
+  counts a cancelled run (exit 0 pass, 1 red, 2 main's CI was read and no
+  containing run concluded in time, 3 cannot check: the commit is unknown or
+  not on main, so pass the merge commit, not the PR head, or main's CI could
+  not be read, so rerun it; exit 3 never licenses the batching below). A replaced run is normal: the run
   that replaces yours also contains your merge, so replacement alone never
   justifies skipping the wait.
   **The one exception to waiting, a jammed main CI** (owner, 2026-11-13): when

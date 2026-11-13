@@ -156,39 +156,129 @@ def test_main_waits_out_cancelled_and_pending_runs_then_reports(
             [_run(2, "new1", conclusion=conclusion), _run(1, MERGE, conclusion="cancelled")],
         ]
     )
-    monkeypatch.setattr(w, "_runs", lambda repo: next(polls))
+    monkeypatch.setattr(w, "_runs", lambda repo, limit=30: next(polls))
     slept = []
     assert w.main([MERGE, "--wait", "3600"], sleep=slept.append) == code
     assert len(slept) == 3
 
 
 def test_main_gives_up_with_2_when_nothing_concludes_with_a_signal(offline, monkeypatch):
-    monkeypatch.setattr(w, "_runs", lambda repo: [_run(1, MERGE, conclusion="cancelled")])
+    monkeypatch.setattr(w, "_runs", lambda repo, limit=30: [_run(1, MERGE, conclusion="cancelled")])
     assert w.main([MERGE, "--wait", "0"], sleep=lambda s: None) == 2
 
 
-def test_an_unreadable_run_list_keeps_waiting_rather_than_deciding(offline, monkeypatch):
-    def broken(repo):
+def test_an_unreadable_run_list_exits_3_never_the_batching_code_2(offline, monkeypatch):
+    """Exit 2 licenses batching merges (closing-session skill), so a CI state
+    that could not be read must end in 3, not 2."""
+
+    def broken(repo, limit=30):
         raise ValueError("bad json")
 
     monkeypatch.setattr(w, "_runs", broken)
-    assert w.main([MERGE, "--wait", "0"], sleep=lambda s: None) == 2
+    assert w.main([MERGE, "--wait", "0"], sleep=lambda s: None) == 3
 
 
-def test_an_unknown_ancestry_during_a_poll_keeps_waiting(offline, monkeypatch):
-    """A head the checkout does not know yet (a poll's fetch failed) must not
-    escape as a crash, whose exit 1 would read as a red main."""
+def test_an_unknown_ancestry_during_a_poll_exits_3_not_a_crash(offline, monkeypatch):
+    """A head the checkout does not know yet (a poll's fetch failed) neither
+    crashes (exit 1 would read as a red main) nor reads as 'observed' (2)."""
 
     def unknown(head):
         raise w.Unknown("bad object")
 
     monkeypatch.setattr(w, "_contains", lambda sha: unknown)
-    monkeypatch.setattr(w, "_runs", lambda repo: [_run(1, "new1", conclusion="success")])
-    assert w.main([MERGE, "--wait", "0"], sleep=lambda s: None) == 2
+    monkeypatch.setattr(w, "_runs", lambda repo, limit=30: [_run(1, "new1", conclusion="success")])
+    assert w.main([MERGE, "--wait", "0"], sleep=lambda s: None) == 3
+
+
+def test_a_read_that_recovers_before_the_deadline_still_exits_2(offline, monkeypatch):
+    """Only the LAST read decides 2 vs 3: an earlier transient failure followed
+    by a complete read with no verdict is an observed 'no verdict yet'."""
+    reads = iter([ValueError("blip"), [_run(1, MERGE, conclusion="cancelled")]])
+
+    def flaky(repo, limit=30):
+        r = next(reads)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    ticks = iter([0, 0, 10])
+    monkeypatch.setattr(w, "_runs", flaky)
+    assert w.main([MERGE, "--wait", "5"], sleep=lambda s: None, clock=lambda: next(ticks)) == 2
+
+
+def test_an_earlier_good_read_does_not_carry_over_a_failed_last_read(offline, monkeypatch):
+    """Mirror of the case above: a complete read, then failures up to the
+    deadline. The last read failed, so the state is unknown: 3, never 2."""
+    reads = iter([[_run(1, MERGE, conclusion="cancelled")], ValueError("down"), ValueError("down")])
+
+    def flaky(repo, limit=30):
+        r = next(reads)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    ticks = iter([0, 0, 1, 10])
+    monkeypatch.setattr(w, "_runs", flaky)
+    assert w.main([MERGE, "--wait", "5"], sleep=lambda s: None, clock=lambda: next(ticks)) == 3
+
+
+# --- search: past the first page ---------------------------------------------------
+
+
+def _page(n, conclusion="cancelled", status="completed", head="new"):
+    return [_run(i, f"{head}{i}", status=status, conclusion=conclusion) for i in range(n)]
+
+
+def test_search_widens_past_a_full_page_of_containing_runs_to_find_the_verdict(monkeypatch):
+    """30 newer queued or cancelled runs must not hide the containing run that
+    concluded red behind them."""
+    deep = _page(30, status="queued", conclusion="") + [_run(99, "new_deep", conclusion="failure")]
+    asked = []
+
+    def runs(repo, limit=30):
+        asked.append(limit)
+        return deep[:limit]
+
+    monkeypatch.setattr(w, "_runs", runs)
+    state, run, complete = w.search(None, _contains)
+    assert (state, run["databaseId"], complete) == ("verdict", 99, True)
+    assert asked == [30, 100]
+
+
+def test_search_stops_once_the_window_reaches_a_run_older_than_the_merge(monkeypatch):
+    rows = _page(5) + [_run(50, "old", conclusion="failure")] + _page(40, head="old")
+    asked = []
+    monkeypatch.setattr(w, "_runs", lambda repo, limit=30: asked.append(limit) or rows[:limit])
+    assert w.search(None, _contains) == ("wait", None, True)
+    assert asked == [30]
+
+
+def test_a_row_without_a_commit_id_at_the_window_edge_does_not_end_the_search(monkeypatch):
+    """An empty headSha proves nothing about what is older, so the search widens
+    rather than declaring itself complete (which would allow an unobserved 2)."""
+    asked = []
+
+    def runs(repo, limit=30):
+        asked.append(limit)
+        return _page(limit - 1) + [_run(77, "", conclusion="cancelled")]
+
+    monkeypatch.setattr(w, "_runs", runs)
+    assert w.search(None, _contains) == ("wait", None, False)
+    assert asked == list(w.RUN_WINDOWS)
+
+
+def test_search_is_incomplete_when_even_the_widest_window_is_all_containing_runs(monkeypatch):
+    monkeypatch.setattr(w, "_runs", lambda repo, limit=30: _page(limit))
+    assert w.search(None, _contains) == ("wait", None, False)
+
+
+def test_main_exits_3_when_the_search_can_never_complete(offline, monkeypatch):
+    monkeypatch.setattr(w, "_runs", lambda repo, limit=30: _page(limit))
+    assert w.main([MERGE, "--wait", "0"], sleep=lambda s: None) == 3
 
 
 def test_the_verdict_line_says_when_it_comes_from_a_later_push(offline, monkeypatch, capsys):
-    monkeypatch.setattr(w, "_runs", lambda repo: [_run(2, "new1", conclusion="failure")])
+    monkeypatch.setattr(w, "_runs", lambda repo, limit=30: [_run(2, "new1", conclusion="failure")])
     assert w.main([MERGE, "--wait", "0"], sleep=lambda s: None) == 1
     assert "a later push's run" in capsys.readouterr().out
 
