@@ -27,7 +27,8 @@ variable is ``[secrets.env:VAR]``, any other text of it ``[secrets.env:VAR~1]``,
 a multi-line value ``[secrets.env:VAR#n]``. Two texts never share a placeholder, whichever variables they
 came from.
 
-``--json`` prints ``{path, realpath, home, mtime_ns, size, needles, restore, overwritten}`` on stdout:
+``--json`` prints ``{path, realpath, home, watch, mtime_ns, size, needles, restore, overwritten}`` on stdout
+(``watch`` lists every path whose appearance or change can move the resolver to another file):
 ``needles`` is ``[{var, text, placeholder}]``, longest text first; ``restore`` is the same list read
 backwards, placeholder -> text; ``overwritten`` names the variables whose value in the file is placeholder
 text (a write stored one, and that key is gone); ``mtime_ns`` and ``size`` are the file's identity before it
@@ -76,15 +77,31 @@ def repo_root(explicit: str | None = None) -> Path:
     return Path.home() / "genesis"
 
 
-def secrets_path(root: Path) -> Path:
-    """The file this process's environment and checkout resolve to (the runtime's own rule)."""
+def _resolver(root: Path):
     resolver = root / "src" / "genesis" / "secrets_location.py"
     spec = importlib.util.spec_from_file_location("_redact_secrets_location", resolver)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load {resolver}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.resolve(environ=os.environ, repo_root=root)
+    return module
+
+
+def secrets_path(root: Path) -> Path:
+    """The file this process's environment and checkout resolve to (the runtime's own rule)."""
+    return _resolver(root).resolve(environ=os.environ, repo_root=root)
+
+
+def watched(root: Path) -> list[str]:
+    """Every path whose appearance or change can change what ``secrets_path`` returns, in the resolver's order:
+    the override alone when ``SECRETS_PATH`` is set, else the home config, the legacy places and the default."""
+    module = _resolver(root)
+    path = module.resolve(environ=os.environ, repo_root=root)
+    if os.environ.get("SECRETS_PATH"):
+        return [str(path)]
+    home = Path.home()
+    paths = [module.home_config_location(home), *module.legacy_locations(home, root), path]
+    return list(dict.fromkeys(str(p) for p in paths))
 
 
 # python-dotenv's grammar (its parser.py and variables.py, BSD-3-Clause), pattern for pattern and in its order.
@@ -270,7 +287,8 @@ def spellings(value: str) -> set[str]:
             found = ()
         for part in found:
             if part:
-                forms.update({part, urllib.parse.unquote(part)})
+                for text in {part, urllib.parse.unquote(part)}:
+                    forms.update({text, *_json_forms(text)})
     return {f for f in forms if len(f) >= MIN_LEN}
 
 
@@ -344,6 +362,7 @@ def load(root: Path) -> dict:
         "path": str(path),
         "realpath": os.path.realpath(path),
         "home": str(Path.home()),
+        "watch": watched(root),
         "mtime_ns": 0,
         "size": 0,
         "needles": [],

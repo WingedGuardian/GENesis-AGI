@@ -4,7 +4,7 @@
 Builds a scratch secrets file (selected through SECRETS_PATH, which the runtime's resolver honours), runs one
 non-interactive Claude Code session with the plugin loaded from a directory (default: this checkout's copy),
 and asks it to read the canary through every path the plugin covers and to write to the secrets file with
-Write and with Edit. Then it checks, step by step, that each scripted call ran and came back holding the
+Write (expected to be refused when it carries placeholders) and with Edit. Then it checks, step by step, that each scripted call ran and came back holding the
 placeholder (a leak scan proves nothing about a step that was skipped), that no canary value reached the model's final
 answer or any record Claude Code kept for the session (the transcript, subagent transcripts, persisted large
 outputs), and that the secrets file came out holding its values, byte for byte where the session did not change
@@ -46,6 +46,9 @@ tool named, and do not skip any:
    (the plugin is expected to refuse this write; quote the refusal and go on)
 9. Read the file {secrets} with the Read tool. Then use the Write tool to write that same file back with
    every line exactly as you read it, plus one more line at the end: CANARY_ADDED=added-value-1
+   (the plugin is expected to refuse this write; quote the refusal and go on)
+9c. Use the Edit tool on {secrets} to replace the line CANARY_REGION=test-region-1 with two lines:
+   CANARY_REGION=test-region-1 and then CANARY_ADDED=added-value-1
 10. LAST: Read {secrets} again, then use the Edit tool on it to replace the whole CANARY_API_KEY line exactly
    as you read it with the line CANARY_API_KEY_ROTATED=rotated-value-000000001 .
 (Use that path exactly as written, with its "..", every time.)
@@ -125,7 +128,7 @@ def main() -> int:
     quoted_line = f'CANARY_QUOTED_SECRET="{quoted_head}\\"mid\\"{secrets.token_hex(4)}"'
     secrets_file = base / "secrets.env"
     secrets_file.write_text(
-        f'CANARY_API_KEY={key}\nCANARY_SERVICE_TOKEN="{token}"\n{quoted_line}\n'
+        f'CANARY_API_KEY={key}\nCANARY_SERVICE_TOKEN="{token}"\n{quoted_line}\nCANARY_REGION=test-region-1\n'
     )
     # The session reaches the secrets file through another spelling of its path, which the restore check must
     # resolve. (A write through a symlink is refused before the plugin sees it: measured on 2.1.299.)
@@ -251,7 +254,16 @@ def main() -> int:
         "refused",
         error=True,
     )
-    step("step 9: the Write to the secrets file ran", ("Write",), "secrets.env", "")
+    step(
+        "step 9: a whole-file Write holding placeholders was refused",
+        ("Write",),
+        "CANARY_ADDED",
+        "refused",
+        error=True,
+    )
+    step(
+        "step 9c: the Edit anchored on a line without a secret ran", ("Edit",), "CANARY_REGION", ""
+    )
     edits = ran(("Edit",), "secrets.env")
     checks.append(
         (
@@ -297,11 +309,11 @@ def main() -> int:
         ),
         ("the token's line is unchanged", f'CANARY_SERVICE_TOKEN="{token}"' in lines, ""),
         (
-            "a Write of the whole file kept the escaped value byte for byte",
+            "the refused Write left the escaped value byte for byte",
             quoted_line in lines,
             "",
         ),
-        ("the Write applied", "CANARY_ADDED=added-value-1" in lines, ""),
+        ("the line the Edit added is there", "CANARY_ADDED=added-value-1" in lines, ""),
         ("the Edit applied", "CANARY_API_KEY_ROTATED=rotated-value-000000001" in lines, ""),
         (
             "the secrets file holds no placeholder",

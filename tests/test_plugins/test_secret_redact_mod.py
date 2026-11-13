@@ -47,7 +47,7 @@ const { execFile } = require("child_process");
       loaderRuns += 1;
       if (failLoads > 0) { failLoads -= 1; return resolve({ exitCode: 1, stdout: "", stderr: "" }); }
       // HOME is the scratch directory, so `~/secrets.env` names the scratch secrets file.
-      execFile(argv[0], argv.slice(1), { env: { ...process.env, SECRETS_PATH: spec.secrets, HOME: spec.dir }, encoding: "utf8" },
+      execFile(argv[0], argv.slice(1), { env: { ...process.env, SECRETS_PATH: spec.override ? spec.secrets : "", GENESIS_REPO_ROOT: "", HOME: spec.dir }, encoding: "utf8" },
         (err, stdout, stderr) => {
           const cut = truncate > 0 && (truncate -= 1, true);
           const hook = afterLoader; afterLoader = null;
@@ -79,7 +79,12 @@ const { execFile } = require("child_process");
 
 
 def _run(
-    tmp_path: Path, script: str, secrets: str | None = f"CANARY_API_KEY={KEY}\n", **vars_
+    tmp_path: Path,
+    script: str,
+    secrets: str | None = f"CANARY_API_KEY={KEY}\n",
+    plugin: Path = PLUGIN,
+    override: bool = True,
+    **vars_,
 ) -> dict:
     node = shutil.which("node")
     if node is None:
@@ -88,8 +93,9 @@ def _run(
     if secrets is not None:
         path.write_text(secrets)
     spec = {
-        "module": str(PLUGIN / "hooks" / "register.js"),
-        "plugin": str(PLUGIN),
+        "module": str(plugin / "hooks" / "register.js"),
+        "plugin": str(plugin),
+        "override": override,
         "secrets": str(path),
         "dir": str(tmp_path),
         "vars": {"key": KEY, "key2": KEY2, **vars_},
@@ -130,7 +136,7 @@ def test_an_errored_call_is_answered_with_its_text_redacted(tmp_path):
     assert res["out"] == {"bad": {"deny": f"exit 1: {P}"}, "identical": True}
 
 
-def test_a_write_to_the_secrets_file_gets_the_files_own_spelling_back(tmp_path):
+def test_an_edit_of_the_secrets_file_matches_the_files_own_spelling(tmp_path):
     line = 'CANARY_API_KEY="a1b2c3d4e5f60718\\"quoted\\""'
     res = _run(
         tmp_path,
@@ -139,17 +145,16 @@ def test_a_write_to_the_secrets_file_gets_the_files_own_spelling_back(tmp_path):
         const next = async e => { seen = e; return { result: "ok" }; };
         const text = 'CANARY_API_KEY="[secrets.env:CANARY_API_KEY]"';
         // Another spelling of the path, which the target check has to resolve.
-        await t.emit("tool.call", { tool: "Edit", file_path: t.dir + "/sub/../secrets.env", old_string: text, new_string: text + "\\nNEW=1" }, next);
+        await t.emit("tool.call", { tool: "Edit", file_path: t.dir + "/sub/../secrets.env", old_string: text, new_string: "CANARY_API_KEY=fresh-value-0123456789" }, next);
         const secretsEdit = seen;
         await t.emit("tool.call", { tool: "Write", file_path: t.dir + "/notes.md", content: text }, next);
-        return { old: secretsEdit.old_string, neu: secretsEdit.new_string, tool: secretsEdit.tool, elsewhere: seen.content };
+        return { old: secretsEdit.old_string, neu: secretsEdit.new_string, elsewhere: seen.content };
         """,
         secrets=f"OTHER=x\n{line}\n",
     )
     assert res["out"] == {
         "old": line,
-        "neu": line + "\nNEW=1",
-        "tool": "Edit",
+        "neu": "CANARY_API_KEY=fresh-value-0123456789",
         "elsewhere": 'CANARY_API_KEY="[secrets.env:CANARY_API_KEY]"',
     }
 
@@ -256,16 +261,16 @@ def test_each_line_of_a_multiline_value_has_its_own_placeholder_and_restores_alo
         """
         const shown = await t.emit("tool.call", { tool: "Bash" }, async () => ({ result: "2: " + t.v.second }));
         let seen;
-        await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: "A=[secrets.env:MULTI_SECRET#2]" },
+        await t.emit("tool.call", { tool: "Edit", file_path: t.secrets, old_string: "[secrets.env:MULTI_SECRET#2]", new_string: "replacement-line-0123" },
           async e => { seen = e; return { result: "ok" }; });
-        return { shown, written: seen.content };
+        return { shown, matched: seen.old_string };
         """,
         secrets=f'MULTI_SECRET="{first}\n{second}"\n',
         second=second,
     )
     assert res["out"] == {
         "shown": {"result": "2: [secrets.env:MULTI_SECRET#2]"},
-        "written": f"A={second}",
+        "matched": second,
     }
 
 
@@ -292,23 +297,23 @@ def test_no_secrets_file_means_no_redaction_and_no_failure(tmp_path):
     assert res == {"out": {"result": KEY}, "logs": []}
 
 
-def test_only_a_write_tool_aimed_at_the_secrets_file_itself_gets_values(tmp_path):
+def test_only_an_edit_aimed_at_the_secrets_file_itself_gets_values(tmp_path):
     (tmp_path / "other.env").write_text("X=1\n")
     res = _run(
         tmp_path,
         """
         const seen = {};
-        const write = async (label, tool, file_path) => {
-          await t.emit("tool.call", { tool, file_path, content: "[secrets.env:CANARY_API_KEY]", command: "[secrets.env:CANARY_API_KEY]" },
-            async e => { seen[label] = e.content; return { result: "ok" }; });
+        const edit = async (label, tool, file_path) => {
+          await t.emit("tool.call", { tool, file_path, old_string: "[secrets.env:CANARY_API_KEY]", new_string: "fresh-value-0123456789", command: "x" },
+            async e => { seen[label] = e.old_string; return { result: "ok" }; });
         };
-        await write("tilde", "Write", "~/secrets.env");          // Claude Code expands it, so it IS the file
-        await write("backup", "Write", t.secrets + ".bak");
-        await write("other env", "Write", t.dir + "/other.env");
-        await write("trailing space", "Write", t.secrets + " ");
-        await write("trailing newline", "Write", t.secrets + "\\n");
-        await write("not a write tool", "Bash", t.secrets);
-        await write("a new file in a new folder", "Write", t.dir + "/new/deeper/notes.md");
+        await edit("tilde", "Edit", "~/secrets.env");          // Claude Code expands it, so it IS the file
+        await edit("backup", "Edit", t.secrets + ".bak");
+        await edit("other env", "Edit", t.dir + "/other.env");
+        await edit("trailing space", "Edit", t.secrets + " ");
+        await edit("trailing newline", "Edit", t.secrets + "\\n");
+        await edit("not a write tool", "Bash", t.secrets);
+        await edit("a new file in a new folder", "Edit", t.dir + "/new/deeper/notes.md");
         return seen;
         """,
     )
@@ -329,8 +334,8 @@ def test_a_refusal_that_quotes_restored_input_is_redacted(tmp_path):
     res = _run(
         tmp_path,
         """
-        const quoted = await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: "K=[secrets.env:CANARY_API_KEY]" },
-          async e => ({ deny: "refused: " + e.content }));
+        const quoted = await t.emit("tool.call", { tool: "Edit", file_path: t.secrets, old_string: "K=[secrets.env:CANARY_API_KEY]", new_string: "K=fresh-value-0123456789" },
+          async e => ({ deny: "refused: " + e.old_string }));
         const plain = { deny: "refused" };
         return { quoted, identical: (await t.emit("tool.call", { tool: "Bash" }, async () => plain)) === plain };
         """,
@@ -405,7 +410,7 @@ def test_cut_off_loader_output_is_a_failed_load_and_each_new_failure_is_logged(t
     )
 
 
-def test_a_write_that_would_store_placeholder_text_as_a_value_is_refused(tmp_path):
+def test_a_write_that_would_store_placeholder_text_is_refused(tmp_path):
     res = _run(
         tmp_path,
         """
@@ -413,26 +418,23 @@ def test_a_write_that_would_store_placeholder_text_as_a_value_is_refused(tmp_pat
         const next = async e => { ran += 1; return { result: "ok" }; };
         const unknown = await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: "CANARY_API_KEY=[secrets.env:CANARY_API_KEY]\\nOTHER_TOKEN=[secrets.env:NEVER_READ]\\n" }, next);
         const edit = await t.emit("tool.call", { tool: "Edit", file_path: t.secrets, old_string: "x", new_string: "A=[secrets.env:NEVER_READ]" }, next);
+        // Even a placeholder this session can restore: what is written never comes from the restore map.
         const known = await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: "CANARY_API_KEY=[secrets.env:CANARY_API_KEY]\\n" }, next);
+        const real = await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: "CANARY_API_KEY=fresh-value-0123456789\\n" }, next);
         const elsewhere = await t.emit("tool.call", { tool: "Write", file_path: t.dir + "/notes.md", content: "[secrets.env:NEVER_READ]" }, next);
-        return { unknown: unknown.deny, edit: edit.deny, known, elsewhere, ran };
+        return { unknown: unknown.deny, edit: edit.deny, known: known.deny, real, elsewhere, ran };
         """,
     )
     out = res["out"]
+    assert "[secrets.env:NEVER_READ]" in out["unknown"] and "refused" in out["unknown"]
+    assert KEY not in out["unknown"]
+    assert "[secrets.env:NEVER_READ]" in out["edit"] and "old_string" in out["known"]
     assert (
-        "[secrets.env:NEVER_READ]" in out["unknown"]
-        and "refused" in out["unknown"]
-        and KEY not in out["unknown"]
-    )
-    assert "[secrets.env:NEVER_READ]" in out["edit"]
-    assert (
-        out["known"] == {"result": "ok"}
-        and out["elsewhere"] == {"result": "ok"}
-        and out["ran"] == 2
+        out["real"] == {"result": "ok"} and out["elsewhere"] == {"result": "ok"} and out["ran"] == 2
     )
 
 
-def test_a_file_whose_texts_share_a_value_is_written_back_byte_for_byte(tmp_path):
+def test_an_edit_matches_each_line_of_a_file_whose_texts_share_a_value(tmp_path):
     # Two variables hold one value in different quoting, and a comment keeps an encoded copy of it.
     source = (
         'FIRST_API_KEY="abcdefghijklmnop\\"quoted\\""\n'
@@ -443,35 +445,37 @@ def test_a_file_whose_texts_share_a_value_is_written_back_byte_for_byte(tmp_path
         tmp_path,
         """
         const read = await t.emit("tool.call", { tool: "Read" }, async () => ({ result: t.read() }));
-        let written;
-        await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: read.result },
-          async e => { written = e.content; return { result: "ok" }; });
-        return { shown: read.result, written };
+        const matched = [];
+        for (const line of read.result.split("\\n").filter(Boolean))
+          await t.emit("tool.call", { tool: "Edit", file_path: t.secrets, old_string: line, new_string: "A=fresh-value-0123456789" },
+            async e => { matched.push(e.old_string); return { result: "ok" }; });
+        return { shown: read.result, matched };
         """,
         secrets=source,
     )
     assert "abcdefghijklmnop" not in res["out"]["shown"]
-    assert res["out"]["written"] == source
+    assert res["out"]["matched"] == source.splitlines()
 
 
 def test_a_rotated_out_value_keeps_a_placeholder_of_its_own(tmp_path):
-    # The old line is kept as a comment. Both values must stay redacted, under different names, or writing the
-    # file back would turn the comment into the new key.
+    # The old line is kept as a comment. Both values stay redacted, under different names, and an Edit can name
+    # either line.
     res = _run(
         tmp_path,
         """
         await t.emit("session.start", {});
         t.write("# old: CANARY_API_KEY=" + t.v.key + "\\nCANARY_API_KEY=" + t.v.key2 + "\\n");
         const read = await t.emit("tool.call", { tool: "Read" }, async () => ({ result: t.read() }));
-        let written;
-        await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: read.result },
-          async e => { written = e.content; return { result: "ok" }; });
-        return { shown: read.result, same: written === t.read() };
+        const matched = [];
+        for (const line of read.result.split("\\n").filter(Boolean))
+          await t.emit("tool.call", { tool: "Edit", file_path: t.secrets, old_string: line, new_string: "A=fresh-value-0123456789" },
+            async e => { matched.push(e.old_string); return { result: "ok" }; });
+        return { shown: read.result, matched: matched.join("\\n") + "\\n" === t.read() };
         """,
     )
     assert res["out"] == {
         "shown": "# old: CANARY_API_KEY=[secrets.env:CANARY_API_KEY~earlier]\nCANARY_API_KEY=[secrets.env:CANARY_API_KEY]\n",
-        "same": True,
+        "matched": True,
     }
 
 
@@ -511,8 +515,7 @@ def test_a_value_used_as_an_object_key_is_redacted(tmp_path):
 
 
 def test_a_held_value_keeps_its_name_through_a_second_rotation(tmp_path):
-    # Rotated twice: the first old key's placeholder must still mean that key, or a write of a text copied
-    # after the first rotation would store the second key in its place.
+    # Rotated twice: the first old key keeps the name it was shown under.
     res = _run(
         tmp_path,
         """
@@ -521,37 +524,39 @@ def test_a_held_value_keeps_its_name_through_a_second_rotation(tmp_path):
         const first = await t.emit("tool.call", { tool: "Read" }, async () => ({ result: t.read() }));
         t.write("# a: CANARY_API_KEY=" + t.v.key + "\\n# b: CANARY_API_KEY=" + t.v.key2 + "\\nCANARY_API_KEY=" + t.v.key3 + "\\n");
         const second = await t.emit("tool.call", { tool: "Read" }, async () => ({ result: t.read() }));
-        let written;
-        await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: second.result },
-          async e => { written = e.content; return { result: "ok" }; });
-        return { first: first.result, second: second.result, same: written === t.read() };
+        return { first: first.result, second: second.result };
         """,
         key3="ck_" + "aa11bb22cc33dd44ee55ff6677889900",
     )
     held = "[secrets.env:CANARY_API_KEY~earlier]"
     assert res["out"]["first"].startswith(f"# a: CANARY_API_KEY={held}\n")
     assert res["out"]["second"].startswith(f"# a: CANARY_API_KEY={held}\n")
-    assert res["out"]["same"] is True
 
 
-def test_a_value_equal_to_another_variables_name_is_replaced_once(tmp_path):
-    # One pass: the placeholder minted for one value is never matched again as another value.
+def test_a_value_equal_to_another_variables_name_is_replaced_once_in_every_hook(tmp_path):
+    # One pass, and a placeholder issued by one hook comes out of the next unchanged (a tool result is stored as a
+    # row, a placeholder the user types is a prompt).
     res = _run(
         tmp_path,
         """
         await t.emit("session.start", {});
         const shown = await t.emit("tool.call", { tool: "Read" }, async () => ({ result: t.read() }));
-        let written;
-        await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: shown.result },
-          async e => { written = e.content; return { result: "ok" }; });
-        return { shown: shown.result, same: written === t.read() };
+        let row, prompt;
+        await t.emit("session.append", { message: { content: shown.result } }, async e => { row = e.message.content; return e; });
+        await t.emit("prompt.submit", { text: "use " + shown.result }, async e => { prompt = e.text; return e; });
+        // A raw value inside placeholder-shaped text this process did not issue is still redacted.
+        const shaped = await t.emit("tool.call", { tool: "Bash" }, async () => ({ result: "[secrets.env:" + t.v.key + "]" }));
+        return { shown: shown.result, row, prompt, shaped: shaped.result };
         """,
         secrets=f"TOKEN_ENV_NAME=CANARY_SERVICE_TOKEN\nCANARY_SERVICE_TOKEN={KEY}\n",
     )
+    # The name on line 2 is TOKEN_ENV_NAME's value, so it is replaced too: once, never inside a placeholder.
+    shown = "TOKEN_ENV_NAME=[secrets.env:TOKEN_ENV_NAME]\n[secrets.env:TOKEN_ENV_NAME]=[secrets.env:CANARY_SERVICE_TOKEN]\n"
     assert res["out"] == {
-        # The name on line 2 is TOKEN_ENV_NAME's value, so it is replaced too: once, never inside a placeholder.
-        "shown": "TOKEN_ENV_NAME=[secrets.env:TOKEN_ENV_NAME]\n[secrets.env:TOKEN_ENV_NAME]=[secrets.env:CANARY_SERVICE_TOKEN]\n",
-        "same": True,
+        "shown": shown,
+        "row": shown,
+        "prompt": "use " + shown,
+        "shaped": "[secrets.env:[secrets.env:CANARY_SERVICE_TOKEN]]",
     }
 
 
@@ -564,13 +569,83 @@ def test_a_write_with_placeholder_text_is_refused_when_the_hook_failed_or_nothin
         // No load has succeeded yet: nothing can be restored, so the write is refused.
         t.failNext(2);
         const unloaded = await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: "CANARY_API_KEY=[secrets.env:CANARY_API_KEY]\\n" }, next);
+        // SECRETS_PATH may name any file, so before a load any target is refused, not only one named secrets.env.
+        const custom = await t.emit("tool.call", { tool: "Write", file_path: t.dir + "/credentials.env", content: "K=[secrets.env:CANARY_API_KEY]\\n" }, next);
         // The hook failed before the tool ran.
         const failed = Object.assign(async e => { ran += 1; return { result: "ok" }; }, { called: false, error: { kind: "error", message: "x" } });
         const caught = await t.catchers["tool.call"](t.$, { tool: "Edit", file_path: t.dir + "/x", old_string: "a", new_string: "[secrets.env:CANARY_API_KEY]" }, failed);
         const plain = await t.catchers["tool.call"](t.$, { tool: "Edit", file_path: t.dir + "/x", old_string: "a", new_string: "b" }, failed);
-        return { unloaded: unloaded.deny, caught: caught.deny, plain, ran };
+        return { unloaded: unloaded.deny, custom: custom.deny, caught: caught.deny, plain, ran };
         """,
     )
     out = res["out"]
-    assert "refused" in out["unloaded"] and "refused" in out["caught"]
+    assert (
+        "refused" in out["unloaded"] and "refused" in out["custom"] and "refused" in out["caught"]
+    )
     assert out["plain"] == {"result": "ok"} and out["ran"] == 1
+
+
+def test_a_rotation_or_a_resume_can_never_write_the_new_key_into_an_old_line(tmp_path):
+    # Read, then the key rotates in a different quoting. Writing the earlier read back is refused; an Edit naming
+    # the old line no longer matches the file, so the tool changes nothing. A second process (a resumed session)
+    # that never saw the old value behaves the same.
+    script = """
+        const shown = await t.emit("tool.call", { tool: "Read" }, async () => ({ result: t.read() }));
+        t.write("CANARY_API_KEY='" + t.v.key2 + "\\"quoted\\"'\\n");
+        const tool = async e => (e.old_string === undefined || t.read().includes(e.old_string) ? { result: "ok" } : { isError: true, text: "old_string not found" });
+        const write = await t.emit("tool.call", { tool: "Write", file_path: t.secrets, content: shown.result + "NEW=1\\n" }, tool);
+        const edit = await t.emit("tool.call", { tool: "Edit", file_path: t.secrets, old_string: shown.result.trim(), new_string: "NEW=1" }, tool);
+        return { shown: shown.result, write: write.deny !== undefined, edit: edit.isError === true || edit.deny !== undefined, file: t.read() };
+        """
+    res = _run(tmp_path, script, secrets=f'CANARY_API_KEY="{KEY}"\n')
+    assert res["out"]["shown"] == f'CANARY_API_KEY="{P}"\n'
+    assert res["out"]["write"] is True and res["out"]["edit"] is True
+    assert res["out"]["file"] == f"CANARY_API_KEY='{KEY2}\"quoted\"'\n"
+
+
+def test_a_key_is_rotated_in_place_with_an_edit_and_a_line_next_to_a_secret_is_refused(tmp_path):
+    res = _run(
+        tmp_path,
+        """
+        const shown = await t.emit("tool.call", { tool: "Read" }, async () => ({ result: t.read() }));
+        let seen;
+        const tool = async e => { seen = e; return { result: "ok" }; };
+        await t.emit("tool.call", { tool: "Edit", file_path: t.secrets, old_string: shown.result.trim(), new_string: "CANARY_API_KEY=" + t.v.key2 }, tool);
+        const rotated = { old: seen.old_string, neu: seen.new_string };
+        const append = await t.emit("tool.call", { tool: "Edit", file_path: t.secrets, old_string: shown.result.trim(), new_string: shown.result.trim() + "\\nNEW=1" }, tool);
+        return { rotated, append: append.deny };
+        """,
+    )
+    assert res["out"]["rotated"] == {
+        "old": f"CANARY_API_KEY={KEY}",
+        "neu": f"CANARY_API_KEY={KEY2}",
+    }
+    assert "refused" in res["out"]["append"] and "anchor" in res["out"]["append"]
+
+
+def test_a_secrets_file_the_resolver_would_now_prefer_is_loaded_on_the_next_event(tmp_path):
+    # No SECRETS_PATH: the resolver prefers ~/.config/genesis/secrets.env when it exists. Creating it mid-session
+    # must be noticed although the file loaded first is unchanged.
+    repo = tmp_path / "repo"
+    shutil.copytree(PLUGIN, repo / "plugins" / "genesis-secret-redact")
+    resolver = repo / "src" / "genesis" / "secrets_location.py"
+    resolver.parent.mkdir(parents=True)
+    shutil.copy(PLUGIN.parents[1] / "src" / "genesis" / "secrets_location.py", resolver)
+    (tmp_path / "genesis").mkdir()
+    (tmp_path / "genesis" / "secrets.env").write_text(f"CANARY_API_KEY={KEY}\n")
+    res = _run(
+        tmp_path,
+        """
+        const before = await t.emit("tool.call", { tool: "Bash" }, async () => ({ result: t.v.key }));
+        t.put(t.dir + "/.config/genesis/secrets.env", "CANARY_API_KEY=" + t.v.key2 + "\\n");
+        const after = await t.emit("tool.call", { tool: "Bash" }, async () => ({ result: t.v.key2 }));
+        // Nothing changes now, so the next event runs no loader.
+        const runs = t.runs();
+        await t.emit("tool.call", { tool: "Bash" }, async () => ({ result: "x" }));
+        return { before, after, idle: t.runs() === runs };
+        """,
+        secrets=None,
+        plugin=repo / "plugins" / "genesis-secret-redact",
+        override=False,
+    )
+    assert res["out"] == {"before": {"result": P}, "after": {"result": P}, "idle": True}

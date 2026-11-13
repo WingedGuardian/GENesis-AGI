@@ -49,28 +49,29 @@ right column concerns URL-shaped secrets, passwords with punctuation and multi-l
 
 ### Placeholders
 
-Every matched text has a placeholder of its own, so a replacement can be undone exactly. The text the
-secrets file holds for a variable is `[secrets.env:VAR]`; any other spelling of that value is
-`[secrets.env:VAR~1]`, `~2` and so on; line 2 of a multi-line value is `[secrets.env:VAR#2]`. A value the
-session held earlier and that has since left the file keeps the name it was shown under, or
-`[secrets.env:VAR~earlier]` when the new value took that name. Two variables holding the same text show one
-placeholder, named after the first of them; writing it back restores that text, so either line comes back as
-it was.
+Every matched text has a placeholder of its own. The text the secrets file holds for a variable is
+`[secrets.env:VAR]`; any other spelling of that value is `[secrets.env:VAR~1]`, `~2` and so on; line 2 of a
+multi-line value is `[secrets.env:VAR#2]`. A value the session held earlier and that has since left the file
+keeps the name it was shown under, or `[secrets.env:VAR~earlier]` when the new value took that name. Two
+variables holding the same text show one placeholder, named after the first of them. A placeholder is
+redacted once: text that already holds one passes through the next hook unchanged.
 
 ## Behaviour worth knowing
 
-- **Writing to the secrets file.** In an Edit or Write whose target lands on the secrets file itself (`~`,
-  `..`, a relative path or a symlinked directory all resolve), each placeholder is turned back into exactly
-  the text it replaced, so a line the session read and did not change comes back byte for byte, and editing a
-  key works. A placeholder written anywhere else stays literal text. Claude Code refuses a write through a
-  symlink to the file outright (measured); a hard link is a different path to the same file and is not
-  recognised, so a write through one stores the placeholder.
-- **One refusal.** A write to the secrets file that still holds placeholder text after that (a placeholder
-  the session never read, or one it altered) is refused, with a message naming the placeholder: stored as it
-  is, it would replace a key with text. So is a write carrying placeholder text to a file named `secrets.env`
-  while no values have loaded, and an Edit or Write carrying placeholder text that the plugin failed to check. This is the only call the plugin blocks. A comment in the file that
-  already contains placeholder text is treated the same way, so change such a file with Edit on the lines
-  concerned.
+- **Writing to the secrets file.** Placeholder text is never written into the secrets file. In an Edit whose
+  target lands on the secrets file itself (`~`, `..`, a relative path or a symlinked directory all resolve),
+  the placeholders in `old_string` (the text being replaced) are turned back into the texts they stood for,
+  so the session can name a line it read: rotating a key in place with Edit works. The text it writes
+  (`new_string`, or a Write's `content`) must hold real values only. A placeholder's meaning can move (a key
+  rotates; a resumed session never saw the text an old name stood for), and a wrong restore in `old_string`
+  only fails the Edit's exact match, so the file never receives a value that was not written as such. A
+  placeholder written anywhere else stays literal text. Claude Code refuses a write through a symlink to the
+  file outright (measured); a hard link is a different path to the same file and is not recognised.
+- **One refusal.** An Edit or Write of the secrets file whose written text holds placeholder text is refused,
+  with a message naming the placeholders. So is any Edit or Write carrying placeholder text while no values
+  have loaded (the file's path is not known yet), and one the plugin failed to check. This is the only call the plugin blocks. In practice: a Write of
+  the whole file as read is refused, and adding a line next to a line holding a secret means anchoring the
+  Edit on a line without one. Onboarding (filling in an empty value) needs no placeholder at all.
 - **A shell write to the secrets file** (`sed -i`, a heredoc) does not go through Edit/Write, so a placeholder
   in it lands in the file as text and that key is gone. The plugin does not repair this (tracked in #4453). It
   reports it: a variable whose value in the file is placeholder text is never treated as a secret value, and
@@ -87,7 +88,9 @@ it was.
   line of a multi-line value that is ordinary text (a line of a JSON credential such as
   `"type": "service_account",`) IS matched, wherever it appears.
 - **A key added or rotated by a tool call** is picked up before that call's result is redacted, so a command
-  that writes a new key and prints it shows the placeholder. (A call that starts while another event is still
+  that writes a new key and prints it shows the placeholder. The plugin watches every path the resolver
+  consults (the `SECRETS_PATH` override when set, else the home config file and the in-checkout places), so a
+  secrets file the resolver would now pick is loaded too. (A call that starts while another event is still
   reloading uses that reload's values; a key its own tool then adds is redacted from the next call on.)
 
 ## Failure directions
@@ -139,7 +142,7 @@ install step.
 - `scripts/e2e_secret_redact.py`: a real Claude Code session with canary values, run with the plugin loaded
   through `--plugin-dir`. It checks, step by step, that each scripted call ran and came back holding the
   placeholder, then the model's answer, the transcript, subagent transcripts and persisted output, and the
-  secrets file after a Write of the whole file and an Edit. Needs a logged-in `claude` and spends one short
+  secrets file after a refused Write of the whole file and two Edits. Needs a logged-in `claude` and spends one short
   session. The typed prompt is not part of it (a `-p` run keeps the engine's own record of its prompt); that
   path was measured in an interactive session.
 

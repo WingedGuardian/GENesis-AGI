@@ -24,7 +24,8 @@ let restores = new Map() // placeholder -> text: `pairs` read backwards (one pla
 let secretsPath = ''
 let secretsReal = '' // the secrets file with symlinks resolved, for the restore-on-write target check
 let home = '' // Claude Code's file tools expand a leading `~` (measured on 2.1.299); the engine's stat does not
-let stamp = '' // mtimeMs:size of secretsPath, taken BEFORE the last load read it
+let watch = [] // every path that can change which file the resolver picks, or what it holds
+let stamp = '' // mtimeMs:size of each watched path, taken BEFORE the last load read the file
 let warned = false
 let retryAt = 0 // no load before this time: a loader that keeps failing must not run on every event
 let reported = '' // the overwritten keys last logged, so each set is logged once
@@ -41,9 +42,10 @@ function repoRoot(pluginRoot) {
 }
 
 // One pass each way: text a replacement produced is never matched again (a value may equal another variable's
-// name, so a second pass would rewrite inside a placeholder). Longest text first, so the alternation takes the
-// longest needle at each position.
-let matcher = null // RegExp of every text in `pairs`, rebuilt on each load
+// name, so a second pass would rewrite inside a placeholder). Placeholders this process issued are in the
+// alternation too, mapped to themselves, so text that was redacted by one hook comes out of the next unchanged.
+// Longest first, so the alternation takes the longest match at each position.
+let matcher = null // RegExp of every issued placeholder and every text in `pairs`, rebuilt on each load
 const byText = new Map()
 
 function redactText(s) {
@@ -160,7 +162,7 @@ function leftover(call) {
 }
 
 function refusal(left) {
-  return `genesis-secret-redact refused this write to the secrets file: it would store placeholder text as a value (${left.join(', ')}). A placeholder is turned back into a value only when this session read that value. Give the real value, or use Edit on the lines you mean to change and leave that line as it is.`
+  return `genesis-secret-redact refused this write to the secrets file: the text it would write holds placeholder text (${left.join(', ')}), which would be stored in place of a value. A placeholder is turned back into its value only in the text an Edit replaces (old_string). Write real values only; to change one line, Edit that line; to add a line next to a line holding a secret, anchor the Edit on a line without one.`
 }
 
 // The fallback when a structured walk throws: redact the JSON text and parse it back.
@@ -171,6 +173,10 @@ function viaJson(x) {
 async function statStamp($, path) {
   const st = await $.fs.stat(path).catch(() => undefined)
   return st && st.kind === 'file' ? `${st.mtimeMs}:${st.size}` : 'absent'
+}
+
+async function stampOf($, paths) {
+  return (await Promise.all(paths.map(p => statStamp($, p)))).join('|')
 }
 
 // The install's venv interpreter when there is one (it has python-dotenv, the runtime's own parser), else python3.
@@ -190,18 +196,21 @@ async function runLoader($) {
 
 async function load($) {
   // Stamp first: a write that lands while the loader reads makes the next check differ and reload again. When
-  // the loader names a path that was not stamped (the first load, or the file moved), stamp it and read again,
-  // so the stamp is never newer than the values it stands for.
-  let before = secretsPath ? await statStamp($, secretsPath) : ''
+  // the loader names paths that were not stamped (the first load, or the resolver's choice moved), stamp them
+  // and read again, so the stamp is never newer than the values it stands for.
+  let before = watch.length ? await stampOf($, watch) : ''
   let parsed = await runLoader($)
-  if (parsed.path !== secretsPath) {
-    before = await statStamp($, parsed.path)
+  let paths = parsed.watch ?? [parsed.path]
+  if (paths.join('\n') !== watch.join('\n')) {
+    before = await stampOf($, paths)
     parsed = await runLoader($)
+    paths = parsed.watch ?? [parsed.path]
   }
   const current = parsed.needles.map(n => [n.text, n.placeholder])
   // A value this session held stays redacted after it leaves the file: a rotated-out key is usually still valid
   // where it was issued, and the very call that replaced it echoes it back in its result (measured: an Edit).
-  // Its placeholder may now name the new value, so it gets a name of its own: every placeholder keeps one text.
+  // Its placeholder may now name the new value, so it gets a name of its own here; nothing restored is ever
+  // written (see tool.call), so a name that moved can only make an Edit's old_string fail to match.
   const texts = new Set(current.map(([text]) => text))
   const taken = new Set(current.map(([, placeholder]) => placeholder))
   // A held value keeps the name it was already shown under, so a placeholder the session copied earlier still
@@ -221,8 +230,11 @@ async function load($) {
   restores = new Map(pairs.map(([text, placeholder]) => [placeholder, text]))
   byText.clear()
   for (const [text, placeholder] of pairs) byText.set(text, placeholder)
-  const escaped = pairs.map(([text]) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  for (const placeholder of restores.keys()) byText.set(placeholder, placeholder)
+  const alternatives = [...byText.keys()].sort((a, b) => b.length - a.length)
+  const escaped = alternatives.map(text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
   matcher = escaped.length ? new RegExp(escaped.join('|'), 'g') : null
+  watch = paths
   stamp = before
   secretsPath = parsed.path
   secretsReal = parsed.realpath ?? parsed.path
@@ -240,7 +252,7 @@ let loading = null // one loader run at a time; concurrent events share it
 // Reload when the secrets file changed since the last load (a key added or rotated mid-session).
 async function fresh($) {
   try {
-    if (!secretsPath || (await statStamp($, secretsPath)) !== stamp) {
+    if (!watch.length || (await stampOf($, watch)) !== stamp) {
       if (Date.now() < retryAt) return
       loading ??= load($).finally(() => {
         loading = null
@@ -272,21 +284,21 @@ export function register(on) {
   on('tool.call', async ($, e, next) => {
     await fresh($)
     let call = e
-    // A write to the secrets file itself (onboarding adds or replaces a key): turn placeholders the model copied
-    // from a redacted read back into the texts they stood for, so the file keeps its values. Nowhere else: a
-    // placeholder written to any other file stays literal, or docs and tests about this plugin would receive
-    // real keys.
-    if (WRITES.has(e.tool) && !secretsPath && leftover(e).length && /(^|\/)secrets\.env$/.test(String(e.file_path))) {
-      // No load has succeeded, so nothing can be restored: a placeholder written to a file named like the
-      // secrets file would replace a key with text.
+    // A write to the secrets file itself (onboarding adds or replaces a key). Placeholder text in what it would
+    // WRITE is refused: stored, it would replace a key with text, and restoring it cannot be made safe (a name's
+    // meaning moves when a key rotates, and a resumed session never saw the text an old name stood for). Only
+    // the text an Edit MATCHES gets its placeholders turned back, so the model can name a line it read; a wrong
+    // restore there fails the tool's exact match and changes nothing. Nowhere else: a placeholder written to any
+    // other file stays literal, or docs and tests about this plugin would receive real keys.
+    if (WRITES.has(e.tool) && !secretsPath && leftover(e).length) {
+      // No load has succeeded, so the secrets file's path is not known (SECRETS_PATH may name any file): every
+      // write carrying placeholder text is refused until it is, since this one may replace a key with text.
       return { deny: refusal(leftover(e)) }
     }
     if (WRITES.has(e.tool) && (await isSecretsFile($, e.file_path))) {
-      call = deep(e, restoreText)
-      // What is left is a placeholder this session holds no text for. Written as it is, it would become that
-      // key's value and the real one would be gone, so this one write is refused (owner ruling 2026-11-12).
-      const left = leftover(call)
+      const left = leftover(e) // owner rulings 2026-11-12: refuse, and restore only what an Edit matches
       if (left.length) return { deny: refusal(left) }
+      if (typeof e.old_string === 'string') call = { ...e, old_string: restoreText(e.old_string) }
     }
     const ran = await next(call)
     if (ran.deny !== undefined) {

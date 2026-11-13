@@ -456,6 +456,8 @@ def test_the_password_inside_a_credential_url_is_a_needle_alone():
         )
     }
     assert {"s3cret%2Fpassw0rd-long", "s3cret/passw0rd-long", "ghx_0123456789abcdef0123"} <= texts
+    # The extracted parts get the same JSON spellings as a whole value (a JSON result escapes `/`).
+    assert "s3cret\\/passw0rd-long" in texts
 
 
 def test_load_reports_restore_texts_and_overwritten_keys(tmp_path, monkeypatch, capsys):
