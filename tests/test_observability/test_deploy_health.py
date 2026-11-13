@@ -459,6 +459,45 @@ def test_a_git_failure_is_reported_as_unchecked_not_as_absent(linear_repo, monke
         assert "no object in this clone" not in reason
 
 
+def test_a_type_check_failure_is_reported_as_unchecked_not_as_missing(linear_repo, monkeypatch):
+    """The same distinction at the second git phase, ``cat-file -t``.
+
+    The object was FOUND by a real ``--disambiguate``; only its type could not
+    be read. Reporting "names a missing object" there is the same wrong remedy
+    as at phase one.
+    """
+    # importlib, not a plain import: see the test above.
+    dh = importlib.import_module("genesis.observability.snapshots.deploy_health")
+
+    repo, _first, _middle, tip = linear_repo
+    real_run_git = dh._run_git
+    for rc, word in ((-1, "timed out"), (-2, "failed")):
+
+        def fake(r, *args, _rc=rc, **k):
+            if args[:1] == ("cat-file",):
+                return _rc, "", ""
+            return real_run_git(r, *args, **k)
+
+        monkeypatch.setattr(dh, "_run_git", fake)
+        resolved, reason = dh.resolve_commit(repo, tip[:8])
+        assert resolved is None
+        assert f"{tip[:8]} resolved to {tip} but could not check its type" in reason, reason
+        assert word in reason, reason
+        assert "missing" not in reason
+        assert "not a commit" not in reason
+
+    # Control: an ordinary non-zero rc from cat-file is still "missing", not
+    # "could not check" — the sentinels are the only unchecked results.
+    monkeypatch.setattr(
+        dh,
+        "_run_git",
+        lambda r, *a, **k: (128, "", "") if a[:1] == ("cat-file",) else real_run_git(r, *a, **k),
+    )
+    resolved, reason = dh.resolve_commit(repo, tip[:8])
+    assert resolved is None
+    assert "names a missing object, not a commit" in reason, reason
+
+
 def test_a_non_sha_from_disambiguate_is_refused(linear_repo, monkeypatch):
     """Guard on the value git hands back, not just on what we sent it.
 

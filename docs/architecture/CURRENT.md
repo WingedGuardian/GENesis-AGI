@@ -1197,15 +1197,31 @@ verified: b321bb634 2026-11-07
 - `cc/context_injector.py` (memory→session injection) lives HERE, not in
   memory. GROUNDWORK: `reflection_bridge/_bridge.py` (v4-executor),
   `session_config.py` (hook-inheritance).
-- **Light-reflection topic repeats (development candidate)**: the bridge stores
-  every reflection output, then suppresses a light-topic summary or posts a
-  periodic stub only when the model sets `material_change` false; an absent or
-  true flag posts. A local overlap floor guards that flag: changed negated text,
-  changed multi-chunk text, code fences, parse fallbacks and low overlap with
-  the last full post still post.
+- **Light-reflection topic repeats (development candidate)**: Light is the
+  system thinking about what code cannot settle. The Light prompt carries a
+  "Changes since the previous Light finding" table computed by code
+  (`awareness/signal_format.light_signal_changes`): each signal's previous and
+  current value, labelled as a counter, an alarm started or cleared, or a band
+  crossing. The model sets `material_change` from that and its own judgment of
+  moves that cross no line. The bridge stores every reflection output, then
+  suppresses the Light-topic summary (or posts a periodic stub) only when the
+  model sets `material_change` false AND code finds no condition change
+  (`light_condition_changes`: an alarm started or cleared, a fixed-level
+  alarm rose, an active alarm crossed its own threshold, a band crossed, a signal appeared or went away) between the run behind the last full
+  post and this run; when code does find one, the summary is posted with those
+  changes listed. That check covers the alarm signals and the signals whose
+  collector sets thresholds (`container_memory_pct` only); every other value is
+  the model's to judge. Wording is not compared. An absent or true flag, a multi-message
+  summary that differs, parse fallbacks and an unknown baseline all post. The
+  previous values come from the awareness tick whose corpus row was written up
+  to 60 s before the finding or post (`reflection_corpus.tick_written_before`);
+  two runs in that window, or a reading that failed in that run, count as
+  unknown and post.
+  `genesis_version_changed` is left out of Light's signal list, change table
+  and condition check (`LIGHT_HIDDEN_SIGNALS`).
   A manager-local Light-topic lock spans history through send persistence;
   unrelated categories retain their independent delivery. History uses
-  insertion order so a current stub supersedes an older future-dated row. Unknown history posts; deep and
+  insertion order so a current stub supersedes an older future-dated row. Deep and
   strategic topic delivery retain their direct path. Installed verification is
   still outstanding.
 - **Background-wait ceiling ownership** (invoker.py): the CLI's headless
@@ -1416,7 +1432,26 @@ verified: 0164dd1f0 2026-10-14
   MUST be a curated, non-opted-out `marketing_prospects` row (authorization is
   DECOUPLED from send-lifecycle status, so a `contacted` follow-up still sends) —
   an unknown / opted-out recipient trips (`recipient_not_curated` / `opted_out`)
-  → demote + hold (fail-closed). Graduation for the BULK cell rides the generic
+  → demote + hold (fail-closed). **Marketing-recipient posture (any GRANTED class):** the gate
+  looks the recipient up in `marketing_prospects`
+  (`marketing_prospects.find_in_recipient`: bare addresses out of a
+  `Name <addr>` or list form) and HOLDS without demoting when (1) the recipient
+  is a prospect and the thread has inbound mail — a reply to a prospect is the
+  owner's to approve in every mode, decided BEFORE the scope guards (g1's
+  exact-match on the stored `From` header would otherwise demote the reply cell
+  for a send that was held anyway); then, after the scope guards, (2) the
+  recipient is an opted-out prospect, whatever the class (g2 covers BULK only);
+  (3) the send is BULK or goes to a prospect and the `marketing_outreach` lever
+  is not `live` — so the IDENTITY follow-up on an unanswered prospect thread is
+  held in `off`/`observe`, like the BULK first touch. Keyed on DB state, never on
+  the caller-supplied `labeled_surplus`. A cold IDENTITY send to a non-prospect
+  is untouched. The owner REJECTING such a hold keeps the grant
+  (`email_gate_watcher._is_posture_hold`: curated prospect + cell still
+  GRANTED); every other rejection stays a correction. Known limits: in `live`,
+  a follow-up on a second, unanswered thread to a prospect who replied on
+  another thread is not a "reply" and sends; an owner-approved non-BULK prospect
+  hold is delivered even with the lever at `off` (only BULK holds re-check it).
+  Graduation for the BULK cell rides the generic
   capability-promotion path (`capability_grants.detect_promotable_cells` →
   `email:send:bulk` qualifies once it has ≥5 owner-approved successes +
   posterior ≥0.70). That path is scoped by
@@ -1459,7 +1494,10 @@ verified: 0164dd1f0 2026-10-14
   recorded in `outreach_history`/`email_threads`). Attacker-controlled reply
   fields are HTML-escaped + control-char-stripped (`_sanitize_ping_field`) because
   the outreach telegram path delivers with `parse_mode="HTML"` unescaped. The
-  autonomous `ReplyHandler` auto-reply path is unchanged by this.
+  `ReplyHandler` still dispatches a session that drafts the reply; the draft
+  reaches `EmailAutonomyGate`, which holds it for the owner (the posture gate
+  above) whenever the thread it answers has inbound mail and its recipient is a
+  curated prospect.
 - **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +
   PII scan for EXTERNAL channels and `content`-category drafts only. Never
   applied to owner channels — don't add them.
@@ -2529,7 +2567,10 @@ verified: 4721e0d93 2026-11-07
   specific scheduler on a stale `scheduler_heartbeats` entry (`awareness`/`surplus`,
   `job_health.last_run` age > 900s) — the "zombie scheduler, alive but not dispatching"
   case. Restart is deferred while `heavy_workload` is set (dream cycle), during a boot
-  stabilization window, or a network outage; repeated restarts (flap) or max-restarts
+  stabilization window, or a network outage; a target in its first start attempt
+  (a start step, no automatic restart yet, under 300 s) is left to systemd's own
+  start timeout, so a start that times out every time still escalates, and a target that is activating, inactive or failed is STARTED, never
+  restarted, so a running start step (ExecStartPre) is never SIGTERMed; repeated restarts (flap) or max-restarts
   escalate to a durable owner/Telegram alert. This is why a wedged/dead surplus needs no
   `subsystem_stale` alert (§9): it is detected and self-healed here at 900s.
   Each tick also reads the container's `io.pressure`; above full avg10 25% it
@@ -4126,7 +4167,18 @@ verified: 9a95483a8e7f 2026-10-09
   429s and unparseable bodies keep the old behaviour. Per-provider circuit breaker (3 failures, exponential backoff
   capped 30 min — 4h for QUOTA_EXHAUSTED and NOT_ENTITLED; 429 = backpressure,
   NOT a breaker failure; state persisted cross-process to
-  `~/.genesis/circuit_breaker_state.json`). **Probe/call evidence symmetry** —
+  `~/.genesis/circuit_breaker_state.json`). **Empty balance as a client error:**
+  a 400/422 is normally BAD_REQUEST (the payload's fault, never recorded by the
+  breaker), except when the body's `error.type` or `error.code` is a measured
+  balance token (`retry._BALANCE_ERROR_TOKENS`): that classifies
+  QUOTA_EXHAUSTED, so the breaker opens after 3 failures and the provider is
+  skipped. The token is matched as a field of the first JSON object in the
+  error string, never as a substring, because a 400 body can carry request or
+  generated text back; a non-JSON body stays BAD_REQUEST. The delegate also
+  reports a litellm `BadRequestError` that carries HTTP 402 as 402 (every
+  other status on that exception is still reported as 400). Cost: a topped-up
+  provider stays skipped until its open window ends or the operator re-enables
+  it from the dashboard. **Probe/call evidence symmetry** —
   a probe may only undo what a probe did: `probe_suspect()` downgrades CLOSED to
   HALF_OPEN on a failed probe and a clean probe may clear THAT, but a breaker
   opened by a real call failure (`_opened_by_call`) is closed only by a real
@@ -4190,7 +4242,13 @@ verified: 9a95483a8e7f 2026-10-09
   external mutator of breaker state is the dashboard toggle
   (`dashboard/routes/providers.py`), and it goes through `force_open()` /
   `force_close()` rather than assigning private fields, so the origin flag
-  cannot drift out of step with the state. Both are COMPLETE transitions --
+  cannot drift out of step with the state. It picks between them from the
+  operator's intent (the dashboard posts `{"enabled": <bool>}`, the action its
+  button showed), and without one from the raw `_state` field: never from
+  `.state`, whose read moves an expired OPEN to HALF_OPEN and once turned an
+  "enable" on an expired hold into a fresh disable. (Known limit: with no
+  intent, a breaker a reader has already moved to HALF_OPEN is disabled, the
+  button a fresh dashboard shows for it.) Both are COMPLETE transitions --
   they notify (which is what the registry wires to `save_state`) and clear the
   qualifiers they invalidate. They are complete with respect to
   BREAKER FIELDS only — neither fires `on_recovery`, so an operator re-enable
@@ -5118,9 +5176,25 @@ logger or unrelated exceptions with copied text and no provenance.
   **The live-move repair** (`scripts/lib/live_move_repair.py`, #3492 PR D1;
   `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS | --restore TS
   [--check]] [--explain]`; `--restore`, below
-  runs the copy bootstrap installs under `~/.genesis/lib/live-repair/current`,
-  never the checkout's; installing that kit, and running the repair at every
-  server start, is PR D2, not yet built; `--explain` needs no kit: with none
+  runs the installed kit, never the checkout's copy: `scripts/lib/live_repair_kit.py
+  install <repo> <home>` (#3492 D2a) writes the files named by `KIT_SOURCES` (one
+  literal tuple in the repair module, read with ast) from HEAD's blobs on main or
+  `live` into `~/.genesis/lib/live-repair.d/<kit_id>/` with a `KIT.json` of their
+  object ids, swaps the `live-repair/current` link by rename, and keeps two kits
+  (the prune takes only kit-id names and skips one whose KIT.json is flocked; the
+  repair takes that shared hold from D2a-2 on; a symlinked `live-repair.d` or
+  `live-repair` is moved aside, never followed; a set-aside kit or `current` is kept a week from the
+  move); `status` reports ok,
+  missing, foreign, corrupt, partial or stale. bootstrap, `deploy_code_only.sh`
+  (past its update-state refusal) and the update's rollback (when the code restore
+  succeeded) install it, never fatally: the installed kit is HEAD's at the last
+  successful install, so it can be newer than the code that wrote the update state
+  (an update killed after its bootstrap; a rollback to a tag from before the
+  installer, whose install fails and keeps the newer kit), and it must read the
+  previous release's state. repair-move resolves `current` physically and runs
+  `python3 -I -S -B`, and the module's own directory is a realpath, so a run stays on
+  the kit it started from. Running the repair at every server start is D2a-2, not
+  yet built; `--explain` needs no kit: with none
   installed it runs the module as HEAD committed it, from memory, never the
   working tree's copy, which may itself be half-written) heals a live row's `mixed_tree`
   toward the rollback tag, never toward the target (with HEAD on `live` at the
