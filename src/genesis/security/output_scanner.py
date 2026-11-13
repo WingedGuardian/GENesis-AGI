@@ -1,9 +1,37 @@
 """Output content scanner — deterministic pattern matching for outbound content.
 
-Scans outbound messages for sensitive data patterns before delivery.
-High-confidence patterns only: API keys, specific IPs, credential
-assignments, internal file paths. General technology mentions are
-NOT flagged (those are handled by prompt-level guidance).
+Scans outbound messages for sensitive data patterns before delivery, and
+redacts credential shapes from text kept for a trusted reader.
+
+Two pattern sources:
+
+* This module's own table (``_OUTPUT_PATTERNS``): credential assignments,
+  private IPs, internal file paths, and four key families kept in a tighter
+  form than the shared table's (the ``sk-`` family, Groq, and GitHub tokens at
+  their real body lengths; ``_LOCAL_FAMILIES``).
+* The shared credential-shape table (``genesis.security.credential_shapes``):
+  every other vendor key prefix it lists, JWTs, Discord webhook URLs and
+  Telegram bot tokens. Each is reported as ``credential_<name>`` and is
+  critical.
+
+This is a pattern gate, not a general secret filter and not a
+high-confidence-only one. The shared shapes are recall-first: a benign string
+with a credential's shape (a slug of 15 or more characters after ``glpat-``,
+a ``<digits>:<32 hex characters>`` pair) is flagged, and on an external send
+that is a quarantine. The known over-matches are pinned in the tests. General
+technology mentions are still NOT flagged (prompt-level guidance handles
+those).
+
+Stated residuals. Content that passes is not proven clean:
+
+* An ``Authorization`` header whose value is not a JWT (an opaque bearer
+  token, a ``Basic`` value) is not detected in plain header form.
+  ``Authorization: Bearer <JWT>`` is caught through the JWT shape, and
+  ``redact_credentials`` redacts a JSON member named ``authorization``.
+* The four locally kept families are not widened to the shared table's
+  floors, so a GitHub token body shorter than the real one (classic under 36
+  characters, fine-grained under 50) is redacted by the hook scrubber and not
+  flagged here.
 """
 
 from __future__ import annotations
@@ -14,6 +42,13 @@ import unicodedata
 from dataclasses import dataclass
 
 from genesis.security.card_shapes import contains_card_number
+from genesis.security.credential_shapes import (
+    KEY_PREFIX_SHAPES,
+    KNOWN_KEY_PREFIX_PATTERN,
+    PREFIX_ANCHOR,
+    STRUCTURED_CREDENTIAL_PATTERN,
+    STRUCTURED_SHAPES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +62,9 @@ class ScanResult:
     risk_level: str  # "none", "medium", "high"
 
 
-# High-confidence patterns that almost certainly indicate sensitive data
-# leakage. Intentionally conservative to minimize false positives.
+# This module's own patterns: high-confidence shapes that almost certainly
+# indicate sensitive data leakage. Intentionally conservative to minimize
+# false positives. The recall-first shared shapes are added below.
 _OUTPUT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         # Covers the whole modern sk-* family: legacy, sk-proj-, sk-svcacct-,
@@ -91,6 +127,30 @@ _OUTPUT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ),
 ]
 
+# Shapes adopted from the shared table, one detector each, reported as
+# ``credential_<name>``. The four families above stay in this module's tighter
+# form, so their shared entries are skipped: adopting them as well would report
+# one key under two names and bring in the table's wider floors.
+_LOCAL_FAMILIES = frozenset({"github", "github_fine_grained", "openai_compatible", "groq"})
+_SHARED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (f"credential_{name}", re.compile(anchor + "(?:" + fragment + ")"))
+    for shapes, anchor in ((KEY_PREFIX_SHAPES, PREFIX_ANCHOR), (STRUCTURED_SHAPES, ""))
+    for name, fragment in shapes
+    if name not in _LOCAL_FAMILIES
+)
+_SHARED_NAMES = frozenset(name for name, _ in _SHARED_PATTERNS)
+
+
+def _shared_shape_present(content: str) -> bool:
+    """Whether any shared-table shape occurs, in one pass per composed pattern.
+
+    Most text carries none, and then the per-shape passes are skipped: without
+    this gate every scan pays one more pass per adopted shape."""
+    return bool(
+        KNOWN_KEY_PREFIX_PATTERN.search(content) or STRUCTURED_CREDENTIAL_PATTERN.search(content)
+    )
+
+
 # Patterns that indicate critical leakage (immediate quarantine).
 # credential_assignment is intentionally NOT critical — it matches
 # natural prose ("secret to our approach:", "token expiry is 86400s").
@@ -104,19 +164,25 @@ _CRITICAL_PATTERNS = frozenset(
         "payment_card",
     }
 )
+# Every shared-table shape is a whole credential, so each one is critical.
+_CRITICAL_PATTERNS |= _SHARED_NAMES
 
 
 def scan_outbound(content: str) -> ScanResult:
     """Scan outbound content for sensitive data patterns.
 
     Returns a ScanResult indicating whether the content is safe to send.
-    Only flags high-confidence patterns to minimize false positives.
+    Flags this module's high-confidence patterns and the recall-first shapes
+    of the shared credential table (see the module docstring for what that
+    costs and what is not covered).
     """
     detected: list[str] = []
 
     for name, pattern in _OUTPUT_PATTERNS:
         if pattern.search(content):
             detected.append(name)
+    if _shared_shape_present(content):
+        detected += [name for name, pattern in _SHARED_PATTERNS if pattern.search(content)]
     # A card number needs a checksum, not just a regex, so it is checked here
     # rather than in the pattern table. Critical: it is never sent outward.
     if contains_card_number(content):
@@ -258,6 +324,10 @@ _REDACTORS: dict[str, re.Pattern[str]] = {
     if name in _REDACTABLE and name not in _ASSIGNMENTS
 }
 _DETECTORS: dict[str, re.Pattern[str]] = dict(_OUTPUT_PATTERNS)
+# The shared shapes carry no trailing ``\b``; they take the same whole-token tail.
+_SHARED_REDACTORS: dict[str, re.Pattern[str]] = {
+    name: re.compile(pattern.pattern + r"""[^\s"'\\]*""") for name, pattern in _SHARED_PATTERNS
+}
 
 
 def _is_credential_key(key: str) -> bool:
@@ -292,6 +362,11 @@ def redact_credentials(content: str) -> tuple[str, list[str]]:
         content, count = pattern.subn(f"[redacted:{name}]", content)
         if count:
             found.append(name)
+    if _shared_shape_present(content):
+        for name, pattern in _SHARED_REDACTORS.items():
+            content, count = pattern.subn(f"[redacted:{name}]", content)
+            if count:
+                found.append(name)
     return content, found
 
 
@@ -327,4 +402,4 @@ def _cut_assignments(content: str) -> tuple[str, list[str]]:
 
 def pattern_names() -> frozenset[str]:
     """Every name ``scan_outbound`` can report, for callers that allow-list some."""
-    return frozenset(name for name, _ in _OUTPUT_PATTERNS) | {"payment_card"}
+    return frozenset(name for name, _ in _OUTPUT_PATTERNS) | {"payment_card"} | _SHARED_NAMES
