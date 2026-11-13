@@ -104,10 +104,15 @@ def key(cls: str, state: bytes, mark: str) -> str:
     return f"live_move_repair:boot:{cls}:{digest}"
 
 
-def unresolved_repeat(report: dict | None, state_sha: str, mark: str, kit_id: str | None) -> bool:
+def unresolved_repeat(
+    report: dict | None, state_sha: str, mark: str, kit_id: str | None, judged: str | None = None
+) -> bool:
     """Did the newest repair of these state bytes end unresolved, with the
     checkout and the kit unchanged since? Then a new heal would end the same
-    way. A newly installed kit tries again: it may be the fix."""
+    way. A newly installed kit tries again: it may be the fix. A heal that
+    recorded what the guard judged as it ended (``end_verdict``) repeats only
+    while the guard judges ``judged`` the same: residue outside the checkout
+    (through a tracked symlink) can go without changing the end mark."""
     if not isinstance(report, dict):
         return False
     result = report.get("result")
@@ -117,4 +122,5 @@ def unresolved_repeat(report: dict | None, state_sha: str, mark: str, kit_id: st
         and report.get("state_sha") == state_sha
         and report.get("end_mark") == mark
         and report.get("kit_id") == kit_id
+        and report.get("end_verdict", judged) == judged
     )

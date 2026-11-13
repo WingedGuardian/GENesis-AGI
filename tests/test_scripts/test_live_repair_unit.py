@@ -27,8 +27,8 @@ FAKE_KIT = """import os, sys
 rc = os.environ.get("FAKE_RC", "0")
 with open(os.path.join(os.environ["HOME"], "kit_argv.json"), "w") as fh:
     fh.write(__import__("json").dumps(sys.argv[1:]))
-if rc == "kill":
-    os.kill(os.getpid(), 9)
+if rc in ("kill", "usr1", "term"):
+    os.kill(os.getpid(), {"kill": 9, "usr1": 10, "term": 15}[rc])
 sys.exit(int(rc))
 """
 
@@ -105,6 +105,8 @@ def test_both_units_bound_their_start(template):
         ("3", True, 0, "live_move_repair:boot:kit:3:k1"),
         ("120", True, 0, "live_move_repair:boot:kit:120:k1"),
         ("kill", True, 137, None),
+        ("usr1", True, 138, None),  # any signal death refuses (#4501 review)
+        ("term", True, 143, None),
     ],
 )
 def test_the_kit_exit_maps_to_the_start(scratch, template, rc, state, start, key):

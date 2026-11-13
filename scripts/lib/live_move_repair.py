@@ -775,6 +775,8 @@ def _kit_check() -> str | None:
         if not stat.S_ISREG(st.st_mode) or st.st_size > 64 << 10:
             return "KIT.json: not a regular file under 64 KiB"
         kit = json.loads(os.pread(_KIT_FD, 64 << 10, 0))
+        if not isinstance(kit, dict):  # valid JSON, not an object (#4501 review)
+            return "KIT.json: not a JSON object"
         _KIT_ID = kit.get("kit_id")
         names, files = kit["kit_sources"], kit["files"]
         if not set(KIT_SOURCES) <= set(names) or set(files) != set(names):
@@ -788,7 +790,7 @@ def _kit_check() -> str | None:
                 return f"{name}: its bytes are not the ones KIT.json names"
     except OSError as exc:
         return f"{os.path.basename(exc.filename or 'KIT.json')}: {exc.strerror or exc}"
-    except (ValueError, KeyError, TypeError) as exc:
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
         return f"KIT.json: unreadable ({type(exc).__name__})"
     return None
 
@@ -1006,7 +1008,7 @@ class Repair:
         self._page("mixed", "critical", verdict, reason, raw, body=body)
         return 0 if self.boot else 3
 
-    def _repeats(self, raw: bytes) -> bool:
+    def _repeats(self, raw: bytes, judged: str) -> bool:
         """F4: the newest repair of these state bytes ended unresolved and the
         checkout is as it left it, so a new heal would end the same way, with
         one more backup per start. Refused at once, with that run's page key."""
@@ -1023,7 +1025,9 @@ class Repair:
                 name = candidate
                 break
         mark = _end_mark(self.repo)
-        if not _boot().unresolved_repeat(report, hashlib.sha256(raw).hexdigest(), mark, _KIT_ID):
+        if not _boot().unresolved_repeat(
+            report, hashlib.sha256(raw).hexdigest(), mark, _KIT_ID, judged
+        ):
             return False
         self._say(
             "the last repair of this update state ended unresolved and nothing changed "
@@ -1126,7 +1130,12 @@ class Repair:
         global _healing
         raw, state = self._state()
         verdict, reason = self.guard.state_verdict(state, self.repo)
+        # Judged half-written: a failure resolving the move's target (its git
+        # call can meet the boot deadline) keeps the service down (#4501 Codex
+        # P1). Cleared below for a tree this repair never heals (a main row).
+        _healing = verdict == self.guard.MIXED_TREE
         to = self._live_target(state)
+        _healing = False
         if verdict == self.guard.SAFE and to:
             # A repair killed after it healed, before it cleared. Its report keeps
             # no result; readers judge "unresolved" by the guard, not by it.
@@ -1154,7 +1163,7 @@ class Repair:
                 self._page("refused", "critical", verdict, reason, raw, _DOWN)
                 return 1
             self.forward = True
-        if self.boot and self._repeats(raw):
+        if self.boot and self._repeats(raw, f"{verdict}: {reason}"):
             return 1
         return self._heal(state, raw, to, index_lock)
 
@@ -1568,6 +1577,10 @@ class Repair:
                     "update card and run scripts/update.sh again"
                 )
             return self._finish(backup, manifest, f"healed, state kept: {kept}", 0)
+        # What the guard judged as the heal ended: the next boot heals again once
+        # it judges otherwise (#4501 Codex P2: residue outside the checkout,
+        # reached through a tracked symlink, leaves the end mark unchanged).
+        manifest["end_verdict"] = f"{verdict}: {reason}"
         return self._finish(backup, manifest, f"unresolved: {verdict}: {reason}", 1)
 
     def _rewrite(self, raw: bytes, state: dict) -> None:
@@ -1799,13 +1812,8 @@ class Repair:
         The report dir, and hooks-before in it, must be this user's 0700
         directories (the heal's _report_dir rule; the retry passes a dir only
         load_report checked): otherwise nothing is touched."""
-        if _DEADLINE is not None:  # C8: never remove hooks with no time to reinstall them
-            left = _DEADLINE - _BOOT.AFTER_S - _BOOT._now() - _BOOT.KILL_GRACE_S
-            if left < 2 * _BOOT.HOOKS_MIN_S:
-                _log(
-                    "the git hooks were not reinstalled: too little of the boot deadline is left; the next run retries"
-                )
-                return False
+        if not _hooks_time_left():  # C8: never remove hooks with no time to reinstall them
+            return False
         common = _out(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
         hooks = os.path.join(common, "hooks")
         # Where git runs hooks from, read without GIT_C's own core.hooksPath
@@ -1850,6 +1858,10 @@ class Repair:
             if not os.path.lexists(aside):
                 os.mkdir(aside, 0o700)
             moved.append((name, _copy_private(dst, aside, name)))
+        # Again, as the hooks are about to go: the git calls above spend the
+        # same budget (#4501 review). The copies made stay in hooks-before/.
+        if moved and not _hooks_time_left():
+            return False
         if moved:
             self._sync(backup)  # the only copy of a hand edit, durable before it goes
             prior = manifest.get("hooks_before")
@@ -1864,6 +1876,21 @@ class Repair:
         for name, _copy in moved:
             os.unlink(os.path.join(hooks, name))
         return self._restore_hooks(tag, tag)
+
+
+def _hooks_time_left() -> bool:
+    """By command always; at boot, is there time to remove hooks and still
+    reinstall them before the deadline (2 x HOOKS_MIN_S past the after-heal
+    reserve)? Logs the skip when not; the next run retries."""
+    if _DEADLINE is None:
+        return True
+    left = _DEADLINE - _BOOT.AFTER_S - _BOOT._now() - _BOOT.KILL_GRACE_S
+    if left >= 2 * _BOOT.HOOKS_MIN_S:
+        return True
+    _log(
+        "the git hooks were not reinstalled: too little of the boot deadline is left; the next run retries"
+    )
+    return False
 
 
 def _sync_listed(text: str, name: str) -> bool:

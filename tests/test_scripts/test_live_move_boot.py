@@ -113,7 +113,9 @@ def test_td31_a_kit_file_missing_skips_the_boot_repair_with_exit_3(w, name):
     _lines_ok(r.stderr)
 
 
-@pytest.mark.parametrize("change", ["byte", "kit_json_missing", "older_guard"])
+@pytest.mark.parametrize(
+    "change", ["byte", "kit_json_missing", "older_guard", "kit_json_list", "kit_json_null"]
+)
 def test_td31_an_altered_kit_skips_the_boot_repair_with_exit_3(w, change):
     killed_tag_side(w, "Z3")
     kit = w.kit()
@@ -123,6 +125,8 @@ def test_td31_an_altered_kit_skips_the_boot_repair_with_exit_3(w, change):
         (kit / "deploy_marker.sh").write_bytes(bytes(data))
     elif change == "kit_json_missing":
         (kit / "KIT.json").unlink()
+    elif change.startswith("kit_json_"):  # valid JSON, not an object (#4501 review)
+        (kit / "KIT.json").write_text("[]" if change == "kit_json_list" else "null")
     else:
         # A guard from before #3987 (no bounded read_state): a version mix.
         text = GUARD.read_text()
@@ -212,6 +216,20 @@ def test_td36_head_moved_before_the_heal_stays_down(w, mod, monkeypatch):
     monkeypatch.setattr(mod.Repair, "_keep_index", moved)
     assert _main(w, mod, monkeypatch) == REFUSE
     assert w.state.exists() and [a["severity"] for a in w.alerts()] == ["critical"]
+
+
+def test_td36_a_target_lookup_failing_after_a_mixed_verdict_stays_down(w, mod, monkeypatch):
+    """#4501 review (Codex P1): the guard judged the tree half-written, then
+    resolving the move's target raised (the boot deadline in its git call).
+    That is a failure after judging: the service stays down, it never starts."""
+    killed_tag_side(w, "Z3")
+
+    def lookup(self, state):
+        raise mod.RepairError("the boot deadline passed (git rev-parse)")
+
+    monkeypatch.setattr(mod.Repair, "_live_target", lookup)
+    assert _main(w, mod, monkeypatch) == REFUSE
+    assert [a["severity"] for a in w.alerts()] == ["critical"]
 
 
 def test_td36_a_heal_that_failed_partway_is_not_healed_again(w, mod, monkeypatch):
@@ -508,6 +526,26 @@ def test_td25_an_unresolved_heal_repeats_without_a_new_backup(tmp_path):
     assert third.returncode in (0, REFUSE)
 
 
+def test_td25_a_residue_gone_outside_the_checkout_is_healed_again(tmp_path):
+    """#4501 review (Codex P2): the residue that kept a heal unresolved can sit
+    outside the checkout (reached through a tracked symlink), where HEAD, status
+    and index.lock never see it go. The repeat check also compares what the guard
+    judges now with what it judged when the heal ended, so removing it heals."""
+    w = _symlink_world(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "x").write_text("not the checkout's\n")
+    w.write_state(w.row("partial"))
+    first = w.repair(mode="--boot")
+    assert first.returncode == REFUSE, (first.returncode, first.stderr)
+    assert w.report()["result"].startswith("unresolved")
+    (outside / "x").unlink()
+    second = w.repair(mode="--boot")
+    assert second.returncode == 0, second.stderr
+    assert not w.state.exists(), "the residue is gone, yet the heal was not tried again"
+    assert len(w.backups()) == 2
+
+
 # ── T-D22 / T-D32: the hooks step is bounded ─────────────────────────────────
 
 # AFTER_S above the guard's own reap reserve (5 s): the healed tree is judged in time.
@@ -583,6 +621,53 @@ def test_td32_the_reinstall_never_starts_its_unlink_without_time_for_it(tmp_path
     r = w.repair(mode="--boot")
     assert r.returncode == 0, r.stderr
     assert json.loads((first / "REPAIR.json").read_text())["hooks"] == "reinstalled"
+
+
+def test_td32_the_budget_spent_while_copying_hooks_aside_moves_none(tmp_path, monkeypatch):
+    """#4501 review: the entry check passed, then the per-hook git calls and the
+    copies spent the budget. Checked again before any hook is removed or
+    recorded: the installed hook stays, REPAIR.json names no moved hook."""
+    w = _real_engine_world(tmp_path)
+    killed_rollback(w, "P")
+    _install(w, "pre-commit", _CANDIDATE_HOOK)
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("lmr_td32b", MODULE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setenv("HOME", str(w.home))
+    for k, v in w.env().items():
+        if k.startswith("GIT_"):
+            monkeypatch.setenv(k, v)
+
+    from tests.test_scripts._live_repair_world import Killed
+
+    def die(self, *a):
+        raise Killed
+
+    real = mod.Repair._restore_hooks
+    monkeypatch.setattr(mod.Repair, "_restore_hooks", die)
+    with pytest.raises(Killed):
+        mod.Repair(str(w.state), str(w.root), True, 0).run()
+    oid = w.to
+    (w.root / ".git" / "objects" / oid[:2] / oid[2:]).unlink()
+    first = w.backups()[0]
+    time.sleep(1.1)
+    monkeypatch.setattr(mod.Repair, "_restore_hooks", real)
+    copy = mod._copy_private
+
+    def slow_copy(src, folder, name):
+        out = copy(src, folder, name)
+        boot = mod._BOOT  # the copies spent the budget: one HOOKS_MIN_S is left
+        mod._DEADLINE = time.monotonic() + boot.AFTER_S + boot.KILL_GRACE_S + boot.HOOKS_MIN_S
+        return out
+
+    monkeypatch.setattr(mod, "_copy_private", slow_copy)
+    _main(w, mod, monkeypatch)
+    assert (w.root / ".git" / "hooks" / "pre-commit").read_text() == _CANDIDATE_HOOK
+    report = json.loads((first / "REPAIR.json").read_text())
+    assert not report.get("hooks_before"), report.get("hooks_before")
+    assert report["hooks"] == "pending", report["hooks"]
 
 
 # ── T-D24: git is bounded at boot ────────────────────────────────────────────
