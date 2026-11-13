@@ -265,6 +265,7 @@ _on_exit() {
     # candidate) must not outlive the script if it died mid-section.
     rm -f "${_SQL_COUNT:-}" "${_SQL_ARTIFACT_TMP:-}" 2>/dev/null || true
     rm -f "${_EXTRA_TAR_TMP:-}" "${_EXTRA_TAR_ERR:-}" 2>/dev/null || true  # §6f plaintext tar + its file-name diagnostics
+    rm -f "${_ENCRYPT_PARTIAL:-}" "${_ENCRYPT_ERR_TMP:-}" 2>/dev/null || true  # encrypt_file's in-flight partial + gpg stderr
     if [ -n "${_VERIFY_DB:-}" ]; then
         rm -f "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm" 2>/dev/null || true
     fi
@@ -448,6 +449,7 @@ _pick_verify_mode() {
 # to a private repo is not acceptable).
 _BACKUP_PASSPHRASE="${GENESIS_BACKUP_PASSPHRASE:-}"
 _ENCRYPT_READY=false
+_ENCRYPT_PARTIAL="" _ENCRYPT_ERR_TMP=""  # encrypt_file's in-flight files, for _on_exit
 if [ -f "$SECRETS_FILE" ] && ! backup_passphrase_file_valid "$SECRETS_FILE"; then
     die "Backup secrets file is unreadable or contains NUL"
 fi
@@ -456,13 +458,102 @@ if [ -n "$_BACKUP_PASSPHRASE" ]; then
     _ENCRYPT_READY=true
 fi
 
-# encrypt_file <src> <dst> — encrypt file contents to <dst> (e.g. *.gpg).
+# encrypt_file <src> <dst> [stamp] — encrypt file contents to <dst> (e.g. *.gpg).
+#
+# The source is read through a pipe, never by name. Given a file name, gpg
+# records the file's size up front and fails ("Input/output error") when the
+# file grows while it reads, which a live session transcript does (#4391). A
+# pipe has no size, so gpg encrypts what it reads to EOF. The passphrase
+# arrives on fd 3, as in encrypt_stream.
+#
+# gpg writes a partial beside <dst>, renamed over it only on success, so a
+# failed run keeps the previous copy: gpg deletes its output on failure, which
+# used to be <dst> itself. The partial is `.genesis-partial.<pid>.XXXXXX` from
+# mktemp: short whatever <dst> is called (a name built from <dst> can exceed the
+# 255-byte limit where <dst> fits), and carrying the pid so the sweep before the
+# commit (§7) can tell a dead run's partial from a live one's. The stamp uses
+# `touch -c`, so a partial removed meanwhile is never recreated empty and moved
+# over the copy. On failure the last line of cat's, gpg's or mv's stderr is logged to stderr;
+# the caller still logs its own WARNING.
+#
+# With `stamp`, which only the callers that skip on `-nt` pass, the copy's
+# mtime is set from the source's; without it the copy keeps its encryption
+# time, as other readers expect (the host credential mirror re-copies a .gpg
+# only when its size or mtime differs, so a re-encrypt under a rotated
+# passphrase must move the mtime).
+#
+# The copy is stamped one second past the source's mtime (whole seconds, read
+# with the clock just before the read), so the callers' `[ "$dst" -nt "$src" ]`
+# skip holds while the source is unchanged and fails once anything is appended
+# after the read began: the source was at least two seconds old then, so an
+# append lands past the stamp. A source younger than that, or with an mtime
+# ahead of the clock, is stamped one second BEFORE its mtime, so the next run
+# re-encrypts it rather than trust a copy an append in the same timestamp tick
+# could have outrun. Only whole seconds are used: some coreutils
+# implementations round `stat %.9Y` and `touch -d @s.ns` through a float by a
+# few hundred nanoseconds, and `%Y` itself up by one just below a second
+# boundary, which the one-second margins absorb.
 encrypt_file() {
     local src="$1"
     local dst="$2"
+    local want_stamp="${3:-}"
     backup_passphrase_valid "$_BACKUP_PASSPHRASE" || return 1
-    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --no-symkey-cache --passphrase-fd 0 \
-        --symmetric --cipher-algo AES256 -o "$dst" "$src" 2>/dev/null
+    local tmp secs now stamp
+    local -a st
+    secs="$(stat -L -c %Y -- "$src")" || return 1
+    now="$(date +%s)"
+    _ENCRYPT_ERR_TMP="$(mktemp -p "$GENESIS_BIG_TMP" encrypt.XXXXXX.err)" || return 1
+    if ! tmp="$(mktemp -p "$(dirname -- "$dst")" ".genesis-partial.$$.XXXXXX")"; then
+        log "  cannot create a partial file beside $dst" >&2
+        rm -f -- "$_ENCRYPT_ERR_TMP"
+        _ENCRYPT_ERR_TMP=""
+        return 1
+    fi
+    _ENCRYPT_PARTIAL="$tmp"
+    if cat -- "$src" 2>>"$_ENCRYPT_ERR_TMP" \
+        | gpg --batch --yes --no-symkey-cache --passphrase-fd 3 \
+            --symmetric --cipher-algo AES256 -o "$tmp" \
+            3< <(printf '%s' "$_BACKUP_PASSPHRASE") 2>>"$_ENCRYPT_ERR_TMP"; then
+        st=("${PIPESTATUS[@]}")
+    else
+        st=("${PIPESTATUS[@]}")
+    fi
+    if [ "${st[0]}" = 0 ] && [ "${st[1]}" = 0 ]; then
+        if [ "$want_stamp" = stamp ]; then
+            if [ $((now - secs)) -ge 2 ]; then
+                stamp="@$((secs + 1))"
+            else
+                stamp="@$((secs - 1))"
+            fi
+            # A failed stamp still moves the copy: refusing would keep the
+            # previous copy for good on a filesystem that will not set times.
+            # The copy then keeps its encryption time, so a write that landed
+            # after cat's EOF and before gpg finished waits for the source's
+            # next change; the log says when the source did change.
+            if ! touch -c -d "$stamp" -- "$tmp" 2>>"$_ENCRYPT_ERR_TMP" && [ -e "$tmp" ]; then
+                local why
+                why="$(tail -n1 "$_ENCRYPT_ERR_TMP" 2>/dev/null | tr -cd '[:print:]' | cut -c1-200)"
+                if [ "$(stat -L -c %Y -- "$src" 2>/dev/null)" != "$secs" ]; then
+                    log "  could not stamp $dst ($why); the source changed during the read, and that change may wait for its next write" >&2
+                else
+                    log "  could not stamp $dst ($why)" >&2
+                fi
+            fi
+        fi
+        # -T: a directory at <dst> is a failure, never a place to move into.
+        if mv -f -T -- "$tmp" "$dst" 2>>"$_ENCRYPT_ERR_TMP"; then
+            rm -f -- "$_ENCRYPT_ERR_TMP"
+            _ENCRYPT_ERR_TMP="" _ENCRYPT_PARTIAL=""
+            return 0
+        fi
+    fi
+    rm -f -- "$tmp"
+    # stderr, not stdout: a caller may capture stdout as its own result
+    # (backup_payment_vault's one-line verdict is read from it).
+    log "  encrypt failed: $(tail -n1 "$_ENCRYPT_ERR_TMP" 2>/dev/null | tr -cd '[:print:]' | cut -c1-200)" >&2
+    rm -f -- "$_ENCRYPT_ERR_TMP"
+    _ENCRYPT_ERR_TMP="" _ENCRYPT_PARTIAL=""
+    return 1
 }
 
 # encrypt_stream <dst> — encrypt stdin to <dst>, same cipher and passphrase as
@@ -929,7 +1020,7 @@ if [ -d "$TRANSCRIPT_DIR" ]; then
             if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
                 continue
             fi
-            encrypt_file "$src" "$dst" || log "WARNING: failed to encrypt $name"
+            encrypt_file "$src" "$dst" stamp || log "WARNING: failed to encrypt $name"
         done < <(find "$TRANSCRIPT_DIR" -maxdepth 1 -name '*.jsonl' -type f -print0)
         _TRANSCRIPT_COUNT=$(find transcripts -maxdepth 1 -name '*.jsonl.gpg' 2>/dev/null | wc -l)
         log "Transcripts: $_TRANSCRIPT_COUNT files (encrypted)"
@@ -956,7 +1047,7 @@ if [ -d "$MEMORY_DIR" ]; then
             if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
                 continue
             fi
-            encrypt_file "$src" "$dst" || log "WARNING: failed to encrypt $rel"
+            encrypt_file "$src" "$dst" stamp || log "WARNING: failed to encrypt $rel"
         done < <(find "$MEMORY_DIR" -type f -print0)
         _MEMORY_COUNT=$(find memory -type f -name '*.gpg' 2>/dev/null | wc -l)
         log "Memory: $_MEMORY_COUNT files (encrypted)"
@@ -1017,7 +1108,7 @@ if [ -d "$_EVAL_DIR" ]; then
             if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
                 continue
             fi
-            encrypt_file "$src" "$dst" || log "WARNING: failed to encrypt eval/$rel"
+            encrypt_file "$src" "$dst" stamp || log "WARNING: failed to encrypt eval/$rel"
         done < <(find "$_EVAL_DIR" -type f -print0)
         _EVAL_COUNT=$(find eval -type f -name '*.gpg' 2>/dev/null | wc -l)
         log "Eval golden sets: $_EVAL_COUNT files (encrypted)"
@@ -1892,6 +1983,34 @@ if ! grep -qx 'creds/\*\*/\.\*\.tmp' .gitignore 2>/dev/null; then
     printf 'creds/**/.*.tmp\n' >> .gitignore
     log "Added the credential staging names to the .gitignore exclusions"
 fi
+# encrypt_file's partials (.genesis-partial.<pid>.XXXXXX) and the SQL dump's
+# staged artifact (data/.genesis.sql.gpg.partial.<pid>): a run killed
+# mid-encrypt leaves one. Never commit one, and sweep those whose writer is
+# gone (#4391). The backup-restore lock admits one run per GENESIS_HOME; the
+# sweep also leaves a partial whose pid is alive, but the plaintext purges in
+# §4, §5 and §6f do not. Two runs sharing this repo under different GENESIS_HOME
+# values are not supported: one can remove the other's partial, which costs the
+# victim a WARNING and keeps its previous copy (`touch -c` and `mv -T` then fail).
+# The .gitignore lines ignore such FILES only: the second re-includes a directory
+# of that name, whose contents git could otherwise never commit, and the third an
+# encrypted copy (a partial's name never ends in .gpg).
+if ! grep -qxF '.genesis-partial.*' .gitignore 2>/dev/null; then
+    if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then printf '\n' >> .gitignore; fi
+    printf '.genesis-partial.*\n!.genesis-partial.*/\n!.genesis-partial.*.gpg\n' >> .gitignore
+    log "Added the encryption partials to the .gitignore exclusions"
+fi
+while IFS= read -r -d '' _partial; do
+    _pbase="${_partial##*/}"
+    case "$_pbase" in
+        .genesis-partial.*) _ppid="${_pbase#.genesis-partial.}"; _ppid="${_ppid%%.*}" ;;
+        *) _ppid="${_pbase##*.partial.}" ;;
+    esac
+    case "$_ppid" in ''|*[!0-9]*) continue ;; esac
+    [ "$_ppid" = "$$" ] && continue
+    kill -0 "$_ppid" 2>/dev/null && continue
+    rm -f -- "$_partial" && log "Removed an encryption partial left by an interrupted run: $_partial"
+done < <(find transcripts memory eval data secrets creds -type f \( -name '.genesis-partial.*' \
+    ! -name '*.gpg' -o -path 'data/.genesis.sql.gpg.partial.*' \) -print0 2>/dev/null)
 
 # --- Commit and push (Tier 1 only) ---
 log "Committing backup..."

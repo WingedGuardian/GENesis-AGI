@@ -1635,6 +1635,9 @@ verified: f62608045437 2026-11-09
   items, response presence and Source/mention evidence; strict decoding rejects
   corrupt v2 inputs as a whole. These are retained-evidence facts, not proof of
   source acquisition or model judgment; see `docs/reference/inbox-coverage-evidence.md`.
+  Its output guard protects every inbox file the monitor may evaluate (any type), retained response targets and the
+  database and its SQLite companions by resolved path and existing file identity, independently of report
+  selection; an existing output directory receives a generated report filename.
   An ordered proof finds the first source-frame closure; ambiguous tokens stay
   raw and cannot supply wrapper context for later URLs.
   The wrapper correction is scoped to this URL path; the entry's existing
@@ -2459,7 +2462,10 @@ verified: 4721e0d93 2026-11-07
   whole page. Locked appends sequence timestamps within a 300-second future
   window; inadmissible clock outliers remain on disk until eligible, with a
   new bounded stream after a large clock reset. Host redeploy and installed
-  conversation-history verification remain outstanding.
+  conversation-history verification remain outstanding. The `test-alert`
+  gateway verb (`--test-alert`) sends one INFO test alert through the same
+  dispatcher, never queued, and prints one JSON line, so a delivery can be
+  triggered on demand and its history row checked.
 - **Snapshot deletion window** (`guardian/deletion_window.py`): routine
   snapshot deletions (the superseded healthy snapshot, prune, and what incus
   would expire before the next window) wait for `snapshots.deletion_window`,
