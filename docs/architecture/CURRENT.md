@@ -1416,7 +1416,26 @@ verified: 0164dd1f0 2026-10-14
   MUST be a curated, non-opted-out `marketing_prospects` row (authorization is
   DECOUPLED from send-lifecycle status, so a `contacted` follow-up still sends) —
   an unknown / opted-out recipient trips (`recipient_not_curated` / `opted_out`)
-  → demote + hold (fail-closed). Graduation for the BULK cell rides the generic
+  → demote + hold (fail-closed). **Marketing-recipient posture (any GRANTED class):** the gate
+  looks the recipient up in `marketing_prospects`
+  (`marketing_prospects.find_in_recipient`: bare addresses out of a
+  `Name <addr>` or list form) and HOLDS without demoting when (1) the recipient
+  is a prospect and the thread has inbound mail — a reply to a prospect is the
+  owner's to approve in every mode, decided BEFORE the scope guards (g1's
+  exact-match on the stored `From` header would otherwise demote the reply cell
+  for a send that was held anyway); then, after the scope guards, (2) the
+  recipient is an opted-out prospect, whatever the class (g2 covers BULK only);
+  (3) the send is BULK or goes to a prospect and the `marketing_outreach` lever
+  is not `live` — so the IDENTITY follow-up on an unanswered prospect thread is
+  held in `off`/`observe`, like the BULK first touch. Keyed on DB state, never on
+  the caller-supplied `labeled_surplus`. A cold IDENTITY send to a non-prospect
+  is untouched. The owner REJECTING such a hold keeps the grant
+  (`email_gate_watcher._is_posture_hold`: curated prospect + cell still
+  GRANTED); every other rejection stays a correction. Known limits: in `live`,
+  a follow-up on a second, unanswered thread to a prospect who replied on
+  another thread is not a "reply" and sends; an owner-approved non-BULK prospect
+  hold is delivered even with the lever at `off` (only BULK holds re-check it).
+  Graduation for the BULK cell rides the generic
   capability-promotion path (`capability_grants.detect_promotable_cells` →
   `email:send:bulk` qualifies once it has ≥5 owner-approved successes +
   posterior ≥0.70). That path is scoped by
@@ -1459,7 +1478,10 @@ verified: 0164dd1f0 2026-10-14
   recorded in `outreach_history`/`email_threads`). Attacker-controlled reply
   fields are HTML-escaped + control-char-stripped (`_sanitize_ping_field`) because
   the outreach telegram path delivers with `parse_mode="HTML"` unescaped. The
-  autonomous `ReplyHandler` auto-reply path is unchanged by this.
+  `ReplyHandler` still dispatches a session that drafts the reply; the draft
+  reaches `EmailAutonomyGate`, which holds it for the owner (the posture gate
+  above) whenever the thread it answers has inbound mail and its recipient is a
+  curated prospect.
 - **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +
   PII scan for EXTERNAL channels and `content`-category drafts only. Never
   applied to owner channels — don't add them.
