@@ -41,6 +41,11 @@ Hits classify pre-operation events, not syscall completion. Known no-ops such
 as an existing ``mkdir``, missing ``unlink``, non-empty ``rmdir``, or an
 unchanged reopen are filtered. Other refused operations and readonly SQLite
 queries outside the recognized literal forms can still be reported.
+Known exclusive/nofollow refusals, metadata-only O_PATH, missing rename/link
+sources, occupied link destinations and same-inode renames are also filtered.
+Protected hardlink sources are observed as ``os.link source`` exposure, even
+without a later content write. Source symlink targets are checked conservatively
+because the link event omits follow_symlinks. No alias history is maintained.
 ``os.open`` of a relative name is judged against the cwd and labelled so (its
 audit event omits ``dir_fd``).
 Attribution is by ``PYTEST_CURRENT_TEST``: a write during collection or a
@@ -73,6 +78,7 @@ from types import ModuleType
 import pytest
 
 from genesis.secrets_location import home_config_location
+from tests import _live_writes_fs
 
 
 def _observer_os():
@@ -296,11 +302,10 @@ def _judge(event: str, args: tuple) -> None:
         if label:
             _record(label, "sqlite connect", target)
         return
-    if event == "os.rename":
-        pairs = ((args[0], args[2]), (args[1], args[3]))
-    elif event == "os.link":
-        pairs = ((args[1], args[3]),)
-    elif event == "os.symlink":
+    if event in ("os.rename", "os.link"):
+        _judge_names(event, args)
+        return
+    if event == "os.symlink":
         pairs = ((args[1], args[2]),)
     elif event == "os.truncate":
         pairs = ((args[0], None),)
@@ -314,6 +319,24 @@ def _judge(event: str, args: tuple) -> None:
             _record(label, event, target)
 
 
+def _unknown():
+    with _fault_lock:
+        _S.faults += 1
+
+
+def _judge_names(event, args):
+    try:
+        effects = _live_writes_fs.name_effects(os, _absolute, event, args)
+    except (OSError, ValueError):
+        _unknown()
+        # Metadata uncertainty must not erase an established destination hit.
+        effects = _live_writes_fs.uncertain_name_effects(_absolute, event, args)
+    for target, operation in effects:
+        label = target and _label(target)
+        if label:
+            _record(label, operation, target)
+
+
 def _no_op(event: str, index: int, target: str) -> bool:
     """True when the call cannot change anything: the audit event fires before
     the system call, so an attempt the kernel refuses (or that is a no-op, such
@@ -321,9 +344,7 @@ def _no_op(event: str, index: int, target: str) -> bool:
     if event == "os.mkdir":
         # Any existing name, directory or not (a file, a dangling symlink): EEXIST.
         return os.path.lexists(target)
-    if event in ("os.remove", "os.rmdir", "shutil.rmtree") or (
-        event == "os.rename" and index == 0
-    ):
+    if event in ("os.remove", "os.rmdir", "shutil.rmtree"):
         if not os.path.lexists(target):
             return True
         is_dir = os.path.isdir(target) and not os.path.islink(target)
@@ -419,14 +440,19 @@ def _hook(event: str, args: tuple) -> None:
     # (a test that patches it) and is itself an audited open.
     _busy.on = True
     try:
+        if event == "open":
+            try:
+                if _live_writes_fs.open_no_effect(os, _absolute, args):
+                    return
+            except (OSError, ValueError):
+                _unknown()  # retain conservative observations as well
         if event == "open" and _ordinary_read(args):
             return
         _judge(event, args)
     except (KeyboardInterrupt, SystemExit, GeneratorExit):
         raise
     except BaseException:  # pytest outcomes also must not escape an observer
-        with _fault_lock:
-            _S.faults += 1
+        _unknown()
     finally:
         _busy.on = False
 
