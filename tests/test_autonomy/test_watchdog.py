@@ -1859,7 +1859,11 @@ def _user_bus() -> dict[str, str]:
     return env
 
 
+# Both markers: the live fence lets a user_manager test run only the real
+# systemd-run, and its systemctl stub answers "nothing reachable", so the
+# state poll and restart_bridge itself need real_tool("systemctl").
 @pytest.mark.user_manager  # runs a real transient unit with a start step
+@pytest.mark.real_tool("systemctl")
 def test_tw4_a_real_start_step_is_never_sigtermed(tmp_path, monkeypatch):
     """T-W4: restart_bridge on a unit whose ExecStartPre is running sends it no
     SIGTERM; a plain `systemctl restart` (the control) does."""
@@ -1868,12 +1872,15 @@ def test_tw4_a_real_start_step_is_never_sigtermed(tmp_path, monkeypatch):
 
     from genesis.autonomy import watchdog as wd
 
-    if shutil.which("systemd-run") is None:
-        pytest.skip("no systemd-run (a CI runner): T-W3 covers the verb")
+    if not all(shutil.which(tool) for tool in ("systemd-run", "systemctl")):
+        pytest.skip("no systemd tooling: T-W3 covers the verb")
     env = _user_bus()
-    probe = ["systemd-run", "--user", "-p", "MemoryMax=1G", "--wait", "--collect", "-q", "true"]
-    if subprocess.run(probe, capture_output=True, timeout=60, env=env).returncode:
-        pytest.skip("no user systemd manager to run a transient unit")
+    for probe in (
+        ["systemctl", "--user", "show-environment"],
+        ["systemd-run", "--user", "-p", "MemoryMax=1G", "--wait", "--collect", "-q", "true"],
+    ):
+        if subprocess.run(probe, capture_output=True, timeout=60, env=env).returncode:
+            pytest.skip("no user systemd manager to run a transient unit")
     monkeypatch.setattr(wd, "systemctl_env", lambda: env)
 
     def case(name, act) -> str:
@@ -1888,11 +1895,11 @@ def test_tw4_a_real_start_step_is_never_sigtermed(tmp_path, monkeypatch):
         )
         try:
             end = time.monotonic() + 10
-            show = ["systemctl", "--user", "show", unit, "-p", "SubState"]
-            while "start-pre" not in subprocess.run(
+            show = ["systemctl", "--user", "show", unit, "-p", "ActiveState", "-p", "SubState"]
+            while "start-pre" not in (seen := subprocess.run(
                 show, capture_output=True, text=True, env=env, timeout=10
-            ).stdout:
-                assert time.monotonic() < end, "the unit never reached start-pre"
+            ).stdout):
+                assert time.monotonic() < end, f"the unit never reached start-pre: {seen!r}"
                 time.sleep(0.1)
             act(unit)
             return trap.read_text()
