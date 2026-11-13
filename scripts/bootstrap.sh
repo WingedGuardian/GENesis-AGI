@@ -2034,6 +2034,18 @@ if [[ -z "$MISSING_CRITICAL" && -z "$MISSING_HELPFUL" ]]; then
 fi
 echo
 
+# --- Genesis's own Claude Code plugins (plugins/, e.g. genesis-secret-redact) ---
+# Registered at user scope so every session on the install loads them; they load in place from this checkout,
+# so later deploys need nothing here. Lever: cc_plugins.<name> in genesis.yaml. Never aborts bootstrap.
+echo "--- Genesis Claude Code plugins ---"
+if [[ -f "$SCRIPT_DIR/cc_plugins.py" && -x "$VENV_DIR/bin/python" ]]; then
+    "$VENV_DIR/bin/python" "$SCRIPT_DIR/cc_plugins.py" apply --repo-root "$GENESIS_ROOT" \
+        || echo "  WARNING: Genesis Claude Code plugins not installed (see above); re-attempted on the next update"
+else
+    echo "  WARNING: scripts/cc_plugins.py or the venv is missing; Genesis Claude Code plugins not installed"
+fi
+echo
+
 # Last, so they survive update.sh's `| tail -10` of this output. The kept count
 # comes from the summary, not GENESIS_MU_KEPT: setup-vnc.sh keeps its units in a
 # child process whose counter never reaches this shell.
