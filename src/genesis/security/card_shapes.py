@@ -5,8 +5,10 @@ logs and storage: browser tool guards, the reference store, reference
 extraction and the outbound scanner. Stdlib only, with no ``genesis`` imports,
 so a script can load this file by path (``scripts/browser.py`` does).
 
-``scripts/hooks/secret_scrub.py`` names three credential-pattern files and asks
-that a shape change be decided for each. For card numbers: ``output_scanner``
+``scripts/hooks/secret_scrub.py`` lists the files that carry credential patterns
+and asks that a shape change be decided for each. The shared key-shape table,
+``credential_shapes``, is not in that list yet; a test holds the hook's copy
+equal to it. For card numbers: ``output_scanner``
 FLAGS one as critical and ``reference_extraction`` REFUSES to capture one. The
 stdlib-only hook scrubber cannot import this module; its redacting copy of the
 shape is tracked in issue #3172. Change the rules here and decide there too.

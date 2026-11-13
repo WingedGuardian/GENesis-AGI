@@ -4766,7 +4766,14 @@ logger or unrelated exceptions with copied text and no provenance.
 - **security/**: prompt-injection defense + outbound scanning — sanitizer is
   LOG-ONLY for internal sources (perimeter EMAIL/INBOX can block);
   `output_scanner` = deterministic outbound secrets/IP scan (a payment card
-  number is a critical finding); `card_shapes` = the one payment-card-number
+  number is a critical finding) plus in-place credential redaction for peer
+  replies and remote diagnostics; `credential_shapes` = the shared
+  credential-shape table (vendor key prefixes, JWT, Discord webhook URL,
+  Telegram bot token; stdlib-only data, recall-first), read by
+  `output_scanner` for every shape it does not own in a tighter local form and
+  held equal to the hook scrubber's two patterns by
+  `tests/test_security/test_credential_shapes.py` until the scrubber loads it;
+  `card_shapes` = the one payment-card-number
   detector (ASCII digits, alphanumeric boundary, standard groupings, brand
   prefix + length, Luhn, UUID groups skipped; stdlib-only so scripts load it
   by path), used by the browser tool guards, `reference_store`, reference
