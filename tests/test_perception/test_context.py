@@ -345,3 +345,27 @@ async def test_light_shows_all_signals_regardless_of_scope(db, identity_dir):
 
     # Light doesn't filter — all signals visible
     assert "micro_only_signal" in ctx.signals_text
+
+
+async def test_light_context_hides_the_version_flag_and_other_depths_keep_it(db, identity_dir):
+    """A version change is settled by code and is not Light's news (#4371)."""
+    import dataclasses
+
+    from genesis.identity.loader import IdentityLoader
+    from genesis.perception.context import ContextAssembler
+
+    assembler = ContextAssembler(identity_loader=IdentityLoader(identity_dir))
+    flag = SignalReading(
+        name="genesis_version_changed", value=1.0, source="system",
+        collected_at="2026-03-05T10:00:00+00:00",
+    )
+    light = _make_tick(depth=Depth.LIGHT)
+    light = dataclasses.replace(light, signals=[*light.signals, flag])
+    ctx = await assembler.assemble(Depth.LIGHT, light, db=db)
+    assert "genesis_version_changed" not in ctx.signals_text
+    assert "cpu_usage" in ctx.signals_text
+
+    micro = _make_tick(depth=Depth.MICRO)
+    micro = dataclasses.replace(micro, signals=[*micro.signals, flag])
+    ctx = await assembler.assemble(Depth.MICRO, micro, db=db)
+    assert "genesis_version_changed" in ctx.signals_text

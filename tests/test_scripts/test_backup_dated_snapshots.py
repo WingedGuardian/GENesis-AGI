@@ -230,6 +230,62 @@ def test_local_backend_writes_dated_snapshot_to_real_fs(backup_env, tmp_path):
     assert status["offsite_confirmed"] is True, status
 
 
+def test_a_live_transcript_backs_up_and_stale_partials_are_swept(backup_env, tmp_path):
+    """#4391: encrypt_file writes a `.genesis-partial.<pid>.XXXXXX` partial beside
+    its target and renames it on success. A run killed mid-encrypt leaves that
+    partial behind: a later run sweeps it once its pid is gone, however young,
+    keeps one whose pid is alive (a run under another GENESIS_HOME can share the
+    repo), and git never commits one. A directory with a partial-like name, and a
+    real file whose name merely contains `.partial.`, are neither swept nor
+    ignored."""
+    home = backup_env["home"]
+    repo = home / "backups" / "genesis-backups"
+    cc_dir = home / ".claude" / "projects" / str(backup_env["gd"]).replace("/", "-")
+    (cc_dir / "session-a.jsonl").write_text('{"type":"user"}\n')
+    (repo / "secrets").mkdir(exist_ok=True)
+    (repo / "data").mkdir(exist_ok=True)
+    dead = 4194301  # above any pid this test can observe alive (checked below)
+    assert not Path(f"/proc/{dead}").exists(), "fixture: the 'dead' pid is alive"
+    leftovers = [
+        repo / "secrets" / f".genesis-partial.{dead}.Ab12Cd",  # written a moment ago
+        repo / "data" / f".genesis.sql.gpg.partial.{dead}",  # the SQL dump's
+    ]
+    for leftover in leftovers:
+        leftover.write_text("half-written")
+    live = repo / "secrets" / f".genesis-partial.{os.getpid()}.Zz99Yy"
+    live.write_text("another live run's partial")
+    real = repo / "secrets" / ".notes.partial.2024.md.gpg"
+    real.write_text("a real encrypted copy")
+    # An encrypted copy of a source named like a partial: never swept or ignored.
+    real_ns = repo / "secrets" / f".genesis-partial.{dead}.x.gpg"
+    real_ns.write_text("a real encrypted copy")
+    named_dir = repo / "secrets" / ".genesis-partial.archive"
+    named_dir.mkdir()
+    (named_dir / "kept.gpg").write_text("inside a partial-like directory")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert (repo / "transcripts" / "session-a.jsonl.gpg").is_file()
+    assert "failed to encrypt" not in proc.stdout
+    for leftover in leftovers:
+        assert not leftover.exists(), f"{leftover.name} from a killed run was not swept"
+    assert real.exists(), "a real file whose name contains .partial. was swept"
+    assert live.exists(), "a live run's partial was swept"
+    assert (named_dir / "kept.gpg").exists()
+    lines = (repo / ".gitignore").read_text().splitlines()
+    assert ".genesis-partial.*" in lines and "!.genesis-partial.*/" in lines
+    tracked = subprocess.run(
+        ["git", "-C", str(repo), "ls-files"], capture_output=True, text=True, check=True
+    ).stdout.splitlines()
+    assert "secrets/.notes.partial.2024.md.gpg" in tracked
+    assert "secrets/.genesis-partial.archive/kept.gpg" in tracked
+    assert real_ns.exists() and f"secrets/{real_ns.name}" in tracked
+    assert "!.genesis-partial.*.gpg" in lines
+    assert not [t for t in tracked if "/.genesis-partial." in t and t.count("/") == 1 and not t.endswith(".gpg")], tracked
+
+
 def test_local_backend_snapshot_includes_memory_config_secrets(backup_env, tmp_path):
     """A2a: the off-site snapshot must ALSO contain memory/, config_overrides/, and
     secrets/ (previously git-Tier-1 only), so the destination is a COMPLETE copy and a

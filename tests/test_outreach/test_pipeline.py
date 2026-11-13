@@ -1579,6 +1579,32 @@ async def test_a_quarantined_subject_is_refused_before_the_approval_gate(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value",
+    ["nvapi-" + "a" * 40, "eyJ" + "a" * 20 + "." + "b" * 20 + "." + "c" * 43],
+    ids=["nvidia", "jwt"],
+)
+async def test_a_subject_with_a_shared_credential_shape_is_refused_before_the_approval_gate(
+    config, db, monkeypatch, value,
+):
+    # Shapes the scanner adopts from the shared table; synthetic, built from parts.
+    pipe, smtp = _smtp_pipe(monkeypatch, config, db, None)
+    held = MagicMock()
+    held.check = AsyncMock()
+    pipe.set_autonomy_gate(held)
+    result = await pipe.submit(OutreachRequest(
+        category=OutreachCategory.NOTIFICATION, topic="t",
+        email_subject="Your access " + value,
+        context="Body.", salience_score=1.0, channel="email", verbatim=True,
+        validated_recipient="recipient@example.com",
+    ))
+    assert result.status == OutreachStatus.FAILED
+    assert result.error == "Subject scan quarantine"
+    held.check.assert_not_called()
+    smtp.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("original", ["A" * 200, "A" * 240, "Re: " + "A" * 200])
 async def test_reply_preserves_full_thread_subject_in_mime(config, db, monkeypatch, original):
     import genesis.mcp.outreach_mcp as mcp_mod

@@ -142,3 +142,32 @@ async def test_baseline_note_persisted_additively(db):
     by_name = {s["name"]: s for s in json.loads(ticks[0]["signals_json"])}
     assert "Baseline: 4.0 sessions/day" in by_name["user_session_pattern"]["baseline_note"]
     assert "baseline_note" not in by_name["conversations_since_reflection"]
+
+
+async def test_failed_reading_persisted_additively(db):
+    """A collector that raises is stored as a placeholder value marked
+    ``failed``; a good reading carries no such key. A reader comparing two
+    ticks needs the mark, or the placeholder reads as a real value."""
+
+    class Broken:
+        signal_name = "scheduled_job_health"
+
+        async def collect(self):
+            raise RuntimeError("synthetic collector failure")
+
+    class Fine:
+        signal_name = "conversations_since_reflection"
+
+        async def collect(self):
+            return SignalReading(
+                name="conversations_since_reflection", value=0.2,
+                source="cc_sessions",
+                collected_at=datetime.now(UTC).isoformat(),
+            )
+
+    await perform_tick(db, [Broken(), Fine()], source="scheduled")
+
+    ticks = await awareness_ticks.query(db)
+    by_name = {s["name"]: s for s in json.loads(ticks[0]["signals_json"])}
+    assert by_name["scheduled_job_health"]["failed"] is True
+    assert "failed" not in by_name["conversations_since_reflection"]
