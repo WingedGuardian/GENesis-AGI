@@ -33,9 +33,13 @@ and attributed to the running test.
 
 Output: a terminal-summary section, and, with ``GENESIS_LIVE_WRITES_REPORT=<file>``,
 one tab-separated line per (test, class, operation, path), written on every run.
+Each field escapes backslash/tab/LF/CR; tests._live_writes_report.decode reads
+the reversible bytes. Empty/parseable TSV alone never establishes completeness.
 Under xdist each worker hands its hits to the controller at session end
 (``workeroutput``, as the live fence does), and only the controller reports; a
-worker that never reported is named in the summary.
+worker that never reported is named in the summary. The ordinary trylast worker
+snapshot includes default/tryfirst sessionfinish hooks, but not later same-priority
+hooks, wrapper teardown, unconfigure or writes after the snapshot.
 
 Hits classify pre-operation events, not syscall completion. Known no-ops such
 as an existing ``mkdir``, missing ``unlink``, non-empty ``rmdir``, or an
@@ -78,7 +82,7 @@ from types import ModuleType
 import pytest
 
 from genesis.secrets_location import home_config_location
-from tests import _live_writes_fs
+from tests import _live_writes_fs, _live_writes_report
 
 
 def _observer_os():
@@ -529,6 +533,7 @@ def install(config) -> None:
     _S.installed = True
 
 
+@pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus):
     # An xdist worker's terminal summary never reaches the run, so it hands its
     # hits to the controller (pytest_testnodedown), as the live fence does.
@@ -572,7 +577,8 @@ def pytest_terminal_summary(terminalreporter):
     if not _S.installed:
         if _S.disarmed:
             terminalreporter.write_line(f"live writes: disarmed ({_S.disarmed})", yellow=True)
-        return
+        else:
+            terminalreporter.write_line("live writes: not installed (unknown, not clean)", yellow=True)
     tr = terminalreporter
     if _S.faults:
         tr.write_line(f"live writes: {_S.faults} events could not be classified (unknown, not clean)", yellow=True)
@@ -596,7 +602,6 @@ def pytest_terminal_summary(terminalreporter):
         try:
             # surrogateescape: a path os.fsdecode() could not decode is written back
             # as its original bytes instead of failing the run.
-            text = "".join("\t".join(key) + "\n" for key in hits)
-            Path(report).write_bytes(text.encode("utf-8", "surrogateescape"))
+            Path(report).write_bytes(_live_writes_report.encode(hits))
         except (OSError, UnicodeError) as exc:  # report-only: never fails a run
             tr.write_line(f"live writes: could not write the report {report}: {exc}", yellow=True)
