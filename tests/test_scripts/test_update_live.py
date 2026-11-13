@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts._deploy_candidates_world import WIRED_UNIT
 from tests.test_scripts._update_source import update_text
 from tests.test_scripts.test_bootstrap_guards import (
     _assert_recovery_refused,
@@ -157,6 +158,12 @@ def _live_world(dc, w, capsys, files: dict | None = None) -> str:
     w.install_engine()
     gate = w.root / "scripts" / "deploy_candidates_gate.py"
     gate.write_text(gate.read_text() + f'\nREQUIRED_MERGED = (("scratch base", "{old_base}"),)\n')
+    # The boot repair kit and unit line in place: the real seams read the user's.
+    gate.write_text(
+        gate.read_text()
+        + '\ndef kit_status(repo):\n    return {"state": "ok"}\n'
+        + f"\ndef unit_show(repo):\n    return subprocess.CompletedProcess([], 0, {WIRED_UNIT!r}, '')\n"
+    )
     _serving_stub(w, _DOWN)
     w.git(w.root, "tag", TAG)
     return old_base

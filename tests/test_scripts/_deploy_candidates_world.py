@@ -39,6 +39,14 @@ HOOK_NAMES = (
 )
 HELPER_NAMES = ("emit_bugfix_audit.py", "db_admission_check.py")
 LOCKED = ("add", "drop", "rebuild")
+# `systemctl --user show genesis-server -p ExecStartPre -p TimeoutStartUSec` for a
+# unit that runs the boot repair (the shape MEASURED on systemd 255).
+WIRED_UNIT = (
+    'ExecStartPre={ path=/bin/sh ; argv[]=/bin/sh -c d=$$(cd -P "$$1/.genesis/lib/live-repair/'
+    'current") ; python3 -I -S -B "$$d/live_move_repair.py" --boot "$$s" "$$2" -- /h /r ; '
+    "ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n"
+    "TimeoutStartUSec=1min 30s\n"
+)
 
 
 def ephemeral_re() -> str:
@@ -359,8 +367,13 @@ def dc_world(tmp_path):
 @pytest.fixture()
 def dc_ready(dc, dc_world, monkeypatch):
     """Every readiness condition met: the required merged commit is the scratch
-    base (which also holds PR C's file), and the server serves that base."""
+    base (which also holds PR C's file), the server serves that base, and the boot
+    repair kit and unit line are in place (seams: the real ones read the user's)."""
     base = dc_world.rev("refs/remotes/origin/main")
     monkeypatch.setattr(dc.gate, "REQUIRED_MERGED", (("scratch base", base),))
+    monkeypatch.setattr(dc.gate, "kit_status", lambda repo: {"state": "ok", "differs": []})
+    monkeypatch.setattr(
+        dc.gate, "unit_show", lambda repo: subprocess.CompletedProcess([], 0, WIRED_UNIT, "")
+    )
     dc_world.serving_sha = base
     return dc_world
