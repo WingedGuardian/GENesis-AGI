@@ -70,9 +70,9 @@ Rules:
   Never edit or loosen an existing scenario; if one is wrong, say so in your
   report. Deleting is allowed only when retiring one as above.
 - The holdout file is the one
-  `.venv/bin/python scripts/holdout_runner.py --has-holdout` names (run from the
-  main checkout); the runner reads the same file. Create it there if it does not
-  exist yet.
+  `.venv/bin/python scripts/holdout_runner.py --holdout-path` prints (run from
+  the main checkout, as its own command); the runner reads the same file. Create
+  it there if it does not exist yet.
 - Never write to any file other than that holdout file and your
   scratch directory. Never commit, push, comment, or open an issue.
 - Your final report lists, for each scenario you added: its id, its `Protects`
