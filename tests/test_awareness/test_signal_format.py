@@ -1,5 +1,7 @@
 """Canonical signal formatter — one format for every reflection depth."""
 
+import pytest
+
 from genesis.awareness.signal_format import format_signal_line, format_signals
 from genesis.awareness.types import SignalReading
 
@@ -240,3 +242,68 @@ def test_every_steady_state_signal_is_classified_for_light():
     classified = sf._ALARM_SIGNALS | sf._COUNTER_SIGNALS | sf.LIGHT_HIDDEN_SIGNALS | model_judged
     assert classified == STEADY_STATE_SIGNALS
     assert not (sf._ALARM_SIGNALS & sf._COUNTER_SIGNALS)
+    # Every alarm is placed as fixed-level (a rise is a condition) or graded
+    # (a rise is the model's, unless it crosses the collector's threshold).
+    graded = {
+        "cc_version_changed",  # 0 or 1: it can only start or clear
+        "scheduled_job_health",
+        "software_error_spike",
+        "stale_browser_processes",
+        "stale_pending_items",
+        "task_completion_quality",
+    }
+    assert sf._LEVEL_ALARM_SIGNALS | graded == sf._ALARM_SIGNALS
+    assert not (sf._LEVEL_ALARM_SIGNALS & graded)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["stale_pending_items", "software_error_spike", "task_completion_quality",
+     "stale_browser_processes", "scheduled_job_health"],
+)
+def test_a_graded_alarm_creeping_up_is_not_a_condition(name):
+    """These collectors emit an age, a ratio or a count over a ceiling, so the
+    value can rise on every run while one condition stands. Start and clear are
+    still conditions; the rise is listed for the model."""
+    from genesis.awareness.signal_format import light_condition_changes
+
+    assert light_condition_changes({name: 0.3}, [_sig(name, 0.31)]) == []
+    assert _changes({name: 0.3}, _sig(name, 0.31))[0] == (
+        f"{name}: 0.3 → 0.31 (alarm still active; value rose)"
+    )
+    assert light_condition_changes({name: 0.0}, [_sig(name, 0.3)]) != []
+    assert light_condition_changes({name: 0.3}, [_sig(name, 0.0)]) != []
+
+
+def test_a_reading_that_failed_in_the_baseline_run_is_unknown():
+    """The stored value of a failed reading is a placeholder. Comparing it
+    would turn "was active, collector broke, now clear" into 0 → 0."""
+    from genesis.awareness.signal_format import light_condition_changes
+
+    assert light_condition_changes({"scheduled_job_health": None}, [_sig("scheduled_job_health", 0.0)]) == [
+        "scheduled_job_health: (reading failed in the previous run) → 0.0"
+    ]
+    assert light_condition_changes({"gone_signal": None}, []) == [
+        "gone_signal: (reading failed) → (not in this run)"
+    ]
+
+
+@pytest.mark.parametrize("name", ["scheduler_liveness", "autonomy_activity", "surplus_activity"])
+def test_a_fixed_level_alarm_rising_is_a_condition(name):
+    from genesis.awareness.signal_format import light_condition_changes
+
+    assert light_condition_changes({name: 0.5}, [_sig(name, 1.0)]) == [
+        f"{name}: 0.5 → 1.0 (alarm level ROSE)"
+    ]
+    assert light_condition_changes({name: 1.0}, [_sig(name, 0.5)]) == []
+
+
+def test_a_graded_alarm_crossing_its_own_threshold_is_a_condition():
+    from genesis.awareness.signal_format import light_condition_changes
+
+    limits = {"warning_threshold": 0.3, "critical_threshold": 0.5}
+    name = "stale_browser_processes"
+    assert light_condition_changes({name: 0.167}, [_sig(name, 0.667, **limits)]) == [
+        f"{name}: 0.167 → 0.667 (alarm still active; below warning → CRITICAL)"
+    ]
+    assert light_condition_changes({name: 0.5}, [_sig(name, 0.667, **limits)]) == []

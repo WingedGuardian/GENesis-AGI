@@ -93,6 +93,7 @@ def _raw(assessment: str, **extra) -> str:
 
 _QUIET = {"scheduled_job_health": 0.0, "budget_pct_consumed": 0.1}
 _RUNS = itertools.count(1)
+_BETWEEN_RUNS_HOURS = 0.05
 _STAMP = "%Y-%m-%dT%H:%M:%S.%f+00:00"
 
 
@@ -102,7 +103,7 @@ def _reading(name, value):
     return SignalReading(name=name, value=value, source="t", collected_at="2026-01-01T00:00:00+00:00")
 
 
-async def _run(tm, signals=None):
+async def _run(tm, signals=None, *, gap=True):
     """Record a Light run the way production does before its summary is sent:
     the tick's stored signals and the run's corpus row. Returns ``(db, tick)``."""
     readings = [_reading(k, v) for k, v in (_QUIET if signals is None else signals).items()]
@@ -118,11 +119,24 @@ async def _run(tm, signals=None):
     db = tm._db
     if db is None:
         return None, tick
+    # Light runs are minutes apart (no two corpus rows within 120 s of each
+    # other in production), and two runs inside the lookup window read as
+    # ambiguous: let that time pass before each run (``gap=False`` for a run
+    # that overlaps the one before it).
+    if gap:
+        await _age(db, _BETWEEN_RUNS_HOURS)
     stamp = datetime.now(UTC).strftime(_STAMP)
     await db.execute(
         "INSERT INTO awareness_ticks (id, source, signals_json, scores_json, created_at) "
         "VALUES (?, 'scheduled', ?, '[]', ?)",
-        (tick.tick_id, json.dumps([{"name": r.name, "value": r.value, "source": "t"} for r in readings]), stamp),
+        (
+            tick.tick_id,
+            json.dumps([
+                {"name": r.name, "value": r.value, "source": "t", **({"failed": True} if r.failed else {})}
+                for r in readings
+            ]),
+            stamp,
+        ),
     )
     await db.execute(
         "INSERT INTO reflection_corpus (id, depth, prompt_text, response_text, tick_id, created_at) "
@@ -133,8 +147,8 @@ async def _run(tm, signals=None):
     return db, tick
 
 
-async def _send(tm, assessment, *, now=None, signals=None, **extra):
-    db, tick = await _run(tm, signals)
+async def _send(tm, assessment, *, now=None, signals=None, gap=True, **extra):
+    db, tick = await _run(tm, signals, gap=gap)
     raw = _raw(assessment, **extra)
     text = format_topic_summary(
         Depth.LIGHT,
@@ -269,6 +283,71 @@ async def test_a_change_the_user_never_saw_is_posted_again(db):
     tm._bot.send_message.side_effect = working
     assert await _send(tm, _A, material_change=False, signals=started) == "posted"
     assert "(alarm STARTED)" in tm._bot.send_message.await_args.kwargs["text"]
+
+
+async def test_a_post_made_while_a_collector_was_broken_is_not_a_clean_baseline(db):
+    """An alarm is active and posted; a later post goes out while its collector
+    is failing (stored as a placeholder zero); the collector then recovers and
+    reads zero. Zero against the placeholder is not "no change": the user last
+    saw the alarm active."""
+    import dataclasses
+
+    tm = await _manager(db)
+    active = {**_QUIET, "scheduled_job_health": 0.5}
+    assert await _send(tm, _A, signals=active) == "posted"
+    broken = {**_QUIET, "scheduled_job_health": dataclasses.replace(
+        _reading("scheduled_job_health", 0.0), failed=True)}
+    assert await _send(tm, _B, signals=broken) == "posted"
+    assert await _send(tm, _B, material_change=False, signals=broken) == "skipped"
+    assert await _send(tm, _B, material_change=False) == "posted"
+    assert "(reading failed in the previous run)" in tm._bot.send_message.await_args.kwargs["text"]
+
+
+async def test_a_change_note_that_would_not_fit_goes_in_the_first_message(db):
+    """A summary that fills one Telegram message cannot take the note at its
+    end: the note would land in a second message, and if that one failed the
+    first alone would become the baseline with the change never shown."""
+    tm = await _manager(db)
+    assert await _send(tm, _A) == "posted"
+    db_, tick = await _run(tm, {**_QUIET, "scheduled_job_health": 0.5})
+    text = "<b>Light Reflection</b>\n\n" + "word " * 808
+    working = tm._bot.send_message.side_effect
+    sent: list[str] = []
+
+    async def _first_only(**kwargs):
+        if sent:
+            raise RuntimeError("synthetic failure of a later message")
+        sent.append(kwargs["text"])
+        return await working(**kwargs)
+
+    tm._bot.send_message.side_effect = _first_only
+    outcome = await send_light_topic_summary(
+        "s", text, source_text=_raw("x", material_change=False), topic_manager=tm, db=db_, tick=tick,
+    )
+    tm._bot.send_message.side_effect = working
+    assert outcome == "posted"
+    assert "(alarm STARTED)" in sent[0]
+    assert sent[0].startswith("<b>Light Reflection</b>\n\n<b>Changed since the last post</b>")
+
+
+async def test_a_summary_already_several_messages_long_still_carries_the_note(db):
+    tm = await _manager(db)
+    assert await _send(tm, _A) == "posted"
+    db_, tick = await _run(tm, {**_QUIET, "scheduled_job_health": 0.5})
+    text = "<b>Light Reflection</b>\n\n" + "word " * 1200
+    assert await send_light_topic_summary(
+        "s", text, source_text=_raw("x", material_change=False), topic_manager=tm, db=db_, tick=tick,
+    ) == "posted"
+    first = tm._bot.send_message.await_args_list[1].kwargs["text"]
+    assert first.startswith("<b>Light Reflection</b>\n\n<b>Changed since the last post</b>")
+
+
+async def test_a_change_note_that_fits_stays_under_the_summary(db):
+    tm = await _manager(db)
+    assert await _send(tm, _A) == "posted"
+    assert await _send(tm, _A, material_change=False, signals={**_QUIET, "scheduled_job_health": 0.5}) == "posted"
+    text = tm._bot.send_message.await_args.kwargs["text"]
+    assert text.index("Disk usage") < text.index("Changed since the last post")
 
 
 async def test_drift_and_the_hidden_version_flag_never_force_a_post(db):
@@ -652,7 +731,7 @@ async def test_concurrent_light_deliveries_share_one_history_decision(db, existi
 
     async def second_send():
         second_started.set()
-        return await _send(tm, _A, material_change=False)
+        return await _send(tm, _A, material_change=False, gap=False)
 
     second = asyncio.create_task(second_send())
     try:

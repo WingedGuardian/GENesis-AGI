@@ -647,13 +647,18 @@ def format_topic_summary(depth, output, *, text: str | None = None) -> str:
 #: Only the model's explicit ``"material_change": false`` suppresses a summary;
 #: an absent flag posts. The flag is trusted only while code finds no condition
 #: change between the run behind the last FULL post and this run (an alarm
-#: started, cleared or rose, a band crossed, a signal appeared or went away:
+#: started or cleared, a fixed-level alarm rose, an active alarm crossed its
+#: own threshold, a band crossed, a signal
+#: appeared or went away:
 #: ``signal_format.light_condition_changes``). The model compares against the
 #: previous stored finding, which may itself have gone unposted, so without
 #: that check an alarm or a band crossing could go unreported. The check covers
 #: the alarm signals and the signals with thresholds (memory only, today). A
 #: value with no thresholds (budget, session pattern, pending findings) is
-#: judged by the model alone, however far it drifts across unposted runs.
+#: judged by the model alone, however far it drifts across unposted runs, and
+#: so is a rise in a graded alarm (an age, a ratio, a count). A baseline that
+#: cannot be trusted (a reading that failed in the posted run, two runs in
+#: the lookup window) counts as unknown, and unknown posts.
 #: Wording is not compared: MEASURED 2026-11-12 on one install's 34 drift-only
 #: Light runs, a 0.3 term-overlap floor blocked 9 of the 17 summaries the model
 #: flagged unchanged, while the state check passed all 17 and caught all 6
@@ -792,14 +797,6 @@ async def _send_light_topic_summary_locked(
         await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
         return "posted"
 
-    # A long summary is several Telegram messages, and a later chunk that
-    # failed to send leaves no trace. Unless the text is identical, post rather
-    # than trust that the user saw all of the last one.
-    multi = len(_split_for_telegram(text)) > 1 or len(_split_for_telegram(last_full["content"])) > 1
-    if multi and text != last_full["content"]:
-        await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
-        return "posted"
-
     changes = await _conditions_changed_since(db, tick, last_full["timestamp"])
     if changes is None:
         logger.info("Light reflection posted: no stored signals for the run behind the last full post")
@@ -812,7 +809,22 @@ async def _send_light_topic_summary_locked(
         if len(changes) > 10:
             listed += f"\n• and {len(changes) - 10} more"
         note = f"<b>Changed since the last post</b> (from the signals):\n{listed}"
-        await send_to_topic(session_id, depth, f"{text}\n\n{note}", topic_manager=topic_manager)
+        augmented = f"{text}\n\n{note}"
+        if len(_split_for_telegram(augmented)) > 1 and text.startswith(header):
+            # A later message that fails to send leaves no trace, and the first
+            # one alone would become the baseline: the note goes where the
+            # first message carries it.
+            augmented = f"{header}\n\n{note}{text[len(header):]}"
+        await send_to_topic(session_id, depth, augmented, topic_manager=topic_manager)
+        return "posted"
+
+    # A long summary is several Telegram messages, and a later chunk that
+    # failed to send leaves no trace. Unless the text is identical, post rather
+    # than trust that the user saw all of the last one. (After the condition
+    # check, so a long summary still carries the change note.)
+    multi = len(_split_for_telegram(text)) > 1 or len(_split_for_telegram(last_full["content"])) > 1
+    if multi and text != last_full["content"]:
+        await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
         return "posted"
 
     now = now or datetime.now(UTC)

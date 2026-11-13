@@ -1206,15 +1206,17 @@ verified: b321bb634 2026-11-07
   moves that cross no line. The bridge stores every reflection output, then
   suppresses the Light-topic summary (or posts a periodic stub) only when the
   model sets `material_change` false AND code finds no condition change
-  (`light_condition_changes`: an alarm started, cleared or rose, a band
-  crossed, a signal appeared or went away) between the run behind the last full
+  (`light_condition_changes`: an alarm started or cleared, a fixed-level
+  alarm rose, an active alarm crossed its own threshold, a band crossed, a signal appeared or went away) between the run behind the last full
   post and this run; when code does find one, the summary is posted with those
   changes listed. That check covers the alarm signals and the signals whose
   collector sets thresholds (`container_memory_pct` only); every other value is
   the model's to judge. Wording is not compared. An absent or true flag, a multi-message
   summary that differs, parse fallbacks and an unknown baseline all post. The
   previous values come from the awareness tick whose corpus row was written up
-  to 60 s before the finding or post (`reflection_corpus.tick_written_before`).
+  to 60 s before the finding or post (`reflection_corpus.tick_written_before`);
+  two runs in that window, or a reading that failed in that run, count as
+  unknown and post.
   `genesis_version_changed` is left out of Light's signal list, change table
   and condition check (`LIGHT_HIDDEN_SIGNALS`).
   A manager-local Light-topic lock spans history through send persistence;

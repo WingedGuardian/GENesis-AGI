@@ -89,3 +89,43 @@ async def test_no_finding_or_no_matching_run_says_so(db):
     await _corpus(db, "tick-old", "2026-11-11T08:00:00.000000+00:00")  # outside the window
     missing = await _light_changes_section(db, _tick(sentinel_activity=0.0), FINDING_AT)
     assert missing.endswith("The previous run's signals are not on record.")
+
+
+@pytest.mark.asyncio
+async def test_two_runs_in_the_window_have_no_baseline(db):
+    """Overlapping reflections can write their corpus rows in either order
+    around one's output, so the newest row is not necessarily the run behind
+    it. Two candidates is no answer."""
+    from genesis.cc.reflection_bridge._prompts import _signals_behind
+    from genesis.db.crud import reflection_corpus
+
+    await _stored_tick(db, "tick-a", critical_failure=0.0)
+    await _stored_tick(db, "tick-b", critical_failure=1.0)
+    await _corpus(db, "tick-a", "2026-11-11T09:00:00.000000+00:00")
+    assert await reflection_corpus.tick_written_before(db, "Light", FINDING_AT) == "tick-a"
+    await _corpus(db, "tick-b", "2026-11-11T09:00:01.000000+00:00")
+    assert await reflection_corpus.tick_written_before(db, "Light", FINDING_AT) is None
+    assert await _signals_behind(db, FINDING_AT, exclude_tick_id=None) is None
+    # The excluded run is not a candidate: one remains.
+    assert await reflection_corpus.tick_written_before(
+        db, "Light", FINDING_AT, exclude_tick_id="tick-b"
+    ) == "tick-a"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_reading_in_the_stored_run_loads_as_unknown(db):
+    from genesis.cc.reflection_bridge._prompts import _signals_behind
+
+    await db.execute(
+        "INSERT INTO awareness_ticks (id, source, signals_json, scores_json, created_at) "
+        "VALUES ('tick-f', 'scheduled', ?, '[]', '2026-11-11T09:00:00+00:00')",
+        (json.dumps([
+            {"name": "scheduled_job_health", "value": 0.0, "source": "t", "failed": True},
+            {"name": "budget_pct_consumed", "value": 0.2, "source": "t"},
+        ]),),
+    )
+    await _corpus(db, "tick-f", "2026-11-11T09:00:00.000000+00:00")
+    assert await _signals_behind(db, FINDING_AT, exclude_tick_id=None) == {
+        "scheduled_job_health": None,
+        "budget_pct_consumed": 0.2,
+    }

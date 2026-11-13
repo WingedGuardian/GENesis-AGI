@@ -558,14 +558,18 @@ async def _light_changes_section(db, tick: TickResult, finding_at: str | None) -
     return header + light_signal_changes(previous, tick.signals)
 
 
-async def _signals_behind(db, at: str, *, exclude_tick_id: str | None) -> dict[str, float] | None:
+async def _signals_behind(
+    db, at: str, *, exclude_tick_id: str | None
+) -> dict[str, float | None] | None:
     """Signal values stored for the Light run behind something written at ``at``.
 
     ``at`` is the timestamp of that run's finding or of its Telegram post; the
     run is found by its corpus row, written just before either
     (``reflection_corpus.tick_written_before``; MEASURED 2026-11-12, the post
     follows the row by 0.5-6.7 s on the last 200 full Light posts). None when
-    there is no such row, or its tick's signals are missing or unreadable.
+    there is no such row, more than one run falls in the lookup window, or its
+    tick's signals are missing or unreadable. A signal whose reading failed in
+    that run maps to None: its stored value is a placeholder.
     """
     from genesis.db.crud import awareness_ticks, reflection_corpus
 
@@ -581,7 +585,7 @@ async def _signals_behind(db, at: str, *, exclude_tick_id: str | None) -> dict[s
     if not isinstance(stored, list):
         return None
     return {
-        s["name"]: float(s["value"])
+        s["name"]: None if s.get("failed") else float(s["value"])
         for s in stored
         if isinstance(s, dict)
         and isinstance(s.get("name"), str)

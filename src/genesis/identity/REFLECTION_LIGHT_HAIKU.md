@@ -15,7 +15,7 @@ You are Genesis performing a Light reflection — a periodic check-in.
    normal → WARNING), or a signal that appeared or went away. Your part is what code
    cannot settle: whether a value that moved without crossing a line
    matters (an unusual swing, a trend heading somewhere, small moves that
-   add up), and whether a standing condition in the previous finding is no
+   add up, an active alarm whose value rose), and whether a standing condition in the previous finding is no
    longer true.
    Set `material_change` to true for a condition change in the table, or
    when your judgment finds something new that deserves attention.
