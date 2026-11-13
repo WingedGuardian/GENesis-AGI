@@ -1653,6 +1653,9 @@ verified: f62608045437 2026-11-09
   items, response presence and Source/mention evidence; strict decoding rejects
   corrupt v2 inputs as a whole. These are retained-evidence facts, not proof of
   source acquisition or model judgment; see `docs/reference/inbox-coverage-evidence.md`.
+  Its output guard protects every inbox file the monitor may evaluate (any type), retained response targets and the
+  database and its SQLite companions by resolved path and existing file identity, independently of report
+  selection; an existing output directory receives a generated report filename.
   An ordered proof finds the first source-frame closure; ambiguous tokens stay
   raw and cannot supply wrapper context for later URLs.
   The wrapper correction is scoped to this URL path; the entry's existing
