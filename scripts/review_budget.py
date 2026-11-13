@@ -376,13 +376,17 @@ def _mark_off_diff(events: Sequence[dict[str, Any]], changed: set[str]) -> None:
     read, so True means the file has left the diff since.
 
     ``blocking`` is never changed by it: for an inline or issue-comment key
-    that flag is the level as the reviewer wrote it (a body key is always False,
-    because the merge gate never scores the review-body channel), and this fact follows the current file set, so a later push can
-    change it for an earlier round. The merge gate lists a floor finding that
-    is off the diff and never scores it; a reader that wants that reading takes
-    ``blocking is True and off_diff is not True``. It is the ONE merge-gate
-    exclusion stated here: a maintainer reply and a documentation path also
-    keep a finding out of the merge gate's score, and neither is in the budget."""
+    that flag is the level as the reviewer wrote it (a body key is always
+    False, because the merge gate never scores the review-body channel), and
+    this fact follows the current file set, so a later push can change it for
+    an earlier round. The merge gate lists an inline floor finding that is off
+    the diff and never scores it; for an INLINE key a reader that wants that
+    reading takes ``blocking is True and off_diff is not True``. It does not
+    hold for an issue-comment key: the merge gate does not score a Codex
+    findings issue comment at all (its badge form matches none of the verdict
+    channel's patterns). And off the diff is the ONE merge-gate exclusion
+    stated here: a maintainer reply and a documentation path also keep a
+    finding out of the merge gate's score, and neither is in the budget."""
     for event in events:
         flags = event["source"].get("blocking")
         if not isinstance(flags, list):
