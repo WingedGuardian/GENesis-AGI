@@ -105,7 +105,13 @@ def _run(
         # Absolute form, derived rather than hardcoded: a literal home path is
         # both a portability failure on any other install and the kind of
         # install-specific value that must not ship in a public fixture.
-        f"set -a; . {Path.home()}/genesis/secrets.env; set +a; python3 x.py",
+        # A fixed id: the default one would carry the home directory, which
+        # differs from one run to the next (CI's collected-floor job compares
+        # ids across two runs).
+        pytest.param(
+            f"set -a; . {Path.home()}/genesis/secrets.env; set +a; python3 x.py",
+            id="absolute-home-path",
+        ),
         "source ~/genesis/secrets.env && ./run.sh",
         "cat ~/genesis/secrets.env",
         # Reading only key NAMES still touches the file — the owner asked to know
