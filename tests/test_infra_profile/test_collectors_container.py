@@ -551,6 +551,9 @@ async def test_storage_cc_tmp_isolated_own_device(proc_root, sys_root, tmp_path,
         return _S(1 if str(path).endswith("cc-tmp") else 2)
 
     monkeypatch.setattr(_container.os, "stat", fake_stat)
+    # The stat stub answers every path, so keep the io-delegation read (which
+    # stats the user-manager cgroup) out of it: not what this test is about.
+    monkeypatch.setattr(_container, "_user_manager_cgroup", lambda: None)
     result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
     assert result.facts["cc_tmp_isolated"] is True
 
@@ -1406,3 +1409,32 @@ def test_system_bus_reachable_follows_the_address(monkeypatch):
         barred.chmod(0o700)
     finally:
         shutil.rmtree(short, ignore_errors=True)
+
+
+# ── user-manager io delegation (cgroup IO settings that cannot take effect) ──
+
+
+def _manager_controllers(sys_root, controllers):
+    cg = sys_root / "fs/cgroup" / _UM.lstrip("/")
+    cg.mkdir(parents=True, exist_ok=True)
+    (cg / "cgroup.controllers").write_text(controllers + "\n")
+
+
+@pytest.mark.parametrize(
+    ("controllers", "expected"),
+    [("cpu memory pids", False), ("cpu io memory pids", True)],
+)
+async def test_storage_records_whether_io_is_delegated(
+    tmp_path, monkeypatch, proc_root, sys_root, controllers, expected
+):
+    _self_cgroup(tmp_path, monkeypatch, "0::" + _UM + "/app.slice/genesis-server.service")
+    _manager_controllers(sys_root, controllers)
+    result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    assert result.facts["user_manager_io_delegated"] is expected
+
+
+async def test_storage_omits_io_delegation_when_it_cannot_be_read(tmp_path, monkeypatch, proc_root, sys_root):
+    # No user-manager cgroup to read: the fact is absent (unknown), never False.
+    _self_cgroup(tmp_path, monkeypatch, "0::/system.slice/qdrant.service")
+    result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    assert "user_manager_io_delegated" not in result.facts
