@@ -2629,13 +2629,19 @@ verified: 0aa0bf9f2 2026-11-10
   over stdin, as the configured container user, #3627) so newer ineligible
   reports cannot hide it; JSON-quoted, capped at 2,000 characters and fenced
   as untrusted; empty, and the prompt unchanged, when there are none. The
+  pick is a stub that runs the repair loader's own `newest_eligible` (#3892;
+  no copy of its rules lives in the collector): from the installed kit
+  (`~/.genesis/lib/live-repair/current`, resolved physically), else from
+  HEAD's blob (`git show HEAD:`, never the working tree), which is also what a
+  kit older than the function gets; each module is read as a regular file of
+  at most 1 MiB, and with neither the pick prints nothing. A cross-reader
+  test runs deploy health, the pick and `newest_eligible` on one dir set. The
   container reads are bounded where they are produced (only a report dir
   named as the writer names it and not a symlink; one regular report opened
   without following a symlink, 4 MiB; the repo compared as the repair loader
   compares it; dirs ordered by the loader's `report_order`, seconds then
   pid, a name over 300 s ahead skipped and at most 8 dirs read, as deploy
-  health does; those rules held equal to the loader's by a parity test and a
-  cross-reader test; a newer one over that cap, unreadable or not a JSON
+  health does; a newer one over that cap, unreadable or not a JSON
   object is shown as "report too large" or "report unreadable", never skipped
   for an older one, unless the top-level repo, result or dismissed_at read
   from the writer's indent-2 layout makes it ineligible; journal lines cut to
@@ -5429,7 +5435,15 @@ logger or unrelated exceptions with copied text and no provenance.
   cleared by a restore (its `restore.restored_at` a string and
   `restore.refused` an int, never a bool, of 0). It loads the repair's module once per snapshot when any
   report dir exists (a module that cannot load, or lacks a name the reader
-  uses, reads every report as refused and blanks nothing), and a linked worktree reads none. The awareness paragraph
+  uses, reads every report as refused and blanks nothing), and a linked worktree reads none.
+  That module is the installed kit's while the kit is `ok`, so the reader
+  judges what the writer that runs judged; otherwise the checkout's, which can
+  differ (#3492 D2b). Every snapshot also carries the kit's state
+  (`live_repair_kit.status`, each of its four git calls on a 5 s budget), report or none,
+  and each state but `ok` is a finding, `live_repair_kit:<missing|partial|
+  stale|corrupt|foreign>` (the kit read under `$HOME/.genesis/lib`, where every
+  installer puts it; a HEAD that cannot be read is no state, never `stale`), whose awareness line names the reinstall:
+  `python3 -I -S <repo>/scripts/lib/live_repair_kit.py install <repo> <home>`. The awareness paragraph
   names, per undismissed report with saved paths, its backup folder,
   `scripts/deploy_candidates repair-move --restore <ts>` (once both the
   installed repair kit and `scripts/deploy_candidates` include it; an exit 2
