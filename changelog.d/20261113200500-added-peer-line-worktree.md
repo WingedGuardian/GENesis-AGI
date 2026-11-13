@@ -1,0 +1,1 @@
+- Each `[Concurrent]` line a session sees for its peers now says where that peer is working: `in <worktree> on <branch>`, plus how many other worktrees it holds. It comes from the worktree claim a session takes on its first edit in a worktree, so a session can tell which worktrees belong to someone else before it touches one.

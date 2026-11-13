@@ -41,6 +41,7 @@ import proactive_memory_hook as pmh  # noqa: E402
 from hook_output import HOOK_STDOUT_CAP, emit_cost  # noqa: E402
 
 _SID = "aaaabbbb-cccc-dddd-eeee-ffff00002222"
+_REAL_PEER_WORKTREES = pmh._peer_worktrees
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +49,7 @@ def _no_live_registry(monkeypatch):
     """Keep the peer renderer off the machine's real session registry (a dev box
     has one and CI does not); the widest-block test sets its own suffix."""
     monkeypatch.setattr(pmh, "_peer_addresses", lambda *a, **k: {})
+    monkeypatch.setattr(pmh, "_peer_worktrees", lambda *a, **k: {})
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +418,25 @@ def _widest_address() -> str:
     return text
 
 
+def _widest_worktree() -> str:
+    """The longest worktree text the real _peer_worktrees can produce: both
+    names over their limits, plus a three-digit count of further claims. Built
+    by the real function over a stubbed claim reader, so a wider bound widens
+    this test with it."""
+    import worktree_claim
+
+    claims = [{"name": "n" * 500, "branch": "b" * 500, "claimed_at": 1.0}] * 1000
+    orig_common, orig_claims = worktree_claim.common_dir_for, worktree_claim.claims_by_session
+    worktree_claim.common_dir_for = lambda root: Path("/nonexistent")
+    worktree_claim.claims_by_session = lambda common, sids, **kw: {s: claims for s in sids}
+    try:
+        text = _REAL_PEER_WORKTREES(["x"], None)["x"]
+    finally:
+        worktree_claim.common_dir_for, worktree_claim.claims_by_session = orig_common, orig_claims
+    assert "(+999 more claimed)" in text and text.count("…") == 2, text  # nothing was dropped
+    return text
+
+
 def test_the_widest_possible_peer_block_leaves_room_for_the_directive() -> None:
     """The arithmetic behind the claim above, MEASURED not derived.
 
@@ -447,16 +468,17 @@ def test_the_widest_possible_peer_block_leaves_room_for_the_directive() -> None:
         }
         collected = _Collect()
         orig_get, orig_count = hb.get_active_sync, hb.count_active_sync
-        orig_addr = pmh._peer_addresses
+        orig_addr, orig_wt = pmh._peer_addresses, pmh._peer_worktrees
         hb.get_active_sync = lambda *a, _r=row, **k: [dict(_r) for _ in range(pmh._MAX_PEERS_SHOWN)]
         hb.count_active_sync = lambda *a, **k: 500
         pmh._peer_addresses = lambda ids, *a, **k: {i: _widest_address() for i in ids}
+        pmh._peer_worktrees = lambda ids, *a, **k: {i: _widest_worktree() for i in ids}
         pmh._OUT = collected
         try:
             pmh._heartbeat_read_and_inject(Path(__file__), _SID)
         finally:
             hb.get_active_sync, hb.count_active_sync = orig_get, orig_count
-            pmh._peer_addresses = orig_addr
+            pmh._peer_addresses, pmh._peer_worktrees = orig_addr, orig_wt
             pmh._OUT = None
 
         peers = [ln for ln in collected.lines if ln.startswith("[Concurrent |")]

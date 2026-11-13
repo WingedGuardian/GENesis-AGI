@@ -960,9 +960,13 @@ verified: b321bb634 2026-11-07
   decontextualised in yours. `model` comes from the SessionStart cache with
   `GENESIS_ROSTER_MODEL` taking precedence, NOT from `cc_sessions.model` — on a
   live install that column is dominated by the literal string `unknown`.
-  Liveness comes ONLY from `session_heartbeats`: `cc_sessions.pid` is unset for
-  most rows and its `status`/`last_activity_at` go stale on running sessions, so
-  it must never be used to decide who is alive. **Every rendered field is
+  Liveness comes ONLY from `session_heartbeats`. `cc_sessions.pid` is set on
+  foreground rows since #1706 (MEASURED 2026-11-13 over rows started in the last
+  three days: 91 of 91 checkpointed and 4 of 4 active rows carry one, 0 of 7
+  completed rows do), but one process can carry several session rows (one pid
+  on 2 rows after a `/clear`, another on 4), and the row's
+  `status`/`last_activity_at` go stale on running sessions, so it must never be
+  used to decide who is alive. **Every rendered field is
   peer-authored, so all pass through `sanitize_detail`** — a newline in any of
   them forges an extra `[Concurrent | …]` line in the reader's context. The
   writers are partial by design (each knows a different subset), so the upsert
@@ -994,6 +998,27 @@ verified: b321bb634 2026-11-07
   `python -m genesis session-address <id>` (whose `--check` compares it with
   `claude agents --json`, Claude Code's supported listing) and the
   `session_address` MCP tool.
+  **And the worktrees the peer holds** — the tag's body opens with
+  `in <worktree> on <branch> (+N more claimed)`, from the worktree-ownership
+  claims (`scripts/hooks/worktree_claim.py` `claims_by_session`), taken on a
+  session's first edit in a worktree and owned by its PROCESS. A claim is
+  matched by the peer's live pid, the one the address lookup above verified
+  against the registry and the process start time, and failing that by the
+  session id the claim recorded: `/clear` starts a new id in the same process,
+  so an id-only join loses every claim made before it (MEASURED 2026-11-13: 4
+  of 18 live claims). Locks are read raw from `<common dir>/worktrees/*/locked`
+  (never porcelain), with a byte test for the namespace before any parse, one
+  entry at a time so a malformed lock skips only itself. A claim shows only on
+  positive identity (`claim_is_live`: start time matches, not a zombie); an
+  unknown is not shown. The worktree named is the most recently CLAIMED one
+  (the lock file's mtime: a lock is never overwritten), which is where the peer
+  last first-edited, not proof of where it is now; the rest are counted. Names
+  are allowlisted (`[A-Za-z0-9._/+-]`) and omitted when outside it, so the
+  suffix can neither forge a field nor cost more than one budget unit a
+  character. A peer with no claim shows no suffix. The scan costs 22-38 ms over
+  638 admin dirs (MEASURED 2026-11-13, 5 runs, `claims_by_session` alone), is
+  skipped once the hook's deadline has passed and checks it during the scan;
+  an unfinished scan or any failure renders the line as before.
 
 - **Slot environment pinning + usable temp directories.**
   LIVE. `tmux new-session` builds a new session's environment from the tmux
