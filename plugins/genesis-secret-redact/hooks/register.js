@@ -259,9 +259,10 @@ let loading = null // one loader run at a time; concurrent events share it
 async function report($, failure) {
   try {
     const body = { ok: failure === undefined, failure: failure ?? null, redacting: pairs.length > 0, variables, overwritten: reported ? reported.split(', ') : [] }
-    // While a failure lasts the file is rewritten once an hour, so a session that keeps failing stays inside
-    // the day `check` reads; a healthy session writes only when its state changes.
-    const line = JSON.stringify({ ...body, hour: body.ok ? 0 : Math.floor(Date.now() / 3_600_000) })
+    // While a session is unhealthy (a failed load, or placeholder text stored as a value) the file is rewritten
+    // once an hour, so it stays inside the day `check` reads; a healthy session writes only when its state changes.
+    const healthy = body.ok && body.overwritten.length === 0
+    const line = JSON.stringify({ ...body, hour: healthy ? 0 : Math.floor(Date.now() / 3_600_000) })
     if (line === stateLine) return
     const base = (await $.env.get('GENESIS_HOME')) || `${await $.env.get('HOME')}/.genesis`
     const session = await $.session.id()
@@ -289,8 +290,10 @@ async function fresh($) {
         loading = null
       })
       await loading
-      await report($)
     }
+    // Every event offers the report: it is written only when its line changes, so a write that failed is retried
+    // and an unhealthy state is refreshed without waiting for the secrets file to change.
+    await report($)
   } catch (err) {
     retryAt = Date.now() + RETRY_MS
     await report($, failureKind(err))

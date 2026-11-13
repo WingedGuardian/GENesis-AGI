@@ -29,7 +29,7 @@ const { execFile } = require("child_process");
 (async () => {
   const mod = await import("data:text/javascript," + encodeURIComponent(fs.readFileSync(spec.module, "utf8")));
   const logs = [];
-  let loaderRuns = 0, failLoads = 0, truncate = 0, garble = 0, afterLoader = null, now = Date.now(), tick = 0;
+  let loaderRuns = 0, failLoads = 0, truncate = 0, garble = 0, failWrites = 0, afterLoader = null, now = Date.now(), tick = 0;
   Date.now = () => now;
   const $ = {
     plugin: { root: spec.plugin },
@@ -43,7 +43,10 @@ const { execFile } = require("child_process");
         return options?.resolve ? { ...stat, realPath: fs.realpathSync(p) } : stat;
       },
       read: async p => fs.readFileSync(p, "utf8"),
-      write: async (p, text) => { fs.mkdirSync(require("path").dirname(p), { recursive: true }); fs.writeFileSync(p, text); },
+      write: async (p, text) => {
+        if (failWrites > 0 && p.includes("/state/secret-redact/")) { failWrites -= 1; throw new Error("ENOSPC"); }
+        fs.mkdirSync(require("path").dirname(p), { recursive: true }); fs.writeFileSync(p, text);
+      },
     },
     process: { run: argv => new Promise(resolve => {
       loaderRuns += 1;
@@ -73,6 +76,7 @@ const { execFile } = require("child_process");
     afterNextLoader: fn => { afterLoader = fn; },
     truncateNext: n => { truncate = n; },
     garbleNext: n => { garble = n; },
+    failWritesNext: n => { failWrites = n; },
     link: (target, p) => { fs.mkdirSync(require("path").dirname(p), { recursive: true }); fs.symlinkSync(target, p); },
     runs: () => loaderRuns,
   };
@@ -707,3 +711,50 @@ def test_a_failure_whose_message_would_quote_a_value_is_recorded_by_its_kind_onl
     )
     text = state.read_text()
     assert KEY not in text and '"failure":"SyntaxError"' in text
+
+
+def test_a_report_that_failed_to_write_is_retried_on_the_next_event(tmp_path):
+    state = (
+        tmp_path
+        / ".genesis"
+        / "state"
+        / "secret-redact"
+        / "0f0f0f0f-1111-2222-3333-444444444444.json"
+    )
+    res = _run(
+        tmp_path,
+        """
+        t.failWritesNext(1);
+        await t.emit("session.start", {});
+        let missing = false;
+        try { t.read(t.dir + "/.genesis/state/secret-redact/0f0f0f0f-1111-2222-3333-444444444444.json"); } catch { missing = true; }
+        await t.emit("prompt.submit", { text: "hello" });  // the secrets file has not changed
+        return { missing };
+        """,
+    )
+    assert res["out"] == {"missing": True}
+    assert '"ok":true' in state.read_text()
+
+
+def test_a_report_of_overwritten_keys_is_refreshed_hourly(tmp_path):
+    state = (
+        tmp_path
+        / ".genesis"
+        / "state"
+        / "secret-redact"
+        / "0f0f0f0f-1111-2222-3333-444444444444.json"
+    )
+    res = _run(
+        tmp_path,
+        """
+        await t.emit("session.start", {});
+        const first = t.read(t.dir + "/.genesis/state/secret-redact/0f0f0f0f-1111-2222-3333-444444444444.json");
+        t.advance(2 * 3600 * 1000);
+        await t.emit("prompt.submit", { text: "hello" });
+        const later = t.read(t.dir + "/.genesis/state/secret-redact/0f0f0f0f-1111-2222-3333-444444444444.json");
+        return { refreshed: first !== later };
+        """,
+        secrets=f"CANARY_API_KEY={KEY}\nOTHER_TOKEN=[secrets.env:GONE_TOKEN]\n",
+    )
+    assert res["out"] == {"refreshed": True}
+    assert '"overwritten":["OTHER_TOKEN"]' in state.read_text()
