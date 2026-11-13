@@ -22,6 +22,14 @@ FUNCTION_HOOKS_ENV = "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS"
 
 
 def pin_dispatched_env(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
-    """Apply the dispatched-session pins to ``env`` in place and return it."""
+    """Apply the dispatched-session pins to ``env`` in place and return it.
+
+    Also drops the client label (``caller_context.drop_client_label``): a
+    dispatched child is never the labelled client, so its calls must not be
+    recorded as that client's.
+    """
+    from genesis.caller_context import drop_client_label
+
     env[FUNCTION_HOOKS_ENV] = "0"
+    drop_client_label(env)
     return env

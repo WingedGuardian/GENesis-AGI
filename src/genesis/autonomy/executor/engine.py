@@ -676,8 +676,15 @@ class CCSessionExecutor:
                         "iteration": iteration,
                         "passed": verify.passed,
                         "skipped": verify.skipped_reason,
+                        "review_error": verify.review_error,
                         "issues": verify.programmatic_issues,
                     })
+
+                if verify.review_error:
+                    await self._persist_blocker(
+                        task_id, verify.review_error, TaskPhase.VERIFYING,
+                    )
+                    return False
 
                 if verify.passed:
                     review_passed = True

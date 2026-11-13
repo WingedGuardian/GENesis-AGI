@@ -361,6 +361,11 @@ class CallerResolver:
         kinds = ", ".join(FORWARDER if k is None else k for k, _s in self._entries)
         return f"CallerResolver({kinds})"
 
+    @property
+    def credential_kinds(self) -> frozenset[str]:
+        """Configured file kinds, without secrets or implicit provisioning."""
+        return frozenset(credential_file_name(kind) for kind, _secret in self._entries)
+
     def resolve(
         self, request_credential: object, forwarded_fields: object
     ) -> CallerContext | Rejected:

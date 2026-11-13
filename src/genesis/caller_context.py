@@ -6,13 +6,23 @@ Caller identity today is process environment. ``CCInvoker._build_env`` stamps
 it on every Claude Code child, and stdio MCP servers inherit it:
 
 - ``GENESIS_CC_SESSION=1``: a Genesis-dispatched session (set on every child,
-  channel conversations included).
+  channel conversations included, and by :func:`dispatched_child_env` on the
+  agent CLIs Genesis starts unattended, such as ``codex exec``).
 - ``GENESIS_SESSION_SUPERVISED=1``: an owner-attended conversation.
 - ``GENESIS_SESSION_ID``: the Genesis ``cc_sessions.id`` row.
 - ``GENESIS_SESSION_ORIGIN``: the dispatching session's origin class.
 - ``CLAUDE_CODE_SESSION_ID``: the Claude Code transcript id (the charter key).
 - ``CLAUDE_SESSION_ID``: a legacy name current Claude Code no longer sets; only
   the trash tombstone still reads it.
+- ``GENESIS_CALLER_PROFILE``: the client a stdio server serves, set by that
+  client's launcher (``codex`` for owner-mode Codex). Read into
+  :attr:`CallerContext.profile`; it labels what the client did and never grants
+  anything.
+- ``CLAUDECODE``: set by Claude Code in the shells and MCP servers it starts.
+- ``CODEX_THREAD_ID``: set by Codex in the shells it runs commands in (not in
+  its MCP servers, which get a filtered environment).
+
+The last two feed :func:`client_kind`, a label for records, never a permission.
 
 Code must not read those variables itself. It calls :func:`caller_context`,
 and a test fails on any direct read under ``src/`` outside this module. The
@@ -58,7 +68,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, MutableMapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -71,6 +81,11 @@ SESSION_ID_ENV = "GENESIS_SESSION_ID"
 SESSION_ORIGIN_ENV = "GENESIS_SESSION_ORIGIN"
 TRANSCRIPT_ID_ENV = "CLAUDE_CODE_SESSION_ID"
 LEGACY_SESSION_ID_ENV = "CLAUDE_SESSION_ID"
+# The client a stdio server is serving, set by that client's launcher (``codex``
+# for owner-mode Codex). A record of which client acted, never a permission.
+PROFILE_ENV = "GENESIS_CALLER_PROFILE"
+CLAUDE_CODE_ENV = "CLAUDECODE"
+CODEX_THREAD_ENV = "CODEX_THREAD_ID"
 
 IDENTITY_ENV_VARS = frozenset(
     {
@@ -80,6 +95,9 @@ IDENTITY_ENV_VARS = frozenset(
         SESSION_ORIGIN_ENV,
         TRANSCRIPT_ID_ENV,
         LEGACY_SESSION_ID_ENV,
+        PROFILE_ENV,
+        CLAUDE_CODE_ENV,
+        CODEX_THREAD_ENV,
     }
 )
 
@@ -112,6 +130,8 @@ class CallerContext:
     transcript_id: str | None = None
     legacy_session_id: str | None = None
     profile: str | None = None
+    claude_code: str | None = None
+    codex_thread: str | None = None
 
     @property
     def unsupervised_dispatched(self) -> bool:
@@ -135,7 +155,10 @@ def enter_shared_service() -> None:
     Rewrites the identity variables as well, so a child process, which inherits
     the environment and not this flag, reads the lost-scope caller too unless a
     tool passes it the real caller. Bootstrap clears the origin variable, so
-    call this after the runtime is initialised.
+    call this after the runtime is initialised. The agent-shell markers go
+    too, so a child no longer reads as running inside an agent's shell: a
+    command-line tool that refuses there (the browser-stack install) needs the
+    caller passed to it like any other identity.
     """
     global _shared_service
     _shared_service = True
@@ -146,7 +169,13 @@ def enter_shared_service() -> None:
 
 
 def caller_context_from_env() -> CallerContext:
-    """The caller as this process's environment describes it, read now."""
+    """Read legacy process identity; shared processes have no environment caller.
+
+    Shared mode returns the lost-scope caller even inside a request. Use
+    ``caller_context()`` for the validated request's identity instead.
+    """
+    if _shared_service:
+        return _LOST_SCOPE_CALLER
     env = os.environ
     return CallerContext(
         dispatched=env.get(CC_SESSION_ENV) == "1",
@@ -155,7 +184,94 @@ def caller_context_from_env() -> CallerContext:
         origin=env.get(SESSION_ORIGIN_ENV),
         transcript_id=env.get(TRANSCRIPT_ID_ENV),
         legacy_session_id=env.get(LEGACY_SESSION_ID_ENV),
+        profile=env.get(PROFILE_ENV) or None,
+        claude_code=env.get(CLAUDE_CODE_ENV),
+        codex_thread=env.get(CODEX_THREAD_ENV),
     )
+
+
+_CODEX_LABEL = "codex"
+_CLIENT_SESSION_NAMES = {_CODEX_LABEL: "Codex session"}
+# client_kind's label for each caller profile: owner-mode Codex's stdio label and
+# the external-client profiles a stdio server or a shared-service credential sets.
+_PROFILE_KINDS = {
+    _CODEX_LABEL: _CODEX_LABEL,
+    "interactive": _CODEX_LABEL,
+    "validator": "codex-sealed",
+    "external": "codex-external",
+}
+
+
+def client_session_name() -> str:
+    """What to call the caller's session in a message: "Claude Code session"
+    unless the caller is a labelled client with its own name (owner-mode Codex).
+    Messages that tell the reader to restart use it, so a Codex user is not told
+    to restart a Claude Code session; Claude Code's wording stays unchanged.
+    """
+    return _CLIENT_SESSION_NAMES.get(caller_context().profile or "", "Claude Code session")
+
+
+def client_kind(external_profile: str | None = None) -> str:
+    """Which agent client made the current call, as a label for records.
+
+    *external_profile* is the MCP external-client profile a stdio server put in
+    force for the call, if any (``"validator"`` for the sealed Codex validator);
+    a caller outside an MCP tool passes nothing. In order:
+
+    - the profile, *external_profile* or else :attr:`CallerContext.profile`:
+      ``"codex-sealed"`` (validator), ``"codex-external"`` (external), ``"codex"``
+      (owner-mode Codex: the ``codex`` stdio label or the ``interactive``
+      credential);
+    - ``"codex"``: ``CODEX_THREAD_ID`` is set (a Codex command shell);
+    - ``"claude"``: ``CLAUDECODE`` is set;
+    - ``"unknown"``: none of these, or a profile this table does not know.
+
+    The Codex thread id is checked before ``CLAUDECODE`` because Codex passes
+    its parent's environment to its shells, so Codex started from a Claude
+    Code shell carries both. Claude Code started from a Codex shell would carry
+    both too and reads as ``codex``: a known limit of a label that only sees
+    the environment.
+
+    This is a label for records. Nothing may grant or refuse anything on it.
+    """
+    ctx = caller_context()
+    profile = external_profile or ctx.profile
+    if profile:
+        return _PROFILE_KINDS.get(profile, "unknown")
+    if ctx.codex_thread:
+        return _CODEX_LABEL
+    if ctx.claude_code:
+        return "claude"
+    return "unknown"
+
+
+def drop_client_label(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
+    """Remove the client label from a child's environment, in place.
+
+    A process Genesis spawns is never the labelled client itself, so it must
+    not inherit the label and have its calls recorded as that client's.
+    """
+    env.pop(PROFILE_ENV, None)
+    return env
+
+
+def dispatched_child_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """A copy of *base* (default: this process's environment) marked dispatched.
+
+    For an agent CLI Genesis starts unattended, such as ``codex exec``. Without
+    the marker the child reads as the owner's own interactive client, which is
+    what an unmarked session means everywhere else. The supervised marker is
+    dropped: nobody watches this child, even when its parent was an
+    owner-attended conversation. So are the parent's session and transcript
+    ids and its client label, which the child is not. The origin class is kept, so a child of an
+    external-influenced session stays classified as one.
+    """
+    env = dict(os.environ if base is None else base)
+    env[CC_SESSION_ENV] = "1"
+    for name in (SUPERVISED_ENV, SESSION_ID_ENV, TRANSCRIPT_ID_ENV, LEGACY_SESSION_ID_ENV):
+        env.pop(name, None)
+    drop_client_label(env)
+    return env
 
 
 def caller_context() -> CallerContext:

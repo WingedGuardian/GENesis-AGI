@@ -16,8 +16,9 @@ mapping, a loop variable, a keyword argument):
 
 - a literal that IS an identity name (a string, or bytes such as
   ``b"NAME=1"`` matched against another process's ``/proc`` environ) may
-  appear only in the accessor, the child-env writer modules and one listed
-  peer-environ reader (this caught the loop-keyed read on main);
+  appear only in the accessor, the child-env writer modules, one listed
+  peer-environ reader and the listed command-line agent-shell refusals (this
+  caught the loop-keyed read on main);
 - the accessor's exported name constants may be used only in the accessor and a
   short allowlist, so a module cannot key a read by importing them instead.
 
@@ -84,6 +85,82 @@ def test_env_fallback_reads_raw_values_per_call(monkeypatch):
     assert ctx.unsupervised_dispatched is True
     monkeypatch.setenv("GENESIS_SESSION_SUPERVISED", "1")
     assert caller_context().unsupervised_dispatched is False
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CODEX_THREAD_ID", " th ")
+    ctx = caller_context()
+    assert (ctx.claude_code, ctx.codex_thread) == ("1", " th ")
+
+
+# ── client_kind: a label for records ─────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("env", "external", "expected"),
+    [
+        ({}, None, "unknown"),
+        ({"CLAUDECODE": "1"}, None, "claude"),
+        ({"CLAUDECODE": ""}, None, "unknown"),
+        ({"CODEX_THREAD_ID": "t"}, None, "codex"),
+        # Codex started from a Claude Code shell inherits CLAUDECODE.
+        ({"CLAUDECODE": "1", "CODEX_THREAD_ID": "t"}, None, "codex"),
+        # Owner-mode Codex MCP servers carry the client label, no thread id.
+        ({"GENESIS_CALLER_PROFILE": "codex"}, None, "codex"),
+        ({"GENESIS_CALLER_PROFILE": "codex", "CLAUDECODE": "1"}, None, "codex"),
+        ({"GENESIS_CALLER_PROFILE": "other"}, None, "unknown"),
+        # An external-client MCP profile wins over whatever the env inherited.
+        ({"CLAUDECODE": "1"}, "validator", "codex-sealed"),
+        ({}, "validator", "codex-sealed"),
+        ({"CLAUDECODE": "1"}, "external", "codex-external"),
+    ],
+)
+def test_client_kind_labels_each_client(monkeypatch, env, external, expected):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    assert cc.client_kind(external) == expected
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected"),
+    [
+        ("validator", "codex-sealed"),
+        ("external", "codex-external"),
+        ("interactive", "codex"),
+        ("codex", "codex"),
+        ("unlisted", "unknown"),
+    ],
+)
+def test_client_kind_labels_a_credential_resolved_profile(monkeypatch, profile, expected):
+    # The profile a shared-service credential resolves to (caller_credentials) is
+    # read from the request-scoped caller, whatever the process inherited.
+    monkeypatch.setenv("CLAUDECODE", "1")
+    with request_caller(CallerContext(profile=profile)):
+        assert cc.client_kind() == expected
+
+
+_GATE_SURFACES = ("autonomy", "payments", "security", "guardian", "ego")
+
+
+def test_client_kind_is_never_read_on_a_gate_surface():
+    """It is a label anyone can spoof by setting an env var, so no gate may use it."""
+    offenders = [
+        f"{path.relative_to(_SRC).as_posix()}"
+        for area in _GATE_SURFACES
+        for path in sorted((_SRC / area).rglob("*.py"))
+        if "client_kind" in path.read_text(encoding="utf-8")
+    ]
+    assert all((_SRC / area).is_dir() for area in _GATE_SURFACES)
+    assert not offenders, f"client_kind used on a gate surface: {offenders}"
+
+
+def test_client_kind_follows_the_request_scoped_caller(monkeypatch):
+    monkeypatch.setenv("CLAUDECODE", "1")
+    with request_caller(CallerContext(codex_thread="t")):
+        assert cc.client_kind() == "codex"
+    with request_caller(CallerContext()):
+        assert cc.client_kind() == "unknown"
+    assert cc.client_kind() == "claude"
+
+
 
 
 def test_request_context_overrides_env_and_resets(monkeypatch):
@@ -189,11 +266,74 @@ def shared_service(monkeypatch):
     return module
 
 
+def test_a_shared_service_labels_lost_scope_work_unknown(shared_service):
+    """The service's own inherited markers name no caller, so they are dropped."""
+    import os
+
+    assert "CLAUDECODE" not in os.environ and "CODEX_THREAD_ID" not in os.environ
+    assert shared_service.client_kind() == "unknown"
+    with request_caller(CallerContext(claude_code="1")):
+        assert shared_service.client_kind() == "claude"
+
+
 def test_lost_scope_work_is_untrusted_at_the_memory_writers(shared_service):
     from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED, session_origin_from_env
 
     assert shared_service._LOST_SCOPE_CALLER.origin == ORIGIN_EXTERNAL_UNTRUSTED
     assert session_origin_from_env() == ORIGIN_EXTERNAL_UNTRUSTED
+
+
+@pytest.mark.parametrize("in_request", [False, True])
+@pytest.mark.parametrize("bare_thread", [False, True])
+def test_explicit_env_accessor_cannot_restore_shared_process_authority(
+    shared_service, monkeypatch, in_request, bare_thread,
+):
+    import threading
+    from contextlib import nullcontext
+
+    from genesis.security.immunity_shadow import DispatchGateRefused, guard_human_gate
+
+    # Simulate later startup/child-env drift after shared mode was selected.
+    values = ("0", "1", "service-row", "owner", "service-transcript", "service-legacy")
+    names = (cc.CC_SESSION_ENV, cc.SUPERVISED_ENV, cc.SESSION_ID_ENV,
+             cc.SESSION_ORIGIN_ENV, cc.TRANSCRIPT_ID_ENV, cc.LEGACY_SESSION_ID_ENV)
+    for name, value in zip(names, values, strict=True):
+        monkeypatch.setenv(name, value)
+    request = CallerContext(dispatched=False, supervised=True, session_id="request-row")
+    seen = []
+
+    def read():
+        seen.append(shared_service.caller_context_from_env())
+
+    with request_caller(request) if in_request else nullcontext():
+        if bare_thread:
+            thread = threading.Thread(target=read)
+            thread.start()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        else:
+            read()
+        if in_request:
+            assert caller_context() is request
+    assert seen == [shared_service._LOST_SCOPE_CALLER]
+    with request_caller(seen[0]), pytest.raises(DispatchGateRefused):
+        guard_human_gate("synthetic-env-accessor-probe")
+
+
+def test_explicit_env_accessor_keeps_raw_legacy_reads(monkeypatch):
+    monkeypatch.setattr(cc, "_shared_service", False)
+    monkeypatch.setenv(cc.CC_SESSION_ENV, "1")
+    monkeypatch.setenv(cc.SUPERVISED_ENV, "true")
+    monkeypatch.setenv(cc.SESSION_ID_ENV, "")
+    monkeypatch.setenv(cc.SESSION_ORIGIN_ENV, " raw ")
+    monkeypatch.setenv(cc.TRANSCRIPT_ID_ENV, " padded ")
+    monkeypatch.setenv(cc.LEGACY_SESSION_ID_ENV, "legacy")
+    expected = CallerContext(dispatched=True, supervised=False, session_id="", origin=" raw ",
+                             transcript_id=" padded ", legacy_session_id="legacy")
+    with request_caller(CallerContext(session_id="request-row")):
+        assert cc.caller_context_from_env() == expected
+        monkeypatch.setenv(cc.SUPERVISED_ENV, "1")
+        assert cc.caller_context_from_env().supervised is True
 
 
 def test_a_child_of_a_shared_service_is_refused_at_the_human_gate(shared_service):
@@ -375,7 +515,10 @@ def test_no_direct_identity_reads_outside_the_accessor():
     for path in files:
         if path == _ACCESSOR:
             continue
+        rel = path.relative_to(_SRC).as_posix()
         for line, name in direct_identity_reads(path.read_text(encoding="utf-8"), str(path)):
+            if rel in _AGENT_SHELL_DETECTORS and name in _AGENT_MARKERS:
+                continue
             offenders.append(f"{path.relative_to(_SRC.parent)}:{line} reads {name}")
     assert not offenders, (
         "Read caller identity through genesis.caller_context.caller_context(), "
@@ -401,6 +544,18 @@ _ENV_WRITERS = {
 _PEER_ENV_READERS = {
     "payments/peer_check.py": "reads a peer's /proc environ to decide process ancestry",
 }
+
+
+# Command-line tools that refuse to run inside a coding agent's own shell. They
+# read their OWN process's agent markers (``CLAUDECODE``, ``CODEX_THREAD_ID``),
+# which is the question they ask; a command-line process is never a shared
+# service, so there is no other caller whose identity they could miss.
+_AGENT_SHELL_DETECTORS = {
+    "payments/cli.py": "vault commands refuse inside an agent's shell",
+    "browser/provision.py": "the browser-stack install refuses inside a Claude Code session",
+}
+# Only these names are excused there; every other identity read is still flagged.
+_AGENT_MARKERS = frozenset({cc.CLAUDE_CODE_ENV, cc.CODEX_THREAD_ENV})
 
 
 def _names_identity(value: object) -> str | None:
@@ -437,6 +592,8 @@ def test_identity_names_appear_only_in_the_accessor_and_env_writers():
         if path == _ACCESSOR or rel in _ENV_WRITERS or rel in _PEER_ENV_READERS:
             continue
         for line, name in identity_name_literals(path.read_text(encoding="utf-8"), str(path)):
+            if rel in _AGENT_SHELL_DETECTORS and name in _AGENT_MARKERS:
+                continue
             offenders.append(f"src/genesis/{rel}:{line} names {name}")
     assert not offenders, (
         "Only genesis/caller_context.py (readers) and the child-env writers may name "
@@ -446,7 +603,7 @@ def test_identity_names_appear_only_in_the_accessor_and_env_writers():
 
 
 def test_env_writer_allowlist_has_no_stale_entries():
-    for rel in {**_ENV_WRITERS, **_PEER_ENV_READERS}:
+    for rel in {**_ENV_WRITERS, **_PEER_ENV_READERS, **_AGENT_SHELL_DETECTORS}:
         path = _SRC / rel
         assert identity_name_literals(path.read_text(encoding="utf-8")), (
             f"{rel} no longer names an identity variable; drop it from _ENV_WRITERS"

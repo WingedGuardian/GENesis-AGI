@@ -1,0 +1,1 @@
+- Safety guards now recognize commands carried by GNU `env -S` and `--split-string`, including quoted arguments, suffix operands and nested carriers. Unknown expansions or unsupported option boundaries report an unreadable command instead of silently hiding it. Directory and environment context stay attached to the original command.

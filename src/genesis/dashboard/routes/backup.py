@@ -403,6 +403,44 @@ def _positive_count(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def _partial_detail_text(value: object) -> str | None:
+    """Name the partial extra directories from ``extra_dirs_partial_detail`` (#4304).
+
+    The caller passes it only to a viewer with a verified credential: directory
+    names are not in ``_STATUS_SAFE_FIELDS``, so the unauthenticated route never
+    shows them. The status file is untrusted by construction, so anything that is
+    not the expected shape is skipped rather than rendered. Returns None when
+    nothing usable is there.
+    """
+    if not isinstance(value, list):
+        return None
+    named: list[str] = []
+    for item in value[:10]:
+        if not isinstance(item, dict):
+            continue
+        label = _scrub_reason(item.get("dir"))
+        if not label:
+            continue
+        refused = item.get("refused")
+        classes = item.get("classes")
+        why = ""
+        if isinstance(classes, dict):
+            why = ", ".join(
+                f"{_scrub_reason(str(k))} ×{v}"
+                for k, v in list(classes.items())[:5]
+                if _positive_count(v)
+            )
+        if _positive_count(refused):
+            text = f"{label}: {refused} member(s) a restore would refuse"
+            named.append(f"{text} ({why})" if why else text)
+        else:
+            named.append(label)
+    # A page-top banner: name three, count the rest.
+    if len(named) > 3:
+        named = [*named[:3], f"and {len(named) - 3} more"]
+    return "; ".join(named) or None
+
+
 def _extras_incomplete(lb: dict, resolved_backend: str) -> bool:
     """True when the last run left a configured extra directory incomplete.
 
@@ -426,6 +464,7 @@ def _backup_health(
     *,
     configured: bool,
     resolved_backend: str,
+    extras_detail: str | None = None,
 ) -> dict:
     """One authoritative backup-health verdict for the page-top banner.
 
@@ -612,13 +651,18 @@ def _backup_health(
     #     Last before healthy: an opt-in extras gap is the least severe state,
     #     so it never masks a core off-site gap (check 8) or a schedule-probe
     #     failure (check 9), which would otherwise hide that backups stopped.
+    #     extras_detail names the partial ones (signed-in viewers only, #4304).
     if _extras_incomplete(lb, resolved_backend):
-        return {
-            "state": "warn",
-            "code": "extra_dirs_incomplete",
-            "reason": "Some configured extra directories were not fully backed up "
-            "in the last run; the backup log names them.",
-        }
+        reason = (
+            "Some configured extra directories were not fully backed up "
+            "in the last run; the backup log names them."
+        )
+        if extras_detail:
+            reason = (
+                "Some configured extra directories were not fully backed up "
+                f"in the last run. Partial: {extras_detail}. The backup log has the rest."
+            )
+        return {"state": "warn", "code": "extra_dirs_incomplete", "reason": reason}
 
     return {"state": "ok", "code": "healthy", "reason": ""}
 
@@ -639,10 +683,15 @@ def backup_status():
     }
 
     last_backup: dict | None = None
+    extras_detail: str | None = None
     if _STATUS_FILE.is_file():
         try:
             raw = json.loads(_STATUS_FILE.read_text())
             if isinstance(raw, dict):
+                # Partial extra dirs by name: a verified operator only, never the
+                # unauthenticated response (the field is not in the allowlist).
+                if has_verified_credential():
+                    extras_detail = _partial_detail_text(raw.get("extra_dirs_partial_detail"))
                 # Allowlist projection — a future field in backup.sh's status
                 # line cannot auto-leak through this unauthenticated route.
                 last_backup = {k: v for k, v in raw.items() if k in _STATUS_SAFE_FIELDS}
@@ -673,6 +722,7 @@ def backup_status():
         result["destinations"],
         configured=configured,
         resolved_backend=_resolved_backend(),
+        extras_detail=extras_detail,
     )
 
     return jsonify(result)
@@ -735,7 +785,12 @@ def backup_config_set():
     if not is_authenticated():
         return jsonify({"error": "authentication required"}), 401
 
-    from genesis.dashboard.routes.secrets import _key_value, _update_secrets_file
+    from genesis.dashboard.routes.secrets import (
+        _MISSING_FILE_MESSAGE,
+        SecretsFileMissingError,
+        _key_value,
+        _update_secrets_file,
+    )
 
     data = request.get_json(silent=True) or {}
     errors: list[str] = []
@@ -846,6 +901,9 @@ def backup_config_set():
             _update_secrets_file(env_updates)
             for k, v in env_updates.items():
                 os.environ[k] = v
+        except SecretsFileMissingError:
+            logger.warning("Backup secrets update refused: the file does not exist")
+            return jsonify({"error": _MISSING_FILE_MESSAGE}), 409
         except Exception:
             logger.error("Failed to write backup secrets", exc_info=True)
             return jsonify({"error": "Failed to write secrets.env"}), 500

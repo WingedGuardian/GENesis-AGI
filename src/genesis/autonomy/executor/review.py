@@ -19,11 +19,11 @@ import logging
 import math
 import os
 import re
-import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from genesis.util.codex_cli import codex_available, codex_child_env, codex_exec_argv
 from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 if TYPE_CHECKING:
@@ -146,6 +146,7 @@ class VerifyResult:
     adversarial_feedback: str | None = None
     skipped_reason: str | None = None
     iteration: int = 0
+    review_error: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +370,33 @@ class TaskReviewer:
             deliverable, requirements, worktree_path=worktree_path,
         )
 
+        # A response with no readable verdict is not model unavailability.
+        # Retry only that leg, keeping the other review and the deliverable.
+        errors = []
+        if fresh_eyes is not None and self._feedback_verdict(fresh_eyes) == "invalid":
+            logger.warning("Fresh-eyes review invalid; retrying once")
+            fresh_eyes = await self._llm_review(
+                _CALL_SITE_EXECUTOR_REVIEW, deliverable, requirements,
+            )
+            state = self._feedback_verdict(fresh_eyes)
+            logger.info("Fresh-eyes review retry: %s", state)
+            if state in (None, "invalid"):
+                errors.append("Fresh-eyes review remained invalid or unavailable after retry")
+        if adversarial is not None and self._feedback_verdict(adversarial) == "invalid":
+            logger.warning("Adversarial review invalid; retrying once")
+            adversarial = await self._tool_capable_review(
+                deliverable, requirements, worktree_path=worktree_path,
+            )
+            state = self._feedback_verdict(adversarial)
+            logger.info("Adversarial review retry: %s", state)
+            if state in (None, "invalid"):
+                errors.append("Adversarial review remained invalid or unavailable after retry")
+        if errors:
+            return VerifyResult(
+                passed=False, review_error="; ".join(errors), iteration=iteration,
+                fresh_eyes_feedback=fresh_eyes, adversarial_feedback=adversarial,
+            )
+
         # Amendment #5: both routing fail -> deliver with warning
         if fresh_eyes is None and adversarial is None:
             logger.warning(
@@ -404,7 +432,7 @@ class TaskReviewer:
         """Run the tool-capable adversarial verification chain.
 
         First-success semantics (same pattern as contribution/review.py):
-        1. Codex (GPT, cross-vendor, full tools) -- ``shutil.which`` guard
+        1. Codex (GPT, cross-vendor, full tools) -- ``codex_available`` guard
         2. CC invoker (Sonnet, same-vendor fallback, full tools)
         3. API call site 20 (last resort, text-only)
 
@@ -452,7 +480,7 @@ class TaskReviewer:
         *worktree_path*: when set, Codex runs with ``cwd`` pointing to the
         worktree so it can read the actual changed files rather than main.
         """
-        if shutil.which("codex") is None:
+        if not codex_available():
             logger.info("review: codex not on PATH -- skipping codex link")
             return None
 
@@ -476,15 +504,21 @@ class TaskReviewer:
             # multi-threaded server (a deadlock there would hang before our
             # wait_for timeout is even armed).
             proc = await asyncio.create_subprocess_exec(
-                "codex", "exec", "-",
-                "-c", 'model_reasoning_effort="medium"',
-                "--json",
-                "--dangerously-bypass-approvals-and-sandbox",
+                *codex_exec_argv(
+                    "-",
+                    "-c", 'model_reasoning_effort="medium"',
+                    "--json",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                ),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
                 start_new_session=True,
+                # Marks this unattended run as dispatched. Inert until the Codex
+                # project config forwards the marker to Genesis's MCP launcher,
+                # which then keeps such a run on the external floor.
+                env=codex_child_env(),
             )
         except FileNotFoundError:
             return None
@@ -538,7 +572,7 @@ class TaskReviewer:
 
         # Parse JSONL output -- same pattern as contribution/review.py
         stdout = stdout_bytes.decode(errors="replace")
-        pieces: list[str] = []
+        output = ""
         for line in stdout.splitlines():
             line = line.strip()
             if not line:
@@ -547,15 +581,17 @@ class TaskReviewer:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if obj.get("type") == "item.completed":
-                item = obj.get("item", {})
-                if item.get("type") == "agent_message" and item.get("text"):
-                    pieces.append(item["text"])
+            if isinstance(obj, dict) and obj.get("type") == "item.completed":
+                item = obj.get("item")
+                if isinstance(item, dict) and item.get("type") == "agent_message":
+                    text = item.get("text")
+                    # Codex emits progress messages too; its final response is
+                    # the LAST agent message, even when that message is empty.
+                    output = text.strip() if isinstance(text, str) else ""
 
-        output = "\n".join(pieces).strip()
         if not output:
             logger.warning("review: codex output was empty after JSONL parse")
-            return None
+            return ""
 
         logger.info("review: codex adversarial verification completed")
         return output
@@ -597,7 +633,7 @@ class TaskReviewer:
                     output.error_message or output.text[:200],
                 )
                 return None
-            return output.text
+            return output.text or ""
         except Exception:
             logger.warning(
                 "CC invoker adversarial review failed",
@@ -645,8 +681,8 @@ class TaskReviewer:
                     call_site,
                     [{"role": "user", "content": prompt}],
                 )
-                if result.success and result.content:
-                    return result.content
+                if result.success:
+                    return result.content or ""
             except Exception:
                 logger.error(
                     "Review routing exception for %s (attempt %d/%d)",
@@ -663,39 +699,42 @@ class TaskReviewer:
 
     # --- Feedback assessment --------------------------------------------
 
+    @staticmethod
+    def _feedback_verdict(feedback: str | None) -> str | None:
+        """None is unavailable; a present response must carry one exact verdict."""
+        if feedback is None:
+            return None
+
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate JSON key")
+                result[key] = value
+            return result
+
+        text = feedback.strip()
+        match = _JSON_BLOCK_RE.fullmatch(text)
+        if match:
+            text = match.group(1).strip()
+        try:
+            data = json.loads(text, object_pairs_hook=unique_object)
+        except (ValueError, TypeError):
+            return "invalid"
+        if isinstance(data, dict) and data.get("verdict") in ("pass", "fail"):
+            return data["verdict"]
+        return "invalid"
+
     def _assess_feedback(
         self,
         fresh_eyes: str | None,
         adversarial: str | None,
     ) -> bool:
-        """Determine overall pass/fail from LLM review feedback.
-
-        Tries JSON parse first (looking for ``"verdict": "fail"``),
-        then falls back to keyword heuristic.
-        """
-        for feedback in (fresh_eyes, adversarial):
-            if feedback is None:
-                continue
-
-            text = feedback.strip()
-
-            # Strip code fences
-            match = _JSON_BLOCK_RE.search(text)
-            if match:
-                text = match.group(1).strip()
-
-            # Try JSON parse
-            with contextlib.suppress(json.JSONDecodeError, ValueError, TypeError):
-                data = json.loads(text)
-                if isinstance(data, dict) and data.get("verdict") == "fail":
-                    return False
-
-            # Keyword heuristic fallback
-            lower = feedback.lower()
-            if '"verdict": "fail"' in lower or '"verdict":"fail"' in lower:
-                return False
-
-        return True
+        """Only explicit pass verdicts or unavailable legs permit delivery."""
+        return all(
+            self._feedback_verdict(feedback) in (None, "pass")
+            for feedback in (fresh_eyes, adversarial)
+        )
 
     # --- Prompt builders ------------------------------------------------
 

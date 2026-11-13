@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections import Counter
+from collections.abc import Sequence
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 # Patterns indicating the evaluation GAVE UP on URLs (not just encountered errors).
@@ -104,60 +107,193 @@ def _extract_coverage_input_urls(text: str) -> list[str]:
 
 
 # Prose punctuation that ends a sentence, and delimiters that come in pairs.
-# Used ONLY to render a coverage token for the prompt -- never to decide
-# coverage identity.
+# The shared occurrence extractor uses source context to prove these wrappers
+# before either prompt presentation or the gate can accept an alternate form.
 _DISPLAY_TRIM_CHARS = ".,;:!?"
 _DISPLAY_PAIRS = {")": "(", "]": "[", "}": "{", '"': '"', "'": "'", "`": "`"}
+_DISPLAY_CLOSERS = {opener: closer for closer, opener in _DISPLAY_PAIRS.items()}
+_CONTEXT_DELIMITERS = re.compile(r"`+|[()\[\]{}'\"\r\n]")
+_BACKTICK_RUNS = re.compile(r"`+")
 
 
-def _display_url(url: str) -> str:
-    """Render a lossless coverage token as the URL the writer meant.
+def _is_escaped(text: str, index: int) -> bool:
+    """Whether an odd adjacent backslash run escapes this delimiter."""
+    start = index
+    while start and text[start - 1] == "\\":
+        start -= 1
+    return (index - start) % 2 == 1
 
-    The coverage grammar keeps every non-whitespace terminal character so the
-    GATE can fail closed on ambiguous punctuation. That is wrong for the
-    PROMPT: a markdown link or a quoted URL yields a token carrying its own
-    wrapper, and telling the model to fetch ``https://example.com/foo)`` asks
-    for a resource that does not exist.
 
-    Trimming here is STRUCTURAL, not a prose heuristic. A paired delimiter is
-    removed only when the remainder leaves it unmatched -- so a markdown
-    wrapper goes and a balanced ``/wiki/Foo_(bar)`` stays, and an IPv6
-    authority keeps its ``]`` because the ``[`` is still open. Sentence
-    punctuation is trimmed outright.
-
-    This runs on the presentation side only. ``_coverage_identity`` still
-    compares the untrimmed token, so nothing here can make a truncated sibling
-    vouch for an omitted URL.
-    """
-    candidate = url
-    unwrapped = False
-    while candidate:
-        last = candidate[-1]
-        if last in _DISPLAY_TRIM_CHARS:
-            candidate = candidate[:-1]
+def _closing_wrapper_suffix(url: str, pos: int, wrappers: Sequence[str]) -> int | None:
+    """After the FIRST source closure, accept only ordered closers/punctuation."""
+    remaining = len(wrappers)
+    while pos < len(url):
+        if url[pos] in _DISPLAY_TRIM_CHARS:
+            pos += 1
             continue
-        opener = _DISPLAY_PAIRS.get(last)
-        if opener is None:
-            break
-        body = candidate[:-1]
-        # Symmetric delimiters (quotes) pair off; asymmetric ones nest.
-        unmatched = (
-            body.count(last) % 2 == 0
-            if opener == last
-            else body.count(opener) <= body.count(last)
+        if not remaining:
+            return None
+        opener = wrappers[remaining - 1]
+        closer = _DISPLAY_CLOSERS.get(opener, opener)
+        if opener.startswith("`"):
+            run = _BACKTICK_RUNS.match(url, pos)
+            if run is None or run.group() != opener:
+                return None
+        elif not url.startswith(closer, pos) or _is_escaped(url, pos):
+            return None
+        pos += len(closer)
+        remaining -= 1
+    return remaining
+
+
+def _paired_source_closure(
+    url: str, current: str, available: Counter[str],
+) -> tuple[int | None, bool]:
+    """Find a source closure, or report uncertainty from misnested URI pairs."""
+    own: list[str] = []
+    for match in _CONTEXT_DELIMITERS.finditer(url):
+        delimiter = match.group()
+        if _is_escaped(url, match.start()):
+            continue
+        if delimiter in ("(", "[", "{"):
+            own.append(delimiter)
+        elif delimiter in (")", "]", "}"):
+            opener = _DISPLAY_PAIRS[delimiter]
+            if own:
+                if own.pop() != opener:
+                    return None, True
+            elif current == opener:
+                return match.start(), False
+            elif available[opener]:
+                return None, True
+        elif available[delimiter]:
+            return None, True
+    return None, False
+
+
+def _symmetric_source_closure(url: str, current: str) -> int | None:
+    """Quotes honor escapes; a code span closes at the first equal-width run."""
+    for match in _CONTEXT_DELIMITERS.finditer(url):
+        if match.group() != current:
+            continue
+        if current.startswith("`") or not _is_escaped(url, match.start()):
+            return match.start()
+    return None
+
+
+def _url_wrapper_proof(
+    url: str, wrappers: Sequence[str], wrapper_counts: Counter[str] | None = None,
+) -> tuple[int, int | None]:
+    """Return payload boundary and remaining source frames (None = uncertain).
+
+    URL-internal openers never create source frames. The first source closure
+    must start a wholly valid closing suffix; later payload/openers cannot
+    restore that proof. Quote/code modes protect their other payload characters.
+    """
+    if not wrappers:
+        return len(url), 0
+    current = wrappers[-1]
+    if current.startswith("`") or current in ("'", '"'):
+        closure = _symmetric_source_closure(url, current)
+    else:
+        available = wrapper_counts if wrapper_counts is not None else Counter(wrappers)
+        closure, uncertain = _paired_source_closure(url, current, available)
+        if uncertain:
+            return len(url), None
+    if closure is None:
+        return len(url), len(wrappers)
+    remaining = _closing_wrapper_suffix(url, closure, wrappers)
+    return (closure, remaining) if remaining is not None else (len(url), None)
+
+
+def _display_url(
+    url: str, *, wrappers: Sequence[str] = (), wrapper_counts: Counter[str] | None = None,
+) -> str:
+    """Return only the display identity justified by the shared source proof."""
+    boundary, _ = _url_wrapper_proof(url, wrappers, wrapper_counts)
+    return url[:boundary]
+
+
+def _advance_wrapper_context(
+    wrappers: list[str], counts: Counter[str], text: str, start: int, end: int,
+) -> None:
+    """Read only intervening prose and proved closing wrappers, never URL bytes."""
+    for match in _CONTEXT_DELIMITERS.finditer(text, start, end):
+        delimiter = match.group()
+        if delimiter in ("\n", "\r"):
+            wrappers.clear()
+            counts.clear()
+            continue
+        in_code = bool(wrappers and wrappers[-1].startswith("`"))
+        if in_code and delimiter != wrappers[-1]:
+            continue
+        # Backslashes are literal inside a code span, including before its
+        # matching closing run (the installed MarkdownIt backtick rule).
+        if not in_code and _is_escaped(text, match.start()):
+            continue
+        if (
+            delimiter == "'" and 0 < match.start() < len(text) - 1
+            and text[match.start() - 1].isalnum() and text[match.end()].isalnum()
+        ):
+            continue  # A contraction inside a word is not a prose quote.
+        if wrappers and delimiter == wrappers[-1] and delimiter[0] in "'\"`":
+            counts[wrappers.pop()] -= 1
+        elif delimiter in ("'", '"') and counts[delimiter]:
+            wrappers.clear()  # A source quote cannot close across an unclosed frame.
+            counts.clear()
+        elif delimiter in (")", "]", "}"):
+            if wrappers and wrappers[-1] == _DISPLAY_PAIRS[delimiter]:
+                counts[wrappers.pop()] -= 1
+            else:
+                wrappers.clear()
+                counts.clear()
+        else:
+            wrappers.append(delimiter)
+            counts[delimiter] += 1
+
+
+@dataclass(frozen=True)
+class _CoverageUrlOccurrence:
+    raw: str
+    start: int
+    end: int
+    display: str
+
+
+def _coverage_url_occurrences(text: str) -> list[_CoverageUrlOccurrence]:
+    """Keep every occurrence's own context, including repeated raw tokens."""
+    occurrences = []
+    wrappers: list[str] = []
+    counts: Counter[str] = Counter()
+    cursor = 0
+    for match in _COVERAGE_INPUT_URL_RE.finditer(text):
+        _advance_wrapper_context(wrappers, counts, text, cursor, match.start())
+        raw = match.group(0)
+        # The discovery regex excludes angle brackets: within an explicit
+        # <URL> those bounds own the URL, not an outer prose delimiter. Inside
+        # code, angle characters are payload and cannot shield code closure.
+        angle_bounded = (
+            match.start() > 0 and text[match.start() - 1] == "<"
+            and not _is_escaped(text, match.start() - 1)
+            and match.end() < len(text) and text[match.end()] == ">"
+            and not (wrappers and wrappers[-1].startswith("`"))
         )
-        if not unmatched:
-            break
-        candidate = body
-        unwrapped = True
-    # Sentence punctuation alone is NOT evidence of a wrapper. `/path;` and
-    # `/q?x=1!` are legal URLs, and round 3 established that such ambiguity
-    # must fail CLOSED -- trimming them for display would ask the evaluator
-    # for a DIFFERENT resource than the one the user saved, and the gate
-    # would then accept that answer. So a trim only stands when it removed a
-    # paired delimiter, which is structurally provable. Sentence punctuation
-    # is consumed only to reach one (`...x",` -> `...x`).
-    return candidate if unwrapped else url
+        boundary, remaining = (
+            (len(raw), len(wrappers)) if angle_bounded
+            else _url_wrapper_proof(raw, wrappers, counts)
+        )
+        display = raw[:boundary]
+        occurrences.append(_CoverageUrlOccurrence(
+            raw, match.start(), match.end(), display,
+        ))
+        if remaining is None:
+            wrappers.clear()
+            counts.clear()
+        else:
+            while len(wrappers) > remaining:
+                counts[wrappers.pop()] -= 1
+        cursor = match.end()
+    return occurrences
 
 
 def _extract_source_urls(response_text: str) -> list[str]:
@@ -217,47 +353,44 @@ def _coverage_url_label(url: str) -> str:
 def _uncovered_urls(response_text: str, input_content: str) -> list[str]:
     """Return input URLs not cited as complete parsed URL identities.
 
-    The response is first reduced to the URLs recognized by the canonical inbox
-    scanner. Comparing parsed identities makes prefixes, sibling hosts, Unicode
-    continuations, and legal URL delimiters different URLs by construction. It
-    also avoids the prior substring matcher's growing boundary rules and keeps
-    the scan linear in the number of extracted URLs.
+    Evidence comes only from Source fields. Every input occurrence keeps its
+    source-proven presentation until after coverage is checked; repeated raw
+    tokens in different contexts cannot erase each other's obligations.
     """
-    urls = _extract_coverage_input_urls(input_content)
-    if not urls:
-        return []
+    return list(dict.fromkeys(
+        occurrence.raw for occurrence in _uncovered_occurrences(
+            response_text, _coverage_url_occurrences(input_content),
+        )
+    ))
+
+
+def _uncovered_occurrences(
+    response_text: str, occurrences: list[_CoverageUrlOccurrence],
+) -> list[_CoverageUrlOccurrence]:
+    """Shared live/report policy, without reconstructing or merging context."""
     response_identities = {
         identity
         for cited in _extract_source_urls(response_text)
         if (identity := _coverage_identity(cited)) is not None
     }
-    return [url for url in urls if not _PLACEHOLDER_RE.search(url)
-            and not _accepted_identities(url) & response_identities]
+    return [
+        occurrence for occurrence in occurrences
+        if not _PLACEHOLDER_RE.search(occurrence.raw)
+        and not _accepted_identities(occurrence.raw, display=occurrence.display)
+        & response_identities
+    ]
 
 
-def _accepted_identities(url: str) -> set[str]:
+def _accepted_identities(url: str, *, display: str | None = None) -> set[str]:
     """Return the identities that count as citing THIS input URL.
 
-    Two renderings of one token, never a widened rule about URLs in general.
-    The prompt shows ``_display_url(url)`` while the gate discovered ``url``,
-    so a response that cites exactly what it was asked for must satisfy the
-    gate -- otherwise the item can never be covered by any compliant answer.
-    MEASURED 2026-09-14 over this install's corpus (284 stored baselines + 112
-    live inbox files, 18,119 tokens): 331 (1.83%) render differently, and 72
-    collapse two input tokens onto one prompt line. Without this, that 1.83%
-    would be a permanent floor under the shadow flag rate -- and the shadow
-    rate is precisely the signal the shadow->enforce decision is meant to read.
-
-    Scoping is what keeps this safe. The set is derived from ONE token, so a
-    truncated SIBLING still cannot vouch for it: given inputs ``/foo`` and
-    ``/foo:bar``, neither one's display form is the other's identity. That is
-    the guarantee the untrimmed comparison was introduced to provide, and it
-    is unchanged.
-
-    An empty set (both renderings unparseable) leaves the URL uncovered.
+    The alternate is supplied only by source-aware occurrence extraction.
+    Without that context, only the raw identity counts. Never union these
+    sets across repeated raw tokens: a literal and a wrapped occurrence can
+    require different citations. An empty set leaves the occurrence uncovered.
     """
     return {
         identity
-        for candidate in (url, _display_url(url))
+        for candidate in (url, display if display is not None else url)
         if (identity := _coverage_identity(candidate)) is not None
     }
