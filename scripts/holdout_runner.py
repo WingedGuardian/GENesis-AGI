@@ -611,7 +611,9 @@ def _ref_repo(ref: dict) -> str:
     return f"{owner}/{name}" if owner and name else ""
 
 
-_HELD_SIGNALS = frozenset({signal.SIGTERM, signal.SIGHUP})
+# While not None, the SIGTERM/SIGHUP handler records the signal here instead of
+# raising; see ``_Worktree.__enter__``.
+_deferred: list[int] | None = None
 
 
 class _Worktree:
@@ -636,12 +638,14 @@ class _Worktree:
         args = ("worktree", "add", "--detach", "--quiet", str(self.path), self.sha)
         # A signal that arrived while Popen was still starting git would raise
         # before ``proc`` exists, leaving git running with nothing to kill it.
-        # So the two signals are held for the Popen call only, git gets the
-        # caller's mask back before exec (it stays killable), and they are
-        # released as the first step inside the try below, where the cleanup
-        # can act on a held one. preexec_fn is safe here: the runner is
-        # single-threaded.
-        held = signal.pthread_sigmask(signal.SIG_BLOCK, _HELD_SIGNALS)
+        # So for the Popen call the handler only records the signal, and it is
+        # raised as the first step inside the try below, where the cleanup can
+        # act on it. This is done in the handler, not with a signal mask: a
+        # mask covers one thread, and the kernel delivers a process-wide
+        # signal to any thread that does not block it.
+        global _deferred
+        pending: list[int] = []
+        _deferred = pending
         try:
             proc = subprocess.Popen(
                 ["git", "-C", str(self.root), *args],
@@ -650,13 +654,16 @@ class _Worktree:
                 encoding="utf-8",
                 errors="surrogateescape",
                 start_new_session=True,  # its own process group, killed whole below
-                preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, held),
             )
         except BaseException:
-            signal.pthread_sigmask(signal.SIG_SETMASK, held)
+            if pending:  # no git to clean up; the signal still ends the run
+                raise SystemExit(128 + pending[0]) from None
             raise
+        finally:
+            _deferred = None
         try:
-            signal.pthread_sigmask(signal.SIG_SETMASK, held)  # a held signal is raised here
+            if pending:
+                raise SystemExit(128 + pending[0])
             _, err = proc.communicate(timeout=GIT_TIMEOUT_S)
         except BaseException as exc:
             _kill_group(proc)
@@ -1125,6 +1132,9 @@ def _signals_exit():
     """
 
     def _exit(signum: int, _frame: object) -> None:
+        if _deferred is not None:
+            _deferred.append(signum)
+            return
         raise SystemExit(128 + signum)
 
     previous = {}

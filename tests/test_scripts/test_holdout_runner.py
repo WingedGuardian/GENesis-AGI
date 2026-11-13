@@ -15,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -1727,12 +1728,17 @@ def test_a_signal_during_worktree_creation_leaves_nothing_behind(repo, tmp_path,
     assert list(scratch.iterdir()) == []
 
 
+@pytest.mark.parametrize("delivery", ["process", "other thread"])
 def test_a_signal_while_git_is_being_started_is_acted_on_after(
-    repo, tmp_path, monkeypatch, _scratch
+    repo, tmp_path, monkeypatch, _scratch, delivery
 ):
     """A SIGTERM that lands inside Popen, before the runner holds a handle to
     git, must not leave git running: the runner holds it until the handle
-    exists, then kills git's group and discards the half-made worktree."""
+    exists, then kills git's group and discards the half-made worktree.
+
+    "other thread" sends it to a second thread, as the kernel may do with a
+    process-wide signal when the process has threads (pytest's timeout watcher
+    is one): a signal mask on the main thread does not hold it there."""
     root, _, _ = repo
     real_git = shutil.which("git")
     bindir = tmp_path / "bin"
@@ -1758,18 +1764,29 @@ def test_a_signal_while_git_is_being_started_is_acted_on_after(
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
     real_popen = subprocess.Popen
 
+    idle = threading.Event()
+    other = threading.Thread(target=idle.wait, daemon=True)
+    other.start()
+
     def popen_then_signal(cmd, *a, **kw):
         proc = real_popen(cmd, *a, **kw)
-        if "worktree" in cmd and "add" in cmd:
-            os.kill(os.getpid(), signal.SIGTERM)  # inside Popen, as far as the caller can tell
+        if "worktree" in cmd and "add" in cmd:  # inside Popen, as far as the caller can tell
+            if delivery == "process":
+                os.kill(os.getpid(), signal.SIGTERM)
+            else:
+                signal.pthread_kill(other.ident, signal.SIGTERM)
+                time.sleep(0.2)  # the handler runs on this thread before Popen returns
         return proc
 
     monkeypatch.setattr(hr.subprocess, "Popen", popen_then_signal)
     holdout = tmp_path / "HOLDOUT.md"
     holdout.write_text(_scenario("H-01", steps="sleep 60", expect="never"))
     before = _worktrees(root)
-    with pytest.raises(SystemExit) as exc:
-        hr.main(["--at-ref", "HEAD", "--root", str(root), "--holdout", str(holdout)])
+    try:
+        with pytest.raises(SystemExit) as exc:
+            hr.main(["--at-ref", "HEAD", "--root", str(root), "--holdout", str(holdout)])
+    finally:
+        idle.set()
     assert exc.value.code == 128 + signal.SIGTERM
     time.sleep(3.5)  # past the wrapper's late write and its unlock
     assert _worktrees(root) == before
