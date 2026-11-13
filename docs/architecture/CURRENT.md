@@ -4129,7 +4129,18 @@ verified: 9a95483a8e7f 2026-10-09
   429s and unparseable bodies keep the old behaviour. Per-provider circuit breaker (3 failures, exponential backoff
   capped 30 min — 4h for QUOTA_EXHAUSTED and NOT_ENTITLED; 429 = backpressure,
   NOT a breaker failure; state persisted cross-process to
-  `~/.genesis/circuit_breaker_state.json`). **Probe/call evidence symmetry** —
+  `~/.genesis/circuit_breaker_state.json`). **Empty balance as a client error:**
+  a 400/422 is normally BAD_REQUEST (the payload's fault, never recorded by the
+  breaker), except when the body's `error.type` or `error.code` is a measured
+  balance token (`retry._BALANCE_ERROR_TOKENS`): that classifies
+  QUOTA_EXHAUSTED, so the breaker opens after 3 failures and the provider is
+  skipped. The token is matched as a field of the first JSON object in the
+  error string, never as a substring, because a 400 body can carry request or
+  generated text back; a non-JSON body stays BAD_REQUEST. The delegate also
+  reports a litellm `BadRequestError` that carries HTTP 402 as 402 (every
+  other status on that exception is still reported as 400). Cost: a topped-up
+  provider stays skipped until its open window ends or the operator re-enables
+  it from the dashboard. **Probe/call evidence symmetry** —
   a probe may only undo what a probe did: `probe_suspect()` downgrades CLOSED to
   HALF_OPEN on a failed probe and a clean probe may clear THAT, but a breaker
   opened by a real call failure (`_opened_by_call`) is closed only by a real
