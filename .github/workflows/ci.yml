@@ -386,7 +386,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-11-06: 88 sites, 31 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-11-12: 90 sites, 31 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 32
     # cannot arrive silently FROM A NEW FUNCTION while the existing 31 are fixed
@@ -780,7 +780,18 @@ jobs:
         # Inherit the current runner ceiling and add exactly twenty identities.
         # Compatibility qualification (#4126): fifteen contained-only cases,
         # measured in run42514975072's JUnit; all fifteen pass in native CI.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 598
+        # Native peer containment (#3575): five real-CLI cases that skip on a
+        # runner with no Claude binary (test_peer_native x4, test_contained_native
+        # x1), measured in run 42667838123 at 603 skipped, 598 -> 603.
+        # Main measured 602 at run 43169373201's base (the old ceiling had one
+        # point of slack). Two by-design identities since, measured in main run
+        # 43298721491 (8108fc9a1) at 604: test_shared_http_admission, skipped at
+        # collection on an unqualified stack (#4058/#4095), and
+        # test_live_closure::test_the_box_lock_and_basetemp_keep_their_real_home_locations,
+        # "no lock expected here (no install)" (#3719). 602 + 2 = 604.
+        # Atomic-write checker (#4436): one strict xfail recording the
+        # conditional-raise false clean, on top of main's 604: 604 -> 605.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 605
 
   test-ubuntu-2404:
     # ubuntu-latest is moving to 26.04, so `test` alone stops showing a break on

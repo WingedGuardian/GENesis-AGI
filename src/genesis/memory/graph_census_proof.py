@@ -101,6 +101,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from genesis import secrets_location
+
 #: A row's ``source`` when ``interpreter_source`` proved the main checkout.
 SOURCE_MAIN = "main"
 #: The only environment keys the census keeps from another process.
@@ -506,15 +508,51 @@ def interpreter_source(
     return reasons
 
 
-def secrets_file(env: dict[str, str], *, main_root: Path) -> Path | None:
-    """The secrets file that process loads, chosen as ``genesis.env.secrets_path``
-    chooses it: ``SECRETS_PATH``, else ``GENESIS_REPO_ROOT``'s, else main's."""
+def secrets_file(
+    env: dict[str, str], *, main_root: Path, start: float | None = None
+) -> Path | None:
+    """The secrets file that process loads, chosen as ``genesis.secrets_location``
+    chooses it for THAT process: ``SECRETS_PATH``, else the resolver's order under
+    its own ``HOME`` with ``GENESIS_REPO_ROOT`` (or main) as the checkout. None
+    when a path cannot be resolved from here, including a missing ``HOME``.
+
+    The resolver answers for NOW, and the process chose at ``start``. With
+    ``start`` given, a fallback past an absent home-config file is accepted only
+    when that file's directory, and every symlink on the way to it, has not
+    changed since ``start`` (by ctime, so a chmod counts too): a directory that
+    changed may have held the file the process loaded, so the answer is None
+    (unknown), never a fallback file it may not have read (#4278). Only
+    ``~/.config/genesis`` is dated, so nothing else in ``~/.config`` moves the
+    census clock. A fallback from the checkout file to ``~/genesis/secrets.env``
+    (a process whose ``GENESIS_REPO_ROOT`` is another checkout) is None too:
+    dating a checkout root would churn with every git operation. Residual: with
+    the home-config directory itself gone, the fallback is accepted, since
+    nothing there is left to date."""
     if env.get("SECRETS_PATH"):
         return expand_home(env["SECRETS_PATH"], env)
-    if env.get("GENESIS_REPO_ROOT"):
-        root = expand_home(env["GENESIS_REPO_ROOT"], env)
-        return None if root is None else root / "secrets.env"
-    return main_root / "secrets.env"
+    home = expand_home("~", env)
+    root = expand_home(env["GENESIS_REPO_ROOT"], env) if env.get("GENESIS_REPO_ROOT") else main_root
+    if home is None or root is None:
+        return None
+    chosen = secrets_location.resolve(environ={}, repo_root=root, home=home)
+    preferred = secrets_location.home_config_location(home)
+    if start is not None and chosen != preferred:
+        legacy = secrets_location.legacy_locations(home, root)
+        if len(legacy) > 1 and chosen == legacy[1]:
+            return None
+        directory = preferred.parent
+        try:
+            changed = (
+                not _links_unchanged_since(directory, start)
+                or directory.stat().st_ctime >= start
+            )
+        except FileNotFoundError:
+            changed = False
+        except OSError:
+            return None
+        if changed:
+            return None
+    return chosen
 
 
 def _links_unchanged_since(path: Path, start: float, _depth: int = 0) -> bool:
@@ -666,7 +704,7 @@ def carry_secrets(
     current = changed_secrets_values(path, start)
     if current is None or "SECRETS_PATH" in current or "GENESIS_REPO_ROOT" in current:
         return None
-    if secrets_file({**env, **current}, main_root=main_root) != path:
+    if secrets_file({**env, **current}, main_root=main_root, start=start) != path:
         return None
     return current if secrets_digest(current) == proven_digest else None
 

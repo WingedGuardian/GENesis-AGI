@@ -7,7 +7,8 @@ The correctness guarantee for the email autonomy gate: a periodic drain
 - **approved**  → send below the gate (``pipeline.deliver_approved``,
   ``gate_cleared``) + ``record_success`` on the cell + mark sent/consumed.
 - **rejected/cancelled** → mark rejected + ``record_correction`` (an explicit
-  no is competence-negative).
+  no is competence-negative), except for a marketing-posture hold on a still
+  GRANTED cell (``_is_posture_hold``): declining that send keeps the grant.
 - **expired** → mark expired, NO correction (no-decision ≠ rejection).
 - **orphaned** (approval row gone) → expire, never send.
 - **pending** → still waiting; left held.
@@ -64,10 +65,35 @@ async def _recipient_opted_out(db: object, recipient: str | None) -> bool:
         return False
     from genesis.db.crud import marketing_prospects as mp
 
-    row = await mp.get_by_email(db, recipient)
+    # find_in_recipient, as the gate uses: a "Name <addr>" or list-form
+    # recipient must not read as "nobody's prospect" here.
+    row = await mp.find_in_recipient(db, recipient)
     if row is None:
         return False
     return bool(row.get("opted_out"))
+
+
+async def _is_posture_hold(db: object, row: dict) -> bool:
+    """True iff this hold was made for the marketing POSTURE, not for competence.
+
+    The gate holds a send to a curated prospect on a GRANTED cell when it is a
+    reply, when the prospect opted out, or when the marketing lever is not
+    ``live``. Nothing is stored on the hold to say so; it is read back from two
+    facts that already exist: the recipient is a curated prospect, and the cell
+    is GRANTED now. A hold made by a scope-guard trip demoted its cell when it
+    was made, and a hold on an ungranted cell never had a grant, so neither
+    reads as a posture hold. (A hold made at ASK whose cell was promoted before
+    the owner answered does; it would be a posture hold if made today.)
+    """
+    from genesis.autonomy.types import CellState, RiskClass
+    from genesis.db.crud import marketing_prospects as mp
+
+    if row["cell_risk_class"] == RiskClass.FINANCIAL.value:
+        return False  # a financial hold is the hardline, never a posture hold
+    if await mp.find_in_recipient(db, row["validated_recipient"]) is None:
+        return False
+    cell = await cg.get_cell(db, row["cell_domain"], row["cell_verb"], row["cell_risk_class"])
+    return cell is not None and cell["state"] == CellState.GRANTED.value
 
 
 async def _stamp_prospect_contacted(db: object, recipient: str | None, now: str) -> None:
@@ -174,8 +200,9 @@ async def drain_pending_email_sends(rt: object) -> int:
             # a non-prospect is untouched. Accepted residue (STOPGAP, tracked in the
             # deferred dedup/provenance PR2, follow-up 17261bc9): a held STANDARD reply
             # to someone who is ALSO an opted-out marketing prospect is refused too —
-            # rare (granted-cell replies auto-allow and never reach this branch) and
-            # fail-safe. The durable fix is a send-provenance flag separating a
+            # fail-safe, and routine now that the gate holds every send to an
+            # opted-out prospect: the owner's approval card for one ends here, not
+            # in a send. The durable fix is a send-provenance flag separating a
             # marketing send from an ordinary reply.
             if await _recipient_opted_out(db, row["validated_recipient"]):
                 if await pes.mark_rejected(db, row["id"], rejected_at=now):
@@ -282,16 +309,21 @@ async def drain_pending_email_sends(rt: object) -> int:
                     result.status.value,
                 )
         elif status in ("rejected", "cancelled"):
+            # Read BEFORE the hold is marked, from state the rejection does not
+            # change. Declining one posture hold is not a competence signal: a
+            # correction would demote the grant for every other recipient.
+            posture_hold = await _is_posture_hold(db, row)
             if await pes.mark_rejected(db, row["id"], rejected_at=now):
-                await cg.record_correction(
-                    db,
-                    domain=row["cell_domain"],
-                    verb=row["cell_verb"],
-                    risk_class=row["cell_risk_class"],
-                    updated_at=now,
-                    # WS-3 gate-3: the OWNER rejected/cancelled — owner decision.
-                    origin_class="owner",
-                )
+                if not posture_hold:
+                    await cg.record_correction(
+                        db,
+                        domain=row["cell_domain"],
+                        verb=row["cell_verb"],
+                        risk_class=row["cell_risk_class"],
+                        updated_at=now,
+                        # WS-3 gate-3: the OWNER rejected/cancelled — owner decision.
+                        origin_class="owner",
+                    )
                 resolved += 1
         elif status == "expired":
             # No-decision (the owner never answered) — expire the hold but do

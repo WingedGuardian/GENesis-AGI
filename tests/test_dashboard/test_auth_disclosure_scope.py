@@ -229,3 +229,58 @@ def test_gates_are_untouched_when_no_password_is_set(app):
     # A gated MUTATION route stays reachable on a passwordless install.
     resp = app.test_client().post("/api/genesis/recon/watchlist", json={"repo": "owner/name"})
     assert resp.status_code != 401, "a passwordless install must not start refusing gated mutations"
+
+
+_PARTIAL_DETAIL = [
+    {"dir": "private/folder-name", "refused": 9, "classes": {"AbsoluteLinkError": 9}}
+]
+
+
+def _status_route_extras_detail(app, monkeypatch, tmp_path, client=None):
+    """The ``extras_detail`` the status route hands the health check, read with the
+    real credential predicate (nothing about auth is patched)."""
+    import json
+
+    from genesis.dashboard.routes import backup as bk
+
+    status = tmp_path / "backup_status.json"
+    status.write_text(
+        json.dumps(
+            {"success": True, "extra_dirs_partial": 1, "extra_dirs_partial_detail": _PARTIAL_DETAIL}
+        )
+    )
+    monkeypatch.setattr(bk, "_STATUS_FILE", status)
+    seen = {}
+    real = bk._backup_health
+
+    def spy(*args, **kwargs):
+        seen["extras_detail"] = kwargs.get("extras_detail")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(bk, "_backup_health", spy)
+    payload = (client or app.test_client()).get("/api/genesis/backup/status").get_json()
+    assert "extras_detail" in seen, "the status route did not reach the health check"
+    return seen["extras_detail"], payload
+
+
+def test_backup_status_never_names_a_partial_dir_without_a_credential(app, monkeypatch, tmp_path):
+    """#4304: the partial extra directory names are infra detail, so the
+    unauthenticated status route withholds them on a passwordless install."""
+    detail, payload = _status_route_extras_detail(app, monkeypatch, tmp_path)
+    assert detail is None
+    assert "folder-name" not in str(payload)
+    assert (payload.get("last_backup") or {}).get("extra_dirs_partial") == 1, (
+        "route did not read the file"
+    )
+
+
+def test_backup_status_names_a_partial_dir_to_an_authenticated_session(app, monkeypatch, tmp_path):
+    """The mirror: a verified operator's banner names the directory and why."""
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "pw")
+    client = app.test_client()
+    assert client.post("/api/genesis/auth/login", json={"password": "pw"}).status_code == 200
+    detail, payload = _status_route_extras_detail(app, monkeypatch, tmp_path, client)
+    assert (
+        detail == "private/folder-name: 9 member(s) a restore would refuse (AbsoluteLinkError ×9)"
+    )
+    assert "extra_dirs_partial_detail" not in (payload.get("last_backup") or {})

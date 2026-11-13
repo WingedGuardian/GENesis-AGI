@@ -126,6 +126,7 @@ _TRANSCRIPT_COUNT=0
 _MEMORY_COUNT=0
 _EXTRA_SKIP_LABELS=()  # declared before the EXIT trap can fire: its status write reads it
 _EXTRA_PARTIAL_LABELS=()
+_EXTRA_PARTIAL_DETAIL=()  # "<label>\t<REFUSED-SUMMARY json>" per partial dir, for the status file
 # What this run's off-site alert block actually ANNOUNCED (or carried forward from a
 # run that did). A run that dies before the alert block records nothing announced, so
 # the next run alerts instead of assuming the earlier one did.
@@ -189,9 +190,41 @@ _write_status() {
         _offsite_core_complete=true
     fi
     if [ $((${_EXTRA_SKIPPED:-0} + ${_EXTRA_UPLOAD_FAILED:-0} + ${_EXTRA_PARTIAL:-0})) -gt 0 ]; then _extras_complete=false; fi
+    # Which extra dirs are partial, and why (#4304): built by json.dumps, never by
+    # splicing labels into this heredoc, so any label stays valid JSON. Ten at most.
+    # Any failure leaves an empty list rather than a broken status file.
+    local _partial_detail='[]'
+    if [ "${#_EXTRA_PARTIAL_DETAIL[@]}" -gt 0 ]; then
+        _partial_detail="$(printf '%s\0' "${_EXTRA_PARTIAL_DETAIL[@]}" | python3 -I -c '
+import json, sys
+out = []
+for entry in sys.stdin.buffer.read().split(b"\0"):
+    if not entry or len(out) >= 10:
+        continue
+    label, _, summary = entry.decode("utf-8", "replace").partition("\t")
+    try:
+        parsed = json.loads(summary)
+    except ValueError:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+    count = parsed.get("count")
+    if not isinstance(count, int) or isinstance(count, bool):
+        count = None
+    classes = parsed.get("classes")
+    classes = {
+        str(k)[:60]: v
+        for k, v in (classes.items() if isinstance(classes, dict) else [])
+        if isinstance(v, int) and not isinstance(v, bool)
+    }
+    out.append({"dir": label[:200], "refused": count, "classes": dict(list(classes.items())[:10])})
+print(json.dumps(out, ensure_ascii=True, separators=(",", ":")))
+' 2>/dev/null)" || _partial_detail='[]'
+        [ -n "$_partial_detail" ] || _partial_detail='[]'
+    fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"payment_vault":"${_PV_STATUS:-skipped}","payment_vault_copies":${_PV_COPIES:-null},"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_dirs_partial_detail":$_partial_detail,"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"payment_vault":"${_PV_STATUS:-skipped}","payment_vault_copies":${_PV_COPIES:-null},"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
 
@@ -232,6 +265,7 @@ _on_exit() {
     # candidate) must not outlive the script if it died mid-section.
     rm -f "${_SQL_COUNT:-}" "${_SQL_ARTIFACT_TMP:-}" 2>/dev/null || true
     rm -f "${_EXTRA_TAR_TMP:-}" "${_EXTRA_TAR_ERR:-}" 2>/dev/null || true  # §6f plaintext tar + its file-name diagnostics
+    rm -f "${_ENCRYPT_PARTIAL:-}" "${_ENCRYPT_ERR_TMP:-}" 2>/dev/null || true  # encrypt_file's in-flight partial + gpg stderr
     if [ -n "${_VERIFY_DB:-}" ]; then
         rm -f "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm" 2>/dev/null || true
     fi
@@ -415,6 +449,7 @@ _pick_verify_mode() {
 # to a private repo is not acceptable).
 _BACKUP_PASSPHRASE="${GENESIS_BACKUP_PASSPHRASE:-}"
 _ENCRYPT_READY=false
+_ENCRYPT_PARTIAL="" _ENCRYPT_ERR_TMP=""  # encrypt_file's in-flight files, for _on_exit
 if [ -f "$SECRETS_FILE" ] && ! backup_passphrase_file_valid "$SECRETS_FILE"; then
     die "Backup secrets file is unreadable or contains NUL"
 fi
@@ -423,13 +458,102 @@ if [ -n "$_BACKUP_PASSPHRASE" ]; then
     _ENCRYPT_READY=true
 fi
 
-# encrypt_file <src> <dst> — encrypt file contents to <dst> (e.g. *.gpg).
+# encrypt_file <src> <dst> [stamp] — encrypt file contents to <dst> (e.g. *.gpg).
+#
+# The source is read through a pipe, never by name. Given a file name, gpg
+# records the file's size up front and fails ("Input/output error") when the
+# file grows while it reads, which a live session transcript does (#4391). A
+# pipe has no size, so gpg encrypts what it reads to EOF. The passphrase
+# arrives on fd 3, as in encrypt_stream.
+#
+# gpg writes a partial beside <dst>, renamed over it only on success, so a
+# failed run keeps the previous copy: gpg deletes its output on failure, which
+# used to be <dst> itself. The partial is `.genesis-partial.<pid>.XXXXXX` from
+# mktemp: short whatever <dst> is called (a name built from <dst> can exceed the
+# 255-byte limit where <dst> fits), and carrying the pid so the sweep before the
+# commit (§7) can tell a dead run's partial from a live one's. The stamp uses
+# `touch -c`, so a partial removed meanwhile is never recreated empty and moved
+# over the copy. On failure the last line of cat's, gpg's or mv's stderr is logged to stderr;
+# the caller still logs its own WARNING.
+#
+# With `stamp`, which only the callers that skip on `-nt` pass, the copy's
+# mtime is set from the source's; without it the copy keeps its encryption
+# time, as other readers expect (the host credential mirror re-copies a .gpg
+# only when its size or mtime differs, so a re-encrypt under a rotated
+# passphrase must move the mtime).
+#
+# The copy is stamped one second past the source's mtime (whole seconds, read
+# with the clock just before the read), so the callers' `[ "$dst" -nt "$src" ]`
+# skip holds while the source is unchanged and fails once anything is appended
+# after the read began: the source was at least two seconds old then, so an
+# append lands past the stamp. A source younger than that, or with an mtime
+# ahead of the clock, is stamped one second BEFORE its mtime, so the next run
+# re-encrypts it rather than trust a copy an append in the same timestamp tick
+# could have outrun. Only whole seconds are used: some coreutils
+# implementations round `stat %.9Y` and `touch -d @s.ns` through a float by a
+# few hundred nanoseconds, and `%Y` itself up by one just below a second
+# boundary, which the one-second margins absorb.
 encrypt_file() {
     local src="$1"
     local dst="$2"
+    local want_stamp="${3:-}"
     backup_passphrase_valid "$_BACKUP_PASSPHRASE" || return 1
-    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --no-symkey-cache --passphrase-fd 0 \
-        --symmetric --cipher-algo AES256 -o "$dst" "$src" 2>/dev/null
+    local tmp secs now stamp
+    local -a st
+    secs="$(stat -L -c %Y -- "$src")" || return 1
+    now="$(date +%s)"
+    _ENCRYPT_ERR_TMP="$(mktemp -p "$GENESIS_BIG_TMP" encrypt.XXXXXX.err)" || return 1
+    if ! tmp="$(mktemp -p "$(dirname -- "$dst")" ".genesis-partial.$$.XXXXXX")"; then
+        log "  cannot create a partial file beside $dst" >&2
+        rm -f -- "$_ENCRYPT_ERR_TMP"
+        _ENCRYPT_ERR_TMP=""
+        return 1
+    fi
+    _ENCRYPT_PARTIAL="$tmp"
+    if cat -- "$src" 2>>"$_ENCRYPT_ERR_TMP" \
+        | gpg --batch --yes --no-symkey-cache --passphrase-fd 3 \
+            --symmetric --cipher-algo AES256 -o "$tmp" \
+            3< <(printf '%s' "$_BACKUP_PASSPHRASE") 2>>"$_ENCRYPT_ERR_TMP"; then
+        st=("${PIPESTATUS[@]}")
+    else
+        st=("${PIPESTATUS[@]}")
+    fi
+    if [ "${st[0]}" = 0 ] && [ "${st[1]}" = 0 ]; then
+        if [ "$want_stamp" = stamp ]; then
+            if [ $((now - secs)) -ge 2 ]; then
+                stamp="@$((secs + 1))"
+            else
+                stamp="@$((secs - 1))"
+            fi
+            # A failed stamp still moves the copy: refusing would keep the
+            # previous copy for good on a filesystem that will not set times.
+            # The copy then keeps its encryption time, so a write that landed
+            # after cat's EOF and before gpg finished waits for the source's
+            # next change; the log says when the source did change.
+            if ! touch -c -d "$stamp" -- "$tmp" 2>>"$_ENCRYPT_ERR_TMP" && [ -e "$tmp" ]; then
+                local why
+                why="$(tail -n1 "$_ENCRYPT_ERR_TMP" 2>/dev/null | tr -cd '[:print:]' | cut -c1-200)"
+                if [ "$(stat -L -c %Y -- "$src" 2>/dev/null)" != "$secs" ]; then
+                    log "  could not stamp $dst ($why); the source changed during the read, and that change may wait for its next write" >&2
+                else
+                    log "  could not stamp $dst ($why)" >&2
+                fi
+            fi
+        fi
+        # -T: a directory at <dst> is a failure, never a place to move into.
+        if mv -f -T -- "$tmp" "$dst" 2>>"$_ENCRYPT_ERR_TMP"; then
+            rm -f -- "$_ENCRYPT_ERR_TMP"
+            _ENCRYPT_ERR_TMP="" _ENCRYPT_PARTIAL=""
+            return 0
+        fi
+    fi
+    rm -f -- "$tmp"
+    # stderr, not stdout: a caller may capture stdout as its own result
+    # (backup_payment_vault's one-line verdict is read from it).
+    log "  encrypt failed: $(tail -n1 "$_ENCRYPT_ERR_TMP" 2>/dev/null | tr -cd '[:print:]' | cut -c1-200)" >&2
+    rm -f -- "$_ENCRYPT_ERR_TMP"
+    _ENCRYPT_ERR_TMP="" _ENCRYPT_PARTIAL=""
+    return 1
 }
 
 # encrypt_stream <dst> — encrypt stdin to <dst>, same cipher and passphrase as
@@ -896,7 +1020,7 @@ if [ -d "$TRANSCRIPT_DIR" ]; then
             if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
                 continue
             fi
-            encrypt_file "$src" "$dst" || log "WARNING: failed to encrypt $name"
+            encrypt_file "$src" "$dst" stamp || log "WARNING: failed to encrypt $name"
         done < <(find "$TRANSCRIPT_DIR" -maxdepth 1 -name '*.jsonl' -type f -print0)
         _TRANSCRIPT_COUNT=$(find transcripts -maxdepth 1 -name '*.jsonl.gpg' 2>/dev/null | wc -l)
         log "Transcripts: $_TRANSCRIPT_COUNT files (encrypted)"
@@ -923,7 +1047,7 @@ if [ -d "$MEMORY_DIR" ]; then
             if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
                 continue
             fi
-            encrypt_file "$src" "$dst" || log "WARNING: failed to encrypt $rel"
+            encrypt_file "$src" "$dst" stamp || log "WARNING: failed to encrypt $rel"
         done < <(find "$MEMORY_DIR" -type f -print0)
         _MEMORY_COUNT=$(find memory -type f -name '*.gpg' 2>/dev/null | wc -l)
         log "Memory: $_MEMORY_COUNT files (encrypted)"
@@ -984,7 +1108,7 @@ if [ -d "$_EVAL_DIR" ]; then
             if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
                 continue
             fi
-            encrypt_file "$src" "$dst" || log "WARNING: failed to encrypt eval/$rel"
+            encrypt_file "$src" "$dst" stamp || log "WARNING: failed to encrypt eval/$rel"
         done < <(find "$_EVAL_DIR" -type f -print0)
         _EVAL_COUNT=$(find eval -type f -name '*.gpg' 2>/dev/null | wc -l)
         log "Eval golden sets: $_EVAL_COUNT files (encrypted)"
@@ -1019,6 +1143,7 @@ _EXTRA_BUILT=()        # names archived THIS run: the only ones uploaded
 _EXTRA_SKIP_LABELS=()  # listed entries not archived this run (recorded in COMPLETE)
 _EXTRA_PARTIAL=0       # archived, but a restore will refuse some of their members
 _EXTRA_PARTIAL_LABELS=()
+_EXTRA_PARTIAL_DETAIL=()
 _extra_prev=0
 if mkdir -p extra 2>/dev/null; then
     _extra_prev="$(find extra -maxdepth 1 -type f -name '*.tar.gpg' 2>/dev/null | wc -l || true)"
@@ -1183,11 +1308,40 @@ else
         fi
         _EXTRA_TAR_ERR="$_tar_err"
         _gpg_tmp="extra/.${_name}.partial.$$"
+        # A Python virtualenv under the directory, whatever it is named (the default
+        # excludes catch only `.venv` and `venv`): any directory holding pyvenv.cfg.
+        # Its interpreter links in bin/ are absolute, so a restore refuses them and the
+        # whole directory is reported partial (#4304). Exactly those links are
+        # excluded, each by its own path: every regular file and relative link in
+        # bin/, the rest of the venv, and any project files beside it in an in-place
+        # venv are archived as before. Found below the root only, so a root that is
+        # itself a venv keeps its links, and not inside a directory the default
+        # excludes already drop. Each exclude is anchored and has tar's wildcard
+        # characters escaped, so it matches that one member and nothing else.
+        _venv_ex=()
+        _venv_prune=()
+        for _x in "${_EXTRA_DEFAULT_EXCLUDES[@]}"; do _venv_prune+=(-name "$_x" -o); done
+        # One -mindepth only: find applies the last one globally, which would stop the
+        # prune at depth 1 (measured). The root's own pyvenv.cfg is skipped below.
+        while IFS= read -r -d '' _venv; do
+            [ "$_venv" = "$_abs" ] && continue
+            while IFS= read -r -d '' _link; do
+                # $(...) below would drop a trailing newline and exclude a sibling
+                # instead: leave such a link in, where restore reports it partial.
+                case "$_link" in *$'\n') continue ;; esac
+                _link_rel="${_link#"$_home_real"/}"
+                _venv_ex+=("--exclude=$(printf '%s' "$_link_rel" | sed 's/[][\\*?]/\\&/g')")
+                log "Excluded a Python virtualenv's absolute link from ~/$_rel: ~/$_link_rel"
+            done < <(find "$_venv/bin" -maxdepth 1 -type l -lname '/*' -print0 2>/dev/null)
+        done < <(find "$_abs" -mindepth 1 -type d \( "${_venv_prune[@]}" -false \) -prune \
+            -o -type f -name pyvenv.cfg -printf '%h\0' 2>/dev/null)
         _tar_rc=0
         # --hard-dereference: a hard link is stored as file content, so restore never
         # meets a hard-link member. Symlinks are kept as links; restore accepts the
         # ones that stay inside the restored directory.
-        tar -C "$_home_real" --hard-dereference "${_extra_ex_args[@]}" -cf "$_tar_tmp" -- "$_rel" 2>"$_tar_err" || _tar_rc=$?
+        tar -C "$_home_real" --hard-dereference "${_extra_ex_args[@]}" \
+            --anchored "${_venv_ex[@]+"${_venv_ex[@]}"}" --no-anchored \
+            -cf "$_tar_tmp" -- "$_rel" 2>"$_tar_err" || _tar_rc=$?
         # GNU tar exit 1 = some files changed while being read: the archive is written,
         # but a file that was changing may be torn. 2+ = fatal.
         _tar_head="$(head -3 "$_tar_err" | tr '\n' ' ')"
@@ -1205,11 +1359,14 @@ else
         # member filter restore uses (never by parsing `tar -t`, which escapes
         # backslashes and, under a C locale, non-ASCII names), so backup keeps exactly
         # what restore will accept.
-        _tar_root="" _tar_root_why="" _tar_verify_rc=0
+        _tar_root="" _tar_root_why="" _tar_summary="" _tar_verify_rc=0
         if _tar_root_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
             _EXTRA_TAR_ERR="$_tar_root_err"
             _tar_root="$(python3 "$_SCRIPT_DIR/lib/extra_restore.py" verify "$_tar_tmp" "$GENESIS_BIG_TMP" 2>"$_tar_root_err")" || _tar_verify_rc=$?
-            _tar_root_why="$(cat "$_tar_root_err")"
+            # verify's last line counts the refusals by class (exit 4 only): kept for
+            # the status file, and left out of the WARNING, which stays prose.
+            _tar_summary="$(grep -m1 '^REFUSED-SUMMARY ' "$_tar_root_err" | cut -d' ' -f2-)" || _tar_summary=""
+            _tar_root_why="$(grep -v '^REFUSED-SUMMARY ' "$_tar_root_err")" || true
             rm -f "$_tar_root_err"
             _EXTRA_TAR_ERR=""
         else
@@ -1239,6 +1396,7 @@ else
                 log "WARNING: extra dir archived without members a restore would refuse (exclude them with GENESIS_BACKUP_EXTRA_EXCLUDES): $_d: $_tar_root_why"
                 _EXTRA_PARTIAL=$((_EXTRA_PARTIAL + 1))
                 _EXTRA_PARTIAL_LABELS+=("$(LC_ALL=C printf '%q' "$_rel" | cut -c1-200)")
+                _EXTRA_PARTIAL_DETAIL+=("${_EXTRA_PARTIAL_LABELS[-1]}"$'\t'"$_tar_summary")
             fi
         else
             rm -f "$_gpg_tmp"
@@ -1825,6 +1983,34 @@ if ! grep -qx 'creds/\*\*/\.\*\.tmp' .gitignore 2>/dev/null; then
     printf 'creds/**/.*.tmp\n' >> .gitignore
     log "Added the credential staging names to the .gitignore exclusions"
 fi
+# encrypt_file's partials (.genesis-partial.<pid>.XXXXXX) and the SQL dump's
+# staged artifact (data/.genesis.sql.gpg.partial.<pid>): a run killed
+# mid-encrypt leaves one. Never commit one, and sweep those whose writer is
+# gone (#4391). The backup-restore lock admits one run per GENESIS_HOME; the
+# sweep also leaves a partial whose pid is alive, but the plaintext purges in
+# §4, §5 and §6f do not. Two runs sharing this repo under different GENESIS_HOME
+# values are not supported: one can remove the other's partial, which costs the
+# victim a WARNING and keeps its previous copy (`touch -c` and `mv -T` then fail).
+# The .gitignore lines ignore such FILES only: the second re-includes a directory
+# of that name, whose contents git could otherwise never commit, and the third an
+# encrypted copy (a partial's name never ends in .gpg).
+if ! grep -qxF '.genesis-partial.*' .gitignore 2>/dev/null; then
+    if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then printf '\n' >> .gitignore; fi
+    printf '.genesis-partial.*\n!.genesis-partial.*/\n!.genesis-partial.*.gpg\n' >> .gitignore
+    log "Added the encryption partials to the .gitignore exclusions"
+fi
+while IFS= read -r -d '' _partial; do
+    _pbase="${_partial##*/}"
+    case "$_pbase" in
+        .genesis-partial.*) _ppid="${_pbase#.genesis-partial.}"; _ppid="${_ppid%%.*}" ;;
+        *) _ppid="${_pbase##*.partial.}" ;;
+    esac
+    case "$_ppid" in ''|*[!0-9]*) continue ;; esac
+    [ "$_ppid" = "$$" ] && continue
+    kill -0 "$_ppid" 2>/dev/null && continue
+    rm -f -- "$_partial" && log "Removed an encryption partial left by an interrupted run: $_partial"
+done < <(find transcripts memory eval data secrets creds -type f \( -name '.genesis-partial.*' \
+    ! -name '*.gpg' -o -path 'data/.genesis.sql.gpg.partial.*' \) -print0 2>/dev/null)
 
 # --- Commit and push (Tier 1 only) ---
 log "Committing backup..."

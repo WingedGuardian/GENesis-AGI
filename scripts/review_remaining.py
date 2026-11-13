@@ -80,6 +80,7 @@ def _remaining_report(cwd: str, repo: str, number: int, budget: dict, deadline: 
             round_number=int(budget["count"]) if is_open else context.round_number,
             gate_lane=bool(budget.get("gate_surface")),
             prior_heads=[r["head"] for r in rounds if r["head"] != head] if is_open else context.prior_heads,
+            key_rounds=rr.key_rounds(budget),
             acceptance=acceptance, round_started=entry["opened_at"],
             reviewed_at=rr._open_review_times(projected), deadline=deadline,
             repo=repo, number=number, wanted_keys=keys - late_keys,
