@@ -62,12 +62,48 @@ logger = logging.getLogger(__name__)
 # A. Credential pair — broadened. Any credential-label word near a value.
 # Doesn't require BOTH user+pass — a single "password: X" is enough.
 _LABEL_WORDS = r"(?:user(?:name)?|login|pass(?:word)?|pwd|email|handle|account)"
+# Copula words a bare-whitespace separator can leave standing between a
+# label and the real value ("login is username: admin"): without this the
+# copula itself is captured as the login. Trade-off, same class as the
+# label words above: a credential literally named "is"/"were" is no longer
+# captured as a value on this path (a password literally "password" was
+# already un-capturable). Copulas are far more often separators than values.
+_COPULA_WORDS = r"(?:is|are|was|were)"
+# A value is rejected as a bare label/copula when the excluded word is the
+# WHOLE value token, ignoring trailing punctuation: the word followed by a
+# punctuation-only tail and then a token end (whitespace, ","/";", or end of
+# string) — or when it is followed directly by ":" or "=", the compact
+# repeated-label shape ("username:admin", "username=admin"). A plain "\b"
+# also fires before punctuation, which wrongly rejected values that merely
+# START with a label/copula word — e.g. "Is!Secure987" /
+# "Password!Secure987" (Codex P2 on PR #4473): the "!" is followed by more
+# word chars, so the token is not the bare word. Trade-off (CodeRabbit on
+# PR #4473): a credential that literally starts with a label/copula word
+# followed by ":" or "=" (e.g. password "user:abc123") is also rejected on
+# these paths — the separator shape is indistinguishable from a repeated
+# label, and the repeated label is the common case.
+_EXCLUDED_VALUE = rf"(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS})(?:[^\s,;\w]*(?=[\s,;]|$)|[:=]))"
+# Introducer words the lifecycle pattern's optional group can consume
+# ("created account named/called/for X"). If the account itself is rejected,
+# the group backtracks and the introducer becomes the account ("named /
+# secret123" — Codex P2 on PR #4473), fabricating a login. Rejecting the
+# introducers as account values makes the pattern fail instead, so the
+# capture falls through to the single-password branch.
+_INTRODUCER_WORDS = r"(?:for|named?|called?)"
+# Same compact-label rule as _EXCLUDED_VALUE: an account that is a label,
+# copula, or introducer word followed directly by ":" or "=" ("handle:admin")
+# is a repeated label, not a real account (CodeRabbit on PR #4473). The
+# pattern then fails and falls through to the single-password capture.
+_EXCLUDED_ACCOUNT = (
+    rf"(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS}|{_INTRODUCER_WORDS})"
+    rf"(?:[^\s,;\w]*(?=[\s,;]|$)|[:=]))"
+)
 _CREDENTIAL_PAIR_PATTERN = re.compile(
     r"\b(?:username|user|login)\s*(?:is\s+|[:=]\s*|\s+)"
-    rf"(?P<user>(?!{_LABEL_WORDS}\b)[^\s,;]+)"
+    rf"(?P<user>{_EXCLUDED_VALUE}[^\s,;]+)"
     r".{0,200}?"
     r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*)"
-    rf"(?P<pass>(?!{_LABEL_WORDS}\b)[^\s,;]+)",
+    rf"(?P<pass>{_EXCLUDED_VALUE}[^\s,;]+)",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -76,7 +112,7 @@ _CREDENTIAL_PAIR_PATTERN = re.compile(
 _SINGLE_CREDENTIAL_PATTERN = re.compile(
     r"\b(?:password|pass(?:word)?|pwd|passphrase|passcode|pin)"
     r"\s*(?:is\s+|[:=]\s*)"
-    r"(?P<value>[^\s,;]{4,})",
+    rf"(?P<value>{_EXCLUDED_VALUE}[^\s,;]{{4,}})",
     re.IGNORECASE,
 )
 
@@ -87,7 +123,7 @@ _EMAIL_PASSWORD_PATTERN = re.compile(
     r"(?P<email>[^\s,;]+@[^\s,;]+)"
     r".{0,200}?"
     r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*)"
-    r"(?P<pass>[^\s,;]{4,})",
+    rf"(?P<pass>{_EXCLUDED_VALUE}[^\s,;]{{4,}})",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -160,11 +196,36 @@ _ACCOUNT_LIFECYCLE_PATTERN = re.compile(
     r"\b(?:created|registered|signed?\s*up|set\s*up)\s+"
     r"(?:an?\s+)?(?:account|user|login)\s+"
     r"(?:for\s+|named?\s+|called?\s+)?"
-    r"(?P<account>[^\s,;]{2,})"
+    rf"(?P<account>{_EXCLUDED_ACCOUNT}[^\s,;]{{2,}})"
     r".{0,200}?"
     r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*)"
-    r"(?P<pass>[^\s,;]{4,})",
+    rf"(?P<pass>{_EXCLUDED_VALUE}[^\s,;]{{4,}})",
     re.IGNORECASE | re.DOTALL,
+)
+
+# F2. Lifecycle account probe — the same prefix as
+# _ACCOUNT_LIFECYCLE_PATTERN but with a PERMISSIVE account group, so a
+# compact label the lifecycle pattern rejected can still be located
+# (CodeRabbit round 4 on PR #4473). When the lifecycle account is
+# "pass:admin", the lifecycle pattern fails and the single branch would
+# match that SAME token as a password ("password: admin"). A rejected
+# account token must not be re-captured as the password: its span is
+# excluded from the single-pattern search below.
+_LIFECYCLE_ACCOUNT_PROBE_PATTERN = re.compile(
+    r"\b(?:created|registered|signed?\s*up|set\s*up)\s+"
+    r"(?:an?\s+)?(?:account|user|login)\s+"
+    r"(?:for\s+|named?\s+|called?\s+)?"
+    r"(?P<account>[^\s,;]{2,})",
+    re.IGNORECASE,
+)
+
+# The _EXCLUDED_ACCOUNT rule as a matchable pattern: a token is rejected
+# when it is a bare label/copula/introducer word, or one followed directly
+# by ":" or "=". Anchored at the start; re.match on the raw account token.
+_REJECTED_ACCOUNT_TOKEN = re.compile(
+    rf"^(?:{_LABEL_WORDS}|{_COPULA_WORDS}|{_INTRODUCER_WORDS})"
+    r"(?:[^\s,;\w]*(?=[\s,;]|$)|[:=])",
+    re.IGNORECASE,
 )
 
 # URL shape — common http(s) URL, rejects trailing punctuation.
@@ -274,6 +335,47 @@ def _user_shared(token: str | None, user_text: str | None) -> bool:
     return token.lower() in user_text.lower()
 
 
+def _rejected_lifecycle_account_spans(content: str) -> list[tuple[int, int]]:
+    """Spans of lifecycle account tokens rejected as compact labels.
+
+    Every "created account <token>" in the content is probed; a token is
+    rejected by the same rule _EXCLUDED_ACCOUNT applies (bare
+    label/copula/introducer word, or one followed directly by ":" or "=").
+    All such spans are returned — a second rejected account later in the
+    text must be excluded too.
+    """
+    spans = []
+    for probe in _LIFECYCLE_ACCOUNT_PROBE_PATTERN.finditer(content):
+        if _REJECTED_ACCOUNT_TOKEN.match(probe.group("account")):
+            spans.append(probe.span("account"))
+    return spans
+
+
+def _first_single_credential(
+    content: str, *, exclude_spans: list[tuple[int, int]] = (),
+) -> re.Match | None:
+    """First single-credential match whose VALUE does not overlap an excluded span.
+
+    The single pattern's leftmost match can sit inside a lifecycle account
+    token the lifecycle branch already rejected ("pass:admin" after
+    "created account"); such a match is the account, not a password, so it
+    is skipped and the next match is tried. The overlap is checked on the
+    credential VALUE span, not the whole match: a rejected account token
+    that is only a label ("password:" after "created account") overlaps
+    the match's label but not its value, so the password that follows it
+    ("secret123") is still captured.
+    """
+    for match in _SINGLE_CREDENTIAL_PATTERN.finditer(content):
+        start, end = match.span("value")
+        if any(
+            start < span_end and span_start < end
+            for span_start, span_end in exclude_spans
+        ):
+            continue
+        return match
+    return None
+
+
 def classify_as_reference(
     extraction: Extraction, user_text: str | None = None,
 ) -> dict | None:
@@ -358,7 +460,11 @@ def classify_as_reference(
             }
 
     # 1d. Single password mention (no user required)
-    single = _SINGLE_CREDENTIAL_PATTERN.search(content)
+    # A lifecycle account token rejected as a compact label ("pass:admin")
+    # must not be re-captured here as the password (CodeRabbit round 4 on
+    # PR #4473): skip single matches overlapping any such span.
+    rejected_spans = _rejected_lifecycle_account_spans(content)
+    single = _first_single_credential(content, exclude_spans=rejected_spans)
     if single:
         password = single.group("value")
         if (
