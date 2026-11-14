@@ -20,6 +20,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -618,8 +619,14 @@ def _without_card_refs(text: str) -> str:
     280 all 12 are digits: a 12-digit run that ``holds_long_digit_run`` flags. The
     audit rows carry the ref on purpose (approval passes a well-formed one through),
     so the value-free sweep removes only refs and still fails on any other run.
+    Only a WHOLE ref is masked: ``vs.CARD_REF`` is meant for ``fullmatch`` and has
+    no end boundary, so searching with it would also eat the first 12 digits of a
+    longer value and hide the rest of that run.
     """
-    return vs.CARD_REF.sub("card_REF", text)
+    return _WHOLE_CARD_REF.sub("card_REF", text)
+
+
+_WHOLE_CARD_REF = re.compile(r"(?<![0-9A-Za-z_])" + vs.CARD_REF.pattern + r"(?![0-9A-Za-z])")
 
 
 def _digit_run_window(text: str, around: int = 20) -> str:
@@ -637,6 +644,10 @@ def test_the_value_free_sweep_ignores_a_digit_ref_but_not_another_run():
     leaked = _without_card_refs(shown + ' "4111-1111-1111"')
     assert ap.holds_long_digit_run(leaked)
     assert "4111-1111-1111" in _digit_run_window(leaked)  # the message names the run
+    # A card_ value longer than a ref is not a ref: its digit run stays visible.
+    overlong = '{"card_ref": "card_1234567890123456"}'
+    assert _without_card_refs(overlong) == overlong
+    assert ap.holds_long_digit_run(_without_card_refs(overlong))
 
 
 async def test_the_registry_puts_the_test_line_first():
