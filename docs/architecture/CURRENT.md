@@ -3210,6 +3210,10 @@ verified: c712f1bde 2026-11-06
   uncovered or stale declarations, including previews; old evidence still parses
   and reasoned `E2E: none` declarations need no mapping. The shared source parser
   also supplies the existing script facade (verified: 2026-11-06).
+  Both writers also refuse a closing verdict while an event-gated gap's date has
+  come, and print or return advisory completeness prompts (`completeness_prompts`)
+  on every run; the prompts change no verdict and are not stored. They do not
+  replace the independent verifier (#4180; verified: 2026-11-14).
   Fixture lookup injection stays outside the public MCP schema. Its
   server-side calibration gate forces preview until operator opt-in, including
   attempt notes. Real writes use a separate admitted existing-only connection;
