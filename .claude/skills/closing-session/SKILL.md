@@ -653,7 +653,29 @@ it** (owner ruling, 2026-10-19):
   #4058/#4095's by-design collection skip together broke the skip ceiling,
   though each had merged green. Wait for that run to conclude before the next
   merge: an in-progress run says nothing yet and a cancelled one says nothing
-  at all, so merging in a burst skips this check. If main turns red, classify it before the next merge, as for
+  at all, so merging in a burst skips this check. Wait with
+  `python3 scripts/wait_main_ci.py <merge-sha>`: main never cancels its run in
+  progress, but each new push replaces the run still pending, so your merge's
+  own run is often never run. The verdict is the newest run that CONTAINS your
+  merge and concluded as a pass or a fail; the script finds it, and it never
+  counts a cancelled run (exit 0 pass, 1 red, 2 main's CI was read and no
+  containing run concluded in time, 3 cannot check: the commit is unknown or
+  not on main, so pass the merge commit, not the PR head, or main's CI could
+  not be read, so rerun it; exit 3 never licenses the batching below). A replaced run is normal: the run
+  that replaces yours also contains your merge, so replacement alone never
+  justifies skipping the wait.
+  **The one exception to waiting, a jammed main CI** (owner, 2026-11-13): when
+  `wait_main_ci.py` exits 2 (no run containing your merge concluded within its
+  4-hour ceiling) AND at least two more PRs are ready, you may merge the ready,
+  fully green PRs that share no files as one batch, then wait once with the
+  script on the LAST merge commit (a run containing it contains them all). This
+  trades early detection for throughput: PRs with disjoint files can still break
+  main together through the whole tree. If that run is red on anything but a
+  classified flake, stop merging; read the failing jobs the script prints, and
+  when they do not point at one PR, run the failing test command locally at
+  each of the batch's merge commits in order to find the first one that fails.
+  Seen that day: four ready PRs, a main queue whose runs took up to 3-4 hours,
+  and three flaky reds in a row put strict pacing at 8-12 hours. If main turns red, classify it before the next merge, as for
   the base-red NOTE in step 1: when the merge you just made caused it, or the
   next PR touches what failed, fix main first; an unrelated flake or an
   infrastructure failure does not hold the queue. GitHub records each such
