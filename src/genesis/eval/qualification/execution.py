@@ -40,7 +40,7 @@ def identity(info):
 class Input:
     """A retained private descriptor; metadata per request, full hashes at boundaries."""
 
-    def __init__(self, path):
+    def __init__(self, path, *, decode=load_json):
         self.path = Path(path).absolute()
         self.fd = private_open(self.path, os.O_RDONLY)
         try:
@@ -48,7 +48,7 @@ class Input:
             with os.fdopen(os.dup(self.fd), "rb") as stream:
                 raw = stream.read()
             self.hash = hashlib.sha256(raw).hexdigest()
-            self.value = load_json(raw)
+            self.value = decode(raw)
             self.check()
         except BaseException:
             self.close()

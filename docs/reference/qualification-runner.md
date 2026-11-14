@@ -1,5 +1,10 @@
 # Offline qualification runner and reports
 
+For read-only reuse across immutable stopped campaigns, see
+[qualification lineage](qualification-lineage.md): `study-check` validates a
+frozen continuation plan and `study-report` scores its inherited prefix. These
+commands authorize no acquisition and retain unresolved historical liabilities.
+
 Run this workflow in a dedicated serial process, never inside the serving
 process. Production rendering and disposable storage replay temporarily patch
 production globals. Use an owned disk-backed scratch directory.

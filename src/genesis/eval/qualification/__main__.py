@@ -11,13 +11,16 @@ from pathlib import Path
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
-    for name in ("check", "run", "report"):
+    for name in ("check", "run", "report", "study-check", "study-report"):
         command = commands.add_parser(name)
         for flag in ("corpus", "temp-root", "reference-policy", "current-reference-policy",
                      "reference-approval", "source-files", "params"):
             command.add_argument("--" + flag, type=Path, required=flag in ("corpus", "temp-root"))
-        command.add_argument("--alias", required=name != "check")
-        if name != "check":
+        if name.startswith("study-"):
+            command.add_argument("--study-plan", type=Path, required=True)
+        else:
+            command.add_argument("--alias", required=name != "check")
+        if name in ("run", "report"):
             command.add_argument("--campaign", type=Path, required=True)
         if name in ("run", "report"):
             command.add_argument("--against")
@@ -103,6 +106,11 @@ async def run(args):
         "reference_policy": policy, "current_reference_policy": read("current_reference_policy"),
         "reference_approval": read("reference_approval"), "source_files": read("source_files"),
     }
+    if args.command.startswith("study-"):
+        from .study_report import inspect
+
+        return await inspect(args.study_plan, cases, args.temp_root, candidates=configured,
+                             options=options, scoring=args.command == "study-report")
     if args.command in ("check", "run"):
         return await admit(args, cases, configured, options)
     against = args.against
