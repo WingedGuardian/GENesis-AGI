@@ -14,7 +14,8 @@ ROOT = Path(__file__).resolve().parents[2]
 MODULES = ["test_shared_http_admission", "test_shared_http_policy", "test_shared_http_runtime",
            "test_shared_cli_startup_contract", "test_shared_forwarder", "test_shared_forwarder_http_errors",
            "test_shared_paths", "test_shared_path_tools", "test_shared_path_routes",
-           "test_shared_path_versions", "test_shared_path_context", "test_plan_bookmark_http", "test_plan_bookmark_peer"]
+           "test_shared_path_versions", "test_shared_path_context", "test_plan_bookmark_http", "test_plan_bookmark_peer",
+           "test_ordinary_memory_frontend", "test_ordinary_memory_faults"]
 LAZY_SDK_MODULES = {"test_shared_path_context"}
 PINS = {"fastmcp": "4.1.4", "mcp": "2.3.0", "uvicorn": "0.54.0"}
 
@@ -129,6 +130,6 @@ def test_protocol_step_is_strict_complete_and_has_no_skip_escape():
     assert "tests/test_mcp/test_plan_bookmark_context.py" in protocol
     assert protocol.index("rm -f junit-shared-mcp.xml") < protocol.index("-m pytest")
     check = next(command for command in commands if "scripts/check_skip_ceiling.py" in command)
-    assert "junit-shared-mcp.xml --ceiling 0 --min-collected 509" in check
+    assert "junit-shared-mcp.xml --ceiling 0 --min-collected 518" in check
     assert not job.get("continue-on-error")
     assert not any(step.get("continue-on-error") for step in job["steps"])

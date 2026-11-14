@@ -696,12 +696,12 @@ def _bearer_auth_middleware(expected_token: str):
     return Middleware(_AuthGuard)
 
 
-def _local_health_frontend(args, argv):
-    """Preflight a mixed ordinary health command before preparing any resource."""
+def _local_frontend(args, argv):
+    """Preflight a mixed ordinary command before preparing any resource."""
     import os
 
     actual_args = list(sys.argv[1:] if argv is None else argv)
-    if (actual_args != ["--server", "health"] or args.transport != "stdio"
+    if (args.server not in ("health", "memory") or actual_args != ["--server", args.server] or args.transport != "stdio"
             or args.external_client is not None):
         return None
     try:
@@ -709,7 +709,7 @@ def _local_health_frontend(args, argv):
 
         root = Path(__file__).resolve().parents[1]
         stdio = [sys.executable, str(root / "scripts/genesis_mcp_server.py"), *actual_args]
-        selected = load_local_settings(root, "health", dict(os.environ), stdio)
+        selected = load_local_settings(root, args.server, dict(os.environ), stdio)
         if selected is None:
             return None
         from genesis.caller_context import caller_context_from_env
@@ -738,7 +738,9 @@ def _local_health_frontend(args, argv):
 
         for handler in logging.getLogger().handlers:
             handler.addFilter(SafeDiagnostics())
-        server = _prepare_health()
+        server = _prepare_health() if args.server == "health" else _prepare_memory()
+        if server is None:
+            return
         anyio.run(partial(serve_stdio, selected.settings, headers,
                           local_server=server, stage=selected.stage))
 
@@ -903,7 +905,7 @@ def main(argv: list[str] | None = None) -> None:
     bootstrapper = _BOOTSTRAPPERS[args.server]
     options = {"external_profile": args.external_client} if args.external_client else {}
     try:
-        if local_frontend := _local_health_frontend(args, argv):
+        if local_frontend := _local_frontend(args, argv):
             local_frontend()
             return
         bootstrapper(transport_kwargs, **options)

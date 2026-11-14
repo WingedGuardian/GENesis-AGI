@@ -460,8 +460,17 @@ receipts outside successful-temp cleanup. Uvicorn re-raises captured SIGTERM
 after graceful shutdown in this qualified version, so the backend check requires
 the expected signal exit together with completed SDK/drain/resource events.
 They neither contact a native client/provider nor activate routing.
+The ordinary memory suites exercise both eligible stages and protocol eras with
+all eight real floor tool bodies, actual SQLite and per-process local Qdrant.
+Embedding providers and optional model extraction are synthetic; rollout,
+readiness and fault controls remain test-only. SQL establishes
+local-write/remote-read visibility; separate in-memory vectors do not. Caller
+and server marker/session decoys, invalid requests, complete catalog traversal,
+cancellation/EOF and feature/catalog refusal cover the mixed consumer. Its
+existing heavy local initialization and final resource owner remain outside
+the savings/activation claim.
 Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
-and a floor of 509 cases. Installation, collection, test or report-check failure
+and a floor of 518 cases. Installation, collection, test or report-check failure
 fails the job; missing or filtered workflow runs do not qualify a PR. Closing
 checks its actual head/base result. Ordinary skip-budget changes require observed
 skip identities; this workflow does not raise that budget automatically.

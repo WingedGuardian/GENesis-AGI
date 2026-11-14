@@ -33,8 +33,8 @@ the bookmark execution contract; dynamic catalog equality remains only a
 logical-generation preflight. Only `tools/call` gains the reserved
 `genesis/planBookmarkPending` metadata, with arguments, IDs and other metadata
 preserved. A client-supplied reserved key refuses before network activity.
-The ordinary memory frontend is the next consumer; this increment does not
-select it or expand credentials. See [shared HTTP](shared-mcp-http.md).
+The ordinary memory frontend below consumes this contract without expanding
+credentials. See [shared HTTP](shared-mcp-http.md).
 
 The ordinary launcher exposes internal `_prepare_health` and `_prepare_memory`
 helpers for managed consumers. Its existing `_bootstrap_health` and
@@ -46,6 +46,32 @@ memory DB still refuses, while health keeps its degraded mode. This preparation
 seam does not itself implement the local/shared union. In particular, ordinary
 health cleanup still owns process-global browser cleanup; any later composition
 must settle all local browser work before that lifespan exits.
+
+## Ordinary memory floor frontend
+
+The exact ordinary `python scripts/genesis_mcp_server.py --server memory`
+command can use the same mixed SDK owner at `memory-floor` or `health-reads`.
+It retains the complete ordinary catalog and executes the eight external-floor
+memory tools through the existing shared memory backend: `memory_recall`,
+`memory_expand`, `memory_core_facts`, `memory_stats`, `knowledge_recall`,
+`knowledge_status`, `procedure_recall`, and `observation_query`. Other advertised
+memory tools, including writes, execute locally. This does not admit the final
+`writes` stage. Health remains eligible only at `health-reads`.
+
+The memory peer always opts into `/mcp/v2` with the ordinary process's
+`HOME/.genesis/plan_bookmark_pending.json`, including when that file is absent.
+Reserved metadata selects the caller's marker and sibling session directory;
+shared readers do not fall back to the server's HOME. Ordinary local tools keep
+their existing pending-bookmark behavior. SDK validation precedes execution,
+and authenticated capability/catalog refusal does not replay locally.
+
+The same P7 snapshot, exact selected command, readiness, stdio and unlabelled
+client restrictions apply. The shipped ceiling stays off, adapters stay empty,
+and no credential or native label rule changes. Missing memory DB retains the
+ordinary refusal. Ordinary memory's heavy initialization and existing local
+lifespan remain; this increment establishes neither memory savings nor the
+final local resource owner's drain guarantee. Pending-bookmark delivery retains
+the documented unlink-before-create/crash-loss and old-reader limitations.
 
 ## Ordinary health read frontend
 
@@ -59,8 +85,9 @@ use that captured configuration. There is no inherited stage marker or new
 
 The shipped ceiling is still `off`, and `adapter.argv` remains empty. This
 increment changes neither registrations nor installed units and does not raise
-the ceiling. It admits health at `health-reads` only; memory, final `writes`,
-bookmarks and native label/credential integration remain separate work. All
+the ceiling. It admits health at `health-reads` only; the memory consumer is
+described above. Final `writes` and native label/credential integration remain
+separate work. All
 labelled/external-profile clients, extra argv and other transports keep their
 ordinary path. Preflight refusal before preparation/input also keeps that path;
 failure after the mixed owner starts ends that owner without replaying a call.
