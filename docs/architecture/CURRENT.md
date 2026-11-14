@@ -73,11 +73,12 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 5a3de4eee 2026-11-07
+verified: 2d3c95cb7 2026-11-14
 ```
 
-The 2026-11-07 verification covers the request-owned memory thread boundaries
-below; other memory descriptions retain their individually cited verification dates.
+The 2026-11-14 scoped review covers ordinary memory's pending-input consumer;
+the request-owned thread boundaries below retain their 2026-11-07 verification.
+Other memory descriptions retain their individually cited verification dates.
 
 **Pending plan bookmarks:** the memory guard captures its checked input path
 and resolves short session hints in that input's sibling `sessions` directory.
@@ -89,8 +90,11 @@ unlabelled memory forwarders on `/mcp/v2` may supply the version1 explicit
 pending path, bound to that caller and reset per request. The memory peer's
 optional input requires the exact advertised capability on each generation;
 static/labelled/absent-metadata/lost-scope callers gain no server-file fallback.
-Ordinary memory routing remains a separate consumer. This scoped description does
-not restamp the complete memory entry or qualify the ordinary local task owner.
+The gated ordinary memory frontend opts into this path at `memory-floor` and
+`health-reads`, including when its HOME marker is absent. Its eight floor tools
+run remotely while local tools retain their existing pending consumer. This
+scoped description does not qualify the ordinary local task owner or the rest
+of the memory entry.
 
 **Shared-owner prerequisite (not activated):** nine thread boundaries in
 `memory/store.py`, `retrieval.py`, `intent.py` and `proactive.py` retain actual
@@ -1639,7 +1643,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: d99da0513 2026-11-09
+verified: 2d3c95cb7 2026-11-14
 ```
 
 Scoped verification covers `mcp/shared_http` composition. It receives
@@ -1672,8 +1676,11 @@ requires the version1 pending-bookmark capability on every generation and uses
 memory-only `/mcp/v2` for execution, using authenticated explicit caller input
 only. Default peers keep `/mcp/v1`; all aliases share one transport/resource owner.
 An older backend without v2 refuses the actual request after idle replacement;
-whole-catalog equality remains a generation preflight. Ordinary memory routing, the final local
-health owner and remaining stages are incomplete; native-client checks and
+whole-catalog equality remains a generation preflight. Ordinary memory now uses
+the same mixed SDK owner at `memory-floor` and `health-reads`, forwarding eight
+memory-floor tools and keeping other tools local. It retains heavy ordinary
+initialization, its existing lifespan, exact argv and the missing-DB refusal.
+The final local resource owner and write stages remain incomplete; native-client checks and
 matched measurements still gate registration changes. This does not reverify the
 whole entry on main; that landing-dependent obligation remains tracked in#4232. See
 `docs/reference/mcp-shared-forwarder.md`.

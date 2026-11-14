@@ -1,0 +1,1 @@
+- Preserve the complete ordinary memory tool catalog while routing its eight floor reads through shared memory, including caller plan bookmarks. Local writes and the existing ordinary initialization remain; the rollout ceiling stays off.

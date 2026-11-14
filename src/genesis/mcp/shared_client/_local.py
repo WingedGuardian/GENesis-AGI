@@ -4,6 +4,7 @@ import copy
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 
 import anyio
 import mcp_types as types
@@ -17,8 +18,9 @@ from mcp.shared.jsonrpc_dispatcher import JSONRPCDispatcher
 from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, LATEST_HANDSHAKE_VERSION
 
 from genesis.caller_context import caller_context
-from genesis.mcp.external_profiles import HEALTH_FLOOR_TOOLS, ExternalProfileMiddleware
+from genesis.mcp.external_profiles import ExternalProfileMiddleware, profile_tools
 from genesis.mcp.shared_http._catalog import Catalog
+from genesis.mcp.shared_settings import LOCAL_FRONTEND_STAGES
 
 from ._connection import RemotePeer
 
@@ -42,12 +44,13 @@ def _original_frame(method):
 class _Routes(Middleware):
     def __init__(self, peer, catalog):
         self.peer, self.catalog = peer, catalog
+        floor = profile_tools(catalog.service, "external")
         self.remote_names = frozenset(
             name for name, entry in catalog.entries.items()
-            if entry.location == "shared" and entry.capabilities <= HEALTH_FLOOR_TOOLS
+            if entry.location == "shared" and entry.capabilities <= floor
         )
-        if self.remote_names != HEALTH_FLOOR_TOOLS:
-            raise ValueError("Incomplete health read frontend")
+        if self.remote_names != floor:
+            raise ValueError(f"Incomplete {catalog.service} read frontend")
 
     async def on_initialize(self, context, call_next):
         if context.message is None:
@@ -135,11 +138,13 @@ class _LocalPeer:
 @asynccontextmanager
 async def local_peer(group, settings, header_factory, server, stage):
     caller = caller_context()
-    if (settings.http.service != "health" or stage != "health-reads" or caller.profile is not None
+    service = settings.http.service
+    if ((service, stage) not in LOCAL_FRONTEND_STAGES or caller.profile is not None
             or any(isinstance(m, ExternalProfileMiddleware) for m in server.middleware)):
         raise ValueError("Unsupported local frontend")
-    catalog = await Catalog.capture(server, "health")
-    remote = RemotePeer(group, settings, header_factory, expected_catalog_revision=catalog.revision(caller))
+    catalog = await Catalog.capture(server, service)
+    remote = RemotePeer(group, settings, header_factory, expected_catalog_revision=catalog.revision(caller),
+                        pending_file=Path.home() / ".genesis/plan_bookmark_pending.json" if service == "memory" else None)
     peer = _LocalPeer(remote)
     routes = _Routes(peer, catalog)
 

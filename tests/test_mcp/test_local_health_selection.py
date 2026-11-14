@@ -79,7 +79,7 @@ def test_ineligible_spawns_stay_ordinary_before_parsing_shared_limits(checkout, 
     elif change == "extra-argv":
         stdio += ["--external-client"]
     elif change == "other-service":
-        service, stdio[-1] = "memory", "memory"
+        service, stdio[-1] = "outreach", "outreach"
     elif change == "stage-off":
         data["stage"] = "off"
     elif change == "stage-memory":

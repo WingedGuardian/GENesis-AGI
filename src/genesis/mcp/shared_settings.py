@@ -10,6 +10,12 @@ from uuid import uuid4
 
 from genesis.mcp.shared_http import SharedHTTPConfig
 
+LOCAL_FRONTEND_STAGES = (
+    ("health", "health-reads"),
+    ("memory", "memory-floor"),
+    ("memory", "health-reads"),
+)
+
 
 @dataclass(frozen=True)
 class SharedServiceSettings:
@@ -98,8 +104,8 @@ def load_shared_settings(root, service, env):
 
 
 def load_local_settings(root, service, env, stdio, *, ready=None):
-    """Re-decide an ordinary health spawn; no inherited handoff state or ABI."""
-    if service != "health" or env.get("GENESIS_CALLER_PROFILE"):
+    """Re-decide an ordinary spawn; no inherited handoff state or ABI."""
+    if service not in ("health", "memory") or env.get("GENESIS_CALLER_PROFILE"):
         return None
     try:
         with _rollout_program(root) as module:
@@ -112,7 +118,7 @@ def load_local_settings(root, service, env, stdio, *, ready=None):
             if not decision.shared or decision.argv != list(stdio):
                 return None
             _requested, stage = module.stage_selection(config, env, ceiling)
-            if stage != "health-reads":
+            if (service, stage) not in LOCAL_FRONTEND_STAGES:
                 return None
             settings = _service_settings(config, service, module.valid_unit)
             return LocalSelection(settings=settings, stage=stage)
