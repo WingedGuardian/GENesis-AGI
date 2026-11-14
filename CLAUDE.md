@@ -722,6 +722,18 @@ gate works, its exemption categories, and the unit rules for size bounds:
   `.claude/docs/premise-check.md` ("Handing a verdict to a builder") and
   build-session ("Building a rework").
 - **Use subagents** to keep main context clean. One concern per subagent.
+  **Name the model on every dispatch, chosen by fit** — most appropriate, not
+  most capable. Recon and mechanical work (locate, enumerate, fetch and
+  summarize, look up a config) runs on the fast tier. Coding, debugging,
+  investigation, adversarial review, and anything whose output drives a
+  decision or a durable record runs on the workhorse tier (in Claude Code,
+  `sonnet` and `opus`). An unmarked dispatch inherits the session's model, so
+  never leave one unmarked. **Nothing above the workhorse tier (a Fable-class
+  model) runs as a subagent without the user's approval for that dispatch.** In
+  Claude Code a fork always runs on its parent's model, so a session on such a
+  model does not fork without that approval either. To check what a subagent
+  ran on, read the `model` field in its transcript rather than a label. (Owner
+  rulings 2026-09-08 and 2026-11-14.)
   **A MANDATED subagent is already the request** — when a gate's block message
   tells you to dispatch one, dispatch it; don't stop to ask. Ask only for
   discretionary fan-out. **An INTERRUPTED STREAM is not discretionary either:**
