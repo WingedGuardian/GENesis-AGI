@@ -1,0 +1,1 @@
+- The Guardian's service restart no longer restarts genesis-server while its start step runs (where the boot repair may be healing the checkout); it starts a stopped unit, restarts a running one without blocking, and judges the result by a new invocation coming up, not by the restart command's return.

@@ -22,6 +22,7 @@ from headlong_controls import dependency_inventory, preflight, read_jsonl, tree_
 from headlong_native_bridge import ReceiptView
 from headlong_native_provider import Backend
 
+CALIBRATION_FIELDS = ("journal", "scopes_closed", "backends", "reports")
 
 def population():
     return {"schema": "ego-owned-timing-population/v1", "timer_wakes": 6, "timer_waits": [5, 10, 20, 40, 40],
@@ -178,7 +179,8 @@ def qualify(name, row):
 
 def calibration(row):
     controls = []
-    for field, value in (("journal", []), ("scopes_closed", False), ("backends", []), ("reports", [])):
+    for field in CALIBRATION_FIELDS:
+        value = False if field == "scopes_closed" else []
         mutant = copy.deepcopy(row)
         mutant[field] = value
         controls.append({"case": row["scenario"], "corruption": field, "rejected": qualify(row["scenario"], mutant) is False})

@@ -10,6 +10,7 @@ build paths that drift is two schemas diverging with nothing to notice.
 
 from __future__ import annotations
 
+import json
 import re
 
 import aiosqlite
@@ -688,12 +689,15 @@ async def test_both_build_paths_agree_on_the_effective_column_shape(tmp_path):
     # Guard-the-guard: the comparison is only meaningful if it actually saw the
     # appended columns in their positions. Without this the test would
     # pass just as happily against two identical PRE-migration tables.
-    assert [c[1] for c in fresh_cols][-5:] == [
+    assert [c[1] for c in fresh_cols][-8:] == [
         "verdict",
         "attempt_count",
         "last_attempt_at",
         "last_attempt_note",
         "rechecks",
+        "closed_by",
+        "last_attempt_by",
+        "recorded_session",
     ]
     by_name = {c[1]: c for c in fresh_cols}
     assert by_name["attempt_count"][3] == 1, "attempt_count must be NOT NULL"
@@ -1114,6 +1118,115 @@ async def test_an_unparseable_attempt_time_makes_a_parked_row_ineligible(db):
     assert await verif_crud.list_validation_candidates(db, now=PICK_NOW) == []
 
 
+# ── a not-yet-done whose validator declared no progress (owner ruling 2026-11-09)
+# The validator judges it and writes ``no_progress`` into the document it already
+# records; the picker reads it from the stored evidence at pick time.
+
+
+def _nyd_doc(no_progress=None):
+    doc = {"pr": 1, "gaps": [{"kind": "not_yet_done", "detail": "d", "command": "c"}]}
+    if no_progress is not None:
+        doc["no_progress"] = no_progress
+    return json.dumps(doc)
+
+
+async def _nyd(db, n, at, *, no_progress=None, pending=False):
+    await verif_crud.record_attempt(
+        db,
+        repo=REPO,
+        pr_number=n,
+        verdict="not-yet-done",
+        note="TRACKING PENDING: findings/0 needs an issue — n" if pending else "n",
+        now=at,
+        evidence=_nyd_doc(no_progress),
+        tracking_pending=pending,
+    )
+
+
+def _picked(rows):
+    return [(r["pr_number"], r["tier"]) for r in rows]
+
+
+@pytest.mark.asyncio
+async def test_a_declared_no_progress_inside_the_window_is_excluded(db):
+    await _open(db, 300, merged="2026-09-01T00:00:00Z")
+    await _open(db, 301, merged="2026-09-20T00:00:00Z")  # never attempted
+    await _nyd(db, 300, "2026-10-20T11:59:00+00:00", no_progress=True)
+    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
+    assert _picked(rows) == [(301, 1)]
+
+
+@pytest.mark.asyncio
+async def test_a_declared_no_progress_past_the_window_is_back_at_tier_0(db):
+    await _open(db, 302, merged="2026-09-01T00:00:00Z")
+    await _open(db, 303, merged="2026-09-20T00:00:00Z")
+    await _nyd(db, 302, "2026-10-13T11:00:00Z", no_progress=True)  # 7d 1h ago
+    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
+    assert _picked(rows) == [(302, 0), (303, 1)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declared", [None, False])
+async def test_an_undeclared_or_false_no_progress_is_eligible_at_once(db, declared):
+    await _open(db, 304)
+    await _nyd(db, 304, "2026-10-20T11:59:00+00:00", no_progress=declared)
+    assert _picked(await verif_crud.list_validation_candidates(db, now=PICK_NOW)) == [(304, 0)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["true", 1, "yes"])
+async def test_only_a_literal_true_is_a_declaration(db, value):
+    """The writers' model refuses any other type; a stored oddity is not a wait."""
+    await _open(db, 305)
+    await _nyd(db, 305, "2026-10-20T11:59:00+00:00", no_progress=value)
+    assert _picked(await verif_crud.list_validation_candidates(db, now=PICK_NOW)) == [(305, 0)]
+
+
+@pytest.mark.asyncio
+async def test_a_tracking_pending_no_progress_is_eligible_and_its_routing_re_record_waits(db):
+    """An interrupted routing is not hidden; the re-record carries the same document,
+    so the declaration carries with it and the wait starts once routing completes."""
+    await _open(db, 306)
+    await _nyd(db, 306, "2026-10-20T11:00:00+00:00", no_progress=True, pending=True)
+    assert _picked(await verif_crud.list_validation_candidates(db, now=PICK_NOW)) == [(306, 0)]
+    await _nyd(db, 306, "2026-10-20T11:05:00+00:00", no_progress=True)
+    assert await verif_crud.list_validation_candidates(db, now=PICK_NOW) == []
+
+
+@pytest.mark.asyncio
+async def test_an_unparseable_stamp_on_a_declared_no_progress_is_ineligible(db):
+    await _open(db, 307)
+    await _nyd(db, 307, "2026-01-01T00:00:00+00:00", no_progress=True)
+    await db.execute(
+        "UPDATE pr_verifications SET last_attempt_at = 'garbage' WHERE pr_number = 307"
+    )
+    await db.commit()
+    assert await verif_crud.list_validation_candidates(db, now=PICK_NOW) == []
+
+
+@pytest.mark.asyncio
+async def test_unparseable_stored_evidence_is_undeclared(db):
+    await _open(db, 308)
+    await verif_crud.record_attempt(
+        db, repo=REPO, pr_number=308, verdict="not-yet-done", note="n",
+        now="2026-10-20T11:59:00+00:00", evidence="{not json",
+    )
+    assert _picked(await verif_crud.list_validation_candidates(db, now=PICK_NOW)) == [(308, 0)]
+
+
+@pytest.mark.asyncio
+async def test_no_progress_on_another_verdict_does_not_delay_it(db):
+    """Only a not-yet-done row waits on the declaration; cannot-verify keeps its own
+    window and a never-delayed verdict stays undelayed."""
+    await _open(db, 309)
+    await verif_crud.record_attempt(
+        db, repo=REPO, pr_number=309, verdict="pass-mechanical",
+        note="TRACKING PENDING: findings/0 needs an issue", now="2026-10-20T11:59:00+00:00",
+        evidence=_nyd_doc(True), tracking_pending=True,
+    )
+    assert _picked(await verif_crud.list_validation_candidates(db, now=PICK_NOW)) == [(309, 0)]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bad", [0, -1])
 async def test_a_sub_one_day_reattempt_window_is_refused(db, bad):
@@ -1172,3 +1285,121 @@ async def test_candidates_before_the_verdict_columns_treat_every_open_row_as_unt
         await _open(conn, 271, merged="2026-09-02T00:00:00Z")
         rows = await verif_crud.list_validation_candidates(conn, now=PICK_NOW)
     assert [(r["pr_number"], r["tier"]) for r in rows] == [(271, 1), (270, 1)]
+
+
+# ── who recorded it (closed_by / last_attempt_by / recorded_session) ─────
+
+
+async def _open_row(db, pr_number):
+    await verif_crud.open_verification(
+        db, repo=REPO, pr_number=pr_number, pr_title="a", merged_at="2026-09-06T10:00:00Z", now=NOW
+    )
+
+
+@pytest.mark.asyncio
+async def test_close_stamps_the_closing_client_and_session(db):
+    await _open_row(db, 40)
+    assert await verif_crud.close_verification(
+        db, repo=REPO, pr_number=40, verdict="pass-mechanical", reason="verified",
+        evidence="ok", now=NOW, recorded_by="claude", recorded_session="transcript-1",
+    )
+    row = await _row(db, 40)
+    assert (row["closed_by"], row["recorded_session"], row["last_attempt_by"]) == (
+        "claude", "transcript-1", "claude")
+
+
+@pytest.mark.asyncio
+async def test_a_close_is_the_latest_attempt_too(db):
+    # Codex attempted, Claude closed: every latest-attempt field names the close.
+    await _open_row(db, 48)
+    await verif_crud.record_attempt(
+        db, repo=REPO, pr_number=48, verdict="cannot-verify", note="n", now=OLD,
+        recorded_by="codex", recorded_session="thread-1")
+    assert await verif_crud.close_verification(
+        db, repo=REPO, pr_number=48, verdict="pass-mechanical", reason="r", evidence="e",
+        now=NOW, recorded_by="claude", recorded_session="transcript-2")
+    row = await _row(db, 48)
+    assert (row["last_attempt_at"], row["last_attempt_by"], row["closed_by"]) == (
+        NOW, "claude", "claude")
+    assert row["recorded_session"] == "transcript-2"
+
+
+@pytest.mark.asyncio
+async def test_attempts_stamp_the_latest_client_and_never_keep_an_older_session(db):
+    await _open_row(db, 41)
+    stamp = dict(repo=REPO, pr_number=41, verdict="cannot-verify", now=NOW)
+    assert await verif_crud.record_attempt(
+        db, **stamp, note="first", recorded_by="codex", recorded_session="thread-1") == "recorded"
+    assert await verif_crud.record_attempt(
+        db, **stamp, note="second", recorded_by="codex-sealed", recorded_session=None) == "recorded"
+    row = await _row(db, 41)
+    # The second attempt had no session id, so the first session id must not remain.
+    assert (row["last_attempt_by"], row["recorded_session"], row["closed_by"]) == (
+        "codex-sealed", None, None)
+    assert row["status"] == "open"
+
+
+@pytest.mark.asyncio
+async def test_an_unlabelled_write_stamps_nothing(db):
+    await _open_row(db, 42)
+    await verif_crud.record_attempt(
+        db, repo=REPO, pr_number=42, verdict="cannot-verify", note="n", now=NOW,
+        recorded_by="claude", recorded_session="t")
+    assert await verif_crud.close_verification(
+        db, repo=REPO, pr_number=42, verdict="pass-mechanical", reason="r", evidence="e", now=NOW)
+    row = await _row(db, 42)
+    # A caller that does not label its writes leaves the columns as they were.
+    assert (row["closed_by"], row["last_attempt_by"], row["recorded_session"]) == (
+        None, "claude", "t")
+
+
+@pytest.mark.asyncio
+async def test_the_path_rule_labels_a_row_born_closed_and_only_that(db):
+    for number, reason in ((43, "docs-only by path rule, deterministic exemption"), (44, None)):
+        await verif_crud.open_verification(
+            db, repo=REPO, pr_number=number, pr_title="d", merged_at="2026-09-06T10:00:00Z",
+            now=NOW, closed_reason=reason, closed_by="repo-pulse")
+    assert (await _row(db, 43))["closed_by"] == "repo-pulse"
+    assert (await _row(db, 44))["closed_by"] is None
+
+
+async def _pre_attribution_table(conn):
+    for mig in PR_VERIFICATION_MIGRATIONS[:3]:
+        await mig.up(conn)
+    await conn.commit()
+    cur = await conn.execute("PRAGMA table_info(pr_verifications)")
+    assert "closed_by" not in {r[1] for r in await cur.fetchall()}, (
+        "guard-the-guard: the fixture must lack the attribution columns")
+
+
+@pytest.mark.asyncio
+async def test_writers_work_before_the_attribution_columns_exist(tmp_path):
+    """The window where an existing install has the table but not these columns."""
+    async with aiosqlite.connect(str(tmp_path / "pre.db")) as conn:
+        conn.row_factory = aiosqlite.Row
+        await _pre_attribution_table(conn)
+        assert not await verif_crud._attribution_columns_available(conn)
+        assert await verif_crud.open_verification(
+            conn, repo=REPO, pr_number=45, pr_title="d", merged_at="2026-09-06T10:00:00Z",
+            now=NOW, closed_reason="docs-only", closed_by="repo-pulse") == "created"
+        await _open_row(conn, 46)
+        assert await verif_crud.record_attempt(
+            conn, repo=REPO, pr_number=46, verdict="cannot-verify", note="n", now=NOW,
+            recorded_by="claude", recorded_session="t") == "recorded"
+        assert await verif_crud.close_verification(
+            conn, repo=REPO, pr_number=46, verdict="pass-mechanical", reason="r", evidence="e",
+            now=NOW, recorded_by="claude", recorded_session="t")
+        assert (await _row(conn, 46))["status"] == "closed"
+
+
+@pytest.mark.asyncio
+async def test_the_recorded_by_migration_keeps_existing_rows_null_and_reruns_cleanly(tmp_path):
+    async with aiosqlite.connect(str(tmp_path / "upgrade.db")) as conn:
+        conn.row_factory = aiosqlite.Row
+        await _pre_attribution_table(conn)
+        await _open_row(conn, 47)
+        for _ in range(2):
+            await PR_VERIFICATION_MIGRATIONS[3].up(conn)
+        row = await _row(conn, 47)
+        assert (row["closed_by"], row["last_attempt_by"], row["recorded_session"]) == (
+            None, None, None)

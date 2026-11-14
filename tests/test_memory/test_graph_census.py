@@ -45,6 +45,43 @@ def _proc(
         (d / "fd" / str(i)).symlink_to(target)
 
 
+@pytest.fixture(autouse=True)
+def _host_home_as_a_homeless_process_resolves_it(monkeypatch):
+    """The fixture processes carry no HOME, so their Genesis home falls back to
+    the passwd entry, as ``Path.home()`` does. The census host's own home comes
+    from ``genesis_home()``, which under the live closure's private test HOME is
+    another directory, so every such process would read as running another
+    home. Pin the host's home to the one those processes resolve, as it is
+    outside a test run; compared by stat only, never read or written."""
+    import genesis.env
+
+    home = _passwd_genesis_home()
+    if home is not None:
+        monkeypatch.setattr(genesis.env, "genesis_home", lambda: home)
+
+
+def _passwd_genesis_home() -> Path | None:
+    """The Genesis home a process without HOME resolves through the passwd
+    entry; None in a numeric-UID container with no entry, where there is none
+    to pin and tests that never resolve such a process must still run."""
+    import pwd
+
+    try:
+        return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".genesis"
+    except KeyError:
+        return None
+
+
+def test_the_census_home_pin_tolerates_a_missing_passwd_entry(monkeypatch):
+    import pwd
+
+    def no_entry(uid):
+        raise KeyError(f"getpwuid(): uid not found: {uid}")
+
+    monkeypatch.setattr(pwd, "getpwuid", no_entry)
+    assert _passwd_genesis_home() is None
+
+
 @pytest.fixture
 def proc_root(tmp_path) -> Path:
     root = tmp_path / "proc"
@@ -621,7 +658,9 @@ def test_the_default_secrets_file_is_main_checkouts(proc_root, repo, tmp_path, m
     secrets.env, which the census proves by its ctime against the start."""
     r, _, _ = repo
     (r / "secrets.env").write_text("OTHER=1\n")
-    env = {"GENESIS_DB_PATH": str(tmp_path / "live.db")}
+    # A server always carries HOME; one with no home-config file loads the checkout file.
+    (tmp_path / "server-home").mkdir()
+    env = {"GENESIS_DB_PATH": str(tmp_path / "live.db"), "HOME": str(tmp_path / "server-home")}
     p = _census_one(proc_root, repo, tmp_path, main_venv, env, secrets=False)
     assert p["telemetry_off"] is False
     # Changed after the server started (a fresh /proc with an earlier start): unknown.

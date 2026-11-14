@@ -38,6 +38,8 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+_BETWEENNESS_SEED = 42
+
 try:
     import networkx as nx
 
@@ -385,7 +387,10 @@ class NetworkxGraphStore:
             raise GraphUnavailableError(
                 f"the memory database cannot be read — the graph cannot be built: {exc}"
             ) from exc
-        rows = [row for row in fetched if row[0] not in invalid and row[1] not in invalid]
+        rows = sorted(
+            (row for row in fetched if row[0] not in invalid and row[1] not in invalid),
+            key=lambda row: (row[0], row[1], row[2], row[3]),
+        )
 
         # MultiDiGraph, not DiGraph: memory_links' primary key is
         # (source_id, target_id, link_type), so one pair may legitimately carry
@@ -394,6 +399,7 @@ class NetworkxGraphStore:
         # an arbitrary survivor and the strength/link_type filters were
         # evaluated against it.
         G = nx.MultiDiGraph()
+        G.add_nodes_from(sorted({node for row in rows for node in row[:2]}))
         for source_id, target_id, link_type, strength in rows:
             G.add_edge(
                 source_id, target_id,
@@ -525,6 +531,6 @@ class NetworkxGraphStore:
         # Use approximate betweenness for large graphs to avoid blocking
         n_nodes = G.number_of_nodes()
         k = min(200, n_nodes) if n_nodes > 200 else None
-        scores = nx.betweenness_centrality(G, k=k)
+        scores = nx.betweenness_centrality(G, k=k, seed=_BETWEENNESS_SEED)
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return ranked if top_n is None else ranked[:top_n]

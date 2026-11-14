@@ -4,13 +4,16 @@ Cross-tool agent entry point (Codex, Cursor, OpenCode, …). The canonical
 project instructions live in **CLAUDE.md** — read it first; everything below
 is supplementary.
 
-## Codex external-client boundary
+## Codex and Genesis
 
-Codex connects to Genesis through the project `.codex/config.toml` as an
-external MCP client. It can request Genesis capabilities on demand, but it is
-not a Genesis foreground or background session: never register its transcript,
-create a charter for it, send its identifiers to session tools, or add lifecycle
-hooks that make Genesis manage the conversation. See
+Codex connects to Genesis through the project `.codex/config.toml`. An
+owner-operated Codex session gets the same Genesis MCP servers and tools a
+Claude Code session gets (owner ruling); read tools run without a prompt and
+anything that writes, sends, spends or spawns asks first. Its calls are
+recorded as client `codex`. A Codex run Genesis starts unattended keeps a
+restricted read floor. Codex is not yet a registered Genesis session: do not
+register its transcript, create a charter for it, send its identifiers to
+session tools, or add lifecycle hooks; that is a later phase. See
 `.agents/skills/genesis-external-client/SKILL.md` when working through Codex.
 
 ## Deploy and working-tree boundary
@@ -278,6 +281,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - **gitnexus-guide** (`.claude/skills/gitnexus/gitnexus-guide/SKILL.md`) — Use when the user asks about GitNexus itself — available tools, how to query the knowledge graph, MCP resources, graph schema, or workflow reference. Examples: "What GitNexus tools are available?", "How do I use GitNexus?"
 - **gitnexus-impact-analysis** (`.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md`) — Use when the user wants to know what will break if they change something, or needs safety analysis before editing code. Examples: "Is it safe to change X?", "What depends on this?", "What will break?"
 - **gitnexus-refactoring** (`.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md`) — Use when the user wants to rename, extract, split, move, or restructure code safely. Examples: "Rename this function", "Extract this into a module", "Refactor this class", "Move this to a separate file"
+- **inbox-review** (`.claude/skills/inbox-review/SKILL.md`) — Review inbox evaluations with the owner on an explicit request, present evidence-grounded grouped cards, and record the owner's actual dispositions.
 - **integrate-module** (`src/genesis/skills/integrate-module/SKILL.md`) — Turn any external program into a Genesis module via structured discovery, connection mapping, config generation, and verification.
 - **lead-generation** (`src/genesis/skills/lead-generation/SKILL.md`) — Prospect discovery, enrichment, scoring, and reporting against an Ideal Customer Profile
 - **linkedin-comment-strategy** (`src/genesis/skills/linkedin-comment-strategy/SKILL.md`) — This skill should be used when the user asks to "write a comment for this LinkedIn post", "help me respond to this post", "what should I comment on this", "craft a LinkedIn comment", or when Genesis identifies high-value posts in the user's network worth engaging with. Also triggered by "how should I engage on LinkedIn" or "help me be more visible on LinkedIn".
@@ -286,6 +290,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - **linkedin-hook-writer** (`src/genesis/skills/linkedin-hook-writer/SKILL.md`) — This skill should be used when the user asks to "write a hook for my post", "give me opening lines", "help me start this LinkedIn post", "I need a better opener", or when the linkedin-post-writer skill needs strong opening options. Also triggered by "my posts aren't getting clicks" or "how do I get people to read my posts".
 - **linkedin-post-writer** (`src/genesis/skills/linkedin-post-writer/SKILL.md`) — This skill should be used when the user asks to "write a LinkedIn post", "draft a post about", "help me post on LinkedIn", "create LinkedIn content", or when Genesis proactively generates post ideas during surplus compute. Also triggered by content calendar execution or when the user shares a topic they want to write about.
 - **linkedin-profile-optimizer** (`src/genesis/skills/linkedin-profile-optimizer/SKILL.md`) — This skill should be used when the user asks to "optimize my LinkedIn profile", "update my LinkedIn headline", "rewrite my LinkedIn summary", "improve my LinkedIn about section", or when Genesis identifies that the user's profile doesn't align with their current goals or target audience.
+- **model-validation** (`src/genesis/skills/model-validation/SKILL.md`) — Qualify a Genesis routing model or compare a candidate against an incumbent using the isolated qualification runner, approved references and retained billing evidence. Use for model qualification and a qualification campaign; not ordinary routing edits, generic product comparisons or a request to select a model from advertised benchmarks.
 - **obstacle-resolution** (`src/genesis/skills/obstacle-resolution/SKILL.md`) — Resolve obstacles using fallback chains — use when an approach fails, a dependency is unavailable, an API returns errors, or a task is blocked and needs an alternative path forward
 - **onboarding** (`src/genesis/skills/onboarding/SKILL.md`) — First-run onboarding — guides new users through Genesis setup on their first CC session. Configures user profile, essential API keys, Telegram, GitHub backup, and service verification. Triggered automatically while the install is not yet FUNCTIONAL (the setup floor — Claude Code login + an LLM key + an embedding key — is unmet), not merely while ~/.genesis/setup-complete is absent. Re-runnable by asking Genesis to "run setup" or "reconfigure [section]".
 - **osint** (`src/genesis/skills/osint/SKILL.md`) — OSINT investigation — discover, track, and report on people, companies, and technologies
@@ -324,7 +329,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - `browser_click` — Click an element on the current page by CSS selector or text.
 - `browser_collaborate` — Toggle collaborative timing mode.
 - `browser_fill` — Fill a form field on the current page.
-- `browser_fill_card` — Pay with a vault card on the Camoufox checkout page now open, after the owner approves this payment with a Telegram tap. Card values never reach you.
+- `browser_fill_card` — Pay with a vault card on the open Camoufox checkout after the owner's Telegram tap; fills in a separate window and clicks Pay itself. Card values never reach you. Usage and limits: the browser-automation skill, "Money".
 - `browser_navigate` — Navigate to a URL and return an accessibility tree snapshot.
 - `browser_press_key` — Press a keyboard key on the current page.
 - `browser_run_js` — Execute JavaScript in the browser's console on the current page.
@@ -402,7 +407,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - `outreach_poll` — Create a Discord poll via webhook. Returns JSON with message_id.
 - `outreach_preferences` — Get/set user channel preferences and quiet hours.
 - `outreach_queue` — List the 20 most recent SENT outreach messages, newest first.
-- `outreach_send` — Queue a message for delivery. Returns outreach_id.
+- `outreach_send` — Queue a message for delivery. Returns outreach_id or a queued status.
 - `outreach_send_and_wait` — Send a message and wait for user reply. Returns JSON with reply or timeout.
 - `provision_grow` — Grow this VM's or container's capacity — approval-gated.
 - `provision_vzdump` — Take a hypervisor backup (vzdump) of the host VM — approval-gated.

@@ -133,6 +133,8 @@ EXEMPT: dict[tuple[str, str], str] = {
     ("observability/snapshots/deploy_health.py", "scripts/guardian-gateway.sh"): _TIER2,
     ("observability/snapshots/deploy_health.py", "scripts/lib/host_swap.sh"): _TIER2,
     ("observability/snapshots/deploy_health.py", "scripts/lib/cc_tmp_volume.sh"): _TIER2,
+    ("observability/snapshots/deploy_health.py", "scripts/cc_settings_align.sh"): _TIER2,
+    ("observability/snapshots/deploy_health.py", "scripts/setup_claude_config.py"): _TIER2,
     ("observability/snapshots/deploy_health.py", "scripts/deploy_candidates"): (
         "run (`list --json`, read-only) per snapshot for what the deploy manifest lists "
         "and what `live` holds, for the non-paging `live_*` advisories; no validated "
@@ -572,6 +574,7 @@ _FRESH = (
     "scripts/lib/managed_units.py",
     "scripts/lib/update_state_guard.py",
     "scripts/lib/live_move_repair.py",
+    "scripts/lib/live_repair_kit.py",
     "scripts/hooks/bash_allowlist_guard.sh",
     "scripts/hooks/bash_allowlist_lib.sh",
     "scripts/lib/deploy_marker.sh",

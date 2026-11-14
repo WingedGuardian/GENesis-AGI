@@ -20,6 +20,9 @@ import pytest
 from genesis.guardian.remote import GuardianRemote
 from genesis.guardian.sent_log_ingest import ingest_guardian_sent_log
 
+# Real awareness ticks here: keep their git-health and bundle steps off the live install.
+pytestmark = pytest.mark.usefixtures("quiet_live_tick")
+
 _CHAT = -1000000000001  # synthetic
 
 

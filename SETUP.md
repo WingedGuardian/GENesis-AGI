@@ -96,7 +96,8 @@ check every engine file in the venv against digests committed in this repo
 (`scripts/lib/falkordb-engine-digests.txt`, generated from the pinned wheel
 files, never from the installed wheel's own record), copy the engine to
 `~/.genesis/deps/falkordb/<version>-<wheel tag>/`, re-check the copy, and write
-the `genesis-falkordb` user unit, **left disabled**, pointing at that copy. The
+the `genesis-falkordb` user unit pointing at that copy, then **enable and
+start** it (an engine that is already running is left running). The
 unit re-checks the copy's digests every time it starts. The engine never runs
 from the venv, so a later install into the venv cannot change what it runs, and
 a new pin lands in a new directory beside the running one. Copies no unit runs
@@ -114,25 +115,41 @@ before fetching. An existing install below the floor gets that refusal from the
 update after the one that ships this check: that first update still runs its old
 `update.sh`, which merges, then rolls back when the new bootstrap refuses.
 
-The memory graph uses the engine only when `config/graphstore.yaml` selects
-`mode: falkordb`; the default is `networkx`, so an install that never arms it
-loses nothing. To arm it:
+The memory graph reads from the engine by default (`config/graphstore.yaml`
+ships `mode: falkordb`). Where the unit was never rendered (the engine was not
+verified on this machine), reads stay on the in-process NetworkX projection
+quietly, with no warning and no health alert. The installers enable and start
+the unit; if the start fails they print one `WARNING` line and carry on. Check
+it with:
 
 ```bash
-systemctl --user enable --now genesis-falkordb
 systemctl --user status genesis-falkordb
 ```
+
+To keep reads off the engine, set `mode: networkx` in
+`~/.genesis/config/graphstore.local.yaml` (or
+`settings_update("graphstore", {"mode": "networkx"})`). To stop the installers
+from enabling the unit again, add `genesis-falkordb.service` to
+`~/.genesis/config/disabled_timers`, then
+`systemctl --user disable --now genesis-falkordb`.
 
 **An engine that is already running is never switched by an update.** If yours
 runs an older module (for example one an earlier Genesis fetched under
 `~/.genesis/deps`, with a `redis-server` from the upstream apt repository), the
 update keeps its unit as it is and says so. Switch it to the bundled engine
-deliberately, when it suits you:
+deliberately, when it suits you. On a running install `bootstrap.sh` refuses
+(it will not run under a live server), so go through `update.sh`, which stops
+and restarts `genesis-server` around it; `--take-template` makes it re-render
+the unit even when the checkout is already up to date, and saves the old unit
+under `~/.genesis/deploy-backups/`:
 
 ```bash
-GENESIS_FALKORDB_SWITCH=1 ./scripts/bootstrap.sh
+GENESIS_FALKORDB_SWITCH=1 ./scripts/update.sh --take-template genesis-falkordb.service
 systemctl --user restart genesis-falkordb
 ```
+
+On a stopped or fresh install, `GENESIS_FALKORDB_SWITCH=1 ./scripts/bootstrap.sh`
+does the same.
 
 After switching, a `redis-server` you installed only for Genesis is no longer
 used by it; removing it, its apt source and its key is your call.
@@ -246,8 +263,13 @@ Each directory becomes one encrypted archive, `extra/<name>.tar.gpg`. It goes to
 the off-site tier only, never the git tier. Every run builds these archives from
 scratch: a snapshot holds only what that run archived, and nothing is carried
 over from an earlier run. Rebuildable caches (`.venv`, `node_modules`,
-`__pycache__`, …) are always excluded, and `GENESIS_BACKUP_EXTRA_EXCLUDES` adds
-more tar exclude patterns (wildcards allowed), matched at any depth.
+`__pycache__`, …) are always excluded. For any other Python virtualenv below the
+listed directory, whatever it is named (any directory holding `pyvenv.cfg`), only
+every absolute symlink in its `bin/` (normally the interpreter links) is left out,
+because a restore refuses them. The rest of the venv is kept, and the log names
+each link. An absolute link elsewhere in a venv still marks the directory partial.
+`GENESIS_BACKUP_EXTRA_EXCLUDES` adds more tar exclude patterns (wildcards
+allowed), matched at any depth.
 
 A listed directory is skipped with a warning when it:
 - is relative, or outside your home directory;
@@ -279,8 +301,11 @@ archives that list names: a leftover archive in `extra/` is never restored. Back
 test-extracts each archive the way restore will (file contents left out), so it
 knows which members a restore would refuse, such as a symlink that leads outside
 the directory or a FIFO. Such a directory is still archived, but recorded as
-partial: the off-site copy is reported incomplete and the alert names it. Exclude
-those members with `GENESIS_BACKUP_EXTRA_EXCLUDES`. A file that changes while it is being archived (tar exit 1)
+partial: the off-site copy is reported incomplete and the alert names it. The
+status file records each partial directory with its count of refused members by
+reason, and the dashboard's backup warning names them to a signed-in operator
+(never on the unauthenticated status route). Exclude those members with
+`GENESIS_BACKUP_EXTRA_EXCLUDES`. A file that changes while it is being archived (tar exit 1)
 is kept but may be torn, and the log says so; stop a writer whose files must be
 consistent, or exclude them. Without an off-site tier the archives stay local
 only, in the backups checkout, and no off-site alert applies.
@@ -308,6 +333,16 @@ systemctl --user enable --now genesis-backup.timer
 systemctl --user start genesis-backup.service   # fire one run now
 cat ~/.genesis/backup_status.json               # expect "success":true
 ```
+
+The service runs backup.sh at the lowest best-effort I/O priority
+(`IOSchedulingClass=best-effort`, `IOSchedulingPriority=7`). The priority is
+per process and every tool the script starts inherits it. Only an I/O scheduler
+that weighs priority levels (BFQ) can act on it; under `none` or `mq-deadline` the
+level within best-effort has no effect. Whether it reaches BFQ when the filesystem sits on
+device-mapper volumes (LVM), which have no scheduler of their own, is not
+established, so treat any effect on disk contention as unverified. The backup
+that `scripts/update.sh` runs before an update calls backup.sh directly, not
+through the service, so it keeps normal priority.
 
 The status file is also the machine-readable proof used by `scripts/update.sh`.
 Each run records a unique `run_id`, `db_integrity_status`,

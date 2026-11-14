@@ -393,14 +393,60 @@ def _is_introspection_only(config) -> bool:
     )
 
 
-pytest_plugins = ["tests._live_fence", "tests._live_closure", "tests._live_outbound"]
+pytest_plugins = [
+    "tests._live_fence",
+    "tests._live_closure",
+    "tests._live_outbound",
+    "tests._live_writes",
+]
+
+
+@contextlib.contextmanager
+def _placed_by_the_real_home():
+    """HOME set back to what it was as the run started while the box lock and
+    basetemp are placed, so both keep exactly the locations ``Path.home()`` gives
+    them without the live closure's private test HOME; restored after.
+
+    HOME as the run started, not the passwd entry: the two differ under
+    ``sudo -E`` or an overridden HOME, and the lock and basetemp follow HOME. A
+    run that started with HOME unset gets it unset again, so ``Path.home()``
+    falls back to the passwd entry as it would have.
+
+    Only CALL-time resolution may run inside. The modules the placement uses are
+    imported before entering: ``genesis.util``'s package init imports
+    ``process_lock``, which binds ``Path.home()`` at import, so importing it in
+    here would bind the real home for the whole run.
+
+    It undoes only the closure's own redirect: a HOME something else set (a test
+    driving this hook with its own HOME) is left alone."""
+    from tests import _live_closure
+
+    before = _live_closure._S.home_before
+    saved = os.environ.get("HOME")
+    if _live_closure._S.home and saved == _live_closure._S.home:
+        if before is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = before
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = saved
 
 
 def pytest_configure(config):
-    _configure_lock_and_basetemp(config)
+    # Imported under the test HOME, never inside the real-home window below.
+    import genesis.util.pytest_lock  # noqa: F401
+    import genesis.util.tmp  # noqa: F401
+
+    with _placed_by_the_real_home():
+        _configure_lock_and_basetemp(config)
     # Armed AFTER the lock (a run refused by it exits above) and after basetemp is
     # placed (the fence allows fakes under it). See tests/_live_fence.py.
-    from tests import _live_closure, _live_fence, _live_outbound
+    from tests import _live_closure, _live_fence, _live_outbound, _live_writes
 
     _live_fence.install(config)
     # Live state paths and endpoints out of the environment, before any test runs
@@ -409,6 +455,9 @@ def pytest_configure(config):
     # In-process connects to live services on this machine, refused as on CI
     # (reads the real home the live fence resolved). See tests/_live_outbound.py.
     _live_outbound.install(config)
+    # Writes into the real home outside the test's temp dirs, reported (not
+    # failed). See tests/_live_writes.py.
+    _live_writes.install(config)
 
 
 def _configure_lock_and_basetemp(config):
@@ -517,6 +566,16 @@ def pytest_unconfigure(config):
 
         _live_fence.uninstall_files(config)
         _live_closure.uninstall_files(config)
+        # The session's test HOME (tests/_live_closure.py), recorded on the config
+        # the closure installed on: a test that drives this hook with its own
+        # config never reaches the live one. Forced removal: tests leave
+        # read-only trees (git objects) in it.
+        home = getattr(config, "_genesis_live_home_cleanup", None)
+        if home:
+            try:
+                _force_rmtree(home)
+            except Exception as exc:  # noqa: BLE001 — best-effort, as below
+                _warn_without_escalating(f"genesis: cleanup of the test HOME {home} failed ({exc!r}).")
         if target:
             # BROAD for the same reason as pytest_configure's fallback: a hook that
             # raises turns a passing suite into exit 1, and cleanup is best-effort.
@@ -772,6 +831,34 @@ def _isolate_override_log(tmp_path):
     mp.delenv("GENESIS_DISCARD_SNAPSHOT_LOG", raising=False)
     yield
     mp.undo()
+
+
+# ── Safety: a REAL awareness tick must not touch the live repo or Guardian ────
+@pytest.fixture()
+def quiet_live_tick():
+    """For a test that runs a real ``AwarenessLoop._on_tick()``: the tick's git
+    steps act on the live install, not on anything the test owns. The cheap git
+    health check writes the Guardian's ``git_health.json`` verdict (under
+    ``~/.genesis/shared``) and a probe file into the repository's shared ``.git``;
+    the bundle publish replaces the Guardian's recovery bundle with this
+    checkout's HEAD; the deep check runs fsck. Each becomes a no-op here. Their
+    own tests (``tests/test_awareness/test_git_health_check.py``,
+    ``tests/test_guardian/test_repo_bundle*.py``) drive them against temp repos."""
+    import genesis.awareness.loop as loop_mod
+
+    async def _no_check(*_a, **_k):
+        return None
+
+    # A fixture-owned MonkeyPatch, as the other safety fixtures here use: a test's
+    # own monkeypatch.undo() must not lift this protection mid-test.
+    mp = pytest.MonkeyPatch()
+    mp.setattr(loop_mod, "_check_git_health", _no_check)
+    mp.setattr(loop_mod, "_publish_repo_bundle_if_due", _no_check)
+    mp.setattr(loop_mod, "_dispatch_git_health_deep", lambda *_a, **_k: None)
+    try:
+        yield
+    finally:
+        mp.undo()
 
 
 # ── Safety: prevent tests from writing to the REAL genesis.db ────────────────

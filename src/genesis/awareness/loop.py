@@ -567,7 +567,9 @@ _FALKORDB_STAND_DOWN = (
     "~/.genesis/config/graphstore.local.yaml) — while `mode: falkordb` is "
     "selected, memory-graph reads depend on the engine, every recall falls back "
     "to NetworkX with a warning, and the health probe reports it DOWN — then "
-    "`systemctl --user disable --now genesis-falkordb`. This alert reads the "
+    "`systemctl --user disable --now genesis-falkordb`, and list "
+    "`genesis-falkordb.service` in ~/.genesis/config/disabled_timers so the "
+    "installers do not enable it again. This alert reads the "
     "infrastructure profile, refreshed at boot and daily, so after either fix "
     "take a refresh (`infrastructure_profile(refresh=true)`) and it clears at "
     "the next hourly posture check"
@@ -918,10 +920,10 @@ def _infra_missing_protections(profile: dict) -> list[str]:
             missing.append("cc_tmp_apply_blocked_on_cc")
         else:
             missing.append("cc_tmp_shared_fs")
-    # Graph engine. An unselected, disabled or stopped engine is the deliberate
-    # default (reads use the in-process NetworkX projection), so it stays
-    # silent — alerting there would fire on every install that has simply not
-    # adopted it. Three states are wrong. Active-without-a-socket: systemd
+    # Graph engine. An unselected engine (no unit, so the shipped falkordb
+    # default reads quietly from NetworkX; or an overlay pinning networkx) stays
+    # silent when disabled or stopped — alerting there would fire on every
+    # install that never provisioned it. Three states are wrong. Active-without-a-socket: systemd
     # reports the service healthy while every reader would fail to connect.
     # Armed-and-failed: the unit is Type=notify, so a module that will not load
     # (or a redis that never signals readiness) never reaches `active` at all —
@@ -1842,8 +1844,23 @@ _DEPLOY_REPAIR_CLASSES = frozenset(
         "live_repair_unread_older",
         "live_repair_unresolved",
         "live_repair_refused",
+        "live_repair_hooks_pending",
+        "live_repair_hooks_saved",
+        "live_repair_kit",
     }
 )
+#: What each live_repair_kit finding means (deploy_health._KIT_FINDINGS).
+_DEPLOY_KIT_STATES = {
+    "missing": "is not installed (no `current` link, or a dangling one), so genesis-server "
+    "starts without its boot repair",
+    "partial": "is missing files its KIT.json lists, so the boot repair may not run",
+    "corrupt": "holds a file that differs from what was installed (or no valid KIT.json), "
+    "so the boot repair may fail or run code nobody installed",
+    "foreign": "is not the installer's (its `current` is not a link into live-repair.d), "
+    "yet the boot repair runs whatever it holds",
+    "stale": "is not the deploy checkout's HEAD (a pull no install followed, or a rollback "
+    "past it), so the boot repair runs other code than the checkout's",
+}
 #: Classes that alone are routine (a medium observation, not a blocker).
 _DEPLOY_INFORMATIONAL_CLASSES = frozenset({"behind_upstream", "live_repair_unread_older"})
 
@@ -1862,6 +1879,11 @@ def _deploy_repair_identity(repairs: dict) -> str:
         "refused": repairs.get("refused"),
         "unread_older": repairs.get("unread_older"),
     }
+    for key in ("hooks_pending", "hooks_saved"):  # only when set: a deploy must not
+        if repairs.get(key):  # re-raise every standing alert
+            named[key] = repairs[key]
+    if repairs.get("kit") in _DEPLOY_KIT_STATES:  # the kit finding, as above
+        named["kit"] = repairs["kit"]
     return hashlib.sha256(json.dumps(named, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
@@ -1905,27 +1927,65 @@ def _deploy_repair_paragraph(repairs: dict) -> str:
             + " Restoring puts the saved files back as uncommitted edits: tracked ones make "
             "deploy_code_only.sh and update.sh refuse to deploy until they are committed "
             "(on a branch, as a PR), moved out, or removed; untracked ones block "
-            "deploy_code_only.sh only under src/, config/ or pyproject.toml. Backups are "
-            "pruned 90 days after the last write to their folder."
+            "deploy_code_only.sh only under src/, config/ or pyproject.toml. A report "
+            "nobody restored or dismissed is never pruned; a restored or dismissed one, "
+            "and other backups, are pruned 90 days after the last write to their folder."
         )
     refused = repairs.get("refused") or 0
     if refused:
         parts.append(
             f"{refused} live-move repair report(s) under ~/.genesis/deploy-backups/ could "
-            "not be read; they are named in the server log."
+            "not be read; they are named in the server log, and each is kept with its "
+            "saved files until `scripts/deploy_candidates repair-move --dismiss <ts>` "
+            "dismisses it (once the installed repair kit includes it; an older kit "
+            "refuses an unreadable report)."
         )
     unread = repairs.get("unread_older") or 0
     if unread:
         parts.append(
             f"{unread} older live-move repair report dir(s) not read, dismissed ones included "
-            "(only the newest are read); this is informational, and they are pruned with "
-            "their backups."
+            "(only the newest are read); one nobody restored or dismissed is kept with "
+            "its backups, the others are pruned 90 days after their last write."
+        )
+    hooks = repairs.get("hooks_pending") or 0
+    if hooks:
+        parts.append(
+            f"{hooks} live-move repair(s) finished a killed rollback but could not put the "
+            "git hooks back yet (readiness refuses every rebuild until it does); every later "
+            "run of scripts/deploy_candidates repair-move retries."
+        )
+    replaced = [
+        r
+        for r in repairs.get("reports") or []
+        if isinstance(r, dict) and r.get("hooks_saved") and not r.get("dismissed")
+    ]
+    if replaced:
+        parts.append(
+            "A live-move repair reinstalled the git hooks of the code that ran before the "
+            "update and moved the installed ones that differed aside (a hand-edited hook's "
+            "only copy may be among them): "
+            + " ".join(
+                f"repair {r['ts']}: {r['backup_dir']}/hooks-before; once you have what you "
+                f"want from it, scripts/deploy_candidates repair-move --dismiss {r['ts']}."
+                for r in replaced
+            )
+            + " The report is kept until it is dismissed."
         )
     if repairs.get("unresolved"):
         parts.append(
             "The last live-move repair did not finish (it was killed partway, or its "
             "REPAIR.json under ~/.genesis/deploy-backups/ names the reason); "
             "scripts/deploy_candidates repair-move runs it again."
+        )
+    kit = repairs.get("kit")
+    if kit in _DEPLOY_KIT_STATES:
+        parts.append(
+            "The live-move repair kit under ~/.genesis/lib/live-repair/ (what heals a "
+            f"half-written `live` checkout at boot, and what repair-move runs) {_DEPLOY_KIT_STATES[kit]}."
+            " To reinstall it from the deploy checkout's HEAD: python3 -I -S "
+            "<repo>/scripts/lib/live_repair_kit.py install <repo> <home> (<repo> the deploy "
+            "checkout, <home> the HOME holding ~/.genesis); bootstrap.sh and "
+            "deploy_code_only.sh run the same install."
         )
     return " ".join(parts)
 
@@ -3921,6 +3981,9 @@ async def perform_tick(
                         # Recent: 27.0/day") so downstream consumers can't misread
                         # a symmetric deviation score's direction.
                         **({"baseline_note": s.baseline_note} if s.baseline_note else {}),
+                        # Additive: a collector's stub reading on error. Without
+                        # it a later comparison reads the stub as a real value.
+                        **({"failed": True} if s.failed else {}),
                     }
                     for s in signals
                 ]

@@ -1,0 +1,32 @@
+[Unit]
+Description=Genesis persistent live agent (local owner controls)
+After=network.target
+StartLimitBurst=4
+StartLimitIntervalSec=120
+# Opt-in: bootstrap and update render this file, without enabling or starting it.
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO_DIR__
+ExecStart=:/bin/sh -c 'exec "$@"' -- "__VENV_EXEC__/bin/python" -m genesis.live_agent
+EnvironmentFile=__REPO_DIR__/secrets.env
+# Quoted with the _EXEC escapes: an unquoted value splits at a space into
+# invalid assignments, which systemd-analyze verify reports but exits 0 on.
+Environment="PATH=__VENV_EXEC__/bin:__CC_BIN_EXEC__:__HOME_EXEC__/.npm-global/bin:__HOME_EXEC__/.local/bin:/usr/local/bin:/usr/bin:/bin"
+RuntimeDirectory=genesis-live-agent
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+Restart=on-failure
+RestartSec=10
+KillMode=mixed
+# The project's default floor (build-session Timeout Policy): stop waits for the
+# SDK session to close; database waits and SDK teardown carry their own bounds.
+TimeoutStopSec=7200
+LimitCORE=0
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

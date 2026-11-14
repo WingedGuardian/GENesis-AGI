@@ -268,7 +268,10 @@ def _load_skill_catalog() -> str | None:
     except (json.JSONDecodeError, OSError):
         return None
 
-    all_skills = data.get("tier1", []) + data.get("tier2", [])
+    all_skills = [
+        skill for skill in data.get("tier1", []) + data.get("tier2", [])
+        if skill.get("disable-model-invocation") is not True
+    ]
     if not all_skills:
         return None
 
@@ -295,21 +298,24 @@ def _get_skill_catalog() -> dict:
     global _skill_catalog_cache, _skill_name_index
     if _skill_catalog_cache is not None:
         return _skill_catalog_cache
-    if _CATALOG_PATH.exists():
-        try:
-            _skill_catalog_cache = json.loads(
-                _CATALOG_PATH.read_text(encoding="utf-8"),
-            )
-            # Build name index for O(1) lookup
-            _skill_name_index = {}
-            for skill in (
-                _skill_catalog_cache.get("tier1", [])
-                + _skill_catalog_cache.get("tier2", [])
-            ):
-                _skill_name_index[skill.get("name", "").lower()] = skill
-            return _skill_catalog_cache
-        except (json.JSONDecodeError, OSError):
-            pass
+    try:
+        data = json.loads(
+            _CATALOG_PATH.read_text(encoding="utf-8"),
+        )
+        if not isinstance(data, dict):
+            return {}
+        # Build name index for O(1) lookup
+        _skill_name_index = {}
+        for tier in ("tier1", "tier2"):
+            entries = data.get(tier, [])
+            for skill in entries if isinstance(entries, list) else []:
+                name = skill.get("name") if isinstance(skill, dict) else None
+                if isinstance(name, str):
+                    _skill_name_index[name.lower()] = skill
+        _skill_catalog_cache = data
+        return _skill_catalog_cache
+    except (ValueError, OSError, RecursionError):
+        pass
     return {}
 
 
@@ -348,7 +354,14 @@ async def load_step_resources(
     for skill_name in step.get("skills", []):
         if not isinstance(skill_name, str):
             continue
+        _get_skill_catalog()
         delegated_name = _LEGACY_STEP_SKILL_DELEGATES.get(skill_name.lower())
+        # Apply before either loading path, including required delegation.
+        if any(
+            (_skill_name_index or {}).get(name, {}).get("disable-model-invocation") is True
+            for name in (skill_name.lower(), delegated_name) if name
+        ):
+            continue
         if delegated_name:
             skill_file, content = _load_required_step_skill(skill_name.lower())
             injected = _bounded_skill_content(

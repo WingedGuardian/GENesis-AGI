@@ -106,6 +106,10 @@ services. The disposition labels are the final roll-up, not the analysis.
 2. **Separate evidence from inference.** Identify what the source demonstrates,
    what the live Genesis map/code demonstrates, what you infer, and what remains
    unknown. Do not turn a source claim or a plausible analogy into a fact.
+   Before deciding, assemble a compact source-facts dossier: the distinctive
+   method, demonstrated versus claimed results, limitations, and relevant
+   maturity/license facts. Missing facts stay unknown. Treat the user's supplied
+   explanation of why it matters as a hypothesis to investigate.
 3. **Compare mechanism by mechanism.** A product can duplicate one Genesis
    capability and still contain a valuable mechanism Genesis lacks. Rejecting
    the package or vendor does not dispose of each mechanism inside it.
@@ -169,6 +173,7 @@ a scoring axis is unremarkable, skip it here.}
 
 ```yaml
 action: ADAPT              # ADOPT | ADAPT | WATCH | IGNORE (default toward ADOPT/ADAPT; WATCH needs a named trigger)
+why_not_adopt: "Reuse option considered; concrete reason direct integration loses to adaptation" # Required for ADAPT
 next_step: "One concrete sentence — what specifically to do next"
 effort: Small              # Trivial | Small | Medium | Large
 scope: V4                  # V4 (do now — DEFAULT) | V5 (sequenced behind named work) | Future (named blocker) | Never (philosophy conflict)
@@ -179,6 +184,13 @@ architecture_impact: extends  # validates | extends | challenges | irrelevant
 Rules:
 - REQUIRED on every evaluation. No exceptions.
 - The `action` field must match your recommendation in the Summary.
+- For ADAPT, `why_not_adopt` must name the reusable option considered and the
+  evidence for choosing adaptation over direct use or integration (including a
+  wrapper, CLI or service). A language/runtime difference alone is not a veto.
+  Label unverified assumptions and name the check needed. If no adoptable
+  candidate was found, state the search and its limits; if none was run, say so.
+  For an abstract idea, explain that no usable tool was evaluated rather than
+  inventing an option or a blocker.
 - `next_step` must be a single concrete sentence. "Investigate further" is
   not concrete. "Extract their prompt-versioning schema and compare to
   genesis.memory.prompt_versions table" is concrete.
@@ -186,6 +198,13 @@ Rules:
   to any active skill in `src/genesis/skills/`. A shallow source can raise an
   important idea. Evaluate the idea, not the container. If the topic matters,
   research it and rate the underlying concept — even if the source itself is thin.
+
+### Evidence
+
+{Concise model-reported record: distinctive source claim and a short supporting
+quote from acquired text (prefix each quoted line with `> `), or the acquisition
+limitation; cited current Genesis mechanism; labelled inference and unknowns.
+This is not mechanical verification. Keep qualifications in durable findings.}
 
 ### Overlap Comparison
 

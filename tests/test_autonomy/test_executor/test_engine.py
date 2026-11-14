@@ -1739,3 +1739,38 @@ class TestRunGitPushBounded:
         with pytest.raises(asyncio.CancelledError):
             await task
         assert killpg_calls and killpg_calls[0][0] == 88889
+
+
+@pytest.mark.asyncio
+async def test_review_error_blocks_without_fixup_and_resumes_completed_steps(
+    db, plan_file, mock_invoker, mock_decomposer, mock_reviewer, mock_subprocess,
+):
+    await _seed_task(db, plan_path=plan_file)
+    # A duck-typed result lets the regression reach the engine before the new
+    # optional field exists in VerifyResult.
+    result = MagicMock(passed=False, review_error="Fresh-eyes review remained invalid",
+                       skipped_reason=None, programmatic_issues=[],
+                       fresh_eyes_feedback=None, adversarial_feedback=None)
+    mock_reviewer.verify_deliverable.return_value = result
+    seen = []
+    async def notified(request):
+        task = await task_states.get_by_id(db, "t-001")
+        if task["current_phase"] == "blocked":
+            seen.append(json.loads(task["blockers"]))
+    outreach = AsyncMock()
+    outreach.submit.side_effect = notified
+    engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer,
+                          outreach_pipeline=outreach)
+    with patch("genesis.autonomy.executor.engine._dispatch.create_fixup_step") as fixup:
+        assert await engine.execute("t-001") is False
+        fixup.assert_not_called()
+    mock_reviewer.verify_deliverable.assert_awaited_once()
+    assert seen and seen[-1]["resume_phase"] == "verifying"
+    assert seen[-1]["description"] == result.review_error
+    steps = await task_steps.get_steps_for_task(db, "t-001")
+    assert len(steps) == 3 and all(s["status"] == "completed" for s in steps)
+    before = mock_invoker.run.await_count
+    mock_reviewer.verify_deliverable.return_value = VerifyResult(passed=True)
+    assert await engine.execute("t-001") is True
+    assert mock_invoker.run.await_count == before
+    assert mock_decomposer.decompose.await_count == 1

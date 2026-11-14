@@ -46,6 +46,10 @@ CHOKEPOINT = "util/codex_cli.py"
 ALLOWED = {
     "runtime/init/process_reaper.py": 2,  # pgrep pattern and label for orphan reaping
     "contribution/review.py": 1,  # reviewer="codex" label on a ReviewResult
+    "caller_context.py": 2,  # client label -> "Codex session" for restart wording
+    # Stops MCP children of a running app-server, never starts Codex: the argv[0]
+    # match, the ~/.codex helper home, and four lines of user-facing text.
+    "sentinel/codex_mcp_stop.py": 6,
 }
 _LOG_METHODS = frozenset({"debug", "info", "warning", "error", "exception", "critical", "log"})
 

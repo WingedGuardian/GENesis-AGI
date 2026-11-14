@@ -708,16 +708,30 @@ def forward_message_is_true(text: str) -> None:
             assert "bootstrap never ran on" in s, s
 
 
-def test_sf1_a_forward_mixed_tree_is_finished_with_post_merge(guard, live):
+def live_forward_message_is_true(text: str) -> None:
+    """HEAD on `live` at the rebuilt tip, a rollback killed partway: the remedy
+    is the repair, which finishes that rollback TOWARD THE TAG (#3492 PR D1f;
+    never toward the tip, which bootstrap never ran on). It never recommends
+    --post-merge, and never offers Dismiss without saying the checkout then
+    holds code bootstrap never ran on (SF1)."""
+    assert "scripts/deploy_candidates repair-move" in text, text
+    assert "finishes the rollback that was killed" in text, text
+    assert not post_merge_advice(text), text
+    for s in _sentences(text):
+        if "Dismiss" in s:
+            assert "bootstrap never ran on" in s, s
+
+
+def test_sf1_a_forward_mixed_tree_on_live_is_repaired_toward_the_tag(guard, live):
     """SF1: HEAD at the target, a tag-side file written by a rollback killed
-    partway. Restoring to HEAD puts the FORWARD tree back, so the remedy is to
-    finish with --post-merge; a bare Dismiss would drop the only guard against
-    restarting onto code bootstrap never ran on."""
+    partway. The remedy is the repair, which puts the paths back toward the tag
+    and moves `live` back to it; a bare Dismiss would drop the only guard
+    against restarting onto code bootstrap never ran on."""
     _git(live["root"], "checkout", "-q", "-B", "live", live["new"])
     (live["root"] / "O").write_text("o\n")
     r = _cli(live, _state(live, live_row(live, "done")))
     assert r.returncode == 4, r.stdout + r.stderr
-    forward_message_is_true(r.stdout)
+    live_forward_message_is_true(r.stdout)
 
 
 def test_sf1_a_tag_side_mixed_tree_never_recommends_post_merge(guard, live):
@@ -813,7 +827,7 @@ def test_sf4_a_rollback_killed_after_adoption_is_a_mixed_tree(guard, live):
     assert verdict == "mixed_tree" and "  ?? O" in reason, reason
     r = _cli(live, live["home"] / "update_state.json")
     assert r.returncode == 4
-    forward_message_is_true(r.stdout)
+    live_forward_message_is_true(r.stdout)
 
 
 def test_sf4_a_clean_adopted_row_reads_as_before(guard, live):
@@ -1416,3 +1430,52 @@ def test_the_guards_git_runs_no_fsmonitor_the_repository_names(guard, repo, tmp_
     mark.unlink()
     subprocess.run(status, capture_output=True, env=guard._env())
     assert not mark.exists(), "the guard's git environment still runs fsmonitor"
+
+
+# ── T-D35: the boot repair's absolute deadline (#3492 D2a-2) ─────────────────
+
+# SPY_*, not GIT_*: the guard's _env() drops every GIT_* variable (#4501 review).
+_SLOW_GIT = """#!/bin/sh
+echo "$@" >> "$SPY_GIT_CALLS"
+[ -n "$SPY_GIT_SLEEP" ] && exec sleep "$SPY_GIT_SLEEP"
+exec {git} "$@"
+"""
+
+
+def _spy_git(tmp_path: Path, monkeypatch, sleep: str = "") -> Path:
+    bin_dir = tmp_path / "spybin"
+    bin_dir.mkdir()
+    (bin_dir / "git").write_text(_SLOW_GIT.format(git=shutil.which("git")))
+    (bin_dir / "git").chmod(0o755)
+    calls = tmp_path / "git_calls"
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("SPY_GIT_CALLS", str(calls))
+    monkeypatch.setenv("SPY_GIT_SLEEP", sleep)
+    return calls
+
+
+def test_td35_a_deadline_already_past_starts_no_git(guard, live, tmp_path, monkeypatch):
+    """Past the boot deadline no call is started: TimeoutExpired, which every
+    caller already reads as "keep the state"."""
+    calls = _spy_git(tmp_path, monkeypatch)
+    guard._DEADLINE = time.monotonic() - 1
+    with pytest.raises(subprocess.TimeoutExpired):
+        guard.state_verdict(live_row(live), str(live["root"]))
+    assert not calls.exists(), calls.read_text()
+
+
+def test_td35_every_git_call_shares_one_deadline(guard, live, tmp_path, monkeypatch):
+    """Seven call sites each with _TIMEOUT_S would wait their sum; with the
+    deadline set they share what is left of it."""
+    calls = _spy_git(tmp_path, monkeypatch, sleep="30")
+    guard._DEADLINE = time.monotonic() + 2
+    start = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        guard.state_verdict(live_row(live), str(live["root"]))
+    assert time.monotonic() - start < 2.5
+    assert calls.exists(), "the spy git never ran: the deadline was not what stopped it"
+
+
+def test_td35_no_deadline_is_the_plain_timeout(guard):
+    assert guard._DEADLINE is None
+    assert guard._t(1) == guard._TIMEOUT_S

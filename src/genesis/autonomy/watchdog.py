@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import math
 import os
 import py_compile
 import subprocess
@@ -49,6 +50,12 @@ logger = logging.getLogger(__name__)
 # runs only while pressure is already high.
 _IO_CULPRIT_TOP_N = 5
 _IO_CULPRIT_SAMPLE_S = 1.0
+# How far ahead of now a persisted restart timestamp may sit and still count.
+# A later one (a corrupt write, or a clock that jumped forward and was then
+# corrected) makes `now - ts` negative: the flap window counts it on every tick
+# and neither prune ever removes it, so the target would never be restarted.
+# The slack absorbs ordinary clock adjustment between two writes.
+_FUTURE_TS_SLACK_S = 300.0
 
 
 def _rate(bytes_per_s: float) -> str:
@@ -198,6 +205,16 @@ class WatchdogChecker:
         # 0.5. Quick check: is the bridge process even running?
         bridge_active = self._is_bridge_active()
         if bridge_active is False:
+            starting = self._unit_starting()
+            if starting:
+                # A unit's start step (the boot repair of #3492, for one) is
+                # still running; a restart now would SIGTERM it. systemd's own
+                # TimeoutStartSec bounds it, so nothing is recorded here.
+                logger.info(
+                    "systemd is starting %s (%s); its own start bounds that",
+                    self._target_service, starting,
+                )
+                return WatchdogAction.SKIP
             if self._bridge_exited_unconfigured():
                 logger.info(
                     "%s exited unconfigured (exit 2) — skipping restart",
@@ -662,6 +679,27 @@ class WatchdogChecker:
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return None  # Can't determine — don't block on this
 
+    def _unit_starting(self) -> str | None:
+        """The target's SubState while systemd runs its FIRST start attempt
+        (a start step, NRestarts 0, entered under _STARTING_BOUND_S ago),
+        else None. Once systemd has restarted the unit itself (a start that
+        times out every time loops through auto-restart and never reaches
+        ``failed``), the check falls through and counts it as a failure, so
+        the loop still escalates. An explicit restart sets NRestarts back to
+        0 (MEASURED); the ``start`` restart_bridge issues joins the job and
+        does not."""
+        unit = _unit_state(self._target_service)
+        if unit is None or unit.get("ActiveState") != "activating":
+            return None
+        if unit.get("SubState") not in _START_STEPS or unit.get("NRestarts") != "0":
+            return None
+        try:
+            since = int(unit["StateChangeTimestampMonotonic"]) / 1e6
+        except (KeyError, ValueError):
+            return None
+        # The same clock as systemd's *TimestampMonotonic (MEASURED).
+        return unit.get("SubState", "?") if time.monotonic() - since < _STARTING_BOUND_S else None
+
     def _bridge_exited_unconfigured(self) -> bool:
         """Check if the target service exited with code 2 (unconfigured — missing secrets.env)."""
         try:
@@ -968,6 +1006,7 @@ class WatchdogChecker:
         """
         history = state.get("restart_history") or []
         if isinstance(history, list):
+            latest_ts = time.time() + _FUTURE_TS_SLACK_S
             kept = []
             for entry in history:
                 if not isinstance(entry, dict):
@@ -976,15 +1015,30 @@ class WatchdogChecker:
                 # bool is a subclass of int; a True timestamp is not a time.
                 if isinstance(ts, bool) or not isinstance(ts, (int, float)):
                     continue
-                if entry.get("reason") in _LEGACY_REASONS:
-                    entry["reason"] = _LEGACY_REASONS[entry["reason"]]
+                # A number can still break the readers: JSON round-trips
+                # Infinity (an infinite flap deadline, so BACKOFF forever) and
+                # integers too large for a float (`now - ts` raises
+                # OverflowError). math.isfinite raises on the latter.
+                try:
+                    if not math.isfinite(ts):
+                        continue
+                except OverflowError:
+                    continue
+                # A finite timestamp in the future is just as unreadable: the
+                # flap window would count it forever (see _FUTURE_TS_SLACK_S).
+                if ts > latest_ts:
+                    continue
+                reason = entry.get("reason")
+                if isinstance(reason, str) and reason in _LEGACY_REASONS:
+                    entry["reason"] = _LEGACY_REASONS[reason]
                 kept.append(entry)
             state["restart_history"] = kept
         else:
             # Not even a list — the shape below it cannot be trusted either.
             state["restart_history"] = []
-        if state.get("last_reason") in _LEGACY_REASONS:
-            state["last_reason"] = _LEGACY_REASONS[state["last_reason"]]
+        last_reason = state.get("last_reason")
+        if isinstance(last_reason, str) and last_reason in _LEGACY_REASONS:
+            state["last_reason"] = _LEGACY_REASONS[last_reason]
         return state
 
     def _save_state(self, state: dict) -> bool:
@@ -1405,6 +1459,28 @@ def _wait_until_active(
     return False
 
 
+#: Longer than one whole start of the server unit: TimeoutStopSec 90 +
+#: TimeoutStartSec 90 + RestartSec 10. SubState changes reset the clock.
+_STARTING_BOUND_S = 300
+_START_STEPS = ("start-pre", "start", "start-post")
+
+
+def _unit_state(service: str) -> dict[str, str] | None:
+    """ActiveState, SubState, NRestarts and StateChangeTimestampMonotonic of
+    *service*, or None when systemctl cannot be read (AttributeError and
+    TypeError: a test double's stdout that is not text)."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", service, "-p", "ActiveState", "-p", "SubState",
+             "-p", "NRestarts", "-p", "StateChangeTimestampMonotonic"],
+            capture_output=True, text=True, timeout=5, env=systemctl_env(),
+        )
+        lines = result.stdout.splitlines()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, AttributeError, TypeError):
+        return None
+    return dict(ln.split("=", 1) for ln in lines if "=" in ln) or None
+
+
 def restart_bridge(service: str = "genesis-server.service", *, timeout_s: int = 120) -> int:
     """Restart the specified Genesis service via systemctl. Returns exit code.
 
@@ -1427,14 +1503,21 @@ def restart_bridge(service: str = "genesis-server.service", *, timeout_s: int = 
     safety net — never the deprecated relay unit. (Name kept for call-site
     stability; it acts on ``service``, the auto-detected target.)
     """
-    logger.info("Restarting %s via systemctl...", service)
+    # A unit that is not active is STARTED: a start joins a start job already
+    # running (the boot repair in its start step) and never stops it, waits for
+    # an auto-restart's own timer, and on a failed or inactive unit does what a
+    # restart would. A restart would SIGTERM that step (MEASURED, #3492 D2a-2).
+    unit = _unit_state(service)
+    state = unit.get("ActiveState") if unit is not None else None
+    verb = "start" if state in ("activating", "inactive", "failed") else "restart"
+    logger.info("Restarting %s via systemctl %s...", service, verb)
     try:
         result = subprocess.run(
-            ["systemctl", "--user", "restart", service],
+            ["systemctl", "--user", verb, service],
             capture_output=True, text=True, timeout=timeout_s, env=systemctl_env(),
         )
         if result.returncode == 0:
-            logger.info("%s restart command succeeded", service)
+            logger.info("%s %s command succeeded", service, verb)
             return 0
         logger.error("%s restart returned %d: %s — verifying actual state",
                      service, result.returncode, result.stderr)

@@ -34,6 +34,10 @@ SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+# The interpreter running this reader, for the commands it prints: those need
+# the same packages (aiosqlite), which a bare `python3` may lack.
+_PY = shlex.quote(sys.executable)
+
 
 def _print_verification_backlog(db_path: str | None) -> None:
     """The pr_verifications day-one reader: open obligations in BACKLOG order —
@@ -160,7 +164,7 @@ def _print_verification_backlog(db_path: str | None) -> None:
     _print_rechecks_due(due, db_path=resolved)
     print(f"pr_verifications: {open_total} open, {histogram.get('closed', 0)} closed ({resolved})")
     print(
-        "  close one: python3 scripts/pr_verification.py close --pr <N> "
+        f"  close one: {_PY} scripts/pr_verification.py close --pr <N> "
         "--evidence-file <doc.json> [--note <why>]  (the verdict is derived from the "
         "document; run `pr_verification.py print-schema` for a template)   "
         "(--verification-log --pr <N> shows what was decided, on any row)"
@@ -206,7 +210,7 @@ def _print_rechecks_due(due: list[dict] | None, *, db_path: Path | str | None = 
         print(f"      {r.get('detail')}")
         print(f"      recheck: {r.get('recheck')}")
         print(
-            f"      record : python3 scripts/pr_verification.py recheck --pr {r['pr_number']} "
+            f"      record : {_PY} scripts/pr_verification.py recheck --pr {r['pr_number']} "
             f"--index {r['index']} --result-file <result.json>{target_db}"
         )
 
@@ -362,6 +366,9 @@ def _print_verification_log(db_path: str | None, pr_number: int | None) -> None:
         reason = (row.get("closed_reason") or "").strip()
         if reason:
             print(f"        reason  : {_clip(reason, 160, row['pr_number'])}")
+        # Who closed it; rows closed before this was recorded print nothing here.
+        if row.get("closed_by"):
+            print(f"        by      : {row['closed_by']}")
         evidence = row.get("evidence")
         if evidence:
             # A census can carry 500 rows; printing every document would bury it.
@@ -436,9 +443,10 @@ def _print_next_for_validation(
 ) -> None:
     """The ONE open obligation a standing validator should work next, or why none.
 
-    Candidates come from ``list_validation_candidates`` (not-yet-done, then
-    never-attempted, then a parked row past its re-attempt window; fail-intent
-    never). This reader then asks GitHub, in 8-day windows stepping 7 days back
+    Candidates come from ``list_validation_candidates`` (not-yet-done, unless
+    its stored evidence declares ``no_progress`` and its last attempt is inside
+    the re-attempt window; then never-attempted, then a parked row past its
+    re-attempt window; fail-intent never). This reader then asks GitHub, in 8-day windows stepping 7 days back
     from today, for each candidate's base branch, merge commit and body, and ranks
     within a tier: deployed with an ``E2E:`` plan, deployed without one, then
     deploy-unproven; newest merge first inside each.
@@ -519,7 +527,8 @@ def _print_next_for_validation(
     if not candidates:
         print(
             f"pr_verifications: no open row is eligible to pick ({open_total} open). "
-            f"Failed rows are the owner's, and parked rows wait out their re-attempt window."
+            f"Failed rows are the owner's; parked rows, and not-yet-done rows whose last "
+            f"attempt declared no progress, wait out their re-attempt window."
         )
         return
 
@@ -717,7 +726,7 @@ def _print_next_for_validation(
     # The database the row was read from, so recording lands on the same ledger
     # (without it, close falls back to genesis_db_path(), another file or none).
     print(
-        f"  record: python3 scripts/pr_verification.py close --pr {n} "
+        f"  record: {_PY} scripts/pr_verification.py close --pr {n} "
         f"--db-path {shlex.quote(resolved)} "
         f"--evidence-file <doc.json> --dry-run   (then again without --dry-run)"
     )
@@ -800,7 +809,8 @@ def main() -> None:
         "--next-for-validation",
         action="store_true",
         help="print the ONE open obligation a standing validator should work next "
-        "(not-yet-done, then never-attempted, then parked past 7 days; deployed with an "
+        "(not-yet-done, which waits 7 days only when its evidence declares no_progress, "
+        "then never-attempted, then parked past 7 days; deployed with an "
         "E2E plan first, newest merge first) or why none, and exit — reads GitHub and "
         "git, writes nothing, fails closed",
     )

@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol
 
+from genesis.util.execution_privacy import PRIVATE_ERROR, exception_is_private
+
 logger = logging.getLogger(__name__)
 
 
@@ -164,6 +166,15 @@ def _now_us() -> int:
     return int(time.time() * 1_000_000)
 
 
+def _exception_message(exc: Exception) -> str:
+    if exception_is_private(exc):
+        return PRIVATE_ERROR
+    try:
+        return f"{type(exc).__name__}: {exc}"
+    except BaseException:
+        return "exception text unavailable"
+
+
 @contextmanager
 def start_span(
     name: str,
@@ -219,7 +230,7 @@ def start_span(
         yield span
     except Exception as exc:
         if include_exception_text:
-            span.set_status_error(f"{type(exc).__name__}: {exc}")
+            span.set_status_error(_exception_message(exc))
         else:
             with contextlib.suppress(Exception):
                 span.set_status_error("exception details omitted")

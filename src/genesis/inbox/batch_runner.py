@@ -22,6 +22,7 @@ from genesis.inbox.url_coverage import (
     _has_url_failures,
     _uncovered_urls,
 )
+from genesis.observability.session_context import session_scope
 from genesis.observability.spans import SpanKind, start_span
 
 if TYPE_CHECKING:
@@ -190,7 +191,7 @@ async def run_one_batch(
         return False
 
     try:
-        with start_span(
+        with session_scope(session_id), start_span(
             "inbox.evaluate",
             SpanKind.OPERATION,
             attributes={"inbox_batch_id": batch_id, "inbox_item_id": item.id},
