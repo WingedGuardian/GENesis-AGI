@@ -60,23 +60,31 @@ class Setter:
     kind: str
 
 
+# ``keys`` is passed by keyword: the deploy-status call-site test reads a Call's
+# positional string args as a path being built, and would glue the keys onto it.
 SETTERS: tuple[Setter, ...] = (
     Setter(
-        "Claude Code session scopes", "src/genesis/cc/invoker.py", ("IOWeight",), kind="scope"
+        "Claude Code session scopes",
+        "src/genesis/cc/invoker.py",
+        keys=("IOWeight",),
+        kind="scope",
     ),
     Setter(
         "capped job scopes (genesis.hostmetrics run)",
         "src/genesis/hostmetrics/run.py",
-        ("IOWeight",),
+        keys=("IOWeight",),
         kind="scope",
     ),
     Setter(
-        "code-intel index scopes", "scripts/lib/code_intel_scope.sh", ("IOWeight",), kind="scope"
+        "code-intel index scopes",
+        "scripts/lib/code_intel_scope.sh",
+        keys=("IOWeight",),
+        kind="scope",
     ),
     Setter(
         "code-intel owner reporter scope",
         "scripts/lib/code_intel_owner.py",
-        ("IOWeight",),
+        keys=("IOWeight",),
         kind="scope",
     ),
 )
