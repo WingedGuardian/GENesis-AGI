@@ -36,14 +36,14 @@ def real_fetch_server():
                 content_type = "text/html; charset=utf-8"
             elif self.path == "/error":
                 status = 503
-            elif self.path == "/redirect":
+            elif self.path == "/private_redirect":
                 status = 302
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             if self.path == "/brotli":
                 body = brotli.compress(body)
                 self.send_header("Content-Encoding", "br")
-            if self.path == "/redirect":
+            if self.path == "/private_redirect":
                 self.send_header("Location", "/plain")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -63,11 +63,16 @@ def real_fetch_server():
         thread.join(timeout=5)
 
 
-@pytest.mark.parametrize("path", ["plain", "html", "redirect", "brotli", "error"])
+@pytest.mark.parametrize("path", ["plain", "html", "private_redirect", "brotli", "error"])
 async def test_installed_scrapling_fetches_real_http(real_fetch_server, path):
     result = await fetch.WebFetcher(timeout_s=5).fetch(f"{real_fetch_server}/{path}")
     assert result.client == "scrapling", "fallback must not hide an import failure"
-    if path == "error":
+    if path == "private_redirect":
+        # Scrapling 0.5.1 defaults to safe redirects; never disable that for a fixture.
+        assert result.status_code == 0
+        assert "Redirect to internal IP" in result.error
+        assert not result.text
+    elif path == "error":
         assert result.status_code == 503
         assert result.error == "HTTP 503"
         assert not result.text
