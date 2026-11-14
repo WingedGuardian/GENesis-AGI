@@ -76,7 +76,7 @@ dependencies = [
     "mcp>=2.3.0,<3",  # Direct SDK floor; FastMCP v4 requires the v2 protocol implementation.
     "detect-secrets>=1.4",  # Phase 6 contribution sanitizer — REQUIRED floor. sanitize.py fails closed if missing.
     "pymupdf>=1.27",  # PDF text extraction for knowledge ingestion pipeline
-    "scrapling>=0.4.7",  # Web fetching with TLS fingerprint impersonation
+    "scrapling==0.5.1",  # Fetcher dependencies are installed with the browser extra below.
     "tldextract>=5",  # Public Suffix List (bundled snapshot): the cookie tools refuse to clear a public suffix
     "curl_cffi==0.17.0",  # Qualified with yt-dlp 2026.10.26; includes patched bundled Brotli.
     "brotli>=1.2.1",  # GHSA-9v8h-qqgm-4m35: the Python decoder is separate from curl_cffi's bundle.
@@ -149,6 +149,7 @@ test = [
 # camoufox < 0.5 engine the browser step has not replaced yet (measured:
 # "Protocol error (Browser.setDefaultViewport)").
 browser = [
+    "scrapling[fetchers]==0.5.1",  # AsyncFetcher imports Patchright/browserforge, even for HTTP.
     "camoufox>=0.5.7,<0.5.9",  # engine pinned by the package's browser-pin.json (Firefox 156).
                              # <0.5.9: 0.5.9 removed camoufox.addons.maybe_download_addons,
                              # which provision.py's addon step calls, and moves the engine to

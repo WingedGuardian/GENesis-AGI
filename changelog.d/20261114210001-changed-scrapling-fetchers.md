@@ -1,0 +1,1 @@
+- Update Scrapling and install its HTTP fetcher dependencies with the browser stack, retaining the plain HTTP fallback for core-only installs.
