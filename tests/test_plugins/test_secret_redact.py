@@ -558,16 +558,19 @@ def test_summary_mode_prints_no_value(secrets_file, capsys):
     assert KEY not in capsys.readouterr().out
 
 
-def test_plugin_manifest_wires_the_mod():
-    hooks = json.loads((BIN.parent / "hooks" / "hooks.json").read_text())
-    assert hooks == {"description": hooks["description"], "modules": ["./register.js"]}
-
-
 def test_a_credential_url_the_url_parser_rejects_still_loads_and_is_matched_whole():
     # urlsplit raises on an unbalanced bracket; that must not cost the other values their redaction.
     broken = "redis://:pa[ssword1234567@cache.example:6379/0"
     found = {n["text"]: n["var"] for n in known.needles({"CACHE_URL": broken, "A_KEY": "k" * 20})}
     assert found[broken] == "CACHE_URL" and found["k" * 20] == "A_KEY"
+
+
+def test_plugin_manifest_wires_the_mod_and_the_publish_guard():
+    hooks = json.loads((BIN.parent / "hooks" / "hooks.json").read_text())
+    assert hooks["modules"] == ["./register.js"]
+    (entry,) = hooks["hooks"]["PreToolUse"]
+    assert entry["matcher"] == "^(Monitor|Bash)$"
+    assert "bin/publish_guard.py" in entry["hooks"][0]["command"]
 
 
 def test_a_name_holding_a_bracket_gets_a_placeholder_that_holds_none():

@@ -1,0 +1,1 @@
+- **Disarming the code-intel freeze releases its locks as soon as it stops.** The freeze's background `sleep` kept a copy of both index locks, so after a disarm they could stay held for a moment while it exited, and an index run or check right then found them still taken. Only the freeze itself holds the locks now.

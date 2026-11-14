@@ -241,7 +241,15 @@ its mode, a new file takes the overlay file's, and an overlay cannot delete a
 file. A link in the overlay, a path under `.git`, and a path that is or passes
 through a link in the worktree are refused. A run ended by SIGTERM or SIGHUP
 still removes its worktree and scratch, and a tree it could not remove is named
-in the output. The writer uses it to check a new scenario on the current tree, and
+in the output. That includes a signal that arrives while `git worktree add` is
+still running: git registers the worktree locked ("initializing") until its
+checkout is done, and `git worktree prune` never drops a locked entry. The
+runner runs the add in its own process group, so it stops git together with
+the child process that does the checkout, then removes the half-made worktree
+with `git worktree remove --force --force`. A runner killed with SIGKILL runs
+no cleanup, so it can still leave one.
+
+The writer uses it to check a new scenario on the current tree, and
 then on a deliberately changed copy, without creating a worktree of its own: an
 agent session in this repository may not remove one, so a worktree the writer
 made would be left behind.

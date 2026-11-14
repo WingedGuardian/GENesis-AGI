@@ -56,6 +56,15 @@ def _dh():
     return importlib.import_module("genesis.observability.snapshots.deploy_health")
 
 
+@pytest.fixture(autouse=True)
+def _no_kit_judged(monkeypatch):
+    """These tests are about the reports: deploy health judges no installed kit
+    here (no live_repair_kit finding; the checkout's loader reads them). The kit's
+    findings and its loader are test_live_repair_kit_readers.py's."""
+    dh = _dh()
+    monkeypatch.setattr(dh, "_repair_kit", lambda home, repo: (None, dh._REPAIR_SCRIPT))
+
+
 def _found(w, **kw) -> dict:
     return _dh().collect_live_repairs(w.gen, w.root, **kw)
 
@@ -143,9 +152,13 @@ def test_dismissing_a_report_no_reader_can_read_clears_it(w, damage):
 
 
 def _guardian_pick(home: Path) -> dict | None:
-    """The host guardian's container-side report pick (#3627), run against this HOME."""
+    """The host guardian's container-side report pick (#3627), run against this
+    HOME, with this checkout's loader as its installed kit (#3892)."""
     from genesis.guardian import collector as gc
 
+    kit = home / ".genesis" / "lib" / "live-repair" / "current"
+    kit.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(MODULE, kit / MODULE.name)
     out = subprocess.run(
         [sys.executable, "-I", "-S", "-"],
         input=gc._REPAIR_PICK,
@@ -514,7 +527,8 @@ def test_both_readers_agree_on_the_newest_report(tmp_path, mod):
     agree on which report is newest. The one intended difference: deploy
     health's ``unresolved`` reads the newest READ report (dismissed included),
     while the guardian pick shows the newest ELIGIBLE one, and shows a newest
-    report it cannot parse as unreadable rather than an older one."""
+    report it cannot parse as unreadable rather than an older one. The pick is
+    the loader's newest_eligible run from the kit (#3892), not a copy of it."""
     home = tmp_path
     gen = home / ".genesis"
     checkout = home / "genesis"
@@ -556,6 +570,10 @@ def test_both_readers_agree_on_the_newest_report(tmp_path, mod):
     assert found["reports"][0]["ts"] == at(300, 5) and found["refused"] == 2, found
     picked = _guardian_pick(home)
     assert picked == {"ts": bad, "result": "report unreadable; not read", "dir_ts": bad}, picked
+    # 5. The pick runs the loader's own newest_eligible (#3892): on this same
+    # dir set, what the pick shows is what that function answers.
+    ts, shown = _writer().newest_eligible(str(gen / "deploy-backups"), str(checkout), now)
+    assert {**json.loads(shown), "dir_ts": ts} == picked
 
 
 def test_a_name_the_writer_never_makes_takes_no_slot(tmp_path):
@@ -1104,7 +1122,7 @@ async def test_a_non_utf8_backup_folder_reaches_the_observation_table(tmp_path, 
     assert "h\\udcff" in row["content"] and "20260101T000000Z-1" in row["content"], row
 
 
-# -- the guardian's pick applies the loader's rules (it cannot import it) --
+# -- the guardian's pick runs the loader's newest_eligible (#3892) ----------
 
 
 def test_the_guardian_pick_reads_a_checkout_whose_path_is_not_utf8(tmp_path):
@@ -1119,17 +1137,10 @@ def test_the_guardian_pick_reads_a_checkout_whose_path_is_not_utf8(tmp_path):
     assert picked is not None and picked["result"] == "healed", picked
 
 
-def test_the_guardian_pick_shares_the_loaders_name_rule_and_caps(mod):
-    """The pick runs as `python3 -I -S -` inside the container, so it carries
-    its own copy of the loader's rules: the same name pattern, the same caps."""
-    from genesis.guardian import collector as gc
-
-    assert mod.REPORT_NAME.pattern == gc._REPAIR_NAME
-    assert gc._REPAIR_REPORT_BYTES == mod.REPORT_BYTES
-    assert gc._REPAIR_REPO_BYTES == mod.REPO_BYTES
-    assert gc._REPAIR_FUTURE_S == mod.REPORT_FUTURE_S
-    assert gc._REPAIR_READS == _dh().REPAIR_REPORTS_READ
-    assert gc._REPAIR_DISMISSED == mod.DISMISS_MARK
+def test_the_readers_share_the_read_count_and_the_prune_the_name_rule(mod):
+    """The pick (newest_eligible) reads as many report dirs as deploy health;
+    the deploy-backups prune carries the loader's name rule and dismiss mark."""
+    assert mod.REPORTS_READ == _dh().REPAIR_REPORTS_READ
     keep = importlib.util.spec_from_file_location("_keep", Path(mod.__file__).parent / "repair_report_keep.py")
     kept = importlib.util.module_from_spec(keep)
     keep.loader.exec_module(kept)
