@@ -26,6 +26,10 @@ class PhysicalWork:
         self._loop = asyncio.get_running_loop()
         self._context = copy_context()
         self._fn, self._args, self._kwargs = fn, args, kwargs
+        # Starting and abandoning are decided under one lock: once the owner
+        # settles unstarted work as unconfirmed, the work can no longer start.
+        self._start_lock = threading.Lock()
+        self._abandoned = False
         self._started = threading.Event()
         self._complete = threading.Event()
         self._terminal = self._loop.create_future()
@@ -44,8 +48,18 @@ class PhysicalWork:
         if not self._terminal.done():
             self._terminal.set_result(None)
 
+    def _abandon_if_unstarted(self) -> bool:
+        with self._start_lock:
+            if self._started.is_set():
+                return False
+            self._abandoned = True
+            return True
+
     def _run(self) -> None:
-        self._started.set()
+        with self._start_lock:
+            if self._abandoned:
+                return
+            self._started.set()
         try:
             self._value = self._context.run(self._fn, *self._args, **self._kwargs)
         except BaseException as exc:
@@ -68,7 +82,9 @@ class PhysicalWork:
                 return
             if proxy.done() and not proxy.cancelled():
                 proxy.exception()  # observe an executor failure, not physical success
-        if not self._started.is_set() or self._terminal.done():
+        if self._terminal.done() or self._abandon_if_unstarted():
+            # Unstarted work is abandoned here, so a submission that raised
+            # after enqueue cannot run against resources its owner then closes.
             raise UnconfirmedWork("Physical resource completion is unconfirmed")
         # A cancelled proxy cannot terminate an already-running synchronous body.
         await asyncio.shield(self._terminal)

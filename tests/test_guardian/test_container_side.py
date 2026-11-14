@@ -16,6 +16,9 @@ import pytest
 from genesis.observability.health import probe_guardian
 from genesis.observability.types import ProbeResult, ProbeStatus
 
+# Real awareness ticks here: keep their git-health and bundle steps off the live install.
+pytestmark = pytest.mark.usefixtures("quiet_live_tick")
+
 # ── probe_guardian ───────────────────────────────────────────────────────
 
 

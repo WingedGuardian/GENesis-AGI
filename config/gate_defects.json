@@ -18,6 +18,9 @@
     ],
     "characterization": [
       "tests/test_hooks/test_merge_gate_characterization.py"
+    ],
+    "server": [
+      "tests/test_hooks/test_merge_gate_server_replay.py"
     ]
   },
   "cases": [
@@ -83,6 +86,15 @@
       "validator": "python",
       "anchor": "        c.get(\"reply_to\")\n        for c in raw\n        if c.get(\"reply_to\") and c.get(\"assoc\") in _MAINTAINER_ASSOCIATIONS",
       "replacement": "        c.get(\"id\")\n        for c in raw\n        if c.get(\"id\")"
+    },
+    {
+      "label": "the inline findings read takes a comment's review id for the comment it replies to",
+      "why": "A REST review comment carries `in_reply_to_id`, absent on a top-level finding, and `pull_request_review_id`, present on every comment. Reading the second as the first makes every finding look like a reply, replies are never scored, and a Codex P1 merges. The other rungs feed this read its output after the jq filter, so only a rung that replays GitHub's raw answer through the filter can see it.",
+      "aim": "server",
+      "path": "scripts/hooks/git_push_guard.py",
+      "validator": "python",
+      "anchor": "\".[] | {id: .id, reply_to: .in_reply_to_id, login: .user.login, \"",
+      "replacement": "\".[] | {id: .id, reply_to: .pull_request_review_id, login: .user.login, \""
     }
   ]
 }

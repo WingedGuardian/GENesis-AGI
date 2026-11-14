@@ -7,7 +7,7 @@ description: >
   the canonical judgment-layer subsystem map so audits start from the map,
   not from a cold grep. Also fires after changing a subsystem's
   capabilities, to keep the map current.
-keywords: [capability, capabilities, subsystem, map, audit, architecture, lacks, missing, compare, competitive]
+keywords: [subsystem, competitive]
 ---
 
 ## The Rule

@@ -10,9 +10,8 @@
 #
 # This intermediate binary still refuses automatic consumption at readiness.
 # The checked consumer below is prepared for the later complete protocol: one
-# provider per claim, complete NUL records and context-bound scalar settlement.
-# Native intent, uncertain completion, scope quiescence and persistent holds
-# belong to Q3/Q4 before automatic readiness can become positive.
+# provider per typed claim and complete context-bound native outcomes. Recovery
+# selection and the final physical exclusion gate still precede positive readiness.
 
 set -u
 
@@ -26,13 +25,17 @@ if [ -z "${HOME:-}" ]; then
     export HOME
 fi
 
-SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-# CODE_INTEL_ENTRYPOINT is a test seam (inject a fake that returns a chosen rc);
-# it defaults to the real locked+capped entrypoint.
+if declare -F _ci_source >/dev/null; then
+    SCRIPT_DIR="${_CI_ORIGIN%/*}"
+else
+    SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+fi
+# Captured provenance check; native dispatch uses the original owner below.
 ENTRYPOINT="${CODE_INTEL_ENTRYPOINT:-$SCRIPT_DIR/lib/code_intel_index.sh}"
 MARKER_PY="$SCRIPT_DIR/lib/index_marker.py"
 # shellcheck source=lib/proc_pressure.sh
-. "$SCRIPT_DIR/lib/proc_pressure.sh"
+if declare -F _ci_source >/dev/null; then _ci_source proc_pressure.sh || exit 76
+else . "$SCRIPT_DIR/lib/proc_pressure.sh"; fi
 
 GENESIS_HOME="${GENESIS_HOME:-$HOME/.genesis}"
 LOCK_DIR="$GENESIS_HOME/locks"
@@ -53,7 +56,10 @@ _log() {
         "$(date -Iseconds 2>/dev/null || date)" "$*" >> "$LOG_FILE" 2>&1
 }
 
-_marker() { python3 "$MARKER_PY" "$@"; }
+_marker() {
+    if declare -F _ci_queue >/dev/null; then _ci_queue "$@"
+    else python3 "$MARKER_PY" "$@"; fi
+}
 
 # Checked machine transport. _WIRE is replaced only after the child has exited;
 # the list snapshot is separately retained before claim/escalation reuse it.
@@ -92,38 +98,14 @@ _pending_wire() {
         _wire_provider "${_WIRE[i+4]}" && _wire_number "${_WIRE[i+5]}"
 }
 
-_finish_outcome() {
-    local context="$1" action="$2" state
-    if ! _marker remember-outcome --context "$context" --action "$action" >> "$LOG_FILE" 2>&1; then
-        _log "could not persist terminal action $action — stopping tick"
-        return 76
-    fi
-    local apply_rc=0
-    state="$(_marker apply-outcome --context "$context" 2>> "$LOG_FILE")" || apply_rc=$?
-    if [ "$apply_rc" -eq 75 ]; then
-        # Retained: the next tick's reconciliation replays it.
-        _log "terminal action $action retained; queue busy, apply deferred"
-        return 75
-    fi
-    if [ "$apply_rc" -ne 0 ]; then
-        _log "terminal action $action retained but could not be applied — stopping tick"
-        return 76
-    fi
-    case "$state" in consumed|pending|failed) printf '%s\n' "$state" ;;
-        *) _log "invalid terminal disposition — stopping tick"; return 76 ;;
-    esac
-}
-
-# A busy apply (75) defers the tick like any busy queue call; anything else fails.
-_settle_exit() {
-    if [ "$1" -eq 75 ]; then exit 0; fi
-    exit 76
-}
-
-
 # Check at each queue boundary; the sentinel can change while a tick runs.
 # Unresolvable configuration defers CBM, as the entrypoint does.
 _cbm_disabled() {
+    if declare -F _ci_available >/dev/null; then
+        ! _ci_available "$HOME/.genesis/config/codebase-managed.json" "$1" \
+            "${CODE_INTEL_INDEX_PERSISTENCE:-true}" >/dev/null 2>> "$LOG_FILE"
+        return $?
+    fi
     ! /usr/bin/python3 -I "$SCRIPT_DIR/codebase_managed.py" \
         --config "$HOME/.genesis/config/codebase-managed.json" available --repo "$1" \
         --persistence "${CODE_INTEL_INDEX_PERSISTENCE:-true}" \
@@ -178,7 +160,12 @@ elif [ "$lock_rc" -ne 0 ]; then
     exit 75
 fi
 
-if [ ! -f "$ENTRYPOINT" ] || [ ! -f "$MARKER_PY" ]; then
+if declare -F _ci_entry >/dev/null; then
+    if [ "$ENTRYPOINT" != "$_CI_EXPECTED_ENTRY" ]; then
+        _log "captured runner requires its captured entrypoint — deferring"
+        exit 75
+    fi
+elif [ ! -f "$ENTRYPOINT" ] || [ ! -f "$MARKER_PY" ]; then
     _log "entrypoint or marker helper missing — deferring without reading the queue"
     exit 75
 fi
@@ -201,6 +188,19 @@ case "$protocol_rc" in
     75) _log "queue busy at readiness — deferring"; exit 0 ;;
     *) _log "automatic queue protocol observation failed — stopping tick"; exit 76 ;;
 esac
+if ! declare -F _ci_owner >/dev/null; then
+    # Older rendered units enter this shell directly. Before any queue action,
+    # restart through the same captured source role as the current unit. The
+    # raw waiter must release its lock so the captured child can acquire it;
+    # another tick may win that race and the child then defers normally.
+    _log "entering captured runner before typed queue dispatch"
+    exec 8>&-
+    capture_rc=0
+    /usr/bin/python3 -I -S "$SCRIPT_DIR/lib/code_intel_source.py" shell runner runner || capture_rc=$?
+    case "$capture_rc" in 0|75|76) exit "$capture_rc" ;;
+        *) _log "captured runner startup failed — stopping tick"; exit 76 ;;
+    esac
+fi
 
 # One owned, private, ephemeral transport path. It is never recovery evidence.
 if ! QUEUE_OUTPUT="$(umask 077; mktemp -- "$GENESIS_HOME/.code-intel-output.XXXXXXXX.tmp")"; then
@@ -209,14 +209,18 @@ if ! QUEUE_OUTPUT="$(umask 077; mktemp -- "$GENESIS_HOME/.code-intel-output.XXXX
 fi
 trap 'rm -f -- "$QUEUE_OUTPUT"' EXIT
 
-# Protocol2 has no native-intent path: restore its unstarted claims or replay a
-# retained scalar. Legacy uncertainty is preserved. Q3 must replace this premise
-# before a later protocol enables automatic native work.
+# Preserve legacy settlement, then reconcile typed claims from durable facts.
 reconcile_rc=0
 _marker reconcile-inflight >> "$LOG_FILE" 2>&1 || reconcile_rc=$?
 case "$reconcile_rc" in 0) ;;
     75) _log "queue busy at inflight reconciliation — deferring"; exit 0 ;;
     *) _log "inflight reconciliation failed — stopping tick without claiming new work"; exit 76 ;;
+esac
+reconcile_rc=0
+_marker reconcile-native >> "$LOG_FILE" 2>&1 || reconcile_rc=$?
+case "$reconcile_rc" in 0) ;;
+    75) _log "queue busy at native reconciliation — deferring"; exit 0 ;;
+    *) _log "native reconciliation failed — stopping tick without claiming new work"; exit 76 ;;
 esac
 
 list_rc=0
@@ -255,7 +259,7 @@ for ((i=0; i<${#_MARKERS[@]}; i+=6)); do
     _idle_ok "$age" || continue
 
     claim_rc=0
-    _queue_capture claim --hash "$hash" --provider "$provider" --nul || claim_rc=$?
+    _queue_capture claim-native --hash "$hash" --provider "$provider" --nul || claim_rc=$?
     case "$claim_rc" in 0|1) ;;
         75) _log "queue busy at claim — deferring"; exit 0 ;;
         *) _log "claim failed (rc=$claim_rc) — stopping tick"; exit 76 ;;
@@ -287,7 +291,12 @@ for ((i=0; i<${#_MARKERS[@]}; i+=6)); do
     mode="${_WIRE[5]}"
     context="${_WIRE[6]}"
     if [ "$provider" = cbm ] && _cbm_disabled "$repo"; then
-        _finish_outcome "$context" restore >/dev/null || _settle_exit $?
+        reconcile_rc=0
+        _marker reconcile-native >> "$LOG_FILE" 2>&1 || reconcile_rc=$?
+        case "$reconcile_rc" in 0) ;;
+            75) _log "queue busy reconciling disabled claim — deferring"; exit 0 ;;
+            *) _log "disabled claim reconciliation failed — stopping tick"; exit 76 ;;
+        esac
         _log "CBM disabled after claim — restored request: $repo"
         continue
     fi
@@ -305,48 +314,40 @@ for ((i=0; i<${#_MARKERS[@]}; i+=6)); do
             fi
         fi
         if [ "$escalation_rc" -eq 75 ]; then
-            _finish_outcome "$context" restore >/dev/null || _settle_exit $?
-            _log "queue busy at full-escalation check — restored claim, deferring"
+            reconcile_rc=0
+            _marker reconcile-native >> "$LOG_FILE" 2>&1 || reconcile_rc=$?
+            case "$reconcile_rc" in 0|75) ;;
+                *) _log "unstarted claim reconciliation failed — stopping tick"; exit 76 ;;
+            esac
+            _log "queue busy at full-escalation check — retained claim, deferring"
             exit 0
         fi
         if [ "$escalation_ok" -ne 1 ]; then
             _log "full-escalation observation failed — restoring claim and stopping tick"
-            _finish_outcome "$context" restore >/dev/null || true
+            _marker reconcile-native >> "$LOG_FILE" 2>&1 || true
             exit 76
         fi
     fi
 
     _log "indexing $repo (tools=$provider mode=$run_mode)"
-    CODE_INTEL_INDEX_LOCK_SKIP_RC=75 \
-        bash "$ENTRYPOINT" "$repo" "$provider" "$run_mode" >> "$LOG_FILE" 2>&1
-    rc=$?
-    case "$rc" in
-        0)
-            action=consume
-            if [ "$provider" = cbm ] && [ "$run_mode" = full ]; then action=consume_full; fi
-            _finish_outcome "$context" "$action" >/dev/null || _settle_exit $?
-            _log "indexed OK: $repo (tools=$provider mode=$run_mode)"
-            ;;
-        75)
-            _finish_outcome "$context" restore >/dev/null || _settle_exit $?
-            _log "lock held / host-frozen — kept request for $repo"
-            ;;
-        3)
-            action=restore
-            if [ "$provider" = cbm ] && [ "$run_mode" = full ]; then action=restore_backoff; fi
-            _finish_outcome "$context" "$action" >/dev/null || _settle_exit $?
-            _log "requested provider missing or refused — kept request, no penalty: $repo"
-            ;;
-        *)
-            if [ "$provider" = cbm ] && [ "$run_mode" = full ] && [ "$mode" != full ]; then
-                _finish_outcome "$context" restore_backoff >/dev/null || _settle_exit $?
-                _log "escalated full failed (rc=$rc) — retained request with full backoff: $repo"
-            else
-                state="$(_finish_outcome "$context" restore_failure)" || _settle_exit $?
-                _log "index failed (rc=$rc) — request $state: $repo"
-            fi
-            ;;
-    esac
+    : > "$QUEUE_OUTPUT" || exit 76
+    if ! _ci_owner "$context" "$run_mode" "$HOME/.genesis/config/codebase-managed.json" \
+            > "$QUEUE_OUTPUT" 2>> "$LOG_FILE"; then
+        _log "owner result unavailable — preserving durable outcome and stopping tick"
+        exit 76
+    fi
+    if ! _read_wire || [ "${#_WIRE[@]}" -ne 6 ]; then
+        _log "invalid native-outcome framing — stopping tick"
+        exit 76
+    fi
+    if ! [[ "${_WIRE[0]}" == 1 && "${_WIRE[1]}" == native-outcome &&
+            "${_WIRE[2]}" == "$hash" && "${_WIRE[3]}" == "$provider" &&
+            "${_WIRE[4]}" == "$context" &&
+            ( "${_WIRE[5]}" == consumed || "${_WIRE[5]}" == pending || "${_WIRE[5]}" == failed ) ]]; then
+        _log "native outcome differs from this claim — stopping tick"
+        exit 76
+    fi
+    _log "native request ${_WIRE[5]}: $repo (tools=$provider mode=$run_mode)"
 done
 
 exit 0

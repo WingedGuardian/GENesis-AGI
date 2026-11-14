@@ -105,7 +105,13 @@ def _run(
         # Absolute form, derived rather than hardcoded: a literal home path is
         # both a portability failure on any other install and the kind of
         # install-specific value that must not ship in a public fixture.
-        f"set -a; . {Path.home()}/genesis/secrets.env; set +a; python3 x.py",
+        # A fixed id: the default one would carry the home directory, which
+        # differs from one run to the next (CI's collected-floor job compares
+        # ids across two runs).
+        pytest.param(
+            f"set -a; . {Path.home()}/genesis/secrets.env; set +a; python3 x.py",
+            id="absolute-home-path",
+        ),
         "source ~/genesis/secrets.env && ./run.sh",
         "cat ~/genesis/secrets.env",
         # Reading only key NAMES still touches the file — the owner asked to know
@@ -787,26 +793,36 @@ class TestAuditFindings:
         monkeypatch.setenv("SECRETS_PATH", str(relocated))
         assert self._touches(command=f"cat {relocated}")
 
-    def test_the_guard_reads_the_same_override_the_runtime_does(self) -> None:
+    def test_the_guard_reads_the_same_override_the_runtime_does(self, tmp_path, monkeypatch) -> None:
         """The two resolvers are a REPLICA — a hook is stdlib-only and cannot
         import `genesis.env` — so the only defence is that they are checked
         against each other rather than maintained in parallel from memory."""
         import re as _re
 
-        env_src = (Path(__file__).resolve().parents[2] / "src" / "genesis" / "env.py").read_text(
-            encoding="utf-8"
-        )
-        body = env_src.split("def secrets_path(", 1)[1].split("\ndef ", 1)[0]
-        names = set(_re.findall(r"os\.environ\.get\(\s*[\"'](\w+)[\"']", body))
-        assert names, "could not read secrets_path()'s override — this test is checking nothing"
+        from genesis.env import secrets_path
 
+        # Every override name the resolver reads must be one the guard reads.
+        src = (
+            Path(__file__).resolve().parents[2] / "src" / "genesis" / "secrets_location.py"
+        ).read_text(encoding="utf-8")
+        names = set(_re.findall(r"environ\.get\(\s*[\"'](\w+)[\"']", src))
+        assert names, "could not read the resolver's override — this test is checking nothing"
         guard = (_HOOKS / "secrets_target.py").read_text(encoding="utf-8")
         missing = sorted(n for n in names if f'"{n}"' not in guard)
         assert not missing, (
-            f"genesis.env.secrets_path() honours {missing}, which "
-            "secrets_target.py does not read. An override the runtime obeys "
-            "and the guard ignores is a credentials file outside the gate."
+            f"the resolver honours {missing}, which secrets_target.py does not read. "
+            "An override the runtime obeys and the guard ignores is a credentials "
+            "file outside the gate."
         )
+
+        # And the file the runtime resolves under that override is gated.
+        relocated = tmp_path / "vault" / "credentials.prod"
+        relocated.parent.mkdir()
+        relocated.write_text("SYNTHETIC_KEY=value\n")
+        monkeypatch.setenv("SECRETS_PATH", str(relocated))
+        resolved = secrets_path()
+        assert resolved == relocated
+        assert self._touches(command=f"cat {resolved}")
 
     # ── R-1: the glob prefilter decided from the pattern's SPELLING ─────────
     #

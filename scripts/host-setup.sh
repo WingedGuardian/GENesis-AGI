@@ -1381,11 +1381,12 @@ fi
 # where an unsuppressed auto-updater bites hardest (it silently moved a host
 # several minor versions past the pin, running the Guardian recovery brain on an
 # unvetted CC). Creates the file when absent; never clobbers an unparseable one.
-if cc_ensure_updater_suppressed "$_host_settings_file"; then
-    echo "  + Auto-updater suppression set in $_host_settings_file"
+if cc_ensure_updater_suppressed "$_host_settings_file" "${CC_CLIENT_SETTINGS_POLICY[@]}"; then
+    echo "  + Auto-updater suppression and retention policy verified in $_host_settings_file"
 else
-    echo "  WARNING: Could not set auto-updater suppression in $_host_settings_file"
-    echo "  Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\"}}"
+    echo "  WARNING: Full suppression and retention policy NOT verified in $_host_settings_file"
+    echo "  State: ${CC_SUPPRESSION_STATE:-unverified}; partial suppression may have been applied."
+    echo "  Resolve the warning above and re-run host setup (python3 is required for retention)."
 fi
 # Under sudo a file this run CREATED belongs to root — hand it back to the
 # operator so their CC can rewrite it.

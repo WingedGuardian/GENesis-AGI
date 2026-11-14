@@ -41,8 +41,8 @@ from typing import Any
 from genesis.cc.foreground_reaper_config import effective_mode, knob_int, load_config
 from genesis.db.crud import cc_sessions, observations, session_heartbeats
 from genesis.env import cc_project_dir
-from genesis.observability.cc_slots import read_proc_start_iso
 from genesis.session_awareness.transcript import _assistant_text, typed_prompt_text
+from genesis.util.proc_io import claude_pid_dead, read_proc_start_iso
 
 logger = logging.getLogger(__name__)
 
@@ -289,44 +289,11 @@ _PROC_ROOT = "/proc"
 
 
 def _pid_dead(pid: int, row: dict) -> bool:
-    """Death-proof for a terminal-registered row's recorded pid.
-
-    True only on POSITIVE evidence the recorded process is gone: /proc entry
-    absent (ENOENT/ESRCH — a MISSING entry, not merely an unreadable one:
-    EACCES from a hidepid mount or another uid is "cannot see", which must
-    fail open), comm no longer ``claude``, or the process at that pid
-    started after the row's newest liveness stamp (pid recycled). The
-    anchor is max(started_at, last_activity_at), NOT started_at alone: a
-    ``--resume`` reopens the row with a NEW pid in the same write that
-    stamps last_activity_at, so the fresh process always starts BEFORE the
-    anchor — anchoring to the original started_at would read every resumed
-    session as recycled. A genuinely recycled pid began after the session's
-    last sign of life, so detection is preserved; any miss fails open into
-    the 24h path. Unknown start time → False (fail-open, matching
-    ``read_proc_start_iso``'s own contract).
-    """
-    proc = Path(_PROC_ROOT) / str(pid)
-    try:
-        comm = (proc / "comm").read_text().strip()
-    except (FileNotFoundError, ProcessLookupError):
-        return True  # the pid does not exist — positive death evidence
-    except (OSError, UnicodeError):
-        # Unreadable (permissions, /proc hiccup) or undecodable (a reused pid
-        # whose comm has invalid bytes for the locale) — fail open; one bad
-        # candidate must not abort the pass for every other stale row.
-        return False
-    if comm != "claude":
-        return True
-    anchor = max(
-        (t for t in (row.get("started_at"), row.get("last_activity_at")) if t),
-        default=None,
-    )
-    if not anchor:
-        return False
-    started = read_proc_start_iso(pid)
-    if started is None:
-        return False
-    return started > anchor
+    """Death-proof for a terminal-registered row's recorded pid: the shared
+    predicate in ``genesis.util.proc_io.claude_pid_dead`` (its docstring has
+    the evidence rules), read against this module's ``_PROC_ROOT`` and
+    ``read_proc_start_iso`` at call time so tests can repoint either."""
+    return claude_pid_dead(pid, row, proc_root=_PROC_ROOT, start_iso=read_proc_start_iso)
 
 
 def _heartbeat_cutoff(now: datetime) -> str:

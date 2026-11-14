@@ -587,6 +587,36 @@ async def test_a_resumed_run_that_sent_then_died_records_the_send(db, ending):
     assert "`outreach_send`" in await _redispatched_prompt(db, first.park_id)
 
 
+async def test_pressure_failure_closes_existing_resume_lineage(db, monkeypatch):
+    from genesis.cc import rate_limit_resume
+    from genesis.cc.exceptions import CCMemoryPressureError, CCProcessError
+    from genesis.cc.oom import OOMEvidence
+
+    first = await _park_ran(db, [("web_search", {"q": "synthetic"})])
+    await parks.claim(db, first.park_id)
+    runner = _park_runner(db)
+    runner._invoker.run_streaming = AsyncMock(side_effect=CCMemoryPressureError(
+        OOMEvidence("synthetic", (1, 2), (1, 2), 4, 5, -9), cause=CCProcessError(),
+    ))
+    request = DirectSessionRequest(
+        prompt="synthetic task", caller_context=f"rate_limit_resume:{first.park_id}",
+    )
+    with pytest.raises(CCMemoryPressureError):
+        await runner._run_session(request, "synthetic-resume")
+    # Exercise the actual stale-claim writer and resume reader, not just a
+    # zero-new-parks assertion: this park already existed before the attempt.
+    await db.execute("UPDATE cc_rate_limit_parks SET claimed_at = NULL")
+    await db.commit()
+    monkeypatch.setattr(rate_limit_resume.cfg_mod, "effective_mode", lambda: "live")
+    dispatch = AsyncMock()
+    monkeypatch.setattr(rate_limit_resume, "_redispatch", dispatch)
+    runtime = SimpleNamespace(_db=db, record_job_success=MagicMock(), record_job_failure=MagicMock())
+    await rate_limit_resume.run_resume_tick(runtime)
+    dispatch.assert_not_awaited()
+    runtime.record_job_failure.assert_not_called()
+    assert (await parks.get_by_id(db, first.park_id))["status"] == "cancelled"
+
+
 async def test_a_resume_capped_while_parking_is_off_still_records_its_send(db):
     first = await _park_ran(db, None)
     await parks.claim(db, first.park_id)

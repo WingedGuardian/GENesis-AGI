@@ -338,11 +338,6 @@ def _pushes(command: str) -> bool:
     return blind is not None or _PUSH in [s.argv for s in segments]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#3257 remains on hash-bearing source; the shared escape repair is partial",
-)
 @PROFILE
 @given(st.lists(_ESCAPABLE, min_size=1, max_size=4), st.sampled_from(["\n", "; ", " && "]))
 @example(words=["It's", "done"], separator="; ")
@@ -350,6 +345,8 @@ def _pushes(command: str) -> bool:
 def test_a_backslash_escaped_word_never_hides_the_next_command(
     words: list[str], separator: str
 ) -> None:
+    """With a `#` in the text the segmenter still leaves escapes unmodelled, so an
+    escaped quote there is refused rather than read (#3713); hash-free text is read."""
     escaped = " ".join("".join(c if c.isalnum() else "\\" + c for c in w) for w in words)
     assert _pushes(f"echo {escaped}{separator}{shlex.join(_PUSH)}")
 

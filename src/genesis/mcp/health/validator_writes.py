@@ -135,7 +135,9 @@ async def record_verification(
     Preview never changes the obligation. After an uncertain real response,
     re-read evidence/attempt_count before retrying: attempts are not idempotent.
     """
+    from genesis.caller_context import client_kind, record_session_id
     from genesis.db.crud import pr_verifications as crud
+    from genesis.mcp.external_profiles import current_external_profile
     from genesis.mcp.health.follow_up_tools import _get_db
     from genesis.session_awareness.codex_validator_config import dry_run_only
     from genesis.session_awareness.pr_evidence import (
@@ -148,6 +150,11 @@ async def record_verification(
         rechecks_for,
     )
     from genesis.session_awareness.pr_recording import _no_duplicates, attempt_note, resolve_repo
+
+    # Read at the tool's entry, where the external-client profile is in force.
+    profile = current_external_profile.get()
+    kind = client_kind(profile.value if profile is not None else None)
+    stamp = {"recorded_by": kind, "recorded_session": record_session_id(kind)}
 
     if len(evidence_json.encode("utf-8")) > MAX_EVIDENCE_BYTES:
         raise ToolError("Evidence exceeds the byte cap; refused rather than truncated")
@@ -177,26 +184,36 @@ async def record_verification(
         mismatch = check_merge_commit(doc.merge_commit, actual.merge_commit)
         if mismatch:
             raise ToolError(mismatch)
-        coverage = check_e2e_coverage(doc, actual.body) if decision.closing else None
+        from genesis.session_awareness.pr_tracking import assess_tracking
+
+        tracking = await assess_tracking(doc, db=db)
+        closing = decision.closing and tracking.complete
+        coverage = check_e2e_coverage(doc, actual.body) if closing else None
         if coverage:
             raise ToolError(coverage.message)
-        rechecks = rechecks_for(doc) if decision.closing else []
+        rechecks = rechecks_for(doc) if closing else []
         if rechecks and not await crud._rechecks_column_available(db):
             raise ToolError("Rechecks are owed but their column is unavailable; run the migration first")
         result = {
             "repo": target,
             "pr": pr,
             "verdict": decision.verdict,
-            "would_close": decision.closing,
+            "would_close": closing,
+            "measurement_would_close": decision.closing,
+            "tracking_complete": tracking.complete,
+            "tracking": tracking.as_dict(),
             "dry_run": preview,
             "server_dry_run_only": forced,
             "recorded": False,
             "rechecks": rechecks,
+            # The document's own declaration. On a recorded not-yet-done whose
+            # tracking is complete, the picker waits the re-attempt window after it.
+            "no_progress": doc.no_progress,
         }
         if preview:
             return result
         now = datetime.now(UTC).isoformat()
-        if decision.closing:
+        if closing:
             changed = await crud.close_verification(
                 db,
                 repo=target,
@@ -205,6 +222,7 @@ async def record_verification(
                 reason=reason_for(doc, decision),
                 evidence=payload,
                 now=now,
+                **stamp,
             )
         else:
             changed = (
@@ -213,9 +231,12 @@ async def record_verification(
                     repo=target,
                     pr_number=pr,
                     verdict=decision.verdict,
-                    note=attempt_note(decision, note),
+                    note=(attempt_note(decision, note) if tracking.complete
+                          else tracking.note(attempt_note(decision, note))),
                     evidence=payload,
                     now=now,
+                    tracking_pending=not tracking.complete,
+                    **stamp,
                 )
                 == "recorded"
             )

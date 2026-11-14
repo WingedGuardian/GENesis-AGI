@@ -180,6 +180,8 @@ jobs:
           # write-capable token. The artifact carries NO verdict — the
           # publisher re-evaluates the gate itself, so untrusted-context
           # output never writes to the head directly.
+          # The publisher job starts only for these three events (its `if:` in
+          # merge-gate-publish.yml): add any new handoff event there too.
           case "$GITHUB_EVENT_NAME" in
             pull_request|pull_request_review|pull_request_review_comment)
               if [ "$IS_FORK" = "true" ] || [ "$ACTOR" = "dependabot[bot]" ]; then

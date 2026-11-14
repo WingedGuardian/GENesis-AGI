@@ -155,7 +155,12 @@ class StdioIPCAdapter:
         self._command = config.command
         self._cwd = config.working_dir
         # Merge with inherited environment so subprocess gets PATH, HOME, etc.
-        self._env = {**os.environ, **config.env} if config.env else None
+        # A module is never the labelled client (owner-mode Codex) whose MCP
+        # server launched it, so it must not carry that client's label into any
+        # Genesis server it talks to.
+        # Built at spawn (start), not here, so a restarted module sees the
+        # environment as it is then, as an inherited env=None always did.
+        self._config_env = dict(config.env or {})
         self._timeout = config.timeout
         self._process: asyncio.subprocess.Process | None = None
 
@@ -170,8 +175,13 @@ class StdioIPCAdapter:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self._cwd,
-            env=self._env,
+            env=self._spawn_env(),
         )
+
+    def _spawn_env(self) -> dict[str, str]:
+        from genesis.caller_context import drop_client_label
+
+        return dict(drop_client_label({**os.environ, **self._config_env}))
 
     async def stop(self) -> None:
         if self._process and self._process.returncode is None:

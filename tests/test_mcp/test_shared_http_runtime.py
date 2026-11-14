@@ -269,3 +269,65 @@ async def test_configured_idle_timeout_releases_session(runtime):
                                                          "Mcp-Session-Id": first.headers["mcp-session-id"]})
     assert expired.status_code == 404
     assert (await initialize(runtime)).status_code == 200
+
+
+async def test_persisting_tracker_requires_background_budgets(tmp_path, monkeypatch):
+    for name in identity.IDENTITY_ENV_VARS:
+        monkeypatch.setenv(name, "fixture")
+    monkeypatch.setattr(identity, "_shared_service", False)
+    db = RequestDatabase(tmp_path / "foreground-only.db", max_units=1)
+    tracker = ProviderActivityTracker()
+    tracker.set_db(db)
+    server = FastMCP("foreground-only")
+    install_instrumentation(server, tracker, "health", db)
+    options = {"config": SharedHTTPConfig("health", "http://127.0.0.1:9123/mcp", 1, 1, 2, 30, 4096),
+               "resolver": CallerResolver("f" * 43, {"external": "e" * 43, "validator": "v" * 43}),
+               "database": db, "tracker": tracker, "loaded_commit": "a" * 40,
+               "started_at": "2026-01-01T00:00:00+00:00", "enabled": lambda: True}
+    try:
+        # A tool's tracker.record() would otherwise raise when its flush is detached.
+        with pytest.raises(ValueError, match="background budgets"):
+            await build_http_app(server, **options)
+        assert identity._shared_service is False
+        tracker.persist_activity = False
+        await build_http_app(server, **options)
+    finally:
+        await db.close()
+
+
+async def test_status_stays_bounded_while_every_foreground_unit_is_held(runtime):
+    first = asyncio.create_task(call(runtime, arguments={"wait": True}))
+    held, release = asyncio.Event(), asyncio.Event()
+
+    async def hold_last_unit():
+        async with runtime.db.unit_of_work():
+            held.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold_last_unit())
+    try:
+        await asyncio.wait_for(runtime.state.entered.wait(), 2)
+        await asyncio.wait_for(held.wait(), 2)
+        # The foreground checkout timeout is 10s; status must not wait it out.
+        status = (await asyncio.wait_for(runtime.client.get("/status"), 5)).json()
+        assert status["stale"] is None and status["active_tools"] == 1
+    finally:
+        release.set()
+        runtime.state.release.set()
+        await holder
+        reply = await first
+    assert not unpack(reply)["result"].get("isError")
+
+
+async def test_tool_replaced_after_capture_is_neither_listed_nor_dispatched(runtime):
+    async def health_status(marker: str = "fixture"):
+        runtime.state.calls += 1
+        return "replacement"
+
+    health_status.__module__ = "genesis.mcp.health.browser"
+    runtime.app.state.fastmcp_server.tool(health_status)
+    listed = unpack(await rpc(runtime, "tools/list"))
+    assert listed["result"]["tools"] == []
+    reply = unpack(await call(runtime))
+    assert reply.get("error") or reply["result"].get("isError")
+    assert runtime.state.calls == 0

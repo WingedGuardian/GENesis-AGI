@@ -1,5 +1,6 @@
 """Qualified upstream composition; resource construction belongs to bootstrap."""
 
+import asyncio
 import logging
 import re
 from contextlib import asynccontextmanager
@@ -28,6 +29,10 @@ from ._settings import SharedHTTPConfig
 
 logger = logging.getLogger(__name__)
 
+# Status reports admission while tools may hold every foreground unit; it must
+# not wait out the checkout timeout. A miss reports freshness as unknown.
+_STATUS_FRESHNESS_WAIT_S = 1.0
+
 
 async def build_http_app(server, *, config, resolver, database, tracker,
                          loaded_commit, started_at, enabled):
@@ -35,6 +40,10 @@ async def build_http_app(server, *, config, resolver, database, tracker,
         raise ValueError("Shared MCP requires qualified configuration and request database")
     if database.foreground_limit != config.db_units:
         raise ValueError("Shared foreground database budget does not match configuration")
+    # Same rule as initialize_request_service: detached work needs its own budget.
+    detached = config.service == "memory" or (tracker is not None and getattr(tracker, "persist_activity", True))
+    if detached and database._background_slots is None:
+        raise ValueError("Shared detached work requires explicit background budgets")
     if not isinstance(loaded_commit, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", loaded_commit):
         raise ValueError("Shared MCP requires known loaded commit identity")
     try:
@@ -74,11 +83,16 @@ async def build_http_app(server, *, config, resolver, database, tracker,
         caller = authenticated_caller(request.scope)
         with caller_scope(caller, config.service):
             active = enabled() is True
+            try:
+                async with asyncio.timeout(_STATUS_FRESHNESS_WAIT_S):
+                    stale = await freshness()
+            except TimeoutError:
+                stale = None
             return JSONResponse({
                 "service": config.service, "loaded_commit": loaded_commit,
                 "started_at": started_at, "transport_schema_version": 1,
                 "catalog_revision": catalog.revision(caller, enabled=active),
-                "enabled": active, "stale": await freshness(),
+                "enabled": active, "stale": stale,
                 "active_tools": messages.limiter.borrowed_tokens, "busy_refusals": messages.busy,
             })
 

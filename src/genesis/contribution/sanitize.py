@@ -30,6 +30,7 @@ user's "why was this rejected?" explanation.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -37,7 +38,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from fnmatch import fnmatch
 from pathlib import Path
 
@@ -156,7 +157,7 @@ class _ParsedDiff:
     size_bytes: int
 
 
-def _normalize_diff_path(raw: str) -> str:
+def _normalize_diff_path(raw: str, *, strict: bool = False) -> str:
     """Normalize a `+++ b/path` or `+++ "b/path"` header value to a plain path.
 
     Git emits C-style quoted paths when the filename contains special
@@ -165,19 +166,27 @@ def _normalize_diff_path(raw: str) -> str:
     `föo`. Failing to normalize lets forbidden paths sneak past the
     glob matcher (P1-2 from the code review).
     """
-    path = raw.strip()
+    # Git appends a tab separator to unquoted ---/+++ paths containing spaces.
+    # Spaces themselves belong to the filename, including trailing spaces.
+    path = raw.removesuffix("\t")
     if path.startswith('"') and path.endswith('"') and len(path) >= 2:
         inner = path[1:-1]
+        if strict and not re.fullmatch(r'(?:[\x20-\x21\x23-\x5b\x5d-\x7e]|\\(?:[abfnrtv"\\]|[0-3][0-7]{2}))*', inner):
+            raise ValueError("invalid_path")
         # C-style escape decode — git uses unicode_escape over UTF-8 bytes
         try:
             path = (
                 inner.encode("latin-1", "backslashreplace")
                 .decode("unicode_escape")
                 .encode("latin-1", "backslashreplace")
-                .decode("utf-8", "replace")
+                .decode("utf-8", "strict" if strict else "replace")
             )
         except (UnicodeDecodeError, UnicodeEncodeError):
+            if strict:
+                raise ValueError("invalid_path") from None
             path = inner  # best-effort; downstream glob will still likely fail-closed
+    if strict and "\0" in path:
+        raise ValueError("invalid_path")
     if path.startswith("a/") or path.startswith("b/"):
         path = path[2:]
     return path
@@ -186,12 +195,31 @@ def _normalize_diff_path(raw: str) -> str:
 _DIFF_GIT_RE = re.compile(r"^diff --git (.+?) (.+?)$")
 
 
+def _native_diff_file(header: str) -> str:
+    """Fixed a/b prefixes and --no-renames give two copies of the same path."""
+    match = re.fullmatch(r"diff --git a/(.+) b/\1", header)
+    if match:
+        path = match.group(1)
+        if any(ord(char) < 32 or ord(char) >= 127 for char in path):
+            raise ValueError("invalid_path")
+        return path
+    match = re.fullmatch(r'diff --git "a/((?:[^"\\]|\\.)+)" "b/\1"', header)
+    if match:
+        return _normalize_diff_path('"b/' + match.group(1) + '"', strict=True)
+    raise ValueError("unsupported_file_header")
+
+
 def _extract_diff_git_paths(header: str) -> tuple[str | None, str | None]:
     """Extract (a-path, b-path) from a `diff --git` line.
 
     Handles both quoted (`"a/..."`) and unquoted forms. Returns
     whatever it can parse; None for unparseable halves.
     """
+    try:
+        path = _native_diff_file(header)
+        return path, path
+    except ValueError:
+        pass  # legacy rename/copy headers may name two different paths
     m = _DIFF_GIT_RE.match(header)
     if not m:
         return None, None
@@ -201,7 +229,102 @@ def _extract_diff_git_paths(header: str) -> tuple[str | None, str | None]:
     return a, b
 
 
-def parse_diff(diff_text: str) -> _ParsedDiff:
+@dataclass
+class _NativeDiffFile:
+    """Native file envelope; content collection remains in the shared parser."""
+
+    path: str
+    modes: dict[str, str] = field(default_factory=dict)
+    index: tuple[str, str, str | None] | None = None
+    old: str | None = None
+    new: str | None = None
+    ends: tuple[int, int] = (0, 0)
+    eof: set[str] = field(default_factory=set)
+    last_prefix: str = ""
+
+    def header(self, raw: str) -> bool:
+        mode = re.fullmatch(r"(old mode|new mode|new file mode|deleted file mode) (100644|100755|120000)", raw)
+        if mode:
+            if self.index is not None or self.old is not None or mode[1] in self.modes:
+                raise ValueError("invalid_mode_order")
+            self.modes[mode[1]] = mode[2]
+            return True
+        if raw.startswith("index "):
+            index = re.fullmatch(r"index ([0-9a-f]{40}|[0-9a-f]{64})\.\.([0-9a-f]{40}|[0-9a-f]{64})(?: (100644|100755|120000))?", raw)
+            if (index is None or len(index[1]) != len(index[2])
+                    or self.index is not None or self.old is not None):
+                raise ValueError("invalid_index")
+            self.index = index[1], index[2], index[3]
+            return True
+        if raw.startswith(("--- ", "+++ ")):
+            old = raw.startswith("--- ")
+            if self.index is None or (self.old is not None if old else self.old is None or self.new is not None):
+                raise ValueError("invalid_file_headers")
+            value = raw[4:]
+            path = _normalize_diff_path(value, strict=True)
+            prefix = "a/" if old else "b/"
+            if path != "/dev/null" and (not value.startswith((prefix, '"' + prefix)) or path != self.path):
+                raise ValueError("mismatched_file_path")
+            if old:
+                self.old = path
+            else:
+                self.new = path
+            return True
+        return False
+
+    def validate(self, *, content: bool) -> None:
+        creation, deletion = "new file mode" in self.modes, "deleted file mode" in self.modes
+        paired = "old mode" in self.modes and "new mode" in self.modes
+        if (("old mode" in self.modes) != ("new mode" in self.modes)
+                or (creation and deletion) or (paired and (creation or deletion))):
+            raise ValueError("conflicting_modes")
+        if self.index is not None:
+            old, new, mode = self.index
+            if (set(old) == {"0"}) != creation or (set(new) == {"0"}) != deletion:
+                raise ValueError("inconsistent_index")
+            if mode is not None and self.modes:
+                raise ValueError("conflicting_modes")
+        if content:
+            if self.index is None or self.old is None or self.new is None:
+                raise ValueError("missing_file_headers")
+            if (self.old == "/dev/null") != creation or (self.new == "/dev/null") != deletion:
+                raise ValueError("inconsistent_file_sides")
+            return
+        if self.old is not None or self.new is not None:
+            raise ValueError("incomplete_file")
+        if paired and self.index is None:
+            return
+        empty = {hashlib.sha1(b"blob 0\0", usedforsecurity=False).hexdigest(),
+                 hashlib.sha256(b"blob 0\0").hexdigest()}
+        if self.index and ((creation and self.index[1] in empty) or (deletion and self.index[0] in empty)):
+            return
+        raise ValueError("incomplete_file")
+
+    def hunk(self, old_start: int, old_count: int, new_start: int, new_count: int) -> None:
+        self.validate(content=True)
+        if not (old_count or new_count):
+            raise ValueError("empty_hunk")
+        for side, start, count, previous in zip(
+            ("old", "new"), (old_start, new_start), (old_count, new_count), self.ends, strict=True,
+        ):
+            if ((getattr(self, side) == "/dev/null" and (start or count))
+                    or (count and (not start or side in self.eof))
+                    or start + (count == 0) < previous):
+                raise ValueError("invalid_hunk_range")
+        self.ends = old_start + max(old_count, 1), new_start + max(new_count, 1)
+
+    def body(self, prefix: str) -> None:
+        sides = {"old", "new"} if prefix == " " else {"new" if prefix == "+" else "old"}
+        if sides & self.eof or any(getattr(self, side) == "/dev/null" for side in sides):
+            raise ValueError("invalid_file_side")
+        self.last_prefix = prefix
+
+    def newline_marker(self) -> None:
+        self.eof.update({"old", "new"} if self.last_prefix == " " else
+                        {"new" if self.last_prefix == "+" else "old"})
+
+
+def parse_diff(diff_text: str, *, strict: bool = False) -> _ParsedDiff:
     """Parse a unified diff into per-file added lines.
 
     Tracks added lines (`+...`) AND all file paths touched by the
@@ -214,32 +337,117 @@ def parse_diff(diff_text: str) -> _ParsedDiff:
 
     Removed lines are what's leaving the codebase, not what the
     contribution ships — they're not scanned for content. Binary
-    patches are flagged separately.
+    patches are flagged separately. The default remains tolerant of incomplete
+    legacy fixtures. Strict mode accepts the native adapter's fixed-format
+    per-parent Git patches and raises value-free reason codes on incomplete or
+    unsupported input; it never silently certifies a partial parse.
     """
     files: list[str] = []
     added: list[tuple[str, int, str]] = []
     current_file: str | None = None
     line_no = 0
     is_binary = False
+    in_hunk = False
+    old_left = new_left = 0
+    native_file: _NativeDiffFile | None = None
+    saw_hunk = False
+    body_line = marker_seen = False
+
+    def _finish_file() -> None:
+        if not strict or native_file is None:
+            return
+        if old_left or new_left:
+            raise ValueError("incomplete_hunk")
+        native_file.validate(content=saw_hunk)
 
     def _add_file(path: str | None) -> None:
         if path and path != "/dev/null" and path not in files:
             files.append(path)
 
-    for raw in diff_text.splitlines():
+    try:
+        size_bytes = len(diff_text.encode("utf-8"))
+    except UnicodeError:
+        if strict:
+            raise ValueError("invalid_encoding") from None
+        raise
+    if strict and diff_text and not diff_text.endswith("\n"):
+        raise ValueError("truncated_patch")
+    records = diff_text.split("\n")
+    if records[-1] == "":
+        records.pop()
+    for raw in records:
         # `diff --git a/foo b/bar` — seen BEFORE +++/--- headers. This
         # is the only header present for rename-only or mode-only commits.
         if raw.startswith("diff --git "):
+            _finish_file()
+            if strict:
+                native_file = _NativeDiffFile(_native_diff_file(raw))
             a, b = _extract_diff_git_paths(raw)
             _add_file(a)
             _add_file(b)
+            current_file = None
+            in_hunk = saw_hunk = False
+            body_line = marker_seen = False
+            old_left = new_left = 0
+            continue
+        if raw.startswith("@@"):
+            if strict and (old_left or new_left):
+                raise ValueError("incomplete_hunk")
+            match = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*)$", raw)
+            if not match:
+                if strict:
+                    raise ValueError("unsupported_hunk")
+                continue
+            if strict and native_file is None:
+                raise ValueError("missing_file_headers")
+            old_start, new_start = int(match[1]), int(match[3])
+            old_left = int(match[2]) if match[2] is not None else 1
+            new_left = int(match[4]) if match[4] is not None else 1
+            if native_file is not None:
+                native_file.hunk(old_start, old_left, new_start, new_left)
+            line_no = new_start - 1
+            in_hunk = saw_hunk = True
+            body_line = marker_seen = False
+            continue
+        if in_hunk:
+            if raw == "\\ No newline at end of file":
+                if strict and (not body_line or marker_seen):
+                    raise ValueError("invalid_newline_marker")
+                if native_file is not None:
+                    native_file.newline_marker()
+                marker_seen = True
+                continue
+            prefix = raw[:1]
+            if prefix in {"+", "-", " "}:
+                old_used, new_used = prefix != "+", prefix != "-"
+                if strict and ((old_used and old_left <= 0) or (new_used and new_left <= 0)):
+                    raise ValueError("hunk_count_overrun")
+                if native_file is not None:
+                    native_file.body(prefix)
+                old_left -= int(old_used)
+                new_left -= int(new_used)
+                if new_used:
+                    line_no += 1
+                if prefix == "+" and current_file is not None:
+                    added.append((current_file, line_no, raw[1:]))
+                body_line = True
+                marker_seen = False
+                continue
+            if strict:
+                raise ValueError("invalid_hunk_record")
+        if strict and native_file is None:
+            raise ValueError("missing_file_header")
+        if native_file is not None:
+            if not native_file.header(raw):
+                raise ValueError("unsupported_record")
+            current_file = None if native_file.new == "/dev/null" else native_file.new
             continue
         # Rename markers — git emits both when a file is renamed.
         if raw.startswith("rename from "):
-            _add_file(_normalize_diff_path(raw[len("rename from "):].strip()))
+            _add_file(_normalize_diff_path(raw[len("rename from "):]))
             continue
         if raw.startswith("rename to "):
-            _add_file(_normalize_diff_path(raw[len("rename to "):].strip()))
+            _add_file(_normalize_diff_path(raw[len("rename to "):]))
             continue
         # Mode changes — file paths already captured via `diff --git` line
         # above, but record for completeness (some diff-format variants
@@ -248,7 +456,7 @@ def parse_diff(diff_text: str) -> _ParsedDiff:
             continue  # no path info here; captured upstream
         if raw.startswith("+++ "):
             # +++ b/path/to/file  OR  +++ /dev/null  OR  +++ "b/path with space"
-            path_raw = raw[4:].strip()
+            path_raw = raw[4:]
             if path_raw == "/dev/null":
                 current_file = None
                 line_no = 0
@@ -260,14 +468,8 @@ def parse_diff(diff_text: str) -> _ParsedDiff:
             continue
         if raw.startswith("--- "):
             continue
-        if raw.startswith("Binary files") and "differ" in raw:
+        if (raw.startswith("Binary files") and "differ" in raw) or raw == "GIT binary patch":
             is_binary = True
-            continue
-        if raw.startswith("@@"):
-            # @@ -a,b +c,d @@
-            m = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw)
-            if m:
-                line_no = int(m.group(1)) - 1
             continue
         if raw.startswith("+") and not raw.startswith("+++"):
             line_no += 1
@@ -277,11 +479,12 @@ def parse_diff(diff_text: str) -> _ParsedDiff:
             if raw.startswith(" "):
                 line_no += 1
 
+    _finish_file()
     return _ParsedDiff(
         file_paths=files,
         added_lines=added,
         is_binary=is_binary,
-        size_bytes=len(diff_text.encode("utf-8")),
+        size_bytes=size_bytes,
     )
 
 

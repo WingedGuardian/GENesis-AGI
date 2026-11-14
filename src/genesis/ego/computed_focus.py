@@ -15,7 +15,25 @@ import logging
 
 import aiosqlite
 
+from genesis.util.text import clip_words, first_sentence
+
 logger = logging.getLogger(__name__)
+
+# Display lengths per field, marker included. Unchanged from the raw slices
+# they replace, so no field exceeds its old maximum; it now ends on a whole
+# word. A dot inside a token (v3.0) no longer ends the sentence, so a field
+# can show more of a row than before, up to that same maximum.
+_DIRECTIVE_CHARS = 60
+_PROPOSAL_CHARS = 40
+_GOAL_CHARS = 40
+
+
+def _topic(content: str | None, n: int) -> str:
+    """First sentence of ``content`` without its full stop, clipped to ``n``."""
+    sentence = first_sentence(content or "")
+    if sentence.endswith("."):
+        sentence = sentence[:-1]
+    return clip_words(sentence, n)
 
 
 async def compute_focus_summary(
@@ -49,7 +67,7 @@ async def compute_focus_summary(
         )
         if directives:
             summaries = [
-                d.get("content", "")[:60].split(".")[0]
+                _topic(d.get("content", ""), _DIRECTIVE_CHARS)
                 for d in directives[:3]
             ]
             parts.append(
@@ -59,8 +77,9 @@ async def compute_focus_summary(
         # Proposal board
         board = await ego_crud.get_board(db, board_size=5)
         if board:
+            # Proposals have no title column: show the first sentence.
             topics = [
-                p.get("content", "")[:40].split(".")[0]
+                _topic(p.get("content", ""), _PROPOSAL_CHARS)
                 for p in board[:3]
             ]
             parts.append(
@@ -73,7 +92,10 @@ async def compute_focus_summary(
 
             goals = await user_goals.list_active(db, limit=5, origin="user")
             if goals:
-                titles = [g.get("title", "")[:40] for g in goals[:3]]
+                titles = [
+                    clip_words(g.get("title", "") or "", _GOAL_CHARS)
+                    for g in goals[:3]
+                ]
                 suffix = f" (+{len(goals) - 3} more)" if len(goals) > 3 else ""
                 parts.append(f"goals: {', '.join(titles)}{suffix}")
 

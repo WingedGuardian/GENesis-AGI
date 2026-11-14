@@ -115,6 +115,7 @@ def _rollback_guard(
     extra: str = "",
     db_file: str = "",
     lock_held: bool = True,
+    after: str = "",
 ) -> str:
     """The guard, inside a function as in _do_rollback, then its verdict. The real
     backup helpers are loaded from update.sh (POST_MERGE=true skips the pre-stop
@@ -139,6 +140,7 @@ def _rollback_guard(
         + "guard() {\n"
         + (f'DB_RESTORE_OWED=1\nDB_SNAPSHOT_TAKEN=1\nDB_FILE="{db_file}"\n' if db_file else "")
         + _block("rollback-code-guard")
+        + after
         + (
             "    local server_down=true\n"
             + _block("rollback-db-decision")
@@ -1453,3 +1455,70 @@ def test_staged_excused_guard_uses_plumbing_and_runs_at_pre_stop():
     prestop = text.index("# BEGIN staged-excused-prestop")
     stop = text.index("--- Stopping services for update ---")
     assert guard < backup_end < snapshot < prestop < stop
+
+
+# ── #3492 D2a-1 (T-D29): the rollback reinstalls the restored HEAD's repair kit ──
+
+_KIT_INSTALLER = REPO_ROOT / "scripts" / "lib" / "live_repair_kit.py"
+
+
+def _kit_repo(tmp_path: Path) -> tuple[Path, str]:
+    """A checkout on main whose tag carries the nine kit sources, then a merge
+    that changes one of them (so the merged code's kit differs from the tag's)."""
+    from tests.test_scripts._live_repair_world import KIT_FILES
+
+    root = tmp_path / "kitroot"
+    _git(tmp_path, "init", "-q", "-b", "main", str(root))
+    lib = root / "scripts" / "lib"
+    lib.mkdir(parents=True)
+    for name in KIT_FILES:
+        (lib / name).write_bytes((REPO_ROOT / "scripts" / "lib" / name).read_bytes())
+    (root / "code.py").write_text("x = 1\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "c1")
+    _git(root, "tag", "pre-update-test")
+    (lib / "alert_queue.sh").write_text((lib / "alert_queue.sh").read_text() + "# merged\n")
+    _git(root, "commit", "-qam", "merged upstream")
+    return root, _git(root, "rev-parse", "HEAD")
+
+
+def _kit(cmd: str, root: Path, home: Path) -> str:
+    return subprocess.run(
+        ["python3", "-I", "-S", str(_KIT_INSTALLER), cmd, str(root), str(home)],
+        capture_output=True, text=True, env=_env(home), check=True,
+    ).stdout  # fmt: skip
+
+
+def _kit_status(root: Path, home: Path) -> dict:
+    import json
+
+    return json.loads(_kit("status", root, home))
+
+
+def _kit_block() -> str:
+    return f'    SCRIPT_DIR="{REPO_ROOT / "scripts"}"\n' + _block("rollback-kit-install")
+
+
+def test_a_rollback_reinstalls_the_restored_heads_kit(tmp_path):
+    home = tmp_path / "home"
+    (home / ".genesis").mkdir(parents=True)
+    root, merged = _kit_repo(tmp_path)
+    _kit("install", root, home)
+    newer = _kit_status(root, home)["kit_id"]
+    r = _run(_rollback_guard(root, own_head=merged, after=_kit_block()), home)
+    assert _verdict(r) == ("reset", "true")
+    assert _git(root, "rev-parse", "HEAD") == _git(root, "rev-parse", "pre-update-test")
+    s = _kit_status(root, home)
+    assert s["state"] == "ok" and s["kit_id"] != newer, (s, r.stdout)
+
+
+def test_a_rollback_that_left_the_code_installs_no_kit(tmp_path):
+    home = tmp_path / "home"
+    (home / ".genesis").mkdir(parents=True)
+    root, merged = _kit_repo(tmp_path)
+    _kit("install", root, home)
+    newer = _kit_status(root, home)["kit_id"]
+    (root / "code.py").write_text("an edit nobody validated\n")
+    r = _run(_rollback_guard(root, own_head=merged, after=_kit_block()), home)
+    assert _verdict(r)[1] == "false", r.stdout
+    assert _kit_status(root, home)["kit_id"] == newer

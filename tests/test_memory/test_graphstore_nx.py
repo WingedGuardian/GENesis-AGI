@@ -738,3 +738,28 @@ async def test_a_closed_connection_after_a_cached_build_is_unavailability(tmp_pa
 
     with pytest.raises(GraphUnavailableError):
         await store.centrality(db, top_n=5)
+
+async def test_centrality_is_reproducible_for_sampled_betweenness(tmp_path):
+    """Independent graphs with opposite insertion orders must rank identically."""
+    links = [(f"node-{i}", f"node-{i + 1}") for i in range(204)]
+    forward_path = tmp_path / "centrality_forward.db"
+    reverse_path = tmp_path / "centrality_reverse.db"
+    await _seed(forward_path, links)
+    await _seed(reverse_path, list(reversed(links)))
+
+    first_store = NetworkxGraphStore()
+    first_db = await aiosqlite.connect(str(forward_path))
+    try:
+        first = await first_store.centrality(first_db, top_n=None)
+    finally:
+        await first_db.close()
+
+    second_store = NetworkxGraphStore()
+    second_db = await aiosqlite.connect(str(reverse_path))
+    await second_db.execute("PRAGMA reverse_unordered_selects = ON")
+    try:
+        second = await second_store.centrality(second_db, top_n=None)
+    finally:
+        await second_db.close()
+
+    assert first == second

@@ -1,0 +1,1 @@
+- fastmcp is held below 4.1.7. That release publishes a tool's whole docstring as its MCP description instead of its first line, which lengthened every Genesis tool description and broke the catalog contract test. The adoption decision is tracked in #4309.

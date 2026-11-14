@@ -485,15 +485,20 @@ _LIVE_GUARDS = [
     ("scripts/hooks/background_pipe_guard.py", "ls | wc -l", True),
 ]
 
+#: Named by guard. The default id would spell out the refused command, and
+#: _PROTECTED sits under the home directory, which differs from one run to the
+#: next: CI's collected-floor job compares ids across two runs.
+_LIVE_GUARD_IDS = [Path(script).stem for script, _, _ in _LIVE_GUARDS]
 
-@pytest.mark.parametrize(("script", "refusal", "background"), _LIVE_GUARDS)
+
+@pytest.mark.parametrize(("script", "refusal", "background"), _LIVE_GUARDS, ids=_LIVE_GUARD_IDS)
 def test_live_a_multi_step_refusal_carries_the_note(script, refusal, background):
     proc = _drive(script, f"echo hi > /tmp/dw_probe && {refusal}", background)
     assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr)
     assert "ENTIRE command was discarded" in proc.stderr, proc.stderr
 
 
-@pytest.mark.parametrize(("script", "refusal", "background"), _LIVE_GUARDS)
+@pytest.mark.parametrize(("script", "refusal", "background"), _LIVE_GUARDS, ids=_LIVE_GUARD_IDS)
 def test_live_the_refusal_still_blocks_and_says_why(script, refusal, background):
     """The note is ADDITIVE: the guard's own verdict and message are unchanged."""
     proc = _drive(script, f"echo hi > /tmp/dw_probe && {refusal}", background)
@@ -501,7 +506,7 @@ def test_live_the_refusal_still_blocks_and_says_why(script, refusal, background)
     assert "blocked" in proc.stderr.lower()
 
 
-@pytest.mark.parametrize(("script", "refusal", "background"), _LIVE_GUARDS)
+@pytest.mark.parametrize(("script", "refusal", "background"), _LIVE_GUARDS, ids=_LIVE_GUARD_IDS)
 def test_live_an_allowed_command_is_untouched(script, refusal, background):
     proc = _drive(script, "cd /tmp && echo hello", background)
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
@@ -523,7 +528,7 @@ def prompt_note(command=None):
 """
 
 
-@pytest.mark.parametrize(("script", "refusal", "background"), _LIVE_GUARDS)
+@pytest.mark.parametrize(("script", "refusal", "background"), _LIVE_GUARDS, ids=_LIVE_GUARD_IDS)
 def test_live_a_poisoned_helper_can_never_fail_a_guard_open(tmp_path, script, refusal, background):
     """A cosmetic helper must not be able to turn a refusal into a non-block.
 

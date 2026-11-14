@@ -118,6 +118,17 @@ async def test_scans_whole_outbound_envelope_before_store(bridge):
     assert (await (await bridge.db.execute("SELECT count(*) FROM peer_outbox")).fetchone())[0] == 0
 
 
+async def test_a_shared_credential_shape_is_refused_before_store(bridge):
+    # A shape the scanner adopts from the shared table; synthetic, built from parts.
+    box = Outbox(bridge.registry)
+    with pytest.raises(ConversationRefusal, match="outbound_refused"):
+        await box.prepare("alpha", "the key is " + "nvapi-" + "a" * 40)
+    assert (await (await bridge.db.execute("SELECT count(*) FROM peer_outbox")).fetchone())[0] == 0
+    # Guard: the same sentence without the value is stored.
+    envelope, _ = await box.prepare("alpha", "the key is rotated")
+    assert envelope.message_id
+
+
 async def test_governed_delivery_preserves_unformatted_typed_payload_and_identity(bridge):
     box = Outbox(bridge.registry)
     p = pipeline(bridge)

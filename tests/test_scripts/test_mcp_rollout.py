@@ -128,6 +128,13 @@ def test_external_client_is_never_routed(flag):
     assert "external" in d.reason
 
 
+def test_a_labelled_client_is_never_routed():
+    # Owner-mode Codex: a shared service would not see the label in this env.
+    d = _decide(STDIO, env={"GENESIS_CALLER_PROFILE": "codex"})
+    assert d.argv == STDIO and not d.shared
+    assert "labelled client" in d.reason
+
+
 @pytest.mark.parametrize("value", ["1", "true", "yes"])
 def test_kill_switch_forces_stdio(value):
     d = _decide(env={"GENESIS_MCP_SHARED_DISABLED": value})

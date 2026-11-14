@@ -103,8 +103,64 @@ def _normalize_desc(value: object) -> str:
     return " ".join(str(value).split())
 
 
+# The fallback reads ``disable-model-invocation`` exactly as the YAML path does
+# (``_parse_frontmatter``: bool True, or the string "true" in any case), for every
+# spelling YAML gives that answer: a quoted or spaced top-level key, a quoted or
+# padded value, ``!!bool true|yes|on``, ``!!str true``, a trailing comment, and a
+# block scalar or next-line value. ``yes``/``on``/``1`` untagged stay strings or
+# ints under the loader, so they are not manual on either path.
+_MANUAL_KEY_RE = re.compile(
+    r"""^["']?disable-model-invocation["']?[ \t]*:(.*)$""",
+    re.MULTILINE | re.IGNORECASE,
+)
+_BLOCK_INDICATORS = frozenset({"", "|", "|-", "|+", ">", ">-", ">+"})
+
+
+def _normalize_frontmatter_text(content: str) -> str:
+    """Drop a UTF-8 byte-order mark and normalise line endings to ``\n``.
+
+    A BOM before ``---`` hides the whole frontmatter (and with it the
+    manual-only flag) from both parsers, and a ``\r`` before the newline
+    defeats the fallback's line-anchored patterns. ``Path.read_text`` already
+    normalises newlines but keeps a BOM; other callers may pass either.
+    """
+    return content.removeprefix("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _legacy_manual_only(frontmatter: str) -> bool:
+    """The fallback parser's read of ``disable-model-invocation``.
+
+    Matches the YAML path's answer for the spellings listed above
+    ``_MANUAL_KEY_RE``; anything else (another tag, an unquoted ``yes``) is
+    not manual, as it is not on the YAML path.
+    """
+    match = _MANUAL_KEY_RE.search(frontmatter)
+    if match is None:
+        return False
+    value = match.group(1).split("#", 1)[0].strip()
+    if value in _BLOCK_INDICATORS:
+        # Block scalar or a value on the next line: its first indented line.
+        for line in frontmatter[match.end():].split("\n")[1:]:
+            if not line.strip():
+                continue
+            if not line[:1].isspace():
+                return False
+            value = line.split("#", 1)[0].strip()
+            break
+        else:
+            return False
+    lowered = value.lower()
+    if lowered.startswith("!!bool"):
+        return lowered[len("!!bool"):].strip().strip("'\"").strip() in {"true", "yes", "on"}
+    if lowered.startswith("!!str"):
+        lowered = lowered[len("!!str"):].strip()
+    elif lowered.startswith("!!"):
+        return False
+    return lowered.strip("'\"").strip() == "true"
+
+
 def _parse_frontmatter(content: str, fallback_name: str = "") -> dict:
-    """Parse YAML frontmatter into name/description/keywords.
+    """Parse name/description/keywords and optional manual-only metadata.
 
     Uses a real YAML parser (the bounded, alias-forbidding ``_FrontmatterLoader``)
     so descriptions with apostrophes, escaped quotes, inline comments, or
@@ -121,6 +177,7 @@ def _parse_frontmatter(content: str, fallback_name: str = "") -> dict:
     unavailable, the block exceeds the size cap, or it is not a valid YAML
     mapping.
     """
+    content = _normalize_frontmatter_text(content)
     if content.startswith("---") and yaml is not None:
         end = content.find("\n---", 3)
         if end < 0:
@@ -160,11 +217,15 @@ def _parse_frontmatter(content: str, fallback_name: str = "") -> dict:
                     keywords = [k.strip() for k in kw.split(",") if k.strip()]
                 else:
                     keywords = []
-                return {
+                info = {
                     "name": name,
                     "description": description,
                     "keywords": keywords,
                 }
+                manual = loaded.get("disable-model-invocation")
+                if manual is True or (isinstance(manual, str) and manual.strip().lower() == "true"):
+                    info["disable-model-invocation"] = True
+                return info
     # PyYAML unavailable, no frontmatter, oversized, or block not a mapping.
     return _parse_frontmatter_legacy(content, fallback_name)
 
@@ -178,10 +239,15 @@ def _parse_frontmatter_legacy(content: str, fallback_name: str = "") -> dict:
     name = fallback_name
     description = ""
     keywords: list[str] = []
+    manual_only = False
+    content = _normalize_frontmatter_text(content)
     if content.startswith("---"):
-        end = content.find("---", 3)
+        end = content.find("\n---", 3)
+        if end < 0:
+            end = content.find("---", 3)
         if end > 0:
             frontmatter = content[3:end]
+            manual_only = _legacy_manual_only(frontmatter)
             name_match = re.search(r'name:\s*["\']?([^"\'\n]+)', frontmatter)
             if name_match:
                 name = name_match.group(1).strip()
@@ -212,7 +278,10 @@ def _parse_frontmatter_legacy(content: str, fallback_name: str = "") -> dict:
                     for k in kw_match.group(1).split(",")
                     if k.strip()
                 ]
-    return {"name": name, "description": description, "keywords": keywords}
+    info = {"name": name, "description": description, "keywords": keywords}
+    if manual_only:
+        info["disable-model-invocation"] = True
+    return info
 
 
 # SELF markers: the files that make a directory a skill IN ITS OWN RIGHT.

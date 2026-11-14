@@ -358,6 +358,87 @@ def test_every_repo_skill_stays_reachable():
     assert unreachable == []
 
 
+#: Everyday words that must never be a skill's frontmatter `keywords:` entry.
+#: One keyword hit scores 2 = `_MIN_SCORE`, so each entry fires its skill ALONE
+#: on any prompt that uses the word. This is NOT `_NAME_TOKEN_STOPLIST`: that
+#: list answers a different question (which NAME words never score) and the
+#: hook deliberately lets a skill declare one of its words as a keyword
+#: ("genesis" for genesis-development, "browser" for browser-automation).
+#: Every word here was in a repo skill's `keywords:`, or was tried in
+#: closing-session's (`work, queue, drive, green, blocking`, recorded as
+#: misfiring in its frontmatter). MEASURED 2026-11-07 by replaying 2,222
+#: prompts from one install's last 30 days through `_score_skill`: `content`
+#: alone fired content-publish on 96 (it matches the `<pasted_content>` tag),
+#: `snapshot` fired browser-automation on 8 prompts about Qdrant snapshots,
+#: `proposal` fired deliverable-builder on 12 ego proposals, and `write`,
+#: `post`, `report` and `pin` also fired on unrelated prompts. The rest were
+#: removed on JUDGMENT as common English: they appeared zero or one time in
+#: that replay, so their misfire rate was not measured. Keep it short: add a
+#: word when a skill's keyword misfires, not from a dictionary.
+#: Generic words some skills KEEP on purpose (genesis, implement, rework,
+#: verification) are absent: their frontmatter records the measured tradeoff.
+_GENERIC_KEYWORDS = frozenset({
+    # writing / publishing
+    "content", "write", "post", "draft", "report", "export", "client",
+    "professional", "polish", "proposal", "submission", "distribution",
+    # web / UI nouns and verbs that every ops prompt uses
+    "page", "site", "tab", "web", "url", "fill", "submit", "login",
+    "upload", "button", "navigate", "snapshot", "overlay",
+    "automate", "automation", "fingerprint",
+    # NOT listed, by owner choice 2026-11-07: `medium` (content-publish),
+    # `screenshot` and `form` (browser-automation), `bot` and `detection`
+    # (stealth-browser) stay as keywords, trading some misfires for those
+    # skills' real triggers ("write a Medium post", "fill out the form",
+    # "the site has bot detection").
+    # analysis
+    "audit", "missing", "map", "compare", "architecture", "capability",
+    "capabilities", "lacks",
+    # release
+    "pin",
+    # tried in closing-session and measured misfiring
+    "work", "queue", "drive", "green", "blocking",
+})
+
+
+def test_no_repo_skill_keyword_is_a_generic_word():
+    """A frontmatter keyword fires its skill on its own, so a generic English
+    word in `keywords:` nudges that skill onto unrelated prompts. Every skill
+    the catalog indexes from this repo must keep its keywords distinctive."""
+    import generate_skill_catalog as gen
+
+    repo = Path(__file__).resolve().parents[2]
+    dirs = [(1, gen.TIER1_DIR)] + [
+        (2, d) for d in gen.TIER2_DIRS if d.is_relative_to(gen.REPO_ROOT)
+    ]
+    assert len(dirs) >= 2, "repo tier-2 skill dir missing from the generator"
+    scanned = 0
+    per_dir = {d: 0 for _tier, d in dirs}
+    offenders = {}
+    for tier, d in dirs:
+        for skill in gen._scan_tier(d, tier, repo):
+            scanned += 1
+            per_dir[d] += 1
+            bad = sorted(
+                k for k in skill.get("keywords", []) if k.lower() in _GENERIC_KEYWORDS
+            )
+            if bad:
+                offenders[skill["name"]] = bad
+    assert scanned >= 10, f"scanned only {scanned} skills; the enumeration is broken"
+    # Each indexed directory must contribute skills: a moved or emptied tier
+    # would otherwise drop out of this check silently.
+    assert all(per_dir.values()), per_dir
+    assert offenders == {}
+
+
+def test_generic_keyword_stoplist_catches_a_generic_entry():
+    """Control for the test above: the check reads the parsed keywords, so a
+    skill declaring a generic word IS flagged (case-insensitive)."""
+    import generate_skill_catalog as gen
+
+    info = gen._parse_frontmatter("---\nname: x\nkeywords: [ffmpeg, Page]\n---\n")
+    assert [k for k in info["keywords"] if k.lower() in _GENERIC_KEYWORDS] == ["Page"]
+
+
 def test_main_vendor_skill_silent_without_vendor_word(tmp_path, monkeypatch, capsys):
     """End to end, pinned on the GATE alone: 'version checker' is not a
     stoplisted name word, so only the gate can keep this nudge silent."""

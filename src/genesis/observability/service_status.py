@@ -21,7 +21,13 @@ from genesis.util.systemd import systemctl_env
 
 logger = logging.getLogger(__name__)
 
-_BRIDGE_LOCK = Path.home() / ".genesis" / "bridge.lock"
+# Each service holds a ProcessLock (genesis.util.process_lock) named for it in
+# this directory: `genesis serve` takes "genesis-server", the bridge "bridge".
+_PID_DIR = Path.home() / ".genesis"
+_LOCK_FOR_UNIT = {
+    "genesis-server.service": "genesis-server.lock",
+    "genesis-bridge.service": "bridge.lock",
+}
 _WATCHDOG_STATE = Path.home() / ".genesis" / "watchdog_state.json"
 
 # Qdrant collections that must exist for Genesis to function.
@@ -101,20 +107,43 @@ def query_systemd_unit(unit_name: str) -> dict:
         return {}
 
 
-def _bridge_pid_alive() -> tuple[int | None, bool]:
-    """Read bridge PID from lock file and check if process is alive.
+def _service_pid_alive(unit_name: str, main_pid: str | None) -> tuple[int | None, bool]:
+    """Read the PID from ``unit_name``'s own lock file and check it is live.
 
-    Returns (pid, is_alive). pid is None if lock file missing/unreadable.
+    Returns (pid, is_alive). pid is reported only when it is alive, so a
+    stale lock's pid is never shown as the service's; otherwise (None, False).
+    The lock is read, never locked: taking the flock here, even briefly, could
+    make a starting server exit.
+
+    "Alive" means the UNIT's own process is running. A SIGKILLed service leaves
+    its lock behind, and its pid can be reused by an unrelated process, so "a
+    process with that pid exists" is not enough. When systemd reported the
+    unit's ``MainPID`` (both units exec Python directly, so it is the lock
+    holder), the lock pid must also equal it; ``MainPID=0`` means the unit has
+    no running main process, which includes a server started outside the unit.
+    With no ``MainPID`` at all (the systemctl query failed) only the existence
+    check remains.
     """
+    lock_name = _LOCK_FOR_UNIT.get(unit_name)
+    if lock_name is None:
+        return None, False
     try:
-        content = _BRIDGE_LOCK.read_text().strip()
-        if not content:
-            return None, False
-        pid = int(content)
-        os.kill(pid, 0)  # signal 0 = existence check
-        return pid, True
+        pid = int((_PID_DIR / lock_name).read_text().strip())
     except (OSError, ValueError):
         return None, False
+    if pid <= 1:  # 0 / -1 address a process group or every process, not a service
+        return None, False
+    try:
+        os.kill(pid, 0)  # signal 0 = existence check
+    except OSError:
+        return None, False
+    if main_pid:
+        try:
+            if int(main_pid) != pid:
+                return None, False
+        except ValueError:
+            return None, False
+    return pid, True
 
 
 def parse_systemd_timestamp(raw: str) -> str | None:
@@ -249,7 +278,7 @@ def collect_service_status() -> dict:
     # Genesis service (auto-detect: server or bridge)
     svc_unit, svc_label = _detect_genesis_service()
     svc_props = query_systemd_unit(svc_unit)
-    bridge_pid, pid_alive = _bridge_pid_alive()
+    bridge_pid, pid_alive = _service_pid_alive(svc_unit, svc_props.get("MainPID"))
     start_ts = parse_systemd_timestamp(svc_props.get("ExecMainStartTimestamp", ""))
     result["bridge"] = {
         "active_state": svc_props.get("ActiveState", "unknown"),

@@ -92,32 +92,45 @@ async def find_exact_duplicate(
     db: aiosqlite.Connection,
     *,
     content: str,
+    source_subsystem: str | None = None,
 ) -> str | None:
-    """Return memory_id if exact content already exists (any collection).
+    """Find exact, recallable content in the writer's visibility scope.
 
-    FTS5 does not support equality (=) on content columns, so we use a
-    length + substr pre-filter followed by Python exact match.
-
-    Collection-agnostic: the FTS ``collection`` column is unreliable
-    (uniformly ``episodic_memory`` regardless of actual Qdrant placement).
+    Collection-agnostic: historical FTS collection values are unreliable.
+    LEFT JOIN preserves metadata-free legacy rows in user scope. Full text
+    equality and every eligibility filter precede LIMIT, so hidden rows and
+    common prefixes cannot crowd a valid duplicate out of the result.
     """
     if not content:
         return None
 
-    # Pre-filter: match on length and first 200 chars to narrow candidates
-    prefix = content[:200]
-    rows = await db.execute_fetchall(
-        "SELECT memory_id, content FROM memory_fts "
-        "WHERE length(content) = ? "
-        "AND substr(content, 1, 200) = ? "
-        "LIMIT 200",
-        (len(content), prefix),
-    )
-    for row in rows:
-        if row[1] == content:
-            return row[0]
+    from datetime import UTC, datetime
 
-    return None
+    sql = """SELECT f.memory_id FROM memory_fts f
+        LEFT JOIN memory_metadata m ON m.memory_id = f.memory_id
+        WHERE f.content = ?
+          AND (m.deprecated IS NULL OR m.deprecated = 0)
+          AND (m.invalid_at IS NULL OR m.invalid_at > ?)
+          AND NOT EXISTS (
+              SELECT 1 FROM deferred_work_queue d
+              WHERE d.work_type = 'memory_deferred_delete'
+                AND d.status IN ('pending', 'processing')
+                AND (CASE WHEN json_valid(d.payload_json)
+                          THEN json_extract(d.payload_json, '$.topic') END) = f.memory_id
+                AND COALESCE(CASE WHEN json_valid(d.payload_json)
+                          THEN json_extract(d.payload_json, '$.category') END, '') = 'memory_delete'
+                AND COALESCE(CASE WHEN json_valid(d.payload_json)
+                          THEN json_extract(d.payload_json, '$.signal_type') END, '') = ''
+          )"""
+    # Same identity as delete_tombstones.has_open_tombstone/count_open_by_identity.
+    params: list = [content, datetime.now(UTC).isoformat()]
+    if source_subsystem is None:
+        sql += " AND m.source_subsystem IS NULL"
+    else:
+        sql += " AND m.source_subsystem = ?"
+        params.append(source_subsystem)
+    rows = await db.execute_fetchall(sql + " LIMIT 1", params)
+    return rows[0][0] if rows else None
 
 
 async def search(

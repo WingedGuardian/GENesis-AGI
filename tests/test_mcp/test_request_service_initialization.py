@@ -14,6 +14,7 @@ from genesis.db.request_database import DatabaseScopeError, RequestDatabase
 from genesis.db.schema import create_all_tables
 from genesis.mcp.request_service import initialize_request_service
 from genesis.mcp.standalone_health import StandaloneHealthDataService
+from genesis.observability.client_call_log import ClientCallLogMiddleware
 from genesis.observability.mcp_middleware import InstrumentationMiddleware
 from genesis.observability.provider_activity import ProviderActivityTracker
 
@@ -286,7 +287,10 @@ async def test_reinitialization_to_legacy_removes_scoped_boundary(database, monk
 
         async with Client(server) as client:
             assert (await client.call_tool("legacy_read")).data == 1
-        assert [m for m in server.middleware if not isinstance(m, InstrumentationMiddleware)] == retained
+        # Both boundaries install_instrumentation manages are excluded: the
+        # instrumentation and the labelled-client call log installed with it.
+        managed = (InstrumentationMiddleware, ClientCallLogMiddleware)
+        assert [m for m in server.middleware if not isinstance(m, managed)] == retained
         boundaries = [m for m in server.middleware if isinstance(m, InstrumentationMiddleware)]
         assert len(boundaries) == int(metrics)
         if metrics:

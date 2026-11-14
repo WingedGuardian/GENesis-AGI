@@ -2582,7 +2582,8 @@ PYEOF
 _tier2_pending_since_baseline() {
     local _baseline="" _rc=0 _activated=""
     local -a _tier2=(scripts/systemd scripts/bootstrap.sh scripts/update.sh
-        scripts/lib/cc_version.sh scripts/hooks pyproject.toml)
+        scripts/lib/cc_version.sh scripts/cc_settings_align.sh scripts/setup_claude_config.py
+        config/cc-global-settings.yaml .claude/settings.json scripts/hooks pyproject.toml)
     if [ "${ON_LIVE:-0}" = 1 ] \
         && _activated="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'refs/genesis/live-activated^{commit}' 2>/dev/null)" \
         && [ -n "$_activated" ] \
@@ -2843,6 +2844,15 @@ if [ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]; then
     memory_resilience_apply
     # Retrofit the raised PID/task ceiling on existing installs (idempotent).
     pid_budget_apply
+    echo ""
+fi
+
+# ── Genesis Claude Code plugins — re-run VISIBLY (bootstrap applied them, but `tail -10` ate its output). This is
+# where an existing install first registers plugins/ (e.g. genesis-secret-redact) and where a warning such as a
+# missing `claude` must be seen. Idempotent: an up-to-date install prints one line per plugin.
+if [ -f "$SCRIPT_DIR/cc_plugins.py" ] && [ -x "$VENV_DIR/bin/python" ]; then
+    "$VENV_DIR/bin/python" "$SCRIPT_DIR/cc_plugins.py" apply --repo-root "$GENESIS_ROOT" \
+        || echo "  WARNING: Genesis Claude Code plugins not installed (see above); re-attempted on the next update"
     echo ""
 fi
 

@@ -204,7 +204,16 @@ try:
         INLINE_P3_RE as _INLINE_P3_RE,
     )
     from review_findings import (
+        cr_findings as _cr_findings,
+    )
+    from review_findings import (
         cr_header_fields as _cr_header_fields,
+    )
+    from review_findings import (
+        cr_markup_mask as _cr_markup_mask,
+    )
+    from review_findings import (
+        cr_masks as _cr_masks,
     )
     from review_findings import (
         cr_severity as _cr_severity,
@@ -254,6 +263,15 @@ except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate on
         raise RuntimeError(_REVIEW_FINDINGS_ERROR)
 
     def _is_cr_marker_line(line):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
+    def _cr_findings(body):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
+    def _cr_markup_mask(body):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
+    def _cr_masks(body, bq_depths=None):  # type: ignore[no-redef]
         raise RuntimeError(_REVIEW_FINDINGS_ERROR)
 
 # This module imports nothing from `review_state`. It once imported the escalation
@@ -359,6 +377,7 @@ try:
         git_subcommand,
         git_subcommand_index,
         has_trailing_override,
+        locale_candidates,
         mentions,
         push_arg_stream,
         split_segments,
@@ -1879,13 +1898,6 @@ def _review_bots(sets: dict[str, frozenset[str]]) -> frozenset[str]:
 # above matches and the if/elif has no else. Read, not recognised; a PR carrying
 # a Major reported `inline-findings: ok`, indistinguishable from a clean one.
 _CR_BLOCKING_SEVERITIES = frozenset({"critical", "major"})
-# CodeRabbit bundles SEVERAL findings into ONE inline comment, separated by a
-# markdown rule, when they land near each other in the diff. Each segment is
-# its own finding with its own severity.
-# At most THREE leading spaces: CommonMark reads a 4+-space-indented rule as
-# CODE, and CodeRabbit quotes markdown as indented code blocks — an indented
-# `---` inside quoted code must not become a finding boundary (Codex P2, #1677).
-_CR_FINDING_SPLIT_RE = re.compile(r"^ {0,3}-{3,}\s*$", re.M)
 # Scoring policy (2026-09-03, issue #1642): Critical and Major each score a full
 # 1.0; every other level scores 0 and is surfaced only. Deliberately fed through
 # the SAME weighted machinery as the Codex findings rather than a second blocking
@@ -2354,190 +2366,6 @@ def _safe_title(raw: str) -> str:
     # bounding it is a selection rather than an amputation — but say that a cut
     # happened, so a clipped title is never read as the whole finding.
     return safe[: _INLINE_TITLE_MAX_CHARS - 1].rstrip() + "…"
-
-
-#: An opening or closing code fence: three-or-more backticks/tildes, then an
-#: optional info string. Captured separately because CommonMark's CLOSING rule
-#: depends on both — same character, at least as long, and no info string.
-_CR_FENCE_RE = re.compile(r"^(`{3,}|~{3,})(.*)$")
-
-
-def _cr_markup_mask(body: str) -> list[bool]:
-    """Per line: True when it sits inside a fenced block OR a ``<details>`` section.
-
-    The union, for callers that treat both as quoted content. A caller that must
-    keep ``<details>`` VISIBLE — the outside-diff parser, whose findings are
-    nested two levels deep inside them by construction — takes the fence half
-    alone from ``_cr_masks``. Both halves come from one implementation on
-    purpose: fence tracking is subtle (CommonMark close rules, the four-backtick
-    suggestion case, the unclosed-fence recovery), and a second copy of it is
-    how #1677 would come back on a surface nobody re-reads.
-    """
-    fence_mask, details_mask = _cr_masks(body)
-    return [f or d for f, d in zip(fence_mask, details_mask, strict=True)]
-
-
-def _cr_masks(
-    body: str, bq_depths: list[int] | None = None
-) -> tuple[list[bool], list[bool]]:
-    """``(fence_mask, details_mask)`` per line — the two kept SEPARATE.
-
-    Per line: True when it sits inside a fenced block or a ``<details>`` section.
-
-    Shared by the splitter and the title extractor because they MUST agree about
-    what is quoted content. They did not: the title extractor skipped fences while
-    the splitter cut across them, so a horizontal rule inside a ```suggestion```
-    manufactured a finding out of quoted markdown — which the title extractor then
-    could only name by its severity header.
-
-    MEASURED before the fix, on a body CodeRabbit plausibly emits (a Minor whose
-    suggestion edits a markdown file containing a rule and an italic two-field
-    line): one Minor finding split into two, the second reading as a MAJOR, and a
-    non-blocking review blocking the merge on the strength of quoted code.
-
-    Fence lines and the ``<details>`` tags themselves count as markup — they are
-    never finding content. ``<details>`` is tracked only OUTSIDE a fence, matching
-    how a markdown renderer reads it.
-    """
-    lines = body.split("\n")
-    # Fence and <details> contributions are tracked as SEPARATE masks and OR'd
-    # at the end, because each has an unclosed-construct recovery that clears
-    # its own contribution — and clearing a single combined mask would also
-    # unmask the OTHER construct's quoted content, silently re-opening the
-    # fence bug whenever a fence sits inside an unclosed <details>.
-    fence_mask = [False] * len(lines)
-    details_mask = [False] * len(lines)
-    fence_char: str | None = None
-    fence_len = 0
-    fence_opened_at: int | None = None
-    # The blockquote depth the OPEN fence was opened at. A renderer scopes a
-    # fence to its container, so only a delimiter in the SAME container can
-    # close it; `bq_depths` is None for callers reading text that never had a
-    # quote prefix stripped, and every depth is then 0, which is exactly the
-    # previous behaviour.
-    fence_bq = 0
-    details_depth = 0
-    details_opened_at: int | None = None
-    for idx, line in enumerate(lines):
-        depth = bq_depths[idx] if bq_depths is not None and idx < len(bq_depths) else 0
-        stripped = line.strip()
-        # CommonMark gives fence DELIMITERS at most three leading spaces; a
-        # 4+-space-indented backtick run is code CONTENT. Stripping first and
-        # matching meant an indented ```` line inside a four-backtick
-        # suggestion closed the outer fence (Codex P2, #1677).
-        indent = len(line) - len(line.lstrip(" \t"))
-        fence = _CR_FENCE_RE.match(stripped) if indent <= 3 else None
-        if fence:
-            run, info = fence.group(1), fence.group(2).strip()
-            if fence_char is None:
-                fence_char, fence_len, fence_opened_at = run[0], len(run), idx
-                fence_bq = depth
-            elif (
-                depth == fence_bq
-                and run[0] == fence_char
-                and len(run) >= fence_len
-                and not info
-            ):
-                # CommonMark: a closing fence uses the SAME character, is at
-                # least as long as the opener, and carries NO info string.
-                # Toggling on any fence line broke on CodeRabbit's own output:
-                # it wraps a suggestion in FOUR backticks precisely when the
-                # suggested markdown contains a three-backtick fence, so the
-                # inner ```md closed the outer block and everything after it —
-                # a quoted `---` and a Major-shaped header — was read as real
-                # findings, blocking a merge on the strength of quoted content
-                # (Codex P2, PR #1677).
-                fence_char, fence_len, fence_opened_at = None, 0, None
-            fence_mask[idx] = True
-            continue
-        if fence_char is not None:
-            fence_mask[idx] = True
-            continue
-        low = stripped.casefold()
-        if low.startswith("<details"):
-            # Nesting is a DEPTH, not a boolean: valid nested <details> meant
-            # the INNER close unmasked the rest of the outer collapsed section,
-            # so a quoted rule + severity header there manufactured a blocking
-            # finding out of collapsed content (Codex P2, PR #1677).
-            if details_depth == 0:
-                details_opened_at = idx
-            details_depth += 1
-            details_mask[idx] = True
-            continue
-        if low.startswith("</details"):
-            details_depth = max(0, details_depth - 1)
-            if details_depth == 0:
-                details_opened_at = None
-            details_mask[idx] = True
-            continue
-        details_mask[idx] = details_depth > 0
-    if fence_opened_at is not None:
-        # An UNCLOSED fence. CommonMark says it runs to the end of the document,
-        # and masking to the end is therefore "correct" — but this mask decides
-        # what the merge gate is allowed to SEE, and hiding every finding after a
-        # stray backtick run is the fail-OPEN direction: a real Critical goes
-        # unreported and the merge proceeds. A phantom finding, the other error,
-        # blocks loudly and gets looked at. So a fence that never closes is
-        # treated as ordinary content from the line it opened on.
-        for i in range(fence_opened_at, len(lines)):
-            fence_mask[i] = False
-    if details_opened_at is not None:
-        # An UNCLOSED <details> gets the same recovery for the same reason: a
-        # stray tag must not hide a later genuine Major from the gate. Only the
-        # details CONTRIBUTION is cleared — quoted fenced content inside the
-        # section stays masked via fence_mask. A complete inner section between
-        # the unclosed opener and end-of-body is unmasked too; that is the
-        # phantom-finding direction, which blocks loudly, and is accepted for
-        # the same reason the fence recovery accepts it (Codex P2, PR #1677).
-        for i in range(details_opened_at, len(lines)):
-            details_mask[i] = False
-    return fence_mask, details_mask
-
-
-def _cr_findings(body: str) -> list[str]:
-    """Split one CodeRabbit comment into its individual findings.
-
-    ONE GitHub comment is not one finding. CodeRabbit bundles several into a
-    single inline comment, separated by a markdown rule, when they land near
-    each other in the diff. Reading only the first is the ORIGINAL BUG of this
-    feature reincarnated one level down — read, then silently dropped.
-
-    MEASURED on live PR #1647, comment id 3925021846: one comment carrying two
-    distinct Major findings. Before this split, `_cr_severity` returned the
-    first and the second existed nowhere in the gate's output. The dangerous
-    ordering is Minor-then-Major: the comment scored as `minor`, landed in the
-    advisory list, and printed "below Major, NOT counted" — a false claim about
-    a Major that was never seen at all.
-
-    A segment carrying no header is folded into the previous one rather than
-    treated as a finding: a rule inside prose is not a finding boundary, and
-    splitting on it would invent findings that do not exist. That fold is not
-    sufficient on its own — it only catches a rule whose following segment has no
-    header, and quoted markdown routinely supplies one. Rules inside fenced or
-    ``<details>`` content are therefore not boundaries at all (see
-    ``_cr_markup_mask``).
-    """
-    lines = body.split("\n")
-    markup = _cr_markup_mask(body)
-    parts: list[str] = []
-    current: list[str] = []
-    for line, is_markup in zip(lines, markup, strict=True):
-        if not is_markup and _CR_FINDING_SPLIT_RE.match(line):
-            parts.append("\n".join(current))
-            current = []
-            continue
-        current.append(line)
-    parts.append("\n".join(current))
-    out: list[str] = []
-    for part in parts:
-        if not part.strip():
-            continue
-        _, header_seen = _cr_severity(part)
-        if header_seen or not out:
-            out.append(part)
-        else:
-            out[-1] = out[-1] + "\n---\n" + part
-    return out or [body]
 
 
 def _coderabbit_title(body: str) -> str:
@@ -5632,7 +5460,16 @@ def _format_rounds(result: dict) -> str:
     if counts:
         trend = result.get("trend")
         mark = {"rising": " (RISING)", "falling": " (falling)", "flat": " (flat)"}.get(trend, "")
-        parts.append("findings per round " + "→".join(str(c) for c in counts) + mark)
+        parts.append("raw findings per round " + "→".join(str(c) for c in counts) + mark)
+    remaining = result.get("remaining_report") or {}
+    if remaining.get("status") == "ok":
+        rows = remaining["rounds"]
+        parts.append("no-defect per round " + "→".join(str(r["no_defect"]) for r in rows))
+        trend = remaining.get("trend")
+        suffix = f" ({trend})" if trend else ""
+        parts.append("remaining findings per round " + "→".join(str(r["remaining_findings"]) for r in rows) + suffix)
+    else:
+        parts.append("remaining findings UNKNOWN (local coverage not validated)")
     legacy = int(result.get("legacy_heads") or 0)
     if legacy:
         parts.append(f"{legacy} head(s) counted by the pre-cutover rule")
@@ -5672,6 +5509,13 @@ def _rounds_row(pr_num: str, repo: str | None = None) -> str:
         result = _review_budget.evaluate_pr(target, pr_num, timeout_for=_gh_timeout)
     except Exception:  # noqa: BLE001 - an advisory row never takes the report down.
         return "unreadable (lookup failed)"
+    if result.get("status") == "ok":
+        import review_remaining  # noqa: PLC0415
+
+        result["remaining_report"] = review_remaining.remaining_report(
+            os.getcwd(), target, int(pr_num), result,
+            deadline=time.monotonic() + _gh_timeout(8.0),
+        )
     return _format_rounds(result)
 
 
@@ -14210,16 +14054,18 @@ def _open_pr_count_for_branch(
     """How many OPEN PRs have ``branch`` as their head, or None if unknowable.
 
     Distinguishing 0 from None is the point of the return type: 0 is a measured
-    "this public branch has no PR" — the state where CI and the leak-detector
-    never run, since ci.yml triggers on pull_request — while None is "the
+    "no open PR from this repository into the default branch" — the state where
+    ci.yml never runs, since it triggers on pull_request into that branch (of the
+    push-triggered workflows only the branch leak scan sees such a
+    branch, on each push) — while None is "the
     question could not be answered" (no gh, no network, no auth). Callers treat
     None as the status quo, never as 0: this feeds a HYGIENE prompt, not a
     security verdict, and the first-push approval it modulates already happened.
 
     COUNTS ONLY PRs TARGETING THE DEFAULT BRANCH, because the question is "does
     CI run on this branch" and `ci.yml` triggers on `pull_request` filtered to
-    `main`. A PR onto a non-default base contributes no CI and no leak scan at
-    all (issue #2035), so counting it would silence the prompt in exactly the
+    `main`. A PR onto a non-default base does not run ci.yml (issue
+    #2035), so counting it would silence the prompt in exactly the
     state the prompt exists to report.
 
     AND ONLY PRs FROM THIS REPOSITORY. `gh pr list --head` matches a bare branch
@@ -14340,10 +14186,12 @@ def _no_open_pr_deny_message(cur: str | None) -> str:
     """The no-open-PR BLOCK text, shared by the plain and close-compound arms."""
     return (
         f"BLOCKED: re-push to '{cur}' — this branch is "
-        f"PUBLIC but has NO OPEN PR, so CI and the leak "
-        f"detector never run on it (ci.yml triggers on "
-        f"pull_request; a branch with no PR matches no "
-        f"trigger).\n"
+        f"PUBLIC but has NO OPEN PR into the default branch, so "
+        f"ci.yml never runs on it (it triggers on pull_request "
+        f"into the default branch; a PR onto another base does "
+        f"not count). Of the workflows a branch push triggers, "
+        f"only the branch leak scan runs, where the branch "
+        f"carries it.\n"
         f"Open its PR first — `gh pr create` — then push "
         f"again. Or close the branch out if it is "
         f"finished with. Both leave the branch in a state "
@@ -14358,8 +14206,9 @@ def _no_pr_block_applies(urls: set[str]) -> bool:
     ``github.user``/``github.public_repo`` in ``~/.genesis/config/genesis.yaml``,
     the same source ``_scheduled_gate_applies`` uses. The reason it has to be
     scoped at all is that the thing being enforced is not a property of branches
-    in general: ``ci.yml`` and the leak detector live in THIS repo and trigger on
-    ``pull_request`` to ITS default branch. On a private fork, on the backups
+    in general: ``ci.yml`` lives in THIS repo and triggers on ``pull_request``
+    to ITS default branch (the branch leak scan runs on branch pushes that carry it, but
+    it is a leak scan only: no tests, no review). On a private fork, on the backups
     repo, on the voice repo, on any unrelated checkout a session wanders into,
     "this branch has no open PR" is an ordinary state with no consequence — and
     blocking it would refuse routine work for a reason that does not exist there.
@@ -15487,7 +15336,20 @@ def _run_merge_and_push_gates() -> int:
         # `_mentions_gated_op` whenever the operation is spelled, which is the
         # honest split: an unreadable program naming a publish is worth
         # refusing, an unreadable program naming nothing is a Tuesday.
-        hidden_gated_verb = any(s.verb_unresolved and s.exe in _GATED_EXES for s in segs)
+        #
+        # A segment whose program word is in `$"..."` locale quoting is the same
+        # fact one word to the left: the parser reports it and names the program
+        # the untranslated reading runs, and when that is git or gh the operation
+        # is as unestablished as a built verb leaves it. A shell handed its script
+        # (or its `-c`) in that quoting is the same fact one level down: the
+        # parser keeps the untranslated script as a candidate and
+        # `locale_candidates` names the dispatchers it mentions. Read per segment
+        # too, so neither can ride a visible push in the same command.
+        hidden_gated_verb = any(
+            (s.verb_unresolved and s.exe in _GATED_EXES)
+            or bool(locale_candidates(s) & _GATED_EXES)
+            for s in segs
+        )
         # A bounds-type blind spot withholds the segments, and this fact with them:
         # MEASURED, a continuation elsewhere in the command changed this guard's
         # verdict on an unresolved verb. Recover the fact from the command itself.
@@ -16061,8 +15923,8 @@ def _run_merge_and_push_gates() -> int:
                             )
                     # A RE-PUSH earns its silence by having been approved at
                     # first publication — but a public branch with NO OPEN PR is
-                    # outside CI and the leak-detector (ci.yml triggers on
-                    # pull_request), so its silence is the state this repo's
+                    # outside ci.yml (it triggers on pull_request; of the push-
+                    # triggered workflows only the branch leak scan sees it), so its silence is the state this repo's
                     # standing rule forbids: published, unchecked, and quietly
                     # growing. Downgrade the silent allow to an ASK naming the
                     # gap. A lookup that cannot answer (None) keeps the status
@@ -16095,8 +15957,8 @@ def _run_merge_and_push_gates() -> int:
                             ask_reason = (
                                 f"re-push to '{cur}': an earlier step in this command "
                                 f"CLOSES a pull request, so the push that follows may "
-                                f"land on a branch with no open PR — outside CI and "
-                                f"the leak scan. Run the close and the push as "
+                                f"land on a branch with no open PR — outside CI. "
+                                f"Run the close and the push as "
                                 f"separate commands so each is judged on the state it "
                                 f"actually runs in."
                             )
@@ -16133,9 +15995,11 @@ def _run_merge_and_push_gates() -> int:
                             ask_routine = True
                             routine_dests.append((push_remote, urls, pcwd, cur))
                             ask_reason = (
-                                f"re-push to '{cur}': this branch is PUBLIC but has "
-                                f"NO OPEN PR, so CI and the leak scan never run on "
-                                f"it. Approve to push, then open its PR "
+                                f"re-push to '{cur}': this branch has "
+                                f"NO OPEN PR into the default branch, so CI gated on "
+                                f"such a PR does not run on it (this guard does not "
+                                f"read this repository's workflows, so other CI may "
+                                f"still run). Approve to push, then open its PR "
                                 f"(gh pr create) — or close the branch out."
                             )
                     # Ordered AFTER the no-PR arm: that arm denies on the public

@@ -4,7 +4,6 @@
         "DISABLE_UPDATES": "1",
         "MCP_TIMEOUT": "120000"
     },
-    "cleanupPeriodDays": 180,
     "skillListingBudgetFraction": 0.02,
     "attribution": {
         "commit": "",
@@ -165,6 +164,16 @@
             }
         ],
         "PreToolUse": [
+            {
+                "matcher": "Bash|Read|Grep|Glob|Edit|Write|MultiEdit|NotebookEdit|Agent|Task",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "[ -d \"${GENESIS_HOME:-$HOME/.genesis}/holdout\" ] || exit 0; ${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/holdout_fence.py pre",
+                        "timeout": 10
+                    }
+                ]
+            },
             {
                 "matcher": ".*",
                 "hooks": [
@@ -396,6 +405,10 @@
                 "hooks": [
                     {
                         "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/worktree_ownership_advisory.py"
+                    },
+                    {
+                        "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/main_checkout_guard.py",
                         "timeout": 30
                     }
@@ -558,6 +571,25 @@
             }
         ],
         "PostToolUse": [
+            {
+                "matcher": "Bash|Read|Grep|Glob|mcp__.*",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "[ -d \"${GENESIS_HOME:-$HOME/.genesis}/holdout\" ] || exit 0; ${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/holdout_fence.py post",
+                        "timeout": 10
+                    }
+                ]
+            },
+            {
+                "matcher": "^(Write|Edit|MultiEdit|NotebookEdit)$",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/worktree_ownership_advisory.py"
+                    }
+                ]
+            },
             {
                 "matcher": "Read|Edit|Write|Glob|Grep",
                 "hooks": [

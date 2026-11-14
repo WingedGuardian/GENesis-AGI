@@ -19,8 +19,10 @@ sandbox on a live container, 263 of 297 processes were readable and 34 denied.
 from __future__ import annotations
 
 import contextlib
+import os
 import time
 from collections.abc import Callable, Iterable
+from datetime import UTC, datetime
 from pathlib import Path
 
 # Module-level so tests can repoint it at a fake tree (the host_boot.py seam).
@@ -232,3 +234,99 @@ def claude_ancestor(pid: int, max_depth: int = 16) -> int | None:
             return ppid
         current = ppid
     return None
+
+
+def _read_btime(proc_root: str) -> int | None:
+    """Boot time (epoch seconds) from ``/proc/stat``'s ``btime`` line, or None."""
+    try:
+        with open(f"{proc_root}/stat") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def read_proc_start_iso(pid: int, proc_root: str | None = None) -> str | None:
+    """Wall-clock start time of a pid as an ISO-8601 UTC string, or None.
+
+    Computed as ``btime + starttime_ticks / CLK_TCK`` where ``starttime`` is
+    field 22 of ``/proc/<pid>/stat`` (clock ticks since boot). The ``comm``
+    field (2) is parenthesised and may itself contain spaces or ``)``, so the
+    line is split after the LAST ``)`` — everything after that is whitespace-
+    delimited starting at field 3 (state), making ``starttime`` index 19.
+    Verified to-the-second against ``ps lstart`` on this host. Returns None on
+    any read/parse failure or an implausible clock tick (fail-open: the caller
+    treats an unknown start time as "not stale", never falsely flagging).
+
+    Lives here, not in ``observability.cc_slots`` (which re-exports it),
+    because importing anything under ``genesis.observability`` runs that
+    package's ``__init__`` and its aiohttp chain: about 300 ms, MEASURED
+    2026-11-07, paid by every session-start hook that only needs this.
+    """
+    proc_root = proc_root or _PROC
+    btime = _read_btime(proc_root)
+    if btime is None:
+        return None
+    try:
+        with open(f"{proc_root}/{pid}/stat") as f:
+            after = f.read().rsplit(")", 1)[1].split()
+        starttime_ticks = int(after[19])
+        clk = os.sysconf("SC_CLK_TCK")
+        if clk <= 0:
+            return None
+        wall = btime + starttime_ticks / clk
+        return datetime.fromtimestamp(wall, UTC).isoformat()
+    except (OSError, ValueError, IndexError, OverflowError):
+        return None
+
+
+def claude_pid_dead(
+    pid: int,
+    row: dict,
+    *,
+    proc_root: str | None = None,
+    start_iso: Callable[[int], str | None] | None = None,
+) -> bool:
+    """Death-proof for a terminal-registered cc_sessions row's recorded pid.
+
+    True only on POSITIVE evidence the recorded process is gone: /proc entry
+    absent (ENOENT/ESRCH — a MISSING entry, not merely an unreadable one:
+    EACCES from a hidepid mount or another uid is "cannot see", which must
+    fail open), comm no longer ``claude``, or the process at that pid
+    started after the row's newest liveness stamp (pid recycled). The
+    anchor is max(started_at, last_activity_at), NOT started_at alone: a
+    ``--resume`` reopens the row with a NEW pid in the same write that
+    stamps last_activity_at, so the fresh process always starts BEFORE the
+    anchor — anchoring to the original started_at would read every resumed
+    session as recycled. A genuinely recycled pid began after the session's
+    last sign of life, so detection is preserved; any miss fails open. Unknown
+    start time → False (fail-open, matching ``read_proc_start_iso``'s own
+    contract).
+
+    The foreground reaper and the session-start in-flight block share this one
+    predicate, so they never disagree about which rows are live.
+    """
+    proc = Path(proc_root or _PROC) / str(pid)
+    try:
+        comm = (proc / "comm").read_text().strip()
+    except (FileNotFoundError, ProcessLookupError):
+        return True  # the pid does not exist — positive death evidence
+    except (OSError, UnicodeError):
+        # Unreadable (permissions, /proc hiccup) or undecodable (a reused pid
+        # whose comm has invalid bytes for the locale) — fail open; one bad
+        # candidate must not abort the pass for every other stale row.
+        return False
+    if comm != "claude":
+        return True
+    anchor = max(
+        (t for t in (row.get("started_at"), row.get("last_activity_at")) if t),
+        default=None,
+    )
+    if not anchor:
+        return False
+    started = (start_iso or read_proc_start_iso)(pid)
+    if started is None:
+        return False
+    return started > anchor

@@ -24,10 +24,10 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import shutil
 import subprocess
 from pathlib import Path
 
+from genesis.util.codex_cli import codex_available, codex_child_env, codex_exec_argv
 from genesis.util.proc_kill import kill_process_group
 
 from .findings import ReviewResult
@@ -97,7 +97,7 @@ _CODEX_KILL_DRAIN_S = 30.0
 
 def _try_codex(diff: str, *, timeout: int = CODEX_TIMEOUT) -> ReviewResult | None:
     """Try the codex exec path. Returns None if codex is missing or errors."""
-    if shutil.which("codex") is None:
+    if not codex_available():
         logger.info("review: codex binary not on PATH — skipping codex link")
         return None
 
@@ -112,17 +112,21 @@ def _try_codex(diff: str, *, timeout: int = CODEX_TIMEOUT) -> ReviewResult | Non
     # child and orphans the tree. Own group → guarded killpg reaps it all.
     try:
         proc = subprocess.Popen(
-            [
-                "codex", "exec", "-",
+            codex_exec_argv(
+                "-",
                 "-s", "read-only",
                 "-c", 'model_reasoning_effort="medium"',
                 "--json",
-            ],
+            ),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             start_new_session=True,
+            # Marks this unattended run as dispatched. Inert until the Codex
+            # project config forwards the marker to Genesis's MCP launcher,
+            # which then keeps such a run on the external floor.
+            env=codex_child_env(),
         )
     except FileNotFoundError:
         return None

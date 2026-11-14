@@ -40,7 +40,7 @@ def identity(info):
 class Input:
     """A retained private descriptor; metadata per request, full hashes at boundaries."""
 
-    def __init__(self, path):
+    def __init__(self, path, *, decode=load_json):
         self.path = Path(path).absolute()
         self.fd = private_open(self.path, os.O_RDONLY)
         try:
@@ -48,7 +48,7 @@ class Input:
             with os.fdopen(os.dup(self.fd), "rb") as stream:
                 raw = stream.read()
             self.hash = hashlib.sha256(raw).hexdigest()
-            self.value = load_json(raw)
+            self.value = decode(raw)
             self.check()
         except BaseException:
             self.close()
@@ -261,6 +261,19 @@ class Operating:
                 "combined_allowance": self.plan["combined_allowance"], "stopped": self.stopped}
 
 
+def _lookup_failures(states):
+    """Count diagnostic GET outcomes independently of settled expense totals."""
+    counts = {}
+    for state in states.values():
+        for row in state.attempts.values():
+            if not row["dispatched"]:
+                continue
+            for item in row.get("lookups", []):
+                status = str(item["http_status"]) if item["http_status"] is not None else "network"
+                counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
 def cost_report(states):
     """Census every generation claim before deciding which expenses are resolved."""
     known, owners, accounting, unresolved, over = {}, {}, {}, set(), 0
@@ -273,7 +286,7 @@ def cost_report(states):
             owner = alias, attempt
             # Invalid or missing costs still carry ownership claims. Deduplicate
             # repeated GET evidence within this attempt, not across owners.
-            claims = {item[field] for item in row["observations"] + row["receipts"]
+            claims = {item[field] for item in row["observations"] + row["receipts"] + row.get("lookups", [])
                       if isinstance(item, dict)
                       for field in ("generation_id", "body_generation_id", "header_generation_id")
                       if isinstance(item.get(field), str) and item[field].strip()}
@@ -293,6 +306,7 @@ def cost_report(states):
                                                 if owner not in unresolved)),
             "unresolved_attempts": len(unresolved), "over_allocation_attempts": over,
             "journal_accounting": accounting,
+            "receipt_lookup_failures": _lookup_failures(states),
             "limitations": ["Late or undisclosed provider charges can exceed the allowance.",
                             "Observed receipts are not an authenticated final invoice."]}
 

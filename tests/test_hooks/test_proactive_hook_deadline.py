@@ -88,18 +88,25 @@ async def test_local_mode_stops_after_blocking_sync_phase_exhausts_deadline(
     writer = _RecordingWriter()
     db_path = tmp_path / "genesis.db"
     db_path.touch()
-    code_calls: list[bool] = []
+    later_calls: list[bool] = []
 
     def _blocking_fts(*_args, **_kwargs):
         """Simulate synchronous FTS work that overruns the deadline."""
         time.sleep(0.05)
         return []
 
-    def _code_search(*_args, **_kwargs):
-        """Record whether a later code-search phase was reached."""
-        code_calls.append(True)
+    def _later_phase(*_args, **_kwargs):
+        """Record whether the next sync phase after FTS was reached."""
+        later_calls.append(True)
         time.sleep(0.2)
-        return []
+        return {
+            "injected_ids": [],
+            "repeat_count": 0,
+            "overlap_pct": 0.0,
+            "working_set_size": 0,
+            "zero_retrieved_injected": 0,
+            "procedure_repeat": 0,
+        }
 
     monkeypatch.setattr(hook, "_OUT", writer)
     monkeypatch.setattr(hook, "_RUN_DEADLINE_S", 0.01)
@@ -119,14 +126,14 @@ async def test_local_mode_stops_after_blocking_sync_phase_exhausts_deadline(
     monkeypatch.setattr(hook, "_ensure_knowledge_retrieved_count", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(hook, "_compute_suppress_ids", lambda *_args, **_kwargs: frozenset())
     monkeypatch.setattr(hook, "_search_fts5", _blocking_fts)
-    monkeypatch.setattr(hook, "_search_code_index", _code_search)
+    monkeypatch.setattr(hook, "_ws_measure", _later_phase)
 
     started = time.monotonic()
     await hook._run("why did recall stall", session_id="deadline-session")
     elapsed = time.monotonic() - started
 
     assert elapsed < 0.2, "a later sync phase ran after the aggregate deadline"
-    assert code_calls == []
+    assert later_calls == []
     assert writer.lines == [
         ("[Session trail] deferred", "session-metadata"),
         (hook._out_of_time_notice(0.0), "final"),
@@ -161,7 +168,6 @@ async def test_failed_knowledge_migration_does_not_create_sentinel(
     monkeypatch.setattr(hook, "_ensure_knowledge_retrieved_count", _interrupted_migration)
     monkeypatch.setattr(hook, "_compute_suppress_ids", lambda *_args, **_kwargs: frozenset())
     monkeypatch.setattr(hook, "_search_fts5", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(hook, "_search_code_index", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(hook, "_record_activity", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(hook, "_record_detail", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(hook, "_ambient_fold", lambda *_args, **_kwargs: None)
@@ -241,7 +247,6 @@ def _quiet_run_body(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, writer: obj
     monkeypatch.setattr(hook, "_load_recent_files", lambda *_a, **_k: [])
     monkeypatch.setattr(hook, "_ensure_knowledge_retrieved_count", lambda *_a, **_k: True)
     monkeypatch.setattr(hook, "_compute_suppress_ids", lambda *_a, **_k: frozenset())
-    monkeypatch.setattr(hook, "_search_code_index", lambda *_a, **_k: [])
     monkeypatch.setattr(
         hook,
         "_ws_measure",
@@ -625,7 +630,13 @@ def test_the_running_hook_arms_the_hard_stop() -> None:
 async def test_landed_recall_owes_no_notice_even_when_the_run_dies_before_flushing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Recall already printed, then a later step fails past the deadline: no notice."""
+    """Recall already printed, then a later step fails past the deadline: no notice.
+
+    The failure must land BEFORE the flush, so only _RECALL_LANDED can suppress
+    the notice. With the [Code] lookup gone no patchable step sits between the
+    server emit and the flush, so the server's results list is what fails: it is
+    iterated in that window, while the H-1 rows are built.
+    """
 
     class _Writer(_RecordingWriter):
         closed = False
@@ -633,16 +644,19 @@ async def test_landed_recall_owes_no_notice_even_when_the_run_dies_before_flushi
     writer = _Writer()
     _quiet_run_body(monkeypatch, tmp_path, writer)
 
-    async def _ok_server(*_a, **_k):
-        return {"lines": ["[Memory | id:abc] recalled"], "results": []}, None
+    class _DiesLate:
+        def __bool__(self) -> bool:
+            return True
 
-    def _dies_late(*_a, **_k):
-        time.sleep(0.1)  # past the deadline, before the run flushes
-        raise RuntimeError("code index broke")
+        def __iter__(self):
+            time.sleep(0.1)  # past the deadline, before the run flushes
+            raise RuntimeError("results broke")
+
+    async def _ok_server(*_a, **_k):
+        return {"lines": ["[Memory | id:abc] recalled"], "results": _DiesLate()}, None
 
     monkeypatch.setattr(hook, "_call_server", _ok_server)
-    monkeypatch.setattr(hook, "_search_code_index", _dies_late)
-    with pytest.raises(RuntimeError, match="code index broke"):
+    with pytest.raises(RuntimeError, match="results broke"):
         await hook._run(
             "why did recall stall",
             session_id="landed-then-died",
@@ -794,7 +808,7 @@ async def test_a_run_records_its_steps_path_and_flags(
     run = names[names.index("heartbeat_write") :]
     assert run == [
         "heartbeat_write", "heartbeat_read", "trail", "activity", "recent_files",
-        "gates", "migration", "suppress", "server", "fts5", "code_index", "degraded_emit",
+        "gates", "migration", "suppress", "server", "fts5", "degraded_emit",
         "flush", "shadow", "ws_measure", "activity_row", "metrics", "fold", "finish",
     ]  # fmt: skip
     assert line["path"] == "degraded"

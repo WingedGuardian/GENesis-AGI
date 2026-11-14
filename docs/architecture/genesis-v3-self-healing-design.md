@@ -78,6 +78,9 @@ to the repository root.
   shutdown calls it before dependency teardown, including partial bootstrap.
 - Contains: snapshot timestamp, resilience axes, queue depths (deferred, dead
   letter, pending embeddings), human summary, and optional health fields
+- `liveness_pulses.surplus_dispatch` carries the runtime's in-memory surplus
+  `last_success` (not `last_run`, which a failed dispatch also sets) for the
+  standalone health MCP, which judges it only while this file is at most 300s old
 - Watchdog uses staleness of this file as the primary bridge liveness signal
 - A delayed write retains its collected timestamp; offloading does not make
   stalled storage healthy or establish that a concurrent SSH outage is fixed.

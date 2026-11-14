@@ -51,6 +51,15 @@ class SkillRefiner:
             logger.exception("Skill refiner LLM call failed")
             return None
 
+        # An exhausted chain returns success=False with content=None; treat it
+        # like any other failed call rather than parsing a missing body.
+        if not result.success or not result.content:
+            logger.warning(
+                "Skill refiner got no usable response for %s: %s",
+                report.skill_name, result.error or "empty content",
+            )
+            return None
+
         return self._parse_response(
             report.skill_name,
             result.content,
@@ -126,32 +135,47 @@ class SkillRefiner:
         )
 
     def _parse_response(
-        self, skill_name: str, text: str, *, provenance_trace: str | None = None
+        self, skill_name: str, text: str | None, *, provenance_trace: str | None = None
     ) -> SkillProposal | None:
         try:
             match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
             raw = match.group(1) if match else text
             data = json.loads(raw)
-        except (json.JSONDecodeError, AttributeError):
+        except (json.JSONDecodeError, AttributeError, TypeError):
             logger.warning("Failed to parse skill refiner response")
             return None
+        if not isinstance(data, dict):
+            logger.warning("Skill refiner response was not a JSON object")
+            return None
 
+        # Every field below comes from an LLM reply; a wrong type must degrade
+        # to a default or a skip, never raise and fail the whole pipeline run.
         change_size_str = data.get("change_size", "minor")
         try:
             change_size = ChangeSize(change_size_str)
-        except ValueError:
+        except (ValueError, TypeError):
             change_size = ChangeSize.MINOR
 
         proposed = data.get("proposed_content", "")
-        if not proposed:
+        if not isinstance(proposed, str) or not proposed:
             return None
+
+        try:
+            confidence = float(data.get("confidence", 0.7))
+        except (TypeError, ValueError):
+            confidence = 0.7
+
+        rationale = data.get("rationale", "")
+        patterns = data.get("failure_patterns_addressed", [])
+        if not isinstance(patterns, list):
+            patterns = []
 
         return SkillProposal(
             skill_name=skill_name,
             proposed_content=proposed,
-            rationale=data.get("rationale", ""),
+            rationale=rationale if isinstance(rationale, str) else "",
             change_size=change_size,
-            confidence=float(data.get("confidence", 0.7)),
-            failure_patterns_addressed=data.get("failure_patterns_addressed", []),
+            confidence=confidence,
+            failure_patterns_addressed=[p for p in patterns if isinstance(p, str)],
             provenance_trace=provenance_trace,
         )
