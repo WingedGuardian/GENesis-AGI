@@ -100,7 +100,7 @@
     {
       "name": "board_status",
       "title": "Board Status",
-      "description": "The work board as the reconciler last read it: counts by column, by\nGenesis status and by kind, coverage (open repo issues and PRs on the board\nagainst the repo's open total), drags logged, and whether the reconciler is\nalive. Reads stored heartbeats only, never GitHub, so it is cheap and safe.\n\n``latest`` is the newest pulse (mode, paused, any error); ``summary`` is the\nnewest SUCCESSFUL read and its age. A board that is off or not set up has a\npulse but no summary, and says so.",
+      "description": "The work board as the reconciler last read it: counts by column, by\nGenesis status and by kind, coverage (open repo issues and PRs on the board\nagainst the repo's open total), drags logged, what the last tick wrote (or\nwould have written, outside ``live``), and whether the reconciler is alive.\nReads stored heartbeats only, never GitHub, so it is cheap and safe.\n\n``latest`` is the newest pulse (mode, paused, any error); ``summary`` is the\nnewest SUCCESSFUL read and its age. A board that is off or not set up has a\npulse but no summary, and says so.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
