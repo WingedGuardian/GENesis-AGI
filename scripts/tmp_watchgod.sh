@@ -18,8 +18,9 @@
 #
 # WHAT IT DOES, by tier (per filesystem; free space AND time-to-full, see
 # dg_tier). It never deletes working files and never kills a process:
-#   YELLOW  log attribution once per episode: who is writing, and where the
-#           space went.
+#   YELLOW  log attribution once per episode: who is writing, where the space
+#           went, and who holds DELETED files there (space du cannot see;
+#           wg_deleted_holders). The ORANGE and RED pages carry that list too.
 #   ORANGE  reclaim: on the $HOME filesystem start genesis-disk-hygiene-
 #           pressure@standard (caches, ~/tmp older than 4 days, live writers
 #           spared); on cc-tmp's, run the retention sweep at 2 days. Page a
@@ -301,6 +302,14 @@ log_attribution() {
         while IFS= read -r line; do log WARN "  writer: $line"; done <<< "$writers"
     else
         log WARN "  writer: (none measurable)"
+    fi
+    # Deleted-but-open files: the space du (below) cannot see. One filtered
+    # /proc walk, bounded by DG_RUNAWAY_SCAN_TIMEOUT_S; synchronous, so the
+    # holders are named while they still exist.
+    local held line
+    held="$(wg_deleted_holders "$dev" "$path")" || held=""
+    if [[ -n "$held" ]]; then
+        while IFS= read -r line; do log WARN "  $line"; done <<< "$held"
     fi
     # Detached from the daemon's stdio: it logs through log() only, and must
     # never hold a pipe a caller is waiting on.
@@ -612,6 +621,15 @@ _WG_WRITERS_LABEL="Top writers among this user's processes this poll (block-devi
 # premise check); the du list in the log shows what holds the space.
 _WG_WRITERS_TMPFS="Writer attribution unavailable: tmpfs writes are not counted per process. The watchgod log lists what is using the space (du)."
 
+_wg_held_block() {
+    # $1 domain key $2 path. The deleted-but-open block for a page, led by a
+    # blank line, or nothing. Computed only when a page is about to be sent.
+    local held
+    held="$(wg_deleted_holders "$1" "$2")" || held=""
+    [[ -n "$held" ]] && printf '\n\n%s' "$held"
+    return 0
+}
+
 # ── Per-filesystem tier handling ─────────────────────────────
 handle_fs() {
     # $1 path $2 limit-domain key (see check_disks) $3 tier $4 free $5 total
@@ -665,7 +683,7 @@ handle_fs() {
             elif [[ -n "${_WG_LEVER_START}${_WG_LEVER_SWEEP}" ]]; then
                 lever="${_WG_LEVER_START}${_WG_LEVER_SWEEP}"
             fi
-            body="${summary}. Reclaim: ${lever}. ${writers_block}"
+            body="${summary}. Reclaim: ${lever}. ${writers_block}$(_wg_held_block "$dev" "$path")"
             _wg_page warning "Disk filling: ${path} ORANGE" "$body" "watchgod:disk:${dev}:orange" "WARNING — ${summary}" \
                 && episode_mark "$dev" "orange$pg"
         fi
@@ -689,7 +707,7 @@ handle_fs() {
             fi
         fi
         if ! episode_seen "$dev" "red$pg"; then
-            body="${summary}. Reserve: ${rel}."$'\n'"${writers_block}"
+            body="${summary}. Reserve: ${rel}."$'\n'"${writers_block}$(_wg_held_block "$dev" "$path")"
             _wg_page emergency "Disk nearly full: ${path} RED" "$body" "watchgod:disk:${dev}:red" "EMERGENCY — ${summary}" \
                 && episode_mark "$dev" "red$pg"
         fi
