@@ -38,6 +38,31 @@ and the spec, and put this line in the issue: "The PR that finishes this issue
 must say `Closes #N`; if the work is split, earlier PRs say `Part of #N`." An
 intent scenario is judged only against a PR that closes its issue. `docs/reference/holdout.md` has the rules.
 
+### Analyze the spec before a builder gets it
+
+Before a spec goes to a builder, run the read-only consistency pass in
+`references/spec-analyze.md` over the spec, plus its plan and tickets when they
+exist. Run it BEFORE the holdout-writer step above: the intent is not final
+until this pass is clean, and scenarios written earlier would test the
+unfixed intent. Then:
+
+- every CRITICAL finding is fixed in the spec (then run the pass again) or
+  carries the owner's exception. A conflict with a standing rule is never
+  accepted by the session. When one looks justified, ask the owner through
+  `AskUserQuestion` rather than rewording the spec around the check, and on a
+  yes record it exactly as `references/spec-analyze.md`, "Owner exception",
+  says: the owner's words verbatim, the requirement and the rule quoted;
+- fix every HIGH finding, or keep it with a one-line reason under the report;
+- send the final report with the spec. When the handoff is an issue, post it
+  as a comment on that issue, after the privacy scrub every public text gets
+  (CLAUDE.md, "Public-Artifact Privacy"); otherwise save it beside the spec
+  as `<spec name>.analysis.md`, so the spec's own text, and the numbers a
+  later run gives it, do not change.
+
+The builder runs `references/spec-converge.md` against the same documents
+before its PR (build-session, "Verify BEFORE the PR"), and the analyze ids are
+the ones it uses.
+
 ### Plan documents carry a structured header
 
 A plan doc that outlives one session (`~/.claude/plans/<name>.md`) opens with
