@@ -175,6 +175,13 @@ def collect_missing_units(template_dir: Path, unit_dir: Path) -> list[str] | Non
 _ABBREV_SHA = re.compile(r"^[0-9a-f]{4,40}$")
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
+#: _run_git's timeout and exec-failure sentinels. A git killed by SIGHUP or
+#: SIGINT also returns -1/-2, so the word can be wrong, but the check did not
+#: complete either way. "I could not check" and "it is not here" have different
+#: remedies, so at every git phase of resolve_commit they must not share a
+#: message with an absent or wrong-typed object.
+_GIT_UNCHECKED = {-1: "timed out", -2: "failed"}
+
 
 def resolve_commit(repo: Path, name: str | None) -> tuple[str | None, str]:
     """Expand a stored (abbreviated) commit name to its full 40-hex SHA.
@@ -212,11 +219,8 @@ def resolve_commit(repo: Path, name: str | None) -> tuple[str | None, str]:
     rc, out, err = _run_git(
         repo, "rev-parse", f"--disambiguate={candidate}", timeout=_CHEAP_TIMEOUT_S
     )
-    if rc in (-1, -2):
-        # _run_git's own sentinels: -1 timeout, -2 exec failure. "I could not
-        # check" and "it is not here" have different remedies, so they must not
-        # share a message.
-        return None, f"could not check {candidate} (git {'timed out' if rc == -1 else 'failed'})"
+    if rc in _GIT_UNCHECKED:
+        return None, f"could not check {candidate} (git {_GIT_UNCHECKED[rc]})"
     names = [line.strip() for line in out.splitlines() if line.strip()]
     if rc != 0 or not names:
         return (
@@ -229,6 +233,12 @@ def resolve_commit(repo: Path, name: str | None) -> tuple[str | None, str]:
     if not _FULL_SHA.match(resolved):
         return None, f"{candidate} resolved to something that is not a SHA: {resolved!r}"
     rc, kind, _ = _run_git(repo, "cat-file", "-t", resolved, timeout=_CHEAP_TIMEOUT_S)
+    if rc in _GIT_UNCHECKED:
+        return (
+            None,
+            f"{candidate} resolved to {resolved} but could not check its type"
+            f" (git {_GIT_UNCHECKED[rc]})",
+        )
     if rc != 0 or kind.strip() != "commit":
         return None, f"{candidate} names a {kind.strip() or 'missing'} object, not a commit"
     return resolved, f"{candidate} resolved to {resolved}"
@@ -937,6 +947,9 @@ REPAIR_UNFINISHED_S = 3600
 REPAIR_REPORTS_READ = 8
 
 _REPAIR_SCRIPT = Path(__file__).resolve().parents[4] / "scripts" / "lib" / "live_move_repair.py"
+_KIT_SCRIPT = Path(__file__).resolve().parents[4] / "scripts" / "lib" / "live_repair_kit.py"
+#: The kit states (live_repair_kit.status) that are a finding; "ok" is none.
+_KIT_FINDINGS = ("missing", "partial", "stale", "corrupt", "foreign")
 _GUARD_SCRIPT = Path(__file__).resolve().parents[4] / "scripts" / "lib" / "update_state_guard.py"
 _REPAIR_SUFFIX = "-live-move-repair"
 #: The writer's results, by prefix, most specific first; anything else is "unknown".
@@ -959,14 +972,44 @@ _GUARD_GIT_TIMEOUT_S = 5
 
 
 def _script(path: Path):
-    """A script of the tree this module ships in, loaded afresh: the repair's
-    own rules, so this reader judges what the writer judged."""
+    """A script loaded afresh by path (the checkout's, or the installed kit's)."""
     spec = importlib.util.spec_from_file_location(f"_deploy_health_{path.stem}", path)
     if spec is None or spec.loader is None:
         raise ImportError(f"{path} cannot be loaded")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _repair_kit(genesis_home_dir: Path, repo: str) -> tuple[str | None, Path]:
+    """(the installed repair kit's state, the live_move_repair.py to read reports
+    with). The kit is the writer that runs (#3492 D2), so with the kit ``ok`` its
+    own loader reads the reports and this reader judges what the writer judged;
+    otherwise the checkout's loader reads them, which may differ from the kit's.
+    The kit is the one under $HOME/.genesis/lib, where every installer puts it,
+    judged by live_repair_kit.status (its git calls on the health route's budget,
+    as the guard's); a state that cannot be read is None."""
+    try:
+        kit = _script(_KIT_SCRIPT)
+        kit.GIT_TIMEOUT_S = _GUARD_GIT_TIMEOUT_S  # this copy of the module is ours alone
+        # The installer, repair-move and the unit all use $HOME/.genesis/lib,
+        # whatever GENESIS_HOME says (review SF-1).
+        home = str(Path.home())
+        found = kit.status(repo, home)
+        # Physically, as the unit runs it; an install swapping `current` since
+        # status read it leaves another kit there: the checkout's loader then.
+        current = os.path.realpath(os.path.join(home, ".genesis", "lib", "live-repair", "current"))
+    except Exception:  # noqa: BLE001 - an unknown kit state keeps the checkout's loader
+        logger.warning("the live-move repair kit's state could not be read", exc_info=True)
+        return None, _REPAIR_SCRIPT
+    state = found.get("state") if isinstance(found, dict) else None
+    if state == "stale" and not found.get("differs"):
+        # status calls a HEAD it could not read (a git failure or timeout)
+        # stale too: that is an unknown state, never a finding.
+        state = None
+    if state == "ok" and os.path.basename(current) == found.get("kit_id"):
+        return state, Path(current) / "live_move_repair.py"
+    return state, _REPAIR_SCRIPT
 
 
 def _refused(name: str, reason: str) -> None:
@@ -1003,10 +1046,11 @@ def collect_live_repairs(
     REPORT_FUTURE_S ahead of ``now`` (a write while the clock ran ahead; the
     guardian's pick skips it too, so neither reader takes it as the newest), is
     refused unread. Of the rest, the newest REPAIR_REPORTS_READ by the loader's
-    ``report_order`` (seconds, then pid; the guardian's pick sorts by the same
-    key) are read through the repair's
+    ``report_order`` (seconds, then pid; the guardian's pick, the loader's
+    ``newest_eligible``, sorts by the same key) are read through the repair's
     own ``load_report`` (its module loads once per call, only when such a dir
-    exists); older ones count in ``unread_older`` (dismissed ones included). A report load_report refuses
+    exists: the installed kit's while the kit is ``ok``, else the checkout's,
+    see _repair_kit); older ones count in ``unread_older`` (dismissed ones included). A report load_report refuses
     (a symlinked dir, a REPAIR.json that is not a regular file within the byte
     cap, not a JSON object, over the row cap, or naming another checkout), or
     one that fails in any other way, counts in ``refused`` and is named once in
@@ -1038,12 +1082,17 @@ def collect_live_repairs(
     hooks the repair replaced to reinstall the tag's (``hooks_before``, any
     true value: the prune's keep rule), whose hooks-before/ may hold a hand
     edit's only copy.
-    Nothing else runs in the checkout."""
+    ``kit``: the installed repair kit's state (live_repair_kit.status: ok,
+    missing, partial, stale, corrupt, foreign; None when it could not be read),
+    read on every call, a report or none: a kit that cannot run is a finding
+    before any repair needs it. Its read-only git calls (the kit list and blob
+    ids at HEAD) are the only other ones in the checkout."""
     now = time.time() if now is None else now
     repo = str(repo_dir)
     backups = genesis_home_dir / "deploy-backups"
     out: dict = {"reports": [], "saved": 0, "refused": 0, "unread_older": 0, "unresolved": False}
     out["hooks_pending"] = out["hooks_saved"] = 0
+    out["kit"], loader = _repair_kit(genesis_home_dir, repo)
     try:
         names = [n for n in os.listdir(backups) if n.endswith(_REPAIR_SUFFIX)]
     except FileNotFoundError:
@@ -1058,7 +1107,7 @@ def collect_live_repairs(
         return out
     try:  # the module and every name used from it: a module on disk lacking
         # one (renamed by a later pull) is unloadable, never a blank snapshot
-        repair = _script(_REPAIR_SCRIPT)
+        repair = _script(loader)
         report_ts, load_report, bad = repair.report_ts, repair.load_report, repair.BadReport
         report_order, future_s = repair.report_order, repair.REPORT_FUTURE_S
         marked = repair.dismiss_marked
@@ -1172,6 +1221,8 @@ def live_repair_findings(repairs: dict | None) -> list[str]:
         found.append(f"live_repair_hooks_saved:{repairs['hooks_saved']}")
     if repairs.get("refused"):
         found.append(f"live_repair_refused:{repairs['refused']}")
+    if repairs.get("kit") in _KIT_FINDINGS:
+        found.append(f"live_repair_kit:{repairs['kit']}")
     return found
 
 

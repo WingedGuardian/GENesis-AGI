@@ -731,7 +731,8 @@ _UNREAD_PROGRAM_REMOVALS = [
     f"bash - <<< '{_PHRASE} /tmp/wt-x'",
     f"bash <(echo '{_PHRASE} /tmp/wt-x')",
     f"bash /dev/stdin <<< '{_PHRASE} /tmp/wt-x'",
-    # `+c` runs its payload, but the parser flattens only a `-` bundle's `-c`.
+    # `+c` runs its payload. The parser now reads it like `-c` (#2218); the
+    # refusal must hold either way.
     f"bash +c '{_PHRASE} /tmp/wt-x'",
     f"timeout 9 bash <<< '{_PHRASE} /tmp/wt-x'",
     f"env bash -s <<< '{_PHRASE} /tmp/wt-x'",

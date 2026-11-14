@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
 
@@ -58,6 +59,39 @@ def refuse_unrepresented(db, residual, selected):
         if (h, provider) == selected and kind not in ("cleanup", "cleanup-disproof"):
             raise RuntimeError("unrepresented native conflict prevents provider admission")
 
+
+@contextmanager
+def decision_gate(db, api, *, native=False, admission=None):
+    """Same admitted connection plus a final drain after recovery callbacks.
+
+    This supplies evidence, not a grant or a provider-hold exception. Ordinary
+    admission retains its unrepresented-conflict prefilter on the initial drain.
+    """
+    active = False
+    try:
+        with api['_legacy']._lock(api['marker_dir'](), api['OUTCOME_LOCK_WAIT_S']):
+            with api['_transaction'](db):
+                admission_schema(db, api['SCHEMA_VERSION'], api['_native'], require_native=native)
+                imported = api['_legacy'].drain(api['marker_dir'](), db, api['_import_one'], api['_fsync_dir'])
+                native_imported = []
+                active = True
+
+                def finalize():
+                    if not active or not db.in_transaction:
+                        raise RuntimeError('recovery decision is closed')
+                    residual = []
+                    native_imported.extend(api['_native'].drain(api['marker_dir'](), db, api['_legs'], api['_proof'],
+                                                         api['marker_hash'], residual=residual))
+                    return tuple(sorted(set(residual)))
+
+                residual = finalize()
+                if admission is not None:
+                    refuse_unrepresented(db, residual, admission)
+                yield db, finalize
+            api['_legacy'].retire(api['marker_dir'](), imported, api['_fsync_dir'])
+            api['_legacy'].retire(api['marker_dir'](), list(dict.fromkeys(native_imported)), api['_fsync_dir'])
+    finally:
+        active = False
 
 def validate_schema(db, native):
     """A version number alone is not evidence of a completed conversion."""
