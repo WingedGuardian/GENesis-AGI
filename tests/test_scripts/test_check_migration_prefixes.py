@@ -89,10 +89,42 @@ def _full_legacy(
     return schema + (schema_extra or []), data + (data_extra or [])
 
 
+def _pinned_base() -> str:
+    """A base ref this checkout CARRIES, for tests that read the real tree.
+
+    Reading ``_REPO`` with no base falls back to ``_DEFAULT_BASE_REF``, which
+    names the CURRENT tip of the default branch, fetched when the job runs —
+    while the tree under test is the merge ref, fixed when the event fired. A
+    migration merged into main between those two therefore looks deleted here,
+    and the guard fails a PR that broke nothing (seen 2026-11-13 on three
+    unrelated PRs). Pinning the base to this checkout's own HEAD keeps these
+    cases measuring the tree, not a branch that moved while the job waited.
+
+    Empty when git cannot answer at all — a tarball checkout, which has no HEAD
+    to pin — since then there is nothing to pin and no race to hit.
+    """
+    try:
+        return subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["git", "-C", str(_REPO), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - no git
+        return ""
+
+
+_BASE = _pinned_base()
+_needs_base = pytest.mark.skipif(not _BASE, reason="no git HEAD to pin the base to")
+
+
+@_needs_base
 def test_real_repo_is_clean():
-    """The acceptance baseline: the guard must pass on the ACTUAL tree, or it
-    is measuring something other than what ships."""
-    assert _mod.check(_REPO) == []
+    """The acceptance baseline: the guard must pass on the ACTUAL tree (against
+    its own HEAD, see ``_pinned_base``), or it is measuring something other than
+    what ships."""
+    assert _mod.check(_REPO, base_ref=_BASE) == []
 
 
 def test_clean_mixed_tree_passes(tmp_path):
@@ -350,17 +382,26 @@ def test_plumbing_failure_exits_2_never_0(tmp_path, monkeypatch, capsys):
     assert "could not run" in capsys.readouterr().err
 
 
+@_needs_base
 def test_clean_run_exits_0_and_says_so(monkeypatch, capsys):
-    monkeypatch.setattr(sys, "argv", ["check", "--repo-root", str(_REPO)])
+    monkeypatch.setattr(sys, "argv", ["check", "--repo-root", str(_REPO), "--base", _BASE])
     assert _mod.main() == 0
     assert "CLEAN" in capsys.readouterr().out
 
 
-def _run_as_ci(repo_root: Path) -> subprocess.CompletedProcess:
+def _run_as_ci(repo_root: Path, *, base: str | None = None) -> subprocess.CompletedProcess:
     """Run the script EXACTLY as ci.yml does: a bare interpreter with no venv,
-    no PYTHONPATH, and nothing pip-installed."""
+    no PYTHONPATH, and nothing pip-installed.
+
+    ``base`` goes through to ``--base`` for the cases that read the real tree:
+    without it the script answers "what was already merged" from the current tip
+    of the default branch, which may have moved since the tree was fixed.
+    """
+    argv = [sys.executable, "-E", "-S", str(_SCRIPT), "--repo-root", str(repo_root)]
+    if base is not None:
+        argv += ["--base", base]
     return subprocess.run(
-        [sys.executable, "-E", "-S", str(_SCRIPT), "--repo-root", str(repo_root)],
+        argv,
         capture_output=True,
         text=True,
         cwd=str(_REPO),
@@ -368,13 +409,14 @@ def _run_as_ci(repo_root: Path) -> subprocess.CompletedProcess:
     )
 
 
+@_needs_base
 def test_ci_command_line_runs_at_all_on_the_real_tree():
     """BLOCKER regression: the first version of this guard bound to the runner
     modules, which import aiosqlite at module scope, so it exited 2 on every PR
     in a job that installs nothing — while every check()-level test passed
     inside the venv. The id contract is stdlib-only so this stays true, and
     ``datetime`` (added for timestamp validation) keeps it true."""
-    proc = _run_as_ci(_REPO)
+    proc = _run_as_ci(_REPO, base=_BASE)
     assert proc.returncode == 0, f"exit {proc.returncode}\n{proc.stdout}\n{proc.stderr}"
     assert "CLEAN" in proc.stdout
 
