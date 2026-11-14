@@ -7,8 +7,9 @@ and asks it to read the canary through every path the plugin covers and to write
 Write (expected to be refused when it carries placeholders) and with Edit. Then it checks, step by step, that each scripted call ran and came back holding the
 placeholder (a leak scan proves nothing about a step that was skipped), that no canary value reached the model's final
 answer or any record Claude Code kept for the session (the transcript, subagent transcripts, persisted large
-outputs), and that the secrets file came out holding its values, byte for byte where the session did not change
-them. The typed-prompt path is not scripted here: a `-p` run keeps the engine's own record of its prompt, which
+outputs, background task output files), and that the secrets file came out holding its values, byte for byte
+where the session did not change them. A PreToolUse logging hook beside the plugin records the command each
+sibling hook saw, so the run also proves the stream wrap left other guards reading the original command. The typed-prompt path is not scripted here: a `-p` run keeps the engine's own record of its prompt, which
 no plugin can rewrite.
 
 Needs Claude Code on PATH and a logged-in account; it spends one short session. Not run in CI. Never touches a
@@ -38,6 +39,9 @@ tool named, and do not skip any:
 3. Bash: seq 1 30000 && cat app.conf   (if the output is saved to a file, Read its last 5 lines)
 4. Read tool: app.conf
 5. Agent tool (general-purpose): 'Run Bash: cat app.conf and reply with its output verbatim'. Quote the reply.
+5b. Monitor tool: command 'cat app.conf; exit 3'. Wait for it to end.
+5c. Bash with run_in_background=true: 'cat app.conf; (sleep 2; echo late-line; cat app.conf) & exit 4'.
+   Wait for its completion notification, run Bash 'sleep 5', then Read its output file.
 6. If an MCP tool named mcp__canary__canary_value is available, call it and quote its result. If one named
    mcp__canary__canary_fail is available, call it too (it reports an error) and quote the error.
 7. Write tool: create notes2.md containing exactly the text you saw for the key in step 4.
@@ -135,6 +139,20 @@ def main() -> int:
     secrets_link = proj / ".." / "secrets.env"
     secrets_file.chmod(0o600)
     (proj / "app.conf").write_text(f"config line\nkey={key}\n")
+    guard_log = base / "guard.log"
+    logger = base / "guard_log.py"
+    logger.write_text(
+        "import json,sys\n"
+        "d=json.load(sys.stdin)\n"
+        f"open({str(guard_log)!r},'a').write(json.dumps({{'tool':d.get('tool_name'),"
+        "'cmd':(d.get('tool_input') or {}).get('command','')})+'\\n')\n"
+    )
+    settings = base / "settings.json"
+    hook = {
+        "matcher": "Bash|Monitor",
+        "hooks": [{"type": "command", "command": f"python3 {logger}"}],
+    }
+    settings.write_text(json.dumps({"hooks": {"PreToolUse": [hook]}}))
 
     mcp_args: list[str] = []
     # A linked worktree has no venv of its own; the install's checkout does.
@@ -166,6 +184,8 @@ def main() -> int:
             args.model,
             "--plugin-dir",
             args.plugin_dir,
+            "--settings",
+            str(settings),
             *mcp_args,
             "--output-format",
             "json",
@@ -264,6 +284,8 @@ def main() -> int:
     step(
         "step 9c: the Edit anchored on a line without a secret ran", ("Edit",), "CANARY_REGION", ""
     )
+    step("step 5b: the Monitor command ran", ("Monitor",), "cat app.conf", "")
+    step("step 5c: the background command ran", ("Bash",), "run_in_background", "")
     edits = ran(("Edit",), "secrets.env")
     checks.append(
         (
@@ -288,7 +310,46 @@ def main() -> int:
         ]
         checks.append((f"{label} holds the placeholder", bool(held), f"{len(held)} files"))
 
-    stores = [transcript] + sorted((transcripts / sid).rglob("*"))
+    # Claude Code keeps task output under CLAUDE_CODE_TMPDIR when that is set, else under TMPDIR (measured).
+    tmp_base = (
+        os.environ.get("CLAUDE_CODE_TMPDIR") or os.environ.get("TMPDIR") or tempfile.gettempdir()
+    )
+    tmp_root = Path(tmp_base) / f"claude-{os.getuid()}"
+    tasks = tmp_root / transcripts.name / sid / "tasks"
+    task_files = sorted(tasks.glob("*.output")) if tasks.is_dir() else []
+    task_text = "".join(p.read_text(errors="replace") for p in task_files)
+    # Steps 5b and 5c each cat app.conf into a task file of its own: each must hold the placeholder by itself.
+    conf_files = [p for p in task_files if "config line" in p.read_text(errors="replace")]
+    seen = (
+        [json.loads(line) for line in guard_log.read_text().splitlines()]
+        if guard_log.exists()
+        else []
+    )
+    checks += [
+        ("background task output files found", bool(task_files), str(tasks)),
+        (
+            "the Monitor's and the background command's task files each hold the placeholder",
+            len(conf_files) >= 2
+            and all(api_key in p.read_text(errors="replace") for p in conf_files),
+            f"{len(conf_files)} files",
+        ),
+        ("late background output reached the task file", "late-line" in task_text, ""),
+        (
+            "no runner internals or job-control notices in task output",
+            "_sr_" not in task_text
+            and "]+  " not in task_text
+            and "redact_run.sh" not in task_text,
+            "",
+        ),
+        (
+            "sibling guards saw the Monitor and background commands as written, never the runner",
+            any(s["tool"] == "Monitor" and "cat app.conf; exit 3" in s["cmd"] for s in seen)
+            and any(s["tool"] == "Bash" and "late-line" in s["cmd"] for s in seen)
+            and not any("redact_run.sh" in s["cmd"] for s in seen),
+            f"{len(seen)} commands logged",
+        ),
+    ]
+    stores = [transcript] + sorted((transcripts / sid).rglob("*")) + task_files
     for p in stores:
         if p.is_file():
             n = raw_in(p.read_text(errors="replace"))
@@ -321,6 +382,45 @@ def main() -> int:
             "",
         ),
     ]
+
+    # Default permission mode: the wrap must not touch the command, or Claude Code's permission check judges the
+    # wrapper (`source ...`) and refuses an allow-listed background command (measured before the bypass gate).
+    allow = base / "allow-settings.json"
+    allow.write_text(json.dumps({"permissions": {"allow": ["Bash(echo DEFAULTMODE-RAN)"]}}))
+    plain = subprocess.run(
+        [
+            "claude",
+            "-p",
+            "--permission-mode",
+            "default",
+            "--model",
+            args.model,
+            "--plugin-dir",
+            args.plugin_dir,
+            "--settings",
+            str(allow),
+            "--output-format",
+            "json",
+            "Use the Bash tool once with run_in_background set to true and command: echo DEFAULTMODE-RAN"
+            " . Wait for it to finish, then reply with the word DONE.",
+        ],
+        cwd=proj,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    try:
+        denials = json.loads(plain.stdout).get("permission_denials") or []
+    except json.JSONDecodeError:
+        denials = None
+    checks.append(
+        (
+            "default mode: an allow-listed background command ran (the wrap left it alone)",
+            plain.returncode == 0 and denials == [],
+            f"exit {plain.returncode}, denials {denials}",
+        )
+    )
 
     failed = [c for c in checks if not c[1]]
     for name, ok, note in checks:
