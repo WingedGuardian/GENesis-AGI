@@ -36,6 +36,8 @@ class ScopeProbe:
     manager.write_text(manager.read_text() + '''
 class ScopeManager:
     def __init__(self, *args, **kwargs): pass
+    def require_no_batch(self, physical_reader):
+        assert callable(physical_reader)  # This synthetic manager has no prior scopes.
     def _object(self, *args): return '/org/freedesktop/systemd1/unit/owned'
     def registration(self, unit, facts, **kwargs):
         return dict(unit=unit, facts=facts, invocation_id='1'*32, stop_usec=90000000)

@@ -2045,6 +2045,18 @@ the shared banner is not an assertion about all concurrent sessions.
   only after original scope registration and admission. It uses the shared
   native-intent seam; imported vendor files remain trusted installed inputs.
   This wiring preserves negative readiness and does not activate indexing.
+  Initial owner admission observes the complete known managed-scope namespace
+  before reservation, rechecking terminal identities and recursive population.
+  This point-in-time census is not global physical exclusion. Standalone manual
+  indexing retains its existing policy; physical exclusion remains a gate.
+  `scripts/lib/code_intel_supervisor.py` wires exact-context explicit owner-loss
+  reconciliation through the captured runner and canonical locks. It preserves
+  orphaned uncertainty, original physical obligations and one-time accounting.
+  Matching terminal leader states alone do not prove controller process end.
+  The same-connection final drain observes callback-created evidence before
+  commit. The acknowledgement grants no retry or acceptance. The automatic
+  reconciliation caller remains separate (#3728), as do positive grants,
+  acceptance, cutover, native qualification and production capacity.
   The queue's `scripts/lib/index_marker_legacy.py` isolates malformed legacy
   artifacts in retained import receipts without replacing business failures;
   real filesystem/SQLite errors remain visible. Schema 3 atomically fans requests
@@ -2090,8 +2102,8 @@ the shared banner is not an assertion about all concurrent sessions.
   original ancestor chain. Collector read failures retain the affected physical
   hold without aborting unrelated reconciliation; publication failures propagate.
   Intent callback RuntimeError refuses child creation
-  with private diagnostics. Automatic readiness stays fenced; typed timer
-  dispatch and supervised recovery remain unfinished. Synthetic fixtures do not
+  with private diagnostics. Automatic readiness stays fenced; native kernel
+  and production acceptance remain unqualified. Synthetic fixtures do not
   establish native kernel or production acceptance.
   `scripts/lib/code_intel_source.py` provides explicit captured-source diagnostics
   and a finite assembly API: Python and shell buffers match one immutable Git
@@ -2159,8 +2171,8 @@ the shared banner is not an assertion about all concurrent sessions.
   reduction covers reconciliation and embedded outcomes; import batches dedupe
   provider revision advances. Retained cleanup evidence preserves healthy
   sibling eligibility after original physical/control release; unresolved extra
-  conflicts remain provider-scoped. Runner and supervised recovery remain
-  separate, unqualified contributions.
+  conflicts remain provider-scoped. Explicit orphan reconciliation supplies no
+  retry grant, acceptance, automatic readiness or production qualification.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede

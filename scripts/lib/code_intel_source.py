@@ -48,6 +48,7 @@ MODULES = (
     ("gitnexus", "_genesis_code_intel_gitnexus", "scripts/lib/code_intel_gitnexus.py"),
     ("owner", "_genesis_code_intel_owner", "scripts/lib/code_intel_owner.py"),
     ("owner_admission", "_genesis_code_intel_owner_admission", "scripts/lib/code_intel_owner_admission.py"),
+    ("supervisor", "_genesis_code_intel_supervisor", "scripts/lib/code_intel_supervisor.py"),
     ("managed", "_genesis_codebase_managed", "scripts/codebase_managed.py"),
 )
 SHELL = (
@@ -504,7 +505,8 @@ def main(argv=None):
     modules = captured.assemble()
     if args.action == "queue":
         try:
-            return modules["queue"].main(args.arguments)
+            supervisor = modules['supervisor'].Supervisor(captured, modules, _runner_lock_fds)
+            return modules["queue"].main(args.arguments, supervisor=supervisor)
         except Exception:
             import traceback
 

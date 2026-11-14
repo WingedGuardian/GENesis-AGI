@@ -19,6 +19,41 @@ def _boot(proc: Path) -> str:
     return str(uuid.UUID((proc / "sys/kernel/random/boot_id").read_text().strip()))
 
 
+def owner_ended(owner, proof, *, proc=Path('/proc')):
+    """Positive old-lifetime end, never an arbitrary process-read exception.
+
+    proc_pid_stat(5): state3, starttime22. A terminal leader can retain live
+    threads, so a matching Z/X/x is not a proved-ended process either.
+    https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
+    """
+    if (not isinstance(owner, dict) or set(owner) != {'pid', 'start_ticks', 'boot_id'}
+            or type(owner['pid']) is not int or not 0 < owner['pid'] < 2**32
+            or type(owner['start_ticks']) is not int or not 0 < owner['start_ticks'] <= 2**63 - 1
+            or not isinstance(owner['boot_id'], str)
+            or str(uuid.UUID(owner['boot_id'])) != owner['boot_id']):
+        raise ValueError('invalid original process identity')
+    boot = _boot(proc)
+    if boot != owner['boot_id']:
+        return True
+    directory = proc / str(owner['pid'])
+    try:
+        identity = proof['_process_identity'](directory, owner['pid'])
+    except FileNotFoundError:
+        try:
+            directory.stat()
+        except FileNotFoundError:
+            ended = True  # Entire original PID entry is absent, not just stat.
+        else:
+            raise ValueError('original process stat unavailable') from None
+    else:
+        if identity[1] <= 0 or identity[3] not in ('R', 'S', 'D', 'Z', 'T', 't', 'X', 'x', 'K', 'W', 'P', 'I'):
+            raise ValueError('original process state or start unavailable')
+        ended = identity[1] != owner['start_ticks']
+    if _boot(proc) != boot:
+        raise ValueError('boot changed during owner-lifetime observation')
+    return ended
+
+
 def _root(baseline, proof, proc):
     _, root, version = proof._ADMISSION["resolve_cgroup"](proc / "self/cgroup", proc / "self/mountinfo")
     if (version != 2 or proof._identity(root) != baseline["root"]
@@ -175,6 +210,60 @@ class ScopeManager:
         if re.fullmatch(r"[A-Za-z0-9_.\\-]+\.slice", result) is None:
             raise ValueError("actual owner slice unavailable")
         return result
+
+
+    def require_no_batch(self, cgroup_empty):
+        """Observe known managed scopes before reservation; this is no exclusion.
+
+        Caller holds the canonical global/repository locks and has not created
+        this attempt's scope. See systemd v255 reply_unit_info/list_units_filtered
+        for the complete tuple and unfiltered empty-state selection.
+        """
+        value = self._call('/org/freedesktop/systemd1', 'org.freedesktop.systemd1.Manager',
+                           'ListUnitsByPatterns', 'asas', '0', '1', 'code-intel-*.scope')
+        data = value['data']
+        if (value['type'] != 'a(ssssssouso)' or not isinstance(data, list)
+                or len(data) != 1 or not isinstance(data[0], list) or not callable(cgroup_empty)):
+            raise ValueError('global batch census unavailable')
+        names, objects = set(), set()
+        for row in data[0]:
+            if (not isinstance(row, list) or len(row) != 10
+                    or any(not isinstance(field, str) or '\0' in field
+                           for i, field in enumerate(row) if i != 7)
+                    or type(row[7]) is not int or row[7] != 0 or row[8:] != ['', '/']
+                    or row[2] != 'loaded' or row[5]
+                    or (row[3], row[4]) not in (('inactive', 'dead'), ('failed', 'failed'))
+                    or re.fullmatch(r'code-intel-[a-f0-9]{12}-(?:cbm|gitnexus)-[0-9]+\.scope', row[0]) is None
+                    or re.fullmatch(r'/org/freedesktop/systemd1/unit/[A-Za-z0-9_]+', row[6]) is None
+                    or row[0] in names or row[6] in objects):
+                raise ValueError('global batch census contains an unproven lifetime')
+            names.add(row[0])
+            objects.add(row[6])
+        for row in data[0]:
+            path = self._object('GetUnit', 's', row[0])
+            if path != row[6]:
+                raise ValueError('global batch object changed')
+            first = self._terminal_unit(self._properties(path, 'Unit'), row)
+            group = self.property(self._properties(path, 'Scope'), 'ControlGroup', 's')
+            target = PurePosixPath(group)
+            if group and (not target.is_absolute() or '..' in target.parts or target.name != row[0]):
+                raise ValueError('global batch cgroup identity unavailable')
+            cgroup_empty(group)  # Recursive population/removal; failed alone can retain tasks.
+            current_group = self.property(self._properties(path, 'Scope'), 'ControlGroup', 's')
+            last = self._terminal_unit(self._properties(path, 'Unit'), row)
+            if first != last or current_group != group or self._object('GetUnit', 's', row[0]) != path:
+                raise ValueError('global batch identity changed during absence proof')
+
+    def _terminal_unit(self, properties, row):
+        identity = self._identity(properties)
+        job = self.property(properties, 'Job', '(uo)')
+        if (identity[0] != row[0] or self.property(properties, 'Following', 's')
+                or self.property(properties, 'ActiveState', 's') != row[3]
+                or self.property(properties, 'SubState', 's') != row[4]
+                or not isinstance(job, list) or len(job) != 2
+                or type(job[0]) is not int or job != [0, '/']):
+            raise ValueError('global batch is no longer the terminal unqueued unit')
+        return identity
 
     def registration(self, unit, facts, *, wall_seconds):
         if type(wall_seconds) is not int or not 0 < wall_seconds <= 2**63 - 1:
