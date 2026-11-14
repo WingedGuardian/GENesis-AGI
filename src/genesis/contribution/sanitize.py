@@ -475,9 +475,8 @@ def parse_diff(diff_text: str, *, strict: bool = False) -> _ParsedDiff:
             line_no += 1
             if current_file is not None:
                 added.append((current_file, line_no, raw[1:]))
-        elif raw.startswith(" ") or raw.startswith("-"):
-            if raw.startswith(" "):
-                line_no += 1
+        elif raw.startswith(" "):
+            line_no += 1
 
     _finish_file()
     return _ParsedDiff(

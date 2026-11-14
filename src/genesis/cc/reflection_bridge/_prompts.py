@@ -633,9 +633,8 @@ async def build_light_prompt_enriched(
             parts.append(f"\n## User Profile\n{ctx.user_profile}")
         if ctx.user_model:
             parts.append(f"\n## User Model\n{ctx.user_model}")
-    elif focus == "anomaly":
-        if ctx.memory_hits:
-            parts.append(f"\n## Recent Observations\n{ctx.memory_hits}")
+    elif focus == "anomaly" and ctx.memory_hits:
+        parts.append(f"\n## Recent Observations\n{ctx.memory_hits}")
 
     parts.append(f"\n{focus_instruction}")
     parts.append(f'\nSet "focus_area": "{focus}" in your JSON output.')

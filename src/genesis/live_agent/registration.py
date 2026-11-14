@@ -27,6 +27,5 @@ async def update_session_row(session_id: str, model: str | None, closed: bool) -
                 expected_last_activity=row.get("last_activity_at"),
             ):
                 raise RuntimeError("registration changed during checkpoint; left unchanged")
-        elif model:
-            if not await update_model_effort(db, session_id, model=model):
-                raise LookupError("live agent registration disappeared during model update")
+        elif model and not await update_model_effort(db, session_id, model=model):
+            raise LookupError("live agent registration disappeared during model update")

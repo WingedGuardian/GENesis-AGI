@@ -11245,11 +11245,10 @@ def _rework_blocks(body: str) -> list[tuple[str, object, str]]:
             inline = tokens[i + 1]
             blocks.append(("para", tuple(items), _rework_inline_text(inline)))
             i += 2
-        elif t in ("fence", "code_block", "hr"):
+        elif t in ("fence", "code_block", "hr") or (
+            t == "html_block" and re.sub(r"<!--.*?-->", "", tok.content, flags=re.DOTALL).strip()
+        ):
             blocks.append(("other", tuple(items), ""))
-        elif t == "html_block":
-            if re.sub(r"<!--.*?-->", "", tok.content, flags=re.DOTALL).strip():
-                blocks.append(("other", tuple(items), ""))
         i += 1
     return blocks
 
