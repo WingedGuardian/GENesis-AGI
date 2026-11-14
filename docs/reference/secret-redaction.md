@@ -58,13 +58,58 @@ redacted once: text that already holds one passes through the next hook unchange
 
 ## Publishing guard
 
-`bin/publish_guard.py`, a second PreToolUse hook in the plugin, refuses a Bash or Monitor command that runs `gh` (directly or through a wrapper such as `timeout` or `bash -c`) when a
-known value appears in the command text or in an existing file of up to 1 MB that the command names (any token,
-or the part after `=` in a token, is tried as a path, so `--body-file f`, `-F body=@f` and every other spelling
-are covered without modelling gh's flags). `gh secret` and `gh auth` are exempt: sending a value to GitHub's
-secret store or logging in is their job. The refusal names the variable and where it was found, never the value.
-If the check cannot run it lets the command through and says so on stderr. Pushed commits are left to the
-repository's pre-push scan.
+`bin/publish_guard.py`, a second PreToolUse hook in the plugin, refuses a Bash or Monitor command that mentions
+`gh` (run directly, through a wrapper such as `timeout`, `bash -c` or `find -exec`, through a variable assigned
+in the same command, or handed as one string to a launcher such as `eval`, `watch`, `script -c`, `flock -c`,
+`su -c`, `tmux new-session` or `parallel`) when a known value appears in the command text, in a word the shell
+would pass to a program, or in an existing file the command names. The command is read with the repository's
+shared shell parser (`scripts/hooks/shell_parse.py`), so nested commands (`bash -c`, `$(...)`, backticks, and
+the launcher strings above, parsed as commands to the parser's depth bound), redirect targets (`<f`, `$(<f)`,
+`<"$HOME/f"`), assignment values (`F=f; gh ... -F "$F"`), globs, `~`/`$HOME` and the directories `cd`, `pushd`
+and `env -C` move into are followed. Every word, every part after an `=`, a short option's attached value
+(`-Ff`) and each of those without a leading `@` is tried as a path, so `--body-file f`, `-F body=@f` and
+`--field=body=@f` are covered without modelling gh's flags. A value in the command text is refused at once,
+without reading files. Files are read up to 16 MiB, a glob is followed to its first 64 files, and the file
+check stops after 8 seconds (the hook's own timeout is 15); in each case the agent gets a one-line note saying
+what was not checked.
+
+A gh-mentioning command the parser cannot prove it read completely (a line continuation, a here-doc it cannot
+tokenize, a `$'...'` string that builds text, and the other blind spots the parser reports) cannot be checked.
+While values are loaded it is refused, with the parser's reason and its way out, when any gh in it may publish:
+`pr create|comment|edit|review|merge`, `issue create|comment|edit`, `api`, `release` or `gist`, found in the raw
+text or with quotes, backslashes and continuations removed. Because the parser cannot be trusted here the match
+is lenient: a gh whose subcommand the text does not clearly show as a read (a variable, an unknown subcommand,
+the word gh in prose) counts as publishing. When every gh in it clearly only reads (`pr view|list|checks`,
+`issue view|list`, `repo view`, `run view|list|watch|download`, `workflow view|list`, `search`, `auth`,
+`secret`...) and no value is in its text, it
+goes ahead with a one-line note to the agent that the value check did not run. Writing a body to a file and
+passing it with `--body-file` keeps a command readable. A launcher's string that cannot be read counts as an
+unreadable command; another program's string that mentions gh (a `git commit -m` message) is data and is skipped
+when it cannot be read. Measured on a live install (2026-11-13, 14,019 distinct gh-mentioning Bash commands from
+the 150 most recent session transcripts): 715 (5.1%) are refused as unreadable, of which 537 the push guard
+already refuses on its own, so 178 (1.3%) are new refusals; 163 pass with the note.
+
+`gh secret` and `gh auth` are exempt: sending a value to GitHub's secret store or logging in is their job. The
+exemption applies only when every gh the command runs is proven to be one of them, so an unreadable command
+with a value in its text, or one where gh runs through a variable or another program, is not exempt. The
+refusal names the variable and where it was found, never the value; a value inside a path is shown as its
+placeholder.
+
+If the values cannot be loaded the command goes ahead and stderr says so. If the parser cannot be loaded only the
+raw command text is checked. A value already found in the command text is refused even when a later step fails.
+Pushed commits are left to the repository's pre-push scan.
+
+Not covered:
+
+- a file the same command writes before gh runs (`... > b.md && gh ... -F b.md`): a PreToolUse hook sees only
+  files that already exist;
+- variables other than `HOME` that the command itself does not assign (set by an earlier call, a loop
+  variable), including a value that reaches gh from the environment (`--body "$VAR"`), tracked in #4573;
+- brace expansion (`{a,b}.md`), `cd -`, `popd`, `CDPATH` and `sudo -D`;
+- a string handed to a program that is not a launcher (`ssh host '...'`) when the parser cannot read it;
+- `$PWD`, `$(pwd)`, `$TMPDIR` and other variables in a path (only `~` and `$HOME` are resolved);
+- a gh name the command builds from pieces (`G=g; ${G}h ...`): no gh is mentioned, so nothing is checked;
+- files over 16 MiB, files past a glob's first 64, and files left when the 8-second check stops.
 
 ## Behaviour worth knowing
 
@@ -117,6 +162,9 @@ install step.
 - Redacting a stored row fails twice: that row's text is withheld with a notice naming the plugin.
 - A saved large output is not cleaned (it is not in a session's `tool-results` folder, or it cannot be read
   or written): the model's copy is still redacted; the disk copy is logged as possibly raw.
+- The publishing guard cannot load the values: the gh command goes ahead and stderr says the check did not run.
+  It cannot load the shell parser: only the raw command text is checked. Any later step fails: a value already
+  found in the command text is still refused; otherwise the command goes ahead.
 
 ## Not covered
 
