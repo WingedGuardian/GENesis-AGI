@@ -15,6 +15,12 @@ every time, on two facts and nothing else:
   2. one of the six numbered answers is missing or empty (``n/a — <reason>`` is an
      answer; a bare ``n/a``, ``TBD`` or an unfilled ``<placeholder>`` is not).
 
+TWO FORMS. The six questions, and the nine-item form (``FORM``): each answer
+starts with its label, answer 2 carries ``Stated:`` and answer 5 ``Wrong fix:``,
+and ``1. Problem: as #<N>`` stands for items 1 to 5. A section in the nine-item
+form (told from its first answer) is judged by it. Until ``FORM_EPOCH`` is set,
+a complete six still passes; from it, a plan owes the nine.
+
 Neither judges content, and the fix is one edit. What they do require is the
 documented FORM: answers as a numbered list. Six answers run together on one line
 read as one answer, and a plan written before question 6 existed is missing one.
@@ -85,6 +91,121 @@ _QUESTIONS = (
     "PR shape: expected counted lines and the split or Shape: reason",
 )
 
+#: The nine-item form: each answer starts with its label. Items 1 to 5 are the
+#: Problem block, which every issue owes; 6 to 9 the Change block, which plans
+#: and an issue handed to a paid builder owe as well. Kept beside the six above,
+#: not in place of them: ``premise_gate`` counts issue completeness by these
+#: tables, and the Action that runs it fetches only five files, so the form's
+#: rules live here rather than in a module of their own.
+FORM = (
+    (
+        "Observed",
+        "what happens, with the command, output and commit (a fresh main), and the local causes ruled out",
+    ),
+    (
+        "Intended",
+        "what should happen. Stated: the doc, test, ruling or comment that says so, or nowhere",
+    ),
+    ("Cost", "who or what is affected, how often, how that was measured"),
+    ("Searched", "existing issues, main and prior rulings: what was searched, what was found"),
+    (
+        "Acceptance",
+        "what must hold afterwards. Wrong fix: the tempting fix that must fail, or none, because ...",
+    ),
+    ("Mechanism", "why this removes the cause; who calls it and what they do differently"),
+    (
+        "Alternatives",
+        "what already does or decides this, the simpler mechanism considered, and why not each",
+    ),
+    ("Evidence", "every outside-behaviour claim and number, measured or cited"),
+    ("Shape", "counted lines, and the split or the Shape: reason"),
+)
+FORM_QUESTIONS = tuple(f"{label}: {what}" for label, what in FORM)
+PROBLEM_BLOCK = tuple(range(1, 6))
+CHANGE_BLOCK = tuple(range(6, 10))
+#: Answers that must carry a second label, and must answer it.
+_SUBLABELS = {2: "Stated", 5: "Wrong fix"}
+#: ``1. Problem: as #<N>`` stands for items 1 to 5: a plan or PR whose issue
+#: already answers the Problem block cites it. The issue is not fetched (no
+#: tracker lookup, as above).
+_AS_LINE = re.compile(r"\s*problem\s*:\s*as\s+#\d+\b", re.IGNORECASE)
+_NEW_FORM_FIRST = re.compile(r"\s*(?:observed\s*:|problem\s*:\s*as\s+#\d)", re.IGNORECASE)
+#: When the nine-item form becomes REQUIRED: issues created on or after it, and
+#: every plan presented after it. None means not yet: a complete section in
+#: either form passes, so nothing that passes today is newly blocked or
+#: labelled. Set in the change that switches the issue forms and the docs, to a
+#: time after that change deploys. ``_TEST_PREMISE_FORM_EPOCH`` overrides it in
+#: tests that run the hook as a subprocess. Write it as GitHub writes
+#: ``created_at`` (``YYYY-MM-DDTHH:MM:SSZ``, like ``GATE_EPOCH``): issues compare
+#: it as a string.
+FORM_EPOCH: str | None = None
+
+
+def form_epoch() -> str | None:
+    override = os.environ.get("_TEST_PREMISE_FORM_EPOCH")
+    return override if override else FORM_EPOCH
+
+
+def is_new_form(answers: dict[int, str] | None) -> bool:
+    """Whether a premise section is written in the nine-item form.
+
+    Its first answer starts ``Observed:`` or ``Problem: as #N``, AND another
+    answer carries its own nine-item label (for the as-line, a Change-block
+    answer). One label is not enough: old question 1 (outside-behaviour claims)
+    is naturally answered "Observed: ...", and judging such a complete six by the
+    nine-item form would newly fail it. Two coincidences in one old section are
+    the residual this accepts."""
+    if not answers or not _NEW_FORM_FIRST.match(answers.get(1, "")):
+        return False
+    others = CHANGE_BLOCK if _AS_LINE.match(answers.get(1, "")) else range(2, len(FORM) + 1)
+    return any(_after_label(FORM[n - 1][0], answers.get(n, "")) is not None for n in others)
+
+
+def _after_label(label: str, answer: str) -> str | None:
+    """The text after ``label:`` at the start of ``answer``, or None without it."""
+    found = re.match(rf"\s*{re.escape(label)}\s*:\s*(.*)\Z", answer, re.IGNORECASE | re.DOTALL)
+    return found.group(1) if found else None
+
+
+def form_problems(
+    answers: dict[int, str], need: tuple[int, ...], *, allow_as_line: bool = False
+) -> list[tuple[int, str]]:
+    """``(n, why)`` for each item in ``need`` that the nine-item form leaves
+    unanswered. Structure only: whether an answer is TRUE is the reviewer's
+    question (the owner ruling in the module docstring)."""
+    # Plans and PR bodies only (spec 5.2): an issue answers its own Problem
+    # block, and a paid build owes all nine written out.
+    as_line = allow_as_line and bool(_AS_LINE.match(answers.get(1, "")))
+    out: list[tuple[int, str]] = []
+    for n in need:
+        if as_line and n in PROBLEM_BLOCK:
+            continue
+        label = FORM[n - 1][0]
+        answer = answers.get(n, "")
+        body = _after_label(label, answer)
+        if body is None:
+            why = "is missing or empty" if _empty(answer) else f"does not start with `{label}:`"
+            out.append((n, why))
+            continue
+        if _empty(body):
+            out.append((n, "is missing or empty"))
+            continue
+        sub = _SUBLABELS.get(n)
+        if sub:
+            spelled = r"\s+".join(re.escape(w) for w in sub.split())
+            found = re.search(rf"\b{spelled}\s*:\s*(.*)\Z", body, re.IGNORECASE | re.DOTALL)
+            if found is None or _empty(found.group(1)):
+                out.append((n, f"has no `{sub}:` answer"))
+    return out
+
+
+def _form_template() -> str:
+    return "".join(f"  {n}. {label}: <{what}>\n" for n, (label, what) in enumerate(FORM, start=1))
+
+
+def _old_template() -> str:
+    return "".join(f"  {n}. <{q}>\n" for n, q in enumerate(_QUESTIONS, start=1))
+
 
 def _plan_text(payload: dict) -> str:
     """The plan this ExitPlanMode presents. The file the payload names first (it is
@@ -133,8 +254,31 @@ def _check(payload: dict) -> int:
         return 0  # no repo work named — not a plan this check is for
 
     answers = premise_answers(prose)
+    epoch = form_epoch()
+    # The template shown is the form the plan owes: the nine-item form once it is
+    # required, or when the plan is already written in it; the six otherwise.
+    template = _form_template() if (epoch is not None or is_new_form(answers)) else _old_template()
     if answers is None:
         problems = ["the plan has no `## Premise checks` section"]
+    elif epoch is None and not any(
+        _empty(answers.get(n, "")) for n in range(1, len(_QUESTIONS) + 1)
+    ):
+        # Until the epoch, EITHER complete form passes: six non-empty answers
+        # pass here exactly as they do today, whatever form they look like.
+        # The nine-item rules can only loosen before then, never tighten.
+        problems = []
+    elif is_new_form(answers):
+        problems = [
+            f"answer {n} ({FORM[n - 1][0]}) {why}"
+            for n, why in form_problems(
+                answers, PROBLEM_BLOCK + CHANGE_BLOCK, allow_as_line=True
+            )
+        ]
+    elif epoch is not None:
+        problems = [
+            "the section uses the six-question form; plans now answer the nine-item form "
+            "below (`1. Problem: as #<N>` stands for items 1 to 5 when an issue answers them)"
+        ]
     else:
         problems = [
             _problem(n, question, answers.get(n, ""))
@@ -148,7 +292,7 @@ def _check(payload: dict) -> int:
         + "".join(f"  - {p}\n" for p in problems)
         + "\nAdd or complete this section in the live plan, then call ExitPlanMode again:\n"
         "\n  ## Premise checks\n"
-        + "".join(f"  {n}. <{q}>\n" for n, q in enumerate(_QUESTIONS, start=1))
+        + template
         + "\n`n/a — <reason>` is a valid answer. The questions:\n"
         '.claude/docs/premise-check.md, "At plan and issue time".',
         file=sys.stderr,
