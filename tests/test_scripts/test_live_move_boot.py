@@ -468,10 +468,12 @@ def test_td21_a_hold_at_boot_starts_and_pages_the_guards_remedy(w):
     assert again.returncode == 0 and len(w.alerts()) == 1, "the same state paged twice"
 
 
-def test_td21_the_3722_shape_names_live_and_never_advises_post_merge(w):
+def test_td21_the_3722_shape_names_live_and_only_an_honest_retry(w):
     """A `live` rollback killed after `merging` (here: phase bootstrap, HEAD at
     own_head on `live`, the tree part-restored): the repair does not heal that
-    phase yet. Start (Q5) with a critical page in `live`'s words."""
+    phase yet. Start (Q5) with a critical page in `live`'s words, carrying the
+    guard's remedy (#3722 advice): --post-merge only as a retry, with its
+    database caveat, never main's "finish with" or "bootstrap never ran on"."""
     killed_rollback(w, "P")
     state = {k: v for k, v in w.row().items() if k != "live_move"}
     w.write_state({**state, "phase": "bootstrap", "own_head": w.to})
@@ -481,9 +483,50 @@ def test_td21_the_3722_shape_names_live_and_never_advises_post_merge(w):
     alerts = w.alerts()
     assert len(alerts) == 1 and alerts[0]["severity"] == "critical", alerts
     body = alerts[0]["body"]
-    assert "`live`" in body and "#3722" in body and "--post-merge" not in body, body
+    assert "`live`" in body and "#3722" in body, body
+    assert "finish with scripts/update.sh --post-merge" not in body.lower(), body
+    assert "bootstrap never ran on" not in body and "migrated database" in body, body
+    assert "retries the update" in body and "git restore --source=HEAD" in body, body
     assert alerts[0]["dedupe_key"].startswith("live_move_repair:boot:mixed:")
     assert "on main" not in r.stderr, r.stderr
+
+
+def test_3722_repair_move_by_command_prints_the_guards_remedy(w):
+    """By command, repair-move exits 3 on that shape as before and prints the
+    guard's remedy, not only "does not handle that phase yet"."""
+    killed_rollback(w, "P")
+    state = {k: v for k, v in w.row().items() if k != "live_move"}
+    w.write_state({**state, "phase": "migrations", "own_head": w.to})
+    r = w.repair()
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "#3722" in r.stdout and "retries the update" in r.stdout, r.stdout
+
+
+def test_3722_cell_c_at_boot_keeps_its_journal_line_under_the_cut(w):
+    """P2 review SF-1: a HOLD reason carries its whole remedy (cell C's is long);
+    the boot journal line shows only its first sentence, under the guardian's
+    400-character cut, and the `kept` page carries the remedy."""
+    # A fresh world is on `live` at the tag: the rollback's checkout finished.
+    state = {k: v for k, v in w.row().items() if k != "live_move"}
+    w.write_state({**state, "phase": "health_check", "own_head": w.to})
+    assert w.guard_rc(json.loads(w.state.read_text())) == 6, "control: cell C holds"
+    r = w.repair(mode="--boot")
+    assert r.returncode == 0, r.stderr
+    _lines_ok(r.stderr)
+    body = w.alerts()[0]["body"]
+    assert "may not have finished" in body and "Dismiss" in body, body
+
+
+def test_3722_the_page_leads_with_the_remedy_before_a_long_path_list(w):
+    """P2 review SF-2: the page body is cut at ALERT_BYTES; with hundreds of
+    listed paths the remedy must still be in what is kept, so it comes before
+    the path list (whose length the guard does not cap)."""
+    killed_rollback(w, "P")
+    state = {k: v for k, v in w.row().items() if k != "live_move"}
+    w.write_state({**state, "phase": "bootstrap", "own_head": w.to})
+    w.repair(mode="--boot")
+    body = w.alerts()[0]["body"]
+    assert body.index("retries the update") < body.index("These paths hold"), body
 
 
 def test_td21_a_main_mixed_tree_starts_with_a_critical_page(w):

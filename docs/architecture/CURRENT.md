@@ -5145,7 +5145,17 @@ logger or unrelated exceptions with copied text and no provenance.
   bootstrap never ran on). At main's merge, put the paths back and finish with
   `--post-merge`; a main row at the tag keeps the by-hand text (save, restore,
   Dismiss). Both live texts name `repair-move --restore <ts>` as the way back
-  for a path that was not the update's. The dashboard's progress poll returns the guard's remedy
+  for a path that was not the update's. A `live` row in a phase after `merging`
+  (bootstrap, migrations, health_check) with HEAD on `live` keeps main's
+  verdicts and exit codes but gets its own text (#3722 advice; nothing heals it
+  yet): at the rebuilt tip, whole (exit 0) or half-written back toward the tag
+  (exit 4), the text says the update was killed in that phase or failed there
+  and may have been rolling back, and names `--post-merge` only as a retry of
+  the same code whose database snapshot is taken after the migration; back at
+  the tag (exit 6), it says the rollback put the checkout there but may not
+  have finished the hooks, kit, packages, database or restart, and to Dismiss
+  and run the update again. For the half-written case repair-move prints that
+  text by command and pages it at boot, remedy first. The dashboard's progress poll returns the guard's remedy
   (`guard_remedy`) and the update card shows it. `deploy_code_only.sh` and the live engine refuse to
   restart or move the checkout while it guards; a plain `update.sh` exits 5
   (before tagging or writing anything), and the dashboard's `/apply` answers
@@ -5290,7 +5300,7 @@ logger or unrelated exceptions with copied text and no provenance.
   a lock held past the budget on such a row); everything else starts (owner
   rulings): a HOLD, GUARDS or CONFLICT_PENDING with a `kept` warning (the
   guard's remedy), a half-written tree it never heals (a main checkout, or a
-  `live` rollback stopped after `merging`, #3722's wording) with a `mixed`
+  `live` rollback stopped after `merging`, whose page carries the guard's #3722 text) with a `mixed`
   critical page, a failure before judging with `skipped`. Each page's key is
   its class, the state's bytes as the run leaves them and an end mark of the
   checkout (HEAD, `status -z`, index.lock), so a heal that keeps a HOLD and the
