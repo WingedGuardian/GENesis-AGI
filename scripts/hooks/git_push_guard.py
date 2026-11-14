@@ -5488,8 +5488,13 @@ def _format_rounds(result: dict) -> str:
     return line
 
 
-def _rounds_row(pr_num: str, repo: str | None = None) -> str:
+def _rounds_row(
+    pr_num: str, repo: str | None = None, budget_out: list[dict] | None = None
+) -> str:
     """The ``rounds`` line of ``--check-pr``: ADVISORY, never a failure.
+
+    ``budget_out``, when given, receives the evaluator's result if it is ``ok``, so
+    the no-change note reads the same budget instead of fetching it a second time.
 
     The round budget is enforced where it acts (the review-request ask above and
     the commit gate); counting it here too would be a second enforcer of one rule.
@@ -5516,7 +5521,206 @@ def _rounds_row(pr_num: str, repo: str | None = None) -> str:
             os.getcwd(), target, int(pr_num), result,
             deadline=time.monotonic() + _gh_timeout(8.0),
         )
+        if budget_out is not None:
+            budget_out.append(result)
     return _format_rounds(result)
+
+
+#: How far back the no-change note walks over merge commits from the head.
+#: Ten catch-up merges after a review is far past any PR seen here; the walk
+#: stops at the first non-merge commit anyway, so the cap only bounds API calls.
+_NO_CHANGE_MAX_STEPS = 10
+
+#: GitHub's compare endpoint lists at most 300 files. At the cap, files beyond it
+#: are invisible, so a merge cannot be shown to leave the PR's files alone.
+_COMPARE_FILE_CAP = 300
+
+#: Wall-clock bound on the note's own API calls. The report path arms no merge
+#: deadline, so each call gets the full 8s of ``_gh_timeout(8)``; without a bound,
+#: a PR with many pushed-out reviewed heads and a long merge chain could add
+#: minutes to ``--check-pr`` for an advisory line. 30s is about one whole report
+#: (MEASURED: ``--check-pr 4611`` took 29s); past it the note gives up silently,
+#: which can only drop a note, never print a false one.
+_NO_CHANGE_BUDGET_S = 30.0
+
+
+def _commit_info(sha: str, repo: str | None) -> tuple[str, str, list[str]] | None:
+    """``(full sha, tree, parents)`` of a commit from the commits API, or None.
+
+    The commits API resolves a short sha and a commit force-pushed out of the PR,
+    which the PR's own commit list no longer holds. An id under 7 hex, an
+    ambiguous one or an unknown one is None, as for ``_commit_at_prefix``, whose
+    input rule this shares. Tests inject via ``_TEST_GH_COMMIT_INFO``: a JSON
+    object keyed by the sha as asked, whose value is ``{sha, tree, parents}``; a
+    missing key reads as an API error."""
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{7,40}", sha):
+        return None
+    raw = os.environ.get("_TEST_GH_COMMIT_INFO")
+    if raw is not None:
+        try:
+            got = json.loads(raw).get(sha)
+        except Exception:
+            return None
+    else:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/commits/{sha}",
+                    "--jq",
+                    "{sha: .sha, tree: .commit.tree.sha, parents: [.parents[].sha]}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(8),
+            )
+            if result.returncode != 0:
+                return None
+            got = json.loads(result.stdout)
+        except Exception:
+            return None
+    if not isinstance(got, dict):
+        return None
+    full, tree, parents = got.get("sha"), got.get("tree"), got.get("parents")
+    if not (isinstance(full, str) and re.fullmatch(r"[0-9a-f]{40}", full.lower())):
+        return None
+    if not (isinstance(tree, str) and tree) or not isinstance(parents, list):
+        return None
+    if not all(isinstance(p, str) and p for p in parents):
+        return None
+    return full.lower(), tree, [p.lower() for p in parents]
+
+
+def _no_change_note(
+    pr_num: str, repo: str | None, budget: dict, *, clock: Callable[[], float] = time.monotonic
+) -> str | None:
+    """A NOTE when the PR's own commits since a review changed no file.
+
+    ADVISORY, and independent of any delivery marker: it exists for the case
+    where nobody has read the PR yet. A contributor can rewrite a reviewed commit
+    with a new message only (or push an empty commit) and then say a finding is
+    fixed; the tree says otherwise.
+
+    Reviewed heads are the budget's marks plus the Codex clean comments on heads
+    no longer in the PR (``unresolved_clean_heads``). The note fires when a
+    commit has the tree of a reviewed head OTHER than itself, reached from the
+    head by stepping back over merge commits along first parents:
+
+    - Every earlier reviewed head counts, not only the newest. With only the
+      newest, one more catch-up merge after a re-review of the rewritten head
+      made that head the reference, the walk reached it, and the note went
+      silent; a late re-review of an older head hid a rewrite the same way.
+    - A reviewed head matching its OWN tree does not count. Stepping back over a
+      routine merge of main reaches the reviewed head after every catch-up, and
+      a merge on top of a reviewed head is not a rewrite.
+    - A merge is stepped over only when it touches none of the PR's own files.
+      Code added while resolving a merge would otherwise hide behind it.
+    - A review of the current head does not silence it: a clean re-review of an
+      unchanged tree does not make the push claimed as a fix change anything.
+
+    Anything unreadable (the PR's files, a merge's files, a compare at GitHub's
+    300-file cap, a commit on the walk) or the time bound prints nothing. A
+    reviewed head whose tree cannot be read is skipped. Both can only drop a
+    note, never print a false one: a missed note costs nothing a review would
+    not catch, and a false one teaches the reader to skip it."""
+    if not isinstance(budget, dict) or budget.get("status") != "ok":
+        return None
+    head = budget.get("current_head")
+    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+        return None
+    stop_at = clock() + _NO_CHANGE_BUDGET_S
+
+    known: dict[str, tuple[str, list[str]]] = {}
+    for c in budget.get("commits") or []:
+        if not isinstance(c, dict):
+            return None
+        sha, tree, parents = c.get("sha"), c.get("tree"), c.get("parents")
+        if isinstance(sha, str) and isinstance(tree, str) and tree and isinstance(parents, list):
+            known[sha.lower()] = (tree, [str(p).lower() for p in parents])
+
+    def lookup(sha: str) -> tuple[str, str, list[str]] | None:
+        if sha in known:
+            return sha, *known[sha]
+        if clock() > stop_at:
+            return None
+        return _commit_info(sha, repo)
+
+    # tree -> {reviewed full sha: newest review time of that sha}
+    reviewed_trees: dict[str, dict[str, tuple[_dt.datetime, str]]] = {}
+    for row in [*(budget.get("marks") or []), *(budget.get("unresolved_clean_heads") or [])]:
+        if not isinstance(row, dict):
+            return None
+        sha, at = row.get("head"), row.get("at")
+        if not (isinstance(sha, str) and sha and isinstance(at, str) and at):
+            continue  # an untimed (pending) review is not a review of a tree yet
+        sha = sha.lower()
+        if head.startswith(sha):
+            continue  # the head itself: the walk starts there
+        try:
+            when = _dt.datetime.fromisoformat(at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if when.tzinfo is None:
+            return None
+        info = lookup(sha)
+        if info is None:
+            continue
+        full, tree, _ = info
+        prior = reviewed_trees.setdefault(tree, {}).get(full)
+        if prior is None or when > prior[0]:
+            reviewed_trees[tree][full] = (when, at)
+    if not reviewed_trees:
+        return None
+
+    own_files: set[str] | None = None
+    current = head
+    for _ in range(_NO_CHANGE_MAX_STEPS + 1):
+        info = lookup(current)
+        if info is None:
+            return None
+        _, tree, parents = info
+        others = {s: v for s, v in reviewed_trees.get(tree, {}).items() if s != current}
+        if others:
+            # A merge was stepped over on the strength of ``own_files``, read after
+            # the budget. Only if the head has not moved since does that list
+            # describe the head this note judges; otherwise a push during the
+            # report could add a file the walk never saw.
+            if own_files is not None and (
+                clock() > stop_at or (_pr_head_sha(pr_num, repo) or "").lower() != head
+            ):
+                return None
+            reviewed_sha, (_, reviewed_at) = max(others.items(), key=lambda kv: kv[1][0])
+            same = "has" if current == head else f"steps back over merges to {current[:12]}, which has"
+            return (
+                f"NOTE: PR #{pr_num} — head {head[:12]} {same} the same tree as "
+                f"{reviewed_sha[:12]}, reviewed at {reviewed_at}: the PR's own commits "
+                "since that review changed no file. Advisory: a claim that this push "
+                "fixed a finding is not shown by the code."
+            )
+        if len(parents) < 2:
+            return None  # a non-merge commit with another tree is a real change
+        if own_files is None:
+            # Uncached on purpose: the memo may hold a read made earlier in the
+            # report, against an older head than the budget's.
+            if clock() > stop_at:
+                return None
+            files = _pr_changed_files_uncached(pr_num, repo)
+            if files is None:
+                return None
+            own_files = set(files)
+        if clock() > stop_at:
+            return None
+        merged = _pr_contribution(parents[0], current, repo)
+        if merged is None or len(merged[2]) >= _COMPARE_FILE_CAP:
+            return None
+        for f in merged[2]:
+            if not isinstance(f, dict):
+                return None
+            if f.get("filename") in own_files or f.get("previous_filename") in own_files:
+                return None
+        current = parents[0]
+    return None
 
 
 def _comment_body(argv: list[str]) -> tuple[str | None, bool]:
@@ -17447,7 +17651,17 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         _print_gate_detail(msg)
     failures += 1 if blocked else 0
     # Advisory: never touches `failures` (see `_rounds_row`).
-    print(f"rounds         : {_rounds_row(pr_num, repo)}")
+    _budget_seen: list[dict] = []
+    print(f"rounds         : {_rounds_row(pr_num, repo, budget_out=_budget_seen)}")
+    # Advisory too, and printed only when it fires: a push since the last review
+    # that changed no file (see `_no_change_note`). It reuses the budget above.
+    if _budget_seen:
+        try:
+            _note = _no_change_note(pr_num, repo, _budget_seen[0])
+        except Exception:  # noqa: BLE001 - an advisory never takes the report down.
+            _note = None
+        if _note:
+            print(_note)
     # Scheduled Claude review at HEAD — the SAME always-fail-closed gate the merge arm
     # enforces (shared function). A missing/stale/unreadable scheduled review is a
     # FAILURE line, never a false all-clear — the report must not diverge from enforcement.
