@@ -218,6 +218,104 @@ def test_green_ends_the_episode_so_the_next_one_pages_again(box):
     assert len(first + [p for p in _pages(box) if p["severity"] == "warning"]) == 2
 
 
+def _clears(box) -> list[dict]:
+    return [p for p in _pages(box) if ":clear-" in p["dedupe_key"]]
+
+
+@pytest.mark.parametrize("tier,word", [("red", "RED"), ("orange", "ORANGE")])
+def test_green_after_a_page_sends_one_all_clear(box, tier, word):
+    """A page with no all-clear leaves the owner unable to tell "recovered a
+    minute later" from "still filling". The first GREEN after a page sends one
+    INFO message saying the filesystem recovered and how far the episode got."""
+    _handle(box, tier)
+    assert not _clears(box)
+    _handle(box, "green", free=90_000)
+    clears = _clears(box)
+    assert len(clears) == 1, _pages(box)
+    assert clears[0]["severity"] == "info"
+    assert clears[0]["title"].startswith("Disk recovered:")
+    assert word in clears[0]["body"] and "90000 MB free" in clears[0]["body"]
+    for q in box["queue"].glob("*.json"):  # delivered: the queue's dedupe cannot hide a repeat
+        q.unlink()
+    _handle(box, "green", free=90_000)
+    assert _clears(box) == [], "one all-clear per episode, not one per green poll"
+
+
+def test_red_after_orange_clears_once_naming_red(box):
+    _handle(box, "orange")
+    _handle(box, "red")
+    _handle(box, "green", free=90_000)
+    clears = _clears(box)
+    assert len(clears) == 1 and "RED" in clears[0]["body"], clears
+
+
+def test_no_all_clear_when_no_page_was_sent(box):
+    """YELLOW pages nobody, so its recovery says nothing either."""
+    _handle(box, "yellow")
+    _handle(box, "green", free=90_000)
+    assert _pages(box) == []
+
+
+def test_no_all_clear_for_a_page_that_never_queued(box):
+    """A page that could not be queued was never seen; clearing it would be the
+    first the owner heard of the episode."""
+    box["queue"].mkdir()
+    box["queue"].chmod(0o555)
+    try:
+        _handle(box, "red")
+    finally:
+        box["queue"].chmod(0o755)
+    _handle(box, "green", free=90_000)
+    assert _clears(box) == []
+
+
+def test_an_all_clear_that_cannot_queue_still_ends_the_episode(box):
+    """Losing an all-clear is logged; it must not hold the episode open, or the
+    next real emergency would be deduplicated against this one and never page."""
+    _handle(box, "red")
+    box["queue"].chmod(0o555)
+    try:
+        _handle(box, "green", free=90_000)
+    finally:
+        box["queue"].chmod(0o755)
+    assert "could not queue the all-clear" in _log(box)
+    for q in box["queue"].glob("*.json"):  # delivered; an undelivered copy collapses
+        q.unlink()
+    _handle(box, "red")
+    assert len([p for p in _pages(box) if p["severity"] == "emergency"]) == 1, "the next episode pages again"
+
+
+@pytest.mark.parametrize("tier", ["red", "orange"])
+def test_the_clear_key_mirrors_its_page_key(box, tier):
+    """Delivery deduplicates on the key for a day. A clear keyed like its page
+    is suppressed exactly when its page was, so the owner never receives an
+    all-clear for a page they did not get (and an ORANGE clear never blocks a
+    later RED one)."""
+    _handle(box, tier)
+    page_key = next(p["dedupe_key"] for p in _pages(box) if p["dedupe_key"].endswith(f":{tier}"))
+    _handle(box, "green", free=90_000)
+    (clear,) = _clears(box)
+    assert clear["dedupe_key"] == page_key.replace(f":{tier}", f":clear-{tier}")
+
+
+@pytest.mark.parametrize("green_act", [0, 1])
+def test_an_observe_page_gets_an_observe_clear_in_either_mode(box, green_act):
+    """The clear follows the page that was sent, not the mode at GREEN."""
+    _handle(box, "red", act=0)
+    _handle(box, "green", free=90_000, act=green_act)
+    (clear,) = _clears(box)
+    assert clear["title"].startswith("[observe mode] Disk recovered:"), clear
+    assert clear["dedupe_key"].endswith(":clear-red:observe"), clear
+
+
+def test_an_act_page_gets_an_act_clear_after_a_switch_to_observe(box):
+    _handle(box, "red", act=1)
+    _handle(box, "green", free=90_000, act=0)
+    (clear,) = _clears(box)
+    assert clear["title"].startswith("Disk recovered:"), clear
+    assert clear["dedupe_key"].endswith(":clear-red"), clear
+
+
 def test_attribution_is_logged_once_per_episode(box):
     _handle(box, "yellow", writers="123 456 1000 5 cp")
     _handle(box, "yellow", writers="123 456 1000 5 cp")

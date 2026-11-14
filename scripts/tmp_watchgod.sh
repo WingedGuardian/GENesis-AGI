@@ -32,6 +32,9 @@
 #           there (that RED was measured before the emptying freed the space).
 # Reclaim levers only run for the filesystem they can actually relieve; the
 # others page with attribution.
+#   GREEN   after an episode that delivered an ORANGE or RED page, send one
+#           INFO all-clear naming how far it got (_wg_all_clear), then end
+#           the episode.
 #
 # RUNAWAY FILES, at every tier (scripts/lib/watchgod_runaway.sh): a file held
 # open for writing that alone is a large share of its filesystem, or that grew
@@ -377,6 +380,40 @@ _wg_page() {
     return 1
 }
 
+_wg_all_clear() {
+    # $1 path $2 domain key $3 free $4 total $5 fstype. Called on the first
+    # GREEN poll after an episode, before its markers are cleared. Sends one
+    # INFO message when the episode delivered a page (an orange/red marker is
+    # written only once its page was queued), so a page never stands alone:
+    # without it the owner cannot tell "recovered a minute later" from "still
+    # filling and muted". Either mode's marker counts, so an episode paged in
+    # observe mode and ended after a switch to act still gets its all-clear.
+    # A failed enqueue is logged and does NOT hold the episode open: an open
+    # episode would deduplicate the next emergency against this one.
+    # The key mirrors the page it answers (tier, and :observe for an observe
+    # page). Delivery deduplicates on that key for a day (outreach governance),
+    # so a clear keyed like its page is suppressed exactly when its page was:
+    # the owner never gets an all-clear for a page they did not receive. A fix
+    # to the page keys (#3276: a second same-tier episode in 24 h is dropped)
+    # must change this key the same way.
+    local path="$1" dev="$2" free="$3" total="$4" fstype="$5" worst="" sfx="" t title
+    for t in red orange; do
+        if episode_seen "$dev" "$t"; then worst="$t"; break; fi
+        if episode_seen "$dev" "${t}_observe"; then worst="$t"; sfx=":observe"; break; fi
+    done
+    [[ -n "$worst" ]] || return 0
+    title="Disk recovered: ${path} is GREEN"
+    [[ -z "$sfx" ]] || title="[observe mode] ${title}"
+    if queue_alert_try info "watchgod:disk" "$title" \
+            "${path}: ${free} MB free of ${total} MB (${fstype}). This episode reached ${worst^^}; the page sent then needs no action now." \
+            "watchgod:disk:${dev}:clear-${worst}${sfx}"; then
+        log INFO "all-clear: ${path} back to GREEN after ${worst} (${free} MB free)"
+    else
+        log WARN "could not queue the all-clear for ${path} (alert queue unwritable?); the episode ends anyway"
+    fi
+    return 0
+}
+
 # ── Reclaim (the one deleter lives in disk_hygiene.sh) ───────
 # What each lever ACTUALLY did on this poll, for the page text: a page states
 # the outcome, never the intent (review finding, #2521 item 4 — the WARNING
@@ -640,6 +677,7 @@ handle_fs() {
         if ls "$DG_STATE_DIR/episode_${dev}_"* >/dev/null 2>&1; then
             (( is_home )) && _wg_unstamp pressure_standard pressure_last-resort
             (( is_cc )) && _wg_unstamp cc_sweep_pressure
+            _wg_all_clear "$path" "$dev" "$free" "$total" "$fstype"
         fi
         episode_clear "$dev"
         (( is_home )) && reserve_ensure "$free" "$total"
