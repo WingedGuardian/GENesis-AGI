@@ -249,6 +249,11 @@ def view(db, h, provider, native, legs, residual, *, exclude=0):
     revision, accepted = (state["hazard_revision"], state["accepted_sequence"]) if state else (0, 0)
     native._integer(revision, "hazard revision")
     native._integer(accepted, "accepted sequence")
+    if state is not None and not accepted and any(state[name] is not None for name in (
+        "accepted_terminal_sha256", "accepted_control_sha256",
+        "accepted_source_identity", "accepted_evidence_reference",
+    )):
+        raise RuntimeError("partial provider safety acceptance")
     invalid_acceptance = bool(accepted) and not recovery._accepted_clean(db, state, native)
     if invalid_acceptance:
         accepted = 0

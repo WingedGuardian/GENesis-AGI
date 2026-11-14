@@ -2073,6 +2073,9 @@ the shared banner is not an assertion about all concurrent sessions.
   uncertainty. New selected launch acknowledgements and ordinary-owner routes
   refuse selected provenance. Selected consumption/execution remains separate;
   provider arguments and automatic readiness are unchanged.
+  Recovery evidence refuses partial zero-watermark acceptance receipts, matching
+  ordinary admission; invalid positive receipts remain explicit safety evidence.
+  The retained retry helper participates in existing server restart detection.
   The queue's `scripts/lib/index_marker_legacy.py` isolates malformed legacy
   artifacts in retained import receipts without replacing business failures;
   real filesystem/SQLite errors remain visible. Schema 3 atomically fans requests

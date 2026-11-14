@@ -28,6 +28,7 @@ _RUNTIME_RELOAD_SCRIPTS=(
     scripts/lib/index_marker_cli.py  # retained queue CLI dispatch through the facade loader
     scripts/lib/index_marker_legacy.py # retained by index_marker's registered sibling loader
     scripts/lib/index_marker_legs.py # retained provider-leg transactions on that connection
+    scripts/lib/index_marker_retry.py # retained supervised grant and settlement transactions
     scripts/lib/index_marker_recovery.py # retained provider safety and control-completion transactions
     scripts/lib/index_marker_execution.py # retained native journal transactions on that connection
     scripts/lib/code_intel_execution.py # retained report validator imported by the queue

@@ -1141,6 +1141,13 @@ Database/IO failures remain errors. Storage uses the existing provider-state
 row and transaction-only `scripts/lib/index_marker_retry.py`; the facade remains
 the sole opener.
 
+A zero acceptance watermark with any non-NULL receipt component is malformed;
+recovery admission refuses it just as ordinary admission does. Grant revocation
+does not repair that independent receipt. Invalid positive-watermark receipts
+remain explicit safety evidence for supervised recovery.
+Changes to retained retry code participate in the existing server restart and
+deployment-validation inventory.
+
 Selected execution, acceptance, strict cutover and native/production qualification
 remain separate gates. Metadata scratch tests exercise actual locks, SQL and
 captured commands with substituted manager/kernel observations and no provider
