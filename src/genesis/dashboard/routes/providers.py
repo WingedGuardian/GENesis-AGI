@@ -56,8 +56,11 @@ def provider_toggle(name: str):
         body = {}
     if not isinstance(body, dict):
         return jsonify({"status": "error", "message": "body must be a JSON object"}), 400
+    # An absent key is "no intent" (an older client); a key that is present
+    # must be a boolean, null included, or the request would fall through to
+    # the state-dependent toggle instead of being refused.
     enabled = body.get("enabled")
-    if enabled is not None and not isinstance(enabled, bool):
+    if "enabled" in body and not isinstance(enabled, bool):
         return jsonify({"status": "error", "message": "'enabled' must be a boolean"}), 400
 
     try:
