@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
+from email.message import EmailMessage
 from email.utils import getaddresses
 
 import aiosqlite
@@ -97,6 +98,29 @@ def _recipient_emails(recipient: str | None) -> list[str]:
     candidates.extend(_ADDRESS_SHAPE.findall(raw))
     candidates.append(raw)
     return list(dict.fromkeys(e for e in map(_normalize_email, candidates) if e))
+
+
+def _delivery_emails(recipient: str | None) -> list[str]:
+    """The normalized addresses a send to ``recipient`` actually reaches.
+
+    Read the way the email adapter sends: the string becomes an
+    ``EmailMessage`` To header and ``smtplib.send_message`` delivers to
+    ``getaddresses`` of that header. Narrower than ``_recipient_emails`` on
+    purpose: an address inside a display name (``"a@x" <b@y>``) is a hold
+    candidate but is never sent to, so it must not be stamped contacted.
+    Empty when the header cannot be built or parsed, since that send raises
+    too; the delivery paths stamp after a send, so this never raises."""
+    raw = recipient or ""
+    if not raw.strip():
+        return []
+    msg = EmailMessage()
+    try:
+        msg["To"] = raw
+        headers = [str(h) for h in msg.get_all("To") or []]
+        found = [addr for _name, addr in getaddresses(headers)]
+    except Exception:  # noqa: BLE001 - an unparseable header was never delivered
+        return []
+    return list(dict.fromkeys(e for e in map(_normalize_email, found) if e))
 
 
 async def find_in_recipient(db: aiosqlite.Connection, recipient: str | None) -> dict | None:
@@ -201,14 +225,14 @@ async def mark_contacted_in_recipient(
     prospect it names goes active → contacted. The delivery paths pass the
     recipient as sent, which can be ``Name <addr>`` or a list; an exact match on
     that string stamps nothing, so a delivered prospect would stay 'active' and be
-    pitched again. Addresses come from ``_recipient_emails``, the same reading
-    ``find_in_recipient`` uses for the hold.
+    pitched again. Addresses come from ``_delivery_emails``: only the ones the
+    send reaches, not every candidate ``find_in_recipient`` holds on.
 
     Same guarantees as ``mark_contacted_by_email``: one conditional UPDATE per
     ``_LOOKUP_CHUNK`` addresses (``status = 'active'``), so a row another writer
     moved on is never downgraded, and a non-prospect address is never touched.
     Returns the number of prospects stamped."""
-    emails = _recipient_emails(recipient)
+    emails = _delivery_emails(recipient)
     stamped = 0
     for start in range(0, len(emails), _LOOKUP_CHUNK):
         chunk = emails[start : start + _LOOKUP_CHUNK]

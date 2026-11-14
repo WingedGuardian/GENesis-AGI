@@ -199,12 +199,39 @@ async def test_mark_contacted_in_recipient_reads_every_recipient_form(db):
 
 
 @pytest.mark.asyncio
+async def test_mark_contacted_in_recipient_stamps_only_delivery_addresses(db):
+    """An address inside a display name is held on but never sent to, so it
+    is not stamped; the stamp follows what the send actually reaches."""
+    for pid, email in (("p1", "one@example.com"), ("p2", "two@example.com")):
+        await mp.create(db, id=pid, email=email, created_at=_TS, updated_at=_TS)
+    recipient = '"one@example.com" <two@example.com>'
+    assert (await mp.find_in_recipient(db, recipient)) is not None  # hold still sees both
+    assert await mp.mark_contacted_in_recipient(db, recipient, contacted_at=_TS) == 1
+    assert (await mp.get_by_id(db, "p1"))["status"] == "active"
+    assert (await mp.get_by_id(db, "p2"))["status"] == "contacted"
+
+
+def test_delivery_emails_follows_the_adapters_header_parse():
+    """Pinned to what an EmailMessage To header plus smtplib's getaddresses
+    deliver to: a header the adapter cannot build reaches nobody."""
+    assert mp._delivery_emails('"one@example.com" <two@example.com>') == ["two@example.com"]
+    assert mp._delivery_emails("a@example.com;b@example.com") == ["a@example.com"]
+    assert mp._delivery_emails("a@example.com\r\nBcc: b@example.com") == []
+    assert mp._delivery_emails("(" * 2000 + "a@example.com") is not None  # never raises
+
+
+@pytest.mark.asyncio
 async def test_mark_contacted_in_recipient_never_downgrades_or_touches_others(db):
     await mp.create(
         db, id="r", email="replied@example.com", status="replied", created_at=_TS, updated_at=_TS
     )
-    assert await mp.mark_contacted_in_recipient(db, "R <replied@example.com>", contacted_at=_TS) == 0
+    assert (
+        await mp.mark_contacted_in_recipient(db, "R <replied@example.com>", contacted_at=_TS) == 0
+    )
     assert (await mp.get_by_id(db, "r"))["status"] == "replied"
-    assert await mp.mark_contacted_in_recipient(db, "Nobody <nobody@example.com>", contacted_at=_TS) == 0
+    assert (
+        await mp.mark_contacted_in_recipient(db, "Nobody <nobody@example.com>", contacted_at=_TS)
+        == 0
+    )
     assert await mp.mark_contacted_in_recipient(db, "", contacted_at=_TS) == 0
     assert await mp.mark_contacted_in_recipient(db, None, contacted_at=_TS) == 0
