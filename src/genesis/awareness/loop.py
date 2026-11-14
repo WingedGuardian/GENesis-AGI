@@ -33,6 +33,7 @@ from genesis.awareness.signals import SignalCollector, collect_all
 from genesis.awareness.types import Depth, TickResult
 from genesis.cc.constants import RATE_LIMIT_DEFERRAL_TTL_S
 from genesis.db.crud import awareness_ticks, observations
+from genesis.infra_profile import cgroup_io as _cgroup_io
 from genesis.infra_profile.codebase_mcp import SLUG as _CODEBASE_MCP_SLUG
 from genesis.infra_profile.codebase_mcp import needs_setup as codebase_mcp_needs_setup
 from genesis.infra_profile.store import load_profile
@@ -722,11 +723,16 @@ _INFRA_POSTURE_DETAIL = {
         "the infrastructure profile, so after either fix take a refresh "
         "(`infrastructure_profile(refresh=true)`)"
     ),
+    _cgroup_io.SLUG: _cgroup_io.warning_detail(),
 }
 
 # Slugs that are a developer-tooling gap rather than a crash-resilience one, so
 # the alert's crash-resilience trailer does not claim otherwise for them.
 _INFRA_POSTURE_TOOLING_SLUGS = frozenset({_CODEBASE_MCP_SLUG})
+
+# Slugs for a resource setting that has no effect on this install: advisory,
+# and not a crash-resilience gap either.
+_INFRA_POSTURE_INERT_SLUGS = frozenset({_cgroup_io.SLUG})
 
 
 def _codebase_mcp_could_alert(section: dict) -> bool:
@@ -920,6 +926,11 @@ def _infra_missing_protections(profile: dict) -> list[str]:
             missing.append("cc_tmp_apply_blocked_on_cc")
         else:
             missing.append("cc_tmp_shared_fs")
+    # IOWeight-family settings Genesis puts on user units and scopes, with no io
+    # controller for the user manager to apply them: systemd accepts and
+    # ignores them silently. Explicit False only (None/absent = unread).
+    if _facts("storage").get("user_manager_io_delegated") is False and _cgroup_io.SETTERS:
+        missing.append(_cgroup_io.SLUG)
     # Graph engine. An unselected engine (no unit, so the shipped falkordb
     # default reads quietly from NetworkX; or an overlay pinning networkx) stays
     # silent when disabled or stopped — alerting there would fire on every
@@ -1004,7 +1015,10 @@ async def _check_infra_protection_posture(db) -> None:
     """Alert when a memory-, network-, or storage-plane protection is missing or the profile is stale.
 
     One 'high' infrastructure_alert (dashboard + morning report; the WS-2 M10
-    reconciler absorbs it into the durable open-set) describing the CURRENT
+    reconciler absorbs it into the durable open-set), or one 'low' informational
+    note when every finding is a setting with no effect here
+    (_INFRA_POSTURE_INERT_SLUGS; dashboard only, the morning report reads
+    critical/high/medium), describing the CURRENT
     posture. Invariant: at most one open row for this source — a posture
     change supersedes the previous row (same "exactly one active alert = the
     current state" pattern as deploy staleness). A stale profile (>3d; refresh
@@ -1022,6 +1036,7 @@ async def _check_infra_protection_posture(db) -> None:
         if age_days is None:
             return  # no usable collected_at stamp — cannot assert anything
         collected_at = profile.get("collected_at")
+        priority = "high"
 
         if age_days > _INFRA_PROFILE_STALE_DAYS:
             key = "profile_stale"
@@ -1036,22 +1051,39 @@ async def _check_infra_protection_posture(db) -> None:
         else:
             missing = _infra_missing_protections(profile)
             unverifiable = _infra_unverifiable_planes(profile)
+            # Informational notes are not posture: with only notes left they
+            # must not decide between hold and replace, or an unverifiable
+            # plane's open high alert would be superseded by a low note.
+            real = [slug for slug in missing if slug not in _INFRA_POSTURE_INERT_SLUGS]
+            if not real and unverifiable:
+                # A plane with retained-but-unverifiable facts: neither
+                # alarm nor all-clear — hold the current state until the
+                # section collector recovers.
+                return
             if not missing:
-                if unverifiable:
-                    # A plane with retained-but-unverifiable facts: neither
-                    # alarm nor all-clear — hold the current state until the
-                    # section collector recovers.
-                    return
                 await _resolve_infra_protection_posture(db)
                 return
             key = ",".join(missing)
             details = "; ".join(f"[{slug}] {_INFRA_POSTURE_DETAIL[slug]}" for slug in missing)
-            content = (
-                f"Infra protection posture: {len(missing)} protection(s) "
-                f"missing on this install (profile collected {collected_at}): "
-                f"{details}."
-            )
-            if any(slug not in _INFRA_POSTURE_TOOLING_SLUGS for slug in missing):
+            # Informational findings alone are a low note, never the high
+            # alert (the deploy-staleness informational-class pattern). Any
+            # other finding beside them keeps the row high.
+            if set(missing) <= _INFRA_POSTURE_INERT_SLUGS:
+                priority = "low"
+                content = (
+                    f"Infra posture note (informational, profile collected "
+                    f"{collected_at}): {details}."
+                )
+            else:
+                content = (
+                    f"Infra protection posture: {len(missing)} protection(s) "
+                    f"missing on this install (profile collected {collected_at}): "
+                    f"{details}."
+                )
+            if any(
+                slug not in _INFRA_POSTURE_TOOLING_SLUGS | _INFRA_POSTURE_INERT_SLUGS
+                for slug in missing
+            ):
                 content += (
                     " Each missing protection removes a crash-resilience "
                     "guarantee this box relies on (2026-07 incident class)."
@@ -1061,6 +1093,12 @@ async def _check_infra_protection_posture(db) -> None:
                 content += (
                     f" {', '.join(tooling)}: a developer-tooling gap, not a "
                     f"crash-resilience one."
+                )
+            inert = [slug for slug in missing if slug in _INFRA_POSTURE_INERT_SLUGS]
+            if inert and priority == "high":
+                content += (
+                    f" {', '.join(inert)}: informational, a setting with no effect "
+                    f"here, not a missing protection."
                 )
             if unverifiable:
                 content += (
@@ -1093,7 +1131,7 @@ async def _check_infra_protection_posture(db) -> None:
             source=_INFRA_POSTURE_SOURCE,
             type="infrastructure_alert",
             content=content,
-            priority="high",
+            priority=priority,
             created_at=datetime.now(UTC).isoformat(),
             content_hash=content_hash,
             skip_if_duplicate=True,
@@ -1101,7 +1139,8 @@ async def _check_infra_protection_posture(db) -> None:
         _last_infra_posture_alert_at = now
         _last_infra_posture_key = key
         if created is not None:
-            logger.warning("Infra protection posture alert: %s", key)
+            logger.warning("Infra protection posture %s (%s): %s",
+                           "note" if priority == "low" else "alert", priority, key)
     except Exception:
         logger.debug("Failed infra protection posture check", exc_info=True)
 

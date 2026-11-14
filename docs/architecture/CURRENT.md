@@ -683,8 +683,16 @@ preserve usable answers, real refusal health and dropped-output replay guards.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: b321bb634 2026-11-07
+verified: 37e124b54 2026-11-08
 ```
+
+Verification refresh is limited to advisory CLI identity below; other execution
+evidence retains its dated basis. Structured-result classification can retain
+`CCError.cc_session_id` without changing error/replay policy. Existing invoker
+spans expose reported identity/source and wrapper return state as optional
+attributes, separate from the Genesis `session_id` column; private execution
+omits the new attributes. Missing metadata is unknown, never acquisition or
+complete-attempt evidence. See `docs/reference/inbox-attempt-identity.md`.
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
   `cc/gmodel_settings.py`): Kimi K3 and MiMo V2.6 Pro select subscription, native
@@ -1619,6 +1627,12 @@ modules: [knowledge, inbox, research, recon, web, pipeline]
 verified: f62608045437 2026-11-09
 ```
 
+Verification refresh is limited to the inbox trace parent: the existing retry
+await has an advisory `inbox.evaluate` span linking observed child attempts by
+batch/row ID. Its returned state describes that await, not delivery, baseline
+completion or source acquisition. Existing execution decisions remain separate;
+other intake evidence retains its dated basis.
+
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
   (`has_unchanged_source`) makes re-ingest of changed sources re-distill;
   `remove_unit` tombstones a source when its last unit is deleted (invariant:
@@ -2006,12 +2020,19 @@ the shared banner is not an assertion about all concurrent sessions.
   without a password) `routes/health.redact_for_untrusted` drops each call
   site's `last_response` (the text its last model call returned; a site that
   had one carries `last_response_hidden: true`), the deploy checkout's file
-  names and probe error, and all of `live_repairs` but its counts. The Agent
-  Zero adapter's own copy of that route (`az_plugins/genesis/api_health.py`)
+  names and probe error, and all of `live_repairs` but its counts, then
+  reduces the rest to an allow-list (`_withhold_free_text`): numbers,
+  booleans and nulls stay, a string stays only under a key listed as a
+  status, name, id, commit or timestamp and only while it has that shape, and
+  every other string (error, reason, message, detail text) is replaced by
+  `<field>_hidden: true`, with `free_text_hidden: true` on the response. A
+  string field a producer adds later is therefore withheld until listed. The
+  Agent Zero adapter's own copy of that route (`az_plugins/genesis/api_health.py`)
   calls the same function. The in-process readers of the snapshot (the health
   MCP tools, ego context) are not affected. Both monitor pages show a note in
-  place of a withheld Last Response, which is every browser on an install with
-  no dashboard password.
+  place of a withheld Last Response and of a discarded item's reason or
+  error, plus a page-level note; the dashboard header shows the same note.
+  That is every browser on an install with no dashboard password.
 - **mcp/**: 5 Genesis MCP servers (health, memory, outreach, recon,
   discord-bot) + external codebase-memory; profile→server allowlist lives in
   `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool
@@ -2055,8 +2076,20 @@ the shared banner is not an assertion about all concurrent sessions.
   Matching terminal leader states alone do not prove controller process end.
   The same-connection final drain observes callback-created evidence before
   commit. The acknowledgement grants no retry or acceptance. The automatic
-  reconciliation caller remains separate (#3728), as do positive grants,
-  acceptance, cutover, native qualification and production capacity.
+  reconciliation caller remains separate (#3728); acceptance, cutover,
+  native qualification and production capacity remain separate gates.
+  Explicit request/revoke/status operations use the existing provider-state
+  grant and bind actual work, retained debt, evidence, provider and runner/
+  watchdog source, policy, boot and bounded dual-clock deadlines. Invalid grant
+  metadata is observable and exactly revocable without clearing independent
+  holds. Retained selected trials settle once; failed-origin work cannot become
+  automatic pending work, and missing/corrupt bindings preserve work and retain
+  uncertainty. New selected launch acknowledgements and ordinary-owner routes
+  refuse selected provenance. Selected consumption/execution remains separate;
+  provider arguments and automatic readiness are unchanged.
+  Recovery evidence refuses partial zero-watermark acceptance receipts, matching
+  ordinary admission; invalid positive receipts remain explicit safety evidence.
+  The retained retry helper participates in existing server restart detection.
   The queue's `scripts/lib/index_marker_legacy.py` isolates malformed legacy
   artifacts in retained import receipts without replacing business failures;
   real filesystem/SQLite errors remain visible. Schema 3 atomically fans requests
@@ -2165,7 +2198,9 @@ the shared banner is not an assertion about all concurrent sessions.
   observations preserve owned OOM kills, including the first sample, before
   duplicate/conflict reduction; clean control cannot erase resource evidence.
   Default initialization stays4; new native authority requires5, with no live
-  cutover, retry grant, acceptance setter or positive automatic readiness here.
+  cutover, acceptance setter or positive automatic readiness here. Explicit
+  transaction-only retry grants in `index_marker_retry.py` require schema5 and
+  captured supervision; they do not implicitly migrate or enable automatic work.
   Legacy uncertainty preserves original settlement/shared debt and uses
   non-claim observations for ambiguous pending/reused identities. Common scalar
   reduction covers reconciliation and embedded outcomes; import batches dedupe
@@ -2889,6 +2924,19 @@ verified: c712f1bde 2026-11-06
   (bootstrap, #1082) → reconcile (guardian, #1083) → alert (this). The
   provision-or-surface convention: a resilience feature that skips on a
   missing prereq must either provision it or register a fact this check reads.
+  The storage section's `user_manager_io_delegated` (io in the user manager's
+  `cgroup.controllers`) feeds `cgroup_io_settings_inert`: an advisory that
+  names every place Genesis sets an `IOWeight`-family key on a user unit or
+  scope (`infra_profile/cgroup_io.py` `SETTERS`, locked against the tree by a
+  test) and says those keys have no effect there. It is informational: alone
+  it is a `low` note (dashboard only; the morning report reads
+  critical/high/medium), never the `high` alert (the deploy-staleness
+  informational-class pattern), and it carries no crash-resilience claim. A
+  note never decides the unverifiable-plane hold: with only notes computable
+  and a plane unverifiable, the open row is kept. Blind spot: it is silent
+  once io is delegated, though weights then still need BFQ or iocost; and
+  while a plane stays unverifiable with no row open, the note is not written
+  either (the same hold that applies to real gaps).
 
 - **Git-health alerts self-heal, slot-scoped (2026-07-16)**: the per-tick cheap
   probe auto-resolves open `git_cheap` observations on pass; the daily deep
@@ -3841,6 +3889,15 @@ verified: 5be8573a5 2026-11-07
   and recovery state. Incremental publication follows durable append; uncertain
   publication stops derived-state reading until reconstruction. Historical
   reading never creates or truncates files; version-1 evidence cannot execute.
+  Read-only `study-check`/`study-report` validate a frozen continuation plan and
+  select the first eligible historical answer for each logical coordinate,
+  regardless of its grade. Original journals supply physical counts and costs;
+  unresolved reservations and separately bound raw receipt annotations remain
+  visible. Full current admission, exact request/source identity and finite
+  remaining allocations are checked without credentials or provider requests.
+  This tranche cannot acquire or resume requests and reports an inherited prefix
+  without claiming verified study closure. See
+  `docs/reference/qualification-lineage.md`.
   The isolated qualification CLI supplies explicit execution and reporting
   callers; it does not schedule automatic execution. Production credentials and
   accounting stores are outside this boundary. See
@@ -4427,6 +4484,13 @@ around the entire message boundary. It preserves memory counters and the
 construction-time persistence hard opt-out, without suppressing queued ordinary
 flushes or validator-memory records. This does not strengthen batch durability
 or make the service read-only.
+
+Limited refresh: the shared span capture/writer/reader slice only. Other platform
+claims retain their earlier verification scope. `start_span` now supports
+`include_exception_text=False` for categorical failures without formatting the
+exception; existing callers keep the default formatter. Inbox attempt metadata
+uses the existing optional span persistence/API, not a new store or gate; see
+`docs/reference/inbox-attempt-identity.md`.
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
 provider/model/outcome. Failed historical attempts render as a warning, not an
@@ -5819,6 +5883,25 @@ verified: 81bbdb0a9 2026-11-08
   substitution boundaries the legacy scans may misread are refused, never
   accepted (#3713 PR 1; same reference doc).
   Existing continuation, heredoc proof, size bounds and nested refusals remain.
+  A word that chooses the program and is written in bash locale quoting
+  (`$"…"`) is reported, not decoded: `_BLIND_LOCALE_PROGRAM`, with the
+  untranslated reading on `Segment.locale_program` as a candidate that is never
+  `exe`. The push guard refuses when that candidate is `git` or `gh`, and
+  `unresolved_verb_programs` carries it to the commit and discard guards. A
+  shell (`_NESTED`) handed its script, or the `-c` that selects it, in that
+  quoting is reported as `_BLIND_LOCALE_SCRIPT`, with the untranslated script on
+  `Segment.locale_script` (a candidate, never parsed); `locale_candidates`
+  mention-scans it for git and gh, and the push, commit and discard guards
+  refuse on that. A body the parse rebuilds from tokens (`case` arm, function
+  body, `coproc`) is read the same way one level down (`_plain_reading`).
+  `destructive_command_guard` and `protected_paths_guard` refuse on either cause
+  when the command names a removal, as on any blind spot. Not reported: the
+  same quoting in any other option or operand, or in the payload of a launcher
+  outside `_NESTED` (here-string or pipe into a shell, `busybox`, `find -exec`,
+  `parallel`, `taskset`, `ssh`, `trap`, `at`, `$SHELL -c`, positional-argument
+  or substitution-built scripts, variable-named programs). Guards that do not
+  read the blind spot (`full_suite_guard`, `worktree_cwd_guard`,
+  `pr_open_review_gate`, `issue_premise_gate`) are unchanged by it.
   Codex's local CLI also has a budget-only shell action hook in
   `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the
   existing commit/request budget decisions, denies approval-required or unknown
@@ -6095,7 +6178,8 @@ shipped mode is `off`.
     (`github.user`/`github.public_repo`, the repo promotions post to — never
     the checkout's own remote) via `ProjectV2.repositories`, and links it with
     `linkProjectV2ToRepository` when not (shown in the dry run first);
-  - Status columns Proposed / Ready / In Progress / In Review / Done; an
+  - Status columns Proposed / Ready / Build / In Progress / In Review / Done
+    (Build: a card there approves one builder run, read by nothing yet); an
     option outside them is ALWAYS kept, never deleted (deleting one clears it
     from every card holding it, and no read before the write can prove none
     does at the write);

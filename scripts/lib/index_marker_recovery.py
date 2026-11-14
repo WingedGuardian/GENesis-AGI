@@ -404,11 +404,21 @@ def _accepted_clean(db, state, native):
         return False
 
 
+def provider_snapshot(db, h, provider):
+    """Read safety/acceptance without decoding unrelated grant storage."""
+    return db.execute(
+        "SELECT hash,repo_path,provider,hazard_revision,accepted_sequence,"
+        "accepted_terminal_sha256,accepted_control_sha256,accepted_source_identity,"
+        "accepted_evidence_reference FROM provider_state WHERE hash=? AND provider=?",
+        (h, provider),
+    ).fetchone()
+
+
 def provider_blocked(db, h, provider, native):
     """Read safety coverage; this never grants a retry or advances acceptance."""
     if provider not in ("cbm", "gitnexus"):
         raise ValueError("invalid provider safety selection")
-    state = db.execute("SELECT * FROM provider_state WHERE hash=? AND provider=?", (h, provider)).fetchone()
+    state = provider_snapshot(db, h, provider)
     accepted = 0
     if state is not None:
         accepted = state["accepted_sequence"]

@@ -29,10 +29,12 @@ const { execFile } = require("child_process");
 (async () => {
   const mod = await import("data:text/javascript," + encodeURIComponent(fs.readFileSync(spec.module, "utf8")));
   const logs = [];
-  let loaderRuns = 0, failLoads = 0, truncate = 0, afterLoader = null, now = Date.now(), tick = 0;
+  let loaderRuns = 0, failLoads = 0, truncate = 0, garble = 0, failWrites = 0, afterLoader = null, now = Date.now(), tick = 0;
   Date.now = () => now;
   const $ = {
     plugin: { root: spec.plugin },
+    env: { get: async name => (spec.env ?? { HOME: spec.dir })[name] },
+    session: { id: async () => "0f0f0f0f-1111-2222-3333-444444444444" },
     ui: { log: m => logs.push(m) },
     fs: {
       stat: async (p, options) => {
@@ -41,7 +43,10 @@ const { execFile } = require("child_process");
         return options?.resolve ? { ...stat, realPath: fs.realpathSync(p) } : stat;
       },
       read: async p => fs.readFileSync(p, "utf8"),
-      write: async (p, text) => fs.writeFileSync(p, text),
+      write: async (p, text) => {
+        if (failWrites > 0 && p.includes("/state/secret-redact/")) { failWrites -= 1; throw new Error("ENOSPC"); }
+        fs.mkdirSync(require("path").dirname(p), { recursive: true }); fs.writeFileSync(p, text);
+      },
     },
     process: { run: argv => new Promise(resolve => {
       loaderRuns += 1;
@@ -50,6 +55,7 @@ const { execFile } = require("child_process");
       execFile(argv[0], argv.slice(1), { env: { ...process.env, SECRETS_PATH: spec.override ? spec.secrets : "", GENESIS_REPO_ROOT: "", HOME: spec.dir }, encoding: "utf8" },
         (err, stdout, stderr) => {
           const cut = truncate > 0 && (truncate -= 1, true);
+          if (garble > 0) { garble -= 1; stdout = "not json " + spec.vars.key; }
           const hook = afterLoader; afterLoader = null;
           if (hook) hook();
           resolve({ exitCode: err ? (err.code ?? 1) : 0, stdout, stderr, isStdoutTruncated: cut });
@@ -69,6 +75,8 @@ const { execFile } = require("child_process");
     failNext: n => { failLoads = n; },
     afterNextLoader: fn => { afterLoader = fn; },
     truncateNext: n => { truncate = n; },
+    garbleNext: n => { garble = n; },
+    failWritesNext: n => { failWrites = n; },
     link: (target, p) => { fs.mkdirSync(require("path").dirname(p), { recursive: true }); fs.symlinkSync(target, p); },
     runs: () => loaderRuns,
   };
@@ -84,6 +92,7 @@ def _run(
     secrets: str | None = f"CANARY_API_KEY={KEY}\n",
     plugin: Path = PLUGIN,
     override: bool = True,
+    env: dict | None = None,
     **vars_,
 ) -> dict:
     node = shutil.which("node")
@@ -100,6 +109,7 @@ def _run(
         "dir": str(tmp_path),
         "vars": {"key": KEY, "key2": KEY2, **vars_},
         "script": script,
+        "env": env,
     }
     proc = subprocess.run(
         [node, "-e", _DRIVER, json.dumps(spec)], capture_output=True, text=True, timeout=120
@@ -649,3 +659,123 @@ def test_a_secrets_file_the_resolver_would_now_prefer_is_loaded_on_the_next_even
         override=False,
     )
     assert res["out"] == {"before": {"result": P}, "after": {"result": P}, "idle": True}
+
+
+def test_each_load_attempt_leaves_a_state_file_with_names_and_counts_only(tmp_path):
+    state = (
+        tmp_path
+        / ".genesis"
+        / "state"
+        / "secret-redact"
+        / "0f0f0f0f-1111-2222-3333-444444444444.json"
+    )
+    res = _run(
+        tmp_path,
+        """
+        const read = () => JSON.parse(t.read(t.dir + "/.genesis/state/secret-redact/0f0f0f0f-1111-2222-3333-444444444444.json"));
+        t.failNext(1);
+        await t.emit("session.start", {});
+        const failed = read();
+        t.advance(31000);
+        await t.emit("tool.call", { tool: "Bash" }, async () => ({ result: "x" }));
+        return { failed, good: read() };
+        """,
+    )
+    failed, good = res["out"]["failed"], res["out"]["good"]
+    assert (failed["ok"], failed["failure"], failed["redacting"]) == (
+        False,
+        "known_values exited 1",
+        False,
+    )
+    assert (good["ok"], good["redacting"], good["variables"], good["overwritten"]) == (
+        True,
+        True,
+        1,
+        [],
+    )
+    assert KEY not in state.read_text()
+
+
+def test_a_failure_whose_message_would_quote_a_value_is_recorded_by_its_kind_only(tmp_path):
+    state = (
+        tmp_path
+        / ".genesis"
+        / "state"
+        / "secret-redact"
+        / "0f0f0f0f-1111-2222-3333-444444444444.json"
+    )
+    _run(
+        tmp_path,
+        """
+        t.garbleNext(2);
+        await t.emit("session.start", {});
+        """,
+    )
+    text = state.read_text()
+    assert KEY not in text and '"failure":"SyntaxError"' in text
+
+
+def test_a_report_that_failed_to_write_is_retried_on_the_next_event(tmp_path):
+    state = (
+        tmp_path
+        / ".genesis"
+        / "state"
+        / "secret-redact"
+        / "0f0f0f0f-1111-2222-3333-444444444444.json"
+    )
+    res = _run(
+        tmp_path,
+        """
+        t.failWritesNext(1);
+        await t.emit("session.start", {});
+        let missing = false;
+        try { t.read(t.dir + "/.genesis/state/secret-redact/0f0f0f0f-1111-2222-3333-444444444444.json"); } catch { missing = true; }
+        await t.emit("prompt.submit", { text: "hello" });  // the secrets file has not changed
+        return { missing };
+        """,
+    )
+    assert res["out"] == {"missing": True}
+    assert '"ok":true' in state.read_text()
+
+
+def test_a_report_of_overwritten_keys_is_refreshed_hourly(tmp_path):
+    state = (
+        tmp_path
+        / ".genesis"
+        / "state"
+        / "secret-redact"
+        / "0f0f0f0f-1111-2222-3333-444444444444.json"
+    )
+    res = _run(
+        tmp_path,
+        """
+        await t.emit("session.start", {});
+        const first = t.read(t.dir + "/.genesis/state/secret-redact/0f0f0f0f-1111-2222-3333-444444444444.json");
+        t.advance(2 * 3600 * 1000);
+        await t.emit("prompt.submit", { text: "hello" });
+        const later = t.read(t.dir + "/.genesis/state/secret-redact/0f0f0f0f-1111-2222-3333-444444444444.json");
+        // The report's time comes from the clock its write decision reads, so it moved by the two hours exactly.
+        return { refreshed: first !== later, moved: Date.parse(JSON.parse(later).at) - Date.parse(JSON.parse(first).at) };
+        """,
+        secrets=f"CANARY_API_KEY={KEY}\nOTHER_TOKEN=[secrets.env:GONE_TOKEN]\n",
+    )
+    assert res["out"] == {"refreshed": True, "moved": 2 * 3600 * 1000}
+    assert '"overwritten":["OTHER_TOKEN"]' in state.read_text()
+
+
+def test_no_report_is_written_when_no_home_folder_is_known(tmp_path):
+    # Neither GENESIS_HOME nor HOME: the mod must not write under a relative "undefined/.genesis" path.
+    res = _run(
+        tmp_path,
+        """
+        const writes = [];
+        const write = t.$.fs.write;
+        t.$.fs.write = async (p, text) => { writes.push(p); return write(p, text); };
+        await t.emit("session.start", {});
+        await t.emit("prompt.submit", { text: "hello" });
+        return { reports: writes.filter(p => p.includes("state/secret-redact")) };
+        """,
+        env={},
+    )
+    assert res["out"] == {"reports": []}
+    assert sum("neither GENESIS_HOME nor HOME" in m for m in res["logs"]) == 1
