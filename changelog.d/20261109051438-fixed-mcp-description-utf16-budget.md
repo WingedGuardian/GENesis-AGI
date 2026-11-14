@@ -1,0 +1,1 @@
+- The MCP description-budget guard now measures NFKC-normalized UTF-16 code units, matching Claude Code's JavaScript length predicate so non-BMP text cannot pass locally and then be truncated by the client.

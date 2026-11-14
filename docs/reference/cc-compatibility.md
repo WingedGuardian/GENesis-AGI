@@ -1109,10 +1109,11 @@ Mitigated, not eliminated.
 
 ---
 
-### MCP tool descriptions are TRUNCATED at 2,048 characters (measured 2.1.280, 2026-09-22)
+### MCP tool descriptions are TRUNCATED at 2,048 UTF-16 code units (measured 2.1.280, 2026-09-22)
 
 Claude Code cuts every MCP tool description (and server-instruction string) at
-**2,048 characters** before the model sees it. The cut is logged — CC writes
+**2,048 UTF-16 code units** before the model sees it. Its JavaScript length
+predicate counts a non-BMP character as two units. The cut is logged — CC writes
 `Tool "X" description truncated from N to 2048 chars` to its per-server
 `mcp-logs-*` files under `~/.cache/claude-cli-nodejs/` — and the text is marked
 `… [truncated]`, but everything past the cut is absent from the model's contract
@@ -1164,12 +1165,16 @@ cost roughly +1,200 tokens per session. Genesis's OWN tools stay under 2,048
 regardless (`tests/test_mcp/test_tool_description_budget.py`), because a description
 that relies on the lever is still cut on an older CC or wherever the setting is absent.
 
-**Measure it the way CC does:** CC's logged lengths match the NFKC-normalized
-description, not the raw one — the pre-change `follow_up_create` logged 4,735
+**Measure it the way CC does:** use JavaScript `String.length` semantics over the
+NFKC-normalized description. CC's logged lengths show that the normalization is
+also load-bearing: the pre-change `follow_up_create` logged 4,735
 where `inspect.getdoc` gives 4,733, because its one `…` normalizes to `...` (+2);
-`memory_recall` matched at 3,525 either way (2 of 2 tools). The test counts NFKC
-length for that reason. Closest to the cap after this change: `follow_up_create`
-2,031 and `direct_session_run` 2,006.
+`memory_recall` matched at 3,525 either way (2 of 2 tools). NFKC alone is not
+enough: Python `len` counts a non-BMP character once while JavaScript counts its
+surrogate pair twice. The test therefore counts NFKC-normalized UTF-16 code units.
+The corrected guard currently checks 159 tools; the largest description is
+`web_fetch` at 2,037 units, followed by `follow_up_create` at 2,031 and
+`memory_recall` at 2,024.
 
 ### Hook stdout is silently FILED above 10,000 characters (measured 2.1.246, 2026-08-30)
 
