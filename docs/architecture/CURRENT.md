@@ -5290,8 +5290,9 @@ logger or unrelated exceptions with copied text and no provenance.
   `live-repair` is moved aside, never followed; a set-aside kit or `current` is kept a week from the
   move); `status` reports ok,
   missing, foreign, corrupt, partial or stale. bootstrap, `deploy_code_only.sh`
-  (past its update-state refusal) and the update's rollback (when the code restore
-  succeeded) install it, never fatally: the installed kit is HEAD's at the last
+  (past its update-state refusal), the update's rollback (when the code restore
+  succeeded) and, on `live`, `update.sh` right before its rebuild (the
+  `live-kit-install` block, #3492 D2c) install it, never fatally: the installed kit is HEAD's at the last
   successful install, so it can be newer than the code that wrote the update state
   (an update killed after its bootstrap; a rollback to a tag from before the
   installer, whose install fails and keeps the newer kit), and it must read the
@@ -5328,6 +5329,15 @@ logger or unrelated exceptions with copied text and no provenance.
   changed refuses at once with no new backup, unless another kit is installed
   (its `kit_id` is part of the match). Every run, by command too, holds the kit's
   `KIT.json` shared until it exits, so a reinstall's prune never removes a kit in use.
+  The deploy engine guards both halves (#3492 D2c): admission refuses a candidate
+  that changes a kit source or either unit template, and readiness
+  (`boot_repair_failures` in `deploy_candidates_gate.py`) refuses `live` while the
+  kit's status is missing, partial, corrupt or foreign, or cannot be judged (a stale kit is a NOTE: the
+  pre-rebuild install heals it), while the LOADED genesis-server unit
+  (`systemctl --user show`, with the user-bus variables defaulted as the watchdog
+  does) has no refusing `ExecStartPre` naming the kit with `--boot` (each entry judged
+  whole: systemd prints a `\n` inside one as a new line), or while its
+  `TimeoutStartUSec` is under 90 s; a systemctl that cannot answer refuses too.
   `--explain` needs no kit: with none
   installed it runs the module as HEAD committed it, from memory, never the
   working tree's copy, which may itself be half-written) heals a live row's `mixed_tree`

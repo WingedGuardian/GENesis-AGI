@@ -16,8 +16,10 @@ Flat sibling of deploy_candidates.py (see that file for the commands).
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -31,6 +33,7 @@ from deploy_candidates_core import (  # noqa: E402
     Refusal,
     Repo,
     Unknown,
+    out,
 )
 
 # ── Readiness ─────────────────────────────────────────────────────────────
@@ -150,12 +153,61 @@ REFUSAL_FILES = (
     # The repair kit's installer, which deploy_code_only.sh runs by path before
     # it restarts (#3492 D2a-1).
     "scripts/lib/live_repair_kit.py",
+    # The boot repair kit (KIT_SOURCES in live_move_repair.py) the server unit runs
+    # before every start, and the units that run it: a candidate editing one could
+    # switch the repair off, or drop its line, and bootstrap on `live` renders it.
+    "scripts/lib/live_move_repair.py",
+    "scripts/lib/live_move_boot.py",
+    "scripts/lib/live_move_restore.py",
+    "scripts/lib/live_move_restore_rows.py",
+    "scripts/lib/live_move_restore_runs.py",
+    "scripts/lib/live_move_restore_write.py",
+    "scripts/systemd/genesis-server.service.template",
+    "scripts/systemd/genesis-bridge.service.template",
     # PR C's file: readiness reads it from the server's base, and it will hold
     # bootstrap's crash-recovery branch guard.
     PR_C_MARKER,
 )
+# The boot repair readiness checks (#3492 D2c): the kit's installer, loaded by
+# path from this directory, and the unit whose LOADED line runs the kit. The
+# start timeout bounds the boot step, whose deadline is 75 s + 3 s alert + slack.
+KIT_INSTALLER = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "lib", "live_repair_kit.py"
+)
+SERVER_UNIT = "genesis-server.service"
+UNIT_PROPS = ("-p", "ExecStartPre", "-p", "TimeoutStartUSec")
+# One `ExecStartPre={ ... }` entry per pre-step, which systemd prints across several
+# lines when its command holds a `\n` (MEASURED: the SQLITE_TMPDIR step does). The
+# kit's entry runs it with --boot and is not `-`-prefixed, or its hold-down exit
+# (75) would be ignored and the start go on. Each entry is judged whole.
+WIRED_KIT = "/.genesis/lib/live-repair/current"
+WIRED_ENTRY = re.compile(r"(?m)^(?=ExecStartPre=\{|TimeoutStartUSec=)")
+BOOT_TIMEOUT_MIN_S = 90
+_TIMESPAN_UNITS = {
+    "us": 1e-6,
+    "ms": 1e-3,
+    "s": 1,
+    "min": 60,
+    "h": 3600,
+    "d": 86400,
+    "w": 604800,
+    "month": 2629800,
+    "y": 31557600,  # systemd.time(7): a month is 30.44 d
+}
 # The engine itself: deploy_candidates, deploy_candidates.py and its siblings.
 ENGINE_PREFIX = "scripts/deploy_candidates"
+
+
+def wired(shown: str) -> bool:
+    """Does ``systemctl show -p ExecStartPre`` output hold the kit's refusing
+    boot step: one entry naming the kit, `--boot` and `ignore_errors=no`?"""
+    return any(
+        entry.startswith("ExecStartPre={")
+        and WIRED_KIT in entry
+        and " --boot " in entry
+        and re.search(r";\s*ignore_errors=no\s*;", entry) is not None
+        for entry in WIRED_ENTRY.split(shown)
+    )
 
 
 # ── readiness ─────────────────────────────────────────────────────────────
@@ -254,7 +306,84 @@ def readiness_failures(repo: Repo, base: str) -> list[str]:
                     f"PR C (the wipers rebuild `live`) is not in {judged} {mb[:12]}: "
                     f"{PR_C_MARKER} does not exist there (it has not merged, or is not deployed)"
                 )
-    return fails + hook_install_failures(repo)
+    return fails + hook_install_failures(repo) + boot_repair_failures(repo)
+
+
+def kit_status(repo: Repo) -> dict:
+    """live_repair_kit.status for this checkout and HOME, loaded by path from this
+    directory (the engine imports nothing by name from the tree it judges)."""
+    spec = importlib.util.spec_from_file_location("_genesis_live_repair_kit", KIT_INSTALLER)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"{KIT_INSTALLER} cannot be loaded")
+    kit = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(kit)
+    return kit.status(str(repo.root), str(repo.home))
+
+
+def unit_show(repo: Repo) -> subprocess.CompletedProcess:
+    """The LOADED server unit's boot-step properties, asked the way the watchdog
+    asks (util/systemd.py): with no user-bus variables systemctl --user fails
+    ("No medium found", MEASURED), and the engine cannot import genesis."""
+    env = dict(repo.env)
+    run = f"/run/user/{os.getuid()}"
+    env["XDG_RUNTIME_DIR"] = env.get("XDG_RUNTIME_DIR") or run
+    env["DBUS_SESSION_BUS_ADDRESS"] = env.get("DBUS_SESSION_BUS_ADDRESS") or f"unix:path={run}/bus"
+    cmd = ["systemctl", "--user", "show", SERVER_UNIT, *UNIT_PROPS]
+    # A local property read answers in milliseconds; 10 s bounds a hung user
+    # manager, and the caller reads the timeout as "cannot confirm" (a refusal).
+    return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=10)
+
+
+def timespan_s(text: str) -> float | None:
+    """Seconds in a systemd timespan ("1min 30s", "infinity"), or None."""
+    if text == "infinity":
+        return float("inf")
+    units = "|".join(sorted(_TIMESPAN_UNITS, key=len, reverse=True))  # "month" before "ms"
+    parts = [re.fullmatch(rf"(\d+(?:\.\d+)?)({units})", t) for t in text.split()]
+    if not parts or None in parts:
+        return None
+    return sum(float(m.group(1)) * _TIMESPAN_UNITS[m.group(2)] for m in parts)
+
+
+def boot_repair_failures(repo: Repo) -> list[str]:
+    """Why the boot repair (#3492 D2) would not guard the next start: the kit
+    the server unit runs, and the unit's LOADED line and start timeout. A stale
+    kit is only a NOTE: update.sh installs HEAD's right before its rebuild, and a
+    refusal here would stop the run that heals it."""
+    fails: list[str] = []
+    install = f'python3 -I -S scripts/lib/live_repair_kit.py install {repo.root} "$HOME"'
+    try:
+        kit = kit_status(repo)
+    except Exception as exc:  # noqa: BLE001 - a kit that cannot be judged refuses
+        kit = {"state": "unreadable", "why": str(exc)}
+    why = f" ({kit.get('why') or ', '.join(kit.get('differs') or [])})"
+    if kit.get("state") == "stale":
+        out(f"  NOTE: the boot repair kit is not HEAD's{why}; update.sh installs HEAD's.")
+    elif kit.get("state") != "ok":
+        fails.append(f"the boot repair kit is {kit.get('state')}{why}; reinstall it: {install}")
+    try:
+        p = unit_show(repo)
+        text = p.stdout if p.returncode == 0 else f"exit {p.returncode}: {p.stderr.strip()}"
+    except (OSError, subprocess.SubprocessError) as exc:
+        p, text = None, str(exc)
+    if p is None or p.returncode != 0:
+        return fails + [f"cannot confirm {SERVER_UNIT} runs the boot repair ({text})"]
+    if not wired(text):
+        fails.append(
+            f"{SERVER_UNIT} does not run the boot repair (no refusing ExecStartPre with the kit "
+            f"and --boot is loaded): scripts/update.sh (or bootstrap.sh) on main renders the "
+            f"unit and installs the kit ({install}); a unit it keeps as hand-edited needs "
+            "update.sh --take-template genesis-server.service"
+        )
+    m = re.search(r"^TimeoutStartUSec=(.*)$", text, re.MULTILINE)
+    have = m.group(1).strip() if m else "unreadable"
+    if (timespan_s(have) or 0) < BOOT_TIMEOUT_MIN_S:
+        fails.append(
+            f"{SERVER_UNIT}'s TimeoutStartUSec is {have}, under the boot repair's "
+            f"{BOOT_TIMEOUT_MIN_S} s: remove the drop-in that lowers it (systemctl --user cat "
+            f"{SERVER_UNIT}), then systemctl --user daemon-reload"
+        )
+    return fails
 
 
 def hook_install_failures(repo: Repo) -> list[str]:
