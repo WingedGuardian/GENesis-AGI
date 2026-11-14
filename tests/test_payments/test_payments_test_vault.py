@@ -611,6 +611,34 @@ async def _audit_sink(_event, _detail):
 CARD_LINE = f"{H.TEST_LABEL} ending 4242"
 
 
+def _without_card_refs(text: str) -> str:
+    """``text`` with each well-formed card ref replaced by a placeholder.
+
+    A card ref is ``card_`` plus 12 random hex characters, and in about 1 vault in
+    280 all 12 are digits: a 12-digit run that ``holds_long_digit_run`` flags. The
+    audit rows carry the ref on purpose (approval passes a well-formed one through),
+    so the value-free sweep removes only refs and still fails on any other run.
+    """
+    return vs.CARD_REF.sub("card_REF", text)
+
+
+def _digit_run_window(text: str, around: int = 20) -> str:
+    """The text around the first prefix that ``holds_long_digit_run`` flags."""
+    for end in range(len(text) + 1):
+        if ap.holds_long_digit_run(text[:end]):
+            return f"digit run near: {text[max(0, end - 40 - around) : end + around]!r}"
+    return "no digit run"
+
+
+def test_the_value_free_sweep_ignores_a_digit_ref_but_not_another_run():
+    shown = '{"card_ref": "card_' + "".join(str((i * 3 + 1) % 10) for i in range(12)) + '"}'
+    assert ap.holds_long_digit_run(shown)  # the raw sweep flags an all-digit ref
+    assert not ap.holds_long_digit_run(_without_card_refs(shown))
+    leaked = _without_card_refs(shown + ' "4111-1111-1111"')
+    assert ap.holds_long_digit_run(leaked)
+    assert "4111-1111-1111" in _digit_run_window(leaked)  # the message names the run
+
+
 async def test_the_registry_puts_the_test_line_first():
     reg = H.TestApprovalRegistry(timeout_cap_s=0.05)
     reg.attach_audit(_audit_sink)
@@ -901,7 +929,8 @@ async def test_end_to_end_request_tap_claim_is_value_free(built):
     key = (layout.vault / vs.IDENTITY).read_text().strip()  # the vault's secret key
     shown = json.dumps(rows) + console.text
     assert H.TEST_NUMBER not in shown and key not in shown
-    assert not ap.holds_long_digit_run(shown)
+    swept = _without_card_refs(shown)
+    assert not ap.holds_long_digit_run(swept), _digit_run_window(swept)
     assert H.TEST_NUMBER.encode() not in child_bytes and key.encode() not in child_bytes
     for path in layout.root.rglob("*"):
         if path.is_file() and not path.is_symlink():
