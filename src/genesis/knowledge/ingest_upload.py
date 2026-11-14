@@ -159,12 +159,14 @@ async def _store_as_is(
     try:
         scan = _SANITIZER.sanitize(file_content, ContentSource.UNKNOWN)
         if scan.detected_patterns:
+            # No file name in these logs: it can carry the credential itself.
             logger.warning(
-                "Injection patterns in store-as-is upload %s: %s (risk=%.3f)",
-                filename, scan.detected_patterns, scan.risk_score,
+                "Injection patterns in store-as-is upload: %s (risk=%.3f)",
+                scan.detected_patterns, scan.risk_score,
             )
-    except Exception:
-        logger.warning("Injection scan failed for upload %s (fail-open)", filename, exc_info=True)
+    except Exception as exc:
+        # No exc_info: a traceback's message can repeat the file name or path.
+        logger.warning("Injection scan failed for a store-as-is upload (fail-open): %s", type(exc).__name__)
 
     # Use context or filename as concept
     concept = context[:200] if context else filename
@@ -263,7 +265,7 @@ async def _store_as_is(
         _commit=True,
     )
 
-    logger.info("Stored %s as single unit %s (store-as-is mode)", filename, unit_id)
+    logger.info("Stored an upload as single unit %s (store-as-is mode)", unit_id)
     return [unit_id]
 
 

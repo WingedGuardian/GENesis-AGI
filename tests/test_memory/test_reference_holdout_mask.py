@@ -16,6 +16,7 @@ Fake credentials, example.org hosts and TEST-NET addresses only.
 from __future__ import annotations
 
 import json
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1258,7 +1259,7 @@ async def test_probes_from_a_large_resolved_entry_are_built_off_the_loop(db, mon
 
     monkeypatch.setattr(asyncio, "to_thread", to_thread)
     await _ingest(db, store, _body(name, value=_OTHER), concept=name)
-    assert {"_resolve", "value_masks"} <= set(offloaded)
+    assert {"_resolve", "_prepare_masks"} <= set(offloaded)
     await _not_indexed(db, store, _CUR)
 
 
@@ -1276,3 +1277,338 @@ async def test_a_rotation_found_by_its_base_masks_the_old_value_in_its_tags(db):
     )
     assert unit == first
     await _not_indexed(db, store, old, new)
+
+
+# ─── Codex round 2 (#4416): minted keys, card numbers, bounded scans, logs ───
+
+_CARD = "4242 4242 4242 4242"  # the public test card
+
+
+async def _all_surfaces(db, store) -> list[str]:
+    """Every indexed surface plus the held meta (which must hold no card)."""
+    texts = await _indexed_texts(db, store)
+    texts += [str(r[0]) for r in await db.execute_fetchall("SELECT meta FROM reference_secrets")]
+    return texts
+
+
+def _token_hex_always(monkeypatch, tag: str = "abcdef") -> None:
+    """Every tag the chokepoint mints collides (its own namespace only: the
+    secret rows' random ids stay random)."""
+    from genesis.memory import knowledge_ingest
+
+    monkeypatch.setattr(knowledge_ingest, "secrets", SimpleNamespace(token_hex=lambda n=3: tag[: 2 * n]))
+
+
+async def test_a_minted_masked_key_never_updates_another_entry(db, monkeypatch):
+    """Round 2 B1 (:327): two credentials whose identifiers are only their
+    values mint a key each; a forced tag collision keeps both entries and both
+    secrets (the mint checks the key is free)."""
+    store = _PointStore()
+    _token_hex_always(monkeypatch)
+    a = await _ingest(db, store, _body("Aa11Bb22!x", value="Aa11Bb22!x"), concept="Aa11Bb22!x")
+    b = await _ingest(db, store, _body("Cc33Dd44!y", value="Cc33Dd44!y"), concept="Cc33Dd44!y")
+    assert a != b
+    assert await kc.get_reference_secret(db, a) == "Aa11Bb22!x"
+    assert await kc.get_reference_secret(db, b) == "Cc33Dd44!y"
+    tagged = re.compile(r".* #[0-9a-f]{6}")
+    assert tagged.fullmatch(a.concept) and tagged.fullmatch(b.concept)
+
+
+async def test_a_minted_identifier_never_updates_another_entry(db, monkeypatch):
+    """Round 2 B1 (:226): two credentials with no identifier mint one each; a
+    forced tag collision keeps both entries and both secrets."""
+    store = _PointStore()
+    _token_hex_always(monkeypatch)
+    a = await _ingest(db, store, "free text password: Aa11Bb22!x", concept=None)
+    b = await _ingest(db, store, "free text password: Cc33Dd44!y", concept=None)
+    assert a != b
+    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 2
+    assert {await kc.get_reference_secret(db, a), await kc.get_reference_secret(db, b)} == {
+        "free text password: Aa11Bb22!x", "free text password: Cc33Dd44!y",
+    }
+
+
+async def test_an_untrusted_retry_replaces_the_tag_never_appends(db, monkeypatch):
+    """Round 2 B1 (A3): uploads under a masked name with a forced tag collision
+    take distinct keys of ONE tag each, never "[held] #abcdef #abcdef"."""
+    store = _PointStore()
+    _token_hex_always(monkeypatch)
+    one = await _untrusted(db, store, "router Pw9fake!x", "password: Pw9fake!x")
+    two = await _untrusted(db, store, "router Pw9fake!x", "password: Pw9fake!x and more")
+    assert one != two
+    single = re.compile(r"router \[held\] #[0-9a-f]{6}")
+    assert single.fullmatch(one.concept) and single.fullmatch(two.concept), (one.concept, two.concept)
+
+
+async def test_a_plain_untrusted_retry_takes_one_tag(db):
+    """Round 2 B1 (A3): an upload under a plain name another value holds takes
+    the name with ONE tag."""
+    store = _PointStore()
+    await _untrusted(db, store, "Prod DB root", "password: RealProd9!x")
+    second = await _untrusted(db, store, "Prod DB root", "attacker file")
+    assert re.fullmatch(r"Prod DB root #[0-9a-f]{6}", second.concept), second.concept
+
+
+async def _assert_no_card(db, store) -> None:
+    from genesis.security.card_shapes import contains_card_number
+
+    for text in await _all_surfaces(db, store):
+        assert not contains_card_number(text), text
+
+
+async def test_a_card_in_an_upload_name_and_path_is_redacted(db):
+    """Round 2 B2 (card.py U1): a card number in the upload's file name and
+    path is redacted in every indexed field and in the held meta; the
+    password is still saved."""
+    store = _PointStore()
+    name = f"{_CARD}.txt"
+    path = f"/inbox/u1/{name}"
+    from genesis.memory.knowledge_ingest import ingest_untrusted_credential
+
+    unit = await ingest_untrusted_credential(
+        store=store, db=db, content="Pw9fake!x", held_value="Pw9fake!x", held_detail="",
+        authority="curated", provenance={"source_doc": path, "source_pipeline": "curated"},
+        concept=name, tags_json=json.dumps(["general", "Reference", "stored-as-is"]),
+        ingestion_source=path, project="reference", domain="reference.credentials",
+        collection="episodic_memory", memory_type="episodic",
+    )
+    await _assert_no_card(db, store)
+    assert await kc.get_reference_secret(db, unit) == "Pw9fake!x"
+
+
+async def test_a_card_in_upload_context_is_redacted_in_held_meta(db):
+    """Round 2 B2 (card.py U2): a card in the user context (caveats)."""
+    store = _PointStore()
+    from genesis.memory.knowledge_ingest import ingest_untrusted_credential
+
+    unit = await ingest_untrusted_credential(
+        store=store, db=db, content="Pw9fake!x", held_value="Pw9fake!x", held_detail="",
+        concept="notes.txt", caveats=[f"User context: card {_CARD}"], project="reference",
+        domain="reference.credentials", collection="episodic_memory", memory_type="episodic",
+    )
+    await _assert_no_card(db, store)
+    assert await kc.get_reference_secret(db, unit) == "Pw9fake!x"
+
+
+async def test_a_card_in_a_distilled_units_fields_is_redacted(db):
+    """Round 2 B2 (card.py D1): a card in a distilled unit's concept, tags and
+    relationships."""
+    store = _PointStore()
+    from genesis.memory.knowledge_ingest import ingest_untrusted_credential
+
+    unit = await ingest_untrusted_credential(
+        store=store, db=db, content="The router admin password is Pw9fake!x",
+        concept=f"router card {_CARD}", tags_json=json.dumps(["net", f"c {_CARD}"]),
+        relationships=[_CARD], project="reference", domain="reference.credentials",
+        collection="episodic_memory", memory_type="episodic",
+    )
+    await _assert_no_card(db, store)
+    assert await kc.get_reference_secret(db, unit) == "The router admin password is Pw9fake!x"
+
+
+async def test_a_card_in_mcp_knowledge_ingest_fields_is_redacted(db):
+    """Round 2 B2 (card.py K1): the knowledge_ingest MCP shape, a card in the
+    concept, provenance and purpose."""
+    store = _PointStore()
+    unit = await _ingest(
+        db, store, "free text Pw9fake!x", concept=f"acct {_CARD}",
+        provenance={"source_doc": _CARD}, purpose=[_CARD],
+    )
+    await _assert_no_card(db, store)
+    assert await kc.get_reference_secret(db, unit) == "free text Pw9fake!x"
+
+
+def test_masking_a_name_against_a_repeated_token_value_is_bounded():
+    """Round 2 SF1: the run search over a held value bounds the occurrences it
+    examines and its look-back, so a 400 KB repeated-token value masks a name
+    in well under a second (the unbounded search took seconds)."""
+    import time
+
+    value = "Abcd1234 " * 45000
+    _strict, named = ro.value_masks(value)
+    start = time.perf_counter()
+    masked, _spans = named.mask_and_spans("Abcd1234.txt")
+    assert time.perf_counter() - start < 1.0
+    assert "Abcd1234" not in masked
+
+
+async def test_a_credential_uploads_name_never_reaches_the_logs(db, memory_mcp, tmp_path, caplog, monkeypatch):
+    """Round 2 SF2 (CodeQL alerts 228-230): the three store-as-is logs the scan
+    flagged (the injection-pattern warning, the scan-failure warning and the
+    stored-unit info) never carry the upload's file name or path."""
+    import logging
+    from types import SimpleNamespace as NS
+
+    from genesis.knowledge import ingest_upload
+
+    name = "router-Pw9fake!x.txt"
+    path = tmp_path / name
+    path.write_text("password: Pw9fake!x")
+
+    def failing_scan(*_a, **_k):
+        raise RuntimeError(f"scanner choked on {path}")
+
+    def flagging_scan(*_a, **_k):
+        return NS(detected_patterns=["ignore-previous"], risk_score=0.9)
+
+    with caplog.at_level(logging.DEBUG):
+        monkeypatch.setattr(ingest_upload._SANITIZER, "sanitize", failing_scan)
+        await ingest_upload._store_as_is(
+            str(path), name, project_type="reference", domain="reference.credentials",
+            purpose=None, context="",
+        )
+        monkeypatch.setattr(ingest_upload._SANITIZER, "sanitize", flagging_scan)
+        await ingest_upload._store_as_is(
+            str(path), name, project_type="notes", domain="general", purpose=None, context="",
+        )
+    messages = [r.getMessage() for r in caplog.records if r.name == "genesis.knowledge.ingest_upload"]
+    assert any("Injection scan failed" in m for m in messages)
+    assert any("Injection patterns in store-as-is" in m for m in messages)
+    assert any("as single unit" in m for m in messages)
+    for record in caplog.records:
+        if not record.name.startswith("genesis"):
+            continue  # a library's own debug log of its SQL is not Genesis's to shape
+        text = record.getMessage() + (record.exc_text or "") + str(record.exc_info or "")
+        assert "Pw9fake" not in text and name not in text, text
+
+
+# ─── round-2 fix audit ───────────────────────────────────────────────────────
+
+
+async def test_a_provenance_whose_values_spell_a_card_is_withheld_not_a_crash(db):
+    """Round-2 audit SF-1 (card2.py P1): a provenance dict whose values only
+    together spell a card is withheld as a dict, and the write is stored."""
+    store = _PointStore()
+    provenance = {"source_pipeline": "curated", "a": "4242", "b": "4242", "c": "4242", "d": "4242"}
+    unit = await _ingest(
+        db, store, "free text Pw9fake!x", concept="router", provenance=provenance,
+        relationships=["4242", "4242", "4242", "4242"],
+    )
+    assert await kc.get_reference_secret(db, unit) == "free text Pw9fake!x"
+    row = await kc.get(db, unit)
+    assert row["source_pipeline"] == "curated"
+    meta = await ro.reveal_meta(db, row)
+    assert isinstance(meta["provenance"], dict) and isinstance(meta["relationships"], list)
+    await _assert_no_card(db, store)
+
+
+def test_a_secret_after_many_repeats_of_its_probe_is_masked_whole():
+    """Round-2 audit SF-2 (bound.py C1): 300 earlier occurrences of a piece of
+    the secret never stop the search before the secret itself, so the name and
+    a tag mask it whole."""
+    strict, named = ro.value_masks("Fake123 " * 300 + "Demo@Fake123")
+    assert named.mask("Demo@Fake123 router") == "[held] router"
+    assert strict.mask("Demo@Fake123") == "[held]"
+
+
+async def test_card_redacted_names_reuse_an_entry_only_for_the_same_value(db):
+    """Owner ruling: two names that differ only by a card number redact to one
+    name; a different value takes a new key, the same value reuses the entry."""
+    store = _PointStore()
+    a = await _ingest(db, store, _body("Visa 4242 4242 4242 4242 PIN", value="Pw1fake!a"),
+                      concept="Visa 4242 4242 4242 4242 PIN")
+    b = await _ingest(db, store, _body("Visa 5555 5555 5555 4444 PIN", value="Pw2fake!b"),
+                      concept="Visa 5555 5555 5555 4444 PIN")
+    assert a != b
+    assert await kc.get_reference_secret(db, a) == "Pw1fake!a"
+    assert await kc.get_reference_secret(db, b) == "Pw2fake!b"
+    again = await _ingest(db, store, _body("Visa 4242 4242 4242 4242 PIN", value="Pw1fake!a"),
+                          concept="Visa 4242 4242 4242 4242 PIN")
+    assert again == a
+    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 2
+    await _assert_no_card(db, store)
+
+
+async def test_a_card_redacted_name_keeps_its_body_header(db):
+    """Round-2 audit note: a body formatted with the identifier as its header
+    gets the redacted header, so the header is not read as description (which
+    would carry the card and be refused)."""
+    store = _PointStore()
+    ident = "Visa 4242 4242 4242 4242 PIN"
+    unit = await _ingest(db, store, _body(ident, value="Pw1fake!a"), concept=ident)
+    row = await kc.get(db, unit)
+    assert row["body"].splitlines()[0] == f"[reference.credentials] {row['concept']}"
+    assert await ro.reveal_reference(db, row) == ("Pw1fake!a", _DESC)
+    await _assert_no_card(db, store)
+
+
+async def test_re_uploading_the_same_credential_file_keeps_one_entry(db, memory_mcp, tmp_path):
+    """Owner ruling: an upload under the same recorded name with the same value
+    as an earlier UPLOAD returns that entry; another value is a new entry, and a
+    trusted entry is never matched."""
+    store = memory_mcp
+    name = "router Pw9fake!x"
+    units = [await _untrusted(db, store, name, "password: Pw9fake!x") for _ in range(3)]
+    assert len(set(units)) == 1
+    other = await _untrusted(db, store, name, "password: Other7fake!y")
+    assert other != units[0]
+    trusted = await _ingest(db, store, _body("vpn Qq88fake!z", value="Qq88fake!z"), concept="vpn Qq88fake!z")
+    upload = await _untrusted(db, store, "vpn Qq88fake!z", "Qq88fake!z")
+    assert upload != trusted
+    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 4
+
+
+# ─── confirming check ────────────────────────────────────────────────────────
+
+_C1, _C2 = "Visa 4242 4242 4242 4242 PIN", "Visa 5555 5555 5555 4444 PIN"
+
+
+async def test_a_same_value_re_save_of_a_card_name_updates_its_minted_entry(db):
+    """Check SF-1 (R1): a card-redacted name another value holds takes a minted
+    key; re-saving it with the same value updates THAT entry, every time."""
+    store = _PointStore()
+    await _ingest(db, store, _body(_C1, value="Pw1fake!a"), concept=_C1)
+    second = await _ingest(db, store, _body(_C2, value="Pw2fake!b"), concept=_C2)
+    third = await _ingest(db, store, _body(_C2, value="Pw2fake!b"), concept=_C2)
+    assert third == second
+    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 2
+
+
+@pytest.mark.parametrize("ident", [_C1 + " Pw3fake!c", "Visa PIN Pw3fake!c"], ids=["carded", "control"])
+async def test_a_placeholder_re_ingest_of_a_card_name_updates_in_place(db, ident):
+    """Check SF-2 (R2): re-ingesting the stored held body of a masked
+    card-redacted name (the value line a placeholder) updates that entry and
+    keeps its value; no empty-valued entry is minted. The control has no card."""
+    store = _PointStore()
+    first = await _ingest(db, store, _body(ident, value="Pw3fake!c"), concept=ident)
+    held = (await kc.get(db, first))["body"]
+    again = await _ingest(db, store, held, concept=ident, tags_json=json.dumps(["newtag"]))
+    assert again == first
+    assert await kc.get_reference_secret(db, first) == "Pw3fake!c"
+    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 1
+
+
+async def test_an_upload_with_another_description_is_kept_beside_the_first(db):
+    """Check note 2: an upload under the same name with the same value but a
+    different description is stored as its own entry, never dropped."""
+    store = _PointStore()
+    name = "router Pw9fake!x"
+    first = await _untrusted(db, store, name, _body(name, value="Pw9fake!x", description="login alice on host A"))
+    second = await _untrusted(db, store, name, _body(name, value="Pw9fake!x", description="login bob on host B"))
+    assert second != first
+    details = {r[0] for r in await db.execute_fetchall("SELECT detail FROM reference_secrets")}
+    assert {"login alice on host A", "login bob on host B"} <= details
+
+
+async def test_a_trusted_save_never_returns_an_uploads_entry(db):
+    """Check note 3 (reup_trusted_too): a trusted save under an upload's name
+    with the upload's value is never returned the upload's entry."""
+    store = _PointStore()
+    name = "router Pw9fake!x"
+    upload = await _untrusted(db, store, name, "password: Pw9fake!x")
+    # The same name, value and (empty) description as the upload's.
+    saved = await _ingest(db, store, "password: Pw9fake!x", concept=name)
+    assert saved != upload
+    assert await kc.get_reference_secret(db, upload) == "password: Pw9fake!x"
+
+
+async def test_masked_card_names_with_other_values_stay_two_entries(db):
+    """Check note 3 (carded_masked): two card-redacted names that also carry
+    their values mask to one base; the second, holding another value, takes a
+    new key instead of rotating the first entry's value away."""
+    store = _PointStore()
+    a = await _ingest(db, store, _body(_C1 + " Aa11fake!x", value="Aa11fake!x"), concept=_C1 + " Aa11fake!x")
+    b = await _ingest(db, store, _body(_C2 + " Bb22fake!y", value="Bb22fake!y"), concept=_C2 + " Bb22fake!y")
+    assert a != b
+    assert await kc.get_reference_secret(db, a) == "Aa11fake!x"
+    assert await kc.get_reference_secret(db, b) == "Bb22fake!y"

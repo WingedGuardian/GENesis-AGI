@@ -125,6 +125,7 @@ _SHORT = 32
 #: costs a bounded check however large the value is.
 _RUN_MAX = 256
 _RUNS_PER_PROBE = 64
+_RUN_SEPARATORS = (" ", "\n", "\t")
 #: Matches spanning more whitespace tokens than this are masked with the whole
 #: field (only a percent-encoded copy of a long multi-word value can need it).
 _WINDOW_MAX = 16
@@ -195,22 +196,24 @@ class ValueMask:
     def runs(self, probe: str) -> list[str]:
         """The short whitespace-delimited runs of the value that hold ``probe``,
         so a match can grow over a secret that spans a separator
-        ("Demo@Fake123"). Found by ``str.find`` on first use, at most
-        ``_RUNS_PER_PROBE`` of them, so a megabyte value costs no full pass."""
+        ("Demo@Fake123"). Found by ``str.find`` on first use: at most
+        ``_RUNS_PER_PROBE`` of them, each occurrence looking no further than
+        ``_RUN_MAX`` characters either side (a longer run is never kept), so a
+        value of repeated tokens costs a linear pass."""
         if probe not in self._runs:
             found: list[str] = []
             for form in self._whole:
                 at = form.find(probe)
                 while at != -1 and len(found) < _RUNS_PER_PROBE:
-                    start = max(form.rfind(" ", 0, at), form.rfind("\n", 0, at), form.rfind("\t", 0, at)) + 1
-                    stop = len(form)
-                    for sep in (" ", "\n", "\t"):
-                        end = form.find(sep, at + len(probe))
-                        if end != -1:
-                            stop = min(stop, end)
-                    if stop - start <= _RUN_MAX and form[start:stop] not in found:
+                    end = at + len(probe)
+                    low, high = max(0, at - _RUN_MAX), min(len(form), end + _RUN_MAX + 1)
+                    start = max(form.rfind(sep, low, at) for sep in _RUN_SEPARATORS) + 1
+                    stops = [i for i in (form.find(sep, end, high) for sep in _RUN_SEPARATORS) if i != -1]
+                    stop = min(stops) if stops else (len(form) if high == len(form) else None)
+                    whole_run = stop is not None and (start > 0 or low == 0)
+                    if whole_run and stop - start <= _RUN_MAX and form[start:stop] not in found:
                         found.append(form[start:stop])
-                    at = form.find(probe, stop)
+                    at = form.find(probe, stop if stop is not None else end)
             self._runs[probe] = found
         return self._runs[probe]
 

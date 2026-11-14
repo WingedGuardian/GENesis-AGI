@@ -42,8 +42,10 @@ class StoredId(str):
 
 #: Content or a value larger than this is split and probed off the event loop.
 _LARGE = 64 * 1024
-#: Random tags an untrusted credential write tries before a uuid one.
+#: Times an untrusted credential write retries under a minted key.
 _MINT_ATTEMPTS = 4
+#: Random tags ``_mint_key`` tries before a uuid-derived one.
+_MINT_TRIES = 8
 #: A credential identifier is indexed up to this long (the full one is in meta).
 _MAX_IDENTIFIER = 512
 #: The pipeline labels a credential unit may carry; anything else reads as the
@@ -74,6 +76,7 @@ async def ingest_knowledge_unit(
     confidence: float = 0.85,
     origin_class: str | None = None,
     insert_only: bool = False,
+    mint_key: bool = False,
     held_value: str | None = None,
     held_detail: str | None = None,
     relationships: list | dict | None = None,
@@ -135,7 +138,7 @@ async def ingest_knowledge_unit(
         concept=concept, tags_json=tags_json, force_fts5_only=force_fts5_only,
         purpose=purpose, ingestion_source=ingestion_source, collection=collection,
         memory_type=memory_type, confidence=confidence, origin_class=origin_class,
-        insert_only=insert_only, held_value=held_value, held_detail=held_detail,
+        insert_only=insert_only, mint_key=mint_key, held_value=held_value, held_detail=held_detail,
         relationships=relationships, caveats=caveats,
     )
     try:
@@ -165,6 +168,7 @@ async def _ingest_once(
     confidence: float = 0.85,
     origin_class: str | None = None,
     insert_only: bool = False,
+    mint_key: bool = False,
     held_value: str | None = None,
     held_detail: str | None = None,
     relationships: list | dict | None = None,
@@ -204,6 +208,29 @@ async def _ingest_once(
         # the readers compare it exactly, so a mixed-case row would be revealed
         # with no audit row.
         domain = knowledge_crud.CREDENTIAL_DOMAIN
+        # Card numbers in the caller's own fields are replaced with the shared
+        # redactor's marker, the rest kept (owner ruling 1dedc18a), ONCE here
+        # for every caller (an upload's file name and path, a distilled unit's
+        # concept, tags and relationships, the MCP tools' fields), before any
+        # of them is recorded, masked or indexed. The value and description
+        # keep their refusal (``split_secret``).
+        from genesis.security.card_redaction import redact_text
+
+        pipeline = provenance.get("source_pipeline") if isinstance(provenance, dict) else None
+        old_header = f"[{knowledge_crud.CREDENTIAL_DOMAIN}] {' '.join(concept.splitlines())}" if concept else None
+        given = concept
+        concept = redact_text(concept) if concept else concept
+        # A name that had a card redacted names an entry only with its value.
+        carded = concept != given
+        if old_header and content.startswith(old_header + "\n"):
+            # A body formatted with the identifier as its header line keeps it.
+            content = f"[{knowledge_crud.CREDENTIAL_DOMAIN}] {' '.join(concept.splitlines())}" + content[len(old_header):]
+        tags_json = redact_text(tags_json) if tags_json else tags_json
+        authority, provenance, purpose, ingestion_source, relationships, caveats = (
+            _redacted_like(field) for field in (
+                authority, provenance, purpose, ingestion_source, relationships, caveats,
+            )
+        )
         # The caller's metadata, verbatim, is held with the value; the unit
         # carries neutral values in its place (below).
         meta = {
@@ -219,11 +246,12 @@ async def _ingest_once(
         # so it reads as a space. It is masked WHOLE and only then capped (the
         # full one is in meta), so a cut never leaves part of a secret.
         flat = " ".join(concept.splitlines()) if concept else ""
+        minted: knowledge_crud.KeyObservation | None = None
         if not flat.strip():
             # The identifier is the entry's key. Derived from the body, it would
-            # be the HELD body, so two credentials would share a key: a fresh
-            # one is minted, and returned to the caller (StoredId.concept).
-            flat = f"credential #{secrets.token_hex(3)}"
+            # be the HELD body, so two credentials would share a key: a fresh,
+            # FREE one is minted, and returned to the caller (StoredId.concept).
+            flat, minted = await _mint_key(db, project, domain, "credential")
         header = f"[{knowledge_crud.CREDENTIAL_DOMAIN}] {flat}"
         # The value AND the free-text description come out of the body. A body
         # with no "Value:" line is free text (a distilled unit, an uploaded
@@ -241,7 +269,7 @@ async def _ingest_once(
         # a placeholder) and the observation the upsert compare-and-swaps
         # against, so what this write keeps is what the commit retains.
         concept = flat
-        observed = await knowledge_crud.observe_credential_key(
+        observed = minted or await knowledge_crud.observe_credential_key(
             db, project_type=project, domain=domain, concept=concept,
         )
         if secret_value == "" and observed.value is not None:
@@ -250,6 +278,13 @@ async def _ingest_once(
         known_secret = (secret_value if secret_value is not None else observed.value) or ""
         known_detail = secret_detail if secret_detail is not None else observed.detail
         entries = await knowledge_crud.masked_key_rows(db, project_type=project, domain=domain)
+        for entry in entries if insert_only and secret_value is not None else ():
+            # An untrusted write of the value an untrusted entry already holds
+            # under this same recorded name (a re-upload) is that entry.
+            if entry.origin == knowledge_crud.UNTRUSTED and entry.given == flat and entry.value == secret_value and (
+                (entry.detail or "") == (secret_detail or "")
+            ):
+                return _stored(entry.id, entry.concept)
         # The secrets this write must not repeat beside its own: the value it
         # replaces, and those of the ONE entry this name resolves to (the entry
         # it updates or, when no trusted one is named, the first of any origin
@@ -268,12 +303,12 @@ async def _ingest_once(
         also = _secrets_of(observed, [resolved] if resolved else [], known_secret)
         # Every probe of the value and of the secrets the capture rules find in
         # it and in the description, built ONCE for the identifier and the tags.
-        build = functools.partial(
-            reference_ops.value_masks, known_secret, prose=prose, detail=known_detail, also=also,
-        )
-        large = len(known_secret) + len(known_detail or "") + sum(len(v or "") for v, _ in also) > _LARGE
-        strict, named = await asyncio.to_thread(build) if large else build()
-        masked, spans = named.mask_and_spans(flat)
+        large = (
+            len(known_secret) + len(known_detail or "") + sum(len(v or "") for v, _ in also)
+            + len(flat) + len(tags_json or "")
+        ) > _LARGE
+        prepare = functools.partial(_prepare_masks, known_secret, flat, prose=prose, detail=known_detail, also=also)
+        strict, named, masked, spans = await asyncio.to_thread(prepare) if large else prepare()
         adopted = None
         cut = len(masked) > _MAX_IDENTIFIER
         if masked != flat or cut:
@@ -290,6 +325,7 @@ async def _ingest_once(
             # takes a fresh key, and a trusted write never adopts the entry one
             # made. A placeholder re-ingest carries the stored value and
             # description over to the new key.
+            given_value = secret_value
             if secret_value is None:
                 secret_value = observed.value
             if secret_detail is None:
@@ -324,9 +360,30 @@ async def _ingest_once(
             # rotates to) is updated under that key as it is, and an untagged
             # entry under this very identifier is left as it is beside the new,
             # masked one.
-            concept = existing_key or f"{base} #{secrets.token_hex(3)}"
-            observed = await knowledge_crud.observe_credential_key(
-                db, project_type=project, domain=domain, concept=concept,
+            if existing_key:
+                concept = existing_key
+                observed = await knowledge_crud.observe_credential_key(
+                    db, project_type=project, domain=domain, concept=concept,
+                )
+            if not existing_key or (carded and given_value not in (None, observed.value)):
+                # A minted key is never an update target: it is free when
+                # observed, and the upsert's absent compare-and-swap refuses it
+                # if another write takes it first. A card-redacted name first
+                # reuses the entry that records it with this very value.
+                adopted = _same_value_entry(entries, flat, given_value) if carded else None
+                concept, observed = await (
+                    _observed_key(db, project, domain, adopted.concept) if adopted
+                    else _mint_key(db, project, domain, base)
+                )
+        elif mint_key or (carded and not observed.absent and secret_value not in (None, observed.value)):
+            # An untrusted retry whose plain identifier another value holds, or
+            # a card-redacted name another value holds: the identifier with ONE
+            # fresh, free tag (or, for the card name, the entry recording it
+            # with this value).
+            adopted = None if mint_key else _same_value_entry(entries, flat, secret_value)
+            concept, observed = await (
+                _observed_key(db, project, domain, adopted.concept) if adopted
+                else _mint_key(db, project, domain, reference_ops.cap_masked(flat, _MAX_IDENTIFIER - 8))
             )
         # What this write knows of the entry's identity, held in meta (never
         # indexed): who wrote it, and every span the identifier's mask has
@@ -352,9 +409,9 @@ async def _ingest_once(
         if secret_value is not None and secret_detail is None:
             # The stored description stays beside a new value, in the new row.
             secret_detail = observed.detail if observed.detail is not None else ""
-        tags_json, content = reference_ops.mask_value_tags(strict, tags_json, content)
+        mask_tags = functools.partial(reference_ops.mask_value_tags, strict, tags_json, content)
+        tags_json, content = await asyncio.to_thread(mask_tags) if large else mask_tags()
         # The unit's own metadata is neutral: the caller's is in the secret row.
-        pipeline = (provenance or {}).get("source_pipeline")
         provenance = {"source_pipeline": pipeline if pipeline in _PIPELINES else "knowledge_ingest"}
         authority = "credential"
         purpose = ingestion_source = relationships = caveats = None
@@ -667,17 +724,75 @@ async def ingest_untrusted_credential(**kwargs) -> str:
     """``ingest_knowledge_unit`` for a credential from a source that must never
     replace one (an upload, a distilled document): insert-only, so a key that
     already holds this value is a no-op returning its id, and a key holding a
-    DIFFERENT value is never overwritten; the write retries under a freshly
-    tagged key instead (``{identifier} #xxxxxx``, then a uuid tag). Never
-    refused for the key being taken (#2426, owner ruling 6f73fe4d)."""
+    DIFFERENT value is never overwritten; the write retries under a minted,
+    free key instead (the identifier with ONE fresh tag, ``_mint_key``; the
+    identifier as given stays the entry's recorded name). Never refused for the
+    key being taken (#2426, owner ruling 6f73fe4d)."""
     concept = kwargs.pop("concept", None) or "credential"
-    candidates = [concept] + [f"{concept} #{secrets.token_hex(3)}" for _ in range(_MINT_ATTEMPTS)]
-    for candidate in [*candidates, f"{concept} #{uuid.uuid4().hex}"]:
+    for attempt in range(_MINT_ATTEMPTS + 1):
         try:
-            return await ingest_knowledge_unit(concept=candidate, insert_only=True, **kwargs)
+            return await ingest_knowledge_unit(
+                concept=concept, insert_only=True, mint_key=attempt > 0, **kwargs,
+            )
         except knowledge_crud.CredentialKeyTaken:
             continue
     raise knowledge_crud.CredentialKeyTaken("every minted key was taken (#2426)")
+
+
+async def _mint_key(db, project: str, domain: str, base: str) -> tuple[str, knowledge_crud.KeyObservation]:
+    """(a fresh key ``"{base} #xxxxxx"`` that no entry holds, the observation
+    of it, absent). The one place a credential key is minted: up to
+    ``_MINT_TRIES`` random tags are tried, then a uuid-derived one, which still
+    ends in the six-hex tag the identity lookups match. The observation binds
+    the upsert to an absent key, so a write that takes it first makes this one
+    retry rather than update it."""
+    for _ in range(_MINT_TRIES):
+        key = f"{base} #{secrets.token_hex(3)}"
+        observed = await knowledge_crud.observe_credential_key(
+            db, project_type=project, domain=domain, concept=key,
+        )
+        if observed.absent:
+            return key, observed
+    key = f"{base} #{uuid.uuid4().hex[:6]}"
+    return key, knowledge_crud.KeyObservation(None, None, None, None)
+
+
+def _same_value_entry(entries: list, flat: str, value: str | None):
+    """The trusted entry that records ``flat`` as its name and holds ``value``
+    (a card-redacted name's own earlier save), or None."""
+    return next(
+        (e for e in entries if e.trusted and e.given == flat and value is not None and e.value == value), None,
+    )
+
+
+async def _observed_key(db, project: str, domain: str, key: str) -> tuple[str, knowledge_crud.KeyObservation]:
+    """(``key``, its observation)."""
+    return key, await knowledge_crud.observe_credential_key(db, project_type=project, domain=domain, concept=key)
+
+
+def _redacted_like(field):
+    """``field`` with card numbers redacted, of the same type: a mapping or a
+    list the redactor withholds whole (its parts together spell a card) is
+    kept as one holding the marker, so no reader of it meets a string."""
+    from genesis.security.card_redaction import redact_value
+
+    walked = redact_value(field)
+    if isinstance(field, dict) and not isinstance(walked, dict):
+        return {"withheld": walked}
+    if isinstance(field, list | tuple) and not isinstance(walked, list | tuple):
+        return [walked]
+    return walked
+
+
+def _prepare_masks(value: str, flat: str, *, prose: bool, detail: str | None, also: tuple) -> tuple:
+    """(strict mask, identifier mask, the masked identifier, its masked spans):
+    the pure-Python preparation of a credential write, in one call so it runs
+    off the event loop together when any input is large."""
+    from genesis.memory import reference_ops
+
+    strict, named = reference_ops.value_masks(value, prose=prose, detail=detail, also=also)
+    masked, spans = named.mask_and_spans(flat)
+    return strict, named, masked, spans
 
 
 def _tag_list(tags_json: str | None) -> list[str] | None:
