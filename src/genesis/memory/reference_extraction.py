@@ -69,12 +69,31 @@ _LABEL_WORDS = r"(?:user(?:name)?|login|pass(?:word)?|pwd|email|handle|account)"
 # captured as a value on this path (a password literally "password" was
 # already un-capturable). Copulas are far more often separators than values.
 _COPULA_WORDS = r"(?:is|are|was|were)"
+# A value is rejected as a bare label/copula only when the excluded word is
+# the WHOLE value token, ignoring trailing punctuation: the word followed by
+# a punctuation-only tail and then a token end (whitespace, ","/";", or end
+# of string). A plain "\b" also fires before punctuation, which wrongly
+# rejected values that merely START with a label/copula word — e.g.
+# "Is!Secure987" / "Password!Secure987" (Codex P2 on PR #4473): the "!" is
+# followed by more word chars, so the token is not the bare word.
+_EXCLUDED_VALUE = rf"(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS})[^\s,;\w]*(?=[\s,;]|$))"
+# Introducer words the lifecycle pattern's optional group can consume
+# ("created account named/called/for X"). If the account itself is rejected,
+# the group backtracks and the introducer becomes the account ("named /
+# secret123" — Codex P2 on PR #4473), fabricating a login. Rejecting the
+# introducers as account values makes the pattern fail instead, so the
+# capture falls through to the single-password branch.
+_INTRODUCER_WORDS = r"(?:for|named?|called?)"
+_EXCLUDED_ACCOUNT = (
+    rf"(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS}|{_INTRODUCER_WORDS})"
+    rf"[^\s,;\w]*(?=[\s,;]|$))"
+)
 _CREDENTIAL_PAIR_PATTERN = re.compile(
     r"\b(?:username|user|login)\s*(?:is\s+|[:=]\s*|\s+)"
-    rf"(?P<user>(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS})\b)[^\s,;]+)"
+    rf"(?P<user>{_EXCLUDED_VALUE}[^\s,;]+)"
     r".{0,200}?"
     r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*)"
-    rf"(?P<pass>(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS})\b)[^\s,;]+)",
+    rf"(?P<pass>{_EXCLUDED_VALUE}[^\s,;]+)",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -83,7 +102,7 @@ _CREDENTIAL_PAIR_PATTERN = re.compile(
 _SINGLE_CREDENTIAL_PATTERN = re.compile(
     r"\b(?:password|pass(?:word)?|pwd|passphrase|passcode|pin)"
     r"\s*(?:is\s+|[:=]\s*)"
-    rf"(?P<value>(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS})\b)[^\s,;]{{4,}})",
+    rf"(?P<value>{_EXCLUDED_VALUE}[^\s,;]{{4,}})",
     re.IGNORECASE,
 )
 
@@ -94,7 +113,7 @@ _EMAIL_PASSWORD_PATTERN = re.compile(
     r"(?P<email>[^\s,;]+@[^\s,;]+)"
     r".{0,200}?"
     r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*)"
-    rf"(?P<pass>(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS})\b)[^\s,;]{{4,}})",
+    rf"(?P<pass>{_EXCLUDED_VALUE}[^\s,;]{{4,}})",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -167,10 +186,10 @@ _ACCOUNT_LIFECYCLE_PATTERN = re.compile(
     r"\b(?:created|registered|signed?\s*up|set\s*up)\s+"
     r"(?:an?\s+)?(?:account|user|login)\s+"
     r"(?:for\s+|named?\s+|called?\s+)?"
-    rf"(?P<account>(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS})\b)[^\s,;]{{2,}})"
+    rf"(?P<account>{_EXCLUDED_ACCOUNT}[^\s,;]{{2,}})"
     r".{0,200}?"
     r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*)"
-    rf"(?P<pass>(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS})\b)[^\s,;]{{4,}})",
+    rf"(?P<pass>{_EXCLUDED_VALUE}[^\s,;]{{4,}})",
     re.IGNORECASE | re.DOTALL,
 )
 

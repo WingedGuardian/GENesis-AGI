@@ -96,6 +96,86 @@ class TestClassifyCredentialPair:
         assert ref["kind"] == "credentials"
         assert ref["value"] == expected
 
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            # Codex P2-1 (round 2): a value that merely STARTS with a copula
+            # or label word plus punctuation is a real credential, not the
+            # bare word — the lookahead rejects whole tokens only.
+            (
+                "The admin password: Is!Secure987 for the staging server",
+                "password: Is!Secure987",
+            ),
+            (
+                "The staging password: Password!Secure987 is ready now",
+                "password: Password!Secure987",
+            ),
+            (
+                "The admin password: Are!Secure987 for the staging server",
+                "password: Are!Secure987",
+            ),
+        ],
+    )
+    def test_copula_prefix_inside_value_is_captured(
+        self, content, expected
+    ):
+        ext = Extraction(
+            content=content,
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == expected
+
+    def test_bare_copula_value_still_rejected(self):
+        # The whole-token rule above must not re-admit a value that IS the
+        # bare copula word.
+        ext = Extraction(
+            content="the password is is, please note it down for me",
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        assert classify_as_reference(ext) is None
+
+    @pytest.mark.parametrize("introducer", ["named", "called", "for"])
+    def test_lifecycle_introducer_not_fabricated_as_account(
+        self, introducer
+    ):
+        # Codex P2-2 (round 2): "created account named handle ..." must NOT
+        # return "named / secret123"; the rejected account falls through to
+        # the single-password capture instead of fabricating a login.
+        ext = Extraction(
+            content=(
+                f"created account {introducer} handle "
+                "with password: secret123"
+            ),
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == "password: secret123"
+
+    def test_lifecycle_introducer_with_real_account(self):
+        # Guard against over-rejection: with a real account after the
+        # introducer, the lifecycle pair is still captured.
+        ext = Extraction(
+            content="created account named admin with password: secret123",
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == "admin / secret123"
+
     def test_rejects_ephemeral_example(self):
         ext = Extraction(
             content="For example, the username: test password: secret would work",
