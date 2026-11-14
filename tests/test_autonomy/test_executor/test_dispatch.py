@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from genesis.autonomy.executor.dispatch import (
     _read_artifact,
@@ -18,6 +21,54 @@ from genesis.autonomy.executor.types import StepResult
 
 
 class TestBuildStepPrompt:
+    def test_static_instructions_have_no_unresolved_context(self) -> None:
+        prompt = build_step_prompt({"idx": 0, "description": "Research API"}, [])
+        assert "{{" not in prompt
+        assert "## Task\nNot provided\nPlanned step count: Not provided" in prompt
+        assert "## Prior Step Results" not in prompt
+        assert "Type: code" in prompt
+        assert "Complexity: medium" in prompt
+
+    @pytest.mark.parametrize("description", [None, ""])
+    def test_missing_context_and_explicit_zero(self, description) -> None:
+        prompt = build_step_prompt(
+            {"idx": 4}, [], task_description=description, planned_step_count=0,
+        )
+        assert "## Task\nNot provided\nPlanned step count: 0" in prompt
+        assert "## Step 4:" in prompt
+        assert "4/0" not in prompt
+
+    def test_values_are_verbatim_and_prior_results_stay_bounded(self) -> None:
+        goal = 'Goal 日本語 {"key": "{{task_description}}"}'
+        step = {"idx": 5, "description": "Fix {{step_description}}", "type": "code"}
+        prior = [StepResult(idx=0, status="completed", result="a" * 201)]
+        prompt = build_step_prompt(
+            step, prior, "Use {{workaround}}", "Resource {{resources}}",
+            task_description=goal, planned_step_count=2,
+        )
+        assert prompt.count(goal) == 1
+        assert "Planned step count: 2" in prompt
+        assert "## Step 5: Fix {{step_description}}" in prompt
+        assert "5/2" not in prompt
+        assert "Use {{workaround}}" in prompt
+        assert "Resource {{resources}}" in prompt
+        assert "a" * 200 in prompt and "a" * 201 not in prompt
+        assert "**Notepad:**" in prompt
+
+    def test_missing_template_still_renders_real_context(self, tmp_path, caplog) -> None:
+        with patch(
+            "genesis.autonomy.executor.dispatch._TASK_STEP_PROMPT_PATH",
+            tmp_path / "missing.md",
+        ):
+            prompt = build_step_prompt(
+                {"idx": 1, "type": "research", "description": "Find docs"}, [],
+                task_description="Build a reader", planned_step_count=3,
+            )
+        assert "## Task\nBuild a reader\nPlanned step count: 3" in prompt
+        assert "## Step 1: Find docs" in prompt
+        assert "**Notepad:**" not in prompt
+        assert "Failed to load step template" in caplog.text
+
     def test_includes_step_info(self) -> None:
         step = {"idx": 0, "description": "Research API", "type": "research", "complexity": "low"}
         prompt = build_step_prompt(step, [])

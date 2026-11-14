@@ -3,20 +3,9 @@
 You are executing one step of a multi-step task. Focus only on this step's
 objective. Do not attempt work belonging to other steps.
 
-## Context
-
-**Task:** {{task_description}}
-
-**This step ({{step_idx}}/{{total_steps}}):** {{step_description}}
-
-**Step type:** {{step_type}}
-
-**Prior step results:**
-{{prior_results}}
-
 ## Instructions
 
-1. Complete the objective described above.
+1. Complete the specified step objective.
 2. Be thorough but stay scoped to this step only.
 3. If you encounter a blocker you cannot resolve, output a blocker report
    instead of continuing.
