@@ -5818,6 +5818,25 @@ verified: 81bbdb0a9 2026-11-08
   substitution boundaries the legacy scans may misread are refused, never
   accepted (#3713 PR 1; same reference doc).
   Existing continuation, heredoc proof, size bounds and nested refusals remain.
+  A word that chooses the program and is written in bash locale quoting
+  (`$"…"`) is reported, not decoded: `_BLIND_LOCALE_PROGRAM`, with the
+  untranslated reading on `Segment.locale_program` as a candidate that is never
+  `exe`. The push guard refuses when that candidate is `git` or `gh`, and
+  `unresolved_verb_programs` carries it to the commit and discard guards. A
+  shell (`_NESTED`) handed its script, or the `-c` that selects it, in that
+  quoting is reported as `_BLIND_LOCALE_SCRIPT`, with the untranslated script on
+  `Segment.locale_script` (a candidate, never parsed); `locale_candidates`
+  mention-scans it for git and gh, and the push, commit and discard guards
+  refuse on that. A body the parse rebuilds from tokens (`case` arm, function
+  body, `coproc`) is read the same way one level down (`_plain_reading`).
+  `destructive_command_guard` and `protected_paths_guard` refuse on either cause
+  when the command names a removal, as on any blind spot. Not reported: the
+  same quoting in any other option or operand, or in the payload of a launcher
+  outside `_NESTED` (here-string or pipe into a shell, `busybox`, `find -exec`,
+  `parallel`, `taskset`, `ssh`, `trap`, `at`, `$SHELL -c`, positional-argument
+  or substitution-built scripts, variable-named programs). Guards that do not
+  read the blind spot (`full_suite_guard`, `worktree_cwd_guard`,
+  `pr_open_review_gate`, `issue_premise_gate`) are unchanged by it.
   Codex's local CLI also has a budget-only shell action hook in
   `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the
   existing commit/request budget decisions, denies approval-required or unknown

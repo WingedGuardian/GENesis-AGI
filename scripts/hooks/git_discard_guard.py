@@ -168,7 +168,9 @@ _DEGRADED_GATED = r"\bclean\b|--recurse-submodules|submodule\.recurse"
 
 try:
     from shell_parse import (  # noqa: E402
-        _BLIND_STRUCTURAL,  # the one blind spot the hidden-verb refusal names
+        _BLIND_LOCALE_PROGRAM,  # named in the hidden-verb refusal's wording
+        _BLIND_LOCALE_SCRIPT,
+        _BLIND_STRUCTURAL,  # named in the hidden-verb refusal's wording
         analyze_checked,
         git_subcommand_index,
         has_trailing_override,
@@ -302,6 +304,14 @@ _STRUCTURAL_VERB_MSG = (
     "operation may discard uncommitted work, and the guard cannot check or snapshot "
     "an operation it cannot see. To proceed: {hint}; run the git command on its own, "
     "with its subcommand written out literally."
+)
+# The same refusal when the git program, or a shell's script, is written in bash
+# locale quoting: the parser's cause names the quoting and its hint the plain-quote
+# rewrite, as the push and commit guards' messages do.
+_LOCALE_VERB_MSG = (
+    "[git-discard-guard] BLOCKED: this command {cause}. A Git operation may discard "
+    "uncommitted work, and the guard cannot check or snapshot an operation it cannot "
+    "name. To proceed: {hint}."
 )
 # The submodule gate's word, case-folded: the config KEY is case-insensitive.
 _RECURSE_WORD = re.compile("recurse", re.IGNORECASE)
@@ -1855,6 +1865,8 @@ def main() -> int:
                 blind = _parse_once(cmd)[1]
                 if blind is _BLIND_STRUCTURAL:
                     message = _STRUCTURAL_VERB_MSG.format(cause=blind.cause, hint=blind.hint)
+                elif blind in (_BLIND_LOCALE_PROGRAM, _BLIND_LOCALE_SCRIPT):
+                    message = _LOCALE_VERB_MSG.format(cause=blind.cause, hint=blind.hint)
             with contextlib.suppress(OSError):
                 print(message, file=sys.stderr)
             if discarded_write is not None:

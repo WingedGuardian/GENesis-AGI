@@ -532,6 +532,16 @@ class Segment:
     #: See :func:`_verb_unresolved`. A guard must not read a False verdict off
     #: this segment's verb; :func:`analyze_checked` reports it as a blind spot.
     verb_unresolved: bool = False
+    #: The program this segment runs when its ``$"..."`` locale quoting is read as
+    #: plain double quotes, where that differs from ``exe``. A CANDIDATE, never the
+    #: executable: the shell may translate such a word before it runs. See
+    #: :func:`_locale_reading`.
+    locale_program: str = ""
+    #: The script this segment's shell runs when its ``$"..."`` locale quoting is
+    #: read as plain double quotes, where that differs from the script the parse
+    #: found (``sh -c $"git push"``, ``bash $"-c" '...'``). A CANDIDATE, never
+    #: parsed into segments of its own; see :func:`locale_candidates`.
+    locale_script: str = ""
 
 
 @dataclass
@@ -1570,7 +1580,7 @@ def has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
     return _has_trailing_override(seg, sigil)
 
 
-def _ansi_c_spans(text: str) -> list[tuple[int, int, str, bool]]:
+def _ansi_c_spans(text: str, _locale: list[int] | None = None) -> list[tuple[int, int, str, bool]]:
     """Locate bash ANSI-C ``$'...'`` quoting spans in SHELL-WORD context.
 
     Returns ``(start, end, content, has_escape)`` per span, where ``end`` is the
@@ -1598,10 +1608,16 @@ def _ansi_c_spans(text: str) -> list[tuple[int, int, str, bool]]:
     for the design choice, not a runtime invariant; the invariant is the
     dq/sq/backslash state machine below, which a security review verified against
     bash's own rules.
+
+    ``_locale``, when given, also collects the index of every ``$`` that opens bash
+    LOCALE quoting (``$"..."``) at word level, from this same walk and quote state
+    rather than a second model of them (see :func:`_locale_reading`). The spans
+    returned are the same with or without it.
     """
     spans: list[tuple[int, int, str, bool]] = []
     i, n = 0, len(text)
     in_sq = in_dq = False
+    expansion = -2  # the last word-level `$` that starts an expansion of its own
     while i < n:
         c = text[i]
         if in_sq:
@@ -1655,8 +1671,25 @@ def _ansi_c_spans(text: str) -> list[tuple[int, int, str, bool]]:
             in_sq = True
             i += 1
             continue
+        if c == "$":
+            # `$$` is the shell's pid parameter, so the second sign of a pair opens
+            # nothing (`$$"x"` is the pid, then plain quotes) and the sign after the
+            # pair starts afresh. One comparison per character: no rescan.
+            if expansion == i - 1:
+                expansion = -2
+            else:
+                expansion = i
+                if _locale is not None and text.startswith('"', i + 1):
+                    _locale.append(i)
         i += 1
     return spans
+
+
+def _locale_openers(text: str) -> list[int]:
+    """The index of every ``$`` in ``text`` that opens ``$"..."`` locale quoting."""
+    found: list[int] = []
+    _ansi_c_spans(text, found)
+    return found
 
 
 def _decode_escape_free_ansi_c(text: str) -> str:
@@ -2131,6 +2164,100 @@ _BLIND_UNCLASSIFIED_OPTION = BlindSpot(
         "it configures another way. If the option is legitimate and current, it "
         "belongs in the option tables in shell_parse (with the classification "
         "MEASURED against the installed binary, not read from help output)"
+    ),
+)
+
+#: A word that decides WHICH PROGRAM runs is written in bash's locale quoting,
+#: ``$"..."``. With no message catalog bash runs the text as written, and shlex,
+#: which knows no such form, keeps the ``$``: so the parse names a program one
+#: character off from the one bash runs, every gate looking for that program finds
+#: none, and nothing else reports it (the word tokenizes cleanly). The verb-position
+#: twin was already caught by :data:`_BLIND_UNRESOLVED_VERB`; this is the program.
+#:
+#: REPORTED, NOT DECODED. Reading the word as plain quotes is right only while no
+#: translation applies: bash looks the string up in a message catalog chosen by
+#: LC_MESSAGES, TEXTDOMAIN and TEXTDOMAINDIR, and ignores the dollar sign only in
+#: the C or POSIX locale or when it finds no translation (bash(1), QUOTING, read
+#: 2026-11-12). A decode would hand a hard policy verdict to a word that may not be
+#: the one that runs. The untranslated reading is kept on
+#: :attr:`Segment.locale_program` as a CANDIDATE, for a guard to test against its
+#: own gated programs.
+#:
+#: NOT the measured exception beside :data:`_ALL_BLIND_SPOTS` (a program named by a
+#: variable stays unreported): that one is ordinary work at volume, and this spelling
+#: is not. It fires only when removing the locale quoting CHANGES the program the
+#: wrapper walk resolves AND leaves a literal name, so ``$"..."`` in an argument, a
+#: wrapper's value or the directory part of a path reports nothing.
+#:
+#: ``bounds_induced`` is False for the reason given at :data:`_BLIND_UNRESOLVED_VERB`:
+#: no bound fired and the segments are complete.
+#:
+#: RESIDUAL, stated so it is not read as coverage: this cause reads the words that
+#: choose the PROGRAM, :data:`_BLIND_UNRESOLVED_VERB` the words that choose the
+#: operation, and :data:`_BLIND_LOCALE_SCRIPT` the ``-c`` and script operand of a
+#: shell in ``_NESTED``. Any other locale-quoted option or operand is reported by
+#: none of them; see the residual list at :data:`_BLIND_LOCALE_SCRIPT`.
+_BLIND_LOCALE_PROGRAM = BlindSpot(
+    bounds_induced=False,
+    cause=(
+        'uses $"..." locale quoting in the words that decide which program runs; '
+        "the shell may translate such a word before it runs, so the guard cannot "
+        "establish which program that is"
+    ),
+    hint=(
+        "write the program name, and any wrapper or option before it, plainly (no "
+        'quotes, or plain quotes); $"..." belongs in a message argument'
+    ),
+)
+
+#: The same quoting one level down: a shell (``_NESTED``) handed the SCRIPT it runs
+#: in ``$"..."``, or the ``-c`` that selects the script written that way
+#: (``sh -c $"git push"``, ``bash $"-c" 'git push'``). shlex keeps the dollar sign,
+#: so the parse reads the script as ``$git push``, a program held in a variable,
+#: which is deliberately unreported (beside :data:`_ALL_BLIND_SPOTS`), or finds no
+#: ``-c`` and no script at all. Bash, with no catalog, runs the plain text, and the
+#: plain spelling of the same command was refused while this one was allowed.
+#:
+#: REPORTED, NOT DECODED, for the reason at :data:`_BLIND_LOCALE_PROGRAM`: a
+#: translation may change the script before the shell runs it. The untranslated
+#: reading is kept on :attr:`Segment.locale_script` as a CANDIDATE and is never
+#: parsed into segments; :func:`locale_candidates` names the dispatchers it mentions
+#: (a mention scan, refusal-only), which is how the push, commit and discard guards
+#: refuse it. It fires only when the plain reading of the segment, through the same
+#: wrapper walk and the same ``_nested_script``, finds a script that differs from
+#: the one the parse found, so locale quoting INSIDE a plain-quoted script, or in a
+#: shell's ``$0`` or positional arguments, reports nothing.
+#:
+#: Below :data:`_BLIND_LOCALE_PROGRAM`, so a command whose program word is also
+#: locale-quoted keeps that cause and its hint; fixing the program word then
+#: leaves this one to report.
+#:
+#: Both causes are also read inside a body the parse rebuilds from tokens (a
+#: ``case`` arm, a function body, ``coproc``): see :func:`_plain_reading`.
+#:
+#: RESIDUAL, stated so it is not read as coverage. Not read: a locale-quoted
+#: payload of any launcher outside ``_NESTED``, which is answered as its plain
+#: spelling is (the ``_REPARSE_CARRIERS`` such as ``eval`` and ``su`` by the push
+#: guard's carrier net on a gated mention; not at all for the launchers whose
+#: plain payload this parse does not read either: a here-string or pipe into a
+#: shell, ``busybox sh -c``, ``find -exec``, ``parallel``, ``taskset``, ``ssh``,
+#: ``trap``, ``at``, ``$SHELL -c``, a script passed as a positional argument or
+#: built by a substitution, a program named by a variable), and a locale-quoted
+#: option or operand of any other program. A guard that does not read blind spots
+#: (the full-suite, worktree-removal, PR-open and issue-create guards) is not
+#: changed by either cause. A guard whose business is not git or gh sees only this cause,
+#: not what the candidate script runs, since the candidate is mention-scanned for
+#: the dispatchers and nothing else.
+_BLIND_LOCALE_SCRIPT = BlindSpot(
+    bounds_induced=False,
+    cause=(
+        'passes a shell its script, or the -c that selects it, in $"..." locale '
+        "quoting; the shell may translate that text before it runs it, so the "
+        "guard cannot establish what the script runs"
+    ),
+    hint=(
+        "write the -c option plainly and the script in plain quotes (single or "
+        'double); $"..." belongs in a message argument'
     ),
 )
 
@@ -2984,6 +3111,25 @@ _STRUCTURAL_DISPATCHERS = (
 )
 
 
+def locale_candidates(segment: Segment) -> frozenset[str]:
+    """The programs ``segment`` may run that only its ``$"..."`` reading names.
+
+    :attr:`Segment.locale_program` when set, plus each dispatcher in
+    ``_STRUCTURAL_DISPATCHERS`` that :attr:`Segment.locale_script` mentions. The
+    script is mention-scanned, never parsed: the result can only ADD a refusal, for
+    a guard to intersect with its own gated programs. Empty for every segment with
+    no locale quoting in the words that choose its program or script.
+    """
+    found = {segment.locale_program} if segment.locale_program else set()
+    if segment.locale_script:
+        found.update(
+            program
+            for program, pattern in _STRUCTURAL_DISPATCHERS
+            if mentions(segment.locale_script, pattern)
+        )
+    return frozenset(found)
+
+
 def unresolved_verb_programs(command: str) -> frozenset[str]:
     """The programs whose operation is unresolved, plus structural candidates.
 
@@ -3014,6 +3160,10 @@ def unresolved_verb_programs(command: str) -> frozenset[str]:
             for segment in result.segments
             if _dispatcher_verb_unresolved(segment)
         )
+        # A locale-quoted program word, or a shell script in that quoting, leaves
+        # the operation just as unestablished.
+        for segment in result.segments:
+            programs.update(locale_candidates(segment))
         if result.structural_incomplete:
             for program, pattern in _STRUCTURAL_DISPATCHERS:
                 if mentions(result.decision_text, pattern):
@@ -3046,6 +3196,10 @@ def unresolved_verb_programs(command: str) -> frozenset[str]:
 #: 200-odd extra prompts alone would also put the change an order of magnitude past
 #: the cost the narrow rule pays.
 #:
+#: (That guard defect has since been fixed: `protected_paths_guard` now runs its
+#: substring fallback in ADDITION to the segment scan, so a new non-bounds cause can
+#: only add a refusal there. The volume argument above is unchanged by that.)
+#:
 #: The residual that leaves, stated so it is not mistaken for coverage: a command
 #: that names its program with a variable is read exactly as it is today, whether or
 #: not it spells the operation. Closing it needs a way to tell such a command apart
@@ -3068,6 +3222,8 @@ _ALL_BLIND_SPOTS = (
     _BLIND_OVER_LONG,
     _BLIND_UNRESOLVED_VERB,
     _BLIND_UNCLASSIFIED_OPTION,
+    _BLIND_LOCALE_PROGRAM,
+    _BLIND_LOCALE_SCRIPT,
     _BLIND_CONTINUATION,
     _BLIND_BUILT_ESCAPE,
     _BLIND_BASH53_SUBSTITUTION,
@@ -3194,7 +3350,8 @@ def analyze_checked(command: str, *, _policy=None) -> tuple[list[Segment], Blind
     cause and hint it had, so the rule can only add net coverage and can never
     reword or re-rank an existing refusal. It also makes the change measurable — the
     flips it causes are exactly the commands moving from "clean parse" to "blind",
-    with nothing else shifting underneath them.
+    with nothing else shifting underneath them. :data:`_BLIND_LOCALE_PROGRAM` and
+    :data:`_BLIND_LOCALE_SCRIPT` sit below it, on the same reasoning.
     """
     result = _analyze_bounded(command, _policy=_policy)
     if result.diagnostic is not None and result.diagnostic.bounds_induced:
@@ -4662,6 +4819,96 @@ def _dispatcher_verb_unresolved(seg: Segment) -> bool:
     return bool(seg.verb_unresolved and seg.argv and _basename(seg.argv[0]) in _VERB_DISPATCHERS)
 
 
+def _locale_reading(
+    src: str, tokens: list[str], argv: list[str], carried_open: int, env_depth: int
+) -> tuple[str, str]:
+    """``(program, script)``: what ``src`` runs with its ``$"..."`` locale quoting
+    read as plain double quotes, where that differs from what ``argv`` resolved.
+
+    ``program`` is the literal name that reading runs when it is not the one
+    ``argv`` resolved; ``script`` is the script that reading hands a shell in
+    ``_NESTED`` when it is not the one the parse found (a locale-quoted script, or a
+    locale-quoted ``-c``). Each is ``""`` otherwise, which is the common answer:
+    locale quoting in an argument, a wrapper's value, the directory part of a path,
+    inside a plain-quoted script or in a shell's positional arguments leaves both
+    where they were. The comparison is between two runs of the SAME wrapper walk and
+    the same ``_nested_script`` rather than a test of ``argv[0]``, so a locale-quoted
+    wrapper word or wrapper option, which moves the walk onto a different program,
+    is seen too.
+
+    Both are candidates only (see :data:`_BLIND_LOCALE_PROGRAM` and
+    :data:`_BLIND_LOCALE_SCRIPT`): nothing here feeds ``exe`` or ``argv``, and the
+    script is never parsed. A second reading that still names its program with an
+    expansion gives no ``program`` and stays the unreported half described beside
+    :data:`_ALL_BLIND_SPOTS`.
+
+    A body the parse rebuilds from tokens (a case arm, a function body, a
+    ``coproc`` command: :func:`_embedded_commands`) is read the same way, one level
+    down: the tokens it is rebuilt from have already lost the quoting, so the inner
+    parse can never see it, and the segment itself resolves to the construct. The
+    plain reading's body is compared with the parse's body through the same walk,
+    and what it runs is this segment's candidate. ``tokens`` is the segment's own
+    tokenization, the one the parse rebuilds its body from.
+
+    COST: one walk for the openers, one join, one more tokenization and wrapper walk
+    of this segment, and two ``_nested_script`` walks of an argv, whatever the number
+    of openers; for a rebuilt body, the same again per level, at most
+    ``MAX_SUBSTITUTION_DEPTH`` levels, the bound the parse itself descends to.
+    Linear in the segment, and the caller skips it for a segment with no ``$"`` in
+    it. Nothing here loops over the openers to re-read the text.
+    """
+    openers = _locale_openers(src)
+    if not openers:
+        return "", ""
+    plain = "".join(
+        src[a + 1 : b] for a, b in zip([-1, *openers], [*openers, len(src)], strict=True)
+    )
+    return _plain_reading(_argv(plain), tokens, argv, carried_open, env_depth, 0)
+
+
+def _plain_reading(
+    plain_tokens: list[str],
+    tokens: list[str],
+    argv: list[str],
+    carried_open: int,
+    env_depth: int,
+    level: int,
+) -> tuple[str, str]:
+    """:func:`_locale_reading` for an already plain tokenization ``plain_tokens``,
+    against the parse's ``tokens`` and the ``argv`` it resolved them to."""
+    if level < MAX_SUBSTITUTION_DEPTH:
+        # A rebuilt body first: the segment itself resolves to the construct
+        # (`case`, `f()`, `coproc`), which the plain reading leaves where it was.
+        rebuilt = _embedded_commands(tokens)
+        for k, body in enumerate(_embedded_commands(plain_tokens)):
+            parsed = rebuilt[k] if k < len(rebuilt) else ""
+            if body == parsed:
+                continue
+            inner = _argv(parsed) if parsed else []
+            found = _plain_reading(
+                _argv(body),
+                inner,
+                _strip_wrappers(inner, 0, _env=_EnvSplitState(depth=env_depth)),
+                0,
+                env_depth,
+                level + 1,
+            )
+            if found != ("", ""):
+                return found
+    words = _strip_wrappers(plain_tokens, carried_open, _env=_EnvSplitState(depth=env_depth))
+    name = _basename(words[0]) if words else ""
+    resolved = _basename(argv[0]) if argv else ""
+    program = name
+    if not name or not _word_is_literal(name) or name == resolved:
+        program = ""
+    script = ""
+    if name in _NESTED:
+        script = _nested_script(words, name)
+        if script and resolved in _NESTED and script == _nested_script(argv, resolved):
+            script = ""
+    return program, script
+
+
 def analyze(command: str) -> list[Segment]:
     """Parse a Bash command into executed Segments (nested scripts flattened).
 
@@ -4828,6 +5075,12 @@ def _analyze_bounded(
             if not in_body and _segment_unproven(raw, escapes_modelled):
                 boundary_unproven = True
         truncated = truncated or env_state.exhausted
+        # Before `carried_open` moves on: the second reading walks the same wrappers.
+        locale_program, locale_script = (
+            _locale_reading(seg.argv_src, tokens, argv, carried_open, _depth + _env_depth)
+            if '$"' in seg.argv_src
+            else ("", "")
+        )
         carried_open = max(0, carried_open + _net_subshell_depth(seg.argv_src))
         exe = _basename(argv[0]) if argv else ""
         out.append(
@@ -4838,6 +5091,8 @@ def _analyze_bounded(
                 raw=raw,
                 redirects=list(seg.redirects),
                 verb_unresolved=_verb_unresolved(argv),
+                locale_program=locale_program,
+                locale_script=locale_script,
             )
         )
         begin, end = next(visible_ranges)
@@ -4942,6 +5197,8 @@ def _analyze_bounded(
                         depth=inner_segment.depth + 1,
                         redirects=inner_segment.redirects,
                         verb_unresolved=inner_segment.verb_unresolved,
+                        locale_program=inner_segment.locale_program,
+                        locale_script=inner_segment.locale_script,
                     )
                 )
     # No length re-check here: at depth 0 the over-long raw command returned
@@ -4967,6 +5224,11 @@ def _analyze_bounded(
         diagnostic = _BLIND_UNCLASSIFIED_OPTION
     elif hidden:
         diagnostic = _BLIND_UNRESOLVED_VERB
+    elif any(segment.locale_program for segment in out):
+        # Below every other cause, so a command that already had one keeps it.
+        diagnostic = _BLIND_LOCALE_PROGRAM
+    elif any(segment.locale_script for segment in out):
+        diagnostic = _BLIND_LOCALE_SCRIPT
     else:
         diagnostic = None
     # An unproven boundary withholds the parse, but only where nothing above already
@@ -4975,7 +5237,16 @@ def _analyze_bounded(
     if (
         _depth == 0
         and boundary_unproven
-        and (diagnostic is None or diagnostic in (_BLIND_UNRESOLVED_VERB, _BLIND_UNCLASSIFIED_OPTION))
+        and (
+            diagnostic is None
+            or diagnostic
+            in (
+                _BLIND_UNRESOLVED_VERB,
+                _BLIND_UNCLASSIFIED_OPTION,
+                _BLIND_LOCALE_PROGRAM,
+                _BLIND_LOCALE_SCRIPT,
+            )
+        )
     ):
         diagnostic = _BLIND_STRUCTURAL
         structural_incomplete = True
