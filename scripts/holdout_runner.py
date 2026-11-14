@@ -611,19 +611,86 @@ def _ref_repo(ref: dict) -> str:
     return f"{owner}/{name}" if owner and name else ""
 
 
+# While not None, the SIGTERM/SIGHUP handler records the signal here instead of
+# raising; see ``_Worktree.__enter__``.
+_deferred: list[int] | None = None
+
+
 class _Worktree:
-    """A detached worktree at ``sha``, removed by its exact path on exit."""
+    """A detached worktree at ``sha``, removed by its exact path on exit.
+
+    ``git worktree add`` registers the worktree LOCKED ("initializing") and
+    unlocks it only when the checkout finishes, and ``git worktree prune``
+    never drops a locked entry. So when the add itself is interrupted (a
+    SIGTERM or SIGHUP turned into ``SystemExit``, or the timeout), the
+    half-made worktree is discarded here before the exception propagates:
+    ``__exit__`` does not run for an ``__enter__`` that raised. git runs the
+    checkout in a child process, so the add runs in its own process group and
+    the whole group is killed first; killing only git left its checkout
+    writing into the tree after it was deleted. Removal uses ``--force``
+    twice, which git needs to remove a locked worktree.
+    """
 
     def __init__(self, root: Path, sha: str, holder: Path, name: str) -> None:
         self.root, self.sha, self.path = root, sha, holder / name
 
     def __enter__(self) -> Path:
-        _git(self.root, "worktree", "add", "--detach", "--quiet", str(self.path), self.sha)
+        args = ("worktree", "add", "--detach", "--quiet", str(self.path), self.sha)
+        # A signal that arrived while Popen was still starting git would raise
+        # before ``proc`` exists, leaving git running with nothing to kill it.
+        # So for the Popen call the handler only records the signal, and it is
+        # raised as the first step inside the try below, where the cleanup can
+        # act on it. This is done in the handler, not with a signal mask: a
+        # mask covers one thread, and the kernel delivers a process-wide
+        # signal to any thread that does not block it.
+        global _deferred
+        pending: list[int] = []
+        _deferred = pending
+        try:
+            proc = subprocess.Popen(
+                ["git", "-C", str(self.root), *args],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                encoding="utf-8",
+                errors="surrogateescape",
+                start_new_session=True,  # its own process group, killed whole below
+            )
+        except BaseException:
+            if pending:  # no git to clean up; the signal still ends the run
+                raise SystemExit(128 + pending[0]) from None
+            raise
+        finally:
+            _deferred = None
+        try:
+            if pending:
+                raise SystemExit(128 + pending[0])
+            _, err = proc.communicate(timeout=GIT_TIMEOUT_S)
+        except BaseException as exc:
+            _kill_group(proc)
+            self._discard()
+            if isinstance(exc, subprocess.TimeoutExpired):
+                raise RunnerError(f"git {' '.join(args)} timed out after {GIT_TIMEOUT_S}s") from exc
+            raise
+        if proc.returncode != 0:
+            self._discard()
+            raise RunnerError(f"git {' '.join(args)} failed: {err.strip()}")
         return self.path
 
     def __exit__(self, *exc: object) -> None:
+        self._discard()
+
+    def _discard(self) -> None:
         subprocess.run(
-            ["git", "-C", str(self.root), "worktree", "remove", "--force", str(self.path)],
+            [
+                "git",
+                "-C",
+                str(self.root),
+                "worktree",
+                "remove",
+                "--force",
+                "--force",
+                str(self.path),
+            ],
             capture_output=True,
             check=False,
         )
@@ -1065,6 +1132,9 @@ def _signals_exit():
     """
 
     def _exit(signum: int, _frame: object) -> None:
+        if _deferred is not None:
+            _deferred.append(signum)
+            return
         raise SystemExit(128 + signum)
 
     previous = {}

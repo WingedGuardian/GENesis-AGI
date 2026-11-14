@@ -170,6 +170,13 @@ def _conflict(db, row, raw):
     return "conflict"
 
 
+def _launch_held(db, value, row, *, fresh_cleanup=None):
+    if row["nonce_origin"] == "selected-recovery":
+        raise ValueError("selected execution support is not installed")
+    return blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"],
+                   fresh_cleanup=fresh_cleanup)
+
+
 @recovery.safety_transition
 def reserve(db, value, data, legs, *, fresh_cleanup=None):
     row = execution(db, value, legs)
@@ -181,7 +188,7 @@ def reserve(db, value, data, legs, *, fresh_cleanup=None):
     if row["typed_applied_state"] is not None or row["launch_permission"] == "cancelled":
         return "cancelled"
     _owns(db, row)
-    if blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"], fresh_cleanup=fresh_cleanup):
+    if _launch_held(db, value, row, fresh_cleanup=fresh_cleanup):
         return "held"
     if ("fast", "moderate", "full").index(data["run_mode"]) < legs.MODES.index(row["mode"]):
         raise ValueError("reservation cannot narrow the claimed workload")
@@ -241,7 +248,7 @@ def register(db, value, data, legs, proof, *, fresh_cleanup=None):
     raw = encode(data)
     if row["scope_registration"] is not None:
         return "already_registered" if bytes(row["scope_registration"]) == raw else _conflict(db, row, raw)
-    if blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"], fresh_cleanup=fresh_cleanup):
+    if _launch_held(db, value, row, fresh_cleanup=fresh_cleanup):
         return "held"
     db.execute("UPDATE executions SET scope_registration=? WHERE execution_seq=?", (raw, row["execution_seq"]))
     return "registered"
@@ -275,7 +282,7 @@ def begin(db, value, data, legs, proof, *, fresh_cleanup=None):
         db.execute("UPDATE executions SET safety_kind='resource',first_typed_conflict="
                    "coalesce(first_typed_conflict,?) WHERE execution_seq=?", (raw, row["execution_seq"]))
         return "resource"  # Preparation OOM is durable; no indexing intent/debt is fabricated.
-    if blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"], fresh_cleanup=fresh_cleanup):
+    if _launch_held(db, value, row, fresh_cleanup=fresh_cleanup):
         return "held"
     db.execute("UPDATE executions SET native_intent=?,launch_permission='spent' WHERE execution_seq=?",
                (raw, row["execution_seq"]))
@@ -651,6 +658,7 @@ def apply(db, value, legs, *, fresh_cleanup=None):
             return None  # A live/may-start owner is not an inferred failed run.
         completion, safety = _classification(row)
         _owns(db, row)
+        increment = False
         if completion == "success":
             state, disposition, charged = "consumed", "consumed", row["attempts"]
             reserved = json.loads(row["launch_reservation"])
@@ -664,11 +672,23 @@ def apply(db, value, legs, *, fresh_cleanup=None):
             if backoff:
                 db.execute("UPDATE repo_state SET full_backoff=? WHERE hash=?",
                            (_receipt_time(json.loads(row["terminal"])["recorded_at"]), row["hash"]))
-            state, disposition, charged = legs._restore(db, row, completion != "unstarted" and not backoff)
+            increment = completion != "unstarted" and not backoff
+        selected = None
+        if row["nonce_origin"] == "selected-recovery":
+            from _genesis_index_marker_retry import settle_selected
+
+            selected = settle_selected(db, row, sys.modules[__name__],
+                                       completion=completion, safety=safety, increment=increment)
+        if selected is not None:
+            state, disposition, charged, safety = selected
+        elif completion != "success":
+            state, disposition, charged = legs._restore(db, row, increment)
         db.execute("UPDATE executions SET typed_applied_state=?,disposition=?,typed_charged_attempts=?,"
                    "completion_kind=?,safety_kind=? WHERE execution_seq=?",
                    (state, disposition, charged, completion, safety, row["execution_seq"]))
-        row = execution(db, value, legs)
+        before, row = row, execution(db, value, legs)
+        if selected is not None:
+            recovery.note_transition(db, before, row)
     if _ownership_clear(row, fresh_cleanup):
         db.execute("DELETE FROM inflight WHERE hash=? AND execution_seq=? AND claim_id=?",
                    (row["hash"], row["execution_seq"], row["claim_id"]))
@@ -798,14 +818,24 @@ def reconcile_execution(db, value, legs, *, fresh_cleanup=None):
     if row["launch_reservation"] is not None and row["launch_permission"] != "cancelled":
         return False  # Reservation/intent recovery requires its bound facts.
     _owns(db, row)
-    state, disposition, charged = legs._restore(db, row, False)
+    safety = row["safety_kind"] or ("uncertainty" if row["scope_registration"] else None)
+    selected = None
+    if row["nonce_origin"] == "selected-recovery":
+        from _genesis_index_marker_retry import settle_selected
+
+        selected = settle_selected(db, row, sys.modules[__name__],
+                                   completion="unstarted", safety=safety, increment=False)
+    if selected is None:
+        state, disposition, charged = legs._restore(db, row, False)
+    else:
+        state, disposition, charged, safety = selected
     if not recovery.control_pending(row) and (row["scope_registration"] is None or _ownership_clear(row, fresh_cleanup)):
         _finish_pointer(db, row)
     before = execution(db, value, legs)  # Fresh-cleanup callbacks may already have retained safety.
     db.execute(
         "UPDATE executions SET completion_kind='unstarted',typed_applied_state=?,"
         "disposition=?,typed_charged_attempts=?,safety_kind=coalesce(safety_kind,?) WHERE execution_seq=?",
-        (state, disposition, charged, "uncertainty" if row["scope_registration"] else None, row["execution_seq"]),
+        (state, disposition, charged, safety, row["execution_seq"]),
     )
     recovery.note_transition(db, before, execution(db, value, legs))
     return True
