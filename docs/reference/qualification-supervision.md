@@ -51,6 +51,17 @@ source, PID, cgroup, start/exit and effective properties; a launcher returning
 success is not a completion receipt. Keep secrets out of command-line and
 metadata records. Use the approved existing credential-selection path.
 
+Budget file descriptors before launch: journal and frozen-input readers retain
+them. Include the complete history/owner/input census, `max_new_attempts` and
+measured runtime headroom. Set the transient unit's `LimitNOFILE=soft:hard`
+within the user manager's existing hard limit, then verify
+`resource.getrlimit(resource.RLIMIT_NOFILE)` in the actual service child and
+exercise harmless high-descriptor event-loop I/O. A scope inherits its caller's
+limits; a service applies manager defaults, so a successful scope run does not
+establish service capacity. Do not change persistent manager limits. See
+[systemd-run](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html)
+and [systemd.exec](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html).
+
 Leave the plan-bound `study_root` absent for the controller to create exclusively.
 Put outer launch metadata beside the study evidence, not in a precreated study
 directory. An existing root or partial generation prevents relaunch. Confirm

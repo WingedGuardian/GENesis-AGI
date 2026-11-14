@@ -80,6 +80,8 @@ request evidence. Follow normal resource admission and record the effective
 service properties; do not copy a backup-only runtime limit into a potentially
 long study. Use one SDK interpreter within the resource envelope: keeping an
 SDK-loaded preparation parent beside a second CLI can exceed the whole-job cap.
+Budget and verify the service's file-descriptor allowance for all bound journals
+and maximum new attempts; scope inheritance does not establish service capacity.
 
 ## Report the measured result and close the evidence
 
