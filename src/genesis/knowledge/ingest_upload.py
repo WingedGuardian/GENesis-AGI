@@ -76,6 +76,7 @@ async def run_ingest(
     filename = upload["filename"]
 
     try:
+        incomplete: str | None = None
         if mode == "store":
             unit_ids = await _store_as_is(
                 file_path, filename,
@@ -85,7 +86,7 @@ async def run_ingest(
                 context=context,
             )
         else:
-            unit_ids = await _extract_with_pipeline(
+            unit_ids, incomplete = await _extract_with_pipeline(
                 upload_id, file_path,
                 project_type=project_type,
                 domain=domain,
@@ -96,10 +97,13 @@ async def run_ingest(
         # Move file to completed directory
         _move_to_completed(file_path, upload_id)
 
+        # The stored units are kept and reported; what could not be stored is
+        # said in error_message, never dropped behind a plain success.
         await knowledge_uploads.update_status(
             rt.db, upload_id,
             status="completed",
             unit_ids=unit_ids,
+            error_message=incomplete,
         )
 
         logger.info(
@@ -210,7 +214,9 @@ async def _store_as_is(
             domain=effective_domain,
             authority="curated",
             provenance={"source_doc": file_path, "source_pipeline": "curated"},
-            concept=filename[:200],
+            # The WHOLE file name: the chokepoint masks a secret in it before
+            # its own cap, so a cut here could leave part of one unmasked.
+            concept=filename,
             tags_json=json.dumps(tags),
             purpose=purpose,
             ingestion_source=file_path,
@@ -269,8 +275,9 @@ async def _extract_with_pipeline(
     domain: str,
     purpose: list[str] | None,
     context: str,
-) -> list[str]:
-    """Run the full extraction pipeline with context injection."""
+) -> tuple[list[str], str | None]:
+    """Run the full extraction pipeline with context injection: (the unit ids,
+    why the ingest is incomplete or None)."""
     from genesis.db.crud import knowledge_uploads
     from genesis.mcp.memory.knowledge import _get_orchestrator
     from genesis.runtime import GenesisRuntime
@@ -300,7 +307,18 @@ async def _extract_with_pipeline(
     if result.error:
         raise RuntimeError(result.error)
 
-    return result.unit_ids
+    from genesis.knowledge.orchestrator import CREDENTIAL_NOT_STORED
+
+    missing = [f for f in result.quality_flags if f.startswith(CREDENTIAL_NOT_STORED)]
+    incomplete = None
+    if missing:
+        reasons = ", ".join(sorted({f[len(CREDENTIAL_NOT_STORED):] for f in missing}))
+        incomplete = (
+            f"Ingest incomplete: {len(missing)} credential unit(s) could not be stored "
+            f"({reasons}); the other units were stored."
+        )
+        logger.warning("Upload %s ingested incomplete: %s", upload_id, incomplete)
+    return result.unit_ids, incomplete
 
 
 def _move_to_completed(file_path: str, upload_id: str) -> str:

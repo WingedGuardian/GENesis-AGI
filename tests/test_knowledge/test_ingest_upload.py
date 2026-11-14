@@ -197,3 +197,30 @@ async def test_store_as_is_scan_failure_is_fail_open(tmp_path):
         )
 
     assert len(unit_ids) == 1
+
+
+async def test_run_ingest_reports_an_incomplete_credential_store(db, upload_id):
+    """A credential unit the document could not store is never reported as a
+    silent success: the upload is completed with the units that were stored,
+    and its error_message says what is missing (by reason only)."""
+    from genesis.knowledge.ingest_upload import run_ingest
+
+    result = FakeIngestResult(
+        unit_ids=["u1"], quality_flags=["credential_unit_not_stored:RuntimeError"],
+    )
+    mock_orchestrator = MagicMock()
+    mock_orchestrator.ingest_source = AsyncMock(return_value=result)
+    mock_rt = MagicMock()
+    mock_rt.db = db
+
+    with (
+        patch("genesis.runtime.GenesisRuntime.instance", return_value=mock_rt),
+        patch("genesis.mcp.memory.knowledge._get_orchestrator", return_value=mock_orchestrator),
+        patch("genesis.knowledge.ingest_upload._move_to_completed"),
+    ):
+        await run_ingest(upload_id, project_type="pro", domain="test")
+
+    row = await knowledge_uploads.get(db, upload_id)
+    assert row["status"] == "completed" and "u1" in row["unit_ids"]
+    assert "incomplete" in (row["error_message"] or "")
+    assert "1 credential" in row["error_message"]

@@ -264,10 +264,12 @@ async def test_a_credential_without_an_identifier_gets_a_minted_key(db):
     assert await kc.get_reference_secret(db, units[1]) == "password: Beta!Fake2"
 
 
+@pytest.mark.xfail(strict=True, reason="fixed by the credential move PR")
 async def test_a_placeholder_re_ingest_whose_identifier_carries_the_stored_value_moves_to_a_masked_key(db):
     """A key written before this rule (directly, so its identifier carries the
-    value): a placeholder re-ingest is stored under the masked identifier with
-    the stored value carried over, and the old entry keeps its secret."""
+    value): a placeholder re-ingest moves that SAME row to the masked
+    identifier (audit 2: an untagged entry whose key spells a current secret is
+    re-keyed, never left beside a second entry), its stored value kept."""
     legacy = "router Kept!Fake5"
     unit, _ = await kc.upsert(
         db, project_type="reference", domain="reference.credentials", source_doc="x",
@@ -277,6 +279,6 @@ async def test_a_placeholder_re_ingest_whose_identifier_carries_the_stored_value
     moved = await _ingest(
         db, _PointStore(), _body("Example router", ro.SECRET_PLACEHOLDER), concept=legacy,
     )
-    assert moved != unit and (await kc.get(db, moved))["concept"].startswith("router [held] #")
+    assert moved == unit and (await kc.get(db, moved))["concept"].startswith("router [held] #")
     assert await kc.get_reference_secret(db, moved) == "password: Kept!Fake5"
-    assert await kc.get_reference_secret(db, unit) == "password: Kept!Fake5"
+    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 1

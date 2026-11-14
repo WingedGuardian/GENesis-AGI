@@ -8,6 +8,7 @@ import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import NamedTuple
 
 import aiosqlite
 
@@ -189,59 +190,106 @@ async def check_credential_write(
     return existing[0] if existing else None
 
 
+#: The key of a credential's held meta that records what the write knew of the
+#: entry's identity (#2426): ``origin`` and ``masked_spans``. Held, never
+#: indexed, and left out of what a reveal returns as the caller's metadata.
+IDENTITY_META = "_identity"
+#: ``origin`` of a write a user made (reference_store, the MCP tools, the
+#: dashboard, the extraction job), and of one from a source that must never
+#: replace a stored credential (``ingest_untrusted_credential``, insert-only).
+TRUSTED = "trusted"
+UNTRUSTED = "untrusted"
+
+
+class MaskedEntry(NamedTuple):
+    """A credential stored under a tagged key (``"... #xxxxxx"``), with what
+    its held meta records of its identity."""
+
+    id: str
+    concept: str
+    value: str
+    detail: str | None
+    #: The full identifier as given, flattened (None: not recorded).
+    given: str | None
+    #: TRUSTED, UNTRUSTED, or None for an entry written before origin was recorded.
+    origin: str | None
+    #: Every span the identifier's mask has replaced, across its rotations
+    #: (None: not recorded, a legacy entry).
+    masked_spans: tuple[str, ...] | None
+
+    @property
+    def trusted(self) -> bool:
+        """A legacy entry (no origin recorded) counts as trusted."""
+        return self.origin != UNTRUSTED
+
+
+def _meta_fields(meta: str | None) -> tuple[str | None, str | None, tuple[str, ...] | None]:
+    """(given identifier flattened, origin, masked spans) a secret row's meta records."""
+    try:
+        data = json.loads(meta) if meta else None
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return None, None, None
+    given = data.get("identifier")
+    given = " ".join(given.splitlines()) if isinstance(given, str) else None
+    identity = data.get(IDENTITY_META)
+    identity = identity if isinstance(identity, dict) else {}
+    origin = identity.get("origin") if isinstance(identity.get("origin"), str) else None
+    spans = identity.get("masked_spans")
+    spans = tuple(x for x in spans if isinstance(x, str)) if isinstance(spans, list) else None
+    return given, origin, spans
+
+
 async def find_masked_key(
     db: aiosqlite.Connection, *, project_type: str, domain: str, base: str,
-    identifier: str | None = None,
+    trusted_only: bool = False,
 ) -> str | None:
     """The key ``"{base} #xxxxxx"`` (the tag ``ingest_knowledge_unit`` adds to
-    a masked identifier) of an existing credential, or None. The masked
+    a masked identifier) of an existing credential, or None; the one CREATED
+    first when several match (``k.rowid``, which an upsert keeps). The masked
     identifier is the entry's identity: a write under it updates that entry,
     with the same value or a rotated one (#2426, owner ruling).
 
-    ``identifier`` (an identifier that had to be cut): only an entry whose
-    held meta records this same full identifier (line breaks read as spaces)
-    matches, so two identifiers cut to the same text stay two entries. Only
+    ``trusted_only``: an entry an untrusted write made is never returned. Only
     rows sharing ``base`` are read."""
     project_type, domain = _canonical_key(project_type, domain)
     escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     rows = await db.execute_fetchall(
         "SELECT k.concept, s.meta FROM knowledge_units k LEFT JOIN reference_secrets s "
         "ON s.id = k.secret_ref WHERE k.project_type = ? AND k.domain = ? "
-        "AND k.concept LIKE ? ESCAPE '\\' ORDER BY k.ingested_at",
+        "AND k.concept LIKE ? ESCAPE '\\' ORDER BY k.rowid",
         (project_type, domain, escaped + " #%"),
     )
     tag = re.compile(re.escape(base) + r" #[0-9a-f]{6}")
     for concept, meta in rows:
         if not tag.fullmatch(concept):
             continue
-        if identifier is None or _meta_identifier(meta) == identifier:
+        if not (trusted_only and _meta_fields(meta)[1] == UNTRUSTED):
             return concept
     return None
 
 
-def _meta_identifier(meta: str | None) -> str | None:
-    """The full identifier a secret row's meta records, flattened."""
-    try:
-        given = json.loads(meta).get("identifier") if meta else None
-    except (ValueError, AttributeError):
-        return None
-    return " ".join(given.splitlines()) if isinstance(given, str) else None
-
-
 async def masked_key_rows(
     db: aiosqlite.Connection, *, project_type: str, domain: str,
-) -> list[tuple[str, str, str | None]]:
-    """(concept, value, detail) of every credential stored under a masked
-    identifier's key (``"... #xxxxxx"``, the tag ``ingest_knowledge_unit``
-    adds), for resolving which entry an identifier names."""
+) -> list[MaskedEntry]:
+    """Every credential stored under a tagged key (``"... #xxxxxx"``, the tag
+    ``ingest_knowledge_unit`` adds), in the order the entries were CREATED
+    (``k.rowid``: an upsert updates its row in place and keeps it, while
+    ``ingested_at`` is refreshed by every write), for resolving which entry an
+    identifier names."""
     project_type, domain = _canonical_key(project_type, domain)
     rows = await db.execute_fetchall(
-        "SELECT k.concept, s.value, s.detail FROM knowledge_units k JOIN reference_secrets s "
-        "ON s.id = k.secret_ref WHERE k.project_type = ? AND k.domain = ? AND k.concept LIKE '% #______'",
+        "SELECT k.id, k.concept, s.value, s.detail, s.meta FROM knowledge_units k JOIN reference_secrets s "
+        "ON s.id = k.secret_ref WHERE k.project_type = ? AND k.domain = ? AND k.concept LIKE '% #______' "
+        "ORDER BY k.rowid",
         (project_type, domain),
     )
     tagged = re.compile(r".* #[0-9a-f]{6}", re.DOTALL)
-    return [(r[0], r[1], r[2]) for r in rows if tagged.fullmatch(r[0])]
+    return [
+        MaskedEntry(r[0], r[1], r[2], r[3], *_meta_fields(r[4]))
+        for r in rows if tagged.fullmatch(r[1])
+    ]
 
 
 async def get_reference_pair(

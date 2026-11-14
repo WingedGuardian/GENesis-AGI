@@ -261,18 +261,25 @@ def _looks_ephemeral(content: str) -> bool:
     return bool(_EPHEMERAL_PATTERN.search(content))
 
 
-def _derive_identifier(extraction: Extraction, *, default_prefix: str) -> str:
+def _derive_identifier(
+    extraction: Extraction, *, default_prefix: str, whole_tokens: bool = False,
+) -> str:
     """Build a human-readable identifier for the entry.
 
     Preference order:
     1. First named entity from the extraction
     2. First 80 chars of content trimmed to a sentence
     3. Default prefix with a short hash of the content
+
+    ``whole_tokens`` (a credential): a cut never splits a whitespace token, so
+    no part of a secret survives it; the ingest chokepoint masks every whole
+    one it sees (#2426).
     """
+    cut = _cut_whole if whole_tokens else _cut_plain
     if extraction.entities:
         first = extraction.entities[0].strip()
         if first:
-            return first[:120]
+            return cut(first, 120)
     content = extraction.content.strip()
     if not content:
         return f"{default_prefix} (empty)"
@@ -282,7 +289,24 @@ def _derive_identifier(extraction: Extraction, *, default_prefix: str) -> str:
         if 0 < idx < 80:
             content = content[:idx]
             break
-    return content[:80].strip() or default_prefix
+    return cut(content, 80).strip() or default_prefix
+
+
+def _cut_plain(text: str, limit: int) -> str:
+    return text[:limit]
+
+
+def _cut_whole(text: str, limit: int) -> str:
+    """``text`` cut to at most ``limit`` characters at a whitespace boundary.
+    A first token longer than the limit is kept whole: the chokepoint masks it
+    and then caps it."""
+    if len(text) <= limit or text[limit].isspace():
+        return text[:limit]
+    at = max(text.rfind(sep, 0, limit) for sep in (" ", "\n", "\t"))
+    if at > 0 and text[:at].strip():
+        return text[:at]
+    end = min((i for i in (text.find(sep, limit) for sep in (" ", "\n", "\t")) if i != -1), default=len(text))
+    return text[:end]
 
 
 def _user_shared(token: str | None, user_text: str | None) -> bool:
@@ -340,7 +364,7 @@ def classify_as_reference(
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
-                    extraction, default_prefix="login",
+                    extraction, whole_tokens=True, default_prefix="login",
                 ),
                 "value": f"{user} / {password}",
                 "description": content,
@@ -359,7 +383,7 @@ def classify_as_reference(
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
-                    extraction, default_prefix="login",
+                    extraction, whole_tokens=True, default_prefix="login",
                 ),
                 "value": f"{email} / {password}",
                 "description": content,
@@ -378,7 +402,7 @@ def classify_as_reference(
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
-                    extraction, default_prefix="account",
+                    extraction, whole_tokens=True, default_prefix="account",
                 ),
                 "value": f"{account} / {password}",
                 "description": content,
@@ -396,7 +420,7 @@ def classify_as_reference(
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
-                    extraction, default_prefix="credential",
+                    extraction, whole_tokens=True, default_prefix="credential",
                 ),
                 "value": f"password: {password}",
                 "description": content,
@@ -411,7 +435,7 @@ def classify_as_reference(
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
-                    extraction, default_prefix="api_key",
+                    extraction, whole_tokens=True, default_prefix="api_key",
                 ),
                 "value": f"token: {tok_value}",
                 "description": content,
@@ -426,7 +450,7 @@ def classify_as_reference(
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
-                    extraction, default_prefix="token",
+                    extraction, whole_tokens=True, default_prefix="token",
                 ),
                 "value": f"token: {tok_value}",
                 "description": content,
@@ -446,7 +470,7 @@ def classify_as_reference(
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
-                    extraction, default_prefix=key,
+                    extraction, whole_tokens=True, default_prefix=key,
                 ),
                 "value": f"{key}={val}",
                 "description": content,

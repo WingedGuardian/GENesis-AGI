@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import aiosqlite
 import pytest
@@ -842,3 +842,437 @@ async def test_credential_units_are_stored_even_when_the_batch_teardown_fails(db
                                                    content=MagicMock(), purpose=None)
     assert len(closed.value.unit_ids) == 2
     assert await kc.get_reference_secret(db, closed.value.unit_ids[1]) == f"password {_SECRET}"
+
+
+# ─── Codex round 1 (#4416) ───────────────────────────────────────────────────
+
+
+async def _indexed_texts(db, store) -> list[str]:
+    """Every indexed surface of every unit: knowledge_units (all columns but the
+    secret_ref), knowledge_fts, and what the store was given (the vector payload
+    and its memory_fts row)."""
+    texts: list[str] = []
+    for row in await db.execute_fetchall("SELECT * FROM knowledge_units"):
+        texts += [str(v) for k, v in dict(row).items() if k != "secret_ref"]
+    for row in await db.execute_fetchall("SELECT concept, body, tags FROM knowledge_fts"):
+        texts += [str(v) for v in row]
+    texts += [json.dumps(call, default=str) for call in store.calls]
+    return texts
+
+
+async def test_an_upload_name_straddling_the_old_cut_is_masked_whole(db, memory_mcp, tmp_path):
+    """P1: the file name reaches the chokepoint whole, so a secret the 200-char
+    cut used to split is masked before any cap, never left as a prefix."""
+    from genesis.knowledge.ingest_upload import _store_as_is
+
+    secret = "ABCD1234EFGH5678IJKL"
+    name = "x" * 185 + " " + secret + ".txt"
+    upload = tmp_path / "creds.txt"
+    upload.write_text(f"password: {secret}")
+    ids = await _store_as_is(str(upload), name, project_type="reference",
+                             domain="reference.credentials", purpose=None, context="")
+    for text in await _indexed_texts(db, memory_mcp):
+        assert secret[:8] not in text, text
+    row = await kc.get(db, ids[0])
+    assert row["concept"].startswith("x" * 185 + " [held]")
+    assert (await ro.reveal_meta(db, row))["identifier"] == name
+
+
+async def test_an_extracted_identifier_cut_mid_secret_never_keeps_a_prefix(db):
+    """P1 (the same class in the extraction job): a derived identifier is never
+    cut through a token, so no part of a secret survives the cut unmasked."""
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import ingest_reference_from_extraction
+
+    secret = "ABCD1234EFGH5678IJKL"
+    content = "lab admin console " * 3 + f"password: {secret}"
+    assert content.index(secret) < 80 < content.index(secret) + len(secret)
+    store = _PointStore()
+    unit = await ingest_reference_from_extraction(
+        Extraction(content=content, extraction_type="entity", confidence=0.9),
+        store=store, db=db, user_text=content,
+    )
+    assert unit is not None
+    for text in await _indexed_texts(db, store):
+        assert secret[:8] not in text, text
+
+
+async def test_many_rotations_under_the_original_name_stay_one_entry(db):
+    """P2: the original identifier, held in meta, is the entry's identity, and
+    every secret it carried is masked, however many rotations ago it was the
+    value."""
+    store = _PointStore()
+    identifier = "db-Hunter2Pass9!"
+    values = ["Hunter2Pass9!", "Other8Pass7!", "Third9Pass6!", "Fourth5Pass4!"]
+    tags = json.dumps(["db", "old Hunter2Pass9!"])
+    units = [
+        await _ingest(db, store, _body(identifier, value=v), concept=identifier, tags_json=tags)
+        for v in values
+    ]
+    assert len(set(units)) == 1
+    rows = await db.execute_fetchall("SELECT concept FROM knowledge_units")
+    assert [r[0] for r in rows] == [units[0].concept]
+    assert await kc.get_reference_secret(db, units[0]) == values[-1]
+    for text in await _indexed_texts(db, store):
+        for value in values:
+            assert value not in text, text
+
+
+async def test_a_serialised_tag_list_never_spells_the_value(db):
+    """P2: json.dumps of the tags can complete a value the decoded tags do
+    not carry (a value with literal quotes); the serialised form is masked too,
+    and the tags as given stay in the held meta."""
+    store = _PointStore()
+    value = '"hunter"'
+    unit = await _ingest(db, store, _body(value=value, tags=["hunter", "lab"]), concept="lab wifi",
+                         tags_json=json.dumps(["hunter", "lab"]), held_value=value, held_detail=_DESC)
+    row = await kc.get(db, unit)
+    for text in await _indexed_texts(db, store):
+        assert value not in text, text
+    assert "lab" in json.loads(row["tags"])
+    assert (await ro.reveal_meta(db, row))["tags"] == ["hunter", "lab"]
+    assert await ro.reveal_reference(db, row) == (value, _DESC)
+
+
+async def test_a_distilled_concept_straddling_the_old_cut_is_masked_whole(db, memory_mcp, tmp_path, monkeypatch):
+    """P1 (the same class in distillation): a credential unit's concept reaches
+    the chokepoint whole; any other unit's is still capped at 200."""
+    import contextlib
+
+    from genesis.knowledge.distillation import DistillationPipeline
+    from genesis.knowledge.processors.base import ProcessedContent
+
+    @contextlib.asynccontextmanager
+    async def _own(_path):
+        yield db
+
+    monkeypatch.setattr("genesis.db.connection.get_raw_db", _own)
+    monkeypatch.setattr("genesis.mcp.memory_mcp.knowledge", kc)
+    await db.commit()
+    secret = "ABCD1234EFGH5678IJKL"
+    router = MagicMock()
+    router.route_call = AsyncMock(return_value=SimpleNamespace(success=True, content=json.dumps([
+        {"concept": "x" * 190 + " " + secret, "body": f"password: {secret}",
+         "domain": "reference.credentials", "confidence": 0.9},
+        {"concept": "y" * 300, "body": "The lab SSID is example-lab",
+         "domain": "reference.fact", "confidence": 0.9},
+    ])))
+    units = await DistillationPipeline(router=router).distill(
+        ProcessedContent(text="notes", source_type="text"), project_type="reference", domain="auto",
+    )
+    ids = await _orchestrator(tmp_path)._store_units(units, project_type="reference", source="doc.md",
+                                                     content=MagicMock(), purpose=None)
+    assert len(ids) == 2
+    for text in await _indexed_texts(db, memory_mcp):
+        assert secret[:8] not in text, text
+    concepts = {r[0] for r in await db.execute_fetchall("SELECT concept FROM knowledge_units")}
+    assert "y" * 200 in concepts
+
+
+# ─── audit of the round-1 fix (B1, B2, SF3, the serialised-tag cost) ─────────
+
+
+async def test_trusted_saves_never_alternate_onto_an_uploaded_entry(db, memory_mcp):
+    """B1: an upload recording the same identifier is never adopted; every
+    trusted save under it lands on the user's own entry, created first."""
+    from genesis.memory.knowledge_ingest import ingest_untrusted_credential
+
+    store = memory_mcp
+    ident = "vpn Aa11Bb22Cc33 login"
+    user = await _ingest(db, store, _body(ident, value="Aa11Bb22Cc33"), concept=ident)
+    upload = await ingest_untrusted_credential(
+        store=store, db=db, content="vpn login password Dd44Ee55Ff66 also Aa11Bb22Cc33",
+        project="reference", domain="reference.credentials", concept=ident,
+        collection="episodic_memory", memory_type="episodic",
+    )
+    assert upload != user
+    held_upload = await kc.get_reference_secret(db, upload)
+    for value in ["Gg77Hh88Ii99", "Jj00Kk11Ll22", "Mm33Nn44Oo55"]:
+        landed = await _ingest(db, store, _body(ident, value=value), concept=ident)
+        assert landed == user
+        assert await kc.get_reference_secret(db, user) == value
+        assert await kc.get_reference_secret(db, upload) == held_upload
+    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 2
+
+
+@pytest.mark.xfail(strict=True, reason="fixed by the credential move PR")
+async def test_a_rotation_to_a_value_the_key_spells_moves_the_same_row(db):
+    """B2: the entry's key spells the value it rotates to; the SAME row moves to
+    the key masked anew, and nothing live indexes either value."""
+    store = _PointStore()
+    ident = "router admin S1x9Qa7 backup S2y8Pb6"
+    first = await _ingest(db, store, _body(ident, value="S1x9Qa7"), concept=ident)
+    before = (await db.execute_fetchall("SELECT rowid, id FROM knowledge_units"))[0]
+    second = await _ingest(db, store, _body(ident, value="S2y8Pb6"), concept=ident)
+    assert first == second
+    assert second.concept.startswith("router admin [held] backup [held] #")
+    rows = await db.execute_fetchall("SELECT rowid, id, concept, body, tags FROM knowledge_units")
+    assert len(rows) == 1 and (rows[0][0], rows[0][1]) == (before[0], before[1])
+    assert rows[0][3].startswith(f"[reference.credentials] {second.concept}\n")
+    live = [str(v) for v in rows[0]] + list(store.points.values())
+    live += [str(v) for r in await db.execute_fetchall("SELECT concept, body, tags FROM knowledge_fts") for v in r]
+    assert not any("S2y8Pb6" in t or "S1x9Qa7" in t for t in live)
+    assert await kc.get_reference_secret(db, second) == "S2y8Pb6"
+
+
+@pytest.mark.parametrize(
+    ("ident", "first", "old"),
+    [
+        ("k x tail y tail", "x tail y", ["x tail y"]),
+        ("wifi blue tail fox tail", "blue tail fox", ["blue tail fox", "tail fox"]),
+    ],
+)
+async def test_every_span_ever_masked_stays_masked_across_rotations(db, ident, first, old):
+    """SF3: the spans the identifier's mask replaced are recorded at write time,
+    so nothing of a rotated-away passphrase is visible after later rotations,
+    whatever pieces of the identifier it repeats."""
+    store = _PointStore()
+    tags = json.dumps(["lab", f"was {first}"])
+    units = [
+        await _ingest(db, store, _body(ident, value=v), concept=ident, tags_json=tags)
+        for v in [first, "Zq8!rotate2x", "Kp7!rotate3x"]
+    ]
+    assert len(set(units)) == 1
+    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 1
+    for text in await _indexed_texts(db, store):
+        for secret in [*old, "Zq8!rotate2x"]:
+            assert secret not in text, text
+    row = await kc.get(db, units[0])
+    assert "lab" in json.loads(row["tags"])
+    meta = await ro.reveal_meta(db, row)
+    assert meta["identifier"] == ident and kc.IDENTITY_META not in meta
+
+
+def test_masking_sixty_four_adversarial_tags_is_fast():
+    """The serialised check is one pass per match, not a window search: the
+    three worst cases together take well under a second (the window search
+    took about 11 s for them)."""
+    import time
+
+    tag = "b" * 256
+    start = time.perf_counter()
+    for span in (8, 32, 63):
+        strict, _ = ro.value_masks('", "'.join([tag] * span))
+        out = ro._serialised_clean(strict, [tag] * 64)
+        assert out is None or not strict.carries(out)
+    assert time.perf_counter() - start < 1.0
+
+
+async def _live_texts(db, store) -> list[str]:
+    """The indexed surfaces as they stand: rows, FTS rows and the LIVE points."""
+    texts: list[str] = []
+    for row in await db.execute_fetchall("SELECT * FROM knowledge_units"):
+        texts += [str(v) for k, v in dict(row).items() if k != "secret_ref"]
+    for row in await db.execute_fetchall("SELECT concept, body, tags FROM knowledge_fts"):
+        texts += [str(v) for v in row]
+    return texts + list(store.points.values())
+
+
+@pytest.mark.xfail(strict=True, reason="fixed by the credential move PR")
+async def test_an_untagged_entry_rotating_to_a_value_its_name_spells_moves(db):
+    """Audit 2, B1: the untagged entry under the identifier is the one a
+    rotation to a value its name carries updates; that same row moves to the
+    masked key, and the old key never indexes the current value."""
+    store = _PointStore()
+    ident = "wifi blue Kq7Zx9Lm"
+    first = await _ingest(db, store, _body(ident, value="Rr55Tt66Yy"), concept=ident)
+    assert first.concept == ident
+    before = (await db.execute_fetchall("SELECT rowid, id FROM knowledge_units"))[0]
+    second = await _ingest(db, store, _body(ident, value="Kq7Zx9Lm"), concept=ident)
+    assert second == first and second.concept.startswith("wifi blue [held] #")
+    rows = await db.execute_fetchall("SELECT rowid, id FROM knowledge_units")
+    assert [tuple(r) for r in rows] == [tuple(before)]
+    for text in await _live_texts(db, store):
+        assert "Kq7Zx9Lm" not in text and "Rr55Tt66Yy" not in text, text
+    assert await kc.get_reference_secret(db, second) == "Kq7Zx9Lm"
+
+
+async def test_re_saving_a_login_credential_keeps_its_key_and_login(db):
+    """Audit 2, SF2: the identifier's own mask keeps the login, so identical
+    saves keep one stable key, the login searchable."""
+    store = _PointStore()
+    ident = "router jdoe77 Pw9x8Q7zK"
+    units = [
+        await _ingest(db, store, _body(ident, value="jdoe77 / Pw9x8Q7zK"), concept=ident)
+        for _ in range(3)
+    ]
+    assert len({u.concept for u in units}) == 1 and len(set(units)) == 1
+    assert units[0].concept.startswith("router jdoe77 [held] #")
+    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 1
+
+
+# ─── audit 7: probes from every entry a name spells; spans via the base ──────
+
+_CUR, _UPV, _OTHER = "Cc33Dd44Ee", "Uu77Vv88Ww", "Oo44Pp55Qq"
+
+
+async def _untrusted(db, store, ident, content):
+    from genesis.memory.knowledge_ingest import ingest_untrusted_credential
+
+    return await ingest_untrusted_credential(
+        store=store, db=db, content=content, project="reference", domain="reference.credentials",
+        concept=ident, collection="episodic_memory", memory_type="episodic",
+    )
+
+
+async def _not_indexed(db, store, *secrets_):
+    for text in await _indexed_texts(db, store):
+        for secret in secrets_:
+            assert secret not in text, text
+
+
+async def test_an_upload_under_a_saved_entrys_name_masks_its_value(db):
+    """Audit 7 B1, r40 case A: a direct save, then an upload under the same name
+    with a different value. The upload adopts nothing, but its name is masked
+    with the stored entry's value: its key is masked and CUR is not indexed."""
+    store = _PointStore()
+    saved = await _ingest(db, store, _body(f"router {_CUR}", value=_CUR), concept=f"router {_CUR}")
+    upload = await _untrusted(db, store, f"router {_CUR}", f"router admin password: {_UPV}")
+    assert upload != saved and upload.concept.startswith("router [held] #")
+    assert await kc.get_reference_secret(db, saved) == _CUR
+    await _not_indexed(db, store, _CUR, _UPV)
+
+
+async def test_an_upload_repeating_the_saved_value_is_masked_by_itself(db):
+    """Audit 7, r40 case B (control): the upload's own body repeats CUR, so its
+    own probes mask it, with or without the stored entry's."""
+    store = _PointStore()
+    await _ingest(db, store, _body(f"router {_CUR}", value=_CUR), concept=f"router {_CUR}")
+    upload = await _untrusted(db, store, f"router {_CUR}", f"router admin password: {_UPV} old {_CUR}")
+    assert upload.concept.startswith("router [held] #")
+    await _not_indexed(db, store, _CUR, _UPV)
+
+
+async def test_a_second_upload_under_an_uploads_name_masks_its_value(db):
+    """Audit 7 B1, r41 case C: upload, then a second upload under the same name
+    with another value: the first upload's value is not indexed."""
+    store = _PointStore()
+    first = await _untrusted(db, store, f"router {_UPV}", _UPV)
+    second = await _untrusted(db, store, f"router {_UPV}", f"password: {_OTHER}")
+    assert second != first and second.concept.startswith("router [held] #")
+    await _not_indexed(db, store, _UPV, _OTHER)
+
+
+async def test_a_save_under_an_uploads_name_masks_its_value_and_adopts_nothing(db):
+    """Audit 7 B1, r41 case D: upload, then a direct save under the upload's
+    name with another value: the save is its own entry (trusted writes adopt
+    only trusted entries) and the upload's value is not indexed."""
+    store = _PointStore()
+    upload = await _untrusted(db, store, f"router {_UPV}", _UPV)
+    saved = await _ingest(db, store, _body(f"router {_UPV}", value=_OTHER), concept=f"router {_UPV}")
+    assert saved != upload and await kc.get_reference_secret(db, upload) == _UPV
+    await _not_indexed(db, store, _UPV, _OTHER)
+
+
+async def test_spans_of_an_entry_found_by_its_base_are_never_lost(db):
+    """Audit 7 SF2, r42: an entry found through its masked base (not by its
+    recorded name) keeps the spans recorded before, so a later save under the
+    first, value-bearing name never indexes the rotated-away value."""
+    store = _PointStore()
+    a, b, c = "Old1Pass!x", "New2Pass!y", "Thr3Pass!z"
+    units = [
+        await _ingest(db, store, _body(ident, value=v), concept=ident)
+        for ident, v in [(f"wifi {a}", a), (f"wifi {b}", b), (f"wifi {a}", c)]
+    ]
+    assert len(set(units)) == 1
+    meta = json.loads(await kc.get_secret_meta(db, (await kc.get(db, units[0]))["secret_ref"]))
+    assert {a, b} <= set(meta[kc.IDENTITY_META]["masked_spans"])
+    await _not_indexed(db, store, a, b, c)
+
+
+# ─── audit 8: one resolving entry, normalised; no false masking; off the loop ─
+
+
+@pytest.mark.parametrize(
+    "name",
+    [f"ROUTER {_CUR}", f"Router {_CUR}", "\uff52\uff4f\uff55\uff54\uff45\uff52 " + _CUR, f"router\t{_CUR}"],
+    ids=["upper", "title", "fullwidth", "tab"],
+)
+async def test_a_spelling_variant_of_a_saved_name_resolves_and_masks(db, name):
+    """Audit 8 (r50 V2/V3b/V9): an upload under a case, fullwidth or whitespace
+    variant of a saved entry's name resolves to it (compared as the mask
+    compares text), so the saved value is not indexed."""
+    store = _PointStore()
+    await _ingest(db, store, _body(f"router {_CUR}", value=_CUR), concept=f"router {_CUR}")
+    upload = await _untrusted(db, store, name, f"password: {_UPV}")
+    assert "[held]" in upload.concept
+    await _not_indexed(db, store, _CUR, _UPV)
+
+
+async def test_an_upload_named_after_a_login_entry_keeps_the_login(db):
+    """Audit 8 (r51): an upload under a saved login entry's name masks that
+    entry's password and keeps its login searchable, as the entry's own name
+    does."""
+    store = _PointStore()
+    name = "router jdoe77 Aa11Bb22"
+    saved = await _ingest(db, store, _body(name, value="jdoe77 / Aa11Bb22"), concept=name)
+    upload = await _untrusted(db, store, name, f"password: {_UPV}")
+    assert saved.concept.startswith("router jdoe77 [held] #")
+    assert upload != saved and upload.concept.startswith("router jdoe77 [held] #")
+    await _not_indexed(db, store, "Aa11Bb22", _UPV)
+
+
+async def test_a_re_save_never_records_another_entrys_login_as_a_span(db):
+    """Audit 8 (r51 L1): re-saving a login entry's name with another value
+    masks the old password, never its login, in the spans it records."""
+    store = _PointStore()
+    name = "router jdoe77 Aa11Bb22"
+    await _ingest(db, store, _body(name, value="jdoe77 / Aa11Bb22"), concept=name)
+    unit = await _ingest(db, store, _body(name, value="Zz99Yy88Xx"), concept=name)
+    meta = json.loads(await kc.get_secret_meta(db, (await kc.get(db, unit))["secret_ref"]))
+    spans = meta[kc.IDENTITY_META]["masked_spans"]
+    assert "Aa11Bb22" in spans and not any("jdoe77" in span for span in spans)
+    assert unit.concept.startswith("router jdoe77 [held] #")
+
+
+async def test_terms_from_a_held_document_are_not_masked_in_a_trusted_name(db):
+    """Audit 8 (r51 F1): uploads named "router" hold a manual whose prose names
+    the model and firmware; a trusted name using those terms resolves to no
+    upload, so nothing of it is masked."""
+    store = _PointStore()
+    doc = ("Router manual. Model RT-AX88U firmware fw3.0.0.4 supports WPA2-PSK and IPv6. "
+           "Default admin page port 8080. Support ticket TK-2291. password: Uu77Vv88Ww")
+    await _untrusted(db, store, "router", doc)
+    await _untrusted(db, store, "router", doc + " v2")
+    for name, value in [("router RT-AX88U admin", "Kk55Ll66Mm"), ("router IPv6 TK-2291 fw3.0.0.4", "Nn77Oo88Pp")]:
+        unit = await _ingest(db, store, _body(name, value=value), concept=name)
+        assert unit.concept == name
+
+
+async def test_probes_from_a_large_resolved_entry_are_built_off_the_loop(db, monkeypatch):
+    """Audit 8: the size check counts every probed value, the resolved entry's
+    included, so a small write that resolves to an entry holding a large value
+    builds its masks (and resolves) off the event loop."""
+    import asyncio
+
+    store = _PointStore()
+    name = f"router {_CUR}"
+    big = f"password: {_CUR}\n" + "filler words for a large held value\n" * 3000
+    await _ingest(db, store, _body(name, value=big), concept=name, held_value=big, held_detail="")
+    offloaded: list[str] = []
+    real = asyncio.to_thread
+
+    async def to_thread(func, *a, **k):
+        offloaded.append(getattr(getattr(func, "func", func), "__name__", "?"))
+        return await real(func, *a, **k)
+
+    monkeypatch.setattr(asyncio, "to_thread", to_thread)
+    await _ingest(db, store, _body(name, value=_OTHER), concept=name)
+    assert {"_resolve", "value_masks"} <= set(offloaded)
+    await _not_indexed(db, store, _CUR)
+
+
+async def test_a_rotation_found_by_its_base_masks_the_old_value_in_its_tags(db):
+    """Audit 9 (M12): a rotation saved under a NEW spelling of the name resolves
+    to the entry only through its masked base, so the entry's value reaches
+    this write's probes only by the rebuild on that path; a tag naming the
+    previous value is masked, and nothing of either value is indexed."""
+    store = _PointStore()
+    old, new = "Aa11Wifi22", "Bb33Wifi44"
+    first = await _ingest(db, store, _body(f"wifi {old}", value=old), concept=f"wifi {old}")
+    unit = await _ingest(
+        db, store, _body(f"wifi {new}", value=new, tags=[f"was {old}"]), concept=f"wifi {new}",
+        tags_json=json.dumps([f"was {old}"]),
+    )
+    assert unit == first
+    await _not_indexed(db, store, old, new)

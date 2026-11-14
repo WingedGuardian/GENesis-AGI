@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import logging
@@ -32,6 +33,10 @@ _BACKGROUND_COMPENSATIONS: set[asyncio.Task] = set()
 
 # Module-level singleton (load_default_patterns() does filesystem I/O).
 _SANITIZER = ContentSanitizer()
+#: A distilled (non-credential) unit's concept is stored up to this long.
+_MAX_CONCEPT = 200
+#: The quality flag of a credential unit that could not be stored (by reason).
+CREDENTIAL_NOT_STORED = "credential_unit_not_stored:"
 
 
 @dataclass
@@ -285,7 +290,9 @@ class KnowledgeOrchestrator:
                 error=f"Storage failed: {exc}",
             )
 
-        # 8. Update manifest
+        # 8. Update manifest. A credential unit that could not be stored is
+        # reported in the quality flags (``credential_unit_not_stored:<reason>``)
+        # and the source is registered as ingested.
         self._manifest.add_source(
             source,
             source_type=content.source_type,
@@ -449,7 +456,12 @@ class KnowledgeOrchestrator:
         from genesis.db.crud.knowledge import holds_secret
 
         credential_units = [u for u in units if holds_secret(project_type, u.domain)]
-        units = [u for u in units if not holds_secret(project_type, u.domain)]
+        # A credential unit's concept reaches the chokepoint whole (it masks a
+        # secret in it before its own cap); every other one is capped here.
+        units = [
+            dataclasses.replace(u, concept=u.concept[:_MAX_CONCEPT])
+            for u in units if not holds_secret(project_type, u.domain)
+        ]
 
         unit_ids: list[str] = []
         qdrant_ids: list[str] = []  # Track for compensation on failure
@@ -564,7 +576,7 @@ class KnowledgeOrchestrator:
                         reason = "card_number" if card else type(exc).__name__
                         logger.warning("A distilled credential unit was not stored (%s)", reason)
                         if flags is not None:
-                            flags.append(f"credential_unit_not_stored:{reason}")
+                            flags.append(f"{CREDENTIAL_NOT_STORED}{reason}")
                         break
 
         if not units:

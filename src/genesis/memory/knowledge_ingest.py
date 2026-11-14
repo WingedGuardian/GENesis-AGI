@@ -109,6 +109,8 @@ async def ingest_knowledge_unit(
     writes nothing; a different value raises
     ``knowledge_crud.CredentialKeyTaken`` and writes nothing, so the caller
     tries another key. A user-typed ``reference_store`` keeps upsert semantics.
+    The write's origin (insert-only: untrusted) is recorded in the held meta: a
+    trusted write never adopts an entry an untrusted one made.
 
     ``held_value`` / ``held_detail`` (#2426): the value and description held out
     of the index into ``reference_secrets``, named by the row's ``secret_ref``.
@@ -212,7 +214,6 @@ async def _ingest_once(
                 ("caveats", caveats),
             ) if v is not None
         }
-        secret_meta = json.dumps(meta, sort_keys=True, ensure_ascii=False, default=str)
         # The identifier is the body's one header line: a line break in it
         # would start a line of its own (a second "Value:" line, a "Tags:" line),
         # so it reads as a space. It is masked WHOLE and only then capped (the
@@ -248,24 +249,32 @@ async def _ingest_once(
             secret_value = None
         known_secret = (secret_value if secret_value is not None else observed.value) or ""
         known_detail = secret_detail if secret_detail is not None else observed.detail
+        entries = await knowledge_crud.masked_key_rows(db, project_type=project, domain=domain)
         # The secrets this write must not repeat beside its own: the value it
-        # replaces, and the entry its identifier names under a masked identity
-        # (a rotation re-stored under the old, value-bearing name).
-        named_entry = await _entry_named_by(db, project, domain, flat)
-        also = tuple(
-            (v, d) for v, d in (
-                (observed.value, observed.detail),
-                (named_entry[1], named_entry[2]) if named_entry else (None, None),
-            ) if v and v != known_secret
-        )
+        # replaces, and those of the ONE entry this name resolves to (the entry
+        # it updates or, when no trusted one is named, the first of any origin
+        # that records this name or whose masked base it matches: an upload
+        # under another entry's name), its value and every span its mask has
+        # replaced in earlier rotations; never its description. Which entry the
+        # write UPDATES is the trusted-only rule; an untrusted write adopts
+        # none. Stated limit: a name that spells a secret of an entry it does
+        # NOT resolve to (another prefix, a mask-only or untagged key, the words
+        # reordered) is not masked with it. The pure-Python work (resolution by
+        # value and probe building) runs off the event loop when any value it
+        # reads is large.
+        resolve = functools.partial(_resolve, entries, flat, insert_only=insert_only)
+        heavy = len(known_secret) + len(known_detail or "") + sum(len(e.value or "") for e in entries)
+        named_entry, resolved = await asyncio.to_thread(resolve) if heavy > _LARGE else resolve()
+        also = _secrets_of(observed, [resolved] if resolved else [], known_secret)
         # Every probe of the value and of the secrets the capture rules find in
         # it and in the description, built ONCE for the identifier and the tags.
         build = functools.partial(
             reference_ops.value_masks, known_secret, prose=prose, detail=known_detail, also=also,
         )
-        large = len(known_secret) + len(known_detail or "") > _LARGE
+        large = len(known_secret) + len(known_detail or "") + sum(len(v or "") for v, _ in also) > _LARGE
         strict, named = await asyncio.to_thread(build) if large else build()
-        masked = named.mask(flat)
+        masked, spans = named.mask_and_spans(flat)
+        adopted = None
         cut = len(masked) > _MAX_IDENTIFIER
         if masked != flat or cut:
             # The identifier carried the value, or was cut: it is stored masked
@@ -278,8 +287,9 @@ async def _ingest_once(
             # the mask (an identifier that was only its value) names no entry:
             # it always gets a fresh tag. An insert-only write
             # (``ingest_untrusted_credential``: uploads, distillation) always
-            # takes a fresh key. A placeholder re-ingest carries the stored value
-            # and description over to the new key.
+            # takes a fresh key, and a trusted write never adopts the entry one
+            # made. A placeholder re-ingest carries the stored value and
+            # description over to the new key.
             if secret_value is None:
                 secret_value = observed.value
             if secret_detail is None:
@@ -287,21 +297,47 @@ async def _ingest_once(
             base = reference_ops.cap_masked(masked, _MAX_IDENTIFIER - 8)
             names = not insert_only and bool(base.replace(reference_ops.HELD_MASK, "").strip())
             existing_key = None
-            if names and cut:
-                # A cut identifier is identified by its FULL text, which the
-                # entry's held meta records: the same one re-stored updates it,
-                # another one cut to the same text is a new entry.
+            if names and named_entry is not None and (not cut or named_entry.given == flat):
+                # The entry it names: by its recorded identifier (a cut one is
+                # identified by its FULL text, which the meta records) or,
+                # failing that, by its value.
+                existing_key = named_entry.concept
+                adopted = named_entry
+            elif names and not cut:
+                # A trusted entry under the same masked base. Its recorded spans
+                # are carried as on the recorded-identity path: into this
+                # write's probes (for the tags) and into the meta it writes.
                 existing_key = await knowledge_crud.find_masked_key(
-                    db, project_type=project, domain=domain, base=base, identifier=flat,
+                    db, project_type=project, domain=domain, base=base, trusted_only=True,
                 )
-            elif names:
-                existing_key = named_entry[0] if named_entry else await knowledge_crud.find_masked_key(
-                    db, project_type=project, domain=domain, base=base,
-                )
+                adopted = next((e for e in entries if e.concept == existing_key), None)
+                extra = _secrets_of(None, [adopted] if adopted else [], known_secret)
+                if set(extra) - set(also):
+                    also = (*also, *extra)
+                    build = functools.partial(
+                        reference_ops.value_masks, known_secret, prose=prose, detail=known_detail, also=also,
+                    )
+                    large = large or sum(len(v or "") for v, _ in extra) > _LARGE
+                    strict, named = await asyncio.to_thread(build) if large else build()
+            # Known limit, fixed by the credential move PR: an existing entry
+            # whose key still spells a secret of this write (the value it
+            # rotates to) is updated under that key as it is, and an untagged
+            # entry under this very identifier is left as it is beside the new,
+            # masked one.
             concept = existing_key or f"{base} #{secrets.token_hex(3)}"
             observed = await knowledge_crud.observe_credential_key(
                 db, project_type=project, domain=domain, concept=concept,
             )
+        # What this write knows of the entry's identity, held in meta (never
+        # indexed): who wrote it, and every span the identifier's mask has
+        # replaced, this time and in each earlier rotation of the entry it
+        # updates, so a later write under the same identifier masks them all.
+        recorded = [*((adopted.masked_spans or ()) if adopted else ()), *spans]
+        meta[knowledge_crud.IDENTITY_META] = {
+            "origin": knowledge_crud.UNTRUSTED if insert_only else knowledge_crud.TRUSTED,
+            "masked_spans": list(dict.fromkeys(span for span in recorded if span.strip())),
+        }
+        secret_meta = json.dumps(meta, sort_keys=True, ensure_ascii=False, default=str)
         content = f"[{knowledge_crud.CREDENTIAL_DOMAIN}] {concept}" + content[len(header):]
         if secret_value is None and observed.value is not None and (
             secret_detail is not None or secret_meta != observed.meta
@@ -533,28 +569,88 @@ def _stored(unit_id: str, concept: str) -> StoredId:
     return stored
 
 
-async def _entry_named_by(db, project: str, domain: str, identifier: str) -> tuple | None:
-    """(key, value, detail) of the stored credential whose masked identity this
-    identifier spells: an entry ``"{base} #xxxxxx"`` whose own value masks the
-    identifier to ``base``. None when there is none."""
+def _entry_named_by(entries: list, identifier: str):
+    """The stored credential (a ``knowledge_crud.MaskedEntry``) a trusted write
+    under ``identifier`` names, or None when there is none.
+
+    The identity rule: the entry whose held meta records this very identifier
+    as given (line breaks read as spaces), the one CREATED first when several
+    do. Only an entry a trusted write made can be named (one with no origin
+    recorded is legacy and counts as trusted): an upload or a distilled
+    document recording the same identifier is never adopted. Failing that, any
+    trusted entry ``"{base} #xxxxxx"`` (legacy or not) whose own value and
+    recorded masked spans mask the identifier to ``base`` (compared as the mask
+    compares text): the masked name is its identity (owner ruling
+    900f1df2), so a rotation saved under the old, value-bearing spelling of
+    the name updates it."""
     from genesis.memory import reference_ops
 
-    for key, value, detail in await knowledge_crud.masked_key_rows(db, project_type=project, domain=domain):
-        base = key[:-8]
-        parts = [part for part in base.split(reference_ops.HELD_MASK) if part.strip()]
-        if not parts:
-            continue  # a base that is only the mask names no entry (it is never reused)
-        at = 0
-        for part in parts:
-            at = identifier.find(part, at)
-            if at == -1:
-                break
-            at += len(part)
-        if at == -1 or not value:
-            continue
-        if reference_ops.value_masks(value, detail=detail)[1].mask(identifier) == base:
-            return key, value, detail
+    trusted = [entry for entry in entries if entry.trusted]
+    for entry in trusted:
+        if entry.given == identifier:
+            return entry
+    for entry in trusted:
+        if entry.value and _base_parts_in(entry, identifier) and _compared(
+            reference_ops.value_masks(
+                entry.value, detail=entry.detail,
+                also=tuple((span, None) for span in entry.masked_spans or ()),
+            )[1].mask(identifier)
+        ) == _compared(entry.concept[:-8]):
+            return entry
     return None
+
+
+def _resolve(entries: list, identifier: str, *, insert_only: bool) -> tuple:
+    """(the trusted entry a trusted write under ``identifier`` updates, the
+    entry the name resolves to for masking). The second is the first unless a
+    trusted lookup names none (always, for an insert-only write); then it is
+    the first entry of any origin that records this name, or else whose masked
+    base the name matches. Pure Python, so it may run off the event loop."""
+    named = None if insert_only else _entry_named_by(entries, identifier)
+    return named, named or _entry_named_by([e._replace(origin=None) for e in entries], identifier)
+
+
+def _compared(text: str) -> str:
+    """``text`` as the mask compares it, with every whitespace run one space."""
+    from genesis.memory.reference_masks import _normalise
+
+    return " ".join(_normalise(text).split())
+
+
+def _base_parts_in(entry, identifier: str) -> bool:
+    """Whether ``identifier`` could mask to the entry's key base: its unmasked
+    pieces occur in it in order, the first at its start and the last at its
+    end unless a mask stands there, compared as the mask compares text. A cheap
+    test before any probe is built (a mask only ever replaces text, so a base
+    with no mask matches only the very same name). A base that is only the
+    mask has no pieces: it names no entry (it is never reused)."""
+    from genesis.memory import reference_ops
+
+    pieces = [_compared(piece) for piece in entry.concept[:-8].split(reference_ops.HELD_MASK)]
+    if not any(pieces):
+        return False
+    text = _compared(identifier)
+    if len(pieces) == 1:
+        return text == pieces[0]
+    if not (text.startswith(pieces[0]) and text.endswith(pieces[-1])):
+        return False
+    at = len(pieces[0])
+    for piece in pieces[1:-1]:
+        at = text.find(piece, at)
+        if at == -1:
+            return False
+        at += len(piece)
+    return at <= len(text) - len(pieces[-1])
+
+
+def _secrets_of(observed, entries: list, known_secret: str) -> tuple:
+    """(value, description) pairs a write must not repeat: those of the key it
+    observed, and of ``entries`` their VALUE (never a description) with each of
+    their recorded masked spans."""
+    pairs = [(observed.value, observed.detail)] if observed is not None else []
+    for entry in entries:
+        pairs += [(entry.value, None), *((span, None) for span in entry.masked_spans or ())]
+    return tuple(dict.fromkeys((v, d) for v, d in pairs if v and v != known_secret))
 
 
 def _tags_as_given(tags_json: str | None) -> object:
