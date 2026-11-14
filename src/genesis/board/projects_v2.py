@@ -52,8 +52,26 @@ Runner = Callable[[str], Awaitable[tuple[int, str, str]]]
 GH_TIMEOUT_S = 60
 
 STATUS_FIELD = "Status"
-#: The board's columns, in order (spec §3.2).
-STATUS_OPTIONS = ("Proposed", "Ready", "In Progress", "In Review", "Done")
+#: The board's columns, in order (spec §3.2). "Build" sits between Ready and In
+#: Progress: a card moved there is the owner's approval for one builder run on
+#: that issue (the builder launcher, spec E). Nothing reads it yet.
+STATUS_OPTIONS = ("Proposed", "Ready", "Build", "In Progress", "In Review", "Done")
+#: Colours and descriptions for a Status option this code CREATES. An existing
+#: option keeps its own (only its id is load-bearing). Explicit, not positional,
+#: so inserting a column never recolours the ones after it.
+STATUS_COLORS = {
+    "Proposed": "GRAY",
+    "Ready": "BLUE",
+    "Build": "PURPLE",
+    "In Progress": "YELLOW",
+    "In Review": "ORANGE",
+    "Done": "GREEN",
+}
+#: A description is sent only when setup CREATES the option; editing one here
+#: later reaches new boards only (an existing board is edited in the GitHub UI).
+STATUS_DESCRIPTIONS = {
+    "Build": "Owner approval for one builder run on this issue (acted on only by an armed launcher).",
+}
 GENESIS_FIELD = "Genesis"
 #: Genesis's own per-card status (spec §3.1). Values carrying a free-text tail
 #: ("Blocked: <reason>", "Waiting: until <t>") keep the tail in GENESIS_NOTE_FIELD.
@@ -296,13 +314,20 @@ async def create_project(
 
 
 def merge_options(
-    existing: list[dict], wanted: tuple[str, ...], *, keep_unlisted: bool
+    existing: list[dict],
+    wanted: tuple[str, ...],
+    *,
+    keep_unlisted: bool,
+    colors: dict[str, str] | None = None,
+    descriptions: dict[str, str] | None = None,
 ) -> list[dict]:
     """The ``singleSelectOptions`` list for ``updateProjectV2Field`` that yields
     *wanted* in order WITHOUT clearing any item's value: every wanted option that
     already exists is re-sent with its ``id`` (identity preserved), new ones are
     sent without one. With ``keep_unlisted`` (the default for a live board),
-    options outside *wanted* are kept, appended, so no card loses its value."""
+    options outside *wanted* are kept, appended, so no card loses its value.
+    *colors* and *descriptions* apply only to an option created here; one absent
+    from *colors* gets a colour by position."""
     by_name = {o["name"]: o for o in existing}
     out = []
     for i, name in enumerate(wanted):
@@ -317,7 +342,13 @@ def merge_options(
                 }
             )
         else:
-            out.append({"name": name, "color": _COLORS[i % len(_COLORS)], "description": ""})
+            out.append(
+                {
+                    "name": name,
+                    "color": (colors or {}).get(name) or _COLORS[i % len(_COLORS)],
+                    "description": (descriptions or {}).get(name, ""),
+                }
+            )
     if keep_unlisted:
         for o in existing:
             if o["name"] not in wanted:
