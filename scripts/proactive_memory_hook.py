@@ -1928,19 +1928,26 @@ def _peer_addresses(
     rather than dropping the line. The suffix is built only from allowlisted
     text (see peer_address.render), so it cannot forge a tag field.
 
-    ``pids_out``, when given, receives each RESOLVED peer's live pid (verified
-    by the resolver against Claude Code's registry and the process start time),
+    ``pids_out``, when given, receives the live pid of each peer resolved OK or
+    UNNAMED (verified by the resolver against Claude Code's registry and the
+    process start time; no other status carries a verified pid),
     which is how _peer_worktrees finds a claim made before a /clear.
     """
     if not session_ids or _deadline_expired(deadline):
         return {}
     try:
-        from genesis.session_awareness.peer_address import render, resolve_many
+        from genesis.session_awareness.peer_address import OK, UNNAMED, render, resolve_many
 
         resolved = resolve_many(session_ids, deadline=deadline)
         if pids_out is not None:
+            # UNNAMED is the same single verified live hit as OK, only without
+            # a registry name, so its pid is just as verified.
             pids_out.update(
-                {sid: res.pid for sid, res in resolved.items() if res.status == "ok" and res.pid}
+                {
+                    sid: res.pid
+                    for sid, res in resolved.items()
+                    if res.status in (OK, UNNAMED) and res.pid
+                }
             )
         return {sid: render(res) for sid, res in resolved.items()}
     except Exception:

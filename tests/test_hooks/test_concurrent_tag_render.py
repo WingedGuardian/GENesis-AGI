@@ -344,6 +344,26 @@ def test_an_expired_deadline_skips_the_lookup(monkeypatch):
     assert _REAL_PEER_ADDRESSES([_SID], None) == {} and len(calls) == 1  # control
 
 
+def test_a_verified_pid_is_forwarded_for_named_and_unnamed_peers_only(monkeypatch):
+    """UNNAMED comes from the same single verified live hit as OK, so its pid
+    finds a claim made before a /clear just as a named peer's does. A status
+    whose pid the resolver did not verify forwards nothing."""
+    from genesis.session_awareness import peer_address as pa
+
+    resolved = {
+        "named": pa.Resolution("named", pa.OK, name="genesis-7f", pid=101),
+        "unnamed": pa.Resolution("unnamed", pa.UNNAMED, pid=102),
+        "ambiguous": pa.Resolution("ambiguous", pa.AMBIGUOUS, names=("a", "b")),
+        # A pid on an unverified status must still be refused, so a predicate
+        # that keyed on the pid alone would fail here.
+        "unreached": pa.Resolution("unreached", pa.NOT_REACHABLE, pid=99),
+    }
+    monkeypatch.setattr(pa, "resolve_many", lambda ids, **k: resolved)
+    pids: dict = {}
+    _REAL_PEER_ADDRESSES(list(resolved), None, pids_out=pids)
+    assert pids == {"named": 101, "unnamed": 102}
+
+
 # --------------------------------------------------------------------------
 # 4. where the peer is working (worktree claims)
 # --------------------------------------------------------------------------
