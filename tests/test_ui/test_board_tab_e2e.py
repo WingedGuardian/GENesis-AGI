@@ -309,6 +309,30 @@ def test_a_failed_read_after_a_good_one_keeps_the_board_and_says_so(
     assert board_errors == []
 
 
+def test_a_failed_read_overtaken_by_a_request_that_never_succeeds_still_says_so(
+    serve_dashboard, board_page, board_errors
+):
+    # A slow refresh that reports its own failure must not be discarded merely
+    # because the 60 s poll has STARTED a newer request: only a newer success
+    # may discard it. The newer request is started by bumping the token while
+    # the first is in flight, and never completes.
+    base = serve_dashboard(password=None)
+    _serve(board_page, [_ok(), {"status": "error", "reason": "OperationalError: locked"}])
+    _open_board(board_page, base)
+    _panel_text(board_page, "on the board")
+    board_page.evaluate(
+        """async () => {
+            const s = Alpine.store('genesisDashboard');
+            const p = s.fetchBoard();
+            s._boardFetchToken += 1;
+            await p;
+        }"""
+    )
+    text = _panel_text(board_page, "Refresh is failing")
+    assert "OperationalError: locked" in text and "5 on the board" in text
+    assert board_errors == []
+
+
 def test_paused_never_hides_an_overdue_reconciler(serve_dashboard, board_page, board_errors):
     base = serve_dashboard(password=None)
     body = _ok()

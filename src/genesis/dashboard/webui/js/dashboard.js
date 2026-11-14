@@ -1307,17 +1307,20 @@
             const resp = await fetchApi("/api/genesis/board");
             if (resp && resp.ok) {
               const payload = await resp.json();
-              if (token !== this._boardFetchToken) return;
               // A read the backend itself reports as failed (heartbeats
               // unreadable, runtime restarting) is a failed REFRESH once a good
               // board is on screen: keep that board and say refresh is failing,
-              // never replace it and read as healthy.
+              // never replace it and read as healthy. Checked BEFORE the
+              // supersession guard: like the HTTP and thrown failures below, it
+              // is discarded only once a newer request has SUCCEEDED, never
+              // because one has merely started (see _newerRequestSucceeded).
               if (payload?.status !== "ok" && this.boardView?.status === "ok") {
                 if (!this._boardNewerRequestSucceeded(token)) {
                   this.failFetch("board", payload?.reason || "Board read failed");
                 }
                 return;
               }
+              if (token !== this._boardFetchToken) return;
               this.boardView = payload;
               this._boardSucceededToken = token;
               this.finishFetch("board");
