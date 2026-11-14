@@ -44,7 +44,9 @@ Use `codebase_navigate` MCP to explore.
   `tmp_filesystem_limit` procedure). Code that creates large temp must pass an
   explicit dir (`mktemp -p ~/tmp` / `tempfile(dir=…)`), never the default. For a
   heavy one-off you run interactively, prefix `TMPDIR=~/tmp/job <cmd>`. Clean up
-  after use.
+  after use. SQLite's spill files are the exception that needs nothing: slot
+  sessions and the server units set `SQLITE_TMPDIR=~/tmp`, which SQLite reads
+  before `TMPDIR`; every other tool still follows `TMPDIR`.
 
 ## Process Management
 
