@@ -1,0 +1,12 @@
+{
+  "name": "genesis",
+  "owner": {"name": "Genesis"},
+  "description": "Claude Code plugins shipped with Genesis and registered by bootstrap (scripts/cc_plugins.py).",
+  "plugins": [
+    {
+      "name": "genesis-secret-redact",
+      "source": "./genesis-secret-redact",
+      "description": "Keeps this install's secrets.env values out of everything a Claude Code session reads or stores."
+    }
+  ]
+}

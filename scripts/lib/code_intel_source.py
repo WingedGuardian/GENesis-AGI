@@ -41,12 +41,15 @@ MODULES = (
     ("legacy", "_genesis_index_marker_legacy", "scripts/lib/index_marker_legacy.py"),
     ("recovery", "_genesis_index_marker_recovery", "scripts/lib/index_marker_recovery.py"),
     ("legs", "_genesis_index_marker_legs", "scripts/lib/index_marker_legs.py"),
+    ("retry", "_genesis_index_marker_retry", "scripts/lib/index_marker_retry.py"),
     ("native", "_genesis_index_marker_execution", "scripts/lib/index_marker_execution.py"),
     ("cli", "_genesis_index_marker_cli", "scripts/lib/index_marker_cli.py"),
     ("queue", "_genesis_index_marker", "scripts/lib/index_marker.py"),
     ("queued", "_genesis_code_intel_queued_worker", "scripts/lib/code_intel_queued_worker.py"),
+    ("gitnexus", "_genesis_code_intel_gitnexus", "scripts/lib/code_intel_gitnexus.py"),
     ("owner", "_genesis_code_intel_owner", "scripts/lib/code_intel_owner.py"),
     ("owner_admission", "_genesis_code_intel_owner_admission", "scripts/lib/code_intel_owner_admission.py"),
+    ("supervisor", "_genesis_code_intel_supervisor", "scripts/lib/code_intel_supervisor.py"),
     ("managed", "_genesis_codebase_managed", "scripts/codebase_managed.py"),
 )
 SHELL = (
@@ -503,7 +506,8 @@ def main(argv=None):
     modules = captured.assemble()
     if args.action == "queue":
         try:
-            return modules["queue"].main(args.arguments)
+            supervisor = modules['supervisor'].Supervisor(captured, modules, _runner_lock_fds)
+            return modules["queue"].main(args.arguments, supervisor=supervisor)
         except Exception:
             import traceback
 

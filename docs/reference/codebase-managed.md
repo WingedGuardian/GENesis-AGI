@@ -532,9 +532,15 @@ re-resolved against the live filesystem, so a queued repository that later moves
 (or gains a symlink) cannot stop the list. A request spooled while the queue was
 busy is still resolved when it is imported.
 
-The consumer checks actual child status, framing and every listed row before
+The consumer checks transport status, framing and every listed row before
 claiming anything. It dispatches only the claimed provider, using that claim's
 mode and opaque context, and rechecks Codebase disablement after claiming.
+It uses `claim-native`; disabled-after-claim and escalation-observation refusals
+reconcile only structurally unstarted typed claims. The captured original owner
+returns six NUL-terminated fields: `1,native-outcome,hash,provider,context,state`,
+where state is `consumed`, `pending` or `failed` after journal application. Every
+field and the original context must match. Missing/failed transport stops the
+tick without scalar settlement; an exit code never consumes or charges work.
 GitNexus full requests do not change Codebase full-index clocks. A malformed
 or failed queue observation stops the tick with 76. The headerless list trusts
 the same-install producer to include the complete population; it cannot detect
@@ -890,11 +896,16 @@ and entry helpers use the held source buffers. Captured Bash ignores inherited
 startup files, shell functions and shell options. The runner-to-entry handoff
 preserves only its canonical runner-lock descriptor; missing, foreign or
 competing lock identity refuses. Scope/watchdog definitions are included in the
-source closure. Physical queued supervision and positive automatic readiness
-remain separate integration work; this startup path preserves the readiness
+source closure. Typed queue dispatch uses the original owner before that owner
+takes the repository lock. Positive automatic readiness remains separate work;
+this startup path preserves the readiness
 fence and does not activate either provider.
 
 Existing units that invoke `scripts/code_intel_runner.sh` remain supported.
+If readiness later permits consumption, that shell restarts through captured
+startup before reconciliation or claiming, releasing its raw runner lock so
+the captured child acquires the canonical lock itself. Incomplete readiness
+still defers before that handoff.
 An authorized full update through `scripts/update.sh` rerenders the unit with
 the new source entry and explicit runner role. A code-only deployment does not
 install those new unit arguments.
@@ -915,10 +926,10 @@ callers retain their existing environment behavior. The optional private runtime
 capsule transports closed top-level objects but supplies no launch or recovery
 authority: source-only queue/shell/availability roles refuse runtime-bearing
 capsules, and diagnostics never print their values. The private owner/monitor
-endpoint below remains separate from unfinished timer/provider integration and
-supervised recovery.
+endpoint below supplies typed provider dispatch; supervised recovery remains
+separate.
 
-The private CBM reporter role now checks the complete runtime source, provider
+The private reporter role checks the complete runtime source, provider
 pin, effective policy and environment recipe. It consumes a bounded atomic
 startup ACK before entering the worker, then brackets its own identity, its live
 original parent, manager invocation and original kernel facts. Registration
@@ -932,7 +943,7 @@ The shared policy identity includes watchdog, CPU and I/O settings; a partial
 full-policy value cannot silently become the earlier five-field recipe. These
 reporter checks do not enable automatic readiness or qualify native containment.
 
-The captured runner now exposes a private initial-owner endpoint for CBM. It
+The captured runner exposes a private initial-owner endpoint for both providers. It
 validates the inherited canonical runner lock, takes the existing repository
 flock itself, and commits its actual process identity before creating workload
 children. Only the first acknowledged reservation releases its sealed runtime.
@@ -1026,9 +1037,146 @@ This endpoint is exercised through the actual queued factory and accepted
 harmless executable descriptor with real locks, processes, pipes and scratch
 SQL, including successful and failed native completion. The fixture substitutes
 its manager, kernel, resource-admission input and provider. It does not
-qualify native containment. Ordinary timer dispatch, the GitNexus adapter and
-positive supervised recovery remain separate; automatic readiness stays fenced.
+qualify native containment. Typed timer dispatch and the GitNexus adapter use
+this owner; positive supervised retry remains separate, and automatic
+readiness stays fenced.
+
+Owner admission also observes the complete known managed-scope namespace before
+reservation. It checks stable terminal identity, no queued job and recursive
+kernel absence across the matching providers and repositories. Failed manager
+state alone does not prove tasks ended. Unknown names, unreadable population
+and identity drift refuse; the check never stops a process. This census is a
+point-in-time observation, not atomic physical exclusion or a RAM reservation.
+Global physical exclusion and production capacity remain separate gates.
+
 Existing standalone indexing policy remains unchanged.
+
+### Explicit owner-loss reconciliation
+
+The captured runner's queue endpoint accepts `reconcile-native --context` with
+the complete original protocol-3 context. Its supervisory caller must supply the
+existing canonical runner lock on descriptor8; the endpoint takes the canonical
+repository lock on descriptor9 itself. Raw queue invocation, the entry profile,
+stale source and missing or occupied coordination descriptors refuse. The
+ordinary no-argument timer reconciliation keeps its previous behavior.
+
+`scripts/lib/code_intel_supervisor.py` collects the witness itself. An original
+owner's changed boot, absent PID or validated changed birth identity can prove
+the original recorded lifetime ended. Matching terminal leader states stay
+unproved because other threads can still run. Unreadable or malformed process
+data cannot prove end; a process in uninterruptible sleep is still alive. Registered work also needs the original
+reporter's lifetime end and actual original kernel release. An existing empty
+group without an original owned wait remains unresolved. A previously retained
+valid original wait can be reused only with a fresh qualified physical
+observation. Unregistered work without native intent has the structural exception:
+cancel future permission and retain orphaned uncertainty, without inventing a
+registration, wait or kernel proof.
+
+The same admitted transaction records orphaned control, retains physical evidence
+and settles that exact execution through the existing reducers. Known success is
+not resent; applied unknown accounting and its debt remain immutable even if a
+late success arrives. Replaying a lost reply uses the original witness and cannot
+replace a newer inflight pointer. Reconciliation does not issue a grant, accept a
+trial, clear the provider hold or enable automatic work.
+
+Recovery decisions can perform one final typed drain on that same connection and
+exclusive publication barrier after fresh-cleanup callbacks. Remaining bodies
+have sorted unique semantic identities; filenames and delivery timestamps do not
+define new incidents. This sees callback-created evidence even when the provider
+revision did not change. Represented artifacts retire only after commit; retained
+conflicts remain available. The ordinary admission prefilter is unchanged.
+
+Scoped admission shares its cache-aware headroom calculation and visible
+cgroup mapping without changing the full worker cap or existing reserves.
+These observations reserve no RAM and do not qualify hidden host limits,
+sustained pressure, deployment peaks or production corpus behavior.
+
+### Explicit supervised grant metadata
+
+The queue endpoint provides `request-retry`, `status-recovery` and `revoke-retry`.
+All take `--repo PATH --provider PROVIDER`.
+`request-retry` additionally requires `--origin pending|failed`, `--mode
+fast|moderate|full`, `--not-after-wall-ns INTEGER` and `--evidence-reference TEXT`.
+Request also accepts `--managed-config PATH`. Revoke requires exactly one of
+`--nonce NONCE` or `--grant-sha256 DIGEST`. Mutating operations require the current captured runner
+and its canonical lock on descriptor8, then take the canonical repository lock
+on descriptor9 internally. A raw queue process cannot substitute for that caller;
+observational `status-recovery` also works without it.
+An explicit schema-5 cutover is a prerequisite, never an implicit side effect.
+
+A retry request names one existing pending or failed provider request, its
+requested mode, a wall-clock deadline and an opaque evidence reference. It does
+not manufacture zero-debt work. The grant binds the actual request snapshot,
+provider evidence and frontier, provider startup and runner/watchdog source,
+policy, original boot and both wall and monotonic deadlines. The explicit
+issue-to-expiry interval must be positive and at most four hours. Evidence
+references must be nonempty, NUL-free valid UTF8, at most4096encoded bytes;
+oversized values are rejected rather than truncated. Issuance checks global
+managed-scope absence and capacity for the full 8 GiB worker plus sibling and
+cache reserves, each at least2GiB; larger explicit reserves remain supported.
+These checks reserve no RAM. Codebase still requires
+enabled managed configuration and its existing lease. No command removes its
+disablement sentinel or changes a service, timer or freeze.
+
+This prefix has no `claim-selected` command and cannot consume a grant into a
+new selected runtime. New selected reservation, registration and native-intent
+acknowledgements refuse; ordinary admission also rejects selected provenance.
+Existing selected history remains cancellable, observable and settleable.
+Failed-origin clean success retires only the exact frozen failure snapshot;
+other outcomes retain the original failed request and independent pending work.
+Missing, corrupt or mismatched spent bindings preserve both work tables, record
+uncertainty unless stronger safety is already retained, and never guess origin
+or reset known debt. Replay does not charge again. Physical and control closure
+remain separate obligations. Grant expiry does not prevent truthful settlement.
+
+Nonce revocation changes only the current unused grant; a healthy spent trial
+remains unchanged. Status returns an invalid-grant descriptor for malformed
+metadata: storage type, byte size and SHA256 of the storage-type ASCII bytes,
+a NUL separator and the raw BLOB bytes. It exposes no corrupt payload and grants
+no launch authority. Exact digest revocation rereads that malformed value under
+the admitted transaction and clears only its grant field. A changed digest or
+healthy grant refuses; a replay after removal reports absent. Accepted receipts,
+hazard revisions, work, execution evidence and independent holds are preserved.
+Database/IO failures remain errors. Storage uses the existing provider-state
+row and transaction-only `scripts/lib/index_marker_retry.py`; the facade remains
+the sole opener.
+
+A zero acceptance watermark with any non-NULL receipt component is malformed;
+recovery admission refuses it just as ordinary admission does. Grant revocation
+does not repair that independent receipt. Invalid positive-watermark receipts
+remain explicit safety evidence for supervised recovery.
+Changes to retained retry code participate in the existing server restart and
+deployment-validation inventory.
+
+Selected execution, acceptance, strict cutover and native/production qualification
+remain separate gates. Metadata scratch tests exercise actual locks, SQL and
+captured commands with substituted manager/kernel observations and no provider
+work. Retained-row compatibility tests construct prior execution facts and prove
+settlement/replay; they do not establish native containment or production capacity.
+
+### Pinned GitNexus typed adapter
+
+Before reservation, selection reads metadata only: the selected Node inode and
+one packaged GitNexus entry must be identifiable without running Node, npm or
+provider version commands. After startup ACK and durable registration, the
+captured stock resolver and Node compatibility gates confirm that same choice.
+The accepted pin remains GitNexus 1.6.12 and Node `^22.18.0 || >=24.11.0`.
+An implicit unknown npm prefix, several distinct installations, a wrapper or an
+unpackaged executable may refuse even when the standalone resolver could run it.
+Use the existing explicit `GITNEXUS_BIN` and `GITNEXUS_NODE_BIN` selections when
+needed; the typed adapter does not rewrite npm configuration or install tools.
+
+The source identity binds Node's executable digest, the exact package/ESM-entry
+metadata and bytes, caller resolution directory, environment, resource policy
+and fixed `analyze` arguments. Only the registered invocation fills its reserved
+environment slot. The initial Node executable is held through descriptor-based
+spawn; the native working directory is the claimed physical repository. Imported
+vendor files and provider-created respawns remain trusted installed inputs;
+entry/package hashing does not seal the whole dependency tree or pin every
+descendant executable. No new `--force`, `--quiet`, heap setting or mode-specific
+provider argument is added. Full 8 GiB/zero-swap containment and existing reserves,
+watchdog and cleanup obligations remain unchanged. This integration neither
+enables automatic readiness nor establishes production resource capacity.
 
 ## Verification
 

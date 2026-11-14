@@ -513,6 +513,8 @@ class CCSessionExecutor:
                     task_id, step, step_results,
                     worktree_path=self._worktree_paths.get(task_id),
                     model_override=model_override,
+                    task_description=description,
+                    planned_step_count=len(steps),
                 )
                 step_results.append(result)
 
@@ -545,6 +547,8 @@ class CCSessionExecutor:
                         task_id, step, result, step_results,
                         worktree_path=wt_path,
                         model_override=model_override,
+                        task_description=description,
+                        planned_step_count=len(steps),
                     )
                     if recovered is not None:
                         step_results[-1] = recovered
@@ -562,6 +566,8 @@ class CCSessionExecutor:
                             workaround=dd_context,
                             worktree_path=wt_path,
                             model_override=model_override,
+                            task_description=description,
+                            planned_step_count=len(steps),
                         )
                         if dd_retry.status == "completed":
                             step_results[-1] = dd_retry
@@ -584,6 +590,8 @@ class CCSessionExecutor:
                             due_diligence_results=dd_context,
                             worktree_path=wt_path,
                             model_override=model_override,
+                            task_description=description,
+                            planned_step_count=len(steps),
                         )
                     )
                     if researched is not None:
@@ -611,6 +619,8 @@ class CCSessionExecutor:
                                 workaround=suggested,
                                 worktree_path=wt_path,
                                 model_override=model_override,
+                                task_description=description,
+                                planned_step_count=len(steps),
                             )
                             if retry.status == "completed":
                                 step_results[-1] = retry
@@ -676,8 +686,15 @@ class CCSessionExecutor:
                         "iteration": iteration,
                         "passed": verify.passed,
                         "skipped": verify.skipped_reason,
+                        "review_error": verify.review_error,
                         "issues": verify.programmatic_issues,
                     })
+
+                if verify.review_error:
+                    await self._persist_blocker(
+                        task_id, verify.review_error, TaskPhase.VERIFYING,
+                    )
+                    return False
 
                 if verify.passed:
                     review_passed = True
@@ -694,6 +711,8 @@ class CCSessionExecutor:
                         task_id, fixup, step_results,
                         worktree_path=self._worktree_paths.get(task_id),
                         model_override=model_override,
+                        task_description=description,
+                        planned_step_count=len(steps),
                     )
                     step_results.append(fixup_result)
                     deliverable = _dispatch.synthesize_deliverable(step_results)

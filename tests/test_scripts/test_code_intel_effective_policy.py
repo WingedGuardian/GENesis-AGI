@@ -73,3 +73,19 @@ def test_fractional_sampling_and_zero_warmup_keep_existing_supported_semantics(q
     selected['watchdog'].update(interval='0.05', warmup_interval='.25', warmup_seconds='0', load_max='0')
     selected['cpu_quota'] = '12.5%'
     assert normalize(selected, queue, full=True) == selected
+
+
+@pytest.mark.parametrize('field', ['sibling_reserve_bytes', 'cache_reserve_bytes'])
+@pytest.mark.parametrize('full', [False, True])
+@pytest.mark.parametrize('amount', [0, 2**31 - 1, 2**31, 2**31 + 1, 2**63 - 1, True, 1.5, -1])
+def test_reserve_floors_apply_to_foundation_and_complete_readers(queue, field, full, amount):
+    selected = policy()
+    if not full:
+        for key in ('io_weight', 'cpu_quota', 'watchdog'):
+            selected.pop(key)
+    selected[field] = amount
+    if type(amount) is int and amount >= 2**31:
+        assert normalize(selected, queue, full=full) == selected
+    else:
+        with pytest.raises(ValueError):
+            normalize(selected, queue, full=full)

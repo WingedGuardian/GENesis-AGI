@@ -7,7 +7,8 @@ import hashlib
 import logging
 import re
 import uuid
-from collections.abc import Callable, Coroutine
+from collections import defaultdict, deque
+from collections.abc import Callable, Coroutine, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -604,8 +605,9 @@ class InboxMonitor:
                 # known hash; and below it, invalidated rows are never retried,
                 # so when a completed sibling held the file's hash nothing ever
                 # re-surfaced it. Now the row keeps its retries and stays an
-                # ordinary retriable failure, so the SAME row is asked about
-                # again. The retry count never bounded re-asking anyway — the
+                # ordinary retriable failure. An identifiable unchanged batch
+                # reuses that row; unknown identity retains history and gets a
+                # fresh row. The retry count never bounded re-asking anyway — the
                 # approval request's own lifetime does (MEASURED, 2026-09-27).
                 if not await inbox_items.mark_failed_keeping_retries(
                     self._db,
@@ -984,12 +986,15 @@ class InboxMonitor:
             # under one drop. Failed batches retry via the delta path next
             # cycle (their lines stay un-baselined), so the old
             # get_retriable_failed single-row reuse is no longer needed.
+            # A file with any replay hold is already known, so it is never
+            # new: detection is this path's snapshot and its hold set is empty.
             await self._queue_drop(
                 str(f),
                 content,
                 h,
                 now_iso,
                 pending_items,
+                held_ids=[],
             )
 
         cooldown = timedelta(seconds=self._config.evaluation_cooldown_seconds)
@@ -1029,6 +1034,8 @@ class InboxMonitor:
             # the file is not re-detected as "modified" on every scan (the
             # detection storm — a stale known hash never caught up because the
             # cooldown branch used to `continue` before writing any row).
+            # Holds are read BEFORE the snapshot: a later one makes arming stale.
+            held_ids = await inbox_items.get_replay_held_ids(self._db, str(f))
             prev_content = await inbox_items.get_evaluated_content(
                 self._db,
                 str(f),
@@ -1158,6 +1165,7 @@ class InboxMonitor:
                 h,
                 now_iso,
                 pending_items,
+                held_ids=held_ids,
             )
 
         # --- Partial-failure auto-retry (PR-2c) ---
@@ -1280,6 +1288,8 @@ class InboxMonitor:
                         ),
                     )
                 continue
+            # Holds are read BEFORE the snapshot: a later one makes arming stale.
+            held_ids = await inbox_items.get_replay_held_ids(self._db, str(f))
             prev_content = await inbox_items.get_evaluated_content(
                 self._db,
                 str(f),
@@ -1309,7 +1319,9 @@ class InboxMonitor:
                 )
                 continue
             before = len(pending_items)
-            await self._queue_drop(str(f), delta, h, now_iso, pending_items)
+            await self._queue_drop(
+                str(f), delta, h, now_iso, pending_items, held_ids=held_ids,
+            )
             if len(pending_items) > before:
                 retried += 1
 
@@ -1322,6 +1334,8 @@ class InboxMonitor:
         content_hash: str,
         now_iso: str,
         pending_items: list[InboxItem],
+        *,
+        held_ids: Sequence[str],
     ) -> None:
         """Segment a file's delta into items, group into batches of
         ``items_per_eval``, and create one pending row per batch under a shared
@@ -1336,6 +1350,8 @@ class InboxMonitor:
         """
         from genesis.db.crud import inbox_items
 
+        # ``held_ids`` is the file's replay-hold set, read by the caller before
+        # its delta snapshot; both arming writes refuse any hold outside it.
         # Deduplicate whole logical items, not URLs. The same bare URL pasted
         # twice is redundant, but two different annotations attached to that
         # URL are distinct user intent and both must retain their source
@@ -1352,19 +1368,24 @@ class InboxMonitor:
             return
         size = max(1, self._config.items_per_eval)
         batches = [items[i : i + size] for i in range(0, len(items), size)]
-        # Reuse retriable failed rows for this file (one per batch) so retries
-        # don't accumulate duplicate rows — the row's retry_count is preserved
-        # so the permanent-failure cap still applies. (A file is re-detected for
-        # retry when ALL its rows failed; partially-failed batches re-enter the
-        # delta on the next file edit.)
+        # A retry budget belongs to the complete ordered batch, never its
+        # position in the source. Unknown or regrouped identities get new rows;
+        # retain their old history instead of transferring its spent budget.
         reusable = await inbox_items.get_retriable_failed_rows(
             self._db,
             file_path,
             max_retries=self._config.max_retries,
         )
+        by_identity: dict[tuple[str, ...], deque[dict]] = defaultdict(deque)
+        unused = {str(row["id"]): row for row in reusable}
+        for row in reusable:
+            saved = inbox_items.stored_item_texts(row.get("batch_items"))
+            if saved:
+                batch_identity = tuple(normalize_url_line(text.strip()) for text in saved)
+                by_identity[batch_identity].append(row)
         drop_id = str(uuid.uuid4())
         pending_start = len(pending_items)
-        for idx, batch in enumerate(batches):
+        for batch in batches:
             # Runtime content stays plain, while the durable column carries a
             # versioned item array. Legacy single-newline storage destroyed the
             # distinction between a standalone note followed by a URL and an
@@ -1373,37 +1394,45 @@ class InboxMonitor:
             stored_batch = inbox_items.serialize_batch_items(
                 [it.text for it in batch]
             )
-            if idx < len(reusable):
-                row_id = str(reusable[idx]["id"])
-                reused = await inbox_items.reuse_as_pending(
+            batch_identity = tuple(normalize_url_line(it.text.strip()) for it in batch)
+            matching = by_identity.get(batch_identity)
+            if matching:
+                row = matching.popleft()
+                row_id = str(row["id"])
+                armed = await inbox_items.reuse_as_pending(
                     self._db,
                     row_id,
                     drop_id=drop_id,
                     batch_items=stored_batch,
                     content_hash=content_hash,
                     created_at=now_iso,
+                    expected_batch_items=row["batch_items"],
+                    expected_retry_ids=list(unused),
+                    max_retries=self._config.max_retries,
+                    expected_held_ids=held_ids,
                 )
-                if not reused:
-                    # Eligibility changed since selection (for example, a
-                    # concurrent attempt put the row on a replay hold).
-                    # Positional reuse does not bind old item identities to
-                    # new batches. Discard this WHOLE stale drop, including
-                    # earlier siblings; the next scan recovers durable pending
-                    # rows and re-derives a delta excluding the new hold.
-                    del pending_items[pending_start:]
-                    return
+                if armed:
+                    del unused[row_id]
             else:
                 row_id = str(uuid.uuid4())
-                await inbox_items.create(
+                armed = await inbox_items.create_pending_if_retriable(
                     self._db,
                     id=row_id,
                     file_path=file_path,
                     content_hash=content_hash,
-                    status="pending",
                     created_at=now_iso,
                     drop_id=drop_id,
                     batch_items=stored_batch,
+                    expected_retry_ids=list(unused),
+                    max_retries=self._config.max_retries,
+                    expected_held_ids=held_ids,
                 )
+            if not armed:
+                # A selected row changed after the delta was read. Discard the
+                # WHOLE stale drop, including earlier siblings; restart recovery
+                # re-derives durable partial work with current replay holds.
+                del pending_items[pending_start:]
+                return
             pending_items.append(
                 InboxItem(
                     id=row_id,
@@ -2652,7 +2681,7 @@ class InboxMonitor:
 
         from genesis.autonomy.build_lane import BuildLane, build_spec_usable
         from genesis.db.crud import build_candidates, follow_ups
-        from genesis.inbox.recommendation import parse_recommendations
+        from genesis.inbox.recommendation import normalise_action, parse_recommendations
 
         recs = parse_recommendations(evaluation_text)
         created = 0
@@ -2661,7 +2690,7 @@ class InboxMonitor:
         build_lane_live = self._build_lane_live()
 
         for rec in recs:
-            action_key = rec.action.lower().replace("_", " ").strip()
+            action_key = normalise_action(rec.action)
             build_fallback = action_key == "build" and not build_lane_live
             if not rec.is_actionable and not build_fallback:
                 continue

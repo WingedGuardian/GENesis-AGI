@@ -5,6 +5,11 @@ services that retain a database object while concurrent requests need separate
 transactions. This prerequisite does not activate a shared MCP service or change
 existing stdio/in-process initialization.
 
+The read-only `foreground_limit` property exposes the configured foreground unit
+budget to the internal shared HTTP builder. The builder requires an exact match
+with its declared database budget and bounds tool concurrency by that budget.
+It does not alter background job or connection admission.
+
 `genesis.mcp.request_service.initialize_request_service` is the internal opt-in
 bootstrap for memory, health, recon and outreach. Supply the facade and the
 service's ordinary dependencies. It awaits outreach table preparation inside
@@ -213,7 +218,7 @@ joins registered work started by joined children before normal DB finalization.
 
 `run_resource_thread(db, fn, *args, **kwargs)` selects this behavior for a facade;
 legacy connections retain ordinary `asyncio.to_thread`, including its immediate
-awaiter cancellation. The memory-consumer migration is a separate prerequisite.
+awaiter cancellation.
 
 A submission exception can occur after enqueue. A canceled queued proxy can also
 prevent its wrapper from ever starting. Where there is no confirmed terminal
@@ -226,3 +231,27 @@ Service owners must withhold dependent provider closers until shutdown succeeds.
 The foreground-plus-background bound remains a physical database-connection
 bound. Joined children can dispatch multiple physical operations through one
 lease; this API adds no separate operation-admission limit or executor pool.
+
+## Memory consumers
+
+The resource helper owns nine existing thread boundaries when their database is
+a facade: MemoryStore's upsert, supersession locate/update and delete locate/delete;
+HybridRetriever's vector search and retrieval-count writes; tag scanning; and
+the copied-row procedure-matrix build. It preserves ordinary thread behavior for
+legacy connections. Other memory maintenance modules and provider shutdown are
+outside this migration; shared factories must qualify all reachable resource use
+before READY. Cancellation settlement does not make external writes transactional
+or make an interrupted call safe to replay.
+
+The retriever forwards its database through the optional `db=` query-expansion
+parameter. Tag rebuilds use `spawn_database_task` with a fresh background unit;
+foreground admission is not held by a detached scan. Shared construction needs
+explicit background-unit and job budgets. Pressure, draining or scheduling
+failure continues expansion with the current cached index without waiting for an independent child or
+falling back to an unowned scan. Legacy callers may omit `db`.
+
+Accepted tag jobs release single flight only in their task completion callback,
+after wrapper cleanup. The body never clears it. Prestart cancellation therefore
+also releases it, and body completion cannot permit a new job while old cleanup
+still owns the flag. Synchronous scheduling failure closes the unscheduled body
+and resets the flag. This is best-effort maintenance, not a durable queue.

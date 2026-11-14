@@ -946,6 +946,7 @@ async def test_td19_a_live_repair_report_raises_its_own_wording_then_resolves(db
     assert "deploy_code_only.sh and update.sh refuse to deploy" in content, content
     assert "committed (on a branch, as a PR), moved out, or removed" in content, content
     assert "90 days after the last write" in content, content
+    assert "nobody restored or dismissed is never pruned" in content, content
     assert "did not finish" in content and "run scripts/update.sh" not in content, content
     assert "says why" not in content, content  # a run killed partway wrote no reason
     _patch_snapshot(monkeypatch, _snap([]))
@@ -1016,8 +1017,10 @@ async def test_a_new_report_refreshes_the_alert(db, monkeypatch):
         lambda r: r["reports"][0].update(saved=5),
         lambda r: r.update(refused=1),
         lambda r: r.update(unread_older=3),
+        lambda r: r.update(hooks_pending=1),
+        lambda r: r.update(hooks_saved=1),
     ],
-    ids=["dismissed", "saved", "refused", "unread_older"],
+    ids=["dismissed", "saved", "refused", "unread_older", "hooks_pending", "hooks_saved"],
 )
 def test_the_alert_identity_follows_every_named_field(change):
     import copy
@@ -1038,7 +1041,10 @@ async def test_refused_reports_have_their_own_wording(db, monkeypatch):
     content = row["content"]
     assert row["priority"] == "high" and "update.sh" not in content, content
     assert "2 live-move repair report(s)" in content and "could not be read" in content
-    assert "named in the server log" in content and "--dismiss" not in content, content
+    # --dismiss now takes a report no reader can read (DISMISSED.json, #4331),
+    # so it is the way out this text names.
+    assert "named in the server log" in content, content
+    assert "repair-move --dismiss <ts>" in content, content
 
 
 async def test_unread_older_reports_alone_raise_nothing(db, monkeypatch):
@@ -1099,3 +1105,74 @@ async def test_commits_behind_with_another_drift_class_stays_high(db, monkeypatc
     )
     await loop._check_deploy_staleness(db)
     assert [r["priority"] for r in await _rows(db)] == ["high"]
+
+
+async def test_d1f_hooks_pending_has_its_own_line(db, monkeypatch):
+    """D1f: git hooks a forward repair could not put back get their own line,
+    no update.sh advice, high (never critical)."""
+    snap = _snap(["live_repair_hooks_pending:1"])
+    snap["live_repairs"] = {**_repairs(), "hooks_pending": 1}
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert "1 live-move repair(s) finished a killed rollback" in content, content
+    assert "git hooks back yet" in content and "repair-move retries" in content, content
+    assert "update.sh" not in content and row["priority"] == "high", row
+
+
+def test_a_zero_hooks_pending_leaves_the_alert_identity_as_it_was():
+    """LOW-4 (owner): `hooks_pending` enters the identity only when non-zero, so
+    a deploy that adds the key (0) does not re-raise every standing alert."""
+    base = _repairs(_repair("20261027T000000Z-1", 1))
+    assert loop._deploy_repair_identity({**base, "hooks_pending": 0, "hooks_saved": 0}) == (
+        loop._deploy_repair_identity(base)
+    )
+    assert loop._deploy_repair_identity({**base, "hooks_pending": 1}) != (
+        loop._deploy_repair_identity(base)
+    )
+
+
+async def test_sf_a_replaced_hooks_name_their_folder(db, monkeypatch):
+    """SF-A: a report holding git hooks the repair replaced names its
+    hooks-before folder and --dismiss, and never pages."""
+    ts = "20261110T000000Z-5"
+    snap = _snap(["live_repair_hooks_saved:1"])
+    snap["live_repairs"] = {**_repairs({**_repair(ts, 0), "hooks_saved": True}), "hooks_saved": 1}
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert f"/home/u/.genesis/deploy-backups/{ts}-live-move-repair/hooks-before" in content, content
+    assert f"scripts/deploy_candidates repair-move --dismiss {ts}" in content, content
+    assert "update.sh" not in content and row["priority"] == "high", row
+
+
+@pytest.mark.parametrize("state", ["missing", "partial", "stale", "corrupt", "foreign"])
+async def test_d2b_a_repair_kit_finding_names_the_install_command(db, monkeypatch, state):
+    """#3492 D2b: the installed repair kit's state (deploy_health's
+    live_repair_kit finding) gets its own line naming the reinstall, with
+    generic paths; no update.sh advice, high (never critical)."""
+    snap = _snap([f"live_repair_kit:{state}"])
+    snap["live_repairs"] = {**_repairs(), "kit": state}
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert "live-move repair kit under ~/.genesis/lib/live-repair/" in content, content
+    assert loop._DEPLOY_KIT_STATES[state] in content, content
+    assert "python3 -I -S <repo>/scripts/lib/live_repair_kit.py install <repo> <home>" in content, (
+        content
+    )
+    assert "update.sh" not in content and row["priority"] == "high", row
+
+
+def test_d2b_the_kit_enters_the_alert_identity_only_as_a_finding():
+    """An ok (or unread) kit leaves a standing alert's identity as it was; a kit
+    finding, or a change of it, is another alert."""
+    base = _repairs(_repair("20261027T000000Z-1", 1))
+    same = loop._deploy_repair_identity(base)
+    assert loop._deploy_repair_identity({**base, "kit": "ok"}) == same
+    assert loop._deploy_repair_identity({**base, "kit": None}) == same
+    missing = loop._deploy_repair_identity({**base, "kit": "missing"})
+    assert missing != same != loop._deploy_repair_identity({**base, "kit": "stale"}) != missing

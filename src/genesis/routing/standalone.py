@@ -12,6 +12,8 @@ rt._router is already set, create_standalone_router() is a no-op.
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from genesis.routing.types import BudgetStatus
@@ -20,6 +22,43 @@ if TYPE_CHECKING:
     from genesis.routing.router import Router
 
 logger = logging.getLogger(__name__)
+
+_external_secret_keys: frozenset[str] | None = None
+
+
+def configure_external_secrets(keys: frozenset[str]) -> None:
+    """Freeze the dedicated external process policy before any bootstrap."""
+    from genesis.caller_context import EXTERNAL_IDENTITY_ENV_VARS
+
+    global _external_secret_keys
+    selected = frozenset(keys) - EXTERNAL_IDENTITY_ENV_VARS - {
+        "GENESIS_REPO_ROOT", "GENESIS_HOME", "SECRETS_PATH",
+    }
+    if _external_secret_keys is not None and _external_secret_keys != selected:
+        raise RuntimeError("external secrets policy already configured")
+    _external_secret_keys = selected
+    for marker in EXTERNAL_IDENTITY_ENV_VARS:
+        os.environ.pop(marker, None)
+
+
+def load_external_secrets(path: Path) -> frozenset[str]:
+    """Import selected missing keys, with inherited values winning interpolation.
+
+    Isolate python-dotenv's private adapter here: the public dotenv_values uses
+    file-first interpolation, even when its result is inserted with setdefault.
+    Return parsed key names for the environment recorder, never values.
+    """
+    from dotenv.main import DotEnv, _load_dotenv_disabled
+
+    if _external_secret_keys is None:
+        raise RuntimeError("external secrets policy not configured")
+    if _load_dotenv_disabled() or not path.is_file():
+        return frozenset()
+    values = DotEnv(str(path), override=False, encoding="utf-8").dict()
+    for key, value in values.items():
+        if key in _external_secret_keys and value is not None:
+            os.environ.setdefault(key, value)
+    return frozenset(values)
 
 
 class NullCostTracker:
@@ -54,7 +93,7 @@ def _build_standalone_router() -> Router | None:
     bus / dead-letter). Returns the ``Router``, or ``None`` if construction
     fails (missing config/secrets) — never raises.
 
-    Touches NO global state. Callers wanting the process-wide singleton use
+    Loads environment values but does not set the runtime singleton. Callers wanting it use
     ``create_standalone_router()``; callers that just need a router instance
     (e.g. the offline attention runner's ``--l15`` path) call this directly and
     own the returned object.
@@ -71,7 +110,9 @@ def _build_standalone_router() -> Router | None:
 
         # 1. Load API keys into environment
         sp = secrets_path()
-        if sp.is_file():
+        if _external_secret_keys is not None:
+            load_external_secrets(sp)
+        elif sp.is_file():
             load_dotenv(str(sp), override=True)
 
         # 2. Load routing config

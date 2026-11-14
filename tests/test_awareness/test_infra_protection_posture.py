@@ -812,6 +812,10 @@ def test_every_rule_slug_has_detail_text():
         "facts": {"registered": True, "disabled": False, "config_present": False},
     }
     producible |= set(_infra_missing_protections(prof_cbm))
+    # IO settings with no io controller for the user manager (storage fact).
+    prof_io = _profile()
+    prof_io["sections"]["storage"]["facts"]["user_manager_io_delegated"] = False
+    producible |= set(_infra_missing_protections(prof_io))
     assert producible == set(_loop._INFRA_POSTURE_DETAIL)
 
 
@@ -1020,3 +1024,91 @@ def test_user_manager_unmonitored_alarm_on_explicit_false_only(um, alarm):
     missing = _infra_missing_protections(_profile(oomd=True, oomd_um=um))
     assert ("oomd_user_manager_unmonitored" in missing) is alarm
 
+
+# ── cgroup IO settings with no io controller: inert, not a crash gap ─────────
+
+_IO_SLUG = "cgroup_io_settings_inert"
+
+
+def _with_io_delegated(value: object) -> dict:
+    profile = _profile()
+    profile["sections"]["storage"]["facts"]["user_manager_io_delegated"] = value
+    return profile
+
+
+@pytest.mark.parametrize(("delegated", "alarm"), [(False, True), (True, False), (None, False)])
+def test_io_settings_inert_alarm_on_explicit_false_only(delegated, alarm):
+    assert (_IO_SLUG in _infra_missing_protections(_with_io_delegated(delegated))) is alarm
+
+
+def test_io_settings_fact_absent_is_silent():
+    assert _IO_SLUG not in _infra_missing_protections(_profile())
+
+
+@pytest.mark.asyncio
+async def test_io_settings_alone_is_a_low_note_not_a_high_alert(monkeypatch):
+    # Owner decision: informational. Alone, the rule never raises the high
+    # posture alert; it is recorded as a low-priority note that still names
+    # each setting and the working alternative.
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _with_io_delegated(False))
+        await _check_infra_protection_posture(db)
+        (alert,) = await _alerts(db)
+        assert alert["priority"] == "low"
+        assert _IO_SLUG in alert["content"]
+        assert "src/genesis/cc/invoker.py" in alert["content"]
+        assert "IOSchedulingClass" in alert["content"]
+        assert "IOSchedulingPriority" in alert["content"]
+        assert "crash-resilience guarantee" not in alert["content"]
+        assert "protection(s) missing" not in alert["content"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_io_settings_beside_a_real_gap_rides_along_without_the_crash_claim(monkeypatch):
+    # A real protection gap keeps the alert high; the IO note still appears in
+    # the text, and is not named as a protection by the crash-resilience sentence.
+    db = await _setup()
+    try:
+        profile = _with_io_delegated(False)
+        profile["sections"]["memory"]["facts"]["cgroup_memory_swap_max"] = 0
+        _use_profile(monkeypatch, profile)
+        await _check_infra_protection_posture(db)
+        (alert,) = await _alerts(db)
+        assert alert["priority"] == "high"
+        assert "container_swap_disabled" in alert["content"]
+        assert _IO_SLUG in alert["content"]
+        assert "crash-resilience guarantee" in alert["content"]
+        assert f"{_IO_SLUG}: informational" in alert["content"]
+    finally:
+        await db.close()
+
+
+
+@pytest.mark.asyncio
+async def test_io_note_never_replaces_a_held_high_alert_when_its_plane_goes_unverifiable(monkeypatch):
+    # Tick 1: a real gap (swap) plus the IO note -> one open high row.
+    # Tick 2: the memory collector fails (facts retained, status error), so the
+    # real gap is unverifiable and only the note is still computable. The hold
+    # must apply exactly as it does with no findings at all: the high row stays
+    # open and no low note supersedes it (the morning report reads high, not low).
+    db = await _setup()
+    try:
+        first = _with_io_delegated(False)
+        first["sections"]["memory"]["facts"]["cgroup_memory_swap_max"] = 0
+        _use_profile(monkeypatch, first)
+        await _check_infra_protection_posture(db)
+        assert [a["priority"] for a in _open(await _alerts(db))] == ["high"]
+
+        second = _with_io_delegated(False)
+        second["sections"]["memory"]["facts"]["cgroup_memory_swap_max"] = 0
+        second["sections"]["memory"]["status"] = "error"
+        _use_profile(monkeypatch, second)
+        await _check_infra_protection_posture(db)
+        rows = await _alerts(db)
+        assert [a["priority"] for a in _open(rows)] == ["high"]
+        assert all(a["priority"] != "low" for a in rows)
+    finally:
+        await db.close()

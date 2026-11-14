@@ -36,6 +36,14 @@ def _mock_bridge_active():
 
 
 @pytest.fixture(autouse=True)
+def _unit_not_starting():
+    """systemd is not starting the target (no real systemctl in tests); the
+    T-W tests below drive the real probe."""
+    with patch.object(WatchdogChecker, "_unit_starting", return_value=None):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _no_deploy_in_progress():
     """Default every watchdog test to 'no deploy running' so the restart gate is
     deterministic regardless of a real ~/.genesis/update_state.json on the host.
@@ -964,6 +972,66 @@ class TestLegacyReasonNormalisation:
             is WatchdogAction.RESTART
         )
 
+    @pytest.mark.parametrize(
+        "bad_ts",
+        [
+            10**309, -(10**309), float("inf"), float("-inf"), float("nan"),
+            1e300, 4_102_444_800.0,  # 2100-01-01 UTC: finite and far in the future
+        ],
+        ids=["huge-int", "huge-negative-int", "inf", "-inf", "nan", "1e300", "year-2100"],
+    )
+    def test_an_unusable_numeric_timestamp_is_dropped(
+        self, tmp_path: Path, stale_status: Path, bad_ts: object,
+    ):
+        """A number can still break the flap arithmetic.
+
+        JSON round-trips an integer too large for a float (``now - ts`` raises
+        OverflowError) and ``Infinity`` (an infinite ``last_ts`` keeps the flap
+        backoff deadline in the future forever, so the target is never
+        restarted). A finite far-future timestamp does the same: ``now - ts`` is
+        negative, so the flap window counts it on every tick. Three same-reason
+        entries put each on the decision path.
+        """
+        self._write(tmp_path, {
+            "consecutive_failures": 0,
+            "next_attempt_after": None,
+            "restart_history": [
+                {"ts": bad_ts, "reason": "target_inactive"} for _ in range(3)
+            ],
+        })
+        checker = _make_checker(tmp_path, stale_status, flap_threshold=3, backoff_max_s=10)
+        state = checker._load_state()
+        assert state["restart_history"] == []
+        assert (
+            checker._restart_if_allowed(state, reason="target_inactive")
+            is WatchdogAction.RESTART
+        )
+
+    @pytest.mark.parametrize("bad_reason", [[], {"r": 1}], ids=["list", "dict"])
+    def test_an_unhashable_history_reason_does_not_raise(
+        self, tmp_path: Path, bad_reason: object,
+    ):
+        self._write(tmp_path, {
+            "consecutive_failures": 0,
+            "next_attempt_after": None,
+            "restart_history": [{"ts": time.time() - 5, "reason": bad_reason}],
+        })
+        checker = _make_checker(tmp_path, tmp_path / "status.json")
+        state = checker._load_state()
+        assert state["restart_history"][0]["reason"] == bad_reason
+        assert (
+            checker._restart_if_allowed(state, reason="target_inactive")
+            is WatchdogAction.RESTART
+        )
+
+    @pytest.mark.parametrize("bad_reason", [[], {"r": 1}], ids=["list", "dict"])
+    def test_an_unhashable_last_reason_does_not_raise(
+        self, tmp_path: Path, bad_reason: object,
+    ):
+        self._write(tmp_path, {"last_reason": bad_reason})
+        checker = _make_checker(tmp_path, tmp_path / "status.json")
+        assert checker._load_state()["last_reason"] == bad_reason
+
     def test_a_malformed_neighbour_does_not_discard_real_history(
         self, tmp_path: Path, stale_status: Path,
     ):
@@ -1312,11 +1380,11 @@ class TestRestartBridge:
     def test_clean_restart_returns_zero(self):
         from genesis.autonomy import watchdog as wd
 
-        completed = MagicMock(returncode=0, stderr="")
+        completed = MagicMock(returncode=0, stderr="", stdout="ActiveState=active\n")
         with patch.object(wd.subprocess, "run", return_value=completed) as run, \
                 patch.object(wd, "_wait_until_active") as wait:
             assert wd.restart_bridge("genesis-server.service") == 0
-            run.assert_called_once()
+            assert run.call_args.args[0][:3] == ["systemctl", "--user", "restart"]
             wait.assert_not_called()  # clean exit needs no verification
 
     def test_timeout_then_active_returns_zero(self):
@@ -1686,3 +1754,161 @@ def _zombie_file(tmp_path: Path) -> Path:
         "scheduler_heartbeats": {"surplus": old.isoformat()},
     }))
     return p
+
+
+# ── T-W: systemd's own start is never cut short (#3492 D2a-2, F3) ────────────
+
+_REAL_UNIT_STARTING = WatchdogChecker._unit_starting
+
+
+def _show(active: str, sub: str, age_s: float, restarts: int = 0) -> MagicMock:
+    stamp = int((time.monotonic() - age_s) * 1e6)
+    out = (
+        f"ActiveState={active}\nSubState={sub}\nNRestarts={restarts}\n"
+        f"StateChangeTimestampMonotonic={stamp}\n"
+    )
+    return MagicMock(returncode=0, stdout=out, stderr="")
+
+
+class TestUnitStarting:
+    def _check(self, tmp_path: Path, status: Path, age_s: float, sub="start-pre", restarts=0):
+        from genesis.autonomy import watchdog as wd
+
+        checker = _make_checker(tmp_path, status)
+        sentinel = WatchdogAction.RESTART
+        with (
+            patch.object(WatchdogChecker, "_unit_starting", _REAL_UNIT_STARTING),
+            patch.object(checker, "_is_bridge_active", return_value=False),
+            patch.object(checker, "_bridge_exited_unconfigured", return_value=False),
+            patch.object(
+                wd.subprocess, "run", return_value=_show("activating", sub, age_s, restarts)
+            ),
+            patch.object(checker, "_restart_if_allowed", return_value=sentinel) as restart,
+        ):
+            return checker.check(), restart
+
+    def test_tw1_a_start_in_progress_is_left_to_systemd(self, tmp_path, fresh_status):
+        """T-W1: the boot repair runs as the unit's start-pre; restarting it
+        would SIGTERM a heal in flight. No failure is recorded."""
+        action, restart = self._check(tmp_path, fresh_status, age_s=5)
+        assert action is WatchdogAction.SKIP
+        restart.assert_not_called()
+        state = tmp_path / "watchdog_state.json"
+        assert not state.exists() or json.loads(state.read_text())["consecutive_failures"] == 0
+
+    def test_a_start_systemd_already_restarted_falls_through(self, tmp_path, fresh_status):
+        """A start step that times out on every try loops through auto-restart
+        without reaching `failed`; after systemd's first restart the watchdog
+        counts it, so the loop still escalates."""
+        action, restart = self._check(tmp_path, fresh_status, age_s=5, restarts=1)
+        restart.assert_called_once()
+        assert action is WatchdogAction.RESTART
+
+    def test_the_auto_restart_delay_falls_through(self, tmp_path, fresh_status):
+        action, restart = self._check(tmp_path, fresh_status, age_s=5, sub="auto-restart")
+        restart.assert_called_once()
+        assert action is WatchdogAction.RESTART
+
+    def test_tw2_a_start_older_than_its_bound_falls_through(self, tmp_path, fresh_status):
+        action, restart = self._check(tmp_path, fresh_status, age_s=400)
+        restart.assert_called_once()
+        assert action is WatchdogAction.RESTART
+
+
+class TestRestartVerb:
+    @pytest.mark.parametrize(
+        ("active", "verb"),
+        [
+            ("failed", "start"),
+            ("inactive", "start"),
+            ("activating", "start"),
+            ("active", "restart"),
+            ("reloading", "restart"),
+            ("deactivating", "restart"),
+        ],
+    )
+    def test_tw3_a_unit_not_active_is_started_never_restarted(self, active, verb):
+        """T-W3: `start` joins a running start job and never stops it (M6); on a
+        failed or inactive unit it does what `restart` would."""
+        from genesis.autonomy import watchdog as wd
+
+        calls: list[list[str]] = []
+
+        def run(argv, **kw):
+            calls.append(argv)
+            if "show" in argv:
+                return _show(active, "start-pre" if active == "activating" else "dead", 1)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with (
+            patch.object(wd.subprocess, "run", side_effect=run),
+            patch.object(wd, "_wait_until_active", return_value=True),
+        ):
+            assert wd.restart_bridge("genesis-server.service") == 0
+        acts = [c[2] for c in calls if "show" not in c]
+        assert acts == [verb], calls
+
+
+def _user_bus() -> dict[str, str]:
+    import os
+
+    run = f"/run/user/{os.getuid()}"
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", run)
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={run}/bus")
+    return env
+
+
+# Both markers: the live fence lets a user_manager test run only the real
+# systemd-run, and its systemctl stub answers "nothing reachable", so the
+# state poll and restart_bridge itself need real_tool("systemctl").
+@pytest.mark.user_manager  # runs a real transient unit with a start step
+@pytest.mark.real_tool("systemctl")
+def test_tw4_a_real_start_step_is_never_sigtermed(tmp_path, monkeypatch):
+    """T-W4: restart_bridge on a unit whose ExecStartPre is running sends it no
+    SIGTERM; a plain `systemctl restart` (the control) does."""
+    import shutil
+    import uuid
+
+    from genesis.autonomy import watchdog as wd
+
+    if not all(shutil.which(tool) for tool in ("systemd-run", "systemctl")):
+        pytest.skip("no systemd tooling: T-W3 covers the verb")
+    env = _user_bus()
+    for probe in (
+        ["systemctl", "--user", "show-environment"],
+        ["systemd-run", "--user", "-p", "MemoryMax=1G", "--wait", "--collect", "-q", "true"],
+    ):
+        if subprocess.run(probe, capture_output=True, timeout=60, env=env).returncode:
+            pytest.skip("no user systemd manager to run a transient unit")
+    monkeypatch.setattr(wd, "systemctl_env", lambda: env)
+
+    def case(name, act) -> str:
+        trap = tmp_path / f"trap-{name}"
+        trap.touch()
+        unit = f"tw4-probe-{uuid.uuid4().hex[:12]}.service"
+        pre = f"/bin/sh -c 'trap \"echo TERM >> {trap}; exit 1\" TERM; sleep 6 & wait'"
+        subprocess.run(
+            ["systemd-run", "--user", "--no-block", f"--unit={unit}", "-p", "MemoryMax=1G",
+             "-p", f"ExecStartPre={pre}", "sleep", "60"],
+            check=True, capture_output=True, env=env, timeout=30,
+        )
+        try:
+            end = time.monotonic() + 10
+            show = ["systemctl", "--user", "show", unit, "-p", "ActiveState", "-p", "SubState"]
+            while "start-pre" not in (seen := subprocess.run(
+                show, capture_output=True, text=True, env=env, timeout=10
+            ).stdout):
+                assert time.monotonic() < end, f"the unit never reached start-pre: {seen!r}"
+                time.sleep(0.1)
+            act(unit)
+            return trap.read_text()
+        finally:
+            for verb in ("stop", "reset-failed"):
+                subprocess.run(["systemctl", "--user", verb, unit], capture_output=True,
+                               env=env, timeout=30)
+
+    assert case("watchdog", lambda u: wd.restart_bridge(u, timeout_s=30)) == ""
+    control = case("control", lambda u: subprocess.run(
+        ["systemctl", "--user", "restart", u], capture_output=True, env=env, timeout=30))
+    assert control == "TERM\n", "the control must see the SIGTERM, or the probe proves nothing"

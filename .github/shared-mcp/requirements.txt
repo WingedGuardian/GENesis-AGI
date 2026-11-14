@@ -1,0 +1,5 @@
+# CI qualification only; expand with the production allowlist after requalification.
+# Ordinary CI and user installs retain their existing runtime dependency ranges.
+fastmcp==4.1.4
+mcp==2.3.0
+uvicorn==0.54.0

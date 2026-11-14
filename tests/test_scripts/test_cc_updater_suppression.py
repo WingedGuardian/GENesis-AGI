@@ -1158,6 +1158,11 @@ class TestCallerWiring:
             if path.name in ("host-setup.sh", "cc_version.sh"):
                 continue
             direct = calls(path, "cc_ensure_updater_suppressed")
+            if path.name == "cc_settings_align.sh":
+                assert direct == [
+                    'if cc_ensure_updater_suppressed "$HOME/.claude/settings.json" --check-only "${CC_CONTAINER_DEFAULTS_EFFECTIVE[@]}"; then'
+                ], direct
+                continue
             assert not direct, (
                 f"{path.relative_to(_REPO_ROOT)} calls the reconciler directly, "
                 f"skipping the container chokepoint: {direct}"
@@ -1195,7 +1200,7 @@ class TestCallerWiring:
         s = _settings(tmp_path)
         s.parent.mkdir(parents=True, exist_ok=True)
         s.write_text(json.dumps(
-            {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}, "theme": "dark"}
+            {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}, "theme": "dark", "cleanupPeriodDays": 180}
         ))
         r = _run(tmp_path, 'cc_ensure_local || true; echo "STATE=$CC_SUPPRESSION_STATE"')
         assert "STATE=defaults" in r.stdout, (r.stdout, r.stderr)
@@ -1372,6 +1377,8 @@ class TestSettingsAlignScriptRuns:
     # CC_CONTAINER_SETTINGS_DEFAULTS, so a file holding only the two suppression
     # keys is an install that has not yet received them.
     _CORRECT = {
+        "cleanupPeriodDays": 180,
+        "attribution": {"commit": "", "pr": "", "sessionUrl": False},
         "env": {
             "DISABLE_AUTOUPDATER": "1",
             "DISABLE_UPDATES": "1",
@@ -1395,7 +1402,7 @@ class TestSettingsAlignScriptRuns:
         (exit 0, one line, never 'MISSING'); tick 2 is silent. A set-if-absent
         default can be written at most once, so the repeat-repair escalation can
         never fire on it."""
-        home = self._seed(tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}})
+        home = self._seed(tmp_path, {"cleanupPeriodDays": 180, "env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}})
         first = self._run_script(home)
         assert first.returncode == 0, first.stdout + first.stderr
         assert "MISSING" not in first.stdout, first.stdout
@@ -1410,7 +1417,7 @@ class TestSettingsAlignScriptRuns:
     def test_a_real_repair_after_a_defaults_tick_is_a_first_repair(self, tmp_path: Path) -> None:
         """`defaults` is persisted as the last outcome; a later genuine repair must
         not be mistaken for the SECOND consecutive one (which fails the unit)."""
-        home = self._seed(tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}})
+        home = self._seed(tmp_path, {"cleanupPeriodDays": 180, "env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}})
         assert self._run_script(home).returncode == 0  # defaults tick
         s = home / ".claude" / "settings.json"
         data = json.loads(s.read_text())
@@ -1470,7 +1477,7 @@ class TestSettingsAlignScriptRuns:
         """The failure this whole timer exists to prevent, one layer up: a green
         unit while the auto-updater is unguarded. If the reconciler is ever
         renamed or moved, this must fail loudly rather than tick over daily."""
-        home = self._seed(tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}})
+        home = self._seed(tmp_path, {"cleanupPeriodDays": 180, "env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}})
         fake_root = tmp_path / "fake"
         (fake_root / "scripts" / "lib").mkdir(parents=True)
         (fake_root / "scripts" / "lib" / "cc_version.sh").write_text(
@@ -2389,14 +2396,14 @@ class TestAlignVerifiesNotAssumes:
         import fcntl as _fcntl
 
         home = self._seed(
-            tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}}
+            tmp_path, TestSettingsAlignScriptRuns._CORRECT
         )
         with self._hold_lock(home) as fh:
             _fcntl.flock(fh, _fcntl.LOCK_EX)
             r = self._run_script(home)
         assert r.returncode == 0, (r.stdout, r.stderr)
         assert "verified read-only" in r.stdout
-        assert "both suppression keys present" in r.stdout
+        assert "suppression, retention and effective defaults verified" in r.stdout
 
     def test_a_held_lock_with_a_fifo_settings_file_fails_fast(self, tmp_path: Path) -> None:
         """The read-only contention path must not BLOCK on a FIFO.
@@ -2675,7 +2682,7 @@ class TestClaudeAiSyncOptOut:
         s = _settings(tmp_path)
         s.parent.mkdir(parents=True, exist_ok=True)
         s.write_text(json.dumps(
-            {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}, **(extra or {})}
+            {"cleanupPeriodDays": 180, "env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}, **(extra or {})}
         ))
         return s
 
@@ -3146,3 +3153,84 @@ class TestClaudeAiSyncOptOut:
             assert ('"syncClaudeAiSkills": false' in r.stdout) is expect_skills, r.stdout
             assert '"syncClaudeAiPlugins": false' in r.stdout, r.stdout
             assert r.stdout.rstrip().endswith("}"), r.stdout  # the hint still closes its object
+
+
+class TestClientRetentionWiring:
+    @pytest.mark.parametrize("before,expected", [(None, 180), (30, 180), (365, 365)])
+    def test_container_chokepoint_applies_user_policy(self, tmp_path, before, expected):
+        settings = _settings(tmp_path)
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"cleanupPeriodDays": before}))
+        result = _run(tmp_path, 'cc_reconcile_container_settings')
+        assert result.returncode == 0, result.stdout + result.stderr
+        data = json.loads(settings.read_text())
+        assert data["cleanupPeriodDays"] == expected
+        assert data["attribution"] == {"commit": "", "pr": "", "sessionUrl": False}
+
+    def test_host_setup_executes_common_policy(self, tmp_path):
+        text = (_REPO_ROOT / "scripts/host-setup.sh").read_text()
+        start = text.index('if cc_ensure_updater_suppressed "$_host_settings_file"')
+        block = text[start:text.index('\n# Under sudo a file', start)]
+        result = _run(tmp_path, '_host_settings_file="$HOME/.claude/settings.json"; ' + block)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(_settings(tmp_path).read_text())["cleanupPeriodDays"] == 180
+        assert "retention" in result.stdout
+
+    @pytest.mark.parametrize("days,success", [(30, False), (365, True)])
+    def test_busy_timer_checks_retention_without_writing(self, tmp_path, days, success):
+        import fcntl
+
+        harness = TestAlignVerifiesNotAssumes()
+        data = dict(TestSettingsAlignScriptRuns._CORRECT, cleanupPeriodDays=days,
+                    attribution={"commit": "", "pr": "", "sessionUrl": False})
+        home = harness._seed(tmp_path, data)
+        settings = home / ".claude/settings.json"
+        before = settings.read_bytes()
+        with harness._hold_lock(home) as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            result = harness._run_script(home)
+        assert (result.returncode == 0) is success, result.stdout + result.stderr
+        assert settings.read_bytes() == before
+
+    def test_project_retention_cap_removed(self):
+        data = json.loads((_REPO_ROOT / ".claude/settings.json").read_text())
+        assert "cleanupPeriodDays" not in data
+
+    def test_host_setup_reports_partial_no_python_and_preserves_created_signal(self, tmp_path):
+        text = (_REPO_ROOT / "scripts/host-setup.sh").read_text()
+        start = text.index('if cc_ensure_updater_suppressed "$_host_settings_file"')
+        block = text[start:text.index('\n# Under sudo a file', start)]
+        bindir = TestVerifiedByConstruction()._bin_sans_python(tmp_path)
+        result = _run(
+            tmp_path,
+            '_host_settings_file="$HOME/.claude/settings.json"; ' + block
+            + '; echo "CREATED=$CC_SUPPRESSION_CREATED STATE=$CC_SUPPRESSION_STATE"',
+            path_dir=bindir,
+        )
+        assert "NOT verified" in result.stdout
+        assert "CREATED=1 STATE=unverified" in result.stdout
+        data = json.loads(_settings(tmp_path).read_text())
+        assert "cleanupPeriodDays" not in data
+        assert data["env"]["DISABLE_AUTOUPDATER"] == "1"
+
+    @pytest.mark.parametrize("script", ["bootstrap.sh", "update.sh", "install.sh"])
+    def test_actual_container_entry_block_applies_policy(self, tmp_path, script):
+        text = (_REPO_ROOT / "scripts" / script).read_text()
+        if script == "install.sh":
+            start = text.index('if cc_reconcile_container_settings "$_settings_file"; then')
+            block = text[start:text.index('\nfi\n', start)] + '\nfi\n'
+        else:
+            message = ('echo "--- Aligning Claude Code to pinned version ---"'
+                       if script == "bootstrap.sh"
+                       else 'echo "--- Syncing container Claude Code to pin ---"')
+            start = text.rfind('_cc_env="$SCRIPT_DIR/lib/cc_version.sh"', 0, text.index(message))
+            assert start >= 0
+            end = text.index('cc_shadow_scan || true', start)
+            block = text[start:end] + '\nfi\n'
+        result = _run(
+            tmp_path,
+            f'SCRIPT_DIR="{_REPO_ROOT / "scripts"}"; HOST_CC_DEGRADED=""; '
+            '_settings_file="$HOME/.claude/settings.json"; ' + block,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(_settings(tmp_path).read_text())["cleanupPeriodDays"] == 180

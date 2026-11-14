@@ -32,6 +32,8 @@ class ErrorCategory(StrEnum):
     # content-policy, malformed/unprocessable request). No same-provider retry
     # and the breaker does NOT trip — it's our payload's fault, not the
     # provider's health, so tripping would wrongly take a healthy provider down.
+    # Carve-out: a 400/422 whose error type is a measured balance token is a
+    # billing state and classifies QUOTA_EXHAUSTED (`retry._BALANCE_ERROR_TOKENS`).
     BAD_REQUEST = "bad_request"
     # An entitlement 403: the credential authenticates fine, but THIS account
     # tier may not use this model. Distinct from both neighbours on purpose,

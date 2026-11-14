@@ -532,6 +532,16 @@ class Segment:
     #: See :func:`_verb_unresolved`. A guard must not read a False verdict off
     #: this segment's verb; :func:`analyze_checked` reports it as a blind spot.
     verb_unresolved: bool = False
+    #: The program this segment runs when its ``$"..."`` locale quoting is read as
+    #: plain double quotes, where that differs from ``exe``. A CANDIDATE, never the
+    #: executable: the shell may translate such a word before it runs. See
+    #: :func:`_locale_reading`.
+    locale_program: str = ""
+    #: The script this segment's shell runs when its ``$"..."`` locale quoting is
+    #: read as plain double quotes, where that differs from the script the parse
+    #: found (``sh -c $"git push"``, ``bash $"-c" '...'``). A CANDIDATE, never
+    #: parsed into segments of its own; see :func:`locale_candidates`.
+    locale_script: str = ""
 
 
 @dataclass
@@ -984,7 +994,8 @@ def parse_segments(
     ``raw`` (so ``_substitutions`` still sees the nested command a substitution redirect
     target EXECUTES) but EXCLUDED from ``argv_src`` — so it can no longer leak into argv
     and spoof ``git_subcommand``/``commit_skips_hooks`` (the push/commit fail-open this
-    split closes). Process substitution ``<(…)``/``>(…)`` stays in BOTH (documented gap).
+    split closes). Process substitution ``<(…)``/``>(…)`` keeps its ``(body)`` in BOTH views, as a
+    word; :func:`_process_substitution_spans` reads the body for the guards.
     ``raw`` stays byte-identical to the historical ``split_segments`` output for every
     ordinary command (the cwd/occurrence consumers match ``Segment.raw`` against a fresh
     re-split; locked by a golden test over a broad corpus). ONE intentional difference
@@ -1233,18 +1244,27 @@ def has_top_level_pipe(command: str, *, count_substitutions: bool = False) -> bo
     return False
 
 
-def _strip_trailing_comment(seg: str) -> str:
-    """Remove an unquoted ``#`` comment (whitespace-preceded or at start) to EOL."""
-    out: list[str] = []
+#: The blanks before which bash starts a comment. Python's ``isspace`` also counts
+#: CR, VT, FF, NEL and NBSP, which bash reads as word characters: ``msg<VT># x``
+#: passes ``# x`` on as arguments.
+_SHELL_BLANKS = frozenset(" \t\n")
+
+
+def _comment_start(seg: str, *, strict: bool = True) -> int | None:
+    """Offset of the ``#`` that starts this segment's comment, or None.
+
+    Strict: the legacy quote scan plus backslash escapes outside quotes, which bash
+    honours (``\\'`` is a literal quote, not the start of one), and bash's blanks.
+    Not strict: the scan main has always used. Neither is bash: each misreads some
+    text the other gets right, so a caller that ALLOWS anything on the answer combines
+    both in the conservative direction rather than trusting either."""
     quote: str | None = None
-    prev_ws = True  # start-of-string counts as preceding whitespace
+    prev_ws = True
     i, n = 0, len(seg)
     while i < n:
         c = seg[i]
         if quote:
-            out.append(c)
             if quote == '"' and c == "\\" and i + 1 < n:
-                out.append(seg[i + 1])
                 i += 2
                 continue
             if c == quote:
@@ -1252,18 +1272,181 @@ def _strip_trailing_comment(seg: str) -> str:
             prev_ws = False
             i += 1
             continue
+        if strict and c == "\\" and i + 1 < n:
+            prev_ws = False
+            i += 2
+            continue
         if c in ("'", '"'):
             quote = c
-            out.append(c)
             prev_ws = False
             i += 1
             continue
         if c == "#" and prev_ws:
-            break  # comment to end of segment
-        out.append(c)
-        prev_ws = c.isspace()
+            return i
+        prev_ws = c in _SHELL_BLANKS if strict else c.isspace()
         i += 1
-    return "".join(out)
+    return None
+
+
+#: Text the legacy scans act on outside quotes: separators, redirections, a comment
+#: start, a line end, a backtick.
+_LEGACY_METAS = frozenset("#;&|<>\n`")
+
+
+def _dq_body_misread(seg: str, i: int, end: int) -> bool:
+    """Whether the legacy scans misread a double-quoted substitution ``seg[i:end]``.
+
+    They do not model substitutions, so a ``"`` in the body closes the outer quote
+    early and the next one reopens it. That is harmless only when the text they then
+    see as unquoted holds nothing they act on, and the pairing ends back inside the
+    outer quote, as bash does (``"$(basename "$f")"``). Otherwise the misread can hide
+    a separator or forge a comment (``"$(printf "x # review-override")"``)."""
+    if '"' not in seg[i:end]:
+        return False
+    quote: str | None = '"'
+    parens = 0
+    j = i
+    while j < end:
+        c = seg[j]
+        if quote == '"':
+            if c == "\\":
+                j += 2
+                continue
+            if c == '"':
+                quote = None
+        elif quote == "'":
+            if c == "'":
+                quote = None
+        elif c in ("'", '"'):
+            quote = c
+        elif c == "\\" or c in _LEGACY_METAS:
+            return True
+        elif c in "({":
+            parens += 1
+        elif c in ")}":
+            parens -= 1
+        j += 1
+    return quote != '"' or parens != 0
+
+
+def _segment_unproven(seg: str, escapes_modelled: bool = True) -> bool:
+    """Whether a boundary in this segment is one the legacy scans cannot be trusted on.
+
+    Refusal only: a True never makes anything readable, and extraction is unchanged,
+    so a substitution is still parsed wherever it was. Each case was measured against
+    bash with a command main showed neither run nor refused (#3713):
+
+    - the segment's comment has a newline after it: a quote in the comment carried the
+      scan past the line end, so the lines after it were cut off with the comment;
+    - outside double quotes, a backslash before ``$(``, before a backtick when another
+      backtick is in the segment, or before a quote in a segment holding a
+      substitution (#3635); and before any quote when the segmenter is not modelling
+      escapes (``escapes_modelled``: it does only for text with no ``#``), since the
+      quote it then opens can swallow a separator and the command after it;
+    - a backtick body holding a backslash;
+    - a double-quoted substitution the legacy scans misread (``_dq_body_misread``).
+
+    A body containing ``<<`` is left to ``_heredoc_hidden_suffixes``, which owns
+    here-doc bodies; the scan here would read the body as shell. A substitution that
+    never closes is not refused: bash runs nothing from that line on, and the lines
+    before it are segments already."""
+    cut = _comment_start(seg)
+    if cut is not None and "\n" in seg[cut:]:
+        return True
+    # argv drops seg[legacy:] as a comment the strict scan says bash does not read.
+    # Refuse if that text could carry a flag or an expansion (`x\ # --force` pushes
+    # with --force); text like ` #b` is only a word.
+    legacy = _comment_start(seg, strict=False)
+    dropped = "" if legacy is None or (cut is not None and cut <= legacy) else (
+        seg[legacy : len(seg) if cut is None else cut]
+    )
+    if any(ch in dropped for ch in "-$`"):
+        return True
+    has_opener = "$(" in seg or "`" in seg
+    quote: str | None = None
+    i, n = 0, len(seg)
+    while i < n:
+        c = seg[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            nxt = seg[i + 1]
+            # A lone escaped backtick has nothing to pair with; beside another one the
+            # extraction pairs them and misses the real substitution.
+            if quote is None and (
+                seg.startswith("$(", i + 1)
+                or (nxt == "`" and seg.count("`") > 1)
+                or (has_opener and nxt == "'")
+                or (not escapes_modelled and nxt in ("'", '"'))
+            ):
+                return True
+            i += 2
+            continue
+        if c in ("'", '"'):
+            quote = None if quote == c else (quote or c)
+            i += 1
+            continue
+        if c == "$" and seg.startswith("$(", i):
+            end = _command_sub_end(seg, i, n)
+            if "<<" not in seg[i:end] and quote == '"' and _dq_body_misread(seg, i, end):
+                return True
+            i = end
+            continue
+        if c == "`":
+            close = seg.find("`", i + 1)
+            if close == -1:
+                return False
+            body = seg[i + 1 : close]
+            if "<<" not in body and (
+                "\\" in body or (quote == '"' and _dq_body_misread(seg, i, close + 1))
+            ):
+                return True
+            i = close + 1
+            continue
+        i += 1
+    return False
+
+
+def _trusted_bodies(
+    command: str, bodies: list[tuple[int, int, int]]
+) -> list[tuple[int, int]]:
+    """The here-doc bodies whose lines are data to bash, as ``(start, end)``.
+
+    The openers come from the legacy scan, which records a ``<<`` that bash reads as
+    quoted text (after ``\\'``) or as part of a comment, and those bodies hold lines
+    bash runs. A body is kept only when ``_TopLevel``, the bash-like pass, places its
+    opener outside every quote and nesting, no ``#`` precedes it on its line, and it
+    does not sit inside a body already kept (there it is data). Dropping one only
+    removes the relief: its lines are checked like any others."""
+    top = _TopLevel(command)
+    kept: list[tuple[int, int]] = []
+    starts: list[int] = []
+    for opener, start, end in sorted(bodies):
+        # Kept bodies are disjoint and ascending (an opener inside one is skipped),
+        # so a bisect finds the only one that could hold this opener.
+        k = _bisect_right(starts, opener) - 1
+        if k >= 0 and opener < kept[k][1]:
+            continue  # a `<<` inside an earlier body is that body's data, no opener
+        line = command.rfind("\n", 0, opener) + 1
+        if top.at(opener) and "#" not in command[line:opener]:
+            kept.append((start, end))
+            starts.append(start)
+    return kept
+
+
+def _strip_trailing_comment(seg: str) -> str:
+    """Remove an unquoted ``#`` comment (blank-preceded or at start) to EOL.
+
+    The cut main has always made, deliberately: argv must not change in either
+    direction. A cut moved earlier drops words bash passes (``--force`` after
+    ``${x:+ \\' # }``), and one moved later keeps words bash never passes (a
+    ``--help`` that would skip a gate). Where the strict and legacy scans disagree,
+    ``_segment_unproven`` refuses instead."""
+    cut = _comment_start(seg, strict=False)
+    return seg if cut is None else seg[:cut]
 
 
 # The recognized ack/override sigils. A trailing comment may carry several of these
@@ -1330,7 +1513,17 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
     — a prose token ahead of the sigil ends the run. This keeps independent acks
     able to coexist without letting an incidental or negated prose mention waive
     the gate.
+
+    The answer is the legacy scan AND the strict one, so an override counts only
+    where main also counted it: the strict scan's own boundaries (a substitution's
+    close, read without comments) are not bash's either, and acting alone it once
+    honoured a sigil main refused (``$(true # ) # sigil`` + newline + ``)``).
     """
+    return _override_scan(seg, sigil, strict=False) and _override_scan(seg, sigil, strict=True)
+
+
+def _override_scan(seg: str, sigil: str, *, strict: bool) -> bool:
+    """One reading of :func:`_has_trailing_override`. Not strict: main's scan."""
     quote: str | None = None
     prev_ws = True
     i, n = 0, len(seg)
@@ -1345,10 +1538,29 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
             prev_ws = False
             i += 1
             continue
+        if strict and c == "\\" and i + 1 < n:
+            # An escaped quote outside quotes is a literal to bash, and the scan
+            # cannot follow where bash's real quotes then go (`\"x" # sigil"` holds
+            # no comment). Waive nothing rather than guess.
+            if seg[i + 1] in ("'", '"'):
+                return False
+            prev_ws = False
+            i += 2
+            continue
         if c in ("'", '"'):
             quote = c
             prev_ws = False
             i += 1
+            continue
+        # A `#` inside a substitution is that command's comment, not this segment's.
+        if strict and c == "$" and seg.startswith("$(", i):
+            i = _command_sub_end(seg, i, n)
+            prev_ws = False
+            continue
+        if strict and c == "`":
+            close = seg.find("`", i + 1)
+            i = n if close == -1 else close + 1
+            prev_ws = False
             continue
         if c == "#" and prev_ws:
             for tok in seg[i + 1 :].split():
@@ -1358,7 +1570,7 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
                     return False  # a prose token ends the leading run of sigils
                 # else: a DIFFERENT recognized sigil — still in the run, keep scanning
             return False
-        prev_ws = c.isspace()
+        prev_ws = c in _SHELL_BLANKS if strict else c.isspace()
         i += 1
     return False
 
@@ -1368,7 +1580,7 @@ def has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
     return _has_trailing_override(seg, sigil)
 
 
-def _ansi_c_spans(text: str) -> list[tuple[int, int, str, bool]]:
+def _ansi_c_spans(text: str, _locale: list[int] | None = None) -> list[tuple[int, int, str, bool]]:
     """Locate bash ANSI-C ``$'...'`` quoting spans in SHELL-WORD context.
 
     Returns ``(start, end, content, has_escape)`` per span, where ``end`` is the
@@ -1396,10 +1608,16 @@ def _ansi_c_spans(text: str) -> list[tuple[int, int, str, bool]]:
     for the design choice, not a runtime invariant; the invariant is the
     dq/sq/backslash state machine below, which a security review verified against
     bash's own rules.
+
+    ``_locale``, when given, also collects the index of every ``$`` that opens bash
+    LOCALE quoting (``$"..."``) at word level, from this same walk and quote state
+    rather than a second model of them (see :func:`_locale_reading`). The spans
+    returned are the same with or without it.
     """
     spans: list[tuple[int, int, str, bool]] = []
     i, n = 0, len(text)
     in_sq = in_dq = False
+    expansion = -2  # the last word-level `$` that starts an expansion of its own
     while i < n:
         c = text[i]
         if in_sq:
@@ -1453,8 +1671,25 @@ def _ansi_c_spans(text: str) -> list[tuple[int, int, str, bool]]:
             in_sq = True
             i += 1
             continue
+        if c == "$":
+            # `$$` is the shell's pid parameter, so the second sign of a pair opens
+            # nothing (`$$"x"` is the pid, then plain quotes) and the sign after the
+            # pair starts afresh. One comparison per character: no rescan.
+            if expansion == i - 1:
+                expansion = -2
+            else:
+                expansion = i
+                if _locale is not None and text.startswith('"', i + 1):
+                    _locale.append(i)
         i += 1
     return spans
+
+
+def _locale_openers(text: str) -> list[int]:
+    """The index of every ``$`` in ``text`` that opens ``$"..."`` locale quoting."""
+    found: list[int] = []
+    _ansi_c_spans(text, found)
+    return found
 
 
 def _decode_escape_free_ansi_c(text: str) -> str:
@@ -1502,6 +1737,37 @@ def _argv(seg: str) -> list[str]:
         return shlex.split(core)
     except ValueError:
         return core.split()
+
+
+def words_with_quoting(seg: str) -> list[tuple[str, bool]] | None:
+    """Each shell word of one segment, with whether bash saw it quoted WHOLE.
+
+    ``("x=a b", True)`` for ``'x=a b'``; ``("--in=a", False)`` for
+    ``--in="a"``, whose prefix is unquoted. The word is :func:`_argv`'s; "quoted
+    whole" comes from a second, quote-keeping tokenization of the same text, and
+    only when that token is one quote pair whose inside is exactly the word.
+    Anything else (an escape inside the quotes, a quote pair mid-word) reads as
+    not quoted whole, which a caller treats as an operand. None when the two
+    tokenizations disagree on the word count, or either fails: the caller then
+    knows nothing about quoting and must fail toward checking.
+    """
+    core = _strip_trailing_comment(_decode_escape_free_ansi_c(seg))
+    try:
+        words = shlex.split(core)
+        lex = shlex.shlex(core, posix=False)
+        lex.whitespace_split = True
+        lex.commenters = ""
+        raws = list(lex)
+    except ValueError:
+        return None
+    if len(raws) != len(words):
+        return None
+    out = []
+    for word, raw in zip(words, raws, strict=True):
+        q = raw[:1]
+        whole = len(raw) >= 2 and q in ("'", '"') and raw[-1] == q and raw[1:-1] == word
+        out.append((word, whole and q not in raw[1:-1]))
+    return out
 
 
 def untokenizable(command: str) -> bool:
@@ -1898,6 +2164,100 @@ _BLIND_UNCLASSIFIED_OPTION = BlindSpot(
         "it configures another way. If the option is legitimate and current, it "
         "belongs in the option tables in shell_parse (with the classification "
         "MEASURED against the installed binary, not read from help output)"
+    ),
+)
+
+#: A word that decides WHICH PROGRAM runs is written in bash's locale quoting,
+#: ``$"..."``. With no message catalog bash runs the text as written, and shlex,
+#: which knows no such form, keeps the ``$``: so the parse names a program one
+#: character off from the one bash runs, every gate looking for that program finds
+#: none, and nothing else reports it (the word tokenizes cleanly). The verb-position
+#: twin was already caught by :data:`_BLIND_UNRESOLVED_VERB`; this is the program.
+#:
+#: REPORTED, NOT DECODED. Reading the word as plain quotes is right only while no
+#: translation applies: bash looks the string up in a message catalog chosen by
+#: LC_MESSAGES, TEXTDOMAIN and TEXTDOMAINDIR, and ignores the dollar sign only in
+#: the C or POSIX locale or when it finds no translation (bash(1), QUOTING, read
+#: 2026-11-12). A decode would hand a hard policy verdict to a word that may not be
+#: the one that runs. The untranslated reading is kept on
+#: :attr:`Segment.locale_program` as a CANDIDATE, for a guard to test against its
+#: own gated programs.
+#:
+#: NOT the measured exception beside :data:`_ALL_BLIND_SPOTS` (a program named by a
+#: variable stays unreported): that one is ordinary work at volume, and this spelling
+#: is not. It fires only when removing the locale quoting CHANGES the program the
+#: wrapper walk resolves AND leaves a literal name, so ``$"..."`` in an argument, a
+#: wrapper's value or the directory part of a path reports nothing.
+#:
+#: ``bounds_induced`` is False for the reason given at :data:`_BLIND_UNRESOLVED_VERB`:
+#: no bound fired and the segments are complete.
+#:
+#: RESIDUAL, stated so it is not read as coverage: this cause reads the words that
+#: choose the PROGRAM, :data:`_BLIND_UNRESOLVED_VERB` the words that choose the
+#: operation, and :data:`_BLIND_LOCALE_SCRIPT` the ``-c`` and script operand of a
+#: shell in ``_NESTED``. Any other locale-quoted option or operand is reported by
+#: none of them; see the residual list at :data:`_BLIND_LOCALE_SCRIPT`.
+_BLIND_LOCALE_PROGRAM = BlindSpot(
+    bounds_induced=False,
+    cause=(
+        'uses $"..." locale quoting in the words that decide which program runs; '
+        "the shell may translate such a word before it runs, so the guard cannot "
+        "establish which program that is"
+    ),
+    hint=(
+        "write the program name, and any wrapper or option before it, plainly (no "
+        'quotes, or plain quotes); $"..." belongs in a message argument'
+    ),
+)
+
+#: The same quoting one level down: a shell (``_NESTED``) handed the SCRIPT it runs
+#: in ``$"..."``, or the ``-c`` that selects the script written that way
+#: (``sh -c $"git push"``, ``bash $"-c" 'git push'``). shlex keeps the dollar sign,
+#: so the parse reads the script as ``$git push``, a program held in a variable,
+#: which is deliberately unreported (beside :data:`_ALL_BLIND_SPOTS`), or finds no
+#: ``-c`` and no script at all. Bash, with no catalog, runs the plain text, and the
+#: plain spelling of the same command was refused while this one was allowed.
+#:
+#: REPORTED, NOT DECODED, for the reason at :data:`_BLIND_LOCALE_PROGRAM`: a
+#: translation may change the script before the shell runs it. The untranslated
+#: reading is kept on :attr:`Segment.locale_script` as a CANDIDATE and is never
+#: parsed into segments; :func:`locale_candidates` names the dispatchers it mentions
+#: (a mention scan, refusal-only), which is how the push, commit and discard guards
+#: refuse it. It fires only when the plain reading of the segment, through the same
+#: wrapper walk and the same ``_nested_script``, finds a script that differs from
+#: the one the parse found, so locale quoting INSIDE a plain-quoted script, or in a
+#: shell's ``$0`` or positional arguments, reports nothing.
+#:
+#: Below :data:`_BLIND_LOCALE_PROGRAM`, so a command whose program word is also
+#: locale-quoted keeps that cause and its hint; fixing the program word then
+#: leaves this one to report.
+#:
+#: Both causes are also read inside a body the parse rebuilds from tokens (a
+#: ``case`` arm, a function body, ``coproc``): see :func:`_plain_reading`.
+#:
+#: RESIDUAL, stated so it is not read as coverage. Not read: a locale-quoted
+#: payload of any launcher outside ``_NESTED``, which is answered as its plain
+#: spelling is (the ``_REPARSE_CARRIERS`` such as ``eval`` and ``su`` by the push
+#: guard's carrier net on a gated mention; not at all for the launchers whose
+#: plain payload this parse does not read either: a here-string or pipe into a
+#: shell, ``busybox sh -c``, ``find -exec``, ``parallel``, ``taskset``, ``ssh``,
+#: ``trap``, ``at``, ``$SHELL -c``, a script passed as a positional argument or
+#: built by a substitution, a program named by a variable), and a locale-quoted
+#: option or operand of any other program. A guard that does not read blind spots
+#: (the full-suite, worktree-removal, PR-open and issue-create guards) is not
+#: changed by either cause. A guard whose business is not git or gh sees only this cause,
+#: not what the candidate script runs, since the candidate is mention-scanned for
+#: the dispatchers and nothing else.
+_BLIND_LOCALE_SCRIPT = BlindSpot(
+    bounds_induced=False,
+    cause=(
+        'passes a shell its script, or the -c that selects it, in $"..." locale '
+        "quoting; the shell may translate that text before it runs it, so the "
+        "guard cannot establish what the script runs"
+    ),
+    hint=(
+        "write the -c option plainly and the script in plain quotes (single or "
+        'double); $"..." belongs in a message argument'
     ),
 )
 
@@ -2467,6 +2827,7 @@ def _heredoc_hidden_suffixes(
     origin: tuple[_HeredocLines, int] | None = None,
     in_substitution: bool = False,
     _inert: list[bool] | None = None,
+    _bodies: list[tuple[int, int, int]] | None = None,
 ) -> list[tuple[int, str, int]]:
     """``(opener, why, at)`` for each here-doc in ``text`` whose body the parse cannot
     be trusted past. ``splits`` and ``openers`` come from the parse of ``text`` itself
@@ -2521,6 +2882,10 @@ def _heredoc_hidden_suffixes(
     fired on 93 real commands at depth 1 and on none was anything hidden, since a
     ``"$(cat <<'EOF'`` body with an apostrophe hands the nested parse a script ending
     ``EOF`` newline ``)``, and a closing paren runs nothing.
+
+    ``_bodies``, when passed, receives ``(opener, start, end)`` in ``text`` for each body
+    whose terminator this check found. That is only as good as the openers, which
+    come from the legacy scan; ``_trusted_bodies`` keeps the ones bash agrees are real.
 
     LINEAR, deliberately: the index is built once per text, and each opener costs a
     constant number of bisects. This runs on a hook path, where a hook killed by its
@@ -2613,6 +2978,8 @@ def _heredoc_hidden_suffixes(
             queued = unknown
             continue
         terminator = lines.ends[primary]  # in the original text
+        if _bodies is not None:
+            _bodies.append((opener, start - base, terminator - base))  # in `text`
         if (
             in_substitution
             and quoted
@@ -2744,6 +3111,25 @@ _STRUCTURAL_DISPATCHERS = (
 )
 
 
+def locale_candidates(segment: Segment) -> frozenset[str]:
+    """The programs ``segment`` may run that only its ``$"..."`` reading names.
+
+    :attr:`Segment.locale_program` when set, plus each dispatcher in
+    ``_STRUCTURAL_DISPATCHERS`` that :attr:`Segment.locale_script` mentions. The
+    script is mention-scanned, never parsed: the result can only ADD a refusal, for
+    a guard to intersect with its own gated programs. Empty for every segment with
+    no locale quoting in the words that choose its program or script.
+    """
+    found = {segment.locale_program} if segment.locale_program else set()
+    if segment.locale_script:
+        found.update(
+            program
+            for program, pattern in _STRUCTURAL_DISPATCHERS
+            if mentions(segment.locale_script, pattern)
+        )
+    return frozenset(found)
+
+
 def unresolved_verb_programs(command: str) -> frozenset[str]:
     """The programs whose operation is unresolved, plus structural candidates.
 
@@ -2774,6 +3160,10 @@ def unresolved_verb_programs(command: str) -> frozenset[str]:
             for segment in result.segments
             if _dispatcher_verb_unresolved(segment)
         )
+        # A locale-quoted program word, or a shell script in that quoting, leaves
+        # the operation just as unestablished.
+        for segment in result.segments:
+            programs.update(locale_candidates(segment))
         if result.structural_incomplete:
             for program, pattern in _STRUCTURAL_DISPATCHERS:
                 if mentions(result.decision_text, pattern):
@@ -2806,6 +3196,10 @@ def unresolved_verb_programs(command: str) -> frozenset[str]:
 #: 200-odd extra prompts alone would also put the change an order of magnitude past
 #: the cost the narrow rule pays.
 #:
+#: (That guard defect has since been fixed: `protected_paths_guard` now runs its
+#: substring fallback in ADDITION to the segment scan, so a new non-bounds cause can
+#: only add a refusal there. The volume argument above is unchanged by that.)
+#:
 #: The residual that leaves, stated so it is not mistaken for coverage: a command
 #: that names its program with a variable is read exactly as it is today, whether or
 #: not it spells the operation. Closing it needs a way to tell such a command apart
@@ -2828,6 +3222,8 @@ _ALL_BLIND_SPOTS = (
     _BLIND_OVER_LONG,
     _BLIND_UNRESOLVED_VERB,
     _BLIND_UNCLASSIFIED_OPTION,
+    _BLIND_LOCALE_PROGRAM,
+    _BLIND_LOCALE_SCRIPT,
     _BLIND_CONTINUATION,
     _BLIND_BUILT_ESCAPE,
     _BLIND_BASH53_SUBSTITUTION,
@@ -2920,6 +3316,11 @@ def analyze_checked(command: str, *, _policy=None) -> tuple[list[Segment], Blind
     Every withholding cause has ``bounds_induced`` set: a consumer that trusts the
     returned segments must not receive a partial list.
 
+    An unproven comment or substitution boundary (:func:`_segment_unproven`) ranks
+    below all of these: it reports the structural cause only where nothing else, or
+    only an unresolved verb, would be reported, so it adds refusals without moving
+    any existing one.
+
     Structural incompleteness is retained independently of the selected diagnostic.
     A higher-priority bound, continuation, or built escape can win the message while
     recovery still needs the fact to add refusal-only Git/GitHub candidates.
@@ -2949,7 +3350,8 @@ def analyze_checked(command: str, *, _policy=None) -> tuple[list[Segment], Blind
     cause and hint it had, so the rule can only add net coverage and can never
     reword or re-rank an existing refusal. It also makes the change measurable — the
     flips it causes are exactly the commands moving from "clean parse" to "blind",
-    with nothing else shifting underneath them.
+    with nothing else shifting underneath them. :data:`_BLIND_LOCALE_PROGRAM` and
+    :data:`_BLIND_LOCALE_SCRIPT` sit below it, on the same reasoning.
     """
     result = _analyze_bounded(command, _policy=_policy)
     if result.diagnostic is not None and result.diagnostic.bounds_induced:
@@ -3642,6 +4044,22 @@ _C_VALUE_TAKING = {
 }
 #: Every other supported interpreter takes `-o option` but not `-O`.
 _C_VALUE_TAKING_DEFAULT = frozenset("o")
+
+#: GNU long options that take their VALUE as the next word. MEASURED on bash 5.2:
+#: `bash --help` lists sixteen long options and only these two take a value;
+#: `bash --rcfile +c --norc -c CMD` runs CMD with `+c` as the rc FILE NAME, and
+#: only the exact spelling is accepted (`--rcfile=FILE` and `--rcf FILE` are
+#: invalid options). dash and zsh reject both names outright, so consuming the
+#: value there can only over-report an invocation that runs nothing.
+_LONG_OPTIONS_WITH_VALUE = frozenset({"--rcfile", "--init-file"})
+
+#: Shells for which a LONE `+` ENDS option processing, so the next word is the
+#: operand even when it looks like an option. The rest (bash, dash, ash and the
+#: `sh` that resolves to one of them) skip a lone `+` as an empty bundle and keep
+#: parsing (#2218). MEASURED with `<shell> + -n FILE`: zsh 5.9, ksh93u+m and
+#: mksh R59 run a script NAMED `-n`; bash 5.2, dash 0.5.12 and busybox ash run
+#: nothing because `-n` is still an option there.
+_LONE_PLUS_ENDS_OPTIONS = frozenset({"zsh", "ksh", "mksh"})
 
 #: Options that make the shell PARSE the script and not execute it. MEASURED on
 #: bash 5.2: `bash -n -c CMD`, `bash -D -c CMD` and `bash -o noexec -c CMD` all
@@ -4401,6 +4819,96 @@ def _dispatcher_verb_unresolved(seg: Segment) -> bool:
     return bool(seg.verb_unresolved and seg.argv and _basename(seg.argv[0]) in _VERB_DISPATCHERS)
 
 
+def _locale_reading(
+    src: str, tokens: list[str], argv: list[str], carried_open: int, env_depth: int
+) -> tuple[str, str]:
+    """``(program, script)``: what ``src`` runs with its ``$"..."`` locale quoting
+    read as plain double quotes, where that differs from what ``argv`` resolved.
+
+    ``program`` is the literal name that reading runs when it is not the one
+    ``argv`` resolved; ``script`` is the script that reading hands a shell in
+    ``_NESTED`` when it is not the one the parse found (a locale-quoted script, or a
+    locale-quoted ``-c``). Each is ``""`` otherwise, which is the common answer:
+    locale quoting in an argument, a wrapper's value, the directory part of a path,
+    inside a plain-quoted script or in a shell's positional arguments leaves both
+    where they were. The comparison is between two runs of the SAME wrapper walk and
+    the same ``_nested_script`` rather than a test of ``argv[0]``, so a locale-quoted
+    wrapper word or wrapper option, which moves the walk onto a different program,
+    is seen too.
+
+    Both are candidates only (see :data:`_BLIND_LOCALE_PROGRAM` and
+    :data:`_BLIND_LOCALE_SCRIPT`): nothing here feeds ``exe`` or ``argv``, and the
+    script is never parsed. A second reading that still names its program with an
+    expansion gives no ``program`` and stays the unreported half described beside
+    :data:`_ALL_BLIND_SPOTS`.
+
+    A body the parse rebuilds from tokens (a case arm, a function body, a
+    ``coproc`` command: :func:`_embedded_commands`) is read the same way, one level
+    down: the tokens it is rebuilt from have already lost the quoting, so the inner
+    parse can never see it, and the segment itself resolves to the construct. The
+    plain reading's body is compared with the parse's body through the same walk,
+    and what it runs is this segment's candidate. ``tokens`` is the segment's own
+    tokenization, the one the parse rebuilds its body from.
+
+    COST: one walk for the openers, one join, one more tokenization and wrapper walk
+    of this segment, and two ``_nested_script`` walks of an argv, whatever the number
+    of openers; for a rebuilt body, the same again per level, at most
+    ``MAX_SUBSTITUTION_DEPTH`` levels, the bound the parse itself descends to.
+    Linear in the segment, and the caller skips it for a segment with no ``$"`` in
+    it. Nothing here loops over the openers to re-read the text.
+    """
+    openers = _locale_openers(src)
+    if not openers:
+        return "", ""
+    plain = "".join(
+        src[a + 1 : b] for a, b in zip([-1, *openers], [*openers, len(src)], strict=True)
+    )
+    return _plain_reading(_argv(plain), tokens, argv, carried_open, env_depth, 0)
+
+
+def _plain_reading(
+    plain_tokens: list[str],
+    tokens: list[str],
+    argv: list[str],
+    carried_open: int,
+    env_depth: int,
+    level: int,
+) -> tuple[str, str]:
+    """:func:`_locale_reading` for an already plain tokenization ``plain_tokens``,
+    against the parse's ``tokens`` and the ``argv`` it resolved them to."""
+    if level < MAX_SUBSTITUTION_DEPTH:
+        # A rebuilt body first: the segment itself resolves to the construct
+        # (`case`, `f()`, `coproc`), which the plain reading leaves where it was.
+        rebuilt = _embedded_commands(tokens)
+        for k, body in enumerate(_embedded_commands(plain_tokens)):
+            parsed = rebuilt[k] if k < len(rebuilt) else ""
+            if body == parsed:
+                continue
+            inner = _argv(parsed) if parsed else []
+            found = _plain_reading(
+                _argv(body),
+                inner,
+                _strip_wrappers(inner, 0, _env=_EnvSplitState(depth=env_depth)),
+                0,
+                env_depth,
+                level + 1,
+            )
+            if found != ("", ""):
+                return found
+    words = _strip_wrappers(plain_tokens, carried_open, _env=_EnvSplitState(depth=env_depth))
+    name = _basename(words[0]) if words else ""
+    resolved = _basename(argv[0]) if argv else ""
+    program = name
+    if not name or not _word_is_literal(name) or name == resolved:
+        program = ""
+    script = ""
+    if name in _NESTED:
+        script = _nested_script(words, name)
+        if script and resolved in _NESTED and script == _nested_script(argv, resolved):
+            script = ""
+    return program, script
+
+
 def analyze(command: str) -> list[Segment]:
     """Parse a Bash command into executed Segments (nested scripts flattened).
 
@@ -4438,6 +4946,7 @@ class _AnalysisResult:
     structural_incomplete: bool
     decision_text: str
     heredoc_incomplete: bool
+    boundary_unproven: bool = False  # see _segment_unproven; applied at depth 0 only
 
 
 def _analyze_bounded(
@@ -4449,8 +4958,26 @@ def _analyze_bounded(
     _ancestors: tuple[tuple[str, str | None], ...] = (),
     _kind: str = "root",
     _env_depth: int = 0,
+    _added_work: list[int] | None = None,
+    _in_added: bool = False,
 ) -> _AnalysisResult:
-    """Parse once, retaining diagnostics and structural facts from every visited level."""
+    """Parse once, retaining diagnostics and structural facts from every visited level.
+
+    ``_added_work`` is ``[used, budget]``, shared by every level of one parse: the
+    characters descended into through a substitution body the legacy scan does not
+    find (see :func:`_substitution_spans`), or anywhere beneath one. The legacy
+    descents are never counted, so a command the legacy scan reads costs what it
+    did. Past the budget the parse stops descending and reports the over-nested
+    bound, the same fail-closed signal as the depth bound. The budget is two passes
+    over the command: a real missed substitution, and one more level inside it, fit,
+    while a crafted command that stacks bodies level on level would multiply the work
+    (MEASURED 2026-11-10, ``analyze_checked`` on crafted commands near the length
+    cap: 6.28s against 0.73s on main without this budget, at most 1.45s against
+    1.00s with it). The cost is that a chain of nested substitutions whose bodies
+    add up to more than twice the command, behind a quote only the legacy scan
+    misreads, is refused as over-nested (measured: six levels at 70 characters)."""
+    if _added_work is None:
+        _added_work = [0, 2 * len(command)]
     # Past the cap, parse NOTHING. Not a prefix: truncating a command mid-string flips
     # the quoting state for everything after the cut, so a prefix parse is not a
     # partial answer, it is a confidently wrong one — and the guards match on the
@@ -4479,11 +5006,16 @@ def _analyze_bounded(
     splits: list[int] = []
     openers: list[int] = []
     starts: list[int] = []
-    ranges, targets = ([] if _policy is not None else None), ([] if _policy is not None else None)
+    ranges: list[tuple[int, int, bool]] = []
+    targets = [] if _policy is not None else None
     parsed = parse_segments(command, _splits=splits, _openers=openers, _starts=starts,
                             _ranges=ranges, _targets=targets)
-    visible_ranges = iter((b, e) for b, e, visible in ranges or [] if visible)
-    for begin, end, visible in ranges or []:
+    visible_ranges = iter((b, e) for b, e, visible in ranges if visible)
+    # Process substitution bodies, read in this level's text: parse_segments drops
+    # the `<`/`>` and leaves `(body)` in raw, where it reads as a word.
+    process_spans = _process_substitution_spans(command) if "(" in command else []
+    level_spans: list[tuple[int, int]] | None = None
+    for begin, end, visible in ranges if _policy is not None else ():
         redirections = tuple((op, target) for at, op, target in targets if begin <= at < end)
         if not visible and redirections:
             _policy.append(PolicySegment("", [], False, "", depth=_depth,
@@ -4497,13 +5029,19 @@ def _analyze_bounded(
     # grammar admits none).
     openers = [o for o in openers if o > proven_line]
     inert: list[bool] = []
+    bodies: list[tuple[int, int, int]] = []
     carried = False
     try:
-        reports = _heredoc_hidden_suffixes(command, splits, openers, here, _in_substitution, inert)
+        reports = _heredoc_hidden_suffixes(
+            command, splits, openers, here, _in_substitution, inert, bodies
+        )
         heredoc = bool(reports)
         carried = any(reason == "carried" for _, reason, _ in reports)
     except Exception:  # noqa: BLE001 — never raise inside the parse; unread is reported
         heredoc = True
+    data_lines = _trusted_bodies(command, bodies)
+    body_starts = [b0 for b0, _ in data_lines]
+    escapes_modelled = "#" not in command  # parse_segments' own switch for this text
     # Only the canonical traversal's whole-fragment proof grants relief. An empty
     # report list is NOT proof; decoded scripts never inherit an outer proof.
     structural_incomplete = structural_incomplete and not inert
@@ -4513,6 +5051,10 @@ def _analyze_bounded(
     # closes. Counted on the segment SOURCE text outside quotes and comments, so a
     # paren inside a quoted argument is never mistaken for a subshell.
     carried_open = 0
+    # A boundary the legacy scans may have misread (_segment_unproven). This
+    # fragment's own whole-body proof clears it; nothing else does, and a proof in a
+    # nested fragment never reaches this one.
+    boundary_unproven = False
     for seg, start in zip(parsed, starts, strict=True):
         raw = seg.raw
         override = _has_trailing_override(raw)
@@ -4524,7 +5066,21 @@ def _analyze_bounded(
         argv = _strip_wrappers(tokens, carried_open, _contexts=contexts, _env=env_state)
         structural_incomplete = structural_incomplete or env_state.unresolved
         structural_message = structural_message or env_state.unresolved
+        if not boundary_unproven and not inert:
+            # Bodies are disjoint and ordered, so a bisect finds the one that could
+            # hold this segment: linear overall, not segments x bodies (a hook killed
+            # by its clock permits).
+            k = _bisect_right(body_starts, start) - 1
+            in_body = k >= 0 and start < data_lines[k][1]
+            if not in_body and _segment_unproven(raw, escapes_modelled):
+                boundary_unproven = True
         truncated = truncated or env_state.exhausted
+        # Before `carried_open` moves on: the second reading walks the same wrappers.
+        locale_program, locale_script = (
+            _locale_reading(seg.argv_src, tokens, argv, carried_open, _depth + _env_depth)
+            if '$"' in seg.argv_src
+            else ("", "")
+        )
         carried_open = max(0, carried_open + _net_subshell_depth(seg.argv_src))
         exe = _basename(argv[0]) if argv else ""
         out.append(
@@ -4535,9 +5091,11 @@ def _analyze_bounded(
                 raw=raw,
                 redirects=list(seg.redirects),
                 verb_unresolved=_verb_unresolved(argv),
+                locale_program=locale_program,
+                locale_script=locale_script,
             )
         )
-        begin, end = next(visible_ranges) if _policy is not None else (0, 0)
+        begin, end = next(visible_ranges)
         if _policy is not None:
             _policy.append(PolicySegment(**(vars(out[-1]) | {"depth": _depth}),
                 position=_scope + (begin,),
@@ -4550,19 +5108,45 @@ def _analyze_bounded(
         if exe in _NESTED:
             script = _nested_script(argv, exe)
             if script:
+                # Decoded, `\$` and `` \` `` are escapes the nested scan does not model.
+                boundary_unproven = boundary_unproven or "\\$" in script or "\\`" in script
                 nested.append((script, None, False, "shell"))
 
         nested.extend(
             (script, None, False, "embedded") for script in _embedded_commands(_argv(seg.argv_src))
         )
-        spans = _substitution_spans(raw)
+        spans, legacy_spans = _substitution_span_sets(raw)
         if spans:
             if command.startswith(raw, start):
                 # raw is a plain slice: read its bodies in the outermost text
                 source, offset = here[0], here[1] + start
             else:
                 source, offset = _HeredocLines(raw), 0  # a redirect rewrote raw
+            added_from = len(nested)
+            added = {
+                added_from + k for k, span in enumerate(spans) if span not in legacy_spans
+            }
             nested.extend((raw[a:b], (source, offset + a), True, "substitution") for a, b in spans)
+        else:
+            added = set()
+        # Bash runs a process substitution's body; the legacy scan never saw one, so
+        # each is added work.
+        for a, b in process_spans:
+            if begin <= a < end:
+                added.add(len(nested))
+                nested.append((command[a:b], (here[0], here[1] + a), True, "substitution"))
+        # A redirect rewrote raw, so its bodies lost the `<`/`>` of any process
+        # substitution inside them (`$(cat <(…))` reached the next level as
+        # `cat  (…)`). Read the same bodies again in this level's own text.
+        if not command.startswith(raw, start) and "(" in raw:
+            if level_spans is None:
+                level_spans = _substitution_spans(command)
+            cut = {raw[a:b] for a, b in spans}
+            for a, b in level_spans:
+                body = command[a:b]
+                if begin <= a < end and body not in cut and ("<(" in body or ">(" in body):
+                    added.add(len(nested))
+                    nested.append((command[a:b], (here[0], here[1] + a), True, "substitution"))
         if not nested:
             continue
         # Past the bound, STOP DESCENDING — and SAY SO. Every scanner below runs
@@ -4577,6 +5161,14 @@ def _analyze_bounded(
             if _depth + env_depth >= MAX_SUBSTITUTION_DEPTH:
                 truncated = True
                 continue
+            in_added = _in_added or nested_index in added
+            if in_added:
+                # Charged only when performed: the descent that would cross the
+                # budget is refused, so the work done never exceeds it.
+                if _added_work[0] + len(script) > _added_work[1]:
+                    truncated = True
+                    continue
+                _added_work[0] += len(script)
             inner = _analyze_bounded(
                 script, _depth=_depth + 1, _decision_text=_decision_text,
                 _origin=origin, _in_substitution=in_substitution,
@@ -4584,6 +5176,8 @@ def _analyze_bounded(
                 _ancestors=_ancestors + (() if in_substitution else tuple(contexts or ())),
                 _kind=kind,
                 _env_depth=env_depth,
+                _added_work=_added_work,
+                _in_added=in_added,
             )
             truncated = truncated or inner.bound_reason == "depth"
             heredoc = heredoc or inner.heredoc_incomplete
@@ -4592,6 +5186,7 @@ def _analyze_bounded(
             continuation = continuation or inner.diagnostic is _BLIND_CONTINUATION
             built_escape = built_escape or inner.diagnostic is _BLIND_BUILT_ESCAPE
             bash53_substitution = bash53_substitution or inner.diagnostic is _BLIND_BASH53_SUBSTITUTION
+            boundary_unproven = boundary_unproven or inner.boundary_unproven
             for inner_segment in inner.segments:
                 out.append(
                     Segment(
@@ -4602,6 +5197,8 @@ def _analyze_bounded(
                         depth=inner_segment.depth + 1,
                         redirects=inner_segment.redirects,
                         verb_unresolved=inner_segment.verb_unresolved,
+                        locale_program=inner_segment.locale_program,
+                        locale_script=inner_segment.locale_script,
                     )
                 )
     # No length re-check here: at depth 0 the over-long raw command returned
@@ -4627,10 +5224,35 @@ def _analyze_bounded(
         diagnostic = _BLIND_UNCLASSIFIED_OPTION
     elif hidden:
         diagnostic = _BLIND_UNRESOLVED_VERB
+    elif any(segment.locale_program for segment in out):
+        # Below every other cause, so a command that already had one keeps it.
+        diagnostic = _BLIND_LOCALE_PROGRAM
+    elif any(segment.locale_script for segment in out):
+        diagnostic = _BLIND_LOCALE_SCRIPT
     else:
         diagnostic = None
+    # An unproven boundary withholds the parse, but only where nothing above already
+    # spoke: every existing cause keeps its class and rank, including the
+    # untokenizable one the discard guard exempts by measured decision.
+    if (
+        _depth == 0
+        and boundary_unproven
+        and (
+            diagnostic is None
+            or diagnostic
+            in (
+                _BLIND_UNRESOLVED_VERB,
+                _BLIND_UNCLASSIFIED_OPTION,
+                _BLIND_LOCALE_PROGRAM,
+                _BLIND_LOCALE_SCRIPT,
+            )
+        )
+    ):
+        diagnostic = _BLIND_STRUCTURAL
+        structural_incomplete = True
     return _AnalysisResult(
-        out, bound_reason, diagnostic, structural_incomplete, _decision_text, heredoc
+        out, bound_reason, diagnostic, structural_incomplete, _decision_text, heredoc,
+        boundary_unproven,
     )
 
 
@@ -4680,7 +5302,8 @@ def _substitutions(text: str) -> list[str]:
     shared ``_command_sub_end`` — a ``)`` inside a quoted operand of the body is
     DATA, so the body is extracted to its TRUE close (the same scanner the redirect-
     target boundary uses, so the two never disagree on where a ``$()`` ends).
-    Best-effort: exotic forms (process substitution ``<(…)``, ANSI-C ``$'…'``
+    Best-effort: exotic forms (process substitution ``<(…)``, which
+    :func:`_process_substitution_spans` reads instead, ANSI-C ``$'…'``
     scripts, shell aliases/functions) are NOT parsed —
     this guard is an approval/friction layer, not a sandbox, and fails toward
     over-matching on the common forms rather than pretending to cover every shell
@@ -4692,7 +5315,97 @@ def _substitutions(text: str) -> list[str]:
 def _substitution_spans(text: str) -> list[tuple[int, int]]:
     """:func:`_substitutions` as ``(start, end)`` offsets of each body in ``text``, so
     the here-doc check can read a body the extraction cut against the text it was
-    cut from."""
+    cut from.
+
+    The union of two readings, so extraction never shrinks below the legacy scan:
+    :func:`_legacy_substitution_spans` tracks single quotes only, so an apostrophe
+    inside ``"don't"`` or an escaped one (``\\'``, ``$'it\\'s'``) opened a span bash
+    never sees and every substitution after it went unseen.
+    :func:`_quoted_substitution_spans` follows bash's quoting. A body either reading
+    finds is extracted.
+    """
+    return _substitution_span_sets(text)[0]
+
+
+def _substitution_span_sets(text: str) -> tuple[list[tuple[int, int]], set[tuple[int, int]]]:
+    """The union :func:`_substitution_spans` returns, and the legacy spans within it."""
+    legacy = set(_legacy_substitution_spans(text))
+    return sorted(legacy | set(_quoted_substitution_spans(text))), legacy
+
+
+def _process_substitution_spans(text: str) -> list[tuple[int, int]]:
+    """Bodies of ``<(…)`` and ``>(…)`` outside quotes, which bash runs. Read generously:
+    a ``(`` after an unquoted ``<`` or ``>`` counts even where bash would reject the
+    line, since reading too much only over-blocks (a ``<(`` in a ``#`` comment is read
+    too, as the ``$(`` scan reads one)."""
+    return _quoted_substitution_spans(text, process=True)
+
+
+def _quoted_substitution_spans(text: str, *, process: bool = False) -> list[tuple[int, int]]:
+    """Substitution bodies under bash's quoting: single quotes block expansion, double
+    quotes do not, and a backslash escapes the next character outside single quotes
+    (inside ``$'…'`` too, where ``\\'`` does not close the span). With ``process``,
+    the bodies of ``<(…)`` and ``>(…)`` instead, outside quotes only; ``$(…)`` and
+    backtick bodies are then skipped whole, as their own level reads them."""
+    subs: list[tuple[int, int]] = []
+    i, n = 0, len(text)
+    quote: str | None = None  # "'", '"' or "$'" (ANSI-C)
+    while i < n:
+        c = text[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if quote == "$'":
+            if c == "'":
+                quote = None
+            i += 1
+            continue
+        if quote is None and c == "'":
+            quote = "'"
+            i += 1
+            continue
+        if quote is None and c == "$" and text.startswith("$'", i):
+            quote = "$'"
+            i += 2
+            continue
+        if c == '"':
+            quote = None if quote == '"' else '"'
+            i += 1
+            continue
+        if process and quote is None and c in "<>" and i + 1 < n and text[i + 1] == "(":
+            end = _command_sub_end(text, i, n)
+            subs.append((i + 2, end - 1))
+            i = end
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "(":
+            end = _command_sub_end(text, i, n)
+            if process:
+                i = end
+                continue
+            # Cut as the legacy scan cuts (an unterminated body loses its last
+            # character), so the two readings agree on every body they both find.
+            # An unclosed `$(` is a syntax error to bash, which runs none of it.
+            subs.append((i + 2, end - 1))
+            i = end
+            continue
+        if c == "`":
+            j = text.find("`", i + 1)
+            if j != -1:
+                if not process:
+                    subs.append((i + 1, j))
+                i = j + 1
+                continue
+        i += 1
+    return subs
+
+
+def _legacy_substitution_spans(text: str) -> list[tuple[int, int]]:
+    """The original scan: only single quotes block extraction."""
     subs: list[tuple[int, int]] = []
     i, n = 0, len(text)
     in_sq = False
@@ -4743,7 +5456,15 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
     state_noexec = False  # `-n` / `-o noexec`, cleared by the `+` forms
     sticky_noexec = False  # `D`, either sign, never cleared
 
+    skip_value = False
     for i, tok in enumerate(argv[1:], 1):
+        if skip_value:
+            # The value of `--rcfile` / `--init-file` is a FILE NAME, whatever
+            # it looks like: `bash --rcfile +c --norc -c CMD` runs CMD. Reading
+            # that `+c` as the selector (now that `+c` selects, #2218) resolved
+            # no script at all and hid CMD from every guard (Codex, PR #4383).
+            skip_value = False
+            continue
         # A LONE `+` IS NOT A TERMINATOR HERE, and treating it as one is a
         # BYPASS. `-` and `--` really do end option processing, so the next
         # token is the command and there is no `-c` script to find. `+` does
@@ -4755,9 +5476,8 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
         #
         # `+` WAS in this set, added with `-`/`--` to answer a review finding
         # about the lone-hyphen case; the hyphen half was right and the plus
-        # half was not. `_first_operand` still treats a lone `+` as a
-        # terminator AFTER the selector, deliberately — see the non-mirror
-        # note there. The shell parses the two positions differently.
+        # half was not. The same holds AFTER the selector: `_first_operand`
+        # skips a lone `+` too (#2218).
         if tok in {"-", "--"}:
             break
         if not (tok[:1] in ("-", "+") and len(tok) > 1):
@@ -4782,27 +5502,27 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
             # suppress execution (`--help`, `--dump-strings`): an invocation
             # that runs nothing, reported as though it might, which is the
             # direction this module's own docstring says to err in.
+            #
+            # The one exception is ARITY, and only where it is measured: the
+            # two bash long options that take a value consume the next word
+            # (`_LONG_OPTIONS_WITH_VALUE`), so that word is never read as an
+            # option bundle, a terminator or the selector.
+            skip_value = tok in _LONG_OPTIONS_WITH_VALUE
             continue
 
         options = tok[1:]
-        if "c" not in options or tok[0] != "-":
+        if "c" not in options:
             # A bundle that does not select the script still carries option
             # state, and an invalid one makes the shell refuse the whole
             # invocation.
             #
-            # ⚠ `+c` IS A SELECTOR and this branch declines it anyway. MEASURED:
-            # `bash +c 'echo X'` and `dash +c 'echo X'` both print X, so the
-            # payload runs while nothing here reports it — a live fail-open in
-            # the `+` spelling. It PRE-DATES this change (the previous scan
-            # skipped `+` tokens entirely and missed it too), and closing it
-            # means deciding what a `+` bundle does to the operand scan, which
-            # is its own measured question rather than a character deleted from
-            # a condition. Tracked as its own issue; NOT closed here, because
-            # widening a gate-surface diff to chase a spelling nothing emits is
-            # how the round budget gets spent. An earlier revision of this
-            # comment asserted the opposite ("`+` DISABLES, so it can never
-            # introduce the command string") — that was false and is the reason
-            # the claim is now stated with its measurement attached.
+            # The SIGN of a bundle does not decide whether it selects: `+c`
+            # selects exactly like `-c` (#2218). MEASURED on bash 5.2 and dash
+            # across 2,256 argv shapes per shell: every shape whose bundle is
+            # `+c`, `+cn`, `+nc`, `+cx`, `+xc` or `+ce` runs its operand, and
+            # those were the ONLY misses this scan had. So the selector test
+            # reads the letter, and the sign only decides what the bundle's
+            # OTHER letters do to the no-exec state.
             if not set(options) - takes_value <= allowed:
                 return ""  # the shell refuses this invocation; nothing runs
             n_values = sum(1 for ch in options if ch in takes_value)
@@ -4835,7 +5555,11 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
             v in _C_NO_EXEC_OPTION_VALUES
             for v in argv[i + 1 : i + 1 + n_values]
         ):
-            state_noexec = True
+            # The sign decides, as in every other bundle: `-cn CMD` parses and
+            # runs nothing, `+cn CMD` RUNS (MEASURED, bash and dash) because
+            # `+n` clears no-exec. Setting it unconditionally here would hide
+            # a command that runs now that `+` bundles reach this branch.
+            state_noexec = tok[0] == "-"
         start = i + 1 + n_values
 
         # ONCE A VALID `-c` BUNDLE OWNS SELECTION, its resolution is final.
@@ -4845,7 +5569,13 @@ def _nested_script(argv: list[str], interpreter: str) -> str:
         # The first `-c` decides, and if its operand cannot be resolved the
         # answer is "nothing", not "keep looking".
         found, script, state_noexec, sticky_noexec = _first_operand(
-            argv, start, allowed, takes_value, state_noexec, sticky_noexec
+            argv,
+            start,
+            allowed,
+            takes_value,
+            state_noexec,
+            sticky_noexec,
+            plus_ends_options=interpreter in _LONE_PLUS_ENDS_OPTIONS,
         )
         if not found or state_noexec or sticky_noexec:
             return ""
@@ -4861,6 +5591,7 @@ def _first_operand(
     takes_value: frozenset[str],
     state_noexec: bool = False,
     sticky_noexec: bool = False,
+    plus_ends_options: bool = False,
 ) -> tuple[bool, str, bool, bool]:
     """``(found, script)`` for the first OPERAND at or after ``start``.
 
@@ -4895,13 +5626,28 @@ def _first_operand(
     j = start
     while j < len(argv):
         tok = argv[j]
+        if tok == "+" and not plus_ends_options:
+            # A LONE `+` IS AN EMPTY BUNDLE, NOT A TERMINATOR, after the
+            # selector exactly as before it (#2218). The shell skips it and
+            # keeps parsing options. MEASURED on bash 5.2 and dash: `-c + -n
+            # CMD` runs NOTHING (the `-n` after `+` is an option, so no-exec is
+            # on) and `-c + +n CMD` runs CMD. Treating `+` as a terminator
+            # returned `+n` as the script and hid CMD from every guard: all
+            # 872 bash and 792 dash misses in a 3-token sweep (80,160 shapes
+            # per shell) had a lone `+` after the selector, and none remain
+            # with this skip. `-c + CMD` still resolves to CMD either way.
+            # zsh, ksh and mksh DO terminate here (`_LONE_PLUS_ENDS_OPTIONS`):
+            # `zsh -c + +n CMD` runs `+n` and not CMD, so they take the
+            # terminator branch below.
+            j += 1
+            continue
         if tok in ("-", "--", "+"):
             # END of option processing. The very next token IS the command
             # string even when it looks like an option: `bash -c -- '-x' CMD`
             # runs `-x` and makes CMD merely `$0`. Resuming the option scan here
             # reported CMD as the script and blocked a command that never ran.
-            # A LONE `-` or `+` terminates the same way: MEASURED, `bash -c - cmd`
-            # and `bash -c + cmd` both run cmd (bash and dash).
+            # A LONE `-` terminates the same way: MEASURED, `bash -c - cmd` runs
+            # cmd (bash and dash).
             j += 1
             if j < len(argv):
                 return (True, argv[j], state_noexec, sticky_noexec)

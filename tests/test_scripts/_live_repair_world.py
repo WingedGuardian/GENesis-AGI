@@ -10,6 +10,7 @@ in this directory's conftest.py.
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import json
 import os
@@ -27,12 +28,25 @@ GUARD = LIB / "update_state_guard.py"
 KIT_FILES = (
     "live_move_repair.py",
     "live_move_restore.py",
+    "live_move_restore_rows.py",
+    "live_move_restore_runs.py",
     "live_move_restore_write.py",
     "update_state_guard.py",
     "deploy_checkout.sh",
     "deploy_marker.sh",
     "alert_queue.sh",
+    "live_move_boot.py",
 )
+
+
+@functools.cache
+def _installer():
+    """scripts/lib/live_repair_kit.py, loaded by path (it is run as a script)."""
+    spec = importlib.util.spec_from_file_location("_live_repair_kit", LIB / "live_repair_kit.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _git_env(home: Path | None = None) -> dict[str, str]:
@@ -68,6 +82,48 @@ def _write(root: Path, files: dict[str, str | None]) -> None:
         full.write_text(body)
 
 
+#: The restore-hooks stand-in committed at the engine's path (the same on both
+#: sides): it records its argv, whether the fd it was handed is update.lock and
+#: can be held exclusive through (the engine's require_update_lock), and whether
+#: the ephemeral pattern came with it; it sleeps SPY_SLEEP seconds first and
+#: exits SPY_RC. SPY_PIDFILE: its pid is appended there first; SPY_FORK: a
+#: grandchild sleeping that long keeps its stdout open (a boot deadline's case).
+SPY = """import fcntl, json, os, subprocess, sys, time
+if os.environ.get("SPY_PIDFILE"):
+    with open(os.environ["SPY_PIDFILE"], "a") as fh:
+        fh.write(str(os.getpid()) + "\\n")
+if os.environ.get("SPY_FORK"):
+    subprocess.Popen(["sleep", os.environ["SPY_FORK"]])
+time.sleep(float(os.environ.get("SPY_SLEEP", "0")))
+fd = int(os.environ.get("DEPLOY_CANDIDATES_LOCK_FD", "-1"))
+lock = os.path.join(os.environ["HOME"], ".genesis", "locks", "update.lock")
+same = held = False
+# Whether the checkout lock is held while it runs (a fresh open cannot take it).
+co = os.open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+             ".git", "genesis-checkout.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+try:
+    fcntl.flock(co, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    checkout_locked = False
+except OSError:
+    checkout_locked = True
+os.close(co)
+try:
+    a, b = os.fstat(fd), os.stat(lock)
+    same = (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    held = True
+except OSError:
+    pass
+rec = {"argv": sys.argv[1:], "fd_is_update_lock": same, "held": held,
+       "ephemeral_re": bool(os.environ.get("DEPLOY_CANDIDATES_EPHEMERAL_RE")),
+       "checkout_locked": checkout_locked,
+       # Whether the update state was still there (not yet healed and cleared).
+       "state_left": os.path.exists(os.path.join(os.environ["HOME"], ".genesis", "update_state.json"))}
+with open(os.path.join(os.environ["HOME"], "hooks_calls.jsonl"), "a") as fh:
+    fh.write(json.dumps(rec) + "\\n")
+sys.exit(int(os.environ.get("SPY_RC", "0")))
+"""
+
 #: The tag (the old tip, checked out on `live`) and the move's target differ in
 #: every way a switch writes: modifications (A, sub/s1), additions (F, Z1-Z5, and
 #: AGENTS.md, an ephemeral path), a deletion (O) and a file that becomes a
@@ -79,6 +135,7 @@ TAG_FILES = {
     "P": "p\n",
     "sub/s1": "s1\n",
     "sub/t": "t\n",
+    "scripts/deploy_candidates.py": SPY,
 }
 TO_FILES = {
     "A": "a2 with more bytes\n",
@@ -97,7 +154,11 @@ class World:
     """A scratch HOME (with ~/.genesis) and a repository whose `live` sits at the
     tag ``pre``; ``to`` is the rebuilt tip the move was going to."""
 
-    def __init__(self, tmp: Path):
+    def __init__(
+        self, tmp: Path, tag_extra: dict[str, str] | None = None, to_extra: dict | None = None
+    ):
+        """``tag_extra`` adds files to the tag (and so to both sides), ``to_extra``
+        changes the target's (the real engine's tests, for instance)."""
         self.home = tmp / "home"
         self.gen = self.home / ".genesis"
         self.gen.mkdir(parents=True)
@@ -105,11 +166,11 @@ class World:
         self.root.mkdir()
         self.state = self.gen / "update_state.json"
         _git(self.root, "init", "-q", "-b", "main")
-        _write(self.root, TAG_FILES)
+        _write(self.root, {**TAG_FILES, **(tag_extra or {})})
         _git(self.root, "add", "-A")
         _git(self.root, "commit", "-qm", "tag")
         self.tag = _git(self.root, "rev-parse", "HEAD")
-        _write(self.root, TO_FILES)
+        _write(self.root, {**TO_FILES, **(to_extra or {})})
         _git(self.root, "add", "-A")
         _git(self.root, "commit", "-qm", "rebuilt tip")
         self.to = _git(self.root, "rev-parse", "HEAD")
@@ -141,13 +202,18 @@ class World:
         kit.mkdir(parents=True, exist_ok=True)
         for name in KIT_FILES:
             shutil.copy2(LIB / name, kit / name)
+        # KIT.json as the installer writes it, through its own hasher (#3492 D2a).
+        (kit / "KIT.json").write_text(json.dumps(_installer().describe(str(kit), KIT_FILES)))
         return kit
 
     def repair(
         self, *args: str, mode: str = "--command", **env: str
     ) -> subprocess.CompletedProcess:
+        # At boot the installed kit runs, as the unit runs it (#3492 D2a-2): its
+        # self-check reads the KIT.json beside it, which scripts/lib has not.
+        module = self.kit() / MODULE.name if mode == "--boot" else MODULE
         return subprocess.run(
-            ["python3", "-I", "-S", str(MODULE), mode, str(self.state), str(self.root), *args],
+            ["python3", "-I", "-S", "-B", str(module), mode, str(self.state), str(self.root), *args],
             capture_output=True,
             text=True,
             env=self.env(**env),
@@ -177,6 +243,11 @@ class World:
             if queue.exists()
             else []
         )
+
+    def hook_calls(self) -> list[dict]:
+        """Each restore-hooks call the spy saw, in order."""
+        path = self.home / "hooks_calls.jsonl"
+        return [json.loads(ln) for ln in path.read_text().splitlines()] if path.exists() else []
 
     def snapshot(self) -> dict[str, bytes | str]:
         """Every node under the checkout (outside .git): bytes, or "dir"/"link:<target>"."""
@@ -276,9 +347,13 @@ def killed_tag_side(w: World, victim: str) -> None:
 
 def killed_rollback(w: World, victim: str) -> None:
     """The move finished (HEAD on `live` at ``to``), then the rollback's switch back
-    to the tag was killed while writing ``victim`` (S18)."""
+    to the tag was killed while writing ``victim`` (S18), or at "prepared" (the
+    whole tag tree and index written, HEAD and `live` unmoved, their locks left)."""
     _git(w.root, "checkout", "-q", "-B", "live", w.to)
-    kill_switch(w.root, w.tag, victim)
+    if victim == "prepared":
+        kill_prepared(w.root, w.tag)
+    else:
+        kill_switch(w.root, w.tag, victim)
     assert _git(w.root, "rev-parse", "HEAD") == w.to, "HEAD moved: the kill came too late"
     w.write_state(w.row("done"))
 

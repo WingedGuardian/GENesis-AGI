@@ -588,6 +588,10 @@ def _topic_observation(text: str) -> str:
     return "\n".join(shown)
 
 
+_TOPIC_PARSE_FALLBACK = "Reflection completed — output was not parseable; stored for review."
+_TOPIC_EMPTY_FALLBACK = "Reflection completed — no summary fields in output; stored for review."
+
+
 def format_topic_summary(depth, output, *, text: str | None = None) -> str:
     """Build the Telegram topic message from PARSED reflection fields only.
 
@@ -603,10 +607,7 @@ def format_topic_summary(depth, output, *, text: str | None = None) -> str:
     """
     source_text = text if text is not None else output.text
     header = f"<b>{depth.value} Reflection</b>"
-    fallback = (
-        f"{header}\n\nReflection completed — output was not parseable; "
-        "stored for review."
-    )
+    fallback = f"{header}\n\n{_TOPIC_PARSE_FALLBACK}"
     # Use the SAME canonical extractor as the routing parser and the salvage
     # gate, so the topic never shows the "not parseable" stub for output that
     # actually routed (e.g. a bare-untagged ``` fence). One algorithm, three
@@ -639,11 +640,210 @@ def format_topic_summary(depth, output, *, text: str | None = None) -> str:
         return fallback
 
     if len(parts) == 1:
-        return (
-            f"{header}\n\nReflection completed — no summary fields in "
-            "output; stored for review."
-        )
+        return f"{header}\n\n{_TOPIC_EMPTY_FALLBACK}"
     return "\n\n".join(parts)
+
+
+#: Only the model's explicit ``"material_change": false`` suppresses a summary;
+#: an absent flag posts. The flag is trusted only while code finds no condition
+#: change between the run behind the last FULL post and this run (an alarm
+#: started or cleared, a fixed-level alarm rose, an active alarm crossed its
+#: own threshold, a band crossed, a signal
+#: appeared or went away:
+#: ``signal_format.light_condition_changes``). The model compares against the
+#: previous stored finding, which may itself have gone unposted, so without
+#: that check an alarm or a band crossing could go unreported. The check covers
+#: the alarm signals and the signals with thresholds (memory only, today). A
+#: value with no thresholds (budget, session pattern, pending findings) is
+#: judged by the model alone, however far it drifts across unposted runs, and
+#: so is a rise in a graded alarm (an age, a ratio, a count). A baseline that
+#: cannot be trusted (a reading that failed in the posted run, two runs in
+#: the lookup window) counts as unknown, and unknown posts.
+#: Wording is not compared: MEASURED 2026-11-12 on one install's 34 drift-only
+#: Light runs, a 0.3 term-overlap floor blocked 9 of the 17 summaries the model
+#: flagged unchanged, while the state check passed all 17 and caught all 6
+#: natural condition changes in the same window.
+
+#: While nothing changes, at most one "no material change" stub per this many
+#: hours, measured from the topic's last reflection post (full or stub). That keeps the
+#: topic a liveness surface (``format_topic_summary``) at two posts a day at
+#: most, against a measured 1-5 repeat posts a day before this gate.
+LIGHT_NO_CHANGE_STUB_HOURS = 12
+
+#: How many of the topic's newest outbound rows are scanned for the last full
+#: post. A long post is one row per chunk and a stub is one row, so this covers
+#: many intervals; when no full post is found inside it the summary is posted.
+_LIGHT_SCAN_ROWS = 20
+
+#: Opens every stub. Model text is HTML-escaped before it reaches the topic, so
+#: no assessment can contain a literal ``<i>`` and be mistaken for a stub.
+_STUB_MARK = "<i>No material change since"
+
+def _is_light_fallback(content: str) -> bool:
+    """Only formatter fallbacks qualify; ordinary assessments can share a suffix."""
+    header = f"<b>{Depth.LIGHT.value} Reflection</b>\n\n"
+    return content in {header + _TOPIC_PARSE_FALLBACK, header + _TOPIC_EMPTY_FALLBACK}
+
+
+def _light_history(rows: list[dict], header: str) -> list[dict] | None:
+    """Reassemble complete observed runs from each header, in insertion order.
+
+    Chunks have no group metadata. Include intervening outbound text rather
+    than silently discard a possible continuation; only headers set the clock.
+    A window without a full header cannot provide a comparison baseline.
+    """
+    groups: list[dict] = []
+    for row in reversed(rows):
+        if not isinstance(row, dict) or not isinstance(row.get("content"), str):
+            return None
+        content = row["content"]
+        if content.startswith(header):
+            full = not content[len(header):].lstrip().startswith(_STUB_MARK) and not _is_light_fallback(content)
+            groups.append({"content": content, "timestamp": row.get("timestamp"), "full": full})
+        elif groups:
+            groups[-1]["content"] += content
+    return groups
+
+
+async def send_light_topic_summary(
+    session_id: str,
+    text: str,
+    *,
+    source_text: str,
+    topic_manager,
+    now: datetime | None = None,
+    db=None,
+    tick=None,
+) -> str:
+    """Post a light summary unless nothing changed since the last full post.
+
+    Returns ``"posted"``, ``"stub"`` or ``"skipped"``. Only the Telegram post is
+    gated; the caller has already stored the reflection's output. A summary is
+    "no change" only when the model says so (``"material_change": false``) and
+    code finds no condition change between the run behind the last full post
+    and ``tick`` (``_conditions_changed_since``); an absent or true flag posts.
+    When the model says false and code does find one, the summary is posted
+    with those changes listed under it. Otherwise a stub is posted if the topic
+    has been quiet for ``LIGHT_NO_CHANGE_STUB_HOURS``, and nothing if not.
+    "Last posted" is read from ``telegram_messages``
+    (``TopicManager.recent_outbound``), so a restart neither re-posts nor
+    forgets a stub. Anything that cannot be decided (no history, a failed read,
+    a parse-failure fallback, no ``db`` or ``tick``, no stored signals for the
+    posted run) is posted. One manager-local lock spans the history read
+    through successful send persistence, including early-post paths.
+    """
+    kwargs = {"source_text": source_text, "topic_manager": topic_manager, "now": now, "db": db, "tick": tick}
+    if not topic_manager:
+        return await _send_light_topic_summary_locked(session_id, text, **kwargs)
+    async with topic_manager.delivery_lock("reflection_light"):
+        return await _send_light_topic_summary_locked(session_id, text, **kwargs)
+
+
+async def _conditions_changed_since(db, tick, posted_at: str) -> list[str] | None:
+    """Condition changes between the run behind the post at ``posted_at`` and ``tick``.
+
+    One line per change, as the Light change table words it. None means it
+    cannot be known (no database or tick, or that run's signals are not on
+    record); the caller posts.
+    """
+    from genesis.awareness.signal_format import light_condition_changes
+    from genesis.cc.reflection_bridge._prompts import _signals_behind
+
+    if db is None or tick is None:
+        return None
+    previous = await _signals_behind(db, posted_at, exclude_tick_id=tick.tick_id)
+    if previous is None:
+        return None
+    return light_condition_changes(previous, tick.signals)
+
+
+async def _send_light_topic_summary_locked(
+    session_id: str,
+    text: str,
+    *,
+    source_text: str,
+    topic_manager,
+    now: datetime | None = None,
+    db=None,
+    tick=None,
+) -> str:
+    from genesis.channels.telegram._handler_helpers import _split_for_telegram
+    from genesis.util.tz import fmt, parse_utc_iso
+
+    depth = Depth.LIGHT
+    if not topic_manager or _is_light_fallback(text):
+        await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
+        return "posted"
+    data = _extract_json_obj(source_text) or {}
+    if data.get("material_change") is not False:
+        await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
+        return "posted"
+    category = f"reflection_{depth.value.lower()}"
+    try:
+        rows = await topic_manager.recent_outbound(category, limit=_LIGHT_SCAN_ROWS)
+    except Exception:
+        logger.warning("Light topic history unreadable; posting summary", exc_info=True)
+        rows = None
+    header = f"<b>{depth.value} Reflection</b>"
+    reflection_rows = _light_history(rows or [], header) or []
+    last_full = next(
+        (
+            r for r in reversed(reflection_rows)
+            if r["full"]
+        ),
+        None,
+    )
+    if last_full is None:
+        await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
+        return "posted"
+
+    changes = await _conditions_changed_since(db, tick, last_full["timestamp"])
+    if changes is None:
+        logger.info("Light reflection posted: no stored signals for the run behind the last full post")
+        await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
+        return "posted"
+    if changes:
+        # The model said nothing changed, but a condition did since the user's
+        # last full post: post, and say what code found.
+        listed = "\n".join(f"• {_escape(line)}" for line in changes[:10])
+        if len(changes) > 10:
+            listed += f"\n• and {len(changes) - 10} more"
+        note = f"<b>Changed since the last post</b> (from the signals):\n{listed}"
+        augmented = f"{text}\n\n{note}"
+        if len(_split_for_telegram(augmented)) > 1 and text.startswith(header):
+            # A later message that fails to send leaves no trace, and the first
+            # one alone would become the baseline: the note goes where the
+            # first message carries it.
+            augmented = f"{header}\n\n{note}{text[len(header):]}"
+        await send_to_topic(session_id, depth, augmented, topic_manager=topic_manager)
+        return "posted"
+
+    # A long summary is several Telegram messages, and a later chunk that
+    # failed to send leaves no trace. Unless the text is identical, post rather
+    # than trust that the user saw all of the last one. (After the condition
+    # check, so a long summary still carries the change note.)
+    multi = len(_split_for_telegram(text)) > 1 or len(_split_for_telegram(last_full["content"])) > 1
+    if multi and text != last_full["content"]:
+        await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
+        return "posted"
+
+    now = now or datetime.now(UTC)
+    # The clock runs from the last reflection post (a reply Genesis made in the
+    # thread is not one). A timestamp that will not parse, or lies in the
+    # future, counts as no history: the stub is posted.
+    last_post = parse_utc_iso(reflection_rows[-1]["timestamp"])
+    quiet = (
+        last_post is None
+        or last_post > now
+        or now - last_post >= timedelta(hours=LIGHT_NO_CHANGE_STUB_HOURS)
+    )
+    if not quiet:
+        logger.info("Light reflection not posted: no material change since the last full post")
+        return "skipped"
+    since = fmt(last_full["timestamp"], "%Y-%m-%d %H:%M %Z")
+    stub = f"{header}\n\n{_STUB_MARK} {_escape(since)}.</i>"
+    await send_to_topic(session_id, depth, stub, topic_manager=topic_manager)
+    return "stub"
 
 
 async def send_to_topic(session_id: str, depth, text: str, *, topic_manager) -> None:
