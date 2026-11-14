@@ -6,7 +6,7 @@
 # backup unit's ExecStartPre that waits until it fits. Keeping one copy means
 # the wait cannot drift from the choice it is waiting to change.
 #
-# Defines _num, _cgroup_headroom_kb and _verify_memory_check. Reads GENESIS_BACKUP_CGROUP_FS / GENESIS_BACKUP_PROC_CGROUP (test overrides)
+# Defines _num, _cgroup_headroom_kb, _cgroup_limit_kb and _verify_memory_check. Reads GENESIS_BACKUP_CGROUP_FS / GENESIS_BACKUP_PROC_CGROUP (test overrides)
 # at call time, so a value loaded from secrets.env after sourcing still counts.
 
 # _num <value> <default> — a decimal integer of at most 6 digits, else the
@@ -61,6 +61,43 @@ _cgroup_headroom_kb() {
             esac
             [ "$_h" -ge 0 ] || _h=0
             if [ -z "$_best" ] || [ "$_h" -lt "$_best" ]; then _best=$_h; fi
+        fi
+        [ "$_d" = "$_root" ] && break
+        _d="${_d%/*}"
+        case "$_d" in "$_root"*) ;; *) break ;; esac
+    done
+    echo "$_best"
+}
+
+# _cgroup_limit_kb — the smallest memory limit over this process's cgroup and
+# its ancestors, in KB; empty when no level is capped. The same levels as
+# _cgroup_headroom_kb: headroom can never exceed this, so a need above it can
+# never fit however much memory other processes free.
+_cgroup_limit_kb() {
+    local _p _d _root _m _best="" _v1=false
+    local _cgroup_fs="${GENESIS_BACKUP_CGROUP_FS:-/sys/fs/cgroup}"
+    local _proc_cgroup="${GENESIS_BACKUP_PROC_CGROUP:-/proc/self/cgroup}"
+    _p=$(awk -F: '$2 ~ /(^|,)memory(,|$)/ {print $3; exit}' "$_proc_cgroup" 2>/dev/null) || _p=""
+    if [ -n "$_p" ]; then
+        _v1=true
+        _root="$_cgroup_fs/memory"
+    else
+        _p=$(awk -F: '$1 == "0" {print $3; exit}' "$_proc_cgroup" 2>/dev/null) || _p=""
+        [ -n "$_p" ] || return 0
+        _root="$_cgroup_fs"
+    fi
+    _d="$_root${_p%/}"
+    while :; do
+        if $_v1; then
+            _m=$(cat "$_d/memory.limit_in_bytes" 2>/dev/null) || _m=""
+        else
+            _m=$(cat "$_d/memory.max" 2>/dev/null) || _m=""
+        fi
+        case "$_m" in ''|*[!0-9]*) _m="" ;; esac
+        # Same cap test as _cgroup_headroom_kb: a decimal below 2^60.
+        if [ -n "$_m" ] && [ "${#_m}" -le 18 ] && [ "$_m" -lt 1152921504606846976 ]; then
+            _m=$(( _m / 1024 ))
+            if [ -z "$_best" ] || [ "$_m" -lt "$_best" ]; then _best=$_m; fi
         fi
         [ "$_d" = "$_root" ] && break
         _d="${_d%/*}"

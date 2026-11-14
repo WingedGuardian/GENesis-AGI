@@ -86,9 +86,14 @@ while :; do
     # tell "waited for nothing" from "the wait mattered".
     if [ "${_avail_kb:-0}" -ge $(( _need_kb + _floor_kb )) ]; then _met=yes; else _met=no; fi
     _numbers="need ${_need_kb} KB + floor ${_floor_kb} KB + margin ${_margin_kb} KB, available ${_avail_kb:-0} KB; backup.sh's line met: ${_met}"
-    # A line above all of memory can never be met: waiting would only delay.
-    if [ "$_line_kb" -gt "${_total_kb:-0}" ]; then
-        _say "verify memory can never fit ($_numbers; MemTotal ${_total_kb:-0} KB); no wait"
+    # A line above all the memory this process can ever have (MemTotal, or a
+    # lower cgroup limit, which also caps the headroom counted as available)
+    # can never be met: waiting would only delay.
+    _capacity_kb=${_total_kb:-0}
+    _limit_kb=$(_cgroup_limit_kb) || _limit_kb=""
+    if [ -n "$_limit_kb" ] && [ "$_limit_kb" -lt "$_capacity_kb" ]; then _capacity_kb=$_limit_kb; fi
+    if [ "$_line_kb" -gt "$_capacity_kb" ]; then
+        _say "verify memory can never fit ($_numbers; capacity ${_capacity_kb} KB); no wait"
         exit 0
     fi
     if [ "${_avail_kb:-0}" -ge "$_line_kb" ]; then

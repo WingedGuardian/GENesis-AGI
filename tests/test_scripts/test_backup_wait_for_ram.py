@@ -23,6 +23,11 @@ import pytest
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 _WAIT = _SCRIPTS / "backup_wait_for_ram.sh"
 
+# A fake cgroup cap far above any host's RAM: headroom is still read from it,
+# but it never becomes the binding capacity (MemTotal is). Tests about a cap
+# that binds write their own memory.max.
+_CAP = 1 << 50
+
 # Independent of the host's free memory: no floor, no margin.
 _MEM_OK = {
     "GENESIS_BACKUP_VERIFY_RAM_FLOOR_PCT": "0",
@@ -40,7 +45,7 @@ def sb(tmp_path):
     # A cgroup v2 tree whose root cap is 1 GiB.
     cg = tmp_path / "cgfs"
     cg.mkdir()
-    (cg / "memory.max").write_text(f"{1 << 30}\n")
+    (cg / "memory.max").write_text(f"{_CAP}\n")
     (cg / "memory.stat").write_text("anon 1\ninactive_file 0\n")
     proc_cg = tmp_path / "proc-cgroup"
     proc_cg.write_text("0::/\n")
@@ -60,7 +65,7 @@ def sb(tmp_path):
 
 def _headroom(sb, free_bytes: int) -> None:
     """Set the fake root cgroup so it has ``free_bytes`` of headroom."""
-    (sb["cg"] / "memory.current").write_text(f"{(1 << 30) - free_bytes}\n")
+    (sb["cg"] / "memory.current").write_text(f"{_CAP - free_bytes}\n")
 
 
 def _shim_sleep(sb, free_after: int | None = None) -> None:
@@ -68,7 +73,7 @@ def _shim_sleep(sb, free_after: int | None = None) -> None:
     ``free_after``, the first call also frees that much cgroup headroom."""
     body = f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{sb["sleeps"]}"\n'
     if free_after is not None:
-        current = (1 << 30) - free_after
+        current = _CAP - free_after
         body += f'printf "%s\\n" "{current}" > "{sb["cg"] / "memory.current"}"\n'
     body += "exit 0\n"
     path = sb["bind"] / "sleep"
@@ -280,6 +285,54 @@ def test_a_line_above_all_memory_never_waits(sb):
     )
     assert proc.returncode == 0, proc.stderr
     assert sleeps == []
+    assert "can never fit" in proc.stdout, proc.stdout
+    # The MemTotal branch, not a cgroup cap: the capacity named is MemTotal.
+    total_kb = next(
+        ln for ln in Path("/proc/meminfo").read_text().splitlines() if ln.startswith("MemTotal:")
+    ).split()[1]
+    assert f"capacity {total_kb} KB" in proc.stdout, proc.stdout
+
+
+def test_a_line_above_the_cgroup_cap_never_waits(sb):
+    """Capped container: the line is under MemTotal but over the cgroup's whole
+    limit, so availability (capped at cgroup headroom) can never meet it."""
+    (sb["cg"] / "memory.max").write_text(f"{256 << 20}\n")
+    (sb["cg"] / "memory.current").write_text(f"{10 << 20}\n")
+    # A sparse 200 MB database: need = 2 x 200 MB, over the 256 MiB cap.
+    with (sb["gd"] / "data" / "genesis.db").open("r+b") as f:
+        f.truncate(200 << 20)
+    _shim_sleep(sb)
+    proc, sleeps = _run(sb, GENESIS_BACKUP_VERIFY_WAIT_MAX_S="3600", **_MEM_OK)
+    assert proc.returncode == 0, proc.stderr
+    assert sleeps == [], proc.stdout
+    assert "can never fit" in proc.stdout, proc.stdout
+
+
+def test_a_line_above_a_cgroup_v1_cap_never_waits(sb):
+    """Same, on a cgroup v1 memory controller with the cap on the parent."""
+    v1 = sb["tmp"] / "cgv1"
+    leaf = v1 / "memory" / "ct" / "svc"
+    leaf.mkdir(parents=True)
+    (v1 / "memory" / "ct" / "memory.limit_in_bytes").write_text(f"{256 << 20}\n")
+    (v1 / "memory" / "ct" / "memory.usage_in_bytes").write_text(f"{10 << 20}\n")
+    (v1 / "memory" / "ct" / "memory.stat").write_text("total_inactive_file 0\n")
+    (leaf / "memory.limit_in_bytes").write_text("9223372036854771712\n")
+    (leaf / "memory.usage_in_bytes").write_text(f"{1 << 20}\n")
+    (leaf / "memory.stat").write_text("total_inactive_file 0\n")
+    proc_cg = sb["tmp"] / "proc-cgroup-v1"
+    proc_cg.write_text("4:memory:/ct/svc\n0::/\n")
+    with (sb["gd"] / "data" / "genesis.db").open("r+b") as f:
+        f.truncate(200 << 20)
+    _shim_sleep(sb)
+    proc, sleeps = _run(
+        sb,
+        GENESIS_BACKUP_VERIFY_WAIT_MAX_S="3600",
+        GENESIS_BACKUP_CGROUP_FS=str(v1),
+        GENESIS_BACKUP_PROC_CGROUP=str(proc_cg),
+        **_MEM_OK,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert sleeps == [], proc.stdout
     assert "can never fit" in proc.stdout, proc.stdout
 
 
