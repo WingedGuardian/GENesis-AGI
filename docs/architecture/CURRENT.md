@@ -2090,6 +2090,10 @@ the shared banner is not an assertion about all concurrent sessions.
   still refuses selected provenance. GN binds ordinary versus selected recovery
   argv to actual durable origin before owner construction and during source
   recapture. Acceptance, cutover and automatic readiness remain separate gates.
+  Selected acknowledgements recheck repository-wide physical/control holds after
+  their final drain. A transient same-transaction fresh proof binds the original
+  lifetime subject and exact-sequence raw cleanup evidence; it grants no durable
+  override and leaves provider quarantine independent.
   Recovery evidence refuses partial zero-watermark acceptance receipts, matching
   ordinary admission; invalid positive receipts remain explicit safety evidence.
   The retained retry helper participates in existing server restart detection.

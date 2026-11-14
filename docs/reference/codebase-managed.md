@@ -1137,6 +1137,11 @@ lease during preparation/consumption and its unchanged disablement-sentinel
 checks. The reporter reacquires its native protections before provider work;
 preparation does not hold that lease for the entire physical run.
 Existing selected history remains cancellable, observable and settleable.
+The final drain also rechecks independent physical/control holds from either
+provider. A fresh check of an invalidated historical scope remains usable only
+within that same transaction, for the unchanged scope and covered raw cleanup
+evidence. New cleanup evidence aborts publication and remains retained for the
+next explicit supervised reconciliation; it never becomes a persistent override.
 Failed-origin clean success retires only the exact frozen failure snapshot;
 other outcomes retain the original failed request and independent pending work.
 Missing, corrupt or mismatched spent bindings preserve both work tables, record

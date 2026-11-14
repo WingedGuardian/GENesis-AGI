@@ -465,6 +465,66 @@ def issue(db, data, native, legs, *, now=None, finalize, fresh_cleanup=None, pri
     return value
 
 
+def _physical_subject(row):
+    """Original lifetime facts; provider-only safety remains independently checked."""
+    fields = ("execution_seq", "hash", "repo_path", "provider", "protocol", "claim_id",
+              "launch_reservation", "launch_permission", "scope_registration", "native_intent",
+              "terminal", "cleanup_proof", "cleanup_invalidated", "control_closure", "completion_kind")
+    subject = {key: row[key] for key in fields}
+    for key in ("cleanup_first_failure", "first_typed_conflict"):
+        item = json.loads(row[key]) if row[key] else None
+        subject[key] = item if item and item.get("kind") in ("cleanup", "cleanup-disproof") else None
+    return subject
+
+
+def _cleanup_residuals(db, residual, annotations, native, legs):
+    if set(residual) != set(annotations):
+        raise RuntimeError("incomplete physical residual annotations")
+    sequences = {}
+    for key, (context, state) in annotations.items():
+        native._object(context, legs.CONTEXT, "physical residual context")
+        native._integer(context["execution_seq"], "physical residual sequence", positive=True)
+        if (type(context["protocol"]) is not int or context["protocol"] != 3
+                or state not in ("waiting", "retained")
+                or (context["hash"], context["provider"]) != key[:2]):
+            raise RuntimeError("invalid physical residual annotations")
+        native.execution(db, context, legs)
+        if key[2] in ("cleanup", "cleanup-disproof"):
+            sequences.setdefault(context["execution_seq"], set()).add(key)
+    return sequences
+
+
+def physical_guard(db, h, native, legs, finalize, *, exclude, fresh_cleanup):
+    """Bind this decision's fresh lifetime proof before its final evidence drain."""
+    before = {}
+    residual = finalize(residual_context=before)
+    baseline = _cleanup_residuals(db, residual, before, native, legs)
+    proven = {}
+
+    def observe(row):
+        if fresh_cleanup is None or fresh_cleanup(row) is not True:
+            return False
+        context = {key: row[key] for key in legs.CONTEXT}
+        proven[row["execution_seq"]] = _physical_subject(native.execution(db, context, legs))
+        return True
+
+    def check():
+        annotations = {}
+        residual = finalize(residual_context=annotations)
+        current = _cleanup_residuals(db, residual, annotations, native, legs)
+
+        def unchanged(row):
+            sequence = row["execution_seq"]
+            return (proven.get(sequence) == _physical_subject(row)
+                    and current.get(sequence, set()) <= baseline.get(sequence, set()))
+
+        if native.physical_blocked(db, h, exclude=exclude, fresh_cleanup=unchanged):
+            raise RuntimeError("final physical ownership prevents selected acknowledgement")
+        return residual
+
+    return observe, check
+
+
 def consume(db, data, native, legs, *, finalize, bind_runtime, fresh_cleanup=None, now=None):
     """Stage one selected actual-owner reservation and validated runtime atomically.
 
@@ -499,10 +559,12 @@ def consume(db, data, native, legs, *, finalize, bind_runtime, fresh_cleanup=Non
     validate(spent, native)
     db.execute("UPDATE provider_state SET grant=? WHERE hash=? AND provider=?",
                (native.encode(spent), data["hash"], data["provider"]))
-    if native.reserve(db, context, reserved, legs, fresh_cleanup=fresh_cleanup) != "reserved":
+    observe, final_physical = physical_guard(db, data["hash"], native, legs, finalize,
+        exclude=context["execution_seq"], fresh_cleanup=fresh_cleanup)
+    if native.reserve(db, context, reserved, legs, fresh_cleanup=observe) != "reserved":
         raise RuntimeError("selected reservation remains held")
     bound = bind_runtime(context, reserved)
-    residual = finalize()  # All physical/runtime callbacks precede the last drain.
+    residual = final_physical()  # All physical/runtime callbacks precede the last drain.
     if reserved["owner"] != recovery.owner_identity():
         raise ValueError("original selected owner changed before publication")
     fresh(spent, _clock() if now is None else now, native)
@@ -643,15 +705,21 @@ def launch_transition(api, context, data, operation):
         selected = row["nonce_origin"] == "selected-recovery"
         if not selected:
             recovery.refuse_unrepresented(db, finalize(), (context["hash"], context["provider"]))
+        fresh = api["_fresh_gate"](db)
+        if selected:
+            fresh, final_physical = physical_guard(db, context["hash"], native, legs, finalize,
+                exclude=context["execution_seq"], fresh_cleanup=fresh)
         args = (db, context, data, legs)
         if operation is not native.reserve:
             args += (api["_proof"],)
-        state = operation(*args, fresh_cleanup=api["_fresh_gate"](db))
+        state = operation(*args, fresh_cleanup=fresh)
         if selected:
-            residual = finalize()  # No later physical/runtime callbacks.
             if state in ("reserved", "registered", "started"):
+                residual = final_physical()  # Pure physical and grant readers follow this drain.
                 trial_decision(db, context, legs, residual,
                                phase="started" if operation is native.begin else "prepared")
+            else:
+                finalize()  # Non-permit outcomes retain their ordinary drain semantics.
     return state  # Duplicate/conflict/resource statuses never become fresh permits.
 
 

@@ -699,7 +699,7 @@ def apply(db, value, legs, *, fresh_cleanup=None):
     return row["typed_applied_state"]
 
 
-def drain(directory, db, legs, proof, hash_repo, *, residual=None):
+def drain(directory, db, legs, proof, hash_repo, *, residual=None, residual_context=None):
     """Called only with the facade's exclusive barrier and active transaction."""
     pending = sorted(directory.glob(".execution-spool-*.spool"))
     retired = []
@@ -709,7 +709,9 @@ def drain(directory, db, legs, proof, hash_repo, *, residual=None):
     for phase in range(2):
         retained = []
         for path in pending:
-            state = _drain_one(path, db, legs, proof, hash_repo, residual=residual if phase == 1 else None)
+            state = _drain_one(path, db, legs, proof, hash_repo,
+                residual=residual if phase == 1 else None,
+                residual_context=residual_context if phase == 1 else None)
             if state in ("waiting", "retained"):
                 retained.append(path)
             else:
@@ -718,7 +720,7 @@ def drain(directory, db, legs, proof, hash_repo, *, residual=None):
     return retired
 
 
-def _drain_one(path, db, legs, proof, hash_repo, *, residual=None):
+def _drain_one(path, db, legs, proof, hash_repo, *, residual=None, residual_context=None):
     name = re.fullmatch(r"\.execution-spool-([0-9a-f]{16})-([0-9a-f]{32})-[0-9a-f]{32}\.spool", path.name)
     if name is None:
         raise ValueError("invalid native spool filename")
@@ -733,7 +735,10 @@ def _drain_one(path, db, legs, proof, hash_repo, *, residual=None):
     state = record(db, value, checked, legs, proof)
     if residual is not None and state in ("waiting", "retained"):
         identity = {key: checked[key] for key in ("version", "kind", "context", "data")}
-        residual.append((value["hash"], value["provider"], checked["kind"], digest(identity)))
+        key = (value["hash"], value["provider"], checked["kind"], digest(identity))
+        residual.append(key)
+        if residual_context is not None:
+            residual_context[key] = (dict(value), state)
     return state
 
 def _provider_blocked(db, h, provider):

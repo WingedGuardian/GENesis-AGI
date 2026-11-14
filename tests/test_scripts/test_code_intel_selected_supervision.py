@@ -104,9 +104,11 @@ def test_selected_owner_drift_rolls_back_without_publishing_a_trial(selection, t
             @contextmanager
             def changed_decision(*args, **kwargs):
                 with decision(*args, **kwargs) as (db, finalize):
-                    def last():
-                        result = finalize()
-                        drift()
+                    def last(**options):
+                        result = finalize(**options)
+                        if db.execute("SELECT 1 FROM executions WHERE nonce_origin='selected-recovery' "
+                                      "AND launch_reservation IS NOT NULL").fetchone():
+                            drift()
                         return result
                     yield db, last
 
