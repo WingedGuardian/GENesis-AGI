@@ -79,6 +79,11 @@ _changed = False  # set when the checkout itself starts to change (_apply)
 _healing = False  # set once a `live` row is judged half-written: no start after it (Q2)
 BOOT_REFUSE = 75  # the unit refuses the start on it; the command's 1
 _DEADLINE: float | None = None  # monotonic, at boot only: every child ends by it
+# At boot, BOOT_DEADLINE_S from entry: the heal's _DEADLINE ends END_MARK_S before
+# it, and the end marks run up to it (#4548), so a mark after the heal is real.
+_MARK_UNTIL: float | None = None
+_GRACE: float | None = None  # _bounded's kill grace while a mark runs (else KILL_GRACE_S)
+_SKIP: str | None = None  # EPHEMERAL_DIRTY_RE for the marks, read once per run
 _BOOT = None  # live_move_boot.py, loaded once
 _KIT_FD: int | None = None  # the kit's KIT.json, held shared while any run uses the kit
 _KIT_ID: str | None = None  # its kit_id, read by the boot self-check (the repeat check's)
@@ -115,7 +120,8 @@ GIT_C = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
 def _bounded(argv: list[str], what: str, **kw):
     """At boot: ``argv`` through the boot runner, ended by the deadline."""
     try:
-        return _BOOT.run(argv, until=_DEADLINE, grace=_BOOT.KILL_GRACE_S, **kw)
+        grace = _BOOT.KILL_GRACE_S if _GRACE is None else _GRACE
+        return _BOOT.run(argv, until=_DEADLINE, grace=grace, **kw)
     except subprocess.TimeoutExpired:
         raise RepairError(f"{what}: stopped, the boot deadline passed") from None
 
@@ -905,10 +911,21 @@ def _state_bytes(path: str) -> bytes:
 
 
 def _end_mark(repo: str) -> str:
+    """The checkout's mark (live_move_boot.end_mark, with each listed path's
+    lstat identity). At boot it runs in the reserve after the heal's deadline,
+    up to BOOT_DEADLINE_S, with MARK_GRACE_S to kill its git (#4548 cell 2)."""
+    global _DEADLINE, _GRACE, _SKIP
+    saved = _DEADLINE, _GRACE
     try:
-        return _boot().end_mark(lambda *a: _git(repo, *a, check=False).stdout)
+        if _MARK_UNTIL is not None and _DEADLINE is not None:
+            _DEADLINE, _GRACE = _MARK_UNTIL, _boot().MARK_GRACE_S
+        if _SKIP is None:
+            _SKIP = _ephemeral()
+        return _boot().end_mark(lambda *a: _git(repo, *a, check=False).stdout, repo, _SKIP)
     except (OSError, RepairError):
         return "unknown"  # past the deadline: the key still names the state
+    finally:
+        _DEADLINE, _GRACE = saved
 
 
 def _boot_key(cls: str, state_path: str, raw: bytes | None, mark: str) -> str:
@@ -973,6 +990,7 @@ class Repair:
         self.update_fd: int | None = None  # update.lock's, handed to restore-hooks
         self.forward = False  # HEAD on `live` at the target: finishing a rollback
         self.start_mark: str | None = None  # at boot, the checkout as the heal found it
+        self.torn = False  # _keep_index rebuilt the index from the tag (it changed the checkout)
 
     def _hold(self, path: str, deadline: float) -> int | None:
         fd = _flock(path, deadline)
@@ -1139,12 +1157,16 @@ class Repair:
         except OSError:
             return False
         # The readable reports, newest first (review LOW-4: a newer folder with
-        # no readable REPAIR.json never hides the run before it; newest 8 only).
+        # no readable REPAIR.json never hides the run before it). The newest 8
+        # REPORTS, not folders (#4548): a lock retire on a healed tree leaves a
+        # folder with none. Bounded: at most 32 folders are read.
         reports = []
-        for candidate in reversed(names[-8:]):  # bounded, as the readers read 8
+        for candidate in reversed(names[-32:]):
             report = self._report(os.path.join(self.backups, candidate, "REPAIR.json"))
             if report is not None:
                 reports.append((candidate, report))
+                if len(reports) == 8:
+                    break
         if not reports:
             return False
         name, report = reports[0]
@@ -1343,7 +1365,24 @@ class Repair:
         self.backup = backup = self._backup_dir()
         self.raw = raw
         ts = os.path.basename(backup)[: -len(SUFFIX)]
-        torn = self._keep_index(backup)
+        manifest = {"ts": ts, "repo": repo, "state_row": state, "tag": tag, "other": to}
+        # The repeat check's (F4): these state bytes, and (at boot) the checkout as left.
+        # The kit too (review SF-B): a newly installed kit may heal what this one could not.
+        manifest.update(state_sha=hashlib.sha256(raw).hexdigest(), end_mark=None, kit_id=_KIT_ID)
+        manifest["start_mark"] = self.start_mark  # round 4: where an outside change shows
+        # `reapply` stays [] (#3868: no generated shell) so older readers stay valid.
+        manifest.update(result=None, paths=[], reapply=[], dismissed_at=None, hooks=None)
+        manifest["index_rebuilt"] = None
+        # #4548: written before anything else (no rows, no `integrity`: nothing is
+        # saved yet), so a heal that fails or is killed before _save is still a
+        # counted attempt; _save writes the whole report over it.
+        self._report_dir(backup)
+        write_json(os.path.join(backup, "REPAIR.json"), manifest, private=True)
+        self._sync(backup)
+        self.torn = torn = self._keep_index(backup)
+        if torn:  # review SF-1: a crash or kill before _save still names the rebuild
+            manifest["index_rebuilt"] = True
+            write_json(os.path.join(backup, "REPAIR.json"), manifest, private=True)
         self.want, self.ephemeral = _tree(repo, tag), _ephemeral()
         index, flags = _index_state(repo)
         rows = None
@@ -1354,14 +1393,7 @@ class Repair:
                 rows = self._rows(to, index, flags)
         readable = rows is not None
         rows = rows if readable else self._rows(None, index, flags)
-        manifest = {"ts": ts, "repo": repo, "state_row": state, "tag": tag, "other": to}
-        # The repeat check's (F4): these state bytes, and (at boot) the checkout as left.
-        # The kit too (review SF-B): a newly installed kit may heal what this one could not.
-        manifest.update(state_sha=hashlib.sha256(raw).hexdigest(), end_mark=None, kit_id=_KIT_ID)
-        manifest["start_mark"] = self.start_mark  # round 4: where an outside change shows
-        # `reapply` stays [] (#3868: no generated shell) so older readers stay valid.
-        manifest.update(result=None, paths=rows, reapply=[], dismissed_at=None, hooks=None)
-        manifest.update(index_rebuilt=torn, integrity="SAVED.json")
+        manifest.update(paths=rows, index_rebuilt=torn, integrity="SAVED.json")
         self._save(backup, manifest)
         self._apply(rows, index)
         if self.forward:
@@ -2175,24 +2207,29 @@ def _dismiss(state: str, repo: str, ts: str, wait: int) -> int:
         os.close(fd)
 
 
-def _record_unresolved(repair: Repair | None, result: str) -> None:
-    """A heal that raised after the checkout began to change ends unresolved in
-    its REPAIR.json (written before the first change, _save), with the checkout
-    as it was left, so the next start's repeat check (F4) refuses at once
+def _record_unresolved(repair: Repair | None, result: str) -> str | None:
+    """A heal that raised ends unresolved in its REPAIR.json (its first one is
+    written as the heal starts, #4548; _save's before the first change), with
+    the checkout as it was left, so the next start's repeat check (F4) counts it
     instead of healing again with one more backup per start. Best effort: the
-    refusal and its page stand whatever this write does."""
+    refusal and its page stand whatever this write does. Returns the end mark
+    it took, for the page key (one mark, not two, in the reserve)."""
     if repair is None or not repair.backup:
-        return
+        return None
     path = os.path.join(repair.backup, "REPAIR.json")
+    mark = None
     try:
         manifest = repair._report(path)
         if manifest is None or manifest.get("result") is not None:
-            return
+            return None
+        if manifest.get("index_rebuilt"):
+            result += "; the index was torn: rebuilt from the tag, its bytes saved as git/index"
         manifest["result"] = result
-        manifest["end_mark"] = _end_mark(repair.repo)
+        manifest["end_mark"] = mark = _end_mark(repair.repo)
         write_json(path, manifest, private=True)
     except Exception as exc:  # noqa: BLE001 - never masks the boot refusal
         _log(f"could not record the failed heal in {path} ({type(exc).__name__}: {exc})")
+    return mark
 
 
 def _boot_failed(repair: Repair | None, state_path: str, exc: Exception) -> int:
@@ -2207,12 +2244,21 @@ def _boot_failed(repair: Repair | None, state_path: str, exc: Exception) -> int:
         )
         cls, rc = "failed", BOOT_REFUSE
         body = f"The boot repair failed partway ({what}); the checkout may be half-restored. What it saved is in {backup}. {_DOWN}"
-        _record_unresolved(repair, f"unresolved: the boot repair failed partway ({what})")
+        mark = _record_unresolved(repair, f"unresolved: the boot repair failed partway ({what})")
     elif _healing:
         _log(f"the repair could not start healing ({what}); the checkout is half-written. {_DOWN}")
         cls, rc = "refused", BOOT_REFUSE
-        body = f"The boot repair could not start healing ({what}); the checkout is half-written, and nothing in it was changed. {_DOWN}"
+        if repair is not None and repair.torn:
+            kept = (
+                f"only the index was rebuilt from the tag; its old bytes are in {backup}/git/index"
+            )
+        else:
+            kept = "nothing in it was changed"
+        body = f"The boot repair could not start healing ({what}); the checkout is half-written, and {kept}. {_DOWN}"
+        # #4548 cell 1: a failure before the full report is a counted attempt too.
+        mark = _record_unresolved(repair, f"{_boot().CRASHED}, before it changed any file ({what})")
     else:
+        mark = None
         _log(f"skipped; nothing was changed ({what})")
         if not os.path.lexists(state_path):
             return 0
@@ -2223,15 +2269,16 @@ def _boot_failed(repair: Repair | None, state_path: str, exc: Exception) -> int:
         "critical",
         _TITLES[cls],
         body,
-        _boot_key(cls, state_path, None, _end_mark(repo) if repo else ""),
+        _boot_key(cls, state_path, None, mark or (_end_mark(repo) if repo else "")),
         backup,
     )
     return rc
 
 
 def main(argv: list[str]) -> int:
-    global _DEADLINE
+    global _DEADLINE, _MARK_UNTIL
     entered = time.monotonic()  # the boot deadline counts from here (F5)
+    _MARK_UNTIL = None  # set below for a boot run only
     ap = argparse.ArgumentParser(prog="live_move_repair.py")
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--boot", action="store_true")
@@ -2269,7 +2316,9 @@ def main(argv: list[str]) -> int:
                 f'python3 -I -S scripts/lib/live_repair_kit.py install {repo[:120]} "$HOME"'
             )
             return 3
-        _DEADLINE = entered + _boot().BOOT_DEADLINE_S
+        boot = _boot()
+        _MARK_UNTIL = entered + boot.BOOT_DEADLINE_S
+        _DEADLINE = _MARK_UNTIL - boot.END_MARK_S  # the reserve is the end marks' (#4548)
     if args.dismiss is not None:  # REPAIR.json's readers stop reporting a dismissed repair's saves
         return _dismiss(args.state, repo, args.dismiss, 30 if args.wait is None else args.wait)
     wait = args.wait if args.wait is not None else 30 if args.restore is not None else 7200
