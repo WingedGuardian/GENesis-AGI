@@ -246,21 +246,63 @@ class TestClassifyCredentialPair:
         assert ref["kind"] == "credentials"
         assert ref["value"] == expected
 
-    @pytest.mark.parametrize("label", ["handle", "account", "email"])
+    @pytest.mark.parametrize(
+        "label", ["handle", "account", "email", "pass", "pwd", "password"]
+    )
     def test_compact_repeated_label_lifecycle_account_falls_through(
         self, label
     ):
         # A compact label in the lifecycle ACCOUNT slot ("handle:admin")
         # is rejected by the same rule on _EXCLUDED_ACCOUNT; the pattern
         # fails and falls through to the single-password capture.
-        # ("pass"/"pwd"/"password" as the account word are excluded here:
-        # the single-pattern fallthrough then reads "pass:admin" as a
-        # password label and returns "password: admin" — pre-existing
-        # leftmost-match behaviour of the single branch, out of scope.)
+        # For "pass"/"pwd"/"password" the fallthrough must NOT re-capture
+        # the rejected token itself as the password ("password: admin"):
+        # single matches overlapping the rejected account span are skipped
+        # (CodeRabbit round 4 on PR #4473).
         ext = Extraction(
             content=(
                 f"created account {label}:admin "
                 "with password: secret123"
+            ),
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == "password: secret123"
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            # No real password anywhere: the rejected account token is not
+            # a password, so nothing is captured (it is not re-read as
+            # "password: admin").
+            "created account pass:admin, no password mentioned here",
+            # The real password is too short for the module's length floor,
+            # so the fallthrough still captures nothing.
+            "created account pass:admin with password: x",
+        ],
+    )
+    def test_rejected_account_without_password_captures_nothing(
+        self, content
+    ):
+        ext = Extraction(
+            content=content,
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        assert classify_as_reference(ext) is None
+
+    def test_two_rejected_accounts_both_excluded(self):
+        # Both rejected account spans are excluded, so the single branch
+        # finds the first real password.
+        ext = Extraction(
+            content=(
+                "created account pass:admin with password: secret123 and "
+                "created account pwd:bob123 with password: hunter2"
             ),
             extraction_type="entity",
             confidence=0.9,

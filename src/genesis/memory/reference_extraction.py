@@ -203,6 +203,31 @@ _ACCOUNT_LIFECYCLE_PATTERN = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# F2. Lifecycle account probe — the same prefix as
+# _ACCOUNT_LIFECYCLE_PATTERN but with a PERMISSIVE account group, so a
+# compact label the lifecycle pattern rejected can still be located
+# (CodeRabbit round 4 on PR #4473). When the lifecycle account is
+# "pass:admin", the lifecycle pattern fails and the single branch would
+# match that SAME token as a password ("password: admin"). A rejected
+# account token must not be re-captured as the password: its span is
+# excluded from the single-pattern search below.
+_LIFECYCLE_ACCOUNT_PROBE_PATTERN = re.compile(
+    r"\b(?:created|registered|signed?\s*up|set\s*up)\s+"
+    r"(?:an?\s+)?(?:account|user|login)\s+"
+    r"(?:for\s+|named?\s+|called?\s+)?"
+    r"(?P<account>[^\s,;]{2,})",
+    re.IGNORECASE,
+)
+
+# The _EXCLUDED_ACCOUNT rule as a matchable pattern: a token is rejected
+# when it is a bare label/copula/introducer word, or one followed directly
+# by ":" or "=". Anchored at the start; re.match on the raw account token.
+_REJECTED_ACCOUNT_TOKEN = re.compile(
+    rf"^(?:{_LABEL_WORDS}|{_COPULA_WORDS}|{_INTRODUCER_WORDS})"
+    r"(?:[^\s,;\w]*(?=[\s,;]|$)|[:=])",
+    re.IGNORECASE,
+)
+
 # URL shape — common http(s) URL, rejects trailing punctuation.
 _URL_PATTERN = re.compile(r"https?://[^\s<>\]\"']+[^\s<>\]\"'.,;!?:]")
 
@@ -310,6 +335,43 @@ def _user_shared(token: str | None, user_text: str | None) -> bool:
     return token.lower() in user_text.lower()
 
 
+def _rejected_lifecycle_account_spans(content: str) -> list[tuple[int, int]]:
+    """Spans of lifecycle account tokens rejected as compact labels.
+
+    Every "created account <token>" in the content is probed; a token is
+    rejected by the same rule _EXCLUDED_ACCOUNT applies (bare
+    label/copula/introducer word, or one followed directly by ":" or "=").
+    All such spans are returned — a second rejected account later in the
+    text must be excluded too.
+    """
+    spans = []
+    for probe in _LIFECYCLE_ACCOUNT_PROBE_PATTERN.finditer(content):
+        if _REJECTED_ACCOUNT_TOKEN.match(probe.group("account")):
+            spans.append(probe.span("account"))
+    return spans
+
+
+def _first_single_credential(
+    content: str, *, exclude_spans: list[tuple[int, int]] = (),
+) -> re.Match | None:
+    """First single-credential match not overlapping an excluded span.
+
+    The single pattern's leftmost match can sit inside a lifecycle account
+    token the lifecycle branch already rejected ("pass:admin" after
+    "created account"); such a match is the account, not a password, so it
+    is skipped and the next match is tried.
+    """
+    for match in _SINGLE_CREDENTIAL_PATTERN.finditer(content):
+        start, end = match.span()
+        if any(
+            start < span_end and span_start < end
+            for span_start, span_end in exclude_spans
+        ):
+            continue
+        return match
+    return None
+
+
 def classify_as_reference(
     extraction: Extraction, user_text: str | None = None,
 ) -> dict | None:
@@ -394,7 +456,11 @@ def classify_as_reference(
             }
 
     # 1d. Single password mention (no user required)
-    single = _SINGLE_CREDENTIAL_PATTERN.search(content)
+    # A lifecycle account token rejected as a compact label ("pass:admin")
+    # must not be re-captured here as the password (CodeRabbit round 4 on
+    # PR #4473): skip single matches overlapping any such span.
+    rejected_spans = _rejected_lifecycle_account_spans(content)
+    single = _first_single_credential(content, exclude_spans=rejected_spans)
     if single:
         password = single.group("value")
         if (
