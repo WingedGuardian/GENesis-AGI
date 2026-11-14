@@ -37,15 +37,18 @@ def _load():
         exec(compile(src, str(path), "exec"), namespace)  # noqa: S102 - trusted local Genesis file
         return (
             namespace["scrub"],
+            # The arms every scrubber version has: which JSON spans to protect is
+            # decided with these, so arms added to ``scrub`` only add redaction.
+            namespace.get("scrub_base", namespace["scrub"]),
             namespace["credential_label_kind"],
             hashlib.sha256(src).hexdigest()[:12],
         )
     except Exception:  # noqa: BLE001 - any failure means: do not store text
-        return None, None, None
+        return None, None, None, None
 
 
-_scrub, _label_kind, _VERSION = _load()
-_ADAPTER_VERSION = "scoped-json-5"
+_scrub, _scrub_base, _label_kind, _VERSION = _load()
+_ADAPTER_VERSION = "scoped-json-6"
 
 
 def version() -> str | None:
@@ -55,7 +58,7 @@ def version() -> str | None:
 
 
 def available() -> bool:
-    return _scrub is not None
+    return _scrub is not None and _scrub_base is not None
 
 
 def _object_pairs():
@@ -88,10 +91,18 @@ def scrub_text(text: str | None) -> tuple[str | None, bool]:
     return _scrub_text(text, 0, [64])
 
 
-def _scrub_text(text, depth, budget):
+def _scrub_text(text, depth, budget, apply=None, decide=None):
+    """``apply`` redacts; ``decide`` picks which JSON spans to protect from the
+    prose pass. A protected span hides its text, a label at its edge included,
+    from the prose pass's arms, so protecting a span the base arms would not
+    can lose a redaction. Deciding with the base arms keeps the protected set
+    exactly the one the base scrubber produces, and ``apply`` only adds. A test
+    that patches ``_scrub`` alone still decides with the real ``_scrub_base``."""
     if not text:
         return text, False
-    if _scrub is None or _label_kind is None or depth > 64:
+    apply = _scrub if apply is None else apply
+    decide = _scrub_base if decide is None else decide
+    if apply is None or decide is None or _label_kind is None or depth > 64:
         return None, True
     try:
         pieces = []
@@ -119,30 +130,45 @@ def _scrub_text(text, depth, budget):
             # A detached quoted member cannot safely represent a full object.
             if isinstance(value, str) and re.match(r"[ \t\r\n]*:", text[end:]):
                 return None, True
-            clean, failed = scrub_json(value, _depth=depth + 1, _budget=budget)
+            original = text[start:end]
+            before = budget[0]
+            clean, failed = scrub_json(
+                value, _depth=depth + 1, _budget=budget, _apply=apply, _decide=decide
+            )
             if failed:
                 return None, True
-            replacement = text[start:end] if json.loads(clean) == value else clean
-            sensitive = _scrub(replacement)
-            if not isinstance(sensitive, str) or sensitive == _PLACEHOLDER:
+            replacement = original if json.loads(clean) == value else clean
+            basis = replacement
+            if decide is not apply:
+                # Same walk with the base arms on a budget copy, so the full
+                # walk's own budget use is unchanged.
+                clean, failed = scrub_json(
+                    value, _depth=depth + 1, _budget=[before], _apply=decide, _decide=decide
+                )
+                if failed:
+                    return None, True
+                basis = original if json.loads(clean) == value else clean
+            sensitive = decide(basis)
+            # The full arms must also accept the span, or it is withheld: the
+            # protected copy never meets them again whole.
+            checked = sensitive if decide is apply else apply(replacement)
+            if any(not isinstance(v, str) or v == _PLACEHOLDER for v in (sensitive, checked)):
                 return None, True
-            protected = replacement != text[start:end] or sensitive != replacement
+            protected = basis != original or sensitive != basis
             pieces.extend(
                 (
                     text[cursor:start],
-                    (replacement, isinstance(value, str), text[start:end])
-                    if protected
-                    else replacement,
+                    (replacement, isinstance(value, str), original) if protected else original,
                 )
             )
             cursor = end
-        out = _scrub_spans(text, pieces)
+        out = _scrub_spans(text, pieces, apply, decide)
         return (None, True) if not isinstance(out, str) or out == _PLACEHOLDER else (out, False)
     except Exception:  # noqa: BLE001 - no raw fallback after sanitizer failure
         return None, True
 
 
-def _scrub_spans(text, pieces):
+def _scrub_spans(text, pieces, apply, decide):
     """Apply prose policy without exposing sanitized JSON delimiters to regexes.
 
     A private-use prefix has more occurrences of its anchor than the entire
@@ -152,7 +178,7 @@ def _scrub_spans(text, pieces):
     """
     protected = any(isinstance(piece, tuple) for piece in pieces)
     if not protected:
-        return _scrub("".join(pieces))
+        return apply("".join(pieces))
     counts = Counter(char for char in text if "\ue000" <= char <= "\uf8ff")
     anchor = next(
         (chr(code) for code in range(0xE000, 0xF900) if chr(code) not in counts),
@@ -172,15 +198,31 @@ def _scrub_spans(text, pieces):
             replacements.append((marker, replacement, _original))
         else:
             rendered.append(piece)
-    out = _scrub("".join(rendered))
+
+    def restore(text):
+        for marker, replacement, _original in replacements:
+            text = text.replace(marker, replacement)
+        if prefix in text or text.count(anchor) > counts[anchor]:
+            raise ValueError("protected JSON marker altered")
+        return text
+
+    # The base arms' pipeline exactly: prose pass, boundary probe, marker check.
+    # Only then do the full arms run over that output, before markers are
+    # restored. Run first, a full arm could consume a marker and the probe would
+    # skip the value after it; checked after them only, a full arm could hide a
+    # marker the prose pass had damaged. Run last, they only add redaction (and
+    # re-running the base arms over their own output only adds too).
+    out = decide("".join(rendered))
     if not isinstance(out, str) or out == _PLACEHOLDER:
         raise ValueError("shared scrubber failed")
-    out = _scrub_span_boundaries(out, [(m, o) for m, _r, o in replacements])
-    for marker, replacement, _original in replacements:
-        out = out.replace(marker, replacement)
-    if prefix in out or out.count(anchor) > counts[anchor]:
-        raise ValueError("protected JSON marker altered")
-    return out
+    out = _scrub_span_boundaries(out, [(m, o) for m, _r, o in replacements], decide)
+    if apply is decide:
+        return restore(out)
+    restore(out)
+    out = apply(out)
+    if not isinstance(out, str) or out == _PLACEHOLDER:
+        raise ValueError("shared scrubber failed")
+    return restore(out)
 
 
 #: How much of a protected span's ORIGINAL text the boundary probe keeps: enough
@@ -190,7 +232,7 @@ _BOUNDARY_TAIL = 64
 _BOUNDARY_SEPARATOR = re.compile(r"[ \t]*[:=]")
 
 
-def _scrub_span_boundaries(out, markers):
+def _scrub_span_boundaries(out, markers, apply):
     """Redact a value that follows a protected span and a separator on its line.
 
     ``out`` is the prose pass's output with the span markers still in place;
@@ -216,13 +258,13 @@ def _scrub_span_boundaries(out, markers):
         if not _BOUNDARY_SEPARATOR.match(window):
             continue
         tail = original[-_BOUNDARY_TAIL:]
-        probed = _scrub(tail + window)
+        probed = apply(tail + window)
         if not isinstance(probed, str) or probed == _PLACEHOLDER:
             raise ValueError("shared scrubber failed")
         if probed == tail + window:
             continue
         head = next(
-            (h for h in (tail, _scrub(tail)) if isinstance(h, str) and probed.startswith(h)),
+            (h for h in (tail, apply(tail)) if isinstance(h, str) and probed.startswith(h)),
             None,
         )
         kept = probed[len(head) :] if head is not None else None
@@ -255,12 +297,16 @@ def _identity_path(path, block_type):
     )
 
 
-def scrub_json(value, *, preserve_identity=False, _depth=0, _budget=None):
+def scrub_json(
+    value, *, preserve_identity=False, _depth=0, _budget=None, _apply=None, _decide=None
+):
     """Scrub decoded JSON before serialization; preserve only transcript ID paths.
 
     Credential labels use the helper loaded from the same bytes as the scrubber.
     """
-    if _scrub is None or _label_kind is None or _depth > 64:
+    apply = _scrub if _apply is None else _apply
+    decide = _scrub_base if _decide is None else _decide
+    if apply is None or decide is None or _label_kind is None or _depth > 64:
         return None, True
     failed = False
     budget = [64] if _budget is None else _budget
@@ -275,7 +321,7 @@ def scrub_json(value, *, preserve_identity=False, _depth=0, _budget=None):
         if isinstance(item, dict):
             out = {}
             for key, child in item.items():
-                clean_key, error = _scrub_text(key, depth + 1, budget)
+                clean_key, error = _scrub_text(key, depth + 1, budget, apply, decide)
                 failed |= error
                 if clean_key in out:
                     failed = True
@@ -288,7 +334,7 @@ def scrub_json(value, *, preserve_identity=False, _depth=0, _budget=None):
         if isinstance(item, list):
             return [walk(child, (*path, index), depth + 1) for index, child in enumerate(item)]
         if isinstance(item, str):
-            clean, error = _scrub_text(item, depth + 1, budget)
+            clean, error = _scrub_text(item, depth + 1, budget, apply, decide)
             failed |= error
             return clean
         return item
