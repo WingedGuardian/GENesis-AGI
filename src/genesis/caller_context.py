@@ -101,6 +101,11 @@ IDENTITY_ENV_VARS = frozenset(
     }
 )
 
+# External launchers clear caller identity and the existing dispatch tracing tags.
+EXTERNAL_IDENTITY_ENV_VARS = IDENTITY_ENV_VARS | {
+    "GENESIS_SLOT", "GENESIS_TRACE_ID", "GENESIS_PARENT_SPAN_ID",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class CallerContext:

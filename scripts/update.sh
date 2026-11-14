@@ -2847,6 +2847,15 @@ if [ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]; then
     echo ""
 fi
 
+# ── Genesis Claude Code plugins — re-run VISIBLY (bootstrap applied them, but `tail -10` ate its output). This is
+# where an existing install first registers plugins/ (e.g. genesis-secret-redact) and where a warning such as a
+# missing `claude` must be seen. Idempotent: an up-to-date install prints one line per plugin.
+if [ -f "$SCRIPT_DIR/cc_plugins.py" ] && [ -x "$VENV_DIR/bin/python" ]; then
+    "$VENV_DIR/bin/python" "$SCRIPT_DIR/cc_plugins.py" apply --repo-root "$GENESIS_ROOT" \
+        || echo "  WARNING: Genesis Claude Code plugins not installed (see above); re-attempted on the next update"
+    echo ""
+fi
+
 # ── Network resilience — re-run VISIBLY (same rationale as memory resilience:
 # bootstrap already applied it, but `tail -10` ate the output). The update path
 # is where an existing install retrofits the KeepConfiguration drop-in + the

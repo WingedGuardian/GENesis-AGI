@@ -168,6 +168,8 @@ def reserve_runtime(snapshot, modules, context, run_mode, settings_path, selecte
     if owner != queue._recovery.owner_identity():
         raise ValueError('initial runtime requires the original actual owner')
     context = native.context(context, queue._legs, queue.marker_hash)
+    if queue.execution_status(context)['nonce_origin'] == 'selected-recovery':
+        raise ValueError('selected runtime requires its supervised execution support')
     selected = modules['queued'].effective_policy(selected, native, full=True)
     reserved = dict(unit=native.expected_unit(context), run_mode=run_mode,
         owner=owner, cap_bytes=8 * 1024**3,

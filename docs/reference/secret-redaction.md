@@ -10,6 +10,30 @@ transcripts, backups and anything published from them. It is not a sandbox again
 value, and it does not stop a command from using one (`curl -H "Authorization: Bearer $KEY"` still runs with
 the real key; only what is shown and stored is redacted).
 
+## Install, upgrade and off-switch
+
+`scripts/bootstrap.sh` and `scripts/update.sh` run `scripts/cc_plugins.py apply`, which registers the checkout's
+`plugins/` folder as the Claude Code marketplace `genesis` at user scope and installs `genesis-secret-redact`.
+Every session on the install then loads it: foreground, subagents and dispatched `claude -p` sessions, except
+sessions launched with `--bare` or `--safe-mode` (readiness probes, eval benches), which load no plugins. The plugin
+loads in place from the checkout, so a later deploy updates it at the next session start with no reinstall.
+
+- **Off:** set `cc_plugins.secret_redact: off` in `~/.genesis/config/genesis.yaml`; the next bootstrap or update
+  uninstalls it. `claude plugin disable genesis-secret-redact@genesis` also works and is kept: `apply` never
+  re-enables a plugin that is installed.
+- **Check:** `scripts/cc_plugins.py check` prints the state and exits 3 when it does not match the lever (for
+  example, disabled while the lever is on, the marketplace pointing at a checkout that moved, or a lever value
+  that is neither `on` nor `off`), and 2 when it cannot tell (no `claude`, unreadable `genesis.yaml`). When the
+  install matches, it reads what sessions report about themselves: each session's plugin writes
+  `~/.genesis/state/secret-redact/<session>.json` (names and counts only) after each load attempt, and `check`
+  exits 4 when a session in the last day could not load the values (it ran unredacted, or on values loaded
+  earlier) or found placeholder text stored as a value in the secrets file; a session that keeps failing
+  refreshes its report hourly. No report in the last day is said to be unknown (exit 0): `check` cannot tell
+  "no session ran" from "a session could not write its report". `apply` removes reports older than a week. Surfacing `check` in Genesis's health alerts is #4441.
+- Only the main checkout registers itself; a linked worktree is refused. A checkout that moved is re-pointed on
+  the next run, keeping a disabled plugin disabled.
+- No `claude` on PATH: the step reports it and is re-attempted on the next update.
+
 ## What is redacted
 
 | Surface | How |
@@ -136,6 +160,9 @@ Not covered:
   secrets file nothing is restored, by design.
 - **Errored tool calls** (a non-zero exit, an MCP tool raising) whose error text holds a value are answered with
   the same text redacted, which the model reads as the call's error result, exactly as it would have.
+- **Using a value.** A placeholder is display text, not the value: a command that needs a key reads it from the
+  environment or the file (`set -a; . <secrets file>; set +a`, or a tool that loads it), never by pasting
+  `[secrets.env:VAR]` into the command line.
 - **Rotation.** A session keeps redacting every value it has loaded, so a key it replaces in the secrets file
   stays hidden in that session (the Edit that replaced it echoes the old line back in its result). A session
   started afterwards knows only the values the file holds then.
@@ -151,8 +178,8 @@ Not covered:
 ## Failure directions
 
 Apart from the one refusal above, every failure here lets the session keep working. Its record is a line in
-Claude Code's debug log (`claude --debug`); a health check that surfaces it without a debug run comes with the
-install step.
+Claude Code's debug log (`claude --debug`) and the session's report, which `scripts/cc_plugins.py check` reads
+(see "Install, upgrade and off-switch").
 
 - The values cannot be loaded: the session runs unredacted. A reload that fails later keeps the values that
   loaded earlier. After a failed load the next attempt waits 30 seconds, so a loader that keeps failing does
