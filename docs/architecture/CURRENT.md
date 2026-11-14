@@ -1974,7 +1974,7 @@ the shared banner is not an assertion about all concurrent sessions.
   `cc_sessions.satellite_id` (added via `_migrate_add_columns`, not the base
   `CREATE TABLE` — mirrors `last_extracted_*`) persists the device for the optional
   `per_device` scope; default `global`.
-- **dashboard/**: Flask blueprint at `/genesis` (~53 route modules);
+- **dashboard/**: Flask blueprint at `/genesis` (~54 route modules);
   `_async_route` bridges sync Flask onto the runtime event loop; heartbeat
   thread detects degraded-but-alive Flask; web terminal (its WebSocket accepts
   same-origin handshakes only: `routes/terminal._refuse_cross_origin_terminal`).
@@ -6107,8 +6107,7 @@ around them. **What exists today:**
 - the READ-ONLY reconciler and its two read tools.
 
 The reconciler's write half (adding every repo item, the bookkeeping move to In
-Review, the Genesis status) and the dashboard tab are follow-on work. The
-shipped mode is `off`.
+Review, the Genesis status) is follow-on work. The shipped mode is `off`.
 
 - **Reconciler, read-only** (`board/reconciler.py`; bootstrap step `board`,
   `runtime/init/board.py`, a 5-min `CronTrigger` on the learning scheduler,
@@ -6132,6 +6131,12 @@ shipped mode is `off`.
   missing or stopped, so the manifest names that cause instead of the board.
 - **`board_status`** reads the stored heartbeats only, never GitHub: the newest
   pulse (alive, mode, error) and the newest SUCCESSFUL read with its age.
+  The dashboard's read-only **Board** tab (#4510; `dashboard/routes/board.py`,
+  `GET /api/genesis/board`, `partials/tabs/board.html`) returns this same
+  function's output unchanged, so the tab and the tool cannot disagree, and it
+  never calls GitHub. It fetches on every entry and every 60 s while open,
+  shows each count with its denominator and age, renders a missing value as
+  "unknown", and shows the newest pulse's age beside an older summary's.
   **`board_item`** reads one issue or PR live (nothing while the mode is
   `off`): its card on the configured
   project (matched by owner AND number), GitHub's blocked-by list (flagged when

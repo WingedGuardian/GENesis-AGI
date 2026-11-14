@@ -5,7 +5,7 @@
       Alpine.store("genesisDashboard", {
         // Tab state
         activeTab: "overview",
-        _tabInitialized: { overview: false, chat: false, internals: false, config: false, files: false, work: false, "follow-ups": false, observations: false, traces: false, autonomy: false, memory: false, knowledge: false, campaigns: false, references: false, calibration: false, backup: false, sessions: false, "zero-drop": false },
+        _tabInitialized: { overview: false, chat: false, internals: false, config: false, files: false, work: false, "follow-ups": false, observations: false, traces: false, autonomy: false, memory: false, knowledge: false, campaigns: false, references: false, calibration: false, backup: false, sessions: false, "zero-drop": false, board: false },
         // ── Calibration tab state ──
         calibrationCells: [],
         calibrationSummary: null,
@@ -371,6 +371,7 @@
           watchlist: { state: "idle", lastSuccess: null, error: null },
           knowledgeRecent: { state: "idle", lastSuccess: null, error: null },
           zeroDrop: { state: "idle", lastSuccess: null, error: null },
+          board: { state: "idle", lastSuccess: null, error: null },
         },
 
         // Polling interval IDs
@@ -400,6 +401,11 @@
         // its sibling for the same reason, and because a key created on first
         // use is invisible to the member scan in test_webui_js_integrity.
         _zeroDropSucceededToken: 0,
+        // The Board tab's own pair, for the same out-of-order reason (see
+        // fetchBoard). Separate tokens: two tabs never share request order.
+        _boardInterval: null,
+        _boardFetchToken: 0,
+        _boardSucceededToken: 0,
         _cockpitInterval: null,
         _commsInterval: null,
         _tracesInterval: null,
@@ -408,6 +414,8 @@
         // endpoint. `null` means NOT FETCHED, which the panel must render
         // differently from a fetched-and-empty board.
         zeroDropView: null,
+        // Board tab: board_status's own output. `null` means NOT FETCHED.
+        boardView: null,
 
         // Observations tab state
         observationsList: [],
@@ -467,6 +475,7 @@
           backup:    [],
           sessions:  ["_ccSessionsTabInterval"],
           "zero-drop": ["_zeroDropInterval"],
+          board:     ["_boardInterval"],
         },
 
         // ── Campaigns ──
@@ -549,7 +558,7 @@
 
         initTab() {
           const hash = location.hash.replace("#", "") || "overview";
-          const valid = ["overview", "chat", "internals", "config", "files", "work", "follow-ups", "observations", "traces", "autonomy", "memory", "knowledge", "campaigns", "references", "calibration", "backup", "sessions", "zero-drop"];
+          const valid = ["overview", "chat", "internals", "config", "files", "work", "follow-ups", "observations", "traces", "autonomy", "memory", "knowledge", "campaigns", "references", "calibration", "backup", "sessions", "zero-drop", "board"];
           this.activeTab = valid.includes(hash) ? hash : "overview";
           window.addEventListener("hashchange", () => {
             const h = location.hash.replace("#", "");
@@ -648,6 +657,12 @@
               // the whole cost.
               this.fetchZeroDrop();
               this._zeroDropInterval = setInterval(() => this.fetchZeroDrop(), 60000);
+              break;
+            case "board":
+              // Every entry, like zero-drop: the tab states how old its numbers
+              // are, so a re-entry must not show a retained summary as current.
+              this.fetchBoard();
+              this._boardInterval = setInterval(() => this.fetchBoard(), 60000);
               break;
             case "traces":
               if (first) { this.fetchSpansRecent(); }
@@ -1281,6 +1296,79 @@
         // already installed a board must not mark a healthy transport broken.
         _newerRequestSucceeded(token) {
           return (this._zeroDropSucceededToken || 0) > token;
+        },
+
+        // ── Board tab (#4510) ─────────────────────────────────────
+        // Same out-of-order guard as fetchZeroDrop, on the board's own tokens.
+        async fetchBoard() {
+          const token = (this._boardFetchToken = (this._boardFetchToken || 0) + 1);
+          this.startFetch("board");
+          try {
+            const resp = await fetchApi("/api/genesis/board");
+            if (resp && resp.ok) {
+              const payload = await resp.json();
+              // A read the backend itself reports as failed (heartbeats
+              // unreadable, runtime restarting) is a failed REFRESH once a good
+              // board is on screen: keep that board and say refresh is failing,
+              // never replace it and read as healthy. Checked BEFORE the
+              // supersession guard: like the HTTP and thrown failures below, it
+              // is discarded only once a newer request has SUCCEEDED, never
+              // because one has merely started (see _newerRequestSucceeded).
+              if (payload?.status !== "ok" && this.boardView?.status === "ok") {
+                if (!this._boardNewerRequestSucceeded(token)) {
+                  this.failFetch("board", payload?.reason || "Board read failed");
+                }
+                return;
+              }
+              if (token !== this._boardFetchToken) return;
+              this.boardView = payload;
+              this._boardSucceededToken = token;
+              this.finishFetch("board");
+            } else if (!this._boardNewerRequestSucceeded(token)) {
+              this.failFetch("board", "Board endpoint returned an error");
+            }
+          } catch (e) {
+            console.warn("Board fetch failed:", e);
+            if (!this._boardNewerRequestSucceeded(token)) {
+              this.failFetch("board", "Failed to fetch the board");
+            }
+          }
+        },
+
+        // A failure is discardable only once a NEWER request has installed a
+        // board, never merely started one (see _newerRequestSucceeded).
+        _boardNewerRequestSucceeded(token) {
+          return (this._boardSucceededToken || 0) > token;
+        },
+
+        // A count for the Board tab: a missing value is "unknown", never 0.
+        boardNum(value) {
+          return typeof value === "number" ? String(value) : "unknown";
+        },
+
+        // The tick's `writes` block (#4400) as one line. A summary from before
+        // the writes existed has none, and says so rather than showing zeros.
+        boardWrites(w) {
+          if (w == null) return "not reported";
+          if (w.unavailable) return "unavailable: " + w.unavailable;
+          // An empty block is what a write phase that failed outright leaves.
+          if (Object.keys(w).length === 0) return "write phase failed (see last error)";
+          const n = (x) => this.boardNum(x);
+          if (w.dry_run) {
+            return "dry run, nothing written: would set " + n(w.would_set_status) + " Status, add at most "
+              + n(w.would_add_at_most) + ", link " + n(w.would_link);
+          }
+          return "added " + n(w.added) + ", Status set " + n(w.status_set) + ", links set " + n(w.links_set)
+            + ", failed " + n(w.failed) + " · budget left " + n(w.budget_left)
+            + (w.stopped_on ? " · stopped on " + w.stopped_on : "");
+        },
+
+        // Seconds as a short age ("42s", "7m", "3h"); unknown when absent.
+        boardAge(seconds) {
+          if (typeof seconds !== "number") return "unknown";
+          if (seconds < 120) return Math.round(seconds) + "s";
+          if (seconds < 7200) return Math.round(seconds / 60) + "m";
+          return Math.round(seconds / 3600) + "h";
         },
 
         async fetchObservations() {
