@@ -361,6 +361,14 @@ _CODE_PROSE_PATHS = (
     ("call_sites", "*", "frequency"),
     ("call_sites", "*", "cost_policy"),
     ("resilience", "summary"),
+    # Fixed strings from snapshots/queues.py ("discarded: count query failed").
+    # The dashboard's queue verdict reads their "<counter>:" prefix, so
+    # withholding them turns a healthy queue into "unknown".
+    ("queues", "errors", "[]"),
+    # snapshots/api_keys.py builds these from provider type names, counts and
+    # call-site ids; the header banner and the provider panel render them.
+    ("api_keys", "alerts", "[]", "message"),
+    ("api_keys", "providers", "*", "cb_label"),
 )
 
 #: The one multi-word enum value a safe key carries (``resilience.level``).
@@ -375,7 +383,9 @@ _ISO_TIME = re.compile(
     r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?)?"
 )
 #: A dict key the walk keeps: a name, never text.
-_KEY = re.compile(r"[A-Za-z0-9_.:@+-]{1,128}")
+#: A structural dict key. No '@': no producer keys a dict on an email-shaped
+#: value, so such a key is text. '.' stays (the infrastructure 'genesis.db' key).
+_KEY = re.compile(r"[A-Za-z0-9_.:+-]{1,128}")
 
 
 def _path_matches(path: tuple, patterns: tuple) -> bool:

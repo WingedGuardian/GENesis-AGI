@@ -400,7 +400,8 @@ _RICH = {
                 "severity": "warning",
                 "provider_type": "type-a",
                 "reason": _free("alert-reason"),
-                "message": _free("alert-message"),
+                # Code-written (snapshots/api_keys.py), so it is kept.
+                "message": "Type-A API key missing — 1 call site(s) affected",
                 "affected_sites": ["site_a"],
             }
         ],
@@ -511,7 +512,6 @@ _MARKED = [
     (("eval_staleness",), "error"),
     (("api_keys", "providers", "provider-a"), "error"),
     (("api_keys", "alerts", 0), "reason"),
-    (("api_keys", "alerts", 0), "message"),
     (("deploy_health", "live"), "reason"),
     (("deploy_health", "live"), "base"),
     (("surplus",), "stall_reason"),
@@ -558,6 +558,7 @@ _KEPT = [
     ("api_keys", "providers", "provider-a", "provider_type"),
     ("api_keys", "providers", "provider-a", "cb_state"),
     ("api_keys", "providers", "provider-a", "cb_reason"),
+    ("api_keys", "alerts", 0, "message"),
     ("api_keys", "providers", "provider-a", "chain_usage"),
     ("api_keys", "providers", "provider-a", "validated_at"),
     ("api_keys", "alerts", 0, "severity"),
@@ -804,3 +805,39 @@ def test_the_dashboard_header_says_detail_text_is_hidden():
     ).read_text()
     assert "health?.free_text_hidden" in header, "the dashboard never reads the marker"
     assert "DASHBOARD_PASSWORD" in header
+
+
+def test_queue_counter_errors_reach_an_uncredentialed_caller():
+    # snapshots/queues.py writes only fixed strings here, and the dashboard's
+    # queue verdict reads their "<counter>:" prefix (dashboard.js queuesSemantic).
+    from genesis.dashboard.routes.health import _withhold_free_text
+
+    queues = {"errors": ["discarded: count query failed"], "discarded": {"known": True}}
+    reduced = _withhold_free_text({"queues": queues})
+    assert reduced["queues"]["errors"] == ["discarded: count query failed"]
+    assert "errors_hidden" not in reduced["queues"]
+
+
+def test_code_written_provider_alert_text_reaches_an_uncredentialed_caller():
+    # snapshots/api_keys.py builds the alert message and breaker label from
+    # provider type names, counts and call-site ids; the header banner renders
+    # the message, the provider panel the label.
+    from genesis.dashboard.routes.health import _withhold_free_text
+
+    message = "Type-A API key missing — 2 call site(s) affected"
+    source = {
+        "api_keys": {
+            "alerts": [{"severity": "critical", "message": message}],
+            "providers": {"provider-a": {"cb_state": "open", "cb_label": "Out of credits"}},
+        }
+    }
+    reduced = _withhold_free_text(source)
+    assert reduced["api_keys"]["alerts"][0]["message"] == message
+    assert reduced["api_keys"]["providers"]["provider-a"]["cb_label"] == "Out of credits"
+
+
+def test_an_email_shaped_key_is_text_and_drops_its_entry():
+    from genesis.dashboard.routes.health import _withhold_free_text
+
+    reduced = _withhold_free_text({"by_message": {"user@example.invalid": 3, "ok_key": 1}})
+    assert reduced["by_message"] == {"keys_hidden": True, "ok_key": 1}
