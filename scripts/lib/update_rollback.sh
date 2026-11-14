@@ -981,6 +981,18 @@ _rollback_body() {
     fi
     # END rollback-code-guard
 
+    # BEGIN rollback-kit-install (extracted by tests/test_scripts/test_update_checkout_moved.py)
+    # The installed live-move repair kit is the version of the code that wrote the
+    # update state (#3492 D2): with the code restored, that is the restored HEAD's,
+    # so the newer kit the update's bootstrap installed is replaced, while the state
+    # file still stands. deploy_code_only.sh, by the same rule, never installs over
+    # a state. Only when the code restore succeeded; never fatal.
+    if [ "$checkout_ok" = "true" ]; then
+        python3 -I -S "$SCRIPT_DIR/lib/live_repair_kit.py" install "$GENESIS_ROOT" "$HOME" \
+            || echo "  NOTE: the live-move repair kit was not reinstalled from $ROLLBACK_TAG; the installed one is kept."
+    fi
+    # END rollback-kit-install
+
     # BEGIN rollback-deps (extracted by tests/test_scripts/test_update_deps_restore.py)
     # Put the packages back to the pre-update record when one was taken: the
     # exact set, not a fresh resolve of the old checkout's ranges. Without a

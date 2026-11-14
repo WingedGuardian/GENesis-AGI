@@ -17,6 +17,7 @@ from pathlib import Path
 from flask import jsonify, request
 
 from genesis.cc.child_env import pin_dispatched_env
+from genesis.cc.invoker import _GH_CREDENTIAL_ENV, _assert_no_gh_credentials
 from genesis.dashboard._blueprint import blueprint
 from genesis.dashboard.update_marker import (
     UpdateLockError,
@@ -793,6 +794,9 @@ def _apply_supervised(pid_file: Path) -> tuple:
         genesis_root=str(_GENESIS_ROOT),
         tier1_prompt=tier1_prompt,
         tier2_prompt=tier2_prompt,
+        # The invoker's own set, not a second list: see GH_CREDENTIAL_ENV in the
+        # template.
+        gh_credential_env=_GH_CREDENTIAL_ENV,
     )
 
     # Write orchestrator to a temp file (avoids arg-length limits with -c).
@@ -873,7 +877,18 @@ def _spawn_detached_cc(
 
     ``effort`` is emitted as ``--effort`` when set; pass None for models that
     don't use an effort setting (Haiku).
+
+    The session's environment carries every gh credential variable the invoker
+    names (``genesis.cc.invoker._GH_CREDENTIAL_ENV``), empty, and passes the
+    invoker's launch gate before anything starts. A refusal raises
+    ``RuntimeError`` with no process started and no log file opened.
     """
+    env = _update_tier_env(pin_dispatched_env(dict(os.environ)))
+    # Empty, not removed, and set last so no earlier layer can restore one: the
+    # gate can vouch only for a key that is present (see the invoker's set).
+    env.update(dict.fromkeys(_GH_CREDENTIAL_ENV, ""))
+    # The last step before the process. Nothing may change ``env`` after it.
+    _assert_no_gh_credentials(env)
     log_path = _HOME / ".genesis" / f"cc_session_{model.replace('/', '_')}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(log_path, "w")  # noqa: SIM115
@@ -887,7 +902,7 @@ def _spawn_detached_cc(
         stderr=subprocess.STDOUT,
         start_new_session=True,
         cwd=str(_GENESIS_ROOT),
-        env=_update_tier_env(pin_dispatched_env(dict(os.environ))),
+        env=env,
     )
     log_fh.close()  # child inherited the fd
     return proc
@@ -926,6 +941,10 @@ PID_FILE = Path({pid_file!r})
 GENESIS_ROOT = Path({genesis_root!r})
 MY_PID = os.getpid()
 SCRIPT_FILE = Path(sys.argv[0])
+# Every environment variable gh reads as a credential: the invoker's own set
+# (genesis.cc.invoker._GH_CREDENTIAL_ENV), substituted when this script is
+# written, so a name added there reaches these sessions with no edit here.
+GH_CREDENTIAL_ENV = {gh_credential_env!r}
 
 # The route that started us wrote OUR pid as the deploy marker while it held
 # update.lock (systemd-run --scope execs us, so its pid is ours), and we leave it
@@ -956,10 +975,14 @@ def spawn_cc(prompt, model, effort=None):
         # GENESIS_UPDATE_TIER mirrors _update_tier_env: these sessions resolve the
         # update's merge in the main checkout, which main_checkout_guard allows
         # only for a session carrying it.
+        # The gh credential variables are set empty, last, so nothing inherited
+        # survives: empty rather than removed, as the invoker pins them. This
+        # script's own environment is left as it was started.
         env = {{
             **os.environ,
             "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "0",
             "GENESIS_UPDATE_TIER": "1",
+            **dict.fromkeys(GH_CREDENTIAL_ENV, ""),
         }}
         proc = subprocess.Popen(
             cmd, start_new_session=True, cwd=str(GENESIS_ROOT), env=env,

@@ -334,6 +334,16 @@ systemctl --user start genesis-backup.service   # fire one run now
 cat ~/.genesis/backup_status.json               # expect "success":true
 ```
 
+The service runs backup.sh at the lowest best-effort I/O priority
+(`IOSchedulingClass=best-effort`, `IOSchedulingPriority=7`). The priority is
+per process and every tool the script starts inherits it. Only an I/O scheduler
+that weighs priority levels (BFQ) can act on it; under `none` or `mq-deadline` the
+level within best-effort has no effect. Whether it reaches BFQ when the filesystem sits on
+device-mapper volumes (LVM), which have no scheduler of their own, is not
+established, so treat any effect on disk contention as unverified. The backup
+that `scripts/update.sh` runs before an update calls backup.sh directly, not
+through the service, so it keeps normal priority.
+
 The status file is also the machine-readable proof used by `scripts/update.sh`.
 Each run records a unique `run_id`, `db_integrity_status`,
 `sqlite_backup_verified`, `failure_class`, and `failure_stage`. An update aborts

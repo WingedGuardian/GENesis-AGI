@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from flask import jsonify
+from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint, logger
 
@@ -48,8 +48,20 @@ def provider_toggle(name: str):
     if breakers is None:
         return jsonify({"status": "error", "message": "circuit breaker registry not available"}), 503
 
+    # The action the dashboard's button showed. The breaker state it rendered
+    # can be stale, so the registry decides from this intent, not from a fresh
+    # read (CircuitBreakerRegistry.toggle). No body means no intent.
+    body = request.get_json(silent=True)
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        return jsonify({"status": "error", "message": "body must be a JSON object"}), 400
+    enabled = body.get("enabled")
+    if enabled is not None and not isinstance(enabled, bool):
+        return jsonify({"status": "error", "message": "'enabled' must be a boolean"}), 400
+
     try:
-        state = breakers.toggle(name)
+        state = breakers.toggle(name, enable=enabled)
     except KeyError:
         return jsonify({"status": "error", "message": f"provider '{name}' not found"}), 404
 

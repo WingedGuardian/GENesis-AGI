@@ -147,6 +147,9 @@ REFUSAL_FILES = (
     # The stale index.lock retirement both scripts run by path before they
     # write the index (#3792).
     "scripts/lib/stale_index_lock.py",
+    # The repair kit's installer, which deploy_code_only.sh runs by path before
+    # it restarts (#3492 D2a-1).
+    "scripts/lib/live_repair_kit.py",
     # PR C's file: readiness reads it from the server's base, and it will hold
     # bootstrap's crash-recovery branch guard.
     PR_C_MARKER,

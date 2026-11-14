@@ -55,14 +55,45 @@ is the boundary for those.
 
 from __future__ import annotations
 
-import os
+import errno
+import genericpath
+import importlib.util
+import os as _os
 import pwd
 import sys
 import tempfile
 import threading
 from pathlib import Path
+from types import ModuleType
 
 import pytest
+
+
+def _observer_os():
+    """Capture functions, including stdlib path helpers' transitive bindings.
+
+    Tests keep the normal mutable OS modules. These private module instances
+    reuse their standard loader and resolver without changing sys.modules.
+    """
+    # Module reprs do not expand environ or other captured values on failure.
+    snapshot = ModuleType("os")
+    snapshot.__dict__.update(vars(_os))
+
+    def private_module(module):
+        copied = importlib.util.module_from_spec(module.__spec__)
+        module.__spec__.loader.exec_module(copied)
+        copied.os = snapshot
+        return copied
+
+    private_generic = private_module(genericpath)
+    snapshot.path = private_module(_os.path)
+    snapshot.path.genericpath = private_generic
+    for name in private_generic.__all__:
+        setattr(snapshot.path, name, getattr(private_generic, name))
+    return snapshot
+
+
+os = _observer_os()
 
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 _EVENTS = frozenset(
@@ -93,10 +124,12 @@ class _State:
     hits: dict[tuple[str, str, str, str], None] = {}  # insertion-ordered set
     merged_workers: set[str] = set()  # xdist workers whose hits were merged
     unreported: list[str] = []  # xdist workers whose hits never arrived
+    faults = 0  # unknown classifications must not look like a clean census
 
 
 _S = _State()
 _busy = threading.local()
+_fault_lock = threading.Lock()
 
 
 def _under(path: str, root: str) -> bool:
@@ -117,7 +150,21 @@ def _absolute(value, dir_fd=None, *, follow=True) -> str | None:
     """The absolute, resolved path. ``follow=False`` resolves only the parent:
     removing, renaming or linking acts on the NAME, so a symlink a test made in
     its own temp dir is that symlink, not the file it points at."""
-    path = _fspath(value)
+    if isinstance(value, int):
+        try:
+            path = os.readlink(f"/proc/self/fd/{value}")
+        except FileNotFoundError:
+            try:
+                os.fstat(value)
+            except OSError as error:
+                if error.errno == errno.EBADF:
+                    return None  # established invalid/closed descriptor
+                raise
+            raise  # valid descriptor, unknown target: count the judging fault
+        if not os.path.isabs(path):
+            return None  # pipes and sockets are not filesystem paths
+    else:
+        path = _fspath(value)
     if not path:
         return None
     if not os.path.isabs(path):
@@ -130,7 +177,7 @@ def _absolute(value, dir_fd=None, *, follow=True) -> str | None:
         path = os.path.join(base, path)
     try:
         if not follow:
-            parent, name = os.path.split(os.path.abspath(path))
+            parent, name = os.path.split(path)
             return os.path.join(os.path.realpath(parent), name)
         return os.path.realpath(path)
     except (OSError, ValueError):
@@ -334,8 +381,11 @@ def _hook(event: str, args: tuple) -> None:
         if event == "open" and _ordinary_read(args):
             return
         _judge(event, args)
-    except Exception:  # noqa: BLE001, S110 - an audit fault must never break the code under test
-        pass
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        raise
+    except BaseException:  # pytest outcomes also must not escape an observer
+        with _fault_lock:
+            _S.faults += 1
     finally:
         _busy.on = False
 
@@ -424,6 +474,7 @@ def pytest_sessionfinish(session, exitstatus):
                 for key in dict.copy(_S.hits)
             ],
             "disarmed": _S.disarmed,
+            "faults": _S.faults,
         }
 
 
@@ -444,6 +495,8 @@ def pytest_testnodedown(node, error):
         _S.hits[tuple(field.decode("utf-8", "surrogateescape") for field in key)] = None
     if got["disarmed"]:
         _S.unreported.append(f"{worker} (disarmed: {got['disarmed']})")
+    with _fault_lock:
+        _S.faults += got.get("faults", 0)
 
 
 def pytest_terminal_summary(terminalreporter):
@@ -454,6 +507,8 @@ def pytest_terminal_summary(terminalreporter):
             terminalreporter.write_line(f"live writes: disarmed ({_S.disarmed})", yellow=True)
         return
     tr = terminalreporter
+    if _S.faults:
+        tr.write_line(f"live writes: {_S.faults} events could not be classified (unknown, not clean)", yellow=True)
     # One snapshot: a thread the run left behind can still record while this runs,
     # and iterating the live dict would raise and fail a run this only reports on.
     # dict.copy() takes it in one step under the GIL, without iterating the dict.

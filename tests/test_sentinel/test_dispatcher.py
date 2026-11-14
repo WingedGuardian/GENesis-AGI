@@ -1541,6 +1541,205 @@ class TestAlarmClearedHysteresis:
         assert ready is True
 
 
+class TestHonestActionResults:
+    """A dispatch is resolved only when EVERY approved action succeeded, and the
+    per-action outcome is recorded (#4302). It used to resolve whenever any
+    action ran, whatever its exit code."""
+
+    @staticmethod
+    def _ran(*outcomes):
+        return [
+            {"command": f"cmd{i}", "success": ok, "stdout": f"out{i}", "stderr": ""}
+            for i, ok in enumerate(outcomes)
+        ]
+
+    def test_all_succeeded_resolves(self):
+        from genesis.sentinel.dispatcher import _record_execution
+
+        r = SentinelResult(dispatched=True)
+        proposed = [{"command": "cmd0"}, {"command": "cmd1"}]
+        _record_execution(r, proposed, self._ran(True, True))
+        assert r.resolved is True
+        assert r.actions_taken == ["cmd0", "cmd1"]
+        assert [o["success"] for o in r.action_outputs] == [True, True]
+        assert r.action_outputs[0]["stdout"] == "out0"
+
+    def test_one_failure_does_not_resolve(self):
+        from genesis.sentinel.dispatcher import _record_execution
+
+        r = SentinelResult(dispatched=True)
+        _record_execution(r, [{"command": "cmd0"}, {"command": "cmd1"}], self._ran(True, False))
+        assert r.resolved is False
+        assert r.actions_taken == ["cmd0", "cmd1"]
+
+    def test_an_action_that_never_started_does_not_resolve(self):
+        """OSError leaves the action out of `executed` entirely."""
+        from genesis.sentinel.dispatcher import _record_execution
+
+        r = SentinelResult(dispatched=True)
+        _record_execution(r, [{"command": "cmd0"}, {"command": "cmd1"}], self._ran(True))
+        assert r.resolved is False
+
+    def test_empty_proposal_does_not_resolve(self):
+        from genesis.sentinel.dispatcher import _record_execution
+
+        r = SentinelResult(dispatched=True)
+        _record_execution(r, [{"command": ""}], [])
+        assert r.resolved is False
+
+    def test_nothing_started_clears_a_preset_resolved_and_keeps_session_actions(self):
+        """No approved action started (every one hit OSError, or the owner
+        rejected): the dispatch is unresolved whatever the result said before,
+        and the session's own actions_taken is not wiped."""
+        from genesis.sentinel.dispatcher import _record_execution
+
+        r = SentinelResult(dispatched=True, resolved=True, actions_taken=["checked logs"])
+        _record_execution(r, [{"command": "cmd0"}], [])
+        assert r.resolved is False
+        assert r.actions_taken == ["checked logs"]
+
+    def test_parse_ignores_self_reported_resolved_beside_proposed_actions(self):
+        """SENTINEL.md: resolved=true means no action is needed. A session that
+        says resolved AND proposes actions is not trusted on the first half."""
+        import json
+
+        d = _make_dispatcher()
+        out = MagicMock()
+        out.text = json.dumps({
+            "diagnosis": "d", "resolved": True,
+            "proposed_actions": [{"command": "cmd0", "description": "x"}],
+        })
+        assert d._parse_output(out, "s1").resolved is False
+        out.text = json.dumps({"diagnosis": "d", "resolved": True, "proposed_actions": []})
+        assert d._parse_output(out, "s1").resolved is True
+
+    @staticmethod
+    def _resolved_and_proposing_output():
+        import json
+
+        out = MagicMock()
+        out.text = json.dumps({
+            "diagnosis": "d", "resolved": True,
+            "proposed_actions": [{"command": "cmd0", "description": "x", "safe": True}],
+        })
+        return out
+
+    @pytest.mark.asyncio
+    async def test_gated_path_runs_actions_and_stays_unresolved_when_none_start(self):
+        """A session that said resolved=true still gets its approved actions
+        run, and when none can start the dispatch escalates, never resolves."""
+        gate = _policy_gate("approved", "req-ok")
+        d = _make_dispatcher(approval_gate=gate)
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        d._invoker.run = AsyncMock(return_value=self._resolved_and_proposing_output())
+        mock_execute = AsyncMock(return_value=[])
+
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"), \
+             patch.object(d, "_execute_approved_actions", mock_execute):
+            result = await d.dispatch(SentinelRequest(
+                trigger_source="test", trigger_reason="test alarm", tier=2,
+            ))
+
+        mock_execute.assert_awaited_once()
+        assert result.resolved is False
+        assert d._state.state == SentinelState.ESCALATED
+
+    @pytest.mark.asyncio
+    async def test_legacy_path_stays_unresolved_when_nothing_runs(self):
+        d = _make_dispatcher(outreach_pipeline=AsyncMock())
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        d._invoker.run = AsyncMock(return_value=self._resolved_and_proposing_output())
+        approve_and_execute = AsyncMock(return_value=[])
+
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"), \
+             patch.object(d, "_request_dispatch_approval", AsyncMock(return_value=True)), \
+             patch.object(d, "_approve_and_execute_actions", approve_and_execute):
+            result = await d.dispatch(SentinelRequest(
+                trigger_source="test", trigger_reason="test alarm", tier=2,
+            ))
+
+        approve_and_execute.assert_awaited_once()
+        assert result.dispatched is True
+        assert result.resolved is False
+        assert d._state.state == SentinelState.ESCALATED
+
+    @pytest.mark.asyncio
+    async def test_resume_stays_unresolved_when_no_action_starts(self):
+        """A parked result that says resolved (written before the parse rule,
+        or by any other path) cannot survive a resume where nothing started."""
+        import json
+
+        from genesis.sentinel.dispatcher import _serialize_request
+
+        d = _make_dispatcher()
+        request = SentinelRequest(
+            trigger_source="fire_alarm", trigger_reason="t", tier=2, alarms=[_alarm(2)],
+        )
+        d._state.pending_policy_id = "sentinel_action"
+        d._state.pending_request_id = "req-r1"
+        d._state.pending_pattern = "test:tier2"
+        d._state.pending_request_json = _serialize_request(request)
+        d._state.pending_cc_result_json = json.dumps({
+            "dispatched": True, "resolved": True, "proposed_actions": [{"command": "cmd0"}],
+        })
+        d._state.transition(SentinelState.AWAITING_ACTION_APPROVAL, reason="test setup")
+        mock_execute = AsyncMock(return_value=[])
+
+        async def _alerts(*args, **kwargs):
+            return [{"id": "test:tier2", "severity": "WARNING", "message": "t2"}]
+
+        with patch("genesis.mcp.health_mcp._impl_health_alerts", new=_alerts), \
+             patch("genesis.sentinel.dispatcher.classify_alerts", return_value=[_alarm(2)]), \
+             patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"), \
+             patch.object(d, "_execute_approved_actions", mock_execute):
+            result = await d.resume_from_approval("req-r1", "approved")
+
+        mock_execute.assert_awaited_once()
+        assert result is not None and result.resolved is False
+        assert d._state.state == SentinelState.ESCALATED
+
+    @pytest.mark.asyncio
+    async def test_failed_action_escalates_and_says_so(self):
+        """End to end through dispatch(): an approved action that exits non-zero
+        ends ESCALATED, and the completion event counts the failure."""
+        gate = _policy_gate("approved", "req-ok")
+        d = _make_dispatcher(approval_gate=gate)
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        d._invoker.run = AsyncMock(return_value=_proposed_actions_output())
+
+        async def _execute(actions):
+            return [
+                {**a, "success": i == 0, "stdout": "", "stderr": "boom" if i else ""}
+                for i, a in enumerate(actions)
+            ]
+
+        events = []
+
+        async def _emit(severity, event_type, message):
+            events.append((severity, event_type, message))
+
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"), \
+             patch.object(d, "_execute_approved_actions", side_effect=_execute), \
+             patch.object(d, "_emit_event", side_effect=_emit):
+            result = await d.dispatch(SentinelRequest(
+                trigger_source="test", trigger_reason="test alarm", tier=2,
+            ))
+
+        assert result.resolved is False
+        assert d._state.state == SentinelState.ESCALATED
+        completed = [e for e in events if e[1] == "sentinel.completed"]
+        assert completed and completed[0][0] == "WARNING"
+        assert "1 of 2 succeeded" in completed[0][2]
+
+
 def _alarm(tier: int) -> FireAlarm:
     return FireAlarm(tier=tier, alert_id=f"test:tier{tier}", severity="WARNING", message=f"t{tier}")
 

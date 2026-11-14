@@ -125,3 +125,48 @@ def test_a_key_before_an_ordinary_escape_is_redacted_not_withheld():
 
     text, _ = disclosable_reply('{"note": "sk-' + "Q" * 24 + '\\nnext line"}')
     assert text == '{"note": "[redacted:api_key_openai]\\nnext line"}'
+
+
+# Shapes adopted from the shared credential table; synthetic, built from parts.
+_NVAPI = "nvapi-" + "a" * 40
+_WEBHOOK = "https://discord" + ".com/api/webhooks/" + "1" * 18 + "/" + "G" * 60
+
+
+def test_a_shared_shape_in_a_reply_is_redacted_and_the_answer_kept():
+    from genesis.peers.results import disclosable_reply
+
+    text, redacted = disclosable_reply("post it to " + _WEBHOOK + " when done")
+    assert text == "post it to [redacted:credential_discord_webhook] when done"
+    assert redacted == ["credential_discord_webhook"]
+
+
+def test_a_shared_shape_hidden_by_json_escapes_withholds_the_reply():
+    from genesis.peers.results import disclosable_reply
+
+    escaped = json.dumps({"url": _WEBHOOK}).replace("/", "\\/")
+    assert "\\/api\\/webhooks" in escaped  # guard: the slashes really are escaped
+    assert disclosable_reply(escaped) == (None, [])
+
+
+def test_a_shared_shape_in_doubly_serialized_json_is_redacted():
+    from genesis.peers.results import disclosable_reply
+
+    text, redacted = disclosable_reply(json.dumps({"inner": json.dumps({"url": _WEBHOOK})}))
+    assert text is not None and "G" * 8 not in text
+    assert json.loads(json.loads(text)["inner"]) == {"url": "[redacted:credential_discord_webhook]"}
+    assert redacted == ["credential_discord_webhook"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"parts": [{"text": "the key is " + _NVAPI}]},  # an outbound peer message
+        {"actionType": "email_send", "description": "send " + _NVAPI},  # approval details
+        {"Bash": 3, "note": _NVAPI},  # a tools summary
+    ],
+    ids=["message", "approval", "tools_summary"],
+)
+def test_a_shared_shape_refuses_structured_peer_disclosure(value):
+    """These callers have no redactor: an adopted shape refuses or blanks them."""
+    assert not json_strings_safe(value)
+    assert not json_strings_safe(value, allow={"internal_file_path", "rfc1918_ip"})

@@ -530,6 +530,16 @@ caller (MEASURED 2026-09-25).
   Genesis chain. Every dispatched session is pinned to `0`
   (`src/genesis/cc/child_env.py`). Measured facts it rests on are in
   `.claude/docs/web-tools-guide.md`; re-checked on every pin bump (checklist item 9).
+- Mods: `plugins/genesis-secret-redact` redacts known secrets.env values from what a session reads and
+  stores (`docs/reference/secret-redaction.md`).
+  MEASURED on 2.1.299: one plugin's `hooks.json` can carry `modules` and `hooks` together; a plugin hook's
+  `updatedInput` applies while sibling settings hooks still receive the original input; a mod's
+  `tool.call` result must keep the tool's output shape or the call fails ("does not match its output
+  shape"); a directory-marketplace plugin loads in place from its source folder (the plugin cache is not
+  what runs); a `--plugin-dir` copy wins over an installed plugin of the same name; the mod runs with
+  `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=0`, so that variable no longer keeps mods out of a session; Write and
+  Edit expand a leading `~` in `file_path`; and the Agent tool's result is a launch notice, with the
+  subagent's reply delivered later.
 - Turn limits (`--max-turns`) and strict MCP config (`--strict-mcp-config`) for Guardian diagnosis
 - PreToolUse / PostToolUse / SessionStart / Stop / UserPromptSubmit hooks
 

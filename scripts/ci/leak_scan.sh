@@ -48,7 +48,9 @@ step_install() {
   # a new detector in an unpinned release would fire on pre-existing
   # content and block every merge. See .github/rulesets/README.md.
   pip install 'detect-secrets==1.5.0'
-  sudo apt-get install -y ripgrep
+  # The pinned official release, not apt: an unreachable apt mirror failed this
+  # required check with no retry (#4376).
+  bash scripts/ci/install_ripgrep.sh  # the script already cd-ed to the repo root (line 39)
 }
 
 _detect_secrets_scan() {

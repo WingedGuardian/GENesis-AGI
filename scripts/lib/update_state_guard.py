@@ -106,6 +106,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 
 SAFE = "safe"
 GUARDS = "guards"
@@ -139,6 +140,21 @@ _LIB = os.path.dirname(os.path.abspath(__file__))
 # 120 s matches the dashboard's other checks; TimeoutExpired reaches every
 # caller's exception path, which keeps the state (guards).
 _TIMEOUT_S = 120
+#: Monotonic; set only by the boot repair (#3492 D2a-2), so that every call
+#: below shares what is left of its one boot deadline. None everywhere else.
+_DEADLINE: float | None = None
+_REAP_S = 5  # _kill_residue_check's own bound, kept inside the deadline
+
+
+def _t(reserve: float) -> float:
+    """A call's timeout: _TIMEOUT_S, or under a boot deadline what is left of
+    it less ``reserve``. With nothing left the call is never started."""
+    if _DEADLINE is None:
+        return _TIMEOUT_S
+    left = _DEADLINE - time.monotonic() - reserve
+    if left <= 0:
+        raise subprocess.TimeoutExpired("git", 0)  # past the boot deadline
+    return min(_TIMEOUT_S, left)
 
 
 def _env() -> dict[str, str]:
@@ -192,7 +208,7 @@ def _rev(repo: str, rev: str) -> str:
         capture_output=True,
         text=True,
         env=_env(),
-        timeout=_TIMEOUT_S,
+        timeout=_t(1),
     ).stdout.strip()
 
 
@@ -208,7 +224,7 @@ def _tag_commit(state: dict, repo: str) -> str:
         ["git", "-C", repo, "check-ref-format", f"refs/tags/{tag}"],
         capture_output=True,
         env=_env(),
-        timeout=_TIMEOUT_S,
+        timeout=_t(1),
     )
     if ok.returncode != 0:
         return ""
@@ -266,6 +282,7 @@ def _merge_residue(
     hidden-entry pass names after its shell's pid ($$, this child's pid) is
     removed, as deploy_health's checkout probe does; TimeoutExpired is then
     raised to the caller as before."""
+    timeout = _t(_REAP_S)  # before the start: with no time left, nothing runs
     proc = subprocess.Popen(
         [
             "bash",
@@ -285,7 +302,7 @@ def _merge_residue(
         start_new_session=True,
     )
     try:
-        stdout, _ = proc.communicate(timeout=_TIMEOUT_S)
+        stdout, _ = proc.communicate(timeout=timeout)
     except BaseException:  # the timeout, or an interrupt that its own session never sees
         _kill_residue_check(proc, repo)
         raise
@@ -327,7 +344,7 @@ def _kill_residue_check(proc: subprocess.Popen, repo: str) -> None:
     # Bounded: SIGKILL stays pending in uninterruptible I/O, the failure the
     # timeout contains; Popen reaps a process left this way when collected.
     with contextlib.suppress(subprocess.TimeoutExpired):
-        proc.communicate(timeout=5)
+        proc.communicate(timeout=_REAP_S)
 
 
 def _conflict_recorded(conflicts_path: str, deploy_head: str) -> bool:
@@ -483,7 +500,7 @@ def _on_live(repo: str) -> bool:
             capture_output=True,
             text=True,
             env=_env(),
-            timeout=_TIMEOUT_S,
+            timeout=_t(1),
         ).stdout.strip()
         == "refs/heads/live"
     )
@@ -539,7 +556,7 @@ def _is_ancestor(repo: str, older: str, newer: str) -> bool:
             ["git", "-C", repo, "merge-base", "--is-ancestor", older, newer],
             capture_output=True,
             env=_env(),
-            timeout=_TIMEOUT_S,
+            timeout=_t(1),
         ).returncode
         == 0
     )
@@ -561,7 +578,7 @@ def _merge_landed(state: dict, repo: str, tag: str, head: str, deploy_head: str)
         capture_output=True,
         text=True,
         env=_env(),
-        timeout=_TIMEOUT_S,
+        timeout=_t(1),
     ).stdout.strip()
     if on != f"refs/heads/{branch}":
         return False
@@ -575,7 +592,7 @@ def _merge_landed(state: dict, repo: str, tag: str, head: str, deploy_head: str)
         capture_output=True,
         text=True,
         env=_env(),
-        timeout=_TIMEOUT_S,
+        timeout=_t(1),
     ).stdout.split()
     return parents == [tag, full]
 

@@ -411,6 +411,24 @@ class TestAutonomyActivityCollector:
 # ── SEED Weight Validation ─────────────────────────────────────────────
 
 
+class TestDatabaseErrorIsAFailedReading:
+    """A collector that cannot read its table returns a placeholder zero. It is
+    marked failed, so a comparison across runs never takes it for a healthy
+    reading (an active alarm would read as cleared)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("module, cls", [
+        ("genesis.learning.signals.autonomy_activity", "AutonomyActivityCollector"),
+        ("genesis.learning.signals.surplus_activity", "SurplusActivityCollector"),
+    ])
+    async def test_db_error_is_marked_failed(self, module, cls):
+        import importlib
+
+        async with aiosqlite.connect(":memory:") as empty:  # no tables: every query raises
+            reading = await getattr(importlib.import_module(module), cls)(empty).collect()
+        assert (reading.value, reading.source, reading.failed) == (0.0, "db_error", True)
+
+
 class TestSeedWeights:
     def test_critical_failure_micro_only(self):
         from genesis.db.schema._tables import SIGNAL_WEIGHTS_SEED
