@@ -469,7 +469,7 @@ explicitly. The CLI checks start all four real factories with disposable local
 dependencies, exercise catalog/authentication/read calls over TCP, and observe
 SDK shutdown and registered-owner drainage before resource closure on SIGTERM.
 Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
-and a floor of 95 cases. Installation, collection, test or report-check failure
+and a floor of 99 cases. Installation, collection, test or report-check failure
 fails the job; missing or filtered workflow runs do not qualify a PR. Closing
 checks its actual head/base result. Ordinary skip-budget changes require observed
 skip identities; this workflow does not raise that budget automatically.
