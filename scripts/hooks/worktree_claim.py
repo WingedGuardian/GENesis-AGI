@@ -62,6 +62,7 @@ import json
 import os
 import re
 import runpy
+import stat
 import subprocess
 from pathlib import Path
 
@@ -486,6 +487,158 @@ def read_lock(root: Path) -> Lock | None:
     return Lock(raw=raw, payload=payload, foreign=payload is None)
 
 
+def common_dir_for(root: Path) -> Path | None:
+    """The repository's common git directory (where ``worktrees/`` lives), read
+    from the main checkout or from any linked worktree. None when ``root`` is
+    neither, or a pointer could not be read."""
+    root = Path(root)
+    try:
+        if (root / ".git").is_dir():
+            return (root / ".git").resolve()
+    except OSError:
+        return None
+    admin = gitdir_for(root)
+    if admin is None:
+        return None
+    try:
+        rel = (admin / "commondir").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not rel:
+        return None
+    common = Path(rel)
+    return (common if common.is_absolute() else admin / common).resolve()
+
+
+def _read_regular(path: str, limit: int = 65536) -> tuple[bytes, float] | None:
+    """``(bytes, mtime)`` of a REGULAR file, or None. Opened non-blocking and
+    without following a symlink, then checked by fstat, so a FIFO or a link
+    planted under an admin-file name is skipped instead of blocking a read
+    (the scan runs in a per-prompt hook)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        return os.read(fd, limit), info.st_mtime
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _admin_text(admin: Path, name: str) -> str | None:
+    got = _read_regular(str(admin / name), 4096)
+    return got[0].decode("utf-8", errors="replace").strip() if got else None
+
+
+def claim_is_live(pid: int, start: int | None = None) -> bool:
+    """True only on POSITIVE evidence that ``pid`` is still the process that
+    took the claim: its recorded start time matches (or, for a lock without
+    one, it is a session process), and it is not a zombie.
+
+    This is the DISPLAY test. :func:`pid_is_live_session` answers the reaper's
+    question, where an unreadable ``/proc`` must protect the claim; here an
+    unknown means the claim is not shown, never that it is."""
+    fields = _proc_fields(pid)
+    if fields is None or not fields or fields[0] in ("Z", "X"):
+        return False
+    if start is None:
+        return is_session_process(pid)
+    try:
+        return int(fields[19]) == start
+    except (IndexError, ValueError):
+        return False
+
+
+#: Lock files read per deadline check while scanning.
+_SCAN_CHECK_EVERY = 16
+_NAMESPACE_BYTES = PAYLOAD_NAMESPACE.encode()
+
+
+def claims_by_session(
+    common_dir: Path, sids, *, pids: dict | None = None, should_stop=None
+) -> dict[str, list[dict]] | None:
+    """The LIVE claims held by each of ``sids``, newest first:
+    ``{sid: [{"name", "branch", "claimed_at"}, ...]}``.
+
+    A claim belongs to its PROCESS but records the session id current when it
+    was taken, and ``/clear`` starts a new id in the same process. So a claim
+    counts for a session when its pid is that session's live pid in ``pids``
+    (verified by the caller, e.g. against Claude Code's session registry), or,
+    failing that, when its recorded ``sid`` is the session's.
+
+    Read straight from each admin directory's ``locked`` file (never porcelain:
+    see :func:`gitdir_for`), with a byte test for our namespace before any
+    parse. A claim counts only when it is ours (:func:`_parse_payload`) and
+    :func:`claim_is_live`. ``claimed_at`` is the lock file's mtime, which is
+    the claim time: :func:`lock_worktree` never overwrites a lock. ``name`` is
+    the worktree's directory name; ``branch`` is None for a detached HEAD.
+    Anything unreadable or malformed is skipped, one entry at a time.
+
+    Returns None when ``should_stop()`` turned true mid-scan: an unfinished scan
+    is "unknown", never "no claims"."""
+    wanted = {sid for sid in sids if _is_safe_session_id(sid)}
+    by_pid = {
+        pid: sid
+        for sid, pid in (pids or {}).items()
+        if sid in wanted and type(pid) is int and pid > 1
+    }
+    out: dict[str, list[dict]] = {}
+    if not wanted:
+        return out
+    try:
+        entries = list(os.scandir(Path(common_dir) / "worktrees"))
+    except OSError:
+        return out
+    for index, entry in enumerate(entries):
+        if should_stop is not None and index % _SCAN_CHECK_EVERY == 0 and should_stop():
+            return None
+        try:
+            got = _read_regular(os.path.join(entry.path, "locked"))
+            if got is None:
+                continue
+            raw, claimed_at = got
+            # Most locks on a busy install are not claims (the reaper's archive
+            # locks): skip them on the bytes, before any decode or parse.
+            if _NAMESPACE_BYTES not in raw:
+                continue
+            payload = _parse_payload(raw.decode("utf-8", errors="replace").strip())
+            if payload is None:
+                continue
+            sid = by_pid.get(payload["pid"])
+            if sid is None:
+                # The lock's own sid is unverified: its pid must at least be a
+                # session process (a verified pid match needs no such check).
+                recorded = payload.get("sid")
+                if (
+                    isinstance(recorded, str)
+                    and recorded in wanted
+                    and is_session_process(payload["pid"])
+                ):
+                    sid = recorded
+            if sid is None or not claim_is_live(payload["pid"], payload.get("start")):
+                continue
+            admin = Path(entry.path)
+            head = _admin_text(admin, "HEAD") or ""
+            pointer = _admin_text(admin, "gitdir")
+            out.setdefault(sid, []).append(
+                {
+                    "name": Path(pointer).parent.name if pointer else entry.name,
+                    "branch": head[len("ref: refs/heads/") :]
+                    if head.startswith("ref: refs/heads/")
+                    else None,
+                    "claimed_at": claimed_at,
+                }
+            )
+        except (OSError, ValueError, TypeError, KeyError, RecursionError):
+            continue
+    for claims in out.values():
+        claims.sort(key=lambda claim: claim["claimed_at"], reverse=True)
+    return out
 def format_reason(payload: dict) -> str:
     """A lock reason: a sentence a blocked reader can act on, then the JSON.
 
