@@ -394,10 +394,12 @@ async def test_delivered_bulk_hold_stamps_prospect_contacted(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_delivered_financial_misclassified_pitch_still_stamps(db):
+async def test_delivered_financial_misclassified_pitch_still_stamps(db, monkeypatch):
     """Provenance is RECIPIENT-based, NOT cell_risk_class: a cold pitch whose body
     tripped the money-pattern classifier holds as FINANCIAL (not BULK), but on
-    delivery to a curated prospect it must STILL stamp them — else re-pitched."""
+    delivery to a curated prospect it must STILL stamp them — else re-pitched.
+    The lever is armed: a prospect send pauses while marketing is off."""
+    monkeypatch.setattr(egw, "_marketing_mode", lambda: "live")
     from genesis.db.crud import marketing_prospects as mp
 
     await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
@@ -675,3 +677,142 @@ async def test_approved_hold_to_opted_out_prospect_in_display_form_is_refused(db
     assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
     assert pipe.calls == []  # not delivered
     assert (await pes.get_by_id(db, "pg"))["status"] == "rejected"
+
+
+# ── Kill-switch and contact stamp for prospect sends on any cell (owner 2026-11-13) ──
+
+
+async def _prospect_hold(db, *, rid, recipient, risk_class, pid="pp"):
+    await pes.create(
+        db,
+        id=pid,
+        request_id=rid,
+        validated_recipient=recipient,
+        category="notification",
+        message="follow-up",
+        held_at=_TS,
+        cell_domain="email",
+        cell_verb="send",
+        cell_risk_class=risk_class,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("risk_class", ["identity", "standard", "financial"])
+async def test_approved_prospect_hold_on_any_cell_pauses_while_marketing_is_off(db, risk_class):
+    """The marketing stop covers every send to a curated prospect, approved or not,
+    whatever its class: with the lever off (the shipped default here) an approved
+    hold addressed in display form is left held, approval unconsumed, nothing sent."""
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await _prospect_hold(
+        db, rid=rid, recipient="Prospect <prospect@example.com>", risk_class=risk_class
+    )
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 0
+    assert pipe.calls == []
+    assert (await pes.get_by_id(db, "pp"))["status"] == "held"
+    assert (await ac.get_by_id(db, rid))["consumed_at"] is None
+    assert (await mp.get_by_id(db, "prospect"))["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_approved_prospect_hold_sends_when_armed_and_stamps_display_form(db, monkeypatch):
+    """With the lever armed the approved hold goes out, and a prospect addressed as
+    `Name <addr>` is stamped contacted, so the campaign does not pitch it again."""
+    monkeypatch.setattr(egw, "_marketing_mode", lambda: "observe")
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await _prospect_hold(
+        db, rid=rid, recipient="Prospect <prospect@example.com>", risk_class="identity"
+    )
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert pipe.calls == [("pp", "hi")]
+    assert (await mp.get_by_id(db, "prospect"))["status"] == "contacted"
+    assert await mp.list_active(db) == []
+
+
+class _PartlyRefusedPipeline(_FakePipeline):
+    """Delivered, but the server refused some recipients (a partly accepted send)."""
+
+    def __init__(self, refused):
+        super().__init__(OutreachStatus.DELIVERED)
+        self._refused = tuple(refused)
+
+    async def deliver_approved(self, row, *, subject=None):
+        self.calls.append((row["id"], subject))
+        return OutreachResult(
+            outreach_id="o",
+            status=OutreachStatus.DELIVERED,
+            channel="email",
+            message_content="",
+            refused_recipients=self._refused,
+        )
+
+
+@pytest.mark.asyncio
+async def test_partly_refused_delivery_stamps_only_accepted_prospects(db, monkeypatch):
+    """A list send the server partly refused is DELIVERED, but the refused
+    prospect was never emailed: it stays active, and only the accepted one is
+    stamped contacted."""
+    monkeypatch.setattr(egw, "_marketing_mode", lambda: "observe")
+    from genesis.db.crud import marketing_prospects as mp
+
+    for pid, email in (("p1", "one@example.com"), ("p2", "two@example.com")):
+        await mp.create(db, id=pid, email=email, created_at=_TS, updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await _prospect_hold(
+        db, rid=rid, recipient="One <one@example.com>, Two <two@example.com>",
+        risk_class="identity",
+    )
+    pipe = _PartlyRefusedPipeline(["two@example.com"])
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert (await pes.get_by_id(db, "pp"))["status"] == "sent"
+    assert (await mp.get_by_id(db, "p1"))["status"] == "contacted"
+    assert (await mp.get_by_id(db, "p2"))["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_non_prospect_hold_is_untouched_by_the_marketing_stop(db):
+    """Control: an approved IDENTITY send to someone who is not a prospect is
+    delivered with the lever off."""
+    rid = await _approval(db, status="approved")
+    await _prospect_hold(db, rid=rid, recipient="Colleague <colleague@example.com>", risk_class="identity")
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert pipe.calls == [("pp", "hi")]
+
+
+@pytest.mark.asyncio
+async def test_prospect_lookup_failure_pauses_rather_than_sends(db, monkeypatch):
+    """Fail safe: if the prospect lookup errors, the kill-switch treats the row as
+    marketing and pauses it (left held, retried next drain) with the lever off."""
+    from genesis.db.crud import marketing_prospects as mp
+
+    rid = await _approval(db, status="approved")
+    await _prospect_hold(db, rid=rid, recipient="someone@example.com", risk_class="identity")
+    real = mp.find_in_recipient
+    calls = {"n": 0}
+
+    async def _flaky(db_, recipient):
+        calls["n"] += 1
+        # The opt-out re-check above calls it first; fail only the kill-switch lookup.
+        if calls["n"] >= 2:
+            raise RuntimeError("simulated lookup failure")
+        return await real(db_, recipient)
+
+    monkeypatch.setattr(mp, "find_in_recipient", _flaky)
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 0
+    assert pipe.calls == []
+    assert (await pes.get_by_id(db, "pp"))["status"] == "held"

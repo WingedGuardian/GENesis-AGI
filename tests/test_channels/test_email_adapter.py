@@ -52,6 +52,40 @@ class TestEmailAdapter:
             assert delivery_id  # non-empty string
 
     @pytest.mark.anyio
+    async def test_send_message_reports_refused_recipients(self, adapter: EmailAdapter) -> None:
+        """smtplib returns normally on a partly accepted send, with a dict of the
+        refused recipients. The delivery id keeps them (normalized) so callers act
+        only on the recipients the server took; it is still the Message-ID string."""
+        mock_smtp = MagicMock()
+        mock_smtp.send_message.return_value = {"Two@Example.com": (450, b"mailbox busy")}
+        with patch("genesis.channels.email_adapter.smtplib.SMTP_SSL") as smtp_cls:
+            smtp_cls.return_value.__enter__ = MagicMock(return_value=mock_smtp)
+            smtp_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+            delivery_id = await adapter.send_message(
+                "One <one@example.com>, Two <Two@Example.com>", "body"
+            )
+
+        sent_msg = mock_smtp.send_message.call_args[0][0]
+        assert isinstance(delivery_id, str)
+        assert delivery_id == sent_msg["Message-ID"]
+        assert delivery_id.refused == frozenset({"two@example.com"})
+
+    @pytest.mark.anyio
+    async def test_send_message_all_accepted_reports_no_refusals(
+        self, adapter: EmailAdapter
+    ) -> None:
+        mock_smtp = MagicMock()
+        mock_smtp.send_message.return_value = {}
+        with patch("genesis.channels.email_adapter.smtplib.SMTP_SSL") as smtp_cls:
+            smtp_cls.return_value.__enter__ = MagicMock(return_value=mock_smtp)
+            smtp_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+            delivery_id = await adapter.send_message("recipient@example.com", "body")
+
+        assert delivery_id.refused == frozenset()
+
+    @pytest.mark.anyio
     async def test_send_message_default_subject(self, adapter: EmailAdapter) -> None:
         mock_smtp = MagicMock()
         with patch("genesis.channels.email_adapter.smtplib.SMTP_SSL") as smtp_cls:

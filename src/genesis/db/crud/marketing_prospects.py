@@ -21,7 +21,9 @@ there is no unbounded growth to GC. No disk-hygiene prune path is wired by desig
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from datetime import UTC, datetime
+from email.message import EmailMessage
 from email.utils import getaddresses
 
 import aiosqlite
@@ -86,6 +88,42 @@ _ADDRESS_SHAPE = re.compile(r'[^\s<>,;"()]+@[^\s<>,;"()]+')
 _LOOKUP_CHUNK = 500
 
 
+def _recipient_emails(recipient: str | None) -> list[str]:
+    """Every normalized address a recipient string names, in first-seen order:
+    what the header parser finds, every address-shaped run, and the string as
+    given. Empty for a blank recipient."""
+    raw = recipient or ""
+    if not raw.strip():
+        return []
+    candidates = [addr for _name, addr in getaddresses([raw])]
+    candidates.extend(_ADDRESS_SHAPE.findall(raw))
+    candidates.append(raw)
+    return list(dict.fromkeys(e for e in map(_normalize_email, candidates) if e))
+
+
+def _delivery_emails(recipient: str | None) -> list[str]:
+    """The normalized addresses a send to ``recipient`` actually reaches.
+
+    Read the way the email adapter sends: the string becomes an
+    ``EmailMessage`` To header and ``smtplib.send_message`` delivers to
+    ``getaddresses`` of that header. Narrower than ``_recipient_emails`` on
+    purpose: an address inside a display name (``"a@x" <b@y>``) is a hold
+    candidate but is never sent to, so it must not be stamped contacted.
+    Empty when the header cannot be built or parsed, since that send raises
+    too; the delivery paths stamp after a send, so this never raises."""
+    raw = recipient or ""
+    if not raw.strip():
+        return []
+    msg = EmailMessage()
+    try:
+        msg["To"] = raw
+        headers = [str(h) for h in msg.get_all("To") or []]
+        found = [addr for _name, addr in getaddresses(headers)]
+    except Exception:  # noqa: BLE001 - an unparseable header was never delivered
+        return []
+    return list(dict.fromkeys(e for e in map(_normalize_email, found) if e))
+
+
 async def find_in_recipient(db: aiosqlite.Connection, recipient: str | None) -> dict | None:
     """The curated prospect a recipient STRING names, or None.
 
@@ -99,13 +137,7 @@ async def find_in_recipient(db: aiosqlite.Connection, recipient: str | None) -> 
     One query per ``_LOOKUP_CHUNK`` addresses, so a very long recipient string
     costs a few queries and not one per address.
     """
-    raw = recipient or ""
-    if not raw.strip():
-        return None
-    candidates = [addr for _name, addr in getaddresses([raw])]
-    candidates.extend(_ADDRESS_SHAPE.findall(raw))
-    candidates.append(raw)
-    emails = list(dict.fromkeys(e for e in map(_normalize_email, candidates) if e))
+    emails = _recipient_emails(recipient)
     found: dict | None = None
     for start in range(0, len(emails), _LOOKUP_CHUNK):
         chunk = emails[start : start + _LOOKUP_CHUNK]
@@ -185,6 +217,43 @@ async def mark_contacted_by_email(
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def mark_contacted_in_recipient(
+    db: aiosqlite.Connection,
+    recipient: str | None,
+    *,
+    contacted_at: str,
+    refused: Iterable[str] = (),
+) -> int:
+    """``mark_contacted_by_email`` for a delivered RECIPIENT STRING: every ACTIVE
+    prospect it names goes active → contacted. The delivery paths pass the
+    recipient as sent, which can be ``Name <addr>`` or a list; an exact match on
+    that string stamps nothing, so a delivered prospect would stay 'active' and be
+    pitched again. Addresses come from ``_delivery_emails``: only the ones the
+    send reaches, not every candidate ``find_in_recipient`` holds on, less any
+    address in ``refused`` (the recipients the server refused on a partly
+    accepted send, from the email adapter's delivery id).
+
+    Same guarantees as ``mark_contacted_by_email``: one conditional UPDATE per
+    ``_LOOKUP_CHUNK`` addresses (``status = 'active'``), so a row another writer
+    moved on is never downgraded, and a non-prospect address is never touched.
+    Returns the number of prospects stamped."""
+    skip = {e for e in map(_normalize_email, refused) if e}
+    emails = [e for e in _delivery_emails(recipient) if e not in skip]
+    stamped = 0
+    for start in range(0, len(emails), _LOOKUP_CHUNK):
+        chunk = emails[start : start + _LOOKUP_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        cursor = await db.execute(
+            "UPDATE marketing_prospects "  # noqa: S608 — placeholders only
+            "SET last_contacted_at = ?, status = 'contacted', updated_at = ? "
+            f"WHERE email COLLATE NOCASE IN ({marks}) AND status = 'active'",
+            (contacted_at, contacted_at, *chunk),
+        )
+        stamped += cursor.rowcount
+    await db.commit()
+    return stamped
 
 
 async def mark_opted_out(db: aiosqlite.Connection, id: str, *, opted_out_at: str) -> bool:

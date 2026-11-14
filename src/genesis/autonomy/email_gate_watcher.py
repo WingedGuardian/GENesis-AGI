@@ -96,18 +96,45 @@ async def _is_posture_hold(db: object, row: dict) -> bool:
     return cell is not None and cell["state"] == CellState.GRANTED.value
 
 
-async def _stamp_prospect_contacted(db: object, recipient: str | None, now: str) -> None:
+async def _stamp_prospect_contacted(
+    db: object, recipient: str | None, now: str, *, refused: tuple[str, ...] = ()
+) -> None:
     """LOOP-FIX helper: on a CONFIRMED delivery, advance the matching prospect
     active → contacted so the campaign's ``list_active`` never re-pitches it.
     Delegates to the shared, active-guarded CRUD (the same entry point
     ``pipeline._deliver`` uses for the GRANTED autonomous path), so the stamp
     semantics live in one place. A non-marketing / non-active / absent recipient is
-    a no-op."""
+    a no-op. Every address the send reaches is stamped, so a prospect addressed
+    as ``Name <addr>`` counts as contacted too; ``refused`` (the send result's
+    ``refused_recipients``) names addresses the server refused, never stamped."""
     if not recipient:
         return
     from genesis.db.crud import marketing_prospects as mp
 
-    await mp.mark_contacted_by_email(db, recipient, contacted_at=now)
+    await mp.mark_contacted_in_recipient(db, recipient, contacted_at=now, refused=refused)
+
+
+async def _is_prospect_send(db: object, row: dict) -> bool:
+    """Is this held send marketing, for the kill-switch: a BULK row, or any row
+    whose recipient names a curated prospect (whatever its class). Fail-SAFE: a
+    lookup error answers True, so the kill-switch pauses the send (left held and
+    retried next drain) rather than letting it out unchecked."""
+    from genesis.autonomy.types import RiskClass
+    from genesis.db.crud import marketing_prospects as mp
+
+    if row["cell_risk_class"] == RiskClass.BULK.value:
+        return True
+
+    try:
+        return await mp.find_in_recipient(db, row["validated_recipient"]) is not None
+    except Exception:  # noqa: BLE001 — fail safe: pause, never send unchecked
+        logger.warning(
+            "Prospect lookup failed for held email %s — treated as marketing for the "
+            "kill-switch (paused)",
+            row["id"],
+            exc_info=True,
+        )
+        return True
 
 
 async def _terminalize_delivered_hold(db: object, row: dict, now: str) -> None:
@@ -182,6 +209,10 @@ async def drain_pending_email_sends(rt: object) -> int:
                 # stamp being idempotent and record_success gated on the flip) rather
                 # than going 'sent' with the prospect left 'active' or the owner-approved
                 # success dropped from promotion evidence.
+                # Known gap (#4647): the crashed cycle's refused recipients were never
+                # saved, so this stamps every address the send reached, including any
+                # the server refused. Not stamping instead would risk a duplicate pitch
+                # to a prospect that was reached, which is the worse error.
                 await _stamp_prospect_contacted(db, row["validated_recipient"], now)
                 await _terminalize_delivered_hold(db, row, now)
                 resolved += 1
@@ -246,14 +277,19 @@ async def drain_pending_email_sends(rt: object) -> int:
             # deliver below) so a mid-run toggle during the opt-out/curation awaits
             # above cannot slip a send past the stop (TOCTOU-closed). Fail-SAFE: pause
             # on anything but an affirmatively-armed mode. PAUSE = leave held, approval
-            # unconsumed, nothing sent → a re-enable resumes it. Scoped to BULK (the
-            # marketing path); non-marketing sends untouched. A FINANCIAL-classified
-            # marketing pitch is the send-provenance edge tracked in follow-up df805eba.
-            if row["cell_risk_class"] == "bulk" and _marketing_mode() not in ("observe", "live"):
+            # unconsumed, nothing sent → a re-enable resumes it. Scoped to marketing
+            # sends: a BULK row, or any row whose recipient is a curated prospect
+            # (owner ruling 2026-11-13: the stop covers every prospect send, approved
+            # or not, whatever its class). Non-prospect sends are untouched. The
+            # prospect lookup is the last await before the mode read, so the read
+            # and the deliver below stay adjacent.
+            is_marketing = await _is_prospect_send(db, row)
+            if is_marketing and _marketing_mode() not in ("observe", "live"):
                 logger.info(
-                    "Held BULK email %s paused — marketing lever not armed (kill-switch); "
-                    "left held, resumes when re-enabled",
+                    "Held marketing email %s (class=%s) paused — marketing lever not "
+                    "armed (kill-switch); left held, resumes when re-enabled",
                     row["id"],
+                    row["cell_risk_class"],
                 )
                 continue
             # Deliver FIRST (verbatim, below the gate). Only on success do we
@@ -274,7 +310,9 @@ async def drain_pending_email_sends(rt: object) -> int:
                 # a non-prospect recipient) so list_active stops re-pitching it. Keyed
                 # on the RECIPIENT being a curated prospect, NOT cell_risk_class, so a
                 # cold pitch that misclassified FINANCIAL (money-term body) is stamped.
-                await _stamp_prospect_contacted(db, row["validated_recipient"], now)
+                await _stamp_prospect_contacted(
+                    db, row["validated_recipient"], now, refused=result.refused_recipients
+                )
                 # Terminalize + record the owner-approved success exactly once (the
                 # mark_sent single-flip gates record_success; identical to the reconcile
                 # branch, so a crash-recovery replay accounts for it the same way).
