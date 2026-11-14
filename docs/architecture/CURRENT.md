@@ -5309,6 +5309,10 @@ logger or unrelated exceptions with copied text and no provenance.
   every child by one deadline 75 s after its start (`live_move_boot.py`: git,
   the guard's git through its `_DEADLINE`, restore-hooks, which ends 10 s early
   so the healed tree is judged in time; a call with no time left never starts;
+  the heal's own git ends 5 s early, `END_MARK_S`, and every end mark may run
+  into that reserve with a 1 s kill grace, so a crash's mark taken after the
+  heal's deadline is still real (#4548; a hung mark early in the run can use the
+  heal's time and the reserve, still inside the 90 s pin);
   the pin 5 + 75 + 3 + 1 + 4 <= 90 is tested, and a run past its deadline
   ended `exit-code`, not `timeout`, in a transient unit: measured 2026-11-11
   with a 20 s deadline; T-D34 repeats it only where a user manager exists). A `live` row judged
@@ -5320,10 +5324,14 @@ logger or unrelated exceptions with copied text and no provenance.
   `live` rollback stopped after `merging`, #3722's wording) with a `mixed`
   critical page, a failure before judging with `skipped`. Each page's key is
   its class, the state's bytes as the run leaves them and an end mark of the
-  checkout (HEAD, `status -z`, index.lock), so a heal that keeps a HOLD and the
+  checkout (HEAD, `status -z`, index.lock, and the lstat identity, ctime
+  included, of up to 20,000 listed paths other than the ephemeral ones, so an
+  edit to a file that is already modified or untracked moves it; #4548), so a heal that keeps a HOLD and the
   next boot's HOLD page once; a repeat of an unresolved heal (a heal that crashed
   partway, or was killed before it recorded a result, is retried once at the next start: owner
-  ruling, its attempts counted from the reports on disk; an end mark the deadline left unreadable
+  ruling, its attempts counted from the newest 8 reports among the newest 32 folders on disk; a heal
+  writes its first REPAIR.json as it starts, before anything is saved, so one that fails or is
+  killed before its backup is complete is counted too (#4548); an end mark the deadline left unreadable
   never counts as a change) with nothing
   changed refuses at once with no new backup, unless another kit is installed
   (its `kit_id` is part of the match). Every run, by command too, holds the kit's
