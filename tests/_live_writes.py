@@ -35,6 +35,11 @@ Output: a terminal-summary section, and, with ``GENESIS_LIVE_WRITES_REPORT=<file
 one tab-separated line per (test, class, operation, path), written on every run.
 Each field escapes backslash/tab/LF/CR; tests._live_writes_report.decode reads
 the reversible bytes. Empty/parseable TSV alone never establishes completeness.
+Judging failures increment the fault count and add ``observer fault`` rows:
+operation is event/stage/fixed-builtin-error-category, path is ``<not captured>``.
+No exception message, filename or traceback is retained. Identical rows deduplicate;
+fault counts do not. Failed attribution uses ``<attribution unavailable>``; failed
+diagnostic retention still leaves a nonzero fault count (unknown, not clean).
 Under xdist each worker hands its hits to the controller at session end
 (``workeroutput``, as the live fence does), and only the controller reports; a
 worker that never reported is named in the summary. The ordinary trylast worker
@@ -327,16 +332,36 @@ def _judge(event: str, args: tuple) -> None:
             _record(label, event, target)
 
 
-def _unknown():
+def _unknown(event, stage, error):
     with _fault_lock:
         _S.faults += 1
+    try:
+        try:
+            node = _node()
+        except (KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise
+        except BaseException:
+            node = "<attribution unavailable>"
+        # Only names of these builtin classes, never the exception's own type
+        # name or values. Keep this best-effort evidence behind the count above.
+        reason = next(kind.__name__ for kind in (
+            FileNotFoundError, NotADirectoryError, PermissionError, OSError,
+            ValueError, TypeError, RuntimeError, AssertionError, Exception, BaseException,
+        ) if isinstance(error, kind))
+        _S.hits[(node, "observer fault", f"{event}/{stage}/{reason}", "<not captured>")] = None
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        raise
+    except BaseException:
+        # Diagnostic failure must neither escape into the observed operation
+        # nor recursively count itself. The existing count invalidates the census.
+        pass
 
 
 def _judge_names(event, args):
     try:
         effects = _live_writes_fs.name_effects(os, _absolute, event, args)
-    except (OSError, ValueError):
-        _unknown()
+    except (OSError, ValueError) as error:
+        _unknown(event, "name-effects", error)
         # Metadata uncertainty must not erase an established destination hit.
         effects = _live_writes_fs.uncertain_name_effects(_absolute, event, args)
     for target, operation in effects:
@@ -447,20 +472,24 @@ def _hook(event: str, args: tuple) -> None:
     # boundary, the read-side credential lookup included: its os.stat can raise
     # (a test that patches it) and is itself an audited open.
     _busy.on = True
+    stage = "judge"
     try:
         if event == "open":
+            stage = "open-no-effect"
             try:
                 if _live_writes_fs.open_no_effect(os, _absolute, args):
                     return
-            except (OSError, ValueError):
-                _unknown()  # retain conservative observations as well
-        if event == "open" and _ordinary_read(args):
-            return
+            except (OSError, ValueError) as error:
+                _unknown(event, stage, error)  # retain conservative observations as well
+            stage = "ordinary-read"
+            if _ordinary_read(args):
+                return
+        stage = "judge"
         _judge(event, args)
     except (KeyboardInterrupt, SystemExit, GeneratorExit):
         raise
-    except BaseException:  # pytest outcomes also must not escape an observer
-        _unknown()
+    except BaseException as error:  # pytest outcomes also must not escape an observer
+        _unknown(event, stage, error)
     finally:
         _busy.on = False
 
@@ -610,7 +639,7 @@ def pytest_terminal_summary(terminalreporter):
         by_class: dict[str, set[str]] = {}
         for node, label, _op, _path in hits:
             by_class.setdefault(label, set()).add(node)
-        tr.section("live writes: writes outside the test's temp dirs (reported, not failed)")
+        tr.section("live writes: audit observations (reported, not failed)")
         for label, nodes in sorted(by_class.items()):
             outside = "<outside a test>" in nodes
             count = len(nodes) - outside
