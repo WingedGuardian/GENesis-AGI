@@ -1113,10 +1113,21 @@ class Repair:
         self._say(
             f"a `live` rollback stopped in phase {phase!r}; the repair does not handle that phase yet (#3722)"
         )
+        # The guard's remedy for that shape (#3722 advice), the one text every
+        # reader prints: by command on stdout, at boot in the page (the journal
+        # keeps the short line above, under the guardian's line cut).
+        remedy = self.guard.message(self.state_path, verdict, reason)
+        if not self.boot:
+            print(remedy, flush=True)
+        lead = (
+            f"{self.guard._LIVE_RETRY}. Restore the listed paths first. "
+            if reason.startswith(self.guard._LIVE_LATER)
+            else ""
+        )
+        # The remedy first: a long path list can run past ALERT_BYTES.
         body = (
-            f"{self.state_path} records a `live` rollback that stopped in phase {phase!r}; the "
-            "repair does not handle that phase yet (#3722), so it left the checkout half-written "
-            f"and {_UNIT} was started anyway: {reason}"
+            f"The repair does not handle phase {phase!r} yet (#3722), so it left the checkout "
+            f"half-written and {_UNIT} was started anyway. {lead}{remedy}"
         )
         self._page("mixed", "critical", verdict, reason, raw, body=body)
         return 0 if self.boot else 3
@@ -1304,7 +1315,11 @@ class Repair:
             self._clear(raw)
             return 0
         if verdict != self.guard.MIXED_TREE:
-            self._say(f"nothing to repair: the checkout is not half-written ({verdict}: {reason})")
+            # At boot only the reason's first sentence: a HOLD reason carries its
+            # remedy, and the guardian cuts journal lines at 400 characters; the
+            # `kept` page below carries the whole text.
+            shown = reason.split(". ", 1)[0] if self.boot else reason
+            self._say(f"nothing to repair: the checkout is not half-written ({verdict}: {shown})")
             if verdict != self.guard.SAFE:
                 self._page("kept", "warning", verdict, reason, raw)
             return 0
