@@ -12,3 +12,16 @@
 #     overlay), never in this tracked file.
 autonomy:
   mode: shadow
+
+# codex_mcp_stop.mode: the Sentinel's stop tool for MCP servers held by a
+# shared Codex app-server daemon (python -m genesis.sentinel.codex_mcp_stop).
+#   propose_only (default): the tool may be proposed and, once the owner
+#     approves the action, run with --execute. Genesis never schedules it on
+#     its own; the Sentinel prompt forbids the session running --execute
+#     itself (a prompt rule, not an enforcement: that session has Bash).
+#   off: the tool refuses before scanning, in dry-run and --execute alike
+#     (exit 4), so a session that only runs the dry-run sees it is off.
+# Any other value reads as off. GENESIS_CODEX_MCP_STOP_DISABLED=1 also turns
+# it off. Set per install in config/sentinel.local.yaml.
+codex_mcp_stop:
+  mode: propose_only

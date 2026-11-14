@@ -20,7 +20,9 @@ there is no unbounded growth to GC. No disk-hygiene prune path is wired by desig
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
+from email.utils import getaddresses
 
 import aiosqlite
 
@@ -74,6 +76,50 @@ async def get_by_email(db: aiosqlite.Connection, email: str) -> dict | None:
     )
     row = await cursor.fetchone()
     return dict(row) if row else None
+
+
+#: Anything shaped like an address, wherever it sits in the string. A net under
+#: the header parser, which gives up on a malformed list ("a@x;b@y", an unclosed
+#: "<") and would otherwise leave the whole string as the only thing looked up.
+_ADDRESS_SHAPE = re.compile(r'[^\s<>,;"()]+@[^\s<>,;"()]+')
+#: Addresses per query; well under SQLite's bound-variable limit.
+_LOOKUP_CHUNK = 500
+
+
+async def find_in_recipient(db: aiosqlite.Connection, recipient: str | None) -> dict | None:
+    """The curated prospect a recipient STRING names, or None.
+
+    A recipient can arrive as a bare address, as ``Name <addr>``, as a list of
+    addresses, or malformed. Every address the header parser finds, every
+    address-shaped run in the string, and the string as given are looked up.
+    A caller that asks "is this a prospect?" with ``get_by_email`` on the raw
+    string gets "no" for every form but the first, which fails OPEN wherever
+    "no" means "send". An opted-out row wins over any other match.
+
+    One query per ``_LOOKUP_CHUNK`` addresses, so a very long recipient string
+    costs a few queries and not one per address.
+    """
+    raw = recipient or ""
+    if not raw.strip():
+        return None
+    candidates = [addr for _name, addr in getaddresses([raw])]
+    candidates.extend(_ADDRESS_SHAPE.findall(raw))
+    candidates.append(raw)
+    emails = list(dict.fromkeys(e for e in map(_normalize_email, candidates) if e))
+    found: dict | None = None
+    for start in range(0, len(emails), _LOOKUP_CHUNK):
+        chunk = emails[start : start + _LOOKUP_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        cursor = await db.execute(
+            f"SELECT * FROM marketing_prospects WHERE email COLLATE NOCASE IN ({marks})",  # noqa: S608 — placeholders only
+            chunk,
+        )
+        for row in await cursor.fetchall():
+            row = dict(row)
+            if row.get("opted_out"):
+                return row
+            found = found or row
+    return found
 
 
 async def list_active(db: aiosqlite.Connection) -> list[dict]:

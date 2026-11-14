@@ -482,160 +482,74 @@ _REPAIR_JOURNAL = (
     "journalctl --user -u genesis-server --since '6 hours ago' --no-pager -o cat"
     " | grep -F 'live-move repair:' | tail -n 20 | cut -c1-400"
 )
-# The newest ELIGIBLE report, chosen inside the container, where the files are:
-# every *-live-move-repair dir, newest first by the loader's report_order (the
-# dir name's UTC seconds, then its pid as a number; never mtime, since
-# dismissing or superseding a report rewrites it), until one is neither
-# dismissed nor superseded, names this checkout (~/genesis, the one this
-# collector reads) and its dir-name ts is in the window (it stops at the first
-# name older than the window: the key is monotone in the ts, so every later one
-# is too). A name more than _REPAIR_FUTURE_S ahead (the loader's
-# REPORT_FUTURE_S) is no report, as in deploy health. At most _REPAIR_READS
-# dirs (deploy health's REPAIR_REPORTS_READ) are read; when none of them is
-# eligible the pick prints nothing, as when there is no report. By design this
-# shows the newest ELIGIBLE report, while deploy health's `unresolved` reads the
-# newest READ one. The window reads the dir name, never the stored ts, which
-# is user-writable. One exec, and at most one file's bytes come back. The host
-# buffers whatever this prints, so a report is read only as a regular file
-# opened without following a symlink (not /dev/zero, not a FIFO), and only its
-# first _REPAIR_REPORT_BYTES. A report over that cap, or one that cannot be read
-# or parsed as a JSON object, is not skipped (an older one would then read as
-# the newest): it is shown as "report too large" or "report unreadable", its ts
-# from its dir, unless a top-level repo (another checkout), result
-# ("superseded") or dismissed_at read from the writer's indent-2 layout (a raw
-# newline is never inside a JSON string, and only a top-level key sits two
-# spaces in) makes it ineligible; a field that cannot be read does not.
-# Piped to `python3 -I -S -` over stdin, so no quoting reaches a shell. It
-# cannot import the repair's load_report (the container's checkout may be the
-# half-written tree), so it carries the same rules: a dir named as the writer's
-# _backup_dir names it (_REPAIR_NAME, the writer's REPORT_NAME), never a
-# symlinked dir, the same byte cap (REPORT_BYTES), the same repo compare
-# (same_repo, REPO_BYTES), the same order (report_order), future skew
-# (REPORT_FUTURE_S) and read count (REPAIR_REPORTS_READ), and it skips a dir
-# holding the loader's DISMISS_MARK (a report dismissed though no reader can
-# read it, #4331), as it skips a dismissed_at one; a parity test holds
-# the constants equal and a cross-reader test runs both readers on one dir set.
+# The newest ELIGIBLE report, chosen inside the container, where the files are,
+# by the repair loader's own newest_eligible (scripts/lib/live_move_repair.py,
+# #3892): no copy of its rules lives here. The checkout may be the half-written
+# tree, so the module comes from the installed repair kit
+# (~/.genesis/lib/live-repair/current, resolved physically, as repair-move runs
+# it), else from HEAD's blob (`git show HEAD:`, as repair-move --explain reads
+# it), never the working tree; a kit older than newest_eligible falls back to
+# HEAD's module. Either is read without following a symlink, as a regular file
+# of at most _REPAIR_SOURCE_BYTES, and run from memory with the __file__ it
+# reads at import (it runs nothing there). The pick compares each report's repo
+# with ~/genesis (the checkout this collector reads) and shows nothing when the
+# newest eligible report's dir-name ts is older than the journal's window (the
+# stored ts is user-writable). One exec; at most one report's bytes come back
+# (REPORT_BYTES), and what is shown for a report it cannot read is
+# newest_eligible's. Piped to `python3 -I -S -` over stdin, so no quoting
+# reaches a shell; with neither module it prints nothing.
 _REPAIR_TS = r"[0-9]{8}T[0-9]{6}Z-[0-9]+"
-_REPAIR_NAME = "(" + _REPAIR_TS + r")\-live\-move\-repair"
-_REPAIR_REPORT_BYTES = 4 * 1024 * 1024  # D1 writes about 0.5 KB per path
-_REPAIR_REPO_BYTES = 4096
-# The longest repo value the pick reads: the writer's json.dump escapes each
-# non-UTF-8 byte of the path as six characters (\udcXX), plus the quotes and
-# the trailing comma. A longer `result` reads as None, so the report is shown.
-_REPAIR_TOP_CHARS = 6 * _REPAIR_REPO_BYTES + 3
 _REPAIR_WINDOW_S = 6 * 3600  # the journal read's window
-_REPAIR_FUTURE_S = 300  # the loader's REPORT_FUTURE_S
-_REPAIR_READS = 8  # deploy health's REPAIR_REPORTS_READ
 _REPAIR_MARK = "REPAIR.json\n"  # a login shell may print first
-_REPAIR_DISMISSED = "DISMISSED.json"  # the loader's DISMISS_MARK
+_REPAIR_SOURCE_BYTES = 1 << 20  # the kit installer's per-file cap
+_REPAIR_GIT_S = 10  # under _INCUS_TIMEOUT, which bounds the whole exec
 _REPAIR_PICK = (
     r"""
-import calendar, errno, json, os, re, stat, sys, time
-CAP, SUFFIX = @CAP@, "-live-move-repair"
-root = os.path.expanduser("~/.genesis/deploy-backups")
-checkout = os.path.realpath(os.path.expanduser("~/genesis"))
+import calendar, os, stat, subprocess, sys, time
+CAP, MODULE = @CAP@, "live_move_repair.py"
+home = os.path.expanduser("~")
+root = os.path.join(home, ".genesis", "deploy-backups")
+checkout = os.path.realpath(os.path.join(home, "genesis"))
 
-def same_repo(named):  # the loader's same_repo
-    if not isinstance(named, str) or "\0" in named:
-        return False
+def kit():
+    path = os.path.join(os.path.realpath(os.path.join(home, ".genesis", "lib", "live-repair", "current")), MODULE)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
-        return len(os.fsencode(named)) <= @REPO@ and os.path.realpath(named) == checkout
-    except (UnicodeError, ValueError, OSError):
-        return False
-
-def top(raw, key):  # a top-level scalar of the writer's indent-2 JSON, or None
-    m = re.search(rb'\n  "' + key + rb'": ([^\n]{0,@TOP@})\n', raw)
-    try:
-        return json.loads(m.group(1).rstrip(b",")) if m else None
-    except (ValueError, RecursionError):
-        return None
-
-def order(name):  # the loader's report_order, of a dir name
-    return calendar.timegm(time.strptime(name[:16], "%Y%m%dT%H%M%SZ")), int(name[17:-len(SUFFIX)])
-
-def read(name):  # (raw, tail) of its REPAIR.json; raw None: unreadable; None: skip it
-    path = os.path.join(root, name)
-    if not stat.S_ISDIR(os.lstat(path).st_mode):
-        return None
-    try:  # dismissed though no reader can read it (the loader's DISMISS_MARK)
-        if stat.S_ISREG(os.lstat(os.path.join(path, @DISMISSED@)).st_mode):
-            return None
-    except OSError:
-        pass
-    try:
-        fd = os.open(os.path.join(path, "REPAIR.json"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:  # a symlinked REPAIR.json is never the writer's
-        return None if exc.errno == errno.ELOOP else (None, b"")
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            return None
-        raw = os.read(fd, CAP + 1)
-        return raw, os.pread(fd, 4096, max(0, st.st_size - 4096)) if len(raw) > CAP else raw
-    except OSError:
-        return None, b""
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
+        return path, os.read(fd, CAP + 1)
     finally:
         os.close(fd)
 
-names = []
-try:
-    for n in os.listdir(root):
-        if re.fullmatch(@NAME@, n):
-            try:
-                names.append((order(n), n))
-            except ValueError:
-                pass
-except OSError:
-    names = []
-names.sort(reverse=True)
-now, reads = time.time(), 0
-for (seconds, _), name in names:
-    age = now - seconds
-    if age > @WINDOW@:  # newest first: past the window here, every later one is too
-        break
-    if age < -@FUTURE@:
-        continue
-    if reads == @READS@:
-        break
-    reads += 1
+def head():
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    src = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", checkout, "show", "HEAD:scripts/lib/" + MODULE],
+                         capture_output=True, env=env, timeout=@GIT_S@, check=True).stdout
+    return os.path.join(checkout, "scripts", "lib", MODULE), src
+
+now, out = time.time(), b""
+for source in (kit, head):
     try:
-        got = read(name)
-        if got is None:
+        path, src = source()
+        if len(src) > CAP:
             continue
-        raw, tail = got
-        try:
-            report = json.loads(raw) if raw is not None and len(raw) <= CAP else None
-        except (ValueError, RecursionError):
-            report = None
-        if isinstance(report, dict):
-            shown = raw
-            if not same_repo(report.get("repo")):
-                continue
-        else:  # over the cap, unreadable, or no JSON object: its top-level fields only
-            raw = raw or b""
-            why = "report too large (over @CAP@ bytes)" if len(raw) > CAP else "report unreadable"
-            shown = json.dumps({"ts": name[: -len(SUFFIX)], "result": why + "; not read"}).encode()
-            repo = top(raw, b"repo")
-            if repo is not None and not same_repo(repo):  # unread: unknown, not another's
-                continue
-            report = {"result": top(raw, b"result"), "dismissed_at": top(tail, b"dismissed_at")}
-        if report.get("dismissed_at") or report.get("result") == "superseded":
-            continue
+        ns = {"__name__": "_live_repair_pick", "__file__": path}
+        exec(compile(src, path, "exec"), ns)
+        if not callable(ns.get("newest_eligible")):
+            continue  # a kit older than newest_eligible (#3892): HEAD's module
+        got = ns["newest_eligible"](root, checkout, now)
+        if got is not None:
+            ts, shown = got
+            seconds = calendar.timegm(time.strptime(ts.split("-", 1)[0], "%Y%m%dT%H%M%SZ"))
+            out = @MARK@.encode() + ts.encode() + b"\n" + shown if now - seconds <= @WINDOW@ else b""
     except Exception:
         continue
-    sys.stdout.buffer.write(@MARK@.encode() + name[: -len(SUFFIX)].encode() + b"\n" + shown)
     break
-""".replace("@CAP@", str(_REPAIR_REPORT_BYTES))
-    .replace("@REPO@", str(_REPAIR_REPO_BYTES))
-    .replace("@TOP@", str(_REPAIR_TOP_CHARS))
-    .replace("@NAME@", repr(_REPAIR_NAME))
+sys.stdout.buffer.write(out)
+""".replace("@CAP@", str(_REPAIR_SOURCE_BYTES))
+    .replace("@GIT_S@", str(_REPAIR_GIT_S))
     .replace("@WINDOW@", str(_REPAIR_WINDOW_S))
-    .replace("@FUTURE@", str(_REPAIR_FUTURE_S))
-    .replace("@READS@", str(_REPAIR_READS))
     .replace("@MARK@", repr(_REPAIR_MARK))
-    .replace("@DISMISSED@", repr(_REPAIR_DISMISSED))
     .encode()
 )
 _REPAIR_FIELD_CAP = 2000
