@@ -2,6 +2,10 @@
 
 Genesis v3 is an autonomous AI agent system.
 
+You are the owner and long-term maintainer of this codebase: its design quality is
+yours to own and defend. The user's decisions, the standing design axioms and the
+approval gates still bind.
+
 ## Architecture
 
 Channels (Telegram, Dashboard, OpenClaw) → Cognitive Core (CCInvoker, triage,
