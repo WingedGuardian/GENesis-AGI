@@ -756,9 +756,10 @@ async def drain_pending_issue_posts(rt: object) -> int:
         elif status in ("rejected", "cancelled"):
             if await pip.mark_rejected(db, row["id"], rejected_at=now):
                 resolved += 1
-        elif status == "expired":
-            if await pip.mark_rejected(db, row["id"], rejected_at=now, expired=True):
-                resolved += 1
+        elif status == "expired" and await pip.mark_rejected(
+            db, row["id"], rejected_at=now, expired=True
+        ):
+            resolved += 1
         # status == 'pending' → still awaiting the owner; leave held.
 
     # Not gated on the board lever: it writes only the local pointer for an issue

@@ -23,6 +23,17 @@ from packaging.version import Version
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_ruff_test_extra_matches_ci_linter():
+    """Tests that shell out to Ruff must use the same rules as the CI lint job."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    requirements = [Requirement(dep) for dep in data["project"]["optional-dependencies"]["test"]]
+    ruff = next(req for req in requirements if req.name == "ruff")
+    workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text()
+    pins = re.findall(r"pip install ['\"]ruff(==[0-9.]+)['\"]", workflow)
+    assert len(pins) == 1, "expected one exact Ruff pin in the lint job"
+    assert str(ruff.specifier) == pins[0], "test extra and CI lint job must pin the same Ruff"
+
+
 def _qdrant_client_requirement() -> Requirement:
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
     for dep in data["project"]["dependencies"]:

@@ -568,9 +568,11 @@ class _UrlGuard:
                 if len(d) == 6:
                     d = d[:2] + d[4:]
                 self._whole |= self._digests([d, d[:2] + "20" + d[2:]])
-            elif kind in ("cvc", "name", "first_name", "last_name", "postal_code"):
-                if len(_norm(value)) >= _MIN_VALUE:
-                    self._whole |= self._digests([value])
+            elif (
+                kind in ("cvc", "name", "first_name", "last_name", "postal_code")
+                and len(_norm(value)) >= _MIN_VALUE
+            ):
+                self._whole |= self._digests([value])
         if "first_name" in values and "last_name" in values:  # the name typed split, whole
             whole = f"{values['first_name']} {values['last_name']}"
             if len(_norm(whole)) >= _MIN_VALUE:

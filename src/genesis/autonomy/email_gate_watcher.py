@@ -325,11 +325,12 @@ async def drain_pending_email_sends(rt: object) -> int:
                         origin_class="owner",
                     )
                 resolved += 1
-        elif status == "expired":
+        elif status == "expired" and await pes.mark_rejected(
+            db, row["id"], rejected_at=now, expired=True
+        ):
             # No-decision (the owner never answered) — expire the hold but do
             # NOT record a correction; expiry is not a competence signal.
-            if await pes.mark_rejected(db, row["id"], rejected_at=now, expired=True):
-                resolved += 1
+            resolved += 1
         # status == 'pending' → still awaiting the owner; leave held.
 
     return resolved

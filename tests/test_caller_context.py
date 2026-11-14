@@ -527,9 +527,8 @@ def direct_identity_reads(source: str, filename: str = "<src>") -> list[tuple[in
             record(node, node.slice)
         elif isinstance(node, ast.Compare) and any(
             isinstance(op, (ast.In, ast.NotIn)) for op in node.ops
-        ):
-            if any(_is_os_environ(c) for c in node.comparators):
-                record(node, node.left)
+        ) and any(_is_os_environ(c) for c in node.comparators):
+            record(node, node.left)
     return hits
 
 
