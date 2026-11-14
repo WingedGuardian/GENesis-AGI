@@ -218,6 +218,101 @@ def test_green_ends_the_episode_so_the_next_one_pages_again(box):
     assert len(first + [p for p in _pages(box) if p["severity"] == "warning"]) == 2
 
 
+@pytest.fixture
+def deleted_holder(box):
+    """A real process holding a DELETED 3 MB file under the sandbox HOME: the
+    shape SQLite's spill files take, which du cannot see."""
+    d = box["home"] / ".genesis" / "cc-tmp"
+    d.mkdir(parents=True, exist_ok=True)
+    code = (
+        "import os, sys, time\n"
+        f"p = os.path.join({str(d)!r}, 'etilqs_test')\n"
+        "f = open(p, 'wb'); f.write(os.urandom(3 * 1024 * 1024)); f.flush(); os.fsync(f.fileno())\n"
+        "os.unlink(p); print('ready', flush=True); time.sleep(60)\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-I", "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "ready"
+        # Guard the guard: the fixture really holds a deleted file.
+        held = [os.readlink(f"/proc/{proc.pid}/fd/{fd}") for fd in os.listdir(f"/proc/{proc.pid}/fd")]
+        assert any(t.endswith("etilqs_test (deleted)") for t in held), held
+        yield proc
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_a_page_names_who_holds_deleted_files(box, deleted_holder):
+    """Space held by deleted-but-open files is invisible to du. The page names
+    the holding process and how much it holds, so the culprit is known at the
+    event, not reconstructed afterwards."""
+    _handle(box, "red")
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    body = page["body"]
+    assert "Deleted but still open" in body, body
+    assert f"pid {deleted_holder.pid} " in body, body
+    assert ": 3 MB in 1 file(s), invisible to du" in body, body
+    assert ": 3 MB in 1 file(s)\n" in body + "\n", body
+
+
+def test_attribution_log_names_who_holds_deleted_files(box, deleted_holder):
+    _handle(box, "yellow")
+    log = _log(box)
+    assert "Deleted but still open" in log and f"pid {deleted_holder.pid} " in log, log
+
+
+def test_no_deleted_block_when_nothing_is_held(box):
+    _handle(box, "red")
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    assert "Deleted but still open" not in page["body"], page["body"]
+
+
+def test_deleted_files_on_another_path_are_not_listed(box, deleted_holder, tmp_path):
+    """Only files under the paged path count: a page for one tree must not
+    blame a holder whose file lives elsewhere on the same disk."""
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    dev = _home_dev(box)
+    # Guard the guard: only the path filter can exclude the holder, never the device.
+    assert str(os.stat(other).st_dev) == dev
+    _run(box, f"ALL_WRITERS=''; handle_fs '{other}' '{dev}q100000' red 1000 100000 - '' btrfs")
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    assert f"pid {deleted_holder.pid} " not in page["body"], page["body"]
+
+
+def test_a_whole_filesystem_domain_is_not_narrowed_by_path(box, deleted_holder, tmp_path):
+    """A mount key covers the whole filesystem; its path is only the first
+    watched path on it, so a holder under another tree must still be named."""
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    dev = _home_dev(box)
+    assert str(os.stat(other).st_dev) == dev
+    _run(box, f"ALL_WRITERS=''; handle_fs '{other}' '{dev}m12345' red 1000 100000 - '' btrfs")
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    assert f"pid {deleted_holder.pid} " in page["body"], page["body"]
+
+
+def test_a_file_held_twice_is_counted_once(box, deleted_holder):
+    """A deleted file held through two descriptors occupies its space once."""
+    d = box["home"] / ".genesis" / "cc-tmp"
+    code = (
+        "import os, time\n"
+        f"p = os.path.join({str(d)!r}, 'etilqs_dup')\n"
+        "f = open(p, 'wb'); f.write(os.urandom(2 * 1024 * 1024)); f.flush(); os.fsync(f.fileno())\n"
+        "g = os.dup(f.fileno()); os.unlink(p); print('ready', flush=True); time.sleep(60)\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-I", "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "ready"
+        _handle(box, "red")
+    finally:
+        proc.kill()
+        proc.wait()
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    # 3 MB + 2 MB, two files, though the 2 MB one is held through two descriptors.
+    assert ": 5 MB in 2 file(s), invisible to du" in page["body"], page["body"]
+
+
 def test_attribution_is_logged_once_per_episode(box):
     _handle(box, "yellow", writers="123 456 1000 5 cp")
     _handle(box, "yellow", writers="123 456 1000 5 cp")

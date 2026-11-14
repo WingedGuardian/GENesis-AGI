@@ -268,6 +268,69 @@ _rw_holders() {
     done
 }
 
+wg_deleted_holders() {
+    # $1 device number, $2 watched path. Prints a block naming the processes
+    # that hold DELETED files under that path on that device, largest first,
+    # or nothing when they hold under 1 MB. Space held this way is invisible
+    # to du: SQLite unlinks its spill files the moment it creates them, so a
+    # spill filling a volume looks, by du, like a volume with nothing in it
+    # (MEASURED on a live install: 40 MB free while du of the tree summed to
+    # about 1.4 GB of a 2 GB quota). Link count 0 is the filter, so no
+    # descriptor's target is read unless it is already deleted. Own-uid
+    # processes only, like every other attribution here. Names come from
+    # _rw_holders, never a command line.
+    # $1 is the domain key (or a bare device number). A mount key ("<dev>m…")
+    # is the whole filesystem, so nothing is narrowed by path: its path is only
+    # the FIRST watched path on that device, and the file filling it may sit
+    # under another (as _rw_domain_for treats it). A quota key ("<dev>q…") or
+    # a bare number bounds its own tree, so only files under $2 count.
+    local key="$1" fdev root proc="${DG_PROC:-/proc}" listing rc=0 d ino b link pid tgt filter=1
+    fdev="${key%%[qm]*}"
+    [[ "$key" == "${fdev}m"* ]] && filter=0
+    root="$(wg_canon "$2")"
+    listing="$(timeout -k 2 "$DG_RUNAWAY_SCAN_TIMEOUT_S" find -L "$proc"/[0-9]*/fd -mindepth 1 -maxdepth 1 \
+                   -type f -links 0 -printf '%D %i %b %p\n' 2>/dev/null)" || rc=$?
+    # Bytes per holder count every descriptor it holds the file through; the
+    # headline total counts each deleted file (device, inode) once, so a file a
+    # parent and child both inherited is not reported twice (review finding).
+    local -A bytes_of=() files_of=() seen=()
+    local total=0 n=0
+    while read -r d ino b link; do
+        [[ "$d" == "$fdev" && "$b" =~ ^[0-9]+$ && "$ino" =~ ^[0-9]+$ ]] || continue
+        [[ "$link" =~ /([0-9]+)/fd/[0-9]+$ ]] || continue
+        pid="${BASH_REMATCH[1]}"
+        if (( filter )) && [[ "$root" != / ]]; then
+            tgt="$(readlink -- "$link" 2>/dev/null)" || continue
+            tgt="${tgt% (deleted)}"
+            [[ "$tgt" == "$root"/* ]] || continue
+        fi
+        bytes_of[$pid]=$(( ${bytes_of[$pid]:-0} + b * 512 ))
+        files_of[$pid]=$(( ${files_of[$pid]:-0} + 1 ))
+        if [[ -z "${seen[$ino]:-}" ]]; then
+            seen[$ino]=1; total=$(( total + b * 512 )); n=$(( n + 1 ))
+        fi
+    done <<< "$listing"
+    (( total >= 1048576 )) || return 0
+    printf 'Deleted but still open under %s: %s MB in %s file(s), invisible to du. Held by:\n' \
+        "$(_rw_show "$root")" "$(( total / 1048576 ))" "$n"
+    # The five largest holders of at least 1 MB each, then one line for the
+    # rest, so small holders (a runtime's own scratch files) do not bury the
+    # one filling the disk.
+    local shown=0 rest=0 rest_b=0 line
+    while read -r b pid; do
+        [[ -n "$pid" ]] || continue
+        if (( shown == 5 || b < 1048576 )); then
+            rest=$(( rest + 1 )); rest_b=$(( rest_b + b )); continue
+        fi
+        line="$(_rw_holders "$pid")"
+        printf '%s: %s MB in %s file(s)\n' "$line" "$(( b / 1048576 ))" "${files_of[$pid]}"
+        shown=$(( shown + 1 ))
+    done < <(for pid in "${!bytes_of[@]}"; do printf '%s %s\n' "${bytes_of[$pid]}" "$pid"; done | sort -rn)
+    (( rest == 0 )) || printf '  and %s more process(es) holding %s MB between them\n' "$rest" "$(( rest_b / 1048576 ))"
+    (( rc <= 1 )) || printf '  (the /proc walk did not complete: status %s, so this list may be short)\n' "$rc"
+    return 0
+}
+
 _rw_episode_open() {
     # $1 generation, $2 now. The file's episode ended: page it again from here.
     unset "_RW_PAGED[$1]" "_RW_DUE[$1]" "_RW_DUE[${1}_observe]"
