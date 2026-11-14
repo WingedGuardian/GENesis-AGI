@@ -874,7 +874,7 @@ maintenance_main() {
     "$VENV_PY" "$REPO_DIR/scripts/prune_contributor_issue_posts.py" --days 30 \
         || echo "prune_contributor_issue_posts exited $?"
 
-    echo "--- work-board retention prune (closed questions >90d, events >180d) ---"
+    echo "--- work-board retention prune (closed questions >90d, events >180d except item_added) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_board.py" --question-days 90 --event-days 180 \
         || echo "prune_board exited $?"
 

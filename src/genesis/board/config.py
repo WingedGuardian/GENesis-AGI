@@ -118,8 +118,7 @@ def effective_mode() -> str:
     return mode
 
 
-# GROUNDWORK(board-reconciler-writes): the predicate every reconciler GitHub write
-# will check (the read-only reconciler writes nothing).
+# The reconciler re-checks this immediately before each of its writes.
 def writes_allowed() -> bool:
     """True only in ``live`` — the single predicate a GitHub writer checks."""
     return effective_mode() == "live"

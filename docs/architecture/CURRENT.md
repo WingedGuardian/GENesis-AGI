@@ -6083,13 +6083,14 @@ around them. **What exists today:**
 - the stores, the `board` mode lever, and the open-question tools;
 - the Projects v2 adapter and its idempotent setup script;
 - promotion of a private record onto the board;
-- the READ-ONLY reconciler and its two read tools.
+- the reconciler, which reads the board every tick and in `live` fills empty
+  Status columns, adds missing open items and records promoted cards' ids,
+  and its two read tools.
 
-The reconciler's write half (adding every repo item, the bookkeeping move to In
-Review, the Genesis status) and the dashboard tab are follow-on work. The
-shipped mode is `off`.
+The bookkeeping move to In Review (#4400 Part 2), the Genesis status and the
+dashboard tab are follow-on work. The shipped mode is `off`.
 
-- **Reconciler, read-only** (`board/reconciler.py`; bootstrap step `board`,
+- **Reconciler** (`board/reconciler.py`; bootstrap step `board`,
   `runtime/init/board.py`, a 5-min `CronTrigger` on the learning scheduler,
   `max_instances=1`). Each tick:
   - reads nothing while paused, in mode `off`, or with no project configured;
@@ -6102,15 +6103,37 @@ shipped mode is `off`.
     nothing else (MEASURED 2026-10-04 on a private sandbox, with a control);
   - flags `observed_late` from the clock alone (older than one interval plus
     slack), never from stored state;
+  - after a good read, runs the write phase (#4400 Part 1). In `live` only,
+    re-checked before each write: records the card id on each `board_links`
+    row whose issue now has a card; fills an EMPTY Status (In Review for an
+    open PR and for an issue with an open closing PR in the tracker repo from
+    a branch of it, else Proposed; each card is re-read just before its write,
+    so a card someone moved, even mid-tick, is never touched); and,
+    when open repo items are missing from the board (archived cards count as
+    on it), lists the repo and adds each one Genesis never added before, so an
+    owner's removal sticks (`prune` never deletes `item_added` rows). A listing
+    that finds nothing to add is not repeated while the gap holds, for up to an
+    hour. Status writes go through `projects_v2.set_status`, an allowlist that
+    refuses In Progress, validated before anything is audited or spent. A
+    Status write is audited before its request (`<item>:<to>:<tick>`); an add
+    is recorded after it succeeds (`<content id>:<tick>`), so a failed add is
+    retried. GitHub writes go 1 s apart, at most 16 per tick (what binds on the
+    normal schedule) and 200 per rolling hour counted from those rows (what
+    bounds extra ticks). A failed request (an HTTP error, a timeout, a rate
+    limit) stops the tick's writes; an error about one item skips that item.
+    Outside `live` the summary carries would-write counts (`dry_run`) and
+    nothing is written;
   - ALWAYS emits a `board` heartbeat (DEBUG) carrying the summary, in every mode
     and while paused. So the pulse is not pause-gated and has no enable check,
-    and in mode `off` it is effectively a learning-scheduler canary;
-  - writes NOTHING to GitHub (a test pins it).
-  A clean tick records job success; a read error publishes `last_error` and no
-  counts, and records a failure. The step raises if the learning scheduler is
+    and in mode `off` it is effectively a learning-scheduler canary.
+  A clean tick records job success, and so does a rate-limited one; a read
+  error publishes `last_error` and no counts, and records a failure. Any other
+  write failure records a failure too, with the read's counts and the writes
+  already made kept. The step raises if the learning scheduler is
   missing or stopped, so the manifest names that cause instead of the board.
 - **`board_status`** reads the stored heartbeats only, never GitHub: the newest
-  pulse (alive, mode, error) and the newest SUCCESSFUL read with its age.
+  pulse (alive, mode, error) and the newest SUCCESSFUL read with its age,
+  including that tick's `writes` block (None on a summary from before #4400).
   **`board_item`** reads one issue or PR live (nothing while the mode is
   `off`): its card on the configured
   project (matched by owner AND number), GitHub's blocked-by list (flagged when
@@ -6211,8 +6234,7 @@ shipped mode is `off`.
     the pointer adds no second event), with each tick re-linking any posted
     row a crash or failed write left unlinked;
   - never touch the project: a promoted issue is created and linked, not
-    added to the board. The reconciler's write half (follow-on) places every
-    open issue; its adapter calls carry `GROUNDWORK(board-reconciler-writes)`.
+    added to the board. The reconciler's backfill places it in `live`.
 - Both lanes can each pass their propose-time duplicate check for one
   follow-up when proposed concurrently; the drain (the only poster, one job,
   rows in sequence) refuses a hold whose follow-up the OTHER lane already
@@ -6241,7 +6263,8 @@ verified: b67423bd 2026-10-03
     privacy-scan receipt, the hash of the body that was scanned);
   - `open_questions` + `open_question_blocks` — local-only owner decisions
     and the work each one blocks (an edge, not a list entry);
-  - `board_events` — the append-only event log.
+  - `board_events` — the append-only event log (pruned at 180 days, except
+    `item_added` rows, which the backfill reads as its memory).
   Each vocabulary is enforced in the CRUD module; `board_events.event` has no
   CHECK because SQLite cannot alter one. A partial UNIQUE index on
   `(event, observed_change_key)` dedups a re-read GitHub change.
@@ -6255,8 +6278,8 @@ verified: b67423bd 2026-10-03
   only turn the board down, never arm it. The master `enabled` fails closed
   unless it is the literal `true`. Board promotion (`board_promote` and the
   drain) reads it on every call, and so do the reconciler and `board_item`.
-  The write entry points the read-only reconciler does not use yet carry
-  `GROUNDWORK(board-reconciler-writes)` (and the tab's, `GROUNDWORK(board-tab)`).
+  The adapter calls nothing uses yet (`issue_node_id`, `set_text`) carry `GROUNDWORK(board-reconciler-writes)` (and the tab's,
+  `GROUNDWORK(board-tab)`).
 - **Open questions** (`mcp/health/open_question_tools.py`: `open_question_raise`,
   `_resolve`, `_block`, `_list`) — never gated by the board mode, because they
   write only local rows. A target id prefix must resolve uniquely against its

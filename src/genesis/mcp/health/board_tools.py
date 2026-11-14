@@ -167,6 +167,9 @@ async def _impl_board_status(db, *, now=None) -> dict:
         "by_kind": od.get("by_kind"),
         "coverage": od.get("coverage"),
         "drags": od.get("drags"),
+        # The tick's write counts (#4400), or would-write counts outside
+        # ``live``; None on a summary from before the writes existed.
+        "writes": od.get("writes"),
     }
     return out
 
@@ -241,8 +244,9 @@ async def _impl_board_item(db, target: str) -> dict:
 async def board_status() -> dict:
     """The work board as the reconciler last read it: counts by column, by
     Genesis status and by kind, coverage (open repo issues and PRs on the board
-    against the repo's open total), drags logged, and whether the reconciler is
-    alive. Reads stored heartbeats only, never GitHub, so it is cheap and safe.
+    against the repo's open total), drags logged, what the last tick wrote (or
+    would have written, outside ``live``), and whether the reconciler is alive.
+    Reads stored heartbeats only, never GitHub, so it is cheap and safe.
 
     ``latest`` is the newest pulse (mode, paused, any error); ``summary`` is the
     newest SUCCESSFUL read and its age. A board that is off or not set up has a
