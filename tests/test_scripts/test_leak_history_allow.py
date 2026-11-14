@@ -112,9 +112,15 @@ def _finding(**over) -> dict:
     return f
 
 
+def _prefix_map(*entries: dict) -> dict[str, str]:
+    """Build the prefix-to-full-commit mapping that ``main`` resolves via git."""
+    return {e["commit"][:lha._COMMIT_PREFIX]: e["commit"] for e in entries}
+
+
 def test_an_exact_match_is_dropped_and_reported():
+    entry = _entry()
     results = _results((f"{_C40[:12]}/src/n.py", _finding()))
-    dropped = lha.apply(results, [_entry()])
+    dropped = lha.apply(results, [entry], _prefix_map(entry))
     assert results["results"] == {}
     assert [(f, r) for f, _, r in dropped] == [(f"{_C40[:12]}/src/n.py", "synthetic")]
 
@@ -130,15 +136,29 @@ def test_an_exact_match_is_dropped_and_reported():
     ids=["other-commit", "other-path", "other-detector", "other-value"],
 )
 def test_anything_short_of_an_exact_match_is_kept(filename, finding):
+    entry = _entry()
+    prefix = filename.partition("/")[0]
+    mapping = {prefix: entry["commit"]} if prefix == _C40[:12] else {prefix: "b" * 40}
     results = _results((filename, finding))
-    assert lha.apply(results, [_entry()]) == []
+    assert lha.apply(results, [entry], mapping) == []
     assert results["results"] == {filename: [finding]}
 
 
+def test_a_different_commit_sharing_the_prefix_is_not_suppressed():
+    """Two commits with the same 12-char prefix are distinct full SHAs."""
+    other_full = _C40[:12] + "f" * 28
+    entry = _entry()
+    results = _results((f"{_C40[:12]}/src/n.py", _finding()))
+    mapping = {_C40[:12]: other_full}
+    assert lha.apply(results, [entry], mapping) == []
+    assert f"{_C40[:12]}/src/n.py" in results["results"]
+
+
 def test_a_dropped_finding_leaves_its_neighbours():
+    entry = _entry()
     keep = _finding(hashed_secret="d" * 40, line_number=2)
     results = _results((f"{_C40[:12]}/src/n.py", _finding()), (f"{_C40[:12]}/src/n.py", keep))
-    lha.apply(results, [_entry()])
+    lha.apply(results, [entry], _prefix_map(entry))
     assert results["results"] == {f"{_C40[:12]}/src/n.py": [keep]}
 
 
