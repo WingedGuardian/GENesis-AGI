@@ -124,7 +124,8 @@ Not covered:
   file outright (measured); a hard link is a different path to the same file and is not recognised.
 - **One refusal.** An Edit or Write of the secrets file whose written text holds placeholder text is refused,
   with a message naming the placeholders. So is any Edit or Write carrying placeholder text while no values
-  have loaded (the file's path is not known yet), and one the plugin failed to check. This is the only call the plugin blocks. In practice: a Write of
+  have loaded (the file's path is not known yet) or since a reload failed (the file may have moved), until a
+  load succeeds, and one the plugin failed to check. This is the only call the plugin blocks. In practice: a Write of
   the whole file as read is refused, and adding a line next to a line holding a secret means anchoring the
   Edit on a line without one. Onboarding (filling in an empty value) needs no placeholder at all.
 - **A shell write to the secrets file** (`sed -i`, a heredoc) does not go through Edit/Write, so a placeholder
