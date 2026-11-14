@@ -258,7 +258,12 @@ def _unmatched_members(
     stored: Path,
     entry: str,
     tree: dict[str, tuple[str, str]],
+    *,
+    seen: set[str] | None = None,
 ) -> list[str]:
+    """Members that do not match ``tree``. ``seen``, when given, collects the
+    path of every file and symlink member, so a caller can also ask which of
+    ``tree``'s paths the archive lacks."""
     unmatched: list[str] = []
     with tarfile.open(stored, "r:gz") as tf:
         for member in tf:
@@ -269,6 +274,8 @@ def _unmatched_members(
                 raise _Unsafe("archive root is not a directory")
             if not (member.isreg() or member.issym()):
                 raise _Unsafe(f"special member: {member.name!r}")
+            if seen is not None:
+                seen.add(rel)
             want = tree.get(rel)
             # The allowlist is for paths the head does not track: a tracked
             # file under `node_modules/` is compared like any other.
