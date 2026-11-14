@@ -28,7 +28,7 @@ def test_measurement_steps_are_advisory_and_keep_the_existing_test_population():
     test_args = shlex.split(tests["run"], comments=True)
     census_args = shlex.split(by_id["census_readback"]["run"])
     assert test_args[test_args.index("-n") + 1] == census_args[census_args.index("--workers") + 1] == "4"
-    for flag in ("--dist=loadfile", "--max-worker-restart=0", "--junit-xml=junit.xml",
+    for flag in ("--dist=loadfile", "--max-worker-restart=0", "--junit-xml=$GENESIS_JUNIT_REPORT",
                  "--ignore-glob=**/test_*az*.py", "--ignore-glob=**/test_*shim*.py", "--ignore=tests/test_ui/"):
         assert flag in test_args
     assert by_id["census_readback"]["env"]["TESTS_OUTCOME"] == "${{ steps.tests.outcome }}"
