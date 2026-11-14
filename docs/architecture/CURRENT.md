@@ -2896,6 +2896,19 @@ verified: c712f1bde 2026-11-06
   (bootstrap, #1082) → reconcile (guardian, #1083) → alert (this). The
   provision-or-surface convention: a resilience feature that skips on a
   missing prereq must either provision it or register a fact this check reads.
+  The storage section's `user_manager_io_delegated` (io in the user manager's
+  `cgroup.controllers`) feeds `cgroup_io_settings_inert`: an advisory that
+  names every place Genesis sets an `IOWeight`-family key on a user unit or
+  scope (`infra_profile/cgroup_io.py` `SETTERS`, locked against the tree by a
+  test) and says those keys have no effect there. It is informational: alone
+  it is a `low` note (dashboard only; the morning report reads
+  critical/high/medium), never the `high` alert (the deploy-staleness
+  informational-class pattern), and it carries no crash-resilience claim. A
+  note never decides the unverifiable-plane hold: with only notes computable
+  and a plane unverifiable, the open row is kept. Blind spot: it is silent
+  once io is delegated, though weights then still need BFQ or iocost; and
+  while a plane stays unverifiable with no row open, the note is not written
+  either (the same hold that applies to real gaps).
 
 - **Git-health alerts self-heal, slot-scoped (2026-07-16)**: the per-tick cheap
   probe auto-resolves open `git_cheap` observations on pass; the daily deep

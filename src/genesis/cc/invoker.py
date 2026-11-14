@@ -256,6 +256,9 @@ def set_oom_score_adj(pid: int, score: int = 500) -> None:
 # The sibling probe-then-commit sites (.claude/mcp/run-codebase-memory,
 # scripts/lib/code_intel_index.sh) already set their own properties at probe
 # time for this reason; this was the one that did not.
+# IOWeight takes effect only where the user manager has the io controller; it
+# is kept for hosts that delegate io, and the infrastructure posture check
+# (infra_profile/cgroup_io.py) names it on hosts where it is inert.
 _SCOPE_PROPERTIES = ("IOWeight=100", "MemoryHigh=62%", "MemoryMax=75%")
 _SCOPE_DESCRIPTION = "Genesis CC session"
 

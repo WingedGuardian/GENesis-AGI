@@ -82,6 +82,10 @@ _TIER2 = (
     "since the last update.sh run; it neither runs nor reads the file"
 )
 _GUARDIAN = "the host guardian's own deploy list, run on the host, never by genesis-server"
+_CGROUP_IO_LABEL = (
+    "a label in the inert-IO-setting note naming where IOWeight is set; never run or read"
+)
+
 EXEMPT: dict[tuple[str, str], str] = {
     ("dashboard/routes/updates.py", "scripts/update.sh"): _UPDATER,
     ("dashboard/routes/backup.py", "scripts/backup.sh"): (
@@ -145,6 +149,8 @@ EXEMPT: dict[tuple[str, str], str] = {
     ("guardian/watchdog.py", "scripts/guardian-gateway.sh"): _GUARDIAN,
     ("guardian/watchdog.py", "scripts/lib/host_swap.sh"): _GUARDIAN,
     ("guardian/watchdog.py", "scripts/lib/cc_tmp_volume.sh"): _GUARDIAN,
+    ("infra_profile/cgroup_io.py", "scripts/lib/code_intel_scope.sh"): _CGROUP_IO_LABEL,
+    ("infra_profile/cgroup_io.py", "scripts/lib/code_intel_owner.py"): _CGROUP_IO_LABEL,
 }
 
 _SCRIPTS_TAIL = re.compile(r"(?<![A-Za-z0-9_.-])scripts/(.*)$")
