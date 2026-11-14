@@ -431,22 +431,35 @@ It also reports reads of the real credential files (the deployed `secrets.env`,
   box lock file, `/dev`, and `__pycache__` / `.pytest_cache` directories.
 - Each write is classed by where it lands (the deployed checkout, this checkout,
   `~/.genesis`, `~/.claude`, elsewhere in the home) and attributed to the test.
-- The run summary counts tests per class under "writes outside the test's temp
-  dirs"; `GENESIS_LIVE_WRITES_REPORT=<file>` writes one tab-separated line per
+- The run summary counts tests per class under "audit observations";
+  `GENESIS_LIVE_WRITES_REPORT=<file>` writes one escaped tab-separated line per
   (test, class, operation, path), on every run.
-- A hit is a write that happens: an attempt the kernel refuses or that changes
-  nothing (`mkdir(exist_ok=True)` on an existing directory, `unlink` of a missing
-  file, reopening an existing file without writing) is not recorded. A relative
+- An observation records a pre-operation event, not successful completion.
+  Established no-effect cases (`mkdir(exist_ok=True)` on an existing directory,
+  `unlink` of a missing file, reopening an existing file without writing) are
+  filtered; other refused operations can still be reported. A relative
   `os.open` is judged against the cwd and labelled so (its audit event carries no
   `dir_fd`). Writes during collection count as "outside any test".
+- An `observer fault` row identifies the test and the audit event/stage/fixed
+  builtin error category. Its path field is the literal `<not captured>`;
+  exception messages, filenames, custom type names and tracebacks are not
+  included. Failed test attribution uses `<attribution unavailable>`.
+  Identical diagnostic rows deduplicate, while the fault count includes every
+  judging failure. If diagnostic capture itself fails, the count still makes
+  the census incomplete. Older count-only reports cannot recover fault causes.
 - Not covered: writes made by child processes, writes without an audit event,
   metadata changes (`chmod`, `utime`, `setxattr`, `touch` of an existing file),
   `mkfifo`/`mknod`, SQLite writes through an already-open connection, and
   `file://localhost` or percent-encoded SQLite URIs. The OS-level sandbox is the
   boundary there.
 
-The list it produces is the to-do list for moving each such test under its own
-`tmp_path`; once it is empty, the audit can refuse instead of report.
+The observations identify tests to investigate and move under their own
+`tmp_path`. Enforcement requires a successful complete census on corrected
+main, with an empty report, zero faults, an installed observer and no missing
+or disarmed workers. An empty TSV alone does not establish this: CI also checks
+the fresh run identity, test outcome, report digest/count and worker coverage.
+The audit remains report-only while ambiguous observations and unknown faults
+remain unresolved.
 
 ## Shared MCP qualification environments
 
