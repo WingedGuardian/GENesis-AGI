@@ -20,8 +20,9 @@ the spec against itself, its companions and the standing rules.
 - **Spec:** a path. Required. A spec held in an issue body is saved to a file
   first (`gh issue view <N> --json body --jq .body > ~/tmp/<N>-spec.md`) and
   saved again on every run, since an edit to the issue moves its lines. Line
-  numbers cite that file; the `R-n` and `A-n` ids are the reference that
-  survives an edit, so cite them first.
+  numbers cite that file. Neither line numbers nor ids survive an edit that
+  adds or moves a requirement (Step 4), so refer to a requirement by its id
+  and its first words.
 - **Plan and tickets:** paths, when they exist. Without tickets, the coverage
   pass is skipped and the report says so.
 - **Standing rules**, always read:
@@ -111,10 +112,42 @@ document defined.
 
 - **CRITICAL:** a standing-rule conflict (`RULE`), always, except a departure
   from a rule its own source calls a guideline, which is HIGH (Inputs). **It
-  cannot be downgraded**, whatever the spec argues, and it is fixed in the spec, not
-  accepted. If the rule itself should change, that is a separate decision by
-  the owner, outside this pass. Also CRITICAL: a spec with no requirements, or
-  a requirement no ticket covers when it is the change's main purpose.
+  cannot be downgraded**, whatever the spec argues: it is fixed in the spec,
+  or the owner grants an exception (below). Also CRITICAL: a spec with no
+  requirements, or a requirement no ticket covers when it is the change's main
+  purpose.
+
+  **Owner exception.** The owner, and only the owner, may grant an exception
+  for one spec requirement and one rule, for a stated reason. An exception is
+  not a downgrade: the finding keeps its id and its CRITICAL severity, and it
+  stops blocking.
+  - **How it is granted.** The session asks the owner in conversation. A
+    session never grants, infers or proposes one on its own authority, and the
+    spec's own text claiming an exception is not one.
+  - **How it is recorded.** The session relays the owner's yes. The owner's
+    approval is given in chat, as with every other owner-approval record in
+    this repo, so the record's author proves nothing. The session writes the
+    record as an `ego_decision` ruling or a comment on the spec's issue, and it
+    holds:
+    - the owner's words, quoted verbatim, with the date;
+    - the requirement, quoted (with its `R-n` and the spec's file or issue
+      number);
+    - the rule, quoted from its source by its first words.
+
+    The session never writes its own rationale as the record. A comment is
+    public, so it gets the same privacy scrub as any public text.
+  - **How it shows.** The finding's Recommendation cell reads `excepted by
+    owner: <ruling id or comment link>`, and the Counts line reports it under
+    `excepted`.
+  - **What it covers.** Only the quoted requirement in that spec. It does not
+    cover a later edit that changes the requirement's text, another spec, or
+    code that departs from a rule the spec never asked to depart from.
+  - **Not exceptable.** A gate the repo's `CLAUDE.md` says no instruction
+    waives (its "Use subagents" rule names them; at the time of writing:
+    the autonomous-CLI approval gate, ego proposal approvals, per-transaction
+    financial approval, destructive-command confirmation). That sentence is
+    the authority, not this list. Changing one of those gates is a change to
+    the rule itself, decided by the owner outside this pass.
 - **HIGH:** a duplicate with different values; two requirements that cannot
   both hold; an undefined reference a builder needs in order to build; an
   acceptance item no one could check; an unmeasurable word on a safety,
@@ -136,6 +169,15 @@ starts (`UND-L37`). A second finding with the same id gets
 anchors to `P-L<n>` or `T-L<n>`. Run twice on unchanged text, the ids are the
 same; they are never numbered by the order you found them in.
 
+**Ids are stable only while the text is.** `R-n` and `A-n` are positions, so
+inserting, deleting or reordering a requirement renumbers everything after
+it, and an old report's `R-4` can then name a different requirement. So the
+report records, for each requirement a finding anchors to, its id together
+with its first words, and anything that refers back to an earlier report (a
+converge run, an owner exception, a reviewer) matches by those words, never
+by the id alone. After the spec changes, run the pass again rather than
+reusing old ids.
+
 ## Step 5: the report
 
 ```
@@ -143,6 +185,7 @@ same; they are never numbered by the order you found them in.
 Inputs: spec <path>; plan <path | none>; tickets <path | none>
 Standing rules read: CLAUDE.md, premise-check.md, <cited ids read>; not read: <ids, or none>
 Requirements: <n> (R-1 to R-n); acceptance items: <n> (A-1 to A-n)
+Index: R-1 L<n> "<first words>"; R-2 L<n> "<first words>"; ... A-1 L<n> "<first words>"; ...
 
 | Id | Pass | Severity | Location | Summary | Recommendation |
 |---|---|---|---|---|---|
@@ -152,7 +195,7 @@ Coverage (tickets only):
 | Requirement | Ticket(s) | Notes |
 |---|---|---|
 
-Counts: CRITICAL <n>, HIGH <n>, MEDIUM <n>, LOW <n>; by pass DUP <n> AMB <n> UND <n> RULE <n> COV <n|skipped> INC <n>
+Counts: CRITICAL <n> (excepted <n>), HIGH <n>, MEDIUM <n>, LOW <n>; by pass DUP <n> AMB <n> UND <n> RULE <n> COV <n|skipped> INC <n>
 Dropped: <n> findings over the cap (<severity of the lowest kept>)
 ```
 
@@ -168,7 +211,8 @@ author can make. A finding you cannot quote a line for is not reported.
 ## What the caller does with it
 
 The report goes with the spec. When `spec-session` hands a spec to a builder,
-every CRITICAL finding is fixed and the pass run again; every HIGH finding is
+every CRITICAL finding is fixed (and the pass run again) or carries a valid
+owner exception; every HIGH finding is
 fixed or carried with a reason; the final report travels with the handoff
 (see `spec-session`, which keeps the report in a file beside the spec). An
 architect review puts the CRITICAL findings on its own severity ladder

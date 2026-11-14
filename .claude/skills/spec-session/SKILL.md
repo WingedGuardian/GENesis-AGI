@@ -46,9 +46,12 @@ exist. Run it BEFORE the holdout-writer step above: the intent is not final
 until this pass is clean, and scenarios written earlier would test the
 unfixed intent. Then:
 
-- fix every CRITICAL finding in the spec and run the pass again; a conflict
-  with a standing rule is never accepted, only fixed or taken to the owner as a
-  change to the rule;
+- every CRITICAL finding is fixed in the spec (then run the pass again) or
+  carries the owner's exception. A conflict with a standing rule is never
+  accepted by the session. When one looks justified, ask the owner through
+  `AskUserQuestion` rather than rewording the spec around the check, and on a
+  yes record it exactly as `references/spec-analyze.md`, "Owner exception",
+  says: the owner's words verbatim, the requirement and the rule quoted;
 - fix every HIGH finding, or keep it with a one-line reason under the report;
 - send the final report with the spec. When the handoff is an issue, post it
   as a comment on that issue, after the privacy scrub every public text gets

@@ -264,8 +264,8 @@ harness fires.
 
 Do the items and run it again until it converges. Something the spec asked
 for may be left unbuilt only on the owner's recorded decision (a change to the
-spec, never your own call), and a standing-rule contradiction never; the
-contract's "carried" rules say how. Put the report's `Outcome:` line in the PR
+spec, never your own call), and a standing-rule contradiction only under the
+owner's recorded exception; the contract's "carried" rules say how. Put the report's `Outcome:` line in the PR
 body under `## Testing`. This applies to any build from a spec, whether or not
 its effect can be shown on this install. The review-time check is different: the
 architect's Step 0.5 compares the diff with the plan and stays informational,

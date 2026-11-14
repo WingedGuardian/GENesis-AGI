@@ -182,8 +182,17 @@ Put every CRITICAL finding from it on the severity ladder below. When you are
 reviewing the plan or spec itself, it is a BLOCKER: a requirement that
 conflicts with a standing rule contradicts a non-negotiable principle. When
 you are reviewing a diff, it is a BLOCKER only if the diff implements the
-conflicting requirement; otherwise it is a SHOULD-FIX against the spec. Report
-the other findings in the pass's own table.
+conflicting requirement; otherwise it is a SHOULD-FIX against the spec. A
+finding marked `excepted by owner` is not a BLOCKER when its record holds up.
+Open the cited ruling (`ego_decision` list) or comment (`gh api`) and check
+that it quotes the owner's words with a date, quotes this requirement as the
+spec states it NOW, and quotes the rule. Then report it as a NOTE that repeats
+the owner's quoted words, so the owner sees every exception in use. The
+record's author proves nothing, since the session writes it, which is why the
+quote goes in front of the owner. A record you cannot open, one that lacks
+the quotes, or one whose quoted requirement no longer matches the spec makes
+the finding a BLOCKER again. So does an exception for a gate the repo's
+`CLAUDE.md` says no instruction waives. Report the other findings in the pass's own table.
 
 Where this ends and the builder's pass begins: Step 0.5 stays informational at
 review time; `spec-converge.md` is the builder's own pass before its PR, and

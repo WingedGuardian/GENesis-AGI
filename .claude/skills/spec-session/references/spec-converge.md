@@ -25,9 +25,12 @@ replace this one, and this one does not replace it.
 
 ## Step 1: the intent inventory
 
-List every requirement and acceptance item with an id. Use the `R-n` and `A-n`
-ids from the spec's `spec-analyze` report when one exists; otherwise number
-them by the rules in `spec-analyze.md`, Step 1. Add each plan decision that
+List every requirement and acceptance item with an id. Number them by the
+rules in `spec-analyze.md`, Step 1, on the spec as it is now. Reuse the ids of
+the spec's `spec-analyze` report only when its Index line still matches the
+spec word for word; otherwise match earlier items by their first words, since
+an inserted requirement renumbers everything after it (`spec-analyze.md`,
+Step 4). Add each plan decision that
 obliges the build to something, and each ticket. Record the line each comes
 from.
 
@@ -50,9 +53,12 @@ one. Every gap gets exactly one class:
 - **contradicts:** the code does something the spec, the plan or a standing
   rule says it must not. A standing-rule contradiction is CRITICAL.
 - **unrequested:** the branch adds something no document asked for. Judge
-  this class over the files the branch changes
-  (`git diff --name-only $(git merge-base origin/<base> HEAD)`, where `<base>`
-  is the PR's base branch) and only the lines it changes there; the code that
+  this class over the files the branch changes, `git diff --name-only
+  $(git merge-base origin/<base> HEAD)` (where `<base>` is the PR's base
+  branch), plus the new files git does not track yet,
+  `git ls-files --others --exclude-standard`, which that diff never lists.
+  Look only at the lines the branch changes in the first set, and at the whole
+  of each new file; the code that
   was already there is not this build's to justify. What the repo's own rules
   require of every change is never unrequested: tests, a changelog fragment, a
   capability registration, docs the change makes stale. This pass never
@@ -100,8 +106,11 @@ gap carried: an earlier listing alone does not. What may be carried:
   decision is recorded (the issue comment, or the line in the plan). Dropping
   something the spec asked for is a change to the spec, never the builder's
   quiet choice;
-- never a contradiction of a standing rule. That gap stays open until it is
-  fixed.
+- a contradiction of a standing rule only where the code does what an excepted
+  spec requirement asks, under the owner exception recorded as
+  `spec-analyze.md` ("Owner exception") describes, which the mark cites. The
+  exception covers that requirement only, so code that departs from a rule on
+  its own stays open until it is fixed.
 
 **When no gap is open**, it writes nothing (no empty section) and still prints
 the full report.
@@ -131,9 +140,10 @@ The `Outcome:` line is always the report's last line and takes exactly one of
 three forms:
 - `Outcome: converged`: no gap is open and nothing is carried, or only kept
   unrequested work is carried;
-- `Outcome: converged-with-carried (<k> carried: <R/A ids of each requested
-  item carried>)`: no gap is open, and at least one requested item is carried
-  on the owner's recorded decision;
+- `Outcome: converged-with-carried (<k> carried: <the R/A id of each item
+  carried, each with the record it cites>)`: no gap is open, and at least one
+  requested item, or one excepted rule contradiction, is carried on the
+  owner's recorded decision;
 - `Outcome: open (<n> open, <m> newly added to <plan file or "session output">)`.
 
 Adapted from `templates/commands/converge.md` in github/spec-kit, tag v1.4.0.
