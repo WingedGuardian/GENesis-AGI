@@ -252,6 +252,7 @@ body {
 
 /* Loading */
 .loading { text-align: center; color: var(--color-text-secondary); padding: 40px; }
+.text-hidden-note { font-size: 11px; color: var(--color-text-secondary); border: 1px solid rgba(148,163,184,0.3); border-radius: 4px; padding: 6px 10px; margin: 0 0 8px; }
 
 /* Nav bar */
 .genesis-nav {
@@ -282,6 +283,7 @@ body {
 
 <div class="container">
     <div class="main-panel">
+        <div id="text-hidden-note" class="text-hidden-note" style="display:none;"></div>
         <div id="loading" class="loading">Connecting...</div>
         <div id="neural-map" class="neural-map" style="display:none;"></div>
         <div id="legend" class="legend" style="display:none;"></div>
@@ -562,6 +564,30 @@ function el(tag, cls, text) {
     if (text !== undefined) e.textContent = text;
     return e;
 }
+
+// -- withheld text helpers --
+// The health API withholds error and detail text from a caller with no
+// credential: each withheld field is marked `<key>_hidden`, and the whole
+// response `free_text_hidden`. These say so instead of showing a blank, and
+// set text only, never markup.
+const TEXT_HIDDEN_HINT = 'Error and detail text is hidden: shown only to a signed-in dashboard session. '
+    + 'Sign in to the dashboard, then reload this page. '
+    + 'If no dashboard password is set, set one first '
+    + '(DASHBOARD_PASSWORD: dashboard Configuration, Provider Keys).';
+
+function hiddenText(obj, key) {
+    if (obj && obj[key]) return String(obj[key]);
+    if (obj && obj[key + '_hidden']) return 'hidden (sign in to see it)';
+    return '';
+}
+
+function showTextHiddenNote(data) {
+    const note = document.getElementById('text-hidden-note');
+    if (!note) return;
+    note.textContent = TEXT_HIDDEN_HINT;
+    note.style.display = data && data.free_text_hidden ? 'block' : 'none';
+}
+// -- end withheld text helpers --
 
 function formatAge(seconds) {
     if (seconds == null) return '';
@@ -1272,7 +1298,7 @@ function updateSidePanel(data) {
     // Show pending deferred item details
     if (queues.deferred_items && queues.deferred_items.length > 0) {
         for (const item of queues.deferred_items) {
-            const desc = (item.site || item.type) + ' \u2014 ' + item.reason;
+            const desc = (item.site || item.type) + ' \u2014 ' + (hiddenText(item, 'reason') || 'unknown');
             const age = formatAge(item.age_s) + (item.attempts > 0 ? ', ' + item.attempts + ' retries' : '');
             qEl.appendChild(sectionRow(desc, age, 'color:#94a3b8;font-size:10px'));
         }
@@ -1357,10 +1383,11 @@ function renderDiscardedItems(container, queues) {
 
         const statusLabel = item.status === 'expired' ? 'Expired' : 'Discarded';
         card.appendChild(el('div', 'di-row', 'Status: ' + statusLabel));
-        card.appendChild(el('div', 'di-row', 'Reason: ' + (item.reason || 'unknown')));
+        card.appendChild(el('div', 'di-row', 'Reason: ' + (hiddenText(item, 'reason') || 'unknown')));
 
-        if (item.error) {
-            card.appendChild(el('div', 'di-error', 'Error: ' + item.error));
+        const errorText = hiddenText(item, 'error');
+        if (errorText) {
+            card.appendChild(el('div', 'di-error', 'Error: ' + errorText));
         }
 
         const meta = [];
@@ -1448,6 +1475,7 @@ async function fetchHealth() {
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         lastData = await resp.json();
         lastFetchTime = Date.now();
+        showTextHiddenNote(lastData);
 
         document.getElementById('loading').style.display = 'none';
         buildNeuralMap(lastData);

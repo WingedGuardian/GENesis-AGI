@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 
 from flask import current_app, jsonify, request
@@ -141,6 +142,14 @@ def redact_for_untrusted(snapshot: dict) -> None:
 
     The trust decision is made once, here. The helpers below take no part in
     it and always redact, so calling one directly can only withhold more.
+
+    Two field-specific reductions keep the shapes the pages read, then
+    ``_withhold_free_text`` reduces everything else to an allow-list: every
+    number, boolean and null stays, and a string stays only where it is a
+    status, name, id or timestamp. So exception and provider error text,
+    database message columns and file contents never reach this caller,
+    including in a field a producer adds later. ``free_text_hidden`` tells a
+    page that text was withheld, so it can say so.
     """
     from genesis.dashboard.auth import has_internal_bearer, has_verified_credential
 
@@ -148,6 +157,10 @@ def redact_for_untrusted(snapshot: dict) -> None:
         return
     _redact_checkout_paths(snapshot)
     _redact_call_site_responses(snapshot)
+    reduced = _withhold_free_text(snapshot)
+    snapshot.clear()  # the caller's own shallow copy: the cached dict is untouched
+    snapshot.update(reduced)
+    snapshot["free_text_hidden"] = True
 
 
 def _redact_checkout_paths(snapshot: dict) -> None:
@@ -229,6 +242,244 @@ def _redact_call_site_responses(snapshot: dict) -> None:
     snapshot["call_sites"] = redacted
 
 
+# --------------------------------------------------------------------------
+# Free text: an allow-list over the whole snapshot
+# --------------------------------------------------------------------------
+#
+# The snapshot gathers twenty-odd producers, several of which merge in a probe's
+# details whole and many of which put an exception's text, a provider's error
+# body or a database message column into a string field. A list of the fields
+# to remove would leak each such field added later, so the reduction runs the
+# other way: a string is kept only where it is listed below as a status, name,
+# id or timestamp, and only while its value still looks like one.
+
+#: Keys whose string value is an enum, a name from config or code, an id, a
+#: commit sha or a model id, wherever they appear in the snapshot. Each was
+#: checked against every producer that writes it. Not here, because some
+#: producer fills them with free text: ``error``, ``message``, ``reason``,
+#: ``detail(s)``, ``summary``, ``path``, ``base``, ``branch``.
+_SAFE_STRING_KEYS = frozenset(
+    {
+        # states and enums
+        "status",
+        "state",
+        "level",
+        "sub_state",
+        "active_state",
+        "current_state",
+        "realtime_status",
+        "budget_status",
+        "key_health",
+        "cb_state",
+        "cb_reason",
+        "criticality",
+        "severity",
+        "alert_severity",
+        "provider_type",
+        "category",
+        "model_tier",
+        "dispatch",
+        "probe_status",
+        "status_reason",
+        "type",
+        "wal_status",
+        "cc_tier",
+        "sys_tier",
+        "scope",
+        "verdict",
+        "mode",
+        "window",
+        "source",
+        "liveness_source",
+        "last_trigger_source",
+        "limit_kind",
+        # names and ids from config, code or the database's own keys
+        "name",
+        "id",
+        "site",
+        "call_site",
+        "slot",
+        "peer",
+        "profile",
+        "provider",
+        "active_provider",
+        "last_run_provider",
+        "model",
+        "cc_model",
+        "last_run_model",
+        "original",
+        "fallback",
+        "class_key",
+        "service_label",
+        "service_unit",
+        "main_pid",
+        "hourly_budget",
+        # commits
+        "head",
+        "live",
+        "commit",
+        "new_commit",
+        "deployed_commit",
+        # times a producer may write in a form other than ISO 8601
+        "since",
+        "reset_at",
+    }
+)
+
+#: Keys whose dict maps a name to an enum (``bridge.resilience_state``).
+_ENUM_MAP_KEYS = frozenset({"resilience_state"})
+
+#: Keys whose list holds names or ids (call-site ids, unit names, memory
+#: classes, wings and link types, memory ids).
+_NAME_LIST_KEYS = frozenset(
+    {
+        "chain_usage",
+        "sole_sites",
+        "see_also",
+        "affected_sites",
+        "injected_ids",
+        "missing_units",
+        "classes",
+        "wings",
+        "by_type",
+    }
+)
+
+#: Exact paths whose string is an enum here though the key is free text
+#: elsewhere. ``*`` matches any one key, ``[]`` any list element.
+_SAFE_STRING_PATHS = (
+    ("cc_sessions", "fallback", "reason"),
+    ("cc_sessions", "peer_availability", "[]", "reason"),
+    ("bridge", "network", "cause"),  # resilience/network_sentinel.py constants
+)
+
+#: Exact paths whose string is prose written by code or config, never by an
+#: exception, a provider or a user (``_call_site_meta``, ``model_routing``,
+#: ``infrastructure.resilience_state_detail``): kept whatever its shape.
+_CODE_PROSE_PATHS = (
+    ("call_sites", "*", "description"),
+    ("call_sites", "*", "frequency"),
+    ("call_sites", "*", "cost_policy"),
+    ("resilience", "summary"),
+    # Fixed strings from snapshots/queues.py ("discarded: count query failed").
+    # The dashboard's queue verdict reads their "<counter>:" prefix, so
+    # withholding them turns a healthy queue into "unknown".
+    ("queues", "errors", "[]"),
+    # snapshots/api_keys.py builds these from provider type names, counts and
+    # call-site ids; the header banner and the provider panel render them.
+    ("api_keys", "alerts", "[]", "message"),
+    ("api_keys", "providers", "*", "cb_label"),
+)
+
+#: The one multi-word enum value a safe key carries (``resilience.level``).
+_SPACED_ENUMS = frozenset({"not configured"})
+
+#: What a kept enum, name, id or model id looks like: no whitespace, so no
+#: sentence, and no leading slash, so no absolute path. ``~`` and ``[]`` are
+#: model-id characters (a routing alias, a context-size suffix).
+_TOKEN = re.compile(r"[A-Za-z0-9_.:@+()~\[\]-][A-Za-z0-9_.:@+()~\[\]/-]{0,127}")
+#: An ISO 8601 date or time, which can carry no text and is kept under any key.
+_ISO_TIME = re.compile(
+    r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?)?"
+)
+#: A dict key the walk keeps: a name, never text.
+#: A structural dict key. No '@': no producer keys a dict on an email-shaped
+#: value, so such a key is text. '.' stays (the infrastructure 'genesis.db' key).
+_KEY = re.compile(r"[A-Za-z0-9_.:+-]{1,128}")
+
+
+def _path_matches(path: tuple, patterns: tuple) -> bool:
+    return any(
+        len(p) == len(path) and all(a in ("*", b) for a, b in zip(p, path, strict=True))
+        for p in patterns
+    )
+
+
+def _keeps(path: tuple, key: str, value: str, *, in_list: bool, enum_map: bool) -> bool:
+    """May this string go to an uncredentialed caller?"""
+    if value == "" or _ISO_TIME.fullmatch(value):
+        return True
+    if _path_matches(path, _CODE_PROSE_PATHS):
+        return True
+    named = (
+        (key in _NAME_LIST_KEYS)
+        if in_list
+        else (key in _SAFE_STRING_KEYS or enum_map or _path_matches(path, _SAFE_STRING_PATHS))
+    )
+    return named and (bool(_TOKEN.fullmatch(value)) or value in _SPACED_ENUMS)
+
+
+def _withhold_free_text(value, path: tuple = ()):
+    """A copy of ``value`` with every string the allow-lists above do not name
+    removed (``redact_for_untrusted`` decides who this runs for).
+
+    Numbers, booleans and nulls are kept everywhere; a tuple is walked as a
+    list, and any other object fails closed. A withheld string in a
+    dict drops its key and sets ``<key>_hidden: true``; one in a list becomes
+    null, and the dict holding the list gets ``<list key>_hidden: true``. A
+    dict key that is text rather than a name drops its entry and sets
+    ``keys_hidden: true``. Every dict and list is rebuilt, never reused, so
+    nothing done to the result reaches the cached snapshot.
+    """
+    if not isinstance(value, dict):
+        return value
+    out: dict = {}
+    enum_map = bool(path) and path[-1] in _ENUM_MAP_KEYS
+    for key, item in value.items():
+        if not (isinstance(key, str) and _KEY.fullmatch(key)):
+            out["keys_hidden"] = True
+            continue
+        here = (*path, key)
+        if isinstance(item, str):
+            if _keeps(here, key, item, in_list=False, enum_map=enum_map):
+                out[key] = item
+            else:
+                out[f"{key}_hidden"] = True
+        elif isinstance(item, dict):
+            out[key] = _withhold_free_text(item, here)
+        elif isinstance(item, (list, tuple)):
+            out[key], hidden = _withhold_in_list(item, here, key)
+            if hidden:
+                out[f"{key}_hidden"] = True
+        elif _is_scalar(item):
+            out[key] = item
+        else:  # an object the JSON encoder would expand (a dataclass): fails closed
+            out[f"{key}_hidden"] = True
+    return out
+
+
+def _withhold_in_list(items: list | tuple, path: tuple, key: str) -> tuple[list, bool]:
+    """``_withhold_free_text`` for a list held under ``key``; returns the copy
+    and whether any string in it (or in a list nested in it) was withheld."""
+    here = (*path, "[]")
+    out: list = []
+    hidden = False
+    for item in items:
+        if isinstance(item, str):
+            if _keeps(here, key, item, in_list=True, enum_map=False):
+                out.append(item)
+            else:
+                out.append(None)
+                hidden = True
+        elif isinstance(item, dict):
+            out.append(_withhold_free_text(item, here))
+        elif isinstance(item, (list, tuple)):
+            nested, nested_hidden = _withhold_in_list(item, here, key)
+            out.append(nested)
+            hidden = hidden or nested_hidden
+        elif _is_scalar(item):
+            out.append(item)
+        else:
+            out.append(None)
+            hidden = True
+    return out, hidden
+
+
+def _is_scalar(value) -> bool:
+    """A number, boolean or null: kept wherever it appears."""
+    return value is None or isinstance(value, (bool, int, float))
+
+
 @blueprint.route("/api/genesis/health")
 @_async_route(timeout=_HEALTH_SNAPSHOT_TIMEOUT_S)
 async def health_snapshot():
@@ -253,12 +504,15 @@ async def health_snapshot():
         pass
 
     snapshot["bridge"] = bridge_health
-    redact_for_untrusted(snapshot)
 
+    # Decided from the full snapshot, before any redaction: the supervisor and
+    # the deploy scripts act on this status code, so what an uncredentialed
+    # caller may read must never change it.
     infra = snapshot.get("infrastructure", {})
     db_status = infra.get("genesis.db", {}).get("status", "") if isinstance(infra, dict) else ""
     healthy = rt.is_bootstrapped and db_status == "healthy"
 
+    redact_for_untrusted(snapshot)
     snapshot["status"] = "healthy" if healthy else "unhealthy"
     status_code = 200 if healthy else 503
 
