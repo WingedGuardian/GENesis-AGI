@@ -73,7 +73,7 @@ rewrites such a command to run through `bin/redact_run.sh`, and that runner pass
   below, the repository's guards) judge the original command, and nothing is approved that would otherwise be
   asked (measured on Claude Code 2.1.299). Claude Code's own `permissions.deny` rules, and any later hook or
   record that reads the call's input, see the wrapper instead: a Bash deny rule does not match a wrapped Monitor
-  or background command (this install has none). Foreground Bash is left alone: the mod already covers its
+  or background command. Foreground Bash is left alone: the mod already covers its
   result.
 - The command arrives base64-encoded and runs, via `eval`, in a subshell of the shell Claude Code built for it, so
   its functions, options, exported variables, heredocs and quoting are unchanged. Its exit status is kept; it
