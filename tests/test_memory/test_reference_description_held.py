@@ -4,9 +4,9 @@ No parser can scrub free text of a value it repeats in every spelling and
 position, so the credential body that every indexed store sees carries only the
 header (the identifier), a detail placeholder, the value placeholder and the
 Tags/Captured trailer. The description and the value go to ONE reference_secrets
-row (``detail``, ``value``); lookup and reveal put both back. The other indexed
-fields (identifier, tags, authority, provenance) are not scrubbed: a write
-whose field carries the value is refused.
+row (``detail``, ``value``); lookup and reveal put both back. In the other
+indexed fields (identifier, tags, authority, provenance) every span of the value
+is masked and the write goes on (#2426 PR A).
 
 Fake credentials and example.org hosts only, never real secrets.
 """
@@ -152,7 +152,7 @@ async def test_a_new_value_with_the_description_placeholder_keeps_the_descriptio
     ],
 )
 async def test_a_tag_carrying_the_value_is_dropped_whole(db, tag):
-    """Owner ruling 1817a5c4: the tag goes, the write does not."""
+    """A tag that is nothing but the value has no other text to keep."""
     store = _PointStore()
     unit = await _ingest(
         db, store, _body("Example portal", "password: Field!Fake5"),
@@ -162,20 +162,22 @@ async def test_a_tag_carrying_the_value_is_dropped_whole(db, tag):
 
 
 @pytest.mark.parametrize(
-    ("field", "kwargs"),
+    ("column", "kwargs"),
     [
-        ("authority", {"authority": "pasted Field!Fake5"}),
-        ("provenance", {"provenance": {"source_doc": "notes Field!Fake5"}}),
+        ("source_doc", {"provenance": {"source_doc": "notes Field!Fake5"}}),
+        ("source_pipeline", {"provenance": {"source_pipeline": "pasted Field!Fake5"}}),
     ],
 )
-async def test_a_value_in_another_indexed_field_is_refused(db, field, kwargs):
+async def test_a_value_in_another_indexed_field_is_held_not_indexed(db, column, kwargs):
+    """Owner ruling c91c5b74: the caller's metadata is held with the value."""
     store = _PointStore()
-    with pytest.raises(ValueError, match=field) as refused:
-        await _ingest(db, store, _body("Example portal", "password: Field!Fake5"), **kwargs)
-    assert "Field!Fake5" not in str(refused.value)
-    assert store.calls == []
-    for table in ("knowledge_units", "knowledge_fts", "reference_secrets"):
-        assert await db.execute_fetchall(f"SELECT 1 FROM {table}") == []  # noqa: S608
+    unit = await _ingest(
+        db, store, _body("Example portal", "password: Field!Fake5"), authority="pasted Field!Fake5", **kwargs,
+    )
+    row = await kc.get(db, unit)
+    assert "Field!Fake5" not in str(row[column])
+    assert all("Field!Fake5" not in str(call) for call in store.calls)
+    assert (await ro.reveal_meta(db, row))["provenance"] == kwargs["provenance"]
 
 
 async def test_a_clean_write_is_not_refused(db):
@@ -191,7 +193,7 @@ async def test_a_clean_write_is_not_refused(db):
     assert await kc.get_reference_secret(db, unit) == "password: Clean!Fake6"
 
 
-async def test_an_identifier_naming_the_login_of_a_login_secret_pair_is_not_refused(db):
+async def test_an_identifier_naming_the_login_of_a_pair_stays_and_its_secret_is_masked(db):
     """Capture writes "login / secret": the login may appear in the identifier
     and tags; the secret half still may not."""
     store = _PointStore()
@@ -201,34 +203,38 @@ async def test_an_identifier_naming_the_login_of_a_login_secret_pair_is_not_refu
     )
     # The header names the login too, and is checked by the same rule (4531815540).
     assert (await kc.get(db, unit))["body"].startswith("[reference.credentials] forum ForumUser42\n")
-    with pytest.raises(ValueError, match="identifier"):
-        await _ingest(
-            db, store, _body("Forum account", "ForumUser43 / Fk9!pass88", identifier="forum Fk9!pass88"),
-            concept="forum Fk9!pass88",
-        )
-
-
-def test_a_value_line_shaped_like_a_trailer_is_refused():
-    """Security review MEDIUM-1: a value line starting 'Tags: ' would be read
-    back as trailer, truncating the value and indexing its tail."""
-    with pytest.raises(ValueError, match="must not contain a line starting"):
-        fmt(kind="credentials", identifier="svc", description="d",
-            value="pw1\nTags: Zx9!kQ7mLeak", tags=None, source=None)
-    with pytest.raises(ValueError, match="repeats a 'Tags:'"):
-        ro.split_secret("[reference.credentials] svc\n\nd\n\nValue: pw1\nTags: Zx9!kQ7mLeak\nTags: a, b")
-
-
-@pytest.mark.parametrize("value", ["hunter2xyz / admin", "Fk3a9Zq / w0rd#9"])
-async def test_the_first_half_of_a_pair_is_probed_in_tags(db, value):
-    """Security review MEDIUM-2: the login-half exemption covers only the exact
-    login in the identifier; tags are probed with the fragments of both halves.
-    A tag that matches is dropped whole (owner ruling 1817a5c4), not refused."""
-    store = _PointStore()
-    first = value.split(" / ")[0]
-    unit = await _ingest(
-        db, store, _body("acct", value, tags=[first, "portal"], identifier="acct portal"),
-        concept="acct portal",
+    # The secret half is masked, under a tagged key.
+    other = await _ingest(
+        db, store, _body("Forum account", "ForumUser43 / Fk9!pass88", identifier="forum Fk9!pass88"),
+        concept="forum Fk9!pass88",
     )
-    body = (await kc.get(db, unit))["body"]
-    assert body.endswith("\nTags: portal")
-    assert first not in body
+    assert (await kc.get(db, other))["concept"].startswith("forum [held] #")
+
+
+def test_a_value_line_shaped_like_a_trailer_is_held_out_whole():
+    """Security review MEDIUM-1: a value line starting 'Tags: ' would be read
+    back as trailer. The writer's own value says where it ends; without it, a
+    repeated trailer line holds out everything after the marker (#2426 PR A)."""
+    value = "pw1\nTags: Zx9!kQ7mLeak"
+    body = fmt(kind="credentials", identifier="svc", description="d", value=value, tags=["a"], source=None)
+    held = ro.split_secret(body, value=value)
+    assert held.value == value and held.body.endswith("\nTags: a")
+    held = ro.split_secret(body)
+    assert "Zx9!kQ7mLeak" not in held.body and held.value == value + "\nTags: a"
+
+
+@pytest.mark.parametrize("value", ["hunter2xyz / Fk3a9!Zq", "Fk3a9Zq / w0rd!x99"])
+async def test_tags_probe_both_halves_of_a_pair(db, value):
+    """Security review MEDIUM-2, and round-3 M-2: tags are probed with the
+    fragments of both halves (only the identifier exempts the login); a tag
+    that is wholly one half is dropped, one carrying it keeps its other text."""
+    store = _PointStore()
+    login, secret = value.split(" / ")
+    tags = [login, f"{secret}-old", "portal"]
+    unit = await _ingest(
+        db, store, _body("acct", value, tags=tags, identifier="acct portal"),
+        concept="acct portal", tags_json=json.dumps(tags),
+    )
+    row = await kc.get(db, unit)
+    assert json.loads(row["tags"]) == ["[held]-old", "portal"]
+    assert row["body"].endswith("\nTags: [held]-old, portal")

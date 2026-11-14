@@ -20,6 +20,7 @@ from genesis.memory.reference_ops import (
     compose_body,
     delete_reference_entry,
     holds_secret,
+    reveal_meta,
 )
 from genesis.security import immunity_shadow
 from genesis.security.card_shapes import contains_card_number
@@ -307,6 +308,8 @@ async def _ingest_knowledge_unit(
     collection: str = "knowledge_base",
     memory_type: str = "knowledge",
     origin_class: str | None = None,
+    held_value: str | None = None,
+    held_detail: str | None = None,
 ) -> str:
     """MCP-side wrapper around :func:`ingest_knowledge_unit`.
 
@@ -314,6 +317,12 @@ async def _ingest_knowledge_unit(
     delegates to the pure-Python helper in ``genesis.memory.knowledge_ingest``.
     Keeps the MCP dispatch surface thin so the same ingestion pipeline can
     run from non-MCP contexts (e.g. the extraction_job reference extractor).
+
+    Returns the unit id; when the unit was stored under another concept than
+    the one asked for (a credential identifier that carried its value is
+    masked, a missing one minted), `` (stored as: <concept>)`` follows it, so
+    the caller can find the entry again. That case used to be a refusal, so no
+    caller depends on its shape.
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
@@ -323,7 +332,7 @@ async def _ingest_knowledge_unit(
 
     from genesis.memory.knowledge_ingest import ingest_knowledge_unit
 
-    return await ingest_knowledge_unit(
+    stored = await ingest_knowledge_unit(
         store=memory_mod._store,
         db=memory_mod._db,
         content=content,
@@ -339,7 +348,13 @@ async def _ingest_knowledge_unit(
         collection=collection,
         memory_type=memory_type,
         origin_class=origin_class,
+        held_value=held_value,
+        held_detail=held_detail,
     )
+    stored_as = getattr(stored, "concept", concept)
+    if not holds_secret(project, domain) or stored_as == concept:
+        return stored
+    return f"{stored} (stored as: {stored_as})"
 
 
 @mcp.tool()
@@ -473,10 +488,6 @@ def _format_reference_body(
     The description appears next because semantic retrieval weights the
     start of the content most heavily.
     """
-    if kind == "credentials":
-        from genesis.memory.reference_ops import refuse_trailer_shaped_value
-
-        refuse_trailer_shaped_value(value)
     lines = [
         f"[reference.{kind}] {identifier}",
         "",
@@ -523,7 +534,7 @@ async def reference_store(
     identifier across re-stores to get upsert semantics.
 
     ``value`` is the raw value (password, URL string, IP address, file path,
-    etc.). Stored plaintext (a credential's value and description outside the search index, so a credential is found by its identifier and tags, which must not contain the value), so an entry holding
+    etc.). Stored plaintext (a credential's value and description outside the search index, so a credential is found by its identifier and tags, where any span of the value is masked), so an entry holding
     a payment card number in any field is refused (the planned card vault
     is tracked in #3172).
 
@@ -538,7 +549,9 @@ async def reference_store(
     ``source`` is optional provenance (``session_id``, ``captured_via``,
     ``captured_at``). Surfaced in the body for audit trails.
 
-    Returns the unit_id of the stored row.
+    Returns the unit_id of the stored row, followed by
+    `` (stored as: <identifier>)`` when a credential identifier carried its
+    value and was stored masked.
     """
     # The reference store keeps values in plaintext, so a payment card number
     # never goes in, whichever field carries it. The refusal does not echo it, and
@@ -616,6 +629,9 @@ async def reference_store(
         collection="episodic_memory",
         memory_type="episodic",
         origin_class=session_origin_from_env(),
+        # A credential's value and description, as given: held out whole, so a
+        # multi-line value is never split by how its lines look (#2426).
+        **({"held_value": value, "held_detail": description} if kind == "credentials" else {}),
     )
     return unit_id
 
@@ -818,6 +834,9 @@ async def reference_lookup(
         }
         if value_missing:
             entry["value_missing"] = True
+        if holds_secret(_REFERENCE_PROJECT, row["domain"]):
+            # The caller metadata held with the value (#2426), put back here.
+            entry["meta"] = await reveal_meta(memory_mod._db, row)
         full_rows.append(entry)
         if len(full_rows) >= limit:
             break

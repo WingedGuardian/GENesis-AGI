@@ -35,10 +35,7 @@ from __future__ import annotations
 
 import json
 import logging
-import re
-import unicodedata
 from typing import TYPE_CHECKING, Any, NamedTuple
-from urllib.parse import unquote
 
 from genesis.db.crud.knowledge import CREDENTIAL_DOMAIN as _CREDENTIAL_DOMAIN
 from genesis.db.crud.knowledge import DETAIL_PLACEHOLDER as _CRUD_DETAIL_PLACEHOLDER
@@ -47,6 +44,22 @@ from genesis.db.crud.knowledge import (
     get_reference_pair,
     get_secret_row,
     holds_secret,  # noqa: F401 - one rule, shared with the db layer
+)
+
+# The masking itself (``ValueMask``, ``value_masks``, the caps, ``HELD_MASK``)
+# lives in ``reference_masks``; its public names are re-exported here.
+from genesis.memory.reference_masks import (
+    HELD_MASK,
+    MAX_TAG_CHARS,  # noqa: F401 - re-exported
+    MAX_TAGS,
+    ValueMask,
+    _as_mask,
+    _mask_tag,
+    _serialised_clean,
+    cap_masked,  # noqa: F401 - re-exported
+    cap_tag,
+    mask_value_spans,  # noqa: F401 - re-exported
+    value_masks,  # noqa: F401 - re-exported
 )
 
 if TYPE_CHECKING:
@@ -128,9 +141,11 @@ def parse_reference_body(body: str | None) -> dict[str, str]:
 # payload and its embedding) therefore gets only the header (the identifier),
 # DETAIL_PLACEHOLDER, the SECRET_PLACEHOLDER value line and the Tags/Captured
 # trailer. The value and the description go to ONE ``reference_secrets`` row
-# (``value``, ``detail``), a table no recall path reads. The other indexed
-# fields (identifier, tags, authority, provenance) are not scrubbed: a write
-# whose field carries the value is refused (``refuse_value_in_fields``).
+# (``value``, ``detail``), a table no recall path reads. In the other indexed
+# fields (identifier, tags, authority, provenance) every span of the value is
+# MASKED with ``HELD_MASK`` (``mask_value_spans``) and the write goes on: no
+# capture is refused or degraded to keep a secret out of the index (owner
+# ruling, #2426), since the original is already held in reference_secrets.
 
 #: Domains whose value is held out. Identifier kinds (url, network, account,
 #: fact) are not: their value is the thing a lookup searches for.
@@ -139,159 +154,55 @@ SECRET_DOMAINS = frozenset({_CREDENTIAL_DOMAIN})
 SECRET_PLACEHOLDER = _CRUD_PLACEHOLDER
 DETAIL_PLACEHOLDER = _CRUD_DETAIL_PLACEHOLDER
 
-_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-_MIN_TOKEN = 4
-_TOKEN_EDGE = ".,;:!?()[]{}\"'"  # noqa: S105 - punctuation, not a secret
+
+def _trailer_tag(tag: str) -> str:
+    """A tag as the body's one ``Tags:`` line can carry it: a line break in
+    it would start a line of its own (a second ``Value:`` line, say)."""
+    return " ".join(tag.splitlines())
 
 
-def _secret_token(token: str) -> bool:
-    """A whitespace token that reads as a secret rather than a word: at least
-    four characters, letters or digits mixed with a digit or a symbol. Plain
-    words ("password", "Router") and email addresses never qualify."""
-    if len(token) < _MIN_TOKEN or _EMAIL.match(token):
-        return False
-    has_digit = any(c.isdigit() for c in token)
-    has_symbol = any(not c.isalnum() for c in token)
-    has_alpha = any(c.isalpha() for c in token)
-    return (has_digit or has_symbol) and (has_alpha or (has_digit and has_symbol))
-
-
-def _normalise(text: str) -> str:
-    """``text`` as the refusal check compares it: NFKC (a fullwidth or other
-    compatibility variant reads as its plain form), every format character
-    (Unicode category Cf: zero-width spaces and joiners, the soft hyphen)
-    removed, then casefolded."""
-    folded = unicodedata.normalize("NFKC", text)
-    return "".join(c for c in folded if unicodedata.category(c) != "Cf").casefold()
-
-
-def _decoded(text: str) -> set[str]:
-    """``text`` and its percent-decoded forms, up to three rounds."""
-    forms = {text}
-    for _ in range(3):
-        text = unquote(text)
-        forms.add(text)
-    return forms
-
-
-#: Where a structured value (a URL, a DSN, a key=value line, a header, XML,
-#: a pipe- or backslash-separated record) splits into its parts, applied to the
-#: NFKC form so fullwidth punctuation splits too. One generic fragmentation, no
-#: per-format parser.
-_FRAGMENT_SPLIT = re.compile(r"[\s:/@?&=#;,|\\<>\"'`(){}\[\]]+")
-#: A host name: dotted labels ending in an alphabetic top-level label.
-_HOSTNAME = re.compile(r"^(?:[a-z0-9-]+\.)+[a-z]{2,}$")
-_SCHEME = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]{0,31})://")
-
-
-def _value_probes(value: str, *, login_exempt: bool = False) -> list[tuple[str, bool]]:
-    """(probe, whole-word only) for the refusal check: the whole value, and
-    every secret-shaped fragment of it, normalised. The value is percent-decoded
-    (up to three rounds), NFKC-normalised and split on whitespace and
-    ``: / @ ? & = # ; , | \\ < > " ' ` ( ) { } [ ]``, so
-    the password, token or key inside a connection URL, a DSN or a
-    ``key=value`` line is a fragment of its own; a fragment that is a host name,
-    a URL scheme, or all digits (a port) is not probed. A secret that reads as
-    a plain word (all letters, or under four characters) is not secret-shaped,
-    so it is matched only as the whole value, and only as a whole word: an
-    ordinary word inside another is no match. That is a stated limit."""
-    whole = value.strip()
-    probes: dict[str, bool] = {}
-    for form in _decoded(whole) if whole else ():
-        probes.setdefault(_normalise(form), form.isalpha() or len(form) < _MIN_TOKEN)
-    # "login / secret" is the shape the capture writers format: with
-    # ``login_exempt`` (the identifier only, which names the account) the
-    # exact login half is not probed. Every other field is probed with the
-    # tokens of both halves.
-    login, sep, secret = whole.partition(" / ")
-    exempt = login.strip().strip(_TOKEN_EDGE) if login_exempt and sep and secret.strip() else None
-    for form in _decoded(whole):
-        schemes = {m.group(1).casefold() for m in _SCHEME.finditer(form)}
-        for fragment in _FRAGMENT_SPLIT.split(unicodedata.normalize("NFKC", form)):
-            fragment = fragment.strip(_TOKEN_EDGE)
-            folded = fragment.casefold()
-            if (
-                not fragment or fragment == exempt or fragment.isdigit()
-                or folded in schemes or _HOSTNAME.match(folded)
-            ):
-                continue
-            if _secret_token(fragment):
-                probes.setdefault(_normalise(fragment), False)
-    probes.pop("", None)
-    return list(probes.items())
-
-
-def refuse_value_in_fields(
-    value: str, fields: dict[str, str | None], *, message: str | None = None,
-    login_exempt: bool = False,
-) -> None:
-    """Fail closed: raise ValueError when the value, or any secret-shaped token
-    of it (in their normalised and percent-decoded forms), occurs in one of the
-    indexed ``fields``. Nothing is scrubbed. The message names the field, never
-    the value; ``message`` replaces it (the identifier refusal). The body's own
-    placeholder lines are no leak and are left out of the check."""
-    patterns = _probe_patterns(value, login_exempt=login_exempt)
-    for name, text in fields.items():
-        if _carries(patterns, text):
-            raise ValueError(
-                message or (
-                    f"refusing a credential reference whose {name} carries its "
-                    "value; keep the value out of that field (#2426)"
-                )
-            )
-
-
-def _probe_patterns(value: str, *, login_exempt: bool = False) -> list[re.Pattern[str]]:
-    return [
-        re.compile(
-            (r"(?<![^\W_])" + re.escape(probe) + r"(?![^\W_])") if as_word else re.escape(probe),
-        )
-        for probe, as_word in _value_probes(value, login_exempt=login_exempt)
-    ]
-
-
-def _carries(patterns: list[re.Pattern[str]], text: str | None) -> bool:
-    """Whether ``text`` (normalised, and percent-decoded) carries a probe. The
-    body placeholders are no leak and are left out."""
-    if not text:
-        return False
-    held_out = text.replace(SECRET_PLACEHOLDER, "").replace(DETAIL_PLACEHOLDER, "")
-    haystacks = {_normalise(form) for form in _decoded(held_out)}
-    return any(pattern.search(h) for pattern in patterns for h in haystacks)
-
-
-def drop_value_tags(value: str, tags_json: str | None, body: str) -> tuple[str | None, str]:
-    """(tags_json, body) with every caller tag that carries the value removed
-    WHOLE, from the tags list and from the body's ``Tags:`` trailer line; the
-    other tags stay. A tag is a label, not prose: dropping the whole element
-    leaves no part of it behind, so this is not a scrub. Tags are dropped
-    rather than refused because a shape heuristic will flag an ordinary tag
-    now and then (a database name, a region), and the cost of that should be
-    one tag, never the whole capture. Unparseable tags are left as they are,
-    for the strict check to refuse."""
-    patterns = _probe_patterns(value)
+def mask_value_tags(
+    value: str | ValueMask, tags_json: str | None, body: str,
+) -> tuple[str | None, str]:
+    """(tags_json, body) for a credential row: at most ``MAX_TAGS`` tags, each
+    masked whole and then capped (``cap_tag``), with every span of the value masked strictly
+    (strings, numbers, lists and dicts at any nesting), in the tags list and in
+    the body's ``Tags:`` trailer line, which is also checked whole (a value
+    holding ", " spans tags no piece of which matches alone). A tag that was
+    nothing but the value is dropped. A ``Captured:`` line is dropped: the
+    caller's provenance is held in the secret row's meta. Tags that are not a
+    JSON list are decoded and masked as one value."""
+    mask = _as_mask(value)
     if tags_json:
         try:
             tags = json.loads(tags_json)
         except ValueError:
-            tags = None
-        if isinstance(tags, list):
-            kept = [t for t in tags if not (isinstance(t, str) and _carries(patterns, t))]
-            if len(kept) != len(tags):
-                tags_json = json.dumps(kept)
+            tags = tags_json
+        if not isinstance(tags, list):
+            tags = [tags]
+        kept = [cap_tag(t) for t in (_mask_tag(mask, t) for t in tags[:MAX_TAGS]) if t is not None]
+        tags_json = _serialised_clean(mask, kept)
     idx = body.find(_VALUE_MARKER)
     if idx != -1:
-        trailer = _trailer(body[idx + len(_VALUE_MARKER):])
+        after = body[idx + len(_VALUE_MARKER):]
+        trailer = _trailer(after)
         rebuilt = []
         for line in trailer:
-            if line.startswith("Tags: "):
-                kept_tags = [t for t in line[len("Tags: "):].split(", ") if not _carries(patterns, t)]
-                if kept_tags:
-                    rebuilt.append("Tags: " + ", ".join(kept_tags))
-            else:
-                rebuilt.append(line)
+            if not line.startswith("Tags: "):
+                continue
+            pieces = line[len("Tags: "):].split(", ")[:MAX_TAGS]
+            joined = ", ".join(t for t in (_mask_tag(mask, t) for t in pieces) if t is not None)
+            if mask.carries(joined):
+                joined = mask.mask(joined)
+            # Capped only once masked, so a cut never leaves part of a secret.
+            joined = ", ".join(cap_tag(t) for t in joined.split(", "))
+            if mask.carries("Tags: " + joined):
+                # The line as stored, prefix and all, is checked once more.
+                line = mask.mask("Tags: " + joined)
+                joined = line[len("Tags: "):] if line.startswith("Tags: ") else HELD_MASK
+            if joined.replace(HELD_MASK, "").strip(", "):
+                rebuilt.append("Tags: " + joined)
         if rebuilt != trailer:
-            after = body[idx + len(_VALUE_MARKER):]
             value_line = after[: len(after) - len("\n".join(trailer))].rstrip("\n")
             body = _held_body(body[:idx], rebuilt, value_line)
     return tags_json, body
@@ -308,80 +219,106 @@ class HeldCredential(NamedTuple):
     detail: str | None
 
 
-def split_secret(body: str) -> HeldCredential:
+def split_secret(
+    body: str,
+    *,
+    header: str | None = None,
+    tags: list[str] | None = None,
+    value: str | None = None,
+    detail: str | None = None,
+) -> HeldCredential:
     """Take the value and the free-text description out of a credential body.
 
     The body is ``[reference.credentials] {identifier}``, a blank line, the
     description, a blank line, ``Value: {value}`` and the Tags/Captured trailer,
     the layout every credential writer formats (the reference_store and
     knowledge_ingest MCP tools, the extraction job, migrate_reference_data).
-    The returned body keeps the header line and the trailer, with
-    DETAIL_PLACEHOLDER where the description stood and the canonical value
-    placeholder line. A body that already carries a placeholder (a re-ingest of
-    a held body) returns None for that part, so the stored one stays. Raises
-    ValueError, before anything is written, when the value cannot be located or
-    a payment card number is in the value or the description.
+    ``header`` is the header line expected for the key (default: the body's own
+    first line); a first line that is not it is part of the description. The
+    returned body is that header, DETAIL_PLACEHOLDER where the description
+    stood, the canonical value placeholder line and the trailer. A body that
+    already carries a placeholder (a re-ingest of a held body) returns None for
+    that part, so the stored one stays. ``value`` and ``detail``, when a writer
+    passes them, are the value and description as it knows them (a multi-line
+    value is held out whole, whatever its lines look like).
+
+    A body whose split point is ambiguous (no ``Value:`` line, the marker twice,
+    a value line shaped like a trailer line, a repeated trailer line, or a
+    parsed value that is not the writer's) is never refused: MORE is held out.
+    Everything after the header goes to the secret (the value: the text after
+    the first marker, or the whole remainder when there is none), the
+    description before the first marker stays the detail (None when there is
+    no marker to separate it, so a stored one is kept), and the trailer is
+    rebuilt only from the structured ``tags``, so no part of the ambiguous text
+    is indexed. Raises ValueError, before anything is written, only when a
+    payment card number is in the value or the description (#3172).
     """
     from genesis.security.card_shapes import contains_card_number
 
-    idx = body.find(_VALUE_MARKER)
-    value = parse_reference_body(body)["value"] if idx != -1 else ""
-    if not value:
-        raise ValueError(
-            "a credential reference must carry its value on a 'Value:' line; "
-            "refusing to index one whose value cannot be held out"
-        )
-    if body.count(_VALUE_MARKER) != 1:
-        # A description carrying the marker would move its tail into the secret
-        # (both this split and parse_reference_body cut at the FIRST marker).
-        raise ValueError(
-            "a credential reference must carry exactly one 'Value:' line; "
-            "refusing a body whose description contains one too"
-        )
-    head = body[:idx]
-    header, _, description = head.partition("\n")
-    description = description.strip()
-    if contains_card_number(value) or contains_card_number(description):
+    first = body.partition("\n")[0]
+    header = first if header is None else header
+    rest = body[len(first):] if first == header else "\n" + body
+    idx = rest.find(_VALUE_MARKER)
+    clean = idx != -1 and rest.count(_VALUE_MARKER) == 1
+    if clean:
+        after = rest[idx + len(_VALUE_MARKER):]
+        if value is not None and value.strip() and after.startswith(value):
+            # The writer's value says exactly where the value line ends: what
+            # follows it is the trailer, whatever the value's lines look like.
+            tail = after[len(value):]
+            trailer = tail.strip("\n").split("\n") if tail.strip() else []
+            clean = tail[:1] in ("", "\n") and all(
+                line.startswith(_TRAILER_PREFIXES) for line in trailer
+            ) and _split_trailer("\n".join(trailer))[1]
+            held = value
+        else:
+            trailer, clean = _split_trailer(after)
+            held = parse_reference_body(rest)["value"]
+            value_lines = held.split("\n")[1:]
+            clean = clean and not any(
+                line.startswith(_TRAILER_PREFIXES) for line in value_lines
+            ) and (value is None or held == value.strip())
+    if clean:
+        description: str | None = rest[:idx].strip()
+    else:
+        # Hold out more: the remainder is the value, nothing of it indexed.
+        held = (rest[idx + len(_VALUE_MARKER):] if idx != -1 else rest).strip()
+        description = rest[:idx].strip() if idx != -1 else None
+        trailer = ["Tags: " + ", ".join(_trailer_tag(t) for t in tags)] if tags else []
+    if value is not None:
+        # The writer's value, exactly as given (a whitespace-only one is empty).
+        held = value if value.strip() else ""
+    if detail is not None:
+        description = detail.strip()
+    if contains_card_number(held) or contains_card_number(description or ""):
         raise ValueError(
             "a credential reference carries a payment card number; cards are "
             "never stored as references"
         )
-    held = _held_body(
-        header + "\n\n" + DETAIL_PLACEHOLDER, _trailer(body[idx + len(_VALUE_MARKER):]),
-    )
     return HeldCredential(
-        held,
-        None if value == SECRET_PLACEHOLDER else value,
+        _held_body(header + "\n\n" + DETAIL_PLACEHOLDER, trailer),
+        # An empty value is an empty value, held like any other; only the
+        # placeholder means "keep the stored one" (#2426 PR A).
+        None if held == SECRET_PLACEHOLDER else held,
         None if description == DETAIL_PLACEHOLDER else description,
     )
 
 
-def refuse_trailer_shaped_value(value: str) -> None:
-    """A value line starting like a body trailer (``Tags: ``, ``Captured: ``)
-    would be read back as trailer: the value truncated and its tail indexed.
-    Writers refuse such a value before formatting the body (#2426)."""
-    if any(line.startswith(_TRAILER_PREFIXES) for line in value.split("\n")[1:]):
-        raise ValueError(
-            "a credential value must not contain a line starting 'Tags: ' or "
-            "'Captured: '; refusing the write (#2426)"
-        )
-
-
-def _trailer(after_marker: str) -> list[str]:
-    """The trailing Tags:/Captured: lines of the text after the value marker."""
+def _split_trailer(after_marker: str) -> tuple[list[str], bool]:
+    """(the trailing Tags:/Captured: lines of the text after the value marker,
+    whether they are unambiguous). Writers emit each trailer line once; a
+    repeated one means part of a multi-line value was read as trailer."""
     lines = after_marker.split("\n")
     trailer: list[str] = []
     while lines and lines[-1].startswith(_TRAILER_PREFIXES):
         trailer.insert(0, lines.pop())
     prefixes = [next(p for p in _TRAILER_PREFIXES if line.startswith(p)) for line in trailer]
-    if len(prefixes) != len(set(prefixes)):
-        # Writers emit each trailer line once; a repeated one means part of a
-        # multi-line value was read as trailer.
-        raise ValueError(
-            "a credential body repeats a 'Tags:' or 'Captured:' line; refusing "
-            "a value that cannot be split safely (#2426)"
-        )
-    return trailer
+    return trailer, len(prefixes) == len(set(prefixes))
+
+
+def _trailer(after_marker: str) -> list[str]:
+    """The trailing Tags:/Captured: lines of the text after the value marker."""
+    return _split_trailer(after_marker)[0]
 
 
 def _held_body(head: str, trailer: list[str], value: str = SECRET_PLACEHOLDER) -> str:
@@ -425,6 +362,20 @@ async def _held_pair(
     return pair[0] or "", pair[1], pair[2]
 
 
+def _credential(row: dict) -> bool:
+    return holds_secret(row.get("project_type"), row.get("domain"))
+
+
+def _held_row(row: dict, parsed_value: str) -> bool:
+    """Whether the row's value (and description) live in reference_secrets: a
+    credential whose body carries the placeholder, or any other reference row
+    written with a held-out value (``ingest_knowledge_unit(held_value=...)``),
+    which names it by ``secret_ref``; its body's value line is masked."""
+    if _credential(row):
+        return parsed_value == SECRET_PLACEHOLDER
+    return bool(row.get("secret_ref"))
+
+
 async def resolve_value(db: aiosqlite.Connection, row: dict) -> str | None:
     """The value of a reference row, or None when a held-out value is missing.
 
@@ -445,14 +396,12 @@ async def reveal_reference(db: aiosqlite.Connection, row: dict) -> tuple[str | N
     parses both from its body. The value is None when a held-out value is
     missing (logged as an error)."""
     parsed = parse_reference_body(row.get("body"))
-    if parsed["value"] != SECRET_PLACEHOLDER or not holds_secret(
-        row.get("project_type"), row.get("domain"),
-    ):
+    if not _held_row(row, parsed["value"]):
         return parsed["value"], parsed["description"]
     body, secret, detail = await _held_pair(db, row)
     current = parse_reference_body(body)
     if secret is None:
-        if current["value"] and current["value"] != SECRET_PLACEHOLDER:
+        if _credential(row) and current["value"] and current["value"] != SECRET_PLACEHOLDER:
             # The unit's current body carries its value inline (a row written
             # before #2426): that body's own value, never a guess.
             return current["value"], current["description"]
@@ -462,6 +411,24 @@ async def reveal_reference(db: aiosqlite.Connection, row: dict) -> tuple[str | N
     if detail is not None and description == DETAIL_PLACEHOLDER:
         description = detail
     return secret, description
+
+
+async def reveal_meta(db: aiosqlite.Connection, row: dict) -> dict | None:
+    """The caller metadata held with a credential's value (#2426): the
+    authority and provenance it was written with, purpose, ingestion source,
+    relationships, caveats, and the identifier and tags as given. Read from the
+    secret row the row names; None when none is held."""
+    from genesis.db.crud.knowledge import IDENTITY_META, get_secret_meta
+
+    text = await get_secret_meta(db, row.get("secret_ref"))
+    try:
+        meta = json.loads(text) if text else None
+    except ValueError:
+        return None
+    if isinstance(meta, dict):
+        # What the write recorded of the entry's identity is not the caller's.
+        meta.pop(IDENTITY_META, None)
+    return meta
 
 
 async def compose_body(db: aiosqlite.Connection, row: dict) -> tuple[str, bool]:
@@ -477,15 +444,13 @@ async def compose_body(db: aiosqlite.Connection, row: dict) -> tuple[str, bool]:
     """
     body = row.get("body") or ""
     idx = body.find(_VALUE_MARKER)
-    if (
-        idx == -1
-        or not holds_secret(row.get("project_type"), row.get("domain"))
-        or parse_reference_body(body)["value"] != SECRET_PLACEHOLDER
-    ):
+    if idx == -1 or not _held_row(row, parse_reference_body(body)["value"]):
         return body, False
     body, value, detail = await _held_pair(db, row)
     idx = body.find(_VALUE_MARKER)
-    if idx == -1 or parse_reference_body(body)["value"] != SECRET_PLACEHOLDER:
+    if idx == -1 or (
+        _credential(row) and parse_reference_body(body)["value"] != SECRET_PLACEHOLDER
+    ):
         # The current body is not a held-out one (no marker, or a value inline):
         # it is returned as stored, its own pair.
         return body, False

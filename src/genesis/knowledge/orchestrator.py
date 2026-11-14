@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import logging
@@ -32,6 +33,10 @@ _BACKGROUND_COMPENSATIONS: set[asyncio.Task] = set()
 
 # Module-level singleton (load_default_patterns() does filesystem I/O).
 _SANITIZER = ContentSanitizer()
+#: A distilled (non-credential) unit's concept is stored up to this long.
+_MAX_CONCEPT = 200
+#: The quality flag of a credential unit that could not be stored (by reason).
+CREDENTIAL_NOT_STORED = "credential_unit_not_stored:"
 
 
 @dataclass
@@ -261,6 +266,7 @@ class KnowledgeOrchestrator:
                     source=source,
                     content=content,
                     purpose=purpose,
+                    flags=quality_flags,
                 )
         except _CommittedBatchCloseError as exc:
             # Commit is authoritative. Finish provenance with these exact ids;
@@ -284,7 +290,9 @@ class KnowledgeOrchestrator:
                 error=f"Storage failed: {exc}",
             )
 
-        # 8. Update manifest
+        # 8. Update manifest. A credential unit that could not be stored is
+        # reported in the quality flags (``credential_unit_not_stored:<reason>``)
+        # and the source is registered as ingested.
         self._manifest.add_source(
             source,
             source_type=content.source_type,
@@ -416,8 +424,12 @@ class KnowledgeOrchestrator:
         source: str,
         content: ProcessedContent,
         purpose: list[str] | None,
+        flags: list[str] | None = None,
     ) -> list[str]:
         """Store knowledge units via the existing knowledge_ingest MCP internals.
+
+        ``flags`` (the caller's quality flags) records each credential unit that
+        could not be stored, by reason only, never its content.
 
         Uses a batch SQLite transaction with Qdrant compensation on failure:
         if anything fails mid-batch, SQLite is rolled back and any Qdrant
@@ -436,17 +448,20 @@ class KnowledgeOrchestrator:
         memory_mod._require_init()
         assert memory_mod._store is not None  # noqa: S101 - type-narrowing invariant
 
-        # #2426: a credential reference is never written by distillation. The
-        # vectors below are stored BEFORE the database rows, so the db layer's
-        # refusal would come after the value had already reached the vector
-        # store: refuse the whole batch here, before anything is written.
+        # #2426: the vectors below are stored BEFORE the database rows, so a
+        # credential unit would reach the vector store with its value. Each one
+        # goes through ingest_knowledge_unit instead, the chokepoint that holds
+        # the value out, BEFORE the rest of the batch (so no batch outcome can
+        # skip them); the batch is never refused.
         from genesis.db.crud.knowledge import holds_secret
 
-        if any(holds_secret(project_type, unit.domain) for unit in units):
-            raise ValueError(
-                "refusing to distil credential references: write them with "
-                "reference_store, which holds the value out (#2426)"
-            )
+        credential_units = [u for u in units if holds_secret(project_type, u.domain)]
+        # A credential unit's concept reaches the chokepoint whole (it masks a
+        # secret in it before its own cap); every other one is capped here.
+        units = [
+            dataclasses.replace(u, concept=u.concept[:_MAX_CONCEPT])
+            for u in units if not holds_secret(project_type, u.domain)
+        ]
 
         unit_ids: list[str] = []
         qdrant_ids: list[str] = []  # Track for compensation on failure
@@ -541,6 +556,31 @@ class KnowledgeOrchestrator:
             source_pipeline="curated",
             collection="knowledge_base",
         )
+
+        # Each credential unit is contained and tried twice; one that still
+        # fails is recorded as a quality flag by reason, never by content, and
+        # the rest of the document proceeds. A payment card number (#3172) is
+        # the one intended refusal: not retried, and recorded the same way.
+        credential_ids: list[str] = []
+        for unit in credential_units:
+            for attempt in (1, 2):
+                try:
+                    credential_ids.append(await self._store_credential_unit(
+                        memory_mod, unit, project_type=project_type, source=source,
+                        purpose=purpose, origin_class=resolved_origin,
+                    ))
+                    break
+                except Exception as exc:
+                    card = isinstance(exc, ValueError) and "payment card number" in str(exc)
+                    if attempt == 2 or card:
+                        reason = "card_number" if card else type(exc).__name__
+                        logger.warning("A distilled credential unit was not stored (%s)", reason)
+                        if flags is not None:
+                            flags.append(f"{CREDENTIAL_NOT_STORED}{reason}")
+                        break
+
+        if not units:
+            return credential_ids
 
         # PHASE 1 — every Qdrant write happens BEFORE the SQLite envelope opens,
         # and this ordering is the fix rather than a tidy-up.
@@ -788,8 +828,40 @@ class KnowledgeOrchestrator:
                 logger.warning("Connection teardown also failed after interruption: %s", exc)
                 raise postcommit_interruption from exc
             if committed:
-                raise _CommittedBatchCloseError(unit_ids) from exc
+                raise _CommittedBatchCloseError(unit_ids + credential_ids) from exc
             raise
 
+        unit_ids += credential_ids
         logger.info("Stored %d knowledge units from %s", len(unit_ids), source)
         return unit_ids
+
+    @staticmethod
+    async def _store_credential_unit(
+        memory_mod, unit, *, project_type: str, source: str,
+        purpose: list[str] | None, origin_class: str,
+    ) -> str:
+        """Store one distilled credential unit through the hold-out chokepoint."""
+        from genesis.memory.knowledge_ingest import ingest_untrusted_credential
+
+        return await ingest_untrusted_credential(
+            store=memory_mod._store,
+            db=memory_mod._db,
+            content=unit.body,
+            project=project_type,
+            domain=unit.domain,
+            authority="curated",
+            provenance={
+                "source_doc": source,
+                "source_pipeline": "curated",
+                "section_title": unit.section_title,
+                "source_date": unit.source_date,
+            },
+            concept=unit.concept,
+            tags_json=json.dumps(unit.tags) if unit.tags else None,
+            purpose=purpose,
+            ingestion_source=source,
+            confidence=unit.confidence,
+            origin_class=origin_class,
+            relationships=unit.relationships or None,
+            caveats=unit.caveats or None,
+        )

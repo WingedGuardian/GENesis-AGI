@@ -1766,6 +1766,11 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE reference_secrets ADD COLUMN detail TEXT",
         "reference_secrets.detail")
+    # And before a credential's caller metadata was held with it (#2426;
+    # migration 20261111230000_reference_secrets_meta adds the same column).
+    await _try_alter(db,
+        "ALTER TABLE reference_secrets ADD COLUMN meta TEXT",
+        "reference_secrets.meta")
     # The secret_ref triggers: no credential unit without its secret row, and a
     # secret row dies when no unit names it any more, however the unit is
     # deleted or repointed (a raw SQL delete, a cleanup script). Triggers, not a

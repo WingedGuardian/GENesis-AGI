@@ -76,6 +76,7 @@ async def run_ingest(
     filename = upload["filename"]
 
     try:
+        incomplete: str | None = None
         if mode == "store":
             unit_ids = await _store_as_is(
                 file_path, filename,
@@ -85,7 +86,7 @@ async def run_ingest(
                 context=context,
             )
         else:
-            unit_ids = await _extract_with_pipeline(
+            unit_ids, incomplete = await _extract_with_pipeline(
                 upload_id, file_path,
                 project_type=project_type,
                 domain=domain,
@@ -96,10 +97,13 @@ async def run_ingest(
         # Move file to completed directory
         _move_to_completed(file_path, upload_id)
 
+        # The stored units are kept and reported; what could not be stored is
+        # said in error_message, never dropped behind a plain success.
         await knowledge_uploads.update_status(
             rt.db, upload_id,
             status="completed",
             unit_ids=unit_ids,
+            error_message=incomplete,
         )
 
         logger.info(
@@ -155,12 +159,14 @@ async def _store_as_is(
     try:
         scan = _SANITIZER.sanitize(file_content, ContentSource.UNKNOWN)
         if scan.detected_patterns:
+            # No file name in these logs: it can carry the credential itself.
             logger.warning(
-                "Injection patterns in store-as-is upload %s: %s (risk=%.3f)",
-                filename, scan.detected_patterns, scan.risk_score,
+                "Injection patterns in store-as-is upload: %s (risk=%.3f)",
+                scan.detected_patterns, scan.risk_score,
             )
-    except Exception:
-        logger.warning("Injection scan failed for upload %s (fail-open)", filename, exc_info=True)
+    except Exception as exc:
+        # No exc_info: a traceback's message can repeat the file name or path.
+        logger.warning("Injection scan failed for a store-as-is upload (fail-open): %s", type(exc).__name__)
 
     # Use context or filename as concept
     concept = context[:200] if context else filename
@@ -180,17 +186,6 @@ async def _store_as_is(
     if context:
         tags.append("user-context")
 
-    # #2426: an uploaded file is never stored as a credential reference. The
-    # vector below is written BEFORE the database row, so refuse here, before
-    # anything is written, rather than at the db layer's refusal afterwards.
-    from genesis.db.crud.knowledge import holds_secret
-
-    if holds_secret(project_type, effective_domain):
-        raise ValueError(
-            "refusing to store an upload as a credential reference: use "
-            "reference_store, which holds the value out (#2426)"
-        )
-
     # Store to Qdrant
     # WS-3: curated ingest is external_untrusted (authority tier, not
     # authorship); derived once, mirrored to both stores.
@@ -199,6 +194,40 @@ async def _store_as_is(
     resolved_origin = derive_origin_class(
         source_pipeline="curated", collection="knowledge_base",
     )
+
+    # #2426: the vector below is written BEFORE the database row, so a
+    # credential upload goes through ingest_knowledge_unit instead, the
+    # chokepoint that holds its content out, under an identifier taken from the
+    # file name. Never refused.
+    from genesis.db.crud.knowledge import holds_secret
+
+    if holds_secret(project_type, effective_domain):
+        from genesis.memory.knowledge_ingest import ingest_untrusted_credential
+
+        unit_id = await ingest_untrusted_credential(
+            store=memory_mod._store,
+            db=memory_mod._db,
+            content=file_content,
+            # The whole file, exactly, is the held value: nothing in it is read
+            # as a body (a "Value:" or "Tags:" line inside it is just text).
+            held_value=file_content,
+            held_detail="",
+            project=project_type,
+            domain=effective_domain,
+            authority="curated",
+            provenance={"source_doc": file_path, "source_pipeline": "curated"},
+            # The WHOLE file name: the chokepoint masks a secret in it before
+            # its own cap, so a cut here could leave part of one unmasked.
+            concept=filename,
+            tags_json=json.dumps(tags),
+            purpose=purpose,
+            ingestion_source=file_path,
+            confidence=0.95,
+            origin_class=resolved_origin,
+            caveats=[f"User context: {context}"] if context else None,
+        )
+        logger.info("Stored credential upload as unit %s (held out)", unit_id)
+        return [unit_id]
     qdrant_id = await memory_mod._store.store(
         file_content,
         f"knowledge:{project_type}/{effective_domain}",
@@ -236,7 +265,7 @@ async def _store_as_is(
         _commit=True,
     )
 
-    logger.info("Stored %s as single unit %s (store-as-is mode)", filename, unit_id)
+    logger.info("Stored an upload as single unit %s (store-as-is mode)", unit_id)
     return [unit_id]
 
 
@@ -248,8 +277,9 @@ async def _extract_with_pipeline(
     domain: str,
     purpose: list[str] | None,
     context: str,
-) -> list[str]:
-    """Run the full extraction pipeline with context injection."""
+) -> tuple[list[str], str | None]:
+    """Run the full extraction pipeline with context injection: (the unit ids,
+    why the ingest is incomplete or None)."""
     from genesis.db.crud import knowledge_uploads
     from genesis.mcp.memory.knowledge import _get_orchestrator
     from genesis.runtime import GenesisRuntime
@@ -279,7 +309,18 @@ async def _extract_with_pipeline(
     if result.error:
         raise RuntimeError(result.error)
 
-    return result.unit_ids
+    from genesis.knowledge.orchestrator import CREDENTIAL_NOT_STORED
+
+    missing = [f for f in result.quality_flags if f.startswith(CREDENTIAL_NOT_STORED)]
+    incomplete = None
+    if missing:
+        reasons = ", ".join(sorted({f[len(CREDENTIAL_NOT_STORED):] for f in missing}))
+        incomplete = (
+            f"Ingest incomplete: {len(missing)} credential unit(s) could not be stored "
+            f"({reasons}); the other units were stored."
+        )
+        logger.warning("Upload %s ingested incomplete: %s", upload_id, incomplete)
+    return result.unit_ids, incomplete
 
 
 def _move_to_completed(file_path: str, upload_id: str) -> str:

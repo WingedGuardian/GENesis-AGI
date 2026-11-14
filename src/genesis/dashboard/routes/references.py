@@ -32,6 +32,7 @@ from genesis.memory.reference_ops import (
     ReferenceStoreUnavailable,
     delete_reference_entry,
     parse_reference_body,
+    reveal_meta,
     reveal_reference,
 )
 
@@ -236,7 +237,12 @@ async def references_reveal(unit_id: str):
         value, description = await reveal_reference(rt.db, row)
         if value is None:
             return jsonify({"error": "This reference's value is missing"}), 409
-        return jsonify({"id": unit_id, "value": value, "description": description})
+        payload = {"id": unit_id, "value": value, "description": description}
+        meta = await reveal_meta(rt.db, row)
+        if meta is not None:
+            # A credential's caller metadata, held with its value (#2426).
+            payload["meta"] = meta
+        return jsonify(payload)
     except Exception:
         logger.exception("Reference reveal failed")
         return jsonify({"error": "Reveal failed"}), 500
