@@ -119,6 +119,29 @@ def test_merge_options_keeps_ids_so_no_card_loses_its_value():
     assert "Todo" not in [o["name"] for o in dropped]
 
 
+def test_build_column_is_added_between_ready_and_in_progress_without_touching_cards():
+    """A board set up before the Build column gains it in place: every existing
+    option keeps its id (no card loses its value) and Build is sent new."""
+    names = ["Proposed", "Ready", "In Progress", "In Review", "Done", "Todo"]
+    existing = [
+        {"id": f"id-{i}", "name": n, "color": "GRAY", "description": ""}
+        for i, n in enumerate(names)
+    ]
+    merged = pv.merge_options(existing, pv.STATUS_OPTIONS, keep_unlisted=True)
+    assert [o["name"] for o in merged] == [
+        "Proposed",
+        "Ready",
+        "Build",
+        "In Progress",
+        "In Review",
+        "Done",
+        "Todo",
+    ]
+    by_name = {o["name"]: o for o in merged}
+    assert "id" not in by_name["Build"], "the new column is created, not renamed from another"
+    assert all(by_name[n]["id"] == f"id-{i}" for i, n in enumerate(names))
+
+
 def test_options_literal_escapes_strings_and_rejects_bad_colors():
     lit = pv._options_literal([{"name": 'x" } evil: {', "color": "RED", "description": "d\n"}])
     assert '"x\\" } evil: {"' in lit, "a quote cannot break out of its string slot"
