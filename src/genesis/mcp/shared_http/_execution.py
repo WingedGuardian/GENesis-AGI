@@ -10,6 +10,7 @@ from mcp import MCPError
 
 from genesis.caller_context import request_caller
 from genesis.mcp.external_profiles import ExternalProfile, current_external_profile
+from genesis.mcp.plan_bookmark_context import PENDING_ENDPOINT, request_pending_bookmark
 from genesis.mcp.shared_paths import FORWARDER_ENDPOINT, SharedPathError, request_paths
 from genesis.observability.mcp_middleware import InstrumentationMiddleware
 from genesis.observability.provider_activity import suppress_activity_persistence
@@ -83,8 +84,10 @@ class SharedMessages(Middleware):
             active = context.fastmcp_context.request_context if context.fastmcp_context is not None else None
             with request_paths(self.service, context.message.name, context.message.arguments,
                                active.meta if active is not None else None,
-                               versioned=get_http_request().url.path == FORWARDER_ENDPOINT,
-                               metadata_available=active is not None):
+                               versioned=get_http_request().url.path in {FORWARDER_ENDPOINT, PENDING_ENDPOINT},
+                               metadata_available=active is not None), request_pending_bookmark(
+                    self.service, caller, active.meta if active is not None else None,
+                    versioned=get_http_request().url.path == PENDING_ENDPOINT):
                 return await call_next(context)
         except SharedPathError as error:
             raise ToolError(str(error)) from None

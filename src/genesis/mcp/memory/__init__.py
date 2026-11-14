@@ -165,10 +165,14 @@ def _require_init() -> None:
     if _store is None or _retriever is None or _db is None:
         raise RuntimeError("memory-mcp not initialized — call init() first")
 
-    pending_file = _PLAN_BOOKMARK_PENDING
+    from genesis.mcp.plan_bookmark_context import current_pending_bookmark
+
+    pending_file = current_pending_bookmark()
+    if pending_file is None and _process_pending_bookmarks:
+        pending_file = _PLAN_BOOKMARK_PENDING
     # Preserve main's audit-label exclusion; native/environment parity still
     # requires integration with its caller-context accessor (#4112/#4131).
-    if _process_pending_bookmarks and not caller_context().profile and pending_file.exists():
+    if pending_file is not None and not caller_context().profile and pending_file.exists():
         from genesis.db.request_database import DatabaseScopeError, spawn_database_task
 
         # The marker is consumed only by an accepted job; retry next call.

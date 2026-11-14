@@ -1,0 +1,1 @@
+- Shared memory can accept an explicit pending plan-bookmark file from an authenticated forwarder after validating tool arguments. Opting-in peers require the matching capability and use the same server's `/mcp/v2` endpoint so a pre-contract backend refuses execution after rollback. Shared defaults and ordinary registrations remain unchanged.

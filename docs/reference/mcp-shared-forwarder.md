@@ -16,6 +16,26 @@ The ordinary health executable also has the inactive health-read consumer
 described below. This is one increment toward the complete four-service union;
 the explicit CLI above remains shared-only.
 
+The internal memory `RemotePeer` accepts an optional `pending_file` for the
+caller bookmark contract. Default peers, including the explicit CLI and health
+frontend, add no bookmark metadata or feature requirement. An opting-in memory
+peer validates its path and requires exact integer
+`plan_bookmark_pending_version: 1` from authenticated `/status` on every
+connection generation, alongside existing service/transport/catalog checks.
+Missing, mismatched or wrongly typed capability refuses before tool dispatch
+when a logical generation is created. Opted-in peers also use memory's
+`/mcp/v2` endpoint for requests, notifications and session cleanup, even when
+no pending file currently exists. The same backend transport and resource owner
+serve it. A pre-contract server without this route refuses the actual request
+after an idle backend replacement; the client never falls back to `/mcp/v1`.
+The payload version remains1. Default peers retain `/mcp/v1`. This route fences
+the bookmark execution contract; dynamic catalog equality remains only a
+logical-generation preflight. Only `tools/call` gains the reserved
+`genesis/planBookmarkPending` metadata, with arguments, IDs and other metadata
+preserved. A client-supplied reserved key refuses before network activity.
+The ordinary memory frontend is the next consumer; this increment does not
+select it or expand credentials. See [shared HTTP](shared-mcp-http.md).
+
 The ordinary launcher exposes internal `_prepare_health` and `_prepare_memory`
 helpers for managed consumers. Its existing `_bootstrap_health` and
 `_bootstrap_memory` wrappers immediately run the returned module server with
@@ -107,8 +127,9 @@ path; an unqualified explicit forwarder refuses before opening its transport.
 ## Caller files and backend compatibility
 
 The trusted service URL still ends in `/mcp`. The forwarder derives `/mcp/v1`
-for every HTTP generation and cleanup request. Both routes use the same server,
-SDK session manager and limits. An older backend without the versioned endpoint
+for default HTTP generations and cleanup requests. Opted-in pending-bookmark
+memory peers use `/mcp/v2` instead. These routes use the same server, SDK session
+manager and limits. An older backend without the versioned endpoint
 refuses the connection before a tool runs; the frontend never downgrades or
 resends a tool call after rollback.
 

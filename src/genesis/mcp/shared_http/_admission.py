@@ -8,6 +8,7 @@ from mcp_types import jsonrpc_message_adapter
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import Response
 
+from genesis.mcp.plan_bookmark_context import PENDING_ENDPOINT
 from genesis.mcp.shared_paths import BASE_ENDPOINT, FORWARDER_ENDPOINT
 
 
@@ -80,7 +81,7 @@ class EnvelopeGuard:
 
     async def __call__(self, scope, receive, send):
         if (scope["type"] != "http" or scope["method"] != "POST"
-                or scope["path"] not in {BASE_ENDPOINT, FORWARDER_ENDPOINT}):
+                or scope["path"] not in {BASE_ENDPOINT, FORWARDER_ENDPOINT, PENDING_ENDPOINT}):
             return await self.app(scope, receive, send)
         try:
             body = await Request(scope, receive).body()
