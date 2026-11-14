@@ -313,6 +313,27 @@ class TestClassifyCredentialPair:
         assert ref["kind"] == "credentials"
         assert ref["value"] == "password: secret123"
 
+    @pytest.mark.parametrize(
+        "label", ["password", "pass", "pwd"]
+    )
+    def test_label_only_overlap_captures_password(self, label):
+        # A rejected lifecycle account token that is ONLY a label
+        # ("password:" after "created account") must not swallow the
+        # password that follows it: the overlap check compares the
+        # credential VALUE span, not the whole single-pattern match,
+        # so the label overlap does not exclude "secret123"
+        # (CodeRabbit round 5 on PR #4473).
+        ext = Extraction(
+            content=f"created account {label}: secret123",
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == "password: secret123"
+
     def test_copula_separator_value_rejected(self):
         # A value that IS a copula word followed by ":" ("is:secret123")
         # is a repeated label with nothing left to retry from, so nothing

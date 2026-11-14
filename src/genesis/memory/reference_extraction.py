@@ -354,15 +354,19 @@ def _rejected_lifecycle_account_spans(content: str) -> list[tuple[int, int]]:
 def _first_single_credential(
     content: str, *, exclude_spans: list[tuple[int, int]] = (),
 ) -> re.Match | None:
-    """First single-credential match not overlapping an excluded span.
+    """First single-credential match whose VALUE does not overlap an excluded span.
 
     The single pattern's leftmost match can sit inside a lifecycle account
     token the lifecycle branch already rejected ("pass:admin" after
     "created account"); such a match is the account, not a password, so it
-    is skipped and the next match is tried.
+    is skipped and the next match is tried. The overlap is checked on the
+    credential VALUE span, not the whole match: a rejected account token
+    that is only a label ("password:" after "created account") overlaps
+    the match's label but not its value, so the password that follows it
+    ("secret123") is still captured.
     """
     for match in _SINGLE_CREDENTIAL_PATTERN.finditer(content):
-        start, end = match.span()
+        start, end = match.span("value")
         if any(
             start < span_end and span_start < end
             for span_start, span_end in exclude_spans
