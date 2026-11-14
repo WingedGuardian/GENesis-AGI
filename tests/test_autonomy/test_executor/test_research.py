@@ -219,7 +219,7 @@ class TestResearchSession:
         assert "required research method" in result.clues
         invoker.run.assert_not_awaited()
 
-    async def test_session_finds_approach(self) -> None:
+    async def test_session_finds_approach(self, tmp_path) -> None:
         output = FakeCCOutput(
             text='Some analysis...\n```json\n{"found": true, "approach": "Use library X version 2.0 which fixes this bug", "sources": ["https://github.com/lib/issues/123"], "clues": null, "concrete_blockers": []}\n```',
         )
@@ -241,6 +241,7 @@ class TestResearchSession:
         assert result.session_id == "ses-research-001"
 
         invocation = invoker.run.await_args.args[0]
+        assert Path(invocation.mcp_config).is_relative_to(tmp_path)
         assert "Evidence standard" in (invocation.system_prompt or "")
         assert '"genesis-recon"' in Path(invocation.mcp_config).read_text()
         assert "mcp__genesis-recon__recon_store_finding" in invocation.disallowed_tools

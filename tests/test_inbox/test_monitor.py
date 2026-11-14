@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -163,7 +164,7 @@ def test_set_build_lane_wires_hook(monitor):
 
 @pytest.mark.asyncio
 async def test_silently_omitted_url_requeues_not_baselines(
-    monitor, inbox_dir, db, mock_invoker, mock_session_manager
+    monitor, inbox_dir, db, mock_invoker, mock_session_manager, tmp_path,
 ):
     """An evaluation that never MENTIONS one of its URLs must not complete.
 
@@ -192,6 +193,11 @@ async def test_silently_omitted_url_requeues_not_baselines(
 
     await monitor.check_once()
 
+    mcp_path = Path(mock_invoker.run.await_args.args[0].mcp_config)
+    assert mcp_path.is_relative_to(tmp_path)
+    assert set(json.loads(mcp_path.read_text())["mcpServers"]) == {
+        "genesis-health", "genesis-memory",
+    }
     row = await inbox_items.get_by_file_path(db, str(f))
     assert row["status"] == "failed"
     assert row["error_message"].startswith("partial_url_failure")
