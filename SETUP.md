@@ -334,6 +334,14 @@ systemctl --user start genesis-backup.service   # fire one run now
 cat ~/.genesis/backup_status.json               # expect "success":true
 ```
 
+Every run proves its SQLite copy restores by rebuilding the database from it, in
+memory when there is room and on disk otherwise. An on-disk rebuild writes a full
+copy of the database in a few minutes, which can stall a shared or spinning disk.
+So when memory is short, the scheduled unit (and the dashboard's Run-Now) first
+waits for it, re-checking every 10 minutes for up to an hour, and the log says so;
+the backup then runs either way. The pre-update backup `update.sh` runs never
+waits. The knobs are under "Restore check" in `secrets.env.example`.
+
 The service runs backup.sh at the lowest best-effort I/O priority
 (`IOSchedulingClass=best-effort`, `IOSchedulingPriority=7`). The priority is
 per process and every tool the script starts inherits it. Only an I/O scheduler

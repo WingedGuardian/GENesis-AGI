@@ -672,6 +672,20 @@ class TestBackupAlertGate:
         alerts = await self._alerts(monkeypatch, tmp_path, status=None, enabled=True)
         assert [a for a in alerts if a["id"] == "backup:not_configured"]
 
+    @pytest.mark.parametrize(("age_h", "overdue"), [(8.5, False), (9.5, True)])
+    async def test_overdue_allows_the_verify_memory_wait(
+        self, monkeypatch, tmp_path, age_h, overdue
+    ):
+        """A run may wait up to 1 h for verify memory before it starts, so the
+        6 h schedule's grace is 1 h + 2 h: 8.5 h is a run still in progress."""
+        from datetime import UTC, datetime, timedelta
+
+        ts = (datetime.now(UTC) - timedelta(hours=age_h)).isoformat()
+        alerts = await self._alerts(
+            monkeypatch, tmp_path, status={"timestamp": ts, "success": True}, enabled=True,
+        )
+        assert bool([a for a in alerts if a["id"] == "backup:overdue"]) is overdue
+
 
 class TestBackupsEnabledHelper:
     """_backups_enabled: env first (server process), secrets.env file as
