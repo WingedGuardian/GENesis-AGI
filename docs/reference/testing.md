@@ -461,7 +461,7 @@ after graceful shutdown in this qualified version, so the backend check requires
 the expected signal exit together with completed SDK/drain/resource events.
 They neither contact a native client/provider nor activate routing.
 Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
-and a floor of 496 cases. Installation, collection, test or report-check failure
+and a floor of 509 cases. Installation, collection, test or report-check failure
 fails the job; missing or filtered workflow runs do not qualify a PR. Closing
 checks its actual head/base result. Ordinary skip-budget changes require observed
 skip identities; this workflow does not raise that budget automatically.
@@ -552,6 +552,12 @@ memory guard and bookmark SQLite index, caller/server decoys, rejected arguments
 static credentials, labelled forwarders and distinct overlapping inputs.
 `test_plan_bookmark_peer.py` runs the actual RemotePeer dispatcher over an owned
 TCP service for both protocol eras, reserved-key refusal, default opt-out, and
-missing/wrong capability on initial and replacement generations. Providers,
+missing/wrong capability on initial and explicitly recreated generations.
+It checks opted peers use `/mcp/v2` for both protocol eras, legacy GET/DELETE,
+default v1 opt-out, and cached-generation refusal when the execution route is
+removed. HTTP cases retain raw envelope, auth, authority and body limits on v2;
+actual ingestion E2E also checks caller-file identity through that route.
+Backend process replacement needs a separate real-process control/counterexample,
+not only explicit `RemotePeer.close()`. Providers,
 vectors and extraction remain synthetic. This qualifies the explicit contract,
 not the still-unwired ordinary memory frontend or native environment-label path.

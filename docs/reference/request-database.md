@@ -275,7 +275,7 @@ RequestDatabase cancellation before the helper starts, including background-unit
 wait, closes the unstarted coroutine and leaves its input untouched. Shared
 resource drain evidence does not qualify the retained ordinary memory
 lifespan's local task shutdown. Shared initialization still disables default
-pending bookmarks. An authenticated, versioned memory forwarder may explicitly
+pending bookmarks. An authenticated memory forwarder on `/mcp/v2` may explicitly
 supply its caller path through the request contract in
 [shared-mcp-http.md](shared-mcp-http.md). The guard captures that input for the
 accepted job; static, labelled, absent-metadata and lost-scope requests do not

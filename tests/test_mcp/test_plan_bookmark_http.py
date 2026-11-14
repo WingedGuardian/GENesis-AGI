@@ -98,7 +98,7 @@ async def bookmark_http(bookmark_app):
         yield runtime
 
 
-async def call(runtime, *, metadata=None, arguments=None, endpoint="/mcp/v1", headers=None):
+async def call(runtime, *, metadata=None, arguments=None, endpoint="/mcp/v2", headers=None):
     return await runtime.client.post(endpoint,
         headers={"mcp-method": "tools/call", "mcp-name": "procedure_recall", **(headers or {})},
         json={"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
@@ -135,7 +135,7 @@ async def test_authenticated_dispatched_requests_preserve_bookmark_effect(bookma
     assert not runtime.pending.exists() and runtime.decoy.exists()
 
 
-@pytest.mark.parametrize("reason", ["absent", "invalid-arguments", "old-endpoint", "external", "validator", "invalid-auth", "labelled-forwarder"])
+@pytest.mark.parametrize("reason", ["absent", "invalid-arguments", "old-endpoint", "v1-endpoint", "external", "validator", "invalid-auth", "labelled-forwarder"])
 async def test_ineligible_or_invalid_calls_do_not_consume_either_marker(bookmark_http, reason):
     runtime = bookmark_http
     options = {"metadata": {KEY: {"version": 1, "path": str(runtime.pending)}}}
@@ -145,6 +145,8 @@ async def test_ineligible_or_invalid_calls_do_not_consume_either_marker(bookmark
         options["arguments"] = {}
     elif reason == "old-endpoint":
         options["endpoint"] = "/mcp"
+    elif reason == "v1-endpoint":
+        options["endpoint"] = "/mcp/v1"
     elif reason in {"external", "validator"}:
         runtime.client.headers.pop("X-Genesis-Caller")
         options["headers"] = {"Authorization": "Bearer " + reason[0] * 43}
@@ -152,8 +154,9 @@ async def test_ineligible_or_invalid_calls_do_not_consume_either_marker(bookmark
         options["headers"] = {"Authorization": "Bearer invalid"}
     else:
         options["headers"] = {"X-Genesis-Caller": json.dumps({"dispatched": False, "supervised": False, "profile": "codex"})}
-    if reason in {"external", "validator"}:
-        baseline = await call(runtime, headers=options["headers"])
+    if reason in {"external", "validator", "old-endpoint", "v1-endpoint"}:
+        baseline = await call(runtime, endpoint=options.get("endpoint", "/mcp/v2"),
+                              headers=options.get("headers"))
         assert baseline.status_code == 200 and not unpack(baseline)["result"].get("isError")
         assert await settled(runtime) == []
         assert runtime.pending.exists() and runtime.decoy.exists()
@@ -225,3 +228,45 @@ async def test_overlapping_requests_keep_distinct_inputs(bookmark_http, tmp_path
     assert not runtime.pending.exists() and not other.exists() and runtime.decoy.exists()
     assert not unpack(await call(runtime))["result"].get("isError")
     assert len(await settled(runtime)) == 2 and runtime.decoy.exists()
+
+
+@pytest.mark.parametrize("kind", ["bool-id", "numeric-text-id", "duplicate-id", "duplicate-meta", "task"])
+async def test_bookmark_endpoint_preserves_raw_envelope_admission(bookmark_http, kind):
+    runtime = bookmark_http
+    assert not unpack(await call(runtime))["result"].get("isError")
+    params = {"name": "procedure_recall", "arguments": {"task_description": "synthetic-task"},
+              "_meta": {**META, KEY: {"version": 1, "path": str(runtime.pending)}}}
+    request = {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": params}
+    if kind in {"bool-id", "numeric-text-id"}:
+        request["id"] = True if kind == "bool-id" else "3"
+    elif kind == "task":
+        params["task"] = {"ttl": 1000}
+    body = json.dumps(request, separators=(",", ":"))
+    if kind == "duplicate-id":
+        body = body.replace('"id":3', '"id":3,"id":4')
+    elif kind == "duplicate-meta":
+        body = body.replace('"_meta":{', '"_meta":{},"_meta":{')
+    response = await runtime.client.post("/mcp/v2", content=body,
+        headers={"Content-Type": "application/json", "mcp-method": "tools/call", "mcp-name": "procedure_recall"})
+    assert response.status_code == 400 and response.text == "Invalid MCP envelope"
+    assert await settled(runtime) == []
+    assert runtime.pending.exists() and runtime.decoy.exists()
+
+
+@pytest.mark.parametrize("kind,code", [("auth", 401), ("host", 421), ("origin", 403), ("body", 413)])
+async def test_bookmark_endpoint_preserves_outer_admission(bookmark_http, kind, code):
+    runtime = bookmark_http
+    assert not unpack(await call(runtime))["result"].get("isError")
+    headers = {"auth": {"Authorization": "Bearer invalid"}, "host": {"Host": "example.invalid"},
+               "origin": {"Origin": "http://example.invalid"}, "body": {}}[kind]
+    arguments = {"task_description": "x" * runtime.config.max_body_bytes} if kind == "body" else None
+    response = await call(runtime, headers=headers, arguments=arguments,
+                          metadata={KEY: {"version": 1, "path": str(runtime.pending)}})
+    assert response.status_code == code
+    assert await settled(runtime) == []
+    assert runtime.pending.exists() and runtime.decoy.exists()
+
+
+async def test_health_has_no_bookmark_execution_endpoint(runtime):
+    assert (await runtime.client.get("/mcp/v2")).status_code == 404
+    assert runtime.state.calls == 0

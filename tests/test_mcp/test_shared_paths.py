@@ -156,6 +156,24 @@ async def test_actual_ingestion_keeps_caller_file_and_source_identity(tmp_path, 
             assert reply["result"]["structuredContent"]["source"] == actual_path
             assert json.loads(events.read_text().splitlines()[-1]) == {
                 "event": "distill", "text": "CALLER fixture", "source": actual_path}
+            # The bookmark execution alias must retain the existing immediate
+            # caller-file/original-identity contract on the same backend.
+            request = frame("v2-file-identity", "tools/call", name="knowledge_ingest_source",
+                            arguments={"source": actual_path, "project_type": "synthetic"})
+            request["params"]["_meta"]["genesis/callerPath"] = valid
+            async with httpx.AsyncClient(trust_env=False, headers={
+                **headers, "Accept": "application/json, text/event-stream",
+                "MCP-Protocol-Version": "2026-07-28", "mcp-method": "tools/call",
+                "mcp-name": "knowledge_ingest_source",
+            }) as control:
+                response = await control.post(f"http://127.0.0.1:{install.port}/mcp/v2", json=request)
+            assert response.status_code == 200
+            reply = unpack(response)
+            assert not reply["result"].get("isError"), reply
+            assert reply["result"]["structuredContent"]["source"] == valid["original"]
+            (tmp_path / "v2-file-identity.json").write_text(json.dumps({
+                "status": response.status_code, "reply": reply, "identity": valid,
+            }, indent=2))
             (tmp_path / "path-refusals.json").write_text(json.dumps(refused, indent=2))
             frontend.stdin.close()
             assert await asyncio.wait_for(frontend.wait(), 30) == 0

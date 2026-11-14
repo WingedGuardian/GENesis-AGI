@@ -9,6 +9,7 @@ from genesis.mcp.shared_paths import SharedPathError
 
 PENDING_META = "genesis/planBookmarkPending"
 PENDING_VERSION = 1
+PENDING_ENDPOINT = "/mcp/v2"
 _SCOPE: ContextVar[tuple | None] = ContextVar("genesis_plan_bookmark_input", default=None)
 
 

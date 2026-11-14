@@ -17,7 +17,7 @@ from genesis.caller_context import enter_shared_service
 from genesis.db.crud.update_history import last_successful_update
 from genesis.db.request_database import RequestDatabase
 from genesis.mcp.external_profiles import ExternalProfileMiddleware
-from genesis.mcp.plan_bookmark_context import PENDING_VERSION
+from genesis.mcp.plan_bookmark_context import PENDING_ENDPOINT, PENDING_VERSION
 from genesis.mcp.shared_paths import FORWARDER_ENDPOINT
 from genesis.observability.commit_identity import is_stale
 from genesis.observability.mcp_middleware import InstrumentationMiddleware
@@ -109,6 +109,8 @@ async def build_http_app(server, *, config, resolver, database, tracker,
     app = create_base_app(
         routes=[Route("/mcp", transport, methods=["GET", "POST", "DELETE"]),
                 Route(FORWARDER_ENDPOINT, transport, methods=["GET", "POST", "DELETE"]),
+                *([Route(PENDING_ENDPOINT, transport, methods=["GET", "POST", "DELETE"])]
+                  if config.service == "memory" else []),
                 Route("/status", status, methods=["GET", "HEAD"])],
         middleware=[Middleware(ExactAuthority, authority=config.authority, origin=config.origin),
                     *auth.get_middleware(), Middleware(RequireAuthMiddleware, required_scopes=[]),

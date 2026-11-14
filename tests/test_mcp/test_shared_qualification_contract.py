@@ -129,6 +129,6 @@ def test_protocol_step_is_strict_complete_and_has_no_skip_escape():
     assert "tests/test_mcp/test_plan_bookmark_context.py" in protocol
     assert protocol.index("rm -f junit-shared-mcp.xml") < protocol.index("-m pytest")
     check = next(command for command in commands if "scripts/check_skip_ceiling.py" in command)
-    assert "junit-shared-mcp.xml --ceiling 0 --min-collected 496" in check
+    assert "junit-shared-mcp.xml --ceiling 0 --min-collected 509" in check
     assert not job.get("continue-on-error")
     assert not any(step.get("continue-on-error") for step in job["steps"])

@@ -27,9 +27,10 @@ cancellation. It does not guarantee all HTTP handlers finish before resource
 shutdown; the resource-owner contract is a separate bootstrap obligation.
 
 An app-wide SDK-backed exact Host/Origin guard precedes bearer authentication.
-P3 authentication covers `/status` GET/HEAD and both `/mcp` and `/mcp/v1`
-GET/POST/DELETE. The versioned route binds the forwarder's caller-file contract;
-it points at the same transport and manager, with the same session cap and
+P3 authentication covers `/status` GET/HEAD and `/mcp`, `/mcp/v1`, and memory's
+`/mcp/v2` GET/POST/DELETE. Both versioned routes bind the caller-file contract;
+v2 additionally admits the pending-bookmark contract. They point at the same
+transport and manager, with the same session cap and
 authenticated principal. Body limits
 and raw-envelope admission follow authentication. Duplicate structural JSON
 fields, nonfinite constants, batches and IDs colliding under the qualified SDK's
@@ -82,17 +83,20 @@ The version must be an integer, the path absolute without NUL, and its final
 filename and parent must be `plan_bookmark_pending.json` and `.genesis`.
 Validation is lexical; it does not resolve or read files. The path supplies
 input, not authority: only an authenticated P3 forwarder with no profile on
-`/mcp/v1` can supply it. Static credentials and the old endpoint refuse this
+`/mcp/v2` can supply it. Static credentials and the old endpoint refuse this
 reserved metadata. Absent metadata retains shared opt-out. The binding resets
 on exit/cancellation and is usable only with its captured authenticated caller.
 SDK argument validation precedes the actual memory guard and background job.
 Shared initialization remains `process_pending_bookmarks=False`, so lost scope
 never falls back to the server's pending file. Jobs capture the path and its
-sibling session directory before detaching. Capability advertisement and the
-peer's logical-generation check do not fence an idle modern HTTP peer against
-backend replacement: a pre-contract server may still accept `/mcp/v1` and omit
-the bookmark effect. The dependent consumer remains blocked until the executing
-request is bound to this contract. Ordinary memory routing is a later
+sibling session directory before detaching. Memory alone serves `/mcp/v2`
+through the same transport, manager, authority/authentication, body/envelope
+checks and tool/session limits. Opted-in peers always use this endpoint;
+a pre-contract backend without it refuses execution even if a modern idle peer
+retains its logical generation across replacement. Base and `/mcp/v1` reads
+without pending metadata remain supported, but refuse that reserved key.
+The payload stays version1 and catalog equality stays generation-scoped.
+Ordinary memory routing is a later
 consumer; this contract changes no registrations or rollout defaults.
 
 Targeted tests: pure `test_shared_http_settings.py`; qualified

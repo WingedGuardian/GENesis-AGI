@@ -85,7 +85,7 @@ Updated readers serialize read/unlink with a fixed adjacent lock, released befor
 bookmark creation awaits. Old readers and the hook writer do not cooperate;
 partial/overlapping writes and crash loss remain existing limitations (#3064).
 The shared factory still disables default pending consumption. Authenticated
-unlabelled memory forwarders on `/mcp/v1` may supply the version1 explicit
+unlabelled memory forwarders on `/mcp/v2` may supply the version1 explicit
 pending path, bound to that caller and reset per request. The memory peer's
 optional input requires the exact advertised capability on each generation;
 static/labelled/absent-metadata/lost-scope callers gain no server-file fallback.
@@ -1668,8 +1668,11 @@ connection and middleware to forward the five health-floor calls. It preserves
 the full advertised local catalog and ordinary argv; selection reuses P7's
 current configuration/readiness, with the ceiling still off. Whole-catalog
 revision checks guard new remote generations. The optional memory peer also
-requires the version1 pending-bookmark capability on every generation, using
-authenticated explicit caller input only. Ordinary memory routing, the final local
+requires the version1 pending-bookmark capability on every generation and uses
+memory-only `/mcp/v2` for execution, using authenticated explicit caller input
+only. Default peers keep `/mcp/v1`; all aliases share one transport/resource owner.
+An older backend without v2 refuses the actual request after idle replacement;
+whole-catalog equality remains a generation preflight. Ordinary memory routing, the final local
 health owner and remaining stages are incomplete; native-client checks and
 matched measurements still gate registration changes. This does not reverify the
 whole entry on main; that landing-dependent obligation remains tracked in#4232. See

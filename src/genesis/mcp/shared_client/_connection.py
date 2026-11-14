@@ -13,7 +13,12 @@ from mcp.shared.exceptions import MCPError
 from mcp.shared.jsonrpc_dispatcher import JSONRPCDispatcher
 from mcp_types import CONNECTION_CLOSED, INTERNAL_ERROR, INVALID_REQUEST, PARSE_ERROR
 
-from genesis.mcp.plan_bookmark_context import PENDING_VERSION, pending_path, prepare_pending_params
+from genesis.mcp.plan_bookmark_context import (
+    PENDING_ENDPOINT,
+    PENDING_VERSION,
+    pending_path,
+    prepare_pending_params,
+)
 from genesis.mcp.shared_paths import forwarder_url, prepare_params
 
 logger = logging.getLogger(__name__)
@@ -74,6 +79,8 @@ class RemotePeer:
             raise ValueError("Pending bookmarks require a memory peer")
         self.pending_file = (pending_path({"version": PENDING_VERSION, "path": str(pending_file)})
                              if pending_file is not None else None)
+        if self.pending_file is not None:
+            self.url = settings.http.origin + PENDING_ENDPOINT
 
     def arm_initialize(self):
         if self.negotiation is not None and not self.negotiation.done.is_set():
