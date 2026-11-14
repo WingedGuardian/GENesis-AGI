@@ -21,10 +21,9 @@ The closed version-3 plan uses `protocol: "bounded_continuation_v1"`. It binds:
   `manifest` per model. Full current campaign validation still applies,
   including every repetition and the explicit incumbent sample when present.
 - Ordered `histories` entries, each containing `directory`, `journal_sha256`,
-  `manifest_hash` and `closure`. This tranche requires null closure and refuses
-  every bounded-study child marker, including a malformed/null marker. The
-  dependent controller tranche must add its child reader and complete sibling
-  financial census together with the writer and closure lifecycle tests.
+  `manifest_hash` and `closure`. Legacy journals use null closure. Bounded-study
+  children require the hash-bound owner and complete sibling/ancestor census
+  described in `qualification-continuation.md`; malformed child markers refuse.
 - A finite `expense_evidence` list. Each auxiliary GET body binds `path`,
   `sha256`, `journal_sha256`, `attempt`, `request_hash`, `generation_id`,
   `model` and `provider`. Its model must match the frozen receipt namespace.
@@ -76,11 +75,10 @@ logical responses. Model quality, sampled incumbent scope and unknown expenses
 remain separate. Synthetic embeddings/extraction establish storage integration
 only.
 
-This read-only tranche reports an inherited prefix and always retains an
-incomplete overall study status without verified study closure. An existing
-`study_root`, even empty, prevents a fresh acquisition admission. Root/child
-inspection during bounded acquisition and verified terminal reporting belong to
-the dependent controller tranche; these commands cannot resume acquisition.
+An inherited prefix retains incomplete overall study status without verified
+study closure. An existing `study_root`, even empty, prevents fresh acquisition.
+Both readers include the current root's physical children; closure certification
+and financial completeness remain separate. These commands cannot resume acquisition.
 The existing `check`, `run` and `report` commands keep their original contracts.
 Keep plans, approvals, raw responses and journals private under the existing
 qualification evidence retention/backup convention.
