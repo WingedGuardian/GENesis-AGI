@@ -176,6 +176,128 @@ class TestClassifyCredentialPair:
         assert ref["kind"] == "credentials"
         assert ref["value"] == "admin / secret123"
 
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            # CodeRabbit (round 3): a compact repeated label — a label
+            # word followed directly by ":" or "=" — is not a login. The
+            # pair branch retries from the second label and captures the
+            # real login ("login is username:admin, password:secret123"
+            # → "admin / secret123").
+            (
+                "login is username:admin, password:secret123",
+                "admin / secret123",
+            ),
+            (
+                "login is username=admin, password:secret123",
+                "admin / secret123",
+            ),
+            (
+                "login is user:admin, password:secret123",
+                "admin / secret123",
+            ),
+        ],
+    )
+    def test_compact_repeated_label_pair_captures_real_login(
+        self, content, expected
+    ):
+        ext = Extraction(
+            content=content,
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == expected
+
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            # Same compact-label rule on the other patterns sharing
+            # _EXCLUDED_VALUE: the repeated label is skipped and the real
+            # value is captured.
+            (
+                "the password is password:secret123",
+                "password: secret123",
+            ),
+            (
+                "email bob@example.com and password is pass:secret123",
+                "bob@example.com / secret123",
+            ),
+            (
+                "created account admin with password is pass:secret123",
+                "admin / secret123",
+            ),
+        ],
+    )
+    def test_compact_repeated_label_other_patterns(
+        self, content, expected
+    ):
+        ext = Extraction(
+            content=content,
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == expected
+
+    @pytest.mark.parametrize("label", ["handle", "account", "email"])
+    def test_compact_repeated_label_lifecycle_account_falls_through(
+        self, label
+    ):
+        # A compact label in the lifecycle ACCOUNT slot ("handle:admin")
+        # is rejected by the same rule on _EXCLUDED_ACCOUNT; the pattern
+        # fails and falls through to the single-password capture.
+        # ("pass"/"pwd"/"password" as the account word are excluded here:
+        # the single-pattern fallthrough then reads "pass:admin" as a
+        # password label and returns "password: admin" — pre-existing
+        # leftmost-match behaviour of the single branch, out of scope.)
+        ext = Extraction(
+            content=(
+                f"created account {label}:admin "
+                "with password: secret123"
+            ),
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == "password: secret123"
+
+    def test_copula_separator_value_rejected(self):
+        # A value that IS a copula word followed by ":" ("is:secret123")
+        # is a repeated label with nothing left to retry from, so nothing
+        # is captured — the same rejection class as a bare "is".
+        ext = Extraction(
+            content="the password is is:secret123 for the vault",
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        assert classify_as_reference(ext) is None
+
+    def test_label_separator_password_is_rejected_tradeoff(self):
+        # Accepted trade-off (CodeRabbit on PR #4473): a credential that
+        # literally starts with a label word followed by ":" or "=" —
+        # here a password that really is "user:abc123" — is rejected on
+        # these paths, because the separator shape is indistinguishable
+        # from a repeated label. Locked in so a future round re-admitting
+        # it has to decide consciously.
+        ext = Extraction(
+            content="the password is user:abc123 for the vault",
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        assert classify_as_reference(ext) is None
+
     def test_rejects_ephemeral_example(self):
         ext = Extraction(
             content="For example, the username: test password: secret would work",

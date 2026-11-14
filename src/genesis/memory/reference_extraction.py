@@ -69,14 +69,20 @@ _LABEL_WORDS = r"(?:user(?:name)?|login|pass(?:word)?|pwd|email|handle|account)"
 # captured as a value on this path (a password literally "password" was
 # already un-capturable). Copulas are far more often separators than values.
 _COPULA_WORDS = r"(?:is|are|was|were)"
-# A value is rejected as a bare label/copula only when the excluded word is
-# the WHOLE value token, ignoring trailing punctuation: the word followed by
-# a punctuation-only tail and then a token end (whitespace, ","/";", or end
-# of string). A plain "\b" also fires before punctuation, which wrongly
-# rejected values that merely START with a label/copula word — e.g.
-# "Is!Secure987" / "Password!Secure987" (Codex P2 on PR #4473): the "!" is
-# followed by more word chars, so the token is not the bare word.
-_EXCLUDED_VALUE = rf"(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS})[^\s,;\w]*(?=[\s,;]|$))"
+# A value is rejected as a bare label/copula when the excluded word is the
+# WHOLE value token, ignoring trailing punctuation: the word followed by a
+# punctuation-only tail and then a token end (whitespace, ","/";", or end of
+# string) — or when it is followed directly by ":" or "=", the compact
+# repeated-label shape ("username:admin", "username=admin"). A plain "\b"
+# also fires before punctuation, which wrongly rejected values that merely
+# START with a label/copula word — e.g. "Is!Secure987" /
+# "Password!Secure987" (Codex P2 on PR #4473): the "!" is followed by more
+# word chars, so the token is not the bare word. Trade-off (CodeRabbit on
+# PR #4473): a credential that literally starts with a label/copula word
+# followed by ":" or "=" (e.g. password "user:abc123") is also rejected on
+# these paths — the separator shape is indistinguishable from a repeated
+# label, and the repeated label is the common case.
+_EXCLUDED_VALUE = rf"(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS})(?:[^\s,;\w]*(?=[\s,;]|$)|[:=]))"
 # Introducer words the lifecycle pattern's optional group can consume
 # ("created account named/called/for X"). If the account itself is rejected,
 # the group backtracks and the introducer becomes the account ("named /
@@ -84,9 +90,13 @@ _EXCLUDED_VALUE = rf"(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS})[^\s,;\w]*(?=[\s,;]|$)
 # introducers as account values makes the pattern fail instead, so the
 # capture falls through to the single-password branch.
 _INTRODUCER_WORDS = r"(?:for|named?|called?)"
+# Same compact-label rule as _EXCLUDED_VALUE: an account that is a label,
+# copula, or introducer word followed directly by ":" or "=" ("handle:admin")
+# is a repeated label, not a real account (CodeRabbit on PR #4473). The
+# pattern then fails and falls through to the single-password capture.
 _EXCLUDED_ACCOUNT = (
     rf"(?!(?:{_LABEL_WORDS}|{_COPULA_WORDS}|{_INTRODUCER_WORDS})"
-    rf"[^\s,;\w]*(?=[\s,;]|$))"
+    rf"(?:[^\s,;\w]*(?=[\s,;]|$)|[:=]))"
 )
 _CREDENTIAL_PAIR_PATTERN = re.compile(
     r"\b(?:username|user|login)\s*(?:is\s+|[:=]\s*|\s+)"
