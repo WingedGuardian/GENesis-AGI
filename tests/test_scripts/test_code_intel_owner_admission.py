@@ -50,6 +50,20 @@ def test_workload_route_needs_no_scope_probe(tmp_path, monkeypatch, provider):
     assert value['io_weight'] == '100' and not calls
 
 
+@pytest.mark.parametrize('provider', ['cbm', 'gitnexus'])
+@pytest.mark.parametrize('field', ['CODE_INTEL_SIBLING_RESERVE_BYTES', 'CODE_INTEL_FILE_CACHE_RESERVE_BYTES'])
+@pytest.mark.parametrize('amount', [0, 2**31 - 1, 2**31 + 1])
+def test_environment_reserves_cannot_lower_the_existing_floor(tmp_path, monkeypatch, provider, field, amount):
+    namespace, modules, manager, _ = prepared(tmp_path, monkeypatch)
+    if amount < 2**31:
+        with pytest.raises(ValueError):
+            namespace['policy'](modules, provider, 'full', manager, {field: str(amount)})
+    else:
+        selected = namespace['policy'](modules, provider, 'full', manager, {field: str(amount)})
+        key = 'sibling_reserve_bytes' if field == 'CODE_INTEL_SIBLING_RESERVE_BYTES' else 'cache_reserve_bytes'
+        assert selected[key] == amount
+
+
 @pytest.mark.parametrize('field,value', [('CODE_INTEL_WORKLOAD_SLICE', 'yes'),
     ('CODE_INTEL_INDEX_MEMORY_MAX', '4G'), ('CODE_INTEL_CBM_MEMORY_MAX', '16G'),
     ('CODE_INTEL_INDEX_IO_WEIGHT', '0'), ('CODE_INTEL_INDEX_CPU_QUOTA', 'unlimited'),
@@ -164,6 +178,20 @@ def test_lost_reservation_ack_cannot_resend_or_reassign_owner(queue, tmp_path, m
                                      actual_owner=actual_owner)
     assert queue.execution_status(claimed['context'])['launch_reservation'] == reserved
     assert queue.execution_status(claimed['context'])['scope_registration'] is None
+
+
+def test_metadata_prefix_never_admits_selected_provenance_through_ordinary_owner(queue, tmp_path, monkeypatch):
+    namespace, snapshot, modules, claimed, settings, selected, streams = runtime_case(queue, tmp_path, monkeypatch)
+    queue = modules['queue']
+    with closing(queue._connect()) as db, queue._transaction(db):
+        db.execute("UPDATE executions SET nonce_origin='selected-recovery' WHERE execution_seq=?",
+                   (claimed['context']['execution_seq'],))
+    before = queue.execution_status(claimed['context'])
+    with pytest.raises(ValueError, match='selected runtime'):
+        namespace['reserve_runtime'](snapshot, modules, claimed['context'], 'fast', str(settings), selected,
+                                     actual_owner=queue._recovery.owner_identity())
+    assert not streams
+    assert queue.execution_status(claimed['context']) == before
 
 
 @pytest.mark.parametrize('field', ['pid', 'start_ticks', 'boot_id'])

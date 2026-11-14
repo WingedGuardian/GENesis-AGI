@@ -357,6 +357,50 @@ def test_every_exemption_still_names_a_call_site():
     assert not stale, "EXEMPT rows whose call site is gone (delete them):\n  " + "\n  ".join(stale)
 
 
+def _sibling_argument(node: ast.AST, receiver: str, loader: str) -> ast.expr | None:
+    """Return only the argument of the supported local file-loader declaration."""
+    if not (
+        isinstance(node, ast.Call)
+        and ast.dump(node.func) == loader
+        and len(node.args) == 2
+        and not node.keywords
+    ):
+        return None
+    target = node.args[1]
+    if (
+        isinstance(target, ast.Call)
+        and isinstance(target.func, ast.Attribute)
+        and target.func.attr == "with_name"
+        and ast.dump(target.func.value) == receiver
+        and len(target.args) == 1
+        and not target.keywords
+    ):
+        return target.args[0]
+    return None
+
+
+def _sibling_loaders(tree: ast.Module, receiver: str, loader: str) -> set[str]:
+    """Bind a declared helper's two parameters; do not guess from its name."""
+    names = set()
+    for function in tree.body:
+        if not isinstance(function, ast.FunctionDef):
+            continue
+        args = function.args
+        parameters = [*args.posonlyargs, *args.args]
+        if len(parameters) != 2 or args.vararg or args.kwarg or args.kwonlyargs:
+            continue
+        alias, filename = (parameter.arg for parameter in parameters)
+        for node in ast.walk(function):
+            argument = _sibling_argument(node, receiver, loader)
+            if (
+                isinstance(argument, ast.Name) and argument.id == filename
+                and isinstance(node.args[0], ast.Name) and node.args[0].id == alias
+            ):
+                names.add(function.name)
+                break
+    return names
+
+
 def _named_by_listed(listed: list[str]) -> set[str]:
     """The scripts/ files the listed scripts themselves import or source."""
     modules = _scripts_modules(REPO / "scripts")
@@ -375,26 +419,21 @@ def _named_by_listed(listed: list[str]) -> set[str]:
                 named.update(modules[t] for t in tops if t in modules)
             receiver = ast.dump(ast.parse("Path(__file__)", mode="eval").body)
             loader = ast.dump(ast.parse("importlib.util.spec_from_file_location", mode="eval").body)
+            delegates = _sibling_loaders(tree, receiver, loader)
             for node in ast.walk(tree):
-                if not (
+                if (
                     isinstance(node, ast.Call)
-                    and ast.dump(node.func) == loader
+                    and isinstance(node.func, ast.Name) and node.func.id in delegates
                     and len(node.args) == 2
                     and not node.keywords
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)
                 ):
-                    continue
-                target = node.args[1]
-                if (
-                    isinstance(target, ast.Call)
-                    and isinstance(target.func, ast.Attribute)
-                    and target.func.attr == "with_name"
-                    and ast.dump(target.func.value) == receiver
-                    and len(target.args) == 1
-                    and not target.keywords
-                    and isinstance(target.args[0], ast.Constant)
-                    and isinstance(target.args[0].value, str)
-                ):
-                    filename = target.args[0].value
+                    argument = node.args[1]
+                else:
+                    argument = _sibling_argument(node, receiver, loader)
+                if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                    filename = argument.value
                     if filename and Path(filename).name == filename:
                         sibling = Path(path).with_name(filename)
                         if (REPO / sibling).is_file():
@@ -463,6 +502,62 @@ def test_listed_sibling_file_loader_is_recognized_without_guessing(tmp_path, mon
     (directory / "worker-only.sh").write_text("# separate worker, not an import\n")
     monkeypatch.setitem(globals(), "REPO", tmp_path)
     assert _named_by_listed(["scripts/lib/facade.py"]) == {"scripts/lib/helper.py"}
+
+
+_SIBLING_HELPER_FIXTURE = (
+    'def load(alias, filename):\n'
+    ' return importlib.util.spec_from_file_location(alias, Path(__file__).with_name(filename))\n'
+)
+
+
+@pytest.mark.parametrize(('declaration', 'call', 'expected'), [
+    (_SIBLING_HELPER_FIXTURE, 'load("alias", "helper.py")', True),
+    (_SIBLING_HELPER_FIXTURE.replace('def load(', 'def renamed('), 'renamed("alias", "helper.py")', True),
+    (_SIBLING_HELPER_FIXTURE, 'def later():\n return load("alias", "helper.py")', True),
+    ('', 'load("alias", "helper.py")', False),
+    (_SIBLING_HELPER_FIXTURE.replace('Path(__file__)', 'other'), 'load("alias", "helper.py")', False),
+    (_SIBLING_HELPER_FIXTURE.replace('importlib.util.spec_from_file_location', 'other_loader'), 'load("alias", "helper.py")', False),
+    (_SIBLING_HELPER_FIXTURE.replace('location(alias, Path(__file__).with_name(filename))',
+        'location(filename, Path(__file__).with_name(alias))'), 'load("alias", "helper.py")', False),
+    (_SIBLING_HELPER_FIXTURE.replace('alias, filename):', 'alias, filename, extra):'), 'load("alias", "helper.py")', False),
+    (_SIBLING_HELPER_FIXTURE, 'load("helper.py")', False),
+    (_SIBLING_HELPER_FIXTURE, 'load("alias", filename="helper.py")', False),
+    (_SIBLING_HELPER_FIXTURE, 'filename="helper.py"\nload("alias", filename)', False),
+    (_SIBLING_HELPER_FIXTURE, 'alias="alias"\nload(alias, "helper.py")', False),
+    (_SIBLING_HELPER_FIXTURE, 'load("alias", "../helper.py")', False),
+    (_SIBLING_HELPER_FIXTURE, 'load("alias", "missing.py")', False),
+    (_SIBLING_HELPER_FIXTURE, 'load("alias", "folder")', False),
+    (_SIBLING_HELPER_FIXTURE, 'box.load("alias", "helper.py")', False),
+    (_SIBLING_HELPER_FIXTURE, 'subprocess.run(["worker-only.sh"])', False),
+])
+def test_listed_sibling_helper_calls_bind_only_the_declared_literal_shape(tmp_path, monkeypatch, declaration, call, expected):
+    directory = tmp_path/'scripts/lib'
+    directory.mkdir(parents=True)
+    (directory/'facade.py').write_text('from pathlib import Path\n'+declaration+call+'\n')
+    (directory/'helper.py').write_text('# retained helper\n')
+    (directory.parent/'helper.py').write_text('# outside the sibling directory\n')
+    (directory/'folder').mkdir()
+    (directory/'worker-only.sh').write_text('# separate worker, not an import\n')
+    monkeypatch.setitem(globals(), 'REPO', tmp_path)
+    assert _named_by_listed(['scripts/lib/facade.py']) == ({'scripts/lib/helper.py'} if expected else set())
+
+
+def test_every_retained_facade_sibling_is_recognized_and_reloadable():
+    facade = 'scripts/lib/index_marker.py'
+    tree = ast.parse((REPO/facade).read_text())
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Name) and node.func.id == '_load_sibling']
+    assert calls
+    declared = set()
+    for call in calls:
+        assert len(call.args) == 2 and not call.keywords
+        assert all(isinstance(arg, ast.Constant) and isinstance(arg.value, str) for arg in call.args)
+        filename = call.args[1].value
+        assert filename and Path(filename).name == filename
+        declared.add(Path(facade).with_name(filename).as_posix())
+    assert 'scripts/lib/code_intel_scope.py' in declared  # Includes the on-demand retained declaration.
+    assert _named_by_listed([facade]) == declared
+    assert declared <= set(_bash_array('_RUNTIME_RELOAD_SCRIPTS'))
 
 
 def test_every_listed_script_is_consumed_and_exists():
@@ -566,6 +661,7 @@ _RELOAD = (
     "scripts/lib/index_marker_cli.py",
     "scripts/lib/index_marker_legacy.py",
     "scripts/lib/index_marker_legs.py",
+    "scripts/lib/index_marker_retry.py",
     "scripts/lib/index_marker_recovery.py",
     "scripts/lib/index_marker_execution.py",
     "scripts/lib/code_intel_execution.py",
