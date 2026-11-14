@@ -157,7 +157,8 @@ install step.
 
 - The values cannot be loaded: the session runs unredacted. A reload that fails later keeps the values that
   loaded earlier. After a failed load the next attempt waits 30 seconds, so a loader that keeps failing does
-  not run on every event.
+  not run on every event; once that wait passes it is retried at the next event even if no watched file has
+  changed since, so the refusal that a failed reload brings ends as soon as a load succeeds.
 - Redacting one tool result fails: a text-level replacement is tried, then the result goes through unchanged.
   The message content of its stored row is still redacted; the structured record of that result is not.
 - Redacting a stored row fails twice: that row's text is withheld with a notice naming the plugin.

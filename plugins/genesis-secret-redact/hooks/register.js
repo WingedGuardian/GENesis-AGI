@@ -259,10 +259,12 @@ async function load($) {
 
 let loading = null // one loader run at a time; concurrent events share it
 
-// Reload when the secrets file changed since the last load (a key added or rotated mid-session).
+// Reload when the secrets file changed since the last load (a key added or rotated mid-session), and after a
+// failed reload whatever the stamps say: the watched paths can return to the last good stamps (a newly preferred
+// file removed again) while the failure still leaves the target unconfirmed, and only a load clears that.
 async function fresh($) {
   try {
-    if (!watch.length || (await stampOf($, watch)) !== stamp) {
+    if (!watch.length || unconfirmed || (await stampOf($, watch)) !== stamp) {
       if (Date.now() < retryAt) return
       loading ??= load($).finally(() => {
         loading = null
