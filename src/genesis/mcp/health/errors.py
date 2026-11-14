@@ -1396,7 +1396,9 @@ async def _compute_alerts(
                     try:
                         last = datetime.fromisoformat(ts)
                         age_h = (datetime.now(UTC) - last).total_seconds() / 3600
-                        if age_h > 8:  # 6h schedule + 2h grace
+                        # 6h schedule + up to 1h of the unit's verify-memory
+                        # wait (backup_wait_for_ram.sh) + 2h grace.
+                        if age_h > 9:
                             alert_id = "backup:overdue"
                             alerts.append(
                                 {

@@ -5,11 +5,20 @@ After=genesis-server.service
 [Service]
 Type=oneshot
 WorkingDirectory=__REPO_DIR__
+# Before the backup, wait (up to the cap below) for its round-trip verify to
+# fit in memory, so it does not rebuild the database on disk. "-": the wait
+# only ever delays the backup, so a failure of it must not stop the run.
+ExecStartPre=-/bin/bash __REPO_DIR__/scripts/backup_wait_for_ram.sh
 ExecStart=/bin/bash __REPO_DIR__/scripts/backup.sh
+# The wait's cap lives here, beside TimeoutStartSec, which bounds ExecStartPre
+# too: the two always deploy together, and a unit without this line never waits.
+Environment=GENESIS_BACKUP_VERIFY_WAIT_MAX_S=3600
 # A large install's SQLite dump + GPG + Qdrant snapshots + Tier-2 upload over
 # LAN can run well past the 90s default TimeoutStartSec, which would SIGTERM a
-# healthy backup mid-encryption. Project floor (timeout policy): 2h.
-TimeoutStartSec=7200
+# healthy backup mid-encryption. Project floor (timeout policy): 2h for the run,
+# plus the up-to-1h verify-memory wait above (TimeoutStartSec covers
+# ExecStartPre: man systemd.service, "time out before the service is fully up").
+TimeoutStartSec=10800
 # Lowest best-effort I/O priority. A run's footprint is disk I/O (SQLite dump,
 # GPG, Qdrant snapshots), not CPU: measured at under one core with CPU pressure
 # near 1%, so nothing CPU-side is lowered. Not IOWeight=: that is a cgroup io
