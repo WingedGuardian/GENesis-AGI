@@ -7,11 +7,16 @@ APScheduler timing. Scheduler integration is tested separately.
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from genesis.awareness.loop import AwarenessLoop, perform_tick
 from genesis.awareness.signals import ConversationCollector
 from genesis.awareness.types import Depth, DepthScore, SignalReading, TickResult
 from genesis.db.crud import awareness_ticks, observations
 from genesis.observability.types import Subsystem
+
+# Real awareness ticks here: keep their git-health and bundle steps off the live install.
+pytestmark = pytest.mark.usefixtures("quiet_live_tick")
 
 
 async def _persist_tick(db, tick: TickResult) -> None:

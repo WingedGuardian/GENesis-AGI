@@ -636,6 +636,8 @@ async def _verification_lane(
                 merged_at=str(pr["mergedAt"]),
                 now=now_iso,
                 closed_reason=reason,
+                # The path-rule exemption is the worker's own decision, not a client's.
+                closed_by="repo-pulse",
             )
             if outcome == "unavailable":
                 # The table vanished mid-loop (a restore, a hostile drop).

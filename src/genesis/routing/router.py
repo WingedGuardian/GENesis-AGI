@@ -569,6 +569,9 @@ class Router:
                 # the breaker on these would wrongly take a reachable provider
                 # offline for every other call site — fail through to the next
                 # chain member WITHOUT recording a breaker failure.
+                # One 400/422 IS recorded: a body whose error type says the
+                # prepaid balance is spent. `classify_error` returns
+                # QUOTA_EXHAUSTED for it, so it never arrives here as BAD_REQUEST.
                 if category not in (
                     ErrorCategory.RATE_LIMITED, ErrorCategory.BAD_REQUEST,
                 ):

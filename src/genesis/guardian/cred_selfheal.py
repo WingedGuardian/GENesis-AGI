@@ -46,6 +46,17 @@ _RESTORED_TTL_S = 86400  # keep a "restored" status visible for 24h (alert dedup
 _MAX_EVENTS = 20
 
 
+def _repo_root() -> Path | None:
+    try:
+        from genesis.env import repo_root
+    except ImportError:  # defensive: a stripped import environment
+        return None
+    try:
+        return repo_root()
+    except Exception:  # noqa: BLE001 — never break the tick; fall back to the env rule
+        return None
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -88,6 +99,11 @@ def check_and_selfheal(
     Returns the status dict (also persisted to ``status_path``). Never raises —
     the awareness loop invokes this zero-arg and must not be broken by it.
     """
+    # The checkout this process runs from, so a secrets file in a checkout other
+    # than ~/genesis is found rather than reported missing and restored over.
+    # Only for this process's own home: a caller-supplied home (a sandbox) keeps
+    # the env/home rule and never resolves into the real checkout.
+    repo_root = _repo_root() if home is None else None
     home = home or Path.home()
     if backup_dir is None:
         backup_dir = _backup_dir_if_present(home / "backups" / "genesis-backups")
@@ -102,7 +118,7 @@ def check_and_selfheal(
     events: list[str] = []
 
     try:
-        results = check_all(tgts, home, backup_dir)
+        results = check_all(tgts, home, backup_dir, repo_root)
     except Exception:  # noqa: BLE001 — must never break the tick
         logger.warning("cred integrity check failed", exc_info=True)
         return _load_status(status_path)
@@ -169,7 +185,7 @@ def check_and_selfheal(
             events.append(f"{name}: {vr.status} (no backup to restore from)")
             continue
 
-        passphrase = resolve_passphrase(home)
+        passphrase = resolve_passphrase(home, repo_root)
         if not passphrase:
             out_targets[name] = {
                 "status": "restore_failed",
@@ -183,7 +199,8 @@ def check_and_selfheal(
         attempts.append(now_iso)
         try:
             rr = restore_file(
-                target, home=home, backup_dir=backup_dir, passphrase=passphrase
+                target, home=home, backup_dir=backup_dir, passphrase=passphrase,
+                repo_root=repo_root,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("restore_file raised for %s", name, exc_info=True)

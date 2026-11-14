@@ -1877,6 +1877,34 @@ three protocol steps also apply: `.claude/skills/closing-session/SKILL.md`,
   self-check.
   A PR whose diff touches the enforcement-hook surface runs the gate-fix lane: round 1 is DUAL, Codex plus `merge_gate.secondary_reviewer` run together at PR open (Codex-only when none is configured, and the PR says so). Read `.claude/skills/genesis-development/references/gate-fix-lane.md` before opening it.
 
+### Security PRs: the premise check comes before round 1
+
+**A PR whose job is to keep a secret or a credential from leaking, or a gate from
+being bypassed, gets an
+independent premise check and a security audit with fixed questions BEFORE its
+first review request**, rather than waiting for round 2 to owe one. Seen
+2026-11-12, #4189/#4418 (locate credential screen): repeated fresh-context
+Claude security audits approved the tree, then Codex round 1 found two P1s and
+CodeRabbit round 2 a Major. The round-2 premise check traced three of the
+findings to one root cause the fixes had each patched around: verdicts cached
+under a stand-in (a path, a stat identity) for the bytes judged (premise-check
+report in the PR's round-2 reflection).
+
+Hand these questions to the security reviewer (`/deep-review`'s, or
+`genesis-security-reviewer`), every time, whatever the PR. The first overlaps
+axis 1 above; keep the two in step:
+- **Check versus use:** is any verdict, exemption or cache entry decided on
+  something other than the exact bytes or state that is then acted on (a path,
+  a stat identity, an earlier read)? Name each place, and the race it allows.
+- **Sibling parity:** does every sibling surface that guards the same thing
+  (another route's deny-list, the dashboard, another gate) refuse at least what
+  this one refuses? List the siblings and diff their rules.
+- **Pattern-independence:** can any count, timing or error a caller observes
+  depend on the caller's input in a way that leaks one bit at a time?
+- **Both backends:** if there is a fast path and a fallback, which one does CI
+  exercise, and which one does a real install use?
+- **Fail closed:** what does each error, timeout and budget exhaustion do?
+
 ### Publishing: a PR opens only after an independent review
 
 **`gh pr create` on the configured public repo is refused until a reviewer has read
@@ -2314,7 +2342,9 @@ Standard open-source workflow: PRs go directly to the public repo.
   drop whose PR body could not be read. Read the
   step summary first; it names every vanished id. If a drop is deliberate, put
   a line `Collected-drop: <reason>` in the PR body and re-run the job (or push,
-  if a re-run no longer clears it: #2624). A branch cut before #2743 that still edits the old
+  if a re-run no longer clears it: #2624). The line is for a drop your own
+  change makes: a failure you inherited from another PR or from main gets the
+  owner's yes before you add it (#4471). A branch cut before #2743 that still edits the old
   `--min-collected` line resolves that conflict by taking main's side and
   deleting its own floor paragraph. The `--ceiling` (skip count) still lives on
   the dormancy-guard line: raise it only in the commit that adds the skip,

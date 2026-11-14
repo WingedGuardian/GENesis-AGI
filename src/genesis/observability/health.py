@@ -765,21 +765,19 @@ async def probe_falkordb(
 ) -> ProbeResult | None:
     """Probe the FalkorDB graph engine over its unix socket.
 
-    Returns ``None`` when the engine is not armed — no socket present. Read that
-    as NOT-YET-ARMED, not as optional: the graph engine is part of the memory
-    architecture, and `config/graphstore.yaml` defaulting to networkx is a staged
-    cutover, not a statement that the engine is a nice-to-have. During that
-    cutover an unarmed engine is the expected state on an install that has not
-    provisioned it yet, so it is reported as "not applicable" rather than as a
-    fault, and the caller omits the key entirely.
+    Returns ``None`` when the engine is not armed — no socket present — and the
+    lever does not select it. The graph engine is part of the memory
+    architecture and `config/graphstore.yaml` ships `mode: falkordb`; an
+    unarmed, unselected engine is an install that never provisioned it (reads
+    stay quietly on networkx, `graphstore_config.selection`), so it is reported
+    as "not applicable" rather than as a fault, and the caller omits the key.
 
-    NOT in the CriticalFailureCollector's probe list *yet*, and that is a
-    transition decision with an expiry rather than a permanent classification:
-    that list is for services whose absence is a real failure, and until the
-    cutover completes an unarmed engine is not one — including it now would pin
-    every not-yet-provisioned install at critical_failure=1.0. It BELONGS there
-    once provisioning is default-on and the lever has moved (F4); moving it is
-    part of that change, not a follow-up to remember.
+    In the CriticalFailureCollector's steady-state probe list exactly when the
+    engine's unit is enabled (`runtime/init/learning.py`, through
+    `graphstore_config.engine_unit_present`): there its absence is a real
+    failure. With no unit it stays out, so an install that never provisioned
+    the engine is not pinned at critical_failure=1.0. The collector omits a
+    ``None`` answer.
 
     Speaks redis PING rather than issuing a graph query — this answers "is the
     engine reachable", and a reachable engine with an empty projection is a

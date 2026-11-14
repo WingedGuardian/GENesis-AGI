@@ -1085,6 +1085,20 @@ if [ -n "${TMPDIR:-}" ]; then
     export CLAUDE_CODE_TMPDIR="$TMPDIR"
 fi
 
+# SQLite temp files go to ~/tmp, not cc-tmp (#3099). SQLite reads SQLITE_TMPDIR
+# before TMPDIR, so a large sort or temp table in anything this slot runs (its
+# MCP servers, a test or a script a session starts) spills onto the big disk while
+# Claude Code's own temp stays on cc-tmp. Those spill files are deleted as soon as
+# they are created, so `du` cannot see them while they fill the small volume.
+# The server, bridge and watchdog units already set the same value (#3098).
+# Pinned only when ~/tmp is a writable directory: otherwise nothing is pinned and
+# SQLite falls back to TMPDIR, which is the behaviour before this change.
+_SQLITE_TMPDIR_PIN=()
+if mkdir -p "$HOME/tmp" 2>/dev/null && [ -d "$HOME/tmp" ] && [ -w "$HOME/tmp" ] && [ -x "$HOME/tmp" ]; then
+    export SQLITE_TMPDIR="$HOME/tmp"
+    _SQLITE_TMPDIR_PIN=(-e "SQLITE_TMPDIR=$SQLITE_TMPDIR")
+fi
+
 # Permission mode for this interactive dev console. Default: auto — auto-approves
 # common ops but still prompts on deny/ask rules, which the operator answers in
 # the tmux session (keeps deny-rule safety). To launch friction-free with
@@ -1280,6 +1294,7 @@ exec "${_TMUX_SERVER_SCOPE[@]}" tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
     "${_TMPDIR_PIN[@]}" \
+    "${_SQLITE_TMPDIR_PIN[@]}" \
     -e "GENESIS_CC_SLOT_OAUTH=${_slot_oauth_mode}" \
     "${_FUNCTION_HOOKS_PIN[@]}" \
     -e "LANG=$LANG" \

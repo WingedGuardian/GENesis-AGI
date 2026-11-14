@@ -173,7 +173,25 @@ def assess(
     elif read_number(leaf / "memory.memsw.limit_in_bytes") != effective_cap:
         raise AdmissionRefused("worker scope permits swap")
 
-    parent = leaf.parent
+    assess_headroom(leaf.parent, root, version, effective_cap, reserve,
+                    cache_reserve=cache_reserve, meminfo_path=meminfo_path)
+
+
+def assess_headroom(
+    group: Path, root: Path, version: int, cap: int, reserve: int, *,
+    cache_reserve: int = 2 * 1024**3,
+    meminfo_path: Path = Path("/proc/meminfo"),
+) -> None:
+    """Observe this destination and every visible ancestor using one formula.
+
+    Scoped admission starts at the leaf's parent; prospective admission starts
+    at the existing destination slice itself. Neither observation reserves RAM.
+    """
+    if version not in (1, 2) or not group.is_absolute() or not root.is_absolute() \
+            or not group.is_relative_to(root) or not group.is_dir():
+        raise AdmissionRefused("cannot observe destination memory hierarchy")
+    limit_file = "memory.max" if version == 2 else "memory.limit_in_bytes"
+    parent = group
     while root == parent or root in parent.parents:
         limit_path = parent / limit_file
         try:
@@ -192,12 +210,12 @@ def assess(
             current = read_number(parent / ("memory.current" if version == 2
                                             else "memory.usage_in_bytes"))
             charge = _working_charge(current, parent / "memory.stat", cache_reserve, version)
-            if limit - charge - reserve < effective_cap:
+            if limit - charge - reserve < cap:
                 raise AdmissionRefused(f"insufficient headroom in {parent}")
         if parent == root:
             break
         parent = parent.parent
-    if _host_available(meminfo_path) - reserve < effective_cap:
+    if _host_available(meminfo_path) - reserve < cap:
         raise AdmissionRefused("insufficient host available memory")
 
 

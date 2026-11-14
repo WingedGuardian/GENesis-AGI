@@ -32,8 +32,15 @@ def build_step_prompt(
     prior_results: list[StepResult],
     workaround: str | None = None,
     resources: str | None = None,
+    *,
+    task_description: str | None = None,
+    planned_step_count: int | None = None,
 ) -> str:
-    """Build the step prompt from TASK_STEP.md template."""
+    """Append task and step context to the static TASK_STEP.md instructions.
+
+    Values are inserted verbatim, never interpreted as template expressions.
+    Step indexes stay zero-based; the planned count excludes review fixups.
+    """
     template = ""
     try:
         template = _TASK_STEP_PROMPT_PATH.read_text(encoding="utf-8")
@@ -54,6 +61,10 @@ def build_step_prompt(
         parts.append("")
 
     parts.extend([
+        "## Task",
+        task_description or "Not provided",
+        f"Planned step count: {planned_step_count if planned_step_count is not None else 'Not provided'}",
+        "",
         f"## Step {step['idx']}: {step.get('description', '')}",
         f"Type: {step.get('type', 'code')}",
         f"Complexity: {step.get('complexity', 'medium')}",

@@ -79,22 +79,40 @@ extended outage.
 
 ## Error Classification
 
-Not all failures are the same. `classify_error()` in `retry.py` determines
-whether to retry and how:
+Not all failures are the same. `classify_error()` in `retry.py` maps a status
+code and error text to an `ErrorCategory` (`types.py`), and the router decides
+two things from it: whether to retry the same provider, and whether the
+failure counts against that provider's circuit breaker.
 
 ```python
-_TRANSIENT_CODES = {408, 429, 500, 502, 503, 504}  # retry with backoff
-_PERMANENT_CODES = {401, 404}                       # stop immediately
-_QUOTA_CODES = {402}                                # 4h circuit breaker
-_QUOTA_KEYWORDS = {"quota", "exceeded", "billing", "limit", "exhausted"}
+_TRANSIENT_CODES = {500, 502, 503, 504}  # retry with backoff
+_RATE_LIMITED_CODES = {429}              # backpressure: fail fast, no breaker record
+_BAD_REQUEST_CODES = {400, 422}          # our payload: fail fast, no breaker record
+_TIMEOUT_CODES = {408}                   # hung provider: fail fast
+_PERMANENT_CODES = {401, 404}            # fail fast
+_QUOTA_CODES = {402}                     # always quota
+_MAYBE_QUOTA_CODES = {403}               # entitlement, quota or permanent, by message
 ```
 
-| Category | What triggers it | What happens |
-|----------|-----------------|--------------|
-| TRANSIENT | 429, 5xx, timeout | Retry with exponential backoff |
-| PERMANENT | 401, 404 | Skip provider, move to next in chain |
-| QUOTA_EXHAUSTED | 402, quota keywords in 403 | Trip breaker with 4h duration |
-| DEGRADED | Malformed/partial response | Retry |
+| Category | What triggers it | Same-provider retry | Breaker records it |
+|----------|-----------------|---------------------|--------------------|
+| TRANSIENT | 500, 502, 503, 504; a statusless error naming a connection; anything unrecognised | Yes, with backoff | Yes |
+| DEGRADED | A statusless error naming a malformed, partial or truncated response | Yes, with backoff | Yes |
+| TIMEOUT | 408; a statusless error naming a timeout | No | Yes |
+| RATE_LIMITED | 429 | No | No (the rate gate is the brake) |
+| BAD_REQUEST | 400, 422 | No | No (the payload's fault) |
+| PERMANENT | 401, 404; a 403 with neither an entitlement marker nor a quota keyword | No | Yes |
+| NOT_ENTITLED | A 403 whose message carries an entitlement marker (checked before the quota keywords) | No | Yes, on the 4-hour cap |
+| QUOTA_EXHAUSTED | 402; a 403 whose message carries a quota keyword; a 400/422 whose `error.type` or `error.code` is a balance token | No | Yes, on the 4-hour cap |
+
+The last trigger exists because an empty prepaid balance can reach the router
+as a client error: litellm raises its bad-request exception for any response
+whose body says `invalid_request_error`, whatever the HTTP status, and the
+delegate reports that exception as 400 unless it carries 402. The token is
+matched as a field of the JSON body, not as words anywhere in the message, so a
+400 that echoes request or generated text stays BAD_REQUEST. A 429 that names
+a daily quota is handled separately: the daily budget ledger deselects the
+provider until the reset the vendor gave, without a breaker record.
 
 ---
 

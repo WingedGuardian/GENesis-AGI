@@ -165,6 +165,16 @@
         ],
         "PreToolUse": [
             {
+                "matcher": "Bash|Read|Grep|Glob|Edit|Write|MultiEdit|NotebookEdit|Agent|Task",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "[ -d \"${GENESIS_HOME:-$HOME/.genesis}/holdout\" ] || exit 0; ${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/holdout_fence.py pre",
+                        "timeout": 10
+                    }
+                ]
+            },
+            {
                 "matcher": ".*",
                 "hooks": [
                     {
@@ -561,6 +571,16 @@
             }
         ],
         "PostToolUse": [
+            {
+                "matcher": "Bash|Read|Grep|Glob|mcp__.*",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "[ -d \"${GENESIS_HOME:-$HOME/.genesis}/holdout\" ] || exit 0; ${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/holdout_fence.py post",
+                        "timeout": 10
+                    }
+                ]
+            },
             {
                 "matcher": "^(Write|Edit|MultiEdit|NotebookEdit)$",
                 "hooks": [

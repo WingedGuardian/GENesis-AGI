@@ -61,6 +61,8 @@ class ScopeProbe:
 class ScopeManager:
  def __init__(self,*args,deadline,require_runtime_limit=False):
   self.deadline,self.require_runtime_limit=deadline,require_runtime_limit
+ def require_no_batch(self,physical_reader):
+  assert callable(physical_reader) # No prior scope in this synthetic namespace.
  def _object(self,*args): return '/org/freedesktop/systemd1/unit/owned'
  def registration(self,unit,facts,**kwargs):
   return dict(unit=unit,facts=facts,invocation_id='1'*32,stop_usec=90000000)

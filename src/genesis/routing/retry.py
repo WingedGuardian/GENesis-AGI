@@ -53,6 +53,63 @@ _ENTITLEMENT_MARKERS = (
     "not authorized",
     "permission_denied",
 )
+# A 400/422 whose error TYPE says the prepaid balance is spent. That is a
+# billing state, not a fault in the payload: the same request fails identically
+# until the account is topped up, so it belongs on the quota path (fail fast,
+# breaker record, long cap) and not on BAD_REQUEST's "never recorded" one.
+#
+# Provenance: MEASURED on a live install as the `type` field of DeepSeek's
+# error body: 538 of 538 calls to that provider in the retained activity log
+# (2026-11-11 to 2026-11-13, no success among them) failed with it. That log
+# is pruned after about a day, so the count cannot be re-derived later. The
+# vendor's error-code page lists the state as HTTP 402 (read 2026-11-13); the
+# wire status on that install was not recorded. The delegate reports a litellm
+# `BadRequestError` as 400 unless it carries 402 (see that handler in
+# `litellm_delegate`), so a 402 on the wire takes the `_QUOTA_CODES` branch
+# and another wire status with this body lands here.
+#
+# Matched against the body's `error.type` / `error.code` FIELDS, never as a
+# substring of the message. A 400 is the status where a body can carry request
+# or generated text back, and BAD_REQUEST stays out of the breaker precisely
+# because a 400 is normally the payload's fault: words that merely appear in a
+# message must not be able to open a breaker.
+# KNOWN GAPS, stated not assumed:
+#   - a body that is not embedded JSON (a Python-repr dict, plain prose) is not
+#     read and stays BAD_REQUEST, as before.
+#   - the body read is the FIRST JSON object in the error string. A reply that
+#     is not JSON itself but quotes a JSON object of this exact shape would
+#     match. None is recorded.
+# Add a token only when a real one is measured.
+_BALANCE_ERROR_TOKENS = frozenset({"insufficient_balance_error"})
+
+
+def _error_body(error_msg: str) -> dict | None:
+    """The first JSON object embedded in a provider error string, or None.
+
+    Never raises: its callers run where an exception would escape the router
+    instead of falling through to the next provider.
+    """
+    start = error_msg.find("{")
+    if start < 0:
+        return None
+    try:
+        body, _ = json.JSONDecoder().raw_decode(error_msg[start:])
+    except (ValueError, RecursionError):  # malformed, or nested past the stack
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _balance_exhausted(error_msg: str) -> bool:
+    """True when the error body's own type or code is a balance token."""
+    body = _error_body(error_msg)
+    error = body.get("error") if body is not None else None
+    if not isinstance(error, dict):
+        return False
+    for key in ("type", "code"):
+        value = error.get(key)
+        if isinstance(value, str) and value.lower() in _BALANCE_ERROR_TOKENS:
+            return True
+    return False
 
 
 def classify_error(status_code: int | None, error_msg: str) -> ErrorCategory:
@@ -70,6 +127,8 @@ def classify_error(status_code: int | None, error_msg: str) -> ErrorCategory:
         if status_code in _PERMANENT_CODES:
             return ErrorCategory.PERMANENT
         if status_code in _BAD_REQUEST_CODES:
+            if _balance_exhausted(error_msg):
+                return ErrorCategory.QUOTA_EXHAUSTED
             return ErrorCategory.BAD_REQUEST
         if status_code in _RATE_LIMITED_CODES:
             return ErrorCategory.RATE_LIMITED
@@ -118,14 +177,8 @@ def daily_quota_reset_s(error_msg: str) -> float | None:
     raises: it runs inside the delegate's 429 handler, where an exception would
     escape the router instead of falling through to the next provider.
     """
-    start = error_msg.find("{")
-    if start < 0:
-        return None
-    try:
-        body, _ = json.JSONDecoder().raw_decode(error_msg[start:])
-    except (ValueError, RecursionError):  # malformed, or nested past the stack
-        return None
-    error = body.get("error") if isinstance(body, dict) else None
+    body = _error_body(error_msg)
+    error = body.get("error") if body is not None else None
     details = error.get("details") if isinstance(error, dict) else None
     if not isinstance(details, list):
         return None

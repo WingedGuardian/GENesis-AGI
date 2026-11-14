@@ -17,7 +17,7 @@ check. Unpinned routing opt-outs retain direct execution. Foreground-only
 `gmodel` catalog entries are not added to
 the automated roster.
 
-Each check uses a fixed diagnostic prompt, safe mode with OAuth support,
+Ordinary checks use a fixed diagnostic prompt, safe mode with OAuth support,
 `--tools ""`, and an empty strict MCP configuration. A complete exact response
 and an observed empty tools/MCP inventory are required. The check carries no
 task content or resume state. Each check receives an invocation timeout of up to
@@ -103,8 +103,19 @@ service restart ends the supervisor and boot reconciliation records
 Actual child teardown requires scope/runtime or operator evidence. There is no
 automatic replay or recovery endpoint.
 
+Server-owned `contained_peer=True` additionally requires managed observe mode,
+an explicit public system prompt and no skills/planning additions. It bypasses
+the owner identity/context/MCP builders and uses the tools-free contained CLI
+policy for readiness, auth/version helpers and actual work. The whole managed
+lifetime, including finalization, cannot update shared provider health, banners
+or Fallback observations. Default-false requests keep their existing receipt
+fingerprints. Contained work has no transcript pointer; its committed full
+artifact remains available. This execution primitive does not authorize foreign
+peers. See [contained peer execution](peer-execution.md) for the exact contract.
+
 Private invocations withhold raw execution/callback diagnostics and error span
-text. Child tool tracing is disabled for this mode because the ordinary trace
+text, including exceptions escaping to ancestor spans and the enumerated tracing
+loggers. Child tool tracing is disabled for this mode because the ordinary trace
 hook records argument and path previews. Concurrent ordinary sessions retain
 their diagnostics. Owner notification and approval paths are not disabled.
 

@@ -27,6 +27,22 @@ from genesis.routing.types import (
 logger = logging.getLogger(__name__)
 _ENV_PATTERN = re.compile(r"\$\{([^}:]+)(?::-(.*?))?\}")
 
+# The C loader parses the same safe YAML subset about 5x faster; this config is
+# read on every session start and MCP server start. Pure-Python fallback where
+# PyYAML was built without libyaml.
+_YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
+def _yaml_load(text: str) -> object:
+    try:
+        return yaml.load(text, Loader=_YAML_LOADER)  # noqa: S506 - a safe loader
+    except yaml.YAMLError:
+        if _YAML_LOADER is yaml.SafeLoader:
+            raise
+        # Re-parse so the error carries the pure-Python loader's message, with
+        # its source snippet; the dashboard config save shows this text.
+        return yaml.load(text, Loader=yaml.SafeLoader)  # noqa: S506 - a safe loader
+
 # Canonical set of runtime dispatch modes honoured by
 # ``AutonomousDispatchRouter.route()``.  Also used by
 # ``update_call_site_in_yaml`` to validate save payloads — keep in sync
@@ -93,7 +109,7 @@ def _load_local_overlay(path: Path) -> object:
     local = _local_path_for(path)
     if not local.is_file():
         return {}
-    loaded = yaml.safe_load(local.read_text())
+    loaded = _yaml_load(local.read_text())
     return {} if loaded is None else loaded
 
 
@@ -415,7 +431,7 @@ def _load_effective(
     display) use this so they see the same overlay-or-base choice the router
     made, not an overlay the loader rejected.
     """
-    base_raw = yaml.safe_load(_expand_env_vars(path.read_text()))
+    base_raw = _yaml_load(_expand_env_vars(path.read_text()))
     local_path = _local_path_for(path)
     if not local_path.is_file():
         return _parse(base_raw, check_api_keys=check_api_keys), base_raw
@@ -1127,7 +1143,7 @@ def _record_overlay_observation(
 
 def load_config_from_string(text: str, *, check_api_keys: bool = True) -> RoutingConfig:
     """Load routing config from a YAML string (no overlay support)."""
-    raw = yaml.safe_load(_expand_env_vars(text))
+    raw = _yaml_load(_expand_env_vars(text))
     return _parse(raw, check_api_keys=check_api_keys)
 
 
@@ -1527,7 +1543,7 @@ def update_call_site_in_yaml(
       - None   → leave the existing yaml value unchanged
     """
     path = Path(path)
-    base_raw = yaml.safe_load(_expand_env_vars(path.read_text()))
+    base_raw = _yaml_load(_expand_env_vars(path.read_text()))
 
     if call_site_id not in (base_raw.get("call_sites") or {}):
         msg = f"Unknown call site: {call_site_id}"
@@ -1697,7 +1713,7 @@ def update_call_site_in_yaml(
     # would then set the whole file aside at the next restart.
     new_text = yaml.dump(local_raw, default_flow_style=False, sort_keys=False)
     try:
-        written = yaml.safe_load(new_text)
+        written = _yaml_load(new_text)
         new_config = _parse(_merge_overlay(base_raw, written if written is not None else {}))
     except Exception as e:
         msg = f"Generated config failed validation: {e}"

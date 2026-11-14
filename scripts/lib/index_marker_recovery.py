@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
 
@@ -58,6 +59,39 @@ def refuse_unrepresented(db, residual, selected):
         if (h, provider) == selected and kind not in ("cleanup", "cleanup-disproof"):
             raise RuntimeError("unrepresented native conflict prevents provider admission")
 
+
+@contextmanager
+def decision_gate(db, api, *, native=False, admission=None):
+    """Same admitted connection plus a final drain after recovery callbacks.
+
+    This supplies evidence, not a grant or a provider-hold exception. Ordinary
+    admission retains its unrepresented-conflict prefilter on the initial drain.
+    """
+    active = False
+    try:
+        with api['_legacy']._lock(api['marker_dir'](), api['OUTCOME_LOCK_WAIT_S']):
+            with api['_transaction'](db):
+                admission_schema(db, api['SCHEMA_VERSION'], api['_native'], require_native=native)
+                imported = api['_legacy'].drain(api['marker_dir'](), db, api['_import_one'], api['_fsync_dir'])
+                native_imported = []
+                active = True
+
+                def finalize():
+                    if not active or not db.in_transaction:
+                        raise RuntimeError('recovery decision is closed')
+                    residual = []
+                    native_imported.extend(api['_native'].drain(api['marker_dir'](), db, api['_legs'], api['_proof'],
+                                                         api['marker_hash'], residual=residual))
+                    return tuple(sorted(set(residual)))
+
+                residual = finalize()
+                if admission is not None:
+                    refuse_unrepresented(db, residual, admission)
+                yield db, finalize
+            api['_legacy'].retire(api['marker_dir'](), imported, api['_fsync_dir'])
+            api['_legacy'].retire(api['marker_dir'](), list(dict.fromkeys(native_imported)), api['_fsync_dir'])
+    finally:
+        active = False
 
 def validate_schema(db, native):
     """A version number alone is not evidence of a completed conversion."""
@@ -370,11 +404,21 @@ def _accepted_clean(db, state, native):
         return False
 
 
+def provider_snapshot(db, h, provider):
+    """Read safety/acceptance without decoding unrelated grant storage."""
+    return db.execute(
+        "SELECT hash,repo_path,provider,hazard_revision,accepted_sequence,"
+        "accepted_terminal_sha256,accepted_control_sha256,accepted_source_identity,"
+        "accepted_evidence_reference FROM provider_state WHERE hash=? AND provider=?",
+        (h, provider),
+    ).fetchone()
+
+
 def provider_blocked(db, h, provider, native):
     """Read safety coverage; this never grants a retry or advances acceptance."""
     if provider not in ("cbm", "gitnexus"):
         raise ValueError("invalid provider safety selection")
-    state = db.execute("SELECT * FROM provider_state WHERE hash=? AND provider=?", (h, provider)).fetchone()
+    state = provider_snapshot(db, h, provider)
     accepted = 0
     if state is not None:
         accepted = state["accepted_sequence"]

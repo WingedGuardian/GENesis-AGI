@@ -417,6 +417,17 @@ def _container_sh(cmd: str, home, extra_path=None) -> str:
     return done.stdout
 
 
+def _kit(home) -> None:
+    """The repair kit's loader in ``home``, where the pick loads it from (#3892)."""
+    import shutil
+    from pathlib import Path
+
+    kit = home / ".genesis" / "lib" / "live-repair" / "current"
+    kit.mkdir(parents=True, exist_ok=True)
+    lib = Path(__file__).resolve().parents[2] / "scripts" / "lib"
+    shutil.copy2(lib / "live_move_repair.py", kit / "live_move_repair.py")
+
+
 def _pick(home) -> bytes:
     """Run the container-side report pick, as the collector pipes it, in a scratch HOME."""
     import subprocess
@@ -424,6 +435,7 @@ def _pick(home) -> bytes:
 
     import genesis.guardian.collector as gc
 
+    _kit(home)
     return subprocess.run(
         [sys.executable, "-I", "-S", "-"],
         input=gc._REPAIR_PICK,
@@ -431,6 +443,18 @@ def _pick(home) -> bytes:
         capture_output=True,
         timeout=60,
     ).stdout
+
+
+def _loader():
+    """scripts/lib/live_move_repair.py, whose newest_eligible the pick runs."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "scripts" / "lib" / "live_move_repair.py"
+    spec = importlib.util.spec_from_file_location("_collector_test_repair", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _mine(home, **over) -> dict:
@@ -481,7 +505,7 @@ def test_report_pick_surfaces_an_over_cap_report_instead_of_an_older_one(tmp_pat
     (_backup_dir(tmp_path, _ts(1)) / "REPAIR.json").write_text(json.dumps(older))
     ts = _ts()
     big = _writer_bytes(_mine(tmp_path, ts=ts), pad_rows=25_000)
-    assert len(big) > gc._REPAIR_REPORT_BYTES
+    assert len(big) > _loader().REPORT_BYTES
     (_backup_dir(tmp_path, ts) / "REPAIR.json").write_bytes(big)
     out = _pick(tmp_path)
     assert out.startswith(gc._REPAIR_MARK.encode()), out[:200]
@@ -490,7 +514,7 @@ def test_report_pick_surfaces_an_over_cap_report_instead_of_an_older_one(tmp_pat
     assert shown_ts.decode() == ts
     assert "report too large" in picked["result"], picked
     assert picked["ts"] == ts
-    assert len(out) <= len(gc._REPAIR_MARK) + len(shown_ts) + 1 + gc._REPAIR_REPORT_BYTES
+    assert len(out) <= len(gc._REPAIR_MARK) + len(shown_ts) + 1 + _loader().REPORT_BYTES
 
 
 def test_report_pick_reads_the_repo_of_a_long_non_utf8_checkout(tmp_path):
@@ -500,7 +524,6 @@ def test_report_pick_reads_the_repo_of_a_long_non_utf8_checkout(tmp_path):
     be shown, not skipped as if it named another checkout."""
     import os
 
-    import genesis.guardian.collector as gc
 
     home = tmp_path
     for _ in range(17):  # 17 x 200 non-UTF-8 bytes: over 20,000 characters escaped
@@ -508,10 +531,10 @@ def test_report_pick_reads_the_repo_of_a_long_non_utf8_checkout(tmp_path):
     home.mkdir(parents=True)
     report = _mine(home)
     assert len(json.dumps(report["repo"])) > 20_000
-    assert len(os.fsencode(report["repo"])) <= gc._REPAIR_REPO_BYTES
+    assert len(os.fsencode(report["repo"])) <= _loader().REPO_BYTES
     ts = _ts()
     big = _writer_bytes(_mine(home, ts=ts), pad_rows=25_000)
-    assert len(big) > gc._REPAIR_REPORT_BYTES
+    assert len(big) > _loader().REPORT_BYTES
     (_backup_dir(home, ts) / "REPAIR.json").write_bytes(big)
     out = _pick(home)
     assert b"report too large" in out, out[:300]
@@ -569,6 +592,7 @@ def _local_container(monkeypatch, home):
 
     import genesis.guardian.collector as gc
 
+    _kit(home)
     bin_dir = home / "bin"
     bin_dir.mkdir(exist_ok=True)
     (bin_dir / "journalctl").write_text("#!/bin/bash\nexit 0\n")
@@ -622,9 +646,9 @@ async def test_e2e_older_eligible_report_behind_five_ineligible_is_shown(tmp_pat
 
 
 def test_report_pick_stops_at_the_first_report_older_than_the_window(tmp_path):
-    """Names sort newest first by their ts: once one is older than the window,
-    every later one is too, so the pick reads no further (here: a report whose
-    own ts claims to be new is never reached behind an old directory)."""
+    """Names sort newest first by their ts, and the window reads the dir name:
+    the newest eligible report older than the window shows nothing (here: a
+    report whose own ts claims to be new does not count as new)."""
     report = json.dumps(_mine(tmp_path, ts=_ts()))
     (_backup_dir(tmp_path, _ts(7)) / "REPAIR.json").write_text(report)
     assert _pick(tmp_path) == b""
@@ -652,13 +676,12 @@ def test_report_pick_skips_an_ineligible_over_cap_report(tmp_path, over):
     (or superseded, or another checkout's) is not shown as "too large": the
     pick reads those top-level fields from the writer's layout without parsing
     the file, and the older eligible report is shown."""
-    import genesis.guardian.collector as gc
 
     older = _mine(tmp_path, ts=_ts(1), result="healed, the older one")
     (_backup_dir(tmp_path, _ts(1)) / "REPAIR.json").write_text(json.dumps(older))
     ts = _ts()
     big = _writer_bytes({**_mine(tmp_path, ts=ts), **over}, pad_rows=25_000)
-    assert len(big) > gc._REPAIR_REPORT_BYTES
+    assert len(big) > _loader().REPORT_BYTES
     (_backup_dir(tmp_path, ts) / "REPAIR.json").write_bytes(big)
     out = _pick(tmp_path)
     assert b"healed, the older one" in out and b"too large" not in out, out[:300]
@@ -684,16 +707,15 @@ def test_report_pick_orders_same_second_reports_by_pid_as_a_number(tmp_path):
 
 
 def test_report_pick_reads_at_most_the_readers_count_of_reports(tmp_path):
-    """R2 premise LOW-1: the pick reads at most _REPAIR_READS report dirs (deploy
+    """R2 premise LOW-1: the pick reads at most REPORTS_READ report dirs (deploy
     health's REPAIR_REPORTS_READ). An eligible report behind that many newer
     ineligible ones is not read, and the pick takes its none-found path (prints
     nothing); one fewer ineligible and it is shown."""
-    import genesis.guardian.collector as gc
 
     (_backup_dir(tmp_path, _ts(3)) / "REPAIR.json").write_text(
         json.dumps(_mine(tmp_path, ts=_ts(3), result="healed, the older one"))
     )
-    dismissed = [_ts(2 - i * 0.1) for i in range(gc._REPAIR_READS)]
+    dismissed = [_ts(2 - i * 0.1) for i in range(_loader().REPORTS_READ)]
     for ts in dismissed:
         report = _mine(tmp_path, ts=ts, dismissed_at="2026-10-21T00:00:00Z")
         (_backup_dir(tmp_path, ts) / "REPAIR.json").write_text(json.dumps(report))
