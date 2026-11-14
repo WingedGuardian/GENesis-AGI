@@ -1,0 +1,1 @@
+- Review status now shows validated no-defect dispositions and remaining findings separately from raw review counts; unavailable local evidence is reported explicitly.

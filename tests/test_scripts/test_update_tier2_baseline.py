@@ -197,3 +197,22 @@ def test_no_interpreter_for_the_reader_is_pending(genesis_root, tmp_path):
         env={"PATH": str(bin_dir), "HOME": str(tmp_path)},
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("path", [
+    "scripts/lib/cc_version.sh", "scripts/cc_settings_align.sh",
+    "scripts/setup_claude_config.py", "config/cc-global-settings.yaml", ".claude/settings.json",
+])
+def test_client_policy_input_requires_activation(genesis_root, path):
+    from genesis.observability.snapshots.deploy_health import collect_tier2_pending
+
+    root, venv = genesis_root
+    baseline = _git(root, "rev-parse", "HEAD")
+    _record_success(root, baseline)
+    changed = root / path
+    changed.parent.mkdir(parents=True, exist_ok=True)
+    changed.write_text("synthetic policy input\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "policy input changed")
+    assert _run_check(root, venv) == 0
+    assert collect_tier2_pending(root, baseline) == [path]

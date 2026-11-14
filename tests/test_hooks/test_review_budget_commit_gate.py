@@ -611,10 +611,6 @@ def test_a_push_only_github_url_from_global_config_still_counts(monkeypatch, rep
         "cd {cwd}; git commit -m fix",
         # Documented residue: any cd chain keeps the previous behaviour.
         "cd {cwd} && git commit -m fix",
-        # Process substitution runs a second command inside ONE parsed segment.
-        "git -C {cwd} commit -m fix > >(git -C {pub} commit -m x)",
-        "git -C {cwd} commit -m fix 2> >(git -C {pub} commit -m x)",
-        "git -C {cwd} commit -F <(git -C {pub} commit -m x)",
     ],
 )
 def test_other_retargeting_shapes_keep_unknown(monkeypatch, repo, home, tmp_path, form):
@@ -631,6 +627,32 @@ def test_other_retargeting_shapes_keep_unknown(monkeypatch, repo, home, tmp_path
     command = form.format(pub=pub, cwd=repo)
     assert _decision(_run(command, repo, home)) == "ask"
     assert _decision(_run(command, repo, home, dispatched=True)) == "deny"
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        "git -C {cwd} commit -m fix > >(git -C {pub} commit -m x)",
+        "git -C {cwd} commit -m fix 2> >(git -C {pub} commit -m x)",
+        "git -C {cwd} commit -F <(git -C {pub} commit -m x)",
+    ],
+)
+def test_a_commit_inside_a_process_substitution_is_refused(monkeypatch, repo, home, tmp_path, form):
+    """NEGATIVE CONTROL. Process substitution runs a second command inside ONE
+    parsed segment. Its body is a nested segment, so the inner commit is seen;
+    it runs in a subshell, whose directory the gate cannot establish, so it is
+    refused in every session type rather than asked about. Never exempted."""
+    _unseamed(monkeypatch, tmp_path)
+    pub = tmp_path / "pub"
+    pub.mkdir()
+    _git(pub, "init", "-q", "-b", "feature/x")
+    _git(pub, "remote", "add", "origin", "https://github.com/owner/repo.git")
+    _mark(repo, home)
+    command = form.format(pub=pub, cwd=repo)
+    for dispatched in (False, True):
+        result = _run(command, repo, home, dispatched=dispatched)
+        assert _decision(result) == "deny"
+        assert "cannot verify which branch this commit lands on" in result.stderr
 
 
 @pytest.mark.parametrize(

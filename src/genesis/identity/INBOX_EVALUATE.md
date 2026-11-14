@@ -558,6 +558,7 @@ For **Genesis-relevant** items, use this YAML block:
 
 ```yaml
 action: ADAPT              # ADOPT | ADAPT | WATCH | IGNORE (default toward ADOPT/ADAPT; WATCH needs a named trigger)
+why_not_adopt: "Reuse option considered; concrete reason direct integration loses to adaptation" # Required for ADAPT
 next_step: "One concrete sentence — what specifically to do next"
 effort: Small              # Trivial | Small | Medium | Large
 scope: V4                  # V4 (do now — DEFAULT) | V5 (sequenced behind named work) | Future (named blocker) | Never (philosophy conflict)
@@ -568,6 +569,14 @@ tool_momentum: high        # high | medium | low — growth/adoption trend
 tool_activity: high        # high | medium | low — maintenance/recency
 tool_maturity: medium      # high | medium | low — proven/stable/age
 ```
+
+For ADAPT, `why_not_adopt` must name the reusable option considered and the
+evidence for choosing adaptation over direct use or integration (including a
+wrapper, CLI or service). A language/runtime difference alone is not a veto.
+Label unverified assumptions and name the check needed. If no adoptable
+candidate was found, state the search and its limits; if none was run, say so.
+For an abstract idea, explain that no usable tool was evaluated rather than
+inventing an option or a blocker.
 
 For items under a **capability-build directive** (Step 2, "Capability-build
 directives"), use `action: BUILD` and extend the Genesis block with the

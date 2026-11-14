@@ -124,6 +124,11 @@ state and what a new session would launch, with the reason.
 
 ## Qualification checklist (when the shared service and adapter exist)
 
+The internal [HTTP composition](shared-mcp-http.md) now accepts initialized
+request-owned resources. No launcher selects it. Owned factories, unit readiness,
+the stdio adapter, local catalog union and matched measurements remain rollout
+prerequisites; constructing the HTTP app alone is not activation evidence.
+
 Before any of these: the service calls `genesis.caller_context.enter_shared_service()`
 before its first request, or work that loses its request scope reads the service's own
 environment as its caller and passes human-only gates.

@@ -238,8 +238,13 @@ count says anything about the other.
 
 ## Standing mode (Claude Code only)
 
+**Only the owner starts one.** A session never starts or restarts a standing
+loop on its own: not from an earlier yes, a plan step or a ledger row, and not
+after the loop stops. Each start needs the owner's explicit instruction at that
+moment. Once started, the loop paces itself until a stop rule below ends it.
+
 A standing validator is a session the owner starts, in a tmux slot, to work the
-backlog one PR at a time. Start it with `/loop` (no interval) so it can pace
+backlog one PR at a time. The owner starts it with `/loop` (no interval) so it can pace
 itself with ScheduleWakeup; it also uses `outreach_send`, so it is a Claude Code
 mode, and the Codex validator above does not run it. **Run one per install:** the
 picker has no lease, so two would pick the same row and report the same failure
@@ -565,6 +570,49 @@ passes (2 of 14 rows) came from this. One PR's
 refusal rule was tested only on its release half, and the defect was in the serve
 half; another's post-save warning was tested on one stop path, and a second path
 lacked it. Open issues named both defects, and neither was read.
+
+### The holdout check
+
+An install may keep hidden holdout scenarios that builders never see
+(`docs/reference/holdout.md`). For every row, run
+`.venv/bin/python scripts/holdout_runner.py --pr <N>` from the main checkout. It
+prints `no holdout on this install`, or one line per scenario the merge touches.
+Record it:
+
+- `REGRESSED` and `NOT-DELIVERED` are a claim that failed at `MEASURED`, so the
+  row derives `fail-intent`.
+- `DELIVERED` goes in `controls`: it failed before the merge and passes after.
+  Then spawn `holdout-writer` in the foreground to retire it into a regression
+  scenario.
+- `PASS` is a finding, never a control: nothing had to come out the other way.
+- `PENDING` needs nothing: the scenario belongs to another issue's work, or to
+  a later PR in a split of this one.
+- `BROKEN-BEFORE`, `STALE-INTENT`, `FIXED`, `DELIVERED-UNLINKED`,
+  `CLOSED-NOT-DELIVERED` and `MALFORMED`
+  are findings about the default branch or the scenario, never this row's
+  verdict. File or reuse an issue for `BROKEN-BEFORE`, and tell the owner about
+  the rest.
+- Exit 3 (the run could not be completed) is a gap naming the reason it printed.
+- A `holdout fence:` line naming possibly spoiled scenarios goes to the owner:
+  a scenario seen by someone other than its writer may be spoiled. One that
+  names none needs no report unless it also counts unreadable lines or
+  says to confirm holdout-writer accesses (those made since the newest
+  scenario was written), which the owner confirms; the same holds for a
+  `no exposures logged` line. An `exposure log unreadable` line goes to the
+  owner too. A line
+  saying the fence is not installed means exposures are not being recorded.
+  A `dismissed` count on the line goes to the owner too, with the latest
+  dismissal's time: any session can run the command, so the owner confirms
+  each dismissal was their ruling. Dismiss a row only when the owner rules it
+  harmless in the conversation:
+  `.venv/bin/python scripts/holdout_runner.py --dismiss <its at> --reason "<why>"`,
+  run as its own command, with a reason that never quotes scenario text. Check
+  that the count it prints equals the rows the owner ruled on; one time can
+  match several rows.
+
+Never open, list or quote the holdout directory (`$GENESIS_HOME/holdout/`,
+`~/.genesis/holdout/` by default) yourself, and never ask what a
+scenario checks beyond its printed `Protects` line: reading it spoils it.
 
 ---
 

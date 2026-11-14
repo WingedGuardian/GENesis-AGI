@@ -1,5 +1,17 @@
 # Testing Guide
 
+Internal shared HTTP qualification uses the exact upgraded-stack interpreter and
+explicit files `tests/test_mcp/test_shared_http_admission.py`,
+`tests/test_mcp/test_shared_http_policy.py`,
+`tests/test_mcp/test_shared_http_runtime.py`, and
+`tests/test_observability/test_activity_persistence_scope.py`. Runtime tests own
+the real manager lifespan in one task, use actual SDK dispatch/SQLite and
+synthetic tools, and cover authentication, profiles/local refusal, activity
+suppression, tool/session/body limits, idle expiration and freshness rollback.
+Persistence assertions explicitly settle existing asynchronous batches; they
+are not an immediate-durability guarantee. These fixtures do not replace owned
+loopback progress/cancellation qualification, independent review or landed E2E.
+
 The standalone rollout CLI and captured deploy source are exercised with real
 `python -I -S` subprocesses in `tests/test_scripts/test_mcp_rollout_config.py`,
 `test_mcp_rollout_failures.py`, and `test_mcp_rollout_repair.py`. Run them with
@@ -303,10 +315,26 @@ inherit it.
   memory hook as a child never posts to the live server.
 - `GENESIS_MCP_LOG_DIR` names a directory that does not exist, so importing the
   health MCP opens no log in the shared `~/tmp`.
+- `HOME` names a private directory for the whole session, created when the
+  plugin is imported (before any `genesis` module loads, so nothing binds the
+  real home first), with `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`
+  and `XDG_STATE_HOME` inside it. Anything resolved through `Path.home()`, `~`
+  or those variables (tokens, the Guardian's shared policy file, caches,
+  stamps, logs, `~/tmp` scratch, `~/.claude`, `~/.genesis`, `~/.ssh`,
+  `~/.aws`) lands there instead. It starts with only `tmp/`. It sits in the
+  real home's big-tmp directory (`GENESIS_BIG_TMP`, else `~/tmp`) where the
+  basetemp redirect applies, else in the default temp dir, and is removed at
+  the end of the run; a killed run's home ages out through the daily `~/tmp`
+  prune. The box lock and basetemp are placed with `HOME` set back to what it
+  was when the run started, so both keep their locations. `tests._live_fence.real_home()` names
+  the real home for a test that must use it, and `PLAYWRIGHT_BROWSERS_PATH`
+  keeps pointing at the real browser cache so the UI tests find their browser.
+  The run summary names the home, and any `genesis` module that was already
+  loaded when it was set (none is expected).
 - A test that sets its own value with `monkeypatch` still wins.
-- `GENESIS_LIVE_E2E=1` (the opt-in live tests) leaves `SECRETS_PATH` and the
-  credential variables in place, and the summary says so; the git, gh,
-  database, hook-URL and log settings still apply.
+- `GENESIS_LIVE_E2E=1` (the opt-in live tests) leaves `SECRETS_PATH`, the
+  credential variables and `HOME` in place, and the summary says so; the git,
+  gh, database, hook-URL and log settings still apply.
 - The closure's directory is removed at the end of the run; a child that
   outlives pytest is left with paths that do not exist, so no credentials.
 - Not covered:
@@ -316,11 +344,19 @@ inherit it.
     `*_BEARER*`, a bare `*_KEY` or `*_PWD`, a DSN, a credential embedded in a
     URL value (`DATABASE_URL`, `HTTP_PROXY`), or a variable pointing at a
     credential file (`AWS_PROFILE`, `DOCKER_CONFIG`, `NETRC`, `KUBECONFIG`);
-  - credentials a program finds through the home directory rather than the
-    environment (`~/.ssh`, tool config files);
-  - a child started with an environment that does not carry these variables,
-    including tests that strip every `GIT_*` variable from a child (its git
-    then reads the home's user config again);
+  - a path resolved from the password database rather than `HOME` (OpenSSH
+    finds `~/.ssh` that way), and a child started with an environment that has
+    no `HOME` at all (Python and bash then fall back to the real home);
+  - an explicit `GENESIS_HOME` a test or the environment sets, and an explicit
+    `GENESIS_BIG_TMP`, which `big_tmp_dir()` keeps using as given;
+  - other variables that already hold a path under the real home when the
+    run starts (a plugin's data directory, a session socket): they are
+    passed through unchanged;
+  - `tempfile` output, which goes to `TMPDIR` (on some installs a directory in
+    the real home);
+  - a child started with an environment that does not carry these variables
+    (a test that strips every `GIT_*` variable from a child still leaves it
+    the private `HOME`, so its git reads only the empty test home's config);
   - a repository-local `core.askPass` or `credential.helper`.
 
 ### The outbound fence: tests never connect to a live service
@@ -380,6 +416,64 @@ containing a newline (it cannot be represented in `/proc/net/unix`); and an
 IPv6 link-local scope id, which `/proc/net/tcp6` does not record, so two
 listeners with the same link-local address on different interfaces are judged
 as one.
+
+### The write audit: writes into the real home are reported
+
+`tests/_live_writes.py`, armed last, reports (never fails) the writes a test
+makes into the real home outside its temp dirs, for the operations it hooks: `open` with write intent,
+`os.remove`/`rename`/`replace`/`mkdir`/`rmdir`/`truncate`/`symlink`/`link`,
+`shutil.rmtree`, and an SQLite connect to a file that is not opened read-only.
+It also reports reads of the real credential files (the deployed `secrets.env`,
+`~/.claude/.credentials.json`, `~/.config/gh/hosts.yml`,
+`~/.genesis/cc_oauth_token.env`).
+
+- Allowed, so never reported: `tempfile.gettempdir()`, pytest's basetemp, the
+  box lock file, `/dev`, and `__pycache__` / `.pytest_cache` directories.
+- Each write is classed by where it lands (the deployed checkout, this checkout,
+  `~/.genesis`, `~/.claude`, elsewhere in the home) and attributed to the test.
+- The run summary counts tests per class under "writes outside the test's temp
+  dirs"; `GENESIS_LIVE_WRITES_REPORT=<file>` writes one tab-separated line per
+  (test, class, operation, path), on every run.
+- A hit is a write that happens: an attempt the kernel refuses or that changes
+  nothing (`mkdir(exist_ok=True)` on an existing directory, `unlink` of a missing
+  file, reopening an existing file without writing) is not recorded. A relative
+  `os.open` is judged against the cwd and labelled so (its audit event carries no
+  `dir_fd`). Writes during collection count as "outside any test".
+- Not covered: writes made by child processes, writes without an audit event,
+  metadata changes (`chmod`, `utime`, `setxattr`, `touch` of an existing file),
+  `mkfifo`/`mknod`, SQLite writes through an already-open connection, and
+  `file://localhost` or percent-encoded SQLite URIs. The OS-level sandbox is the
+  boundary there.
+
+The list it produces is the to-do list for moving each such test under its own
+`tmp_path`; once it is empty, the audit can refuse instead of report.
+
+## Shared MCP qualification environments
+
+Ordinary CI keeps its existing runtime dependency ranges. The shared-only
+protocol suites require the exact versions admitted by
+`genesis.mcp.shared_http._settings.require_qualified_stack`; an unsupported
+ordinary environment explicitly skips those three modules before SDK imports.
+Pure configuration and missing/later-version refusal tests remain ordinary
+tests in `tests/test_mcp/test_shared_http_settings.py`.
+
+`.github/workflows/shared-mcp-qualification.yml` installs the separate
+`.github/shared-mcp/requirements.txt` constraints alongside the existing test-tool
+pins. It runs for relevant PRs across base branches, including stacked PRs, with
+read-only permissions. `GENESIS_REQUIRE_SHARED_MCP_QUALIFICATION=1` is test-only:
+qualification refusal becomes a collection error in this job. No production
+version, feature, credential or rollout gate changes.
+
+The protocol step names the admission, policy and actual HTTP modules explicitly.
+Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
+and a floor of 91 cases. Installation, collection, test or report-check failure
+fails the job; missing or filtered workflow runs do not qualify a PR. Closing
+checks its actual head/base result. Ordinary skip-budget changes require observed
+skip identities; this workflow does not raise that budget automatically.
+
+For a local run, use an already qualified isolated interpreter and the same
+strict test flag, then run the workflow's report check. Changing installed
+packages or enabling shared services is not part of that test command.
 
 ## Integration Tests
 

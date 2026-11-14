@@ -26,6 +26,7 @@ on:
       - tests/test_hooks/test_git_push_guard_codex_freshness.py
       - tests/test_hooks/test_scored_bot_reviewers.py
       - tests/test_hooks/test_merge_gate_characterization.py
+      - tests/test_hooks/test_merge_gate_server_replay.py
 
 permissions:
   contents: read

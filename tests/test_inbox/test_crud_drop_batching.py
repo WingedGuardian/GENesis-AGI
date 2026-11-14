@@ -312,6 +312,7 @@ async def test_reuse_as_pending_resets_created_at(db):
     await inbox_items.reuse_as_pending(
         db, "r", drop_id="NEW", batch_items="new", content_hash="h1",
         created_at="2026-06-30T18:00:00+00:00",
+        expected_batch_items="old", expected_retry_ids=["r"], max_retries=3,
     )
     row = await inbox_items.get_by_id(db, "r")
     assert row["status"] == "pending"
@@ -336,6 +337,7 @@ async def test_get_by_file_path_returns_rearmed_reused_row(db):
     await inbox_items.reuse_as_pending(
         db, "reused", drop_id="D", batch_items="new", content_hash="h",
         created_at="2026-06-30T18:00:00+00:00",
+        expected_batch_items=None, expected_retry_ids=["reused"], max_retries=3,
     )
     latest = await inbox_items.get_by_file_path(db, _FP)
     assert latest["id"] == "reused", (

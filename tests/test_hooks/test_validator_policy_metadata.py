@@ -104,7 +104,10 @@ def test_default_segment_shape_and_values_are_unchanged_by_policy_scan(parser, c
     assert blind == repeated_blind and expected == [asdict(s) for s in repeated]
     for segment in repeated:
         assert type(segment) is parser.Segment
-        assert set(asdict(segment)) == {'exe', 'argv', 'override', 'raw', 'depth', 'redirects', 'verb_unresolved'}
+        assert set(asdict(segment)) == {
+            'exe', 'argv', 'override', 'raw', 'depth', 'redirects', 'verb_unresolved',
+            'locale_program', 'locale_script',  # ordinary-view facts, like verb_unresolved; not policy ones
+        }
 
 
 @pytest.mark.parametrize('case', ['length', 'depth', 'verb', 'continuation'])

@@ -30,7 +30,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from contextlib import contextmanager, suppress
+from contextlib import closing, contextmanager, suppress
 from pathlib import Path
 
 FULL_INTERVAL_S = 7 * 24 * 3600
@@ -48,9 +48,10 @@ AUTOMATIC_PROTOCOL_INCOMPLETE = 10
 BUSY_STATUS = 75
 
 
-def _load_sibling(name, spec):
+def _load_sibling(name, filename):
     module = sys.modules.get(name)
     if module is None:
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(filename))
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         try:
@@ -61,42 +62,13 @@ def _load_sibling(name, spec):
     return module
 
 
-_legacy = _load_sibling(
-    "_genesis_index_marker_legacy",
-    importlib.util.spec_from_file_location(
-        "_genesis_index_marker_legacy", Path(__file__).with_name("index_marker_legacy.py")
-    ),
-)
-_recovery = _load_sibling(
-    "_genesis_index_marker_recovery",
-    importlib.util.spec_from_file_location(
-        "_genesis_index_marker_recovery", Path(__file__).with_name("index_marker_recovery.py")
-    ),
-)
-_legs = _load_sibling(
-    "_genesis_index_marker_legs",
-    importlib.util.spec_from_file_location(
-        "_genesis_index_marker_legs", Path(__file__).with_name("index_marker_legs.py")
-    ),
-)
-_native = _load_sibling(
-    "_genesis_index_marker_execution",
-    importlib.util.spec_from_file_location(
-        "_genesis_index_marker_execution", Path(__file__).with_name("index_marker_execution.py")
-    ),
-)
-_proof = _load_sibling(
-    "_genesis_code_intel_execution",
-    importlib.util.spec_from_file_location(
-        "_genesis_code_intel_execution", Path(__file__).with_name("code_intel_execution.py")
-    ),
-)
-_cli = _load_sibling(
-    "_genesis_index_marker_cli",
-    importlib.util.spec_from_file_location(
-        "_genesis_index_marker_cli", Path(__file__).with_name("index_marker_cli.py")
-    ),
-)
+_legacy = _load_sibling("_genesis_index_marker_legacy", "index_marker_legacy.py")
+_recovery = _load_sibling("_genesis_index_marker_recovery", "index_marker_recovery.py")
+_legs = _load_sibling("_genesis_index_marker_legs", "index_marker_legs.py")
+_retry = _load_sibling("_genesis_index_marker_retry", "index_marker_retry.py")
+_native = _load_sibling("_genesis_index_marker_execution", "index_marker_execution.py")
+_proof = _load_sibling("_genesis_code_intel_execution", "code_intel_execution.py")
+_cli = _load_sibling("_genesis_index_marker_cli", "index_marker_cli.py")
 MAX_ATTEMPTS = _legs.MAX_ATTEMPTS
 VALID_TOOLS = (*_legs.PROVIDERS, "both")
 VALID_MODES = _legs.MODES
@@ -419,21 +391,16 @@ def _publisher(*, wait_s: float = LOCK_WAIT_S, legacy_requests: bool = False):
 @contextmanager
 def _queue_gate(*, native=False, admission=None):
     """Initialize first, then drain and decide under one exclusive barrier."""
-    db = _connect(OUTCOME_LOCK_WAIT_S)
-    try:
-        with _legacy._lock(marker_dir(), OUTCOME_LOCK_WAIT_S):
-            with _transaction(db):
-                _recovery.admission_schema(db, SCHEMA_VERSION, _native, require_native=native)
-                imported = _legacy.drain(marker_dir(), db, _import_one, _fsync_dir)
-                residual = []
-                native_imported = _native.drain(marker_dir(), db, _legs, _proof, marker_hash, residual=residual)
-                if admission is not None:
-                    _recovery.refuse_unrepresented(db, residual, admission)
-                yield db
-            _legacy.retire(marker_dir(), imported, _fsync_dir)
-            _legacy.retire(marker_dir(), native_imported, _fsync_dir)
-    finally:
-        db.close()
+    with _decision_gate(native=native, admission=admission) as (db, _finalize):
+        yield db
+
+
+@contextmanager
+def _decision_gate(*, native=False, admission=None):
+    with closing(_connect(OUTCOME_LOCK_WAIT_S)) as db, _recovery.decision_gate(
+        db, globals(), native=native, admission=admission
+    ) as decision:
+        yield decision
 
 
 def _coalesce_pending(db: sqlite3.Connection, h: str, data: dict, *, legacy=False) -> None:
@@ -666,11 +633,7 @@ def _fresh_cleanup(db, row, *, proc=Path("/proc")) -> bool:
     if (row["scope_registration"] is None or row["cleanup_proof"] is None
             or row["completion_kind"] == "unbound" or row["launch_permission"] not in ("spent", "cancelled")):
         return False
-    scope = _load_sibling(
-        "_genesis_code_intel_scope",
-        importlib.util.spec_from_file_location(
-            "_genesis_code_intel_scope", Path(__file__).with_name("code_intel_scope.py")),
-    )
+    scope = _load_sibling("_genesis_code_intel_scope", "code_intel_scope.py")
     retained = (json.loads(path.read_bytes(), object_pairs_hook=_proof._unique)
                 for path in marker_dir().glob(f".execution-spool-{row['hash']}-{row['claim_id']}-*.spool"))
     return _native.retain_fresh_cleanup(
@@ -922,9 +885,7 @@ def _cli_context(args):
 
 
 def _machine_hash(value: str) -> str:
-    if len(value) != 16 or any(char not in "0123456789abcdef" for char in value):
-        raise ValueError("invalid machine repository hash")
-    return value
+    return _native._hex(value, 16, "machine repository hash")
 
 
 def _pending_record(row: dict) -> tuple[str, ...]:
@@ -967,8 +928,8 @@ def _write_machine(records) -> None:
     sys.stdout.buffer.flush()
 
 
-def main(argv: list[str] | None = None) -> int:
-    return _cli.main(argv, globals())
+def main(argv: list[str] | None = None, *, supervisor=None) -> int:
+    return _cli.main(argv, globals(), supervisor=supervisor)
 
 
 if __name__ == "__main__":

@@ -565,6 +565,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-serena-claude-code.service genesis-serena-codex.service \
                     genesis-backup.timer genesis-backup.service \
                     genesis-server.service genesis-bridge.service \
+                    genesis-live-agent.service \
                     genesis-falkordb.service \
                     qdrant.service; do
             safe_disable_service "$unit"

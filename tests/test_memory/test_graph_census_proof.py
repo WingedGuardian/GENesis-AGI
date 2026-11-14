@@ -245,16 +245,138 @@ def test_a_reason_never_carries_an_environment_value(tree):
 # ── secrets file and kill switch ──────────────────────────────────────────
 
 
-def test_the_secrets_file_is_chosen_the_way_genesis_env_chooses_it(tree):
+def test_the_secrets_file_is_chosen_the_way_genesis_env_chooses_it(tree, tmp_path):
     main = tree["main"]
-    assert proof.secrets_file({}, main_root=main) == main / "secrets.env"
-    assert proof.secrets_file({"GENESIS_REPO_ROOT": "/r"}, main_root=main) == Path("/r/secrets.env")
+    home = tmp_path / "server-home"
+    home.mkdir()
+    h = {"HOME": str(home)}
+    # No file anywhere: the checkout default, as the resolver gives it.
+    assert proof.secrets_file(h, main_root=main) == main / "secrets.env"
+    (main / "secrets.env").write_text("K=v\n")
+    assert proof.secrets_file(h, main_root=main) == main / "secrets.env"
+    other = tmp_path / "r"
+    other.mkdir()
+    (other / "secrets.env").write_text("K=v\n")
+    env = {**h, "GENESIS_REPO_ROOT": str(other)}
+    assert proof.secrets_file(env, main_root=main) == other / "secrets.env"
+    # That process's own home config outranks both checkouts.
+    (home / ".config/genesis").mkdir(parents=True)
+    (home / ".config/genesis/secrets.env").write_text("K=v\n")
+    assert proof.secrets_file(h, main_root=main) == home / ".config/genesis/secrets.env"
+    # Its HOME is required to know that, so none means unprovable.
+    assert proof.secrets_file({}, main_root=main) is None
     env = {"GENESIS_REPO_ROOT": "/r", "SECRETS_PATH": "/s/x.env"}
     assert proof.secrets_file(env, main_root=main) == Path("/s/x.env")
     env = {"SECRETS_PATH": "~/s.env", "HOME": "/home/other"}
     assert proof.secrets_file(env, main_root=main) == Path("/home/other/s.env")
     assert proof.secrets_file({"SECRETS_PATH": "~/s.env"}, main_root=main) is None
     assert proof.secrets_file({"SECRETS_PATH": "rel.env"}, main_root=main) is None
+
+
+def _homes(tree, tmp_path):
+    main = tree["main"]
+    home = tmp_path / "server-home"
+    (home / ".config/genesis").mkdir(parents=True)
+    (main / "secrets.env").write_text("GENESIS_GRAPH_TELEMETRY_DISABLED=0\n")
+    return main, home, {"HOME": str(home)}
+
+
+def _after(path: Path) -> float:
+    """A start time just after ``path``'s last change; later changes are newer."""
+    start = path.stat().st_ctime + 1e-3
+    time.sleep(0.02)
+    return start
+
+
+def test_a_deleted_home_config_never_proves_the_fallback(tree, tmp_path):
+    # #4278: a server that loaded the home config, which is deleted after it
+    # started, must read as unknown, not as proven from the checkout file.
+    main, home, h = _homes(tree, tmp_path)
+    preferred = home / ".config/genesis/secrets.env"
+    preferred.write_text("GENESIS_GRAPH_TELEMETRY_DISABLED=1\n")
+    start = _after(preferred)
+    preferred.unlink()
+    assert proof.secrets_file(h, main_root=main) == main / "secrets.env"  # NOW
+    assert proof.secrets_file(h, main_root=main, start=start) is None
+
+
+def test_an_unchanged_home_config_dir_accepts_the_fallback(tree, tmp_path):
+    main, home, h = _homes(tree, tmp_path)
+    start = _after(home / ".config/genesis")
+    assert proof.secrets_file(h, main_root=main, start=start) == main / "secrets.env"
+
+
+def test_an_unrelated_config_change_does_not_touch_the_proof(tree, tmp_path):
+    # Only ~/.config/genesis is dated, so other apps' config churn never makes a
+    # server unknown (and never resets the census clock).
+    main, home, h = _homes(tree, tmp_path)
+    start = _after(home / ".config/genesis")
+    (home / ".config/other-app").mkdir()
+    (home / ".config/other-app/settings").write_text("x")
+    assert proof.secrets_file(h, main_root=main, start=start) == main / "secrets.env"
+
+
+def test_a_swapped_home_config_link_never_proves_the_fallback(tree, tmp_path):
+    # ~/.config/genesis as a symlink, pointed at an older empty directory after
+    # start: stat follows the link, so the link itself must be dated too.
+    main, home, h = _homes(tree, tmp_path)
+    (home / ".config/genesis").rmdir()
+    old_empty = tmp_path / "old-empty"
+    old_empty.mkdir()
+    loaded = tmp_path / "loaded"
+    loaded.mkdir()
+    (loaded / "secrets.env").write_text("GENESIS_GRAPH_TELEMETRY_DISABLED=1\n")
+    link = home / ".config/genesis"
+    link.symlink_to(loaded)
+    start = _after(link)
+    tmp_link = home / ".config/genesis.new"
+    tmp_link.symlink_to(old_empty)
+    tmp_link.replace(link)
+    assert proof.secrets_file(h, main_root=main) == main / "secrets.env"  # NOW
+    assert proof.secrets_file(h, main_root=main, start=start) is None
+
+
+def test_a_fallback_between_two_checkouts_is_unknown(tree, tmp_path):
+    # GENESIS_REPO_ROOT names another checkout whose file is gone; the resolver
+    # now lands on ~/genesis/secrets.env, which the process may never have read.
+    main = tree["main"]
+    home = tmp_path / "server-home"
+    (home / "genesis").mkdir(parents=True)
+    (home / "genesis/secrets.env").write_text("K=v\n")
+    other = tmp_path / "other-checkout"
+    other.mkdir()
+    env = {"HOME": str(home), "GENESIS_REPO_ROOT": str(other)}
+    start = time.time()
+    assert proof.secrets_file(env, main_root=main) == home / "genesis/secrets.env"  # NOW
+    assert proof.secrets_file(env, main_root=main, start=start) is None
+
+
+def test_with_no_home_config_dir_the_fallback_is_accepted(tree, tmp_path):
+    # The stated residual: nothing is left to date once the directory is gone.
+    main = tree["main"]
+    home = tmp_path / "bare-home"
+    home.mkdir()
+    (main / "secrets.env").write_text("K=v\n")
+    start = time.time()
+    h = {"HOME": str(home)}
+    assert proof.secrets_file(h, main_root=main, start=start) == main / "secrets.env"
+
+
+def test_the_migration_rename_is_carried_not_reset(tree, tmp_path):
+    # The move renames the checkout file into the home config after servers
+    # started. The renamed file is preferred now and changed since start, so it
+    # is not proven directly, but the earlier proven digest carries it.
+    main, home, h = _homes(tree, tmp_path)
+    legacy = main / "secrets.env"
+    start = _after(legacy)
+    proven = proof.secrets_digest(proof.secrets_values(legacy, start))
+    preferred = home / ".config/genesis/secrets.env"
+    legacy.rename(preferred)
+    path = proof.secrets_file(h, main_root=main, start=start)
+    assert path == preferred
+    assert proof.secrets_values(path, start) is None
+    carried = proof.carry_secrets(path, start, proven, env=h, main_root=main)
+    assert carried == {"GENESIS_GRAPH_TELEMETRY_DISABLED": "0"}
 
 
 def test_a_secrets_file_unchanged_since_start_is_read(tmp_path):
