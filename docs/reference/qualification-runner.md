@@ -4,6 +4,9 @@ For read-only reuse across immutable stopped campaigns, see
 [qualification lineage](qualification-lineage.md): `study-check` validates a
 frozen continuation plan and `study-report` scores its inherited prefix. These
 commands authorize no acquisition and retain unresolved historical liabilities.
+For explicitly approved finite acquisition, see
+[bounded continuation](qualification-continuation.md): `study-run` requires a
+new plan/count-bound spending assertion and never relaunches an existing root.
 
 Run this workflow in a dedicated serial process, never inside the serving
 process. Production rendering and disposable storage replay temporarily patch

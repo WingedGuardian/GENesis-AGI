@@ -3590,6 +3590,12 @@ verified: 5be8573a5 2026-11-07
   independent-backup claim. Missing retained evidence refuses before rendering.
   The isolated serial CLI supports Flash-only, explicit Pro–Flash or historical MiMo–Flash execution
   under an exact frozen operating plan and a separate local spending assertion.
+  Bounded `study-run` uses a separate count-bound consent, fixed nonrelaunchable
+  root and one existing physical journal per request. Only the precise closed
+  upstream-pool rejection can receive a finite replacement. Both offline study
+  readers census the complete owner/sibling population; model errors and
+  unresolved expense remain separate. This adds no paid authorization, route
+  selection or activation. See `docs/reference/qualification-continuation.md`.
   An explicit manifest-bound Pro incumbent sample retains complete reference
   admission and full Flash gates. Sampled Pro reports completion separately
   from qualification; execution and detached reporting use the same declared

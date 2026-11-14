@@ -46,13 +46,14 @@ class Frozen(execution.Input):
 class History(Frozen):
     """A hash-bound snapshot, with the original full row and incident history."""
 
-    def __init__(self, reference):
+    def __init__(self, reference, *, owners=None):
         if (not isinstance(reference, dict)
                 or set(reference) != {"directory", "journal_sha256", "manifest_hash", "closure"}
                 or not isinstance(reference["directory"], str) or not reference["directory"].strip()
                 or not is_hash(reference["manifest_hash"])):
             raise Incomplete("invalid history reference")
         self.directory = Path(reference["directory"]).absolute()
+        self.owner, self.closure_safe = None, True
         super().__init__(self.directory / "answers.jsonl", reference["journal_sha256"])
         try:
             snapshot = Campaign.read(self.directory)
@@ -65,12 +66,20 @@ class History(Frozen):
                     or digest(self._state.manifest) != reference["manifest_hash"]):
                 raise Incomplete("history manifest changed")
             self.reference = copy.deepcopy(reference)
+            self.semantic_manifest = self._state.manifest
             if "study" in self._state.manifest["binding"] or reference["closure"] is not None:
-                raise Incomplete("study_child_requires_controller_reader")
-            self.check(final=True)
+                if owners is None:
+                    raise Incomplete("study_child_requires_controller_reader")
+                owners.resolve(self, reference["closure"])
+            Frozen.check(self, final=True)
         except BaseException:
             self.close()
             raise
+
+    def check(self, *, final=False, owner=True):
+        super().check(final=final)
+        if owner and self.owner is not None:
+            self.owner.check(final=final)
 
     @property
     def state(self):
@@ -124,7 +133,14 @@ def _receipt(receipt, spec, generation):
 def eligible(history, identity):
     """Return a verified physical row regardless of whether its judgment agrees."""
     history.check()
-    state, row = history._state, history._state.attempts[identity]
+    if not history.closure_safe:
+        return None
+    return eligible_row(history._state, identity, history.semantic_manifest)
+
+
+def eligible_row(state, identity, semantic_manifest):
+    """Verify a real physical state against its owner's full logical admission."""
+    row = state.attempts[identity]
     incidents = {f"{name}:{identity}" for name in ("billing", "reservation", "answer", "failure", "identity")}
     if identity not in state.answers or state.blockers & incidents or len(row["observations"]) != 1:
         return None
@@ -132,8 +148,8 @@ def eligible(history, identity):
         spec, observed, generation = row["spec"], row["observations"][0], _generation(row)
         if generation is None:
             return None
-        binding = state.manifest["binding"]["transports"][spec["alias"]]
-        prepared = state.manifest["binding"]["admission"]["plan"][spec["contract"]][spec["case_id"]]
+        binding = semantic_manifest["binding"]["transports"][spec["alias"]]
+        prepared = semantic_manifest["binding"]["admission"]["plan"][spec["contract"]][spec["case_id"]]
         if (pinned.model_identities(binding) != pinned.model_identities(spec)
                 or pinned.frozen_credential_mode(binding) != pinned.frozen_credential_mode(spec)
                 or pinned.frozen_receipt_policy(binding) != pinned.frozen_receipt_policy(spec)
@@ -163,12 +179,19 @@ def eligible(history, identity):
 def rejected(history, identity):
     """Recognize only the explicit upstream-pool rejection; never settle its cost."""
     history.check()
+    if not history.closure_safe:
+        return False
     row = history._state.attempts[identity]
+    failures = [event["error"] for event in history._lines
+                if event["kind"] == "failure" and event["attempt"] == identity]
+    return rejected_row(row, failures)
+
+
+def rejected_row(row, failures):
+    """The same closed-evidence predicate serves inherited and just-closed requests."""
     if not row["dispatched"] or len(row["observations"]) != 1 or _generation(row) is None:
         return False
     spec, observed = row["spec"], row["observations"][0]
-    failures = [event["error"] for event in history._lines
-                if event["kind"] == "failure" and event["attempt"] == identity]
     normalization = "invalid financial evidence: 'usage'"
     derivative = {"operating_comparison_stopped:LocalFailure", "operating_comparison_stopped:Incomplete"}
     if (not failures or failures[0] != normalization or any(value not in derivative for value in failures[1:])

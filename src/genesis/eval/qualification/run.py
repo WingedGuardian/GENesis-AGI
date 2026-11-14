@@ -215,7 +215,7 @@ async def _case(name, case, router, sandbox):
     return result
 
 
-async def score(cases, router, temp_root):
+async def score(cases, router, temp_root, *, stop_on_error=False):
     """Serial orchestration. A local fault stops subsequent acquisition, not just scoring."""
     records, clamped, stopped = {}, {}, False
     attempts = {coordinate[:4]: attempt for coordinate, attempt in router.schedule.items()}
@@ -252,6 +252,9 @@ async def score(cases, router, temp_root):
                     else:
                         rows[identity] = _record(name, case, result)
                         clamped[name] += _clamped(name, router.calls[0][1])
+                        if stop_on_error and result["error"]:
+                            router.stop_processing(identity, Incomplete("model_output_invalid"))
+                            stopped = True
     return records, clamped
 
 
