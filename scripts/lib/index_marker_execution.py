@@ -170,11 +170,15 @@ def _conflict(db, row, raw):
     return "conflict"
 
 
-def _launch_held(db, value, row, *, fresh_cleanup=None):
-    if row["nonce_origin"] == "selected-recovery":
-        raise ValueError("selected execution support is not installed")
-    return blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"],
-                   fresh_cleanup=fresh_cleanup)
+def _launch_held(db, value, row, legs, *, fresh_cleanup=None, reserved=None):
+    if row["nonce_origin"] != "selected-recovery":
+        return blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"],
+                       fresh_cleanup=fresh_cleanup)
+    from _genesis_index_marker_retry import trial_binding
+
+    trial_binding(db, value, legs, reserved=reserved)
+    return physical_blocked(db, value["hash"], exclude=row["execution_seq"],
+                            fresh_cleanup=fresh_cleanup)
 
 
 @recovery.safety_transition
@@ -188,7 +192,7 @@ def reserve(db, value, data, legs, *, fresh_cleanup=None):
     if row["typed_applied_state"] is not None or row["launch_permission"] == "cancelled":
         return "cancelled"
     _owns(db, row)
-    if _launch_held(db, value, row, fresh_cleanup=fresh_cleanup):
+    if _launch_held(db, value, row, legs, fresh_cleanup=fresh_cleanup, reserved=data):
         return "held"
     if ("fast", "moderate", "full").index(data["run_mode"]) < legs.MODES.index(row["mode"]):
         raise ValueError("reservation cannot narrow the claimed workload")
@@ -248,7 +252,7 @@ def register(db, value, data, legs, proof, *, fresh_cleanup=None):
     raw = encode(data)
     if row["scope_registration"] is not None:
         return "already_registered" if bytes(row["scope_registration"]) == raw else _conflict(db, row, raw)
-    if _launch_held(db, value, row, fresh_cleanup=fresh_cleanup):
+    if _launch_held(db, value, row, legs, fresh_cleanup=fresh_cleanup):
         return "held"
     db.execute("UPDATE executions SET scope_registration=? WHERE execution_seq=?", (raw, row["execution_seq"]))
     return "registered"
@@ -282,7 +286,7 @@ def begin(db, value, data, legs, proof, *, fresh_cleanup=None):
         db.execute("UPDATE executions SET safety_kind='resource',first_typed_conflict="
                    "coalesce(first_typed_conflict,?) WHERE execution_seq=?", (raw, row["execution_seq"]))
         return "resource"  # Preparation OOM is durable; no indexing intent/debt is fabricated.
-    if _launch_held(db, value, row, fresh_cleanup=fresh_cleanup):
+    if _launch_held(db, value, row, legs, fresh_cleanup=fresh_cleanup):
         return "held"
     db.execute("UPDATE executions SET native_intent=?,launch_permission='spent' WHERE execution_seq=?",
                (raw, row["execution_seq"]))

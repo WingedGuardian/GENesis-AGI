@@ -1,0 +1,1 @@
+- Add captured supervised retry consumption through the existing contained owner, with atomic first-acknowledgement handling, original-owner checks and GitNexus arguments bound to retained execution origin. Automatic indexing remains disabled pending separate acceptance and cutover.

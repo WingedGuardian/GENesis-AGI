@@ -113,17 +113,20 @@ def capture(snapshot, modules, environment, *, cwd):
 def _source(snapshot, modules, context, reserved, policy, options, recipe):
     configuration = dict(repo_path=context['repo_path'], run_mode=reserved['run_mode'],
         cap_bytes=reserved['cap_bytes'], policy=policy, provider_options=options,
-        environment_recipe=recipe, arguments=['analyze'])
+        environment_recipe=recipe, arguments=options['arguments'])
     return dict(commit=snapshot.commit, files=dict(snapshot.files),
         provider_digest=options['node']['sha256'], provider_version='gitnexus@'+version(snapshot),
         configuration_sha256=modules['queue']._native.digest(configuration))
 
 
-def freeze(snapshot, modules, context, reserved, policy, environment, *, cwd=None):
+def freeze(snapshot, modules, context, reserved, policy, environment, *, cwd=None, recovery=False):
     """Bind actual files and the complete invocation recipe without admission."""
     if context['provider'] != 'gitnexus':
         raise ValueError('GN adapter requires its own provider context')
     options, frozen = capture(snapshot, modules, environment, cwd=Path.cwd() if cwd is None else cwd)
+    if type(recovery) is not bool:
+        raise ValueError('invalid GN recovery argument selection')
+    options['arguments'] = ['analyze', '--force', '--no-parse-cache'] if recovery else ['analyze']
     recipe = dict(frozen=frozen, registration_slots={'INVOCATION_ID': 'scope.invocation_id'})
     modules['queued'].NativeEnvironment(recipe, modules['queue']._native)
     return options, recipe, _source(snapshot, modules, context, reserved, policy, options, recipe)
@@ -132,8 +135,10 @@ def freeze(snapshot, modules, context, reserved, policy, environment, *, cwd=Non
 def validate(snapshot, modules, value):
     """Closed capsule decoding is not discovery, registration or provider I/O."""
     native = modules['queue']._native
-    options = native._object(value['provider_options'], ('node', 'entry', 'package', 'cwd', 'path'),
+    options = native._object(value['provider_options'], ('node', 'entry', 'package', 'cwd', 'path', 'arguments'),
                              'GN runtime options')
+    if options['arguments'] not in (['analyze'], ['analyze', '--force', '--no-parse-cache']):
+        raise ValueError('unsupported GN runtime arguments')
     for key in ('node', 'entry', 'package'):
         pin = native._object(options[key], ('path', 'device', 'inode', 'sha256'), 'GN file pin')
         if not Path(native._text(pin['path'], 'GN file path')).is_absolute():
@@ -150,14 +155,32 @@ def validate(snapshot, modules, value):
         raise ValueError('GN runtime differs from its complete accepted source and recipe')
 
 
+def require_origin(value, modules):
+    """Refuse an argv mismatch against the actual retained execution origin.
+
+    This observation is a wiring fence, never a launch acknowledgement. The
+    admitted native transitions independently enforce grant/source/evidence.
+    """
+    origin = modules['queue'].execution_status(value['context']).get('nonce_origin')
+    if origin not in ('generated', 'selected-recovery'):
+        raise ValueError('GN requires its actual supported execution origin')
+    recovery = origin == 'selected-recovery'
+    expected = ['analyze', '--force', '--no-parse-cache'] if recovery else ['analyze']
+    if value['provider_options']['arguments'] != expected:
+        raise ValueError('GN arguments differ from the actual execution origin')
+    return recovery
+
+
 def current_source(snapshot, modules, value):
     """Re-read accepted inputs without running selection/version processes."""
     if not snapshot.current_matches():
         raise ValueError('captured GN startup source changed')
+    recovery = require_origin(value, modules)
     original = dict(value['environment_recipe']['frozen'])
     original['PATH'] = value['provider_options']['path']
     options, recipe, source = freeze(snapshot, modules, value['context'], value['reservation'],
-        value['policy'], original, cwd=value['provider_options']['cwd'])
+        value['policy'], original, cwd=value['provider_options']['cwd'],
+        recovery=recovery)
     if options != value['provider_options'] or recipe != value['environment_recipe']:
         raise ValueError('accepted GN files or native environment changed')
     return source
@@ -206,7 +229,8 @@ def run(snapshot, modules, value, environment, *, startup, observe, verify):
         confirm(snapshot, modules, value, native_environment)
         with Path(value['provider_options']['node']['path']).open('rb') as executable:
             report = queued.native(
-                [f'/proc/self/fd/{executable.fileno()}', value['provider_options']['entry']['path'], 'analyze'],
+                [f'/proc/self/fd/{executable.fileno()}', value['provider_options']['entry']['path'],
+                 *value['provider_options']['arguments']],
                 executable, after_spawn=executable.close,
                 pass_fds=(executable.fileno(),), env=native_environment, cwd=context['repo_path'])
         provider_ok = report['outcome'] == 'complete' and report['payload_returncode'] == 0

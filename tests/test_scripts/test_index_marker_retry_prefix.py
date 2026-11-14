@@ -1,4 +1,4 @@
-"""The metadata prefix must not issue a fresh selected launch acknowledgement."""
+"""Selected provenance alone cannot issue a fresh native launch acknowledgement."""
 
 from contextlib import closing
 
@@ -29,7 +29,7 @@ def test_prior_selected_row_cannot_acquire_a_new_launch_ack(queue, tmp_path, pro
     before = queue.execution_status(context)
     data = {"reserve_launch": _reservation(claimed), "register_scope": _registration(claimed),
             "begin_native": _intent(queue, claimed)}[transition]
-    with pytest.raises(ValueError, match="selected execution support"):
+    with pytest.raises(ValueError, match="native transition does not own a consumed selected grant"):
         getattr(queue, transition)(context, data)
     assert queue.execution_status(context) == before
     assert queue.get_inflight(context["hash"])["claim_id"] == context["claim_id"]
