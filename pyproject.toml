@@ -78,8 +78,9 @@ dependencies = [
     "pymupdf>=1.27",  # PDF text extraction for knowledge ingestion pipeline
     "scrapling>=0.4.7",  # Web fetching with TLS fingerprint impersonation
     "tldextract>=5",  # Public Suffix List (bundled snapshot): the cookie tools refuse to clear a public suffix
-    "curl_cffi>=0.15.0",  # curl_cffi backend for Scrapling's AsyncFetcher
-    "yt-dlp[default]>=2026.08.19",  # YouTube metadata + transcripts (knowledge/processors/youtube.py,
+    "curl_cffi==0.17.0",  # Qualified with yt-dlp 2026.10.26; includes patched bundled Brotli.
+    "brotli>=1.2.1",  # GHSA-9v8h-qqgm-4m35: the Python decoder is separate from curl_cffi's bundle.
+    "yt-dlp[default]==2026.10.26",  # YouTube metadata + transcripts (knowledge/processors/youtube.py,
                                     # behind the web_fetch MCP tool). The `default` extra brings the
                                     # JavaScript challenge solver (yt-dlp-ejs) at the exact version this
                                     # yt-dlp release pins, installed locally: never fetched at run time.

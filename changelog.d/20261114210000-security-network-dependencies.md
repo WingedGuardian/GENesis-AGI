@@ -1,0 +1,1 @@
+- Update YouTube extraction and TLS impersonation dependencies, and require the fixed Python Brotli decoder for compressed responses.
