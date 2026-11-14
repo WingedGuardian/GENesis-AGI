@@ -410,6 +410,42 @@ class TestManualMode:
         assert line.index(" TMPDIR=") < line.index(" LANG="), line  # LANG last
         assert line.index("GENESIS_CC_SLOT_OAUTH=") < line.index(" LANG="), line
 
+    def test_create_pins_sqlite_tmpdir_to_home_tmp(self, door):
+        """SQLite spills (etilqs_*) from a slot's processes must land on ~/tmp,
+        not on the small cc-tmp volume TMPDIR points at (#3099).
+
+        SQLite reads SQLITE_TMPDIR before TMPDIR. It has to be PINNED with -e,
+        for the same reason TMPDIR is: a new session takes the tmux SERVER's
+        environment, so exporting it in this script alone does not reach a slot
+        created on a server someone else started.
+        """
+        run, log, _sessions, _listing, _panes = door
+        result = run("manual")
+        assert result.returncode == 0, result.stderr
+        line = _new_session_line(log)
+        want = f"-e SQLITE_TMPDIR={Path(run.home) / 'tmp'}"
+        assert want in line, line
+        assert line.index(" SQLITE_TMPDIR=") < line.index(" LANG="), line  # LANG last
+        # TMPDIR itself is unchanged: CC's own temp stays on cc-tmp.
+        assert f"-e TMPDIR={Path(run.home) / '.genesis' / 'cc-tmp'}" in line, line
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the mode bit")
+    def test_unusable_home_tmp_pins_no_sqlite_tmpdir(self, door):
+        """When ~/tmp cannot be written, the door pins no SQLITE_TMPDIR, so
+        SQLite falls back to TMPDIR, exactly as before #3099. It never pins a
+        directory it could not write."""
+        run, log, _sessions, _listing, _panes = door
+        home_tmp = Path(run.home) / "tmp"
+        home_tmp.mkdir(parents=True, exist_ok=True)
+        home_tmp.chmod(0o500)
+        try:
+            proc = run("manual")
+        finally:
+            home_tmp.chmod(0o700)
+        assert proc.returncode == 0, proc.stderr
+        line = _new_session_line(log)
+        assert "SQLITE_TMPDIR=" not in line, line
+
     @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the mode bit")
     def test_no_usable_temp_dir_leaves_tmpdir_unset_not_empty(self, door, tmp_path):
         """When NO candidate is usable, the door must leave TMPDIR genuinely
