@@ -27,7 +27,37 @@ Two layers callers combine:
 1. ``is_secret_path`` / ``command_touches_secret`` — flag inputs whose *bodies*
    are secret by nature (``.env``, ``*.pem``, ``id_ed25519``, ``cat secrets``),
    so the caller can skip capturing the body entirely.
-2. ``scrub`` — redact inline secret shapes from whatever text IS captured.
+2. ``scrub`` — redact inline secret shapes from whatever text IS captured:
+   vendor key prefixes, PEM armour, structured tokens, credential headers and
+   bearer values, labelled values (``password: …``, ``"api_key": …``,
+   ``API_TOKEN=…``), URL userinfo passwords, and command-line credential flags.
+
+Command-line credential flags, run LAST over what the other arms left:
+
+* After a flag whose name ends in a credential label (``--password``,
+  ``--passwd``, ``--token``, ``--secret``, ``--api-key``, ``--http-password``,
+  ``-pass``, …) and a separator (whitespace, ``=``, ``:``, or ``is``), the whole
+  shell word is withheld: quoted segments, escapes and adjacent quoted pieces
+  are one word. A quote that opens the value and never closes withholds to the
+  end of the text (to the end of the line when the flag sits inside a quote); a
+  value starting with escaped quoting (a JSON-encoded command, any depth)
+  withholds to the end of the line. A flag named inside a quoted argument ends
+  its value at that quote. Kept: ``--password-file``-style names, a
+  whitespace-separated value starting with ``-``, and an empty ``""``.
+* After ``-u`` (alone or ending a grouped short flag of up to four lowercase
+  letters), ``--user`` or ``--proxy-user``, everything after the first colon of
+  the word is withheld and the user name kept. Kept: a value with no colon, a
+  ``+`` format (``date -u +%H:%M``), and a ``/``-leading second half after a
+  short ``-u`` on ``rsync`` or ``scp`` (a remote path).
+
+Stated residuals, none of which an earlier version redacted either: an apostrophe
+earlier on the line can make a quoted value read as no value; a value joined
+past a closing quote (``"--token=a"b``) is cut at the quote; grouped short flags
+with an uppercase letter or more than four letters (``-sSu``); a quoted value
+spanning lines inside an enclosing quote; a mid-word quote with no partner on
+its line ends the word; ``-p`` short password flags (``mysql -p…``,
+``sshpass -p``); argv lists (``['--password', 'x']``); ``-U``; a ``-u`` user
+name starting with ``+``.
 """
 
 from __future__ import annotations
@@ -431,6 +461,301 @@ def _redact_quoted_key_values(text: str) -> str:
     out.append(text[pos:])
     return "".join(out)
 
+
+# Command-line credential flags: ``--password "two words"``, ``--token=x``,
+# ``-pass 'a b'``. The label arms below need a ``:``, ``=`` or ``is`` separator
+# after the label, so a value separated from its flag by whitespace alone passed
+# through whole, and so did every flag named by a label only the quoted-key arm
+# knew (``passwd``, ``token``, ``secret``). The flag NAME reuses the three label
+# vocabularies above rather than a list of its own: the name must END at the
+# label (so ``--password-file`` and ``--token-file`` are not credentials) and may
+# carry ``-``/``_`` delimited segments before it (``--http-password``,
+# ``--db-password``, ``--github-token``). ``-p`` is not in any vocabulary, so it
+# is never read as a password flag: it is a port to ssh and docker and the
+# parents flag to mkdir, and a ``-p 'a b c'`` password is a stated residual.
+# The separator is whitespace, or ``=`` / ``:`` with optional whitespace around
+# it, or whitespace + ``is`` + whitespace: the same separators the label arms
+# accept, so a lone separator word (``--password = x``) is never read as the
+# value. A flag begins a shell word: start of text, whitespace, a quote, ``=`` or
+# a shell separator before it. Bounded segment repeats keep each start's scan
+# bounded, and the lookbehind admits only word starts.
+_FLAG_START = r"(?<![^\s\"'=;|&(`])"
+_CREDENTIAL_FLAG_PATTERN = re.compile(
+    _FLAG_START + r"--?(?:[A-Za-z0-9]{1,64}[_-]){0,8}"
+    r"(?:" + _TOKEN_LABEL + r"|" + _PASSWORD_LABEL + r"|" + _QUOTED_KEY_EXTRA_LABEL + r")"
+    r"(?P<sep>[ \t]*[=:][ \t]*|[ \t]+(?:is[ \t]+)?)",
+    re.IGNORECASE,
+)
+# A ``user:password`` pair after curl's ``-u``/``--user`` and ``--proxy-user``
+# (curl --help: ``-u, --user <user:password>``, ``-U, --proxy-user
+# <user:password>``), attached (``-ualice:pw``), separated, or as a grouped short
+# flag (``-su alice:pw``). Only the password goes: everything after the FIRST
+# colon, the user name kept, as the URL userinfo arm keeps it. A value with no
+# colon (``-u alice``, ``env -u NAME``, ``git push -u origin``) is untouched, and
+# so are two colon-bearing shapes that are not credentials: a ``+`` format
+# (``date -u +%H:%M``) and, after a short ``-u`` on ``rsync`` or ``scp`` only, a
+# ``/``-leading remote path (``rsync -avu host:/srv``). ``-U`` is
+# left out on purpose: it is wget's ``--user-agent``, whose value carries
+# colons, and the pattern is case-sensitive so ``-u`` never matches it.
+_USER_FLAG_PATTERN = re.compile(
+    _FLAG_START + r"(?:--(?:proxy-)?user(?P<lsep>=|[ \t]+)|-[a-z]{0,4}u(?P<ssep>[ \t]*))",
+)
+_WORD_END = frozenset(" \t\r\n;|&<>()`")
+# One double-quoted segment. The two alternatives start on different characters,
+# so a failed match backtracks linearly, not quadratically.
+_DOUBLE_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"', re.DOTALL)
+# A value that starts with escaped quoting, at any encoding depth (``\"`` once
+# JSON-encoded, ``\\\"`` twice).
+_ESCAPED_QUOTE_START = re.compile(r"\\{1,64}[\"']")
+_QUOTE_EVENT = re.compile(r"[\"'\\\n]")
+
+
+def _line_end(text: str, i: int, nl: list[int] | None = None) -> int:
+    """End of the line holding ``i``, before a ``\\r\\n`` pair's ``\\r``.
+
+    ``nl`` caches the last newline found: callers ask in increasing order, and
+    the first newline at or after an earlier position is also the first one at
+    or after any later position up to it, so one long line is searched once
+    rather than once per value on it.
+    """
+    if nl is not None and nl[0] >= i:
+        j = nl[0]
+    else:
+        j = text.find("\n", i)
+        j = len(text) if j == -1 else j
+        if nl is not None:
+            nl[0] = j
+    return j - 1 if j > i and j < len(text) and text[j - 1] == "\r" else j
+
+
+def _quote_close(text: str, i: int, limit: int) -> int:
+    """Index just past the quote that closes the one opening at ``i``, searched
+    before ``limit``; -1 when it does not close there."""
+    if text[i] == "'":
+        j = text.find("'", i + 1, limit)
+        return -1 if j == -1 else j + 1
+    m = _DOUBLE_QUOTED.match(text, i, limit)
+    return -1 if m is None else m.end()
+
+
+class _QuoteTracker:
+    """The quote open at a position, read left to right and reset at each line.
+
+    A flag NAMED inside a quoted argument (``-m "the --secret flag"``) has a
+    value that ends where that quote closes, not a word that runs on. Line-local
+    because captured text is mostly prose and output, where an apostrophe would
+    otherwise colour the rest of the capture. Positions are asked in increasing
+    order, so the whole text is read once.
+    """
+
+    __slots__ = ("text", "pos", "quote")
+
+    def __init__(self, text: str) -> None:
+        self.text, self.pos, self.quote = text, 0, ""
+
+    def at(self, i: int) -> str:
+        text, j, quote = self.text, self.pos, self.quote
+        while j < i:
+            m = _QUOTE_EVENT.search(text, j, i)
+            if m is None:
+                break
+            c, j = m.group(), m.end()
+            if c == "\n":
+                quote = ""
+            elif c == "\\":
+                if quote != "'":
+                    j += 1
+            elif not quote:
+                quote = c
+            elif c == quote:
+                quote = ""
+        self.pos, self.quote = max(j, i), quote
+        return quote
+
+    def resume(self, i: int, quote: str) -> None:
+        self.pos, self.quote = i, quote
+
+
+def _shell_word_end(text: str, i: int, enclosed: str = "", nl: list[int] | None = None) -> int:
+    """Where the shell word starting at ``i`` ends, read as the shell reads it.
+
+    A word is a run of unquoted characters, ``'…'`` and ``"…"`` segments and
+    backslash escapes, ended by unquoted whitespace or a shell metacharacter, so
+    ``"a b"'c d'`` is ONE word and a quoted space never ends it. ``enclosed`` is
+    the quote the word sits inside (the flag was named in a quoted argument):
+    that quote ends the word too. Where the end cannot be read, more is withheld,
+    never less, but only as far as the value's own quoting reaches:
+
+    * a quote that OPENS the value and never closes runs to the end of the text,
+      which is how the shell reads it (a capture cut mid-value); inside an
+      enclosing quote it runs to the end of the line;
+    * a quote that opens MID-word with no partner on its line ends the word
+      there, so a stray quote cannot take the following lines with it;
+    * a value that starts with escaped quoting (``\\"a b\\"``, at any depth) is a
+      serialized string, a JSON field or a log record, whose quoting cannot be
+      read here: it runs to the end of the line, as the header arm's value does.
+    """
+    n = len(text)
+    if _ESCAPED_QUOTE_START.match(text, i):
+        return _line_end(text, i, nl)
+    start, line_end = i, -1
+    while i < n:
+        c = text[i]
+        if c in _WORD_END or c == enclosed:
+            break
+        if c in "\"'":
+            if line_end < i:
+                line_end = _line_end(text, i, nl)
+            opens_value = i == start
+            limit = n if opens_value and not enclosed else line_end
+            close = _quote_close(text, i, limit)
+            if close == -1:
+                if not opens_value:
+                    break
+                return line_end if enclosed else n
+            i = close
+        elif c == "\\":
+            i += 2
+        else:
+            i += 1
+    return min(i, n)
+
+
+def _flag_values(text: str, pattern: re.Pattern, takes_dash_value):
+    """Yield ``(match, start, end)`` of each flag value in ``text``, left to right.
+
+    A flag inside a word already scanned is skipped, so scanned spans never
+    overlap and the scan is linear in the input. ``takes_dash_value(match)``
+    says whether a value starting with ``-`` is a value or the next option.
+    """
+    tracker = _QuoteTracker(text)
+    scanned = 0
+    nl = [-1]
+    for m in pattern.finditer(text):
+        if m.start() < scanned:  # inside a word already scanned
+            continue
+        start = m.end()
+        if start >= len(text) or text[start] in _WORD_END:
+            continue
+        if text[start] == "-" and not takes_dash_value(m):
+            continue
+        enclosed = tracker.at(m.start())
+        if enclosed and text[start] == enclosed:
+            continue  # the flag ends its quoted argument: no value
+        end = scanned = _shell_word_end(text, start, enclosed, nl)
+        tracker.resume(end, enclosed)
+        if end > start:
+            yield m, start, end
+
+
+def _redact_credential_flags(text: str) -> str:
+    """Withhold the whole shell word after a credential flag.
+
+    A whitespace-separated value that starts with ``-`` is read as the next
+    option, not the value (``--password --verbose``); after ``=`` or ``:`` it is
+    withheld whatever it starts with. An empty quoted value (``""``) is kept.
+    """
+    if "-" not in text:
+        return text
+    out: list[str] = []
+    pos = 0
+    for _m, start, end in _flag_values(
+        text, _CREDENTIAL_FLAG_PATTERN, lambda m: any(c in m.group("sep") for c in "=:")
+    ):
+        if text[start:end] in ('""', "''"):
+            continue
+        if text[start:end].rstrip(",.") == _REDACTED:
+            continue  # already withheld by an earlier arm: keep its punctuation
+        out.append(text[pos:start])
+        out.append(_REDACTED)
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _first_colon(text: str, start: int, end: int) -> tuple[int, str]:
+    """The first ``:`` in ``text[start:end]`` and the quote open at it (``""``
+    when none). Backslash escapes are skipped outside quotes and inside ``"``."""
+    quote, i = "", start
+    while i < end:
+        c = text[i]
+        if c == "\\" and quote != "'":
+            i += 2
+            continue
+        if quote:
+            if c == quote:
+                quote = ""
+            elif c == ":":
+                return i, quote
+        elif c in "\"'":
+            quote = c
+        elif c == ":":
+            return i, ""
+        i += 1
+    return -1, ""
+
+
+# Commands whose short ``-u`` is not a user flag and whose ``host:/path``
+# operand carries a colon. Only these keep a ``/``-leading second half.
+_REMOTE_PATH_COMMANDS = frozenset({"rsync", "scp"})
+_SEGMENT_BREAK = re.compile(r"[;|&\n(]")
+_COMMAND_WORD = re.compile(r"[ \t]*(?:sudo[ \t]+)?([^\s;|&()]+)")
+
+
+class _SegmentTracker:
+    """The command word of the shell segment holding a position, read left to
+    right (positions are asked in increasing order, so the text is read once)."""
+
+    __slots__ = ("text", "pos", "seg", "cached")
+
+    def __init__(self, text: str) -> None:
+        self.text, self.pos, self.seg, self.cached = text, 0, 0, None
+
+    def command_at(self, i: int) -> str:
+        for m in _SEGMENT_BREAK.finditer(self.text, self.pos, i):
+            self.seg, self.cached = m.end(), None
+        self.pos = max(self.pos, i)
+        if self.cached is None:
+            word = _COMMAND_WORD.match(self.text, self.seg)
+            self.cached = word.group(1).rsplit("/", 1)[-1] if word else ""
+        return self.cached
+
+
+def _user_flag_takes_dash_value(m: re.Match) -> bool:
+    return m.group("lsep") == "=" or (m.group("lsep") is None and not m.group("ssep"))
+
+
+def _redact_user_passwords(text: str) -> str:
+    """Withhold the password half of a ``user:password`` after a user flag.
+
+    Everything after the first colon in the word goes. When that colon sits
+    inside a quoted segment, the quote is closed again after the marker so the
+    result stays well-formed and a second scrub reads it the same way.
+    """
+    if "-" not in text or ":" not in text:
+        return text
+    out: list[str] = []
+    pos = 0
+    segment = _SegmentTracker(text)
+    for m, start, end in _flag_values(text, _USER_FLAG_PATTERN, _user_flag_takes_dash_value):
+        if text.startswith("+", start + (text[start] in "\"'")):
+            continue  # a format (``date -u +%H:%M``), not a user
+        colon, quote = _first_colon(text, start, end)
+        if colon == -1 or text[colon + 1 : end] in ("", quote):
+            continue
+        if (
+            text.startswith("/", colon + 1)
+            and m.group("ssep") is not None
+            and segment.command_at(m.start()) in _REMOTE_PATH_COMMANDS
+        ):
+            continue  # a remote path (``rsync -avu host:/srv``), not a password
+        out.append(text[pos : colon + 1])
+        out.append(_REDACTED + quote)
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
 # Credentials embedded in a URL's userinfo section (the user/password pair that
 # can precede an "@" host separator). Only fires when an "@" follows, so a plain
 # host-and-port URL never matches.
@@ -593,6 +918,23 @@ def scrub(text: str) -> str:
 
     Fail-safe: on any internal error returns a placeholder, never the raw input.
     """
+    return _scrub(text, flags=True)
+
+
+def scrub_base(text: str) -> str:
+    """``scrub`` without the two credential-flag passes.
+
+    Not a weaker scrub to store with: it exists so a caller that decides
+    something from WHETHER the scrubber changed a span (transcript analytics
+    hides changed JSON spans from its whole-text pass) can decide it exactly as
+    before those passes existed, then apply ``scrub`` itself. The flag passes
+    run last and only add redaction, so that caller's output can only gain
+    redaction from them.
+    """
+    return _scrub(text, flags=False)
+
+
+def _scrub(text: str, *, flags: bool) -> str:
     if not text:
         return text
     try:
@@ -606,6 +948,13 @@ def scrub(text: str) -> str:
         text = _redact_value_group(_SINGLE_CREDENTIAL_PATTERN, text, "value")
         text = _redact_value_group(_URL_CREDENTIAL_PATTERN, text, "pw")
         text = _redact_env(text)
+        # The flag passes run LAST, on what every other arm already withheld.
+        # They only ever replace text with the marker, so nothing an earlier arm
+        # redacts can survive them; run first, they consumed labels and quotes
+        # the label arms needed (``--secret password: x`` lost ``x``).
+        if flags:
+            text = _redact_credential_flags(text)
+            text = _redact_user_passwords(text)
         return text
     except Exception:  # noqa: BLE001 - never leak raw text on a scrub failure
         return "[scrub-error: content withheld]"
