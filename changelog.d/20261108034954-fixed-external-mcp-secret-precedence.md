@@ -1,0 +1,1 @@
+- External health and memory MCP clients preserve inherited targets and values during startup and router retries, import only their declared dependency keys, and keep Genesis session markers cleared.

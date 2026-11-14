@@ -101,7 +101,10 @@ async def test_standalone_bootstrap_passes_policy_to_memory_init(
 @pytest.mark.parametrize("server_name", ["memory", "health"])
 def test_standalone_entrypoint_selects_external_policy(monkeypatch, tmp_path, external, server_name):
     import scripts.genesis_mcp_server as server
+    from genesis.routing import standalone
 
+    # Each parametrized startup represents a fresh dedicated server process.
+    monkeypatch.setattr(standalone, "_external_secret_keys", None)
     monkeypatch.setattr("genesis.env.secrets_path", lambda: tmp_path / "absent")
     monkeypatch.setattr(server, "is_genesis_enabled", lambda: True)
     # Record and restore this process-global setting; main() calls setdefault.
