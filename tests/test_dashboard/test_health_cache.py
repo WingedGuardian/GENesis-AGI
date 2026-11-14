@@ -143,9 +143,21 @@ _REPAIRS = {
     "unresolved": False,
     "a_future_key": "/srv/install/private",
 }
+#: Two sites as the producer emits them: one that has run and holds the model's
+#: output, one (the embedding shape) that carries the key with no text.
+_CALL_SITES = {
+    "site_with_output": {
+        "status": "healthy",
+        "last_run_provider": "provider-a",
+        "last_response": "verdict text",
+    },
+    "site_without_output": {"status": "healthy", "last_response": None},
+}
 
 
-async def _health_as(remote_addr, headers=None, *, verified=False, monkeypatch, repairs=None):
+async def _health_as(
+    remote_addr, headers=None, *, verified=False, monkeypatch, repairs=None, call_sites=None
+):
     """Call the route as a peer at ``remote_addr``; returns (body, cached)."""
     from genesis.dashboard import auth
 
@@ -161,6 +173,11 @@ async def _health_as(remote_addr, headers=None, *, verified=False, monkeypatch, 
                 "main_checkout": dict(_CHECKOUT),
                 "live_repairs": dict(_REPAIRS) if repairs is None else repairs,
             },
+            "call_sites": (
+                {sid: dict(site) for sid, site in _CALL_SITES.items()}
+                if call_sites is None
+                else call_sites
+            ),
         }
 
     svc._compute_snapshot = _compute
@@ -285,6 +302,86 @@ async def test_the_internal_bearer_gets_the_live_repair_reports(monkeypatch):
         "198.51.100.7", {"Authorization": "Bearer tok"}, monkeypatch=monkeypatch
     )
     assert body["deploy_health"]["live_repairs"] == _REPAIRS
+
+
+# --------------------------------------------------------------------------
+# A call site's last model output is not public
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_an_uncredentialed_peer_gets_call_sites_without_the_response_text(monkeypatch):
+    """Each call site carries the text its last model call returned. The route
+    answers every network, so that text goes only to a caller that presented a
+    credential: the rest of the site (status, provider) stays, a marker says a
+    response exists, and the shared cached snapshot keeps the text for the
+    callers that may read it."""
+    body, cached = await _health_as("198.51.100.7", monkeypatch=monkeypatch)
+    ran, idle = body["call_sites"]["site_with_output"], body["call_sites"]["site_without_output"]
+    assert "last_response" not in ran and "last_response" not in idle, body["call_sites"]
+    assert "verdict text" not in str(body), body
+    assert ran["last_response_hidden"] is True
+    assert "last_response_hidden" not in idle, "nothing was withheld from a site with no output"
+    assert ran["status"] == "healthy" and ran["last_run_provider"] == "provider-a"
+    assert idle["status"] == "healthy"
+    assert cached["call_sites"]["site_with_output"]["last_response"] == "verdict text"
+    assert "last_response_hidden" not in cached["call_sites"]["site_with_output"]
+
+
+@pytest.mark.asyncio
+async def test_a_loopback_peer_without_a_credential_gets_no_response_text(monkeypatch):
+    """Same rule as the checkout's file names: a proxy makes every outside
+    caller arrive from loopback, so the peer address reveals nothing."""
+    body, _ = await _health_as("127.0.0.1", monkeypatch=monkeypatch)
+    assert "last_response" not in body["call_sites"]["site_with_output"]
+    assert body["call_sites"]["site_with_output"]["last_response_hidden"] is True
+    assert "verdict text" not in str(body), body
+
+
+@pytest.mark.asyncio
+async def test_a_verified_session_gets_the_response_text(monkeypatch):
+    body, _ = await _health_as("198.51.100.7", verified=True, monkeypatch=monkeypatch)
+    assert body["call_sites"] == _CALL_SITES, "a signed-in caller must see the sites unchanged"
+
+
+@pytest.mark.asyncio
+async def test_the_internal_bearer_gets_the_response_text(monkeypatch):
+    from genesis.dashboard import auth
+
+    monkeypatch.setattr(auth, "get_or_create_internal_api_token", lambda: "tok")
+    body, _ = await _health_as(
+        "198.51.100.7", {"Authorization": "Bearer tok"}, monkeypatch=monkeypatch
+    )
+    assert body["call_sites"] == _CALL_SITES
+    body, _ = await _health_as(
+        "198.51.100.7", {"Authorization": "Bearer wrong"}, monkeypatch=monkeypatch
+    )
+    assert "last_response" not in body["call_sites"]["site_with_output"]
+    assert "verdict text" not in str(body), body
+
+
+@pytest.mark.asyncio
+async def test_a_call_sites_value_that_is_not_a_site_fails_closed(monkeypatch):
+    """Only a site dict can be reduced by key. Anything else under ``call_sites``
+    reaches an uncredentialed caller as an empty site: that covers the failed
+    section's own shape, whose ``error`` is exception text, and a shape a later
+    change might put there. An empty dict, not null, because the dashboard
+    pages read ``.status`` off every value."""
+    failed_section = {"status": "error", "error": "unable to open /srv/install/private/db"}
+    body, cached = await _health_as(
+        "198.51.100.7", monkeypatch=monkeypatch, call_sites=dict(failed_section)
+    )
+    assert body["call_sites"] == {"status": {}, "error": {}}, body["call_sites"]
+    assert "/srv/install" not in str(body), body
+    assert cached["call_sites"] == failed_section
+
+    body, _ = await _health_as("198.51.100.7", monkeypatch=monkeypatch, call_sites=["verdict text"])
+    assert body["call_sites"] == {}, body["call_sites"]
+    assert "verdict text" not in str(body), body
+
+    body, _ = await _health_as(
+        "198.51.100.7", verified=True, monkeypatch=monkeypatch, call_sites=dict(failed_section)
+    )
+    assert body["call_sites"] == failed_section, "a signed-in caller sees the section as computed"
 
 
 # --------------------------------------------------------------------------

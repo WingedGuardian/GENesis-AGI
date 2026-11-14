@@ -28,6 +28,7 @@ _RUNTIME_RELOAD_SCRIPTS=(
     scripts/lib/index_marker_cli.py  # retained queue CLI dispatch through the facade loader
     scripts/lib/index_marker_legacy.py # retained by index_marker's registered sibling loader
     scripts/lib/index_marker_legs.py # retained provider-leg transactions on that connection
+    scripts/lib/index_marker_retry.py # retained supervised grant and settlement transactions
     scripts/lib/index_marker_recovery.py # retained provider safety and control-completion transactions
     scripts/lib/index_marker_execution.py # retained native journal transactions on that connection
     scripts/lib/code_intel_execution.py # retained report validator imported by the queue
@@ -42,6 +43,7 @@ _RUNTIME_FRESH_SCRIPTS=(
     scripts/lib/managed_units.py          # run by dashboard/routes/updates.py for the update status card
     scripts/lib/update_state_guard.py     # loaded by dashboard/routes/updates.py for /apply and the progress poll, and by observability/snapshots/deploy_health.py
     scripts/lib/live_move_repair.py       # loaded afresh by observability/snapshots/deploy_health.py (its report loader) on every snapshot
+    scripts/lib/live_repair_kit.py        # loaded afresh by observability/snapshots/deploy_health.py (the kit's status) on every snapshot
     scripts/hooks/bash_allowlist_guard.sh # run through .claude/hooks/genesis-hook by cc/invoker.py
     scripts/hooks/bash_allowlist_lib.sh   # sourced by bash_allowlist_guard.sh on every run
     scripts/lib/deploy_marker.sh          # sourced by observability/snapshots/deploy_health.py's main-checkout probe on every snapshot, and by update_state_guard.py

@@ -455,16 +455,15 @@ def config_path(raw: str) -> Path:
     return absolute(str(path.parent.resolve() / path.name))
 
 
-def cgroup_empty(control: str) -> None:
-    if not control:
-        return
+def resolve_control_group(control: str) -> tuple[Path, Path, int]:
+    """Map an existing manager ControlGroup through the visible v2 namespace."""
     path = absolute(control)
     if ".." in path.parts:
         raise ValueError("invalid managed ControlGroup")
     mountinfo = Path("/proc/self/mountinfo")
     _, root, version = resolve_cgroup(Path("/proc/self/cgroup"), mountinfo)
     if version != 2:
-        raise ValueError("uninstall requires visible cgroup v2 state")
+        raise ValueError("managed observation requires visible cgroup v2 state")
     mappings = []
     for row in mountinfo.read_text().splitlines():
         left, separator, right = row.partition(" - ")
@@ -481,6 +480,13 @@ def cgroup_empty(control: str) -> None:
     mounted = mappings[0]
     relative = path.relative_to(mounted) if path.is_relative_to(mounted) else path.relative_to("/")
     group = root / relative
+    return group, root, version
+
+
+def cgroup_empty(control: str) -> None:
+    if not control:
+        return
+    group, _, _ = resolve_control_group(control)
     try:
         values = dict(line.split() for line in (group / "cgroup.events").read_text().splitlines())
     except FileNotFoundError:

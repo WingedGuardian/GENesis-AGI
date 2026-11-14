@@ -10,6 +10,7 @@ behaviours.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -2341,3 +2342,89 @@ def test_a_complete_round_names_no_round_head():
     open there is no head-owned round to name."""
     got = rr.owed_state(_budget(round_state="complete"), [], now=T0)
     assert got["round_head"] is None and got["owed"] == []
+
+
+@pytest.mark.parametrize("key,citation", [("c1", "reply=9"), ("r20:2", "comment=9"), ("i30", "comment=9")])
+def test_no_defect_grammar_retains_typed_disposition(key, citation):
+    parsed = rr.parse(_reflection(keys=[key], decision="acknowledge",
+                                 dispositions=[f"Disposition: {key} no-defect {citation}"]))
+    assert parsed.ok, parsed.problems
+    assert parsed.dispositions[key].kind == "no-defect"
+    assert parsed.dispositions[key].citation == 9
+
+
+@pytest.mark.parametrize("key,citation", [("c1", "comment=9"), ("r20:2", "reply=9"), ("i30", "reply=9")])
+def test_no_defect_citation_kind_matches_finding(key, citation):
+    assert not rr.parse(_reflection(keys=[key], dispositions=[f"Disposition: {key} no-defect {citation}"])).ok
+
+
+def test_acknowledge_cannot_cover_a_fix_or_filed_issue():
+    assert not rr.parse(_reflection(decision="acknowledge")).ok
+
+
+@pytest.mark.parametrize("key", ["c1", "r20:2", "i30"])
+@pytest.mark.parametrize("fault", [None, "author", "pr", "target", "empty", "future", "unreadable", "missing", "crlf", "case"])
+def test_no_defect_coverage_validates_cited_record(repo, tmp_path, monkeypatch, key, fault):
+    path, head = repo
+    kind = "reply" if key.startswith("c") else "comment"
+    _commit_reflection(path, tmp_path, _reflection(keys=[key], head=head, decision="acknowledge",
+        dispositions=[f"Disposition: {key} no-defect {kind}=9"]))
+    record = dict(id=9, author_association="OWNER", created_at="2026-01-01T00:00:00Z",
+                  updated_at="2026-01-01T00:00:00Z", body=f"No-defect: {key}\nEvidence: existing behavior is correct.",
+                  in_reply_to_id=1, pull_request_url="https://api.github.com/repos/o/r/pulls/8",
+                  issue_url="https://api.github.com/repos/o/r/issues/8")
+    if fault == "author":
+        record["author_association"] = "CONTRIBUTOR"
+    if fault == "pr":
+        record["pull_request_url"] += "9"
+        record["issue_url"] += "9"
+    if fault == "target":
+        record["in_reply_to_id"] = 2
+        record["body"] = "No-defect: i99\nEvidence: unrelated"
+    if fault == "empty":
+        record["body"] = "" if key.startswith("c") else f"No-defect: {key}\n"
+    if fault == "future":
+        record["updated_at"] = "2099-01-01T00:00:00Z"
+    if fault == "crlf":
+        record["body"] = record["body"].replace("\n", "\r\n")
+    if fault == "case":
+        record["pull_request_url"] = record["pull_request_url"].replace("o/r/", "O/R/")
+        record["issue_url"] = record["issue_url"].replace("o/r/", "O/R/")
+    original = rr._run
+    calls = []
+    def run(argv, **kwargs):
+        if argv[0] != "gh":
+            return original(argv, **kwargs)
+        calls.append(argv)
+        if fault == "missing":
+            return 1, json.dumps({"message": "Not Found", "status": "404"}), ""
+        return (1, "", "unavailable") if fault == "unreadable" else (0, json.dumps(record), "")
+    monkeypatch.setattr(rr, "_run", run)
+    if fault == "unreadable":
+        with pytest.raises(rr.Refused):
+            _covered(path, head, repo="o/r", number=8)
+    else:
+        assert _covered(path, head, repo="o/r", number=8) == ({key} if fault in (None, "crlf", "case") else set())
+    assert len(calls) == 1
+
+
+def test_superseded_normal_citation_is_not_fetched(repo, tmp_path, monkeypatch):
+    path, head = repo
+    for citation in (8, 9):
+        _commit_reflection(path, tmp_path, _reflection(keys=["c1"], head=head,
+            dispositions=[f"Disposition: c1 no-defect reply={citation}"]))
+    record = dict(id=9, author_association="OWNER", in_reply_to_id=1, body="Already covered.",
+                  pull_request_url="https://api.github.com/repos/o/r/pulls/8",
+                  created_at="2026-01-01T00:00:00Z", updated_at="2026-01-01T00:00:00Z")
+    original = rr._run
+    calls = []
+    def run(argv, **kw):
+        if argv[0] != "gh":
+            return original(argv, **kw)
+        calls.append(argv[-1])
+        if argv[-1].endswith("/8"):
+            return 1, "", "unavailable superseded citation"
+        return 0, json.dumps(record), ""
+    monkeypatch.setattr(rr, "_run", run)
+    assert _covered(path, head, repo="o/r", number=8) == {"c1"}
+    assert calls == ["repos/o/r/pulls/comments/9"]

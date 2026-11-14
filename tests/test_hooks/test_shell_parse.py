@@ -1200,12 +1200,34 @@ _EXECUTING_C_SHAPES = [
     # consumes a value exactly like `-o`.
     "bash -c +e 'PAYLOAD'",
     "bash -c +o pipefail 'PAYLOAD'",
-    # A lone `-` (and a lone `+`) ends option processing like `--`.
+    # A lone `-` ends option processing like `--`. A lone `+` does NOT: it is
+    # an empty bundle the shell skips (#2218), so the operand after it is
+    # still the script.
     "bash -c - 'PAYLOAD'",
     "bash -c + 'PAYLOAD'",
     "sh -c -- 'PAYLOAD'",
     "sh -c - 'PAYLOAD'",
     "sh -c +e 'PAYLOAD'",
+    # `+c` selects exactly like `-c` (#2218): the sign of the bundle does not
+    # decide whether it selects, only what its other letters do.
+    "bash +c 'PAYLOAD'",
+    "bash +cx 'PAYLOAD'",
+    "bash +xc 'PAYLOAD'",
+    "bash +ce 'PAYLOAD'",
+    "sh +c 'PAYLOAD'",
+    "bash +c -- 'PAYLOAD'",
+    # `+n` inside the selecting bundle CLEARS no-exec, so these run.
+    "bash +cn 'PAYLOAD'",
+    "sh +nc 'PAYLOAD'",
+    # A lone `+` after the selector is skipped and option parsing continues.
+    "bash -c + +n 'PAYLOAD'",
+    "bash +c + 'PAYLOAD'",
+    "sh -c + +e 'PAYLOAD'",
+    # The value of `--rcfile` / `--init-file` is a file NAME even when it looks
+    # like a selector, so the real `-c` later still selects (Codex, PR #4383).
+    "bash --rcfile +c --norc -c 'PAYLOAD'",
+    "bash --init-file +c --posix -c 'PAYLOAD'",
+    "bash --rcfile -- -c 'PAYLOAD'",
 ]
 
 
@@ -1339,15 +1361,43 @@ def test_plus_bundles_are_options_the_scan_steps_past():
 
 
 def test_a_lone_minus_or_plus_ends_options_for_the_script():
-    """`bash -c - CMD` and `bash -c + CMD` both run CMD — a lone sign ends
-    option processing like `--`. Falling through to the operand case read
-    `-` itself as the script (Codex P2, PR #2112)."""
+    """`bash -c - CMD` and `bash -c + CMD` both run CMD. A lone `-` ends option
+    processing like `--`; a lone `+` is an empty bundle bash skips (#2218), and
+    either way CMD is the operand here. Falling through to the operand case
+    read `-` itself as the script (Codex P2, PR #2112)."""
     assert sp._nested_script(
         ["bash", "-c", "-", "git push origin main"], "bash"
     ) == "git push origin main"
     assert sp._nested_script(
         ["bash", "-c", "+", "git push origin main"], "bash"
     ) == "git push origin main"
+
+
+@pytest.mark.parametrize(
+    ("interp", "tail", "script"),
+    [
+        # bash, dash and ash skip a lone `+` and keep parsing options, so a
+        # later `+n` clears no-exec and a later `-n` sets it. `sh` follows them
+        # because it resolves to dash or bash.
+        ("bash", ["-c", "+", "+n", "git push"], "git push"),
+        ("dash", ["-c", "+", "+n", "git push"], "git push"),
+        ("ash", ["-c", "+", "+n", "git push"], "git push"),
+        ("sh", ["-c", "+", "+n", "git push"], "git push"),
+        ("bash", ["-c", "+", "-n", "git push"], ""),
+        # zsh and ksh END option processing at a lone `+`: the next word is the
+        # command string whatever it looks like, and the payload is only `$0`.
+        ("zsh", ["-c", "+", "+n", "git push"], "+n"),
+        ("ksh", ["-c", "+", "+n", "git push"], "+n"),
+        ("zsh", ["-c", "+", "-n", "git push"], "-n"),
+        ("zsh", ["-c", "+", "git push"], "git push"),
+    ],
+)
+def test_a_lone_plus_after_the_selector_follows_the_shell(interp, tail, script):
+    """MEASURED (#2218): `<shell> -c + +n 'echo RAN'` prints RAN in bash 5.2,
+    dash 0.5.12 and busybox ash, and runs `+n` (not the payload) in zsh 5.9 and
+    ksh93u+m; `<shell> + -n FILE` runs nothing in the first group and a script
+    named `-n` in the second. One rule for every shell got one group wrong."""
+    assert sp._nested_script([interp, *tail], interp) == script
 
 
 def test_value_taking_letters_stay_interpreter_specific():
@@ -1392,6 +1442,9 @@ _INERT_C_SHAPES = [
     "dash -c -t 'PAYLOAD'",          # dash: Illegal option
     "dash -c -h 'PAYLOAD'",
     "dash -c -r 'PAYLOAD'",
+    # `--rcfile` consumes `-c` as its FILE NAME, so no `-c` selects and the
+    # payload is only a script path that does not exist.
+    "bash --rcfile -c 'PAYLOAD'",
 ]
 
 
@@ -1522,6 +1575,23 @@ _NO_EXEC_MATRIX = [
     (["+", "+n", "-c", "PAYLOAD"], True),                        # + skipped, +n enables
     (["-", "-c", "PAYLOAD"], False),                             # - DOES terminate
     (["--", "-c", "PAYLOAD"], False),                            # -- DOES terminate
+    # #2218: `+c` SELECTS like `-c`, and the bundle's sign only decides what
+    # its OTHER letters do. Before the fix every `+c` row that runs was a
+    # BYPASS: the parser reported no nested command at all.
+    (["+c", "PAYLOAD"], True),                                   # +c selects
+    (["+cn", "PAYLOAD"], True),                                  # +n in it clears
+    (["-cn", "PAYLOAD"], False),                                 # -n in it sets
+    (["-n", "+c", "PAYLOAD"], False),                            # earlier -n holds
+    (["-n", "+cn", "PAYLOAD"], True),                            # +cn clears it
+    (["+c", "-n", "PAYLOAD"], False),                            # later -n holds
+    # #2218: a lone `+` AFTER the selector is the same empty bundle as before
+    # it, not a terminator. MEASURED: `-c + -n CMD` runs nothing, which is
+    # only possible if option parsing continued past the `+`.
+    (["-c", "+", "PAYLOAD"], True),
+    (["-c", "+", "+n", "PAYLOAD"], True),                        # issue's shape
+    (["-c", "+", "-n", "PAYLOAD"], False),                       # + not a terminator
+    (["-c", "+", "+", "PAYLOAD"], True),
+    (["+c", "+", "-x", "PAYLOAD"], True),
 ]
 
 

@@ -86,8 +86,17 @@ def mount_digest(path: Path) -> str:
     return hashlib.sha256("\n".join(sorted(mounts)).encode()).hexdigest()
 
 
+def _process_identity(directory: Path, pid: int):
+    """Parse PID/start/parent/state; this alone proves no wait or process end."""
+    process = (directory / "stat").read_text()
+    tail = process.rpartition(") ")[2].split()
+    if _NUMBER(process.split(" ", 1)[0], "reporter pid") != pid or len(tail) < 20:
+        raise ValueError("reporter process identity mismatch or start unavailable")
+    return pid, _NUMBER(tail[19], "reporter start"), _NUMBER(tail[1], "reporter parent"), tail[0]
+
+
 def _process_state(directory: Path, pid: int, *, allow_zombie=False):
-    """PID, start and parent: proc_pid_stat(5), fields1,22,4.
+    """PID/start/parent with the existing live-subject/OwnedChild contract.
 
     Only an actual OwnedChild may retain Z identity; default live scope proof
     still refuses it. Identity alone never supplies a terminal wait result.
@@ -95,13 +104,10 @@ def _process_state(directory: Path, pid: int, *, allow_zombie=False):
     """
     if type(allow_zombie) is not bool:
         raise ValueError("invalid owned zombie identity selection")
-    process = (directory / "stat").read_text()
-    tail = process.rpartition(") ")[2].split()
-    if _NUMBER(process.split(" ", 1)[0], "reporter pid") != pid or len(tail) < 20:
-        raise ValueError("reporter process identity mismatch or start unavailable")
-    if tail[0] in ("X", "x") or (tail[0] == "Z" and not allow_zombie):
+    identity = _process_identity(directory, pid)
+    if identity[3] in ("X", "x") or (identity[3] == "Z" and not allow_zombie):
         raise ValueError("scope subject has already ended")
-    return pid, _NUMBER(tail[19], "reporter start"), _NUMBER(tail[1], "reporter parent")
+    return identity[:3]
 
 
 class ScopeProbe:

@@ -547,6 +547,15 @@ if [ -z "${GENESIS_BOOTSTRAP_ALLOW_LIVE:-}" ]; then
     fi
 fi
 
+# BEGIN live-repair-kit (#3492 D2; extracted by tests/test_scripts/test_live_repair_kit.py)
+# The live-move repair kit, installed outside the checkout it may have to repair,
+# from HEAD's blobs (never the working tree). After crash recovery, which refuses
+# on a half-written tree (the old kit then stays, the version that wrote the
+# state), and after the units check, which promises no change when it refuses.
+python3 -I -S "$SCRIPT_DIR/lib/live_repair_kit.py" install "$GENESIS_ROOT" "$HOME" \
+    || echo "  WARNING: the live-move repair kit was not installed; the installed one, if any, is kept."
+# END live-repair-kit
+
 # --- Prerequisites ---
 echo "--- Checking and installing prerequisites ---"
 
@@ -2022,6 +2031,18 @@ if [[ -n "$MISSING_HELPFUL" ]]; then
 fi
 if [[ -z "$MISSING_CRITICAL" && -z "$MISSING_HELPFUL" ]]; then
     echo "  All recommended plugins installed."
+fi
+echo
+
+# --- Genesis's own Claude Code plugins (plugins/, e.g. genesis-secret-redact) ---
+# Registered at user scope so every session on the install loads them; they load in place from this checkout,
+# so later deploys need nothing here. Lever: cc_plugins.<name> in genesis.yaml. Never aborts bootstrap.
+echo "--- Genesis Claude Code plugins ---"
+if [[ -f "$SCRIPT_DIR/cc_plugins.py" && -x "$VENV_DIR/bin/python" ]]; then
+    "$VENV_DIR/bin/python" "$SCRIPT_DIR/cc_plugins.py" apply --repo-root "$GENESIS_ROOT" \
+        || echo "  WARNING: Genesis Claude Code plugins not installed (see above); re-attempted on the next update"
+else
+    echo "  WARNING: scripts/cc_plugins.py or the venv is missing; Genesis Claude Code plugins not installed"
 fi
 echo
 
