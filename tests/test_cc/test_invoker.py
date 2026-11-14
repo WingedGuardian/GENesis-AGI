@@ -7091,6 +7091,213 @@ async def test_invocation_failed_coalesces_per_class_and_tag(monkeypatch, fail_b
     assert fail_bus.events[-1][4]["coalesced"] == 2
 
 
+async def test_invocation_failed_coalesces_per_session(monkeypatch, fail_bus):
+    """#4342: one caller tag shared by many sessions (every inbox batch) must
+    not merge their failures. Dedup still holds within a single session, and a
+    session's swallowed count rides on that SAME session's next event."""
+    import genesis.cc.invoker as inv_mod
+    from genesis.observability.session_context import session_scope
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(inv_mod.time, "monotonic", lambda: clock["t"])
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+
+    async def fail_in(session):
+        with session_scope(session), pytest.raises(CCTimeoutError):
+            await invoker.run(CCInvocation(prompt="x", caller_tag="inbox.eval"))
+
+    await fail_in("manager-a")
+    await fail_in("manager-a")  # same session inside the window: coalesced
+    clock["t"] += 10.0
+    await fail_in("manager-b")  # different session, same failure: its own event
+    assert [(e[4]["session_id"], e[4]["coalesced"]) for e in fail_bus.events] == [
+        ("manager-a", 0),
+        ("manager-b", 0),
+    ]
+
+    clock["t"] += 61.0
+    # manager-a (a finished batch) never fails again. The next claim retires its
+    # window and declares the failure it swallowed against manager-a — never on b.
+    await fail_in("manager-b")
+    assert [
+        (e[4]["session_id"], e[4]["coalesced"], e[4].get("retired", False))
+        for e in fail_bus.events[2:]
+    ] == [("manager-b", 0, False), ("manager-a", 1, True)]
+    assert "1 similar failure(s) coalesced" in fail_bus.events[-1][3]
+
+
+async def test_invocation_failed_unscoped_calls_keep_one_window(monkeypatch, fail_bus):
+    """Outside any session scope the key's session is None: behaviour is unchanged."""
+    import genesis.cc.invoker as inv_mod
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(inv_mod.time, "monotonic", lambda: clock["t"])
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+    for _ in range(3):
+        with pytest.raises(CCTimeoutError):
+            await invoker.run(CCInvocation(prompt="x", caller_tag="a"))
+    assert len(fail_bus.events) == 1
+    assert fail_bus.events[0][4]["session_id"] is None
+
+
+async def test_invocation_failed_state_retires_settled_sessions(monkeypatch, fail_bus):
+    """Session ids are an open set: once a window passes every session-scoped
+    entry is retired, and a count one still owed is declared against its own
+    session rather than kept forever or lost."""
+    import genesis.cc.invoker as inv_mod
+    from genesis.observability.session_context import session_scope
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(inv_mod.time, "monotonic", lambda: clock["t"])
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+
+    for i in range(50):  # fifty one-shot sessions, as fifty inbox batches would be
+        with session_scope(f"batch-{i}"), pytest.raises(CCTimeoutError):
+            await invoker.run(CCInvocation(prompt="x", caller_tag="inbox.eval"))
+    with session_scope("batch-0"), pytest.raises(CCTimeoutError):
+        await invoker.run(CCInvocation(prompt="x", caller_tag="inbox.eval"))  # owes 1
+    assert len(inv_mod._failure_event_state) == 50
+
+    clock["t"] += 61.0
+    with session_scope("later"), pytest.raises(CCTimeoutError):
+        await invoker.run(CCInvocation(prompt="x", caller_tag="inbox.eval"))
+    assert {k[3] for k in inv_mod._failure_event_state} == {"later"}
+    declared = [e[4] for e in fail_bus.events if e[4].get("retired")]
+    assert [(d["session_id"], d["coalesced"]) for d in declared] == [("batch-0", 1)]
+
+
+async def test_invocation_failed_retired_count_survives_a_failed_declaration(
+    monkeypatch, fail_bus
+):
+    """A declaration the bus rejects is put back, and the next claim declares it."""
+    import genesis.cc.invoker as inv_mod
+    from genesis.observability.session_context import session_scope
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(inv_mod.time, "monotonic", lambda: clock["t"])
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+
+    async def fail_in(session):
+        with session_scope(session), pytest.raises(CCTimeoutError):
+            await invoker.run(CCInvocation(prompt="x", caller_tag="inbox.eval"))
+
+    await fail_in("batch-a")
+    await fail_in("batch-a")  # swallowed: batch-a owes 1
+    clock["t"] += 61.0
+
+    async def emit(*args, **kwargs):
+        if kwargs.get("retired"):
+            raise RuntimeError("bus broke")
+
+    fail_bus.emit.side_effect = emit
+    await fail_in("batch-b")
+    assert any(k[3] == "batch-a" for k in inv_mod._failure_event_state)
+
+    fail_bus.emit.side_effect = None
+    clock["t"] += 61.0
+    await fail_in("batch-c")
+    declared = [e[4] for e in fail_bus.events if e[4].get("retired")]
+    assert [(d["session_id"], d["coalesced"]) for d in declared][-1] == ("batch-a", 1)
+    assert not any(k[3] == "batch-a" for k in inv_mod._failure_event_state)
+
+
+async def test_invocation_failed_main_emit_failure_restores_retired_counts(
+    monkeypatch, fail_bus
+):
+    """If the claimant's own event fails, the counts its sweep retired were never
+    declared: they go back, and a later claim declares them."""
+    import genesis.cc.invoker as inv_mod
+    from genesis.observability.session_context import session_scope
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(inv_mod.time, "monotonic", lambda: clock["t"])
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+
+    async def fail_in(session):
+        with session_scope(session), pytest.raises(CCTimeoutError):
+            await invoker.run(CCInvocation(prompt="x", caller_tag="inbox.eval"))
+
+    await fail_in("batch-a")
+    await fail_in("batch-a")  # batch-a owes 1
+    clock["t"] += 61.0
+
+    async def emit(*args, **kwargs):
+        if not kwargs.get("retired"):
+            raise RuntimeError("bus broke")
+
+    fail_bus.emit.side_effect = emit
+    await fail_in("batch-b")  # its own event fails before any declaration
+    owed = {k[3]: s[1] for k, s in inv_mod._failure_event_state.items() if s[1]}
+    assert owed == {"batch-a": 1}
+
+    fail_bus.emit.side_effect = None
+    await fail_in("batch-c")
+    declared = [e[4] for e in fail_bus.events if e[4].get("retired")]
+    assert [(d["session_id"], d["coalesced"]) for d in declared] == [("batch-a", 1)]
+
+
+def test_put_back_merges_into_a_session_that_reclaimed_meanwhile():
+    """A put-back must not drop the owed count when the session has claimed the
+    key again during the await: the count joins the live entry."""
+    import genesis.cc.invoker as inv_mod
+
+    inv_mod._reset_failure_event_state()
+    key = ("CCTimeoutError", "inbox.eval", "", "batch-a")
+    inv_mod._failure_event_state[key] = [2000.0, 0]  # re-claimed during the await
+    inv_mod._put_back_owed(key, [1000.0, 1])
+    assert inv_mod._failure_event_state[key] == [2000.0, 1]
+    inv_mod._reset_failure_event_state()
+
+
+async def test_cancelled_declaration_puts_back_the_undeclared_counts(monkeypatch, fail_bus):
+    """Cancellation propagates, and every count not yet declared is kept."""
+    import genesis.cc.invoker as inv_mod
+    from genesis.observability.session_context import session_scope
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(inv_mod.time, "monotonic", lambda: clock["t"])
+    inv = CCInvocation(prompt="x", caller_tag="inbox.eval")
+    for session in ("batch-a", "batch-a", "batch-b", "batch-b"):  # both owe 1
+        with session_scope(session):
+            await inv_mod._emit_invocation_failed_event(CCTimeoutError("slow"), inv, streaming=False)
+    clock["t"] += 61.0
+
+    async def emit(*args, **kwargs):
+        if kwargs.get("retired"):
+            raise asyncio.CancelledError()
+
+    fail_bus.emit.side_effect = emit
+    with session_scope("batch-c"), pytest.raises(asyncio.CancelledError):
+        await inv_mod._emit_invocation_failed_event(CCTimeoutError("slow"), inv, streaming=False)
+    owed = {k[3]: s[1] for k, s in inv_mod._failure_event_state.items() if s[1]}
+    assert owed == {"batch-a": 1, "batch-b": 1}
+
+
+async def test_cancelled_main_emit_puts_back_the_retired_counts(monkeypatch, fail_bus):
+    """Cancelled during the claimant's own event, before any declaration: the
+    cancellation propagates unchanged and the retired counts are kept."""
+    import genesis.cc.invoker as inv_mod
+    from genesis.observability.session_context import session_scope
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(inv_mod.time, "monotonic", lambda: clock["t"])
+    inv = CCInvocation(prompt="x", caller_tag="inbox.eval")
+    for _ in range(2):  # batch-a owes 1
+        with session_scope("batch-a"):
+            await inv_mod._emit_invocation_failed_event(CCTimeoutError("slow"), inv, streaming=False)
+    clock["t"] += 61.0
+
+    async def emit(*args, **kwargs):
+        if not kwargs.get("retired"):
+            raise asyncio.CancelledError()
+
+    fail_bus.emit.side_effect = emit
+    with session_scope("batch-b"), pytest.raises(asyncio.CancelledError):
+        await inv_mod._emit_invocation_failed_event(CCTimeoutError("slow"), inv, streaming=False)
+    owed = {k[3]: s[1] for k, s in inv_mod._failure_event_state.items() if s[1]}
+    assert owed == {"batch-a": 1}
+
+
 def test_failure_event_bus_lookup_never_constructs_a_runtime():
     """Observability must not lazily build a blank runtime singleton."""
     import genesis.cc.invoker as inv_mod

@@ -1,0 +1,1 @@
+- **Claude Code failure events are no longer merged across inbox sessions.** When two inbox batches failed the same way within a minute, only the first got a `cc.invocation_failed` event and the second's failure was counted on whichever session failed next. Repeated failures are now coalesced per session, so each batch's failure is reported against its own session.
