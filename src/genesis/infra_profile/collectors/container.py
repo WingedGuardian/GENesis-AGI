@@ -29,6 +29,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
+from genesis.infra_profile import cgroup_io
 from genesis.infra_profile.collectors._probe import (
     ProbeFailed,
     reap,
@@ -851,6 +852,14 @@ async def collect_storage(
             if root_dev in devs:
                 facts["io_scheduler"] = _read(disk_dir / "queue/scheduler")
                 break
+
+    # Whether IOWeight-family settings on user units and scopes can take effect:
+    # the io controller must be among the user manager's controllers. Recorded
+    # only when readable (absent = unknown), so the posture rule that warns on
+    # an explicit False never fires on a box it could not read.
+    io_delegated = cgroup_io.io_delegated(sys_root, _user_manager_cgroup())
+    if io_delegated is not None:
+        facts["user_manager_io_delegated"] = io_delegated
 
     # /tmp is a MEASUREMENT TARGET here (small tmpfs = known incident class),
     # not a temp-file location.
