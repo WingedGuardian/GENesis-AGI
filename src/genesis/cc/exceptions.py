@@ -15,6 +15,10 @@ if TYPE_CHECKING:
 class CCError(Exception):
     """Base for all CC invocation errors."""
 
+    # Optional reported CLI transcript identity, never a Genesis lifecycle ID.
+    # Populated by structured-result classification, not inferred from prose.
+    cc_session_id: str | None = None
+
 
 class CCTimeoutError(CCError):
     """CC session timed out."""
@@ -36,6 +40,7 @@ class CCReplayUnsafeError(CCProcessError):
         self.__cause__ = cause
         self.raw_text = getattr(cause, "raw_text", None)
         self.raw_event = getattr(cause, "raw_event", None)
+        self.cc_session_id = getattr(cause, "cc_session_id", None)
 
 
 class CCMemoryPressureError(CCReplayUnsafeError):

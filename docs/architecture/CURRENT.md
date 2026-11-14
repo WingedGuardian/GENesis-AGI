@@ -683,8 +683,16 @@ preserve usable answers, real refusal health and dropped-output replay guards.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: b321bb634 2026-11-07
+verified: 37e124b54 2026-11-08
 ```
+
+Verification refresh is limited to advisory CLI identity below; other execution
+evidence retains its dated basis. Structured-result classification can retain
+`CCError.cc_session_id` without changing error/replay policy. Existing invoker
+spans expose reported identity/source and wrapper return state as optional
+attributes, separate from the Genesis `session_id` column; private execution
+omits the new attributes. Missing metadata is unknown, never acquisition or
+complete-attempt evidence. See `docs/reference/inbox-attempt-identity.md`.
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
   `cc/gmodel_settings.py`): Kimi K3 and MiMo V2.6 Pro select subscription, native
@@ -1618,6 +1626,12 @@ entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
 verified: f62608045437 2026-11-09
 ```
+
+Verification refresh is limited to the inbox trace parent: the existing retry
+await has an advisory `inbox.evaluate` span linking observed child attempts by
+batch/row ID. Its returned state describes that await, not delivery, baseline
+completion or source acquisition. Existing execution decisions remain separate;
+other intake evidence retains its dated basis.
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
   (`has_unchanged_source`) makes re-ingest of changed sources re-distill;
@@ -4461,6 +4475,13 @@ around the entire message boundary. It preserves memory counters and the
 construction-time persistence hard opt-out, without suppressing queued ordinary
 flushes or validator-memory records. This does not strengthen batch durability
 or make the service read-only.
+
+Limited refresh: the shared span capture/writer/reader slice only. Other platform
+claims retain their earlier verification scope. `start_span` now supports
+`include_exception_text=False` for categorical failures without formatting the
+exception; existing callers keep the default formatter. Inbox attempt metadata
+uses the existing optional span persistence/API, not a new store or gate; see
+`docs/reference/inbox-attempt-identity.md`.
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
 provider/model/outcome. Failed historical attempts render as a warning, not an
