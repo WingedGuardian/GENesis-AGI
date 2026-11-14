@@ -11,7 +11,9 @@
 // withheld with a notice naming this plugin. An errored tool call (`isError`) whose text holds a value is
 // answered with the same text redacted (as a `deny`, the one form a hook can answer an error in).
 //
-// One refusal: a write to the secrets file that would store placeholder text as a value (see tool.call).
+// One refusal: a write to the secrets file that would store placeholder text as a value, and any write carrying
+// placeholder text while which file is the secrets file is not known: before a first load, or since a reload
+// failed (see tool.call).
 //
 // Not covered here: Monitor and background Bash output also reach records Claude Code keeps itself and this mod
 // cannot rewrite (queued notifications, task output files). The `.catch` handling follows the pattern of the
@@ -28,6 +30,9 @@ let watch = [] // every path that can change which file the resolver picks, or w
 let stamp = '' // mtimeMs:size of each watched path, taken BEFORE the last load read the file
 let warned = false
 let retryAt = 0 // no load before this time: a loader that keeps failing must not run on every event
+// The last reload failed, so the secrets file may no longer be `secretsPath` (the resolver can have moved to a
+// file created since): which file holds the values is unconfirmed until a load succeeds again.
+let unconfirmed = false
 let reported = '' // the overwritten keys last logged, so each set is logged once
 
 const RETRY_MS = 30_000
@@ -161,6 +166,10 @@ function leftover(call) {
   return [...new Set(written.flatMap(t => t.match(PLACEHOLDER) ?? []))]
 }
 
+function unknownTarget(left) {
+  return `genesis-secret-redact refused this write: it holds placeholder text (${left.join(', ')}), and the plugin cannot confirm which file is the secrets file because loading its values ${secretsPath ? 'failed at the last reload' : 'has not succeeded yet'}. Until a load succeeds (it is retried at the next tool call once 30 seconds have passed), write without placeholder text, or retry the write then.`
+}
+
 function refusal(left) {
   return `genesis-secret-redact refused this write to the secrets file: the text it would write holds placeholder text (${left.join(', ')}), which would be stored in place of a value. A placeholder is turned back into its value only in the text an Edit replaces (old_string). Write real values only; to change one line, Edit that line; to add a line next to a line holding a secret, anchor the Edit on a line without one.`
 }
@@ -240,6 +249,7 @@ async function load($) {
   secretsReal = parsed.realpath ?? parsed.path
   home = parsed.home ?? ''
   warned = false // a later failure is a new event and is logged again
+  unconfirmed = false
   // A write that does not go through Edit/Write (`sed -i`, a heredoc) gets no restore, so placeholder text a
   // session copied from a redacted read can land in the secrets file as a value. That key is gone; say which.
   const overwritten = (parsed.overwritten ?? []).join(', ')
@@ -261,6 +271,7 @@ async function fresh($) {
     }
   } catch (err) {
     retryAt = Date.now() + RETRY_MS
+    unconfirmed = true
     // Keep the last values that loaded: they are still secrets. Without any, this session is unredacted.
     if (!warned) {
       warned = true
@@ -290,10 +301,11 @@ export function register(on) {
     // the text an Edit MATCHES gets its placeholders turned back, so the model can name a line it read; a wrong
     // restore there fails the tool's exact match and changes nothing. Nowhere else: a placeholder written to any
     // other file stays literal, or docs and tests about this plugin would receive real keys.
-    if (WRITES.has(e.tool) && !secretsPath && leftover(e).length) {
-      // No load has succeeded, so the secrets file's path is not known (SECRETS_PATH may name any file): every
-      // write carrying placeholder text is refused until it is, since this one may replace a key with text.
-      return { deny: refusal(leftover(e)) }
+    if (WRITES.has(e.tool) && (!secretsPath || unconfirmed) && leftover(e).length) {
+      // No load has succeeded, or the last reload failed, so which file is the secrets file is not known
+      // (SECRETS_PATH may name any file, and the resolver may have moved): every write carrying placeholder text
+      // is refused until a load succeeds, since this one may replace a key with text.
+      return { deny: unknownTarget(leftover(e)) }
     }
     if (WRITES.has(e.tool) && (await isSecretsFile($, e.file_path))) {
       const left = leftover(e) // owner rulings 2026-11-12: refuse, and restore only what an Edit matches
