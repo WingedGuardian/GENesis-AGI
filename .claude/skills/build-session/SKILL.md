@@ -28,6 +28,13 @@ it holds the review-chain, evidence and private-data rules every session uses.
 review_state sequence, the sigils, the Pre-Commit Gate, the depth gate and
 verify-RED. Read it; it is not on-demand reference.
 
+**Mandatory read before your first code edit of an item:**
+`.claude/skills/build-session/references/ponytail-house-delta.md` (where
+Genesis differs from the ruleset below; it wins), then
+`.claude/skills/build-session/references/ponytail.md` (a vendored ruleset for
+the smallest complete change: reuse what exists before writing anything new).
+Read both, in that order; they are not on-demand reference.
+
 ### Where your session ENDS — build sessions and closing sessions
 
 **A session that writes code and a session that drives a PR to merge are
