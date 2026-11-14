@@ -76,6 +76,9 @@ def result_ref(server: str, tool: str, result: Any) -> str | None:
     if key is None or not isinstance(structured, dict):
         return None
     value = structured.get(key)
+    if (server, tool) == ("memory", "memory_store") and isinstance(value, dict):
+        # A store that supersedes returns a report; the row it wrote is its memory_id.
+        value = value.get("memory_id")
     if not isinstance(value, str):
         return None
     # A writer may echo a caller-supplied id with surrounding whitespace (the

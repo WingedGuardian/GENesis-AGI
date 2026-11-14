@@ -63,9 +63,11 @@ async def test_memory_store_persists_and_supersedes_through_actual_tool(recordin
         old = (await client.call_tool("memory_store", arguments | {
             "content": "Synthetic validator measurement: 3 of 4 controls passed",
         })).data
-        new = (await client.call_tool("memory_store", arguments | {
+        report = (await client.call_tool("memory_store", arguments | {
             "content": "Synthetic corrected measurement: 4 of 4 controls passed", "supersedes": old,
         })).data
+        assert report["superseded"] is True
+        new = report["memory_id"]
         assert old != new
     # FastMCP 4 runs background tasks only through the tasks extension, which
     # Genesis does not install: task metadata starts no task and still meets the
