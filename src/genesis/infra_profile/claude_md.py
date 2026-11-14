@@ -134,7 +134,8 @@ def update_block(
         logger.debug("infra_profile: %s missing — not seeding", claude_md_path)
         return False
 
-    original = claude_md_path.read_text()
+    with claude_md_path.open(newline="") as source:
+        original = source.read()
     updated = _replace_block(original, BLOCK_NAME, build_block_content(profile))
     if updated == original:
         return False
