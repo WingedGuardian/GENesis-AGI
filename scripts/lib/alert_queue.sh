@@ -47,11 +47,13 @@ alert_stable_key() {
 }
 
 queue_alert_try() {
-    local severity="${1:-warning}" source="${2:-shell}" title="${3:-}" body="${4:-}" dedupe="${5:-}"
+    # $6, optional: the entry's meta as a JSON object. Anything else fails the
+    # enqueue (non-zero), never a silent empty meta: a reader may gate on it.
+    local severity="${1:-warning}" source="${2:-shell}" title="${3:-}" body="${4:-}" dedupe="${5:-}" meta="${6:-}"
     mkdir -p "$_ALERT_QUEUE_ROOT" 2>/dev/null || return 1
     ALERT_QUEUE_ROOT="$_ALERT_QUEUE_ROOT" \
     ALERT_SEVERITY="$severity" ALERT_SOURCE="$source" \
-    ALERT_TITLE="$title" ALERT_BODY="$body" ALERT_DEDUPE="$dedupe" \
+    ALERT_TITLE="$title" ALERT_BODY="$body" ALERT_DEDUPE="$dedupe" ALERT_META="$meta" \
     python3 -I -S - <<'PY' 2>/dev/null
 import json, math, os, time, uuid
 root = os.environ["ALERT_QUEUE_ROOT"]
@@ -65,6 +67,16 @@ def text(name, default=""):
     return os.environ.get(name, default).encode("utf-8", "surrogateescape").decode("utf-8", "replace")
 
 
+def meta():
+    raw = os.environ.get("ALERT_META", "")
+    if not raw:
+        return {}
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("meta must be a JSON object")
+    return value
+
+
 entry = {
     "schema": 1,
     "ts": ts,
@@ -73,7 +85,7 @@ entry = {
     "title": text("ALERT_TITLE"),
     "body": text("ALERT_BODY"),
     "dedupe_key": text("ALERT_DEDUPE") or None,
-    "meta": {},
+    "meta": meta(),
 }
 
 

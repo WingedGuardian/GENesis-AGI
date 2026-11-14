@@ -286,16 +286,47 @@ def test_an_all_clear_that_cannot_queue_still_ends_the_episode(box):
 
 
 @pytest.mark.parametrize("tier", ["red", "orange"])
-def test_the_clear_key_mirrors_its_page_key(box, tier):
-    """Delivery deduplicates on the key for a day. A clear keyed like its page
-    is suppressed exactly when its page was, so the owner never receives an
-    all-clear for a page they did not get (and an ORANGE clear never blocks a
-    later RED one)."""
+def test_the_clear_names_the_page_it_answers_and_the_episode_start(box, tier):
+    """Queued is not delivered. The clear names its page's key and when the
+    episode began, and the drainer sends it only if that page was DELIVERED
+    since then (runtime/init/alert_drain.py), so the owner never receives an
+    all-clear for a page they did not get."""
+    import os
+
     _handle(box, tier)
     page_key = next(p["dedupe_key"] for p in _pages(box) if p["dedupe_key"].endswith(f":{tier}"))
+    yellow = box["state"] / f"episode_{_home_dev(box)}_yellow"
+    os.utime(yellow, (1_700_000_000, 1_700_000_000))  # the episode's first marker
     _handle(box, "green", free=90_000)
     (clear,) = _clears(box)
-    assert clear["dedupe_key"] == page_key.replace(f":{tier}", f":clear-{tier}")
+    assert clear["meta"] == {"answers_pages": [page_key], "episode_start": 1_700_000_000}
+    assert clear["dedupe_key"] == page_key.replace(f":{tier}", f":clear-{tier}:1700000000")
+
+
+def test_a_clear_after_red_and_orange_answers_both_pages(box):
+    _handle(box, "orange")
+    _handle(box, "red")
+    _handle(box, "green", free=90_000)
+    (clear,) = _clears(box)
+    assert sorted(clear["meta"]["answers_pages"]) == sorted(
+        p["dedupe_key"] for p in _pages(box) if p["severity"] in ("warning", "emergency")
+    )
+
+
+def test_each_episode_gets_its_own_clear_key(box):
+    """A clear keyed only by tier would be deduplicated for a day against the
+    previous episode's clear, even when this episode's page was delivered."""
+    import os
+
+    keys = []
+    for stamp in (1_700_000_000, 1_700_090_000):
+        _handle(box, "red")
+        os.utime(box["state"] / f"episode_{_home_dev(box)}_yellow", (stamp, stamp))
+        _handle(box, "green", free=90_000)
+        keys += [c["dedupe_key"] for c in _clears(box)]
+        for q in box["queue"].glob("*.json"):  # delivered
+            q.unlink()
+    assert len(keys) == 2 and keys[0] != keys[1], keys
 
 
 @pytest.mark.parametrize("green_act", [0, 1])
@@ -305,7 +336,8 @@ def test_an_observe_page_gets_an_observe_clear_in_either_mode(box, green_act):
     _handle(box, "green", free=90_000, act=green_act)
     (clear,) = _clears(box)
     assert clear["title"].startswith("[observe mode] Disk recovered:"), clear
-    assert clear["dedupe_key"].endswith(":clear-red:observe"), clear
+    assert ":clear-red:observe:" in clear["dedupe_key"], clear
+    assert clear["meta"]["answers_pages"][0].endswith(":red:observe"), clear
 
 
 def test_an_act_page_gets_an_act_clear_after_a_switch_to_observe(box):
@@ -313,7 +345,7 @@ def test_an_act_page_gets_an_act_clear_after_a_switch_to_observe(box):
     _handle(box, "green", free=90_000, act=0)
     (clear,) = _clears(box)
     assert clear["title"].startswith("Disk recovered:"), clear
-    assert clear["dedupe_key"].endswith(":clear-red"), clear
+    assert ":clear-red:" in clear["dedupe_key"] and ":observe" not in clear["dedupe_key"], clear
 
 
 def test_attribution_is_logged_once_per_episode(box):

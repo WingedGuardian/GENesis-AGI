@@ -32,9 +32,10 @@
 #           there (that RED was measured before the emptying freed the space).
 # Reclaim levers only run for the filesystem they can actually relieve; the
 # others page with attribution.
-#   GREEN   after an episode that delivered an ORANGE or RED page, send one
+#   GREEN   after an episode that queued an ORANGE or RED page, queue one
 #           INFO all-clear naming how far it got (_wg_all_clear), then end
-#           the episode.
+#           the episode. The alert drainer sends it only if one of those
+#           pages was delivered during the episode.
 #
 # RUNAWAY FILES, at every tier (scripts/lib/watchgod_runaway.sh): a file held
 # open for writing that alone is a large share of its filesystem, or that grew
@@ -382,31 +383,47 @@ _wg_page() {
 
 _wg_all_clear() {
     # $1 path $2 domain key $3 free $4 total $5 fstype. Called on the first
-    # GREEN poll after an episode, before its markers are cleared. Sends one
-    # INFO message when the episode delivered a page (an orange/red marker is
+    # GREEN poll after an episode, before its markers are cleared. Queues one
+    # INFO message when the episode queued a page (an orange/red marker is
     # written only once its page was queued), so a page never stands alone:
     # without it the owner cannot tell "recovered a minute later" from "still
     # filling and muted". Either mode's marker counts, so an episode paged in
     # observe mode and ended after a switch to act still gets its all-clear.
     # A failed enqueue is logged and does NOT hold the episode open: an open
     # episode would deduplicate the next emergency against this one.
-    # The key mirrors the page it answers (tier, and :observe for an observe
-    # page). Delivery deduplicates on that key for a day (outreach governance),
-    # so a clear keyed like its page is suppressed exactly when its page was:
-    # the owner never gets an all-clear for a page they did not receive. A fix
-    # to the page keys (#3276: a second same-tier episode in 24 h is dropped)
-    # must change this key the same way.
+    # Queued is not delivered: delivery can drop a page, or deduplicate it
+    # against an earlier episode's page for a day (#3276). So the clear names
+    # the pages it answers and when the episode began (its first marker:
+    # YELLOW is marked before any page), and the drainer
+    # (runtime/init/alert_drain.py) sends it only if one of those pages was
+    # DELIVERED since then. Its key carries that start, so one episode's clear
+    # never deduplicates the next episode's.
     local path="$1" dev="$2" free="$3" total="$4" fstype="$5" worst="" sfx="" t title
+    local pages="" start="" f m
     for t in red orange; do
         if episode_seen "$dev" "$t"; then worst="$t"; break; fi
         if episode_seen "$dev" "${t}_observe"; then worst="$t"; sfx=":observe"; break; fi
     done
     [[ -n "$worst" ]] || return 0
+    if [[ ! "$dev" =~ ^[0-9A-Za-z]+$ ]]; then
+        log WARN "all-clear for ${path} not queued: domain key '${dev}' cannot be named in it"
+        return 0
+    fi
+    for t in red red_observe orange orange_observe; do
+        episode_seen "$dev" "$t" || continue
+        pages+="${pages:+,}\"watchgod:disk:${dev}:${t/_observe/:observe}\""
+    done
+    for f in "$DG_STATE_DIR/episode_${dev}_"*; do
+        m="$(stat -c %Y "$f" 2>/dev/null)" || continue
+        if [[ -z "$start" ]] || (( m < start )); then start="$m"; fi
+    done
+    [[ -n "$start" ]] || start="$(date +%s)"
     title="Disk recovered: ${path} is GREEN"
     [[ -z "$sfx" ]] || title="[observe mode] ${title}"
     if queue_alert_try info "watchgod:disk" "$title" \
             "${path}: ${free} MB free of ${total} MB (${fstype}). This episode reached ${worst^^}; the page sent then needs no action now." \
-            "watchgod:disk:${dev}:clear-${worst}${sfx}"; then
+            "watchgod:disk:${dev}:clear-${worst}${sfx}:${start}" \
+            "{\"answers_pages\":[${pages}],\"episode_start\":${start}}"; then
         log INFO "all-clear: ${path} back to GREEN after ${worst} (${free} MB free)"
     else
         log WARN "could not queue the all-clear for ${path} (alert queue unwritable?); the episode ends anyway"

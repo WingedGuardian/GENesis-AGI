@@ -33,9 +33,10 @@ class _FakePipeline:
 
 
 class _RT:
-    def __init__(self, pipeline=None, loop=None) -> None:
+    def __init__(self, pipeline=None, loop=None, db=None) -> None:
         self._outreach_pipeline = pipeline
         self._awareness_loop = loop
+        self._db = db
 
 
 def _enqueue(root, **kw):
@@ -337,3 +338,271 @@ async def test_same_key_repeat_is_still_suppressed(tmp_path, monkeypatch, outrea
 
     assert pipe.statuses == [OutreachStatus.DELIVERED, OutreachStatus.REJECTED]
     assert q.list_queued(root) == []  # REJECTED stays terminal
+
+
+# --- an all-clear is sent only for a page that was delivered ------------------
+# The disk guardian's all-clear names the pages it answers and when its episode
+# began (meta.answers_pages, meta.episode_start). Enqueueing a page is not
+# delivering it: delivery can drop it (IGNORED), or deduplicate it against a page
+# from an earlier episode. A clear for a page the owner never received in this
+# episode is the first they would hear of it, so the drain checks delivery.
+
+_RED = "watchgod:disk:42:red"
+_ORANGE = "watchgod:disk:42:orange"
+
+
+def _enqueue_clear(root, start, pages=(_RED,)):
+    _enqueue(
+        root,
+        severity="info",
+        source="watchgod:disk",
+        title="Disk recovered: /data is GREEN",
+        body="/data: 9000 MB free of 10000 MB (ext4). This episode reached RED.",
+        dedupe_key=f"watchgod:disk:42:clear-red:{int(start)}",
+        meta={"answers_pages": list(pages), "episode_start": start},
+    )
+
+
+def _deliver_page(root, pipe, db, key):
+    _enqueue(root, source="watchgod:disk", title=f"page {key}", body="filling", dedupe_key=key)
+    return alert_drain._make_drainer(_RT(pipeline=pipe, db=db))()
+
+
+@pytest.mark.asyncio
+async def test_a_clear_whose_page_was_delivered_this_episode_is_sent(tmp_path, monkeypatch, outreach_db):
+    import time
+
+    root = tmp_path / "queue"
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
+    pipe = _GovernedPipeline(outreach_db)
+    start = time.time() - 5
+    await _deliver_page(root, pipe, outreach_db, _RED)
+    _enqueue_clear(root, start)
+    await alert_drain._make_drainer(_RT(pipeline=pipe, db=outreach_db))()
+
+    assert pipe.statuses == [OutreachStatus.DELIVERED, OutreachStatus.DELIVERED]
+    assert q.list_queued(root) == []
+
+
+@pytest.mark.asyncio
+async def test_a_clear_whose_page_was_never_delivered_is_dropped(tmp_path, monkeypatch, outreach_db, caplog):
+    import logging
+    import time
+
+    root = tmp_path / "queue"
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
+    pipe = _GovernedPipeline(outreach_db)
+    _enqueue_clear(root, time.time() - 5)
+    with caplog.at_level(logging.INFO, logger="genesis.runtime.init.alert_drain"):
+        await alert_drain._make_drainer(_RT(pipeline=pipe, db=outreach_db))()
+
+    assert pipe.statuses == [], "never submitted"
+    assert q.list_queued(root) == [], "dropped, not retried forever"
+    assert "all-clear not sent" in caplog.text and "no page it answers" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_clear_whose_page_was_delivered_before_the_episode_is_dropped(tmp_path, monkeypatch, outreach_db):
+    """The page delivered in an EARLIER episode: this episode's page was
+    deduplicated against it, so this episode's clear answers nothing."""
+    import time
+
+    root = tmp_path / "queue"
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
+    pipe = _GovernedPipeline(outreach_db)
+    await _deliver_page(root, pipe, outreach_db, _RED)
+    _enqueue(root, source="watchgod:disk", title="page again", body="filling", dedupe_key=_RED)
+    await alert_drain._make_drainer(_RT(pipeline=pipe, db=outreach_db))()
+    assert pipe.statuses == [OutreachStatus.DELIVERED, OutreachStatus.REJECTED]  # guard: the repeat deduped
+
+    _enqueue_clear(root, time.time() + 60)
+    await alert_drain._make_drainer(_RT(pipeline=pipe, db=outreach_db))()
+
+    assert len(pipe.statuses) == 2, "the clear was not submitted"
+    assert q.list_queued(root) == []
+
+
+@pytest.mark.asyncio
+async def test_an_ignored_page_gets_no_clear(tmp_path, monkeypatch, outreach_db):
+    import time
+
+    root = tmp_path / "queue"
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
+    pipe = _FakePipeline(OutreachStatus.IGNORED)
+    start = time.time() - 5
+    await _deliver_page(root, pipe, outreach_db, _RED)
+    _enqueue_clear(root, start)
+    await alert_drain._make_drainer(_RT(pipeline=pipe, db=outreach_db))()
+
+    assert len(pipe.calls) == 1, "only the page was submitted"
+    assert q.list_queued(root) == []
+
+
+@pytest.mark.asyncio
+async def test_any_answered_page_that_was_delivered_counts(tmp_path, monkeypatch, outreach_db):
+    """RED deduplicated, ORANGE delivered: the owner did hear of this episode."""
+    import time
+
+    root = tmp_path / "queue"
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
+    pipe = _GovernedPipeline(outreach_db)
+    start = time.time() - 5
+    await _deliver_page(root, pipe, outreach_db, _ORANGE)
+    _enqueue_clear(root, start, pages=(_RED, _ORANGE))
+    await alert_drain._make_drainer(_RT(pipeline=pipe, db=outreach_db))()
+
+    assert pipe.statuses == [OutreachStatus.DELIVERED, OutreachStatus.DELIVERED]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "meta",
+    [
+        {"answers_pages": "watchgod:disk:42:red", "episode_start": 1.0},
+        {"answers_pages": [], "episode_start": 1.0},
+        {"answers_pages": [""], "episode_start": 1.0},
+        {"answers_pages": [_RED], "episode_start": "yesterday"},
+        {"answers_pages": [_RED], "episode_start": True},
+        {"answers_pages": [_RED]},
+    ],
+)
+async def test_a_malformed_answer_drops_the_clear(tmp_path, monkeypatch, outreach_db, caplog, meta):
+    """A clear that cannot say what it answers is never sent ungated."""
+    import logging
+
+    root = tmp_path / "queue"
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
+    pipe = _GovernedPipeline(outreach_db)
+    await _deliver_page(root, pipe, outreach_db, _RED)
+    _enqueue(root, severity="info", source="watchgod:disk", title="Disk recovered", body="ok",
+             dedupe_key="watchgod:disk:42:clear-red:1", meta=meta)
+    with caplog.at_level(logging.WARNING, logger="genesis.runtime.init.alert_drain"):
+        await alert_drain._make_drainer(_RT(pipeline=pipe, db=outreach_db))()
+
+    assert pipe.statuses == [OutreachStatus.DELIVERED]
+    assert q.list_queued(root) == []
+    assert "malformed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_clear_waits_while_the_database_is_unwired(tmp_path, monkeypatch):
+    import time
+
+    root = tmp_path / "queue"
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+    _enqueue_clear(root, time.time())
+    await alert_drain._make_drainer(_RT(pipeline=pipe, db=None))()
+
+    assert pipe.calls == []
+    assert len(q.list_queued(root)) == 1, "kept for the next tick"
+
+
+@pytest.mark.asyncio
+async def test_an_entry_without_answers_is_not_gated(tmp_path, monkeypatch):
+    """Every other queued alert keeps its old path, database or not."""
+    root = tmp_path / "queue"
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+    _enqueue(root, dedupe_key="backup:k1", meta={"likely_cause": "disk"})
+    await alert_drain._make_drainer(_RT(pipeline=pipe, db=None))()
+
+    assert len(pipe.calls) == 1
+
+
+async def _seed_delivery(db, topic, delivered_at):
+    from genesis.db.crud import outreach as outreach_crud
+
+    rid = f"seed-{delivered_at}"
+    await outreach_crud.create(
+        db, id=rid, signal_type="queued_alert", topic=topic, category="blocker",
+        salience_score=1.0, channel="telegram", message_content="page",
+        created_at=delivered_at, content_hash=None,
+    )
+    await outreach_crud.record_delivery(db, rid, delivered_at=delivered_at)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "delivered_at,since,expected",
+    [
+        # 2023-11-14T22:13:20Z is epoch 1700000000.
+        ("2023-11-14T22:13:20.999999+00:00", 1_700_000_000.0, True),  # same second counts
+        ("2023-11-14T22:13:21.000001+00:00", 1_700_000_000.9, True),  # later, fraction floored
+        ("2023-11-14T22:13:19.999999+00:00", 1_700_000_000.0, False),  # just before
+        ("2023-11-14T17:13:20.500000-05:00", 1_700_000_000.0, True),  # offset normalised to UTC
+        ("2023-11-14T17:13:19-05:00", 1_700_000_000.0, False),
+    ],
+)
+async def test_delivered_topic_since_compares_real_stored_times(outreach_db, delivered_at, since, expected):
+    from genesis.db.crud import outreach as outreach_crud
+
+    await _seed_delivery(outreach_db, "alert:p", delivered_at)
+    got = await outreach_crud.delivered_topic_since(
+        outreach_db, signal_type="queued_alert", topics=["alert:other", "alert:p"], since_epoch=since,
+    )
+    assert got is expected
+
+
+@pytest.mark.asyncio
+async def test_delivered_topic_since_ignores_an_undelivered_row_and_other_signals(outreach_db):
+    from genesis.db.crud import outreach as outreach_crud
+
+    await outreach_crud.create(
+        outreach_db, id="u", signal_type="queued_alert", topic="alert:p", category="blocker",
+        salience_score=1.0, channel="telegram", message_content="page",
+        created_at="2023-11-14T22:13:30+00:00", content_hash=None,
+    )
+    await outreach_crud.create(
+        outreach_db, id="g", signal_type="guardian_alert", topic="alert:p", category="blocker",
+        salience_score=1.0, channel="telegram", message_content="page",
+        created_at="2023-11-14T22:13:30+00:00", content_hash=None,
+    )
+    await outreach_crud.record_delivery(outreach_db, "g", delivered_at="2023-11-14T22:13:30+00:00")
+    assert not await outreach_crud.delivered_topic_since(
+        outreach_db, signal_type="queued_alert", topics=["alert:p"], since_epoch=1_700_000_000.0,
+    )
+    assert not await outreach_crud.delivered_topic_since(
+        outreach_db, signal_type="queued_alert", topics=[], since_epoch=0.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_page_still_retrying_holds_its_clear_back(tmp_path, monkeypatch, outreach_db):
+    """The page sits ahead of its clear and a kept entry stops the drain, so the
+    clear is never judged while its page can still be delivered."""
+    import time
+
+    root = tmp_path / "queue"
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
+    failing = _FakePipeline(OutreachStatus.FAILED)
+    start = time.time() - 5
+    _enqueue(root, source="watchgod:disk", title="page", body="filling", dedupe_key=_RED)
+    _enqueue_clear(root, start)
+    await alert_drain._make_drainer(_RT(pipeline=failing, db=outreach_db))()
+    assert len(failing.calls) == 1 and len(q.list_queued(root)) == 2, "both kept"
+
+    pipe = _GovernedPipeline(outreach_db)
+    await alert_drain._make_drainer(_RT(pipeline=pipe, db=outreach_db))()
+    assert pipe.statuses == [OutreachStatus.DELIVERED, OutreachStatus.DELIVERED]
+    assert q.list_queued(root) == []
+
+
+@pytest.mark.asyncio
+async def test_a_page_delivered_in_an_earlier_episode_and_again_in_this_one(tmp_path, monkeypatch, outreach_db):
+    import time
+
+    root = tmp_path / "queue"
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
+    await _seed_delivery(outreach_db, f"alert:{_RED}", "2023-11-14T22:13:20+00:00")
+    await _seed_delivery(outreach_db, f"alert:{_RED}", datetime_now_iso())
+    pipe = _GovernedPipeline(outreach_db)
+    _enqueue_clear(root, time.time() - 30)
+    await alert_drain._make_drainer(_RT(pipeline=pipe, db=outreach_db))()
+    assert pipe.statuses == [OutreachStatus.DELIVERED]
+
+
+def datetime_now_iso() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).isoformat()
