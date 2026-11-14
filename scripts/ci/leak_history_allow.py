@@ -129,21 +129,51 @@ def parse_allowlist(text: str) -> list[dict]:
 
 
 def _key(entry: dict) -> tuple[str, str, str, str]:
-    return (entry["commit"][:_COMMIT_PREFIX], entry["path"], entry["type"], entry["sha1"])
+    return (entry["commit"], entry["path"], entry["type"], entry["sha1"])
 
 
-def apply(results: dict, entries: list[dict]) -> list[tuple[str, dict, str]]:
+def _resolve_prefixes(results: dict) -> dict[str, str]:
+    """Map short commit prefixes from result filenames to full 40-char SHAs.
+
+    Each unique prefix is resolved via ``git rev-parse``.  An unresolvable or
+    ambiguous prefix is omitted: its findings stay (fail closed).
+    """
+    prefixes: set[str] = set()
+    for filename in results.get("results", {}):
+        prefix, sep, _ = filename.partition("/")
+        if sep:
+            prefixes.add(prefix)
+    mapping: dict[str, str] = {}
+    for prefix in prefixes:
+        proc = _git("rev-parse", "--verify", "--quiet", prefix)
+        if proc.returncode == 0:
+            full = proc.stdout.strip()
+            if _HEX40.fullmatch(full):
+                mapping[prefix] = full
+    return mapping
+
+
+def apply(
+    results: dict,
+    entries: list[dict],
+    prefix_to_commit: dict[str, str],
+) -> list[tuple[str, dict, str]]:
     """Remove allowlisted findings from a detect-secrets results object in place.
 
-    Result filenames are ``<commit12>/<path>``, relative to the scratch tree.
+    Result filenames are ``<commit-prefix>/<path>``, relative to the scratch
+    tree.  *prefix_to_commit* maps each prefix to its full 40-char SHA so the
+    comparison is exact.
     Returns (filename, finding, reason) for each finding it removed.
     """
     allowed = {_key(e): e for e in entries}
     dropped: list[tuple[str, dict, str]] = []
     found = results.get("results", {})
     for filename in list(found):
-        commit, sep, path = filename.partition("/")
+        raw_commit, sep, path = filename.partition("/")
         if not sep:
+            continue
+        commit = prefix_to_commit.get(raw_commit)
+        if commit is None:
             continue
         kept = []
         for finding in found[filename]:
@@ -173,7 +203,8 @@ def main(argv: list[str]) -> int:
         return 0
     with open(argv[1], encoding="utf-8") as fh:
         results = json.load(fh)
-    dropped = apply(results, entries)
+    prefix_to_commit = _resolve_prefixes(results)
+    dropped = apply(results, entries, prefix_to_commit)
     with open(argv[1], "w", encoding="utf-8") as fh:
         json.dump(results, fh, indent=2)
     for filename, finding, reason in dropped:
