@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from genesis.cc.session_config import (
+    _MCP_PROFILES,
     _READONLY_DISALLOWED,
     SessionConfigBuilder,
 )
@@ -108,6 +112,54 @@ class TestLoadIdentityBlock:
 
 
 class TestBuildMcpConfig:
+    @pytest.mark.parametrize("profile", _MCP_PROFILES)
+    def test_named_profiles_use_owned_output_and_real_root(self, profile, tmp_path):
+        """Cold generation remains real for every named profile."""
+        result = SessionConfigBuilder().build_mcp_config(profile)
+        assert result is not None
+        generated = Path(result)
+        assert generated == tmp_path / "generated-mcp" / f"{profile}_mcp.json"
+        servers = json.loads(generated.read_text(encoding="utf-8"))["mcpServers"]
+        assert set(servers) == set(_MCP_PROFILES[profile])
+        repo = Path(__file__).resolve().parents[2]
+        for server in servers.values():
+            assert server["command"] == str(repo / ".claude/mcp/run-mcp-server")
+
+    def test_two_builders_reuse_fresh_cache(self, monkeypatch, tmp_path):
+        from genesis.cc import session_config
+
+        first = SessionConfigBuilder().build_mcp_config("research")
+        assert first is not None
+        before = Path(first).read_bytes()
+
+        def unexpected_render(*args, **kwargs):
+            pytest.fail("fresh config should have been reused")
+
+        monkeypatch.setattr(session_config, "render_mcp_servers", unexpected_render)
+        second = SessionConfigBuilder().build_mcp_config("research")
+        assert second == first
+        assert Path(second).is_relative_to(tmp_path)
+        assert Path(second).read_bytes() == before
+
+    def test_stale_cache_regenerates_without_touching_template(self, tmp_path):
+        generated = tmp_path / "generated-mcp" / "research_mcp.json"
+        generated.parent.mkdir()
+        generated.write_text("stale cache", encoding="utf-8")
+        os.utime(generated, (1, 1))
+
+        assert SessionConfigBuilder().build_mcp_config("research") == str(generated)
+        assert set(json.loads(generated.read_text())["mcpServers"]) == set(_MCP_PROFILES["research"])
+
+    def test_render_failure_preserves_none_result(self, monkeypatch, tmp_path):
+        from genesis.cc import session_config
+
+        def unavailable(*args, **kwargs):
+            raise OSError("synthetic template failure")
+
+        monkeypatch.setattr(session_config, "render_mcp_servers", unavailable)
+        assert SessionConfigBuilder().build_mcp_config("research") is None
+        assert not (tmp_path / "generated-mcp").exists()
+
     def test_full_returns_none(self, builder):
         assert builder.build_mcp_config("full") is None
 

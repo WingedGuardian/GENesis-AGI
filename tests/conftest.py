@@ -398,6 +398,7 @@ pytest_plugins = [
     "tests._live_closure",
     "tests._live_outbound",
     "tests._live_writes",
+    "tests._session_config",
 ]
 
 
