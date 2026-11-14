@@ -739,6 +739,47 @@ async def test_approved_prospect_hold_sends_when_armed_and_stamps_display_form(d
     assert await mp.list_active(db) == []
 
 
+class _PartlyRefusedPipeline(_FakePipeline):
+    """Delivered, but the server refused some recipients (a partly accepted send)."""
+
+    def __init__(self, refused):
+        super().__init__(OutreachStatus.DELIVERED)
+        self._refused = tuple(refused)
+
+    async def deliver_approved(self, row, *, subject=None):
+        self.calls.append((row["id"], subject))
+        return OutreachResult(
+            outreach_id="o",
+            status=OutreachStatus.DELIVERED,
+            channel="email",
+            message_content="",
+            refused_recipients=self._refused,
+        )
+
+
+@pytest.mark.asyncio
+async def test_partly_refused_delivery_stamps_only_accepted_prospects(db, monkeypatch):
+    """A list send the server partly refused is DELIVERED, but the refused
+    prospect was never emailed: it stays active, and only the accepted one is
+    stamped contacted."""
+    monkeypatch.setattr(egw, "_marketing_mode", lambda: "observe")
+    from genesis.db.crud import marketing_prospects as mp
+
+    for pid, email in (("p1", "one@example.com"), ("p2", "two@example.com")):
+        await mp.create(db, id=pid, email=email, created_at=_TS, updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await _prospect_hold(
+        db, rid=rid, recipient="One <one@example.com>, Two <two@example.com>",
+        risk_class="identity",
+    )
+    pipe = _PartlyRefusedPipeline(["two@example.com"])
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert (await pes.get_by_id(db, "pp"))["status"] == "sent"
+    assert (await mp.get_by_id(db, "p1"))["status"] == "contacted"
+    assert (await mp.get_by_id(db, "p2"))["status"] == "active"
+
+
 @pytest.mark.asyncio
 async def test_non_prospect_hold_is_untouched_by_the_marketing_stop(db):
     """Control: an approved IDENTITY send to someone who is not a prospect is

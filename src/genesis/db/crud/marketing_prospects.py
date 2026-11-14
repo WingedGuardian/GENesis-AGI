@@ -21,6 +21,7 @@ there is no unbounded growth to GC. No disk-hygiene prune path is wired by desig
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from email.message import EmailMessage
 from email.utils import getaddresses
@@ -219,20 +220,27 @@ async def mark_contacted_by_email(
 
 
 async def mark_contacted_in_recipient(
-    db: aiosqlite.Connection, recipient: str | None, *, contacted_at: str
+    db: aiosqlite.Connection,
+    recipient: str | None,
+    *,
+    contacted_at: str,
+    refused: Iterable[str] = (),
 ) -> int:
     """``mark_contacted_by_email`` for a delivered RECIPIENT STRING: every ACTIVE
     prospect it names goes active → contacted. The delivery paths pass the
     recipient as sent, which can be ``Name <addr>`` or a list; an exact match on
     that string stamps nothing, so a delivered prospect would stay 'active' and be
     pitched again. Addresses come from ``_delivery_emails``: only the ones the
-    send reaches, not every candidate ``find_in_recipient`` holds on.
+    send reaches, not every candidate ``find_in_recipient`` holds on, less any
+    address in ``refused`` (the recipients the server refused on a partly
+    accepted send, from the email adapter's delivery id).
 
     Same guarantees as ``mark_contacted_by_email``: one conditional UPDATE per
     ``_LOOKUP_CHUNK`` addresses (``status = 'active'``), so a row another writer
     moved on is never downgraded, and a non-prospect address is never touched.
     Returns the number of prospects stamped."""
-    emails = _delivery_emails(recipient)
+    skip = {e for e in map(_normalize_email, refused) if e}
+    emails = [e for e in _delivery_emails(recipient) if e not in skip]
     stamped = 0
     for start in range(0, len(emails), _LOOKUP_CHUNK):
         chunk = emails[start : start + _LOOKUP_CHUNK]

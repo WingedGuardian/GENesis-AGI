@@ -834,6 +834,15 @@ class OutreachPipeline:
                 error=str(exc),
             )
 
+        # Recipients the email server refused on a partly accepted send
+        # (EmailDeliveryId.refused); empty for every other channel and result.
+        _refused = getattr(delivery_id, "refused", None)
+        refused_recipients = (
+            tuple(sorted(str(a) for a in _refused))
+            if isinstance(_refused, (frozenset, set, tuple, list))
+            else ()
+        )
+
         now = datetime.now(UTC).isoformat()
         if self._db:
             from genesis.outreach.governance import content_hash
@@ -935,7 +944,9 @@ class OutreachPipeline:
                 try:
                     from genesis.db.crud import marketing_prospects as _mp
 
-                    await _mp.mark_contacted_in_recipient(self._db, recipient, contacted_at=now)
+                    await _mp.mark_contacted_in_recipient(
+                        self._db, recipient, contacted_at=now, refused=refused_recipients,
+                    )
                 except Exception:  # noqa: BLE001 — stamp is best-effort post-send; never break the send
                     logger.warning(
                         "granted-cell prospect contact-stamp failed (post-send); "
@@ -981,6 +992,7 @@ class OutreachPipeline:
             governance_result=gov,
             chat_id=str(delivery_recipient) if channel == "telegram" else None,
             thread_id=thread_id if channel == "telegram" else None,
+            refused_recipients=refused_recipients,
         )
 
     async def _resolve_subject(self, request: OutreachRequest) -> str | None:

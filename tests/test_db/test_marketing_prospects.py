@@ -211,6 +211,23 @@ async def test_mark_contacted_in_recipient_stamps_only_delivery_addresses(db):
     assert (await mp.get_by_id(db, "p2"))["status"] == "contacted"
 
 
+@pytest.mark.asyncio
+async def test_mark_contacted_in_recipient_skips_server_refused_addresses(db):
+    """A partly accepted send reaches only the recipients the server took; one it
+    refused (passed as ``refused``, any case) stays active for a later pitch."""
+    for pid, email in (("p1", "one@example.com"), ("p2", "two@example.com")):
+        await mp.create(db, id=pid, email=email, created_at=_TS, updated_at=_TS)
+    stamped = await mp.mark_contacted_in_recipient(
+        db,
+        "One <one@example.com>, Two <two@example.com>",
+        contacted_at=_TS,
+        refused=["TWO@example.com"],
+    )
+    assert stamped == 1
+    assert (await mp.get_by_id(db, "p1"))["status"] == "contacted"
+    assert (await mp.get_by_id(db, "p2"))["status"] == "active"
+
+
 def test_delivery_emails_follows_the_adapters_header_parse():
     """Pinned to what an EmailMessage To header plus smtplib's getaddresses
     deliver to: a header the adapter cannot build reaches nobody."""

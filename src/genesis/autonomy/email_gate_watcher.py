@@ -96,19 +96,22 @@ async def _is_posture_hold(db: object, row: dict) -> bool:
     return cell is not None and cell["state"] == CellState.GRANTED.value
 
 
-async def _stamp_prospect_contacted(db: object, recipient: str | None, now: str) -> None:
+async def _stamp_prospect_contacted(
+    db: object, recipient: str | None, now: str, *, refused: tuple[str, ...] = ()
+) -> None:
     """LOOP-FIX helper: on a CONFIRMED delivery, advance the matching prospect
     active → contacted so the campaign's ``list_active`` never re-pitches it.
     Delegates to the shared, active-guarded CRUD (the same entry point
     ``pipeline._deliver`` uses for the GRANTED autonomous path), so the stamp
     semantics live in one place. A non-marketing / non-active / absent recipient is
-    a no-op. Every address the recipient string names is stamped, so a prospect
-    addressed as ``Name <addr>`` counts as contacted too."""
+    a no-op. Every address the send reaches is stamped, so a prospect addressed
+    as ``Name <addr>`` counts as contacted too; ``refused`` (the send result's
+    ``refused_recipients``) names addresses the server refused, never stamped."""
     if not recipient:
         return
     from genesis.db.crud import marketing_prospects as mp
 
-    await mp.mark_contacted_in_recipient(db, recipient, contacted_at=now)
+    await mp.mark_contacted_in_recipient(db, recipient, contacted_at=now, refused=refused)
 
 
 async def _is_prospect_send(db: object, row: dict) -> bool:
@@ -206,6 +209,10 @@ async def drain_pending_email_sends(rt: object) -> int:
                 # stamp being idempotent and record_success gated on the flip) rather
                 # than going 'sent' with the prospect left 'active' or the owner-approved
                 # success dropped from promotion evidence.
+                # Known gap (#4647): the crashed cycle's refused recipients were never
+                # saved, so this stamps every address the send reached, including any
+                # the server refused. Not stamping instead would risk a duplicate pitch
+                # to a prospect that was reached, which is the worse error.
                 await _stamp_prospect_contacted(db, row["validated_recipient"], now)
                 await _terminalize_delivered_hold(db, row, now)
                 resolved += 1
@@ -303,7 +310,9 @@ async def drain_pending_email_sends(rt: object) -> int:
                 # a non-prospect recipient) so list_active stops re-pitching it. Keyed
                 # on the RECIPIENT being a curated prospect, NOT cell_risk_class, so a
                 # cold pitch that misclassified FINANCIAL (money-term body) is stamped.
-                await _stamp_prospect_contacted(db, row["validated_recipient"], now)
+                await _stamp_prospect_contacted(
+                    db, row["validated_recipient"], now, refused=result.refused_recipients
+                )
                 # Terminalize + record the owner-approved success exactly once (the
                 # mark_sent single-flip gates record_success; identical to the reconcile
                 # branch, so a crash-recovery replay accounts for it the same way).
