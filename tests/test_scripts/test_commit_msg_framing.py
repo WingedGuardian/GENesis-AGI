@@ -35,8 +35,104 @@ from pathlib import Path
 
 import pytest
 
+from genesis.session_awareness.zero_drop_git import scrubbed_git_env
+
 REPO = Path(__file__).resolve().parents[2]
 HOOK = REPO / "scripts" / "hooks" / "commit-msg"
+
+
+@pytest.fixture(scope="module")
+def owned_framing_history(tmp_path_factory):
+    """A real, full-enough history; no project hooks or live refs are touched."""
+    repo = tmp_path_factory.mktemp("framing-history")
+    env = {
+        **scrubbed_git_env(),
+        "GIT_AUTHOR_NAME": "Fixture",
+        "GIT_COMMITTER_NAME": "Fixture",
+        "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+        "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+    }
+
+    def git(*args, data=None):
+        return subprocess.run(
+            ["git", "-C", str(repo), *args], input=data,
+            capture_output=True, check=True, env=env,
+        ).stdout.strip()
+
+    git("init", "-q")
+    tree = git("mktree", data=b"").decode("ascii")
+    parent = None
+    for index in range(200):
+        parents = ["-p", parent] if parent else []
+        parent = git("commit-tree", tree, *parents, data=f"Owned fixture {index}\n".encode()).decode("ascii")
+    return repo, parent, git
+
+
+@pytest.mark.parametrize("match_on_first_line", [False, True], ids=["body-only", "prefixed-content"])
+def test_history_rate_uses_first_physical_line(owned_framing_history, monkeypatch, match_on_first_line):
+    repo, parent, git = owned_framing_history
+    # Both special commits change their tree, including the prefixed control.
+    for index in range(2):
+        blob = git("hash-object", "-w", "--stdin", data=f"owned {index}\n".encode()).decode("ascii")
+        tree = git("mktree", data=f"100644 blob {blob}\towned.txt\n".encode()).decode("ascii")
+        if match_on_first_line:
+            message = f"Round-reflection: fixture credentials leaked {index}\n"
+        else:
+            message = f"Ordinary fixture subject {index}\ncredentials leaked in a synthetic fixture\n"
+        parent = git("commit-tree", tree, "-p", parent, data=message.encode()).decode("ascii")
+    branch = "refs/heads/owned-first-line" if match_on_first_line else "refs/heads/owned-body"
+    git("update-ref", branch, parent)
+    git("symbolic-ref", "HEAD", branch)
+    monkeypatch.setitem(globals(), "REPO", repo)
+    try:
+        if match_on_first_line:
+            with pytest.raises(AssertionError, match=r"2 of 202 subjects fire"):
+                TestMeasuredRates().test_fire_rate_on_this_repositorys_real_subjects()
+        else:
+            TestMeasuredRates().test_fire_rate_on_this_repositorys_real_subjects()
+    except pytest.skip.Exception as exc:
+        pytest.fail(f"owned full-history measurement unexpectedly skipped: {exc}")
+
+
+def test_owned_history_clears_ambient_git_environment(tmp_path, tmp_path_factory, monkeypatch):
+    outside = tmp_path / "outside.git"
+    env = scrubbed_git_env()
+    subprocess.run(["git", "init", "--bare", "-q", str(outside)], env=env, check=True)
+    original_head = (outside / "HEAD").read_bytes()
+    monkeypatch.setenv("GIT_DIR", str(outside))
+    monkeypatch.setenv("GIT_COMMON_DIR", str(outside))
+    monkeypatch.setenv("GIT_OBJECT_DIRECTORY", str(outside / "objects"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(outside / "owned-index"))
+    monkeypatch.setenv("GIT_NAMESPACE", "owned-ambient")
+    repo, parent, git = owned_framing_history.__wrapped__(tmp_path_factory)
+    assert (repo / ".git").is_dir()
+    git("update-ref", "refs/heads/owned-fixture", parent)
+    git("symbolic-ref", "HEAD", "refs/heads/owned-fixture")
+    assert (outside / "HEAD").read_bytes() == original_head
+    assert set((outside / "objects").iterdir()) == {
+        outside / "objects" / "info", outside / "objects" / "pack"
+    }
+    assert not (outside / "owned-index").exists()
+
+
+def test_history_reader_clears_ambient_git_environment(owned_framing_history, tmp_path, monkeypatch):
+    repo, parent, git = owned_framing_history
+    git("update-ref", "refs/heads/owned-reader", parent)
+    git("symbolic-ref", "HEAD", "refs/heads/owned-reader")
+    outside = tmp_path / "outside.git"
+    env = scrubbed_git_env()
+    subprocess.run(["git", "init", "--bare", "-q", str(outside)], env=env, check=True)
+    monkeypatch.setenv("GIT_DIR", str(outside))
+    monkeypatch.setenv("GIT_COMMON_DIR", str(outside))
+    monkeypatch.setenv("GIT_OBJECT_DIRECTORY", str(outside / "objects"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(outside / "owned-index"))
+    monkeypatch.setenv("GIT_NAMESPACE", "owned-ambient")
+    monkeypatch.setitem(globals(), "REPO", repo)
+    try:
+        TestMeasuredRates().test_fire_rate_on_this_repositorys_real_subjects()
+    except pytest.skip.Exception as exc:
+        pytest.fail(f"owned history reader followed ambient Git environment: {exc}")
+
 
 # Incident framing, phrased the ways people actually phrase it. Derived by
 # enumerating the axis BY HAND — tense, voice, noun, and state word — because a
@@ -241,28 +337,20 @@ class TestMeasuredRates:
         long body. That rate gets a checker muted, so the scope is the subject.
         """
         proc = subprocess.run(
-            ["git", "-C", str(REPO), "log", "--format=%s", "--no-merges"],
+            ["git", "-C", str(REPO), "log", "--format=%B", "-z", "--no-merges"],
             capture_output=True,
-            text=True,
+            env=scrubbed_git_env(),
         )
         if proc.returncode != 0:
             pytest.skip("git history unavailable")
-        # Split on the LF RECORD DELIMITER only. `str.splitlines()` also breaks
-        # on U+0085, U+2028 and U+2029, which a commit subject may legitimately
-        # contain — the shell hook's `head`/`grep` pipeline keeps them INSIDE the
-        # subject, so a subject that really does fire would be cut into two
-        # non-matching strings here and the measured rate would UNDERCOUNT the
-        # hook's real behaviour. A rate that measures something other than what
-        # ships is worse than no rate (Codex P2, PR #1623).
-        # Review-round reflection records (`git commit --allow-empty
-        # --cleanup=verbatim`, scripts/review_reflection.py) are machine grammar,
-        # not prose: their first paragraph has no blank line after it, so %s is the
-        # whole record, and a squash merge never carries them to main. On a PR
-        # branch they would be counted as subjects, and one describing a
-        # credential-read audit ("credential files are recorded") reads as framing.
+        # Git's %s flattens the first paragraph, including physical body lines.
+        # Match the hook's head -n1 instead: NUL separates full messages, then
+        # literal LF ends the first line. Bytes preserve CR and Unicode line
+        # separators inside that line, without subprocess newline conversion.
         subjects = [
-            s for s in proc.stdout.split("\n")
-            if s.strip() and not s.startswith("Round-reflection:")
+            subject
+            for record in proc.stdout.split(b"\0")
+            if (subject := record.split(b"\n", 1)[0].decode("utf-8", errors="replace")).strip()
         ]
         if len(subjects) < 200:
             pytest.skip(f"shallow history ({len(subjects)} subjects); rate not meaningful")
