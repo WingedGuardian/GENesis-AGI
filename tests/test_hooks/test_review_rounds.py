@@ -1887,13 +1887,15 @@ def test_the_row_names_the_open_round_by_the_head_under_a_permuted_list(guard):
         (RABBIT, CR_MAJOR, True),
         (RABBIT, "_⚠️ Potential issue_ | _🔴 Critical_\n\nbody", True),
         (RABBIT, CR_MINOR, False),
-        # Any header line decides: a Major after a Minor is at the floor.
+        # Each finding segment decides: a Major after a Minor is at the floor.
         (RABBIT, CR_MINOR + "\n\n---\n\n" + CR_MAJOR, True),
         # A source footer is not a severity header, in either number.
         (RABBIT, CR_MINOR + "\n\n_Source: Linters/SAST tools_", False),
         (RABBIT, CR_MINOR + "\n\n_Sources: Coding guidelines, Learnings_", False),
-        # A header whose level cannot be read makes the comment unreadable.
-        (RABBIT, CR_MINOR + "\n\n_⚠️ Potential issue_ | _🟣 Severe_", None),
+        # A segment whose header level cannot be read makes the comment unreadable;
+        # a later header line inside the same segment is not read, as in the gate.
+        (RABBIT, CR_MINOR + "\n\n---\n\n_⚠️ Potential issue_ | _🟣 Severe_", None),
+        (RABBIT, CR_MINOR + "\n\n_⚠️ Potential issue_ | _🟣 Severe_", False),
         (RABBIT, "no header", None),
         (STRANGER, P1, None),
     ],

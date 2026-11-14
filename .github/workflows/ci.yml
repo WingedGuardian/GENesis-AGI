@@ -601,6 +601,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[test,transcript-analytics]" -c .github/test-tools/requirements.txt
+      - name: Install ripgrep
+        # Pinned official release, so the tests that need rg (locate's rg
+        # backend, the branch leak-scan workflow, the portability checks) run
+        # here instead of skipping.
+        run: bash scripts/ci/install_ripgrep.sh
       - name: Run tests
         # The narrator below fires on THIS step's failure, not on the job's.
         id: tests
@@ -791,7 +796,12 @@ jobs:
         # "no lock expected here (no install)" (#3719). 602 + 2 = 604.
         # Atomic-write checker (#4436): one strict xfail recording the
         # conditional-raise false clean, on top of main's 604: 604 -> 605.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 605
+        # locate content search (#4418): two rg-only cases skip because this job
+        # does not install ripgrep (test_locate.py::
+        # test_a_secret_bearing_file_with_a_line_break_in_its_name_is_skipped
+        # [\n] and [\r], "rg not on PATH"), measured in run 43313729694's JUnit,
+        # 605 -> 607.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 607
 
   test-ubuntu-2404:
     # ubuntu-latest is moving to 26.04, so `test` alone stops showing a break on

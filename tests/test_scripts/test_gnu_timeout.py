@@ -74,6 +74,26 @@ def test_the_sweep_finds_the_known_users():
     } <= set(_users())
 
 
+#: Files whose kill-after picks GNU's `timeout` inline instead of loading the
+#: helper: a unit's one /bin/sh line, run at boot, where sourcing the bash helper
+#: from a checkout the line exists to distrust is not an option (#4501).
+_SELECTS_INLINE = (
+    "systemd/genesis-server.service.template",
+    "systemd/genesis-bridge.service.template",
+)
+
+
+@pytest.mark.parametrize("rel", _SELECTS_INLINE)
+def test_a_unit_line_selects_gnu_timeout_inline(rel):
+    """The sweep above cannot see these (the call is on a variable), so this holds
+    them: each selects `gnutimeout` when present, runs its kill-after on that
+    choice, and has no bare `timeout -k` left."""
+    text = (_SCRIPTS / rel).read_text()
+    assert "command -v gnutimeout >/dev/null 2>&1 && t=gnutimeout" in text, rel
+    assert '"$$t" -k ' in text, rel
+    assert not any(_KILL_AFTER.search(ln) for ln in _code_lines(_SCRIPTS / rel)), rel
+
+
 @pytest.mark.parametrize("rel", _users())
 def test_every_script_passing_a_kill_after_loads_the_helper_first(rel):
     owner = _LOADED_THROUGH.get(rel, rel)

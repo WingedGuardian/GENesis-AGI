@@ -60,7 +60,7 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def _commit_sources(repo: Path, overrides: dict[str, str] | None = None, msg: str = "kit") -> str:
-    """Commit the nine kit sources (the real files, or *overrides*) under scripts/lib/."""
+    """Commit the ten kit sources (the real files, or *overrides*) under scripts/lib/."""
     lib = repo / "scripts" / "lib"
     lib.mkdir(parents=True, exist_ok=True)
     for name in KIT_FILES:
@@ -135,7 +135,7 @@ def test_install_takes_heads_blobs_never_the_working_tree(kitmod, repo, home):
     assert manifest["commit"] == _git(repo, "rev-parse", "HEAD")
     assert manifest["kit_id"] == kit.name
     assert sorted(manifest["kit_sources"]) == sorted(KIT_FILES)
-    assert len(manifest["kit_sources"]) == 9
+    assert len(manifest["kit_sources"]) == 10
     assert set(manifest["files"]) == set(KIT_FILES)
     for name in KIT_FILES:
         data = (kit / name).read_bytes()
@@ -482,7 +482,7 @@ def _closure() -> set[str]:
 
 def test_kit_sources_is_the_closure_and_the_test_worlds_list():
     sources = _kit_sources()
-    assert len(sources) == len(set(sources)) == 9
+    assert len(sources) == len(set(sources)) == 10
     assert set(sources) == _closure()
     assert set(sources) == set(KIT_FILES)
 
