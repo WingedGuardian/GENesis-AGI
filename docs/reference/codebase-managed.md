@@ -1091,7 +1091,7 @@ cgroup mapping without changing the full worker cap or existing reserves.
 These observations reserve no RAM and do not qualify hidden host limits,
 sustained pressure, deployment peaks or production corpus behavior.
 
-### Explicit supervised grant metadata
+### Explicit supervised retry
 
 The queue endpoint provides `request-retry`, `status-recovery` and `revoke-retry`.
 All take `--repo PATH --provider PROVIDER`.
@@ -1118,9 +1118,24 @@ These checks reserve no RAM. Codebase still requires
 enabled managed configuration and its existing lease. No command removes its
 disablement sentinel or changes a service, timer or freeze.
 
-This prefix has no `claim-selected` command and cannot consume a grant into a
-new selected runtime. New selected reservation, registration and native-intent
-acknowledgements refuse; ordinary admission also rejects selected provenance.
+`claim-selected --repo PATH --provider PROVIDER --nonce NONCE` consumes only
+the current unused grant through that same captured runner and both canonical
+locks. It also accepts `--managed-config PATH`. In one admitted transaction it
+freezes the trial, spends the grant and validates the reservation/runtime. The
+original actual-owner identity survives policy, census, preparation and the final
+evidence drain. Only the first successful commit reply reaches the shared
+contained owner in that same process. A spent grant or lost commit reply cannot
+reconstruct a runtime or authorize a resend; status reports the retained trial
+for supervised reconciliation. An older source grant refuses until the operator
+explicitly issues a replacement against the current captured inputs. Ordinary
+admission still rejects selected provenance.
+
+Selected reservation, registration and native intent independently recheck the
+spent binding, source, granted request/debt, deadlines, physical exclusion and
+final evidence. Managed CBM still requires enabled configuration, its lifecycle
+lease during preparation/consumption and its unchanged disablement-sentinel
+checks. The reporter reacquires its native protections before provider work;
+preparation does not hold that lease for the entire physical run.
 Existing selected history remains cancellable, observable and settleable.
 Failed-origin clean success retires only the exact frozen failure snapshot;
 other outcomes retain the original failed request and independent pending work.
@@ -1148,11 +1163,14 @@ remain explicit safety evidence for supervised recovery.
 Changes to retained retry code participate in the existing server restart and
 deployment-validation inventory.
 
-Selected execution, acceptance, strict cutover and native/production qualification
-remain separate gates. Metadata scratch tests exercise actual locks, SQL and
-captured commands with substituted manager/kernel observations and no provider
-work. Retained-row compatibility tests construct prior execution facts and prove
-settlement/replay; they do not establish native containment or production capacity.
+Acceptance, strict cutover and native/production qualification remain separate
+gates. Automatic readiness stays negative; issuing or consuming consent does not
+enable automatic retries. Metadata and selected-CLI scratch tests exercise real
+locks, SQL, commit refusal and lost replies with substituted manager/kernel
+observations and an inert owner. Separate sealed GitNexus tests exercise harmless
+provider-child success/failure and late-origin refusal. Retained-row compatibility
+tests construct prior execution facts and prove settlement/replay. These checks
+do not establish native containment or production indexing capacity.
 
 ### Pinned GitNexus typed adapter
 
@@ -1168,13 +1186,19 @@ needed; the typed adapter does not rewrite npm configuration or install tools.
 
 The source identity binds Node's executable digest, the exact package/ESM-entry
 metadata and bytes, caller resolution directory, environment, resource policy
-and fixed `analyze` arguments. Only the registered invocation fills its reserved
+and exact invocation arguments: ordinary generated work uses `analyze`;
+an explicitly selected recovery uses `analyze --force --no-parse-cache`.
+The adapter compares those arguments with the retained execution origin before
+constructing the physical owner and again during source recapture before native
+intent. Unsupported or changed origins refuse; the argument list cannot grant
+itself recovery authority. Only the registered invocation fills its reserved
 environment slot. The initial Node executable is held through descriptor-based
 spawn; the native working directory is the claimed physical repository. Imported
 vendor files and provider-created respawns remain trusted installed inputs;
 entry/package hashing does not seal the whole dependency tree or pin every
-descendant executable. No new `--force`, `--quiet`, heap setting or mode-specific
-provider argument is added. Full 8 GiB/zero-swap containment and existing reserves,
+descendant executable. Selected recovery's forced rebuild is included in its
+frozen source and resource preflight; no quiet or heap setting is added.
+Full 8 GiB/zero-swap containment and existing reserves,
 watchdog and cleanup obligations remain unchanged. This integration neither
 enables automatic readiness nor establishes production resource capacity.
 

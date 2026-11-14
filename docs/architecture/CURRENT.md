@@ -2070,9 +2070,12 @@ the shared banner is not an assertion about all concurrent sessions.
   metadata is observable and exactly revocable without clearing independent
   holds. Retained selected trials settle once; failed-origin work cannot become
   automatic pending work, and missing/corrupt bindings preserve work and retain
-  uncertainty. New selected launch acknowledgements and ordinary-owner routes
-  refuse selected provenance. Selected consumption/execution remains separate;
-  provider arguments and automatic readiness are unchanged.
+  uncertainty. Captured `claim-selected` atomically consumes one current grant;
+  only its first committed reply reaches the same original actual owner. Spent
+  or lost replies cannot reconstruct runtime authority. Ordinary owner admission
+  still refuses selected provenance. GN binds ordinary versus selected recovery
+  argv to actual durable origin before owner construction and during source
+  recapture. Acceptance, cutover and automatic readiness remain separate gates.
   Recovery evidence refuses partial zero-watermark acceptance receipts, matching
   ordinary admission; invalid positive receipts remain explicit safety evidence.
   The retained retry helper participates in existing server restart detection.
@@ -2186,7 +2189,9 @@ the shared banner is not an assertion about all concurrent sessions.
   Default initialization stays4; new native authority requires5, with no live
   cutover, acceptance setter or positive automatic readiness here. Explicit
   transaction-only retry grants in `index_marker_retry.py` require schema5 and
-  captured supervision; they do not implicitly migrate or enable automatic work.
+  captured supervision. Selected consumption shares the existing transaction,
+  final drain and physical owner, preserving original identity and first-commit
+  acknowledgement; it does not implicitly migrate or enable automatic work.
   Legacy uncertainty preserves original settlement/shared debt and uses
   non-claim observations for ambiguous pending/reused identities. Common scalar
   reduction covers reconciliation and embedded outcomes; import batches dedupe
