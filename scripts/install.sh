@@ -900,6 +900,8 @@ fi
 echo "  [6/$TOTAL_STEPS] Installing Genesis package..."
 
 _genesis_installed=0  # the browser stack step (step 11) needs Genesis importable
+# shellcheck source=lib/venv_setup.sh
+. "$SCRIPT_DIR/lib/venv_setup.sh"
 if [ -d "$VENV_PATH" ]; then
     # The graph engine's hash-pinned wheel, BEFORE the editable install:
     # pyproject.toml declares the same falkordblite pin, and installed first it is
@@ -915,8 +917,6 @@ if [ -d "$VENV_PATH" ]; then
     fi
     # Worktree guard + editable install + import verification — shared with
     # bootstrap.sh so the guard can't drift between the two entry points.
-    # shellcheck source=lib/venv_setup.sh
-    . "$SCRIPT_DIR/lib/venv_setup.sh"
     _ei_rc=0
     if [ "${FALKORDB_PIP_REFUSED:-}" = "1" ]; then
         # The hash-pinned wheel was refused: the editable install would fetch the
@@ -1481,6 +1481,11 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         timer_name=$(basename "$template" .template)
         case "$timer_name" in
             genesis-backup.timer) continue ;;  # deliberate setup step
+            genesis-transcript-analytics.timer)
+                if ! transcript_analytics_ready "$VENV_PATH"; then
+                    systemctl --user disable --now "$timer_name" 2>/dev/null || true
+                    continue
+                fi ;;
         esac
         # A re-run must not turn back on a timer the operator switched off
         # (~/.genesis/config/disabled_timers; lib/managed_units.sh).

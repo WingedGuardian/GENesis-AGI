@@ -254,6 +254,21 @@ jobs:
             [ -f "$_t" ] || continue
             _n=$(basename "$_t")
             [ "$_n" = "genesis-backup.timer" ] && continue
+            # Transcript analytics is opt-in: the installer enables its timer only
+            # when transcript_analytics_ready (lib/venv_setup.sh) says so, and
+            # disables it otherwise. Mirror that predicate, and on a fresh install
+            # (not configured) require the timer to stay off.
+            if [ "$_n" = "genesis-transcript-analytics.timer" ]; then
+              if ! ( . scripts/lib/venv_setup.sh && transcript_analytics_ready .venv ); then
+                # install.sh's `disable --now` ignores its own failure, so a
+                # timer left running would pass an enabled-only check.
+                if systemctl --user is-enabled --quiet "$_n" || systemctl --user is-active --quiet "$_n"; then
+                  echo "::error::$_n is enabled or active although transcript analytics is not configured"
+                  exit 1
+                fi
+                continue
+              fi
+            fi
             # BOTH questions. is-enabled catches "never armed"; is-active
             # catches an `enable --now` whose START leg failed — the triggered
             # .service missing or unloadable — which install.sh swallows with
@@ -323,6 +338,47 @@ jobs:
               exit 1
             fi
           done
+
+          # The opt-in analytics timer is checked OFF above (not configured on a
+          # fresh install), so its start path would otherwise never run here.
+          # Opt in the way a user does (the local overlay), install its extra and
+          # check readiness through the installer's own functions
+          # (lib/venv_setup.sh), arm it as install.sh does, then run its service
+          # once. Result= honours the unit's SuccessExitStatus (75: skipped).
+          _ta=genesis-transcript-analytics
+          mkdir -p ~/.genesis/config
+          printf 'enabled: true\n' > ~/.genesis/config/transcript_analytics.local.yaml
+          if ! ( . scripts/lib/venv_setup.sh && editable_install_guarded "$PWD" .venv && transcript_analytics_ready .venv ); then
+            echo "::error::transcript analytics configured, but the installer's readiness check still fails"
+            exit 1
+          fi
+          systemctl --user enable --now "$_ta.timer"
+          if ! systemctl --user is-enabled --quiet "$_ta.timer" || ! systemctl --user is-active --quiet "$_ta.timer"; then
+            echo "::error::$_ta.timer configured but not enabled and active"
+            systemctl --user status "$_ta.timer" --no-pager -l || true
+            exit 1
+          fi
+          # Both: the start's own status (a run the timer fired first could leave
+          # Result=success behind a failed start) and the unit's Result.
+          _ta_start=0
+          systemctl --user start "$_ta.service" || _ta_start=$?
+          _ta_result=$(systemctl --user show -p Result --value "$_ta.service")
+          if [ "$_ta_start" -ne 0 ] || [ "$_ta_result" != "success" ]; then
+            echo "::error::$_ta.service start exited $_ta_start with Result=$_ta_result"
+            systemctl --user status "$_ta.service" --no-pager -l || true
+            journalctl --user -u "$_ta.service" --no-pager -n 80 || true
+            # The unit's own output may not reach this user's journal on a
+            # runner: run the same command line once more, outside systemd, so
+            # the failure is named.
+            echo "--- the unit's command, run directly:"
+            _ta_rc=0
+            .venv/bin/python -m genesis transcripts ingest --timer || _ta_rc=$?
+            echo "--- exit status: $_ta_rc"
+            exit 1
+          fi
+          # Leave the box as a fresh install left it.
+          systemctl --user disable --now "$_ta.timer"
+          rm -f ~/.genesis/config/transcript_analytics.local.yaml
 
           # The user-facing artifacts that hardcoded ~/genesis until this PR: both
           # must point at where the repo ACTUALLY is, or they are installed dead on

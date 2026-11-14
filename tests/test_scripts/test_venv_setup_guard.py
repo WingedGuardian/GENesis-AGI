@@ -123,12 +123,16 @@ def test_the_documented_return_contract_matches_the_code() -> None:
 
 
 def _fake_venv(tmp_path: Path) -> tuple[Path, Path]:
-    """A venv whose pip records its arguments and whose python imports anything."""
+    """A venv whose pip records its arguments and whose python imports anything.
+    Its analytics config check answers "not configured" (exit 1), so the
+    optional analytics extra is not installed after the core packages."""
     venv = tmp_path / "venv"
     (venv / "bin").mkdir(parents=True)
     log = tmp_path / "pip.args"
     (venv / "bin" / "pip").write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{log}"\n')
-    (venv / "bin" / "python").write_text("#!/bin/sh\nexit 0\n")
+    (venv / "bin" / "python").write_text(
+        '#!/bin/sh\n[ "$2" = genesis.transcript_analytics.config ] && exit 1\nexit 0\n'
+    )
     for name in ("pip", "python"):
         (venv / "bin" / name).chmod(0o755)
     return venv, log
@@ -303,3 +307,100 @@ def test_runtime_extras_failure_without_a_summary_writes_nothing_else(tmp_path: 
     res = _install_runtime_extras(tmp_path, venv)
     assert res.returncode == 1
     assert list(tmp_path.glob("summary*")) == []
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_analytics_extra_is_installed_only_when_opted_in(tmp_path, enabled):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", cwd=repo)
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    calls = tmp_path / "pip-calls"
+    pip = venv / "bin/pip"
+    pip.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{calls}"\n')
+    python = venv / "bin/python"
+    python.write_text(
+        f'#!/bin/sh\nif [ "$1" = "-m" ]; then\n  exit {0 if enabled else 1}\nfi\nexit 0\n'
+    )
+    pip.chmod(0o700)
+    python.chmod(0o700)
+    result = _call(str(repo), str(venv))
+    assert result.returncode == 0, result.stderr
+    assert ("[transcript-analytics]" in calls.read_text()) is enabled
+
+
+def _analytics_venv(tmp_path, config_rc=0, import_rc=0, extra_rc=0):
+    """Fake only external Python/pip; execute the real shared shell helpers."""
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    calls = tmp_path / "calls"
+    python = venv / "bin/python"
+    python.write_text(
+        '#!/bin/bash\n'
+        f'printf "%s\\n" "$*" >> "{calls}"\n'
+        'if [[ "$1" == "-m" ]]; then\n'
+        '  [[ "$3" == "--configured-enabled" ]] || exit 99\n'
+        f'  exit {config_rc}\nfi\n'
+        f'if [[ "$2" == *duckdb* ]]; then exit {import_rc}; fi\nexit 0\n'
+    )
+    pip = venv / "bin/pip"
+    pip.write_text(
+        '#!/bin/bash\n'
+        f'printf "%s\\n" "$*" >> "{calls}"\n'
+        f'if [[ "$*" == *"[transcript-analytics]"* ]]; then exit {extra_rc}; fi\nexit 0\n'
+    )
+    python.chmod(0o700)
+    pip.chmod(0o700)
+    return venv, calls
+
+
+@pytest.mark.parametrize("config_rc,extra_rc", [(0, 1), (2, 0)])
+def test_optional_analytics_failure_preserves_core_install(tmp_path, config_rc, extra_rc):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", cwd=repo)
+    venv, calls = _analytics_venv(tmp_path, config_rc=config_rc, extra_rc=extra_rc)
+    result = _call(str(repo), str(venv))
+    assert result.returncode == RC_OK, result.stderr
+    assert "WARNING" in result.stderr
+    assert ("[transcript-analytics]" in calls.read_text()) is (config_rc == 0)
+
+
+@pytest.mark.parametrize("script_name", ["bootstrap.sh", "install.sh"])
+@pytest.mark.parametrize("config_rc,import_rc,ready", [(0, 0, True), (0, 1, False), (1, 0, False), (2, 0, False)])
+def test_real_installer_timer_loop_requires_config_and_imports(
+    tmp_path, script_name, config_rc, import_rc, ready
+):
+    venv, calls = _analytics_venv(tmp_path, config_rc=config_rc, import_rc=import_rc)
+    templates = tmp_path / "templates"
+    units = tmp_path / "units"
+    templates.mkdir()
+    units.mkdir()
+    for name in ("genesis-transcript-analytics.timer", "genesis-watchdog.timer"):
+        (templates / f"{name}.template").touch()
+        (units / name).touch()
+    body = (_REPO_ROOT / "scripts" / script_name).read_text()
+    start = body.index('for template in "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do')
+    end = body.index("\n    done", start)
+    loop = body[start:end] + '\n    done\n'
+    script = f'''
+set -e
+source "{_LIB}"
+GENESIS_ROOT="{tmp_path}"
+VENV_PATH="{venv}"
+SYSTEMD_TEMPLATE_DIR="{templates}"
+SYSTEMD_USER_DIR="{units}"
+GENESIS_TRANSCRIPT_ANALYTICS_DISABLED=1
+export GENESIS_TRANSCRIPT_ANALYTICS_DISABLED
+systemctl() {{ printf '%s\\n' "$*"; }}
+{loop.replace('$GENESIS_ROOT/.venv', str(venv))}
+'''
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert "enable --now genesis-watchdog.timer" in result.stdout
+    assert ("enable --now genesis-transcript-analytics.timer" in result.stdout) is ready
+    assert ("disable --now genesis-transcript-analytics.timer" in result.stdout) is not ready
+    assert ("import duckdb" in calls.read_text()) is (config_rc == 0)
+    if config_rc == 2 or import_rc == 1:
+        assert "WARNING" in result.stderr

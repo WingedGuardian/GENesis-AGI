@@ -258,3 +258,73 @@ def test_status_reports_unreadable_source_fingerprint(tmp_path, monkeypatch, cap
     out = json.loads(capsys.readouterr().out)
     assert out["stale_or_unbuilt"] == 1
     assert out["source_errors"][0]["source"] == source.name
+
+
+def test_timer_ingest_skips_a_projects_root_that_does_not_exist_yet(tmp_path, monkeypatch, capsys):
+    import argparse
+
+    from genesis.transcript_analytics import store
+
+    def never(*a, **kw):
+        raise AssertionError("the store must not run without a projects root")
+
+    monkeypatch.setattr(store, "ingest", never)
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude"))  # the default root is <CLAUDE_HOME>/projects
+    args = argparse.Namespace(
+        timer=True, projects=tmp_path / "claude" / "projects", data=tmp_path / "data",
+        since=None, no_derive=False, disabled=False,
+    )
+    monkeypatch.setattr(cli, "_disabled", lambda a: False)
+    assert cli.cmd_ingest(args) == 75
+    assert "no transcripts yet" in capsys.readouterr().out
+
+
+def test_timer_ingest_still_fails_a_missing_configured_projects_root(tmp_path, monkeypatch):
+    """A configured path that does not exist is a wrong setting: it must not
+    pass as a quiet skipped tick every hour."""
+    import argparse
+
+    from genesis.transcript_analytics import store
+
+    calls = []
+    monkeypatch.setattr(store, "ingest", lambda *a, **kw: calls.append(a) or {"failed": 0})
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude"))
+    monkeypatch.setattr(cli, "_disabled", lambda a: False)
+    args = argparse.Namespace(
+        timer=True, projects=tmp_path / "typo" / "projects", data=tmp_path / "data",
+        since=None, no_derive=True,
+    )
+    cli.cmd_ingest(args)
+    assert calls, "a missing non-default root reaches the store, which names it"
+
+
+def test_manual_ingest_still_reports_a_missing_projects_root(tmp_path, monkeypatch):
+    import argparse
+
+    from genesis.transcript_analytics import store
+
+    calls = []
+    monkeypatch.setattr(store, "ingest", lambda *a, **kw: calls.append(a) or {"failed": 0})
+    args = argparse.Namespace(
+        timer=False, projects=tmp_path / "projects", data=tmp_path / "data", since=None,
+        no_derive=True,
+    )
+    cli.cmd_ingest(args)
+    assert calls, "a manual ingest reaches the store, which names the missing root"
+
+
+def test_timer_ingest_does_not_skip_a_dangling_projects_link(tmp_path, monkeypatch):
+    import argparse
+
+    from genesis.transcript_analytics import store
+
+    link = tmp_path / "projects"
+    link.symlink_to(tmp_path / "gone")
+    calls = []
+    monkeypatch.setattr(store, "ingest", lambda *a, **kw: calls.append(a) or {"failed": 0})
+    monkeypatch.setattr(cli, "_disabled", lambda a: False)
+    args = argparse.Namespace(
+        timer=True, projects=link, data=tmp_path / "data", since=None, no_derive=True,
+    )
+    cli.cmd_ingest(args)
+    assert calls, "a dangling link is a misconfiguration the store's strict resolve reports"
