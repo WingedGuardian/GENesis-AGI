@@ -24,6 +24,8 @@ from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
 
+MIN_RESERVE_BYTES = 2 * 1024**3
+
 # This child changes only its own selection score, then preserves its PID across
 # exec. No mutable project source is reopened after durable native intent.
 _NATIVE_EXEC = """import os,sys
@@ -250,6 +252,8 @@ def effective_policy(value, native, *, full=False):
         raise ValueError("invalid effective worker policy fields")
     for key in ("wall_seconds", "sibling_reserve_bytes", "cache_reserve_bytes"):
         native._integer(value[key], key, positive=key == "wall_seconds")
+    if min(value["sibling_reserve_bytes"], value["cache_reserve_bytes"]) < MIN_RESERVE_BYTES:
+        raise ValueError("typed worker reserves cannot be below two GiB each")
     if (value["route"] not in ("workload", "capped", "inherit")
             or not isinstance(value["slice"], str)
             or re.fullmatch(r"[A-Za-z0-9_.\\-]+\.slice", value["slice"]) is None):

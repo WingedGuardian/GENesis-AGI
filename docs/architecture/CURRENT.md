@@ -2062,8 +2062,17 @@ the shared banner is not an assertion about all concurrent sessions.
   Matching terminal leader states alone do not prove controller process end.
   The same-connection final drain observes callback-created evidence before
   commit. The acknowledgement grants no retry or acceptance. The automatic
-  reconciliation caller remains separate (#3728), as do positive grants,
-  acceptance, cutover, native qualification and production capacity.
+  reconciliation caller remains separate (#3728); acceptance, cutover,
+  native qualification and production capacity remain separate gates.
+  Explicit request/revoke/status operations use the existing provider-state
+  grant and bind actual work, retained debt, evidence, provider and runner/
+  watchdog source, policy, boot and bounded dual-clock deadlines. Invalid grant
+  metadata is observable and exactly revocable without clearing independent
+  holds. Retained selected trials settle once; failed-origin work cannot become
+  automatic pending work, and missing/corrupt bindings preserve work and retain
+  uncertainty. New selected launch acknowledgements and ordinary-owner routes
+  refuse selected provenance. Selected consumption/execution remains separate;
+  provider arguments and automatic readiness are unchanged.
   The queue's `scripts/lib/index_marker_legacy.py` isolates malformed legacy
   artifacts in retained import receipts without replacing business failures;
   real filesystem/SQLite errors remain visible. Schema 3 atomically fans requests
@@ -2172,7 +2181,9 @@ the shared banner is not an assertion about all concurrent sessions.
   observations preserve owned OOM kills, including the first sample, before
   duplicate/conflict reduction; clean control cannot erase resource evidence.
   Default initialization stays4; new native authority requires5, with no live
-  cutover, retry grant, acceptance setter or positive automatic readiness here.
+  cutover, acceptance setter or positive automatic readiness here. Explicit
+  transaction-only retry grants in `index_marker_retry.py` require schema5 and
+  captured supervision; they do not implicitly migrate or enable automatic work.
   Legacy uncertainty preserves original settlement/shared debt and uses
   non-claim observations for ambiguous pending/reused identities. Common scalar
   reduction covers reconciliation and embedded outcomes; import batches dedupe

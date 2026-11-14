@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -42,7 +43,130 @@ class Supervisor:
             raise RuntimeError("explicit schema5 cutover is required")
         return result["value"]  # Advisory only; the admitted transaction rereads it.
 
+    def _current_grant(self, h, provider):
+        queue = self.modules["queue"]
+        return self._observe_schema5(lambda db: queue._retry.load(db, h, provider, queue._native))
 
+    def request_retry(self, data):
+        self._guard()
+        snapshot, modules = self.snapshot, self.modules
+        queue, admission = modules["queue"], modules["owner_admission"]
+        queue._native._object(
+            data,
+            (
+                "repo_path",
+                "provider",
+                "origin",
+                "run_mode",
+                "not_after_wall_ns",
+                "evidence_reference",
+                "managed_config",
+            ),
+            "supervised retry request",
+        )
+        repo = queue.canonical_repo(data["repo_path"])
+        h = queue.marker_hash(repo)
+        with admission.repository_lock_for(modules, repo, h):
+            prior = self._current_grant(
+                h, data["provider"]
+            )  # Never implicitly converts an older queue.
+            manager = modules["scope"].ScopeManager(
+                modules["unit"].bus_call,
+                modules["unit"].typed_property,
+                deadline=time.monotonic()
+                + admission.wall_seconds(modules, data["run_mode"], os.environ),
+            )
+            policy = admission.policy(
+                modules, data["provider"], data["run_mode"], manager, os.environ
+            )
+            manager.require_no_batch(modules["unit"].cgroup_empty)
+            nonce = queue.secrets.token_hex(16)
+            unit = queue._native.expected_unit(
+                dict(hash=h, provider=data["provider"], claim_id=nonce)
+            )
+
+            def capacity(control):
+                modules["admission"].assess_headroom(
+                    *modules["unit"].resolve_control_group(control),
+                    8 * 1024**3,
+                    policy["sibling_reserve_bytes"],
+                    cache_reserve=policy["cache_reserve_bytes"],
+                )
+
+            manager.require_slice_capacity(policy["slice"], capacity)
+            with admission.prepared_inputs(
+                snapshot,
+                modules,
+                repo,
+                data["provider"],
+                data["run_mode"],
+                data["managed_config"],
+                policy,
+                unit=unit,
+            ) as inputs:
+                if data["provider"] == "cbm":
+                    config = modules["managed"].runtime_config(
+                        modules["unit"].config_path(data["managed_config"])
+                    )
+                    modules["managed"].require_enabled(
+                        config
+                    )  # Never enables service or removes sentinel.
+                prior_source = None
+                if prior and prior["status"] == "spent":
+                    try:
+                        old_policy = admission.policy(
+                            modules, prior["provider"], prior["run_mode"], manager, os.environ
+                        )
+                        old_unit = queue._native.expected_unit(prior["trial"])
+                        with admission.prepared_inputs(
+                            snapshot, modules, repo, prior["provider"], prior["run_mode"],
+                            data["managed_config"], old_policy, unit=old_unit,
+                        ) as old:
+                            prior_source = dict(nonce=prior["nonce"], source=old["source"])
+                    except (OSError, ValueError):
+                        # No changed-source proof. The final transaction may
+                        # supersede only for its independent conclusive state;
+                        # an otherwise eligible clean success still stays current.
+                        prior_source = None
+                candidate = dict(
+                    hash=h,
+                    repo_path=repo,
+                    provider=data["provider"],
+                    origin=data["origin"],
+                    run_mode=data["run_mode"],
+                    nonce=nonce,
+                    source=inputs["source"],
+                    policy_sha256=queue._native.digest(policy),
+                    evidence_reference=data["evidence_reference"],
+                    not_after_wall_ns=data["not_after_wall_ns"],
+                )
+                with queue._decision_gate(native=True) as (db, finalize):
+                    result = queue._retry.issue(
+                        db,
+                        candidate,
+                        queue._native,
+                        queue._legs,
+                        finalize=finalize,
+                        fresh_cleanup=queue._fresh_gate(db),
+                        prior_source=prior_source,
+                    )
+        return result
+
+    def revoke_retry(self, repo, provider, nonce=None, *, grant_sha256=None):
+        self._guard()
+        queue = self.modules["queue"]
+        repo = queue.canonical_repo(repo)
+        h = queue.marker_hash(repo)
+        with self.modules["owner_admission"].repository_lock_for(self.modules, repo, h):
+            if grant_sha256 is None:
+                self._current_grant(h, provider)
+            else:
+                self._observe_schema5(lambda db: None)  # Malformed content is checked after admission.
+            with queue._decision_gate(native=True) as (db, finalize):
+                finalize()
+                result = queue._retry.revoke(db, h, provider, nonce, queue._native,
+                                             grant_sha256=grant_sha256)
+        return result
 
 
     def reconcile_context(self, context):

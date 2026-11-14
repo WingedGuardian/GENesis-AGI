@@ -58,7 +58,10 @@ def main(argv: list[str] | None, api: dict, *, supervisor=None) -> int:
     p = sub.add_parser("reconcile-native")
     p.add_argument('--context')
     api['_native'].add_commands(sub)
+    api['_retry'].add_commands(sub, api['_legs'])
     args = parser.parse_args(argv)
+    if args.cmd in api['_retry'].COMMANDS:
+        return api['_retry'].dispatch(args, api, supervisor)
     if args.cmd in api['_native'].COMMANDS:
         return api['_native'].dispatch(args, api, api['_proof'])
     machine = getattr(args, "nul", False)

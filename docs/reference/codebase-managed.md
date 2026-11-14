@@ -1091,6 +1091,62 @@ cgroup mapping without changing the full worker cap or existing reserves.
 These observations reserve no RAM and do not qualify hidden host limits,
 sustained pressure, deployment peaks or production corpus behavior.
 
+### Explicit supervised grant metadata
+
+The queue endpoint provides `request-retry`, `status-recovery` and `revoke-retry`.
+All take `--repo PATH --provider PROVIDER`.
+`request-retry` additionally requires `--origin pending|failed`, `--mode
+fast|moderate|full`, `--not-after-wall-ns INTEGER` and `--evidence-reference TEXT`.
+Request also accepts `--managed-config PATH`. Revoke requires exactly one of
+`--nonce NONCE` or `--grant-sha256 DIGEST`. Mutating operations require the current captured runner
+and its canonical lock on descriptor8, then take the canonical repository lock
+on descriptor9 internally. A raw queue process cannot substitute for that caller;
+observational `status-recovery` also works without it.
+An explicit schema-5 cutover is a prerequisite, never an implicit side effect.
+
+A retry request names one existing pending or failed provider request, its
+requested mode, a wall-clock deadline and an opaque evidence reference. It does
+not manufacture zero-debt work. The grant binds the actual request snapshot,
+provider evidence and frontier, provider startup and runner/watchdog source,
+policy, original boot and both wall and monotonic deadlines. The explicit
+issue-to-expiry interval must be positive and at most four hours. Evidence
+references must be nonempty, NUL-free valid UTF8, at most4096encoded bytes;
+oversized values are rejected rather than truncated. Issuance checks global
+managed-scope absence and capacity for the full 8 GiB worker plus sibling and
+cache reserves, each at least2GiB; larger explicit reserves remain supported.
+These checks reserve no RAM. Codebase still requires
+enabled managed configuration and its existing lease. No command removes its
+disablement sentinel or changes a service, timer or freeze.
+
+This prefix has no `claim-selected` command and cannot consume a grant into a
+new selected runtime. New selected reservation, registration and native-intent
+acknowledgements refuse; ordinary admission also rejects selected provenance.
+Existing selected history remains cancellable, observable and settleable.
+Failed-origin clean success retires only the exact frozen failure snapshot;
+other outcomes retain the original failed request and independent pending work.
+Missing, corrupt or mismatched spent bindings preserve both work tables, record
+uncertainty unless stronger safety is already retained, and never guess origin
+or reset known debt. Replay does not charge again. Physical and control closure
+remain separate obligations. Grant expiry does not prevent truthful settlement.
+
+Nonce revocation changes only the current unused grant; a healthy spent trial
+remains unchanged. Status returns an invalid-grant descriptor for malformed
+metadata: storage type, byte size and SHA256 of the storage-type ASCII bytes,
+a NUL separator and the raw BLOB bytes. It exposes no corrupt payload and grants
+no launch authority. Exact digest revocation rereads that malformed value under
+the admitted transaction and clears only its grant field. A changed digest or
+healthy grant refuses; a replay after removal reports absent. Accepted receipts,
+hazard revisions, work, execution evidence and independent holds are preserved.
+Database/IO failures remain errors. Storage uses the existing provider-state
+row and transaction-only `scripts/lib/index_marker_retry.py`; the facade remains
+the sole opener.
+
+Selected execution, acceptance, strict cutover and native/production qualification
+remain separate gates. Metadata scratch tests exercise actual locks, SQL and
+captured commands with substituted manager/kernel observations and no provider
+work. Retained-row compatibility tests construct prior execution facts and prove
+settlement/replay; they do not establish native containment or production capacity.
+
 ### Pinned GitNexus typed adapter
 
 Before reservation, selection reads metadata only: the selected Node inode and
