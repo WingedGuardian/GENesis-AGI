@@ -12,10 +12,11 @@ inputs. What this pins:
 2. ``is_finding`` never reads a comment as informational when the gate reads a
    segment above Trivial/Info, and still counts a Trivial-then-Major bundle
    with no rule between them (a round counter must never undercount);
-3. a header inside fenced code or ``<details>``, and a source footer line in
-   either number, open no round unless one starts a segment, where the gate
-   reads it as unknown too (#4460);
-4. the gate reads through the moved functions, not a copy.
+3. a source footer line in either number opens no round unless one starts a
+   segment, where the gate reads it as unknown too (#4460);
+4. the round counter reads every header line, quoted ones included, so a markup
+   shape the gate's mask gets wrong (#1722) cannot hide a header from it;
+5. the gate reads through the moved functions, not a copy.
 """
 
 from __future__ import annotations
@@ -75,7 +76,25 @@ MORE_INPUTS = {
     "empty": "",
 }
 
-ALL_INPUTS = {**AUDIT_INPUTS, **MORE_INPUTS}
+#: Shapes the gate's fence and ``<details>`` mask reads differently from
+#: CommonMark (#1722). Each hides the rule and the Major after a Trivial from
+#: the gate, which reads ``['trivial']``; the round counter must still count it.
+_TAIL = "\n\n```python\npass\n```\n"
+FALSE_FENCE_INPUTS = {
+    "inline span as a line": f"{TRIV}\n\n**a**\n\n```example```\n\n---\n\n{MAJ}{_TAIL}",
+    "backtick in info string": f"{TRIV}\n\n**a**\n\nuse:\n```x`y\n\n---\n\n{MAJ}{_TAIL}",
+    "inline span with prose": f"{TRIV}\n\n**a**\n\n``` `name` ``` is wrong\n\n---\n\n{MAJ}{_TAIL}",
+    "tab-indented backticks": f"{TRIV}\n\n**a**\n\n\t```\n\n---\n\n{MAJ}{_TAIL}",
+    "fence in a bullet item": f"{TRIV}\n\n**a**\n\n- ```python\n  x = 1\n  ```\n\n---\n\n{MAJ}{_TAIL}",
+    "fence in an ordered item": f"{TRIV}\n\n**a**\n\n1. ```python\n   x = 1\n   ```\n\n---\n\n{MAJ}{_TAIL}",
+    "one-line details": (
+        f"{TRIV}\n\n<details><summary>a</summary>b</details>\n\n---\n\n{MAJ}"
+        "\n\n<details>\n<summary>c</summary>\n\nd\n\n</details>\n</details>\n"
+    ),
+    "inline span, no rule": f"{TRIV}\n\n```example```\n\n{MAJ}{_TAIL}",
+}
+
+ALL_INPUTS = {**AUDIT_INPUTS, **MORE_INPUTS, **FALSE_FENCE_INPUTS}
 
 
 def _gate_levels(body: str) -> list[str | None]:
@@ -134,9 +153,11 @@ def test_the_round_counter_never_reads_less_than_the_gate(name):
         ("empty", True),
         # A footer that opens its own segment is unreadable there, as in the gate.
         ("rule then footer", True),
-        # Fenced and collapsed content, footers and markers open no round.
-        ("Trivial, quoted Minor", False),
-        ("Trivial, Minor in details", False),
+        # A header quoted in fenced or collapsed content opens a round too: the
+        # counter does not trust the gate's mask (#4569), so it may overcount.
+        ("Trivial, quoted Minor", True),
+        ("Trivial, Minor in details", True),
+        # Footers and markers open no round.
         ("plural footer", False),
         ("singular footer", False),
         ("Trivial, rule, prose", False),
@@ -145,6 +166,73 @@ def test_the_round_counter_never_reads_less_than_the_gate(name):
 )
 def test_what_opens_a_round(name, want):
     assert rf.is_finding(RABBIT, ALL_INPUTS[name]) is want
+
+
+@pytest.mark.parametrize("name", list(FALSE_FENCE_INPUTS))
+def test_a_false_fence_hides_the_major_from_the_gate_not_from_the_counter(name):
+    body = FALSE_FENCE_INPUTS[name]
+    assert _gate_levels(body) == ["trivial"]
+    assert rf.is_finding(RABBIT, body) is True
+
+
+def _every_line_reading(body: str) -> bool:
+    """Main's round-counter reading before #4491, minus the ruled plural-footer
+    exception (#4460): every header line counts unless it is informational or a
+    source footer in either number; a comment with no header counts."""
+    headers = 0
+    for line in body.split("\n"):
+        if not line.strip():
+            continue
+        level, seen = rf.cr_severity(line)
+        if not seen or rf._CR_SOURCE_FOOTER_RE.fullmatch(line.strip()):
+            continue
+        headers += 1
+        if level not in rf.CR_INFORMATIONAL:
+            return True
+    return headers == 0
+
+
+def _generated_bodies(n: int = 600) -> list[str]:
+    import random
+
+    rng = random.Random(4569)
+    pool = [
+        TRIV,
+        MIN,
+        MAJ,
+        UNK,
+        "**t**",
+        "prose",
+        "",
+        "---",
+        "```",
+        "```md",
+        "~~~",
+        "```example```",
+        "\t```",
+        "- ```python",
+        "  ```",
+        "<details>",
+        "<summary>x</summary>",
+        "</details>",
+        "<details><summary>a</summary>b</details>",
+        "_Source: Linters/SAST tools_",
+        "_Sources: Coding guidelines_",
+    ]
+    # Each body opens with a Trivial header, so its first segment reads
+    # informational and the verdict rests on the header-line scan.
+    return [
+        TRIV + "\n" + "\n".join(rng.choice(pool) for _ in range(rng.randint(1, 12)))
+        for _ in range(n)
+    ]
+
+
+def test_the_round_counter_counts_whatever_the_every_line_scan_counts():
+    """A round counter must never undercount: whatever main's every-line scan
+    counted, this reader counts too, on fixed and generated bodies alike."""
+    bodies = list(ALL_INPUTS.values()) + _generated_bodies()
+    missed = [b for b in bodies if _every_line_reading(b) and not rf.is_finding(RABBIT, b)]
+    assert missed == []
 
 
 def test_a_plural_source_footer_opens_no_round():

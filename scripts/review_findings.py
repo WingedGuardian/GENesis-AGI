@@ -682,17 +682,20 @@ def is_finding(login: str, body: str) -> bool:
     # CodeRabbit can bundle several findings into one comment. The merge gate
     # splits it at a markdown rule (`cr_findings`) and reads each segment's first
     # header, and a segment above Trivial/Info counts. So does any other header
-    # line outside fenced code and `<details>` that is not informational or that
-    # cannot be read: a Trivial header ahead of a Major one with no rule between
-    # them must not hide the Major from a counter that must never undercount
-    # (owner ruling, #4491). A header inside fenced code or `<details>`, and a
-    # source footer line, count only where the gate reads them too: as the first
-    # line of a segment, where they read unknown. A comment with no header at all
-    # counts.
+    # line that is not informational or that cannot be read: a Trivial header
+    # ahead of a Major one with no rule between them must not hide the Major from
+    # a counter that must never undercount (owner ruling, #4491). That scan reads
+    # EVERY line, quoted ones included. The gate's fence and `<details>` mask is
+    # not CommonMark (#1722): a whole-line inline span such as ```x``` opens it
+    # and hides the rule and the Major after it, so a counter that trusted the
+    # mask would undercount where it never did before (owner ruling, #4569). A
+    # header quoted in fenced code therefore opens a round, which overcounts, the
+    # direction a round counter may err in. A source footer line is not a header,
+    # and a comment with no header at all counts.
     if any(level not in CR_INFORMATIONAL for level in cr_levels(body)):
         return True
-    for line, quoted in zip(body.split("\n"), cr_markup_mask(body), strict=True):
-        if quoted or not line.strip():
+    for line in body.split("\n"):
+        if not line.strip():
             continue
         level, seen = cr_severity(line)
         footer = _CR_SOURCE_FOOTER_RE.fullmatch(line.strip())
