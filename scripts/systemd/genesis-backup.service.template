@@ -10,6 +10,20 @@ ExecStart=/bin/bash __REPO_DIR__/scripts/backup.sh
 # LAN can run well past the 90s default TimeoutStartSec, which would SIGTERM a
 # healthy backup mid-encryption. Project floor (timeout policy): 2h.
 TimeoutStartSec=7200
+# Lowest best-effort I/O priority. A run's footprint is disk I/O (SQLite dump,
+# GPG, Qdrant snapshots), not CPU: measured at under one core with CPU pressure
+# near 1%, so nothing CPU-side is lowered. Not IOWeight=: that is a cgroup io
+# setting, inert in a user unit unless the user manager has the io controller
+# delegated (often only cpu/memory/pids are). This is per-process ioprio,
+# inherited by every child backup.sh starts. MEASURED: the class reaches the
+# unit's process and its children. UNVERIFIED: its effect on disk contention.
+# Only BFQ weighs best-effort levels, and where the filesystem sits on
+# device-mapper volumes (which have no scheduler of their own, BFQ being on the
+# disks beneath) it is not established that the priority reaches BFQ.
+# Best-effort 7, not idle: if it does take effect, idle could starve a run on a
+# busy disk past the timeout above.
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 # git push authenticates via ~/.gitconfig's `gh auth git-credential` helper
 # (/usr/bin/gh, hosts.yml-backed) — no shell env or GH_TOKEN needed. sqlite3,
 # gpg, curl, smbclient all live in the system paths below.

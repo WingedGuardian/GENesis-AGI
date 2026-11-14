@@ -231,7 +231,7 @@ def test_actual_producer_enables_runtime_validation_without_changing_generic_loo
 
     namespace, snapshot, modules, claimed, settings, selected, _ = runtime_case(queue, tmp_path, monkeypatch)
     constructor = modules['scope'].ScopeManager
-    managers, allowed, refused = [], [], []
+    managers, allowed, refused, census = [], [], [], []
 
     def observed_constructor(bus_call, property_value, **kwargs):
         bus = runtime_bus(selected['wall_seconds'])
@@ -240,7 +240,13 @@ def test_actual_producer_enables_runtime_validation_without_changing_generic_loo
                 'random': ('RuntimeRandomizedExtraUSec', variant('t', 1)),
                 'signal': ('FinalKillSignal', variant('i', 15))}[fault]
             bus.scope[name] = value
-        operation = constructor(bus, property_value,
+        def call(path, interface, method, *args, timeout):
+            if method == 'ListUnitsByPatterns':
+                assert args == ('asas', '0', '1', 'code-intel-*.scope')
+                census.append(True)  # This fixture's namespace has no old batch.
+                return variant('a(ssssssouso)', [[]])
+            return bus(path, interface, method, *args, timeout=timeout)
+        operation = constructor(call, property_value,
             **{**kwargs, 'deadline': 1, 'clock': lambda: bus.now})
         managers.append(operation)
         return operation
@@ -265,6 +271,7 @@ def test_actual_producer_enables_runtime_validation_without_changing_generic_loo
     monkeypatch.setattr(modules['owner'], 'PhysicalOwner', physical_owner)
     assert namespace['main'](snapshot, modules, json.dumps(claimed['context']), 'fast', str(settings)) == 76
     assert len(managers) == 2
+    assert census == [True]
     assert managers[0].require_runtime_limit is False and managers[1].require_runtime_limit is True
     assert bool(allowed) is (fault is None) and bool(refused) is (fault is not None)
     state = modules['queue'].execution_status(claimed['context'])

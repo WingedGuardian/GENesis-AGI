@@ -645,16 +645,24 @@ def format_topic_summary(depth, output, *, text: str | None = None) -> str:
 
 
 #: Only the model's explicit ``"material_change": false`` suppresses a summary;
-#: an absent flag posts. Overlap alone never suppresses, and changed numbers do
-#: not force a post: MEASURED 2026-11-07, 193 of 200 light summaries carry
-#: numbers that move every run, so the model judges whether a value moved
-#: materially. The flag is trusted only when the summary still shares at least
-#: this much with the last FULL post. The model compares against the previous
-#: stored finding, which may itself have gone unposted, so without a floor a
-#: chain of small drifts could hide a large change from the user indefinitely.
-#: MEASURED 2026-11-11 over 199 consecutive pairs of one install's last 200
-#: light summaries: 21 score at least 0.3 under the negation rule below.
-LIGHT_MODEL_FLAG_MIN_JACCARD = 0.3
+#: an absent flag posts. The flag is trusted only while code finds no condition
+#: change between the run behind the last FULL post and this run (an alarm
+#: started or cleared, a fixed-level alarm rose, an active alarm crossed its
+#: own threshold, a band crossed, a signal
+#: appeared or went away:
+#: ``signal_format.light_condition_changes``). The model compares against the
+#: previous stored finding, which may itself have gone unposted, so without
+#: that check an alarm or a band crossing could go unreported. The check covers
+#: the alarm signals and the signals with thresholds (memory only, today). A
+#: value with no thresholds (budget, session pattern, pending findings) is
+#: judged by the model alone, however far it drifts across unposted runs, and
+#: so is a rise in a graded alarm (an age, a ratio, a count). A baseline that
+#: cannot be trusted (a reading that failed in the posted run, two runs in
+#: the lookup window) counts as unknown, and unknown posts.
+#: Wording is not compared: MEASURED 2026-11-12 on one install's 34 drift-only
+#: Light runs, a 0.3 term-overlap floor blocked 9 of the 17 summaries the model
+#: flagged unchanged, while the state check passed all 17 and caught all 6
+#: natural condition changes in the same window.
 
 #: While nothing changes, at most one "no material change" stub per this many
 #: hours, measured from the topic's last reflection post (full or stub). That keeps the
@@ -675,38 +683,6 @@ def _is_light_fallback(content: str) -> bool:
     """Only formatter fallbacks qualify; ordinary assessments can share a suffix."""
     header = f"<b>{Depth.LIGHT.value} Reflection</b>\n\n"
     return content in {header + _TOPIC_PARSE_FALLBACK, header + _TOPIC_EMPTY_FALLBACK}
-
-
-def _comparable(content: str) -> str:
-    """Topic text reduced to its words: tags and the header line removed."""
-    body = content.split("\n\n", 1)[1] if "\n\n" in content else content
-    return _html.unescape(re.sub(r"<[^>]+>", " ", body))
-
-
-def _light_overlap(first: str, second: str) -> float:
-    """Term overlap for the model-flag floor; changed negated text scores 0.
-
-    Keeping 'not' as just one term still hides a polarity change under a long
-    common prefix. Counts alone also miss moving 'not' to another subject.
-    """
-    from genesis.memory.source_verification import extract_terms
-
-    if first == second:
-        return 1.0
-
-    def negations(body: str) -> set[str]:
-        words = re.findall(r"\b\w+(?:['’]\w+)*\b", body.casefold())
-        return {w for w in words if w in {"no", "nor", "not", "never", "none", "neither", "without", "cannot"}
-                or w.endswith(("n't", "n’t"))}
-
-    neg_first, neg_second = negations(first), negations(second)
-    if neg_first or neg_second:
-        return 0.0
-    terms_first = extract_terms(first) | neg_first
-    terms_second = extract_terms(second) | neg_second
-    if not terms_first or not terms_second:
-        return 0.0
-    return len(terms_first & terms_second) / len(terms_first | terms_second)
 
 
 def _light_history(rows: list[dict], header: str) -> list[dict] | None:
@@ -736,30 +712,49 @@ async def send_light_topic_summary(
     source_text: str,
     topic_manager,
     now: datetime | None = None,
+    db=None,
+    tick=None,
 ) -> str:
-    """Post a light summary unless it repeats the last full post.
+    """Post a light summary unless nothing changed since the last full post.
 
     Returns ``"posted"``, ``"stub"`` or ``"skipped"``. Only the Telegram post is
     gated; the caller has already stored the reflection's output. A summary is
     "no change" only when the model says so (``"material_change": false``) and
-    it still scores at least ``LIGHT_MODEL_FLAG_MIN_JACCARD`` against the last
-    full post in the topic; an absent or true flag posts. Then a stub is posted
-    if the topic has been quiet for ``LIGHT_NO_CHANGE_STUB_HOURS``, and nothing
-    otherwise. "Last posted" is read from ``telegram_messages``
+    code finds no condition change between the run behind the last full post
+    and ``tick`` (``_conditions_changed_since``); an absent or true flag posts.
+    When the model says false and code does find one, the summary is posted
+    with those changes listed under it. Otherwise a stub is posted if the topic
+    has been quiet for ``LIGHT_NO_CHANGE_STUB_HOURS``, and nothing if not.
+    "Last posted" is read from ``telegram_messages``
     (``TopicManager.recent_outbound``), so a restart neither re-posts nor
     forgets a stub. Anything that cannot be decided (no history, a failed read,
-    a parse-failure fallback) is posted. One manager-local lock spans the
-    history read through successful send persistence, including early-post
-    paths.
+    a parse-failure fallback, no ``db`` or ``tick``, no stored signals for the
+    posted run) is posted. One manager-local lock spans the history read
+    through successful send persistence, including early-post paths.
     """
+    kwargs = {"source_text": source_text, "topic_manager": topic_manager, "now": now, "db": db, "tick": tick}
     if not topic_manager:
-        return await _send_light_topic_summary_locked(
-            session_id, text, source_text=source_text, topic_manager=topic_manager, now=now,
-        )
+        return await _send_light_topic_summary_locked(session_id, text, **kwargs)
     async with topic_manager.delivery_lock("reflection_light"):
-        return await _send_light_topic_summary_locked(
-            session_id, text, source_text=source_text, topic_manager=topic_manager, now=now,
-        )
+        return await _send_light_topic_summary_locked(session_id, text, **kwargs)
+
+
+async def _conditions_changed_since(db, tick, posted_at: str) -> list[str] | None:
+    """Condition changes between the run behind the post at ``posted_at`` and ``tick``.
+
+    One line per change, as the Light change table words it. None means it
+    cannot be known (no database or tick, or that run's signals are not on
+    record); the caller posts.
+    """
+    from genesis.awareness.signal_format import light_condition_changes
+    from genesis.cc.reflection_bridge._prompts import _signals_behind
+
+    if db is None or tick is None:
+        return None
+    previous = await _signals_behind(db, posted_at, exclude_tick_id=tick.tick_id)
+    if previous is None:
+        return None
+    return light_condition_changes(previous, tick.signals)
 
 
 async def _send_light_topic_summary_locked(
@@ -769,6 +764,8 @@ async def _send_light_topic_summary_locked(
     source_text: str,
     topic_manager,
     now: datetime | None = None,
+    db=None,
+    tick=None,
 ) -> str:
     from genesis.channels.telegram._handler_helpers import _split_for_telegram
     from genesis.util.tz import fmt, parse_utc_iso
@@ -800,13 +797,33 @@ async def _send_light_topic_summary_locked(
         await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
         return "posted"
 
-    current, previous = _comparable(text), _comparable(last_full["content"])
+    changes = await _conditions_changed_since(db, tick, last_full["timestamp"])
+    if changes is None:
+        logger.info("Light reflection posted: no stored signals for the run behind the last full post")
+        await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
+        return "posted"
+    if changes:
+        # The model said nothing changed, but a condition did since the user's
+        # last full post: post, and say what code found.
+        listed = "\n".join(f"• {_escape(line)}" for line in changes[:10])
+        if len(changes) > 10:
+            listed += f"\n• and {len(changes) - 10} more"
+        note = f"<b>Changed since the last post</b> (from the signals):\n{listed}"
+        augmented = f"{text}\n\n{note}"
+        if len(_split_for_telegram(augmented)) > 1 and text.startswith(header):
+            # A later message that fails to send leaves no trace, and the first
+            # one alone would become the baseline: the note goes where the
+            # first message carries it.
+            augmented = f"{header}\n\n{note}{text[len(header):]}"
+        await send_to_topic(session_id, depth, augmented, topic_manager=topic_manager)
+        return "posted"
+
+    # A long summary is several Telegram messages, and a later chunk that
+    # failed to send leaves no trace. Unless the text is identical, post rather
+    # than trust that the user saw all of the last one. (After the condition
+    # check, so a long summary still carries the change note.)
     multi = len(_split_for_telegram(text)) > 1 or len(_split_for_telegram(last_full["content"])) > 1
-    # A large shared prefix must not hide a changed or previously missing tail.
-    # Code fences can be inserted by the splitter, so that baseline is uncertain.
-    uncertain = "```" in text or "```" in last_full["content"]
-    score = 0.0 if uncertain or (multi and current != previous) else _light_overlap(current, previous)
-    if score < LIGHT_MODEL_FLAG_MIN_JACCARD:
+    if multi and text != last_full["content"]:
         await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
         return "posted"
 
@@ -821,10 +838,7 @@ async def _send_light_topic_summary_locked(
         or now - last_post >= timedelta(hours=LIGHT_NO_CHANGE_STUB_HOURS)
     )
     if not quiet:
-        logger.info(
-            "Light reflection not posted: model reported no material change (jaccard=%.2f)",
-            score,
-        )
+        logger.info("Light reflection not posted: no material change since the last full post")
         return "skipped"
     since = fmt(last_full["timestamp"], "%Y-%m-%d %H:%M %Z")
     stub = f"{header}\n\n{_STUB_MARK} {_escape(since)}.</i>"

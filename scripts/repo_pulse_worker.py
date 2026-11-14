@@ -366,6 +366,9 @@ def _print_verification_log(db_path: str | None, pr_number: int | None) -> None:
         reason = (row.get("closed_reason") or "").strip()
         if reason:
             print(f"        reason  : {_clip(reason, 160, row['pr_number'])}")
+        # Who closed it; rows closed before this was recorded print nothing here.
+        if row.get("closed_by"):
+            print(f"        by      : {row['closed_by']}")
         evidence = row.get("evidence")
         if evidence:
             # A census can carry 500 rows; printing every document would bury it.

@@ -414,9 +414,21 @@ class LiteLLMDelegate:
             # subclass BadRequestError, so this catches them too. Deterministic:
             # the router classifies BAD_REQUEST, fails fast to the next provider,
             # and does NOT trip the breaker (it's our payload, not the provider).
+            #
+            # One status is carried through instead of flattened: 402. litellm
+            # raises BadRequestError for a response whose body says
+            # "invalid_request_error" whatever its HTTP status, and keeps the
+            # real status on the exception (MEASURED on litellm 1.100.4, over
+            # loopback). A vendor that reports an empty balance as 402 with
+            # that code in the body would otherwise reach the router as a 400.
+            # Only 402: every other status on this exception is still reported
+            # as 400, so no other class of error changes category here.
+            status = 402 if getattr(e, "status_code", None) == 402 else 400
             if _should_log_failure(provider):
-                logger.warning("Provider %s bad request: %s", provider, e)
-            return CallResult(success=False, error=str(e), status_code=400)
+                logger.warning(
+                    "Provider %s bad request (status %s): %s", provider, status, e,
+                )
+            return CallResult(success=False, error=str(e), status_code=status)
         except litellm.UnprocessableEntityError as e:
             if _should_log_failure(provider):
                 logger.warning("Provider %s unprocessable request: %s", provider, e)

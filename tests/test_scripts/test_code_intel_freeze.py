@@ -59,10 +59,12 @@ def _repo_lock_path(tmp_path: Path, repo: Path) -> Path:
     return _lock_dir(tmp_path) / f"code-intel-{digest}.lock"
 
 
-def _arm_freeze(tmp_path: Path, repo: Path, logfile: Path) -> subprocess.Popen:
+def _arm_freeze(
+    tmp_path: Path, repo: Path, logfile: Path, path: str = _SYSTEM_PATH
+) -> subprocess.Popen:
     """Start the freeze in the background; return once it has logged ARMED."""
     env = {
-        "PATH": _SYSTEM_PATH,
+        "PATH": path,
         "HOME": str(tmp_path),
         "GENESIS_HOME": str(tmp_path / ".genesis"),
     }
@@ -145,6 +147,41 @@ def test_armed_freeze_holds_runner_self_lock(tmp_path):
     with runner_lock.open("w") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)  # must not raise
         fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def test_disarm_releases_locks_while_sleep_is_still_exiting(tmp_path):
+    """Disarm frees the locks even if the backgrounded sleep is slow to die.
+
+    The fake `sleep` lingers for two seconds after SIGTERM, the way a loaded
+    runner can. The locks must be free as soon as the freeze shell has exited,
+    not whenever its child finally goes away (#3956).
+    """
+    repo = _make_repo(tmp_path)
+    logfile = tmp_path / "freeze.log"
+    runner_lock = _lock_dir(tmp_path) / "code-intel-runner.lock"
+    repo_lock = _repo_lock_path(tmp_path, repo)
+    slowbin = tmp_path / "slowbin"
+    slowbin.mkdir()
+    ready = tmp_path / "sleep.ready"
+    _write_exec(
+        slowbin / "sleep",
+        "#!/usr/bin/env bash\n"
+        "trap '/bin/sleep 2; kill \"$child\"; exit 0' TERM\n"
+        "/bin/sleep 60 &\n"
+        "child=$!\n"
+        f': > "{ready}"\n'
+        'wait "$child"\n',
+    )
+    proc = _arm_freeze(tmp_path, repo, logfile, path=f"{slowbin}:{_SYSTEM_PATH}")
+    deadline = time.time() + 20
+    while not ready.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    assert ready.exists(), "the fake sleep never started"
+    _disarm(proc)
+    for lock in (runner_lock, repo_lock):
+        with lock.open("w") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)  # must not raise
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def test_entrypoint_reaches_scope_admission_after_disarm(tmp_path):

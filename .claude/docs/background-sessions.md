@@ -188,6 +188,14 @@ fallback, and gh documents the two on the same line. If a gh release adds a
 credential variable, add it there and cite the release; a name recalled without a
 citation is how this broke.
 
+The dashboard's update sessions (`dashboard/routes/updates.py`) start outside
+`CCInvoker` and import this set rather than keeping their own: Tier 3 pins it and
+passes `_assert_no_gh_credentials`, and Tiers 1/2 get it substituted into the
+generated orchestrator script, so a name added to `_GH_CREDENTIAL_ENV` reaches
+both. They pass no `--settings`, so the second copy of these pins that the
+invoker writes into its `--settings` file does not cover them
+(`docs/architecture/CURRENT.md`, section 2).
+
 **Read this before assuming a non-allowlisted session is unauthenticated — it is
 not.** MEASURED: with no `GH_CONFIG_DIR` pin, a session with `GH_TOKEN=""` is
 STILL FULLY AUTHENTICATED, because `gh` falls back to `hosts.yml` on disk. The

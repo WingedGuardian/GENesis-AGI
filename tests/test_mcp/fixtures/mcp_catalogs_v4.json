@@ -1681,7 +1681,6 @@
       "title": "Follow Up Update",
       "description": "Update an existing follow-up item.\n\nChange status, add resolution notes, mark blocked, adjust priority, pin/unpin,\nor move it between the hot (follow_up) and cold (tabled) lanes.",
       "inputSchema": {
-        "type": "object",
         "additionalProperties": false,
         "properties": {
           "follow_up_id": {
@@ -1696,7 +1695,7 @@
           "resolution_notes": {
             "default": "",
             "type": "string",
-            "description": "Notes on resolution or progress. Appended to any existing notes\n(after a blank line); earlier notes are never replaced."
+            "description": "Notes on resolution or progress. Appended to any existing notes\n(after a blank line); earlier notes are kept unless replace_notes is set."
           },
           "blocked_reason": {
             "default": "",
@@ -1722,11 +1721,17 @@
             "default": "",
             "type": "string",
             "description": "Set/replace the revisit trigger (the event that would\nresurface the item). Empty to leave unchanged."
+          },
+          "replace_notes": {
+            "default": false,
+            "type": "boolean",
+            "description": "True to REPLACE the existing notes with resolution_notes\ninstead of appending (to correct a wrong or sensitive note). Requires\nresolution_notes; the earlier notes are lost. Default False."
           }
         },
         "required": [
           "follow_up_id"
-        ]
+        ],
+        "type": "object"
       },
       "outputSchema": {
         "additionalProperties": true,
@@ -3630,7 +3635,7 @@
           "contains": {
             "default": "",
             "type": "string",
-            "description": "Optional content match (only files passing the other filters are\nopened). Empty = no content filtering."
+            "description": "Optional content match (only files passing the other filters are\nopened). Empty = no content filtering. Credential files (the\nsecrets file and its backups, .env, private keys, token and\ncredential files, any file carrying a value from the secrets file)\nare never content-searched: findable by name, counted in\ncontent_skipped_credential_files; read stored credentials with\nreference_lookup."
           },
           "regex": {
             "default": false,

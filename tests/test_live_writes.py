@@ -47,11 +47,163 @@ def home(tmp_path, monkeypatch):
         audit._S, "credential_files", frozenset({os.path.join(root, "genesis", "secrets.env")})
     )
     monkeypatch.setattr(audit._S, "hits", {})
+    monkeypatch.setattr(audit._S, "faults", 0)
     return fake
 
 
 def _hits():
     return {(label, op, Path(path).name) for _node, label, op, path in audit._S.hits}
+
+
+@pytest.mark.parametrize("operation", ["remove", "rename", "mkdir", "rmdir", "rmtree", "link", "symlink"])
+def test_name_operations_resolve_symlink_parent_before_dotdot(home, operation):
+    live = home / ".genesis"
+    (live / "nested").mkdir()
+    allowed = home.parent / "allowed"
+    link = allowed / "link"
+    link.symlink_to(live / "nested", target_is_directory=True)
+    victim = live / "victim"
+    target = str(link / ".." / "victim")
+    source = allowed / "source"
+    source.write_bytes(b"owned")
+    if operation in {"remove", "rename"}:
+        victim.write_bytes(b"owned")
+    elif operation in {"rmdir", "rmtree"}:
+        victim.mkdir()
+    audit._S.hits.clear()
+
+    if operation == "remove":
+        os.remove(target)
+    elif operation == "rename":
+        os.rename(target, allowed / "renamed")
+    elif operation == "mkdir":
+        os.mkdir(target)
+    elif operation == "rmdir":
+        os.rmdir(target)
+    elif operation == "rmtree":
+        shutil.rmtree(target)
+    elif operation == "link":
+        os.link(source, target)
+    else:
+        os.symlink(source, target)
+
+    event = "shutil.rmtree" if operation == "rmtree" else f"os.{operation}"
+    assert ("~/.genesis", event, "victim") in _hits()
+    if operation in {"remove", "rename", "rmdir", "rmtree"}:
+        assert not victim.exists()
+    elif operation == "mkdir":
+        assert victim.is_dir()
+    else:
+        assert victim.read_bytes() == b"owned"
+
+
+def test_descriptor_truncate_records_its_protected_target(home):
+    target = home / ".genesis" / "descriptor"
+    target.write_bytes(b"owned")
+    with target.open("r+b") as handle:
+        audit._S.hits.clear()
+        os.ftruncate(handle.fileno(), 1)
+    assert target.read_bytes() == b"o"
+    assert ("~/.genesis", "os.truncate", "descriptor") in _hits()
+
+
+def test_valid_descriptor_without_proc_visibility_counts_uncertainty(home, monkeypatch):
+    target = home / ".genesis" / "hidden-descriptor"
+    target.write_bytes(b"owned")
+    with target.open("r+b") as handle:
+        descriptor = handle.fileno()
+        readlink = audit.os.readlink
+
+        def unavailable(path, *args, **kwargs):
+            if path == f"/proc/self/fd/{descriptor}":
+                raise FileNotFoundError(path)
+            return readlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(audit.os, "readlink", unavailable)
+        audit._S.hits.clear()
+        os.ftruncate(descriptor, 1)
+    assert target.read_bytes() == b"o"
+    assert not audit._S.hits
+    assert audit._S.faults == 1
+
+
+def test_invalid_descriptor_is_not_an_unknown_write(home):
+    audit._hook("os.truncate", (-1, 1))
+    assert not audit._S.hits
+    assert audit._S.faults == 0
+
+
+def test_hook_uses_private_os_and_transitive_path_bindings(home, monkeypatch):
+    directory = home / ".genesis" / "empty-dir"
+    directory.mkdir()
+    nested = home / ".genesis" / "nested"
+    nested.mkdir()
+    (home / ".genesis" / "pointer").symlink_to(nested, target_is_directory=True)
+    modules = {name: sys.modules[name] for name in ("os", "posixpath", "genericpath")}
+    names = ("stat", "lstat", "listdir", "getcwd", "readlink")
+    helpers = {name: getattr(os, name) for name in names}
+    audit._observer_os()
+    assert all(sys.modules[name] is module for name, module in modules.items())
+    assert all(getattr(os, name) is helper for name, helper in helpers.items())
+    monkeypatch.chdir(home / ".genesis")
+    audit._S.hits.clear()
+
+    def global_helper_reached(*args, **kwargs):
+        raise AssertionError("observer reached a mutable global OS helper")
+
+    with pytest.MonkeyPatch.context() as global_patch:
+        for name in names:
+            global_patch.setattr(os, name, global_helper_reached)
+        audit._hook("open", ("pointer/../private-os", "w", os.O_WRONLY))
+        audit._hook("os.rmdir", (str(directory), -1))
+        with pytest.raises(AssertionError, match="mutable global OS helper"):
+            os.getcwd()
+
+    assert ("~/.genesis", "write", "private-os") in _hits()
+    assert ("~/.genesis", "os.rmdir", "empty-dir") in _hits()
+    assert audit._S.faults == 0
+    assert all(getattr(os, name) is helper for name, helper in helpers.items())
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, pytest.fail.Exception])
+def test_judging_fault_is_counted_without_escaping(home, monkeypatch, failure):
+    monkeypatch.setattr(audit._S, "faults", 0, raising=False)
+
+    def broken(*args):
+        raise failure("owned judging fault")
+
+    with pytest.MonkeyPatch.context() as injection:
+        injection.setattr(audit, "_judge", broken)
+        audit._hook("os.mkdir", ("owned", 0o700, -1))
+    assert audit._S.faults == 1
+
+
+@pytest.mark.parametrize("signal", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_hook_preserves_operator_interrupts(home, monkeypatch, signal):
+    def interrupted(*args):
+        raise signal()
+
+    monkeypatch.setattr(audit, "_judge", interrupted)
+    with pytest.raises(signal):
+        audit._hook("os.mkdir", ("owned", 0o700, -1))
+
+
+def test_fault_count_reaches_controller_and_summary(home, monkeypatch):
+    monkeypatch.setattr(audit._S, "faults", 3, raising=False)
+    monkeypatch.setattr(audit._S, "merged_workers", set())
+    monkeypatch.setattr(audit._S, "unreported", [])
+    config = type("C", (), {"workeroutput": {}})()
+    audit.pytest_sessionfinish(type("S", (), {"config": config})(), 0)
+    audit._S.faults = 0
+    node = type("N", (), {"gateway": type("G", (), {"id": "gw0"})(), "workeroutput": config.workeroutput})()
+    audit.pytest_testnodedown(node, None)
+    assert audit._S.faults == 3
+    monkeypatch.setattr(audit._S, "hits", {})
+    monkeypatch.delenv("GENESIS_LIVE_WRITES_REPORT", raising=False)
+    lines = []
+    reporter = type("R", (), {"config": object(), "write_line": lambda self, line, **kw: lines.append(line)})()
+    audit.pytest_terminal_summary(reporter)
+    assert any("3 events could not be classified" in line for line in lines)
 
 
 def test_the_audit_is_armed():

@@ -385,7 +385,12 @@ def _descendants(cwd: str, sha: str, current: str) -> set[str]:
     return set(out.split())
 
 
-def covered_late_keys(
+def covered_late_keys(cwd: str, budget: Mapping[str, Any], late: Sequence[Mapping[str, Any]], **context) -> set[str]:
+    """Compatibility set view of the same fully validated late coverage."""
+    return set(coverage_details(cwd, budget, late, **context))
+
+
+def coverage_details(
     cwd: str,
     budget: Mapping[str, Any],
     late: Sequence[Mapping[str, Any]],
@@ -393,7 +398,9 @@ def covered_late_keys(
     gate_lane: bool,
     acceptance: Sequence[str] | None,
     deadline: float | None = None,
-) -> set[str]:
+    repo: str | None = None,
+    number: int | None = None,
+) -> dict[str, rr.Disposition]:
     """Late keys answered by committed reflections. A reflection R naming head
     N, committed at T, credits late key k (reviewed on head H at time S) only
     when ALL hold:
@@ -438,8 +445,9 @@ def covered_late_keys(
     refuses. Raises ``Refused`` when git cannot be read: unknown, never
     nothing owed."""
     with rr.deadline_scope(deadline):
-        return _covered_late_keys(
-            cwd, budget, late, gate_lane=gate_lane, acceptance=acceptance, deadline=deadline
+        return _coverage_details(
+            cwd, budget, late, gate_lane=gate_lane, acceptance=acceptance, deadline=deadline,
+            repo=repo, number=number,
         )
 
 
@@ -462,7 +470,7 @@ def _before_every_fix(
     return True
 
 
-def _covered_late_keys(
+def _coverage_details(
     cwd: str,
     budget: Mapping[str, Any],
     late: Sequence[Mapping[str, Any]],
@@ -470,7 +478,9 @@ def _covered_late_keys(
     gate_lane: bool,
     acceptance: Sequence[str] | None,
     deadline: float | None,
-) -> set[str]:
+    repo: str | None,
+    number: int | None,
+) -> dict[str, rr.Disposition]:
     current = budget.get("current_head")
     in_graph, ancestors = _ancestry(budget)
     log = rr._log_reflections(cwd)
@@ -479,7 +489,8 @@ def _covered_late_keys(
     checked: dict[tuple[str, RoundContext], bool] = {}
     fix_times: dict[tuple[str, str], datetime | None] = {}
     tip_rows: dict[str, list[rr.Fix]] = {}
-    covered: set[str] = set()
+    covered: dict[str, rr.Disposition] = {}
+    citation_cache: dict[str, dict] = {}
     for sha, kind, body, made_at in log:
         if deadline is not None and time.monotonic() > deadline:
             raise rr.Refused("the late-findings check ran out of time")
@@ -563,7 +574,11 @@ def _covered_late_keys(
                     ).ok
                 passed = passed and checked[(sha, context)]
             if passed:
-                covered.add(key)
+                valid = rr.validated_dispositions(
+                    parsed, cwd=cwd, repo=repo, number=number, made_at=made_at,
+                    cache=citation_cache, keys=[key],
+                )
+                covered.update(valid)
     return covered
 
 
@@ -623,7 +638,7 @@ def _late_status(
     acceptance = (
         rr._acceptance(budget, repo, number) if is_open or _needs_acceptance(budget, late) else None
     )
-    covered = rr._open_covered(cwd, budget, state, acceptance, deadline) if is_open else set()
+    covered = rr._open_covered(cwd, budget, state, acceptance, deadline, repo, number) if is_open else set()
     late_covered = (
         covered_late_keys(
             cwd,
@@ -632,6 +647,7 @@ def _late_status(
             gate_lane=state["gate_lane"],
             acceptance=acceptance,
             deadline=deadline,
+            repo=repo, number=number,
         )
         if late
         else set()

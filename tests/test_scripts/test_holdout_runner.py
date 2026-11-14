@@ -11,9 +11,11 @@ import datetime as dt
 import importlib.util
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -1642,3 +1644,151 @@ def test_an_escaped_copy_of_a_step_line_is_not_masked_as_documented():
     steps = '"$HOLDOUT_PYTHON" -c "import calc"'
     arm = hr.Arm(False, 1, json.dumps({"f": steps}) + "\n", False)
     assert hr.MASKED_STEP_LINE not in hr.describe_failed_arm(arm, steps)
+
+
+def _locked_worktrees(root) -> int:
+    return sum(
+        1 for ln in _git(root, "worktree", "list", "--porcelain").splitlines() if ln[:6] == "locked"
+    )
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP], ids=["SIGTERM", "SIGHUP"])
+def test_a_signal_during_worktree_creation_leaves_nothing_behind(repo, tmp_path, sig):
+    """A signal that lands while `git worktree add` is still running must not
+    leave a locked registration or a partial tree. A git wrapper on PATH holds
+    the add for two seconds so the signal lands inside it every time."""
+    root, _, _ = repo
+    home = tmp_path / "home"
+    home.mkdir()
+    scratch = home / "tmp"
+    real_git = shutil.which("git")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    marker = tmp_path / "add-started"
+    wrapper = bindir / "git"
+    # For `worktree add`, run the real add, then hold the state git itself is in
+    # while it checks out: registered and locked "initializing". Unlock at the
+    # end, as git does when the checkout finishes.
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        'case " $* " in *" worktree add "*)\n'
+        "  for a; do path=$prev; prev=$a; done\n"
+        '  "' + str(real_git) + '" "$@" || exit $?\n'
+        '  "'
+        + str(real_git)
+        + '" -C "'
+        + str(root)
+        + '" worktree lock --reason initializing "$path"\n'
+        # A child that outlives git, as git's own checkout process does: it
+        # writes into the tree a moment later unless its group is killed.
+        '  (sleep 1; mkdir -p "$path" && echo late > "$path/late-file") &\n'
+        '  : > "' + str(marker) + '"; sleep 2\n'
+        '  exec "' + str(real_git) + '" -C "' + str(root) + '" worktree unlock "$path";;\n'
+        "esac\n"
+        'exec "' + str(real_git) + '" "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    holdout = tmp_path / "HOLDOUT.md"
+    holdout.write_text(_scenario("H-01", steps="sleep 60", expect="never"))
+    before = _worktrees(root)
+    env = {k: v for k, v in os.environ.items() if k != "GENESIS_BIG_TMP"}
+    env["HOME"] = str(home)
+    env["PATH"] = f"{bindir}{os.pathsep}{env.get('PATH', '')}"
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(REPO_DIR / "scripts" / "holdout_runner.py"),
+            "--at-ref",
+            "HEAD",
+            "--root",
+            str(root),
+            "--holdout",
+            str(holdout),
+        ],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert marker.exists(), "git worktree add never started"
+        assert _locked_worktrees(root) == 1  # the signal lands inside the locked window
+        proc.send_signal(sig)
+        rc = proc.wait(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert rc == 128 + sig
+    time.sleep(2)  # past the moment the outliving child would write
+    assert _worktrees(root) == before
+    assert _locked_worktrees(root) == 0
+    assert list(scratch.iterdir()) == []
+
+
+@pytest.mark.parametrize("delivery", ["process", "other thread"])
+def test_a_signal_while_git_is_being_started_is_acted_on_after(
+    repo, tmp_path, monkeypatch, _scratch, delivery
+):
+    """A SIGTERM that lands inside Popen, before the runner holds a handle to
+    git, must not leave git running: the runner holds it until the handle
+    exists, then kills git's group and discards the half-made worktree.
+
+    "other thread" sends it to a second thread, as the kernel may do with a
+    process-wide signal when the process has threads (pytest's timeout watcher
+    is one): a signal mask on the main thread does not hold it there."""
+    root, _, _ = repo
+    real_git = shutil.which("git")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    wrapper = bindir / "git"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        'case " $* " in *" worktree add "*)\n'
+        "  for a; do path=$prev; prev=$a; done\n"
+        '  "' + str(real_git) + '" "$@" || exit $?\n'
+        '  "'
+        + str(real_git)
+        + '" -C "'
+        + str(root)
+        + '" worktree lock --reason initializing "$path"\n'
+        '  (sleep 1; mkdir -p "$path" && echo late > "$path/late-file") &\n'
+        "  sleep 2\n"
+        '  exec "' + str(real_git) + '" -C "' + str(root) + '" worktree unlock "$path";;\n'
+        "esac\n"
+        'exec "' + str(real_git) + '" "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+    real_popen = subprocess.Popen
+
+    idle = threading.Event()
+    other = threading.Thread(target=idle.wait, daemon=True)
+    other.start()
+
+    def popen_then_signal(cmd, *a, **kw):
+        proc = real_popen(cmd, *a, **kw)
+        if "worktree" in cmd and "add" in cmd:  # inside Popen, as far as the caller can tell
+            if delivery == "process":
+                os.kill(os.getpid(), signal.SIGTERM)
+            else:
+                signal.pthread_kill(other.ident, signal.SIGTERM)
+                time.sleep(0.2)  # the handler runs on this thread before Popen returns
+        return proc
+
+    monkeypatch.setattr(hr.subprocess, "Popen", popen_then_signal)
+    holdout = tmp_path / "HOLDOUT.md"
+    holdout.write_text(_scenario("H-01", steps="sleep 60", expect="never"))
+    before = _worktrees(root)
+    try:
+        with pytest.raises(SystemExit) as exc:
+            hr.main(["--at-ref", "HEAD", "--root", str(root), "--holdout", str(holdout)])
+    finally:
+        idle.set()
+    assert exc.value.code == 128 + signal.SIGTERM
+    time.sleep(3.5)  # past the wrapper's late write and its unlock
+    assert _worktrees(root) == before
+    assert _locked_worktrees(root) == 0
+    assert list(_scratch.iterdir()) == []

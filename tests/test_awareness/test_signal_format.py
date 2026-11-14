@@ -1,5 +1,7 @@
 """Canonical signal formatter — one format for every reflection depth."""
 
+import pytest
+
 from genesis.awareness.signal_format import format_signal_line, format_signals
 from genesis.awareness.types import SignalReading
 
@@ -104,3 +106,204 @@ def test_metadata_not_rendered():
     line = format_signal_line(s)
     assert "forged" not in line
     assert "\n" not in line
+
+
+# ── light_signal_changes: the Light change table (#4371) ────────────────────
+
+
+def _changes(previous, *current):
+    from genesis.awareness.signal_format import light_signal_changes
+
+    return light_signal_changes(previous, list(current)).splitlines()
+
+
+def test_changes_count_unchanged_signals_and_list_movers():
+    lines = _changes(
+        {"budget_pct_consumed": 0.126, "recon_findings_pending": 0.4},
+        _sig("budget_pct_consumed", 0.158),
+        _sig("recon_findings_pending", 0.4),
+    )
+    assert lines == ["budget_pct_consumed: 0.126 → 0.158 (+0.032)", "1 other signal(s) unchanged."]
+
+
+def test_changes_tag_counters_and_alarms_and_hide_the_version_flag():
+    lines = _changes(
+        {
+            "micro_count_since_light": 0.0,
+            "sentinel_activity": 0.5,
+            "scheduled_job_health": 0.0,
+            "critical_failure": 0.5,
+            "genesis_version_changed": 0.0,
+        },
+        _sig("micro_count_since_light", 0.4),
+        _sig("sentinel_activity", 0.0),
+        _sig("scheduled_job_health", 0.75),
+        _sig("critical_failure", 1.0),
+        _sig("genesis_version_changed", 1.0),
+    )
+    assert "micro_count_since_light: 0.0 → 0.4 (counter; moves every run)" in lines
+    assert "sentinel_activity: 0.5 → 0.0 (alarm CLEARED)" in lines
+    assert "scheduled_job_health: 0.0 → 0.75 (alarm STARTED)" in lines
+    assert "critical_failure: 0.5 → 1.0 (alarm level ROSE)" in lines
+    assert not any("genesis_version_changed" in line for line in lines)
+    assert lines[-1] == "0 other signal(s) unchanged."
+
+
+def test_changes_report_a_band_change_with_the_current_thresholds():
+    bands = {"normal_max": 0.80, "warning_threshold": 0.85, "critical_threshold": 0.90}
+    crossed = _changes({"container_memory_pct": 0.79}, _sig("container_memory_pct", 0.86, **bands))
+    assert crossed[0] == "container_memory_pct: 0.79 → 0.86 (band normal → WARNING)"
+    within = _changes({"container_memory_pct": 0.45}, _sig("container_memory_pct", 0.43, **bands))
+    assert within[0] == "container_memory_pct: 0.45 → 0.43 (still normal)"
+
+
+def test_changes_list_signals_that_appeared_or_went_away():
+    lines = _changes({"gone_signal": 0.2}, _sig("new_signal", 0.1))
+    assert "new_signal: (not in the previous run) → 0.1" in lines
+    assert "gone_signal: 0.2 → (not in this run)" in lines
+    assert lines[-1] == "0 other signal(s) unchanged."
+
+
+def test_condition_changes_are_only_what_code_can_settle():
+    from genesis.awareness.signal_format import light_condition_changes
+
+    bands = {"normal_max": 0.80, "warning_threshold": 0.85, "critical_threshold": 0.90}
+    previous = {
+        "micro_count_since_light": 0.0,
+        "budget_pct_consumed": 0.1,
+        "container_memory_pct": 0.5,
+        "critical_failure": 0.5,
+        "scheduled_job_health": 0.0,
+        "sentinel_activity": 0.5,
+        "genesis_version_changed": 0.0,
+        "gone_signal": 0.2,
+    }
+    drift = [
+        _sig("micro_count_since_light", 0.4),
+        _sig("budget_pct_consumed", 0.9),
+        _sig("container_memory_pct", 0.79, **bands),
+        _sig("critical_failure", 0.3),
+        _sig("scheduled_job_health", 0.0),
+        _sig("sentinel_activity", 0.5),
+        _sig("genesis_version_changed", 1.0),
+        _sig("gone_signal", 0.2),
+    ]
+    assert light_condition_changes(previous, drift) == []
+    assert light_condition_changes({"critical_failure": 0.5}, [_sig("critical_failure", 1.0)]) == [
+        "critical_failure: 0.5 → 1.0 (alarm level ROSE)"
+    ]
+    changed = [
+        _sig("container_memory_pct", 0.86, **bands),
+        _sig("scheduled_job_health", 0.75),
+        _sig("sentinel_activity", 0.0),
+        _sig("new_signal", 0.1),
+    ]
+    assert light_condition_changes(previous, changed) == [
+        "container_memory_pct: 0.5 → 0.86 (band normal → WARNING)",
+        "new_signal: (not in the previous run) → 0.1",
+        "scheduled_job_health: 0.0 → 0.75 (alarm STARTED)",
+        "sentinel_activity: 0.5 → 0.0 (alarm CLEARED)",
+        "budget_pct_consumed: 0.1 → (not in this run)",
+        "critical_failure: 0.5 → (not in this run)",
+        "gone_signal: 0.2 → (not in this run)",
+        "micro_count_since_light: 0.0 → (not in this run)",
+    ]
+
+
+def test_a_failed_reading_is_never_compared():
+    """A failed collector returns a stub value; an alarm must not read as
+    cleared because its collector broke."""
+    import dataclasses
+
+    from genesis.awareness.signal_format import light_condition_changes
+
+    stub = dataclasses.replace(_sig("scheduled_job_health", 0.0), failed=True)
+    assert light_condition_changes({"scheduled_job_health": 0.5}, [stub]) == []
+    assert _changes({"scheduled_job_health": 0.5}, stub)[0] == (
+        "scheduled_job_health: (reading failed this run)"
+    )
+
+
+def test_every_steady_state_signal_is_classified_for_light():
+    """A new collector must be placed: an alarm (code posts its transitions), a
+    counter, hidden, or a value the model judges. Only a signal whose collector
+    sets thresholds gets a band check."""
+    from genesis.awareness import signal_format as sf
+    from genesis.awareness.types import STEADY_STATE_SIGNALS
+
+    model_judged = {
+        "budget_pct_consumed",
+        "container_memory_pct",
+        "outreach_engagement_data",
+        "recon_findings_pending",
+        "user_goal_staleness",
+        "user_session_pattern",
+    }
+    classified = sf._ALARM_SIGNALS | sf._COUNTER_SIGNALS | sf.LIGHT_HIDDEN_SIGNALS | model_judged
+    assert classified == STEADY_STATE_SIGNALS
+    assert not (sf._ALARM_SIGNALS & sf._COUNTER_SIGNALS)
+    # Every alarm is placed as fixed-level (a rise is a condition) or graded
+    # (a rise is the model's, unless it crosses the collector's threshold).
+    graded = {
+        "cc_version_changed",  # 0 or 1: it can only start or clear
+        "scheduled_job_health",
+        "software_error_spike",
+        "stale_browser_processes",
+        "stale_pending_items",
+        "task_completion_quality",
+    }
+    assert sf._LEVEL_ALARM_SIGNALS | graded == sf._ALARM_SIGNALS
+    assert not (sf._LEVEL_ALARM_SIGNALS & graded)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["stale_pending_items", "software_error_spike", "task_completion_quality",
+     "stale_browser_processes", "scheduled_job_health"],
+)
+def test_a_graded_alarm_creeping_up_is_not_a_condition(name):
+    """These collectors emit an age, a ratio or a count over a ceiling, so the
+    value can rise on every run while one condition stands. Start and clear are
+    still conditions; the rise is listed for the model."""
+    from genesis.awareness.signal_format import light_condition_changes
+
+    assert light_condition_changes({name: 0.3}, [_sig(name, 0.31)]) == []
+    assert _changes({name: 0.3}, _sig(name, 0.31))[0] == (
+        f"{name}: 0.3 → 0.31 (alarm still active; value rose)"
+    )
+    assert light_condition_changes({name: 0.0}, [_sig(name, 0.3)]) != []
+    assert light_condition_changes({name: 0.3}, [_sig(name, 0.0)]) != []
+
+
+def test_a_reading_that_failed_in_the_baseline_run_is_unknown():
+    """The stored value of a failed reading is a placeholder. Comparing it
+    would turn "was active, collector broke, now clear" into 0 → 0."""
+    from genesis.awareness.signal_format import light_condition_changes
+
+    assert light_condition_changes({"scheduled_job_health": None}, [_sig("scheduled_job_health", 0.0)]) == [
+        "scheduled_job_health: (reading failed in the previous run) → 0.0"
+    ]
+    assert light_condition_changes({"gone_signal": None}, []) == [
+        "gone_signal: (reading failed) → (not in this run)"
+    ]
+
+
+@pytest.mark.parametrize("name", ["scheduler_liveness", "autonomy_activity", "surplus_activity"])
+def test_a_fixed_level_alarm_rising_is_a_condition(name):
+    from genesis.awareness.signal_format import light_condition_changes
+
+    assert light_condition_changes({name: 0.5}, [_sig(name, 1.0)]) == [
+        f"{name}: 0.5 → 1.0 (alarm level ROSE)"
+    ]
+    assert light_condition_changes({name: 1.0}, [_sig(name, 0.5)]) == []
+
+
+def test_a_graded_alarm_crossing_its_own_threshold_is_a_condition():
+    from genesis.awareness.signal_format import light_condition_changes
+
+    limits = {"warning_threshold": 0.3, "critical_threshold": 0.5}
+    name = "stale_browser_processes"
+    assert light_condition_changes({name: 0.167}, [_sig(name, 0.667, **limits)]) == [
+        f"{name}: 0.167 → 0.667 (alarm still active; below warning → CRITICAL)"
+    ]
+    assert light_condition_changes({name: 0.5}, [_sig(name, 0.667, **limits)]) == []

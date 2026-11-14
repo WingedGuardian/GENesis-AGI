@@ -1846,8 +1846,21 @@ _DEPLOY_REPAIR_CLASSES = frozenset(
         "live_repair_refused",
         "live_repair_hooks_pending",
         "live_repair_hooks_saved",
+        "live_repair_kit",
     }
 )
+#: What each live_repair_kit finding means (deploy_health._KIT_FINDINGS).
+_DEPLOY_KIT_STATES = {
+    "missing": "is not installed (no `current` link, or a dangling one), so genesis-server "
+    "starts without its boot repair",
+    "partial": "is missing files its KIT.json lists, so the boot repair may not run",
+    "corrupt": "holds a file that differs from what was installed (or no valid KIT.json), "
+    "so the boot repair may fail or run code nobody installed",
+    "foreign": "is not the installer's (its `current` is not a link into live-repair.d), "
+    "yet the boot repair runs whatever it holds",
+    "stale": "is not the deploy checkout's HEAD (a pull no install followed, or a rollback "
+    "past it), so the boot repair runs other code than the checkout's",
+}
 #: Classes that alone are routine (a medium observation, not a blocker).
 _DEPLOY_INFORMATIONAL_CLASSES = frozenset({"behind_upstream", "live_repair_unread_older"})
 
@@ -1869,6 +1882,8 @@ def _deploy_repair_identity(repairs: dict) -> str:
     for key in ("hooks_pending", "hooks_saved"):  # only when set: a deploy must not
         if repairs.get(key):  # re-raise every standing alert
             named[key] = repairs[key]
+    if repairs.get("kit") in _DEPLOY_KIT_STATES:  # the kit finding, as above
+        named["kit"] = repairs["kit"]
     return hashlib.sha256(json.dumps(named, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
@@ -1961,6 +1976,16 @@ def _deploy_repair_paragraph(repairs: dict) -> str:
             "The last live-move repair did not finish (it was killed partway, or its "
             "REPAIR.json under ~/.genesis/deploy-backups/ names the reason); "
             "scripts/deploy_candidates repair-move runs it again."
+        )
+    kit = repairs.get("kit")
+    if kit in _DEPLOY_KIT_STATES:
+        parts.append(
+            "The live-move repair kit under ~/.genesis/lib/live-repair/ (what heals a "
+            f"half-written `live` checkout at boot, and what repair-move runs) {_DEPLOY_KIT_STATES[kit]}."
+            " To reinstall it from the deploy checkout's HEAD: python3 -I -S "
+            "<repo>/scripts/lib/live_repair_kit.py install <repo> <home> (<repo> the deploy "
+            "checkout, <home> the HOME holding ~/.genesis); bootstrap.sh and "
+            "deploy_code_only.sh run the same install."
         )
     return " ".join(parts)
 
@@ -3956,6 +3981,9 @@ async def perform_tick(
                         # Recent: 27.0/day") so downstream consumers can't misread
                         # a symmetric deviation score's direction.
                         **({"baseline_note": s.baseline_note} if s.baseline_note else {}),
+                        # Additive: a collector's stub reading on error. Without
+                        # it a later comparison reads the stub as a real value.
+                        **({"failed": True} if s.failed else {}),
                     }
                     for s in signals
                 ]
