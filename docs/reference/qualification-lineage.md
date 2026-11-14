@@ -27,7 +27,8 @@ The closed version-3 plan uses `protocol: "bounded_continuation_v1"`. It binds:
   financial census together with the writer and closure lifecycle tests.
 - A finite `expense_evidence` list. Each auxiliary GET body binds `path`,
   `sha256`, `journal_sha256`, `attempt`, `request_hash`, `generation_id`,
-  `model` and `provider`. A hash-bound raw price annotation cannot settle an
+  `model` and `provider`. Its model must match the frozen receipt namespace.
+  A hash-bound raw price annotation cannot settle an
   invalid historical receipt, reconstruct an answer or release a reservation.
 - The exact derived `reuse` map: alias → logical manifest attempt ID →
   `{journal_sha256, attempt}`. Select the first independently eligible response
@@ -60,6 +61,12 @@ may overlap reserved liabilities. Duplicate histories, generation ownership
 collisions, changed or torn inputs, contradictory prices and charges above their
 reservations refuse admission. Readers never modify, truncate or acknowledge a
 history. Private file ownership/link rules and existing writer locks apply.
+An over-allocation receipt remains reportable while its canonical reservation
+stays held. Known receipt charges and unresolved journal liabilities are distinct.
+A reported usage or receipt cost above allocation blocks execution even when
+another retained answer fills the same logical coordinate. Captured invalid
+historical receipts retain their raw-cost disclosure and do not gain settlement
+or response eligibility from it.
 
 `study-report` replays eligible retained answers through the real rubric/J9 and
 novelty contracts, using disposable storage for the latter. Logical projections

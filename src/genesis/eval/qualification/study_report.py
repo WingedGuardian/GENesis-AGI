@@ -142,8 +142,7 @@ class Study:
         usages = [item["usage"]["cost"] for item in row["observations"]
                   if isinstance(item.get("usage"), dict) and item["usage"].get("cost") is not None]
         if ((settled is not None and charge != settled)
-                or any(accounting.currency(v) != charge for v in usages)
-                or charge > accounting.currency(row["spec"]["max_charge"])):
+                or any(accounting.currency(v) != charge for v in usages)):
             raise Incomplete("study_expense_contradiction")
         self.annotations[owner] = charge
         self.receipt_identities[owner] = identity
@@ -176,7 +175,8 @@ class Study:
             history = self.histories[entry["journal_sha256"]]
             row = history._state.attempts[entry["attempt"]]
             if (entry["request_hash"] != row["spec"]["request_hash"]
-                    or entry["generation_id"] != lineage._generation(row)):
+                    or entry["generation_id"] != lineage._generation(row)
+                    or entry["model"] != pinned.model_identities(row["spec"])[2]):
                 raise Incomplete("study_expense_association_changed")
             frozen = self._stack.enter_context(lineage.Frozen(entry["path"], entry["sha256"]))
             self.auxiliary.append(frozen)
@@ -193,6 +193,12 @@ class Study:
             for alias, manifest in self.manifests.items():
                 admitted[history.hash, alias] = lineage.compatible(history._state.manifest, manifest)
             for attempt, row in history._state.attempts.items():
+                charges = [self.annotations.get((history.hash, attempt))]
+                charges.extend(accounting.currency(o["usage"]["cost"]) for o in row["observations"]
+                               if isinstance(o.get("usage"), dict) and o["usage"].get("cost") is not None)
+                if any(c is not None and c > accounting.currency(row["spec"]["max_charge"])
+                       for c in charges):
+                    self.execution_issues.append("historical_charge_exceeds_allocation")
                 by_coordinate.setdefault(coordinate(row["spec"]), []).append((history, attempt, row))
         for alias, manifest in self.manifests.items():
             self.rows[alias], self.reuse[alias], self.missing[alias] = {}, {}, []
