@@ -264,9 +264,12 @@ async function report($, failure) {
     const healthy = body.ok && body.overwritten.length === 0
     const line = JSON.stringify({ ...body, hour: healthy ? 0 : Math.floor(Date.now() / 3_600_000) })
     if (line === stateLine) return
-    const base = (await $.env.get('GENESIS_HOME')) || `${await $.env.get('HOME')}/.genesis`
+    const home = await $.env.get('HOME')
+    const base = (await $.env.get('GENESIS_HOME')) || (home ? `${home}/.genesis` : '')
+    if (!base) throw new Error('neither GENESIS_HOME nor HOME is set') // never a path relative to the session's folder
     const session = await $.session.id()
-    await $.fs.write(`${base}/state/secret-redact/${session}.json`, `${JSON.stringify({ session, at: new Date().toISOString(), ...body })}\n`)
+    // Date.now, the clock the write decision above reads, so the two never disagree.
+    await $.fs.write(`${base}/state/secret-redact/${session}.json`, `${JSON.stringify({ session, at: new Date(Date.now()).toISOString(), ...body })}\n`)
     stateLine = line
   } catch (err) {
     if (!stateWarned) {

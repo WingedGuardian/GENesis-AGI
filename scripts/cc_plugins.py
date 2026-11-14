@@ -16,11 +16,12 @@ Lever: `cc_plugins.secret_redact` in `${GENESIS_HOME:-~/.genesis}/config/genesis
 `claude plugin install` WOULD re-enable it, so `apply` installs only when the plugin is absent).
 
 Only the main checkout registers itself: a linked worktree is skipped, since its directory can be archived away
-and every session would then load nothing. A checkout that moved is re-pointed in place (`marketplace add` over
-the same name keeps the install and an owner's disable, measured). The marketplace is identified by its name,
-`genesis`: one of that name that an in-place add does not re-point (another kind of source, for example the public
-repository added as a GitHub marketplace) is replaced by remove-then-add, which uninstalls its plugin, so an
-owner's disable is written down first and applied again after.
+and every session would then load nothing. A checkout that moved is re-pointed in place: `marketplace add` over
+the same name keeps the install and an owner's disable (measured from a directory and from a GitHub source). The
+marketplace is identified by its name, `genesis`. Should an in-place add not re-point one of that name (a source
+kind not measured: a git URL, a url or an npm source), it is replaced by remove-then-add, which uninstalls its
+plugin, so an owner's disable is written down first and applied again after; a failure in that step leaves the
+note for the next run and never hides the error it follows.
 
 Exit codes: 0 consistent / applied (an invalid lever value is applied as "change nothing" and reported),
 2 cannot run (no `claude`, not the main checkout, unreadable genesis.yaml, a CLI failure),
@@ -34,6 +35,7 @@ Exit codes: 0 consistent / applied (an invalid lever value is applied as "change
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -148,8 +150,9 @@ def _replace_marketplace(name: str, plugin_id: str, path: str, now: dict) -> lis
     """Remove-then-add, for a same-named marketplace the in-place add did not re-point (another kind of source).
 
     Removing the marketplace uninstalls its plugin and forgets an owner's disable (measured), so that choice is
-    written down first and cleared only after a disable succeeds; `apply` honours a pending one before anything
-    else. A failure in between restores the previous registration where it can.
+    written down first and cleared only after a disable succeeds: here after the replace, or by a later `apply`
+    once the plugin is installed (never while the lever is off). A failure in between restores the previous
+    registration where it can.
     """
     marker = _keep_disabled_marker(name)
     if now["installed"] and not now["enabled"]:
@@ -170,34 +173,55 @@ def _replace_marketplace(name: str, plugin_id: str, path: str, now: dict) -> lis
             restored = f"; restored the previous registration at {old}"
         except (RuntimeError, subprocess.SubprocessError):
             restored = f"; {name} may now be NOT INSTALLED, so sessions may not be redacted until the next run succeeds"
-        _honour_keep_disabled(name, plugin_id)
+        if _honour_keep_disabled(name, plugin_id) == "pending":
+            restored += "; the owner's disable is still pending and the next run applies it"
         raise RuntimeError(f"{exc}{restored}") from exc
     kept = _honour_keep_disabled(name, plugin_id)
-    return [f"{name}: marketplace replaced, now at {path}" + (" (kept disabled)" if kept else "")]
+    note = {
+        "done": " (kept disabled)",
+        "pending": " (the owner's disable is pending: the next run applies it)",
+    }
+    return [f"{name}: marketplace replaced, now at {path}" + note.get(kept, "")]
 
 
-def _honour_keep_disabled(name: str, plugin_id: str) -> bool:
-    """Re-disable the plugin when the owner's disable is written down and the plugin is enabled; True if a
-    pending choice is now honoured. The marker stays until a disable succeeds."""
-    marker = _keep_disabled_marker(name)
-    if not marker.exists():
-        return False
-    now = state(name)
-    if not now["installed"]:
-        return False  # installed later by apply, which honours the marker then
+def _honour_keep_disabled(name: str, plugin_id: str) -> str:
+    """Re-disable the plugin when the owner's disable is written down: "done" when that choice now holds,
+    "pending" when it is written down and could not be applied yet (the marker stays for the next run), "" when
+    nothing is written down. Never raises: it runs after a failure, and must not replace that failure."""
     try:
+        if not _keep_disabled_marker(name).exists():
+            return ""
+        now = state(name)
+        if not now["installed"]:
+            return "pending"  # installed later by apply, which honours the marker then
         if now["enabled"]:
             _run_or_raise("disable", plugin_id, "-s", "user")
-    except (RuntimeError, subprocess.SubprocessError):
-        return False
-    marker.unlink(missing_ok=True)
-    return True
+        _keep_disabled_marker(name).unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001 -- any failure (a CLI error, unexpected CLI JSON, the state folder) leaves it pending
+        return "pending"
+    return "done"
+
+
+def _kept_lines(name: str, plugin_id: str) -> list[str]:
+    kept = _honour_keep_disabled(name, plugin_id)
+    if kept == "done":
+        return [f"{name}: disabled again (the owner's choice, kept through an earlier re-point)"]
+    if kept == "pending":
+        return [
+            f"{name}: the owner's disable from an earlier re-point is still pending; the next run applies it"
+        ]
+    return []
 
 
 def apply(root: Path, key: str, name: str) -> list[str]:
     """Make the install match the lever; returns what was done, one line each."""
     want = lever(key)
     prune_reports()
+    # The sessions' report folder (the mod's write creates it too, measured on 2.1.299, so a failure here is not one).
+    with contextlib.suppress(OSError):
+        (Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis") / STATE_DIR).mkdir(
+            parents=True, exist_ok=True
+        )
     if want.startswith("invalid:"):
         return [f"{name}: lever cc_plugins.{key}={want[8:]!r} is not on/off; nothing changed"]
     plugin_id = f"{name}@{MARKETPLACE}"
@@ -224,15 +248,11 @@ def apply(root: Path, key: str, name: str) -> list[str]:
     if not now["installed"]:
         _run_or_raise("install", plugin_id, "-s", "user")
         done.append(f"{name}: installed")
-        if _honour_keep_disabled(name, plugin_id):
-            done.append(
-                f"{name}: disabled again (the owner's choice, kept through an earlier re-point)"
-            )
+        done += _kept_lines(name, plugin_id)
         return done
-    if _honour_keep_disabled(name, plugin_id):
-        done.append(
-            f"{name}: disabled again (the owner's choice, kept through an earlier re-point)"
-        )
+    kept = _kept_lines(name, plugin_id)
+    if kept:
+        done += kept
     elif not now["enabled"]:
         done.append(f"{name}: installed but disabled (owner's choice; left as is)")
     return done or [f"{name}: up to date"]

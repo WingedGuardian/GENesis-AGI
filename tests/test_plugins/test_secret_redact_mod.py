@@ -33,7 +33,7 @@ const { execFile } = require("child_process");
   Date.now = () => now;
   const $ = {
     plugin: { root: spec.plugin },
-    env: { get: async name => ({ HOME: spec.dir })[name] },
+    env: { get: async name => (spec.env ?? { HOME: spec.dir })[name] },
     session: { id: async () => "0f0f0f0f-1111-2222-3333-444444444444" },
     ui: { log: m => logs.push(m) },
     fs: {
@@ -92,6 +92,7 @@ def _run(
     secrets: str | None = f"CANARY_API_KEY={KEY}\n",
     plugin: Path = PLUGIN,
     override: bool = True,
+    env: dict | None = None,
     **vars_,
 ) -> dict:
     node = shutil.which("node")
@@ -108,6 +109,7 @@ def _run(
         "dir": str(tmp_path),
         "vars": {"key": KEY, "key2": KEY2, **vars_},
         "script": script,
+        "env": env,
     }
     proc = subprocess.run(
         [node, "-e", _DRIVER, json.dumps(spec)], capture_output=True, text=True, timeout=120
@@ -752,9 +754,28 @@ def test_a_report_of_overwritten_keys_is_refreshed_hourly(tmp_path):
         t.advance(2 * 3600 * 1000);
         await t.emit("prompt.submit", { text: "hello" });
         const later = t.read(t.dir + "/.genesis/state/secret-redact/0f0f0f0f-1111-2222-3333-444444444444.json");
-        return { refreshed: first !== later };
+        // The report's time comes from the clock its write decision reads, so it moved by the two hours exactly.
+        return { refreshed: first !== later, moved: Date.parse(JSON.parse(later).at) - Date.parse(JSON.parse(first).at) };
         """,
         secrets=f"CANARY_API_KEY={KEY}\nOTHER_TOKEN=[secrets.env:GONE_TOKEN]\n",
     )
-    assert res["out"] == {"refreshed": True}
+    assert res["out"] == {"refreshed": True, "moved": 2 * 3600 * 1000}
     assert '"overwritten":["OTHER_TOKEN"]' in state.read_text()
+
+
+def test_no_report_is_written_when_no_home_folder_is_known(tmp_path):
+    # Neither GENESIS_HOME nor HOME: the mod must not write under a relative "undefined/.genesis" path.
+    res = _run(
+        tmp_path,
+        """
+        const writes = [];
+        const write = t.$.fs.write;
+        t.$.fs.write = async (p, text) => { writes.push(p); return write(p, text); };
+        await t.emit("session.start", {});
+        await t.emit("prompt.submit", { text: "hello" });
+        return { reports: writes.filter(p => p.includes("state/secret-redact")) };
+        """,
+        env={},
+    )
+    assert res["out"] == {"reports": []}
+    assert sum("neither GENESIS_HOME nor HOME" in m for m in res["logs"]) == 1

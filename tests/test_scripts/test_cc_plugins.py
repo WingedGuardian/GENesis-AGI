@@ -37,6 +37,9 @@ if os.environ.get("FAKE_CLAUDE_HANG_IF_ARG") and os.environ["FAKE_CLAUDE_HANG_IF
         open(once, "w").close()
         import time; time.sleep(30)
 def save(): json.dump(st, open(state_file, "w"))
+broken = os.environ.get("FAKE_CLAUDE_BREAK_LIST_AFTER")  # `list --json` prints garbage once a matching call ran
+if broken and a == ["list", "--json"] and calls and any(broken in c for c in open(calls).read().splitlines()[:-1]):
+    print("not json"); sys.exit(0)
 if a == ["marketplace", "list", "--json"]:
     # A string is a directory marketplace; a dict is listed as it is (a GitHub one has no path).
     print(json.dumps([{"name": n, "source": "directory", "path": p} if isinstance(p, str) else {"name": n, **p}
@@ -432,3 +435,51 @@ def test_a_failed_disable_during_a_replacement_is_honoured_on_the_next_apply(wor
         Path(world.home) / "state" / "cc_plugins" / "genesis-secret-redact.keep-disabled"
     ).exists()
     assert first.returncode in (0, 2)
+
+
+def _marker(world):
+    return Path(world.home) / "state" / "cc_plugins" / "genesis-secret-redact.keep-disabled"
+
+
+def test_a_failing_keep_disabled_step_never_hides_a_failed_replacement(world):
+    # The replacement's installs fail, and the keep-disabled step that follows cannot read the plugin list: the
+    # error said is still the replacement's, with its NOT INSTALLED warning, and the owner's choice stays written.
+    world.set_state(
+        {
+            "mkts": {"genesis": {"source": "github", "repo": "someone/else"}},
+            "plugins": {PLUGIN: False},
+        }
+    )
+    run = world.run(
+        "apply",
+        FAKE_CLAUDE_ADD_KEEPS_SOURCE="1",
+        FAKE_CLAUDE_FAIL="install",
+        FAKE_CLAUDE_BREAK_LIST_AFTER="marketplace remove",
+    )
+    assert run.returncode == 2 and "Traceback" not in run.stdout + run.stderr
+    assert "simulated failure" in run.stdout and "NOT INSTALLED" in run.stdout
+    assert "still pending" in run.stdout and _marker(world).exists()
+
+
+def test_a_failing_keep_disabled_step_after_a_good_replacement_is_not_a_failure(world):
+    # The replacement works; only the re-disable cannot run yet. The run succeeds, says the disable is pending,
+    # and the next run applies it.
+    world.set_state(
+        {
+            "mkts": {"genesis": {"source": "github", "repo": "someone/else"}},
+            "plugins": {PLUGIN: False},
+        }
+    )
+    first = world.run(
+        "apply", FAKE_CLAUDE_ADD_KEEPS_SOURCE="1", FAKE_CLAUDE_BREAK_LIST_AFTER="install"
+    )
+    assert first.returncode == 0 and "replaced" in first.stdout and "pending" in first.stdout
+    assert _marker(world).exists()
+    second = world.run("apply")
+    assert second.returncode == 0 and "disabled again" in second.stdout
+    assert world.state()["plugins"][PLUGIN] is False and not _marker(world).exists()
+
+
+def test_apply_creates_the_session_report_folder(world):
+    assert world.run("apply").returncode == 0
+    assert (Path(world.home) / "state" / "secret-redact").is_dir()
