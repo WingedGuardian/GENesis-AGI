@@ -6368,6 +6368,20 @@ verified: b67423bd 2026-10-03
 - **Do not:** write any card, column or status into a local table (the spec
   allows exactly these three stores), or make Genesis move a card into
   In Progress (only a human starts work).
+- **Builder guard** (`scripts/hooks/builder_guard.py`, PreToolUse on Bash;
+  spec E ticket E3e). A no-op unless `GENESIS_BUILDER_KEY` is set, which only
+  the slot door's builder launch sets. With it set it BLOCKS `gh pr merge`,
+  `gh pr review`, every API merge `gh_merge.api_merge_reason` refuses for any
+  session, review-thread replies (REST `.../comments/<id>/replies` or
+  `in_reply_to`) and the GraphQL `resolveReviewThread` /
+  `unresolveReviewThread` / `addPullRequestReviewThreadReply` mutations,
+  through `gh` or `curl` / `wget`. An unreadable command that names one of them
+  is refused. Why a block: a reply under the owner's login clears a Codex P1
+  from the merge gate, and a builder carries no dispatched marker, so the
+  merge arm would let it merge once every machine gate is green. `gh pr
+  create`, `gh pr comment`, reads and `git push` are left to the other guards.
+  A broken `hook_input` blocks every session (the shared degraded contract);
+  any other failure blocks a builder only.
 - **Measured facts the follow-on PRs depend on** (2026-10-03, private sandbox
   project):
   - on this account, issue timelines carry NO `ProjectV2ItemStatusChangedEvent`,
