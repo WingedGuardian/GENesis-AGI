@@ -14,6 +14,24 @@ from genesis.channels.base import ChannelAdapter
 logger = logging.getLogger(__name__)
 
 
+class EmailDeliveryId(str):
+    """The Message-ID a send returns, carrying the recipients the server refused.
+
+    Still a plain ``str`` to every caller of ``ChannelAdapter.send_message``.
+    ``smtplib`` returns normally when it accepts at least one recipient and
+    reports the rest in a dict; ``refused`` keeps those addresses (normalized),
+    so a caller that acts per recipient acts only on the ones the server took.
+    """
+
+    refused: frozenset[str]
+
+    def __new__(cls, message_id: str, refused: Any = None) -> EmailDeliveryId:
+        obj = super().__new__(cls, message_id)
+        keys = refused.keys() if isinstance(refused, dict) else ()
+        obj.refused = frozenset(str(k).strip().lower() for k in keys if str(k).strip())
+        return obj
+
+
 class EmailAdapter(ChannelAdapter):
     """SMTP-based email adapter for the outreach pipeline.
 
@@ -60,7 +78,9 @@ class EmailAdapter(ChannelAdapter):
         message_thread_id: int | None = None,
         **kwargs: Any,
     ) -> str:
-        """Send an email. Returns the Message-ID as delivery ID.
+        """Send an email. Returns the Message-ID as delivery ID, as an
+        ``EmailDeliveryId`` whose ``refused`` names any recipient the server
+        refused on a partly accepted send.
 
         Args:
             channel_id: Recipient email address.
@@ -82,24 +102,32 @@ class EmailAdapter(ChannelAdapter):
         msg["Message-ID"] = email.utils.make_msgid(domain=domain)
         msg.set_content(text)
 
-        def _send_sync() -> None:
+        def _send_sync() -> Any:
             # Synchronous smtplib runs in a worker thread (asyncio.to_thread) so
             # the SMTP round-trip — connect, TLS, login, send — never blocks the
             # event loop. A blocking send here froze heartbeats/health/awareness
             # while the recovery worker retried failed sends (incident 2026-06-14).
             with smtplib.SMTP_SSL(self._host, self._port, timeout=30) as smtp:
                 smtp.login(self._username, self._password)
-                smtp.send_message(msg)
+                # The refused-recipients dict: empty when all were accepted
+                # (all refused raises SMTPRecipientsRefused instead).
+                return smtp.send_message(msg)
 
         try:
-            await asyncio.to_thread(_send_sync)
+            refused = await asyncio.to_thread(_send_sync)
         except smtplib.SMTPException:
             logger.exception("Failed to send email to %s", recipient)
             raise
 
-        message_id = msg["Message-ID"]
-        logger.info("Email sent to %s (Message-ID: %s)", recipient, message_id)
-        return message_id
+        delivery_id = EmailDeliveryId(msg["Message-ID"], refused)
+        if delivery_id.refused:
+            logger.warning(
+                "Email to %s partly refused by the server: %s",
+                recipient,
+                sorted(delivery_id.refused),
+            )
+        logger.info("Email sent to %s (Message-ID: %s)", recipient, delivery_id)
+        return delivery_id
 
     async def send_typing(self, channel_id: str) -> None:
         """No-op — email has no typing indicator."""
