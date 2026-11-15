@@ -640,7 +640,13 @@ _BEFORE_ARM = re.compile(
     re.I,
 )
 _PASS_COUNT = re.compile(r"\b(\d+)\s*(?:/|of)\s*\1\b")
-_TEST_MODULE = re.compile(r"\b(test_\w+?)(?:\.py)?::")
+#: A pytest node id's module, directory included: two same-named modules in
+#: different directories are two modules (``tests/a/test_x.py`` != ``tests/b/test_x.py``).
+#: The lookbehind lets a match start only at a token boundary. Without it the
+#: repeated path segment is retried from every character of a long path-like run,
+#: which is quadratic: 48 s on 64,000 characters, against 7 ms anchored (measured
+#: 2026-11-14), and evidence reaches the MCP writer at up to 256 KiB.
+_TEST_MODULE = re.compile(r"(?<![\w./-])((?:[\w.-]+/)*test_\w+?)(?:\.py)?::")
 
 
 def completeness_prompts(doc: EvidenceDocument) -> list[str]:

@@ -151,6 +151,15 @@ def test_an_unchanged_claim_is_asked_for_its_before_arm(claim, measurement, aske
         ("tests/a/test_one.py::test_x and tests/b/test_two.py::test_y pass", True),
         ("test_one.py::test_x and test_one.py::test_z pass", False),
         ("test_one::test_x and test_two::test_y pass", True),
+        # Same basename, different directories: two modules (review finding on #4697).
+        (
+            "tests/test_inbox/test_config.py::test_a and tests/test_mail/test_config.py::test_b pass",
+            True,
+        ),
+        (
+            "tests/test_inbox/test_config.py::test_a and tests/test_inbox/test_config.py::test_b pass",
+            False,
+        ),
         ("the probe ran", False),
     ],
 )
@@ -197,3 +206,15 @@ def test_prompts_never_change_the_derived_verdict():
     )
     assert pe.completeness_prompts(prompted)
     assert _decision(plain).verdict == _decision(prompted).verdict
+
+
+def test_the_test_module_scan_stays_linear_on_a_long_path_like_run():
+    """Unanchored, the path-segment repeat is retried from every character: 48 s on
+    this input, against about 7 ms anchored (measured 2026-11-14). The bound is
+    about 700 times the anchored time, so only the quadratic form can miss it."""
+    import time
+
+    doc = _doc(claims=[{"claim": "it works", "verdict": "pass", "tier": "MEASURED", "measurement": "a/" * 32_000}])
+    start = time.perf_counter()
+    pe.completeness_prompts(doc)
+    assert time.perf_counter() - start < 5.0
