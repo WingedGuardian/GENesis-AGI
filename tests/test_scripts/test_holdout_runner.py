@@ -1728,9 +1728,13 @@ def test_a_signal_during_worktree_creation_leaves_nothing_behind(repo, tmp_path,
     assert list(scratch.iterdir()) == []
 
 
-@pytest.mark.parametrize("delivery", ["process", "other thread"])
+# DIAGNOSTIC (#4703, not for merge): repeat the [process] case so one CI run catches a
+# 1-in-10 failure; the instrumentation adds no process before git starts and none before the kill.
+@pytest.mark.parametrize(
+    ("delivery", "attempt"), [("process", i) for i in range(20)] + [("other thread", 0)]
+)
 def test_a_signal_while_git_is_being_started_is_acted_on_after(
-    repo, tmp_path, monkeypatch, _scratch, delivery
+    repo, tmp_path, monkeypatch, _scratch, delivery, attempt
 ):
     """A SIGTERM that lands inside Popen, before the runner holds a handle to
     git, must not leave git running: the runner holds it until the handle
@@ -1744,18 +1748,26 @@ def test_a_signal_while_git_is_being_started_is_acted_on_after(
     bindir = tmp_path / "bin"
     bindir.mkdir()
     wrapper = bindir / "git"
+    wlog = str(tmp_path / "wrapper.log")
+    # Timestamps from /proc/uptime with shell builtins only, so the wrapper forks
+    # nothing before the real git runs.
+    stamp = 'read up _ < /proc/uptime; echo "$up '
     wrapper.write_text(
         "#!/bin/sh\n"
         'case " $* " in *" worktree add "*)\n'
         "  for a; do path=$prev; prev=$a; done\n"
-        '  "' + str(real_git) + '" "$@" || exit $?\n'
+        "  " + stamp + 'add-start pid=$$" >> "' + wlog + '"\n'
+        '  "' + str(real_git) + '" "$@"; rc=$?\n'
+        "  " + stamp + 'add-done rc=$rc" >> "' + wlog + '"; [ $rc = 0 ] || exit $rc\n'
         '  "'
         + str(real_git)
         + '" -C "'
         + str(root)
         + '" worktree lock --reason initializing "$path"\n'
+        "  " + stamp + 'locked" >> "' + wlog + '"\n'
         '  (sleep 1; mkdir -p "$path" && echo late > "$path/late-file") &\n'
         "  sleep 2\n"
+        "  " + stamp + 'unlocking" >> "' + wlog + '"\n'
         '  exec "' + str(real_git) + '" -C "' + str(root) + '" worktree unlock "$path";;\n'
         "esac\n"
         'exec "' + str(real_git) + '" "$@"\n'
@@ -1779,6 +1791,63 @@ def test_a_signal_while_git_is_being_started_is_acted_on_after(
         return proc
 
     monkeypatch.setattr(hr.subprocess, "Popen", popen_then_signal)
+    events = []
+    admin = root / ".git" / "worktrees"
+
+    def _up():
+        with open("/proc/uptime") as f:
+            return f.read().split()[0]
+
+    def _admin():  # no subprocess: the registration as git keeps it on disk
+        try:
+            return {d.name: sorted(x.name for x in d.iterdir()) for d in admin.iterdir()} if admin.exists() else {}
+        except OSError as e:
+            return f"<{e!r}>"
+
+    def _snap(label, fn):
+        try:
+            return fn()
+        except Exception as e:  # a failed snapshot must never skip the cleanup
+            return f"<{label} failed: {e!r}>"
+
+    def _group(pgid):
+        out = subprocess.run(["ps", "-eo", "pid=,pgid=,stat=,args="], capture_output=True, text=True).stdout
+        return [ln.strip() for ln in out.splitlines() if ln.split()[1:2] == [str(pgid)]]
+
+    def _porcelain():
+        return _git(root, "worktree", "list", "--porcelain").replace("\n", " | ")
+
+    real_kill_group = hr._kill_group
+
+    def kill_group(proc):
+        events.append(f"{_up()} kill pgid={proc.pid} admin={_admin()}")
+        try:
+            real_kill_group(proc)
+        finally:
+            events.append(f"{_up()} killed group={_snap('group', lambda: _group(proc.pid))} admin={_admin()}")
+
+    monkeypatch.setattr(hr, "_kill_group", kill_group)
+    real_discard = hr._Worktree._discard
+    real_run = hr.subprocess.run
+
+    def discard(self):
+        events.append(f"{_up()} discard-before admin={_admin()}")
+
+        def run(argv, *a, **kw):
+            r = real_run(argv, *a, **kw)
+            if "remove" in argv:
+                err = r.stderr.decode(errors="replace") if isinstance(r.stderr, bytes) else r.stderr
+                events.append(f"{_up()} remove rc={r.returncode} stderr={err.strip()!r}")
+            return r
+
+        hr.subprocess.run = run
+        try:
+            real_discard(self)
+        finally:
+            hr.subprocess.run = real_run
+            events.append(f"{_up()} discard-after admin={_admin()}")
+
+    monkeypatch.setattr(hr._Worktree, "_discard", discard)
     holdout = tmp_path / "HOLDOUT.md"
     holdout.write_text(_scenario("H-01", steps="sleep 60", expect="never"))
     before = _worktrees(root)
@@ -1787,8 +1856,21 @@ def test_a_signal_while_git_is_being_started_is_acted_on_after(
             hr.main(["--at-ref", "HEAD", "--root", str(root), "--holdout", str(holdout)])
     finally:
         idle.set()
+    raised_in = [(e.frame.code.name, e.lineno) for e in exc.traceback]
     assert exc.value.code == 128 + signal.SIGTERM
     time.sleep(3.5)  # past the wrapper's late write and its unlock
-    assert _worktrees(root) == before
-    assert _locked_worktrees(root) == 0
-    assert list(_scratch.iterdir()) == []
+
+    def diag():
+        try:
+            timeline = Path(wlog).read_text()
+        except OSError:
+            timeline = "(no wrapper log)"
+        return (
+            f"\n#4703 diagnostics: raised in {raised_in}\nevents (uptime s):\n  " + "\n  ".join(events)
+            + f"\nwrapper timeline (uptime s):\n{timeline}\nnow: {_up()} admin={_admin()}"
+            + f" porcelain={_snap('porcelain', _porcelain)}"
+        )
+
+    assert _worktrees(root) == before, diag()
+    assert _locked_worktrees(root) == 0, diag()
+    assert list(_scratch.iterdir()) == [], diag()
