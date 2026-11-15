@@ -17,7 +17,7 @@ Usage:
     delivery_marker.py compose --pr N --head SHA --verdict V --scope S --checker K
                                --body-file PROSE [--intended I] [--change C]
                                [--coderabbit R] [--outcome O] [--basis B]
-                               [--repo OWNER/REPO] [--out FILE]
+                               [--repo OWNER/REPO] [--out FILE] [--second-reader]
     delivery_marker.py read --pr N [--repo OWNER/REPO]
 
 ``compose`` validates the fields, derives the basis from the PR body's first pointer
@@ -42,6 +42,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -340,9 +341,11 @@ def render(fields: dict[str, str], prose: str) -> str:
 # ── GitHub reads (the one seam tests replace) ────────────────────────────────
 
 
-def _gh(args: list[str]) -> str:
+def _gh(args: list[str], *, timeout: float | None = None) -> str:
     try:
-        r = subprocess.run(["gh", *args], capture_output=True, text=True)
+        r = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise Refused(f"gh {' '.join(args[:2])} timed out after {timeout} s") from exc
     except OSError as exc:
         raise Refused(f"cannot run gh: {exc}") from exc
     if r.returncode != 0:
@@ -368,10 +371,13 @@ def _repo(repo: str | None) -> str:
     return repo
 
 
-def _pr(repo: str, pr: int) -> dict:
+def _pr(repo: str, pr: int, *, timeout: float | None = None) -> dict:
     try:
         meta = json.loads(
-            _gh(["api", f"repos/{repo}/pulls/{pr}", "--jq", "{head: .head.sha, body: .body}"])
+            _gh(
+                ["api", f"repos/{repo}/pulls/{pr}", "--jq", "{head: .head.sha, body: .body}"],
+                timeout=timeout,
+            )
         )
     except ValueError as exc:
         raise Refused("unreadable PR metadata from gh") from exc
@@ -408,6 +414,149 @@ def _is_owner(row: dict, owner: str) -> bool:
 
 def _basis(repo: str, pr: int, meta: dict) -> str:
     return basis_from_body(meta.get("body"), linked=lambda: linked_issues(repo, pr), repo=repo)
+
+
+# ── the shadow second reader (spec 4.5) ──────────────────────────────────────
+#
+# An install may name a command in genesis.yaml, `delivery.second_reader_cmd`, that
+# scores one question about the PR. The script names no vendor and runs nothing when
+# the key is absent. The score goes to a local log only: it is not printed, not put in
+# the marker and not read by the gate, because it is in shadow until measured.
+
+#: The question form, by the id the measurement used. F1 put the issue's fix in the
+#: question and the diff in the state; it was the form that passed.
+SECOND_READER_FORM = "F1"
+_F1 = "The linked issue requires this fix: \u00ab{fix}\u00bb. Does this change implement that fix?"
+#: The prose's Asked line: the issue sentence the verdict turns on, quoted.
+_ASKED_RE = re.compile(r'^[ \t]*Asked:[ \t]*"(.+)"[ \t]*$', re.MULTILINE)
+#: Largest diff sent, in characters. Diffs up to 96,476 characters were measured
+#: without errors; past this the score is not worth the payload.
+_DIFF_CAP = 200_000
+#: The command's whole run. It has no other watchdog, and compose waits on it; the
+#: measured median call was 88 ms, and the measured client aborted each call at 30 s.
+_READER_TIMEOUT_S = 120
+#: Each gh read the reader makes (visibility, diff, head). Shadow work must not hold
+#: compose on a hung gh; the session's own reads above it carry no such bound.
+_GH_TIMEOUT_S = 60
+
+
+def _genesis_home() -> Path:
+    # Expanded like the runtime's own genesis_home(): a GENESIS_HOME of ~/x is a home path.
+    # A ~user that does not exist stays the literal path it was before, never a crash.
+    home = Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis")
+    try:
+        return home.expanduser()
+    except RuntimeError:
+        return home
+
+
+def second_reader_cmd() -> list[str] | None:
+    """The argv named by ``delivery.second_reader_cmd`` in genesis.yaml, or None."""
+    path = _genesis_home() / "config" / "genesis.yaml"
+    try:
+        import yaml  # noqa: PLC0415  (lazy: only an install that sets the key needs it)
+    except ImportError:
+        return None
+    try:
+        conf = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return None
+    delivery = conf.get("delivery") if isinstance(conf, dict) else None
+    value = delivery.get("second_reader_cmd") if isinstance(delivery, dict) else None
+    try:
+        if isinstance(value, str) and value.strip():
+            argv = shlex.split(value)
+        elif isinstance(value, list) and value and all(isinstance(v, str) for v in value):
+            argv = list(value)
+        else:
+            return None
+        # No shell runs it, so expand a leading ~ in any argument (a script path, say).
+        return [str(Path(v).expanduser()) if v.startswith("~") else v for v in argv] or None
+    except (ValueError, RuntimeError):  # an unbalanced quote; ~nosuchuser
+        return None
+
+
+def second_reader(*, repo: str, pr: int, head: str, basis: str, verdict: str, prose: str) -> str:
+    """Run the second reader once and append its result to the shadow log.
+
+    Returns a line for the session that never carries the score. Only public text is
+    sent: the read must be against an issue (a ledger row, follow-up, spec or plan is
+    private), and the fix text is the prose's quoted Asked line, which the private-data
+    floor has already checked. Every failure is logged and reported; none stops compose.
+    """
+    cmd = second_reader_cmd()
+    if cmd is None:
+        return "second reader: none configured (delivery.second_reader_cmd)"
+    if not basis.startswith("issue:"):
+        return "second reader: skipped, the basis is not a public issue"
+    asked = _ASKED_RE.search(prose)
+    if not asked:
+        return 'second reader: skipped, the prose has no Asked: "<issue sentence>" line'
+    record = {
+        "ts": time.time(),
+        "pr": pr,
+        "head": head,
+        "basis": basis,
+        "verdict": verdict,
+        "form": SECOND_READER_FORM,
+        "p": None,
+        "model": None,
+        "error": None,
+    }
+    try:
+        # A private repo's diff is private source, whatever the basis says.
+        if (
+            _gh(["api", f"repos/{repo}", "--jq", ".private"], timeout=_GH_TIMEOUT_S).strip()
+            != "false"
+        ):
+            return "second reader: skipped, the repository is not public"
+        diff = _gh(["pr", "diff", str(pr), "--repo", repo], timeout=_GH_TIMEOUT_S)
+        if len(diff) > _DIFF_CAP:
+            raise Refused(f"diff of {len(diff)} characters is over {_DIFF_CAP}")
+        # The score must describe the head the marker names.
+        if _pr(repo, pr, timeout=_GH_TIMEOUT_S)["head"] != head:
+            raise Refused("the PR's head moved while the diff was read")
+        payload = {
+            "form": SECOND_READER_FORM,
+            "question": _F1.format(fix=asked.group(1)),
+            "fix": asked.group(1),
+            "diff": diff,
+        }
+        r = subprocess.run(
+            cmd,
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=_READER_TIMEOUT_S,
+        )
+        # Errors from here on are fixed strings: the command's own output may carry the
+        # score, which the session must not see.
+        lines = r.stdout.strip().splitlines()
+        if r.returncode != 0 or not lines:
+            raise Refused(f"the command exited {r.returncode} with no result line")
+        out = json.loads(lines[-1])
+        p = out.get("p") if isinstance(out, dict) else None
+        if isinstance(p, bool) or not isinstance(p, (int, float)) or not 0 <= p <= 1:
+            raise Refused("the command's result line has no probability in 0..1")
+        record["p"], record["model"] = float(p), _safe(out.get("model") or "")[:80] or None
+    except Refused as exc:
+        record["error"] = _safe(str(exc))[:300]
+    except ValueError:
+        record["error"] = "the command's result line is not JSON"
+    except subprocess.TimeoutExpired:
+        record["error"] = f"the command ran past {_READER_TIMEOUT_S} s"
+    except Exception as exc:  # the shadow reader never stops compose, whatever fails
+        record["error"] = f"{type(exc).__name__} while running the command"
+    log = _genesis_home() / "delivery" / "shadow.jsonl"
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except OSError as exc:
+        return f"second reader: could not write {log}: {exc}"
+    if record["error"]:
+        return f"second reader: failed ({record['error']}), logged to {log}"
+    return f"second reader: recorded in {log} (shadow; not shown here)"
 
 
 def compose(a: argparse.Namespace) -> int:
@@ -493,7 +642,7 @@ def compose(a: argparse.Namespace) -> int:
         for c in _comments(repo, a.pr)
         if _is_owner(c, owner) and LEAD_RE.match(c.get("body") or "")
     ]
-    home = Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis")
+    home = _genesis_home()
     out = (Path(a.out) if a.out else home / "delivery" / f"pr-{a.pr}-{head[:12]}.md").resolve()
     try:
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -516,6 +665,14 @@ def compose(a: argparse.Namespace) -> int:
         cmd = ["gh", "pr", "comment", str(a.pr), "--repo", repo, "--body-file", str(out)]
         print(f"Wrote {out}. Post it with:")
     print(shlex.join(cmd))
+    if a.second_reader:
+        try:
+            note = second_reader(
+                repo=repo, pr=a.pr, head=head, basis=basis, verdict=a.verdict, prose=prose
+            )
+        except Exception as exc:  # the marker is written and its command printed already
+            note = f"second reader: failed ({type(exc).__name__}); nothing logged"
+        print(note, file=sys.stderr)
     return 0
 
 
@@ -582,6 +739,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     c.add_argument("--out", help="where to write the comment (default $GENESIS_HOME/delivery/)")
     c.add_argument("--repo")
+    c.add_argument(
+        "--second-reader",
+        action="store_true",
+        help="also run the install's delivery.second_reader_cmd (shadow; logged, not shown)",
+    )
     r = sub.add_parser("read", help="list the PR's marker blocks as a reader treats them")
     r.add_argument("--pr", type=int, required=True)
     r.add_argument("--repo")
