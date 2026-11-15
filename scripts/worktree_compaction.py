@@ -49,6 +49,7 @@ from pathlib import Path
 
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_TOKEN = re.compile(r"[0-9a-f]{32}\Z")
 # Dropped on top of lifecycle's `_git_env`, as `worktree_redundancy.GIT_LOCATION_VARS`
 # does: each makes git read another index, object store or namespace.
 _EXTRA_GIT_VARS = (
@@ -134,6 +135,98 @@ def _admin_has_refs(admin: Path) -> bool:
         return True
 
 
+def _anchor_token(lc, admin: Path) -> str | None:
+    """The token compaction left in this admin directory, or None. A recreated
+    registration has a new admin directory without it, and a reattach recovery
+    removes it (`worktree_lifecycle._reattach`)."""
+    path = admin / lc.COMPACTION_MARK_FILE
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        token = path.read_text().strip()
+    except OSError:
+        return None
+    return token if _TOKEN.match(token) else None
+
+
+def _mark_anchor(lc, admin: Path) -> str | None:
+    """Give the recorded anchor an identity a recreated registration cannot
+    share. Overwrites a token left by an attempt that died before its stub."""
+    token = os.urandom(16).hex()
+    path = admin / lc.COMPACTION_MARK_FILE
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(token)
+            f.flush()
+            os.fsync(f.fileno())
+        lc._fsync_path(admin)
+    except OSError:
+        return None
+    return token
+
+
+def _owns_anchor(lc, stub: dict, admin: Path) -> bool:
+    """The stub recorded a token and this admin directory still carries it."""
+    token = stub.get("anchor_token")
+    return (
+        isinstance(token, str) and bool(_TOKEN.match(token)) and (_anchor_token(lc, admin) == token)
+    )
+
+
+def _loses_history(
+    lc, red, repo_root: Path, admin: Path, head: str, *, check_head: bool = True
+) -> str | None:
+    """Why removing this registration would lose something ``head`` does not
+    hold, or None. Read from the registration itself at the moment of removal,
+    so it holds whatever recovery or anyone else did to it since the stub was
+    written.
+
+    ``check_head=False`` is for a LOCKED anchor that carries this stub's mark:
+    its HEAD need not equal the head (the branch it names may since have moved
+    or been deleted, and the pin already holds the head), but a HEAD that
+    still resolves must be reachable from a branch, remote, tag or the head,
+    like its reflog commits, so a commit written straight into a detached
+    HEAD with no reflog entry still holds it. The index and its own refs are
+    checked against the head itself."""
+    extra: set[str] = set()
+    if check_head:
+        rc, out = _git_rc(lc, repo_root, ["--git-dir", str(admin), "rev-parse", "HEAD"])
+        if rc != 0 or out.strip() != head:
+            return "its registration's HEAD is not the recorded head"
+    else:
+        rc, out = _git_rc(
+            lc, repo_root, ["--git-dir", str(admin), "rev-parse", "--verify", "-q", "HEAD^{commit}"]
+        )
+        if rc == 0 and out.strip() and out.strip() != head:
+            extra.add(out.strip())
+    rc, _ = _git_rc(
+        lc, repo_root, ["--git-dir", str(admin), "diff-index", "--cached", "--quiet", head]
+    )
+    if rc != 0:
+        return "its registration's index differs from the head (staged state)"
+    if _admin_has_refs(admin):
+        return "its registration holds per-worktree refs"
+    try:
+        logged = red._reflog_commits([admin])
+    except OSError as e:
+        return f"its reflog is unreadable ({type(e).__name__})"
+    logged = set(logged) | extra
+    if logged:
+        # `--not` does not reach `--stdin` revisions, which stay positive.
+        rc, out = _git_rc(
+            lc,
+            repo_root,
+            ["rev-list", "--stdin", "--not", "--branches", "--remotes", "--tags", head],
+            stdin="\n".join(sorted(logged)) + "\n",
+        )
+        if rc != 0:
+            return "its reflog commits could not be checked"
+        if out.split():
+            return f"its HEAD or reflog holds commit(s) nothing else reaches: {out.split()[0][:12]}"
+    return None
+
+
 def _raise(err: OSError) -> None:
     raise err
 
@@ -188,32 +281,9 @@ def _keep_reason(
     if not lc._path_absent(anchor["path"]):
         return f"its registration's directory exists ({anchor['path']})"
     admin = anchor["admin"]
-    rc, out = _git_rc(lc, repo_root, ["--git-dir", str(admin), "rev-parse", "HEAD"])
-    if rc != 0 or out.strip() != head:
-        return "its registration's HEAD is not the recorded head"
-    rc, _ = _git_rc(
-        lc, repo_root, ["--git-dir", str(admin), "diff-index", "--cached", "--quiet", "HEAD"]
-    )
-    if rc != 0:
-        return "its registration's index differs from HEAD (staged state)"
-    if _admin_has_refs(admin):
-        return "its registration holds per-worktree refs"
-    try:
-        logged = red._reflog_commits([admin])
-    except OSError as e:
-        return f"its reflog is unreadable ({type(e).__name__})"
-    if logged:
-        # `--not` does not reach `--stdin` revisions, which stay positive.
-        rc, out = _git_rc(
-            lc,
-            repo_root,
-            ["rev-list", "--stdin", "--not", "--branches", "--remotes", "--tags", head],
-            stdin="\n".join(sorted(logged)) + "\n",
-        )
-        if rc != 0:
-            return "its reflog commits could not be checked"
-        if out.split():
-            return f"its reflog holds commit(s) nothing else reaches: {out.split()[0][:12]}"
+    lost = _loses_history(lc, red, repo_root, admin, head)
+    if lost is not None:
+        return lost
     ref = pin_ref(entry)
     rc, _ = _git_rc(lc, repo_root, ["check-ref-format", ref])
     if rc != 0:
@@ -347,6 +417,10 @@ def valid_stub(lc, stub: dict, entry: str) -> bool:
                 and bool(_SHA256.match(stub["bundle_sha256"]))
             )
         )
+        and (
+            "anchor_token" not in stub
+            or (isinstance(stub["anchor_token"], str) and bool(_TOKEN.match(stub["anchor_token"])))
+        )
         and isinstance(admin, str)
         and admin not in ("", ".", "..")
         and os.path.basename(admin) == admin
@@ -447,7 +521,7 @@ def _audit(lc, repo_root: Path, counts: dict, *, dry_run: bool) -> None:
             lc._log(f"ERROR {entry}: {outcome[len('error: ') :]}")
 
 
-def _finish(lc, repo_root: Path, stub: dict, anchors: list[dict] | None) -> str:
+def _finish(lc, red, repo_root: Path, stub: dict, anchors: list[dict] | None) -> str:
     """Steps 3-4 from a written stub: ``"done"``, ``"nothing"`` or ``"held: why"``.
 
     Acts only on the tarball and the anchor the stub recorded, so an entry that
@@ -472,12 +546,20 @@ def _finish(lc, repo_root: Path, stub: dict, anchors: list[dict] | None) -> str:
             return f"held: an anchor it did not record ({anchor['admin'].name}) names it"
         if anchor["reason"] != lc._archive_lock_reason(entry):
             return "held: its anchor was re-locked by a recovery that did not complete"
+        if not _owns_anchor(lc, stub, anchor["admin"]):
+            return "held: its anchor is not the registration it recorded"
+        lost = _loses_history(lc, red, repo_root, anchor["admin"], stub["head"], check_head=False)
+        if lost is not None:
+            return f"held: {lost}"
     did = False
     for anchor in mine:
         if not (lc._unlock_anchor(anchor) and lc._prune_anchor(anchor)):
             return "held: its anchor could not be removed"
         did = True
-    did = _prune_leftover_registration(lc, repo_root, stub) or did
+    leftover = _prune_leftover_registration(lc, red, repo_root, stub)
+    if leftover.startswith("held: "):
+        return leftover
+    did = leftover == "pruned" or did
     if os.path.lexists(tarball):
         if not lc._delete_stored(tarball, sidecar):
             return "held: the tarball could not be deleted"
@@ -489,37 +571,69 @@ def _finish(lc, repo_root: Path, stub: dict, anchors: list[dict] | None) -> str:
             return f"held: its old sidecar could not be removed ({e})"
         lc._fsync_path(lc.TRASH_DIR)
         did = True
-    if did:
-        lc._append_record(
+    # The journal is the only record that compaction finished, and a stub with
+    # nothing left on disk is never visited for any other reason: write the
+    # record whenever it is missing, and hold (so the next run retries) when
+    # that write fails.
+    if did or entry not in (_recorded_compacted(lc) or set()):
+        if not lc._append_record(
             {
                 "event": "compacted",
                 "name": entry,
                 "pin": stub["pin"],
                 "at": datetime.now(UTC).isoformat(),
             }
-        )
+        ):
+            return "held: its completion record could not be written"
+        did = True
     return "done" if did else "nothing"
 
 
-def _prune_leftover_registration(lc, repo_root: Path, stub: dict) -> bool:
+def _recorded_compacted(lc) -> set[str] | None:
+    """Entries the journal records as ``compacted``, or None when it is unreadable."""
+    try:
+        _, rows = lc._read_index()
+    except (OSError, ValueError):
+        return None
+    return {
+        r["name"] for r in rows if r.get("event") == "compacted" and isinstance(r.get("name"), str)
+    }
+
+
+def _prune_leftover_registration(lc, red, repo_root: Path, stub: dict) -> str:
     """A run that died between unlocking the recorded anchor and pruning it
     leaves an unlocked, directory-less registration that no longer reads as an
-    anchor. Prune it, by the same identity checks `_prune_anchor` applies."""
+    anchor. Prune it, by the same identity checks `_prune_anchor` applies:
+    ``"pruned"``, ``"none"`` (nothing of ours there) or ``"held: why"``."""
     admin_root = lc._admin_worktrees_dir(repo_root)
     name = stub.get("anchor_admin")
     if admin_root is None or not isinstance(name, str) or not name or "/" in name:
-        return False
+        return "none"
     admin = admin_root / name
     if admin.is_symlink() or not admin.is_dir() or (admin / "locked").exists():
-        return False
+        return "none"
     path = stub["original_path"]
     if lc._registration_path(admin) != path or not lc._path_absent(path):
-        return False
-    return lc._prune_anchor({"admin": admin, "path": path})
+        return "none"
+    if "anchor_token" not in stub:
+        return "held: its stub records no anchor token, so a registration under its name is never removed"
+    if not _owns_anchor(lc, stub, admin):
+        # Same name and path, new admin directory: a recovery recreated it.
+        return "none"
+    lost = _loses_history(lc, red, repo_root, admin, stub["head"])
+    if lost is not None:
+        # A recovery reattached it and it moved on; it is the user's now.
+        return f"held: {lost}"
+    return (
+        "pruned"
+        if lc._prune_anchor({"admin": admin, "path": path})
+        else "held: its leftover registration could not be removed"
+    )
 
 
-def _resume(lc, repo_root: Path, counts: dict) -> None:
-    """Finish every stub whose tarball, sidecar or anchor is still there."""
+def _resume(lc, red, repo_root: Path, counts: dict) -> None:
+    """Finish every stub whose tarball, sidecar or anchor is still there, or
+    whose completion record is missing from the journal."""
     try:
         names = {p.name for p in lc.TRASH_DIR.iterdir()}
     except OSError as e:
@@ -534,6 +648,7 @@ def _resume(lc, repo_root: Path, counts: dict) -> None:
     anchors = lc._archive_anchors(repo_root)
     admin_root = lc._admin_worktrees_dir(repo_root)
     owned = {a["entry"] for a in anchors or []}
+    recorded = _recorded_compacted(lc)
     for entry in pending:
         stub = lc._read_meta(stub_path(lc, entry))
         if not valid_stub(lc, stub, entry):
@@ -543,6 +658,10 @@ def _resume(lc, repo_root: Path, counts: dict) -> None:
             and isinstance(stub.get("anchor_admin"), str)
             and (admin_root / stub["anchor_admin"]).is_dir()
             and lc._registration_path(admin_root / stub["anchor_admin"]) == stub["original_path"]
+            and (
+                "anchor_token" not in stub
+                or _owns_anchor(lc, stub, admin_root / stub["anchor_admin"])
+            )
         )
         leftovers = (
             entry + lc.ARCHIVE_SUFFIX in names
@@ -550,6 +669,8 @@ def _resume(lc, repo_root: Path, counts: dict) -> None:
             or entry in owned
             or leftover_admin
             or anchors is None
+            or recorded is None
+            or entry not in recorded
         )
         if not leftovers:
             continue
@@ -558,7 +679,7 @@ def _resume(lc, repo_root: Path, counts: dict) -> None:
                 counts["skipped"] += 1
                 lc._log(f"SKIP resuming {entry}: another lifecycle operation holds the lock")
                 continue
-            outcome = _finish(lc, repo_root, stub, lc._archive_anchors(repo_root))
+            outcome = _finish(lc, red, repo_root, stub, lc._archive_anchors(repo_root))
         if outcome == "done":
             counts["resumed"] += 1
             lc._log(f"RESUMED compaction of {entry}")
@@ -588,7 +709,7 @@ def compact_trash(
         return counts
     _audit(lc, repo_root, counts, dry_run=dry_run)
     if not dry_run:
-        _resume(lc, repo_root, counts)
+        _resume(lc, red, repo_root, counts)
     anchors = lc._archive_anchors(repo_root)
     if anchors is None:
         counts["errors"] += 1
@@ -689,6 +810,10 @@ def _compact_one(
         }
     ):
         return "the journal could not be written"
+    token = _mark_anchor(lc, mine[0]["admin"])
+    if token is None:
+        lc._log(f"KEEP {entry}: its anchor could not be marked; its pin is harmless")
+        return "its anchor could not be marked"
     # 2. Stub, durable before anything is removed.
     stub = {
         **meta,
@@ -701,6 +826,7 @@ def _compact_one(
         "archive_bytes": identity["size"],
         "archive_identity": identity,
         "anchor_admin": mine[0]["admin"].name,
+        "anchor_token": token,
     }
     path = stub_path(lc, entry)
     try:
@@ -711,7 +837,7 @@ def _compact_one(
         lc._log(f"KEEP {entry}: the stub could not be written ({e}); its pin is harmless")
         return f"the stub could not be written ({e})"
     # 3-4. Anchor, then tarball and sidecar.
-    outcome = _finish(lc, repo_root, stub, lc._archive_anchors(repo_root))
+    outcome = _finish(lc, red, repo_root, stub, lc._archive_anchors(repo_root))
     if outcome != "done":
         lc._log(f"HOLD {entry}: {outcome[len('held: ') :]}; the next run finishes it")
         return outcome

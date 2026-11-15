@@ -1300,6 +1300,10 @@ def _sidecar_meta_path(trash_path: Path) -> Path:
 COMPACTED_SUFFIX = ".compacted.json"
 COMPACTED_BUNDLE_SUFFIX = ".compacted.bundle"
 COMPACTED_FORMAT = "compacted-v1"
+# Compaction's claim on the anchor it is removing, kept in that registration's
+# admin directory. A recovery that puts the tree back under the registration
+# makes it live again, so `_reattach` removes the claim.
+COMPACTION_MARK_FILE = "genesis-compaction-mark"
 
 
 def _compacted_path(trash_path: Path) -> Path:
@@ -2780,7 +2784,7 @@ def _recover_compacted(
             return False
         print(f"The pin {pin} of {entry} was missing; {outcome} it.", file=sys.stderr)
     compaction_fields = ("format", "pin", "head", "compacted_at", "archive_bytes",
-                         "archive_identity", "anchor_admin", "bundle", "bundle_base",
+                         "archive_identity", "anchor_admin", "anchor_token", "bundle", "bundle_base",
                          "bundle_sha256", "bundle_bytes")
     restore = {k: v for k, v in meta.items() if k not in compaction_fields}
     restore.update(commit=head, detached=True, branch="")
@@ -3671,7 +3675,21 @@ def _reattach(
     # an unlocked registration has nothing to release. The answer is checked: a
     # worktree left locked under the reaper's reason reads as an archive anchor to
     # expiry and to the zero-drop sweep, which is not what a recovered tree is.
-    unlock_failed = owned and _run_git(
+    #
+    # Compaction's mark goes FIRST, while the registration is still locked: a
+    # live, unlocked registration that still carried the mark could be taken for
+    # the anchor a stopped compaction was removing. If the mark cannot be
+    # removed, the lock stays, so the registration keeps reading as an archive
+    # anchor rather than as a live tree compaction might claim.
+    mark_failed = None
+    try:
+        (admin / COMPACTION_MARK_FILE).unlink()
+        _fsync_path(admin)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        mark_failed = e
+    unlock_failed = owned and mark_failed is None and _run_git(
         repo_root, ["worktree", "unlock", original_path], timeout=10) is None
 
     # The reaper's metadata goes; the worktree's own files stay.
@@ -3691,6 +3709,12 @@ def _reattach(
 
     report["mode"] = "reattached"
     print(f"Reattached {original_path} to its preserved registration.")
+    if mark_failed is not None:
+        report["incomplete"] = True
+        print(f"Could not remove compaction's mark from the registration of "
+              f"{original_path} ({mark_failed}), so it was left LOCKED. Remove "
+              f"{admin / COMPACTION_MARK_FILE} and then run: git worktree unlock "
+              f"{_shell_word(original_path)}", file=sys.stderr)
     if leftovers:
         # The tree is not as archived while the reaper's own files remain in it.
         report["incomplete"] = True

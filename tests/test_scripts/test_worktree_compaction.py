@@ -651,6 +651,206 @@ def test_journal_records_compacting_then_compacted_and_never_deleted(repo, tmp_p
     assert a["entry"] not in wl._deleted_names()
 
 
+def test_a_failed_completion_record_is_retried_once(repo, tmp_path, monkeypatch):
+    """The journal is the only record that a compaction finished, and a stub with
+    nothing left on disk is visited for no other reason: a failed `compacted`
+    append holds the run and the next run writes it, exactly once."""
+    a = _archive(repo, tmp_path, "unrecorded")
+    real = wl._append_record
+
+    def no_completion(record):
+        return False if record.get("event") == "compacted" else real(record)
+
+    monkeypatch.setattr(wl, "_append_record", no_completion)
+    first = _compact(repo)
+    assert first["compacted"] == 0 and first["held"] == 1, first
+    assert not a["archive"].exists(), "the physical steps still ran"
+
+    def events():
+        rows = [json.loads(x) for x in wl.TOMBSTONE_INDEX.read_text().splitlines()]
+        return [r["event"] for r in rows if r.get("event") and r.get("name") == a["entry"]]
+
+    assert events() == ["compacting"]
+    monkeypatch.setattr(wl, "_append_record", real)
+    assert _compact(repo)["resumed"] == 1
+    assert events() == ["compacting", "compacted"]
+    again = _compact(repo)
+    assert again["resumed"] == 0 and again["held"] == 0, again
+    assert events() == ["compacting", "compacted"], "the retry must not duplicate"
+
+
+def test_a_recovered_registration_is_never_taken_for_a_leftover(repo, tmp_path):
+    """Recovery recreates the registration under the anchor's old admin name and
+    path. Moved aside with new detached work, it must survive the next run: the
+    stub's pin does not hold that work, the registration's HEAD does."""
+    a = _archive(repo, tmp_path, "revived")
+    assert _compact(repo)["compacted"] == 1
+    assert wl._recover(a["entry"], repo, {}) is True
+    (a["path"] / "later.txt").write_text("made after recovery\n")
+    _git(a["path"], "add", "-A")
+    _git(a["path"], "commit", "-qm", "after recovery")
+    later = _git(a["path"], "rev-parse", "HEAD").stdout.strip()
+    a["path"].rename(tmp_path / "revived.moved")
+
+    counts = _compact(repo)
+
+    assert counts["resumed"] == 0 and counts["held"] == 0, counts
+    assert str(a["path"]) in _registered(repo), "the recovered registration was pruned"
+    _git(repo, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all")
+    _git(repo, "gc", "--prune=now", "-q")
+    assert _commit_exists(repo, later)
+
+
+def _held_then_reattached(repo, tmp_path, monkeypatch, name):
+    """A compaction that stops before its anchor is removed, then a recovery,
+    which REATTACHES the tree under that same registration (admin directory and
+    all), then new detached work, then the checkout moved aside."""
+    a = _archive(repo, tmp_path, name)
+    real = wl._unlock_anchor
+    monkeypatch.setattr(wl, "_unlock_anchor", lambda anchor: False)
+    assert _compact(repo)["held"] == 1
+    monkeypatch.setattr(wl, "_unlock_anchor", real)
+    admin = _admin(repo, a["entry"])
+    assert (admin / wl.COMPACTION_MARK_FILE).is_file(), "control: the anchor carries the mark"
+    report: dict = {}
+    assert wl._recover(a["entry"], repo, report) is True
+    assert report.get("mode") == "reattached", report
+    (a["path"] / "later.txt").write_text("made after recovery\n")
+    _git(a["path"], "add", "-A")
+    _git(a["path"], "commit", "-qm", "after recovery")
+    later = _git(a["path"], "rev-parse", "HEAD").stdout.strip()
+    return a, admin, later
+
+
+def _survives(repo, a, later) -> None:
+    a["path"].rename(a["path"].with_name(a["path"].name + ".moved"))
+    _compact(repo)
+    assert str(a["path"]) in _registered(repo), "the reattached registration was pruned"
+    _git(repo, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all")
+    _git(repo, "gc", "--prune=now", "-q")
+    assert _commit_exists(repo, later), "the work made after recovery was collected"
+
+
+def test_a_reattached_registration_is_never_taken_for_a_leftover(repo, tmp_path, monkeypatch):
+    a, admin, later = _held_then_reattached(repo, tmp_path, monkeypatch, "reattached")
+    assert not (admin / wl.COMPACTION_MARK_FILE).exists(), "reattach must retire the mark"
+    _survives(repo, a, later)
+
+
+def test_a_moved_registration_is_never_pruned_even_if_it_carries_the_mark(
+    repo, tmp_path, monkeypatch
+):
+    """The mark is a claim, not proof: pruning also requires that the
+    registration holds nothing beyond the pinned head, read at the moment of
+    removal. Here the mark is put back by hand after the reattach."""
+    a, admin, later = _held_then_reattached(repo, tmp_path, monkeypatch, "remarked")
+    stub = json.loads(_stub(a["entry"]).read_text())
+    (admin / wl.COMPACTION_MARK_FILE).write_text(stub["anchor_token"])
+    _survives(repo, a, later)
+
+
+def test_a_stub_without_an_anchor_token_stays_recoverable_and_holds_cleanup(
+    repo, tmp_path, monkeypatch
+):
+    """A stub written before the token existed is still audited and recoverable;
+    only the registration cleanup, which needs the token, is held."""
+    a = _archive(repo, tmp_path, "tokenless")
+    real = wl._prune_anchor
+    monkeypatch.setattr(wl, "_prune_anchor", lambda *_a, **_k: False)
+    assert _compact(repo)["compacted"] == 0
+    monkeypatch.setattr(wl, "_prune_anchor", real)
+    stub = json.loads(_stub(a["entry"]).read_text())
+    stub.pop("anchor_token")
+    _stub(a["entry"]).write_text(json.dumps(stub))
+    assert str(a["path"]) in _registered(repo), "control: the leftover registration is there"
+
+    counts = _compact(repo)
+
+    assert counts["errors"] == 0 and counts["held"] == 1, counts
+    assert str(a["path"]) in _registered(repo), "a token-less stub must not prune"
+    _git(repo, "update-ref", "-d", _pin_ref(a["entry"]))
+    assert _compact(repo)["repinned"] == 1, "the audit still repairs its pin"
+    assert wl._recover(a["entry"], repo, {}) is True
+
+
+class _Killed(BaseException):
+    """A kill: nothing in the code under test may catch it."""
+
+
+def test_a_recovery_killed_after_its_unlock_leaves_no_mark(repo, tmp_path, monkeypatch):
+    """The reattach retires compaction's mark BEFORE it unlocks. A recovery
+    killed straight after the unlock leaves a live registration without the
+    mark, so a checkout moved aside with no new work is still never pruned."""
+    a = _archive(repo, tmp_path, "killed")
+    real_unlock = wl._unlock_anchor
+    monkeypatch.setattr(wl, "_unlock_anchor", lambda anchor: False)
+    assert _compact(repo)["held"] == 1
+    monkeypatch.setattr(wl, "_unlock_anchor", real_unlock)
+    admin = _admin(repo, a["entry"])
+    real_git = wl._run_git
+
+    def unlock_then_die(cwd, args, *rest, **kw):
+        out = real_git(cwd, args, *rest, **kw)
+        if args[:2] == ["worktree", "unlock"]:
+            raise _Killed
+        return out
+
+    monkeypatch.setattr(wl, "_run_git", unlock_then_die)
+    with pytest.raises(_Killed):
+        wl._recover(a["entry"], repo, {})
+    monkeypatch.setattr(wl, "_run_git", real_git)
+    assert _registered(repo)[str(a["path"])] is None, "control: the unlock ran"
+    assert not (admin / wl.COMPACTION_MARK_FILE).exists(), "the mark outlived the unlock"
+
+    a["path"].rename(tmp_path / "killed.moved")
+    _compact(repo)
+    assert str(a["path"]) in _registered(repo), "the revived registration was pruned"
+
+
+def test_a_held_branch_anchor_finishes_after_its_branch_is_deleted(repo, tmp_path, monkeypatch):
+    """A locked anchor's HEAD moves only with the branch it names. Once the pin
+    holds the head, a deleted branch must not hold the compaction for ever; the
+    anchor's index, refs and reflog are still checked against the head."""
+    a = _archive(repo, tmp_path, "brgone", branch="feat-gone")
+    real = wl._unlock_anchor
+    monkeypatch.setattr(wl, "_unlock_anchor", lambda anchor: False)
+    assert _compact(repo)["held"] == 1
+    monkeypatch.setattr(wl, "_unlock_anchor", real)
+    _git(repo, "update-ref", "-d", "refs/heads/feat-gone")
+
+    counts = _compact(repo)
+
+    assert counts["resumed"] == 1 and counts["held"] == 0, counts
+    assert not a["archive"].exists()
+    assert str(a["path"]) not in _registered(repo)
+    assert _ref(repo, _pin_ref(a["entry"])) == a["head"]
+    _gc_now(repo)
+    assert _commit_exists(repo, a["head"])
+    assert wl._recover(a["entry"], repo, {}) is True
+    assert _git(a["path"], "rev-parse", "HEAD").stdout.strip() == a["head"]
+
+
+def test_a_locked_anchor_with_a_commit_only_its_reflog_reaches_is_held(repo, tmp_path, monkeypatch):
+    """The HEAD check is dropped for a locked anchor, never the reflog check: a
+    commit only the anchor's reflog reaches keeps it."""
+    a = _archive(repo, tmp_path, "reflogged")
+    real = wl._unlock_anchor
+    monkeypatch.setattr(wl, "_unlock_anchor", lambda anchor: False)
+    assert _compact(repo)["held"] == 1
+    monkeypatch.setattr(wl, "_unlock_anchor", real)
+    admin = _admin(repo, a["entry"])
+    tree = _git(repo, "rev-parse", f"{a['head']}^{{tree}}").stdout.strip()
+    extra = _git(
+        repo, "commit-tree", tree, "-p", a["head"], "-m", "only in the reflog"
+    ).stdout.strip()
+    _git(repo, "--git-dir", str(admin), "update-ref", "-m", "later", "HEAD", extra)
+
+    counts = _compact(repo)
+
+    assert counts["held"] == 1, counts
+    assert a["archive"].exists() and str(a["path"]) in _registered(repo)
+
+
 def test_the_pin_is_created_only_when_absent(repo, tmp_path):
     """`update-ref <ref> <new> ""` is create-only (git-update-ref(1)); an existing
     pin at another head is never overwritten."""
@@ -716,3 +916,24 @@ def test_an_inherited_index_variable_does_not_steer_the_gates(repo, tmp_path, mo
     _archive(repo, tmp_path, "envvar")
     monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "elsewhere.index"))
     assert _compact(repo)["compacted"] == 1
+
+
+def test_a_locked_anchor_whose_detached_head_moved_without_a_reflog_is_held(
+    repo, tmp_path, monkeypatch
+):
+    """A held compaction's locked anchor whose detached HEAD was written straight
+    to a new commit, with no reflog entry, still holds: the commit is reachable
+    only from that registration, so pruning it would let gc collect it."""
+    a = _archive(repo, tmp_path, "rawhead")
+    real = wl._unlock_anchor
+    monkeypatch.setattr(wl, "_unlock_anchor", lambda *_a, **_k: False)
+    assert _compact(repo)["held"] == 1
+    monkeypatch.setattr(wl, "_unlock_anchor", real)
+    admin = _admin(repo, a["entry"])
+    tree = _git(repo, "rev-parse", f"{a['head']}^{{tree}}").stdout.strip()
+    extra = _git(repo, "commit-tree", tree, "-p", a["head"], "-m", "anchor-only").stdout.strip()
+    (admin / "HEAD").write_text(extra + "\n")  # a raw write: no reflog entry
+    counts = _compact(repo)
+    assert counts["resumed"] == 0 and counts["held"] == 1, counts
+    _gc_now(repo)
+    assert _commit_exists(repo, extra), "the anchor-only commit was collected"
