@@ -64,7 +64,7 @@ class Input:
                 raw = stream.read()
             if hashlib.sha256(raw).hexdigest() != self.hash:
                 raise Incomplete("operating_input_changed")
-            self.check()
+            Input.check(self)
 
     def close(self):
         os.close(self.fd)
