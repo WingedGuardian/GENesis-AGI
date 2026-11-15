@@ -784,9 +784,14 @@ def _reset_memory_alarm_breakdown():
     mp.setattr(errors, "_codex_mcp_cache", None)
     mp.setattr(errors, "_codex_mcp_blind_logged_at", None)
     # Same for the process_memory_high alarm: no real /proc scan by default.
-    mp.setattr(errors, "_process_scan", lambda _threshold: types.SimpleNamespace(targets=[]))
+    mp.setattr(
+        errors,
+        "_process_scan",
+        lambda _threshold: types.SimpleNamespace(targets=[], uncertain=[], uncertain_pids=set()),
+    )
     mp.setattr(errors, "_process_cache", None)
     mp.setattr(errors, "_process_blind_logged_at", None)
+    mp.setattr(errors, "_process_refresh_lock", None)
     yield
     mp.undo()
 

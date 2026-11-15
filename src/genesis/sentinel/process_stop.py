@@ -266,19 +266,36 @@ def _classify(pid: int, threshold_kb: int, result: Scan) -> Target | None:
     )
 
 
-def _alive(pid: int, starttime: int) -> bool:
-    st = proc_io.read_stat(pid)
-    return st is not None and st[1] != "Z" and st[4] == starttime
+def _alive(pid: int, starttime: int) -> bool | None:
+    """True while ``pid`` is still the process that started at ``starttime``;
+    False once it is gone, a zombie, or another process; None when its stat
+    cannot be read (EACCES, EIO), which is no evidence that it stopped."""
+    try:
+        stat = (Path(proc_io._PROC) / str(pid) / "stat").read_bytes().decode("utf-8", "replace")
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    except OSError:
+        return None
+    try:
+        after = stat[stat.rindex(")") + 2 :].split()
+        state, st = after[0], int(after[19])
+    except (ValueError, IndexError):
+        return None
+    return st == starttime and state != "Z"
 
 
 def _pidfd_kill(pid: int, starttime: int, sig: int) -> None:
     """Signal ``pid`` only if it is still the process that started at
     ``starttime``. The pidfd is opened BEFORE the start-time check, so the
     check and the signal name the same process even if the pid is reused in
-    between. Raises ProcessLookupError when it is gone or is another process."""
+    between. Raises ProcessLookupError when it is gone or is another process,
+    and OSError when that cannot be told."""
     fd = os.pidfd_open(pid)
     try:
-        if proc_io.read_starttime(pid) != starttime:
+        state = _alive(pid, starttime)
+        if state is None:
+            raise OSError(f"pid {pid}: identity unreadable; not signalled")
+        if not state:
             raise ProcessLookupError(f"pid {pid} is no longer the approved process")
         signal.pidfd_send_signal(fd, sig)
     finally:
@@ -289,12 +306,13 @@ def stop(
     targets: list[Target],
     *,
     kill: Callable[[int, int, int], None] = _pidfd_kill,
-    alive: Callable[[int, int], bool] = _alive,
+    alive: Callable[[int, int], bool | None] = _alive,
     sleep: Callable[[float], None] = time.sleep,
     grace_s: float = TERM_GRACE_S,
     kill_grace_s: float = KILL_GRACE_S,
 ) -> tuple[list[Target], list[str]]:
-    """SIGTERM each target, then SIGKILL what is still the same process."""
+    """SIGTERM each target, then SIGKILL what is still the same process. A
+    target whose liveness cannot be read is a failure, never "stopped"."""
     failures: list[str] = []
     signalled: list[Target] = []
     gone: list[Target] = []
@@ -302,7 +320,11 @@ def stop(
         if t.pid <= 1:
             failures.append(f"{t.pid}: unsafe pid; skipped")
             continue
-        if not alive(t.pid, t.starttime):
+        state = alive(t.pid, t.starttime)
+        if state is None:
+            failures.append(f"{t.pid}: liveness unreadable; not signalled")
+            continue
+        if not state:
             gone.append(t)  # exited (or the pid was reused) since the scan
             continue
         try:
@@ -313,11 +335,12 @@ def stop(
         except OSError as exc:  # PermissionError, or a pidfd error: never lose the report
             failures.append(f"{t.pid}: SIGTERM refused ({exc})")
     deadline = time.monotonic() + grace_s
-    while any(alive(t.pid, t.starttime) for t in signalled) and time.monotonic() < deadline:
+    # An unreadable state (None) waits like a live one: it is not a stop.
+    while any(alive(t.pid, t.starttime) is not False for t in signalled) and time.monotonic() < deadline:
         sleep(0.2)
     stopped: list[Target] = []
     for t in signalled:
-        if alive(t.pid, t.starttime):
+        if alive(t.pid, t.starttime) is not False:
             try:
                 kill(t.pid, t.starttime, signal.SIGKILL)
             except ProcessLookupError:
@@ -326,9 +349,12 @@ def stop(
                 failures.append(f"{t.pid}: SIGKILL refused ({exc})")
                 continue
             kill_deadline = time.monotonic() + kill_grace_s
-            while alive(t.pid, t.starttime) and time.monotonic() < kill_deadline:
+            while alive(t.pid, t.starttime) is not False and time.monotonic() < kill_deadline:
                 sleep(0.2)
-        if alive(t.pid, t.starttime):
+        final = alive(t.pid, t.starttime)
+        if final is None:
+            failures.append(f"{t.pid}: liveness unreadable after the signals; not known to be stopped")
+        elif final:
             failures.append(f"{t.pid}: still alive after SIGKILL")
         else:
             stopped.append(t)
@@ -402,6 +428,10 @@ def main(argv: list[str] | None = None) -> int:
     # judged: report it as not done, so the remedy is never recorded resolved.
     unreadable = [(pid, st) for pid, st in not_targets if pid in found.uncertain_pids]
     not_targets = [x for x in not_targets if x not in unreadable]
+    # Processes over the line that the owner did not approve are never touched,
+    # but while one remains the alarm is still true: the run is not done, so
+    # the Sentinel neither records it resolved nor quiets the alarm.
+    unapproved = [t for t in found.targets if (t.pid, t.starttime) not in only]
     stopped, failures = stop(approved)
     freed_mb = sum(t.held_kb for t in stopped) / 1024
     print(
@@ -415,9 +445,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  not stopped {pid}:{st}: no longer an eligible target")
     for pid, st in unreadable:
         print(f"  NOT STOPPED {pid}:{st}: could not be read, so it was not judged; still running")
+    for t in unapproved:
+        print(
+            f"  NOT APPROVED pid {t.pid}:{t.starttime}: {t.held_kb / 1024:.0f} MB, over the line "
+            "and not in --only; left running (propose it separately)"
+        )
     for f in failures:
         print(f"  FAILED {f}")
-    return EXIT_OK if not failures and not unreadable else EXIT_PARTIAL
+    return EXIT_OK if not failures and not unreadable and not unapproved else EXIT_PARTIAL
 
 
 def _parse_only(raw: str) -> set[tuple[int, int]] | None:

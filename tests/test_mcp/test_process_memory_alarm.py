@@ -41,7 +41,7 @@ def health(monkeypatch):
     monkeypatch.setattr(process_stop, "load_propose_at_mb", lambda path=None: 6144)
     calls = []
 
-    def set_scan(mbs, *, raises=False):
+    def set_scan(mbs, *, raises=False, uncertain_pids=()):
         def fake(threshold):
             calls.append(threshold)
             if raises:
@@ -57,6 +57,8 @@ def health(monkeypatch):
                     )
                     for i, mb in enumerate(mbs)
                 ],
+                uncertain=[f"{p} (unreadable)" for p in uncertain_pids],
+                uncertain_pids=set(uncertain_pids),
                 threshold_mb=threshold,
             )
 
@@ -125,6 +127,44 @@ async def test_a_raising_scan_logs_once_and_emits_nothing(health, caplog, monkey
         monkeypatch.setattr(errors, "_process_cache", None)
         assert await _alarm() is None
     assert caplog.text.count("process_memory_high: the stop tool's scan raised") == 1
+
+
+def _rescan(monkeypatch, set_scan, *args, **kwargs):
+    """Swap the scan but keep the cached reading, expired so the next call refreshes."""
+    stamp, held = errors._process_cache
+    set_scan(*args, **kwargs)
+    monkeypatch.setattr(errors, "_process_cache", (stamp - errors._PROCESS_TTL_S, held))
+
+
+@pytest.mark.asyncio
+async def test_a_failed_refresh_keeps_the_last_observation(health, monkeypatch):
+    set_scan, _ = health
+    set_scan([9000])
+    assert await _alarm() is not None
+    _rescan(monkeypatch, set_scan, [], raises=True)
+    assert await _alarm() is not None
+
+
+@pytest.mark.asyncio
+async def test_a_flagged_process_turning_unreadable_keeps_the_alarm(health, monkeypatch):
+    set_scan, _ = health
+    set_scan([9000])  # pid 300
+    assert await _alarm() is not None
+    _rescan(monkeypatch, set_scan, [], uncertain_pids=[300])
+    assert await _alarm() is not None
+    _rescan(monkeypatch, set_scan, [], uncertain_pids=[999])  # unrelated: the reading stands
+    assert await _alarm() is None
+
+
+@pytest.mark.asyncio
+async def test_overlapping_callers_share_one_scan(health):
+    import asyncio
+
+    set_scan, calls = health
+    set_scan([9000])
+    results = await asyncio.gather(*(errors._process_memory_high() for _ in range(5)))
+    assert all(r is not None for r in results)
+    assert len(calls) == 1
 
 
 def test_tier_2_and_scoped():

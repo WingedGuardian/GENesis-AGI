@@ -294,8 +294,9 @@ async def _codex_mcp_held() -> tuple[int, int, int] | None:
 # sessions, including server-dispatched ones, are). Cached like codex_mcp_held.
 # An unreadable process is not alarmed on; a raising scan logs hourly.
 _PROCESS_TTL_S = 60.0
-_process_cache: tuple[float, tuple[int, str, int] | None] | None = None
+_process_cache: tuple[float, tuple[int, str, int, frozenset[int]] | None] | None = None
 _process_blind_logged_at: float | None = None
+_process_refresh_lock = None  # asyncio.Lock, made on first use: one scan at a time
 
 
 def _process_scan(threshold_mb: int):
@@ -313,28 +314,42 @@ async def _process_memory_high() -> tuple[int, str, int, int] | None:
 
     from genesis.sentinel import process_stop
 
-    global _process_cache, _process_blind_logged_at  # noqa: PLW0603
+    global _process_cache, _process_blind_logged_at, _process_refresh_lock  # noqa: PLW0603
     if process_stop.load_mode() == process_stop.MODE_OFF:
         return None
     threshold = process_stop.load_propose_at_mb()
     if threshold is None:
         return None
-    now = time.monotonic()
-    if _process_cache is None or now - _process_cache[0] >= _PROCESS_TTL_S:
-        held: tuple[int, str, int] | None = None
-        try:
-            found = await asyncio.to_thread(_process_scan, threshold)
-            if found.targets:
-                top = found.targets[0]
-                held = (len(found.targets), f"pid {top.pid} {top.label}", top.held_kb // 1024)
-            else:
-                held = (0, "", 0)
-        except Exception:
-            if _process_blind_logged_at is None or now - _process_blind_logged_at >= 3600:
-                _process_blind_logged_at = now
-                logger.error("process_memory_high: the stop tool's scan raised; the alarm is blind", exc_info=True)
-        _process_cache = (now, held)
-    held = _process_cache[1]
+    if _process_refresh_lock is None:
+        _process_refresh_lock = asyncio.Lock()
+    async with _process_refresh_lock:
+        # Re-read under the lock: a waiting caller reuses the scan just made.
+        now = time.monotonic()
+        if _process_cache is None or now - _process_cache[0] >= _PROCESS_TTL_S:
+            prior = _process_cache[1] if _process_cache is not None else None
+            held = prior  # a failed scan keeps the last observation
+            try:
+                found = await asyncio.to_thread(_process_scan, threshold)
+            except Exception:
+                found = None
+                if _process_blind_logged_at is None or now - _process_blind_logged_at >= 3600:
+                    _process_blind_logged_at = now
+                    logger.error(
+                        "process_memory_high: the stop tool's scan raised; the alarm is blind", exc_info=True
+                    )
+            if found is not None:
+                if found.targets:
+                    top = found.targets[0]
+                    held = (
+                        len(found.targets), f"pid {top.pid} {top.label}", top.held_kb // 1024,
+                        frozenset(t.pid for t in found.targets),
+                    )
+                elif prior is not None and prior[3] & found.uncertain_pids:
+                    pass  # a process the last reading flagged is now unreadable: no evidence it eased
+                else:
+                    held = (0, "", 0, frozenset())
+            _process_cache = (now, held)
+    held = _process_cache[1] if _process_cache is not None else None
     if held is None or held[0] == 0:
         return None
     return held[0], held[1], held[2], threshold

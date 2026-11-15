@@ -305,16 +305,24 @@ def test_execute_stops_only_the_approved_identity(fake_proc, monkeypatch, capsys
     200 must never stop it (architect BLOCKER, 2026-11-15)."""
     calls = _main_env(monkeypatch)
     _w(fake_proc, 210, comm="claude", argv=("claude",), rss_kb=9 * GB)
-    assert mod.main(["--execute", "--only", "200:2000"]) == mod.EXIT_OK
+    # Devin review: 210 is still over the line, so the run is not done (the
+    # Sentinel must not record the alarm resolved), but it is never signalled.
+    assert mod.main(["--execute", "--only", "200:2000"]) == mod.EXIT_PARTIAL
     assert calls == [[200]]
-    assert "stopped 1 of 1 approved" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "stopped 1 of 1 approved" in out
+    assert "NOT APPROVED pid 210:2100" in out
 
 
 def test_execute_skips_an_approved_pid_now_held_by_another_process(fake_proc, monkeypatch, capsys):
     calls = _main_env(monkeypatch)
-    assert mod.main(["--execute", "--only", "200:1999"]) == mod.EXIT_OK  # start time differs
+    # The start time differs: the approval names another process. The one now
+    # at pid 200 is still over the line and unapproved, so the run is partial.
+    assert mod.main(["--execute", "--only", "200:1999"]) == mod.EXIT_PARTIAL
     assert calls == [[]]
-    assert "not stopped 200:1999: no longer an eligible target" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "not stopped 200:1999: no longer an eligible target" in out
+    assert "NOT APPROVED pid 200:2000" in out
 
 
 def test_execute_skips_an_approved_process_now_under_the_line(fake_proc, monkeypatch, capsys):
@@ -359,6 +367,44 @@ def test_a_status_read_error_is_uncertain_not_gone(fake_proc, monkeypatch, capsy
     assert mod.main(["--execute", "--only", "200:2000"]) == mod.EXIT_PARTIAL
     assert calls == [[]]
     assert "NOT STOPPED 200:2000" in capsys.readouterr().out
+
+
+def _target(pid=200, st=2000):
+    return mod.Target(pid=pid, starttime=st, held_kb=9 * GB, label="x", unit="session-1.scope")
+
+
+def test_unreadable_liveness_before_the_signal_is_a_failure_not_a_stop():
+    """Codex review: an unreadable stat is no evidence the process stopped."""
+    sent = []
+    stopped, failures = mod.stop(
+        [_target()], kill=lambda *a: sent.append(a), alive=lambda pid, st: None, sleep=lambda s: None,
+    )
+    assert stopped == [] and sent == []
+    assert failures and "liveness unreadable" in failures[0]
+
+
+def test_unreadable_liveness_after_the_signals_is_a_failure_not_a_stop():
+    states = iter([True] + [None] * 50)
+    stopped, failures = mod.stop(
+        [_target()], kill=lambda *a: None, alive=lambda pid, st: next(states),
+        sleep=lambda s: None, grace_s=0, kill_grace_s=0,
+    )
+    assert stopped == []
+    assert failures
+
+
+def test_alive_reads_a_permission_error_as_unknown(fake_proc, monkeypatch):
+    real = mod.Path.read_bytes
+
+    def _read_bytes(self):
+        if self.name == "stat" and self.parent.name == "200":
+            raise PermissionError(13, "denied")
+        return real(self)
+
+    monkeypatch.setattr(mod.Path, "read_bytes", _read_bytes)
+    assert mod._alive(200, 2000) is None
+    assert mod._alive(999, 1) is False  # gone
+    assert mod._alive(210 if (fake_proc / "210").exists() else 50, 1) is False  # another start time
 
 
 def test_a_non_utf8_process_name_never_aborts_the_scan(fake_proc):
