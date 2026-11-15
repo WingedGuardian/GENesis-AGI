@@ -51,6 +51,7 @@ class Study:
         self._stack = ExitStack()
         self.plan, self.checked = copy.deepcopy(plan), copy.deepcopy(checked)
         self.histories, self.auxiliary, self.annotations, self.receipt_identities = {}, [], {}, {}
+        self.current_root, self.current_included = None, False
         try:
             self._validate(cases)
             self._read()
@@ -148,9 +149,13 @@ class Study:
         self.receipt_identities[owner] = identity
 
     def _read(self):
+        from .study_state import Owners
+
+        self.owners_reader = Owners(self.plan["histories"], self.plan["expense_evidence"])
+        self._stack.callback(self.owners_reader.close)
         self.owners, paths = {}, set()
         for ref in self.plan["histories"]:
-            history = self._stack.enter_context(lineage.History(ref))
+            history = self._stack.enter_context(lineage.History(ref, owners=self.owners_reader))
             if history.hash in self.histories or history.directory.resolve() in paths:
                 raise Incomplete("study_duplicate_history")
             paths.add(history.directory.resolve())
@@ -184,14 +189,18 @@ class Study:
             self._annotate(history, entry["attempt"], frozen.raw,
                            model=entry["model"], provider=entry["provider"])
 
-    def _select(self):
+    def _select(self, *, verify_reuse=True):
+        self.check()
         self.rows, self.reuse, self.missing, self.replaced, self.execution_issues = {}, {}, {}, set(), []
         # Preserve acquisition order while comparing each large shared admission
         # once per history/alias, rather than once per observed answer.
-        by_coordinate, admitted = {}, {}
+        by_coordinate, admitted, shared = {}, {}, {}
         for history in self.histories.values():
             for alias, manifest in self.manifests.items():
-                admitted[history.hash, alias] = lineage.compatible(history._state.manifest, manifest)
+                key = id(history.semantic_manifest), alias
+                if key not in shared:
+                    shared[key] = lineage.compatible(history.semantic_manifest, manifest)
+                admitted[history.hash, alias] = shared[key]
             for attempt, row in history._state.attempts.items():
                 charges = [self.annotations.get((history.hash, attempt))]
                 charges.extend(accounting.currency(o["usage"]["cost"]) for o in row["observations"]
@@ -209,11 +218,14 @@ class Study:
                         unsafe |= row.get("reserved_at") is not None
                         continue
                     matching = admitted[history.hash, alias] and same_request(row["spec"], spec)
-                    answer = lineage.eligible(history, attempt) if matching else None
+                    answer = lineage.eligible_row(history._state, attempt, history.semantic_manifest) \
+                        if matching and history.closure_safe else None
                     if answer is not None and logical not in self.rows[alias]:
                         self.rows[alias][logical] = answer
                         self.reuse[alias][logical] = {"journal_sha256": history.hash, "attempt": attempt}
-                    elif matching and lineage.rejected(history, attempt):
+                    elif matching and history.closure_safe and lineage.rejected_row(row, [
+                        e["error"] for e in history._lines if e["kind"] == "failure" and e["attempt"] == attempt
+                    ]):
                         rejected += 1
                     else:
                         unsafe = True
@@ -223,7 +235,7 @@ class Study:
                         self.execution_issues.append("missing_coordinate_has_nonreplaceable_history")
                 if rejected:
                     self.replaced.add((alias, logical))
-        if canonical(self.plan["reuse"]) != canonical(self.reuse):
+        if verify_reuse and canonical(self.plan["reuse"]) != canonical(self.reuse):
             raise Incomplete("study_reuse_map_changed")
 
     def _fund(self):
@@ -244,8 +256,15 @@ class Study:
             raise Incomplete("study_allowance_insufficient")
 
     def check(self, *, final=False):
-        for item in [*self.histories.values(), *self.auxiliary]:
+        roots = {id(h.owner): h.owner for h in self.histories.values() if h.owner is not None}
+        if self.current_root is not None:
+            roots[id(self.current_root)] = self.current_root
+        for history in self.histories.values():
+            history.check(final=final, owner=False)
+        for item in self.auxiliary:
             item.check(final=final)
+        for root in roots.values():
+            root.check(final=final)
         current = source_identity()
         if any(self.plan[k] != v for k, v in current.items()):
             raise Incomplete("study_source_changed")
@@ -258,14 +277,21 @@ class Study:
                 "combined_allowance": self.plan["combined_allowance"]}
 
     def preview(self):
+        try:
+            include_current(self)
+        except (Incomplete, OSError):
+            return {"status": "incomplete", "scope": "offline evidence inspection only; no spending approval",
+                    "execution_issues": ["study_root_unreadable"], "financial": None}
         self.check(final=True)
-        existing = Path(self.plan["study_root"]).exists() or Path(self.plan["study_root"]).is_symlink()
+        existing = self.current_root is not None or Path(self.plan["study_root"]).exists() \
+            or Path(self.plan["study_root"]).is_symlink()
         return {"status": "incomplete" if existing or self.execution_issues else "pass",
                 "scope": "offline inherited-evidence admission only; no spending approval",
                 "plan_hash": digest(self.plan), "reused": sum(map(len, self.reuse.values())),
                 "missing": sum(map(len, self.missing.values())),
                 "max_new_attempts": self.plan["max_new_attempts"],
                 "execution_issues": sorted(set(self.execution_issues + (["study_root_exists"] if existing else []))),
+                "closure_state": self.current_root.terminal_state if self.current_root else "unstarted",
                 "financial": self.financial()}
 
 
@@ -296,6 +322,7 @@ class LogicalView:
 
 
 async def report(study, cases, temp_root, *, config=None):
+    terminal = include_current(study)
     reports, records, states = {}, {}, {}
     for alias, manifest in study.manifests.items():
         view = LogicalView(study, alias)
@@ -320,11 +347,52 @@ async def report(study, cases, temp_root, *, config=None):
         kind: sum(event["kind"] == kind for h in study.histories.values() for event in h._lines)
         for kind in ("dispatch", "observation", "billing", "failure", "receipt_lookup")}
     # This entry reports an inherited prefix. It never invents study closure.
-    result.update(status="incomplete", terminal="unstarted_or_unverified")
+    if not terminal or terminal["status"] != "pass" or not terminal["admission_current"]:
+        result.update(status="incomplete")
+    result["terminal"] = terminal or "unstarted_or_unverified"
     return result
 
 
-async def inspect(plan_path, cases, temp_root, *, candidates, options, scoring=False, config=None):
+def include_current(study, *, root_path=None):
+    """Read this plan's complete physical census; never grant relaunch authority."""
+    from .study_state import Owners, read_root
+
+    if study.current_included:
+        if root_path is not None and Path(root_path).absolute() != study.current_root.directory:
+            raise Incomplete("study_conflicting_read_copy")
+        return study.current_root.terminal
+    path = Path(root_path) if root_path is not None else Path(study.plan["study_root"])
+    if not path.exists() and not path.is_symlink():
+        if root_path is not None:
+            raise Incomplete("study_requested_copy_missing")
+        return None
+    root = read_root(path)
+    study._stack.callback(root.close)
+    if canonical(root.plan) != canonical(study.plan):
+        raise Incomplete("study_root_plan_changed")
+    study.current_root = root
+    references = root.references()
+    owners = Owners([*study.plan["histories"], *references], study.plan["expense_evidence"])
+    study._stack.callback(owners.close)
+    for ref in references:
+        if ref["journal_sha256"] in study.histories:
+            continue
+        history = study._stack.enter_context(lineage.History(ref, owners=owners))
+        study.histories[history.hash] = history
+        for identity, row in history._state.attempts.items():
+            study._claim((history.hash, identity), row)
+            for receipt in row["receipts"]:
+                if receipt.get("raw_body") and receipt.get("response_model") and receipt.get("response_provider"):
+                    study._annotate(history, identity, receipt["raw_body"].encode(),
+                                    model=receipt["response_model"], provider=receipt["response_provider"])
+    study._select(verify_reuse=False)
+    study.liability = accounting.total(accounting.total([h._state.settled, h._state.reserved])
+                                      for h in study.histories.values())
+    study.current_included = True
+    return root.terminal
+
+
+async def inspect(plan_path, cases, temp_root, *, candidates, options, scoring=False, config=None, root_path=None):
     """Public read-only entry always computes full current admission internally."""
     with ExitStack() as stack:
         plan = execution.Input(plan_path)
@@ -339,6 +407,8 @@ async def inspect(plan_path, cases, temp_root, *, candidates, options, scoring=F
 
         checked = await admission()
         study = stack.enter_context(Study(plan.value, checked, cases))
+        if root_path is not None:
+            include_current(study, root_path=root_path)
         result = await report(study, cases, temp_root, config=config) if scoring else study.preview()
         if digest(run.admission_identity(await admission())) != study.admission:
             raise Incomplete("study_admission_changed")
