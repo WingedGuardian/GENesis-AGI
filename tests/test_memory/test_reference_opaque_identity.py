@@ -279,3 +279,23 @@ async def test_an_identifier_with_a_line_break_carrying_its_value_is_refused(db)
     with pytest.raises(ValueError, match="must not contain its value"):
         await _save(db, store, secret, secret)
     assert await _units(db) == 0
+
+
+async def test_a_body_without_the_standard_header_still_names_its_entry(db):
+    """Codex round 1 on #4749: a body whose first line is not the standard
+    header gains it, so the name is searchable and shown, and the caller's own
+    first line is kept (held with the description, never dropped)."""
+    store = _PointStore()
+    unit = await _ingest(
+        db, store, "VPN account\n\nLab account\n\nValue: Rr77Ss88!t", concept="Lab VPN login",
+    )
+    row = await kc.get(db, unit)
+    assert _OPAQUE.fullmatch(row["concept"])
+    assert row["body"].split("\n", 1)[0] == "[reference.credentials] Lab VPN login"
+    assert ro.display_name(row) == "Lab VPN login"
+    fts = await db.execute_fetchall("SELECT body FROM knowledge_fts WHERE rowid = (SELECT rowid FROM knowledge_units WHERE id = ?)", (unit,))
+    assert not fts or "Lab VPN login" in fts[0][0]
+    assert "Rr77Ss88" not in row["body"]
+    composed, missing = await ro.compose_body(db, row)
+    assert not missing and "VPN account" in composed and "Rr77Ss88!t" in composed
+    assert await _save(db, store, "lab vpn LOGIN", "Uu99Vv00!w") == unit

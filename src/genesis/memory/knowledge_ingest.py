@@ -206,10 +206,11 @@ async def _ingest_once(
         else:
             name = concept
         # The name is the body's header line, built here from the name and
-        # never from the key (a line break in it reads as a space). Only the
-        # header a writer formats from the identifier is replaced, and for a
-        # write by key the first line (the identifier given there is not
-        # used): any other first line stays, and is checked strictly below.
+        # never from the key (a line break in it reads as a space). The header
+        # a writer formats from the identifier is replaced, and for a write by
+        # key the first line (the identifier given there is not used). Any
+        # other first line stays below the built header, checked strictly with
+        # the rest, so every credential body names its entry (the key is opaque).
         domain_header = f"[{knowledge_crud.CREDENTIAL_DOMAIN}] "
         ours = domain_header + concept + "\n" if entry_key is None else None
         if entry_key is not None:
@@ -219,6 +220,8 @@ async def _ingest_once(
         name = " ".join(name.splitlines())
         if content.startswith(ours):
             content = f"{domain_header}{name}\n" + content[len(ours):]
+        else:
+            content = f"{domain_header}{name}\n" + content
         # The value AND the free-text description come out of the body; both go
         # to one reference_secrets row. The body keeps only the header, the
         # two placeholders and the Tags/Captured trailer.
