@@ -2,7 +2,8 @@
 """PreToolUse(Bash) block for a builder session: no merges, no reviews, no review-thread writes.
 
 A builder is a Claude Code session the board launcher started in a tmux slot
-for one issue (``scripts/cc-slot.sh launch``, which sets ``GENESIS_BUILDER_KEY``).
+for one issue (``scripts/cc-slot.sh launch`` sets ``GENESIS_BUILDER_KEY`` once the slot
+door's builder mode lands; until then nothing sets it and this hook is inert).
 Its job ends at an open pull request plus one ``@codex review``; the closing
 session handles review threads and merges (owner ruling, spec E). This hook does
 nothing unless ``GENESIS_BUILDER_KEY`` is set and non-empty. With it set, it
@@ -52,6 +53,7 @@ passes, its documented contract; any other failure blocks a builder only.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import sys
@@ -91,7 +93,7 @@ _MUTATIONS = re.compile(
     r"|submitPullRequestReview|dismissPullRequestReview|deletePullRequestReview"
     r"|mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest|mergeBranch)\b"
 )
-_IN_REPLY = re.compile(r"\bin_?reply_?to", re.IGNORECASE)
+_IN_REPLY = re.compile(r"in_?reply_?to(?:_id)?", re.IGNORECASE)
 # Matched against a normalised path (see _norm).
 _GRAPHQL_PATH = re.compile(r"(?:^|/)graphql/?$")
 _COMMENTS = re.compile(r"/pulls/[^/]+/comments/?$")
@@ -103,14 +105,19 @@ _WRITE_TARGETS = (
     (re.compile(r"/repos/[^/]+/[^/]+/merges/?$"), "a branch merge"),
 )
 #: A command-running program whose text names a refused operation.
-_INTERPRETERS = frozenset({"python", "python3", "perl", "node", "ruby"})
+_INTERPRETER = re.compile(r"(?:python[\d.]*|perl[\d.]*|node|nodejs|ruby[\d.]*)")
 
 
 def _inline_code(argv: list[str]) -> str | None:
-    """The code an interpreter is given on its command line (``-c``/``-e``)."""
+    """The code an interpreter is given on its command line: ``-c CODE``,
+    ``-e CODE``, ``--eval CODE``, or glued (``-cCODE``, ``-e'...'``, ``--eval=CODE``)."""
     for n, tok in enumerate(argv[1:], start=1):
-        if tok in ("-c", "-e", "--eval") and n + 1 < len(argv):
+        if tok in ("-c", "-e", "--eval", "-E") and n + 1 < len(argv):
             return argv[n + 1]
+        if tok.startswith("--eval="):
+            return tok[len("--eval=") :]
+        if len(tok) > 2 and tok[0] == "-" and tok[1] in "ceE" and tok[1] != "-":
+            return tok[2:]
     return None
 
 
@@ -134,6 +141,7 @@ _CARRIERS = frozenset(
 _BLIND = re.compile(
     r"\bgh\b[^|;&]*\bpr\s+(?:merge|review)\b"
     r"|/pulls/[^\s'\"]*/(?:merge|merge-async|replies|reviews)\b"
+    r"|/pulls/comments/\d"
     r"|/merges\b|\bin_reply_to\b(?!_id)|" + _MUTATIONS.pattern,
     re.IGNORECASE,
 )
@@ -160,6 +168,21 @@ def _norm(path: str) -> str:
     return "/" + "/".join(parts)
 
 
+def _grouped_method(argv: list[str]) -> tuple[str | None, int | None]:
+    """A method given inside a short-flag group (``gh api -iX DELETE …``,
+    ``-iXDELETE``), which the shared argv reader does not split: ``(method,
+    index of the word it consumed)``."""
+    from gh_merge import _is_group
+
+    for n, tok in enumerate(argv[1:], start=1):
+        if _is_group(tok) and "X" in tok:
+            rest = tok[tok.index("X") + 1 :]
+            if rest:
+                return rest, None
+            return (argv[n + 1] if n + 1 < len(argv) else "UNKNOWN"), n + 1
+    return None, None
+
+
 def _write_target(path: str) -> str | None:
     norm = _norm(path)
     for pattern, what in _WRITE_TARGETS:
@@ -170,6 +193,7 @@ def _write_target(path: str) -> str | None:
 
 def _gh_reason(seg, cmd: str, n_segments: int, cwd: str | None) -> str | None:
     from gh_merge import (
+        _graphql_code,
         _graphql_documents,
         _read_text,
         api_merge_reason,
@@ -200,12 +224,17 @@ def _gh_reason(seg, cmd: str, n_segments: int, cwd: str | None) -> str | None:
         return None
     endpoint = call.endpoint or ""
     has_body = bool(call.fields) or call.input is not None
-    method = (call.method or ("POST" if has_body else "GET")).upper()
+    grouped, consumed = _grouped_method(seg.argv)
+    if consumed is not None and endpoint == seg.argv[consumed]:
+        # The shared reader took the method word for the endpoint.
+        later = [t for t in seg.argv[consumed + 1 :] if not t.startswith("-")]
+        endpoint = later[0] if later else ""
+    method = (call.method or grouped or ("POST" if has_body else "GET")).upper()
     if _GRAPHQL_PATH.search(_norm(endpoint)):
         docs = _graphql_documents(call, cwd, trusted)
         if docs is None:
             return "a GraphQL request whose query this guard cannot read"
-        if any(_MUTATIONS.search(d) for d in docs):
+        if any(_MUTATIONS.search(_graphql_code(d)) for d in docs):
             return "a GraphQL review, review-thread or merge mutation"
         return None
     if method in ("GET", "HEAD"):
@@ -220,7 +249,7 @@ def _gh_reason(seg, cmd: str, n_segments: int, cwd: str | None) -> str | None:
             body = _read_text(call.input, cwd) if trusted else None
             if body is None:
                 return "a review-comment write whose body this guard cannot read"
-            if _IN_REPLY.search(body):
+            if _replies(body):
                 return "a reply to a review comment (`in_reply_to` in the body)"
     return None
 
@@ -244,56 +273,106 @@ _WGET_BODY = {"--post-data", "--post-file", "--body-data", "--body-file"}
 _METHOD = {"-X", "--request", "--method"}
 #: Options whose value is a file name, never the body text itself.
 _FILE_BODY = {"--post-file", "--body-file", "-T", "--upload-file"}
-#: curl and wget options whose value is not a URL (headers, output, auth...).
+#: Options whose value is not a URL, PER PROGRAM: the same letter is a value
+#: option in one and a boolean in the other (curl -O is boolean, wget -O takes a
+#: file; wget -b/-c/-r are boolean, curl's take values). READ: curl(1), wget(1).
 _VALUE_OPTS = {
-    "-H",
-    "--header",
-    "-o",
-    "--output",
-    "-w",
-    "--write-out",
-    "-u",
-    "--user",
-    "-A",
-    "--user-agent",
-    "-e",
-    "--referer",
-    "-b",
-    "--cookie",
-    "-c",
-    "--cookie-jar",
-    "-m",
-    "--max-time",
-    "--connect-timeout",
-    "-r",
-    "--range",
-    "-x",
-    "--proxy",
-    "--cacert",
-    "--cert",
-    "--key",
-    "-E",
-    "--resolve",
-    "--retry",
-    "-O",
-    "--output-document",
-    "--header=",
-    "-U",
-    "--user-agent=",
-    "--http-user",
-    "--http-password",
-    "-P",
-    "--directory-prefix",
-    "--timeout",
-    "-t",
-    "--tries",
+    "curl": frozenset(
+        {
+            "-H",
+            "--header",
+            "-o",
+            "--output",
+            "-w",
+            "--write-out",
+            "-u",
+            "--user",
+            "-A",
+            "--user-agent",
+            "-e",
+            "--referer",
+            "-b",
+            "--cookie",
+            "-c",
+            "--cookie-jar",
+            "-m",
+            "--max-time",
+            "--connect-timeout",
+            "-r",
+            "--range",
+            "-x",
+            "--proxy",
+            "--cacert",
+            "--cert",
+            "--key",
+            "-E",
+            "--resolve",
+            "--retry",
+            "-U",
+            "--proxy-user",
+            "-t",
+            "--telnet-option",
+        }
+    ),
+    "wget": frozenset(
+        {
+            "-O",
+            "--output-document",
+            "-o",
+            "--output-file",
+            "-a",
+            "--append-output",
+            "-U",
+            "--user-agent",
+            "-t",
+            "--tries",
+            "-P",
+            "--directory-prefix",
+            "--header",
+            "--http-user",
+            "--http-password",
+            "--timeout",
+            "-T",
+            "-e",
+            "--execute",
+            "--referer",
+            "--load-cookies",
+            "--save-cookies",
+        }
+    ),
 }
-#: Short curl options that take a value, inside a flag group (``-sH v``).
-_SHORT_VALUE = set("HowuAebcmrxEUPt")
+#: Short options that take a value, inside a flag group (``-sH v``), per program.
+_SHORT_VALUE = {"curl": set("HowuAebcmrxEUt"), "wget": set("OoaUtPTe")}
+
+
+def _json_or_none(body: str):
+    try:
+        return json.loads(body)
+    except (ValueError, TypeError):
+        return None
+
+
+def _replies(body: str) -> bool:
+    """A comment body makes a reply only through an ``in_reply_to`` KEY; text
+    that mentions the word is not one. A body that is not JSON cannot be read
+    and counts as one (fail closed)."""
+    doc = _json_or_none(body)
+    if not isinstance(doc, dict):
+        return True
+    return any(_IN_REPLY.fullmatch(str(k)) for k in doc)
+
+
+def _query_of(body: str) -> str:
+    doc = _json_or_none(body)
+    if isinstance(doc, dict) and isinstance(doc.get("query"), str):
+        return doc["query"]
+    return body
 
 
 def _http_reason(seg) -> str | None:
     """A refused GitHub request through curl or wget."""
+    from gh_merge import _graphql_code
+
     argv = seg.argv
     prog = os.path.basename(argv[0])
     urls, bodies, method, unreadable = [], [], None, False
@@ -308,10 +387,10 @@ def _http_reason(seg) -> str | None:
             urls.append(glued if glued else (argv[i + 1] if i + 1 < len(argv) else ""))
             i += 1 if glued else 2
             continue
-        if name in _VALUE_OPTS and not glued:
+        if name in _VALUE_OPTS.get(prog, ()) and not glued:
             i += 2  # the value of a header, output, user... option is not a URL
             continue
-        if name in _VALUE_OPTS:
+        if name in _VALUE_OPTS.get(prog, ()):
             i += 1
             continue
         if name in _METHOD or name in _CURL_BODY or name in _WGET_BODY:
@@ -334,7 +413,7 @@ def _http_reason(seg) -> str | None:
             for n, ch in enumerate(letters):
                 if ch == "K":
                     return f"`{prog}` reading its request from a config file"
-                if ch in _SHORT_VALUE:
+                if ch in _SHORT_VALUE.get(prog, ()):
                     if not letters[n + 1 :]:
                         i += 1  # its value is the next word
                     break
@@ -378,7 +457,7 @@ def _http_reason(seg) -> str | None:
         if _GRAPHQL_PATH.search(path):
             if unreadable:
                 return f"`{prog}` sending a GraphQL body this guard cannot read"
-            if any(_MUTATIONS.search(b) for b in bodies):
+            if any(_MUTATIONS.search(_graphql_code(_query_of(b))) for b in bodies):
                 return f"`{prog}` sending a GraphQL review, review-thread or merge mutation"
             continue
         if method in ("GET", "HEAD"):
@@ -386,7 +465,7 @@ def _http_reason(seg) -> str | None:
         what = _write_target(path)
         if what:
             return f"{what} through `{prog}`"
-        if _COMMENTS.search(path) and (unreadable or any(_IN_REPLY.search(b) for b in bodies)):
+        if _COMMENTS.search(path) and (unreadable or any(_replies(b) for b in bodies)):
             return f"a reply to a review comment through `{prog}`"
     return None
 
@@ -407,7 +486,7 @@ def reason(cmd: str, cwd: str | None) -> str | None:
             found = _gh_reason(seg, cmd, len(segs), cwd if seg.depth == 0 else None)
         elif exe in ("curl", "wget"):
             found = _http_reason(seg)
-        elif exe in _INTERPRETERS:
+        elif _INTERPRETER.fullmatch(os.path.basename(seg.argv[0]) if seg.argv else exe):
             code = _inline_code(seg.argv)
             found = (
                 f"`{exe}` running code that names a merge, a review or a review-thread write"

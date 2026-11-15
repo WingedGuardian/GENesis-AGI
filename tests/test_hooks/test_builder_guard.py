@@ -77,6 +77,20 @@ REFUSED = [
     "gh api 'graphql?x=1' -f query=\"$(cat m.graphql)\"",
     "curl -X PUT https://api.github.com/repos/o/r/pulls/5/x/../merge",
     "python3 -c 'import os; os.system(\"gh pr merge 5\")'",
+    # PR review round 1 (Devin, Kimi).
+    "gh api -X PATCH repos/o/r/pulls/comments/99 \\\n  -f body=x",
+    "curl -O -X PUT https://api.github.com/repos/o/r/pulls/5/merge",
+    "curl -X PUT -O https://api.github.com/repos/o/r/pulls/5/merge",
+    "wget -c --method=PUT https://api.github.com/repos/o/r/pulls/5/merge",
+    "wget -b --method=PUT https://api.github.com/repos/o/r/pulls/5/merge",
+    "wget -r --method=PUT https://api.github.com/repos/o/r/pulls/5/merge",
+    "gh api -iX DELETE repos/o/r/pulls/comments/99",
+    "gh api -iXDELETE repos/o/r/pulls/comments/99",
+    "perl -e'system(\"gh pr merge 5\")'",
+    "ruby -e'system(\"gh pr merge 5\")'",
+    "python3 -c'import os; os.system(\"gh pr merge 5\")'",
+    "python3.12 -c 'import os; os.system(\"gh pr merge 5\")'",
+    'node --eval=\'require("child_process").execSync("gh pr merge 5")\'',
 ]
 
 ALLOWED = [
@@ -115,11 +129,17 @@ ALLOWED = [
     'curl -X PATCH -H "Authorization: token $GH_TOKEN" https://api.github.com/repos/o/r/pulls/5 -d \'{"body":"x"}\'',
     "gh api repos/o/r/issues/5/comments -f body='the guard now refuses resolveReviewThread'",
     "gh api -X PATCH repos/o/r/pulls/5 -f body='Blocks minimizeComment and addPullRequestReview.'",
+    # PR review round 1: prose that names an operation is not the operation.
+    'gh api graphql -f \'query=mutation { addComment(input:{subjectId:"PR_x",body:"Fixed resolveReviewThread detection"}) { clientMutationId } }\'',
+    "gh api repos/o/r/pulls/5/comments --input prose.json",
 ]
 
 
 def _fixtures(cwd: Path) -> None:
     (cwd / "reply.json").write_text('{"body": "x", "in_reply_to": 9}')
+    (cwd / "prose.json").write_text(
+        '{"body": "Fix in_reply_to parsing", "commit_id": "abc", "path": "a.py", "line": 1}'
+    )
     (cwd / "plain.json").write_text('{"body": "x", "commit_id": "abc", "path": "a.py", "line": 1}')
     (cwd / "body.json").write_text('{"body": "x", "in_reply_to": 9}')
     (cwd / "q.json").write_text(
