@@ -1885,7 +1885,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: c719d647b 2026-11-15
+verified: d70924fb5 2026-11-15
 ```
 
 Scoped verification: internal `mcp/shared_http` composition only. It receives
