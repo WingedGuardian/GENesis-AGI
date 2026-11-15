@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from genesis.db.crud import knowledge as knowledge_crud
+from genesis.knowledge.lifetime import unreferenced, writer
 from genesis.memory.classification import CLASS_WEIGHTS
 from genesis.security.sanitizer import ContentSanitizer, ContentSource
 
@@ -284,157 +285,161 @@ async def _ingest_once(
     if provenance and provenance.get("source_doc"):
         source_doc = provenance["source_doc"]
 
-    if observed is not None:
-        # The observation is the predecessor the compare-and-swap commits
-        # against, so its point is the one this write really displaces.
-        unit_id = observed.unit_id or str(uuid.uuid4())
-        old_qdrant_id = observed.qdrant_id
-    else:
-        existing = await knowledge_crud.find_by_unique_key(
-            db, project_type=project, domain=domain, concept=resolved_concept,
-        )
-        unit_id = existing["id"] if existing else str(uuid.uuid4())
-        old_qdrant_id = existing.get("qdrant_id") if existing else None
+    # Hold the knowledge writer lock from the predecessor read through cleanup, so
+    # no other publisher can dedup onto, or retire, a point between this write's
+    # store, its reference commit and its cleanup.
+    async with writer(db):
+        if observed is not None:
+            # The observation is the predecessor the compare-and-swap commits
+            # against, so its point is the one this write really displaces.
+            unit_id = observed.unit_id or str(uuid.uuid4())
+            old_qdrant_id = observed.qdrant_id
+        else:
+            existing = await knowledge_crud.find_by_unique_key(
+                db, project_type=project, domain=domain, concept=resolved_concept,
+            )
+            unit_id = existing["id"] if existing else str(uuid.uuid4())
+            old_qdrant_id = existing.get("qdrant_id") if existing else None
 
-    source_pipeline_val = (provenance or {}).get("source_pipeline", "knowledge_ingest")
-    source_session_id = (provenance or {}).get("session_id")
-    # WS-3: derive ONCE and pass the same value to both stores below — the
-    # same both-stores-consistent discipline as the source_pipeline mirror.
-    from genesis.memory.provenance import derive_origin_class
+        source_pipeline_val = (provenance or {}).get("source_pipeline", "knowledge_ingest")
+        source_session_id = (provenance or {}).get("session_id")
+        # WS-3: derive ONCE and pass the same value to both stores below — the
+        # same both-stores-consistent discipline as the source_pipeline mirror.
+        from genesis.memory.provenance import derive_origin_class
 
-    resolved_origin = derive_origin_class(
-        origin_class=origin_class,
-        source_pipeline=source_pipeline_val,
-        collection=collection,
-    )
-    # memory_type is passed by name at each call below, not in this dict: the
-    # store-subsystem coverage test finds memory writers by their keywords
-    # (tests/test_memory/test_store_subsystem_coverage.py).
-    store_kwargs = dict(
-        collection=collection,
-        tags=[domain, project, authority],
-        confidence=confidence,
-        auto_link=False,
-        source_pipeline=source_pipeline_val,
-        memory_class=memory_class,
-        source_session_id=source_session_id,
-        force_fts5_only=force_fts5_only,
-        project_type=project,
-        origin_class=resolved_origin,
-    )
-    # ``created``: the point is this write's own (no other unit can name it), so
-    # the cleanup after the upsert may delete it whenever the unit does not
-    # name it. A credential write never reuses a point (dedup off): two writes
-    # of the same held-out body would otherwise share one, and one write's
-    # cleanup could delete the point the other's unit names (#2426). An
-    # insert-only write learns whether dedup matched, so it never deletes a
-    # pre-existing memory it did not create. Every other write keeps the
-    # deduplicating store exactly as before.
-    created = False
-    if credential:
-        # dedup=False: the id always names a memory this call created (the
-        # store's contract), so ``created`` is known without asking.
-        qdrant_memory_id = await store.store(
-            content, f"knowledge:{project}/{domain}", memory_type=memory_type, dedup=False,
-            **store_kwargs,
+        resolved_origin = derive_origin_class(
+            origin_class=origin_class,
+            source_pipeline=source_pipeline_val,
+            collection=collection,
         )
-        created = True
-    elif insert_only:
-        qdrant_memory_id, created = await store.store_reporting_creation(
-            content, f"knowledge:{project}/{domain}", memory_type=memory_type, **store_kwargs,
+        # memory_type is passed by name at each call below, not in this dict: the
+        # store-subsystem coverage test finds memory writers by their keywords
+        # (tests/test_memory/test_store_subsystem_coverage.py).
+        store_kwargs = dict(
+            collection=collection,
+            tags=[domain, project, authority],
+            confidence=confidence,
+            auto_link=False,
+            source_pipeline=source_pipeline_val,
+            memory_class=memory_class,
+            source_session_id=source_session_id,
+            force_fts5_only=force_fts5_only,
+            project_type=project,
+            origin_class=resolved_origin,
         )
-    else:
-        qdrant_memory_id = await store.store(
-            content, f"knowledge:{project}/{domain}", memory_type=memory_type, **store_kwargs,
-        )
-
-    embedding_model = getattr(store._embeddings, "model_name", "qwen3-embedding:0.6b-fp16")
-    resolved_tags = tags_json or json.dumps([domain, project, authority])
-    upsert_kwargs = dict(
-        id=unit_id,
-        project_type=project,
-        domain=domain,
-        source_doc=source_doc,
-        concept=resolved_concept,
-        body=content,
-        tags=resolved_tags,
-        ingested_at=now_iso,
-        qdrant_id=qdrant_memory_id,
-        confidence=confidence,
-        source_platform=provenance.get("platform") if provenance else None,
-        section_title=provenance.get("section_title") if provenance else None,
-        source_date=provenance.get("source_date") if provenance else None,
-        embedding_model=embedding_model,
-        # Mirror the Qdrant write's default (audit D12): never leave the SQLite
-        # knowledge_units pipeline NULL while the vector payload has a value —
-        # provenance must be consistent across both stores.
-        source_pipeline=source_pipeline_val,
-        purpose=json.dumps(purpose) if purpose else None,
-        ingestion_source=ingestion_source,
-        origin_class=resolved_origin,
-        secret_value=secret_value,
-        secret_detail=secret_detail,
-        expected=observed,
-    )
-    try:
-        actual_id, inserted = await knowledge_crud.upsert(
-            db, insert_only=insert_only, **upsert_kwargs,
-        )
-        if insert_only and not inserted:
-            # The key was taken, with this value, between the check and the
-            # write: the unit is unchanged, and so is the point it names.
-            return actual_id
-    finally:
-        # After EVERY attempt (success, CredentialKeyTaken, a trigger's refusal,
-        # a cancellation, any error): a point this write created that no unit
-        # names when the attempt ends is deleted, so a refused write leaves no
-        # recallable orphan. Safe because the point is this write's alone.
-        if created:
-            await _drop_unnamed_point(store, db, qdrant_memory_id)
-
-    # AFTER the upsert, so a failed upsert (a refused credential write, a
-    # missing reference_secrets table) never leaves the row pointing at a
-    # point already deleted: the old point stays until its replacement row commits.
-    # If we replaced an existing entry whose Qdrant point ID differs from
-    # the new one, the old point is now orphaned — delete it so Qdrant
-    # stays in sync with the knowledge_units row of record. store.delete()
-    # handles metadata, FTS5, Qdrant, links, and pending_embeddings cascade.
-    # store.store dedups by exact content, so two non-credential units can
-    # share one point: never delete a point any unit still names, this one
-    # included (a concurrent write may have pointed it back). For a credential
-    # the check is reliable, not merely likely: its writes never reuse a point,
-    # so once no unit names the old point, no later write can name it again.
-    still_named = bool(old_qdrant_id) and await knowledge_crud.qdrant_point_named_elsewhere(
-        db, old_qdrant_id, exclude_id="",
-    )
-    if old_qdrant_id and old_qdrant_id != qdrant_memory_id and not still_named:
-        try:
-            res = await store.delete(old_qdrant_id)
-            if res.get("deferred"):
-                # Vector store unavailable → store.delete() touched nothing, so
-                # the replaced memory is still fully alive (point + metadata +
-                # FTS) alongside its successor — and unlike a ghost, no cleanup
-                # can classify it as an offender (it has a metadata row). No
-                # sweep retries this delete either, so log LOUDLY: this is the
-                # knowledge-unit stale-pair case for a cross-store reconcile.
-                logger.error(
-                    "Stale-point cleanup deferred for %s while upserting "
-                    "knowledge unit %s: vector store unavailable — the replaced "
-                    "memory remains recallable alongside its successor until "
-                    "reconciled", old_qdrant_id, unit_id,
-                )
-        except Exception:
-            logger.error(
-                "Failed to clean up stale Qdrant point %s while upserting "
-                "knowledge unit %s", old_qdrant_id, unit_id, exc_info=True,
+        # ``created``: the point is this write's own (no other unit can name it), so
+        # the cleanup after the upsert may delete it whenever the unit does not
+        # name it. A credential write never reuses a point (dedup off): two writes
+        # of the same held-out body would otherwise share one, and one write's
+        # cleanup could delete the point the other's unit names (#2426). An
+        # insert-only write learns whether dedup matched, so it never deletes a
+        # pre-existing memory it did not create. Every other write keeps the
+        # deduplicating store exactly as before.
+        created = False
+        if credential:
+            # dedup=False: the id always names a memory this call created (the
+            # store's contract), so ``created`` is known without asking.
+            qdrant_memory_id = await store.store(
+                content, f"knowledge:{project}/{domain}", memory_type=memory_type, dedup=False,
+                **store_kwargs,
+            )
+            created = True
+        elif insert_only:
+            qdrant_memory_id, created = await store.store_reporting_creation(
+                content, f"knowledge:{project}/{domain}", memory_type=memory_type, **store_kwargs,
+            )
+        else:
+            qdrant_memory_id = await store.store(
+                content, f"knowledge:{project}/{domain}", memory_type=memory_type, **store_kwargs,
             )
 
-    logger.info(
-        "Knowledge unit %s (project=%s, domain=%s)",
-        "ingested" if inserted else "updated",
-        project, domain,
-    )
-    return actual_id
+        embedding_model = getattr(store._embeddings, "model_name", "qwen3-embedding:0.6b-fp16")
+        resolved_tags = tags_json or json.dumps([domain, project, authority])
+        upsert_kwargs = dict(
+            id=unit_id,
+            project_type=project,
+            domain=domain,
+            source_doc=source_doc,
+            concept=resolved_concept,
+            body=content,
+            tags=resolved_tags,
+            ingested_at=now_iso,
+            qdrant_id=qdrant_memory_id,
+            confidence=confidence,
+            source_platform=provenance.get("platform") if provenance else None,
+            section_title=provenance.get("section_title") if provenance else None,
+            source_date=provenance.get("source_date") if provenance else None,
+            embedding_model=embedding_model,
+            # Mirror the Qdrant write's default (audit D12): never leave the SQLite
+            # knowledge_units pipeline NULL while the vector payload has a value —
+            # provenance must be consistent across both stores.
+            source_pipeline=source_pipeline_val,
+            purpose=json.dumps(purpose) if purpose else None,
+            ingestion_source=ingestion_source,
+            origin_class=resolved_origin,
+            secret_value=secret_value,
+            secret_detail=secret_detail,
+            expected=observed,
+        )
+        try:
+            actual_id, inserted = await knowledge_crud.upsert(
+                db, insert_only=insert_only, **upsert_kwargs,
+            )
+            if insert_only and not inserted:
+                # The key was taken, with this value, between the check and the
+                # write: the unit is unchanged, and so is the point it names.
+                return actual_id
+        finally:
+            # After EVERY attempt (success, CredentialKeyTaken, a trigger's refusal,
+            # a cancellation, any error): a point this write created that no unit
+            # names when the attempt ends is deleted, so a refused write leaves no
+            # recallable orphan. Safe because the point is this write's alone.
+            if created:
+                await _drop_unnamed_point(store, db, qdrant_memory_id)
+
+        # AFTER the upsert, so a failed upsert (a refused credential write, a
+        # missing reference_secrets table) never leaves the row pointing at a
+        # point already deleted: the old point stays until its replacement row commits.
+        # If we replaced an existing entry whose Qdrant point ID differs from
+        # the new one, the old point is now orphaned — delete it so Qdrant
+        # stays in sync with the knowledge_units row of record. store.delete()
+        # handles metadata, FTS5, Qdrant, links, and pending_embeddings cascade.
+        # store.store dedups by exact content, so two non-credential units can
+        # share one point: never delete a point any unit still names, this one
+        # included (a concurrent write may have pointed it back). For a credential
+        # the check is reliable, not merely likely: its writes never reuse a point,
+        # so once no unit names the old point, no later write can name it again.
+        # ``unreferenced`` is that global check; a failed lookup logs and skips the
+        # cleanup rather than deleting a point it could not prove unnamed.
+        if (old_qdrant_id and old_qdrant_id != qdrant_memory_id
+                and await unreferenced(db, [old_qdrant_id])):
+            try:
+                res = await store.delete(old_qdrant_id)
+                if res.get("deferred"):
+                    # Vector store unavailable → store.delete() touched nothing, so
+                    # the replaced memory is still fully alive (point + metadata +
+                    # FTS) alongside its successor — and unlike a ghost, no cleanup
+                    # can classify it as an offender (it has a metadata row). No
+                    # sweep retries this delete either, so log LOUDLY: this is the
+                    # knowledge-unit stale-pair case for a cross-store reconcile.
+                    logger.error(
+                        "Stale-point cleanup deferred for %s while upserting "
+                        "knowledge unit %s: vector store unavailable — the replaced "
+                        "memory remains recallable alongside its successor until "
+                        "reconciled", old_qdrant_id, unit_id,
+                    )
+            except Exception:
+                logger.error(
+                    "Failed to clean up stale Qdrant point %s while upserting "
+                    "knowledge unit %s", old_qdrant_id, unit_id, exc_info=True,
+                )
+
+        logger.info(
+            "Knowledge unit %s (project=%s, domain=%s)",
+            "ingested" if inserted else "updated",
+            project, domain,
+        )
+        return actual_id
 
 
 def field_text(value: object) -> str | None:
