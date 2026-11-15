@@ -112,13 +112,23 @@ def _bug_form_body() -> str:
 # -- harness -----------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _post_epoch(monkeypatch):
+    """The hook stamps a new issue with the wall clock, so these tests pin the
+    epoch rather than depend on today's date. They run on the post-epoch side,
+    the path every create takes from FORM_EPOCH on; the few about the `bug`
+    label's Verification section pass ``_BEFORE`` (see ``_UNTIL_THE_EPOCH``)."""
+    monkeypatch.setenv("_TEST_PREMISE_FORM_EPOCH", _AFTER)
+
+
+#: For a test of the pre-epoch rule, which the hook takes until FORM_EPOCH.
+_UNTIL_THE_EPOCH = {"_TEST_PREMISE_FORM_EPOCH": _BEFORE}
+
+
 def _environ(monkeypatch, *, dispatched=False, extra=None):
     for name in ("GENESIS_CC_SESSION", "GH_REPO", "GH_HOST"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", CANON)
-    # The hook stamps a new issue with the wall clock; a far epoch keeps these
-    # tests on the pre-epoch side whatever today is (post-epoch: _AFTER).
-    monkeypatch.setenv("_TEST_PREMISE_FORM_EPOCH", _BEFORE)
     if dispatched:
         monkeypatch.setenv("GENESIS_CC_SESSION", "1")
     for k, v in (extra or {}).items():
@@ -142,7 +152,7 @@ def _sub_env(extra=None, *, dispatched=False):
         k: v for k, v in os.environ.items() if k not in ("GENESIS_CC_SESSION", "GH_REPO", "GH_HOST")
     }
     env["_TEST_CANONICAL_PUBLIC_REPO"] = CANON
-    env["_TEST_PREMISE_FORM_EPOCH"] = _BEFORE
+    env["_TEST_PREMISE_FORM_EPOCH"] = _AFTER
     if dispatched:
         env["GENESIS_CC_SESSION"] = "1"
     env.update(extra or {})
@@ -199,17 +209,30 @@ PRE_EPOCH = "2026-10-01T00:00:00Z"
 def test_owed_answers_names_the_section_and_the_missing_numbers():
     assert gate.owed_answers({"body": MISSING, "labels": [], "created_at": NOW}) == (
         "premise",
-        [1, 2, 3, 4, 5, 6],
+        [1, 2, 3, 4, 5],
     )
-    assert gate.owed_answers({"body": PARTIAL, "labels": [], "created_at": NOW}) == (
+    assert gate.owed_answers({"body": NEW_PARTIAL, "labels": [], "created_at": NOW}) == (
         "premise",
-        [2, 6],
+        [5],
     )
-    assert gate.owed_answers({"body": SIX, "labels": [], "created_at": NOW}) == ("", [])
+    # A six-question section, even complete, owes the Problem block after the epoch.
+    assert gate.owed_answers({"body": SIX, "labels": [], "created_at": NOW}) == (
+        "premise",
+        [1, 2, 3, 4, 5],
+    )
+    assert gate.owed_answers({"body": NEW_PROBLEM, "labels": [], "created_at": NOW}) == ("", [])
 
 
-def test_owed_answers_switches_to_verification_for_a_bug():
-    assert gate.owed_answers({"body": SIX, "labels": ["bug"], "created_at": NOW}) == (
+def test_owed_answers_switches_to_verification_for_a_bug(monkeypatch):
+    """Until the epoch (an issue created before it keeps this rule): a `bug` issue
+    owes Verification. After it, the Problem block like any other issue."""
+    assert gate.owed_answers({"body": VERIFIED, "labels": ["bug"], "created_at": NOW}) == (
+        "premise",
+        [1, 2, 3, 4, 5],
+    )
+    assert gate.owed_answers({"body": NEW_PROBLEM, "labels": ["bug"], "created_at": NOW}) == ("", [])
+    monkeypatch.setenv("_TEST_PREMISE_FORM_EPOCH", _BEFORE)
+    assert gate.owed_answers({"body": NEW_PROBLEM, "labels": ["bug"], "created_at": NOW}) == (
         "verification",
         [1, 2, 3, 4, 5],
     )
@@ -252,14 +275,15 @@ def test_owed_answers_agrees_with_the_server_gate_on_an_opened_event(
 
 
 def test_owed_message_names_the_numbers_the_format_and_the_placeholder():
-    msg = gate.owed_message({"body": PARTIAL, "labels": [], "created_at": NOW})
-    assert "answer 2 (repo searched for existing code, result written down)" in msg
-    assert "answer 6" in msg and "is only a <placeholder>" in msg
+    body = NEW_PARTIAL.replace("4. Searched: issues and main; nothing.", "4. Searched: <existing issues, main and prior rulings: what was searched, what was found>")
+    msg = gate.owed_message({"body": body, "labels": [], "created_at": NOW})
+    assert "answer 5 (Acceptance) has no `Wrong fix:` answer" in msg
+    assert "answer 4 (Searched) is only a `<placeholder>`" in msg
     assert "answer 1 " not in msg and "answer 3 " not in msg
-    assert "## Premise checks" in msg and "n/a — <reason>" in msg
+    assert "## Premise checks" in msg and "n/a — <reason>" in msg and "1. Observed: <" in msg
     msg = gate.owed_message({"body": MISSING, "labels": ["bug"], "created_at": NOW})
-    assert "no `## Verification` section" in msg
-    assert gate.owed_message({"body": SIX, "labels": [], "created_at": NOW}) == ""
+    assert "no `## Premise checks` section" in msg and "not Verification" in msg
+    assert gate.owed_message({"body": NEW_PROBLEM, "labels": [], "created_at": NOW}) == ""
 
 
 def test_owed_answers_adds_no_module_import_to_the_action_script():
@@ -348,17 +372,18 @@ def test_1_a_literal_body_with_no_section_blocks(monkeypatch, capsys):
     assert code == 2 and not out
     assert "BLOCKED (issue premise check)" in err
     assert "no `## Premise checks` section" in err
-    for n in range(1, 7):
-        assert f"  {n}. <" in err
+    for n, (label, _) in enumerate(gate._plan_gate.FORM, start=1):
+        assert f"  {n}. {label}: <" in err
     assert "python3 scripts/premise_gate.py check" in err
 
 
 def test_2_a_partial_body_names_exactly_the_missing_answers(monkeypatch, capsys, tmp_path):
-    code, _, err = _call(monkeypatch, capsys, _create("-F", str(_file(tmp_path, PARTIAL))))
+    partial = NEW_PARTIAL.replace("3. Cost: every PR, counted from CI runs.", "3. Cost: <who or what is affected, how often, how that was measured>")
+    code, _, err = _call(monkeypatch, capsys, _create("-F", str(_file(tmp_path, partial))))
     assert code == 2
-    assert "answer 2 (repo searched for existing code, result written down) is missing" in err
-    assert "answer 6 (" in err and "is only a <placeholder>" in err
-    for n in (1, 3, 4, 5):
+    assert "answer 5 (Acceptance) has no `Wrong fix:` answer" in err
+    assert "answer 3 (" in err and "is only a `<placeholder>`" in err
+    for n in (1, 2, 4):
         assert f"answer {n} (" not in err
     assert f"(body read from {tmp_path / 'issue.md'})" in err
 
@@ -405,8 +430,8 @@ def test_after_the_epoch_a_bug_label_owes_the_problem_block_not_verification(
 
 
 def test_3_a_complete_body_passes_silently(monkeypatch, capsys):
-    assert _call(monkeypatch, capsys, _create(_b(SIX))) == (0, "", "")
-    na = SIX.replace("5. No numbers.", "5. n/a — there are no numbers here.")
+    assert _call(monkeypatch, capsys, _create(_b(NEW_PROBLEM))) == (0, "", "")
+    na = NEW_PROBLEM.replace("5. No numbers.", "5. n/a — there are no numbers here.")
     assert _call(monkeypatch, capsys, _create(_b(na))) == (0, "", "")
 
 
@@ -415,11 +440,13 @@ def test_3_a_complete_body_passes_silently(monkeypatch, capsys):
     [("--label", "bug"), ("-l", "docs,bug"), ("-l", "docs", "-l", "bug"), ("--label=bug",)],
 )
 def test_4_a_bug_label_owes_the_verification_section(monkeypatch, capsys, tmp_path, labels):
-    # SIX carries code spans; a backtick in a --body value is unknown, so read it from a file
-    six = _file(tmp_path, SIX, "six.md")
-    code, _, err = _call(monkeypatch, capsys, _create(*labels, "-F", str(six)))
+    """Until the epoch only; after it a `bug` create owes the Problem block
+    (test_after_the_epoch_a_bug_label_owes_the_problem_block_not_verification)."""
+    complete = _file(tmp_path, NEW_PROBLEM, "complete.md")
+    extra = _UNTIL_THE_EPOCH
+    code, _, err = _call(monkeypatch, capsys, _create(*labels, "-F", str(complete)), extra=extra)
     assert code == 2 and "## Verification" in err
-    assert _call(monkeypatch, capsys, _create(*labels, _b(VERIFIED)))[0] == 0
+    assert _call(monkeypatch, capsys, _create(*labels, _b(VERIFIED)), extra=extra)[0] == 0
 
 
 def test_5_a_bug_form_body_passes(monkeypatch, capsys):
@@ -498,7 +525,7 @@ def test_14f_a_hung_git_config_read_is_target_unknown(monkeypatch, capsys, tmp_p
 def test_7_heredoc_bodies_the_parser_excised_are_judged(monkeypatch, capsys):
     plain = _create("-F", "- <<'EOF'") + "\n" + MISSING + "\nEOF"
     assert _call(monkeypatch, capsys, plain)[0] == 2
-    assert _call(monkeypatch, capsys, _create("-F", "- <<'EOF'") + "\n" + SIX + "EOF")[0] == 0
+    assert _call(monkeypatch, capsys, _create("-F", "- <<'EOF'") + "\n" + NEW_PROBLEM + "EOF")[0] == 0
     idiom = _create("--body \"$(cat <<'EOF'") + "\n" + MISSING + '\nEOF\n)"'
     assert _call(monkeypatch, capsys, idiom)[0] == 2
     piped = "cat f.md | " + _create("-F", "-")
@@ -566,14 +593,14 @@ def test_10b_a_body_whose_text_is_a_flag_is_judged(monkeypatch, capsys):
 
 
 def test_11_the_body_file_wins_and_the_last_one_counts(monkeypatch, capsys, tmp_path):
-    good = _file(tmp_path, SIX, "good.md")
+    good = _file(tmp_path, NEW_PROBLEM, "good.md")
     bad = _file(tmp_path, MISSING, "bad.md")
     assert _call(monkeypatch, capsys, _create(_b(MISSING), "-F", str(good)))[0] == 0
     assert _call(monkeypatch, capsys, _create("-F", str(good), _b(MISSING)))[0] == 0
-    assert _call(monkeypatch, capsys, _create("-F", str(bad), _b(SIX)))[0] == 2
+    assert _call(monkeypatch, capsys, _create("-F", str(bad), _b(NEW_PROBLEM)))[0] == 2
     assert _call(monkeypatch, capsys, _create("-F", str(good), "-F", str(bad)))[0] == 2
     assert _call(monkeypatch, capsys, _create("-F", str(bad), "-F", str(good)))[0] == 0
-    assert _call(monkeypatch, capsys, _create(_b(SIX), _b(MISSING)))[0] == 2
+    assert _call(monkeypatch, capsys, _create(_b(NEW_PROBLEM), _b(MISSING)))[0] == 2
 
 
 def test_12_issue_new_is_judged(monkeypatch, capsys):
@@ -716,7 +743,7 @@ def test_16_compound_and_nested_creates(monkeypatch, capsys):
     assert code == 2 and "the ENTIRE command was discarded" not in err  # one step: no note
     inner = _create(_b(MISSING))
     assert _call(monkeypatch, capsys, "bash -c " + shlex.quote(inner))[0] == 2
-    two = _create(_b(SIX)) + " && " + _create(_b(MISSING))
+    two = _create(_b(NEW_PROBLEM)) + " && " + _create(_b(MISSING))
     assert _call(monkeypatch, capsys, two)[0] == 2
 
 
@@ -726,7 +753,7 @@ def test_17_unreadable_commands_pass(monkeypatch, capsys):
     cont = "gh issue create -R acme/widget \\\n -t x " + _b(MISSING)
     assert _call(monkeypatch, capsys, cont)[0] == 0
     assert _call(monkeypatch, capsys, _create("positional", _b(MISSING)))[0] == 0
-    assert _call(monkeypatch, capsys, _create('-l "$L"', _b(SIX)))[0] == 0
+    assert _call(monkeypatch, capsys, _create('-l "$L"', _b(NEW_PROBLEM)))[0] == 0
     assert _call(monkeypatch, capsys, _create('-F "$HOME/x.md"'))[0] == 0
 
 
@@ -920,31 +947,36 @@ def test_r1_web_and_editor_are_read_by_their_value(monkeypatch, capsys, flags, e
 
 def test_r1_a_label_names_bug_in_any_case(monkeypatch, capsys):
     """gh resolves `-l Bug` to the repo's `bug` label (EqualFold), so the opened event
-    carries `bug` and the server owes the verification section."""
-    assert _call(monkeypatch, capsys, _create("-l", "Bug", _b(VERIFIED)))[0] == 0
-    code, _, err = _call(monkeypatch, capsys, _create("-l", "docs,BUG", _b(MISSING)))
+    carries `bug` and the server owes the verification section (until the epoch)."""
+    extra = _UNTIL_THE_EPOCH
+    assert _call(monkeypatch, capsys, _create("-l", "Bug", _b(VERIFIED)), extra=extra)[0] == 0
+    code, _, err = _call(monkeypatch, capsys, _create("-l", "docs,BUG", _b(MISSING)), extra=extra)
     assert code == 2 and "## Verification" in err
 
 
+@pytest.mark.parametrize("epoch", [_AFTER, _BEFORE])
 @pytest.mark.parametrize("spelling", ["bug", "Bug", "BUG", "docs,Bug"])
-@pytest.mark.parametrize("body", ["MISSING", "SIX", "VERIFIED"])
+@pytest.mark.parametrize("body", ["MISSING", "SIX", "NEW_PROBLEM", "VERIFIED"])
 def test_r1_the_hook_and_the_server_agree_on_a_label_in_any_case(
-    monkeypatch, capsys, tmp_path, spelling, body
+    monkeypatch, capsys, tmp_path, spelling, body, epoch
 ):
     """Parity through the label resolution: the hook sees what was typed, the server
-    sees the repo's own label name, which gh matched case-insensitively."""
-    text = {"MISSING": MISSING, "SIX": SIX, "VERIFIED": VERIFIED}[body]
+    sees the repo's own label name, which gh matched case-insensitively. Before the
+    epoch the label decides the section, so the case handling is what is tested."""
+    monkeypatch.setenv("_TEST_PREMISE_FORM_EPOCH", epoch)  # before the server call too
+    text = {"MISSING": MISSING, "SIX": SIX, "NEW_PROBLEM": NEW_PROBLEM, "VERIFIED": VERIFIED}[body]
     resolved = [{"name": "docs" if x.lower() == "docs" else "bug"} for x in spelling.split(",")]
     issue = {"number": 1, "body": text, "labels": resolved, "created_at": NOW}
     server_adds = "premises-missing" in gate.decide({"action": "opened", "issue": issue}).add
     f = _file(tmp_path, text)
-    code = _call(monkeypatch, capsys, _create("-l", spelling, "-F", str(f)))[0]
-    assert (code == 2) == server_adds, (spelling, body, code)
+    extra = {"_TEST_PREMISE_FORM_EPOCH": epoch}
+    code = _call(monkeypatch, capsys, _create("-l", spelling, "-F", str(f)), extra=extra)[0]
+    assert (code == 2) == server_adds, (spelling, body, epoch, code)
 
 
 def test_r1_the_heredoc_idiom_is_matched_whole(monkeypatch, capsys):
     """A tail concatenated after the idiom's `)"` is part of the body gh receives."""
-    section = SIX[SIX.index("## Premise checks") :].replace("`", "")
+    section = NEW_PROBLEM[NEW_PROBLEM.index("## Premise checks") :].replace("`", "")
     idiom = _create("--body \"$(cat <<'EOF'") + "\nintro\nEOF\n)\"'\n" + section + "'"
     assert _call(monkeypatch, capsys, idiom)[0] == 0
     plain = _create("--body \"$(cat <<'EOF'") + "\n" + MISSING + '\nEOF\n)"'
@@ -956,7 +988,7 @@ def test_r1_a_writer_that_does_not_look_like_one_makes_the_file_unknown(
 ):
     """An earlier step can write the file without looking like a writer: `rg --pre`
     runs a program, and a process substitution has no segment of its own."""
-    six = _file(tmp_path, SIX, "six.md")
+    six = _file(tmp_path, NEW_PROBLEM, "six.md")
     f = _file(tmp_path, MISSING)
     create = _create("-F", str(f))
     assert _call(monkeypatch, capsys, create)[0] == 2  # control
@@ -971,7 +1003,7 @@ def test_r2_earlier_steps_on_the_allow_list_let_a_body_file_be_read(monkeypatch,
     write a file, so a body file behind them is read. MEASURED over 776 real creates:
     217 literal-path `-F` creates went unread, 133 behind only a `cd`."""
     f = _file(tmp_path, MISSING, "missing.md")
-    six = _file(tmp_path, SIX, "six.md")
+    six = _file(tmp_path, NEW_PROBLEM, "six.md")
     for step in (
         f"cd {tmp_path}",
         f"grep -nE 'premise|Summary' {f}",
@@ -1109,7 +1141,7 @@ def test_the_prefilter_skips_the_parser_import(tmp_path):
     names = _imported(res.stderr)
     assert "hook_input" in names, "the importtime probe saw nothing; fix the probe"
     assert not {"shell_parse", "premise_gate", "plan_doc"} & names
-    res = _subprocess(_HOOK, _create(_b(SIX)), args=("-X", "importtime"))
+    res = _subprocess(_HOOK, _create(_b(NEW_PROBLEM)), args=("-X", "importtime"))
     assert {"shell_parse", "premise_gate"} <= _imported(res.stderr)
 
 
@@ -1237,7 +1269,7 @@ def test_the_generated_matrix(monkeypatch, capsys, tmp_path):
     wrong = []
     blocks = 0
     for i, (sub, shape, rpos, wrap, kind, dispatched) in enumerate(cells):
-        body = SIX if kind == "complete" else MISSING
+        body = NEW_PROBLEM if kind == "complete" else MISSING
         cmd = _shape_command(sub, shape, rpos, wrap, body, tmp_path / f"b{i}.md")
         expect = (
             2 if (not dispatched and kind == "missing" and _judged(sub, shape, rpos, wrap)) else 0

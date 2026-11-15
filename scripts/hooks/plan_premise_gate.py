@@ -138,7 +138,7 @@ _NEW_FORM_FIRST = re.compile(r"\s*(?:observed\s*:|problem\s*:\s*as\s+#\d)", re.I
 #: switched the issue forms and the docs, to a time after that change merged,
 #: so an issue filed from the old forms before the merge is never labelled for
 #: it. ``_TEST_PREMISE_FORM_EPOCH`` overrides it in tests that run the hook as a
-#: subprocess (``none`` pins it unset), so no test depends on today's date
+#: subprocess, so no test depends on today's date
 #: (``issue_premise_gate`` stamps a new issue with the wall clock). Write it as GitHub writes
 #: ``created_at`` (``YYYY-MM-DDTHH:MM:SSZ``, like ``GATE_EPOCH``): issues compare
 #: it as a string.
@@ -147,8 +147,6 @@ FORM_EPOCH: str | None = "2026-11-22T00:00:00Z"
 
 def form_epoch() -> str | None:
     override = os.environ.get("_TEST_PREMISE_FORM_EPOCH")
-    if (override or "").strip().lower() == "none":  # a test pins the epoch unset
-        return None
     return override if override else FORM_EPOCH
 
 
@@ -285,7 +283,18 @@ def form_problems(
             continue
         main, subtext = fields
         if field_empty(main):
-            out.append((n, "is missing or empty"))
+            # An answer written inside the template's brackets is told so, not
+            # only that it is empty (the six-question path's `_problem` reads
+            # the whole answer; this reads the field after its label).
+            rest = _LEADING_LABELS.sub("", main, count=1)
+            rest = rest.replace("\u200b", "")
+            only_placeholder = bool(_PLACEHOLDER.search(rest)) and not _PLACEHOLDER.sub("", rest).strip()
+            why = (
+                "is only a `<placeholder>`: replace it, brackets included"
+                if only_placeholder
+                else "is missing or empty"
+            )
+            out.append((n, why))
             continue
         sub = _SUBLABELS.get(n)
         if sub and field_empty(subtext):

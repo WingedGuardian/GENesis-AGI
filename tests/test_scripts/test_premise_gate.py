@@ -22,14 +22,13 @@ gate = private_module("premise_gate_under_test", _SCRIPT)
 
 @pytest.fixture(autouse=True)
 def _six_question_rule(monkeypatch: pytest.MonkeyPatch) -> None:
-    """These tests pin the epoch unset. For the label job that is the rule issues
-    created before ``FORM_EPOCH`` still follow. For the ``devin-ready`` guard and
-    ``check`` it is the rule from before the switch: they now owe the nine
-    whatever the date, so here they pin the guard's mechanics (removal, the
-    aside comment, the one-comment rule), not which form passes. The shipped
-    epoch's rules are tested in ``test_premise_form.py``."""
-    monkeypatch.setattr(gate._plan_gate, "FORM_EPOCH", None)
+    """These tests run at the SHIPPED epoch, the rules production applies. Their
+    issues are created before it, so the label job judges them by the old rule
+    those issues keep (a complete six passes), while the ``devin-ready`` guard
+    and ``check`` owe all nine whatever the date. The nine-item rules in detail
+    are tested in ``test_premise_form.py``."""
     monkeypatch.delenv("_TEST_PREMISE_FORM_EPOCH", raising=False)
+    assert gate._plan_gate.FORM_EPOCH is not None
 
 
 _COMPLETE = """## Summary
@@ -42,6 +41,23 @@ Do the thing in `scripts/x.py`.
 4. Caller: the CI job, tracked by #42.
 5. No numbers.
 6. About 100 counted lines, one PR.
+"""
+
+#: A complete section in the nine-item form: what a paid build (devin-ready,
+#: check) owes now that FORM_EPOCH is set, whatever the issue's date.
+_NINE = """## Summary
+Do the thing in `scripts/x.py`.
+
+## Premise checks
+1. Observed: the guard reports a merged migration as deleted (main at abc123); not a stale tree.
+2. Intended: a migration merged after checkout is not reported. Stated: docs/x.md:40
+3. Cost: every PR opened before a migration lands, counted from CI runs.
+4. Searched: issues for "migration guard", main and rulings; nothing.
+5. Acceptance: a merged migration passes, a deleted one is still reported. Wrong fix: pinning the base to HEAD.
+6. Mechanism: compare against the merge base; the CI step passes it.
+7. Alternatives: the existing base helper decides this; reused.
+8. Evidence: the measured CI runs above.
+9. Shape: about 40 counted lines, one PR.
 """
 
 _FORM_EMPTY = "### Summary\n\nDo the thing.\n\n### Premise checks\n\n_No response_\n"
@@ -126,19 +142,26 @@ def test_devin_ready_without_answers_is_removed_with_an_aside_comment() -> None:
     assert plan.remove == ["devin-ready"]
     assert plan.add == ["premises-missing"]
     assert plan.comment.startswith("(aside)\n")
-    assert "6 of 6" in plan.comment
+    assert "9 of 9" in plan.comment
 
 
 def test_the_comment_names_only_the_missing_answers() -> None:
-    body = _COMPLETE.replace("3. Scope reuses the shared reader.", "3. n/a")
+    body = _NINE.replace("7. Alternatives: the existing base helper decides this; reused.", "7. Alternatives: n/a")
     plan = gate.decide(_event("labeled", body, labels=["devin-ready"], label="devin-ready"))
-    assert "1 of 6" in plan.comment and "3. scope limits" in plan.comment
-    assert "1. outside-behaviour" not in plan.comment
+    assert "1 of 9" in plan.comment and "7. Alternatives" in plan.comment
+    assert "1. Observed" not in plan.comment
 
 
 def test_devin_ready_on_a_complete_issue_stays() -> None:
-    plan = gate.decide(_event("labeled", _COMPLETE, labels=["devin-ready"], label="devin-ready"))
+    plan = gate.decide(_event("labeled", _NINE, labels=["devin-ready"], label="devin-ready"))
     assert not plan.add and not plan.remove and not plan.comment
+
+
+def test_devin_ready_on_a_complete_six_is_removed_naming_the_conversion() -> None:
+    """The guard ignores the issue's date: a paid build owes the nine."""
+    plan = gate.decide(_event("labeled", _COMPLETE, labels=["devin-ready"], label="devin-ready"))
+    assert plan.remove == ["devin-ready"] and gate.CONVERSION_NOTE in plan.comment
+    assert not plan.add  # its OWN section, the six, is complete for an issue of its date
 
 
 def test_the_guard_ignores_grandfathering() -> None:
@@ -276,7 +299,7 @@ def test_another_label_event_does_nothing_even_with_devin_ready_present() -> Non
 def test_the_guard_clears_a_stale_missing_label_on_a_complete_issue() -> None:
     plan = gate.decide(
         _event(
-            "labeled", _COMPLETE, labels=["devin-ready", "premises-missing"], label="devin-ready"
+            "labeled", _NINE, labels=["devin-ready", "premises-missing"], label="devin-ready"
         )
     )
     assert plan.remove == ["premises-missing"] and not plan.comment
@@ -364,11 +387,11 @@ def test_one_empty_verification_answer_is_enough_to_label() -> None:
     assert gate.decide(_event("opened", body, labels=["bug"])).add == ["premises-missing"]
 
 
-def test_devin_ready_on_a_verified_bug_still_needs_the_six_premise_answers() -> None:
+def test_devin_ready_on_a_verified_bug_still_needs_the_nine_premise_answers() -> None:
     plan = gate.decide(
         _event("labeled", _VERIFIED, labels=["bug", "devin-ready"], label="devin-ready")
     )
-    assert plan.remove == ["devin-ready"] and "6 of 6" in plan.comment
+    assert plan.remove == ["devin-ready"] and "9 of 9" in plan.comment
 
 
 # -- the workflow file itself ---------------------------------------------------
@@ -444,7 +467,7 @@ def test_the_guard_keeps_the_label_when_a_bug_lacks_its_verification() -> None:
     plan = gate.decide(
         _event(
             "labeled",
-            _COMPLETE,
+            _NINE,
             labels=["bug", "premises-missing", "devin-ready"],
             label="devin-ready",
         )
@@ -452,7 +475,7 @@ def test_the_guard_keeps_the_label_when_a_bug_lacks_its_verification() -> None:
     assert plan.remove == [] and plan.add == [] and not plan.comment
 
 
-def test_the_guard_on_a_verified_bug_without_the_six_removes_devin_and_the_label() -> None:
+def test_the_guard_on_a_verified_bug_without_the_premise_answers_removes_devin_and_the_label() -> None:
     plan = gate.decide(
         _event(
             "labeled",
@@ -597,11 +620,11 @@ def no_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gate.subprocess, "run", refuse)
 
 
-def test_check_passes_an_issue_with_the_six(
+def test_check_passes_an_issue_with_the_nine(
     capsys: pytest.CaptureFixture[str], no_subprocess: None
 ) -> None:
     gh = _FakeGh()
-    assert gate.main(["check", "7"], gh, lambda n: _issue(_COMPLETE)) == 0
+    assert gate.main(["check", "7"], gh, lambda n: _issue(_NINE)) == 0
     assert "issue 7: ready for devin-ready" in capsys.readouterr().out
     assert gh.calls == []
 
@@ -612,19 +635,19 @@ def test_check_names_every_missing_answer(
     gh = _FakeGh()
     assert gate.main(["check", "#7"], gh, lambda n: _issue("bare")) == 1
     out = capsys.readouterr().out
-    assert [f"missing premise answer {n}:" in out for n in range(1, 7)] == [True] * 6
+    assert [f"missing premise answer {n}:" in out for n in range(1, 10)] == [True] * 9
     assert "NOT ready" in out and "verification" not in out
     assert gh.calls == []
 
 
-def test_check_on_a_verified_bug_still_needs_the_six(capsys: pytest.CaptureFixture[str]) -> None:
+def test_check_on_a_verified_bug_still_needs_the_premise_answers(capsys: pytest.CaptureFixture[str]) -> None:
     assert gate.main(["check", "7"], _FakeGh(), lambda n: _issue(_VERIFIED, "bug")) == 1
     out = capsys.readouterr().out
     assert "missing premise answer 1:" in out and "missing verification" not in out
 
 
 def test_check_lists_missing_verification_on_a_bug(capsys: pytest.CaptureFixture[str]) -> None:
-    assert gate.main(["check", "7"], _FakeGh(), lambda n: _issue(_COMPLETE, "bug")) == 0
+    assert gate.main(["check", "7"], _FakeGh(), lambda n: _issue(_NINE, "bug")) == 0
     out = capsys.readouterr().out
     assert "missing verification answer 5:" in out and "issue 7: ready for devin-ready" in out
 
@@ -635,10 +658,10 @@ def test_check_reports_an_unreadable_issue(read: object) -> None:
 
 
 def test_check_counts_a_partial_answer_set(capsys: pytest.CaptureFixture[str]) -> None:
-    partial = _COMPLETE.replace("5. No numbers.\n", "5.\n")
+    partial = _NINE.replace("8. Evidence: the measured CI runs above.\n", "8.\n")
     assert gate.main(["check", "7"], _FakeGh(), lambda n: _issue(partial)) == 1
     out = capsys.readouterr().out
-    assert "missing premise answer 5:" in out and "(1 of 6 missing)" in out
+    assert "missing premise answer 8:" in out and "(1 of 9 missing)" in out
 
 
 @pytest.mark.parametrize(

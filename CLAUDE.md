@@ -717,7 +717,8 @@ gate works, its exemption categories, and the unit rules for size bounds:
   9. Shape: expected size in counted lines (`python3 scripts/pr_shape.py --base origin/main`), and the split or the `Shape:` reason. The rule (`.claude/docs/premise-check.md`, step 6): under 500 is the target, 500-1,000 carries a `Shape:` reason, and over 1,000 needs user approval. It is a guideline the session weighs; from 500 to 1,000 a stated reason is enough. Prefer one concern per PR (one mechanism a reviewer can accept or reject alone).
   An issue owes items 1 to 5 (and 6 to 9 if it writes any of them); a plan, and
   an issue handed to Devin, owe all nine.
-  `1. Problem: as #<N>` stands for items 1 to 5 when that issue answers them.
+  In a plan or PR body, `1. Problem: as #<N>` stands for items 1 to 5 when that
+  issue answers them; an issue writes its own.
 - **Rework is a contract with two sides.** A send-back's spec is
   decision-complete: what is kept, what is deleted, the shape, the split plan,
   and every question either answered or explicitly delegated. It never ends in

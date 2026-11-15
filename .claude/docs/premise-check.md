@@ -44,7 +44,9 @@ existing code and scope limits to 7, the caller to 6, the shape to 9.
 **The switch** (`FORM_EPOCH` in `scripts/hooks/plan_premise_gate.py`, 2026-11-22).
 Plans and `devin-ready` owe the nine-item form now. An issue created on or after
 the epoch owes it; one created before it keeps the old rule, under which a
-complete six-question section still passes, so no older issue changes state. A
+complete six-question section still passes, so no older issue changes its label
+state. `devin-ready` is different: it owes the nine on any issue, whatever its
+date, so applying it to a complete six removes it again. A
 six-question section that no longer completes something is answered with the
 mapping above.
 
