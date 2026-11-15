@@ -239,7 +239,9 @@ async def test_ingest_classified_extraction(db_with_schema, mock_store):
     assert row is not None
     assert row[0] == "reference"
     assert row[1] == "reference.credentials"
-    assert row[2] == "HobbyForum"
+    # The key is opaque; the name is the body's header line.
+    assert row[2].startswith("cred-")
+    assert row[3].startswith("[reference.credentials] HobbyForum\n")
     # The description and the value are held out together (#2426): the body
     # carries the identifier, the placeholders and the trailer only.
     assert "Passw0rd!x9z" not in row[3]

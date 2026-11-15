@@ -193,7 +193,7 @@ async def test_no_realistic_write_is_refused(db, name, value, identifier, kept, 
     assert json.loads(row["tags"]) == ["reference", "credentials", *kept], name
     for tag in dropped:
         assert all(tag not in text for text in await _indexed(db, store, unit)), tag
-    assert row["concept"] == identifier
+    assert ro.display_name(row) == identifier
 
 
 async def test_a_mismatched_header_is_checked_strictly(db):

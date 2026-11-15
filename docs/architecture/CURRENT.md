@@ -184,10 +184,33 @@ Easy-to-forget mechanisms:
   secret a unit stops naming (repointed or deleted);
   `knowledge_crud.sweep_orphan_secrets` (after every delete, and at boot)
   removes secrets older than an hour that an interrupted upsert left unnamed.
-  `ingest_knowledge_unit(insert_only=True)` and `knowledge_crud.upsert(insert_only=True)`
-  never change an existing credential key (a different value raises
-  `CredentialKeyTaken`); no writer passes it yet: it is the mechanism a later
-  change wires the extraction job's auto-capture to.
+  **A credential's key is opaque and its identity is the hash of its name.**
+  A new credential is stored under `concept = cred-<12 hex>`
+  (`secrets.token_hex(6)`, checked absent), never derived from the name or the
+  value; the name is the body's header line. `knowledge_units.name_hash`
+  (`reference_ops.name_hash`: card-redacted, NFKC, format characters removed,
+  casefolded, whitespace collapsed, sha256) and `name_origin` (`trusted`,
+  `untrusted`, `carded`) are written by the INSERT and never changed by an
+  update. A trusted write by name updates the earliest trusted entry with that
+  hash, else an entry with no hash yet whose recorded name matches (a legacy
+  plain key, or one with a trailing ` #xxxxxx` removed), which that write gives
+  the hash; else it mints a new key. A partial unique index
+  (`idx_knowledge_units_name_hash`, trusted rows with a 64-character hash) makes
+  concurrent first saves of a name one entry. `entry_key=` (trusted callers,
+  credentials only; `reference_store(entry_key=...)`) writes to an existing
+  entry by key and keeps its recorded name; an unknown key is refused with
+  nothing written, and text that reads like a key passed as an identifier is a
+  name. Any update keeps the name the entry records. An insert-only write
+  returns an untrusted entry under that hash with the same value and
+  description, else adds a new entry; it never updates one. A card-redacted name
+  reuses an entry only when it holds the same value. Migration
+  `20261115060803_credential_name_hash` backfills existing credentials; of
+  legacy names differing only in case the earliest keeps the hash, and each
+  later one gets one the index leaves out (still stored, revealable,
+  deletable). The dashboard list and `reference_lookup` show the name
+  (`reference_ops.display_name`); lookup results carry the key as `concept`.
+  `ingest_knowledge_unit(insert_only=True)` has no writer yet: it is the
+  mechanism a later change wires the extraction job's auto-capture to.
   Two `knowledge_units` triggers refuse a
   credential body without exactly one placeholder line, whichever process
   writes it (text on a later line only the Python check sees).
@@ -202,8 +225,8 @@ Easy-to-forget mechanisms:
   (`knowledge_crud.KeyObservation`: absent, or the secret and point it named),
   checked inside the one statement that writes the unit, so a same-key writer
   in another process that commits in between makes it write nothing
-  (`CredentialKeyChanged`); the ingest then re-reads and runs once more, and
-  a second change reaches the caller.
+  (`CredentialKeyChanged`); the ingest then re-reads and runs again, up to five
+  times, so every writer in a race lands, and a sixth change reaches the caller.
   Only `reference_ops` reads the secret row: `compose_body` puts the value and
   the description back for `reference_lookup` (behind its audit log),
   `reveal_reference` returns both for the dashboard's reveal, and
@@ -211,7 +234,7 @@ Easy-to-forget mechanisms:
   read, they re-read the unit's current body, value and description with one
   statement (`knowledge_crud.get_reference_pair`), so a body never comes back
   beside another write's secret. A credential is therefore found by its
-  identifier and tags only; the dashboard list shows the description placeholder. Identifier kinds (url, network,
+  name and tags only; the dashboard list shows the description placeholder. Identifier kinds (url, network,
   account, fact) keep their value in the body, because it is what their lookups
   search for. NOT covered yet: the episodic memory the extraction job stores
   for the same conversation text, which still carries an auto-captured value.
