@@ -1,10 +1,11 @@
 """Masking a held-out credential value in the fields that are indexed (#2426).
 
-The probes of a value (``reference_ops._value_probes``) feed ``ValueMask`` and
-its span matcher, the probe sets a write builds (``value_masks``), and the caps
-that cut a masked field never through a mask. Every indexed field of a
-credential (its identifier and tags) is masked with these before it is stored;
-the original is held in ``reference_secrets``.
+Split out of ``reference_ops`` (which re-exports the public names): the probes
+of a value (``_value_probes``), ``ValueMask`` and its span matcher, the probe
+sets a write builds (``value_masks``), and the caps that cut a masked field
+never through a mask. Every indexed field of a credential (its identifier and
+tags) is masked with these before it is stored; the original is held in
+``reference_secrets``.
 """
 
 from __future__ import annotations
@@ -12,20 +13,129 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from urllib.parse import unquote
 
 from genesis.db.crud.knowledge import DETAIL_PLACEHOLDER, SECRET_PLACEHOLDER
-from genesis.memory.reference_ops import (
-    _SPACING,
-    _TOKEN_EDGE,
-    _decoded,
-    _normalise,
-    _secret_token,
-    _value_probes,
-)
 
 #: What a masked span of a held-out value reads as in an indexed field. Short,
 #: fixed, and no credential keyword, so it is no secret-scanner hit.
 HELD_MASK = "[held]"
+
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_MIN_TOKEN = 4
+_TOKEN_EDGE = ".,;:!?()[]{}\"'"  # noqa: S105 - punctuation, not a secret
+
+
+_ASCII_DIGIT = re.compile(r"[0-9]")
+_ASCII_ALPHA = re.compile(r"[A-Za-z]")
+_ASCII_SYMBOL = re.compile(r"[^0-9A-Za-z]")
+
+
+def _secret_token(token: str) -> bool:
+    """A whitespace token that reads as a secret rather than a word: at least
+    four characters, letters or digits mixed with a digit or a symbol. Plain
+    words ("password", "Router") and email addresses never qualify."""
+    if len(token) < _MIN_TOKEN or _EMAIL.match(token):
+        return False
+    if token.isascii():
+        # The same three tests on ASCII, in C (an upload holds out megabytes).
+        has_digit = _ASCII_DIGIT.search(token) is not None
+        has_symbol = _ASCII_SYMBOL.search(token) is not None
+        has_alpha = _ASCII_ALPHA.search(token) is not None
+        return (has_digit or has_symbol) and (has_alpha or (has_digit and has_symbol))
+    has_digit = any(c.isdigit() for c in token)
+    has_symbol = any(not c.isalnum() for c in token)
+    has_alpha = any(c.isalpha() for c in token)
+    return (has_digit or has_symbol) and (has_alpha or (has_digit and has_symbol))
+
+
+#: Whitespace ``_normalise`` changes: a character other than a space, or a run.
+_SPACING = re.compile(r"[^\S ]|  ")
+
+
+def _one_space(text: str) -> str:
+    """``text`` with every whitespace run one space (``str.split`` is the fast
+    path: an upload holds out megabytes)."""
+    if not _SPACING.search(text):
+        return text
+    words = text.split()
+    if not words:
+        return " "
+    return (" " if text[0].isspace() else "") + " ".join(words) + (" " if text[-1].isspace() else "")
+
+
+def _normalise(text: str) -> str:
+    """``text`` as the refusal check compares it: NFKC (a fullwidth or other
+    compatibility variant reads as its plain form), every format character
+    (Unicode category Cf: zero-width spaces and joiners, the soft hyphen)
+    removed, then casefolded, and every whitespace run read as one space (a
+    multi-word value spaced another way is the same value)."""
+    if text.isascii():
+        # NFKC leaves ASCII as it is, and no ASCII character is a format one.
+        return _one_space(text.casefold())
+    folded = unicodedata.normalize("NFKC", text)
+    plain = "".join(c for c in folded if unicodedata.category(c) != "Cf")
+    return _one_space(plain.casefold())
+
+
+def _decoded(text: str) -> set[str]:
+    """``text`` and its percent-decoded forms, up to three rounds."""
+    forms = {text}
+    for _ in range(3):
+        text = unquote(text)
+        forms.add(text)
+    return forms
+
+
+#: Where a structured value (a URL, a DSN, a key=value line, a header, XML,
+#: a pipe- or backslash-separated record) splits into its parts, applied to the
+#: NFKC form so fullwidth punctuation splits too. One generic fragmentation, no
+#: per-format parser.
+_FRAGMENT_SPLIT = re.compile(r"[\s:/@?&=#;,|\\<>\"'`(){}\[\]]+")
+#: A host name: dotted labels ending in an alphabetic top-level label.
+_HOSTNAME = re.compile(r"^(?:[a-z0-9-]+\.)+[a-z]{2,}$")
+_SCHEME = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]{0,31})://")
+
+
+def _value_probes(value: str, *, login_exempt: bool = False) -> list[tuple[str, bool]]:
+    """(probe, whole-word only) for the refusal check: the whole value, and
+    every secret-shaped fragment of it, normalised. The value is percent-decoded
+    (up to three rounds), NFKC-normalised and split on whitespace and
+    ``: / @ ? & = # ; , | \\ < > " ' ` ( ) { } [ ]``, so
+    the password, token or key inside a connection URL, a DSN or a
+    ``key=value`` line is a fragment of its own; a fragment that is a host name,
+    a URL scheme, or all digits (a port) is not probed. A secret that reads as
+    a plain word (all letters, or under four characters) is not secret-shaped,
+    so it is matched only as the whole value, and only as a whole word: an
+    ordinary word inside another is no match. That is a stated limit."""
+    whole = value.strip()
+    probes: dict[str, bool] = {}
+    for form in _decoded(whole) if whole else ():
+        probes.setdefault(_normalise(form), form.isalpha() or len(form) < _MIN_TOKEN)
+    # "login / secret" is the shape the capture writers format: with
+    # ``login_exempt`` (the identifier only, which names the account) the
+    # exact login half is not probed. Every other field is probed with the
+    # tokens of both halves.
+    login, sep, secret = whole.partition(" / ")
+    exempt = login.strip().strip(_TOKEN_EDGE) if login_exempt and sep and secret.strip() else None
+    for form in _decoded(whole):
+        schemes = {m.group(1).casefold() for m in _SCHEME.finditer(form)}
+        # Each distinct fragment once (the same output; a long value repeats).
+        for fragment in dict.fromkeys(_FRAGMENT_SPLIT.split(unicodedata.normalize("NFKC", form))):
+            fragment = fragment.strip(_TOKEN_EDGE)
+            folded = fragment.casefold()
+            if (
+                not fragment
+                or fragment == exempt
+                or fragment.isdigit()
+                or folded in schemes
+                or _HOSTNAME.match(folded)
+            ):
+                continue
+            if _secret_token(fragment):
+                probes.setdefault(_normalise(fragment), False)
+    probes.pop("", None)
+    return list(probes.items())
 
 
 #: Probes up to this long are looked up by every substring length present;
@@ -287,8 +397,8 @@ def _captured_probes(texts: list[str | None]) -> list[tuple[str, bool]]:
     """(probe, whole-word) of every secret the capture rules recognise in
     ``texts``: the secret whole (a plain word or digits as a whole word) and
     its secret-shaped fragments."""
-    # Imported here, not at load: reference_extraction imports knowledge_ingest,
-    # whose credential path is where this module is meant to be called from.
+    # Imported here: reference_extraction imports knowledge_ingest, whose
+    # credential path imports this module.
     from genesis.memory.reference_extraction import captured_secrets
 
     probes: list[tuple[str, bool]] = []
