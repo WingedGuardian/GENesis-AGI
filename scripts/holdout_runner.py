@@ -435,18 +435,28 @@ def _stop_git_group(proc: subprocess.Popen) -> None:
     if proc.pid <= 1:  # never signal group 1 or below: it would reach every process
         proc.wait()
         return
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(proc.pid, signal.SIGTERM)
-    deadline = time.monotonic() + GIT_STOP_GRACE_S
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        proc.wait(timeout=GIT_STOP_GRACE_S)
-    while time.monotonic() < deadline:
-        if not _group_alive(proc.pid):
-            break  # nothing in the group is still running
-        time.sleep(0.02)
-    else:
+    try:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGTERM)
+        deadline = time.monotonic() + GIT_STOP_GRACE_S
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=GIT_STOP_GRACE_S)
+        while time.monotonic() < deadline:
+            if not _group_alive(proc.pid):
+                break  # nothing in the group is still running
+            time.sleep(0.02)
+        else:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
+    except BaseException:
+        # Interrupted before the group is known to be gone: kill what is left
+        # and give the kill a moment to land, so the caller does not discard a
+        # tree a member is still writing.
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(proc.pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=1)
+        raise
     proc.wait()
 
 
@@ -692,7 +702,7 @@ class _Worktree:
     ``git worktree add`` registers the worktree LOCKED ("initializing") and
     unlocks it only when the checkout finishes, and ``git worktree prune``
     never drops a locked entry. So when the add itself is interrupted (a
-    SIGTERM or SIGHUP turned into ``SystemExit``, or the timeout), the
+    SIGTERM, SIGHUP or SIGINT turned into ``SystemExit``, or the timeout), the
     half-made worktree is discarded here before the exception propagates:
     ``__exit__`` does not run for an ``__enter__`` that raised. git runs the
     checkout in a child process, so the add runs in its own process group and
@@ -740,8 +750,7 @@ class _Worktree:
         except BaseException as exc:
             # A second signal during the cleanup is held, like the first one
             # during Popen, so it cannot skip the discard; it ends the run after.
-            later: list[int] = []
-            _deferred = later
+            _deferred = later = []  # first, before anything can check for signals
             try:
                 try:
                     _stop_git_group(proc)
@@ -763,6 +772,15 @@ class _Worktree:
         self._discard()
 
     def _discard(self) -> None:
+        # Unlock first: an add killed after git wrote its admin entry but before
+        # the tree's .git file leaves a locked entry that remove refuses and
+        # prune never drops, and unlock does not need the tree (#4703). So no
+        # locked registration survives, however the stop above ended.
+        subprocess.run(
+            ["git", "-C", str(self.root), "worktree", "unlock", str(self.path)],
+            capture_output=True,
+            check=False,
+        )
         subprocess.run(
             [
                 "git",
@@ -1208,7 +1226,11 @@ def cmd_at_ref(
 
 @contextlib.contextmanager
 def _signals_exit():
-    """Turn SIGTERM and SIGHUP into ``SystemExit`` so every ``finally`` runs.
+    """Turn SIGTERM, SIGHUP and SIGINT into ``SystemExit`` so every ``finally`` runs.
+
+    All three go through the same handler, so the deferral that holds a signal
+    while git starts and while its half-made worktree is cleaned up holds a
+    Ctrl-C too.
 
     A run killed by its caller (a tool timeout, a closed terminal) would
     otherwise leave its worktrees, its scratch and a running step behind.
@@ -1222,7 +1244,7 @@ def _signals_exit():
 
     previous = {}
     if threading.current_thread() is threading.main_thread():
-        for sig in (signal.SIGTERM, signal.SIGHUP):
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
             previous[sig] = signal.signal(sig, _exit)
     try:
         yield

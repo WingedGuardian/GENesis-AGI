@@ -1837,13 +1837,58 @@ def test_stopping_git_lets_it_clean_up_before_any_kill(tmp_path):
     assert not hr._group_alive(proc.pid)
 
 
+def test_the_discard_clears_a_locked_entry_whose_tree_has_no_git_file(repo, tmp_path):
+    """The state a SIGKILL'd add can leave (#4703): the admin entry is written and
+    locked, the tree's .git file is not. `git worktree remove` refuses it and
+    prune never drops a locked entry, so the discard unlocks first."""
+    root, _, _ = repo
+    before = _worktrees(root)
+    holder = tmp_path / "holder"
+    holder.mkdir()
+    tree = holder / "tree"
+    _git(root, "worktree", "add", "--detach", "--quiet", str(tree), "HEAD")
+    _git(root, "worktree", "lock", "--reason", "initializing", str(tree))
+    (tree / ".git").unlink()
+    refused = subprocess.run(
+        ["git", "-C", str(root), "worktree", "remove", "--force", "--force", str(tree)],
+        capture_output=True,
+    )
+    assert refused.returncode != 0  # the state this test is about
+    hr._Worktree(root, _git(root, "rev-parse", "HEAD"), holder, "tree")._discard()
+    shutil.rmtree(holder)  # what the runner's holder cleanup does next
+    _git(root, "worktree", "prune")
+    assert _locked_worktrees(root) == 0
+    assert _worktrees(root) == before
+
+
+def _signal_when(path, sig, limit=30.0):
+    """Send ``sig`` to this process once ``path`` exists, so a signal meant for
+    the cleanup never lands before the setup it depends on. ``.set()`` cancels."""
+    cancel = threading.Event()
+
+    def wait():
+        end = time.monotonic() + limit
+        while not path.exists():
+            if cancel.is_set() or time.monotonic() > end:
+                return
+            time.sleep(0.01)
+        if not cancel.is_set():
+            os.kill(os.getpid(), sig)
+
+    threading.Thread(target=wait, daemon=True).start()
+    return cancel
+
+
+@pytest.mark.parametrize("second", [signal.SIGHUP, signal.SIGINT], ids=["SIGHUP", "SIGINT"])
 def test_a_second_signal_during_the_cleanup_still_discards_the_worktree(
-    repo, tmp_path, monkeypatch, _scratch
+    repo, tmp_path, monkeypatch, _scratch, second
 ):
-    """A SIGHUP that lands while git's group is being stopped is held until the
-    discard has run, then ignored in favour of the first signal's exit code."""
+    """A SIGHUP or a Ctrl-C that lands while git's group is being stopped is held
+    until the discard has run, then ignored in favour of the first signal's exit
+    code."""
     root, _, _ = repo
     real_git = shutil.which("git")
+    ready = tmp_path / "ready"  # the wrapper's add has registered and locked
     bindir = tmp_path / "bin"
     bindir.mkdir()
     (bindir / "git").write_text(
@@ -1851,12 +1896,16 @@ def test_a_second_signal_during_the_cleanup_still_discards_the_worktree(
         'case " $* " in *" worktree add "*)\n'
         "  for a; do path=$prev; prev=$a; done\n"
         '  "' + str(real_git) + '" "$@" || exit $?\n'
+        "  trap '' TERM\n"  # before ready: it holds the lock and outlives SIGTERM
         '  "'
         + str(real_git)
         + '" -C "'
         + str(root)
         + '" worktree lock --reason initializing "$path"\n'
-        "  trap '' TERM; sleep 3;;\n"  # holds the lock and outlives SIGTERM: the discard must force it
+        + '  touch "'
+        + str(ready)
+        + '"\n'
+        "  sleep 3;;\n"  # the discard must force the locked tree
         "esac\n"
         'exec "' + str(real_git) + '" "$@"\n'
     )
@@ -1866,20 +1915,19 @@ def test_a_second_signal_during_the_cleanup_still_discards_the_worktree(
     real_stop = hr._stop_git_group
 
     def stop_with_a_second_signal(proc):
-        os.kill(os.getpid(), signal.SIGHUP)
+        os.kill(os.getpid(), second)
         real_stop(proc)
 
     monkeypatch.setattr(hr, "_stop_git_group", stop_with_a_second_signal)
     holdout = tmp_path / "HOLDOUT.md"
     holdout.write_text(_scenario("H-01", steps="sleep 60", expect="never"))
     before = _worktrees(root)
-    timer = threading.Timer(1.0, lambda: os.kill(os.getpid(), signal.SIGTERM))
-    timer.start()  # the add and its lock are done well within a second; the wrapper is still running
+    sender = _signal_when(ready, signal.SIGTERM)
     try:
         with pytest.raises(SystemExit) as exc:
             hr.main(["--at-ref", "HEAD", "--root", str(root), "--holdout", str(holdout)])
     finally:
-        timer.cancel()
+        sender.set()
     assert exc.value.code == 128 + signal.SIGTERM
     assert _worktrees(root) == before
     assert _locked_worktrees(root) == 0
@@ -1893,6 +1941,7 @@ def test_an_error_while_stopping_git_still_discards_the_worktree(
     half-made worktree is still discarded before the error propagates."""
     root, _, _ = repo
     real_git = shutil.which("git")
+    ready = tmp_path / "ready"  # the wrapper's add has registered and locked
     bindir = tmp_path / "bin"
     bindir.mkdir()
     (bindir / "git").write_text(
@@ -1905,6 +1954,9 @@ def test_an_error_while_stopping_git_still_discards_the_worktree(
         + '" -C "'
         + str(root)
         + '" worktree lock --reason initializing "$path"\n'
+        + '  touch "'
+        + str(ready)
+        + '"\n'
         "  sleep 3;;\n"
         "esac\n"
         'exec "' + str(real_git) + '" "$@"\n'
@@ -1921,12 +1973,11 @@ def test_an_error_while_stopping_git_still_discards_the_worktree(
     holdout = tmp_path / "HOLDOUT.md"
     holdout.write_text(_scenario("H-01", steps="sleep 60", expect="never"))
     before = _worktrees(root)
-    timer = threading.Timer(1.0, lambda: os.kill(os.getpid(), signal.SIGTERM))
-    timer.start()  # the add and its lock are done well within a second
+    sender = _signal_when(ready, signal.SIGTERM)
     try:
         rc = hr.main(["--at-ref", "HEAD", "--root", str(root), "--holdout", str(holdout)])
     finally:
-        timer.cancel()
+        sender.set()
     assert rc == 3
     assert "the stop failed" in capsys.readouterr().out
     assert _worktrees(root) == before
@@ -1969,6 +2020,26 @@ def test_a_process_name_that_is_not_utf8_does_not_break_the_group_check(tmp_path
     finally:
         proc.kill()
         proc.wait()
+
+
+def test_an_interrupt_while_stopping_kills_the_group_before_it_returns(tmp_path, monkeypatch):
+    """Cut short during its grace wait, the stop kills what is left of the group
+    before the interrupt propagates, so no member outlives it to write into a
+    tree the caller then discards."""
+    late, ready = tmp_path / "late", tmp_path / "ready"
+    # The leader exits at once; the member that outlives it ignores SIGTERM.
+    member = f"trap '' TERM; touch {ready}; sleep 1.5; touch {late}"
+    proc = subprocess.Popen(["sh", "-c", f'sh -c "{member}" &'], start_new_session=True)
+    _wait_for(ready)
+
+    def interrupted(_pgid):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(hr, "_group_alive", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        hr._stop_git_group(proc)
+    time.sleep(2)  # past the moment the member would have written
+    assert not late.exists(), "a group member outlived the interrupted stop"
 
 
 def test_a_git_that_ignores_sigterm_is_killed_after_the_grace(tmp_path, monkeypatch):
