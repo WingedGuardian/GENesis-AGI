@@ -199,7 +199,8 @@ class TestLaunchCreates:
 
     def test_ssh_origin_is_stripped_before_the_capacity_gate(self, door):
         """An SSH variable would make the gate offer an interactive reclaim."""
-        proc = door.launch(extra_env={"SSH_CONNECTION": "10.0.0.1 1 10.0.0.2 22"})
+        # RFC 5737 documentation addresses: never a real network.
+        proc = door.launch(extra_env={"SSH_CONNECTION": "192.0.2.1 1 198.51.100.2 22"})
         assert proc.returncode == 0, proc.stderr
         cap_calls = [
             ln for ln in door.state["py_log"].read_text().splitlines() if "session_cap" in ln
