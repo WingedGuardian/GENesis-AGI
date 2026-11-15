@@ -255,7 +255,7 @@ async def _init_standalone_health_actions(db) -> None:
         )
 
 
-def _prepare_health(*, external_profile: str | None = None) -> FastMCP:
+def _prepare_health(*, external_profile: str | None = None, module_owner=None) -> FastMCP:
     """Prepare the existing health server without starting its transport.
 
     Uses StandaloneHealthDataService which reads ~/.genesis/status.json
@@ -280,6 +280,15 @@ def _prepare_health(*, external_profile: str | None = None) -> FastMCP:
         svc = StandaloneHealthDataService(status_path=_DEFAULT_STATUS, db=None)
         tracker = ProviderActivityTracker()
         init_health_mcp(svc, activity_tracker=tracker)
+        if module_owner is not None:
+            @asynccontextmanager
+            async def _module_lifespan(server):
+                try:
+                    yield
+                finally:
+                    await module_owner.close()
+
+            mcp._lifespan = _module_lifespan
         clear_mcp_crash("health")
         return mcp
 
@@ -311,9 +320,37 @@ def _prepare_health(*, external_profile: str | None = None) -> FastMCP:
             clear_mcp_crash("health")
             yield
         finally:
-            from genesis.mcp.health.browser import async_cleanup as _browser_cleanup
-            await _browser_cleanup()
-            await db.close()
+            async def cleanup():
+                if module_owner is not None:
+                    await module_owner.close()
+                from genesis.mcp.health.browser import async_cleanup as _browser_cleanup
+                await _browser_cleanup()
+                await db.close()
+
+            if module_owner is None:
+                await cleanup()
+            else:
+                # Retain the whole owned teardown, not just the first closer.
+                # Unknown module drainage still withholds dependent closure.
+                import asyncio
+
+                import anyio
+
+                from genesis.util.tasks import tracked_task
+
+                task = tracked_task(cleanup(), name='module-health-teardown')
+                interrupted = False
+                with anyio.CancelScope(shield=True):
+                    while not task.done():
+                        try:
+                            await asyncio.shield(task)
+                        except asyncio.CancelledError:
+                            interrupted = True
+                        except Exception:
+                            break
+                task.result()
+                if interrupted:
+                    raise asyncio.CancelledError
 
     mcp._lifespan = _lifespan
     return mcp
@@ -729,8 +766,6 @@ def _local_frontend(args, argv):
         return None
 
     def run():
-        from functools import partial
-
         import anyio
 
         from genesis.mcp.shared_client import serve_stdio
@@ -738,11 +773,25 @@ def _local_frontend(args, argv):
 
         for handler in logging.getLogger().handlers:
             handler.addFilter(SafeDiagnostics())
-        server = _prepare_health() if args.server == "health" else _prepare_memory()
-        if server is None:
-            return
-        anyio.run(partial(serve_stdio, selected.settings, headers,
-                          local_server=server, stage=selected.stage))
+        async def execute():
+            if args.server == "health":
+                from genesis.mcp.health.module_ops import bind_resource_owner
+                from genesis.mcp.local_modules import ModuleResourceOwner
+
+                owner = ModuleResourceOwner(grace_s=selected.settings.shutdown_grace_s)
+                with bind_resource_owner(owner):
+                    try:
+                        server = _prepare_health(module_owner=owner)
+                        await serve_stdio(selected.settings, headers, local_server=server,
+                                          stage=selected.stage, module_owner=owner)
+                    finally:
+                        await owner.close()
+            else:
+                server = _prepare_memory()
+                if server is not None:
+                    await serve_stdio(selected.settings, headers, local_server=server, stage=selected.stage)
+
+        anyio.run(execute)
 
     return run
 

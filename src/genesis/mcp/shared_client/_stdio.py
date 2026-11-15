@@ -50,7 +50,7 @@ async def _peer_owner(owners, settings, header_factory, local_server, stage):
             yield peer
 
 
-async def serve(settings, header_factory, *, local_server=None, stage=None):
+async def serve(settings, header_factory, *, local_server=None, stage=None, module_owner=None):
     ready, output, peer = anyio.Event(), None, None
 
     async def refuse():
@@ -63,23 +63,27 @@ async def serve(settings, header_factory, *, local_server=None, stage=None):
 
     class RawInput:
         async def __aiter__(self):
-            async for raw in anyio.wrap_file(input_buffer):
-                try:
-                    body = validate_envelope(raw)
-                    text = raw.decode("utf-8", "strict")
-                    # Check the exact SDK JSON decoder too (e.g. a UTF-8 BOM),
-                    # so its parser cannot silently drop a raw-admitted frame.
-                    jsonrpc_message_adapter.validate_json(text, by_name=False)
-                    await ready.wait()
-                    if body.get("method") == "initialize" and body.get("id") is not None:
-                        peer.arm_initialize()
-                except ValueError:
-                    await ready.wait()
-                    # As for SDK request replies, sending must not hide input EOF
-                    # behind a non-reading peer. These tasks belong to the owner.
-                    peer.group.start_soon(refuse)
-                    continue
-                yield text
+            try:
+                async for raw in anyio.wrap_file(input_buffer):
+                    try:
+                        body = validate_envelope(raw)
+                        text = raw.decode("utf-8", "strict")
+                        # Retain both raw admission and the exact SDK decoder.
+                        jsonrpc_message_adapter.validate_json(text, by_name=False)
+                        await ready.wait()
+                        if body.get("method") == "initialize" and body.get("id") is not None:
+                            peer.arm_initialize()
+                    except ValueError:
+                        await ready.wait()
+                        # Refusal sends must not hide input EOF from the owner.
+                        peer.group.start_soon(refuse)
+                        continue
+                    yield text
+            finally:
+                if module_owner is not None:
+                    # Hold EOF/error propagation behind the retained drain so
+                    # the SDK cannot courtesy-cancel tools before their grace.
+                    await module_owner.close()
 
     input_buffer, restore_input = _claim_fd(0, sys.stdin, "rb", _open_stdin_diversion)
     output_buffer = restore_output = old_blocking = None

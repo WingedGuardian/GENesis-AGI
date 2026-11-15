@@ -6,6 +6,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
+from genesis.mcp.local_modules import ModuleCleanupUnconfirmed
 from genesis.modules.external.config import ProgramConfig
 from genesis.modules.external.ipc import create_ipc_adapter
 
@@ -28,10 +29,10 @@ class ExternalProgramAdapter:
     or data stores. Those remain the program's responsibility.
     """
 
-    def __init__(self, config: ProgramConfig) -> None:
+    def __init__(self, config: ProgramConfig, *, owner=None) -> None:
         self._config = config
         self._enabled = config.enabled
-        self._ipc = create_ipc_adapter(config.ipc)
+        self._ipc = create_ipc_adapter(config.ipc) if owner is None else create_ipc_adapter(config.ipc, owner=owner)
         self._runtime: Any = None
         self._healthy: bool = False
         self._last_health_error: str | None = None
@@ -231,6 +232,8 @@ class ExternalProgramAdapter:
                 method=method,
             )
             return result
+        except ModuleCleanupUnconfirmed:
+            raise
         except Exception as exc:
             logger.error(
                 "Operation '%s' failed on module '%s': %s",
@@ -252,6 +255,8 @@ class ExternalProgramAdapter:
             else:
                 self._last_health_error = self._last_health_error or "health check returned unhealthy"
             return self._healthy
+        except ModuleCleanupUnconfirmed:
+            raise
         except Exception as exc:
             self._healthy = False
             self._last_health_error = str(exc)

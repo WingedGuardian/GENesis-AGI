@@ -58,7 +58,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, MutableMapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -71,6 +71,17 @@ SESSION_ID_ENV = "GENESIS_SESSION_ID"
 SESSION_ORIGIN_ENV = "GENESIS_SESSION_ORIGIN"
 TRANSCRIPT_ID_ENV = "CLAUDE_CODE_SESSION_ID"
 LEGACY_SESSION_ID_ENV = "CLAUDE_SESSION_ID"
+PROFILE_ENV = "GENESIS_CALLER_PROFILE"
+
+
+def drop_client_label(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
+    """Remove the client label from a child's environment, in place.
+
+    A process Genesis spawns is never the labelled client itself, so it must
+    not inherit the label and have its calls recorded as that client's.
+    """
+    env.pop(PROFILE_ENV, None)
+    return env
 
 IDENTITY_ENV_VARS = frozenset(
     {

@@ -390,7 +390,7 @@ as one.
 Ordinary CI keeps its existing runtime dependency ranges. The shared-only
 protocol and shared CLI suites require the exact versions admitted by
 `genesis.mcp.shared_http._settings.require_qualified_stack`; an unsupported
-ordinary environment explicitly skips the eleven SDK-specific modules before
+ordinary environment explicitly skips the SDK-specific modules before
 SDK imports. The caller-path policy, read-location API and ordinary preparation
 tests remain ordinary tests; policy and preparation also run in the qualified
 protocol selection.
@@ -470,14 +470,51 @@ cancellation/EOF and feature/catalog refusal cover the mixed consumer. Its
 existing heavy local initialization and final resource owner remain outside
 the savings/activation claim.
 Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
-and a floor of 518 cases. Installation, collection, test or report-check failure
+and a floor of 532 cases. Installation, collection, test or report-check failure
 fails the job; missing or filtered workflow runs do not qualify a PR. Closing
 checks its actual head/base result. Ordinary skip-budget changes require observed
 skip identities; this workflow does not raise that budget automatically.
 
+After that protocol run, the same job checks local module ownership and both
+SDK protocol-era cancellation regressions with AnyIO 4.9.0 and 4.13.0. These
+compatibility checks exercise the task boundary that contains operation
+cancellation while preserving real caller cancellation, including previously
+handled cancellation inside an operation and both owner/caller stop orderings. They do
+not change production dependency policy or ordinary CI's floating coverage.
+
 For a local run, use an already qualified isolated interpreter and the same
 strict test flag, then run the workflow's report check. Changing installed
 packages or enabling shared services is not part of that test command.
+
+Local module ownership regressions live in `test_local_module_owner.py`,
+`test_local_module_processes.py`, `test_local_module_cancellation.py` and
+`test_local_module_operation.py`, with uncertainty conversion regressions in
+`test_local_module_uncertainty.py`. Logical launch boundary controls in
+`test_local_module_launch.py` verify deadline propagation and recorded-owner
+delegation alongside unchanged no-record cleanup. Fake identities are fenced
+from signal syscalls; these controls do not establish physical settlement.
+The cancellation/operation suites cover caller/child cancellation,
+shared cleanup deadlines, pre-entry closure, pending-unit quarantine, repeated
+cancellation with held resources and owned/ownerless module-call wiring.
+The uncertainty suite exercises actual owned stdio readiness and execution with
+injected confirmation refusal, plus ordinary-error parity at all three selected
+generic conversion boundaries. Its owned physical settlement follows the verdict. They exercise actual stdio/SSH-method bodies
+with owned Python children, serialized replies, process-group settlement,
+failed HTTP closure and unknown creation. Isolated Linux subreaper controllers
+distinguish naturally settled descendants from failure-only observer rescue;
+rescued pipe-creation faults qualify uncertainty reporting, not natural recovery.
+Lifetime-ordering tests cover per-exchange SSH retirement, independent later
+cleanup allowances, spontaneous stdio exit with a paused pipe, observer failure
+and close races, and expired retries that probe absence without signalling.
+`test_local_module_frontend.py` runs actual ordinary health CLI/stdio/TCP flows
+through the real YAML loader and module body with a precisely allowed synthetic
+child command. Both protocol eras, cancellation/EOF and DB/no-DB preparation
+cover the respective cases. Receipts establish that module settlement precedes
+database closure.
+Repeated cancellation during the real DB-backed health lifespan also checks
+completion of the browser/database closers after confirmed module drainage.
+These tests neither execute a real SSH/model/provider program
+nor establish production host-stall, crash-recovery or memory-saving bounds.
 
 `test_shared_notify.py` exercises owned local datagrams and error propagation
 without SDK qualification. `test_shared_mcp_templates.py` reuses both actual

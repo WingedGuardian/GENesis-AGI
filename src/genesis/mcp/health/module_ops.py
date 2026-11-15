@@ -9,6 +9,7 @@ the genesis-server process.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from pathlib import Path
 
 import yaml
@@ -22,6 +23,21 @@ _LOCAL_MODULES_DIR = Path.home() / ".genesis" / "config" / "modules"
 
 # Cache of loaded configs + IPC adapters (lazy, per-process lifetime)
 _adapters: dict | None = None
+_resource_owner = None
+
+
+@contextmanager
+def bind_resource_owner(owner):
+    """Bind one frontend/cache generation; never adopt legacy live adapters."""
+    global _resource_owner
+    if _resource_owner is not None or _adapters is not None:
+        raise RuntimeError('Module adapter generation is already bound')
+    _resource_owner = owner
+    try:
+        yield
+    finally:
+        if owner.closed:
+            _resource_owner = None
 
 
 def _reset_adapter_cache() -> None:
@@ -44,13 +60,15 @@ def _reset_adapter_cache() -> None:
 def _get_adapters() -> dict:
     """Lazily load external module configs and create adapters."""
     global _adapters
-    if _adapters is not None:
-        return _adapters
+    owner = _resource_owner
+    adapters = _adapters if owner is None else owner.adapters
+    if adapters is not None:
+        return adapters
 
     from genesis.modules.external.adapter import ExternalProgramAdapter
     from genesis.modules.external.config import ProgramConfig
 
-    _adapters = {}
+    adapters = {}
 
     # Collect configs: repo defaults first, local overlay wins on same filename
     # (mirrors genesis.runtime.init.modules._load_modules_from_yaml)
@@ -66,12 +84,16 @@ def _get_adapters() -> dict:
             if not data or data.get("type") != "external":
                 continue
             config = ProgramConfig.from_dict(data)
-            adapter = ExternalProgramAdapter(config)
-            _adapters[config.name] = adapter
+            adapter = ExternalProgramAdapter(config) if owner is None else ExternalProgramAdapter(config, owner=owner)
+            adapters[config.name] = adapter
         except Exception:
             logger.warning("Failed to load module config from %s", yaml_path.name, exc_info=True)
 
-    return _adapters
+    if owner is None:
+        _adapters = adapters
+    else:
+        owner.adapters = adapters
+    return adapters
 
 
 async def _ensure_adapter_started(adapter) -> None:
@@ -118,8 +140,11 @@ async def _impl_module_call(
     if not adapter.enabled:
         return {"error": f"Module '{module_name}' is disabled"}
 
-    await _ensure_adapter_started(adapter)
-    return await adapter.execute_operation(operation.strip(), params)
+    async def execute():
+        await _ensure_adapter_started(adapter)
+        return await adapter.execute_operation(operation.strip(), params)
+
+    return await _resource_owner.run(execute) if _resource_owner is not None else await execute()
 
 
 async def _impl_module_list() -> dict:
