@@ -360,8 +360,19 @@ async def _run(rt, items: list[dict] | None, now: datetime) -> dict:
         return {"armed": armed, "unavailable": "no public tracker configured"}
     tick = _Tick(rt, now, "/".join(tracker_pair).lower())
     enabled_at = await _enabled_at(tick, armed)
+    from genesis.board import builder_watch
+
+    # Watch duties run armed or not, and before any launch, so a builder that
+    # finished frees its place in this same pass.
+    watch = await builder_watch.run_watch(tick, items)
     if not armed:
-        return {"armed": False, "reason": why}
+        out = {"armed": False, "reason": why, "watch": watch}
+        if watch.get("error"):
+            out["error"] = f"watch: {watch['error']}"
+        return out
+    tick.out["watch"] = watch
+    if watch.get("error"):
+        tick.out["error"] = f"watch: {watch['error']}"
     if items is None:
         tick.out["board_read"] = "failed"
         return tick.out
@@ -659,6 +670,61 @@ async def _list_backlog(tick: _Tick, cards: list[dict]) -> None:
         )
 
 
+def _transcript(root: Path, session_id: str) -> Path:
+    """Where Claude Code keeps the conversation of a session started in *root*:
+    its project directory is the checkout path with every non-alphanumeric
+    character as ``-`` (MEASURED: a checkout at ``/home/<user>/genesis`` keeps its
+    sessions under ``-home-<user>-genesis``)."""
+    slug = re.sub(r"[^A-Za-z0-9]", "-", str(root))
+    return Path.home() / ".claude" / "projects" / slug / f"{session_id}.jsonl"
+
+
+def _resume_target(
+    history: list[dict], key: str, root: Path, worktree: Path
+) -> tuple[str | None, str | None]:
+    """``(session id, None)`` to resume the issue's last builder, or ``(None,
+    why it starts fresh)``. Resumable: the newest earlier builder of the issue
+    ended paused or exited (not closed after its PR), its conversation file is
+    still there, and so is its worktree."""
+    launched = [
+        e
+        for e in history
+        if e["event"] == "builder_launched" and (e.get("detail") or {}).get("key") != key
+    ]
+    if not launched:
+        return None, None
+    last = launched[0]  # newest first
+    last_key = (last.get("detail") or {}).get("key")
+    ended = {e["event"] for e in history if (e.get("detail") or {}).get("key") == last_key}
+    if not ended & {"builder_paused", "builder_exited"} or "builder_closed" in ended:
+        return None, None
+    session_id = (last.get("detail") or {}).get("session_id")
+    if not session_id or not _transcript(root, session_id).is_file():
+        return None, "its earlier conversation could not be found"
+    from genesis.board.builder_watch import session_alive
+
+    if session_alive(session_id):
+        return None, "its earlier conversation is still running in another process"
+    resumed_attempts = {
+        e.get("attempt")
+        for e in history
+        if e["event"] == "builder_launching"
+        and (e.get("detail") or {}).get("key") == key
+        and (e.get("detail") or {}).get("session_id") == session_id
+    }
+    if any(
+        e["event"] == "launch_failed"
+        and (e.get("detail") or {}).get("key") == key
+        and (e.get("detail") or {}).get("strike") is not False
+        and e.get("attempt") in resumed_attempts
+        for e in history
+    ):
+        return None, "resuming its earlier conversation failed"
+    if not worktree.is_dir():
+        return None, f"its earlier worktree {worktree.name} is gone"
+    return session_id, None
+
+
 def _render(template: str, *, issue: int, snapshot: Path, worktree: Path) -> str:
     return (
         template.replace("{issue}", str(issue))
@@ -735,7 +801,9 @@ async def _launch(tick: _Tick, card: dict, facts: dict, sessions: dict, history)
         default=0,
     )
     slot = _free_slot(sessions, tick.settings["first_slot"])
-    session_id = str(uuid.uuid4())
+    session_id, resume_note = _resume_target(history, key, root, worktree)
+    resuming = session_id is not None
+    session_id = session_id or str(uuid.uuid4())
     unit = f"{UNIT_PREFIX}{number}-{uuid.uuid4().hex[:8]}"
     # The checks above took network round trips; a disarm (or the kill switch)
     # in the meantime cancels the launch before its gate row exists.
@@ -805,6 +873,7 @@ async def _launch(tick: _Tick, card: dict, facts: dict, sessions: dict, history)
         key,
         "--session-id",
         session_id,
+        *(["--resume"] if resuming else []),
         "--slot",
         str(slot),
         "--prompt-file",
@@ -836,12 +905,21 @@ async def _launch(tick: _Tick, card: dict, facts: dict, sessions: dict, history)
         logger.warning("builder launcher: tmux read after launch failed", exc_info=True)
         now_sessions = None
     if now_sessions is not None and key in now_sessions.values():
-        await _launched(tick, card, {"detail": {"slot": slot, "session_id": session_id}}, rc=rc)
+        await _launched(
+            tick,
+            card,
+            {"detail": {"slot": slot, "session_id": session_id}},
+            rc=rc,
+            resumed=resuming,
+            fresh_because=resume_note,
+        )
         tick.out["launched"] += 1
         late = " (seen late)" if card["moved"] < tick.now - _LATE_AFTER else ""
+        how = "resumed its earlier conversation" if resuming else "started"
+        note = f" It starts fresh: {resume_note}." if resume_note else ""
         await tick.notify(
-            f"Build #{number} started in cc-{slot}{late}. It answers through Remote Control "
-            f"as 'build #{number}', or attach to cc-{slot}.",
+            f"Build #{number} {how} in cc-{slot}{late}.{note} It answers through Remote "
+            f"Control as 'build #{number}', or attach to cc-{slot}.",
             f"launched:{key}",
         )
         return True

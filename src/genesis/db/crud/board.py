@@ -862,6 +862,48 @@ async def added_numbers(db: aiosqlite.Connection, *, repo: str) -> set[int]:
     return {row[0] for row in await cur.fetchall()}
 
 
+async def active_builders(db: aiosqlite.Connection, *, repo: str) -> list[dict]:
+    """``builder_launched`` rows in *repo* whose move has no ``builder_paused``,
+    ``builder_exited`` or ``builder_closed`` row yet (the builder launcher's
+    watch). One query, so its length is the number of LIVE builders, never the
+    length of the history."""
+    cur = await db.execute(
+        "SELECT * FROM board_events l WHERE l.event = 'builder_launched' AND l.repo = ? "
+        "AND NOT EXISTS (SELECT 1 FROM board_events e "
+        "WHERE e.event IN ('builder_paused', 'builder_exited', 'builder_closed') "
+        "AND e.observed_change_key IN (l.observed_change_key || '#p', "
+        "l.observed_change_key || '#x', l.observed_change_key || '#c')) "
+        "ORDER BY l.id",
+        ((repo or "").lower(),),
+    )
+    return [_decoded(item) for item in await _all(cur)]
+
+
+async def open_holds(db: aiosqlite.Connection, *, repo: str) -> list[dict]:
+    """``launch_queued`` rows in *repo* whose move has no ``builder_launched``,
+    ``launch_refused``, ``move_absorbed`` or ``launch_withdrawn`` row yet."""
+    cur = await db.execute(
+        "SELECT * FROM board_events q WHERE q.event = 'launch_queued' AND q.repo = ? "
+        "AND NOT EXISTS (SELECT 1 FROM board_events e "
+        "WHERE e.event IN ('builder_launched', 'launch_refused', 'move_absorbed', "
+        "'launch_withdrawn') "
+        "AND e.observed_change_key = substr(q.observed_change_key, 1, "
+        "instr(q.observed_change_key, '#q:') - 1)) "
+        "ORDER BY q.id",
+        ((repo or "").lower(),),
+    )
+    return [_decoded(item) for item in await _all(cur)]
+
+
+def _decoded(item: dict) -> dict:
+    if item.get("detail"):
+        try:
+            item["detail"] = json.loads(item["detail"])
+        except ValueError:
+            item["detail"] = {"unparseable": True}
+    return item
+
+
 async def links_without_item(db: aiosqlite.Connection, *, repo: str) -> list[dict]:
     """``{"id", "issue_number"}`` of every link in *repo* whose project item
     is not recorded yet."""

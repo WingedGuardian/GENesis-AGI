@@ -332,7 +332,8 @@ async def test_a_second_tick_does_not_launch_again(db, world):
 async def test_nothing_happens_while_disarmed(db, world):
     world.armed = (False, "builder_launch.enabled is not true")
     _, out = await _run(db, [_card()])
-    assert out == {"armed": False, "reason": "builder_launch.enabled is not true"}
+    assert (out["armed"], out["reason"]) == (False, "builder_launch.enabled is not true")
+    assert out["watch"]["watched"] == 0
     assert world.launches == [] and world.calls == []
     assert await _events(db) == []
 
