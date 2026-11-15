@@ -1905,7 +1905,9 @@ def test_tw4_a_real_start_step_is_never_sigtermed(tmp_path, monkeypatch):
             while "start-pre" not in (seen := subprocess.run(
                 show, capture_output=True, text=True, env=env, timeout=10
             ).stdout) or not ready.exists():
-                assert time.monotonic() < end, f"the unit never reached start-pre: {seen!r}"
+                assert time.monotonic() < end, (
+                    f"start-pre with its trap set never seen: {seen!r}, ready={ready.exists()}"
+                )
                 time.sleep(0.1)
             act(unit)
             return trap.read_text()
