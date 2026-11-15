@@ -9,7 +9,10 @@ started. After the deadline only the alert (bounded here), the report write
 and the exit run, so the step ends inside the unit's TimeoutStartSec: the pin
 is PRE_MAIN_S + BOOT_DEADLINE_S + ALERT_TIMEOUT_S + REPORT_S + SHELL_ALERT_S
 <= TIMEOUT_START_S (5 + 75 + 3 + 1 + 4 = 88 <= 90; the shape was measured in a
-transient unit with a 20 s deadline, 2026-11-11).
+transient unit with a 20 s deadline, 2026-11-11). The heal's own git work ends
+END_MARK_S before BOOT_DEADLINE_S: the end marks taken after it (a crash's, the
+page key's) run in that reserve, so they are real marks and the sum is unchanged
+(#4548; an allowance after the deadline would start nothing).
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+import re
 import signal
 import subprocess
 import time
@@ -29,6 +33,10 @@ ALERT_TIMEOUT_S = 3
 GUARD_REAP_S = 5  # the guard's own kill-and-reap of its residue check
 PRE_MAIN_S, REPORT_S, SHELL_ALERT_S = 5, 1, 4  # interpreter start; REPAIR.json; the unit's page
 TIMEOUT_START_S = 90  # the units' TimeoutStartSec
+END_MARK_S = 5  # the end of BOOT_DEADLINE_S kept for end marks (3 git calls, ~60 ms each)
+MARK_GRACE_S = 1  # a mark's git is TERMed this long before BOOT_DEADLINE_S
+# lstat identities a mark holds: 5,750 took 72-102 ms here, so ~0.35 s (extrapolated).
+MARK_PATHS = 20000
 _now = time.monotonic
 
 
@@ -83,16 +91,53 @@ def queue_alert(lib: str, severity: str, title: str, body: str, key: str) -> int
     return run(argv, until=_now() + ALERT_TIMEOUT_S, grace=0).returncode
 
 
-def end_mark(git) -> str:
+def end_mark(git, root: str | None = None, skip: str | None = None) -> str:
     """What the checkout looks like now: HEAD, `status --porcelain -uall -z`
-    and whether index.lock exists, hashed. ``git(*args)`` returns stdout."""
+    and whether index.lock exists, hashed. ``git(*args)`` returns stdout.
+
+    With ``root``, also the lstat identity (mode, size, mtime, ctime, inode) of
+    each path the status lists, so an edit to a file that is already modified
+    or untracked moves the mark too (#4548; porcelain alone does not change).
+    ctime is kept because no tool sets it back, unlike mtime. Paths matching
+    ``skip`` (EPHEMERAL_DIRTY_RE, matched whole against " " + path as the guard
+    does) are left out: tools rewrite them on their own. Past MARK_PATHS paths
+    the rest are not stat'ed, so an edit beyond them alone is not seen: that
+    refuses (fails closed), as a mark with no stat part did."""
     head = git("rev-parse", "-q", "--verify", "HEAD")
     status = git("--no-optional-locks", "status", "--porcelain", "-uall", "-z")
     lock = os.fsdecode(
         git("rev-parse", "--path-format=absolute", "--git-path", "index.lock").strip()
     )
     held = b"1" if os.path.lexists(lock) else b"0"
-    return hashlib.sha256(head + b"\0" + status + b"\0" + held).hexdigest()
+    parts = [head, status, held]
+    if root is not None:
+        parts.append(_identities(root, status, re.compile(f"(?:{skip})") if skip else None))
+    return hashlib.sha256(b"\0".join(parts)).hexdigest()
+
+
+def _identities(root: str, status: bytes, skip) -> bytes:
+    """lstat identity of each path a `status --porcelain -z` lists (a rename's
+    or copy's source field skipped); "gone" when lstat fails."""
+    fields, out, i = status.split(b"\0"), [], 0
+    while i < len(fields) and len(out) < MARK_PATHS:
+        field, i = fields[i], i + 1
+        if len(field) < 4:
+            continue
+        if b"R" in field[:2] or b"C" in field[:2]:
+            i += 1  # the source path follows as its own field
+        path = os.fsdecode(field[3:])
+        if skip is not None and skip.fullmatch(" " + path):
+            continue
+        try:
+            st = os.lstat(os.path.join(root, path))
+        except OSError:
+            ident = b"gone"
+        else:
+            ident = (
+                f"{st.st_mode} {st.st_size} {st.st_mtime_ns} {st.st_ctime_ns} {st.st_ino}".encode()
+            )
+        out.append(field[3:] + b"\0" + ident)
+    return b"\0".join(out)
 
 
 def key(cls: str, state: bytes, mark: str) -> str:

@@ -23,6 +23,9 @@ from tests.test_scripts.test_pr_verification_closer import (
     _seed,
 )
 from tests.test_scripts.test_pr_verification_closer import (
+    _close_before_the_fixture_dates as _close_before_the_fixture_dates,
+)
+from tests.test_scripts.test_pr_verification_closer import (
     _no_real_github as _no_real_github,
 )
 

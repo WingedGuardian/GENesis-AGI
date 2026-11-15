@@ -498,7 +498,10 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
             try:
                 await stream.aclose()
             except BaseException as exc:
-                if failure is None:
+                # Delegate normalization can discard exception notes. Preserve
+                # this independent incident in the adapter's durable failure.
+                self.error = "response_stream_cleanup_failed:" + exception_name(exc)
+                if failure is None or not isinstance(exc, Exception):
                     raise
                 failure.add_note("response stream cleanup also failed: " + exception_name(exc))
 

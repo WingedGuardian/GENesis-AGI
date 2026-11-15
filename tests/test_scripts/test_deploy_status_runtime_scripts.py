@@ -94,6 +94,10 @@ EXEMPT: dict[tuple[str, str], str] = {
     ("restore/cli.py", "scripts/restore.sh"): (
         "the `genesis restore` command line, a separate process from the server"
     ),
+    ("mcp/shared_settings.py", "scripts/lib/mcp_rollout.py"): (
+        "loaded afresh by the shared MCP service (genesis_mcp_server.py "
+        "--shared-service), a separate process; genesis-server never imports it"
+    ),
     ("cc/invoker.py", "scripts/hooks/cc_span_hook.py"): (
         "registered as a PostToolUse hook for the Claude Code sessions the server "
         "launches; it runs inside those sessions, never in the server"
