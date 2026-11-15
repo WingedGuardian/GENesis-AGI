@@ -108,17 +108,40 @@ _WRITE_TARGETS = (
 _INTERPRETER = re.compile(r"(?:python[\d.]*|perl[\d.]*|node|nodejs|ruby[\d.]*)")
 
 
+#: The options that hand each interpreter code to run: short letters, long names.
+_CODE_OPTS = {
+    "python": ("c", ()),
+    "perl": ("eE", ()),
+    "ruby": ("e", ()),
+    "node": ("ep", ("--eval", "--print")),
+    "nodejs": ("ep", ("--eval", "--print")),
+}
+
+
 def _inline_code(argv: list[str]) -> str | None:
-    """The code an interpreter is given on its command line: ``-c CODE``,
-    ``-e CODE``, ``--eval CODE``, or glued (``-cCODE``, ``-e'...'``, ``--eval=CODE``)."""
+    """Every piece of code an interpreter is given on its command line, joined.
+
+    Fails closed on the flags: every word is read, and each short-flag group
+    letter by letter, so a flag before the code letter (``python3 -E -c``,
+    ``python3 -W x -c``, ``perl -wle``) cannot hide it, and every code option
+    counts (perl joins several ``-e``). A script's own ``-c`` argument may be
+    read as code; it is refused only when it names a refused operation."""
+    name = os.path.basename(argv[0]).rstrip("0123456789.")
+    letters, long_opts = _CODE_OPTS.get(name, ("ceEp", ("--eval", "--print")))
+    code: list[str] = []
     for n, tok in enumerate(argv[1:], start=1):
-        if tok in ("-c", "-e", "--eval", "-E") and n + 1 < len(argv):
-            return argv[n + 1]
-        if tok.startswith("--eval="):
-            return tok[len("--eval=") :]
-        if len(tok) > 2 and tok[0] == "-" and tok[1] in "ceE" and tok[1] != "-":
-            return tok[2:]
-    return None
+        nxt = argv[n + 1] if n + 1 < len(argv) else ""
+        if tok.startswith("--"):
+            opt, eq, val = tok.partition("=")
+            if opt in long_opts:
+                code.append(val if eq else nxt)
+        elif tok.startswith("-") and len(tok) > 1:
+            group = tok[1:]
+            for k, ch in enumerate(group):
+                if ch in letters:
+                    code.append(group[k + 1 :] or nxt)
+                    break
+    return "\n".join(code) if code else None
 
 
 _CARRIERS = frozenset(
@@ -254,95 +277,14 @@ def _gh_reason(seg, cmd: str, n_segments: int, cwd: str | None) -> str | None:
     return None
 
 
-# curl and wget options that carry a request body, and those that name a method.
-_CURL_BODY = {
-    "-d",
-    "--data",
-    "--data-binary",
-    "--data-raw",
-    "--data-ascii",
-    "--data-urlencode",
-    "--json",
-    "-F",
-    "--form",
-    "--form-string",
-    "-T",
-    "--upload-file",
+#: curl and wget options that read the request, or its URLs, from somewhere this
+#: guard cannot see: long names and short letters. READ: curl(1), wget(1).
+_HTTP_INDIRECT = {
+    "curl": ({"-K", "--config"}, "K"),
+    "wget": ({"-i", "--input-file", "-e", "--execute", "--config", "-B", "--base"}, "ieB"),
 }
-_WGET_BODY = {"--post-data", "--post-file", "--body-data", "--body-file"}
-_METHOD = {"-X", "--request", "--method"}
-#: Options whose value is a file name, never the body text itself.
-_FILE_BODY = {"--post-file", "--body-file", "-T", "--upload-file"}
-#: Options whose value is not a URL, PER PROGRAM: the same letter is a value
-#: option in one and a boolean in the other (curl -O is boolean, wget -O takes a
-#: file; wget -b/-c/-r are boolean, curl's take values). READ: curl(1), wget(1).
-_VALUE_OPTS = {
-    "curl": frozenset(
-        {
-            "-H",
-            "--header",
-            "-o",
-            "--output",
-            "-w",
-            "--write-out",
-            "-u",
-            "--user",
-            "-A",
-            "--user-agent",
-            "-e",
-            "--referer",
-            "-b",
-            "--cookie",
-            "-c",
-            "--cookie-jar",
-            "-m",
-            "--max-time",
-            "--connect-timeout",
-            "-r",
-            "--range",
-            "-x",
-            "--proxy",
-            "--cacert",
-            "--cert",
-            "--key",
-            "-E",
-            "--resolve",
-            "--retry",
-            "-U",
-            "--proxy-user",
-            "-t",
-            "--telnet-option",
-        }
-    ),
-    "wget": frozenset(
-        {
-            "-O",
-            "--output-document",
-            "-o",
-            "--output-file",
-            "-a",
-            "--append-output",
-            "-U",
-            "--user-agent",
-            "-t",
-            "--tries",
-            "-P",
-            "--directory-prefix",
-            "--header",
-            "--http-user",
-            "--http-password",
-            "--timeout",
-            "-T",
-            "-e",
-            "--execute",
-            "--referer",
-            "--load-cookies",
-            "--save-cookies",
-        }
-    ),
-}
-#: Short options that take a value, inside a flag group (``-sH v``), per program.
-_SHORT_VALUE = {"curl": set("HowuAebcmrxEUt"), "wget": set("OoaUtPTe")}
+#: Short letters that take a value, so later letters in the group are that value.
+_SHORT_VALUE = {"curl": set("HowuAebcmrxEUtdFTXK"), "wget": set("OoaUtPTeiB")}
 
 
 def _json_or_none(body: str):
@@ -362,111 +304,53 @@ def _replies(body: str) -> bool:
     return any(_IN_REPLY.fullmatch(str(k)) for k in doc)
 
 
-def _query_of(body: str) -> str:
-    doc = _json_or_none(body)
-    if isinstance(doc, dict) and isinstance(doc.get("query"), str):
-        return doc["query"]
-    return body
+def _endpoint(word: str) -> str | None:
+    """The refused GitHub endpoint a curl or wget word names, if any."""
+    try:
+        parts = urlsplit(word if "://" in word else f"https://{word}")
+        host = (parts.hostname or "").rstrip(".")
+    except ValueError:
+        return None
+    path = parts.path if "://" in word else word
+    what = _write_target(path)
+    if what:
+        return what
+    norm = _norm(path)
+    if _COMMENTS.search(norm):
+        return "the review comments of a pull request"
+    if _GRAPHQL_PATH.search(_norm(parts.path)) and _GITHUB_HOST.match(host + "."):
+        return "a GitHub GraphQL request (use `gh api graphql`)"
+    return None
 
 
 def _http_reason(seg) -> str | None:
-    """A refused GitHub request through curl or wget."""
-    from gh_merge import _graphql_code
+    """A refused GitHub request through curl or wget.
 
+    Fails closed on the request: a word that names a merge, review, review-comment
+    or GitHub GraphQL endpoint is refused whatever method, body or other options
+    the command carries, on any host. Two review rounds found curl and wget
+    options this guard had modelled wrongly (curl ``-O`` and ``--next``, wget
+    ``-b`` and ``-d``), and a builder needs none of these endpoints through curl:
+    ``gh`` covers the reads, and its calls are read above."""
     argv = seg.argv
     prog = os.path.basename(argv[0])
-    urls, bodies, method, unreadable = [], [], None, False
-    i = 1
-    while i < len(argv):
-        tok = argv[i]
-        name, _, glued = tok.partition("=") if tok.startswith("--") else (tok, "", "")
-        value = None
-        if tok in ("-K", "--config") or tok.startswith("-K") or name == "--config":
-            return f"`{prog}` reading its request from a config file"
-        if name == "--url":
-            urls.append(glued if glued else (argv[i + 1] if i + 1 < len(argv) else ""))
-            i += 1 if glued else 2
-            continue
-        if name in _VALUE_OPTS.get(prog, ()) and not glued:
-            i += 2  # the value of a header, output, user... option is not a URL
-            continue
-        if name in _VALUE_OPTS.get(prog, ()):
-            i += 1
-            continue
-        if name in _METHOD or name in _CURL_BODY or name in _WGET_BODY:
-            if glued or tok.startswith("--") and "=" in tok:
-                value = glued
-            else:
-                i += 1
-                value = argv[i] if i < len(argv) else ""
-            if name in _METHOD:
-                method = value.upper()
-            else:
-                bodies.append(value)
-                if name in _FILE_BODY:
-                    unreadable = True
-        elif tok.startswith("-X") and len(tok) > 2:
-            method = tok[2:].upper()
-        elif tok.startswith("-") and not tok.startswith("--") and len(tok) > 2:
-            # A short-flag group: -sd BODY, -sXPUT and the like.
-            letters = tok[1:]
-            for n, ch in enumerate(letters):
-                if ch == "K":
-                    return f"`{prog}` reading its request from a config file"
-                if ch in _SHORT_VALUE.get(prog, ()):
-                    if not letters[n + 1 :]:
-                        i += 1  # its value is the next word
+    longs, shorts = _HTTP_INDIRECT[prog]
+    for tok in argv[1:]:
+        name = tok.split("=", 1)[0] if tok.startswith("--") else tok
+        if name in longs:
+            return f"`{prog}` reading its request from a file or base this guard cannot see"
+        if tok.startswith("-") and not tok.startswith("--"):
+            for ch in tok[1:]:
+                if ch in shorts:
+                    return f"`{prog}` reading its request from a file or base this guard cannot see"
+                if ch in _SHORT_VALUE[prog]:
                     break
-                if ch in "dFT":
-                    rest = letters[n + 1 :]
-                    if rest:
-                        bodies.append(rest)
-                    else:
-                        i += 1
-                        bodies.append(argv[i] if i < len(argv) else "")
-                    break
-                if ch == "X":
-                    rest = letters[n + 1 :]
-                    if rest:
-                        method = rest.upper()
-                    else:
-                        i += 1
-                        method = (argv[i] if i < len(argv) else "").upper()
-                    break
-        elif not tok.startswith("-"):
-            urls.append(tok)
-        i += 1
-    for body in bodies:
-        if body.startswith("@") or "$" in body or "`" in body:
-            unreadable = True
-    method = method or ("POST" if bodies else "GET")
-    for url in urls:
-        try:
-            parts = urlsplit(url if "://" in url else f"https://{url}")
-            parts.hostname  # noqa: B018 — raises ValueError on a malformed netloc
-        except ValueError:
-            continue  # not a URL
-        host = (parts.hostname or "").rstrip(".")
-        if not _GITHUB_HOST.match(host + "."):
-            if "$" not in url or method in ("GET", "HEAD"):
-                continue
-            if not _BLIND.search(seg.raw):
-                continue
-            return f"`{prog}` sending a {method} to a URL this guard cannot read"
-        path = _norm(parts.path)
-        if _GRAPHQL_PATH.search(path):
-            if unreadable:
-                return f"`{prog}` sending a GraphQL body this guard cannot read"
-            if any(_MUTATIONS.search(_graphql_code(_query_of(b))) for b in bodies):
-                return f"`{prog}` sending a GraphQL review, review-thread or merge mutation"
-            continue
-        if method in ("GET", "HEAD"):
-            continue
-        what = _write_target(path)
-        if what:
-            return f"{what} through `{prog}`"
-        if _COMMENTS.search(path) and (unreadable or any(_replies(b) for b in bodies)):
-            return f"a reply to a review comment through `{prog}`"
+        for word in {tok, tok.split("=", 1)[-1]}:
+            what = _endpoint(word)
+            if what:
+                return f"{what} through `{prog}` (to read one, use `gh api <path>`)"
+        if ("$" in tok or "`" in tok or "{{" in tok) and _BLIND.search(seg.raw):
+            return f"`{prog}` sending a request to a URL this guard cannot read"
     return None
 
 

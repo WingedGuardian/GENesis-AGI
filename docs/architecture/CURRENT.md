@@ -6376,7 +6376,9 @@ verified: b67423bd 2026-10-03
   `in_reply_to`) and the GraphQL `resolveReviewThread` /
   `unresolveReviewThread` / `addPullRequestReviewThreadReply` mutations,
   through `gh` or `curl` / `wget`. An unreadable command that names one of them
-  is refused. Why a block: a reply under the owner's login clears a Codex P1
+  is refused. `curl` / `wget` fail closed: any word naming a merge, review,
+  review-comment or GitHub GraphQL endpoint is refused whatever the method, so
+  a builder reads those through `gh api`. Why a block: a reply under the owner's login clears a Codex P1
   from the merge gate, and a builder carries no dispatched marker, so the
   merge arm would let it merge once every machine gate is green. `gh pr
   create`, `gh pr comment`, reads and `git push` are left to the other guards.

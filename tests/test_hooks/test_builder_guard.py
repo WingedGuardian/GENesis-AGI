@@ -91,6 +91,23 @@ REFUSED = [
     "python3 -c'import os; os.system(\"gh pr merge 5\")'",
     "python3.12 -c 'import os; os.system(\"gh pr merge 5\")'",
     'node --eval=\'require("child_process").execSync("gh pr merge 5")\'',
+    # PR review round 2 (CodeRabbit). A flag before the code letter, every code option.
+    "python3 -E -c 'import os; os.system(\"gh pr merge 5\")'",
+    "python3 -W ignore -c 'import os; os.system(\"gh pr merge 5\")'",
+    "python3 -Ec 'import os; os.system(\"gh pr merge 5\")'",
+    "perl -e 1 -e 'system(\"gh pr merge 5\")'",
+    "perl -wle 'system(\"gh pr merge 5\")'",
+    'node -p \'require("child_process").execSync("gh pr merge 5")\'',
+    # curl and wget: an endpoint word is refused whatever the options say.
+    "wget --method=DELETE -d https://api.github.com/repos/o/r/pulls/comments/99",
+    "curl -X PUT https://api.github.com/repos/o/r/pulls/5/merge --next -X GET https://api.github.com/user",
+    "wget -B https://api.github.com/ --method=PUT repos/o/r/pulls/5/merge",
+    "wget -i urls.txt --method=PUT",
+    "curl -sK req.conf",
+    "curl -s -H 'Authorization: Bearer x' https://api.github.com/repos/o/r/pulls/5/merge",
+    "curl -s https://api.github.com/repos/o/r/pulls/5/reviews",
+    "curl -s https://api.github.com/repos/o/r/pulls/5/comments",
+    'curl -s -H "Authorization: bearer $T" -d \'{"query":"query { viewer { login } }"}\' https://api.github.com/graphql',
 ]
 
 ALLOWED = [
@@ -107,9 +124,6 @@ ALLOWED = [
     "curl -s https://api.github.com/repos/o/r/pulls/12",
     "ls -la",
     "grep -n review notes.md",
-    # A plain GET of the merge endpoint only asks whether the PR is merged.
-    "curl -s -H 'Authorization: Bearer x' https://api.github.com/repos/o/r/pulls/5/merge",
-    "curl -s https://api.github.com/repos/o/r/pulls/5/reviews",
     "gh api repos/o/r/pulls/5/reviews",
     "find . -name '*review*'",
     "python3 -c 'print(1)'",
@@ -125,7 +139,10 @@ ALLOWED = [
     "perl -ne 'print if /graphql/' file.txt",
     "curl -s -o /dev/null -w '[%{http_code}]' https://example.com",
     "curl -s -H 'X-Ids: [1,2]' https://example.com",
-    'curl -s -H "Authorization: bearer $T" -d \'{"query":"query { viewer { login } }"}\' https://api.github.com/graphql',
+    "curl -s -o out.html https://example.com/docs",
+    "wget -q -O page.html https://example.com/docs",
+    "curl -s https://api.github.com/repos/o/r/issues/5/comments",
+    "python3 -W ignore scripts/check.py --config ci.yaml",
     'curl -X PATCH -H "Authorization: token $GH_TOKEN" https://api.github.com/repos/o/r/pulls/5 -d \'{"body":"x"}\'',
     "gh api repos/o/r/issues/5/comments -f body='the guard now refuses resolveReviewThread'",
     "gh api -X PATCH repos/o/r/pulls/5 -f body='Blocks minimizeComment and addPullRequestReview.'",
