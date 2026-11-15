@@ -2325,6 +2325,26 @@ class TestCodexMcpHeldPark:
         assert "service:genesis_down" in {a.alert_id for a in request.alarms}
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("blocker", ["heavy_workload", "active_session", "no_invoker", "boot_grace"])
+    async def test_no_take_over_when_the_replacement_dispatch_would_be_deferred(self, blocker):
+        """Cancelling the owner's request is only worth it if the outage's
+        dispatch then goes through; a later gate refusing it would lose both."""
+        d, gate = self._parked([self._HELD])
+        if blocker == "active_session":
+            d._active_session_id = "sess-1"
+        elif blocker == "no_invoker":
+            d._invoker = None
+        elif blocker == "boot_grace":
+            d._state.started_at = datetime.now(UTC).isoformat()
+        both = [self._HELD, self._DOWN]
+        workload = "dream_cycle" if blocker == "heavy_workload" else None
+        with patch("genesis.sentinel.dispatcher._heavy_workload", return_value=workload):
+            await self._ticks(d, [both, both, both])
+        gate.resolve_request.assert_not_awaited()
+        assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+        assert d._state.pending_request_id == "req-held"
+
+    @pytest.mark.asyncio
     async def test_take_over_starts_the_cooldown_for_the_cancelled_pattern(self):
         d, gate = self._parked([self._HELD])
         both = [self._HELD, self._DOWN]

@@ -377,6 +377,16 @@ def _warning_park_strength(alarms: Sequence[Mapping[str, Any]], ids: set[str]) -
     return best
 
 
+def _heavy_workload() -> str | None:
+    """The runtime's heavy-workload label (e.g. a dream cycle), or None when
+    there is none or the runtime cannot be read."""
+    try:
+        from genesis.runtime import GenesisRuntime
+        return GenesisRuntime.instance().heavy_workload or None
+    except Exception:
+        return None
+
+
 def _superseding_alarm_ids(
     park_strength: tuple[int, int] | None,
     pending_ids: set[str],
@@ -651,16 +661,12 @@ class SentinelDispatcher:
 
         # Gate 2.5: Heavy workload — defer restart-type remediation while
         # a long-running batch job (e.g. dream cycle) is in progress.
-        try:
-            from genesis.runtime import GenesisRuntime
-            wl = GenesisRuntime.instance().heavy_workload
-            if wl:
-                return SentinelResult(
-                    dispatched=False,
-                    reason=f"Heavy workload active ({wl}) — deferring dispatch",
-                )
-        except Exception:
-            pass
+        wl = _heavy_workload()
+        if wl:
+            return SentinelResult(
+                dispatched=False,
+                reason=f"Heavy workload active ({wl}) — deferring dispatch",
+            )
 
         # Gate 3: Concurrent limit
         if self._active_session_id is not None:
@@ -2235,6 +2241,18 @@ class SentinelDispatcher:
                     None,
                 )
                 if head not in challengers or head == pattern or not self._backoff_ready(head)[0]:
+                    challengers = set()
+                # The same holds for every other gate _gated_dispatch applies
+                # after Gate 2: a take-over during a heavy workload, the boot
+                # grace, a running session or a missing invoker would cancel
+                # the owner's request and then defer the outage's dispatch too.
+                if (
+                    self._state.in_bootstrap_grace()
+                    or _heavy_workload()
+                    or self._active_session_id is not None
+                    or self._invoker is None
+                    or self._session_manager is None
+                ):
                     challengers = set()
                 # Without a row to cancel, clearing the park would forget an
                 # approval the owner can still answer: never take over then.
