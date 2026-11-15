@@ -44,6 +44,7 @@ from pydantic import (
 )
 
 from genesis.db.crud.pr_verifications import MAX_EVIDENCE_BYTES, PASS_VERDICTS, VERDICTS
+from genesis.session_awareness.pr_completeness import CompletenessReview
 
 __all__ = [
     "CLAIM_VERDICTS",
@@ -338,9 +339,15 @@ class EvidenceDocument(BaseModel):
     # steps are the same as the stored previous attempt's. On a not-yet-done row the
     # picker then waits the re-attempt window. Absent or false: offered at once.
     no_progress: StrictBool = False
+    # P2 can parse/check a report; close enforcement is a separate integration.
+    completeness: CompletenessReview | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def _coverage_targets_exist(self) -> EvidenceDocument:
+        if self.completeness is not None:
+            self.completeness.validate_indices(self)
         for i, item in enumerate(self.e2e):
             for key in ("claim", "gap"):
                 index = getattr(item, key)

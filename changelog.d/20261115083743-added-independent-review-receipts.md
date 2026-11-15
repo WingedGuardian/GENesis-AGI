@@ -1,0 +1,1 @@
+- Validators can check whether a retained independent review still matches its PR sources and evidence, while historical evidence remains readable. This prepares review receipts; close enforcement remains a separate change.

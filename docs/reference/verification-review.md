@@ -48,3 +48,35 @@ Sources: [GitHub pull-request APIs](https://docs.github.com/en/rest/pulls/pulls)
 [Git apply](https://git-scm.com/docs/git-apply). Patch parsing uses
 `git apply --numstat -z --allow-empty` without applying any changes. Its rename
 output names the destination; the file API supplies the previous filename.
+
+## Retained independent review
+
+The optional typed evidence field `completeness` records a two-stage review.
+Stage A inventories the complete packet before the independent reviewer sees
+the candidate. Stage B binds that retained inventory, evidence, claim/gap
+coverage and per-claim control judgments to the source digests. Full workflow,
+field forms and authority limits:
+[independent completeness review](../../.claude/skills/validating-merges/references/completeness-review.md).
+
+Prepare can also accept `--evidence /path/to/candidate.json` to print its
+canonical digest without placing candidate reasoning in the source packet.
+The candidate is validated before any acquisition/publication.
+
+```bash
+.venv/bin/python scripts/verification_review.py check --packet /path/to/packet-directory --inventory /path/to/stage-a.json
+.venv/bin/python scripts/verification_review.py check --packet /path/to/packet-directory --inventory /path/to/stage-a.json --evidence /path/to/candidate-with-review.json
+```
+
+Without evidence, this checks inventory structure/source binding and prints its
+canonical digest. With evidence, it requires a completed bound report and the
+same retained inventory. Both forms are read-only and offline: live GitHub
+source freshness and actual reviewer independence are not established by a
+successful check. Refusals exit `2` and do not alter any input.
+
+Historical evidence without a report still parses and serializes without the
+new field. Malformed optional reports are schema errors. Failed/missing/stale
+reports cannot pass `check`; retained execution establishes whether an actual
+fresh-context reviewer ran. The stored evidence cap remains 256 KiB including
+the report. Both close writers retain their earlier behavior in this P2
+intermediate release; enforcement and installed qualification are separate work,
+and HOLD remains in force.

@@ -2875,7 +2875,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 956d69d62 2026-11-15
+verified: 41c7343b3 2026-11-15
 ```
 
 - **Peer-handoff surface (2026-09-26)**: a SessionStart hook
@@ -3229,6 +3229,10 @@ verified: 956d69d62 2026-11-15
   file pagination, Git-parsed diff reconciliation and content digests. It acquires
   review inputs only; it does not judge evidence or authorize a close. Usage and
   refusal bounds: `docs/reference/verification-review.md`.
+  Typed `pr_completeness.CompletenessReview` receipts and the read-only `check`
+  command bind a retained independent inventory and evidence to that packet.
+  P2 parses/checks receipts; it does not yet enforce either close writer. Offline
+  checks do not establish live source freshness or reviewer independence.
   Fixture lookup injection stays outside the public MCP schema. Its
   server-side calibration gate forces preview until operator opt-in, including
   attempt notes. Real writes use a separate admitted existing-only connection;

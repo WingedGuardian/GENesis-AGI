@@ -681,6 +681,22 @@ scenario checks beyond its printed `Protects` line: reading it spoils it.
 
 ## Evidence: what the record has to carry
 
+### Independent completeness receipt
+
+For the two-stage source/evidence review and its typed receipt, read
+`references/completeness-review.md`. Stage A inventories the full source packet
+before the reviewer sees the candidate. Stage B audits that retained inventory,
+every claim/gap/control, and every file disposition against the evidence. Retain
+the actual fresh-context execution; JSON alone does not prove independence.
+
+The current P2 release can parse and check this optional receipt. It does not
+yet enforce completeness in either close writer, authorize a validator launch,
+or release HOLD. A successful offline `check` establishes binding to the supplied
+packet, not fresh GitHub state or a complete semantic judgment. The shared close
+gate and its installed qualification are separate work. Historical documents
+without the field still parse; omit malformed/incomplete output when recording
+a legitimate open attempt and retain the raw review separately.
+
 The evidence document is validated by a strict model
 (`genesis.session_awareness.pr_evidence`): every prose field must be a non-blank
 string, an unknown key is refused rather than dropped, and the refusal names the
