@@ -7238,10 +7238,104 @@ def test_put_back_merges_into_a_session_that_reclaimed_meanwhile():
 
     inv_mod._reset_failure_event_state()
     key = ("CCTimeoutError", "inbox.eval", "", "batch-a")
-    inv_mod._failure_event_state[key] = [2000.0, 0]  # re-claimed during the await
-    inv_mod._put_back_owed(key, [1000.0, 1])
-    assert inv_mod._failure_event_state[key] == [2000.0, 1]
+    inv_mod._failure_event_state[key] = [2000.0, 0, 2000.0]  # re-claimed during the await
+    inv_mod._put_back_owed(key, [1000.0, 1, 1010.0])
+    assert inv_mod._failure_event_state[key] == [2000.0, 1, 2000.0]
     inv_mod._reset_failure_event_state()
+
+
+async def test_sweeper_declares_a_quiet_sessions_count_without_a_later_failure(
+    monkeypatch, fail_bus
+):
+    """Review on #4433 (CodeRabbit): a session that swallows a failure and then
+    goes quiet makes no further claim. The sweep declares its count anyway,
+    against its own session, and only once the window has passed."""
+    import genesis.cc.invoker as inv_mod
+    from genesis.observability.session_context import session_scope
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(inv_mod.time, "monotonic", lambda: clock["t"])
+    inv = CCInvocation(prompt="x", caller_tag="inbox.eval")
+    for _ in range(2):  # batch-a owes 1, then never fails again
+        with session_scope("batch-a"):
+            await inv_mod._emit_invocation_failed_event(CCTimeoutError("slow"), inv, streaming=False)
+
+    clock["t"] += 30.0
+    assert await inv_mod.declare_settled_failure_counts() == 0  # window still open
+    assert not [e for e in fail_bus.events if e[4].get("retired")]
+
+    clock["t"] += 31.0
+    assert await inv_mod.declare_settled_failure_counts() == 1
+    declared = [e[4] for e in fail_bus.events if e[4].get("retired")]
+    assert [(d["session_id"], d["coalesced"]) for d in declared] == [("batch-a", 1)]
+    assert inv_mod._failure_event_state == {}
+    assert await inv_mod.declare_settled_failure_counts() == 0  # declared once only
+
+
+async def test_sweeper_keeps_counts_when_there_is_no_bus(monkeypatch, fail_bus):
+    """Without a bus nothing could be declared, so nothing is retired."""
+    import genesis.cc.invoker as inv_mod
+    from genesis.observability.session_context import session_scope
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(inv_mod.time, "monotonic", lambda: clock["t"])
+    inv = CCInvocation(prompt="x", caller_tag="inbox.eval")
+    for _ in range(2):
+        with session_scope("batch-a"):
+            await inv_mod._emit_invocation_failed_event(CCTimeoutError("slow"), inv, streaming=False)
+    clock["t"] += 61.0
+    monkeypatch.setattr(inv_mod, "_runtime_event_bus", lambda: None)
+    assert await inv_mod.declare_settled_failure_counts() == 0
+    owed = {k[3]: s[1] for k, s in inv_mod._failure_event_state.items() if s[1]}
+    assert owed == {"batch-a": 1}
+
+
+async def test_sweeper_loop_sweeps_each_interval_and_survives_errors(monkeypatch):
+    """The runtime loop keeps going past a failed sweep and stops on cancel."""
+    import genesis.cc.invoker as inv_mod
+
+    calls = {"n": 0}
+
+    async def sweep():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("sweep broke")
+        return 0
+
+    monkeypatch.setattr(inv_mod, "declare_settled_failure_counts", sweep)
+    task = asyncio.create_task(inv_mod.run_failure_count_sweeper(interval_s=0))
+    while calls["n"] < 3:
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert calls["n"] >= 3
+
+
+async def test_retired_count_is_dated_to_the_sessions_last_failure(monkeypatch, fail_bus):
+    """Review on #4433 (Codex): a count declared long after its failures must
+    not read as a fresh error. The declaration is back-dated to the session's
+    last failure (the swallowed one, not the first emit)."""
+    import genesis.cc.invoker as inv_mod
+    from genesis.observability.session_context import session_scope
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(inv_mod.time, "monotonic", lambda: clock["t"])
+    inv = CCInvocation(prompt="x", caller_tag="inbox.eval")
+    with session_scope("batch-a"):
+        await inv_mod._emit_invocation_failed_event(CCTimeoutError("slow"), inv, streaming=False)
+    clock["t"] += 20.0  # the swallowed failure, at t=1020
+    with session_scope("batch-a"):
+        await inv_mod._emit_invocation_failed_event(CCTimeoutError("slow"), inv, streaming=False)
+
+    clock["t"] = 1000.0 + 3 * 3600  # declared hours later, by an unrelated claim
+    with session_scope("batch-b"):
+        await inv_mod._emit_invocation_failed_event(CCTimeoutError("slow"), inv, streaming=False)
+    retired = [e[4] for e in fail_bus.events if e[4].get("retired")]
+    assert len(retired) == 1
+    assert retired[0]["occurred_seconds_ago"] == pytest.approx(3 * 3600 - 20.0)
+    fresh = [e[4] for e in fail_bus.events if not e[4].get("retired")]
+    assert all("occurred_seconds_ago" not in d for d in fresh)
 
 
 async def test_cancelled_declaration_puts_back_the_undeclared_counts(monkeypatch, fail_bus):

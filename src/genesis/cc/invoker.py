@@ -1608,14 +1608,19 @@ async def _emit_bg_truncation_event(cc_session_id: str) -> None:
 # enough to collapse one incident's fan-out burst into one row.
 _FAILURE_EVENT_COALESCE_S = 60.0
 # (error_class, caller_tag, roster_model, session_id) -> [monotonic time of last
-# emit, suppressed since]. Session ids are an open set and most sessions are
+# emit, suppressed since, monotonic time of the last failure (emitted or
+# suppressed)]. Session ids are an open set and most sessions are
 # one-shot (an inbox batch, an ego cycle), so a session's swallowed count usually
 # has no "next event" of its own to ride on. Each claim therefore retires every
 # session-scoped entry whose window has passed, and any count it still owes is
 # declared in an event of its own, against its own session
-# (_declare_retired_counts). Unscoped entries (session None) are a closed set and
-# keep the original rule: dropped when they owe nothing, otherwise kept so the
-# count rides on the next event for the same key.
+# (_declare_retired_counts). A session that goes quiet makes no further claim,
+# so a runtime-owned sweeper (run_failure_count_sweeper) does the same retiring
+# on a timer; without it a quiet session's count waited for an unrelated later
+# failure, or was lost at exit. A declared count is back-dated to its last
+# failure, so it never reads as a fresh error. Unscoped entries (session None)
+# are a closed set and keep the original rule: dropped when they owe nothing,
+# otherwise kept so the count rides on the next event for the same key.
 _FailureKey = tuple[str, str | None, str, str | None]
 _failure_event_state: dict[_FailureKey, list[float]] = {}
 
@@ -1645,6 +1650,7 @@ def _put_back_owed(key: _FailureKey, state: list[float]) -> None:
         _failure_event_state[key] = state
     else:
         current[1] += state[1]
+        current[2] = max(current[2], state[2])
 
 
 async def _declare_retired_counts(bus, owed: list[tuple[_FailureKey, list[float]]]) -> None:
@@ -1669,7 +1675,12 @@ async def _declare_retired_counts(bus, owed: list[tuple[_FailureKey, list[float]
 
 
 async def _declare_retired_count(bus, key: _FailureKey, state: list[float]) -> None:
-    """Emit one retired session's owed count (see ``_declare_retired_counts``)."""
+    """Emit one retired session's owed count (see ``_declare_retired_counts``).
+
+    The event is back-dated to the session's last failure: it reports failures
+    that already happened, and stamping it "now" would make a long-finished
+    session's error look active again to every recency consumer.
+    """
     from genesis.cc import exceptions as cc_exceptions
     from genesis.observability.types import Severity, Subsystem
 
@@ -1688,6 +1699,7 @@ async def _declare_retired_count(bus, key: _FailureKey, state: list[float]) -> N
         Severity.WARNING if is_limit else Severity.ERROR,
         "cc.invocation_failed",
         message,
+        occurred_seconds_ago=max(0.0, time.monotonic() - state[2]),
         error_class=error_class,
         roster_model=roster_model,
         session_id=session_id,
@@ -1695,6 +1707,38 @@ async def _declare_retired_count(bus, key: _FailureKey, state: list[float]) -> N
         coalesced=count,
         retired=True,
     )
+
+
+async def declare_settled_failure_counts() -> int:
+    """Retire expired coalescing entries now and declare the counts they owe.
+
+    The same retiring a claim does, without waiting for a claim: a session that
+    goes quiet after a swallowed failure makes none. Returns how many entries
+    were declared (or put back on a failed emit). No-ops without a bus, so
+    nothing is retired that could not be declared.
+    """
+    bus = _runtime_event_bus()
+    if bus is None:
+        return 0
+    owed = _sweep_failure_event_state(time.monotonic())
+    if owed:
+        await _declare_retired_counts(bus, owed)
+    return len(owed)
+
+
+async def run_failure_count_sweeper(interval_s: float = _FAILURE_EVENT_COALESCE_S) -> None:
+    """Runtime-owned loop: every ``interval_s``, declare settled failure counts.
+
+    Started at bootstrap and cancelled at shutdown (GenesisRuntime). A count is
+    declared at most one window plus one interval after its session's last
+    emitted event. Never exits on an ordinary error.
+    """
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            await declare_settled_failure_counts()
+        except Exception:
+            logger.debug("cc.invocation_failed failure-count sweep failed", exc_info=True)
 
 
 def _runtime_event_bus():
@@ -1781,6 +1825,7 @@ async def _emit_invocation_failed_event(
             prev_state = _failure_event_state.get(key)
             if prev_state is not None and now - prev_state[0] < _FAILURE_EVENT_COALESCE_S:
                 prev_state[1] += 1
+                prev_state[2] = now
                 key = None  # suppressed: nothing to roll back
                 return
             coalesced = int(prev_state[1]) if prev_state is not None else 0
@@ -1790,7 +1835,7 @@ async def _emit_invocation_failed_event(
             owed = [(k, st) for k, st in owed if k != key]
             # Claimed BEFORE the await so concurrent failures coalesce instead of
             # racing to emit; rolled back below if the emit itself fails.
-            _failure_event_state[key] = [now, 0]
+            _failure_event_state[key] = [now, 0, now]
 
         from genesis.observability.types import Severity, Subsystem
 
