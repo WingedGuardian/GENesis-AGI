@@ -1885,7 +1885,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: 6b4f275 2026-11-08
+verified: 70fa89bf5 2026-11-15
 ```
 
 Scoped verification: internal `mcp/shared_http` composition only. It receives
@@ -2071,6 +2071,16 @@ the shared banner is not an assertion about all concurrent sessions.
   only after original scope registration and admission. It uses the shared
   native-intent seam; imported vendor files remain trusted installed inputs.
   This wiring preserves negative readiness and does not activate indexing.
+  Scoped code-intelligence contribution verification against main70fa89bf5
+  (2026-11-15; observer implementation belongs to this contribution): the runner's
+  source-only queue-health observer retains a boot-local consecutive-busy clock,
+  queues a warning after two observed hours, and retries pending notices through
+  the existing best-effort guardian transport. Captured helper bytes, exact
+  per-descriptor kernel lock records on layered filesystems and a bounded own
+  notification worker preserve the original tick status. The timing record is
+  observation-only; provider state, quarantine and launch/readiness authority are
+  unchanged. This check does not requalify the other channel/interface subsystems
+  or native production capacity.
   Initial owner admission observes the complete known managed-scope namespace
   before reservation, rechecking terminal identities and recursive population.
   This point-in-time census is not global physical exclusion. Standalone manual

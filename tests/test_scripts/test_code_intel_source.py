@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SELF = "scripts/lib/code_intel_source.py"
 PYTHON = (
     SELF,
+    "scripts/lib/code_intel_busy.py",
     "scripts/lib/managed_units.py",
     "scripts/lib/code_intel_cbm_admission.py",
     "src/genesis/util/systemd.py",
@@ -49,8 +50,10 @@ SHELL = (
     "scripts/lib/gitnexus_version.sh",
     "scripts/lib/proc_pressure.sh",
     "scripts/lib/code_intel_scope.sh",
+    "scripts/lib/alert_queue.sh",
 )
 ALIASES = (
+    "_genesis_code_intel_busy",
     "managed_units",
     "code_intel_cbm_admission",
     "_genesis_util_systemd",

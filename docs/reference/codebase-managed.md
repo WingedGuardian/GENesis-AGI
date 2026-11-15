@@ -490,6 +490,52 @@ consumer is prepared behind this fence; native evidence and durable
 resource-failure quarantine must complete before automatic work can resume.
 That readiness does not authorize lifting a freeze or disable sentinel.
 
+### Prolonged queue contention
+
+The runner retains a small observation clock at
+`$GENESIS_HOME/code-intel-runner-busy.json` (default `~/.genesis/`). Consecutive
+observed queue-busy ticks spanning two hours queue a warning through the existing
+guardian alert transport. This measures the span of observed ticks, not continuous
+sampling. A nonbusy/error tick ends the clock; a new boot starts timing again.
+Overlapping ticks and startup failures before queue observation leave it alone.
+An already-due notice survives failed enqueue, nonbusy ticks and reboot. Further
+due intervals coalesce under the oldest pending key with a count and first/latest
+intervals, rather than growing an unbounded history.
+
+Warnings include an enqueue-attempt timestamp and available kernel lock-holder
+PIDs/command names for the queue files. They avoid full process arguments.
+Layered filesystems can expose different devices in `stat` and `/proc/locks`;
+the fallback requires a matching descriptor identity **and** its exact kernel
+lock record. An open descriptor alone never establishes a holder. Exited,
+unreadable, namespace-hidden and unidentified open-file-description owners stay
+explicitly unknown. These are contemporaneous diagnostics, not stable process
+identities or permission to terminate anything.
+
+The source-only observer uses captured helper bytes and the existing runner lock.
+Its worker/notification process group has a five-second observation budget;
+timeouts and uncertain completion preserve the original tick status and retain
+actual pending state for retry. Non-interruptible kernel I/O remains a limit;
+the observer cannot promise that a signal instantly releases such a task's locks.
+The bound also assumes its coordinator remains alive and scheduled: killing only
+that process can leave its child running. The rendered service retains systemd's
+default control-group stop behavior; effective native unit behavior is separately
+qualified. This is not a supervisor-death or SIGKILL recovery guarantee.
+The notifier inherits neither the runner lock nor the source capsule. Its queue
+root follows the actual runtime's `GENESIS_HOME` resolver; an unrelated ambient
+`GENESIS_ALERT_QUEUE_ROOT` does not redirect it. Custom locations outside HOME
+still require the operator-owned systemd allowlist described above.
+
+The timing record uses file and directory synchronization. Canonical alert enqueue
+is atomic and best-effort; it does not prove delivery or power-loss survival.
+Unknown future/nonregular or oversized timing records are left untouched and
+diagnosed. Malformed current timing starts a fresh clock with an error notice;
+valid pending debt is retained where readable. A failed state write can leave
+older timing, so continuity across that write is uncertain. Only this observer's
+owned regular temporary files are pruned by its next publication. None of this
+changes provider evidence, attempts, quarantine, retry grants or readiness.
+The current opaque owner/apply error remains an error; the later cutover needs
+its separate typed busy distinction before enabling consumption.
+
 No ordinary command converts an existing queue. Converting on connect is unsafe
 across code rollbacks: a failed update restores older code but not the queue,
 and older code refuses a newer schema. On an older queue (schema 1, 2 or 3, or an

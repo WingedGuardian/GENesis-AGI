@@ -19,10 +19,13 @@ import json
 import os
 import re
 import shlex
+import signal
 import stat
 import subprocess
 import sys
-from contextlib import contextmanager
+import threading
+import time
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -31,6 +34,7 @@ SELF = "scripts/lib/code_intel_source.py"
 # Dependency order and names are closed. Extending the queued runtime requires
 # explicitly updating this inventory, assembly and its drift tests together.
 MODULES = (
+    ("busy", "_genesis_code_intel_busy", "scripts/lib/code_intel_busy.py"),
     ("units", "managed_units", "scripts/lib/managed_units.py"),
     ("admission", "code_intel_cbm_admission", "scripts/lib/code_intel_cbm_admission.py"),
     ("systemd", "_genesis_util_systemd", "src/genesis/util/systemd.py"),
@@ -57,11 +61,12 @@ SHELL = (
     "scripts/lib/gitnexus_version.sh",
     "scripts/lib/proc_pressure.sh",
     "scripts/lib/code_intel_scope.sh",
+    "scripts/lib/alert_queue.sh",
 )
 FILE_LIMIT = 1024 * 1024
 CAPSULE_LIMIT = 4 * FILE_LIMIT
 RUNTIME_ROLES = ('reporter',)
-SOURCE_ROLES = ('owner',)
+SOURCE_ROLES = ('owner', 'tick-observation')
 SEALS = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
 # Read entry once BEFORE compiling its substantive code, register for dataclasses,
 # and retain its original origin. -I -S excludes caller imports and site hooks.
@@ -326,6 +331,7 @@ class Snapshot:
         ]
         if role == 'runner':
             functions.append(('_ci_owner', 'owner', ()))
+            functions.append(('_ci_tick', 'tick-observation', ()))
         for function, action, arguments in functions:
             lines.append(
                 function
@@ -454,12 +460,82 @@ def _runner_lock_fds():
     return (8,)
 
 
-def main(argv=None):
+def _tick_signal(pid, signum):
+    # OwnedProcess's WNOWAIT rule: close numeric authority BEFORE final reap.
+    # This fixed isolated CLI has default SIGCHLD and exclusive child reaping.
+    os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    for send in (os.killpg, os.kill):
+        with suppress(ProcessLookupError):
+            send(pid, signum)  # Own unreaped child; also covers the pre-setsid race.
+
+
+def _coordinate_tick(argv, until):
+    if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL or threading.active_count() != 1:
+        raise ValueError('tick observation requires the isolated CLI child owner')
+    pid = os.fork()
+    if pid == 0:
+        result = 76
+        try:
+            os.setsid()
+            # Inherit the exact loaded entry/capsule. No live self reload or new
+            # partial-capsule protocol; all capture/restore/assembly is supervised.
+            result = main(argv, _observation_child=True)
+        except BaseException as error:
+            print('code-intel: health worker failed: ' + type(error).__name__, file=sys.stderr, flush=True)
+        os._exit(0 if result == 0 else 76)
+    result, reaped = 76, False
+    try:
+        for signum, deadline in ((None, until - 1), (signal.SIGTERM, until - 0.25),
+                                 (signal.SIGKILL, until)):
+            if signum is not None:
+                _tick_signal(pid, signum)
+            observed = None
+            while time.monotonic() < deadline:
+                observed = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                if observed is not None:
+                    if signum is None and observed.si_code == os.CLD_EXITED and observed.si_status == 0:
+                        result = 0
+                    break
+                time.sleep(0.02)
+            if observed is not None:
+                break
+    except ChildProcessError:
+        print('code-intel: observation child ownership lost', file=sys.stderr)
+    finally:
+        try:
+            _tick_signal(pid, signal.SIGKILL)
+        except ChildProcessError:
+            pass  # No numeric signals after another reaper consumed its identity.
+        else:
+            while True:
+                ended, _ = os.waitpid(pid, os.WNOHANG)
+                if ended == pid:
+                    reaped = True
+                    break
+                if time.monotonic() >= until:
+                    break
+                time.sleep(0.02)
+    if result != 0 or not reaped:
+        print('code-intel: health observation incomplete; completion uncertain', file=sys.stderr)
+    return result if reaped else 76
+
+
+def main(argv=None, *, _observation_child=False):
+    observation_until = time.monotonic() + 5
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("describe", "shell", "queue", "available", *SOURCE_ROLES, *RUNTIME_ROLES))
     parser.add_argument("profile", choices=("entry", "runner"))
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+    if args.action == 'tick-observation' and not _observation_child:
+        if args.profile != 'runner' or len(args.arguments) != 2:
+            parser.error('tick observation requires runner outcome and phase')
+        try:
+            _runner_lock_fds()
+            return _coordinate_tick(argv, observation_until)
+        except (OSError, ValueError) as error:
+            print('code-intel: tick observation refused: ' + type(error).__name__, file=sys.stderr)
+            return 76
     if "_CAPSULE_FD" in globals():
         captured = restore(
             globals()["_CAPSULE_FD"], globals()["_ENTRY_BYTES"], globals()["_CAPSULE_SHA256"]
@@ -476,6 +552,20 @@ def main(argv=None):
         parser.error('executable role requires private runner runtime')
     if captured.runtime_value is not None and args.action not in ('describe', *RUNTIME_ROLES):
         parser.error("runtime capsule cannot use a source-only role")
+    if args.action == 'tick-observation':
+        if len(args.arguments) != 2:
+            parser.error('tick observation requires outcome and phase')
+        try:
+            _runner_lock_fds()
+            modules = captured.assemble()
+            busy = modules['busy']
+            outcome, phase = args.arguments
+            if outcome not in busy.OUTCOMES or phase not in busy.PHASES:
+                parser.error('unknown tick observation')
+            return busy.worker(captured, outcome, phase)
+        except (OSError, ValueError) as error:
+            print('code-intel: tick observation refused: ' + type(error).__name__, file=sys.stderr)
+            return 76
     if args.action == 'owner':
         if len(args.arguments) != 3:
             parser.error('initial owner requires context, run mode and managed config')

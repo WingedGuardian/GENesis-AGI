@@ -160,6 +160,29 @@ elif [ "$lock_rc" -ne 0 ]; then
     exit 75
 fi
 
+TICK_OUTCOME=unobserved
+TICK_PHASE=startup
+QUEUE_OUTPUT=""
+_finish_tick() {
+    local original_rc="$1" observer_rc=0
+    trap - EXIT
+    if [ -n "$QUEUE_OUTPUT" ]; then rm -f -- "$QUEUE_OUTPUT"; fi
+    if [ "$TICK_OUTCOME" != unobserved ]; then
+        if declare -F _ci_tick >/dev/null; then
+            _ci_tick "$TICK_OUTCOME" "$TICK_PHASE" >> "$LOG_FILE" 2>&1 || observer_rc=$?
+        else
+            /usr/bin/python3 -I -S "$SCRIPT_DIR/lib/code_intel_source.py" \
+                tick-observation runner "$TICK_OUTCOME" "$TICK_PHASE" \
+                >> "$LOG_FILE" 2>&1 || observer_rc=$?
+        fi
+        if [ "$observer_rc" -ne 0 ]; then
+            _log "tick health observation incomplete (rc=$observer_rc) — original status retained"
+        fi
+    fi
+    exit "$original_rc"
+}
+trap '_finish_tick "$?"' EXIT
+
 if declare -F _ci_entry >/dev/null; then
     if [ "$ENTRYPOINT" != "$_CI_EXPECTED_ENTRY" ]; then
         _log "captured runner requires its captured entrypoint — deferring"
@@ -181,11 +204,13 @@ fi
 # per-tick JSON goes to /dev/null so the pause adds one log line per tick, not
 # two; its errors still reach the log.
 protocol_rc=0
+TICK_OUTCOME=error
+TICK_PHASE=readiness
 _marker automatic-ready > /dev/null 2>> "$LOG_FILE" || protocol_rc=$?
 case "$protocol_rc" in
     0) _log "readiness helper reported ready, but this protocol has no ready state — stopping tick"; exit 76 ;;
-    10) _log "automatic queue protocol incomplete — deferring"; exit 0 ;;
-    75) _log "queue busy at readiness — deferring"; exit 0 ;;
+    10) TICK_OUTCOME=nonbusy; _log "automatic queue protocol incomplete — deferring"; exit 0 ;;
+    75) TICK_OUTCOME=busy; _log "queue busy at readiness — deferring"; exit 0 ;;
     *) _log "automatic queue protocol observation failed — stopping tick"; exit 76 ;;
 esac
 if ! declare -F _ci_owner >/dev/null; then
@@ -194,6 +219,7 @@ if ! declare -F _ci_owner >/dev/null; then
     # raw waiter must release its lock so the captured child can acquire it;
     # another tick may win that race and the child then defers normally.
     _log "entering captured runner before typed queue dispatch"
+    TICK_OUTCOME=unobserved
     exec 8>&-
     capture_rc=0
     /usr/bin/python3 -I -S "$SCRIPT_DIR/lib/code_intel_source.py" shell runner runner || capture_rc=$?
@@ -207,26 +233,30 @@ if ! QUEUE_OUTPUT="$(umask 077; mktemp -- "$GENESIS_HOME/.code-intel-output.XXXX
     _log "cannot create queue transport — stopping tick"
     exit 76
 fi
-trap 'rm -f -- "$QUEUE_OUTPUT"' EXIT
+TICK_OUTCOME=error
+TICK_PHASE=inflight
 
 # Preserve legacy settlement, then reconcile typed claims from durable facts.
 reconcile_rc=0
 _marker reconcile-inflight >> "$LOG_FILE" 2>&1 || reconcile_rc=$?
 case "$reconcile_rc" in 0) ;;
-    75) _log "queue busy at inflight reconciliation — deferring"; exit 0 ;;
+    75) TICK_OUTCOME=busy; _log "queue busy at inflight reconciliation — deferring"; exit 0 ;;
     *) _log "inflight reconciliation failed — stopping tick without claiming new work"; exit 76 ;;
 esac
 reconcile_rc=0
+TICK_PHASE=native
 _marker reconcile-native >> "$LOG_FILE" 2>&1 || reconcile_rc=$?
 case "$reconcile_rc" in 0) ;;
-    75) _log "queue busy at native reconciliation — deferring"; exit 0 ;;
+    75) TICK_OUTCOME=busy; _log "queue busy at native reconciliation — deferring"; exit 0 ;;
     *) _log "native reconciliation failed — stopping tick without claiming new work"; exit 76 ;;
 esac
 
 list_rc=0
+TICK_PHASE=pending-list
 _queue_capture list-legs --nul || list_rc=$?
 if [ "$list_rc" -eq 75 ]; then
     _log "queue busy at pending-list — deferring"
+    TICK_OUTCOME=busy
     exit 0
 fi
 if [ "$list_rc" -ne 0 ] || ! _read_wire; then
@@ -259,9 +289,10 @@ for ((i=0; i<${#_MARKERS[@]}; i+=6)); do
     _idle_ok "$age" || continue
 
     claim_rc=0
+    TICK_PHASE=claim
     _queue_capture claim-native --hash "$hash" --provider "$provider" --nul || claim_rc=$?
     case "$claim_rc" in 0|1) ;;
-        75) _log "queue busy at claim — deferring"; exit 0 ;;
+        75) TICK_OUTCOME=busy; _log "queue busy at claim — deferring"; exit 0 ;;
         *) _log "claim failed (rc=$claim_rc) — stopping tick"; exit 76 ;;
     esac
     if ! _read_wire; then
@@ -292,9 +323,10 @@ for ((i=0; i<${#_MARKERS[@]}; i+=6)); do
     context="${_WIRE[6]}"
     if [ "$provider" = cbm ] && _cbm_disabled "$repo"; then
         reconcile_rc=0
+        TICK_PHASE=disabled-claim
         _marker reconcile-native >> "$LOG_FILE" 2>&1 || reconcile_rc=$?
         case "$reconcile_rc" in 0) ;;
-            75) _log "queue busy reconciling disabled claim — deferring"; exit 0 ;;
+            75) TICK_OUTCOME=busy; _log "queue busy reconciling disabled claim — deferring"; exit 0 ;;
             *) _log "disabled claim reconciliation failed — stopping tick"; exit 76 ;;
         esac
         _log "CBM disabled after claim — restored request: $repo"
@@ -304,6 +336,7 @@ for ((i=0; i<${#_MARKERS[@]}; i+=6)); do
     run_mode="$mode"
     if [ "$provider" = cbm ] && [ "$mode" != full ]; then
         escalation_rc=0
+        TICK_PHASE=escalation
         _queue_capture should-escalate --hash "$hash" --nul || escalation_rc=$?
         escalation_ok=0
         if [ "$escalation_rc" -eq 0 ] && _read_wire && [ "${#_WIRE[@]}" -eq 4 ]; then
@@ -320,6 +353,7 @@ for ((i=0; i<${#_MARKERS[@]}; i+=6)); do
                 *) _log "unstarted claim reconciliation failed — stopping tick"; exit 76 ;;
             esac
             _log "queue busy at full-escalation check — retained claim, deferring"
+            TICK_OUTCOME=busy
             exit 0
         fi
         if [ "$escalation_ok" -ne 1 ]; then
@@ -330,6 +364,7 @@ for ((i=0; i<${#_MARKERS[@]}; i+=6)); do
     fi
 
     _log "indexing $repo (tools=$provider mode=$run_mode)"
+    TICK_PHASE=owner
     : > "$QUEUE_OUTPUT" || exit 76
     if ! _ci_owner "$context" "$run_mode" "$HOME/.genesis/config/codebase-managed.json" \
             > "$QUEUE_OUTPUT" 2>> "$LOG_FILE"; then
@@ -350,4 +385,6 @@ for ((i=0; i<${#_MARKERS[@]}; i+=6)); do
     _log "native request ${_WIRE[5]}: $repo (tools=$provider mode=$run_mode)"
 done
 
+TICK_OUTCOME=nonbusy
+TICK_PHASE=complete
 exit 0

@@ -1,0 +1,1 @@
+- Warn when consecutive code-intelligence queue-busy observations span two hours, retaining failed notification attempts and reporting available lock holders without enabling indexing or changing retry permissions.
