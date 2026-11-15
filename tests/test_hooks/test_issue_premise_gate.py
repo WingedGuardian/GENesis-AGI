@@ -85,6 +85,19 @@ It breaks.
 """
 
 MISSING = "Just a short note about the thing."
+#: The nine-item form: its Problem block complete, and the same block with
+#: answer 5 lacking its ``Wrong fix:`` label, so the parity check covers both forms.
+NEW_PROBLEM = """## Summary
+Do the thing.
+
+## Premise checks
+1. Observed: the guard fails on main at abc123; not a stale tree.
+2. Intended: it passes. Stated: docs/x.md:40
+3. Cost: every PR, counted from CI runs.
+4. Searched: issues and main; nothing.
+5. Acceptance: a merged migration passes. Wrong fix: pinning the base to HEAD.
+"""
+NEW_PARTIAL = NEW_PROBLEM.replace(" Wrong fix: pinning the base to HEAD.", "")
 
 
 def _bug_form_body() -> str:
@@ -207,7 +220,7 @@ def test_owed_answers_honours_both_exemptions():
     ("body", "labels", "created", "section"),
     list(
         itertools.product(
-            [MISSING, PARTIAL, SIX, VERIFIED, "bugform"],
+            [MISSING, PARTIAL, SIX, VERIFIED, NEW_PROBLEM, NEW_PARTIAL, "bugform"],
             [[], ["bug"], [{"name": "bug"}, {"name": "x"}]],
             [PRE_EPOCH, NOW],
             [None],
