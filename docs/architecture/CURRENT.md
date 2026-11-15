@@ -1473,10 +1473,14 @@ verified: 0164dd1f0 2026-10-14
   the caller-supplied `labeled_surplus`. A cold IDENTITY send to a non-prospect
   is untouched. The owner REJECTING such a hold keeps the grant
   (`email_gate_watcher._is_posture_hold`: curated prospect + cell still
-  GRANTED); every other rejection stays a correction. Known limits: in `live`,
-  a follow-up on a second, unanswered thread to a prospect who replied on
-  another thread is not a "reply" and sends; an owner-approved non-BULK prospect
-  hold is delivered even with the lever at `off` (only BULK holds re-check it).
+  GRANTED); every other rejection stays a correction. At delivery the drain's
+  kill-switch re-check covers every approved hold that is BULK or goes to a
+  prospect, whatever its class (`email_gate_watcher._is_prospect_send`; a lookup
+  error pauses), and both delivery paths stamp every prospect the recipient
+  string names (`marketing_prospects.mark_contacted_in_recipient`), so a
+  `Name <addr>` recipient counts as contacted. Known limit: in `live`, a
+  follow-up on a second, unanswered thread to a prospect who replied on another
+  thread is not a "reply" and sends.
   Graduation for the BULK cell rides the generic
   capability-promotion path (`capability_grants.detect_promotable_cells` →
   `email:send:bulk` qualifies once it has ≥5 owner-approved successes +
@@ -1497,7 +1501,8 @@ verified: 0164dd1f0 2026-10-14
   that converts per-action approval into a standing grant; a denylist would hand
   that conversion to every new capability by default. **Contact-stamping (loop-fix):** on a CONFIRMED
   delivery a matching prospect is advanced active → `contacted` via one
-  active-guarded CRUD (`marketing_prospects.mark_contacted_by_email`) called from
+  active-guarded CRUD (`marketing_prospects.mark_contacted_in_recipient`, which
+  stamps every prospect the recipient string names) called from
   BOTH delivery paths — the email-gate drain (`email_gate_watcher`) for a HELD →
   owner-approved send, AND `pipeline._deliver` for a GRANTED-cell autonomous send
   (which delivers inline and never touches the drain, so the fix survives
