@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pwd
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -48,13 +49,55 @@ def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
     )
 
 
+_ISOLATED = ("TRASH_DIR", "LOG_DIR", "TOMBSTONE_INDEX", "BOARD_CACHE")
+
+
+def _live_locations(name: str) -> set[Path]:
+    """Where the module writes with no patch: its value on load, and the same
+    path under the account's real home, which a redirected HOME does not move."""
+    loaded = Path(getattr(wl, name))
+    found = {loaded.resolve()}
+    try:
+        rel = loaded.relative_to(Path.home())
+    except ValueError:
+        return found
+    try:
+        real_home = pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:  # a uid with no passwd entry: HOME is all there is
+        return found
+    found.add((Path(real_home) / rel).resolve())
+    return found
+
+
+# Taken on load, before any test patches the module.
+_LIVE = {name: _live_locations(name) for name in _ISOLATED}
+
+
+def _require_isolation() -> None:
+    """Refuse to run against the live trash, journal, log or board cache.
+
+    `_isolate` is autouse, but a test imported into another module with
+    `from ... import *` runs without it, because `*` skips underscore names.
+    The helpers below call this through this module's own globals, so it
+    holds however the test that calls them was collected."""
+    for name in _ISOLATED:
+        current = Path(getattr(wl, name)).resolve()
+        for live in _LIVE[name]:
+            if current == live or live in current.parents:
+                pytest.fail(
+                    f"{name} resolves to the live {live}: the isolation fixture did not run",
+                    pytrace=False,
+                )
+
+
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     """Never touch the operator's real ~/.genesis."""
-    for name in ("TRASH_DIR", "LOG_DIR", "TOMBSTONE_INDEX", "BOARD_CACHE"):
+    for name in _ISOLATED:
         monkeypatch.setattr(wl, name, tmp_path / f"isolated-{name.lower()}")
     for var in (wl.RETENTION_ENV, wl.STALE_CLAIM_ENV, wl.COMPACTION_ENV):
         monkeypatch.delenv(var, raising=False)
+    _require_isolation()
 
 
 @pytest.fixture
@@ -100,6 +143,7 @@ def _archive(
 ) -> dict:
     """Archive a worktree holding one commit only it reaches, through the REAL
     reaper. ``setup(wt)`` runs after that commit and before archiving."""
+    _require_isolation()
     wt = tmp_path / name
     if branch:
         _git(repo, "worktree", "add", "-q", "-b", branch, str(wt))
@@ -171,6 +215,7 @@ def _admin(repo: Path, entry: str) -> Path:
 
 
 def _compact(repo: Path, **kw) -> dict:
+    _require_isolation()
     kw.setdefault("days", 30)
     return wl._compact_trash(repo, **kw)
 
@@ -785,6 +830,134 @@ def test_a_stub_without_an_anchor_token_stays_recoverable_and_holds_cleanup(
     _git(repo, "update-ref", "-d", _pin_ref(a["entry"]))
     assert _compact(repo)["repinned"] == 1, "the audit still repairs its pin"
     assert wl._recover(a["entry"], repo, {}) is True
+
+
+def _leftover(repo, tmp_path, monkeypatch, name, **kw) -> dict:
+    """A run that unlocked its anchor and died before pruning it: an unlocked,
+    checkout-less registration carrying the stub's mark is left behind."""
+    a = _archive(repo, tmp_path, name, **kw)
+    real = wl._prune_anchor
+    monkeypatch.setattr(wl, "_prune_anchor", lambda *_a, **_k: False)
+    assert _compact(repo)["compacted"] == 0
+    monkeypatch.setattr(wl, "_prune_anchor", real)
+    assert str(a["path"]) in _registered(repo), "control: the leftover registration is there"
+    return a
+
+
+def test_a_leftover_finishes_after_its_branch_is_deleted(repo, tmp_path, monkeypatch):
+    """The leftover's HEAD names the archived branch. Once that branch is
+    deleted HEAD no longer resolves, which loses nothing: the pin holds the
+    head. The cleanup must finish, not hold on every later run."""
+    a = _leftover(repo, tmp_path, monkeypatch, "lbr", branch="feat-lbr")
+    _git(repo, "update-ref", "-d", "refs/heads/feat-lbr")
+
+    counts = _compact(repo)
+
+    assert counts["resumed"] == 1 and counts["held"] == 0, counts
+    assert not a["archive"].exists()
+    assert str(a["path"]) not in _registered(repo)
+    again = _compact(repo)
+    assert again["resumed"] == 0 and again["held"] == 0, again
+    _gc_now(repo)
+    assert _commit_exists(repo, a["head"])
+    assert wl._recover(a["entry"], repo, {}) is True
+
+
+def test_a_leftover_finishes_after_its_branch_moves_on(repo, tmp_path, monkeypatch):
+    """The branch moved to a commit the branch itself still reaches: nothing
+    only the leftover holds, so the cleanup finishes."""
+    a = _leftover(repo, tmp_path, monkeypatch, "lmv", branch="feat-lmv")
+    tree = _git(repo, "rev-parse", f"{a['head']}^{{tree}}").stdout.strip()
+    moved = _git(repo, "commit-tree", tree, "-p", a["head"], "-m", "moved").stdout.strip()
+    _git(repo, "update-ref", "refs/heads/feat-lmv", moved)
+
+    counts = _compact(repo)
+
+    assert counts["resumed"] == 1 and counts["held"] == 0, counts
+    assert str(a["path"]) not in _registered(repo)
+
+
+def test_a_leftover_whose_head_moved_to_unreachable_work_still_holds(repo, tmp_path, monkeypatch):
+    """HEAD need not equal the head, but a HEAD only the leftover reaches (a
+    commit written straight into it, with no reflog entry) is work the pin
+    does not hold: the registration stays."""
+    a = _leftover(repo, tmp_path, monkeypatch, "ldh")
+    admin = wl._admin_worktrees_dir(repo)
+    adm = next(p for p in admin.iterdir() if wl._registration_path(p) == str(a["path"]))
+    tree = _git(repo, "rev-parse", f"{a['head']}^{{tree}}").stdout.strip()
+    extra = _git(repo, "commit-tree", tree, "-p", a["head"], "-m", "x").stdout.strip()
+    (adm / "HEAD").write_text(extra + "\n")
+
+    counts = _compact(repo)
+
+    assert counts["held"] == 1, counts
+    assert str(a["path"]) in _registered(repo)
+    _git(repo, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all")
+    _git(repo, "gc", "--prune=now", "-q")
+    assert _commit_exists(repo, extra), "the held registration's HEAD keeps the commit"
+
+
+def test_a_leftover_whose_head_cannot_be_read_holds(repo, tmp_path, monkeypatch):
+    """Without HEAD equality, a HEAD that does not resolve holds nothing. A
+    read that never answered (a timeout, an OSError) is not that answer: the
+    same leftover as above, its HEAD the only holder of a commit, must hold
+    when only that one read fails."""
+    a = _leftover(repo, tmp_path, monkeypatch, "lhr")
+    admin = wl._admin_worktrees_dir(repo)
+    adm = next(p for p in admin.iterdir() if wl._registration_path(p) == str(a["path"]))
+    tree = _git(repo, "rev-parse", f"{a['head']}^{{tree}}").stdout.strip()
+    extra = _git(repo, "commit-tree", tree, "-p", a["head"], "-m", "x").stdout.strip()
+    (adm / "HEAD").write_text(extra + "\n")
+    real_load = wl._load_compaction_module
+
+    def load():
+        mod = real_load()
+        real_rc = mod._git_rc
+
+        def flaky(lc, root, args, **kw):
+            if "HEAD^{commit}" in args and str(adm) in args:
+                return None, ""
+            return real_rc(lc, root, args, **kw)
+
+        mod._git_rc = flaky
+        return mod
+
+    monkeypatch.setattr(wl, "_load_compaction_module", load)
+
+    counts = _compact(repo)
+
+    assert counts["held"] == 1 and counts["resumed"] == 0, counts
+    assert str(a["path"]) in _registered(repo)
+    _git(repo, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all")
+    _git(repo, "gc", "--prune=now", "-q")
+    assert _commit_exists(repo, extra)
+
+
+@pytest.mark.parametrize("name", _ISOLATED)
+@pytest.mark.parametrize("under", [False, True], ids=["itself", "beneath"])
+def test_the_isolation_guard_refuses_a_live_location(monkeypatch, name, under):
+    """Without `_isolate`, every helper that archives or compacts stops before
+    it writes. Proven here by pointing one location back at its live value;
+    nothing is written, since only the guard runs."""
+    for live in _LIVE[name]:
+        monkeypatch.setattr(wl, name, live / "x" if under else live)
+        with pytest.raises(pytest.fail.Exception, match="isolation fixture did not run"):
+            _require_isolation()
+
+
+def test_the_isolation_guard_covers_the_real_home_under_a_redirected_one():
+    try:
+        real = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except KeyError:
+        pytest.skip("this uid has no passwd entry, so there is no other home")
+    for name in _ISOLATED:
+        assert any(real in p.parents for p in _LIVE[name]), (name, _LIVE[name])
+
+
+def test_the_isolation_fixture_points_every_location_into_the_test_dir(tmp_path):
+    for name in _ISOLATED:
+        assert tmp_path in Path(getattr(wl, name)).resolve().parents, name
+    _require_isolation()
 
 
 class _Killed(BaseException):

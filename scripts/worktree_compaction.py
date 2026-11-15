@@ -182,8 +182,9 @@ def _loses_history(
     so it holds whatever recovery or anyone else did to it since the stub was
     written.
 
-    ``check_head=False`` is for a LOCKED anchor that carries this stub's mark:
-    its HEAD need not equal the head (the branch it names may since have moved
+    ``check_head=False`` is for a registration that carries this stub's mark,
+    a LOCKED anchor or the unlocked leftover of an interrupted prune: its HEAD
+    need not equal the head (the branch it names may since have moved
     or been deleted, and the pin already holds the head), but a HEAD that
     still resolves must be reachable from a branch, remote, tag or the head,
     like its reflog commits, so a commit written straight into a detached
@@ -198,6 +199,10 @@ def _loses_history(
         rc, out = _git_rc(
             lc, repo_root, ["--git-dir", str(admin), "rev-parse", "--verify", "-q", "HEAD^{commit}"]
         )
+        # 1 is git's answer that HEAD names no commit; anything else (a timeout,
+        # a broken admin directory) is no answer, and no answer protects nothing.
+        if rc not in (0, 1):
+            return "its registration's HEAD could not be read"
         if rc == 0 and out.strip() and out.strip() != head:
             extra.add(out.strip())
     rc, _ = _git_rc(
@@ -620,9 +625,12 @@ def _prune_leftover_registration(lc, red, repo_root: Path, stub: dict) -> str:
     if not _owns_anchor(lc, stub, admin):
         # Same name and path, new admin directory: a recovery recreated it.
         return "none"
-    lost = _loses_history(lc, red, repo_root, admin, stub["head"])
+    # Its branch may have moved or been deleted since the run died, as for a
+    # locked anchor in `_finish`: HEAD need not equal the head, only be
+    # reachable from something that stays.
+    lost = _loses_history(lc, red, repo_root, admin, stub["head"], check_head=False)
     if lost is not None:
-        # A recovery reattached it and it moved on; it is the user's now.
+        # Something this run does not own was left in it; it holds.
         return f"held: {lost}"
     return (
         "pruned"
