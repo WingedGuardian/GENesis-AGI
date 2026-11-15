@@ -1,0 +1,1 @@
+- **Dashboard: clicking "enable" on a disabled provider now enables it, even after its hold window has passed.** Once a disabled provider's hold expired (30 minutes), clicking "enable" disabled it for another window instead. The dashboard now sends the action its button showed, and the toggle route acts on that rather than re-reading the breaker state.

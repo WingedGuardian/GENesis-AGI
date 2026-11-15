@@ -21,6 +21,7 @@ the schema authority; nothing here creates tables. ``now`` is always injected
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import aiosqlite
@@ -165,6 +166,7 @@ async def open_verification(
     now: str,
     closed_reason: str | None = None,
     commit: bool = True,
+    closed_by: str | None = None,
 ) -> str:
     """Record one merged PR's verification obligation. Returns an outcome word.
 
@@ -181,26 +183,34 @@ async def open_verification(
       changed (whatever its status — a closed row is a decision already made).
     - ``"unavailable"`` — pre-migration window; nothing written. The caller
       must NOT count this PR as recorded (dedup makes the retry idempotent).
+
+    ``closed_by`` labels a row born closed (who applied the exemption); it is
+    ignored for an open row and written only when the column exists.
     """
     if not await _tables_available(db):
         return "unavailable"
     status = "closed" if closed_reason else "open"
+    columns = ("id, repo, pr_number, pr_title, merged_at, status, closed_reason, "
+               "closed_at, evidence, created_at")
+    values = [
+        uuid.uuid4().hex,
+        repo,
+        pr_number,
+        pr_title,
+        merged_at,
+        status,
+        closed_reason,
+        now if closed_reason else None,
+        None,
+        now,
+    ]
+    if closed_reason and closed_by is not None and await _attribution_columns_available(db):
+        columns += ", closed_by"
+        values.append(closed_by)
     cursor = await db.execute(
-        "INSERT OR IGNORE INTO pr_verifications "
-        "(id, repo, pr_number, pr_title, merged_at, status, closed_reason, "
-        "closed_at, evidence, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
-        (
-            uuid.uuid4().hex,
-            repo,
-            pr_number,
-            pr_title,
-            merged_at,
-            status,
-            closed_reason,
-            now if closed_reason else None,
-            now,
-        ),
+        f"INSERT OR IGNORE INTO pr_verifications ({columns}) "
+        f"VALUES ({', '.join('?' * len(values))})",
+        tuple(values),
     )
     if commit:
         await db.commit()
@@ -217,6 +227,8 @@ async def close_verification(
     evidence: str | None,
     now: str,
     rechecks: list[dict] | None = None,
+    recorded_by: str | None = None,
+    recorded_session: str | None = None,
 ) -> bool:
     """Close an OPEN obligation with its verification record (the validator's
     write). True iff a row changed — a closed row never flips back or gets its
@@ -258,6 +270,10 @@ async def close_verification(
     Event-gated ``rechecks`` are stored atomically with the close. Omitted entries
     are derived from typed evidence, covering existing callers during rollout.
     A close owing rechecks refuses while their column is absent.
+
+    ``recorded_by`` (``caller_context.client_kind()``) and ``recorded_session``
+    are stamped as ``closed_by``, ``last_attempt_by`` and ``recorded_session`` in
+    the same UPDATE, when the columns exist; they label the row and decide nothing.
     """
     if verdict not in PASS_VERDICTS:
         raise ValueError(
@@ -285,6 +301,13 @@ async def close_verification(
     params = (reason, now, evidence, verdict, now)
     if stored is not None:
         params += (stored,)
+    # A close is an attempt too (it sets last_attempt_at and counts), so its
+    # client is the latest attempt's as well as the closer.
+    stamp, stamp_params = await _attribution(
+        db, ("closed_by", "last_attempt_by"), recorded_by, recorded_session
+    )
+    extra += stamp
+    params += stamp_params
     cursor = await db.execute(
         "UPDATE pr_verifications SET status = 'closed', closed_reason = ?, "
         "closed_at = ?, evidence = ?, verdict = ?, last_attempt_at = ?, "
@@ -295,6 +318,35 @@ async def close_verification(
     )
     await db.commit()
     return bool(cursor.rowcount)
+
+
+_ATTRIBUTION_COLUMNS = frozenset({"closed_by", "last_attempt_by", "recorded_session"})
+
+
+async def _attribution_columns_available(db: aiosqlite.Connection) -> bool:
+    """Do the who-recorded-it columns exist? Asked every time, uncached, for the
+    reason :func:`_verdict_columns_available` is: a subprocess writer can run
+    against a table the migration runner has not caught up yet. Absent columns
+    mean the write goes ahead without the stamp, never that it fails."""
+    cursor = await db.execute("PRAGMA table_info(pr_verifications)")
+    return {row[1] for row in await cursor.fetchall()} >= _ATTRIBUTION_COLUMNS
+
+
+async def _attribution(
+    db: aiosqlite.Connection, by_columns: tuple[str, ...], by: str | None, session: str | None
+) -> tuple[str, tuple]:
+    """The SET fragment that stamps who wrote this change, or nothing.
+
+    ``by`` goes in every column of *by_columns* and ``session`` in
+    ``recorded_session``. Both describe the CURRENT write, so both are set, NULL
+    included: a later write without a session id must not leave an earlier
+    session's id beside it. Nothing is stamped when *by* is ``None`` (a caller
+    that does not label its writes) or the columns are absent.
+    """
+    if by is None or not await _attribution_columns_available(db):
+        return "", ()
+    sets = "".join(f", {column} = ?" for column in by_columns)
+    return sets + ", recorded_session = ?", (*([by] * len(by_columns)), session)
 
 
 async def _verdict_columns_available(db: aiosqlite.Connection) -> bool:
@@ -327,6 +379,8 @@ async def record_attempt(
     now: str,
     evidence: str | None = None,
     tracking_pending: bool = False,
+    recorded_by: str | None = None,
+    recorded_session: str | None = None,
 ) -> str:
     """Record a non-closing measurement. ``"recorded" | "missing" | "unavailable"``.
 
@@ -354,6 +408,9 @@ async def record_attempt(
     field describes the LATEST attempt, so an attempt made without a document leaves
     the row with none rather than showing an earlier attempt's document under this
     attempt's verdict. Capped at :data:`MAX_EVIDENCE_BYTES`; over the cap raises.
+
+    ``recorded_by`` and ``recorded_session`` are stamped as ``last_attempt_by``
+    and ``recorded_session``, like :func:`close_verification`'s.
     """
     if verdict not in VERDICTS:
         raise ValueError(
@@ -365,7 +422,7 @@ async def record_attempt(
             f"must go through close_verification, so exactly one writer moves the row "
             f"to 'closed'."
         )
-    if tracking_pending and (not evidence or not note or not note.startswith("TRACKING PENDING:")):
+    if tracking_pending and (not evidence or not tracking_pending_note(note)):
         raise ValueError("pending tracking requires evidence and a TRACKING PENDING note")
     _check_evidence_size(evidence)
     if not note or not note.strip():
@@ -387,12 +444,15 @@ async def record_attempt(
     # FIRST attempt's measured-failure document displayed under the new verdict,
     # unlabelled. The row's rule is that every attempt field describes the LATEST
     # attempt; a missing document is shown as missing, not disguised by an older one.
+    stamp, stamp_params = await _attribution(
+        db, ("last_attempt_by",), recorded_by, recorded_session
+    )
     cursor = await db.execute(
         "UPDATE pr_verifications SET verdict = ?, last_attempt_at = ?, "
         "last_attempt_note = ?, attempt_count = attempt_count + 1, "
-        "evidence = ? "
+        "evidence = ?" + stamp + " "
         "WHERE repo = ? AND pr_number = ? AND status = 'open'",
-        (verdict, now, note, evidence, repo, pr_number),
+        (verdict, now, note, evidence, *stamp_params, repo, pr_number),
     )
     await db.commit()
     return "recorded" if cursor.rowcount else "missing"
@@ -542,20 +602,62 @@ _CANDIDATE_TIERS = {
 }
 
 #: Picked only once their last attempt is older than the re-attempt window.
+#: (A ``not-yet-done`` row waits the same window only when its stored evidence
+#: declares ``no_progress``; see :func:`list_validation_candidates`.)
 _DELAYED_VERDICTS = frozenset({"cannot-verify"})
 
 #: Never picked: a failure is the owner's to act on, never the loop's to retry.
 _NEVER_PICKED = frozenset({"fail-intent"})
 
+#: Days a delayed row waits before the picker offers it again. The picker's default
+#: and the CLI's "offered again after" line both read it.
+REATTEMPT_DAYS = 7
+
+#: The note prefix a tracking-pending attempt must carry (see :func:`record_attempt`).
+TRACKING_PENDING_PREFIX = "TRACKING PENDING:"
+
+
+def tracking_pending_note(note: object) -> bool:
+    """Does a stored ``last_attempt_note`` mark its attempt's routing unfinished?
+
+    The one test of that marker: :func:`record_attempt` refuses a pending write
+    whose note fails it, and the picker reads it."""
+    return isinstance(note, str) and note.startswith(TRACKING_PENDING_PREFIX)
+
+
+def declares_no_progress(evidence: object) -> bool:
+    """Does a stored evidence document declare ``no_progress: true``?
+
+    Read straight from the JSON rather than through the evidence model, so a
+    historical document that no longer parses is simply undeclared (False, no
+    wait). Only the literal ``true`` counts; the writers' model refuses any other
+    type, so anything else here is not a declaration."""
+    if not isinstance(evidence, str) or not evidence:
+        return False
+    try:
+        doc = json.loads(evidence)
+    except ValueError:
+        return False
+    return isinstance(doc, dict) and doc.get("no_progress") is True
+
 
 async def list_validation_candidates(
-    db: aiosqlite.Connection, *, now: str, reattempt_days: int = 7
+    db: aiosqlite.Connection, *, now: str, reattempt_days: int = REATTEMPT_DAYS
 ) -> list[dict]:
     """Open rows a validator may pick next, best first. Each carries a ``tier``.
 
-    Eligibility (owner ruling, 2026-10-29): ``not-yet-done`` always, with no
-    delay, because the commands that finish it are named and runnable now
-    (tier 0), as do passing measurements awaiting routing; never attempted
+    Eligibility (owner ruling 2026-10-29, amended 2026-11-09): ``not-yet-done``
+    with no delay, because the commands that finish it are named and runnable now
+    (tier 0), UNLESS its stored evidence declares ``no_progress`` (the validator
+    judged that this attempt's remaining steps are the previous attempt's) and its
+    routing is complete: then it waits until its last attempt is at least
+    ``reattempt_days`` old and returns to tier 0. Such a row's step usually needs
+    an action a standing validator may not take (push, deploy, merge); without the
+    wait every pass re-picked it and the rest of the ledger was never reached. A
+    last note marked ``TRACKING PENDING:`` is offered at once, so an interrupted
+    routing is not hidden; the routing re-record carries the same document, and
+    with it the declaration. Passing measurements awaiting routing are tier 0
+    with no wait; never attempted
     (tier 1); ``cannot-verify`` only once its last
     attempt is at least ``reattempt_days`` old (tier 2), so a precondition gets
     time to become reachable; ``fail-intent`` never. Within a tier, NEWEST merge
@@ -570,7 +672,7 @@ async def list_validation_candidates(
     The re-attempt window compares parsed INSTANTS in Python, not strings in
     SQL: writers store ISO stamps in more than one spelling (``Z`` and
     ``+00:00``), and those sort differently as text. A stamp that does not parse
-    leaves the row out, since an unknown age is not "old enough".
+    leaves a waiting row out, since an unknown age is not "old enough".
 
     Before the verdict columns exist no attempt could have been recorded, so
     every open row is never-attempted. Assumes a Row factory. Empty
@@ -606,7 +708,12 @@ async def list_validation_candidates(
     for raw in await cursor.fetchall():
         row = dict(raw)
         verdict = row.get("verdict")
-        if verdict in _DELAYED_VERDICTS:
+        stuck = (
+            verdict == "not-yet-done"
+            and declares_no_progress(row.get("evidence"))
+            and not tracking_pending_note(row.get("last_attempt_note"))
+        )
+        if verdict in _DELAYED_VERDICTS or stuck:
             try:
                 last = datetime.fromisoformat(str(row.get("last_attempt_at")))
             except ValueError:

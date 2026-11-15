@@ -45,7 +45,7 @@ def _load():
 
 
 _scrub, _label_kind, _VERSION = _load()
-_ADAPTER_VERSION = "scoped-json-4"
+_ADAPTER_VERSION = "scoped-json-5"
 
 
 def version() -> str | None:
@@ -130,7 +130,9 @@ def _scrub_text(text, depth, budget):
             pieces.extend(
                 (
                     text[cursor:start],
-                    (replacement, isinstance(value, str)) if protected else replacement,
+                    (replacement, isinstance(value, str), text[start:end])
+                    if protected
+                    else replacement,
                 )
             )
             cursor = end
@@ -162,22 +164,79 @@ def _scrub_spans(text, pieces):
     rendered, replacements = [], []
     for index, piece in enumerate(pieces):
         if isinstance(piece, tuple):
-            replacement, quoted = piece
+            replacement, quoted, _original = piece
             marker = f"{prefix}{index}{anchor}"
             if quoted:
                 marker = f'"{marker}"'
             rendered.append(marker)
-            replacements.append((marker, replacement))
+            replacements.append((marker, replacement, _original))
         else:
             rendered.append(piece)
     out = _scrub("".join(rendered))
     if not isinstance(out, str) or out == _PLACEHOLDER:
         raise ValueError("shared scrubber failed")
-    for marker, replacement in replacements:
+    out = _scrub_span_boundaries(out, [(m, o) for m, _r, o in replacements])
+    for marker, replacement, _original in replacements:
         out = out.replace(marker, replacement)
     if prefix in out or out.count(anchor) > counts[anchor]:
         raise ValueError("protected JSON marker altered")
     return out
+
+
+#: How much of a protected span's ORIGINAL text the boundary probe keeps: enough
+#: for a credential label, its quotes and escapes.
+_BOUNDARY_TAIL = 64
+#: The separators main's label arms read after a label and its closing quote.
+_BOUNDARY_SEPARATOR = re.compile(r"[ \t]*[:=]")
+
+
+def _scrub_span_boundaries(out, markers):
+    """Redact a value that follows a protected span and a separator on its line.
+
+    ``out`` is the prose pass's output with the span markers still in place;
+    ``markers`` is ``(marker, original span text)`` per protected span. The
+    marker hid any credential label that ENDS its span ('"... cookie"=VALUE')
+    from the arm that would redact VALUE. Probe the span's original tail plus
+    the rest of its line (up to the next marker) and keep the probe's
+    redaction of that trailing text. This runs AFTER the prose pass and only
+    removes text from its output, so it can add redaction and never take any
+    away. A marker the prose pass consumed needs no probe. When the probe's
+    output cannot be split at the span boundary, the trailing text is withheld.
+    Windows are disjoint, so the cost is linear.
+    """
+    found = sorted(
+        (at, marker, original) for marker, original in markers if (at := out.find(marker)) >= 0
+    )
+    ends = [at for at, _, _ in found[1:]] + [len(out)]
+    for (at, marker, original), stop in reversed(list(zip(found, ends, strict=True))):
+        start = at + len(marker)
+        newline = out.find("\n", start, stop)
+        end = stop if newline < 0 else newline
+        window = out[start:end]
+        if not _BOUNDARY_SEPARATOR.match(window):
+            continue
+        tail = original[-_BOUNDARY_TAIL:]
+        probed = _scrub(tail + window)
+        if not isinstance(probed, str) or probed == _PLACEHOLDER:
+            raise ValueError("shared scrubber failed")
+        if probed == tail + window:
+            continue
+        head = next(
+            (h for h in (tail, _scrub(tail)) if isinstance(h, str) and probed.startswith(h)),
+            None,
+        )
+        kept = probed[len(head) :] if head is not None else None
+        if kept is None or not _is_subsequence(kept.replace("[REDACTED]", ""), window):
+            kept = "[REDACTED]"
+        out = out[:start] + kept + out[end:]
+    return out
+
+
+def _is_subsequence(needle, haystack):
+    """True when every character of ``needle`` appears in ``haystack`` in order:
+    the kept text came from the window, never from the span's original."""
+    chars = iter(haystack)
+    return all(char in chars for char in needle)
 
 
 _IDENTITY_ROOT = frozenset({"uuid", "parentUuid", "sessionId", "agentId", "requestId"})

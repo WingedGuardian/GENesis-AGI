@@ -26,11 +26,11 @@ def env(tmp_path, monkeypatch):
         "creds/claude_credentials.json.gpg", "json", required_keys=("claudeAiOauth",),
     )
 
-    monkeypatch.setattr(cred_selfheal, "resolve_passphrase", lambda h: "p")
+    monkeypatch.setattr(cred_selfheal, "resolve_passphrase", lambda h, repo_root=None: "p")
 
     calls = {"restore": 0}
 
-    def fake_restore(t, *, home, backup_dir, passphrase):
+    def fake_restore(t, *, home, backup_dir, passphrase, repo_root=None):
         calls["restore"] += 1
         return RestoreResult(True, "restored", aside_path=str(home / "aside"),
                              backup_mtime="2026-07-10T00:00:00+00:00", detail="ok")
@@ -119,7 +119,7 @@ def test_a_backups_directory_that_denies_search_is_reported(tmp_path, request):
 
 
 def test_no_passphrase_is_restore_failed(env, monkeypatch):
-    monkeypatch.setattr(cred_selfheal, "resolve_passphrase", lambda h: None)
+    monkeypatch.setattr(cred_selfheal, "resolve_passphrase", lambda h, repo_root=None: None)
     env.write(_ZEROED)
     out = env.run()
     assert out["targets"]["claude_credentials"]["status"] == "restore_failed"
@@ -131,7 +131,7 @@ def test_unreadable_is_alert_only(env, monkeypatch):
     from genesis.guardian.cred_integrity import ValidationResult
     monkeypatch.setattr(
         cred_selfheal, "check_all",
-        lambda tgts, home, backup: {
+        lambda tgts, home, backup, repo_root=None: {
             "claude_credentials": ValidationResult(False, "unreadable", "perm denied")
         },
     )
@@ -169,3 +169,40 @@ def test_never_raises_on_check_failure(env, monkeypatch):
     # Must not raise; returns prior status (empty here).
     out = env.run()
     assert isinstance(out, dict)
+
+
+def test_selfheal_finds_secrets_in_the_checkout_it_runs_from(tmp_path, monkeypatch):
+    # A checkout outside ~/genesis: without the process's own root the guardian
+    # resolved home/genesis/secrets.env, reported it missing, and restored over
+    # nothing while the live file sat in the real checkout.
+    from genesis.guardian.cred_integrity import DEFAULT_TARGETS
+
+    monkeypatch.delenv("SECRETS_PATH", raising=False)
+    monkeypatch.delenv("GENESIS_REPO_ROOT", raising=False)
+    home = tmp_path / "home"
+    checkout = tmp_path / "elsewhere"
+    checkout.mkdir(parents=True)
+    (checkout / "secrets.env").write_text("ANTHROPIC_API_KEY=x\nOTHER=y\nMORE=z\n")
+    backups = home / "backups" / "genesis-backups"
+    (backups / "secrets").mkdir(parents=True)
+    (backups / "secrets" / "secrets.env.gpg").write_bytes(b"x")
+    target = next(t for t in DEFAULT_TARGETS if t.name == "secrets_env")
+    restores = []
+    monkeypatch.setattr(cred_selfheal, "restore_file", lambda *a, **k: restores.append(k))
+    monkeypatch.setattr("genesis.env.repo_root", lambda: checkout)
+    monkeypatch.setenv("HOME", str(home))  # the process's own home: home=None below
+    out = cred_selfheal.check_and_selfheal(
+        backup_dir=backups, status_path=tmp_path / "status.json", targets=(target,)
+    )
+    assert restores == [], "restored although the live file is in the process's checkout"
+    assert out["targets"]["secrets_env"]["status"] != "corrupt", out["targets"]["secrets_env"]
+
+
+def test_a_supplied_home_never_resolves_into_the_real_checkout(tmp_path, monkeypatch):
+    # A sandbox home (every test) must keep the env/home rule, never the
+    # process's own repo root, or a real checkout file could be moved aside.
+    seen = []
+    monkeypatch.setattr("genesis.env.repo_root", lambda: tmp_path / "real-checkout")
+    monkeypatch.setattr(cred_selfheal, "check_all", lambda t, h, b, repo_root=None: seen.append(repo_root) or {})
+    cred_selfheal.check_and_selfheal(home=tmp_path / "sandbox", status_path=tmp_path / "s.json", targets=())
+    assert seen == [None]

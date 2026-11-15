@@ -170,6 +170,24 @@ async def test_missing_mapping_does_not_prevent_recording_an_incomplete_attempt(
     assert row(path)["status"] == "open"
 
 
+@pytest.mark.parametrize("declared", [True, False, None])
+async def test_the_result_echoes_the_documents_no_progress(recording, monkeypatch, declared):
+    from genesis.mcp.health import validator_writes
+
+    path, _, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    monkeypatch.setattr(
+        validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: run the timer")
+    )
+    over = {} if declared is None else {"no_progress": declared}
+    doc = _doc(gaps=[{"kind": "not_yet_done", "detail": "not run", "command": "run timer"}], **over)
+    result = await call(doc)
+    assert result["recorded"] and result["no_progress"] is bool(declared)
+    assert json.loads(row(path)["evidence"])["no_progress"] is bool(declared)
+    preview = await call(doc, dry_run=True)
+    assert preview["recorded"] is False and preview["no_progress"] is bool(declared)
+
+
 async def test_existing_mcp_close_stores_rechecks_without_a_new_caller_argument(recording):
     path, _, config = recording
     config.with_suffix(".local.yaml").write_text("dry_run_only: false")
@@ -214,6 +232,23 @@ async def test_local_opt_in_records_derived_result_and_closed_rows_are_immutable
     else:
         assert stored["last_attempt_note"] == "Synthetic result"
     assert not shared.in_transaction
+
+
+@pytest.mark.parametrize("verdict", ["pass-mechanical", "cannot-verify"])
+async def test_the_sealed_validator_is_stamped_on_what_it_writes(recording, monkeypatch, verdict):
+    # Even if the server inherited a Claude Code shell's markers and transcript id,
+    # the external-client profile in force for the call decides the label, and a
+    # Codex label never carries the parent transcript as its session.
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "parent-transcript")
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    path, _shared, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    args = {"note": "Synthetic result"} if verdict != "pass-mechanical" else {}
+    assert (await call(_doc_for(verdict), **args))["recorded"] is True
+    stored = row(path)
+    by = "closed_by" if verdict == "pass-mechanical" else "last_attempt_by"
+    assert stored[by] == "codex-sealed" and stored["recorded_session"] is None
 
 
 @pytest.mark.parametrize("over", [

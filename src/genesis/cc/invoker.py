@@ -18,6 +18,7 @@ import subprocess
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from functools import wraps
 from pathlib import Path
 
 from genesis.cc import final_status, oom, roster
@@ -38,6 +39,8 @@ from genesis.cc.exceptions import (
     CCTimeoutError,
 )
 from genesis.cc.provider_readiness import (
+    contained_provider,
+    isolated_provider,
     probing_provider,
     provider_status_isolated,
     rate_limit_rejected,
@@ -54,6 +57,7 @@ from genesis.cc.types import (
 )
 from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
 from genesis.observability.spans import SpanKind, start_span
+from genesis.util.execution_privacy import private_execution
 from genesis.util.inflight import inflight
 from genesis.util.proc_kill import (
     ProcessCleanupUncertain,
@@ -66,6 +70,20 @@ from genesis.util.proc_kill import (
 from genesis.util.systemd import literal_scope_args
 
 logger = logging.getLogger(__name__)
+
+
+def _contained_call(method):
+    @wraps(method)
+    async def run(self, invocation, *args, **kwargs):
+        policy = invocation.peer_segment
+        if policy is None:
+            return await method(self, invocation, *args, **kwargs)
+        policy.validate(invocation)
+        invocation = replace(invocation, confirm_cleanup=True)
+        with private_execution(), isolated_provider(contained=True):
+            async with policy.invocation():
+                return await method(self, invocation, *args, **kwargs)
+    return run
 
 # Free-text status matching in ``_classify_error``. A bare substring match on
 # "429" also hit identifiers that merely contain the digits (UUIDs, request
@@ -238,6 +256,9 @@ def set_oom_score_adj(pid: int, score: int = 500) -> None:
 # The sibling probe-then-commit sites (.claude/mcp/run-codebase-memory,
 # scripts/lib/code_intel_index.sh) already set their own properties at probe
 # time for this reason; this was the one that did not.
+# IOWeight takes effect only where the user manager has the io controller; it
+# is kept for hosts that delegate io, and the infrastructure posture check
+# (infra_profile/cgroup_io.py) names it on hosts where it is inert.
 _SCOPE_PROPERTIES = ("IOWeight=100", "MemoryHigh=62%", "MemoryMax=75%")
 _SCOPE_DESCRIPTION = "Genesis CC session"
 
@@ -1522,7 +1543,9 @@ def _stderr_bg_truncated(stderr_text: str | None) -> bool:
     return bool(stderr_text) and _BG_TRUNCATION_MARKER in stderr_text
 
 
-def _unreplayable_after_drop(dropped: int, outcome: str) -> CCStreamTruncatedError:
+def _unreplayable_after_drop(
+    dropped: int, outcome: str, *, cc_session_id: str | None = None,
+) -> CCStreamTruncatedError:
     """The no-retry error for a run whose stream we could not fully read.
 
     A drop is not only a lost-ANSWER problem; it is a lost-EVIDENCE problem. The
@@ -1535,11 +1558,36 @@ def _unreplayable_after_drop(dropped: int, outcome: str) -> CCStreamTruncatedErr
     ``outcome`` names what the run reported, so the message says which shape hit
     it rather than inviting a guess.
     """
-    return CCStreamTruncatedError(
+    error = CCStreamTruncatedError(
         f"CC stream dropped {dropped} over-limit line(s) "
         f"(limit={_STREAM_LINE_LIMIT} bytes) and {outcome}. The run must not be "
         "replayed: the tool calls behind the dropped line may already have run."
     )
+    error.cc_session_id = cc_session_id
+    return error
+
+
+def _reported_cli_id(value: object) -> str | None:
+    """Keep an opaque reported identity; blanks and nonstrings are unknown."""
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _record_cc_identity(span, observed: CCOutput | CCError | None, returned: bool) -> None:
+    """Advisory metadata only; never mask execution or expose private IDs."""
+    with contextlib.suppress(Exception):
+        from genesis.util.execution_privacy import private_execution_active
+
+        if private_execution_active():
+            return
+        if isinstance(observed, CCOutput):
+            sid, source = _reported_cli_id(observed.session_id), "cc_output"
+        elif isinstance(observed, CCError):
+            sid, source = _reported_cli_id(observed.cc_session_id), "classified_result"
+        else:
+            sid, source = None, "unknown"
+        span.set_attr("cc_session_id", sid)
+        span.set_attr("cc_identity_source", source if sid is not None else "unknown")
+        span.set_attr("cc_outcome", "returned" if returned else "not_returned")
 
 
 async def _emit_bg_truncation_event(cc_session_id: str) -> None:
@@ -1949,7 +1997,7 @@ class CCInvoker:
                 claude_path,
             )
 
-    async def _cc_version(self) -> tuple[int, int, int] | None:
+    async def _cc_version(self, invocation=None) -> tuple[int, int, int] | None:
         """The version of the CC binary this invoker runs, or None if unreadable.
 
         Keyed by the resolved file's (path, inode, mtime), so an update that
@@ -1966,6 +2014,10 @@ class CCInvoker:
         per window; the answer itself is never lost, only its cost reading
         degrades to additive.
         """
+        if invocation is not None and invocation.peer_segment is not None:
+            from genesis.cc.peer_helpers import version
+
+            return await version(self, invocation)
         resolved = shutil.which(self._claude_path)
         if not resolved:
             self._warn_version_once(self._claude_path, "binary not found")
@@ -2016,10 +2068,11 @@ class CCInvoker:
             why,
         )
 
-    async def _with_cost_semantics(self, output: CCOutput) -> CCOutput:
+    async def _with_cost_semantics(self, output: CCOutput, invocation=None) -> CCOutput:
         """Stamp whether ``output.cost_usd`` is a running total (see
         ``cost_is_cumulative_for``). The one place the flag is set."""
-        return replace(output, cost_is_cumulative=cost_is_cumulative_for(await self._cc_version()))
+        version = await self._cc_version() if invocation is None else await self._cc_version(invocation)
+        return replace(output, cost_is_cumulative=cost_is_cumulative_for(version))
 
     @property
     def working_dir(self) -> str | None:
@@ -2032,7 +2085,7 @@ class CCInvoker:
 
     async def _fire_downgrade_callback(self, output: CCOutput) -> None:
         """Invoke model downgrade callback if applicable. Never raises."""
-        if probing_provider():
+        if probing_provider() or contained_provider():
             return
         if not output.downgraded or not self._on_model_downgrade:
             return
@@ -2349,6 +2402,8 @@ class CCInvoker:
     def _build_args(
         self, inv: CCInvocation, *, settings_pins: dict[str, str] | None = None
     ) -> list[str]:
+        if inv.peer_segment is not None:
+            inv.peer_segment.validate(inv)
         args = [self._claude_path, "-p"]
         # Roster routing: when model_id_override is set, model selection comes
         # entirely from ANTHROPIC_MODEL (set in _build_env). A --model flag here
@@ -2403,8 +2458,13 @@ class CCInvoker:
         # so skip strict under bare. strict is safe with any other config state:
         # with a --mcp-config it pins to those servers; with none it yields zero
         # servers cleanly (probe-verified) — the secure-by-default posture.
-        if inv.strict_mcp_config and not inv.bare:
+        if inv.strict_mcp_config and not inv.bare and inv.peer_segment is None:
             args.append("--strict-mcp-config")
+        if inv.peer_segment is not None:
+            args += inv.peer_segment.cli_flags()
+            if inv.peer_segment.tools:
+                args += ["--allowedTools", ",".join(inv.peer_segment.tools)]
+            return args  # Never prepare owner hooks/settings or protected context.
         # Register the dispatch hooks (span capture, Bash allowlist enforcement,
         # the main-checkout guard) for this session. Dispatched sessions run with
         # a cwd outside any git repo, so CC never loads the repo's
@@ -2459,6 +2519,15 @@ class CCInvoker:
     _CC_SANDBOX_TMPDIR = Path.home() / ".genesis" / "cc-tmp"
 
     def _build_env(self, inv: CCInvocation | None = None) -> dict[str, str]:
+        if inv is not None and inv.peer_segment is not None:
+            env = inv.peer_segment.environment(inv)
+            env.update({name: "" for name in _GH_CREDENTIAL_ENV})
+            if inv.claude_code_tmpdir:
+                # Both, as the ordinary path keeps them: the CLI's own temp files
+                # follow TMPDIR, which would otherwise fall back to /tmp.
+                env["CLAUDE_CODE_TMPDIR"] = inv.claude_code_tmpdir
+                env["TMPDIR"] = inv.claude_code_tmpdir
+            return env
         env = dict(os.environ)
         env.pop("CLAUDECODE", None)
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
@@ -2707,6 +2776,8 @@ class CCInvoker:
         # UNCONDITIONAL: every dispatched session, allowlisted or not. See
         # `_assert_no_gh_credentials` — gating this on the allowlist is what made
         # the pin decorative once no profile declared one.
+        if inv.peer_segment is not None:
+            inv.peer_segment.pin_environment(env, inv.working_dir)
         _assert_no_gh_credentials(env)
         if inv.bash_allowlist:
             _assert_hardening_present(env, tuple(inv.bash_allowlist))
@@ -2714,6 +2785,14 @@ class CCInvoker:
         # so no later layer can turn function hooks back on (review).
         pin_dispatched_env(env)
         return env
+
+    async def _launch_args(self, invocation, args, env):
+        if invocation.peer_segment is not None:
+            invocation.peer_segment.validate(invocation)
+            return invocation.peer_segment.launch_args(
+                args, env, invocation.working_dir, _SCOPE_PROPERTIES,
+            )
+        return [*await _get_scope_args(), *args]
 
     def _register_proc(
         self, key: str, proc: asyncio.subprocess.Process, *, confirm_cleanup: bool = False
@@ -2782,6 +2861,25 @@ class CCInvoker:
         *,
         result: dict | None = None,
     ) -> CCError:
+        """Classify once, retaining only a reported structured-result CLI ID."""
+        parsed_stdout = _cli_result_payload(stdout_text)
+        err = CCInvoker._classify_error_kind(
+            stderr_text, stdout_text, parsed_stdout=parsed_stdout, result=result,
+        )
+        with contextlib.suppress(Exception):
+            payload = result if isinstance(result, dict) else parsed_stdout
+            if isinstance(payload, dict) and payload.get("type") == "result":
+                err.cc_session_id = _reported_cli_id(payload.get("session_id"))
+        return err
+
+    @staticmethod
+    def _classify_error_kind(
+        stderr_text: str,
+        stdout_text: str = "",
+        *,
+        parsed_stdout: dict | None,
+        result: dict | None = None,
+    ) -> CCError:
         """Classify CC output into a typed CC exception.
 
         Checks both stderr and stdout — when CC runs in streaming-JSON
@@ -2801,7 +2899,6 @@ class CCInvoker:
         # the blob carries dozens of numbers (durations, token counts, costs)
         # and UUIDs, so a text match over it can read "output_tokens":529 as an
         # overload or a UUID's "429" as a rate limit.
-        parsed_stdout = _cli_result_payload(stdout_text)
         payload = result if isinstance(result, dict) else parsed_stdout
         pattern_parts = [stderr_text]
         if parsed_stdout is None:
@@ -2978,6 +3075,7 @@ class CCInvoker:
         except Exception:
             logger.debug("network preflight check errored — proceeding", exc_info=True)
 
+    @_contained_call
     async def run(self, invocation: CCInvocation) -> CCOutput:
         """Run a dispatched CC session (traced; see ``_run_traced``).
 
@@ -3040,19 +3138,27 @@ class CCInvoker:
                 "streaming": False,
             },
         ) as span:
-            output = replace(
-                await self._run_inner(invocation, admission),
-                roster_model=roster_model,
-            )
-            output = _split_final_status(invocation, output)
-            with contextlib.suppress(Exception):
-                span.set_attr("cost_usd", output.cost_usd)
-                span.set_attr("input_tokens", output.input_tokens)
-                span.set_attr("output_tokens", output.output_tokens)
-                span.set_attr("model_used", output.model_used)
-                if output.is_error:
-                    span.set_status_error(output.error_message or "CC session error")
-            return output
+            observed = None
+            returned = False
+            try:
+                observed = await self._run_inner(invocation, admission)
+                output = replace(observed, roster_model=roster_model)
+                output = _split_final_status(invocation, output)
+                with contextlib.suppress(Exception):
+                    span.set_attr("cost_usd", output.cost_usd)
+                    span.set_attr("input_tokens", output.input_tokens)
+                    span.set_attr("output_tokens", output.output_tokens)
+                    span.set_attr("model_used", output.model_used)
+                    if output.is_error:
+                        span.set_status_error(output.error_message or "CC session error")
+                returned = True
+                return output
+            except CCError as exc:
+                if observed is None:
+                    observed = exc
+                raise
+            finally:
+                _record_cc_identity(span, observed, returned)
 
     async def _apply_login_fallback(
         self,
@@ -3089,9 +3195,18 @@ class CCInvoker:
         try:
             from genesis.cc.login_health import fallback_env_if_login_dead
 
-            fb = await fallback_env_if_login_dead(cc_path=self._claude_path)
+            if inv is not None and inv.peer_segment is not None:
+                from genesis.cc.peer_helpers import logged_out
+
+                fb = await fallback_env_if_login_dead(
+                    cc_path=self._claude_path, probe=lambda: logged_out(self, inv), use_cache=False,
+                )
+            else:
+                fb = await fallback_env_if_login_dead(cc_path=self._claude_path)
             if fb:
                 return {**env, **fb}
+        except ProcessCleanupUncertain:
+            raise
         except Exception:
             logger.debug("login fallback check failed", exc_info=True)
         return env
@@ -3138,11 +3253,14 @@ class CCInvoker:
         reg_key: str | None = None
         evidence = None
         try:
-            scope_args = await _get_scope_args()
-            baseline = await asyncio.to_thread(oom.capture_baseline, managed=bool(scope_args))
-            proc = await asyncio.create_subprocess_exec(
-                *scope_args,
-                *args,
+            launch = await self._launch_args(invocation, args, env)
+            # Managed when a scope prefix wraps the CLI (always, for a peer).
+            baseline = await asyncio.to_thread(
+                oom.capture_baseline, managed=len(launch) > len(args)
+            )
+            create = spawn_owned if invocation.confirm_cleanup else asyncio.create_subprocess_exec
+            proc = await create(
+                *launch,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -3155,7 +3273,7 @@ class CCInvoker:
             )
             admission.release()
             reg_key = invocation.session_key or f"pid:{proc.pid}"
-            reg_key = self._register_proc(reg_key, proc)
+            reg_key = self._register_proc(reg_key, proc, confirm_cleanup=invocation.confirm_cleanup)
             logger.info("CC subprocess spawned (PID %s)", proc.pid)
             set_oom_score_adj(proc.pid, 500)
             if invocation.on_spawn is not None:
@@ -3172,6 +3290,10 @@ class CCInvoker:
                 timeout=invocation.timeout_s,
             )
             evidence = await asyncio.to_thread(oom.capture_finish, baseline, proc.returncode)
+        except ProcessCleanupUncertain as exc:
+            if exc.process is not None:
+                self._register_proc(f"pid:{exc.process.pid}", exc.process, confirm_cleanup=True)
+            raise
         except FileNotFoundError:
             logger.error(
                 "Claude CLI not found at %r. Ensure @anthropic-ai/claude-code "
@@ -3219,13 +3341,13 @@ class CCInvoker:
             raise CCTimeoutError(f"Timeout after {invocation.timeout_s}s") from None
         finally:
             if reg_key is not None:
-                self._unregister_proc(reg_key)
-                # Don't leak a still-running proc on an abnormal exit (e.g. task
-                # cancellation); communicate() reaps it on the normal path.
-                if proc is not None and proc.returncode is None:
-                    # Group-kill: a bare proc.kill() would orphan the claude
-                    # tree's MCP/helper children on cancellation.
-                    kill_process_group(proc)
+                if invocation.confirm_cleanup:
+                    await self._confirm_registered_exit(proc, reg_key)
+                else:
+                    self._unregister_proc(reg_key)
+                    # Ordinary calls retain their existing reap behavior.
+                    if proc is not None and proc.returncode is None:
+                        kill_process_group(proc)
 
         elapsed = int((time.monotonic() - start) * 1000)
         logger.info(
@@ -3250,7 +3372,7 @@ class CCInvoker:
             raise err
 
         output = self._parse_output(stdout.decode(errors="replace"), invocation, elapsed)
-        output = await self._with_cost_semantics(output)
+        output = await self._with_cost_semantics(output, invocation) if invocation.peer_segment else await self._with_cost_semantics(output)
         if _stderr_bg_truncated(stderr.decode(errors="replace")):
             output = replace(output, bg_truncated=True)
             logger.warning(
@@ -3280,6 +3402,7 @@ class CCInvoker:
             await self._fire_empty_output_callback(invocation, output)
         return output
 
+    @_contained_call
     async def run_streaming(
         self,
         invocation: CCInvocation,
@@ -3327,19 +3450,27 @@ class CCInvoker:
                 "streaming": True,
             },
         ) as span:
-            output = replace(
-                await self._run_streaming_inner(invocation, on_event, admission),
-                roster_model=roster_model,
-            )
-            output = _split_final_status(invocation, output)
-            with contextlib.suppress(Exception):
-                span.set_attr("cost_usd", output.cost_usd)
-                span.set_attr("input_tokens", output.input_tokens)
-                span.set_attr("output_tokens", output.output_tokens)
-                span.set_attr("model_used", output.model_used)
-                if output.is_error:
-                    span.set_status_error(output.error_message or "CC session error")
-            return output
+            observed = None
+            returned = False
+            try:
+                observed = await self._run_streaming_inner(invocation, on_event, admission)
+                output = replace(observed, roster_model=roster_model)
+                output = _split_final_status(invocation, output)
+                with contextlib.suppress(Exception):
+                    span.set_attr("cost_usd", output.cost_usd)
+                    span.set_attr("input_tokens", output.input_tokens)
+                    span.set_attr("output_tokens", output.output_tokens)
+                    span.set_attr("model_used", output.model_used)
+                    if output.is_error:
+                        span.set_status_error(output.error_message or "CC session error")
+                returned = True
+                return output
+            except CCError as exc:
+                if observed is None:
+                    observed = exc
+                raise
+            finally:
+                _record_cc_identity(span, observed, returned)
 
     async def _run_streaming_inner(
         self,
@@ -3395,12 +3526,14 @@ class CCInvoker:
         )
 
         try:
-            scope_args = await _get_scope_args()
-            baseline = await asyncio.to_thread(oom.capture_baseline, managed=bool(scope_args))
+            launch = await self._launch_args(invocation, args, env)
+            # Managed when a scope prefix wraps the CLI (always, for a peer).
+            baseline = await asyncio.to_thread(
+                oom.capture_baseline, managed=len(launch) > len(args)
+            )
             create = spawn_owned if invocation.confirm_cleanup else asyncio.create_subprocess_exec
             proc = await create(
-                *scope_args,
-                *args,
+                *launch,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -3831,7 +3964,7 @@ class CCInvoker:
 
         if result_data is not None:
             output = self._parse_result_dict(result_data, invocation, elapsed)
-            output = await self._with_cost_semantics(output)
+            output = await self._with_cost_semantics(output, invocation) if invocation.peer_segment else await self._with_cost_semantics(output)
             # () is a real report ("the runtime watched and saw no tool_use"),
             # distinct from None ("nothing watched"). A `if tools_seen:` guard
             # here would silently downgrade the former to the latter on every
@@ -3892,7 +4025,7 @@ class CCInvoker:
                 await self._notify_status_change(err)
                 if oversized_dropped:
                     raise _unreplayable_after_drop(
-                        oversized_dropped, "CC reported an error result"
+                        oversized_dropped, "CC reported an error result", cc_session_id=err.cc_session_id,
                     ) from err
                 raise err
 
@@ -3975,6 +4108,9 @@ class CCInvoker:
                 oversized_dropped,
                 "NO result event arrived — the result line was almost certainly one of them",
             )
+
+        if invocation.peer_segment is not None and proc.returncode != 0:
+            raise CCProcessError("Contained peer exited without a result")
 
         # No result event — treat collected text as response (success path)
         output = CCOutput(

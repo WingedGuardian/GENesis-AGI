@@ -1,0 +1,1 @@
+- The scheduled backup (`genesis-backup.service`) now runs at the lowest best-effort I/O priority. Whether this eases disk contention depends on the disk's I/O scheduler (only BFQ weighs it) and is not yet verified on device-mapper (LVM) volumes. It takes effect after the next update re-installs the unit.

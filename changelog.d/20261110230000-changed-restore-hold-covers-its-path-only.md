@@ -1,0 +1,1 @@
+- A live-move restore whose interrupted run left newer content in an aside now holds back only the parts at that path, below it or above it; every other part of the report is restored. A hold in a run folder named before this release still stops the whole restore until that content is moved out.

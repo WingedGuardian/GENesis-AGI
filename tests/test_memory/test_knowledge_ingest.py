@@ -23,6 +23,13 @@ def _mock_store() -> MagicMock:
     return store
 
 
+def _mock_db() -> MagicMock:
+    """A db whose reads return no rows (no other unit names the old point)."""
+    db = MagicMock()
+    db.execute_fetchall = AsyncMock(return_value=[])
+    return db
+
+
 async def _run(content: str):
     """Invoke ingest_knowledge_unit with crud mocked; return its result."""
     with patch(
@@ -34,7 +41,7 @@ async def _run(content: str):
     ):
         return await ingest_knowledge_unit(
             store=_mock_store(),
-            db=MagicMock(),
+            db=_mock_db(),
             content=content,
             project="proj",
             domain="dom",
@@ -94,7 +101,7 @@ async def _run_replace(delete_result):
     ):
         unit_id = await ingest_knowledge_unit(
             store=store,
-            db=MagicMock(),
+            db=_mock_db(),
             content="replacement body",
             project="proj",
             domain="dom",
@@ -142,7 +149,7 @@ async def _run_capture(provenance: dict | None = None):
     ) as upsert_mock:
         await ingest_knowledge_unit(
             store=store,
-            db=MagicMock(),
+            db=_mock_db(),
             content="some knowledge body",
             project="proj",
             domain="dom",

@@ -334,6 +334,10 @@ class EvidenceDocument(BaseModel):
     tracking: list[TrackingDisposition] = []
     # Optional for historical documents; the close checks against the live PR body.
     e2e: list[E2ECoverage] = []
+    # The validator's own judgment that this attempt made no progress: its remaining
+    # steps are the same as the stored previous attempt's. On a not-yet-done row the
+    # picker then waits the re-attempt window. Absent or false: offered at once.
+    no_progress: StrictBool = False
 
     @model_validator(mode="after")
     def _coverage_targets_exist(self) -> EvidenceDocument:

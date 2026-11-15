@@ -288,7 +288,7 @@ def test_generated_genesis_wrapper_parses_for_any_repo_path(repo_dir):
 )
 @pytest.mark.parametrize(
     "placeholder",
-    ["__HOME__", "__VENV__", "__REPO_DIR__", "__CC_BIN_DIR__", "__AZ_ROOT__"],
+    ["__HOME__", "__VENV__", "__REPO_DIR__", "__CC_BIN_DIR__", "__AZ_ROOT__", "__SECRETS_FILE__"],
 )
 def test_every_sed_substitution_value_renders_verbatim(az_root, placeholder):
     """EVERY value used as a sed REPLACEMENT must render verbatim, not just AZ_ROOT.

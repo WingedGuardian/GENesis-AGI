@@ -60,10 +60,10 @@ Verdicts, in order:
    nothing), else SAFE. HEAD on `live` at ``to``: MIXED_TREE (forward) when the
    two-dot residue back toward the tag is non-empty, else GUARDS (moved, not
    bootstrapped). Anywhere else, or a record of any other shape, or one under
-   any phase but "merging": HOLD. The MIXED_TREE remedy follows HEAD: at the
-   tag, scripts/deploy_candidates repair-move (live_move_repair.py) puts the
-   paths back, saving what it changes (#3492 PR D1); at the update's new code,
-   put them back and finish with --post-merge;
+   any phase but "merging": HOLD. The MIXED_TREE remedy is the same at either
+   end: scripts/deploy_candidates repair-move (live_move_repair.py) returns the
+   checkout to the tag, saving what it changes (#3492 PR D1); at the target it
+   also finishes the rollback that was killed, moving `live` back (PR D1f);
 7a. a "merging" row on `live` with no record and an own_head other than the
    tag (update.sh adopted the tip, and its row no longer carries the record)
    is judged the same way toward own_head, and that verdict is final (main's
@@ -77,8 +77,7 @@ shell, env.update_in_progress() in the dashboard). Anything this module cannot
 decide guards. Retiring a guarding file on purpose is the job of that update's
 ``--post-merge`` (GUARDS only: a resolved conflict reads GUARDS, a pending one
 merged nothing), bootstrap's crash recovery, the dashboard's Dismiss, or (a
-half-written `live` checkout at the tag) the repair once this rule calls the
-tree SAFE.
+half-written `live` checkout) the repair once this rule calls the tree SAFE.
 
 Command line (``python3 -I -S``, standard library only)::
 
@@ -107,6 +106,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 
 SAFE = "safe"
 GUARDS = "guards"
@@ -140,6 +140,21 @@ _LIB = os.path.dirname(os.path.abspath(__file__))
 # 120 s matches the dashboard's other checks; TimeoutExpired reaches every
 # caller's exception path, which keeps the state (guards).
 _TIMEOUT_S = 120
+#: Monotonic; set only by the boot repair (#3492 D2a-2), so that every call
+#: below shares what is left of its one boot deadline. None everywhere else.
+_DEADLINE: float | None = None
+_REAP_S = 5  # _kill_residue_check's own bound, kept inside the deadline
+
+
+def _t(reserve: float) -> float:
+    """A call's timeout: _TIMEOUT_S, or under a boot deadline what is left of
+    it less ``reserve``. With nothing left the call is never started."""
+    if _DEADLINE is None:
+        return _TIMEOUT_S
+    left = _DEADLINE - time.monotonic() - reserve
+    if left <= 0:
+        raise subprocess.TimeoutExpired("git", 0)  # past the boot deadline
+    return min(_TIMEOUT_S, left)
 
 
 def _env() -> dict[str, str]:
@@ -193,7 +208,7 @@ def _rev(repo: str, rev: str) -> str:
         capture_output=True,
         text=True,
         env=_env(),
-        timeout=_TIMEOUT_S,
+        timeout=_t(1),
     ).stdout.strip()
 
 
@@ -209,7 +224,7 @@ def _tag_commit(state: dict, repo: str) -> str:
         ["git", "-C", repo, "check-ref-format", f"refs/tags/{tag}"],
         capture_output=True,
         env=_env(),
-        timeout=_TIMEOUT_S,
+        timeout=_t(1),
     )
     if ok.returncode != 0:
         return ""
@@ -267,6 +282,7 @@ def _merge_residue(
     hidden-entry pass names after its shell's pid ($$, this child's pid) is
     removed, as deploy_health's checkout probe does; TimeoutExpired is then
     raised to the caller as before."""
+    timeout = _t(_REAP_S)  # before the start: with no time left, nothing runs
     proc = subprocess.Popen(
         [
             "bash",
@@ -286,7 +302,7 @@ def _merge_residue(
         start_new_session=True,
     )
     try:
-        stdout, _ = proc.communicate(timeout=_TIMEOUT_S)
+        stdout, _ = proc.communicate(timeout=timeout)
     except BaseException:  # the timeout, or an interrupt that its own session never sees
         _kill_residue_check(proc, repo)
         raise
@@ -328,7 +344,7 @@ def _kill_residue_check(proc: subprocess.Popen, repo: str) -> None:
     # Bounded: SIGKILL stays pending in uninterruptible I/O, the failure the
     # timeout contains; Popen reaps a process left this way when collected.
     with contextlib.suppress(subprocess.TimeoutExpired):
-        proc.communicate(timeout=5)
+        proc.communicate(timeout=_REAP_S)
 
 
 def _conflict_recorded(conflicts_path: str, deploy_head: str) -> bool:
@@ -356,6 +372,10 @@ _FORWARD = "the checkout is at the update's new code"
 #: the live-move repair heals (scripts/lib/live_move_repair.py, #3492 PR D1):
 #: message() names that command instead of the by-hand steps.
 _LIVE = "the live checkout is half-written"
+#: ... and on a `live` row with HEAD on `live` at the rebuilt tip (a rollback
+#: killed partway), which the repair finishes toward the tag (#3492 PR D1f).
+#: Main's forward case keeps _FORWARD and its --post-merge remedy.
+_LIVE_FORWARD = "the live checkout is at the rebuilt tip"
 
 #: HOLD remedies, one per kind of state. None recommends --post-merge: it
 #: refuses every one of them.
@@ -439,13 +459,13 @@ def _mixed(
     tag: str, to: str, residue: list[str], *, forward: bool = False, live: bool = False
 ) -> tuple[str, str]:
     """MIXED_TREE, its reason naming the two commits and listing every path.
-    ``forward``: HEAD is at ``to``, not the tag, so the remedy finishes forward.
-    ``live``: a `live` row with HEAD at the tag, which the repair heals."""
+    ``forward``: HEAD is at ``to``, not the tag. ``live``: a `live` row, which
+    the repair heals at either end; else main's, which finishes forward."""
     lines = [_shown(r) for r in residue] or [
         "(the rebuild recorded that git wrote part of the tree)"
     ]
     where = (
-        f"{_FORWARD} ({to[:12]}), half-written back toward {tag[:12]}"
+        f"{_LIVE_FORWARD if live else _FORWARD} ({to[:12]}), half-written back toward {tag[:12]}"
         if forward
         else f"{_LIVE if live else 'the checkout is half-written'} between {tag[:12]} and "
         f"{to[:12] or 'its merge'}"
@@ -453,7 +473,7 @@ def _mixed(
     return MIXED_TREE, where + ":\n" + "\n".join("  " + ln for ln in lines)
 
 
-def _forward(repo: str, tag: str, to: str) -> tuple[str, str] | None:
+def _forward(repo: str, tag: str, to: str, *, live: bool = False) -> tuple[str, str] | None:
     """HEAD is at ``to``, the update's new code: MIXED_TREE (forward) when the
     two-dot residue back toward the tag is non-empty, the paths a rollback
     checkout from ``to`` to the tag writes (one killed partway leaves HEAD at
@@ -469,7 +489,21 @@ def _forward(repo: str, tag: str, to: str) -> tuple[str, str] | None:
     (test_merging_at_the_tag_with_tracked_changes_guards), not a safety need,
     and changing it is tracked on its own (#3566)."""
     residue = _merge_residue(repo, to, tag, two_dot=True, ephemeral_ok=True)
-    return _mixed(tag, to, residue, forward=True) if residue else None
+    return _mixed(tag, to, residue, forward=True, live=live) if residue else None
+
+
+def _on_live(repo: str) -> bool:
+    """Is HEAD the branch `live` (not detached, not another branch)?"""
+    return (
+        subprocess.run(
+            ["git", "-C", repo, "symbolic-ref", "-q", "HEAD"],
+            capture_output=True,
+            text=True,
+            env=_env(),
+            timeout=_t(1),
+        ).stdout.strip()
+        == "refs/heads/live"
+    )
 
 
 def _live_verdict(state: dict, repo: str, to: str, move_phase: str) -> tuple[str, str]:
@@ -492,15 +526,8 @@ def _live_verdict(state: dict, repo: str, to: str, move_phase: str) -> tuple[str
         if _merge_residue(repo, tag, ""):
             return _hold("tracked files changed that the move does not write", _NOT_MOVED)
         return SAFE, "the rebuild moved nothing"
-    branch = subprocess.run(
-        ["git", "-C", repo, "symbolic-ref", "-q", "HEAD"],
-        capture_output=True,
-        text=True,
-        env=_env(),
-        timeout=_TIMEOUT_S,
-    ).stdout.strip()
-    if head == to and branch == "refs/heads/live":
-        return _forward(repo, tag, to) or (
+    if head == to and _on_live(repo):
+        return _forward(repo, tag, to, live=True) or (
             GUARDS,
             f"it moved live to {to[:12]}, which bootstrap has not run on",
         )
@@ -529,7 +556,7 @@ def _is_ancestor(repo: str, older: str, newer: str) -> bool:
             ["git", "-C", repo, "merge-base", "--is-ancestor", older, newer],
             capture_output=True,
             env=_env(),
-            timeout=_TIMEOUT_S,
+            timeout=_t(1),
         ).returncode
         == 0
     )
@@ -551,7 +578,7 @@ def _merge_landed(state: dict, repo: str, tag: str, head: str, deploy_head: str)
         capture_output=True,
         text=True,
         env=_env(),
-        timeout=_TIMEOUT_S,
+        timeout=_t(1),
     ).stdout.strip()
     if on != f"refs/heads/{branch}":
         return False
@@ -565,7 +592,7 @@ def _merge_landed(state: dict, repo: str, tag: str, head: str, deploy_head: str)
         capture_output=True,
         text=True,
         env=_env(),
-        timeout=_TIMEOUT_S,
+        timeout=_t(1),
     ).stdout.split()
     return parents == [tag, full]
 
@@ -598,7 +625,11 @@ def state_verdict(state: object, repo: str, conflicts_path: str | None = None) -
     # tip): a rollback checkout back to the tag killed partway leaves HEAD there
     # with tag-side files written (#3532 round 2).
     if own and tag and own != tag and head == own:
-        mixed = _forward(repo, tag, own)
+        # Rule 7a's row (an adopted live tip, "merging") with HEAD on `live`: the
+        # live wording, whose remedy the repair finishes (#3492 PR D1f); in any
+        # other phase the repair does not act, so main's wording stays.
+        live = phase == "merging" and _adopted_tip(state, repo) == own and _on_live(repo)
+        mixed = _forward(repo, tag, own, live=live)
         if mixed:
             return mixed
     if phase == "fetching":
@@ -711,6 +742,21 @@ def message(state_path: str, verdict_: str, reason: str) -> str:
             "stale .git/index.lock if no git process is running. "
         )
         head = f"{state_path} records an update that stopped partway: {reason}\n"
+        if reason.startswith(_LIVE_FORWARD):
+            # Restoring to HEAD would put back the rebuilt tip, code bootstrap
+            # never ran on, so the by-hand steps are the repair's own
+            # (--explain), never the restore-to-HEAD text, and never --post-merge.
+            return head + (
+                "Put it back with scripts/deploy_candidates repair-move. HEAD is the rebuilt "
+                "tip, which bootstrap never ran on, and the repair finishes the rollback that "
+                "was killed: it returns these paths to the rollback tag, moves `live` back to "
+                "the tag and puts back the git hooks the rebuild installed. It saves every path "
+                "it changes under ~/.genesis/deploy-backups/ first, and reports any that were "
+                "not the update's with the command that puts them back (repair-move --restore "
+                "<ts>). If it cannot run (it says when its kit is not installed), repair-move "
+                "--explain prints the same steps to do by hand. Do not Dismiss the update first: that leaves a checkout holding "
+                "code bootstrap never ran on, with nothing to stop a restart onto it."
+            )
         if reason.startswith(_LIVE):
             # The repair first; the by-hand steps too, because the kit repair-move
             # runs is installed by a later change (#3492 PR D2), and with no kit
@@ -719,9 +765,9 @@ def message(state_path: str, verdict_: str, reason: str) -> str:
                 "Put it back with scripts/deploy_candidates repair-move. It returns these "
                 "paths to the rollback tag (HEAD), saves every path it changes under "
                 "~/.genesis/deploy-backups/ first, and reports any that were not the "
-                "update's with the step that re-applies them; repair-move --explain prints "
-                "its steps. If it cannot run (it says when its kit is not installed), do it "
-                "by hand. " + by_hand + "HEAD is the code that ran before the update, so the "
+                "update's with the command that puts them back (repair-move --restore <ts>); "
+                "repair-move --explain prints its steps. If it cannot run (it says when its kit "
+                "is not installed), do it by hand. " + by_hand + "HEAD is the code that ran before the update, so the "
                 "checkout is then that code again: Dismiss the update on the dashboard's "
                 "update card (or remove update_state.json). Do NOT run scripts/update.sh "
                 "--post-merge: it refuses a half-written tree."

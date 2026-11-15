@@ -1,0 +1,1 @@
+- Route queued indexing through the original supervised owner and durable native outcomes. Pinned GitNexus preparation starts after scope registration; unsupported or ambiguous installations defer without guessing. Automatic indexing remains disabled pending recovery and production qualification.

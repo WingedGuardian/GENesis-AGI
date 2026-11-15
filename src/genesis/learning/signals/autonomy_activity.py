@@ -41,7 +41,9 @@ class AutonomyActivityCollector:
             categories = await autonomy.list_all(self._db)
         except Exception:
             logger.error("AutonomyActivityCollector DB query failed", exc_info=True)
-            return self._reading(0.0, "db_error")
+            # Not a reading: marked failed so a comparison across runs never
+            # takes this zero for "alarm cleared".
+            return self._reading(0.0, "db_error", failed=True)
 
         if not categories:
             return self._reading(0.0, "no_categories")
@@ -92,8 +94,9 @@ class AutonomyActivityCollector:
             logger.debug("earnback-pending check failed", exc_info=True)
             return False
 
-    def _reading(self, value: float, source: str) -> SignalReading:
+    def _reading(self, value: float, source: str, *, failed: bool = False) -> SignalReading:
         return SignalReading(
+            failed=failed,
             name=self.signal_name,
             value=value,
             source=source,

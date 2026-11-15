@@ -1,0 +1,1 @@
+- The disk-pressure reclaim no longer removes `~/tmp` work younger than 4 days at ORANGE (it was 2). ORANGE can start on a disk that still has room when a write burst, such as a backup, lifts a low-space warning one level. The nearly-full RED pass still prunes at 2 days. Every `~/tmp` entry the prune removes, daily or under pressure, is now named in its log with its size.

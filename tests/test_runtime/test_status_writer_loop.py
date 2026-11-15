@@ -34,13 +34,35 @@ async def _run_for(coro, iterations: int, interval_s: float) -> asyncio.Task:
     return task
 
 
+async def _run_until(coro, done, deadline_s: float = 10.0) -> None:
+    """Run ``coro`` until ``done()`` holds, then cancel it.
+
+    Waits on the condition, not on elapsed time: a loaded CI runner can stretch a
+    few short intervals past any fixed window. The deadline only ends a real hang,
+    which the assertions after it then report.
+    """
+    task = asyncio.create_task(coro)
+    loop = asyncio.get_running_loop()
+    end = loop.time() + deadline_s
+    try:
+        while not done() and loop.time() < end:
+            await asyncio.sleep(0.005)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 @pytest.mark.asyncio
 async def test_loop_calls_writer_each_interval():
     """Loop wakes every interval and calls writer.write() once per cycle."""
     writer = AsyncMock()
     rt = _fake_runtime(writer)
 
-    await _run_for(run_status_writer_loop(rt, interval_s=0.02), iterations=3, interval_s=0.02)
+    await _run_until(
+        run_status_writer_loop(rt, interval_s=0.02),
+        lambda: rt.record_job_success.call_count >= 2,
+    )
 
     assert writer.write.await_count >= 2
     assert rt.record_job_success.call_count >= 2
@@ -61,7 +83,10 @@ async def test_loop_survives_transient_write_failure():
     writer.write.side_effect = flaky_write
     rt = _fake_runtime(writer)
 
-    await _run_for(run_status_writer_loop(rt, interval_s=0.02), iterations=3, interval_s=0.02)
+    await _run_until(
+        run_status_writer_loop(rt, interval_s=0.02),
+        lambda: rt.record_job_success.call_count >= 2,
+    )
 
     assert writer.write.await_count >= 3
     assert rt.record_job_failure.call_count >= 1
