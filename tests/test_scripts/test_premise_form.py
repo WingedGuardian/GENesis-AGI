@@ -656,3 +656,9 @@ def test_setting_the_epoch_back_to_none_restores_the_either_form_rule(monkeypatc
         assert not plan.remove and not plan.comment
     payload = {"tool_name": "ExitPlanMode", "tool_input": {"plan": _plan(_OLD_SIX)}}
     assert gate._plan_gate._check(payload) == 0
+
+
+def test_an_as_line_plan_with_unlabelled_change_answers_is_told_to_label_them(tmp_path):
+    answers = "1. Problem: as #42\n6. reused the shared reader.\n7. none simpler.\n8. cited.\n9. 40 lines.\n"
+    r = _run_plan(tmp_path, _plan(answers))
+    assert r.returncode == 2 and "the other answers with their own labels" in r.stderr

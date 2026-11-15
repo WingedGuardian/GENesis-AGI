@@ -155,7 +155,8 @@ def form_epoch() -> str | None:
 #: nine-item section with a malformed first answer reads as "not nine-item" too.
 NOT_NINE_NOTE = (
     "This section is not in the nine-item form: its first answer must start "
-    "`Observed:` (or, in a plan or PR, `Problem: as #<N>`). If it is in the "
+    "`Observed:` (or, in a plan or PR, `Problem: as #<N>`), and the other answers "
+    "with their own labels (`Mechanism:` ... `Shape:`). If it is in the "
     "six-question form, the six map in: outside claims and numbers to 8 (Evidence), "
     "existing code and scope limits to 7 (Alternatives), the caller to 6 "
     "(Mechanism), the shape to 9 (Shape); items 1 to 5 state the problem."
