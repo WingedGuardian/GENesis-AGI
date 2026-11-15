@@ -11,7 +11,7 @@ from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from pathlib import Path
 
-from . import pinned, sampling
+from . import native_expense, pinned, sampling
 from .accounting import Journal, _billing, currency, total
 from .evidence import Incomplete, canonical, check_directory, digest, load_json, private_open
 
@@ -323,11 +323,14 @@ def cost_report(states):
             owner = alias, attempt
             # Invalid or missing costs still carry ownership claims. Deduplicate
             # repeated GET evidence within this attempt, not across owners.
-            claims = {item[field] for item in row["observations"] + row["receipts"] + row.get("lookups", [])
+            claims = {value for item in row["observations"] + row["receipts"] + row.get("lookups", [])
                       if isinstance(item, dict)
-                      for field in ("generation_id", "body_generation_id", "header_generation_id",
-                                    "response_generation_id")
-                      if isinstance(item.get(field), str) and item[field].strip()}
+                      for value in (native_expense.generation_claims(item)
+                                    if row["spec"].get("cost_basis") == native_expense.BASIS
+                                    else [item.get(field) for field in (
+                                        "generation_id", "body_generation_id", "header_generation_id",
+                                        "response_generation_id")])
+                      if isinstance(value, str) and value.strip()}
             for generation in claims:
                 key = row["spec"]["generation_namespace"], generation
                 owners.setdefault(key, set()).add(owner)

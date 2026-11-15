@@ -10,7 +10,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import accounting, execution, lineage, pinned, preflight, run, sampling
+from . import accounting, execution, lineage, native_expense, pinned, preflight, run, sampling
 from .evidence import Incomplete, canonical, digest
 
 PROTOCOL = "bounded_continuation_v1"
@@ -128,8 +128,10 @@ class Study:
 
     def _claim(self, owner, row):
         for item in row["observations"] + row["receipts"] + row["lookups"]:
-            for field in ("generation_id", "body_generation_id", "header_generation_id", "response_generation_id"):
-                generation = item.get(field)
+            claims = (native_expense.generation_claims(item)
+                      if row["spec"].get("cost_basis") == native_expense.BASIS else [item.get(field) for field in (
+                          "generation_id", "body_generation_id", "header_generation_id", "response_generation_id")])
+            for generation in claims:
                 if generation is not None:
                     if not isinstance(generation, str) or not generation.strip():
                         raise Incomplete("study_generation_invalid")

@@ -1,6 +1,7 @@
 """Calculated native token tariffs, distinct from provider monetary receipts."""
 
 import re
+from datetime import datetime, timedelta
 from decimal import MAX_EMAX, MIN_EMIN, Context, Decimal, localcontext
 
 from .accounting import currency, total
@@ -47,6 +48,28 @@ def validate_spec(spec: dict) -> None:
             or re.fullmatch(r"[a-f0-9]{64}", evidence["sha256"]) is None
             or not isinstance(evidence["observed_at"], str) or not evidence["observed_at"].strip()):
         raise Incomplete("invalid native pricing evidence")
+    try:
+        observed = datetime.fromisoformat(evidence["observed_at"])
+    except ValueError:
+        raise Incomplete("invalid native pricing timestamp") from None
+    if observed.utcoffset() != timedelta(0):
+        raise Incomplete("native pricing timestamp must be UTC")
+
+
+def generation_claims(observation: dict) -> list:
+    """Read retained native identities, including contradictory and malformed claims."""
+    values = [observation.get(key) for key in (
+        "generation_id", "body_generation_id", "header_generation_id", "response_generation_id")]
+    headers = observation.get("response_headers")
+    if isinstance(headers, dict):
+        values.append(headers.get("x-generation-id"))
+    try:
+        raw = load_json(observation.get("raw_body", ""))
+    except (ValueError, TypeError):
+        return values
+    if isinstance(raw, dict):
+        values.append(raw.get("id"))
+    return values
 
 
 def _counts(usage):
@@ -83,6 +106,7 @@ def observation_interval(spec: dict, observation: dict) -> tuple[Decimal, Decima
     claims = [(observation.get(key), generation) for key in (
         "body_generation_id", "header_generation_id", "response_generation_id")]
     claims.extend(((observation.get("response_model"), spec["model"]),
+                   (observation.get("response_provider"), spec["upstream"]),
                    (headers.get("x-generation-id"), generation)))
     if any(value is not None and (not isinstance(value, str) or value != expected)
            for value, expected in claims):

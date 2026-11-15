@@ -305,11 +305,12 @@ def assert_claim_accounting(spec, observation, resolved):
 
 
 @pytest.mark.parametrize("field", ["body_generation_id", "header_generation_id", "response_generation_id",
-                                  "response_model", "response_headers"])
+                                  "response_model", "response_provider", "response_headers"])
 @pytest.mark.parametrize("variant", ["absent", "none", "agree", "conflict", "bool", "number", "container", "blank"])
 def test_all_retained_identity_claims_control_financial_settlement(field, variant):
     spec, observation = fixture()
-    expected = spec["model"] if field == "response_model" else observation["generation_id"]
+    expected = {"response_model": spec["model"], "response_provider": spec["upstream"]}.get(
+        field, observation["generation_id"])
     values = {"none": None, "agree": expected, "conflict": "contradictory", "bool": True,
               "number": 1, "container": [], "blank": ""}
     if variant != "absent":
@@ -325,7 +326,7 @@ def test_malformed_retained_header_containers_hold_the_whole_reservation(headers
     assert_claim_accounting(spec, observation, False)
 
 
-@pytest.mark.parametrize("source", ["native_observation", "legacy_receipt"])
+@pytest.mark.parametrize("source", ["native_observation", "native_raw_body", "native_header", "legacy_receipt"])
 def test_returned_generation_claim_marks_every_owner_unresolved_without_mutating_counters(source):
     spec, second_observation = fixture()
     first_observation = copy.deepcopy(second_observation)
@@ -334,8 +335,14 @@ def test_returned_generation_claim_marks_every_owner_unresolved_without_mutating
     raw["id"] = first_observation["generation_id"]
     first_observation["raw_body"] = json.dumps(raw)
     claimed = second_observation["generation_id"]
-    if source == "native_observation":
-        first_observation["response_generation_id"] = claimed
+    if source.startswith("native"):
+        if source == "native_raw_body":
+            raw["id"] = claimed
+            first_observation["raw_body"] = json.dumps(raw)
+        elif source == "native_header":
+            first_observation["response_headers"] = {"x-generation-id": claimed}
+        else:
+            first_observation["response_generation_id"] = claimed
         with pytest.raises(Incomplete):
             native_expense.billing_evidence(spec, first_observation)
         first_receipt = None
@@ -360,6 +367,50 @@ def test_returned_generation_claim_marks_every_owner_unresolved_without_mutating
     assert first.reserved == Decimal(spec["max_charge"]) and second.reserved == 0
     assert report["unresolved_attempts"] == 2
     assert Decimal(report["observed_receipt_cost"]) == 0
-    if source == "native_observation":
+    if source.startswith("native"):
         assert report["calculated_cost_interval"]["resolved_attempts"] == 0
     assert states == before
+
+
+@pytest.mark.parametrize("timestamp", ["not-a-time", "2026-01-01", "2026-01-01T00:00:00",
+                                       "2026-01-01T00:00:00-05:00", "2026-01-01T00:00:00+00:01"])
+def test_pricing_evidence_requires_a_valid_utc_timestamp(timestamp):
+    spec, _ = fixture()
+    spec["native_tariff"]["pricing_evidence"]["observed_at"] = timestamp
+    with pytest.raises(Incomplete):
+        accounting.validate_manifest(history(spec, {})[0]["manifest"])
+
+
+@pytest.mark.parametrize("timestamp", ["2026-01-01T00:00:00Z", "2026-01-01T00:00:00+00:00",
+                                       "2026-01-01T00:00:00.123456Z"])
+def test_pricing_evidence_preserves_valid_utc_timestamp(timestamp):
+    spec, observation = fixture()
+    spec["native_tariff"]["pricing_evidence"]["observed_at"] = timestamp
+    before = copy.deepcopy(spec)
+    accounting.validate_manifest(history(spec, {})[0]["manifest"])
+    assert_claim_accounting(spec, observation, True)
+    assert spec == before
+
+
+@pytest.mark.parametrize("field", ["generation_id", "body_generation_id", "header_generation_id",
+                                  "response_generation_id", "raw_body", "response_headers"])
+def test_study_claims_every_retained_native_generation(field):
+    from genesis.eval.qualification.study_report import Study
+
+    spec, observation = fixture()
+    claim = "synthetic-other-generation"
+    if field == "raw_body":
+        raw = json.loads(observation["raw_body"])
+        raw["id"] = claim
+        observation[field] = json.dumps(raw)
+    elif field == "response_headers":
+        observation[field] = {"x-generation-id": claim}
+    else:
+        observation[field] = claim
+    study = object.__new__(Study)
+    study.owners = {(spec["generation_namespace"], claim): ("other", spec["id"])}
+    row = row_for(spec, observation)
+    before = copy.deepcopy(row)
+    with pytest.raises(Incomplete, match="study_generation_collision"):
+        study._claim(("current", spec["id"]), row)
+    assert row == before
