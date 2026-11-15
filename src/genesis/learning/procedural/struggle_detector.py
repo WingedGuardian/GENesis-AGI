@@ -14,6 +14,9 @@ import json
 import logging
 from pathlib import Path
 
+# Stdlib-only, so the "zero LLM cost, purely programmatic" contract above holds.
+from genesis.transcript_analytics.classify import classify
+
 logger = logging.getLogger(__name__)
 
 # Struggle score threshold for triggering the Judge.
@@ -81,6 +84,70 @@ def _summarize_args(tool_name: str, tool_input: object) -> str:
     return args_text[:cap]
 
 
+# A failed result's text is kept on its spine entry for the outcome writer, which
+# scrubs it and stores 400 characters. The transcript keeps the full text, so this
+# is a selection, not the only copy; the bound stops one huge failed result (an
+# error echoing a whole file) from being held in memory for the rest of the parse.
+_FAILURE_TEXT_CAP = 65_536
+
+
+def _outcome_fields(tool_id: object, tool_input: object, rec: dict) -> dict:
+    """Per-call fields the tool-outcome writer reads; ignored by scoring and the judge."""
+    file_path = tool_input.get("file_path") if isinstance(tool_input, dict) else None
+    return {
+        "tool_use_id": tool_id if isinstance(tool_id, str) and tool_id else None,
+        "file_path": file_path if isinstance(file_path, str) else None,
+        "is_sidechain": rec.get("isSidechain") is True,
+        "has_result": False,
+        "session_id": None,
+        "timestamp": None,
+        "failure_class": None,
+        "failure_text": None,
+    }
+
+
+def _content_text(content: object) -> str:
+    """The text the model saw, as ``transcript_analytics`` reads it: text blocks only."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            b["text"]
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+        )
+    return ""
+
+
+def _record_result(entry: dict, block: dict, content: object, rec: dict) -> None:
+    """Classify a paired result with the shared transcript classifier.
+
+    ``failure_class`` is ``transcript_analytics.classify``'s class (``hook_block``,
+    ``user_rejected``, ``exit_nonzero``, ...) or None for a success. The raw
+    ``is_error`` value is passed through, because an absent flag is not a success
+    there: it applies only its strong unflagged rules.
+    """
+    flag = block.get("is_error")
+    denial = rec.get("toolDenialKind")
+    text = _content_text(content)
+    try:
+        cls, _source = classify(
+            text,
+            is_error=flag if isinstance(flag, bool) else None,
+            denial_kind=denial if isinstance(denial, str) else None,
+        )
+    except Exception:  # noqa: BLE001 - never let the writer's fields cut the spine short
+        logger.warning("tool-result classification failed; call left unrecorded", exc_info=True)
+        return
+    sid = rec.get("sessionId")
+    ts = rec.get("timestamp")
+    entry["has_result"] = True
+    entry["session_id"] = sid if isinstance(sid, str) and sid else None
+    entry["timestamp"] = ts if isinstance(ts, str) and ts else None
+    entry["failure_class"] = cls
+    entry["failure_text"] = text[:_FAILURE_TEXT_CAP] if cls else None
+
+
 def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
     """Parse JSONL into a compact action spine AND a grounding haystack.
 
@@ -100,6 +167,11 @@ def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
         "outcome": "ok"|"error",# tool result outcome
         "error_text": str,      # error content (if any)
     }
+
+    Tool entries also carry the fields ``_outcome_fields`` lists, read only by
+    the tool-outcome writer: ``tool_use_id``, ``file_path``, ``is_sidechain``,
+    ``has_result``, ``session_id`` and ``timestamp`` (of the result record),
+    ``failure_class`` and ``failure_text``.
 
     Reads raw JSONL line-by-line to capture tool_use + tool_result blocks
     that read_transcript_messages() intentionally strips.
@@ -163,6 +235,7 @@ def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
 
                         args_summary = _summarize_args(tool_name, tool_input)
 
+                        tool_id = block.get("id", "")
                         spine_entry = {
                             "turn": turn,
                             "type": "tool",
@@ -170,17 +243,18 @@ def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
                             "args_summary": args_summary,
                             "outcome": "ok",  # default, updated by tool_result
                             "error_text": "",
+                            **_outcome_fields(tool_id, tool_input, entry),
                         }
                         spine.append(spine_entry)
 
-                        tool_id = block.get("id", "")
                         if tool_id:
                             pending_tools[tool_id] = spine_entry
 
                     elif block_type == "tool_result":
                         tool_id = block.get("tool_use_id", "")
                         is_error = block.get("is_error", False)
-                        result_content = block.get("content", "")
+                        raw_content = block.get("content", "")
+                        result_content = raw_content
                         if isinstance(result_content, list):
                             result_content = " ".join(
                                 str(b.get("text", ""))
@@ -193,6 +267,7 @@ def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
                             if is_error:
                                 entry_ref["outcome"] = "error"
                                 entry_ref["error_text"] = str(result_content)[:400]
+                            _record_result(entry_ref, block, raw_content, entry)
 
                     elif block_type == "text" and msg_type == "user":
                         text = block.get("text", "")
@@ -215,7 +290,10 @@ def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
         logger.warning("Failed to parse transcript for action spine", exc_info=True)
 
     # Mark orphaned tool_use entries (no matching tool_result) as errors.
-    # This happens when sessions crash mid-execution.
+    # This happens when sessions crash mid-execution — and also when the call is
+    # simply still running at read time, which is why ``has_result`` stays False
+    # here: the struggle score treats both as errors, but the outcome writer
+    # (``learning/tool_outcomes.py``) must not record either as a failure.
     for entry in pending_tools.values():
         entry["outcome"] = "error"
         entry["error_text"] = "no result received (session may have crashed)"

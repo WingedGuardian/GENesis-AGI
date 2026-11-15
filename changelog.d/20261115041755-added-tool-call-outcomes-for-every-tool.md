@@ -1,0 +1,1 @@
+- Genesis now records whether each tool call in a session succeeded or failed, for every tool rather than only file edits, so recurring failures can be counted. Failure text is scrubbed of credentials before it is stored; rows are kept for 180 days and failure text for 90.

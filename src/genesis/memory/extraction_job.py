@@ -621,6 +621,7 @@ async def run_extraction_cycle(
                 spine, haystack = await asyncio.to_thread(
                     build_spine_and_haystack, transcript_path
                 )
+                await _record_tool_outcomes(db, spine, cc_session_id)
                 struggle_score = score_struggle(spine)
                 struggle_triggered = struggle_score >= STRUGGLE_THRESHOLD
                 if (
@@ -702,6 +703,31 @@ async def run_extraction_cycle(
             logger.warning("Connection pass failed", exc_info=True)
 
     return summary
+
+
+async def _record_tool_outcomes(
+    db: aiosqlite.Connection, spine: list[dict], cc_session_id: str
+) -> None:
+    """Record every main-session tool call's outcome from the parsed spine (#4712).
+
+    Best-effort and isolated: a failure here is logged and never affects
+    extraction or the procedure builder. Idempotent (unique ``tool_use_id``), so
+    a later cycle re-reading the same transcript writes nothing twice, and it is
+    what records a call whose result had not arrived on an earlier cycle.
+    """
+    try:
+        from genesis.db.crud.tool_call_outcomes import insert_outcomes
+        from genesis.learning.tool_outcomes import outcome_rows
+
+        rows = await asyncio.to_thread(
+            outcome_rows, spine, fallback_session_id=cc_session_id
+        )
+        await insert_outcomes(db, rows)
+    except Exception:
+        logger.warning(
+            "Tool-outcome recording failed for session %s — extraction unaffected",
+            cc_session_id, exc_info=True,
+        )
 
 
 async def _enqueue_procedure_rebuild(
