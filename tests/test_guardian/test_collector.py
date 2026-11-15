@@ -247,6 +247,17 @@ async def test_live_repair_names_journal_lines_and_report(monkeypatch):
     assert "0 saved path(s)" in text and "re-apply" not in text
 
 
+async def test_live_repair_a_heal_stopped_before_saving_is_not_read_as_restored(monkeypatch):
+    """#4548 review SF-2: a heal's first report (no rows, no integrity record)
+    is a heal that stopped before it saved anything, never "0 path(s) restored"."""
+    early = _report(paths=[], result=None)
+    text = await _collect(monkeypatch, "", _reports(early))
+    assert "stopped before it saved anything" in text and "0 path(s) restored" not in text, text
+    full = _report(paths=[], result=None, integrity="SAVED.json")  # control: a saved, empty heal
+    text = await _collect(monkeypatch, "", _reports(full))
+    assert "0 path(s) restored" in text and "stopped before" not in text, text
+
+
 async def test_live_repair_shows_the_dir_names_ts_never_the_stored_one(monkeypatch):
     text = await _collect(monkeypatch, "", _reports(_report(ts="x\n--- END ---")))
     assert f'ts "{_DIR_TS}"' in text and "END" not in text, text

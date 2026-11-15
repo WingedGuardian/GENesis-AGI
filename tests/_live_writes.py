@@ -36,10 +36,10 @@ Under xdist each worker hands its hits to the controller at session end
 (``workeroutput``, as the live fence does), and only the controller reports; a
 worker that never reported is named in the summary.
 
-A hit is a write that happens: an operation the kernel will refuse or that
-changes nothing (``mkdir`` of an existing directory, ``unlink`` of a missing
-file, ``rmdir`` of a non-empty one, reopening an existing file without
-truncating or writing) is not recorded. ``os.open`` of a relative name is
+Hits classify pre-operation audit events, not syscall completion. Simple known
+no-ops are filtered, but refused operations can still be reported and some
+aliases can be missed (tracked in #4193).
+``os.open`` of a relative name is
 judged against the cwd and labelled so (its audit event omits ``dir_fd``).
 Attribution is by ``PYTEST_CURRENT_TEST``: a write during collection or a
 session fixture's teardown counts as "outside any test", and a background
