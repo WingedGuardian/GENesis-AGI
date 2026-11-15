@@ -1148,3 +1148,47 @@ def test_any_unexpected_error_in_the_reader_never_stops_compose(dm, monkeypatch,
         prose=_ASKED,
     )
     assert rc == 0 and out.exists() and "RecursionError" in cap.err
+
+
+def test_every_gh_read_the_reader_makes_is_bounded(dm, monkeypatch, tmp_path, capsys):
+    _configure(monkeypatch, tmp_path, [sys.executable, str(_reader(tmp_path, _ECHO))])
+    gh = FakeGh()
+    seen = []
+    inner = gh.__call__
+
+    def spy(args, timeout=None):
+        seen.append((args[:2], timeout))
+        return inner(args, timeout=timeout)
+
+    rc, _, _ = _compose(
+        dm,
+        monkeypatch,
+        tmp_path,
+        capsys,
+        spy,
+        "--intended",
+        "read",
+        "--second-reader",
+        prose=_ASKED,
+    )
+    assert rc == 0
+    # The reader's own reads come after the marker is written: the visibility, the
+    # diff and the final head check, each with the reader's bound.
+    reader = seen[-3:]
+    assert [a for a, _ in reader] == [
+        ["api", "repos/Own/repo"],
+        ["pr", "diff"],
+        ["api", "repos/Own/repo/pulls/7"],
+    ]
+    assert all(t == dm._GH_TIMEOUT_S for _, t in reader)
+
+
+def test_a_tilde_genesis_home_is_a_home_path(dm, monkeypatch):
+    monkeypatch.setenv("GENESIS_HOME", "~/custom-genesis-home")
+    got = dm._genesis_home()
+    assert "~" not in str(got) and got == Path.home() / "custom-genesis-home"
+
+
+def test_an_unknown_user_genesis_home_never_crashes(dm, monkeypatch):
+    monkeypatch.setenv("GENESIS_HOME", "~nosuchuser_zz9/h")
+    assert str(dm._genesis_home()) == "~nosuchuser_zz9/h"

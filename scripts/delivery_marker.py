@@ -371,10 +371,13 @@ def _repo(repo: str | None) -> str:
     return repo
 
 
-def _pr(repo: str, pr: int) -> dict:
+def _pr(repo: str, pr: int, *, timeout: float | None = None) -> dict:
     try:
         meta = json.loads(
-            _gh(["api", f"repos/{repo}/pulls/{pr}", "--jq", "{head: .head.sha, body: .body}"])
+            _gh(
+                ["api", f"repos/{repo}/pulls/{pr}", "--jq", "{head: .head.sha, body: .body}"],
+                timeout=timeout,
+            )
         )
     except ValueError as exc:
         raise Refused("unreadable PR metadata from gh") from exc
@@ -438,7 +441,13 @@ _GH_TIMEOUT_S = 60
 
 
 def _genesis_home() -> Path:
-    return Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis")
+    # Expanded like the runtime's own genesis_home(): a GENESIS_HOME of ~/x is a home path.
+    # A ~user that does not exist stays the literal path it was before, never a crash.
+    home = Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis")
+    try:
+        return home.expanduser()
+    except RuntimeError:
+        return home
 
 
 def second_reader_cmd() -> list[str] | None:
@@ -505,7 +514,7 @@ def second_reader(*, repo: str, pr: int, head: str, basis: str, verdict: str, pr
         if len(diff) > _DIFF_CAP:
             raise Refused(f"diff of {len(diff)} characters is over {_DIFF_CAP}")
         # The score must describe the head the marker names.
-        if _pr(repo, pr)["head"] != head:
+        if _pr(repo, pr, timeout=_GH_TIMEOUT_S)["head"] != head:
             raise Refused("the PR's head moved while the diff was read")
         payload = {
             "form": SECOND_READER_FORM,
