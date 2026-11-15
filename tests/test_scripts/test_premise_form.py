@@ -336,3 +336,9 @@ def test_six_non_empty_answers_pass_in_either_form_while_unset():
     main passes any six non-empty answers today."""
     body = _issue(_PROBLEM.replace(" Stated: docs/x.md:40", "") + _CHANGE)
     assert _opened(body).add == []
+
+
+def test_after_the_epoch_an_older_issue_keeps_the_old_rule_even_with_coincidences(epoch):
+    """Grandfathering survives the epoch for issues created before it: the
+    either-form rule still applies to them (secondary review, P3)."""
+    assert _opened(_issue(_TWO_COINCIDENCES), created="2026-11-01T00:00:00Z").add == []

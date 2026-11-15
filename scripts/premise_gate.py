@@ -190,7 +190,10 @@ def premise_gaps(
     new_form = _plan_gate.is_new_form(answers)
     required = epoch is not None and (build or created_at >= epoch)
     old_missing = missing_answers(body)
-    if epoch is None and not old_missing:
+    # An issue created before the epoch keeps that rule after it too; a paid build
+    # never does (the guard ignores grandfathering).
+    grandfathered = not build and epoch is not None and created_at < epoch
+    if (epoch is None or grandfathered) and not old_missing:
         # Until the epoch, EITHER complete form passes (spec, PR 2a): six
         # non-empty answers pass as they do today, whatever form they look
         # like, so the nine-item rules only loosen before then.
