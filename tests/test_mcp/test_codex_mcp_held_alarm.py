@@ -137,6 +137,43 @@ async def test_a_raising_scan_logs_once_and_emits_nothing(health, caplog, monkey
 
 
 @pytest.mark.asyncio
+async def test_a_failed_refresh_keeps_the_last_observation(health, monkeypatch):
+    """A read error is no evidence the groups are gone: dropping the alarm would
+    read as cleared to the Sentinel's re-verification of a pending approval."""
+    set_scan, _ = health
+    set_scan([5000])
+    assert await _alarm() is not None
+    stamp, held = errors._codex_mcp_cache
+    set_scan([], raises=True)
+    monkeypatch.setattr(errors, "_codex_mcp_cache", (stamp - errors._CODEX_MCP_TTL_S, held))
+    assert await _alarm() is not None
+
+
+@pytest.mark.asyncio
+async def test_an_all_uncertain_refresh_keeps_the_last_observation(health, monkeypatch):
+    """Architect class audit: a scan that classified nothing because children
+    were unreadable is no reading, so the alarm must not read as cleared."""
+    set_scan, _ = health
+    set_scan([5000])
+    assert await _alarm() is not None
+    stamp, held = errors._codex_mcp_cache
+    set_scan([], uncertain=["777 python (descriptors unreadable)"])
+    monkeypatch.setattr(errors, "_codex_mcp_cache", (stamp - errors._CODEX_MCP_TTL_S, held))
+    assert await _alarm() is not None
+
+
+@pytest.mark.asyncio
+async def test_overlapping_callers_share_one_scan(health):
+    import asyncio
+
+    set_scan, calls = health
+    set_scan([5000])
+    results = await asyncio.gather(*(errors._codex_mcp_held() for _ in range(5)))
+    assert all(r is not None for r in results)
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_unclassifiable_children_with_no_group_log_blindness(health, caplog):
     set_scan, _ = health
     set_scan([], uncertain=["101 python (descriptors unreadable)"])

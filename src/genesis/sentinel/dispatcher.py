@@ -659,36 +659,10 @@ class SentinelDispatcher:
                 reason=f"Sentinel awaiting approval ({self._state.pending_policy_id})",
             )
 
-        # Gate 2.5: Heavy workload — defer restart-type remediation while
-        # a long-running batch job (e.g. dream cycle) is in progress.
-        wl = _heavy_workload()
-        if wl:
-            return SentinelResult(
-                dispatched=False,
-                reason=f"Heavy workload active ({wl}) — deferring dispatch",
-            )
-
-        # Gate 3: Concurrent limit
-        if self._active_session_id is not None:
-            return SentinelResult(
-                dispatched=False,
-                reason=f"Sentinel session already active: {self._active_session_id}",
-            )
-
-        # Gate 3: Per-pattern backoff (replaces both global cooldown and
-        # daily budget). If the pattern has burned through its attempts,
-        # escalate to the user and suppress further auto-dispatch.
         pattern = _extract_pattern(request)
-        ready, reason = self._backoff_ready(pattern)
-        if not ready:
-            return SentinelResult(dispatched=False, reason=reason)
-
-        # Gate 4: CC infrastructure
-        if self._invoker is None or self._session_manager is None:
-            return SentinelResult(
-                dispatched=False,
-                reason="CC invoker or session manager not available",
-            )
+        blocked = self._post_park_gate(pattern)
+        if blocked is not None:
+            return SentinelResult(dispatched=False, reason=blocked)
 
         # Passed all gates — check if this attempt crosses the escalation
         # threshold. If so, post an escalation message instead of dispatching
@@ -701,6 +675,43 @@ class SentinelDispatcher:
         self._pattern_attempts.setdefault(pattern, []).append(time.monotonic())
 
         return await self._execute_dispatch(request, pattern=pattern)
+
+    def _post_park_gate(self, pattern: str) -> str | None:
+        """Why a dispatch for ``pattern`` would be refused after the park gate,
+        or None when it would pass. One home for these gates, so the take-over
+        in check_fire_alarms predicts exactly what _gated_dispatch does."""
+        # Gate 2.5: Heavy workload — defer restart-type remediation while
+        # a long-running batch job (e.g. dream cycle) is in progress.
+        wl = _heavy_workload()
+        if wl:
+            return f"Heavy workload active ({wl}) — deferring dispatch"
+        # Gate 3: Concurrent limit
+        if self._active_session_id is not None:
+            return f"Sentinel session already active: {self._active_session_id}"
+        # Gate 3: Per-pattern backoff (replaces both global cooldown and
+        # daily budget). If the pattern has burned through its attempts,
+        # escalate to the user and suppress further auto-dispatch.
+        ready, reason = self._backoff_ready(pattern)
+        if not ready:
+            return reason
+        # Gate 4: CC infrastructure
+        if self._invoker is None or self._session_manager is None:
+            return "CC invoker or session manager not available"
+        return None
+
+    def _dispatch_order(self, alarms: list[FireAlarm]) -> list[FireAlarm]:
+        """Confirmed alarms in the order dispatch reads them: strongest first,
+        and among equally strong ones, those whose pattern may dispatch before
+        those in backoff or declined. dispatch() keys every gate on the first
+        alarm, so a declined warning listed first would otherwise hide an
+        eligible one of the same strength behind it. Stable otherwise."""
+        return sorted(
+            alarms,
+            key=lambda a: (_alarm_strength(a.tier, a.severity), not self._backoff_ready(a.alert_id)[0]),
+        )
+
+    def _would_escalate(self, pattern: str) -> bool:
+        return len(self._pattern_attempts.get(pattern, [])) + 1 >= _ESCALATE_AT_ATTEMPT
 
     async def _execute_dispatch(
         self, request: SentinelRequest, *, pattern: str = "",
@@ -2232,26 +2243,26 @@ class SentinelDispatcher:
                 # that alarm must be a challenger, must not be the pattern being
                 # cancelled (it gets a cooldown below), and must pass backoff
                 # itself. Otherwise the owner's request is cancelled for nothing.
-                head = next(
-                    (
-                        a.alert_id for a in alarms
-                        if sum(1 for s in self._recent_alarm_sets if a.alert_id in s)
-                        >= _ALARM_CONFIRMATION_COUNT
-                    ),
-                    None,
-                )
-                if head not in challengers or head == pattern or not self._backoff_ready(head)[0]:
-                    challengers = set()
-                # The same holds for every other gate _gated_dispatch applies
-                # after Gate 2: a take-over during a heavy workload, the boot
-                # grace, a running session or a missing invoker would cancel
-                # the owner's request and then defer the outage's dispatch too.
+                confirmed_now = self._dispatch_order([
+                    a for a in alarms
+                    if sum(1 for s in self._recent_alarm_sets if a.alert_id in s)
+                    >= _ALARM_CONFIRMATION_COUNT
+                ])
+                head = confirmed_now[0].alert_id if confirmed_now else None
+                # It must also clear every gate _gated_dispatch applies (the boot
+                # grace, then the post-park gates) and reach a real dispatch, not
+                # an escalation: otherwise the owner's request is cancelled and
+                # nothing dispatched in its place. Accepted residual: this is a
+                # prediction made before the awaits below, so a gate that flips
+                # during them (a heavy workload starting) can still defer the
+                # dispatch; the stronger alarm then dispatches on a later tick,
+                # and the warning pattern may ask again after its cooldown.
                 if (
-                    self._state.in_bootstrap_grace()
-                    or _heavy_workload()
-                    or self._active_session_id is not None
-                    or self._invoker is None
-                    or self._session_manager is None
+                    head not in challengers
+                    or head == pattern
+                    or self._state.in_bootstrap_grace()
+                    or self._post_park_gate(head) is not None
+                    or self._would_escalate(head)
                 ):
                     challengers = set()
                 # Without a row to cancel, clearing the park would forget an
@@ -2318,7 +2329,7 @@ class SentinelDispatcher:
             )
             return None
 
-        confirmed_alarms = [a for a in alarms if a.alert_id in confirmed_ids]
+        confirmed_alarms = self._dispatch_order([a for a in alarms if a.alert_id in confirmed_ids])
         tier = worst_tier(confirmed_alarms)
 
         # Tier 3 alarms are handled by reflexes only — don't wake the Sentinel

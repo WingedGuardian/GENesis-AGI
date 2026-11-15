@@ -14,9 +14,18 @@
   /dev/null, so every Genesis Python server was skipped (on a live daemon, 5 of
   22 groups and about 1,200 of 3,800 MB were found). A target must now read a
   pipe the app-server writes and write one it reads, on any descriptor, and no
-  other child of the app-server may hold either pipe. A chat command Codex
+  other child of the app-server may hold either pipe; while a child's
+  descriptors cannot be read, no sibling qualifies. A chat command Codex
   starts in pipe mode, whose stdin is /dev/null, still never qualifies.
+- **The build-up also comes from terminal Codex sessions.** On Codex 0.169 a
+  terminal `codex` uses the shared app-server, and each subagent it spawns
+  leaves a full set of MCP servers there. The tool's output and the Sentinel
+  prompt no longer name terminal `codex` as a workaround.
 - **A take-over never drops the owner's answer.** If cancelling the parked
   request fails because it is no longer pending, the park is kept; and a
   take-over happens only when the alarm the dispatch would lead with is the
-  challenger and is itself clear of backoff.
+  challenger and its dispatch would really start: clear of backoff, the boot
+  grace, a heavy workload, a running session and the escalation limit.
+- **The alarm's scan cache keeps its last reading when a refresh fails**, so a
+  read error never looks like the groups going away, and overlapping callers
+  share one scan.

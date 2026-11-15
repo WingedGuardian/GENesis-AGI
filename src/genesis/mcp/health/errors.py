@@ -231,6 +231,7 @@ _memory_culprits: str | None = None
 _CODEX_MCP_TTL_S = 60.0
 _codex_mcp_cache: tuple[float, tuple[int, int] | None] | None = None  # (monotonic, (groups, MB))
 _codex_mcp_blind_logged_at: float | None = None
+_codex_mcp_refresh_lock = None  # asyncio.Lock, made on first use: one scan at a time
 
 
 def _codex_mcp_scan():
@@ -252,38 +253,54 @@ async def _codex_mcp_held() -> tuple[int, int, int] | None:
 
     from genesis.sentinel import codex_mcp_stop
 
-    global _codex_mcp_cache, _codex_mcp_blind_logged_at  # noqa: PLW0603
+    global _codex_mcp_cache, _codex_mcp_blind_logged_at, _codex_mcp_refresh_lock  # noqa: PLW0603
     if codex_mcp_stop.load_mode() == codex_mcp_stop.MODE_OFF:
         return None
     threshold = codex_mcp_stop.load_propose_at_mb()
     if threshold is None:
         return None
-    now = time.monotonic()
-    if _codex_mcp_cache is None or now - _codex_mcp_cache[0] >= _CODEX_MCP_TTL_S:
-        held: tuple[int, int] | None = None
-        try:
-            scan = await asyncio.to_thread(_codex_mcp_scan)
-        except Exception:
-            scan = None
-            if _codex_mcp_blind_logged_at is None or now - _codex_mcp_blind_logged_at >= 3600:
-                _codex_mcp_blind_logged_at = now
-                logger.error("codex_mcp_held: the stop tool's scan raised; the alarm is blind", exc_info=True)
-        if scan is not None:
-            held = (len(scan.groups), sum(g.rss_kb for g in scan.groups) // 1024)
-            if scan.app_servers and scan.uncertain and not scan.groups and (
-                _codex_mcp_blind_logged_at is None or now - _codex_mcp_blind_logged_at >= 3600
-            ):
-                _codex_mcp_blind_logged_at = now
-                logger.error(
-                    "codex_mcp_held: %d app-server child(ren) could not be classified and no MCP group "
-                    "was found; the alarm may be blind in this process",
-                    len(scan.uncertain),
-                )
-        _codex_mcp_cache = (now, held)
-    held = _codex_mcp_cache[1]
+    if _codex_mcp_refresh_lock is None:
+        _codex_mcp_refresh_lock = asyncio.Lock()
+    async with _codex_mcp_refresh_lock:
+        # Re-read the clock and the cache under the lock: a caller that waited
+        # here uses the scan the first one just made instead of running another.
+        now = time.monotonic()
+        if _codex_mcp_cache is None or now - _codex_mcp_cache[0] >= _CODEX_MCP_TTL_S:
+            await _refresh_codex_mcp_cache(now)
+    held = _codex_mcp_cache[1] if _codex_mcp_cache is not None else None
     if held is None or held[0] == 0 or held[1] < threshold:
         return None
     return held[0], held[1], threshold
+
+
+async def _refresh_codex_mcp_cache(now: float) -> None:
+    import asyncio
+
+    global _codex_mcp_cache, _codex_mcp_blind_logged_at  # noqa: PLW0603
+    # A failed scan keeps the last observation: a read error is no evidence the
+    # groups are gone, and dropping the alarm would read as cleared to the
+    # Sentinel's re-verification of a pending approval.
+    held = _codex_mcp_cache[1] if _codex_mcp_cache is not None else None
+    try:
+        scan = await asyncio.to_thread(_codex_mcp_scan)
+    except Exception:
+        scan = None
+        if _codex_mcp_blind_logged_at is None or now - _codex_mcp_blind_logged_at >= 3600:
+            _codex_mcp_blind_logged_at = now
+            logger.error("codex_mcp_held: the stop tool's scan raised; the alarm is blind", exc_info=True)
+    if scan is not None and scan.app_servers and scan.uncertain and not scan.groups:
+        # Nothing classified and something unreadable is no reading at all:
+        # keep the last observation, as for a raise.
+        if _codex_mcp_blind_logged_at is None or now - _codex_mcp_blind_logged_at >= 3600:
+            _codex_mcp_blind_logged_at = now
+            logger.error(
+                "codex_mcp_held: %d app-server child(ren) could not be classified and no MCP group "
+                "was found; the alarm may be blind in this process",
+                len(scan.uncertain),
+            )
+    elif scan is not None:
+        held = (len(scan.groups), sum(g.rss_kb for g in scan.groups) // 1024)
+    _codex_mcp_cache = (now, held)
 
 
 # ``infra:process_memory_high``: one process over ``process_stop.propose_at_mb``

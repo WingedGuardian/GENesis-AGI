@@ -3,10 +3,13 @@
 Codex threads that run on the shared app-server daemon (the path editor
 clients such as the VS Code extension use) each start a full set of stdio
 MCP servers, and finished subagent threads can keep those sets alive for
-hours (upstream openai/codex#38247). A terminal ``codex`` TUI runs embedded
-instead: its subagents share one set and exiting it frees everything
-(measured on a live install, 2026-11-10). This tool is the Sentinel's
-deterministic remedy for that build-up under ``infra:container_memory_high``.
+hours (upstream openai/codex#38247, #56937, #25015). On Codex 0.166 a
+terminal ``codex`` TUI ran embedded, with its own MCP children. On 0.169 it
+uses the daemon too, and its subagents leave a set each: 44 of 45 new
+threads in one day were subagents of long-running TUI sessions (measured on a
+live install, 2026-11-15). This tool is the Sentinel's deterministic remedy
+for that build-up under ``infra:codex_mcp_held`` and
+``infra:container_memory_high``.
 
 DRY-RUN BY DEFAULT. It signals only with ``--execute``, which only the action
 the owner approves is meant to carry, so a session that drops a flag kills
@@ -234,6 +237,8 @@ def _pipe_ends(pid: int) -> tuple[set[str], set[str]] | None:
     fd_dir = _proc() / str(pid) / "fd"
     try:
         names = os.listdir(fd_dir)
+    except FileNotFoundError:
+        return set(), set()  # it exited mid-scan: a gone process holds no pipe
     except OSError:
         return None
     reads: set[str] = set()
@@ -365,10 +370,10 @@ def scan() -> Scan:
         # server's own request and reply pipes are held by it alone; a pipe
         # end that leaked into another child (an inherited descriptor) is
         # shared, and sharing one proves nothing about the child holding it.
-        # A child whose descriptors cannot be read is not counted here, so a
-        # pipe shared only with it reads as unshared. Such a child is itself
-        # uncertain, the owner approves every stop, and stop() re-checks the
-        # leader's start time: an accepted residual, not a target rule.
+        # A child whose descriptors cannot be read might share any pipe, so
+        # while one exists no sibling's pipes can be shown exclusive: every
+        # candidate under this app-server is then uncertain, never a target.
+        blind_siblings = sorted(pid for pid, ends in child_ends.items() if ends is None)
         holders: dict[str, int] = {}
         for ends in child_ends.values():
             for p in (ends[0] | ends[1]) if ends else ():
@@ -406,6 +411,11 @@ def scan() -> Scan:
             ends = child_ends.get(pid)
             if ends is None:
                 result.unreadable(f"{label} (descriptors unreadable)")
+                continue
+            if blind_siblings:
+                result.unreadable(
+                    f"{label} (pipe exclusivity unproven: sibling {blind_siblings[0]} descriptors unreadable)"
+                )
                 continue
             reads, writes = ends
             # The MCP stdio transport: a request pipe the app-server writes and
@@ -584,8 +594,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"codex_mcp_stop: stopped {len(stopped)} of {len(found.groups)} group(s), "
         f"~{freed_mb:.0f} MB freed, {len(failures)} failed. Codex threads on this "
-        f"daemon lose these servers until reopened; subagent-heavy Codex work from a "
-        f"terminal `codex` does not build them up."
+        f"daemon lose these servers until reopened."
     )
     for f in failures:
         print(f"  FAILED {f}")
