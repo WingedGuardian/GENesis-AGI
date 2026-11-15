@@ -2325,7 +2325,9 @@ class TestCodexMcpHeldPark:
         assert "service:genesis_down" in {a.alert_id for a in request.alarms}
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("blocker", ["heavy_workload", "active_session", "no_invoker", "boot_grace"])
+    @pytest.mark.parametrize(
+        "blocker", ["heavy_workload", "active_session", "no_invoker", "boot_grace", "would_escalate"],
+    )
     async def test_no_take_over_when_the_replacement_dispatch_would_be_deferred(self, blocker):
         """Cancelling the owner's request is only worth it if the outage's
         dispatch then goes through; a later gate refusing it would lose both."""
@@ -2336,6 +2338,9 @@ class TestCodexMcpHeldPark:
             d._invoker = None
         elif blocker == "boot_grace":
             d._state.started_at = datetime.now(UTC).isoformat()
+        elif blocker == "would_escalate":
+            # Four old attempts: backoff is ready, but the fifth escalates.
+            d._pattern_attempts["service:genesis_down"] = [time.monotonic() - 10**6] * 4
         both = [self._HELD, self._DOWN]
         workload = "dream_cycle" if blocker == "heavy_workload" else None
         with patch("genesis.sentinel.dispatcher._heavy_workload", return_value=workload):
@@ -2343,6 +2348,20 @@ class TestCodexMcpHeldPark:
         gate.resolve_request.assert_not_awaited()
         assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
         assert d._state.pending_request_id == "req-held"
+
+    def test_a_held_back_alarm_does_not_hide_an_equally_strong_eligible_one(self):
+        """Codex review: dispatch() keys every gate on the first alarm, so a
+        declined or backed-off warning listed first would block another one."""
+        d, _gate = self._parked([self._HELD])
+        held = FireAlarm(tier=2, alert_id="infra:codex_mcp_held", severity="WARNING", message="a")
+        other = FireAlarm(tier=2, alert_id="infra:other_warning", severity="WARNING", message="b")
+        down = FireAlarm(tier=1, alert_id="service:genesis_down", severity="CRITICAL", message="c")
+        assert [a.alert_id for a in d._dispatch_order([held, other])] == [held.alert_id, other.alert_id]
+        d._resolved_cooldowns[held.alert_id] = time.monotonic()
+        assert [a.alert_id for a in d._dispatch_order([held, other])] == [other.alert_id, held.alert_id]
+        # Readiness never outranks strength.
+        d._resolved_cooldowns[down.alert_id] = time.monotonic()
+        assert d._dispatch_order([other, down])[0].alert_id == down.alert_id
 
     @pytest.mark.asyncio
     async def test_take_over_starts_the_cooldown_for_the_cancelled_pattern(self):

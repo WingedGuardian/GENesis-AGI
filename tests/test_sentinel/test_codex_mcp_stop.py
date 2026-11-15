@@ -73,6 +73,10 @@ def _write_proc(
         os.symlink(exe, d / "exe")
     if fds is None and stdio is not None:
         fds = {0: (stdio[0], "r"), 1: (stdio[1], "w")}
+    if fds is None and stdio is None:
+        # Descriptors that cannot be read: listing a plain file raises
+        # NotADirectoryError, an OSError that is not "the process is gone".
+        (d / "fd").write_text("")
     if fds is not None:
         (d / "fd").mkdir()
         (d / "fdinfo").mkdir()
@@ -169,7 +173,6 @@ def fake_proc(tmp_path, monkeypatch):
         argv=["serena"],
         cgroup="/user.slice/app.slice/genesis-serena-codex.service",
     )
-    w(root, 107, comm="python3", ppid=APP, pgid=107, argv=["python3", "fds-hidden"], stdio=None)
     # A running chat command in Codex's pipe mode: own group, stdout piped, stdin
     # /dev/null (core/src/spawn.rs, unified_exec stdin_open=tty). Must be skipped.
     w(
@@ -201,7 +204,6 @@ def test_scan_targets_only_the_mcp_group(fake_proc):
         (103, "not an MCP server"),
         (104, "not its own process group"),
         (106, "systemd unit"),
-        (107, "descriptors unreadable"),
         (108, "not an MCP server"),
     ]:
         assert (fake_proc / str(pid)).is_dir()
@@ -271,6 +273,37 @@ def test_a_pipe_another_child_also_holds_proves_nothing(fake_proc):
         assert any(s.startswith(f"{pid} ") and "not an MCP server" in s for s in found.skipped)
 
 
+def test_an_unreadable_sibling_leaves_every_candidate_unproven(fake_proc):
+    """CodeRabbit: a sibling whose descriptors cannot be read may hold the same
+    pipes (an inherited end), so no candidate's pipes can be shown exclusive."""
+    _write_proc(
+        fake_proc, 124, comm="bash", ppid=APP, pgid=124, argv=["bash", "-c", "make"],
+        fds={0: ("pipe:[1011]", "r"), 1: ("pipe:[1012]", "w")},
+    )
+    (fake_proc / "124" / "fdinfo" / "0").unlink()
+    (fake_proc / "124" / "fdinfo" / "0").mkdir()  # reading it raises
+    found = mod.scan()
+    assert found.groups == []
+    assert any(s.startswith("101 ") and "exclusivity unproven" in s for s in found.uncertain)
+
+
+def test_a_sibling_that_exited_mid_scan_is_not_a_blind_sibling(fake_proc, monkeypatch):
+    """A child gone between the pid listing and its fd read holds no pipe; it
+    must not make every candidate uncertain."""
+    _write_proc(
+        fake_proc, 125, comm="bash", ppid=APP, pgid=125, argv=["bash"], stdio=None,
+    )
+    real = mod.os.listdir
+
+    def _listdir(path):
+        if str(path).endswith("/125/fd"):
+            raise FileNotFoundError(path)
+        return real(path)
+
+    monkeypatch.setattr(mod.os, "listdir", _listdir)
+    assert [g.pgid for g in mod.scan().groups] == [101]
+
+
 def test_an_unreadable_pipe_mode_is_uncertain_never_skipped(fake_proc):
     (fake_proc / "101" / "fdinfo" / "0").unlink()
     (fake_proc / "101" / "fdinfo" / "0").mkdir()  # reading it raises, not "gone"
@@ -296,6 +329,7 @@ def test_app_server_with_unreadable_descriptors_classifies_nothing(fake_proc):
     import shutil
 
     shutil.rmtree(fake_proc / str(APP) / "fd")
+    (fake_proc / str(APP) / "fd").write_text("")  # unreadable, not gone
     found = mod.scan()
     assert found.groups == []
     assert any(f"app-server {APP}" in s and "descriptors unreadable" in s for s in found.uncertain)
@@ -575,6 +609,7 @@ def test_unreadable_candidates_with_nothing_stopped_is_not_done(fake_proc, monke
     import shutil
 
     shutil.rmtree(fake_proc / "101" / "fd")
+    (fake_proc / "101" / "fd").write_text("")  # unreadable, not gone
     monkeypatch.setattr(mod, "load_mode", lambda: mod.MODE_PROPOSE_ONLY)
     calls = []
     monkeypatch.setattr(mod, "stop", lambda *a, **k: calls.append(a) or ([], []))
@@ -587,20 +622,32 @@ def _stops_everything(groups, **_k):
     return list(groups), []
 
 
-def test_unreadable_candidate_beside_a_stopped_group_is_partial(fake_proc, monkeypatch, capsys):
-    """Readable groups stopping cleanly does not make the run done while another
-    candidate was never classified (fixture pid 107: descriptors unreadable)."""
+def _add_blind_child(root):
+    """A direct child of the app-server whose descriptors cannot be read."""
+    _write_proc(root, 107, comm="python3", ppid=APP, pgid=107, argv=["python3", "fds-hidden"], stdio=None)
+
+
+def test_an_unreadable_child_is_uncertain(fake_proc):
+    _add_blind_child(fake_proc)
+    found = mod.scan()
+    assert any(s.startswith("107 ") and "descriptors unreadable" in s for s in found.uncertain)
+
+
+def test_an_unreadable_child_makes_the_run_partial_and_stops_nothing(fake_proc, monkeypatch, capsys):
+    """With a child that cannot be read, no sibling's pipes are proven exclusive:
+    nothing is a target, and the run is not done."""
+    _add_blind_child(fake_proc)
+    stopped = []
     monkeypatch.setattr(mod, "load_mode", lambda: mod.MODE_PROPOSE_ONLY)
-    monkeypatch.setattr(mod, "stop", _stops_everything)
+    monkeypatch.setattr(mod, "stop", lambda groups, **_k: (stopped.extend(groups) or (list(groups), [])))
     assert mod.main(["--execute"]) == mod.EXIT_PARTIAL
-    assert "1 candidate(s) could not be read and were not stopped" in capsys.readouterr().out
+    assert stopped == []
+    assert "could not be read; nothing stopped" in capsys.readouterr().out
 
 
 def test_every_candidate_readable_and_stopped_is_ok(fake_proc, monkeypatch):
     # Control for the test above: the same run without the unreadable candidate.
-    import shutil
 
-    shutil.rmtree(fake_proc / "107")
     monkeypatch.setattr(mod, "load_mode", lambda: mod.MODE_PROPOSE_ONLY)
     monkeypatch.setattr(mod, "stop", _stops_everything)
     assert mod.main(["--execute"]) == mod.EXIT_OK
@@ -663,9 +710,7 @@ def test_a_process_named_unreadable_is_not_uncertain(fake_proc):
 
 
 def test_a_process_named_unreadable_does_not_make_the_run_partial(fake_proc, monkeypatch):
-    import shutil
 
-    shutil.rmtree(fake_proc / "107")  # the fixture's genuinely unreadable candidate
     _write_proc(
         fake_proc, 109, comm="unreadable", ppid=APP, pgid=109,
         argv=["unreadable"], stdio=("/dev/pts/3", "/dev/pts/3"),

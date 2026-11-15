@@ -782,6 +782,7 @@ def _reset_memory_alarm_breakdown():
     mp.setattr(errors, "_codex_mcp_scan", lambda: None)
     mp.setattr(errors, "_codex_mcp_cache", None)
     mp.setattr(errors, "_codex_mcp_blind_logged_at", None)
+    mp.setattr(errors, "_codex_mcp_refresh_lock", None)
     yield
     mp.undo()
 
