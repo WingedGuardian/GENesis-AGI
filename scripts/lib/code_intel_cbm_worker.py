@@ -24,8 +24,18 @@ from types import MappingProxyType
 
 # v0.11.0 Linux x86_64 portable release, independently matched to release digest.
 BUILD = "ce11c141431aeadd788506c3a7e6942db8fd438dec369d0707a39ec9fd8c6510"  # pragma: allowlist secret (public executable digest, not a secret)
+RELEASES = MappingProxyType({
+    BUILD: MappingProxyType(dict(version="0.11.0", worker="v0.11.0-stock-worker")),
+})
 MAX_RESPONSE = 1024 * 1024
 JOB_CAP = 8 * 1024**3
+
+
+def qualified_release(build: str):
+    """Select reviewed code policy by exact digest, never by a version range."""
+    if not isinstance(build, str) or build not in RELEASES:
+        raise ValueError("unsupported managed build; repeat acceptance before upgrading")
+    return RELEASES[build]
 
 
 def verify_scope(env: dict[str, str]) -> int:
@@ -120,7 +130,7 @@ def _execute_stock_worker(path: Path, args: argparse.Namespace, cap: int, *, que
                 managed["ready"](config)
             else:
                 managed["ready"](config, environment=environment)
-            executable = managed["verified_binary"](Path(config["binary"]))
+            executable = managed["verified_binary"](Path(config["binary"]), config["build"])
             # Keep the accepted inode through child creation, but close the
             # lifecycle admission lock immediately after Popen, before wait.
             with (
@@ -154,7 +164,7 @@ def _spawn_worker(
         "cli",
         "--index-worker",
         "--index-worker-build",
-        BUILD,
+        config["build"],
         "index_repository",
         json.dumps(
             {

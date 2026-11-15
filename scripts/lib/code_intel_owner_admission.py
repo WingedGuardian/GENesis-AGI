@@ -142,7 +142,7 @@ def prepared_inputs(snapshot, modules, repo_path, provider, run_mode, settings_p
             if (len(documents) != 1 or type(documents[0]) is not bytes
                     or Path(config['main']) != snapshot.root or config['main'] != repo_path):
                 raise ValueError('initial runtime requires its one immutable primary configuration')
-            with managed.verified_binary(Path(config['binary'])):
+            with managed.verified_binary(Path(config['binary']), config['build']):
                 pass  # Read/hash/access only; no provider process before reservation.
             environment = managed.native_env(config, environment=control)
             environment.pop('INVOCATION_ID', None)

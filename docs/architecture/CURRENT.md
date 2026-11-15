@@ -1885,7 +1885,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: 6b4f275 2026-11-08
+verified: 9eaa6aba0 2026-11-15
 ```
 
 Scoped verification: internal `mcp/shared_http` composition only. It receives
@@ -2055,6 +2055,14 @@ the shared banner is not an assertion about all concurrent sessions.
   `docs/reference/serena-shared-main.md`.
   External Codebase has pinned configuration staging/diagnostics and bounded
   native query unit entry points in `scripts/codebase_managed.py`.
+  The captured worker's immutable release records select an exact configured
+  build across staging, managed execution, queue source identity and worker argv.
+  Only v0.11.0 is currently qualified; future releases require their own reviewed
+  record and native acceptance. A different supported binary at the configured
+  path still refuses; policy updates do not update existing settings or consent.
+  Scoped CBM verification uses isolated configuration and captured-owner execution
+  through the stock adapter to harmless children; installed-provider and real
+  kernel containment qualification remain separate.
   Status separately observes conditional queue initialization-lock prerequisites
   without opening the queue or changing current-schema availability.
   Install and bootstrap render disabled query/client-slice templates without

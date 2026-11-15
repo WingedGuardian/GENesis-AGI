@@ -1,0 +1,1 @@
+- Select managed Codebase builds through reviewed release records while retaining exact configured-binary checks, captured source binding and immutable settings. The initially supported release remains v0.11.0; this does not upgrade or enable existing installations.
