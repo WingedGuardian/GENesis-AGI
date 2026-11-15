@@ -141,6 +141,8 @@ def eligible(history, identity):
 def eligible_row(state, identity, semantic_manifest):
     """Verify a real physical state against its owner's full logical admission."""
     row = state.attempts[identity]
+    if "cost_basis" in row["spec"]:
+        return None  # Native answer eligibility requires the later transport integration.
     incidents = {f"{name}:{identity}" for name in ("billing", "reservation", "answer", "failure", "identity")}
     if identity not in state.answers or state.blockers & incidents or len(row["observations"]) != 1:
         return None

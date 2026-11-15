@@ -44,6 +44,22 @@ def same_request(prior, current):
             and pinned.frozen_receipt_policy(prior) == pinned.frozen_receipt_policy(current))
 
 
+def _native_upper(spec, observed):
+    from .native_expense import observation_interval
+
+    try:
+        return observation_interval(spec, observed)[1]
+    except (ValueError, KeyError, TypeError):
+        return None  # Unknown remains reserved; no raw-response repair or zero substitution.
+
+
+def _observation_charges(row):
+    if "cost_basis" in row["spec"]:
+        return [_native_upper(row["spec"], observed) for observed in row["observations"]]
+    return [accounting.currency(o["usage"]["cost"]) for o in row["observations"]
+            if isinstance(o.get("usage"), dict) and o["usage"].get("cost") is not None]
+
+
 class Study:
     """Validated frozen inputs; no constructor grants execution authority."""
 
@@ -168,7 +184,8 @@ class Study:
                     raw = receipt.get("raw_body")
                     # Invalid old receipts remain unresolved. A raw GET cost can
                     # still be disclosed separately without settling it.
-                    if raw and receipt.get("response_model") and receipt.get("response_provider"):
+                    if ("cost_basis" not in row["spec"] and raw
+                            and receipt.get("response_model") and receipt.get("response_provider")):
                         self._annotate(history, attempt, raw.encode(), model=receipt["response_model"],
                                        provider=receipt["response_provider"])
         seen = set()
@@ -203,8 +220,7 @@ class Study:
                 admitted[history.hash, alias] = shared[key]
             for attempt, row in history._state.attempts.items():
                 charges = [self.annotations.get((history.hash, attempt))]
-                charges.extend(accounting.currency(o["usage"]["cost"]) for o in row["observations"]
-                               if isinstance(o.get("usage"), dict) and o["usage"].get("cost") is not None)
+                charges.extend(_observation_charges(row))
                 if any(c is not None and c > accounting.currency(row["spec"]["max_charge"])
                        for c in charges):
                     self.execution_issues.append("historical_charge_exceeds_allocation")
@@ -382,7 +398,8 @@ def include_current(study, *, root_path=None):
         for identity, row in history._state.attempts.items():
             study._claim((history.hash, identity), row)
             for receipt in row["receipts"]:
-                if receipt.get("raw_body") and receipt.get("response_model") and receipt.get("response_provider"):
+                if ("cost_basis" not in row["spec"] and receipt.get("raw_body")
+                        and receipt.get("response_model") and receipt.get("response_provider")):
                     study._annotate(history, identity, receipt["raw_body"].encode(),
                                     model=receipt["response_model"], provider=receipt["response_provider"])
     study._select(verify_reuse=False)
