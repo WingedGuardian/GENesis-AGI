@@ -58,6 +58,9 @@ JUDGE_TIMEOUT_SECS = 300.0
 # score — but ALWAYS store. Grounding is never a drop gate. See grounding.py.
 _GROUNDING_WARN_THRESHOLD = 0.25
 
+# Returned in place of a procedure id for a lesson recorded in shadow mode.
+SHADOW_ID = "shadow"
+
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
@@ -216,10 +219,15 @@ async def _store_judged_procedure(
     source_session_id: str | None = None,
     grounding_score: float | None = None,
     origin_class: str | None = None,
+    shadow: bool = False,
 ) -> str | None:
     """Run the scoping + (same-type + cross-type) novelty checks, then store via
     store_procedure_checked. Returns procedure ID on success, None on
     skip/duplicate/directive.
+
+    ``shadow``: run every check, then append the lesson to the lesson-builder
+    shadow record instead of storing it, and return ``SHADOW_ID``. Nothing is
+    written to the store, and the fail-open rate limiter is not advanced.
 
     ``origin_class`` is the WS-3 gate-1 session provenance (from the caller's
     tool-name scan); the shadow gate emits it after a successful store. Defaults
@@ -285,7 +293,8 @@ async def _store_judged_procedure(
                 task_type,
             )
             return None
-        _fail_open_timestamps[task_type] = time.monotonic()
+        if not shadow:
+            _fail_open_timestamps[task_type] = time.monotonic()
 
     if not is_novel:
         logger.info(
@@ -294,6 +303,22 @@ async def _store_judged_procedure(
             max_sim,
         )
         return None
+
+    if shadow:
+        from genesis.learning.procedural.lesson_builder_config import record_shadow_lesson
+
+        record_shadow_lesson({
+            "session_id": source_session_id,
+            "task_type": task_type,
+            "principle": principle,
+            "scenario": scenario,
+            "steps": steps,
+            "tools_used": tools_used,
+            "max_similarity": round(max_sim, 3) if max_sim is not None else None,
+            "novelty_fell_open": fell_open,
+            "grounding_score": round(grounding_score, 3) if grounding_score is not None else None,
+        })
+        return SHADOW_ID
 
     # Pack embedding if available
     principle_blob = None
@@ -419,8 +444,13 @@ async def judge_multi_procedure(
     *,
     source_session_id: str | None = None,
     max_new: int | None = None,
+    shadow: bool = False,
 ) -> list[str]:
     """Build 0..N topic-segmented procedures from a struggle-detected session.
+
+    ``shadow`` records each would-be procedure instead of storing it (see
+    ``_store_judged_procedure``); the returned list then holds ``SHADOW_ID``
+    once per would-be procedure.
 
     ``spine`` is rendered USER-BLIND (tool actions only); ``haystack`` is the
     uncapped execution record used for grounding. Each built procedure is grounded
@@ -493,6 +523,7 @@ async def judge_multi_procedure(
             source_session_id=source_session_id,
             grounding_score=gscore,
             origin_class=origin_class,
+            shadow=shadow,
         )
         if proc_id:
             stored.append(proc_id)
