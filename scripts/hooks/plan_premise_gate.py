@@ -251,6 +251,28 @@ def _label_only(text: str) -> bool:
     return not _PLACEHOLDER.sub("", rest).replace("\u200b", "").strip()
 
 
+#: A proposal's answer 2: its ``Stated:`` field starts with the word the form
+#: names, "nowhere", quotes and markup allowed (the form writes it ``"nowhere"``).
+#: Owner ruling 2026-11-15: only that word; another wording that admits no
+#: citation ("none — new behaviour") passes as cited, a stated residual. So does
+#: the parser's rule for where a sub-label starts: a capitalized "as Stated:" in
+#: the main answer opens the field early (``_sublabel_at``).
+_NOWHERE = re.compile(r"[\W_]*nowhere\b", re.IGNORECASE)
+
+
+def is_proposal(answers: dict[int, str] | None) -> bool:
+    """Whether a nine-item section's answer 2 admits that nothing states the
+    intended behaviour (``Stated: nowhere``): the issue is then a proposal, not a
+    fix. Read from the ``Stated:`` field alone, so prose in the main answer never
+    counts."""
+    if not is_new_form(answers):
+        return False
+    fields = form_fields(2, answers.get(2, ""))
+    if fields is None or fields[1] is None:
+        return False
+    return bool(_NOWHERE.match(_LEADING_LABELS.sub("", fields[1], count=1)))
+
+
 def field_empty(text: str | None) -> bool:
     """Whether a field says nothing once a leading run of labels is taken off."""
     return text is None or _empty(_LEADING_LABELS.sub("", text, count=1))
