@@ -1,0 +1,1 @@
+- Tool-call outcome rows now store the class of each failure (for example a hook refusal or a user rejection) as the classifier saw it, in a new `error_class` column. The class depends on text and metadata the row does not keep, so it could not be worked out later.

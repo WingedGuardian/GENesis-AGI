@@ -61,14 +61,14 @@ async def insert_outcomes(db: aiosqlite.Connection, rows: list[tuple]) -> None:
     """Insert outcome rows, ignoring any ``tool_use_id`` already recorded.
 
     Each row is ``(session_id, tool_name, file_path, success, error_snippet,
-    timestamp, tool_use_id)``.
+    timestamp, tool_use_id, error_class)``.
     """
     if not rows:
         return
     await db.executemany(
         "INSERT OR IGNORE INTO tool_call_outcomes "
-        "(session_id, tool_name, file_path, success, error_snippet, timestamp, tool_use_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "(session_id, tool_name, file_path, success, error_snippet, timestamp, tool_use_id,"
+        " error_class) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         rows,
     )
     await db.commit()

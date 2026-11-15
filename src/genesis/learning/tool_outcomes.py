@@ -36,11 +36,11 @@ What is written, and what deliberately is not:
 * Outcomes are recorded after the extraction watermark moves; a failed record
   is logged and not retried, so a session that has ended loses those calls.
 
-The kind of a failure is not stored yet, and it cannot be recomputed from the
-row: the classifier reads the full result text and the record's
-``toolDenialKind``, while the row keeps neither (the snippet is 400 scrubbed
-characters, and a hook prefix can close past character 1,500). Storing the
-class at write time needs its own schema change.
+The class of a failure is stored in ``error_class`` as the classifier returned
+it (#4722), because it cannot be recomputed from the row: the classifier reads
+the full result text and the record's ``toolDenialKind``, while the row keeps
+neither (the snippet is 400 scrubbed characters, and a hook prefix can close
+past character 1,500).
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 # Stored characters of scrubbed failure text: the classifier's own head window
 # (``transcript_analytics.classify._HEAD``). Enough to read the reason's first
-# sentence; not enough to re-derive the class (see the module docstring).
+# sentence; the class is stored separately (see the module docstring).
 SNIPPET_CHARS = 400
 
 # A JSON ``\uXXXX`` escape. The scrubber decodes escapes only inside a JSON
@@ -116,7 +116,7 @@ def outcome_rows(spine: list[dict], *, fallback_session_id: str | None) -> list[
 
     Row order matches ``db/crud/tool_call_outcomes.insert_outcomes``:
     ``(session_id, tool_name, file_path, success, error_snippet, timestamp,
-    tool_use_id)``.
+    tool_use_id, error_class)``.
     """
     from genesis.db.crud.tool_call_outcomes import (
         ROW_RETENTION_DAYS,
@@ -151,6 +151,7 @@ def outcome_rows(spine: list[dict], *, fallback_session_id: str | None) -> list[
                 # so the row (and its text) would outlive every horizon.
                 entry["timestamp"] if when is not None else now,
                 entry["tool_use_id"],
+                entry.get("failure_class"),
             )
         )
     return rows

@@ -1506,7 +1506,11 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             -- Dedup key for the Stop-hook outcome scanner (#1597). Every row the
             -- scanner writes carries a value; the pre-#1597 rows carry NULL
             -- (SQLite allows multiple NULLs in a UNIQUE index).
-            tool_use_id      TEXT
+            tool_use_id      TEXT,
+            -- Class of a failed call as the transcript writer classified it
+            -- (transcript_analytics.classify, #4722); NULL on success rows, the
+            -- Stop-hook sensor's rows and rows written before the column.
+            error_class      TEXT
         )
     """,
     "direct_session_queue": """

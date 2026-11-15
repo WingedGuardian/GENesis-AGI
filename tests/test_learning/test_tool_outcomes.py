@@ -107,6 +107,45 @@ def test_rows_are_exactly_the_recordable_calls(transcript):
     assert rows["toolu_ok"][0] == SID  # the record's own sessionId
     assert rows["toolu_hook"][5] == "2026-11-01T10:01:01Z"  # the result's timestamp
     assert rows["toolu_ok"][4] is None  # no snippet on a success
+    kinds = {tid: row[7] for tid, row in rows.items()}
+    assert kinds == {
+        "toolu_ok": None,
+        "toolu_hook": "hook_block",
+        "toolu_reject": "user_rejected",
+        "toolu_exit": "exit_nonzero",
+    }
+
+
+def test_the_stored_class_holds_what_the_row_alone_could_not_rebuild(tmp_path):
+    """The two cases #4722 exists for: a class that comes from toolDenialKind,
+    which no column keeps, and a hook refusal whose prefix closes past the
+    400-character snippet."""
+    long_hook = (
+        "PreToolUse:Bash hook error: [bash -c '" + "x" * 600 + "']: BLOCKED: refused."
+    )
+    records = [
+        _use("toolu_denied", "Bash", {"command": "x"}, ts="2026-11-01T10:00:00Z"),
+        _result(
+            "toolu_denied", "Not run.", ts="2026-11-01T10:00:01Z",
+            is_error=True, denial="permission-denied",
+        ),
+        _use("toolu_longhook", "Bash", {"command": "y"}, ts="2026-11-01T10:01:00Z"),
+        _result("toolu_longhook", long_hook, ts="2026-11-01T10:01:01Z", is_error=True),
+    ]
+    path = tmp_path / f"{SID}.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    _, rows = _rows(path)
+    assert rows["toolu_denied"][7] == "denied_permission-denied"
+    assert rows["toolu_longhook"][7] == "hook_block"
+    # Neither is recoverable from what the row stores.
+    from genesis.transcript_analytics.classify import classify
+
+    assert classify(rows["toolu_denied"][4] or "", is_error=True, denial_kind=None)[0] != (
+        "denied_permission-denied"
+    )
+    assert classify(rows["toolu_longhook"][4] or "", is_error=True, denial_kind=None)[0] != (
+        "hook_block"
+    )
 
 
 def test_a_call_with_no_result_is_never_a_row_but_still_scores_as_an_error(transcript):
@@ -246,10 +285,10 @@ async def test_prune_drops_old_rows_and_old_failure_text_only(db):
         return ts.replace("+00:00", "Z") if z else ts
 
     rows = [
-        ("s", "Bash", None, 0, "old text", ago(200), "t_old"),
-        ("s", "Bash", None, 0, "mid text", ago(120, z=True), "t_mid"),
-        ("s", "Bash", None, 0, "new text", ago(10, z=True), "t_new"),
-        ("s", "Read", None, 1, None, ago(179), "t_keep"),
+        ("s", "Bash", None, 0, "old text", ago(200), "t_old", "other"),
+        ("s", "Bash", None, 0, "mid text", ago(120, z=True), "t_mid", "other"),
+        ("s", "Bash", None, 0, "new text", ago(10, z=True), "t_new", "other"),
+        ("s", "Read", None, 1, None, ago(179), "t_keep", None),
     ]
     await tco.insert_outcomes(db, rows)
     removed, cleared = await tco.prune(db, now=now)
@@ -299,6 +338,13 @@ async def test_an_extraction_cycle_records_tool_outcomes(db, tmp_path, monkeypat
         "toolu_ok",
         "toolu_reject",
     ]
+    cur = await db.execute(
+        "SELECT tool_use_id, error_class FROM tool_call_outcomes"
+        " WHERE tool_use_id IN ('toolu_ok', 'toolu_reject')"
+    )
+    assert dict(await cur.fetchall()) == {"toolu_ok": None, "toolu_reject": "user_rejected"}
+
+
 def _ago(days):
     from datetime import UTC, datetime, timedelta
 
