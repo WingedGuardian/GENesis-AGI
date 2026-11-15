@@ -222,6 +222,28 @@ def register_scope(context, data):
             assert current_grant['nonce'] == grant['nonce'] and current_grant['status'] == 'spent'
         assert Path(str(marker)+'.calls').read_text() == 'call\n'
 
+        acceptance = prefix + snapshot.resume_command('queue', 'accept-retry', '--repo', str(root),
+            '--provider', 'gitnexus', '--nonce', grant['nonce'], '--managed-config', '/unused/settings',
+            '--evidence-reference', 'fixture://query-and-artifact-verified')
+        for replayed in (False, True):
+            with snapshot.sealed() as fd:
+                accepted = subprocess.run(acceptance, stdin=fd, env=env, cwd=cwd,
+                                          capture_output=True, timeout=30)
+            if payload_rc:
+                assert accepted.returncode != 0
+            else:
+                assert accepted.returncode == 0, accepted.stderr.decode()
+                receipt = json.loads(accepted.stdout)
+                assert receipt['state'] == ('already_accepted' if replayed else 'accepted')
+                assert receipt['trial'] == claimed['context'] and receipt['launch_authority'] is False
+                assert receipt['receipt']['accepted_evidence_reference'] == 'fixture://query-and-artifact-verified'
+            assert Path(str(marker)+'.calls').read_text() == 'call\n'
+        with closing(queue._connect()) as db:
+            assert db.execute('SELECT count(*) FROM executions').fetchone()[0] == 1
+            assert db.execute('SELECT accepted_sequence FROM provider_state WHERE hash=? AND provider=?',
+                              (claimed['hash'], 'gitnexus')).fetchone()[0] == (
+                                  claimed['context']['execution_seq'] if payload_rc == 0 else 0)
+
 
 @pytest.mark.parametrize('payload_rc', [0, 3, 75])
 @pytest.mark.parametrize('selected', [False, True])
