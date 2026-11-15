@@ -497,6 +497,8 @@ the first verified answer regardless of its grade.
 
 ### Fixed
 
+- Holdout runner: a run interrupted while it creates a worktree now stops git with SIGTERM, so git removes its own half-made worktree, and uses SIGKILL only on a git that is still running after 10 seconds. Killing git outright could leave a locked worktree registration that could not be removed. The cleanup also unlocks the half-made worktree before removing it, so no locked registration survives however git was stopped. A Ctrl-C is now handled like SIGTERM and SIGHUP, and a second signal, a Ctrl-C or an error while stopping git no longer skips that cleanup.
+
 - Outreach emails now carry their request topic as the subject, including sends released after owner approval. Subjects receive the existing disclosure checks and text scrubbing; line breaks are unfolded into spaces and an empty topic retains the default subject.
 
 - Checked shell parsing now preserves nested structural uncertainty and refuses possible Git/GitHub operations instead of trusting a partial parse.
