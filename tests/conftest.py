@@ -42,6 +42,7 @@ import contextlib  # noqa: E402
 import os  # noqa: E402
 import shutil  # noqa: E402
 import subprocess  # noqa: E402
+import types  # noqa: E402
 
 import aiosqlite  # noqa: E402
 import pytest  # noqa: E402
@@ -782,6 +783,10 @@ def _reset_memory_alarm_breakdown():
     mp.setattr(errors, "_codex_mcp_scan", lambda: None)
     mp.setattr(errors, "_codex_mcp_cache", None)
     mp.setattr(errors, "_codex_mcp_blind_logged_at", None)
+    # Same for the process_memory_high alarm: no real /proc scan by default.
+    mp.setattr(errors, "_process_scan", lambda _threshold: types.SimpleNamespace(targets=[]))
+    mp.setattr(errors, "_process_cache", None)
+    mp.setattr(errors, "_process_blind_logged_at", None)
     yield
     mp.undo()
 

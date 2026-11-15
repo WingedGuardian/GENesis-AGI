@@ -64,6 +64,9 @@ _TIER2_PATTERNS = {
     # memory is high (#4302). The dispatcher lets a confirmed CRITICAL or tier-1
     # alarm take over a park held only by WARNINGs, so this one never blocks it.
     "infra:codex_mcp_held",
+    # Same reason: a single runaway process, proposed for process_stop before
+    # container memory is high.
+    "infra:process_memory_high",
 }
 
 # Non-remediable CRITICALs are dropped at every awareness tick — log each

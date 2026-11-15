@@ -286,6 +286,60 @@ async def _codex_mcp_held() -> tuple[int, int, int] | None:
     return held[0], held[1], threshold
 
 
+# ``infra:process_memory_high``: one process over ``process_stop.propose_at_mb``
+# of RAM+swap (a single runaway with no children, which neither the tree
+# breakdown nor codex_mcp_held names early). The stop tool's own ``scan()``
+# decides what counts, so the alarm never names a process the remedy would not
+# stop (systemd services and the user manager are never listed; Claude Code
+# sessions, including server-dispatched ones, are). Cached like codex_mcp_held.
+# An unreadable process is not alarmed on; a raising scan logs hourly.
+_PROCESS_TTL_S = 60.0
+_process_cache: tuple[float, tuple[int, str, int] | None] | None = None
+_process_blind_logged_at: float | None = None
+
+
+def _process_scan(threshold_mb: int):
+    """The stop tool's read-only scan (a seam: the test suite replaces it)."""
+    from genesis.sentinel import process_stop
+
+    return process_stop.scan(threshold_mb)
+
+
+async def _process_memory_high() -> tuple[int, str, int, int] | None:
+    """(count, largest label, largest MB, threshold MB) when the alarm should
+    fire, else None. Never raises; a raising scan logs at ERROR hourly."""
+    import asyncio
+    import time
+
+    from genesis.sentinel import process_stop
+
+    global _process_cache, _process_blind_logged_at  # noqa: PLW0603
+    if process_stop.load_mode() == process_stop.MODE_OFF:
+        return None
+    threshold = process_stop.load_propose_at_mb()
+    if threshold is None:
+        return None
+    now = time.monotonic()
+    if _process_cache is None or now - _process_cache[0] >= _PROCESS_TTL_S:
+        held: tuple[int, str, int] | None = None
+        try:
+            found = await asyncio.to_thread(_process_scan, threshold)
+            if found.targets:
+                top = found.targets[0]
+                held = (len(found.targets), f"pid {top.pid} {top.label}", top.held_kb // 1024)
+            else:
+                held = (0, "", 0)
+        except Exception:
+            if _process_blind_logged_at is None or now - _process_blind_logged_at >= 3600:
+                _process_blind_logged_at = now
+                logger.error("process_memory_high: the stop tool's scan raised; the alarm is blind", exc_info=True)
+        _process_cache = (now, held)
+    held = _process_cache[1]
+    if held is None or held[0] == 0:
+        return None
+    return held[0], held[1], held[2], threshold
+
+
 async def _memory_breakdown_line() -> str:
     """The top-memory-trees line; never raises (see ``pid_breakdown.memory_summary``)."""
     import asyncio
@@ -773,6 +827,22 @@ async def _compute_alerts(
                 "message": (
                     f"A shared Codex app-server holds {groups} MCP server group(s), {held_mb} MB "
                     f"in all (alarm at {threshold_mb} MB). Remedy: codex_mcp_stop, dry-run first."
+                ),
+            }
+        )
+        current_ids.add(alert_id)
+
+    big = await _process_memory_high()
+    if big is not None:
+        count, top_label, top_mb, threshold_mb = big
+        alert_id = "infra:process_memory_high"
+        alerts.append(
+            {
+                "id": alert_id,
+                "severity": "WARNING",
+                "message": (
+                    f"{count} process(es) hold at least {threshold_mb} MB of RAM+swap each; the "
+                    f"largest is {top_label} at {top_mb} MB. Remedy: process_stop, dry-run first."
                 ),
             }
         )
