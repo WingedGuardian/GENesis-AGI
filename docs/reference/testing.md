@@ -434,9 +434,11 @@ It also reports reads of the real credential files (the deployed `secrets.env`,
 - The run summary counts tests per class under "writes outside the test's temp
   dirs"; `GENESIS_LIVE_WRITES_REPORT=<file>` writes one tab-separated line per
   (test, class, operation, path), on every run.
-- A hit is a write that happens: an attempt the kernel refuses or that changes
-  nothing (`mkdir(exist_ok=True)` on an existing directory, `unlink` of a missing
-  file, reopening an existing file without writing) is not recorded. A relative
+- Hits are pre-operation classifications of audit events, not proof that a
+  syscall completed. Simple known no-ops (`mkdir(exist_ok=True)` on an existing
+  directory, `unlink` of a missing file, reopening an existing file without
+  writing) are filtered, but an operation the kernel refuses can still be
+  reported, and some aliases can be missed (tracked in #4193). A relative
   `os.open` is judged against the cwd and labelled so (its audit event carries no
   `dir_fd`). Writes during collection count as "outside any test".
 - Not covered: writes made by child processes, writes without an audit event,
@@ -446,7 +448,9 @@ It also reports reads of the real credential files (the deployed `secrets.env`,
   boundary there.
 
 The list it produces is the to-do list for moving each such test under its own
-`tmp_path`; once it is empty, the audit can refuse instead of report.
+`tmp_path`. Keep it report-only while the #4193 accuracy gaps are corrected:
+enforcement requires a corrected audit and a complete empty CI census, which a
+selected local run cannot establish.
 
 ## Shared MCP qualification environments
 
