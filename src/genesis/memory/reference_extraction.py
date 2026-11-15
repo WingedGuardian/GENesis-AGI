@@ -284,7 +284,7 @@ def _derive_identifier(
     if not content:
         return f"{default_prefix} (empty)"
     # Take up to the first period or newline
-    for stop in (".", "\n", ";"):
+    for stop in () if whole_tokens else (".", "\n", ";"):
         idx = content.find(stop)
         if 0 < idx < 80:
             content = content[:idx]

@@ -125,6 +125,7 @@ async def test_both_writers_bodies_are_held_out(db):
             project=ro.REFERENCE_PROJECT,
             domain="reference.credentials",
             concept=f"writer-{i}",
+            held_value=_VALUE,  # as both writers pass it
         )
         assert _PASSWORD not in store.store.await_args.args[0]
         assert await _secret(db, unit_id) == _VALUE

@@ -188,7 +188,7 @@ async def test_a_tag_carrying_the_value_keeps_its_other_text(db):
     store = _PointStore()
     tags = ["lab", f"{_SECRET}-room", _SECRET]
     unit = await _ingest(
-        db, store, _body(tags=tags), concept="lab wifi", tags_json=json.dumps(tags)
+        db, store, _body(tags=tags), concept="lab wifi", tags_json=json.dumps(tags), held_value=_VALUE,
     )
     row = await _assert_held(db, store, unit)
     # The tag that was nothing but the secret had no other content to keep.
@@ -203,7 +203,8 @@ async def test_a_tag_naming_a_secret_shaped_login_is_masked(db):
     value = f"{_SECRET} / 482913"
     tags = [_SECRET, "work"]
     unit = await _ingest(
-        db, store, _body(value=value, tags=tags), concept="lab wifi", tags_json=json.dumps(tags)
+        db, store, _body(value=value, tags=tags), concept="lab wifi", tags_json=json.dumps(tags),
+        held_value=value,
     )
     row = await _assert_held(db, store, unit, value=value)
     assert json.loads(row["tags"]) == ["work"]
@@ -274,15 +275,14 @@ async def test_a_trailer_shaped_value_line_is_held_out_whole(db, monkeypatch):
         kind="credentials", identifier="lab wifi", value=value, description=_DESC, tags=["lab"]
     )
     row = await _assert_held(db, store, unit, value=value)
-    assert row["body"].endswith(f"Value: {ro.SECRET_PLACEHOLDER}\nTags: lab")
+    # The Tags line is built from the masked tags_json, never from the body.
+    assert row["body"].endswith(f"Value: {ro.SECRET_PLACEHOLDER}\nTags: reference, credentials, lab")
 
 
 def test_a_repeated_trailer_line_holds_out_more():
-    held = ro.split_secret(
-        f"[reference.credentials] svc\n\nd\n\nValue: pw1\nTags: {_SECRET}\nTags: a, b",
-        tags=["a"],
-    )
-    assert _SECRET not in held.body and held.body.endswith("\nTags: a")
+    held = ro.split_secret(f"[reference.credentials] svc\n\nd\n\nValue: pw1\nTags: {_SECRET}\nTags: a, b")
+    # The built body carries no caller text: its Tags line comes from tags_json.
+    assert _SECRET not in held.body and held.body.endswith(f"Value: {ro.SECRET_PLACEHOLDER}")
     assert held.value == f"pw1\nTags: {_SECRET}\nTags: a, b" and held.detail == "d"
 
 
@@ -519,7 +519,7 @@ async def test_a_delimited_value_still_masks_a_term_shaped_secret(db):
     store = _PointStore()
     value = "password: Sunny-2024"
     unit = await _ingest(db, store, _body("wifi Sunny-2024", value=value, tags=["Sunny-2024"]), concept="wifi Sunny-2024",
-                         tags_json=json.dumps(["Sunny-2024"]))
+                         tags_json=json.dumps(["Sunny-2024"]), held_value=value)
     row = await _assert_held(db, store, unit, secret="Sunny-2024", value=value)
     assert row["concept"].startswith("wifi [held] #")
 
@@ -1612,3 +1612,110 @@ async def test_masked_card_names_with_other_values_stay_two_entries(db):
     assert a != b
     assert await kc.get_reference_secret(db, a) == "Aa11fake!x"
     assert await kc.get_reference_secret(db, b) == "Bb22fake!y"
+
+
+# ─── round 3 (#4416): the chokepoint builds the indexed body ─────────────────
+
+
+async def test_a_rotation_through_the_returned_key_keeps_the_entrys_identity(db):
+    """Codex 4571673749 / CodeRabbit 4571679688: save a name carrying V1,
+    rotate through the RETURNED masked key to V2, then save the original name
+    with V3: one entry, and no value it ever held is indexed."""
+    store = _PointStore()
+    v1, v2, v3 = "Hunter2Pass9fake!", "Other8Pass7fake!", "Third9Pass6fake!"
+    first = await _ingest(db, store, _body(f"db-{v1}", value=v1), concept=f"db-{v1}", held_value=v1)
+    await _ingest(db, store, _body(first.concept, value=v2), concept=first.concept, held_value=v2)
+    third = await _ingest(db, store, _body(f"db-{v1}", value=v3), concept=f"db-{v1}", held_value=v3)
+    assert third == first
+    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 1
+    await _not_indexed(db, store, v1, v2, v3)
+
+
+async def test_a_distilled_body_is_held_whole_and_never_parsed(db, memory_mcp):
+    """Codex 4571673757: a distilled body's own Value:/Tags: lines are text,
+    held whole; nothing of it is indexed."""
+    from genesis.knowledge.distillation import KnowledgeUnit
+    from genesis.knowledge.orchestrator import KnowledgeOrchestrator
+
+    pw = "Hunter2Pass9fake!"
+    unit = KnowledgeUnit(concept="conn notes", body=f"Connection notes\n\nValue: public-label\nTags: {pw}",
+                         domain="reference.credentials", tags=["infra"])
+    stored = await KnowledgeOrchestrator._store_credential_unit(
+        SimpleNamespace(_store=memory_mcp, _db=db), unit, project_type="reference", source="doc.md",
+        purpose=None, origin_class="external_untrusted",
+    )
+    await _not_indexed(db, memory_mcp, pw)
+    assert await ro.reveal_reference(db, await kc.get(db, stored)) == (unit.body, "")
+
+
+async def test_the_chokepoint_never_indexes_a_body_trailer(db):
+    """Owner ruling 9f9d0b53: the indexed body is built from the masked key and
+    the masked tags_json; a Tags: line in caller text is held, not indexed."""
+    store = _PointStore()
+    pw = "Hunter2Pass9fake!"
+    unit = await _untrusted(db, store, "conn notes", f"Connection notes\n\nValue: public-label\nTags: {pw}")
+    await _not_indexed(db, store, pw)
+    assert (await kc.get(db, unit))["body"] == (
+        f"[reference.credentials] {unit.concept}\n\n{ro.DETAIL_PLACEHOLDER}\n\nValue: {ro.SECRET_PLACEHOLDER}"
+    )
+
+
+def test_a_value_starting_with_a_trailer_prefix_is_held():
+    """CodeRabbit 4571679694: the value is held whole, never read as a trailer."""
+    held = ro.split_secret("[reference.credentials] router\n\nDescription\n\nValue: Tags: sample-pw-fake9")
+    assert "sample-pw-fake9" in (held.value or "") and "sample-pw-fake9" not in held.body
+
+
+async def test_a_value_split_across_the_tag_cap_is_masked(db):
+    """Codex 4571673753: the tag list is masked whole, and only then capped,
+    so a value spanning tags 64 and 65 leaves no part of itself."""
+    store = _PointStore()
+    value = "correct horse, battery staple"
+    tags = [f"t{i}" for i in range(63)] + ["correct horse", "battery staple"]
+    await _ingest(db, store, _body(value=value, tags=tags), concept="lab wifi",
+                  tags_json=json.dumps(tags), held_value=value, held_detail=_DESC)
+    await _not_indexed(db, store, "correct horse", "battery staple")
+
+
+async def test_an_upload_with_another_description_under_a_plain_name_is_kept(db):
+    """Codex 4571673755 / CodeRabbit 4571679681: one sameness rule (name, value
+    and description) for insert-only writes, on a plain key too."""
+    from genesis.memory.knowledge_ingest import ingest_untrusted_credential
+
+    store = _PointStore()
+    ids = [
+        await ingest_untrusted_credential(
+            store=store, db=db, content="x", held_value="Pw9fake!x", held_detail=detail, project="reference",
+            domain="reference.credentials", concept="router login", collection="episodic_memory",
+            memory_type="episodic",
+        )
+        for detail in ("login alice on host A", "login bob on host B", "login bob on host B")
+    ]
+    assert ids[0] != ids[1] and ids[2] == ids[1]
+    details = {r[0] for r in await db.execute_fetchall("SELECT detail FROM reference_secrets")}
+    assert details == {"login alice on host A", "login bob on host B"}
+
+
+def test_an_extracted_credential_identifier_is_never_cut_inside_a_token():
+    """The premise check's note: a credential's identifier is not cut at a '.'
+    inside a token (whole_tokens), so no part of a secret survives the cut."""
+    from genesis.memory.reference_extraction import _derive_identifier
+
+    extraction = SimpleNamespace(entities=[], content="router pw Ab3.Cd4ef!x for the lab")
+    assert "Ab3.Cd4ef!x" in _derive_identifier(extraction, default_prefix="credential", whole_tokens=True)
+
+
+def test_a_parsed_bodys_trailer_lines_stay_in_the_held_value():
+    """Owner ruling (round 3): when the chokepoint parses a body itself, its
+    trailing Tags:/Captured: lines are held with the value (a placeholder value excepted)."""
+    held = ro.split_secret("[reference.credentials] svc\n\nd\n\nValue: pw1\nTags: lab-x9\nCaptured: via=manual")
+    assert held.value == "pw1\nTags: lab-x9\nCaptured: via=manual" and held.detail == "d"
+    assert "lab-x9" not in held.body and "via=manual" not in held.body
+
+
+async def test_a_knowledge_ingest_body_reveals_its_trailer_and_indexes_none_of_it(db):
+    store = _PointStore()
+    body = "[reference.credentials] lab wifi\n\nGuest wifi\n\nValue: Hunter2Pass9fake!\nTags: lab-x9"
+    unit = await _ingest(db, store, body, concept="lab wifi")
+    await _not_indexed(db, store, "Hunter2Pass9fake!", "lab-x9")
+    assert await ro.reveal_reference(db, await kc.get(db, unit)) == ("Hunter2Pass9fake!\nTags: lab-x9", "Guest wifi")

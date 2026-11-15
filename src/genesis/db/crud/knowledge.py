@@ -155,6 +155,8 @@ async def check_credential_write(
     secret_value: str | None,
     insert_only: bool = False,
     observed: KeyObservation | None = None,
+    secret_detail: str | None = None,
+    secret_meta: str | None = None,
 ) -> str | None:
     """Raise ValueError when a credential row could not commit with its value;
     otherwise return the id of the row already holding this key, or None.
@@ -164,7 +166,7 @@ async def check_credential_write(
     credential leaves nothing behind in any store. The statement touches
     ``reference_secrets``, so a database whose schema init has not created the
     table fails here too. With ``insert_only``, a key already holding a
-    different value raises ``CredentialKeyTaken``; a returned id then means the
+    different credential (``same_untrusted``) raises ``CredentialKeyTaken``; a returned id then means the
     key already holds this very value. A no-op (None) for every other row.
     ``observed`` (the caller's own read of the key) is used instead of reading
     it again, so the check and the compare-and-swap agree on one read.
@@ -175,6 +177,7 @@ async def check_credential_write(
     if observed is not None:
         existing = None if observed.absent else (
             observed.unit_id, observed.secret_ref, observed.value, observed.qdrant_id,
+            observed.detail, observed.meta,
         )
     else:
         existing = await _credential_row(db, project_type, domain, concept)
@@ -183,11 +186,25 @@ async def check_credential_write(
             "refusing a credential reference with no value to hold: its body "
             "carries the placeholder and no secret is stored for it (#2426)"
         )
-    if insert_only and existing and secret_value is not None and existing[2] != secret_value:
+    if insert_only and existing and secret_value is not None and not same_untrusted(
+        existing, secret_value, secret_detail, secret_meta,
+    ):
         raise CredentialKeyTaken(
             "this credential key already holds a different value (#2426)"
         )
     return existing[0] if existing else None
+
+
+def same_untrusted(existing, value: str | None, detail: str | None, meta: str | None) -> bool:
+    """The one sameness rule of an insert-only write (#2426): the stored entry
+    (a ``MaskedEntry`` or a ``_credential_row``) is this write's credential only
+    when an untrusted write made it under the name the write's ``meta`` records,
+    with the same value and description."""
+    if not isinstance(existing, MaskedEntry):
+        existing = MaskedEntry(existing[0], "", existing[2], existing[4], *_meta_fields(existing[5]))
+    return existing.origin == UNTRUSTED and existing.given is not None and existing.given == _meta_fields(meta)[0] and (
+        existing.value == value and (existing.detail or "") == (detail or "")
+    )
 
 
 #: The key of a credential's held meta that records what the write knew of the
@@ -690,7 +707,7 @@ async def upsert(
     which never changes an existing row anyway.
 
     ``insert_only`` (uploads and distillation): a credential key that already exists is
-    never changed. If it holds the same value the call is a no-op that returns
+    never changed. If it holds this credential (``same_untrusted``) the call is a no-op that returns
     ``(existing_id, False)``; if it holds a different one, ``CredentialKeyTaken``
     is raised and nothing is written, so the caller tries another key.
 
@@ -750,7 +767,7 @@ async def upsert(
             # placeholder body with no value.
             secret_ref = existing[1]
         elif insert_only and existing:
-            if existing[2] != secret_value:
+            if not same_untrusted(existing, secret_value, secret_detail, secret_meta):
                 raise CredentialKeyTaken(
                     "this credential key already holds a different value (#2426)"
                 )
@@ -884,7 +901,7 @@ async def upsert(
         winner = await _credential_row(db, project_type, domain, concept)
         if _commit:
             await db.commit()
-        if credential and (winner is None or winner[2] != secret_value):
+        if credential and (winner is None or not same_untrusted(winner, secret_value, secret_detail, secret_meta)):
             raise CredentialKeyTaken("this credential key already holds a different value (#2426)")
         if winner is not None:
             return winner[0], False

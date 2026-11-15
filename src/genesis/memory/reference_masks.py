@@ -453,8 +453,8 @@ def _mask_tag(mask: ValueMask, tag: object) -> object | None:
     return masked
 
 
-#: A credential's tags are capped before they are masked; the originals are
-#: held in the secret row's meta.
+#: A credential's tags are masked as a whole list, and only then capped; the
+#: originals are held in the secret row's meta.
 MAX_TAGS = 64
 MAX_TAG_CHARS = 256
 
@@ -486,34 +486,37 @@ _SERIALISED_PASSES = 4
 
 
 def _serialised_clean(mask: ValueMask, tags: list) -> str | None:
-    """``tags`` as JSON, checked as it is stored: serialising can complete a
-    value no decoded tag carries (a value in literal quotes, or one spanning
-    the ``", "`` between two tags). Each pass finds every span of the value in
-    the serialised text and masks, as one tag, each run of consecutive tags a
-    span touches; a pass is repeated only while a match remains. A list that
-    never comes clean is not indexed at all (None: the row's default tags). The
-    tags as given are held in the secret row's meta either way."""
+    """``tags`` as JSON, checked as it is stored (``clean_tag_runs``), or None
+    when the list never comes clean (the row's default tags)."""
+    tags = clean_tag_runs(mask, tags, json.dumps, "[", "]")
+    return None if tags is None else json.dumps(tags)
+
+
+def clean_tag_runs(mask: ValueMask, tags: list, render, prefix: str, suffix: str) -> list | None:
+    """``tags`` as rendered (``prefix + ", ".join(render(t)) + suffix``: their
+    JSON, or the ``Tags:`` line), each run of tags a span of the value touches
+    masked as one tag: rendering can complete a value no single tag carries (in
+    literal quotes, or across ``", "``). None when it never comes clean."""
     tags = list(tags)
     for _ in range(_SERIALISED_PASSES):
-        parts = [json.dumps(t) for t in tags]
-        text = "[" + ", ".join(parts) + "]"  # json.dumps(tags), with each tag's offsets
-        spans = mask.mask_spans(text)
+        parts = [render(t) for t in tags]
+        spans = mask.mask_spans(prefix + ", ".join(parts) + suffix)
         if not spans:
-            return text
-        bounds, at = [], 1
+            return tags
+        bounds, at = [], len(prefix)
         for part in parts:
             bounds.append((at, at + len(part)))
             at += len(part) + 2
         runs = []
         for start, stop in spans:
-            # A span in a separator or a bracket touches the tags beside it.
+            # A span in a separator or the prefix touches the tags beside it.
             hit = [i for i, (lo, hi) in enumerate(bounds) if lo - 2 < stop and hi + 2 > start]
             if not hit:
                 return None
             runs.append((hit[0], hit[-1] + 1))
         merged = _merged(runs)
         if all(tags[lo:hi] == [HELD_MASK] for lo, hi in merged):
-            # Only a lone mask, or the list's own brackets, spell it.
+            # Only a lone mask, or the rendering's own frame, spells it.
             return None
         for lo, hi in reversed(merged):
             tags[lo:hi] = [HELD_MASK]

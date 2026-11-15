@@ -395,6 +395,8 @@ async def _ingest_entry(
         memory_class="fact",  # bypass 0.7x auto-reference penalty
         concept=entry.identifier,
         tags_json=tags_json,
+        # A credential's value and description, as given, so its Tags line is not held as part of the value.
+        **({"held_value": entry.value, "held_detail": entry.description} if entry.kind == "credentials" else {}),
         # References live in episodic_memory alongside other personal data —
         # match reference_store's invariant (mcp/memory/knowledge.py). Without
         # this, ingest defaults to collection="knowledge_base", stranding

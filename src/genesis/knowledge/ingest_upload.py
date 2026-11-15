@@ -107,8 +107,8 @@ async def run_ingest(
         )
 
         logger.info(
-            "Ingest completed for %s: %d units created (mode=%s)",
-            filename, len(unit_ids), mode,
+            "Ingest completed for upload %s: %d units created (mode=%s)",
+            upload_id, len(unit_ids), mode,
         )
 
     except Exception as exc:

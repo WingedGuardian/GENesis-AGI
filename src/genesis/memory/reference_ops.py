@@ -58,6 +58,7 @@ from genesis.memory.reference_masks import (
     _serialised_clean,
     cap_masked,  # noqa: F401 - re-exported
     cap_tag,
+    clean_tag_runs,
     mask_value_spans,  # noqa: F401 - re-exported
     value_masks,  # noqa: F401 - re-exported
 )
@@ -139,8 +140,9 @@ def parse_reference_body(body: str | None) -> dict[str, str]:
 # (owner ruling, every review round found another way through). Every store
 # that indexes a body (knowledge_units + knowledge_fts, memory_fts, the Qdrant
 # payload and its embedding) therefore gets only the header (the identifier),
-# DETAIL_PLACEHOLDER, the SECRET_PLACEHOLDER value line and the Tags/Captured
-# trailer. The value and the description go to ONE ``reference_secrets`` row
+# DETAIL_PLACEHOLDER, the SECRET_PLACEHOLDER value line and one Tags line built
+# from the masked tags_json: the chokepoint builds that body, and no caller
+# text after the header is ever indexed (owner ruling 9f9d0b53). The value and the description go to ONE ``reference_secrets`` row
 # (``value``, ``detail``), a table no recall path reads. In the other indexed
 # fields (identifier, tags, authority, provenance) every span of the value is
 # MASKED with ``HELD_MASK`` (``mask_value_spans``) and the write goes on: no
@@ -155,63 +157,44 @@ SECRET_PLACEHOLDER = _CRUD_PLACEHOLDER
 DETAIL_PLACEHOLDER = _CRUD_DETAIL_PLACEHOLDER
 
 
-def _trailer_tag(tag: str) -> str:
-    """A tag as the body's one ``Tags:`` line can carry it: a line break in
-    it would start a line of its own (a second ``Value:`` line, say)."""
-    return " ".join(tag.splitlines())
+def _trailer_tag(tag: object) -> str:
+    """A tag as the body's one ``Tags:`` line carries it: a line break in it
+    would start a line of its own (a second ``Value:`` line, say)."""
+    text = tag if isinstance(tag, str) else json.dumps(tag, ensure_ascii=False, default=str)
+    return " ".join(text.splitlines())
 
 
 def mask_value_tags(
     value: str | ValueMask, tags_json: str | None, body: str,
 ) -> tuple[str | None, str]:
-    """(tags_json, body) for a credential row: at most ``MAX_TAGS`` tags, each
-    masked whole and then capped (``cap_tag``), with every span of the value masked strictly
-    (strings, numbers, lists and dicts at any nesting), in the tags list and in
-    the body's ``Tags:`` trailer line, which is also checked whole (a value
-    holding ", " spans tags no piece of which matches alone). A tag that was
-    nothing but the value is dropped. A ``Captured:`` line is dropped: the
-    caller's provenance is held in the secret row's meta. Tags that are not a
-    JSON list are decoded and masked as one value."""
+    """(tags_json, body) for a credential row: each tag masked whole (a tag that
+    was only the value dropped; JSON that is not a list is one tag), then the
+    WHOLE list masked as its ``Tags:`` line renders it, and only then capped
+    (``MAX_TAGS``, ``cap_tag``) and checked again as stored. ``body`` gets its
+    one ``Tags:`` line from that list alone (owner ruling 9f9d0b53)."""
+    if not tags_json:
+        return tags_json, body
     mask = _as_mask(value)
-    if tags_json:
-        try:
-            tags = json.loads(tags_json)
-        except ValueError:
-            tags = tags_json
-        if not isinstance(tags, list):
-            tags = [tags]
-        kept = [cap_tag(t) for t in (_mask_tag(mask, t) for t in tags[:MAX_TAGS]) if t is not None]
-        tags_json = _serialised_clean(mask, kept)
-    idx = body.find(_VALUE_MARKER)
-    if idx != -1:
-        after = body[idx + len(_VALUE_MARKER):]
-        trailer = _trailer(after)
-        rebuilt = []
-        for line in trailer:
-            if not line.startswith("Tags: "):
-                continue
-            pieces = line[len("Tags: "):].split(", ")[:MAX_TAGS]
-            joined = ", ".join(t for t in (_mask_tag(mask, t) for t in pieces) if t is not None)
-            if mask.carries(joined):
-                joined = mask.mask(joined)
-            # Capped only once masked, so a cut never leaves part of a secret.
-            joined = ", ".join(cap_tag(t) for t in joined.split(", "))
-            if mask.carries("Tags: " + joined):
-                # The line as stored, prefix and all, is checked once more.
-                line = mask.mask("Tags: " + joined)
-                joined = line[len("Tags: "):] if line.startswith("Tags: ") else HELD_MASK
-            if joined.replace(HELD_MASK, "").strip(", "):
-                rebuilt.append("Tags: " + joined)
-        if rebuilt != trailer:
-            value_line = after[: len(after) - len("\n".join(trailer))].rstrip("\n")
-            body = _held_body(body[:idx], rebuilt, value_line)
-    return tags_json, body
+    try:
+        tags = json.loads(tags_json)
+    except ValueError:
+        tags = tags_json
+    tags = tags if isinstance(tags, list) else [tags]
+    kept = clean_tag_runs(mask, [t for t in (_mask_tag(mask, t) for t in tags) if t is not None], _trailer_tag,
+                          "Tags: ", "")
+    if kept is not None:
+        kept = clean_tag_runs(mask, [cap_tag(t) for t in kept[:MAX_TAGS]], _trailer_tag, "Tags: ", "")
+    stored = None if kept is None else _serialised_clean(mask, kept)
+    line = ", ".join(map(_trailer_tag, json.loads(stored) if stored else []))
+    if line.replace(HELD_MASK, "").strip(", "):
+        body += "\nTags: " + line
+    return stored, body
 
 
 class HeldCredential(NamedTuple):
     """What ``split_secret`` takes out of a credential body."""
 
-    #: The indexed body: header, DETAIL_PLACEHOLDER, the value placeholder line, trailer.
+    #: The indexed body as built: header, DETAIL_PLACEHOLDER, the value placeholder line.
     body: str
     #: The value, or None when the body carried the value placeholder (a re-ingest).
     value: str | None
@@ -223,35 +206,21 @@ def split_secret(
     body: str,
     *,
     header: str | None = None,
-    tags: list[str] | None = None,
     value: str | None = None,
     detail: str | None = None,
 ) -> HeldCredential:
-    """Take the value and the free-text description out of a credential body.
+    """Hold a credential's value and free-text description out of its body.
 
-    The body is ``[reference.credentials] {identifier}``, a blank line, the
-    description, a blank line, ``Value: {value}`` and the Tags/Captured trailer,
-    the layout every credential writer formats (the reference_store and
-    knowledge_ingest MCP tools, the extraction job, migrate_reference_data).
-    ``header`` is the header line expected for the key (default: the body's own
-    first line); a first line that is not it is part of the description. The
-    returned body is that header, DETAIL_PLACEHOLDER where the description
-    stood, the canonical value placeholder line and the trailer. A body that
-    already carries a placeholder (a re-ingest of a held body) returns None for
-    that part, so the stored one stays. ``value`` and ``detail``, when a writer
-    passes them, are the value and description as it knows them (a multi-line
-    value is held out whole, whatever its lines look like).
-
-    A body whose split point is ambiguous (no ``Value:`` line, the marker twice,
-    a value line shaped like a trailer line, a repeated trailer line, or a
-    parsed value that is not the writer's) is never refused: MORE is held out.
-    Everything after the header goes to the secret (the value: the text after
-    the first marker, or the whole remainder when there is none), the
-    description before the first marker stays the detail (None when there is
-    no marker to separate it, so a stored one is kept), and the trailer is
-    rebuilt only from the structured ``tags``, so no part of the ambiguous text
-    is indexed. Raises ValueError, before anything is written, only when a
-    payment card number is in the value or the description (#3172).
+    The indexed body is BUILT, never taken from the caller's text: ``header``
+    (default: the body's first line; any other first line is held text),
+    DETAIL_PLACEHOLDER and the value placeholder line (``mask_value_tags``
+    adds the Tags line from the masked tags_json). All text after the header
+    is held: ``value`` and ``detail``, when a writer passes them, exactly as
+    given; otherwise the description before the first ``Value:`` line, and
+    everything after it, trailer lines included, as the value (no marker: the
+    whole rest, the description None so a stored one is kept). A
+    placeholder part (a re-ingest) is None: the stored one stays, and a placeholder
+    value's trailer lines are not kept. ValueError only for a card number in either.
     """
     from genesis.security.card_shapes import contains_card_number
 
@@ -259,32 +228,13 @@ def split_secret(
     header = first if header is None else header
     rest = body[len(first):] if first == header else "\n" + body
     idx = rest.find(_VALUE_MARKER)
-    clean = idx != -1 and rest.count(_VALUE_MARKER) == 1
-    if clean:
-        after = rest[idx + len(_VALUE_MARKER):]
-        if value is not None and value.strip() and after.startswith(value):
-            # The writer's value says exactly where the value line ends: what
-            # follows it is the trailer, whatever the value's lines look like.
-            tail = after[len(value):]
-            trailer = tail.strip("\n").split("\n") if tail.strip() else []
-            clean = tail[:1] in ("", "\n") and all(
-                line.startswith(_TRAILER_PREFIXES) for line in trailer
-            ) and _split_trailer("\n".join(trailer))[1]
-            held = value
-        else:
-            trailer, clean = _split_trailer(after)
-            held = parse_reference_body(rest)["value"]
-            value_lines = held.split("\n")[1:]
-            clean = clean and not any(
-                line.startswith(_TRAILER_PREFIXES) for line in value_lines
-            ) and (value is None or held == value.strip())
-    if clean:
-        description: str | None = rest[:idx].strip()
-    else:
-        # Hold out more: the remainder is the value, nothing of it indexed.
-        held = (rest[idx + len(_VALUE_MARKER):] if idx != -1 else rest).strip()
-        description = rest[:idx].strip() if idx != -1 else None
-        trailer = ["Tags: " + ", ".join(_trailer_tag(t) for t in tags)] if tags else []
+    held, description = rest.strip(), None
+    if idx != -1:
+        # The whole rest is held, trailer lines included; a value that parses to the
+        # placeholder (a re-ingest) keeps the stored one, its trailer lines unkept.
+        held, description = rest[idx + len(_VALUE_MARKER):].strip(), rest[:idx].strip()
+        if parse_reference_body(rest)["value"] == SECRET_PLACEHOLDER:
+            held = SECRET_PLACEHOLDER
     if value is not None:
         # The writer's value, exactly as given (a whitespace-only one is empty).
         held = value if value.strip() else ""
@@ -296,7 +246,7 @@ def split_secret(
             "never stored as references"
         )
     return HeldCredential(
-        _held_body(header + "\n\n" + DETAIL_PLACEHOLDER, trailer),
+        _held_body(header + "\n\n" + DETAIL_PLACEHOLDER, []),
         # An empty value is an empty value, held like any other; only the
         # placeholder means "keep the stored one" (#2426 PR A).
         None if held == SECRET_PLACEHOLDER else held,
@@ -304,21 +254,13 @@ def split_secret(
     )
 
 
-def _split_trailer(after_marker: str) -> tuple[list[str], bool]:
-    """(the trailing Tags:/Captured: lines of the text after the value marker,
-    whether they are unambiguous). Writers emit each trailer line once; a
-    repeated one means part of a multi-line value was read as trailer."""
+def _trailer(after_marker: str) -> list[str]:
+    """The trailing Tags:/Captured: lines of the text after the value marker."""
     lines = after_marker.split("\n")
     trailer: list[str] = []
     while lines and lines[-1].startswith(_TRAILER_PREFIXES):
         trailer.insert(0, lines.pop())
-    prefixes = [next(p for p in _TRAILER_PREFIXES if line.startswith(p)) for line in trailer]
-    return trailer, len(prefixes) == len(set(prefixes))
-
-
-def _trailer(after_marker: str) -> list[str]:
-    """The trailing Tags:/Captured: lines of the text after the value marker."""
-    return _split_trailer(after_marker)[0]
+    return trailer
 
 
 def _held_body(head: str, trailer: list[str], value: str = SECRET_PLACEHOLDER) -> str:

@@ -224,3 +224,26 @@ async def test_run_ingest_reports_an_incomplete_credential_store(db, upload_id):
     assert row["status"] == "completed" and "u1" in row["unit_ids"]
     assert "incomplete" in (row["error_message"] or "")
     assert "1 credential" in row["error_message"]
+
+
+async def test_run_ingest_completion_log_names_no_file(db, caplog):
+    """The completion log carries the upload id, never the file name, which
+    can carry a credential (#2426)."""
+    import logging
+
+    from genesis.knowledge.ingest_upload import run_ingest
+
+    uid = await knowledge_uploads.insert(db, filename="creds-Hunter2fake.txt", file_path="/tmp/x.txt", file_size=1)
+    mock_orchestrator = MagicMock()
+    mock_orchestrator.ingest_source = AsyncMock(return_value=FakeIngestResult())
+    mock_rt = MagicMock()
+    mock_rt.db = db
+    with (
+        patch("genesis.runtime.GenesisRuntime.instance", return_value=mock_rt),
+        patch("genesis.mcp.memory.knowledge._get_orchestrator", return_value=mock_orchestrator),
+        patch("genesis.knowledge.ingest_upload._move_to_completed"),
+        caplog.at_level(logging.INFO, logger="genesis.knowledge.ingest_upload"),
+    ):
+        await run_ingest(uid, project_type="pro", domain="test")
+    assert any("Ingest completed" in r.getMessage() for r in caplog.records)
+    assert not any("Hunter2fake" in r.getMessage() for r in caplog.records)

@@ -847,6 +847,10 @@ class KnowledgeOrchestrator:
             store=memory_mod._store,
             db=memory_mod._db,
             content=unit.body,
+            # The whole distilled text is the held value: it is free text, and
+            # nothing in it is read as a body (a "Value:" or "Tags:" line is text).
+            held_value=unit.body,
+            held_detail="",
             project=project_type,
             domain=unit.domain,
             authority="curated",

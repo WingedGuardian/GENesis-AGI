@@ -98,7 +98,8 @@ async def test_lookup_and_reveal_return_the_description_and_value_byte_for_byte(
     store = _PointStore()
     description = "Login for the example portal\nsecond line: Byte!Fake1 note"
     original = _body(description, "user: example-admin, password: Byte!Fake1", tags=["portal"])
-    unit = await _ingest(db, store, original, tags_json=json.dumps(["portal"]))
+    unit = await _ingest(db, store, original, tags_json=json.dumps(["portal"]),
+                         held_value="user: example-admin, password: Byte!Fake1", held_detail=description)
     row = await kc.get(db, unit)
     assert ro.DETAIL_PLACEHOLDER in row["body"]
     composed, missing = await ro.compose_body(db, row)
@@ -218,7 +219,8 @@ def test_a_value_line_shaped_like_a_trailer_is_held_out_whole():
     value = "pw1\nTags: Zx9!kQ7mLeak"
     body = fmt(kind="credentials", identifier="svc", description="d", value=value, tags=["a"], source=None)
     held = ro.split_secret(body, value=value)
-    assert held.value == value and held.body.endswith("\nTags: a")
+    # Round 3: the built body carries no caller text (its Tags line comes from tags_json).
+    assert held.value == value and held.body.endswith(f"Value: {ro.SECRET_PLACEHOLDER}")
     held = ro.split_secret(body)
     assert "Zx9!kQ7mLeak" not in held.body and held.value == value + "\nTags: a"
 
@@ -233,7 +235,7 @@ async def test_tags_probe_both_halves_of_a_pair(db, value):
     tags = [login, f"{secret}-old", "portal"]
     unit = await _ingest(
         db, store, _body("acct", value, tags=tags, identifier="acct portal"),
-        concept="acct portal", tags_json=json.dumps(tags),
+        concept="acct portal", tags_json=json.dumps(tags), held_value=value,
     )
     row = await kc.get(db, unit)
     assert json.loads(row["tags"]) == ["[held]-old", "portal"]

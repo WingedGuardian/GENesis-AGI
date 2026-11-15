@@ -253,15 +253,15 @@ async def _ingest_once(
             # FREE one is minted, and returned to the caller (StoredId.concept).
             flat, minted = await _mint_key(db, project, domain, "credential")
         header = f"[{knowledge_crud.CREDENTIAL_DOMAIN}] {flat}"
-        # The value AND the free-text description come out of the body. A body
-        # with no "Value:" line is free text (a distilled unit, an uploaded
-        # file): its value is prose (``ValueMask``), and nothing of it is
-        # indexed. Large content is split off the event loop (an upload can be
-        # 2 MB).
+        # The indexed body is BUILT here (header and placeholders; the Tags
+        # line later, from the masked tags_json): every word of the caller's
+        # text after the header is held, never indexed (owner ruling 9f9d0b53).
+        # A body with no "Value:" line is free text (a distilled unit, an
+        # uploaded file): its value is prose (``ValueMask``). Large content is
+        # split off the event loop (an upload can be 2 MB).
         prose = "\n\nValue: " not in content
         split = functools.partial(
-            reference_ops.split_secret, content, header=header, tags=_tag_list(tags_json),
-            value=held_value, detail=held_detail,
+            reference_ops.split_secret, content, header=header, value=held_value, detail=held_detail,
         )
         large = len(content) + len(held_value or "") > _LARGE
         content, secret_value, secret_detail = await asyncio.to_thread(split) if large else split()
@@ -279,11 +279,10 @@ async def _ingest_once(
         known_detail = secret_detail if secret_detail is not None else observed.detail
         entries = await knowledge_crud.masked_key_rows(db, project_type=project, domain=domain)
         for entry in entries if insert_only and secret_value is not None else ():
-            # An untrusted write of the value an untrusted entry already holds
-            # under this same recorded name (a re-upload) is that entry.
-            if entry.origin == knowledge_crud.UNTRUSTED and entry.given == flat and entry.value == secret_value and (
-                (entry.detail or "") == (secret_detail or "")
-            ):
+            # An untrusted write of the credential an untrusted entry already
+            # holds (a re-upload) is that entry: the one sameness rule, which
+            # check_credential_write applies to the plain key too.
+            if knowledge_crud.same_untrusted(entry, secret_value, secret_detail, json.dumps({"identifier": flat})):
                 return _stored(entry.id, entry.concept)
         # The secrets this write must not repeat beside its own: the value it
         # replaces, and those of the ONE entry this name resolves to (the entry
@@ -309,7 +308,6 @@ async def _ingest_once(
         ) > _LARGE
         prepare = functools.partial(_prepare_masks, known_secret, flat, prose=prose, detail=known_detail, also=also)
         strict, named, masked, spans = await asyncio.to_thread(prepare) if large else prepare()
-        adopted = None
         cut = len(masked) > _MAX_IDENTIFIER
         if masked != flat or cut:
             # The identifier carried the value, or was cut: it is stored masked
@@ -338,7 +336,6 @@ async def _ingest_once(
                 # identified by its FULL text, which the meta records) or,
                 # failing that, by its value.
                 existing_key = named_entry.concept
-                adopted = named_entry
             elif names and not cut:
                 # A trusted entry under the same masked base. Its recorded spans
                 # are carried as on the recorded-identity path: into this
@@ -389,7 +386,9 @@ async def _ingest_once(
         # indexed): who wrote it, and every span the identifier's mask has
         # replaced, this time and in each earlier rotation of the entry it
         # updates, so a later write under the same identifier masks them all.
-        recorded = [*((adopted.masked_spans or ()) if adopted else ()), *spans]
+        # Inherited at ONE site, from the entry this write compare-and-swaps
+        # against, whichever way it was found (through its own stored key too).
+        recorded = [*(knowledge_crud._meta_fields(observed.meta)[2] or ()), *spans]
         meta[knowledge_crud.IDENTITY_META] = {
             "origin": knowledge_crud.UNTRUSTED if insert_only else knowledge_crud.TRUSTED,
             "masked_spans": list(dict.fromkeys(span for span in recorded if span.strip())),
@@ -431,6 +430,7 @@ async def _ingest_once(
     held_by = await knowledge_crud.check_credential_write(
         db, project_type=project, domain=domain, concept=resolved_concept,
         secret_value=secret_value, insert_only=insert_only, observed=observed,
+        secret_detail=secret_detail, secret_meta=secret_meta,
     )
     if insert_only and held_by is not None:
         # The key already holds this very value: nothing to write, and no
@@ -702,9 +702,11 @@ def _base_parts_in(entry, identifier: str) -> bool:
 
 def _secrets_of(observed, entries: list, known_secret: str) -> tuple:
     """(value, description) pairs a write must not repeat: those of the key it
-    observed, and of ``entries`` their VALUE (never a description) with each of
-    their recorded masked spans."""
+    observed (with its recorded masked spans), and of ``entries`` their VALUE
+    (never a description) with each of their recorded masked spans."""
     pairs = [(observed.value, observed.detail)] if observed is not None else []
+    if observed is not None:
+        pairs += [(span, None) for span in knowledge_crud._meta_fields(observed.meta)[2] or ()]
     for entry in entries:
         pairs += [(entry.value, None), *((span, None) for span in entry.masked_spans or ())]
     return tuple(dict.fromkeys((v, d) for v, d in pairs if v and v != known_secret))
@@ -793,17 +795,6 @@ def _prepare_masks(value: str, flat: str, *, prose: bool, detail: str | None, al
     strict, named = reference_ops.value_masks(value, prose=prose, detail=detail, also=also)
     masked, spans = named.mask_and_spans(flat)
     return strict, named, masked, spans
-
-
-def _tag_list(tags_json: str | None) -> list[str] | None:
-    """The tags of ``tags_json`` as strings, or None when it is not a JSON list."""
-    if not tags_json:
-        return None
-    try:
-        tags = json.loads(tags_json)
-    except ValueError:
-        return None
-    return [str(t) for t in tags] if isinstance(tags, list) else None
 
 
 async def _drop_unnamed_point(store: MemoryStore, db: aiosqlite.Connection, qdrant_id: str | None) -> None:

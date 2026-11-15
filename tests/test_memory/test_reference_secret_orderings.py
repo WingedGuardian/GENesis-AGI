@@ -8,6 +8,8 @@ Fake credentials only, never real secrets.
 
 from __future__ import annotations
 
+import json
+
 import aiosqlite
 import pytest
 
@@ -303,7 +305,7 @@ def _value_of(writer: str) -> str:
     return f"password: {writer}-Fake9x"
 
 
-async def _write(conn, writer: str, *, insert_only: bool = False):
+async def _write(conn, writer: str, *, insert_only: bool = False, meta: str | None = None):
     """One credential upsert of the key; ``source_doc`` names the body's writer."""
     return await kc.upsert(
         conn,
@@ -313,6 +315,7 @@ async def _write(conn, writer: str, *, insert_only: bool = False):
         concept=_KEY,
         body=_HELD,
         secret_value=_value_of(writer),
+        secret_meta=meta,
         insert_only=insert_only,
     )
 
@@ -640,8 +643,17 @@ async def test_an_insert_only_write_never_changes_an_existing_key(db):
     with pytest.raises(kc.CredentialKeyTaken):
         await _write(db, "B", insert_only=True)
     assert await _new_shape_pairs(db) == [("A", _value_of("A"))]
-    # The same value is a no-op success.
-    unit, inserted = await _write(db, "A", insert_only=True)
+    # Round 3 (one sameness rule): the same value under a trusted entry is
+    # another credential, so the key is taken too.
+    with pytest.raises(kc.CredentialKeyTaken):
+        await _write(db, "A", insert_only=True)
+    assert await _secret_rows(db) == 1
+
+
+async def test_an_insert_only_write_of_the_same_untrusted_credential_is_a_no_op(db):
+    meta = json.dumps({"identifier": _KEY, "_identity": {"origin": kc.UNTRUSTED, "masked_spans": []}})
+    await _write(db, "A", insert_only=True, meta=meta)
+    unit, inserted = await _write(db, "A", insert_only=True, meta=meta)
     assert inserted is False
     assert await _secret(db, unit) == _value_of("A")
     assert await _secret_rows(db) == 1

@@ -141,6 +141,7 @@ async def _write(db, store, value, identifier, tags, *, header=None):
         body,
         concept=identifier,
         tags_json=json.dumps(["reference", "credentials", *tags]),
+        held_value=value,  # as reference_store passes it
     )
 
 
@@ -212,7 +213,8 @@ async def test_a_login_in_the_tags_trailer_is_dropped(db):
     """Round-3 M-2: tags are probed strictly, the login included."""
     store = _PointStore()
     body = _body("forum", "ForumUser42 / Fk9!pass77", ["ForumUser42", "forum"])
-    unit = await _ingest(db, store, body, concept="forum")
+    # Round 3: the Tags line is built from tags_json, never from the body.
+    unit = await _ingest(db, store, body, concept="forum", tags_json=json.dumps(["ForumUser42", "forum"]))
     stored = (await kc.get(db, unit))["body"]
     assert stored.endswith("\nTags: forum")
     assert "ForumUser42" not in stored and "Fk9!pass77" not in stored
