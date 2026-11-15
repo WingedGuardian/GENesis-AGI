@@ -1,0 +1,1 @@
+- Autonomous task workers now receive the task goal and planned step count alongside each step, including resumed work, recovery retries, and review fixups, instead of unresolved context placeholders.

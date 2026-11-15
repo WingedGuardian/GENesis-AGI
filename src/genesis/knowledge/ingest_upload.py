@@ -180,6 +180,17 @@ async def _store_as_is(
     if context:
         tags.append("user-context")
 
+    # #2426: an uploaded file is never stored as a credential reference. The
+    # vector below is written BEFORE the database row, so refuse here, before
+    # anything is written, rather than at the db layer's refusal afterwards.
+    from genesis.db.crud.knowledge import holds_secret
+
+    if holds_secret(project_type, effective_domain):
+        raise ValueError(
+            "refusing to store an upload as a credential reference: use "
+            "reference_store, which holds the value out (#2426)"
+        )
+
     # Store to Qdrant
     # WS-3: curated ingest is external_untrusted (authority tier, not
     # authorship); derived once, mirrored to both stores.

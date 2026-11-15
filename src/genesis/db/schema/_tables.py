@@ -969,6 +969,7 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             purpose          TEXT,
             ingestion_source TEXT,
             origin_class     TEXT,
+            secret_ref       TEXT,
             UNIQUE(project_type, domain, concept)
         )
     """,
@@ -986,6 +987,33 @@ CREATE TABLE IF NOT EXISTS peer_grants (
     # outlive the entries they describe — deleting a reference entry (e.g.
     # password rotation: delete + re-store) must not cascade away the
     # access history.  The unit_id is a soft reference only.
+    #
+    # reference_secrets: the value of a credential reference (#2426), and its
+    # free-text description (``detail``, held out with it), held OUT of every indexed
+    # store: knowledge_units.body carries a placeholder instead, so neither
+    # knowledge_fts, memory_fts, the Qdrant payload nor the embedding sees it.
+    # Its own table rather than a knowledge_units column because recall reads
+    # knowledge_units with SELECT *, so a value column would ride into every
+    # recall row; the unit carries only ``secret_ref``, a random id naming its
+    # row here. Rows are insert-only, never updated: crud/knowledge.upsert
+    # inserts a new row under a fresh random id (never derived from the value),
+    # then ONE statement writes the unit naming it, so a body and the secret it
+    # names are always one writer's pair. The knowledge_units triggers
+    # (crud/knowledge.secret_ref_trigger_ddl, created in _migrations.py) refuse a
+    # credential unit naming no row, and delete the row a unit stops naming;
+    # sweep_orphan_secrets removes rows an interrupted upsert left unnamed.
+    # Read only through memory/reference_ops.resolve_value. Retention: one row
+    # per credential unit, retired with it. Backed up with the rest of
+    # genesis.db. Migration 20261105043443_reference_secrets creates the same
+    # table, column and triggers on an existing database.
+    "reference_secrets": """
+        CREATE TABLE IF NOT EXISTS reference_secrets (
+            id         TEXT PRIMARY KEY,
+            value      TEXT NOT NULL,
+            detail     TEXT,
+            created_at TEXT NOT NULL
+        )
+    """,
     # Append-only log of the MCP tool calls a labelled client makes (owner-mode
     # Codex): never the arguments. New-Store justification + retention in
     # migration 20261108071709_client_tool_calls; DDL byte-identical to it.
@@ -2142,7 +2170,10 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             attempt_count     INTEGER NOT NULL DEFAULT 0,
             last_attempt_at   TEXT,
             last_attempt_note TEXT,
-            rechecks          TEXT
+            rechecks          TEXT,
+            closed_by         TEXT,
+            last_attempt_by   TEXT,
+            recorded_session  TEXT
         )
     """,
     # ── WS-2 sensor fabric (M9/M10) ──────────────────────────────────────
@@ -2764,6 +2795,9 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_memory_meta_superseded_by ON memory_metadata(superseded_by)",
     # knowledge_units
     "CREATE INDEX IF NOT EXISTS idx_knowledge_units_qdrant_id ON knowledge_units(qdrant_id)",
+    # The secret_ref triggers and the orphan sweep look units up by secret_ref.
+    "CREATE INDEX IF NOT EXISTS idx_knowledge_units_secret_ref ON knowledge_units(secret_ref) "
+    "WHERE secret_ref IS NOT NULL",
     # codebase index
     "CREATE INDEX IF NOT EXISTS idx_code_symbols_module ON code_symbols(module_path)",
     "CREATE INDEX IF NOT EXISTS idx_code_symbols_name ON code_symbols(name)",

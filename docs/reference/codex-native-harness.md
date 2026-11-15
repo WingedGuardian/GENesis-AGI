@@ -67,6 +67,16 @@ execution. Native runs use the contained workflow; the older opt-in invocation
 below describes the inherited harness mechanics, not authorization to run it on
 a live install.
 
+The shared app-server driver retains an independent copy of each parsed
+`turn/completed` notification with its monotonic receipt time before enqueueing
+the message for consumers. Its raw queue and event interfaces stay unchanged;
+receipt time measures local observation, not backend emission. The loopback
+provider accepts an optional `action_plan` keyed by one-based request index.
+Appending the request and selecting its action share one lock. Omitting the
+plan preserves one action followed by final responses; an explicit empty plan
+emits only final responses, and an empty action dictionary remains an action.
+Pure driver tests cover these contracts without launching a native executable.
+
 ## Inherited opt-in harness
 
 Run the opt-in integration file on a Unix host with Codex and the Genesis Python dependencies installed:

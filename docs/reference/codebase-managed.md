@@ -1038,9 +1038,121 @@ harmless executable descriptor with real locks, processes, pipes and scratch
 SQL, including successful and failed native completion. The fixture substitutes
 its manager, kernel, resource-admission input and provider. It does not
 qualify native containment. Typed timer dispatch and the GitNexus adapter use
-this owner; positive supervised recovery remains separate, and automatic
+this owner; positive supervised retry remains separate, and automatic
 readiness stays fenced.
+
+Owner admission also observes the complete known managed-scope namespace before
+reservation. It checks stable terminal identity, no queued job and recursive
+kernel absence across the matching providers and repositories. Failed manager
+state alone does not prove tasks ended. Unknown names, unreadable population
+and identity drift refuse; the check never stops a process. This census is a
+point-in-time observation, not atomic physical exclusion or a RAM reservation.
+Global physical exclusion and production capacity remain separate gates.
+
 Existing standalone indexing policy remains unchanged.
+
+### Explicit owner-loss reconciliation
+
+The captured runner's queue endpoint accepts `reconcile-native --context` with
+the complete original protocol-3 context. Its supervisory caller must supply the
+existing canonical runner lock on descriptor8; the endpoint takes the canonical
+repository lock on descriptor9 itself. Raw queue invocation, the entry profile,
+stale source and missing or occupied coordination descriptors refuse. The
+ordinary no-argument timer reconciliation keeps its previous behavior.
+
+`scripts/lib/code_intel_supervisor.py` collects the witness itself. An original
+owner's changed boot, absent PID or validated changed birth identity can prove
+the original recorded lifetime ended. Matching terminal leader states stay
+unproved because other threads can still run. Unreadable or malformed process
+data cannot prove end; a process in uninterruptible sleep is still alive. Registered work also needs the original
+reporter's lifetime end and actual original kernel release. An existing empty
+group without an original owned wait remains unresolved. A previously retained
+valid original wait can be reused only with a fresh qualified physical
+observation. Unregistered work without native intent has the structural exception:
+cancel future permission and retain orphaned uncertainty, without inventing a
+registration, wait or kernel proof.
+
+The same admitted transaction records orphaned control, retains physical evidence
+and settles that exact execution through the existing reducers. Known success is
+not resent; applied unknown accounting and its debt remain immutable even if a
+late success arrives. Replaying a lost reply uses the original witness and cannot
+replace a newer inflight pointer. Reconciliation does not issue a grant, accept a
+trial, clear the provider hold or enable automatic work.
+
+Recovery decisions can perform one final typed drain on that same connection and
+exclusive publication barrier after fresh-cleanup callbacks. Remaining bodies
+have sorted unique semantic identities; filenames and delivery timestamps do not
+define new incidents. This sees callback-created evidence even when the provider
+revision did not change. Represented artifacts retire only after commit; retained
+conflicts remain available. The ordinary admission prefilter is unchanged.
+
+Scoped admission shares its cache-aware headroom calculation and visible
+cgroup mapping without changing the full worker cap or existing reserves.
+These observations reserve no RAM and do not qualify hidden host limits,
+sustained pressure, deployment peaks or production corpus behavior.
+
+### Explicit supervised grant metadata
+
+The queue endpoint provides `request-retry`, `status-recovery` and `revoke-retry`.
+All take `--repo PATH --provider PROVIDER`.
+`request-retry` additionally requires `--origin pending|failed`, `--mode
+fast|moderate|full`, `--not-after-wall-ns INTEGER` and `--evidence-reference TEXT`.
+Request also accepts `--managed-config PATH`. Revoke requires exactly one of
+`--nonce NONCE` or `--grant-sha256 DIGEST`. Mutating operations require the current captured runner
+and its canonical lock on descriptor8, then take the canonical repository lock
+on descriptor9 internally. A raw queue process cannot substitute for that caller;
+observational `status-recovery` also works without it.
+An explicit schema-5 cutover is a prerequisite, never an implicit side effect.
+
+A retry request names one existing pending or failed provider request, its
+requested mode, a wall-clock deadline and an opaque evidence reference. It does
+not manufacture zero-debt work. The grant binds the actual request snapshot,
+provider evidence and frontier, provider startup and runner/watchdog source,
+policy, original boot and both wall and monotonic deadlines. The explicit
+issue-to-expiry interval must be positive and at most four hours. Evidence
+references must be nonempty, NUL-free valid UTF8, at most4096encoded bytes;
+oversized values are rejected rather than truncated. Issuance checks global
+managed-scope absence and capacity for the full 8 GiB worker plus sibling and
+cache reserves, each at least2GiB; larger explicit reserves remain supported.
+These checks reserve no RAM. Codebase still requires
+enabled managed configuration and its existing lease. No command removes its
+disablement sentinel or changes a service, timer or freeze.
+
+This prefix has no `claim-selected` command and cannot consume a grant into a
+new selected runtime. New selected reservation, registration and native-intent
+acknowledgements refuse; ordinary admission also rejects selected provenance.
+Existing selected history remains cancellable, observable and settleable.
+Failed-origin clean success retires only the exact frozen failure snapshot;
+other outcomes retain the original failed request and independent pending work.
+Missing, corrupt or mismatched spent bindings preserve both work tables, record
+uncertainty unless stronger safety is already retained, and never guess origin
+or reset known debt. Replay does not charge again. Physical and control closure
+remain separate obligations. Grant expiry does not prevent truthful settlement.
+
+Nonce revocation changes only the current unused grant; a healthy spent trial
+remains unchanged. Status returns an invalid-grant descriptor for malformed
+metadata: storage type, byte size and SHA256 of the storage-type ASCII bytes,
+a NUL separator and the raw BLOB bytes. It exposes no corrupt payload and grants
+no launch authority. Exact digest revocation rereads that malformed value under
+the admitted transaction and clears only its grant field. A changed digest or
+healthy grant refuses; a replay after removal reports absent. Accepted receipts,
+hazard revisions, work, execution evidence and independent holds are preserved.
+Database/IO failures remain errors. Storage uses the existing provider-state
+row and transaction-only `scripts/lib/index_marker_retry.py`; the facade remains
+the sole opener.
+
+A zero acceptance watermark with any non-NULL receipt component is malformed;
+recovery admission refuses it just as ordinary admission does. Grant revocation
+does not repair that independent receipt. Invalid positive-watermark receipts
+remain explicit safety evidence for supervised recovery.
+Changes to retained retry code participate in the existing server restart and
+deployment-validation inventory.
+
+Selected execution, acceptance, strict cutover and native/production qualification
+remain separate gates. Metadata scratch tests exercise actual locks, SQL and
+captured commands with substituted manager/kernel observations and no provider
+work. Retained-row compatibility tests construct prior execution facts and prove
+settlement/replay; they do not establish native containment or production capacity.
 
 ### Pinned GitNexus typed adapter
 

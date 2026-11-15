@@ -13,6 +13,17 @@ integration and separable upstream components before rebuilding. A foreign
 runtime affects integration cost; legitimate privacy, license, architectural-core
 and equivalence constraints still justify non-adoption.
 
+Both evaluator templates request `why_not_adopt` for ADAPT: the reusable option
+considered and evidence for choosing adaptation over direct integration, with
+uncertainty and search limits preserved. The existing Recommendation parser
+retains the full trimmed nonempty string. Missing, blank, null or nonstring
+values become `None`; ADAPT then emits a generic warning without rejecting the
+recommendation or changing routing, approvals or capability-build ownership.
+The optional field is appended after `classification`, preserving the original
+positional constructor prefix. Other actions may retain it without requiring it.
+This records an explanation; it does not validate the decision or establish a
+measured improvement in model judgment. Existing evaluations remain usable.
+
 Each evaluated item includes a concise `### Evidence` section after its
 recommendation and before comparison/lenses. It records a source claim and short
 quote from acquired text, or an acquisition limitation; the relevant current

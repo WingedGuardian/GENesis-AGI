@@ -17,6 +17,17 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "hooks"))
 import destructive_command_guard as dg  # noqa: E402
 
+from tests import _live_fence  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _a_real_home(monkeypatch):
+    """The guard's depth floor counts ``~`` as the home it expands to, and these
+    cases describe an ordinary home (two levels deep). The live closure gives the
+    session a deep private HOME, so put the real one back; the guard only judges
+    the command text, nothing runs."""
+    monkeypatch.setenv("HOME", _live_fence.real_home() or str(Path.home()))
+
 
 def _blocks(cmd: str) -> bool:
     v = dg._rm_violations(cmd)

@@ -1,7 +1,7 @@
 """Recovery engine — HOST-SIDE. Executes recovery actions with verification.
 
 Recovery actions in escalation order:
-1. RESTART_SERVICES  — systemctl restart genesis-server
+1. RESTART_SERVICES  — start or restart genesis-server, judged by its new start
 2. IO_TRIAGE         — kill top I/O consumer (one per cycle)
 3. RESOURCE_CLEAR    — clear /tmp, reclaim page cache, restart
 4. REVERT_CODE       — git stash && git revert HEAD, restart (never on `live`)
@@ -34,6 +34,32 @@ logger = logging.getLogger(__name__)
 # The branch itself, then the shared predicate (#3013) run from the checkout.
 _HEAD_PROBE = "git -C ~/genesis symbolic-ref -q HEAD"
 _LIVE_PROBE = "python3 -I -S ~/genesis/scripts/lib/live_checkout.py ~/genesis"
+
+
+#: genesis-server's start: polled every _POLL_S for up to _START_WAIT_S (a stop,
+#: TimeoutStartSec and RestartSec, 90 + 90 + 10 s at the unit's values).
+_START_WAIT_S = 200
+_POLL_S = 5
+_UNREAD_MAX = 3  # consecutive reads that fail: the container does not answer
+_SHOW = (
+    "systemctl --user show genesis-server"
+    " -p ActiveState -p SubState -p InvocationID -p Result"
+)
+#: The boot repair's newest line in genesis-server's journal (#3492 D2).
+_REPAIR_LINE = (
+    "journalctl --user -u genesis-server --since -15min -n 200 --no-pager -o cat"
+    " | grep -F 'live-move repair:' | tail -n 1"
+)
+
+
+async def _server_unit(container: str) -> dict[str, str] | None:
+    """genesis-server's ActiveState, SubState and InvocationID, or None when
+    they cannot be read (a login shell may print lines first: key=value only)."""
+    rc, lines = await _in_container(container, _SHOW)
+    if rc != 0:
+        return None
+    vals = dict(ln.split("=", 1) for ln in lines if "=" in ln)
+    return vals if "ActiveState" in vals else None
 
 
 async def _in_container(container: str, cmd: str) -> tuple[int, list[str]]:
@@ -213,16 +239,62 @@ class RecoveryEngine:
             return False, f"Unknown action: {action}"
 
     async def _restart_services(self, container: str) -> tuple[bool, str]:
-        """Restart genesis-server service inside the container."""
-        rc, stdout, stderr = await _run_subprocess(
-            "incus", "exec", container, "--",
-            "su", "-", "ubuntu", "-c",
-            "systemctl --user restart genesis-server",
-            timeout=30.0,
-        )
-        if rc != 0:
-            return False, f"systemctl restart failed: {stderr}"
-        return True, "genesis-server restarted"
+        """Restart genesis-server inside the container, judged by the unit itself.
+
+        A start in progress is left to finish: the boot repair heals the
+        checkout in the unit's start step, and a restart would SIGTERM it
+        (#3492 D2). A stopped or failed unit is started, a running one
+        restarted, both without blocking; then the unit is polled until a NEW
+        invocation is active (the old process can still read active just after
+        a --no-block restart), or it failed, or _START_WAIT_S passed. The bound
+        covers a stop (90 s), a start step (90 s) and RestartSec (10 s)."""
+        before = await _server_unit(container)
+        state = (before or {}).get("ActiveState")
+        if state == "activating":
+            cmd, old = None, None
+        else:
+            verb = "start" if state in ("failed", "inactive") else "restart"
+            cmd, old = f"systemctl --user {verb} --no-block genesis-server", before
+        if cmd:
+            rc, _out, stderr = await _run_subprocess(
+                "incus", "exec", container, "--", "su", "-", "ubuntu", "-c", cmd, timeout=30.0,
+            )
+            # A client timeout is not the result: the unit's own state decides.
+            if rc != 0 and not (rc == -1 and stderr == "timeout"):
+                return False, f"systemctl {cmd.split()[2]} failed: {stderr}"
+        old_id = (old or {}).get("InvocationID")
+        last, unread = before or {}, 0
+        # A clock bound (each read can take its 30 s timeout) and a poll bound
+        # (the clock alone never ends where sleep is patched out).
+        end = asyncio.get_running_loop().time() + _START_WAIT_S
+        for n in range(_START_WAIT_S // _POLL_S + 1):
+            if n:
+                if asyncio.get_running_loop().time() >= end:
+                    break
+                await asyncio.sleep(_POLL_S)
+            cur = await _server_unit(container)
+            if cur is None:
+                unread += 1
+                if unread >= _UNREAD_MAX:
+                    last = {"ActiveState": "unreadable", "SubState": "unreadable"}
+                    break
+                continue
+            unread, last = 0, cur
+            if cur.get("Result") == "start-limit-hit" and cur.get("ActiveState") == "failed":
+                break  # systemd refuses every start until the limit resets
+            if old_id and cur.get("InvocationID") == old_id:
+                continue  # the old process, or the start has not run yet
+            if cur.get("ActiveState") == "active":
+                return True, "genesis-server started"
+            if cur.get("ActiveState") == "failed":
+                break
+        _rc, lines = await _in_container(container, _REPAIR_LINE)
+        lines = [ln for ln in lines if "live-move repair:" in ln]  # not a login banner
+        why = f"; its start step's last line: {lines[-1][:400]}" if lines else ""
+        shown = f"{last.get('ActiveState', 'unknown')}/{last.get('SubState', 'unknown')}"
+        if last.get("Result") == "start-limit-hit":
+            shown += ", start limit hit: systemd refuses starts until it resets"
+        return False, f"genesis-server did not come up ({shown}){why}"
 
     async def _io_triage(self, container: str) -> tuple[bool, str]:
         """Kill the top I/O consumer. One process per cycle — reassess after.

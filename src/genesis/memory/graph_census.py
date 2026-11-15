@@ -481,7 +481,7 @@ def build_census(
         )
         # Each value derived the way THIS server derives it (its own SECRETS_PATH,
         # GENESIS_REPO_ROOT and HOME), never from the census process's state.
-        secrets_path = proof.secrets_file(env, main_root=repo)
+        secrets_path = proof.secrets_file(env, main_root=repo, start=proc["start"])
         file_vals = proof.secrets_values(secrets_path, proc["start"])
         carried = False
         if file_vals is None and prior:

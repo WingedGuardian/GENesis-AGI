@@ -123,7 +123,15 @@ measurement is not covered by a writer gate.
 
 The audit reads OPEN and CLOSED records through the admitted read-only database
 connection. It lists missing/malformed/mismatched legacy evidence as requiring
-manual classification; it never rewrites or reopens closed rows. Missing
+manual classification; it never rewrites or reopens closed rows. Evidence written
+before `gaps` replaced `scope_limits` (otherwise valid, no `gaps` key, and
+`scope_limits` a list of strings) is read for this report only: its routing is
+assessed like any other row, it carries `legacy_scope_limits` (the entry count)
+and a pending line, and it never counts as complete. The entries are not mapped
+to kinds, and the writers still refuse `scope_limits`. An open legacy row is
+re-recorded with `gaps`; a closed one is never amended, so its entries are
+classified in the run log and any actionable one gets filed or reused tracking.
+Missing
 structured linkage is not proof that no issue exists. Read the evidence, search
 the tracker and file/reuse actual work; do not manufacture duplicate tasks.
 The offline option avoids public network reads and reports those receipts as

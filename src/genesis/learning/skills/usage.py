@@ -8,10 +8,10 @@ reads, skill-injection nudges, dispatched injections (``cc_sessions``
 - ``active``: chosen at least once in the window (a tool load, a slash load or
   a SKILL.md read);
 - ``zombie``: nudged at least once, never chosen;
-- ``dead``: the nudge hook can offer it (it is in the catalog), neither nudged
+- ``dead``: the nudge hook can offer it (an automatic catalog entry), neither nudged
   nor used;
 - ``not_nudgeable``: neither nudged nor used, and the hook cannot nudge it
-  (user-level and plugin skills, which Claude Code still lists).
+  (manual-only catalog entries, user-level and plugin skills).
 
 Configured deliveries never decide the state (owner ruling, 2026-10-20): a
 dispatched session's ``skill_tags`` injection and an agent-frontmatter preload
@@ -296,7 +296,10 @@ def load_population(
                 if not isinstance(name, str) or not name:
                     skipped += 1
                     continue
-                found += pop._add(name, f"catalog-{tier}", nudge_eligible=True)
+                found += pop._add(
+                    name, f"catalog-{tier}",
+                    nudge_eligible=item.get("disable-model-invocation") is not True,
+                )
                 if isinstance(path, str) and path.startswith("/"):
                     pop._abs_dirs[path.rstrip("/")] = name
                 elif isinstance(path, str) and path:

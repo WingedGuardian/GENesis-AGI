@@ -401,7 +401,11 @@ async def _write(
 
             from datetime import datetime
 
+            from genesis.caller_context import client_kind, record_session_id
+
             now = datetime.now(UTC).isoformat()
+            kind = client_kind()
+            stamp = {"recorded_by": kind, "recorded_session": record_session_id(kind)}
 
             if closing:
                 changed = await crud.close_verification(
@@ -412,6 +416,7 @@ async def _write(
                     reason=reason,
                     evidence=payload,
                     now=now,
+                    **stamp,
                 )
                 if not changed:
                     print(
@@ -437,6 +442,7 @@ async def _write(
                 now=now,
                 evidence=payload,
                 tracking_pending=not tracking.complete,
+                **stamp,
             )
             if outcome != "recorded":
                 print(

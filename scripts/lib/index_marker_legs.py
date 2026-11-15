@@ -447,12 +447,35 @@ def claim(db, h, provider, *, protocol=2):
     row = db.execute("SELECT * FROM pending WHERE hash=? AND provider=?", (h, provider)).fetchone()
     if row is None:
         return None
+    result = _insert_claim(db, h, provider, row, protocol=protocol,
+                           nonce=secrets.token_hex(16), origin='generated')
+    db.execute("DELETE FROM pending WHERE hash=? AND provider=?", (h, provider))
+    return result
+
+
+def _insert_claim(db, h, provider, row, *, protocol, nonce, origin):
+    """Stage one actual execution and pointer; caller owns selection and commit.
+
+    Selected callers still owe an actual-owner reservation in this SAME
+    transaction. This helper neither consumes a grant nor deletes/coalesces work.
+    """
+    if not db.in_transaction:
+        raise RuntimeError('claim insertion requires an admitted transaction')
+    if (type(protocol) is not int or protocol not in (2, 3) or provider not in PROVIDERS
+            or not isinstance(nonce, str) or re.fullmatch(r'[a-f0-9]{32}', nonce) is None
+            or origin not in ('generated', 'selected-recovery')
+            or origin == 'selected-recovery' and protocol != 3
+            or row['hash'] != h or row['provider'] != provider
+            or row['mode'] not in MODES or type(row['attempts']) is not int
+            or not 0 <= row['attempts'] <= INTEGER_MAX):
+        raise ValueError('invalid staged claim identity or debt')
+    if db.execute("SELECT 1 FROM inflight WHERE hash=?", (h,)).fetchone():
+        raise RuntimeError('staged claim cannot replace current ownership')
     _identity(db, h, row["repo_path"])
-    nonce = secrets.token_hex(16)
     cursor = db.execute(
         "INSERT INTO executions(hash,repo_path,provider,protocol,entry_kind,claim_id,original_tools,"
         "mode,requested_at,attempts,legacy_unqualified,legacy_shared_attempts,nonce_origin) "
-        "VALUES(?,?,?,?,'claim',?,?,?,?,?,?,?,'generated')",
+        "VALUES(?,?,?,?,'claim',?,?,?,?,?,?,?,?)",
         (
             h,
             row["repo_path"],
@@ -465,6 +488,7 @@ def claim(db, h, provider, *, protocol=2):
             row["attempts"],
             row["legacy_unqualified"],
             row["legacy_shared_attempts"],
+            origin,
         ),
     )
     sequence = cursor.lastrowid
@@ -486,7 +510,6 @@ def claim(db, h, provider, *, protocol=2):
             row["legacy_shared_attempts"],
         ),
     )
-    db.execute("DELETE FROM pending WHERE hash=? AND provider=?", (h, provider))
     context = dict(
         hash=h,
         repo_path=row["repo_path"],
