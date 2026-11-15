@@ -89,6 +89,18 @@ def test_env_fallback_reads_raw_values_per_call(monkeypatch):
     monkeypatch.setenv("CODEX_THREAD_ID", " th ")
     ctx = caller_context()
     assert (ctx.claude_code, ctx.codex_thread) == ("1", " th ")
+    monkeypatch.setenv("GENESIS_BUILDER_KEY", "PVTI_x@2026-11-15T00:00:00Z")
+    assert caller_context().builder_key == "PVTI_x@2026-11-15T00:00:00Z"
+
+
+def test_a_dispatched_child_never_inherits_a_builder_key(monkeypatch):
+    """A child Genesis starts from inside a builder slot is not that builder,
+    so the builder guard must not see it as one."""
+    monkeypatch.setenv("GENESIS_BUILDER_KEY", "k")
+    env = cc.dispatched_child_env()
+    assert "GENESIS_BUILDER_KEY" not in env
+    assert env["GENESIS_CC_SESSION"] == "1"
+    assert "GENESIS_BUILDER_KEY" in IDENTITY_ENV_VARS
 
 
 # ── client_kind: a label for records ─────────────────────────────────────────

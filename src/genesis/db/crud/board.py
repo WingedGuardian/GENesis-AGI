@@ -51,6 +51,22 @@ TERMINAL_QUESTION_STATUSES = ("resolved", "dropped")
 #:   bookkeeping_move   — Genesis moved a card (the one allowed move: In Review)
 #:   comment_write      — Genesis posted a templated, scanned comment
 #:   override           — an owner move past an advisory (admission, blocked-by)
+#: The builder launcher's (board/launcher.py), each keyed per move
+#: (``<item>@<Status updatedAt>``, with ``#a<n>`` / ``#ask:<id>`` suffixes):
+#:   launcher_enabled   — an armed tick after a disarmed one (keyed by its own time)
+#:   launcher_disabled  — a disarmed tick after an armed one (keyed by its own time)
+#:   move_absorbed      — a Build move for an issue that already has a builder
+#:   launch_refused     — a Build move refused for a fact about the issue or move
+#:   launch_queued      — a Build move held for install state (capacity, memory, login)
+#:   launch_withdrawn   — a held move whose card left Build
+#:   builder_launching  — slot, session id and worktree chosen; launch about to start
+#:   builder_launched   — the builder's tmux session is up
+#:   launch_failed      — one failed launch attempt (a strike)
+#:   builder_paused     — the builder was stopped because its card left Build
+#:   builder_exited     — the builder's session ended with no linked PR
+#:   builder_closed     — the builder's session was closed after its PR opened
+#:   ask_raised         — a builder was seen waiting on the owner
+#:   ask_answered       — that wait ended
 EVENTS = frozenset(
     {
         "promotion",
@@ -62,6 +78,20 @@ EVENTS = frozenset(
         "bookkeeping_move",
         "comment_write",
         "override",
+        "launcher_enabled",
+        "launcher_disabled",
+        "move_absorbed",
+        "launch_refused",
+        "launch_queued",
+        "launch_withdrawn",
+        "builder_launching",
+        "builder_launched",
+        "launch_failed",
+        "builder_paused",
+        "builder_exited",
+        "builder_closed",
+        "ask_raised",
+        "ask_answered",
     }
 )
 

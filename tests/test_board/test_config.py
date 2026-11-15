@@ -190,3 +190,44 @@ def test_validator_refuses_project_keys_they_are_overlay_only(change):
     file: a session must not repoint it at a project it controls."""
     [error] = _validate_board(change)
     assert "board_setup.py --write-config" in error
+
+
+# ── builder_launch arming (spec E, E3a) ─────────────────────────────────────
+
+
+@pytest.mark.parametrize("mode", ["propose_only", "live"])
+def test_builder_launch_arms_only_on_the_literal_true(config_dirs, mode):
+    _, overlay = config_dirs
+    overlay.write_text(f"mode: '{mode}'\nbuilder_launch:\n  enabled: true\n")
+    assert bc.builder_launch_armed() == (True, "armed")
+
+
+@pytest.mark.parametrize(
+    "section",
+    ["", "builder_launch: true\n", "builder_launch:\n  enabled: 'true'\n",
+     "builder_launch:\n  enabled: 1\n", "builder_launch:\n  enabled:\n",
+     "builder_launch:\n  enabled: false\n"],
+)
+def test_builder_launch_fails_closed_on_anything_else(config_dirs, section):
+    _, overlay = config_dirs
+    overlay.write_text("mode: 'live'\n" + section)
+    armed, reason = bc.builder_launch_armed()
+    assert armed is False and "enabled" in reason
+
+
+def test_builder_launch_never_arms_on_an_off_or_degraded_mode(config_dirs, monkeypatch):
+    _, overlay = config_dirs
+    overlay.write_text("mode: 'off'\nbuilder_launch:\n  enabled: true\n")
+    assert bc.builder_launch_armed() == (False, "board mode is off")
+    overlay.write_text("mode: 'LIVE'\nbuilder_launch:\n  enabled: true\n")
+    armed, reason = bc.builder_launch_armed()
+    assert armed is False and "invalid" in reason
+    overlay.write_text("mode: 'live'\nbuilder_launch:\n  enabled: true\n")
+    monkeypatch.setenv(bc._DISABLE_ENV, "1")
+    assert bc.builder_launch_armed() == (False, "board kill switch set")
+
+
+def test_a_session_cannot_arm_the_launcher_through_settings():
+    """Arming is a hand edit of the overlay only: settings_update refuses the key."""
+    errors = _validate_board({"builder_launch": {"enabled": True}})
+    assert errors and "Unknown key 'builder_launch'" in errors[0]

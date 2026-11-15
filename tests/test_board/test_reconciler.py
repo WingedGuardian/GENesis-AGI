@@ -302,3 +302,54 @@ def test_no_board_module_writes_a_field_around_the_status_chokepoint():
         if p.name != "projects_v2.py" and "set_single_select" in p.read_text()
     ]
     assert offenders == []
+
+
+# ── the Build column and the builder launcher (spec E, E3a) ─────────────────
+
+
+async def test_a_build_card_is_logged_as_a_drag_naming_its_column(db, monkeypatch):
+    fresh = (NOW - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    FakeBoard([_item("I1", "Build", updated=fresh, number=7),
+               _item("I2", "In Progress", updated=fresh, number=8)]).install(monkeypatch)
+    out = await reconciler.run_tick(FakeRT(db), now=NOW)
+    assert out["drags"] == {"in_progress": 1, "build": 1, "newly_logged": 2}
+    statuses = {e["issue_number"]: e["detail"]["status"]
+                for e in (await board_crud.list_events(db, event="drag"))["items"]}
+    assert statuses == {7: "Build", 8: "In Progress"}
+
+
+@pytest.mark.parametrize("setup", ["ok", "off", "paused", "error"])
+async def test_the_launcher_runs_every_tick_with_cards_only_from_a_good_read(
+    db, monkeypatch, setup
+):
+    from genesis.board import launcher
+
+    seen = []
+
+    async def fake_launcher(rt, items, now):
+        seen.append(items)
+        return {"armed": False}
+
+    monkeypatch.setattr(launcher, "run_launcher", fake_launcher)
+    item = _item("I1", "Build", number=7)
+    FakeBoard([item], fail=pv.ProjectsError("boom") if setup == "error" else None).install(
+        monkeypatch)
+    if setup == "off":
+        monkeypatch.setattr(board_config, "effective_mode", lambda: "off")
+    out = await reconciler.run_tick(FakeRT(db, paused=(setup == "paused")), now=NOW)
+    assert out["launcher"] == {"armed": False}
+    assert seen == ([[item]] if setup == "ok" else [None])
+
+
+async def test_a_launcher_failure_is_a_job_failure_beside_a_good_read(db, monkeypatch):
+    from genesis.board import launcher
+
+    async def broken(rt, items, now):
+        return {"error": "RuntimeError: tmux exploded"}
+
+    monkeypatch.setattr(launcher, "run_launcher", broken)
+    FakeBoard([_item("I1", "Proposed", number=1)]).install(monkeypatch)
+    rt = FakeRT(db)
+    out = await reconciler.run_tick(rt, now=NOW)
+    assert out["board_state"] == "ok" and rt.successes == []
+    assert "builder launcher failed: RuntimeError: tmux exploded" in str(rt.failures[0][1])

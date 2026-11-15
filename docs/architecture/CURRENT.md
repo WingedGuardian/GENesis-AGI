@@ -6136,7 +6136,9 @@ around them. **What exists today:**
 - promotion of a private record onto the board;
 - the reconciler, which reads the board every tick and in `live` fills empty
   Status columns, adds missing open items and records promoted cards' ids,
-  and its two read tools.
+  and its two read tools;
+- the builder launcher, which starts one builder in a tmux slot for a card
+  moved to Build, once a hand edit has armed it (off by default).
 
 The bookkeeping move to In Review (#4400 Part 2), the Genesis status and the
 dashboard tab are follow-on work. The shipped mode is `off`.
@@ -6149,8 +6151,8 @@ dashboard tab are follow-on work. The shipped mode is `off`.
     own open totals, and counts cards by Status, Genesis field and kind, plus
     coverage: open tracker issues and PRs on the board against the repo's open
     total;
-  - logs one `drag` event per In Progress card per Status change, keyed
-    `item@<Status updatedAt>`. That value moves on a real Status change and on
+  - logs one `drag` event per In Progress or Build card per Status change
+    (detail `status` names the column), keyed `item@<Status updatedAt>`. That value moves on a real Status change and on
     nothing else (MEASURED 2026-10-04 on a private sandbox, with a control);
   - flags `observed_late` from the clock alone (older than one interval plus
     slack), never from stored state;
@@ -6174,6 +6176,9 @@ dashboard tab are follow-on work. The shipped mode is `off`.
     limit) stops the tick's writes; an error about one item skips that item.
     Outside `live` the summary carries would-write counts (`dry_run`) and
     nothing is written;
+  - then runs the builder launcher (below) on every tick except a failed pause
+    check, with the cards only from a good read; its summary is the
+    `launcher` block, and its error is a job failure;
   - ALWAYS emits a `board` heartbeat (DEBUG) carrying the summary, in every mode
     and while paused. So the pulse is not pause-gated and has no enable check,
     and in mode `off` it is effectively a learning-scheduler canary.
@@ -6182,6 +6187,39 @@ dashboard tab are follow-on work. The shipped mode is `off`.
   write failure records a failure too, with the read's counts and the writes
   already made kept. The step raises if the learning scheduler is
   missing or stopped, so the manifest names that cause instead of the board.
+- **Builder launcher** (`board/launcher.py`, spec E ticket E3a). Armed only by
+  `builder_launch: {enabled: true}` (the literal) in `board.local.yaml`, on a
+  valid mode other than `off`; `settings_update` refuses the key. The levers
+  beside it (`capacity` 1, `min_free_gb` 4, `login_margin_hours` 6,
+  `first_slot` 9) are range-checked (`config.builder_launch_settings`).
+  - Arming changes are recorded (`launcher_enabled` / `launcher_disabled`); a
+    move not later than the latest enable never launches, and the cards in
+    Build at enable are listed to the owner once.
+  - For each card in Build in the tick's read, keyed `k = item@<Status
+    updatedAt>`: absorbs a move for an issue that already has a live builder;
+    HOLDS (`launch_queued`, keyed `k#q:<kind>`, one owner line per reason) on
+    capacity, free memory, a login expiring within the margin or unreadable,
+    a missing prompt template, slot script or builder guard
+    (`scripts/hooks/builder_guard.py` named in `.claude/settings.json`), or a
+    slot door refusal (retried only once the tmux session set changes);
+    REFUSES (`launch_refused`, final for k) a card that is not an open issue
+    in the tracker repo, an author outside OWNER / MEMBER / COLLABORATOR, an
+    edit after the move, incomplete premise checks
+    (`scripts/premise_gate.py check`, run with `GH_REPO`), or an open closing
+    PR. A failed read is retried next tick, never refused.
+  - Then: writes the body snapshot and the rendered `config/BUILDER_PROMPT.md`
+    under `~/.genesis/builders/<N>/`; records an approval row
+    (`builder_launch`, `costly_reversible`) resolved
+    `board:move:unattributed` (classified `unknown` on purpose) and consumed
+    BEFORE anything starts; writes `builder_launching` (slot, session id,
+    worktree, systemd unit); runs `scripts/cc-slot.sh launch` through
+    `systemd-run --user --wait`, which passes the door's exit code through
+    (MEASURED: 0, 64, 75). Up = a tmux session carrying the key:
+    `builder_launched`. Exit 75 is not a strike; other failures are
+    `launch_failed` strikes, and the third stops the move and tells the owner.
+    A timed-out launch stops its unit; an attempt a restart interrupted is
+    settled from tmux and the unit's state.
+  - Run state is derived from tmux and the board read, never from events.
 - **`board_status`** reads the stored heartbeats only, never GitHub: the newest
   pulse (alive, mode, error) and the newest SUCCESSFUL read with its age,
   including that tick's `writes` block (None on a summary from before #4400).
