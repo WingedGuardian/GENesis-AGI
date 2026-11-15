@@ -467,3 +467,108 @@ def test_a_reviewed_rename_source_counts_as_a_reviewed_file(guard, monkeypatch):
     ]
     monkeypatch.setenv("_TEST_GH_CONTRIBUTION", json.dumps(contrib))
     assert guard._no_change_note("7", REPO, _merged_budget()) is None
+
+
+# ── round 2: every compare row read through one validator ────────────────────
+
+
+def _rewrite_then_merge(guard, monkeypatch, *, merge_rows, reviewed_rows=None):
+    """#4611's shape, with the merge's (and optionally the reviewed head's) compare
+    rows written raw, so a malformed row can be tried."""
+    _seams(monkeypatch, infos=_REVIEWED_INFO, merge_files={(REWRITE, MERGE): ["x"]}, head=MERGE)
+    contrib = json.loads(os.environ["_TEST_GH_CONTRIBUTION"])
+    contrib[f"{REWRITE[:12]}..{MERGE[:12]}"]["files"] = merge_rows
+    if reviewed_rows is not None:
+        contrib[f"{BASE_TIP[:12]}..{REVIEWED[:12]}"]["files"] = reviewed_rows
+    monkeypatch.setenv("_TEST_GH_CONTRIBUTION", json.dumps(contrib))
+    budget = _budget(
+        MERGE,
+        [(REWRITE, TREE, [BASE]), (MERGE, TREE_MERGE, [REWRITE, MAIN])],
+        [(REVIEWED, "2026-11-01T00:00:00+00:00")],
+    )
+    return guard._no_change_note("7", REPO, budget)
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [{"filename": None}],
+        [{}],
+        [{"filename": ""}],
+        [{"filename": 123}],
+        [{"filename": ["a"]}],
+        [],
+        [{"filename": "src/other.py", "previous_filename": 5}],
+        [{"filename": "src/other.py", "previous_filename": ""}],
+        ["src/other.py"],
+    ],
+)
+def test_an_unreadable_merge_row_prints_nothing(guard, monkeypatch, rows):
+    assert _rewrite_then_merge(guard, monkeypatch, merge_rows=rows) is None
+
+
+@pytest.mark.parametrize("rows", [[{"filename": None}], [{"filename": ""}], [], [{"filename": "a", "previous_filename": 7}]])
+def test_an_unreadable_reviewed_row_prints_nothing(guard, monkeypatch, rows):
+    merge = [{"filename": "src/other.py"}]
+    assert _rewrite_then_merge(guard, monkeypatch, merge_rows=merge, reviewed_rows=rows) is None
+
+
+def test_a_well_formed_merge_row_still_prints_the_note(guard, monkeypatch):
+    rows = [{"filename": "src/other.py", "previous_filename": None}]
+    assert _rewrite_then_merge(guard, monkeypatch, merge_rows=rows) is not None
+
+
+def test_no_note_is_returned_after_the_time_bound(guard, monkeypatch):
+    """The bound is checked once more after the last call, before the note."""
+    _seams(monkeypatch, infos=_REVIEWED_INFO)
+    budget = _budget(REWRITE, [(REWRITE, TREE, [BASE])], [(REVIEWED, "2026-11-01T00:00:00+00:00")])
+    # Calls: the start, the reviewed head's lookup, then the check before the note.
+    ticks = iter([0.0, 0.0, 99.0, 99.0, 99.0])
+    assert guard._no_change_note("7", REPO, budget, clock=lambda: next(ticks)) is None
+
+
+def test_a_later_review_of_a_different_tree_is_named(guard, monkeypatch):
+    """R1 reviewed, R2 (another tree) reviewed later, then a push back to R1's tree:
+    the note still holds against R1, and names R2's later review."""
+    later = "6" * 40
+    infos = {**_REVIEWED_INFO, later: {"sha": later, "tree": TREE_CODE, "parents": [REVIEWED]}}
+    _seams(monkeypatch, infos=infos)
+    budget = _budget(
+        REWRITE,
+        [(REWRITE, TREE, [BASE])],
+        [(REVIEWED, "2026-11-01T00:00:00+00:00"), (later, "2026-11-02T00:00:00+00:00")],
+    )
+    note = guard._no_change_note("7", REPO, budget)
+    assert note is not None and REVIEWED[:12] in note
+    assert f"A later review, of {later[:12]}" in note and "may answer that one" in note
+
+
+def test_an_earlier_review_of_another_tree_adds_no_caveat(guard, monkeypatch):
+    earlier = "6" * 40
+    infos = {**_REVIEWED_INFO, earlier: {"sha": earlier, "tree": TREE_CODE, "parents": [BASE]}}
+    _seams(monkeypatch, infos=infos)
+    budget = _budget(
+        REWRITE,
+        [(REWRITE, TREE, [BASE])],
+        [(earlier, "2026-10-01T00:00:00+00:00"), (REVIEWED, "2026-11-01T00:00:00+00:00")],
+    )
+    note = guard._no_change_note("7", REPO, budget)
+    assert note is not None and "later review" not in note
+
+
+def test_an_empty_pr_file_list_prints_nothing_across_a_merge(guard, monkeypatch):
+    """An empty list would read as 'the PR touches no file', so no merge could
+    ever be refused for touching one."""
+    _seams(
+        monkeypatch,
+        infos=_REVIEWED_INFO,
+        merge_files={(REWRITE, MERGE): ["src/other.py"]},
+        head=MERGE,
+        pr_files=(),
+    )
+    budget = _budget(
+        MERGE,
+        [(REWRITE, TREE, [BASE]), (MERGE, TREE_MERGE, [REWRITE, MAIN])],
+        [(REVIEWED, "2026-11-01T00:00:00+00:00")],
+    )
+    assert guard._no_change_note("7", REPO, budget) is None

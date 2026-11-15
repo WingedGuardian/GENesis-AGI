@@ -5539,8 +5539,9 @@ _COMPARE_FILE_CAP = 300
 #: deadline, so each call gets the full 8s of ``_gh_timeout(8)``; without a bound,
 #: a PR with many pushed-out reviewed heads and a long merge chain could add
 #: minutes to ``--check-pr`` for an advisory line. 30s is about one whole report
-#: (MEASURED: ``--check-pr 4611`` took 29s); past it the note gives up silently,
-#: which can only drop a note, never print a false one.
+#: (MEASURED: ``--check-pr 4611`` took 29s). No call STARTS after it, and a note is
+#: not returned after it, but the last call may run to its own 8s timeout. Past it
+#: the note gives up silently, which can only drop a note, never print a false one.
 _NO_CHANGE_BUDGET_S = 30.0
 
 
@@ -5592,6 +5593,33 @@ def _commit_info(sha: str, repo: str | None) -> tuple[str, str, list[str]] | Non
     return full.lower(), tree, [p.lower() for p in parents]
 
 
+def _compare_row_paths(rows: object) -> set[str] | None:
+    """The paths a compare file list names, or None when it cannot be read whole.
+
+    None for an empty list (``_pr_contribution``'s jq reads a missing ``files``
+    as none, and a merge or reviewed head whose tree changed names at least one
+    file), for a row that is not an object, for a ``filename`` that is not a
+    non-empty string, and for a ``previous_filename`` that is present and not
+    one. The same rule as ``_pr_changed_files_uncached``. The note treats None as
+    unreadable, so a missing field can never read as "this merge touched
+    nothing"."""
+    if not isinstance(rows, list) or not rows:
+        return None
+    out: set[str] = set()
+    for f in rows:
+        if not isinstance(f, dict):
+            return None
+        name, prev = f.get("filename"), f.get("previous_filename")
+        if not (isinstance(name, str) and name):
+            return None
+        if prev is not None and not (isinstance(prev, str) and prev):
+            return None
+        out.add(name)
+        if prev:
+            out.add(prev)
+    return out
+
+
 def _stepped_merges_spare_review(
     pr_num: str,
     repo: str | None,
@@ -5602,8 +5630,9 @@ def _stepped_merges_spare_review(
 ) -> bool:
     """Whether the merges ``_no_change_note`` stepped over touched none of the
     files the reviewed head itself changed. False whenever that cannot be
-    shown: the base tip or the contribution unreadable, GitHub's 300-file cap,
-    or the note's time bound spent."""
+    shown: the base tip or the contribution unreadable (an empty or malformed
+    file list included, ``_compare_row_paths``), GitHub's 300-file cap, or the
+    note's time bound spent."""
     if clock() > stop_at:
         return False
     base = _pr_base_sha(pr_num, repo)
@@ -5612,11 +5641,9 @@ def _stepped_merges_spare_review(
     reviewed = _pr_contribution(base, reviewed_sha, repo)
     if reviewed is None or len(reviewed[2]) >= _COMPARE_FILE_CAP:
         return False
-    names: set[str] = set()
-    for f in reviewed[2]:
-        if not isinstance(f, dict):
-            return False
-        names.update(n for n in (f.get("filename"), f.get("previous_filename")) if isinstance(n, str))
+    names = _compare_row_paths(reviewed[2])
+    if names is None:
+        return False
     return not (stepped & names)
 
 
@@ -5730,12 +5757,33 @@ def _no_change_note(
                 pr_num, repo, reviewed_sha, stepped, clock, stop_at
             ):
                 return None
+            if clock() > stop_at:
+                return None
             same = "has" if current == head else f"steps back over merges to {current[:12]}, which has"
+            # After a force-push back to an older reviewed tree, a review made LATER
+            # saw a different tree, and its finding may be answered by dropping that
+            # tree's change. Name it, so the reader does not take the note as the
+            # whole story.
+            matched_when = others[reviewed_sha][0]
+            later = [
+                (when, sha, at)
+                for other_tree, heads in reviewed_trees.items()
+                if other_tree != tree
+                for sha, (when, at) in heads.items()
+                if when > matched_when
+            ]
+            caveat = ""
+            if later:
+                _, later_sha, later_at = max(later)
+                caveat = (
+                    f" A later review, of {later_sha[:12]} at {later_at}, saw a different "
+                    "tree; this push may answer that one."
+                )
             return (
                 f"NOTE: PR #{pr_num} — head {head[:12]} {same} the same tree as "
                 f"{reviewed_sha[:12]}, reviewed at {reviewed_at}: the PR's own commits "
                 "since that review changed no file. Advisory: a claim that this push "
-                "fixed a finding is not shown by the code."
+                f"fixed a finding is not shown by the code.{caveat}"
             )
         if len(parents) < 2:
             return None  # a non-merge commit with another tree is a real change
@@ -5745,22 +5793,18 @@ def _no_change_note(
             if clock() > stop_at:
                 return None
             files = _pr_changed_files_uncached(pr_num, repo)
-            if files is None:
-                return None
+            if not files:
+                return None  # a PR with a head changes a file: an empty list is unreadable
             own_files = set(files)
         if clock() > stop_at:
             return None
         merged = _pr_contribution(parents[0], current, repo)
         if merged is None or len(merged[2]) >= _COMPARE_FILE_CAP:
             return None
-        for f in merged[2]:
-            if not isinstance(f, dict):
-                return None
-            if f.get("filename") in own_files or f.get("previous_filename") in own_files:
-                return None
-            stepped.update(
-                n for n in (f.get("filename"), f.get("previous_filename")) if isinstance(n, str)
-            )
+        paths = _compare_row_paths(merged[2])
+        if paths is None or paths & own_files:
+            return None
+        stepped |= paths
         current = parents[0]
     return None
 
