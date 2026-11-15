@@ -85,9 +85,11 @@ def _summarize_args(tool_name: str, tool_input: object) -> str:
 
 
 # A failed result's text is kept on its spine entry for the outcome writer, which
-# scrubs it and stores 400 characters. The transcript keeps the full text, so this
-# is a selection, not the only copy; the bound stops one huge failed result (an
-# error echoing a whole file) from being held in memory for the rest of the parse.
+# scrubs it and stores 400 characters. Text over this bound is withheld (None),
+# never cut: the scrubber decodes JSON strings to find escaped credentials, and a
+# cut string no longer decodes, so a cut could leave a credential readable. The
+# bound stops one huge failed result (an error echoing a whole file) from being
+# held in memory for the rest of the parse; the failure itself is still recorded.
 _FAILURE_TEXT_CAP = 65_536
 
 
@@ -145,7 +147,7 @@ def _record_result(entry: dict, block: dict, content: object, rec: dict) -> None
     entry["session_id"] = sid if isinstance(sid, str) and sid else None
     entry["timestamp"] = ts if isinstance(ts, str) and ts else None
     entry["failure_class"] = cls
-    entry["failure_text"] = text[:_FAILURE_TEXT_CAP] if cls else None
+    entry["failure_text"] = text if cls and len(text) <= _FAILURE_TEXT_CAP else None
 
 
 def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:

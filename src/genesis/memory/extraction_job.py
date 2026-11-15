@@ -294,6 +294,10 @@ async def run_extraction_cycle(
                     db, session_id, delta.new_line_count,
                     last_extracted_byte=delta.new_byte_offset,
                 )
+                # The appended lines may hold only a tool result (the delta
+                # reader drops those), so record outcomes here too: no later
+                # cycle re-reads this transcript unless new text arrives.
+                await _record_tool_outcomes_from(db, transcript_path, cc_session_id)
             continue
 
         chunks = chunk_messages(messages, chunk_size=chunk_size)
@@ -703,6 +707,26 @@ async def run_extraction_cycle(
             logger.warning("Connection pass failed", exc_info=True)
 
     return summary
+
+
+async def _record_tool_outcomes_from(
+    db: aiosqlite.Connection, transcript_path: Path, cc_session_id: str
+) -> None:
+    """Parse ``transcript_path`` and record its outcomes; never raises.
+
+    For a cycle whose delta has no message, which skips the builder's parse.
+    """
+    try:
+        from genesis.learning.procedural.struggle_detector import build_spine_and_haystack
+
+        spine, _ = await asyncio.to_thread(build_spine_and_haystack, transcript_path)
+    except Exception:
+        logger.warning(
+            "Tool-outcome parse failed for session %s — extraction unaffected",
+            cc_session_id, exc_info=True,
+        )
+        return
+    await _record_tool_outcomes(db, spine, cc_session_id)
 
 
 async def _record_tool_outcomes(

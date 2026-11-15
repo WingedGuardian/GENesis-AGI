@@ -299,3 +299,121 @@ async def test_an_extraction_cycle_records_tool_outcomes(db, tmp_path, monkeypat
         "toolu_ok",
         "toolu_reject",
     ]
+def _ago(days):
+    from datetime import UTC, datetime, timedelta
+
+    return (datetime.now(UTC) - timedelta(days=days)).isoformat().replace("+00:00", "Z")
+
+
+def test_calls_older_than_the_retention_horizons_are_not_rebuilt(tmp_path):
+    """A resumed session replays its whole transcript. A call older than the row
+    horizon must not come back after the prune deleted it, and failure text older
+    than the snippet horizon must not come back either."""
+    records = [
+        _use("toolu_old", "Bash", {"command": "x"}, ts=_ago(200)),
+        _result("toolu_old", "Exit code 1", ts=_ago(200), is_error=True),
+        _use("toolu_mid", "Bash", {"command": "y"}, ts=_ago(100)),
+        _result("toolu_mid", HOOK_TEXT, ts=_ago(100), is_error=True),
+        _use("toolu_new", "Bash", {"command": "z"}, ts=_ago(1)),
+        _result("toolu_new", HOOK_TEXT, ts=_ago(1), is_error=True),
+    ]
+    path = tmp_path / f"{SID}.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    _, rows = _rows(path)
+    assert set(rows) == {"toolu_mid", "toolu_new"}
+    assert rows["toolu_mid"][3] == 0 and rows["toolu_mid"][4] is None
+    assert rows["toolu_new"][4] is not None
+
+
+def test_failure_text_over_the_cap_is_withheld_not_cut(tmp_path):
+    """Cutting a long result before scrubbing can leave a JSON string open, and
+    the scrubber does not decode escapes in an open string. Over the cap, the
+    spine keeps no text at all; the failure is still recorded."""
+    from genesis.learning.procedural import struggle_detector as sd
+
+    long_text = "Exit code 1 " + "p" * (sd._FAILURE_TEXT_CAP + 10)
+    records = [
+        _use("toolu_long", "Bash", {"command": "x"}, ts="2026-11-01T10:00:00Z"),
+        _result("toolu_long", long_text, ts="2026-11-01T10:00:01Z", is_error=True),
+    ]
+    path = tmp_path / f"{SID}.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    spine, rows = _rows(path)
+    entry = next(e for e in spine if e.get("tool_use_id") == "toolu_long")
+    assert entry["failure_class"] is not None and entry["failure_text"] is None
+    assert rows["toolu_long"][3] == 0 and rows["toolu_long"][4] is None
+
+
+# The leading "s" of the key as a JSON escape: a backslash, "u", "0073".
+_ESCAPED_KEY = "\\u0073" + FAKE_KEY[1:]
+
+
+def test_an_escaped_credential_in_an_unclosed_quote_is_never_stored():
+    text = 'npm ERR! "token=' + _ESCAPED_KEY + " and more words"
+    assert "\\u0073" in text  # the escape itself, not a decoded "s"
+    assert tool_outcomes._snippet(text) is None
+
+
+def test_a_harmless_escape_keeps_its_snippet():
+    text = 'Error: "caf\\u00e9 not found'
+    assert tool_outcomes._snippet(text) == text
+
+
+def test_an_unparseable_timestamp_is_stored_as_now_so_the_prune_can_reach_it():
+    spine = [{
+        "type": "tool", "tool": "Bash", "tool_use_id": "toolu_ts", "has_result": True,
+        "is_sidechain": False, "session_id": SID, "timestamp": "not a time",
+        "failure_class": None, "failure_text": None, "file_path": None,
+    }]
+    (row,) = tool_outcomes.outcome_rows(spine, fallback_session_id="fb")
+    from datetime import datetime
+
+    assert datetime.fromisoformat(row[5]).tzinfo is not None
+
+
+async def test_a_result_appended_without_new_text_is_recorded(db, tmp_path, monkeypatch):
+    """A tool result arriving with no new conversation text yields an empty
+    message delta. The cycle must still record the now-finished call."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from genesis.db.crud import cc_sessions
+    from genesis.memory import extraction_job
+
+    await cc_sessions.create(
+        db,
+        id=SID,
+        session_type="foreground",
+        model="sonnet",
+        started_at="2026-11-01T00:00:00",
+        last_activity_at="2026-11-01T00:00:00",
+        source_tag="foreground",
+        status="active",
+    )
+    text = {"type": "user", "message": {"content": "please list"}}
+    first = [text, _use("toolu_late", "Bash", {"command": "sleep 1"}, ts="2026-11-01T10:00:00Z")]
+    path = tmp_path / f"{SID}.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in first) + "\n")
+
+    async def fake_extract(**_kwargs):
+        return SimpleNamespace(
+            extractions=[], session_keywords=[], session_topic="", parse_error=None
+        )
+
+    monkeypatch.setattr(extraction_job, "_extract_chunk", fake_extract)
+
+    async def cycle():
+        await extraction_job.run_extraction_cycle(
+            db=db, store=AsyncMock(), router=AsyncMock(), transcript_dir=tmp_path
+        )
+
+    async def recorded():
+        cur = await db.execute("SELECT tool_use_id FROM tool_call_outcomes")
+        return [r[0] for r in await cur.fetchall()]
+
+    await cycle()
+    assert await recorded() == []  # still running: no result yet
+    with path.open("a") as f:
+        f.write(json.dumps(_result("toolu_late", "done", ts="2026-11-01T10:00:05Z")) + "\n")
+    await cycle()
+    assert await recorded() == ["toolu_late"]

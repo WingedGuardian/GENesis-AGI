@@ -27,29 +27,56 @@ What is written, and what deliberately is not:
   (``transcript_analytics.scrub.scrub_text``) and only then cut, so a cut never
   lands inside a credential the scrubber would have recognised whole. When the
   scrubber fails or withholds the text, the snippet is NULL and the failure is
-  still recorded.
+  still recorded. Text over the parser's bound is withheld there, not cut.
+* This writer does not rebuild a call older than the prune's row horizon, and
+  drops its failure text past the snippet horizon. A resumed session replays its
+  whole transcript, and ``INSERT OR IGNORE`` dedupes only against rows that
+  still exist, so without this a pruned call would come back until the next
+  prune. The Stop-hook sensor applies no such cutoff to its Edit/Write rows.
+* Outcomes are recorded after the extraction watermark moves; a failed record
+  is logged and not retried, so a session that has ended loses those calls.
 
-The kind of a failure and its reason are not stored: a reader derives them
-from ``tool_name`` and ``error_snippet`` with the same classifier, so the
-definition can change without re-keying stored rows.
+The kind of a failure is not stored yet, and it cannot be recomputed from the
+row: the classifier reads the full result text and the record's
+``toolDenialKind``, while the row keeps neither (the snippet is 400 scrubbed
+characters, and a hook prefix can close past character 1,500). Storing the
+class at write time needs its own schema change.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+import re
+from datetime import UTC, datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-# Stored characters of scrubbed failure text. Matches the classifier's own
-# head window (``transcript_analytics.classify._HEAD``), which is all a
-# reader needs to re-derive the class and the reason's first sentence.
+# Stored characters of scrubbed failure text: the classifier's own head window
+# (``transcript_analytics.classify._HEAD``). Enough to read the reason's first
+# sentence; not enough to re-derive the class (see the module docstring).
 SNIPPET_CHARS = 400
+
+# A JSON ``\uXXXX`` escape. The scrubber decodes escapes only inside a JSON
+# string that parses; inside an unterminated quote it falls back to plain text
+# and an escaped credential passes through. Measured: 'token=\u0073k-ant-…'
+# after an unclosed quote came out unredacted.
+_UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
 
 # Tools ``scripts/edit_failure_sensor.py`` records; this writer leaves them to it.
 SENSOR_TOOLS = frozenset({"Edit", "Write"})
 
 _scrub_unavailable_logged = False
+
+
+def _parse_ts(value: object) -> datetime | None:
+    """A transcript timestamp as an aware UTC datetime, or None if unparseable."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def _snippet(text: str | None) -> str | None:
@@ -71,6 +98,16 @@ def _snippet(text: str | None) -> str | None:
         return None
     if failed or not scrubbed:
         return None
+    if _UNICODE_ESCAPE.search(scrubbed):
+        # Fail closed on an escape the scrubber did not decode: decode a copy,
+        # scrub it, and store nothing if that copy held anything to redact.
+        decoded = _UNICODE_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), scrubbed)
+        try:
+            again, again_failed = scrub_text(decoded)
+        except Exception:  # noqa: BLE001 - as above
+            return None
+        if again_failed or again != decoded:
+            return None
     return scrubbed[:SNIPPET_CHARS]
 
 
@@ -81,8 +118,16 @@ def outcome_rows(spine: list[dict], *, fallback_session_id: str | None) -> list[
     ``(session_id, tool_name, file_path, success, error_snippet, timestamp,
     tool_use_id)``.
     """
+    from genesis.db.crud.tool_call_outcomes import (
+        ROW_RETENTION_DAYS,
+        SNIPPET_RETENTION_DAYS,
+    )
+
     rows: list[tuple] = []
-    now = datetime.now(UTC).isoformat()
+    now_dt = datetime.now(UTC)
+    now = now_dt.isoformat()
+    row_cut = now_dt - timedelta(days=ROW_RETENTION_DAYS)
+    text_cut = now_dt - timedelta(days=SNIPPET_RETENTION_DAYS)
     for entry in spine:
         if entry.get("type") != "tool" or not entry.get("has_result"):
             continue
@@ -90,15 +135,21 @@ def outcome_rows(spine: list[dict], *, fallback_session_id: str | None) -> list[
             continue
         if entry.get("tool") in SENSOR_TOOLS:
             continue  # module docstring: the Stop-hook sensor's tools
+        when = _parse_ts(entry.get("timestamp"))
+        if when is not None and when < row_cut:
+            continue  # past the prune's horizon: do not resurrect it
         failed = entry.get("failure_class") is not None
+        keep_text = failed and (when is None or when >= text_cut)
         rows.append(
             (
                 entry.get("session_id") or fallback_session_id,
                 entry.get("tool") or "unknown",
                 entry.get("file_path"),
                 0 if failed else 1,
-                _snippet(entry.get("failure_text")) if failed else None,
-                entry.get("timestamp") or now,
+                _snippet(entry.get("failure_text")) if keep_text else None,
+                # An unparseable stamp would never match the prune's datetime(),
+                # so the row (and its text) would outlive every horizon.
+                entry["timestamp"] if when is not None else now,
                 entry["tool_use_id"],
             )
         )
