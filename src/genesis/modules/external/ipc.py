@@ -15,6 +15,7 @@ import httpx
 
 from genesis.cc.child_env import FUNCTION_HOOKS_ENV
 from genesis.cc.types import CCModel, EffortLevel, model_supports_effort
+from genesis.mcp.local_modules import ModuleCleanupUnconfirmed
 from genesis.modules.external.config import IPCConfig
 from genesis.security.output_scanner import (
     LOCATION_FINDINGS,
@@ -88,29 +89,46 @@ class IPCAdapter(Protocol):
 class HttpIPCAdapter:
     """Communicates with external programs via HTTP REST API."""
 
-    def __init__(self, config: IPCConfig) -> None:
+    def __init__(self, config: IPCConfig, *, owner=None) -> None:
         if not config.url:
             raise ValueError("HTTP IPC requires a url in config")
         self._url = config.url.rstrip("/")
         self._timeout = config.timeout
         self._client: httpx.AsyncClient | None = None
+        self._owner = owner
 
     @property
     def needs_start(self) -> bool:
         return self._client is None
 
     async def start(self) -> None:
+        if self._owner is not None:
+            self._owner.require_unit()
+            if self._client is not None:
+                return
         self._client = httpx.AsyncClient(
             base_url=self._url,
             timeout=self._timeout,
         )
+        if self._owner is not None:
+            self._owner.retain_client(self._client)
 
     async def stop(self) -> None:
+        if self._owner is not None:
+            await self._owner.retire(self._client)
+            self._client = None
+            return
         if self._client:
             await self._client.aclose()
             self._client = None
 
     async def send(self, path: str, data: dict | None = None, method: str = "GET") -> dict:
+        if self._owner is not None:
+            with self._owner.use(self._client):
+                return await self._send(path, data, method)
+        return await self._send(path, data, method)
+
+    async def _send(self, path: str, data: dict | None = None, method: str = "GET") -> dict:
         if not self._client:
             raise RuntimeError("HTTP IPC not started")
         try:
@@ -137,6 +155,12 @@ class HttpIPCAdapter:
             return {"error": str(exc)}
 
     async def health_check(self, endpoint: str, expected_status: int) -> bool:
+        if self._owner is not None:
+            with self._owner.use(self._client):
+                return await self._health_check(endpoint, expected_status)
+        return await self._health_check(endpoint, expected_status)
+
+    async def _health_check(self, endpoint: str, expected_status: int) -> bool:
         if not self._client:
             return False
         try:
@@ -149,31 +173,53 @@ class HttpIPCAdapter:
 class StdioIPCAdapter:
     """Communicates with external programs via JSON lines over stdin/stdout."""
 
-    def __init__(self, config: IPCConfig) -> None:
+    def __init__(self, config: IPCConfig, *, owner=None) -> None:
         if not config.command:
             raise ValueError("stdio IPC requires a command in config")
         self._command = config.command
         self._cwd = config.working_dir
         # Merge with inherited environment so subprocess gets PATH, HOME, etc.
-        self._env = {**os.environ, **config.env} if config.env else None
+        self._config_env = dict(config.env or {})
         self._timeout = config.timeout
         self._process: asyncio.subprocess.Process | None = None
+        self._owner = owner
+        self._exchange = asyncio.Lock()
 
     @property
     def needs_start(self) -> bool:
         return self._process is None or self._process.returncode is not None
 
     async def start(self) -> None:
+        if self._owner is not None:
+            async with self._exchange:
+                if self.needs_start:
+                    if self._process is not None:
+                        previous, self._process = self._process, None
+                        await self._owner.retire(previous)
+                    self._process = await self._owner.spawn(*self._command, persistent=True,
+                        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE, cwd=self._cwd, env=self._spawn_env())
+            return
         self._process = await asyncio.create_subprocess_exec(
             *self._command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self._cwd,
-            env=self._env,
+            env=self._spawn_env(),
         )
 
+    def _spawn_env(self) -> dict[str, str]:
+        from genesis.caller_context import drop_client_label
+
+        return dict(drop_client_label({**os.environ, **self._config_env}))
+
     async def stop(self) -> None:
+        if self._owner is not None:
+            async with self._exchange:
+                previous, self._process = self._process, None
+                await self._owner.retire(previous)
+            return
         if self._process and self._process.returncode is None:
             self._process.terminate()
             try:
@@ -183,6 +229,25 @@ class StdioIPCAdapter:
             self._process = None
 
     async def send(self, path: str, data: dict | None = None, method: str = "GET") -> dict:
+        if self._owner is not None:
+            self._owner.require_unit()
+            async with self._exchange:
+                self._owner.require_unit()
+                try:
+                    return await self._send(path, data, method)
+                except BaseException:
+                    previous, self._process = self._process, None
+                    await self._owner.retire(previous)
+                    raise
+        return await self._send(path, data, method)
+
+    async def _response_error(self, error):
+        if self._owner is not None:
+            previous, self._process = self._process, None
+            await self._owner.retire(previous)
+        return error
+
+    async def _send(self, path: str, data: dict | None = None, method: str = "GET") -> dict:
         if not self._process or self._process.returncode is not None:
             raise RuntimeError("stdio process not running")
         request = json.dumps({"path": path, "method": method, "data": data or {}})
@@ -194,15 +259,15 @@ class StdioIPCAdapter:
                 timeout=self._timeout,
             )
             if not line:
-                return {"error": "process closed stdout"}
+                return await self._response_error({"error": "process closed stdout"})
             result = json.loads(line.decode().strip())
             if not isinstance(result, dict):
                 return {"data": result}
             return result
         except TimeoutError:
-            return {"error": "timeout waiting for response"}
+            return await self._response_error({"error": "timeout waiting for response"})
         except json.JSONDecodeError as exc:
-            return {"error": f"invalid JSON response: {exc}"}
+            return await self._response_error({"error": f"invalid JSON response: {exc}"})
 
     async def health_check(self, endpoint: str, expected_status: int) -> bool:
         if not self._process or self._process.returncode is not None:
@@ -210,6 +275,8 @@ class StdioIPCAdapter:
         try:
             result = await self.send(endpoint, method="GET")
             return "error" not in result
+        except ModuleCleanupUnconfirmed:
+            raise
         except Exception:
             return False
 
@@ -225,7 +292,7 @@ class SshIPCAdapter:
     Uses OpenSSH CLI (not paramiko) following the Guardian SSH pattern.
     """
 
-    def __init__(self, config: IPCConfig) -> None:
+    def __init__(self, config: IPCConfig, *, owner=None) -> None:
         if not config.ssh_host:
             raise ValueError("SSH IPC requires ssh_host in config")
         self._ssh_host = config.ssh_host
@@ -234,6 +301,12 @@ class SshIPCAdapter:
         self._remote_working_dir = config.remote_working_dir
         self._remote_claude_path = config.remote_claude_path
         self._timeout = config.timeout
+        self._owner = owner
+
+    async def _spawn(self, *args, **kwargs):
+        if self._owner is not None:
+            return await self._owner.spawn(*args, **kwargs)
+        return await asyncio.create_subprocess_exec(*args, **kwargs)
 
     @property
     def needs_start(self) -> bool:
@@ -361,17 +434,17 @@ class SshIPCAdapter:
         ssh_args = self._build_ssh_args(remote_cmd)
 
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await self._spawn(
                 *ssh_args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(input=prompt.encode()),
-                timeout=timeout_s,
-            )
+            stdout_bytes, stderr_bytes = await self._communicate(proc, timeout=timeout_s, input=prompt.encode())
         except TimeoutError:
+            if self._owner is not None:
+                await self._owner.retire(proc)
+                return {"error": f"SSH CC dispatch timed out after {timeout_s}s"}
             try:
                 proc.kill()
                 await proc.wait()
@@ -430,6 +503,13 @@ class SshIPCAdapter:
             )
         return failed
 
+    async def _communicate(self, proc, *, timeout, **kwargs):
+        try:
+            return await asyncio.wait_for(proc.communicate(**kwargs), timeout=timeout)
+        finally:
+            if self._owner is not None:
+                await self._owner.retire(proc)
+
     async def _send_shell(self, command: str) -> dict:
         """Run a raw shell command on the remote machine.
 
@@ -440,16 +520,16 @@ class SshIPCAdapter:
         """
         ssh_args = self._build_ssh_args(command)
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await self._spawn(
                 *ssh_args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=30,
-            )
+            stdout_bytes, stderr_bytes = await self._communicate(proc, timeout=30)
         except TimeoutError:
+            if self._owner is not None:
+                await self._owner.retire(proc)
+                return {"error": "SSH shell command timed out"}
             try:
                 proc.kill()
                 await proc.wait()
@@ -512,12 +592,13 @@ class SshIPCAdapter:
 
 def create_ipc_adapter(
     config: IPCConfig,
+    *, owner=None,
 ) -> HttpIPCAdapter | StdioIPCAdapter | SshIPCAdapter:
     """Factory: create the right IPC adapter from config."""
     if config.method == "http":
-        return HttpIPCAdapter(config)
+        return HttpIPCAdapter(config) if owner is None else HttpIPCAdapter(config, owner=owner)
     if config.method == "stdio":
-        return StdioIPCAdapter(config)
+        return StdioIPCAdapter(config) if owner is None else StdioIPCAdapter(config, owner=owner)
     if config.method == "ssh":
-        return SshIPCAdapter(config)
+        return SshIPCAdapter(config) if owner is None else SshIPCAdapter(config, owner=owner)
     raise ValueError(f"Unknown IPC method: {config.method}")

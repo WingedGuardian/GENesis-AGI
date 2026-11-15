@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 
-def install():
+def install(*, module_command=None):
     port = int(os.environ["LOCAL_HEALTH_TEST_PORT"])
     report = Path(os.environ["LOCAL_HEALTH_TEST_REPORT"])
     role = os.environ["LOCAL_HEALTH_TEST_ROLE"]
@@ -40,9 +40,14 @@ def install():
 
     class IdentityGitOnly(original_popen):
         def __init__(self, argv, *args, **kwargs):
-            if argv != ["git", "-C", str(root), "rev-parse", "HEAD"]:
+            module_allowed = (module_command is not None and list(argv) == module_command
+                              and kwargs.get('start_new_session') is True)
+            if argv != ["git", "-C", str(root), "rev-parse", "HEAD"] and not module_allowed:
                 raise PermissionError("health fixture refuses non-identity subprocesses")
             super().__init__(argv, *args, **kwargs)
+            if module_allowed:
+                stat = Path(f'/proc/{self.pid}/stat').read_text().rpartition(')')[2].split()
+                record('module-created', pid=self.pid, pgid=os.getpgid(self.pid), birth=stat[19])
 
     subprocess.Popen = IdentityGitOnly
 
@@ -169,3 +174,4 @@ def install():
     JSONResponse.render = render
     record("source", argv=sys.argv, script_sha256=hashlib.sha256(
         (root / "scripts/genesis_mcp_server.py").read_bytes()).hexdigest())
+    return record

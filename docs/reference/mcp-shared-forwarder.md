@@ -125,12 +125,90 @@ executing locally. This is a preflight, not an atomic upgrade lock; an unrelated
 non-routed schema change can also make the whole-catalog comparison refuse.
 
 The intermediate health process still initializes ordinary health resources.
-It establishes no memory saving or leak repair. Generic concurrent request
+It establishes no memory saving or general Codex MCP process-leak repair. Generic concurrent request
 callbacks from two independently allocating peers remain unqualified; current
 local Context uses are progress notifications. Payment peer constraints remain
 unchanged, and disposable protocol fixtures do not establish native payment or
 client acceptance. Final local ownership, remaining stages and matched
 all-process measurements still gate activation.
+
+### Local module resource lifetime
+
+Only the selected mixed health frontend binds a module resource owner and its
+adapter-cache generation. Ordinary/default, labelled and explicit shared-only
+launches retain their existing module lifecycle. The owner covers module
+readiness checks and execution, including degraded health startup without a
+database; listing configuration creates no physical resource unit.
+
+Local SSH subprocesses and stdio programs start in owned process groups.
+Cancellation retains the actual launch task, including before a process handle
+is returned. Confirmed group settlement, rather than the leader's return code,
+releases ownership. This does not prove a remote SSH job stopped.
+SSH retires each physical exchange before decoding or returning its result,
+including readiness before a later long operation. A retained stdio observer
+uses public leader status to trigger group settlement even when inherited or
+paused pipes keep `Process.wait()` pending. It is joined before owner closure;
+observation failure quarantines its generation. Prompt settlement removes the
+deliberate exchange/idle retention windows, but numeric process groups are not
+atomically bound to their original creation against every OS scheduling race.
+Stdio startup
+and exchanges are serialized; an abandoned or malformed exchange retires its
+group before a later explicit call, with no automatic operation replay. A
+well-formed business error does not itself invalidate a stdio exchange. Child
+environments are rebuilt at spawn and strip the caller's client label.
+
+Input EOF/error starts quiescence before the SDK joins handlers. The existing
+`shutdown_grace_s` permits accepted work to finish; after cancellation one
+30-second phase covers the frontend's cleanup, rather than thirty seconds per
+resource. This is an owner-approved reporting/intervention policy, not a normal
+execution timeout or a hard total-shutdown bound.
+Owner-initiated stopping cancels the operation's own scope and reports an
+explicit stopped-operation error. It does not cancel the SDK's handler task or
+unrelated calls. A stopped-operation reply alone does not certify cleanup;
+owner drainage separately reports any remaining uncertainty.
+Readiness and IPC execute in one retained async child within the frontend.
+Owner stopping targets that child's unit; the SDK handler shield-awaits it.
+External native and SDK request cancellation stay with the handler: it cancels
+and joins the exact child before re-delivering cancellation. Genuine caller
+cancellation therefore survives even when the child handles its own stop;
+no cumulative cancellation-counter heuristic is used. Unconfirmed cleanup takes
+precedence over caller cancellation; ordinary admission refusal does not. The
+selected adapter readiness/operation and stdio health wrappers preserve that
+uncertainty type instead of converting it to an ordinary error dictionary or
+unhealthy status. The bridge preserves
+context variables for this closed readiness/IPC callback; it is not a generic
+runner for tools borrowing SDK request-scoped dependencies.
+A supplied launch record delegates known-handle cancellation cleanup to this
+owner. The launch helper does not start its independent default confirmer for
+that recorded handle; callers without a record retain their existing strong
+drain behavior. Each resource retains its first retirement deadline; retrying after expiry
+can check absence but cannot obtain another termination attempt. Successful
+readiness retirement does not start a later operation's cancellation clock.
+Historical cancellation counts do not start that clock. A retirement entered
+with an active `CancelledError`, one interrupted while waiting, or unit
+finalization starts the unit's cleanup allowance; later retirement keeps it
+even after the exception is handled. A cancellation handler that has already
+finished before cleanup begins leaves ordinary retirement unaffected.
+Callbacks must begin cancellation cleanup at that boundary or use the unit
+finalizer. The owner does not infer hidden cancellation intent when a callback
+performs its first retirement inside a nested, unrelated exception handler.
+Caller cancellation publishes the earliest existing unit/resource/global
+allowance to child finalization before cancellation, with no renewed wait phase.
+A still-running admitted child is quarantined even when it has not acquired a
+physical resource yet. A pending launch, failed client close or unconfirmed
+group remains owned and refuses new module work.
+HTTP clients remain retained until their actual close task succeeds; a closed
+flag alone is not sufficient. Module drain must succeed before existing
+browser/database closers run. The complete owned teardown is retained and
+shielded so interrupted successful drainage finishes those closers before
+re-delivering cancellation; unknown drainage still withholds them.
+Missing handles never prove absence, and the
+in-memory registry provides no cross-crash adoption guarantee.
+
+This lifetime prerequisite retains heavy initialization, the default-off
+ceiling and existing routing/credentials. The final small local bootstrap,
+writes stage, native-client checks and matched all-process measurements remain
+activation gates.
 
 ## Explicit invocation
 

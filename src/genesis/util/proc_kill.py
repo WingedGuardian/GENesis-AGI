@@ -27,6 +27,7 @@ import logging
 import os
 import signal
 import subprocess
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,16 @@ class ProcessCleanupUncertain(RuntimeError):
     def __init__(self, message="Process cleanup is unconfirmed", *, process=None):
         super().__init__(message)
         self.process = process
+
+
+@dataclass
+class LaunchRecord:
+    """Single-use launch observation; the retaining resource owner settles it."""
+
+    task: asyncio.Task | None = None
+    process: asyncio.subprocess.Process | None = None
+    confirmed: bool = False
+    _claimed: bool = False
 
 
 def kill_process_group(proc, sig: signal.Signals = signal.SIGKILL) -> None:
@@ -116,6 +127,7 @@ async def confirm_process_exit(
     graceful: bool = False,
     escalation_grace_s: float = 0.0,
     confirm_timeout_s: float | None = None,
+    terminate: bool = True,
 ) -> None:
     """Opt-in strong drain: refusals are unknown, never proof of group exit.
 
@@ -131,17 +143,20 @@ async def confirm_process_exit(
     (``None`` resolves ``DEFAULT_REAP_TIMEOUT_S`` at call time, the same bound
     as the ordinary reap). Past it the group is reported as uncertain rather
     than watched forever; the caller keeps holding what it owns either way.
+    ``terminate=False`` only observes absence; an expired owned identity must
+    not acquire a fresh kill attempt when its retained cleanup is retried.
     """
     if confirm_timeout_s is None:
         confirm_timeout_s = DEFAULT_REAP_TIMEOUT_S
 
     async def drain():
-        if graceful:
+        if terminate and graceful:
             await reap_bounded(proc)
             if process_group_alive(proc):
                 await asyncio.sleep(escalation_grace_s)
-        with contextlib.suppress(OSError):
-            kill_process_group(proc)
+        if terminate:
+            with contextlib.suppress(OSError):
+                kill_process_group(proc)
         loop = asyncio.get_running_loop()
         give_up = loop.time() + confirm_timeout_s
         while True:
@@ -201,13 +216,28 @@ def _raised_by_popen(exc: BaseException) -> bool:
     return False
 
 
-async def spawn_owned(*args, **kwargs):
+async def spawn_owned(*args, launch_record: LaunchRecord | None = None, **kwargs):
     """Retain a managed subprocess launch until its process handle is known.
 
     Cancelling CPython's creation coroutine kills only the transport's leader.
     Shield it, then drain the group before delivering the caller's cancel.
+    With a launch_record, transfer the known handle to its retaining owner
+    instead: that owner must settle it under its own cleanup deadline.
     """
-    launch = asyncio.create_task(asyncio.create_subprocess_exec(*args, **kwargs))
+    if launch_record is not None:
+        if not isinstance(launch_record, LaunchRecord):
+            raise TypeError("launch_record must be a LaunchRecord")
+        if launch_record._claimed or launch_record.task is not None or launch_record.process is not None:
+            raise ValueError("LaunchRecord is already claimed")
+        launch_record._claimed = True
+    creation = asyncio.create_subprocess_exec(*args, **kwargs)
+    try:
+        launch = asyncio.create_task(creation)
+    except BaseException:
+        creation.close()
+        raise
+    if launch_record is not None:
+        launch_record.task = launch
     interrupted = False
     try:
         while not launch.done():
@@ -218,8 +248,12 @@ async def spawn_owned(*args, **kwargs):
         if launch.cancelled():
             raise ProcessCleanupUncertain("Process creation is unconfirmed")
         proc = launch.result()
+        if launch_record is not None:
+            launch_record.process = proc
     except Exception as exc:
         if _raised_by_popen(exc):
+            if launch_record is not None:
+                launch_record.confirmed = True
             # Popen failed with no child left (never forked, or exec failed
             # and CPython reaped it), so nothing is left to own. An ordinary
             # failure, not an uncertain one. A cancel received meanwhile
@@ -234,6 +268,10 @@ async def spawn_owned(*args, **kwargs):
         # ordinary/nonstreaming callers (they do not use this opt-in helper).
         raise ProcessCleanupUncertain("Process creation is unconfirmed") from None
     if interrupted:
+        if launch_record is not None:
+            # The registered owner retains this handle and its first cleanup
+            # deadline. A second default confirmer could signal after expiry.
+            raise asyncio.CancelledError
         try:
             await confirm_process_exit(proc)
         except ProcessCleanupUncertain as exc:

@@ -1643,7 +1643,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: 2d3c95cb7 2026-11-14
+verified: b750f654e 2026-11-15
 ```
 
 Scoped verification covers `mcp/shared_http` composition. It receives
@@ -1680,7 +1680,22 @@ whole-catalog equality remains a generation preflight. Ordinary memory now uses
 the same mixed SDK owner at `memory-floor` and `health-reads`, forwarding eight
 memory-floor tools and keeping other tools local. It retains heavy ordinary
 initialization, its existing lifespan, exact argv and the missing-DB refusal.
-The final local resource owner and write stages remain incomplete; native-client checks and
+The mixed health frontend also binds an opt-in module resource owner/cache
+generation. It retains actual subprocess launches and process groups, serializes
+stdio exchanges and retires ambiguous sessions without replay. SSH exchanges
+retire before their results return; persistent stdio leader exit triggers
+registered observation/settlement. Retried expired identities cannot gain a new
+termination attempt. Early input EOF
+starts quiescence before SDK joins; existing grace precedes an owner-approved
+30s post-cancel phase. Unknown resources/client closes retain ownership and
+prevent successful dependent closure.
+Handled cancellation history does not time healthy readiness or execution.
+Once cancellation cleanup starts, its unit allowance persists through later
+retirement and finalization, including cancellation received while waiting.
+Successful owned DB teardown retains the whole closer sequence through repeated
+cancellation; unknown module drainage still withholds browser/database closure.
+DB/no-DB preparation is wired; heavy
+initialization remains. The final small local bootstrap and write stages remain incomplete; native-client checks and
 matched measurements still gate registration changes. This does not reverify the
 whole entry on main; that landing-dependent obligation remains tracked in#4232. See
 `docs/reference/mcp-shared-forwarder.md`.
@@ -4014,7 +4029,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py, caller_context.py, caller_credentials.py]
-verified: e34ba4e4f 2026-11-08
+verified: b750f654e 2026-11-15
 ```
 
 Scoped verification covers the request-ownership prerequisite below and the
@@ -4022,6 +4037,12 @@ caller/activity boundary. Shared mode refuses process-environment identity
 through both accessors, including after environment drift; validated requests
 use `caller_context()`. Legacy reads remain raw and per-call. Other platform
 descriptions retain their individually cited dates. No shared activation.
+
+The module-owner prerequisite adds a single-use `LaunchRecord` observation/settlement-delegation seam
+to `util.proc_kill.spawn_owned`, without changing default managed callers.
+Known-exit confirmation is distinct from unreturned/uncertain creation. Stdio's
+child environment carries current-main's client-label drop; caller-role and
+native forwarding policy are not transplanted with that helper.
 
 The explicit stdio forwarder now has a read-only P3 header consumer in
 `caller_credentials.forwarder_headers`. It reuses existing identity and
@@ -4988,8 +5009,11 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 702274dfe 2026-11-05
+verified: b750f654e 2026-11-15
 ```
+
+The 2026-11-15 scoped verification covers the opt-in external-module ownership
+paths below. Other descriptions retain their individually cited evidence.
 
 - **modules/**: capability modules are "hands, not brain" — a module may
   observe Genesis but never participates in cognition, and MUST NOT set
@@ -4997,6 +5021,13 @@ verified: 702274dfe 2026-11-05
   (config/modules/*.yaml + auto-discovery; YAML wins), enabled-state persisted
   in DB. Shipped: content-pipeline (enabled, ALL auto-features OFF),
   crypto-ops, prediction-markets. GROUNDWORK: autonomous-distribution.
+  External IPC adapters accept optional internal ownership only for the selected
+  mixed-health frontend. Its module readiness/IPC runs in one retained async
+  child per operation, containing owner stops while preserving caller cancellation.
+  Its unit owns local SSH groups, persistent stdio and HTTP clients; pending
+  child work quarantines admission even before physical resource acquisition. Ordinary runtime registry/unload
+  behavior is unchanged; unresolved cleanup is retained rather than silently
+  adopted by a new cache generation.
 - **skills/**: skills are directories with SKILL.md — registration is catalog
   generation (`scripts/generate_skill_catalog.py` scans `.claude/skills/`,
   `src/genesis/skills/`, `~/.genesis/skill-library/` →
