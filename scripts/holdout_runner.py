@@ -405,17 +405,20 @@ def _group_alive(pgid: int) -> bool:
     if not proc_root.is_dir():
         return True
     seen = False
+    want = str(pgid).encode()
     for entry in proc_root.iterdir():
         if not entry.name.isdigit():
             continue
         try:
-            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+            # Bytes: a command name need not be valid UTF-8, and any process's
+            # name is read here, not only git's.
+            fields = (entry / "stat").read_bytes().rsplit(b")", 1)[1].split()
         except (OSError, IndexError):
             continue
         # After the command name: state, ppid, pgrp, ...
-        if len(fields) > 2 and fields[2] == str(pgid):
+        if len(fields) > 2 and fields[2] == want:
             seen = True
-            if fields[0] != "Z":
+            if fields[0] != b"Z":
                 return True
     # The group exists but /proc showed none of it: this /proc is not our pid
     # namespace, so it cannot tell zombies apart. Treat the group as alive.
@@ -740,8 +743,10 @@ class _Worktree:
             later: list[int] = []
             _deferred = later
             try:
-                _stop_git_group(proc)
-                self._discard()
+                try:
+                    _stop_git_group(proc)
+                finally:  # an error while stopping must not skip the discard
+                    self._discard()
             finally:
                 _deferred = None
             if later and not isinstance(exc, SystemExit):
