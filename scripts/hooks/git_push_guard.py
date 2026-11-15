@@ -5592,6 +5592,34 @@ def _commit_info(sha: str, repo: str | None) -> tuple[str, str, list[str]] | Non
     return full.lower(), tree, [p.lower() for p in parents]
 
 
+def _stepped_merges_spare_review(
+    pr_num: str,
+    repo: str | None,
+    reviewed_sha: str,
+    stepped: set[str],
+    clock: Callable[[], float],
+    stop_at: float,
+) -> bool:
+    """Whether the merges ``_no_change_note`` stepped over touched none of the
+    files the reviewed head itself changed. False whenever that cannot be
+    shown: the base tip or the contribution unreadable, GitHub's 300-file cap,
+    or the note's time bound spent."""
+    if clock() > stop_at:
+        return False
+    base = _pr_base_sha(pr_num, repo)
+    if not base or clock() > stop_at:
+        return False
+    reviewed = _pr_contribution(base, reviewed_sha, repo)
+    if reviewed is None or len(reviewed[2]) >= _COMPARE_FILE_CAP:
+        return False
+    names: set[str] = set()
+    for f in reviewed[2]:
+        if not isinstance(f, dict):
+            return False
+        names.update(n for n in (f.get("filename"), f.get("previous_filename")) if isinstance(n, str))
+    return not (stepped & names)
+
+
 def _no_change_note(
     pr_num: str, repo: str | None, budget: dict, *, clock: Callable[[], float] = time.monotonic
 ) -> str | None:
@@ -5614,8 +5642,14 @@ def _no_change_note(
     - A reviewed head matching its OWN tree does not count. Stepping back over a
       routine merge of main reaches the reviewed head after every catch-up, and
       a merge on top of a reviewed head is not a rewrite.
-    - A merge is stepped over only when it touches none of the PR's own files.
-      Code added while resolving a merge would otherwise hide behind it.
+    - A merge is stepped over only when it touches none of the PR's current
+      files AND none of the files the reviewed head itself changed. Code added
+      while resolving a merge would otherwise hide behind it, and so would a
+      merge that put a reviewed file back to the base (that file leaves the
+      PR's current list, though the merge changed reviewed code). The reviewed
+      head's contribution is read against the LIVE base tip, so a base
+      retargeted or rewritten after the review is measured against a base the
+      reviewer never saw: an accepted gap.
     - A review of the current head does not silence it: a clean re-review of an
       unchanged tree does not make the push claimed as a fix change anything.
 
@@ -5674,6 +5708,7 @@ def _no_change_note(
         return None
 
     own_files: set[str] | None = None
+    stepped: set[str] = set()  # every file a stepped-over merge touched
     current = head
     for _ in range(_NO_CHANGE_MAX_STEPS + 1):
         info = lookup(current)
@@ -5691,6 +5726,10 @@ def _no_change_note(
             ):
                 return None
             reviewed_sha, (_, reviewed_at) = max(others.items(), key=lambda kv: kv[1][0])
+            if stepped and not _stepped_merges_spare_review(
+                pr_num, repo, reviewed_sha, stepped, clock, stop_at
+            ):
+                return None
             same = "has" if current == head else f"steps back over merges to {current[:12]}, which has"
             return (
                 f"NOTE: PR #{pr_num} — head {head[:12]} {same} the same tree as "
@@ -5719,6 +5758,9 @@ def _no_change_note(
                 return None
             if f.get("filename") in own_files or f.get("previous_filename") in own_files:
                 return None
+            stepped.update(
+                n for n in (f.get("filename"), f.get("previous_filename")) if isinstance(n, str)
+            )
         current = parents[0]
     return None
 

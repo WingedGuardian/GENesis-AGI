@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -51,6 +52,7 @@ TREE = "a" * 40
 TREE_CODE = "c" * 40
 TREE_MERGE = "d" * 40
 PR_FILE = "tests/test_thing.py"
+BASE_TIP = "c0" * 20  # the base branch tip now
 
 
 def _budget(head, commits, marks, unresolved=()):
@@ -65,12 +67,29 @@ def _budget(head, commits, marks, unresolved=()):
     }
 
 
-def _seams(monkeypatch, *, infos=None, merge_files=None, pr_files=(PR_FILE,), head=None):
+def _seams(
+    monkeypatch,
+    *,
+    infos=None,
+    merge_files=None,
+    pr_files=(PR_FILE,),
+    head=None,
+    reviewed_files=(PR_FILE,),
+):
     # The head the note re-reads before firing across a merge; unset means an
     # empty read, which never equals a real head.
     monkeypatch.setenv("_TEST_GH_HEAD_SHA", head or "")
     monkeypatch.setenv("_TEST_GH_COMMIT_INFO", json.dumps(infos or {}))
-    contrib = {}
+    # The base tip, and the reviewed head's own contribution over it: what the
+    # reviewed head changed, which a stepped-over merge must not touch either.
+    monkeypatch.setenv("_TEST_GH_BASE_OID", BASE_TIP)
+    contrib = {
+        f"{BASE_TIP[:12]}..{REVIEWED[:12]}": {
+            "mb": BASE,
+            "status": "ahead",
+            "files": [{"filename": f} for f in reviewed_files],
+        }
+    }
     for (left, right), files in (merge_files or {}).items():
         contrib[f"{left[:12]}..{right[:12]}"] = {
             "mb": left,
@@ -369,3 +388,82 @@ def test_the_budget_records_clean_comments_on_heads_no_longer_in_the_pr():
         {"head": pushed_out[:10], "at": "2026-07-01T00:00:00+00:00"}
     ]
     assert got["marks"] == []  # still not a mark: round counting is unchanged
+
+
+def test_a_merge_that_drops_a_reviewed_file_stops_the_walk(guard, monkeypatch):
+    """Round-1 finding (Codex P2, Devin): the reviewed head changed two files; a
+    merge restored one of them to the base, so it left the PR's current file
+    list. The merge changed reviewed code, and must not be stepped over."""
+    dropped = "src/dropped.py"
+    _seams(
+        monkeypatch,
+        infos=_REVIEWED_INFO,
+        merge_files={(REWRITE, MERGE): [dropped, "src/main_side.py"]},
+        pr_files=(PR_FILE,),  # dropped.py is no longer in the PR's diff
+        reviewed_files=(PR_FILE, dropped),
+        head=MERGE,
+    )
+    budget = _budget(
+        MERGE,
+        [(REWRITE, TREE, [BASE]), (MERGE, TREE_MERGE, [REWRITE, MAIN])],
+        [(REVIEWED, "2026-11-01T00:00:00+00:00")],
+    )
+    assert guard._no_change_note("7", REPO, budget) is None
+
+
+def test_an_unreadable_reviewed_contribution_prints_nothing_across_a_merge(guard, monkeypatch):
+    _seams(
+        monkeypatch,
+        infos=_REVIEWED_INFO,
+        merge_files={(REWRITE, MERGE): ["src/main_side.py"]},
+        head=MERGE,
+    )
+    monkeypatch.setenv("_TEST_GH_BASE_OID", "")  # base tip unreadable
+    budget = _budget(
+        MERGE,
+        [(REWRITE, TREE, [BASE]), (MERGE, TREE_MERGE, [REWRITE, MAIN])],
+        [(REVIEWED, "2026-11-01T00:00:00+00:00")],
+    )
+    assert guard._no_change_note("7", REPO, budget) is None
+
+
+def _merged_budget():
+    return _budget(
+        MERGE,
+        [(REWRITE, TREE, [BASE]), (MERGE, TREE_MERGE, [REWRITE, MAIN])],
+        [(REVIEWED, "2026-11-01T00:00:00+00:00")],
+    )
+
+
+def test_a_missing_or_capped_reviewed_contribution_prints_nothing(guard, monkeypatch):
+    _seams(
+        monkeypatch, infos=_REVIEWED_INFO, merge_files={(REWRITE, MERGE): ["src/x.py"]}, head=MERGE
+    )
+    contrib = json.loads(os.environ["_TEST_GH_CONTRIBUTION"])
+    reviewed_key = f"{BASE_TIP[:12]}..{REVIEWED[:12]}"
+    missing = {k: v for k, v in contrib.items() if k != reviewed_key}
+    monkeypatch.setenv("_TEST_GH_CONTRIBUTION", json.dumps(missing))
+    assert guard._no_change_note("7", REPO, _merged_budget()) is None
+    capped = dict(contrib)
+    capped[reviewed_key] = {
+        "mb": BASE,
+        "status": "ahead",
+        "files": [{"filename": f"src/f{i}.py"} for i in range(guard._COMPARE_FILE_CAP)],
+    }
+    monkeypatch.setenv("_TEST_GH_CONTRIBUTION", json.dumps(capped))
+    assert guard._no_change_note("7", REPO, _merged_budget()) is None
+
+
+def test_a_reviewed_rename_source_counts_as_a_reviewed_file(guard, monkeypatch):
+    """The reviewed head renamed old.py to new.py; a merge touching old.py changed
+    reviewed code, so the walk must not step over it."""
+    _seams(
+        monkeypatch, infos=_REVIEWED_INFO, merge_files={(REWRITE, MERGE): ["src/old.py"]}, head=MERGE
+    )
+    contrib = json.loads(os.environ["_TEST_GH_CONTRIBUTION"])
+    contrib[f"{BASE_TIP[:12]}..{REVIEWED[:12]}"]["files"] = [
+        {"filename": PR_FILE},
+        {"filename": "src/new.py", "previous_filename": "src/old.py"},
+    ]
+    monkeypatch.setenv("_TEST_GH_CONTRIBUTION", json.dumps(contrib))
+    assert guard._no_change_note("7", REPO, _merged_budget()) is None
