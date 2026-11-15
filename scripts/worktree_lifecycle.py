@@ -2756,6 +2756,17 @@ def _recover_compacted(
               "changed.", file=sys.stderr)
         return False
     head, pin, original = meta["head"], meta["pin"], meta["original_path"]
+    # Recovery recreates with `git worktree add --force`, which REPLACES a
+    # registration still at this path, with its index and reflog. One left by
+    # an earlier recovery of this stub may hold work the pin does not: keep it.
+    later = _registration_beyond(compaction, lc, repo_root, original, head)
+    if later is not None:
+        print(f"{original} is still registered and {later}, so recovering it would "
+              "replace that registration and could lose that work. Nothing was "
+              "changed. If the checkout was moved, reconnect it with: git worktree "
+              "repair <its new path>; if it is no longer wanted, remove it with git "
+              "worktree remove (or prune) first.", file=sys.stderr)
+        return False
     pinned = (_run_git(repo_root, ["rev-parse", "--verify", "-q", f"{pin}^{{commit}}"],
                        timeout=15) or "").strip() == head
     branch = meta.get("branch") if isinstance(meta.get("branch"), str) else ""
@@ -2809,6 +2820,37 @@ def _recover_compacted(
                   "switch -c <name>")
         print(f"Compacted entry kept at {stub} (recovery does not consume it)")
     return ok
+
+
+def _registration_beyond(compaction, lc, repo_root: Path, original: str, head: str) -> str | None:
+    """Why the registration at ``original`` holds something ``head`` does not
+    (in compaction's own terms, `_loses_history`), or None when there is no
+    such registration or it holds nothing more. Unknown reads as a reason."""
+    admin_root = _admin_worktrees_dir(repo_root)
+    if admin_root is None:
+        return "its registrations could not be listed"
+    try:
+        admins = [p for p in admin_root.iterdir() if p.is_dir() and not p.is_symlink()]
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return f"its registrations could not be listed ({e})"
+    red = None
+    for admin in admins:
+        if _registration_path(admin) != original:
+            continue
+        reason = _read_lock_file(admin)
+        if reason is not None and _archive_entry_from_reason(reason) is not None:
+            # Another archive's history anchor: `_restore_from_dir` refuses it
+            # and names that archive, so this check must not advise removing it.
+            continue
+        red = red or _load_redundancy_module()
+        if red is None:
+            return "its registration could not be checked"
+        lost = compaction._loses_history(lc, red, repo_root, admin, head)
+        if lost is not None:
+            return lost.replace("its registration", "the registration", 1)
+    return None
 
 
 def _restore_from_dir(
@@ -3622,6 +3664,24 @@ def _reattach(
               f"Nothing was changed; the archive is intact at {where}. Retry --recover.",
               file=sys.stderr)
         return "abort"
+    # Compaction's mark goes FIRST, before the tree is placed, while the
+    # registration is still locked and directory-less. A kill at any later
+    # point leaves an UNMARKED registration, which compaction never takes for
+    # the anchor it was removing; a kill before it leaves a marked one with no
+    # tree placed, which is still that anchor. If the mark cannot be removed,
+    # nothing is placed and the registration stays locked.
+    try:
+        (admin / COMPACTION_MARK_FILE).unlink()
+        _fsync_path(admin)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        report["incomplete"] = True
+        print(f"Could not remove compaction's mark from the registration of "
+              f"{original_path} ({e}). Nothing was placed and the registration "
+              f"is still locked; the archive is intact at {where}. Remove "
+              f"{admin / COMPACTION_MARK_FILE} and retry --recover.", file=sys.stderr)
+        return "abort"
     dest = Path(original_path)
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -3675,21 +3735,8 @@ def _reattach(
     # an unlocked registration has nothing to release. The answer is checked: a
     # worktree left locked under the reaper's reason reads as an archive anchor to
     # expiry and to the zero-drop sweep, which is not what a recovered tree is.
-    #
-    # Compaction's mark goes FIRST, while the registration is still locked: a
-    # live, unlocked registration that still carried the mark could be taken for
-    # the anchor a stopped compaction was removing. If the mark cannot be
-    # removed, the lock stays, so the registration keeps reading as an archive
-    # anchor rather than as a live tree compaction might claim.
-    mark_failed = None
-    try:
-        (admin / COMPACTION_MARK_FILE).unlink()
-        _fsync_path(admin)
-    except FileNotFoundError:
-        pass
-    except OSError as e:
-        mark_failed = e
-    unlock_failed = owned and mark_failed is None and _run_git(
+    # (Compaction's mark was already retired before the tree was placed.)
+    unlock_failed = owned and _run_git(
         repo_root, ["worktree", "unlock", original_path], timeout=10) is None
 
     # The reaper's metadata goes; the worktree's own files stay.
@@ -3709,12 +3756,6 @@ def _reattach(
 
     report["mode"] = "reattached"
     print(f"Reattached {original_path} to its preserved registration.")
-    if mark_failed is not None:
-        report["incomplete"] = True
-        print(f"Could not remove compaction's mark from the registration of "
-              f"{original_path} ({mark_failed}), so it was left LOCKED. Remove "
-              f"{admin / COMPACTION_MARK_FILE} and then run: git worktree unlock "
-              f"{_shell_word(original_path)}", file=sys.stderr)
     if leftovers:
         # The tree is not as archived while the reaper's own files remain in it.
         report["incomplete"] = True

@@ -298,7 +298,7 @@ def _keep_reason(
         return "head tree could not be read"
     seen: set[str] = set()
     try:
-        unmatched = red._unmatched_members(stored, entry, tree, seen=seen)
+        unmatched = red._unmatched_members(stored, entry, tree, seen=seen, strict=True)
     except red._Unsafe as e:
         return str(e)
     except red._READ_ERRORS as e:

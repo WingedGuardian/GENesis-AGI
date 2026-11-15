@@ -28,9 +28,23 @@ _SCRIPT = _ROOT / "scripts" / "worktree_lifecycle.py"
 wl = private_module("worktree_lifecycle_compaction", _SCRIPT)
 
 
+# The fixture's own git never follows a caller's repository or index; the code
+# under test still sees them, which test_an_inherited_index_variable relies on.
+_GIT_LOCATION_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+)
+
+
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_LOCATION_VARS}
     return subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=check
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=check, env=env
     )
 
 
@@ -807,6 +821,95 @@ def test_a_recovery_killed_after_its_unlock_leaves_no_mark(repo, tmp_path, monke
     assert str(a["path"]) in _registered(repo), "the revived registration was pruned"
 
 
+def _held_compaction(repo, tmp_path, monkeypatch, name):
+    """An archive whose compaction stopped with its anchor still locked."""
+    a = _archive(repo, tmp_path, name)
+    real = wl._unlock_anchor
+    monkeypatch.setattr(wl, "_unlock_anchor", lambda anchor: False)
+    assert _compact(repo)["held"] == 1
+    monkeypatch.setattr(wl, "_unlock_anchor", real)
+    return a, _admin(repo, a["entry"])
+
+
+def _nothing_lost(repo, a) -> None:
+    assert str(a["path"]) in _registered(repo), "the registration was pruned"
+    _gc_now(repo)
+    assert _commit_exists(repo, a["head"])
+    assert _ref(repo, _pin_ref(a["entry"])) == a["head"]
+
+
+def test_a_recovery_killed_after_placing_the_tree_is_never_pruned(repo, tmp_path, monkeypatch):
+    """Killed straight after the tree is placed: the registration is still
+    locked but no longer marked, so no later run takes it for its anchor, even
+    once the checkout is moved aside with no new work."""
+    a, admin = _held_compaction(repo, tmp_path, monkeypatch, "placed")
+    real_place = wl._place_tree
+
+    def place_then_die(*args, **kw):
+        real_place(*args, **kw)
+        raise _Killed
+
+    monkeypatch.setattr(wl, "_place_tree", place_then_die)
+    with pytest.raises(_Killed):
+        wl._recover(a["entry"], repo, {})
+    monkeypatch.setattr(wl, "_place_tree", real_place)
+    assert a["path"].is_dir(), "control: the tree was placed"
+    assert not (admin / wl.COMPACTION_MARK_FILE).exists(), "the mark outlived the placement"
+
+    assert _compact(repo)["held"] == 1
+    a["path"].rename(tmp_path / "placed.moved")
+    counts = _compact(repo)
+
+    assert counts["resumed"] == 0 and counts["held"] == 1, counts
+    assert a["archive"].exists()
+    _nothing_lost(repo, a)
+
+
+def test_a_recovery_killed_before_placing_the_tree_loses_nothing(repo, tmp_path, monkeypatch):
+    """Killed after the mark is retired and before the tree is placed: the
+    registration is locked, unmarked and directory-less. Compaction holds it,
+    and a second recovery still brings the tree back."""
+    a, admin = _held_compaction(repo, tmp_path, monkeypatch, "unplaced")
+    real_place = wl._place_tree
+
+    def die(*args, **kw):
+        raise _Killed
+
+    monkeypatch.setattr(wl, "_place_tree", die)
+    with pytest.raises(_Killed):
+        wl._recover(a["entry"], repo, {})
+    monkeypatch.setattr(wl, "_place_tree", real_place)
+    assert not a["path"].exists(), "control: nothing was placed"
+    assert not (admin / wl.COMPACTION_MARK_FILE).exists(), "control: the mark was retired"
+
+    counts = _compact(repo)
+
+    assert counts["resumed"] == 0 and counts["held"] == 1, counts
+    assert a["archive"].exists()
+    _nothing_lost(repo, a)
+    report: dict = {}
+    assert wl._recover(a["entry"], repo, report) is True
+    assert report.get("mode") == "reattached", report
+    assert _git(a["path"], "rev-parse", "HEAD").stdout.strip() == a["head"]
+
+
+def test_a_mark_that_cannot_be_retired_places_nothing(repo, tmp_path, monkeypatch):
+    """The mark is removed before placement or not at all: when it cannot be,
+    recovery stops with the registration still locked and marked."""
+    a, admin = _held_compaction(repo, tmp_path, monkeypatch, "stuckmark")
+    mark = admin / wl.COMPACTION_MARK_FILE
+    mark.unlink()
+    mark.mkdir()  # unlink() now fails with an OSError that is not "not found"
+    report: dict = {}
+
+    assert wl._recover(a["entry"], repo, report) is False
+
+    assert report.get("incomplete") is True
+    assert not a["path"].exists(), "the tree was placed although the mark stayed"
+    assert _registered(repo)[str(a["path"])] == wl._archive_lock_reason(a["entry"])
+    assert a["archive"].exists()
+
+
 def test_a_held_branch_anchor_finishes_after_its_branch_is_deleted(repo, tmp_path, monkeypatch):
     """A locked anchor's HEAD moves only with the branch it names. Once the pin
     holds the head, a deleted branch must not hold the compaction for ever; the
@@ -849,6 +952,91 @@ def test_a_locked_anchor_with_a_commit_only_its_reflog_reaches_is_held(repo, tmp
 
     assert counts["held"] == 1, counts
     assert a["archive"].exists() and str(a["path"]) in _registered(repo)
+
+
+def _ignored_user_file(rel: str):
+    """Setup: ignore ``rel``'s top directory in a commit, then write a file the
+    user made there. Ignored, so the reaper's status check reads the tree clean."""
+
+    def setup(wt: Path) -> None:
+        top = rel.split("/")[0]
+        (wt / ".gitignore").write_text(f"{top}/\n")
+        _git(wt, "add", ".gitignore")
+        _git(wt, "commit", "-qm", f"ignore {top}")
+        (wt / rel).parent.mkdir(parents=True, exist_ok=True)
+        (wt / rel).write_text("only copy\n")
+
+    return setup
+
+
+@pytest.mark.parametrize(
+    "rel",
+    ["node_modules/private-notes.txt", ".venv/notes.txt", "config/.generated/keep.txt"],
+)
+def test_an_ignored_file_only_the_archive_holds_keeps_it(repo, tmp_path, rel):
+    """Expiry's allowlist (caches it may drop) is not compaction's: a file under
+    an ignored directory is in no commit and no bundle, so deleting the tarball
+    would lose its only copy."""
+    a = _archive(repo, tmp_path, "ignored", setup=_ignored_user_file(rel))
+    with __import__("tarfile").open(a["archive"]) as tf:
+        assert any(m.name.endswith(rel) for m in tf), "control: the archive holds it"
+
+    counts = _compact(repo)
+
+    assert counts["compacted"] == 0, counts
+    assert a["archive"].exists()
+    assert rel in counts["kept"][a["entry"]], counts["kept"]
+
+
+def test_python_bytecode_alone_still_compacts(repo, tmp_path):
+    """Bytecode is the one cache every tested worktree carries; it is rebuilt
+    from the sources the commit holds, so it never keeps an archive."""
+
+    def setup(wt: Path) -> None:
+        (wt / "pkg" / "__pycache__").mkdir(parents=True)
+        (wt / "pkg" / "__pycache__" / "m.cpython-312.pyc").write_bytes(b"\0bytecode")
+        (wt / ".gitignore").write_text("__pycache__/\n")
+        _git(wt, "add", ".gitignore")
+        _git(wt, "commit", "-qm", "ignore bytecode")
+
+    _archive(repo, tmp_path, "bytecode", setup=setup)
+    assert _compact(repo)["compacted"] == 1
+
+
+def test_a_second_recovery_never_replaces_a_registration_with_later_work(repo, tmp_path):
+    """Recovering a stub recreates the worktree; recovering it AGAIN, after new
+    detached work and a move, must not `worktree add --force` over that
+    registration: the pin holds only the archived head."""
+    a = _archive(repo, tmp_path, "twice")
+    assert _compact(repo)["compacted"] == 1
+    assert wl._recover(a["entry"], repo, {}) is True
+    (a["path"] / "later.txt").write_text("made after recovery\n")
+    _git(a["path"], "add", "-A")
+    _git(a["path"], "commit", "-qm", "after recovery")
+    later = _git(a["path"], "rev-parse", "HEAD").stdout.strip()
+    moved = tmp_path / "twice.moved"
+    a["path"].rename(moved)
+
+    assert wl._recover(a["entry"], repo, {}, dry_run=True) is False
+    assert wl._recover(a["entry"], repo, {}) is False
+
+    assert str(a["path"]) in _registered(repo), "the later registration was replaced"
+    _git(repo, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all")
+    _git(repo, "gc", "--prune=now", "-q")
+    assert _commit_exists(repo, later)
+    _git(repo, "worktree", "repair", str(moved))
+    assert _git(moved, "rev-parse", "HEAD").stdout.strip() == later
+
+
+def test_a_second_recovery_over_a_clean_registration_still_works(repo, tmp_path):
+    """A registration left at the pinned head with nothing beyond it is
+    replaced, as before: refusing it would strand a lossless recovery."""
+    a = _archive(repo, tmp_path, "clean2")
+    assert _compact(repo)["compacted"] == 1
+    assert wl._recover(a["entry"], repo, {}) is True
+    a["path"].rename(tmp_path / "clean2.moved")
+    assert wl._recover(a["entry"], repo, {}) is True
+    assert _git(a["path"], "rev-parse", "HEAD").stdout.strip() == a["head"]
 
 
 def test_the_pin_is_created_only_when_absent(repo, tmp_path):
@@ -911,6 +1099,13 @@ def test_a_symlinked_bundle_is_never_fetched(repo, tmp_path):
     assert counts["errors"] == 1 and counts["repinned"] == 0, counts
 
 
+def test_the_fixture_git_ignores_a_callers_repository_variables(repo, tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "not-a-repo"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "elsewhere.index"))
+    assert _git(repo, "rev-parse", "--absolute-git-dir").stdout.strip() == str(repo / ".git")
+    assert _git(repo, "ls-files").stdout.split() == ["seed.txt"]
+
+
 def test_an_inherited_index_variable_does_not_steer_the_gates(repo, tmp_path, monkeypatch):
     """A caller's GIT_INDEX_FILE must not make the index gate read another index."""
     _archive(repo, tmp_path, "envvar")
@@ -937,3 +1132,22 @@ def test_a_locked_anchor_whose_detached_head_moved_without_a_reflog_is_held(
     assert counts["resumed"] == 0 and counts["held"] == 1, counts
     _gc_now(repo)
     assert _commit_exists(repo, extra), "the anchor-only commit was collected"
+
+
+def test_a_second_recovery_over_another_archives_anchor_names_that_archive(repo, tmp_path, capsys):
+    """Recover A, commit, the path is archived again as B (B's locked anchor now
+    sits at the path), then recover A again: the refusal names archive B to
+    recover instead, never advice to remove B's anchor, its history's only hold."""
+    a = _archive(repo, tmp_path, "twice")
+    assert _compact(repo)["compacted"] == 1
+    assert wl._recover(a["entry"], repo, {}) is True
+    (a["path"] / "b.txt").write_text("b\n")
+    _git(a["path"], "add", "-A")
+    _git(a["path"], "commit", "-qm", "b")
+    rec = next(x for x in wl._list_worktrees(repo) if x["path"] == str(a["path"]))
+    assert wl._trash_worktree(rec, repo, lane="unmerged") is True
+    capsys.readouterr()
+    assert wl._recover(a["entry"] + ".compacted.json", repo, {}) is False
+    err = capsys.readouterr().err
+    assert "registered to another archive" in err, err
+    assert "worktree remove" not in err, err
