@@ -95,6 +95,28 @@ EVENTS = frozenset(
     }
 )
 
+#: The builder launcher's events (board/launcher.py, board/builder_watch.py).
+LAUNCHER_EVENTS = frozenset(
+    {
+        "launcher_enabled",
+        "launcher_disabled",
+        "move_absorbed",
+        "launch_refused",
+        "launch_queued",
+        "launch_withdrawn",
+        "builder_launching",
+        "builder_launched",
+        "launch_failed",
+        "builder_paused",
+        "builder_exited",
+        "builder_closed",
+        "ask_raised",
+        "ask_answered",
+    }
+)
+#: Never deleted by :func:`prune`.
+_NEVER_PRUNED = LAUNCHER_EVENTS | {"item_added"}
+
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 # owner/repo#123 — GitHub's own owner/name grammar (alnum, '-', '_', '.').
 _CARD = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*)/[A-Za-z0-9._-]+#[1-9][0-9]*$")
@@ -840,6 +862,28 @@ async def added_numbers(db: aiosqlite.Connection, *, repo: str) -> set[int]:
     return {row[0] for row in await cur.fetchall()}
 
 
+async def unsettled_launches(db: aiosqlite.Connection, *, repo: str, since: str) -> list[dict]:
+    """``builder_launching`` rows in *repo* written at or after *since* that have
+    no outcome: no ``builder_launched`` for their move and no ``launch_failed``
+    for their attempt (both share the attempt's change key)."""
+    cur = await db.execute(
+        "SELECT * FROM board_events l WHERE l.event = 'builder_launching' AND l.repo = ? "
+        "AND l.created_at >= ? "
+        "AND NOT EXISTS (SELECT 1 FROM board_events e WHERE e.event = 'builder_launched' "
+        "AND json_extract(e.detail, '$.key') = json_extract(l.detail, '$.key')) "
+        "AND NOT EXISTS (SELECT 1 FROM board_events f WHERE f.event = 'launch_failed' "
+        "AND f.observed_change_key = l.observed_change_key) ORDER BY l.id",
+        ((repo or "").lower(), since),
+    )
+    items = await _all(cur)
+    for item in items:
+        try:
+            item["detail"] = json.loads(item["detail"]) if item.get("detail") else {}
+        except ValueError:
+            item["detail"] = {"unparseable": True}
+    return items
+
+
 async def links_without_item(db: aiosqlite.Connection, *, repo: str) -> list[dict]:
     """``{"id", "issue_number"}`` of every link in *repo* whose project item
     is not recorded yet."""
@@ -864,8 +908,11 @@ async def prune(
     and events older than ``event_days``. Unverified questions and pointers are
     never pruned — they are open work and durable fact respectively — and
     neither are ``item_added`` events: they are the backfill's only memory of
-    what it added, so pruning one would re-add a card the owner removed. Returns
-    the real per-table deletion counts."""
+    what it added, so pruning one would re-add a card the owner removed. Nor are
+    the builder launcher's rows (:data:`LAUNCHER_EVENTS`): its cutoff is the
+    latest enable, and a move's final rows (launched, refused, absorbed, strikes)
+    are what stop it being evaluated again. Returns the real per-table deletion
+    counts."""
     for name, days in (("question_days", question_days), ("event_days", event_days)):
         if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
             raise ValueError(f"{name} must be a positive int")
@@ -883,7 +930,8 @@ async def prune(
         cur = await db.execute(f"DELETE FROM open_questions WHERE id IN ({doomed})", (q_cutoff,))
         questions = cur.rowcount
         cur = await db.execute(
-            "DELETE FROM board_events WHERE created_at < ? AND event != 'item_added'",
+            "DELETE FROM board_events WHERE created_at < ? AND event NOT IN "
+            f"({', '.join(repr(e) for e in sorted(_NEVER_PRUNED))})",
             (e_cutoff,),
         )
         events = cur.rowcount

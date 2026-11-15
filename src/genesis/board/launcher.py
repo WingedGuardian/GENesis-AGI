@@ -195,13 +195,16 @@ async def premise_rc(issue: int, repo: str) -> int:
 
 
 def mem_available_kb() -> int | None:
+    """Usable memory in KiB, capped by the container's cgroup limit: inside a
+    memory-limited container /proc/meminfo can describe the host's headroom."""
+    from genesis.hostmetrics.readings import read_memory
+
     try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1])
-    except (OSError, ValueError, IndexError):
+        mem = read_memory()
+    except Exception:
+        logger.warning("builder launcher: memory read failed", exc_info=True)
         return None
-    return None
+    return None if mem is None else mem.available // 1024
 
 
 def login_expiry() -> datetime | None:
@@ -294,7 +297,9 @@ class _Tick:
                 text,
                 OutreachRequest(
                     category=OutreachCategory.ALERT,
-                    topic="Builder launcher",
+                    # Outreach governance dedups on (signal_type, topic,
+                    # category), not source_id, so each line carries its own.
+                    topic=f"Builder launcher: {source_id}",
                     context=text,
                     salience_score=0.8,
                     signal_type="builder_launch",
@@ -384,6 +389,8 @@ def _open_pr_numbers(items: list[dict], tracker: str) -> set[int]:
         content = it.get("content") or {}
         if content.get("__typename") != "Issue":
             continue
+        if ((content.get("repository") or {}).get("nameWithOwner") or "").lower() != tracker:
+            continue  # another repo's issue N says nothing about tracker issue N
         nodes = (content.get("closedByPullRequestsReferences") or {}).get("nodes") or []
         if any(
             n
@@ -438,19 +445,9 @@ async def _run(rt, items: list[dict] | None, now: datetime) -> dict:
 
     cards = _build_cards(items)
     tick.out["candidates"] = len(cards)
-    if tick.out.get("enabled_now"):
-        if cards:
-            listed = ", ".join(f"#{c['number']}" for c in cards if c["number"])
-            await tick.notify(
-                f"Builder launcher armed. Cards already in Build are not launched: {listed}. "
-                "Move one out of Build and back to launch it.",
-                f"enabled:{tick.iso}",
-            )
-        tick.out["pre_enable"] = len(cards)
-        return tick.out
-
     fresh = [c for c in cards if c["moved"] is not None and c["moved"] > enabled_at]
     tick.out["pre_enable"] = len(cards) - len(fresh)
+    await _list_backlog(tick, [c for c in cards if c not in fresh])
     if not fresh:
         return tick.out
 
@@ -463,10 +460,15 @@ async def _run(rt, items: list[dict] | None, now: datetime) -> dict:
         busy = len(live_keys)  # fail closed: every live builder holds a place
     else:
         busy = sum(1 for k in live_keys if key_issues.get(k) not in open_prs)
+    # An attempt still starting (its unit alive, no session yet) holds a place
+    # too, whether or not its card is still in Build; counted once, here.
+    busy += await _pending_attempts(tick, sessions)
 
     for card in fresh:
-        # True when the move now holds a place: launched, still starting, or
-        # launched with an outcome nobody could read.
+        if tick.out.get("disarmed"):
+            break  # a disarm seen mid-pass ends it: no further checks or launches
+        # True when the move now holds a place: launched, or launched with an
+        # outcome nobody could read.
         if await _one(tick, card, sessions, key_issues, busy):
             busy += 1
             sessions = await tmux_sessions()
@@ -542,15 +544,13 @@ async def _settle(tick: _Tick, card: dict, history: list[dict], sessions: dict) 
     unit = (last.get("detail") or {}).get("unit")
     if unit and await unit_state(unit) != "gone":
         return "wait"
-    await tick.event(
-        "launch_failed",
-        key=key,
-        change_key=f"{key}#a{attempt}",
-        issue=card["number"],
-        item=card["item"],
-        attempt=attempt,
-        reason="no builder session after the launch",
-        strike=True,
+    await _strike(
+        tick,
+        card,
+        attempt,
+        "no builder session after the launch",
+        history,
+        (last.get("detail") or {}).get("slot"),
     )
     return None
 
@@ -584,7 +584,7 @@ async def _one(tick: _Tick, card: dict, sessions: dict, key_issues, busy: int) -
     settled = await _settle(tick, card, history, sessions)
     if settled is not None:
         tick.out["skipped"] += 1
-        return settled == "wait"
+        return False  # a starting attempt's place was counted up front
     history = await _history(tick.db, tick.tracker, number) or history
     if _strikes(history, key) >= MAX_STRIKES:
         tick.out["skipped"] += 1
@@ -681,13 +681,109 @@ def _install_hold(tick: _Tick, busy: int) -> tuple[str, str] | None:
         return "install:template", "the builder prompt template is missing"
     if not (root / "scripts" / "cc-slot.sh").is_file():
         return "install:script", "the slot script is missing"
-    try:
-        wired = GUARD_HOOK.name in (root / ".claude" / "settings.json").read_text()
-    except OSError:
-        wired = False
-    if not ((root / GUARD_HOOK).is_file() and wired):
+    if not ((root / GUARD_HOOK).is_file() and _guard_wired(root / ".claude" / "settings.json")):
         return "install:guard", "the builder guard is not installed"
     return None
+
+
+#: A Claude Code hook matcher made only of these is an exact list of tool names
+#: split on ``|`` or ``,``; anything else is a regex tested unanchored (READ:
+#: Claude Code hooks documentation, "matcher").
+_PLAIN_MATCHER = re.compile(r"[\w\- ,|]+")
+
+
+def _matcher_covers_bash(matcher: str) -> bool:
+    if matcher in ("", "*"):
+        return True
+    if _PLAIN_MATCHER.fullmatch(matcher):
+        return "Bash" in {part.strip() for part in re.split(r"[|,]", matcher)}
+    try:
+        return re.search(matcher, "Bash") is not None
+    except re.error:
+        return False
+
+
+def _guard_wired(settings: Path) -> bool:
+    """True when the settings run the builder guard as a PreToolUse hook on Bash:
+    a ``command`` hook whose command has a ``hooks/builder_guard.py`` word, in a
+    block whose matcher covers ``Bash`` by Claude Code's rules, with hooks not
+    disabled. A mention anywhere else does not count."""
+    import shlex
+
+    try:
+        data = json.loads(settings.read_text())
+        blocks = data["hooks"]["PreToolUse"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if not isinstance(data, dict) or data.get("disableAllHooks") is True:
+        return False
+    for block in blocks if isinstance(blocks, list) else []:
+        if not isinstance(block, dict) or not _matcher_covers_bash(block.get("matcher") or ""):
+            continue
+        for hook in block.get("hooks") or []:
+            if not isinstance(hook, dict) or hook.get("type") != "command":
+                continue
+            try:
+                words = shlex.split(str(hook.get("command", "")))
+            except ValueError:
+                continue
+            if "hooks/builder_guard.py" in words:
+                return True
+    return False
+
+
+async def _list_backlog(tick: _Tick, cards: list[dict]) -> None:
+    """Tell the owner once which cards were already in Build when the launcher
+    was armed: one row per card (``launch_queued``, hold ``pre_enable``), so a
+    first armed tick whose board read failed still lists them on the next."""
+    from genesis.db.crud import board as board_crud
+
+    listed = []
+    for card in cards:
+        if card["kind"] != "Issue" or card["repo"] != tick.tracker or not card["number"]:
+            continue
+        seen = await board_crud.list_events(
+            tick.db, repo=tick.tracker, issue_number=card["number"], limit=EVENT_READ_LIMIT
+        )
+        if _of_key(seen["items"], card["key"], *_FINAL_FOR_MOVE, "launch_queued"):
+            continue  # launched, refused, absorbed or already listed under this move
+        row = await tick.event(
+            "launch_queued",
+            key=card["key"],
+            change_key=f"{card['key']}#q:pre_enable",
+            issue=card["number"],
+            item=card["item"],
+            hold="pre_enable",
+            reason="it was in Build when the launcher was armed",
+        )
+        if row is not None:
+            listed.append(f"#{card['number']}")
+    if listed:
+        await tick.notify(
+            f"Builder launcher armed. Cards already in Build are not launched: "
+            f"{', '.join(listed)}. Move one out of Build and back to launch it.",
+            f"backlog:{tick.iso}",
+        )
+
+
+async def _pending_attempts(tick: _Tick, sessions: dict) -> int:
+    """Launch attempts still starting: no outcome yet, no session carrying the
+    move's key, and a unit that is not gone. Only the last hour is read: a launch
+    is bounded at :data:`LAUNCH_TIMEOUT_S` and its unit is stopped on timeout, so
+    an older attempt cannot still be starting."""
+    from genesis.db.crud import board as board_crud
+
+    since = (tick.now - timedelta(hours=1)).isoformat()
+    live = set(sessions.values())
+    pending = 0
+    for e in await board_crud.unsettled_launches(tick.db, repo=tick.tracker, since=since):
+        detail = e.get("detail") or {}
+        if detail.get("key") in live:
+            continue
+        unit = detail.get("unit")
+        if unit and await unit_state(unit) != "gone":
+            pending += 1
+    return pending
 
 
 def _render(template: str, *, issue: int, snapshot: Path, worktree: Path) -> str:
@@ -709,8 +805,7 @@ def _free_slot(sessions: dict, first: int) -> int:
 async def _strike(
     tick: _Tick, card: dict, attempt: int, reason: str, history: list[dict], slot: int | None
 ) -> None:
-    tick.out["failed"] += 1
-    await tick.event(
+    row = await tick.event(
         "launch_failed",
         key=card["key"],
         change_key=f"{card['key']}#a{attempt}",
@@ -720,6 +815,9 @@ async def _strike(
         reason=reason[:400],
         strike=True,
     )
+    if row is None:
+        return  # this attempt's outcome was already recorded
+    tick.out["failed"] += 1
     strikes = _strikes(history, card["key"]) + 1
     if strikes >= MAX_STRIKES:
         log = f" See ~/.genesis/logs/cc_exit_{slot}.log." if slot else ""
@@ -766,6 +864,12 @@ async def _launch(tick: _Tick, card: dict, facts: dict, sessions: dict, history)
     slot = _free_slot(sessions, tick.settings["first_slot"])
     session_id = str(uuid.uuid4())
     unit = f"genesis-builder-{number}-{uuid.uuid4().hex[:8]}"
+    # The checks above took network round trips; a disarm (or the kill switch)
+    # in the meantime cancels the launch before its gate row exists.
+    if not board_config.builder_launch_armed()[0]:
+        tick.out["skipped"] += 1
+        tick.out["disarmed"] = True
+        return False
 
     # The gate: one approval row per attempt that runs, resolved as the move's
     # own approval and consumed BEFORE anything starts. Any failure: no launch.
@@ -831,6 +935,22 @@ async def _launch(tick: _Tick, card: dict, facts: dict, sessions: dict, history)
         "--prompt-file",
         str(prompt),
     ]
+    if not board_config.builder_launch_armed()[0]:
+        # Disarmed after the gate: nothing has started, so this attempt closes
+        # as a failure that is not a strike.
+        tick.out["skipped"] += 1
+        tick.out["disarmed"] = True
+        await tick.event(
+            "launch_failed",
+            key=key,
+            change_key=f"{key}#a{attempt}",
+            issue=number,
+            item=card["item"],
+            attempt=attempt,
+            reason="the launcher was disarmed",
+            strike=False,
+        )
+        return False
     rc, output = await run_launch(argv)
     if rc == 124:
         await stop_unit(unit)

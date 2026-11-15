@@ -4,6 +4,7 @@ ever does."""
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
@@ -25,9 +26,11 @@ SETTINGS = {"capacity": 1, "min_free_gb": 4, "login_margin_hours": 6, "first_slo
 class FakeOutreach:
     def __init__(self):
         self.sent: list[tuple[str, str]] = []
+        self.topics: list[str] = []
 
     async def submit_raw(self, text, request, **_):
         self.sent.append((text, request.source_id))
+        self.topics.append(request.topic)
 
 
 class FakeRT:
@@ -97,7 +100,8 @@ class World:
         (self.root / "scripts" / "cc-slot.sh").write_text("#!/bin/sh\n")
         (self.root / launcher.GUARD_HOOK).write_text("# guard\n")
         (self.root / ".claude" / "settings.json").write_text(
-            '{"hooks": {"PreToolUse": [{"command": "scripts/hooks/builder_guard.py"}]}}'
+            '{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", '
+            '"command": "x/.claude/hooks/genesis-hook hooks/builder_guard.py"}]}]}}'
         )
         self.builders = tmp_path / "builders"
         self.reset()
@@ -314,9 +318,19 @@ async def test_cards_in_build_at_enable_are_listed_once_and_never_launched(db, w
     rt, out = await _run(db, [old])  # the first armed tick
     assert out.get("enabled_now") and world.launches == []
     assert "#3" in rt._outreach_pipeline.sent[0][0]
-    _, out = await _run(db, [old], now=_later(1))
-    assert world.launches == [] and out["pre_enable"] == 1
-    assert [e["event"] for e in await _events(db)] == ["launcher_enabled"]
+    rt2, out = await _run(db, [old], now=_later(1))
+    assert world.launches == [] and out["pre_enable"] == 1 and rt2._outreach_pipeline.sent == []
+    assert [e["event"] for e in await _events(db)] == ["launcher_enabled", "launch_queued"]
+    [row] = await _events(db, "launch_queued")
+    assert row["detail"]["hold"] == "pre_enable"
+
+
+async def test_a_first_armed_tick_with_no_board_read_still_lists_the_backlog(db, world):
+    old = _card("I1", number=3, moved=NOW - timedelta(days=1))
+    rt, _ = await _run(db, None)
+    assert rt._outreach_pipeline.sent == []
+    rt, _ = await _run(db, [old], now=_later(1))
+    assert "#3" in rt._outreach_pipeline.sent[0][0] and world.launches == []
 
 
 async def test_re_arming_moves_the_cutoff(db, world):
@@ -333,6 +347,7 @@ async def test_re_arming_moves_the_cutoff(db, world):
         "launcher_enabled",
         "launcher_disabled",
         "launcher_enabled",
+        "launch_queued",  # listed to the owner once as already in Build at re-arm
     ]
 
 
@@ -861,3 +876,254 @@ async def test_launch_facts_names_a_missing_issue():
 
     with pytest.raises(pv.ProjectsError, match="^no issue #7"):
         await pv.launch_facts("owner", "repo", 7, runner=runner)
+
+
+# ── PR review round 1 ───────────────────────────────────────────────────────
+
+
+async def test_each_owner_line_has_its_own_dedup_identity(db, world):
+    """Outreach governance dedups on (signal_type, topic, category), not source_id."""
+    await _arm(db)
+    world.sessions["cc-3"] = "other-key"
+    rt, _ = await _run(db, [_card("I1", number=7), _card("I2", number=8)])
+    assert len(rt._outreach_pipeline.topics) == 2
+    assert len(set(rt._outreach_pipeline.topics)) == 2
+
+
+async def test_disarming_during_the_checks_cancels_the_launch(db, world, monkeypatch):
+    await _arm(db)
+
+    async def premise_then_disarm(issue, repo):
+        world.armed = (False, "builder_launch.enabled is not true")
+        return 0
+
+    monkeypatch.setattr(launcher, "premise_rc", premise_then_disarm)
+    _, out = await _run(db, [_card()])
+    assert world.launches == [] and await _approvals(db) == [] and out["launched"] == 0
+
+
+async def test_disarming_after_the_gate_closes_the_attempt_without_a_strike(db, world, monkeypatch):
+    from genesis.autonomy.approval import ApprovalManager
+
+    await _arm(db)
+    real = ApprovalManager.resolve
+
+    async def resolve_then_disarm(self, *a, **k):
+        world.armed = (False, "builder_launch.enabled is not true")
+        return await real(self, *a, **k)
+
+    monkeypatch.setattr(ApprovalManager, "resolve", resolve_then_disarm)
+    await _run(db, [_card()])
+    assert world.launches == []
+    [failed] = await _events(db, "launch_failed")
+    assert failed["detail"]["strike"] is False and "disarmed" in failed["reason"]
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        '{"note": "hooks/builder_guard.py"}',
+        '{"hooks": {"PreToolUse": [{"matcher": "Write", "hooks": [{"type": "command", '
+        '"command": "x/genesis-hook hooks/builder_guard.py"}]}]}}',
+        '{"hooks": {"PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", '
+        '"command": "x/genesis-hook hooks/builder_guard.py"}]}]}}',
+        "not json",
+    ],
+)
+async def test_a_guard_named_but_not_wired_on_bash_holds(db, world, settings):
+    await _arm(db)
+    (world.root / ".claude" / "settings.json").write_text(settings)
+    _, out = await _run(db, [_card()])
+    assert out["held"] == 1 and world.launches == []
+    [row] = await _events(db, "launch_queued")
+    assert row["detail"]["hold"] == "install:guard"
+
+
+@pytest.mark.parametrize("matcher", ["Bash", ".*", "", "Bash|Edit"])
+def test_the_guard_counts_as_wired_on_any_matcher_that_covers_bash(tmp_path, matcher):
+    f = tmp_path / "settings.json"
+    f.write_text(
+        '{"hooks": {"PreToolUse": [{"matcher": "%s", "hooks": [{"type": "command", '
+        '"command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/builder_guard.py"}]}]}}'.replace(
+            "%s", matcher
+        )
+    )
+    assert launcher._guard_wired(f) is True
+
+
+async def test_an_attempt_still_starting_for_a_card_that_left_build_holds_its_place(db, world):
+    await _arm(db)
+    gone = _card("I9", number=9)
+    async with board_crud.owned_connection(db) as own:
+        await board_crud.append_event(
+            own,
+            event="builder_launching",
+            now=NOW.isoformat(),
+            repo=REPO,
+            issue_number=9,
+            attempt=1,
+            worker="board_launcher",
+            observed_change_key=f"{_key(gone)}#a1",
+            detail={"key": _key(gone), "slot": 9, "session_id": "s", "unit": "genesis-builder-9-x"},
+        )
+    world.active_units.add("genesis-builder-9-x")
+    _, out = await _run(db, [_card("I1", number=7)])
+    assert world.launches == [] and out["held"] == 1
+
+
+async def test_another_repos_issue_does_not_free_a_tracker_builders_place(db, world):
+    await _arm(db)
+    first = _card("I1", number=5)
+    world.facts = _facts(number=5)
+    await _run(db, [first])
+    pr = {
+        "number": 9,
+        "state": "OPEN",
+        "isCrossRepository": False,
+        "repository": {"nameWithOwner": REPO},
+    }
+    foreign = _card("X5", number=5, repo="other/repo", status="In Review", closers=[pr])
+    world.facts = _facts(number=8)
+    _, out = await _run(db, [first, foreign, _card("I2", number=8)], now=_later(1))
+    assert len(world.launches) == 1 and out["held"] == 1
+
+
+async def test_a_third_strike_found_by_settling_tells_the_owner(db, world):
+    await _arm(db)
+    world.launch_rc = 1
+    for n in range(2):
+        await _run(db, [_card()], now=_later(n))
+    card = _card()
+    async with board_crud.owned_connection(db) as own:
+        await board_crud.append_event(
+            own,
+            event="builder_launching",
+            now=NOW.isoformat(),
+            repo=REPO,
+            issue_number=7,
+            attempt=3,
+            worker="board_launcher",
+            observed_change_key=f"{_key(card)}#a3",
+            detail={"key": _key(card), "slot": 9, "session_id": "s", "unit": "gone-unit"},
+        )
+    rt, _ = await _run(db, [card], now=_later(3))
+    assert any("3 times" in t for t, _ in rt._outreach_pipeline.sent)
+
+
+def test_free_memory_is_the_cgroup_reading(monkeypatch):
+    from genesis.hostmetrics import readings
+
+    monkeypatch.setattr(
+        readings, "read_memory", lambda: readings.Memory(18 << 30, 3 << 30, "cgroup")
+    )
+    assert launcher.mem_available_kb() == 3 * 1024 * 1024
+    monkeypatch.setattr(readings, "read_memory", lambda: None)
+    assert launcher.mem_available_kb() is None
+
+
+# ── adversarial audit of the round-1 fix ────────────────────────────────────
+
+
+def test_the_launchers_owner_lines_dedup_on_their_topic_alone():
+    from genesis.outreach import governance
+
+    assert "builder_launch" in governance._TOPIC_IS_IDENTITY
+
+
+@pytest.mark.parametrize(
+    ("matcher", "covers"),
+    [
+        ("*", True),
+        ("", True),
+        ("Bash", True),
+        ("Edit, Bash", True),
+        ("Edit|Bash", True),
+        ("Ba.h", True),
+        ("Edit", False),
+        ("Bash2", False),
+        ("[", False),
+    ],
+)
+def test_matchers_follow_claude_codes_rules(matcher, covers):
+    assert launcher._matcher_covers_bash(matcher) is covers
+
+
+@pytest.mark.parametrize(
+    ("command", "wired"),
+    [
+        ("x/genesis-hook hooks/builder_guard.py", True),
+        ("[ -d x ] || exit 0; x/genesis-hook hooks/builder_guard.py", True),
+        ("echo hooks/builder_guard.py.bak", False),
+    ],
+)
+def test_the_guard_command_must_run_the_hook(tmp_path, command, wired):
+    f = tmp_path / "s.json"
+    f.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PreToolUse": [
+                        {"matcher": "Bash", "hooks": [{"type": "command", "command": command}]}
+                    ]
+                }
+            }
+        )
+    )
+    assert launcher._guard_wired(f) is wired
+
+
+def test_disabled_hooks_mean_no_guard(tmp_path):
+    f = tmp_path / "s.json"
+    f.write_text(
+        json.dumps(
+            {
+                "disableAllHooks": True,
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "x/genesis-hook hooks/builder_guard.py",
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
+        )
+    )
+    assert launcher._guard_wired(f) is False
+
+
+async def test_an_attempt_older_than_an_hour_no_longer_holds_a_place(db, world):
+    await _arm(db, at=NOW - timedelta(days=1))
+    old = _card("I9", number=9)
+    async with board_crud.owned_connection(db) as own:
+        await board_crud.append_event(
+            own,
+            event="builder_launching",
+            now=(NOW - timedelta(hours=2)).isoformat(),
+            repo=REPO,
+            issue_number=9,
+            attempt=1,
+            worker="board_launcher",
+            observed_change_key=f"{_key(old)}#a1",
+            detail={"key": _key(old), "slot": 9, "session_id": "s", "unit": "u-old"},
+        )
+    world.active_units.add("u-old")
+    _, out = await _run(db, [_card("I1", number=7)])
+    assert out["launched"] == 1
+
+
+async def test_a_repeated_strike_row_neither_counts_nor_tells_the_owner_twice(db, world):
+    await _arm(db)
+    card = _card()
+    tick = launcher._Tick(FakeRT(db), NOW, REPO)
+    hist = []
+    for _ in range(2):
+        await launcher._strike(
+            tick, {**card, "key": _key(card), "number": 7, "item": "I1"}, 3, "rc 1", hist, 9
+        )
+    assert tick.out["failed"] == 1
