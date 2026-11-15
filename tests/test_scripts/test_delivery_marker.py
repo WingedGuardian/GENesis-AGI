@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import sys
 from pathlib import Path
 
 import pytest
@@ -271,11 +272,15 @@ class FakeGh:
         self.reviews = list(reviews)
         self.me, self.heads, self.linked = me, list(heads), list(linked)
         self.bodies, self.owner_type, self.role = list(bodies), owner_type, role
+        self.diff = "diff --git a/scripts/x.py b/scripts/x.py\n+fixed\n"
+        self.private = "false"
         self.calls: list[list[str]] = []
 
-    def __call__(self, args):
+    def __call__(self, args, timeout=None):
         self.calls.append(args)
         path = args[1] if args[0] == "api" else ""
+        if args[:2] == ["pr", "diff"]:
+            return self.diff
         if args[:2] == ["pr", "view"]:
             return "".join(json.dumps(i) + "\n" for i in self.linked)
         if args[:2] == ["repo", "view"]:
@@ -283,7 +288,7 @@ class FakeGh:
         if path == "user":
             return self.me + "\n"
         if path == "repos/Own/repo":
-            return self.owner_type + "\n"
+            return (self.private if ".private" in args else self.owner_type) + "\n"
         if path.startswith("orgs/"):
             if self.role is None:
                 raise dm_refused("HTTP 404")
@@ -440,7 +445,7 @@ def test_compose_refuses_at_the_rest_file_cap(dm, monkeypatch, tmp_path, capsys)
 
 
 def test_compose_refuses_on_a_gh_failure(dm, monkeypatch, tmp_path, capsys):
-    def boom(args):
+    def boom(args, timeout=None):
         raise dm.Refused("gh api failed: HTTP 502")
 
     rc, _, cap = _compose(dm, monkeypatch, tmp_path, capsys, boom, "--intended", "read")
@@ -859,3 +864,287 @@ def test_read_warns_on_each_marker_when_the_basis_cannot_be_derived(dm, monkeypa
     monkeypatch.setattr(dm, "_gh", FakeGh(body="Spec: a/b\n", comments=[row]))
     assert dm.main(["read", "--pr", "7"]) == 0
     assert "cannot be derived now" in capsys.readouterr().out
+
+
+# ── the shadow second reader ─────────────────────────────────────────────────
+
+_ASKED = 'Asked: "the gate must bind HEAD"\n- DONE: x (`scripts/x.py:4`)\n'
+
+
+def _reader(tmp_path, body):
+    script = tmp_path / "reader.py"
+    script.write_text(body)
+    return script
+
+
+def _configure(monkeypatch, tmp_path, cmd):
+    home = tmp_path / "gh_home"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "genesis.yaml").write_text(
+        "delivery:\n  second_reader_cmd: " + json.dumps(cmd) + "\n"
+        if cmd is not None
+        else "other: 1\n"
+    )
+    monkeypatch.setenv("GENESIS_HOME", str(home))
+    return home / "delivery" / "shadow.jsonl"
+
+
+_ECHO = (
+    "import json, sys\n"
+    "d = json.load(sys.stdin)\n"
+    "assert d['form'] == 'F1' and 'the gate must bind HEAD' in d['question'] and '+fixed' in d['diff']\n"
+    "print(json.dumps({'p': 0.4242, 'model': 'test-model-1'}))\n"
+)
+
+
+def test_second_reader_logs_the_score_and_never_prints_it(dm, monkeypatch, tmp_path, capsys):
+    log = _configure(monkeypatch, tmp_path, [sys.executable, str(_reader(tmp_path, _ECHO))])
+    rc, out, cap = _compose(
+        dm,
+        monkeypatch,
+        tmp_path,
+        capsys,
+        FakeGh(),
+        "--intended",
+        "read",
+        "--second-reader",
+        prose=_ASKED,
+    )
+    assert rc == 0 and out.exists()
+    [rec] = [json.loads(x) for x in log.read_text().splitlines()]
+    assert rec["p"] == 0.4242 and rec["form"] == "F1" and rec["model"] == "test-model-1"
+    assert (
+        rec["pr"] == 7
+        and rec["head"] == HEAD
+        and rec["verdict"] == "DELIVERS"
+        and rec["error"] is None
+    )
+    assert "0.42" not in cap.out + cap.err and "recorded" in cap.err
+    assert "0.42" not in out.read_text()
+
+
+def test_no_configured_command_runs_nothing(dm, monkeypatch, tmp_path, capsys):
+    log = _configure(monkeypatch, tmp_path, None)
+    rc, _, cap = _compose(
+        dm,
+        monkeypatch,
+        tmp_path,
+        capsys,
+        FakeGh(),
+        "--intended",
+        "read",
+        "--second-reader",
+        prose=_ASKED,
+    )
+    assert rc == 0 and "none configured" in cap.err and not log.exists()
+
+
+def test_without_the_flag_nothing_runs(dm, monkeypatch, tmp_path, capsys):
+    log = _configure(monkeypatch, tmp_path, [sys.executable, str(_reader(tmp_path, _ECHO))])
+    rc, _, cap = _compose(
+        dm, monkeypatch, tmp_path, capsys, FakeGh(), "--intended", "read", prose=_ASKED
+    )
+    assert rc == 0 and not log.exists() and "second reader" not in cap.err
+
+
+@pytest.mark.parametrize(
+    "body, prose, why",
+    [
+        (f"Ledger: {HEX32}\n", _ASKED, "not a public issue"),
+        ("Spec: some-spec\n", _ASKED, "not a public issue"),
+        ("Closes #4602\n", "- DONE: x (`scripts/x.py:4`)\n", "no Asked"),
+    ],
+)
+def test_private_bases_and_missing_fix_text_are_skipped(
+    dm, monkeypatch, tmp_path, capsys, body, prose, why
+):
+    log = _configure(
+        monkeypatch, tmp_path, [sys.executable, "-c", "raise SystemExit('must not run')"]
+    )
+    extra = ["--intended", "read"] if body.startswith("Closes") else []
+    rc, _, cap = _compose(
+        dm, monkeypatch, tmp_path, capsys, FakeGh(body=body), *extra, "--second-reader", prose=prose
+    )
+    assert rc == 0 and why in cap.err and not log.exists()
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        "import sys; sys.exit(3)",
+        "print('not json')",
+        "import json; print(json.dumps({'p': 1.5}))",
+        "import json; print(json.dumps({'p': True}))",
+        "import json; print(json.dumps(['p', 0.5]))",
+    ],
+)
+def test_a_failing_reader_is_logged_and_never_stops_compose(
+    dm, monkeypatch, tmp_path, capsys, reader
+):
+    log = _configure(monkeypatch, tmp_path, [sys.executable, str(_reader(tmp_path, reader))])
+    rc, out, cap = _compose(
+        dm,
+        monkeypatch,
+        tmp_path,
+        capsys,
+        FakeGh(),
+        "--intended",
+        "read",
+        "--second-reader",
+        prose=_ASKED,
+    )
+    assert rc == 0 and out.exists() and "failed" in cap.err
+    [rec] = [json.loads(x) for x in log.read_text().splitlines()]
+    assert rec["p"] is None and rec["error"]
+
+
+def test_an_oversized_diff_is_not_sent(dm, monkeypatch, tmp_path, capsys):
+    log = _configure(
+        monkeypatch, tmp_path, [sys.executable, "-c", "raise SystemExit('must not run')"]
+    )
+    gh = FakeGh()
+    gh.diff = "x" * (dm._DIFF_CAP + 1)
+    rc, _, cap = _compose(
+        dm, monkeypatch, tmp_path, capsys, gh, "--intended", "read", "--second-reader", prose=_ASKED
+    )
+    assert rc == 0 and "over" in cap.err
+    [rec] = [json.loads(x) for x in log.read_text().splitlines()]
+    assert rec["p"] is None and "over" in rec["error"]
+
+
+@pytest.mark.parametrize(
+    "yaml_text, argv0",
+    [
+        ("delivery:\n  second_reader_cmd: '~/bin/r --x'\n", "/bin/r"),
+        ("delivery:\n  second_reader_cmd: [a, b]\n", "a"),
+        ("delivery:\n  second_reader_cmd: 7\n", None),
+        ("delivery: 3\n", None),
+        ("- a\n- b\n", None),
+        (": : :\n", None),
+    ],
+)
+def test_second_reader_cmd_reads_only_a_string_or_list(dm, monkeypatch, tmp_path, yaml_text, argv0):
+    home = tmp_path / "h"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "genesis.yaml").write_text(yaml_text)
+    monkeypatch.setenv("GENESIS_HOME", str(home))
+    got = dm.second_reader_cmd()
+    assert (got is None) if argv0 is None else got[0].endswith(argv0)
+
+
+def test_second_reader_cmd_expands_a_home_path_in_any_argument(dm, monkeypatch, tmp_path):
+    home = tmp_path / "h"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "genesis.yaml").write_text(
+        "delivery:\n  second_reader_cmd: [python3, ~/r.py, x~y]\n"
+    )
+    monkeypatch.setenv("GENESIS_HOME", str(home))
+    got = dm.second_reader_cmd()
+    assert (
+        got[0] == "python3"
+        and not got[1].startswith("~")
+        and got[1].endswith("/r.py")
+        and got[2] == "x~y"
+    )
+
+
+@pytest.mark.parametrize(
+    "yaml_text",
+    [
+        "delivery:\n  second_reader_cmd: 'python3 \"unbalanced'\n",
+        "delivery:\n  second_reader_cmd: [~nosuchuser_zz9/r.py]\n",
+    ],
+)
+def test_a_malformed_command_reads_as_none_and_never_raises(dm, monkeypatch, tmp_path, yaml_text):
+    home = tmp_path / "h"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "genesis.yaml").write_text(yaml_text)
+    monkeypatch.setenv("GENESIS_HOME", str(home))
+    assert dm.second_reader_cmd() is None
+
+
+def test_a_private_repository_is_never_sent(dm, monkeypatch, tmp_path, capsys):
+    log = _configure(
+        monkeypatch, tmp_path, [sys.executable, "-c", "raise SystemExit('must not run')"]
+    )
+    gh = FakeGh()
+    gh.private = "true"
+    rc, _, cap = _compose(
+        dm, monkeypatch, tmp_path, capsys, gh, "--intended", "read", "--second-reader", prose=_ASKED
+    )
+    assert rc == 0 and "not public" in cap.err and not log.exists()
+    assert not any(c[:2] == ["pr", "diff"] for c in gh.calls)
+
+
+def test_a_head_that_moves_during_the_read_logs_no_score(dm, monkeypatch, tmp_path, capsys):
+    log = _configure(monkeypatch, tmp_path, [sys.executable, str(_reader(tmp_path, _ECHO))])
+    gh = FakeGh(heads=[HEAD, HEAD, OTHER])  # compose's two reads, then the reader's
+    rc, _, cap = _compose(
+        dm, monkeypatch, tmp_path, capsys, gh, "--intended", "read", "--second-reader", prose=_ASKED
+    )
+    assert rc == 0
+    [rec] = [json.loads(x) for x in log.read_text().splitlines()]
+    assert rec["p"] is None and "moved" in rec["error"]
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        "import json; print(json.dumps({'p': '0.4242', 'model': 'm'}))",
+        "import sys; sys.stderr.write('p=0.4242'); sys.exit(1)",
+        "print('{\"p\": 0.4242')",
+    ],
+)
+def test_a_bad_result_never_shows_the_score(dm, monkeypatch, tmp_path, capsys, reader):
+    log = _configure(monkeypatch, tmp_path, [sys.executable, str(_reader(tmp_path, reader))])
+    rc, out, cap = _compose(
+        dm,
+        monkeypatch,
+        tmp_path,
+        capsys,
+        FakeGh(),
+        "--intended",
+        "read",
+        "--second-reader",
+        prose=_ASKED,
+    )
+    assert rc == 0 and "failed" in cap.err
+    assert "4242" not in cap.out + cap.err + log.read_text() + out.read_text()
+    assert "while running the command" not in log.read_text()  # not the catch-all
+
+
+def test_a_missing_executable_is_logged_not_raised(dm, monkeypatch, tmp_path, capsys):
+    log = _configure(monkeypatch, tmp_path, [str(tmp_path / "no-such-reader")])
+    rc, _, cap = _compose(
+        dm,
+        monkeypatch,
+        tmp_path,
+        capsys,
+        FakeGh(),
+        "--intended",
+        "read",
+        "--second-reader",
+        prose=_ASKED,
+    )
+    assert rc == 0 and "failed" in cap.err
+    [rec] = [json.loads(x) for x in log.read_text().splitlines()]
+    assert rec["p"] is None and rec["error"]
+
+
+def test_any_unexpected_error_in_the_reader_never_stops_compose(dm, monkeypatch, tmp_path, capsys):
+    def boom(**kw):
+        raise RecursionError("deep")
+
+    monkeypatch.setattr(dm, "second_reader", boom)
+    rc, out, cap = _compose(
+        dm,
+        monkeypatch,
+        tmp_path,
+        capsys,
+        FakeGh(),
+        "--intended",
+        "read",
+        "--second-reader",
+        prose=_ASKED,
+    )
+    assert rc == 0 and out.exists() and "RecursionError" in cap.err
