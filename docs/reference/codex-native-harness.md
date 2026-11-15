@@ -79,20 +79,20 @@ Pure driver tests cover these contracts without launching a native executable.
 
 ## Separate MCP elicitation experiment
 
-`codex-elicitation.yml` adds a separate17-case, app-server-only experiment on
+`codex-elicitation.yml` adds a separate 17-case, app-server-only experiment on
 the same pinned package and containment. It extends the parent image rather than
 installing another native runtime. Its closed census, capture plugin, manifest
-and reader are independent of the inherited111-case qualification; neither
+and reader are independent of the inherited 111-case qualification; neither
 reader accepts the other's population. The shared deterministic provider gains
 an optional request-index action plan. Append and index selection share one lock,
 so concurrent requests receive the action for their own recorded index; existing one-action callers keep their
 original behavior and retain the parent qualification workflow.
-Ordinary CI discovers and skips the17 opt-in cases; any skip-ceiling adjustment
+Ordinary CI discovers and skips the 17 opt-in cases; any skip-ceiling adjustment
 must use the actual CI JUnit measurement rather than a developer-host count.
-Run42566419285 measured615skips including2xfails: exactly the parent population
-plus these17native ids, with no removed skips or changed reasons. Its65,730
-passing tests had no failures/errors; the old598ceiling alone failed the job.
-The615ceiling change still requires fresh CI against the final head and main.
+Measured 2026-11-14 against main (run 43648630801, test job): 591 skipped of
+73,336 collected, including these 17, under the existing ceiling of 607, so no
+ceiling change is needed. Re-measure if the ceiling check ever fails on this
+population.
 
 The zero-argument fake `record` tool can append only to its owned scratch sink.
 It sends a required boolean form through the typed MCP SDK `send_request` API,
