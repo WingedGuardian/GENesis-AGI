@@ -1728,10 +1728,10 @@ def test_a_signal_during_worktree_creation_leaves_nothing_behind(repo, tmp_path,
     assert list(scratch.iterdir()) == []
 
 
-# DIAGNOSTIC (#4703, not for merge): repeat the [process] case so one CI run catches a
-# 1-in-10 failure; the instrumentation adds no process before git starts and none before the kill.
+# DIAGNOSTIC (#4703, not for merge): repeat the [process] case (100x; 20 caught nothing in one
+# CI run) so a CI run catches a 1-in-10-runs failure; the instrumentation adds no process before git starts and none before the kill.
 @pytest.mark.parametrize(
-    ("delivery", "attempt"), [("process", i) for i in range(20)] + [("other thread", 0)]
+    ("delivery", "attempt"), [("process", i) for i in range(100)] + [("other thread", 0)]
 )
 def test_a_signal_while_git_is_being_started_is_acted_on_after(
     repo, tmp_path, monkeypatch, _scratch, delivery, attempt
