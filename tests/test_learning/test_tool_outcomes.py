@@ -108,7 +108,7 @@ def test_rows_are_exactly_the_recordable_calls(transcript):
         "toolu_exit": 0,
     }
     assert rows["toolu_ok"][0] == SID  # the record's own sessionId
-    assert rows["toolu_hook"][5] == f"{DAY}T10:01:01Z"  # the result's timestamp
+    assert rows["toolu_hook"][5] == f"{DAY}T10:01:01+00:00"  # the result's time, normalised
     assert rows["toolu_ok"][4] is None  # no snippet on a success
     kinds = {tid: row[7] for tid, row in rows.items()}
     assert kinds == {
@@ -413,6 +413,28 @@ def test_an_escaped_credential_in_an_unclosed_quote_is_never_stored():
 def test_a_harmless_escape_keeps_its_snippet():
     text = 'Error: "caf\\u00e9 not found'
     assert tool_outcomes._snippet(text) == text
+
+
+async def test_a_compact_timestamp_is_stored_in_a_form_the_prune_can_read(db):
+    """Python parses 20261101T100001Z; SQLite datetime() does not. Stored raw,
+    such a row would never be pruned."""
+    compact = DAY.replace("-", "") + "T100001Z"
+    spine = [{
+        "type": "tool", "tool": "Bash", "tool_use_id": "toolu_compact", "has_result": True,
+        "is_sidechain": False, "session_id": SID, "timestamp": compact,
+        "failure_class": None, "failure_text": None, "file_path": None,
+    }]
+    offset = dict(spine[0], tool_use_id="toolu_offset", timestamp=f"{DAY}T15:30:16+05:30:15")
+    rows = tool_outcomes.outcome_rows([*spine, offset], fallback_session_id="fb")
+    await tco.insert_outcomes(db, rows)
+    cur = await db.execute(
+        "SELECT tool_use_id, datetime(timestamp) FROM tool_call_outcomes ORDER BY tool_use_id"
+    )
+    # The offset with seconds is converted to UTC, not kept in a form datetime() rejects.
+    assert [tuple(r) for r in await cur.fetchall()] == [
+        ("toolu_compact", f"{DAY} 10:00:01"),
+        ("toolu_offset", f"{DAY} 10:00:01"),
+    ]
 
 
 def test_an_unparseable_timestamp_is_stored_as_now_so_the_prune_can_reach_it():

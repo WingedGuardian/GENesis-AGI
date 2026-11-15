@@ -76,7 +76,9 @@ def _parse_ts(value: object) -> datetime | None:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    # Converted to UTC: an offset with seconds (+05:30:15) survives isoformat() and
+    # SQLite datetime() rejects it.
+    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
 
 
 def _snippet(text: str | None) -> str | None:
@@ -147,9 +149,11 @@ def outcome_rows(spine: list[dict], *, fallback_session_id: str | None) -> list[
                 entry.get("file_path"),
                 0 if failed else 1,
                 _snippet(entry.get("failure_text")) if keep_text else None,
-                # An unparseable stamp would never match the prune's datetime(),
-                # so the row (and its text) would outlive every horizon.
-                entry["timestamp"] if when is not None else now,
+                # Stored as the parsed instant in extended ISO form, never raw: the
+                # prune compares with SQLite datetime(), which rejects spellings
+                # Python accepts (a compact 20261101T100001Z), and an unreadable
+                # stamp would outlive every horizon. Unparseable stamps store now.
+                when.isoformat() if when is not None else now,
                 entry["tool_use_id"],
                 entry.get("failure_class"),
             )
