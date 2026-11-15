@@ -223,6 +223,34 @@ _MIN_CONTENT_LENGTH = 30
 _MIN_URL_CONTEXT_LENGTH = 20
 
 
+#: (pattern, group) of every credential pattern above whose group is a secret.
+_SECRET_GROUPS = (
+    (_CREDENTIAL_PAIR_PATTERN, "pass"),
+    (_SINGLE_CREDENTIAL_PATTERN, "value"),
+    (_EMAIL_PASSWORD_PATTERN, "pass"),
+    (_ACCOUNT_LIFECYCLE_PATTERN, "pass"),
+    (_KNOWN_KEY_PREFIX_PATTERN, "token"),
+    (_CREDENTIAL_TOKEN_PATTERN, "token"),
+    (_ENV_ASSIGNMENT_PATTERN, "val"),
+)
+
+
+def captured_secrets(texts: list[str]) -> set[str]:
+    """Every secret a credential pattern above captures in ``texts``, across
+    every match of every pattern: the secrets the capture rules recognise in
+    free prose (the hold-out masking of a prose value probes them, #2426)."""
+    found: set[str] = set()
+    for text in texts:
+        if not isinstance(text, str) or not text:
+            continue
+        for pattern, group in _SECRET_GROUPS:
+            for match in pattern.finditer(text):
+                value = (match.group(group) or "").strip().rstrip(".,;:)\"'")
+                if value:
+                    found.add(value)
+    return found
+
+
 def _looks_ephemeral(content: str) -> bool:
     """Check if content contains example/placeholder markers.
 
