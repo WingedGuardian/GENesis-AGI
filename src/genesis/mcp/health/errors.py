@@ -222,6 +222,70 @@ _ONGOING_RE = re.compile(rf"\s*{re.escape(_ONGOING_MARK)}[^)]*\)\s*$")
 _memory_culprits: str | None = None
 
 
+# ``infra:codex_mcp_held``: MCP server groups held by a shared Codex app-server
+# past ``codex_mcp_stop.propose_at_mb`` (#4302). It wakes the Sentinel to propose
+# ``codex_mcp_stop`` before the container-memory alarm (anon > 85%), by which
+# point capped jobs are already refused. The stop tool's own ``scan()`` decides
+# what counts, so the alarm and the remedy cannot disagree. One /proc pass per
+# minute at most: ``_compute_alerts`` runs on every tick and every dashboard poll.
+_CODEX_MCP_TTL_S = 60.0
+_codex_mcp_cache: tuple[float, tuple[int, int] | None] | None = None  # (monotonic, (groups, MB))
+_codex_mcp_blind_logged_at: float | None = None
+
+
+def _codex_mcp_scan():
+    """The stop tool's read-only scan (a seam: the test suite replaces it)."""
+    from genesis.sentinel import codex_mcp_stop
+
+    return codex_mcp_stop.scan()
+
+
+async def _codex_mcp_held() -> tuple[int, int, int] | None:
+    """(group count, held MB, threshold MB) when the alarm should fire, else None.
+
+    Never raises. A scan that raises, or one that finds an app-server whose
+    children it cannot classify while finding no group, logs at ERROR at most
+    once an hour: either would leave the alarm silently dark.
+    """
+    import asyncio
+    import time
+
+    from genesis.sentinel import codex_mcp_stop
+
+    global _codex_mcp_cache, _codex_mcp_blind_logged_at  # noqa: PLW0603
+    if codex_mcp_stop.load_mode() == codex_mcp_stop.MODE_OFF:
+        return None
+    threshold = codex_mcp_stop.load_propose_at_mb()
+    if threshold is None:
+        return None
+    now = time.monotonic()
+    if _codex_mcp_cache is None or now - _codex_mcp_cache[0] >= _CODEX_MCP_TTL_S:
+        held: tuple[int, int] | None = None
+        try:
+            scan = await asyncio.to_thread(_codex_mcp_scan)
+        except Exception:
+            scan = None
+            if _codex_mcp_blind_logged_at is None or now - _codex_mcp_blind_logged_at >= 3600:
+                _codex_mcp_blind_logged_at = now
+                logger.error("codex_mcp_held: the stop tool's scan raised; the alarm is blind", exc_info=True)
+        if scan is not None:
+            held = (len(scan.groups), sum(g.rss_kb for g in scan.groups) // 1024)
+            if scan.app_servers and scan.uncertain and not scan.groups and (
+                _codex_mcp_blind_logged_at is None or now - _codex_mcp_blind_logged_at >= 3600
+            ):
+                _codex_mcp_blind_logged_at = now
+                logger.error(
+                    "codex_mcp_held: %d app-server child(ren) could not be classified and no MCP group "
+                    "was found; the alarm may be blind in this process",
+                    len(scan.uncertain),
+                )
+        _codex_mcp_cache = (now, held)
+    held = _codex_mcp_cache[1]
+    if held is None or held[0] == 0 or held[1] < threshold:
+        return None
+    return held[0], held[1], threshold
+
+
 async def _memory_breakdown_line() -> str:
     """The top-memory-trees line; never raises (see ``pid_breakdown.memory_summary``)."""
     import asyncio
@@ -697,6 +761,22 @@ async def _compute_alerts(
         current_ids.add(alert_id)
     else:
         _memory_culprits = None
+
+    codex_held = await _codex_mcp_held()
+    if codex_held is not None:
+        groups, held_mb, threshold_mb = codex_held
+        alert_id = "infra:codex_mcp_held"
+        alerts.append(
+            {
+                "id": alert_id,
+                "severity": "WARNING",
+                "message": (
+                    f"A shared Codex app-server holds {groups} MCP server group(s), {held_mb} MB "
+                    f"in all (alarm at {threshold_mb} MB). Remedy: codex_mcp_stop, dry-run first."
+                ),
+            }
+        )
+        current_ids.add(alert_id)
 
     qdrant_cols = snap.get("infrastructure", {}).get("qdrant_collections", {})
     missing_cols = qdrant_cols.get("missing", [])

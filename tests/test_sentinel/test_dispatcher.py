@@ -2232,3 +2232,235 @@ class TestApprovalIsConsumedOnUse:
         gate.mark_consumed.assert_not_awaited()
         d._invoker.run.assert_awaited()
         mock_execute.assert_awaited_once()
+
+
+class TestCodexMcpHeldPark:
+    """``infra:codex_mcp_held`` (#4302) is a WARNING that wakes the Sentinel, and
+    its park must never stand in front of a real outage. Owner rulings
+    2026-11-14: a confirmed CRITICAL or tier-1 alarm takes over a park held only
+    by WARNINGs, and a declined stop for this pattern is quiet for 24 h.
+    """
+
+    _HELD = {"id": "infra:codex_mcp_held", "severity": "WARNING", "message": "held"}
+    _DOWN = {"id": "service:genesis_down", "severity": "CRITICAL", "message": "down"}
+
+    def _parked(self, park_alerts, state=SentinelState.AWAITING_ACTION_APPROVAL):
+        import json
+
+        from genesis.sentinel.classifier import classify_alerts
+        from genesis.sentinel.remediation_map import available_tools
+
+        parked = classify_alerts(park_alerts, available_tools())
+        gate = MagicMock()
+        gate.resolve_request = AsyncMock()
+        d = _make_dispatcher(approval_gate=gate)
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        d._state.pending_request_id = "req-held"
+        d._state.pending_policy_id = (
+            "sentinel_dispatch" if state == SentinelState.AWAITING_DISPATCH_APPROVAL else "sentinel_action"
+        )
+        d._state.pending_pattern = parked[0].alert_id
+        d._state.pending_request_json = json.dumps({
+            "tier": min(a.tier for a in parked),
+            "alarms": [
+                {"tier": a.tier, "alert_id": a.alert_id, "severity": a.severity, "message": a.message}
+                for a in parked
+            ],
+        })
+        d._state.transition(state, reason="test setup")
+        # check_fire_alarms calls dispatch() on every confirmed tick; it is
+        # Gate 2 inside dispatch() that refuses while parked. So what matters
+        # is the state each call SEES: still parked means Gate 2 refuses it.
+        d.seen_states = []
+
+        async def _dispatch(request):
+            d.seen_states.append(d._state.state)
+
+        d.dispatch = AsyncMock(side_effect=_dispatch)
+        return d, gate
+
+    @staticmethod
+    def _parked_states():
+        return {SentinelState.AWAITING_ACTION_APPROVAL, SentinelState.AWAITING_DISPATCH_APPROVAL}
+
+    async def _ticks(self, d, per_tick):
+        calls = [list(t) for t in per_tick]
+
+        async def _alerts(*args, **kwargs):
+            return calls.pop(0)
+
+        with patch("genesis.mcp.health_mcp._impl_health_alerts", new=_alerts), \
+             patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"):
+            for _ in per_tick:
+                await d.check_fire_alarms()
+        assert calls == []
+
+    def test_held_alarm_is_tier_2_and_scoped(self):
+        from genesis.sentinel.classifier import classify_alerts
+        from genesis.sentinel.remediation_map import REMEDIATION_MAP, available_tools
+
+        assert REMEDIATION_MAP["infra:codex_mcp_held"] == frozenset({"container.process_control"})
+        alarms = classify_alerts([self._HELD], available_tools())
+        assert [(a.alert_id, a.tier, a.severity) for a in alarms] == [
+            ("infra:codex_mcp_held", 2, "WARNING"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_confirmed_outage_takes_over_a_warning_park(self):
+        d, gate = self._parked([self._HELD])
+        both = [self._HELD, self._DOWN]
+        await self._ticks(d, [both])
+        # One sighting is not confirmed: the park stands.
+        gate.resolve_request.assert_not_awaited()
+        assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+        await self._ticks(d, [both])
+        gate.resolve_request.assert_awaited_once_with(
+            "req-held", decision="cancelled", resolved_by="superseded",
+        )
+        assert d.seen_states[-1] == SentinelState.HEALTHY  # Gate 2 lets it through
+        request = d.dispatch.await_args.args[0]
+        assert request.tier == 1
+        assert "service:genesis_down" in {a.alert_id for a in request.alarms}
+
+    @pytest.mark.asyncio
+    async def test_take_over_starts_the_cooldown_for_the_cancelled_pattern(self):
+        d, gate = self._parked([self._HELD])
+        both = [self._HELD, self._DOWN]
+        await self._ticks(d, [both, both])
+        ready, reason = d._backoff_ready("infra:codex_mcp_held")
+        assert ready is False and "cooldown" in reason
+
+    @pytest.mark.asyncio
+    async def test_a_failed_cancel_keeps_the_park(self):
+        """The row is no longer pending (the owner just answered it): never drop
+        that answer by clearing the park anyway."""
+        d, gate = self._parked([self._HELD])
+        gate.resolve_request = AsyncMock(return_value=False)
+        both = [self._HELD, self._DOWN]
+        await self._ticks(d, [both, both])
+        gate.resolve_request.assert_awaited_once()
+        assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+        assert d._state.pending_request_id == "req-held"
+        assert set(d.seen_states) <= self._parked_states()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("missing", ["gate", "request_id"])
+    async def test_no_row_to_cancel_means_no_take_over(self, missing):
+        d, _gate = self._parked([self._HELD])
+        if missing == "gate":
+            d._approval_gate = None
+        else:
+            d._state.pending_request_id = ""
+        both = [self._HELD, self._DOWN]
+        await self._ticks(d, [both, both, both])
+        assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+
+    @pytest.mark.asyncio
+    async def test_a_challenger_that_cannot_dispatch_takes_nothing_over(self):
+        import time as _time
+
+        d, gate = self._parked([self._HELD])
+        d._resolved_cooldowns["service:genesis_down"] = _time.monotonic()
+        both = [self._HELD, self._DOWN]
+        await self._ticks(d, [both, both, both])
+        gate.resolve_request.assert_not_awaited()
+        assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+
+    @pytest.mark.asyncio
+    async def test_dispatch_park_is_taken_over_too(self):
+        d, gate = self._parked([self._HELD], state=SentinelState.AWAITING_DISPATCH_APPROVAL)
+        both = [self._HELD, self._DOWN]
+        await self._ticks(d, [both, both])
+        gate.resolve_request.assert_awaited_once()
+        assert d.seen_states[-1] == SentinelState.HEALTHY
+
+    @pytest.mark.asyncio
+    async def test_a_critical_park_is_never_taken_over(self):
+        mem = {"id": "infra:container_memory_high", "severity": "CRITICAL", "message": "mem"}
+        d, gate = self._parked([mem])
+        both = [mem, self._DOWN]
+        await self._ticks(d, [both, both, both])
+        gate.resolve_request.assert_not_awaited()
+        assert d.seen_states and set(d.seen_states) <= self._parked_states()
+        assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+
+    @pytest.mark.asyncio
+    async def test_another_warning_does_not_take_over(self):
+        other = {"id": "service:watchdog_failing", "severity": "WARNING", "message": "w"}
+        d, gate = self._parked([self._HELD])
+        both = [self._HELD, other]
+        await self._ticks(d, [both, both, both])
+        gate.resolve_request.assert_not_awaited()
+        assert set(d.seen_states) <= self._parked_states()
+
+    @pytest.mark.asyncio
+    async def test_unreadable_park_severity_is_never_taken_over(self):
+        import json
+
+        d, gate = self._parked([self._HELD])
+        req = json.loads(d._state.pending_request_json)
+        del req["alarms"][0]["severity"]
+        d._state.pending_request_json = json.dumps(req)
+        both = [self._HELD, self._DOWN]
+        await self._ticks(d, [both, both])
+        gate.resolve_request.assert_not_awaited()
+        assert d.seen_states and set(d.seen_states) <= self._parked_states()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("policy", ["sentinel_action", "sentinel_dispatch"])
+    async def test_a_declined_stop_is_quiet_for_24h(self, policy):
+        """Owner ruling 2026-11-14 (a declined stop is quiet for 24 h) rests on
+        the path real declines take: the owner's answer lands on the parked row
+        and handle_approval_resolution converges on it, for either policy. The
+        container-memory alarm stays free to dispatch."""
+        d, _gate = self._parked(
+            [self._HELD],
+            state=(
+                SentinelState.AWAITING_ACTION_APPROVAL if policy == "sentinel_action"
+                else SentinelState.AWAITING_DISPATCH_APPROVAL
+            ),
+        )
+        with patch("genesis.sentinel.dispatcher.append_log"):
+            await d.handle_approval_resolution("req-held", "rejected")
+        expiry = datetime.fromisoformat(d._state.rejected_patterns["infra:codex_mcp_held"])
+        assert timedelta(hours=23) < expiry - datetime.now(UTC) < timedelta(hours=25)
+        ready, reason = d._backoff_ready("infra:codex_mcp_held")
+        assert ready is False and "rejected" in reason.lower()
+        assert d._backoff_ready("infra:container_memory_high")[0] is True
+
+    @pytest.mark.asyncio
+    async def test_a_tier1_warning_park_is_not_taken_over_by_a_tier2_critical(self):
+        """service:watchdog_blind is tier 1 at WARNING. A tier-2 CRITICAL is weaker
+        by the classifier's order, and dispatch would lead with the parked tier-1
+        alarm anyway, so cancelling would only drop the owner's request."""
+        blind = {"id": "service:watchdog_blind", "severity": "WARNING", "message": "blind"}
+        mem = {"id": "infra:container_memory_high", "severity": "CRITICAL", "message": "mem"}
+        d, gate = self._parked([blind])
+        both = [blind, mem]
+        await self._ticks(d, [both, both, both])
+        gate.resolve_request.assert_not_awaited()
+        assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+
+    @pytest.mark.asyncio
+    async def test_a_tier1_warning_park_is_taken_over_by_a_tier1_critical(self):
+        blind = {"id": "service:watchdog_blind", "severity": "WARNING", "message": "blind"}
+        d, gate = self._parked([blind])
+        both = [blind, self._DOWN]
+        await self._ticks(d, [both, both])
+        gate.resolve_request.assert_awaited_once()
+        assert d.dispatch.await_args.args[0].alarms[0].alert_id == "service:genesis_down"
+
+    @pytest.mark.asyncio
+    async def test_take_over_reaches_the_real_dispatch_gates(self):
+        """No dispatch mock: the real dispatch() must pass every gate after a
+        take-over and hand the outage to _execute_dispatch."""
+        d, gate = self._parked([self._HELD])
+        del d.dispatch  # back to the real method
+        d._execute_dispatch = AsyncMock(return_value=SentinelResult(dispatched=True))
+        both = [self._HELD, self._DOWN]
+        await self._ticks(d, [both, both])
+        gate.resolve_request.assert_awaited_once()
+        d._execute_dispatch.assert_awaited_once()
+        assert d._execute_dispatch.await_args.kwargs["pattern"] == "service:genesis_down"

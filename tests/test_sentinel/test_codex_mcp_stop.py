@@ -27,10 +27,17 @@ def _write_proc(
     argv,
     starttime=None,
     exe="/usr/bin/python3",
-    stdio=("pipe:[1]", "pipe:[2]"),
+    stdio="own",
+    fds=None,
     cgroup="/user.slice/session-1.scope",
     rss_kb=1024,
 ):
+    """``stdio`` is (fd 0, fd 1), read and write; the default "own" gives the
+    process its own pair, pipe:[<pid>1] and pipe:[<pid>2], whose other ends the
+    fixture's app-server holds. ``fds`` replaces it with
+    {fd: (target, "r" | "w" | "rw")} for any descriptor layout."""
+    if stdio == "own":
+        stdio = (f"pipe:[{pid}1]", f"pipe:[{pid}2]")
     d = root / str(pid)
     d.mkdir()
     # Fields after ')': state ppid pgrp session tty tpgid flags minflt cminflt
@@ -64,10 +71,17 @@ def _write_proc(
     (d / "status").write_text(f"Name:\t{comm}\nVmRSS:\t{rss_kb} kB\n")
     if exe is not None:
         os.symlink(exe, d / "exe")
-    if stdio is not None:
+    if fds is None and stdio is not None:
+        fds = {0: (stdio[0], "r"), 1: (stdio[1], "w")}
+    if fds is not None:
         (d / "fd").mkdir()
-        os.symlink(stdio[0], d / "fd" / "0")
-        os.symlink(stdio[1], d / "fd" / "1")
+        (d / "fdinfo").mkdir()
+        for fd, (target, mode) in fds.items():
+            os.symlink(target, d / "fd" / str(fd))
+            # O_CLOEXEC set, as the kernel reports it; access mode in the low bits.
+            access = {"r": os.O_RDONLY, "w": os.O_WRONLY, "rw": os.O_RDWR}[mode]
+            flags = 0o2000000 | access
+            (d / "fdinfo" / str(fd)).write_text(f"pos:\t0\nflags:\t0{flags:o}\nmnt_id:\t15\n")
 
 
 @pytest.fixture
@@ -96,6 +110,24 @@ def fake_proc(tmp_path, monkeypatch):
         ppid=1,
         pgid=APP,
         argv=["/opt/codex", "app-server", "--listen", "unix"],
+        # The daemon's ends: it writes every child's request pipe (<pid>1, and
+        # 11 for the Genesis layout, 900 and 902 spare) and reads every reply
+        # pipe (<pid>2, 12, 901, 903) and the chat command's output (9).
+        fds={
+            0: ("/dev/null", "r"),
+            5: ("pipe:[9]", "r"),
+            6: ("pipe:[11]", "w"),
+            7: ("pipe:[12]", "r"),
+            8: ("pipe:[900]", "w"),
+            9: ("pipe:[901]", "r"),
+            10: ("pipe:[902]", "w"),
+            11: ("pipe:[903]", "r"),
+            **{
+                100 + 2 * (child - 101) + k: (f"pipe:[{child}{k + 1}]", "w" if k == 0 else "r")
+                for child in range(101, 131)
+                for k in (0, 1)
+            },
+        },
     )
     # The target: an MCP server group (leader + one member), pipe stdio.
     w(
@@ -166,15 +198,107 @@ def test_scan_targets_only_the_mcp_group(fake_proc):
     # Guard the guard: every exclusion fixture exists and was considered.
     for pid, why in [
         (102, "Codex helper"),
-        (103, "not pipes"),
+        (103, "not an MCP server"),
         (104, "not its own process group"),
         (106, "systemd unit"),
-        (107, "stdio unreadable"),
-        (108, "not pipes"),
+        (107, "descriptors unreadable"),
+        (108, "not an MCP server"),
     ]:
         assert (fake_proc / str(pid)).is_dir()
         assert any(s.startswith(f"{pid} ") and why in s for s in found.skipped), (pid, reasons)
     assert not any(s.startswith("301 ") for s in found.skipped)
+
+
+def test_scan_targets_the_mcp_sdk_descriptor_layout(fake_proc):
+    """The layout the MCP Python SDK leaves (MEASURED on a live Genesis server,
+    2026-11-14): fd 0 /dev/null, fd 1 and 2 the stderr pipe, the protocol on
+    private duplicates. The old stdin-and-stdout test skipped every one."""
+    _write_proc(
+        fake_proc, 120, comm="python", ppid=APP, pgid=120,
+        argv=["python", "genesis_mcp_server.py", "--server", "health"],
+        fds={
+            0: ("/dev/null", "r"),
+            1: ("pipe:[13]", "w"),
+            2: ("pipe:[13]", "w"),
+            18: ("pipe:[11]", "r"),
+            19: ("pipe:[12]", "w"),
+        },
+        rss_kb=200 * 1024,
+    )
+    found = mod.scan()
+    assert sorted(g.pgid for g in found.groups) == [101, 120]
+
+
+@pytest.mark.parametrize(
+    "fds",
+    [
+        # Reads a pipe, but not one the app-server writes.
+        {0: ("pipe:[50]", "r"), 1: ("pipe:[901]", "w")},
+        # Writes back to the app-server only: a running command's output.
+        {0: ("/dev/null", "r"), 1: ("pipe:[901]", "w")},
+        # Reads the request pipe but replies nowhere the app-server reads.
+        {0: ("pipe:[900]", "r"), 1: ("pipe:[51]", "w")},
+        # Both real pipes, but the wrong ends: it writes the request pipe and
+        # reads the reply pipe. Only the fdinfo access mode tells this apart.
+        {0: ("pipe:[900]", "w"), 1: ("pipe:[901]", "r")},
+    ],
+)
+def test_scan_needs_both_pipes_to_be_the_app_servers(fake_proc, fds):
+    _write_proc(fake_proc, 121, comm="python", ppid=APP, pgid=121, argv=["python", "x.py"], fds=fds)
+    found = mod.scan()
+    assert 121 not in [g.pgid for g in found.groups]
+    assert any(s.startswith("121 ") and "not an MCP server" in s for s in found.skipped)
+
+
+def test_read_write_descriptors_count_as_both_ends(fake_proc):
+    _write_proc(
+        fake_proc, 122, comm="python", ppid=APP, pgid=122, argv=["python", "x.py"],
+        fds={3: ("pipe:[902]", "rw"), 4: ("pipe:[903]", "rw")},
+    )
+    assert sorted(g.pgid for g in mod.scan().groups) == [101, 122]
+
+
+def test_a_pipe_another_child_also_holds_proves_nothing(fake_proc):
+    """A child that inherited another server's pipe ends is not targeted, and the
+    server that shares them is not either: shared pipes never identify anyone."""
+    _write_proc(
+        fake_proc, 123, comm="bash", ppid=APP, pgid=123, argv=["bash", "-c", "make"],
+        fds={0: ("pipe:[1011]", "r"), 1: ("pipe:[1012]", "w")},
+    )
+    found = mod.scan()
+    assert found.groups == []
+    for pid in (101, 123):
+        assert any(s.startswith(f"{pid} ") and "not an MCP server" in s for s in found.skipped)
+
+
+def test_an_unreadable_pipe_mode_is_uncertain_never_skipped(fake_proc):
+    (fake_proc / "101" / "fdinfo" / "0").unlink()
+    (fake_proc / "101" / "fdinfo" / "0").mkdir()  # reading it raises, not "gone"
+    found = mod.scan()
+    assert 101 not in [g.pgid for g in found.groups]
+    assert any(s.startswith("101 ") and "descriptors unreadable" in s for s in found.uncertain)
+
+
+@pytest.mark.parametrize("info", ["pos:\t0\nmnt_id:\t15\n", "pos:\t0\nflags:\n", "flags:\tzz\n"])
+def test_an_unparseable_fdinfo_is_uncertain(fake_proc, info):
+    (fake_proc / "101" / "fdinfo" / "0").write_text(info)
+    found = mod.scan()
+    assert 101 not in [g.pgid for g in found.groups]
+    assert any(s.startswith("101 ") and "descriptors unreadable" in s for s in found.uncertain)
+
+
+def test_a_descriptor_closed_mid_read_is_ignored(fake_proc):
+    os.symlink("pipe:[77]", fake_proc / "101" / "fd" / "9")  # no fdinfo: it just closed
+    assert [g.pgid for g in mod.scan().groups] == [101]
+
+
+def test_app_server_with_unreadable_descriptors_classifies_nothing(fake_proc):
+    import shutil
+
+    shutil.rmtree(fake_proc / str(APP) / "fd")
+    found = mod.scan()
+    assert found.groups == []
+    assert any(f"app-server {APP}" in s and "descriptors unreadable" in s for s in found.uncertain)
 
 
 def test_scan_skips_a_child_under_a_claude_session(fake_proc):
@@ -465,7 +589,7 @@ def _stops_everything(groups, **_k):
 
 def test_unreadable_candidate_beside_a_stopped_group_is_partial(fake_proc, monkeypatch, capsys):
     """Readable groups stopping cleanly does not make the run done while another
-    candidate was never classified (fixture pid 107: stdio unreadable)."""
+    candidate was never classified (fixture pid 107: descriptors unreadable)."""
     monkeypatch.setattr(mod, "load_mode", lambda: mod.MODE_PROPOSE_ONLY)
     monkeypatch.setattr(mod, "stop", _stops_everything)
     assert mod.main(["--execute"]) == mod.EXIT_PARTIAL

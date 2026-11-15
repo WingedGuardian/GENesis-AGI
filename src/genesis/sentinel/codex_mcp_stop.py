@@ -23,7 +23,11 @@ process that is ALL of:
   daemon; a plugin broker's stdio ``codex app-server`` has no ``--listen``);
 - the leader of its own process group (Codex spawns every stdio MCP server
   with ``ProcessMode::NewGroup``, rmcp-client ``stdio_server_launcher.rs``);
-- talking over pipes on stdin and stdout (the MCP stdio transport);
+- talking to that app-server over the MCP stdio transport: it reads a pipe the
+  app-server writes and writes a pipe the app-server reads, on any descriptor,
+  and no other child of the app-server holds either pipe (the MCP Python SDK
+  moves the stream off fd 0 and 1, so stdin alone is no test; a chat command
+  Codex starts in pipe mode, stdin /dev/null, has no request pipe);
 - not a Codex binary (``~/.codex/`` helpers such as code-mode);
 - not under a ``claude`` process and not in a systemd ``.service`` unit.
 
@@ -126,8 +130,13 @@ def load_mode(path: Path | None = None) -> str:
         # strict: a broken owner overlay raises into the handler below (off),
         # instead of falling back to the shipped propose_only.
         raw = merge_local_overlay(raw or {}, cfg_path, strict=True)
-    except Exception:
-        logger.warning("Failed to load %s; codex_mcp_stop is off", cfg_path, exc_info=True)
+    except Exception as exc:
+        # The health alarm reads this on every computation (several per tick):
+        # warn once per distinct failure, not on every read.
+        key = f"mode:{cfg_path}:{type(exc).__name__}:{exc}"
+        if key not in _WARNED_ONCE:
+            _WARNED_ONCE.add(key)
+            logger.warning("Failed to load %s; codex_mcp_stop is off", cfg_path, exc_info=True)
         return MODE_OFF
     if not isinstance(raw, dict):
         return MODE_OFF
@@ -138,6 +147,47 @@ def load_mode(path: Path | None = None) -> str:
     section = raw["codex_mcp_stop"]
     mode = section.get("mode") if isinstance(section, dict) else None
     return mode if mode in (MODE_PROPOSE_ONLY, MODE_OFF) else MODE_OFF
+
+
+DEFAULT_PROPOSE_AT_MB = 4096
+
+
+def load_propose_at_mb(path: Path | None = None) -> int | None:
+    """MB of held MCP groups at which the health alarm ``infra:codex_mcp_held``
+    fires so the Sentinel proposes this tool early; None turns the alarm off.
+
+    Absent key: the shipped default. A value that is not a positive integer, or
+    a config that cannot be read, logs and reads as None: no early alarm, which
+    leaves the container-memory alarm as the only route, as before.
+    """
+    cfg_path = path or _CONFIG_PATH
+    try:
+        import yaml
+
+        from genesis._config_overlay import merge_local_overlay
+
+        raw = yaml.safe_load(cfg_path.read_text()) if cfg_path.exists() else {}
+        raw = merge_local_overlay(raw or {}, cfg_path, strict=True)
+    except Exception as exc:
+        key = f"load:{cfg_path}:{type(exc).__name__}:{exc}"
+        if key not in _WARNED_ONCE:
+            _WARNED_ONCE.add(key)
+            logger.warning("Failed to load %s; the codex_mcp_held alarm is off", cfg_path, exc_info=True)
+        return None
+    section = raw.get("codex_mcp_stop") if isinstance(raw, dict) else None
+    if not isinstance(section, dict) or "propose_at_mb" not in section:
+        return DEFAULT_PROPOSE_AT_MB
+    value = section["propose_at_mb"]
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        # Read on every health computation (several per tick): warn once per value.
+        if repr(value) not in _WARNED_ONCE:
+            _WARNED_ONCE.add(repr(value))
+            logger.warning("codex_mcp_stop.propose_at_mb=%r is not a positive integer; the alarm is off", value)
+        return None
+    return value
+
+
+_WARNED_ONCE: set[str] = set()
 
 
 def _proc() -> Path:
@@ -170,12 +220,49 @@ def _rss_kb(pid: int) -> int:
     return 0
 
 
-def _is_pipe(pid: int, fd: int) -> bool | None:
-    """True/False for a readable fd link; None when it cannot be read."""
+def _pipe_ends(pid: int) -> tuple[set[str], set[str]] | None:
+    """(pipes the process reads, pipes it writes), by pipe identity
+    (``pipe:[inode]``) on ANY descriptor; None when they cannot be read.
+
+    Any descriptor, not just 0 and 1: the MCP Python SDK (mcp>=2.3) moves the
+    protocol stream to private duplicates at startup and points fd 0 at
+    /dev/null and fd 1 at stderr, so a Genesis server's stdin is never the pipe
+    it reads (MEASURED on a live install, 2026-11-14). A descriptor that closes
+    while it is read is skipped; one whose mode cannot be read makes the whole
+    answer None, so a permission problem reads as uncertain, never as "no pipes".
+    """
+    fd_dir = _proc() / str(pid) / "fd"
     try:
-        return os.readlink(_proc() / str(pid) / "fd" / str(fd)).startswith("pipe:")
+        names = os.listdir(fd_dir)
     except OSError:
         return None
+    reads: set[str] = set()
+    writes: set[str] = set()
+    for name in names:
+        try:
+            target = os.readlink(fd_dir / name)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        if not target.startswith("pipe:"):
+            continue
+        try:
+            info = (_proc() / str(pid) / "fdinfo" / name).read_text()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        try:
+            flags = next(ln.split()[1] for ln in info.splitlines() if ln.startswith("flags:"))
+            mode = int(flags, 8) & os.O_ACCMODE
+        except (StopIteration, ValueError, IndexError):
+            return None  # no flags line, or one that does not parse: uncertain
+        if mode in (os.O_RDONLY, os.O_RDWR):
+            reads.add(target)
+        if mode in (os.O_WRONLY, os.O_RDWR):
+            writes.add(target)
+    return reads, writes
 
 
 _SAFE_LABEL = __import__("re").compile(r"[^A-Za-z0-9._+-]")
@@ -266,6 +353,26 @@ def scan() -> Scan:
             # Without it the same-group exclusion below cannot be applied.
             result.unreadable(f"app-server {app} (process group unreadable)")
             continue
+        app_ends = _pipe_ends(app)
+        if app_ends is None:
+            # Without its pipe ends no child can be shown to talk to it.
+            result.unreadable(f"app-server {app} (descriptors unreadable)")
+            continue
+        app_reads, app_writes = app_ends
+        children = sorted(pid for pid, s in stats.items() if s[2] == app)
+        child_ends = {pid: _pipe_ends(pid) for pid in children}
+        # How many direct children hold each pipe the app-server also holds. A
+        # server's own request and reply pipes are held by it alone; a pipe
+        # end that leaked into another child (an inherited descriptor) is
+        # shared, and sharing one proves nothing about the child holding it.
+        # A child whose descriptors cannot be read is not counted here, so a
+        # pipe shared only with it reads as unshared. Such a child is itself
+        # uncertain, the owner approves every stop, and stop() re-checks the
+        # leader's start time: an accepted residual, not a target rule.
+        holders: dict[str, int] = {}
+        for ends in child_ends.values():
+            for p in (ends[0] | ends[1]) if ends else ():
+                holders[p] = holders.get(p, 0) + 1
         for pid, (_comm, _state, ppid, _threads, starttime) in sorted(stats.items()):
             if ppid != app:
                 continue
@@ -296,12 +403,20 @@ def scan() -> Scan:
             if os.path.realpath(exe.removesuffix(" (deleted)")).startswith(codex_homes) or exe.startswith(codex_homes):
                 result.skipped.append(f"{label} (Codex helper)")
                 continue
-            stdin_pipe, stdout_pipe = _is_pipe(pid, 0), _is_pipe(pid, 1)
-            if stdin_pipe is None or stdout_pipe is None:
-                result.unreadable(f"{label} (stdio unreadable)")
+            ends = child_ends.get(pid)
+            if ends is None:
+                result.unreadable(f"{label} (descriptors unreadable)")
                 continue
-            if not (stdin_pipe and stdout_pipe):
-                result.skipped.append(f"{label} (stdio is not pipes: not an MCP server)")
+            reads, writes = ends
+            # The MCP stdio transport: a request pipe the app-server writes and
+            # this process alone reads, and a reply pipe the other way. A chat
+            # command Codex starts in pipe mode has stdin /dev/null and only
+            # output pipes, so it fails. (A command started with BOTH stdin and
+            # stdout piped would pass, as it did under the old fd 0/1 test.)
+            request = {p for p in reads & app_writes if holders.get(p) == 1}
+            reply = {p for p in writes & app_reads if holders.get(p) == 1}
+            if not (request and reply):
+                result.skipped.append(f"{label} (no request and reply pipes with the app-server: not an MCP server)")
                 continue
             if proc_io.claude_ancestor(pid) is not None:
                 result.skipped.append(f"{label} (under a Claude Code session)")
@@ -311,7 +426,9 @@ def scan() -> Scan:
                 result.unreadable(f"{label} (cgroup unreadable)")
                 continue
             if unit.endswith(".service"):
-                result.skipped.append(f"{label} (systemd unit {unit})")
+                # A same-user process can name a transient unit anything, and this
+                # text reaches the Sentinel's transcript: print it sanitised.
+                result.skipped.append(f"{label} (systemd unit {_SAFE_LABEL.sub('_', unit)[:60]})")
                 continue
             members = sorted(by_pgid.get(pg, [pid]))
             result.groups.append(

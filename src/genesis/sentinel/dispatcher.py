@@ -353,6 +353,50 @@ def _triggering_alarm_ids(alarms: Sequence[Mapping[str, Any]], tier: int | None)
     return triggering or all_ids
 
 
+def _alarm_strength(tier: int, severity: str) -> tuple[int, int]:
+    """The classifier's own ordering key (lower is stronger): tier, then
+    CRITICAL before anything else. Dispatch takes the strongest alarm first."""
+    return (tier, 0 if str(severity).upper() == "CRITICAL" else 1)
+
+
+def _warning_park_strength(alarms: Sequence[Mapping[str, Any]], ids: set[str]) -> tuple[int, int] | None:
+    """Strength of the strongest triggering alarm of a park held ONLY by
+    WARNING alarms; None when any trigger is not WARNING or its tier or
+    severity cannot be read (such a park is never taken over). Pure."""
+    best: tuple[int, int] | None = None
+    for a in alarms if isinstance(alarms, (list, tuple)) else ():
+        if not isinstance(a, dict) or a.get("alert_id") not in ids:
+            continue
+        sev, tier = a.get("severity"), a.get("tier")
+        if not isinstance(sev, str) or sev.upper() != "WARNING":
+            return None
+        if isinstance(tier, bool) or not isinstance(tier, int):
+            return None
+        s = _alarm_strength(tier, sev)
+        best = s if best is None or s < best else best
+    return best
+
+
+def _superseding_alarm_ids(
+    park_strength: tuple[int, int] | None,
+    pending_ids: set[str],
+    alarms: Sequence[FireAlarm],
+    recent_sets: Sequence[set[str]],
+) -> set[str]:
+    """Confirmed alarms strictly stronger, by the classifier's ordering, than a
+    WARNING-only park: a CRITICAL of the same tier, or any alarm of a
+    stronger tier. Empty for any other park. Pure; never raises."""
+    if park_strength is None:
+        return set()
+    return {
+        a.alert_id
+        for a in alarms
+        if a.alert_id not in pending_ids
+        and _alarm_strength(a.tier, a.severity) < park_strength
+        and sum(1 for ids in recent_sets if a.alert_id in ids) >= _ALARM_CONFIRMATION_COUNT
+    }
+
+
 class SentinelDispatcher:
     """Orchestrates Sentinel CC sessions for infrastructure incident response.
 
@@ -2099,11 +2143,13 @@ class SentinelDispatcher:
             SentinelState.AWAITING_ACTION_APPROVAL,
         ):
             pending_ids = set()
+            park_strength: tuple[int, int] | None = None
             if self._state.pending_request_json:
                 try:
                     import json
                     req = json.loads(self._state.pending_request_json)
                     pending_ids = _triggering_alarm_ids(req.get("alarms", []) or [], req.get("tier"))
+                    park_strength = _warning_park_strength(req.get("alarms", []) or [], pending_ids)
                 except (json.JSONDecodeError, TypeError, AttributeError):
                     pass
             # Fall back to pending_pattern (single alarm ID) if no list
@@ -2162,6 +2208,80 @@ class SentinelDispatcher:
                     f"awaiting approval — park cancelled, back to HEALTHY",
                 )
                 return None
+            else:
+                # A park held only by WARNING alarms must not stand in front of a
+                # CRITICAL or tier-1 one: Gate 2 refuses every dispatch while
+                # parked and Sentinel approvals never expire, so an unanswered
+                # warning-level proposal (infra:codex_mcp_held, which does not
+                # clear by itself) would leave a later outage unanswered. Owner
+                # ruling 2026-11-14: the stronger alarm takes over. "Stronger" is
+                # the classifier's own order (tier, then CRITICAL first). A park
+                # with any CRITICAL trigger, or whose tiers or severities cannot
+                # be read, is never taken over.
+                challengers = _superseding_alarm_ids(
+                    park_strength, pending_ids, alarms, self._recent_alarm_sets,
+                )
+                # Cancel only when the dispatch that follows would go through:
+                # dispatch() keys its backoff on the FIRST confirmed alarm, so
+                # that alarm must be a challenger, must not be the pattern being
+                # cancelled (it gets a cooldown below), and must pass backoff
+                # itself. Otherwise the owner's request is cancelled for nothing.
+                head = next(
+                    (
+                        a.alert_id for a in alarms
+                        if sum(1 for s in self._recent_alarm_sets if a.alert_id in s)
+                        >= _ALARM_CONFIRMATION_COUNT
+                    ),
+                    None,
+                )
+                if head not in challengers or head == pattern or not self._backoff_ready(head)[0]:
+                    challengers = set()
+                # Without a row to cancel, clearing the park would forget an
+                # approval the owner can still answer: never take over then.
+                if not request_id or self._approval_gate is None:
+                    challengers = set()
+                cancelled = True
+                if challengers and request_id and self._approval_gate is not None:
+                    try:
+                        cancelled = await self._approval_gate.resolve_request(
+                            request_id, decision="cancelled", resolved_by="superseded",
+                        )
+                    except Exception:
+                        cancelled = False
+                        logger.warning("Failed to cancel sentinel approval %s", request_id, exc_info=True)
+                if challengers and not cancelled:
+                    # The row is no longer pending (most likely the owner just
+                    # answered it): keep the park so the approval-resolution
+                    # path converges on the real answer instead of dropping it.
+                    logger.info(
+                        "Could not cancel sentinel approval %s for %s; keeping the park",
+                        request_id, sorted(challengers),
+                    )
+                elif challengers:
+                    # The warning-level pattern waits the resolved-dispatch
+                    # cooldown before it may ask again, so a take-over cannot
+                    # turn into a cancel-and-re-ask loop.
+                    if alarm_backed and pattern:
+                        self._resolved_cooldowns[pattern] = time.monotonic()
+                    logger.info(
+                        "Alarms %s supersede the warning-only park %s (%s) — cancelling it",
+                        sorted(challengers), request_id, sorted(pending_ids),
+                    )
+                    async with self._lock:
+                        # Clear only the park that was cancelled: another path
+                        # may have resolved it while the cancel was awaited.
+                        if self._state.pending_request_id == request_id:
+                            self._state.clear_pending()
+                            self._state.transition(
+                                SentinelState.HEALTHY,
+                                reason=f"warning-only park superseded by {sorted(challengers)}",
+                            )
+                            save_state(self._state)
+                    await self._emit_event(
+                        "INFO", "sentinel.approval_superseded",
+                        f"Pending warning-only approval for {sorted(pending_ids)} cancelled: "
+                        f"{sorted(challengers)} takes over",
+                    )
 
         if not alarms:
             return None
