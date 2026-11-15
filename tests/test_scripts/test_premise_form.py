@@ -342,3 +342,104 @@ def test_after_the_epoch_an_older_issue_keeps_the_old_rule_even_with_coincidence
     """Grandfathering survives the epoch for issues created before it: the
     either-form rule still applies to them (secondary review, P3)."""
     assert _opened(_issue(_TWO_COINCIDENCES), created="2026-11-01T00:00:00Z").add == []
+
+
+# -- round 1: an answer is judged on its own field, with labels taken off ---------
+
+_TEMPLATE_ISSUE = gate._plan_gate._form_template()
+_BARE_LABELS = "".join(f"{n}. {label}:\n" for n, (label, _) in enumerate(gate._plan_gate.FORM, start=1))
+
+
+def _gaps(body, *, build=False, created=_NEW):
+    return gate.premise_gaps(body, build=build, created_at=created)[1]
+
+
+@pytest.mark.parametrize(
+    "old, new, n",
+    [
+        # M1, M2: a filled sub-label never fills an empty main answer.
+        ("2. Intended: a migration merged after checkout is not reported. Stated: docs/x.md:40",
+         "2. Intended:  Stated: docs/x.md:40", 2),
+        ("5. Acceptance: a migration merged after checkout passes, a deleted one is still reported. "
+         "Wrong fix: pinning the base to HEAD.", "5. Acceptance:  Wrong fix: none, because no fix is proposed", 5),
+        # M3: a word in prose is not the sub-label.
+        ("2. Intended: a migration merged after checkout is not reported. Stated: docs/x.md:40",
+         "2. Intended: works as stated: nothing written", 2),
+        # M4: a main answer that is only another item's label.
+        ("3. Cost: every PR opened before a migration lands, about 3 a week, counted from CI runs.",
+         "3. Cost: Searched:", 3),
+        # M5: a placeholder main answer with the sub-label filled.
+        ("2. Intended: a migration merged after checkout is not reported. Stated: docs/x.md:40",
+         "2. Intended: <what should happen> Stated: docs/x.md", 2),
+    ],
+)
+def test_each_field_is_judged_on_its_own(old, new, n):
+    body = _issue(_PROBLEM.replace(old, new))
+    assert n in [k for k, _ in gate._plan_gate.form_problems(
+        gate.premise_answers(gate.strip_quoted(body)), gate._plan_gate.PROBLEM_BLOCK)]
+
+
+def test_a_sub_label_after_a_sentence_end_or_capitalized_counts():
+    for answer in ("2. Intended: it passes. stated: docs/x.md:40", "2. Intended: it passes Stated: docs/x.md:40"):
+        body = _issue(_PROBLEM.replace(
+            "2. Intended: a migration merged after checkout is not reported. Stated: docs/x.md:40", answer))
+        found = gate._plan_gate.form_problems(gate.premise_answers(gate.strip_quoted(body)), (2,))
+        assert found == [], (answer, found)
+
+
+@pytest.mark.parametrize("section", [_TEMPLATE_ISSUE, _BARE_LABELS])
+def test_an_unfilled_nine_item_section_is_not_six_answers(section):
+    # M6: the issue label, the devin-ready guard and check, before the epoch.
+    body = _issue(section)
+    assert _opened(body).add == ["premises-missing"]
+    assert _gaps(body) and _gaps(body, build=True)
+    plan = _devin(body, created=_OLD)
+    assert "devin-ready" in plan.remove
+
+
+@pytest.mark.parametrize("section", [_TEMPLATE_ISSUE, _BARE_LABELS])
+def test_the_plan_gate_blocks_an_unfilled_nine_item_section(tmp_path, section):
+    # M7.
+    assert _run_plan(tmp_path, _plan(section)).returncode == 2
+
+
+def test_a_grandfathered_unfilled_template_still_owes_its_answers(epoch):
+    # M8: an issue created before the epoch keeps the either-form rule, but bare
+    # labels are not six answers under it either.
+    assert _opened(_issue(_TEMPLATE_ISSUE), created="2026-11-01T00:00:00Z").add == ["premises-missing"]
+
+
+def test_a_complete_new_form_and_an_old_six_still_pass(tmp_path):
+    # An old six the detector claims (answer 1 opens 'Observed:', answer 4
+    # 'Searched:'), with answers that open with a form word and say little:
+    # today's rule passes it, so it still passes.
+    claimed = _OLD_SIX.replace("1. n/a — no outside behaviour.", "1. Observed: no outside behaviour.").replace(
+        "2. Searched scripts/ for x; nothing.", "2. Shape: none").replace(
+        "4. Caller: the CI job, tracked by #42.", "4. Searched: caller is #12")
+    assert gate._plan_gate.is_new_form(gate.premise_answers(gate.strip_quoted(_issue(claimed))))
+    assert _opened(_issue(claimed)).add == []
+    assert _run_plan(tmp_path, _plan(claimed)).returncode == 0
+    assert _opened(_issue(_PROBLEM)).add == []
+    assert _opened(_issue(_PROBLEM + _CHANGE)).add == []
+    assert _opened(_issue(_OLD_SIX)).add == []
+
+
+def test_items_left_as_the_template_placeholder_are_unanswered(tmp_path, epoch):
+    """The template's own placeholder names the sub-label; it is not the answer."""
+    template = {n: line for n, line in enumerate(gate._plan_gate._form_template().splitlines(), start=1)}
+    body = _PROBLEM
+    body = body.replace(
+        "2. Intended: a migration merged after checkout is not reported. Stated: docs/x.md:40",
+        template[2].strip())
+    body = body.replace(
+        "5. Acceptance: a migration merged after checkout passes, a deleted one is still reported. "
+        "Wrong fix: pinning the base to HEAD.", template[5].strip())
+    answers = gate.premise_answers(gate.strip_quoted(_issue(body)))
+    assert [n for n, _ in gate._plan_gate.form_problems(answers, gate._plan_gate.PROBLEM_BLOCK)] == [2, 5]
+    assert gate.premise_gaps(_issue(body + _CHANGE), build=True, created_at=_NEW)[1]
+    assert _run_plan(tmp_path, _plan(body + _CHANGE), epoch="2026-11-15T00:00:00Z").returncode == 2
+
+
+def test_the_label_strip_takes_only_a_leading_run():
+    assert not gate._plan_gate.field_empty("TBD Shape: later")
+    assert gate._plan_gate.field_empty("Cost: Stated: Wrong fix:")

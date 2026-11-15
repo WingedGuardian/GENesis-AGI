@@ -160,12 +160,14 @@ def missing_answers(body: str, *, bug: bool = False) -> list[int]:
     return [n for n in range(1, count + 1) if _empty(answers.get(n, ""))]
 
 
-def _written(n: int, answer: str) -> str:
-    """What answer ``n`` says after its nine-item label (the whole answer when the
-    label is absent), so a bare ``Mechanism:`` or one left as the template's
-    placeholder reads as empty."""
-    after = _plan_gate._after_label(_plan_gate.FORM[n - 1][0], answer)
-    return answer if after is None else after
+def _written(n: int, answer: str) -> bool:
+    """Whether answer ``n`` says anything past its nine-item labels (the whole
+    answer is judged when the label is absent), so a bare ``Mechanism:``, a run
+    of labels, or the template's placeholder reads as not written."""
+    fields = _plan_gate.form_fields(n, answer)
+    if fields is None:
+        return not _empty(answer)
+    return not _plan_gate.field_empty(fields[0])
 
 
 def premise_gaps(
@@ -193,7 +195,11 @@ def premise_gaps(
     # An issue created before the epoch keeps that rule after it too; a paid build
     # never does (the guard ignores grandfathering).
     grandfathered = not build and epoch is not None and created_at < epoch
-    if (epoch is None or grandfathered) and not old_missing:
+    # The either-form rule reads the six with form labels taken off when the
+    # section is in the nine-item form (``six_missing``): bare labels are not
+    # answers, so the unfilled template does not pass as six answered questions.
+    either_missing = _plan_gate.six_missing(answers) if answers is not None else old_missing
+    if (epoch is None or grandfathered) and not either_missing:
         # Until the epoch, EITHER complete form passes (spec, PR 2a): six
         # non-empty answers pass as they do today, whatever form they look
         # like, so the nine-item rules only loosen before then.
@@ -201,7 +207,7 @@ def premise_gaps(
     if not new_form and not required:
         return _QUESTIONS, old_missing, {}
     change_written = new_form and any(
-        not _empty(_written(n, answers.get(n, ""))) for n in _plan_gate.CHANGE_BLOCK
+        _written(n, answers.get(n, "")) for n in _plan_gate.CHANGE_BLOCK
     )
     need = _plan_gate.PROBLEM_BLOCK
     if build or change_written:

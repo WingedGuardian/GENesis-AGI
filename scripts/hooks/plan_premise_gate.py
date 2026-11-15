@@ -161,6 +161,84 @@ def is_new_form(answers: dict[int, str] | None) -> bool:
     return any(_after_label(FORM[n - 1][0], answers.get(n, "")) is not None for n in others)
 
 
+#: Every label the form uses, main and sub. A field that is only labels (``Cost:
+#: Searched:`` read as item 3) is empty: a label is not an answer.
+_ALL_LABELS = tuple(label for label, _ in FORM) + tuple(_SUBLABELS.values()) + ("Problem",)
+_LEADING_LABELS = re.compile(
+    r"\A\s*(?:(?:"
+    + "|".join(r"\s+".join(re.escape(w) for w in lab.split()) for lab in _ALL_LABELS)
+    + r")\s*:\s*)+",
+    re.IGNORECASE,
+)
+
+
+def _sublabel_at(sub: str, body: str) -> re.Match[str] | None:
+    """Where the sub-label ``sub:`` starts a field in ``body``, or None.
+
+    A field starts at the beginning, after a sentence end or a newline, or where
+    the label is written capitalized as the form writes it (``Stated:``,
+    ``Wrong fix:``). Prose such as "works as stated: nothing" is not the field."""
+    words = sub.split()
+    loose = r"\s+".join(re.escape(w) for w in words)
+    after_break = re.compile(rf"(?:\A|(?<=[.;!?)\n]))\s*({loose})\s*:", re.IGNORECASE)
+    first, rest = words[0], words[1:]
+    capital = re.escape(first[0].upper()) + "(?i:" + re.escape(first[1:]) + ")"
+    tail = "".join(r"\s+(?i:" + re.escape(w) + ")" for w in rest)
+    capitalized = re.compile(rf"\b({capital}{tail})\s*:")
+    found = [m for m in (after_break.search(body), capitalized.search(body)) if m]
+    return min(found, key=lambda m: m.start(1)) if found else None
+
+
+def form_fields(n: int, answer: str) -> tuple[str, str | None] | None:
+    """Answer ``n`` split into ``(main, sub)`` after its label, or None when the
+    answer does not start with the label. ``sub`` is the text after the item's
+    sub-label (None when it has none, or when the item takes none). Each part
+    is judged on its own: a filled sub-label never fills an empty main answer."""
+    body = _after_label(FORM[n - 1][0], answer)
+    if body is None:
+        return None
+    sub = _SUBLABELS.get(n)
+    # The template's own placeholder holds the sub-label's name ("<what should
+    # happen. Stated: the doc ...>"), so search with placeholders blanked; the
+    # offsets still index the original text.
+    masked = _PLACEHOLDER.sub(lambda m: " " * len(m.group()), body)
+    found = _sublabel_at(sub, masked) if sub else None
+    if found is None:
+        return body, None
+    return body[: found.start(1)], body[found.end() :]
+
+
+def six_missing(answers: dict[int, str]) -> list[int]:
+    """Which of the six answers are empty, for the either-form rule.
+
+    Today's rule, plus one case: in a section the nine-item form detector
+    claims, an answer that is nothing but form labels and placeholders counts as
+    empty. Otherwise the unfilled nine-item template, whose six first answers
+    are bare labels, would pass as six answered questions. A label followed by
+    any text ("Shape: none") keeps today's result, so an old six whose answers
+    happen to open with a form word is unchanged. The residual: in such a
+    section, an answer that is a bare label with no text ("Searched:") newly
+    counts as empty."""
+    if not is_new_form(answers):
+        return [n for n in range(1, len(_QUESTIONS) + 1) if _empty(answers.get(n, ""))]
+    return [
+        n
+        for n in range(1, len(_QUESTIONS) + 1)
+        if _empty(answers.get(n, "")) or _label_only(answers.get(n, ""))
+    ]
+
+
+def _label_only(text: str) -> bool:
+    """Whether ``text`` is nothing but a leading run of form labels and placeholders."""
+    rest = _LEADING_LABELS.sub("", text, count=1)
+    return not _PLACEHOLDER.sub("", rest).replace("\u200b", "").strip()
+
+
+def field_empty(text: str | None) -> bool:
+    """Whether a field says nothing once a leading run of labels is taken off."""
+    return text is None or _empty(_LEADING_LABELS.sub("", text, count=1))
+
+
 def _after_label(label: str, answer: str) -> str | None:
     """The text after ``label:`` at the start of ``answer``, or None without it."""
     found = re.match(rf"\s*{re.escape(label)}\s*:\s*(.*)\Z", answer, re.IGNORECASE | re.DOTALL)
@@ -182,20 +260,18 @@ def form_problems(
             continue
         label = FORM[n - 1][0]
         answer = answers.get(n, "")
-        body = _after_label(label, answer)
-        if body is None:
+        fields = form_fields(n, answer)
+        if fields is None:
             why = "is missing or empty" if _empty(answer) else f"does not start with `{label}:`"
             out.append((n, why))
             continue
-        if _empty(body):
+        main, subtext = fields
+        if field_empty(main):
             out.append((n, "is missing or empty"))
             continue
         sub = _SUBLABELS.get(n)
-        if sub:
-            spelled = r"\s+".join(re.escape(w) for w in sub.split())
-            found = re.search(rf"\b{spelled}\s*:\s*(.*)\Z", body, re.IGNORECASE | re.DOTALL)
-            if found is None or _empty(found.group(1)):
-                out.append((n, f"has no `{sub}:` answer"))
+        if sub and field_empty(subtext):
+            out.append((n, f"has no `{sub}:` answer"))
     return out
 
 
@@ -260,12 +336,10 @@ def _check(payload: dict) -> int:
     template = _form_template() if (epoch is not None or is_new_form(answers)) else _old_template()
     if answers is None:
         problems = ["the plan has no `## Premise checks` section"]
-    elif epoch is None and not any(
-        _empty(answers.get(n, "")) for n in range(1, len(_QUESTIONS) + 1)
-    ):
-        # Until the epoch, EITHER complete form passes: six non-empty answers
-        # pass here exactly as they do today, whatever form they look like.
-        # The nine-item rules can only loosen before then, never tighten.
+    elif epoch is None and not six_missing(answers):
+        # Until the epoch, EITHER complete form passes: six answers pass here as
+        # they do today (``six_missing``: only an answer that is nothing but form
+        # labels newly counts as empty, so an unfilled template does not pass).
         problems = []
     elif is_new_form(answers):
         problems = [
