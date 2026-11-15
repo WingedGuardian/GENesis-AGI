@@ -155,6 +155,8 @@ REMEDIATION_MAP: dict[str, frozenset[str]] = {
     # MCP servers held by a shared Codex app-server past codex_mcp_stop.propose_at_mb
     # (#4302): remedied by the codex_mcp_stop tool, which runs under process control.
     "infra:codex_mcp_held": frozenset({"container.process_control"}),
+    # One process over process_stop.propose_at_mb of RAM+swap: process_stop.
+    "infra:process_memory_high": frozenset({"container.process_control"}),
     "infra:qdrant_collections_missing": frozenset({"qdrant.local"}),
     "provider:qdrant_unreachable": frozenset({"qdrant.local"}),
     "genesis:update_failed": frozenset({"container.services"}),
