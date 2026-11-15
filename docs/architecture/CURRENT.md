@@ -2875,7 +2875,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: c712f1bde 2026-11-06
+verified: 956d69d62 2026-11-15
 ```
 
 - **Peer-handoff surface (2026-09-26)**: a SessionStart hook
@@ -3224,6 +3224,11 @@ verified: c712f1bde 2026-11-06
   uncovered or stale declarations, including previews; old evidence still parses
   and reasoned `E2E: none` declarations need no mapping. The shared source parser
   also supplies the existing script facade (verified: 2026-11-06).
+  `scripts/verification_review.py prepare` acquires private source packets through
+  `session_awareness/pr_verification_sources.py`: bracketed PR identities, complete
+  file pagination, Git-parsed diff reconciliation and content digests. It acquires
+  review inputs only; it does not judge evidence or authorize a close. Usage and
+  refusal bounds: `docs/reference/verification-review.md`.
   Fixture lookup injection stays outside the public MCP schema. Its
   server-side calibration gate forces preview until operator opt-in, including
   attempt notes. Real writes use a separate admitted existing-only connection;
