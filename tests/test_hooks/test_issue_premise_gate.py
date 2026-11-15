@@ -48,6 +48,10 @@ hook = private_module("issue_premise_gate_under_test", _HOOK)
 gate = private_module("premise_gate_for_issue_hook", _SCRIPTS / "premise_gate.py")
 
 CANON = "acme/widget"
+#: FORM_EPOCH overrides (``_TEST_PREMISE_FORM_EPOCH``): every new issue is
+#: created before _BEFORE and after _AFTER, whatever today's date is.
+_BEFORE = "2999-01-01T00:00:00Z"
+_AFTER = "2026-01-01T00:00:00Z"
 
 SIX = """## Summary
 Do the thing in `scripts/x.py`.
@@ -112,6 +116,9 @@ def _environ(monkeypatch, *, dispatched=False, extra=None):
     for name in ("GENESIS_CC_SESSION", "GH_REPO", "GH_HOST"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", CANON)
+    # The hook stamps a new issue with the wall clock; a far epoch keeps these
+    # tests on the pre-epoch side whatever today is (post-epoch: _AFTER).
+    monkeypatch.setenv("_TEST_PREMISE_FORM_EPOCH", _BEFORE)
     if dispatched:
         monkeypatch.setenv("GENESIS_CC_SESSION", "1")
     for k, v in (extra or {}).items():
@@ -135,6 +142,7 @@ def _sub_env(extra=None, *, dispatched=False):
         k: v for k, v in os.environ.items() if k not in ("GENESIS_CC_SESSION", "GH_REPO", "GH_HOST")
     }
     env["_TEST_CANONICAL_PUBLIC_REPO"] = CANON
+    env["_TEST_PREMISE_FORM_EPOCH"] = _BEFORE
     if dispatched:
         env["GENESIS_CC_SESSION"] = "1"
     env.update(extra or {})
@@ -353,6 +361,47 @@ def test_2_a_partial_body_names_exactly_the_missing_answers(monkeypatch, capsys,
     for n in (1, 3, 4, 5):
         assert f"answer {n} (" not in err
     assert f"(body read from {tmp_path / 'issue.md'})" in err
+
+
+_PROBLEM = """## Summary
+Make `scripts/x.py` compare against the merge base.
+
+## Premise checks
+1. Observed: the guard reports a merged migration as deleted (main at abc123); not a stale tree.
+2. Intended: a migration merged after checkout is not reported. Stated: docs/x.md:40
+3. Cost: every PR opened before a migration lands, counted from CI runs.
+4. Searched: issues for "migration guard", main and rulings; nothing.
+5. Acceptance: a merged migration passes, a deleted one is still reported. Wrong fix: pinning the base to HEAD.
+"""
+
+
+def test_after_the_epoch_a_six_answer_body_is_refused_naming_the_conversion(
+    monkeypatch, capsys, tmp_path
+):
+    six = _file(tmp_path, SIX, "six.md")
+    code, _, err = _call(
+        monkeypatch, capsys, _create("-F", str(six)), extra={"_TEST_PREMISE_FORM_EPOCH": _AFTER}
+    )
+    assert code == 2 and "six-question form" in err and "1. Observed:" in err
+
+
+def test_after_the_epoch_a_problem_block_passes(monkeypatch, capsys, tmp_path):
+    body = _file(tmp_path, _PROBLEM, "problem.md")
+    extra = {"_TEST_PREMISE_FORM_EPOCH": _AFTER}
+    assert _call(monkeypatch, capsys, _create("-F", str(body)), extra=extra) == (0, "", "")
+
+
+def test_after_the_epoch_a_bug_label_owes_the_problem_block_not_verification(
+    monkeypatch, capsys, tmp_path
+):
+    extra = {"_TEST_PREMISE_FORM_EPOCH": _AFTER}
+    verified = _file(tmp_path, VERIFIED, "verified.md")
+    code, _, err = _call(
+        monkeypatch, capsys, _create("-l", "bug", "-F", str(verified)), extra=extra
+    )
+    assert code == 2 and "## Premise checks" in err and "## Verification" not in err
+    problem = _file(tmp_path, _PROBLEM, "problem.md")
+    assert _call(monkeypatch, capsys, _create("-l", "bug", "-F", str(problem)), extra=extra)[0] == 0
 
 
 def test_3_a_complete_body_passes_silently(monkeypatch, capsys):

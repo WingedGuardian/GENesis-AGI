@@ -11,7 +11,9 @@ PreToolUse: Bash. It BLOCKS (stderr + exit 2) a foreground ``gh issue create`` (
 its alias ``new``) when the server gate's own rule, ``premise_gate.owed_answers``,
 says the body owes answers: the ``## Premise checks`` answers for a work issue (the
 six, or the nine-item form's Problem block; ``premise_gate.premise_gaps``),
-the five ``## Verification`` answers for one labelled ``bug``. The block names the
+the five ``## Verification`` answers for one labelled ``bug`` and created before
+``FORM_EPOCH`` (the hook stamps the current time, so from the epoch a ``bug``
+create owes the Problem block too). The block names the
 missing section and numbers, shows the format, and points at ``python3
 scripts/premise_gate.py check <number>``. It asks for work, never for approval, so
 the agent can satisfy it alone.

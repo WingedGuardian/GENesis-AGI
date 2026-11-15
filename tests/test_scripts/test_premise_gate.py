@@ -19,6 +19,19 @@ from tests.conftest import private_module
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "premise_gate.py"
 gate = private_module("premise_gate_under_test", _SCRIPT)
 
+
+@pytest.fixture(autouse=True)
+def _six_question_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests pin the epoch unset. For the label job that is the rule issues
+    created before ``FORM_EPOCH`` still follow. For the ``devin-ready`` guard and
+    ``check`` it is the rule from before the switch: they now owe the nine
+    whatever the date, so here they pin the guard's mechanics (removal, the
+    aside comment, the one-comment rule), not which form passes. The shipped
+    epoch's rules are tested in ``test_premise_form.py``."""
+    monkeypatch.setattr(gate._plan_gate, "FORM_EPOCH", None)
+    monkeypatch.delenv("_TEST_PREMISE_FORM_EPOCH", raising=False)
+
+
 _COMPLETE = """## Summary
 Do the thing in `scripts/x.py`.
 

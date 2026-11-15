@@ -48,6 +48,10 @@ def home(tmp_path: Path) -> Path:
 def _call(home: Path, payload: dict | str) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GENESIS_")}
     env["HOME"] = str(home)
+    # These tests pin the reader's mechanics in the six-question form, so they run
+    # with the epoch unset. The nine-item path plans take now that FORM_EPOCH is
+    # set is tested in tests/test_scripts/test_premise_form.py.
+    env["_TEST_PREMISE_FORM_EPOCH"] = "none"
     return subprocess.run(
         [sys.executable, str(_HOOK)],
         input=payload if isinstance(payload, str) else json.dumps(payload),
