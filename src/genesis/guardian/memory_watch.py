@@ -39,6 +39,7 @@ from genesis.guardian.pool import (
     TIER_HIGH,
     TIER_OK,
     TIER_WARN,
+    AlertDecision,
     _tier_for,
     decide_alert,
 )
@@ -108,6 +109,18 @@ def _held_tier(
     return _worse(raw, held)
 
 
+def _exit_margin(cfg: MemoryTiersConfig) -> float:
+    """The configured exit margin in points, or 5 when it is not a number.
+    A bad value must not take the RAM watch down every tick."""
+    try:
+        return max(0.0, float(cfg.exit_margin_pct))
+    except (TypeError, ValueError):
+        logger.warning(
+            "memory_tiers.exit_margin_pct=%r is not a number; using 5", cfg.exit_margin_pct
+        )
+        return 5.0
+
+
 def memory_axis_tiers(
     container_pct: float | None,
     host_pct: float | None,
@@ -116,14 +129,7 @@ def memory_axis_tiers(
 ) -> dict[str, str]:
     """Per-axis tiers, each held by the exit margin against its prior tier."""
     prior = prior or {}
-    try:
-        margin = max(0.0, float(cfg.exit_margin_pct))
-    except (TypeError, ValueError):
-        # A bad value must not take the RAM watch down every tick.
-        logger.warning(
-            "memory_tiers.exit_margin_pct=%r is not a number; using 5", cfg.exit_margin_pct
-        )
-        margin = 5.0
+    margin = _exit_margin(cfg)
     return {
         "container": _held_tier(
             container_pct,
@@ -231,6 +237,7 @@ async def check_memory_and_alert(
     # from before ``axes`` existed seeds both axes from its ``tier``.
     state_file = config.state_path / "memory_alert_state.json"
     peak = TIER_OK
+    paged: str | None = None
     axes_prior: dict[str, str] = {}
     blind_prior: dict[str, str] = {}
     last_alert_at: datetime | None = None
@@ -239,6 +246,9 @@ async def check_memory_and_alert(
             data = json.loads(state_file.read_text())
             raw_peak = data.get("tier", TIER_OK)
             peak = raw_peak if isinstance(raw_peak, str) and raw_peak in _TIER_RANK else TIER_OK
+            raw_paged = data.get("paged")
+            if isinstance(raw_paged, str) and raw_paged in _TIER_RANK:
+                paged = raw_paged
             raw_axes = data.get("axes")
             if isinstance(raw_axes, dict):
                 axes_prior = {
@@ -280,19 +290,35 @@ async def check_memory_and_alert(
         baseline = tier
     decision = decide_alert(tier, baseline, last_alert_at, now, cfg.realert_hours)
 
+    # Severity and the exhaustion warning follow what was MEASURED (plus what
+    # a blind axis holds), not a tier the exit margin is holding up: 87% held
+    # at CRIT by the margin is not "near exhaustion". A blind axis's hold
+    # counts for one re-alert window; after that it is stale and no longer
+    # sets the severity (the page still names it).
+    measured = memory_worst_tier(container_pct, host_pct, cfg)
+    blind_hours: dict[str, float] = {}
+    for pct, axis in ((container_pct, "container"), (host_pct, "host")):
+        if pct is None:
+            blind_hours[axis] = _hours_since(blind_since[axis], now)
+            if blind_hours[axis] < cfg.realert_hours:
+                measured = _worse(measured, axes[axis])
+    # ``live`` is ``tier`` without a stale blind hold: what the readings (with
+    # their exit margin) and a fresh blind hold support. ``paged`` is the live
+    # tier the last page went out at. A stale hold can keep ``tier`` level
+    # while the pressure behind it rises, e.g. a container blind since a CRIT
+    # page while host RAM climbs to CRIT: that rise is news, so it pages. The
+    # margin stays in ``live``, so a reading hovering at a line still pages
+    # once. A state file from before ``paged`` existed seeds it from the peak.
+    live = TIER_OK
+    for pct, axis in ((container_pct, "container"), (host_pct, "host")):
+        if pct is not None or blind_hours[axis] < cfg.realert_hours:
+            live = _worse(live, axes[axis])
+    if paged is None:
+        paged = peak
+    if not decision.should_alert and _TIER_RANK[live] > _TIER_RANK[paged]:
+        decision = AlertDecision(True, tier, f"pressure rose {paged}→{live}")
+
     if decision.should_alert:
-        # Severity and the exhaustion warning follow what was MEASURED (plus
-        # what a blind axis holds), not a tier the exit margin is holding up:
-        # 87% held at CRIT by the margin is not "near exhaustion".
-        # A blind axis's hold counts for one re-alert window; after that it is
-        # stale and no longer sets the severity (the page still names it).
-        measured = memory_worst_tier(container_pct, host_pct, cfg)
-        blind_hours: dict[str, float] = {}
-        for pct, axis in ((container_pct, "container"), (host_pct, "host")):
-            if pct is None:
-                blind_hours[axis] = _hours_since(blind_since[axis], now)
-                if blind_hours[axis] < cfg.realert_hours:
-                    measured = _worse(measured, axes[axis])
         if decision.is_resolution:
             severity = AlertSeverity.INFO
             title = "RAM pressure recovered"
@@ -312,7 +338,7 @@ async def check_memory_and_alert(
         if measured != tier and not decision.is_resolution:
             body += (
                 f" (measured {measured}; held at {tier} until the reading falls "
-                f"{cfg.exit_margin_pct:g} points below the {tier} line)"
+                f"{_exit_margin(cfg):g} points below the {tier} line)"
             )
         if measured == TIER_CRIT:
             body += (
@@ -330,6 +356,7 @@ async def check_memory_and_alert(
     # blind-axis hold see the tier each axis held last time.
     if decision.should_alert:
         peak = TIER_OK if decision.is_resolution else tier
+        paged = TIER_OK if decision.is_resolution else live
     new_alert_at = now if decision.should_alert else last_alert_at
     try:
         state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -337,6 +364,7 @@ async def check_memory_and_alert(
             json.dumps(
                 {
                     "tier": peak,
+                    "paged": paged,
                     "axes": axes,
                     "blind_since": blind_since,
                     "last_alert_at": new_alert_at.isoformat() if new_alert_at else None,

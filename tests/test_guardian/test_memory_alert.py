@@ -15,6 +15,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from genesis.guardian import memory_watch
 from genesis.guardian.alert.base import AlertSeverity
 from genesis.guardian.config import GuardianConfig, MemoryTiersConfig
@@ -367,6 +369,56 @@ async def test_a_long_blind_hold_stops_setting_the_severity(tmp_path):
     assert "container unmeasured for 7.0h (holding crit)" in page.body
     await _run(config, disp, [(60.0, 50.0)])  # read again: the clock clears
     assert "container" not in json.loads(state_file.read_text())["blind_since"]
+
+
+async def test_a_measured_rise_pages_past_a_stale_blind_hold(tmp_path):
+    """A container blind since a CRIT page holds CRIT; once that hold is stale
+    and paged as a WARNING, host RAM rising to CRIT must page CRITICAL at once,
+    not wait out another window behind the held CRIT."""
+    config = _config(tmp_path, realert_hours=6.0)
+    disp = _FakeDispatcher()
+    await _run(config, disp, [(95.0, 50.0), (None, 50.0)])
+    state_file = config.state_path / "memory_alert_state.json"
+    data = json.loads(state_file.read_text())
+    stale = (datetime.now(UTC) - timedelta(hours=7)).isoformat()
+    data["blind_since"]["container"] = stale
+    data["last_alert_at"] = stale
+    state_file.write_text(json.dumps(data))
+    await _run(config, disp, [(None, 50.0)])
+    assert disp.sent[-1].severity == AlertSeverity.WARNING
+    sent = len(disp.sent)
+    await _run(config, disp, [(None, 96.0)])
+    assert len(disp.sent) == sent + 1
+    page = disp.sent[-1]
+    assert page.severity == AlertSeverity.CRITICAL
+    assert "pressure rose ok→crit" in page.body
+    await _run(config, disp, [(None, 96.0)])  # the same measured tier is not news
+    assert len(disp.sent) == sent + 1
+
+
+@pytest.mark.parametrize("under, over", [(73.0, 76.0), (90.0, 93.0)])
+async def test_a_reminder_that_lands_under_the_line_does_not_double_page(tmp_path, under, over):
+    """Architect review: a reminder taken on a reading the margin holds up must
+    not make the next reading over the line look like a fresh rise."""
+    config = _config(tmp_path, realert_hours=6.0)
+    disp = _FakeDispatcher()
+    await _run(config, disp, [(over, 10.0), (under, 10.0), (over, 10.0)])
+    assert len(disp.sent) == 1
+    _backdate(config, 7)
+    await _run(config, disp, [(under, 10.0)])
+    assert len(disp.sent) == 2 and "sustained" in disp.sent[-1].body
+    await _run(config, disp, [(over, 10.0), (under, 10.0), (over, 10.0)])
+    assert len(disp.sent) == 2
+
+
+async def test_a_held_reminder_with_a_non_numeric_margin_still_sends(tmp_path):
+    config = _config(tmp_path, exit_margin_pct=None)
+    disp = _FakeDispatcher()
+    await _run(config, disp, [(78.0, 10.0)])
+    _backdate(config, 7)
+    await _run(config, disp, [(72.0, 10.0)])  # held at WARN by the default margin
+    assert len(disp.sent) == 2
+    assert "falls 5 points below the warn line" in disp.sent[-1].body
 
 
 async def test_a_non_numeric_margin_falls_back(tmp_path):
