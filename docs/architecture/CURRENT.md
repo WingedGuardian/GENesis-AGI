@@ -85,8 +85,10 @@ physical completion through their RequestDatabase unit. Legacy connections keep
 ordinary thread cancellation. The retriever forwards the facade to tag expansion;
 tag scans run in independently admitted background units, with accepted-task
 completion as the single-flight release. Pressure or draining serves the stale
-query. Other maintenance threads and shared provider closers still need factory
-qualification; this is not a shared-service activation.
+query. The explicit shared factory additionally owns the builtin embedding
+clients and cache handles while retaining separate storage/recall providers.
+Other maintenance threads retain their existing lifetime. This is not a
+shared-service activation; factory qualification is scoped separately.
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
 `memory_fts`) and Qdrant share no transaction, so drift (orphaned "ghost"
@@ -1911,12 +1913,14 @@ modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
 verified: 6b4f275 2026-11-08
 ```
 
-Scoped verification: internal `mcp/shared_http` composition only. It receives
+Scoped verification covers `mcp/shared_http` composition. It receives
 initialized request-owned resources and supplies SDK transport limits, app-wide
 authority/authentication, per-message caller/profile binding, shared/local
 ancestry admission, nonblocking tool capacity and authenticated version/catalog
-status. No launcher selects it; owned bootstrap, native clients and rollout
-remain separate. See `docs/reference/shared-mcp-http.md`. That scoped check
+status. The gated explicit `--shared-service` path constructs the actual
+standalone services with a bounded facade, frozen limits and outer resource
+owner. Ordinary session selection remains unchanged. Unit readiness, native
+clients and rollout remain separate. See `docs/reference/shared-mcp-http.md`. That scoped check
 (5a3de4eee, 2026-11-08) does not requalify the other channels/interfaces subsystems.
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -2112,9 +2116,16 @@ the shared banner is not an assertion about all concurrent sessions.
   metadata is observable and exactly revocable without clearing independent
   holds. Retained selected trials settle once; failed-origin work cannot become
   automatic pending work, and missing/corrupt bindings preserve work and retain
-  uncertainty. New selected launch acknowledgements and ordinary-owner routes
-  refuse selected provenance. Selected consumption/execution remains separate;
-  provider arguments and automatic readiness are unchanged.
+  uncertainty. Captured `claim-selected` atomically consumes one current grant;
+  only its first committed reply reaches the same original actual owner. Spent
+  or lost replies cannot reconstruct runtime authority. Ordinary owner admission
+  still refuses selected provenance. GN binds ordinary versus selected recovery
+  argv to actual durable origin before owner construction and during source
+  recapture. Acceptance, cutover and automatic readiness remain separate gates.
+  Selected acknowledgements recheck repository-wide physical/control holds after
+  their final drain. A transient same-transaction fresh proof binds the original
+  lifetime subject and exact-sequence raw cleanup evidence; it grants no durable
+  override and leaves provider quarantine independent.
   Recovery evidence refuses partial zero-watermark acceptance receipts, matching
   ordinary admission; invalid positive receipts remain explicit safety evidence.
   The retained retry helper participates in existing server restart detection.
@@ -2228,7 +2239,9 @@ the shared banner is not an assertion about all concurrent sessions.
   Default initialization stays4; new native authority requires5, with no live
   cutover, acceptance setter or positive automatic readiness here. Explicit
   transaction-only retry grants in `index_marker_retry.py` require schema5 and
-  captured supervision; they do not implicitly migrate or enable automatic work.
+  captured supervision. Selected consumption shares the existing transaction,
+  final drain and physical owner, preserving original identity and first-commit
+  acknowledgement; it does not implicitly migrate or enable automatic work.
   Legacy uncertainty preserves original settlement/shared debt and uses
   non-claim observations for ambiguous pending/reused identities. Common scalar
   reduction covers reconciliation and embedded outcomes; import batches dedupe
@@ -3238,6 +3251,10 @@ verified: c712f1bde 2026-11-06
   uncovered or stale declarations, including previews; old evidence still parses
   and reasoned `E2E: none` declarations need no mapping. The shared source parser
   also supplies the existing script facade (verified: 2026-11-06).
+  Both writers also refuse a closing verdict while an event-gated gap's date has
+  come, and print or return advisory completeness prompts (`completeness_prompts`)
+  on every run; the prompts change no verdict and are not stored. They do not
+  replace the independent verifier (#4180; verified: 2026-11-14).
   Fixture lookup injection stays outside the public MCP schema. Its
   server-side calibration gate forces preview until operator opt-in, including
   attempt notes. Real writes use a separate admitted existing-only connection;
@@ -4722,8 +4739,9 @@ logger or unrelated exceptions with copied text and no provenance.
   `RequestDatabase` supplies a stable facade with one fresh physical connection
   per independent unit, bounded admission, retained cancellation cleanup and
   cursor closure. It preserves explicit CRUD commits and refuses expired scopes;
-  it does not provide whole-tool atomicity. Existing MCP initialization still
-  uses its legacy connection. `spawn_database_task` gives scoped detached
+  it does not provide whole-tool atomicity. Ordinary stdio and in-process MCP
+  initialization retain legacy connections; explicit shared startup uses the
+  facade. `spawn_database_task` gives scoped detached
   writers their own unit, preserves other caller context, and tracks jobs from
   scheduling through shutdown, including cancellation before start.
   Detached work requires explicit background connection and job-count budgets;
@@ -4738,7 +4756,8 @@ logger or unrelated exceptions with copied text and no provenance.
   fails shutdown; dependent provider closure requires positive settlement.
   `run_resource_thread` preserves ordinary legacy thread cancellation. These are
   internal prerequisites; the nine memory-consumer thread boundaries use them,
-  while shared factory wiring remains separate. Lease budgets bound database
+  and the explicit shared factory drains them before dependent provider closure.
+  Lease budgets bound database
   connections, not executor items.
   Activity, embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
   legacy connections keep ordinary task scheduling. Internal
@@ -4750,9 +4769,11 @@ logger or unrelated exceptions with copied text and no provenance.
   warmed once by the owning bootstrap; registration cannot rebind pending flushes
   or duplicate history. Scoped health supports the standalone status-file service,
   rejecting runtime snapshot sharing before changing registration. Reinitialization
-  replaces obsolete instrumentation in either DB mode. No CLI or transport
-  selects it yet; caller identity, bookmark policy and shared activation remain
-  separate work. See
+  replaces obsolete instrumentation in either DB mode. The explicit shared HTTP
+  launcher selects it with authenticated request callers and leaves pending
+  memory bookmark files for the per-session path. Ordinary stdio and in-process
+  initialization retain their existing paths; local bookmark consumption and
+  routing activation remain separate work. See
   `docs/reference/request-database.md` for lifecycle and failure semantics.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Every
@@ -5374,6 +5395,10 @@ logger or unrelated exceptions with copied text and no provenance.
   every child by one deadline 75 s after its start (`live_move_boot.py`: git,
   the guard's git through its `_DEADLINE`, restore-hooks, which ends 10 s early
   so the healed tree is judged in time; a call with no time left never starts;
+  the heal's own git ends 5 s early, `END_MARK_S`, and every end mark may run
+  into that reserve with a 1 s kill grace, so a crash's mark taken after the
+  heal's deadline is still real (#4548; a hung mark early in the run can use the
+  heal's time and the reserve, still inside the 90 s pin);
   the pin 5 + 75 + 3 + 1 + 4 <= 90 is tested, and a run past its deadline
   ended `exit-code`, not `timeout`, in a transient unit: measured 2026-11-11
   with a 20 s deadline; T-D34 repeats it only where a user manager exists). A `live` row judged
@@ -5385,10 +5410,14 @@ logger or unrelated exceptions with copied text and no provenance.
   `live` rollback stopped after `merging`, #3722's wording) with a `mixed`
   critical page, a failure before judging with `skipped`. Each page's key is
   its class, the state's bytes as the run leaves them and an end mark of the
-  checkout (HEAD, `status -z`, index.lock), so a heal that keeps a HOLD and the
+  checkout (HEAD, `status -z`, index.lock, and the lstat identity, ctime
+  included, of up to 20,000 listed paths other than the ephemeral ones, so an
+  edit to a file that is already modified or untracked moves it; #4548), so a heal that keeps a HOLD and the
   next boot's HOLD page once; a repeat of an unresolved heal (a heal that crashed
   partway, or was killed before it recorded a result, is retried once at the next start: owner
-  ruling, its attempts counted from the reports on disk; an end mark the deadline left unreadable
+  ruling, its attempts counted from the newest 8 reports among the newest 32 folders on disk; a heal
+  writes its first REPAIR.json as it starts, before anything is saved, so one that fails or is
+  killed before its backup is complete is counted too (#4548); an end mark the deadline left unreadable
   never counts as a change) with nothing
   changed refuses at once with no new backup, unless another kit is installed
   (its `kit_id` is part of the match). Every run, by command too, holds the kit's
@@ -5984,6 +6013,23 @@ verified: 81bbdb0a9 2026-11-08
   effects. Independent copied-artifact readback refuses incomplete or stale
   evidence; no production provider, native auth, lifecycle enrollment or live
   policy is added. See `docs/reference/codex-native-harness.md`.
+  A separate 17-case MCP elicitation experiment has its own frozen manifest and
+  reader. Proper approval metadata, data-form controls, request binding and
+  physical sink ordering are tested independently; synthetic fixture results
+  confer no production action authority or human-frontend qualification.
+  Its isolated frontend declares standard form input and a root user thread;
+  this permits the data-entry Never control without exempting proper approvals.
+  Initial native results were 15 passed / 2 failed; corrected expectations and client
+  declarations require a fresh complete run before qualification.
+  The elicitation reader checks all retained frames and binds interruption
+  server terminals and reader-thread completion receipts to their inputs.
+  Normal receipts must follow their own fixture outcome; interrupted completions
+  must follow their successful typed interrupt RPC acknowledgement in the raw
+  stream, including when completion is received during flush.
+  Foreign/stale controls finish on a current decline; EOF requires fresh
+  root/writer liveness, same-census ancestry and frozen known-child retirement
+  before fallback cleanup. Independent golden replies and atomic provider
+  indexing pin these witnesses; final contained verification remains required.
   Interactive native qualification records a Codex0.166.0 reference binary.
   The launcher warns on other recognizable versions and retains its startup
   inspection/refusal checks; those inspect state, not actual tool denial.

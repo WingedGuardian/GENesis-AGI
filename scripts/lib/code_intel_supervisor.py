@@ -1,4 +1,4 @@
-"""Captured explicit recovery operations; no opener, timer or native workload."""
+"""Captured explicit recovery operations using the existing queue and owner."""
 
 from __future__ import annotations
 
@@ -103,6 +103,7 @@ class Supervisor:
                 data["managed_config"],
                 policy,
                 unit=unit,
+                recovery=True,
             ) as inputs:
                 if data["provider"] == "cbm":
                     config = modules["managed"].runtime_config(
@@ -120,7 +121,7 @@ class Supervisor:
                         old_unit = queue._native.expected_unit(prior["trial"])
                         with admission.prepared_inputs(
                             snapshot, modules, repo, prior["provider"], prior["run_mode"],
-                            data["managed_config"], old_policy, unit=old_unit,
+                            data["managed_config"], old_policy, unit=old_unit, recovery=True,
                         ) as old:
                             prior_source = dict(nonce=prior["nonce"], source=old["source"])
                     except (OSError, ValueError):
@@ -168,6 +169,71 @@ class Supervisor:
                                              grant_sha256=grant_sha256)
         return result
 
+
+    def claim_selected(self, data):
+        """Only a fresh committed runtime reaches this same physical owner."""
+        self._guard()
+        snapshot, modules = self.snapshot, self.modules
+        queue, admission = modules["queue"], modules["owner_admission"]
+        native = queue._native
+        actual_owner = queue._recovery.owner_identity()
+        native._object(data, ("repo_path", "provider", "nonce", "managed_config"), "selected claim")
+        native._hex(data["nonce"], 32, "selected nonce")
+        repo = queue.canonical_repo(data["repo_path"])
+        h = queue.marker_hash(repo)
+        with admission.repository_lock_for(modules, repo, h):
+            grant = self._current_grant(h, data["provider"])
+            if grant is None or grant["nonce"] != data["nonce"] or grant["repo_path"] != repo:
+                raise ValueError("selected claim does not name the current grant")
+            if grant["status"] == "spent":
+                return dict(state="already_claimed", trial=grant["trial"], launch_authority=False)
+            manager = modules["scope"].ScopeManager(
+                modules["unit"].bus_call, modules["unit"].typed_property,
+                deadline=time.monotonic() + admission.wall_seconds(modules, grant["run_mode"], os.environ))
+            policy = admission.policy(modules, data["provider"], grant["run_mode"], manager, os.environ)
+            if actual_owner != queue._recovery.owner_identity():
+                raise ValueError("actual selected owner changed during policy lookup")
+            manager.require_no_batch(modules["unit"].cgroup_empty)
+            if actual_owner != queue._recovery.owner_identity():
+                raise ValueError("actual selected owner changed during batch census")
+
+            def capacity(control):
+                modules["admission"].assess_headroom(
+                    *modules["unit"].resolve_control_group(control), 8 * 1024**3,
+                    policy["sibling_reserve_bytes"], cache_reserve=policy["cache_reserve_bytes"])
+
+            manager.require_slice_capacity(policy["slice"], capacity)
+            unit = native.expected_unit(dict(hash=h, provider=data["provider"], claim_id=data["nonce"]))
+            with admission.prepared_inputs(snapshot, modules, repo, data["provider"], grant["run_mode"],
+                                           data["managed_config"], policy, unit=unit, recovery=True) as inputs:
+                if data["provider"] == "cbm":
+                    config = modules["managed"].runtime_config(modules["unit"].config_path(data["managed_config"]))
+                    modules["managed"].require_enabled(config)
+                if actual_owner != queue._recovery.owner_identity():
+                    raise ValueError("actual selected owner changed during preparation")
+                reserved = dict(unit=unit, run_mode=grant["run_mode"], source=inputs["source"],
+                    owner=actual_owner, cap_bytes=8 * 1024**3,
+                    **{key:policy[key] for key in ("route", "slice", "wall_seconds")})
+
+                def bind(context, actual):
+                    runtime = dict(context=context, reservation=actual, policy=policy,
+                        provider_options=inputs["provider_options"], environment_recipe=inputs["environment_recipe"])
+                    bound = snapshot.with_runtime(runtime)
+                    modules["queued"].runtime_inputs(bound, modules)
+                    return bound
+
+                request = dict(hash=h, provider=data["provider"], nonce=data["nonce"],
+                               reservation=reserved, policy_sha256=native.digest(policy))
+                with queue._decision_gate(native=True) as (db, finalize):
+                    result = queue._retry.consume(db, request, native, queue._legs, finalize=finalize,
+                        bind_runtime=bind, fresh_cleanup=queue._fresh_gate(db))
+                    if result is None:
+                        current_trial = queue._retry.load(db, h, data["provider"], native)["trial"]
+            if result is None:
+                return dict(state="already_claimed", trial=current_trial, launch_authority=False)
+            claimed, bound = result
+            state = admission.execute_runtime(bound, modules, actual_owner=actual_owner)  # No reserve or repository-lock reacquisition.
+            return dict(state=state or "open", trial=claimed["context"], launch_authority=False)
 
     def reconcile_context(self, context):
         self._guard()

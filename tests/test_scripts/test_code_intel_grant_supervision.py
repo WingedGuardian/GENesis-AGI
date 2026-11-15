@@ -99,11 +99,8 @@ def test_explicit_issue_uses_source_metadata_and_capacity_without_claiming_or_ex
     assert {row["attempts"] for row in queue.list_markers()} == {0}
 
 
-@pytest.mark.parametrize("enabled,sentinel", [(True, False), (False, False), (True, True)])
-def test_cbm_metadata_request_preserves_enablement_sentinel_and_shared_lease(
-    selection, tmp_path, monkeypatch, enabled, sentinel
-):
-    supervisor, request, calls, activity, modules = configured(selection, tmp_path, monkeypatch, 5)
+def cbm_configuration(supervisor, request, modules, monkeypatch, *, enabled=True, sentinel=False):
+    """Existing accepted-config/lease fixture shared by metadata and selected cases."""
     queue, managed, root = modules["queue"], modules["managed"], supervisor.snapshot.root
     queue.write_marker(str(root), "cbm", "full")
     config = dict(version=2, main=str(root), binary=str(root / "synthetic-binary"),
@@ -143,6 +140,17 @@ def test_cbm_metadata_request_preserves_enablement_sentinel_and_shared_lease(
     monkeypatch.setattr(managed, "show", lambda *args, **kwargs: {"UnitFileState": "enabled" if enabled else "disabled"})
     monkeypatch.setattr(queue._retry, "issue", issue)
     request.update(provider="cbm", managed_config=str(settings))
+    return held, streams, observed
+
+
+@pytest.mark.parametrize("enabled,sentinel", [(True, False), (False, False), (True, True)])
+def test_cbm_metadata_request_preserves_enablement_sentinel_and_shared_lease(
+    selection, tmp_path, monkeypatch, enabled, sentinel
+):
+    supervisor, request, calls, activity, modules = configured(selection, tmp_path, monkeypatch, 5)
+    queue = modules["queue"]
+    held, streams, observed = cbm_configuration(
+        supervisor, request, modules, monkeypatch, enabled=enabled, sentinel=sentinel)
     before = queue.database_path().read_bytes()
     if enabled and not sentinel:
         grant = supervisor.request_retry(request)
@@ -158,3 +166,75 @@ def test_cbm_metadata_request_preserves_enablement_sentinel_and_shared_lease(
     with closing(queue._connect()) as db:
         assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM inflight").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("lost_ack", [False, True])
+def test_selected_supervisor_runs_only_its_first_acknowledged_actual_owner(
+    selection, tmp_path, monkeypatch, lost_ack
+):
+    supervisor, request, calls, activity, modules = configured(selection, tmp_path, monkeypatch, 5)
+    queue = modules["queue"]
+    operation = getattr(supervisor, "claim_selected", None)
+    assert callable(operation), "selected runtime must reach the same supervised actual owner"
+    grant = supervisor.request_retry(request)
+    executions = []
+
+    class Owner:
+        def __init__(self, used, context, reserved, probe, manager):
+            assert used is modules and reserved["owner"] == queue._recovery.owner_identity()
+            self.context = context
+
+        def run(self, bound):
+            executions.append(self.context)
+            assert bound.runtime_value["context"] == self.context
+            assert queue.execution_status(self.context)["launch_permission"] == "reserved"
+            return None  # No workload or fabricated completion; original control stays open.
+
+    monkeypatch.setattr(modules["owner"], "PhysicalOwner", Owner)
+    data = dict(repo_path=request["repo_path"], provider="gitnexus", nonce=grant["nonce"],
+                managed_config="/unused")
+    original = queue._decision_gate
+    if lost_ack:
+        @contextmanager
+        def lost(*args, **kwargs):
+            with original(*args, **kwargs) as admitted:
+                yield admitted
+            raise OSError("synthetic lost committed acknowledgement")
+
+        monkeypatch.setitem(queue.claim_native.__globals__, "_decision_gate", lost)
+        with pytest.raises(OSError, match="lost committed"):
+            operation(data)
+        monkeypatch.setitem(queue.claim_native.__globals__, "_decision_gate", original)
+    else:
+        first = operation(data)
+        assert first["launch_authority"] is False and first["state"] == "open"
+    duplicate = operation(data)
+    assert duplicate["launch_authority"] is False
+    # The read-only preflight is advisory: the transaction must supply the
+    # actual already-consumed context even if that earlier read saw issued.
+    monkeypatch.setattr(supervisor, "_current_grant", lambda h, provider: grant)
+    stale_read = operation(data)
+    assert stale_read["trial"] == duplicate["trial"] and stale_read["launch_authority"] is False
+    assert len(executions) == (0 if lost_ack else 1)
+    with closing(queue._connect()) as db:
+        retained = queue._retry.load(db, grant["hash"], "gitnexus", queue._native)
+        assert retained["status"] == "spent" and duplicate["trial"] == retained["trial"]
+        assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM inflight").fetchone()[0] == 1
+        assert queue._native.execution(db, retained["trial"], queue._legs)["native_intent"] is None
+    assert not activity.exists()
+    entered = []
+
+    def forbidden(*args, **kwargs):
+        entered.append(True)
+        raise AssertionError("ordinary owner reached selected metadata")
+
+    admission = modules["owner_admission"]
+    policy = admission.policy(modules, "gitnexus", grant["run_mode"],
+                              modules["scope"].ScopeManager(), {})
+    monkeypatch.setattr(admission, "prepared_inputs", forbidden)
+    with pytest.raises(ValueError, match="selected"):
+        admission.reserve_runtime(supervisor.snapshot, modules, duplicate["trial"],
+                                  grant["run_mode"], "/unused", policy,
+                                  actual_owner=queue._recovery.owner_identity())
+    assert not entered

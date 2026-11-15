@@ -243,3 +243,72 @@ def test_concurrent_provider_actions_bind_to_their_own_append_index(monkeypatch)
             actual = [first.result(), second.result()]
         assert requests == [{"probe": index} for index in (0, 1, 2)]
         assert actual == [actions[2], actions[3]]
+
+
+@pytest.mark.parametrize("damage", [None, "root_dead", "writer_dead", "reused_writer", "detached", "already_terminal"])
+def test_eof_input_capture_rechecks_live_pending_owned_writer(tmp_path, monkeypatch, damage):
+    import copy
+
+    from tests.test_hooks import test_codex_elicitation_native as native
+    from tests.test_hooks.codex_elicitation_driver import ElicitationDriver
+    from tests.test_hooks.test_codex_elicitation_readback import golden, persist
+
+    evidence, sinks = golden(tmp_path, "approval_eof")
+    population = {10: copy.deepcopy(evidence["driver_before"]), 20: copy.deepcopy(evidence["owned"][0]["before"])}
+    ask = evidence["observed"][0]["message"]
+    driver = ElicitationDriver(SimpleNamespace(events=[], process=SimpleNamespace(pid=10)), tmp_path)
+    driver.consents.observe(ask)
+    monkeypatch.setattr(native, "census", lambda: population)
+    if damage == "root_dead":
+        population[10]["state"] = "Z"
+    elif damage == "writer_dead":
+        population[20]["state"] = "Z"
+    elif damage == "reused_writer":
+        population[20]["start"] += 1
+    elif damage == "detached":
+        population[20]["ppid"] = 99
+    elif damage == "already_terminal":
+        evidence["server"].append({**evidence["server"][-1], "event": "cancelled"})
+        persist(tmp_path, evidence, sinks)
+    if damage:
+        with pytest.raises(AssertionError):
+            native.capture_eof_live(driver, tmp_path, evidence, "thread", "turn-0")
+        assert not driver.observations
+    else:
+        native.capture_eof_live(driver, tmp_path, evidence, "thread", "turn-0")
+        assert evidence["eof_live"]["writers"] == [population[20]]
+        assert evidence["eof_live"]["ancestries"] == [[population[20], population[10]]]
+        assert evidence["eof_live"]["at"] < driver.observations[0]["at"] < evidence["eof_input_at"]
+        assert driver.observations[0]["label"] == "before-native-eof"
+
+
+@pytest.mark.parametrize("state", ["natural", "after_close", "survivor"])
+def test_natural_eof_capture_precedes_cleanup_and_freezes_children(tmp_path, monkeypatch, state):
+    from tests.test_hooks import test_codex_elicitation_native as native
+    from tests.test_hooks.codex_elicitation_driver import ElicitationDriver
+
+    driver = ElicitationDriver(SimpleNamespace(events=[]), tmp_path)
+    evidence = {"owned": [{"before": {"pid": 20, "start": 20}, "ancestry": [20, 10]}]}
+    called = []
+
+    def retirement(value):
+        called.append(True)
+        if state == "survivor":
+            raise RuntimeError("owned child survived")
+        value["owned"][0]["after"] = {"state": "absent"}
+
+    monkeypatch.setattr(native, "observe_retirement", retirement)
+    if state == "after_close":
+        driver.snapshot("before-close")
+        with pytest.raises(AssertionError):
+            native.capture_natural_eof(driver, evidence)
+        assert not called
+    elif state == "survivor":
+        with pytest.raises(RuntimeError, match="survived"):
+            native.capture_natural_eof(driver, evidence)
+        assert "eof_natural" not in evidence and not driver.observations
+    else:
+        native.capture_natural_eof(driver, evidence)
+        evidence["owned"][0]["after"]["state"] = "S"
+        assert evidence["eof_natural"][0]["after"] == {"state": "absent"}
+        assert [row["label"] for row in driver.observations] == ["native-eof-retired"]
