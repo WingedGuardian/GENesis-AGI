@@ -2248,13 +2248,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE tool_call_outcomes ADD COLUMN tool_use_id TEXT",
         "tool_call_outcomes.tool_use_id",
     )
-    # Class of each failed call (#4722). Mirrored in migration
-    # 20261115161928_tco_error_class for the standalone runner.
-    await _try_alter(
-        db,
-        "ALTER TABLE tool_call_outcomes ADD COLUMN error_class TEXT",
-        "tool_call_outcomes.error_class",
-    )
+    # Class of each failed call and the writer's insert time (#4722). Mirrored
+    # in migration 20261115161928_tco_error_class_recorded_at for the runner.
+    for _col in ("error_class", "recorded_at"):
+        await _try_alter(
+            db,
+            f"ALTER TABLE tool_call_outcomes ADD COLUMN {_col} TEXT",
+            f"tool_call_outcomes.{_col}",
+        )
 
     # How a session ENDED (crud.cc_sessions.update_status). Mirrored in
     # migration 20261104144136 for the standalone runner; here so an existing DB

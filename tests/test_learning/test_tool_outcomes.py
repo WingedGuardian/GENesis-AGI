@@ -9,6 +9,7 @@ non-zero exit, a call whose result has not arrived, and a subagent call.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -20,6 +21,8 @@ from genesis.learning.procedural.struggle_detector import (
 )
 
 SID = "11111111-2222-3333-4444-555555555555"
+# Fixture calls are dated yesterday, so the retention horizons never drop them.
+DAY = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
 # A synthetic credential shape the shared scrubber redacts; not a real key.
 FAKE_KEY = "sk-ant-api03-" + "Q" * 40
 
@@ -57,26 +60,26 @@ HOOK_TEXT = (
 )
 
 RECORDS = [
-    _use("toolu_ok", "Bash", {"command": "ls"}, ts="2026-11-01T10:00:00Z"),
-    _result("toolu_ok", "a\nb", ts="2026-11-01T10:00:01Z"),
-    _use("toolu_hook", "Bash", {"command": "cat <<EOF"}, ts="2026-11-01T10:01:00Z"),
-    _result("toolu_hook", HOOK_TEXT, ts="2026-11-01T10:01:01Z", is_error=True),
-    _use("toolu_reject", "ExitPlanMode", {"plan": "x"}, ts="2026-11-01T10:02:00Z"),
+    _use("toolu_ok", "Bash", {"command": "ls"}, ts=f"{DAY}T10:00:00Z"),
+    _result("toolu_ok", "a\nb", ts=f"{DAY}T10:00:01Z"),
+    _use("toolu_hook", "Bash", {"command": "cat <<EOF"}, ts=f"{DAY}T10:01:00Z"),
+    _result("toolu_hook", HOOK_TEXT, ts=f"{DAY}T10:01:01Z", is_error=True),
+    _use("toolu_reject", "ExitPlanMode", {"plan": "x"}, ts=f"{DAY}T10:02:00Z"),
     _result(
         "toolu_reject",
         "The user doesn't want to proceed with this tool use.",
-        ts="2026-11-01T10:02:01Z",
+        ts=f"{DAY}T10:02:01Z",
         is_error=True,
         denial="user-rejected",
     ),
-    _use("toolu_exit", "Bash", {"command": "false"}, ts="2026-11-01T10:03:00Z"),
-    _result("toolu_exit", "Exit code 1", ts="2026-11-01T10:03:01Z", is_error=True),
-    _use("toolu_edit", "Edit", {"file_path": "/x/y.py"}, ts="2026-11-01T10:04:00Z"),
-    _result("toolu_edit", "The file has been updated.", ts="2026-11-01T10:04:01Z"),
-    _use("toolu_side", "Bash", {"command": "pwd"}, ts="2026-11-01T10:05:00Z", sidechain=True),
-    _result("toolu_side", "Exit code 2", ts="2026-11-01T10:05:01Z", is_error=True, sidechain=True),
+    _use("toolu_exit", "Bash", {"command": "false"}, ts=f"{DAY}T10:03:00Z"),
+    _result("toolu_exit", "Exit code 1", ts=f"{DAY}T10:03:01Z", is_error=True),
+    _use("toolu_edit", "Edit", {"file_path": "/x/y.py"}, ts=f"{DAY}T10:04:00Z"),
+    _result("toolu_edit", "The file has been updated.", ts=f"{DAY}T10:04:01Z"),
+    _use("toolu_side", "Bash", {"command": "pwd"}, ts=f"{DAY}T10:05:00Z", sidechain=True),
+    _result("toolu_side", "Exit code 2", ts=f"{DAY}T10:05:01Z", is_error=True, sidechain=True),
     # Still running when the transcript is read: no result record yet.
-    _use("toolu_pending", "Bash", {"command": "sleep 600"}, ts="2026-11-01T10:06:00Z"),
+    _use("toolu_pending", "Bash", {"command": "sleep 600"}, ts=f"{DAY}T10:06:00Z"),
 ]
 
 
@@ -105,7 +108,7 @@ def test_rows_are_exactly_the_recordable_calls(transcript):
         "toolu_exit": 0,
     }
     assert rows["toolu_ok"][0] == SID  # the record's own sessionId
-    assert rows["toolu_hook"][5] == "2026-11-01T10:01:01Z"  # the result's timestamp
+    assert rows["toolu_hook"][5] == f"{DAY}T10:01:01Z"  # the result's timestamp
     assert rows["toolu_ok"][4] is None  # no snippet on a success
     kinds = {tid: row[7] for tid, row in rows.items()}
     assert kinds == {
@@ -124,13 +127,13 @@ def test_the_stored_class_holds_what_the_row_alone_could_not_rebuild(tmp_path):
         "PreToolUse:Bash hook error: [bash -c '" + "x" * 600 + "']: BLOCKED: refused."
     )
     records = [
-        _use("toolu_denied", "Bash", {"command": "x"}, ts="2026-11-01T10:00:00Z"),
+        _use("toolu_denied", "Bash", {"command": "x"}, ts=f"{DAY}T10:00:00Z"),
         _result(
-            "toolu_denied", "Not run.", ts="2026-11-01T10:00:01Z",
+            "toolu_denied", "Not run.", ts=f"{DAY}T10:00:01Z",
             is_error=True, denial="permission-denied",
         ),
-        _use("toolu_longhook", "Bash", {"command": "y"}, ts="2026-11-01T10:01:00Z"),
-        _result("toolu_longhook", long_hook, ts="2026-11-01T10:01:01Z", is_error=True),
+        _use("toolu_longhook", "Bash", {"command": "y"}, ts=f"{DAY}T10:01:00Z"),
+        _result("toolu_longhook", long_hook, ts=f"{DAY}T10:01:01Z", is_error=True),
     ]
     path = tmp_path / f"{SID}.jsonl"
     path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
@@ -184,10 +187,10 @@ def test_no_failures_means_only_success_rows(tmp_path):
         "\n".join(
             json.dumps(r)
             for r in (
-                _use("toolu_a", "Read", {"file_path": "/a"}, ts="2026-11-01T11:00:00Z"),
-                _result("toolu_a", "contents", ts="2026-11-01T11:00:01Z"),
-                _use("toolu_b", "Grep", {"pattern": "x"}, ts="2026-11-01T11:01:00Z"),
-                _result("toolu_b", "No matches", ts="2026-11-01T11:01:01Z", is_error=False),
+                _use("toolu_a", "Read", {"file_path": "/a"}, ts=f"{DAY}T11:00:00Z"),
+                _result("toolu_a", "contents", ts=f"{DAY}T11:00:01Z"),
+                _use("toolu_b", "Grep", {"pattern": "x"}, ts=f"{DAY}T11:01:00Z"),
+                _result("toolu_b", "No matches", ts=f"{DAY}T11:01:01Z", is_error=False),
             )
         )
         + "\n"
@@ -343,6 +346,13 @@ async def test_an_extraction_cycle_records_tool_outcomes(db, tmp_path, monkeypat
         " WHERE tool_use_id IN ('toolu_ok', 'toolu_reject')"
     )
     assert dict(await cur.fetchall()) == {"toolu_ok": None, "toolu_reject": "user_rejected"}
+    cur = await db.execute(
+        "SELECT COUNT(*), COUNT(recorded_at), MIN(recorded_at) > MAX(timestamp)"
+        " FROM tool_call_outcomes"
+    )
+    total, stamped, later = await cur.fetchone()
+    # Every writer row carries its insert time, which postdates these calls.
+    assert total == stamped == 4 and later == 1
 
 
 def _ago(days):
@@ -379,8 +389,8 @@ def test_failure_text_over_the_cap_is_withheld_not_cut(tmp_path):
 
     long_text = "Exit code 1 " + "p" * (sd._FAILURE_TEXT_CAP + 10)
     records = [
-        _use("toolu_long", "Bash", {"command": "x"}, ts="2026-11-01T10:00:00Z"),
-        _result("toolu_long", long_text, ts="2026-11-01T10:00:01Z", is_error=True),
+        _use("toolu_long", "Bash", {"command": "x"}, ts=f"{DAY}T10:00:00Z"),
+        _result("toolu_long", long_text, ts=f"{DAY}T10:00:01Z", is_error=True),
     ]
     path = tmp_path / f"{SID}.jsonl"
     path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
@@ -437,7 +447,7 @@ async def test_a_result_appended_without_new_text_is_recorded(db, tmp_path, monk
         status="active",
     )
     text = {"type": "user", "message": {"content": "please list"}}
-    first = [text, _use("toolu_late", "Bash", {"command": "sleep 1"}, ts="2026-11-01T10:00:00Z")]
+    first = [text, _use("toolu_late", "Bash", {"command": "sleep 1"}, ts=f"{DAY}T10:00:00Z")]
     path = tmp_path / f"{SID}.jsonl"
     path.write_text("\n".join(json.dumps(r) for r in first) + "\n")
 
@@ -460,6 +470,6 @@ async def test_a_result_appended_without_new_text_is_recorded(db, tmp_path, monk
     await cycle()
     assert await recorded() == []  # still running: no result yet
     with path.open("a") as f:
-        f.write(json.dumps(_result("toolu_late", "done", ts="2026-11-01T10:00:05Z")) + "\n")
+        f.write(json.dumps(_result("toolu_late", "done", ts=f"{DAY}T10:00:05Z")) + "\n")
     await cycle()
     assert await recorded() == ["toolu_late"]

@@ -1510,7 +1510,13 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             -- Class of a failed call as the transcript writer classified it
             -- (transcript_analytics.classify, #4722); NULL on success rows, the
             -- Stop-hook sensor's rows and rows written before the column.
-            error_class      TEXT
+            error_class      TEXT,
+            -- When the transcript writer inserted the row (#4722). ``timestamp``
+            -- is the call's time; a resumed session backfills old calls, so the
+            -- earliest surviving recorded_at is a conservative lower bound on
+            -- full coverage. No DEFAULT on purpose: writer only; NULL on sensor
+            -- rows (a default would pull the bound back to the sensor's history).
+            recorded_at      TEXT
         )
     """,
     "direct_session_queue": """

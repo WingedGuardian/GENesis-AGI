@@ -1,4 +1,4 @@
-"""Migration ``20261115161928_tco_error_class``: the class of each failed call (#4722)."""
+"""Migration ``20261115161928_tco_error_class_recorded_at`` (#4722)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import pytest
 
 from genesis.db.schema import create_all_tables
 
-migration = importlib.import_module("genesis.db.migrations.20261115161928_tco_error_class")
+migration = importlib.import_module("genesis.db.migrations.20261115161928_tco_error_class_recorded_at")
 
 
 async def _cols(db: aiosqlite.Connection) -> list[str]:
@@ -44,9 +44,9 @@ async def test_up_appends_the_column_and_keeps_rows_null():
     try:
         await migration.up(db)
         await migration.up(db)  # idempotent
-        assert (await _cols(db))[-1] == "error_class"
-        cur = await db.execute("SELECT error_class FROM tool_call_outcomes")
-        assert [r[0] for r in await cur.fetchall()] == [None]
+        assert (await _cols(db))[-2:] == ["error_class", "recorded_at"]
+        cur = await db.execute("SELECT error_class, recorded_at FROM tool_call_outcomes")
+        assert [tuple(r) for r in await cur.fetchall()] == [(None, None)]
     finally:
         await db.close()
 
@@ -81,7 +81,7 @@ async def test_up_is_a_no_op_after_the_base_path_built_the_table():
         await create_all_tables(db)
         before = await _cols(db)
         await migration.up(db)
-        assert await _cols(db) == before and before[-1] == "error_class"
+        assert await _cols(db) == before and before[-2:] == ["error_class", "recorded_at"]
     finally:
         await db.close()
 
@@ -91,6 +91,6 @@ async def test_the_base_schema_path_adds_the_column_to_an_existing_table():
     db = await _legacy_db()
     try:
         await create_all_tables(db)
-        assert "error_class" in await _cols(db)
+        assert (await _cols(db))[-2:] == ["error_class", "recorded_at"]
     finally:
         await db.close()
