@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 import uuid
@@ -86,12 +87,88 @@ def _lines_ok(stderr: str) -> None:
             assert len(line) <= 400, (len(line), line)
 
 
-def _gone(pid: int) -> bool:
+def _stat(path: str) -> list[str] | None:
+    """The fields after the command name in a /proc stat file; None if unreadable."""
     try:
-        os.killpg(pid, 0)
-    except ProcessLookupError:
-        return True
-    return False
+        with open(path) as fh:
+            return fh.read().rsplit(")", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+
+
+def _running(pid: int) -> bool:
+    """Any thread of ``pid`` is not a zombie (a dead main thread can outlive others)."""
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return False
+    return any((f := _stat(f"/proc/{pid}/task/{tid}/stat")) and f[0] != "Z" for tid in tids)
+
+
+def _live_members(pgid: int) -> list[int] | None:
+    """Pids in process group ``pgid`` with a running thread; None without /proc."""
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    return [
+        int(e)
+        for e in filter(str.isdigit, entries)
+        if (f := _stat(f"/proc/{e}/stat")) and int(f[2]) == pgid and _running(int(e))
+    ]
+
+
+def _describe(pids: list[int]) -> str:
+    """State, parent and group of each pid, for an assertion message."""
+    parts = []
+    for pid in pids:
+        f = _stat(f"/proc/{pid}/stat")
+        parts.append(
+            f"{pid}: gone" if f is None else f"{pid}: state={f[0]} ppid={f[1]} pgrp={f[2]}"
+        )
+    live = {pid: _live_members(pid) for pid in pids}
+    return "; ".join(parts) + f"; live members by group: {live}"
+
+
+def _gone(pid: int, wait_s: float = 5.0) -> bool:
+    """No live member is left in the process group led by ``pid``.
+
+    A SIGKILLed process is a zombie until its parent, or init after an orphaning,
+    reaps it, and ``killpg(pid, 0)`` still succeeds on a zombie. So this asks for
+    members that are still RUNNING, and waits a short bound for reaping lag on a
+    loaded runner rather than checking once.
+    """
+    end = time.monotonic() + wait_s
+    while True:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return True
+        if _live_members(pid) == []:
+            return True
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.05)
+
+
+def test_gone_counts_an_unreaped_zombie_leader_as_gone():
+    """The reap check itself: a killed, not-yet-reaped leader is gone, a live one is not."""
+    proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        assert proc.pid > 1 and not _gone(proc.pid, wait_s=0.2)  # alive: not gone
+        os.killpg(proc.pid, signal.SIGKILL)
+        end = time.monotonic() + 5
+        while time.monotonic() < end:  # wait for the zombie, without reaping it
+            with open(f"/proc/{proc.pid}/stat") as fh:
+                if fh.read().rsplit(")", 1)[1].split()[0] == "Z":
+                    break
+            time.sleep(0.01)
+        os.killpg(proc.pid, 0)  # the zombie keeps its group: killpg alone says alive
+        assert _gone(proc.pid, wait_s=0.2)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
 
 
 # ── T-D31: the boot self-check of the installed kit ──────────────────────────
@@ -720,7 +797,8 @@ def test_td22_restore_hooks_is_killed_at_the_deadline_and_left_pending(w, tmp_pa
     assert r.returncode == 0, (r.returncode, r.stderr)
     assert took <= 14 + 3 + 1.5, took
     assert w.report()["hooks"] == "pending" and not w.state.exists()
-    assert all(_gone(int(p)) for p in pids.read_text().split()), "a spy process survived"
+    recorded = [int(p) for p in pids.read_text().split()]
+    assert all(_gone(p) for p in recorded), f"a spy process survived: {_describe(recorded)}"
 
 
 def test_td32_the_reinstall_never_starts_its_unlink_without_time_for_it(tmp_path, monkeypatch):
@@ -858,7 +936,8 @@ def test_td24_a_git_that_ignores_term_is_killed_at_the_deadline(w, tmp_path):
     assert r.returncode == REFUSE, (r.returncode, r.stderr)
     assert took <= 9 + 3 + 2, took
     assert "deadline" in r.stderr, r.stderr
-    assert all(_gone(int(p)) for p in pids.read_text().split()), "a git process survived"
+    recorded = [int(p) for p in pids.read_text().split()]
+    assert all(_gone(p) for p in recorded), f"a git process survived: {_describe(recorded)}"
     assert w.state.exists()
 
 
