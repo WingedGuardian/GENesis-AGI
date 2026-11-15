@@ -592,11 +592,17 @@ async def _collect_live_repair(config: GuardianConfig) -> str:
         shown = ", ".join(_quoted(p, 200) for p in foreign[:10])
         # The writer stores no shell steps (#3868); count what its folder holds.
         saved = sum(1 for r in rows if isinstance(r.get("saved_as"), str))
+        # No integrity record: the heal's first report (#4548), written before it
+        # saved anything, so its empty row list is not "0 restored".
+        early = counted and not rows and "integrity" not in report
         lines.append(
             f"newest report: ts {_quoted(report.get('ts'), 40)}, result "
             f"{_quoted(report.get('result') or 'not finished', 200)}; "
             + (
-                f"{len(rows)} path(s) restored, {len(foreign)} not the update's; "
+                "a heal that stopped before it saved anything: the checkout may still be"
+                " half-written; "
+                if early
+                else f"{len(rows)} path(s) restored, {len(foreign)} not the update's; "
                 if counted
                 else "its restored paths could not be read; "
             )
