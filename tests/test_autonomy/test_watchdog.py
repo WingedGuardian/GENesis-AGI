@@ -1886,8 +1886,14 @@ def test_tw4_a_real_start_step_is_never_sigtermed(tmp_path, monkeypatch):
     def case(name, act) -> str:
         trap = tmp_path / f"trap-{name}"
         trap.touch()
+        ready = tmp_path / f"ready-{name}"
         unit = f"tw4-probe-{uuid.uuid4().hex[:12]}.service"
-        pre = f"/bin/sh -c 'trap \"echo TERM >> {trap}; exit 1\" TERM; sleep 6 & wait'"
+        # The shell marks itself ready once its trap is installed: systemd reports
+        # start-pre as soon as it forks, before the trap exists (#4726).
+        pre = (
+            f"/bin/sh -c 'trap \"echo TERM >> {trap}; exit 1\" TERM; touch {ready}; "
+            "sleep 6 & wait'"
+        )
         subprocess.run(
             ["systemd-run", "--user", "--no-block", f"--unit={unit}", "-p", "MemoryMax=1G",
              "-p", f"ExecStartPre={pre}", "sleep", "60"],
@@ -1898,8 +1904,10 @@ def test_tw4_a_real_start_step_is_never_sigtermed(tmp_path, monkeypatch):
             show = ["systemctl", "--user", "show", unit, "-p", "ActiveState", "-p", "SubState"]
             while "start-pre" not in (seen := subprocess.run(
                 show, capture_output=True, text=True, env=env, timeout=10
-            ).stdout):
-                assert time.monotonic() < end, f"the unit never reached start-pre: {seen!r}"
+            ).stdout) or not ready.exists():
+                assert time.monotonic() < end, (
+                    f"start-pre with its trap set never seen: {seen!r}, ready={ready.exists()}"
+                )
                 time.sleep(0.1)
             act(unit)
             return trap.read_text()
