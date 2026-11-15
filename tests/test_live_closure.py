@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path, PurePath
+from types import SimpleNamespace
 
 import pytest
 
@@ -441,6 +442,9 @@ def test_no_genesis_module_holds_a_state_path_under_the_real_home(request):
     # (test_the_box_lock_and_basetemp_keep_their_real_home_locations): a fixture
     # pointing a module's state file at tmp_path is private too.
     base = Path(request.config._tmp_path_factory.getbasetemp())
+    # Import-time DB/secrets use the closure's separate temporary directory.
+    # TMPDIR can place it under the real home too; its siblings remain live.
+    closure_base = Path(closure._S.base)
     offenders = []
     for name, module in list(sys.modules.items()):
         if module is None or not (name == "genesis" or name.startswith("genesis.")):
@@ -451,10 +455,34 @@ def test_no_genesis_module_holds_a_state_path_under_the_real_home(request):
                 and value != ours
                 and ours not in value.parents
                 and base not in value.parents
+                and value != closure_base
+                and closure_base not in value.parents
                 and any(value == root or root in value.parents for root in roots)
             ):
                 offenders.append(f"{name}.{attr}={value}")
     assert offenders == []
+
+
+@pytest.mark.parametrize("relative,owned", [
+    ("tmp/closure", True), ("tmp/closure/import-time-genesis.db", True),
+    ("tmp/closure-sibling/state.db", False), (".genesis/state.db", False),
+])
+def test_state_path_check_exempts_only_its_owned_closure(tmp_path, monkeypatch, relative, owned):
+    # Invoke the actual assertion with owned synthetic paths. No live file is
+    # opened even when the assertion is deliberately made to reject a path.
+    real = tmp_path / "synthetic-home"
+    monkeypatch.setitem(globals(), "_REAL_HOME", str(real))
+    monkeypatch.setattr(closure._S, "home", str(real / "tmp/private-home"))
+    monkeypatch.setattr(closure._S, "base", str(real / "tmp/closure"))
+    module = SimpleNamespace(STATE=real / relative)
+    monkeypatch.setitem(sys.modules, "genesis._owned_closure_probe", module)
+    request = SimpleNamespace(config=SimpleNamespace(
+        _tmp_path_factory=SimpleNamespace(getbasetemp=lambda: real / "tmp/pytest-base")))
+    if owned:
+        test_no_genesis_module_holds_a_state_path_under_the_real_home(request)
+    else:
+        with pytest.raises(AssertionError, match="genesis._owned_closure_probe.STATE"):
+            test_no_genesis_module_holds_a_state_path_under_the_real_home(request)
 
 
 def test_the_box_lock_and_basetemp_keep_their_real_home_locations(request):

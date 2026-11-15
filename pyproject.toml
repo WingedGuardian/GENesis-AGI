@@ -242,6 +242,9 @@ quote-style = "double"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Pytest bootstraps a fresh cache beside cache_dir. Nest it so those transient
+# files also stay inside the existing test-owned .pytest_cache directory.
+cache_dir = ".pytest_cache/pytest"
 asyncio_mode = "auto"
 # Explicit, so pytest-asyncio stops warning that it is unset (pytest 9.2 prints
 # that warning ahead of everything, including tests/conftest.py's own first
