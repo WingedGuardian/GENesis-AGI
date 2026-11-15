@@ -24,9 +24,14 @@ OTHER = "fedcba9876543210fedcba9876543210fedcba98"
 HEX32 = "a" * 32
 
 
+_DM = None
+
+
 @pytest.fixture(scope="module")
 def dm():
-    return private_module("delivery_marker", _SCRIPTS / "delivery_marker.py")
+    global _DM
+    _DM = private_module("delivery_marker", _SCRIPTS / "delivery_marker.py")
+    return _DM
 
 
 def _block(fields: str) -> str:
@@ -185,12 +190,12 @@ def test_parse_never_raises(dm):
     ],
 )
 def test_basis_from_body(dm, body, basis):
-    assert dm.basis_from_body(body) == basis
+    assert dm.basis_from_body(body, linked=lambda: [], repo="Own/repo") == basis
 
 
 def test_basis_refuses_a_body_the_pointer_parser_cannot_read(dm):
     with pytest.raises(dm.Refused, match="pointer"):
-        dm.basis_from_body("Spec: a/b\n")
+        dm.basis_from_body("Spec: a/b\n", linked=lambda: [], repo="Own/repo")
 
 
 # ── evidence: a DELIVERS cites changed lines on its DONE lines ───────────────
@@ -240,6 +245,12 @@ def test_render_round_trips_through_parse(dm):
 # ── compose: the CLI, end to end through the gh seam ─────────────────────────
 
 
+def dm_refused(msg):
+    from tests.test_scripts import test_delivery_marker as me  # noqa: PLC0415
+
+    return me._DM.Refused(msg)
+
+
 class FakeGh:
     def __init__(
         self,
@@ -251,19 +262,32 @@ class FakeGh:
         reviews=(),
         me="own",
         heads=(),
+        linked=(),
+        bodies=(),
+        owner_type="User",
+        role=None,
     ):
         self.head, self.body, self.files, self.comments = head, body, list(files), list(comments)
         self.reviews = list(reviews)
-        self.me, self.heads = me, list(heads)
+        self.me, self.heads, self.linked = me, list(heads), list(linked)
+        self.bodies, self.owner_type, self.role = list(bodies), owner_type, role
         self.calls: list[list[str]] = []
 
     def __call__(self, args):
         self.calls.append(args)
         path = args[1] if args[0] == "api" else ""
+        if args[:2] == ["pr", "view"]:
+            return "".join(json.dumps(i) + "\n" for i in self.linked)
         if args[:2] == ["repo", "view"]:
             return "Own/repo\n"
         if path == "user":
             return self.me + "\n"
+        if path == "repos/Own/repo":
+            return self.owner_type + "\n"
+        if path.startswith("orgs/"):
+            if self.role is None:
+                raise dm_refused("HTTP 404")
+            return self.role + "\n"
         if path.endswith("/files"):
             return "".join(json.dumps(f) + "\n" for f in self.files)
         if path.endswith("/comments"):
@@ -272,7 +296,8 @@ class FakeGh:
             return "".join(json.dumps(c) + "\n" for c in self.reviews)
         if "/pulls/" in path:
             head = self.heads.pop(0) if self.heads else self.head
-            return json.dumps({"head": head, "body": self.body})
+            body = self.bodies.pop(0) if self.bodies else self.body
+            return json.dumps({"head": head, "body": body})
         raise AssertionError(args)
 
 
@@ -375,7 +400,8 @@ def test_compose_never_posts(dm, monkeypatch, tmp_path, capsys):
     gh = FakeGh()
     _compose(dm, monkeypatch, tmp_path, capsys, gh, "--intended", "read")
     for c in gh.calls:
-        assert c[0] in ("api", "repo") and "--method" not in c and "comment" not in c
+        assert (c[0] in ("api", "repo") or c[:2] == ["pr", "view"]) and "--method" not in c
+        assert "comment" not in c
 
 
 @pytest.mark.parametrize(
@@ -575,10 +601,56 @@ def test_a_done_line_in_another_form_is_refused_not_skipped(dm, variant):
     assert probs and "- DONE:" in probs[0]
 
 
-@pytest.mark.parametrize("body", ["Fixes #4245. References #4246.\n", "This closes #9 for good.\n"])
-def test_basis_refuses_an_issue_named_mid_sentence(dm, body):
-    with pytest.raises(dm.Refused, match="line of its own"):
-        dm.basis_from_body(body)
+def _link(n, repo="Own/repo"):
+    return {"number": n, "repo": repo}
+
+
+def test_basis_takes_the_issue_github_links_when_no_pointer_line(dm):
+    # GitHub links "Fixes #4245." mid-sentence (measured on a real PR); the pointer
+    # parser reads whole lines only, so the link is what names the basis.
+    body = "Fixes #4245. References #4246.\n"
+    assert dm.basis_from_body(body, linked=lambda: [_link(4245)], repo="Own/repo") == "issue:4245"
+    # Unlinked, the line still opens with the pointer, so it names the basis.
+    assert dm.basis_from_body(body, linked=lambda: [], repo="Own/repo") == "issue:4245"
+
+
+def test_a_pointer_line_wins_over_the_linked_issue(dm):
+    assert (
+        dm.basis_from_body("Closes #7\n", linked=lambda: [_link(9)], repo="Own/repo") == "issue:7"
+    )
+
+
+def test_basis_refuses_several_linked_issues(dm):
+    with pytest.raises(dm.Refused, match="several issues"):
+        dm.basis_from_body(
+            "Fixes #1 and fixes #2\n", linked=lambda: [_link(1), _link(2)], repo="Own/repo"
+        )
+
+
+def test_basis_refuses_a_linked_issue_in_another_repo(dm):
+    with pytest.raises(dm.Refused, match="another"):
+        dm.basis_from_body(
+            "Fixes other/repo#3\n", linked=lambda: [_link(3, "other/repo")], repo="Own/repo"
+        )
+
+
+def test_basis_has_no_default_for_the_linked_issues(dm):
+    with pytest.raises(TypeError):
+        dm.basis_from_body("x", repo="Own/repo")
+
+
+def test_compose_reads_the_linked_issue_from_github(dm, monkeypatch, tmp_path, capsys):
+    gh = FakeGh(body="Fixes #4602 in the sense that it closes it.\n", linked=[_link(4602)])
+    rc, out, _ = _compose(dm, monkeypatch, tmp_path, capsys, gh, "--intended", "read")
+    assert rc == 0
+    [b] = dm.parse(out.read_text())
+    assert b["fields"]["basis"] == "issue:4602"
+
+
+def test_compose_refuses_an_unreadable_linked_issue_row(dm, monkeypatch, tmp_path, capsys):
+    gh = FakeGh(body="Fixes #1 inline.\n", linked=[{"number": "1; x", "repo": "Own/repo"}])
+    rc, _, cap = _compose(dm, monkeypatch, tmp_path, capsys, gh, "--intended", "read")
+    assert rc == 2 and "linked-issue row" in cap.err
 
 
 # ── review round (pre-PR security findings) ──────────────────────────────────
@@ -643,3 +715,147 @@ def test_read_escapes_control_characters_from_github(dm, monkeypatch, capsys):
     assert dm.main(["read", "--pr", "7"]) == 0
     out = capsys.readouterr().out
     assert "\x1b" not in out and "\\x1b" in out
+
+
+def test_a_pointer_line_never_reads_the_linked_issues(dm):
+    def boom():
+        raise AssertionError("linked issues read although a pointer line decides")
+
+    assert dm.basis_from_body("Closes #7\n", linked=boom, repo="Own/repo") == "issue:7"
+
+
+def test_a_linked_issue_with_no_repository_is_unreadable(dm, monkeypatch, tmp_path, capsys):
+    gh = FakeGh(body="Fixes #1 inline.\n", linked=[{"number": 1, "repo": "/"}])
+    rc, _, cap = _compose(dm, monkeypatch, tmp_path, capsys, gh, "--intended", "read")
+    assert rc == 2 and "linked-issue row" in cap.err
+
+
+# ── review round 1 on the PR (one class: inputs read off their source's rule) ──
+
+
+def test_a_cited_path_may_hold_spaces(dm):
+    prose = "- DONE: x (`docs/user guide.md:12`)\n"
+    assert dm.evidence_problems("DELIVERS", prose, {"docs/user guide.md"}) == []
+    assert dm.evidence_problems("DELIVERS", prose, {"docs/user"})
+
+
+def test_a_header_over_several_lines_is_unusable(dm):
+    text = f"<!-- genesis-delivery-check: head={HEAD} basis=claim\nverdict=DELIVERS scope=CLEAN -->"
+    [b] = dm.parse(text)
+    assert b["fields"] is None and "one line" in b["problem"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "This refs #12 for the rest.\n",
+        "Depends on #3; refs #12 as well.\n",
+        "It is part of #12, the first step.\n",
+    ],
+)
+def test_an_unlinked_issue_named_mid_sentence_refuses(dm, body):
+    with pytest.raises(dm.Refused, match="inside a sentence"):
+        dm.basis_from_body(body, linked=lambda: [], repo="Own/repo")
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["Example:\n\n```\nFixes #9\n```\n", "Text.\n<!-- refs #9 for later -->\n"],
+)
+def test_hidden_examples_never_block_a_claim(dm, body):
+    assert dm.basis_from_body(body, linked=lambda: [], repo="Own/repo") == "claim"
+
+
+def test_compose_refuses_when_the_basis_changes_mid_compose(dm, monkeypatch, tmp_path, capsys):
+    gh = FakeGh(bodies=["Closes #4602\n", "Closes #4603\n"])
+    rc, out, cap = _compose(dm, monkeypatch, tmp_path, capsys, gh, "--intended", "read")
+    assert rc == 2 and "basis changed" in cap.err and not out.exists()
+
+
+def test_read_flags_a_basis_edited_since_the_check(dm, monkeypatch, capsys):
+    row = {"id": 1, "login": "own", "author_association": "OWNER", "body": _good(), "stamp": "s"}
+    monkeypatch.setattr(dm, "_gh", FakeGh(body="Closes #9\n", comments=[row]))
+    assert dm.main(["read", "--pr", "7"]) == 0
+    out = capsys.readouterr().out
+    assert "basis is now issue:9" in out
+
+
+def test_an_org_owned_repo_refuses_with_the_reason(dm, monkeypatch, tmp_path, capsys):
+    gh = FakeGh(me="someone", owner_type="Organization")
+    rc, out, cap = _compose(dm, monkeypatch, tmp_path, capsys, gh, "--intended", "read")
+    assert rc == 2 and "organization" in cap.err and not out.exists()
+
+
+@pytest.mark.parametrize(
+    "body, basis",
+    [
+        ("Part of #4677. The diff is 42 counted lines.\n", "issue:4677"),
+        ("Intro.\n\n- Refs #12 and more text\n", "issue:12"),
+        ("**Fixes #7** and also tidies.\n", "issue:7"),
+        ("Text mentions refs #3 later.\nPart of #9: the main work.\n", "issue:9"),
+    ],
+)
+def test_a_line_opening_with_a_pointer_names_the_basis(dm, body, basis):
+    assert dm.basis_from_body(body, linked=lambda: [], repo="Own/repo") == basis
+
+
+def test_github_links_win_over_a_line_opener(dm):
+    body = "Part of #9. More.\n"
+    assert dm.basis_from_body(body, linked=lambda: [_link(4)], repo="Own/repo") == "issue:4"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "This is _Refs #14_ inline.\n",
+        "See it: refs owner/repo#77 more.\n",
+        "Ok, closes https://github.com/o/r/issues/5 now.\n",
+        "Text Closes: #12 here.\n",
+    ],
+)
+def test_the_refusal_net_takes_every_way_a_body_names_an_issue(dm, body):
+    with pytest.raises(dm.Refused, match="inside a sentence"):
+        dm.basis_from_body(body, linked=lambda: [], repo="Own/repo")
+
+
+@pytest.mark.parametrize(
+    "body, basis",
+    [
+        ("1. Fixes #3 and more\n", "issue:3"),
+        ("> Fixes #1 quoted\n", "issue:1"),
+        ("   Refs #4 three spaces\n", "issue:4"),
+    ],
+)
+def test_the_line_opener_follows_the_pointer_parsers_line_rules(dm, body, basis):
+    assert dm.basis_from_body(body, linked=lambda: [], repo="Own/repo") == basis
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Context.\n\n    Fixes #8 (an indented code example)\n",
+        "Fixes #12abc and more\n",
+        "Fixes #0 and more\n",
+        "Clo\u017fes #9 and more\n",
+    ],
+)
+def test_the_line_opener_rejects_what_the_parser_would(dm, body):
+    try:
+        got = dm.basis_from_body(body, linked=lambda: [], repo="Own/repo")
+    except dm.Refused:
+        return
+    assert not got.startswith("issue:"), got
+
+
+def test_a_header_with_a_unicode_line_separator_is_unusable(dm):
+    [b] = dm.parse(
+        f"<!-- genesis-delivery-check: head={HEAD}\u2028basis=claim verdict=DELIVERS scope=CLEAN -->"
+    )
+    assert b["fields"] is None and "one line" in b["problem"]
+
+
+def test_read_warns_on_each_marker_when_the_basis_cannot_be_derived(dm, monkeypatch, capsys):
+    row = {"id": 1, "login": "own", "author_association": "OWNER", "body": _good(), "stamp": "s"}
+    monkeypatch.setattr(dm, "_gh", FakeGh(body="Spec: a/b\n", comments=[row]))
+    assert dm.main(["read", "--pr", "7"]) == 0
+    assert "cannot be derived now" in capsys.readouterr().out

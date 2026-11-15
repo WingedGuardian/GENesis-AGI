@@ -20,8 +20,9 @@ Usage:
                                [--repo OWNER/REPO] [--out FILE]
     delivery_marker.py read --pr N [--repo OWNER/REPO]
 
-``compose`` validates the fields, derives the basis from the PR body with the same
-pointer parser the acceptance gate uses (``--basis``, when given, must agree), refuses a
+``compose`` validates the fields, derives the basis from the PR body's first pointer
+line (the acceptance gate's parser) or, with none, from the one issue GitHub links to
+the PR (``--basis``, when given, must agree), refuses a
 DELIVERS whose DONE lines cite no ``path:line`` or cite a file the PR does not change,
 writes the comment to a file, and PRINTS the one ``gh`` command that posts it: a PATCH
 of the owner's existing marker comment, or a new comment. It never posts.
@@ -41,6 +42,7 @@ import re
 import shlex
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -82,16 +84,35 @@ _OUTCOME_VERDICT = {
 
 #: GitHub's REST list of a PR's files stops at 3,000 entries.
 FILE_CAP = 3000
-_CITE_RE = re.compile(r"`([^`\s]+):[1-9][0-9]*(?:-[1-9][0-9]*)?`")
+#: A citation is `path:line` or `path:start-end` in backticks. The path may hold
+#: spaces (GitHub filenames can); it runs to the LAST colon before the line number.
+_CITE_RE = re.compile(r"`([^`\n]+):[1-9][0-9]*(?:-[1-9][0-9]*)?`")
+#: A pointer keyword and an issue number. Read on the visible text only (the shared
+#: readable-body view, so fenced examples and HTML comments never count).
+_KEYWORD = r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs|part[ \t]+of)[ \t]+#([1-9][0-9]*)(?![0-9A-Za-z_])"
+#: A visible line that OPENS with one, followed by more text ("Part of #4677. The diff
+#: is ..."), which the pointer parser does not read because the line is not only the
+#: pointer. MEASURED over 400 recent PR bodies: 24 name their basis this way.
+#: Built on the pointer parser's own line rules (acceptance_declaration.py): indent 0-3
+#: (4+ is indented code), at most one `>` or list-marker wrapper, ASCII case folding.
+_LEAD_POINTER_RE = re.compile(
+    r" {0,3}(?:>[ \t]*|(?:[-*+]|[0-9]{1,9}[.)])[ \t]+)?[*_]{0,2}" + _KEYWORD,
+    re.IGNORECASE | re.ASCII,
+)
+#: The same keyword anywhere in a line. Only mid-line is this ambiguous (9 of the 400:
+#: "Depends on #4599; ... Refs #4193."), so the writer refuses rather than guess.
+#: The refusal net is WIDER than the opener, since refusing is the safe direction: it
+#: also takes a colon, `owner/repo#N`, an issue URL and a keyword after `_` or `*`.
+_INLINE_POINTER_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs|part[ \t]+of)[ \t]*:?[ \t]+"
+    r"(?:#|[\w.-]+/[\w.-]+#|https?://github\.com/[\w.-]+/[\w.-]+/issues/)[0-9]+",
+    re.IGNORECASE | re.ASCII,
+)
 _DONE_RE = re.compile(r"[ \t]*-[ \t]+DONE:")
 #: Anything a reader would take for a DONE line. Each one must be in the exact form
 #: above, so a numbered, quoted, bold or lower-case variant cannot skip the check.
 _DONE_LOOSE_RE = re.compile(
     r"[ \t>]*(?:[-*+]|[0-9]+[.)])?[ \t]*[*_]*done[*_]*[ \t]*[*_]*:", re.IGNORECASE
-)
-#: A closing keyword inside a sentence, which the pointer parser does not read.
-_INLINE_CLOSE_RE = re.compile(
-    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[ \t]+#[0-9]+", re.IGNORECASE
 )
 #: The comment is public and no hook scans a comment body, so the writer refuses the
 #: plainest private shapes: private and tailnet IPv4 addresses, home-directory paths
@@ -163,6 +184,8 @@ def parse(text: str) -> list[dict]:
         fields: dict[str, str] = {}
         problem = None if raw else "the block names no fields"
         tokens = raw.split()
+        if len(m.group(1).splitlines()) > 1:  # any line separator, U+2028 included
+            problem, tokens = "the header must be one line", []
         if not _EXACT_RE.match(text):
             problem = "the header must open with '<!-- genesis-delivery-check:' exactly"
             raw, tokens = m.group(0).strip(), []
@@ -185,26 +208,89 @@ def parse(text: str) -> list[dict]:
     return out
 
 
-def basis_from_body(body: str | None) -> str:
-    """The marker's ``basis`` value for a PR body, read by ``parse_acceptance``."""
+def basis_from_body(body: str | None, *, linked: Callable[[], list[dict]], repo: str) -> str:
+    """The marker's ``basis`` for a PR: the body's first pointer line, read by
+    ``parse_acceptance``; with none, the one issue GitHub links from the PR.
+
+    ``linked`` returns GitHub's ``closingIssuesReferences`` for the PR, as
+    ``[{"number", "repo"}]`` (``linked_issues``); it is called only when the body has no
+    pointer line, so a good ``Closes #N`` never depends on that read. GitHub links a closing
+    keyword anywhere in the body ("Fixes #4245." mid-sentence), which the pointer
+    parser, reading whole lines, does not; asking GitHub covers those without a second
+    hand-written grammar. Required, with no default, so a caller cannot skip it and
+    silently derive ``claim``. Several linked issues, or one in another repository,
+    refuse: the session must say which one the read was against.
+    """
     parsed = acceptance_declaration.parse_acceptance(body or "")
     source = parsed["source"]
-    if source is None:
-        other = [p for p in parsed["problems"] if p not in (_NO_POINTER, "empty PR body")]
-        other = [p for p in other if not p.startswith(("no ## Acceptance", "## Acceptance has"))]
-        if other:
-            raise Refused(f"the PR body's source pointer cannot be read: {'; '.join(other)}")
-        # The pointer parser reads a pointer only as a line of its own. A body that
-        # names an issue mid-sentence would otherwise be judged as its own claim, which
-        # skips the issue's acceptance and the proposal rule. The gate reads the same
-        # parser, so the fix is the body, not a smarter writer.
-        if m := _INLINE_CLOSE_RE.search(body or ""):
+    if source is not None:
+        return f"{_KIND[source['kind']]}:{source['value']}"
+    other = [p for p in parsed["problems"] if p not in (_NO_POINTER, "empty PR body")]
+    other = [p for p in other if not p.startswith(("no ## Acceptance", "## Acceptance has"))]
+    if other:
+        raise Refused(f"the PR body's source pointer cannot be read: {'; '.join(other)}")
+    linked = linked()
+    if not linked:
+        # GitHub links closing keywords only, and only on some PRs. A body that names
+        # an issue in a form it did not link would otherwise be judged as its own claim
+        # (owner ruling, 2026-11-15): a line that opens with the pointer names the basis;
+        # a mention only mid-line refuses.
+        readable = acceptance_declaration._readable_body()
+        if readable is None:
+            raise Refused("cannot load readable_body from check_cc_pin_receipts.py")
+        visible = readable(body or "", keep_blank=True)
+        for line in visible.split("\n"):
+            if m := _LEAD_POINTER_RE.match(line):
+                return f"issue:{int(m.group(1))}"
+        if m := _INLINE_POINTER_RE.search(visible):
             raise Refused(
-                f"the PR body says '{m.group(0)}' inside a sentence, which the pointer parser"
-                " does not read: put it on a line of its own, then compose again"
+                f"the PR body says '{m.group(0)}' inside a sentence and GitHub links no issue:"
+                " put that pointer on a line of its own, then compose again"
             )
         return "claim"
-    return f"{_KIND[source['kind']]}:{source['value']}"
+    if len(linked) > 1:
+        names = ", ".join(f"{i['repo']}#{i['number']}" for i in linked)
+        raise Refused(
+            f"GitHub links several issues to this PR ({names}): put the one the read is"
+            " against on a line of its own ('Closes #N'), then compose again"
+        )
+    [issue] = linked
+    if issue["repo"].lower() != repo.lower():
+        raise Refused(
+            f"the PR's linked issue is {issue['repo']}#{issue['number']}, in another"
+            " repository: a marker names an issue in this one, so put that issue's"
+            " pointer ('Closes #N') on a line of its own, or record the PR's own claim"
+        )
+    return f"issue:{issue['number']}"
+
+
+def linked_issues(repo: str, pr: int) -> list[dict]:
+    """GitHub's ``closingIssuesReferences`` for the PR, as ``[{"number", "repo"}]``."""
+    raw = _gh(
+        [
+            "pr",
+            "view",
+            str(pr),
+            "--repo",
+            repo,
+            "--json",
+            "closingIssuesReferences",
+            "--jq",
+            '.closingIssuesReferences[] | {number, repo: (.repository.owner.login + "/"'
+            " + .repository.name)} | @json",
+        ]
+    )
+    rows = _jsonl(raw)  # MEASURED: gh prints each @json result as one plain object line
+    for row in rows:
+        num = row.get("number") if isinstance(row, dict) else None
+        if (
+            not isinstance(num, int)
+            or isinstance(num, bool)
+            or num < 1
+            or not _REPO_RE.fullmatch(str(row.get("repo")))
+        ):
+            raise Refused(f"unreadable linked-issue row from gh: {_safe(row)[:80]}")
+    return rows
 
 
 def evidence_problems(verdict: str, prose: str, changed: set[str]) -> list[str]:
@@ -320,6 +406,10 @@ def _is_owner(row: dict, owner: str) -> bool:
 # ── commands ─────────────────────────────────────────────────────────────────
 
 
+def _basis(repo: str, pr: int, meta: dict) -> str:
+    return basis_from_body(meta.get("body"), linked=lambda: linked_issues(repo, pr), repo=repo)
+
+
 def compose(a: argparse.Namespace) -> int:
     repo = _repo(a.repo)
     owner = repo.split("/")[0].lower()
@@ -327,6 +417,15 @@ def compose(a: argparse.Namespace) -> int:
     # non-owner session reports its read and posts nothing (spec 4.3).
     me = _gh(["api", "user", "--jq", ".login"]).strip().lower()
     if me != owner:
+        # On an org-owned repo no login equals the org's name, and GitHub gives an org
+        # member's comments MEMBER or COLLABORATOR, never OWNER (measured on two public
+        # org repos), so readers would ignore any marker posted there.
+        if _gh(["api", f"repos/{repo}", "--jq", ".owner.type"]).strip() == "Organization":
+            raise Refused(
+                f"{repo} is owned by an organization: readers trust only the owner's login or"
+                " the OWNER association, which GitHub gives no org member, so a marker here"
+                " would be ignored; report the read instead of posting"
+            )
         raise Refused(
             f"gh is authenticated as '{_safe(me)}', not the repo owner '{owner}': a marker from"
             " this account is ignored by every reader, so report the read instead of posting"
@@ -338,9 +437,11 @@ def compose(a: argparse.Namespace) -> int:
         raise Refused(
             f"the PR's head is now {head[:12]}, not the {a.head} you read: read the change since"
         )
-    basis = basis_from_body(meta.get("body"))
+    basis = _basis(repo, a.pr, meta)
     if a.basis and a.basis != basis:
-        raise Refused(f"--basis {a.basis} disagrees with the PR body's pointer ({basis})")
+        raise Refused(
+            f"--basis {a.basis} disagrees with the PR's basis ({basis}: its pointer line, or the issue GitHub links)"
+        )
     fields = {
         "head": head,
         "basis": basis,
@@ -377,8 +478,13 @@ def compose(a: argparse.Namespace) -> int:
         )
     # The file list is read after the head check, so a push in between would check the
     # citations against a tree nobody read. Re-read the head and refuse if it moved.
-    if _pr(repo, a.pr)["head"] != head:
+    again = _pr(repo, a.pr)
+    if again["head"] != head:
         raise Refused("the PR's head moved while composing: read the change since")
+    if _basis(repo, a.pr, again) != basis:
+        raise Refused(
+            "the PR's basis changed while composing (its body or links were edited): read it again"
+        )
     problems = evidence_problems(a.verdict, prose, set(files))
     if problems:
         raise Refused("; ".join(problems))
@@ -415,9 +521,14 @@ def compose(a: argparse.Namespace) -> int:
 
 def read(a: argparse.Namespace) -> int:
     repo = _repo(a.repo)
-    head = _pr(repo, a.pr)["head"]
+    meta = _pr(repo, a.pr)
+    head = meta["head"]
     owner = repo.split("/")[0].lower()
-    print(f"PR #{a.pr} head {head[:12]}")
+    try:
+        current, why = _basis(repo, a.pr, meta), ""
+    except Refused as exc:
+        current, why = None, str(exc)
+    print(f"PR #{a.pr} head {head[:12]} basis {current or 'unreadable: ' + _safe(why)}")
     seen = 0
     for where, rows in (
         ("comment", _comments(repo, a.pr)),
@@ -442,6 +553,10 @@ def read(a: argparse.Namespace) -> int:
                         if f["head"] == head
                         else f"at {f['head'][:12]}, not the current head"
                     )
+                    if current is None:
+                        at += ", the PR's basis cannot be derived now: re-read"
+                    elif f["basis"] != current:
+                        at += f", but the PR's basis is now {current}: re-read"
                     print(
                         f"- {label}: {at}: "
                         + " ".join(f"{k}={v}" for k, v in f.items() if k != "head")
@@ -461,7 +576,7 @@ def main(argv: list[str] | None = None) -> int:
         c.add_argument(f"--{key}", required=True, choices=VALUES[key].pattern.split("|"))
     for key in ("intended", "change", "coderabbit", "outcome"):
         c.add_argument(f"--{key}", choices=VALUES[key].pattern.split("|"))
-    c.add_argument("--basis", help="assert the basis; it must match the PR body's pointer")
+    c.add_argument("--basis", help="assert the basis; it must match the one derived from the PR")
     c.add_argument(
         "--body-file", required=True, help="the read's prose (DONE/PARTIAL lines and the rest)"
     )
