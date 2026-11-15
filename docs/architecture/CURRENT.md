@@ -85,8 +85,10 @@ physical completion through their RequestDatabase unit. Legacy connections keep
 ordinary thread cancellation. The retriever forwards the facade to tag expansion;
 tag scans run in independently admitted background units, with accepted-task
 completion as the single-flight release. Pressure or draining serves the stale
-query. Other maintenance threads and shared provider closers still need factory
-qualification; this is not a shared-service activation.
+query. The explicit shared factory additionally owns the builtin embedding
+clients and cache handles while retaining separate storage/recall providers.
+Other maintenance threads retain their existing lifetime. This is not a
+shared-service activation; factory qualification is scoped separately.
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
 `memory_fts`) and Qdrant share no transaction, so drift (orphaned "ghost"
@@ -1888,12 +1890,14 @@ modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
 verified: 6b4f275 2026-11-08
 ```
 
-Scoped verification: internal `mcp/shared_http` composition only. It receives
+Scoped verification covers `mcp/shared_http` composition. It receives
 initialized request-owned resources and supplies SDK transport limits, app-wide
 authority/authentication, per-message caller/profile binding, shared/local
 ancestry admission, nonblocking tool capacity and authenticated version/catalog
-status. No launcher selects it; owned bootstrap, native clients and rollout
-remain separate. See `docs/reference/shared-mcp-http.md`. That scoped check
+status. The gated explicit `--shared-service` path constructs the actual
+standalone services with a bounded facade, frozen limits and outer resource
+owner. Ordinary session selection remains unchanged. Unit readiness, native
+clients and rollout remain separate. See `docs/reference/shared-mcp-http.md`. That scoped check
 (5a3de4eee, 2026-11-08) does not requalify the other channels/interfaces subsystems.
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -4708,8 +4712,9 @@ logger or unrelated exceptions with copied text and no provenance.
   `RequestDatabase` supplies a stable facade with one fresh physical connection
   per independent unit, bounded admission, retained cancellation cleanup and
   cursor closure. It preserves explicit CRUD commits and refuses expired scopes;
-  it does not provide whole-tool atomicity. Existing MCP initialization still
-  uses its legacy connection. `spawn_database_task` gives scoped detached
+  it does not provide whole-tool atomicity. Ordinary stdio and in-process MCP
+  initialization retain legacy connections; explicit shared startup uses the
+  facade. `spawn_database_task` gives scoped detached
   writers their own unit, preserves other caller context, and tracks jobs from
   scheduling through shutdown, including cancellation before start.
   Detached work requires explicit background connection and job-count budgets;
@@ -4724,7 +4729,8 @@ logger or unrelated exceptions with copied text and no provenance.
   fails shutdown; dependent provider closure requires positive settlement.
   `run_resource_thread` preserves ordinary legacy thread cancellation. These are
   internal prerequisites; the nine memory-consumer thread boundaries use them,
-  while shared factory wiring remains separate. Lease budgets bound database
+  and the explicit shared factory drains them before dependent provider closure.
+  Lease budgets bound database
   connections, not executor items.
   Activity, embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
   legacy connections keep ordinary task scheduling. Internal
@@ -4736,9 +4742,11 @@ logger or unrelated exceptions with copied text and no provenance.
   warmed once by the owning bootstrap; registration cannot rebind pending flushes
   or duplicate history. Scoped health supports the standalone status-file service,
   rejecting runtime snapshot sharing before changing registration. Reinitialization
-  replaces obsolete instrumentation in either DB mode. No CLI or transport
-  selects it yet; caller identity, bookmark policy and shared activation remain
-  separate work. See
+  replaces obsolete instrumentation in either DB mode. The explicit shared HTTP
+  launcher selects it with authenticated request callers and leaves pending
+  memory bookmark files for the per-session path. Ordinary stdio and in-process
+  initialization retain their existing paths; local bookmark consumption and
+  routing activation remain separate work. See
   `docs/reference/request-database.md` for lifecycle and failure semantics.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Every
