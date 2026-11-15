@@ -115,6 +115,10 @@ BASELINE: dict[tuple[str, str], tuple[int, str]] = {
     ("src/genesis/channels/stt.py", "provider"): (1, "Groq STT call site"),
     ("src/genesis/deliberation/backends/fusion.py", "provider"): (1, "OpenRouter fusion call site"),
     ("src/genesis/eval/longmemeval/client.py", "provider"): (1, "OpenRouter eval client"),
+    ("src/genesis/eval/qualification/native.py", "provider"): (
+        1,
+        "frozen first-party qualification transport identity",
+    ),
     ("src/genesis/eval/qualification/native_expense.py", "provider"): (
         1,
         "native tariff origin identity constant; no request dispatch",
