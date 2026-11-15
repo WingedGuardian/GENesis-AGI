@@ -76,12 +76,15 @@ def decision_gate(db, api, *, native=False, admission=None):
                 native_imported = []
                 active = True
 
-                def finalize():
+                def finalize(*, residual_context=None):
                     if not active or not db.in_transaction:
                         raise RuntimeError('recovery decision is closed')
                     residual = []
+                    options = {} if residual_context is None else {'residual_context': residual_context}
+                    if residual_context is not None:
+                        residual_context.clear()
                     native_imported.extend(api['_native'].drain(api['marker_dir'](), db, api['_legs'], api['_proof'],
-                                                         api['marker_hash'], residual=residual))
+                                                         api['marker_hash'], residual=residual, **options))
                     return tuple(sorted(set(residual)))
 
                 residual = finalize()

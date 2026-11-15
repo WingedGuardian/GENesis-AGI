@@ -464,6 +464,198 @@ def issue(db, data, native, legs, *, now=None, finalize, fresh_cleanup=None, pri
     )
     return value
 
+
+def _physical_subject(row):
+    """Original lifetime facts; provider-only safety remains independently checked."""
+    fields = ("execution_seq", "hash", "repo_path", "provider", "protocol", "claim_id",
+              "launch_reservation", "launch_permission", "scope_registration", "native_intent",
+              "terminal", "cleanup_proof", "cleanup_invalidated", "control_closure", "completion_kind")
+    subject = {key: row[key] for key in fields}
+    for key in ("cleanup_first_failure", "first_typed_conflict"):
+        item = json.loads(row[key]) if row[key] else None
+        subject[key] = item if item and item.get("kind") in ("cleanup", "cleanup-disproof") else None
+    return subject
+
+
+def _cleanup_residuals(db, residual, annotations, native, legs):
+    if set(residual) != set(annotations):
+        raise RuntimeError("incomplete physical residual annotations")
+    sequences = {}
+    for key, (context, state) in annotations.items():
+        native._object(context, legs.CONTEXT, "physical residual context")
+        native._integer(context["execution_seq"], "physical residual sequence", positive=True)
+        if (type(context["protocol"]) is not int or context["protocol"] != 3
+                or state not in ("waiting", "retained")
+                or (context["hash"], context["provider"]) != key[:2]):
+            raise RuntimeError("invalid physical residual annotations")
+        native.execution(db, context, legs)
+        if key[2] in ("cleanup", "cleanup-disproof"):
+            sequences.setdefault(context["execution_seq"], set()).add(key)
+    return sequences
+
+
+def physical_guard(db, h, native, legs, finalize, *, exclude, fresh_cleanup):
+    """Bind this decision's fresh lifetime proof before its final evidence drain."""
+    before = {}
+    residual = finalize(residual_context=before)
+    baseline = _cleanup_residuals(db, residual, before, native, legs)
+    proven = {}
+
+    def observe(row):
+        if fresh_cleanup is None or fresh_cleanup(row) is not True:
+            return False
+        context = {key: row[key] for key in legs.CONTEXT}
+        proven[row["execution_seq"]] = _physical_subject(native.execution(db, context, legs))
+        return True
+
+    def check():
+        annotations = {}
+        residual = finalize(residual_context=annotations)
+        current = _cleanup_residuals(db, residual, annotations, native, legs)
+
+        def unchanged(row):
+            sequence = row["execution_seq"]
+            return (proven.get(sequence) == _physical_subject(row)
+                    and current.get(sequence, set()) <= baseline.get(sequence, set()))
+
+        if native.physical_blocked(db, h, exclude=exclude, fresh_cleanup=unchanged):
+            raise RuntimeError("final physical ownership prevents selected acknowledgement")
+        return residual
+
+    return observe, check
+
+
+def consume(db, data, native, legs, *, finalize, bind_runtime, fresh_cleanup=None, now=None):
+    """Stage one selected actual-owner reservation and validated runtime atomically.
+
+    Caller holds the admitted transaction and lifecycle/coordination leases.
+    Errors must escape that transaction; only its first committed return may
+    reach the same actual owner's execution core. Duplicate calls return None.
+    """
+    if not db.in_transaction or not callable(bind_runtime):
+        raise RuntimeError("selected consumption requires its admitted runtime validator")
+    native._object(data, ("hash", "provider", "nonce", "reservation", "policy_sha256"),
+                   "selected consumption")
+    for key, size in (("hash", 16), ("nonce", 32), ("policy_sha256", 64)):
+        native._hex(data[key], size, key)
+    grant = load(db, data["hash"], data["provider"], native)
+    if grant is None or grant["nonce"] != data["nonce"]:
+        raise ValueError("selected consumption does not name the current grant")
+    if grant["status"] == "spent":
+        return None  # No reconstructed runtime or first reservation ACK.
+    fresh(grant, _clock() if now is None else now, native)
+    row, selected = selected_request(db, data["hash"], data["provider"],
+                                     grant["request"]["origin"], native, legs)
+    if selected != grant["request"] or data["policy_sha256"] != grant["policy_sha256"]:
+        raise ValueError("selected request or policy changed")
+    claimed = legs._insert_claim(db, data["hash"], data["provider"], row,
+                                 protocol=3, nonce=data["nonce"], origin="selected-recovery")
+    context = claimed["context"]
+    reserved = native.reservation(data["reservation"], context)
+    if (reserved["owner"] != recovery.owner_identity() or reserved["source"] != grant["source"]
+            or reserved["run_mode"] != grant["run_mode"]):
+        raise ValueError("selected reservation does not bind actual owner and granted inputs")
+    spent = dict(grant, status="spent", trial=context)
+    validate(spent, native)
+    db.execute("UPDATE provider_state SET grant=? WHERE hash=? AND provider=?",
+               (native.encode(spent), data["hash"], data["provider"]))
+    observe, final_physical = physical_guard(db, data["hash"], native, legs, finalize,
+        exclude=context["execution_seq"], fresh_cleanup=fresh_cleanup)
+    if native.reserve(db, context, reserved, legs, fresh_cleanup=observe) != "reserved":
+        raise RuntimeError("selected reservation remains held")
+    bound = bind_runtime(context, reserved)
+    residual = final_physical()  # All physical/runtime callbacks precede the last drain.
+    if reserved["owner"] != recovery.owner_identity():
+        raise ValueError("original selected owner changed before publication")
+    fresh(spent, _clock() if now is None else now, native)
+    current = view(db, data["hash"], data["provider"], native, legs, residual,
+                   exclude=context["execution_seq"])
+    if (any(current[key] != grant[key] for key in ("hazard_revision", "frontier", "evidence"))
+            or legs.MODES.index(current["required_mode"]) > legs.MODES.index(grant["run_mode"])):
+        raise ValueError("selected safety evidence or required envelope changed")
+    _, selected = selected_request(db, data["hash"], data["provider"],
+                                   grant["request"]["origin"], native, legs)
+    retained = native.execution(db, context, legs)
+    native._owns(db, retained)
+    if (selected != grant["request"] or load(db, data["hash"], data["provider"], native) != spent
+            or retained["launch_permission"] != "reserved"
+            or bytes(retained["launch_reservation"]) != native.encode(reserved)
+            or any(retained[key] is not None for key in (
+                "scope_registration", "native_intent", "terminal", "first_stop", "cleanup_proof",
+                "control_closure", "safety_kind", "first_typed_conflict"))
+            or retained["cleanup_invalidated"]):
+        raise ValueError("selected trial changed before publication")
+    if grant["request"]["origin"] == "pending":
+        db.execute("DELETE FROM pending WHERE hash=? AND provider=?",
+                   (data["hash"], data["provider"]))
+    return claimed, bound
+
+
+def trial_binding(db, context, legs, *, reserved=None, now=None, phase="prepared"):
+    """Validate retained selected authority at a native launch transition.
+
+    The facade additionally checks the exact residual set after its last drain;
+    this reader cannot stand in for that publication-boundary decision.
+    """
+    import _genesis_index_marker_execution as native
+
+    if phase not in ("prepared", "started"):
+        raise ValueError("unknown selected transition phase")
+    native._object(context, legs.CONTEXT, "selected trial context")
+    native._integer(context["execution_seq"], "selected sequence", positive=True)
+    if type(context["protocol"]) is not int or context["protocol"] != 3:
+        raise ValueError("selected trial requires protocol3")
+    row = native.execution(db, context, legs)
+    grant = load(db, context["hash"], context["provider"], native)
+    if (grant is None or grant["status"] != "spent" or grant["trial"] != context
+            or row["nonce_origin"] != "selected-recovery"):
+        raise ValueError("native transition does not own a consumed selected grant")
+    fresh(grant, _clock() if now is None else now, native)
+    native._owns(db, row)
+    if reserved is None:
+        if row["launch_reservation"] is None:
+            raise ValueError("selected trial has no reservation")
+        reserved = json.loads(row["launch_reservation"])
+    native.reservation(reserved, context)
+    if phase == "started":
+        if (row["native_intent"] is None or row["launch_permission"] != "spent"
+                or json.loads(row["native_intent"])["source"] != grant["source"]):
+            raise ValueError("selected intent was not durably staged")
+    elif (row["native_intent"] is not None or row["launch_permission"] not in (None, "reserved")
+          or row["launch_permission"] is None and row["launch_reservation"] is not None):
+        raise ValueError("selected native permission is already closed")
+    if (reserved["source"] != grant["source"] or reserved["run_mode"] != grant["run_mode"]
+            or row["mode"] != grant["request"]["mode"]
+            or row["attempts"] != grant["request"]["attempts"]
+            or row["requested_at"] != grant["request"]["requested_at"]
+            or row["legacy_unqualified"] != grant["request"]["legacy_unqualified"]
+            or row["legacy_shared_attempts"] != grant["request"]["legacy_shared_attempts"]
+            or any(row[key] is not None for key in (
+                "terminal", "first_stop", "cleanup_proof", "control_closure",
+                "safety_kind", "first_typed_conflict", "conflict_reason"))
+            or row["cleanup_invalidated"]):
+        raise ValueError("selected trial no longer binds its granted inputs and debt")
+    current = view(db, context["hash"], context["provider"], native, legs, (),
+                   exclude=context["execution_seq"])
+    if (any(current[key] != grant[key] for key in ("hazard_revision", "frontier"))
+            or not set(current["evidence"]).issubset(grant["evidence"])
+            or legs.MODES.index(current["required_mode"]) > legs.MODES.index(grant["run_mode"])):
+        raise ValueError("selected grant no longer covers current safety and workload")
+    return grant
+
+
+def trial_decision(db, context, legs, residual, *, reserved=None, now=None, phase="prepared"):
+    """Exact provider evidence comparison on the admitted final-drain snapshot."""
+    import _genesis_index_marker_execution as native
+
+    grant = trial_binding(db, context, legs, reserved=reserved, now=now, phase=phase)
+    current = view(db, context["hash"], context["provider"], native, legs, residual,
+                   exclude=context["execution_seq"])
+    if any(current[key] != grant[key] for key in ("hazard_revision", "frontier", "evidence")):
+        raise ValueError("selected grant residual evidence changed")
+    return grant
+
+
 def settle_selected(db, row, native, *, completion, safety, increment):
     """Settle selected history without inventing its lost request origin.
 
@@ -502,6 +694,35 @@ def settle_selected(db, row, native, *, completion, safety, increment):
         return "consumed", "consumed", row["attempts"], safety
     return "failed", "selected-failure-retained", row["attempts"] + int(increment), safety
 
+
+def launch_transition(api, context, data, operation):
+    """Use the existing opener/barrier for exact selected native acknowledgements."""
+    native, legs = api["_native"], api["_legs"]
+    if operation not in (native.reserve, native.register, native.begin):
+        raise ValueError("unknown native launch transition")
+    with api["_decision_gate"](native=True) as (db, finalize):
+        row = native.execution(db, context, legs)
+        selected = row["nonce_origin"] == "selected-recovery"
+        if not selected:
+            recovery.refuse_unrepresented(db, finalize(), (context["hash"], context["provider"]))
+        fresh = api["_fresh_gate"](db)
+        if selected:
+            fresh, final_physical = physical_guard(db, context["hash"], native, legs, finalize,
+                exclude=context["execution_seq"], fresh_cleanup=fresh)
+        args = (db, context, data, legs)
+        if operation is not native.reserve:
+            args += (api["_proof"],)
+        state = operation(*args, fresh_cleanup=fresh)
+        if selected:
+            if state in ("reserved", "registered", "started"):
+                residual = final_physical()  # Pure physical and grant readers follow this drain.
+                trial_decision(db, context, legs, residual,
+                               phase="started" if operation is native.begin else "prepared")
+            else:
+                finalize()  # Non-permit outcomes retain their ordinary drain semantics.
+    return state  # Duplicate/conflict/resource statuses never become fresh permits.
+
+
 def revoke(db, h, provider, nonce, native, *, grant_sha256=None):
     if not db.in_transaction:
         raise RuntimeError("retry revocation requires an admitted transaction")
@@ -536,7 +757,7 @@ def revoke(db, h, provider, nonce, native, *, grant_sha256=None):
     return value
 
 
-COMMANDS = {"status-recovery", "request-retry", "revoke-retry"}
+COMMANDS = {"status-recovery", "request-retry", "revoke-retry", "claim-selected"}
 
 
 def add_commands(sub, legs):
@@ -557,6 +778,10 @@ def add_commands(sub, legs):
             selected = parser.add_mutually_exclusive_group(required=True)
             selected.add_argument("--nonce")
             selected.add_argument("--grant-sha256")
+        elif name == "claim-selected":
+            parser.add_argument("--nonce", required=True)
+            parser.add_argument("--managed-config",
+                default=str(Path.home() / ".genesis/config/codebase-managed.json"))
 
 
 def dispatch(args, api, supervisor):
@@ -607,6 +832,9 @@ def dispatch(args, api, supervisor):
                     managed_config=args.managed_config,
                 )
             )
+        elif args.cmd == "claim-selected":
+            result = supervisor.claim_selected(dict(repo_path=repo, provider=args.provider,
+                nonce=args.nonce, managed_config=args.managed_config))
         else:
             result = supervisor.revoke_retry(repo, args.provider, args.nonce,
                                              grant_sha256=args.grant_sha256)
