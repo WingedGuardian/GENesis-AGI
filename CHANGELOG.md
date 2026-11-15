@@ -9,6 +9,985 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+## [v3.0b20] - 2026-11-15
+
+### Added
+
+- `scripts/delivery_marker.py compose --second-reader` runs the command an install names as `delivery.second_reader_cmd` in genesis.yaml, which scores whether the PR diff implements the issue's quoted fix. The score goes to `$GENESIS_HOME/delivery/shadow.jsonl` only: it is not printed, not put in the marker and not read by any gate. It runs only for a PR whose basis is a public issue, and nothing runs when the key is unset.
+
+- Genesis now records whether each tool call in a session succeeded or failed, for every tool rather than only file edits, so recurring failures can be counted. Failure text is scrubbed of credentials before it is stored; rows are kept for 180 days and failure text for 90.
+
+- **Genesis can pay with a vault card after your Telegram tap (off by default).** With `card_fill.enabled: true` in `config/payments.yaml` (and the browser restarted), the new `browser_fill_card` tool reopens the checkout in a separate, short-lived browser window that no other browser tool can reach and that shows blank on the display, fills the merchant's other fields (email, address and similar), asks you to approve with a tap that shows the site, amount, card, Pay button label and the names of the fields it fills, then fills the card, clicks Pay itself and closes the window. It refuses a checkout or card form not served over https from a named site (an IP address or a local host is refused), and right before clicking Pay it checks that the page still shows what you approved and that every card field still holds what it typed. Genesis only ever sees a fixed status: after Pay it is `submitted_unverified`, or `challenge` / `card_url_blocked` / `card_url_leaked` / `pay_click_unknown` / `outcome_unknown` with "do NOT retry" (`card_url_blocked`: the window blocked a request that would have put a card value (number, expiry, CVC, name or postal code) in a URL; `card_url_leaked`: a redirect carried it, which the window can see but not stop; if either happens while the card is being typed, Pay is not clicked and the code is `card_url_before_pay` (or `card_value_in_request` when only the CVC, expiry, name or postal code matched, which can be a coincidence and does not mean the card number left); if the checkout navigates or opens a window by itself while the card is being typed, Pay is not clicked and the code is `moved_while_filling`; both also say "do NOT retry"); a bank (3DS) check is not shown yet, so it closes the window and reports the outcome as unknown. While card fill is on, Camoufox keeps no form history, autofill, password capture, browsing history or disk cache for any site, and exposes no accessibility tree (other programs on the machine cannot read typed card numbers through it). Card and Pay selectors must be plain CSS.
+
+- **A `live` checkout that an interrupted update left half-written can now be put back with one command.** `scripts/deploy_candidates repair-move` returns every path the interrupted move touched to the code that ran before the update, then clears the update's restart guard once the shared check agrees. It never moves forward onto code that was never installed. Before changing anything it copies every file it will change to `~/.genesis/deploy-backups/<time>-live-move-repair/`, and any file that was not the update's own (another session's edit, a staged or flagged entry) is reported with the exact command that puts it back (staged content, both index flags, symlinks and FIFOs included; a socket, which holds nothing to save, is reported as removed), in the command's output and a critical alert (the deploy-health and awareness readers of that report arrive in a follow-up change; `repair-move --dismiss <time>` marks a report as handled). It also keeps a byte copy of git's index, and rebuilds an index a power loss tore from the code that ran before the update. A repair that was itself interrupted is finished by the next run, without a new backup when the checkout already healed. `repair-move --explain` prints the manual steps. Every message about a `live` checkout left half-written at the code that ran before the update (bootstrap, `update.sh`, the live engine and the dashboard) now names the command; a `main` checkout's message is unchanged. The command runs a copy of the repair installed outside the checkout, which a later change installs; until then it says the copy is missing, and `repair-move --explain` and the half-written-checkout message still give the manual steps. The rebuild also now writes its merge objects to disk durably, so a power loss right after it cannot lose the code the update was moving to.
+
+- Added an inactive Codex validator adapter that runs existing safety guards,
+  converts approval requests to explicit denials, retains advisories and refuses
+  observable guard failures. Shell calls require an absolute directory change
+  with a failure exit and newline before the body, preserving foreground scope;
+  patches are checked against their actual targets in validator scratch roots.
+  Publishing-allowance qualification keeps six original tests direct and checks
+  validator refusal separately with independent cache state and fault controls.
+  Ordinary Codex configuration and MCP access are unchanged.
+
+- Expose the existing bounded, scrubbed transcript evidence reader through the
+  analytics CLI, matching accepted source references and reporting reused-ID
+  ambiguity without choosing an owner.
+
+- **Live agent (experimental).** `scripts/live_agent_cli.py` drives one persistent, fully loaded Claude Code session from a program: send a turn, steer it while it runs, interrupt it, and approve or deny its permission asks, with a short progress stream. It runs on your Claude subscription through the pinned `claude` and resumes the same session across restarts. This is the groundwork for a voice front end; nothing else uses it yet.
+
+- Added opt-in contained CI controls for pinned Headlong mechanics and synthetic provider routes, without native-agent, model-quality or production-runtime claims.
+
+- Added an opt-in contained experiment for real Claude Code through the Agent SDK,
+  with scripted loopback responses and actual canonical proposal claims. Independent
+  state, artifact and handler-error checks qualify the work-tool seam without real
+  inference or production changes; orchestration and engine parity remain separate.
+
+- Added an opt-in contained invocation policy on prepared native peer receipts, including tools-free execution, owned helper/scope cleanup and operation-wide provider observation isolation. Ordinary same-owner conversations retain their current behavior; cross-owner admission remains a separate consumer change.
+
+- Allow a smaller Pro incumbent baseline in Flash model comparisons while retaining full Flash qualification, detailed incomplete legacy reports, and clear reporting of the baseline's limited scope.
+
+- Qualification runs can explicitly select an existing shared OpenRouter key under a frozen version-2 operating plan and separate spending approval, retaining receipt evidence and no-resend recovery without exclusive account-usage claims.
+
+- ### Added
+
+  - Shared offline ego-runtime mechanics metadata and explicit source attribution
+    for the protected native fixture bridge. Existing monolith cases retain their
+    qualification predicates; the owned loop and full runtime parity remain
+    separate work.
+
+- ### Added
+
+  - Contained offline ego-loop adapter with actual trigger/config binding,
+    evidence-checked native completion, conservative restart and owned child cleanup.
+    An early native smoke joins the existing isolated controls; the full mechanics
+    comparison and production/Codex integration remain separate.
+
+- ### Added
+
+  - Contained shared native mechanics corpus for the offline owned loop, with
+    separate generated reducer cells, retained journals and scoring controls.
+    Crash/recovery qualification and final runtime comparison remain separate.
+
+- ### Added
+
+  - Contained owned-loop interruption and late-I/O recovery fixtures, with init
+    adoption controls, scoped process evidence and plain-loop reopen checks.
+    Actual contained qualification is required; timing and final comparison follow.
+
+- ### Added
+
+  - Private offline ego-loop journal reducer with separate external cursor and
+    generated timer progress, persisted pacing and conservative restart handling.
+    Runnable/native integration remains a separate qualification step.
+
+- Added a separate offline C1 actual-clock/lifecycle instrument for six timer
+  wakes, three fixed reactive arrival offsets, SIGTERM during backoff and writer
+  contention. Actual contained evidence and independent readback are required;
+  this adds no production runtime or Codex execution path.
+
+- Added an opt-in offline baseline exercising canonical proposal resolution, revocation, revision and dispatch claims in disposable databases, with independent committed-state and fixture artifact checks.
+
+- Live-agent hosts can declare speech output so session identity instructions omit the terminal model/effort header, including after resume and compaction.
+
+- Add an opt-in persistent live-agent user service with private local owner controls, a terminal attach client, reconnectable approval visibility, and explicit interruption. Installing updates renders the unit without enabling it.
+
+- Add an explicit internal indexing execution-evidence helper that refuses missing scope proof and preserves uncertain completion separately from command exit codes. Automatic queue quarantine and provider activation remain separate work.
+
+- Offline Headlong evaluation can test preservation of issued references through
+  secret redaction in a derived runtime, with stock behavior retained separately.
+  Production runtime selection remains unchanged.
+
+- Offline runtime comparison can exercise the actual Headlong monolith through
+  Claude Code and the Agent SDK, including issued-reference continuity, blocked
+  prompts and partial effects. Stock controls remain separate; production runtime
+  selection is unchanged.
+
+- Add the inactive Codex validator's bounded publication, service, store and file
+  policy, using optional canonical-parser context without activating a profile.
+  Git, GitHub and the Genesis CLI are allowlists of read operations, and
+  mutating HTTP to the live store ports refuses on any host.
+
+- Retain explicit index-launch intent, completion and cleanup evidence durably so replay can preserve completed work while an unresolved writer, uncertain outcome or resource failure continues to block unsafe retries. Automatic indexing remains disabled pending native integration and acceptance.
+
+- Add an owner-supervised Codex validator launcher with a dedicated profile, explicit login, trusted-hook and server checks, physical source qualification, and a main-root branch-test mode. Versions differing from its native qualification reference warn while retaining startup checks. It does not install a service or enable unattended validation.
+
+- Add explicit read-only indexing-source diagnostics that retain the captured helper identities across deployment changes without enabling indexing.
+
+- Added validator-only memory and eligible private follow-up tools, plus strict evidence-derived verification recording with a server-forced preview gate until calibration opt-in.
+- Keep validator-health activity metrics in memory without letting instrumentation commit or roll back unrelated pending work; historical provider reads and other clients retain their existing behavior.
+- Verify the PR's merge identity before previewing or recording results, share empty-safe CLI/MCP notes, and refuse invalid calibration settings without overwriting retained configuration.
+
+- Added privacy-scanned issue/PR timeline comments to the existing filer and exposed the single-source validator skill with Codex-specific tool and execution rules.
+
+- **Card fill reaches card forms behind clicks.** `browser_fill_card` takes `steps`: the clicks (a cart, "Continue to checkout", "Add card") that the payment window replays before it reads the form. Billing fields inside the card frame can be filled, and `first_name`/`last_name` are split from the card's name. A required consent checkbox (a debit authorization) goes in `consent`: the Telegram tap shows its label, and it is ticked only after you approve. Billing address values can come from `card_fill.billing` in your private `payments.local.yaml` instead of tool arguments.
+
+- **Card fill pays checkouts whose fee depends on the card.** `browser_fill_card` takes `save` (the control that stores the card) and `amount_max`, a ceiling you approve on the Telegram tap ("up to $X"). After the card is saved, it reads the real total and clicks Pay only if the total is at or above the subtotal and at or under the ceiling; otherwise it stops before Pay and tells you to check the merchant account, since the save step itself may run a card check. Both amounts are passed with their currency symbol; a total in another currency is not read. The ceiling checks what the page shows; it is not a limit the merchant enforces. While it waits for your tap, it moves the mouse in the checkout every minute so an idle-logout timer sees activity.
+
+- Retain provider safety and original-owner control completion in an explicitly converted queue schema, preserving legacy evidence, startup OOM facts and accounting while keeping automatic indexing and supervised recovery commands fenced.
+
+- Capture code-intelligence startup code and explicit queued-worker inputs across process handoffs, preserving literal service tool paths and the existing automatic-indexing fence.
+
+- The private Codebase reporter now validates its captured runtime, original owner and scope before worker entry, preserves startup OOM evidence and the original counter baseline, and binds the full control policy without enabling automatic indexing.
+
+- Adds the private Codebase startup owner and pressure-monitor lifecycle, retaining terminal child waits, bounding pre-startup drain and retrying cleanup reads within the original budget. The initial scope validates an independent manager runtime cap before startup permission. Literal scope arguments, uncertain cleanup and original resource evidence remain retained while automatic indexing stays disabled pending integration and qualification.
+
+- Captured indexing supervision can reconcile an exact ended owner's work
+without repeating its native operation or clearing its provider hold. Admission
+checks global managed-scope absence, and recovery can re-drain callback-published
+evidence on the same transaction. Automatic readiness remains disabled.
+
+- Add explicit supervised retry-grant request, observation and revocation, including exact corrupt-metadata revocation and conservative settlement of retained selected trials. New selected execution, acceptance and automatic readiness remain separate.
+
+- `scripts/genesis_peer_mcp.py`: a standalone MCP client for the same-owner
+  agent conversation API, so a Claude Code, Codex or OpenCode agent on another
+  machine can hand Genesis a task and read the reply. The agent conversations
+  reference gains a step-by-step for connecting one.
+
+- Added a read-only MCP process diagnostic with separate RSS/PSS/SwapPss totals,
+  explicit missing-data reporting and stable process-ancestry observations.
+  It leaves conversation ownership unknown and performs no process cleanup.
+
+- **The deploy-health report now says what the live-move repair saved, and where.** After the repair puts a half-written `live` checkout back to its rollback tag, each of its reports is listed with its time, its backup folder and how many paths the update did not write were saved there (`live_repair_saved:<n>`), until you run `scripts/deploy_candidates repair-move --dismiss <time>`. Putting them back will be `repair-move --restore <time>`, which comes in a later release; until then the saved copies are in the named folder. Backups are pruned 90 days after the last write to their folder. Only the newest eight reports are read; older ones are counted as informational. A report the reader cannot read safely (a name, file type, size, row count or checkout the repair never writes) is counted as refused and named in the server log, and never blanks the rest of the report. An interrupted repair reads as unresolved only while the shared restart guard still calls the checkout half-written. The host guardian's diagnosis picks the newest eligible report inside the container, for this checkout only, by the time in its folder name, so newer dismissed or superseded reports cannot hide it. Both readers order reports the same way, and a report whose folder name is more than five minutes in the future (written while the clock ran ahead) is counted as refused rather than taken as the newest. The open health endpoint shows only the counts to a caller without credentials.
+
+- A plan that names repo files can no longer leave plan mode without a `## Premise checks` section answering the six plan-time premise questions. It blocks until the section exists and every answer is filled in (`n/a — <reason>` counts). Plans that name no repo paths, such as research or errand plans, are unaffected.
+
+- Publish optional run/attempt-bound collected-test review evidence for pull requests, preserving the existing collected-floor verdict and raw artifact.
+
+- Session-ledger rows can now be marked `relayed`: the owner's own request, written down by a dispatched session such as a channel conversation. Those rows get the same undisposed-ledger escalation as foreground agreements by default. If you override `escalate_added_by` in a local `ledger_escalation.local.yaml`, add `relayed` to your list to keep it, because the overlay replaces the shipped list.
+
+- **Guardian alerts appear in conversation history.** Alerts the host Guardian posts to Telegram are now recorded alongside Genesis's own messages and labelled as the Guardian's, so a reply to one has its context. This needs a Guardian redeployed with the `sent-log` gateway verb; with an older Guardian nothing changes. `GENESIS_GUARDIAN_SENT_LOG_DISABLED=1` turns the pull off.
+
+- New issues without their answers get a `premises-missing` label until the answers are added. Work issues answer the six plan-time premise questions. Bug reports answer five verification questions instead: reproduced, evidence, reporter-side causes ruled out, searched, expected vs actual. The bug-report form now asks for these, and reports filed through it are not labelled. Applying `devin-ready` to an issue without the six premise answers removes it again, with a comment listing what is missing, so a paid Devin session does not start on an unspecified issue. `/task` plans that name repo files now carry the premise section.
+
+- **Inbox URL coverage report.** New read-only `scripts/inbox_coverage_report.py` answers, for every URL in an inbox note, whether it was evaluated, whether its `*.genesis.md` response still exists, and whether the response actually covered it — per note and in totals with explicit denominators. Opens the database `mode=ro` and never touches inbox or response files; part of #2803.
+
+- `python3 scripts/premise_gate.py check <issue>` reports whether an issue is ready for `devin-ready`: it lists the missing premise answers (and, for a bug report, the missing verification answers) and exits 0 only when the six premise answers are complete. Sessions run it before applying the label, because the label's own check runs only after the paid trigger has fired.
+
+- `python3 scripts/repo_pulse_worker.py --next-for-validation` names the one post-merge verification a validator should work next, or says why there is none. It picks not-yet-done rows first, then never-attempted ones, then parked rows after a week, and never a recorded failure. Within those it prefers a PR that is already deployed and has an `E2E:` plan, newest merge first. It reads GitHub and git and writes nothing, and when either cannot answer it picks nothing rather than guess.
+
+- A foreground session's `gh issue create` is now refused before it posts when its body lacks the answers the premise gate requires (the six premise answers, or the five verification answers for an issue labelled `bug`). The refusal names the missing answers and the format. Dispatched sessions are never blocked, and a body the check cannot read in full passes as before.
+
+- **You can now check, without changing anything, what restoring a live-move repair's saved paths would do.** `live_move_repair.py --restore <time> --check` reads one repair report and, for every saved path, says whether it still holds what the repair left (safe to put back), already holds the saved copy, or has changed since (and why: changed by a later deploy, something staged below it, a symlinked folder above it, a newer repair touching it, its saved copy missing, a file too large to check). It changes nothing in the checkout or the saved backups, waits at most 30 seconds for an update in progress, and refuses a report that is not exactly what the repair writes. Putting the paths back is a later release. `--dismiss` now refuses a time that is not a repair report's and reads the report through the same checks.
+
+- A background session that stops without finishing (fails, is truncated, or expires idle) now reaches you in one Telegram page per hour that lists each stop and its reason, including campaign, mail, peer, inbox and reflection sessions that used to fail silently. Work you asked for directly (an MCP request, an ego dispatch, a job you scheduled) still pages when it fails, and a stop already reported is not listed again. Set `GENESIS_STOPPED_SESSION_PAGES=off` to turn the hourly page off.
+
+- **`repair-move --restore <time>` now puts a live-move repair's saved paths back.** It writes only what still holds exactly what the repair left, and refuses every other path by name: one edited, staged or changed upstream since, a saved copy whose SHA-256 no longer matches its record, a report folder another account could have written, a filesystem that cannot move a file without risking a replace. What it replaces is moved, never copied or deleted, into a private folder under `deploy-backups` first, and every new file goes in with a move that fails rather than overwrite anything that appeared meanwhile, so a session writing the same path is never clobbered. Restored files keep their recorded permissions without setuid, setgid or sticky bits. A restore killed at any step finishes on the next run, and `--check` agrees with it. The report records the outcome, and the deploy-health count, the awareness note and the guardian's diagnosis clear a report only once a restore refused nothing. A restored file gets back the extended attributes its saved copy kept.
+
+- A background session that exits cleanly but could not finish (a tool was denied, something it needed was missing, or only you can decide the next step) now says so, and is listed in the hourly stopped-session page instead of being recorded as a success. Work you asked for directly pages at once when it stops this way, and a result delivered back to your conversation is marked stopped instead of complete. An ego dispatch that stopped short no longer counts as a successful proposal. A Sentinel session that crashed or was cancelled is now recorded as failed. The hourly page also counts the sessions of the past hour that ended without saying how they went.
+
+- **`repair-move --restore <time> --check` now refuses a report it did not write before judging it.** The report folder and everything in it must belong to this account with no group or world write, reached without following a link; a report holding a path nested below another saved path is refused, one written before the integrity record is judged with a note that a restore refuses it, and no git call runs the repository's own fsmonitor program or hooks. `--restore` without `--check` still writes nothing. A newer report whose rows do not all name a plain path also refuses the check, since such a row could hide an overlap, and a row field holding a list or object is refused as a bad report rather than crashing the check. A saved directory holding a nested checkout's `.git` files (or a socket inside one) is now judged instead of refused whole, and `repair-move --wait N --restore TS --check` takes the mode after `--wait` and refuses two modes at once. When `deploy-backups` is a link, another user's or writable by others, the repair still heals and saves into it, and its output and alert now warn that the restore check refuses reports there.
+
+- Extend the internal request-owned database registry with explicit shutdown grace and synchronous resource-work ownership. Keep admission until actual physical completion and DB closure; unconfirmed dispatch fails shutdown without permitting dependent provider cleanup. Legacy thread cancellation and zero-grace initiating `close()` remain supported. No shared service is activated.
+
+- The database layer now logs any write transaction the server keeps open for a second or more (`sqlite txn held: …`), naming the code that opened it, so a process that keeps the database's writer slot busy can be found; set `GENESIS_SQLITE_TXN_HOLD_MS=0` to turn it off.
+
+- **Shared MCP services can start explicitly with `--shared-service`.** Startup freezes the operator limits, runs the actual standalone service initializers, and owns provider cleanup: registered resource work settles before clients and caches close, including after a partial startup or a signal. A start that never completes exits non-zero. The rollout stays off; unit readiness and client switching are separate changes.
+
+- Warn before editing a worktree claimed by another live Claude Code session, and claim unowned worktrees after a successful file edit. Claims preserve existing locks and the feature remains advisory, with the existing settings and environment switches.
+
+- Added credential-free contained native Codex compatibility checks and source-bound artifact readback, without activating a production executor.
+
+- Add a model-validation workflow skill for qualification evidence, exact paid consent, model identity, no-resend recovery and bounded promotion claims.
+
+- **Inbox traces can show reported CLI identities for observed evaluation attempts.**
+  Available result identities survive classified errors and appear on separate
+  invoker spans under the inbox batch. Tracing remains optional, private execution
+  omits the new invoker attributes, and missing telemetry never implies that no
+  work ran. Retry, approval and response handling keep their existing behavior.
+
+- **A standing validator session now has written rules.** The validating-merges skill gains a "Standing mode" section for a session the owner starts (with `/loop`) to work the post-merge verification backlog one PR per pass: pick with `--next-for-validation`, verify, dry-run the record, route each concern to a tracking issue, tell the owner about a `fail-intent` (once through outreach when they are not attached), and pace itself with ScheduleWakeup. It records open verdicts but never closes a record: a document that would close one is saved for the owner's review and the loop ends, because the closing tool checks a record's form and not whether it covers every claim the PR made. It never deploys, merges, pushes or edits tracked files, and it stops to ask after three passes on the same row, three same-cause `cannot-verify` results, three same-cause picker faults, or a rate limit. The closing-session skill gets a matching pacing paragraph: each pass reads the queue once and acts only on PRs that changed. The commands the verification readers and the closer print now start with the interpreter that ran them instead of a bare `python3`, which may lack `aiosqlite` and failed on an install.
+
+- **The gate-defect corpus has a `server` rung.** It runs the merge gate's `--check-pr` report as a subprocess, with the merge-gate workflow's environment and a fake `gh` that answers every GitHub read from recorded responses, so the gate's real fetch-and-parse path is tested. The other rungs stub those reads. Any read the fake does not know fails the test. One new corpus case is caught only by this rung: the inline-findings read mistaking a comment's review id for the comment it replies to, which would let a Codex P1 merge.
+
+- The inbox coverage report includes whole text/logical items, legacy input membership and explicit baseline/response evidence without promoting unknown history to verified evaluation.
+
+- Add an explicit owner-requested inbox-review skill and read-only exact-tag ruling helper, preserving full evidence, historical uncertainty and actual owner dispositions in existing records.
+
+- Added read-only qualification study checks and inherited-answer reports across
+immutable stopped campaigns, preserving physical attempts, unresolved costs and
+the first verified answer regardless of its grade.
+
+- **Holdout scenarios for validators.** An install can keep hidden, exact behavioural checks that builders never see, in `$GENESIS_HOME/holdout/HOLDOUT.md` (`~/.genesis` by default). The new `holdout-writer` subagent writes them, either from today's behaviour (regression) or from a specced issue's intent before it is built. `scripts/holdout_runner.py --pr N` runs the scenarios a merge touches, before and after the merge, and prints only ids, verdicts and one-line descriptions. The validating-merges skill records those verdicts, and the spec-session skill adds intent scenarios before an issue goes to a builder. An install without the file is unaffected. See `docs/reference/holdout.md`.
+
+- The Sentinel can now offer, behind your approval, to free memory held by Codex's shared background server. Codex sessions from editor clients (such as the VS Code extension) start a full set of tool servers for every helper agent, and finished helpers can keep them running for hours. The new remedy (`python -m genesis.sentinel.codex_mcp_stop`) lists those servers, and on an approved action stops only them. It never touches Claude Code sessions, systemd services or a running chat command. A Sentinel dispatch is now reported as resolved only when every approved action succeeded, and each action's output is recorded. Turn the remedy off with `codex_mcp_stop.mode: off` in `config/sentinel.local.yaml`.
+
+- **Advisory fence around hidden holdout scenarios.** A new hook, `scripts/hooks/holdout_fence.py`, is wired into Claude Code (before and after tool calls, MCP results included) and the Codex CLI (shell calls). It records any agent other than `holdout-writer` reaching the install's holdout directory, or seeing a scenario's expected output in a result, and tells that agent to stop. It never blocks. Exposures go to `$GENESIS_HOME/logs/holdout-exposures.jsonl`, which is never rotated, and mentions and broad searches to a separate activity log. An install without a holdout directory exits in the shell before any Python starts.
+
+- **The live-move repair now also finishes a rollback that was killed partway.** When an update's rollback on `live` was interrupted while switching back, the checkout was left on the update's new code with part of the old code written over it, and `scripts/deploy_candidates repair-move` refused it. It now returns those paths to the code that ran before the update (saving every one it changes first, as before), moves `live` back to it only if nothing else moved `live` meanwhile, and puts back the git hooks the update installed. If the hooks cannot be put back at once, every later repair run retries while `live` is still at that code (a dismissed report included); deploy health counts them (`live_repair_hooks_pending`), the awareness check names them, and the 90-day backup prune keeps that report until the retry ends or it is dismissed. When the update's own code can no longer be read (a power loss took it), the repair instead reinstalls the hooks of the code that ran before, first saving every installed hook that differed (a hand-edited one included) in the report's `hooks-before/` folder, and says where; that report is kept, and counted by deploy health (`live_repair_hooks_saved`), until it is dismissed. The half-written-checkout message for this case now names the command and no longer suggests finishing the update with `--post-merge`, and both live messages now name `repair-move --restore <ts>` as the way to put back a path that was not the update's.
+
+- **The live-move repair kit is now installed.** `scripts/deploy_candidates repair-move` runs the repair from a copy kept outside the checkout (the checkout is what it may have to repair), and until now nothing installed that copy, so the command stopped with "the live-move repair kit is not installed". A new installer, `scripts/lib/live_repair_kit.py install <repo> <home>`, copies the repair's files from the committed code on `main` or `live` (never from uncommitted edits) into `~/.genesis/lib/live-repair.d/<id>/` with a list of their hashes, and switches `~/.genesis/lib/live-repair/current` to it in one step, so a reader always finds one whole version. It keeps the previous version too; `status` reports whether the installed kit is current, stale, partial, altered or missing. bootstrap, `scripts/deploy_code_only.sh` and an update's rollback now run it, and a failure only prints a note. `repair-move` now runs the versioned copy directly, so a reinstall during a run cannot mix two versions. The repair does not yet run when the server starts; that is the next change.
+
+- **An exposure the owner judged harmless can be dismissed.** `scripts/holdout_runner.py --dismiss TIME --reason TEXT` appends a dismissal row to the holdout fence's exposure log for the exposure row(s) recorded at exactly that time. The runner then leaves them out of the exposure count and the possibly-spoiled list, and prints how many rows are dismissed and when the latest dismissal was made, on every run; the reason stays in the log. Nothing is removed from the log, a dismissal never reaches a row written after it or a holdout-writer row, and it is refused when no such row exists.
+
+- **The guardian gateway has a `test-alert` verb.** It sends one test alert through the host Guardian's own alert channels and prints one JSON line (`ok`, `sent`, `error`), so Genesis can check that host alerts reach Telegram, and reach its message history, without waiting for a real incident. It runs no recovery, and a failed send is never queued for later replay. An install whose Guardian code predates the verb gets a clear "run update" error instead of a full check cycle.
+
+- **genesis-server now heals a half-written `live` checkout before it starts.** An update killed partway through moving the `live` checkout could leave its files half from one version and half from another, and the next start ran that tree. genesis-server and genesis-bridge now run the installed repair kit first: it checks the kit against its recorded hashes, judges the update state, and heals the checkout back to the rollback tag, saving everything it changes. A tree it judged half-written and could not heal keeps the service down, with a critical page; every other case starts, with one page for each update state the start goes past (the same state pages once, not on every start). Every step ends within 75 s, inside the unit's 90 s start limit.
+
+- **`follow_up_update` can correct a note: `replace_notes=True`.** Notes are
+  still appended by default. Passing `replace_notes=True` with
+  `resolution_notes` replaces the row's notes instead, for fixing a wrong or
+  sensitive note. It is refused without replacement text, and validators can
+  only append.
+
+- **The deploy engine now refuses `live` when the boot repair would not run.** Candidates that change the boot repair kit or the unit templates that run it are kept off `live`, and the engine's readiness check refuses while the installed kit is missing, partial, corrupt or foreign (or cannot be judged at all), while the loaded genesis-server unit has no boot repair step or systemctl cannot answer for it, or while its start timeout is under 90 s. A kit that is only older than HEAD gets a note instead. On `live`, `update.sh` reinstalls the kit from HEAD right before its rebuild, so readiness finds a healed kit rather than rolling the update back.
+
+- The infrastructure posture check now records a low-priority informational note when the user systemd manager has no io cgroup controller, naming each Genesis unit or scope whose `IOWeight` setting therefore has no effect on the install. It points to the per-process alternative (`ionice` around a scope's command, `IOSchedulingClass`/`IOSchedulingPriority` on a service). It never raises the high posture alert on its own, and nothing is blocked.
+
+- The work-board reconciler can now fill your board, in `live` mode only. Each tick it sets an empty Status column (In Review for an open pull request, and for an issue with an open pull request from the same repo that closes it; Proposed for any other open issue), adds each open issue and pull request that is not on the board yet, and records the card for every promoted issue. It never moves a card you placed, never sets In Progress, and never re-adds a card you removed. It makes at most 200 GitHub writes an hour, and stops for the tick when a GitHub request fails (a rate limit included). In `propose_only` it writes nothing and `board_status` shows what it would have written.
+
+- Qualification studies can explicitly authorize finite continuation with one
+  journal per physical attempt, complete inherited cost accounting and a bounded
+  replacement policy for verified upstream pool rejections. Existing study roots
+  cannot relaunch; offline reports retain model errors and unresolved expenses.
+
+- **The work board gains a Build column, between Ready and In Progress.** `scripts/board_setup.py --apply` adds it to an existing board's Status field in place, so every card keeps its current column and any extra option (such as GitHub's default "Todo") is still kept. A card in Build will mean the owner approves one builder run on that issue. Nothing acts on the column yet: the reconciler counts it, and the builder launcher that reads it comes later.
+
+- **`scripts/wait_main_ci.py` waits for main CI's verdict on a merge.** Main
+  never cancels its CI run in progress, but each new push replaces the run still
+  pending, so a merge's own run is often never run. The script takes the newest
+  run that contains the merge and concluded as a pass or a fail, never a
+  cancelled or signal-less one, and exits 0 (pass), 1 (red, with the failing
+  jobs), 2 (timed out) or 3 (the commit cannot be checked). The closing-session
+  skill now names it, and adds the rule for a jammed main CI: batch ready,
+  green PRs that share no files, then wait for one run that contains them all.
+
+- **Specs are checked before a builder gets them, and builds are checked
+  against their spec before the PR.** A read-only analyze pass reports
+  duplicated or conflicting requirements, unmeasurable wording, references
+  nothing defines, uncovered requirements and conflicts with standing rules (a
+  conflict is always CRITICAL). The `spec-session` skill runs it before handing
+  a spec over, and the architect agent runs it on any plan or spec it reviews.
+  A converge pass lists what a build still owes its spec, and `build-session`
+  runs it before opening a PR. Both are adapted from GitHub's spec-kit (MIT).
+
+- **Added: the disk guardian now says when a disk it paged about has recovered.** After an ORANGE or RED page, the first poll that finds the filesystem back to GREEN sends one message saying so, with the free space and how far the episode got. Before, a page was never followed by anything, so a disk that recovered a minute later looked the same as one still filling. The all-clear names the pages it answers and when the episode began, and the alert drainer sends it only if one of those pages was actually delivered since then: a page dropped by delivery, or deduplicated against an earlier episode's page, gets no all-clear. Each episode's all-clear has its own key, an all-clear that cannot be queued is logged without delaying the next alert, and the shell alert queue now takes an optional meta object.
+
+- Add captured supervised retry consumption through the existing contained owner, with atomic first-acknowledgement handling, original-owner checks and GitNexus arguments bound to retained execution origin. Late evidence of another writer prevents a recovery launch. Automatic indexing remains disabled pending separate acceptance and cutover.
+
+- `--check-pr` now prints an advisory note when a pull request's commits since its last review changed no file (a message-only rewrite or an empty commit, including under a later merge of main), so a "fixed" claim on such a push is not taken on trust.
+
+- Post-merge verification records: `scripts/pr_verification.py close` and the `pr_verification_close` MCP tool now refuse to close a record whose event-gated gap has a date that has already come (run its recheck now instead), and show advisory completeness questions on every run (`check:` lines, or a `prompts` field) to answer before a close.
+
+- Add `scripts/delivery_marker.py`, which writes and reads the delivery-check marker on a PR: `compose` validates the verdict fields, derives the basis from the PR body's source pointer, refuses a DELIVERS whose DONE lines cite no changed `path:line`, and prints the one `gh` command that posts or updates the comment; `read` lists the PR's marker blocks as a reader treats them; `parse()` is the shared parser.
+
+
+### Changed
+
+- The graph census (schema 3) covers the other graph-traversal producers it can see, not only memory servers: ambient workers get the same code-source proof, the census host gets a row of its own, other python processes on the main venv are checked for code history and database, replay is listed as excluded, and another stack running beside the host is dirty. A census-level check covers the code history of every commit the checkout held in the last two and a half hours, so processes that started and ended between two censuses are covered for history, though not for code source or kill switch.
+
+- **The commit gate now requires a round reflection before a review round's fixes.**
+  While a PR's open review round owes a reflection (what
+  `python3 scripts/review_reflection.py status` prints), a content commit is
+  denied, in foreground and dispatched sessions alike. The deny names the owed
+  keys and the round's obligations (a class audit or a premise check, by lane
+  and round). The session writes the reflection, checks it with
+  `review_reflection.py validate`, and commits it alone with
+  `git commit --allow-empty --cleanup=verbatim -F <file>`; then the fix commits.
+  An unreadable review budget keeps the existing path (the round-approval ask,
+  or a deny when dispatched); anything else the gate cannot read (the owed keys,
+  git, or time) allows the commit with an advisory. An install can set
+  `hooks.reflection_gate: advisory` to see the verdicts without enforcing them.
+- **The local review streak's two tiers are retired.** The round-2 mode-switch
+  block and the round-3 hard stop no longer exist, and `# audit-ack` and
+  `# escalation-ack` authorize nothing.
+- **Late review findings are owed from the gate's go-live.** Reviews that arrive
+  after a round's fix (`review_late`) now count toward what a reflection must
+  answer, from the moment the gate started enforcing; PRs that were merge-ready
+  at that moment owe nothing for rounds they had already opened.
+
+- **Development skills gain new rules and correct claims the code does not
+  support.**
+  - New rules:
+    - a fix is measured against the original exploit and its neighbouring
+      spellings, not just asserted;
+    - a setting's effect scope is checked against the scope that actually
+      loads it;
+    - a root cause counts only once it is verified to certainty;
+    - a separate PR never means a separate session;
+    - a mutation harness refuses a non-unique anchor;
+    - `/deep-review` verifies each finding before triage.
+  - New guidance: several sigils go in one comment, because a second `#` ends
+    the run.
+  - Corrections:
+    - a Python `finally:` does not run on SIGTERM or SIGHUP without a handler;
+    - the gate-fix lane's round 1 is dual, the diff shrinks in scope after
+      round 1, and the lane allows two discovery rounds plus one marked
+      confirmation;
+    - the retired `final-round-accept` sigil is named only when a gate is
+      already asking for approval.
+
+- Queued indexing preserves separate Codebase and GitNexus requests, retry debt,
+  and claim/outcome history, including original failure evidence across upgrades.
+  An existing queue is not converted on update: until an explicit cutover,
+  new requests are kept in the format the previous version reads.
+
+- Automatic indexing pauses before queue consumption while the protocol upgrade
+  is incomplete. Requests and explicit queue APIs remain available; readiness
+  observation cannot enable indexing or change queued work. Manual refreshes
+  with `scripts/lib/code_intel_index.sh` keep working, and the paused runner
+  reports a normal tick rather than a failed unit.
+
+- **The card vault no longer has a passphrase.** Its key is a private file that genesis-server loads at start, so there is no `vault unlock` and no relock after 30 minutes or a restart; every card release still needs your Telegram tap. A vault made with a passphrase asks you to run `python -m genesis vault migrate` once (it asks the passphrase one last time and keeps a copy of the vault as it was, which the first backup of the migrated vault deletes). `vault init` and `vault retire` ask nothing, `vault unlock`/`vault lock` are retired, and the vault's backup archive is no longer copied to the host-VM credential mirror: after a host-only restore, add the card again with `vault add`.
+
+- Same-owner peer replies now redact credential-shaped text in place
+  (`[redacted:<pattern>]`) instead of withholding the whole reply, and private
+  addresses, home paths and localhost ports pass through. A reply that is still
+  unsafe after redaction (for example an escaped credential) is withheld as
+  before. The task view lists what was redacted in `replyRedacted`.
+
+- Transcript analytics queries without `live=True` now see the derived views only, whether or not a
+  snapshot is current. When none is, the derived views are computed on a private connection and
+  read in full, so raw views and reconciliation intermediates no longer leak through a cache
+  fallback and the SQL text is no longer inspected. Snapshot reads skip a manifest or table that
+  is not a regular file instead of blocking on it.
+
+- **A graph read timeout now says which leg of the read the deadline caught.** The diagnosis keeps the 16 innermost frames with their lines (four could not tell a reconnect's handshake from a query's reply) and records the connection the client's pool was about to hand out; the cutover report prints the phase (`construct`, `connect` or `reply`) and that connection state.
+
+- **A secrets.env edit no longer leaves every memory server "kill-switch state unknown" in the graph census.** Each census row now records a digest of the six secrets keys it reads (never a value), and the next census carries a server whose file changed only in other keys, so routine secrets edits stop resetting the FalkorDB cutover clock.
+
+- The closing-session, build-session, premise-check and AGENTS.md guidance now says that a PR closes only when the problem it solves is dead (already solved on main or by its successor, or dropped by an owner decision). A PR whose code cannot land but whose problem is still wanted stays open and is sent back by the usual routes (an architecture decision while the design is in question, a rework spec once the owner has decided), and a closing map judges each part by the problem it solved, not by whether its code survived.
+
+- **The Light Reflections topic suppresses repeat summaries while retaining every stored reflection.** A periodic "No material change since …" note keeps the topic live. Only the model's explicit no-change flag suppresses a summary; an absent flag, changed negated text and changed multi-chunk summaries post. A manager-local lock serializes Light delivery, and a new stub supersedes older future-dated history.
+
+- **A post-merge E2E is now explicitly a test, not an operation.** The `validating-merges` skill says an E2E writes no real data (live database rows, real config, sent messages, pushes, deliveries to another install). It uses scratch copies, mock payloads or existing production evidence instead. A write is allowed only when nothing else can establish the claim, and only after it has been named and approved by the user; the validator then cleans it up and records either way in the evidence. The skill also warns that some hooks write the live database as a side effect of matching (the procedure advisor bumps `surfaced_count`), so a probe has to point `GENESIS_DB_PATH` at a scratch copy.
+- **A reachable step a validator skipped no longer closes a row.** The `validating-merges` skill now says a NOT-YET-DONE item (a test file not run, a probe skipped for cost) is never written into `scope_limits` to close a row; it is run, or the row stays open. A gap that waits on a production event gets a local recheck follow-up naming the trigger and the re-measure command, because a closed row is never read again.
+- **A delegated validation gets the validator's own re-check before it closes a row.** When a subagent wrote the evidence, the validator re-derives at least one load-bearing claim itself first; a failed or erroring re-check keeps the row open.
+
+- **Surplus output is no longer posted to the Telegram Surplus topic by default.** Outputs are still stored and promoted exactly as before; set `telegram.post_insights: true` in `config/surplus.local.yaml` (or through the `surplus` settings domain) and restart the server to post them again. Deep reflections now also record which promoted surplus insights they drew on, in the `deep_reflection.completed` event, so the value of surplus ideation can be measured.
+
+- The inbox Dropbox sync now runs from a systemd timer (`genesis-inbox-sync.timer`, every 5 minutes) instead of a crontab line, and Genesis raises an alert when it stops succeeding for 30 minutes or when a vault deletion cannot be applied locally. The vault it syncs is the new `inbox_monitor.sync_remote` setting (empty means off); an install that synced from cron should set it in `~/.genesis/config/inbox_monitor.local.yaml` before updating, then remove the old crontab line.
+- The inbox sync now moves whatever a pull replaces or removes to the Genesis trash, so a wrong `watch_path` or an emptied vault can be undone. It refuses relative and hidden-folder targets, and raises one alert per outage.
+
+- Upgrade the MCP servers to FastMCP 4 and MCP SDK 2 while preserving their stdio tool catalogs, external-client restrictions, and progress reporting. Dependency changes require the full update path.
+
+- **Edits to the files that steer a CI check, an approval gate or an outbound
+  action get the strictest review bar.** A pull request touching one of these
+  now classifies in the `critical` lane, the same as the code that reads it,
+  instead of as ordinary config:
+  - the leak-scan rules and history allowlist, the atomic-write baseline, the
+    shipped-hook version ledger, and the mutation-sweep manifests (not on main
+    yet: the sweep's own pull request adds the first, the second is planned);
+  - the autonomy rules and approval policy, the autonomous-CLI policy and the
+    payments config;
+  - the board, contributor-worklog, marketing and career outreach, desktop
+    takeover, entity adjudication and update configs, each of which can switch
+    an outbound or irreversible action on.
+
+  A test re-derives which files CI checks read, so a check that starts reading a
+  new one, in a recognised spelling, fails until it is listed. `pyproject.toml`
+  and the config files not listed here keep their lane.
+
+- The Guardian's routine snapshot deletions (the previous day's healthy snapshot, retention and age pruning) now wait for a maintenance window, by default 05:00-07:00 in your timezone, because deleting a large btrfs snapshot can stall the filesystem for minutes. Set `snapshots.deletion_window: any` in `guardian.yaml` to delete immediately as before. Reserve relief does not wait for the window; early relief waits only while the measured runway allows it. Each routine deletion checks the current time, failed deletion batches stop, and empty maintenance passes do not delay reserve relief. DST gaps and repeated hours use real opening times.
+
+- **The local review streak is gone.** `scripts/review_state.py` no longer keeps
+  a per-worktree round count, the statusline drops its `streak:` field (it now
+  reads `<branch> · ledger:<n> · PR#<n>:<state>`), and the dormant cap menu on
+  `AskUserQuestion` is unwired. `review_state.py mark --source external
+  --defects|--clean` is still accepted and records the reviewer and its outcome
+  in the review marker for provenance; no gate reads either. Review rounds are
+  counted only from GitHub (`scripts/review_budget.py`). Old
+  `~/.genesis/review_rounds/` files are no longer read and can be deleted.
+
+- **The `genesis-merge-gate` check appears once per PR head.** The merge-gate
+  workflow's job now runs under its own check name, `merge-gate-run`, and always
+  succeeds; every event, including the PR's own push, publishes the verdict as the
+  `genesis-merge-gate` check. Before, the push-triggered job carried that name
+  itself and was usually cancelled by the review events that followed, so most PRs
+  listed a cancelled `genesis-merge-gate` beside the real verdict.
+
+- **Opening a pull request on your public repo now needs an independent review first.** `gh pr create` is refused until a reviewer agent or `/code-review` of the branch has finished in that session, read from Claude Code's own records rather than a file the session writes. `# pr-review-waived` opens one anyway on the owner's yes, and is logged. A clone that declares no public repo is unaffected.
+
+- Added read-only exact task-branch and linked-worktree validation helpers with preservation tests; creation and recovery activation remain separate follow-ups for #3020/#3060.
+
+- The FalkorDB graph engine now installs with Genesis as an ordinary Python dependency: its Redis server and module come in one hash-pinned package, so there is no longer an apt repository to add or a separate engine download. The engine runs from a verified copy under `~/.genesis/deps/falkordb/<version>-<wheel tag>/`, checked file by file against digests committed in the repo, so nothing installed into the venv later can change what it runs, and a version change lands beside a running engine instead of on top of it. Genesis now requires Ubuntu 24.04 or newer (glibc 2.38+) on x86_64 or aarch64; anywhere else `install.sh` and `bootstrap.sh` refuse in one line before installing anything (an existing install below the floor: its first update still merges with the old `update.sh` and then rolls back; later updates refuse before fetching). If that hash-pinned package does not install, `bootstrap.sh` stops before the package install and `install.sh` skips the package install with a warning, so the engine is never fetched without its hashes. An engine that is already running is not switched by an update; run `GENESIS_FALKORDB_SWITCH=1 scripts/update.sh --take-template genesis-falkordb.service` (it stops and restarts genesis-server) and then restart `genesis-falkordb` to move it to the bundled engine.
+
+- A credential reference now keeps its value and its description in a separate `reference_secrets` table; its indexed body carries the identifier, a placeholder for each, and its tags. `reference_lookup` returns the full entry, and the dashboard reveal returns the value and the description. A credential is found by its identifier and tags, and a save whose identifier or source fields contain the value, or any part of a structured value such as a connection URL's password, is refused; a tag that contains it is dropped and the rest are kept. Every other field a save can carry (its memory class, purpose and source details, nested values included) is checked the same way, and a credential's memory class must be a known class. The dashboard shows a credential's description while it is revealed, shows why a reveal failed, and forgets a revealed entry when it is hidden or its detail view is closed. Re-saving with a placeholder keeps the stored value or description. A credential never shares a search vector with another entry, a refused save leaves no vector behind, and two saves of the same credential at once, even from different processes, never pair one save's description with the other's value: the later save re-reads and retries once. Existing references are rewritten by a follow-up change.
+
+- **A new install on a host with a newer Python now uses 3.12.** Ubuntu 26.04 ships only Python 3.14, and 23 tests fail on it. Setup now installs uv's Python 3.12 for the venv, adding no package source, and warns and carries on with the system Python if it cannot get one. An existing venv stays on the Python it has.
+
+- **CI keeps checking Ubuntu 24.04 as `ubuntu-latest` moves to 26.04.** A new `test-ubuntu-2404` job runs the test files that broke in that move, and a subset of them again with pytest's temp on its own filesystem. GitHub does not require it, but a red result blocks the merge gate until overridden.
+
+- **Updates keep uv's Python patched.** A venv on uv's Python 3.12 now moves to the latest patch that uv knows, on each update that applies a change, since no package manager does that for it. uv itself is pinned in `scripts/lib/python312.sh` and brought up to that version, never down. The update's summary says when either moved: a Claude Code session started before then cannot use the payment vault until it restarts. A rollback leaves both where they are.
+
+- A background session that is denied access to `secrets.env` no longer pages you on Telegram. The access is still denied and still recorded at low priority (it is listed on the dashboard, and in the morning report's observation list when it is among the top five); what pages you now is a background session that actually stopped because of it, through the hourly stopped-session page.
+
+- Shared Serena services now support the reviewed 2.1.0 release with MCP 2.2
+  readiness checks and classic tools. Upgrade during a drained sharing window;
+  automatic installation preserves active, newer or unreadable providers.
+
+- **Ubuntu 26.04 is now a tested OS for installing Genesis, alongside 24.04.** The installer no longer warns that runtime behaviour may vary there, and the setup guide says so. The README's recommendation for the host stays 24.04, which is the release its container uses.
+
+- The `[test]` extra now includes pytest-xdist, pinned in CI to 3.8.0. No CI job runs tests in parallel yet; this lets the fixes for parallel runs carry their own `-n` tests. Because the extra changed, an install's next code-only deploy refuses and names `scripts/update.sh`, which reinstalls.
+
+- **Validators now record one evidence claim per declared claim.** The `validating-merges` skill's Evidence section says every claim a merged PR makes (its body, its `E2E:` line, and each behaviour its diff changes) gets its own evidence claim and control. A claim this install cannot reach is `NOT_VERIFIABLE_HERE`; one that could have run but did not is a `not_yet_done` gap, which keeps the row open. The Codex section points at the rule and records the calibration measurement that prompted it. A stale reference to the retired `scope_limits` field is updated to the typed gap kinds.
+
+- Test crash diagnostics work for parallel runs. A test still running at 540 s now dumps every thread's stack to stderr before the 600 s timeout ends it; a parallel worker's terminal output was discarded, so a hang showed only "worker crashed". The CI breadcrumb lists every test in flight rather than whichever started last, and the failure summary says when a worker crashed and that the tests queued behind it may not have run. On CI, a test that writes the runner's real `~/.genesis` is named at the end of the run (advisory).
+
+- CI's `test` job runs the suite on four pytest-xdist workers (`-n 4 --dist=loadfile --max-worker-restart=0`). In 6 measured runs the test step's median was 33 minutes, against 117 serially, with the same tests run. The job keeps its name, its single junit report and the skip ceiling.
+
+- **Validators probe beyond a PR's own tests, and a guard denial no longer stops a Codex run.** The `validating-merges` skill now says the shipped tests are the author's evidence: every claim needs at least one probe or code-path read those tests do not already perform, and the validator searches the issues that cite the PR, open and closed, before deriving a verdict. Under Codex, a guard denial stops that action only: the claim becomes a `not_yet_done` gap (the row stays open), the denial is logged, and the run continues; retrying a denied action another way stays forbidden. The section also says how to write commands that avoid the most common false denials (a `*` in a raw SQL query, prose naming the credentials file) and that the shared pytest lock is a wait, not a reason to stop.
+
+- Secrets-file readers and writers in Python and shell now find the file through one shared resolver with the same rule as before: `SECRETS_PATH` if set, otherwise the checkout's `secrets.env`.
+
+- Every reader of the credentials file (Python, shell, Guardian, the graph census, disk hygiene, the eval loaders) now finds a `~/.config/genesis/secrets.env` when one exists, ahead of the checkout file; with none, the default is unchanged. The secrets guard protects that file and its dedicated folder. Moving installs there is a later migration.
+
+- The session-start context now lists live sessions and the other live sessions' missions, computed when the session starts. Essential Knowledge no longer carries the stale "Active sessions" count or the raw-prompt "Active Work" list.
+
+- Inbox and standalone evaluation prompts request concise evidence records,
+  distinguish explicit facts from inference in evaluator output, and separate reusable
+  integration artifacts from operator-only adoption decisions in BUILD verdicts.
+
+- **Codex now gets the same Genesis tools as Claude Code.** Running Codex in the repo starts all four Genesis MCP servers (health, memory, outreach, recon) with the full tool set instead of a 13-tool read-only subset. Read tools run without a prompt; anything that writes, sends, spends or starts work asks first, as does any tool not yet classified. Codex's calls are recorded as client `codex`, and its credential lookups are stamped with it. Codex runs that Genesis itself starts unattended keep the read-only subset.
+
+- **`--expire-trash` now deletes a worktree archive only when its content is proven to be in `main`.** Before, the manual expiry trusted metadata the reaper recorded at archive time, which could miss ignored files, edits made after the dirty check, and work matched only by patch id. Now an archive expires only when its recorded head is an ancestor of `main` or the exact head of a merged PR, every file in it matches that head byte for byte (execute bit included) or is a regenerable cache or generated file, and its worktree's reflog holds no commit that only that reflog reaches. `--no-network` is honoured, and `GIT_DIR`-style variables in the caller's environment no longer redirect the checks. Anything else, including a corrupt archive or a failed check, keeps the archive and logs why. A dry run reports how many would expire. Nothing schedules expiry yet.
+
+- Evaluator templates request an explicit ADAPT adoption trade-off. The existing
+  Recommendation parser preserves optional `why_not_adopt` text and warns on
+  missing usable ADAPT rationale while retaining historical routing behavior.
+
+- **A standing validator or closing loop now starts only on the owner's explicit instruction.** The validating-merges and closing-session "Standing mode" sections say a session never starts or restarts such a loop on its own: not from an earlier approval, a plan step or a ledger row, and not after the loop stops. Once the owner starts one, it still paces itself until a stop rule ends it. `docs/architecture/CURRENT.md` says the same for the verification-obligation consumer.
+
+- Memory-graph reads now use the FalkorDB graph engine by default wherever it is installed: `config/graphstore.yaml` ships `mode: falkordb`. An install where the engine was never set up, or its `genesis-falkordb` unit is not enabled, keeps reading from the in-process NetworkX projection with no warning and no health alert. `bootstrap.sh` and `install.sh` now enable and start the `genesis-falkordb` unit after setting it up; an engine that is already running is left running, and a start that fails prints one warning without stopping the install. Saving graphstore settings in the dashboard now stores only the settings you changed, so an unrelated save no longer pins `mode`. Once the unit is enabled, or reads are set to the engine, the engine counts toward the critical-failure health signal. A fresh `install.sh` install with the engine running also runs one graph projection once genesis-server has created its database (waiting up to two minutes), so reads use the engine without waiting for the hourly run; if the database is not ready in time, the hourly run projects. Because the settings page shows the stored config, it cannot save `mode: falkordb` explicitly while that is already the shipped value; enable the engine's unit instead. To keep reads off the engine, set `mode: networkx` in `~/.genesis/config/graphstore.local.yaml`; or list `genesis-falkordb.service` in `~/.genesis/config/disabled_timers` and disable the unit, which keeps reads on NetworkX and stops the installers enabling it again.
+
+- **The server and agent-zero units load one secrets file, chosen when they are rendered.** Each unit's `EnvironmentFile=` is now the file the resolver picks when bootstrap or install renders it, so the units and the Python readers name the same file. A missing file no longer stops the server unit, so its startup restore can run; if the file is still missing, unreadable or unloadable after that (empty, NUL bytes, not UTF-8, a byte-order mark, or a line the loader cannot parse), the server exits before serving rather than run the dashboard without its password. agent-zero still refuses to start without the file. The dashboard edits an existing secrets file but no longer creates one: it answers 409 and points to bootstrap, because a writer that cannot see an existing file elsewhere would otherwise create a template-shaped one that every reader then prefers.
+
+- The session observer no longer records tool activity from a `holdout-writer` agent: neither a subagent of that type, nor a main session started with `--agent holdout-writer`, nor the parent's `Agent` call that spawns one. Everything the observer captures becomes memories that proactive recall shows to other sessions, and the scenarios a holdout writer handles must stay hidden from builders.
+
+- A live-move restore whose interrupted run left newer content in an aside now holds back only the parts at that path, below it or above it; every other part of the report is restored. A hold in a run folder named before this release still stops the whole restore until that content is moved out.
+
+- **Light reflections now see what changed since the previous run, and a quiet run stays off the Light topic.** The Light prompt carries a table, computed by code, of each signal's previous and current value, labelled as a counter that moves every run, an alarm that started, cleared or moved up a level, or a band crossing; a cleared alarm, which the zero-filtered signal list hides, now shows there. Light's own job is the part code cannot settle: whether a move that crosses no line deserves attention. A summary the model marks as no change is kept off the topic only while code finds no condition change since the last summary that was actually posted. When it does find one, the summary is posted with those changes listed, whatever the model said. That check replaces the comparison of wording, which rejected about half of honest no-change summaries. A Genesis version change is no longer shown to the Light reflection, so it stops leading Light summaries.
+
+- **Emails to a marketing prospect wait for your approval unless you set the
+  marketing lever to `live`.** The email gate now holds a send to a curated
+  prospect whenever `marketing_outreach` is `off` or `observe`, whatever class
+  the send has. Before, only the first cold email was held; a follow-up on an
+  unanswered thread could go out on its own once cold sends had been granted.
+  Two cases are held in every mode, `live` included: a reply to a prospect who
+  wrote back, and any send to a prospect who opted out (approving that one
+  still does not deliver it). Rejecting one of these held sends no longer
+  costs the grant for other emails. Emails to anyone else are unchanged.
+
+- **Call-site response detail on the health endpoint now needs dashboard
+  sign-in.** In `GET /api/genesis/health`, a call site's `last_response` goes
+  to a signed-in dashboard session or the internal API token. Other callers get
+  the rest of the site (status, provider, run time, token count) with
+  `last_response_hidden: true` where a response exists. The Agent Zero
+  adapter's copy of the route applies the same rule.
+
+  On an install with no dashboard password nothing can sign in, so the neural
+  monitor's **Last Response** box shows a note in place of the text, from
+  localhost too. Set a dashboard password (Configuration, Provider Keys) and
+  sign in to see it again. The health MCP tools read the snapshot in process
+  and are unchanged.
+
+- The `genesis-architect` review agent now names its model (`model: opus`) instead of inheriting
+  the session's model, so a plan review runs on that tier unless the caller passes an explicit
+  model.
+
+- **Deploy health now reports the live-move repair kit's state, and every reader of a repair report uses the installed kit.** A missing, partial, altered, foreign or out-of-date kit under `~/.genesis/lib/live-repair/` is now a deploy-health finding (`live_repair_kit:<state>`) whether or not any repair has run, and its alert names the reinstall: `python3 -I -S <repo>/scripts/lib/live_repair_kit.py install <repo> <home>`. While the kit is current, deploy health reads repair reports with the kit's own code, the code that wrote them. The guardian's view of the newest repair report now runs the repair's own selection from the installed kit (or, for a kit older than this change, from the committed code), instead of a separate copy of its rules; what it shows is unchanged.
+
+- The scheduled backup (`genesis-backup.service`) now runs at the lowest best-effort I/O priority. Whether this eases disk contention depends on the disk's I/O scheduler (only BFQ weighs it) and is not yet verified on device-mapper (LVM) volumes. It takes effect after the next update re-installs the unit.
+
+
+### Removed
+
+- Remove the per-prompt `[Code]` hints from proactive recall: across 15,412 hints sessions received over 30 days, 34 (0.22%) were followed by a touch of the hinted file.
+
+
+### Fixed
+
+- Outreach emails now carry their request topic as the subject, including sends released after owner approval. Subjects receive the existing disclosure checks and text scrubbing; line breaks are unfolded into spaces and an empty topic retains the default subject.
+
+- Checked shell parsing now preserves nested structural uncertainty and refuses possible Git/GitHub operations instead of trusting a partial parse.
+- Preserve main’s heredoc protections and narrow inert-data relief while combining nested diagnostics; complex valid heredoc prefixes can remain explicit structural refusals.
+
+- An update that dies after stopping `genesis-server` (a crash, a kill or a power loss, at any point after the stop) no longer leaves the server down: the next update restarts and health-checks it, even when there is nothing new to merge, when `genesis-bridge` is running in its place, or after the update-failure alert has been raised and archived. The restart counts as done only once the update itself has seen the server pass its health check. An update that cannot record the restart it would owe refuses to stop the server. A server stopped by the operator, and not by an update, still stays stopped. Bootstrap's crash recovery reports such a crash as an update failure on the dashboard.
+
+- **Plan-mode hooks now read the plan you actually approved.** The plan bookmark recorded the first plan file your plan happened to mention (or, failing that, the newest plan from any session) and filed it under whichever session last touched its folder; it now uses the plan path and session id Claude Code sends. The adopt-first plan check also stopped scanning old, superseded sections of a plan when the divider was written with one `#` or extra text, and no longer stops reading at a divider shown inside a code example. Both hooks now share one plan reader, `scripts/hooks/plan_doc.py`.
+
+- **An update killed partway through moving the checkout is no longer recovered over as if nothing had happened.** On the `live` integration branch the rebuild now records how far its checkout move got in the update's own `update_state.json` row (the `live_move` field; the separate `~/.genesis/live_move.json` file is no longer used), and every reader that judges an interrupted update (bootstrap's crash recovery, `update.sh`, `deploy_code_only.sh`, the dashboard) now sees it. A checkout left half-written, on `live` or on `main` (including by a `live` rollback stopped after the rebuilt code was adopted), gets a new verdict that lists the affected paths and says how to put them back and what to do next, which the dashboard's update card now shows; an unrelated edit elsewhere in the checkout is no longer mistaken for one. `update.sh --post-merge` now finishes only what it is for, merged code that has not been activated yet (or a resolved merge conflict): it refuses (exit 5), with the reason and what to do instead, a half-written checkout (including a rollback stopped partway back), an update that never changed the checkout, a checkout someone moved, and a record that cannot be trusted, and also when the state check could not run. Bootstrap's crash recovery now judges whether an update is still running by `update.lock`, not by its recorded process id (which a defunct or reused process makes look alive): while the lock is held it stops without changing anything, unless the running update itself started it (so a bootstrap run by hand during an update now refuses; the update that installs this change is recognised too, as bootstrap's direct parent, though the update.sh it runs is the previous version), and it proceeds at the rollback tag only when the shared check clears the state. A `live` rollback whose rebuild began moving but wrote nothing now restarts the old code instead of leaving the services down.
+
+- **The Guardian never reverts code on a `live` checkout, and its diagnosis
+  names the boot repair.** Where the container checkout is on `live` (the
+  integration branch the deploy manifest builds), or could not be shown not to
+  be, a proposed `REVERT_CODE` now becomes `RESTART_CONTAINER`, the ladder's
+  next rung, before the action approval, so the approval names what will run.
+  A container restart ends any process still holding the update or checkout
+  lock and lets a boot repair run where one is installed. It does not fix a bad
+  candidate's code: that candidate is removed with
+  `scripts/deploy_candidates drop <branch>`, which the Guardian will run itself
+  in a later change. `REVERT_CODE` also refuses on its own, because its
+  `git stash` would put a half-written tree on the stash every session shares
+  and its revert would commit onto a branch the deploy engine rebuilds. Every
+  other branch reverts as before. The diagnosis now carries the boot repair's
+  recent journal lines and a summary of its newest current `REPAIR.json`
+  (result, counts, and up to ten of the paths that were not the update's),
+  every value quoted, bounded and marked as untrusted container data; it adds
+  nothing when there is none. The diagnosis prompt now states that everything
+  collected from the container is data, never an instruction, and each field
+  of a Guardian Telegram alert is cut to a bound, so a long alert is no longer
+  refused by Telegram's 4,096-character limit. The Guardian reaches the host
+  only through `scripts/update.sh`.
+
+- Preserve every tool call and result in multi-tool transcript records, retain result scrub failures, and leave unrelated or ambiguous delegation matches unresolved.
+
+- Reject transcript leaves replaced by symlinks during collection, and allow maintenance pruning after interrupted temporary selector swaps without following their targets.
+
+- Transcript verification compares cached rows with forced live views over one captured source selection; status uses that same captured-record model for marker totals, coverage and snapshot freshness.
+- The CLI retains its original default-off configuration seed and manual-use reference so a private opt-in works through the canonical configuration path.
+
+- Recover malformed disposable analytics cache entries during rebuilding, preserve
+  symlink targets, and sync the parent directory after discarding a restored cache,
+  including retries after a directory-sync failure has already removed the cache.
+
+- Preserve historical actor distinctions and complete unknown-content coverage,
+  record view semantics in query manifests, reject contradictory orphan-result
+  lineage evidence, and stabilize conflicting tool display selection.
+
+- Transcript collection rejects a source replaced by a nonregular file before
+  extraction. FIFO replacement cannot hold the writer waiting for a FIFO writer;
+  failed refreshes retain the previously accepted source revision.
+- Sidecar fingerprinting rejects nonregular or oversized metadata. Collection
+  preserves its captured root, refuses corrupt bindings, and continues past
+  individual source stat failures while recording incomplete coverage.
+
+- Report saved schedule intent separately from live registration in MCP and the dashboard, retain job IDs on registration failure, and offer same-ID retry without creating duplicate schedules.
+
+- Confine analytics status to valid snapshot selectors, honor canonical runtime homes for default paths, and batch SQL previews and CSV exports while preserving complete query counts and explicit path overrides.
+- Report individual source stat failures without aborting the remaining status checks.
+
+- Keep missing call/result hashes unknown, align supported attribution with the
+  complete evidence admitted by reconciliation, and retain scrub-failure flags
+  across duplicate orphan results. Invalidate older derived caches with views
+  version 24 while preserving source records and independent companion evidence.
+  Bound evidence source records and retained context, refuse nonregular originals
+  without blocking, withhold recursive JSON and retain scrubbed result envelopes.
+  Retain existing changed-source archive fallback diagnostics.
+
+- Preserve malformed legacy index requests as durable import evidence while allowing valid sibling requests to proceed. Queue filesystem and database failures now remain visible and recoverable; `index_marker.py import-status` inspects retained receipts without running migration.
+
+- Live-agent sessions report their initialized model and checkpoint their existing session row after shutdown when the child is confirmed dead, preserving recorded usage.
+
+- Checked queued indexing validates complete NUL records and actual queue-command
+status before one-provider dispatch, preserves claimed identity and mode, and
+replays retained completion without resending. Entrypoint and freeze repository
+paths retain trailing newlines and agree on Linux root aliases before lock hashing.
+A busy queue now defers the tick (logged, exit 0) instead of failing the unit, and
+a queued repository that later moves no longer stops the whole list.
+Automatic readiness remains disabled
+until native evidence and persistent resource-failure quarantine are complete.
+
+- Keep commands after ordinary backslash-escaped quotes visible to shell guards for hash-free scanner inputs, including nested shell scripts. Hash-containing calls retain their earlier behavior; broader hash/escape gaps remain open. Existing continuation and incomplete-syntax limits remain in force.
+
+- Require fresh original-scope proof before releasing disputed index ownership, retaining new owned OOM evidence without repeating completed work or clearing provider safety holds. Reject ambiguous manager or ancestor identities, isolate unavailable cleanup proof from unrelated recovery, and retain pre-launch refusal diagnostics. Automatic indexing remains fenced.
+
+- Daily maintenance now runs independently of worktree archiving, so a long archive pass cannot prevent cache and retention cleanup. Both daily jobs allow up to two hours to finish.
+
+- Interrupted worktree archives are retried automatically, with their original directories and Git history preserved until verification succeeds. Completed archive records and the worktree dashboard recover after interrupted runs.
+
+- Transcript analytics keeps paired-result-only agent lineage unknown while
+  retaining raw result IDs for search. Independent companion and scoped unpaired
+  result evidence still support lineage.
+
+- Route queued indexing through the original supervised owner and durable native outcomes. Pinned GitNexus preparation starts after scope registration; unsupported or ambiguous installations defer without guessing. Automatic indexing remains disabled pending recovery and production qualification.
+
+- **Card fill says which step, consent or extra field it could not find.** A refusal now names the item and why (`step_not_found:2:none`, `:several`, `:frame` or `:owner`), and a checkout step counts only shown elements, so a hidden copy of a button no longer makes the step ambiguous.
+
+- The update-state guard reads residue paths as raw bytes, so a file name
+  holding a carriage return is shown and quoted as itself instead of as a
+  different name with a newline in it.
+
+- **The first graph read after each hourly projection no longer pays the engine's warm-up.** The projector now runs the callers' own traversal and marker queries on the new graph before swapping it in, and prints the outcome in its journal (`warm-up: ...`). In engine time, that first read had taken 52-358 ms where later reads took 1-3.5 ms; it was the read behind each graph read timeout recorded from 2026-10-21 to 2026-10-26, each during a container I/O stall. With the warm-up it took 1.2-2.9 ms in 15 of 15 test runs.
+
+- **Card fill no longer misses a checkout step that re-renders.** A step looks for its one shown element again until its wait is up, so a page that replaces the button between two looks still has it clicked. When a step finds nothing, the server log also records the payment window's request counts and the hosts of failed and still-pending requests (host names only).
+
+- Transcript analytics `status` takes the snapshot's manifest and freshness from the reader itself, so it no longer blocks on a manifest that is not a regular file and never reports a cache as current that queries would reject. `verify` reports a missing cache as unavailable without first computing every derived view live. The CLI and reference text now say that plain `sql` sees derived views only and `--live` adds the raw tables.
+
+- **The live-move repair no longer loses a staged entry that sits above a restored path, and its re-apply steps never act through a symlink.** When git's index held a file where the checkout has a directory (a staged `sub` over `sub/`), restoring a path inside that directory dropped the staged entry with no backup and no re-apply step. That entry is now saved and reported like any other. A path the repair saw behind a symlinked or non-directory parent now gets only its index state back, and its report says it was not reachable. Before this, the printed steps could delete a file outside the checkout once they had put the symlink back. Steps now run parents first. `repair-move --explain` without the installed kit now reads the module as committed, not the checkout's copy, which may itself be half-written.
+
+- **Card fill ticks a styled consent checkbox.** When the checkbox input sits under a drawn box and cannot take a click, the tool ticks it through the input's own label (the one label whose control is that input, in the same frame), after a trial tick there passes. Every consent refusal now names the item and the reason (`consent_not_found:<n>:trial`, `owner`, `box`, `duplicate`, `frame`, `none` or `several`).
+
+- **Card fill names what stopped it after the tap.** `page_changed`, `claimed_not_filled`, `failed_before_pay` and `saved_page_changed` now carry the check that refused (for example `page_changed:granted:title`, `saved_page_changed:pay_price`, or `page_changed:late:extra_field_failed:city:held`). An extra field that fails says whether it could not be filled, did not hold its value, is no longer on the page, or could not be read (a field a re-render replaced is found again by its selector), and the log lists which other fields still held (lengths and booleans only). Each result's code is logged once, the save stage logs the kinds of frames it added (never a page-chosen name), a spelled-out `three-d-secure` URL counts as a bank challenge, and a consent box that cannot be read at the tick is `consent_failed`. A `page_changed` stop after the approval no longer says "Nothing was filled" when billing fields may have been typed, and `claimed_not_filled` says the card was not typed rather than that nothing was.
+
+- When Claude Code is capped and a Telegram reply falls back to the tool-less backup model, that model now sees the chat's recent messages on resumed turns too, opens with a single `[Contingency mode via <provider>]` label instead of a wrong `[Sonnet / ...]` header, and says plainly when it lacks earlier context instead of promising to look it up later.
+
+- A failed career-outreach bridge probe or auto-run dispatch now records the remote's exit code and the end of its error output (credentials scrubbed) in job health, instead of only "Remote claude exited 1".
+
+- Messages Genesis starts to an enrolled peer agent are no longer held by your quiet hours, the salience threshold or your daily outreach budget, and no longer use that budget up: a note to a peer was refused once the day's Telegram notifications had spent it. Duplicate suppression still applies, and a new per-peer cap (`rate_limits.agent_daily_per_peer`, default 50 a day) keeps a loop from flooding one peer.
+
+- **Card fill tells a result shown in place from a bank check, and clicks the Pay a save rebuilt.** A new optional `success` argument names a top-document marker for a checkout that shows its result without changing page; shown and steady with Pay gone, the result is `submitted_in_place` (most likely paid; do not retry). Without it, such a checkout still ends as `challenge`, whose text now says the charge may have happened. After a save, Pay is found again by its selector, must pass every check it passed at the tap (same origin, not the save control or a card field, a live button with no GET submit, the tap's label shape, the accepted price), and that element is the one clicked; a missing or substituted Pay stops before the click and says so (`saved_page_changed:pay_gone`, `:pay_is_other`, ...).
+
+- **Card fill chooses a billing option the way a person does when a checkout reverts scripted choices.** If a select in the extra (billing) fields does not keep the option a script set, the tool focuses it, checks it is the focused element, types the option's text and tabs away, then requires it to show exactly that option; otherwise it stops with `extra_field_failed:<name>:select`, before the card is claimed. Card fields never take this path.
+
+- **The container memory alarm names who holds the memory, and the Sentinel stops re-asking for approval while memory hovers at the line.** `infra:container_memory_high` now carries the top three process trees by summed RSS (name, pid, size, child count), taken once when the alarm starts, or says why the breakdown was unavailable. A Sentinel approval parked for an alarm is cancelled only after the alarm has been gone for two ticks in a row, and that cancel starts the same 15-minute re-dispatch cooldown as a resolved incident.
+
+- **Essential knowledge's "Key Insights" no longer fills with job logs.** The process reaper's, entity adjudication's and the dream cycle's per-run status reports are no longer shown as insights (they are still recorded), and an insight repeated with only whitespace or case differences appears once, so repeats no longer push distinct insights out of the section.
+
+- **The test suite passes again under pytest 9.2.** Two tests failed once pytest 9.2.0 was released. The collected-floor move test renamed a test ID by writing a private pytest field that 9.2 no longer reads; it now uses pytest's public `pytest_make_parametrize_id` hook. Its parameter-cache test, which still passed but had stopped exercising parametrized IDs under 9.2, now collects real parametrized items. The test-lock check that "pytest-timeout is not active" is the first line of a run failed because pytest 9.2 prints pytest-asyncio's unset-option warning ahead of it; `pyproject.toml` now sets `asyncio_default_fixture_loop_scope = "function"`. Every async fixture in the suite was already function-scoped, so no fixture changes the event loop it runs on.
+
+- The morning report no longer repeats yesterday's alarm. It now sees what the previous report flagged as Urgent or BLOCKER and demotes an item that has not changed, saying what changed when it does re-raise one. Deploy lag ("N commits behind upstream") is no longer reported as urgent or as a blocker.
+
+- A zero-drop detector alert that stays open across three morning reports now moves to the report's Standing Items instead of reappearing as new each day, and a deploy that is only behind upstream is reported at medium rather than high priority.
+
+- **Inbox eval-memory extraction now reports what actually happened.** Each run emits exactly one event — `memory.persisted` when memories were stored, `memory.extraction_outcome` (with `status`/`reason`/`extracted`/`stored`, WARNING on failure) otherwise — so a broken extraction is no longer indistinguishable from an evaluation with nothing worth keeping, and a parse failure leaves a trace.
+
+- Task completion retains worktrees, Git refs and saved paths; notepad seeding preserves existing entries. Creation and recovery safety remain follow-up work (#3020/#3060).
+
+- SQL memory-graph traversal now preserves distinct node IDs that contain shared prefixes, wildcard characters, empty strings, or embedded NULs, instead of incorrectly treating them as cycles.
+
+- The inbox Dropbox sync now removes a local response only when the vault was seen to hold it and no longer does, so a response whose upload failed, or that was written while the sync was not running, is kept and uploaded instead of being deleted. Deleting a response in a subfolder now reaches the local copy too, a removed response goes to the Genesis trash so it can be restored, and the upload never overwrites a file already in the vault.
+
+- Email subjects are scanned in full before truncation, invisible-only subjects are refused, and replies preserve the full original thread title.
+
+- **Slow status-file writes no longer block the event loop.** Genesis collects status on its runtime loop and publishes it atomically in an ordered file worker. Canceling a caller leaves publication owned until that worker finishes; graceful shutdown drains it before closing dependencies, including after partial bootstrap. The status format, snapshot timestamp, startup write and minute refresh remain unchanged. This addresses status-writer responsiveness, not the unresolved cause of shared-storage stalls or SSH disconnections. Refs #1870.
+
+- The hook secret scrubber now redacts credentials stored under quoted keys, such as a JSON `{"api_key": "..."}` member, a Python dict `{'password': ...}`, or an escaped key inside a serialized string. Before, those values reached session observations and captured terminal output unredacted.
+
+- **The merge gate reads CodeRabbit's current inline finding header again.** Since
+  2026-10-17 CodeRabbit opens each inline finding with a marker comment, and since
+  2026-10-25 its header draws the level's icon as HTML and separates fields with a
+  middle dot (`**<icon> Major** · **Category** · **Effort**`). The gate read neither
+  layout, so those findings fell to the "unknown severity" note and a Major or
+  Critical never blocked a merge. Both layouts now read their level on inline
+  findings, and the finding's title is reported instead of the raw header.
+  Findings CodeRabbit places in its review body (outside the diff) are a
+  separate reader and are not covered here.
+
+- Updating an existing install past the FastMCP 4 upgrade no longer leaves a server that cannot start. FastMCP 4 moved its code into a separate `fastmcp-slim` package, and pip's in-place upgrade deleted those files while removing FastMCP 2; the install now finds any package whose files an upgrade deleted and reinstalls it at the same version. The post-install check now also imports the server's MCP stack, so a broken one fails the install instead of the health check.
+
+- **The privacy scan no longer passes when the fingerprint file cannot be read.**
+  When `~/.genesis/release-fingerprints.txt` (or `GENESIS_RELEASE_FINGERPRINTS`)
+  existed but could not be read, the exact-value scan returned no findings and was
+  recorded as having run, so text bound for a public issue or PR passed a check
+  that never looked at it. It now blocks with a message naming the fix (repair the
+  file's permissions or regenerate it). A missing file is unchanged: a warning for
+  a PR diff, a block for an issue.
+
+- **The merge gate shows CodeRabbit's outside-diff findings again.** Since
+  2026-09-14 CodeRabbit writes findings that fall outside a PR's diff as a bold
+  `Outside diff range comments (N)` section with one collapsible entry per
+  finding, and the gate's reader only knew the earlier layout: it read zero
+  declared and zero found, so these advisory findings were never shown (32 across
+  30 reviews in October, 18 of them Major). The gate now reads both layouts; a
+  section that states its count and has entries the gate cannot read still
+  reports the shortfall, and a section line without a count is still read.
+
+- A failed update's rollback no longer discards database writes when the update did not change the database. The rollback compares the pre-update snapshot with the live database (schema, `user_version` and applied migrations) and restores the snapshot only when they differ or cannot be compared. Before, any update that reached the migration step restored the snapshot, even when no migration was pending.
+
+- A failed update's database restore no longer leaves Genesis unable to start while Claude Code sessions are open. The rollback now writes the pre-update snapshot into the live database through SQLite instead of copying the file over it, so sessions keep working and see the restored data, and the server can write as soon as it restarts. Nothing is terminated. If the restore cannot complete within its bound, the database is left as it was and the rollback says so.
+
+- A failed update's rollback now restores exactly the packages that were installed before the update, instead of reinstalling whatever the old version ranges resolve to today. Before, a rollback could leave an incompatible set (and files left behind by a package split) and still report success; now it reports a rollback whose packages do not match or do not import as incomplete. When the exact set cannot be restored, the rollback still falls back to reinstalling the old version ranges, and now also checks that Genesis imports before calling that step done.
+
+- A fresh install, and the browser step of an update, no longer pull camoufox 0.5.9: that release removed an API the browser provisioning calls and moves the engine to Firefox 158. The browser extra now takes camoufox 0.5.7-0.5.8 until 0.5.9 is adopted deliberately.
+
+- A background session running a read-only `python -m genesis db query "…"` whose SQL contains `*` (for example `select count(*) …`) from the checkout root is no longer refused as a `secrets.env` access, and no longer raises a false critical alert. Only the quoted arguments of that one read-only command are exempt, and only when every other command on the line is a non-executing reader such as `head`, `tail` or `cut`; everything else keeps the existing check.
+
+- The Guardian's deletion window now spaces its routine snapshot deletions at least five minutes apart instead of running them back to back, and a snapshot that keeps refusing to delete no longer blocks every other routine deletion: it is skipped, and a warning names it when the window ends. The Guardian heartbeat is written before snapshot maintenance, so a slow window pass cannot make the Guardian look down, and an invalid `snapshots.deletion_window_timezone` now raises a warning instead of silently falling back.
+
+- **A failed update now runs the rollback from the code it was updating to.** Before, an update always rolled back with the version it started from, so a fix to the rollback could not protect the update that delivered it. The new rollback is checked before the server stops and again when it starts; if anything about it is wrong, the update says so and keeps the rollback it started with. `~/.genesis/last_rollback_source.json` records which one ran and why.
+
+- A memory-pressure kill can no longer end every interactive Claude Code session at once. Each slot, and each interactive `gmodel` or bashrc `claude` launch, now starts in its own systemd scope with a memory cap (55% of the machine's memory, plus 5% of it in swap): a session that outgrows it loses its largest process, inside that session only. A systemd-oomd kill no longer takes every slot, though on systemd 255 one oomd action can still take more than one; before, every slot shared the tmux server's cgroup and was killed with it. A tmux server started by the slot door also gets a scope of its own, so restarting the Genesis server after opening the dashboard terminal no longer ends every slot. Slots started before the update move when they are relaunched; without a systemd user manager, launches work as before.
+
+- systemd-oomd now monitors the per-user manager, where the Genesis server's "kill me last" preference is honoured: a memory-pressure kill takes sessions and background runs first and reaches the server last (on systemd 255 one oomd action can still kill several cgroups, #3874). Before, a `systemctl --user daemon-reload` (run on every bootstrap and deploy) silently dropped that monitor (systemd issue #43174), leaving only the root-owned `user.slice` monitor, which ignores the preference, so the server was killed like any other process. The per-user limit is 60% of PSI `full` time (overriding the distro's 50%), and `user.slice` stays monitored as a backstop at 80% for pressure the first monitor cannot relieve; both are upstream-aligned starting values, not yet tuned to measured pressure. The user manager itself, its D-Bus, the shared Serena units and the disk guardian are protected too, `bootstrap.sh` reports only the monitors it confirmed by reading them back, uninstall removes the user drop-ins, and the awareness loop alerts when oomd is not running or the per-user monitor is not live.
+
+- After the graph engine restarts, memory-graph reads recover at once: the engine's unit rebuilds the projection as soon as the engine is up, and each process's first read retries the connection the restart closed instead of falling back to a multi-second in-process rebuild. A retried read still counts against the FalkorDB cutover clock.
+
+- **Corrected the Kimi labels in the model docs.** The routing registry now says it is a design record and points at `config/model_routing.yaml`, the model columns and purpose of its rows 17 and 20 match that config, and `docs/reference/models.md` gains a Kimi K3 entry and the right Kimi K2.6 API id.
+
+- **A live-move repair no longer prints shell steps to put saved paths back, and a boot repair with many saved paths no longer fails the start.** The repair's report and alert now name one command, `scripts/deploy_candidates repair-move --restore <time>` (with `--check` to see first what it would write), instead of `rm -rf`/`cp -a` steps that destroyed newer work if run after the path changed. A repair at server start that saved hundreds of paths exited 1 ("the update state is kept") after healing the checkout, because its alert outgrew the system's argument limit; the alert text is now capped (the full result stays in the report) and a failed alert never changes the exit code. Each report folder now also holds `SAVED.json`, a SHA-256 and the original mode of every saved file (a link's target, a FIFO's mode), and the folders are private to the install's user: `deploy-backups` and each report 0700, the report files 0600, saved copies without group or world write. `repair-move --restore <time> --check` now passes through `scripts/deploy_candidates`, and `--dismiss` waits for an update in progress instead of racing it.
+
+- **On Ubuntu 26.04, deploys, updates, backups, the disk watchdog and the session launcher stop a stuck command as reliably as on 24.04.** 26.04's default `timeout` kills less than they relied on, so they now use the GNU one it ships beside it. An auto-updater suppression carrying a deeply nested default also no longer fails outright under Python 3.14, which is what a fresh 26.04 install runs: the bad default is refused by name and the suppression still lands, as it always did on 3.12.
+
+- **Commands started in a systemd scope now receive their arguments exactly as written, on every systemd version.** Background Claude sessions, `genesis.hostmetrics run`, dashboard updates and the code-intelligence indexer all start commands this way, and Genesis now asks for literal arguments wherever systemd supports the option.
+
+- CC session scopes use the fixed description "Genesis CC session" instead of the Claude command line, keeping prompts out of systemd scope descriptions and their journal entries.
+
+- **The backup's restore check no longer writes a plaintext dump or stalls the disk.** Every backup proves its SQLite copy restores by decrypting it and rebuilding the whole database. The decrypted dump now streams straight into sqlite3 instead of being written to a file, and the rebuilt database lives in memory when there is room for it plus a fifth of memory spare (on disk as before otherwise; the log says which and why). On a btrfs root the old write-and-delete held up filesystem writes for up to a minute every six hours. Because the SQL now runs while the dump is still being authenticated, it runs in sqlite3's safe mode and counts only once GPG has authenticated the whole file. `GENESIS_BACKUP_VERIFY_MEMORY=off`, `GENESIS_BACKUP_VERIFY_RAM_FACTOR` and `GENESIS_BACKUP_VERIFY_RAM_FLOOR_PCT` tune it.
+
+- **The backup no longer writes the database dump to a plaintext file before encrypting it.** The SQLite dump used to sit in the big-temp dir as a readable file for a few minutes every run. It now streams straight into encryption. The restore check that runs afterwards still decrypts one temporary copy to prove the backup restores. A dump that fails part-way, including one sqlite3 reports as a success but ends in `ROLLBACK`, is discarded and reported as a dump failure instead of being encrypted and kept.
+
+- **Safety checks that relied on older Python behaviour now hold on 3.13 and 3.14.** A symlink loop no longer slips past the dashboard's file checks, the trash's refusal to guess where the database is, or the quarantine and prune checks. An unreadable quarantine marker now keeps the database fenced, and prune keeps a transcript it cannot reach instead of treating it as gone.
+
+- **The guards now see through Ubuntu 26.04's renamed tools.** GNU coreutils and classic sudo sit beside their replacements under other names there, and uutils adds a multicall binary, so a rule keyed on a tool's name could miss the same program. The parser now resolves `gnu<tool>`, `sudo.ws`, `sudo-rs`, `su-rs` and `coreutils <tool>` to the usual name. `sudo`'s table also lists the value options it was missing, whose values read as the command.
+
+- **The guards now refuse commands holding bash 5.3's new substitution forms.** Ubuntu 26.04 ships bash 5.3, which runs them where an older bash refuses them, and the parser read them as ordinary parameter text. It now reports them as text it cannot read, so a guard that fails closed refuses, and a mention of that text in a message goes through a file instead.
+
+- **The credential check no longer reads a denied directory as a missing file.** On Python 3.14, which is the system `python3` on Ubuntu 26.04, that allowed a restore that moved a live key aside for an older backup. On older Pythons it crashed the check, and that tick's other files went unchecked. A path it cannot check is now reported as unreadable, which alerts and never restores, on every Python version. Such an alert no longer uses up the guardian's restore if the file later proves corrupt.
+
+- A task step that could not finish (for example, denied a tool it needed) and said so no longer counts as completed: it stops the task as blocked and you are notified, as for any blocked step. A step that reports it failed is treated the same way, as blocked, so nothing re-runs it automatically on its own say-so.
+
+- A stale `.git/index.lock` left by a git process that died no longer freezes updates and code deploys until someone removes it by hand. When no running process holds the lock and it is more than ten minutes old, the update or deploy saves a copy under `~/.genesis/deploy-backups/`, removes it, carries on, and alerts you that it did.
+
+- **The guards no longer lose the commands after a top-level comment that holds a quote.** The shell parser did not model `#` comments, so an apostrophe or quote inside one (`# it's`) opened a quote that ran on to the next one, and the command lines in between went unseen by the guards. A `#` that starts a word at bash's top level now opens a comment that runs to the end of the line, as in bash, and text inside a comment is no longer reported as a command. A `#` inside a word (`a#b`, `$#`, `${#v}`), inside `${...}` or a backtick, and every `#` in a command that contains a here-doc, keep the old scan.
+
+- **The secrets guard checks more of how a command names a file, and can no longer time out into an allow.** A word joined with `=`, `@` or `:` is checked part by part, partly quoted words are read the way bash reads them, and a file pattern a program expands itself is matched against the file's name. The check now runs with a hard five-second limit and gates if it does not finish, because a hook that times out lets the command run.
+
+- Shared MCP deploy checks retain a complete standalone configuration CLI through checkout updates, including future imports and source removal. Invalid server configuration reports a clear error; JSON reads use UTF-8. Shared routing stays off.
+
+- Opt-in request-owned database jobs use explicitly bounded background admission, preserving foreground capacity. Recall retries inline on queue pressure; best-effort observations tolerate refusal and pending bookmarks remain available for retry. No shared service is enabled by this change.
+
+- Running the test suite locally no longer overwrites the install's `~/.genesis/bootstrap_manifest.json` and `capabilities.json`: the runtime bootstrap tests now write under a temporary home. Two other test-state leaks that only showed in parallel runs are also closed: the deploy-candidates fixture now restores `sys.path` and `sys.meta_path`, and the health-alert tests no longer read a persisted manifest.
+
+- The dashboard's MCP tool list and the status snapshot no longer list or count the four `user_job_*` tools under health (the count drops from 96 to 92). No MCP server serves them, so no session could call them. They now register on an object of their own, so health lists only the tools it serves.
+
+- Two test environment assumptions that broke under parallel runs are fixed. The vault tests that bind a Unix socket root it in a short `/tmp` directory, because the per-test temp path plus a parallel worker segment exceeded the 107-byte socket path limit. The tailscale watchdog tests now need about 330 s of uptime instead of 900 s, the real minimum given the helper's rate-limit floor; when they still skip, the message states the measured uptime.
+
+- The test suite's live fence works under parallel runs (`pytest -n`). Workers used to take the controller's already-fenced environment for the original, so `real_tool` tests still got stubs and `user_manager` tests lost the session bus. A refusal outside its test in a worker also left the run green. Workers now adopt the originals their controller recorded, and the controller collects each worker's late refusals and fails the run, as a serial run does.
+
+- **A FIFO, symlink or oversized file at `~/.genesis/update_state.json` no longer hangs or misleads a deploy.** The restart guard, the live-move repair, the deploy-in-progress check (which the dashboard's Dismiss asks while holding the update lock) and the update progress route read the update state through one bounded rule that never follows a final link, never blocks on a FIFO and reads at most 1 MiB; anything else is reported as a state that cannot be read, which every caller already refuses on. The guard's own git calls also stop running a repository-configured fsmonitor program or hooks.
+
+- Verification closes now require explicit claim or gap coverage for declared E2E plans, including previews, so omitted checks cannot silently produce a clean pass.
+
+- Three tests that raced other processes in parallel CI runs are fixed. The stale index-lock tests list only their own processes in `/proc`, so another worker's `git` can no longer count as the lock's holder. The validator serving tests give subprocess startup room before their collection timeout. The vault overlay test keeps the original file's inode allocated, so a same-text replacement cannot land on it.
+
+- Memory thread work retains request-owned resources through physical completion.
+Tag maintenance uses independent background admission and task-owned single flight.
+
+- Record delivered Guardian alerts as displayed text, fail incomplete history reads, and preserve cursor ordering through bounded clock changes.
+
+- **The FalkorDB default-on clock ignores unrelated source edits and qualifying
+  recent generic processes.** Generic-process relief requires clean history and
+  a reported start at least 2s inside the 2h30m lookback. Graph-read producers
+  retain their existing proof requirements; dirty-code checks cover the bounded
+  graph-read dependency list. Stored census rows are re-judged.
+
+- **A git that is merely exiting no longer keeps a stale `index.lock` in place.** The live-move repair and the stale index-lock cleanup counted a git of this user whose `/proc` entry could not be read as the lock's holder, from a single scan. A git exiting, on a box running many git sessions, looks like that for milliseconds, so the stale lock was left and the update's next index write failed. A process in the kernel's exit path (the `PF_EXITING` flag, which is set before an exiting process's files become unreadable) is now dropped at once, since it runs no user code again. Any other unreadable process counts only if it is still the same process, and still unreadable, across three re-checks about 0.15 s apart (about 0.45 s, spent only when one is seen); if its file descriptors become readable it is judged on them. The host-metrics disk test now checks the total exactly and free space within 1 MiB, since another writer can change free space between two reads.
+
+- The stranded-work detector no longer loses whole finding classes to "database is locked" while the server is busy: each class now takes the database's write slot before it reads, a class or blindness alert that still loses the lock is retried, and a final loss records which process held the lock.
+
+- The session-start in-flight block now prints active autonomy task ids in full, so they can be passed straight to `task_detail` and `task_control`, and its live-worktree list and "(+N more)" count leave out registrations whose directory is gone and the worktree reaper's archive anchors.
+
+- Ignore the database's safety snapshots and side files in git status, clear the empty side files a database-conversion backup could leave, and have the daily disk groom reset failed transient systemd units (one-off jobs and unnamed session scopes) more than a day after they failed, logging why each failed. A unit killed by its memory limit is never reset, and neither are persistent or `genesis-*` units.
+
+- Shorten the ego focus summary and the session-start Essential Knowledge lines at word boundaries with a visible "…", instead of cutting words in half.
+
+- **Skill nudges no longer fire on everyday words.** A single frontmatter `keywords:` hit is enough to nudge a skill, so generic words in six skills' keyword lists could surface content-publish, deliverable-builder, subsystem-map, cc-update, browser-automation and stealth-browser on unrelated prompts; `content` alone matched the `<pasted_content>` tag, and `snapshot`, `proposal`, `write`, `post`, `report` and `pin` were seen misfiring. Those words and other common-English ones (`page`, `site`, `tab`, `audit`, `map` and similar) are removed, each skill keeps its distinctive keywords, and a test now fails when any repo skill's `keywords:` lists a word from a short generic-word stoplist. The scoring rule is unchanged.
+
+- In shared mode, the explicit caller environment accessor now returns the
+  untrusted lost-scope caller even after environment drift. Validated request
+  identity and ordinary legacy environment behavior retain their existing paths.
+
+- Inbox evaluations preserve literal delimiter punctuation and use source-proven wrappers consistently across prompts, coverage enforcement and the coverage report.
+- Support same-line prose wrappers, quoted Markdown links and matching backtick runs, retaining raw tokens whenever early or ambiguous closure prevents a wrapper proof.
+
+- Session revision notices and dashboard badges now compare the recorded launch revision with the current checkout even when no full deploy was recorded. They distinguish matching, different, and unknown revisions without claiming which source bytes a running process has loaded.
+
+- Claude Code failures with external SIGKILL and comparable cgroup OOM-kill counters now report possible memory pressure and stop automatic retry, provider failover and contingency. Shared counters are explicitly correlation, not victim proof. Inbox batches retain their manual-release replay hold; owned timeout, cancellation and result cleanup keep their existing outcomes.
+
+- Claude Code user settings now receive the shared transcript-retention policy during container install, bootstrap/update and daily settings alignment, and during host setup. The default minimum is 180 days; higher values survive, and a valid positive `GENESIS_CC_RETENTION_DAYS` selects an exact value. Host version alignment does not enforce retention. The project retention cap is removed, and a contended settings timer verifies the complete effective policy without writing settings.
+
+- Safety guards now recognize commands carried by GNU `env -S` and `--split-string`, including quoted arguments, suffix operands and nested carriers. Unknown expansions or unsupported option boundaries report an unreadable command instead of silently hiding it. Directory and environment context stay attached to the original command.
+
+- External health and memory MCP clients preserve inherited targets and values during startup and router retries, import only their declared dependency keys, and keep Genesis session markers cleared.
+
+- Freeze gateway, selected-backend and receipt model identities separately during qualification, retaining strict legacy matching and raw evidence.
+
+- Keep corrupt approval-resumed inbox batches retryable when the retry cap was lowered while approval was pending, so safe item re-derivation can request fresh approval.
+- Retain approval-parked rows and defer new inbox work when approval retirement fails, preventing a later drop from reusing the old site grant.
+
+- Repeated memories now resolve aliases before checking for duplicates, keep user and subsystem memories separate, and ignore retired or pending-deletion copies when deciding whether to save new content.
+
+- Deduplicated memory corrections now apply supersession through the existing validated, locked path. Invalid correction handles and successor pairs reject without creating a new memory; duplicate results retain their existing ownership flag.
+
+- **The weekly skill-evolution job no longer crashes when the skill refiner gets no answer or a malformed one.** When every provider for the refiner call site failed, the refiner handed an empty result to its parser, the job raised a `TypeError`, and it was reported as failed with that error instead of the real cause. It now logs the routing error, skips that skill and carries on. A reply that is not a JSON object, or whose `proposed_content` is not text, is skipped the same way, and a missing or non-numeric `confidence` falls back to the default instead of failing the run. The second refiner call, which validates larger proposals, now logs the routing error too rather than a `TypeError`.
+
+- **Health status no longer reports the main service's process as dead while it is running.** The `services.bridge.pid_alive` field in `health_status` and the health snapshot read only the legacy bridge's lock file, so on any install running `genesis-server` it always showed `pid: null, pid_alive: false`. It now reads the lock of whichever unit is running. When systemd can be queried, the lock's pid must also match the unit's `MainPID`, so a lock left behind by a killed server does not read as alive; `pid` is shown only when that process is alive.
+
+- **The `health_status` MCP tool can now confirm that surplus is alive.** It runs outside the server, with no runtime of its own, so it always reported surplus as `liveness_error: true` with no last success, even on a healthy install. The server now writes its in-memory surplus success time into `~/.genesis/status.json`, and the tool reads it from there, trusting it only while the file is at most five minutes old. A stale or future-dated file, a missing pause flag, or an older server that does not write the value still reads as unavailable, never as healthy. The surplus block now also says where its verdict came from (`liveness_source`: `runtime` or `status_file`).
+
+- **`locate` content search now skips files that hold credentials.** A content search (`contains`) skips: any file the dashboard's file routes treat as a credential (that predicate moved to `genesis.security.credential_names` and is shared); further credential names (`secrets.yaml`, `api_key.txt`, `*.tfvars`, editor backups of credential files, and similar) unless git tracks the file unchanged since the last commit; anything under `.config`, `.ssh`, `.aws`, `.docker`, `.gnupg` or `.kube`; the configured secrets file under any name (by inode); and any file whose content carries a value from the secrets file, including one line of a multiline key, also when the file changes during the search. Whole files are skipped, never single lines. Skipped files stay findable by name and are counted in `content_skipped_credential_files`; stored credentials are read through `reference_lookup`.
+
+- Qualification campaigns retain unavailable receipt lookups separately from billing, allowing a later verified receipt to settle expense without erasing failed attempts. New campaigns can explicitly opt into bounded404 metadata waiting; completions are never retried and historical invalid billing remains unresolved.
+
+- **The weekly gate-corpus run now labels the issue it opens `premises-missing`.** The label was meant to come from the premise-gate workflow, but an issue opened with a workflow's own token starts no other workflow run, so it was never applied. The filer now passes the label when it creates the issue; an update to an open issue leaves labels alone, so the premise gate can still remove it once answers are added.
+
+- Inbox approval resume preserves newer row state when another process claims,
+completes, supersedes or reparks the same batch during the approval lookup.
+
+- Review and commit checks no longer request approval solely because an unrelated PR comment changed while the review budget was being read. Changes to budget or review evidence still stop the action, and existing approval limits remain.
+
+- Inserted or reordered inbox items no longer inherit another batch's spent
+  retries. Reconstructed batches with missing or corrupt identities receive fresh,
+  bounded retry budgets through normal approval while retaining the old history.
+
+- Inbox evaluation execution and invocation errors now carry their own session
+  identity, keeping telemetry distinct across concurrent evaluations and restoring
+  the surrounding context afterward.
+
+- **`--next-for-validation` no longer re-picks a stuck `not-yet-done` row every pass.** The evidence document gains an optional boolean, `no_progress` (absent or `false` by default). A validator sets it to `true` when this attempt's remaining steps are the same work as the stored previous attempt's. The picker reads it from the row's stored evidence at pick time: a `not-yet-done` row that declares it waits the re-attempt window (7 days, compared as parsed instants against `last_attempt_at`) and then returns to the front. A row whose last note is `TRACKING PENDING:` is still offered at once, so an interrupted routing is not hidden. The routing re-record carries the same document, so the wait starts once routing completes. An undeclared row goes first with no wait, as before. The CLI prints when a declared row is offered again, and the MCP writer's result echoes `no_progress`. Before, a row whose remaining step needed a push, deploy or merge, which a standing validator may not do, held every pass, and the rest of the open ledger was never reached. A session whose MCP servers started before this deploy rejects a document carrying `no_progress` until the session restarts.
+
+- The inbox coverage report accepts an existing output directory and refuses
+destinations aliasing any eligible note, retained response target or database,
+including unselected notes and hardlinks.
+
+- Manual-only skills no longer appear in Genesis automatic nudges or executor skill loading; explicit owner loading remains available.
+
+- Ordinary tests isolate Guardian credential paths at collection and per-test setup.
+
+- Disk-reclaim tests write audit logs only in their own temporary directories.
+
+- Vault initialization and migration refuse an unknown server service state.
+
+- Let review reflections acknowledge no-defect findings with validated maintainer citations.
+
+- Retry unreadable executor review verdicts once and block verification if they remain invalid.
+
+- Review status now shows validated no-defect dispositions and remaining findings separately from raw review counts; unavailable local evidence is reported explicitly.
+
+- **Merging main into a PR branch no longer erases the latest review round's debt.** When nothing after the newest reviewed head is a fix (only merges of main, or empty commits such as a pushed reflection), that round's findings stay owed (also when the merge draws findings of its own), and the commit gate denies the next fix until a round reflection names them. A fix commit made after such a merge used to be admitted with nothing owed and no warning. The gate now also warns when a real commit has moved past a review round that never got a reflection.
+
+- Knowledge ingestion preserves the committed unit count and source manifest after a connection teardown error, and reports a teardown warning without repeating extraction.
+
+- Replacing a knowledge unit preserves vectors referenced by other committed units, and concurrent ingestion paths coordinate reference publication with cleanup.
+
+- fastmcp is held below 4.1.7. That release publishes a tool's whole docstring as its MCP description instead of its first line, which lengthened every Genesis tool description and broke the catalog contract test. The adoption decision is tracked in #4309.
+
+- **Claude Code sessions start and resume several seconds faster, and Genesis's MCP tools become available sooner.** The LLM routing library (litellm, about 7 seconds to import) now loads the first time an LLM call is made instead of whenever routing code is imported. The SessionStart check that reads the routing config no longer pays for it, so the slowest session-start hook drops from about 8 seconds to under 1. Each Genesis MCP server (health, memory, outreach, recon) answers its startup handshake in about 4 to 7 seconds instead of 9 to 12. The Genesis server still loads the library at startup, so its first LLM call is no slower. Sessions pick this up when they next start after the update.
+
+- **Guards no longer miss a command hidden behind a quote in a comment or a quoted substitution.** A `#` comment holding a quote after a here-doc or an escaped quote, paired `"$(…)"` substitutions with quotes inside, and a vertical tab or form feed before `#` could let a push or a `--no-verify` through unseen, and a `# review-override` inside a quoted substitution or after an escaped quote could waive a gate. These commands are now refused with a message saying how to rewrite them. Ordinary commit and PR here-doc messages, `"$(basename "$f")"`-style nesting and multi-line `$(…)` are unaffected.
+
+- **The graph census no longer proves a memory server's kill switch from a file it may not have loaded.** The census picks each server's secrets file the way the resolver picks it now. When that is a fallback past an absent `~/.config/genesis/secrets.env`, it now counts only if the `~/.config/genesis` directory has not changed since the server started; otherwise the server reads as unknown. A home-config file deleted after a server started could otherwise make the census prove the switch from the checkout file. Only that one directory is dated, so changes elsewhere in `~/.config` never reset the switchover clock.
+
+- **Guards now see a command substitution after an apostrophe inside double quotes.** In `echo "don't" $(…)`, `"it's $(…)"` or `$'it\'s' $(…)`, the parser read the apostrophe as opening a single-quoted string, so the push, destructive-command and protected-paths guards never saw the command inside the substitution, though bash runs it. Substitutions are now found under bash's quoting, and everything the old scan found is still found.
+
+- The disk-pressure reclaim no longer removes `~/tmp` work younger than 4 days at ORANGE (it was 2). ORANGE can start on a disk that still has room when a write burst, such as a backup, lifts a low-space warning one level. The nearly-full RED pass still prunes at 2 days. Every `~/tmp` entry the prune removes, daily or under pressure, is now named in its log with its size.
+
+- A Sentinel approval waiting on you now goes away by itself once the alarm that raised it clears, even while an unrelated lower-tier warning is still active. Previously a long-lived warning that happened to be bundled into the request kept the approval pending for days, and a later approval press could still act on a problem that had already resolved (#3845).
+
+- The daily disk hygiene no longer deletes a live-move repair report folder that is older than 90 days while nobody has restored or dismissed it. That folder holds the only saved copy of the edits the repair moved out of the checkout, and deleting it also cleared the deploy-health alert about them. It now stays, and is named in the hygiene output, while it is unresolved, together with the restore run folder holding its in-flight aside; a report the prune cannot read is kept too, until `scripts/deploy_candidates repair-move --dismiss <ts>` dismisses it, which now works on a report no reader can read (it writes `DISMISSED.json` beside it; deploy health, the guardian's diagnosis and the prune then skip the folder, while a restore of an older report still waits on it as a newer report until it is pruned). A restored or dismissed report, and other deploy backups, are still pruned 90 days after their last write.
+
+- **The in-container credential self-heal finds secrets.env in the checkout it runs from.** The self-heal now passes the server's own repo root to the credential checks, so on a checkout outside `~/genesis` it no longer reports the live secrets file missing and restores a backup elsewhere. The host Guardian, which knows no repo root, behaves as before.
+
+- `scripts/deploy_candidates repair-move --restore TS --check` now names the refusals `--restore TS` makes from what it can see: a saved copy that is not what SAVED.json records (`other:hash-mismatch`, `other:no-hash`, `other:too-large`, `other:not-saved`), a flag the index update would drop (`other:flag-changed`), and a folder above a refused child (`child-refused`). It used to report those parts as ready and exit 0.
+
+- **Guards now see commands inside a process substitution.** `cat <(…)` and `> >(…)` run their contents, but the parser kept `(…)` as an ordinary word, so a push or an `rm` there reached neither the push guard nor the destructive-command and protected-paths guards. Those bodies are now read like any other substitution and checked, and a quoted `"<(…)"` stays plain text. A commit inside one is now refused by the commit review check, which cannot tell which directory it runs in; before, the check asked about the outer commit alone.
+
+- A live-move restore now finds and judges every run folder of its report, not only the one its in-flight record names. Content written into a run's aside after that run finished, or one a later part's record replaced, is named on every `--restore` and `--check`, refused, and keeps the report's alert up instead of being forgotten. A held run folder that was pruned or removed is reported lost once rather than read as released. Run folders are now named for their report and kept as long as it is, and a run that leaves nothing behind removes its own folder.
+
+- **A second no-fix push no longer releases an older review round's debt.** Every review round behind the tip with no fix after it now stays owed. Before, an older round's findings were silently dropped by any of: a second empty push (for example a CI re-trigger), an unreviewed merge of main, or a reflection answering only the newer round. The commit gate's deny names every held round.
+
+- A live-move restore now names, on every run, the files git ignores (a server's `__pycache__`, for example) that it moved aside with a directory and could not put back, including after a restore that was killed partway. Before, they were named once at most and never again. They do not keep the report from clearing.
+
+- **The merge-gate publisher no longer starts a runner for every merge-gate run.** Its job now runs only when the triggering run could have left a fork or Dependabot handoff: a `pull_request` or review event whose run was neither cancelled nor skipped. Concurrency moved to the job with its key unchanged, so a run whose job is skipped takes no part in it. In a replay over the 100 most recent merge-gate runs, the job would have started for 1 of them (plus the one handoff still in retention, which still publishes) instead of all of them. The workflow comment no longer claims a supersede check that does not exist (#3820).
+
+- **A repeated finding class is caught even when the earlier answer named no round head.** The recurring-class rule refuses a later round's `fix-instances` when the class came up before. An earlier round's answer that had to name a fix or a merge of main (a late finding, or a held round) was left out of that history, so the class could repeat unnoticed. Such an answer now counts for the round its keys belong to. Only reflections made before the one being judged count, and a first answer in the same round never counts against the one that corrects it.
+
+- The dashboard's reference detail view ignores a response that arrives after it was closed or after another reference was opened, so a closed reference no longer reopens and a slow earlier response no longer replaces the one opened last. The References tab now says that a newly saved credential's description is hidden with its value, and that credentials saved earlier show their description until they are converted.
+
+- **The holdout fence no longer records a plain directory listing as an exposure.** A tool result that only names the holdout directory now goes to the activity log with no note when the result contains no line of any holdout file and the call is a shell command made only of commands that print names or their own arguments (such as `du`, `ls`, `stat`, `find` with no action, `echo` and `printf`, and filters such as `sort` and `head` reading only their input), run directly, on the holdout or on a directory above it. Before, a routine `du -sh ~/.genesis/*` or `find ~/.genesis -maxdepth 1` wrote a permanent exposure and marked scenarios as possibly spoiled. Anything else that names the directory is still an exposure: a recursive `grep`, `find … | xargs head`, a wrapper, a command substitution, `eval`, a redirect to a file, an expansion other than `$HOME` and `$GENESIS_HOME`, an option that opens, writes or runs something, `git` or `gh`, or a result from another tool. The full list is in `docs/reference/holdout.md`. One change before the tool runs: `find … -fprintf` and `-fprint0` on the holdout are now an access with a note, not a listing, because they write a file.
+
+- Shell parsing now reads `bash +c CMD` and `sh +c CMD` like `-c`, and skips a lone `+` after the selector instead of ending option parsing, so commands passed that way are visible to every Bash guard (#2218).
+
+- **The holdout runner no longer asks the owner to confirm every writer access on every run.** The fence's exposure log is never rotated, so once the `holdout-writer` agent had written scenarios, each `scripts/holdout_runner.py --pr N` run repeated "confirm each was a writer run you ordered" for the same accesses. A writer access is now only counted when it is no later than the day after the newest `Author` date in the holdout file, and is reported when it is later, when its time is unreadable, or when no scenario carries a date. The runner keeps no state of its own, and the message clears itself the next time the writer writes a scenario.
+
+- **Backups no longer lose the saved copy of a session transcript that is still being written.** gpg was given each transcript by name, and it fails when the file grows while it reads, which an active Claude Code session's transcript does. That failure also deleted the previous encrypted copy, so the backup ended up with no copy of that session's transcript at all. Every encryption in `scripts/backup.sh` now reads its source through a pipe, writes a hidden partial file beside the copy and renames it into place only on success. A failure therefore keeps the previous copy, and the backup log names gpg's own error instead of only saying the step failed. A partial left by an interrupted run is never committed to the backups repository, and the next run removes it, along with any leftover partial SQL dump from an earlier interrupted run.
+
+- **The holdout writer no longer leaves worktrees behind.** Its instructions had it create two detached worktrees per run and remove them with `git worktree remove`, which this repository refuses to agent sessions, so both stayed on disk until the lifecycle manager reaped them. `scripts/holdout_runner.py` gains `--at-ref REF`, which runs scenarios against a temporary worktree of a commit that the runner creates and removes itself, and `--overlay DIR`, which copies a directory's files over that worktree first. The writer now checks a new scenario with those two, and never holds a worktree of its own. In every mode, a run ended by SIGTERM or SIGHUP (a caller's timeout) now removes its worktrees, its scratch and the running step before it exits.
+
+- The live-move repair now retries a forward repair's pending git hooks only after its heal, and only when the checkout then reads safe; it no longer runs the checkout's engine and hook sync while the tree is half-written or a held update state still guards it.
+
+- **The backup warning now says which extra directory was only partly backed up, and a Python virtualenv's interpreter links no longer cause it.** When a directory listed in `GENESIS_BACKUP_EXTRA_DIRS` held members a restore would refuse, the dashboard said only that "some configured extra directories were not fully backed up" and pointed at the log. The status file now records each partial directory with the count of refused members by reason, and the dashboard's backup warning names them for a signed-in operator. The unauthenticated status route still shows only the generic text. A virtualenv's interpreter links in `bin/` are absolute, so a restore refuses them, which made any directory holding a venv report partial unless the venv was named exactly `.venv` or `venv`. Every absolute link in a virtualenv's `bin/` (normally the interpreter links) is now left out of the archive, found by its `pyvenv.cfg`, and the rest of the venv is still backed up.
+
+- **`follow_up_update` no longer erases a follow-up's earlier resolution notes.**
+  The tool documents `resolution_notes` as appended context for future sessions,
+  but every update replaced the column, so a one-line ruling wiped the scope
+  notes and cross-links earlier sessions had left. New notes are now appended
+  after a blank line on every path (notes only, with a status, with a blocked
+  reason, and for validators), the same way PR evidence is already appended.
+
+- The Guardian's service restart no longer restarts genesis-server while its start step runs (where the boot repair may be healing the checkout); it starts a stopped unit, restarts a running one without blocking, and judges the result by a new invocation coming up, not by the restart command's return.
+
+- **The holdout runner's output no longer names the holdout or echoes a scenario's steps.** `scripts/holdout_runner.py --has-holdout` prints only `holdout: present` or `holdout: none`; printing the path made a check inside a compound command count as a holdout exposure. The writer gets the path from the new `--holdout-path`, run as its own command. A failing scenario's observed output now masks any line that echoes the scenario's own steps, which code under test could read from the scratch directory beside `$TMPDIR`.
+
+- **The watchdog no longer cuts short a service that systemd is still starting.** When the watched service was not running, the watchdog restarted it, even while systemd was in the middle of starting it; a restart stops the start step that is running (a step that can take over a minute, such as a repair before the server starts). It now leaves a start in progress alone for up to five minutes, and when it does act on a service that is not running, it starts it rather than restarting it.
+
+- **Dashboard: clicking "enable" on a disabled provider now enables it, even after its hold window has passed.** Once a disabled provider's hold expired (30 minutes), clicking "enable" disabled it for another window instead. The dashboard now sends the action its button showed, and the toggle route acts on that rather than re-reading the breaker state.
+
+- **A provider whose prepaid balance is empty is now skipped instead of being tried first on every call.** An empty balance could reach the router as a client error (HTTP 400) rather than a payment error. That was treated as a problem with the request, which never counts against a provider, so the provider stayed first in its chains and each call paid a wasted round trip before falling through. It is now treated as an exhausted quota: after three such failures the provider is held out and the API-keys card shows it as out of credits. After a top-up the provider is used again when its hold expires (the hold starts at a few minutes and doubles on repeated failures, up to four hours), or at once if you re-enable it from the dashboard.
+
+- **Outbound scanning and credential redaction catch more credential shapes.**
+  An email or Discord send, and an email subject, are now refused when they
+  carry a JWT (including one in an `Authorization: Bearer` header), a Discord
+  webhook URL, a Telegram bot token, or a GitLab, NVIDIA, Tavily, Firecrawl,
+  Hugging Face, xAI, Slack, AWS, Google, DeepInfra, Cerebras, Stripe, npm or
+  PyPI key. Peer replies and the failure text kept from remote runs redact
+  the same shapes in place, and peer messages, approval details and tool
+  summaries that carry one are refused or withheld.
+
+  These shapes come from one shared table that favours catching a credential
+  over sparing a lookalike, so a benign string with the same shape (a long
+  slug after `glpat-`, a `<digits>:<32 hex characters>` pair) is refused too.
+  A send that fails with `Content scan quarantine: ['credential_...']` names
+  the shape that matched.
+
+- **Guards no longer miss a command whose program name is written in `$"…"` quoting.** Bash runs a word in its locale-translation quoting as the text inside it, but the guard parser kept the dollar sign, so a `git`, `gh` or `rm` spelled that way (whole, in part, behind `command`, `env`, a path or a nested shell, or inside a `case` arm, a function body or `coproc`) was not recognised and went through unchecked. The same held one level down, for a shell handed its script that way (`sh -c $"…"`, `bash $"-c" '…'`, including behind `xargs` or a pipe). The parser now reports both. Five checks refuse on that: the push, commit and discard checks when the command may run git or gh, and the destructive-removal and protected-path checks when it names a removal. Each refusal names the locale quoting and says to write the program name, the `-c` and the script in plain quotes. `$"…"` in a message or any other argument is unaffected. Still not read, by any check: a locale-quoted script handed to a launcher the parser does not open in plain quotes either (a here-string or pipe into a shell, `busybox sh -c`, `find -exec`, `parallel`, `taskset`, `ssh`, `trap`, `at`, `$SHELL -c`, a script passed as a positional argument or built by a substitution, a program named by a variable); and the other command checks (the full-suite, worktree-removal, PR-open and issue-create checks) still answer a locale-quoted program word as they answer an unknown program.
+
+- **Detail text on the health endpoint now needs dashboard sign-in.** A caller
+  of `GET /api/genesis/health` with neither a signed-in dashboard session nor
+  the internal API token gets every status, count, flag, id and timestamp, with
+  `<field>_hidden: true` in place of each text field and `free_text_hidden:
+  true` on the response. A text field added to the snapshot later is handled
+  the same way. The host-side supervisor and the deploy scripts read only
+  statuses and numbers and are unaffected, and the status code is decided
+  before anything is withheld.
+
+  On an install with no dashboard password nothing can sign in, so the
+  dashboard header and both monitor pages show a note where that text used to
+  be, from localhost too. Set a dashboard password (Configuration, Provider
+  Keys) and sign in to see it again.
+
+- **Disarming the code-intel freeze releases its locks as soon as it stops.** The freeze's background `sleep` kept a copy of both index locks, so after a disarm they could stay held for a moment while it exited, and an index run or check right then found them still taken. Only the freeze itself holds the locks now.
+
+- **A holdout run killed while it is still creating its temporary worktree no longer leaves that worktree behind.** `git worktree add` registers a worktree locked until its checkout finishes, and `git worktree prune` never drops a locked entry, so a SIGTERM or SIGHUP that reached `scripts/holdout_runner.py` in that window left a locked registration and a partial tree, one per signal. When the add is interrupted, the runner now removes the half-made worktree itself, with `git worktree remove --force --force`.
+
+- **The review round counter and the review budget now read CodeRabbit findings the way the merge gate does.** Each used to read every line of a CodeRabbit comment as a possible severity header. A Major header quoted inside fenced code or a `<details>` section could therefore count as a floor finding the merge gate never scored. The review budget's floor fact now shares the merge gate's code for skipping fenced and collapsed content and for splitting a comment into findings. The round counter reads the gate's findings too, and still reads every header line besides, quoted ones included, because the gate's mask is not CommonMark and can hide a real header. A Trivial comment ending in a plural `_Sources: …_` footer no longer opens a review round; that is the only case where the round counter now opens fewer rounds. On the 523 most recent CodeRabbit comments, no reading changed.
+
+- **Turning marketing `off` now also stops a prospect email you already
+  approved.** A held send to a curated prospect that you approved but that has
+  not gone out yet now waits while the `marketing_outreach` lever is `off`, as
+  a cold first touch already did, and goes out if you turn marketing back on.
+  This applies whatever kind of email it is. Emails to anyone else are
+  unchanged. Also, a prospect addressed as `Name <address>` now counts as
+  contacted once an email reaches them, so the campaign does not pitch them
+  again.
+
+- Preserve Personal Notes and original newline bytes outside the managed container block when refreshing CLAUDE.md; malformed markers leave the file unchanged.
+
+- Autonomous task workers now receive the task goal and planned step count alongside each step, including resumed work, recovery retries, and review fixups, instead of unresolved context placeholders.
+
+- **Transcript analytics now redacts a credential value that follows a scrubbed JSON span.** Before the shared scrubber runs over stored text, the adapter hides each JSON span it has already scrubbed behind a placeholder. A credential label at the end of such a span (`"... cookie"=VALUE`) was therefore hidden from the rule that redacts `VALUE`, and the value was stored. After that pass, the adapter now checks the span's original tail plus the rest of its line and withholds what that check redacts. It only ever adds redaction. Stored sources are re-scrubbed on the next ingest (adapter version `scoped-json-5`).
+
+- **Fixed: SQLite temp files from Claude Code sessions no longer fill the small Claude Code temp volume.** Sessions started through `cc-slot.sh` now get `SQLITE_TMPDIR=~/tmp`, as the server, bridge and watchdog units already do, so a large sort or temp table run by a session (its MCP servers, a test or a script) spills onto the big disk. These spill files are deleted as soon as they are made, so `du` cannot see them while they fill the volume; one such run drove it to 40 MB free and raised a disk alert. Claude Code's own `TMPDIR` is unchanged. A session picks this up when it is next started; running sessions keep their environment.
+
+- **The boot repair counts every attempt, and sees every outside edit.** A heal that failed before it saved its report left a backup folder with nothing in it to count, so every start made one more backup and tried the same heal again. It now writes its report as it starts: after one retry, later starts stop trying (the service stays down, as before) and make no new backup until the checkout or the repair kit changes. A crash at the very end of the time limit recorded the checkout as "unknown", so no later edit could let a start try again; the last 5 s of the 75 s limit are now kept for that record. Editing a file that was already modified or untracked now counts as a change too. When a failure follows a rebuild of a torn index, the report and the page say the index was rebuilt instead of "nothing was changed", and the Guardian reads a heal that stopped before saving anything as such, not as "0 paths restored".
+
+- Refuse malformed partial zero-watermark acceptance receipts during supervised retry admission, preserving ordinary-admission parity without clearing receipts, work or provider holds.
+
+- Include retained retry code in server restart detection and recognize its existing sibling-loader declarations during deployment-inventory checks.
+
+
+### Security
+
+- Privacy scans preserve added content containing non-LF separators or text resembling patch headers, so those lines cannot disappear during diff parsing.
+
+- The Sentinel no longer runs its proposed fixes when the approval step itself fails. Previously, an error while asking for approval (for example a locked database) was logged and the proposed commands then ran without your approval. Now nothing runs and the incident is escalated instead. An unrecognised approval status is also treated as "not approved", both for actions and for starting a remediation session.
+
+- **The Sentinel now uses up an approval when it acts on it.** The approval gate reuses an approved request that nothing has used yet, and before this the Sentinel's dispatch and action steps used such a reused approval without consuming it, so one approval could authorize more than one run. Both steps now mark the approval consumed before acting. If that fails because the approval was already used, the dispatch is refused (logged as `dispatch_approval_already_used`), and the action step fails closed without running the proposed actions (#4348).
+
+- Claude Code sessions no longer see or store your `secrets.env` values. A new plugin, installed for every session on the install by bootstrap and update, replaces each value with `[secrets.env:VAR]` in tool results, transcripts, saved outputs and typed prompts, however a command reached it (Monitor and background-task output follow in a later change). Commands still run with the real values, and a key can still be replaced in place with Edit. Turn it off with `cc_plugins.secret_redact: off` in `~/.genesis/config/genesis.yaml`. See `docs/reference/secret-redaction.md`.
+
+- **Dashboard update sessions no longer inherit a GitHub token from the
+  server's environment.** The Claude Code sessions an update starts from the
+  dashboard (all three tiers) now run with `GH_TOKEN`, `GITHUB_TOKEN`,
+  `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` empty. `gh`, and git
+  through gh's credential helper, still authenticate from the login stored on
+  disk (`gh auth login`). If the server's environment is the only place your
+  GitHub token lives and your update remote is private, an update run from the
+  dashboard can no longer fetch with it: run `gh auth login` once, or update
+  with `scripts/update.sh` from a shell.
+
+
 ### Added
 
 - Internal shared MCP HTTP composition with qualified SDK limits, validated
