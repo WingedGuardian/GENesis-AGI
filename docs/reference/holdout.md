@@ -246,8 +246,13 @@ still running: git registers the worktree locked ("initializing") until its
 checkout is done, and `git worktree prune` never drops a locked entry. The
 runner runs the add in its own process group, so it stops git together with
 the child process that does the checkout, then removes the half-made worktree
-with `git worktree remove --force --force`. A runner killed with SIGKILL runs
-no cleanup, so it can still leave one.
+with `git worktree remove --force --force`. It stops the group with SIGTERM,
+on which git removes its own half-made worktree, and sends SIGKILL only to a
+git still running 10 seconds later: SIGKILL alone can land after git registered
+the worktree and before it wrote the tree's `.git` file, a state that
+`git worktree remove` refuses to clean. A second signal during this cleanup is
+held until it is done. A runner killed with SIGKILL runs no cleanup, so it can
+still leave one.
 
 The writer uses it to check a new scenario on the current tree, and
 then on a deliberately changed copy, without creating a worktree of its own: an

@@ -1,0 +1,1 @@
+- Holdout runner: a run interrupted while it creates a worktree now stops git with SIGTERM, so git removes its own half-made worktree, and uses SIGKILL only on a git that is still running after 10 seconds. Killing git outright could leave a locked worktree registration that could not be removed. A second signal during that cleanup no longer skips it.
