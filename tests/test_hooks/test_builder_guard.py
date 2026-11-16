@@ -98,6 +98,18 @@ REFUSED = [
     "perl -e 1 -e 'system(\"gh pr merge 5\")'",
     "perl -wle 'system(\"gh pr merge 5\")'",
     'node -p \'require("child_process").execSync("gh pr merge 5")\'',
+    # PR review round 3 (confirmation, Codex and CodeRabbit).
+    "gh api \\\n  repos/o/r/pulls/5/comments --input reply.json",
+    "gh api -iF event=APPROVE repos/o/r/pulls/5/reviews",
+    "gh api -iX DELETE -H 'Accept: x' repos/o/r/pulls/comments/9",
+    'node -pe \'require("child_process").execSync("gh pr merge 5")\'',
+    "curl --request-target /graphql --data-binary @q.json https://api.github.com",
+    "wget --input-f=urls.txt --method=PUT",
+    # Round-3 fix audit: encoded grouped calls and curl long-option prefixes.
+    "gh api -iX DELETE repos/o/r/%70ulls/comments/9",
+    "gh api -iF event=APPROVE repos/o/r/pull%73/5/reviews",
+    "curl --confi curl.cfg",
+    "curl --request-targ /graphql --data-binary @q.json https://api.github.com",
     # curl and wget: an endpoint word is refused whatever the options say.
     "wget --method=DELETE -d https://api.github.com/repos/o/r/pulls/comments/99",
     "curl -X PUT https://api.github.com/repos/o/r/pulls/5/merge --next -X GET https://api.github.com/user",
@@ -140,6 +152,8 @@ ALLOWED = [
     "curl -s -o /dev/null -w '[%{http_code}]' https://example.com",
     "curl -s -H 'X-Ids: [1,2]' https://example.com",
     "curl -s -o out.html https://example.com/docs",
+    "curl --request PUT https://example.com/x",
+    "gh api \\\n  repos/o/r/pulls/5/comments --paginate --jq '.[].id'",
     "wget -q -O page.html https://example.com/docs",
     "curl -s https://api.github.com/repos/o/r/issues/5/comments",
     "python3 -W ignore scripts/check.py --config ci.yaml",

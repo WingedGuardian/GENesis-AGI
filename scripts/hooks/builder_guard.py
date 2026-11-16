@@ -139,7 +139,8 @@ def _inline_code(argv: list[str]) -> str | None:
             group = tok[1:]
             for k, ch in enumerate(group):
                 if ch in letters:
-                    code.append(group[k + 1 :] or nxt)
+                    # Both: `-pe CODE` (node) puts the code in the next word.
+                    code.extend((group[k + 1 :], nxt))
                     break
     return "\n".join(code) if code else None
 
@@ -169,6 +170,28 @@ _BLIND = re.compile(
     re.IGNORECASE,
 )
 _GITHUB_HOST = re.compile(r"^(?:api\.)?github\.com\.?$", re.IGNORECASE)
+#: A pull-request, merge or GraphQL path anywhere in a word (fail-closed nets).
+_PULLS_OR_GRAPHQL = re.compile(r"/pulls\b|(?:^|[/\s'\"])graphql\b|/merges\b", re.IGNORECASE)
+#: A request naming a pull-request or GraphQL path, and a request body read
+#: from a file: on a line this guard cannot parse, the two together are a write
+#: it cannot read (a wrapped `gh api ... --input reply.json`).
+_BLIND_REQUEST = re.compile(
+    r"\b(?:gh\s+api|curl|wget)\b.*(?:/pulls\b|/merges\b|\bgraphql\b)", re.IGNORECASE
+)
+_FILE_BODY = re.compile(
+    r"--input\b|(?:^|\s)-[a-zA-Z]*d\s*@|--data[\w-]*[=\s]+@|--json[=\s]+@"
+    r"|(?:^|\s)-T\b|--upload-file\b|--post-file\b|--body-file\b"
+)
+#: The shortest prefix of each refused long option that curl or wget would take
+#: for it (both accept an unambiguous prefix; MEASURED curl 8.5.0: `--confi` read
+#: a config file). curl's own exact `--request` stays allowed.
+_LONG_MIN_PREFIX = {
+    "--config": "--conf",
+    "--request-target": "--request-",
+    "--input-file": "--inp",
+    "--execute": "--exe",
+    "--base": "--bas",
+}
 
 _TAIL = (
     "A builder session stops at an open pull request plus one `@codex review`; the "
@@ -191,21 +214,6 @@ def _norm(path: str) -> str:
     return "/" + "/".join(parts)
 
 
-def _grouped_method(argv: list[str]) -> tuple[str | None, int | None]:
-    """A method given inside a short-flag group (``gh api -iX DELETE …``,
-    ``-iXDELETE``), which the shared argv reader does not split: ``(method,
-    index of the word it consumed)``."""
-    from gh_merge import _is_group
-
-    for n, tok in enumerate(argv[1:], start=1):
-        if _is_group(tok) and "X" in tok:
-            rest = tok[tok.index("X") + 1 :]
-            if rest:
-                return rest, None
-            return (argv[n + 1] if n + 1 < len(argv) else "UNKNOWN"), n + 1
-    return None, None
-
-
 def _write_target(path: str) -> str | None:
     norm = _norm(path)
     for pattern, what in _WRITE_TARGETS:
@@ -218,6 +226,7 @@ def _gh_reason(seg, cmd: str, n_segments: int, cwd: str | None) -> str | None:
     from gh_merge import (
         _graphql_code,
         _graphql_documents,
+        _is_group,
         _read_text,
         api_merge_reason,
         files_trusted,
@@ -245,14 +254,18 @@ def _gh_reason(seg, cmd: str, n_segments: int, cwd: str | None) -> str | None:
     call = _parse_api(seg.argv)
     if call is None:
         return None
+    if any(_is_group(t) for t in seg.argv[2:]) and any(
+        _PULLS_OR_GRAPHQL.search(unquote(t)) for t in seg.argv
+    ):
+        # The shared reader does not split -iF / -iX groups (a field or method
+        # read as the endpoint), so the request is not read at all.
+        return (
+            "a `gh api` call with grouped short flags naming a pull request or GraphQL "
+            "(give each flag on its own)"
+        )
     endpoint = call.endpoint or ""
     has_body = bool(call.fields) or call.input is not None
-    grouped, consumed = _grouped_method(seg.argv)
-    if consumed is not None and endpoint == seg.argv[consumed]:
-        # The shared reader took the method word for the endpoint.
-        later = [t for t in seg.argv[consumed + 1 :] if not t.startswith("-")]
-        endpoint = later[0] if later else ""
-    method = (call.method or grouped or ("POST" if has_body else "GET")).upper()
+    method = (call.method or ("POST" if has_body else "GET")).upper()
     if _GRAPHQL_PATH.search(_norm(endpoint)):
         docs = _graphql_documents(call, cwd, trusted)
         if docs is None:
@@ -280,7 +293,7 @@ def _gh_reason(seg, cmd: str, n_segments: int, cwd: str | None) -> str | None:
 #: curl and wget options that read the request, or its URLs, from somewhere this
 #: guard cannot see: long names and short letters. READ: curl(1), wget(1).
 _HTTP_INDIRECT = {
-    "curl": ({"-K", "--config"}, "K"),
+    "curl": ({"-K", "--config", "--request-target"}, "K"),
     "wget": ({"-i", "--input-file", "-e", "--execute", "--config", "-B", "--base"}, "ieB"),
 }
 #: Short letters that take a value, so later letters in the group are that value.
@@ -337,7 +350,15 @@ def _http_reason(seg) -> str | None:
     longs, shorts = _HTTP_INDIRECT[prog]
     for tok in argv[1:]:
         name = tok.split("=", 1)[0] if tok.startswith("--") else tok
-        if name in longs:
+        if name in longs or (
+            # Both take an unambiguous prefix of a long option.
+            name.startswith("--")
+            and any(
+                o.startswith(name) and name.startswith(_LONG_MIN_PREFIX.get(o, o))
+                for o in longs
+                if o.startswith("--")
+            )
+        ):
             return f"`{prog}` reading its request from a file or base this guard cannot see"
         if tok.startswith("-") and not tok.startswith("--"):
             for ch in tok[1:]:
@@ -356,12 +377,21 @@ def _http_reason(seg) -> str | None:
 
 def reason(cmd: str, cwd: str | None) -> str | None:
     """Why a builder may not run *cmd*, or None."""
-    from shell_parse import analyze_checked, mentions, rewrites_before_running
+    from shell_parse import analyze_checked, fold_continuations, mentions, rewrites_before_running
 
     segs, blind = analyze_checked(cmd)
     if blind is not None or rewrites_before_running(cmd):
         if mentions(cmd, _BLIND):
             return "a command this guard cannot read that names a merge, a review or a review-thread write"
+        if any(
+            _BLIND_REQUEST.search(ln) and _FILE_BODY.search(ln)
+            for ln in fold_continuations(cmd).splitlines()
+        ):
+            # A wrapped line hides the request's body and method (--input FILE).
+            return (
+                "a GitHub request this guard cannot read that names a pull request or "
+                "GraphQL (write it on one line)"
+            )
         if blind is not None:
             return None
     for seg in segs:
