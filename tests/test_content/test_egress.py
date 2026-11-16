@@ -75,6 +75,27 @@ class TestPIIScan:
         assert r.quarantined is False
 
 
+class TestSharedCredentialShapes:
+    """Shapes the scanner adopts from the shared table; synthetic values."""
+
+    NVAPI = "nvapi-" + "a" * 40
+    BOT_TOKEN = "1234567890:" + "H" * 35
+
+    def test_external_sends_quarantine(self):
+        for channel in ("discord", "email"):
+            for value in (self.NVAPI, self.BOT_TOKEN):
+                r = gate(f"the value is {value}", channel=channel, category="notification")
+                assert r.quarantined is True, (channel, value[:6])
+                assert r.scan.risk_level == "high"
+
+    def test_owner_facing_channel_is_not_scanned(self):
+        text = f"the value is {self.NVAPI}"
+        r = gate(text, channel="telegram", category="notification")
+        assert r.applied is False
+        assert r.text == text
+        assert r.scan is None
+
+
 class TestFlags:
     def test_banned_words_flagged_on_external(self):
         r = gate("We leverage robust synergy.", channel="email", category="surplus")

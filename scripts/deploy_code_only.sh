@@ -913,6 +913,12 @@ esac
 # holds is not what was checked. The same check runs again just before a restart.
 SHA="$_CHECKED"
 _checkout_unmoved || _restart_or_refuse
+# The boot repair kit follows HEAD (#3492 D2): installed from HEAD's blobs, under
+# update.lock, never fatal. Past the update-state refusal above, so it never
+# installs over a state: the installed kit is the version of the code that wrote
+# the state (the update's rollback reinstalls the restored code's for that reason).
+python3 -I -S "$_SELF_DIR/lib/live_repair_kit.py" install "$GENESIS_ROOT" "$HOME" {_UPDATE_LOCK_FD}>&- \
+    || echo "  NOTE: the live-move repair kit was not installed from HEAD; the installed one is kept."
 
 if [ "$MODE" = pull ]; then
     _report_pending "$_PULL_FROM"

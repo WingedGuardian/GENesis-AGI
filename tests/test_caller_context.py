@@ -137,6 +137,31 @@ def test_client_kind_labels_a_credential_resolved_profile(monkeypatch, profile, 
         assert cc.client_kind() == expected
 
 
+_BOTH_IDS = {"CLAUDE_CODE_SESSION_ID": "tr", "CODEX_THREAD_ID": "th"}
+
+
+@pytest.mark.parametrize(
+    ("env", "kind", "expected"),
+    [
+        ({}, "claude", None),
+        ({"CLAUDE_CODE_SESSION_ID": "tr"}, "claude", "tr"),
+        ({"CODEX_THREAD_ID": "th"}, "codex", "th"),
+        # Codex started from a Claude Code shell inherits the parent transcript id,
+        # which must never sit beside a Codex label.
+        (_BOTH_IDS, "codex", "th"),
+        ({"CLAUDE_CODE_SESSION_ID": "tr"}, "codex", None),
+        ({"CLAUDE_CODE_SESSION_ID": "tr"}, "codex-sealed", None),
+        (_BOTH_IDS, "codex-sealed", "th"),
+        (_BOTH_IDS, "unknown", None),
+        ({"CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": ""}, "claude", None),
+    ],
+)
+def test_record_session_id_follows_the_label(monkeypatch, env, kind, expected):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    assert cc.record_session_id(kind) == expected
+
+
 _GATE_SURFACES = ("autonomy", "payments", "security", "guardian", "ego")
 
 
@@ -613,8 +638,9 @@ def test_env_writer_allowlist_has_no_stale_entries():
 # Modules allowed to use the accessor's exported name constants, with why.
 _CONSTANT_USERS = {
     "memory/provenance.py": "names the origin variable in one log message",
+    "routing/standalone.py": "clears external identity and excludes it from file imports; never reads caller identity",
 }
-_EXPORTED_NAMES = _ACCESSOR_CONSTANTS | {"IDENTITY_ENV_VARS"}
+_EXPORTED_NAMES = _ACCESSOR_CONSTANTS | {"IDENTITY_ENV_VARS", "EXTERNAL_IDENTITY_ENV_VARS"}
 
 
 def identity_constant_uses(source: str, filename: str = "<src>") -> list[tuple[int, str]]:
@@ -665,6 +691,7 @@ def _any_net(snippet: str) -> bool:
         "import genesis.caller_context as c\nimport os as _os\n_os.environ.get(c.CC_SESSION_ENV)",
         'from os import environ\nenviron.get("GENESIS_CC_SESSION")',
         "from genesis.caller_context import IDENTITY_ENV_VARS\n{k: os.environ.get(k) for k in IDENTITY_ENV_VARS}",
+        "from genesis.caller_context import EXTERNAL_IDENTITY_ENV_VARS\n{k: os.environ.get(k) for k in EXTERNAL_IDENTITY_ENV_VARS}",
         'os.environ.get(key="GENESIS_CC_SESSION")',
         "from genesis.caller_context import *\nos.environ.get(CC_SESSION_ENV)",
         'b"GENESIS_CC_SESSION=1" in open("/proc/1/environ", "rb").read().split(b"\\0")',

@@ -23,6 +23,11 @@ Modes (increasing authority):
   - ``live``    — same wire behavior today (the gate still authorizes each send),
     but the owner has affirmatively enabled autonomous cold outreach.
 
+The gate reads this mode for more than the BULK cell: any GRANTED-cell send to a
+curated prospect (the IDENTITY follow-up on an unanswered thread included) is
+held unless the mode is ``live``, and a reply to a prospect is held in every
+mode (``EmailAutonomyGate.check``, the marketing-recipient posture gate).
+
 A missing/corrupt config degrades to DEFAULTS (mode ``off``). An invalid ``mode``
 value degrades to ``off`` — for a cold-send substrate the safest degrade is the
 LEAST authority (fully inert), not a partial-authority fallback. Env kill switch

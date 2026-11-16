@@ -13,7 +13,11 @@ import uuid as _uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from genesis.awareness.signal_format import format_signal_line, format_signals
+from genesis.awareness.signal_format import (
+    LIGHT_HIDDEN_SIGNALS,
+    format_signal_line,
+    format_signals,
+)
 from genesis.awareness.types import Depth, SignalReading, TickResult
 from genesis.cc.reflection_bridge.reflection_models_config import model_for_depth
 
@@ -35,16 +39,20 @@ def _format_signal(s: SignalReading, *, unchanged_ticks: int = 0) -> str:
     return format_signal_line(s, unchanged_ticks=unchanged_ticks)
 
 
-def _format_signals_from_tick(tick: TickResult, *, min_value: float = 0.0) -> str:
+def _format_signals_from_tick(
+    tick: TickResult, *, min_value: float = 0.0, excluded_signals: set[str] | None = None
+) -> str:
     """Canonical signal block for a TickResult (thin delegate).
 
     When min_value > 0, signals at or below that value are excluded
-    (bootstrap placeholder filtering). No silent truncation — every
-    passing signal renders, one canonical line each.
+    (bootstrap placeholder filtering); ``excluded_signals`` drops names
+    outright. No silent truncation — every passing signal renders, one
+    canonical line each.
     """
     return format_signals(
         tick.signals,
         staleness=tick.signal_staleness or {},
+        excluded_signals=excluded_signals,
         min_value=min_value,
         empty="none",
     )
@@ -257,7 +265,9 @@ async def build_reflection_prompt(
 
     # For Light reflections, filter out zero-value bootstrap placeholder signals
     signals_summary = _format_signals_from_tick(
-        tick, min_value=0.001 if depth == Depth.LIGHT else 0.0,
+        tick,
+        min_value=0.001 if depth == Depth.LIGHT else 0.0,
+        excluded_signals=set(LIGHT_HIDDEN_SIGNALS) if depth == Depth.LIGHT else None,
     )
 
     scores_summary = ", ".join(
@@ -490,6 +500,16 @@ async def _fetch_prior_light_summary(db) -> str | None:
     observation (source ``cc_reflection_light``), truncated to 400 chars.
     Returns ``None`` when no prior summary exists.
     """
+    finding = await _fetch_prior_light_finding(db)
+    return finding[0] if finding else None
+
+
+async def _fetch_prior_light_finding(db) -> tuple[str, str] | None:
+    """The previous light finding as ``(content[:400], created_at)``, or None.
+
+    The timestamp locates the run that produced it, so the change table compares
+    against that run's signals, not some other Light run's.
+    """
     from genesis.db.crud import observations
 
     # resolved=None: include all summaries regardless of resolution state.
@@ -509,7 +529,69 @@ async def _fetch_prior_light_summary(db) -> str | None:
     if not results:
         return None
     content = results[0].get("content", "")
-    return content[:400] if content.strip() else None
+    if not content.strip():
+        return None
+    return content[:400], results[0].get("created_at") or ""
+
+
+async def _light_changes_section(db, tick: TickResult, finding_at: str | None) -> str:
+    """The `Changes since the previous Light finding` prompt section (#4371).
+
+    Diffs the signals stored for the run that produced the previous finding
+    against this tick's live readings. That run is found by its corpus row,
+    written just before the finding (``reflection_corpus.tick_written_before``).
+    With no finding, no matching row or an unreadable tick, the section says so
+    rather than comparing against an unrelated run.
+    """
+    from genesis.awareness.signal_format import light_signal_changes
+
+    header = (
+        "\n## Changes since the previous Light finding\n"
+        "Computed by code from the signals stored for the run that wrote the "
+        "previous finding. These are facts; whether they matter is your call.\n"
+    )
+    if not finding_at:
+        return header + "No previous Light finding on record."
+    previous = await _signals_behind(db, finding_at, exclude_tick_id=tick.tick_id)
+    if previous is None:
+        return header + "The previous run's signals are not on record."
+    return header + light_signal_changes(previous, tick.signals)
+
+
+async def _signals_behind(
+    db, at: str, *, exclude_tick_id: str | None
+) -> dict[str, float | None] | None:
+    """Signal values stored for the Light run behind something written at ``at``.
+
+    ``at`` is the timestamp of that run's finding or of its Telegram post; the
+    run is found by its corpus row, written just before either
+    (``reflection_corpus.tick_written_before``; MEASURED 2026-11-12, the post
+    follows the row by 0.5-6.7 s on the last 200 full Light posts). None when
+    there is no such row, more than one run falls in the lookup window, or its
+    tick's signals are missing or unreadable. A signal whose reading failed in
+    that run maps to None: its stored value is a placeholder.
+    """
+    from genesis.db.crud import awareness_ticks, reflection_corpus
+
+    try:
+        prev_tick_id = await reflection_corpus.tick_written_before(
+            db, "Light", at, exclude_tick_id=exclude_tick_id
+        )
+        row = await awareness_ticks.get_by_id(db, prev_tick_id) if prev_tick_id else None
+        stored = json.loads(row["signals_json"]) if row and row.get("signals_json") else None
+    except Exception:
+        logger.warning("Could not read a previous Light run's signals", exc_info=True)
+        stored = None
+    if not isinstance(stored, list):
+        return None
+    return {
+        s["name"]: None if s.get("failed") else float(s["value"])
+        for s in stored
+        if isinstance(s, dict)
+        and isinstance(s.get("name"), str)
+        and isinstance(s.get("value"), int | float)
+        and not isinstance(s.get("value"), bool)
+    }
 
 
 async def build_light_prompt_enriched(
@@ -528,19 +610,22 @@ async def build_light_prompt_enriched(
         f"Tick ID: {tick.tick_id}",
         f"Timestamp: {tick.timestamp}",
         f"Trigger: {tick.trigger_reason or 'scheduled'}\n",
-        f"## Live Tick Signals (canonical)\nThese are the ONLY signals you may cite by name/value. Anything else in this prompt is stored context, not a live signal.\n{ctx.signals_text}",
+        f"## Live Tick Signals (canonical)\nThese, and the change table below, are the ONLY signal data you may cite by name/value. Signals at zero are left out of this list; a cleared alarm shows in the change table. Anything else in this prompt is stored context, not a live signal.\n{ctx.signals_text}",
         f"\n## Current Cognitive State\n{ctx.cognitive_state or '(none)'}",
     ]
 
-    # Prior context: what the previous Light cycle found.
-    # Prevents the LLM from re-discovering unchanged conditions.
-    prior_summary = await _fetch_prior_light_summary(db)
+    # Prior context: what the previous Light cycle found, and what the signals
+    # did since that run (#4371). Prevents the LLM from re-discovering
+    # unchanged conditions or reading drift as news.
+    finding = await _fetch_prior_light_finding(db)
+    prior_summary = finding[0] if finding else None
+    parts.append(await _light_changes_section(db, tick, finding[1] if finding else None))
     if prior_summary:
         parts.append(
             f"\n## Previous Light Cycle Finding\n{prior_summary}\n"
             "Do NOT repeat or rephrase this as news. Only report what is NEW or "
-            "CHANGED; when nothing is, set material_change to false and give "
-            "the short restatement your instructions describe."
+            "CHANGED; when nothing is, set material_change to false and state "
+            "the standing conditions briefly, as your instructions describe."
         )
 
     if focus == "user_impact":

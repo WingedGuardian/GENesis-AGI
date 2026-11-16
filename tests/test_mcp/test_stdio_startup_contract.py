@@ -129,6 +129,9 @@ async def test_real_launcher_starts_lists_and_calls(server, stdio_install, tmp_p
     child = json.loads((tmp_path / "child-report.json").read_text())
     assert child["entries"] == child["exits"] == 1
     assert child["listed_without_worker"] is True
+    # Startup (bootstrap + lifespan) stays litellm-free; litellm loads on
+    # first use only (routing/litellm_delegate.py, #3558).
+    assert child["litellm_loaded"] is False, f"{server} imported litellm at startup"
     assert child["source"] == str((capsule / "src" / "genesis" / "__init__.py").resolve())
     # Receipts preserve measurements without putting install-specific absolute
     # paths or machine measurements in the committed fixture files.

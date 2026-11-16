@@ -19,12 +19,24 @@ H4 = "4" * 40
 H5 = "5" * 40
 
 
-def _linear_commits(*heads):
-    """GraphQL commit nodes for a linear history, each with its parent."""
+def _tree_of(sha):
+    """A tree id that can never equal its commit id: the test then tells the
+    two fields apart, which a reversed all-one-digit id would not."""
+    return "".join("abcdef0123456789"["0123456789abcdef".index(c)] for c in sha)
+
+
+def _linear_commits(*heads, facts=False):
+    """GraphQL commit nodes for a linear history, each with its parent. With
+    ``facts``, each also carries a tree and a commit time."""
     return [
         {
             "commit": {
                 "oid": h,
+                **(
+                    {"tree": {"oid": _tree_of(h)}, "committedDate": f"2026-10-04T0{i}:00:00Z"}
+                    if facts
+                    else {}
+                ),
                 "parents": {
                     "totalCount": 1 if i else 0,
                     "nodes": [{"oid": heads[i - 1]}] if i else [],
@@ -849,6 +861,38 @@ def test_graphql_comment_landing_between_reads_is_unknown(monkeypatch, author, r
     assert "evidence_changed_during_evaluation" in got["errors"], got
 
 
+def test_a_clean_comment_on_a_pushed_out_head_between_reads_stays_ok(monkeypatch):
+    """``unresolved_clean_heads`` is advisory output for ``--check-pr``'s no-change
+    note, not budget policy. Before it existed, such a comment changed nothing in
+    the result; it must not now make the double read disagree and turn an ok
+    budget into unknown."""
+    _no_seams(monkeypatch)
+    pushed_out = "9" * 40
+    late = {
+        "fullDatabaseId": "11",
+        "body": "Codex Review: Didn't find any major issues.\nReviewed commit: `"
+        + pushed_out[:10]
+        + "`",
+        "createdAt": "2026-11-01T00:00:00Z",
+        "updatedAt": "2026-11-01T00:00:00Z",
+        "author": {"login": "chatgpt-codex-connector", "__typename": "Bot"},
+    }
+    base = _graphql_server(files=_FILES, commits=_COMMITS)
+    grown = _graphql_server(comments=[late], files=_FILES, commits=_COMMITS)
+    calls = []
+
+    def serve(argv, *, timeout):
+        calls.append(argv)
+        return (base if len(calls) == 1 else grown)(argv, timeout=timeout)
+
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "ok", got
+    # Control: the comment IS recognised, so the two reads really disagree on the
+    # advisory field. Without this the test would pass if it were ignored.
+    alone = rb.evaluate_pr("owner/repo", 7, runner=grown, external_identity_templates=())
+    assert [h["head"] for h in alone["unresolved_clean_heads"]] == [pushed_out[:10]], alone
+
+
 @pytest.mark.parametrize("login,kind", [
     ("someone", "User"), ("coderabbitai", "Bot"), ("github-actions", "Bot"),
 ])
@@ -1358,7 +1402,7 @@ def test_an_earlier_snapshots_recovered_failure_does_not_excuse_a_later_one(monk
     assert not rb.errors_are_transient(got["errors"]), got
 
 
-def _gql_timed_review(head, when, *, login, body="Looks good.", tops=()):
+def _gql_timed_review(head, when, *, login, body="Looks good.", tops=(), paths=()):
     return {
         "state": "COMMENTED",
         "submittedAt": when,
@@ -1368,7 +1412,12 @@ def _gql_timed_review(head, when, *, login, body="Looks good.", tops=()):
         "comments": {
             "pageInfo": {"hasNextPage": False},
             "nodes": [
-                {"fullDatabaseId": str(900 + i), "replyTo": None, "body": b}
+                {
+                    "fullDatabaseId": str(900 + i),
+                    "replyTo": None,
+                    "body": b,
+                    "path": paths[i] if i < len(paths) else None,
+                }
                 for i, b in enumerate(tops)
             ],
         },
@@ -1396,12 +1445,60 @@ def test_the_live_read_carries_commit_parents_and_finds_a_late_review(monkeypatc
     )
     got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
     assert got["status"] == "ok", got
-    assert got["commits"] == [{"sha": H4, "parents": []}, {"sha": H5, "parents": [H4]}]
+    assert got["commits"] == [
+        {"sha": H4, "parents": [], "tree": None, "committed_at": None},
+        {"sha": H5, "parents": [H4], "tree": None, "committed_at": None},
+    ]
     assert got["count"] == 0, got
     assert [(f["head"], f["keys"], f["round_head"]) for f in got["findings"]] == [
         (H4, ["c900"], None)
     ]
     assert " parents(first: 100) { totalCount nodes { oid } }" in " ".join(serve.seen[0])
+
+
+def test_the_live_read_carries_trees_times_and_comment_paths(monkeypatch):
+    """End to end through the GraphQL read: each tree and its time reach the
+    result, and each finding says whether its file is in the changed files."""
+    _no_seams(monkeypatch)
+    p1 = "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange)</sub></sub>  Broken**"
+    serve = _graphql_server(
+        reviews=[
+            _gql_timed_review(
+                H5,
+                "2026-10-05T01:00:00Z",
+                login="chatgpt-codex-connector",
+                body="",
+                tops=[p1, p1, p1, p1],
+                # A path GitHub would not send is no path.
+                paths=["src/x.py", "docs/elsewhere.md", 5, ""],
+            )
+        ],
+        files=_FILES,
+        commits=_linear_commits(H4, H5, facts=True),
+    )
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert got["commits"] == [
+        {
+            "sha": H4,
+            "parents": [],
+            "tree": _tree_of(H4),
+            "committed_at": "2026-10-04T00:00:00+00:00",
+        },
+        {
+            "sha": H5,
+            "parents": [H4],
+            "tree": _tree_of(H5),
+            "committed_at": "2026-10-04T01:00:00+00:00",
+        },
+    ]
+    assert all(row["tree"] != row["sha"] for row in got["commits"])
+    assert got["count"] == 1
+    assert got["findings"][0]["blocking"] == [True, True, True, True]
+    assert got["findings"][0]["off_diff"] == [False, True, None, None]
+    query = " ".join(serve.seen[0])
+    assert "committedDate tree { oid }" in query
+    assert "replyTo { id } body path" in query
 
 
 def test_a_commit_node_without_its_parents_is_malformed(monkeypatch):

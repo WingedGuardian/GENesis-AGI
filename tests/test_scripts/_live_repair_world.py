@@ -10,6 +10,7 @@ in this directory's conftest.py.
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import json
 import os
@@ -34,7 +35,18 @@ KIT_FILES = (
     "deploy_checkout.sh",
     "deploy_marker.sh",
     "alert_queue.sh",
+    "live_move_boot.py",
 )
+
+
+@functools.cache
+def _installer():
+    """scripts/lib/live_repair_kit.py, loaded by path (it is run as a script)."""
+    spec = importlib.util.spec_from_file_location("_live_repair_kit", LIB / "live_repair_kit.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _git_env(home: Path | None = None) -> dict[str, str]:
@@ -74,8 +86,14 @@ def _write(root: Path, files: dict[str, str | None]) -> None:
 #: sides): it records its argv, whether the fd it was handed is update.lock and
 #: can be held exclusive through (the engine's require_update_lock), and whether
 #: the ephemeral pattern came with it; it sleeps SPY_SLEEP seconds first and
-#: exits SPY_RC.
-SPY = """import fcntl, json, os, sys, time
+#: exits SPY_RC. SPY_PIDFILE: its pid is appended there first; SPY_FORK: a
+#: grandchild sleeping that long keeps its stdout open (a boot deadline's case).
+SPY = """import fcntl, json, os, subprocess, sys, time
+if os.environ.get("SPY_PIDFILE"):
+    with open(os.environ["SPY_PIDFILE"], "a") as fh:
+        fh.write(str(os.getpid()) + "\\n")
+if os.environ.get("SPY_FORK"):
+    subprocess.Popen(["sleep", os.environ["SPY_FORK"]])
 time.sleep(float(os.environ.get("SPY_SLEEP", "0")))
 fd = int(os.environ.get("DEPLOY_CANDIDATES_LOCK_FD", "-1"))
 lock = os.path.join(os.environ["HOME"], ".genesis", "locks", "update.lock")
@@ -184,13 +202,18 @@ class World:
         kit.mkdir(parents=True, exist_ok=True)
         for name in KIT_FILES:
             shutil.copy2(LIB / name, kit / name)
+        # KIT.json as the installer writes it, through its own hasher (#3492 D2a).
+        (kit / "KIT.json").write_text(json.dumps(_installer().describe(str(kit), KIT_FILES)))
         return kit
 
     def repair(
         self, *args: str, mode: str = "--command", **env: str
     ) -> subprocess.CompletedProcess:
+        # At boot the installed kit runs, as the unit runs it (#3492 D2a-2): its
+        # self-check reads the KIT.json beside it, which scripts/lib has not.
+        module = self.kit() / MODULE.name if mode == "--boot" else MODULE
         return subprocess.run(
-            ["python3", "-I", "-S", str(MODULE), mode, str(self.state), str(self.root), *args],
+            ["python3", "-I", "-S", "-B", str(module), mode, str(self.state), str(self.root), *args],
             capture_output=True,
             text=True,
             env=self.env(**env),

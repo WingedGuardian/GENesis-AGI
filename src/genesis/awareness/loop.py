@@ -33,6 +33,7 @@ from genesis.awareness.signals import SignalCollector, collect_all
 from genesis.awareness.types import Depth, TickResult
 from genesis.cc.constants import RATE_LIMIT_DEFERRAL_TTL_S
 from genesis.db.crud import awareness_ticks, observations
+from genesis.infra_profile import cgroup_io as _cgroup_io
 from genesis.infra_profile.codebase_mcp import SLUG as _CODEBASE_MCP_SLUG
 from genesis.infra_profile.codebase_mcp import needs_setup as codebase_mcp_needs_setup
 from genesis.infra_profile.store import load_profile
@@ -722,11 +723,16 @@ _INFRA_POSTURE_DETAIL = {
         "the infrastructure profile, so after either fix take a refresh "
         "(`infrastructure_profile(refresh=true)`)"
     ),
+    _cgroup_io.SLUG: _cgroup_io.warning_detail(),
 }
 
 # Slugs that are a developer-tooling gap rather than a crash-resilience one, so
 # the alert's crash-resilience trailer does not claim otherwise for them.
 _INFRA_POSTURE_TOOLING_SLUGS = frozenset({_CODEBASE_MCP_SLUG})
+
+# Slugs for a resource setting that has no effect on this install: advisory,
+# and not a crash-resilience gap either.
+_INFRA_POSTURE_INERT_SLUGS = frozenset({_cgroup_io.SLUG})
 
 
 def _codebase_mcp_could_alert(section: dict) -> bool:
@@ -920,6 +926,11 @@ def _infra_missing_protections(profile: dict) -> list[str]:
             missing.append("cc_tmp_apply_blocked_on_cc")
         else:
             missing.append("cc_tmp_shared_fs")
+    # IOWeight-family settings Genesis puts on user units and scopes, with no io
+    # controller for the user manager to apply them: systemd accepts and
+    # ignores them silently. Explicit False only (None/absent = unread).
+    if _facts("storage").get("user_manager_io_delegated") is False and _cgroup_io.SETTERS:
+        missing.append(_cgroup_io.SLUG)
     # Graph engine. An unselected engine (no unit, so the shipped falkordb
     # default reads quietly from NetworkX; or an overlay pinning networkx) stays
     # silent when disabled or stopped — alerting there would fire on every
@@ -1004,7 +1015,10 @@ async def _check_infra_protection_posture(db) -> None:
     """Alert when a memory-, network-, or storage-plane protection is missing or the profile is stale.
 
     One 'high' infrastructure_alert (dashboard + morning report; the WS-2 M10
-    reconciler absorbs it into the durable open-set) describing the CURRENT
+    reconciler absorbs it into the durable open-set), or one 'low' informational
+    note when every finding is a setting with no effect here
+    (_INFRA_POSTURE_INERT_SLUGS; dashboard only, the morning report reads
+    critical/high/medium), describing the CURRENT
     posture. Invariant: at most one open row for this source — a posture
     change supersedes the previous row (same "exactly one active alert = the
     current state" pattern as deploy staleness). A stale profile (>3d; refresh
@@ -1022,6 +1036,7 @@ async def _check_infra_protection_posture(db) -> None:
         if age_days is None:
             return  # no usable collected_at stamp — cannot assert anything
         collected_at = profile.get("collected_at")
+        priority = "high"
 
         if age_days > _INFRA_PROFILE_STALE_DAYS:
             key = "profile_stale"
@@ -1036,22 +1051,39 @@ async def _check_infra_protection_posture(db) -> None:
         else:
             missing = _infra_missing_protections(profile)
             unverifiable = _infra_unverifiable_planes(profile)
+            # Informational notes are not posture: with only notes left they
+            # must not decide between hold and replace, or an unverifiable
+            # plane's open high alert would be superseded by a low note.
+            real = [slug for slug in missing if slug not in _INFRA_POSTURE_INERT_SLUGS]
+            if not real and unverifiable:
+                # A plane with retained-but-unverifiable facts: neither
+                # alarm nor all-clear — hold the current state until the
+                # section collector recovers.
+                return
             if not missing:
-                if unverifiable:
-                    # A plane with retained-but-unverifiable facts: neither
-                    # alarm nor all-clear — hold the current state until the
-                    # section collector recovers.
-                    return
                 await _resolve_infra_protection_posture(db)
                 return
             key = ",".join(missing)
             details = "; ".join(f"[{slug}] {_INFRA_POSTURE_DETAIL[slug]}" for slug in missing)
-            content = (
-                f"Infra protection posture: {len(missing)} protection(s) "
-                f"missing on this install (profile collected {collected_at}): "
-                f"{details}."
-            )
-            if any(slug not in _INFRA_POSTURE_TOOLING_SLUGS for slug in missing):
+            # Informational findings alone are a low note, never the high
+            # alert (the deploy-staleness informational-class pattern). Any
+            # other finding beside them keeps the row high.
+            if set(missing) <= _INFRA_POSTURE_INERT_SLUGS:
+                priority = "low"
+                content = (
+                    f"Infra posture note (informational, profile collected "
+                    f"{collected_at}): {details}."
+                )
+            else:
+                content = (
+                    f"Infra protection posture: {len(missing)} protection(s) "
+                    f"missing on this install (profile collected {collected_at}): "
+                    f"{details}."
+                )
+            if any(
+                slug not in _INFRA_POSTURE_TOOLING_SLUGS | _INFRA_POSTURE_INERT_SLUGS
+                for slug in missing
+            ):
                 content += (
                     " Each missing protection removes a crash-resilience "
                     "guarantee this box relies on (2026-07 incident class)."
@@ -1061,6 +1093,12 @@ async def _check_infra_protection_posture(db) -> None:
                 content += (
                     f" {', '.join(tooling)}: a developer-tooling gap, not a "
                     f"crash-resilience one."
+                )
+            inert = [slug for slug in missing if slug in _INFRA_POSTURE_INERT_SLUGS]
+            if inert and priority == "high":
+                content += (
+                    f" {', '.join(inert)}: informational, a setting with no effect "
+                    f"here, not a missing protection."
                 )
             if unverifiable:
                 content += (
@@ -1093,7 +1131,7 @@ async def _check_infra_protection_posture(db) -> None:
             source=_INFRA_POSTURE_SOURCE,
             type="infrastructure_alert",
             content=content,
-            priority="high",
+            priority=priority,
             created_at=datetime.now(UTC).isoformat(),
             content_hash=content_hash,
             skip_if_duplicate=True,
@@ -1101,7 +1139,8 @@ async def _check_infra_protection_posture(db) -> None:
         _last_infra_posture_alert_at = now
         _last_infra_posture_key = key
         if created is not None:
-            logger.warning("Infra protection posture alert: %s", key)
+            logger.warning("Infra protection posture %s (%s): %s",
+                           "note" if priority == "low" else "alert", priority, key)
     except Exception:
         logger.debug("Failed infra protection posture check", exc_info=True)
 
@@ -1846,8 +1885,21 @@ _DEPLOY_REPAIR_CLASSES = frozenset(
         "live_repair_refused",
         "live_repair_hooks_pending",
         "live_repair_hooks_saved",
+        "live_repair_kit",
     }
 )
+#: What each live_repair_kit finding means (deploy_health._KIT_FINDINGS).
+_DEPLOY_KIT_STATES = {
+    "missing": "is not installed (no `current` link, or a dangling one), so genesis-server "
+    "starts without its boot repair",
+    "partial": "is missing files its KIT.json lists, so the boot repair may not run",
+    "corrupt": "holds a file that differs from what was installed (or no valid KIT.json), "
+    "so the boot repair may fail or run code nobody installed",
+    "foreign": "is not the installer's (its `current` is not a link into live-repair.d), "
+    "yet the boot repair runs whatever it holds",
+    "stale": "is not the deploy checkout's HEAD (a pull no install followed, or a rollback "
+    "past it), so the boot repair runs other code than the checkout's",
+}
 #: Classes that alone are routine (a medium observation, not a blocker).
 _DEPLOY_INFORMATIONAL_CLASSES = frozenset({"behind_upstream", "live_repair_unread_older"})
 
@@ -1869,6 +1921,8 @@ def _deploy_repair_identity(repairs: dict) -> str:
     for key in ("hooks_pending", "hooks_saved"):  # only when set: a deploy must not
         if repairs.get(key):  # re-raise every standing alert
             named[key] = repairs[key]
+    if repairs.get("kit") in _DEPLOY_KIT_STATES:  # the kit finding, as above
+        named["kit"] = repairs["kit"]
     return hashlib.sha256(json.dumps(named, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
@@ -1961,6 +2015,16 @@ def _deploy_repair_paragraph(repairs: dict) -> str:
             "The last live-move repair did not finish (it was killed partway, or its "
             "REPAIR.json under ~/.genesis/deploy-backups/ names the reason); "
             "scripts/deploy_candidates repair-move runs it again."
+        )
+    kit = repairs.get("kit")
+    if kit in _DEPLOY_KIT_STATES:
+        parts.append(
+            "The live-move repair kit under ~/.genesis/lib/live-repair/ (what heals a "
+            f"half-written `live` checkout at boot, and what repair-move runs) {_DEPLOY_KIT_STATES[kit]}."
+            " To reinstall it from the deploy checkout's HEAD: python3 -I -S "
+            "<repo>/scripts/lib/live_repair_kit.py install <repo> <home> (<repo> the deploy "
+            "checkout, <home> the HOME holding ~/.genesis); bootstrap.sh and "
+            "deploy_code_only.sh run the same install."
         )
     return " ".join(parts)
 
@@ -3956,6 +4020,9 @@ async def perform_tick(
                         # Recent: 27.0/day") so downstream consumers can't misread
                         # a symmetric deviation score's direction.
                         **({"baseline_note": s.baseline_note} if s.baseline_note else {}),
+                        # Additive: a collector's stub reading on error. Without
+                        # it a later comparison reads the stub as a real value.
+                        **({"failed": True} if s.failed else {}),
                     }
                     for s in signals
                 ]

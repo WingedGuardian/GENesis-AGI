@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
@@ -85,3 +85,45 @@ async def count(
     cursor = await db.execute(sql, params)
     row = await cursor.fetchone()
     return row[0] if row else 0
+
+
+async def tick_written_before(
+    db: aiosqlite.Connection,
+    depth: str,
+    at: str,
+    *,
+    window_seconds: float = 60.0,
+    exclude_tick_id: str | None = None,
+) -> str | None:
+    """The tick_id of the one ``depth`` corpus row written at or up to
+    ``window_seconds`` before ``at`` (an ISO UTC timestamp).
+
+    A reflection writes its corpus row just before the summary observation it
+    produces (0.00-0.26 s apart on the newest 10 Light runs, measured
+    2026-11-11), so this finds the run behind a given observation. A row
+    written after the observation belongs to a later run (one whose output
+    failed to parse writes a row and no observation) and is never picked.
+    Returns None when no row is in the window or ``at`` does not parse, and
+    when more than one run has a row there: two overlapping reflections can
+    write their rows in either order around one's output, so which run is
+    behind ``at`` cannot be told (no two Light rows fell within 120 s of each
+    other in 517, measured 2026-11-12).
+    """
+    try:
+        upper = datetime.fromisoformat(at).astimezone(UTC)
+    except (TypeError, ValueError):
+        return None
+    lower = upper - timedelta(seconds=window_seconds)
+    fmt = "%Y-%m-%dT%H:%M:%S.%f+00:00"
+    sql = (
+        "SELECT DISTINCT tick_id FROM reflection_corpus WHERE depth = ? "
+        "AND created_at <= ? AND created_at >= ? AND tick_id IS NOT NULL"
+    )
+    params: list = [depth, upper.strftime(fmt), lower.strftime(fmt)]
+    if exclude_tick_id is not None:
+        sql += " AND tick_id != ?"
+        params.append(exclude_tick_id)
+    sql += " LIMIT 2"
+    cursor = await db.execute(sql, params)
+    rows = await cursor.fetchall()
+    return rows[0][0] if len(rows) == 1 else None

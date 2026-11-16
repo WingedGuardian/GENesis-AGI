@@ -1,0 +1,1 @@
+- `--check-pr` now prints an advisory note when a pull request's commits since its last review changed no file (a message-only rewrite or an empty commit, including under a later merge of main), so a "fixed" claim on such a push is not taken on trust.

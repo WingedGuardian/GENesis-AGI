@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
-from genesis.awareness.signal_format import format_signals
+from genesis.awareness.signal_format import LIGHT_HIDDEN_SIGNALS, format_signals
 from genesis.awareness.types import Depth, TickResult
 from genesis.db.crud import cognitive_state, observations, signal_weights
 from genesis.identity.loader import IdentityLoader
@@ -181,6 +181,8 @@ class ContextAssembler:
         excluded_signals: set[str] | None = None
         if depth == Depth.MICRO:
             excluded_signals = await micro_excluded_signals(db) or None
+        elif depth == Depth.LIGHT:
+            excluded_signals = set(LIGHT_HIDDEN_SIGNALS)
 
         # For Light reflections, filter out zero-value bootstrap placeholder signals
         _min_val = 0.001 if depth == Depth.LIGHT else 0.0
