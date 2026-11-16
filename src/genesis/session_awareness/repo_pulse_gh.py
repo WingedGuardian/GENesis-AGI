@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 
 from genesis.env import repo_root
@@ -568,6 +569,33 @@ async def read_queue_pr_mergeability(
     if value not in {"MERGEABLE", "CONFLICTING", "UNKNOWN"}:
         return {"error": f"mergeability reread returned invalid value: {value[:120]}"}
     return {"mergeable": value}
+
+
+async def read_queue_pr_identity(
+    repo: str, number: int, *, runner: Runner | None = None
+) -> dict:
+    """Read the live head and update timestamp around a gate report."""
+    run = runner or _default_runner
+    try:
+        rc, out, err = await run([
+            "gh", "pr", "view", str(number), "--repo", repo,
+            "--json", "headRefOid,updatedAt",
+        ])
+    except Exception as exc:
+        return {"error": f"PR identity read failed: {exc}"}
+    if rc:
+        return {"error": f"PR identity read failed (rc={rc}): {err.strip()[:400]}"}
+    try:
+        data = json.loads(out)
+    except (TypeError, ValueError) as exc:
+        return {"error": f"PR identity response is malformed: {exc}"}
+    head = data.get("headRefOid") if isinstance(data, dict) else None
+    updated = data.get("updatedAt") if isinstance(data, dict) else None
+    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head):
+        return {"error": "PR identity response has a missing or malformed head SHA"}
+    if not isinstance(updated, str) or not updated:
+        return {"error": "PR identity response has a missing or malformed updatedAt"}
+    return {"head_sha": head, "updated_at": updated}
 
 
 # Full-history fields for the zero-drop branch join (session-awareness

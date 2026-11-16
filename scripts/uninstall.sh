@@ -559,6 +559,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
                     genesis-cc-settings-align.timer genesis-cc-settings-align.service \
                     genesis-graph-project.timer genesis-graph-project.service \
+                    genesis-pr-queue-sweep.timer genesis-pr-queue-sweep.service \
                     genesis-code-intel.timer genesis-code-intel.service \
                     genesis-star-milestone.timer genesis-star-milestone.service \
                     genesis-browser-stack.timer genesis-browser-stack.service \

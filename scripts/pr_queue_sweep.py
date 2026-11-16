@@ -140,6 +140,48 @@ def _gate_report(
     return report, None
 
 
+def _gate_pin(report: dict) -> str | None:
+    if report.get("verdict_kind") != "MERGEABLE":
+        return None
+    rows = report.get("rows")
+    value = next(
+        (row for name, row in rows.items() if name.casefold() == "merge-with"),
+        None,
+    ) if isinstance(rows, dict) else None
+    if not isinstance(value, str):
+        return None
+    pins = re.findall(r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])", value)
+    return pins[0] if len(pins) == 1 else None
+
+
+def _gate_identity_error(report: dict, listed_head: str, listed_updated: str,
+                         before: dict, after: dict) -> str | None:
+    rows = report.get("rows")
+    head_check = next(
+        (value for name, value in rows.items() if name.casefold() == "codex-at-head"),
+        "",
+    ) if isinstance(rows, dict) else ""
+    if isinstance(head_check, str) and (
+        "head moved" in head_check.casefold() or "could not be re-read" in head_check.casefold()
+    ):
+        return f"gate reported an untrusted head check: {head_check}"
+    pin = _gate_pin(report)
+    if report.get("verdict_kind") == "MERGEABLE" and pin is None:
+        return "clean gate output lacks a complete merge-with head pin"
+    for label, snapshot in (("before", before), ("after", after)):
+        if not isinstance(snapshot, dict) or snapshot.get("error"):
+            detail = snapshot.get("error", "invalid response") if isinstance(snapshot, dict) else "invalid response"
+            return f"{label} PR identity read failed: {detail}"
+        head, updated = snapshot.get("head_sha"), snapshot.get("updated_at")
+        if not isinstance(head, str) or not isinstance(updated, str):
+            return f"{label} PR identity is incomplete"
+        if head.casefold() != listed_head.casefold() or updated != listed_updated:
+            return f"{label} PR identity differs from the listed head or updatedAt"
+    if pin and pin.casefold() != before["head_sha"].casefold():
+        return "gate merge-with pin does not match the stable PR head"
+    return None
+
+
 def _api_pr(raw: dict, old: dict | None) -> dict:
     errors = []
     number = raw["number"]
@@ -273,7 +315,23 @@ async def _read_state_comments(pr: dict, repo: str, runner, now: datetime) -> No
             continue
         created = comment.get("createdAt")
         for key, heading in (("rework", "## Rework spec"), ("parked", "## Parked")):
-            if not _comment_heading(comment.get("body"), heading):
+            body = comment.get("body")
+            if key == "rework":
+                if not isinstance(body, str):
+                    error = "maintainer rework comment body is malformed"
+                    pr["errors"].append(f"comment read failed: {error}")
+                    pr["comment_read_error"] = error
+                    return
+                try:
+                    matched = guard._rework_heading_comment(body, "rework spec")
+                except guard._ReworkUnreadable as exc:
+                    error = f"maintainer rework comment is unreadable: {exc}"
+                    pr["errors"].append(f"comment read failed: {error}")
+                    pr["comment_read_error"] = error
+                    return
+            else:
+                matched = _comment_heading(body, heading)
+            if not matched:
                 continue
             parsed = _parse_time(created)
             if parsed is None:
@@ -576,7 +634,11 @@ def _render_markdown(data: dict, now: datetime) -> str:
 def _replace_link(path: Path, target: str) -> None:
     temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     temp.symlink_to(target)
-    os.replace(temp, path)
+    try:
+        os.replace(temp, path)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
 
 
 def _switch_current(root: Path, generation: str) -> None:
@@ -786,13 +848,26 @@ async def _sweep(
         if not re.fullmatch(r"[0-9a-fA-F]{40}", pr.get("head_sha") or ""):
             pr["report_error"] = "gate report cannot be tied to a valid listed head SHA"
             continue
+        before = await repo_pulse_gh.read_queue_pr_identity(repo, pr["number"], runner=runner)
         result = await _run_gate(pr["number"], repo)
+        read_at = _stamp(clock())
         report, error = _gate_report(
-            pr["head_sha"], pr["updated_at"], _stamp(clock()), result
+            pr["head_sha"], pr["updated_at"], read_at, result
+        )
+        pin = _gate_pin(report)
+        if pin:
+            report["reported_head_sha"] = pin
+        elif not before.get("error"):
+            report["reported_head_sha"] = before["head_sha"]
+        if not before.get("error"):
+            report["reported_updated_at"] = before["updated_at"]
+        after = await repo_pulse_gh.read_queue_pr_identity(repo, pr["number"], runner=runner)
+        identity_error = _gate_identity_error(
+            report, pr["head_sha"], pr["updated_at"], before, after
         )
         pr["report_attempt"] = report
-        if error:
-            pr["report_error"] = error
+        if error or identity_error:
+            pr["report_error"] = "; ".join(value for value in (error, identity_error) if value)
         else:
             pr["gate"] = report
             pr["report_error"] = None

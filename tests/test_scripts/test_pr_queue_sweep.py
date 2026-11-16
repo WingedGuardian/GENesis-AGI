@@ -69,10 +69,13 @@ def _comments(comments):
 def _runner(
     prs, *, comments=None, mergeability=None, fail_listing=False,
     repo_name="o/r", repo_url="https://github.com/o/r", comment_error=(),
+    identity_reads=None,
 ):
     calls = []
     comments = comments or {}
     mergeability = mergeability or {}
+    identity_reads = identity_reads or {}
+    identity_positions = {}
 
     async def run(argv):
         calls.append(argv)
@@ -80,6 +83,24 @@ def _runner(
             return 0, repo_name + "\n", ""
         if argv[1] == "pr":
             number = int(argv[3])
+            fields = argv[argv.index("--json") + 1]
+            if fields == "headRefOid,updatedAt":
+                snapshots = identity_reads.get(number)
+                if snapshots is None:
+                    row = next(pr for pr in prs if pr["number"] == number)
+                    snapshots = [{
+                        "head_sha": row["headRefOid"],
+                        "updated_at": row["updatedAt"],
+                    }]
+                index = identity_positions.get(number, 0)
+                identity_positions[number] = index + 1
+                snapshot = snapshots[min(index, len(snapshots) - 1)]
+                if "error" in snapshot:
+                    return 1, "", snapshot["error"]
+                return 0, json.dumps({
+                    "headRefOid": snapshot["head_sha"],
+                    "updatedAt": snapshot["updated_at"],
+                }), ""
             return 0, mergeability.get(number, "UNKNOWN") + "\n", ""
         if argv[1] == "api":
             query = next(arg for arg in argv if arg.startswith("query="))
@@ -98,9 +119,10 @@ def _runner(
     return run, calls
 
 
-def _install_fake_gate(tmp_path, monkeypatch, *, fail=(), blocked=()):
+def _install_fake_gate(tmp_path, monkeypatch, *, fail=(), blocked=(), pins=None, moved=()):
     script = tmp_path / "fake-gate.py"
     calls = tmp_path / "gate-calls"
+    pins = pins or {}
     ok = [
         "mergeable      : MERGEABLE", "ci             : green",
         "base-branch    : ok (default)", "pin-receipts   : ok (current)",
@@ -108,15 +130,37 @@ def _install_fake_gate(tmp_path, monkeypatch, *, fail=(), blocked=()):
         "rounds         : 1/5", "scheduled-claude: ok (at head)",
         "review-body    : ok", "inline-findings: ok (P2s: 0, P3s: 0)",
         "main-reverts   : advisory — clean", "rework         : ok (current)",
+        "merge-with     : __PIN__",
     ]
-    blocked_rows = ok.copy()
+    blocked_rows = [row for row in ok if not row.startswith("merge-with")]
     blocked_rows[8] = "review-body    : BLOCK — unanswered"
     blocked_rows[9] = "inline-findings: BLOCK — score 1.0"
     def emit(rows, verdict):
-        return [f"print({row!r})" for row in rows] + [f"print({verdict!r})"]
+        output = []
+        for row in rows:
+            if row.startswith("merge-with"):
+                output.append(
+                    "pin = pins.get(n, format(n, '040x'))\n"
+                    "if isinstance(pin, list):\n"
+                    " index = pin_indexes.get(n, 0)\n"
+                    " pin_indexes[n] = index + 1\n"
+                    " pin = pin[min(index, len(pin) - 1)]\n"
+                    "print('merge-with     : --match-head-commit ' + pin)"
+                )
+            elif row.startswith("codex-at-head"):
+                output.append(
+                    f"print('codex-at-head  : ok; HEAD MOVED after gate verification' "
+                    f"if n in moved else {row!r})"
+                )
+            else:
+                output.append(f"print({row!r})")
+        return output + [f"print({verdict!r})"]
     lines = [
         "from pathlib import Path", "import sys",
         "n = int(sys.argv[sys.argv.index('--check-pr') + 1])",
+        f"pins = {dict(pins)!r}",
+        "pin_indexes = {}",
+        f"moved = {set(moved)!r}",
         f"Path({str(calls)!r}).open('a').write(str(n) + '\\n')",
         f"if n in {set(fail)!r}:", " print('verdict        : malformed')", " sys.exit(2)",
         f"if n in {set(blocked)!r}:",
@@ -136,6 +180,95 @@ def _load(root):
 def _canonical(monkeypatch):
     monkeypatch.setattr(sweep.guard, "_canonical_public_repo", lambda: "o/r")
     monkeypatch.setattr(sweep, "UNKNOWN_REREAD_DELAY", 0)
+
+
+@pytest.mark.asyncio
+async def test_gate_report_for_moved_head_is_preserved_but_untrusted(tmp_path, monkeypatch):
+    _canonical(monkeypatch)
+    old = _pr(1)
+    new_head = "b" * 40
+    _install_fake_gate(tmp_path, monkeypatch, pins={1: new_head})
+    runner, _ = _runner([old], identity_reads={1: [
+        {"head_sha": old["headRefOid"], "updated_at": old["updatedAt"]},
+        {"head_sha": new_head, "updated_at": "2026-11-11T00:00:00Z"},
+    ]})
+
+    assert await sweep._sweep(tmp_path / "state", runner=runner, now=NOW) == 0
+
+    pr = _load(tmp_path / "state")["prs"][0]
+    assert pr["report_attempt"]["reported_head_sha"] == new_head
+    assert pr["report_attempt"]["read_at"] == sweep._stamp(NOW)
+    assert "merge-with" in pr["report_attempt"]["stdout"]
+    assert pr["report_status"] == "error"
+    assert pr["readiness_status"] == "unknown"
+    assert pr["state"] == "blocked"
+    assert pr["gate"] is None
+
+
+@pytest.mark.asyncio
+async def test_gate_head_moved_row_is_untrusted_even_when_verdict_passes(tmp_path, monkeypatch):
+    _canonical(monkeypatch)
+    _install_fake_gate(tmp_path, monkeypatch, moved={1})
+    runner, _ = _runner([_pr(1)])
+
+    assert await sweep._sweep(tmp_path / "state", runner=runner, now=NOW) == 0
+
+    pr = _load(tmp_path / "state")["prs"][0]
+    assert "HEAD MOVED" in pr["report_attempt"]["stdout"]
+    assert pr["report_attempt"]["verdict_kind"] == "MERGEABLE"
+    assert pr["report_status"] == "error"
+    assert pr["readiness_status"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_gate_identity_read_failure_never_marks_pr_ready(tmp_path, monkeypatch):
+    _canonical(monkeypatch)
+    _install_fake_gate(tmp_path, monkeypatch)
+    listed = _pr(1)
+    runner, _ = _runner([listed], identity_reads={1: [
+        {"error": "identity API unavailable"},
+        {"head_sha": listed["headRefOid"], "updated_at": listed["updatedAt"]},
+    ]})
+
+    assert await sweep._sweep(tmp_path / "state", runner=runner, now=NOW) == 0
+
+    pr = _load(tmp_path / "state")["prs"][0]
+    assert "identity API unavailable" in pr["report_error"]
+    assert pr["report_status"] == "error"
+    assert pr["readiness_status"] == "unknown"
+    assert pr["state"] == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_identity_runner_timeout_is_published_as_per_pr_error(tmp_path, monkeypatch):
+    _canonical(monkeypatch)
+    _install_fake_gate(tmp_path, monkeypatch)
+    listed = _pr(1)
+    base_runner, _ = _runner([listed])
+
+    async def runner(argv):
+        if argv[1] == "pr" and argv[argv.index("--json") + 1] == "headRefOid,updatedAt":
+            raise TimeoutError("identity command timed out")
+        return await base_runner(argv)
+
+    assert await sweep._sweep(tmp_path / "state", runner=runner, now=NOW) == 0
+
+    pr = _load(tmp_path / "state")["prs"][0]
+    assert "identity command timed out" in pr["report_error"]
+    assert pr["readiness_status"] == "unknown"
+    assert pr["state"] == "blocked"
+
+
+def test_clean_gate_without_a_complete_pin_is_untrusted():
+    updated = "2026-11-10T00:00:00Z"
+    report, error = sweep._gate_report(
+        SHA, updated, sweep._stamp(NOW),
+        (0, "mergeable : MERGEABLE\nverdict : MERGEABLE (all gates pass)\n", "", None),
+    )
+    identity = {"head_sha": SHA, "updated_at": updated}
+
+    assert error is None
+    assert "pin" in sweep._gate_identity_error(report, SHA, updated, identity, identity)
 
 
 @pytest.mark.asyncio
@@ -194,13 +327,19 @@ def test_report_order_is_never_read_then_oldest_successful_read():
 @pytest.mark.asyncio
 async def test_changed_head_invalidates_report_and_pr_refresh_preserves_queue(tmp_path, monkeypatch):
     _canonical(monkeypatch)
-    calls = _install_fake_gate(tmp_path, monkeypatch)
+    old_head = _pr(2)["headRefOid"]
+    calls = _install_fake_gate(
+        tmp_path, monkeypatch,
+        pins={2: old_head},
+    )
     prs = [_pr(1), _pr(2)]
     runner, _ = _runner(prs)
     root = tmp_path / "state"
     assert await sweep._sweep(root, runner=runner, now=NOW) == 0
     old = _load(root)
     prs[1] = _pr(2, head="b" * 40)
+    fake_gate = Path(sweep.GUARD_PATH)
+    fake_gate.write_text(fake_gate.read_text().replace(old_head, "b" * 40))
 
     assert await sweep._sweep(
         root, runner=runner, forced_pr=2, now=NOW + timedelta(hours=1)
@@ -256,7 +395,10 @@ async def test_unknown_mergeability_is_reread_once_and_gate_errors_are_published
 
     assert await sweep._sweep(root, runner=runner, now=NOW) == 0
     out = _load(root)
-    assert sum(argv[1] == "pr" and argv[2] == "view" for argv in calls) == 1
+    assert sum(
+        argv[1] == "pr" and argv[argv.index("--json") + 1] == "mergeable"
+        for argv in calls
+    ) == 1
     assert out["prs"][0]["mergeable"] == "UNKNOWN"
     assert out["prs"][0]["conflict_files"] == []
     assert out["prs"][0]["state"] == "blocked"
@@ -456,6 +598,59 @@ async def test_named_labels_comments_and_parked_warning(tmp_path, monkeypatch):
     assert "parked comment age" in markdown and "no maintainer" in markdown
 
 
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("(aside)\n\n## Rework spec\nDo it", "rework-specced"),
+        ("## Rework spec: v2\nDo it", "rework-specced"),
+        ("## Rework spec draft\nDo it", "rework-unspecced"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_rework_comment_classification_uses_gate_parser(
+    body, expected, tmp_path, monkeypatch
+):
+    _canonical(monkeypatch)
+    _install_fake_gate(tmp_path, monkeypatch)
+    runner, _ = _runner(
+        [_pr(1, labels=("needs-rework",))],
+        comments={1: [{
+            "authorAssociation": "OWNER",
+            "body": body,
+            "createdAt": "2026-11-12T00:00:00Z",
+        }]},
+    )
+
+    assert await sweep._sweep(tmp_path / "state", runner=runner, now=NOW) == 0
+
+    assert _load(tmp_path / "state")["prs"][0]["state"] == expected
+
+
+@pytest.mark.asyncio
+async def test_unreadable_rework_comment_parser_is_a_per_pr_error(tmp_path, monkeypatch):
+    _canonical(monkeypatch)
+    _install_fake_gate(tmp_path, monkeypatch)
+
+    def unreadable(*args, **kwargs):
+        raise sweep.guard._ReworkUnreadable("fixture parser failure")
+
+    monkeypatch.setattr(sweep.guard, "_rework_heading_comment", unreadable)
+    runner, _ = _runner(
+        [_pr(1, labels=("needs-rework",))],
+        comments={1: [{
+            "authorAssociation": "OWNER",
+            "body": "## Rework spec\nDo it",
+            "createdAt": "2026-11-12T00:00:00Z",
+        }]},
+    )
+
+    assert await sweep._sweep(tmp_path / "state", runner=runner, now=NOW) == 0
+
+    pr = _load(tmp_path / "state")["prs"][0]
+    assert "fixture parser failure" in pr["comment_read_error"]
+    assert pr["readiness_status"] == "unknown"
+
+
 def test_show_prints_cached_age_without_reading_github(tmp_path, monkeypatch, capsys):
     root = tmp_path / "pr_queue"
     data = {
@@ -640,6 +835,21 @@ q._publish(Path(sys.argv[2]), json.loads(sys.argv[3]), q.datetime.now(q.UTC))
     assert child.returncode == -9
     assert _load(root) == old
     assert "Read: 0 of 0 open PRs" in (root / "worklist.md").read_text()
+
+
+def test_replace_link_cleans_temp_symlink_when_replace_fails(tmp_path, monkeypatch):
+    link = tmp_path / "current"
+    link.symlink_to("old-generation")
+
+    def fail_replace(source, destination):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(sweep.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        sweep._replace_link(link, "new-generation")
+
+    assert os.readlink(link) == "old-generation"
+    assert not list(tmp_path.glob(".current.*.tmp"))
 
 
 def test_timer_is_hourly_persistent_and_uses_project_timeout():

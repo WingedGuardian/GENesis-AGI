@@ -391,3 +391,42 @@ async def test_queue_mergeability_reread_uses_shared_runner():
 
     assert out == {"mergeable": "CONFLICTING"}
     assert run.calls[0][:3] == ["gh", "pr", "view"]
+
+
+@pytest.mark.asyncio
+async def test_queue_pr_identity_reads_head_and_update_time_with_shared_runner():
+    calls = []
+
+    async def run(argv):
+        calls.append(argv)
+        return 0, json.dumps({
+            "headRefOid": "a" * 40,
+            "updatedAt": "2026-11-13T12:00:00Z",
+        }), ""
+
+    out = await gh.read_queue_pr_identity("o/r", 9, runner=run)
+
+    assert out == {"head_sha": "a" * 40, "updated_at": "2026-11-13T12:00:00Z"}
+    assert calls[0] == [
+        "gh", "pr", "view", "9", "--repo", "o/r", "--json", "headRefOid,updatedAt",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_queue_pr_identity_reports_malformed_api_facts():
+    async def run(argv):
+        return 0, json.dumps({"headRefOid": "short", "updatedAt": "2026-11-13T12:00:00Z"}), ""
+
+    out = await gh.read_queue_pr_identity("o/r", 9, runner=run)
+
+    assert "error" in out and "head SHA" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_queue_pr_identity_runner_exception_is_a_read_error():
+    async def run(argv):
+        raise TimeoutError("identity command timed out")
+
+    out = await gh.read_queue_pr_identity("o/r", 9, runner=run)
+
+    assert out == {"error": "PR identity read failed: identity command timed out"}
