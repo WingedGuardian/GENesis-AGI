@@ -727,7 +727,7 @@ closing session.
 
 ### 5. Sending a PR back
 
-Two triggers, two labels:
+Named states:
 
 - **A BROKEN premise, or a design question** → `needs-architecture-session`.
   This is the established disposition in "Some PRs are not
@@ -737,6 +737,13 @@ Two triggers, two labels:
   below with `needs-architecture-session`, and reuse that PR's decision
   follow-up (updating its text and work state) as the step-4 row below
   instead of opening a second one.
+- **The maintainer deliberately pauses work** → `parked`. Apply the label and
+  add a maintainer comment headed `## Parked` that gives the reason and the
+  condition for returning to the PR. The label without that comment is only a
+  warning; the queue worklist warns when the comment is missing and shows the
+  comment's age when present. Parked work does not wake automatically when its
+  return condition appears met: a maintainer decides when to resume it. The
+  sweep is read-only and never writes to GitHub.
 - **The owner decides a terminal round is rework** → `needs-rework`. The owner is
   present by definition, so this runs in the foreground:
   1. Open the `ready` follow-up FIRST (step 4 below). Then comment with the
@@ -995,10 +1002,30 @@ neither blocks opening).
 
 ## Working the queue
 
-1. List the open PRs — **completely**. `gh pr list` defaults to `--limit 30`, and
-   a listing whose result count equals its limit is a truncated read, not a
-   complete one. Pass a limit well above the queue size and reconcile the count
-   against an independent denominator before trusting it:
+1. Start EVERY pass by showing the cached queue worklist:
+
+   ```bash
+   python3 scripts/pr_queue_sweep.py --show
+   ```
+
+   Quote its `Generated` timestamp and `Cached worklist age`, plus `Read`
+   (`read`/`open_total`) and `limit_hit`. Treat this cached list as a lead, not
+   current gate evidence: use it to select work, then run the actual gate for
+   each selected non-draft PR before taking action:
+
+   ```bash
+   python3 scripts/hooks/git_push_guard.py --check-pr <N> --repo <owner>/<repo>
+   ```
+
+   Do not rely on a cached verdict as current, and do not rerun `--check-pr` for
+   every open PR on every pass.
+
+   If `--show` has no cached worklist, fails, reports `limit_hit=true`, has a
+   `read` count different from `open_total`, or reports another listing/read
+   error, use the complete GitHub listing fallback. `gh pr list` defaults to
+   `--limit 30`, and a listing whose result count equals its limit is truncated.
+   Pass a limit well above the queue size and reconcile it against an independent
+   denominator:
 
    ```bash
    gh pr list --state open --limit 200 --json number,title,isDraft | jq length
@@ -1014,16 +1041,17 @@ neither blocks opening).
    queue as a merge candidate — which GitHub will then refuse to merge. A draft
    is not a merge candidate until someone marks it ready; count it, list it,
    and keep it out of the closing set.
-   Re-reading the same capped list on every pass never discovers the remainder,
-   so the omitted PRs are neither checked nor weighed when sorting by cost — they
-   simply never enter the queue. Then `--check-pr` each one.
+   A partial cached list is not a complete queue; the fallback must finish
+   before choosing from the full set.
 2. **Sort by what is cheapest to close**, not by number. A PR blocked only on a
    stale review is minutes; one with a live P1 in a subsystem you have not read
    is not. Clearing the cheap ones first is what makes the rate.
 3. Batch what still needs the owner (step 4) where you can — one message
    covering three PRs costs the user one decision instead of three.
-4. Re-read the queue at the start of every pass. Never work from a remembered
-   list: another session may have opened, closed, or pushed to any of them.
+4. Never reuse a prior pass's selection. Each pass's current complete worklist
+   (or completed GitHub fallback) selects candidates, and the fresh gate check
+   above governs any action; another session may have opened, closed, or pushed
+   to any PR since the prior pass.
 5. **Triage every question before you ask it** (owner, 2026-10-28). A closing
    session that asks about everything stalls its queue, and one that guesses
    makes decisions nobody signed. Put each question in exactly ONE bucket first.
