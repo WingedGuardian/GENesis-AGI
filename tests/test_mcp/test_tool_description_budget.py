@@ -54,9 +54,12 @@ def _description_length(description: str) -> int:
     """Return CC's NFKC-normalized JavaScript ``String.length`` value.
 
     JavaScript counts UTF-16 code units, so a non-BMP character counts twice.
-    Count per character rather than encoding so a lone surrogate remains one
-    code unit, matching JavaScript instead of raising ``UnicodeEncodeError``.
+    Combine valid surrogate pairs before normalization; preserve lone
+    surrogates as individual code units, matching JavaScript strings.
     """
+    description = description.encode("utf-16-le", "surrogatepass").decode(
+        "utf-16-le", "surrogatepass"
+    )
     normalized = unicodedata.normalize("NFKC", description)
     return sum(2 if ord(char) > 0xFFFF else 1 for char in normalized)
 
@@ -117,6 +120,37 @@ def test_description_length_matches_client_utf16_units():
     assert _description_length("a" * 2045 + "…") == 2048
     assert _description_length("a" * 2046 + "…") == 2049
     assert _description_length("\ud800") == 1
+
+
+@pytest.mark.parametrize(
+    ("description", "expected"),
+    [
+        ("\ud835\udc00", 1),
+        ("a" * 2047 + "\ud835\udc00", 2048),
+        ("\ud835\udc00" * 2048, 2048),
+        ("\U0001d400", 1),
+        ("\ud83d\udca1", 2),
+        ("\ud800", 1),
+        ("\udc00", 1),
+        ("\udc00\ud800", 2),
+        ("\ud800a\udc00", 3),
+        ("\ud800\ud800", 2),
+    ],
+    ids=[
+        "normalized-pair",
+        "normalized-pair-at-cap",
+        "repeated-normalized-pairs",
+        "scalar-control",
+        "unchanged-pair",
+        "lone-high",
+        "lone-low",
+        "reversed-pair",
+        "interrupted-pair",
+        "two-high-surrogates",
+    ],
+)
+def test_description_length_preserves_javascript_surrogate_semantics(description, expected):
+    assert _description_length(description) == expected
 
 
 def test_unparseable_source_is_rejected(tmp_path: Path):
