@@ -29,6 +29,8 @@ UNIT_PREFIX = "genesis-builder-"
 
 #: Read from each tmux session's own environment (a peer's, never this process's).
 _KEY_VAR = "GENESIS_BUILDER_KEY"
+#: The builder's issue, pinned on the same session (spec E3c, cc-slot.sh launch).
+_ISSUE_VAR = "GENESIS_BUILDER_ISSUE"
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +97,30 @@ async def tmux_sessions() -> dict[str, str | None]:
         else:
             raise RuntimeError(f"tmux show-environment -t {name} failed (rc={rc}): {line[:200]}")
     return sessions
+
+
+async def session_issues(sessions: dict[str, str | None]) -> dict[str, int | None]:
+    """The issue pinned on each builder session (``GENESIS_BUILDER_ISSUE``, set
+    by the slot door beside the key), or None where it is missing. A session
+    that ended since *sessions* was read is left out; any other failure raises."""
+    out: dict[str, int | None] = {}
+    for name, key in sessions.items():
+        if not key:
+            continue
+        rc, env = await _exec(
+            ["tmux", "show-environment", "-t", f"={name}", _ISSUE_VAR], timeout=LOCAL_TIMEOUT_S
+        )
+        line = env.strip()
+        if rc == 0 and line.startswith(f"{_ISSUE_VAR}="):
+            value = line.split("=", 1)[1]
+            out[name] = int(value) if value.isdigit() else None
+        elif "unknown variable" in line or line == f"-{_ISSUE_VAR}":
+            out[name] = None
+        elif "can't find session" in line:
+            continue
+        else:
+            raise RuntimeError(f"tmux show-environment -t {name} failed (rc={rc}): {line[:200]}")
+    return out
 
 
 async def premise_rc(issue: int, repo: str) -> int:

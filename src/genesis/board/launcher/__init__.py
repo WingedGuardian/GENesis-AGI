@@ -44,7 +44,9 @@ Any failure to write, resolve or consume the row means no launch.
 Run state is derived: a live builder is a tmux session carrying
 ``GENESIS_BUILDER_KEY``; a finished one is an issue with an open closing PR
 (from the board read). A builder's issue is its card's on the same board read
-(the key starts with the card's item id), and a launch still starting is a live
+(the key starts with the card's item id; a builder whose card left the board
+reads its issue from its own ``builder_launched`` row and its PRs live), and a
+launch still starting is a live
 ``genesis-builder-*`` systemd unit, which systemd itself stops at
 ``RuntimeMaxSec``. ``board_events`` is the audit log and each move's outcome
 record; no row count decides capacity.
@@ -83,6 +85,7 @@ from genesis.board.launcher.probes import (  # noqa: E402
     mem_available_kb,
     premise_rc,
     run_launch,
+    session_issues,
     starting_units,
     stop_unit,
     tmux_sessions,
@@ -272,8 +275,11 @@ def _build_cards(items: list[dict]) -> list[dict]:
     return sorted(cards, key=lambda c: c["moved"] or datetime.max.replace(tzinfo=UTC))
 
 
-def _open_pr_numbers(items: list[dict], tracker: str) -> set[int]:
-    """Issues the board read shows with an open closing PR from this repo."""
+def _finished_numbers(items: list[dict], tracker: str) -> set[int]:
+    """Tracker issues whose builder is done on this read: CLOSED (its PR merged,
+    or it was closed by hand), or with an open closing PR from this repo. A
+    builder's session can outlive its PR, so an OPEN-PR rule alone would count a
+    merged build busy again."""
     out = set()
     for it in items:
         content = it.get("content") or {}
@@ -281,6 +287,9 @@ def _open_pr_numbers(items: list[dict], tracker: str) -> set[int]:
             continue
         if ((content.get("repository") or {}).get("nameWithOwner") or "").lower() != tracker:
             continue  # another repo's issue N says nothing about tracker issue N
+        if content.get("state") == "CLOSED":
+            out.add(content.get("number"))
+            continue
         nodes = (content.get("closedByPullRequestsReferences") or {}).get("nodes") or []
         if any(
             n
@@ -293,25 +302,32 @@ def _open_pr_numbers(items: list[dict], tracker: str) -> set[int]:
     return out
 
 
-def _item_issues(items: list[dict], tracker: str) -> dict[str, int]:
-    """Project item id -> issue number, for the tracker's issue cards on this read.
-    A builder key is ``<item>@<Status updatedAt>``, so a live builder's issue is
-    its card's; a builder whose card left the board maps to nothing and holds a
-    place (fail closed)."""
-    out = {}
-    for it in items:
-        content = it.get("content") or {}
-        if content.get("__typename") != "Issue":
-            continue
-        if ((content.get("repository") or {}).get("nameWithOwner") or "").lower() != tracker:
-            continue
-        if it.get("id") and content.get("number"):
-            out[it["id"]] = content["number"]
-    return out
+async def _off_board_finished(tick: _Tick, number: int) -> bool:
+    """True when a builder's issue *number*, whose card is not on this read, is
+    done: CLOSED, or with an open closing PR (read live). Any failed read is
+    False: the builder holds its place."""
+    from genesis.board import projects_v2 as pv
+
+    try:
+        owner, name = tick.tracker.split("/", 1)
+        facts = await pv.launch_facts(owner, name, number)
+    except Exception:
+        logger.warning("builder launcher: off-board issue #%s unread", number, exc_info=True)
+        return False
+    if facts.get("state") == "CLOSED":
+        return True
+    return bool(facts.get("open_prs")) and not facts.get("open_prs_unresolved")
 
 
-def _issue_of(key: str | None, item_issues: dict[str, int]) -> int | None:
-    return item_issues.get(key.rsplit("@", 1)[0]) if key else None
+def _board_numbers(items: list[dict], tracker: str) -> set[int]:
+    """Tracker issue numbers with a card on this read."""
+    return {
+        (it.get("content") or {}).get("number")
+        for it in items
+        if (it.get("content") or {}).get("__typename") == "Issue"
+        and (((it.get("content") or {}).get("repository") or {}).get("nameWithOwner") or "").lower()
+        == tracker
+    }
 
 
 async def run_launcher(rt, items: list[dict] | None, now: datetime) -> dict:
@@ -349,25 +365,43 @@ async def _run(rt, items: list[dict] | None, now: datetime) -> dict:
     if not fresh:
         return tick.out
 
+    # Units BEFORE sessions: a launch that finishes between the two reads is
+    # then in at least one of them (a unit seen and its session seen counts
+    # twice for one tick, never zero times). An attempt still starting holds a
+    # place whether or not its card is still in Build.
+    starting = await starting_units()
     sessions = await tmux_sessions()
-    item_issues = _item_issues(items, tick.tracker)
+    # Each builder's issue is pinned on its own tmux session by the slot door.
+    issues = await session_issues(sessions)
+    finished = _finished_numbers(items, tick.tracker)
+    on_board = _board_numbers(items, tick.tracker)
+    busy = starting
+    off_board = []
     # Per session, not per key: two sessions carrying one key are two builders.
-    live_keys = [k for k in sessions.values() if k]
-    open_prs = _open_pr_numbers(items, tick.tracker)
-    # A builder with no card on this read maps to None, never in open_prs: it holds.
-    busy = sum(1 for k in live_keys if _issue_of(k, item_issues) not in open_prs)
-    # An attempt still starting (its unit alive) holds a place too, whether or
-    # not its card is still in Build; counted once, here.
-    busy += await starting_units()
+    for name, key in sessions.items():
+        if not key:
+            continue
+        number = issues.get(name)
+        if number is None or (number in on_board and number not in finished):
+            busy += 1  # no pinned issue reads as building (fail closed)
+        elif number not in on_board:
+            off_board.append(number)
+    # A builder whose card left the board holds its place unless its issue is
+    # done (read live). Read only when the answer can free a place.
+    capacity = board_config.builder_launch_settings()["capacity"]
+    for number in off_board:
+        if busy >= capacity or not await _off_board_finished(tick, number):
+            busy += 1
 
     for card in fresh:
         if tick.out.get("disarmed"):
             break  # a disarm seen mid-pass ends it: no further checks or launches
         # True when the move now holds a place: launched, or launched with an
         # outcome nobody could read.
-        if await _one(tick, card, sessions, item_issues, busy):
+        if await _one(tick, card, sessions, issues, busy):
             busy += 1
             sessions = await tmux_sessions()
+            issues = await session_issues(sessions)
     return tick.out
 
 
@@ -462,7 +496,7 @@ def _door_refused_unchanged(history: list[dict], key: str, sessions: dict) -> bo
     return False
 
 
-async def _one(tick: _Tick, card: dict, sessions: dict, item_issues, busy: int) -> bool:
+async def _one(tick: _Tick, card: dict, sessions: dict, issues: dict, busy: int) -> bool:
     """Handle one fresh Build move. True when it holds a builder place now."""
     key, number = card["key"], card["number"]
     if card["kind"] != "Issue" or card["repo"] != tick.tracker or not number:
@@ -487,9 +521,7 @@ async def _one(tick: _Tick, card: dict, sessions: dict, item_issues, busy: int) 
         return False
 
     # Absorb: the issue already has a live builder (another move's key).
-    live_for_issue = [
-        k for k in sessions.values() if k and k != key and _issue_of(k, item_issues) == number
-    ]
+    live_for_issue = [k for n, k in sessions.items() if k and k != key and issues.get(n) == number]
     if live_for_issue:
         tick.out["absorbed"] += 1
         await tick.event(

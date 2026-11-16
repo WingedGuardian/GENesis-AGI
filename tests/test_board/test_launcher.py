@@ -123,6 +123,8 @@ class World:
         self.stopped: list[str] = []
         self.unit_default = "gone"
         self.units_unreadable = False
+        #: The issue the slot door pinned on each session (GENESIS_BUILDER_ISSUE).
+        self.session_issue: dict[str, int] = {}
         self.settings = dict(SETTINGS)
 
     async def tmux_sessions(self):
@@ -134,6 +136,7 @@ class World:
         if self.comes_up and self.launch_rc in (0, 124):
             slot = argv[argv.index("--slot") + 1]
             self.sessions[f"cc-{slot}"] = argv[argv.index("--key") + 1]
+            self.session_issue[f"cc-{slot}"] = int(argv[argv.index("--issue") + 1])
         return self.launch_rc, "out"
 
     async def premise_rc(self, issue, repo):
@@ -152,6 +155,9 @@ class World:
 
     async def stop_unit(self, unit):
         self.stopped.append(unit)
+
+    async def session_issues(self, sessions):
+        return {n: self.session_issue.get(n) for n, k in sessions.items() if k}
 
     async def starting_units(self):
         if self.units_unreadable:
@@ -175,6 +181,7 @@ def world(tmp_path, monkeypatch):
         "unit_state",
         "stop_unit",
         "starting_units",
+        "session_issues",
     ):
         monkeypatch.setattr(launcher, name, getattr(w, name))
     monkeypatch.setattr(launcher, "mem_available_kb", lambda: w.mem_kb)
@@ -888,6 +895,114 @@ async def test_an_unreadable_unit_list_raises(monkeypatch):
     monkeypatch.setattr(probes, "_exec", fake_exec)
     with pytest.raises(RuntimeError):
         await probes.starting_units()
+
+
+async def test_a_session_with_no_pinned_issue_holds_its_place(db, world):
+    """A session the slot door never pinned (an older build) reads as building."""
+    await _arm(db)
+    world.sessions["cc-9"] = "PVTI_old@2026-11-01T00:00:00Z"
+    _, out = await _run(db, [_card()])
+    assert world.launches == [] and out["held"] == 1
+
+
+async def test_an_off_board_builder_with_an_open_pr_frees_its_place(db, world):
+    await _arm(db)
+    world.sessions["cc-9"] = "PVTI_gone@2026-11-01T00:00:00Z"
+    world.session_issue["cc-9"] = 41
+    world.facts = {**world.facts, "open_prs": [{"number": 90}], "open_prs_unresolved": False}
+    # The new card's own facts must show no PR, so they are served per issue.
+    real = world.launch_facts
+
+    async def per_issue(owner, name, number):
+        f = await real(owner, name, number)
+        return f if number == 41 else {**f, "open_prs": [], "open_prs_unresolved": False}
+
+    import genesis.board.projects_v2 as pvm
+
+    pvm.launch_facts = per_issue
+    try:
+        _, out = await _run(db, [_card()])
+    finally:
+        pvm.launch_facts = real
+    assert len(world.launches) == 1, out
+
+
+async def test_an_off_board_builder_without_a_pr_holds_its_place(db, world):
+    await _arm(db)
+    world.sessions["cc-9"] = "PVTI_gone@2026-11-01T00:00:00Z"
+    world.session_issue["cc-9"] = 41
+    _, out = await _run(db, [_card()])
+    assert world.launches == [] and out["held"] == 1
+
+
+@pytest.mark.parametrize(
+    "facts",
+    [RuntimeError("graphql down"), {"open_prs": [{"number": 90}], "open_prs_unresolved": True}],
+)
+async def test_an_off_board_builder_holds_on_a_failed_or_partial_read(db, world, facts):
+    await _arm(db)
+    world.sessions["cc-9"] = "PVTI_gone@2026-11-01T00:00:00Z"
+    world.session_issue["cc-9"] = 41
+    real = world.launch_facts
+
+    async def per_issue(owner, name, number):
+        if number == 41:
+            if isinstance(facts, BaseException):
+                raise facts
+            return {**(await real(owner, name, number)), **facts}
+        return await real(owner, name, number)
+
+    import genesis.board.projects_v2 as pvm
+
+    pvm.launch_facts = per_issue
+    try:
+        _, out = await _run(db, [_card()])
+    finally:
+        pvm.launch_facts = real
+    assert world.launches == [] and out["held"] == 1
+
+
+async def test_an_off_board_builder_is_not_read_when_capacity_is_already_full(db, world):
+    await _arm(db)
+    world.sessions["cc-9"] = "PVTI_gone@2026-11-01T00:00:00Z"
+    world.active_units.add("genesis-builder-3-aa")
+    world.session_issue["cc-9"] = 41
+    world.calls.clear()
+    await _run(db, [_card()])
+    assert world.calls.count("facts") <= 1  # only the new card's own read, if any
+
+
+async def test_a_builder_whose_issue_closed_frees_its_place(db, world):
+    """Its PR merged and closed the issue, but its session is still up."""
+    await _arm(db)
+    done = _card("I9", number=9, status="Done")
+    done["content"]["state"] = "CLOSED"
+    world.sessions["cc-9"] = _key(done)
+    world.session_issue["cc-9"] = 9
+    _, out = await _run(db, [_card(), done])
+    assert len(world.launches) == 1, out
+
+
+async def test_units_are_read_before_sessions(db, world):
+    """A launch finishing between the two reads must show in one of them."""
+    await _arm(db)
+    order = []
+    real_units, real_sessions = world.starting_units, world.tmux_sessions
+
+    async def units():
+        order.append("units")
+        return await real_units()
+
+    async def sessions():
+        order.append("sessions")
+        return await real_sessions()
+
+    launcher.starting_units, launcher.tmux_sessions = units, sessions
+    try:
+        await _run(db, [_card()])
+    finally:
+        launcher.starting_units, launcher.tmux_sessions = real_units, real_sessions
+    assert order[:2] == ["units", "sessions"]
 
 
 async def test_a_running_launch_unit_holds_a_place(db, world):
