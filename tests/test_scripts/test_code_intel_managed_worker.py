@@ -23,7 +23,7 @@ def managed(tmp_path, monkeypatch):
     binary = tmp_path / "binary"
     binary.write_bytes(b"accepted inode")
     lock = tmp_path / "lifecycle.lock"
-    config = dict(binary=str(binary), main=str(tmp_path), cache=str(tmp_path))
+    config = dict(binary=str(binary), main=str(tmp_path), cache=str(tmp_path), build=worker.BUILD)
     events = []
 
     @contextmanager
@@ -46,7 +46,7 @@ def managed(tmp_path, monkeypatch):
         "ready": Mock(),
         "require_enabled": Mock(),
         "check_backend": Mock(return_value="123"),
-        "verified_binary": lambda path: path.open("rb"),
+        "verified_binary": lambda path, build: path.open("rb"),
         "native_env": lambda cfg: {"CBM_CACHE_DIR": cfg["cache"]},
     }
     monkeypatch.setattr(worker, "load_managed", lambda: namespace, raising=False)

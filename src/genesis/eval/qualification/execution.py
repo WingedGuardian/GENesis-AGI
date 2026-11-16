@@ -22,10 +22,13 @@ STOP = "stop_both_on_unresolved_evidence_no_resend"
 SINGLE_STOP = "stop_campaign_on_unresolved_evidence_no_resend"
 
 
-def selected_aliases(models):
+def selected_aliases(models, *, allow_native=False):
     """Select one explicit population, preserving its serial order."""
     if isinstance(models, dict):
-        for aliases in ((ALIASES[1],), ALIASES, PRO_COMPARISON):
+        populations = ((ALIASES[1],), ALIASES, PRO_COMPARISON)
+        if allow_native:
+            populations += (("deepseek-flash",),)
+        for aliases in populations:
             if set(models) == set(aliases):
                 return aliases
     raise Incomplete("operating_plan_invalid")

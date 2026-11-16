@@ -970,9 +970,13 @@ complete-attempt evidence. See `docs/reference/inbox-attempt-identity.md`.
   decontextualised in yours. `model` comes from the SessionStart cache with
   `GENESIS_ROSTER_MODEL` taking precedence, NOT from `cc_sessions.model` — on a
   live install that column is dominated by the literal string `unknown`.
-  Liveness comes ONLY from `session_heartbeats`: `cc_sessions.pid` is unset for
-  most rows and its `status`/`last_activity_at` go stale on running sessions, so
-  it must never be used to decide who is alive. **Every rendered field is
+  Liveness comes ONLY from `session_heartbeats`. `cc_sessions.pid` is set on
+  foreground rows since #1706 (MEASURED 2026-11-13 over rows started in the last
+  three days: 91 of 91 checkpointed and 4 of 4 active rows carry one, 0 of 7
+  completed rows do), but one process can carry several session rows (one pid
+  on 2 rows after a `/clear`, another on 4), and the row's
+  `status`/`last_activity_at` go stale on running sessions, so it must never be
+  used to decide who is alive. **Every rendered field is
   peer-authored, so all pass through `sanitize_detail`** — a newline in any of
   them forges an extra `[Concurrent | …]` line in the reader's context. The
   writers are partial by design (each knows a different subset), so the upsert
@@ -1004,6 +1008,27 @@ complete-attempt evidence. See `docs/reference/inbox-attempt-identity.md`.
   `python -m genesis session-address <id>` (whose `--check` compares it with
   `claude agents --json`, Claude Code's supported listing) and the
   `session_address` MCP tool.
+  **And the worktrees the peer holds** — the tag's body opens with
+  `in <worktree> on <branch> (+N more claimed)`, from the worktree-ownership
+  claims (`scripts/hooks/worktree_claim.py` `claims_by_session`), taken on a
+  session's first edit in a worktree and owned by its PROCESS. A claim is
+  matched by the peer's live pid, the one the address lookup above verified
+  against the registry and the process start time, and failing that by the
+  session id the claim recorded: `/clear` starts a new id in the same process,
+  so an id-only join loses every claim made before it (MEASURED 2026-11-13: 4
+  of 18 live claims). Locks are read raw from `<common dir>/worktrees/*/locked`
+  (never porcelain), with a byte test for the namespace before any parse, one
+  entry at a time so a malformed lock skips only itself. A claim shows only on
+  positive identity (`claim_is_live`: start time matches, not a zombie); an
+  unknown is not shown. The worktree named is the most recently CLAIMED one
+  (the lock file's mtime: a lock is never overwritten), which is where the peer
+  last first-edited, not proof of where it is now; the rest are counted. Names
+  are allowlisted (`[A-Za-z0-9._/+-]`) and omitted when outside it, so the
+  suffix can neither forge a field nor cost more than one budget unit a
+  character. A peer with no claim shows no suffix. The scan costs 22-38 ms over
+  638 admin dirs (MEASURED 2026-11-13, 5 runs, `claims_by_session` alone), is
+  skipped once the hook's deadline has passed and checks it during the scan;
+  an unfinished scan or any failure renders the line as before.
 
 - **Slot environment pinning + usable temp directories.**
   LIVE. `tmux new-session` builds a new session's environment from the tmux
@@ -1887,7 +1912,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: 6b4f275 2026-11-08
+verified: 9eaa6aba0 2026-11-15
 ```
 
 Scoped verification covers `mcp/shared_http` composition. It receives
@@ -2059,6 +2084,14 @@ the shared banner is not an assertion about all concurrent sessions.
   `docs/reference/serena-shared-main.md`.
   External Codebase has pinned configuration staging/diagnostics and bounded
   native query unit entry points in `scripts/codebase_managed.py`.
+  The captured worker's immutable release records select an exact configured
+  build across staging, managed execution, queue source identity and worker argv.
+  Only v0.11.0 is currently qualified; future releases require their own reviewed
+  record and native acceptance. A different supported binary at the configured
+  path still refuses; policy updates do not update existing settings or consent.
+  Scoped CBM verification uses isolated configuration and captured-owner execution
+  through the stock adapter to harmless children; installed-provider and real
+  kernel containment qualification remain separate.
   Status separately observes conditional queue initialization-lock prerequisites
   without opening the queue or changing current-schema availability.
   Install and bootstrap render disabled query/client-slice templates without
@@ -2869,11 +2902,40 @@ verified: 0aa0bf9f2 2026-11-10
   the Failure Inventory remedy for memory held by a shared Codex app-server
   daemon's MCP servers (#4302). Dry-run by default; `--execute` only inside an
   approved action. Resolves targets when it runs: direct children of a
-  `codex app-server --listen` process that lead their own process group with
-  pipe stdin+stdout, excluding Codex helper binaries, systemd-unit members and
+  `codex app-server --listen` process that lead their own process group and
+  read a pipe the app-server writes and write one it reads, on any descriptor,
+  that no other app-server child also holds
+  (matched by pipe identity and `fdinfo` access mode: the MCP Python SDK moves
+  the protocol off fd 0/1, so a stdin test missed every Genesis server),
+  excluding Codex helper binaries, systemd-unit members and
   anything under a `claude` process. Lever `codex_mcp_stop.mode` in
   `config/sentinel.yaml` (`propose_only` | `off`) +
-  `GENESIS_CODEX_MCP_STOP_DISABLED=1`.
+  `GENESIS_CODEX_MCP_STOP_DISABLED=1`. Proposed early by the health alarm
+  `infra:codex_mcp_held` (WARNING, tier 2 via `_TIER2_PATTERNS`), which fires
+  when that same `scan()` totals `codex_mcp_stop.propose_at_mb` (default 4096)
+  or more; the scan runs off-loop and is cached 60 s in `mcp/health/errors.py`.
+  Because that alarm does not clear by itself, `check_fire_alarms` lets a
+  confirmed alarm that is stronger by the classifier's order (tier, then
+  CRITICAL first) cancel (`resolved_by="superseded"`) a park whose triggering
+  alarms are all WARNING, but only when the alarm dispatch would lead with is
+  that challenger and passes backoff; a park with any CRITICAL trigger is never
+  taken over, and a cancel that fails keeps the park. The cancelled pattern
+  starts the 15-minute resolved cooldown. A declined dispatch or action is
+  quiet for 24 h through `handle_approval_resolution` (every pattern).
+- **sentinel/process_stop.py** (`python -m genesis.sentinel.process_stop`):
+  the Failure Inventory remedy for ONE runaway process. Dry-run by default;
+  `--execute` only inside an approved action. Resolves targets when it runs:
+  this user's processes (not pid 1, not zombies or kernel threads, not the
+  tool's own ancestors) outside any systemd `.service` unit that hold
+  `process_stop.propose_at_mb` (default 6144) MB of RSS+swap, excluding
+  `init.scope`. `--execute` requires `--only PID:STARTTIME,...` copied from the
+  dry-run and stops only those identities still eligible, so an approval never
+  covers a process that crossed the line later. SIGTERM, then SIGKILL, through
+  a pidfd opened before the start-time check, to the process alone. Claude Code
+  sessions (foreground and server-dispatched `run-*.scope`) are eligible. Lever `process_stop.mode` (`propose_only` | `off`) +
+  `GENESIS_PROCESS_STOP_DISABLED=1`. Proposed early by the health alarm
+  `infra:process_memory_high` (WARNING, tier 2), from the same `scan()`,
+  cached 60 s.
 - GROUNDWORK: guardian-cgroup, guardian-bidirectional, sentinel-live-autonomy.
 
 ## 9. Ambient cognition — heartbeat, reflection, attention
@@ -3985,6 +4047,10 @@ verified: 3f70a665b 2026-11-15
   establish provider spend bounds or owner approval. This verification refresh covers the qualification slice;
   other learning/evaluation entries retain their previous verification scope.
   See `docs/reference/qualification-transport.md`.
+  A gated native first-party DeepSeek profile shares the same bounded controller
+  and guarded HTTP lifecycle. Native tariff calculations remain separate from
+  legacy provider receipts and cannot supply invoice or promotion authority.
+  See `docs/reference/qualification-native.md`.
   Complete offline preflight checks all registered corpus floors, current
   reference policy/approval/source identities and explicit call-site parameters.
   Production rendering determines duplicate questions and selected novelty IDs.
