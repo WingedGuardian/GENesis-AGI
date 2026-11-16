@@ -16,6 +16,15 @@ The ordinary health executable also has the inactive health-read consumer
 described below. This is one increment toward the complete four-service union;
 the explicit CLI above remains shared-only.
 
+The memory backend additionally exposes the opt-in `/mcp/v3` database-target
+contract described in [shared HTTP](shared-mcp-http.md#memory-database-target-contract).
+It checks its configured logical database against each call's reserved metadata
+before execution, while retaining v2's caller-file and pending-bookmark rules
+on the same SDK transport. The ordinary frontend in this increment still uses
+v2: target-aware pre-input selection and per-call stamping are a separate
+consumer change. Existing mixed-DB routing is not yet qualified or fixed by
+the backend contract alone.
+
 The internal memory `RemotePeer` accepts an optional `pending_file` for the
 caller bookmark contract. Default peers, including the explicit CLI and health
 frontend, add no bookmark metadata or feature requirement. An opting-in memory

@@ -16,6 +16,12 @@ from starlette.routing import Route
 from genesis.caller_context import enter_shared_service
 from genesis.db.crud.update_history import last_successful_update
 from genesis.db.request_database import RequestDatabase
+from genesis.mcp.database_target import (
+    TARGET_ENDPOINT,
+    TARGET_STATUS,
+    TARGET_VERSION,
+    database_target,
+)
 from genesis.mcp.external_profiles import ExternalProfileMiddleware
 from genesis.mcp.plan_bookmark_context import PENDING_ENDPOINT, PENDING_VERSION
 from genesis.mcp.shared_paths import FORWARDER_ENDPOINT
@@ -54,7 +60,8 @@ async def build_http_app(server, *, config, resolver, database, tracker,
         raise ValueError("Shared MCP requires one matching unprofiled resource boundary")
     catalog = await Catalog.capture(server, config.service)
     auth = CallerAuth(resolver, config.service)
-    messages = SharedMessages(config, catalog, enabled)
+    target = database_target(database.path) if config.service == "memory" else None
+    messages = SharedMessages(config, catalog, enabled, database_target=target)
     transport = StreamableHTTPASGIApp(None)
 
     async def freshness():
@@ -83,6 +90,8 @@ async def build_http_app(server, *, config, resolver, database, tracker,
                 "enabled": active, "stale": await freshness(),
                 "active_tools": messages.limiter.borrowed_tokens, "busy_refusals": messages.busy,
                 **({"plan_bookmark_pending_version": PENDING_VERSION} if config.service == "memory" else {}),
+                **({TARGET_STATUS: {"version": TARGET_VERSION, "target": target}}
+                   if config.service == "memory" else {}),
             })
 
     @asynccontextmanager
@@ -110,6 +119,8 @@ async def build_http_app(server, *, config, resolver, database, tracker,
         routes=[Route("/mcp", transport, methods=["GET", "POST", "DELETE"]),
                 Route(FORWARDER_ENDPOINT, transport, methods=["GET", "POST", "DELETE"]),
                 *([Route(PENDING_ENDPOINT, transport, methods=["GET", "POST", "DELETE"])]
+                  if config.service == "memory" else []),
+                *([Route(TARGET_ENDPOINT, transport, methods=["GET", "POST", "DELETE"])]
                   if config.service == "memory" else []),
                 Route("/status", status, methods=["GET", "HEAD"])],
         middleware=[Middleware(ExactAuthority, authority=config.authority, origin=config.origin),

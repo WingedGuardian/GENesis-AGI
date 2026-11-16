@@ -28,8 +28,8 @@ shutdown; the resource-owner contract is a separate bootstrap obligation.
 
 An app-wide SDK-backed exact Host/Origin guard precedes bearer authentication.
 P3 authentication covers `/status` GET/HEAD and `/mcp`, `/mcp/v1`, and memory's
-`/mcp/v2` GET/POST/DELETE. Both versioned routes bind the caller-file contract;
-v2 additionally admits the pending-bookmark contract. They point at the same
+`/mcp/v2` and `/mcp/v3` GET/POST/DELETE. The versioned routes bind the caller-file contract;
+v2 and v3 additionally admit the pending-bookmark contract. They point at the same
 transport and manager, with the same session cap and
 authenticated principal. Body limits
 and raw-envelope admission follow authentication. Duplicate structural JSON
@@ -83,7 +83,7 @@ The version must be an integer, the path absolute without NUL, and its final
 filename and parent must be `plan_bookmark_pending.json` and `.genesis`.
 Validation is lexical; it does not resolve or read files. The path supplies
 input, not authority: only an authenticated P3 forwarder with no profile on
-`/mcp/v2` can supply it. Static credentials and the old endpoint refuse this
+`/mcp/v2` or `/mcp/v3` can supply it. Static credentials and the old endpoint refuse this
 reserved metadata. Absent metadata retains shared opt-out. The binding resets
 on exit/cancellation and is usable only with its captured authenticated caller.
 SDK argument validation precedes the actual memory guard and background job.
@@ -98,6 +98,34 @@ without pending metadata remain supported, but refuse that reserved key.
 The payload stays version1 and catalog equality stays generation-scoped.
 Ordinary memory routing is a later
 consumer; this contract changes no registrations or rollout defaults.
+
+### Memory database target contract
+
+Memory also advertises `database_target_contract` as
+`{"version": 1, "target": "<64 lowercase hexadecimal characters>"}`. The target
+is a domain-separated SHA-256 digest of the service's canonical configured
+SQLite path. It identifies a logical configured target; it is neither a
+credential nor proof of dataset contents or transaction continuity during a
+live database-file replacement. The path itself is not returned. The service
+keeps its single configured database and never opens a path supplied in this
+contract.
+
+On `/mcp/v3`, every `tools/call` requires the exact same object in
+`_meta["genesis/databaseTarget"]`. Version must be an integer; missing, extra,
+wrongly typed or mismatched fields refuse before tool instrumentation,
+database checkout, bookmark consumption and body execution. Raw duplicate
+fields within that object also refuse before SDK decoding. Only the existing
+authenticated unprofiled forwarder role may use this execution contract.
+Existing authority, authentication, body/raw-ID admission, catalog, capacity,
+caller-file identity and pending-bookmark checks remain in force. GET and
+DELETE use the existing SDK session manager; v3 starts no additional service.
+
+The backend rechecks each call, including calls on a retained logical
+generation. Older servers without v3 refuse the request; a bound client must
+not downgrade or replay it through an older route. Existing v1/v2 peers retain
+their current behavior. Ordinary target-aware selection/stamping is a separate
+consumer change: this backend increment alone does not fix mixed-DB routing,
+activate sharing or establish memory savings.
 
 Targeted tests: pure `test_shared_http_settings.py`; qualified
 `test_shared_http_admission.py`, `test_shared_http_policy.py` and

@@ -1643,7 +1643,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: b750f654e 2026-11-15
+verified: 5e5f80fb9 2026-11-15
 ```
 
 Scoped verification covers `mcp/shared_http` composition. It receives
@@ -1675,6 +1675,13 @@ revision checks guard new remote generations. The optional memory peer also
 requires the version1 pending-bookmark capability on every generation and uses
 memory-only `/mcp/v2` for execution, using authenticated explicit caller input
 only. Default peers keep `/mcp/v1`; all aliases share one transport/resource owner.
+The memory-only `/mcp/v3` backend contract additionally requires a matching
+configured logical DB target on every authenticated unprofiled tool call,
+before instrumentation/checkout/bookmark/body effects. Its digest is not a
+credential, file opener or dataset identity. It retains v2's caller-file and
+pending-input rules on the same SDK manager. This scoped backend increment
+does not yet change ordinary frontend target selection/stamping, fix split-DB
+routing or activate sharing; those consumer and integration gates remain.
 An older backend without v2 refuses the actual request after idle replacement;
 whole-catalog equality remains a generation preflight. Ordinary memory now uses
 the same mixed SDK owner at `memory-floor` and `health-reads`, forwarding eight
