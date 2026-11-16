@@ -517,7 +517,7 @@ def _commit_migration(repo: Path, name: str, message: str) -> str:
     return _git(repo, "rev-parse", "HEAD").strip()
 
 
-def test_a_base_that_resolves_is_the_merge_base_never_head(tmp_path):
+def test_a_base_that_resolves_is_the_merge_base_never_head(tmp_path, monkeypatch):
     """#4602: a resolved base must be the merge base, and the check must be able
     to tell it from ``HEAD``.
 
@@ -544,12 +544,21 @@ def test_a_base_that_resolves_is_the_merge_base_never_head(tmp_path):
     merge_base = _git(repo, "merge-base", "HEAD", "origin/main").strip()
     assert head_sha != merge_base, "the fixture must separate HEAD from the merge base"
 
+    # Exercise the helper itself, not only _git: a regression that makes
+    # _pinned_base return HEAD would still pass every other test in this file.
+    monkeypatch.delenv("PR_BASE_SHA", raising=False)
+    pinned = _pinned_base(repo)
+    assert pinned == merge_base, (
+        f"_pinned_base must resolve the merge base ({merge_base[:8]}), not HEAD "
+        f"({head_sha[:8]}); it resolved {pinned[:8] or '(empty)'}"
+    )
+
     assert _mod.check(repo, base_ref=head_sha) == [], (
         "a HEAD-pinned base compares the tree with itself and reports nothing; "
         "if this ever fails the comparison is no longer vacuous and the test "
         "stopped measuring what #4602 is about"
     )
-    violations = _mod.check(repo, base_ref=merge_base)
+    violations = _mod.check(repo, base_ref=pinned)
     assert any(_MERGED_TS in v and "already-merged" in v for v in violations), (
         f"the merge base must still catch the committed deletion, got {violations}"
     )
@@ -576,14 +585,34 @@ def test_no_resolvable_base_skips_rather_than_falling_back_to_head(tmp_path, mon
 def test_a_pr_base_sha_wins_over_the_merge_base(tmp_path, monkeypatch):
     """#4602: ``PR_BASE_SHA`` is the base CI knows, so it is used as given.
 
-    CI exports it for the guard's own step; using it here means the tests compare
-    against the same ref the harness does instead of re-deriving one that can
-    disagree with it.
-    """
-    repo, base = _committed_repo_with_origin(tmp_path)
-    monkeypatch.setenv("PR_BASE_SHA", base)
+    CI exports it for the guard's own step, so the tests compare against the same
+    ref the harness does instead of re-deriving one that can disagree with it.
 
-    assert _pinned_base(repo) == base
+    PR_BASE_SHA names a commit that is NOT the merge base, so the two can be told
+    apart. With them equal, a regression that ignored PR_BASE_SHA would still
+    return the right answer and this test would pass while measuring nothing,
+    which is the gap CodeRabbit found in the first version.
+    """
+    repo, fork_point = _committed_repo_with_origin(tmp_path)
+
+    _git(repo, "checkout", "-q", "-b", "feature")
+    branch_tip = _commit_migration(repo, _MERGED_TS, "a commit on the branch")
+
+    _git(repo, "checkout", "-q", "--detach", fork_point)
+    origin_tip = _commit_migration(repo, "20260102000000_on_main.py", "a commit on main")
+    _git(repo, "update-ref", "refs/remotes/origin/main", origin_tip)
+    _git(repo, "checkout", "-q", "feature")
+
+    merge_base = _git(repo, "merge-base", "HEAD", "origin/main").strip()
+    assert merge_base == fork_point, (
+        f"the fork point must be the merge base, got {merge_base[:8]} vs {fork_point[:8]}"
+    )
+    assert branch_tip != fork_point, "the branch tip must differ from the fork point"
+
+    monkeypatch.setenv("PR_BASE_SHA", branch_tip)
+    assert _pinned_base(repo) == branch_tip, (
+        f"PR_BASE_SHA must win: expected {branch_tip[:8]}, not the merge base {merge_base[:8]}"
+    )
 
 
 def test_deleting_an_already_merged_timestamp_migration_is_caught(tmp_path):
