@@ -209,7 +209,7 @@ def test_readiness_requires_permanent_native_rpc_matching_manager_pid(
         Mock(return_value=SimpleNamespace(returncode=0, stdout=response)),
     )
     config = dict(
-        binary=str(binary), cache=str(tmp_path), runtime=str(tmp_path), main=str(tmp_path)
+        binary=str(binary), build=runtime.BUILD, cache=str(tmp_path), runtime=str(tmp_path), main=str(tmp_path)
     )
     if response == "daemon: active (permanent)\n  pid: 123\n":
         runtime.ready(config)
@@ -239,7 +239,7 @@ def test_readiness_rechecks_authority_after_successful_rpc(runtime, tmp_path, mo
 
     monkeypatch.setattr(namespace["subprocess"], "run", rpc)
     config = dict(
-        binary=str(binary),
+        binary=str(binary), build=runtime.BUILD,
         sentinel=str(sentinel),
         cache=str(tmp_path),
         runtime=str(tmp_path),
@@ -267,7 +267,7 @@ def test_native_status_can_use_remaining_startup_deadline(runtime, tmp_path, mon
         return SimpleNamespace(returncode=0, stdout="daemon: active (permanent)\n  pid: 123\n")
 
     monkeypatch.setattr(namespace["subprocess"], "run", rpc)
-    runtime.ready(dict(binary=str(binary), main=str(tmp_path), cache=str(tmp_path), runtime=str(tmp_path)))
+    runtime.ready(dict(binary=str(binary), build=runtime.BUILD, main=str(tmp_path), cache=str(tmp_path), runtime=str(tmp_path)))
 
 
 def test_readiness_uses_frozen_native_values_without_replacing_control_environment(runtime, tmp_path, monkeypatch):
@@ -291,7 +291,7 @@ def test_readiness_uses_frozen_native_values_without_replacing_control_environme
         return SimpleNamespace(returncode=0, stdout="daemon: active (permanent)\n  pid: 123\n")
 
     monkeypatch.setattr(namespace["subprocess"], "run", rpc)
-    runtime.ready(dict(binary=str(binary), main=str(tmp_path), cache=str(tmp_path), runtime=str(tmp_path)),
+    runtime.ready(dict(binary=str(binary), build=runtime.BUILD, main=str(tmp_path), cache=str(tmp_path), runtime=str(tmp_path)),
                   environment=selected)
     assert observed == [{**selected, "CBM_CACHE_DIR": str(tmp_path), "CBM_RUNTIME_DIR": str(tmp_path),
                          "CBM_ALLOWED_ROOT": str(tmp_path), "SYNTHETIC_UNSELECTED_VALUE": None}]
@@ -311,7 +311,7 @@ def test_readiness_does_not_start_rpc_after_deadline(runtime, tmp_path, monkeypa
     rpc = Mock()
     monkeypatch.setattr(namespace["subprocess"], "run", rpc)
     with pytest.raises(ValueError, match="ready"):
-        runtime.ready(dict(binary=str(binary), main=str(tmp_path), cache=str(tmp_path)))
+        runtime.ready(dict(binary=str(binary), build=runtime.BUILD, main=str(tmp_path), cache=str(tmp_path)))
     rpc.assert_not_called()
 
 
@@ -337,10 +337,10 @@ def test_readiness_native_window_is_clipped_to_total_startup_budget(
     monkeypatch.setattr(namespace["subprocess"], "run", rpc)
     if expected_timeout is None:
         with pytest.raises(ValueError, match="ready"):
-            runtime.ready(dict(binary=str(binary), main=str(tmp_path), cache=str(tmp_path)))
+            runtime.ready(dict(binary=str(binary), build=runtime.BUILD, main=str(tmp_path), cache=str(tmp_path)))
         rpc.assert_not_called()
     else:
-        runtime.ready(dict(binary=str(binary), main=str(tmp_path), cache=str(tmp_path), runtime=str(tmp_path)))
+        runtime.ready(dict(binary=str(binary), build=runtime.BUILD, main=str(tmp_path), cache=str(tmp_path), runtime=str(tmp_path)))
         assert rpc.call_args.kwargs["timeout"] == expected_timeout
 
 
@@ -371,7 +371,7 @@ def test_readiness_clips_final_manager_calls_and_rejects_late_success(
         return SimpleNamespace(returncode=0, stdout="daemon: active (permanent)\n  pid: 123\n")
 
     monkeypatch.setattr(namespace["subprocess"], "run", rpc)
-    config = dict(binary=str(binary), main=str(tmp_path), cache=str(tmp_path), runtime=str(tmp_path))
+    config = dict(binary=str(binary), build=runtime.BUILD, main=str(tmp_path), cache=str(tmp_path), runtime=str(tmp_path))
     if rpc_finishes_at < 115:
         runtime.ready(config)
         assert backend.call_args.kwargs["timeout"] == 1

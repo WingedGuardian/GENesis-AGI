@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -19,10 +20,38 @@ from tests.test_scripts.test_code_intel_captured_reporter import prepared
 from tests.test_scripts.test_code_intel_source import isolated_modules as isolated_modules
 
 
-@pytest.mark.parametrize('scenario', ['unregistered', 'owner-dies', 'native', 'native-failure'])
+def _stock_adapter(root, marker, payload, *, variant, failed):
+    """Keep the production adapter; only the executable and manager are fixtures."""
+    program = root / 'synthetic-worker'
+    program.write_text(
+        '#!/usr/bin/python3\nimport hashlib,json,pathlib,sys\n'
+        "assert sys.argv[1:3] == ['cli','--index-worker']\n"
+        "assert sys.argv[sys.argv.index('--index-worker-build')+1] == hashlib.sha256(open(sys.argv[0],'rb').read()).hexdigest()\n"
+        + 'pathlib.Path(' + repr(str(marker)) + ").write_text('entered')\n"
+        + 'pathlib.Path(' + repr(str(payload)) + ").open('a').write('once\\n')\n"
+        + "pathlib.Path(sys.argv[sys.argv.index('--response-out')+1]).write_text(json.dumps("
+        + repr(dict(isError=failed, content=[])) + '))\n# ' + variant + '\n')
+    program.chmod(0o700)
+    build = hashlib.sha256(program.read_bytes()).hexdigest()
+    worker = root / 'scripts/lib/code_intel_cbm_worker.py'
+    actual = Path(__file__).resolve().parents[2] / 'scripts/lib/code_intel_cbm_worker.py'
+    worker.write_text(actual.read_text() + '\nRELEASES = MappingProxyType({**RELEASES, '
+        + repr(build) + ': MappingProxyType(dict(version="fixture", worker="fixture-stock-worker"))})\n')
+    managed = root / 'scripts/codebase_managed.py'
+    managed.write_text(managed.read_text() + '''
+def ready(config,*,environment=None): pass
+def require_enabled(config,**kwargs): pass
+def check_backend(config,**kwargs): return 'fixture'
+''')
+    return program, build
+
+
+@pytest.mark.parametrize('scenario', ['unregistered', 'owner-dies', 'native', 'native-failure',
+                                      'stock-first', 'stock-second', 'stock-error'])
 def test_actual_captured_initial_owner_closes_only_after_actual_children(tmp_path, monkeypatch, scenario):
-    owner_dies, native = scenario == 'owner-dies', scenario in ('native', 'native-failure')
-    native_failure = scenario == 'native-failure'
+    stock = scenario.startswith('stock-')
+    owner_dies, native = scenario == 'owner-dies', scenario in ('native', 'native-failure') or stock
+    native_failure = scenario in ('native-failure', 'stock-error')
     source, original, modules, _, _, marker = prepared(tmp_path, monkeypatch)
     root = original.root
     proof = root / 'scripts/lib/code_intel_execution.py'
@@ -57,6 +86,7 @@ def cleanup_observation(registration,digest,proof,*,owned_wait):
         admission.write_text(admission.read_text() + '\ndef assess(*args,**kwargs): pass\n')
         worker = root / 'scripts/lib/code_intel_cbm_worker.py'
         worker.write_text(worker.read_text() + '\nBUILD = ' + repr(build)
+                          + '\nRELEASES = MappingProxyType({**RELEASES, BUILD: MappingProxyType(dict(version="fixture", worker="fixture-stock-worker"))})'
                           + '\n_PROGRAM = Path(' + repr(str(program)) + ')'
                           + '\n_ENTRY = Path(' + repr(str(marker)) + ')'
                           + '\n_RC = ' + repr(3 if native_failure else 0)
@@ -82,8 +112,19 @@ def main(argv,*,queued_factory,queued_native_environment):
     else:
         managed = root / 'scripts/codebase_managed.py'
         managed.write_text(managed.read_text() + '''
-def verified_binary(path,**kwargs): return open('/dev/null','rb')
+def verified_binary(path,build,**kwargs): return open('/dev/null','rb')
 ''')
+    if stock:
+        program, build = _stock_adapter(root, marker, payload, variant=scenario, failed=native_failure)
+        cache = root / 'cache'
+        cache.mkdir()
+        (root / 'runtime').mkdir()
+        (cache / 'config.json').write_text(json.dumps(dict(ui_enabled=False)))
+        with closing(sqlite3.connect(cache / '_config.db')) as db:
+            db.execute('CREATE TABLE config (key TEXT,value TEXT)')
+            db.executemany('INSERT INTO config VALUES (?,?)',
+                           [(key, 'false') for key in modules['managed'].DISABLED_KEYS])
+            db.commit()
     owner = root / 'scripts/lib/code_intel_owner.py'
     owner.write_text(owner.read_text() + '''
 def scope_command(snapshot,modules,ack_fd):
@@ -194,7 +235,7 @@ PhysicalOwner.early=_fixture_pause_before_ack
         assert state['native_intent']['executable']['sha256'] == build
         assert state['launch_reservation']['source']['provider_digest'] == build
         assert state['scope_registration']['facts'] == closure['startup']['scope']['facts']
-        assert state['terminal']['data']['report']['payload_returncode'] == (3 if native_failure else 0)
+        assert state['terminal']['data']['report']['payload_returncode'] == (3 if native_failure and not stock else 0)
         assert state['terminal']['data']['report']['payload_started'] is True
         assert state['terminal']['data']['provider_ok'] is (not native_failure)
         assert closure['state'] == 'clean' and closure['reason'] == 'normal'

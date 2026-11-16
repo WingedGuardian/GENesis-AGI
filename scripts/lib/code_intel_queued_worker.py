@@ -239,8 +239,9 @@ def cbm_source(*, snapshot, worker, config, args, cap, settings, environment, po
     if registration_slots is not None:
         value["registration_slots"] = dict(registration_slots)
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-    return dict(commit=snapshot.commit, files=dict(snapshot.files), provider_digest=worker.BUILD,
-                provider_version="v0.11.0-stock-worker",
+    release = worker.qualified_release(config["build"])
+    return dict(commit=snapshot.commit, files=dict(snapshot.files), provider_digest=config["build"],
+                provider_version=release["worker"],
                 configuration_sha256=hashlib.sha256(encoded).hexdigest())
 
 
@@ -302,9 +303,9 @@ def runtime_inputs(snapshot, modules):
     else:
         options = native._object(value['provider_options'], ('managed_config', 'persistence'), 'CBM runtime options')
         modules['unit'].absolute(options['managed_config'])
+        release = modules['worker'].qualified_release(reserved['source']['provider_digest'])
         if (options['persistence'] not in ('true', 'false')
-                or reserved['source']['provider_digest'] != modules['worker'].BUILD
-                or reserved['source']['provider_version'] != 'v0.11.0-stock-worker'):
+                or reserved['source']['provider_version'] != release['worker']):
             raise ValueError('runtime provider inputs differ from the accepted worker')
     return value, NativeEnvironment(value['environment_recipe'], native)
 

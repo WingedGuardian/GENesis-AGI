@@ -184,7 +184,8 @@ No alternate executable or uncapped execution path is provided by the launcher.
 
 Run from the primary Genesis checkout, using the accepted v0.11.0 Linux x86_64
 portable binary from the [upstream release](https://github.com/DeusData/codebase-memory-mcp/releases/tag/v0.11.0).
-Other builds/platforms require new acceptance before changing the build pin.
+Other builds/platforms require native acceptance and a reviewed release record
+before use; currently only that release is qualified.
 The binary must be a regular executable file, rather than a symlink.
 
 ```bash
@@ -196,8 +197,25 @@ The binary must be a regular executable file, rather than a symlink.
 ```
 
 The binary argument names an already obtained executable. This command does
-not download or run an installer. Its digest must match the existing stock
-worker's accepted `BUILD`. It never executes a binary found on PATH.
+not download or run an installer. Its digest must match a record in the captured
+stock worker's immutable `RELEASES` table. It never executes a binary found on PATH.
+Configure discovers the selected build from the retained source descriptor,
+copies that same inode and verifies the copy against the selected digest before
+running native configuration. Schema 2 retains that exact digest as `build`.
+
+Every executing role requires the configured digest, even if a different binary
+at that path is another qualified release. The same identity selects the queue's
+provider label and native worker build argument. Captured runner source includes
+the release table; updating live code does not change an existing capsule's policy
+or authorize reuse of old source-bound retry consent. There is no version-range,
+latest-release or PATH fallback, and no queue/settings migration for this selection.
+
+Future compatible releases add small reviewed records after isolated native
+qualification of configuration, daemon/frontend, worker containment and indexing.
+An upgrade uses fresh state and preserves the old binary/settings/cache bundle.
+Rollback restores that bundle after quiescing the candidate; do not open a cache
+written by a newer format with an older binary. Adding support does not upgrade
+existing settings, activate services or remove the disablement sentinel.
 
 Choose a new, short state path outside the repository and settings directory.
 The provider's native runtime uses Unix sockets and refuses overlong endpoint
