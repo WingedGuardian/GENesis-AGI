@@ -211,6 +211,33 @@ class ScopeManager:
             raise ValueError("actual owner slice unavailable")
         return result
 
+    def require_slice_capacity(self, name, observe):
+        """Observe a loaded active destination; never load or start a slice."""
+        if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9_.\\-]+\.slice", name) is None:
+            raise ValueError("invalid destination slice")
+        path = self._object('GetUnit', 's', name)
+
+        def identity():
+            properties = self._properties(path, 'Unit')
+            result = self._identity(properties)
+            job = self.property(properties, 'Job', '(uo)')
+            if (result[0] != name or self.property(properties, 'Following', 's')
+                    or self.property(properties, 'ActiveState', 's') != 'active'
+                    or self.property(properties, 'SubState', 's') != 'active'
+                    or not isinstance(job, list) or len(job) != 2
+                    or type(job[0]) is not int or job != [0, '/']):
+                raise ValueError('destination slice is not the stable active unit')
+            return result
+
+        first = identity()
+        group = self.property(self._properties(path, 'Slice'), 'ControlGroup', 's')
+        target = PurePosixPath(group)
+        if (not target.is_absolute() or '\0' in group or '..' in target.parts or target.name != name):
+            raise ValueError('destination slice cgroup unavailable')
+        observe(group)
+        current_group = self.property(self._properties(path, 'Slice'), 'ControlGroup', 's')
+        if identity() != first or current_group != group or self._object('GetUnit', 's', name) != path:
+            raise ValueError('destination slice changed during capacity observation')
 
     def require_no_batch(self, cgroup_empty):
         """Observe known managed scopes before reservation; this is no exclusion.

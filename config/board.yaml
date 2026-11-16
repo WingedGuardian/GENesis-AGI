@@ -14,9 +14,15 @@ enabled: true
 #                  promotion. A fresh clone has no board until its owner sets
 #                  one up.
 #   propose_only — the board is READ: the reconciler reads the project and
-#                  computes state, promotion holds proposals for approval, but
-#                  nothing is written to GitHub.
+#                  computes state (including what it WOULD write), promotion
+#                  holds proposals for approval, but nothing is written to
+#                  GitHub.
 #   live         — the reconciler and approved promotions may write to GitHub.
+#                  The reconciler fills empty Status columns, adds every open
+#                  issue and PR not on the board once (a card you remove stays
+#                  removed), at most 200 GitHub writes an hour; on a board
+#                  this starts empty that takes hours, and board_status shows
+#                  the progress.
 #                  OVERLAY-ONLY: settings_update() and the dashboard reject
 #                  `live`, so a model can never arm public-repo writes for
 #                  itself. The owner sets it in ~/.genesis/config/board.local.yaml.

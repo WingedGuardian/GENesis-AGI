@@ -237,6 +237,9 @@ class OutreachResult:
     # scope standalone-text resolution to the prompt's own chat+topic.
     chat_id: str | None = None
     thread_id: int | None = None
+    # Email: recipients the server refused on a partly accepted send (normalized).
+    # The send still reads DELIVERED; per-recipient follow-ups skip these.
+    refused_recipients: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

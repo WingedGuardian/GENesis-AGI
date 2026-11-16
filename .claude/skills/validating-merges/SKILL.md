@@ -63,7 +63,8 @@ harm and why redaction/public-task/private-evidence cannot avoid it.
 Both writers retain the measurement verdict when routing is pending and leave the
 row OPEN. CLI exit **4 means measurement recorded or previewed, tracking pending**;
 re-read before retrying. MCP exposes `recorded`, `tracking_complete`, `tracking`
-and `would_close` separately. A preview stores nothing. Never call the batch
+and `would_close` separately, and `prompts` (see "Completeness checks" under
+Evidence). A preview stores nothing. Never call the batch
 handled until the selected-row checkpoint reports complete tracking.
 
 Checkpoint after each row, before moving batches, and before a completion report.
@@ -367,7 +368,9 @@ loop's end.
      `fail-intent` whose tracking is pending:** the picker never offers a
      fail-intent row again, so nothing would bring it back.
    - a saved closing document: end the loop and tell the owner (one
-     `outreach_send` if they are not attached).
+     `outreach_send` if they are not attached), quoting the dry run's
+     `check:` lines (MCP: its `prompts`) so the owner sees its open questions
+     before closing it.
 7. **Pace:** ScheduleWakeup for the next pass.
 
 **A pick whose change is truly absent from the serving tree** (rare, since the
@@ -722,6 +725,29 @@ scenario checks beyond its printed `Protects` line: reading it spoils it.
 ---
 
 ## Evidence: what the record has to carry
+
+### Completeness checks
+
+Both writers run two checks on every document (#4180). Neither replaces the
+independent verifier: on 128 defects verifiers named in first-round documents, a
+deterministic rule could catch only a few (measured 2026-11-14).
+
+- **A refusal.** A close (a closing verdict with complete tracking) is refused
+  while an `event_gated` gap's trigger is a date on or before today (UTC); an
+  attempt that keeps the row open is not. The measurement is owed now: closing
+  would store a recheck already due, and a failed recheck never reopens the row.
+  Run the recheck and record its result as a claim (or as `not_yet_done` if it
+  cannot run here). If the event has not happened yet, set the trigger to the first
+  date on which it will have.
+- **Prompts.** Questions about the document's own completeness, each naming its
+  target: every `method` gap (is its step reachable here? then it is
+  `not_yet_done`); a claim saying something is unchanged or still true with no
+  before arm in its measurement; a claim citing tests from two or more test
+  modules (two claims folded into one?); an `accepted_limit` resting on a pass
+  count. Once the verdict is derived, the CLI prints them as `pr_verification:
+  check:` lines (dry run, open record or close), and MCP returns them as `prompts`. They change no verdict and are not stored, so
+  **answer each one on the dry run, before the real close**: fix the document, or
+  judge that it does not apply. A close is permanent.
 
 The evidence document is validated by a strict model
 (`genesis.session_awareness.pr_evidence`): every prose field must be a non-blank

@@ -294,6 +294,10 @@ async def run_extraction_cycle(
                     db, session_id, delta.new_line_count,
                     last_extracted_byte=delta.new_byte_offset,
                 )
+                # The appended lines may hold only a tool result (the delta
+                # reader drops those), so record outcomes here too: no later
+                # cycle re-reads this transcript unless new text arrives.
+                await _record_tool_outcomes_from(db, transcript_path, cc_session_id)
             continue
 
         chunks = chunk_messages(messages, chunk_size=chunk_size)
@@ -621,6 +625,7 @@ async def run_extraction_cycle(
                 spine, haystack = await asyncio.to_thread(
                     build_spine_and_haystack, transcript_path
                 )
+                await _record_tool_outcomes(db, spine, cc_session_id)
                 struggle_score = score_struggle(spine)
                 struggle_triggered = struggle_score >= STRUGGLE_THRESHOLD
                 if (
@@ -702,6 +707,51 @@ async def run_extraction_cycle(
             logger.warning("Connection pass failed", exc_info=True)
 
     return summary
+
+
+async def _record_tool_outcomes_from(
+    db: aiosqlite.Connection, transcript_path: Path, cc_session_id: str
+) -> None:
+    """Parse ``transcript_path`` and record its outcomes; never raises.
+
+    For a cycle whose delta has no message, which skips the builder's parse.
+    """
+    try:
+        from genesis.learning.procedural.struggle_detector import build_spine_and_haystack
+
+        spine, _ = await asyncio.to_thread(build_spine_and_haystack, transcript_path)
+    except Exception:
+        logger.warning(
+            "Tool-outcome parse failed for session %s — extraction unaffected",
+            cc_session_id, exc_info=True,
+        )
+        return
+    await _record_tool_outcomes(db, spine, cc_session_id)
+
+
+async def _record_tool_outcomes(
+    db: aiosqlite.Connection, spine: list[dict], cc_session_id: str
+) -> None:
+    """Record every main-session tool call's outcome from the parsed spine (#4712).
+
+    Best-effort and isolated: a failure here is logged and never affects
+    extraction or the procedure builder. Idempotent (unique ``tool_use_id``), so
+    a later cycle re-reading the same transcript writes nothing twice, and it is
+    what records a call whose result had not arrived on an earlier cycle.
+    """
+    try:
+        from genesis.db.crud.tool_call_outcomes import insert_outcomes
+        from genesis.learning.tool_outcomes import outcome_rows
+
+        rows = await asyncio.to_thread(
+            outcome_rows, spine, fallback_session_id=cc_session_id
+        )
+        await insert_outcomes(db, rows)
+    except Exception:
+        logger.warning(
+            "Tool-outcome recording failed for session %s — extraction unaffected",
+            cc_session_id, exc_info=True,
+        )
 
 
 async def _enqueue_procedure_rebuild(
