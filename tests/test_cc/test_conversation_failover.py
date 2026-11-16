@@ -60,6 +60,66 @@ _PEER_INV = CCInvocation(
 )
 
 
+def _pressure_error():
+    from genesis.cc.exceptions import CCMemoryPressureError
+    from genesis.cc.oom import OOMEvidence
+
+    return CCMemoryPressureError(
+        OOMEvidence("synthetic", (1, 2), (1, 2), 4, 5, -9),
+        cause=CCQuotaExhaustedError("usage limit reached"),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize("partial", [False, True])
+async def test_pressure_terminal_never_retries_contingency_or_quota_stamp(
+    loop, invoker, db, monkeypatch, streaming, resume, partial,
+):
+    if resume:
+        invoker.run.return_value = _output()
+        await loop.handle_message("first", user_id="u1", channel=ChannelType.TERMINAL)
+    invoker.reset_mock()
+    invoker.run.side_effect = _pressure_error()
+    invoker.run_streaming.side_effect = _pressure_error()
+    if streaming and partial:
+        async def partial_then_pressure(invocation, *, on_event):
+            await on_event(StreamEvent(event_type="text", text="partial answer"))
+            raise _pressure_error()
+        invoker.run_streaming.side_effect = partial_then_pressure
+    loop._try_contingency = AsyncMock(return_value="must not run")
+    stamp = AsyncMock()
+    monkeypatch.setattr(cc_sessions, "update_rate_limit", stamp)
+    call = loop.handle_message_streaming if streaming else loop.handle_message
+    reply = await call("work", user_id="u1", channel=ChannelType.TERMINAL)
+    assert "memory pressure" in reply
+    assert invoker.run.await_count + invoker.run_streaming.await_count == 1
+    loop._try_contingency.assert_not_awaited()
+    stamp.assert_not_awaited()
+    assert (await (await db.execute("SELECT COUNT(*) FROM cc_rate_limit_parks")).fetchone())[0] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_pressure_peer_stops_chain_without_provider_failure(loop, invoker, db, monkeypatch, streaming):
+    monkeypatch.setattr(roster, "failover_invocations", lambda *a, **k: [
+        ("glm-5.2", _PEER_INV), ("second-peer", _PEER_INV),
+    ])
+    invoker.run.side_effect = [CCRateLimitError("429"), _pressure_error(), _output("forbidden")]
+    invoker.run_streaming.side_effect = [CCRateLimitError("429"), _pressure_error(), _output("forbidden")]
+    loop._try_contingency = AsyncMock(return_value="must not run")
+    failure = MagicMock()
+    monkeypatch.setattr(peer_availability, "note_failure", failure)
+    call = loop.handle_message_streaming if streaming else loop.handle_message
+    reply = await call("work", user_id="u1", channel=ChannelType.TERMINAL)
+    assert "memory pressure" in reply
+    assert invoker.run.await_count + invoker.run_streaming.await_count == 2
+    failure.assert_not_called()
+    loop._try_contingency.assert_not_awaited()
+    assert (await (await db.execute("SELECT COUNT(*) FROM cc_rate_limit_parks")).fetchone())[0] == 0
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("resume", [False, True])

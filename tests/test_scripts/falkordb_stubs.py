@@ -146,7 +146,16 @@ def _stage(tmp_path: Path, *, wheel: bool = True) -> dict:
         'if [ -n "${ENGINE_NOBUS:-}" ]; then\n'
         '    echo "Failed to connect to bus: No medium found" >&2; exit 1\n'
         "fi\n"
-        'state="${ENGINE_STATE:-inactive}"\n'
+        # is-enabled: what systemd prints for the unit file state (ENGINE_ENABLED,
+        # default `disabled`; `-`, so an EMPTY value plays a manager that printed
+        # nothing; rc 1 unless enabled); enable: rc ENABLE_RC.
+        'case "$2" in\n'
+        '    is-enabled) e="${ENGINE_ENABLED-disabled}"; printf "%s\\n" "$e";'
+        ' [ "$e" = enabled ]; exit ;;\n'
+        '    enable) exit "${ENABLE_RC:-0}" ;;\n'
+        "esac\n"
+        # `-`: an EMPTY value plays an unreadable state.
+        'state="${ENGINE_STATE-inactive}"\n'
         'printf "%s\\n" "$state"\n'
         '[ "$state" = active ]\n'
     )

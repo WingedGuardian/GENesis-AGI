@@ -1,0 +1,1 @@
+- Every reader of the credentials file (Python, shell, Guardian, the graph census, disk hygiene, the eval loaders) now finds a `~/.config/genesis/secrets.env` when one exists, ahead of the checkout file; with none, the default is unchanged. The secrets guard protects that file and its dedicated folder. Moving installs there is a later migration.

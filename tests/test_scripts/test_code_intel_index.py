@@ -231,6 +231,11 @@ def _test_entrypoint(tmp_path: Path, fakebin: Path) -> Path:
     source = _ENTRYPOINT.read_text()
     assert "/usr/bin/systemd-run" in source
     script.write_text(source.replace("/usr/bin/systemd-run", str(fakebin / "systemd-run")))
+    # Scope functions now live in the sourced helper. Fence every absolute
+    # manager consumer in the private closure before executing the entrypoint.
+    (script_dir / "code_intel_scope.sh").write_text(
+        (_ENTRYPOINT.parent / "code_intel_scope.sh").read_text().replace(
+            "/usr/bin/systemd-run", str(fakebin / "systemd-run")))
     install_manager(tmp_path / "codebase_managed.py", tmp_path, tmp_path / "repo", fakebin / "codebase-memory-mcp")
     (script_dir / "code_intel_cbm_worker.py").write_text(
         "import subprocess,sys\n"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 
 import aiosqlite
 
@@ -34,6 +35,35 @@ _REPLAY_HOLD_SQL = (
     f"substr(COALESCE(error_message, ''), 1, {len(REPLAY_UNSAFE_PREFIX)})"
     f" = '{REPLAY_UNSAFE_PREFIX}'"
 )
+
+# Both queue writers must notice a selected row becoming ineligible, including
+# unmatched history that is retained instead of rearmed. One statement closes
+# the selection-to-write race without owning the shared connection's transaction.
+_RETRIABLE_SELECTION_SQL = f"""NOT EXISTS (
+    SELECT 1 FROM json_each(?) selected
+    LEFT JOIN inbox_items prior ON prior.id = selected.value
+    WHERE prior.id IS NULL OR prior.status != 'failed' OR prior.retry_count >= ?
+      OR substr(COALESCE(prior.error_message, ''), 1, {len(REPLAY_UNSAFE_PREFIX)})
+         = '{REPLAY_UNSAFE_PREFIX}'
+      OR prior.error_message LIKE ? || '%'
+)"""
+
+
+def _no_newer_hold_sql(file_path_sql: str) -> str:
+    """Refuse when the file gained a replay hold the caller did not read.
+
+    Retry selection never returns held rows, so a hold written after the
+    caller's delta snapshot is invisible to the selected-row check above while
+    its content is still in the delta. The caller reads the hold set BEFORE
+    that snapshot; any other hold on the file makes the write stale.
+    """
+    return f"""NOT EXISTS (
+    SELECT 1 FROM inbox_items held
+    WHERE held.file_path = {file_path_sql} AND held.status = 'failed'
+      AND substr(COALESCE(held.error_message, ''), 1, {len(REPLAY_UNSAFE_PREFIX)})
+         = '{REPLAY_UNSAFE_PREFIX}'
+      AND held.id NOT IN (SELECT value FROM json_each(?))
+)"""
 
 # Prefix marking a row that has been CLAIMED for an in-flight dispatch (the CC
 # call is about to run / is running).  The resume pass flips a parked row from
@@ -420,6 +450,7 @@ async def update_status(
     error_message: str | None = None,
     evaluated_content: str | None = None,
     retry_count: int | None = None,
+    expected_approval_marker: str | None = None,
 ) -> bool:
     """Update an inbox_items row's status and related fields.
 
@@ -434,32 +465,34 @@ async def update_status(
     change, eliminating the race window where a concurrent reader
     could see ``failed`` with ``retry_count < max_retries`` and
     re-detect the file.
+
+    With ``expected_approval_marker``, update only a still-parked row carrying
+    that exact marker. False means the row disappeared or another writer won;
+    callers must not report the stale transition as completed.
     """
     if retry_count is not None:
-        cursor = await db.execute(
-            """UPDATE inbox_items
+        sql = """UPDATE inbox_items
                SET status = ?, processed_at = ?, error_message = ?,
                    retry_count = ?
-               WHERE id = ?""",
-            (status, processed_at, error_message, retry_count, id),
-        )
+               WHERE id = ?"""
+        params = (status, processed_at, error_message, retry_count, id)
     elif status == "failed":
         # Increment retry_count on failure (default)
-        cursor = await db.execute(
-            """UPDATE inbox_items
+        sql = """UPDATE inbox_items
                SET status = ?, processed_at = ?, error_message = ?,
                    retry_count = retry_count + 1
-               WHERE id = ?""",
-            (status, processed_at, error_message, id),
-        )
+               WHERE id = ?"""
+        params = (status, processed_at, error_message, id)
     else:
-        cursor = await db.execute(
-            """UPDATE inbox_items
+        sql = """UPDATE inbox_items
                SET status = ?, processed_at = ?, error_message = ?,
                    evaluated_content = COALESCE(?, evaluated_content)
-               WHERE id = ?""",
-            (status, processed_at, error_message, evaluated_content, id),
-        )
+               WHERE id = ?"""
+        params = (status, processed_at, error_message, evaluated_content, id)
+    if expected_approval_marker is not None:
+        sql += " AND status = 'processing' AND error_message = ?"
+        params += (expected_approval_marker,)
+    cursor = await db.execute(sql, params)
     await db.commit()
     return cursor.rowcount > 0
 
@@ -749,6 +782,16 @@ async def get_handled_batch_content(
     return handled
 
 
+async def get_replay_held_ids(db: aiosqlite.Connection, file_path: str) -> list[str]:
+    """Ids of the file's replay-held rows; read BEFORE the delta snapshot."""
+    cursor = await db.execute(
+        f"SELECT id FROM inbox_items WHERE file_path = ? AND status = 'failed' "
+        f"AND ({_REPLAY_HOLD_SQL}) ORDER BY id",
+        (file_path,),
+    )
+    return [str(row[0]) for row in await cursor.fetchall()]
+
+
 async def get_opaque_replay_hold_files(db: aiosqlite.Connection) -> list[str]:
     """Fail closed when a held batch cannot prove which logical items ran."""
     cursor = await db.execute(
@@ -790,6 +833,7 @@ async def mark_failed_keeping_retries(
     error_message: str,
     processed_at: str | None = None,
     retriable_below: int | None = None,
+    expected_approval_marker: str | None = None,
 ) -> bool:
     """Fail a row WITHOUT spending its retry budget, in one UPDATE.
 
@@ -803,6 +847,9 @@ async def mark_failed_keeping_retries(
     sits at or above that cap. A row whose count predates a LOWERED cap would
     otherwise land at the cap, where nothing retries it and its never-evaluated
     content counts as handled (#2447 review).
+
+    ``expected_approval_marker`` has the same conditional-update contract as
+    :func:`update_status`; ordinary failure callers can omit it.
     """
     if retriable_below is None:
         sql = """UPDATE inbox_items
@@ -815,6 +862,9 @@ async def mark_failed_keeping_retries(
                retry_count = MIN(retry_count, ?)
            WHERE id = ?"""
         params = (processed_at, error_message, max(retriable_below - 1, 0), id)
+    if expected_approval_marker is not None:
+        sql += " AND status = 'processing' AND error_message = ?"
+        params += (expected_approval_marker,)
     cursor = await db.execute(sql, params)
     await db.commit()
     return cursor.rowcount > 0
@@ -858,6 +908,40 @@ async def mark_file_failures_abandoned(
     return cursor.rowcount
 
 
+async def create_pending_if_retriable(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    file_path: str,
+    drop_id: str,
+    batch_items: str,
+    content_hash: str,
+    created_at: str,
+    expected_retry_ids: list[str],
+    max_retries: int,
+    expected_held_ids: Sequence[str] = (),
+) -> bool:
+    """Create a fresh batch only while the queue's unused retry rows remain eligible.
+
+    Old unmatched history stays intact. False discards the in-memory drop just
+    like a lost rearm; earlier committed siblings remain restart-recoverable.
+    ``expected_held_ids`` is the file's hold set read before the delta; any
+    other hold refuses (the default, none known, refuses on any hold).
+    """
+    cursor = await db.execute(
+        f"""INSERT INTO inbox_items
+            (id, file_path, content_hash, status, created_at, drop_id, batch_items)
+            SELECT ?, ?, ?, 'pending', ?, ?, ?
+            WHERE {_RETRIABLE_SELECTION_SQL}
+              AND {_no_newer_hold_sql("?")}""",
+        (id, file_path, content_hash, created_at, drop_id, batch_items,
+         json.dumps(expected_retry_ids), max_retries, APPROVAL_INVALIDATED_PREFIX,
+         file_path, json.dumps(list(expected_held_ids))),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def reuse_as_pending(
     db: aiosqlite.Connection,
     id: str,
@@ -866,6 +950,10 @@ async def reuse_as_pending(
     batch_items: str,
     content_hash: str,
     created_at: str,
+    expected_batch_items: str | None,
+    expected_retry_ids: list[str],
+    max_retries: int,
+    expected_held_ids: Sequence[str] = (),
 ) -> bool:
     """Re-arm a retriable failed row as a fresh pending batch.
 
@@ -880,14 +968,22 @@ async def reuse_as_pending(
     an ancient created_at and broke all of those (the baseline reads switched
     to processed_at ordering for completion-keyed correctness; this fixes the
     created_at-keyed consumers at the source).
+    The caller matches logical item identity first. The exact stored payload and
+    eligibility of every still-unused selected row are checked again atomically;
+    a newly held unmatched row must also prevent this stale drop from dispatching,
+    and so must any hold on the file outside ``expected_held_ids``.
     """
     cursor = await db.execute(
         f"""UPDATE inbox_items
            SET status = 'pending', error_message = NULL,
                drop_id = ?, batch_items = ?, content_hash = ?,
                created_at = ?
-           WHERE id = ? AND status = 'failed' AND NOT ({_REPLAY_HOLD_SQL})""",
-        (drop_id, batch_items, content_hash, created_at, id),
+           WHERE id = ? AND batch_items IS ?
+             AND {_RETRIABLE_SELECTION_SQL}
+             AND {_no_newer_hold_sql("(SELECT file_path FROM inbox_items WHERE id = ?)")}""",
+        (drop_id, batch_items, content_hash, created_at, id, expected_batch_items,
+         json.dumps([id, *expected_retry_ids]), max_retries, APPROVAL_INVALIDATED_PREFIX,
+         id, json.dumps(list(expected_held_ids))),
     )
     await db.commit()
     return cursor.rowcount > 0

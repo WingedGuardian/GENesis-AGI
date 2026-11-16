@@ -6,8 +6,9 @@ A single session that balloons (a leak) is otherwise invisible — this surfaces
 per-slot RSS so it can be shown on the dashboard and alerted on. This is leak
 DETECTION, not OOM prevention (the container has ample headroom).
 
-Stdlib-only leaf at import time (the one genesis import — ``mcp_spawn_store``,
-itself a stdlib-only leaf — is lazy, inside the function, so no import cycle).
+Near-leaf at import time: its only top-level genesis import is ``genesis.util``
+(``proc_io``, which owns the start-time parse); ``mcp_spawn_store``, itself a
+stdlib-only leaf, is lazy, inside the function, so no import cycle.
 
 IMPORTANT — reading ``/proc/<pid>/environ`` of ANOTHER process is ptrace-FSCREDS
 gated and FAILS with EACCES inside genesis-server's systemd sandbox
@@ -24,7 +25,8 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import UTC, datetime
+
+from genesis.util import proc_io as _proc_io
 
 logger = logging.getLogger(__name__)
 
@@ -63,49 +65,14 @@ def read_proc_rss_mb(pid: int) -> float | None:
     return None
 
 
-def _read_btime() -> int | None:
-    """Boot time (epoch seconds) from ``/proc/stat``'s ``btime`` line, or None.
-
-    Read fresh each call (not cached) so tests that repoint ``_PROC`` see their
-    own fake; the caller reads it at most once per slot on a cold dashboard
-    fetch, so the cost is trivial.
-    """
-    try:
-        with open(f"{_PROC}/stat") as f:
-            for line in f:
-                if line.startswith("btime "):
-                    return int(line.split()[1])
-    except (OSError, ValueError, IndexError):
-        return None
-    return None
-
-
 def read_proc_start_iso(pid: int) -> str | None:
     """Wall-clock start time of a pid as an ISO-8601 UTC string, or None.
 
-    Computed as ``btime + starttime_ticks / CLK_TCK`` where ``starttime`` is
-    field 22 of ``/proc/<pid>/stat`` (clock ticks since boot). The ``comm``
-    field (2) is parenthesised and may itself contain spaces or ``)``, so the
-    line is split after the LAST ``)`` — everything after that is whitespace-
-    delimited starting at field 3 (state), making ``starttime`` index 19.
-    Verified to-the-second against ``ps lstart`` on this host. Returns None on
-    any read/parse failure or an implausible clock tick (fail-open: the caller
-    treats an unknown start time as "not stale", never falsely flagging).
+    Delegates to ``genesis.util.proc_io.read_proc_start_iso`` (the stdlib leaf
+    that owns the parse), reading this module's ``_PROC`` at call time so tests
+    that repoint it see their own fake tree.
     """
-    btime = _read_btime()
-    if btime is None:
-        return None
-    try:
-        with open(f"{_PROC}/{pid}/stat") as f:
-            after = f.read().rsplit(")", 1)[1].split()
-        starttime_ticks = int(after[19])
-        clk = os.sysconf("SC_CLK_TCK")
-        if clk <= 0:
-            return None
-        wall = btime + starttime_ticks / clk
-        return datetime.fromtimestamp(wall, UTC).isoformat()
-    except (OSError, ValueError, IndexError, OverflowError):
-        return None
+    return _proc_io.read_proc_start_iso(pid, proc_root=_PROC)
 
 
 def _slot_label(pid: int) -> str | None:

@@ -11,9 +11,9 @@ automatically admitted. Source-editing `rename` and group-metadata `group_sync`
 are excluded. Raw Cypher and group listing remain available. This catalog
 restriction does not make GitNexus side-effect-free: retained operations can
 recover/cache data, and it does not constrain a separate raw server or host
-operator. Tool availability still requires task authorization. The Genesis health and memory entries
-retain their existing narrow allowlists. Interactive Genesis writer activation
-is separate work; this connection does not enroll Codex in Genesis's lifecycle.
+operator. Tool availability still requires task authorization. The Genesis entries are
+configured separately (owner-mode parity; see `.agents/skills/genesis-external-client/SKILL.md`);
+this connection does not enroll Codex in Genesis's lifecycle.
 
 Codex supports project MCP configuration for trusted projects, `cwd`, startup
 timeouts and tool allowlists. See the [official MCP reference](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).

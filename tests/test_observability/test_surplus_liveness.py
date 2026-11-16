@@ -160,3 +160,74 @@ async def test_future_pulse_is_unavailable(db, runtime_singleton):
     r = await surplus_status(db, _fake_surplus())
     assert r["liveness_error"] is True
     assert r["stalled"] is False
+
+
+# ---------------------------------------------------------------------------
+# Status-file path (#4072): the standalone health MCP has no runtime, so the
+# server carries the same in-memory pulse through status.json. The file's own
+# age gates it: a frozen file (server dead, writer failing) must read
+# UNAVAILABLE, never green, including when it froze while paused.
+# ---------------------------------------------------------------------------
+
+
+def _iso(minutes_ago: float | None) -> str | None:
+    if minutes_ago is None:
+        return None
+    return (datetime.now(UTC) - timedelta(minutes=minutes_ago)).isoformat()
+
+
+def _file_pulse(*, written_min_ago=0.1, pulse_min_ago=1.0, paused=False):
+    from genesis.observability.snapshots.surplus import StatusFilePulse
+
+    return StatusFilePulse(
+        last_success=_iso(pulse_min_ago) if isinstance(pulse_min_ago, (int, float)) else pulse_min_ago,
+        paused=paused,
+        written_at=_iso(written_min_ago) if isinstance(written_min_ago, (int, float)) else written_min_ago,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "kwargs", "liveness_error", "stalled"),
+    [
+        ("fresh file, recent pulse", {}, False, False),
+        ("fresh file, pulse past the stall threshold", {"pulse_min_ago": 600}, False, True),
+        ("fresh file, paused with an old pulse", {"pulse_min_ago": 600, "paused": True}, False, False),
+        ("stale file, recent pulse", {"written_min_ago": 10}, True, False),
+        ("stale file frozen while paused", {"written_min_ago": 10, "paused": True}, True, False),
+        ("future-dated file", {"written_min_ago": -30}, True, False),
+        ("file without a timestamp", {"written_min_ago": None}, True, False),
+        ("unparseable file timestamp", {"written_min_ago": "yesterday"}, True, False),
+        ("no pulse (older server)", {"pulse_min_ago": None}, True, False),
+        ("non-string pulse", {"pulse_min_ago": 12345}, True, False),
+        ("string paused flag", {"paused": "false"}, True, False),
+        ("missing paused flag", {"paused": None}, True, False),
+    ],
+)
+async def test_status_file_pulse_cells(db, runtime_singleton, case, kwargs, liveness_error, stalled):
+    _install_runtime(present=False)  # the standalone MCP process has no runtime
+    pulse = _file_pulse(**kwargs)
+    if case == "non-string pulse":
+        from dataclasses import replace
+
+        pulse = replace(pulse, last_success=12345)
+    r = await surplus_status(db, None, status_file_pulse=pulse)
+    assert r["liveness_error"] is liveness_error, case
+    assert r["stalled"] is stalled, case
+    assert r["liveness_source"] == "status_file", case
+
+
+@pytest.mark.asyncio
+async def test_status_file_path_reports_last_success(db, runtime_singleton):
+    _install_runtime(present=False)
+    pulse = _file_pulse(pulse_min_ago=2)
+    r = await surplus_status(db, None, status_file_pulse=pulse)
+    assert r["last_success_at"] == pulse.last_success
+
+
+@pytest.mark.asyncio
+async def test_runtime_path_labels_its_source(db, runtime_singleton):
+    _install_runtime(paused=False, pulse_min_ago=1)
+    r = await surplus_status(db, _fake_surplus())
+    assert r["liveness_error"] is False
+    assert r["liveness_source"] == "runtime"

@@ -274,7 +274,8 @@ def test_scope_drain_checks_descendants_not_launcher_pid(
     else:
         with pytest.raises(RuntimeError, match="drain was not confirmed"):
             peer._stop_scope()
-    assert calls[-1] == ["systemctl", "--user", "stop", peer.unit_name]
+    assert os.path.isabs(calls[-1][0]) and os.path.basename(calls[-1][0]) == "systemctl"
+    assert calls[-1][1:] == ["--user", "stop", peer.unit_name]
 
 
 def test_failed_manager_query_is_not_an_empty_scope(peer_invocation, monkeypatch):
@@ -285,6 +286,44 @@ def test_failed_manager_query_is_not_an_empty_scope(peer_invocation, monkeypatch
     )
     with pytest.raises(RuntimeError, match="state could not be confirmed"):
         peer_invocation.peer_segment._stop_scope()
+
+
+_BUS = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+
+
+def test_a_server_without_bus_variables_still_reaches_the_user_manager(
+    peer_invocation, monkeypatch
+):
+    """A server started without the user-bus variables gives a contained launch
+    and its scope queries the per-uid defaults systemctl_env() supplies, so
+    systemd-run --user can start the scope and cleanup can confirm it."""
+    for name in _BUS:
+        monkeypatch.delenv(name, raising=False)
+    uid = os.getuid()
+    expected = {
+        "XDG_RUNTIME_DIR": f"/run/user/{uid}",
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus",
+    }
+    env = peer_invocation.peer_segment.environment(peer_invocation)
+    assert {name: env.get(name) for name in _BUS} == expected
+    seen = []
+
+    def systemctl(args, **kwargs):
+        seen.append(kwargs.get("env") or {})
+        return subprocess.CompletedProcess(args, 1, "", "")
+
+    monkeypatch.setattr(peer_segment.subprocess, "run", systemctl)
+    with pytest.raises(RuntimeError, match="state could not be confirmed"):
+        peer_invocation.peer_segment._show_scope()
+    assert {name: seen[-1].get(name) for name in _BUS} == expected
+
+
+def test_inherited_bus_variables_are_kept(peer_invocation, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/fixture-runtime")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/fixture-runtime/bus")
+    env = peer_invocation.peer_segment.environment(peer_invocation)
+    assert env["XDG_RUNTIME_DIR"] == "/run/fixture-runtime"
+    assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/fixture-runtime/bus"
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -879,3 +918,83 @@ async def test_peer_non_streaming_success_cannot_clear_the_owner_cli_limited_sta
     assert not output.is_error
     notify.assert_not_awaited()
     assert invoker._last_was_error is True
+
+
+def test_peer_environment_keeps_tmpdir_with_the_cc_tmpdir(peer_invocation, tmp_path):
+    """The CLI's own temp files follow TMPDIR; the peer env sets it with
+    CLAUDE_CODE_TMPDIR, as the ordinary path does, instead of falling back to /tmp."""
+    invocation = replace(peer_invocation, claude_code_tmpdir=str(tmp_path / "cc-tmp"))
+    env = CCInvoker(claude_path="/fixture/claude")._build_env(invocation)
+    assert env["TMPDIR"] == env["CLAUDE_CODE_TMPDIR"] == str(tmp_path / "cc-tmp")
+
+
+def test_scope_state_uses_systemctl_from_absolute_path_entries_only(tmp_path, monkeypatch):
+    """A relative PATH entry resolves against the server's cwd; systemctl is taken
+    from absolute entries only, as launch_args resolves systemd-run."""
+    for where in ("rel/bin", "abs/bin"):
+        fake = tmp_path / where / "systemctl"
+        fake.parent.mkdir(parents=True)
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", os.pathsep.join(["rel/bin", str(tmp_path / "abs" / "bin")]))
+    seen = []
+
+    def run(argv, **kwargs):
+        seen.append(argv[0])
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="LoadState=loaded\nActiveState=active\nControlGroup=/x\n"
+        )
+
+    monkeypatch.setattr(peer_segment.subprocess, "run", run)
+    peer = PeerSegment(
+        segment_id="a" * 32, deadline_at=time.time() + 60, tools=("mcp__genesis_peer__perform",)
+    )
+    peer._show_scope()
+    assert seen == [str(tmp_path / "abs" / "bin" / "systemctl")]
+    monkeypatch.setenv("PATH", "rel/bin")
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        peer._show_scope()
+
+
+@pytest.mark.parametrize("missing", ["systemctl", "cgroup v2", "deadline"])
+def test_a_host_that_cannot_contain_a_peer_refuses_before_the_claim(
+    tmp_path, monkeypatch, missing
+):
+    """Cleanup cannot tell never-launched from maybe-launched, so a missing
+    precondition is refused before the claim exists: nothing is held, and the
+    error is a plain refusal, not an unconfirmed drain."""
+    from genesis.util.proc_kill import ProcessCleanupUncertain
+
+    root = tmp_path / "cgroup"
+    root.mkdir()
+    (root / "cgroup.controllers").write_text("memory\n")
+    tool = tmp_path / "bin" / "systemctl"
+    tool.parent.mkdir()
+    tool.write_text("#!/bin/sh\nexit 0\n")
+    tool.chmod(0o755)
+    monkeypatch.setattr(peer_segment, "_CGROUP_ROOT", root)
+    monkeypatch.setenv("PATH", str(tool.parent))
+    deadline = time.time() + 60
+    if missing == "systemctl":
+        monkeypatch.setenv("PATH", "relative/bin")
+    elif missing == "cgroup v2":
+        (root / "cgroup.controllers").unlink()
+    else:
+        deadline = time.time() - 1
+    peer = PeerSegment(
+        segment_id="b" * 32, deadline_at=deadline, tools=("mcp__genesis_peer__perform",)
+    )
+    calls = []
+    monkeypatch.setattr(peer_segment.subprocess, "run", lambda *a, **k: calls.append(a))
+
+    async def enter():
+        async with peer.invocation():
+            raise AssertionError("the body must not run")
+
+    expected = ValueError if missing == "deadline" else CCProcessError
+    with pytest.raises(expected) as caught:
+        asyncio.run(enter())
+    assert not isinstance(caught.value, ProcessCleanupUncertain)
+    assert peer.unit_name not in peer_segment._INVOCATION_UNITS
+    assert calls == []  # no cleanup query for a claim that never existed

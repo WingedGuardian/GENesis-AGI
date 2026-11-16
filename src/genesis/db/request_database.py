@@ -27,6 +27,7 @@ from genesis.db.connection import (
     drain_connection_worker,
     get_db,
 )
+from genesis.db.physical_work import PhysicalWork, UnconfirmedWork
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,8 @@ class _Lease:
     active: bool = True
     closed: bool = False
     cursors: set[Any] = field(default_factory=set)
+    physical: set[PhysicalWork] = field(default_factory=set)
+    admission: asyncio.BoundedSemaphore | None = None
 
     def require_active(self) -> SerializedConnection:
         if not self.active or self.connection is None:
@@ -144,6 +147,7 @@ class RequestDatabase:
         if not math.isfinite(checkout_timeout_s) or checkout_timeout_s <= 0:
             raise ValueError("checkout_timeout_s must be finite and positive")
         self.path = Path(path).expanduser().resolve()
+        self._foreground_limit = max_units
         self._slots = asyncio.BoundedSemaphore(max_units)
         self._background_slots = (
             asyncio.BoundedSemaphore(max_background_units) if max_background_units is not None else None
@@ -158,7 +162,13 @@ class RequestDatabase:
         self._jobs: set[asyncio.Task] = set()
         self._closing = False
         self._close_task: asyncio.Task | None = None
+        self._grace_deadline: float | None = None
         self._unclosed: set[_Lease] = set()
+
+    @property
+    def foreground_limit(self) -> int:
+        """Configured foreground capacity; live checkout count is separate."""
+        return self._foreground_limit
 
     def _lease(self) -> _Lease:
         lease = self._current.get()
@@ -168,7 +178,11 @@ class RequestDatabase:
         return lease
 
     def _worker(self, coroutine) -> asyncio.Task:
-        task = asyncio.create_task(coroutine)
+        try:
+            task = asyncio.create_task(coroutine)
+        except BaseException:
+            coroutine.close()
+            raise
         self._workers.add(task)
         task.add_done_callback(self._workers.discard)
         return task
@@ -206,6 +220,65 @@ class RequestDatabase:
             await drain_connection_worker(conn._conn)
             lease.closed = True
 
+    async def _settle_physical(self, lease: _Lease) -> None:
+        unconfirmed = None
+        for work in tuple(lease.physical):
+            try:
+                await work.wait()
+            except UnconfirmedWork as exc:
+                self._closing = True
+                unconfirmed = exc
+            else:
+                lease.physical.discard(work)
+        if unconfirmed is not None:
+            raise unconfirmed
+
+    async def _finish_unit(self, opening: asyncio.Task, lease: _Lease, success: bool) -> None:
+        try:
+            await self._settle_physical(lease)
+        except UnconfirmedWork as exc:
+            # DB cleanup is separate from physical provider confirmation. Its
+            # success must not release this lease's admission or provider claim.
+            await self._finish(opening, lease, False)
+            raise DatabaseScopeError("Physical resource work is unconfirmed") from exc
+        await self._finish(opening, lease, success)
+
+    def _release_lease(self, lease: _Lease) -> None:
+        if lease.closed and not lease.physical:
+            if lease.admission is not None:
+                lease.admission.release()
+                lease.admission = None
+            self._unclosed.discard(lease)
+        else:
+            self._unclosed.add(lease)
+            logger.error("Database or physical resource closure could not be confirmed")
+
+    async def run_in_thread(self, fn, /, *args, **kwargs) -> Any:
+        """Keep a live unit and its admission until synchronous work terminates.
+
+        Uses the loop's existing executor. Lease budgets bound DB connections,
+        not the number of physical operations dispatched by joined children.
+        """
+        lease = self._lease()
+        work = PhysicalWork(fn, args, kwargs)
+        lease.physical.add(work)
+        try:
+            try:
+                work.submit()
+            except BaseException as exc:
+                # run_in_executor can raise after enqueue. No proxy is not
+                # proof that a non-idempotent operation did not start.
+                self._closing = True
+                raise DatabaseScopeError("Physical work submission is unconfirmed") from exc
+            try:
+                return await _settle(self._worker(work.result()))
+            except UnconfirmedWork as exc:
+                self._closing = True
+                raise DatabaseScopeError("Physical resource work is unconfirmed") from exc
+        finally:
+            if work.complete:
+                lease.physical.discard(work)
+
     @asynccontextmanager
     async def unit_of_work(self, *, independent: bool = False) -> AsyncIterator[RequestDatabase]:
         existing = self._current.get()
@@ -226,7 +299,6 @@ class RequestDatabase:
             raise ValueError("background admission is not configured")
         finished: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._owners[owner] = finished
-        acquired = False
         opening = None
         token = None
         lease = _Lease()
@@ -239,7 +311,7 @@ class RequestDatabase:
             else:
                 async with asyncio.timeout(self._timeout):
                     await slots.acquire()
-            acquired = True
+            lease.admission = slots
             opening = self._worker(self._open(lease))
             await asyncio.shield(opening)
             token = self._current.set(lease)
@@ -255,15 +327,11 @@ class RequestDatabase:
                     logger.warning("Database unit of work ended outside its owning context")
             try:
                 if opening is not None:
-                    cleanup = self._worker(self._finish(opening, lease, success))
+                    cleanup = self._worker(self._finish_unit(opening, lease, success))
                     await _settle(cleanup)
             finally:
-                if acquired:
-                    if lease.closed:
-                        slots.release()
-                    else:
-                        self._unclosed.add(lease)
-                        logger.error("Database connection closure could not be confirmed")
+                if lease.admission is not None:
+                    self._release_lease(lease)
                 del self._owners[owner]
                 finished.set_result(None)
 
@@ -319,6 +387,11 @@ class RequestDatabase:
     async def _shutdown(self) -> None:
         owners = tuple(self._owners.items())
         jobs = tuple(self._jobs)
+        signals = {finished for _task, finished in owners} | set(jobs)
+        if signals and self._grace_deadline is not None:
+            remaining = max(0, self._grace_deadline - asyncio.get_running_loop().time())
+            if remaining:
+                await asyncio.wait(signals, timeout=remaining)
         for task in set(self._owners) | set(jobs):
             task.cancel()
         # Wait for the unit, not the task: a task that has left its unit may be
@@ -333,24 +406,54 @@ class RequestDatabase:
         )
         while self._workers:
             await asyncio.gather(*tuple(self._workers), return_exceptions=True)
+        for lease in tuple(self._unclosed):
+            try:
+                await self._settle_physical(lease)
+            except UnconfirmedWork:
+                continue
+            self._release_lease(lease)
         # A pending unit belongs to a task that finished without leaving it.
         if self._unclosed or any(not finished.done() for _task, finished in owners):
-            raise DatabaseScopeError("Database shutdown has unconfirmed connection closures")
+            raise DatabaseScopeError("Database shutdown has unconfirmed resource closures")
 
-    async def close(self) -> None:
+    def begin_draining(self) -> None:
+        """Refuse new independent admission without starting shutdown yet."""
         lease = self._current.get()
         if asyncio.current_task() in self._owners or (lease is not None and lease.active):
             raise DatabaseScopeError("Close the manager outside a unit of work")
+        self._closing = True
+
+    async def drain(self, *, grace_s: float) -> None:
+        """Give registered work explicit grace, then cancel and settle it.
+
+        The first shutdown caller fixes the deadline. A grace deadline allows
+        cancellation, never an unconfirmed resource close. A caller may bound
+        its own wait; a non-terminating physical worker can require owner stop.
+        """
+        if isinstance(grace_s, bool) or not isinstance(grace_s, (int, float)):
+            raise ValueError("grace_s must be finite and nonnegative")
+        try:
+            grace = float(grace_s)
+        except OverflowError as exc:
+            raise ValueError("grace_s must be finite and nonnegative") from exc
+        if not math.isfinite(grace) or grace < 0:
+            raise ValueError("grace_s must be finite and nonnegative")
+        self.begin_draining()
+        if self._grace_deadline is None:
+            self._grace_deadline = asyncio.get_running_loop().time() + grace
         previous = self._close_task
         # A failed shutdown described its moment, so a later close looks again.
         if previous is None or (
             previous.done() and (previous.cancelled() or previous.exception() is not None)
         ):
-            self._closing = True
             self._close_task = asyncio.create_task(self._shutdown())
         # Shutdown keeps running if this caller is cancelled, and the caller can
         # still bound its own wait or be cancelled by a task it is waiting on.
         await asyncio.shield(self._close_task)
+
+    async def close(self) -> None:
+        """Initiate zero-grace shutdown, or join the first caller's shutdown."""
+        await self.drain(grace_s=0)
 
     def _cursor_operation(self, method: str, *args, **kwargs):
         lease = self._lease()
@@ -413,3 +516,10 @@ def spawn_database_task(db, coroutine, **task_options) -> asyncio.Task:
     from genesis.util.tasks import tracked_task
 
     return tracked_task(coroutine, **task_options)
+
+
+async def run_resource_thread(db, fn, /, *args, **kwargs) -> Any:
+    """Retain facade ownership; preserve ordinary legacy thread cancellation."""
+    if isinstance(db, RequestDatabase):
+        return await db.run_in_thread(fn, *args, **kwargs)
+    return await asyncio.to_thread(fn, *args, **kwargs)

@@ -207,3 +207,39 @@ def test_deep_cyclic_provenance_and_base_exception_group(monkeypatch, caplog):
     with pytest.raises(BaseExceptionGroup) as caught, spans.start_span("ancestor"):
         raise group
     assert caught.value is group and CANARY not in caplog.text
+
+
+def test_a_split_private_group_stays_private():
+    """``except*`` and ``split()`` build new groups around the same leaves, so the
+    private marker must sit on every leaf, not only on the group that was raised."""
+    from genesis.util.execution_privacy import exception_is_private
+
+    leaf = ValueError(CANARY)
+    with pytest.raises(ExceptionGroup) as caught, private_execution():
+        raise ExceptionGroup("Synthetic group", [leaf, TypeError("Synthetic other")])
+    matched, rest = caught.value.split(ValueError)
+    assert matched is not caught.value and matched.exceptions[0] is leaf
+    assert exception_is_private(matched)
+    assert exception_is_private(rest)
+    assert exception_is_private(leaf)
+
+
+def test_a_refused_marker_write_does_not_leave_a_sibling_unmarked():
+    """One member whose marker write raises (a colliding key with a raising
+    ``__eq__``) must not stop the walk before its siblings are marked."""
+    from genesis.util import execution_privacy as ep
+
+    class Colliding:
+        def __hash__(self):
+            return hash(ep._ERROR_MARKER)
+
+        def __eq__(self, other):
+            raise TypeError("Synthetic collision")
+
+    sibling, poisoned = ValueError(CANARY), ValueError("Synthetic poisoned")
+    poisoned.__dict__[Colliding()] = 1
+    with pytest.raises(ExceptionGroup) as caught, private_execution():
+        raise ExceptionGroup("Synthetic group", [sibling, poisoned])
+    matched, _rest = caught.value.split(lambda exc: exc is sibling)
+    assert ep.exception_is_private(sibling)
+    assert ep.exception_is_private(matched)

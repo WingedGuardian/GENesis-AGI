@@ -398,6 +398,89 @@ class TestRefiner:
         assert result.proposed_content == "improved"
         router.route_call.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_propose_exhausted_chain_returns_none(self):
+        """#4074: an exhausted chain returns success=False, content=None.
+
+        propose() must treat that like any other failed call and return None,
+        not hand None to the regex parser (TypeError that failed the whole job).
+        """
+        from genesis.routing.types import RoutingResult
+
+        refiner = SkillRefiner()
+        report = SkillReport(
+            skill_name="x", usage_count=5, success_count=3,
+            failure_count=2, success_rate=0.6,
+        )
+        router = MagicMock()
+        router.route_call = AsyncMock(return_value=RoutingResult(
+            success=False, call_site_id="33_skill_refiner",
+            content=None, error="All providers exhausted",
+        ))
+
+        result = await refiner.propose(report, "old content", router=router)
+        assert result is None
+        router.route_call.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_propose_empty_successful_content_returns_none(self):
+        from genesis.routing.types import RoutingResult
+
+        refiner = SkillRefiner()
+        report = SkillReport(
+            skill_name="x", usage_count=5, success_count=3,
+            failure_count=2, success_rate=0.6,
+        )
+        router = MagicMock()
+        router.route_call = AsyncMock(return_value=RoutingResult(
+            success=True, call_site_id="33_skill_refiner", content="",
+        ))
+
+        assert await refiner.propose(report, "old content", router=router) is None
+
+    def test_parse_response_none_text_returns_none(self):
+        assert SkillRefiner()._parse_response("test", None) is None
+
+    def test_parse_response_non_object_json_returns_none(self):
+        refiner = SkillRefiner()
+        assert refiner._parse_response("test", json.dumps(["a", "b"])) is None
+        assert refiner._parse_response("test", json.dumps("just a string")) is None
+
+    @pytest.mark.parametrize("confidence", [None, "high", [1]])
+    def test_parse_response_bad_confidence_defaults(self, confidence):
+        """A malformed confidence must not raise out of the parser (it aborted the run)."""
+        text = json.dumps({"proposed_content": "x", "confidence": confidence})
+        result = SkillRefiner()._parse_response("test", text)
+        assert result is not None
+        assert result.confidence == 0.7
+
+    @pytest.mark.parametrize("proposed", [{"a": 1}, ["x"], 5])
+    def test_parse_response_non_string_content_returns_none(self, proposed):
+        """Non-string content would crash the validator's splitlines() later."""
+        text = json.dumps({"proposed_content": proposed})
+        assert SkillRefiner()._parse_response("test", text) is None
+
+    def test_parse_response_coerces_bad_list_and_text_fields(self):
+        text = json.dumps({
+            "proposed_content": "x",
+            "rationale": {"not": "text"},
+            "change_size": ["moderate"],
+            "failure_patterns_addressed": "timeout",
+        })
+        result = SkillRefiner()._parse_response("test", text)
+        assert result is not None
+        assert result.rationale == ""
+        assert result.change_size == ChangeSize.MINOR
+        assert result.failure_patterns_addressed == []
+
+    def test_parse_response_keeps_only_string_patterns(self):
+        text = json.dumps({
+            "proposed_content": "x",
+            "failure_patterns_addressed": ["timeout", 3, None, "auth"],
+        })
+        result = SkillRefiner()._parse_response("test", text)
+        assert result.failure_patterns_addressed == ["timeout", "auth"]
+
 
 class TestWS10ContentLoss:
     """WS-10 / LRN-01: never overwrite a SKILL.md from a truncated view.
@@ -447,6 +530,32 @@ class TestWS10ContentLoss:
         _, kwargs = pipeline._applicator.apply.await_args
         assert kwargs.get("current_content") == "the full current SKILL.md content", \
             f"pipeline must pass current_content so the consistency check can run; kwargs={kwargs}"
+
+    @pytest.mark.asyncio
+    async def test_run_survives_exhausted_refiner_chain(self, db, monkeypatch):
+        """#4074: one skill whose refiner chain is exhausted must be skipped,
+        not abort the whole run with a TypeError."""
+        from genesis.routing.types import RoutingResult
+
+        router = MagicMock()
+        router.route_call = AsyncMock(return_value=RoutingResult(
+            success=False, call_site_id="33_skill_refiner",
+            content=None, error="All providers exhausted",
+        ))
+        pipeline = SkillEvolutionPipeline(db=db, router=router)
+        report = SkillReport(skill_name="s", usage_count=5, success_count=2,
+                             failure_count=3, success_rate=0.4)
+        pipeline._analyzer.analyze_all = AsyncMock(return_value=[report])
+        pipeline._analyzer.needs_review = lambda r: True
+        pipeline._applicator.apply = AsyncMock()
+        import genesis.learning.skills.pipeline as pipeline_mod
+        monkeypatch.setattr(pipeline_mod, "load_skill", lambda name: "content")
+
+        summary = await pipeline.run()
+
+        router.route_call.assert_awaited_once()
+        assert summary["proposed"] == 0
+        pipeline._applicator.apply.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_run_suppresses_when_unresolved_proposal_pending(self, db):
@@ -732,6 +841,28 @@ class TestApplicator:
             rationale="r", change_size=ChangeSize.MODERATE,
         )
         assert await applicator._llm_validate(proposal, router=router) is False
+
+    @pytest.mark.asyncio
+    async def test_validate_exhausted_chain_logs_routing_error(self, caplog):
+        """#4074: an exhausted chain reports the routing error, not a json TypeError."""
+        import logging
+
+        from genesis.routing.types import RoutingResult
+
+        router = MagicMock()
+        router.route_call = AsyncMock(return_value=RoutingResult(
+            success=False, call_site_id="33_skill_refiner",
+            content=None, error="All providers exhausted",
+        ))
+        applicator = SkillApplicator()
+        proposal = SkillProposal(
+            skill_name="x", proposed_content="c",
+            rationale="r", change_size=ChangeSize.MODERATE,
+        )
+        with caplog.at_level(logging.WARNING, logger="genesis.learning.skills.applicator"):
+            assert await applicator._llm_validate(proposal, router=router) is False
+        assert "All providers exhausted" in caplog.text
+        assert "TypeError" not in caplog.text
 
 
 # ---------------------------------------------------------------------------

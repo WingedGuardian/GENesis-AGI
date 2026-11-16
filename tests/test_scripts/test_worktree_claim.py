@@ -684,14 +684,14 @@ def test_an_unreadable_git_pointer_is_foreign_not_absent(repo, worktree, monkeyp
     payload = P(wc.RULE_CLAIM, pid=os.getpid(), start=99)
     assert wc.lock_worktree(worktree, payload) is True
 
-    real_read = pathlib.Path.read_text
+    real_read = pathlib.Path.read_bytes
 
     def unreadable(self, *args, **kwargs):
         if self.name == ".git":
             raise PermissionError(13, "Permission denied")
         return real_read(self, *args, **kwargs)
 
-    monkeypatch.setattr(pathlib.Path, "read_text", unreadable)
+    monkeypatch.setattr(pathlib.Path, "read_bytes", unreadable)
     lock = wc.read_lock(worktree)
     assert lock is not None, "an unreadable .git pointer read as NO LOCK"
     assert lock.foreign is True

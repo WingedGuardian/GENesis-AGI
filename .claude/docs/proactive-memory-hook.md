@@ -10,10 +10,11 @@ reimplementation of it.
 1. **Session-local awareness** (always, in-process): heartbeat + concurrent-
    session tags, intent-trail/pivot detection, recent-activity summary, the H-1
    working-set measurement, and the ambient session-awareness fold.
-   The hook also runs a local `code_symbols` lookup and prints any `[Code]
-   symbol — location` structural hints on the server path — the server engine
-   surfaces semantic memory only, so this cheap local lane (which the pre-flip
-   fork fused) stays hook-side.
+   The hook used to print local `[Code] symbol — location` hints from
+   `code_symbols`. Removing that lane was decided on 2026-11-07: across 15,412 hints
+   sessions actually received over 30 days, 34 (0.22%) were followed by a touch
+   of the hinted file within 15 tool calls, while they appeared in 74% of recall
+   injections.
 2. **Recall** (delegated): the hook POSTs `{prompt, session_id, profile:"cc_hook",
    file_keywords, suppress_ids}` to `POST /api/genesis/hook/recall`. The server
    engine (`genesis.memory.proactive.proactive_context`) runs the full pipeline —
@@ -142,7 +143,7 @@ carries:
   then `stdin`, `heartbeat_write`, `heartbeat_read`, `trail`, `activity`,
   `recent_files`, `gates` (the off-mode, short-prompt and database checks),
   `migration`, `suppress`, `server`, the path's own steps
-  (`server_emit`, `code_hints` / `fts5`, `code_index`, `degraded_emit`,
+  (`server_emit` / `fts5`, `degraded_emit`,
   `shadow`), `flush` (writing the deferred session lines, wherever a path does
   it; off mode then `metrics`), `ws_measure`, `activity_row`, `metrics`, `fold`,
   and `finish` (cleanup and exit). Under its 1,000-byte cap the oldest steps fold into one
@@ -228,7 +229,6 @@ meaning** rather than by one blanket character cap:
 |---|---|---|
 | extracted keywords | length window, `_MAX_KEYWORD_CHARS` | the ROOT. An identifier cannot get long here (every non-alphanumeric char becomes whitespace, so identifiers SPLIT), but an unbroken alphanumeric run — a pasted hash, token, or minified blob — is one token of whatever length. DROPPED, not truncated: a keyword is a KEY (`_detect_pivot` compares keyword sets), so a truncated id would collide with a different id sharing its prefix. |
 | `[Session trail]` | `_MAX_TRAIL_LINE_CHARS` | drops WHOLE oldest pivots and marks it with the `… →` prefix the count bound already uses. A truncated arrow chain would end in half a topic that reads like a whole one. Slices to the displayed window BEFORE clipping labels — clipping first walked and encoded every pivot a long session had ever recorded, on every prompt, to discard all but the newest fifty. |
-| `[Code]` hints | `_MAX_CODE_HINT_CHARS` | the largest surface on REAL data. Clips the signature and keeps the file location whole — the location is the actionable half. |
 | `[Concurrent]` peers | `_MAX_PEERS_SHOWN` (a query `LIMIT`) | bounded by COUNT so the safety directive that follows always has room. Overflow is NAMED from a `COUNT`, never inferred from a read that stopped at its own limit. |
 
 `tests/test_scripts/test_hook_output_contract.py` fails this hook if any
@@ -255,13 +255,13 @@ marker at all. `_CUT_NOTICE_RESERVE` plus `_announce_cut` via `emit_final`
 the announcement unconditional. It is wired in `main()`'s `finally` because
 `_run` has several exit paths and per-path calls would be a convention.
 
-**Units.** The two SIZE bounds (trail line, code hint) are measured in UTF-16
+**Units.** The SIZE bound (the trail line) is measured in UTF-16
 code units — what the harness bills — via `utf16_len` and `clip_to_cost`. The
 keyword window is deliberately in CODEPOINTS, because it asks whether a token is
 a word or a pasted blob, and billing a 20-character astral CJK word as 40 units
 would drop a real word for being non-Latin; `_detect_pivot`'s filter must use the
 same unit or the two disagree about what is in the window. Mixing the units does
-not loosen a bound, it skips it: the code hint originally billed in UTF-16 while
+not loosen a bound, it skips it: the since-removed `[Code]` hint billed in UTF-16 while
 deciding in `len`, so 200 emoji rendered 626 units against a stated 400 and were
 never clipped. The breach lives in the MIDDLE of the range — a huge value trips
 the guard and clips correctly — so any probe here sweeps widths.

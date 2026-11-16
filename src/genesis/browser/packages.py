@@ -82,15 +82,18 @@ def packages_changed_message(stale: list[str]) -> str | None:
         v = _loaded.get(d, STARTUP_VERSIONS[d])
         return "an unknown version" if v is _UNKNOWN else str(v)
 
+    from genesis.caller_context import client_session_name
+
+    session = client_session_name()
     changed = ", ".join(f"{d} {was(d)} -> {now[d]}" for d in stale)
     if any(now[d] is None or now[d] == UNREADABLE for d in stale):
         # Uninstalled or damaged under the session: a restart alone will not repair it.
         advice = (
-            "Restart this Claude Code session; if the browser is still unavailable "
+            f"Restart this {session}; if the browser is still unavailable "
             f"after that, tell the user; operator step: {PACKAGE_HINT}."
         )
     else:
-        advice = "Restart this Claude Code session to load them; do not reinstall."
+        advice = f"Restart this {session} to load them; do not reinstall."
     return f"Browser packages changed after this session started ({changed}). {advice}"
 
 

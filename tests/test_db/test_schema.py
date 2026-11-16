@@ -51,6 +51,7 @@ EXPECTED_TABLES = [
     "task_steps",
     "memory_metadata",
     "credential_access_log",
+    "reference_secrets",
     "session_heartbeats",
     "ego_intentions",
     "entity_resolution_audit",
@@ -171,6 +172,7 @@ async def test_no_unexpected_tables(db):
         "memory_reconcile_runs",  # memory integrity Phase 1 (repair lane audit)
         "pr_verifications",  # post-merge E2E obligation ledger (issue #1718)
         "zero_drop_findings",  # stranded-work detector (one row per standing condition)
+        "client_tool_calls",  # labelled-client (owner-mode Codex) tool-call log
         "board_links",  # work board: card <-> private source + promotion audit
         "open_questions",  # work board: local-only unresolved forks
         "open_question_blocks",  # work board: question -> blocked work edges

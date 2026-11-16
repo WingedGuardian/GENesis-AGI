@@ -73,8 +73,22 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 2ece179f9ebc 2026-10-28
+verified: 5a3de4eee 2026-11-07
 ```
+
+The 2026-11-07 verification covers the request-owned memory thread boundaries
+below; other memory descriptions retain their individually cited verification dates.
+
+**Shared-owner prerequisite (not activated):** nine thread boundaries in
+`memory/store.py`, `retrieval.py`, `intent.py` and `proactive.py` retain actual
+physical completion through their RequestDatabase unit. Legacy connections keep
+ordinary thread cancellation. The retriever forwards the facade to tag expansion;
+tag scans run in independently admitted background units, with accepted-task
+completion as the single-flight release. Pressure or draining serves the stale
+query. The explicit shared factory additionally owns the builtin embedding
+clients and cache handles while retaining separate storage/recall providers.
+Other maintenance threads retain their existing lifetime. This is not a
+shared-service activation; factory qualification is scoped separately.
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
 `memory_fts`) and Qdrant share no transaction, so drift (orphaned "ghost"
@@ -135,6 +149,76 @@ Easy-to-forget mechanisms:
   (`memory/corrective.py`), which runs inside those tools — so the internal
   runtime stack and the hermetic LongMemEval harness (both pass explicit
   `rerank` kwargs) are unaffected.
+- **A credential reference's value and description are held out of its own
+  indexes** (#2426). For `reference.credentials`, `ingest_knowledge_unit` (the
+  one chokepoint every reference writer passes) indexes only the header (the
+  identifier), `[description held in the reference secret store]`,
+  `Value: [held in the reference secret store; read it with reference_lookup]`
+  and the Tags/Captured trailer (`reference_ops.split_secret`), so the unit's
+  knowledge_units and knowledge_fts rows, its memory_fts row, the Qdrant payload
+  and the embedding never see the value or the free-text description (no
+  scrub of free text: owner ruling, every spelling was another way through).
+  The identifier, tags, authority and provenance are not scrubbed. The value is
+  probed whole and by its fragments: percent-decoded, NFKC-normalised, split on
+  whitespace and `: / @ ? & = # ; , | \ < > " ' ( ) { } [ ]` (so a URL, DSN,
+  key=value, XML or pipe-separated password is a fragment of its own), leaving out host names, URL schemes and ports, and keeping each
+  secret-shaped fragment; matching is normalised (NFKC, format characters
+  removed, casefolded) and percent-decoded. An identifier, body header, or
+  ANY other caller field that can reach a store (authority, memory class,
+  purpose, ingestion source, and every provenance value, nested or not, each
+  read as text by `knowledge_ingest.field_text` and leaf by leaf) that carries
+  a probe refuses the write (`reference_ops.refuse_value_in_fields`; the
+  identifier with its own message, and the `[reference.credentials] {identifier}`
+  header by the identifier rule only when it is exactly that header). A caller
+  tag that carries a probe is dropped whole, from the tags and the body's Tags
+  line, and the write goes on (`reference_ops.drop_value_tags`), so a heuristic
+  match on an ordinary tag costs that tag, never the capture. Stated limits: a
+  secret that reads as a plain word (all letters, or under four characters) is
+  matched only as the whole value, and so is a fragment that is all digits or
+  shaped like a host name (dotted labels ending in letters). A credential's memory class becomes an
+  indexed tag, so it must be None or a known class (`classification.CLASS_WEIGHTS`).
+  The value and the description (`detail`)
+  go to one insert-only `reference_secrets` row under a fresh random id, and ONE statement
+  then writes the unit naming it in `knowledge_units.secret_ref`, so a body and
+  the secret it names are always one writer's pair on a connection that
+  serializes statements, not transactions. The `knowledge_units_secret_ref_*`
+  triggers refuse a credential unit naming no stored secret and delete the
+  secret a unit stops naming (repointed or deleted);
+  `knowledge_crud.sweep_orphan_secrets` (after every delete, and at boot)
+  removes secrets older than an hour that an interrupted upsert left unnamed.
+  `ingest_knowledge_unit(insert_only=True)` and `knowledge_crud.upsert(insert_only=True)`
+  never change an existing credential key (a different value raises
+  `CredentialKeyTaken`); no writer passes it yet: it is the mechanism a later
+  change wires the extraction job's auto-capture to.
+  Two `knowledge_units` triggers refuse a
+  credential body without exactly one placeholder line, whichever process
+  writes it (text on a later line only the Python check sees).
+  A re-ingest carrying a placeholder keeps what the key already holds for it:
+  both placeholders keep the secret row; a new description with the value
+  placeholder writes a new row with the stored value; a new value with the
+  description placeholder keeps the stored description. A credential write never shares a vector point
+  (`MemoryStore.store(..., dedup=False)`), and a point it created that no unit
+  names when the write ends (refused, failed or cancelled) is deleted, so no
+  stale-point cleanup can delete a point a unit names. The credential upsert
+  is a compare-and-swap against the ingest's own earlier read of the key
+  (`knowledge_crud.KeyObservation`: absent, or the secret and point it named),
+  checked inside the one statement that writes the unit, so a same-key writer
+  in another process that commits in between makes it write nothing
+  (`CredentialKeyChanged`); the ingest then re-reads and runs once more, and
+  a second change reaches the caller.
+  Only `reference_ops` reads the secret row: `compose_body` puts the value and
+  the description back for `reference_lookup` (behind its audit log),
+  `reveal_reference` returns both for the dashboard's reveal, and
+  `resolve_value` the value alone. When a unit was repointed after its row was
+  read, they re-read the unit's current body, value and description with one
+  statement (`knowledge_crud.get_reference_pair`), so a body never comes back
+  beside another write's secret. A credential is therefore found by its
+  identifier and tags only; the dashboard list shows the description placeholder. Identifier kinds (url, network,
+  account, fact) keep their value in the body, because it is what their lookups
+  search for. NOT covered yet: the episodic memory the extraction job stores
+  for the same conversation text, which still carries an auto-captured value.
+  Credentials stored before this change keep their value inline until the
+  follow-up migration rewrites them; both readers parse those as before.
 - **`drift_recall`** (`memory/drift.py`) is the degraded-mode fallback; its
   FTS drilldown searches every collection in `source_collections`,
   rank-merged across collections.
@@ -257,8 +341,29 @@ snapshot is fixed at the first SELECT step, so stamping afterwards can pin a
 projection that is missing a mid-load commit (MEASURED 2026-09-06). That preparation is now
 used: `graphstore_falkor.FalkorGraphStore` is the second implementation, a
 long-lived FalkorDB server reached over a unix socket, selected by
-`config/graphstore.yaml` (`mode: networkx|falkordb`, default **networkx**, so
-the lever is inert until moved). It carries its own projection of
+`config/graphstore.yaml` (`mode: networkx|falkordb`, shipped default
+**falkordb** since the cutover bar was met: 14 days on a live install with zero
+fallbacks). The default applies **where present only**:
+`graphstore_config.selection()` keeps reads on NetworkX QUIETLY when `falkordb`
+comes from the shipped file alone (no overlay sets `mode`) and no
+`genesis-falkordb.service` unit is rendered and enabled (its `default.target.wants` link), publishing the selection with
+`quiet_reason="engine_not_provisioned"` and no error, so the telemetry row is
+neither a fallback nor a clock break (`graph_cutover.is_quiet_row`; a row only
+partly quiet still breaks). An overlay `mode: falkordb`, and a unit that exists
+but is stopped or failed, stay loud. `probe_falkordb` joins the steady-state
+critical-failure probes when the unit is enabled or the selection says
+falkordb, an overlay choice included (`runtime/init/learning.py`, decided at
+server start). Bootstrap and install
+arm the unit after rendering it from a verified engine (`falkordb_enable_unit`):
+`enable --now` when it is inactive or failed, a plain `enable` when it is
+running and disabled (a running engine is never started or restarted), nothing
+when masked or listed in `~/.genesis/config/disabled_timers`; a failed start is
+one WARNING line, never a failed bootstrap. The graphstore dashboard save
+writes only the keys that changed, so an unrelated save never pins `mode`
+into the overlay: the editor sends back what it showed (`__shown`) and a key
+is written when it differs from that, type included; a client with no
+snapshot is compared against the merged config (`routes/settings.py`
+`_changed_keys`). It carries its own projection of
 `memory_links` and applies the SAME visibility predicate — but at QUERY time,
 over mirrored `invalid_epoch`/`deprecated` node properties, which closes the
 future-`invalid_at` gap the NetworkX store states below. That closes the TIME
@@ -300,9 +405,19 @@ then rolls back when bootstrap refuses). The unit is `Type=simple` with a PING r
 poll, because the wheel's redis has no libsystemd to notify with, and a deploy
 moves an engine onto a different module only when systemd reports it inactive
 or failed (a running engine, or one whose state cannot be read, keeps its unit)
-or `GENESIS_FALKORDB_SWITCH=1` asks for it.
+or `GENESIS_FALKORDB_SWITCH=1` asks for it (on a running install through
+`update.sh --take-template genesis-falkordb.service`, since bootstrap refuses
+under a live server; then restart the unit).
 The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
-(`memory/graphstore_project.py`); that schedule is its staleness bound. The
+(`memory/graphstore_project.py`); that schedule is its staleness bound. Because
+`install.sh` starts the engine before genesis-server has created the database
+(bootstrap seeds it first), `install.sh` projects once after it starts the
+server, when the engine is active: it waits up to 120 s for the two tables
+the projector reads, then starts `genesis-graph-project.service`; a timeout
+leaves it to the hourly run. The graph-engine probe membership is decided at
+server start, so a
+`mode` change made live joins or leaves the critical-failure probes at the
+next restart. The
 engine keeps no data on disk, so its unit also (re)starts the projector on
 every start, restarts included; a projection already running against the
 engine that just died is stopped and run again (`ExecStartPost`, issue #3035): a restarted engine is
@@ -387,7 +502,13 @@ census does not read is carried: each row records `secrets_digest`, a hash of
 the six keys it reads, and the next census proves a changed file whose current
 values hash the same for the same pid and start (`carried: true`; the latest
 census row only; never when the file names `SECRETS_PATH` or
-`GENESIS_REPO_ROOT`)), and its database
+`GENESIS_REPO_ROOT`); the file is the one the resolver picks now, and a
+fallback past an absent `~/.config/genesis/secrets.env` counts only when that
+directory and every symlink on its path are unchanged by ctime since the server
+started, since a changed one may have held the file it loaded (#4278), and a
+fallback from another checkout's file to `~/genesis/secrets.env` is unknown;
+nothing else in `~/.config` is read),
+and its database
 scope (the primary database is fixed at import from the exec env or the root
 default, and a path in the file becomes a second one; `foreign` only when every
 one of them differs from the live database by `(st_dev, st_ino)`, no symlink on
@@ -565,8 +686,16 @@ preserve usable answers, real refusal health and dropped-output replay guards.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: a8fa35a35 2026-10-23
+verified: 37e124b54 2026-11-08
 ```
+
+Verification refresh is limited to advisory CLI identity below; other execution
+evidence retains its dated basis. Structured-result classification can retain
+`CCError.cc_session_id` without changing error/replay policy. Existing invoker
+spans expose reported identity/source and wrapper return state as optional
+attributes, separate from the Genesis `session_id` column; private execution
+omits the new attributes. Missing metadata is unknown, never acquisition or
+complete-attempt evidence. See `docs/reference/inbox-attempt-identity.md`.
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
   `cc/gmodel_settings.py`): Kimi K3 and MiMo V2.6 Pro select subscription, native
@@ -622,6 +751,24 @@ verified: a8fa35a35 2026-10-23
   per-binary hardening, which made an every-session claim depend on an invocation
   shape that, once no profile declares an allowlist, never occurs: the pin was
   written by the builder and verified by nothing.
+  **"Every dispatch" means every `CCInvoker` dispatch, plus the dashboard's
+  update sessions** (`dashboard/routes/updates.py`), which start `claude -p`
+  outside the invoker and import its set and gate instead of keeping a second
+  list. Tier 3 (`_spawn_detached_cc`) sets the four names empty as the last
+  change to the environment and passes `_assert_no_gh_credentials` before the
+  session's log is opened or a process starts; a refusal raises. Tiers 1/2 are
+  started by the generated orchestrator script, which cannot import genesis
+  while an update is replacing it: `_apply_supervised` substitutes the invoker's
+  set into the script (`GH_CREDENTIAL_ENV`) and `spawn_cc` sets those names empty
+  after the inherited environment. The orchestrator process itself keeps the
+  server's environment, and so does `update.sh` on the direct path
+  (`_apply_direct`, which starts no session); an `update.sh` a tier session runs
+  inherits that session's pins. Two limits: these sessions pass no
+  `--settings`, so the settings-level pin above does not apply to them, and the
+  script's `spawn_cc` sets the names but does not run the gate
+  (`tests/test_dashboard/test_update_template.py` runs the written script and
+  applies the gate to what the session received). A session started outside
+  both the invoker and the update routes does not go through this gate.
   **"`gh` holds no credential" is the claim; "the session is unauthenticated" is
   NOT** — tool scope decides the second, and a profile permitting `Read` with an
   outbound tool can still reach a credential FILE, which no env pin touches.
@@ -959,8 +1106,9 @@ verified: a8fa35a35 2026-10-23
   `emit_bugfix_audit`) stamp origin inline. Migration 0085 backfills historical rows. On the
   READ side, the LAUNDERING-CRITICAL surfaces now EXCLUDE external/unknown-origin content
   (fail-closed: `origin_class IN ('owner','first_party')`, NULL excluded) —
-  `essential_knowledge._recent_decisions` + `_active_session_pivots` (the always-loaded L1
-  file), `reflection.gather_evaluation_context` (×4) + `_recent_observations` +
+  `essential_knowledge._recent_decisions` (the always-loaded L1 file; its old
+  `_active_session_pivots` reader is gone, since live sessions are now shown only in the
+  session-start in-flight block, `memory/open_loops.py`, which skips external-origin rows), `reflection.gather_evaluation_context` (×4) + `_recent_observations` +
   `gather_for_calibration`, and `perception.context._build_memory_hits` + `_build_light_chain`
   (the deep-reflection/perception prompt pipeline) — severing the external→reflection→
   `first_party`-stamped-delta laundering path, with a deep-reflection prompt-rule belt and a
@@ -1078,6 +1226,33 @@ verified: a8fa35a35 2026-10-23
 - `cc/context_injector.py` (memory→session injection) lives HERE, not in
   memory. GROUNDWORK: `reflection_bridge/_bridge.py` (v4-executor),
   `session_config.py` (hook-inheritance).
+- **Light-reflection topic repeats (development candidate)**: Light is the
+  system thinking about what code cannot settle. The Light prompt carries a
+  "Changes since the previous Light finding" table computed by code
+  (`awareness/signal_format.light_signal_changes`): each signal's previous and
+  current value, labelled as a counter, an alarm started or cleared, or a band
+  crossing. The model sets `material_change` from that and its own judgment of
+  moves that cross no line. The bridge stores every reflection output, then
+  suppresses the Light-topic summary (or posts a periodic stub) only when the
+  model sets `material_change` false AND code finds no condition change
+  (`light_condition_changes`: an alarm started or cleared, a fixed-level
+  alarm rose, an active alarm crossed its own threshold, a band crossed, a signal appeared or went away) between the run behind the last full
+  post and this run; when code does find one, the summary is posted with those
+  changes listed. That check covers the alarm signals and the signals whose
+  collector sets thresholds (`container_memory_pct` only); every other value is
+  the model's to judge. Wording is not compared. An absent or true flag, a multi-message
+  summary that differs, parse fallbacks and an unknown baseline all post. The
+  previous values come from the awareness tick whose corpus row was written up
+  to 60 s before the finding or post (`reflection_corpus.tick_written_before`);
+  two runs in that window, or a reading that failed in that run, count as
+  unknown and post.
+  `genesis_version_changed` is left out of Light's signal list, change table
+  and condition check (`LIGHT_HIDDEN_SIGNALS`).
+  A manager-local Light-topic lock spans history through send persistence;
+  unrelated categories retain their independent delivery. History uses
+  insertion order so a current stub supersedes an older future-dated row. Deep and
+  strategic topic delivery retain their direct path. Installed verification is
+  still outstanding.
 - **Background-wait ceiling ownership** (invoker.py): the CLI's headless
   `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` (default 600s) SIGKILLs a dispatched
   Workflow/subagent mid-run with a partial result. `CCInvocation.bg_wait_ceiling_ms`
@@ -1286,7 +1461,30 @@ verified: 0164dd1f0 2026-10-14
   MUST be a curated, non-opted-out `marketing_prospects` row (authorization is
   DECOUPLED from send-lifecycle status, so a `contacted` follow-up still sends) —
   an unknown / opted-out recipient trips (`recipient_not_curated` / `opted_out`)
-  → demote + hold (fail-closed). Graduation for the BULK cell rides the generic
+  → demote + hold (fail-closed). **Marketing-recipient posture (any GRANTED class):** the gate
+  looks the recipient up in `marketing_prospects`
+  (`marketing_prospects.find_in_recipient`: bare addresses out of a
+  `Name <addr>` or list form) and HOLDS without demoting when (1) the recipient
+  is a prospect and the thread has inbound mail — a reply to a prospect is the
+  owner's to approve in every mode, decided BEFORE the scope guards (g1's
+  exact-match on the stored `From` header would otherwise demote the reply cell
+  for a send that was held anyway); then, after the scope guards, (2) the
+  recipient is an opted-out prospect, whatever the class (g2 covers BULK only);
+  (3) the send is BULK or goes to a prospect and the `marketing_outreach` lever
+  is not `live` — so the IDENTITY follow-up on an unanswered prospect thread is
+  held in `off`/`observe`, like the BULK first touch. Keyed on DB state, never on
+  the caller-supplied `labeled_surplus`. A cold IDENTITY send to a non-prospect
+  is untouched. The owner REJECTING such a hold keeps the grant
+  (`email_gate_watcher._is_posture_hold`: curated prospect + cell still
+  GRANTED); every other rejection stays a correction. At delivery the drain's
+  kill-switch re-check covers every approved hold that is BULK or goes to a
+  prospect, whatever its class (`email_gate_watcher._is_prospect_send`; a lookup
+  error pauses), and both delivery paths stamp every prospect the recipient
+  string names (`marketing_prospects.mark_contacted_in_recipient`), so a
+  `Name <addr>` recipient counts as contacted. Known limit: in `live`, a
+  follow-up on a second, unanswered thread to a prospect who replied on another
+  thread is not a "reply" and sends.
+  Graduation for the BULK cell rides the generic
   capability-promotion path (`capability_grants.detect_promotable_cells` →
   `email:send:bulk` qualifies once it has ≥5 owner-approved successes +
   posterior ≥0.70). That path is scoped by
@@ -1306,7 +1504,8 @@ verified: 0164dd1f0 2026-10-14
   that converts per-action approval into a standing grant; a denylist would hand
   that conversion to every new capability by default. **Contact-stamping (loop-fix):** on a CONFIRMED
   delivery a matching prospect is advanced active → `contacted` via one
-  active-guarded CRUD (`marketing_prospects.mark_contacted_by_email`) called from
+  active-guarded CRUD (`marketing_prospects.mark_contacted_in_recipient`, which
+  stamps every prospect the recipient string names) called from
   BOTH delivery paths — the email-gate drain (`email_gate_watcher`) for a HELD →
   owner-approved send, AND `pipeline._deliver` for a GRANTED-cell autonomous send
   (which delivers inline and never touches the drain, so the fix survives
@@ -1329,7 +1528,10 @@ verified: 0164dd1f0 2026-10-14
   recorded in `outreach_history`/`email_threads`). Attacker-controlled reply
   fields are HTML-escaped + control-char-stripped (`_sanitize_ping_field`) because
   the outreach telegram path delivers with `parse_mode="HTML"` unescaped. The
-  autonomous `ReplyHandler` auto-reply path is unchanged by this.
+  `ReplyHandler` still dispatches a session that drafts the reply; the draft
+  reaches `EmailAutonomyGate`, which holds it for the owner (the posture gate
+  above) whenever the thread it answers has inbound mail and its recipient is a
+  curated prospect.
 - **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +
   PII scan for EXTERNAL channels and `content`-category drafts only. Never
   applied to owner channels — don't add them.
@@ -1430,8 +1632,14 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: b0867170e 2026-10-02
+verified: f62608045437 2026-11-09
 ```
+
+Verification refresh is limited to the inbox trace parent: the existing retry
+await has an advisory `inbox.evaluate` span linking observed child attempts by
+batch/row ID. Its returned state describes that await, not delivery, baseline
+completion or source acquisition. Existing execution decisions remain separate;
+other intake evidence retains its dated basis.
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
   (`has_unchanged_source`) makes re-ingest of changed sources re-distill;
@@ -1440,19 +1648,50 @@ verified: b0867170e 2026-10-02
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
   contrast the intake bypass in entry 4.
 - **inbox/**: file-drop monitor with approval-gated dispatch.
+  Explicit owner-requested disposition review uses the manual-only Tier-1
+  `inbox-review` skill, reached by the attended-request pointer in `CLAUDE.md`.
+  Its read-only `scripts/inbox_review_rulings.py` helper enumerates exact-tagged
+  retained FTS history in a snapshot, including uncertain metadata, without
+  ranking, authority adjudication or writes. The workflow uses existing memory
+  and per-review outcomes documents; it adds no ledger or automatic evaluation.
+  Activation prerequisites and deterministic/native validation limits are in
+  `docs/reference/owner-inbox-review.md` (verified: 2026-11-09).
   `monitor.py` owns scanning, approval, retries and baseline writes;
   `batch_runner.py` executes one approved batch and post-processes its output,
-  reached through the monitor's `_run_one_batch` forwarding method. Before any
+  reached through the monitor's `_run_one_batch` forwarding method. Its manager
+  session scopes only the invoker/retry await, stamping child environment and
+  invocation-failure attribution. The prior task context is restored before
+  handlers, postprocessing and detached work; explicit follow-up transcript IDs
+  retain their namespace. This does not grant supervision or change external
+  provenance, approvals or replay policy. See `docs/reference/inbox-session-attribution.md`.
+  Before any
   DB, approval, response, or baseline mutation, it composes and validates one
   deterministic system prompt from `INBOX_EVALUATE.md`, the complete
   `evaluate` skill, the complete `user_evaluate` skill, and an explicit
   precedence footer. A missing, unreadable, or empty component fails the scan
   closed without caching a partial prompt; a successful composite is reused
   byte-for-byte by the approval route, CC invocation, and prompt-version hash.
+  Evaluations request one model-reported Evidence section per item, preserving
+  source claims, acquired quotations or acquisition limits, current mechanism/
+  user evidence, and labelled uncertainty. The existing optional output-memory
+  extractor is unchanged and may still lose qualifications or introduce an
+  unsupported claim; evaluator evidence is not mechanical source grounding or
+  a guarantee of memory correctness. Reuse and
+  deliverable-backed BUILD/adoption boundaries are described in
+  `docs/reference/inbox-evaluation-quality.md`.
+  ADAPT output requests an explicit `why_not_adopt` explanation; the parser
+  preserves its optional string and warns on missing usable rationale without
+  changing existing recommendation routing or build ownership.
   The phase order is prompt preflight → recover pending → resume approval →
   detect → create → dispatch;
   `approval_key_stable=True` (ONE
-  site-level approval key). The refresh path folds parked files into the
+  site-level approval key). Resume consumes an approved grant before releasing
+  its awaiting row. Resume state transitions require the row to retain its
+  original `processing` status and exact awaiting-approval marker; a concurrent
+  claim, completion, supersession or new approval marker wins over the stale
+  transition. A lookup/retirement failure preserves that row and defers
+  all new/modified/retry site work for the scan, while healthy approved siblings
+  can resume after successful consumption. The refresh path folds parked files into the
   batch so approvals fire once (#914). A pending approval is HELD until the
   user resolves it (no re-ask, no age-based cancel) and is auto-cancelled only
   when *orphaned* — no live inbox row (`awaiting_approval:`/`dispatching:`)
@@ -1460,11 +1699,27 @@ verified: b0867170e 2026-10-02
   4h staleness cancel that re-detected unchanged files and nagged. Three checks
   sit between a response and the baseline: a coherence check (annotates, never
   blocks), a give-up-LANGUAGE URL-failure check, and a URL-COVERAGE check
-  requiring every scanner-recognized input URL's parsed identity to appear in
+  requiring every recognized input URL occurrence's parsed identity to appear in
   the response — that last one catches SILENT omission, which the language
   check cannot see by construction. Scheme and host case plus one leading
   `www.` are presentation variants; authority, path, query, and fragment
-  identity remain exact. Coverage
+  identity remain exact. Prompt and coverage share source-aware URL occurrences:
+  only matching unmatched wrappers in the same-line source context justify
+  removing closing delimiters, including prose parentheticals, quoted links
+  and matching backtick runs. Literal terminal punctuation and repeated tokens in different
+  contexts retain their own identities. The read-only coverage report retains
+  these occurrences too; it does not reconstruct coverage from normalized URLs.
+  It separately reports stored input, baseline-only membership, whole logical
+  items, response presence and Source/mention evidence; strict decoding rejects
+  corrupt v2 inputs as a whole. These are retained-evidence facts, not proof of
+  source acquisition or model judgment; see `docs/reference/inbox-coverage-evidence.md`.
+  Its output guard protects every inbox file the monitor may evaluate (any type), retained response targets and the
+  database and its SQLite companions by resolved path and existing file identity, independently of report
+  selection; an existing output directory receives a generated report filename.
+  An ordered proof finds the first source-frame closure; ambiguous tokens stay
+  raw and cannot supply wrapper context for later URLs.
+  The wrapper correction is scoped to this URL path; the entry's existing
+  verification stamp remains the basis for its other claims. Coverage
   is ENFORCED by default (`url_coverage_mode`, `config/inbox_monitor.yaml`;
   `shadow` observes without acting): an uncovered URL re-queues its item
   through the bounded retry lane, logging only stable opaque URL ids. It
@@ -1478,7 +1733,8 @@ verified: b0867170e 2026-10-02
   can carry share tokens — while a storm alert names the file only. The retry-lane storm site
   abandons only URL-failure rows. An approval that ends unanswered (`approval_ended:`)
   does not spend a retry and leaves the row an ordinary retriable failure, so
-  the same row is asked about again; with `resilience.parking_mode:
+  an identifiable unchanged batch keeps its retry budget when asked about again;
+  with `resilience.parking_mode:
   live`, a network outage (`CCNetworkOfflineError`) does not spend retries. Follow-up and
   build-lane durable writes finish before the completed baseline commits, so a
   cancellation cannot permanently hide their absence. On restart every
@@ -1486,6 +1742,12 @@ verified: b0867170e 2026-10-02
   complete outstanding work is re-derived from the current source and completed
   baseline, so a crash during multi-row creation cannot silently lose the
   never-created tail or leave pending rows suppressing the file forever.
+  Retry reuse matches the complete ordered logical batch, with the queue's
+  existing tracking normalization and preserved annotations. Missing, corrupt
+  or regrouped identities get fresh bounded rows through normal approval while
+  old history remains. Both creation and reuse atomically reject newly ineligible
+  selected history, including unmatched rows; lost writes discard the whole
+  in-memory drop, leaving partial durable rows for restart recovery.
   Replay-unsafe batches persist a hold independent of the retry cap; readable
   held blocks are excluded from future deltas without becoming completed
   baseline content, while unreadable holds block their source file. The
@@ -1626,8 +1888,18 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: 973a0e6 2026-10-30
+verified: 6b4f275 2026-11-08
 ```
+
+Scoped verification covers `mcp/shared_http` composition. It receives
+initialized request-owned resources and supplies SDK transport limits, app-wide
+authority/authentication, per-message caller/profile binding, shared/local
+ancestry admission, nonblocking tool capacity and authenticated version/catalog
+status. The gated explicit `--shared-service` path constructs the actual
+standalone services with a bounded facade, frozen limits and outer resource
+owner. Ordinary session selection remains unchanged. Unit readiness, native
+clients and rollout remain separate. See `docs/reference/shared-mcp-http.md`. That scoped check
+(5a3de4eee, 2026-11-08) does not requalify the other channels/interfaces subsystems.
 
 The neural monitor includes the non-routing **Fallback** observation, and the
 dashboard labels the shared fallback indicator as last successful/observed use.
@@ -1758,11 +2030,34 @@ the shared banner is not an assertion about all concurrent sessions.
   isolation is the primary control — see
   `SECURITY.md`, which is authoritative for the threat model. Consult this
   before concluding a route is protected because a password exists.
+  One open read reduces its own body: `GET /api/genesis/health` answers every
+  network (`auth._OPEN_FROM_ANY_NETWORK`), and for a caller with neither the
+  internal bearer nor a verified session (`has_verified_credential`, never true
+  without a password) `routes/health.redact_for_untrusted` drops each call
+  site's `last_response` (the text its last model call returned; a site that
+  had one carries `last_response_hidden: true`), the deploy checkout's file
+  names and probe error, and all of `live_repairs` but its counts, then
+  reduces the rest to an allow-list (`_withhold_free_text`): numbers,
+  booleans and nulls stay, a string stays only under a key listed as a
+  status, name, id, commit or timestamp and only while it has that shape, and
+  every other string (error, reason, message, detail text) is replaced by
+  `<field>_hidden: true`, with `free_text_hidden: true` on the response. A
+  string field a producer adds later is therefore withheld until listed. The
+  Agent Zero adapter's own copy of that route (`az_plugins/genesis/api_health.py`)
+  calls the same function. The in-process readers of the snapshot (the health
+  MCP tools, ego context) are not affected. Both monitor pages show a note in
+  place of a withheld Last Response and of a discarded item's reason or
+  error, plus a page-level note; the dashboard header shows the same note.
+  That is every browser on an install with no dashboard password.
 - **mcp/**: 5 Genesis MCP servers (health, memory, outreach, recon,
   discord-bot) + external codebase-memory; profile→server allowlist lives in
   `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool
   modules). `standalone_health.py` serves from `~/.genesis/status.json` when no
-  live runtime (stale-but-functional).
+  live runtime (stale-but-functional). Surplus liveness there comes from the
+  server's in-memory `surplus_dispatch` success pulse, which the status writer
+  carries in `liveness_pulses` (verified 2026-11-08): it is trusted only while the
+  file is at most 300s old (`snapshots/surplus.py` `STATUS_FILE_MAX_AGE_S`), and
+  any stale, future-dated or mistyped field reads `liveness_error`, never green.
   The optional fixed-main Serena services qualify provider 2.1.0 and MCP 2.2
   readiness; they select classic tools and reject switching or REPL capability.
   Their existing locking, per-profile limits and native stdio worktree routing
@@ -1781,6 +2076,43 @@ the shared banner is not an assertion about all concurrent sessions.
   locks. This does not activate the service or establish production capacity
   or unattended resource-failure readiness. See
   `docs/reference/codebase-managed.md`.
+  The prepared typed timer tail calls the captured original owner and accepts
+  only complete, context-bound native outcomes. GitNexus selection captures
+  Node/package metadata before reservation and confirms the pinned installation
+  only after original scope registration and admission. It uses the shared
+  native-intent seam; imported vendor files remain trusted installed inputs.
+  This wiring preserves negative readiness and does not activate indexing.
+  Initial owner admission observes the complete known managed-scope namespace
+  before reservation, rechecking terminal identities and recursive population.
+  This point-in-time census is not global physical exclusion. Standalone manual
+  indexing retains its existing policy; physical exclusion remains a gate.
+  `scripts/lib/code_intel_supervisor.py` wires exact-context explicit owner-loss
+  reconciliation through the captured runner and canonical locks. It preserves
+  orphaned uncertainty, original physical obligations and one-time accounting.
+  Matching terminal leader states alone do not prove controller process end.
+  The same-connection final drain observes callback-created evidence before
+  commit. The acknowledgement grants no retry or acceptance. The automatic
+  reconciliation caller remains separate (#3728); acceptance, cutover,
+  native qualification and production capacity remain separate gates.
+  Explicit request/revoke/status operations use the existing provider-state
+  grant and bind actual work, retained debt, evidence, provider and runner/
+  watchdog source, policy, boot and bounded dual-clock deadlines. Invalid grant
+  metadata is observable and exactly revocable without clearing independent
+  holds. Retained selected trials settle once; failed-origin work cannot become
+  automatic pending work, and missing/corrupt bindings preserve work and retain
+  uncertainty. Captured `claim-selected` atomically consumes one current grant;
+  only its first committed reply reaches the same original actual owner. Spent
+  or lost replies cannot reconstruct runtime authority. Ordinary owner admission
+  still refuses selected provenance. GN binds ordinary versus selected recovery
+  argv to actual durable origin before owner construction and during source
+  recapture. Acceptance, cutover and automatic readiness remain separate gates.
+  Selected acknowledgements recheck repository-wide physical/control holds after
+  their final drain. A transient same-transaction fresh proof binds the original
+  lifetime subject and exact-sequence raw cleanup evidence; it grants no durable
+  override and leaves provider quarantine independent.
+  Recovery evidence refuses partial zero-watermark acceptance receipts, matching
+  ordinary admission; invalid positive receipts remain explicit safety evidence.
+  The retained retry helper participates in existing server restart detection.
   The queue's `scripts/lib/index_marker_legacy.py` isolates malformed legacy
   artifacts in retained import receipts without replacing business failures;
   real filesystem/SQLite errors remain visible. Schema 3 atomically fans requests
@@ -1795,7 +2127,7 @@ the shared banner is not an assertion about all concurrent sessions.
   fences every automatic reconciliation/claim/launch until the later protocol
   completes. There is no readiness setter. Behind that fence, the checked
   consumer validates complete NUL list/claim/escalation acknowledgements and
-  actual child status, dispatches one provider from its authoritative claim and
+  transport status, dispatches one provider from its authoritative typed claim and
   settles the complete context. Entrypoint and freeze repository normalization
   preserve trailing newlines and collapse Linux root aliases before lock hashing.
   Retained terminal decisions replay without
@@ -1826,15 +2158,61 @@ the shared banner is not an assertion about all concurrent sessions.
   original ancestor chain. Collector read failures retain the affected physical
   hold without aborting unrelated reconciliation; publication failures propagate.
   Intent callback RuntimeError refuses child creation
-  with private diagnostics. Automatic readiness stays fenced; actual scope creation, watchdog/
-  runner wiring and recovery remain unfinished. Synthetic fixtures do not
+  with private diagnostics. Automatic readiness stays fenced; native kernel
+  and production acceptance remain unqualified. Synthetic fixtures do not
   establish native kernel or production acceptance.
   `scripts/lib/code_intel_source.py` provides explicit captured-source diagnostics
   and a finite assembly API: Python and shell buffers match one immutable Git
   tree, and Python compilation/hashing use those same bytes with original origins.
   Private sealed handoff checks its caller-bound digest before entry compilation;
-  cached local modules refuse. This is not yet the queued shell/watchdog caller
-  and supplies no new launch, recovery or automatic-readiness authority.
+  cached local modules refuse. Service startup enters captured runner and
+  entry helpers, including the queue/availability and scope/watchdog closure;
+  only the canonical runner lock crosses its entry handoff. Optional queued
+  inputs freeze the native environment with one registered invocation slot,
+  preserving process-control environment and managed config/path/admission
+  checks. Private runtime transport is not launch authority; automatic
+  readiness stays fenced and
+  the supervised recovery caller remains separate.
+  The private CBM reporter consumes its bounded startup ACK before worker entry,
+  verifies its actual live parent and original scope, and rechecks ownership at
+  registration and native intent. Original counter baselines and fresh startup
+  OOM observations survive the handoff; either hierarchical or local sampled
+  kills refuse startup. The existing private output carries framed control
+  data, with provider output routed to logging. Watchdog/CPU/IO policy binds
+  the same source identity. The private initial-owner endpoint takes the
+  canonical locks, reserves its actual self once, owns scoped reporter and
+  monitor children, and sends ACK only after fresh child checks. Its sole
+  private cancellation-pipe writer retires the monitor through EOF. Required
+  physical control precedes blocking publication; raw waits, producer EOF,
+  monitor-group absence and original cleanup independently constrain closure.
+  Work expiry first enters the existing stop transition; final cleanup expiry
+  retains an open obligation rather than certifying completion.
+  Pending startup pressure precedes ACK, and every first stop chooses the
+  observed scope or the actual unacknowledged child. Monitor interval waits
+  wake on private EOF; manager-client cancellation and actual reaps remain
+  owned, and an unavailable client wait keeps closure open.
+  First stop intent is distinct from resolved action: failed validated attempts
+  retry inside the same original budget while children and output drain.
+  Terminal child identity retains raw wait authority without allowing terminal
+  subjects into default live scope proof. The canonical launcher reuses captured
+  literal-argument compatibility with its exact executable/environment basis.
+  Synchronous manager observations and non-atomic name-based actions retain
+  their documented trusted-manager boundaries.
+  Pre-startup stop intent fixes a two-second local drain bound clipped to work
+  expiry; accepted TERM and late group proof cannot certify closure. Transient
+  cleanup reads retry within the fixed final budget, requiring fresh proof.
+  The initial scope also requests the frozen runtime cap, zero randomized extra
+  and final SIGKILL; only its actual producer requires these effective typed
+  properties before ACK. Generic readers retain their existing contract.
+  Manager runtime enforcement survives ordinary owner return/death, but is not
+  a cleanup receipt or native qualification. Kernel/manager failure and explicit
+  trusted-manager abandonment remain limits; activation is still fenced.
+  Separate producer histories retain the first baseline and one strongest
+  actual sample across delayed delivery. Unknown closure stays open; unregistered
+  launches stay uncertain. A retained local-only kill leaves uncertainty even
+  after successful waits, without changing historical resource accounting or
+  inventing an accepted stop. Timer dispatch, GitNexus's runtime adapter, supervised
+  recovery and native qualification remain separate gates.
   `index_marker_recovery.py` adds explicit transaction-only schema-5 storage,
   original-owner control completion, persistent provider holds and an exact
   terminal/control/source acceptance-watermark reader on the same queue.
@@ -1843,14 +2221,18 @@ the shared banner is not an assertion about all concurrent sessions.
   observations preserve owned OOM kills, including the first sample, before
   duplicate/conflict reduction; clean control cannot erase resource evidence.
   Default initialization stays4; new native authority requires5, with no live
-  cutover, retry grant, acceptance setter or positive automatic readiness here.
+  cutover, acceptance setter or positive automatic readiness here. Explicit
+  transaction-only retry grants in `index_marker_retry.py` require schema5 and
+  captured supervision. Selected consumption shares the existing transaction,
+  final drain and physical owner, preserving original identity and first-commit
+  acknowledgement; it does not implicitly migrate or enable automatic work.
   Legacy uncertainty preserves original settlement/shared debt and uses
   non-claim observations for ambiguous pending/reused identities. Common scalar
   reduction covers reconciliation and embedded outcomes; import batches dedupe
   provider revision advances. Retained cleanup evidence preserves healthy
   sibling eligibility after original physical/control release; unresolved extra
-  conflicts remain provider-scoped. Runner and supervised recovery remain
-  separate, unqualified contributions.
+  conflicts remain provider-scoped. Explicit orphan reconciliation supplies no
+  retry grant, acceptance, automatic readiness or production qualification.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
@@ -2040,8 +2422,15 @@ the shared banner is not an assertion about all concurrent sessions.
   skills and MCP servers like a terminal and registers as an owner foreground
   session. The host updates its initialized model and checkpoints existing rows
   after disconnect only when the recorded child is confirmed dead; failures
-  remain visible and leave the existing reaper as fallback. Phase 0 host:
-  `scripts/live_agent_cli.py`; only the `owner_cli`
+  remain visible and leave the existing reaper as fallback.
+  Hosts can declare `output_surface="speech"`; identity injection
+  then requests direct spoken replies without terminal model/effort headers.
+  Hosts: `scripts/live_agent_cli.py` for a direct terminal, or the opt-in
+  `genesis-live-agent.service` with a private Unix control socket and
+  `scripts/live_agent_attach.py` owner client. Detaching preserves the agent;
+  reconnect sends current state/full pending asks, not event history. Slow
+  controllers disconnect rather than accumulate unbounded delivery queues.
+  The unit renders without default enablement. Only the `owner_cli`
   initiator may call `turn()` until model-initiated turns pass the
   autonomous-CLI approval gate. Turns the session injects itself
   (background-task notifications, peer or scheduled messages) still run, as in
@@ -2195,7 +2584,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 4721e0d93 2026-11-07
+verified: 0aa0bf9f2 2026-11-10
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -2213,7 +2602,10 @@ verified: 4721e0d93 2026-11-07
   whole page. Locked appends sequence timestamps within a 300-second future
   window; inadmissible clock outliers remain on disk until eligible, with a
   new bounded stream after a large clock reset. Host redeploy and installed
-  conversation-history verification remain outstanding.
+  conversation-history verification remain outstanding. The `test-alert`
+  gateway verb (`--test-alert`) sends one INFO test alert through the same
+  dispatcher, never queued, and prints one JSON line, so a delivery can be
+  triggered on demand and its history row checked.
 - **Snapshot deletion window** (`guardian/deletion_window.py`): routine
   snapshot deletions (the superseded healthy snapshot, prune, and what incus
   would expire before the next window) wait for `snapshots.deletion_window`,
@@ -2277,7 +2669,10 @@ verified: 4721e0d93 2026-11-07
   specific scheduler on a stale `scheduler_heartbeats` entry (`awareness`/`surplus`,
   `job_health.last_run` age > 900s) — the "zombie scheduler, alive but not dispatching"
   case. Restart is deferred while `heavy_workload` is set (dream cycle), during a boot
-  stabilization window, or a network outage; repeated restarts (flap) or max-restarts
+  stabilization window, or a network outage; a target in its first start attempt
+  (a start step, no automatic restart yet, under 300 s) is left to systemd's own
+  start timeout, so a start that times out every time still escalates, and a target that is activating, inactive or failed is STARTED, never
+  restarted, so a running start step (ExecStartPre) is never SIGTERMed; repeated restarts (flap) or max-restarts
   escalate to a durable owner/Telegram alert. This is why a wedged/dead surplus needs no
   `subsystem_stale` alert (§9): it is detected and self-healed here at 900s.
   Each tick also reads the container's `io.pressure`; above full avg10 25% it
@@ -2306,13 +2701,19 @@ verified: 4721e0d93 2026-11-07
   over stdin, as the configured container user, #3627) so newer ineligible
   reports cannot hide it; JSON-quoted, capped at 2,000 characters and fenced
   as untrusted; empty, and the prompt unchanged, when there are none. The
+  pick is a stub that runs the repair loader's own `newest_eligible` (#3892;
+  no copy of its rules lives in the collector): from the installed kit
+  (`~/.genesis/lib/live-repair/current`, resolved physically), else from
+  HEAD's blob (`git show HEAD:`, never the working tree), which is also what a
+  kit older than the function gets; each module is read as a regular file of
+  at most 1 MiB, and with neither the pick prints nothing. A cross-reader
+  test runs deploy health, the pick and `newest_eligible` on one dir set. The
   container reads are bounded where they are produced (only a report dir
   named as the writer names it and not a symlink; one regular report opened
   without following a symlink, 4 MiB; the repo compared as the repair loader
   compares it; dirs ordered by the loader's `report_order`, seconds then
   pid, a name over 300 s ahead skipped and at most 8 dirs read, as deploy
-  health does; those rules held equal to the loader's by a parity test and a
-  cross-reader test; a newer one over that cap, unreadable or not a JSON
+  health does; a newer one over that cap, unreadable or not a JSON
   object is shown as "report too large" or "report unreadable", never skipped
   for an older one, unless the top-level repo, result or dismissed_at read
   from the writer's indent-2 layout makes it ineligible; journal lines cut to
@@ -2320,6 +2721,20 @@ verified: 4721e0d93 2026-11-07
   `live_repair_unresolved` reads the newest READ one, and
   Telegram alert fields are cut before escaping. Residual: a container that
   fakes git's own output can still pass the probe.
+- **`RESTART_SERVICES` waits for systemd's own start** (#3492 D2): it reads
+  genesis-server's `ActiveState`, `SubState` and `InvocationID` first. A unit
+  still `activating` gets no command, because its start step may be the boot
+  repair healing the checkout, and a restart would SIGTERM it. A `failed` or
+  `inactive` unit gets `start --no-block`, an active one `restart --no-block`.
+  The result is then judged by the unit, polled every 5 s for up to 200 s by the clock (a
+  stop, a start step and RestartSec at the unit's 90 + 90 + 10 s): success
+  only once a new invocation is `active`, since just after a `--no-block`
+  restart the old process can still read active. Three unreadable reads in a
+  row end the wait, and a unit at its start limit (`Result=start-limit-hit`)
+  is reported at once with that named. A client timeout on the
+  command is not a failure in itself. A unit that fails or never comes up is
+  reported with its state and the boot repair's newest `live-move repair:`
+  journal line (cut to 400), and that report is the recovery-failed page.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
   `scripts/update.sh` / `guardian-gateway.sh` (the host-deploy gate in the dev
   skill). Known wart: the watchdog's stale-alert wording inverts when the
@@ -2357,8 +2772,13 @@ verified: 4721e0d93 2026-11-07
   (`pool.py`) and **RAM** (`memory_watch.py`, E-rest) — the latter over two
   axes worst-of, container cgroup (via incus-exec, best-effort) + host-VM
   `/proc/meminfo` (the reliable axis). Both use the shared `_tier_for`/
-  `decide_alert` hysteresis. Read-only `disk-status`/`ram-status` verbs expose
-  the same measurement to the container.
+  `decide_alert` hysteresis; RAM adds flap damping on top: a per-axis exit
+  margin (`memory_tiers.exit_margin_pct`, default 5), a blind axis holding its
+  last tier (stale after one re-alert window, and named in the page), and a
+  baseline of the highest tier paged since the last recovery that lasts one
+  re-alert window (state `memory_alert_state.json`: `tier` = that peak,
+  `axes`, `blind_since`). Read-only `disk-status`/`ram-status` verbs expose
+  the same raw measurement to the container.
 - **Pool RELIEF** (`pool_relief.py`) runs every tick, BEFORE `_check_cycle`
   (during an outage's diagnosis that is about hourly, since the tick is a
   oneshot). The tiers above only alert, and a thin pool once filled to 100%
@@ -2449,7 +2869,18 @@ verified: 4721e0d93 2026-11-07
   `"live"` is NOT implemented (dispatcher warns + downgrades); every proposed
   action requires human approval. `InfrastructureMonitor` (call site 37, free
   models) observes each awareness tick and wakes the dispatcher; state persists
-  to `~/.genesis/sentinel_state.json`.
+  to `~/.genesis/sentinel_state.json`. A dispatch counts as resolved only
+  when EVERY approved action exited 0 (`_record_execution`); per-action output
+  goes into the observation and log.
+- **sentinel/codex_mcp_stop.py** (`python -m genesis.sentinel.codex_mcp_stop`):
+  the Failure Inventory remedy for memory held by a shared Codex app-server
+  daemon's MCP servers (#4302). Dry-run by default; `--execute` only inside an
+  approved action. Resolves targets when it runs: direct children of a
+  `codex app-server --listen` process that lead their own process group with
+  pipe stdin+stdout, excluding Codex helper binaries, systemd-unit members and
+  anything under a `claude` process. Lever `codex_mcp_stop.mode` in
+  `config/sentinel.yaml` (`propose_only` | `off`) +
+  `GENESIS_CODEX_MCP_STOP_DISABLED=1`.
 - GROUNDWORK: guardian-cgroup, guardian-bidirectional, sentinel-live-autonomy.
 
 ## 9. Ambient cognition — heartbeat, reflection, attention
@@ -2523,6 +2954,19 @@ verified: c712f1bde 2026-11-06
   (bootstrap, #1082) → reconcile (guardian, #1083) → alert (this). The
   provision-or-surface convention: a resilience feature that skips on a
   missing prereq must either provision it or register a fact this check reads.
+  The storage section's `user_manager_io_delegated` (io in the user manager's
+  `cgroup.controllers`) feeds `cgroup_io_settings_inert`: an advisory that
+  names every place Genesis sets an `IOWeight`-family key on a user unit or
+  scope (`infra_profile/cgroup_io.py` `SETTERS`, locked against the tree by a
+  test) and says those keys have no effect there. It is informational: alone
+  it is a `low` note (dashboard only; the morning report reads
+  critical/high/medium), never the `high` alert (the deploy-staleness
+  informational-class pattern), and it carries no crash-resilience claim. A
+  note never decides the unverifiable-plane hold: with only notes computable
+  and a plane unverifiable, the open row is kept. Blind spot: it is silent
+  once io is delegated, though weights then still need BFQ or iocost; and
+  while a plane stays unverifiable with no row open, the note is not written
+  either (the same hold that applies to real gaps).
 
 - **Git-health alerts self-heal, slot-scoped (2026-07-16)**: the per-tick cheap
   probe auto-resolves open `git_cheap` observations on pass; the daily deep
@@ -2743,8 +3187,25 @@ verified: c712f1bde 2026-11-06
   idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
   one is age-based and passive. `session_awareness/repo_pulse*.py`.
-- **Post-merge verification obligations** (shipped; producer automatic, consumer
-  manual-invoke only — nothing dispatches a validator yet — issue #1718):
+- **Holdout scenarios** (shipped; per-install data, none in the repo): hidden
+  exact checks that builders never see, in `$GENESIS_HOME/holdout/HOLDOUT.md`,
+  written only by the `holdout-writer` subagent (regression scenarios from
+  today's behaviour, or intent scenarios from a specced issue before it is
+  built). `scripts/holdout_runner.py --pr N` runs each touched scenario at the
+  merge's first parent and at the merge, prints ids, verdicts and `Protects`
+  lines only, and the validating-merges skill ("The holdout check") maps the
+  verdicts into the evidence document. The session observer records nothing for
+  that subagent, so its work stays out of memory. An advisory hook,
+  `scripts/hooks/holdout_fence.py`, records any other agent reaching the
+  directory or receiving its text, and the runner names the scenarios those
+  exposures may have spoiled. An install without the file
+  has no holdout and the runner says so. Format and rules:
+  `docs/reference/holdout.md`.
+- **Post-merge verification obligations** (shipped; producer automatic; consumer
+  the standing validator session, started only on the owner's explicit
+  instruction and self-paced once started, per the validating-merges skill's
+  "Standing mode", or any manual validator; nothing dispatches or restarts one
+  automatically — issue #1718):
   the pulse worker's verification lane opens one `pr_verifications` row per
   MERGED PR, so "run the E2E after merge" survives the merge instead of living
   in someone's memory. A documentation-only diff is auto-closed with the reason
@@ -2759,8 +3220,12 @@ verified: c712f1bde 2026-11-06
   (`scripts/pr_verification.py`, with its doctrine in the `validating-merges`
   skill and its readers on `repo_pulse_worker.py`). Its picker,
   `repo_pulse_worker.py --next-for-validation`, names the ONE row to work next:
-  not-yet-done, then never-attempted, then a parked row past 7 days, never
-  fail-intent; deployed rows with an `E2E:` plan first, newest merge first. Deploy
+  not-yet-done and passing rows awaiting tracking, then never-attempted, then a
+  parked row past 7 days, never fail-intent. A not-yet-done row whose stored
+  evidence declares `no_progress` (the validator's judgment that its remaining
+  steps are the previous attempt's) waits 7 days after that attempt once its
+  tracking is complete (a `TRACKING PENDING:` last note is offered at once), then
+  returns to the front; deployed rows with an `E2E:` plan first, newest merge first. Deploy
   is merge-commit ancestry of the serving commit, except a stacked PR, which is
   kept and labelled because ancestry cannot prove it either way. It fails closed
   (picks nothing) when GitHub or git cannot answer. The verdict is DERIVED from the
@@ -2775,6 +3240,10 @@ verified: c712f1bde 2026-11-06
   uncovered or stale declarations, including previews; old evidence still parses
   and reasoned `E2E: none` declarations need no mapping. The shared source parser
   also supplies the existing script facade (verified: 2026-11-06).
+  Both writers also refuse a closing verdict while an event-gated gap's date has
+  come, and print or return advisory completeness prompts (`completeness_prompts`)
+  on every run; the prompts change no verdict and are not stored. They do not
+  replace the independent verifier (#4180; verified: 2026-11-14).
   Fixture lookup injection stays outside the public MCP schema. Its
   server-side calibration gate forces preview until operator opt-in, including
   attempt notes. Real writes use a separate admitted existing-only connection;
@@ -2784,7 +3253,11 @@ verified: c712f1bde 2026-11-06
   the recheck CLI appends failed/done measurements without reopening the row.
   Unfinished or malformed rechecks survive retention; malformed histories are
   surfaced for inspection rather than hiding later rows. Owed rechecks refuse
-  closes before migration, including CLI/MCP previews. Only a PASS verdict discharges
+  closes before migration, including CLI/MCP previews. Each close and attempt
+  records which client wrote it (`closed_by` / `last_attempt_by`, from
+  `caller_context.client_kind()`) and the session (`recorded_session`); the
+  path-rule exemption records `repo-pulse`, existing rows stay NULL, and the
+  label decides nothing. Only a PASS verdict discharges
   an obligation; the other verdicts leave the row OPEN and annotate it, so a PR
   nobody could verify says why instead of looking untouched. The one non-obvious
   invariant, because the obvious one is false: a PASS verdict implies the row is
@@ -3229,7 +3702,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 3e27b4794 2026-10-23
+verified: 5be8573a5 2026-11-07
 ```
 
 - **eval/ego_runtime**: opt-in canonical proposal-operation probes using fresh
@@ -3450,6 +3923,15 @@ verified: 3e27b4794 2026-10-23
   and recovery state. Incremental publication follows durable append; uncertain
   publication stops derived-state reading until reconstruction. Historical
   reading never creates or truncates files; version-1 evidence cannot execute.
+  Read-only `study-check`/`study-report` validate a frozen continuation plan and
+  select the first eligible historical answer for each logical coordinate,
+  regardless of its grade. Original journals supply physical counts and costs;
+  unresolved reservations and separately bound raw receipt annotations remain
+  visible. Full current admission, exact request/source identity and finite
+  remaining allocations are checked without credentials or provider requests.
+  This tranche cannot acquire or resume requests and reports an inherited prefix
+  without claiming verified study closure. See
+  `docs/reference/qualification-lineage.md`.
   The isolated qualification CLI supplies explicit execution and reporting
   callers; it does not schedule automatic execution. Production credentials and
   accounting stores are outside this boundary. See
@@ -3472,7 +3954,10 @@ verified: 3e27b4794 2026-10-23
   See `docs/reference/qualification-corpus.md`.
   Qualification's pinned transport supplies a caller-provided adapter router
   through the production delegate, a shared one-egress wire guard, response-hook
-  durability and exact lexical Decimal GET billing. Documented selected-route
+  durability and exact lexical Decimal GET billing. Frozen gateway `model`,
+  optional `backend_model` and `receipt_model` keep namespace-specific exact
+  matching; omitted pins retain strict legacy IDs, with no inferred aliases or
+  migration of stopped campaigns. Documented selected-route
   metadata is checked on live acceptance and replay; gateway response caching
   is explicitly disabled. Contradictory served identities retain unresolved
   liability, while expense settlement cannot qualify invalid routing evidence.
@@ -3517,6 +4002,12 @@ verified: 3e27b4794 2026-10-23
   independent-backup claim. Missing retained evidence refuses before rendering.
   The isolated serial CLI supports Flash-only, explicit Pro–Flash or historical MiMo–Flash execution
   under an exact frozen operating plan and a separate local spending assertion.
+  Bounded `study-run` uses a separate count-bound consent, fixed nonrelaunchable
+  root and one existing physical journal per request. Only the precise closed
+  upstream-pool rejection can receive a finite replacement. Both offline study
+  readers census the complete owner/sibling population; model errors and
+  unresolved expense remain separate. This adds no paid authorization, route
+  selection or activation. See `docs/reference/qualification-continuation.md`.
   An explicit manifest-bound Pro incumbent sample retains complete reference
   admission and full Flash gates. Sampled Pro reports completion separately
   from qualification; execution and detached reporting use the same declared
@@ -3572,6 +4063,11 @@ verified: 3e27b4794 2026-10-23
   pinned monolith invocation, retaining outer context/probe/backoff/wake code.
   Thirteen cases/fifteen wakes/thirteen native sessions plus reader correlations
   require actual state, bytes, run attribution, context and pacing evidence.
+  Command cleanup is measured through task-local group-closure records for
+  version discovery, setup, appends, wakes, history and correlation readers;
+  missing, live or unverifiable scopes cannot pass. Verified container init
+  identity and before/after census additionally reject unexpected survivors.
+  This stamp refresh covers that developer-evaluation cleanup slice only.
   Integration requires its actual post-review CI report. Tiered memory is off,
   deterministic related context remains on, and only the protected MCP effect is
   exposed; no full runtime, dispatcher or capability parity follows. See
@@ -3771,6 +4267,16 @@ verified: 9a95483a8e7f 2026-10-09
   (`gemini-flash-latest`) is declared but unchained: it resolved to 3.8 Flash
   (same model and quota as `gemini-free`), so it joins the chains only once it
   resolves to a different model.
+- **litellm loads on first use, not on import** (#3558): `litellm_delegate`
+  imports it inside `_litellm()` on the first `LiteLLMDelegate.call()` (in a
+  worker thread) and registers `_CUSTOM_MODEL_COSTS` then. So importing
+  `genesis.routing`, loading the routing config, the onboarding floor check and
+  building the standalone router all stay litellm-free: the SessionStart charter
+  hook and the standalone MCP servers no longer pay its multi-second import. The
+  server keeps importing it at startup (`runtime/init/router.py` calls
+  `litellm_delegate.warm()`). Patch `litellm_delegate.litellm` as before; never
+  re-add a module-level `import litellm` (locked by
+  `tests/test_routing/test_litellm_lazy.py`).
 - **Coherent routing reloads** (`Router.reload_config`,
   `LiteLLMDelegate.for_config`): requests capture config/delegate/pacing/breaker
   bindings before yielding. Replacement/rename breakers preserve holds while
@@ -3821,7 +4327,18 @@ verified: 9a95483a8e7f 2026-10-09
   429s and unparseable bodies keep the old behaviour. Per-provider circuit breaker (3 failures, exponential backoff
   capped 30 min — 4h for QUOTA_EXHAUSTED and NOT_ENTITLED; 429 = backpressure,
   NOT a breaker failure; state persisted cross-process to
-  `~/.genesis/circuit_breaker_state.json`). **Probe/call evidence symmetry** —
+  `~/.genesis/circuit_breaker_state.json`). **Empty balance as a client error:**
+  a 400/422 is normally BAD_REQUEST (the payload's fault, never recorded by the
+  breaker), except when the body's `error.type` or `error.code` is a measured
+  balance token (`retry._BALANCE_ERROR_TOKENS`): that classifies
+  QUOTA_EXHAUSTED, so the breaker opens after 3 failures and the provider is
+  skipped. The token is matched as a field of the first JSON object in the
+  error string, never as a substring, because a 400 body can carry request or
+  generated text back; a non-JSON body stays BAD_REQUEST. The delegate also
+  reports a litellm `BadRequestError` that carries HTTP 402 as 402 (every
+  other status on that exception is still reported as 400). Cost: a topped-up
+  provider stays skipped until its open window ends or the operator re-enables
+  it from the dashboard. **Probe/call evidence symmetry** —
   a probe may only undo what a probe did: `probe_suspect()` downgrades CLOSED to
   HALF_OPEN on a failed probe and a clean probe may clear THAT, but a breaker
   opened by a real call failure (`_opened_by_call`) is closed only by a real
@@ -3885,7 +4402,13 @@ verified: 9a95483a8e7f 2026-10-09
   external mutator of breaker state is the dashboard toggle
   (`dashboard/routes/providers.py`), and it goes through `force_open()` /
   `force_close()` rather than assigning private fields, so the origin flag
-  cannot drift out of step with the state. Both are COMPLETE transitions --
+  cannot drift out of step with the state. It picks between them from the
+  operator's intent (the dashboard posts `{"enabled": <bool>}`, the action its
+  button showed), and without one from the raw `_state` field: never from
+  `.state`, whose read moves an expired OPEN to HALF_OPEN and once turned an
+  "enable" on an expired hold into a fresh disable. (Known limit: with no
+  intent, a breaker a reader has already moved to HALF_OPEN is disabled, the
+  button a fresh dashboard shows for it.) Both are COMPLETE transitions --
   they notify (which is what the registry wires to `save_state`) and clear the
   qualifiers they invalidate. They are complete with respect to
   BREAKER FIELDS only — neither fires `on_recovery`, so an operator re-enable
@@ -3982,14 +4505,63 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
-          env.py, _config_overlay.py, caller_context.py, caller_credentials.py]
-verified: 973a0e6 2026-10-30
+          env.py, secrets_location.py, _config_overlay.py, caller_context.py, caller_credentials.py]
+verified: 5a3de4eee 2026-11-08
 ```
+
+Scoped verification: the caller identity boundary only. Shared mode refuses
+process-environment identity through both accessors, including after environment
+drift; validated requests use `caller_context()`. Legacy reads remain raw and
+per-call. This does not requalify the remaining platform/data subsystems or
+activate shared MCP.
+
+A 2026-11-07 verification at the same commit covers the request-ownership
+prerequisite below; the other platform descriptions retain their individually
+cited verification dates.
+
+Shared validator-health also has a request-local automatic activity-write opt-out
+around the entire message boundary. It preserves memory counters and the
+construction-time persistence hard opt-out, without suppressing queued ordinary
+flushes or validator-memory records. This does not strengthen batch durability
+or make the service read-only.
+
+Limited refresh: the shared span capture/writer/reader slice only. Other platform
+claims retain their earlier verification scope. `start_span` now supports
+`include_exception_text=False` for categorical failures without formatting the
+exception; existing callers keep the default formatter. Inbox attempt metadata
+uses the existing optional span persistence/API, not a new store or gate; see
+`docs/reference/inbox-attempt-identity.md`.
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
 provider/model/outcome. Failed historical attempts render as a warning, not an
 inferred current provider outage. The readiness worker uses the shared
 tool-disabled CC probe without changing its schedule or routing authority.
+
+`util/codex_cli.py` is the only place under `src/genesis` that names the Codex
+CLI. Its `codex_exec_argv`/`codex_child_env` give every Codex run Genesis
+starts unattended (the executor's adversarial verifier, the contribution
+reviewer) a child environment from `caller_context.dispatched_child_env`:
+`GENESIS_CC_SESSION=1`, supervised marker dropped, origin kept.
+`tests/test_codex_dispatch_marker.py` fails on a `codex` literal anywhere else.
+The marker is inert until the Codex project config forwards it to the Genesis
+MCP launcher; it exists so an unmarked Codex run can mean the owner's own
+client, as an unmarked Claude Code session does.
+
+Tool calls from a labelled client (`GENESIS_CALLER_PROFILE`, read into
+`CallerContext.profile`; owner-mode Codex sets `codex`) are logged to
+`client_tool_calls` by `observability/client_call_log.py`, which
+`install_instrumentation` puts on all four servers and which reads
+`caller_context()` per call: client, server, tool, start time, `outcome`
+(`returned`/`raised`/`cancelled` — how the call ended, not whether the tool
+succeeded), and the written row's id for an allowlisted set of writer tools.
+Never the arguments. The write runs after the call on its own connection,
+shielded from cancellation; a failed or skipped write (no database file, table
+not migrated yet) is a warning that never changes the tool result. Credential
+lookups stamp the same label into `credential_access_log.client` server-side.
+Retention: `scripts/prune_client_tool_calls.py` (default 180 days) from disk
+hygiene. Unlabelled calls, which include every Claude Code session, log nothing.
+Credential values returned through `knowledge_recall`/`memory_recall` are still
+not in `credential_access_log` (#3983 removes them from those paths).
 
 Fresh dedicated validator-health trackers disable new activity persistence
 before DB attachment, retaining memory metrics and historical provider SELECTs.
@@ -4156,14 +4728,26 @@ logger or unrelated exceptions with copied text and no provenance.
   `RequestDatabase` supplies a stable facade with one fresh physical connection
   per independent unit, bounded admission, retained cancellation cleanup and
   cursor closure. It preserves explicit CRUD commits and refuses expired scopes;
-  it does not provide whole-tool atomicity. Existing MCP initialization still
-  uses its legacy connection. `spawn_database_task` gives scoped detached
+  it does not provide whole-tool atomicity. Ordinary stdio and in-process MCP
+  initialization retain legacy connections; explicit shared startup uses the
+  facade. `spawn_database_task` gives scoped detached
   writers their own unit, preserves other caller context, and tracks jobs from
   scheduling through shutdown, including cancellation before start.
   Detached work requires explicit background connection and job-count budgets;
   foreground-only construction allocates neither. Background admission is
   separate from foreground capacity; recall queue pressure falls back inline
   while shutdown refuses new resource work (source checked 2026-11-06).
+  `begin_draining`/explicit-grace `drain` extend the same registry; `close`
+  initiates zero-grace shutdown and concurrent callers join the first policy.
+  `run_in_thread` retains actual synchronous completion independently of an
+  asyncio proxy, including joined-child work, before DB finalization/admission
+  release. Ambiguous submission/canceled-before-start work retains its claim and
+  fails shutdown; dependent provider closure requires positive settlement.
+  `run_resource_thread` preserves ordinary legacy thread cancellation. These are
+  internal prerequisites; the nine memory-consumer thread boundaries use them,
+  and the explicit shared factory drains them before dependent provider closure.
+  Lease budgets bound database
+  connections, not executor items.
   Activity, embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
   legacy connections keep ordinary task scheduling. Internal
   `initialize_request_service` bootstraps memory/health/recon/outreach with
@@ -4174,9 +4758,11 @@ logger or unrelated exceptions with copied text and no provenance.
   warmed once by the owning bootstrap; registration cannot rebind pending flushes
   or duplicate history. Scoped health supports the standalone status-file service,
   rejecting runtime snapshot sharing before changing registration. Reinitialization
-  replaces obsolete instrumentation in either DB mode. No CLI or transport
-  selects it yet; caller identity, bookmark policy and shared activation remain
-  separate work. See
+  replaces obsolete instrumentation in either DB mode. The explicit shared HTTP
+  launcher selects it with authenticated request callers and leaves pending
+  memory bookmark files for the per-session path. Ordinary stdio and in-process
+  initialization retain their existing paths; local bookmark consumption and
+  routing activation remain separate work. See
   `docs/reference/request-database.md` for lifecycle and failure semantics.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Every
@@ -4351,7 +4937,14 @@ logger or unrelated exceptions with copied text and no provenance.
 - **security/**: prompt-injection defense + outbound scanning — sanitizer is
   LOG-ONLY for internal sources (perimeter EMAIL/INBOX can block);
   `output_scanner` = deterministic outbound secrets/IP scan (a payment card
-  number is a critical finding); `card_shapes` = the one payment-card-number
+  number is a critical finding) plus in-place credential redaction for peer
+  replies and remote diagnostics; `credential_shapes` = the shared
+  credential-shape table (vendor key prefixes, JWT, Discord webhook URL,
+  Telegram bot token; stdlib-only data, recall-first), read by
+  `output_scanner` for every shape it does not own in a tighter local form and
+  held equal to the hook scrubber's two patterns by
+  `tests/test_security/test_credential_shapes.py` until the scrubber loads it;
+  `card_shapes` = the one payment-card-number
   detector (ASCII digits, alphanumeric boundary, standard groupings, brand
   prefix + length, Luhn, UUID groups skipped; stdlib-only so scripts load it
   by path), used by the browser tool guards, `reference_store`, reference
@@ -4550,7 +5143,15 @@ logger or unrelated exceptions with copied text and no provenance.
   marker only while holding `locks/update.lock`; the routes also run the `live`
   check under it and remove a marker only when its holder is dead or theirs.
   Exception: `bootstrap.sh`'s crash recovery still removes it unconditionally.
-  `secrets_path()` is repo-relative unless SECRETS_PATH set.
+  `secrets_path()` delegates to the stdlib-only `secrets_location.py`, mirrored
+  by `scripts/lib/secrets_path.sh`: `SECRETS_PATH` wins; otherwise an existing
+  `~/.config/genesis/secrets.env` wins over the checkout and `~/genesis`
+  legacy files. With no file, the default is still the checkout's file; the
+  default switch, the unit files and creating the home config are the
+  migration's. Missing credentials at startup queue a critical alert. Guardian
+  check/restore and passphrase resolution, the graph census proof, disk
+  hygiene's store knobs and the eval loaders all take that one answer, and the
+  secrets guard protects the home-config file, its folder and their aliases.
 - **Managed systemd user units** (deploy scripts, no `src/genesis` module):
   `bootstrap.sh` renders `scripts/systemd/*.template` and `setup-vnc.sh`
   renders `scripts/systemd/vnc/` into `~/.config/systemd/user`, both through
@@ -4636,12 +5237,16 @@ logger or unrelated exceptions with copied text and no provenance.
   count there, one anywhere else (the rebuild having moved nothing) `holds`. A "merging"
   row on `live` whose record update.sh already dropped (it adopted the tip,
   own_head is that tip) is judged the same way toward own_head, so a rollback
-  killed partway after adoption is caught too. The remedy follows HEAD: on a
-  live row at the tag, the repair (`scripts/deploy_candidates repair-move`,
-  below), then the by-hand steps for when its kit is not installed; at the update's new code (main's merge or the rebuilt tip), put the
-  paths back and finish with `--post-merge` (Dismissing there leaves code
-  bootstrap never ran on); a main row at the tag keeps the by-hand text (save,
-  restore, Dismiss). The dashboard's progress poll returns the guard's remedy
+  killed partway after adoption is caught too. On a live row the remedy is the
+  repair (`scripts/deploy_candidates repair-move`, below) whichever end HEAD is
+  at: at the tag, followed by the by-hand steps for when its kit is not
+  installed; on `live` at the rebuilt tip (a rollback killed partway), it
+  finishes that rollback toward the tag, with `repair-move --explain` as the
+  by-hand steps, and never `--post-merge` (Dismissing there leaves code
+  bootstrap never ran on). At main's merge, put the paths back and finish with
+  `--post-merge`; a main row at the tag keeps the by-hand text (save, restore,
+  Dismiss). Both live texts name `repair-move --restore <ts>` as the way back
+  for a path that was not the update's. The dashboard's progress poll returns the guard's remedy
   (`guard_remedy`) and the update card shows it. `deploy_code_only.sh` and the live engine refuse to
   restart or move the checkout while it guards; a plain `update.sh` exits 5
   (before tagging or writing anything), and the dashboard's `/apply` answers
@@ -4749,14 +5354,78 @@ logger or unrelated exceptions with copied text and no provenance.
   **The live-move repair** (`scripts/lib/live_move_repair.py`, #3492 PR D1;
   `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS | --restore TS
   [--check]] [--explain]`; `--restore`, below
-  runs the copy bootstrap installs under `~/.genesis/lib/live-repair/current`,
-  never the checkout's; installing that kit, and running the repair at every
-  server start, is PR D2, not yet built; `--explain` needs no kit: with none
+  runs the installed kit, never the checkout's copy: `scripts/lib/live_repair_kit.py
+  install <repo> <home>` (#3492 D2a) writes the files named by `KIT_SOURCES` (one
+  literal tuple in the repair module, read with ast) from HEAD's blobs on main or
+  `live` into `~/.genesis/lib/live-repair.d/<kit_id>/` with a `KIT.json` of their
+  object ids, swaps the `live-repair/current` link by rename, and keeps two kits
+  (the prune takes only kit-id names and skips one whose KIT.json is flocked:
+  every repair run holds it shared; a symlinked `live-repair.d` or
+  `live-repair` is moved aside, never followed; a set-aside kit or `current` is kept a week from the
+  move); `status` reports ok,
+  missing, foreign, corrupt, partial or stale. bootstrap, `deploy_code_only.sh`
+  (past its update-state refusal), the update's rollback (when the code restore
+  succeeded) and, on `live`, `update.sh` right before its rebuild (the
+  `live-kit-install` block, #3492 D2c) install it, never fatally: the installed kit is HEAD's at the last
+  successful install, so it can be newer than the code that wrote the update state
+  (an update killed after its bootstrap; a rollback to a tag from before the
+  installer, whose install fails and keeps the newer kit), and it must read the
+  previous release's state. repair-move resolves `current` physically and runs
+  `python3 -I -S -B`, and the module's own directory is a realpath, so a run stays on
+  the kit it started from. **At every start** of genesis-server and genesis-bridge
+  (#3492 D2a-2) an `ExecStartPre` runs the kit's `live_move_repair.py --boot`
+  (`TimeoutStartSec=90`). Its 75 refuses the start, and so does a signal death
+  and the 1 of a kit from before this step (no `live_move_boot.py`, e.g. one a
+  rollback reinstalled: it exits 1 where this kit exits 75);
+  every other outcome starts, with a journal line and, while an update state
+  exists, a page keyed `live_move_repair:boot:kit:<rc>:<kit_id>` (no kit or a
+  crash). `--boot` first re-hashes the kit against its `KIT.json` (a file
+  missing, altered or of another version: exit 3, start and page), then ends
+  every child by one deadline 75 s after its start (`live_move_boot.py`: git,
+  the guard's git through its `_DEADLINE`, restore-hooks, which ends 10 s early
+  so the healed tree is judged in time; a call with no time left never starts;
+  the heal's own git ends 5 s early, `END_MARK_S`, and every end mark may run
+  into that reserve with a 1 s kill grace, so a crash's mark taken after the
+  heal's deadline is still real (#4548; a hung mark early in the run can use the
+  heal's time and the reserve, still inside the 90 s pin);
+  the pin 5 + 75 + 3 + 1 + 4 <= 90 is tested, and a run past its deadline
+  ended `exit-code`, not `timeout`, in a transient unit: measured 2026-11-11
+  with a 20 s deadline; T-D34 repeats it only where a user manager exists). A `live` row judged
+  half-written that it could not heal keeps the service down (75: unresolved,
+  a failure after judging, a backup that cannot be written, the "neither" race,
+  a lock held past the budget on such a row); everything else starts (owner
+  rulings): a HOLD, GUARDS or CONFLICT_PENDING with a `kept` warning (the
+  guard's remedy), a half-written tree it never heals (a main checkout, or a
+  `live` rollback stopped after `merging`, #3722's wording) with a `mixed`
+  critical page, a failure before judging with `skipped`. Each page's key is
+  its class, the state's bytes as the run leaves them and an end mark of the
+  checkout (HEAD, `status -z`, index.lock, and the lstat identity, ctime
+  included, of up to 20,000 listed paths other than the ephemeral ones, so an
+  edit to a file that is already modified or untracked moves it; #4548), so a heal that keeps a HOLD and the
+  next boot's HOLD page once; a repeat of an unresolved heal (a heal that crashed
+  partway, or was killed before it recorded a result, is retried once at the next start: owner
+  ruling, its attempts counted from the newest 8 reports among the newest 32 folders on disk; a heal
+  writes its first REPAIR.json as it starts, before anything is saved, so one that fails or is
+  killed before its backup is complete is counted too (#4548); an end mark the deadline left unreadable
+  never counts as a change) with nothing
+  changed refuses at once with no new backup, unless another kit is installed
+  (its `kit_id` is part of the match). Every run, by command too, holds the kit's
+  `KIT.json` shared until it exits, so a reinstall's prune never removes a kit in use.
+  The deploy engine guards both halves (#3492 D2c): admission refuses a candidate
+  that changes a kit source or either unit template, and readiness
+  (`boot_repair_failures` in `deploy_candidates_gate.py`) refuses `live` while the
+  kit's status is missing, partial, corrupt or foreign, or cannot be judged (a stale kit is a NOTE: the
+  pre-rebuild install heals it), while the LOADED genesis-server unit
+  (`systemctl --user show`, with the user-bus variables defaulted as the watchdog
+  does) has no refusing `ExecStartPre` naming the kit with `--boot` (each entry judged
+  whole: systemd prints a `\n` inside one as a new line), or while its
+  `TimeoutStartUSec` is under 90 s; a systemctl that cannot answer refuses too.
+  `--explain` needs no kit: with none
   installed it runs the module as HEAD committed it, from memory, never the
   working tree's copy, which may itself be half-written) heals a live row's `mixed_tree`
-  with HEAD at the rollback tag, toward the tag, never toward the target (HEAD
-  at the target, a rollback killed partway, is refused with exit 1 and nothing
-  changed: finishing that rollback is a later PR, D1f): under update.lock and
+  toward the rollback tag, never toward the target (with HEAD on `live` at the
+  target, a rollback killed partway, PR D1f also finishes that rollback, below;
+  HEAD anywhere else off the tag is refused with exit 1): under update.lock and
   genesis-checkout.lock (every git lock a killed switch leaves, `index.lock`,
   `HEAD.lock`, the branch's ref lock and `packed-refs.lock`, is waited for while
   a process holds it, then saved into the backup's `git/` and removed by one
@@ -4806,8 +5475,63 @@ logger or unrelated exceptions with copied text and no provenance.
   never from the copy). The alert body is cut at 16 KiB, with how much was
   left out and a pointer to `REPAIR.json`, because one argv or environment
   string of 128 KiB or more is E2BIG (MEASURED); a queue that fails is
-  logged and never changes the exit code. A failure before the checkout itself changes (a
-  failed backup included) exits 0 at `--boot`. The guard then judges
+  logged and never changes the exit code. With HEAD on `live` at the target
+  (D1f), after that restore (a prefix of the tag's bytes counting as the
+  rollback's own interrupted write) `REPAIR.json` records `hooks: "pending"`,
+  then `live` moves from the target to the tag by compare-and-swap (`git
+  update-ref`, old value the target; a lost swap is `unresolved`, exit 1, the
+  ref untouched), then the tag's own `scripts/deploy_candidates.py
+  restore-hooks <target> <tag>` runs with update.lock's fd and under the
+  checkout lock, as update.sh's rollback runs it (`hooks` becomes `ok`; a
+  failure leaves it `pending`, said in the output, and the alert is
+  critical). When restore-hooks fails and the moved-from commit's
+  `scripts/hooks` cannot be read (the commit, a tree or a blob there gone: no
+  retry could ever restore from it), the repair reinstalls the tag's hooks
+  instead: every installed regular-file hook the tag's sync-hooks.sh lists
+  whose bytes are not the tag's (a candidate's, or a hand-edited one; a
+  symlinked or unlisted hook, or one already the tag's, is left alone) is
+  copied into the report's `hooks-before/` (0600, never over an earlier copy,
+  made durable; the report dir and `hooks-before/` must be this user's 0700
+  directories, on the retry path too, or nothing is touched), the names are
+  written to REPAIR.json's `hooks_before` with a note naming the folder ("not
+  reinstalled yet"), and only then removed; then the tag's own `restore-hooks
+  <tag> <tag>` has sync-hooks.sh install them fresh and judges them as
+  readiness does. Between that removal and the install no such hook is
+  installed (seconds; accepted: a failure there leaves the record, and the
+  next run converges). On its exit 0 `hooks` is `reinstalled` (not pending:
+  the hooks count and keep no longer apply), `hooks_note` says so, and the
+  output and an alert (critical when hooks were moved aside) name the folder.
+  A report whose `hooks_before` is set is kept by the prune and counted in
+  `live_repair_hooks_saved:<n>` until `--dismiss` (it may hold a hand edit's
+  only copy). A hook only the moved-from commit listed stays installed. With core.hooksPath
+  pointing away from `$GIT_COMMON_DIR/hooks` nothing is touched and the hooks
+  stay pending (readiness names that setting). Every later run first re-reads
+  each pending report (through `load_report`; a DISMISS_MARK folder is
+  skipped) under both locks, before its heal, and judges it against the refs
+  as it found them: `superseded` once `live` itself left the report's tag;
+  owed while `live` is that tag and HEAD is on `live` (HEAD elsewhere: left
+  pending; an entry whose commits are not full commit ids: left as it is).
+  An owed report's restore-hooks runs only after the heal, and only when the
+  tree then reads SAFE (no state, or one the guard calls SAFE), judged again
+  first since the heal may have moved `live` (#4367): restore-hooks runs the
+  checkout's engine and sync-hooks.sh, which a half-written tree may hold
+  another commit's bytes for and a held one a hand edit. A forward heal's own
+  restore-hooks runs inside the heal, once the files are the tag's, as
+  before. Each retry writes back only `hooks` (0600); a report
+  dismissed with `dismissed_at` is still retried while its folder exists
+  (dismissal ends only its count and its keep). One report's retry failing
+  (its write, say) is logged and never stops another report's retry.
+  `--dismiss` and a restore take update.lock too, so neither's field is lost
+  (every REPAIR.json writer holds it); with no state file and update.lock
+  held it exits 0 at once. At `--boot` restore-hooks is bounded by the boot
+  deadline (above), and the reinstall below starts removing hooks only with
+  twice `HOOKS_MIN_S` left; by command it is unbounded. With the target's objects gone in
+  the forward case, the whole-tree fallback and a torn index's rebuild read
+  the tag, never HEAD (the target). After a forward heal HEAD is the tag on
+  `live`, so `--restore <ts>` judges its foreign paths as after any other
+  repair. A failure before the checkout itself changes exits 0 at `--boot`
+  only while no `live` row was judged half-written (after that, a failed backup
+  included, 75). The guard then judges
   again and only its SAFE removes the state (byte-identical re-read); `guards`
   or `holds` (an edit off the move's paths) keeps it, its result naming the
   restore before what still holds, and exits 0; a kept "partial" record is
@@ -4815,7 +5539,7 @@ logger or unrelated exceptions with copied text and no provenance.
   `holds`, not `mixed_tree` again; anything
   else is `unresolved` (exit 1). A target whose objects are
   gone (its root tree, or any subtree or blob classification reads) is healed
-  by the whole tree against HEAD and cleared by a clean-tree
+  by the whole tree against the tag and cleared by a clean-tree
   check. A main row is out of scope (exit 3; 0 at `--boot`). The engine
   writes its merges with `core.fsync=committed`. Each repair prints its report
   (the restore command included) and queues an alert (critical when anything was
@@ -4849,22 +5573,49 @@ logger or unrelated exceptions with copied text and no provenance.
   cleared by a restore (its `restore.restored_at` a string and
   `restore.refused` an int, never a bool, of 0). It loads the repair's module once per snapshot when any
   report dir exists (a module that cannot load, or lacks a name the reader
-  uses, reads every report as refused and blanks nothing), and a linked worktree reads none. The awareness paragraph
+  uses, reads every report as refused and blanks nothing), and a linked worktree reads none.
+  That module is the installed kit's while the kit is `ok`, so the reader
+  judges what the writer that runs judged; otherwise the checkout's, which can
+  differ (#3492 D2b). Every snapshot also carries the kit's state
+  (`live_repair_kit.status`, each of its four git calls on a 5 s budget), report or none,
+  and each state but `ok` is a finding, `live_repair_kit:<missing|partial|
+  stale|corrupt|foreign>` (the kit read under `$HOME/.genesis/lib`, where every
+  installer puts it; a HEAD that cannot be read is no state, never `stale`), whose awareness line names the reinstall:
+  `python3 -I -S <repo>/scripts/lib/live_repair_kit.py install <repo> <home>`. The awareness paragraph
   names, per undismissed report with saved paths, its backup folder,
   `scripts/deploy_candidates repair-move --restore <ts>` (once both the
   installed repair kit and `scripts/deploy_candidates` include it; an exit 2
   "not available yet" means an older kit) and `--dismiss <ts>`, says a
   restore leaves uncommitted edits (tracked ones block deploy_code_only.sh and
   update.sh, untracked ones deploy_code_only.sh only under `src/`, `config/` or
-  `pyproject.toml`), that backups are pruned 90 days after the last write to
-  their folder, and, for a report whose last restore refused parts, that its
+  `pyproject.toml`), that a report nobody restored or dismissed is never
+  pruned (disk_hygiene's deploy-backups prune asks
+  `scripts/lib/repair_report_keep.py`, which keeps exactly what this count
+  still counts, an undismissed report whose `hooks` is still `pending` or
+  whose `hooks_before` names hooks it replaced, the
+  restore run folder holding such a report's in-flight aside, and any report
+  it cannot read) while a restored or dismissed report
+  and other backups are pruned 90 days after the last write to their folder,
+  and, for a report whose last restore refused parts, that its
   output names each and that a part it can never write goes back by hand from
   the folder's `tree/`, then `--dismiss`; the guardian's diagnosis shows the
   newest report's `restore.restored_at` and `restore.refused`, quoted; it escapes any text a database
   column cannot hold rather than losing the alert, and is replaced whenever
   the reports it names change. `GET /api/genesis/health` reduces
   `live_repairs` to an allow-list of its counts for a caller without the
-  internal bearer or a verified session. `live_repair_unresolved` needs the
+  internal bearer or a verified session. `live_repair_hooks_pending:<n>`
+  counts the read, undismissed reports whose `hooks` is exactly `pending` and
+  whose `tag` is where the branch `live` points (the writer's own rule: `live`
+  moved on means superseded); one `git rev-parse --verify -q
+  refs/heads/live^{commit}`, bounded at 10 s, runs per snapshot and only when
+  such a report exists, and a timeout or a failing git keeps the count. It has
+  its own awareness line (readiness refuses every rebuild until the hooks are
+  back) and is in the health route's counts; `live_repair_hooks_saved:<n>`
+  counts the read, undismissed reports with a `hooks_before`, its awareness
+  line naming each `hooks-before/` folder and `--dismiss <ts>`; each enters the
+  alert's identity only when non-zero. A pending report whose commits are not full commit ids
+  (a hand edit), or one older than the newest eight reports the reader reads,
+  is kept by the prune and counted by no reader (accepted). `live_repair_unresolved` needs the
   newest report to say so (or to have no result after an hour) AND the
   shared guard, run at read time and only then, to call the update state
   `mixed_tree`: a run killed after its restore and before its result leaves
@@ -4875,12 +5626,20 @@ logger or unrelated exceptions with copied text and no provenance.
   rule accepts (`report_ts`; anything else exits 2 before a path is built) and
   read the report through `load_report`; `--dismiss` rewrites `REPAIR.json`
   only under update.lock (30 s wait by default; still held, exit 1 and
-  nothing written), so it cannot race a restore's own rewrite. `scripts/
+  nothing written), so it cannot race a restore's own rewrite. A report
+  `load_report` refuses (unreadable, or another checkout's) is dismissed with
+  `DISMISSED.json` beside it, only in a real directory of this user's, and
+  `REPAIR.json` is left as it is; deploy health, the guardian's pick and the
+  deploy-backups prune all skip a folder holding it. `scripts/
   deploy_candidates repair-move --restore TS [--check]` passes through to the
   kit. `live_move_repair.py --restore TS
   --check` (#3492 PR B1) is the read-only judge of what a restore would
   write, in a second kit source, `scripts/lib/live_move_restore.py`, loaded
-  from the kit's own directory like the guard. It takes the repair's locks in
+  from the kit's own directory like the guard. Its report and row rules and
+  read budgets live in `live_move_restore_rows.py`, and its run-folder and
+  origin rules in `live_move_restore_runs.py`, which loads the rows module;
+  both are loaded by path from the same directory, so they ship in the kit
+  beside it. It takes the repair's locks in
   the repair's order with a short wait (30 s; `--wait` honoured) and exits 1
   while any is held (naming the pid the update state records, if any), or
   while the guard calls the checkout `mixed_tree` or `guards`. It reaches
@@ -4964,8 +5723,10 @@ logger or unrelated exceptions with copied text and no provenance.
   with the stricter gate, and writes only parts judged `as-left`; it never
   restarts anything. Each node part, the one `REPAIR.json` names in flight
   first: STAGE the saved node in a run folder
-  `deploy-backups/<UTC time>-<pid>-live-move-restore/new/<path>` (made 0700 at
-  the first write; each file copied with its sha256 checked against
+  `deploy-backups/<UTC time>-<pid>-<report ts>-live-move-restore/new/<path>`
+  (made 0700 at the first write and named for its report, #4011, so every
+  later run of that report finds it; a run that leaves no aside and no
+  index-before.txt removes its folder; each file copied with its sha256 checked against
   `SAVED.json`, else `other:hash-mismatch`, a missing record
   `other:no-hash`, a null hash `other:too-large`; its mode the record's &
   0o777, so setuid, setgid and sticky never come back; a directory row built
@@ -4986,13 +5747,18 @@ logger or unrelated exceptions with copied text and no provenance.
   the restore did not move there: while the in-flight part's aside holds
   anything else (a write after the move, through an open fd), unless that
   part read already-restored or as-left by the resume rule (both judged the
-  aside itself), the record is kept, and since it has one slot no other part
-  is written (`other:inflight-unresolved`, naming the aside, in `--check`
-  too; the in-flight part too, when its path holds the tag's state again), so
+  aside itself), the record is kept, and no part at that path, below it or
+  above it is written (`other:inflight-unresolved`, naming the aside, in
+  `--check` too; the in-flight part too, when its path holds the tag's state
+  again); every other part restores (#4025 item 1). Every held aside the run
+  folders show covers its path the same way, and so does an aside it cannot
+  read or judge, so a hold still covers it after a later part's intent took
+  the slot; a hold in a folder named before
+  #4011 still stops every part, since only the in-flight slot finds it. So
   every run names it and exits 1 until what is there is moved out. An aside
   still holding the repair's own as-left copy (the part refused by a gate
   after a kill, or a put-back that failed) holds nothing back; that one read
-  has its own budget. Moving the content out releases the other parts, and
+  has its own budget. Moving the content out releases the parts it covers, and
   the in-flight path is then judged by what it holds: the saved node a kill
   after the put-in left there reads already-restored; a path a kill after
   the aside left empty, or one holding whatever appeared there after a failed
@@ -5030,6 +5796,29 @@ logger or unrelated exceptions with copied text and no provenance.
   `update-index -q --refresh`, then a second judge that must read
   already-restored for every part written, and for a flag or an index part
   already restored whose entry the index call replaced (else `post-check`).
+  Every run (and `--check`) also judges every aside in every run folder
+  of the report (#4011, `runs.aside_parts`): an aside holding content the
+  restore did not put there is an `aside` part, `other:aside-held`, named and
+  counted refused on every run (so `restored_at` stays unwritten and the
+  alert stays up; one that cannot be read on its folder's own budget is
+  `other:aside-unreadable`); each part is keyed `<run>/aside/<path>`; a run
+  folder (or its `aside/`) that is not this user's alone is
+  `other:not-owned`, never skipped; a held in-flight record whose whole run
+  folder is gone is `other:aside-lost`, said once (the record is then
+  cleared), while an aside moved out by hand with its folder still there is
+  a release; over 64 run folders refuses the report whole. Each folder's asides are read on
+  their own budget (2 GiB, 200,000 entries), so `--check` on a report with many run folders
+  costs time, never a wrong verdict. Folders named
+  before #4011 carry no ts and are found only through the in-flight record.
+  The deploy-backups prune keeps a run folder named for its report for as
+  long as that report's folder exists.
+  The files git ignores that a tag directory held when it was moved aside
+  (a server's `__pycache__`) stay in its aside: a tag directory is a node
+  part only where the repair saved a file or a link there (one whose disk node
+  is a directory, or nothing, is no node part; its files are rows), so they
+  never have a directory to go back to. Every `--restore` names them, from every as-left aside of every run
+  folder, so a run killed before naming them loses nothing; they never
+  withhold `restored_at`.
   `REPAIR.json` gets a `restore` block, `{inflight: [run, path, "node"] |
   null, refused: <int>, restored_at: <str> | null}` (no per-part list; the
   output carries those), rewritten under update.lock after a re-read;
@@ -5045,8 +5834,8 @@ logger or unrelated exceptions with copied text and no provenance.
   `refused:<reason>`, with a note where things are), a summary, the restored
   paths and what they now block (tracked edits: deploy_code_only.sh and
   update.sh; untracked ones: deploy_code_only.sh, only under `src/`,
-  `config/` or `pyproject.toml`), the run folder (pruned 90 days after its
-  last write), the ignored files a directory moved aside held, and for a
+  `config/` or `pyproject.toml`), the run folder (kept while its report is),
+  the ignored files a directory moved aside held, and for a
   part it can never write (`cannot-make`, `target-unreadable`, `too-large`,
   `no-hash`) to put it back by hand from the report's `tree/`, then
   `--dismiss`. Exit 0 when nothing was refused, else 1. Residuals, named: a
@@ -5079,7 +5868,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 702274dfe 2026-11-05
+verified: 81bbdb0a9 2026-11-08
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -5107,6 +5896,11 @@ verified: 702274dfe 2026-11-05
   under propose-only; the apply/resolve path that would create one is a
   follow-up (future WS1 `enforce`).
   Voice-master exemplars are on the contribution FORBIDDEN list.
+  Manual-only catalog entries (`disable-model-invocation: true`) receive no
+  hook nudge or executor suggestion/assigned/delegated body injection, while
+  explicit foreground lookup and the inventory remain available. Usage retains
+  them as not nudge-eligible. Activation requires explicit catalog regeneration
+  and restarting cached consumers; see `docs/reference/manual-only-skills.md`.
   Cross-tool export: `scripts/export_agents_md.py` writes a body-scope
   inventory (skills + action tools, never memory/brain) into a managed
   `<!-- genesis:skills -->` block in `AGENTS.md` for Cursor/Codex/other
@@ -5139,14 +5933,40 @@ verified: 702274dfe 2026-11-05
   pairs as word data. Hash-containing calls keep the earlier backslash handling
   to avoid a comment/quote regression; generic #3257/#3264 remain partial/open.
   A `#` that starts a word at bash's top level opens a comment the scanner skips
-  (#3473), except in commands containing `<<`.
+  (#3473), except in commands containing `<<`. Comment and double-quoted
+  substitution boundaries the legacy scans may misread are refused, never
+  accepted (#3713 PR 1; same reference doc).
   Existing continuation, heredoc proof, size bounds and nested refusals remain.
+  A word that chooses the program and is written in bash locale quoting
+  (`$"…"`) is reported, not decoded: `_BLIND_LOCALE_PROGRAM`, with the
+  untranslated reading on `Segment.locale_program` as a candidate that is never
+  `exe`. The push guard refuses when that candidate is `git` or `gh`, and
+  `unresolved_verb_programs` carries it to the commit and discard guards. A
+  shell (`_NESTED`) handed its script, or the `-c` that selects it, in that
+  quoting is reported as `_BLIND_LOCALE_SCRIPT`, with the untranslated script on
+  `Segment.locale_script` (a candidate, never parsed); `locale_candidates`
+  mention-scans it for git and gh, and the push, commit and discard guards
+  refuse on that. A body the parse rebuilds from tokens (`case` arm, function
+  body, `coproc`) is read the same way one level down (`_plain_reading`).
+  `destructive_command_guard` and `protected_paths_guard` refuse on either cause
+  when the command names a removal, as on any blind spot. Not reported: the
+  same quoting in any other option or operand, or in the payload of a launcher
+  outside `_NESTED` (here-string or pipe into a shell, `busybox`, `find -exec`,
+  `parallel`, `taskset`, `ssh`, `trap`, `at`, `$SHELL -c`, positional-argument
+  or substitution-built scripts, variable-named programs). Guards that do not
+  read the blind spot (`full_suite_guard`, `worktree_cwd_guard`,
+  `pr_open_review_gate`, `issue_premise_gate`) are unchanged by it.
   Codex's local CLI also has a budget-only shell action hook in
   `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the
   existing commit/request budget decisions, denies approval-required or unknown
   evidence, and returns control to the user without native approval or Genesis
   lifecycle registration. It does not enforce the future reflection gates or
   cover arbitrary indirect execution. See `docs/reference/codex-review-stop.md`.
+  The shared budget accepts issue-comment churn between its two reads only when
+  both complete policy projections are successful and identical. Counts,
+  confirmation consumption, findings, reflection keys, marks and reviewer
+  attribution participate; real policy changes still return unknown, and an
+  exhausted budget still requires approval. Head/review/ancestry checks remain.
   A separate, inactive `scripts/hooks/codex-validator-adapter` translates native
   validator calls to the existing guards concurrently. It requires an absolute
   Bash cd/exit opener terminated by a newline, confines patches to validator
@@ -5174,6 +5994,31 @@ verified: 702274dfe 2026-11-05
   Explicit login accepts `--device-auth` for headless authentication.
   Inspection/run disable account-connected Apps through fixed CLI arguments
   and verify that effective setting, retaining the exact two-server boundary.
+  A contained compatibility workflow extends the existing native fixture driver
+  for explicitly handled app-server requests and freezes its source/binary/case
+  manifest before execution. It checks native command approval, canonical guard
+  ask versus denial, resume, required MCP failure, dispatched provenance and
+  ready-descendant cleanup with synthetic loopback responses and harmless
+  effects. Independent copied-artifact readback refuses incomplete or stale
+  evidence; no production provider, native auth, lifecycle enrollment or live
+  policy is added. See `docs/reference/codex-native-harness.md`.
+  A separate 17-case MCP elicitation experiment has its own frozen manifest and
+  reader. Proper approval metadata, data-form controls, request binding and
+  physical sink ordering are tested independently; synthetic fixture results
+  confer no production action authority or human-frontend qualification.
+  Its isolated frontend declares standard form input and a root user thread;
+  this permits the data-entry Never control without exempting proper approvals.
+  Initial native results were 15 passed / 2 failed; corrected expectations and client
+  declarations require a fresh complete run before qualification.
+  The elicitation reader checks all retained frames and binds interruption
+  server terminals and reader-thread completion receipts to their inputs.
+  Normal receipts must follow their own fixture outcome; interrupted completions
+  must follow their successful typed interrupt RPC acknowledgement in the raw
+  stream, including when completion is received during flush.
+  Foreign/stale controls finish on a current decline; EOF requires fresh
+  root/writer liveness, same-census ancestry and frozen known-child retirement
+  before fallback cleanup. Independent golden replies and atomic provider
+  indexing pin these witnesses; final contained verification remains required.
   Interactive native qualification records a Codex0.166.0 reference binary.
   The launcher warns on other recognizable versions and retains its startup
   inspection/refusal checks; those inspect state, not actual tool denial.
@@ -5181,13 +6026,19 @@ verified: 702274dfe 2026-11-05
   It supplies no service/timer wiring, copied credentials, deploy authority or
   lifecycle enrollment. See `docs/reference/codex-validator-launcher.md` for
   operator commands, source inventory, permitted MCP startup effects and races.
-  Codex has a separate external-client adapter in `.codex/config.toml`: it
-  starts the existing standalone health and memory MCP servers through a
-  launcher that scrubs inherited Genesis session identity, provenance,
-  supervision, slot, and trace context, then allowlists health plus explicit
-  recall tools. The launcher also selects `--external-client`; memory initialization
-  then disables processing of Claude's pending plan-bookmark file. Ordinary
-  Genesis memory initialization keeps that processing enabled by default.
+  Codex's project config (`.codex/config.toml`) starts all four Genesis MCP
+  servers through `scripts/codex_owner_mcp.py`, which reuses the external
+  launcher's environment scrub and main-checkout resolution. An unmarked Codex
+  run is the owner's: the ordinary bootstrap, every tool, labelled
+  `GENESIS_CALLER_PROFILE=codex` (calls logged to `client_tool_calls`); read
+  tools are pre-approved in the config and every other tool prompts, new ones
+  included. A run Genesis starts unattended (`util/codex_cli.py` sets
+  `GENESIS_CC_SESSION=1`, forwarded through `env_vars`) gets
+  `--external-client` and the health/recall floor, and no outreach or recon
+  server. Memory initialization skips Claude's pending plan-bookmark file for
+  both: the external profile through `process_pending_bookmarks=False`, a
+  labelled caller per call. Ordinary Claude Code memory initialization keeps
+  that processing enabled.
   The standalone server enforces the `external` or `validator` tool profile
   during discovery and direct calls. External retains its health/recall floor;
   validator additionally admits memory_store, eligible private follow-up CRUD
@@ -5341,13 +6192,14 @@ around them. **What exists today:**
 - the stores, the `board` mode lever, and the open-question tools;
 - the Projects v2 adapter and its idempotent setup script;
 - promotion of a private record onto the board;
-- the READ-ONLY reconciler and its two read tools.
+- the reconciler, which reads the board every tick and in `live` fills empty
+  Status columns, adds missing open items and records promoted cards' ids,
+  and its two read tools.
 
-The reconciler's write half (adding every repo item, the bookkeeping move to In
-Review, the Genesis status) and the dashboard tab are follow-on work. The
-shipped mode is `off`.
+The bookkeeping move to In Review (#4400 Part 2), the Genesis status and the
+dashboard tab are follow-on work. The shipped mode is `off`.
 
-- **Reconciler, read-only** (`board/reconciler.py`; bootstrap step `board`,
+- **Reconciler** (`board/reconciler.py`; bootstrap step `board`,
   `runtime/init/board.py`, a 5-min `CronTrigger` on the learning scheduler,
   `max_instances=1`). Each tick:
   - reads nothing while paused, in mode `off`, or with no project configured;
@@ -5360,15 +6212,37 @@ shipped mode is `off`.
     nothing else (MEASURED 2026-10-04 on a private sandbox, with a control);
   - flags `observed_late` from the clock alone (older than one interval plus
     slack), never from stored state;
+  - after a good read, runs the write phase (#4400 Part 1). In `live` only,
+    re-checked before each write: records the card id on each `board_links`
+    row whose issue now has a card; fills an EMPTY Status (In Review for an
+    open PR and for an issue with an open closing PR in the tracker repo from
+    a branch of it, else Proposed; each card is re-read just before its write,
+    so a card someone moved, even mid-tick, is never touched); and,
+    when open repo items are missing from the board (archived cards count as
+    on it), lists the repo and adds each one Genesis never added before, so an
+    owner's removal sticks (`prune` never deletes `item_added` rows). A listing
+    that finds nothing to add is not repeated while the gap holds, for up to an
+    hour. Status writes go through `projects_v2.set_status`, an allowlist that
+    refuses In Progress, validated before anything is audited or spent. A
+    Status write is audited before its request (`<item>:<to>:<tick>`); an add
+    is recorded after it succeeds (`<content id>:<tick>`), so a failed add is
+    retried. GitHub writes go 1 s apart, at most 16 per tick (what binds on the
+    normal schedule) and 200 per rolling hour counted from those rows (what
+    bounds extra ticks). A failed request (an HTTP error, a timeout, a rate
+    limit) stops the tick's writes; an error about one item skips that item.
+    Outside `live` the summary carries would-write counts (`dry_run`) and
+    nothing is written;
   - ALWAYS emits a `board` heartbeat (DEBUG) carrying the summary, in every mode
     and while paused. So the pulse is not pause-gated and has no enable check,
-    and in mode `off` it is effectively a learning-scheduler canary;
-  - writes NOTHING to GitHub (a test pins it).
-  A clean tick records job success; a read error publishes `last_error` and no
-  counts, and records a failure. The step raises if the learning scheduler is
+    and in mode `off` it is effectively a learning-scheduler canary.
+  A clean tick records job success, and so does a rate-limited one; a read
+  error publishes `last_error` and no counts, and records a failure. Any other
+  write failure records a failure too, with the read's counts and the writes
+  already made kept. The step raises if the learning scheduler is
   missing or stopped, so the manifest names that cause instead of the board.
 - **`board_status`** reads the stored heartbeats only, never GitHub: the newest
-  pulse (alive, mode, error) and the newest SUCCESSFUL read with its age.
+  pulse (alive, mode, error) and the newest SUCCESSFUL read with its age,
+  including that tick's `writes` block (None on a summary from before #4400).
   **`board_item`** reads one issue or PR live (nothing while the mode is
   `off`): its card on the configured
   project (matched by owner AND number), GitHub's blocked-by list (flagged when
@@ -5398,7 +6272,8 @@ shipped mode is `off`.
     (`github.user`/`github.public_repo`, the repo promotions post to — never
     the checkout's own remote) via `ProjectV2.repositories`, and links it with
     `linkProjectV2ToRepository` when not (shown in the dry run first);
-  - Status columns Proposed / Ready / In Progress / In Review / Done; an
+  - Status columns Proposed / Ready / Build / In Progress / In Review / Done
+    (Build: a card there approves one builder run, read by nothing yet); an
     option outside them is ALWAYS kept, never deleted (deleting one clears it
     from every card holding it, and no read before the write can prove none
     does at the write);
@@ -5469,8 +6344,7 @@ shipped mode is `off`.
     the pointer adds no second event), with each tick re-linking any posted
     row a crash or failed write left unlinked;
   - never touch the project: a promoted issue is created and linked, not
-    added to the board. The reconciler's write half (follow-on) places every
-    open issue; its adapter calls carry `GROUNDWORK(board-reconciler-writes)`.
+    added to the board. The reconciler's backfill places it in `live`.
 - Both lanes can each pass their propose-time duplicate check for one
   follow-up when proposed concurrently; the drain (the only poster, one job,
   rows in sequence) refuses a hold whose follow-up the OTHER lane already
@@ -5499,7 +6373,8 @@ verified: b67423bd 2026-10-03
     privacy-scan receipt, the hash of the body that was scanned);
   - `open_questions` + `open_question_blocks` — local-only owner decisions
     and the work each one blocks (an edge, not a list entry);
-  - `board_events` — the append-only event log.
+  - `board_events` — the append-only event log (pruned at 180 days, except
+    `item_added` rows, which the backfill reads as its memory).
   Each vocabulary is enforced in the CRUD module; `board_events.event` has no
   CHECK because SQLite cannot alter one. A partial UNIQUE index on
   `(event, observed_change_key)` dedups a re-read GitHub change.
@@ -5513,8 +6388,8 @@ verified: b67423bd 2026-10-03
   only turn the board down, never arm it. The master `enabled` fails closed
   unless it is the literal `true`. Board promotion (`board_promote` and the
   drain) reads it on every call, and so do the reconciler and `board_item`.
-  The write entry points the read-only reconciler does not use yet carry
-  `GROUNDWORK(board-reconciler-writes)` (and the tab's, `GROUNDWORK(board-tab)`).
+  The adapter calls nothing uses yet (`issue_node_id`, `set_text`) carry `GROUNDWORK(board-reconciler-writes)` (and the tab's,
+  `GROUNDWORK(board-tab)`).
 - **Open questions** (`mcp/health/open_question_tools.py`: `open_question_raise`,
   `_resolve`, `_block`, `_list`) — never gated by the board mode, because they
   write only local rows. A target id prefix must resolve uniquely against its

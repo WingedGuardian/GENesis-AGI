@@ -12,6 +12,57 @@ REF = "aaaaaaaa-1234-4567-8912-bbbbbbbbbbbb"
 PATTERN = r"(?<edge>^|[^0-9])[0-9]{4}([ -][0-9]{4}){2,3}(?<end>[^0-9]|$)"
 
 
+@pytest.fixture(scope="session")
+def jq_required():
+    # Probe the dependency, never GUARD/RENDER_RECORD: a broken program must fail.
+    try:
+        result = subprocess.run(["jq", "-n", "--argjson", "end", "1", "$end"],
+                                capture_output=True, text=True, timeout=5)
+    except FileNotFoundError:
+        pytest.skip("jq is not installed")
+    if result.returncode or result.stdout.strip() != "1":
+        pytest.skip("jq lacks the required $end binding (jq 1.7 or newer)")
+
+
+@pytest.mark.parametrize("availability", ["missing", "old", "wrong_output"])
+def test_jq_dependency_probe_skips_only_unavailable_capability(monkeypatch, availability):
+    def run(argv, **kwargs):
+        assert argv == ["jq", "-n", "--argjson", "end", "1", "$end"]
+        assert kwargs == {"capture_output": True, "text": True, "timeout": 5}
+        if availability == "missing":
+            raise FileNotFoundError("synthetic missing jq")
+        return subprocess.CompletedProcess(argv, 3 if availability == "old" else 0,
+                                           stdout="" if availability == "old" else "null\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(pytest.skip.Exception, match="jq"):
+        jq_required.__wrapped__()
+
+
+def test_jq_dependency_probe_accepts_the_required_feature(monkeypatch):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="1\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert jq_required.__wrapped__() is None
+    assert calls == [["jq", "-n", "--argjson", "end", "1", "$end"]]
+
+
+def test_compatible_jq_does_not_hide_a_redaction_program_failure(modules, monkeypatch):
+    def run(argv, **kwargs):
+        feature_probe = argv[-1] == "$end"
+        return subprocess.CompletedProcess(argv, 0 if feature_probe else 3,
+                                           stdout="1\n" if feature_probe else "", stderr="synthetic filter failure")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert jq_required.__wrapped__() is None
+    with pytest.raises(AssertionError):
+        test_unregistered_reference_is_not_exempt(modules)
+
+
 @pytest.fixture
 def modules(monkeypatch):
     monkeypatch.syspath_prepend(str(ROOT / "scripts/ci"))
@@ -24,6 +75,7 @@ def guard(module, text, refs):
 
 
 @pytest.mark.parametrize("prefix", ["", "λ", "🙂λ", "e\u0301 "])
+@pytest.mark.usefixtures("jq_required")
 def test_registered_reference_and_ordinary_card(modules, prefix):
     _, patch = modules
     text = prefix + REF + " card 4111 1111 1111 1111 end"
@@ -32,6 +84,7 @@ def test_registered_reference_and_ordinary_card(modules, prefix):
     assert result.stdout == prefix + REF + " card <redacted:card> end"
 
 
+@pytest.mark.usefixtures("jq_required")
 def test_unregistered_reference_is_not_exempt(modules):
     _, patch = modules
     result = guard(patch, REF, [])
@@ -39,6 +92,7 @@ def test_unregistered_reference_is_not_exempt(modules):
     assert result.stdout == "aaaaaaaa-<redacted:card>-bbbbbbbbbbbb"
 
 
+@pytest.mark.usefixtures("jq_required")
 def test_crossing_reference_is_typed_conflict_without_input_leak(modules):
     _, patch = modules
     ref = "aaaaaaaa-1234-4567-8912-bbbbbbbb4111"
@@ -50,6 +104,7 @@ def test_crossing_reference_is_typed_conflict_without_input_leak(modules):
 
 @pytest.mark.parametrize("letter,escaped", [("a", r"\u0061"), ("b", r"\u0062"), ("1", r"\u0031"), ("-", r"\u002d")])
 @pytest.mark.parametrize("as_key", [False, True])
+@pytest.mark.usefixtures("jq_required")
 def test_encoded_reference_is_literal_before_final_pass(modules, letter, escaped, as_key):
     _, patch = modules
     record = {REF: "🙂λ " + REF} if as_key else {"details": "🙂λ " + REF}

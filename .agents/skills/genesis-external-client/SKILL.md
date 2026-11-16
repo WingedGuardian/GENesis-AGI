@@ -1,33 +1,47 @@
 ---
 name: genesis-external-client
-description: Use when Codex needs Genesis capabilities through MCP without joining Genesis's session lifecycle. Covers tool selection, explicit state changes, and session-boundary limits.
+description: Use when Codex uses Genesis capabilities through MCP. Covers the owner-mode tool surface, approvals, the unattended floor, and the session-lifecycle limits that still apply.
 ---
 
-# Genesis as an external tool client
+# Genesis from Codex
 
-This Codex conversation is not a Genesis session. It may call the Genesis MCP
-servers on demand, but Genesis must not register, heartbeat, extract, summarize,
-or otherwise manage this conversation. The external launcher removes inherited
-Genesis session identity, provenance, supervision, slot, and trace context before
-starting either MCP server. In a Git worktree it resolves Genesis's live runtime
-state through the main checkout rather than creating worktree-local state.
+An owner-operated Codex session gets the same Genesis MCP servers and tools a
+Claude Code session gets: health, memory, outreach and recon, with no client
+allowlist (owner ruling, 2026-11-08). `scripts/codex_owner_mcp.py` starts the
+ordinary server and labels it `codex`, so every tool call is recorded in
+`client_tool_calls` and credential lookups are stamped `client=codex`, once the
+database has that table and column (migration `20261108071709`; until it runs,
+calls are served and a warning is logged instead). The label
+is a record of which client acted, never a permission. In a Git worktree the
+launcher resolves Genesis's live runtime state through the main checkout.
+
+Approvals: read tools are pre-approved; anything that writes, sends, spends or
+spawns asks before it runs, and so does any tool not yet classified in
+`.codex/config.toml`. That holds only under an approval policy that can ask:
+started with `--dangerously-bypass-approvals-and-sandbox`, Codex runs every
+tool without asking (measured, codex-cli 0.166.0), as Claude Code does under its
+skip-permissions mode. Genesis's own gates (the payment tap, outreach rules,
+board and contributor approvals) still apply on top. `browser_fill_card` asks
+first like any spending tool; the payment vault's peer check may also refuse a
+Codex-started server, and the owner's per-payment Telegram tap is the control
+that always applies.
+
+A Codex run that Genesis starts unattended (the executor's verifier, the
+contribution reviewer) carries the dispatched marker and keeps the external
+floor: 5 health and 8 memory read tools, no outreach or recon server.
 
 Codex defers MCP schemas until requested. Before calling a Genesis tool that is
 not already visible, use MCP tool discovery for its exact `server.tool` name.
 
-The ordinary Codex profile provides the approved health and recall floor.
-The separately qualified validator profile also admits memory_store, private
-follow_up_create/list/update and pr_verification_close. It has no session ledger,
-charter, dispatch, browser, outreach, campaign or settings authority. Do not work
-around either allowlist; another expansion needs its own capability review.
+This conversation is still not a registered Genesis session: Genesis does not
+heartbeat, extract, summarize or inject context into it. Do not pass a Codex
+thread or session identifier to `session_charter`, `session_ledger_*`, or other
+session-bound tools, and never create a synthetic session or charter to make one
+work; registering Codex conversations is a later phase.
 
-The standalone launcher enforces `--external-client` on the server as well as
-the client allowlist. Both the `external` default and explicit `validator`
-profile have separate closed tool sets: external retains5health/8memory tools;
-validator admits9health/9memory. Direct calls to other tools are rejected before
-their bodies run; the health bootstrap also
-skips dispatch queue and campaign initialization. These tool profiles are not
-authentication or isolation from an operator with full host access.
+The separately qualified validator profile (its own launcher, not this config)
+admits memory_store, private follow_up_create/list/update and
+pr_verification_close on top of the floor.
 
 Validator follow-ups require user_input_needed, a stable request_key for creation
 and no schedule, pin or session provenance; updates may touch eligible private
@@ -41,10 +55,12 @@ before retrying; verification attempt counters are not idempotency keys. See
 `docs/reference/codex-validator-writers.md`. This skill does not activate the
 dedicated validator launcher or authorize deployment/calibration.
 
-Do not pass a Codex thread or session identifier to `session_charter`,
-`session_ledger_*`, or other session-bound tools. Those tools operate only on an
-explicitly identified, existing Genesis session. Never create a synthetic session
-or charter to make one work.
+Validator batches also follow `docs/reference/validator-tracking.md`: preflight
+the actual exposed tools, persist measurements, verify structured task receipts,
+and checkpoint the selected rows. Public-by-default includes install-local and
+security-related work; private tasks require concrete unavoidable disclosure
+harm. A missing private writer does not block safe public filing. Honor pauses
+without creating a Genesis session or adding lifecycle hooks.
 
 Use `genesis-health` for live status and `genesis-memory` for recall. Recall
 may update Genesis retrieval-use metadata; this is expected and does not make
@@ -62,8 +78,8 @@ symbol tools for branch truth rather than indexing another checkout. See
 
 If a capability requires automatic context injection, transcript extraction,
 session continuity, or background delivery into this conversation, explain that
-it is unavailable to an external client. Do not add lifecycle hooks or work
-around the boundary.
+it is not available to Codex yet (the session-lifecycle phase). Do not add
+lifecycle hooks or work around the boundary.
 
 The project also wires a local Codex CLI shell action guard for review budgets.
 It denies actions requiring fresh approval and requests user handoff, without

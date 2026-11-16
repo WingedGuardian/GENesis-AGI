@@ -1,0 +1,1 @@
+- Remove the per-prompt `[Code]` hints from proactive recall: across 15,412 hints sessions received over 30 days, 34 (0.22%) were followed by a touch of the hinted file.

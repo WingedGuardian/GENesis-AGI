@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 from genesis.cc.exceptions import CCProcessError
 from genesis.util.proc_kill import ProcessCleanupUncertain
-from genesis.util.systemd import literal_scope_args
+from genesis.util.systemd import literal_scope_args, systemctl_env
 
 if TYPE_CHECKING:
     from genesis.cc.types import CCInvocation
@@ -55,6 +55,21 @@ _PROVIDER_ENV = frozenset(
         "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS",
     }
 )
+
+
+def _systemctl() -> str:
+    """``systemctl`` from the absolute PATH entries only, the rule ``launch_args``
+    applies to ``systemd-run``: a relative entry would resolve against whatever
+    directory the server runs in. Unresolvable is unconfirmed scope state."""
+    path = os.pathsep.join(
+        entry
+        for entry in os.environ.get("PATH", os.defpath).split(os.pathsep)
+        if entry and os.path.isabs(entry)
+    )
+    found = shutil.which("systemctl", path=path) if path else None
+    if found is None:
+        raise RuntimeError("peer scope state could not be confirmed")
+    return found
 
 
 @dataclass(frozen=True)
@@ -131,8 +146,25 @@ class PeerSegment:
                 "--strict-mcp-config", "--disable-slash-commands", "--no-chrome",
                 "--no-session-persistence"]
 
+    def _preflight(self) -> None:
+        """What cleanup will need, checked before the claim exists.
+
+        Cleanup cannot tell "never launched" from "maybe launched", so a
+        precondition it first meets there turns a configuration error into an
+        unconfirmed drain that holds the slot until restart. Refusing here
+        holds nothing."""
+        if self.deadline_at - time.time() <= 0:
+            raise ValueError("peer segment deadline expired")
+        try:
+            _systemctl()
+        except RuntimeError:
+            raise CCProcessError("peer containment unavailable: no systemctl on PATH") from None
+        if not (_CGROUP_ROOT / "cgroup.controllers").is_file():
+            raise CCProcessError("peer containment unavailable: no cgroup v2 filesystem")
+
     @contextlib.asynccontextmanager
     async def invocation(self):
+        self._preflight()
         # All invoker instances/loops in this server share scope ownership.
         # Rejected duplicates must never enter the owner's cleanup path.
         with _INVOCATION_LOCK:
@@ -221,6 +253,11 @@ class PeerSegment:
         # capability is its facade lease; it inherits no owner API credential,
         # shell startup override, external-client setting, or session identity.
         env = {key: value for key, value in os.environ.items() if key in _PROVIDER_ENV}
+        # systemd-run --user needs the user bus; a server started without these
+        # gets the same per-uid defaults every other systemctl caller uses.
+        bus = systemctl_env()
+        for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+            env.setdefault(key, bus[key])
         self.pin_environment(env, invocation.working_dir)
         from genesis.cc.roster import apply_routing_env
 
@@ -274,7 +311,7 @@ class PeerSegment:
     def _show_scope(self) -> dict[str, str]:
         result = subprocess.run(
             [
-                "systemctl",
+                _systemctl(),
                 "--user",
                 "show",
                 self.unit_name,
@@ -285,6 +322,7 @@ class PeerSegment:
             capture_output=True,
             text=True,
             timeout=15,
+            env=systemctl_env(),
         )
         values = dict(line.split("=", 1) for line in result.stdout.split("\n") if line)
         if result.returncode or set(values) != {"LoadState", "ActiveState", "ControlGroup"}:
@@ -309,7 +347,10 @@ class PeerSegment:
         if not control_group.startswith("/") or ".." in group.parts or group.name != self.unit_name:
             raise RuntimeError("peer scope control group could not be confirmed")
         stopped = subprocess.run(
-            ["systemctl", "--user", "stop", self.unit_name], capture_output=True, timeout=15
+            [_systemctl(), "--user", "stop", self.unit_name],
+            capture_output=True,
+            timeout=15,
+            env=systemctl_env(),
         )
         try:
             events = dict(

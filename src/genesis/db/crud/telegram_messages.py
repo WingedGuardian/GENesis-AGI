@@ -77,6 +77,28 @@ async def query_recent(
     return [dict(r) for r in reversed(rows)]
 
 
+async def latest_outbound(
+    db: aiosqlite.Connection,
+    chat_id: int,
+    thread_id: int,
+    *,
+    limit: int,
+) -> list[dict]:
+    """Outbound rows in insertion order, newest first. One row per sent chunk.
+
+    A clock step must not let an older future stamp outrank a newly posted stub.
+    Other history queries retain their chronological ordering.
+    """
+    cursor = await db.execute(
+        """SELECT content, timestamp FROM telegram_messages
+           WHERE chat_id = ? AND thread_id = ? AND direction = 'outbound'
+           ORDER BY id DESC LIMIT ?""",
+        (chat_id, thread_id, limit),
+    )
+    rows = await cursor.fetchall()
+    return [{"content": r[0], "timestamp": r[1]} for r in rows]
+
+
 async def query_all_recent(
     db: aiosqlite.Connection,
     *,

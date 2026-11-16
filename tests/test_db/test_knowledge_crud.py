@@ -314,11 +314,17 @@ async def test_delete_nonexistent(db):
 # ─── knowledge.find_by_unique_key ────────────────────────────────────────────
 
 
+# A credential body as #2426 writes it: the value held out of the indexed text.
+_HELD = f"[reference.credentials] HobbyForum login\n\nforum creds\n\nValue: {knowledge.SECRET_PLACEHOLDER}"
+
+
 async def test_find_by_unique_key_hit(db):
-    uid = await knowledge.insert(
+    # A credential row commits only beside its secret, so it is written by
+    # upsert, which holds the value (insert() has none to hold, and is refused).
+    uid, _ = await knowledge.upsert(
         db, project_type="reference", domain="reference.credentials",
         source_doc="manual", concept="HobbyForum login",
-        body="forum creds",
+        body=_HELD, secret_value="fake-forum-pass-1",
     )
     row = await knowledge.find_by_unique_key(
         db, project_type="reference", domain="reference.credentials",
@@ -326,7 +332,7 @@ async def test_find_by_unique_key_hit(db):
     )
     assert row is not None
     assert row["id"] == uid
-    assert row["body"] == "forum creds"
+    assert row["body"] == _HELD
 
 
 async def test_find_by_unique_key_miss(db):

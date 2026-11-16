@@ -11,8 +11,10 @@ The EFFECTIVE stage is the lowest of three: the stage requested
 (``GENESIS_MCP_SHARED_STAGE``, else the config), the code ceiling
 ``MAX_STAGE``, and what the server's unit can serve (installed, enabled,
 running). A server outside the effective stage, or whose unit is not ready,
-runs stdio. Codex (``--external-client``) and the kill switch
-``GENESIS_MCP_SHARED_DISABLED=1`` always run stdio: Codex's switch is its own.
+runs stdio. Codex always runs stdio: the unattended floor passes
+``--external-client``, and owner mode carries ``GENESIS_CALLER_PROFILE``, a label
+a shared service would not see. So does any spawn under the kill switch
+``GENESIS_MCP_SHARED_DISABLED=1``.
 
 Fail direction: any error here (an unreadable overlay, an unknown stage)
 launches the stdio server and says why on stderr. Stdio is not a degraded mode;
@@ -208,6 +210,10 @@ def decide(argv, *, config, env, ready, ceiling, python, root):
     stdio = list(argv)
     if "--external-client" in stdio:
         return Decision(stdio, False, "external client: never routed by this switch")
+    if env.get("GENESIS_CALLER_PROFILE"):
+        # Owner-mode Codex: the label rides this process's environment, which a
+        # shared service never sees, so its calls would go unattributed there.
+        return Decision(stdio, False, "labelled client: the shared service cannot carry the label")
     if kill_switch_on(env):
         return Decision(stdio, False, f"{KILL_SWITCH} is set")
     requested = (

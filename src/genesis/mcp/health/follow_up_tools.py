@@ -362,11 +362,28 @@ async def _impl_follow_up_update(
     pinned: bool | None = None,
     work_state: str | None = None,
     revisit_condition: str | None = None,
+    replace_notes: bool = False,
 ) -> dict:
-    """Update an existing follow-up item."""
+    """Update an existing follow-up item.
+
+    ``resolution_notes`` is appended to the row's existing notes unless
+    ``replace_notes`` is set, which overwrites them (the correction path).
+    """
     db = _get_db()
     if db is None:
         return {"error": "Database not available", "error_code": "db_unavailable"}
+
+    if replace_notes and resolution_notes is None:
+        # Empty notes mean "no change", so a replace with nothing to write would
+        # silently do nothing. Refuse before any write.
+        return {
+            "error": (
+                "replace_notes=True needs resolution_notes: the replacement text. "
+                "NOTHING was updated."
+            ),
+            "error_code": "replace_needs_notes",
+        }
+    append_notes = not replace_notes
 
     valid_statuses = {"pending", "scheduled", "in_progress", "completed", "failed", "blocked"}
     if status and status not in valid_statuses:
@@ -537,6 +554,7 @@ async def _impl_follow_up_update(
                 follow_up_id,
                 status,
                 resolution_notes=resolution_notes,
+                append_notes=append_notes,
                 blocked_reason=blocked_reason,
             )
             if not updated:
@@ -550,6 +568,7 @@ async def _impl_follow_up_update(
                 follow_up_id,
                 "blocked",
                 resolution_notes=resolution_notes,
+                append_notes=append_notes,
                 blocked_reason=blocked_reason,
             )
         elif resolution_notes is not None:
@@ -561,6 +580,7 @@ async def _impl_follow_up_update(
                 db,
                 follow_up_id,
                 resolution_notes=resolution_notes,
+                append_notes=append_notes,
             )
 
         refreshed = await follow_ups.get_by_id(db, follow_up_id)
@@ -675,6 +695,7 @@ async def follow_up_update(
     pinned: str = "",
     work_state: str = "",
     revisit_condition: str = "",
+    replace_notes: bool = False,
 ) -> dict:
     """Update an existing follow-up item.
 
@@ -692,7 +713,8 @@ async def follow_up_update(
             (error_code='scheduled_needs_link') because it would be invisible to
             every surface. To park for later use work_state='blocked_on_trigger'
             (event) or recreate with strategy='scheduled_task' (time).
-        resolution_notes: Notes on resolution or progress. Appended context for future sessions.
+        resolution_notes: Notes on resolution or progress. Appended to any existing notes
+            (after a blank line); earlier notes are kept unless replace_notes is set.
         blocked_reason: Why this follow-up is blocked (sets status to blocked if status not provided).
         priority: New priority (low, medium, high, critical). Empty to keep current.
         pinned: "true" to pin (ego cannot auto-resolve) or "false" to unpin. Empty to keep current.
@@ -702,10 +724,15 @@ async def follow_up_update(
             set). Empty to keep the current lane.
         revisit_condition: Set/replace the revisit trigger (the event that would
             resurface the item). Empty to leave unchanged.
+        replace_notes: True to REPLACE the existing notes with resolution_notes
+            instead of appending (to correct a wrong or sensitive note). Requires
+            resolution_notes; the earlier notes are lost. Default False.
     """
     if current_external_profile.get() == ExternalProfile.VALIDATOR:
         if pinned or work_state or revisit_condition:
             raise ToolError("Validators cannot change pins, lanes or triggers")
+        if replace_notes:
+            raise ToolError("Validators cannot replace notes; they only append")
         return await validator_writes.private_update(
             _get_db(), follow_up_id, status=status or None,
             resolution_notes=resolution_notes or None, blocked_reason=blocked_reason or None,
@@ -726,6 +753,7 @@ async def follow_up_update(
         pinned=pinned_bool,
         work_state=work_state or None,
         revisit_condition=revisit_condition or None,
+        replace_notes=replace_notes,
     )
 
 

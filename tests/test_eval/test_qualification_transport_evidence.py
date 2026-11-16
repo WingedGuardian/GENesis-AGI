@@ -346,12 +346,16 @@ async def test_stream_close_cannot_discard_complete_durable_answer(tmp_path, can
             transport=httpx.MockTransport(transport),
         )
         try:
-            failure = httpx.ReadError if partial else (asyncio.CancelledError if cancelled else RuntimeError)
+            # Cleanup cancellation remains cancellation even after a partial read.
+            failure = asyncio.CancelledError if cancelled else (httpx.ReadError if partial else RuntimeError)
             with pytest.raises(failure):
                 await handler.client.post(
                     ENDPOINT + "/chat/completions", json=expected,
                     headers={"Authorization": "Bearer synthetic-key"},
                 )
+            assert handler.error == "response_stream_cleanup_failed:" + (
+                "CancelledError" if cancelled else "RuntimeError"
+            )
             observations = campaign.attempt("case-0")["observations"]
             assert bool(observations) is not partial
             if not partial:
@@ -616,7 +620,9 @@ async def test_invalid_get_receipts_retain_funded_liability(tmp_path, isolated_k
         )
         with pytest.raises(LocalFailure):
             await reconcile(campaign, "case-0", transport=transport)
-        assert len(campaign.attempt("case-0")["receipts"]) == 1
+        row = campaign.attempt("case-0")
+        assert len(row["receipts"]) == (0 if change == "status" else 1)
+        assert len(row["lookups"]) == (1 if change == "status" else 0)
         assert campaign.state.reserved == Decimal("0.1") and campaign.state.blockers
     with Journal(campaign.directory, campaign.expected_manifest) as reopened:
         assert reopened.state.reserved == Decimal("0.1") and reopened.state.blockers

@@ -68,6 +68,12 @@ def validate_manifest(manifest):
             raise Incomplete("duplicate attempt or invalid request hash")
         seen.add(row["id"])
         currency(row.get("max_charge"))
+        if "cost_basis" in row:
+            from .native_expense import validate_spec
+
+            validate_spec(row)
+        elif "native_tariff" in row:
+            raise Incomplete("native tariff requires an explicit cost basis")
     if total(currency(row["max_charge"]) for row in manifest["attempts"]) > currency(
         manifest["budget"]
     ):
@@ -88,7 +94,15 @@ class State:
 
 def _billing(row):
     """Missing cost can reconcile; contradictory or invalid evidence cannot settle."""
-    charges, ids = [], set()
+    if "cost_basis" in row["spec"]:
+        from .native_expense import interval
+
+        measured = interval(row)
+        return measured[1] if measured is not None and measured[1] <= currency(row["spec"]["max_charge"]) else None
+    if any(isinstance(item, dict) and "cost_basis" in item for item in row["receipts"]):
+        return None
+    charges = []
+    ids = {item['generation_id'] for item in row.get('lookups', [])}
     for answer in row["observations"]:
         if not isinstance(answer, dict):
             return None
@@ -138,6 +152,27 @@ def _billing(row):
     return charges[0]
 
 
+def _validated_lookup(item, spec):
+    """One binding/schema authority for both durable writes and historical replay."""
+    if (
+        not isinstance(item, dict)
+        or item.get("attempt") != spec["id"]
+        or item.get("request_hash") != spec["request_hash"]
+        or not isinstance(item.get("generation_id"), str)
+        or not item["generation_id"].strip()
+        or not isinstance(item.get("error"), str)
+        or not item["error"].strip()
+        or "http_status" not in item
+        or (item["http_status"] is not None and (
+            type(item["http_status"]) is not int
+            or not 100 <= item["http_status"] <= 599
+            or item["http_status"] == 200
+        ))
+    ):
+        raise Incomplete("invalid receipt lookup evidence")
+    return item
+
+
 def _apply(state, line, index):
     kind, attempt = line["kind"], line.get("attempt")
     if not isinstance(attempt, str) or attempt not in state.attempts:
@@ -181,6 +216,8 @@ def _apply(state, line, index):
         raise Incomplete("event precedes dispatch")
     elif kind == "observation":
         row["observations"].append(line.get("evidence"))
+    elif kind == "receipt_lookup":
+        row["lookups"].append(_validated_lookup(line.get("evidence"), row["spec"]))
     elif kind == "billing":
         row["receipts"].append(line.get("receipt"))
     elif kind == "failure":
@@ -194,7 +231,8 @@ def _apply(state, line, index):
 
 def _summarize(state, changed):
     affected = {changed}
-    for item in state.attempts[changed]["observations"] + state.attempts[changed]["receipts"]:
+    row = state.attempts[changed]
+    for item in row["observations"] + row["receipts"] + row["lookups"]:
         generation = item.get("generation_id") if isinstance(item, dict) else None
         if isinstance(generation, str) and generation.strip():
             key = state.attempts[changed]["spec"]["generation_namespace"], generation
@@ -250,7 +288,7 @@ def _stage(state, line, index):
     )
     _apply(staged, line, index)
     row = staged.attempts[attempt]
-    for item in row["observations"] + row["receipts"]:
+    for item in row["observations"] + row["receipts"] + row["lookups"]:
         generation = item.get("generation_id") if isinstance(item, dict) else None
         if isinstance(generation, str) and generation.strip():
             key = row["spec"]["generation_namespace"], generation
@@ -293,6 +331,7 @@ def reconstruct(lines) -> State:
             "spec": r,
             "observations": [],
             "receipts": [],
+            "lookups": [],
             "dispatched": False,
             "failed": False,
             "acknowledged": set(),

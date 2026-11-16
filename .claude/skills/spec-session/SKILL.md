@@ -28,6 +28,41 @@ A minimal skill for now; its process is designed later. Also read:
   candidate;
 - `build-session`'s "Generalizability Gate" before a spec names where code runs.
 
+**Intent scenarios, when the install keeps a holdout.** If
+`.venv/bin/python scripts/holdout_runner.py --has-holdout` (from the main
+checkout) prints `holdout: present`, then once the issue's intent is final and before it goes to a builder, spawn the
+`holdout-writer` subagent IN THE FOREGROUND with the issue number and "intent".
+It adds scenarios that fail on the default branch until the change lands, and
+reports only their ids and `Protects` lines. Keep the scenarios out of the issue
+and the spec, and put this line in the issue: "The PR that finishes this issue
+must say `Closes #N`; if the work is split, earlier PRs say `Part of #N`." An
+intent scenario is judged only against a PR that closes its issue. `docs/reference/holdout.md` has the rules.
+
+### Analyze the spec before a builder gets it
+
+Before a spec goes to a builder, run the read-only consistency pass in
+`references/spec-analyze.md` over the spec, plus its plan and tickets when they
+exist. Run it BEFORE the holdout-writer step above: the intent is not final
+until this pass is clean, and scenarios written earlier would test the
+unfixed intent. Then:
+
+- every CRITICAL finding is fixed in the spec (then run the pass again) or
+  carries the owner's exception. A conflict with a standing rule is never
+  accepted by the session. When one looks justified, ask the owner through
+  `AskUserQuestion` rather than rewording the spec around the check, and on a
+  yes record it exactly as `references/spec-analyze.md`, "Owner exception",
+  says: the owner's words verbatim, the requirement and the rule quoted;
+- fix every HIGH finding, or keep it with a one-line reason under the report;
+- send the final report with the spec. When the handoff is an issue, post it
+  as a comment on that issue, after the privacy scrub every public text gets
+  (CLAUDE.md, "Public-Artifact Privacy"); otherwise save it beside the spec
+  as `<spec name>.analysis.md`, so the spec's own text, and the numbers a
+  later run gives it, do not change.
+
+The builder runs `references/spec-converge.md` against the same documents
+before its PR (build-session, "Verify BEFORE the PR"), and the analyze ids are
+the ones it uses.
+
 ### Plan documents carry a structured header
 
 A plan doc that outlives one session (`~/.claude/plans/<name>.md`) opens with

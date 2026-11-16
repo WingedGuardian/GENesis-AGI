@@ -843,7 +843,7 @@ def check_backend(config: dict, *, starting: bool = False, timeout: float = 30) 
     return pid
 
 
-def ready(config: dict) -> None:
+def ready(config: dict, *, environment=None) -> None:
     validate_provider_paths(config)
     deadline = time.monotonic() + 120
     native_deadline = None
@@ -867,7 +867,8 @@ def ready(config: dict) -> None:
                     break
                 response = subprocess.run(
                     [f"/proc/self/fd/{executable.fileno()}", "daemon", "status"],
-                    env=native_env(config),
+                    env=(native_env(config) if environment is None else
+                         native_env(config, environment=environment)),
                     pass_fds=(executable.fileno(),),
                     capture_output=True,
                     text=True,

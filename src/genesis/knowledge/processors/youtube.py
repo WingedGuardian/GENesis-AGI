@@ -21,6 +21,7 @@ import contextlib
 import importlib.util
 import json
 import logging
+import math
 import re
 import sys
 import tempfile
@@ -352,18 +353,21 @@ class YouTubeProcessor:
 
         cap = audio_max_minutes()
         duration = result.metadata.get("duration")
-        bounded = (
-            recorded
-            and isinstance(duration, (int, float)) and not isinstance(duration, bool)
-            and 0 < duration <= cap * 60
+        # A JSON number such as 1e400 decodes to a non-finite float; treat it
+        # as unknown rather than formatting it (int(inf) raises OverflowError).
+        finite_duration = (
+            isinstance(duration, (int, float))
+            and not isinstance(duration, bool)
+            and (isinstance(duration, int) or math.isfinite(duration))
         )
+        bounded = recorded and finite_duration and 0 < duration <= cap * 60
         if not result.transcript and audio_fallback and not bounded:
             # Live, upcoming, zero, unknown or over-cap length: never download
             # an audio track whose size nothing bounds.
             audio_fallback = False
             if not recorded:
                 why = "a live or unfinished stream"
-            elif isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration > 0:
+            elif finite_duration and duration > 0:
                 why = f"{int(duration) // 60} min long"
             else:
                 why = "of unknown length"

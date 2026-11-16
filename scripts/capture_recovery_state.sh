@@ -48,8 +48,13 @@ if [ -d "${VENV_PATH:-$GENESIS_REPO/.venv}" ]; then
     "${VENV_PATH:-$GENESIS_REPO/.venv}/bin/python" -m pip freeze > "$OUT_DIR/pip_freeze.txt" || true
 fi
 
-if [ -f "${SECRETS_PATH:-$GENESIS_REPO/secrets.env}" ]; then
-    stat "${SECRETS_PATH:-$GENESIS_REPO/secrets.env}" > "$OUT_DIR/secrets_stat.txt" || true
+# shellcheck source=lib/secrets_path.sh
+. "$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/secrets_path.sh"
+# Best effort like every other step here: an unresolvable SECRETS_PATH skips
+# this one file rather than ending the capture.
+_secrets_file="$(genesis_secrets_path "$GENESIS_REPO")" || _secrets_file=""
+if [ -f "$_secrets_file" ]; then
+    stat "$_secrets_file" > "$OUT_DIR/secrets_stat.txt" || true
 fi
 
 echo "Recovery state captured at $OUT_DIR"

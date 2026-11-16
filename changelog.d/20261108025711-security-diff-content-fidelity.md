@@ -1,0 +1,1 @@
+- Privacy scans preserve added content containing non-LF separators or text resembling patch headers, so those lines cannot disappear during diff parsing.

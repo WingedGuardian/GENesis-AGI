@@ -6,9 +6,18 @@ user-facing error templates in channel handlers.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from genesis.cc.oom import OOMEvidence
+
 
 class CCError(Exception):
     """Base for all CC invocation errors."""
+
+    # Optional reported CLI transcript identity, never a Genesis lifecycle ID.
+    # Populated by structured-result classification, not inferred from prose.
+    cc_session_id: str | None = None
 
 
 class CCTimeoutError(CCError):
@@ -31,6 +40,20 @@ class CCReplayUnsafeError(CCProcessError):
         self.__cause__ = cause
         self.raw_text = getattr(cause, "raw_text", None)
         self.raw_event = getattr(cause, "raw_event", None)
+        self.cc_session_id = getattr(cause, "cc_session_id", None)
+
+
+class CCMemoryPressureError(CCReplayUnsafeError):
+    """External SIGKILL correlated with an OOM counter, not a proven victim."""
+
+    def __init__(self, evidence: OOMEvidence, *, cause: CCError):
+        super().__init__(
+            "⚠️ This attempt was killed while its cgroup recorded an OOM kill. "
+            "Local memory pressure may be responsible; the shared counter cannot identify the victim. "
+            "Work may already have run. No automatic retry or provider failover will run.",
+            cause=cause,
+        )
+        self.evidence = evidence
 
 
 class CCStreamTruncatedError(CCReplayUnsafeError):

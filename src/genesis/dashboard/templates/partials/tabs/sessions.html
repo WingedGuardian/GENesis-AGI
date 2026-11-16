@@ -90,10 +90,10 @@
                       <span style="font-size: 0.7rem; padding: 0.1rem 0.4rem; border-radius: 4px; background: rgba(240,173,78,0.15); color: #f0ad4e; white-space: nowrap;"
                             x-text="'proc alive, db says ' + s.status"></span>
                     </template>
-                    <template x-if="s.live && s.live.stale_code">
+                    <template x-if="s.live">
                       <span style="font-size: 0.7rem; padding: 0.1rem 0.4rem; border-radius: 4px; background: rgba(240,173,78,0.15); color: #f0ad4e; white-space: nowrap;"
-                            :title="'This session\'s MCP tools are running pre-deploy code (deployed commit ' + (s.live.deploy_commit || '?') + '). Restart the session to load it.'"
-                            x-text="'stale · restart for ' + (s.live.deploy_commit || 'latest')"></span>
+                            :title="s.live.recorded_revision === 'unknown' ? 'Recorded revision could not be compared; loaded bytes unverified.' : 'Recorded launch revision compared with current checkout ' + (s.live.checkout_commit || '?') + '; loaded bytes unverified.'"
+                            x-text="s.live.recorded_revision === 'different_recorded_revision' ? 'recorded revision differs' : (s.live.recorded_revision === 'same_recorded_revision' ? 'same recorded revision' : 'revision unknown')"></span>
                     </template>
                   </div>
                 </template>
@@ -105,10 +105,10 @@
                   <template x-for="u in $store.genesisDashboard.sessionsTab.data.unmatched_slots" :key="u.pid">
                     <div style="font-size: 0.75rem; color: #f87171; display: flex; gap: 0.4rem; align-items: center;">
                       <span :title="'session memory (whole process tree)'" x-text="(u.slot ? '#' + u.slot + ' ' : '') + 'pid ' + u.pid + ' ' + (u.rss_mb / 1024).toFixed(1) + 'G (' + u.status + ')'"></span>
-                      <template x-if="u.stale_code">
+                      <template x-if="u">
                         <span style="font-size: 0.68rem; padding: 0.05rem 0.35rem; border-radius: 4px; background: rgba(240,173,78,0.15); color: #f0ad4e; white-space: nowrap;"
-                              :title="'This process is running pre-deploy code (deployed commit ' + (u.deploy_commit || '?') + '). Restart it to load the deployed code.'"
-                              x-text="'stale · restart for ' + (u.deploy_commit || 'latest')"></span>
+                              :title="u.recorded_revision === 'unknown' ? 'Recorded revision could not be compared; loaded bytes unverified.' : 'Recorded launch revision compared with current checkout ' + (u.checkout_commit || '?') + '; loaded bytes unverified.'"
+                              x-text="u.recorded_revision === 'different_recorded_revision' ? 'recorded revision differs' : (u.recorded_revision === 'same_recorded_revision' ? 'same recorded revision' : 'revision unknown')"></span>
                       </template>
                     </div>
                   </template>

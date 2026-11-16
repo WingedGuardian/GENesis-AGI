@@ -120,6 +120,11 @@ async def private_list(db, *, status_filter, limit, include_tabled):
     }
 
 
+def _today():
+    """The UTC date a close is judged on; the backlog's "Rechecks due" read uses the same."""
+    return datetime.now(UTC).date()
+
+
 async def record_verification(
     evidence_json: str,
     pr: StrictInt,
@@ -135,19 +140,28 @@ async def record_verification(
     Preview never changes the obligation. After an uncertain real response,
     re-read evidence/attempt_count before retrying: attempts are not idempotent.
     """
+    from genesis.caller_context import client_kind, record_session_id
     from genesis.db.crud import pr_verifications as crud
+    from genesis.mcp.external_profiles import current_external_profile
     from genesis.mcp.health.follow_up_tools import _get_db
     from genesis.session_awareness.codex_validator_config import dry_run_only
     from genesis.session_awareness.pr_evidence import (
         MAX_EVIDENCE_BYTES,
         Refusal,
         check_e2e_coverage,
+        check_event_dates,
+        completeness_prompts,
         decide,
         parse_evidence,
         reason_for,
         rechecks_for,
     )
     from genesis.session_awareness.pr_recording import _no_duplicates, attempt_note, resolve_repo
+
+    # Read at the tool's entry, where the external-client profile is in force.
+    profile = current_external_profile.get()
+    kind = client_kind(profile.value if profile is not None else None)
+    stamp = {"recorded_by": kind, "recorded_session": record_session_id(kind)}
 
     if len(evidence_json.encode("utf-8")) > MAX_EVIDENCE_BYTES:
         raise ToolError("Evidence exceeds the byte cap; refused rather than truncated")
@@ -157,6 +171,7 @@ async def record_verification(
     decision = decide(doc, park=park, asserted=verdict, note=note)
     if isinstance(decision, Refusal):
         raise ToolError(decision.message)
+    prompts = completeness_prompts(doc)
     payload = json.dumps(doc.model_dump(mode="json"), indent=2, sort_keys=True, ensure_ascii=False)
     if len(payload.encode("utf-8")) > MAX_EVIDENCE_BYTES:
         raise ToolError("Canonical evidence exceeds the byte cap")
@@ -184,6 +199,9 @@ async def record_verification(
         coverage = check_e2e_coverage(doc, actual.body) if closing else None
         if coverage:
             raise ToolError(coverage.message)
+        dated = check_event_dates(doc, closing, _today())
+        if dated:
+            raise ToolError(dated.message)
         rechecks = rechecks_for(doc) if closing else []
         if rechecks and not await crud._rechecks_column_available(db):
             raise ToolError("Rechecks are owed but their column is unavailable; run the migration first")
@@ -199,6 +217,11 @@ async def record_verification(
             "server_dry_run_only": forced,
             "recorded": False,
             "rechecks": rechecks,
+            # The document's own declaration. On a recorded not-yet-done whose
+            # tracking is complete, the picker waits the re-attempt window after it.
+            "no_progress": doc.no_progress,
+            # Questions to answer before a close; never stored, never a verdict.
+            "prompts": prompts,
         }
         if preview:
             return result
@@ -212,6 +235,7 @@ async def record_verification(
                 reason=reason_for(doc, decision),
                 evidence=payload,
                 now=now,
+                **stamp,
             )
         else:
             changed = (
@@ -225,6 +249,7 @@ async def record_verification(
                     evidence=payload,
                     now=now,
                     tracking_pending=not tracking.complete,
+                    **stamp,
                 )
                 == "recorded"
             )

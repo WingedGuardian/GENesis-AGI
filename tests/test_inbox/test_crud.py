@@ -149,6 +149,7 @@ async def test_get_all_known_reused_row_wins_over_older_completed(db):
     await inbox_items.reuse_as_pending(
         db, "reused", drop_id="D", batch_items="new-url",
         content_hash="CURRENT", created_at="2026-03-10T20:00:00+00:00",
+        expected_batch_items=None, expected_retry_ids=["reused"], max_retries=3,
     )
     known = await inbox_items.get_all_known(db)
     assert known["/inbox/a.md"] == "CURRENT"

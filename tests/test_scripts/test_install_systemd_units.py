@@ -187,11 +187,12 @@ def test_every_unit_path_starts_at_an_ALLOWED_root():
             name, sep, value = line.partition("=")
             if not sep or name.strip() not in _PATH_DIRECTIVES:
                 continue
-            # The managed backend starts at a neutral cwd; its helper validates
-            # and enters the configured primary checkout before executing native.
-            if (source, name.strip(), value) == (
-                TEMPLATE_DIR / "genesis-cbm-query.service.template", "WorkingDirectory", "/"
-            ):
+            # The managed backend and captured runner start at a neutral cwd;
+            # their entry helpers explicitly resolve the selected checkout.
+            if (source, name.strip(), value) in {
+                (TEMPLATE_DIR / "genesis-cbm-query.service.template", "WorkingDirectory", "/"),
+                (TEMPLATE_DIR / "genesis-code-intel.service.template", "WorkingDirectory", "/"),
+            }:
                 continue
             for token in _path_tokens(value):
                 if token.startswith("__") or token.startswith(_ALLOWED_ROOT_PREFIXES):
@@ -216,6 +217,10 @@ def test_every_unit_path_starts_at_an_ALLOWED_root():
         ("genesis-cbm-query.service.template", "ExecStart", "/", False),
         ("genesis-cbm-query.service.template", "WorkingDirectory", "/home/foreign", False),
         ("genesis-cbm-query.service.template", "WorkingDirectory", "/ /home/foreign", False),
+        ("genesis-code-intel.service.template", "WorkingDirectory", "/", True),
+        ("genesis-code-intel.service.template", "ExecStart", "/", False),
+        ("genesis-code-intel.service.template", "WorkingDirectory", "/home/foreign", False),
+        ("genesis-code-intel.service.template", "WorkingDirectory", "/ /home/foreign", False),
     ],
 )
 def test_neutral_cwd_exception_is_specific(tmp_path, monkeypatch, filename, directive, value, allowed):

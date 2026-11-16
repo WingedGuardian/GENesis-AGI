@@ -170,11 +170,27 @@ def test_the_reason_is_matched_exactly_not_by_prefix():
 # ─── the acceptance replay ───────────────────────────────────────────────────
 
 
-def test_expiry_deletes_archive_then_pin_then_unlocks_then_prunes(repo, tmp_path):
-    """The real case, end to end: an archived detached worktree whose commit is
+def _redundancy_says_yes(monkeypatch) -> None:
+    """Stub the content predicate (worktree_redundancy.py, tested on its own) so
+    the deletion machinery can be exercised on a commit only the anchor holds."""
+
+    class _Yes:
+        @staticmethod
+        def archive_redundancy(*_a, **_k):
+            return True, "test"
+
+    monkeypatch.setattr(wl, "_load_redundancy_module", lambda: _Yes)
+
+
+def test_expiry_deletes_archive_then_pin_then_unlocks_then_prunes(repo, tmp_path, monkeypatch):
+    """The machinery, end to end: an archived detached worktree whose commit is
     reachable from nothing but its anchor. Before expiry `gc` must keep it;
     after expiry the archive, pin, lock and registration are all gone and `gc`
-    collects it. A merged archive's commit survives because main reaches it."""
+    collects it. A merged archive's commit survives because main reaches it.
+    The real predicate would KEEP `old` (its head is not in main), so it is
+    stubbed here; `test_the_real_predicate_keeps_an_unmerged_detached_archive`
+    is the other half."""
+    _redundancy_says_yes(monkeypatch)
     old = _archive(repo, tmp_path, "old", detached_commit=True)
     merged = _archive(repo, tmp_path, "merged")
     young = _archive(repo, tmp_path, "young", detached_commit=True)
@@ -227,6 +243,22 @@ def test_expiry_deletes_archive_then_pin_then_unlocks_then_prunes(repo, tmp_path
     assert not _commit_exists(repo, old["head"]), "an expired archive's commit outlived it"
     assert _commit_exists(repo, merged["head"]), "a commit main reaches must survive"
     assert _commit_exists(repo, young["head"]), "a young archive's commit must survive"
+
+
+def test_the_real_predicate_keeps_an_unmerged_detached_archive(repo, tmp_path):
+    """The hole #2504 closes: `lane: merged` recorded at archive time, but the
+    head is reachable from nothing in main. The archive, its anchor and its
+    commit all survive, and a clean merged archive beside it still expires."""
+    held = _archive(repo, tmp_path, "held", detached_commit=True)
+    clean = _archive(repo, tmp_path, "clean")
+    _backdate(held["entry"], 40)
+    _backdate(clean["entry"], 40)
+    counts = wl._expire_trash(repo, days=30)
+    assert counts["expired"] == 1 and counts["kept"] == 1
+    assert held["archive"].exists() and not clean["archive"].exists()
+    assert _registered(repo)[str(held["path"])], "a kept archive keeps its anchor"
+    _gc_now(repo)
+    assert _commit_exists(repo, held["head"])
 
 
 def test_ORDER_is_archive_then_ref_then_unlock_then_prune(repo, tmp_path, monkeypatch):
@@ -521,7 +553,7 @@ def test_UNMERGED_archives_never_expire_and_MERGED_ones_do(repo, tmp_path):
     reaper's own recorded verdict, and anything but an explicit "merged" —
     unmerged, absent (pre-lane entries), unreadable meta — is kept."""
     unmerged = _archive(repo, tmp_path, "unm", detached_commit=True, lane="unmerged")
-    merged = _archive(repo, tmp_path, "mrg", detached_commit=True, lane="merged")
+    merged = _archive(repo, tmp_path, "mrg", lane="merged")
     nolane = _archive(repo, tmp_path, "nolane", detached_commit=True, lane="merged")
     for a in (unmerged, merged, nolane):
         _backdate(a["entry"], 400)
@@ -563,7 +595,7 @@ def test_a_MERGED_archive_that_held_uncommitted_changes_is_kept(repo, tmp_path, 
     """Owner ruling: uncommitted changes exist only in the archive, so a merged
     archive that recorded any is kept. Only an explicit boolean False expires;
     absent or non-boolean fails toward keeping."""
-    a = _archive(repo, tmp_path, "dirtymrg", detached_commit=True, lane="merged")
+    a = _archive(repo, tmp_path, "dirtymrg", lane="merged")
     _backdate(a["entry"], 400)
     meta = wl.TRASH_DIR / f"{a['entry']}.meta.json"
     data = json.loads(meta.read_text())

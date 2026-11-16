@@ -252,6 +252,25 @@ line keeps its meaning: the check to run AFTER the merge. For a hook that is sti
 needed, because a pre-PR run tests the worktree copy, not the merged copy the
 harness fires.
 
+**Work built from a spec converges against it before the PR.** Run the pass in
+`.claude/skills/spec-session/references/spec-converge.md`:
+- the spec, its plan and its tickets are the only statement of intent;
+- a checked box, a closed row or a "done" bullet is not evidence that the work
+  was done;
+- each gap is missing, partial, contradicts or unrequested;
+- its only write is appending items to your plan file, each traced to the spec
+  line it comes from;
+- when nothing remains it changes nothing.
+
+Do the items and run it again until it converges. Something the spec asked
+for may be left unbuilt only on the owner's recorded decision (a change to the
+spec, never your own call), and a standing-rule contradiction only under the
+owner's recorded exception; the contract's "carried" rules say how. Put the report's `Outcome:` line in the PR
+body under `## Testing`. This applies to any build from a spec, whether or not
+its effect can be shown on this install. The review-time check is different: the
+architect's Step 0.5 compares the diff with the plan and stays informational,
+and it does not replace this pass.
+
 **Which copy actually ran is the whole question. Check it; never assume it.**
 - A hook guard run as `python3 <worktree>/scripts/hooks/<guard>.py`, with a real
   payload on stdin, runs the branch's copy of that file. The harness, and the
@@ -1877,6 +1896,34 @@ three protocol steps also apply: `.claude/skills/closing-session/SKILL.md`,
   self-check.
   A PR whose diff touches the enforcement-hook surface runs the gate-fix lane: round 1 is DUAL, Codex plus `merge_gate.secondary_reviewer` run together at PR open (Codex-only when none is configured, and the PR says so). Read `.claude/skills/genesis-development/references/gate-fix-lane.md` before opening it.
 
+### Security PRs: the premise check comes before round 1
+
+**A PR whose job is to keep a secret or a credential from leaking, or a gate from
+being bypassed, gets an
+independent premise check and a security audit with fixed questions BEFORE its
+first review request**, rather than waiting for round 2 to owe one. Seen
+2026-11-12, #4189/#4418 (locate credential screen): repeated fresh-context
+Claude security audits approved the tree, then Codex round 1 found two P1s and
+CodeRabbit round 2 a Major. The round-2 premise check traced three of the
+findings to one root cause the fixes had each patched around: verdicts cached
+under a stand-in (a path, a stat identity) for the bytes judged (premise-check
+report in the PR's round-2 reflection).
+
+Hand these questions to the security reviewer (`/deep-review`'s, or
+`genesis-security-reviewer`), every time, whatever the PR. The first overlaps
+axis 1 above; keep the two in step:
+- **Check versus use:** is any verdict, exemption or cache entry decided on
+  something other than the exact bytes or state that is then acted on (a path,
+  a stat identity, an earlier read)? Name each place, and the race it allows.
+- **Sibling parity:** does every sibling surface that guards the same thing
+  (another route's deny-list, the dashboard, another gate) refuse at least what
+  this one refuses? List the siblings and diff their rules.
+- **Pattern-independence:** can any count, timing or error a caller observes
+  depend on the caller's input in a way that leaks one bit at a time?
+- **Both backends:** if there is a fast path and a fallback, which one does CI
+  exercise, and which one does a real install use?
+- **Fail closed:** what does each error, timeout and budget exhaustion do?
+
 ### Publishing: a PR opens only after an independent review
 
 **`gh pr create` on the configured public repo is refused until a reviewer has read
@@ -2314,7 +2361,9 @@ Standard open-source workflow: PRs go directly to the public repo.
   drop whose PR body could not be read. Read the
   step summary first; it names every vanished id. If a drop is deliberate, put
   a line `Collected-drop: <reason>` in the PR body and re-run the job (or push,
-  if a re-run no longer clears it: #2624). A branch cut before #2743 that still edits the old
+  if a re-run no longer clears it: #2624). The line is for a drop your own
+  change makes: a failure you inherited from another PR or from main gets the
+  owner's yes before you add it (#4471). A branch cut before #2743 that still edits the old
   `--min-collected` line resolves that conflict by taking main's side and
   deleting its own floor paragraph. The `--ceiling` (skip count) still lives on
   the dormancy-guard line: raise it only in the commit that adds the skip,

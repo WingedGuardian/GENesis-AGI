@@ -11,13 +11,13 @@ OpenClaw QMD query expansion. See:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import time
 from dataclasses import dataclass, field
 
 from genesis.db.crud._fts import bounded_terms, fts5_term
+from genesis.db.request_database import run_resource_thread
 
 logger = logging.getLogger(__name__)
 
@@ -586,26 +586,42 @@ async def _rebuild_tag_index(
     qdrant_client: object,
     collections: list[str],
     total_count: int,
+    *,
+    db=None,
 ) -> None:
-    """Background SWR rebuild: scan tags in a thread, rebuild, clear the flag.
+    """Scan off the loop, retaining a shared owner's actual physical work."""
+    tag_lists = await run_resource_thread(db, _scan_tag_lists, qdrant_client, collections)
+    _tag_index.build(tag_lists, total_count)
+    logger.info(
+        "Tag co-occurrence index rebuilt in background (%d tag-lists, corpus=%d)",
+        len(tag_lists), total_count,
+    )
 
-    Single-flight — the caller sets ``_rebuild_in_flight`` before scheduling
-    this, and this clears it in a ``finally`` so a scan failure can't wedge the
-    index stale forever.
-    """
+
+def _tag_rebuild_finished(_task) -> None:
+    """Release single flight after the accepted job's wrapper cleanup too."""
     global _rebuild_in_flight  # noqa: PLW0603
+    _rebuild_in_flight = False
+
+
+def _schedule_tag_rebuild(qdrant_client, collections, total_count, *, db=None) -> None:
+    """Keep scheduling/cleanup failures separate from cached query expansion."""
+    from genesis.db.request_database import spawn_database_task
+
+    global _rebuild_in_flight  # noqa: PLW0603
+    _rebuild_in_flight = True
+    rebuild = _rebuild_tag_index(qdrant_client, list(collections), total_count, db=db)
+    task = None
     try:
-        # The scroll is synchronous Qdrant I/O; keep it off the event loop so a
-        # large-corpus rebuild never blocks concurrent recalls.
-        tag_lists = await asyncio.to_thread(_scan_tag_lists, qdrant_client, collections)
-        _tag_index.build(tag_lists, total_count)
-        logger.info(
-            "Tag co-occurrence index rebuilt in background (%d tag-lists, corpus=%d)",
-            len(tag_lists),
-            total_count,
-        )
+        task = spawn_database_task(db, rebuild, name="tag_index_rebuild")
+    except Exception:
+        logger.warning("Tag rebuild scheduling failed; using cached index", exc_info=True)
     finally:
-        _rebuild_in_flight = False
+        if task is None:
+            rebuild.close()
+            _rebuild_in_flight = False
+    if task is not None:
+        task.add_done_callback(_tag_rebuild_finished)
 
 
 def _tokenize_query(query: str) -> list[str]:
@@ -685,6 +701,7 @@ async def expand_query(
     collections: list[str],
     *,
     max_expansions: int = 5,
+    db=None,
 ) -> str:
     """Expand a query with co-occurring tags for improved FTS5 recall.
 
@@ -697,7 +714,7 @@ async def expand_query(
     Returns the original query if expansion produces no results or
     if Qdrant is unavailable.
     """
-    global _last_count_check, _cached_total_count, _rebuild_in_flight  # noqa: PLW0603
+    global _last_count_check, _cached_total_count  # noqa: PLW0603
 
     try:
         # Time-gate the Qdrant point-count poll: the pre-SWR code hit
@@ -722,13 +739,7 @@ async def expand_query(
         # an unexpanded FTS query (a marginal recall dip) instead of a
         # multi-second inline scroll stall.
         if total_count > 0 and _tag_index.is_stale(total_count) and not _rebuild_in_flight:
-            _rebuild_in_flight = True
-            from genesis.util.tasks import tracked_task
-
-            tracked_task(
-                _rebuild_tag_index(qdrant_client, list(collections), total_count),
-                name="tag_index_rebuild",
-            )
+            _schedule_tag_rebuild(qdrant_client, collections, total_count, db=db)
 
         # Expand query
         # Bounded HERE, not inside _tokenize_query: classify_stance reads that

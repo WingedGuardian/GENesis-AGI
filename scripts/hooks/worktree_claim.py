@@ -61,6 +61,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import runpy
 import subprocess
 from pathlib import Path
 
@@ -84,17 +85,17 @@ PAYLOAD_NAMESPACE = "genesis.worktree-ownership"
 RULE_CLAIM = "claim"
 RULES = (RULE_CLAIM,)
 
-# A session process: argv[0]'s basename is exactly `claude`. MEASURED: the
+# A session process: argv[0] has a supported Claude launcher basename. MEASURED: the
 # wrapper that launches it (`bash -c cd ... && claude ...`) also contains the
 # string "claude", so a substring test over the whole cmdline matches the shell
 # too and would record the WRONG pid -- one that outlives the session it wraps.
-_SESSION_EXE = "claude"
+_SESSION_EXES = {"claude", "claude.exe", "claude-code"}
 
 _GIT_TIMEOUT = 30
 
-# Session ids are UUID-shaped. Anything else is not one, and is refused rather
-# than escaped -- the id is echoed into a lock reason a human reads.
-_SID_RE = re.compile(r"[0-9a-fA-F-]{1,64}\Z")
+# Load the canonical stdlib predicate by sibling path: reapers also import this
+# module directly under system Python, without hooks on sys.path.
+_is_safe_session_id = runpy.run_path(str(Path(__file__).with_name("hook_input.py")))["is_safe_session_id"]
 
 # Locks written by something else that we can nonetheless NAME. Claude Code's own
 # `isolation: "worktree"` subagents lock the worktree they create, with a reason
@@ -166,6 +167,8 @@ def worktree_root_for(path: str | Path) -> Path | None:
         try:
             if dot_git.is_file():
                 return candidate
+            if dot_git.is_dir():
+                return None  # A nearer primary checkout is not the enclosing worktree.
         except OSError:
             continue
         if candidate == candidate.parent:
@@ -183,20 +186,19 @@ def gitdir_for(root: Path) -> Path | None:
     different bytes than were written.
     """
     try:
-        text = (root / ".git").read_text(encoding="utf-8", errors="replace")
+        raw = (root / ".git").read_bytes()
     except OSError:
         return None
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("gitdir:"):
-            target = line[len("gitdir:") :].strip()
-            if not target:
-                return None
-            candidate = Path(target)
-            if not candidate.is_absolute():
-                candidate = (root / candidate).resolve()
-            return candidate
-    return None
+    # Git's gitfile reader consumes one byte string, removing only trailing
+    # CR/LF. Splitting lines or replacing undecodable bytes can name a DIFFERENT
+    # admin directory, where a written claim would not protect the worktree.
+    if not raw.startswith(b"gitdir: "):
+        return None
+    target = os.fsdecode(raw[8:].rstrip(b"\r\n"))
+    if not target or "\0" in target:
+        return None
+    candidate = Path(target)
+    return candidate if candidate.is_absolute() else (root / candidate).resolve()
 
 
 # --------------------------------------------------------------------------
@@ -293,7 +295,7 @@ def is_session_process(pid: int) -> bool:
         return False
     if not argv or not argv[0]:
         return False
-    return os.path.basename(argv[0].decode(errors="replace")) == _SESSION_EXE
+    return os.path.basename(argv[0].decode(errors="replace")) in _SESSION_EXES
 
 
 def session_pid_from_ancestry(start_pid: int | None = None, max_hops: int = 12) -> int | None:
@@ -524,19 +526,24 @@ def build_payload(
         "pid": pid,
         "start": start,
     }
-    if sid and _SID_RE.match(sid):
+    if _is_safe_session_id(sid):
         payload["sid"] = sid
     return payload
 
 
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess | None:
     try:
-        return subprocess.run(
+        result = subprocess.run(
             ["git", "-C", str(root), *args],
             capture_output=True,
-            text=True,
+            env={k: v for k, v in os.environ.items() if not k.startswith("GIT_") or k.startswith("GIT_CONFIG")},
             timeout=_GIT_TIMEOUT,
         )
+        # Paths are bytes: text=True both rejects non-UTF-8 peers and changes
+        # CR/CRLF inside names. Match the lifecycle reader's lossless decoding.
+        result.stdout = result.stdout.decode("utf-8", "surrogateescape")
+        result.stderr = result.stderr.decode("utf-8", "surrogateescape")
+        return result
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
 
@@ -544,11 +551,11 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess | None:
 def lock_worktree(root: Path, payload: dict) -> bool:
     """Lock ``root`` with ``payload``. Returns False if it was already locked.
 
-    Never overwrites an existing lock. An existing lock is another rule's or
-    another session's statement of ownership, and replacing it would discard the
-    release condition that makes it removable. git refuses a second lock anyway;
-    checking first is what keeps the answer deterministic and off the /proc walk
-    that ``build_payload`` would otherwise perform.
+    Never overwrites an existing lock. Native Git's check followed by write can
+    give two concurrent first editors success. Publish the complete existing
+    reason with the shared exclusive atomic writer, after Git validates that
+    the target is a registered linked worktree. Readers and release rules stay
+    unchanged; an existing lock is another owner's statement.
     """
     if read_lock(root) is not None:
         return False
@@ -564,8 +571,27 @@ def lock_worktree(root: Path, payload: dict) -> bool:
     # foreign, unlock_worktree -> False, `git worktree remove` -> rc 128.
     if _parse_payload(reason) is None:
         return False
-    result = _git(root, "worktree", "lock", "--reason", reason, str(root))
-    return bool(result and result.returncode == 0)
+    result = _git(root, "worktree", "list", "--porcelain", "-z")
+    if not result or result.returncode:
+        return False
+    try:
+        paths = [Path(field[9:]).resolve() for field in result.stdout.split("\0") if field.startswith("worktree ")]
+        gitdir = gitdir_for(root)
+        if root.resolve() not in paths[1:] or gitdir is None:
+            return False
+        # As in lifecycle release, bind the pointer to THIS registration:
+        # two individually valid worktrees must not let A claim B's admin dir.
+        backlink = os.fsdecode((gitdir / "gitdir").read_bytes().rstrip(b"\r\n"))
+        if Path(backlink).name != ".git" or Path(backlink).parent.resolve() != root.resolve():
+            return False
+        # Load the stdlib-only leaf without importing genesis.util's package
+        # initializers: this library also runs under the system interpreter.
+        atomic = Path(__file__).resolve().parents[2] / "src/genesis/util/atomic.py"
+        writer = runpy.run_path(str(atomic))["atomic_write_text"]
+        writer(gitdir / "locked", reason + "\n", encoding="utf-8", overwrite=False)
+        return True
+    except (OSError, ValueError, KeyError):
+        return False
 
 
 def unlock_worktree(root: Path, *, expect_pid: int | None = None) -> bool:

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import re
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
 import pytest
 
 from genesis.db.crud import task_states
@@ -339,3 +343,217 @@ def test_real_git_archive_reasons_agree_with_reaper_parser(tmp_path):
             assert actual_live is expected_live, repr(reason)
         finally:
             _git(repo, "worktree", "unlock", str(live))
+
+
+# ── Live sessions: count + other sessions' missions ──────────────────────────
+
+
+def _ago(minutes: float) -> str:
+    return (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat()
+
+
+async def _session(db, sid, *, pid=None, minutes_ago=1, channel=None,
+                   cc_session_id=None, mission=None, origin=None,
+                   session_type="foreground", status="active"):
+    await db.execute(
+        "INSERT INTO cc_sessions (id, session_type, channel, model, status, pid, "
+        "started_at, last_activity_at, cc_session_id, origin_class) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (sid, session_type, channel, "m", status, pid, _ago(minutes_ago + 60),
+         _ago(minutes_ago), cc_session_id or sid, origin),
+    )
+    if mission is not None:
+        await db.execute(
+            "INSERT INTO session_charters (session_id, mission, created_at, "
+            "mission_updated_at) VALUES (?,?,?,?)",
+            (sid, mission, _ago(minutes_ago), _ago(minutes_ago)),
+        )
+    await db.commit()
+
+
+@pytest.fixture
+def live(monkeypatch):
+    """Pids in ``alive`` are live claude processes; ``own`` is this hook's."""
+    state = {"alive": set(), "own": None}
+    monkeypatch.setattr(open_loops, "_pid_dead", lambda pid, row: pid not in state["alive"])
+    monkeypatch.setattr(open_loops, "_own_claude_pid", lambda: state["own"])
+    return state
+
+
+async def _block(db, dirs, own_session_id=""):
+    repo, plans = dirs
+    return await build_inflight_block(
+        db, repo_root=repo, plans_dir=plans, own_session_id=own_session_id
+    )
+
+
+async def test_one_pid_with_several_rows_is_one_session_showing_its_newest(
+    empty_db, empty_dirs, live
+):
+    """A /clear or resume keeps the pid and leaves the old row active (#4015)."""
+    live["alive"] = {100}
+    await _session(empty_db, "old", pid=100, minutes_ago=90, mission="Old cleared work.")
+    await _session(empty_db, "new", pid=100, minutes_ago=1, mission="Current work here.")
+    block = await _block(empty_db, empty_dirs)
+    assert "**Live sessions:** 1 CC" in block
+    assert "Current work here." in block
+    assert "Old cleared work" not in block
+
+
+async def test_dead_pid_is_not_counted(empty_db, empty_dirs, live):
+    live["alive"] = {100}
+    await _session(empty_db, "a", pid=100, mission="Alive mission.")
+    await _session(empty_db, "b", pid=200, mission="Dead mission.")
+    block = await _block(empty_db, empty_dirs)
+    assert "**Live sessions:** 1 CC" in block
+    assert "Dead mission" not in block
+
+
+async def test_channel_row_counts_only_while_recent(empty_db, empty_dirs, live):
+    await _session(empty_db, "t1", channel="telegram", cc_session_id="x1", minutes_ago=30)
+    await _session(empty_db, "t2", channel="telegram", cc_session_id="x2", minutes_ago=300)
+    block = await _block(empty_db, empty_dirs)
+    assert "**Live sessions:** 0 CC + 1 telegram" in block
+
+
+async def test_pidless_terminal_row_counts_as_cc_while_recent(empty_db, empty_dirs, live):
+    """Adopted terminal rows carry no pid and no channel."""
+    await _session(empty_db, "adopted", minutes_ago=10, mission="Adopted work.")
+    await _session(empty_db, "stale", minutes_ago=600, mission="Stale work.")
+    block = await _block(empty_db, empty_dirs)
+    assert "**Live sessions:** 1 CC" in block
+    assert "Adopted work." in block
+    assert "Stale work" not in block
+
+
+async def test_own_session_excluded_by_pid_even_before_its_row_exists(
+    empty_db, empty_dirs, live
+):
+    """SessionStart hooks run in parallel: after a /clear this session's row may
+    not exist yet, and the newest row on its pid is the conversation cleared."""
+    live["alive"] = {100, 300}
+    live["own"] = 100
+    await _session(empty_db, "cleared", pid=100, mission="Just-cleared conversation.")
+    await _session(empty_db, "peer", pid=300, mission="Peer mission.")
+    block = await _block(empty_db, empty_dirs, own_session_id="brand-new-id")
+    assert "**Live sessions:** 2 CC (incl. this session)" in block
+    assert "Just-cleared" not in block
+    assert "Peer mission." in block
+
+
+async def test_own_session_excluded_by_id(empty_db, empty_dirs, live):
+    await _session(empty_db, "me", minutes_ago=1, mission="My own mission.")
+    block = await _block(empty_db, empty_dirs, own_session_id="me")
+    assert "(incl. this session)" in block
+    assert "My own mission" not in block
+
+
+async def test_external_origin_mission_never_shown(empty_db, empty_dirs, live):
+    live["alive"] = {100}
+    await _session(empty_db, "v", pid=100, mission="EXTERNAL_MISSION_TEXT",
+                   origin="external_untrusted")
+    block = await _block(empty_db, empty_dirs)
+    assert "**Live sessions:** 1 CC" in block
+    assert "EXTERNAL_MISSION_TEXT" not in block
+
+
+async def test_mission_clipped_at_a_word_boundary_on_one_line(empty_db, empty_dirs, live):
+    live["alive"] = {100}
+    words = "Build the health sweep queue one worktree per PR\nstarting with lock contention "
+    await _session(empty_db, "a", pid=100, mission=words * 6)
+    block = await _block(empty_db, empty_dirs)
+    [line] = [ln for ln in block.splitlines() if ln.startswith("- Build")]
+    mission = re.sub(r" \([^)]*\)$", "", line[2:])
+    assert mission.endswith("…")
+    assert len(mission) <= 140
+    assert set(mission[:-1].split()) <= set(words.split())
+
+
+async def test_session_without_mission_counted_but_no_line(empty_db, empty_dirs, live):
+    live["alive"] = {100}
+    await _session(empty_db, "a", pid=100)
+    block = await _block(empty_db, empty_dirs)
+    assert "**Live sessions:** 1 CC" in block
+    assert "self-declared missions" not in block
+
+
+async def test_background_and_completed_rows_ignored(empty_db, empty_dirs, live):
+    live["alive"] = {100, 200}
+    await _session(empty_db, "bg", pid=100, session_type="background_task", mission="Bg.")
+    await _session(empty_db, "done", pid=200, status="completed", mission="Done.")
+    assert await _block(empty_db, empty_dirs) == ""
+
+
+async def test_sessions_section_failure_leaves_others(empty_db, empty_dirs, live, monkeypatch):
+    async def boom(*a, **k):
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(open_loops, "_session_lines", boom)
+    await _insert_task(empty_db, "task0001", "Fix the widget")
+    block = await _block(empty_db, empty_dirs)
+    assert "Fix the widget" in block
+    assert "Live sessions" not in block
+
+
+def test_pid_dead_is_the_reapers_predicate(monkeypatch):
+    """One predicate for the reaper and this block, both through
+    proc_io.claude_pid_dead; this block never imports the reaper or anything
+    under genesis.observability (about 300 ms at every session start)."""
+    from genesis.cc import foreground_reaper
+    from genesis.util import proc_io
+
+    assert foreground_reaper.claude_pid_dead is proc_io.claude_pid_dead
+    seen = []
+    monkeypatch.setattr(proc_io, "claude_pid_dead", lambda pid, row: seen.append(pid) or True)
+    assert open_loops._pid_dead(4242, {}) is True
+    assert seen == [4242]
+    src = Path(open_loops.__file__).read_text()
+    assert "foreground_reaper" not in src
+    assert "genesis.observability" not in src
+
+
+async def test_voice_row_is_a_channel_not_cc(empty_db, empty_dirs, live):
+    """Voice rows carry id == cc_session_id like terminal rows, with no pid."""
+    await empty_db.execute(
+        "INSERT INTO cc_sessions (id, session_type, channel, model, status, "
+        "started_at, last_activity_at, cc_session_id, source_tag, origin_class) "
+        "VALUES ('v1','foreground','voice_s2s','m','active',?,?,'v1','voice',"
+        "'external_untrusted')",
+        (_ago(70), _ago(10)),
+    )
+    await empty_db.commit()
+    block = await _block(empty_db, empty_dirs)
+    assert "**Live sessions:** 0 CC + 1 voice_s2s" in block
+
+
+async def test_own_channel_session_counted_once(empty_db, empty_dirs, live):
+    """A session hosted by a channel row is this session, not also a channel."""
+    live["own"] = 100
+    await _session(empty_db, "row", channel="telegram", cc_session_id="cc-1", minutes_ago=5)
+    block = await _block(empty_db, empty_dirs, own_session_id="cc-1")
+    assert "**Live sessions:** 1 CC (incl. this session)" in block
+    assert "telegram" not in block
+
+
+async def test_own_session_counted_before_its_row_exists(empty_db, empty_dirs, live):
+    """Fresh start: this session's row is not registered yet, so nothing on
+    its pid is visible; it is still one of the live sessions."""
+    live["alive"] = {300}
+    live["own"] = 100
+    await _session(empty_db, "peer", pid=300, mission="Peer mission.")
+    block = await _block(empty_db, empty_dirs, own_session_id="fresh")
+    assert "**Live sessions:** 2 CC (incl. this session)" in block
+    assert "Peer mission." in block
+
+
+async def test_live_sessions_survive_truncation(empty_db, empty_dirs, live, monkeypatch):
+    """The section comes first: an over-long block drops plans and worktrees."""
+    live["alive"] = {300}
+    await _session(empty_db, "peer", pid=300, mission="Peer mission.")
+    monkeypatch.setattr(
+        open_loops, "_plan_lines", lambda d: ["- " + "y" * 100 for _ in range(60)]
+    )
+    block = await _block(empty_db, empty_dirs)
+    assert "…(truncated)" in block
+    assert "**Live sessions:** 1 CC" in block
+    assert "Peer mission." in block

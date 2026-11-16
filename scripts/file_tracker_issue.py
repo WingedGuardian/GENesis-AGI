@@ -39,9 +39,10 @@ containing backticks or `$(...)` — ordinary in a technical title — would exe
 if interpolated into a command line, after the privacy scan, with its output in
 the public title. The absence of a shell is the mechanism, not a precaution.
 
-This does NOT decide whether the issue SHOULD be public. The caller owns the two
-hard limits in CLAUDE.md — explicit user approval for an irreversible post, and
-never publishing an unfixed security defect.
+This does NOT decide whether the issue SHOULD be public. CLAUDE.md makes
+actionable work public by default, with no per-post approval within authorized
+scope. The caller must scrub private detail and withhold a whole item only when
+a useful redacted description necessarily enables concrete disclosure harm.
 
 Usage:
     file_tracker_issue.py --title-file T --body-file B --area area:memory \\

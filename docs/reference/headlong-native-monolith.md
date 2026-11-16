@@ -83,6 +83,17 @@ boundary. Reports and actual image/container metadata are retained for seven day
 Host tests exercise only owned Python helpers, actual disposable CRUD and passive
 evidence. Integrated success requires the exact-head post-review contained run.
 
+The B controller measures group closure after every command, including native
+version discovery, scenario setup/appends, wakes, history lookup and correlation
+readers. Each task-local command log retains argv, group ID, exit, timeout and
+closure-probe results. Missing logs, live groups, inaccessible probes or timeouts
+make qualification incomplete; subsequent cleanup cannot turn those records into
+success. Other users of the shared command helper keep its existing result shape.
+The dedicated container also retains its verified init/controller identity and
+before/after process census. Unexpected surviving processes fail the report and
+require investigation; an outer-group probe alone does not establish closure of
+independently sessioned descendants. Container removal remains separately verified.
+
 The private shared case inventory in `scripts/ci/ego_runtime_cases.py` describes
 these same thirteen cases, their first native response kind, wake count,
 reactive input, injected fault and blocked-prompt status. The B report includes

@@ -161,6 +161,21 @@ def test_record_command_preserves_the_selected_database_path(tmp_path, capsys):
     assert args[args.index("--db-path") + 1] == str(db)
 
 
+def test_printed_commands_name_the_interpreter_running_the_reader(tmp_path, capsys):
+    """A bare `python3` may lack aiosqlite, which pr_verification.py needs, so
+    both commands the backlog prints start with this interpreter."""
+    import sys
+
+    db = tmp_path / "synthetic.db"
+    _build_rechecks(db, [_EVENT])
+    _w._print_verification_backlog(str(db))
+    out = capsys.readouterr().out
+    py = shlex.quote(sys.executable)
+    # Read the whole output: a quoted interpreter path is not confined to one line.
+    assert f"record : {py} scripts/pr_verification.py recheck" in out
+    assert f"close one: {py} scripts/pr_verification.py close" in out
+
+
 @pytest.mark.parametrize("bad_results", [["bad"], [None], [{}], "bad", 0])
 def test_malformed_history_is_shown_once_and_later_valid_row_survives(
     tmp_path, capsys, bad_results

@@ -6,7 +6,9 @@ background_pipe_guard (no run_in_background), review_enforcement_commit,
 pre_push_privacy_review, pr_open_review_gate, adopt_first_gate, plan_premise_gate,
 plan_confidence_reminder,
 behavioral_linter, procedure_advisor, cbm-discovery-gate, deploy_timeout_advisory
-(commit/plan/lifecycle), pretool_check (autonomous admission). Hosted web tools
+(commit/plan/lifecycle), pretool_check (autonomous admission), holdout_fence
+(advisory only and event-specific; the Codex CLI wires it in .codex/config.toml,
+where it records validator shell access too). Hosted web tools
 do not reach hooks. Existing guards' internal fail-open paths remain theirs;
 observable failures here deny. Arbitrary programs, later stdin, filesystem races
 and failed/killed outer hooks remain outside this accident-prevention layer.

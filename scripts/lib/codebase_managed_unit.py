@@ -455,16 +455,15 @@ def config_path(raw: str) -> Path:
     return absolute(str(path.parent.resolve() / path.name))
 
 
-def cgroup_empty(control: str) -> None:
-    if not control:
-        return
+def resolve_control_group(control: str) -> tuple[Path, Path, int]:
+    """Map an existing manager ControlGroup through the visible v2 namespace."""
     path = absolute(control)
     if ".." in path.parts:
         raise ValueError("invalid managed ControlGroup")
     mountinfo = Path("/proc/self/mountinfo")
     _, root, version = resolve_cgroup(Path("/proc/self/cgroup"), mountinfo)
     if version != 2:
-        raise ValueError("uninstall requires visible cgroup v2 state")
+        raise ValueError("managed observation requires visible cgroup v2 state")
     mappings = []
     for row in mountinfo.read_text().splitlines():
         left, separator, right = row.partition(" - ")
@@ -481,6 +480,13 @@ def cgroup_empty(control: str) -> None:
     mounted = mappings[0]
     relative = path.relative_to(mounted) if path.is_relative_to(mounted) else path.relative_to("/")
     group = root / relative
+    return group, root, version
+
+
+def cgroup_empty(control: str) -> None:
+    if not control:
+        return
+    group, _, _ = resolve_control_group(control)
     try:
         values = dict(line.split() for line in (group / "cgroup.events").read_text().splitlines())
     except FileNotFoundError:
@@ -538,9 +544,10 @@ def validate_provider_paths(config: dict) -> None:
             raise ValueError(f"pinned provider does not support backslash in {key} paths")
 
 
-def native_env(config: dict) -> dict[str, str]:
+def native_env(config: dict, *, environment=None) -> dict[str, str]:
     validate_provider_paths(config)
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CBM_")}
+    selected = os.environ if environment is None else environment
+    env = {k: v for k, v in selected.items() if not k.startswith("CBM_")}
     env.update(
         CBM_CACHE_DIR=config["cache"],
         CBM_RUNTIME_DIR=config["runtime"],
