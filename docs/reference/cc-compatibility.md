@@ -1172,9 +1172,9 @@ where `inspect.getdoc` gives 4,733, because its one `…` normalizes to `...` (+
 `memory_recall` matched at 3,525 either way (2 of 2 tools). NFKC alone is not
 enough: Python `len` counts a non-BMP character once while JavaScript counts its
 surrogate pair twice. The test therefore counts NFKC-normalized UTF-16 code units.
-The corrected guard currently checks 159 tools; the largest description is
-`web_fetch` at 2,037 units, followed by `follow_up_create` at 2,031 and
-`memory_recall` at 2,024.
+The corrected guard checks 159 tools at the current integration checkpoint;
+the largest description is `locate` at 2,046 units, followed by `web_fetch` at
+2,037 and `follow_up_create` at 2,031.
 
 ### Hook stdout is silently FILED above 10,000 characters (measured 2.1.246, 2026-08-30)
 
