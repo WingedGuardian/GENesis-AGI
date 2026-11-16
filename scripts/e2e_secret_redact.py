@@ -117,7 +117,7 @@ def main() -> int:
         return 2
 
     scratch_parent = Path.home() / "tmp"
-    scratch_parent.mkdir(exist_ok=True)
+    scratch_parent.mkdir(parents=True, exist_ok=True)
     base = Path(tempfile.mkdtemp(prefix="secret-redact-e2e-", dir=scratch_parent))
     proj = base / "proj"
     proj.mkdir()
@@ -191,7 +191,8 @@ def main() -> int:
     checks: list[tuple[str, bool, str]] = []
     checks.append(("final answer has no canary", raw_in(out.get("result", "")) == 0, ""))
     # Find the session's records by its id, not by re-deriving Claude Code's folder naming.
-    found = list((Path.home() / ".claude" / "projects").glob(f"*/{sid}.jsonl"))
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    found = list((config / "projects").glob(f"*/{sid}.jsonl"))
     if not found:
         print(f"FAIL: no transcript found for session {sid}")
         return 1

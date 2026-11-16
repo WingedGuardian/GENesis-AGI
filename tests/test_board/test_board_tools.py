@@ -71,6 +71,24 @@ async def test_latest_pulse_and_newest_successful_summary_are_both_reported(db):
     assert out["pulses_read"] == 2 and out["scan_limit"] == manifest._HEARTBEAT_SCAN_LIMIT
 
 
+@pytest.mark.parametrize(
+    "writes",
+    [
+        {"added": 2, "status_set": 3, "links_set": 0, "budget_left": 11, "stopped_on": None},
+        {"dry_run": True, "would_set_status": 4, "would_add_at_most": 9, "would_link": 0},
+    ],
+)
+async def test_the_summary_carries_the_tick_s_writes(db, writes):
+    await _pulse(db, 1, board_state="ok", mode="live", items_total=3, writes=writes)
+    out = await bt._impl_board_status(db, now=NOW)
+    assert out["summary"]["writes"] == writes
+
+
+async def test_a_summary_from_before_the_writes_shows_none(db):
+    await _pulse(db, 1, board_state="ok", mode="propose_only", items_total=3)
+    assert (await bt._impl_board_status(db, now=NOW))["summary"]["writes"] is None
+
+
 async def test_pulses_without_a_read_give_no_summary_and_say_why(db):
     await _pulse(db, 5, board_state="error", mode="propose_only")
     await _pulse(db, 0, board_state="error", mode="propose_only")

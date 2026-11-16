@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -130,7 +132,7 @@ class TestGates:
 
 class TestDispatch:
     @pytest.mark.asyncio
-    async def test_successful_dispatch(self):
+    async def test_successful_dispatch(self, tmp_path):
         d = _make_dispatcher()
         d._state.started_at = "2020-01-01T00:00:00+00:00"
 
@@ -148,6 +150,11 @@ class TestDispatch:
         assert result.resolved
         assert result.diagnosis == "test diagnosis"
         assert result.session_id == "test-session-123"
+        mcp_path = Path(d._invoker.run.await_args.args[0].mcp_config)
+        assert mcp_path.is_relative_to(tmp_path)
+        assert set(json.loads(mcp_path.read_text())["mcpServers"]) == {
+            "genesis-health", "genesis-memory", "genesis-outreach",
+        }
         assert d._state.state == SentinelState.HEALTHY
 
     @pytest.mark.asyncio
