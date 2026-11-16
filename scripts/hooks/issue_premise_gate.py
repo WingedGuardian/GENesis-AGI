@@ -9,7 +9,8 @@ body, so this hook asks for it at the one moment it is cheap.
 
 PreToolUse: Bash. It BLOCKS (stderr + exit 2) a foreground ``gh issue create`` (or
 its alias ``new``) when the server gate's own rule, ``premise_gate.owed_answers``,
-says the body owes answers: the six ``## Premise checks`` answers for a work issue,
+says the body owes answers: the ``## Premise checks`` answers for a work issue (the
+six, or the nine-item form's Problem block; ``premise_gate.premise_gaps``),
 the five ``## Verification`` answers for one labelled ``bug``. The block names the
 missing section and numbers, shows the format, and points at ``python3
 scripts/premise_gate.py check <number>``. It asks for work, never for approval, so

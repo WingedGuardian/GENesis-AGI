@@ -398,6 +398,7 @@ pytest_plugins = [
     "tests._live_closure",
     "tests._live_outbound",
     "tests._live_writes",
+    "tests._session_config",
 ]
 
 
@@ -455,8 +456,8 @@ def pytest_configure(config):
     # In-process connects to live services on this machine, refused as on CI
     # (reads the real home the live fence resolved). See tests/_live_outbound.py.
     _live_outbound.install(config)
-    # Writes into the real home outside the test's temp dirs, reported (not
-    # failed). See tests/_live_writes.py.
+    # Report direct in-process writes after the existing boundaries are armed.
+    # Remains observational until #4193's accuracy and complete-census gates pass.
     _live_writes.install(config)
 
 

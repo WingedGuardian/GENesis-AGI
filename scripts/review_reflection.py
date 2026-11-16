@@ -1326,7 +1326,12 @@ def _is_ancestor(cwd: str, sha: str, of: str) -> bool:
     raise Refused(f"git merge-base --is-ancestor {sha[:12]} {of[:12]} failed")
 
 
-def covered_keys(
+def covered_keys(cwd: str, head: str, **context) -> set[str]:
+    """Compatibility set view of the same fully validated coverage."""
+    return set(coverage_details(cwd, head, **context))
+
+
+def coverage_details(
     cwd: str,
     head: str,
     *,
@@ -1340,8 +1345,9 @@ def covered_keys(
     deadline: float | None = None,
     repo: str | None = None,
     number: int | None = None,
-) -> set[str]:
-    """Keys answered at ``head`` by committed reflections. THE coverage check.
+    wanted_keys: Iterable[str] | None = None,
+) -> dict[str, Disposition]:
+    """Validated dispositions for keys answered at ``head`` by committed reflections. THE coverage check.
 
     A reflection counts only when it is an EMPTY commit naming this exact head,
     made before any fix of the key it credits (``fix_clock``: a commit made
@@ -1374,7 +1380,7 @@ def covered_keys(
     included; past it the check raises ``Refused``.
     """
     with deadline_scope(deadline):
-        return _covered_keys(
+        return _coverage_details(
             cwd,
             head,
             round_number=round_number,
@@ -1384,11 +1390,11 @@ def covered_keys(
             acceptance=acceptance,
             round_started=round_started,
             reviewed_at=reviewed_at or {},
-            repo=repo, number=number,
+            repo=repo, number=number, wanted_keys=wanted_keys,
         )
 
 
-def _covered_keys(
+def _coverage_details(
     cwd: str,
     head: str,
     *,
@@ -1401,9 +1407,11 @@ def _covered_keys(
     reviewed_at: Mapping[str, datetime | None],
     repo: str | None,
     number: int | None,
-) -> set[str]:
+    wanted_keys: Iterable[str] | None,
+) -> dict[str, Disposition]:
     log = _log_reflections(cwd)
-    covered: set[str] = set()
+    covered: dict[str, Disposition] = {}
+    wanted = None if wanted_keys is None else set(wanted_keys)
     cache: dict[str, dict] = {}
     for sha, kind, body, committed_at in log:
         if kind != "empty":
@@ -1441,7 +1449,8 @@ def _covered_keys(
         if result.ok:
             valid = validated_dispositions(
                 result, cwd=cwd, repo=repo, number=number, made_at=committed_at, cache=cache,
-                keys=(k for k in result.keys if k not in covered and clears(clock, reviewed_at.get(k))),
+                keys=(k for k in result.keys if k not in covered
+                      and (wanted is None or k in wanted) and clears(clock, reviewed_at.get(k))),
             )
             covered.update(valid)
     return covered

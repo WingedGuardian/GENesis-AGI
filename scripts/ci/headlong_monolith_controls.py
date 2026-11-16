@@ -230,6 +230,10 @@ def command(argv, env, root, data=None, timeout=100):
                 stdout, stderr = exc.output or b"", exc.stderr or b""
                 stdout = stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout
                 stderr = stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr
+                # Reap the SIGKILLed leader before the group probe below: an unreaped
+                # zombie is still a group member, so the probe would record a closed
+                # group as alive. SIGKILL cannot be ignored, so this wait ends.
+                process.wait()
         result = {"returncode": -9 if timed_out else process.returncode,
                   "stdout": stdout, "stderr": stderr, "timed_out": timed_out}
         record_command(process, argv, result)

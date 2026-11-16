@@ -3735,6 +3735,8 @@ async def test_a_drop_before_an_error_result_is_not_a_retryable_error(invoker, m
     assert isinstance(caught.value.__cause__, CCQuotaExhaustedError), (
         "the provider's own classification must survive as the cause"
     )
+    assert caught.value.cc_session_id == "s1"
+    assert caught.value.__cause__.cc_session_id == "s1"
     # The status signal is real evidence about the account and still worth
     # having — suppressing the retry must not also suppress the back-off.
     assert [type(e) for e in statuses] == [CCQuotaExhaustedError]

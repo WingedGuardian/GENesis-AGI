@@ -24,6 +24,7 @@ Two independent contracts live here:
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -129,10 +130,15 @@ def test_the_rendered_field_list_matches_the_renderer():
     restatement of the renderer, and the whole point of the class fix is that
     those drift.
     """
-    after = Path(pmh.__file__).read_text().split("def _heartbeat_read_and_inject")[1]
-    # Stop at the next TOP-LEVEL def -- `\ndef ` alone runs straight past
-    # `async def _run`, over-capturing 320 lines of unrelated body.
-    body = re.split(r"\n(?:async )?def ", after)[0]
+    source = Path(pmh.__file__).read_text()
+    functions = [
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_heartbeat_read_and_inject"
+    ]
+    assert len(functions) == 1, "renderer must be one top-level function"
+    body = ast.get_source_segment(source, functions[0])
+    assert body is not None, "renderer source must be available"
     # `s.get(` must not match the tail of another identifier: an unanchored
     # pattern also matches `ws_stats.get(`, which is a different object.
     reads = set(re.findall(r'(?<![A-Za-z0-9_])s\.get\(\s*"(\w+)"', body))
@@ -140,12 +146,26 @@ def test_the_rendered_field_list_matches_the_renderer():
         f"renderer reads {sorted(reads)}, test list is {sorted(_RENDERED_FIELDS)} -- "
         "a field was added to the tag without being added to the sanitize check"
     )
-    # Guard-the-guard: if the extraction above ever silently matched nothing,
-    # an empty set would compare unequal and the failure would look like a
-    # renderer change rather than a broken test.
-    assert len(body.splitlines()) < 80, (
-        f"body extraction over-captured: {len(body.splitlines())} lines"
-    )
+
+
+@pytest.mark.parametrize("change", ["new-field", "following-function", "long-renderer"])
+def test_renderer_field_inventory_checks_only_its_function(tmp_path, monkeypatch, change):
+    reads = "\n".join(f'    s.get("{field}")' for field in _RENDERED_FIELDS)
+    source = "def _heartbeat_read_and_inject(s):\n" + reads + "\n"
+    if change == "new-field":
+        source += '    s.get("new_unsafe_field")\n'
+    elif change == "following-function":
+        source += '\nasync def unrelated(s):\n    s.get("not_a_renderer_field")\n'
+    else:
+        source += "    pass\n" * 100
+    fixture = tmp_path / "renderer.py"
+    fixture.write_text(source)
+    monkeypatch.setattr(pmh, "__file__", str(fixture))
+    if change == "new-field":
+        with pytest.raises(AssertionError, match="new_unsafe_field"):
+            test_the_rendered_field_list_matches_the_renderer()
+    else:
+        test_the_rendered_field_list_matches_the_renderer()
 
 
 def test_a_forged_field_separator_cannot_add_tag_fields(monkeypatch, capsys, tmp_path):
