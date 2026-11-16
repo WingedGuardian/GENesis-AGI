@@ -9,8 +9,11 @@
 #     max_procedures_per_session per source session in any rolling 24 hours.
 #   shadow: the builder makes its real model call and runs its scoping and
 #     novelty checks under the same cap, then appends each lesson it would have
-#     stored to ~/.genesis/output/lesson_builder_shadow.jsonl (rotated to .1 past
-#     5 MB). Nothing is stored. Use it to judge lesson quality before live.
+#     stored to ~/.genesis/output/lesson_builder_shadow.jsonl (moved to .1 once
+#     its oldest record is over 24 hours old, so the two files hold the cap's
+#     whole window). Nothing is stored. Use it to judge lesson quality before
+#     live. A lesson that repeats one already recorded for the session in the
+#     window is dropped, as live's novelty check drops it at the store.
 #     It slightly overstates live: the store step it skips can still drop a
 #     lesson that matches an explicit teach, or refine an existing lesson.
 #     A shadow build that fails on provider exhaustion is not queued.

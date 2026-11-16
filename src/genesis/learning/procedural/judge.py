@@ -61,6 +61,11 @@ _GROUNDING_WARN_THRESHOLD = 0.25
 # Returned in place of a procedure id for a lesson recorded in shadow mode.
 SHADOW_ID = "shadow"
 
+# task_type -> monotonic time of shadow mode's last fail-open record, kept apart
+# from the live limiter (embedding._fail_open_timestamps) so shadow allows what
+# live allows when the embedder is down, without rate-limiting a later live store.
+_shadow_fail_open_timestamps: dict[str, float] = {}
+
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
@@ -210,6 +215,58 @@ def _parse_judge_response_list(text: str) -> list[dict] | None:
 # ── Storage ──────────────────────────────────────────────────────────────────
 
 
+def _b64_embedding(vec: list[float] | None) -> str | None:
+    """``vec`` packed as the store packs it, base64 for the JSON shadow record."""
+    if vec is None:
+        return None
+    import base64
+
+    from genesis.learning.procedural.embedding import pack_embedding
+
+    try:
+        return base64.b64encode(pack_embedding(vec)).decode("ascii")
+    except ValueError:  # wrong dimension: record the lesson without it
+        return None
+
+
+def _shadow_repeat(session_id: str | None, vec: list[float] | None) -> float | None:
+    """Similarity to the closest lesson already shadow-recorded for the session
+    in the cap window, when at or above the novelty threshold; else None.
+
+    Shadow records are not in the store, so the novelty gate cannot see them,
+    and each cycle re-judges the whole session: without this, a repeated
+    proposal of one lesson uses up the session's shadow cap where live mode would
+    reject it as a duplicate. Approximates live: one cosine test across task
+    types, where live tests cosine within a type and asks the model across types.
+    No vector (the embedder is down) means no check, as live fails open.
+    """
+    if vec is None or not session_id:
+        return None
+    import base64
+    import binascii
+    from datetime import UTC, datetime
+
+    from genesis.learning.procedural.embedding import cosine_similarity, unpack_embedding
+    from genesis.learning.procedural.extractor import NOVELTY_THRESHOLD
+    from genesis.learning.procedural.lesson_builder_config import CAP_WINDOW, shadow_records
+
+    best: float | None = None
+    for entry in shadow_records(session_id, datetime.now(UTC) - CAP_WINDOW):
+        raw = entry.get("principle_embedding_b64")
+        if not isinstance(raw, str):
+            continue
+        try:
+            prior = unpack_embedding(base64.b64decode(raw, validate=True))
+        except (binascii.Error, ValueError):
+            continue
+        if prior is None:
+            continue
+        sim = cosine_similarity(vec, prior)
+        if sim >= NOVELTY_THRESHOLD and (best is None or sim > best):
+            best = sim
+    return best
+
+
 async def _store_judged_procedure(
     db: aiosqlite.Connection,
     data: dict,
@@ -286,15 +343,17 @@ async def _store_judged_procedure(
         # time.monotonic() (uptime-based on Linux) < cooldown — i.e. on a freshly
         # booted host (the failure mode CI's fresh runners hit). Matches the
         # membership-guarded check in extractor._fail_open.
-        last = _fail_open_timestamps.get(task_type)
+        # Shadow keeps its own limiter, so it records what live would store
+        # without ever rate-limiting a later live store.
+        stamps = _shadow_fail_open_timestamps if shadow else _fail_open_timestamps
+        last = stamps.get(task_type)
         if last is not None and time.monotonic() - last < FAIL_OPEN_COOLDOWN_SECS:
             logger.info(
                 "Judge: rate-limited fail-open store for %s (cooldown active)",
                 task_type,
             )
             return None
-        if not shadow:
-            _fail_open_timestamps[task_type] = time.monotonic()
+        stamps[task_type] = time.monotonic()
 
     if not is_novel:
         logger.info(
@@ -305,9 +364,20 @@ async def _store_judged_procedure(
         return None
 
     if shadow:
+        import asyncio
+
         from genesis.learning.procedural.lesson_builder_config import record_shadow_lesson
 
-        record_shadow_lesson({
+        # Both read or write the shadow files; keep that file I/O off the loop.
+        repeat_sim = await asyncio.to_thread(_shadow_repeat, source_session_id, principle_vec)
+        if repeat_sim is not None:
+            logger.info(
+                "Judge [shadow]: procedure for %s repeats a lesson already recorded "
+                "for session %s (sim=%.3f)", task_type, source_session_id, repeat_sim,
+            )
+            return None
+        await asyncio.to_thread(record_shadow_lesson, {
+            "principle_embedding_b64": _b64_embedding(principle_vec),
             "session_id": source_session_id,
             "task_type": task_type,
             "principle": principle,

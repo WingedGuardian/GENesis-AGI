@@ -35,6 +35,9 @@ import aiosqlite
 from genesis.env import cc_project_dir, voice_transcript_dir
 from genesis.learning.procedural.judge import ProcedureBuilderUnavailable
 from genesis.learning.procedural.lesson_builder_config import (
+    CAP_WINDOW as _LESSON_CAP_WINDOW,
+)
+from genesis.learning.procedural.lesson_builder_config import (
     builder_mode as lesson_builder_mode,
 )
 from genesis.memory.extraction import (
@@ -114,10 +117,13 @@ _TRANSCRIPT_DIR = Path.home() / ".claude" / "projects" / cc_project_dir()
 # never silently dropped.
 _PROCEDURE_REBUILD_WORK = "procedure_rebuild"
 _MAX_PROCEDURE_REBUILD_ATTEMPTS = 8
-
-# The per-session lesson cap counts over this rolling window. A session that
-# stays active across many 2-hour cycles must not get a fresh cap each cycle.
-_LESSON_CAP_WINDOW = timedelta(hours=24)
+# Rebuilds the drain runs per extraction cycle (each one is a builder model call).
+_DRAIN_BATCH = 20
+# Pending rebuilds the drain reads to find a batch's worth of eligible ones. A
+# resource bound only (one live install's deferred_work_queue held 44
+# procedure_rebuild rows in total, all completed, on 2026-11-15), and hitting it
+# is logged.
+_DRAIN_SCAN_LIMIT = 1000
 
 
 async def _lesson_cap_left(
@@ -125,17 +131,20 @@ async def _lesson_cap_left(
 ) -> int:
     """New lessons this source session may still add in the rolling window.
 
-    Counts ``procedural_memory`` rows whose JSON ``source`` names the session,
-    as the judge writes it. A row whose ``source`` is not valid JSON is not
-    counted (the CASE keeps ``json_extract``, which would raise, off it).
+    Counts ``procedural_memory`` rows created in the window by the session:
+    ``created_session_id``, set once at insert, so a refine that rewrites
+    ``source`` cannot reopen a slot. A row written before that column existed
+    falls back to the session its JSON ``source`` names; a ``source`` that is not
+    valid JSON is not counted (the CASE keeps ``json_extract``, which would
+    raise, off it).
     ``shadow`` also counts the lessons shadow mode recorded for the session, so
     shadow makes the same number of builder calls live would.
     """
     since = datetime.now(UTC) - _LESSON_CAP_WINDOW
     cursor = await db.execute(
         "SELECT COUNT(*) FROM procedural_memory"
-        " WHERE CASE WHEN json_valid(source)"
-        " THEN json_extract(source, '$.session_id') END = ?"
+        " WHERE COALESCE(created_session_id, CASE WHEN json_valid(source)"
+        " THEN json_extract(source, '$.session_id') END) = ?"
         " AND datetime(created_at) >= datetime(?)",
         (cc_session_id, since.isoformat()),
     )
@@ -887,10 +896,22 @@ async def _drain_procedure_rebuilds(
         return
 
     queue = DeferredWorkQueue(db)
+    # Read past the batch: an item whose session is at its cap is skipped without
+    # moving, so a page of exactly the batch size could hold only capped items
+    # and starve every eligible one behind them until a cap window expired.
     items = await dw_crud.query_pending(
-        db, work_type=_PROCEDURE_REBUILD_WORK, limit=20,
+        db, work_type=_PROCEDURE_REBUILD_WORK, limit=_DRAIN_SCAN_LIMIT,
     )
+    if len(items) >= _DRAIN_SCAN_LIMIT:
+        logger.warning(
+            "Procedure rebuild drain read %d pending items, its scan limit; later "
+            "items wait for a later cycle", len(items),
+        )
+    capped: set[str] = set()  # sessions found at their cap during this drain
+    processed = 0
     for item in items:
+        if processed >= _DRAIN_BATCH:
+            break
         item_id = item["id"]
         attempts = item.get("attempts", 0)
 
@@ -905,6 +926,20 @@ async def _drain_procedure_rebuilds(
             continue
 
         cc_session_id = payload.get("cc_session_id") or payload.get("session_id")
+
+        # The session's cap is spent for now: leave the item pending, with no
+        # attempt spent, so a later cycle rebuilds it once the window moves on.
+        # Checked before the transcript search, which touches the filesystem.
+        if cc_session_id in capped:
+            continue
+        cap_left = (
+            await _lesson_cap_left(db, cc_session_id, max_procedures_per_session)
+            if cc_session_id else 0
+        )
+        if cc_session_id and cap_left == 0:
+            capped.add(cc_session_id)
+            continue
+
         transcript_path = (
             _find_transcript(transcript_dir, cc_session_id) if cc_session_id else None
         )
@@ -913,12 +948,7 @@ async def _drain_procedure_rebuilds(
             await queue.mark_discarded(item_id, "transcript not found")
             continue
 
-        # The session's cap is spent for now: leave the item pending, with no
-        # attempt spent, so a later cycle rebuilds it once the window moves on.
-        cap_left = await _lesson_cap_left(db, cc_session_id, max_procedures_per_session)
-        if cap_left == 0:
-            continue
-
+        processed += 1
         await queue.mark_processing(item_id)  # increments attempts
         try:
             # Offload the synchronous transcript read+parse off the event loop

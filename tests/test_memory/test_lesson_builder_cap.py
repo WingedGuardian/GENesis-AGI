@@ -175,6 +175,37 @@ async def test_lessons_older_than_the_window_do_not_count(db, monkeypatch):
     assert await ej._lesson_cap_left(db, CC, 7) == 6
 
 
+async def _create_lesson(db, *, session=CC, source=_DEFAULT):
+    """Insert through the store's own create, which sets created_session_id."""
+    from genesis.db.crud import procedural
+
+    if source is _DEFAULT:
+        source = json.dumps({"type": "struggle_extraction", "session_id": session})
+    return await procedural.create(
+        db, id=uuid.uuid4().hex, task_type="t", principle="p", steps=[], tools_used=[],
+        context_tags=[], created_at=datetime.now(UTC).isoformat(), source=source,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refine_that_rewrites_source_still_counts_against_the_creator(db):
+    """Codex P2 on #4720: a refine overwrites ``source`` (operations.py), which
+    reopened the creating session's slot when the cap counted by source."""
+    from genesis.db.crud import procedural
+
+    pid = await _create_lesson(db)
+    await procedural.update(db, pid, source={"type": "explicit_teach"})
+    assert await ej._lesson_cap_left(db, CC, 7) == 6
+    await procedural.update(db, pid, source={"type": "struggle_extraction", "session_id": "x"})
+    assert await ej._lesson_cap_left(db, "x", 7) == 7  # the refiner created nothing
+
+
+@pytest.mark.asyncio
+async def test_rows_without_a_creation_session_fall_back_to_source(db):
+    await _add_lesson(db)  # a raw insert, as rows written before the column
+    assert await ej._lesson_cap_left(db, CC, 7) == 6
+
+
 @pytest.mark.asyncio
 async def test_other_sessions_and_malformed_sources_do_not_count(db):
     await _add_lesson(db, session="other")
@@ -225,6 +256,44 @@ async def test_drain_leaves_a_capped_session_pending_without_spending_an_attempt
     pending = await _drain(db, monkeypatch, builder)
     assert builder.calls == []
     assert len(pending) == 1 and pending[0]["attempts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_capped_rebuilds_do_not_starve_an_eligible_one_behind_them(db, monkeypatch):
+    """Codex P2 + Devin on #4720: the drain read a 20-item page and skipped the
+    capped items in it without moving them, so an eligible item behind 20 capped
+    ones waited until a cap window expired."""
+    _set_mode(monkeypatch, "live")
+    for i in range(ej._DRAIN_BATCH):
+        for _ in range(7):
+            await _add_lesson(db, session=f"capped-{i}")
+        await ej._enqueue_procedure_rebuild(db, f"s{i}", f"capped-{i}")
+    await ej._enqueue_procedure_rebuild(db, "free", "free-session")
+    seen = []
+    builder = _Builder(db)
+
+    async def spy(db_, spine, haystack, score, router, *, source_session_id, max_new, shadow=False):
+        seen.append(source_session_id)
+        return await builder(
+            db_, spine, haystack, score, router,
+            source_session_id=source_session_id, max_new=max_new, shadow=shadow,
+        )
+
+    pending = await _drain(db, monkeypatch, spy)
+    assert seen == ["free-session"]
+    assert len(pending) == ej._DRAIN_BATCH
+    assert all(p["attempts"] == 0 for p in pending)
+
+
+@pytest.mark.asyncio
+async def test_the_drain_still_processes_at_most_one_batch(db, monkeypatch):
+    _set_mode(monkeypatch, "live")
+    for i in range(ej._DRAIN_BATCH + 3):
+        await ej._enqueue_procedure_rebuild(db, f"s{i}", f"open-{i}")
+    builder = _Builder(db, yield_n=0)
+    pending = await _drain(db, monkeypatch, builder)
+    assert len(builder.calls) == ej._DRAIN_BATCH
+    assert len(pending) == 3
 
 
 # ── the lever ───────────────────────────────────────────────────────────────
@@ -311,12 +380,151 @@ def test_shadow_count_reads_both_files_and_skips_bad_lines(out_dir):
     assert lbc.shadow_count(CC, now - timedelta(hours=24)) == 2
 
 
-def test_shadow_record_rotates_past_its_size_bound(out_dir, monkeypatch):
-    monkeypatch.setattr(lbc, "SHADOW_MAX_BYTES", 100)
-    for _ in range(5):
-        lbc.record_shadow_lesson({"session_id": CC, "pad": "x" * 40})
+def _write_records(path, *ages):
+    now = datetime.now(UTC)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(
+        json.dumps({"ts": (now - age).isoformat(), "session_id": CC}) + "\n" for age in ages
+    ))
+
+
+def test_shadow_record_rotates_only_once_its_oldest_record_leaves_the_window(out_dir):
+    """Rotation replaces ``.1``; it may do so only when every record it would
+    drop is outside the cap window, or the cap forgets lessons still inside it."""
+    active, rotated = out_dir / lbc.SHADOW_FILE, out_dir / (lbc.SHADOW_FILE + ".1")
+    _write_records(rotated, timedelta(hours=2))
+    _write_records(active, timedelta(hours=3), timedelta(hours=1))
+    lbc.record_shadow_lesson({"session_id": CC})
+    assert lbc.shadow_count(CC, datetime.now(UTC) - lbc.CAP_WINDOW) == 4  # nothing rotated
+    _write_records(active, lbc.CAP_WINDOW + timedelta(minutes=5), timedelta(hours=1))
+    lbc.record_shadow_lesson({"session_id": CC})
+    assert len(rotated.read_text().splitlines()) == 2  # the old active file is now .1
+    assert len(active.read_text().splitlines()) == 1
+    assert lbc.shadow_count(CC, datetime.now(UTC) - lbc.CAP_WINDOW) == 2
+
+
+def test_shadow_rotation_skips_unreadable_leading_lines(out_dir):
+    active = out_dir / lbc.SHADOW_FILE
+    _write_records(active, lbc.CAP_WINDOW + timedelta(hours=1))
+    active.write_text("not json\n" + active.read_text())
+    lbc.record_shadow_lesson({"session_id": CC})
     assert (out_dir / (lbc.SHADOW_FILE + ".1")).exists()
-    assert (out_dir / lbc.SHADOW_FILE).stat().st_size <= 200
+
+
+def test_shadow_count_keeps_a_record_whose_text_holds_a_line_separator(out_dir):
+    """``ensure_ascii=False`` writes U+2028 raw, and ``splitlines`` splits on it."""
+    lbc.record_shadow_lesson({"session_id": CC, "principle": "a b c\x85d"})
+    assert lbc.shadow_count(CC, datetime.now(UTC) - lbc.CAP_WINDOW) == 1
+    assert lbc.shadow_records(CC, datetime.now(UTC) - lbc.CAP_WINDOW)[0]["principle"] == (
+        "a b c\x85d"
+    )
+
+
+def _unit(i):
+    from genesis.learning.procedural.embedding import EMBEDDING_DIM
+
+    vec = [0.0] * EMBEDDING_DIM
+    vec[i] = 1.0
+    return vec
+
+
+async def _shadow_store(db, monkeypatch, *, session, vec, fell_open=False):
+    import genesis.learning.procedural.extractor as ex
+    import genesis.learning.procedural.scoping as sc
+
+    monkeypatch.setattr(sc, "is_behavioral_directive", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        ex, "_principle_is_novel", AsyncMock(return_value=(True, 0.1, vec, fell_open)),
+    )
+    return await jm._store_judged_procedure(
+        db, {"task_type": f"t-{uuid.uuid4().hex[:6]}", "principle": "p", "steps": ["s"]},
+        MagicMock(), source_type="struggle_extraction", source_session_id=session, shadow=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_shadow_drops_a_lesson_it_already_recorded_for_the_session(db, monkeypatch, out_dir):
+    """Devin on #4720: shadow records are not in the store, so the novelty gate
+    could not see them, and each cycle's re-proposal of the same lesson used up
+    the session's shadow cap. Live mode rejects that repeat at the store."""
+    assert await _shadow_store(db, monkeypatch, session=CC, vec=_unit(0)) == jm.SHADOW_ID
+    assert await _shadow_store(db, monkeypatch, session=CC, vec=_unit(0)) is None
+    assert await _shadow_store(db, monkeypatch, session=CC, vec=_unit(1)) == jm.SHADOW_ID
+    assert await _shadow_store(db, monkeypatch, session="other", vec=_unit(0)) == jm.SHADOW_ID
+    assert lbc.shadow_count(CC, datetime.now(UTC) - lbc.CAP_WINDOW) == 2
+
+
+@pytest.mark.asyncio
+async def test_shadow_records_a_lesson_it_cannot_compare(db, monkeypatch, out_dir):
+    """With no usable vector (the embedder is down) the repeat check cannot run,
+    and the lesson is recorded, as live's novelty gate fails open."""
+    assert await _shadow_store(db, monkeypatch, session=CC, vec=None, fell_open=True) == jm.SHADOW_ID
+    assert await _shadow_store(db, monkeypatch, session=CC, vec=None, fell_open=True) == jm.SHADOW_ID
+    lbc.record_shadow_lesson({"session_id": CC, "principle_embedding_b64": "not base64!"})
+    assert await _shadow_store(db, monkeypatch, session=CC, vec=_unit(0)) == jm.SHADOW_ID
+
+
+@pytest.mark.asyncio
+async def test_shadow_rate_limits_fail_open_records_as_live_does(db, monkeypatch, out_dir):
+    """With the embedder down, live allows one store per task type per cooldown;
+    shadow must not allow more, and must not limit a later live store."""
+    import genesis.learning.procedural.embedding as emb
+    import genesis.learning.procedural.extractor as ex
+    import genesis.learning.procedural.scoping as sc
+
+    monkeypatch.setattr(jm, "_shadow_fail_open_timestamps", {})
+    monkeypatch.setattr(emb, "_fail_open_timestamps", {})
+    monkeypatch.setattr(jm, "_fail_open_timestamps", emb._fail_open_timestamps)
+    monkeypatch.setattr(sc, "is_behavioral_directive", AsyncMock(return_value=False))
+    monkeypatch.setattr(ex, "_principle_is_novel", AsyncMock(return_value=(True, 0.0, None, True)))
+
+    async def store(shadow):
+        return await jm._store_judged_procedure(
+            db, {"task_type": "same-type", "principle": "p", "steps": ["s"]}, MagicMock(),
+            source_type="struggle_extraction", source_session_id=CC, shadow=shadow,
+        )
+
+    assert await store(True) == jm.SHADOW_ID
+    assert await store(True) is None  # cooldown, as live
+    assert emb._fail_open_timestamps == {}  # live untouched
+
+
+def test_a_held_shadow_lock_makes_a_writer_wait(out_dir):
+    import fcntl
+    import threading
+
+    out_dir.mkdir()
+    lock = open(out_dir / (lbc.SHADOW_FILE + ".lock"), "a")  # noqa: SIM115
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    writer = threading.Thread(target=lbc.record_shadow_lesson, args=({"session_id": CC},))
+    writer.start()
+    writer.join(timeout=0.5)
+    try:
+        assert writer.is_alive() and not (out_dir / lbc.SHADOW_FILE).exists()
+    finally:
+        lock.close()
+    writer.join(timeout=10)
+    assert lbc.shadow_count(CC, datetime.now(UTC) - lbc.CAP_WINDOW) == 1
+
+
+def test_a_record_cut_short_does_not_swallow_the_next_one(out_dir):
+    out_dir.mkdir()
+    (out_dir / lbc.SHADOW_FILE).write_text('{"ts": "2026-11-15T00:00:00+00:00", "sess')
+    lbc.record_shadow_lesson({"session_id": CC})
+    assert lbc.shadow_count(CC, datetime.now(UTC) - lbc.CAP_WINDOW) == 1
+
+
+def test_a_lock_that_cannot_be_taken_degrades_to_unlocked(out_dir, monkeypatch):
+    import fcntl
+
+    def refuse(*_a):
+        raise OSError("ENOLCK")
+
+    lbc.record_shadow_lesson({"session_id": CC})
+    monkeypatch.setattr(fcntl, "flock", refuse)
+    assert lbc.shadow_count(CC, datetime.now(UTC) - lbc.CAP_WINDOW) == 1
+    lbc.record_shadow_lesson({"session_id": CC})
+    assert lbc.shadow_count(CC, datetime.now(UTC) - lbc.CAP_WINDOW) == 2
 
 
 def test_shadow_record_write_failure_never_raises(tmp_path, monkeypatch):
@@ -402,4 +610,14 @@ def test_a_valid_overlay_is_honoured(tmp_path, monkeypatch):
 
 def test_an_unreadable_base_reads_as_shadow(tmp_path, monkeypatch):
     monkeypatch.setattr(lbc, "_base_path", lambda: tmp_path / "missing.yaml")
+    assert lbc.builder_mode() == "shadow"
+
+
+@pytest.mark.parametrize("text", ["false\n", "0\n", "[]\n", "''\n", "", "# only a comment\n"])
+def test_a_base_that_is_not_a_mapping_reads_as_shadow(tmp_path, monkeypatch, text):
+    """A falsy root (false, 0, [], an empty string) must not become an empty
+    mapping, which would merge to the live default; an empty base is damaged too."""
+    base = tmp_path / "lesson_builder.yaml"
+    base.write_text(text)
+    monkeypatch.setattr(lbc, "_base_path", lambda: base)
     assert lbc.builder_mode() == "shadow"
