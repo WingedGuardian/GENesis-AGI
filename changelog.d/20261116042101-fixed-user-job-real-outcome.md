@@ -1,0 +1,1 @@
+User-job runs now remain running until their dispatched session ends, then record the session outcome and reason. Startup reconciliation recovers interrupted runs, and post-spawn bookkeeping errors no longer turn a successful dispatch into a job failure.

@@ -142,6 +142,45 @@ async def record_run_start(
     return run_id
 
 
+async def attach_run_session(
+    db: aiosqlite.Connection,
+    run_id: str,
+    session_id: str,
+) -> bool:
+    """Attach a spawned session to a run by ID."""
+    cursor = await db.execute(
+        "UPDATE user_job_runs SET session_id = ? WHERE id = ?",
+        (session_id, run_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def get_running_run_by_session(
+    db: aiosqlite.Connection,
+    session_id: str,
+) -> dict | None:
+    """Return the running user-job run attached to a session, if any."""
+    if not session_id:
+        return None
+    cursor = await db.execute(
+        """SELECT * FROM user_job_runs
+           WHERE session_id = ? AND status = 'running'
+           ORDER BY started_at DESC LIMIT 1""",
+        (session_id,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def list_running_runs(db: aiosqlite.Connection) -> list[dict]:
+    """Return every unfinished run, oldest first for boot reconciliation."""
+    cursor = await db.execute(
+        "SELECT * FROM user_job_runs WHERE status = 'running' ORDER BY started_at ASC",
+    )
+    return [dict(row) for row in await cursor.fetchall()]
+
+
 async def record_run_complete(
     db: aiosqlite.Connection,
     run_id: str,
@@ -149,17 +188,21 @@ async def record_run_complete(
     status: str,
     result_json: dict | None = None,
     error_message: str | None = None,
-) -> None:
-    """Record a run completion (passed or failed)."""
+    only_if_running: bool = False,
+) -> bool:
+    """Record a run completion; optionally compare-and-set from running."""
     now = datetime.now(UTC).isoformat()
-    await db.execute(
-        """UPDATE user_job_runs
-           SET status = ?, completed_at = ?, result_json = ?, error_message = ?
-           WHERE id = ?""",
-        (status, now, json.dumps(result_json) if result_json else None,
-         error_message, run_id),
+    result_json_text = json.dumps(result_json) if result_json else None
+    guard = " AND status = 'running'" if only_if_running else ""
+    cursor = await db.execute(
+        """UPDATE user_job_runs SET status = ?, completed_at = ?,
+           result_json = ?, error_message = ? WHERE id = ?""" + guard,
+        (status, now, result_json_text, error_message, run_id),
     )
+    updated = cursor.rowcount > 0
     await db.commit()
+    if only_if_running and not updated:
+        return False
 
     # Update the parent job
     cursor = await db.execute(
@@ -170,7 +213,7 @@ async def record_run_complete(
         job_id = row[0] if isinstance(row, tuple) else row["job_id"]
         update_kwargs: dict = {
             "last_status": status,
-            "last_result_json": json.dumps(result_json) if result_json else None,
+            "last_result_json": result_json_text,
         }
         if status == "failed":
             # Increment failure count
@@ -180,6 +223,7 @@ async def record_run_complete(
         else:
             update_kwargs["failure_count"] = 0
         await update_job(db, job_id, **update_kwargs)
+    return True
 
 
 async def get_run_history(
