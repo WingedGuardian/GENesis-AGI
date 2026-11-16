@@ -1460,7 +1460,8 @@ if [[ "$MODE_ARG" == "launch" ]]; then
     _NS_FLAG=-d
     # Also on the SESSION (not only claude's env), so the launcher can map a
     # builder key to its slot with `tmux show-environment -t cc-N`.
-    _L_KEY_PIN=(-e "GENESIS_BUILDER_KEY=${_L_KEY}")
+    # The issue too: the launcher maps a builder to its issue from here, live.
+    _L_KEY_PIN=(-e "GENESIS_BUILDER_KEY=${_L_KEY}" -e "GENESIS_BUILDER_ISSUE=${_L_ISSUE}")
     _NS_CMD="cd ${_GENESIS_ROOT_Q} && env -i${_L_ENV_Q} ${_L_PANE_ENV} ${_SLOT_EXEC_PREFIX:-}claude ${_WEB_OVERRIDE_ARGS:-}${CC_PERM_FLAG}${_L_CLAUDE_Q}; __ec=\$?; ${_CC_EXIT_CAPTURE_Q} ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
 else
     _NS_FLAG=-A
@@ -1488,9 +1489,10 @@ if [[ "$MODE_ARG" == "launch" ]]; then
     # tmux refuses a client command past ~16.3 KB (MEASURED on tmux 3.4: 16300
     # bytes accepted, 16340 refused). Refuse it here as bad input (64), not later
     # as a tmux failure the launcher would count as a strike.
-    _L_ARGV_BYTES=0
-    for _a in "${_NS[@]}"; do _L_ARGV_BYTES=$(( _L_ARGV_BYTES + ${#_a} + 1 )); done
-    unset _a
+    # In BYTES: under this script's UTF-8 locale ${#} counts characters, and a
+    # multibyte prompt would pass a character count (MEASURED: 3 CJK chars read
+    # as 3 under UTF-8 and 9 under LC_ALL=C). The subshell keeps the locale local.
+    _L_ARGV_BYTES=$(LC_ALL=C; n=0; for _a in "${_NS[@]}"; do n=$(( n + ${#_a} + 1 )); done; echo "$n")
     if [[ "$_L_ARGV_BYTES" -gt 16000 ]]; then
         echo "cc-slot launch: the pane command is ${_L_ARGV_BYTES} bytes; tmux refuses past about 16300 — shorten the prompt" >&2
         exit 64

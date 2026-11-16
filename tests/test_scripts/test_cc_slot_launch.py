@@ -335,6 +335,14 @@ class TestLaunchRefuses:
         assert proc.returncode == 64, proc.stderr
         assert "tmux refuses" in proc.stderr
 
+    def test_a_multibyte_prompt_is_measured_in_bytes(self, door):
+        """5,300 CJK characters fit the 16,384-byte file bound but assemble to
+        about 17.6 KB; a character count read 7,028 and let tmux fail it (Codex)."""
+        door.prompt.write_text("\u754c" * 5300)
+        proc = door.launch()
+        assert proc.returncode == 64, proc.stderr
+        assert "tmux refuses" in proc.stderr
+
     def test_a_prompt_starting_with_a_dash_exits_64(self, door):
         door.prompt.write_text("--dangerously-skip-permissions\n")
         assert door.launch().returncode == 64
@@ -404,6 +412,7 @@ class TestCallerFixedSlot:
         args = door.new_session_args()
         assert args[args.index("-s") + 1] == "cc-3"
         assert self.KEY_PIN in args, "the key is on the session env"
+        assert "GENESIS_BUILDER_ISSUE=7" in args, "the issue is on the session env"
         lang = next(a for a in args if a.startswith("LANG="))
         assert args.index(self.KEY_PIN) < args.index(lang), "LANG stays the last pin"
 
