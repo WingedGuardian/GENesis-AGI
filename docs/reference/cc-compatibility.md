@@ -1165,16 +1165,21 @@ cost roughly +1,200 tokens per session. Genesis's OWN tools stay under 2,048
 regardless (`tests/test_mcp/test_tool_description_budget.py`), because a description
 that relies on the lever is still cut on an older CC or wherever the setting is absent.
 
-**Measure it the way CC does:** use JavaScript `String.length` semantics over the
-NFKC-normalized description. CC's logged lengths show that the normalization is
-also load-bearing: the pre-change `follow_up_create` logged 4,735
-where `inspect.getdoc` gives 4,733, because its one `…` normalizes to `...` (+2);
-`memory_recall` matched at 3,525 either way (2 of 2 tools). NFKC alone is not
-enough: Python `len` counts a non-BMP character once while JavaScript counts its
-surrogate pair twice. The test therefore counts NFKC-normalized UTF-16 code units.
-The corrected guard checks 159 tools at the current integration checkpoint;
-the largest description is `locate` at 2,046 units, followed by `web_fetch` at
-2,037 and `follow_up_create` at 2,031.
+**Measure the raw client limit independently:** JavaScript `String.length`
+counts UTF-16 units, including two for a non-BMP character. The installed
+2.1.299 truncator receives the tool description directly and checks raw
+`e.length`; it does not normalize that string first. The two historical log
+comparisons above do not establish a general normalization rule.
+
+The repository also retains NFKC normalization as a deliberately conservative
+additional budget, including expansion such as `…` to `...`. The guard uses the
+larger of the raw and normalized UTF-16 lengths: normalization contractions
+must never conceal raw overflow. Valid surrogate pairs are combined before
+normalization, while lone units remain representable. Different Python and Node
+Unicode databases can disagree about normalization, so normalized parity alone
+is not the client predicate. All 159 descriptions at this integration checkpoint
+fit both budgets; the largest guard value is `locate` at 2,046 units (raw 2,040),
+followed by `web_fetch` at 2,037 and `follow_up_create` at 2,031.
 
 ### Hook stdout is silently FILED above 10,000 characters (measured 2.1.246, 2026-08-30)
 

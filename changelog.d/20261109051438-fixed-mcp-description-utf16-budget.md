@@ -1,1 +1,1 @@
-- The MCP description-budget guard now measures NFKC-normalized UTF-16 code units, matching Claude Code's JavaScript length predicate so non-BMP text cannot pass locally and then be truncated by the client.
+- The MCP description-budget guard independently enforces raw UTF-16 length and retains NFKC as a conservative additional budget, so normalization contractions cannot hide descriptions the client truncates.

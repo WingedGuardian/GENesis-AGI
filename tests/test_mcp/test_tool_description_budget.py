@@ -51,17 +51,16 @@ _is_mcp_tool_decorator = private_module(
 
 
 def _description_length(description: str) -> int:
-    """Return CC's NFKC-normalized JavaScript ``String.length`` value.
+    """Return the larger raw and conservative normalized UTF-16 budgets.
 
-    JavaScript counts UTF-16 code units, so a non-BMP character counts twice.
-    Combine valid surrogate pairs before normalization; preserve lone
-    surrogates as individual code units, matching JavaScript strings.
+    The client checks raw JavaScript String.length. NFKC is an additional
+    repository constraint; its contractions must never conceal raw overflow.
+    Canonicalize valid surrogate pairs before normalization and preserve lone
+    units, so malformed strings remain measurable rather than raising.
     """
-    description = description.encode("utf-16-le", "surrogatepass").decode(
-        "utf-16-le", "surrogatepass"
-    )
-    normalized = unicodedata.normalize("NFKC", description)
-    return sum(2 if ord(char) > 0xFFFF else 1 for char in normalized)
+    encoded = description.encode("utf-16-le", "surrogatepass")
+    normalized = unicodedata.normalize("NFKC", encoded.decode("utf-16-le", "surrogatepass"))
+    return max(len(encoded), len(normalized.encode("utf-16-le", "surrogatepass"))) // 2
 
 
 def _tool_descriptions(
@@ -74,13 +73,12 @@ def _tool_descriptions(
     verified against the live server object, where raw ``__doc__`` differs
     materially (``direct_session_run``: 2,131 raw vs 2,006 cleaned).
 
-    Measured in NFKC-normalized UTF-16 code units, because CC's own predicate
-    uses JavaScript ``String.length``. The normalization is retained because its log
-    matches: it reported the pre-change ``follow_up_create`` as 4,735 where
-    ``getdoc`` gives 4,733 — its one ``…`` normalizes to ``...`` (+2) — and
-    ``memory_recall`` as 3,525 in both (2 of 2 tools). A raw codepoint count
-    would pass both a 2,046-character description holding one ``…`` and a
-    2,047-character description ending in one non-BMP character that CC cuts.
+    Each budget is the larger raw and NFKC-normalized UTF-16 length. Raw
+    JavaScript String.length is the installed client's predicate; normalization
+    is a deliberately conservative additional repository constraint, not an
+    inference about the client's Unicode database. Counting raw units prevents
+    contractions from hiding overflow. The normalized budget also rejects
+    expansion such as a 2,046-character description containing one ellipsis.
 
     Enumerated by AST rather than regex on purpose: an earlier regex pass over
     these same files found 21 of 147 tools and reported "0 over the cap", which
@@ -109,8 +107,8 @@ def _tool_descriptions(
     return found
 
 
-def test_description_length_matches_client_utf16_units():
-    """Boundary controls use the same units as JavaScript ``String.length``."""
+def test_description_length_covers_raw_units_and_normalization_expansion():
+    """Raw client limits and the additional normalization budget both apply."""
     assert _description_length("a" * 2048) == 2048
     assert _description_length("a" * 2049) == 2049
     assert _description_length("\U0001f4a1" * 1024) == 2048
@@ -125,10 +123,14 @@ def test_description_length_matches_client_utf16_units():
 @pytest.mark.parametrize(
     ("description", "expected"),
     [
-        ("\ud835\udc00", 1),
-        ("a" * 2047 + "\ud835\udc00", 2048),
-        ("\ud835\udc00" * 2048, 2048),
-        ("\U0001d400", 1),
+        ("\ud835\udc00", 2),
+        ("a" * 2047 + "\ud835\udc00", 2049),
+        ("\ud835\udc00" * 2048, 4096),
+        ("\U0001d400", 2),
+        ("a" * 2046 + "\U0001d400", 2048),
+        ("a" * 2047 + "\U0001d400", 2049),
+        ("a" * 2046 + "\ud835\udc00", 2048),
+        ("a" * 2047 + "\U0001ccf3", 2049),
         ("\ud83d\udca1", 2),
         ("\ud800", 1),
         ("\udc00", 1),
@@ -137,10 +139,14 @@ def test_description_length_matches_client_utf16_units():
         ("\ud800\ud800", 2),
     ],
     ids=[
-        "normalized-pair",
-        "normalized-pair-at-cap",
-        "repeated-normalized-pairs",
+        "compatibility-pair",
+        "compatibility-pair-over-cap",
+        "repeated-compatibility-pairs",
         "scalar-control",
+        "scalar-contraction-at-cap",
+        "scalar-contraction-over-cap",
+        "pair-contraction-at-cap",
+        "newer-unicode-raw-over-cap",
         "unchanged-pair",
         "lone-high",
         "lone-low",
@@ -149,7 +155,7 @@ def test_description_length_matches_client_utf16_units():
         "two-high-surrogates",
     ],
 )
-def test_description_length_preserves_javascript_surrogate_semantics(description, expected):
+def test_description_length_preserves_raw_surrogate_and_normalized_budgets(description, expected):
     assert _description_length(description) == expected
 
 
@@ -186,16 +192,16 @@ def test_mcp_tool_population_is_discoverable():
 
 
 def test_no_mcp_tool_description_exceeds_the_cc_cap():
-    """No Genesis tool description may exceed CC's 2,048-UTF-16-code-unit cap.
+    """Every description must fit both raw and normalized 2,048-unit budgets.
 
-    Past the cap, CC cuts the text (logging the cut and marking it
-    "… [truncated]"), so the tail is simply absent from the contract the model
-    reads — however the call site was written.
+    Raw overflow is truncated by the client. Normalized-only overflow fails
+    the additional conservative repository budget, without asserting that the
+    raw client string is truncated.
     """
     over = [(n, p, ln) for n, p, ln in _tool_descriptions() if ln > _CC_DESCRIPTION_CAP]
     assert not over, (
-        f"MCP tool description(s) exceed Claude Code's {_CC_DESCRIPTION_CAP}-UTF-16-unit "
-        "cap; everything past it is cut before the model sees it:\n"
+        f"MCP tool description(s) exceed the {_CC_DESCRIPTION_CAP}-UTF-16-unit "
+        "raw-client or conservative normalized budget (shown as their maximum):\n"
         + "\n".join(
             f"  {ln:>6} UTF-16 units  {n}  ({p})"
             for n, p, ln in sorted(over, reverse=True, key=lambda t: t[2])
