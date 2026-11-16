@@ -1013,8 +1013,33 @@ def _pidfile(layout, pid: int) -> None:
 def _fake_serve(tmp_path: Path, *args: str) -> subprocess.Popen:
     script = tmp_path / "bin" / H.Path(H.__file__).name
     script.parent.mkdir(exist_ok=True)
-    script.write_text("import time\ntime.sleep(60)\n")
-    return subprocess.Popen([sys.executable, str(script), *args])
+    script.write_text("import time\nprint('ready', flush=True)\ntime.sleep(60)\n")
+    child = subprocess.Popen([sys.executable, str(script), *args], stdout=subprocess.PIPE)
+    try:
+        # Popen can return before /proc exposes the new command line.
+        assert child.stdout.readline() == b"ready\n", "fake serve did not start"
+    except BaseException:
+        child.kill()
+        child.wait()
+        raise
+    finally:
+        child.stdout.close()
+    return child
+
+
+@pytest.mark.parametrize("reply", [b"", b"not ready\n"])
+def test_fake_serve_refuses_missing_startup_ack(tmp_path, monkeypatch, reply):
+    events = []
+    child = SimpleNamespace(
+        stdout=io.BytesIO(reply),
+        kill=lambda: events.append("kill"),
+        wait=lambda: events.append("wait"),
+    )
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: child)
+    with pytest.raises(AssertionError, match="fake serve did not start"):
+        _fake_serve(tmp_path, "serve")
+    assert events == ["kill", "wait"]
+    assert child.stdout.closed
 
 
 def test_teardown_never_signals_a_process_that_is_not_this_serve(tmp_path):
