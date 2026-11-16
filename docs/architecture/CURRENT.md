@@ -2922,6 +2922,20 @@ verified: 0aa0bf9f2 2026-11-10
   taken over, and a cancel that fails keeps the park. The cancelled pattern
   starts the 15-minute resolved cooldown. A declined dispatch or action is
   quiet for 24 h through `handle_approval_resolution` (every pattern).
+- **sentinel/process_stop.py** (`python -m genesis.sentinel.process_stop`):
+  the Failure Inventory remedy for ONE runaway process. Dry-run by default;
+  `--execute` only inside an approved action. Resolves targets when it runs:
+  this user's processes (not pid 1, not zombies or kernel threads, not the
+  tool's own ancestors) outside any systemd `.service` unit that hold
+  `process_stop.propose_at_mb` (default 6144) MB of RSS+swap, excluding
+  `init.scope`. `--execute` requires `--only PID:STARTTIME,...` copied from the
+  dry-run and stops only those identities still eligible, so an approval never
+  covers a process that crossed the line later. SIGTERM, then SIGKILL, through
+  a pidfd opened before the start-time check, to the process alone. Claude Code
+  sessions (foreground and server-dispatched `run-*.scope`) are eligible. Lever `process_stop.mode` (`propose_only` | `off`) +
+  `GENESIS_PROCESS_STOP_DISABLED=1`. Proposed early by the health alarm
+  `infra:process_memory_high` (WARNING, tier 2), from the same `scan()`,
+  cached 60 s.
 - GROUNDWORK: guardian-cgroup, guardian-bidirectional, sentinel-live-autonomy.
 
 ## 9. Ambient cognition — heartbeat, reflection, attention

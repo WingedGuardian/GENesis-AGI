@@ -213,16 +213,6 @@ def _pgid(pid: int) -> int | None:
         return None
 
 
-def _rss_kb(pid: int) -> int:
-    try:
-        for line in (_proc() / str(pid) / "status").read_text().splitlines():
-            if line.startswith("VmRSS:"):
-                return int(line.split()[1])
-    except (OSError, ValueError, IndexError):
-        pass
-    return 0
-
-
 def _pipe_ends(pid: int) -> tuple[set[str], set[str]] | None:
     """(pipes the process reads, pipes it writes), by pipe identity
     (``pipe:[inode]``) on ANY descriptor; None when they cannot be read.
@@ -341,8 +331,17 @@ def _exited(stat) -> bool:
 def scan() -> Scan:
     """Read ``/proc`` and classify every child of a shared Codex app-server."""
     result = Scan()
-    stats = {pid: proc_io.read_stat(pid) for pid in _all_pids()}
-    stats = {pid: s for pid, s in stats.items() if s is not None}
+    stats = {}
+    for pid in _all_pids():
+        st = proc_io.probe_stat(pid)
+        if st == proc_io.GONE:
+            continue  # exited mid-scan: holds nothing
+        if st == proc_io.UNREADABLE:
+            # Its parent cannot be read, so it may be an app-server child (or
+            # one itself): the scan cannot call itself complete.
+            result.unreadable(f"{pid} (stat unreadable)")
+            continue
+        stats[pid] = (st.comm, st.state, st.ppid, st.threads, st.starttime)
     for pid in sorted(stats):
         argv = _argv(pid)
         if argv and _is_daemon_app_server(argv):
@@ -457,31 +456,61 @@ def scan() -> Scan:
                 result.skipped.append(f"{label} (systemd unit {_SAFE_LABEL.sub('_', unit)[:60]})")
                 continue
             members = sorted(by_pgid.get(pg, [pid]))
+            rss_kb = 0
+            for m in members:
+                held = proc_io.held_kb(m)
+                if held == proc_io.UNREADABLE:
+                    # The group is still classified, but its figure is now a
+                    # lower bound: the alarm reads unknown below the threshold.
+                    result.unreadable(f"{label} (member {m} memory unreadable)")
+                elif held != proc_io.GONE:
+                    rss_kb += held
             result.groups.append(
                 Group(
                     pgid=pg,
                     starttime=starttime,
                     cmd=_safe_label(argv),
                     members=members,
-                    rss_kb=sum(_rss_kb(m) for m in members),
+                    rss_kb=rss_kb,
                 )
             )
     return result
 
 
-def _group_alive(pgid: int) -> bool:
-    """True while any member of the group is still running.
+def _group_exists(pgid: int) -> bool | None:
+    """False when the kernel has no process at all in the group (signal 0
+    finds none, not even a zombie); True when it has one; None when it cannot
+    say (another user's group). A seam: the fake-/proc tests replace it."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    return True
 
-    A zombie (state ``Z``) has already exited and holds no memory; it stays
-    listed only until its parent reaps it, so it does not count as alive
-    (MEASURED: a killed child whose parent had not reaped it read as "still
-    alive after SIGKILL").
+
+def _group_alive(pgid: int) -> bool:
+    """True while any member of the group is still running, or might be.
+
+    A zombie whose every thread has exited holds no memory; it stays listed
+    only until its parent reaps it, so it does not count as alive (MEASURED: a
+    killed child whose parent had not reaped it read as "still alive after
+    SIGKILL"). A zombie LEADER whose other threads run is alive. A pid whose
+    stat cannot be read may be a member that has not stopped, so it counts as
+    alive: the stop then reports the group as not stopped, never as done. A
+    group with no process left at all (not even a zombie) is gone without
+    reading anyone's stat.
     """
+    if _group_exists(pgid) is False:
+        return False
     for pid in _all_pids():
-        if _pgid(pid) != pgid:
+        st = proc_io.probe_stat(pid)
+        if st == proc_io.GONE:
             continue
-        st = proc_io.read_stat(pid)
-        if st is not None and st[1] != "Z":
+        if st == proc_io.UNREADABLE:
+            return True
+        if st.pgid == pgid and not st.exited:
             return True
     return False
 

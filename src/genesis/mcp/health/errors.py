@@ -314,6 +314,101 @@ async def _refresh_codex_mcp_cache(now: float) -> None:
     _codex_mcp_cache = (now, reading)
 
 
+# ``infra:process_memory_high``: one process over ``process_stop.propose_at_mb``
+# of RAM+swap (a single runaway with no children, which neither the tree
+# breakdown nor codex_mcp_held names early). The stop tool's own ``scan()``
+# decides what counts, so the alarm never names a process the remedy would not
+# stop (systemd services and the user manager are never listed; Claude Code
+# sessions, including server-dispatched ones, are). Cached like codex_mcp_held.
+# An unreadable process is not alarmed on; a raising scan logs hourly.
+_PROCESS_TTL_S = 60.0
+# (monotonic, threshold MB the scan used, reading). A reading is
+# (count, largest label, largest MB, complete), or None when the scan raised.
+# Only the latest reading is kept, and only for the threshold it was taken at:
+# the scan filters by the threshold, so another threshold needs a new scan.
+_process_cache: tuple[float, int, tuple[int, str, int, bool] | None] | None = None
+_process_blind_logged_at: float | None = None
+_process_refresh_lock = None  # asyncio.Lock, made on first use: one scan at a time
+# Third state, as for codex_mcp_held: the scan could not say.
+PROCESS_UNKNOWN = "unknown"
+
+
+def _process_scan(threshold_mb: int):
+    """The stop tool's read-only scan (a seam: the test suite replaces it)."""
+    from genesis.sentinel import process_stop
+
+    return process_stop.scan(threshold_mb)
+
+
+async def _process_memory_high() -> tuple[int, str, int, int] | str | None:
+    """(count, largest label, largest MB, threshold MB) when the alarm should
+    fire; ``PROCESS_UNKNOWN`` when the scan cannot tell; else None.
+
+    A process found over the line fires the alarm even if another candidate
+    was unreadable. With none found, an unreadable candidate (which may be over
+    the line) or a raising scan is unknown, not clear. Never raises; a raising
+    scan logs at ERROR hourly.
+    """
+    import asyncio
+    import time
+
+    from genesis.sentinel import process_stop
+
+    global _process_cache, _process_blind_logged_at, _process_refresh_lock  # noqa: PLW0603
+    if process_stop.load_mode() == process_stop.MODE_OFF:
+        return None
+    threshold = process_stop.load_propose_at_mb()
+    if threshold is None:
+        return None
+    if _process_refresh_lock is None:
+        _process_refresh_lock = asyncio.Lock()
+    async with _process_refresh_lock:
+        # Re-read under the lock: a waiting caller reuses the scan just made.
+        now = time.monotonic()
+        if (
+            _process_cache is None
+            or _process_cache[1] != threshold
+            or now - _process_cache[0] >= _PROCESS_TTL_S
+        ):
+            reading: tuple[int, str, int, bool] | None
+            try:
+                found = await asyncio.to_thread(_process_scan, threshold)
+            except Exception:
+                reading = None
+                if _process_blind_logged_at is None or now - _process_blind_logged_at >= 3600:
+                    _process_blind_logged_at = now
+                    logger.error(
+                        "process_memory_high: the stop tool's scan raised; the alarm is blind", exc_info=True
+                    )
+            else:
+                complete = not found.uncertain_pids
+                if (
+                    not complete
+                    and not found.targets
+                    and (_process_blind_logged_at is None or now - _process_blind_logged_at >= 3600)
+                ):
+                    # Unknown, with no alert to show it: say so, hourly.
+                    _process_blind_logged_at = now
+                    logger.error(
+                        "process_memory_high: %d candidate process(es) could not be read and none "
+                        "was found over the line; the alarm may be blind in this process",
+                        len(found.uncertain_pids),
+                    )
+                if found.targets:
+                    top = found.targets[0]
+                    reading = (len(found.targets), f"pid {top.pid} {top.label}", top.held_kb // 1024, complete)
+                else:
+                    reading = (0, "", 0, complete)
+            _process_cache = (now, threshold, reading)
+    reading = _process_cache[2] if _process_cache is not None else None
+    if reading is None:
+        return PROCESS_UNKNOWN
+    count, label, top_mb, complete = reading
+    if count:
+        return count, label, top_mb, threshold
+    return None if complete else PROCESS_UNKNOWN
+
+
 async def _memory_breakdown_line() -> str:
     """The top-memory-trees line; never raises (see ``pid_breakdown.memory_summary``)."""
     import asyncio
@@ -558,7 +653,7 @@ async def _compute_alerts(
         )
         if queue_unknown_ids is not None:
             # Never computed on this path: unknown, not cleared.
-            queue_unknown_ids.add("infra:codex_mcp_held")
+            queue_unknown_ids.update({"infra:codex_mcp_held", "infra:process_memory_high"})
         return alerts, current_ids
 
     snap = await _service.snapshot()
@@ -809,6 +904,25 @@ async def _compute_alerts(
                 "message": (
                     f"A shared Codex app-server holds {groups} MCP server group(s), {held_mb} MB "
                     f"in all (alarm at {threshold_mb} MB). Remedy: codex_mcp_stop, dry-run first."
+                ),
+            }
+        )
+        current_ids.add(alert_id)
+
+    big = await _process_memory_high()
+    if big == PROCESS_UNKNOWN:
+        if queue_unknown_ids is not None:
+            queue_unknown_ids.add("infra:process_memory_high")
+    elif big is not None:
+        count, top_label, top_mb, threshold_mb = big
+        alert_id = "infra:process_memory_high"
+        alerts.append(
+            {
+                "id": alert_id,
+                "severity": "WARNING",
+                "message": (
+                    f"{count} process(es) hold at least {threshold_mb} MB of RAM+swap each; the "
+                    f"largest is {top_label} at {top_mb} MB. Remedy: process_stop, dry-run first."
                 ),
             }
         )

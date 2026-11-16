@@ -98,6 +98,8 @@ def fake_proc(tmp_path, monkeypatch):
     (home / ".codex" / "packages").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(proc_io, "_PROC", str(root))
+    # The fake tree's groups do not exist on the real kernel: never ask it.
+    monkeypatch.setattr(mod, "_group_exists", lambda pgid: None)
     codex_helper = str(home / ".codex" / "packages" / "codex-code-mode")
 
     w = _write_proc
@@ -731,9 +733,42 @@ def test_unlistable_proc_during_the_stop_is_partial(fake_proc, monkeypatch, caps
     assert "outcome unknown" in capsys.readouterr().out
 
 
+def test_group_alive_counts_an_unreadable_member_as_alive(fake_proc):
+    """Audit (round 3): a pid whose stat cannot be read may be a member that has
+    not stopped, so the group is never reported stopped on that evidence."""
+    for pid in (101, 105):
+        p = fake_proc / str(pid) / "stat"
+        p.write_text(p.read_text().replace(") S ", ") Z ", 1))
+    assert mod._group_alive(101) is False  # control: every member exited
+    stat = fake_proc / "105" / "stat"
+    stat.unlink()
+    stat.mkdir()  # reading it raises
+    assert mod._group_alive(101) is True
+
+
+def test_a_group_with_no_process_left_is_gone_without_reading_stats(fake_proc, monkeypatch):
+    """Audit note: once the kernel has no process in the group, an unrelated
+    unreadable pid elsewhere must not keep it 'alive'."""
+    (fake_proc / "999").mkdir()
+    (fake_proc / "999" / "stat").mkdir()  # an unrelated, unreadable pid
+    assert mod._group_alive(101) is True  # it might be a member
+    monkeypatch.setattr(mod, "_group_exists", lambda pgid: False)
+    assert mod._group_alive(101) is False
+
+
+def test_an_unreadable_pid_makes_the_codex_scan_incomplete(fake_proc):
+    """Audit: a pid whose stat cannot be read may be an app-server child, so the
+    scan must not call itself complete."""
+    (fake_proc / "998").mkdir()
+    (fake_proc / "998" / "stat").mkdir()
+    found = mod.scan()
+    assert any(u.startswith("998 ") for u in found.uncertain)
+
+
 def test_group_alive_raises_when_proc_is_unlistable(tmp_path, monkeypatch):
     # An empty listing would make every signalled group read as stopped.
     monkeypatch.setattr(proc_io, "_PROC", str(tmp_path / "absent"))
+    monkeypatch.setattr(mod, "_group_exists", lambda pgid: None)  # the kernel cannot say
     with pytest.raises(OSError):
         mod._group_alive(101)
 

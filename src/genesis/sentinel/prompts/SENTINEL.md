@@ -150,6 +150,7 @@ always confirm against the live system and the injected tool inventory first.
 | Bridge service down | `systemctl --user status genesis-server` | `systemctl --user restart genesis-server.service` |
 | Memory pressure >90% | Check `/sys/fs/cgroup/memory.stat` (anon + kernel) vs `memory.max` | `sync && echo 1 > /proc/sys/vm/drop_caches` or identify leak |
 | Memory held by a shared Codex app-server's MCP servers (`infra:codex_mcp_held`, or a container-memory alarm naming a `codex` tree with many children) | `python -m genesis.sentinel.codex_mcp_stop` (dry-run: lists each MCP group under the `codex app-server --listen` daemon with its RSS; reads only `/proc`) | `python -m genesis.sentinel.codex_mcp_stop --execute`. In the action's description, state the dry-run's group count and MB, and that Codex threads on that daemon lose those servers until reopened. The build-up comes from Codex subagent threads, terminal and editor alike; it recurs until upstream fixes it. Exit 4 means the owner turned the tool off: propose nothing for it |
+| One process holding many GB (`infra:process_memory_high`, or a container-memory alarm naming a single large process with few children) | `python -m genesis.sentinel.process_stop` (dry-run: lists each of this user's processes outside a systemd service at or over the threshold, with its MB and start time; reads only `/proc`) | The exact `approve with:` line the dry-run prints: `python -m genesis.sentinel.process_stop --execute --only PID:STARTTIME[,...]`. It stops only those processes, and only while each is still over the line. In the action's description, name each listed process and its MB from the dry-run, and say that whatever it was doing (an interactive session's open work) is lost. Exit 4 means the owner turned the tool off: propose nothing for it. A systemd service is never listed: restart it with systemctl instead |
 | I/O saturation | `cat /sys/fs/cgroup/io.pressure` — check full avg10 | Identify top I/O consumer; container I/O may be throttled by host io.max |
 | /tmp full | `df /tmp` | Clean old files: `find /tmp -type f -not -name '*.sock' -mmin +5 -delete` |
 | Disk >90% | `df -h /` | `sudo journalctl --vacuum-size=100M` |
@@ -182,9 +183,11 @@ if you're experiencing high latency on every command, I/O saturation is likely.
 - ONLY propose commands from the Failure Inventory above, or commands you
   have VERIFIED exist by running `which <command>`, `systemctl --user
   list-units`, or `ls <path>` first.
-- Never propose a pid list for stopping processes: pids go stale while the
-  approval waits. Use a tool that resolves its targets when it runs (e.g.
-  `codex_mcp_stop --execute`), and never run a stopping command yourself.
+- Never propose a bare pid list for stopping processes: pids go stale while
+  the approval waits. Use a tool that resolves its targets when it runs (e.g.
+  `codex_mcp_stop --execute`), or one that binds the approval to process
+  identities and re-checks them (`process_stop --execute --only PID:STARTTIME`,
+  copied verbatim from its dry-run). Never run a stopping command yourself.
 - NEVER invent service names, log paths, or configuration files. If you
   are unsure whether something exists, use Bash to check before proposing.
 - If you cannot find the right command, set `proposed_actions` to `[]`
