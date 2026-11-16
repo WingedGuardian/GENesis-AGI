@@ -42,7 +42,6 @@ import contextlib  # noqa: E402
 import os  # noqa: E402
 import shutil  # noqa: E402
 import subprocess  # noqa: E402
-import types  # noqa: E402
 
 import aiosqlite  # noqa: E402
 import pytest  # noqa: E402
@@ -790,11 +789,9 @@ def _reset_memory_alarm_breakdown():
     mp.setattr(errors, "_codex_mcp_blind_logged_at", None)
     mp.setattr(errors, "_codex_mcp_refresh_lock", None)
     # Same for the process_memory_high alarm: no real /proc scan by default.
-    mp.setattr(
-        errors,
-        "_process_scan",
-        lambda _threshold: types.SimpleNamespace(targets=[], uncertain=[], uncertain_pids=set()),
-    )
+    from genesis.sentinel.process_stop import Scan as _EmptyProcessScan
+
+    mp.setattr(errors, "_process_scan", lambda threshold: _EmptyProcessScan(threshold_mb=threshold))
     mp.setattr(errors, "_process_cache", None)
     mp.setattr(errors, "_process_blind_logged_at", None)
     mp.setattr(errors, "_process_refresh_lock", None)

@@ -432,6 +432,11 @@ def main(argv: list[str] | None = None) -> int:
     # but while one remains the alarm is still true: the run is not done, so
     # the Sentinel neither records it resolved nor quiets the alarm.
     unapproved = [t for t in found.targets if (t.pid, t.starttime) not in only]
+    # A candidate the scan could not read may be over the line too: while one
+    # exists the run cannot say nothing over the line remains, as the alarm
+    # (which reads the same scan) says unknown. Never signalled, named, partial.
+    approved_pids = {pid for pid, _st in only}
+    unjudged = sorted(pid for pid in found.uncertain_pids if pid not in approved_pids)
     stopped, failures = stop(approved)
     freed_mb = sum(t.held_kb for t in stopped) / 1024
     print(
@@ -450,9 +455,12 @@ def main(argv: list[str] | None = None) -> int:
             f"  NOT APPROVED pid {t.pid}:{t.starttime}: {t.held_kb / 1024:.0f} MB, over the line "
             "and not in --only; left running (propose it separately)"
         )
+    for pid in unjudged:
+        print(f"  NOT JUDGED pid {pid}: could not be read, so it may still be over the line; left running")
     for f in failures:
         print(f"  FAILED {f}")
-    return EXIT_OK if not failures and not unreadable and not unapproved else EXIT_PARTIAL
+    done = not failures and not unreadable and not unapproved and not unjudged
+    return EXIT_OK if done else EXIT_PARTIAL
 
 
 def _parse_only(raw: str) -> set[tuple[int, int]] | None:

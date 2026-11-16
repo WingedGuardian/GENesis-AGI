@@ -105,6 +105,29 @@ async def test_lever_or_threshold_off_never_scans(health, monkeypatch):
     assert calls == []
 
 
+def _expire(monkeypatch):
+    stamp, threshold, reading = errors._process_cache
+    monkeypatch.setattr(errors, "_process_cache", (stamp - errors._PROCESS_TTL_S, threshold, reading))
+
+
+async def _state() -> str:
+    """'firing', 'unknown' (absent but in the unknown-id channel) or 'clear'."""
+    unknown: set[str] = set()
+    alerts, ids = await errors._compute_alerts(queue_unknown_ids=unknown)
+    if _ALARM in ids:
+        assert any(a["id"] == _ALARM for a in alerts)
+        return "firing"
+    return "unknown" if _ALARM in unknown else "clear"
+
+
+def _rescan(monkeypatch, set_scan, *args, **kwargs):
+    """Swap the scan but keep the cached reading, expired so the next call refreshes."""
+    saved = errors._process_cache
+    set_scan(*args, **kwargs)
+    monkeypatch.setattr(errors, "_process_cache", saved)
+    _expire(monkeypatch)
+
+
 @pytest.mark.asyncio
 async def test_scan_is_cached_for_a_minute(health, monkeypatch):
     set_scan, calls = health
@@ -112,10 +135,21 @@ async def test_scan_is_cached_for_a_minute(health, monkeypatch):
     assert await _alarm() is not None
     assert await _alarm() is not None
     assert len(calls) == 1
-    stamp, held = errors._process_cache
-    monkeypatch.setattr(errors, "_process_cache", (stamp - errors._PROCESS_TTL_S, held))
+    _expire(monkeypatch)
     await _alarm()
     assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_new_threshold_is_never_served_from_the_cache(health, monkeypatch):
+    """CodeRabbit: a target found at 6144 MB says nothing about 12288 MB; the
+    scan filters by the threshold, so a changed threshold scans again."""
+    set_scan, calls = health
+    set_scan([7168])
+    assert await _alarm() is not None
+    monkeypatch.setattr(process_stop, "load_propose_at_mb", lambda path=None: 12288)
+    await _alarm()
+    assert calls == [6144, 12288]
 
 
 @pytest.mark.asyncio
@@ -129,31 +163,65 @@ async def test_a_raising_scan_logs_once_and_emits_nothing(health, caplog, monkey
     assert caplog.text.count("process_memory_high: the stop tool's scan raised") == 1
 
 
-def _rescan(monkeypatch, set_scan, *args, **kwargs):
-    """Swap the scan but keep the cached reading, expired so the next call refreshes."""
-    stamp, held = errors._process_cache
-    set_scan(*args, **kwargs)
-    monkeypatch.setattr(errors, "_process_cache", (stamp - errors._PROCESS_TTL_S, held))
-
-
 @pytest.mark.asyncio
-async def test_a_failed_refresh_keeps_the_last_observation(health, monkeypatch):
+async def test_a_failed_refresh_reads_unknown_not_cleared(health, monkeypatch):
     set_scan, _ = health
     set_scan([9000])
-    assert await _alarm() is not None
+    assert await _state() == "firing"
     _rescan(monkeypatch, set_scan, [], raises=True)
-    assert await _alarm() is not None
+    assert await _state() == "unknown"
 
 
 @pytest.mark.asyncio
-async def test_a_flagged_process_turning_unreadable_keeps_the_alarm(health, monkeypatch):
+async def test_an_unreadable_candidate_with_no_target_is_unknown(health, monkeypatch):
+    """An unreadable process may be the one over the line."""
     set_scan, _ = health
     set_scan([9000])  # pid 300
-    assert await _alarm() is not None
+    assert await _state() == "firing"
     _rescan(monkeypatch, set_scan, [], uncertain_pids=[300])
-    assert await _alarm() is not None
-    _rescan(monkeypatch, set_scan, [], uncertain_pids=[999])  # unrelated: the reading stands
-    assert await _alarm() is None
+    assert await _state() == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_a_readable_target_fires_while_another_is_unreadable(health):
+    set_scan, _ = health
+    set_scan([9000], uncertain_pids=[999])
+    assert await _state() == "firing"
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_process_is_not_lost_behind_another_target(health, monkeypatch):
+    """CodeRabbit: A flagged, then A unreadable while B is a readable target,
+    then B under the line while A stays unreadable. Nothing retained A, and
+    nothing needs to: the last reading is unknown, never clear."""
+    set_scan, _ = health
+    set_scan([9000])  # A = pid 300
+    assert await _state() == "firing"
+    _rescan(monkeypatch, set_scan, [8000], uncertain_pids=[999])  # B readable, A unreadable
+    assert await _state() == "firing"
+    _rescan(monkeypatch, set_scan, [], uncertain_pids=[999])  # B eased, A still unreadable
+    assert await _state() == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_a_blind_reading_logs_once_an_hour(health, caplog, monkeypatch):
+    set_scan, _ = health
+    with caplog.at_level(logging.ERROR, logger="genesis.mcp.health.errors"):
+        set_scan([], uncertain_pids=[999])
+        assert await _state() == "unknown"
+        _rescan(monkeypatch, set_scan, [], uncertain_pids=[999])
+        assert await _state() == "unknown"
+    assert caplog.text.count("the alarm may be blind") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_complete_reading_with_no_target_clears(health, monkeypatch):
+    """Control: nothing unreadable and nothing over the line is a real clearance."""
+    set_scan, _ = health
+    set_scan([9000])
+    assert await _state() == "firing"
+    _rescan(monkeypatch, set_scan, [])
+    assert await _state() == "clear"
 
 
 @pytest.mark.asyncio
@@ -163,7 +231,7 @@ async def test_overlapping_callers_share_one_scan(health):
     set_scan, calls = health
     set_scan([9000])
     results = await asyncio.gather(*(errors._process_memory_high() for _ in range(5)))
-    assert all(r is not None for r in results)
+    assert all(isinstance(r, tuple) for r in results)
     assert len(calls) == 1
 
 

@@ -352,6 +352,20 @@ def test_an_approved_process_that_cannot_be_read_is_a_partial_result(
     assert "no longer an eligible target" not in out
 
 
+def test_an_unreadable_unapproved_candidate_makes_the_run_partial(fake_proc, monkeypatch, capsys):
+    """Audit (round 2): the approved process stops, but another big process
+    could not be read, so the run cannot say nothing over the line remains
+    (the alarm, reading the same scan, says unknown). It is never signalled."""
+    calls = _main_env(monkeypatch)
+    _w(fake_proc, 220, comm="python", argv=("python",), rss_kb=9 * GB)
+    (fake_proc / "220" / "cgroup").unlink()
+    assert mod.main(["--execute", "--only", "200:2000"]) == mod.EXIT_PARTIAL
+    assert calls == [[200]]
+    out = capsys.readouterr().out
+    assert "stopped 1 of 1 approved" in out
+    assert "NOT JUDGED pid 220" in out
+
+
 def test_a_status_read_error_is_uncertain_not_gone(fake_proc, monkeypatch, capsys):
     """Only a vanished process reads as gone; EACCES or EIO is unjudged."""
     calls = _main_env(monkeypatch)

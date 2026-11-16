@@ -322,9 +322,15 @@ async def _refresh_codex_mcp_cache(now: float) -> None:
 # sessions, including server-dispatched ones, are). Cached like codex_mcp_held.
 # An unreadable process is not alarmed on; a raising scan logs hourly.
 _PROCESS_TTL_S = 60.0
-_process_cache: tuple[float, tuple[int, str, int, frozenset[int]] | None] | None = None
+# (monotonic, threshold MB the scan used, reading). A reading is
+# (count, largest label, largest MB, complete), or None when the scan raised.
+# Only the latest reading is kept, and only for the threshold it was taken at:
+# the scan filters by the threshold, so another threshold needs a new scan.
+_process_cache: tuple[float, int, tuple[int, str, int, bool] | None] | None = None
 _process_blind_logged_at: float | None = None
 _process_refresh_lock = None  # asyncio.Lock, made on first use: one scan at a time
+# Third state, as for codex_mcp_held: the scan could not say.
+PROCESS_UNKNOWN = "unknown"
 
 
 def _process_scan(threshold_mb: int):
@@ -334,9 +340,15 @@ def _process_scan(threshold_mb: int):
     return process_stop.scan(threshold_mb)
 
 
-async def _process_memory_high() -> tuple[int, str, int, int] | None:
+async def _process_memory_high() -> tuple[int, str, int, int] | str | None:
     """(count, largest label, largest MB, threshold MB) when the alarm should
-    fire, else None. Never raises; a raising scan logs at ERROR hourly."""
+    fire; ``PROCESS_UNKNOWN`` when the scan cannot tell; else None.
+
+    A process found over the line fires the alarm even if another candidate
+    was unreadable. With none found, an unreadable candidate (which may be over
+    the line) or a raising scan is unknown, not clear. Never raises; a raising
+    scan logs at ERROR hourly.
+    """
     import asyncio
     import time
 
@@ -353,34 +365,48 @@ async def _process_memory_high() -> tuple[int, str, int, int] | None:
     async with _process_refresh_lock:
         # Re-read under the lock: a waiting caller reuses the scan just made.
         now = time.monotonic()
-        if _process_cache is None or now - _process_cache[0] >= _PROCESS_TTL_S:
-            prior = _process_cache[1] if _process_cache is not None else None
-            held = prior  # a failed scan keeps the last observation
+        if (
+            _process_cache is None
+            or _process_cache[1] != threshold
+            or now - _process_cache[0] >= _PROCESS_TTL_S
+        ):
+            reading: tuple[int, str, int, bool] | None
             try:
                 found = await asyncio.to_thread(_process_scan, threshold)
             except Exception:
-                found = None
+                reading = None
                 if _process_blind_logged_at is None or now - _process_blind_logged_at >= 3600:
                     _process_blind_logged_at = now
                     logger.error(
                         "process_memory_high: the stop tool's scan raised; the alarm is blind", exc_info=True
                     )
-            if found is not None:
+            else:
+                complete = not found.uncertain_pids
+                if (
+                    not complete
+                    and not found.targets
+                    and (_process_blind_logged_at is None or now - _process_blind_logged_at >= 3600)
+                ):
+                    # Unknown, with no alert to show it: say so, hourly.
+                    _process_blind_logged_at = now
+                    logger.error(
+                        "process_memory_high: %d candidate process(es) could not be read and none "
+                        "was found over the line; the alarm may be blind in this process",
+                        len(found.uncertain_pids),
+                    )
                 if found.targets:
                     top = found.targets[0]
-                    held = (
-                        len(found.targets), f"pid {top.pid} {top.label}", top.held_kb // 1024,
-                        frozenset(t.pid for t in found.targets),
-                    )
-                elif prior is not None and prior[3] & found.uncertain_pids:
-                    pass  # a process the last reading flagged is now unreadable: no evidence it eased
+                    reading = (len(found.targets), f"pid {top.pid} {top.label}", top.held_kb // 1024, complete)
                 else:
-                    held = (0, "", 0, frozenset())
-            _process_cache = (now, held)
-    held = _process_cache[1] if _process_cache is not None else None
-    if held is None or held[0] == 0:
-        return None
-    return held[0], held[1], held[2], threshold
+                    reading = (0, "", 0, complete)
+            _process_cache = (now, threshold, reading)
+    reading = _process_cache[2] if _process_cache is not None else None
+    if reading is None:
+        return PROCESS_UNKNOWN
+    count, label, top_mb, complete = reading
+    if count:
+        return count, label, top_mb, threshold
+    return None if complete else PROCESS_UNKNOWN
 
 
 async def _memory_breakdown_line() -> str:
@@ -627,7 +653,7 @@ async def _compute_alerts(
         )
         if queue_unknown_ids is not None:
             # Never computed on this path: unknown, not cleared.
-            queue_unknown_ids.add("infra:codex_mcp_held")
+            queue_unknown_ids.update({"infra:codex_mcp_held", "infra:process_memory_high"})
         return alerts, current_ids
 
     snap = await _service.snapshot()
@@ -884,7 +910,10 @@ async def _compute_alerts(
         current_ids.add(alert_id)
 
     big = await _process_memory_high()
-    if big is not None:
+    if big == PROCESS_UNKNOWN:
+        if queue_unknown_ids is not None:
+            queue_unknown_ids.add("infra:process_memory_high")
+    elif big is not None:
         count, top_label, top_mb, threshold_mb = big
         alert_id = "infra:process_memory_high"
         alerts.append(
