@@ -55,8 +55,12 @@ sources, occupied link destinations and same-inode renames are also filtered.
 Protected hardlink sources are observed as ``os.link source`` exposure, even
 without a later content write. Source symlink targets are checked conservatively
 because the link event omits follow_symlinks. No alias history is maintained.
-``os.open`` of a relative name is judged against the cwd and labelled so (its
-audit event omits ``dir_fd``).
+Relative ``os.open`` events omit ``dir_fd``. On Linux/CPython the FD witness
+corrects supported successful calls using the returned descriptor; other calls
+retain the explicitly labelled cwd guess. Failed/ambiguous calls and every
+credential-read fault remain conservative; no published evidence is removed.
+Pending calls are sealed across report capture. Callable identity/builtin type
+change under instrumentation; signature/pickle/dir_fd metadata are preserved.
 Attribution is by ``PYTEST_CURRENT_TEST``: a write during collection or a
 session fixture's teardown counts as "outside any test", and a background
 thread an earlier test left running is charged to the test running now.
@@ -87,7 +91,7 @@ from types import ModuleType
 import pytest
 
 from genesis.secrets_location import home_config_location
-from tests import _live_writes_fs, _live_writes_report
+from tests import _live_writes_fd, _live_writes_fs, _live_writes_report
 
 
 def _observer_os():
@@ -158,6 +162,7 @@ class _State:
 _S = _State()
 _busy = threading.local()
 _fault_lock = threading.Lock()
+_W = _live_writes_fd.Witness(sys.modules[__name__])
 
 
 def _under(path: str, root: str) -> bool:
@@ -237,7 +242,16 @@ def _node() -> str:
 
 
 def _record(label: str, op: str, path: str) -> None:
-    _S.hits[(_node(), label, op, path)] = None
+    key = (_node(), label, op, path)
+    try:
+        if _W.defer(key):
+            return
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        raise
+    except BaseException as error:
+        _W.invalidate()
+        _unknown("open", "fd-witness", error)
+    _S.hits[key] = None
 
 
 def _sqlite_target(database) -> str | None:
@@ -466,14 +480,18 @@ def _ordinary_read(args: tuple) -> bool:
 
 
 def _hook(event: str, args: tuple) -> None:
-    if event not in _EVENTS or getattr(_busy, "on", False):
+    if event not in _EVENTS:
         return
     # Everything past the event check runs under the guard and the exception
     # boundary, the read-side credential lookup included: its os.stat can raise
     # (a test that patches it) and is itself an audited open.
+    was_busy = getattr(_busy, "on", False)
     _busy.on = True
-    stage = "judge"
+    stage = "fd-witness"
     try:
+        _W.note(event, args)
+        if was_busy:
+            return
         if event == "open":
             stage = "open-no-effect"
             try:
@@ -491,7 +509,7 @@ def _hook(event: str, args: tuple) -> None:
     except BaseException as error:  # pytest outcomes also must not escape an observer
         _unknown(event, stage, error)
     finally:
-        _busy.on = False
+        _busy.on = was_busy
 
 
 def install(config) -> None:
@@ -565,6 +583,7 @@ def install(config) -> None:
     _S.credential_inodes = frozenset(inodes)
     sys.addaudithook(_hook)
     _S.installed = True
+    _W.install()
 
 
 @pytest.hookimpl(trylast=True)
@@ -574,18 +593,19 @@ def pytest_sessionfinish(session, exitstatus):
     # Earlier ordinary hooks may update Session after the argument was copied.
     _S.exitstatus = int(getattr(session, "exitstatus", exitstatus))
     if hasattr(session.config, "workeroutput"):
+        hits, state = _W.capture(_live_writes_report.observation_state)
         session.config.workeroutput["genesis_live_writes"] = {
             # As bytes: xdist's channel refuses a str it cannot encode as UTF-8
             # (MEASURED: execnet DumpError), which an undecodable path is.
             "hits": [
                 [field.encode("utf-8", "surrogateescape") for field in key]
-                for key in dict.copy(_S.hits)
+                for key in hits
             ],
-            "disarmed": _S.disarmed,
-            "faults": _S.faults,
+            "disarmed": state["disarmed"],
+            "faults": state["faults"],
         }
         if _S.census_id:
-            session.config.workeroutput["genesis_live_writes"]["census"] = _live_writes_report.observation_state(_S)
+            session.config.workeroutput["genesis_live_writes"]["census"] = state
 
 
 def _worker_id(node):
@@ -623,6 +643,7 @@ def pytest_testnodedown(node, error):
 def pytest_terminal_summary(terminalreporter):
     if hasattr(terminalreporter.config, "workeroutput"):
         return  # a worker: its hits go to the controller, which reports once
+    hits, state = _W.capture(_live_writes_report.census_state)
     if not _S.installed:
         if _S.disarmed:
             terminalreporter.write_line(f"live writes: disarmed ({_S.disarmed})", yellow=True)
@@ -634,7 +655,6 @@ def pytest_terminal_summary(terminalreporter):
     # One snapshot: a thread the run left behind can still record while this runs,
     # and iterating the live dict would raise and fail a run this only reports on.
     # dict.copy() takes it in one step under the GIL, without iterating the dict.
-    hits = list(dict.copy(_S.hits))
     if hits:
         by_class: dict[str, set[str]] = {}
         for node, label, _op, _path in hits:
@@ -651,6 +671,10 @@ def pytest_terminal_summary(terminalreporter):
         try:
             # surrogateescape: a path os.fsdecode() could not decode is written back
             # as its original bytes instead of failing the run.
-            _live_writes_report.publish(report, hits, _live_writes_report.census_state(_S))
+            _live_writes_report.publish(report, hits, state)
         except (OSError, UnicodeError) as exc:  # report-only: never fails a run
             tr.write_line(f"live writes: could not write the report {report}: {exc}", yellow=True)
+
+
+def pytest_unconfigure(config):
+    _W.close()
