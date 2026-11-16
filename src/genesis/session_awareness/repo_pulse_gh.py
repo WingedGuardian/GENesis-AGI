@@ -335,6 +335,241 @@ async def list_open_prs(
     return {"repo": repo, "prs": prs, "limit_hit": len(raw) >= limit}
 
 
+_QUEUE_PR_QUERY = """query($owner:String!, $name:String!, $after:String) {
+  repository(owner:$owner, name:$name) {
+    url
+    defaultBranchRef { name }
+    pullRequests(states:OPEN, first:100, after:$after) {
+      totalCount
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number title url isDraft mergeable updatedAt createdAt headRefOid baseRefName
+        labels(first:100) { totalCount pageInfo { hasNextPage endCursor } nodes { name } }
+        commits(last:1) { nodes { commit { committedDate } } }
+      }
+    }
+  }
+}"""
+_QUEUE_LABELS_QUERY = """query($owner:String!, $name:String!, $number:Int!, $after:String) {
+  repository(owner:$owner, name:$name) {
+    pullRequest(number:$number) {
+      labels(first:100, after:$after) {
+        totalCount pageInfo { hasNextPage endCursor } nodes { name }
+      }
+    }
+  }
+}"""
+_QUEUE_COMMENTS_QUERY = """query($owner:String!, $name:String!, $number:Int!, $after:String) {
+  repository(owner:$owner, name:$name) {
+    pullRequest(number:$number) {
+      comments(first:100, after:$after) {
+        totalCount pageInfo { hasNextPage endCursor }
+        nodes { authorAssociation body createdAt }
+      }
+    }
+  }
+}"""
+
+
+def _queue_graphql_argv(repo: str, query: str, variables: dict) -> list[str]:
+    parts = repo.split("/")
+    if len(parts) != 2 or not all(parts):
+        raise ValueError("repo must be an owner/name slug")
+    argv = ["gh", "api", "graphql", "-f", f"query={query}"]
+    argv.extend(["-F", f"owner={parts[0]}", "-F", f"name={parts[1]}"])
+    for key, value in variables.items():
+        if value is not None:
+            argv.extend(["-F", f"{key}={value}"])
+    return argv
+
+
+async def _queue_graphql(
+    repo: str, query: str, variables: dict, run: Runner
+) -> tuple[dict | None, str | None]:
+    try:
+        argv = _queue_graphql_argv(repo, query, variables)
+    except ValueError as exc:
+        return None, str(exc)
+    rc, out, err = await run(argv)
+    if rc:
+        return None, f"gh api graphql failed (rc={rc}): {err.strip()[:400]}"
+    try:
+        payload = json.loads(out)
+    except json.JSONDecodeError as exc:
+        return None, f"gh api graphql returned invalid JSON: {exc}"
+    if not isinstance(payload, dict):
+        return None, "gh api graphql returned a non-object payload"
+    if payload.get("errors"):
+        return None, f"gh api graphql returned errors: {str(payload['errors'])[:400]}"
+    data = payload.get("data")
+    return (data, None) if isinstance(data, dict) else (None, "gh api graphql omitted data")
+
+
+async def _complete_queue_labels(pr: dict, repo: str, run: Runner) -> str | None:
+    labels = pr.get("labels")
+    if not isinstance(labels, dict) or not isinstance(labels.get("nodes"), list):
+        return "queue listing omitted labels"
+    page = labels.get("pageInfo")
+    if not isinstance(page, dict) or type(page.get("hasNextPage")) is not bool:
+        return "queue listing returned malformed label pagination"
+    seen = set()
+    while page["hasNextPage"]:
+        cursor = page.get("endCursor")
+        if not isinstance(cursor, str) or not cursor or cursor in seen:
+            return "label pagination cursor missing or repeated"
+        seen.add(cursor)
+        data, error = await _queue_graphql(
+            repo, _QUEUE_LABELS_QUERY, {"number": pr["number"], "after": cursor}, run
+        )
+        if error:
+            return error
+        repository = data.get("repository")
+        pull = repository.get("pullRequest") if isinstance(repository, dict) else None
+        connection = pull.get("labels") if isinstance(pull, dict) else None
+        if not isinstance(connection, dict) or not isinstance(connection.get("nodes"), list):
+            return "label pagination returned malformed data"
+        labels["nodes"].extend(connection["nodes"])
+        page = connection.get("pageInfo")
+        if not isinstance(page, dict) or type(page.get("hasNextPage")) is not bool:
+            return "label pagination returned malformed pageInfo"
+        if connection.get("totalCount") != labels.get("totalCount"):
+            return "label totalCount changed during pagination"
+    if labels.get("totalCount") != len(labels["nodes"]):
+        return "label totalCount does not match rows read"
+    return None
+
+
+async def list_queue_prs(*, repo: str | None = None, runner: Runner | None = None) -> dict:
+    """Read every open PR and the live default branch through gh GraphQL.
+
+    The result retains malformed numbered rows for the sweep to report. A
+    missing/non-integer number or failed cursor page is a listing error; a
+    terminal page whose count disagrees with ``totalCount`` is returned with
+    ``limit_hit`` and honest ``read``/``open_total`` values.
+    """
+    run = runner or _default_runner
+    if repo is None:
+        repo = await resolve_repo(run)
+    if not repo:
+        return {"repo": repo, "prs": [], "open_total": 0, "read": 0,
+                "limit_hit": True, "error": "repo slug resolve failed"}
+    prs, total, default_branch, repo_url = [], None, None, None
+    cursor, seen, limit_hit = None, set(), False
+    while True:
+        data, error = await _queue_graphql(repo, _QUEUE_PR_QUERY, {"after": cursor}, run)
+        if error:
+            return {"repo": repo, "prs": prs, "open_total": total or 0, "read": len(prs),
+                    "default_branch": default_branch, "repo_url": repo_url,
+                    "limit_hit": True, "error": error}
+        repository = data.get("repository")
+        connection = repository.get("pullRequests") if isinstance(repository, dict) else None
+        branch = repository.get("defaultBranchRef") if isinstance(repository, dict) else None
+        page = connection.get("pageInfo") if isinstance(connection, dict) else None
+        nodes = connection.get("nodes") if isinstance(connection, dict) else None
+        count = connection.get("totalCount") if isinstance(connection, dict) else None
+        if type(count) is not int or not isinstance(nodes, list) or not isinstance(page, dict):
+            return {"repo": repo, "prs": prs, "open_total": total or 0, "read": len(prs),
+                    "default_branch": default_branch, "repo_url": repo_url,
+                    "limit_hit": True, "error": "queue listing returned malformed connection"}
+        if total is None:
+            total = count
+            default_branch = branch.get("name") if isinstance(branch, dict) else None
+            repo_url = repository.get("url")
+            if not default_branch or not isinstance(repo_url, str):
+                return {"repo": repo, "prs": prs, "open_total": total, "read": 0,
+                        "limit_hit": True, "error": "queue listing omitted repo URL or default branch"}
+        elif count != total:
+            limit_hit = True
+            total = max(total, count)
+        for row in nodes:
+            if not isinstance(row, dict) or type(row.get("number")) is not int:
+                return {"repo": repo, "prs": prs, "open_total": total, "read": len(prs),
+                        "default_branch": default_branch, "repo_url": repo_url,
+                        "limit_hit": True, "error": "queue listing row omitted an integer number"}
+            prs.append(row)
+            label_error = await _complete_queue_labels(row, repo, run)
+            if label_error:
+                row["_queue_error"] = label_error
+        more = page.get("hasNextPage")
+        if type(more) is not bool:
+            return {"repo": repo, "prs": prs, "open_total": total, "read": len(prs),
+                    "default_branch": default_branch, "repo_url": repo_url,
+                    "limit_hit": True, "error": "queue listing omitted hasNextPage"}
+        if not more:
+            break
+        next_cursor = page.get("endCursor")
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor in seen:
+            return {"repo": repo, "prs": prs, "open_total": total, "read": len(prs),
+                    "default_branch": default_branch, "repo_url": repo_url,
+                    "limit_hit": True, "error": "queue listing cursor missing or repeated"}
+        seen.add(next_cursor)
+        cursor = next_cursor
+    return {"repo": repo, "prs": prs, "open_total": total, "read": len(prs),
+            "default_branch": default_branch, "repo_url": repo_url,
+            "limit_hit": limit_hit or len(prs) != total}
+
+
+async def list_queue_pr_comments(
+    repo: str, number: int, *, runner: Runner | None = None
+) -> dict:
+    """Read all issue comments for a labeled PR, preserving partial-read errors."""
+    run = runner or _default_runner
+    comments, total, cursor, seen = [], None, None, set()
+    while True:
+        data, error = await _queue_graphql(
+            repo, _QUEUE_COMMENTS_QUERY, {"number": number, "after": cursor}, run
+        )
+        if error:
+            return {"comments": comments, "read": len(comments), "total": total or 0,
+                    "limit_hit": True, "error": error}
+        repository = data.get("repository")
+        pull = repository.get("pullRequest") if isinstance(repository, dict) else None
+        connection = pull.get("comments") if isinstance(pull, dict) else None
+        page = connection.get("pageInfo") if isinstance(connection, dict) else None
+        nodes = connection.get("nodes") if isinstance(connection, dict) else None
+        count = connection.get("totalCount") if isinstance(connection, dict) else None
+        if type(count) is not int or not isinstance(nodes, list) or not isinstance(page, dict):
+            return {"comments": comments, "read": len(comments), "total": total or 0,
+                    "limit_hit": True, "error": "comments returned malformed connection"}
+        if total is None:
+            total = count
+        elif total != count:
+            return {"comments": comments, "read": len(comments), "total": max(total, count),
+                    "limit_hit": True, "error": "comment totalCount changed during pagination"}
+        comments.extend(nodes)
+        more = page.get("hasNextPage")
+        if type(more) is not bool:
+            return {"comments": comments, "read": len(comments), "total": total,
+                    "limit_hit": True, "error": "comments omitted hasNextPage"}
+        if not more:
+            break
+        next_cursor = page.get("endCursor")
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor in seen:
+            return {"comments": comments, "read": len(comments), "total": total,
+                    "limit_hit": True, "error": "comment cursor missing or repeated"}
+        seen.add(next_cursor)
+        cursor = next_cursor
+    return {"comments": comments, "read": len(comments), "total": total,
+            "limit_hit": len(comments) != total}
+
+
+async def read_queue_pr_mergeability(
+    repo: str, number: int, *, runner: Runner | None = None
+) -> dict:
+    """One delayed mergeability reread for a queue row initially marked UNKNOWN."""
+    run = runner or _default_runner
+    rc, out, err = await run([
+        "gh", "pr", "view", str(number), "--repo", repo,
+        "--json", "mergeable", "-q", ".mergeable",
+    ])
+    value = out.strip()
+    if rc:
+        return {"error": f"mergeability reread failed (rc={rc}): {err.strip()[:400]}"}
+    if value not in {"MERGEABLE", "CONFLICTING", "UNKNOWN"}:
+        return {"error": f"mergeability reread returned invalid value: {value[:120]}"}
+    return {"mergeable": value}
+
+
 # Full-history fields for the zero-drop branch join (session-awareness
 # zero_drop). Deliberately NOT PR_FIELDS: the join reads identity, state and
 # timing only — never title or body, so no PR prose can reach a model prompt
