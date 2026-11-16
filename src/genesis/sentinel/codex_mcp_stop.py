@@ -333,6 +333,11 @@ def _is_daemon_app_server(argv: list[str]) -> bool:
     return False
 
 
+def _exited(stat) -> bool:
+    """A zombie whose only thread has exited (state Z, one thread)."""
+    return stat[1] == "Z" and stat[3] <= 1
+
+
 def scan() -> Scan:
     """Read ``/proc`` and classify every child of a shared Codex app-server."""
     result = Scan()
@@ -365,7 +370,15 @@ def scan() -> Scan:
             continue
         app_reads, app_writes = app_ends
         children = sorted(pid for pid, s in stats.items() if s[2] == app)
-        child_ends = {pid: _pipe_ends(pid) for pid in children}
+        # A zombie with one thread has exited: it holds no descriptors, and
+        # /proc refuses its fd directory even to its own user (EACCES,
+        # MEASURED), which would otherwise read as an unreadable sibling and
+        # blind the whole daemon. A killed MCP server stays one until Codex
+        # reaps it. A Z with more threads is a process whose main thread exited
+        # while others still run (and may hold pipes): that one stays unreadable.
+        child_ends = {
+            pid: (set(), set()) if _exited(stats[pid]) else _pipe_ends(pid) for pid in children
+        }
         # How many direct children hold each pipe the app-server also holds. A
         # server's own request and reply pipes are held by it alone; a pipe
         # end that leaked into another child (an inherited descriptor) is
@@ -383,6 +396,9 @@ def scan() -> Scan:
                 continue
             argv = _argv(pid) or []
             label = f"{pid} {_safe_label(argv)}"
+            if _exited(stats[pid]):
+                result.skipped.append(f"{label} (exited, not yet reaped)")
+                continue
             pg = _pgid(pid)
             if pg is None:
                 result.unreadable(f"{label} (process group unreadable)")

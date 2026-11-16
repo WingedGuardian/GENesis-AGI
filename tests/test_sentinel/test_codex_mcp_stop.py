@@ -31,6 +31,8 @@ def _write_proc(
     fds=None,
     cgroup="/user.slice/session-1.scope",
     rss_kb=1024,
+    state="S",
+    threads=1,
 ):
     """``stdio`` is (fd 0, fd 1), read and write; the default "own" gives the
     process its own pair, pipe:[<pid>1] and pipe:[<pid>2], whose other ends the
@@ -43,7 +45,7 @@ def _write_proc(
     # Fields after ')': state ppid pgrp session tty tpgid flags minflt cminflt
     # majflt cmajflt utime stime cutime cstime prio nice threads itreal starttime
     after = [
-        "S",
+        state,
         str(ppid),
         str(pgid),
         "1",
@@ -60,7 +62,7 @@ def _write_proc(
         "0",
         "20",
         "0",
-        "1",
+        str(threads),
         "0",
         str(starttime or pid * 10),
     ]
@@ -285,6 +287,60 @@ def test_an_unreadable_sibling_leaves_every_candidate_unproven(fake_proc):
     found = mod.scan()
     assert found.groups == []
     assert any(s.startswith("101 ") and "exclusivity unproven" in s for s in found.uncertain)
+
+
+def test_an_unreaped_zombie_sibling_is_not_a_blind_sibling(fake_proc, monkeypatch):
+    """Audit F1: /proc refuses a zombie's fd directory even to its own user
+    (EACCES, measured), and a killed MCP server stays a zombie until Codex
+    reaps it. It holds no descriptors, so it must not blind its siblings."""
+    _write_proc(fake_proc, 126, comm="python", ppid=APP, pgid=126, argv=["python"], state="Z")
+    real = mod.os.listdir
+
+    def _listdir(path):
+        if str(path).endswith("/126/fd"):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path)
+
+    monkeypatch.setattr(mod.os, "listdir", _listdir)
+    found = mod.scan()
+    assert [g.pgid for g in found.groups] == [101]
+    assert not found.uncertain
+    assert any(s.startswith("126 ") and "exited" in s for s in found.skipped)
+
+
+def test_a_zombie_leader_with_live_threads_still_blinds(fake_proc, monkeypatch):
+    """A process whose main thread exited while others run reads state Z with
+    more than one thread (MEASURED), and its other threads may hold pipes: it
+    is not exited, so its unreadable descriptors keep every sibling unproven."""
+    _write_proc(fake_proc, 128, comm="python", ppid=APP, pgid=128, argv=["python"], state="Z", threads=2)
+    real = mod.os.listdir
+
+    def _listdir(path):
+        if str(path).endswith("/128/fd"):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path)
+
+    monkeypatch.setattr(mod.os, "listdir", _listdir)
+    found = mod.scan()
+    assert found.groups == []
+    assert any("exclusivity unproven" in s for s in found.uncertain)
+
+
+def test_an_unreadable_live_sibling_still_blinds(fake_proc, monkeypatch):
+    """Control for the zombie case: the same EACCES on a running child keeps
+    every candidate unproven."""
+    _write_proc(fake_proc, 127, comm="python", ppid=APP, pgid=127, argv=["python"])
+    real = mod.os.listdir
+
+    def _listdir(path):
+        if str(path).endswith("/127/fd"):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path)
+
+    monkeypatch.setattr(mod.os, "listdir", _listdir)
+    found = mod.scan()
+    assert found.groups == []
+    assert any("exclusivity unproven" in s for s in found.uncertain)
 
 
 def test_a_sibling_that_exited_mid_scan_is_not_a_blind_sibling(fake_proc, monkeypatch):

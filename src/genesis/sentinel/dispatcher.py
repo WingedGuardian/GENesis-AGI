@@ -462,6 +462,10 @@ class SentinelDispatcher:
         # of the last _ALARM_RING_SIZE ticks before we even consider
         # dispatching. Prevents single-tick flaps from waking the Sentinel.
         self._recent_alarm_sets: deque[set[str]] = deque(maxlen=_ALARM_RING_SIZE)
+        # Same ticks, the ids whose reading was unknown (health's unknown-id
+        # channel). Never a dispatch trigger; for a pending approval they count
+        # as present, so a blind tick cannot read as "cleared".
+        self._recent_unknown_sets: deque[set[str]] = deque(maxlen=_ALARM_RING_SIZE)
 
         # Load dispatch approval policy — sentinel inherits from the global
         # manual_approval_required setting (no separate sentinel toggle).
@@ -555,14 +559,16 @@ class SentinelDispatcher:
 
         try:
             from genesis.mcp.health_mcp import _impl_health_alerts
-            alerts = await _impl_health_alerts(active_only=True)
+            unknown_ids: set[str] = set()
+            alerts = await _impl_health_alerts(active_only=True, unknown_ids=unknown_ids)
         except Exception:
             logger.warning("Re-verification failed — proceeding with dispatch", exc_info=True)
             return True  # Fail-open
 
         current_alarms = classify_alerts(alerts or [], available_tools())
         current_ids = {a.alert_id for a in current_alarms}
-        overlap = original_ids & current_ids
+        # An alarm whose reading is unknown this tick has not cleared.
+        overlap = original_ids & (current_ids | unknown_ids)
 
         if overlap:
             logger.info(
@@ -2109,7 +2115,8 @@ class SentinelDispatcher:
 
         try:
             from genesis.mcp.health_mcp import _impl_health_alerts
-            alerts = await _impl_health_alerts(active_only=True)
+            unknown_ids: set[str] = set()
+            alerts = await _impl_health_alerts(active_only=True, unknown_ids=unknown_ids)
         except Exception:
             logger.debug("Failed to query health alerts for fire alarm check", exc_info=True)
             return None
@@ -2126,6 +2133,7 @@ class SentinelDispatcher:
         # Update the ring buffer with this tick's alarm ids (always — even
         # if empty, an empty set is data that confirms absence).
         self._recent_alarm_sets.append(current_ids)
+        self._recent_unknown_sets.append(set(unknown_ids))
 
         # Lock-starvation guard. dispatch() and resume_from_approval() hold
         # self._lock for the whole of an ACTIVE CC remediation (up to timeout_s,
@@ -2181,16 +2189,21 @@ class SentinelDispatcher:
             alarm_backed = bool(pending_ids) and not pattern.startswith("direct:")
 
             request_id = self._state.pending_request_id
-            absent = bool(pending_ids) and not (pending_ids & current_ids)
+            # An unknown reading is not an absence: it must reach the branch
+            # below, where a stronger alarm can still take the park over.
+            absent = bool(pending_ids) and not (pending_ids & (current_ids | unknown_ids))
             # Clear-side hysteresis, derived rather than counted: the ring buffer
             # already holds this and the previous ticks' alarm ids (appended above,
             # including on lock-busy ticks). An empty or short ring (e.g. just
             # after a restart) keeps the park, so a restart can only delay a
             # cancel, never cause an early one.
             recent = list(self._recent_alarm_sets)[-_ALARM_CLEAR_TICKS:]
+            recent_unknown = list(self._recent_unknown_sets)[-len(recent):] if recent else []
+            # Both rings grow on the same ticks; aligned from the newest end.
+            recent_unknown = [set()] * (len(recent) - len(recent_unknown)) + recent_unknown
             cleared = (
                 len(recent) == _ALARM_CLEAR_TICKS
-                and all(not (pending_ids & ids) for ids in recent)
+                and all(not (pending_ids & (ids | unknown)) for ids, unknown in zip(recent, recent_unknown, strict=True))
             )
             if absent and alarm_backed and not cleared:
                 logger.info(

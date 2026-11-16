@@ -1453,11 +1453,18 @@ class TestAlarmClearedHysteresis:
         return d, gate
 
     async def _ticks(self, d, sequence):
+        """Each tick: True (firing), False (absent) or "unknown" (absent, but in
+        the read path's unknown-id channel)."""
         on = [{"id": self._ALARM, "severity": "CRITICAL", "message": "mem"}]
-        calls = [on if present else [] for present in sequence]
+        calls = list(sequence)
 
         async def _alerts(*args, **kwargs):
-            return calls.pop(0)
+            tick = calls.pop(0)
+            if tick == "unknown":
+                if kwargs.get("unknown_ids") is not None:
+                    kwargs["unknown_ids"].add(self._ALARM)
+                return []
+            return on if tick else []
 
         with patch("genesis.mcp.health_mcp._impl_health_alerts", new=_alerts), \
              patch("genesis.sentinel.dispatcher.write_last_run"), \
@@ -1522,6 +1529,29 @@ class TestAlarmClearedHysteresis:
         assert d._state.state == SentinelState.AWAITING_DISPATCH_APPROVAL
         gate.resolve_request.assert_not_awaited()
         await self._ticks(d, [False])
+        assert d._state.state == SentinelState.HEALTHY
+        gate.resolve_request.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unknown_ticks_never_cancel_the_park(self):
+        """A blind reading (an unreadable scan, a restart) is not a clearance."""
+        d, gate = self._parked()
+        await self._ticks(d, ["unknown", "unknown", "unknown"])
+        assert d._state.state == SentinelState.AWAITING_DISPATCH_APPROVAL
+        gate.resolve_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_tick_breaks_the_absent_streak(self):
+        d, gate = self._parked()
+        await self._ticks(d, [False, "unknown", False])
+        assert d._state.state == SentinelState.AWAITING_DISPATCH_APPROVAL
+        gate.resolve_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_two_absent_ticks_after_an_unknown_one_still_cancel(self):
+        """Control: once readings are definite again, the hysteresis applies."""
+        d, gate = self._parked()
+        await self._ticks(d, ["unknown", False, False])
         assert d._state.state == SentinelState.HEALTHY
         gate.resolve_request.assert_awaited_once()
 
@@ -1959,8 +1989,10 @@ class TestTriggeringTierPark:
             alarms=[_alarm(2), _alarm(3)],
         )
 
-    async def _re_verify(self, d, req, classified):
+    async def _re_verify(self, d, req, classified, unknown=()):
         async def _alerts(*args, **kwargs):
+            if kwargs.get("unknown_ids") is not None:
+                kwargs["unknown_ids"].update(unknown)
             return []
 
         with patch("genesis.mcp.health_mcp._impl_health_alerts", new=_alerts), \
@@ -1975,6 +2007,14 @@ class TestTriggeringTierPark:
     @pytest.mark.asyncio
     async def test_re_verify_triggering_active_returns_true(self):
         assert await self._re_verify(_make_dispatcher(), self._request(), [2]) is True
+
+    @pytest.mark.asyncio
+    async def test_re_verify_counts_an_unknown_triggering_alarm_as_active(self):
+        """A reading the health layer could not take is not a clearance: the
+        approved action must not be dropped as stale on a blind tick."""
+        req = self._request()
+        assert await self._re_verify(_make_dispatcher(), req, [], unknown={"test:tier2"}) is True
+        assert await self._re_verify(_make_dispatcher(), req, []) is False  # control
 
     @pytest.mark.asyncio
     async def test_re_verify_request_tier_none_uses_all_ids(self):
@@ -2283,10 +2323,13 @@ class TestCodexMcpHeldPark:
     def _parked_states():
         return {SentinelState.AWAITING_ACTION_APPROVAL, SentinelState.AWAITING_DISPATCH_APPROVAL}
 
-    async def _ticks(self, d, per_tick):
+    async def _ticks(self, d, per_tick, unknown=()):
+        """``unknown``: ids the read path reports as unknown on every tick."""
         calls = [list(t) for t in per_tick]
 
         async def _alerts(*args, **kwargs):
+            if kwargs.get("unknown_ids") is not None:
+                kwargs["unknown_ids"].update(unknown)
             return calls.pop(0)
 
         with patch("genesis.mcp.health_mcp._impl_health_alerts", new=_alerts), \
@@ -2323,6 +2366,18 @@ class TestCodexMcpHeldPark:
         request = d.dispatch.await_args.args[0]
         assert request.tier == 1
         assert "service:genesis_down" in {a.alert_id for a in request.alarms}
+
+    @pytest.mark.asyncio
+    async def test_confirmed_outage_takes_over_a_park_whose_alarm_reads_unknown(self):
+        """Audit: an unknown reading of the parked alarm is not an absence. It
+        must still reach the take-over, or a blind scan would hold an outage
+        behind a warning park for as long as the scan stays blind."""
+        d, gate = self._parked([self._HELD])
+        await self._ticks(d, [[self._DOWN], [self._DOWN]], unknown={"infra:codex_mcp_held"})
+        gate.resolve_request.assert_awaited_once_with(
+            "req-held", decision="cancelled", resolved_by="superseded",
+        )
+        assert d.seen_states[-1] == SentinelState.HEALTHY
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

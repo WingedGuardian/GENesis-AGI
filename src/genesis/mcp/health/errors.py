@@ -229,9 +229,16 @@ _memory_culprits: str | None = None
 # what counts, so the alarm and the remedy cannot disagree. One /proc pass per
 # minute at most: ``_compute_alerts`` runs on every tick and every dashboard poll.
 _CODEX_MCP_TTL_S = 60.0
-_codex_mcp_cache: tuple[float, tuple[int, int] | None] | None = None  # (monotonic, (groups, MB))
+# (monotonic, reading). A reading is (groups, MB, complete), or None when the
+# scan raised. Only the latest reading is kept: an incomplete one is reported
+# as UNKNOWN, never replaced by an older figure.
+_codex_mcp_cache: tuple[float, tuple[int, int, bool] | None] | None = None
 _codex_mcp_blind_logged_at: float | None = None
 _codex_mcp_refresh_lock = None  # asyncio.Lock, made on first use: one scan at a time
+# The alarm's third state: the scan could not say whether the groups are held.
+# `_compute_alerts` reports it through the unknown-id channel, so neither the
+# durable alert row nor the Sentinel's pending approval reads it as cleared.
+CODEX_MCP_UNKNOWN = "unknown"
 
 
 def _codex_mcp_scan():
@@ -241,19 +248,21 @@ def _codex_mcp_scan():
     return codex_mcp_stop.scan()
 
 
-async def _codex_mcp_held() -> tuple[int, int, int] | None:
-    """(group count, held MB, threshold MB) when the alarm should fire, else None.
+async def _codex_mcp_held() -> tuple[int, int, int] | str | None:
+    """(group count, held MB, threshold MB) when the alarm should fire;
+    ``CODEX_MCP_UNKNOWN`` when the scan cannot tell; else None.
 
-    Never raises. A scan that raises, or one that finds an app-server whose
-    children it cannot classify while finding no group, logs at ERROR at most
-    once an hour: either would leave the alarm silently dark.
+    What it could read is a lower bound: past the threshold it fires even if
+    something else was unreadable. Below it, an incomplete scan (one that
+    raised, or left a candidate unclassified) is unknown, not clear. Never
+    raises; a blind scan logs at ERROR at most once an hour.
     """
     import asyncio
     import time
 
     from genesis.sentinel import codex_mcp_stop
 
-    global _codex_mcp_cache, _codex_mcp_blind_logged_at, _codex_mcp_refresh_lock  # noqa: PLW0603
+    global _codex_mcp_refresh_lock  # noqa: PLW0603
     if codex_mcp_stop.load_mode() == codex_mcp_stop.MODE_OFF:
         return None
     threshold = codex_mcp_stop.load_propose_at_mb()
@@ -267,40 +276,42 @@ async def _codex_mcp_held() -> tuple[int, int, int] | None:
         now = time.monotonic()
         if _codex_mcp_cache is None or now - _codex_mcp_cache[0] >= _CODEX_MCP_TTL_S:
             await _refresh_codex_mcp_cache(now)
-    held = _codex_mcp_cache[1] if _codex_mcp_cache is not None else None
-    if held is None or held[0] == 0 or held[1] < threshold:
-        return None
-    return held[0], held[1], threshold
+    reading = _codex_mcp_cache[1] if _codex_mcp_cache is not None else None
+    if reading is None:
+        return CODEX_MCP_UNKNOWN
+    groups, held_mb, complete = reading
+    if groups and held_mb >= threshold:
+        return groups, held_mb, threshold
+    return None if complete else CODEX_MCP_UNKNOWN
 
 
 async def _refresh_codex_mcp_cache(now: float) -> None:
     import asyncio
 
     global _codex_mcp_cache, _codex_mcp_blind_logged_at  # noqa: PLW0603
-    # A failed scan keeps the last observation: a read error is no evidence the
-    # groups are gone, and dropping the alarm would read as cleared to the
-    # Sentinel's re-verification of a pending approval.
-    held = _codex_mcp_cache[1] if _codex_mcp_cache is not None else None
+    reading: tuple[int, int, bool] | None
     try:
         scan = await asyncio.to_thread(_codex_mcp_scan)
     except Exception:
-        scan = None
+        reading = None
         if _codex_mcp_blind_logged_at is None or now - _codex_mcp_blind_logged_at >= 3600:
             _codex_mcp_blind_logged_at = now
             logger.error("codex_mcp_held: the stop tool's scan raised; the alarm is blind", exc_info=True)
-    if scan is not None and scan.app_servers and scan.uncertain and not scan.groups:
-        # Nothing classified and something unreadable is no reading at all:
-        # keep the last observation, as for a raise.
-        if _codex_mcp_blind_logged_at is None or now - _codex_mcp_blind_logged_at >= 3600:
+    else:
+        complete = not scan.uncertain
+        reading = (len(scan.groups), sum(g.rss_kb for g in scan.groups) // 1024, complete)
+        if not complete and (
+            _codex_mcp_blind_logged_at is None or now - _codex_mcp_blind_logged_at >= 3600
+        ):
+            # Below the threshold this reads unknown, with no alert to show it.
             _codex_mcp_blind_logged_at = now
             logger.error(
-                "codex_mcp_held: %d app-server child(ren) could not be classified and no MCP group "
-                "was found; the alarm may be blind in this process",
+                "codex_mcp_held: %d app-server child(ren) could not be classified (%d MCP group(s) "
+                "read); the alarm may be blind in this process, unknown below the threshold",
                 len(scan.uncertain),
+                len(scan.groups),
             )
-    elif scan is not None:
-        held = (len(scan.groups), sum(g.rss_kb for g in scan.groups) // 1024)
-    _codex_mcp_cache = (now, held)
+    _codex_mcp_cache = (now, reading)
 
 
 async def _memory_breakdown_line() -> str:
@@ -545,6 +556,9 @@ async def _compute_alerts(
                 "message": "HealthDataService not initialized",
             }
         )
+        if queue_unknown_ids is not None:
+            # Never computed on this path: unknown, not cleared.
+            queue_unknown_ids.add("infra:codex_mcp_held")
         return alerts, current_ids
 
     snap = await _service.snapshot()
@@ -780,7 +794,12 @@ async def _compute_alerts(
         _memory_culprits = None
 
     codex_held = await _codex_mcp_held()
-    if codex_held is not None:
+    if codex_held == CODEX_MCP_UNKNOWN:
+        # Not firing, not cleared: a durable row stays open and a pending
+        # Sentinel approval stays parked (the unknown-id channel).
+        if queue_unknown_ids is not None:
+            queue_unknown_ids.add("infra:codex_mcp_held")
+    elif codex_held is not None:
         groups, held_mb, threshold_mb = codex_held
         alert_id = "infra:codex_mcp_held"
         alerts.append(
@@ -1611,18 +1630,26 @@ async def _compute_alerts(
     return alerts, current_ids
 
 
-async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
+async def _impl_health_alerts(
+    active_only: bool = True, *, unknown_ids: set[str] | None = None
+) -> list[dict]:
     """Live alert list + the in-memory one-generation resolved rendering.
 
     Read path — contract unchanged for all existing callers (sentinel, morning
     report, dashboard, the health_alerts MCP tool). Durable persistence is NOT
     done here (that would multi-write across the runtime + health-MCP processes);
     it lives in the single awareness-tick ``alert_events`` writer (WS-2 M10).
+
+    ``unknown_ids``, when given, is filled with the ids whose reading this call
+    could not take: absent from the list, but not cleared either.
     """
     import genesis.mcp.health_mcp as health_mcp_mod
 
     queue_unknown_ids: set[str] = set()
     alerts, current_ids = await _compute_alerts(queue_unknown_ids=queue_unknown_ids)
+    if unknown_ids is not None:
+        unknown_ids.clear()
+        unknown_ids.update(queue_unknown_ids)
     _alert_history = health_mcp_mod._alert_history
     retained = {aid: stamp for aid, stamp in _alert_history.items() if aid in queue_unknown_ids}
 

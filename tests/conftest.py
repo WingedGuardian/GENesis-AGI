@@ -779,7 +779,11 @@ def _reset_memory_alarm_breakdown():
     mp.setattr(errors, "_memory_culprits", None)
     # The codex_mcp_held alarm's scan reads the real /proc; tests that exercise
     # it install their own scan. Its 60 s cache and blind-log stamp reset too.
-    mp.setattr(errors, "_codex_mcp_scan", lambda: None)
+    # An empty Scan, as the real scan returns on a box with no app-server: a
+    # complete reading that nothing is held (None is not a value scan returns).
+    from genesis.sentinel.codex_mcp_stop import Scan as _EmptyScan
+
+    mp.setattr(errors, "_codex_mcp_scan", _EmptyScan)
     mp.setattr(errors, "_codex_mcp_cache", None)
     mp.setattr(errors, "_codex_mcp_blind_logged_at", None)
     mp.setattr(errors, "_codex_mcp_refresh_lock", None)
