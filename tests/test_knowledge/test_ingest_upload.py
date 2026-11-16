@@ -161,7 +161,9 @@ async def test_store_as_is_scans_and_logs_injection(tmp_path, caplog):
 
     with patch("genesis.mcp.memory_mcp._require_init"), \
          patch("genesis.mcp.memory_mcp._store", mock_store), \
-         patch("genesis.mcp.memory_mcp._db", MagicMock()), \
+         patch("genesis.mcp.memory_mcp._db", MagicMock(
+             execute_fetchall=AsyncMock(return_value=[(0, "main", "")]),
+         )), \
          patch("genesis.db.crud.knowledge.insert", new_callable=AsyncMock), \
          caplog.at_level(logging.WARNING):
         unit_ids = await _store_as_is(
@@ -189,7 +191,9 @@ async def test_store_as_is_scan_failure_is_fail_open(tmp_path):
                side_effect=RuntimeError("boom")), \
          patch("genesis.mcp.memory_mcp._require_init"), \
          patch("genesis.mcp.memory_mcp._store", mock_store), \
-         patch("genesis.mcp.memory_mcp._db", MagicMock()), \
+         patch("genesis.mcp.memory_mcp._db", MagicMock(
+             execute_fetchall=AsyncMock(return_value=[(0, "main", "")]),
+         )), \
          patch("genesis.db.crud.knowledge.insert", new_callable=AsyncMock):
         unit_ids = await _store_as_is(
             str(f), "doc.txt",

@@ -99,6 +99,7 @@ GH_CALLERS = {
     "_pr_changed_files_uncached": "api pulls/N/files --paginate",
     "_pr_commit_rows": "api pulls/N/commits",
     "_commit_at_prefix": "api commits/<sha>",
+    "_commit_info": "api commits/<sha> (the no-change note)",
     "_commit_touched_files": "api commits/<sha> --paginate",
     "_classify_post_review_delta": "api compare/<a>...<b>",
     "_pr_contribution": "api compare/<a>...<b>",

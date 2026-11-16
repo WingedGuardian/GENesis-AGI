@@ -41,6 +41,7 @@ MODULES = (
     ("legacy", "_genesis_index_marker_legacy", "scripts/lib/index_marker_legacy.py"),
     ("recovery", "_genesis_index_marker_recovery", "scripts/lib/index_marker_recovery.py"),
     ("legs", "_genesis_index_marker_legs", "scripts/lib/index_marker_legs.py"),
+    ("retry", "_genesis_index_marker_retry", "scripts/lib/index_marker_retry.py"),
     ("native", "_genesis_index_marker_execution", "scripts/lib/index_marker_execution.py"),
     ("cli", "_genesis_index_marker_cli", "scripts/lib/index_marker_cli.py"),
     ("queue", "_genesis_index_marker", "scripts/lib/index_marker.py"),

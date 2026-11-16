@@ -29,6 +29,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -48,6 +49,34 @@ def _no_live_registry(monkeypatch):
     """Keep the peer renderer off the machine's real session registry (a dev box
     has one and CI does not); the widest-block test sets its own suffix."""
     monkeypatch.setattr(pmh, "_peer_addresses", lambda *a, **k: {})
+
+
+@pytest.fixture
+def recall_db(tmp_path, monkeypatch):
+    """Keep the real hook migration and all its connects on an owned database."""
+    db_path = tmp_path / "hook.db"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("CREATE TABLE knowledge_units (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    home = tmp_path / "hook-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(pmh, "_DB_PATH", db_path)
+    connect = pmh._sqlite_connect
+    targets = []
+
+    def owned_connect(target, *args, **kwargs):
+        assert Path(target) == db_path
+        targets.append(Path(target))
+        return connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(pmh, "_sqlite_connect", owned_connect)
+    yield db_path
+    assert targets, "fixture never exercised a real SQLite connection"
+    assert (home / ".genesis/.knowledge_retrieved_count_migrated").exists()
+    with closing(sqlite3.connect(db_path)) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(knowledge_units)")}
+    assert "retrieved_count" in columns
 
 
 # ---------------------------------------------------------------------------
@@ -781,7 +810,7 @@ def test_the_call_that_trips_the_cut_still_counts_as_delivered() -> None:
     assert out.cut is not None, "fixture did not actually trip a cut"
 
 
-def test_a_cut_during_recall_does_not_mark_unseen_rows_surfaced(monkeypatch) -> None:
+def test_a_cut_during_recall_does_not_mark_unseen_rows_surfaced(monkeypatch, recall_db) -> None:
     """The server path, end to end through `_run`.
 
     `lines` and `results` are parallel views of the same hits but nothing
@@ -829,7 +858,6 @@ def test_a_cut_during_recall_does_not_mark_unseen_rows_surfaced(monkeypatch) -> 
         monkeypatch.setattr(pmh, name, lambda *a, **k: None)
     monkeypatch.setattr(pmh, "_load_recent_files", lambda *a, **k: [])
     monkeypatch.setattr(pmh, "_compute_suppress_ids", lambda *a, **k: [])
-    monkeypatch.setattr(pmh, "_DB_PATH", Path(__file__))  # only existence is checked
 
     import asyncio
 
@@ -843,7 +871,7 @@ def test_a_cut_during_recall_does_not_mark_unseen_rows_surfaced(monkeypatch) -> 
     )
 
 
-def test_the_degraded_path_records_nothing_when_its_blob_is_dropped(monkeypatch) -> None:
+def test_the_degraded_path_records_nothing_when_its_blob_is_dropped(monkeypatch, recall_db) -> None:
     """The second bookkeeping site, and the unambiguous one.
 
     `_format_degraded` renders the whole result set as ONE blob, so if that
@@ -891,7 +919,6 @@ def test_the_degraded_path_records_nothing_when_its_blob_is_dropped(monkeypatch)
         monkeypatch.setattr(pmh, name, lambda *a, **k: None)
     monkeypatch.setattr(pmh, "_load_recent_files", lambda *a, **k: [])
     monkeypatch.setattr(pmh, "_compute_suppress_ids", lambda *a, **k: [])
-    monkeypatch.setattr(pmh, "_DB_PATH", Path(__file__))
 
     # Close the writer BEFORE _run reaches the degraded emit.
     pmh._writer().emit("x" * (pmh.DEFAULT_BUDGET * 2), block="server-recall")

@@ -43,7 +43,7 @@ def health(monkeypatch):
     monkeypatch.setattr(codex_mcp_stop, "load_propose_at_mb", lambda path=None: 4096)
     calls = []
 
-    def set_scan(groups_mb, *, app_servers=(1,), uncertain=(), raises=False):
+    def set_scan(groups_mb, *, app_servers=(1,), uncertain=(), raises=False, reset_cache=True):
         def fake():
             calls.append(1)
             if raises:
@@ -58,7 +58,8 @@ def health(monkeypatch):
             )
 
         monkeypatch.setattr(errors, "_codex_mcp_scan", fake)
-        monkeypatch.setattr(errors, "_codex_mcp_cache", None)
+        if reset_cache:
+            monkeypatch.setattr(errors, "_codex_mcp_cache", None)
 
     return set_scan, calls
 
@@ -136,30 +137,118 @@ async def test_a_raising_scan_logs_once_and_emits_nothing(health, caplog, monkey
     assert caplog.text.count("scan raised") == 1
 
 
-@pytest.mark.asyncio
-async def test_a_failed_refresh_keeps_the_last_observation(health, monkeypatch):
-    """A read error is no evidence the groups are gone: dropping the alarm would
-    read as cleared to the Sentinel's re-verification of a pending approval."""
-    set_scan, _ = health
-    set_scan([5000])
-    assert await _alarm() is not None
-    stamp, held = errors._codex_mcp_cache
-    set_scan([], raises=True)
-    monkeypatch.setattr(errors, "_codex_mcp_cache", (stamp - errors._CODEX_MCP_TTL_S, held))
-    assert await _alarm() is not None
+async def _state() -> str:
+    """'firing', 'unknown' (absent but in the unknown-id channel) or 'clear'."""
+    unknown: set[str] = set()
+    alerts, ids = await errors._compute_alerts(queue_unknown_ids=unknown)
+    if _ALARM in ids:
+        assert any(a["id"] == _ALARM for a in alerts)
+        return "firing"
+    return "unknown" if _ALARM in unknown else "clear"
+
+
+def _expire(monkeypatch):
+    stamp, reading = errors._codex_mcp_cache
+    monkeypatch.setattr(errors, "_codex_mcp_cache", (stamp - errors._CODEX_MCP_TTL_S, reading))
 
 
 @pytest.mark.asyncio
-async def test_an_all_uncertain_refresh_keeps_the_last_observation(health, monkeypatch):
-    """Architect class audit: a scan that classified nothing because children
-    were unreadable is no reading, so the alarm must not read as cleared."""
+async def test_a_failed_refresh_reads_unknown_not_cleared(health, monkeypatch):
+    """A read error is no evidence the groups are gone: the alarm is unknown,
+    so neither the durable row nor a pending approval reads it as cleared."""
     set_scan, _ = health
     set_scan([5000])
-    assert await _alarm() is not None
-    stamp, held = errors._codex_mcp_cache
-    set_scan([], uncertain=["777 python (descriptors unreadable)"])
-    monkeypatch.setattr(errors, "_codex_mcp_cache", (stamp - errors._CODEX_MCP_TTL_S, held))
-    assert await _alarm() is not None
+    assert await _state() == "firing"
+    _expire(monkeypatch)
+    set_scan([], raises=True, reset_cache=False)
+    assert await _state() == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_an_all_uncertain_refresh_reads_unknown(health, monkeypatch):
+    set_scan, _ = health
+    set_scan([5000])
+    assert await _state() == "firing"
+    _expire(monkeypatch)
+    set_scan([], uncertain=["777 python (descriptors unreadable)"], reset_cache=False)
+    assert await _state() == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_a_blind_first_scan_after_a_restart_is_unknown(health):
+    """Audit F3: no earlier reading in this process, and the first scan is
+    blind. That must not read as cleared."""
+    set_scan, _ = health
+    set_scan([], uncertain=["101 python (descriptors unreadable)"])
+    assert await _state() == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_a_partial_refresh_below_the_threshold_is_unknown(health, monkeypatch):
+    """Two app-servers, one now unreadable: the readable one's small group is a
+    lower bound, not evidence the other's memory was released."""
+    set_scan, _ = health
+    set_scan([5000], app_servers=(1, 2))
+    assert await _state() == "firing"
+    _expire(monkeypatch)
+    set_scan(
+        [512],
+        app_servers=(1, 2),
+        uncertain=["app-server 2 (descriptors unreadable)"],
+        reset_cache=False,
+    )
+    assert await _state() == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_a_partial_refresh_past_the_threshold_fires(health):
+    """A lower bound past the threshold is proof on its own."""
+    set_scan, _ = health
+    set_scan([5000], app_servers=(1, 2), uncertain=["app-server 2 (descriptors unreadable)"])
+    assert await _state() == "firing"
+
+
+@pytest.mark.asyncio
+async def test_no_old_figure_outlives_a_complete_reading(health, monkeypatch):
+    """Audit F2: nothing is retained. Unknown for as long as the scan is
+    partial, then the first complete reading decides, here a clear one."""
+    set_scan, _ = health
+    set_scan([5000], app_servers=(1, 2))
+    assert await _state() == "firing"
+    for _ in range(3):
+        _expire(monkeypatch)
+        set_scan(
+            [100],
+            app_servers=(1, 2),
+            uncertain=["app-server 2 (descriptors unreadable)"],
+            reset_cache=False,
+        )
+        assert await _state() == "unknown"
+    _expire(monkeypatch)
+    set_scan([100], app_servers=(1, 2), reset_cache=False)
+    assert await _state() == "clear"
+
+
+@pytest.mark.asyncio
+async def test_a_complete_refresh_below_the_threshold_clears(health, monkeypatch):
+    """Control: with nothing unreadable, a lower reading is a real clearance."""
+    set_scan, _ = health
+    set_scan([5000])
+    assert await _state() == "firing"
+    _expire(monkeypatch)
+    set_scan([512], reset_cache=False)
+    assert await _state() == "clear"
+
+
+@pytest.mark.asyncio
+async def test_the_read_path_reports_the_unknown_id(health):
+    """The Sentinel reads `_impl_health_alerts`: the unknown id must reach it."""
+    set_scan, _ = health
+    set_scan([], uncertain=["101 python (descriptors unreadable)"])
+    unknown: set[str] = set()
+    alerts = await errors._impl_health_alerts(active_only=True, unknown_ids=unknown)
+    assert _ALARM in unknown
+    assert not any(a["id"] == _ALARM for a in alerts)
 
 
 @pytest.mark.asyncio

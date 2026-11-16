@@ -252,6 +252,25 @@ line keeps its meaning: the check to run AFTER the merge. For a hook that is sti
 needed, because a pre-PR run tests the worktree copy, not the merged copy the
 harness fires.
 
+**Work built from a spec converges against it before the PR.** Run the pass in
+`.claude/skills/spec-session/references/spec-converge.md`:
+- the spec, its plan and its tickets are the only statement of intent;
+- a checked box, a closed row or a "done" bullet is not evidence that the work
+  was done;
+- each gap is missing, partial, contradicts or unrequested;
+- its only write is appending items to your plan file, each traced to the spec
+  line it comes from;
+- when nothing remains it changes nothing.
+
+Do the items and run it again until it converges. Something the spec asked
+for may be left unbuilt only on the owner's recorded decision (a change to the
+spec, never your own call), and a standing-rule contradiction only under the
+owner's recorded exception; the contract's "carried" rules say how. Put the report's `Outcome:` line in the PR
+body under `## Testing`. This applies to any build from a spec, whether or not
+its effect can be shown on this install. The review-time check is different: the
+architect's Step 0.5 compares the diff with the plan and stays informational,
+and it does not replace this pass.
+
 **Which copy actually ran is the whole question. Check it; never assume it.**
 - A hook guard run as `python3 <worktree>/scripts/hooks/<guard>.py`, with a real
   payload on stdin, runs the branch's copy of that file. The harness, and the
