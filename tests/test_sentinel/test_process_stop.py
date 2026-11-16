@@ -30,12 +30,17 @@ def _w(
     cgroup="/user.slice/user-1000.slice/session-1.scope",
     starttime=None,
     status=True,
+    threads=1,
+    flags=0,
 ):
     d = root / str(pid)
     d.mkdir()
+    middle = ["0"] * 16
+    middle[6 - 3] = str(flags)  # flags is field 9, index 6 after ')'
+    middle[17 - 3] = str(threads)  # num_threads is field 20, index 17 after ')'
     after = (
         ["S" if state is None else state, str(ppid), str(pid)]
-        + ["0"] * 16
+        + middle
         + [str(starttime or pid * 10)]
     )
     (d / "stat").write_text(f"{pid} ({comm}) " + " ".join(after) + "\n")
@@ -72,8 +77,10 @@ def fake_proc(tmp_path, monkeypatch):
         cgroup="/user.slice/user-1000.slice/user@1000.service/app.slice/genesis-server.service",
     )
     _w(root, 202, comm="small", argv=("small",), rss_kb=1 * GB)
-    _w(root, 203, comm="zomb", argv=("zomb",), rss_kb=8 * GB, state="Z")
-    _w(root, 204, comm="kworker", argv=(), rss_kb=8 * GB)
+    _w(root, 203, comm="zomb", argv=(), state="Z", status=False)
+    (root / "203" / "status").write_text("Name:\tzomb\n")  # an exited process: no Vm lines
+    _w(root, 204, comm="kworker", argv=(), flags=0x00200000, status=False)  # PF_KTHREAD
+    (root / "204" / "status").write_text("Name:\tkworker\nKthread:\t1\n")  # no Vm lines
     return root
 
 
@@ -199,6 +206,40 @@ def test_alive_checks_identity_and_zombies(fake_proc):
     assert mod._alive(200, 1) is False  # different start time: a reused pid
     assert mod._alive(203, 2030) is False  # zombie
     assert mod._alive(999, 1) is False
+
+
+def _zombie_leader(root, pid, *, live_rss_kb, threads=2):
+    """What the kernel shows for a leader that exited while another thread runs
+    (MEASURED): stat state Z with the thread count, an empty cmdline, a status
+    with no Vm lines, and the memory in the live task's own status."""
+    _w(root, pid, comm="codex", argv=(), state="Z", threads=threads, status=False)
+    (root / str(pid) / "status").write_text("Name:\tcodex\nKthread:\t0\n")
+    task = root / str(pid) / "task"
+    (task / str(pid)).mkdir(parents=True)
+    (task / str(pid) / "status").write_text("Name:\tcodex\nState:\tZ (zombie)\n")
+    (task / str(pid + 1)).mkdir()
+    (task / str(pid + 1) / "status").write_text(f"Name:\tcodex\nState:\tS (sleeping)\nVmRSS:\t{live_rss_kb} kB\n")
+
+
+def test_a_zombie_leader_with_live_threads_is_a_target(fake_proc):
+    """Its threads still hold the memory, so the scan (and the alarm) count it,
+    reading the figure from the live task and naming it by its comm."""
+    _zombie_leader(fake_proc, 232, live_rss_kb=9 * GB)
+    found = mod.scan(6144, self_pid=SELF)
+    targets = {t.pid: t for t in found.targets}
+    assert 232 in targets and targets[232].held_kb == 9 * GB
+    assert "codex" in targets[232].label
+    assert 203 not in targets  # control: a plain zombie is not
+
+
+def test_a_zombie_leader_with_live_threads_is_still_alive(fake_proc):
+    """Codex review: a leader that exited while other threads run reads Z with
+    more than one thread; its memory is still held, so it is not stopped (and
+    SIGKILL must still go out)."""
+    _zombie_leader(fake_proc, 230, live_rss_kb=9 * GB, threads=3)
+    assert mod._alive(230, 2300) is True
+    _w(fake_proc, 236, comm="codex", argv=("codex",), state="Z", threads=1)
+    assert mod._alive(236, 2360) is False  # control: the last thread is gone
 
 
 # --- lever and threshold ---------------------------------------------------

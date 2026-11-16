@@ -157,27 +157,6 @@ def load_propose_at_mb(path: Path | None = None) -> int | None:
     return value
 
 
-def _held_kb(pid: int) -> int | None:
-    """VmRSS + VmSwap in kB; None when the process is gone or the file does not
-    parse. A kernel thread has neither line and reads as 0. Any other read error
-    (EACCES, EIO) raises, so ``scan()`` records the pid as uncertain instead of
-    reading it as gone."""
-    try:
-        # Bytes, then a lenient decode: a process may name itself with any
-        # non-NUL bytes, and the Name: line would make a strict read raise.
-        text = (Path(proc_io._PROC) / str(pid) / "status").read_bytes().decode("utf-8", "replace")
-    except (FileNotFoundError, ProcessLookupError):
-        return None
-    total = 0
-    try:
-        for line in text.splitlines():
-            if line.startswith(("VmRSS:", "VmSwap:")):
-                total += int(line.split()[1])
-    except (ValueError, IndexError):
-        return None
-    return total
-
-
 def _service_cgroup(pid: int) -> bool | None:
     """True when any component of the pid's cgroup path is a systemd service
     other than the user manager (``user@<uid>.service``, which holds every user
@@ -233,17 +212,29 @@ def scan(threshold_mb: int, *, self_pid: int | None = None) -> Scan:
 def _classify(pid: int, threshold_kb: int, result: Scan) -> Target | None:
     """The pid as a Target, None when it is not one (an unreadable candidate
     is recorded in ``result.uncertain``)."""
-    held = _held_kb(pid)
-    if held is None or held < threshold_kb:
-        return None  # cheap filter first: only big processes are read further
-    st = proc_io.read_stat(pid)
-    argv = _argv(pid)
-    label = f"{pid} {_safe_label(argv or [])}"
-    if st is None or argv is None:
-        result.mark_uncertain(pid, f"{label} (stat or cmdline unreadable)")
+    # Cheap filter first: only big processes are read further. The figure
+    # comes from a live task when the leader has exited (proc_io.held_kb).
+    held = proc_io.held_kb(pid)
+    if held == proc_io.GONE:
         return None
-    if st[1] == "Z" or not argv:
-        return None  # a zombie holds nothing; no argv is a kernel thread
+    if held == proc_io.UNREADABLE:
+        result.mark_uncertain(pid, f"{pid} (memory unreadable)")
+        return None
+    if held < threshold_kb:
+        return None
+    st = proc_io.probe_stat(pid)
+    if st == proc_io.GONE:
+        return None
+    argv = _argv(pid)
+    if st == proc_io.UNREADABLE or argv is None:
+        result.mark_uncertain(pid, f"{pid} {_safe_label(argv or [])} (stat or cmdline unreadable)")
+        return None
+    if st.exited or st.kernel_thread:
+        return None  # nothing held, or a kernel thread
+    # A leader that exited while its threads run has an empty cmdline: name it
+    # by its comm.
+    label_argv = argv or [st.comm]
+    label = f"{pid} {_safe_label(label_argv)}"
     owner = _same_uid(pid)
     if owner is None:
         result.mark_uncertain(pid, f"{label} (owner unreadable)")
@@ -259,8 +250,8 @@ def _classify(pid: int, threshold_kb: int, result: Scan) -> Target | None:
         return None  # a service (or the user manager): systemctl, never this tool
     return Target(
         pid=pid,
-        starttime=st[4],
-        label=_safe_label(argv),
+        starttime=st.starttime,
+        label=_safe_label(label_argv),
         held_kb=held,
         unit=_SAFE_LABEL.sub("_", unit)[:60],
     )
@@ -268,20 +259,16 @@ def _classify(pid: int, threshold_kb: int, result: Scan) -> Target | None:
 
 def _alive(pid: int, starttime: int) -> bool | None:
     """True while ``pid`` is still the process that started at ``starttime``;
-    False once it is gone, a zombie, or another process; None when its stat
-    cannot be read (EACCES, EIO), which is no evidence that it stopped."""
-    try:
-        stat = (Path(proc_io._PROC) / str(pid) / "stat").read_bytes().decode("utf-8", "replace")
-    except (FileNotFoundError, ProcessLookupError):
+    False once it is gone, a zombie with no thread left, or another process;
+    None when its stat cannot be read (EACCES, EIO), which is no evidence that
+    it stopped. A leader that exited while other threads run reads ``Z`` with
+    more than one thread: still alive, still holding its memory."""
+    st = proc_io.probe_stat(pid)
+    if st == proc_io.GONE:
         return False
-    except OSError:
+    if st == proc_io.UNREADABLE:
         return None
-    try:
-        after = stat[stat.rindex(")") + 2 :].split()
-        state, st = after[0], int(after[19])
-    except (ValueError, IndexError):
-        return None
-    return st == starttime and state != "Z"
+    return st.starttime == starttime and not st.exited
 
 
 def _pidfd_kill(pid: int, starttime: int, sig: int) -> None:
