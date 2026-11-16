@@ -118,6 +118,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 import uuid
 from collections.abc import Callable
@@ -341,6 +342,7 @@ def _pytest(
     where = tmp if tmp and os.path.isdir(tmp) else None  # a test may have removed it
     with tempfile.TemporaryFile(dir=where) as out, tempfile.TemporaryFile(dir=where) as err:
         proc = None
+        timed_out = False
         try:
             # Held: a raise between the child starting and this name being bound
             # would leave nothing that could kill it.
@@ -348,15 +350,35 @@ def _pytest(
                 proc = subprocess.Popen(
                     cmd, cwd=str(cwd), env=env, stdout=out, stderr=err, start_new_session=True
                 )
-            proc.wait(timeout=timeout)
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    status = os.waitid(
+                        os.P_PID,
+                        proc.pid,
+                        os.WEXITED | os.WNOWAIT | os.WNOHANG,
+                    )
+                except ChildProcessError:
+                    proc.wait(timeout=timeout)
+                    _kill_group(proc.pid)
+                    break
+                if status is not None and status.si_pid:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                time.sleep(min(0.05, remaining))
         except subprocess.TimeoutExpired:
+            timed_out = True
             _kill_group(proc.pid)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=10)
-            raise
+            raise subprocess.TimeoutExpired(cmd, timeout) from None
         finally:
             if proc is not None:
                 _kill_group(proc.pid)
+                if not timed_out and proc.returncode is None:
+                    proc.wait()
         return subprocess.CompletedProcess(
             cmd,
             proc.returncode,
