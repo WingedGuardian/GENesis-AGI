@@ -115,6 +115,10 @@ BASELINE: dict[tuple[str, str], tuple[int, str]] = {
     ("src/genesis/channels/stt.py", "provider"): (1, "Groq STT call site"),
     ("src/genesis/deliberation/backends/fusion.py", "provider"): (1, "OpenRouter fusion call site"),
     ("src/genesis/eval/longmemeval/client.py", "provider"): (1, "OpenRouter eval client"),
+    ("src/genesis/eval/qualification/native_expense.py", "provider"): (
+        1,
+        "native tariff origin identity constant; no request dispatch",
+    ),
     ("src/genesis/eval/qualification/pinned.py", "provider"): (
         3,
         "frozen eval transport, doc cites",
@@ -134,6 +138,10 @@ BASELINE: dict[tuple[str, str], tuple[int, str]] = {
     ("tests/test_cc/test_roster.py", "provider"): (1, "roster routing fixture"),
     ("tests/test_channels/test_discord_adapter.py", "egress"): (12, "adapter fixture literals"),
     ("tests/test_deliberation/test_deliberate.py", "provider"): (1, "deliberation fixtures"),
+    ("tests/test_eval/test_qualification_native_expenses.py", "provider"): (
+        1,
+        "synthetic native tariff endpoint fixture; no provider requests",
+    ),
     ("tests/test_hooks/test_behavioral_linter.py", "provider"): (37, "provider linter fixtures"),
     ("tests/test_hooks/test_inline_hooks.py", "provider"): (1, "inline-hook fixtures"),
     ("tests/test_hooks/test_secret_scrub.py", "egress"): (6, "scrub fixtures"),

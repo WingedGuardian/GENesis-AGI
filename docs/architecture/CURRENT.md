@@ -2773,8 +2773,13 @@ verified: 0aa0bf9f2 2026-11-10
   (`pool.py`) and **RAM** (`memory_watch.py`, E-rest) — the latter over two
   axes worst-of, container cgroup (via incus-exec, best-effort) + host-VM
   `/proc/meminfo` (the reliable axis). Both use the shared `_tier_for`/
-  `decide_alert` hysteresis. Read-only `disk-status`/`ram-status` verbs expose
-  the same measurement to the container.
+  `decide_alert` hysteresis; RAM adds flap damping on top: a per-axis exit
+  margin (`memory_tiers.exit_margin_pct`, default 5), a blind axis holding its
+  last tier (stale after one re-alert window, and named in the page), and a
+  baseline of the highest tier paged since the last recovery that lasts one
+  re-alert window (state `memory_alert_state.json`: `tier` = that peak,
+  `axes`, `blind_since`). Read-only `disk-status`/`ram-status` verbs expose
+  the same raw measurement to the container.
 - **Pool RELIEF** (`pool_relief.py`) runs every tick, BEFORE `_check_cycle`
   (during an outage's diagnosis that is about hourly, since the tick is a
   oneshot). The tiers above only alert, and a thin pool once filled to 100%
@@ -2872,11 +2877,26 @@ verified: 0aa0bf9f2 2026-11-10
   the Failure Inventory remedy for memory held by a shared Codex app-server
   daemon's MCP servers (#4302). Dry-run by default; `--execute` only inside an
   approved action. Resolves targets when it runs: direct children of a
-  `codex app-server --listen` process that lead their own process group with
-  pipe stdin+stdout, excluding Codex helper binaries, systemd-unit members and
+  `codex app-server --listen` process that lead their own process group and
+  read a pipe the app-server writes and write one it reads, on any descriptor,
+  that no other app-server child also holds
+  (matched by pipe identity and `fdinfo` access mode: the MCP Python SDK moves
+  the protocol off fd 0/1, so a stdin test missed every Genesis server),
+  excluding Codex helper binaries, systemd-unit members and
   anything under a `claude` process. Lever `codex_mcp_stop.mode` in
   `config/sentinel.yaml` (`propose_only` | `off`) +
-  `GENESIS_CODEX_MCP_STOP_DISABLED=1`.
+  `GENESIS_CODEX_MCP_STOP_DISABLED=1`. Proposed early by the health alarm
+  `infra:codex_mcp_held` (WARNING, tier 2 via `_TIER2_PATTERNS`), which fires
+  when that same `scan()` totals `codex_mcp_stop.propose_at_mb` (default 4096)
+  or more; the scan runs off-loop and is cached 60 s in `mcp/health/errors.py`.
+  Because that alarm does not clear by itself, `check_fire_alarms` lets a
+  confirmed alarm that is stronger by the classifier's order (tier, then
+  CRITICAL first) cancel (`resolved_by="superseded"`) a park whose triggering
+  alarms are all WARNING, but only when the alarm dispatch would lead with is
+  that challenger and passes backoff; a park with any CRITICAL trigger is never
+  taken over, and a cancel that fails keeps the park. The cancelled pattern
+  starts the 15-minute resolved cooldown. A declined dispatch or action is
+  quiet for 24 h through `handle_approval_resolution` (every pattern).
 - GROUNDWORK: guardian-cgroup, guardian-bidirectional, sentinel-live-autonomy.
 
 ## 9. Ambient cognition — heartbeat, reflection, attention
@@ -4637,6 +4657,18 @@ logger or unrelated exceptions with copied text and no provenance.
   `python -m genesis.trash list|restore`. Callers: cognitive rollback, the
   orphan task-worktree reset, and the dashboard's file-browser and memory-file
   deletes (`docs/reference/trash.md`). Stdlib only.
+- **Worktree reaper trash** (`scripts/worktree_lifecycle.py`, outside `src/`;
+  read at 26218b962, 2026-11-10): the daily hygiene run archives stale
+  worktrees into `~/.genesis/worktree-trash`. An entry has two forms: a
+  `<entry>.tar.gz` with a `<entry>.meta.json` sidecar and a locked, directory-less
+  registration (the anchor that keeps its commits reachable), or a compacted
+  `<entry>.compacted.json` stub whose head is pinned under `refs/archived/` and
+  carried in a `<entry>.compacted.bundle`; each compaction run re-pins a lost pin.
+  Nothing deletes or compacts on a schedule yet. `--expire-trash` (merged,
+  content-proven redundant: `worktree_redundancy.py`, #2504) and
+  `--compact-trash` (unmerged, every file equal to its head:
+  `worktree_compaction.py`) are manual, and #4160 tracks scheduling them.
+  `--recover` restores either form; a stub comes back detached at its pin.
 - **hostmetrics/**: stdlib-only resource readings (container cgroup memory and
   CPU, PSI, disks, and the host's headroom through the guardian gateway) and the
   `preflight`/`status` CLI that admits or refuses a heavy job against the
