@@ -64,7 +64,7 @@ _CASES = [
     ("manual_stale_cleanup", "unknown"),
     # unknown: a hypothetical future channel nobody registered
     ("app:button:99", "unknown"),
-    # unknown ON PURPOSE (board/launcher.py): a Build move on the work board is
+    # unknown ON PURPOSE (board/launcher/): a Build move on the work board is
     # the owner's approval by ruling, but nothing attests WHO moved the card, so
     # it is neither human-attested nor a system self-approval.
     ("board:move:unattributed", "unknown"),

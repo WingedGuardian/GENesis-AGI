@@ -43,9 +43,11 @@ Any failure to write, resolve or consume the row means no launch.
 
 Run state is derived: a live builder is a tmux session carrying
 ``GENESIS_BUILDER_KEY``; a finished one is an issue with an open closing PR
-(from the board read). The ``builder_launching`` rows map a builder's key back
-to its issue (a short read of them holds every launch); otherwise
-``board_events`` is the audit log.
+(from the board read). A builder's issue is its card's on the same board read
+(the key starts with the card's item id), and a launch still starting is a live
+``genesis-builder-*`` systemd unit, which systemd itself stops at
+``RuntimeMaxSec``. ``board_events`` is the audit log and each move's outcome
+record; no row count decides capacity.
 
 Never raises into the reconciler: a failure is logged and returned in the
 summary block (``error``), which the reconciler reports as a job failure.
@@ -53,12 +55,10 @@ summary block (``error``), which the reconciler reports as a job failure.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
 import re
-import sys
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -67,16 +67,31 @@ from genesis.board import config as board_config
 
 logger = logging.getLogger(__name__)
 
+# Outside readings. Tests replace them by name on this module, which reaches
+# every call made from here; a probe calling another probe (each calls _exec)
+# resolves it in probes, so a stub of _exec itself goes on probes.
+from genesis.board.launcher.probes import (  # noqa: E402
+    LAUNCH_TIMEOUT_S,
+    LAUNCH_WAIT_S,  # noqa: F401  (re-exported for other board modules)
+    LOCAL_TIMEOUT_S,  # noqa: F401  (re-exported for other board modules)
+    PREMISE_TIMEOUT_S,  # noqa: F401  (re-exported for other board modules)
+    UNIT_PREFIX,
+    _exec,  # noqa: F401  (re-exported for other board modules)
+    _guard_wired,
+    _matcher_covers_bash,  # noqa: F401  (re-exported for other board modules)
+    login_expiry,
+    mem_available_kb,
+    premise_rc,
+    run_launch,
+    starting_units,
+    stop_unit,
+    tmux_sessions,
+    unit_state,
+)
+
 WORKER = "board_launcher"
 BUILD = "Build"
 MAX_STRIKES = 3
-#: The slot door's normal run is about 5 s (create, a 3 s settle, the capacity
-#: probe). The bound is for a tmux client or capacity probe that hangs.
-LAUNCH_TIMEOUT_S = 180
-#: premise_gate.py makes one gh read; this bounds a hung gh.
-PREMISE_TIMEOUT_S = 120
-#: A local tmux or systemctl round trip; a hang means no reachable server.
-LOCAL_TIMEOUT_S = 15
 RESOLVED_BY = "board:move:unattributed"
 ALLOWED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 #: One issue's whole event history is read; a longer one fails closed.
@@ -85,7 +100,6 @@ EVENT_READ_LIMIT = 500
 RC_REFUSED = 75
 #: The builder guard (spec E3e). No launch until it is installed and wired.
 GUARD_HOOK = Path("scripts") / "hooks" / "builder_guard.py"
-_KEY_VAR = "GENESIS_BUILDER_KEY"
 _SLOT_RE = re.compile(r"^cc-([1-9][0-9]{0,3})$")
 _FINAL_FOR_MOVE = ("builder_launched", "launch_refused", "move_absorbed")
 _LATE_AFTER = timedelta(seconds=420)  # one tick interval plus slack
@@ -109,130 +123,6 @@ def _parse(ts: str | None) -> datetime | None:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
-
-
-# ─── outside readings (each replaced in tests) ──────────────────────────────
-
-
-async def _exec(
-    argv: list[str], *, timeout: float, cwd: str | None = None, env: dict | None = None
-) -> tuple[int, str]:
-    """Run *argv* (never a shell); return ``(rc, combined output)``. A timeout
-    kills the process and returns rc 124."""
-    from genesis.hostmetrics.jobs import systemd_env
-
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        cwd=cwd,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        env={**systemd_env(), **(env or {})},
-    )
-    try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return 124, f"timed out after {timeout}s"
-    return proc.returncode or 0, out.decode(errors="replace")
-
-
-async def tmux_sessions() -> dict[str, str | None]:
-    """Every tmux session name, with the builder key pinned on it (or None).
-
-    No tmux server reads as no sessions. Any other failure raises, so a
-    capacity count is never taken from a reading that did not happen; a
-    session that ended between the two reads is left out."""
-    rc, out = await _exec(
-        ["tmux", "list-sessions", "-F", "#{session_name}"], timeout=LOCAL_TIMEOUT_S
-    )
-    if rc != 0:
-        if "no server running" in out or (
-            "error connecting" in out and "No such file or directory" in out
-        ):
-            return {}
-        raise RuntimeError(f"tmux list-sessions failed (rc={rc}): {out.strip()[:200]}")
-    sessions: dict[str, str | None] = {}
-    for name in (line.strip() for line in out.splitlines()):
-        if not name:
-            continue
-        rc, env = await _exec(
-            ["tmux", "show-environment", "-t", f"={name}", _KEY_VAR], timeout=LOCAL_TIMEOUT_S
-        )
-        line = env.strip()
-        if rc == 0 and line.startswith(f"{_KEY_VAR}="):
-            sessions[name] = line.split("=", 1)[1]
-        elif "unknown variable" in line or line == f"-{_KEY_VAR}":
-            sessions[name] = None
-        elif "can't find session" in line:
-            continue
-        else:
-            raise RuntimeError(f"tmux show-environment -t {name} failed (rc={rc}): {line[:200]}")
-    return sessions
-
-
-async def premise_rc(issue: int, repo: str) -> int:
-    """``scripts/premise_gate.py check N`` against *repo*: 0 ready, 1 answers
-    missing, 2 unreadable. Anything else reads as 2, including a timeout and a
-    crash: Python exits 1 on an uncaught exception too (MEASURED 2026-11-15, an
-    import error), so 1 counts only with the gate's own "NOT ready" verdict."""
-    root = _repo_root()
-    try:
-        rc, out = await _exec(
-            [sys.executable, str(root / "scripts" / "premise_gate.py"), "check", str(issue)],
-            timeout=PREMISE_TIMEOUT_S,
-            cwd=str(root),
-            # The checkout may carry several remotes; the tracker is configured.
-            env={"GH_REPO": repo},
-        )
-    except OSError:
-        logger.warning("premise gate could not run for #%s", issue, exc_info=True)
-        return 2
-    if rc == 1 and f"issue {issue}: NOT ready" in out:
-        return 1
-    return 0 if rc == 0 else 2
-
-
-def mem_available_kb() -> int | None:
-    """Usable memory in KiB, capped by the container's cgroup limit: inside a
-    memory-limited container /proc/meminfo can describe the host's headroom."""
-    from genesis.hostmetrics.readings import read_memory
-
-    try:
-        mem = read_memory()
-    except Exception:
-        logger.warning("builder launcher: memory read failed", exc_info=True)
-        return None
-    return None if mem is None else mem.available // 1024
-
-
-def login_expiry() -> datetime | None:
-    from genesis.cc.login_health import refresh_token_expiry
-
-    return refresh_token_expiry()
-
-
-async def run_launch(argv: list[str]) -> tuple[int, str]:
-    return await _exec(argv, timeout=LAUNCH_TIMEOUT_S, cwd=str(_repo_root()))
-
-
-async def unit_state(unit: str) -> str:
-    """``active``, ``gone`` or ``unknown``. MEASURED (systemd 255): is-active
-    exits 0 for an active unit, 3 for an inactive one and 4 for one that no
-    longer exists (a ``--collect`` unit that finished). Anything else (a hung
-    systemctl, a bus error) is unknown, which the caller treats as active."""
-    rc, _ = await _exec(
-        ["systemctl", "--user", "is-active", "--quiet", unit], timeout=LOCAL_TIMEOUT_S
-    )
-    return "active" if rc == 0 else "gone" if rc in (3, 4) else "unknown"
-
-
-async def stop_unit(unit: str) -> None:
-    await _exec(["systemctl", "--user", "stop", unit], timeout=LOCAL_TIMEOUT_S)
-
-
-# ─── one pass ───────────────────────────────────────────────────────────────
 
 
 class _Tick:
@@ -403,17 +293,25 @@ def _open_pr_numbers(items: list[dict], tracker: str) -> set[int]:
     return out
 
 
-async def _key_issues(db, tracker: str) -> dict[str, int] | None:
-    """Builder key -> issue, from every ``builder_launching`` row (None when the
-    read is short)."""
-    from genesis.db.crud import board as board_crud
+def _item_issues(items: list[dict], tracker: str) -> dict[str, int]:
+    """Project item id -> issue number, for the tracker's issue cards on this read.
+    A builder key is ``<item>@<Status updatedAt>``, so a live builder's issue is
+    its card's; a builder whose card left the board maps to nothing and holds a
+    place (fail closed)."""
+    out = {}
+    for it in items:
+        content = it.get("content") or {}
+        if content.get("__typename") != "Issue":
+            continue
+        if ((content.get("repository") or {}).get("nameWithOwner") or "").lower() != tracker:
+            continue
+        if it.get("id") and content.get("number"):
+            out[it["id"]] = content["number"]
+    return out
 
-    got = await board_crud.list_events(
-        db, repo=tracker, event="builder_launching", limit=EVENT_READ_LIMIT
-    )
-    if got["listed"] < got["total"]:
-        return None
-    return {(e.get("detail") or {}).get("key"): e["issue_number"] for e in got["items"]}
+
+def _issue_of(key: str | None, item_issues: dict[str, int]) -> int | None:
+    return item_issues.get(key.rsplit("@", 1)[0]) if key else None
 
 
 async def run_launcher(rt, items: list[dict] | None, now: datetime) -> dict:
@@ -452,24 +350,22 @@ async def _run(rt, items: list[dict] | None, now: datetime) -> dict:
         return tick.out
 
     sessions = await tmux_sessions()
-    key_issues = await _key_issues(tick.db, tick.tracker)
+    item_issues = _item_issues(items, tick.tracker)
     # Per session, not per key: two sessions carrying one key are two builders.
     live_keys = [k for k in sessions.values() if k]
     open_prs = _open_pr_numbers(items, tick.tracker)
-    if key_issues is None:
-        busy = len(live_keys)  # fail closed: every live builder holds a place
-    else:
-        busy = sum(1 for k in live_keys if key_issues.get(k) not in open_prs)
-    # An attempt still starting (its unit alive, no session yet) holds a place
-    # too, whether or not its card is still in Build; counted once, here.
-    busy += await _pending_attempts(tick, sessions)
+    # A builder with no card on this read maps to None, never in open_prs: it holds.
+    busy = sum(1 for k in live_keys if _issue_of(k, item_issues) not in open_prs)
+    # An attempt still starting (its unit alive) holds a place too, whether or
+    # not its card is still in Build; counted once, here.
+    busy += await starting_units()
 
     for card in fresh:
         if tick.out.get("disarmed"):
             break  # a disarm seen mid-pass ends it: no further checks or launches
         # True when the move now holds a place: launched, or launched with an
         # outcome nobody could read.
-        if await _one(tick, card, sessions, key_issues, busy):
+        if await _one(tick, card, sessions, item_issues, busy):
             busy += 1
             sessions = await tmux_sessions()
     return tick.out
@@ -566,7 +462,7 @@ def _door_refused_unchanged(history: list[dict], key: str, sessions: dict) -> bo
     return False
 
 
-async def _one(tick: _Tick, card: dict, sessions: dict, key_issues, busy: int) -> bool:
+async def _one(tick: _Tick, card: dict, sessions: dict, item_issues, busy: int) -> bool:
     """Handle one fresh Build move. True when it holds a builder place now."""
     key, number = card["key"], card["number"]
     if card["kind"] != "Issue" or card["repo"] != tick.tracker or not number:
@@ -575,7 +471,7 @@ async def _one(tick: _Tick, card: dict, sessions: dict, key_issues, busy: int) -
         )
         return False
     history = await _history(tick.db, tick.tracker, number)
-    if history is None or key_issues is None:
+    if history is None:
         await _hold(tick, card, "history", "its launch history is longer than one read")
         return False
     if _of_key(history, key, *_FINAL_FOR_MOVE):
@@ -592,7 +488,7 @@ async def _one(tick: _Tick, card: dict, sessions: dict, key_issues, busy: int) -
 
     # Absorb: the issue already has a live builder (another move's key).
     live_for_issue = [
-        k for k in sessions.values() if k and k != key and key_issues.get(k) == number
+        k for k in sessions.values() if k and k != key and _issue_of(k, item_issues) == number
     ]
     if live_for_issue:
         tick.out["absorbed"] += 1
@@ -686,52 +582,6 @@ def _install_hold(tick: _Tick, busy: int) -> tuple[str, str] | None:
     return None
 
 
-#: A Claude Code hook matcher made only of these is an exact list of tool names
-#: split on ``|`` or ``,``; anything else is a regex tested unanchored (READ:
-#: Claude Code hooks documentation, "matcher").
-_PLAIN_MATCHER = re.compile(r"[\w\- ,|]+")
-
-
-def _matcher_covers_bash(matcher: str) -> bool:
-    if matcher in ("", "*"):
-        return True
-    if _PLAIN_MATCHER.fullmatch(matcher):
-        return "Bash" in {part.strip() for part in re.split(r"[|,]", matcher)}
-    try:
-        return re.search(matcher, "Bash") is not None
-    except re.error:
-        return False
-
-
-def _guard_wired(settings: Path) -> bool:
-    """True when the settings run the builder guard as a PreToolUse hook on Bash:
-    a ``command`` hook whose command has a ``hooks/builder_guard.py`` word, in a
-    block whose matcher covers ``Bash`` by Claude Code's rules, with hooks not
-    disabled. A mention anywhere else does not count."""
-    import shlex
-
-    try:
-        data = json.loads(settings.read_text())
-        blocks = data["hooks"]["PreToolUse"]
-    except (OSError, ValueError, KeyError, TypeError):
-        return False
-    if not isinstance(data, dict) or data.get("disableAllHooks") is True:
-        return False
-    for block in blocks if isinstance(blocks, list) else []:
-        if not isinstance(block, dict) or not _matcher_covers_bash(block.get("matcher") or ""):
-            continue
-        for hook in block.get("hooks") or []:
-            if not isinstance(hook, dict) or hook.get("type") != "command":
-                continue
-            try:
-                words = shlex.split(str(hook.get("command", "")))
-            except ValueError:
-                continue
-            if "hooks/builder_guard.py" in words:
-                return True
-    return False
-
-
 async def _list_backlog(tick: _Tick, cards: list[dict]) -> None:
     """Tell the owner once which cards were already in Build when the launcher
     was armed: one row per card (``launch_queued``, hold ``pre_enable``), so a
@@ -764,26 +614,6 @@ async def _list_backlog(tick: _Tick, cards: list[dict]) -> None:
             f"{', '.join(listed)}. Move one out of Build and back to launch it.",
             f"backlog:{tick.iso}",
         )
-
-
-async def _pending_attempts(tick: _Tick, sessions: dict) -> int:
-    """Launch attempts still starting: no outcome yet, no session carrying the
-    move's key, and a unit that is not gone. Only the last hour is read: a launch
-    is bounded at :data:`LAUNCH_TIMEOUT_S` and its unit is stopped on timeout, so
-    an older attempt cannot still be starting."""
-    from genesis.db.crud import board as board_crud
-
-    since = (tick.now - timedelta(hours=1)).isoformat()
-    live = set(sessions.values())
-    pending = 0
-    for e in await board_crud.unsettled_launches(tick.db, repo=tick.tracker, since=since):
-        detail = e.get("detail") or {}
-        if detail.get("key") in live:
-            continue
-        unit = detail.get("unit")
-        if unit and await unit_state(unit) != "gone":
-            pending += 1
-    return pending
 
 
 def _render(template: str, *, issue: int, snapshot: Path, worktree: Path) -> str:
@@ -863,7 +693,7 @@ async def _launch(tick: _Tick, card: dict, facts: dict, sessions: dict, history)
     )
     slot = _free_slot(sessions, tick.settings["first_slot"])
     session_id = str(uuid.uuid4())
-    unit = f"genesis-builder-{number}-{uuid.uuid4().hex[:8]}"
+    unit = f"{UNIT_PREFIX}{number}-{uuid.uuid4().hex[:8]}"
     # The checks above took network round trips; a disarm (or the kill switch)
     # in the meantime cancels the launch before its gate row exists.
     if not board_config.builder_launch_armed()[0]:
@@ -921,6 +751,7 @@ async def _launch(tick: _Tick, card: dict, facts: dict, sessions: dict, history)
         "--quiet",
         "--pipe",
         f"--unit={unit}",
+        f"--property=RuntimeMaxSec={LAUNCH_TIMEOUT_S}",
         f"--working-directory={root}",
         str(root / "scripts" / "cc-slot.sh"),
         "launch",

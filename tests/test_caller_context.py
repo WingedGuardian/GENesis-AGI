@@ -580,6 +580,7 @@ _ENV_WRITERS = {
 # not the caller's own claim. A shared service needs its own decision for each.
 _PEER_ENV_READERS = {
     "payments/peer_check.py": "reads a peer's /proc environ to decide process ancestry",
+    "board/launcher/probes.py": "reads each tmux builder session's key from that session's environment",
 }
 
 

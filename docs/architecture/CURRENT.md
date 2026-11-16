@@ -6187,7 +6187,7 @@ dashboard tab are follow-on work. The shipped mode is `off`.
   write failure records a failure too, with the read's counts and the writes
   already made kept. The step raises if the learning scheduler is
   missing or stopped, so the manifest names that cause instead of the board.
-- **Builder launcher** (`board/launcher.py`, spec E ticket E3a). Armed only by
+- **Builder launcher** (`board/launcher/`, spec E ticket E3a). Armed only by
   `builder_launch: {enabled: true}` (the literal) in `board.local.yaml`, on a
   valid mode other than `off`; `settings_update` refuses the key. The levers
   beside it (`capacity` 1, `min_free_gb` 4, `login_margin_hours` 6,
@@ -6217,9 +6217,14 @@ dashboard tab are follow-on work. The shipped mode is `off`.
     (MEASURED: 0, 64, 75). Up = a tmux session carrying the key:
     `builder_launched`. Exit 75 is not a strike; other failures are
     `launch_failed` strikes, and the third stops the move and tells the owner.
-    A timed-out launch stops its unit; an attempt a restart interrupted is
-    settled from tmux and the unit's state.
-  - Run state is derived from tmux and the board read, never from events.
+    systemd stops the unit itself at `RuntimeMaxSec` (the launch timeout),
+    restart or not; an attempt a restart interrupted is settled from tmux and
+    the unit's state.
+  - Run state is derived, never read from events: a place is a live tmux
+    session carrying a key whose card (same board read) has no open closing
+    PR, or a running `genesis-builder-*` unit (`systemctl list-units`); a
+    builder whose card left the board holds its place. The host reads live in
+    `board/launcher/probes.py`.
 - **`board_status`** reads the stored heartbeats only, never GitHub: the newest
   pulse (alive, mode, error) and the newest SUCCESSFUL read with its age,
   including that tick's `writes` block (None on a summary from before #4400).

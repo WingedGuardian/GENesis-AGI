@@ -133,9 +133,9 @@ _TOPIC_IS_IDENTITY: frozenset[str] = frozenset(
         # _notify): one owner-requested failure, never fuzzy body identity, so
         # two fast failures with the same error body both page at once.
         "direct_session_fail",
-        # topic = "Builder launcher: <kind>:<move key>" (board/launcher.py): one
-        # line per board event, which the launcher already dedups by its rows; a
-        # repeated refusal of a new move is a new line, never a fuzzy-body repeat.
+        # topic = "Builder launcher: <kind>:<move key>" (board/launcher/): one line
+        # per board event, which the launcher already dedups by its own rows, so
+        # two moves' alerts with one body (the same refusal) both reach the owner.
         "builder_launch",
     }
 )
@@ -224,17 +224,13 @@ class GovernanceGate:
             if await self._content_available():
                 passed.append("content_quota")
             else:
-                failed.append(
-                    f"content_quota: daily content limit ({self._config.content_daily}) reached"
-                )
+                failed.append(f"content_quota: daily content limit ({self._config.content_daily}) reached")
 
         if request.category == OutreachCategory.NOTIFICATION:
             if await self._notification_available():
                 passed.append("notification_quota")
             else:
-                failed.append(
-                    f"notification_quota: daily notification limit ({self._config.notification_daily}) reached"
-                )
+                failed.append(f"notification_quota: daily notification limit ({self._config.notification_daily}) reached")
 
         # Engagement throttle: reduce outreach if ignore rate is high
         # BLOCKER/ALERT/NOTIFICATION categories always exempt — notifications
@@ -307,14 +303,12 @@ class GovernanceGate:
                 "Invalid quiet_hours window (start=%r end=%r) — treating quiet "
                 "hours as DISABLED. Expected HH:MM; fix config/outreach.yaml or "
                 "your local overlay.",
-                raw.start,
-                raw.end,
+                raw.start, raw.end,
             )
             return False
         if start == end:
             return False
         from zoneinfo import ZoneInfo
-
         try:
             tz = ZoneInfo(user_timezone())
         except Exception:
@@ -332,7 +326,9 @@ class GovernanceGate:
         return await self._is_duplicate(request)
 
     async def _is_duplicate(self, request: OutreachRequest) -> bool:
-        window_hours = _DEDUP_WINDOWS.get(request.signal_type, _DEFAULT_DEDUP_HOURS)
+        window_hours = _DEDUP_WINDOWS.get(
+            request.signal_type, _DEFAULT_DEDUP_HOURS
+        )
         if window_hours == 0:
             return False
         window_spec = f"-{window_hours} hours"
@@ -340,9 +336,7 @@ class GovernanceGate:
         # Older recovery workers recorded morning reports as deferred_retry.
         # Keep those delivered rows effective if queue completion failed before
         # an upgrade; topic/category/window remain the same identity boundary.
-        legacy_signal = (
-            "deferred_retry" if request.signal_type == "morning_report" else request.signal_type
-        )
+        legacy_signal = "deferred_retry" if request.signal_type == "morning_report" else request.signal_type
 
         # Primary key: (signal_type, topic, category) within the window.
         # NB: wrap delivered_at in datetime(). Stored values are ISO-8601 with a
@@ -355,13 +349,7 @@ class GovernanceGate:
             "WHERE signal_type IN (?, ?) AND topic = ? AND category = ? "
             "AND delivered_at IS NOT NULL "
             "AND datetime(delivered_at) >= datetime('now', ?)",
-            (
-                request.signal_type,
-                legacy_signal,
-                request.topic,
-                request.category.value,
-                window_spec,
-            ),
+            (request.signal_type, legacy_signal, request.topic, request.category.value, window_spec),
         )
         row = await cursor.fetchone()
         if (row[0] if row else 0) > 0:
@@ -501,7 +489,6 @@ class GovernanceGate:
         """
         try:
             from genesis.db.crud.outreach import get_engagement_stats
-
             stats = await get_engagement_stats(self._db, days=7)
         except Exception:
             return None  # Can't check → don't throttle

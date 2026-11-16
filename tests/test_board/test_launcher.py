@@ -13,6 +13,7 @@ import pytest
 from genesis.board import config as board_config
 from genesis.board import launcher
 from genesis.board import projects_v2 as pv
+from genesis.board.launcher import probes
 from genesis.db.crud import approval_requests as approval_crud
 from genesis.db.crud import board as board_crud
 from genesis.db.schema import create_all_tables
@@ -121,6 +122,7 @@ class World:
         self.active_units: set[str] = set()
         self.stopped: list[str] = []
         self.unit_default = "gone"
+        self.units_unreadable = False
         self.settings = dict(SETTINGS)
 
     async def tmux_sessions(self):
@@ -151,6 +153,11 @@ class World:
     async def stop_unit(self, unit):
         self.stopped.append(unit)
 
+    async def starting_units(self):
+        if self.units_unreadable:
+            raise RuntimeError("systemctl list-units exited 1")
+        return len(self.active_units)
+
 
 @pytest.fixture
 def world(tmp_path, monkeypatch):
@@ -161,7 +168,14 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(launcher, "_repo_root", lambda: w.root)
     monkeypatch.setattr(launcher, "_builders_dir", lambda: w.builders)
     monkeypatch.setattr(launcher, "_utcnow", lambda: NOW)
-    for name in ("tmux_sessions", "run_launch", "premise_rc", "unit_state", "stop_unit"):
+    for name in (
+        "tmux_sessions",
+        "run_launch",
+        "premise_rc",
+        "unit_state",
+        "stop_unit",
+        "starting_units",
+    ):
         monkeypatch.setattr(launcher, name, getattr(w, name))
     monkeypatch.setattr(launcher, "mem_available_kb", lambda: w.mem_kb)
     monkeypatch.setattr(launcher, "login_expiry", lambda: w.expiry)
@@ -225,6 +239,9 @@ async def test_a_build_move_launches_one_builder_through_a_consumed_gate(db, wor
     assert out["launched"] == 1, out
     [argv] = world.launches
     assert argv[:6] == ["systemd-run", "--user", "--collect", "--wait", "--quiet", "--pipe"]
+    # systemd bounds the unit itself, so a server restart cannot leave it running.
+    assert f"--property=RuntimeMaxSec={launcher.LAUNCH_TIMEOUT_S}" in argv
+    assert launcher.LAUNCH_WAIT_S > launcher.LAUNCH_TIMEOUT_S
     assert argv[argv.index("--key") + 1] == _key(card)
     assert argv[argv.index("--slot") + 1] == "9"  # builders start at first_slot
     assert argv[argv.index("--issue") + 1] == "7"
@@ -669,7 +686,7 @@ async def test_tmux_sessions_reads_keys(monkeypatch, replies, expected):
     async def fake_exec(argv, **_):
         return queue.pop(0)
 
-    monkeypatch.setattr(launcher, "_exec", fake_exec)
+    monkeypatch.setattr(probes, "_exec", fake_exec)
     assert await launcher.tmux_sessions() == expected
 
 
@@ -687,7 +704,7 @@ async def test_a_tmux_reading_that_did_not_happen_raises(monkeypatch, replies):
     async def fake_exec(argv, **_):
         return queue.pop(0)
 
-    monkeypatch.setattr(launcher, "_exec", fake_exec)
+    monkeypatch.setattr(probes, "_exec", fake_exec)
     with pytest.raises(RuntimeError):
         await launcher.tmux_sessions()
 
@@ -715,7 +732,7 @@ async def test_premise_rc_reads_the_gate_verdict(monkeypatch, tmp_path, rc, out,
         seen.update(kw)
         return rc, out
 
-    monkeypatch.setattr(launcher, "_exec", fake_exec)
+    monkeypatch.setattr(probes, "_exec", fake_exec)
     monkeypatch.setattr(launcher, "_repo_root", lambda: tmp_path)
     assert await launcher.premise_rc(7, REPO) == expected
     assert seen["env"] == {"GH_REPO": REPO}
@@ -792,7 +809,9 @@ async def test_two_sessions_with_one_key_are_two_builders(db, world):
     assert out["held"] == 1 and world.launches == []
 
 
-async def test_a_launch_history_longer_than_one_read_holds(db, world, monkeypatch):
+async def test_other_issues_launch_rows_past_one_read_do_not_hold(db, world, monkeypatch):
+    """No lifetime row count decides capacity: rows of other issues past the
+    read limit (never pruned) once held every move forever."""
     monkeypatch.setattr(launcher, "EVENT_READ_LIMIT", 1)
     await _arm(db)
     for n in (1, 2):
@@ -809,9 +828,80 @@ async def test_a_launch_history_longer_than_one_read_holds(db, world, monkeypatc
                 detail={"key": f"old{n}"},
             )
     _, out = await _run(db, [_card()])
+    assert len(world.launches) == 1, out
+
+
+async def test_a_launch_history_of_its_own_issue_longer_than_one_read_holds(db, world, monkeypatch):
+    monkeypatch.setattr(launcher, "EVENT_READ_LIMIT", 1)
+    await _arm(db)
+    card = _card()
+    for n in (1, 2):
+        async with board_crud.owned_connection(db) as own:
+            await board_crud.append_event(
+                own,
+                event="move_absorbed",
+                now=NOW.isoformat(),
+                repo=REPO,
+                issue_number=card["content"]["number"],
+                worker="board_launcher",
+                observed_change_key=f"old{n}",
+                detail={"key": f"old{n}"},
+            )
+    _, out = await _run(db, [card])
     assert world.launches == []
     [row] = await _events(db, "launch_queued")
     assert row["detail"]["hold"] == "history"
+
+
+@pytest.mark.parametrize(
+    ("rc", "output", "expected"),
+    [
+        (
+            0,
+            "genesis-builder-7-aa.service loaded active running x\n"
+            "genesis-builder-8-bb.service loaded activating start x\n"
+            "genesis-builder-9-cc.service loaded failed failed x\n"
+            "genesis-builder-5-dd.service loaded inactive dead x\n"
+            "genesis-slot-1.scope loaded active running x\n"
+            "Warning: something on stderr\n",
+            2,
+        ),
+        (0, "", 0),
+    ],
+)
+async def test_starting_units_counts_live_builder_units(monkeypatch, rc, output, expected):
+    calls = []
+
+    async def fake_exec(argv, **kw):
+        calls.append(argv)
+        return rc, output
+
+    monkeypatch.setattr(probes, "_exec", fake_exec)
+    assert await probes.starting_units() == expected
+    assert calls[0][:3] == ["systemctl", "--user", "list-units"]
+
+
+async def test_an_unreadable_unit_list_raises(monkeypatch):
+    async def fake_exec(argv, **kw):
+        return 1, "Failed to connect to bus"
+
+    monkeypatch.setattr(probes, "_exec", fake_exec)
+    with pytest.raises(RuntimeError):
+        await probes.starting_units()
+
+
+async def test_a_running_launch_unit_holds_a_place(db, world):
+    await _arm(db)
+    world.active_units.add("genesis-builder-3-abcd1234")
+    _, out = await _run(db, [_card()])
+    assert world.launches == [] and out["held"] == 1
+
+
+async def test_an_unreadable_unit_list_launches_nothing(db, world):
+    await _arm(db)
+    world.units_unreadable = True
+    _, out = await _run(db, [_card()])
+    assert world.launches == []
 
 
 async def test_a_card_from_another_repo_is_not_filed_under_a_tracker_issue(db, world):
@@ -1097,7 +1187,9 @@ def test_disabled_hooks_mean_no_guard(tmp_path):
     assert launcher._guard_wired(f) is False
 
 
-async def test_an_attempt_older_than_an_hour_no_longer_holds_a_place(db, world):
+async def test_an_unsettled_attempt_whose_unit_is_gone_holds_no_place(db, world):
+    """Places come from live units, not rows: systemd retires a launch unit at
+    its RuntimeMaxSec, so a row left without an outcome holds nothing."""
     await _arm(db, at=NOW - timedelta(days=1))
     old = _card("I9", number=9)
     async with board_crud.owned_connection(db) as own:
@@ -1112,7 +1204,6 @@ async def test_an_attempt_older_than_an_hour_no_longer_holds_a_place(db, world):
             observed_change_key=f"{_key(old)}#a1",
             detail={"key": _key(old), "slot": 9, "session_id": "s", "unit": "u-old"},
         )
-    world.active_units.add("u-old")
     _, out = await _run(db, [_card("I1", number=7)])
     assert out["launched"] == 1
 

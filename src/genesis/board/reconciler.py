@@ -44,7 +44,7 @@ Every five minutes (``CronTrigger``, ``max_instances=1``) one tick:
    timeout, a rate limit) stops the tick's writes; an error about one item
    skips that item. Outside ``live`` nothing is written and the summary
    carries would-write counts instead (``dry_run``);
-5. after the write phase, the builder launcher (``board/launcher.py``) takes
+5. after the write phase, the builder launcher (``board/launcher/``) takes
    the cards in Build; it does nothing unless it is armed;
 6. ALWAYS emits a ``board`` heartbeat whose details carry the summary, in
    every mode and while paused. A pulse that stopped when the board was off

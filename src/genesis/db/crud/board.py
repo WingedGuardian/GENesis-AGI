@@ -51,7 +51,7 @@ TERMINAL_QUESTION_STATUSES = ("resolved", "dropped")
 #:   bookkeeping_move   — Genesis moved a card (the one allowed move: In Review)
 #:   comment_write      — Genesis posted a templated, scanned comment
 #:   override           — an owner move past an advisory (admission, blocked-by)
-#: The builder launcher's (board/launcher.py), each keyed per move
+#: The builder launcher's (board/launcher/), each keyed per move
 #: (``<item>@<Status updatedAt>``, with ``#a<n>`` / ``#ask:<id>`` suffixes):
 #:   launcher_enabled   — an armed tick after a disarmed one (keyed by its own time)
 #:   launcher_disabled  — a disarmed tick after an armed one (keyed by its own time)
@@ -95,7 +95,7 @@ EVENTS = frozenset(
     }
 )
 
-#: The builder launcher's events (board/launcher.py, board/builder_watch.py).
+#: The builder launcher's events (board/launcher/, board/builder_watch.py).
 LAUNCHER_EVENTS = frozenset(
     {
         "launcher_enabled",
@@ -860,28 +860,6 @@ async def added_numbers(db: aiosqlite.Connection, *, repo: str) -> set[int]:
         ((repo or "").lower(),),
     )
     return {row[0] for row in await cur.fetchall()}
-
-
-async def unsettled_launches(db: aiosqlite.Connection, *, repo: str, since: str) -> list[dict]:
-    """``builder_launching`` rows in *repo* written at or after *since* that have
-    no outcome: no ``builder_launched`` for their move and no ``launch_failed``
-    for their attempt (both share the attempt's change key)."""
-    cur = await db.execute(
-        "SELECT * FROM board_events l WHERE l.event = 'builder_launching' AND l.repo = ? "
-        "AND l.created_at >= ? "
-        "AND NOT EXISTS (SELECT 1 FROM board_events e WHERE e.event = 'builder_launched' "
-        "AND json_extract(e.detail, '$.key') = json_extract(l.detail, '$.key')) "
-        "AND NOT EXISTS (SELECT 1 FROM board_events f WHERE f.event = 'launch_failed' "
-        "AND f.observed_change_key = l.observed_change_key) ORDER BY l.id",
-        ((repo or "").lower(), since),
-    )
-    items = await _all(cur)
-    for item in items:
-        try:
-            item["detail"] = json.loads(item["detail"]) if item.get("detail") else {}
-        except ValueError:
-            item["detail"] = {"unparseable": True}
-    return items
 
 
 async def links_without_item(db: aiosqlite.Connection, *, repo: str) -> list[dict]:
