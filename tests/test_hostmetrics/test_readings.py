@@ -242,19 +242,28 @@ def test_disk_reads_statvfs(tmp_path):
     assert total > 0 and 0 <= free <= total
 
 
-def test_disk_matches_os_statvfs(tmp_path):
-    # Two reads of free space taken moments apart differ whenever anything else
-    # writes to the filesystem: a parallel CI worker wrote 4 KiB between them
-    # (2026-11-07). The total is exact; free space must agree within 1 MiB.
-    st = os.statvfs(tmp_path)
-    total, free = r.read_disk(tmp_path)
-    assert total == st.f_blocks * st.f_frsize
-    assert abs(free - st.f_bavail * st.f_frsize) <= 1024 * 1024
+def test_disk_matches_os_statvfs(tmp_path, monkeypatch):
+    # One fixed snapshot checks the conversion without racing filesystem writes.
+    st = os.statvfs_result((4096, 1024, 100, 70, 40, 1000, 900, 900, 0, 255))
+
+    def statvfs(path):
+        assert path == tmp_path
+        return st
+
+    monkeypatch.setattr(r.os, "statvfs", statvfs)
+    assert r.read_disk(tmp_path) == (102400, 40960)
 
 
-def test_disk_path_not_yet_created_reads_its_parent(tmp_path):
+def test_disk_path_not_yet_created_reads_its_parent(tmp_path, monkeypatch):
     # A job often writes into a directory it creates; judge the parent's filesystem.
-    assert r.read_disk(tmp_path / "new" / "deeper") == r.read_disk(tmp_path)
+    st = os.statvfs_result((4096, 1024, 100, 70, 40, 1000, 900, 900, 0, 255))
+
+    def statvfs(path):
+        assert path == tmp_path
+        return st
+
+    monkeypatch.setattr(r.os, "statvfs", statvfs)
+    assert r.read_disk(tmp_path / "new" / "deeper") == (102400, 40960)
     assert r.disk_device(tmp_path / "new") == os.stat(tmp_path).st_dev
 
 

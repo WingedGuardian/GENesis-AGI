@@ -152,6 +152,9 @@ REMEDIATION_MAP: dict[str, frozenset[str]] = {
     "guardian:heartbeat_stale": frozenset({"guardian.ssh_restart"}),
     "infra:disk_low": frozenset({"container.disk_reclaim", "host.resource_alloc"}),
     "infra:container_memory_high": frozenset({"container.process_control", "host.resource_alloc"}),
+    # MCP servers held by a shared Codex app-server past codex_mcp_stop.propose_at_mb
+    # (#4302): remedied by the codex_mcp_stop tool, which runs under process control.
+    "infra:codex_mcp_held": frozenset({"container.process_control"}),
     "infra:qdrant_collections_missing": frozenset({"qdrant.local"}),
     "provider:qdrant_unreachable": frozenset({"qdrant.local"}),
     "genesis:update_failed": frozenset({"container.services"}),
