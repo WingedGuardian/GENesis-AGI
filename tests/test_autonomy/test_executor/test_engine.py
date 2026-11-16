@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiosqlite
 import pytest
 
+from genesis.autonomy.executor import worktree_mgr
 from genesis.autonomy.executor.engine import MAX_REVIEW_ITERATIONS, CCSessionExecutor
 from genesis.autonomy.executor.review import PreMortemResult, ReviewResult, VerifyResult
 from genesis.autonomy.executor.types import (
@@ -99,6 +100,17 @@ def mock_subprocess(monkeypatch):
     proc.communicate = AsyncMock(return_value=(b"", b""))
     proc.returncode = 0
     create = AsyncMock(return_value=proc)
+
+    async def fresh_task(task_id, repo_root, worktree_base):
+        return worktree_mgr.task_locator(task_id, worktree_base)
+
+    async def create_worktree(task_id, repo_root, worktree_base, base=None):
+        return worktree_base / f"task-{task_id[:8]}"
+
+    worktree_create = AsyncMock(side_effect=create_worktree)
+    monkeypatch.setattr(worktree_mgr, "assert_fresh_task", fresh_task)
+    monkeypatch.setattr(worktree_mgr, "create_worktree", worktree_create)
+    create.worktree_create = worktree_create
     monkeypatch.setattr("asyncio.create_subprocess_exec", create)
     return create
 
@@ -366,13 +378,7 @@ class TestAmendment7Worktree:
 
         await engine.execute("t-001")
 
-        # Check that git worktree add was called
-        calls = mock_subprocess.call_args_list
-        add_calls = [
-            c for c in calls
-            if "worktree" in c.args and "add" in c.args
-        ]
-        assert len(add_calls) == 1
+        mock_subprocess.worktree_create.assert_awaited_once()
 
     async def test_no_worktree_for_research_only(
         self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
@@ -388,10 +394,7 @@ class TestAmendment7Worktree:
 
         await engine.execute("t-001")
 
-        # No worktree add or remove calls
-        calls = mock_subprocess.call_args_list
-        wt_calls = [c for c in calls if "worktree" in c.args]
-        assert len(wt_calls) == 0
+        mock_subprocess.worktree_create.assert_not_awaited()
 
     async def test_worktree_cleaned_on_completion(
         self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
@@ -460,6 +463,11 @@ class TestAmendment7Worktree:
 
         monkeypatch.setattr(worktree_mgr, "is_registered_worktree", gone)
         monkeypatch.setattr(worktree_mgr, "create_worktree", refuse)
+        monkeypatch.setattr(
+            worktree_mgr,
+            "assert_fresh_task",
+            AsyncMock(return_value=("task/t-001", Path("/x/task-t-001"))),
+        )
         engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
         engine._resolve_and_record_base = AsyncMock(return_value=None)
         task = {"outputs": json.dumps({"worktree_path": "/x/task-t-001"})}

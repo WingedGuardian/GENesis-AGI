@@ -4186,9 +4186,9 @@ Refusing a proposed update preserves a previously valid opt-in.
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
   item into the Genesis trash (`~/.genesis/trash`) with a tombstone, never
   copying, and refuses an item on another volume;
-  `python -m genesis.trash list|restore`. Callers: cognitive rollback, the
-  orphan task-worktree reset, and the dashboard's file-browser and memory-file
-  deletes (`docs/reference/trash.md`). Stdlib only.
+  `python -m genesis.trash list|restore`. Callers: cognitive rollback and the
+  dashboard's file-browser and memory-file deletes (`docs/reference/trash.md`).
+  Task-worktree creation now refuses retained or occupied state. Stdlib only.
 - **hostmetrics/**: stdlib-only resource readings (container cgroup memory and
   CPU, PSI, disks, and the host's headroom through the guardian gateway) and the
   `preflight`/`status` CLI that admits or refuses a heavy job against the

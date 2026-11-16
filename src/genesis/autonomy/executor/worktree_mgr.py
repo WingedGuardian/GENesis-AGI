@@ -27,26 +27,6 @@ _GIT_READ_TIMEOUT_S = 60.0
 # ---------------------------------------------------------------------------
 
 
-async def _delete_branch(branch: str, repo_root: Path) -> None:
-    """Delete a local git branch. Logs result, never raises."""
-    proc = await asyncio.create_subprocess_exec(
-        "git", "branch", "-D", branch,
-        cwd=str(repo_root),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=_scrubbed_git_env(),
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode == 0:
-        logger.info("Deleted branch %s", branch)
-    else:
-        # Branch may not exist — that's fine
-        logger.debug(
-            "Branch %s not deleted (may not exist): %s",
-            branch, stderr.decode(errors="replace").strip(),
-        )
-
-
 @dataclass(frozen=True)
 class BaseRef:
     """Where a task branch starts: the remote default branch and its commit.
@@ -136,24 +116,6 @@ async def resolve_base(repo_root: Path) -> BaseRef | None:
     return BaseRef(name=ref[len(prefix):], sha=sha)
 
 
-async def _prune_worktrees(repo_root: Path) -> None:
-    """Run git worktree prune to clean orphaned entries."""
-    proc = await asyncio.create_subprocess_exec(
-        "git", "worktree", "prune",
-        cwd=str(repo_root),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=_scrubbed_git_env(),
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        # The add that follows then fails on the stale record; say why here.
-        logger.warning(
-            "git worktree prune failed in %s: %s",
-            repo_root, stderr.decode(errors="replace").strip(),
-        )
-
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -165,86 +127,138 @@ async def create_worktree(
     worktree_base: Path,
     base: BaseRef | None = None,
 ) -> Path:
-    """Create a git worktree for code task isolation.
-
-    Cleans up stale state from previous runs before creating.
-    Returns the worktree path on success.
-    Handles the case where the task branch already exists (e.g., resume
-    after restart) by checking it out instead of creating a new branch.
-    Raises RuntimeError if worktree creation fails.
-
-    ``base`` (from ``resolve_base``) cuts the new branch from ``base.sha``,
-    the default branch's commit, with ``--no-track`` so the task branch has no
-    upstream: a bare ``git pull`` or ``git push`` inside the task must not
-    target the default branch (cut from a remote-tracking ref, a branch TRACKS
-    it by default; measured on git 2.43). ``None`` keeps the previous
-    behaviour: cut from HEAD.
-    """
-    short_id = task_id[:8]
-    branch = f"task/{short_id}"
-    wt_path = worktree_base / f"task-{short_id}"
-
-    # Clean up stale state from previous runs of this task
-    if wt_path.exists():
-        logger.info("Stale worktree dir %s exists, cleaning up", wt_path)
-        await cleanup_worktree(wt_path, repo_root)
-        if wt_path.exists():
-            await _clear_stale_dir(wt_path, repo_root, task_id)
+    """Create a worktree only when its canonical task state is fresh."""
+    branch, wt_path = await assert_fresh_task(task_id, repo_root, worktree_base)
+    if base is None:
+        rc, start_tip = await _git_read(
+            repo_root, "rev-parse", "--verify", "HEAD^{commit}",
+        )
+        if rc != 0 or not start_tip:
+            raise _task_stale(task_id, branch, wt_path, "current HEAD could not be read as a commit")
     else:
-        # No dir but branch might linger from a prior crash
-        await _prune_worktrees(repo_root)
-        await _delete_branch(branch, repo_root)
+        start_tip = base.sha
+        if not start_tip:
+            raise _task_stale(task_id, branch, wt_path, "selected base has no commit")
 
-    if base is not None:
-        add_args = ["--no-track", "-b", branch, str(wt_path), base.sha]
-    else:
-        add_args = ["-b", branch, str(wt_path)]
-    proc = await asyncio.create_subprocess_exec(
-        "git", "worktree", "add", *add_args,
-        cwd=str(repo_root),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=_scrubbed_git_env(),
-    )
-    _, stderr = await proc.communicate()
+    await assert_fresh_task(task_id, repo_root, worktree_base)
+    try:
+        wt_path.mkdir(parents=True)
+    except FileExistsError as exc:
+        raise _task_stale(task_id, branch, wt_path, "target path became occupied") from exc
+    except OSError as exc:
+        raise _task_stale(task_id, branch, wt_path, f"target path could not be claimed: {exc}") from exc
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "worktree", "add", "--no-track", "-b", branch,
+            str(wt_path), start_tip,
+            cwd=str(repo_root),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_scrubbed_git_env(),
+        )
+        _, stderr = await proc.communicate()
+    except Exception as exc:
+        raise _task_stale(task_id, branch, wt_path, f"git worktree add failed: {exc}") from exc
     if proc.returncode != 0:
-        err = stderr.decode(errors="replace")
-        if "already exists" in err:
-            # Branch exists from previous run — check it out
-            proc = await asyncio.create_subprocess_exec(
-                "git", "worktree", "add", str(wt_path), branch,
-                cwd=str(repo_root),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_scrubbed_git_env(),
-            )
-            _, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                err2 = stderr.decode(errors="replace")
-                logger.error("Failed to create worktree: %s", err2)
-                raise RuntimeError(f"Worktree creation failed: {err2}")
-            logger.info(
-                "Created worktree at %s (existing branch %s)", wt_path, branch,
-            )
-        else:
-            logger.error("Failed to create worktree: %s", err)
-            raise RuntimeError(f"Worktree creation failed: {err}")
-    else:
-        logger.info("Created worktree at %s (branch %s)", wt_path, branch)
+        detail = stderr.decode(errors="replace").strip() or f"exit status {proc.returncode}"
+        raise _task_stale(task_id, branch, wt_path, f"git worktree add failed: {detail}")
 
+    try:
+        actual_tip = await branch_tip(branch, repo_root)
+        if actual_tip != start_tip:
+            raise StaleWorktreeError(
+                f"created branch tip changed from {start_tip} to {actual_tip}",
+            )
+        if await _tag_conflict(branch, repo_root):
+            raise StaleWorktreeError(f"same-named tag appeared for {branch}")
+        records = await _worktree_records(repo_root)
+        if records is None:
+            raise StaleWorktreeError("git worktree list could not be read after add")
+        branch_records = [
+            record for record in records
+            if record.get("branch") == f"refs/heads/{branch}"
+        ]
+        if (
+            len(branch_records) != 1
+            or _as_named(Path(branch_records[0]["worktree"])) != _as_named(wt_path)
+        ):
+            raise StaleWorktreeError("created branch registration is missing, duplicated, or elsewhere")
+        await _validate_live_worktree(wt_path, repo_root, branch, start_tip, records)
+    except Exception as exc:
+        raise _task_stale(
+            task_id, branch, wt_path, f"post-add validation failed: {exc}",
+        ) from exc
+
+    logger.info("Created worktree at %s (branch %s)", wt_path, branch)
     return wt_path
 
 
 class StaleWorktreeError(RuntimeError):
-    """A previous task worktree could not be cleared without losing work.
+    """Task worktree state is unsafe to create or reuse automatically.
 
-    Nothing was deleted; the message says where it is and why it was left.
+    Nothing was deleted; the message identifies what to inspect before retrying.
     """
 
 
 def task_locator(task_id: str, worktree_base: Path) -> tuple[str, Path]:
     short_id = task_id[:8]
     return f"task/{short_id}", worktree_base / f"task-{short_id}"
+
+
+async def assert_fresh_task(
+    task_id: str,
+    repo_root: Path,
+    worktree_base: Path,
+) -> tuple[str, Path]:
+    """Return the canonical task locator only when no retained state is found."""
+    if not isinstance(task_id, str) or not task_id:
+        raise StaleWorktreeError(
+            f"task {task_id!r}, branch task/<invalid>, worktree {worktree_base}: "
+            "task ID must have a non-empty string prefix",
+        )
+    branch, wt_path = task_locator(task_id, worktree_base)
+    prefix = task_id[:8]
+    if "/" in prefix or "\\" in prefix or "\0" in prefix:
+        raise _task_stale(task_id, branch, wt_path, "task ID prefix is path-bearing")
+    try:
+        rc, _ = await _git_read(repo_root, "check-ref-format", "--branch", branch)
+    except Exception as exc:
+        raise _task_stale(
+            task_id, branch, wt_path, f"task branch name could not be checked: {exc}",
+        ) from exc
+    if rc != 0:
+        raise _task_stale(task_id, branch, wt_path, "task ID prefix is not a valid Git branch name")
+
+    try:
+        tip = await branch_tip(branch, repo_root)
+    except Exception as exc:
+        raise _task_stale(task_id, branch, wt_path, f"task branch could not be classified: {exc}") from exc
+    if tip is not None:
+        raise _task_stale(task_id, branch, wt_path, f"retained task branch exists at {tip}")
+
+    try:
+        records = await _worktree_records(repo_root)
+    except Exception as exc:
+        raise _task_stale(
+            task_id, branch, wt_path, f"git worktree list could not be read: {exc}",
+        ) from exc
+    if records is None:
+        raise _task_stale(task_id, branch, wt_path, "git worktree list could not be read")
+    if _listed_records(records, wt_path):
+        raise _task_stale(task_id, branch, wt_path, "target path already has a worktree registration")
+    branch_ref = f"refs/heads/{branch}"
+    if any(record.get("branch") == branch_ref for record in records):
+        raise _task_stale(task_id, branch, wt_path, "task branch is registered at another worktree path")
+    try:
+        has_tag = await _tag_conflict(branch, repo_root)
+    except Exception as exc:
+        raise _task_stale(task_id, branch, wt_path, f"task tag could not be classified: {exc}") from exc
+    if has_tag:
+        raise _task_stale(task_id, branch, wt_path, "same-named tag already exists")
+    if os.path.lexists(wt_path):
+        raise _task_stale(task_id, branch, wt_path, "target path is already occupied")
+    return branch, wt_path
 
 
 async def branch_tip(branch: str, repo_root: Path) -> str | None:
@@ -363,66 +377,6 @@ def _record_for(records: list[dict[str, str]], wt_path: Path) -> dict[str, str] 
     )
 
 
-async def _clear_stale_dir(wt_path: Path, repo_root: Path, task_id: str) -> None:
-    """Clear a task-worktree path that ``cleanup_worktree`` could not remove.
-
-    A registered worktree survives cleanup because ``git worktree remove``
-    (no ``--force``) refused it, i.e. it holds uncommitted work or a lock.
-    It is never deleted: the worktree reaper archives it into the worktree
-    trash, and re-creating at the same path cannot work while git still has it
-    registered (MEASURED: the add fails on the existing branch, then on the
-    registered path). A directory git does not know is an orphan; it goes to
-    the trash (#2926 G2) so the new worktree can take its place.
-
-    Registration comes from ``git worktree list``, not ``git rev-parse`` inside the directory:
-    task worktrees live under the repo, so ``git rev-parse`` inside an orphan
-    directory walks up to the main repository and succeeds (MEASURED). An
-    unreadable list deletes nothing.
-    """
-    records = await _worktree_records(repo_root)
-    if records is None:  # unreadable or timed out: treat as registered, delete nothing
-        raise StaleWorktreeError(
-            f"the previous worktree for this task, {wt_path}, was left in place: "
-            "git's worktree list could not be read to tell an orphan from live work"
-        )
-    if wt_path.is_symlink():
-        raise StaleWorktreeError(
-            f"the previous worktree path for this task, {wt_path}, is a symlink; "
-            "nothing reaps it, so remove the link by hand before retrying"
-        )
-    record = _record_for(records, wt_path)
-    if record is not None:
-        if "locked" in record:
-            raise StaleWorktreeError(
-                f"the previous worktree for this task, {wt_path}, is locked; nothing "
-                "reaps a locked worktree, so unlock it (git worktree unlock) or "
-                "remove it by hand before retrying"
-            )
-        raise StaleWorktreeError(
-            f"the previous worktree for this task, {wt_path}, holds uncommitted work "
-            "git would not remove; it was left in place, and the worktree reaper "
-            "archives it into the worktree trash once it goes idle"
-        )
-    from genesis.trash import TrashRefused, trash
-
-    try:
-        # Off the event loop: sizing a large orphan tree walks every file.
-        stone = await asyncio.to_thread(
-            trash,
-            wt_path,
-            reason=f"orphan task worktree directory, task {task_id}",
-            caller="worktree_mgr.create_worktree",
-        )
-    except TrashRefused as exc:
-        raise StaleWorktreeError(
-            f"the stale directory {wt_path} could not be moved to the trash: {exc}"
-        ) from None
-    logger.warning("Moved orphan task worktree dir %s to the trash (%s)", wt_path, stone.entry_id)
-    # A prunable record for this path survives the move, and ``git worktree
-    # add`` refuses "a missing but already registered worktree" (MEASURED).
-    await _prune_worktrees(repo_root)
-
-
 async def is_registered_worktree(wt_path: Path, repo_root: Path) -> bool:
     """Whether ``wt_path`` is a live linked worktree of ``repo_root`` (#3021).
 
@@ -437,9 +391,10 @@ async def is_registered_worktree(wt_path: Path, repo_root: Path) -> bool:
     to another task's worktree, and a ``.git`` file copied from another task.
     Paths are compared as named (``_as_named``), never fully resolved.
 
-    False sends the caller to re-create, which removes a clean worktree and
-    force-deletes its branch, committed steps included. So anything that
-    cannot be READ raises StaleWorktreeError instead of reading as False.
+    False means this path is not verified as this repository's live worktree.
+    Creation callers must independently refuse retained refs and occupied paths
+    rather than infer that the branch is disposable. Anything that cannot be
+    READ raises StaleWorktreeError instead of reading as False.
     """
     dot_git = wt_path / ".git"
     if wt_path.is_symlink() or not dot_git.is_file():
@@ -466,7 +421,12 @@ async def is_registered_worktree(wt_path: Path, repo_root: Path) -> bool:
         return False  # pruned admin directory: nothing points back
     except OSError:
         raise unreadable("git's record of it") from None
-    return _as_named(Path(back)) == _as_named(wt_path) / ".git"
+    # worktree.useRelativePaths writes this backlink relative to the admin
+    # directory. Keep the named-path check so a symlinked worktree cannot pass.
+    back_link = Path(back)
+    if not back_link.is_absolute():
+        back_link = admin_dir / back_link
+    return _as_named(back_link) == _as_named(wt_path) / ".git"
 
 
 async def cleanup_worktree(

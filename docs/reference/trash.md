@@ -80,8 +80,7 @@ nothing has it open, but only as this command reads its own configuration: with
 every Genesis process stopped and the path set only in `secrets.env`, `put`
 would move the database. It would then sit in the trash, the server would start
 on a new empty one, and `restore` would refuse until that new file is moved
-aside. A task-worktree reset (below) refuses a leftover directory a process is
-still using for the same reason.
+aside.
 
 The trash used to be planned per volume (a trash on each mount, after
 `send2trash`). It was narrowed to one trash because every caller lives on the
@@ -96,15 +95,9 @@ revisit it.
   file a modification created, and a forced rollback over newer content no
   ledger row records. Overwriting content the ledger row already holds trashes
   nothing.
-- **Task-worktree reset** (`autonomy/executor/worktree_mgr.create_worktree`): a
-  leftover directory git no longer knows. A registered task worktree with
-  uncommitted work is never deleted: the task fails with that reason (on every
-  retry until it is cleared) and the worktree reaper
-  (`scripts/worktree_lifecycle.py`) archives it, once idle, into its own
-  worktree trash, `~/.genesis/worktree-trash/`, which keeps git history and
-  has its own `--list-trash` / `--recover`. A LOCKED task worktree is never
-  reaped; the task fails saying so, and it needs `git worktree unlock` or a
-  manual removal.
+- **Task-worktree creation** (`autonomy/executor/worktree_mgr.create_worktree`):
+  retained branches and occupied or registered paths are refused without
+  deletion, pruning or trashing.
 
 - **Dashboard file API delete** (`DELETE /api/genesis/files/delete`; no button
   calls it today): the file (a symlink path deletes its target, as the route
@@ -161,13 +154,20 @@ is why the note says "if this session created them, nothing to do".
 - **Database rows**: deleting a follow-up, a knowledge entry, a memory or a
   reference from the dashboard deletes rows, not files, and is not covered.
 - **Task completion** retains checkout contents, registrations and refs, and
-  keeps the saved worktree path. This is not full task durability: creation-time
-  pruning, branch resets and orphan handling still need the follow-up for
-  #3020/#3060. A planning retry can refuse a retained checkout until exact
-  reattachment is implemented. Independent lifecycle cleanup is unchanged;
-  retention at completion is not a backup or expiry policy. Keeping a private
-  per-worktree ref does not guarantee its objects survive GC run from a
-  different checkout.
+  keeps the saved worktree path. Creation refuses retained or occupied state;
+  the live saved-path shortcut is unchanged, while missing-path recovery uses
+  fresh creation or refuses. Independent lifecycle cleanup is unchanged;
+  completion retention is
+  not a backup or expiry policy. A private per-worktree ref does not guarantee
+  its objects survive garbage collection run from a different checkout. Exact
+  reattachment and required-history recovery remain follow-up work for #3020/#3060.
+
+  Creation does not guarantee that an already-started Git child stops on caller
+  cancellation. Failed or raced creation can leave inspectable new refs,
+  checkout contents, registrations and administration; that is not silent
+  overwriting or license to delete it. A dangling symbolic ref can reach Git
+  before postvalidation refuses it. The executor never prunes or deletes this
+  partial state; manual inspection is required before retry.
 
 ## Retention and backups
 
