@@ -181,6 +181,29 @@ def test_readiness_observation_errors_stop_before_queue_actions(tmp_path, state)
     assert h and reason in (tmp_path / ".genesis/code-intelligence-runner.log").read_text()
 
 
+def test_busy_tick_records_health_clock_without_consuming_queue(tmp_path, monkeypatch):
+    # Capture requires a committed source tree. Use the existing disposable
+    # fixture rather than weakening that check for uncommitted development code.
+    from tests.test_scripts.test_code_intel_source import case
+
+    checkout, _, _ = case(tmp_path, monkeypatch, "runner")
+    _seed_marker(tmp_path)
+    before = _inventory(tmp_path)
+    database = _mdir(tmp_path) / "queue.sqlite3"
+    with closing(sqlite3.connect(database, isolation_level=None)) as db:
+        db.execute("BEGIN EXCLUSIVE")
+        result = _run_runner(tmp_path, runner=checkout / "scripts/code_intel_runner.sh")
+    assert result.returncode == 0, result.stderr
+    assert "queue busy at readiness" in _runner_log(tmp_path)
+    assert not (tmp_path / "entry.log").exists()
+    assert _inventory(tmp_path) == before
+    clock = json.loads((tmp_path / ".genesis/code-intel-runner-busy.json").read_text())
+    assert clock["version"] == 1 and clock["pending"] == {}
+    assert 0 <= clock["active"]["first_busy_ns"] <= clock["active"]["last_busy_ns"]
+    assert clock["active"]["due_registered"] is False
+    assert not list((tmp_path / ".genesis/alerts/queue").glob("*.json"))
+
+
 def test_missing_marker_helper_is_explicit_deferral(tmp_path):
     private = tmp_path / "runner"
     private.mkdir()

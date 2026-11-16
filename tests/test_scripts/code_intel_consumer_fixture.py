@@ -39,7 +39,7 @@ def main(argv=None, *, supervisor=None):
     if command == 'reconcile-native' and os.environ.get('TEST_BUSY_CLAIM_RECONCILIATION') == '1':
         if get_inflight(os.environ['TEST_QUEUE_HASH']) is not None:
             Path(os.environ['TEST_RECONCILE_WITNESS']).write_text('busy after claim')
-            return 75
+            return int(os.environ.get('TEST_CLAIM_RECONCILIATION_STATUS', '75'))
     if command == 'automatic-ready':
         return 0 # Owned future-capability fixture only; metadata stays zero.
     if command == 'claim-native':
@@ -162,11 +162,13 @@ def remove_readiness_fence(root):
     """Prepare only an owned harmless future-tail fixture, before capture."""
     path = root / 'scripts/code_intel_runner.sh'
     fence = '''protocol_rc=0
+TICK_OUTCOME=error
+TICK_PHASE=readiness
 _marker automatic-ready > /dev/null 2>> "$LOG_FILE" || protocol_rc=$?
 case "$protocol_rc" in
     0) _log "readiness helper reported ready, but this protocol has no ready state — stopping tick"; exit 76 ;;
-    10) _log "automatic queue protocol incomplete — deferring"; exit 0 ;;
-    75) _log "queue busy at readiness — deferring"; exit 0 ;;
+    10) TICK_OUTCOME=nonbusy; _log "automatic queue protocol incomplete — deferring"; exit 0 ;;
+    75) TICK_OUTCOME=busy; _log "queue busy at readiness — deferring"; exit 0 ;;
     *) _log "automatic queue protocol observation failed — stopping tick"; exit 76 ;;
 esac
 '''
