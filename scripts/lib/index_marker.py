@@ -717,8 +717,7 @@ def reconcile_native() -> list[str]:
 def reserve_launch(context: dict, data: dict) -> str:
     context = _native.context(context, _legs, marker_hash)
     data = _native.reservation(data, context)
-    with _queue_gate(native=True, admission=(context["hash"], context["provider"])) as db:
-        state = _native.reserve(db, context, data, _legs, fresh_cleanup=_fresh_gate(db))
+    state = _retry.launch_transition(globals(), context, data, _native.reserve)
     if state in ("conflict", "held"):
         raise RuntimeError("native reservation refused: " + state)
     return state
@@ -732,8 +731,7 @@ def cancel_launch(context: dict) -> str:
 
 def _native_gate(context, data, operation):
     context = _native.context(context, _legs, marker_hash)
-    with _queue_gate(native=True, admission=(context["hash"], context["provider"])) as db:
-        state = operation(db, context, data, _legs, _proof, fresh_cleanup=_fresh_gate(db))
+    state = _retry.launch_transition(globals(), context, data, operation)
     if state in ("conflict", "resource", "held"):
         raise RuntimeError("native launch refused: " + state)
     return state
