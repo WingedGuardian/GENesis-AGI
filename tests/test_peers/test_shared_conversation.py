@@ -1,6 +1,7 @@
 """Restricted foreign reasoning never inherits private owner authority/history."""
 
 import asyncio
+import base64
 import json
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
@@ -10,8 +11,8 @@ import pytest
 
 from genesis.peers.conversation import ConversationRefusal
 from genesis.peers.outbox import Outbox, owned_context
+from tests.test_peers.test_conversation import _clock_receipt, incoming, message, settle
 from tests.test_peers.test_conversation import bridge as bridge
-from tests.test_peers.test_conversation import incoming, message, settle
 
 
 @pytest.fixture(autouse=True)
@@ -355,3 +356,66 @@ async def test_malformed_receipt_modes_cannot_default_to_owner(bridge, marker):
         await b.service.get(b.identities["alpha"], row["id"])
     assert caught.value.status == 404
     assert (await b.service.list(b.identities["alpha"], 20))[0] == []
+
+
+@pytest.mark.parametrize("same_owner", [1, 0])
+async def test_task_cursor_binds_current_trust_despite_stale_identity(bridge, same_owner):
+    b = bridge
+    identity = b.identities["alpha"]
+    if not same_owner:
+        identity = await foreign(b)
+    trust = "same_owner" if same_owner else "conversation_shared"
+    for _ in range(3):
+        sid = await _clock_receipt(b)
+        await b.db.execute(
+            "UPDATE cc_sessions SET metadata=json_set(metadata,'$.conversation_trust',?) WHERE id=?",
+            (trust, sid),
+        )
+    await b.db.commit()
+    rows, token, total = await b.service.list(identity, 1)
+    assert len(rows) == 1 and token and total == 3
+    following, tail, following_total = await b.service.list(identity, 20, token)
+    assert len(following) == 2 and tail == "" and following_total == 3
+    assert rows[0]["id"] not in {r["id"] for r in following}
+    async with b.registry.transaction() as db:
+        await db.execute("UPDATE peers SET same_owner=? WHERE peer_id='alpha'", (1 - same_owner,))
+    if same_owner:
+        await b.registry.grant("alpha", "conversation_shared", "allow")
+    with pytest.raises(ConversationRefusal) as refused:
+        await b.service.list(identity, 20, token)
+    assert refused.value.code == "validation_error" and refused.value.status == 400
+
+
+@pytest.mark.parametrize("same_owner", [1, 0])
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_context_cursor_page_total_and_legacy_trust(bridge, same_owner, legacy):
+    b = bridge
+    identity = b.identities["alpha"] if same_owner else await foreign(b)
+    trust = "same_owner" if same_owner else "conversation_shared"
+    other_trust = "conversation_shared" if same_owner else "same_owner"
+    context, other_context = str(uuid4()), str(uuid4())
+    target = set()
+    for row_context, row_trust in [(context, trust)] * 3 + [(other_context, trust), (context, other_trust)]:
+        sid = await _clock_receipt(b)
+        await b.db.execute(
+            "UPDATE cc_sessions SET metadata=json_set(metadata,'$.context_id',?,'$.conversation_trust',?) WHERE id=?",
+            (row_context, row_trust, sid),
+        )
+        if row_context == context and row_trust == trust:
+            target.add(sid)
+    await b.db.commit()
+    rows, token, total = await b.service.list(identity, 1, context=context)
+    assert len(rows) == 1 and token and total == 3
+    if legacy:
+        value = json.loads(base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)))
+        value["v"] = 1
+        value.pop("trust", None)
+        token = base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+    if legacy and not same_owner:
+        with pytest.raises(ConversationRefusal) as refused:
+            await b.service.list(identity, 20, token, context)
+        assert refused.value.code == "validation_error" and refused.value.status == 400
+    else:
+        following, tail, following_total = await b.service.list(identity, 20, token, context)
+        assert len(following) == 2 and tail == "" and following_total == 3
+        assert {r["id"] for r in rows + following} == target

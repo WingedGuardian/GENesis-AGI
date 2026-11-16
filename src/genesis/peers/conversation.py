@@ -557,23 +557,19 @@ class ConversationService:
             uuid_id(context)
         else:
             context = None
-        anchor = task_cursor.decode(token, identity.peer, context) if token is not None else None
-        async with self.registry.connection() as authority_db:
-            peer = await authorize(authority_db, identity, allow_shared=True)
-        where, owner = owned(peer)
-        values = list(owner)
-        if anchor:
-            where += " AND (a2a_status_at,id)<(?,?)"
-            values += list(anchor)
-        if context:
-            where += " AND json_extract(metadata,'$.context_id')=?"
-            values.append(context)
         async with self.registry.connection() as db:
             await self._same_database(db)
             await db.execute("BEGIN")
-            current = await authorize(db, identity, allow_shared=True)
-            if conversation_trust(current) != conversation_trust(peer):
-                raise ConversationRefusal("state_conflict", 409)
+            peer = await authorize(db, identity, allow_shared=True)
+            anchor = task_cursor.decode(token, peer, context) if token is not None else None
+            where, owner = owned(peer)
+            values = list(owner)
+            if anchor:
+                where += " AND (a2a_status_at,id)<(?,?)"
+                values += list(anchor)
+            if context:
+                where += " AND json_extract(metadata,'$.context_id')=?"
+                values.append(context)
             rows = await (
                 await db.execute(
                     f"SELECT cc_sessions.*, {PENDING} AS pending_approvals "  # noqa: S608 — static schema expression
@@ -594,7 +590,7 @@ class ConversationService:
                 raise ConversationRefusal("not_ready", 503)
             return (
                 [dict(r) for r in rows[:size]],
-                task_cursor.encode(rows[size - 1], identity.peer, context) if len(rows) > size else "",
+                task_cursor.encode(rows[size - 1], peer, context) if len(rows) > size else "",
                 total[0],
             )
 

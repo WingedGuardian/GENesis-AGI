@@ -181,6 +181,9 @@ release = []  # detect-secrets is now a core dep (see dependencies above)
 requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.package-data]
+genesis = ["identity/PEER_PUBLIC.md"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
