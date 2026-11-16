@@ -385,5 +385,10 @@ def worker(captured, outcome, phase):
         )
         pending = {}
         _due(pending, "observation_error", interval)
+        # No writable episode record: one unavailable-monitor identity per root/boot.
+        # Keep attempt timing in the body; the existing outreach window owns repeats.
+        pending["observation_error"]["key"] = "code-intel-health-unavailable:" + hashlib.sha256(
+            json.dumps([os.path.abspath(base), interval["boot_id"]]).encode()
+        ).hexdigest()
         enqueue("observation_error", pending["observation_error"], holders(base))
         return 76

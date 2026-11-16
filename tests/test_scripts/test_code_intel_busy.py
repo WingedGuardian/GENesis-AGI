@@ -8,7 +8,9 @@ import json
 import os
 import subprocess
 import sys
+from itertools import count
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -334,3 +336,70 @@ def test_invalid_other_notice_cannot_discard_valid_due_debt(tmp_path):
     assert not tick(tmp_path, DUE + 1, lambda *args: False)
     assert read(tmp_path)["pending"]["prolonged_busy"] == expected
     assert read(tmp_path)["pending"]["observation_error"]["count"] == 1
+
+
+@pytest.mark.parametrize("failure", ["future", "directory", "write"])
+def test_unavailable_health_record_reuses_real_queue_identity(tmp_path, monkeypatch, failure):
+    path = tmp_path / "code-intel-runner-busy.json"
+    if failure == "future":
+        path.write_text('{"version":2}')
+    elif failure == "directory":
+        path.mkdir()
+    else:
+        publish = busy._publish
+
+        def uncertain_write(*args):
+            publish(*args)
+            raise OSError("publication acknowledgement unavailable")
+
+        monkeypatch.setattr(busy, "_publish", uncertain_write)
+    before = path.lstat() if path.exists() else None
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path))
+    now = count(10)
+    monkeypatch.setattr(busy.time, "monotonic_ns", lambda: next(now))
+    captured = SimpleNamespace(
+        buffers={"scripts/lib/alert_queue.sh": (ROOT / "scripts/lib/alert_queue.sh").read_bytes()}
+    )
+    assert busy.worker(captured, "busy", "readiness") == 76
+    assert busy.worker(captured, "nonbusy", "complete") == 76
+    notices = list((tmp_path / "alerts/queue").glob("*.json"))
+    assert len(notices) == 1, "unchanged unavailable monitoring minted a second real queue notice"
+    notice = json.loads(notices[0].read_text())
+    assert notice["dedupe_key"] and "observation_error" in notice["body"]
+    if before is not None:
+        after = path.lstat()
+        assert (before.st_ino, before.st_mode, before.st_mtime_ns) == (
+            after.st_ino, after.st_mode, after.st_mtime_ns
+        )
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_unavailable_health_identity_separates_roots_and_boots(tmp_path, monkeypatch, relative):
+    keys, boot = [], [BOOT]
+    read_text = Path.read_text
+
+    def read(path, *args, **kwargs):
+        if path == Path("/proc/sys/kernel/random/boot_id"):
+            return boot[0]
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    now = count(10)
+    monkeypatch.setattr(busy.time, "monotonic_ns", lambda: next(now))
+    monkeypatch.setattr(
+        busy, "_enqueue", lambda captured, kind, item, snapshot: keys.append(item["key"]) or True
+    )
+    for name, identity in [("one", BOOT), ("two", BOOT), ("one", OTHER_BOOT), ("one", BOOT)]:
+        base = tmp_path / name
+        base.mkdir(exist_ok=True)
+        path = base / "code-intel-runner-busy.json"
+        path.write_text('{"version":2}')
+        boot[0] = identity
+        if relative:
+            monkeypatch.chdir(base)
+        monkeypatch.setenv("GENESIS_HOME", "." if relative else str(base))
+        assert busy.worker(SimpleNamespace(), "busy", "readiness") == 76
+        assert path.read_text() == '{"version":2}'
+    assert keys[0] == keys[3], "a later attempt in the same root/boot changed identity"
+    assert keys[0] != keys[1], "independent health roots cross-suppress each other"
+    assert keys[0] != keys[2], "a new boot reuses the prior boot's unavailable identity"

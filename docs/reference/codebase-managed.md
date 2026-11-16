@@ -536,6 +536,12 @@ changes provider evidence, attempts, quarantine, retry grants or readiness.
 The current opaque owner/apply error remains an error; the later cutover needs
 its separate typed busy distinction before enabling consumption.
 
+When timing cannot be read or written, its fallback diagnostic uses one stable
+identity per health root and boot. Queued repeats coalesce and the existing
+outreach window controls redelivery. Separate failure episodes cannot be proved
+without a usable timing record, so faults in that scope/window can coalesce;
+the notice still labels its actual enqueue-attempt snapshot.
+
 No ordinary command converts an existing queue. Converting on connect is unsafe
 across code rollbacks: a failed update restores older code but not the queue,
 and older code refuses a newer schema. On an older queue (schema 1, 2 or 3, or an
