@@ -68,6 +68,12 @@ def validate_manifest(manifest):
             raise Incomplete("duplicate attempt or invalid request hash")
         seen.add(row["id"])
         currency(row.get("max_charge"))
+        if "cost_basis" in row:
+            from .native_expense import validate_spec
+
+            validate_spec(row)
+        elif "native_tariff" in row:
+            raise Incomplete("native tariff requires an explicit cost basis")
     if total(currency(row["max_charge"]) for row in manifest["attempts"]) > currency(
         manifest["budget"]
     ):
@@ -88,6 +94,13 @@ class State:
 
 def _billing(row):
     """Missing cost can reconcile; contradictory or invalid evidence cannot settle."""
+    if "cost_basis" in row["spec"]:
+        from .native_expense import interval
+
+        measured = interval(row)
+        return measured[1] if measured is not None and measured[1] <= currency(row["spec"]["max_charge"]) else None
+    if any(isinstance(item, dict) and "cost_basis" in item for item in row["receipts"]):
+        return None
     charges = []
     ids = {item['generation_id'] for item in row.get('lookups', [])}
     for answer in row["observations"]:
