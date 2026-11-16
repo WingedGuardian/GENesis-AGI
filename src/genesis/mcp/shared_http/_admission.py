@@ -8,6 +8,7 @@ from mcp_types import jsonrpc_message_adapter
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import Response
 
+from genesis.mcp.database_target import TARGET_ENDPOINT, TARGET_META
 from genesis.mcp.plan_bookmark_context import PENDING_ENDPOINT
 from genesis.mcp.shared_paths import BASE_ENDPOINT, FORWARDER_ENDPOINT
 
@@ -27,7 +28,7 @@ def _check_id(value):
         raise ValueError("Unsupported shared request ID")
 
 
-def validate_envelope(body: bytes) -> dict:
+def validate_envelope(body: bytes, *, target_bound=False) -> dict:
     try:
         value = json.loads(body, object_pairs_hook=_Object, parse_constant=_not_json_constant)
         if not isinstance(value, dict):
@@ -40,6 +41,8 @@ def validate_envelope(body: bytes) -> dict:
         structural = [value, value.get("error")]
         if isinstance(params, dict):
             structural.extend((params, params.get("_meta")))
+            if target_bound and isinstance(params.get("_meta"), dict):
+                structural.append(params["_meta"].get(TARGET_META))
         if any(isinstance(node, _Object) and node.duplicate for node in structural):
             raise ValueError("Duplicate envelope field")
         if "id" in value:
@@ -81,11 +84,11 @@ class EnvelopeGuard:
 
     async def __call__(self, scope, receive, send):
         if (scope["type"] != "http" or scope["method"] != "POST"
-                or scope["path"] not in {BASE_ENDPOINT, FORWARDER_ENDPOINT, PENDING_ENDPOINT}):
+                or scope["path"] not in {BASE_ENDPOINT, FORWARDER_ENDPOINT, PENDING_ENDPOINT, TARGET_ENDPOINT}):
             return await self.app(scope, receive, send)
         try:
             body = await Request(scope, receive).body()
-            validate_envelope(body)
+            validate_envelope(body, target_bound=scope["path"] == TARGET_ENDPOINT)
         except (ValueError, ClientDisconnect):
             return await Response("Invalid MCP envelope", status_code=400)(scope, receive, send)
         consumed = False

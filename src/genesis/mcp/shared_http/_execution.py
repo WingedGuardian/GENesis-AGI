@@ -9,6 +9,7 @@ from fastmcp.server.middleware import Middleware
 from mcp import MCPError
 
 from genesis.caller_context import request_caller
+from genesis.mcp.database_target import TARGET_ENDPOINT, require_database_target
 from genesis.mcp.external_profiles import ExternalProfile, current_external_profile
 from genesis.mcp.plan_bookmark_context import PENDING_ENDPOINT, request_pending_bookmark
 from genesis.mcp.shared_paths import FORWARDER_ENDPOINT, SharedPathError, request_paths
@@ -52,8 +53,9 @@ class SharedInstrumentation(InstrumentationMiddleware):
 
 
 class SharedMessages(Middleware):
-    def __init__(self, config, catalog, enabled):
+    def __init__(self, config, catalog, enabled, *, database_target=None):
         self.service, self.catalog, self.enabled = config.service, catalog, enabled
+        self.database_target = database_target
         self.limiter = anyio.CapacityLimiter(config.tool_concurrency)
         self.busy = 0
 
@@ -72,6 +74,14 @@ class SharedMessages(Middleware):
         # Use validated metadata, never a lost-scope/default CallerContext as
         # evidence of a forwarder role. Discovery/cancel never borrow a token.
         caller = authenticated_caller(get_http_request().scope)
+        active = context.fastmcp_context.request_context if context.fastmcp_context is not None else None
+        if get_http_request().url.path == TARGET_ENDPOINT:
+            if self.service != "memory" or caller.profile is not None:
+                raise ToolError("Database binding requires an authenticated memory forwarder")
+            try:
+                require_database_target(active.meta if active is not None else None, self.database_target)
+            except SharedPathError as error:
+                raise ToolError(str(error)) from None
         if not self.catalog.allowed(context.message.name, caller, enabled=self.enabled() is True):
             raise ToolError("Tool unavailable in this shared service")
         token = object()
@@ -81,13 +91,12 @@ class SharedMessages(Middleware):
             self.busy += 1
             raise MCPError(code=-32000, message=BUSY_MESSAGE) from None
         try:
-            active = context.fastmcp_context.request_context if context.fastmcp_context is not None else None
             with request_paths(self.service, context.message.name, context.message.arguments,
                                active.meta if active is not None else None,
-                               versioned=get_http_request().url.path in {FORWARDER_ENDPOINT, PENDING_ENDPOINT},
+                               versioned=get_http_request().url.path in {FORWARDER_ENDPOINT, PENDING_ENDPOINT, TARGET_ENDPOINT},
                                metadata_available=active is not None), request_pending_bookmark(
                     self.service, caller, active.meta if active is not None else None,
-                    versioned=get_http_request().url.path == PENDING_ENDPOINT):
+                    versioned=get_http_request().url.path in {PENDING_ENDPOINT, TARGET_ENDPOINT}):
                 return await call_next(context)
         except SharedPathError as error:
             raise ToolError(str(error)) from None
