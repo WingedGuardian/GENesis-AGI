@@ -37,6 +37,10 @@ class AlertDispatcher:
     def add_channel(self, channel: AlertChannel) -> None:
         self._channels.append(channel)
 
+    @property
+    def has_channels(self) -> bool:
+        return bool(self._channels)
+
     async def send(self, alert: Alert, *, allow_queue_fallback: bool = True) -> bool:
         """Send alert to all channels. Returns True if any succeeded.
 

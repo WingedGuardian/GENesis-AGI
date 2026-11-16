@@ -6,6 +6,7 @@ source-and-call pattern. Age is set via os.utime -> wall-clock-independent.
 """
 
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -79,7 +80,7 @@ def test_missing_dir_is_noop(tmp_path):
 
 # ── liveness: an old child still held open is spared (watchgod v2) ────────
 #
-# The pressure mode prunes at 2 days, where "a download that started days ago
+# The pressure mode prunes at 4 days (2 at RED), where "a download that started days ago
 # is still running" stops being hypothetical. The holder is a real process with
 # a real open descriptor, so the prune reads /proc exactly as it does live.
 
@@ -643,3 +644,58 @@ def test_the_recursive_delete_scan_sees_every_spelling():
         assert rm_r.search(comment.sub("", line)), line
     for line in ('rm -f -- "$x"', '# rm -rf "$x"', 'echo x  # rm -rf "$x"', 'find . -delete'):
         assert not rm_r.search(comment.sub("", line)), line
+
+
+# ── how far each pressure tier reaches, and what it says it removed ───────
+#
+# The standard (ORANGE) pass can start on a disk that still has room: the ETA
+# tier lifts a YELLOW floor one level when a burst writes fast. So it spares
+# ~/tmp work younger than 4 days. The last-resort (RED) pass keeps 2 days.
+
+
+def _pressure_with(tmp_path: Path, tier: str, ages: dict[str, float]) -> tuple[str, dict]:
+    home = tmp_path / "home"
+    (home / "tmp").mkdir(parents=True, exist_ok=True)
+    for name, days in ages.items():
+        job = home / "tmp" / name
+        job.mkdir()
+        (job / "out.bin").write_bytes(b"x" * 3 * 1024 * 1024)
+        _age(job / "out.bin", days)
+        _age(job, days)
+    out = _pressure_out(tmp_path, tmp_path / "reclaim.lock", tier, 1)
+    return out, {n: (home / "tmp" / n).exists() for n in ages}
+
+
+def test_the_standard_pressure_pass_spares_tmp_work_younger_than_four_days(tmp_path):
+    out, kept = _pressure_with(tmp_path, "standard", {"three_days": 3, "five_days": 5})
+    assert kept == {"three_days": True, "five_days": False}, out
+    assert "~/tmp age prune (>4d" in out
+
+
+@pytest.mark.parametrize("tier", ["last-resort", "--last-resort"])
+def test_the_last_resort_pressure_pass_still_prunes_at_two_days(tmp_path, tier):
+    out, kept = _pressure_with(tmp_path, tier, {"one_day": 1, "three_days": 3})
+    assert kept == {"one_day": True, "three_days": False}, out
+    assert "~/tmp age prune (>2d" in out
+
+
+def test_every_removed_entry_is_named_with_its_size(tmp_path):
+    d = tmp_path / "tmp"
+    d.mkdir()
+    job = d / "old_job"
+    job.mkdir()
+    (job / "out.bin").write_bytes(b"x" * 3 * 1024 * 1024)
+    _age(job / "out.bin", 10)
+    _age(job, 10)
+    f = d / "old.log"
+    f.write_text("x")
+    _age(f, 10)
+    # What the filesystem stores for the fixture (directory blocks on ext4,
+    # compression on btrfs) decides the number, so measure it the same way.
+    want = subprocess.run(["du", "-smx", "--", str(job)], capture_output=True, text=True,
+                          check=True).stdout.split()[0]  # fmt: skip
+    r = _run_prune(d)
+    assert not job.exists() and not f.exists()
+    sizes = re.findall(rf"tmp prune: removed {re.escape(str(job))} \((\d+) MB\)", r.stdout)
+    assert sizes == [want], r.stdout
+    assert f"tmp prune: removed {f} (" in r.stdout, r.stdout

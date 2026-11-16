@@ -72,10 +72,21 @@ class TopicManager:
         self._categories = categories or DEFAULT_CATEGORIES
         self._persistent_topics: dict[str, int] = {}  # category → thread_id
         self._create_lock = asyncio.Lock()
+        self._delivery_locks: dict[str, asyncio.Lock] = {}
         # Heal a shutdown-closed send client on outbound topic messages. The
         # host wires this to the Telegram adapter's stopping flag so we never
         # resurrect a client mid-shutdown; default = never stopping.
         self._stopping = stopping or (lambda: False)
+
+    def delivery_lock(self, category: str) -> asyncio.Lock:
+        """Serialize a caller's history/decision/delivery within this manager.
+
+        Topic creation has its own lock; sends must not reacquire this one.
+        There is no await between lookup and creation on the owning event loop.
+        """
+        if category not in self._delivery_locks:
+            self._delivery_locks[category] = asyncio.Lock()
+        return self._delivery_locks[category]
 
     async def load_persisted(self) -> None:
         """Load persisted topic mappings from DB. Call once after construction."""
@@ -155,6 +166,21 @@ class TopicManager:
     def get_thread_id(self, category: str) -> int | None:
         """Get the thread_id for a category without creating. Returns None if not created yet."""
         return self._persistent_topics.get(category)
+
+    async def recent_outbound(self, category: str, *, limit: int) -> list[dict] | None:
+        """What this bot last posted in ``category``'s topic, newest first.
+
+        Read back from the outbound rows ``_send_single`` persists, so it
+        survives a restart. ``None`` means it cannot be known (no database, or
+        the topic does not exist yet), which is not the same as "nothing
+        posted". A failed read raises.
+        """
+        thread_id = self.get_thread_id(category)
+        if self._db is None or thread_id is None:
+            return None
+        from genesis.db.crud.telegram_messages import latest_outbound
+
+        return await latest_outbound(self._db, self._chat_id, thread_id, limit=limit)
 
     async def send_to_category(
         self,

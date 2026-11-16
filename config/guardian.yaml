@@ -146,6 +146,8 @@ memory_tiers:
   host_high_pct: 88
   host_crit_pct: 94
   realert_hours: 6
+  # A tier is left only this many points below its line (no page per crossing).
+  exit_margin_pct: 5
 
 # Credential-file integrity backstop (G.1). The container self-heals corrupt
 # credential files first (its awareness tick); the guardian validates the same

@@ -1,0 +1,1 @@
+- Include retained retry code in server restart detection and recognize its existing sibling-loader declarations during deployment-inventory checks.

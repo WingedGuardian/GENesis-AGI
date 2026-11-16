@@ -136,21 +136,37 @@ def _require_current_server() -> None:
     svc = _service({"op": "status"})
     if isinstance(svc, dict) and svc.get("ok") and "loaded_at" in svc:
         return
-    if svc is None and not _server_unit_active():
-        return
+    if svc is None:
+        active = _server_unit_active()
+        if active is False:
+            return
+        if active is None:
+            raise vs.VaultError(
+                "cannot determine whether genesis-server is running; "
+                "restore the user service-manager connection and try again"
+            )
     raise vs.VaultError(_OLD_SERVER)
 
 
-def _server_unit_active() -> bool:
-    """Whether the genesis-server unit is active. No systemctl (an install without
-    a user systemd) means no such unit; an unanswered query counts as active."""
+def _server_unit_active() -> bool | None:
+    """True means active, False confirmed inactive/absent, None unknown.
+
+    A missing systemctl retains support for installs without a user systemd.
+    Query errors and transitional states never establish that the server is off.
+    """
     try:
-        cmd = ["systemctl", "--user", "is-active", "--quiet", "genesis-server"]
-        return subprocess.run(cmd, timeout=10, check=False).returncode == 0
-    except OSError:
+        cmd = ["systemctl", "--user", "is-active", "genesis-server"]
+        result = subprocess.run(cmd, timeout=10, check=False, capture_output=True, text=True)
+    except FileNotFoundError:
         return False
-    except subprocess.TimeoutExpired:
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    state = result.stdout.strip()
+    if result.returncode == 0 and state in {"active", "reloading"}:
         return True
+    if result.returncode in {3, 4} and state == "inactive":
+        return False
+    return None
 
 
 def _cmd_unlock(args: argparse.Namespace) -> int:

@@ -63,7 +63,8 @@ harm and why redaction/public-task/private-evidence cannot avoid it.
 Both writers retain the measurement verdict when routing is pending and leave the
 row OPEN. CLI exit **4 means measurement recorded or previewed, tracking pending**;
 re-read before retrying. MCP exposes `recorded`, `tracking_complete`, `tracking`
-and `would_close` separately. A preview stores nothing. Never call the batch
+and `would_close` separately, and `prompts` (see "Completeness checks" under
+Evidence). A preview stores nothing. Never call the batch
 handled until the selected-row checkpoint reports complete tracking.
 
 Checkpoint after each row, before moving batches, and before a completion report.
@@ -238,8 +239,13 @@ count says anything about the other.
 
 ## Standing mode (Claude Code only)
 
+**Only the owner starts one.** A session never starts or restarts a standing
+loop on its own: not from an earlier yes, a plan step or a ledger row, and not
+after the loop stops. Each start needs the owner's explicit instruction at that
+moment. Once started, the loop paces itself until a stop rule below ends it.
+
 A standing validator is a session the owner starts, in a tmux slot, to work the
-backlog one PR at a time. Start it with `/loop` (no interval) so it can pace
+backlog one PR at a time. The owner starts it with `/loop` (no interval) so it can pace
 itself with ScheduleWakeup; it also uses `outreach_send`, so it is a Claude Code
 mode, and the Codex validator above does not run it. **Run one per install:** the
 picker has no lease, so two would pick the same row and report the same failure
@@ -320,7 +326,9 @@ loop's end.
      `fail-intent` whose tracking is pending:** the picker never offers a
      fail-intent row again, so nothing would bring it back.
    - a saved closing document: end the loop and tell the owner (one
-     `outreach_send` if they are not attached).
+     `outreach_send` if they are not attached), quoting the dry run's
+     `check:` lines (MCP: its `prompts`) so the owner sees its open questions
+     before closing it.
 7. **Pace:** ScheduleWakeup for the next pass.
 
 **A pick whose change is truly absent from the serving tree** (rare, since the
@@ -566,6 +574,49 @@ refusal rule was tested only on its release half, and the defect was in the serv
 half; another's post-save warning was tested on one stop path, and a second path
 lacked it. Open issues named both defects, and neither was read.
 
+### The holdout check
+
+An install may keep hidden holdout scenarios that builders never see
+(`docs/reference/holdout.md`). For every row, run
+`.venv/bin/python scripts/holdout_runner.py --pr <N>` from the main checkout. It
+prints `no holdout on this install`, or one line per scenario the merge touches.
+Record it:
+
+- `REGRESSED` and `NOT-DELIVERED` are a claim that failed at `MEASURED`, so the
+  row derives `fail-intent`.
+- `DELIVERED` goes in `controls`: it failed before the merge and passes after.
+  Then spawn `holdout-writer` in the foreground to retire it into a regression
+  scenario.
+- `PASS` is a finding, never a control: nothing had to come out the other way.
+- `PENDING` needs nothing: the scenario belongs to another issue's work, or to
+  a later PR in a split of this one.
+- `BROKEN-BEFORE`, `STALE-INTENT`, `FIXED`, `DELIVERED-UNLINKED`,
+  `CLOSED-NOT-DELIVERED` and `MALFORMED`
+  are findings about the default branch or the scenario, never this row's
+  verdict. File or reuse an issue for `BROKEN-BEFORE`, and tell the owner about
+  the rest.
+- Exit 3 (the run could not be completed) is a gap naming the reason it printed.
+- A `holdout fence:` line naming possibly spoiled scenarios goes to the owner:
+  a scenario seen by someone other than its writer may be spoiled. One that
+  names none needs no report unless it also counts unreadable lines or
+  says to confirm holdout-writer accesses (those made since the newest
+  scenario was written), which the owner confirms; the same holds for a
+  `no exposures logged` line. An `exposure log unreadable` line goes to the
+  owner too. A line
+  saying the fence is not installed means exposures are not being recorded.
+  A `dismissed` count on the line goes to the owner too, with the latest
+  dismissal's time: any session can run the command, so the owner confirms
+  each dismissal was their ruling. Dismiss a row only when the owner rules it
+  harmless in the conversation:
+  `.venv/bin/python scripts/holdout_runner.py --dismiss <its at> --reason "<why>"`,
+  run as its own command, with a reason that never quotes scenario text. Check
+  that the count it prints equals the rows the owner ruled on; one time can
+  match several rows.
+
+Never open, list or quote the holdout directory (`$GENESIS_HOME/holdout/`,
+`~/.genesis/holdout/` by default) yourself, and never ask what a
+scenario checks beyond its printed `Protects` line: reading it spoils it.
+
 ---
 
 ## Hard limits
@@ -632,6 +683,29 @@ lacked it. Open issues named both defects, and neither was read.
 ---
 
 ## Evidence: what the record has to carry
+
+### Completeness checks
+
+Both writers run two checks on every document (#4180). Neither replaces the
+independent verifier: on 128 defects verifiers named in first-round documents, a
+deterministic rule could catch only a few (measured 2026-11-14).
+
+- **A refusal.** A close (a closing verdict with complete tracking) is refused
+  while an `event_gated` gap's trigger is a date on or before today (UTC); an
+  attempt that keeps the row open is not. The measurement is owed now: closing
+  would store a recheck already due, and a failed recheck never reopens the row.
+  Run the recheck and record its result as a claim (or as `not_yet_done` if it
+  cannot run here). If the event has not happened yet, set the trigger to the first
+  date on which it will have.
+- **Prompts.** Questions about the document's own completeness, each naming its
+  target: every `method` gap (is its step reachable here? then it is
+  `not_yet_done`); a claim saying something is unchanged or still true with no
+  before arm in its measurement; a claim citing tests from two or more test
+  modules (two claims folded into one?); an `accepted_limit` resting on a pass
+  count. Once the verdict is derived, the CLI prints them as `pr_verification:
+  check:` lines (dry run, open record or close), and MCP returns them as `prompts`. They change no verdict and are not stored, so
+  **answer each one on the dry run, before the real close**: fix the document, or
+  judge that it does not apply. A close is permanent.
 
 The evidence document is validated by a strict model
 (`genesis.session_awareness.pr_evidence`): every prose field must be a non-blank

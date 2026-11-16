@@ -110,6 +110,18 @@ def _pr_view(args: list[str], state: dict) -> tuple[int, str, str]:
     return _answer({f: pr[f] for f in fields}, _one(opts, "--jq"))
 
 
+def _pr_status(args: list[str], state: dict) -> tuple[int, str, str]:
+    """``review_reflection.pr_identity`` (the rounds row's remaining-findings
+    report). The merge-gate workflow checks out the BASE commit, so no PR belongs
+    to the current branch: ``currentBranch`` is null, the report reads that as
+    "no local branch for this PR" and shows UNKNOWN, never a count."""
+    pos, opts = _opts(args, {"--json"})
+    _allow_only(opts, {"--json"})
+    if pos or _one(opts, "--json") != "number,state,url":
+        raise _Unrouted(f"pr status {pos} {opts}")
+    return _answer({"currentBranch": None, "createdBy": [], "needsReview": []}, None)
+
+
 def _pr_list(args: list[str], state: dict) -> tuple[int, str, str]:
     pos, opts = _opts(args, {"--repo", "--state", "--label", "--limit", "--json", "--jq"})
     _allow_only(opts, {"--repo", "--state", "--label", "--limit", "--json", "--jq"})
@@ -216,13 +228,14 @@ GRAPHQL_DOCUMENTS = {
         " $number) { headRefOid body reviews(first: 100, after: $after_reviews) {"
         " pageInfo { hasNextPage endCursor } nodes { fullDatabaseId state submittedAt"
         " body author { login __typename } commit { oid } comments(first: 100) {"
-        " pageInfo { hasNextPage } nodes { fullDatabaseId replyTo { id } body } } } }"
+        " pageInfo { hasNextPage } nodes { fullDatabaseId replyTo { id } body path } } } }"
         " comments(first: 100, after: $after_comments) { pageInfo { hasNextPage"
         " endCursor } nodes { fullDatabaseId body createdAt updatedAt author { login"
         " __typename } } } files(first: 100, after: $after_files) { pageInfo {"
         " hasNextPage endCursor } nodes { path changeType } } commits(first: 100,"
         " after: $after_commits) { pageInfo { hasNextPage endCursor } nodes { commit"
-        " { oid parents(first: 100) { totalCount nodes { oid } } } } } } } }"
+        " { oid committedDate tree { oid } parents(first: 100) { totalCount nodes {"
+        " oid } } } } } } } }"
     ),
     "review_budget_reread": (
         "query($owner: String!, $name: String!, $number: Int!, $after_reviews:"
@@ -231,12 +244,12 @@ GRAPHQL_DOCUMENTS = {
         " headRefOid body reviews(first: 100, after: $after_reviews) { pageInfo {"
         " hasNextPage endCursor } nodes { fullDatabaseId state submittedAt body"
         " author { login __typename } commit { oid } comments(first: 100) { pageInfo"
-        " { hasNextPage } nodes { fullDatabaseId replyTo { id } body } } } }"
+        " { hasNextPage } nodes { fullDatabaseId replyTo { id } body path } } } }"
         " comments(first: 100, after: $after_comments) { pageInfo { hasNextPage"
         " endCursor } nodes { fullDatabaseId body createdAt updatedAt author { login"
         " __typename } } } commits(first: 100, after: $after_commits) { pageInfo {"
-        " hasNextPage endCursor } nodes { commit { oid parents(first: 100) {"
-        " totalCount nodes { oid } } } } } } } }"
+        " hasNextPage endCursor } nodes { commit { oid committedDate tree { oid }"
+        " parents(first: 100) { totalCount nodes { oid } } } } } } } }"
     ),
 }
 
@@ -357,6 +370,7 @@ def _review_budget_answer(state: dict, connections: tuple[str, ...]) -> dict:
                         if c.get("in_reply_to_id")
                         else None,
                         "body": c["body"],
+                        "path": c.get("path"),
                     }
                     for c in inline
                     if c.get("pull_request_review_id") == r["id"]
@@ -384,6 +398,8 @@ def _review_budget_answer(state: dict, connections: tuple[str, ...]) -> dict:
         {
             "commit": {
                 "oid": c["sha"],
+                "committedDate": ((c.get("commit") or {}).get("committer") or {}).get("date"),
+                "tree": {"oid": ((c.get("commit") or {}).get("tree") or {}).get("sha")},
                 "parents": {
                     "totalCount": len(c["parents"]),
                     "nodes": [{"oid": p["sha"]} for p in c["parents"]],
@@ -438,6 +454,8 @@ def _api(args: list[str], state: dict) -> tuple[int, str, str]:
 def _route(argv: list[str], state: dict) -> tuple[int, str, str]:
     if len(argv) >= 2 and argv[:2] == ["pr", "view"]:
         return _pr_view(argv[2:], state)
+    if len(argv) >= 2 and argv[:2] == ["pr", "status"]:
+        return _pr_status(argv[2:], state)
     if len(argv) >= 2 and argv[:2] == ["pr", "list"]:
         return _pr_list(argv[2:], state)
     if len(argv) >= 2 and argv[:2] == ["repo", "view"]:

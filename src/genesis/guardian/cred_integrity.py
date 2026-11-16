@@ -81,8 +81,13 @@ class CredTarget:
     file_mode: int = 0o600
 
 
-def resolve_secrets_path(home: Path) -> Path:
+def resolve_secrets_path(home: Path, repo_root: Path | None = None) -> Path:
     """Standalone twin of secrets_location.resolve, using the target home.
+
+    ``repo_root`` is the checkout the caller runs from, when it knows it (the
+    in-container self-heal passes ``genesis.env.repo_root()``). Without it the
+    root is ``GENESIS_REPO_ROOT`` or ``home/genesis``, which on a checkout
+    elsewhere misses its file and reports it missing.
 
     Keep an unreadable preferred candidate so validation reports unreadable,
     rather than treating it as missing and restoring over a live file.
@@ -95,7 +100,10 @@ def resolve_secrets_path(home: Path) -> Path:
             return home / override[2:]
         return Path(override).expanduser()
     new = home / ".config" / "genesis" / "secrets.env"
-    repo = Path(os.environ.get("GENESIS_REPO_ROOT") or home / "genesis").expanduser()
+    if repo_root is not None:
+        repo = Path(repo_root)
+    else:
+        repo = Path(os.environ.get("GENESIS_REPO_ROOT") or home / "genesis").expanduser()
     for candidate in (new, repo / "secrets.env", home / "genesis" / "secrets.env"):
         try:
             mode = os.stat(candidate).st_mode
@@ -110,10 +118,10 @@ def resolve_secrets_path(home: Path) -> Path:
     return repo / "secrets.env"
 
 
-def credential_path(target: CredTarget, home: Path) -> Path:
+def credential_path(target: CredTarget, home: Path, repo_root: Path | None = None) -> Path:
     """Secrets use the resolver; other credential paths stay HOME-relative."""
     if target.name == "secrets_env" and target.path == "genesis/secrets.env":
-        return resolve_secrets_path(home)
+        return resolve_secrets_path(home, repo_root)
     return home / target.path
 
 
@@ -298,13 +306,13 @@ def _known_present(path: Path) -> bool:
 
 
 def validate_file(
-    target: CredTarget, home: Path, backup_dir: Path | None
+    target: CredTarget, home: Path, backup_dir: Path | None, repo_root: Path | None = None
 ) -> ValidationResult:
     """Validate one target on disk. Missing disambiguates on backup presence:
     missing + backup exists → corruption ("missing"); missing + no backup →
     never provisioned ("absent", healthy — the clean degradation for installs
     without backups or without an optional file like genesis.yaml)."""
-    path = credential_path(target, home)
+    path = credential_path(target, home, repo_root)
     try:
         present = _exists(path)
         has_backup = (
@@ -327,9 +335,10 @@ def check_all(
     targets: tuple[CredTarget, ...] | None,
     home: Path,
     backup_dir: Path | None,
+    repo_root: Path | None = None,
 ) -> dict[str, ValidationResult]:
     tgts = targets if targets is not None else DEFAULT_TARGETS
-    return {t.name: validate_file(t, home, backup_dir) for t in tgts}
+    return {t.name: validate_file(t, home, backup_dir, repo_root) for t in tgts}
 
 
 # ── Restore (container-only side effects) ───────────────────────────────────
@@ -488,7 +497,12 @@ def decrypt_backup_stream(src: Path, passphrase: str | bytes, scratch: Path | No
 
 
 def restore_file(
-    target: CredTarget, *, home: Path, backup_dir: Path, passphrase: str
+    target: CredTarget,
+    *,
+    home: Path,
+    backup_dir: Path,
+    passphrase: str,
+    repo_root: Path | None = None,
 ) -> RestoreResult:
     """Restore one target from its encrypted backup. Order is the safety
     property: decrypt → validate decrypted → (only then) move original aside →
@@ -509,7 +523,7 @@ def restore_file(
             detail=f"decrypted backup {decrypted.status}: {decrypted.detail}",
         )
 
-    target_path = credential_path(target, home)
+    target_path = credential_path(target, home, repo_root)
     tmp = target_path.with_name(f".{target_path.name}.restore-tmp-{os.getpid()}")
     aside: Path | None = None
     try:
@@ -542,7 +556,7 @@ def restore_file(
             detail=f"placement failed: {exc}",
         )
 
-    placed = validate_file(target, home, backup_dir)
+    placed = validate_file(target, home, backup_dir, repo_root)
     mtime = datetime.fromtimestamp(src.stat().st_mtime, _UTC).isoformat()
     if not placed.ok:
         return RestoreResult(
@@ -594,14 +608,14 @@ def _backup_passphrase_value(raw: bytes, *, escrow: bool = False) -> str | None:
     return selected
 
 
-def resolve_passphrase(home: Path) -> str | None:
+def resolve_passphrase(home: Path, repo_root: Path | None = None) -> str | None:
     """env → validated secrets.env → host escrow. The escrow is the exit for the
     circular case (secrets.env itself corrupt → its passphrase is unusable)."""
     env_pass = os.environ.get("GENESIS_BACKUP_PASSPHRASE", "")
     if env_pass:
         return env_pass
 
-    secrets = resolve_secrets_path(home)
+    secrets = resolve_secrets_path(home, repo_root)
     try:
         raw = secrets.read_bytes()
     except OSError:

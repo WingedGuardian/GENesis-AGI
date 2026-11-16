@@ -106,14 +106,14 @@ _hold 8 "$RUNNER_LOCK" "runner"
 
 _log "ARMED — all code-intel indexing is frozen (repo=$REPO_PATH). Stop this unit to disarm."
 
-# Hold the locks open until systemd stops us. The backgrounded `sleep` INHERITS
-# lock fds 8/9, so it must be killed on the way out or an orphaned sleep keeps
-# the locks held after we exit (systemd's cgroup SIGKILL would reap it, but the
-# trap makes release deterministic for a plain SIGTERM too). Closing fds 8/9 in
-# THIS shell releases the locks.
+# Hold the locks open until systemd stops us. The backgrounded `sleep` gets lock
+# fds 8/9 closed, so only THIS shell holds the locks and its exit releases them
+# at once: the trap's `kill` does not wait, so a sleep that still held the fds
+# could keep the locks for a moment after disarm. The trap still kills the sleep
+# so it does not outlive us.
 _sleep_pid=""
 _disarm() { _log "disarming — releasing code-intel locks"; [ -n "$_sleep_pid" ] && kill "$_sleep_pid" 2>/dev/null; exit 0; }
 trap _disarm TERM INT
-sleep infinity &
+sleep infinity 8>&- 9>&- &
 _sleep_pid=$!
 wait "$_sleep_pid"

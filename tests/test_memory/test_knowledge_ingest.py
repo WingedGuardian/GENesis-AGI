@@ -9,10 +9,25 @@ detect-and-log only; ingestion is never blocked, and a scan error is fail-open.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from genesis.memory.knowledge_ingest import ingest_knowledge_unit
+
+
+@pytest.fixture(autouse=True)
+def _mock_lifetime_for_mock_database(monkeypatch):
+    """These are stub-only tests; real ownership is tested with owned storage."""
+    @contextlib.asynccontextmanager
+    async def writer(_db):
+        yield
+    monkeypatch.setattr("genesis.memory.knowledge_ingest.writer", writer)
+    monkeypatch.setattr("genesis.memory.knowledge_ingest.unreferenced", AsyncMock(
+        side_effect=lambda db, ids: ids,
+    ))
 
 
 def _mock_store() -> MagicMock:
@@ -21,6 +36,13 @@ def _mock_store() -> MagicMock:
     store.delete = AsyncMock()
     store._embeddings.model_name = "test-model"
     return store
+
+
+def _mock_db() -> MagicMock:
+    """A db whose reads return no rows (no other unit names the old point)."""
+    db = MagicMock()
+    db.execute_fetchall = AsyncMock(return_value=[])
+    return db
 
 
 async def _run(content: str):
@@ -34,7 +56,7 @@ async def _run(content: str):
     ):
         return await ingest_knowledge_unit(
             store=_mock_store(),
-            db=MagicMock(),
+            db=_mock_db(),
             content=content,
             project="proj",
             domain="dom",
@@ -94,7 +116,7 @@ async def _run_replace(delete_result):
     ):
         unit_id = await ingest_knowledge_unit(
             store=store,
-            db=MagicMock(),
+            db=_mock_db(),
             content="replacement body",
             project="proj",
             domain="dom",
@@ -142,7 +164,7 @@ async def _run_capture(provenance: dict | None = None):
     ) as upsert_mock:
         await ingest_knowledge_unit(
             store=store,
-            db=MagicMock(),
+            db=_mock_db(),
             content="some knowledge body",
             project="proj",
             domain="dom",

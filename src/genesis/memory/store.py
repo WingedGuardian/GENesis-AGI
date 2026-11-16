@@ -311,7 +311,8 @@ class MemoryStore:
         one deduplication matched — anything that may later COMPENSATE for the
         write — must use :meth:`store_reporting_creation` instead. Deleting a
         deduplicated id destroys a pre-existing memory that other rows point
-        at (Codex P1, PR #1653).
+        at (Codex P1, PR #1653). With ``dedup=False`` no deduplication runs,
+        so the id always names a memory this call created.
         """
         memory_id, _created = await self.store_reporting_creation(
             content, source, **kwargs
@@ -350,6 +351,7 @@ class MemoryStore:
         durability: str | None = None,
         expires_at: str | None = None,
         preference_domain: str | None = None,
+        dedup: bool = True,
     ) -> tuple[str, bool]:
         """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link.
 
@@ -375,6 +377,11 @@ class MemoryStore:
                 ``provenance.derive_origin_class`` and stamped into the
                 Qdrant payload, memory_metadata, and (for KB ingest paths)
                 knowledge_units.
+            dedup: False skips exact-content deduplication, so the returned id
+                always names a memory this call created (``created`` is True).
+                For a writer that must own its point outright: a credential
+                reference (#2426), whose cleanup deletes the point it stored
+                whenever its unit does not end up naming it.
         """
         # Validate life_domain if explicitly provided
         if life_domain is not None:
@@ -403,10 +410,11 @@ class MemoryStore:
         # Dedup normalized identity first; retain legacy raw-text compatibility.
         existing = None
         try:
-            existing = await memory_crud.find_exact_duplicate(
-                self._db, content=content, source_subsystem=source_subsystem,
-            )
-            if existing is None and content != raw_content:
+            if dedup:
+                existing = await memory_crud.find_exact_duplicate(
+                    self._db, content=content, source_subsystem=source_subsystem,
+                )
+            if dedup and existing is None and content != raw_content:
                 existing = await memory_crud.find_exact_duplicate(
                     self._db, content=raw_content, source_subsystem=source_subsystem,
                 )

@@ -1,0 +1,1 @@
+- A Sentinel approval waiting on you now goes away by itself once the alarm that raised it clears, even while an unrelated lower-tier warning is still active. Previously a long-lived warning that happened to be bundled into the request kept the approval pending for days, and a later approval press could still act on a problem that had already resolved (#3845).

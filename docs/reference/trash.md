@@ -192,7 +192,54 @@ check below holds, and keeps it (logging `KEEP <name>: <reason>`) otherwise:
   `config/.generated/`, and `*.egg-info/`;
 - the archive reads cleanly to the end of its gzip stream.
 
-Legacy directory entries are never expired. `--dry-run` reports how many would
+`scripts/worktree_lifecycle.py --compact-trash [--compact-after-days N]`
+(default 30) shrinks an UNMERGED archive instead, and only when nothing is lost.
+Every condition below must hold, or the archive is kept whole (`KEEP <name>:
+<reason>`):
+
+- the reaper recorded it on the unmerged lane with no uncommitted changes, it is
+  older than N days, and its recorded head resolves;
+- no recovery scratch directory and no directory of the same name sit beside it;
+- exactly one registration anchors it, with the plain archive lock reason, and
+  that registration's directory is absent, its HEAD is the recorded head, its
+  index matches that HEAD (nothing staged), and it holds no per-worktree refs;
+- every commit in that registration's reflog is reachable from the head,
+  branches, remote-tracking refs or tags;
+- every file in the tarball matches the head's tree, by the same check and
+  allowlist expiry uses; untracked or ignored files outside that allowlist keep
+  the archive, and so does a tracked file the tarball lacks (a deletion that was
+  never committed);
+- `refs/archived/<entry>-<sha256(entry)[:10]>` is a valid ref name and is free or
+  already names the head.
+
+It then, in this order:
+
+1. pins the head under that ref (create-only);
+2. writes `<entry>.compacted.bundle`, a verified git bundle of the commits the
+   head adds beyond the default branch (none when the branch already holds it);
+3. writes `<entry>.compacted.json`: the sidecar's metadata plus the pin and the
+   bundle's digest;
+4. removes the anchor;
+5. deletes the tarball and the sidecar.
+
+A run that stops part way is finished by the next one, which touches only the
+tarball and anchor the stub recorded. The stub, the bundle and the pin are kept
+for ever. The pin is the only ref holding the commit, and a refs repair can drop
+it silently, so every `--compact-trash` run first checks each stub's pin. It
+re-creates a missing pin, restoring it from the bundle when gc has already
+collected the commit, and reports anything it cannot repair as an `ERROR`.
+
+`--list-trash` shows a stub as `pinned`, or `PIN MISSING`. Expiry never deletes
+a stub, and never deletes a pin a stub owns. `--recover` repairs a lost pin the
+same way, then recreates the worktree detached at the pinned commit, keeping the
+stub. The regenerable paths in the allowlist above (caches, `.venv`,
+`node_modules`) do not come back.
+
+`--dry-run` takes no lock and writes nothing. The run exits 2 when an entry is
+held part way or a pin cannot be repaired. `GENESIS_WORKTREE_TRASH_COMPACTION=0`
+disables compaction. Nothing schedules it yet (#4160).
+
+Legacy directory entries are never expired or compacted. `--dry-run` reports how many would
 expire; `--no-network` judges offline, so an archive only a merged PR proves is
 kept. Git's repository-location variables (`GIT_DIR` and friends, and `GH_REPO`)
 in the caller's environment are ignored. One residual: once an archive judged by its merged PR expires, its exact

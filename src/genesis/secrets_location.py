@@ -31,10 +31,11 @@ exist but cannot be checked (a directory on its path is not searchable). That
 keeps the reader on the file it cannot open, so it fails loudly instead of
 silently loading an older legacy copy; all three copies agree on this.
 
-Readers find a home-config file and the secrets guard protects it, but the
-systemd units still load only the checkout file, and nothing creates the home
-config: the default switch and the units land with the migration. A home-config
-file created by hand before then splits the units from these readers.
+Readers find a home-config file and the secrets guard protects it. The systemd
+units load the one file `genesis_secrets_path` picks when bootstrap or install
+renders them, so a hand-made home-config file reaches the units at the next
+bootstrap. Nothing creates the home config yet: the default switch and the move
+land with the migration.
 """
 
 from __future__ import annotations

@@ -33,6 +33,8 @@ from secret_scrub import (  # noqa: E402
     scrub,
     scrub_info,
 )
+from secret_values import redact as redact_secret_values  # noqa: E402
+from secret_values import redact_deep as redact_secret_values_deep  # noqa: E402
 
 # Tools that produce low-signal observations — not worth capturing
 _SKIP_TOOLS = frozenset(
@@ -56,6 +58,16 @@ _SKIP_TOOLS = frozenset(
         "NotebookEdit",
     }
 )
+
+# Agent types whose tool activity is never recorded. Everything this hook
+# captures is extracted into memories that proactive recall shows to other
+# sessions, so an agent handling text that must stay out of recall (a writer of
+# hidden evaluation scenarios, which builders must never see) is skipped whole.
+# Keyed on agent_type alone, with or without an agent_id: a main session started
+# with --agent carries the type too, and it is the same writer, so observing it
+# would leak the same text. This closes the observer only: the parent session
+# later reading the agent's files with its own tools is observed as usual.
+_UNOBSERVED_AGENT_TYPES = frozenset({"holdout-writer"})
 
 # Max chars to capture from tool output
 _OUTPUT_CAP = 2000
@@ -145,7 +157,9 @@ def _summarize_output(tool_name: str, tool_input: dict, output_raw: str) -> str:
         return "[skipped: command reads a secret-bearing file]"
     if _is_credential_tool(tool_name):
         return "[skipped: credential-store tool]"
-    return scrub(_truncate_output(output_raw))
+    # Known secrets.env values first, and before truncating: a cut through a value would leave a prefix no exact
+    # match can find. Then the pattern scrub for secret shapes that are not in the file.
+    return scrub(_truncate_output(redact_secret_values(output_raw)))
 
 
 def main() -> None:
@@ -226,24 +240,37 @@ def _process(data: dict) -> None:
     if tool_name in _SKIP_TOOLS:
         return
 
-    # Validate session_id as safe path component
-    if "/" in session_id or "\\" in session_id or ".." in session_id:
+    if data.get("agent_type") in _UNOBSERVED_AGENT_TYPES:
         return
 
     tool_input = data.get("tool_input") or {}
     if not isinstance(tool_input, dict):
         tool_input = {}
 
+    # The parent's own Agent call carries no agent_id, but its result holds the
+    # subagent's prompt and final report.
+    if (
+        tool_name in ("Agent", "Task")
+        and tool_input.get("subagent_type") in _UNOBSERVED_AGENT_TYPES
+    ):
+        return
+
+    # Validate session_id as safe path component
+    if "/" in session_id or "\\" in session_id or ".." in session_id:
+        return
+
     # Tool result travels in the stdin payload (CC PostToolUse contract); the
     # old CLAUDE_TOOL_USE_RESULT env var is no longer set.
     _resp = data.get("tool_response")
-    output_raw = json.dumps(_resp) if _resp else ""
+    output_raw = json.dumps(redact_secret_values_deep(_resp)) if _resp else ""
 
     observation = {
         "ts": time.time(),
         "session_id": session_id,
         "tool_name": tool_name,
-        "key_info": _extract_key_info(tool_name, tool_input),
+        # Values first, on the whole input: key info truncates commands and arguments, and a cut value no longer
+        # matches.
+        "key_info": _extract_key_info(tool_name, redact_secret_values_deep(tool_input)),
         "output_summary": _summarize_output(tool_name, tool_input, output_raw),
     }
 

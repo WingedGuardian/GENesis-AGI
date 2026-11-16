@@ -55,6 +55,7 @@ dependencies = [
                                   # bound is the best instrument available here, not a complete one.
     "pydantic>=2.12,<3",  # strict validation for the decision registry (already pulled in by fastapi, litellm and mcp)
     "pyyaml",
+    "python-dotenv>=1.2.0,<2",  # external MCP adapter uses inherited-first interpolation and the disable predicate
     "a2a-sdk==1.2.2",
     "claude-agent-sdk==0.2.172",  # live_agent: drives a persistent Claude Code session (query/steer/interrupt/
                                   # can_use_tool). Pinned exactly: the wire contract it speaks to the CLI moves
@@ -71,7 +72,7 @@ dependencies = [
     "flask>=3.0",
     "flask-sock>=0.7",
     "wsproto>=1.2",  # transitive dep of flask-sock; pin to prevent silent uninstall
-    "fastmcp>=4.1.4,<5",  # Qualified v4 API and security floor; no background-tasks extra.
+    "fastmcp>=4.1.4,<4.1.7",  # Qualified v4 API and security floor; no background-tasks extra. <4.1.7: 4.1.7 publishes whole docstrings as tool descriptions (#4309).
     "mcp>=2.3.0,<3",  # Direct SDK floor; FastMCP v4 requires the v2 protocol implementation.
     "detect-secrets>=1.4",  # Phase 6 contribution sanitizer — REQUIRED floor. sanitize.py fails closed if missing.
     "pymupdf>=1.27",  # PDF text extraction for knowledge ingestion pipeline

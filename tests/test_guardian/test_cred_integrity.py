@@ -593,3 +593,20 @@ def test_decrypt_backup_stream_cli_fails_when_reader_stops(tmp_path):
         env={"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path)},
     )
     assert proc.stdout.strip() not in (b"0", b""), proc
+
+
+def test_an_explicit_repo_root_finds_a_checkout_outside_home_genesis(tmp_path):
+    from genesis.guardian import cred_integrity as ci
+
+    home = tmp_path / "home"
+    checkout = tmp_path / "elsewhere"
+    checkout.mkdir(parents=True)
+    (checkout / "secrets.env").write_text("K=v\n")
+    assert ci.resolve_secrets_path(home) == home / "genesis" / "secrets.env"
+    assert ci.resolve_secrets_path(home, checkout) == checkout / "secrets.env"
+    target = next(t for t in ci.DEFAULT_TARGETS if t.name == "secrets_env")
+    assert ci.credential_path(target, home, checkout) == checkout / "secrets.env"
+    # The home config still outranks any checkout.
+    (home / ".config" / "genesis").mkdir(parents=True)
+    (home / ".config" / "genesis" / "secrets.env").write_text("K=v\n")
+    assert ci.resolve_secrets_path(home, checkout) == home / ".config" / "genesis" / "secrets.env"

@@ -12,6 +12,7 @@ scratch HOME's ~/.genesis/lib/live-repair/current.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -97,20 +98,68 @@ def test_td1_a_switch_killed_on_the_tag_side_is_healed_and_saved(w, victim):
     assert _git(w.root, "rev-parse", "HEAD") == w.tag
     assert (w.backups()[-1] / "git" / "index.lock").exists() is lock_left
     assert foreign_rows(w) == [], "the update's own files were reported as foreign"
+    assert w.hook_calls() == [], "restore-hooks runs only when `live` moved back"
+    assert w.report()["hooks"] is None
 
 
-def test_td2_a_rollback_killed_partway_is_left_to_the_forward_repair(w):
-    """HEAD on `live` at the target (a rollback killed partway) is the forward
-    repair's case (D1f): the command says so, exits 1, and changes nothing."""
-    killed_rollback(w, "P")
+# Back toward the tag the switch adds O first, P in the middle and sub/t last;
+# "prepared" is the whole tag tree written, with HEAD.lock and live's lock left.
+@pytest.mark.parametrize("victim", ["O", "P", "sub/t", "prepared"])
+def test_td2_a_rollback_killed_partway_finishes_toward_the_tag(w, victim):
+    """T-D2 (D1f): HEAD on `live` at the target, the rollback's switch back
+    killed partway: the repair finishes that rollback. The files go back to the
+    tag, `live` moves from the target to the tag, and restore-hooks runs from
+    the checkout with update.lock's fd, as update.sh's rollback runs it."""
+    killed_rollback(w, victim)
     assert w.guard_rc(w.row("done")) == 4, "control: the kill left a mixed tree"
-    before, head = w.snapshot(), _git(w.root, "rev-parse", "live")
+    before = w.snapshot()
     r = w.repair()
-    assert r.returncode == 1 and "forward case: needs the forward repair (D1f)" in r.stdout, (
-        r.stdout
-    )
-    assert w.snapshot() == before and _git(w.root, "rev-parse", "live") == head
-    assert w.state.exists() and w.backups() == []
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert_healed(w, before)
+    assert _git(w.root, "rev-parse", "HEAD") == w.tag
+    assert _git(w.root, "symbolic-ref", "HEAD") == "refs/heads/live"
+    assert _git(w.root, "rev-parse", "live@{1}") == w.to, "`live` was not moved from the target"
+    assert w.hook_calls() == [
+        {
+            "argv": ["restore-hooks", w.to, w.tag],
+            "fd_is_update_lock": True,
+            "held": True,
+            "ephemeral_re": True,
+            "checkout_locked": True,
+            # The heal's own call runs before it clears the state (the files are
+            # the tag's by then); only an older report's retry waits for SAFE.
+            "state_left": True,
+        }
+    ]
+    assert w.report()["hooks"] == "ok"
+    assert foreign_rows(w) == [], "the rollback's own files were reported as foreign"
+
+
+def test_td2_a_detached_head_at_the_target_is_never_finished(w, mod):
+    """The forward case is HEAD on `live` at the target, as the guard's live
+    rule has it. Detached there (the guard made to say mixed regardless), the
+    repair changes nothing: moving `live` would leave HEAD where it is."""
+    killed_rollback(w, "P")
+    _git(w.root, "update-ref", "--no-deref", "HEAD", w.to)
+    before = w.snapshot()
+    repair = mod.Repair(str(w.state), str(w.root), False, 10)
+    repair.guard.state_verdict = lambda *a, **k: (repair.guard.MIXED_TREE, "forced")
+    assert repair.run() == 1
+    assert w.snapshot() == before and w.backups() == []
+    assert _git(w.root, "rev-parse", "live") == w.to and w.hook_calls() == []
+
+
+def test_td2_an_interrupted_write_toward_the_tag_is_the_rollbacks(w):
+    """T-D4, forward: the rollback was writing the TAG's bytes, so a prefix of
+    them (O, which only the tag has) is the rollback's own, never foreign."""
+    killed_rollback(w, "P")
+    (w.root / "O").write_text("o")
+    before = w.snapshot()
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert_healed(w, before)
+    assert {row["path"]: row["class"] for row in w.report()["paths"]}["O"] == "engine"
+    assert foreign_rows(w) == []
 
 
 # ── T-D3: foreign paths are saved, healed and reported ───────────────────────
@@ -288,9 +337,11 @@ def test_r1_the_backup_is_durable_in_its_parents_before_the_checkout_changes(w, 
     assert synced.index(str(w.gen / "deploy-backups")) > synced.index(backup)
 
 
-def test_r1_a_backup_that_fails_at_boot_leaves_the_server_to_start(w):
-    """Devin c4385592320: a backup that cannot be written (a full disk, a
-    permission) changed nothing in the checkout, so --boot exits 0."""
+def test_r1_a_backup_that_fails_at_boot_keeps_a_judged_mixed_tree_down(w):
+    """Devin c4385592320, as owner ruling Q2 (#3492 D2a-2) changed it: a backup
+    that cannot be written (a full disk, a permission) changed nothing in the
+    checkout, but the tree was judged half-written, so --boot exits 75 (the
+    server stays down) with one critical page; nothing is touched."""
     if os.geteuid() == 0:
         pytest.skip("running as root: the permission cannot be refused")
     killed_tag_side(w, "Z3")
@@ -302,13 +353,17 @@ def test_r1_a_backup_that_fails_at_boot_leaves_the_server_to_start(w):
         r = w.repair(mode="--boot")
     finally:
         root.chmod(0o755)
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert "nothing was changed" in r.stderr, r.stderr
+    assert r.returncode == 75, r.stdout + r.stderr
+    assert "could not start healing" in r.stderr, r.stderr
     assert w.snapshot() == before and w.state.exists()
+    alerts = w.alerts()
+    assert [a["severity"] for a in alerts] == ["critical"], alerts
+    assert alerts[0]["dedupe_key"].startswith("live_move_repair:boot:refused:"), alerts
 
 
 def test_r1_a_failure_after_the_checkout_changed_stays_fatal_at_boot(w, mod, monkeypatch):
-    """The other side of c4385592320: once _apply began, a failure exits 1."""
+    """The other side of c4385592320: once _apply began, a failure keeps the
+    server down (75 at boot) with one critical page naming the backup."""
     killed_tag_side(w, "Z3")
     real = mod._git
 
@@ -318,7 +373,11 @@ def test_r1_a_failure_after_the_checkout_changed_stays_fatal_at_boot(w, mod, mon
         return real(repo, *args, **kw)
 
     monkeypatch.setattr(mod, "_git", fail_at_restore)
-    assert mod.main(["--boot", str(w.state), str(w.root)]) == 1
+    monkeypatch.setattr(mod, "_LIB", str(w.kit()))  # main --boot checks the kit it runs from
+    assert mod.main(["--boot", str(w.state), str(w.root)]) == 75
+    alerts = w.alerts()
+    assert [a["dedupe_key"].split(":")[2] for a in alerts] == ["failed"], alerts
+    assert alerts[0]["severity"] == "critical" and str(w.backups()[-1]) in alerts[0]["body"]
 
 
 @pytest.mark.parametrize("window", ["before_clear", "before_finish"])
@@ -363,6 +422,32 @@ def test_td4_empty_prefix_and_ephemeral_paths_are_the_updates(w):
     assert rows["Z5"] == rows["sub/s1"] == rows["AGENTS.md"] == "engine", rows
     assert foreign_rows(w) == []
     assert [a["severity"] for a in w.alerts()] == ["warning"]
+
+
+# ── T-D5: the forward case's compare-and-swap ───────────────────────────────
+
+
+def test_td5_live_moved_meanwhile_is_unresolved_and_untouched(w, mod, monkeypatch):
+    """T-D5: `live` moved after the repair read it: the compare-and-swap loses,
+    the ref stays where the other writer put it, the report says unresolved,
+    the state is kept, no hook is touched, and the exit is 1."""
+    killed_rollback(w, "P")
+    real = mod._git
+
+    def racing(repo, *args, **kw):
+        if args[:1] == ("update-ref",):
+            other = _git(w.root, "commit-tree", "-m", "other writer", f"{w.tag}^{{tree}}")
+            _git(w.root, "update-ref", "refs/heads/live", other)
+        return real(repo, *args, **kw)
+
+    monkeypatch.setattr(mod, "_git", racing)
+    rc = mod.Repair(str(w.state), str(w.root), False, 10).run()
+    assert rc == 1
+    assert w.report()["result"].startswith("unresolved"), w.report()["result"]
+    assert w.report()["hooks"] is None
+    assert _git(w.root, "log", "-1", "--format=%s", "live") == "other writer", "the ref was moved"
+    assert w.state.exists()
+    assert w.hook_calls() == []
 
 
 # ── T-D6: locks, within one budget ──────────────────────────────────────────
@@ -568,6 +653,56 @@ def test_td7_a_repair_killed_partway_converges(w, mod, monkeypatch):
     assert json.loads((first / "REPAIR.json").read_text())["result"] == "superseded"
 
 
+def test_td7_a_repair_killed_before_moving_live_converges(w, mod, monkeypatch):
+    """D1f: killed after the files were restored and the hooks recorded
+    pending, before `live` moved. The next run supersedes that entry (HEAD is
+    not the tag), finds every path at the tag, moves `live` and puts the hooks
+    back."""
+    killed_rollback(w, "P")
+    real = mod._git
+
+    def die_at_cas(repo, *args, **kw):
+        if args[:1] == ("update-ref",):
+            raise Killed
+        return real(repo, *args, **kw)
+
+    monkeypatch.setattr(mod, "_git", die_at_cas)
+    with pytest.raises(Killed):
+        mod.Repair(str(w.state), str(w.root), True, 0).run()
+    first = w.backups()[-1]
+    assert json.loads((first / "REPAIR.json").read_text())["hooks"] == "pending"
+    assert w.state.exists() and _git(w.root, "rev-parse", "HEAD") == w.to
+    r = w.repair(mode="--boot")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not w.state.exists() and _git(w.root, "rev-parse", "live") == w.tag
+    assert w.snapshot() == tag_snapshot()
+    killed = json.loads((first / "REPAIR.json").read_text())
+    assert killed["result"] == "superseded" and killed["hooks"] == "superseded", killed
+    # Not backups()[-1]: two runs in one second sort by pid, not by age.
+    [healed] = [b for b in w.backups() if b != first]
+    assert json.loads((healed / "REPAIR.json").read_text())["hooks"] == "ok"
+    assert [c["argv"] for c in w.hook_calls()] == [["restore-hooks", w.to, w.tag]]
+
+
+def test_td7_a_repair_killed_after_moving_live_retries_the_hooks(w, mod, monkeypatch):
+    """Killed right after the compare-and-swap: the next run puts the hooks
+    back first (HEAD is the tag on `live`), then the guard's SAFE clears."""
+    killed_rollback(w, "P")
+
+    def die(self, *a):
+        raise Killed
+
+    monkeypatch.setattr(mod.Repair, "_restore_hooks", die)
+    with pytest.raises(Killed):
+        mod.Repair(str(w.state), str(w.root), True, 0).run()
+    assert w.report()["hooks"] == "pending" and _git(w.root, "rev-parse", "HEAD") == w.tag
+    r = w.repair(mode="--boot")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not w.state.exists()
+    assert w.report()["hooks"] == "ok"
+    assert [c["argv"] for c in w.hook_calls()] == [["restore-hooks", w.to, w.tag]]
+
+
 # ── T-D8: only the guard's SAFE clears ───────────────────────────────────────
 
 
@@ -687,8 +822,9 @@ def test_td9_a_main_row_is_out_of_scope(w):
 
 
 def test_td16_a_kit_without_its_guard_skips_at_boot(w, tmp_path):
-    """T-D16: the kit cannot load its guard: boot exits 0 with a journal line
-    (the server starts as it would have before D), the command exits 1."""
+    """T-D16: the kit cannot load its guard: boot's self-check exits 3 with a
+    journal line (the unit shell starts the server and pages, #3492 D2a-2),
+    the command exits 1."""
     killed_tag_side(w, "Z3")
     kit = tmp_path / "kit"
     kit.mkdir()
@@ -697,7 +833,7 @@ def test_td16_a_kit_without_its_guard_skips_at_boot(w, tmp_path):
     boot = subprocess.run(
         [*argv, "--boot", str(w.state), str(w.root)], capture_output=True, text=True, env=w.env()
     )
-    assert boot.returncode == 0 and "nothing was changed" in boot.stderr, boot.stderr
+    assert boot.returncode == 3 and "incomplete or altered" in boot.stderr, boot.stderr
     cmd = subprocess.run(
         [*argv, "--command", str(w.state), str(w.root)], capture_output=True, text=True, env=w.env()
     )
@@ -902,6 +1038,49 @@ def test_r2_a_missing_object_below_a_readable_root_takes_the_full_tree(w, lost):
     assert w.report()["result"].startswith("healed (the target was unreadable)")
 
 
+def _assert_forward_healed_once(w, before, r) -> None:
+    """One run: the tag's tree, the state gone, `live` moved back, the hooks
+    put back, and every pre-repair node not at the tag's bytes saved."""
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert w.snapshot() == tag_snapshot() and not w.state.exists()
+    assert _git(w.root, "status", "--porcelain", "-uall") == ""
+    assert _git(w.root, "rev-parse", "live") == w.tag
+    assert w.report()["hooks"] == "ok" and len(w.backups()) == 1
+    backup = w.backups()[-1]
+    for rel, node in before.items():
+        if isinstance(node, bytes) and tag_snapshot().get(rel) != node:
+            assert (backup / "tree" / rel).read_bytes() == node, rel
+
+
+@pytest.mark.parametrize("lost", ["root", "subtree"])
+def test_d1f_an_unreadable_target_is_healed_toward_the_tag_in_one_run(w, lost):
+    """SF-1: HEAD is the target, so the full-tree fallback must diff the TAG
+    (worktree and index), never HEAD: the target's root tree, or a subtree of
+    it, gone after a power loss, still heals in one run, losing nothing."""
+    killed_rollback(w, "P")
+    _missing(w, "" if lost == "root" else "P")
+    assert w.guard_rc(w.row("done")) == 4, "control: the guard calls it half-written"
+    before = w.snapshot()
+    r = w.repair()
+    _assert_forward_healed_once(w, before, r)
+    assert w.report()["result"].startswith("healed (the target was unreadable)")
+
+
+def test_d1f_a_torn_index_with_an_unreadable_target_is_rebuilt_from_the_tag(w):
+    """SF-1: a torn index is rebuilt from the TAG (read-tree HEAD would read
+    the target's missing tree), then the forward repair heals in one run."""
+    killed_rollback(w, "P")
+    _missing(w, "")
+    index = w.root / ".git" / "index"
+    torn = index.read_bytes()[: len(index.read_bytes()) // 2]
+    index.write_bytes(torn)
+    before = w.snapshot()
+    r = w.repair(mode="--boot")
+    _assert_forward_healed_once(w, before, r)
+    assert (w.backups()[-1] / "git" / "index").read_bytes() == torn
+    assert "index was torn" in w.report()["result"], w.report()["result"]
+
+
 @pytest.mark.parametrize("victim", ["Z3", "prepared"])
 def test_r2_a_torn_index_is_kept_and_rebuilt_from_the_tag(w, victim):
     """Audit S4: git reads a torn index without checking it (no error), then
@@ -993,13 +1172,282 @@ def test_td20_a_tag_side_live_message_names_the_repair(w, case):
     assert r.stdout.index("repair-move") < r.stdout.index("save any you want to keep")
 
 
-def test_td20_head_at_the_target_keeps_pr_cs_message_until_d1f(w):
+@pytest.mark.parametrize("case", ["record", "adopted"])
+def test_td20_head_at_the_target_names_the_repair_too(w, case):
+    """D1f: HEAD on `live` at the target, a rollback killed partway: the
+    remedy is the repair, which finishes that rollback; never --post-merge."""
     _git(w.root, "checkout", "-q", "-B", "live", w.to)
     (w.root / "O").write_text("o\n")
-    r = _guard_cli(w, w.row("done"))
+    r = _guard_cli(w, w.row("done") if case == "record" else _adopted(w))
     assert r.returncode == 4, r.stdout + r.stderr
-    assert "finish with scripts/update.sh --post-merge" in r.stdout, r.stdout
-    assert "repair-move" not in r.stdout, r.stdout
+    assert "Put it back with scripts/deploy_candidates repair-move" in r.stdout, r.stdout
+    assert "finishes the rollback that was killed" in r.stdout, r.stdout
+    assert "repair-move --explain" in r.stdout, r.stdout
+    assert not _post_merge_advice(r.stdout), r.stdout
+
+
+def test_td20_an_adopted_tip_off_live_keeps_mains_wording(w):
+    """Rule 7a's row detached at the adopted tip: the repair would not act
+    there (it finishes a rollback only on `live`), so it is not named."""
+    _git(w.root, "checkout", "-q", "--detach", w.to)
+    (w.root / "O").write_text("o\n")
+    r = _guard_cli(w, _adopted(w))
+    assert r.returncode == 4, r.stdout + r.stderr
+    assert "finishes the rollback that was killed" not in r.stdout, r.stdout
+
+
+def test_td20_a_non_merging_adopted_row_on_live_keeps_mains_wording(w):
+    """LOW-2: an adopted live row in a later phase (a rollback after a failed
+    bootstrap, killed partway) is not the repair's (it acts on "merging" rows
+    only), so the guard must not name it there."""
+    _git(w.root, "checkout", "-q", "-B", "live", w.to)
+    (w.root / "O").write_text("o\n")
+    r = _guard_cli(w, {**_adopted(w), "phase": "bootstrap"})
+    assert r.returncode == 4, r.stdout + r.stderr
+    assert "finishes the rollback that was killed" not in r.stdout, r.stdout
+
+
+def test_explain_names_the_forward_steps():
+    """LOW-1/LOW-6: restore-hooks needs update.lock, which no by-hand route
+    takes, so the step names the route that does: re-running repair-move. A
+    row without a move record names its target by own_head."""
+    r = subprocess.run(
+        ["python3", "-I", "-S", str(MODULE), "--explain"], capture_output=True, text=True
+    )
+    assert r.returncode == 0
+    assert "git update-ref refs/heads/live <tag> <target>" in r.stdout, r.stdout
+    assert "under update.lock" not in r.stdout, r.stdout
+    assert "re-run scripts/deploy_candidates repair-move" in r.stdout, r.stdout
+    assert "own_head" in r.stdout, r.stdout
+
+
+def test_d1f_a_kept_state_after_a_forward_heal_says_what_was_done(w):
+    """LOW-5: an edit off the move's paths keeps the state (HOLD). The kept
+    text must not say the update never changed the checkout: it moved `live`,
+    and the repair moved it back."""
+    killed_rollback(w, "P")
+
+    def edit_k():  # K is the same at both ends: off the move's paths
+        (w.root / "K").write_text("mine\n")
+        _git(w.root, "add", "K")
+
+    _lock_aside_if_any(w, edit_k)
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert w.state.exists() and _git(w.root, "rev-parse", "live") == w.tag
+    result = w.report()["result"]
+    assert result.startswith("healed, state kept"), result
+    assert "never changed the checkout" not in result, result
+    assert "moved back" in result, result
+
+
+# ── T-D18: hooks pending are retried ─────────────────────────────────────────
+
+
+def test_td18_hooks_that_failed_are_retried_until_put_back(w):
+    killed_rollback(w, "P")
+    r = w.repair(SPY_RC="1")
+    assert r.returncode == 0 and not w.state.exists(), r.stdout + r.stderr
+    assert w.report()["hooks"] == "pending"
+    assert "git hooks are not put back yet" in r.stdout, r.stdout
+    again = w.repair(mode="--boot")
+    assert again.returncode == 0, again.stderr
+    assert w.report()["hooks"] == "ok"
+    assert [c["argv"] for c in w.hook_calls()] == [["restore-hooks", w.to, w.tag]] * 2
+
+
+@pytest.mark.parametrize("moved", ["commit-on-live", "live-moved-head-detached"])
+def test_td18_hooks_pending_after_live_moved_on_are_superseded(w, moved):
+    """`refs/heads/live` itself left the tag (a mover now owns the hooks): the
+    entry is superseded and restore-hooks is not run again."""
+    killed_rollback(w, "P")
+    assert w.repair(SPY_RC="1").returncode == 0
+    if moved == "commit-on-live":
+        _git(w.root, "commit", "-q", "--allow-empty", "-m", "the next update")
+    else:
+        _git(w.root, "checkout", "-q", "--detach", w.tag)
+        other = _git(w.root, "commit-tree", "-m", "the next update", f"{w.tag}^{{tree}}")
+        _git(w.root, "update-ref", "refs/heads/live", other)
+    assert w.repair(mode="--boot").returncode == 0
+    assert w.report()["hooks"] == "superseded"
+    assert len(w.hook_calls()) == 1
+
+
+def test_td18_hooks_pending_while_head_is_merely_detached_wait(w):
+    """SF-2: HEAD detached at the tag, `live` still there: nothing moved the
+    hooks' owner, so the entry stays pending (no call), and once HEAD is back
+    on `live` the retry puts them back."""
+    killed_rollback(w, "P")
+    assert w.repair(SPY_RC="1").returncode == 0
+    _git(w.root, "checkout", "-q", "--detach", w.tag)
+    assert w.repair(mode="--boot").returncode == 0
+    assert w.report()["hooks"] == "pending" and len(w.hook_calls()) == 1
+    _git(w.root, "checkout", "-q", "live")
+    assert w.repair(mode="--boot").returncode == 0
+    assert w.report()["hooks"] == "ok" and len(w.hook_calls()) == 2
+
+
+def test_td18_the_retry_waits_while_the_tree_is_half_written(w):
+    """#4367 item 1: a pending report at the tag T; a later update from `live`
+    at T is killed on the tag side toward U, so HEAD is `live` at T while part
+    of the tree holds U's bytes. restore-hooks would run the checkout's engine
+    and sync-hooks.sh from that tree, so the retry waits until the heal ends
+    with the tree SAFE, then runs in the same run (plan review F1, F2)."""
+    killed_rollback(w, "P")
+    assert w.repair(SPY_RC="1").returncode == 0
+    assert w.report()["hooks"] == "pending" and len(w.hook_calls()) == 1
+    pending = w.backups()[-1]
+    killed_tag_side(w, "Z3")
+    assert w.guard_rc() == 4, "control: the tree reads half-written (MIXED_TREE)"
+    healed = w.repair(mode="--boot")
+    assert healed.returncode == 0 and not w.state.exists(), healed.stdout + healed.stderr
+    calls = w.hook_calls()
+    assert len(calls) == 2 and not calls[-1]["state_left"], "the retry ran before the heal"
+    assert json.loads((pending / "REPAIR.json").read_text())["hooks"] == "ok"
+
+
+def test_td18_the_retry_waits_while_the_state_holds(w):
+    """Plan review F2: the retry runs the checkout's engine, so it runs only on
+    a SAFE tree. A state the repair leaves held (a tracked edit the move does
+    not write: HOLD) keeps the entry pending; once the state is gone it retries."""
+    killed_rollback(w, "P")
+    assert w.repair(SPY_RC="1").returncode == 0
+    assert w.report()["hooks"] == "pending" and len(w.hook_calls()) == 1
+    (w.root / "K").write_text("someone's edit\n")
+    w.write_state(w.row("clean"))
+    assert w.guard_rc() == 6, "control: the state reads HOLD"
+    assert w.repair(mode="--boot").returncode == 0
+    assert w.state.exists() and len(w.hook_calls()) == 1, "the retry ran on a held tree"
+    assert w.report()["hooks"] == "pending"
+    w.state.unlink()
+    assert w.repair(mode="--boot").returncode == 0
+    assert w.report()["hooks"] == "ok" and len(w.hook_calls()) == 2
+
+
+def test_td18_the_retry_runs_under_the_checkout_lock(w):
+    """LOW-4: as the forward heal and update.sh's rollback do."""
+    killed_rollback(w, "P")
+    assert w.repair(SPY_RC="1").returncode == 0
+    assert w.repair(mode="--boot").returncode == 0
+    assert [c["checkout_locked"] for c in w.hook_calls()] == [True, True]
+
+
+def test_td18_a_dismiss_and_a_waiting_retry_both_land(w):
+    """SF-3: --dismiss and the retry both take update.lock, so whichever gets
+    it second writes over the first's result: the retry changes only `hooks`
+    and the dismissal only `dismissed_at`, so neither is undone."""
+    killed_rollback(w, "P")
+    assert w.repair(SPY_RC="1").returncode == 0
+    ts = w.report()["ts"]
+    w.write_state({"phase": "done"})  # a state, so a held lock is waited for
+    fd = os.open(w.gen / "locks" / "update.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        p = subprocess.Popen(
+            ["python3", "-I", "-S", str(MODULE), "--command", str(w.state), str(w.root),
+             "--wait", "60"],
+            env=w.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )  # fmt: skip
+        d = subprocess.Popen(
+            ["python3", "-I", "-S", str(MODULE), "--dismiss", ts, str(w.state), str(w.root),
+             "--wait", "60"],
+            env=w.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )  # fmt: skip
+        time.sleep(2)
+        assert w.report()["hooks"] == "pending", "control: the retry waits for the lock"
+        assert not w.report()["dismissed_at"], "control: the dismissal waits for the lock"
+    finally:
+        os.close(fd)
+    _out, err = p.communicate(timeout=120)
+    assert p.returncode == 0, err
+    _dout, derr = d.communicate(timeout=120)
+    assert d.returncode == 0, derr
+    assert w.report()["hooks"] == "ok" and len(w.hook_calls()) == 2
+    assert w.report()["dismissed_at"], "the retry's write undid the dismissal"
+
+
+def test_td18_a_dismiss_waits_while_restore_hooks_runs(w):
+    """SF-3: the retry holds update.lock through restore-hooks and its write,
+    so a --dismiss sent meanwhile waits for it and then lands on the retry's
+    result: the hooks stay ok and the report is dismissed."""
+    killed_rollback(w, "P")
+    assert w.repair(SPY_RC="1").returncode == 0
+    ts = w.report()["ts"]
+    p = subprocess.Popen(
+        ["python3", "-I", "-S", str(MODULE), "--command", str(w.state), str(w.root)],
+        env=w.env(SPY_SLEEP="4"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )  # fmt: skip
+    time.sleep(2)
+    start = time.monotonic()
+    d = subprocess.run(
+        ["python3", "-I", "-S", str(MODULE), "--dismiss", ts, str(w.state), str(w.root)],
+        capture_output=True, text=True, env=w.env(),
+    )  # fmt: skip
+    waited = time.monotonic() - start
+    assert d.returncode == 0, d.stderr
+    _out, err = p.communicate(timeout=120)
+    assert p.returncode == 0, err
+    assert waited >= 1, "the dismissal did not wait for the retry's update.lock"
+    assert len(w.hook_calls()) == 2, "control: the retry ran"
+    assert w.report()["hooks"] == "ok"
+    assert w.report()["dismissed_at"], "the dismissal was lost"
+
+
+def test_td18_a_held_update_lock_with_no_state_exits_at_once(w):
+    """A deploy restarting its own server holds update.lock: with no state
+    file the retry waits for nothing, and runs nothing."""
+    killed_rollback(w, "P")
+    assert w.repair(SPY_RC="1").returncode == 0
+    fd = os.open(w.gen / "locks" / "update.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        start = time.monotonic()
+        r = w.repair("--wait", "30")
+        took = time.monotonic() - start
+    finally:
+        os.close(fd)
+    assert r.returncode == 0 and took < 15, (took, r.stdout + r.stderr)
+    assert len(w.hook_calls()) == 1 and w.report()["hooks"] == "pending"
+
+
+@pytest.mark.parametrize("how", ["other-checkout", "symlinked-report"])
+def test_td18_a_pending_report_the_loader_refuses_is_never_retried(w, tmp_path, how):
+    """The retry reads reports through load_report, as the readers do: one
+    naming another checkout, or a REPAIR.json that is a symlink, is never
+    retried (restore-hooks is not run) and never rewritten."""
+    killed_rollback(w, "P")
+    assert w.repair(SPY_RC="1").returncode == 0
+    path = w.backups()[-1] / "REPAIR.json"
+    report = json.loads(path.read_text())
+    if how == "other-checkout":
+        report["repo"] = str(tmp_path / "elsewhere")
+        path.write_text(json.dumps(report))
+    else:
+        real = tmp_path / "real.json"
+        real.write_text(json.dumps(report))
+        path.unlink()
+        path.symlink_to(real)
+    before = path.read_bytes() if how == "other-checkout" else real.read_bytes()
+    assert w.repair(mode="--boot").returncode == 0
+    assert len(w.hook_calls()) == 1
+    after = path.read_bytes() if how == "other-checkout" else real.read_bytes()
+    assert after == before and (how == "other-checkout" or path.is_symlink())
+
+
+@pytest.mark.parametrize("value", ["--help", "main", "a" * 39])
+@pytest.mark.parametrize("field", ["other", "tag"])
+def test_td18_a_tampered_commit_in_a_pending_entry_is_never_run(w, field, value):
+    """REPAIR.json is user-writable: a commit field that is not a full commit
+    id (an option, a ref name, a short id) never reaches restore-hooks' argv."""
+    killed_rollback(w, "P")
+    assert w.repair(SPY_RC="1").returncode == 0
+    path = w.backups()[-1] / "REPAIR.json"
+    report = json.loads(path.read_text())
+    report[field] = value
+    path.write_text(json.dumps(report))
+    assert w.repair(mode="--boot").returncode == 0
+    assert len(w.hook_calls()) == 1
+    assert json.loads(path.read_text())["hooks"] == "pending"
 
 
 def test_td20_a_main_rows_text_is_pr_cs_byte_for_byte(w):
@@ -1903,10 +2351,315 @@ def test_a_fifo_at_the_state_path_never_stalls_the_repair(w, mode):
     for every update and deploy. Read through the guard's bounded reader, it
     is an unreadable state: nothing to repair, at once."""
     os.mkfifo(w.state)
+    module = w.kit() / MODULE.name if mode == "--boot" else MODULE  # boot runs the kit
     r = subprocess.run(
-        ["python3", "-I", "-S", str(MODULE), mode, str(w.state), str(w.root)],
+        ["python3", "-I", "-S", "-B", str(module), mode, str(w.state), str(w.root)],
         capture_output=True, text=True, env=w.env(), timeout=30,
     )  # fmt: skip
     assert r.returncode == 0, r.stdout + r.stderr
     assert "cannot be read" in r.stdout + r.stderr, r.stdout + r.stderr
     assert stat.S_ISFIFO(os.lstat(w.state).st_mode), "the repair left the state path alone"
+
+
+# ── SF-1: a moved-from commit no retry can read ──────────────────────────────
+
+_ENGINE = ("deploy_candidates.py", "deploy_candidates_core.py", "deploy_candidates_gate.py",
+           "deploy_candidates_manifest.py", "deploy_candidates_plan.py")  # fmt: skip
+_TAG_HOOK = "#!/bin/sh\n# the tag's {}\nexit 0\n"
+_CANDIDATE_HOOK = "#!/bin/sh\n# a candidate's pre-commit, only the target has it\nexit 0\n"
+
+
+def _real_engine_world(tmp_path: Path, **extra: str) -> World:
+    """The world with the REAL engine and sync-hooks.sh committed (not the
+    spy), the tag's own pre-commit and pre-push, and the target's pre-commit
+    changed (a hook an approved candidate brought); ``extra``: more tag files."""
+    tag = {f"scripts/{n}": (REPO / "scripts" / n).read_text() for n in _ENGINE}
+    tag.update(extra)
+    tag["scripts/hooks/sync-hooks.sh"] = (REPO / "scripts" / "hooks" / "sync-hooks.sh").read_text()
+    tag.update({f"scripts/hooks/{n}": _TAG_HOOK.format(n) for n in ("pre-commit", "pre-push")})
+    tag[".gitignore"] = "__pycache__/\n"  # as the real checkout ignores the engine's bytecode
+    return World(tmp_path, tag, {"scripts/hooks/pre-commit": _CANDIDATE_HOOK})
+
+
+def _install(w: World, name: str, body: str) -> Path:
+    dst = w.root / ".git" / "hooks" / name
+    dst.write_text(body)
+    dst.chmod(0o755)
+    return dst
+
+
+def _hook_install_failures(w: World) -> list[str]:
+    """Readiness's own install check (gate.hook_install_failures), run on the
+    scratch checkout by its committed engine."""
+    code = (
+        "import json, os, sys; sys.path.insert(0, sys.argv[1] + '/scripts'); "
+        "import deploy_candidates_core as c, deploy_candidates_gate as g; "
+        "print(json.dumps(g.hook_install_failures(c.Repo(c.Path(sys.argv[1]), os.environ))))"
+    )
+    r = subprocess.run(["python3", "-I", "-S", "-c", code, str(w.root)], capture_output=True,
+                       text=True, env=w.env(), check=True)  # fmt: skip
+    return json.loads(r.stdout)
+
+
+@pytest.mark.parametrize("gone", ["target-trees", "target-commit"])
+def test_sf1_hooks_the_moved_from_commit_cannot_give_back_are_reinstalled(
+    tmp_path, gone, monkeypatch
+):
+    """SF-1 (owner ruling): the REAL engine's restore-hooks cannot restore from
+    a moved-from commit it cannot read (its trees gone: the hook list is
+    unreadable; the commit gone: it refuses, `does not resolve`), so a retry
+    would fail forever. The repair backs up every installed hook that is not
+    the tag's (the candidate's pre-commit, a hand-edited pre-push) into the
+    report's hooks-before/, has the tag's engine install the tag's hooks, and
+    records "reinstalled": readiness's install check then passes, the report
+    and the alert name the backup, and no later run retries."""
+    w = _real_engine_world(tmp_path)
+    killed_rollback(w, "P")
+    _install(w, "pre-commit", _CANDIDATE_HOOK)
+    mine = _TAG_HOOK.format("pre-push") + "# mine\n"
+    _install(w, "pre-push", mine)
+    if gone == "target-trees":
+        _missing(w, "")
+        r = w.repair()
+        first = w.backups()[-1]
+    else:
+        # Killed right after `live` moved back; then the target's commit is lost.
+        spec = importlib.util.spec_from_file_location("lmr_sf1", MODULE)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        monkeypatch.setenv("HOME", str(w.home))
+        for k, v in w.env().items():
+            if k.startswith("GIT_"):
+                monkeypatch.setenv(k, v)
+
+        def die(self, *a):
+            raise Killed
+
+        monkeypatch.setattr(mod.Repair, "_restore_hooks", die)
+        with pytest.raises(Killed):
+            mod.Repair(str(w.state), str(w.root), True, 0).run()
+        assert w.report()["hooks"] == "pending", "control: the hooks are owed"
+        first = w.backups()[-1]
+        oid = w.to
+        (w.root / ".git" / "objects" / oid[:2] / oid[2:]).unlink()
+        r = w.repair(mode="--boot")
+    assert r.returncode == 0, r.stdout + r.stderr
+    backup = first
+    report = json.loads((backup / "REPAIR.json").read_text())
+    assert report["hooks"] == "reinstalled", (report["hooks"], r.stdout + r.stderr)
+    aside = backup / "hooks-before"
+    assert (aside / "pre-commit").read_text() == _CANDIDATE_HOOK
+    assert (aside / "pre-push").read_text() == mine, "the hand edit was not kept"
+    assert stat.S_IMODE((aside / "pre-push").stat().st_mode) == 0o600
+    assert report["hooks_before"] == ["pre-commit", "pre-push"], report.get("hooks_before")
+    hooks = w.root / ".git" / "hooks"
+    for name in ("pre-commit", "pre-push"):
+        assert (hooks / name).read_text() == _TAG_HOOK.format(name), name
+        assert os.access(hooks / name, os.X_OK), name
+    assert _hook_install_failures(w) == []
+    assert str(aside) in report["hooks_note"], report["hooks_note"]
+    assert any(str(aside) in a["body"] for a in w.alerts()), w.alerts()
+    before = (backup / "REPAIR.json").read_bytes()
+    again = w.repair(mode="--boot")
+    assert again.returncode == 0, again.stderr
+    assert (backup / "REPAIR.json").read_bytes() == before, "a later run retried"
+    assert "restore-hooks failed" not in again.stderr, again.stderr
+
+
+def test_sf1_a_readable_moved_from_commit_is_never_reinstalled_over(tmp_path):
+    """Control: the moved-from commit reads, and a hand-edited hook makes the
+    real restore-hooks fail: the hooks stay pending (retried; the hand edit is
+    readiness's to name), nothing is moved aside."""
+    w = _real_engine_world(tmp_path)
+    killed_rollback(w, "P")
+    _install(w, "pre-commit", _CANDIDATE_HOOK)
+    _install(w, "pre-push", _TAG_HOOK.format("pre-push") + "# mine\n")
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert w.report()["hooks"] == "pending"
+    assert not (w.backups()[-1] / "hooks-before").exists()
+
+
+def test_low2_a_retry_that_cannot_write_its_report_still_lets_the_heal_run(w, mod, monkeypatch):
+    """LOW-2: one pending report's write failing (ENOSPC, a folder pruned
+    meanwhile) is logged; the half-written tree in the same run still heals."""
+    killed_rollback(w, "P")
+    assert w.repair(SPY_RC="1").returncode == 0
+    pending = w.backups()[-1] / "REPAIR.json"
+    assert json.loads(pending.read_text())["hooks"] == "pending"
+    killed_tag_side(w, "Z3")
+    age_locks(w)
+    real = mod.write_json
+
+    def full(path, *a, **kw):
+        if os.path.abspath(path) == str(pending):
+            raise OSError(28, "No space left on device")
+        return real(path, *a, **kw)
+
+    monkeypatch.setattr(mod, "write_json", full)
+    assert mod.Repair(str(w.state), str(w.root), True, 0).run() == 0
+    assert not w.state.exists(), "the heal did not run"
+    assert w.snapshot() == tag_snapshot()
+
+
+def _real_engine_mod(w: World, monkeypatch):
+    """The repair module loaded in-process against ``w`` (HOME, git env)."""
+    spec = importlib.util.spec_from_file_location("lmr_sf1b", MODULE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setenv("HOME", str(w.home))
+    for k, v in w.env().items():
+        if k.startswith("GIT_"):
+            monkeypatch.setenv(k, v)
+    return mod
+
+
+def _report_of(w: World) -> tuple[Path, dict]:
+    [backup] = w.backups()
+    return backup, json.loads((backup / "REPAIR.json").read_text())
+
+
+def test_sf1_with_core_hookspath_elsewhere_nothing_is_touched(tmp_path):
+    """LOW-D: git runs hooks from another directory, so a reinstall into
+    $GIT_COMMON_DIR/hooks would install what git never runs: nothing is
+    copied, removed or installed, and the hooks stay pending."""
+    w = _real_engine_world(tmp_path)
+    killed_rollback(w, "P")
+    elsewhere = tmp_path / "elsewhere-hooks"
+    elsewhere.mkdir()
+    _git(w.root, "config", "core.hooksPath", str(elsewhere))
+    _install(w, "pre-commit", _CANDIDATE_HOOK)
+    _missing(w, "")
+    w.repair()
+    backup, report = _report_of(w)
+    assert report["hooks"] == "pending" and not report.get("hooks_before"), report
+    assert not (backup / "hooks-before").exists()
+    assert (w.root / ".git" / "hooks" / "pre-commit").read_text() == _CANDIDATE_HOOK
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_sf1_an_unlisted_hook_and_one_equal_to_the_tags_are_left_alone(tmp_path):
+    """LOW-D: only a hook the tag's sync-hooks.sh lists AND whose bytes are not
+    the tag's is moved aside: a user's own hook the list does not name (even
+    with a source at the tag) and a hook already the tag's copy are neither
+    backed up nor replaced."""
+    w = _real_engine_world(tmp_path, **{"scripts/hooks/post-checkout": _TAG_HOOK.format("pc")})
+    killed_rollback(w, "P")
+    _install(w, "pre-commit", _CANDIDATE_HOOK)
+    equal = _install(w, "pre-push", _TAG_HOOK.format("pre-push"))
+    inode = equal.stat().st_ino
+    _install(w, "post-checkout", "#!/bin/sh\n# the user's own\nexit 0\n")
+    _missing(w, "")
+    w.repair()
+    backup, report = _report_of(w)
+    assert report["hooks"] == "reinstalled", report
+    assert report["hooks_before"] == ["pre-commit"]
+    assert sorted(p.name for p in (backup / "hooks-before").iterdir()) == ["pre-commit"]
+    hooks = w.root / ".git" / "hooks"
+    assert (hooks / "post-checkout").read_text() == "#!/bin/sh\n# the user's own\nexit 0\n"
+    assert (hooks / "pre-push").stat().st_ino == inode, "a hook equal to the tag's was replaced"
+
+
+def test_sf1_a_reinstall_that_fails_after_the_removal_is_recorded_then_converges(
+    tmp_path, monkeypatch
+):
+    """LOW-A / LOW-D: the names moved aside are in REPAIR.json before any is
+    removed, so a reinstall that then fails leaves a report saying where they
+    went ("not reinstalled yet"); the next run converges."""
+    w = _real_engine_world(tmp_path)
+    killed_rollback(w, "P")
+    _install(w, "pre-commit", _CANDIDATE_HOOK)
+    _missing(w, "")
+    mod = _real_engine_mod(w, monkeypatch)
+    real = mod.Repair._restore_hooks
+
+    def no_reinstall(self, before, after):
+        return False if before == after else real(self, before, after)
+
+    monkeypatch.setattr(mod.Repair, "_restore_hooks", no_reinstall)
+    mod.Repair(str(w.state), str(w.root), False, 10).run()
+    backup, report = _report_of(w)
+    assert report["hooks"] == "pending", report["hooks"]
+    assert report["hooks_before"] == ["pre-commit"]
+    aside = backup / "hooks-before"
+    assert str(aside) in report["hooks_note"] and "not reinstalled yet" in report["hooks_note"]
+    assert (aside / "pre-commit").read_text() == _CANDIDATE_HOOK
+    assert not (w.root / ".git" / "hooks" / "pre-commit").exists(), "control: it was removed"
+    monkeypatch.undo()
+    r = w.repair(mode="--boot")
+    assert r.returncode == 0, r.stdout + r.stderr
+    _, report = _report_of(w)
+    assert report["hooks"] == "reinstalled" and report["hooks_before"] == ["pre-commit"]
+    assert _hook_install_failures(w) == []
+    assert (aside / "pre-commit").read_text() == _CANDIDATE_HOOK, "the saved copy was lost"
+
+
+def test_sf1_a_symlinked_hook_is_never_moved_aside(tmp_path):
+    """LOW-D: a hook that is a symlink is not a file the repair copies or
+    removes (sync-hooks.sh then leaves it as user-modified: still pending)."""
+    w = _real_engine_world(tmp_path)
+    killed_rollback(w, "P")
+    _install(w, "pre-commit", _CANDIDATE_HOOK)
+    target = tmp_path / "my-pre-push"
+    target.write_text("#!/bin/sh\n# mine, linked\nexit 0\n")
+    target.chmod(0o755)
+    link = w.root / ".git" / "hooks" / "pre-push"
+    link.symlink_to(target)
+    _missing(w, "")
+    w.repair()
+    backup, report = _report_of(w)
+    assert link.is_symlink() and target.read_text() == "#!/bin/sh\n# mine, linked\nexit 0\n"
+    assert not (backup / "hooks-before" / "pre-push").exists()
+    assert report["hooks"] == "pending" and report["hooks_before"] == ["pre-commit"], report
+
+
+@pytest.mark.parametrize("planted", ["open-folder", "linked-aside"])
+def test_sf1_the_retry_writes_hooks_before_only_into_a_private_report_dir(
+    tmp_path, monkeypatch, planted
+):
+    """LOW-C: the retry writes hooks-before/ under the heal's rule for a report
+    dir: this user's, 0700, never through a link. A folder others can enter,
+    or a hooks-before that is a link, refuses: nothing is copied or removed."""
+    w = _real_engine_world(tmp_path)
+    killed_rollback(w, "P")
+    _install(w, "pre-commit", _CANDIDATE_HOOK)
+    mod = _real_engine_mod(w, monkeypatch)
+
+    def die(self, *a):
+        raise Killed
+
+    monkeypatch.setattr(mod.Repair, "_restore_hooks", die)
+    with pytest.raises(Killed):
+        mod.Repair(str(w.state), str(w.root), True, 0).run()
+    monkeypatch.undo()
+    first = w.backups()[-1]
+    (w.root / ".git" / "objects" / w.to[:2] / w.to[2:]).unlink()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    if planted == "open-folder":
+        first.chmod(0o755)
+    else:
+        (first / "hooks-before").symlink_to(elsewhere)
+    w.repair(mode="--boot")
+    report = json.loads((first / "REPAIR.json").read_text())
+    assert report["hooks"] == "pending" and not report.get("hooks_before"), report
+    assert list(elsewhere.iterdir()) == []
+    assert (w.root / ".git" / "hooks" / "pre-commit").read_text() == _CANDIDATE_HOOK
+
+
+def test_sf1_the_hooks_the_repair_would_touch_are_the_engines_list(mod):
+    """NOTE-A: the repair's "is it listed" test (a name quoted in the tag's
+    sync-hooks.sh) picks exactly the names the engine's own parser reads from
+    the real sync-hooks.sh, out of every file under scripts/hooks."""
+    text = (REPO / "scripts" / "hooks" / "sync-hooks.sh").read_text()
+    code = (
+        "import json, sys; sys.path.insert(0, sys.argv[1]); "
+        "import deploy_candidates_gate as g; print(json.dumps(g.sync_hook_names(sys.stdin.read())))"
+    )
+    parsed = json.loads(subprocess.run(
+        ["python3", "-I", "-S", "-c", code, str(REPO / "scripts")], input=text,
+        capture_output=True, text=True, check=True,
+    ).stdout)  # fmt: skip
+    names = os.listdir(REPO / "scripts" / "hooks")
+    assert {n for n in names if mod._sync_listed(text, n)} == set(parsed)
+    assert set(parsed) <= set(names), "control: every listed hook has a source"

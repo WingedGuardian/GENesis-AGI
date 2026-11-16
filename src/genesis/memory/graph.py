@@ -44,6 +44,7 @@ from genesis.memory.graph_telemetry import (
     exception_reason,
     note_traversal,
     publish_selection,
+    read_quiet_reason,
     read_retry,
     read_selection,
     reset_retry,
@@ -138,10 +139,13 @@ def _traversal_store() -> GraphStore:
     global _falkor_store
     mode = "unknown"
     try:
-        from genesis.memory.graphstore_config import effective_mode
+        from genesis.memory.graphstore_config import selection
 
-        mode = effective_mode()
-        publish_selection(mode, None)
+        mode, quiet_reason = selection()
+        # A quiet networkx (the engine was never provisioned here) is published
+        # with its reason and NO error: an error would read as selection_failed,
+        # a broken cutover clock, for an install that never ran the engine.
+        publish_selection(mode, None, quiet_reason=quiet_reason)
         if mode != "falkordb":
             return _store
         if _falkor_store is None:
@@ -258,6 +262,7 @@ async def traverse(
     reset_retry()
     active = _traversal_store()
     configured, selection_error = read_selection()
+    quiet_reason = read_quiet_reason()
     track = _TraversalTrack(served_by=getattr(active, "name", "?"))
     outcome: str | None = None
     final_reason: str | None = None
@@ -277,6 +282,7 @@ async def traverse(
             primary_reason=selection_error or track.primary_reason,
             final_reason=None,
             diag=track.primary_diag,
+            quiet_reason=quiet_reason,
         )
 
     track.on_break = _record_break
@@ -357,6 +363,7 @@ async def traverse(
                 final_reason=final_reason,
                 diag=track.primary_diag,
                 elapsed_ms=primary_ms,
+                quiet_reason=quiet_reason,
             )
 
 

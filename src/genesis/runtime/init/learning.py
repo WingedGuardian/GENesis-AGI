@@ -377,6 +377,33 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
         misfire_grace_time=3600,
     )
 
+    async def _prune_tool_call_outcomes() -> None:
+        # Every main-session tool call gets a row (#4712), so the table grows
+        # with all work; retention values live beside the CRUD.
+        if rt._db is None:
+            return
+        try:
+            from genesis.db.crud import tool_call_outcomes as _tco
+
+            removed, cleared = await _tco.prune(rt._db)
+            rt.record_job_success("tool_call_outcomes_prune")
+            if removed or cleared:
+                logger.info(
+                    "tool_call_outcomes prune: removed %d rows (>%dd), cleared %d snippets (>%dd)",
+                    removed, _tco.ROW_RETENTION_DAYS, cleared, _tco.SNIPPET_RETENTION_DAYS,
+                )
+        except Exception as exc:
+            rt.record_job_failure("tool_call_outcomes_prune", exc=exc)
+            logger.exception("tool_call_outcomes prune failed")
+
+    scheduler.add_job(
+        _prune_tool_call_outcomes,
+        CronTrigger(hour=5, minute=55, timezone=user_timezone()),
+        id="tool_call_outcomes_prune",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
 
 def build_learning_collectors(rt: GenesisRuntime) -> list:
     """Build the steady-state signal-collector set installed after learning init.
@@ -458,6 +485,18 @@ def build_learning_collectors(rt: GenesisRuntime) -> list:
     ]
     if ollama_enabled():
         probes.append(probe_ollama)
+    # The graph engine is part of the memory architecture when reads use it
+    # (graphstore_config.selection says falkordb, an overlay choice included) or
+    # its unit is enabled. With neither, reads stay quietly on networkx, so
+    # probing it would pin such an install at critical_failure=1.0 for a
+    # service it does not run. Decided at build time: a selection or unit that
+    # changes later takes effect at the next server start.
+    from genesis.memory.graphstore_config import engine_unit_present, selection
+
+    if engine_unit_present() or selection()[0] == "falkordb":
+        from genesis.observability.health import probe_falkordb
+
+        probes.append(probe_falkordb)
 
     from genesis.learning.signals.cc_version import CCVersionCollector
     from genesis.learning.signals.genesis_version import GenesisVersionCollector

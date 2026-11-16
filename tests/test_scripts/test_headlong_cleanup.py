@@ -37,6 +37,29 @@ def test_actual_timeout_records_cleanup_without_qualifying_success(module, tmp_p
     assert not module.closed_commands(records)
 
 
+def test_a_slow_post_kill_drain_still_reaps_the_leader(module, monkeypatch, tmp_path):
+    # A loaded runner can outlast the post-kill communicate() budget. The killed
+    # leader must still be reaped before the group probe: an unreaped zombie is a
+    # group member, and the probe would record a closed group as alive (#4555).
+    real_popen = module.subprocess.Popen
+
+    class SlowDrain(real_popen):
+        calls = 0
+
+        def communicate(self, *args, **kwargs):
+            SlowDrain.calls += 1
+            if SlowDrain.calls == 1:
+                return super().communicate(*args, **kwargs)
+            raise subprocess.TimeoutExpired(self.args, kwargs.get("timeout"), output="", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "Popen", SlowDrain)
+    with module.command_records() as records:
+        result = module.command([sys.executable, "-c", "import signal; signal.pause()"],
+                                os.environ.copy(), tmp_path, timeout=0.2)
+    assert SlowDrain.calls == 2 and result["timed_out"] is True
+    assert records[0]["group_closed"] is True and records[0]["probe_error"] is None
+
+
 @pytest.mark.parametrize("problem", ["survivor", "permission"])
 def test_live_or_unverifiable_group_never_becomes_clean(module, monkeypatch, tmp_path, problem):
     def group_alive(pgid):
@@ -121,6 +144,9 @@ def test_bounded_pipe_drain_failure_retains_incomplete_evidence(module, monkeypa
         def communicate(self, *args, **kwargs):
             assert "timeout" in kwargs
             raise subprocess.TimeoutExpired("fixture", kwargs["timeout"], output=b"partial", stderr=b"diagnostic")
+
+        def wait(self, timeout=None):
+            return self.returncode
 
     monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: Process())
     monkeypatch.setattr(module.os, "killpg", lambda *args: None)

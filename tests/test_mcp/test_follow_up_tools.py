@@ -586,7 +586,134 @@ async def test_notes_only_does_not_write_stale_status(db):
 
     row = await follow_ups.get_by_id(db, fid)
     assert row["status"] == "completed"  # stale in_progress NOT written back
-    assert row["resolution_notes"] == "fg note"
+    assert row["resolution_notes"] == "ego done\n\nfg note"  # appended (#4397)
+
+
+async def test_update_appends_resolution_notes(db):
+    """#4397: resolution_notes is documented as appended; a later update must not
+    erase earlier notes, on every write path (notes-only, status, blocked)."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="keeps its history",
+            reason="r",
+            strategy="ego_judgment",
+            work_state="ready",
+        )
+        fid = created["id"]
+        await follow_up_tools._impl_follow_up_update(fid, resolution_notes="first: scope note")
+        await follow_up_tools._impl_follow_up_update(fid, resolution_notes="second: cross-link")
+        await follow_up_tools._impl_follow_up_update(
+            fid, blocked_reason="waiting", resolution_notes="third: blocked"
+        )
+        await follow_up_tools._impl_follow_up_update(
+            fid, status="completed", resolution_notes="fourth: ruling"
+        )
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "completed"
+    assert row["resolution_notes"] == (
+        "first: scope note\n\nsecond: cross-link\n\nthird: blocked\n\nfourth: ruling"
+    )
+
+
+async def test_replace_notes_overwrites_on_every_write_path(db):
+    """replace_notes=True is the explicit opt-out of the append default: the new
+    text replaces the row's notes on the notes-only, blocked and status paths."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="needs a correction",
+            reason="r",
+            strategy="ego_judgment",
+            work_state="ready",
+        )
+        fid = created["id"]
+        await follow_up_tools._impl_follow_up_update(fid, resolution_notes="wrong note")
+        await follow_up_tools._impl_follow_up_update(
+            fid, resolution_notes="corrected", replace_notes=True
+        )
+        assert (await follow_ups.get_by_id(db, fid))["resolution_notes"] == "corrected"
+        await follow_up_tools._impl_follow_up_update(
+            fid, blocked_reason="waiting", resolution_notes="blocked note", replace_notes=True
+        )
+        assert (await follow_ups.get_by_id(db, fid))["resolution_notes"] == "blocked note"
+        await follow_up_tools._impl_follow_up_update(
+            fid, status="completed", resolution_notes="final", replace_notes=True
+        )
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "completed"
+    assert row["resolution_notes"] == "final"
+
+
+async def test_replace_notes_without_notes_is_refused(db):
+    """replace_notes with no resolution_notes would silently do nothing (empty notes
+    are treated as 'no change'), so it is refused loudly and nothing is written."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="keep me",
+            reason="r",
+            strategy="ego_judgment",
+            work_state="ready",
+        )
+        fid = created["id"]
+        await follow_up_tools._impl_follow_up_update(fid, resolution_notes="original")
+        result = await follow_up_tools._impl_follow_up_update(
+            fid, status="completed", priority="critical", replace_notes=True
+        )
+    assert result["error_code"] == "replace_needs_notes"
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["resolution_notes"] == "original"
+    assert row["status"] != "completed"
+    assert row["priority"] != "critical"  # refused before the early priority write
+
+
+async def test_mcp_tool_exposes_replace_notes(db):
+    """The real MCP tool accepts replace_notes and threads it through (an unknown
+    argument would be rejected by FastMCP, so this also pins the signature)."""
+    from fastmcp import Client, FastMCP
+
+    from genesis.mcp.health import mcp
+
+    source = {tool.name: tool for tool in await mcp.list_tools()}
+    server = FastMCP("follow-up-tools")
+    server.add_tool(source["follow_up_update"])
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="via the tool",
+            reason="r",
+            strategy="ego_judgment",
+            work_state="ready",
+        )
+        fid = created["id"]
+        async with Client(server) as client:
+            await client.call_tool(
+                "follow_up_update", {"follow_up_id": fid, "resolution_notes": "one"}
+            )
+            await client.call_tool(
+                "follow_up_update", {"follow_up_id": fid, "resolution_notes": "two"}
+            )
+            assert (await follow_ups.get_by_id(db, fid))["resolution_notes"] == "one\n\ntwo"
+            await client.call_tool(
+                "follow_up_update",
+                {"follow_up_id": fid, "resolution_notes": "only", "replace_notes": True},
+            )
+    assert (await follow_ups.get_by_id(db, fid))["resolution_notes"] == "only"
+
+
+async def test_crud_update_status_still_replaces_by_default(db):
+    """Internal callers of update_status / update_notes keep replace semantics
+    unless they opt in with append_notes=True."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="internal writer",
+            reason="r",
+            strategy="ego_judgment",
+            work_state="ready",
+        )
+    fid = created["id"]
+    await follow_ups.update_notes(db, fid, resolution_notes="old")
+    await follow_ups.update_status(db, fid, "in_progress", resolution_notes="new")
+    assert (await follow_ups.get_by_id(db, fid))["resolution_notes"] == "new"
+    await follow_ups.update_notes(db, fid, resolution_notes="newer", append_notes=True)
+    assert (await follow_ups.get_by_id(db, fid))["resolution_notes"] == "new\n\nnewer"
 
 
 # ─── H4a/H4c: short-prefix id resolution + loud failed lookups ────────────────
