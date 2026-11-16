@@ -1,0 +1,1 @@
+- Refuse malformed partial zero-watermark acceptance receipts during supervised retry admission, preserving ordinary-admission parity without clearing receipts, work or provider holds.

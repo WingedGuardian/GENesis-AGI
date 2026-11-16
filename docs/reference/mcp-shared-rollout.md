@@ -125,7 +125,8 @@ state and what a new session would launch, with the reason.
 ## Qualification checklist (when the shared service and adapter exist)
 
 The internal [HTTP composition](shared-mcp-http.md) now accepts initialized
-request-owned resources. No launcher selects it. Owned factories, unit readiness,
+request-owned resources. Explicit `--shared-service` startup constructs the owned
+factories; ordinary session launch keeps its existing selection. Unit readiness,
 the stdio adapter, local catalog union and matched measurements remain rollout
 prerequisites; constructing the HTTP app alone is not activation evidence.
 

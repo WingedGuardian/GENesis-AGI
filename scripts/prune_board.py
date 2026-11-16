@@ -3,8 +3,9 @@
 
 Deletes CLOSED open questions (resolved / dropped) older than ``--question-days``
 (default 90) together with their block edges, and board events older than
-``--event-days`` (default 180). Unverified questions are open work and promotion
-pointers (``board_links``) are durable fact, so neither is ever pruned. Invoked
+``--event-days`` (default 180). Unverified questions are open work, promotion
+pointers (``board_links``) are durable fact, and ``item_added`` events are the
+backfill's memory of what it added, so none of them is ever pruned. Invoked
 by ``scripts/disk_hygiene.sh`` (the genesis-disk-hygiene timer); also runnable by
 hand. Best-effort — a failure here must not skip other hygiene steps.
 

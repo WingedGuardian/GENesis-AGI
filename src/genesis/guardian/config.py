@@ -263,6 +263,9 @@ class MemoryTiersConfig:
     host_crit_pct: float = 94.0
     # Re-alert cadence while a tier is sustained. Tier increases alert immediately.
     realert_hours: float = 6.0
+    # A tier is left only once the reading is this many points below its line,
+    # so a reading that hovers at a line pages once, not on every crossing.
+    exit_margin_pct: float = 5.0
 
 
 @dataclass
