@@ -3710,7 +3710,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 5be8573a5 2026-11-07
+verified: 6a73d1b75 2026-11-15
 ```
 
 - **eval/ego_runtime**: opt-in canonical proposal-operation probes using fresh
@@ -3987,6 +3987,10 @@ verified: 5be8573a5 2026-11-07
   establish provider spend bounds or owner approval. This verification refresh covers the qualification slice;
   other learning/evaluation entries retain their previous verification scope.
   See `docs/reference/qualification-transport.md`.
+  A gated native first-party DeepSeek profile shares the same bounded controller
+  and guarded HTTP lifecycle. Native tariff calculations remain separate from
+  legacy provider receipts and cannot supply invoice or promotion authority.
+  See `docs/reference/qualification-native.md`.
   Complete offline preflight checks all registered corpus floors, current
   reference policy/approval/source identities and explicit call-site parameters.
   Production rendering determines duplicate questions and selected novelty IDs.

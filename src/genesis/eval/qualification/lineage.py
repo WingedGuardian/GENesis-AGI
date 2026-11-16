@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 from . import accounting, execution, pinned
 from .evidence import Campaign, Incomplete, canonical, digest
@@ -141,8 +142,6 @@ def eligible(history, identity):
 def eligible_row(state, identity, semantic_manifest):
     """Verify a real physical state against its owner's full logical admission."""
     row = state.attempts[identity]
-    if "cost_basis" in row["spec"]:
-        return None  # Native answer eligibility requires the later transport integration.
     incidents = {f"{name}:{identity}" for name in ("billing", "reservation", "answer", "failure", "identity")}
     if identity not in state.answers or state.blockers & incidents or len(row["observations"]) != 1:
         return None
@@ -152,6 +151,18 @@ def eligible_row(state, identity, semantic_manifest):
             return None
         binding = semantic_manifest["binding"]["transports"][spec["alias"]]
         prepared = semantic_manifest["binding"]["admission"]["plan"][spec["contract"]][spec["case_id"]]
+        from .transports import select
+
+        profile = select(spec["alias"], binding)
+        if profile is not pinned:
+            profile.validate_binding(binding, SimpleNamespace(model_id=spec["model"]), binding["params"])
+            profile.validate_attempt(spec, binding)
+            profile.verify_observation(observed, spec)
+            if (digest(profile.request_body(spec["model"], binding["params"], spec["contract"],
+                                            prepared["messages"])) != spec["request_hash"]
+                    or profile.native_expense.interval(row) is None):
+                return None
+            return copy.deepcopy(row)
         if (pinned.model_identities(binding) != pinned.model_identities(spec)
                 or pinned.frozen_credential_mode(binding) != pinned.frozen_credential_mode(spec)
                 or pinned.frozen_receipt_policy(binding) != pinned.frozen_receipt_policy(spec)
@@ -191,6 +202,8 @@ def rejected(history, identity):
 
 def rejected_row(row, failures):
     """The same closed-evidence predicate serves inherited and just-closed requests."""
+    if row["spec"].get("transport_kind") is not None or row["spec"].get("cost_basis") is not None:
+        return False
     if not row["dispatched"] or len(row["observations"]) != 1 or _generation(row) is None:
         return False
     spec, observed = row["spec"], row["observations"][0]

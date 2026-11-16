@@ -10,7 +10,17 @@ from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import accounting, execution, lineage, native_expense, pinned, preflight, run, sampling
+from . import (
+    accounting,
+    execution,
+    lineage,
+    native,
+    native_expense,
+    pinned,
+    preflight,
+    run,
+    sampling,
+)
 from .evidence import Incomplete, canonical, digest
 
 PROTOCOL = "bounded_continuation_v1"
@@ -36,11 +46,15 @@ def coordinate(spec):
 
 def same_request(prior, current):
     fields = ("alias", "model", "upstream", "endpoint", "generation_namespace", "request_hash",
-              "credential_fingerprint", "receipt_provider", "provider_identity_evidence")
-    return (canonical(coordinate(prior)) == canonical(coordinate(current))
+              "credential_fingerprint", "receipt_provider", "provider_identity_evidence",
+              "transport_kind", "cost_basis", "native_tariff")
+    shared = (canonical(coordinate(prior)) == canonical(coordinate(current))
             and all(prior.get(k) == current.get(k) for k in fields)
+            and pinned.frozen_credential_mode(prior) == pinned.frozen_credential_mode(current))
+    if current.get("transport_kind") == native.KIND:
+        return shared
+    return (shared and "transport_kind" not in prior and "transport_kind" not in current
             and pinned.model_identities(prior) == pinned.model_identities(current)
-            and pinned.frozen_credential_mode(prior) == pinned.frozen_credential_mode(current)
             and pinned.frozen_receipt_policy(prior) == pinned.frozen_receipt_policy(current))
 
 
@@ -106,7 +120,7 @@ class Study:
         if (not isinstance(price, dict) or set(price) != {"observed_at", "evidence"}
                 or any(not isinstance(v, str) or not v.strip() for v in price.values())):
             raise Incomplete("study_price_evidence_missing")
-        self.aliases = execution.selected_aliases(p["models"])
+        self.aliases = execution.selected_aliases(p["models"], allow_native=True)
         if set(self.checked["models"]) != set(self.aliases):
             raise Incomplete("study_candidate_population_changed")
         self.manifests = {}
@@ -115,7 +129,7 @@ class Study:
             if not isinstance(model, dict) or set(model) != {"manifest"}:
                 raise Incomplete("study_model_invalid")
             manifest = model["manifest"]
-            run.validate_campaign(manifest, self.checked, alias, cases=cases)
+            run.validate_campaign(manifest, self.checked, alias, cases=cases, allow_native=True)
             if sampling.has_sample(manifest) and self.aliases != execution.PRO_COMPARISON:
                 raise Incomplete("incumbent_sample_population_invalid")
             transport = manifest["binding"]["transports"][alias]
@@ -124,6 +138,8 @@ class Study:
                     or any(accounting.currency(r["max_charge"]) <= 0 for r in manifest["attempts"])):
                 raise Incomplete("study_transport_invalid")
             self.manifests[alias] = manifest
+        if self.aliases == (native.ALIAS,):
+            native.validate_study(p)
         self.admission = digest(run.admission_identity(self.checked))
 
     def _claim(self, owner, row):
@@ -355,6 +371,14 @@ async def report(study, cases, temp_root, *, config=None):
             sampling.baseline_report(reports[alias], selected, records[alias], cases)
         reports[alias]["admission"] = study.admission
         states[alias] = view.state
+        if alias == native.ALIAS:
+            reports[alias]["identity_scope"] = "First-party DeepSeek alias at acquisition; fingerprints do not prove immutable weights."
+            reports[alias]["system_fingerprints"] = sorted({
+                observation["system_fingerprint"] for history in study.histories.values()
+                for row in history._state.attempts.values()
+                if row["spec"]["alias"] == alias and row["spec"].get("transport_kind") == native.KIND
+                for observation in row["observations"]
+                if isinstance(observation.get("system_fingerprint"), str)})
     financial = study.financial()
     if len(reports) == 2:
         result = sampling.comparison(cases, reports, records, states, financial)
