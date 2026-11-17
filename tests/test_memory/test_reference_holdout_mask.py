@@ -2041,3 +2041,19 @@ async def test_a_plain_secret_part_is_masked_in_every_indexed_surface(db, value,
         tags_json=json.dumps(["reference", "credentials", tag]),
     )
     await _assert_held(db, store, unit, secret=secret, value=value)
+
+
+@pytest.mark.parametrize("insert_only", [True, False])
+async def test_a_typed_copy_of_a_prose_value_keeps_its_stricter_probes(db, insert_only):
+    """Devin on #4843 (comment 4605993646): a stored TYPED value equal to a
+    prose write's whole text was dropped as a duplicate of the write's own
+    value, so its fragments the prose rule skips as terms stayed visible in
+    the write's tags. The typed copy is kept, and masks them."""
+    store = _PointStore()
+    phrase = "Correct-Horse Battery-9x"
+    await _ingest(db, store, _body("vault phrase", value=phrase), concept="vault phrase", held_value=phrase)
+    unit = await _ingest(
+        db, store, phrase, concept="vault phrase",
+        tags_json=json.dumps(["vault", "Battery-9x-old"]), insert_only=insert_only,
+    )
+    assert json.loads((await kc.get(db, unit))["tags"]) == ["vault", "[held]-old"]
