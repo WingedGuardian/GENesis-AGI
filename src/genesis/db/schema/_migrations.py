@@ -1705,6 +1705,11 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE procedural_memory ADD COLUMN lesson TEXT",
         "procedural_memory.lesson")
+    # The session that created the row, set once at insert (#4717). Mirrored in
+    # migration 20261116034039_procedural_created_session_id for the runner.
+    await _try_alter(db,
+        "ALTER TABLE procedural_memory ADD COLUMN created_session_id TEXT",
+        "procedural_memory.created_session_id")
 
     # Rebuild cognitive_state table if CHECK constraint lacks resilience_degradation.
     # SQLite can't ALTER CHECK constraints — requires table rebuild.

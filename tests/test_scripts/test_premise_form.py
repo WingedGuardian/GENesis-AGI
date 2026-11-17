@@ -662,3 +662,117 @@ def test_an_as_line_plan_with_unlabelled_change_answers_is_told_to_label_them(tm
     answers = "1. Problem: as #42\n6. reused the shared reader.\n7. none simpler.\n8. cited.\n9. 40 lines.\n"
     r = _run_plan(tmp_path, _plan(answers))
     assert r.returncode == 2 and "the other answers with their own labels" in r.stderr
+
+
+# -- 2b: a proposal (answer 2 says Stated: nowhere) --------------------------------
+
+_CITED = _PROBLEM + _CHANGE
+
+
+def _nowhere(stated: str) -> str:
+    return _issue(_CITED.replace("Stated: docs/x.md:40", f"Stated: {stated}"))
+
+
+@pytest.mark.parametrize(
+    "stated", ["nowhere", '"nowhere"', "“nowhere”", "**nowhere**", "Nowhere.", "nowhere yet", "nowhere — new"]
+)
+def test_a_stated_nowhere_is_a_proposal(stated):
+    answers = gate.premise_answers(gate.strip_quoted(_nowhere(stated)))
+    assert gate._plan_gate.is_proposal(answers)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _issue(_CITED),
+        # prose in the main answer is not the Stated field
+        _issue(_CITED.replace("2. Intended: a migration", "2. Intended: found nowhere else, a migration")),
+        _issue(_OLD_SIX),  # an old six has no Stated field
+        _nowhere("none — new behaviour"),  # the stated residual: only the word the form names
+        _nowhere("docs/x.md:40, found nowhere else"),  # a citation first: the match is anchored
+        _nowhere("<nowhere>"),  # a placeholder, which CommonMark drops
+        _issue(
+            _CITED.replace(
+                "2. Intended: a migration merged after checkout is not reported. Stated: docs/x.md:40",
+                gate._plan_gate._form_template().splitlines()[1].strip(),
+            )
+        ),  # the template's own slot
+    ],
+)
+def test_a_cited_or_old_form_issue_is_not_a_proposal(body):
+    assert not gate._plan_gate.is_proposal(gate.premise_answers(gate.strip_quoted(body)))
+
+
+def test_the_label_job_adds_and_removes_proposal_with_the_body(shipped):
+    assert gate.decide(_event("opened", _nowhere("nowhere"))).add == ["proposal"]
+    edited = gate.decide(_event("edited", _issue(_CITED), labels=["proposal"]))
+    assert edited.remove == ["proposal"] and edited.add == []
+    kept = gate.decide(_event("edited", _nowhere('"nowhere"'), labels=["proposal"]))
+    assert kept.add == [] and kept.remove == []
+
+
+def test_devin_ready_on_a_complete_proposal_is_removed_saying_how_to_clear_it(shipped):
+    plan = _devin(_nowhere("nowhere"), created=_OLD)
+    assert plan.remove == ["devin-ready"]
+    assert plan.comment.startswith("(aside)\n")
+    assert "this issue is a proposal" in plan.comment and gate.PROPOSAL_LINE in plan.comment
+    assert "Missing or empty" not in plan.comment and "missing premise answers" not in plan.comment
+    assert plan.comment.rstrip().endswith("Then apply `devin-ready` again.")
+    assert plan.add == ["proposal"]  # the guard brings the mirror label up to date too
+
+
+def test_devin_ready_on_a_proposal_with_missing_answers_names_both(shipped):
+    body = _nowhere("nowhere").replace("8. Evidence: the measured CI runs above.", "8. Evidence: TBD")
+    plan = _devin(body, created=_OLD)
+    assert "missing premise answers and this issue is a proposal" in plan.comment
+    assert "1 of 9" in plan.comment and gate.PROPOSAL_LINE in plan.comment
+
+
+def test_only_the_body_decides_never_the_label(shipped):
+    hand_removed = _event("labeled", _nowhere("nowhere"), labels=["devin-ready"], label="devin-ready")
+    assert gate.decide(hand_removed).remove == ["devin-ready"]
+    hand_added = _event(
+        "labeled", _issue(_CITED), labels=["devin-ready", "proposal"], label="devin-ready"
+    )
+    plan = gate.decide(hand_added)
+    assert "devin-ready" not in plan.remove and plan.remove == ["proposal"] and not plan.comment
+
+
+def test_a_failed_removal_on_a_proposal_says_so():
+    plan = gate.Plan(remove=["devin-ready"], comment=gate._comment([], proposal=True))
+    calls, bodies = [], []
+
+    def run(args):
+        calls.append(args)
+        if args[:2] == ["issue", "comment"]:
+            bodies.append(Path(args[-1]).read_text())
+        return 1 if "--remove-label" in args else 0
+
+    gate.apply(plan, 7, run)
+    assert "could NOT be removed" in bodies[0] and "was removed" not in bodies[0]
+    assert "this issue is a proposal" in bodies[0]
+
+
+def test_apply_creates_the_proposal_label_before_adding_it():
+    calls = []
+    gate.apply(gate.Plan(add=["proposal"]), 7, lambda args: calls.append(args) or 0)
+    assert calls[0][:3] == ["label", "create", "proposal"]
+    assert calls[1] == ["issue", "edit", "7", "--add-label", "proposal"]
+
+
+@pytest.mark.parametrize("stated", ["docs/x.md:40", "nowhere"])
+@pytest.mark.parametrize("drop", [None, "8. Evidence: the measured CI runs above."])
+def test_check_and_the_guard_agree_on_a_proposal(shipped, capsys, stated, drop):
+    body = _nowhere(stated)
+    if drop:
+        body = body.replace(drop, "8. Evidence: TBD")
+    guard_removes = "devin-ready" in _devin(body, created=_OLD).remove
+    code = gate.check(7, view=lambda n: {"body": body, "labels": [], "createdAt": _OLD})
+    out = capsys.readouterr().out
+    assert (code == 1) == guard_removes, (stated, drop)
+    assert ("a proposal" in out) == (stated == "nowhere")
+
+
+def test_a_devin_ready_comment_needs_a_reason():
+    with pytest.raises(ValueError):
+        gate._comment([])
