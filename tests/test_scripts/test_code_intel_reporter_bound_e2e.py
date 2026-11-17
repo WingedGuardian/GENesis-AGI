@@ -60,6 +60,7 @@ class ScopeManager:
     admission.write_text(admission.read_text() + '\ndef assess(*args, **kwargs): pass\n')
     worker = root / 'scripts/lib/code_intel_cbm_worker.py'
     worker.write_text(worker.read_text() + '\nBUILD = ' + repr(hashlib.sha256(executable.read_bytes()).hexdigest())
+                      + '\nRELEASES = MappingProxyType({**RELEASES, BUILD: MappingProxyType(dict(version="fixture", worker="fixture-stock-worker"))})'
                       + '\n_PHASE_FILE = Path(' + repr(str(phase_file)) + ')'
                       + '\n_ENTRY = Path(' + repr(str(entry)) + ')'
                       + '\n_OUTPUT = ' + repr(str(output))
@@ -68,7 +69,7 @@ def main(argv, *, queued_factory, queued_native_environment):
     from types import SimpleNamespace
     _ENTRY.write_text('entered')
     args = SimpleNamespace(repo_path=argv[argv.index('--repo-path')+1], mode='full', persistence='true')
-    run = queued_factory({}, args, 8*1024**3, b'{}', queued_native_environment.frozen)
+    run = queued_factory({'build': BUILD}, args, 8*1024**3, b'{}', queued_native_environment.frozen)
     _PHASE_FILE.write_text('register')
     run.register()
     _PHASE_FILE.write_text('preintent')
@@ -94,7 +95,7 @@ def main(argv, *, queued_factory, queued_native_environment):
     reserved = value['reservation']
     reserved['unit'] = modules['native'].expected_unit(claimed['context'])
     reserved['source'] = modules['queued'].cbm_source(snapshot=snapshot, worker=modules['worker'],
-        config={}, args=SimpleNamespace(repo_path=str(root), mode='full', persistence='true'),
+        config={'build': modules['worker'].BUILD}, args=SimpleNamespace(repo_path=str(root), mode='full', persistence='true'),
         cap=reserved['cap_bytes'], settings=b'{}', environment=value['environment_recipe']['frozen'],
         policy=value['policy'], registration_slots=value['environment_recipe']['registration_slots'])
     assert modules['queue'].reserve_launch(claimed['context'], reserved) == 'reserved'

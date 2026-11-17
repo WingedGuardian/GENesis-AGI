@@ -33,6 +33,7 @@ leaking an unparsed secret into a non-reveal payload.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -398,6 +399,72 @@ def _put_detail_back(head: str, detail: str | None) -> str:
     if detail is None or rest.strip() != DETAIL_PLACEHOLDER:
         return head
     return header + sep + detail
+
+
+# ─── A credential's identity: an opaque key and the hash of its name (#2426) ──
+#
+# A credential is stored under an opaque key (``cred-`` and 12 hex, minted once
+# by the chokepoint) and found again by ``name_hash`` of its full name, never
+# by a string a later change could mask or cap. Only the hash is stored
+# (``knowledge_units.name_hash``); the name itself is the body's header line.
+
+#: The opaque key a credential is stored under.
+OPAQUE_KEY = re.compile(r"cred-[0-9a-f]{12}")
+_HEADER = f"[{_CREDENTIAL_DOMAIN}] "
+#: ``knowledge_units.name_origin``: a name written by a trusted writer (one
+#: entry per name, the partial unique index), by an insert-only one, or a name
+#: that had a card number redacted (its hash no longer tells two names apart,
+#: so it is out of the index and names an entry only with the same value).
+TRUSTED, UNTRUSTED, CARDED = "trusted", "untrusted", "carded"
+
+
+def name_hash(name: str) -> str:
+    """The identity of a credential name: the sha256 hex of the name
+    card-redacted, NFKC-normalised, format characters removed, casefolded, and
+    every whitespace run one space. The one place a name is normalised for
+    identity."""
+    from genesis.security.card_redaction import redact_text
+
+    return hashlib.sha256(" ".join(_normalise(redact_text(name)).split()).encode()).hexdigest()
+
+
+def name_origin(name: str, *, insert_only: bool = False) -> str:
+    """The ``name_origin`` a write of ``name`` records."""
+    from genesis.security.card_redaction import redact_text
+
+    if insert_only:
+        return UNTRUSTED
+    return CARDED if redact_text(name) != name else TRUSTED
+
+
+def display_name(row: dict) -> str | None:
+    """The name a reference row is shown under: for a credential, the name its
+    body header carries (its concept is an opaque key, or a legacy name); for
+    any other kind, its concept. Decided by the domain alone: the dashboard
+    list's rows carry no project_type, and every row it lists is a reference."""
+    if (row.get("domain") or "").strip().lower() != _CREDENTIAL_DOMAIN:
+        return row.get("concept")
+    head = (row.get("body") or "").split("\n", 1)[0]
+    return head[len(_HEADER):] if head.startswith(_HEADER) else row.get("concept")
+
+
+def recorded_name(concept: str, body: str | None) -> str:
+    """The full name a stored credential records: for an opaque key, its body
+    header; for a key stored before opaque keys, the key itself (a credential
+    was keyed by its identifier). The backfill migration and the chokepoint's
+    lookup of a row with no hash yet both use it."""
+    if OPAQUE_KEY.fullmatch(concept or ""):
+        head = (body or "").split("\n", 1)[0]
+        return head[len(_HEADER):] if head.startswith(_HEADER) else ""
+    return concept or ""
+
+
+def legacy_identity(concept: str, body: str | None) -> tuple[str, str]:
+    """(name_hash, name_origin) of a credential stored with no hash recorded
+    (before the name columns, or by a process on older code), from its
+    ``recorded_name``. Every such entry was written by a trusted writer."""
+    name = recorded_name(concept, body)
+    return name_hash(name), name_origin(name)
 
 
 async def _held_pair(

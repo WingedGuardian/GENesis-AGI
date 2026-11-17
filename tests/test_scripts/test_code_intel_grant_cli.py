@@ -15,7 +15,7 @@ from tests.test_scripts.test_code_intel_gitnexus_metadata import selection as se
 from tests.test_scripts.test_code_intel_source import isolated_modules as isolated_modules
 
 
-def cli_case(selection, tmp_path, *, schema5=True):
+def cli_case(selection, tmp_path, *, schema5=True, prepare=None):
     original, modules, environment, cwd, activity, _, _ = selection
     root = original.root
     capacity = tmp_path / "capacity"
@@ -43,6 +43,8 @@ def resolve_control_group(control):
 """)
     admission = root / "scripts/lib/code_intel_cbm_admission.py"
     admission.write_text(admission.read_text() + "\ndef _host_available(path): return 64*1024**3\n")
+    if prepare is not None:
+        prepare(root)  # Fixture-only mutations must precede its source commit/capture.
     git_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     subprocess.run(["git", "-C", str(root), "add", "."], env=git_env,
                    check=True, capture_output=True)
@@ -149,11 +151,13 @@ def test_actual_corrupt_digest_revoke_retains_capture_and_schema_guards(selectio
     assert not activity.exists() and {row["attempts"] for row in queue.list_markers()} == {0}
 
 
-def test_selected_command_is_unavailable_in_metadata_prefix(selection, tmp_path):
+@pytest.mark.parametrize("raw", [False, True])
+def test_selected_command_requires_a_current_grant_and_captured_supervision(selection, tmp_path, raw):
     case = cli_case(selection, tmp_path)
     before = case[1].database_path().read_bytes()
     result = invoke(case, ["claim-selected", "--repo", str(case[0].root),
-                           "--provider", "gitnexus", "--nonce", "b" * 32])
-    assert result.returncode == 2 and b"invalid choice" in result.stderr
+                           "--provider", "gitnexus", "--nonce", "b" * 32], raw=raw)
+    assert result.returncode != 0 and b"invalid choice" not in result.stderr
+    assert (b"captured" if raw else b"current grant") in result.stderr
     assert case[1].database_path().read_bytes() == before
     assert not case[5].exists() and not case[6].exists()

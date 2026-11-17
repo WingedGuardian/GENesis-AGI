@@ -7,6 +7,7 @@ import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import NamedTuple
 
 import aiosqlite
 
@@ -104,6 +105,46 @@ async def observe_credential_key(
     if row is None:
         return KeyObservation(None, None, None, None)
     return KeyObservation(row[0], row[1], row[3], row[2], row[4])
+
+
+class CredentialEntry(NamedTuple):
+    """A stored credential as a write by name sees it (``named_credentials``)."""
+
+    id: str
+    concept: str
+    body: str | None
+    value: str | None
+    detail: str | None
+    #: ``knowledge_units.name_hash`` / ``name_origin`` (None: not recorded yet).
+    name_hash: str | None
+    name_origin: str | None
+
+
+async def has_name_hash(db: aiosqlite.Connection) -> bool:
+    """Whether ``knowledge_units`` has the name-identity columns yet (a process
+    on new code may run before the migration that adds them)."""
+    rows = await db.execute_fetchall("PRAGMA table_info(knowledge_units)")
+    return "name_hash" in {r[1] for r in rows}
+
+
+async def named_credentials(
+    db: aiosqlite.Connection, *, project_type: str, domain: str, name_hash: str,
+) -> list[CredentialEntry]:
+    """The credentials that may carry the name ``name_hash`` names, in the order
+    they were CREATED (``rowid``, which an upsert keeps): every one recording
+    that hash, and every one recording none yet, which the caller checks by its
+    recorded name. Every row, when the columns do not exist yet."""
+    project_type, domain = _canonical_key(project_type, domain)
+    hashed = await has_name_hash(db)
+    columns = "k.name_hash, k.name_origin" if hashed else "NULL, NULL"
+    where = " AND (k.name_hash = ? OR k.name_hash IS NULL)" if hashed else ""
+    rows = await db.execute_fetchall(
+        f"SELECT k.id, k.concept, k.body, s.value, s.detail, {columns} FROM knowledge_units k "  # noqa: S608 - fixed fragments
+        f"LEFT JOIN reference_secrets s ON s.id = k.secret_ref WHERE k.project_type = ? AND k.domain = ?{where} "
+        "ORDER BY k.rowid",
+        (project_type, domain, *((name_hash,) if hashed else ())),
+    )
+    return [CredentialEntry(*r[:7]) for r in rows]
 
 
 def _still_observed(row: tuple | None, expected: KeyObservation) -> bool:
@@ -521,6 +562,8 @@ async def upsert(
     secret_detail: str | None = None,
     insert_only: bool = False,
     expected: KeyObservation | None = None,
+    name_hash: str | None = None,
+    name_origin: str | None = None,
     _commit: bool = True,
 ) -> tuple[str, bool]:
     """Insert or update a knowledge unit keyed on (project_type, domain, concept).
@@ -550,6 +593,14 @@ async def upsert(
     inserts only if the key is still absent; a present one updates only the row
     still naming the observed secret and point. Ignored with ``insert_only``,
     which never changes an existing row anyway.
+
+    ``name_hash`` / ``name_origin`` (a credential's identity, #2426,
+    ``reference_ops.name_hash``): written by the INSERT, and by an update only
+    onto a row that records none yet (the self-healing backfill), never changed
+    once set. A second trusted entry with the same hash is refused by the
+    partial unique index; the write then raises ``CredentialKeyChanged`` with
+    nothing written, and the retry finds the first. Skipped on a database
+    without the columns.
 
     ``insert_only`` (for auto-capture; no writer passes it yet): a credential key that already exists is
     never changed. If it holds the same value the call is a no-op that returns
@@ -625,6 +676,7 @@ async def upsert(
                 (secret_ref, secret_value, secret_detail, datetime.now(UTC).isoformat()),
             )
 
+    named = credential and name_hash is not None and await has_name_hash(db)
     cas = credential and expected is not None and not insert_only
     if insert_only or (cas and expected.absent):
         on_conflict = "DO NOTHING"
@@ -653,6 +705,11 @@ async def upsert(
                    purpose         = excluded.purpose,
                    ingestion_source = excluded.ingestion_source,
                    origin_class    = excluded.origin_class{repoint}"""
+        if named:
+            on_conflict += (
+                ",\n                   name_hash       = COALESCE(knowledge_units.name_hash, excluded.name_hash)"
+                ",\n                   name_origin     = COALESCE(knowledge_units.name_origin, excluded.name_origin)"
+            )
     # Compare-and-swap (``expected`` present): the row is written only while it
     # still exists and names the observed secret and point. INSERT ... SELECT
     # with an EXISTS guard, so a row deleted since the read is not re-created,
@@ -663,12 +720,13 @@ async def upsert(
             "\n               WHERE knowledge_units.id = ? AND knowledge_units.secret_ref IS ?"
             " AND knowledge_units.qdrant_id IS ?"
         )
+    marks = ", ".join("?" * (23 if named else 21))
     source = (
-        "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
+        f"SELECT {marks} "
         "WHERE EXISTS (SELECT 1 FROM knowledge_units WHERE project_type = ? "
         "AND domain = ? AND concept = ?)"
         if cas_present
-        else "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        else f"VALUES ({marks})"
     )
     try:
         cursor = await db.execute(
@@ -676,7 +734,7 @@ async def upsert(
                (id, project_type, domain, source_doc, source_platform, section_title,
                 concept, body, relationships, caveats, tags, confidence,
                 source_date, ingested_at, qdrant_id, embedding_model,
-                source_pipeline, purpose, ingestion_source, origin_class, secret_ref)
+                source_pipeline, purpose, ingestion_source, origin_class, secret_ref{", name_hash, name_origin" if named else ""})
                {source}
                ON CONFLICT(project_type, domain, concept) {on_conflict}""",  # noqa: S608 - fixed fragments, values bound
             (
@@ -701,6 +759,7 @@ async def upsert(
                 ingestion_source,
                 origin_class,
                 secret_ref,
+                *((name_hash, name_origin) if named else ()),
                 *(
                     (project_type, domain, concept,
                      expected.unit_id, expected.secret_ref, expected.qdrant_id)
@@ -709,6 +768,21 @@ async def upsert(
             ),
         )
     except aiosqlite.IntegrityError as exc:
+        if named and "name_hash" in str(exc):
+            # Another trusted entry took this name since the write read it (a
+            # concurrent first save): nothing was written. Retire this call's
+            # secret row, then say so; the retry finds and updates that entry.
+            if secret_value is not None and secret_ref is not None:
+                await db.execute(
+                    "DELETE FROM reference_secrets WHERE id = ? AND NOT EXISTS "
+                    "(SELECT 1 FROM knowledge_units WHERE secret_ref = ?)",
+                    (secret_ref, secret_ref),
+                )
+            if _commit:
+                await db.commit()
+            raise CredentialKeyChanged(
+                "another entry took this credential's name while the write ran (#2426)"
+            ) from exc
         if _REF_GUARD_REFUSED not in str(exc):
             raise
         raise ValueError(

@@ -22,7 +22,8 @@ def runtime(captured, modules):
                    protocol=3, execution_seq=1, claim_id='1' * 32)
     source = dict(commit=captured.commit, files=dict(captured.files),
                   provider_digest=modules['worker'].BUILD,
-                  provider_version='v0.11.0-stock-worker', configuration_sha256='a' * 64)
+                  provider_version=modules['worker'].qualified_release(modules['worker'].BUILD)['worker'],
+                  configuration_sha256='a' * 64)
     owner = dict(pid=os.getpid(), start_ticks=int(Path('/proc/self/stat').read_text().rpartition(') ')[2].split()[19]),
                  boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip())
     reserved = dict(unit=modules['queue']._native.expected_unit(context), run_mode='full',

@@ -34,6 +34,12 @@ import aiosqlite
 
 from genesis.env import cc_project_dir, voice_transcript_dir
 from genesis.learning.procedural.judge import ProcedureBuilderUnavailable
+from genesis.learning.procedural.lesson_builder_config import (
+    CAP_WINDOW as _LESSON_CAP_WINDOW,
+)
+from genesis.learning.procedural.lesson_builder_config import (
+    builder_mode as lesson_builder_mode,
+)
 from genesis.memory.extraction import (
     RETRY_PROMPT,
     ExtractionResult,
@@ -111,6 +117,44 @@ _TRANSCRIPT_DIR = Path.home() / ".claude" / "projects" / cc_project_dir()
 # never silently dropped.
 _PROCEDURE_REBUILD_WORK = "procedure_rebuild"
 _MAX_PROCEDURE_REBUILD_ATTEMPTS = 8
+# Rebuilds the drain runs per extraction cycle (each one is a builder model call).
+_DRAIN_BATCH = 20
+# Pending rebuilds the drain reads to find a batch's worth of eligible ones. A
+# resource bound only (one live install's deferred_work_queue held 44
+# procedure_rebuild rows in total, all completed, on 2026-11-15), and hitting it
+# is logged.
+_DRAIN_SCAN_LIMIT = 1000
+
+
+async def _lesson_cap_left(
+    db: aiosqlite.Connection, cc_session_id: str, cap: int, *, shadow: bool = False,
+) -> int:
+    """New lessons this source session may still add in the rolling window.
+
+    Counts ``procedural_memory`` rows created in the window by the session:
+    ``created_session_id``, set once at insert, so a refine that rewrites
+    ``source`` cannot reopen a slot. A row written before that column existed
+    falls back to the session its JSON ``source`` names; a ``source`` that is not
+    valid JSON is not counted (the CASE keeps ``json_extract``, which would
+    raise, off it).
+    ``shadow`` also counts the lessons shadow mode recorded for the session, so
+    shadow makes the same number of builder calls live would.
+    """
+    since = datetime.now(UTC) - _LESSON_CAP_WINDOW
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM procedural_memory"
+        " WHERE COALESCE(created_session_id, CASE WHEN json_valid(source)"
+        " THEN json_extract(source, '$.session_id') END) = ?"
+        " AND datetime(created_at) >= datetime(?)",
+        (cc_session_id, since.isoformat()),
+    )
+    row = await cursor.fetchone()
+    used = row[0] if row else 0
+    if shadow:
+        from genesis.learning.procedural.lesson_builder_config import shadow_count
+
+        used += await asyncio.to_thread(shadow_count, cc_session_id, since)
+    return max(0, cap - used)
 
 
 async def _check_claim_duplicate(
@@ -294,6 +338,10 @@ async def run_extraction_cycle(
                     db, session_id, delta.new_line_count,
                     last_extracted_byte=delta.new_byte_offset,
                 )
+                # The appended lines may hold only a tool result (the delta
+                # reader drops those), so record outcomes here too: no later
+                # cycle re-reads this transcript unless new text arrives.
+                await _record_tool_outcomes_from(db, transcript_path, cc_session_id)
             continue
 
         chunks = chunk_messages(messages, chunk_size=chunk_size)
@@ -310,10 +358,6 @@ async def run_extraction_cycle(
         all_keywords: set[str] = set()
         latest_topic = ""
         session_extraction_count = 0
-        # Per-session cap on NEW draft procedures (extraction + struggle
-        # streams). Without this, a single session can flood the store with
-        # hundreds of conf≈0 candidates that never get validated.
-        session_procs = 0
         session_candidates: list[dict] = []  # flag-only chunk signal (C2b)
 
         for chunk in chunks:
@@ -601,6 +645,7 @@ async def run_extraction_cycle(
                     keywords=all_keywords, topic=latest_topic,
                 )
 
+            shadow = False  # set from the lever below; read by the except
             # Stream 1: the whole-session procedure BUILDER (runs once per
             # session, after all chunks). Parses the full JSONL into a user-blind
             # action spine + a grounding haystack, scores struggle, and runs the
@@ -621,12 +666,31 @@ async def run_extraction_cycle(
                 spine, haystack = await asyncio.to_thread(
                     build_spine_and_haystack, transcript_path
                 )
+                await _record_tool_outcomes(db, spine, cc_session_id)
                 struggle_score = score_struggle(spine)
                 struggle_triggered = struggle_score >= STRUGGLE_THRESHOLD
-                if (
-                    (struggle_triggered or session_candidates)
-                    and session_procs < max_procedures_per_session
-                ):
+                # Per-session cap on NEW draft lessons, counted from the store
+                # over a rolling window. A local counter restarted at 0 every
+                # cycle, so one long session reached 811 lessons.
+                # Shadow runs the real builder and records what it would store.
+                builder_mode = (
+                    lesson_builder_mode()
+                    if struggle_triggered or session_candidates
+                    else "off"
+                )
+                shadow = builder_mode == "shadow"
+                cap_left = 0
+                if builder_mode != "off":
+                    cap_left = await _lesson_cap_left(
+                        db, cc_session_id, max_procedures_per_session, shadow=shadow,
+                    )
+                    if cap_left == 0:
+                        logger.info(
+                            "Procedure builder skipped for %s: %d lessons already "
+                            "built from it in the last 24h",
+                            session_id, max_procedures_per_session,
+                        )
+                if cap_left:
                     from genesis.learning.procedural.judge import (
                         JUDGE_TIMEOUT_SECS,
                         judge_multi_procedure,
@@ -636,12 +700,16 @@ async def run_extraction_cycle(
                         judge_multi_procedure(
                             db, spine, haystack, struggle_score, router,
                             source_session_id=cc_session_id,
-                            max_new=max_procedures_per_session - session_procs,
+                            max_new=cap_left,
+                            shadow=shadow,
                         ),
                         timeout=JUDGE_TIMEOUT_SECS,
                     )
-                    session_procs += len(stored_ids)
-                    if stored_ids:
+                    if shadow:
+                        summary["shadow_lessons"] = (
+                            summary.get("shadow_lessons", 0) + len(stored_ids)
+                        )
+                    elif stored_ids:
                         summary["struggle_procedures"] = (
                             summary.get("struggle_procedures", 0) + len(stored_ids)
                         )
@@ -649,15 +717,16 @@ async def run_extraction_cycle(
                     # candidates alone, with no struggle signal.
                     if session_candidates and not struggle_triggered:
                         logger.info(
-                            "Procedure builder fired on candidates-only for %s "
+                            "Procedure builder (%s) fired on candidates-only for %s "
                             "(%d candidates, score=%.2f): stored=%d",
-                            session_id, len(session_candidates), struggle_score,
-                            len(stored_ids),
+                            builder_mode, session_id, len(session_candidates),
+                            struggle_score, len(stored_ids),
                         )
                     logger.info(
-                        "Procedure builder for %s: score=%.2f, candidates=%d, stored=%d",
-                        session_id, struggle_score, len(session_candidates),
-                        len(stored_ids),
+                        "Procedure builder (%s) for %s: score=%.2f, candidates=%d, "
+                        "stored=%d",
+                        builder_mode, session_id, struggle_score,
+                        len(session_candidates), len(stored_ids),
                     )
             except (ProcedureBuilderUnavailable, TimeoutError) as exc:
                 # Transient: the provider chain was exhausted, or the build was
@@ -670,11 +739,19 @@ async def run_extraction_cycle(
                 # There is nothing of ours to undo anyway — procedure stores
                 # self-commit and the deferred memory_events was committed by the
                 # watermark update above.
-                logger.warning(
-                    "Procedure builder unavailable for session %s (%s) — "
-                    "re-queuing for rebuild", session_id, type(exc).__name__,
-                )
-                await _enqueue_procedure_rebuild(db, session_id, cc_session_id)
+                if shadow:
+                    # A queued rebuild runs only in live and stores, so queuing a
+                    # shadow build would store what shadow promised not to.
+                    logger.warning(
+                        "Procedure builder [shadow] unavailable for session %s (%s) — "
+                        "not queued", session_id, type(exc).__name__,
+                    )
+                else:
+                    logger.warning(
+                        "Procedure builder unavailable for session %s (%s) — "
+                        "re-queuing for rebuild", session_id, type(exc).__name__,
+                    )
+                    await _enqueue_procedure_rebuild(db, session_id, cc_session_id)
             except Exception:
                 # Deterministic failure (parse/logic) — NOT re-queued; retrying
                 # would burn every attempt identically. No rollback (shared
@@ -702,6 +779,51 @@ async def run_extraction_cycle(
             logger.warning("Connection pass failed", exc_info=True)
 
     return summary
+
+
+async def _record_tool_outcomes_from(
+    db: aiosqlite.Connection, transcript_path: Path, cc_session_id: str
+) -> None:
+    """Parse ``transcript_path`` and record its outcomes; never raises.
+
+    For a cycle whose delta has no message, which skips the builder's parse.
+    """
+    try:
+        from genesis.learning.procedural.struggle_detector import build_spine_and_haystack
+
+        spine, _ = await asyncio.to_thread(build_spine_and_haystack, transcript_path)
+    except Exception:
+        logger.warning(
+            "Tool-outcome parse failed for session %s — extraction unaffected",
+            cc_session_id, exc_info=True,
+        )
+        return
+    await _record_tool_outcomes(db, spine, cc_session_id)
+
+
+async def _record_tool_outcomes(
+    db: aiosqlite.Connection, spine: list[dict], cc_session_id: str
+) -> None:
+    """Record every main-session tool call's outcome from the parsed spine (#4712).
+
+    Best-effort and isolated: a failure here is logged and never affects
+    extraction or the procedure builder. Idempotent (unique ``tool_use_id``), so
+    a later cycle re-reading the same transcript writes nothing twice, and it is
+    what records a call whose result had not arrived on an earlier cycle.
+    """
+    try:
+        from genesis.db.crud.tool_call_outcomes import insert_outcomes
+        from genesis.learning.tool_outcomes import outcome_rows
+
+        rows = await asyncio.to_thread(
+            outcome_rows, spine, fallback_session_id=cc_session_id
+        )
+        await insert_outcomes(db, rows)
+    except Exception:
+        logger.warning(
+            "Tool-outcome recording failed for session %s — extraction unaffected",
+            cc_session_id, exc_info=True,
+        )
 
 
 async def _enqueue_procedure_rebuild(
@@ -768,11 +890,28 @@ async def _drain_procedure_rebuilds(
     )
     from genesis.resilience.deferred_work import DeferredWorkQueue
 
+    # Off or shadow: queued rebuilds stay pending, with no attempt spent, until
+    # the builder is live again.
+    if lesson_builder_mode() != "live":
+        return
+
     queue = DeferredWorkQueue(db)
+    # Read past the batch: an item whose session is at its cap is skipped without
+    # moving, so a page of exactly the batch size could hold only capped items
+    # and starve every eligible one behind them until a cap window expired.
     items = await dw_crud.query_pending(
-        db, work_type=_PROCEDURE_REBUILD_WORK, limit=20,
+        db, work_type=_PROCEDURE_REBUILD_WORK, limit=_DRAIN_SCAN_LIMIT,
     )
+    if len(items) >= _DRAIN_SCAN_LIMIT:
+        logger.warning(
+            "Procedure rebuild drain read %d pending items, its scan limit; later "
+            "items wait for a later cycle", len(items),
+        )
+    capped: set[str] = set()  # sessions found at their cap during this drain
+    processed = 0
     for item in items:
+        if processed >= _DRAIN_BATCH:
+            break
         item_id = item["id"]
         attempts = item.get("attempts", 0)
 
@@ -787,6 +926,20 @@ async def _drain_procedure_rebuilds(
             continue
 
         cc_session_id = payload.get("cc_session_id") or payload.get("session_id")
+
+        # The session's cap is spent for now: leave the item pending, with no
+        # attempt spent, so a later cycle rebuilds it once the window moves on.
+        # Checked before the transcript search, which touches the filesystem.
+        if cc_session_id in capped:
+            continue
+        cap_left = (
+            await _lesson_cap_left(db, cc_session_id, max_procedures_per_session)
+            if cc_session_id else 0
+        )
+        if cc_session_id and cap_left == 0:
+            capped.add(cc_session_id)
+            continue
+
         transcript_path = (
             _find_transcript(transcript_dir, cc_session_id) if cc_session_id else None
         )
@@ -795,6 +948,7 @@ async def _drain_procedure_rebuilds(
             await queue.mark_discarded(item_id, "transcript not found")
             continue
 
+        processed += 1
         await queue.mark_processing(item_id)  # increments attempts
         try:
             # Offload the synchronous transcript read+parse off the event loop
@@ -808,7 +962,7 @@ async def _drain_procedure_rebuilds(
                 judge_multi_procedure(
                     db, spine, haystack, score, router,
                     source_session_id=cc_session_id,
-                    max_new=max_procedures_per_session,
+                    max_new=cap_left,
                 ),
                 timeout=JUDGE_TIMEOUT_SECS,
             )

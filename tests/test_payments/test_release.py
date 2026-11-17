@@ -968,12 +968,12 @@ async def test_a_live_claim_still_retires_before_the_reply(ctx, monkeypatch):
 
 @pytest.fixture
 def digit_ref(vault, monkeypatch):
-    """A card whose generated ref is ``card_`` and 12 digits (about 0.36% of cards)."""
+    """A legacy card with a 12-digit reference from the former generator."""
     path, refs = vault
     digits = "".join(str((i * 7 + 3) % 10) for i in range(12))  # built at run time
     card = vs.parse_card(VISA, f"12/{_exp_year()}", CVC)
     with monkeypatch.context() as m:
-        m.setattr(vs.secrets, "token_hex", lambda n: digits)
+        m.setattr(vs, "_new_card_ref", lambda: "card_" + digits)
         ref = vs.add_card(
             card,
             label="Digit ref card",

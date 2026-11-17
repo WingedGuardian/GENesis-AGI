@@ -287,19 +287,19 @@ async def test_shrinkage_toward_parent_toward_global(db):
 
 
 async def test_tool_lane_strict_base_rate_only(db):
-    for i in range(4):
-        await _tool_row(db, tool="Edit", success=1 if i < 3 else 0, days_ago=10)
+    for i in range(30):
+        await _tool_row(db, tool="Edit", success=1 if i < 24 else 0, days_ago=10)
     await _tool_row(db, tool="Edit", success=0, days_ago=200)  # all-time only
     await recompute_calibration_cells(db, now=NOW)
     cells = await _cells(db, domain="tool")
     recent = _one(cells, domain="tool.Edit", provenance="policy_prior", window=90)
     alltime = _one(cells, domain="tool.Edit", provenance="policy_prior", window=0)
-    assert recent["n"] == 4
-    assert recent["base_rate"] == pytest.approx(0.75)
-    assert recent["n_mechanical"] == 4
-    assert recent["status"] == "unknown"  # n < 10
-    assert alltime["n"] == 5
-    assert alltime["base_rate"] == pytest.approx(0.6)
+    assert recent["n"] == 30
+    assert recent["base_rate"] == pytest.approx(0.8)
+    assert recent["n_mechanical"] == 30
+    assert recent["status"] == "ok"  # the floor admits only n >= 30
+    assert alltime["n"] == 31
+    assert alltime["base_rate"] == pytest.approx(24 / 31)
     for key in (
         "mean_confidence",
         "brier",
@@ -310,6 +310,22 @@ async def test_tool_lane_strict_base_rate_only(db):
         "shrunk_estimate",
     ):
         assert recent[key] is None, f"{key} must be NULL on tool cells"
+
+
+async def test_tool_lane_skips_a_rarely_called_tool(db):
+    """A tool with fewer than 30 calls in a window gets no cell for it (#4712).
+
+    The table now holds every tool, so without the floor each rare MCP tool
+    would add a ``thin`` or ``unknown`` cell to every calibration surface.
+    """
+    for _ in range(29):
+        await _tool_row(db, tool="mcp__rare__tool", success=1, days_ago=10)
+    for _ in range(30):
+        await _tool_row(db, tool="Bash", success=1, days_ago=10)
+    await recompute_calibration_cells(db, now=NOW)
+    domains = {c["domain"] for c in await _cells(db, domain="tool")}
+    assert "tool.Bash" in domains
+    assert "tool.mcp__rare__tool" not in domains
 
 
 # ── orchestration: empty state, history, rebuild ─────────────────────────────

@@ -85,8 +85,10 @@ physical completion through their RequestDatabase unit. Legacy connections keep
 ordinary thread cancellation. The retriever forwards the facade to tag expansion;
 tag scans run in independently admitted background units, with accepted-task
 completion as the single-flight release. Pressure or draining serves the stale
-query. Other maintenance threads and shared provider closers still need factory
-qualification; this is not a shared-service activation.
+query. The explicit shared factory additionally owns the builtin embedding
+clients and cache handles while retaining separate storage/recall providers.
+Other maintenance threads retain their existing lifetime. This is not a
+shared-service activation; factory qualification is scoped separately.
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
 `memory_fts`) and Qdrant share no transaction, so drift (orphaned "ghost"
@@ -184,10 +186,33 @@ Easy-to-forget mechanisms:
   secret a unit stops naming (repointed or deleted);
   `knowledge_crud.sweep_orphan_secrets` (after every delete, and at boot)
   removes secrets older than an hour that an interrupted upsert left unnamed.
-  `ingest_knowledge_unit(insert_only=True)` and `knowledge_crud.upsert(insert_only=True)`
-  never change an existing credential key (a different value raises
-  `CredentialKeyTaken`); no writer passes it yet: it is the mechanism a later
-  change wires the extraction job's auto-capture to.
+  **A credential's key is opaque and its identity is the hash of its name.**
+  A new credential is stored under `concept = cred-<12 hex>`
+  (`secrets.token_hex(6)`, checked absent), never derived from the name or the
+  value; the name is the body's header line. `knowledge_units.name_hash`
+  (`reference_ops.name_hash`: card-redacted, NFKC, format characters removed,
+  casefolded, whitespace collapsed, sha256) and `name_origin` (`trusted`,
+  `untrusted`, `carded`) are written by the INSERT and never changed by an
+  update. A trusted write by name updates the earliest trusted entry with that
+  hash, else an entry with no hash yet whose recorded name matches (a legacy
+  plain key, or one with a trailing ` #xxxxxx` removed), which that write gives
+  the hash; else it mints a new key. A partial unique index
+  (`idx_knowledge_units_name_hash`, trusted rows with a 64-character hash) makes
+  concurrent first saves of a name one entry. `entry_key=` (trusted callers,
+  credentials only; `reference_store(entry_key=...)`) writes to an existing
+  entry by key and keeps its recorded name; an unknown key is refused with
+  nothing written, and text that reads like a key passed as an identifier is a
+  name. Any update keeps the name the entry records. An insert-only write
+  returns an untrusted entry under that hash with the same value and
+  description, else adds a new entry; it never updates one. A card-redacted name
+  reuses an entry only when it holds the same value. Migration
+  `20261115060803_credential_name_hash` backfills existing credentials; of
+  legacy names differing only in case the earliest keeps the hash, and each
+  later one gets one the index leaves out (still stored, revealable,
+  deletable). The dashboard list and `reference_lookup` show the name
+  (`reference_ops.display_name`); lookup results carry the key as `concept`.
+  `ingest_knowledge_unit(insert_only=True)` has no writer yet: it is the
+  mechanism a later change wires the extraction job's auto-capture to.
   Two `knowledge_units` triggers refuse a
   credential body without exactly one placeholder line, whichever process
   writes it (text on a later line only the Python check sees).
@@ -202,8 +227,8 @@ Easy-to-forget mechanisms:
   (`knowledge_crud.KeyObservation`: absent, or the secret and point it named),
   checked inside the one statement that writes the unit, so a same-key writer
   in another process that commits in between makes it write nothing
-  (`CredentialKeyChanged`); the ingest then re-reads and runs once more, and
-  a second change reaches the caller.
+  (`CredentialKeyChanged`); the ingest then re-reads and runs again, up to five
+  times, so every writer in a race lands, and a sixth change reaches the caller.
   Only `reference_ops` reads the secret row: `compose_body` puts the value and
   the description back for `reference_lookup` (behind its audit log),
   `reveal_reference` returns both for the dashboard's reveal, and
@@ -211,7 +236,7 @@ Easy-to-forget mechanisms:
   read, they re-read the unit's current body, value and description with one
   statement (`knowledge_crud.get_reference_pair`), so a body never comes back
   beside another write's secret. A credential is therefore found by its
-  identifier and tags only; the dashboard list shows the description placeholder. Identifier kinds (url, network,
+  name and tags only; the dashboard list shows the description placeholder. Identifier kinds (url, network,
   account, fact) keep their value in the body, because it is what their lookups
   search for. NOT covered yet: the episodic memory the extraction job stores
   for the same conversation text, which still carries an auto-captured value.
@@ -968,9 +993,13 @@ complete-attempt evidence. See `docs/reference/inbox-attempt-identity.md`.
   decontextualised in yours. `model` comes from the SessionStart cache with
   `GENESIS_ROSTER_MODEL` taking precedence, NOT from `cc_sessions.model` — on a
   live install that column is dominated by the literal string `unknown`.
-  Liveness comes ONLY from `session_heartbeats`: `cc_sessions.pid` is unset for
-  most rows and its `status`/`last_activity_at` go stale on running sessions, so
-  it must never be used to decide who is alive. **Every rendered field is
+  Liveness comes ONLY from `session_heartbeats`. `cc_sessions.pid` is set on
+  foreground rows since #1706 (MEASURED 2026-11-13 over rows started in the last
+  three days: 91 of 91 checkpointed and 4 of 4 active rows carry one, 0 of 7
+  completed rows do), but one process can carry several session rows (one pid
+  on 2 rows after a `/clear`, another on 4), and the row's
+  `status`/`last_activity_at` go stale on running sessions, so it must never be
+  used to decide who is alive. **Every rendered field is
   peer-authored, so all pass through `sanitize_detail`** — a newline in any of
   them forges an extra `[Concurrent | …]` line in the reader's context. The
   writers are partial by design (each knows a different subset), so the upsert
@@ -1002,6 +1031,27 @@ complete-attempt evidence. See `docs/reference/inbox-attempt-identity.md`.
   `python -m genesis session-address <id>` (whose `--check` compares it with
   `claude agents --json`, Claude Code's supported listing) and the
   `session_address` MCP tool.
+  **And the worktrees the peer holds** — the tag's body opens with
+  `in <worktree> on <branch> (+N more claimed)`, from the worktree-ownership
+  claims (`scripts/hooks/worktree_claim.py` `claims_by_session`), taken on a
+  session's first edit in a worktree and owned by its PROCESS. A claim is
+  matched by the peer's live pid, the one the address lookup above verified
+  against the registry and the process start time, and failing that by the
+  session id the claim recorded: `/clear` starts a new id in the same process,
+  so an id-only join loses every claim made before it (MEASURED 2026-11-13: 4
+  of 18 live claims). Locks are read raw from `<common dir>/worktrees/*/locked`
+  (never porcelain), with a byte test for the namespace before any parse, one
+  entry at a time so a malformed lock skips only itself. A claim shows only on
+  positive identity (`claim_is_live`: start time matches, not a zombie); an
+  unknown is not shown. The worktree named is the most recently CLAIMED one
+  (the lock file's mtime: a lock is never overwritten), which is where the peer
+  last first-edited, not proof of where it is now; the rest are counted. Names
+  are allowlisted (`[A-Za-z0-9._/+-]`) and omitted when outside it, so the
+  suffix can neither forge a field nor cost more than one budget unit a
+  character. A peer with no claim shows no suffix. The scan costs 22-38 ms over
+  638 admin dirs (MEASURED 2026-11-13, 5 runs, `claims_by_session` alone), is
+  skipped once the hook's deadline has passed and checks it during the scan;
+  an unfinished scan or any failure renders the line as before.
 
 - **Slot environment pinning + usable temp directories.**
   LIVE. `tmux new-session` builds a new session's environment from the tmux
@@ -1473,10 +1523,14 @@ verified: 0164dd1f0 2026-10-14
   the caller-supplied `labeled_surplus`. A cold IDENTITY send to a non-prospect
   is untouched. The owner REJECTING such a hold keeps the grant
   (`email_gate_watcher._is_posture_hold`: curated prospect + cell still
-  GRANTED); every other rejection stays a correction. Known limits: in `live`,
-  a follow-up on a second, unanswered thread to a prospect who replied on
-  another thread is not a "reply" and sends; an owner-approved non-BULK prospect
-  hold is delivered even with the lever at `off` (only BULK holds re-check it).
+  GRANTED); every other rejection stays a correction. At delivery the drain's
+  kill-switch re-check covers every approved hold that is BULK or goes to a
+  prospect, whatever its class (`email_gate_watcher._is_prospect_send`; a lookup
+  error pauses), and both delivery paths stamp every prospect the recipient
+  string names (`marketing_prospects.mark_contacted_in_recipient`), so a
+  `Name <addr>` recipient counts as contacted. Known limit: in `live`, a
+  follow-up on a second, unanswered thread to a prospect who replied on another
+  thread is not a "reply" and sends.
   Graduation for the BULK cell rides the generic
   capability-promotion path (`capability_grants.detect_promotable_cells` →
   `email:send:bulk` qualifies once it has ≥5 owner-approved successes +
@@ -1497,7 +1551,8 @@ verified: 0164dd1f0 2026-10-14
   that converts per-action approval into a standing grant; a denylist would hand
   that conversion to every new capability by default. **Contact-stamping (loop-fix):** on a CONFIRMED
   delivery a matching prospect is advanced active → `contacted` via one
-  active-guarded CRUD (`marketing_prospects.mark_contacted_by_email`) called from
+  active-guarded CRUD (`marketing_prospects.mark_contacted_in_recipient`, which
+  stamps every prospect the recipient string names) called from
   BOTH delivery paths — the email-gate drain (`email_gate_watcher`) for a HELD →
   owner-approved send, AND `pipeline._deliver` for a GRANTED-cell autonomous send
   (which delivers inline and never touches the drain, so the fix survives
@@ -1880,15 +1935,17 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: 6b4f275 2026-11-08
+verified: d70924fb5 2026-11-15
 ```
 
-Scoped verification: internal `mcp/shared_http` composition only. It receives
+Scoped verification covers `mcp/shared_http` composition. It receives
 initialized request-owned resources and supplies SDK transport limits, app-wide
 authority/authentication, per-message caller/profile binding, shared/local
 ancestry admission, nonblocking tool capacity and authenticated version/catalog
-status. No launcher selects it; owned bootstrap, native clients and rollout
-remain separate. See `docs/reference/shared-mcp-http.md`. That scoped check
+status. The gated explicit `--shared-service` path constructs the actual
+standalone services with a bounded facade, frozen limits and outer resource
+owner. Ordinary session selection remains unchanged. Unit readiness, native
+clients and rollout remain separate. See `docs/reference/shared-mcp-http.md`. That scoped check
 (5a3de4eee, 2026-11-08) does not requalify the other channels/interfaces subsystems.
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -2050,6 +2107,14 @@ the shared banner is not an assertion about all concurrent sessions.
   `docs/reference/serena-shared-main.md`.
   External Codebase has pinned configuration staging/diagnostics and bounded
   native query unit entry points in `scripts/codebase_managed.py`.
+  The captured worker's immutable release records select an exact configured
+  build across staging, managed execution, queue source identity and worker argv.
+  Only v0.11.0 is currently qualified; future releases require their own reviewed
+  record and native acceptance. A different supported binary at the configured
+  path still refuses; policy updates do not update existing settings or consent.
+  Scoped CBM verification uses isolated configuration and captured-owner execution
+  through the stock adapter to harmless children; installed-provider and real
+  kernel containment qualification remain separate.
   Status separately observes conditional queue initialization-lock prerequisites
   without opening the queue or changing current-schema availability.
   Install and bootstrap render disabled query/client-slice templates without
@@ -2076,7 +2141,7 @@ the shared banner is not an assertion about all concurrent sessions.
   Matching terminal leader states alone do not prove controller process end.
   The same-connection final drain observes callback-created evidence before
   commit. The acknowledgement grants no retry or acceptance. The automatic
-  reconciliation caller remains separate (#3728); acceptance, cutover,
+  reconciliation caller remains separate (#3728); cutover,
   native qualification and production capacity remain separate gates.
   Explicit request/revoke/status operations use the existing provider-state
   grant and bind actual work, retained debt, evidence, provider and runner/
@@ -2084,9 +2149,23 @@ the shared banner is not an assertion about all concurrent sessions.
   metadata is observable and exactly revocable without clearing independent
   holds. Retained selected trials settle once; failed-origin work cannot become
   automatic pending work, and missing/corrupt bindings preserve work and retain
-  uncertainty. New selected launch acknowledgements and ordinary-owner routes
-  refuse selected provenance. Selected consumption/execution remains separate;
-  provider arguments and automatic readiness are unchanged.
+  uncertainty. Captured `claim-selected` atomically consumes one current grant;
+  only its first committed reply reaches the same original actual owner. Spent
+  or lost replies cannot reconstruct runtime authority. Ordinary owner admission
+  still refuses selected provenance. GN binds ordinary versus selected recovery
+  argv to actual durable origin before owner construction and during source
+  recapture. Captured `accept-retry` publishes explicit metadata for a clean,
+  already-settled selected trial after exact source/policy, debt and physical/
+  control checks. It never settles accounting, retires an inflight pointer or
+  launches a provider. Immutable replay recovers a lost acceptance reply without
+  resend; current drain annotations allow only older known retained provider
+  evidence to use the acceptance watermark. Trial/newer hazards and physical
+  obligations remain independent holds. Cutover and automatic readiness remain
+  separate gates.
+  Selected acknowledgements recheck repository-wide physical/control holds after
+  their final drain. A transient same-transaction fresh proof binds the original
+  lifetime subject and exact-sequence raw cleanup evidence; it grants no durable
+  override and leaves provider quarantine independent.
   Recovery evidence refuses partial zero-watermark acceptance receipts, matching
   ordinary admission; invalid positive receipts remain explicit safety evidence.
   The retained retry helper participates in existing server restart detection.
@@ -2198,9 +2277,13 @@ the shared banner is not an assertion about all concurrent sessions.
   observations preserve owned OOM kills, including the first sample, before
   duplicate/conflict reduction; clean control cannot erase resource evidence.
   Default initialization stays4; new native authority requires5, with no live
-  cutover, acceptance setter or positive automatic readiness here. Explicit
+  cutover or positive automatic readiness here. The explicit acceptance setter
+  changes only the five existing receipt fields after completed-trial validation.
+  Explicit
   transaction-only retry grants in `index_marker_retry.py` require schema5 and
-  captured supervision; they do not implicitly migrate or enable automatic work.
+  captured supervision. Selected consumption shares the existing transaction,
+  final drain and physical owner, preserving original identity and first-commit
+  acknowledgement; it does not implicitly migrate or enable automatic work.
   Legacy uncertainty preserves original settlement/shared debt and uses
   non-claim observations for ambiguous pending/reused identities. Common scalar
   reduction covers reconciliation and embedded outcomes; import batches dedupe
@@ -2747,8 +2830,13 @@ verified: 0aa0bf9f2 2026-11-10
   (`pool.py`) and **RAM** (`memory_watch.py`, E-rest) — the latter over two
   axes worst-of, container cgroup (via incus-exec, best-effort) + host-VM
   `/proc/meminfo` (the reliable axis). Both use the shared `_tier_for`/
-  `decide_alert` hysteresis. Read-only `disk-status`/`ram-status` verbs expose
-  the same measurement to the container.
+  `decide_alert` hysteresis; RAM adds flap damping on top: a per-axis exit
+  margin (`memory_tiers.exit_margin_pct`, default 5), a blind axis holding its
+  last tier (stale after one re-alert window, and named in the page), and a
+  baseline of the highest tier paged since the last recovery that lasts one
+  re-alert window (state `memory_alert_state.json`: `tier` = that peak,
+  `axes`, `blind_since`). Read-only `disk-status`/`ram-status` verbs expose
+  the same raw measurement to the container.
 - **Pool RELIEF** (`pool_relief.py`) runs every tick, BEFORE `_check_cycle`
   (during an outage's diagnosis that is about hourly, since the tick is a
   oneshot). The tiers above only alert, and a thin pool once filled to 100%
@@ -2846,11 +2934,40 @@ verified: 0aa0bf9f2 2026-11-10
   the Failure Inventory remedy for memory held by a shared Codex app-server
   daemon's MCP servers (#4302). Dry-run by default; `--execute` only inside an
   approved action. Resolves targets when it runs: direct children of a
-  `codex app-server --listen` process that lead their own process group with
-  pipe stdin+stdout, excluding Codex helper binaries, systemd-unit members and
+  `codex app-server --listen` process that lead their own process group and
+  read a pipe the app-server writes and write one it reads, on any descriptor,
+  that no other app-server child also holds
+  (matched by pipe identity and `fdinfo` access mode: the MCP Python SDK moves
+  the protocol off fd 0/1, so a stdin test missed every Genesis server),
+  excluding Codex helper binaries, systemd-unit members and
   anything under a `claude` process. Lever `codex_mcp_stop.mode` in
   `config/sentinel.yaml` (`propose_only` | `off`) +
-  `GENESIS_CODEX_MCP_STOP_DISABLED=1`.
+  `GENESIS_CODEX_MCP_STOP_DISABLED=1`. Proposed early by the health alarm
+  `infra:codex_mcp_held` (WARNING, tier 2 via `_TIER2_PATTERNS`), which fires
+  when that same `scan()` totals `codex_mcp_stop.propose_at_mb` (default 4096)
+  or more; the scan runs off-loop and is cached 60 s in `mcp/health/errors.py`.
+  Because that alarm does not clear by itself, `check_fire_alarms` lets a
+  confirmed alarm that is stronger by the classifier's order (tier, then
+  CRITICAL first) cancel (`resolved_by="superseded"`) a park whose triggering
+  alarms are all WARNING, but only when the alarm dispatch would lead with is
+  that challenger and passes backoff; a park with any CRITICAL trigger is never
+  taken over, and a cancel that fails keeps the park. The cancelled pattern
+  starts the 15-minute resolved cooldown. A declined dispatch or action is
+  quiet for 24 h through `handle_approval_resolution` (every pattern).
+- **sentinel/process_stop.py** (`python -m genesis.sentinel.process_stop`):
+  the Failure Inventory remedy for ONE runaway process. Dry-run by default;
+  `--execute` only inside an approved action. Resolves targets when it runs:
+  this user's processes (not pid 1, not zombies or kernel threads, not the
+  tool's own ancestors) outside any systemd `.service` unit that hold
+  `process_stop.propose_at_mb` (default 6144) MB of RSS+swap, excluding
+  `init.scope`. `--execute` requires `--only PID:STARTTIME,...` copied from the
+  dry-run and stops only those identities still eligible, so an approval never
+  covers a process that crossed the line later. SIGTERM, then SIGKILL, through
+  a pidfd opened before the start-time check, to the process alone. Claude Code
+  sessions (foreground and server-dispatched `run-*.scope`) are eligible. Lever `process_stop.mode` (`propose_only` | `off`) +
+  `GENESIS_PROCESS_STOP_DISABLED=1`. Proposed early by the health alarm
+  `infra:process_memory_high` (WARNING, tier 2), from the same `scan()`,
+  cached 60 s.
 - GROUNDWORK: guardian-cgroup, guardian-bidirectional, sentinel-live-autonomy.
 
 ## 9. Ambient cognition — heartbeat, reflection, attention
@@ -3210,6 +3327,10 @@ verified: c712f1bde 2026-11-06
   uncovered or stale declarations, including previews; old evidence still parses
   and reasoned `E2E: none` declarations need no mapping. The shared source parser
   also supplies the existing script facade (verified: 2026-11-06).
+  Both writers also refuse a closing verdict while an event-gated gap's date has
+  come, and print or return advisory completeness prompts (`completeness_prompts`)
+  on every run; the prompts change no verdict and are not stored. They do not
+  replace the independent verifier (#4180; verified: 2026-11-14).
   Fixture lookup injection stays outside the public MCP schema. Its
   server-side calibration gate forces preview until operator opt-in, including
   attempt notes. Real writes use a separate admitted existing-only connection;
@@ -3668,7 +3789,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 5be8573a5 2026-11-07
+verified: 3f70a665b 2026-11-15
 ```
 
 - **eval/ego_runtime**: opt-in canonical proposal-operation probes using fresh
@@ -3836,6 +3957,19 @@ verified: 5be8573a5 2026-11-07
   Critic + a `replay` off|shadow sub-config) + `GENESIS_SKILL_EVOLUTION_GATE_OFF`.
   `tool_discovery.py` static maps are deprecated (GROUNDWORK
   provider-migration) — use ProviderRegistry.
+- **The whole-session lesson builder** (Stream 1 of
+  `memory/extraction_job.run_extraction_cycle`, plus its `procedure_rebuild`
+  drain) adds at most 7 new lessons per source session in any rolling 24 hours,
+  counted by `procedural_memory.created_session_id`. That column is written once,
+  at insert, so a refine that rewrites `source` cannot reopen a slot. Lever: the
+  `lesson_builder` settings domain (`off | shadow | live`, shipped `live`; an
+  unreadable base or overlay reads as `shadow`). In shadow the builder runs its
+  real model call and checks, stores nothing, and appends each would-be lesson
+  to `~/.genesis/output/lesson_builder_shadow.jsonl`. That file is also the
+  shadow cap's count, so it rotates by time (the two files always hold the
+  window) and drops a lesson that repeats one already recorded for the session.
+  Queued rebuilds wait, unspent, until the mode is live; the drain scans past
+  capped sessions, so they never starve an eligible one.
 - **eval/**: J9 = fire-and-forget emit hooks on live cognitive paths (the
   "cannot break production" contract — hooks must never raise) + weekly Sunday
   aggregation (hard 7-day window) + an on-demand batch judge as a surplus
@@ -3945,6 +4079,10 @@ verified: 5be8573a5 2026-11-07
   establish provider spend bounds or owner approval. This verification refresh covers the qualification slice;
   other learning/evaluation entries retain their previous verification scope.
   See `docs/reference/qualification-transport.md`.
+  A gated native first-party DeepSeek profile shares the same bounded controller
+  and guarded HTTP lifecycle. Native tariff calculations remain separate from
+  legacy provider receipts and cannot supply invoice or promotion authority.
+  See `docs/reference/qualification-native.md`.
   Complete offline preflight checks all registered corpus floors, current
   reference policy/approval/source identities and explicit call-site parameters.
   Production rendering determines duplicate questions and selected novelty IDs.
@@ -3968,6 +4106,12 @@ verified: 5be8573a5 2026-11-07
   independent-backup claim. Missing retained evidence refuses before rendering.
   The isolated serial CLI supports Flash-only, explicit Pro–Flash or historical MiMo–Flash execution
   under an exact frozen operating plan and a separate local spending assertion.
+  Bounded `study-run` uses a separate count-bound consent, fixed nonrelaunchable
+  root and one existing physical journal per request. Only the precise closed
+  upstream-pool rejection can receive a finite replacement. Both offline study
+  readers census the complete owner/sibling population; model errors and
+  unresolved expense remain separate. This adds no paid authorization, route
+  selection or activation. See `docs/reference/qualification-continuation.md`.
   An explicit manifest-bound Pro incumbent sample retains complete reference
   admission and full Flash gates. Sampled Pro reports completion separately
   from qualification; execution and detached reporting use the same declared
@@ -4601,6 +4745,18 @@ logger or unrelated exceptions with copied text and no provenance.
   `python -m genesis.trash list|restore`. Callers: cognitive rollback, the
   orphan task-worktree reset, and the dashboard's file-browser and memory-file
   deletes (`docs/reference/trash.md`). Stdlib only.
+- **Worktree reaper trash** (`scripts/worktree_lifecycle.py`, outside `src/`;
+  read at 26218b962, 2026-11-10): the daily hygiene run archives stale
+  worktrees into `~/.genesis/worktree-trash`. An entry has two forms: a
+  `<entry>.tar.gz` with a `<entry>.meta.json` sidecar and a locked, directory-less
+  registration (the anchor that keeps its commits reachable), or a compacted
+  `<entry>.compacted.json` stub whose head is pinned under `refs/archived/` and
+  carried in a `<entry>.compacted.bundle`; each compaction run re-pins a lost pin.
+  Nothing deletes or compacts on a schedule yet. `--expire-trash` (merged,
+  content-proven redundant: `worktree_redundancy.py`, #2504) and
+  `--compact-trash` (unmerged, every file equal to its head:
+  `worktree_compaction.py`) are manual, and #4160 tracks scheduling them.
+  `--recover` restores either form; a stub comes back detached at its pin.
 - **hostmetrics/**: stdlib-only resource readings (container cgroup memory and
   CPU, PSI, disks, and the host's headroom through the guardian gateway) and the
   `preflight`/`status` CLI that admits or refuses a heavy job against the
@@ -4688,8 +4844,9 @@ logger or unrelated exceptions with copied text and no provenance.
   `RequestDatabase` supplies a stable facade with one fresh physical connection
   per independent unit, bounded admission, retained cancellation cleanup and
   cursor closure. It preserves explicit CRUD commits and refuses expired scopes;
-  it does not provide whole-tool atomicity. Existing MCP initialization still
-  uses its legacy connection. `spawn_database_task` gives scoped detached
+  it does not provide whole-tool atomicity. Ordinary stdio and in-process MCP
+  initialization retain legacy connections; explicit shared startup uses the
+  facade. `spawn_database_task` gives scoped detached
   writers their own unit, preserves other caller context, and tracks jobs from
   scheduling through shutdown, including cancellation before start.
   Detached work requires explicit background connection and job-count budgets;
@@ -4704,7 +4861,8 @@ logger or unrelated exceptions with copied text and no provenance.
   fails shutdown; dependent provider closure requires positive settlement.
   `run_resource_thread` preserves ordinary legacy thread cancellation. These are
   internal prerequisites; the nine memory-consumer thread boundaries use them,
-  while shared factory wiring remains separate. Lease budgets bound database
+  and the explicit shared factory drains them before dependent provider closure.
+  Lease budgets bound database
   connections, not executor items.
   Activity, embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
   legacy connections keep ordinary task scheduling. Internal
@@ -4716,9 +4874,11 @@ logger or unrelated exceptions with copied text and no provenance.
   warmed once by the owning bootstrap; registration cannot rebind pending flushes
   or duplicate history. Scoped health supports the standalone status-file service,
   rejecting runtime snapshot sharing before changing registration. Reinitialization
-  replaces obsolete instrumentation in either DB mode. No CLI or transport
-  selects it yet; caller identity, bookmark policy and shared activation remain
-  separate work. See
+  replaces obsolete instrumentation in either DB mode. The explicit shared HTTP
+  launcher selects it with authenticated request callers and leaves pending
+  memory bookmark files for the per-session path. Ordinary stdio and in-process
+  initialization retain their existing paths; local bookmark consumption and
+  routing activation remain separate work. See
   `docs/reference/request-database.md` for lifecycle and failure semantics.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Every
@@ -5320,8 +5480,9 @@ logger or unrelated exceptions with copied text and no provenance.
   `live-repair` is moved aside, never followed; a set-aside kit or `current` is kept a week from the
   move); `status` reports ok,
   missing, foreign, corrupt, partial or stale. bootstrap, `deploy_code_only.sh`
-  (past its update-state refusal) and the update's rollback (when the code restore
-  succeeded) install it, never fatally: the installed kit is HEAD's at the last
+  (past its update-state refusal), the update's rollback (when the code restore
+  succeeded) and, on `live`, `update.sh` right before its rebuild (the
+  `live-kit-install` block, #3492 D2c) install it, never fatally: the installed kit is HEAD's at the last
   successful install, so it can be newer than the code that wrote the update state
   (an update killed after its bootstrap; a rollback to a tag from before the
   installer, whose install fails and keeps the newer kit), and it must read the
@@ -5339,6 +5500,10 @@ logger or unrelated exceptions with copied text and no provenance.
   every child by one deadline 75 s after its start (`live_move_boot.py`: git,
   the guard's git through its `_DEADLINE`, restore-hooks, which ends 10 s early
   so the healed tree is judged in time; a call with no time left never starts;
+  the heal's own git ends 5 s early, `END_MARK_S`, and every end mark may run
+  into that reserve with a 1 s kill grace, so a crash's mark taken after the
+  heal's deadline is still real (#4548; a hung mark early in the run can use the
+  heal's time and the reserve, still inside the 90 s pin);
   the pin 5 + 75 + 3 + 1 + 4 <= 90 is tested, and a run past its deadline
   ended `exit-code`, not `timeout`, in a transient unit: measured 2026-11-11
   with a 20 s deadline; T-D34 repeats it only where a user manager exists). A `live` row judged
@@ -5350,14 +5515,27 @@ logger or unrelated exceptions with copied text and no provenance.
   `live` rollback stopped after `merging`, #3722's wording) with a `mixed`
   critical page, a failure before judging with `skipped`. Each page's key is
   its class, the state's bytes as the run leaves them and an end mark of the
-  checkout (HEAD, `status -z`, index.lock), so a heal that keeps a HOLD and the
+  checkout (HEAD, `status -z`, index.lock, and the lstat identity, ctime
+  included, of up to 20,000 listed paths other than the ephemeral ones, so an
+  edit to a file that is already modified or untracked moves it; #4548), so a heal that keeps a HOLD and the
   next boot's HOLD page once; a repeat of an unresolved heal (a heal that crashed
   partway, or was killed before it recorded a result, is retried once at the next start: owner
-  ruling, its attempts counted from the reports on disk; an end mark the deadline left unreadable
+  ruling, its attempts counted from the newest 8 reports among the newest 32 folders on disk; a heal
+  writes its first REPAIR.json as it starts, before anything is saved, so one that fails or is
+  killed before its backup is complete is counted too (#4548); an end mark the deadline left unreadable
   never counts as a change) with nothing
   changed refuses at once with no new backup, unless another kit is installed
   (its `kit_id` is part of the match). Every run, by command too, holds the kit's
   `KIT.json` shared until it exits, so a reinstall's prune never removes a kit in use.
+  The deploy engine guards both halves (#3492 D2c): admission refuses a candidate
+  that changes a kit source or either unit template, and readiness
+  (`boot_repair_failures` in `deploy_candidates_gate.py`) refuses `live` while the
+  kit's status is missing, partial, corrupt or foreign, or cannot be judged (a stale kit is a NOTE: the
+  pre-rebuild install heals it), while the LOADED genesis-server unit
+  (`systemctl --user show`, with the user-bus variables defaulted as the watchdog
+  does) has no refusing `ExecStartPre` naming the kit with `--boot` (each entry judged
+  whole: systemd prints a `\n` inside one as a new line), or while its
+  `TimeoutStartUSec` is under 90 s; a systemctl that cannot answer refuses too.
   `--explain` needs no kit: with none
   installed it runs the module as HEAD committed it, from memory, never the
   working tree's copy, which may itself be half-written) heals a live row's `mixed_tree`
@@ -5940,6 +6118,23 @@ verified: 81bbdb0a9 2026-11-08
   effects. Independent copied-artifact readback refuses incomplete or stale
   evidence; no production provider, native auth, lifecycle enrollment or live
   policy is added. See `docs/reference/codex-native-harness.md`.
+  A separate 17-case MCP elicitation experiment has its own frozen manifest and
+  reader. Proper approval metadata, data-form controls, request binding and
+  physical sink ordering are tested independently; synthetic fixture results
+  confer no production action authority or human-frontend qualification.
+  Its isolated frontend declares standard form input and a root user thread;
+  this permits the data-entry Never control without exempting proper approvals.
+  Initial native results were 15 passed / 2 failed; corrected expectations and client
+  declarations require a fresh complete run before qualification.
+  The elicitation reader checks all retained frames and binds interruption
+  server terminals and reader-thread completion receipts to their inputs.
+  Normal receipts must follow their own fixture outcome; interrupted completions
+  must follow their successful typed interrupt RPC acknowledgement in the raw
+  stream, including when completion is received during flush.
+  Foreign/stale controls finish on a current decline; EOF requires fresh
+  root/writer liveness, same-census ancestry and frozen known-child retirement
+  before fallback cleanup. Independent golden replies and atomic provider
+  indexing pin these witnesses; final contained verification remains required.
   Interactive native qualification records a Codex0.166.0 reference binary.
   The launcher warns on other recognizable versions and retains its startup
   inspection/refusal checks; those inspect state, not actual tool denial.
@@ -6113,13 +6308,14 @@ around them. **What exists today:**
 - the stores, the `board` mode lever, and the open-question tools;
 - the Projects v2 adapter and its idempotent setup script;
 - promotion of a private record onto the board;
-- the READ-ONLY reconciler and its two read tools.
+- the reconciler, which reads the board every tick and in `live` fills empty
+  Status columns, adds missing open items and records promoted cards' ids,
+  and its two read tools.
 
-The reconciler's write half (adding every repo item, the bookkeeping move to In
-Review, the Genesis status) and the dashboard tab are follow-on work. The
-shipped mode is `off`.
+The bookkeeping move to In Review (#4400 Part 2), the Genesis status and the
+dashboard tab are follow-on work. The shipped mode is `off`.
 
-- **Reconciler, read-only** (`board/reconciler.py`; bootstrap step `board`,
+- **Reconciler** (`board/reconciler.py`; bootstrap step `board`,
   `runtime/init/board.py`, a 5-min `CronTrigger` on the learning scheduler,
   `max_instances=1`). Each tick:
   - reads nothing while paused, in mode `off`, or with no project configured;
@@ -6132,15 +6328,37 @@ shipped mode is `off`.
     nothing else (MEASURED 2026-10-04 on a private sandbox, with a control);
   - flags `observed_late` from the clock alone (older than one interval plus
     slack), never from stored state;
+  - after a good read, runs the write phase (#4400 Part 1). In `live` only,
+    re-checked before each write: records the card id on each `board_links`
+    row whose issue now has a card; fills an EMPTY Status (In Review for an
+    open PR and for an issue with an open closing PR in the tracker repo from
+    a branch of it, else Proposed; each card is re-read just before its write,
+    so a card someone moved, even mid-tick, is never touched); and,
+    when open repo items are missing from the board (archived cards count as
+    on it), lists the repo and adds each one Genesis never added before, so an
+    owner's removal sticks (`prune` never deletes `item_added` rows). A listing
+    that finds nothing to add is not repeated while the gap holds, for up to an
+    hour. Status writes go through `projects_v2.set_status`, an allowlist that
+    refuses In Progress, validated before anything is audited or spent. A
+    Status write is audited before its request (`<item>:<to>:<tick>`); an add
+    is recorded after it succeeds (`<content id>:<tick>`), so a failed add is
+    retried. GitHub writes go 1 s apart, at most 16 per tick (what binds on the
+    normal schedule) and 200 per rolling hour counted from those rows (what
+    bounds extra ticks). A failed request (an HTTP error, a timeout, a rate
+    limit) stops the tick's writes; an error about one item skips that item.
+    Outside `live` the summary carries would-write counts (`dry_run`) and
+    nothing is written;
   - ALWAYS emits a `board` heartbeat (DEBUG) carrying the summary, in every mode
     and while paused. So the pulse is not pause-gated and has no enable check,
-    and in mode `off` it is effectively a learning-scheduler canary;
-  - writes NOTHING to GitHub (a test pins it).
-  A clean tick records job success; a read error publishes `last_error` and no
-  counts, and records a failure. The step raises if the learning scheduler is
+    and in mode `off` it is effectively a learning-scheduler canary.
+  A clean tick records job success, and so does a rate-limited one; a read
+  error publishes `last_error` and no counts, and records a failure. Any other
+  write failure records a failure too, with the read's counts and the writes
+  already made kept. The step raises if the learning scheduler is
   missing or stopped, so the manifest names that cause instead of the board.
 - **`board_status`** reads the stored heartbeats only, never GitHub: the newest
-  pulse (alive, mode, error) and the newest SUCCESSFUL read with its age.
+  pulse (alive, mode, error) and the newest SUCCESSFUL read with its age,
+  including that tick's `writes` block (None on a summary from before #4400).
   **`board_item`** reads one issue or PR live (nothing while the mode is
   `off`): its card on the configured
   project (matched by owner AND number), GitHub's blocked-by list (flagged when
@@ -6170,7 +6388,8 @@ shipped mode is `off`.
     (`github.user`/`github.public_repo`, the repo promotions post to — never
     the checkout's own remote) via `ProjectV2.repositories`, and links it with
     `linkProjectV2ToRepository` when not (shown in the dry run first);
-  - Status columns Proposed / Ready / In Progress / In Review / Done; an
+  - Status columns Proposed / Ready / Build / In Progress / In Review / Done
+    (Build: a card there approves one builder run, read by nothing yet); an
     option outside them is ALWAYS kept, never deleted (deleting one clears it
     from every card holding it, and no read before the write can prove none
     does at the write);
@@ -6241,8 +6460,7 @@ shipped mode is `off`.
     the pointer adds no second event), with each tick re-linking any posted
     row a crash or failed write left unlinked;
   - never touch the project: a promoted issue is created and linked, not
-    added to the board. The reconciler's write half (follow-on) places every
-    open issue; its adapter calls carry `GROUNDWORK(board-reconciler-writes)`.
+    added to the board. The reconciler's backfill places it in `live`.
 - Both lanes can each pass their propose-time duplicate check for one
   follow-up when proposed concurrently; the drain (the only poster, one job,
   rows in sequence) refuses a hold whose follow-up the OTHER lane already
@@ -6271,7 +6489,8 @@ verified: b67423bd 2026-10-03
     privacy-scan receipt, the hash of the body that was scanned);
   - `open_questions` + `open_question_blocks` — local-only owner decisions
     and the work each one blocks (an edge, not a list entry);
-  - `board_events` — the append-only event log.
+  - `board_events` — the append-only event log (pruned at 180 days, except
+    `item_added` rows, which the backfill reads as its memory).
   Each vocabulary is enforced in the CRUD module; `board_events.event` has no
   CHECK because SQLite cannot alter one. A partial UNIQUE index on
   `(event, observed_change_key)` dedups a re-read GitHub change.
@@ -6285,8 +6504,8 @@ verified: b67423bd 2026-10-03
   only turn the board down, never arm it. The master `enabled` fails closed
   unless it is the literal `true`. Board promotion (`board_promote` and the
   drain) reads it on every call, and so do the reconciler and `board_item`.
-  The write entry points the read-only reconciler does not use yet carry
-  `GROUNDWORK(board-reconciler-writes)` (and the tab's, `GROUNDWORK(board-tab)`).
+  The adapter calls nothing uses yet (`issue_node_id`, `set_text`) carry `GROUNDWORK(board-reconciler-writes)` (and the tab's,
+  `GROUNDWORK(board-tab)`).
 - **Open questions** (`mcp/health/open_question_tools.py`: `open_question_raise`,
   `_resolve`, `_block`, `_list`) — never gated by the board mode, because they
   write only local rows. A target id prefix must resolve uniquely against its

@@ -132,10 +132,11 @@ a tool-appended status block at end-of-file is not plan content and is current
 by construction. That is a real rough edge, not a clean exception, and it will
 read as archaeology to anyone scrolling.
 
-A plan doc's body answers the six plan-time premise questions in
+A plan doc's body answers the nine-item premise form in
 `.claude/docs/premise-check.md`, "At plan and issue time", in its
-`## Premise checks` section format. A plan that names repo paths cannot leave plan
-mode without that section and six non-empty answers.
+`## Premise checks` section format (`1. Problem: as #<N>` may stand for items 1
+to 5 when that issue answers them). A plan that names repo paths cannot leave plan
+mode without that section and its answers.
 
 ## What each field is for
 

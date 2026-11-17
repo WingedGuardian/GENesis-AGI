@@ -8,21 +8,28 @@ import os
 from pathlib import Path
 
 
+def _study_arguments(command, name):
+    command.add_argument("--study-plan", type=Path, required=True)
+    if name == "study-run":
+        command.add_argument("--spending-approval", type=Path, required=True)
+    else:
+        command.add_argument("--study-root", type=Path)
+
+
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
-    for name in ("check", "run", "report", "study-check", "study-report"):
+    for name in ("check", "run", "report", "study-check", "study-report", "study-run"):
         command = commands.add_parser(name)
         for flag in ("corpus", "temp-root", "reference-policy", "current-reference-policy",
                      "reference-approval", "source-files", "params"):
             command.add_argument("--" + flag, type=Path, required=flag in ("corpus", "temp-root"))
         if name.startswith("study-"):
-            command.add_argument("--study-plan", type=Path, required=True)
+            _study_arguments(command, name)
         else:
             command.add_argument("--alias", required=name != "check")
         if name in ("run", "report"):
             command.add_argument("--campaign", type=Path, required=True)
-        if name in ("run", "report"):
             command.add_argument("--against")
             command.add_argument("--against-campaign", type=Path)
         if name == "run":
@@ -72,6 +79,26 @@ async def admit(args, cases, configured, options):
 
 
 async def run(args):
+    if args.command != "study-run":
+        return await _run(args)
+    from .execution import Input
+
+    # Freeze before loading corpus/options, so a later file generation cannot
+    # silently stand in for the generation rendered by complete preflight.
+    with contextlib.ExitStack() as stack:
+        paths = [getattr(args, flag) for flag in (
+            "params", "reference_policy", "current_reference_policy", "reference_approval", "source_files")]
+        paths += list(args.corpus.glob("*.jsonl"))
+        inputs = []
+        for path in paths:
+            if path is not None:
+                item = Input(path, decode=bytes)
+                stack.callback(item.close)
+                inputs.append(item)
+        return await _run(args, study_inputs=inputs)
+
+
+async def _run(args, *, study_inputs=()):
     from genesis.eval.qualification import corpus, execution, preflight, references
     from genesis.eval.qualification import run as qualification
     from genesis.eval.qualification.evidence import Incomplete, load_json
@@ -107,10 +134,16 @@ async def run(args):
         "reference_approval": read("reference_approval"), "source_files": read("source_files"),
     }
     if args.command.startswith("study-"):
+        if args.command == "study-run":
+            from .continuation import execute
+
+            return await execute(args.study_plan, args.spending_approval, cases, args.temp_root,
+                                 candidates=configured, options=options,
+                                 input_descriptors=study_inputs)
         from .study_report import inspect
 
         return await inspect(args.study_plan, cases, args.temp_root, candidates=configured,
-                             options=options, scoring=args.command == "study-report")
+                             options=options, scoring=args.command == "study-report", root_path=args.study_root)
     if args.command in ("check", "run"):
         return await admit(args, cases, configured, options)
     against = args.against

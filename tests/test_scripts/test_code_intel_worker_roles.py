@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from tests.test_scripts import test_code_intel_index as index
+from tests.test_scripts.managed_code_intel_fixture import qualify_bytes
 from tests.test_scripts.test_code_intel_cbm_worker import _args, _fake_worker, worker
 
 
@@ -127,8 +127,10 @@ def test_native_child_is_promoted_without_changing_adapter(tmp_path, monkeypatch
         "import json,sys\n", "import json,sys\nfrom pathlib import Path\n"
         f"Path({str(proof)!r}).write_text(Path('/proc/self/oom_score_adj').read_text())\n",
     ))
-    monkeypatch.setitem(worker.load_managed()["verified_binary"].__globals__, "BUILD",
-                        hashlib.sha256(binary.read_bytes()).hexdigest())
+    managed = worker.load_managed()
+    digest, = qualify_bytes(monkeypatch, managed["qualified_release"], binary.read_bytes())
+    qualify_bytes(monkeypatch, worker.qualified_release, binary.read_bytes())
+    managed["runtime_config"](tmp_path / "settings")["build"] = digest
     before = Path("/proc/self/oom_score_adj").read_text()
     actual = worker.subprocess.Popen
 

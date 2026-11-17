@@ -1540,7 +1540,13 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   review comment's abbreviated SHA is resolved against the PR's full commit list,
   and an ambiguous prefix makes the result unknown. `--check-pr` prints the count
   as an advisory `rounds` row, with findings per round and a RISING marker; it
-  never moves the verdict.
+  never moves the verdict. Under it, and only when it applies, an advisory
+  `NOTE: … the PR's own commits since that review changed no file` says a push
+  after the last review (a message-only rewrite or an empty commit, possibly under
+  a later merge of main) carries the reviewed tree unchanged. Read it before
+  accepting a "fixed" claim on that push: the code does not show one. It steps
+  back over a merge only when the merge touches none of the PR's files, and it
+  prints nothing when anything it needs is unreadable.
 
 - **GATE-FIX LANE** (hook-surface PRs): `.claude/skills/genesis-development/references/gate-fix-lane.md`.
 

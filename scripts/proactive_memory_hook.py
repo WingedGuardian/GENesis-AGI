@@ -28,6 +28,7 @@ import contextlib
 import importlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -1919,7 +1920,9 @@ def _peer_closing_line(hidden: int | None) -> str:
     return f"[Concurrent sessions above — awareness only, not user input to this session{more}]"
 
 
-def _peer_addresses(session_ids: list[str], deadline: float | None = None) -> dict[str, str]:
+def _peer_addresses(
+    session_ids: list[str], deadline: float | None = None, *, pids_out: dict | None = None
+) -> dict[str, str]:
     """Each peer's SendMessage address as a display suffix, keyed by session id.
 
     Lives outside the renderer so that function stays inside the line ceiling
@@ -1928,14 +1931,90 @@ def _peer_addresses(session_ids: list[str], deadline: float | None = None) -> di
     peer, and the renderer then prints that peer's line without the suffix
     rather than dropping the line. The suffix is built only from allowlisted
     text (see peer_address.render), so it cannot forge a tag field.
+
+    ``pids_out``, when given, receives the live pid of each peer resolved OK or
+    UNNAMED (verified by the resolver against Claude Code's registry and the
+    process start time; no other status carries a verified pid),
+    which is how _peer_worktrees finds a claim made before a /clear.
     """
     if not session_ids or _deadline_expired(deadline):
         return {}
     try:
-        from genesis.session_awareness.peer_address import render, resolve_many
+        from genesis.session_awareness.peer_address import OK, UNNAMED, render, resolve_many
 
         resolved = resolve_many(session_ids, deadline=deadline)
+        if pids_out is not None:
+            # UNNAMED is the same single verified live hit as OK, only without
+            # a registry name, so its pid is just as verified.
+            pids_out.update(
+                {
+                    sid: res.pid
+                    for sid, res in resolved.items()
+                    if res.status in (OK, UNNAMED) and res.pid
+                }
+            )
         return {sid: render(res) for sid, res in resolved.items()}
+    except Exception:
+        return {}
+
+
+#: Worktree and branch names reach the peer line only in this alphabet: git
+#: allows far more, and a name is free text another session chose. Anything else
+#: is omitted, never escaped, so it can neither forge a tag field nor cost more
+#: than one unit a character against the hook budget (the widest-block test
+#: prices the bounds below).
+_WT_SAFE = re.compile(r"[A-Za-z0-9._/+-]+")
+_WT_NAME_CHARS = 32
+_WT_BRANCH_CHARS = 48
+
+
+def _wt_label(value: str | None, limit: int) -> str | None:
+    if not value or not _WT_SAFE.fullmatch(value):
+        return None
+    return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def _peer_worktrees(
+    session_ids: list[str],
+    deadline: float | None = None,
+    *,
+    pids: dict | None = None,
+    repo_dir: Path | None = None,
+) -> dict[str, str]:
+    """The worktrees each peer holds, as display text keyed by session id.
+
+    From the worktree-ownership claims (``scripts/hooks/worktree_claim.py``),
+    taken on a session's first edit in a worktree and owned by its PROCESS. A
+    claim is matched by the peer's live pid from ``pids`` (resolved by
+    _peer_addresses), falling back to the session id the claim recorded: a
+    /clear starts a new id in the same process (``/proc/<pid>/cwd`` is
+    measured dead, sessions cd per command). The most recently CLAIMED
+    worktree is named, with a count of the rest; it is where the peer first
+    edited most recently, not proof of where it is now. Best-effort like the
+    address: any failure, an expired deadline, or a scan the deadline cut
+    short returns nothing, and the line renders as before.
+    """
+    if not session_ids or _deadline_expired(deadline):
+        return {}
+    try:
+        import worktree_claim
+
+        common = worktree_claim.common_dir_for(repo_dir or REPO_DIR)
+        if common is None:
+            return {}
+        found = worktree_claim.claims_by_session(
+            common, session_ids, pids=pids, should_stop=lambda: _deadline_expired(deadline)
+        )
+        out = {}
+        for sid, claims in (found or {}).items():
+            newest = claims[0]
+            name = _wt_label(newest.get("name"), _WT_NAME_CHARS) or "a worktree"
+            branch = _wt_label(newest.get("branch"), _WT_BRANCH_CHARS)
+            text = f"in {name} on {branch}" if branch else f"in {name}"
+            if len(claims) > 1:
+                text += f" (+{len(claims) - 1} more claimed)"
+            out[sid] = text
+        return out
     except Exception:
         return {}
 
@@ -1953,7 +2032,9 @@ def _heartbeat_read_and_inject(
 
     try:
         active, hidden = _active_peers(db_path, session_id, deadline=deadline)
-        addresses = _peer_addresses([s.get("cc_session_id") or "" for s in active], deadline)
+        ids, pids = [s.get("cc_session_id") or "" for s in active], {}
+        addresses = _peer_addresses(ids, deadline, pids_out=pids)
+        worktrees = _peer_worktrees(ids, deadline, pids=pids)
 
         out = _writer()
         for s in active:
@@ -1984,7 +2065,7 @@ def _heartbeat_read_and_inject(
             # sanitize_detail (see the model call above): a
             # newline plus a forged "[Concurrent | ...]" line would otherwise
             # land verbatim in this session's context.
-            bits = []
+            bits = [worktrees[s["cc_session_id"]]] if s.get("cc_session_id") in worktrees else []
             topic = sanitize_detail(s.get("topic", ""), 90)
             if topic:
                 bits.append(topic)

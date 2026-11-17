@@ -15,6 +15,20 @@ Closes #
 
 <!-- Bullet the key changes. -->
 
+## Premise checks
+
+<!-- The Change block of the premise form (.claude/docs/premise-check.md, "At plan
+     and issue time"); a plan's section can be copied here. `Problem: as #N`
+     stands for items 1 to 5 when the linked issue answers them; otherwise write
+     1 to 5 out too. A PR-shape `Shape:` reason, when one is owed, goes on its
+     own line as well: item 9 does not count as that line. -->
+
+1. Problem: as #
+6. Mechanism:
+7. Alternatives:
+8. Evidence:
+9. Shape:
+
 ## Testing
 
 <!-- How did you verify this works? -->

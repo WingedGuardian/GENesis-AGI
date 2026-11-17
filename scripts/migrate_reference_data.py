@@ -23,7 +23,8 @@ Sources:
      Genesis has configured".
 
 Idempotent: relies on the UNIQUE(project_type, domain, concept) constraint
-on ``knowledge_units`` plus ``knowledge.upsert`` semantics. Re-running
+on ``knowledge_units`` plus ``knowledge.upsert`` semantics (a credential is
+found again by the hash of its full name, its key being opaque). Re-running
 updates existing entries in place; the first ingestion's stable unit_id is
 preserved.
 
