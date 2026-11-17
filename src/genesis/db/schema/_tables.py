@@ -82,7 +82,8 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             principle_embedding BLOB,                      -- qwen3-embedding(1024 float32) of `principle`, little-endian; read by proactive procedure hook
             surfaced_count    INTEGER NOT NULL DEFAULT 0,  -- contextual-hook surfacings (proactive hook / tool advisor); honest funnel signal, NOT read by promoter
             trigger_spec      TEXT,                        -- JSON: {patterns, repeat} for a lesson (learning/procedural/lesson_shape.py)
-            lesson            TEXT                         -- JSON: {authored_via, authored_in, origin, reviewed, authored_at}; NULL = an earned procedure
+            lesson            TEXT,                        -- JSON: {authored_via, authored_in, origin, reviewed, authored_at}; NULL = an earned procedure
+            created_session_id TEXT                        -- source session at insert, never rewritten (the lesson cap counts it; #4717)
         )
     """,
     "attention_events": """

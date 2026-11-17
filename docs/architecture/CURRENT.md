@@ -890,6 +890,38 @@ complete-attempt evidence. See `docs/reference/inbox-attempt-identity.md`.
   took the predecessor design through 7 review rounds is retired by
   construction. Forbidden mechanisms are test-pinned (no send-keys /
   respawn-pane / set-environment; exactly one new-session invocation).
+- **The slot door has a builder mode, for code with nobody at the terminal**
+  (`scripts/cc-slot.sh launch --issue N --key K --session-id UUID [--resume]
+  [--slot N] --prompt-file F`; spec E, E3). It creates the slot through the same
+  single create invocation, DETACHED (`-d`, never `-A`), and never prompts.
+  - **Slot:** the caller's `--slot N`, refused (75) when taken and never
+    swapped, so the launcher can record it before launching. Without it, the
+    lowest free slot.
+  - **Capacity:** SSH variables are cleared first, so the gate answers ALLOW or
+    DENY, never an interactive reclaim.
+  - **Exit codes:** 0 when the session is still there a few seconds after the
+    create (a claude that exits at once is reported as a failure); 75 for a taken
+    slot or a capacity refusal (retry later); 64 for bad input, including a pane
+    command past tmux's client limit (MEASURED on tmux 3.4: 16300 bytes accepted,
+    16340 refused); any other non-zero for a failure.
+  - **OAuth:** the fallback token is never injected, because Remote Control
+    cannot run on it.
+  - **Environment:** the pane rebuilds claude's environment with `env -i`, from
+    the variable names a manual slot carries plus `GENESIS_BUILDER_KEY`, so no
+    other pane's identity, `GENESIS_CC_SESSION`, API key or token reaches it. The
+    key is also pinned on the tmux session, so `tmux show-environment -t cc-N`
+    maps a builder to its slot. Values are POSIX single-quoted, not `printf %q`,
+    so the pane command does not depend on bash.
+  - **claude:** starts with Remote Control (`build #N`), a fixed `--session-id`
+    (or `-r` to resume), `--model opus` (Claude Code's alias for the latest Opus,
+    so no version is pinned and a saved `/model` default cannot change it), the
+    interactive slots' permission mode, and `config/builder_settings.json` for
+    its subagent caps. A missing or malformed caps file refuses the launch.
+  - **Attach:** builders share the slot numbers, so an operator's
+    `ssh <host>-N` joins a running builder in `cc-N` (the intended attach path).
+
+  Nothing calls it yet: the board launcher (E3a) will. `config/BUILDER_PROMPT.md`
+  is the builder's first-message template, rendered by that launcher.
 - **Roster peer availability is OBSERVATION, never a gate** (`cc/peer_availability.py`,
   recorded from the failover loop in `cc/conversation.py`). `roster.failover_chain`
   admits a peer on CREDENTIAL PRESENCE — "is `auth_env` set" — so a quota-blocked
@@ -1935,7 +1967,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: 9eaa6aba0 2026-11-15
+verified: d70924fb5 2026-11-15
 ```
 
 Scoped verification covers `mcp/shared_http` composition. It receives
@@ -2141,7 +2173,7 @@ the shared banner is not an assertion about all concurrent sessions.
   Matching terminal leader states alone do not prove controller process end.
   The same-connection final drain observes callback-created evidence before
   commit. The acknowledgement grants no retry or acceptance. The automatic
-  reconciliation caller remains separate (#3728); acceptance, cutover,
+  reconciliation caller remains separate (#3728); cutover,
   native qualification and production capacity remain separate gates.
   Explicit request/revoke/status operations use the existing provider-state
   grant and bind actual work, retained debt, evidence, provider and runner/
@@ -2154,7 +2186,14 @@ the shared banner is not an assertion about all concurrent sessions.
   or lost replies cannot reconstruct runtime authority. Ordinary owner admission
   still refuses selected provenance. GN binds ordinary versus selected recovery
   argv to actual durable origin before owner construction and during source
-  recapture. Acceptance, cutover and automatic readiness remain separate gates.
+  recapture. Captured `accept-retry` publishes explicit metadata for a clean,
+  already-settled selected trial after exact source/policy, debt and physical/
+  control checks. It never settles accounting, retires an inflight pointer or
+  launches a provider. Immutable replay recovers a lost acceptance reply without
+  resend; current drain annotations allow only older known retained provider
+  evidence to use the acceptance watermark. Trial/newer hazards and physical
+  obligations remain independent holds. Cutover and automatic readiness remain
+  separate gates.
   Selected acknowledgements recheck repository-wide physical/control holds after
   their final drain. A transient same-transaction fresh proof binds the original
   lifetime subject and exact-sequence raw cleanup evidence; it grants no durable
@@ -2270,7 +2309,9 @@ the shared banner is not an assertion about all concurrent sessions.
   observations preserve owned OOM kills, including the first sample, before
   duplicate/conflict reduction; clean control cannot erase resource evidence.
   Default initialization stays4; new native authority requires5, with no live
-  cutover, acceptance setter or positive automatic readiness here. Explicit
+  cutover or positive automatic readiness here. The explicit acceptance setter
+  changes only the five existing receipt fields after completed-trial validation.
+  Explicit
   transaction-only retry grants in `index_marker_retry.py` require schema5 and
   captured supervision. Selected consumption shares the existing transaction,
   final drain and physical owner, preserving original identity and first-commit
@@ -3780,7 +3821,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 6a73d1b75 2026-11-15
+verified: 3f70a665b 2026-11-15
 ```
 
 - **eval/ego_runtime**: opt-in canonical proposal-operation probes using fresh
@@ -3948,6 +3989,19 @@ verified: 6a73d1b75 2026-11-15
   Critic + a `replay` off|shadow sub-config) + `GENESIS_SKILL_EVOLUTION_GATE_OFF`.
   `tool_discovery.py` static maps are deprecated (GROUNDWORK
   provider-migration) — use ProviderRegistry.
+- **The whole-session lesson builder** (Stream 1 of
+  `memory/extraction_job.run_extraction_cycle`, plus its `procedure_rebuild`
+  drain) adds at most 7 new lessons per source session in any rolling 24 hours,
+  counted by `procedural_memory.created_session_id`. That column is written once,
+  at insert, so a refine that rewrites `source` cannot reopen a slot. Lever: the
+  `lesson_builder` settings domain (`off | shadow | live`, shipped `live`; an
+  unreadable base or overlay reads as `shadow`). In shadow the builder runs its
+  real model call and checks, stores nothing, and appends each would-be lesson
+  to `~/.genesis/output/lesson_builder_shadow.jsonl`. That file is also the
+  shadow cap's count, so it rotates by time (the two files always hold the
+  window) and drops a lesson that repeats one already recorded for the session.
+  Queued rebuilds wait, unspent, until the mode is live; the drain scans past
+  capped sessions, so they never starve an eligible one.
 - **eval/**: J9 = fire-and-forget emit hooks on live cognitive paths (the
   "cannot break production" contract — hooks must never raise) + weekly Sunday
   aggregation (hard 7-day window) + an on-demand batch judge as a surplus

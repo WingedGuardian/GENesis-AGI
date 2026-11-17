@@ -168,6 +168,8 @@ def insertion(before, after, stored, case, path, gates):
         "lesson": None,
         "first_mover": 0 if path == "judge" else int(gates.results["validation"]["first_mover"]),
         "extraction_context": None if path == "judge" else gates.results["validation"]["extraction_context"],
+        # Neither replay source names a session_id (see `source` below).
+        "created_session_id": None,
     }
     source = {"type": "qualification"} if path == "judge" else {
         "type": "auto_extracted", "triage_outcome": "success"
