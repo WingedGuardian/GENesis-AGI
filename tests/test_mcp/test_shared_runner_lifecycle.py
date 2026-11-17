@@ -26,6 +26,11 @@ def test_owner_retirement_precedes_signal_replay_and_loop_teardown(tmp_path, cas
     assert events.count("resources-closed") == 1, result
     assert events.count("lifespan-stopped") == 1, result
     assert events.index("lifespan-stopped") < events.index("resources-closed"), result
+    if case in {"normal", "force-exit"}:
+        assert events[-1] == "completed", result
+    if case in {"lifespan-failed", "bind-error"}:
+        # A start that never completes must not look like a clean stop.
+        assert events[-1] == "SystemExit", result
     if case == "SIGTERM":
         assert run.returncode == -15, result
     if case == "SIGINT":

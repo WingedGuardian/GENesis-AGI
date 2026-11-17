@@ -15,6 +15,8 @@ from genesis.mcp.shared_resources import initialize_shared_service
 from genesis.util.tasks import tracked_task
 
 logger = logging.getLogger(__name__)
+#: uvicorn's exit status for a server that never started.
+_STARTUP_FAILURE = 3
 
 
 class SharedServer(uvicorn.Server):
@@ -91,3 +93,9 @@ async def serve_shared(settings, *, resolver, loaded_commit, started_at, db_path
             if server.started:
                 # Rejoin even if a caller cancelled its first shutdown wait.
                 await server.shutdown()
+        if not server.started:
+            # serve() returns normally when the ASGI lifespan startup fails.
+            # uvicorn's own run() exits 3 then (main.py in 0.44, the constant
+            # moved to config.py by 0.54); do the same, so a supervisor sees a
+            # failed start rather than a clean stop.
+            raise SystemExit(_STARTUP_FAILURE)

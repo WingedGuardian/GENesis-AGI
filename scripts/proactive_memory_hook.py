@@ -28,6 +28,7 @@ import contextlib
 import importlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -48,6 +49,7 @@ from hook_deadline import (  # noqa: E402
     written_units,
 )
 from hook_phases import PhaseClock  # noqa: E402
+from secret_values import redact as redact_secret_values  # noqa: E402
 
 # Per-step timings, written to stderr once per run (hook_phases.py). Created
 # before the hard stop is armed so a stop that fires during the imports below
@@ -139,13 +141,11 @@ if str(SRC_DIR) not in sys.path:
 # only loaded by the Genesis runtime (bridge/AZ), not by Claude Code.
 from dotenv import load_dotenv  # noqa: E402
 
-# SECRETS_PATH wins, as in genesis.env.secrets_path().
+from genesis.secrets_location import resolve as _resolve_secrets  # noqa: E402
+
+# Resolved as genesis.env.secrets_path() resolves it.
 _PHASES.mark("dotenv")
-load_dotenv(
-    Path(os.environ["SECRETS_PATH"]).expanduser()
-    if os.environ.get("SECRETS_PATH")
-    else REPO_DIR / "secrets.env"
-)
+load_dotenv(_resolve_secrets(environ=os.environ, repo_root=REPO_DIR))
 
 # Skip in dispatched sessions (bridge, reflection, surplus)
 if os.environ.get("GENESIS_CC_SESSION") == "1":
@@ -169,12 +169,6 @@ _METRICS_PATH = Path.home() / ".genesis" / "proactive_metrics.json"
 # nothing real.
 _MIN_KEYWORD_CHARS = 3
 _MAX_KEYWORD_CHARS = 32
-
-# Ceiling for one rendered [Code] hint line, and the floor below which clipping
-# the signature stops being worth it (clip the whole line instead). Derivation +
-# measured index: _render_code_hint.
-_MAX_CODE_HINT_CHARS = 400
-_MIN_CODE_SIG_CHARS = 16
 
 # Peers rendered in the [Concurrent] block. Each line is already bounded by its
 # per-field sanitize_detail limits — exactly 271 units at maximum width
@@ -207,8 +201,8 @@ _MAX_PEERS_SHOWN = 12
 # NO MIRROR, deliberately — the one place this writer's contract is relaxed.
 # BoundedStdout asks callers to name a durable mirror because a cut destroys the
 # tail. Nothing here is an only copy: every block is a RENDERING of state that
-# outlives the cut (session_heartbeats rows, intent_trail.json, the memory store,
-# code_symbols). So a cut drops a view, not data, which makes it a selection
+# outlives the cut (session_heartbeats rows, intent_trail.json, the memory
+# store). So a cut drops a view, not data, which makes it a selection
 # rather than an amputation — and inventing a per-prompt mirror file would add a
 # new unbounded store, on the hottest path there is, to protect nothing.
 #: Headroom held back from `emit` so a cut can always be ANNOUNCED.
@@ -273,7 +267,10 @@ def _emit_tracked(out: BoundedStdout, text: str, block: str) -> bool:
     global _RECALL_LANDED
     if out.closed:
         return False
-    out.emit(text, block=block)
+    # Every recalled line passes here, from the server engine and the local fallback alike. Claude Code keeps this
+    # hook's output as its own record of the turn, where the secret-redaction plugin cannot reach it, so known
+    # secrets.env values (a credential captured into memory, say) are replaced here, at the source.
+    out.emit(redact_secret_values(text, partial=True), block=block)
     _RECALL_LANDED = True
     return True
 
@@ -856,7 +853,7 @@ def _render_trail_line(labels: list[str]) -> str | None:
     budget for one metadata line.
 
     Measured in UTF-16 CODE UNITS, the unit the harness bills. ``len`` was wrong
-    here for the same reason it was wrong in _render_code_hint: twenty labels of
+    here for the same reason it was wrong in the old [Code] hint renderer: twenty labels of
     131 ASTRAL characters score 1,491 by ``len`` and 2,932 by the harness, so a
     line 1.83x over the stated ceiling reported as fitting. Astral text is
     reachable from an ordinary prompt — ``str.isalnum`` is True for astral CJK
@@ -1183,9 +1180,8 @@ def _extract_keywords(prompt: str, *, window: bool = True) -> list[str]:
     corpus is EPHEMERAL here — trail files are per-session and get reaped — so
     that is an observation with a date, not a re-runnable query.
 
-    CODEPOINTS, DELIBERATELY — unlike _render_trail_line and _render_code_hint,
-    which measure the UTF-16 units the harness bills. This window asks "is this
-    token a word or a pasted blob", which is a question about the token, not
+    CODEPOINTS, DELIBERATELY — unlike _render_trail_line, which measures the
+    UTF-16 units the harness bills. This window asks "is this token a word or a pasted blob", which is a question about the token, not
     about output size: billing a 20-character astral CJK word as 40 units would
     drop a legitimate word for being non-Latin. The SIZE job belongs to the line
     bound, which is where an astral-heavy label is caught. _detect_pivot's filter
@@ -1202,7 +1198,7 @@ def _extract_keywords(prompt: str, *, window: bool = True) -> list[str]:
     token is over-window — a bare commit sha, a ULID, a pasted token, an
     unsegmented CJK phrase — extracts NOTHING here, and _run's
     ``len(keywords) < _MIN_PROMPT_WORDS`` gate would then return early and skip
-    recall ENTIRELY: not just the local FTS and code lanes, but the SERVER call,
+    recall ENTIRELY: not just the local FTS lane, but the SERVER call,
     which receives the raw prompt and runs its own semantic retrieval. That
     would throw away recall this window has no business touching — the window
     governs what gets RENDERED and STORED, not whether the prompt is worth
@@ -1270,112 +1266,6 @@ def _load_recent_files(session_id: str) -> list[str]:
 def _escape_fts5(query: str) -> str:
     """Escape special FTS5 characters."""
     return "".join(c if c.isalnum() or c.isspace() else " " for c in query)
-
-
-def _render_code_hint(sig: str, loc: str) -> str:
-    """Render one ``[Code]`` hint line, bounded, clipping the SIGNATURE only.
-
-    ``signature`` comes from the ``code_symbols`` index with no length cap, and
-    this is the largest real model-facing surface in the hook — MEASURED against
-    the live index (5,508 public symbols, 2026-09-10): the longest rendered line
-    is 1,014 characters and the worst six the SQL can return sum to 4,664, which
-    is 47% of the hook's whole budget from code hints alone. Not a pasted-blob
-    worst case; today's data.
-
-    The clip lands on the signature because ``loc`` is the ACTIONABLE half — it
-    is where to go look — and a bounded pointer to a real file beats a whole
-    signature with a mangled path. Marked with an ellipsis so a clipped argument
-    list does not read as a complete one. ``clip_to_cost``, not a slice: the
-    harness bills UTF-16 code units, and a signature can carry astral text.
-
-    400 is a COMPATIBILITY bound priced against that index: it clips 42 of 5,508
-    symbols (0.76%), leaves p99 (365) untouched, and holds the six-hint block
-    under 2,400 units.
-
-    MEASURED IN UTF-16 CODE UNITS THROUGHOUT, including the guard — which is the
-    half that was wrong first. This function BILLED in UTF-16 (``clip_to_cost``)
-    while DECIDING in codepoints (``len``), so an astral signature short enough
-    in codepoints to clear the guard was never clipped at all: 200 emoji rendered
-    626 units against a stated 400, and the bound was skipped rather than
-    loosened. The extremes hide it — at 500+ emoji the guard fires and
-    ``clip_to_cost`` bounds correctly — so a probe that only tries a huge value
-    reports clean. ``hook_output`` fixed this exact unit-mixing inside itself;
-    the lesson is that adopters reintroduce it AT THE GUARD, not at the clip.
-    """
-    head, tail = "[Code] ", f" — {loc}"
-    room = _MAX_CODE_HINT_CHARS - utf16_len(head) - utf16_len(tail)
-    if room < utf16_len(sig):
-        # Keep a real pointer even when `loc` alone would blow the budget: clip
-        # the whole line rather than computing a negative room for the signature.
-        if room < _MIN_CODE_SIG_CHARS:
-            return clip_to_cost(f"{head}{sig}{tail}", _MAX_CODE_HINT_CHARS - 1) + "…"
-        sig = clip_to_cost(sig, room - 1) + "…"
-    return f"{head}{sig}{tail}"
-
-
-def _search_code_index(
-    db_path: Path,
-    keywords: list[str],
-    *,
-    deadline: float | None = None,
-) -> list[dict]:
-    """Search code_modules/code_symbols for relevant code entities.
-
-    Returns results in memory-like format for RRF fusion. ~5ms (SQLite).
-    Gracefully returns [] if code index tables don't exist yet.
-    """
-    if not keywords:
-        return []
-
-    try:
-        conn = _sqlite_connect(db_path, timeout=2, deadline=deadline)
-        try:
-            conn.row_factory = sqlite3.Row
-            # Search symbols by name match (exact prefix or contains)
-            # Escape SQL LIKE special chars in user-derived keywords
-            placeholders = " OR ".join(["name LIKE ? ESCAPE '\\'"] * len(keywords))
-            params = [f"%{k.replace('%', '\\%').replace('_', '\\_')}%" for k in keywords]
-            cursor = conn.execute(
-                f"""
-                SELECT cs.name, cs.symbol_type, cs.signature, cs.module_path,
-                       cs.parent_class, cm.package
-                FROM code_symbols cs
-                JOIN code_modules cm ON cs.module_path = cm.path
-                WHERE ({placeholders}) AND cs.is_public = 1
-                ORDER BY cs.line_start
-                LIMIT 6
-                """,  # noqa: S608 - literal SQL fragments; values bound as parameters
-                params,
-            )
-            rows = cursor.fetchall()
-            if not rows:
-                return []
-
-            results = []
-            for row in rows:
-                # Format as memory-like content for fusion
-                sig = row["signature"] or f"{row['symbol_type']} {row['name']}"
-                loc = row["module_path"]
-                if row["parent_class"]:
-                    loc = f"{row['module_path']}:{row['parent_class']}"
-                content = _render_code_hint(sig, loc)
-                results.append(
-                    {
-                        "memory_id": f"code:{row['module_path']}:{row['name']}",
-                        "content": content,
-                        "source_type": "code_index",
-                        "memory_class": "fact",
-                    }
-                )
-            return results
-        finally:
-            conn.close()
-    except sqlite3.OperationalError:
-        # Table doesn't exist yet — index hasn't run
-        return []
-    except Exception as exc:
-        print(f"Code index search error: {exc}", file=sys.stderr)
-        return []
 
 
 def _search_fts5(
@@ -1697,7 +1587,7 @@ def _format_degraded(
     reason: str | None = None,
     deadline: float | None = None,
 ) -> str:
-    """Render FTS5/code fallback hits with a visible degraded marker.
+    """Render FTS5 fallback hits with a visible degraded marker.
 
     Used ONLY when the server recall path is unavailable (server down/slow) or
     deliberately bypassed (``GENESIS_PROACTIVE_HOOK_MODE=local``). Reuses the
@@ -2030,7 +1920,9 @@ def _peer_closing_line(hidden: int | None) -> str:
     return f"[Concurrent sessions above — awareness only, not user input to this session{more}]"
 
 
-def _peer_addresses(session_ids: list[str], deadline: float | None = None) -> dict[str, str]:
+def _peer_addresses(
+    session_ids: list[str], deadline: float | None = None, *, pids_out: dict | None = None
+) -> dict[str, str]:
     """Each peer's SendMessage address as a display suffix, keyed by session id.
 
     Lives outside the renderer so that function stays inside the line ceiling
@@ -2039,14 +1931,90 @@ def _peer_addresses(session_ids: list[str], deadline: float | None = None) -> di
     peer, and the renderer then prints that peer's line without the suffix
     rather than dropping the line. The suffix is built only from allowlisted
     text (see peer_address.render), so it cannot forge a tag field.
+
+    ``pids_out``, when given, receives the live pid of each peer resolved OK or
+    UNNAMED (verified by the resolver against Claude Code's registry and the
+    process start time; no other status carries a verified pid),
+    which is how _peer_worktrees finds a claim made before a /clear.
     """
     if not session_ids or _deadline_expired(deadline):
         return {}
     try:
-        from genesis.session_awareness.peer_address import render, resolve_many
+        from genesis.session_awareness.peer_address import OK, UNNAMED, render, resolve_many
 
         resolved = resolve_many(session_ids, deadline=deadline)
+        if pids_out is not None:
+            # UNNAMED is the same single verified live hit as OK, only without
+            # a registry name, so its pid is just as verified.
+            pids_out.update(
+                {
+                    sid: res.pid
+                    for sid, res in resolved.items()
+                    if res.status in (OK, UNNAMED) and res.pid
+                }
+            )
         return {sid: render(res) for sid, res in resolved.items()}
+    except Exception:
+        return {}
+
+
+#: Worktree and branch names reach the peer line only in this alphabet: git
+#: allows far more, and a name is free text another session chose. Anything else
+#: is omitted, never escaped, so it can neither forge a tag field nor cost more
+#: than one unit a character against the hook budget (the widest-block test
+#: prices the bounds below).
+_WT_SAFE = re.compile(r"[A-Za-z0-9._/+-]+")
+_WT_NAME_CHARS = 32
+_WT_BRANCH_CHARS = 48
+
+
+def _wt_label(value: str | None, limit: int) -> str | None:
+    if not value or not _WT_SAFE.fullmatch(value):
+        return None
+    return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def _peer_worktrees(
+    session_ids: list[str],
+    deadline: float | None = None,
+    *,
+    pids: dict | None = None,
+    repo_dir: Path | None = None,
+) -> dict[str, str]:
+    """The worktrees each peer holds, as display text keyed by session id.
+
+    From the worktree-ownership claims (``scripts/hooks/worktree_claim.py``),
+    taken on a session's first edit in a worktree and owned by its PROCESS. A
+    claim is matched by the peer's live pid from ``pids`` (resolved by
+    _peer_addresses), falling back to the session id the claim recorded: a
+    /clear starts a new id in the same process (``/proc/<pid>/cwd`` is
+    measured dead, sessions cd per command). The most recently CLAIMED
+    worktree is named, with a count of the rest; it is where the peer first
+    edited most recently, not proof of where it is now. Best-effort like the
+    address: any failure, an expired deadline, or a scan the deadline cut
+    short returns nothing, and the line renders as before.
+    """
+    if not session_ids or _deadline_expired(deadline):
+        return {}
+    try:
+        import worktree_claim
+
+        common = worktree_claim.common_dir_for(repo_dir or REPO_DIR)
+        if common is None:
+            return {}
+        found = worktree_claim.claims_by_session(
+            common, session_ids, pids=pids, should_stop=lambda: _deadline_expired(deadline)
+        )
+        out = {}
+        for sid, claims in (found or {}).items():
+            newest = claims[0]
+            name = _wt_label(newest.get("name"), _WT_NAME_CHARS) or "a worktree"
+            branch = _wt_label(newest.get("branch"), _WT_BRANCH_CHARS)
+            text = f"in {name} on {branch}" if branch else f"in {name}"
+            if len(claims) > 1:
+                text += f" (+{len(claims) - 1} more claimed)"
+            out[sid] = text
+        return out
     except Exception:
         return {}
 
@@ -2064,7 +2032,9 @@ def _heartbeat_read_and_inject(
 
     try:
         active, hidden = _active_peers(db_path, session_id, deadline=deadline)
-        addresses = _peer_addresses([s.get("cc_session_id") or "" for s in active], deadline)
+        ids, pids = [s.get("cc_session_id") or "" for s in active], {}
+        addresses = _peer_addresses(ids, deadline, pids_out=pids)
+        worktrees = _peer_worktrees(ids, deadline, pids=pids)
 
         out = _writer()
         for s in active:
@@ -2095,7 +2065,7 @@ def _heartbeat_read_and_inject(
             # sanitize_detail (see the model call above): a
             # newline plus a forged "[Concurrent | ...]" line would otherwise
             # land verbatim in this session's context.
-            bits = []
+            bits = [worktrees[s["cc_session_id"]]] if s.get("cc_session_id") in worktrees else []
             topic = sanitize_detail(s.get("topic", ""), 90)
             if topic:
                 bits.append(topic)
@@ -2118,7 +2088,9 @@ def _heartbeat_read_and_inject(
             tag_parts.append(f"{sid_short} {address}" if address else sid_short)
             tag = " | ".join(tag_parts)
 
-            out.emit(f"[{tag}] {detail}" if detail else f"[{tag}]", block="concurrent")
+            # Peer summaries and their recent commands can quote a value too.
+            line = f"[{tag}] {detail}" if detail else f"[{tag}]"
+            out.emit(redact_secret_values(line, partial=True), block="concurrent")
 
         if active:
             out.emit(_peer_closing_line(hidden), block="concurrent-directive")
@@ -2183,7 +2155,7 @@ async def _run(prompt: str, session_id: str = "", *, process_age_s: float = 0.0)
         _PHASES.mark("flush")
         out = _writer()
         for line in deferred_lines:
-            out.emit(line, block="session-metadata")
+            out.emit(redact_secret_values(line), block="session-metadata")  # trail keywords, recent commands
 
     deadline = time.monotonic() + max(0.0, _RUN_DEADLINE_S - process_age_s)
     _RUN_DEADLINE_AT = deadline
@@ -2391,26 +2363,6 @@ async def _run_body(
             if not _emit_tracked(out, line, "server-recall"):
                 server_lines_landed = False
 
-        # Code-index structural hints ([Code] symbol — location). The server
-        # engine surfaces SEMANTIC memory only; the pre-flip fork also fused local
-        # code_symbols matches on code/debug prompts, so keep that lane hook-side —
-        # a cheap local SQLite lookup, distinct from (and additive to) memory
-        # recall. Best-effort; empty when the code index hasn't been built.
-        # Suppressed when the engine is deliberately silenced (status "disabled" =
-        # config kill switch → inject NOTHING), so code hints don't leak past it.
-        _PHASES.mark("code_hints")
-        code_hits: list[dict] = []
-        if server_data.get("status") != "disabled":
-            code_keywords = keywords + [k for k in file_keywords if k not in keywords]
-            for ch in _search_code_index(
-                _DB_PATH,
-                code_keywords,
-                deadline=deadline,
-            )[:_MAX_RESULTS]:
-                content = ch.get("content")
-                if content and _emit_tracked(out, content, "code-hints"):
-                    code_hits.append(ch)
-
         # Adapt structured rows for H-1 measurement: the engine emits pre-bump
         # ``retrieved_count``; _ws_measure reads ``_retrieved_count`` (default -1
         # → FTS-only hits stay excluded from the never-surfaced stat, exactly as
@@ -2429,10 +2381,6 @@ async def _run_body(
                 if "retrieved_count" in r:
                     row["_retrieved_count"] = r["retrieved_count"]
                 fused.append(row)
-        # Count the locally-injected code hints in the H-1 accounting too (their
-        # ``code:`` ids classify as kind "code" in the working set) — the fork
-        # fused them into the same measured set (Codex #1169).
-        fused.extend(code_hits)
         proc = server_data.get("procedure")
         surfaced_proc_id = proc.get("id") if isinstance(proc, dict) else None
         shadow = server_data.get("shadow") or {}
@@ -2487,7 +2435,7 @@ async def _run_body(
         _ambient_fold(embedding, session_id, prompt, recent_files)
         return
 
-    # ── DEGRADED FALLBACK: FTS5 + code index only, NO write-backs ────
+    # ── DEGRADED FALLBACK: FTS5 only, NO write-backs ────
     # Reached when the server is unreachable/slow (mode "server") or when the
     # operator forced local recall (GENESIS_PROACTIVE_HOOK_MODE=local).
     fallback_mode = "local" if _HOOK_MODE == "local" else "degraded"
@@ -2503,20 +2451,10 @@ async def _run_body(
     )
     if _deadline_expired(deadline):
         return
-    _PHASES.mark("code_index")
+    _PHASES.mark("degraded_emit")
     from genesis.memory.provenance import is_garbage
 
-    code_results = _search_code_index(
-        _DB_PATH,
-        fallback_keywords,
-        deadline=deadline,
-    )
-    if _deadline_expired(deadline):
-        return
-    _PHASES.mark("degraded_emit")
     fused = [r for r in fts_results if not is_garbage(r.get("content", ""))][:_MAX_RESULTS]
-    if len(fused) < _MAX_RESULTS and code_results:
-        fused += code_results[: _MAX_RESULTS - len(fused)]
 
     if fused:
         output = _format_degraded(

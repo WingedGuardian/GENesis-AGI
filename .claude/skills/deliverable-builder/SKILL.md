@@ -7,8 +7,7 @@ description: >
   verification policeman and a Stop-hook that won't let the session finish without a verified
   PASS. Use when producing a job take-home, client report, executive one-pager, slide deck,
   proposal, or anything going out under the user's name.
-keywords: [deliverable, take-home, submission, report, one-pager, deck, proposal, pdf, docx,
-  pptx, export, professional, send-ready, polish, client]
+keywords: [deliverable, take-home, one-pager, deck, pdf, docx, pptx, send-ready]
 ---
 
 # Deliverable Builder

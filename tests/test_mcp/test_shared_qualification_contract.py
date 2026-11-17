@@ -99,7 +99,7 @@ def test_workflow_runs_stacked_prs_with_read_only_checkout():
     assert set(events["pull_request"]["types"]) >= {"opened", "synchronize", "edited", "reopened"}
     paths = events["pull_request"]["paths"]
     assert paths == events["push"]["paths"]
-    assert set(paths) >= {"src/genesis/**", "tests/**", "scripts/**", "pyproject.toml",
+    assert set(paths) >= {"src/genesis/**", "tests/**", "scripts/**", "pyproject.toml", "config/**",
         ".github/workflows/shared-mcp-qualification.yml", ".github/shared-mcp/**", ".github/test-tools/**"}
     assert spec["permissions"] == {"contents": "read"}
     steps = spec["jobs"]["qualify"]["steps"]
@@ -119,6 +119,6 @@ def test_protocol_step_is_strict_complete_and_has_no_skip_escape():
         assert f"tests/test_mcp/{module}.py" in protocol
     assert protocol.index("rm -f junit-shared-mcp.xml") < protocol.index("-m pytest")
     check = next(command for command in commands if "scripts/check_skip_ceiling.py" in command)
-    assert "junit-shared-mcp.xml --ceiling 0 --min-collected 100" in check
+    assert "junit-shared-mcp.xml --ceiling 0 --min-collected 104" in check
     assert not job.get("continue-on-error")
     assert not any(step.get("continue-on-error") for step in job["steps"])

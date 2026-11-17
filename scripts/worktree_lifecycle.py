@@ -869,6 +869,7 @@ def _is_merged(ref: str, repo_root: Path, *, is_branch: bool = True) -> bool:
 
 def _merge_verdict(
     ref: str, repo_root: Path, *, is_branch: bool = True, allow_network: bool = True,
+    tip: str | None = None,
 ) -> str:
     """Return WHICH method proved the work is in ``main`` — or "" if none did.
 
@@ -891,6 +892,11 @@ def _merge_verdict(
     ``ref`` is a branch name (``is_branch=True``) or, for a detached-HEAD
     worktree, its HEAD commit SHA (``is_branch=False``).
 
+    ``tip`` is the commit to judge instead of what ``ref`` resolves to now: trash
+    expiry passes an archive's recorded head, so a branch that has since moved or
+    been deleted is judged by what was archived. ``gh`` is still asked by the
+    branch NAME, and the PR it returns must have merged exactly ``tip``.
+
     For a BRANCH, three methods in order:
     1. git merge-base --is-ancestor (fast; branch tip is an ancestor of main)
     2. gh pr list --head <branch> --state merged (handles squash merges)
@@ -912,10 +918,11 @@ def _merge_verdict(
     """
     # Method 1: git merge-base (branch ref or raw SHA) — the ONLY method for a
     # detached HEAD (see docstring: patch-id/PR methods are unsafe for a bare SHA).
+    commit = tip or ref
     try:
         result = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", ref, "main"],
-            capture_output=True, cwd=str(repo_root), timeout=10,
+            ["git", "merge-base", "--is-ancestor", commit, "main"],
+            capture_output=True, cwd=str(repo_root), timeout=10, env=_git_env(),
         )
         if result.returncode == 0:
             return "ancestor"
@@ -943,16 +950,17 @@ def _merge_verdict(
             ["gh", "pr", "list", "--head", ref, "--base", _default_branch(repo_root),
              "--state", "merged", "--limit", "10", "--json", "number,headRefOid"],
             capture_output=True, text=True, errors="surrogateescape",
+            # GH_REPO would point gh at another repository than the cwd's.
             cwd=str(repo_root), timeout=30,
+            env={k: v for k, v in _git_env().items() if k != "GH_REPO"},
         )
         if result.returncode == 0:
             prs = json.loads(result.stdout)
-            tip = _run_git(repo_root, ["rev-parse", ref], timeout=15)
-            tip = (tip or "").strip()
+            sha = tip or (_run_git(repo_root, ["rev-parse", ref], timeout=15) or "").strip()
             for pr in prs:
                 # No tip to compare against is NOT a pass: without it this is the
                 # name-only check that produced the false positive.
-                if tip and pr.get("headRefOid") == tip:
+                if sha and pr.get("headRefOid") == sha:
                     return "pr"
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError,
             _SkipNetwork):
@@ -961,9 +969,9 @@ def _merge_verdict(
     # Method 3: zero unique commits (patch-id equivalence) — branch heads only.
     try:
         result = subprocess.run(
-            ["git", "cherry", "main", ref],
+            ["git", "cherry", "main", commit],
             capture_output=True, text=True, errors="surrogateescape",
-            cwd=str(repo_root), timeout=10,
+            cwd=str(repo_root), timeout=10, env=_git_env(),
         )
         if result.returncode == 0:
             # Lines starting with '+' are unique commits not in main
@@ -1287,6 +1295,21 @@ def _sidecar_meta_path(trash_path: Path) -> Path:
     return Path(str(trash_path) + ".meta.json")
 
 
+# A COMPACTED entry: the archive's tarball, sidecar and anchor replaced by this
+# stub and a `refs/archived/*` pin of its head (scripts/worktree_compaction.py).
+COMPACTED_SUFFIX = ".compacted.json"
+COMPACTED_BUNDLE_SUFFIX = ".compacted.bundle"
+COMPACTED_FORMAT = "compacted-v1"
+# Compaction's claim on the anchor it is removing, kept in that registration's
+# admin directory. A recovery that puts the tree back under the registration
+# makes it live again, so `_reattach` removes the claim.
+COMPACTION_MARK_FILE = "genesis-compaction-mark"
+
+
+def _compacted_path(trash_path: Path) -> Path:
+    return Path(str(trash_path) + COMPACTED_SUFFIX)
+
+
 def _compress_entry(trash_path: Path, meta: dict, *, keep_source: bool = False) -> Path | None:
     """Replace a trashed directory with a gzip tarball. Returns the archive path.
 
@@ -1567,6 +1590,7 @@ def _trash_name_taken_excluding_claim(trash_path: Path) -> bool:
     """
     return (
         _archive_path(trash_path).exists() or _sidecar_meta_path(trash_path).exists()
+        or os.path.lexists(_compacted_path(trash_path))
     )
 
 
@@ -1581,6 +1605,9 @@ def _trash_name_taken(trash_path: Path) -> bool:
         trash_path.exists()
         or _archive_path(trash_path).exists()
         or _sidecar_meta_path(trash_path).exists()
+        # A compacted entry is a stub alone, and its name stays taken for ever:
+        # reusing it would put a NEW archive where the stub's resume pass looks.
+        or os.path.lexists(_compacted_path(trash_path))
     )
 
 
@@ -2635,6 +2662,8 @@ def _recover_locked(
         return False
 
     stored = matches[0]
+    if stored.name.endswith(COMPACTED_SUFFIX):
+        return _recover_compacted(stored, repo_root, report, dry_run=dry_run)
     if dry_run:
         # Resolution and ambiguity checks above are read-only, so running them
         # in dry-run keeps the preview's error messages identical to a real
@@ -2699,6 +2728,129 @@ def _recover_locked(
         return ok
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _recover_compacted(
+    stub: Path, repo_root: Path, report: dict, *, dry_run: bool = False,
+) -> bool:
+    """Recover a COMPACTED entry: recreate the worktree DETACHED at its pinned head.
+
+    Compaction (scripts/worktree_compaction.py) proved every file of the archive
+    equal to that commit, so a checkout of it IS the archived tree. The restore
+    goes through `_restore_from_dir` unchanged, from a scratch directory holding
+    only the metadata: with no `.git` there, it takes the recreate path, detached
+    at the commit, which the pin keeps reachable. Detached and never on the
+    branch: the branch may have moved or gone since. Like an archive, the stub
+    and the pin are kept.
+    """
+    entry = _entry_name(stub)
+    meta = _read_meta(stub)
+    compaction = _load_compaction_module()
+    if compaction is None:
+        print("The compaction module could not be loaded; nothing was changed.",
+              file=sys.stderr)
+        return False
+    lc = _ThisModule()
+    if not compaction.valid_stub(lc, meta, entry):
+        print(f"The compacted entry {stub} is unreadable or incomplete; nothing was "
+              "changed.", file=sys.stderr)
+        return False
+    head, pin, original = meta["head"], meta["pin"], meta["original_path"]
+    # Recovery recreates with `git worktree add --force`, which REPLACES a
+    # registration still at this path, with its index and reflog. One left by
+    # an earlier recovery of this stub may hold work the pin does not: keep it.
+    later = _registration_beyond(compaction, lc, repo_root, original, head)
+    if later is not None:
+        print(f"{original} is still registered and {later}, so recovering it would "
+              "replace that registration and could lose that work. Nothing was "
+              "changed. If the checkout was moved, reconnect it with: git worktree "
+              "repair <its new path>; if it is no longer wanted, remove it with git "
+              "worktree remove (or prune) first.", file=sys.stderr)
+        return False
+    pinned = (_run_git(repo_root, ["rev-parse", "--verify", "-q", f"{pin}^{{commit}}"],
+                       timeout=15) or "").strip() == head
+    branch = meta.get("branch") if isinstance(meta.get("branch"), str) else ""
+    if dry_run:
+        if os.path.lexists(original):
+            print(f"Original path already exists: {original}", file=sys.stderr)
+            return False
+        read, lock = _registration_lock(original, repo_root)
+        holder = _archive_entry_from_reason(lock.rstrip("\n")) if lock is not None else None
+        # The real run refuses only a registration ANOTHER archive holds
+        # (`_restore_from_dir`, `owned`); this entry's own re-lock is accepted.
+        if not read or (holder is not None and holder != entry):
+            print(f"{original} is registered to another archive ({holder}) or its "
+                  "registration could not be read; a real run would refuse.", file=sys.stderr)
+            return False
+        repair = "" if pinned else " after restoring its lost pin (from its bundle if needed)"
+        print(f"WOULD RECREATE {original} DETACHED at {head[:8]} from the pin {pin}{repair}"
+              f"{f' (it was on branch {branch})' if branch else ''}; the compacted entry "
+              f"would be KEPT at {stub}")
+        return True
+    if not pinned:
+        outcome = compaction.repair_pin(lc, repo_root, meta)
+        if outcome.startswith("error: "):
+            print(f"The pin {pin} of {entry} is missing and could not be repaired: "
+                  f"{outcome[len('error: '):]}. Nothing else was changed.", file=sys.stderr)
+            return False
+        print(f"The pin {pin} of {entry} was missing; {outcome} it.", file=sys.stderr)
+    compaction_fields = ("format", "pin", "head", "compacted_at", "archive_bytes",
+                         "archive_identity", "anchor_admin", "anchor_token", "bundle", "bundle_base",
+                         "bundle_sha256", "bundle_bytes")
+    restore = {k: v for k, v in meta.items() if k not in compaction_fields}
+    restore.update(commit=head, detached=True, branch="")
+    scratch = _scratch_dir_for(stub)
+    try:
+        shutil.rmtree(scratch, ignore_errors=True)
+        inner = scratch / entry
+        try:
+            inner.mkdir(parents=True, mode=_PRIVATE_DIR_MODE)
+            _atomic_write_text(inner / ".trash_meta.json", json.dumps(restore),
+                               mode=_PRIVATE_FILE_MODE)
+        except OSError as e:
+            print(f"Could not prepare the recovery of {entry}: {e}", file=sys.stderr)
+            return False
+        ok = _restore_from_dir(inner, repo_root, report, stored=stub)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    if ok:
+        if branch:
+            print(f"It was on branch {branch!r} when archived; the worktree is detached at "
+                  f"the archived commit. To work on a branch: git -C {_shell_word(original)} "
+                  "switch -c <name>")
+        print(f"Compacted entry kept at {stub} (recovery does not consume it)")
+    return ok
+
+
+def _registration_beyond(compaction, lc, repo_root: Path, original: str, head: str) -> str | None:
+    """Why the registration at ``original`` holds something ``head`` does not
+    (in compaction's own terms, `_loses_history`), or None when there is no
+    such registration or it holds nothing more. Unknown reads as a reason."""
+    admin_root = _admin_worktrees_dir(repo_root)
+    if admin_root is None:
+        return "its registrations could not be listed"
+    try:
+        admins = [p for p in admin_root.iterdir() if p.is_dir() and not p.is_symlink()]
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return f"its registrations could not be listed ({e})"
+    red = None
+    for admin in admins:
+        if _registration_path(admin) != original:
+            continue
+        reason = _read_lock_file(admin)
+        if reason is not None and _archive_entry_from_reason(reason) is not None:
+            # Another archive's history anchor: `_restore_from_dir` refuses it
+            # and names that archive, so this check must not advise removing it.
+            continue
+        red = red or _load_redundancy_module()
+        if red is None:
+            return "its registration could not be checked"
+        lost = compaction._loses_history(lc, red, repo_root, admin, head)
+        if lost is not None:
+            return lost.replace("its registration", "the registration", 1)
+    return None
 
 
 def _restore_from_dir(
@@ -3512,6 +3664,24 @@ def _reattach(
               f"Nothing was changed; the archive is intact at {where}. Retry --recover.",
               file=sys.stderr)
         return "abort"
+    # Compaction's mark goes FIRST, before the tree is placed, while the
+    # registration is still locked and directory-less. A kill at any later
+    # point leaves an UNMARKED registration, which compaction never takes for
+    # the anchor it was removing; a kill before it leaves a marked one with no
+    # tree placed, which is still that anchor. If the mark cannot be removed,
+    # nothing is placed and the registration stays locked.
+    try:
+        (admin / COMPACTION_MARK_FILE).unlink()
+        _fsync_path(admin)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        report["incomplete"] = True
+        print(f"Could not remove compaction's mark from the registration of "
+              f"{original_path} ({e}). Nothing was placed and the registration "
+              f"is still locked; the archive is intact at {where}. Remove "
+              f"{admin / COMPACTION_MARK_FILE} and retry --recover.", file=sys.stderr)
+        return "abort"
     dest = Path(original_path)
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -3565,6 +3735,7 @@ def _reattach(
     # an unlocked registration has nothing to release. The answer is checked: a
     # worktree left locked under the reaper's reason reads as an archive anchor to
     # expiry and to the zero-drop sweep, which is not what a recovered tree is.
+    # (Compaction's mark was already retired before the tree was placed.)
     unlock_failed = owned and _run_git(
         repo_root, ["worktree", "unlock", original_path], timeout=10) is None
 
@@ -3722,10 +3893,17 @@ def _iter_trash_entries() -> list[tuple[Path, Path]]:
         elif e.name.endswith(ARCHIVE_SUFFIX):
             base = Path(str(e)[: -len(ARCHIVE_SUFFIX)])
             out.append((e, _sidecar_meta_path(base)))
+        elif e.name.endswith(COMPACTED_SUFFIX):
+            # A compacted entry (scripts/worktree_compaction.py) is its own
+            # metadata. While its tarball or a directory of the same name is
+            # still there, THAT is the entry, exactly as before compaction.
+            base = Path(str(e)[: -len(COMPACTED_SUFFIX)])
+            if not os.path.lexists(_archive_path(base)) and not os.path.lexists(base):
+                out.append((e, e))
     return out
 
 
-def _list_trash() -> None:
+def _list_trash(repo_root: Path | None = None) -> None:
     """Show trash contents with age, lane, and size.
 
     Age is what an explicitly-run ``--expire-trash`` window is compared with
@@ -3741,6 +3919,7 @@ def _list_trash() -> None:
 
     now = time.time()
     total_mb = 0.0
+    compacted = pin_missing = 0
     print(f"{'Name':<44} {'Age':>5} {'Lane':<9} {'Size':>8}  {'Branch':<28} Original Path")
     print("-" * 130)
 
@@ -3773,6 +3952,22 @@ def _list_trash() -> None:
         # failing under storage pressure, exactly when the number is being read
         # to decide whether there is a problem.
         size_mb = 0.0
+        if stored.name.endswith(COMPACTED_SUFFIX):
+            # Nothing but metadata is left; the tree is the pinned commit.
+            compacted += 1
+            stub = _read_meta(stored)
+            head, pin = stub.get("head"), stub.get("pin")
+            # Checked, not assumed: the pin is the only ref holding the commit.
+            pinned = (isinstance(head, str) and isinstance(pin, str) and (_run_git(
+                repo_root or _repo_root(), ["rev-parse", "--verify", "-q", f"{pin}^{{commit}}"],
+                timeout=15,
+            ) or "").strip() == head)
+            if not pinned:
+                pin_missing += 1
+            state = "pinned" if pinned else "PIN MISSING"
+            print(f"{stored.name:<44} {age_days:>4.0f}d {lane:<9} {state:>8}  "
+                  f"{branch:<28} {original} ({state} {str(head)[:8]})")
+            continue
         if stored.is_file():
             with contextlib.suppress(OSError):
                 size_mb = stored.stat().st_size / 1048576
@@ -3791,6 +3986,13 @@ def _list_trash() -> None:
           f"{total_mb:.0f} MB archived. Retention is off: nothing expires "
           f"automatically, and --expire-trash deletes nothing without an explicit "
           f"--retention-days or {RETENTION_ENV}.")
+    if compacted:
+        print(f"{compacted} of them compacted: the tree is the commit pinned under "
+              "refs/archived/, and --recover recreates it detached there.")
+    if pin_missing:
+        print(f"{pin_missing} compacted entr{'y has' if pin_missing == 1 else 'ies have'} "
+              "lost their pin: run --compact-trash, which re-pins them (from their bundle "
+              "when the commit is gone).")
 # ---------------------------------------------------------------------------
 # Retention: expiring old archives, and the anchors that pointed at them
 # ---------------------------------------------------------------------------
@@ -3803,18 +4005,22 @@ def _list_trash() -> None:
 # else ever releases those anchors.
 #
 # RETENTION IS OFF BY DEFAULT (owner ruling 2026-09-27, split out of #2458).
-# The predicate below reads `lane` and `had_uncommitted_changes` from metadata
-# the reaper recorded at ARCHIVE time for a REVERSIBLE action, and that is not a
-# proof that deleting the archive loses nothing: `lane: merged` includes
-# patch-id verdicts, which cannot see an evil merge; the dirty-state sample
-# ignores gitignored files the tarball does capture; and it is taken before the
-# tree is archived. A read-only pass over one install (2026-09-27, method in
-# #2504) found 15 of 131 eligible archives holding files their recorded head
-# does not. So nothing schedules
-# expiry, and `--expire-trash` deletes nothing unless an operator names a window
-# explicitly. Issue #2504 specifies the content-verified predicate that has to
-# land before a default window returns. The delete -> unpin -> unlock -> prune
-# machinery below is kept: it is the part that is sound.
+# `lane` and `had_uncommitted_changes` are metadata the reaper recorded at
+# ARCHIVE time for a REVERSIBLE action, and they are not a proof that deleting
+# the archive loses nothing: `lane: merged` includes patch-id verdicts, which
+# cannot see an evil merge; the dirty-state sample ignores gitignored files the
+# tarball does capture; and it is taken before the tree is archived. A read-only
+# pass over one install (2026-09-27, method in #2504) found 15 of 131 eligible
+# archives holding files their recorded head does not.
+#
+# So those checks are only a pre-filter. An archive expires only when
+# `scripts/worktree_redundancy.py` (#2504) also proves it redundant NOW: its
+# recorded head resolves, a fresh `_merge_verdict` of that head is `ancestor` or
+# `pr` (never `patch-id`), and every file in the tarball matches the head's tree
+# byte for byte or is on a short allowlist of regenerable paths. Any failure
+# keeps the archive. Nothing schedules expiry yet, and `--expire-trash` deletes
+# nothing unless an operator names a window explicitly. The delete -> unpin ->
+# unlock -> prune machinery below is unchanged.
 #
 # The tombstone index is NOT pruned: it is kilobytes, it is the greppable record
 # of every reaped worktree, and it also records each expiry.
@@ -4015,7 +4221,10 @@ def _archive_anchors(repo_root: Path) -> list[dict] | None:
 
 def _entry_name(stored: Path) -> str:
     name = stored.name
-    return name[: -len(ARCHIVE_SUFFIX)] if name.endswith(ARCHIVE_SUFFIX) else name
+    for suffix in (ARCHIVE_SUFFIX, COMPACTED_SUFFIX):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
 
 
 def _entry_age_days(stored: Path, meta: dict, now: float) -> float | None:
@@ -4323,6 +4532,12 @@ def _delete_archive_refs(repo_root: Path, entry: str) -> list[str]:
     while it exists, the pin is what keeps its commits collectable-proof. A
     failure leaves the ref, which keeps commits alive: the safe direction.
     """
+    if os.path.lexists(_compacted_path(TRASH_DIR / entry)):
+        # A compacted entry's pin is the only ref holding its commit, and the
+        # stub owns it for ever. A same-named archive expiring beside the stub
+        # (a hand copy, a restore) must not take it.
+        _log(f"KEEP the pin of {entry}: a compacted stub owns it")
+        return []
     digest = hashlib.sha256(entry.encode("utf-8", "surrogateescape")).hexdigest()[:10]
     out = _run_git(repo_root, ["for-each-ref", "--format=%(refname)", "refs/archived/"], timeout=15)
     if out is None:
@@ -4393,12 +4608,14 @@ def _remove_anchors(repo_root: Path, entry: str, anchors: list[dict]) -> int:
 
 
 def _expire_trash(
-    repo_root: Path, *, days: int, now: float | None = None, dry_run: bool = False
+    repo_root: Path, *, days: int, now: float | None = None, dry_run: bool = False,
+    allow_network: bool = True,
 ) -> dict:
     """Expire clean MERGED archives older than ``days``: DELETE THE ARCHIVE, then
     its commit pin, then UNLOCK its anchor, then PRUNE that registration. Unmerged
-    archives, merged ones that held uncommitted changes, and any whose metadata
-    cannot be read, are never expired.
+    archives, merged ones that held uncommitted changes, any whose metadata
+    cannot be read, and any the redundancy check does not prove lossless
+    (`_archive_redundant`), are never expired.
 
     The order IS the safety property. The lock keeps an archive's registration
     — and with it the commits the archive points at — alive; once the archive
@@ -4409,7 +4626,10 @@ def _expire_trash(
     """
     now = time.time() if now is None else now
     counts = {"expired": 0, "anchors_removed": 0, "skipped": 0, "retried": 0,
-              "kept": 0}
+              "kept": 0, "would_expire": 0}
+    # The content-verified predicate (#2504). If it cannot load, nothing
+    # expires: there is no fallback to the metadata-only checks below.
+    redundancy = _load_redundancy_module()
     with _lifecycle_lock() as held:
         if not held:
             _log("SKIP expiry: another lifecycle run (expiry or --recover) holds the lock")
@@ -4463,14 +4683,25 @@ def _expire_trash(
                 _log(f"SKIP {name}: its registration's directory exists ({live[0]})")
                 counts["skipped"] += 1
                 continue
+            redundant, why = _archive_redundant(
+                redundancy, stored, meta, repo_root, allow_network=allow_network,
+                reflog_dirs=[a["admin"] for a in mine],
+            )
+            if not redundant:
+                _log(f"KEEP {name}: {why}")
+                counts["kept"] += 1
+                continue
             summary = {
                 "lane": meta.get("lane") or "?",
                 "branch": meta.get("branch", ""),
-                "unique_commits": len(meta.get("unique_commits") or []),
+                "unique_commits": (len(meta["unique_commits"])
+                                   if isinstance(meta.get("unique_commits"), list) else 0),
                 "had_uncommitted_changes": bool(meta.get("had_uncommitted_changes")),
             }
             if dry_run:
-                _log(f"WOULD EXPIRE {name} ({age:.0f}d, {summary}) and {len(mine)} anchor(s)")
+                counts["would_expire"] += 1
+                _log(f"WOULD EXPIRE {name} ({age:.0f}d, {summary}; {why}) "
+                     f"and {len(mine)} anchor(s)")
                 continue
             if not _append_record(
                 {
@@ -4494,7 +4725,7 @@ def _expire_trash(
             # not enough: it is written before the deletion, which can fail.
             _append_record({"event": "deleted", "name": name,
                             "at": datetime.now(UTC).isoformat()})
-            _log(f"EXPIRED {name} ({age:.0f}d > {days}d; {summary})")
+            _log(f"EXPIRED {name} ({age:.0f}d > {days}d; {summary}; {why})")
             # An archive and a leftover directory can share a base name (a
             # partial cleanup after compressing). The anchor protects whichever
             # form is left, so it goes only once NO stored form of this entry
@@ -4529,12 +4760,115 @@ def _expire_trash(
                     counts["retried"] += 1
                     counts["anchors_removed"] += removed
                     _log(f"FINISHED expiry of {name}: removed {removed} leftover anchor(s)")
+    dry = f"{counts['would_expire']} would expire (dry run), " if dry_run else ""
     _log(
-        f"Expiry: {counts['expired']} archive(s) expired, {counts['anchors_removed']} "
+        f"Expiry: {dry}{counts['expired']} archive(s) expired, {counts['anchors_removed']} "
         f"anchor(s) removed, {counts['retried']} earlier expiry finished, "
-        f"{counts['skipped']} skipped, {counts['kept']} kept (unmerged, held uncommitted changes, or undetermined)"
+        f"{counts['skipped']} skipped, {counts['kept']} kept (unmerged, held uncommitted "
+        f"changes or files not in its merged head, or undetermined)"
     )
     return counts
+
+
+def _load_redundancy_module():
+    """``scripts/worktree_redundancy.py`` under a private name, or None."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "worktree_redundancy.py"
+    try:
+        spec = importlib.util.spec_from_file_location("_worktree_lifecycle_redundancy", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as e:  # noqa: BLE001 — any load failure means "expire nothing"
+        _log(f"WARN could not load {path.name}: {e}; no archive will expire")
+        return None
+    return module
+
+
+def _archive_redundant(
+    module, stored: Path, meta: dict, repo_root: Path, *, reflog_dirs: list[Path],
+    allow_network: bool = True,
+) -> tuple[bool, str]:
+    """The predicate's verdict for one archive. Fails CLOSED on any error.
+
+    ``reflog_dirs`` (required) are the admin dirs of the registrations expiry
+    would prune.
+    """
+    if module is None:
+        return False, "redundancy check unavailable"
+    branch = meta.get("branch") if isinstance(meta.get("branch"), str) else ""
+
+    def verdict(head: str) -> str:  # the head the predicate validated
+        return _merge_verdict(branch or head, repo_root, is_branch=bool(branch), tip=head,
+                              allow_network=allow_network)
+
+    try:
+        redundant, why = module.archive_redundancy(
+            stored, meta, repo_root, verdict=verdict, reflog_dirs=reflog_dirs,
+        )
+    except Exception as e:  # noqa: BLE001
+        return False, f"redundancy check failed ({type(e).__name__})"
+    return redundant is True, str(why)
+
+
+# ---------------------------------------------------------------------------
+# Compaction: a clean unmerged archive becomes a pinned commit and a stub
+# ---------------------------------------------------------------------------
+
+# Owner ruling 2026-11-09/10: an UNMERGED archive older than this, whose every
+# file matches its recorded head, is compacted (scripts/worktree_compaction.py).
+# Lossless only; anything else keeps its full tarball. Manual for now.
+COMPACT_AFTER_DAYS = 30
+# Kill switch (`0`/`off` disables), read like STALE_CLAIM_ENV.
+COMPACTION_ENV = "GENESIS_WORKTREE_TRASH_COMPACTION"
+
+
+class _ThisModule:
+    """This module's globals, read at call time, as the compaction module's ``lc``:
+    late binding, so a test's monkeypatch of TRASH_DIR or a helper is what it
+    sees. A private test copy of this script is not in ``sys.modules`` by name."""
+
+    def __getattr__(self, name: str):
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+def _load_compaction_module():
+    """``scripts/worktree_compaction.py`` under a private name, or None."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "worktree_compaction.py"
+    try:
+        spec = importlib.util.spec_from_file_location("_worktree_lifecycle_compaction", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as e:  # noqa: BLE001 — any load failure means "compact nothing"
+        _log(f"WARN could not load {path.name}: {e}; nothing is compacted")
+        return None
+    return module
+
+
+def _compact_trash(
+    repo_root: Path, *, days: int = COMPACT_AFTER_DAYS, dry_run: bool = False,
+    now: float | None = None,
+) -> dict:
+    """Compact eligible archives; every failure keeps them whole."""
+    empty = {"compacted": 0, "would_compact": 0, "resumed": 0, "repinned": 0, "skipped": 0,
+             "held": 0, "errors": 0, "kept": {}}
+    if _env_disabled(COMPACTION_ENV):
+        _log(f"Compaction not run: disabled by {COMPACTION_ENV}")
+        return empty
+    compaction, redundancy = _load_compaction_module(), _load_redundancy_module()
+    if compaction is None or redundancy is None:
+        return {**empty, "errors": 1}
+    return compaction.compact_trash(_ThisModule(), redundancy, repo_root, days=days,
+                                    dry_run=dry_run, now=now)
 
 
 # ---------------------------------------------------------------------------
@@ -4664,6 +4998,15 @@ def main() -> int:
     parser.add_argument("--retention-days", type=int, default=None, metavar="N",
                         help=f"Retention for --expire-trash; {RETENTION_ENV} "
                              "overrides it (0/off disables)")
+    parser.add_argument("--compact-trash", action="store_true",
+                        help="Replace each clean UNMERGED archive older than "
+                             "--compact-after-days, whose every file matches its "
+                             "recorded head, with a refs/archived pin of that head "
+                             "and a metadata stub (lossless; --recover recreates "
+                             f"it detached). {COMPACTION_ENV}=0 disables")
+    parser.add_argument("--compact-after-days", type=int, default=COMPACT_AFTER_DAYS,
+                        metavar="N", help="Age for --compact-trash (default "
+                                          f"{COMPACT_AFTER_DAYS})")
     parser.add_argument("--release-stale-claims", action="store_true",
                         help="Release session-claim locks whose claiming process "
                              f"is gone ({STALE_CLAIM_ENV}=0 disables)")
@@ -4697,11 +5040,20 @@ def main() -> int:
         if days is None:
             _log(f"Trash expiry not run: {source}")
             return 0
-        _log(f"Trash expiry starting ({source}). WARNING: retention is off by default "
-             "because this predicate is NOT a losslessness proof (#2504); an archive it "
-             "expires may hold files no commit has")
-        _expire_trash(repo_root, days=days, dry_run=args.dry_run)
+        _log(f"Trash expiry starting ({source}). An archive expires only when its head "
+             "is in main and its files match that head (#2504); nothing schedules this run")
+        _expire_trash(repo_root, days=days, dry_run=args.dry_run,
+                      allow_network=not args.no_network)
         return 0
+
+    if args.compact_trash:
+        if args.compact_after_days <= 0:
+            _log("Compaction not run: --compact-after-days must be positive")
+            return 2
+        counts = _compact_trash(repo_root, days=args.compact_after_days, dry_run=args.dry_run)
+        # Non-zero for anything a scheduler must not read as success: an entry
+        # held part way, a lost pin, an unreadable stub, an unlistable trash.
+        return 2 if counts["held"] or counts["errors"] else 0
 
     if args.release_stale_claims:
         if _env_disabled(STALE_CLAIM_ENV):

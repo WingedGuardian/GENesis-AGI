@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.test_scripts.managed_code_intel_fixture import qualify_bytes
+
 HELPER = Path(__file__).resolve().parents[2] / "scripts/lib/code_intel_cbm_worker.py"
 SPEC = importlib.util.spec_from_file_location("cbm_worker", HELPER)
 assert SPEC and SPEC.loader
@@ -54,22 +56,45 @@ def _main_args(tmp_path):
             "--mode", "full", "--persistence", "false"]
 
 
-def _fake_worker(tmp_path, monkeypatch, *, error=False, rc=0):
+@pytest.mark.parametrize("private", [False, True])
+@pytest.mark.parametrize("error_type", [OSError, ValueError, RuntimeError,
+                                      worker.sqlite3.Error, worker.subprocess.SubprocessError])
+def test_main_preserves_default_errors_and_propagates_private_reporter_errors(
+        tmp_path, monkeypatch, capsys, private, error_type):
+    message = "synthetic-private-preparation-detail"
+
+    def refuse(env):
+        raise error_type(message)
+
+    monkeypatch.setattr(worker, "verify_scope", refuse)
+    if private:
+        with pytest.raises(error_type, match=message):
+            worker.main(_main_args(tmp_path), queued_native_environment=object())
+        assert capsys.readouterr().err == ""
+    else:
+        assert worker.main(_main_args(tmp_path)) == 111
+        assert message in capsys.readouterr().err
+
+
+def _fake_worker(tmp_path, monkeypatch, *, error=False, rc=0, variant=""):
     binary = tmp_path / "binary"
     binary.write_text(
         "#!/usr/bin/python3\nimport json,sys\n"
+        "import hashlib\n"
         "assert sys.argv[1:3]==['cli','--index-worker']\n"
+        "assert sys.argv[sys.argv.index('--index-worker-build')+1]==hashlib.sha256(open(sys.argv[0],'rb').read()).hexdigest()\n"
         "response=sys.argv[sys.argv.index('--response-out')+1]\n"
         "open(response,'w').write(json.dumps("
         + repr({"isError": error, "content": [{"type": "text", "text": "ok"}]})
-        + f"))\nsys.exit({rc})\n"
+        + f"))\nsys.exit({rc})\n# fixture {variant}\n"
     )
     binary.chmod(0o700)
     monkeypatch.setattr(worker, "BUILD", hashlib.sha256(binary.read_bytes()).hexdigest())
+    qualify_bytes(monkeypatch, worker.qualified_release, binary.read_bytes())
     managed = runpy.run_path(str(HELPER.parents[1] / "codebase_managed.py"))
-    monkeypatch.setitem(managed["verified_binary"].__globals__, "BUILD", worker.BUILD)
+    qualify_bytes(monkeypatch, managed["qualified_release"], binary.read_bytes())
     config = dict(
-        binary=str(binary), main=str(tmp_path), cache=str(tmp_path), runtime=str(tmp_path)
+        binary=str(binary), main=str(tmp_path), cache=str(tmp_path), runtime=str(tmp_path), build=worker.BUILD
     )
     managed.update(
         runtime_config=lambda path: config,
@@ -101,7 +126,7 @@ def test_process_failures_are_never_queue_partial_success_or_deferral(rc, tmp_pa
 
 def test_pin_mismatch_refuses_before_spawn(tmp_path, monkeypatch):
     _fake_worker(tmp_path, monkeypatch)
-    monkeypatch.setitem(worker.load_managed()["verified_binary"].__globals__, "BUILD", "0" * 64)
+    worker.load_managed()["runtime_config"](tmp_path / "settings")["build"] = "0" * 64
     with pytest.raises(ValueError, match="unsupported"):
         worker._execute_stock_worker(tmp_path / "settings", _args(tmp_path), 8 * 1024**3)
     assert not list(tmp_path.glob("genesis-worker-*"))

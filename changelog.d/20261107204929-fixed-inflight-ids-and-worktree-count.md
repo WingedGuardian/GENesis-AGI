@@ -1,0 +1,1 @@
+- The session-start in-flight block now prints active autonomy task ids in full, so they can be passed straight to `task_detail` and `task_control`, and its live-worktree list and "(+N more)" count leave out registrations whose directory is gone and the worktree reaper's archive anchors.

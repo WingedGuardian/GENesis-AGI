@@ -1,0 +1,1 @@
+- Session revision notices and dashboard badges now compare the recorded launch revision with the current checkout even when no full deploy was recorded. They distinguish matching, different, and unknown revisions without claiming which source bytes a running process has loaded.

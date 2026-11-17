@@ -9,6 +9,7 @@ interpreter prints the paths, so the shell's own checks are what is exercised.
 from __future__ import annotations
 
 import fcntl
+import os
 import subprocess
 from pathlib import Path
 
@@ -324,17 +325,40 @@ def test_a_secrets_path_under_home_is_expanded(tmp_path):
     assert f"root={tmp_path / 'c'}/camoufox" in r.stdout, r.stdout + r.stderr
 
 
-def test_the_store_knobs_still_come_from_the_checkout(tmp_path):
-    """SECRETS_PATH is honoured for the browser settings only: the hook-audit
-    stores' writers read their directories from the checkout's secrets.env."""
+def _knob_dir(tmp_path, repo, extra_env):
+    script = (
+        f"source '{_HYGIENE}'\nREPO_DIR='{repo}'\n"
+        # The call site's exact shape: the resolver's file, nothing if unresolvable.
+        '_k="$(genesis_secrets_path "$REPO_DIR")" || _k=""\n'
+        '_load_store_knob GENESIS_MERGE_OVERRIDE_DIR "$_k"\necho "dir=${GENESIS_MERGE_OVERRIDE_DIR:-}"'
+    )
+    env = {"HOME": str(tmp_path / "home"), "PATH": os.environ["PATH"], **extra_env}
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False, env=env)
+    return r.stdout + r.stderr
+
+
+def test_the_store_knobs_come_from_the_file_the_runtime_reads(tmp_path):
+    """The hook-audit stores' writers read their directories from the environment
+    the server loads, and the server loads the resolver's file, so the groom reads
+    that same file: an override, then home config, then the checkout."""
     repo = tmp_path / "repo"
     repo.mkdir()
+    (tmp_path / "home").mkdir()
     (repo / "secrets.env").write_text("GENESIS_MERGE_OVERRIDE_DIR=/from/repo\n")
+    assert "dir=/from/repo" in _knob_dir(tmp_path, repo, {})
+    home_config = tmp_path / "home" / ".config" / "genesis" / "secrets.env"
+    home_config.parent.mkdir(parents=True)
+    home_config.write_text("GENESIS_MERGE_OVERRIDE_DIR=/from/home-config\n")
+    assert "dir=/from/home-config" in _knob_dir(tmp_path, repo, {})
     elsewhere = tmp_path / "elsewhere.env"
     elsewhere.write_text("GENESIS_MERGE_OVERRIDE_DIR=/from/elsewhere\n")
-    script = (
-        f"source '{_HYGIENE}'\nREPO_DIR='{repo}'\nexport SECRETS_PATH='{elsewhere}'\n"
-        '_load_store_knob GENESIS_MERGE_OVERRIDE_DIR\necho "dir=$GENESIS_MERGE_OVERRIDE_DIR"'
-    )
-    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
-    assert "dir=/from/repo" in r.stdout, r.stdout + r.stderr
+    assert "dir=/from/elsewhere" in _knob_dir(tmp_path, repo, {"SECRETS_PATH": str(elsewhere)})
+
+
+def test_an_unresolvable_override_loads_no_store_knob(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (tmp_path / "home").mkdir()
+    (repo / "secrets.env").write_text("GENESIS_MERGE_OVERRIDE_DIR=/from/repo\n")
+    out = _knob_dir(tmp_path, repo, {"SECRETS_PATH": "~genesis_nonexistent_test_user/x.env"})
+    assert "dir=" in out and "/from/repo" not in out

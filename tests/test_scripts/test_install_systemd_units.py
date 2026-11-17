@@ -187,11 +187,13 @@ def test_every_unit_path_starts_at_an_ALLOWED_root():
             name, sep, value = line.partition("=")
             if not sep or name.strip() not in _PATH_DIRECTIVES:
                 continue
-            # These managed services validate their configured checkout after
-            # starting at a neutral cwd. Keep the exception template-specific.
+            # These managed services and the captured runner start at a neutral
+            # cwd; their entry helpers explicitly resolve the selected checkout.
+            # Keep the exception template-specific.
             neutral_cwd_templates = {
                 TEMPLATE_DIR / filename for filename in (
                     "genesis-cbm-query.service.template",
+                    "genesis-code-intel.service.template",
                     "genesis-mcp-health.service.template",
                     "genesis-mcp-memory.service.template",
                     "genesis-mcp-outreach.service.template",
@@ -223,6 +225,10 @@ def test_every_unit_path_starts_at_an_ALLOWED_root():
         ("genesis-cbm-query.service.template", "ExecStart", "/", False),
         ("genesis-cbm-query.service.template", "WorkingDirectory", "/home/foreign", False),
         ("genesis-cbm-query.service.template", "WorkingDirectory", "/ /home/foreign", False),
+        ("genesis-code-intel.service.template", "WorkingDirectory", "/", True),
+        ("genesis-code-intel.service.template", "ExecStart", "/", False),
+        ("genesis-code-intel.service.template", "WorkingDirectory", "/home/foreign", False),
+        ("genesis-code-intel.service.template", "WorkingDirectory", "/ /home/foreign", False),
         ("genesis-mcp-extra.service.template", "WorkingDirectory", "/", False),
         *[(f"genesis-mcp-{service}.service.template", directive, value, allowed)
           for service in ("health", "memory", "outreach", "recon")

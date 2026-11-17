@@ -37,7 +37,7 @@ from code_intel_cbm_admission import (  # noqa: E402
     read_number,
     resolve_cgroup,
 )
-from code_intel_cbm_worker import BUILD  # noqa: E402
+from code_intel_cbm_worker import BUILD, qualified_release  # noqa: E402,F401
 from codebase_managed_unit import (  # noqa: E402,F401
     absolute,
     artifact_parent,
@@ -52,6 +52,7 @@ from codebase_managed_unit import (  # noqa: E402,F401
     loaded_properties,
     native_env,
     native_install,
+    open_qualified_binary,
     parent_identity,
     queue_initialization_advisory,
     sentinel_armed,
@@ -61,7 +62,6 @@ from codebase_managed_unit import (  # noqa: E402,F401
     validate_frontend_boundary,
     validate_provider_paths,
     validate_source_identity,
-    verify_binary_access,
     verify_worker_writes,
 )
 from codebase_managed_unit import (  # noqa: E402
@@ -314,7 +314,7 @@ def validate_loaded_backend(config: dict) -> None:
 def runtime_preflight(config: dict) -> None:
     validate_provider_paths(config)
     verify_cache(config)
-    with verified_binary(Path(config["binary"])):
+    with verified_binary(Path(config["binary"]), config["build"]):
         pass  # fail before changing native state when the accepted inode is invalid
     if sentinel_armed(config["sentinel"]):
         raise ValueError("managed Codebase sentinel is armed")
@@ -508,28 +508,14 @@ def validate_settings(value: dict, *, require_build: bool = True) -> dict:
         absolute(value.get(key))
     if not isinstance(value.get("build"), str) or not value["build"]:
         raise ValueError("missing managed build identity")
-    if require_build and value["build"] != BUILD:
-        raise ValueError("unsupported managed build; repeat acceptance before upgrading")
+    if require_build:
+        qualified_release(value["build"])
     return value
 
 
-def verified_binary(path: Path, *, execute: bool = True):
-    """Verify this inode; only a staging copy source may omit effective execute access."""
-    absolute(str(path))
-    fd = os.open(path, os.O_RDONLY | OPEN_FLAGS)
-    stream = os.fdopen(fd, "rb")
-    try:
-        verify_binary_access(fd, execute=execute)
-        digest = hashlib.sha256()
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-        if digest.hexdigest() != BUILD:
-            raise ValueError("unsupported managed executable; repeat acceptance before upgrading")
-        stream.seek(0)
-    except BaseException:
-        stream.close()
-        raise
-    return stream
+def verified_binary(path: Path, expected_build: str, *, execute: bool = True):
+    """Validate immediately and return the retained configured executable stream."""
+    return open_qualified_binary(path, expected_build, execute=execute)[0]
 
 
 def verify_cache(config: dict) -> None:
@@ -620,12 +606,10 @@ def configure(args: argparse.Namespace, path: Path) -> None:
         version=2,
         main=str(main),
         binary=str(state / "bin/codebase-memory-mcp"),
-        build=BUILD,
         cache=str(state / "cache"),
         runtime=str(state / "runtime"),
         sentinel=str(absolute(args.sentinel)),
     )
-    validate_settings(config)
     validate_provider_paths(config)
     with lifecycle_lock():
         if any(os.path.lexists(p) for p in (path, absolute(args.state), state)):
@@ -633,7 +617,9 @@ def configure(args: argparse.Namespace, path: Path) -> None:
         staging_created = False
         try:
             existing_parent = first_existing_parent(state)
-            with verified_binary(source, execute=False) as executable:
+            executable, config["build"] = open_qualified_binary(source, execute=False)
+            with executable:
+                validate_settings(config)
                 state.mkdir(parents=True, mode=0o700)
                 staging_created = True
                 (state / "bin").mkdir(mode=0o700)
@@ -646,7 +632,7 @@ def configure(args: argparse.Namespace, path: Path) -> None:
             (state / "runtime").mkdir(mode=0o700)
             with (cache / "config.json").open("x") as ui:
                 json.dump(dict(ui_enabled=False), ui)
-            with verified_binary(Path(config["binary"])) as executable:
+            with verified_binary(Path(config["binary"]), config["build"]) as executable:
                 for key in DISABLED_KEYS:
                     subprocess.run(
                         [f"/proc/self/fd/{executable.fileno()}", "config", "set", key, "false"],
@@ -820,7 +806,7 @@ def client(path: Path, unit: str) -> None:
         verify_cache(config)
         ready(config)
         os.chdir(config["main"])
-        with verified_binary(Path(config["binary"])) as executable:
+        with verified_binary(Path(config["binary"]), config["build"]) as executable:
             require_enabled(config)
             check_backend(config)
             os.set_inheritable(executable.fileno(), True)
@@ -843,7 +829,7 @@ def check_backend(config: dict, *, starting: bool = False, timeout: float = 30) 
     return pid
 
 
-def ready(config: dict) -> None:
+def ready(config: dict, *, environment=None) -> None:
     validate_provider_paths(config)
     deadline = time.monotonic() + 120
     native_deadline = None
@@ -855,7 +841,7 @@ def ready(config: dict) -> None:
             raise ValueError("managed native daemon readiness deadline expired")
         return min(30, remaining)
 
-    with verified_binary(Path(config["binary"])) as executable:
+    with verified_binary(Path(config["binary"]), config["build"]) as executable:
         while time.monotonic() < (native_deadline or deadline):
             try:
                 pid = check_backend(config, starting=True, timeout=manager_timeout())
@@ -867,7 +853,8 @@ def ready(config: dict) -> None:
                     break
                 response = subprocess.run(
                     [f"/proc/self/fd/{executable.fileno()}", "daemon", "status"],
-                    env=native_env(config),
+                    env=(native_env(config) if environment is None else
+                         native_env(config, environment=environment)),
                     pass_fds=(executable.fileno(),),
                     capture_output=True,
                     text=True,
@@ -897,7 +884,7 @@ def serve(config: dict) -> None:
     os.chdir(config["main"])
     # No shared lifecycle lock here: enable will hold exclusive while it waits
     # for ExecStartPost readiness. Native startup must not deadlock against it.
-    with verified_binary(Path(config["binary"])) as executable:
+    with verified_binary(Path(config["binary"]), config["build"]) as executable:
         # The pinned local CLI repairs a dead endpoint generation. Internal
         # daemon startup alone refuses stale sockets after a prior SIGKILL.
         subprocess.run(
@@ -940,7 +927,7 @@ def available(path: Path, repo: str, persistence: bool = True) -> None:
     verify_cache(config)
     require_enabled(config)
     validate_loaded_backend(config)
-    with verified_binary(Path(config["binary"])):
+    with verified_binary(Path(config["binary"]), config["build"]):
         check_backend(config)
     require_enabled(config)
 

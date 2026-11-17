@@ -87,6 +87,14 @@ def synthetic_fingerprints(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("GENESIS_RELEASE_FINGERPRINTS", str(path))
 
 
+@pytest.fixture(autouse=True)
+def private_home(tmp_path_factory, monkeypatch):
+    """The tracker lock (``~/.genesis/locks``) and the issue-body snapshot
+    (``~/tmp``) both resolve ``Path.home()`` at call time: a private HOME keeps
+    both off the live install, with the real lock function and its contract."""
+    monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
+
+
 # --- round 3: the permission check resolved the FORK and reported ADMIN -------
 
 

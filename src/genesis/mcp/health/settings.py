@@ -126,6 +126,22 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # read live per grading pass by ws2_ledger_config
     ),
+    "lesson_builder": SettingsDomain(
+        name="lesson_builder",
+        description=(
+            "Whole-session lesson builder — `mode` off/shadow/live. Live "
+            "(default) builds and stores new lessons, at most 7 per source "
+            "session in any rolling 24 hours; shadow runs the builder and "
+            "appends each would-be lesson to "
+            "~/.genesis/output/lesson_builder_shadow.jsonl, storing nothing; "
+            "off skips the builder. "
+            "Invalid values degrade to shadow. Read live each extraction "
+            "cycle by genesis.learning.procedural.lesson_builder_config."
+        ),
+        config_filename="lesson_builder.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per extraction cycle
+    ),
     "repo_pulse": SettingsDomain(
         name="repo_pulse",
         description=(
@@ -269,10 +285,11 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         name="graphstore",
         description=(
             "Which backend answers memory-graph traversals — `enabled` plus "
-            "`mode` networkx/falkordb. networkx (default) is the in-process "
-            "projection and depends on nothing else; falkordb is a long-lived "
-            "server over a unix socket that needs the engine armed, the client "
-            "installed, and a projection built. Anything unreadable or "
+            "`mode` networkx/falkordb. falkordb (shipped default) is a "
+            "long-lived server over a unix socket that needs the engine armed "
+            "and a projection built; on an install with no engine unit the "
+            "shipped default reads quietly from networkx, the in-process "
+            "projection that depends on nothing else. Anything unreadable or "
             "unrecognised degrades to networkx, and the facade falls back to it "
             "at runtime rather than answering empty. Betweenness centrality "
             "always stays on networkx — FalkorDB cannot compute it. Read live "
@@ -367,29 +384,16 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
     "worktree_ownership": SettingsDomain(
         name="worktree_ownership",
         description=(
-            "Worktree ownership — INERT LIBRARY PREREQUISITE, not a live "
-            "protection. Nothing in the running system calls it: no hook, no "
-            "scheduled job, and no reaper path takes or releases a claim today, "
-            "so turning this on protects NOTHING and turning it off loses "
-            "nothing. It is surfaced here only so the lever exists before its "
-            "consumers do — read the paragraph below as the DESIGN it will "
-            "implement, never as behaviour you currently have. The status line "
-            "moves when the Edit/Write hook that claims a worktree on first "
-            "write (and warns when a session writes into one another live "
-            "session holds) lands, together with the reaper-side release. "
-            "DESIGN: master `enabled` + `mode` advisory/off; records which LIVE "
-            "SESSION is using which worktree, as a `git worktree lock` reason "
-            "the reaper already treats as protected. It replaces two signals "
-            "measured dead: /proc/*/cwd ownership (0 of 200 worktrees had a "
-            "process CWD inside them while 7 sessions ran) and mtime staleness "
-            "(the activity walk misses any edit deeper than two directory "
-            "levels, which is most of src/). Dirtiness is deliberately "
-            "NOT recorded here: it is DERIVABLE, so the design computes it at the "
-            "reaper's decision point rather than storing a snapshot that goes stale "
-            "between the write and the read. That predicate is NOT LANDED — it ships "
-            "with the reaper-side work — so nothing consults dirtiness either. "
-            "Nothing is ever blocked. Read live per call — takes effect immediately, no "
-            "restart. Env kill switch GENESIS_WORKTREE_OWNERSHIP=1 forces off."
+            "Worktree ownership — live, nonblocking advice before Edit/Write/"
+            "MultiEdit/NotebookEdit and a claim after the first successful edit "
+            "in a linked worktree of the hook's repository. Claims record the "
+            "actual session PID/start identity in a git worktree lock; existing "
+            "foreign locks are preserved. The daily disk-hygiene stale-claim "
+            "pass releases claims whose session is gone, independently of this "
+            "setting. Disabling enabled or selecting mode off stops new claims "
+            "and advice; it does not disable that cleanup. Nothing is ever "
+            "blocked. Read live per call — takes effect immediately, no restart. "
+            "Env kill switch GENESIS_WORKTREE_OWNERSHIP=1 forces off."
         ),
         config_filename="worktree_ownership.yaml",
         readonly=False,
@@ -1572,6 +1576,20 @@ def _validate_ws2_ledger(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_lesson_builder(changes: dict) -> list[str]:
+    """Validate lesson_builder lever changes (see
+    genesis.learning.procedural.lesson_builder_config)."""
+    from genesis.learning.procedural.lesson_builder_config import MODES
+
+    errors: list[str] = []
+    for key, value in changes.items():
+        if key != "mode":
+            errors.append(f"Unknown key '{key}'. Valid: mode")
+        elif value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
 def _validate_skill_replay_subconfig(value, replay_modes) -> list[str]:
     """Validate the ``replay`` sub-config of the skill-evolution gate."""
     if not isinstance(value, dict):
@@ -1945,10 +1963,27 @@ def _validate_graphstore(changes: dict) -> list[str]:
     # entirely. The precondition belongs to the state the update RESULTS IN:
     # required only when the effective config both enables the lever and selects
     # falkordb, which also mirrors `effective_mode()`'s own `is True` test.
-    from genesis.memory.graphstore_config import load_config
+    #
+    # And judge whether the result would actually DEPEND on the engine. The
+    # shipped default is falkordb, but with no install overlay setting `mode` and
+    # no engine unit rendered, reads stay quietly on networkx (the where-present
+    # guard, graphstore_config.selection). Requiring the socket there would
+    # refuse every save on an install that never provisioned the engine. The
+    # result depends on it when this update or the stored overlay sets `mode`
+    # (written to the overlay, it is loud), or the unit is enabled.
+    from genesis.memory.graphstore_config import (
+        engine_unit_present,
+        load_config,
+        mode_set_by_overlay,
+    )
 
     effective = {**load_config(), **changes}
-    if effective.get("enabled", True) is True and effective.get("mode") == "falkordb":
+    depends = "mode" in changes or mode_set_by_overlay() or engine_unit_present()
+    if (
+        depends
+        and effective.get("enabled", True) is True
+        and effective.get("mode") == "falkordb"
+    ):
         from genesis.env import falkordb_socket_path
 
         socket_path = falkordb_socket_path()
@@ -2314,6 +2349,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "memory_recall": _validate_memory_recall,
     "session_ledger_shadow": _validate_session_ledger_shadow,
     "ws2_ledger": _validate_ws2_ledger,
+    "lesson_builder": _validate_lesson_builder,
     "repo_pulse": _validate_repo_pulse,
     "zero_drop": _validate_zero_drop,
     "contributor_worklog": _validate_contributor_worklog,

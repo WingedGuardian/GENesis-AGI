@@ -194,6 +194,9 @@ def test_the_record_command_targets_the_database_the_row_came_from(tmp_path, rep
     record = next(line for line in out.splitlines() if line.lstrip().startswith("record:"))
     argv = shlex.split(record.split("record:", 1)[1].split("(then again")[0])
     assert argv[argv.index("--db-path") + 1] == str(db), record
+    # A bare `python3` may lack aiosqlite, which pr_verification.py needs. Read the
+    # whole output: a quoted interpreter path is not confined to one line.
+    assert f"record: {shlex.quote(sys.executable)} scripts/pr_verification.py close" in out
 
 
 def test_the_newest_planned_pr_wins(tmp_path, repo, capsys):
@@ -217,7 +220,7 @@ def test_not_yet_done_beats_a_newer_untouched_row(tmp_path, repo, capsys):
     prs = [_pr(1, "2026-10-10T00:00:00Z", s["c1"]), _pr(2, "2026-10-12T00:00:00Z", s["c2"])]
     out = _pick(db, repo, _runner(prs), capsys)
     assert _picked(out) == 1, out
-    assert "tier: not-yet-done" in out
+    assert "tier: unfinished work or tracking" in out
 
 
 def test_an_untouched_row_beats_a_newer_reattempt(tmp_path, repo, capsys):

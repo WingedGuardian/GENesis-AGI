@@ -1535,6 +1535,36 @@ def test_the_rounds_row_is_advisory_and_never_moves_the_verdict(monkeypatch, cap
     assert rc == 0, out
 
 
+@pytest.mark.parametrize("note_behaviour", ["fires", "silent", "raises"])
+def test_the_no_change_note_is_wired_and_never_moves_the_verdict(
+    monkeypatch, capsys, note_behaviour
+):
+    """The report hands the rounds row's budget to ``_no_change_note`` and prints
+    what it returns. Firing, silent or raising, the verdict stays green."""
+    _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
+    budget = {"status": "ok", "current_head": HEAD}
+    seen = {}
+
+    def fake_rounds(pr_num, repo=None, budget_out=None):
+        if budget_out is not None:
+            budget_out.append(budget)
+        return "x"
+
+    def fake_note(pr_num, repo, got):
+        seen["budget"] = got
+        if note_behaviour == "raises":
+            raise RuntimeError("boom")
+        return "NOTE: PR #100 — wired" if note_behaviour == "fires" else None
+
+    monkeypatch.setattr(_mod, "_rounds_row", fake_rounds)
+    monkeypatch.setattr(_mod, "_no_change_note", fake_note)
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    assert seen["budget"] is budget
+    assert ("NOTE: PR #100 — wired" in out) is (note_behaviour == "fires")
+    assert rc == 0, out
+
+
 def test_check_pr_report_scheduled_absent_fails_verdict(monkeypatch, capsys):
     """An absent scheduled review is a FAILURE line and flips the report's verdict —
     the report must not diverge from the always-fail-closed enforcement gate."""

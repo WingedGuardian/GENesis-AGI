@@ -6,14 +6,14 @@ directly — and the harness FILES a hook entry over ``HOOK_STDOUT_CAP`` behind 
 ~2 KB preview with no error and no exit-code change. A breach here is silent and
 costs the window its peer list and its prompt-injection safety directive.
 
-Four surfaces were unbounded, and they fail differently, which is why each gets
-its own bound rather than one blanket cap:
+Four surfaces were unbounded, and they fail differently, which is why each got
+its own bound rather than one blanket cap (the code hint has since been removed
+with the [Code] lane itself; the other three remain):
 
 * the keyword window  — ``prompt`` is arbitrary user text and every keyword was
   length-unbounded, so ONE pasted alphanumeric run became one token;
 * the trail LINE      — bounded keywords still allow fifty wide labels;
-* the code hint       — ``code_symbols.signature`` has no cap, and this is the
-  largest surface MEASURED on real data rather than on a pasted worst case;
+* the code hint       — ``code_symbols.signature`` had no cap (lane removed);
 * the peer block      — ``get_active_sync`` had no ``LIMIT``.
 
 Every number asserted here is derived in the docstring of the function that owns
@@ -29,6 +29,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,7 @@ import proactive_memory_hook as pmh  # noqa: E402
 from hook_output import HOOK_STDOUT_CAP, emit_cost  # noqa: E402
 
 _SID = "aaaabbbb-cccc-dddd-eeee-ffff00002222"
+_REAL_PEER_WORKTREES = pmh._peer_worktrees
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +50,35 @@ def _no_live_registry(monkeypatch):
     """Keep the peer renderer off the machine's real session registry (a dev box
     has one and CI does not); the widest-block test sets its own suffix."""
     monkeypatch.setattr(pmh, "_peer_addresses", lambda *a, **k: {})
+    monkeypatch.setattr(pmh, "_peer_worktrees", lambda *a, **k: {})
+
+
+@pytest.fixture
+def recall_db(tmp_path, monkeypatch):
+    """Keep the real hook migration and all its connects on an owned database."""
+    db_path = tmp_path / "hook.db"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("CREATE TABLE knowledge_units (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    home = tmp_path / "hook-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(pmh, "_DB_PATH", db_path)
+    connect = pmh._sqlite_connect
+    targets = []
+
+    def owned_connect(target, *args, **kwargs):
+        assert Path(target) == db_path
+        targets.append(Path(target))
+        return connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(pmh, "_sqlite_connect", owned_connect)
+    yield db_path
+    assert targets, "fixture never exercised a real SQLite connection"
+    assert (home / ".genesis/.knowledge_retrieved_count_migrated").exists()
+    with closing(sqlite3.connect(db_path)) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(knowledge_units)")}
+    assert "retrieved_count" in columns
 
 
 # ---------------------------------------------------------------------------
@@ -217,77 +248,18 @@ def test_a_trail_with_only_out_of_window_history_still_debounces() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. the code hint — the largest surface on real data
+# 4. the SIZE bounds are measured in the unit the harness bills
 # ---------------------------------------------------------------------------
-
-
-def test_a_long_signature_is_clipped_but_the_location_survives_whole() -> None:
-    """``loc`` is the ACTIONABLE half: a bounded pointer to a real file beats a
-    whole signature with a mangled path."""
-    loc = "src/genesis/memory/retrieval.py:MemoryStore"
-    line = pmh._render_code_hint("def f(" + "a: int, " * 300 + ")", loc)
-
-    assert len(line) <= pmh._MAX_CODE_HINT_CHARS
-    assert line.endswith(f" — {loc}"), "the location must not be clipped"
-    assert "…" in line, "a clipped signature must not read as a complete one"
-    assert line.startswith("[Code] def f(")
-
-
-def test_a_normal_signature_is_rendered_unchanged() -> None:
-    """p99 of the live index is 365 chars — the common case must not move."""
-    line = pmh._render_code_hint("def get_active_sync(db_path: str) -> list[dict]", "a/b.py")
-    assert line == "[Code] def get_active_sync(db_path: str) -> list[dict] — a/b.py"
-    assert "…" not in line
-
-
-def test_the_line_is_bounded_even_when_the_location_alone_overflows() -> None:
-    """There is no room to clip the signature INTO, so the line is clipped.
-
-    Without this branch the signature's room goes negative and the slice silently
-    inverts — bounding nothing on exactly the pathological input the bound exists
-    for.
-    """
-    line = pmh._render_code_hint("def f()", "x" * 5000)
-    assert len(line) <= pmh._MAX_CODE_HINT_CHARS
-
-
-def test_six_hints_cannot_dominate_the_budget() -> None:
-    """The SQL returns at most 6 rows; this pins what that costs at worst."""
-    worst = pmh._render_code_hint("s" * 10_000, "m" * 10_000)
-    assert 6 * emit_cost(worst) < HOOK_STDOUT_CAP // 2
-
-
-# ---------------------------------------------------------------------------
-# 4b. the SIZE bounds are measured in the unit the harness bills
-# ---------------------------------------------------------------------------
-# REGRESSION CLASS. Both size bounds below billed in UTF-16 (clip_to_cost) while
+# REGRESSION CLASS. The code-hint and trail size bounds billed in UTF-16 (clip_to_cost) while
 # DECIDING in codepoints (len), so an astral value short enough in codepoints to
-# clear the guard was never bounded at all. The extremes hide it — a huge astral
+# clear the guard was never bounded at all. The code hint is gone; the trail
+# test below keeps the class pinned. The extremes hide it — a huge astral
 # value trips the guard and clips correctly — so these fixtures sit in the MIDDLE
 # of the range, which is the only place the defect is visible. The original
 # battery had no astral fixture at all and could not see this.
 
 _ASTRAL = "\U0001f600"  # 1 codepoint, 2 UTF-16 units
 _ASTRAL_ALNUM = "\U00020000"  # astral CJK: str.isalnum() is True, so a prompt can carry it
-
-
-@pytest.mark.parametrize("n", [100, 150, 200, 250, 300, 383, 500, 1000])
-def test_a_code_hint_holds_its_bound_in_utf16_at_every_astral_width(n: int) -> None:
-    """Sweep the width, because ONE sample would have reported clean.
-
-    At n=2000 this passed before the fix; the breach lives around n=200-383,
-    where `room < len(sig)` is False and no clipping happens at all.
-    """
-    line = pmh._render_code_hint(_ASTRAL * n, "src/genesis/memory/retrieval.py")
-    assert emit_cost(line) - 1 <= pmh._MAX_CODE_HINT_CHARS, (
-        f"{n} astral chars rendered {emit_cost(line) - 1} UTF-16 units against a "
-        f"stated ceiling of {pmh._MAX_CODE_HINT_CHARS}"
-    )
-
-
-def test_an_astral_location_cannot_push_the_hint_over() -> None:
-    line = pmh._render_code_hint("def f()", _ASTRAL * 200)
-    assert emit_cost(line) - 1 <= pmh._MAX_CODE_HINT_CHARS
 
 
 def test_the_trail_line_holds_its_bound_in_utf16() -> None:
@@ -475,6 +447,25 @@ def _widest_address() -> str:
     return text
 
 
+def _widest_worktree() -> str:
+    """The longest worktree text the real _peer_worktrees can produce: both
+    names over their limits, plus a three-digit count of further claims. Built
+    by the real function over a stubbed claim reader, so a wider bound widens
+    this test with it."""
+    import worktree_claim
+
+    claims = [{"name": "n" * 500, "branch": "b" * 500, "claimed_at": 1.0}] * 1000
+    orig_common, orig_claims = worktree_claim.common_dir_for, worktree_claim.claims_by_session
+    worktree_claim.common_dir_for = lambda root: Path("/nonexistent")
+    worktree_claim.claims_by_session = lambda common, sids, **kw: {s: claims for s in sids}
+    try:
+        text = _REAL_PEER_WORKTREES(["x"], None)["x"]
+    finally:
+        worktree_claim.common_dir_for, worktree_claim.claims_by_session = orig_common, orig_claims
+    assert "(+999 more claimed)" in text and text.count("…") == 2, text  # nothing was dropped
+    return text
+
+
 def test_the_widest_possible_peer_block_leaves_room_for_the_directive() -> None:
     """The arithmetic behind the claim above, MEASURED not derived.
 
@@ -506,16 +497,17 @@ def test_the_widest_possible_peer_block_leaves_room_for_the_directive() -> None:
         }
         collected = _Collect()
         orig_get, orig_count = hb.get_active_sync, hb.count_active_sync
-        orig_addr = pmh._peer_addresses
+        orig_addr, orig_wt = pmh._peer_addresses, pmh._peer_worktrees
         hb.get_active_sync = lambda *a, _r=row, **k: [dict(_r) for _ in range(pmh._MAX_PEERS_SHOWN)]
         hb.count_active_sync = lambda *a, **k: 500
         pmh._peer_addresses = lambda ids, *a, **k: {i: _widest_address() for i in ids}
+        pmh._peer_worktrees = lambda ids, *a, **k: {i: _widest_worktree() for i in ids}
         pmh._OUT = collected
         try:
             pmh._heartbeat_read_and_inject(Path(__file__), _SID)
         finally:
             hb.get_active_sync, hb.count_active_sync = orig_get, orig_count
-            pmh._peer_addresses = orig_addr
+            pmh._peer_addresses, pmh._peer_worktrees = orig_addr, orig_wt
             pmh._OUT = None
 
         peers = [ln for ln in collected.lines if ln.startswith("[Concurrent |")]
@@ -640,7 +632,7 @@ def test_a_cut_is_announced_even_when_the_budget_is_exactly_spent() -> None:
     async def _flood(prompt: str, session_id: str = "", **_kwargs: object) -> None:
         out = pmh._writer()
         out.emit("x" * (ceiling - 1), block="server-recall")
-        out.emit("y" * 500, block="code-hints")
+        out.emit("y" * 500, block="degraded-recall")
 
     buf = io.StringIO()
     real_run, real_stdin, real_stdout = pmh._run, sys.stdin, sys.stdout
@@ -680,7 +672,6 @@ def test_the_cut_notice_fits_the_reserve_it_declares() -> None:
             "concurrent",
             "concurrent-directive",
             "server-recall",
-            "code-hints",
             "degraded-recall",
             "session-metadata",
         ],
@@ -823,7 +814,7 @@ def test_delivery_bookkeeping_counts_only_what_the_writer_accepted() -> None:
     out.emit("x" * pmh.DEFAULT_BUDGET, block="server-recall")
     assert out.closed, "fixture did not close the writer"
 
-    assert pmh._emit_tracked(out, "dropped", "code-hints") is False, (
+    assert pmh._emit_tracked(out, "dropped", "degraded-recall") is False, (
         "a block offered to a closed writer must NOT be reported as delivered"
     )
 
@@ -841,7 +832,7 @@ def test_the_call_that_trips_the_cut_still_counts_as_delivered() -> None:
     assert out.cut is not None, "fixture did not actually trip a cut"
 
 
-def test_a_cut_during_recall_does_not_mark_unseen_rows_surfaced(monkeypatch) -> None:
+def test_a_cut_during_recall_does_not_mark_unseen_rows_surfaced(monkeypatch, recall_db) -> None:
     """The server path, end to end through `_run`.
 
     `lines` and `results` are parallel views of the same hits but nothing
@@ -889,16 +880,6 @@ def test_a_cut_during_recall_does_not_mark_unseen_rows_surfaced(monkeypatch) -> 
         monkeypatch.setattr(pmh, name, lambda *a, **k: None)
     monkeypatch.setattr(pmh, "_load_recent_files", lambda *a, **k: [])
     monkeypatch.setattr(pmh, "_compute_suppress_ids", lambda *a, **k: [])
-    # A code hint too, so this test covers BOTH bookkeeping sites. Without it
-    # the code-hints call site could record unconditionally and still pass:
-    # asserting on `_emit_tracked` alone proves the helper works, not that the
-    # call site uses it.
-    monkeypatch.setattr(
-        pmh,
-        "_search_code_index",
-        lambda *a, **k: [{"content": "[Code] f — a.py", "memory_id": "c1"}],
-    )
-    monkeypatch.setattr(pmh, "_DB_PATH", Path(__file__))  # only existence is checked
 
     import asyncio
 
@@ -908,17 +889,17 @@ def test_a_cut_during_recall_does_not_mark_unseen_rows_surfaced(monkeypatch) -> 
     assert pmh._writer().cut is not None, "fixture did not produce a cut"
     assert measured[0] == [], (
         "rows were marked surfaced after a cut swallowed the recall block — "
-        f"neither the server results nor the code hint reached the model: {measured[0]}"
+        f"the server results never reached the model: {measured[0]}"
     )
 
 
-def test_the_degraded_path_records_nothing_when_its_blob_is_dropped(monkeypatch) -> None:
-    """The third bookkeeping site, and the unambiguous one.
+def test_the_degraded_path_records_nothing_when_its_blob_is_dropped(monkeypatch, recall_db) -> None:
+    """The second bookkeeping site, and the unambiguous one.
 
     `_format_degraded` renders the whole result set as ONE blob, so if that
     single emit does not land, NOTHING in `fused` was shown — unlike the server
     path, where a partial cut leaves the mapping unknown. Needs its own test:
-    the other two sites can be fixed while this one still records blind.
+    the server site can be fixed while this one still records blind.
     """
     measured: list[list[dict]] = []
 
@@ -933,7 +914,6 @@ def test_the_degraded_path_records_nothing_when_its_blob_is_dropped(monkeypatch)
             {"memory_id": "d1", "content": "a degraded recall hit", "collection": "episodic_memory"}
         ],
     )
-    monkeypatch.setattr(pmh, "_search_code_index", lambda *a, **k: [])
     monkeypatch.setattr(
         pmh,
         "_ws_measure",
@@ -961,7 +941,6 @@ def test_the_degraded_path_records_nothing_when_its_blob_is_dropped(monkeypatch)
         monkeypatch.setattr(pmh, name, lambda *a, **k: None)
     monkeypatch.setattr(pmh, "_load_recent_files", lambda *a, **k: [])
     monkeypatch.setattr(pmh, "_compute_suppress_ids", lambda *a, **k: [])
-    monkeypatch.setattr(pmh, "_DB_PATH", Path(__file__))
 
     # Close the writer BEFORE _run reaches the degraded emit.
     pmh._writer().emit("x" * (pmh.DEFAULT_BUDGET * 2), block="server-recall")
@@ -987,7 +966,7 @@ def test_a_cut_says_so_in_band() -> None:
 
 @pytest.mark.parametrize(
     "name",
-    ["_MAX_KEYWORD_CHARS", "_MAX_TRAIL_LINE_CHARS", "_MAX_CODE_HINT_CHARS", "_MAX_PEERS_SHOWN"],
+    ["_MAX_KEYWORD_CHARS", "_MAX_TRAIL_LINE_CHARS", "_MAX_PEERS_SHOWN"],
 )
 def test_each_bound_is_a_positive_int(name: str) -> None:
     """Cheap, but it is the assertion that would have caught a bound set to 0 or

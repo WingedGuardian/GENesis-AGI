@@ -118,3 +118,11 @@ async def test_unknown_defining_modules_refuse_startup(module):
     server.tool(function(module), name="health_status")
     with pytest.raises(ValueError, match="defining module"):
         await Catalog.capture(server, "health")
+
+
+async def test_versioned_tool_refuses_startup():
+    """A versioned call reaches get_tool(name, version=...), not the captured tool."""
+    server = FastMCP("catalog-fixture")
+    server.add_tool(Tool.from_function(function("genesis.mcp.health.status"), name="health_status", version="1"))
+    with pytest.raises(ValueError, match="versioned tools"):
+        await Catalog.capture(server, "health")

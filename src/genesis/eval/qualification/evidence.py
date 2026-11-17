@@ -18,6 +18,7 @@ KINDS = {
     "dispatch",
     "observation",
     "billing",
+    "receipt_lookup",
     "failure",
     "acknowledgement",
     "answer",

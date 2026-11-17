@@ -6,6 +6,7 @@ their funded liability and can only be reconciled with GET requests.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -33,7 +34,9 @@ from .corpus import route, versions
 from .evidence import Incomplete, canonical, digest, load_json
 
 ENDPOINT = "https://openrouter.ai/api/v1"
+NAMESPACE = "openrouter"
 KEY_ENV = "GENESIS_QUALIFICATION_OPENROUTER_KEY"
+QUALIFICATION_KEY_ENVS = (KEY_ENV, "GENESIS_QUALIFICATION_DEEPSEEK_KEY")
 PRODUCTION_KEY_NAMES = ("API_KEY_OPENROUTER", "OPENROUTER_API_KEY", "OPENROUTER_API_TOKEN")
 ROOT = Path(__file__).resolve().parents[4]
 ROUTES = ("judge", "relevance", "novelty")
@@ -47,6 +50,10 @@ MAX_CURRENCY_CHARS = 4096
 # clock does. A response slower than the wall clock leaves a dispatched
 # attempt for the existing GET-only recovery path; it is never resent.
 COMPLETION_TIMEOUT_S = 120
+# Opt-in metadata availability limits; not a provider readiness guarantee.
+RECEIPT_WAIT_TIMEOUT = 600
+RECEIPT_WAIT_INTERVAL = 30
+RECEIPT_WAIT_READS = 21
 
 
 class LocalFailure(Incomplete):
@@ -62,7 +69,7 @@ def _redaction_values() -> frozenset[str]:
         value
         for name, value in os.environ.items()
         if value
-        and (name == KEY_ENV or len(value) >= 8)
+        and (name in QUALIFICATION_KEY_ENVS or len(value) >= 8)
         and any(word in name.upper() for word in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
     }
 
@@ -119,6 +126,10 @@ _WIRE_FIELDS = frozenset({
     "attempt", "is_byok", "endpoints", "total", "available", "provider", "selected",
     "data", "total_cost", "provider_name", "upstream_id", "error", "code",
     "pipeline", "attempts", "status",
+    "system_fingerprint", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens",
+    "prompt_tokens_details", "cached_tokens", "completion_tokens_details",
+    "reasoning_tokens", "safety_tokens", "server_tool_use", "refusal",
+    "reasoning_content", "tool_calls", "server_tool_calls", "annotations", "title",
 })
 _KEY_COLON = re.compile(r"\s*:")
 
@@ -211,7 +222,7 @@ def safe_evidence(value: dict, depth=0) -> dict:
     for key, item in value.items():
         if key == "raw_body" and isinstance(item, str):
             result[key] = safe_text(item, schema_keys=_WIRE_FIELDS)
-        elif key in ("usage", "association", "response_headers") and isinstance(item, dict):
+        elif key in ("usage", "native_usage", "association", "response_headers") and isinstance(item, dict):
             result[key] = safe_evidence(item, depth + 1)
         else:
             result[key] = _safe_value(item, depth + 1)
@@ -345,6 +356,15 @@ def _response_identity(raw, response_headers):
     }
 
 
+def model_identities(spec):
+    """Exact gateway, backend and receipt pins; only absent pins use legacy IDs."""
+    values = (spec.get("model"), spec.get("backend_model", spec.get("model")),
+              spec.get("receipt_model", spec.get("model")))
+    if any(not isinstance(value, str) or not value.strip() for value in values):
+        raise LocalFailure("invalid frozen model identities")
+    return values
+
+
 def _observed_identity(observation, spec):
     """Keep field-specific conflicting facts unresolved in existing accounting fields.
 
@@ -358,9 +378,11 @@ def _observed_identity(observation, spec):
         # receipt-only observations can account expense, never qualify a route.
         return {"model": observation.get("model", observation.get("response_model")),
                 "upstream": observation.get("upstream")}
-    models = [raw.get("model"), *(item.get("model") for item in selected)]
+    model, backend_model, _ = model_identities(spec)
+    models = [(raw.get("model"), model),
+              *((item.get("model"), backend_model) for item in selected)]
     providers = [raw.get("provider"), *(item.get("provider") for item in selected)]
-    wrong_models = [value for value in models if value is not None and value != spec["model"]]
+    wrong_models = [value for value, expected in models if value is not None and value != expected]
     wrong_providers = [value for value in providers if value is not None and value != spec["receipt_provider"]]
     return {
         "model": wrong_models or observation.get("response_model", observation.get("model")),
@@ -372,6 +394,7 @@ def _observed_identity(observation, spec):
 
 def verify_routing(observation, spec):
     """Qualify the documented gateway route, never infer backend parameter execution."""
+    _, backend_model, _ = model_identities(spec)
     raw, metadata, available, selected = _route_facts(observation)
     headers = observation.get("response_headers", {})
     if not isinstance(headers, dict) or headers.get("x-openrouter-cache-status") not in (None, "MISS"):
@@ -392,7 +415,7 @@ def verify_routing(observation, spec):
         raise LocalFailure("routing metadata does not verify one unchanged pinned gateway attempt")
     endpoint = selected[0]
     if (
-        endpoint.get("model") != spec["model"]
+        endpoint.get("model") != backend_model
         or endpoint.get("provider") != spec["receipt_provider"]
         or observation.get("response_provider") != endpoint["provider"]
         or ("provider" in raw and raw["provider"] != endpoint["provider"])
@@ -402,7 +425,7 @@ def verify_routing(observation, spec):
         attempts = metadata["attempts"]
         if (
             not isinstance(attempts, list) or len(attempts) != 1 or not isinstance(attempts[0], dict)
-            or attempts[0].get("model") != spec["model"]
+            or attempts[0].get("model") != backend_model
             or attempts[0].get("provider") != spec["receipt_provider"]
             or type(attempts[0].get("status")) is not int or attempts[0]["status"] != 200
         ):
@@ -423,6 +446,9 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
     The supplied callback must append to Journal before this response hook
     returns. No outer SDK success or cancellable cleanup substitutes for it.
     """
+
+    completion_url = ENDPOINT + "/chat/completions"
+    request_headers = {"X-OpenRouter-Metadata": "enabled", "X-OpenRouter-Cache": "false"}
 
     def __init__(self, expected: dict, key: str, record, *, transport=None, timeout=COMPLETION_TIMEOUT_S):
         self.expected, self.key, self.record = load_json(canonical(expected)), key, record
@@ -450,7 +476,7 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
         body = load_json(await request.aread())
         if (
             request.method != "POST"
-            or str(request.url) != ENDPOINT + "/chat/completions"
+            or str(request.url) != self.completion_url
             or request.headers.get("Authorization") != f"Bearer {self.key}"
             or canonical(body) != canonical(self.expected)
         ):
@@ -458,8 +484,7 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
             raise LocalFailure(self.error)
         # Set these after SDK construction, at the final serialized egress hook.
         # SDK caching=False does not control the gateway's response cache.
-        request.headers["X-OpenRouter-Metadata"] = "enabled"
-        request.headers["X-OpenRouter-Cache"] = "false"
+        request.headers.update(self.request_headers)
 
     async def after(self, response: httpx.Response):
         if response.is_closed:
@@ -481,7 +506,10 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
             try:
                 await stream.aclose()
             except BaseException as exc:
-                if failure is None:
+                # Delegate normalization can discard exception notes. Preserve
+                # this independent incident in the adapter's durable failure.
+                self.error = "response_stream_cleanup_failed:" + exception_name(exc)
+                if failure is None or not isinstance(exc, Exception):
                     raise
                 failure.add_note("response stream cleanup also failed: " + exception_name(exc))
 
@@ -533,8 +561,9 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
 
 
 @contextmanager
-def private_logs():
+def private_logs(*, secrets=()):
     """Redact log records and suppress normal SDK verbosity; restore both."""
+    token = _SCOPED_SECRETS.set(_redaction_values() | {secret for secret in secrets if secret})
     original = logging.getLogRecordFactory()
     # Log calls can originate on SDK threads without the caller's context.
     secrets = _redaction_values()
@@ -579,6 +608,7 @@ def private_logs():
         logging.setLogRecordFactory(original)
         litellm.suppress_debug_info = quiet
         litellm.set_verbose = verbose
+        _SCOPED_SECRETS.reset(token)
 
 
 def check_callback_isolation():
@@ -618,14 +648,16 @@ def production_credentials() -> set[str]:
 
 
 @contextmanager
-def scoped_credential(key: str):
+def scoped_credential(key: str, *, aliases=PRODUCTION_KEY_NAMES, target="OPENROUTER_API_KEY"):
     """The delegate reads its key from the environment; lend it the approved one."""
-    saved = {name: os.environ.get(name) for name in PRODUCTION_KEY_NAMES}
-    token = _SCOPED_SECRETS.set(_redaction_values())
+    if target not in aliases:
+        raise LocalFailure("credential target must belong to its fixed resolver aliases")
+    saved = {name: os.environ.get(name) for name in aliases}
+    token = _SCOPED_SECRETS.set(_redaction_values() | {key})
     try:
-        for name in PRODUCTION_KEY_NAMES:
+        for name in aliases:
             os.environ.pop(name, None)
-        os.environ["OPENROUTER_API_KEY"] = key
+        os.environ[target] = key
         yield
     finally:
         for name, value in saved.items():
@@ -772,6 +804,58 @@ def credential(mode="dedicated") -> str:
     return key
 
 
+def frozen_receipt_policy(spec):
+    policy = spec.get("receipt_policy", "single")
+    if not isinstance(policy, str) or policy not in ("single", "wait_404"):
+        raise LocalFailure("invalid frozen receipt policy")
+    return policy
+
+
+async def _receipt_response(journal, attempt, key, evidence, policy, transport):
+    """Failed lookups retain ownership and liability, never financial authority."""
+    wait = policy == "wait_404"
+    with private_logs():
+        client = httpx.AsyncClient(
+            transport=transport, follow_redirects=False,
+            **({"timeout": 30} if wait else {}),
+        )
+        try:
+            async with asyncio.timeout(RECEIPT_WAIT_TIMEOUT if wait else None):
+                for index in range(RECEIPT_WAIT_READS if wait else 1):
+                    try:
+                        response = await client.get(
+                            ENDPOINT + "/generation",
+                            params={"id": evidence["generation_id"]},
+                            headers={"Authorization": f"Bearer {key}"},
+                        )
+                    except BaseException as exc:
+                        try:
+                            journal.append("receipt_lookup", attempt=attempt, evidence=safe_evidence({
+                                **evidence, "http_status": None, "error": failure_message(exc),
+                            }))
+                        except BaseException as append_error:
+                            exc.add_note("lookup evidence append failed: " + exception_name(append_error))
+                        raise
+                    if response.status_code == 200:
+                        return response
+                    journal.append("receipt_lookup", attempt=attempt, evidence=safe_evidence({
+                        **evidence, "http_status": response.status_code,
+                        "raw_body": safe_body(response.content), "error": "billing GET failed",
+                    }))
+                    if response.status_code != 404 or not wait or index + 1 == RECEIPT_WAIT_READS:
+                        raise LocalFailure("billing GET failed")
+                    # Only this invocation's durably recorded404 permits another GET.
+                    await asyncio.sleep(RECEIPT_WAIT_INTERVAL)
+        finally:
+            active = sys.exception()
+            try:
+                await client.aclose()
+            except BaseException as cleanup:
+                if active is None or not isinstance(cleanup, Exception):
+                    raise
+                active.add_note("receipt client cleanup failed: " + exception_name(cleanup))
+
+
 async def reconcile(journal, attempt: str, *, transport=None, association=None, credential_mode=None):
     """Append GET evidence without sending a completion, including on recovery.
 
@@ -783,6 +867,14 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None, 
     row = journal.attempt(attempt)
     spec = row["spec"]
     binding = journal.expected_manifest["binding"].get("transports", {}).get(spec["alias"], {})
+    _, _, receipt_model = model_identities(spec)
+    if ((binding and model_identities(spec) != model_identities(binding))
+            or (not binding and any(key in spec for key in ("backend_model", "receipt_model")))):
+        raise LocalFailure("reconciliation model identities differ from frozen transport")
+    policy = frozen_receipt_policy(spec)
+    if (policy != frozen_receipt_policy(binding)
+            or (not binding and "receipt_policy" in spec)):
+        raise LocalFailure("reconciliation receipt policy differs from frozen transport")
     mode = frozen_credential_mode(spec)
     if (mode != frozen_credential_mode(binding)
             or (credential_mode is not None and credential_mode != mode)):
@@ -830,25 +922,16 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None, 
     key = credential(mode)
     if hashlib.sha256(key.encode()).hexdigest() != spec.get("credential_fingerprint"):
         raise LocalFailure("reconciliation credential differs from frozen identity")
-    with private_logs():
-        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
-            response = await client.get(
-                ENDPOINT + "/generation",
-                params={"id": generation},
-                headers={"Authorization": f"Bearer {key}"},
-            )
     evidence = {
         "generation_id": generation,
         "attempt": attempt,
         "request_hash": spec["request_hash"],
-        "http_status": response.status_code,
-        "raw_body": safe_body(response.content),
         "association": association_evidence,
         "provider_identity_evidence": identity,
     }
+    response = await _receipt_response(journal, attempt, key, evidence, policy, transport)
+    evidence.update(http_status=response.status_code, raw_body=safe_body(response.content))
     try:
-        if response.status_code != 200:
-            raise LocalFailure("billing GET failed")
         envelope = financial_json(response.content, (("data", "total_cost"),))
         if "error" in envelope:
             raise LocalFailure("billing GET returned an error envelope")
@@ -861,7 +944,7 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None, 
         )
         if (
             data.get("id") != generation
-            or data.get("model") != spec["model"]
+            or data.get("model") != receipt_model
             or data.get("provider_name") != display
         ):
             raise LocalFailure("billing GET identity differs from frozen request")
@@ -869,7 +952,7 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None, 
             identity_fields = _observed_identity(observation, spec)
             if any(value is not None and value != spec[name] for name, value in identity_fields.items()):
                 raise LocalFailure("retained routing identity contradicts billing settlement")
-        evidence.update(model=data["model"], upstream=spec["upstream"], charge=data["total_cost"])
+        evidence.update(model=spec["model"], upstream=spec["upstream"], charge=data["total_cost"])
     except (ValueError, KeyError, TypeError) as exc:
         evidence["error"] = failure_message(exc)
         # Invalid evidence is still durable; Journal refuses settlement.
@@ -972,6 +1055,49 @@ def request_body(model, params, contract, messages):
     }))
 
 
+def validate_binding(binding, cfg, params):
+    expected = {"model": cfg.model_id, "params": params, "endpoint": ENDPOINT,
+                "generation_namespace": NAMESPACE}
+    if not isinstance(binding, dict) or any(
+        canonical(binding.get(key)) != canonical(value) for key, value in expected.items()
+    ):
+        raise LocalFailure("transport differs from the frozen campaign binding")
+    model_identities(binding)
+    frozen_receipt_policy(binding)
+
+
+def validate_attempt(spec, binding):
+    if (model_identities(spec) != model_identities(binding)
+            or frozen_receipt_policy(spec) != frozen_receipt_policy(binding)
+            or not isinstance(spec.get("receipt_provider"), str) or not spec["receipt_provider"].strip()
+            or not isinstance(spec.get("provider_identity_evidence"), str)
+            or not spec["provider_identity_evidence"].strip()):
+        raise LocalFailure("schedule differs from the frozen transport identity")
+
+
+def verify_observation(observation, spec):
+    verify_routing(observation, spec)
+    if (observation.get("model") != spec["model"] or observation.get("upstream") != spec["upstream"]
+            or observation.get("response_model") != spec["model"]
+            or observation.get("response_provider") != spec["receipt_provider"]
+            or observation.get("http_status") != 200 or observation.get("error")
+            or not isinstance(observation.get("content"), str)):
+        raise LocalFailure("retained response is not verified evidence of the pinned model")
+
+
+def delegate_kwargs(params, contract, expected):
+    body = params[route(contract)]
+    return {**{key: value for key, value in body.items() if key != "reasoning"},
+            "extra_body": {"provider": expected["provider"],
+                           **({"reasoning": body["reasoning"]} if "reasoning" in body else {})}}
+
+
+HTTPHandler = ObservedHTTPHandler
+observed_identity = _observed_identity
+finalize = reconcile
+finalize_on_failure = False
+
+
 class PinnedRouter:
     """Adapter router for one frozen, fully funded model campaign.
 
@@ -986,10 +1112,6 @@ class PinnedRouter:
                  dispatch_admission=None, credential_mode=None):
         self.campaign, self.alias = campaign, alias
         self.config = config or routing()
-        self.cfg = resolve(alias, self.config)
-        self.params = load_json(canonical(validate_params(params)))
-        if self.cfg.params:
-            raise LocalFailure("implicit routing parameters are forbidden in qualification")
         self.transport, self.dispatch = transport, dispatch
         self.dispatch_admission = dispatch_admission
         # One detached snapshot at construction, never a full campaign copy per call.
@@ -997,16 +1119,14 @@ class PinnedRouter:
         self.manifest = state.manifest
         transports = self.manifest["binding"].get("transports")
         binding = transports.get(alias) if isinstance(transports, dict) else None
-        expected = {
-            "model": self.cfg.model_id,
-            "params": self.params,
-            "endpoint": ENDPOINT,
-            "generation_namespace": "openrouter",
-        }
-        if not isinstance(binding, dict) or any(
-            canonical(binding.get(k)) != canonical(v) for k, v in expected.items()
-        ):
-            raise LocalFailure("transport differs from the frozen campaign binding")
+        from .transports import select
+
+        self.profile = select(alias, binding, config=self.config)
+        self.cfg = self.profile.resolve(alias, self.config)
+        self.params = load_json(canonical(self.profile.validate_params(params)))
+        if self.cfg.params:
+            raise LocalFailure("implicit routing parameters are forbidden in qualification")
+        self.profile.validate_binding(binding, self.cfg, self.params)
         mode = frozen_credential_mode(binding)
         selected_mode = credential_mode if credential_mode is not None else ("dedicated" if dispatch else mode)
         if selected_mode != mode:
@@ -1030,16 +1150,13 @@ class PinnedRouter:
                 spec["alias"] != alias
                 or spec["model"] != self.cfg.model_id
                 or spec["upstream"] != self.params["upstream"]
-                or spec["endpoint"] != ENDPOINT + "/chat/completions"
-                or spec["generation_namespace"] != "openrouter"
+                or spec["endpoint"] != self.profile.ENDPOINT + "/chat/completions"
+                or spec["generation_namespace"] != self.profile.NAMESPACE
                 or spec.get("credential_fingerprint") != self.fingerprint
                 or frozen_credential_mode(spec) != mode
-                or not isinstance(spec.get("receipt_provider"), str)
-                or not spec["receipt_provider"].strip()
-                or not isinstance(spec.get("provider_identity_evidence"), str)
-                or not spec["provider_identity_evidence"].strip()
             ):
                 raise LocalFailure("schedule differs from the frozen transport identity")
+            self.profile.validate_attempt(spec, binding)
             coordinate = tuple(
                 spec.get(k) for k in ("contract", "version", "case_id", "repetition", "prompt_hash")
             )
@@ -1079,7 +1196,7 @@ class PinnedRouter:
             self.campaign.fail(self.served[case_id], message)
 
     def request(self, messages):
-        return request_body(self.cfg.model_id, self.params, self.contract, messages)
+        return self.profile.request_body(self.cfg.model_id, self.params, self.contract, messages)
 
     async def route_call(self, call_site_id, messages, **kwargs):
         case_id = self.case_id or self.prompts.get(digest(messages))
@@ -1118,16 +1235,7 @@ class PinnedRouter:
                     raise LocalFailure("unanswered")
                 answer = await self._send(attempt, expected)
             spec = row["spec"]
-            verify_routing(answer, spec)
-            if (
-                answer.get("model") != spec["model"]
-                or answer.get("upstream") != spec["upstream"]
-                or answer.get("response_provider") != spec["receipt_provider"]
-                or answer.get("http_status") != 200
-                or answer.get("error")
-                or not isinstance(answer.get("content"), str)
-            ):
-                raise LocalFailure("retained response is not verified evidence of the pinned model")
+            self.profile.verify_observation(answer, spec)
         except Exception as exc:
             failure = exc if isinstance(exc, LocalFailure) else LocalFailure(failure_message(exc))
             self.local[case_id or "<unmatched>"] = failure_message(failure)
@@ -1159,7 +1267,23 @@ class PinnedRouter:
             error.add_note("failure evidence append failed: " + exception_name(append_error))
 
     async def _send(self, attempt, expected):
-        secret = credential(self.credential_mode)
+        secret = self.profile.credential(self.credential_mode)
+        with private_logs(secrets=(secret,)):
+            try:
+                return await self._send_private(attempt, expected, secret)
+            except BaseException as exc:
+                if not isinstance(exc, Exception):
+                    exc.args = (failure_message(exc),)
+                    if getattr(exc, "__notes__", None):
+                        exc.__notes__ = [safe_text(note) for note in exc.__notes__]
+                    # Suppress explicit causes as well as implicit context while
+                    # preserving the original cancellation object and type.
+                    raise exc from None
+                # Nothing outside the explicit secret lifetime may re-render
+                # a provider/cleanup exception or its unredacted chained cause.
+                raise LocalFailure(failure_message(exc)) from None
+
+    async def _send_private(self, attempt, expected, secret):
         if hashlib.sha256(secret.encode()).hexdigest() != self.fingerprint:
             raise LocalFailure("qualification credential differs from frozen identity")
         info = (await key_status(secret, self.transport, required=str(self.required))
@@ -1173,26 +1297,13 @@ class PinnedRouter:
             spec = row["spec"]
             observed = {
                 **observation,
-                **_observed_identity(observation, spec),
+                **self.profile.observed_identity(observation, spec),
             }
             self.campaign.observe(attempt, observed)
-            verify_routing(observed, spec)
-            if (
-                observation["response_model"] != spec["model"]
-                or observation["response_provider"] != spec["receipt_provider"]
-                or observation["http_status"] != 200
-                or observation["error"]
-            ):
-                raise LocalFailure("provider observation is not verified pinned-model evidence")
+            self.profile.verify_observation(observed, spec)
 
-        body = self.params[route(self.contract)]
-        flat = {k: v for k, v in body.items() if k != "reasoning"}
-        extra = {
-            "provider": expected["provider"],
-            **({"reasoning": body["reasoning"]} if "reasoning" in body else {}),
-        }
         # Local client setup must succeed before an irreversible dispatch event.
-        handler = ObservedHTTPHandler(expected, secret, record, transport=self.transport)
+        handler = self.profile.HTTPHandler(expected, secret, record, transport=self.transport)
         dispatched = False
         try:
             if row.get("reserved_at") is None:
@@ -1207,7 +1318,7 @@ class PinnedRouter:
             dispatched = True
             self.required = total([self.required, Decimal(row["spec"]["max_charge"]).copy_negate()])
             try:
-                with private_logs(), scoped_credential(secret):
+                with self.profile.scoped_credential(secret):
                     result = await LiteLLMDelegate(self.config).call(
                         self.alias,
                         self.cfg.model_id,
@@ -1219,8 +1330,7 @@ class PinnedRouter:
                         failure_callback=[],
                         caching=False,
                         timeout=COMPLETION_TIMEOUT_S,
-                        extra_body=extra,
-                        **flat,
+                        **self.profile.delegate_kwargs(self.params, self.contract, expected),
                     )
                 if (
                     getattr(result, "success", None) is not True
@@ -1242,10 +1352,19 @@ class PinnedRouter:
                 if dispatched:
                     self._failure(attempt, cleanup)
                 if active is None or not isinstance(cleanup, Exception):
+                    active = cleanup
                     raise
+            finally:
+                if dispatched and active is not None and self.profile.finalize_on_failure:
+                    try:
+                        await self.profile.finalize(self.campaign, attempt, transport=self.transport,
+                                                    credential_mode=self.credential_mode)
+                    except BaseException as secondary:
+                        self._failure(attempt, secondary)
+                        active.add_note("native calculation also failed: " + exception_name(secondary))
         try:
-            await reconcile(self.campaign, attempt, transport=self.transport,
-                            credential_mode=self.credential_mode)
+            await self.profile.finalize(self.campaign, attempt, transport=self.transport,
+                                        credential_mode=self.credential_mode)
         except BaseException as exc:
             self._failure(attempt, exc)
             raise

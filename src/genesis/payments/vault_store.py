@@ -103,6 +103,15 @@ _HOST = re.compile(
 CARD_REF = re.compile(r"card_[0-9a-f]{12}")
 
 
+def _new_card_ref() -> str:
+    # Shape exempts card refs from the 12-digit rule; an all-digit tail would
+    # put a card-number-shaped run in audit rows and messages.
+    while True:
+        tail = secrets.token_hex(6)
+        if not tail.isdigit():
+            return "card_" + tail
+
+
 class VaultError(Exception):
     """A vault operation was refused. The message never carries a card value."""
 
@@ -775,7 +784,7 @@ def add_card(
             digest = hashlib.sha256(_read_small(pinned / IDENTITY)).hexdigest()
         except OSError as exc:
             raise VaultError(f"identity.key cannot be read ({exc.strerror})") from None
-        ref = "card_" + secrets.token_hex(6)
+        ref = _new_card_ref()
         # The row's identity and scope ride inside the authenticated blob, so a
         # blob copied to another row, or a row re-scoped in the clear, is caught
         # by whoever decrypts it.

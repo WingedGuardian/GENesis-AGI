@@ -1,0 +1,1 @@
+- The stranded-work detector no longer loses whole finding classes to "database is locked" while the server is busy: each class now takes the database's write slot before it reads, a class or blindness alert that still loses the lock is retried, and a final loss records which process held the lock.

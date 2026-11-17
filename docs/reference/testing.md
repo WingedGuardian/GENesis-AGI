@@ -89,9 +89,14 @@ parametrized cases make the collected item count higher still). The suite runs
 without external service dependencies -- Qdrant, Ollama, and LLM APIs are
 mocked in unit tests.
 
-**Runtime.** CI runs the suite FULLY SERIALLY. pytest-xdist is in the `[test]`
-extra (pinned in `.github/test-tools/requirements.txt`), but no CI job passes
-`-n` yet, and a local `-n` run is unsupported. MEASURED 2026-09-06 over the last 23 successful `main` runs, for
+**Runtime.** CI's `test` job runs the suite on four pytest-xdist workers
+(`-n 4 --dist=loadfile --max-worker-restart=0`; xdist is pinned in
+`.github/test-tools/requirements.txt`). MEASURED 2026-11-05 over 6 runs: the
+`Run tests` step's median was 33.35 min, against 117.0 serial, with the same
+test ids (62,766), and a 7.8 GB memory peak. A local `-n` run is unsupported:
+that peak is too much for a shared box, and the full-suite guard refuses it.
+The figures that follow are older serial ones, from a suite less than half its
+current size, MEASURED 2026-09-06 over the last 23 successful `main` runs, for
 the **`test` job specifically** (`gh api .../actions/runs/<id>/jobs`, name ==
 `test`): min 19m38s, median 29m22s, max 31m15s. Do not quote workflow-RUN
 duration here — it is ~20 minutes longer because it spans 12 sibling jobs plus
@@ -100,7 +105,9 @@ queue time, and it is not what any of the ceilings below bound.
 Two ceilings bound the suite, and they are different things:
 
 - `timeout = 600` in `pyproject.toml` is pytest-timeout's **per-test** limit —
-  one hung test is killed and the suite continues. It is NOT a suite budget.
+  with the thread method it ends the process that ran the hung test, so the
+  run stops (under `--max-worker-restart=0`, once the other workers finish
+  what they were handed). It is NOT a suite budget.
   It applies wherever `pytest-timeout` is installed: always in CI, and on an
   install once bootstrap's non-fatal step has installed the `[test]` extra
   (`install_runtime_extras`; a code-only deploy warns when it is missing).
@@ -108,8 +115,9 @@ Two ceilings bound the suite, and they are different things:
   holds the box-wide test lock until it is killed by hand.
 - `timeout-minutes: 180` on CI's `test` job bounds the whole job, for a hang
   the per-test timeout cannot catch. It must stay above (max job + one
-  per-test kill) — 31m15s + 10m ≈ 41m — or it would pre-empt the per-test
-  limit and make it dead code.
+  per-test kill), or it would pre-empt the per-test limit and make it dead
+  code. The serial job had reached 82-146 min by 2026-11-05; on four workers
+  the measured step took 31-48 min.
 
 The per-test cost of individual tests had never been measured; CI now prints
 `--durations=25` so the slowest are visible in every run's log. Read them
@@ -307,10 +315,26 @@ inherit it.
   memory hook as a child never posts to the live server.
 - `GENESIS_MCP_LOG_DIR` names a directory that does not exist, so importing the
   health MCP opens no log in the shared `~/tmp`.
+- `HOME` names a private directory for the whole session, created when the
+  plugin is imported (before any `genesis` module loads, so nothing binds the
+  real home first), with `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`
+  and `XDG_STATE_HOME` inside it. Anything resolved through `Path.home()`, `~`
+  or those variables (tokens, the Guardian's shared policy file, caches,
+  stamps, logs, `~/tmp` scratch, `~/.claude`, `~/.genesis`, `~/.ssh`,
+  `~/.aws`) lands there instead. It starts with only `tmp/`. It sits in the
+  real home's big-tmp directory (`GENESIS_BIG_TMP`, else `~/tmp`) where the
+  basetemp redirect applies, else in the default temp dir, and is removed at
+  the end of the run; a killed run's home ages out through the daily `~/tmp`
+  prune. The box lock and basetemp are placed with `HOME` set back to what it
+  was when the run started, so both keep their locations. `tests._live_fence.real_home()` names
+  the real home for a test that must use it, and `PLAYWRIGHT_BROWSERS_PATH`
+  keeps pointing at the real browser cache so the UI tests find their browser.
+  The run summary names the home, and any `genesis` module that was already
+  loaded when it was set (none is expected).
 - A test that sets its own value with `monkeypatch` still wins.
-- `GENESIS_LIVE_E2E=1` (the opt-in live tests) leaves `SECRETS_PATH` and the
-  credential variables in place, and the summary says so; the git, gh,
-  database, hook-URL and log settings still apply.
+- `GENESIS_LIVE_E2E=1` (the opt-in live tests) leaves `SECRETS_PATH`, the
+  credential variables and `HOME` in place, and the summary says so; the git,
+  gh, database, hook-URL and log settings still apply.
 - The closure's directory is removed at the end of the run; a child that
   outlives pytest is left with paths that do not exist, so no credentials.
 - Not covered:
@@ -320,11 +344,19 @@ inherit it.
     `*_BEARER*`, a bare `*_KEY` or `*_PWD`, a DSN, a credential embedded in a
     URL value (`DATABASE_URL`, `HTTP_PROXY`), or a variable pointing at a
     credential file (`AWS_PROFILE`, `DOCKER_CONFIG`, `NETRC`, `KUBECONFIG`);
-  - credentials a program finds through the home directory rather than the
-    environment (`~/.ssh`, tool config files);
-  - a child started with an environment that does not carry these variables,
-    including tests that strip every `GIT_*` variable from a child (its git
-    then reads the home's user config again);
+  - a path resolved from the password database rather than `HOME` (OpenSSH
+    finds `~/.ssh` that way), and a child started with an environment that has
+    no `HOME` at all (Python and bash then fall back to the real home);
+  - an explicit `GENESIS_HOME` a test or the environment sets, and an explicit
+    `GENESIS_BIG_TMP`, which `big_tmp_dir()` keeps using as given;
+  - other variables that already hold a path under the real home when the
+    run starts (a plugin's data directory, a session socket): they are
+    passed through unchanged;
+  - `tempfile` output, which goes to `TMPDIR` (on some installs a directory in
+    the real home);
+  - a child started with an environment that does not carry these variables
+    (a test that strips every `GIT_*` variable from a child still leaves it
+    the private `HOME`, so its git reads only the empty test home's config);
   - a repository-local `core.askPass` or `credential.helper`.
 
 ### The outbound fence: tests never connect to a live service
@@ -385,6 +417,54 @@ IPv6 link-local scope id, which `/proc/net/tcp6` does not record, so two
 listeners with the same link-local address on different interfaces are judged
 as one.
 
+### The write audit: writes into the real home are reported
+
+`tests/_live_writes.py`, armed last, reports (never fails) the writes a test
+makes into the real home outside its temp dirs, for the operations it hooks: `open` with write intent,
+`os.remove`/`rename`/`replace`/`mkdir`/`rmdir`/`truncate`/`symlink`/`link`,
+`shutil.rmtree`, and an SQLite connect to a file that is not opened read-only.
+It also reports reads of the real credential files (the deployed `secrets.env`,
+`~/.claude/.credentials.json`, `~/.config/gh/hosts.yml`,
+`~/.genesis/cc_oauth_token.env`).
+
+- Allowed, so never reported: `tempfile.gettempdir()`, pytest's basetemp, the
+  box lock file, `/dev`, and `__pycache__` / `.pytest_cache` directories.
+- Each write is classed by where it lands (the deployed checkout, this checkout,
+  `~/.genesis`, `~/.claude`, elsewhere in the home) and attributed to the test.
+- The run summary counts tests per class under "writes outside the test's temp
+  dirs"; `GENESIS_LIVE_WRITES_REPORT=<file>` writes one tab-separated line per
+  (test, class, operation, path), on every run.
+- Hits are pre-operation classifications of audit events, not proof that a
+  syscall completed. Simple known no-ops (`mkdir(exist_ok=True)` on an existing
+  directory, `unlink` of a missing file, reopening an existing file without
+  writing) are filtered, but an operation the kernel refuses can still be
+  reported, and some aliases can be missed (tracked in #4193). A relative
+  `os.open` is judged against the cwd and labelled so (its audit event carries no
+  `dir_fd`). Writes during collection count as "outside any test".
+- Not covered: writes made by child processes, writes without an audit event,
+  metadata changes (`chmod`, `utime`, `setxattr`, `touch` of an existing file),
+  `mkfifo`/`mknod`, SQLite writes through an already-open connection, and
+  `file://localhost` or percent-encoded SQLite URIs. The OS-level sandbox is the
+  boundary there.
+
+The list it produces is the to-do list for moving each such test under its own
+`tmp_path`. Keep it report-only while the #4193 accuracy gaps are corrected:
+enforcement requires a corrected audit and a complete empty CI census, which a
+selected local run cannot establish.
+
+Generated session MCP configs are isolated by the function-scoped autouse fixture
+in `tests/_session_config.py`, registered by the root conftest. It redirects only
+the builder's generated-output directory to each test's `tmp_path`: generation,
+profile filtering, template reads, repository-root substitution and cache reuse
+remain real. Its independent monkeypatch survives a test undoing its own patches.
+Each test starts with a cold output directory, including on separate xdist workers.
+This fixture does not cover generation during collection, broader-scoped fixture
+setup or child processes; those callers must explicitly own their output paths.
+The bounded-output hook tests that exercise recall use a real temporary SQLite
+database and migration marker, rather than pointing SQLite at a test source file.
+These fixture fixes do not enable write-audit enforcement or establish that the
+full-suite census is empty.
+
 ## Shared MCP qualification environments
 
 Ordinary CI keeps its existing runtime dependency ranges. The shared-only
@@ -409,7 +489,7 @@ They also exercise path/abstract readiness datagrams after bind and cleanup on
 failed notification, bind failure and shutdown requested during startup. The
 memory notification-failure case checks its actual provider/cache closers.
 Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
-and a floor of 100 cases. Installation, collection, test or report-check failure
+and a floor of 104 cases. Installation, collection, test or report-check failure
 fails the job; missing or filtered workflow runs do not qualify a PR. Closing
 checks its actual head/base result. Ordinary skip-budget changes require observed
 skip identities; this workflow does not raise that budget automatically.

@@ -976,3 +976,105 @@ class TestReflectionHeartbeatThreshold:
         assert result["reflection"]["status"] == "alive"
         # ~30 min old: older than the OLD 1200s threshold, well under the new 4h.
         assert 1700 < result["reflection"]["age_seconds"] < 1900
+
+
+class TestStandaloneSurplusLiveness:
+    """#4072: the standalone MCP has no runtime, so surplus liveness comes from
+    the in-memory pulse the server writes into status.json, gated by the file's
+    own age. Before this, every standalone read reported liveness_error=True."""
+
+    @pytest.fixture(autouse=True)
+    def _no_runtime(self):
+        from genesis.runtime._core import GenesisRuntime
+
+        original = GenesisRuntime._instance
+        GenesisRuntime._instance = None
+        yield
+        GenesisRuntime._instance = original
+
+    @staticmethod
+    def _write(
+        tmp_path: Path, *, written_min_ago: float, pulse_min_ago: float | None, paused: bool = False
+    ) -> Path:
+        from datetime import UTC, datetime, timedelta
+
+        now = datetime.now(UTC)
+        data = {
+            "timestamp": (now - timedelta(minutes=written_min_ago)).isoformat(),
+            "resilience_state": {},
+            "queue_depths": {},
+            "paused_state": {"is_paused": paused, "reason": None, "since": None},
+        }
+        if pulse_min_ago is not None:
+            data["liveness_pulses"] = {
+                "surplus_dispatch": (now - timedelta(minutes=pulse_min_ago)).isoformat(),
+            }
+        path = tmp_path / "status.json"
+        path.write_text(json.dumps(data))
+        return path
+
+    async def _surplus(self, path: Path, db) -> dict:
+        from genesis.mcp.standalone_health import StandaloneHealthDataService
+
+        return (await StandaloneHealthDataService(status_path=path, db=db).snapshot())["surplus"]
+
+    async def test_fresh_status_file_confirms_liveness(self, tmp_path, db) -> None:
+        surplus = await self._surplus(
+            self._write(tmp_path, written_min_ago=0.2, pulse_min_ago=1), db
+        )
+        assert surplus["liveness_error"] is False
+        assert surplus["stalled"] is False
+        assert surplus["last_success_at"] is not None
+
+    async def test_stale_status_file_is_unavailable(self, tmp_path, db) -> None:
+        surplus = await self._surplus(
+            self._write(tmp_path, written_min_ago=10, pulse_min_ago=1), db
+        )
+        assert surplus["liveness_error"] is True
+
+    async def test_stale_file_frozen_while_paused_is_unavailable(self, tmp_path, db) -> None:
+        path = self._write(tmp_path, written_min_ago=10, pulse_min_ago=600, paused=True)
+        surplus = await self._surplus(path, db)
+        assert surplus["liveness_error"] is True
+
+    async def test_real_writer_to_real_reader_round_trip(self, tmp_path, db, monkeypatch) -> None:
+        """The writer and reader share only key names; drive the REAL
+        StatusFileWriter into the REAL standalone reader so a rename on either
+        side fails here instead of silently reverting #4072."""
+        from datetime import UTC, datetime
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        import genesis.runtime as runtime_pkg
+        from genesis.resilience.state import ResilienceStateMachine
+        from genesis.resilience.status_writer import StatusFileWriter
+
+        pulse = datetime.now(UTC).isoformat()
+        rt = MagicMock()
+        rt.job_health = {"surplus_dispatch": {"last_run": pulse, "last_success": pulse}}
+        # The writer reads the pause flag from GenesisRuntime.instance().
+        fake_instance = SimpleNamespace(
+            paused=False,
+            pause_reason=None,
+            paused_since=None,
+            heavy_workload=False,
+            _bootstrap_completed_at=None,
+        )
+        monkeypatch.setattr(
+            runtime_pkg.GenesisRuntime, "instance", classmethod(lambda cls: fake_instance)
+        )
+        path = tmp_path / "status.json"
+        await StatusFileWriter(
+            state_machine=ResilienceStateMachine(), runtime=rt, path=str(path)
+        ).write()
+
+        surplus = await self._surplus(path, db)
+        assert surplus["liveness_error"] is False
+        assert surplus["liveness_source"] == "status_file"
+        assert surplus["last_success_at"] == pulse
+
+    async def test_older_server_without_pulse_is_unavailable(self, tmp_path, db) -> None:
+        surplus = await self._surplus(
+            self._write(tmp_path, written_min_ago=0.2, pulse_min_ago=None), db
+        )
+        assert surplus["liveness_error"] is True

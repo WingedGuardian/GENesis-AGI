@@ -394,10 +394,12 @@ async def test_delivered_bulk_hold_stamps_prospect_contacted(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_delivered_financial_misclassified_pitch_still_stamps(db):
+async def test_delivered_financial_misclassified_pitch_still_stamps(db, monkeypatch):
     """Provenance is RECIPIENT-based, NOT cell_risk_class: a cold pitch whose body
     tripped the money-pattern classifier holds as FINANCIAL (not BULK), but on
-    delivery to a curated prospect it must STILL stamp them — else re-pitched."""
+    delivery to a curated prospect it must STILL stamp them — else re-pitched.
+    The lever is armed: a prospect send pauses while marketing is off."""
+    monkeypatch.setattr(egw, "_marketing_mode", lambda: "live")
     from genesis.db.crud import marketing_prospects as mp
 
     await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
@@ -529,3 +531,288 @@ async def test_owner_success_gated_on_mark_sent_claim(db, monkeypatch):
     assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
     cell = await cg.get_cell(db, "email", "send", "bulk")
     assert cell["successes"] == 0  # not claimed → success not recorded (no double-count)
+
+
+# --------------------------------------------------------------------------- #
+# Rejecting a marketing-posture hold. The gate holds a send to a curated
+# prospect on a GRANTED cell for posture reasons (a reply, an opt-out, a lever
+# that is not `live`). The owner declining that one send says nothing about the
+# cell's competence, so it must not cost the grant.
+
+
+async def _grant(db, risk):
+    from genesis.autonomy.types import CellEvent
+
+    for event in (CellEvent.CLASSIFY, CellEvent.APPROVE):
+        await cg.apply_event(
+            db,
+            origin_class="first_party",
+            domain="email",
+            verb="send",
+            risk_class=risk,
+            event=event,
+            updated_at=_TS,
+        )
+
+
+async def _prospect(db, email):
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id=f"prospect-{email}", email=email, created_at=_TS, updated_at=_TS)
+
+
+@pytest.mark.parametrize("status", ["rejected", "cancelled"])
+@pytest.mark.asyncio
+async def test_rejecting_a_posture_hold_keeps_the_grant(db, monkeypatch, status):
+    # The real gate makes the hold: a cold follow-up to a prospect, IDENTITY
+    # granted, lever at `observe`. The owner rejects it; the drain must leave the
+    # grant as it was.
+    from genesis.autonomy.email_gate import EmailAutonomyGate
+    from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+    monkeypatch.setattr("genesis.outreach.marketing_config.effective_mode", lambda: "observe")
+    await _grant(db, "identity")
+    await _prospect(db, "known@example.com")
+    mgr = ApprovalManager(db=db)
+    gate = EmailAutonomyGate(db=db, approval_manager=mgr, event_bus=None)
+    req = OutreachRequest(
+        category=OutreachCategory.BLOCKER,
+        topic="bump",
+        context="body",
+        salience_score=0.5,
+        channel="email",
+        validated_recipient="known@example.com",
+        thread_id="t-unanswered",
+    )
+    decision = await gate.check(request=req, recipient="known@example.com", message_text="bump")
+    assert decision.allow is False
+    assert await mgr.resolve(decision.request_id, status=status)
+
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert pipe.calls == []  # never sent
+    assert (await pes.get_by_id(db, decision.pending_id))["status"] == "rejected"
+    cell = await cg.get_cell(db, "email", "send", "identity")
+    assert cell["state"] == "granted"
+    assert cell["corrections"] == 0
+
+
+@pytest.mark.asyncio
+async def test_rejecting_a_prospect_hold_on_an_ungranted_cell_still_corrects(db):
+    # Control: a hold made because the cell is not granted is the ordinary
+    # approval loop, and its rejection stays a correction.
+    await _prospect(db, "known@example.com")
+    rid = await _approval(db, status="rejected")
+    await _bulk_hold_for(
+        db, prospect_email="known@example.com", rid=rid, cell_risk_class="identity", pid="pi"
+    )
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert (await pes.get_by_id(db, "pi"))["status"] == "rejected"
+    assert (await cg.get_cell(db, "email", "send", "identity"))["corrections"] == 1
+
+
+@pytest.mark.asyncio
+async def test_rejecting_a_financial_hold_to_a_prospect_still_corrects(db):
+    # Control: the financial hardline is never a posture hold, whatever state
+    # its cell is in. A financial cell cannot be granted through the API, so
+    # the state is forced, as hand-edited or legacy data would have it.
+    from genesis.autonomy.types import CellEvent
+
+    await cg.apply_event(
+        db,
+        origin_class="first_party",
+        domain="email",
+        verb="send",
+        risk_class="financial",
+        event=CellEvent.CLASSIFY,
+        updated_at=_TS,
+    )
+    await db.execute(
+        "UPDATE capability_grants SET state = 'granted' "
+        "WHERE domain = 'email' AND verb = 'send' AND risk_class = 'financial'"
+    )
+    await db.commit()
+    assert (await cg.get_cell(db, "email", "send", "financial"))["state"] == "granted"
+    await _prospect(db, "known@example.com")
+    rid = await _approval(db, status="rejected")
+    await _bulk_hold_for(
+        db, prospect_email="known@example.com", rid=rid, cell_risk_class="financial", pid="pf"
+    )
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert (await cg.get_cell(db, "email", "send", "financial"))["corrections"] == 1
+
+
+@pytest.mark.asyncio
+async def test_rejecting_a_non_prospect_hold_on_a_granted_cell_still_corrects(db):
+    # Control: the exemption needs BOTH a curated prospect and a granted cell.
+    await _grant(db, "standard")
+    rid = await _approval(db, status="rejected")
+    await _hold(db, pid="p1", rid=rid)  # a@b.c is nobody's prospect
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    cell = await cg.get_cell(db, "email", "send", "standard")
+    assert cell["state"] == "ask"
+    assert cell["corrections"] == 1
+
+
+@pytest.mark.asyncio
+async def test_approved_hold_to_opted_out_prospect_in_display_form_is_refused(db):
+    # The approved-send opt-out check reads the address the same way the gate
+    # does: a "Name <addr>" recipient must not slip past it.
+    from genesis.db.crud import marketing_prospects as mp
+
+    await _prospect(db, "gone@example.com")
+    await mp.mark_opted_out(db, "prospect-gone@example.com", opted_out_at=_TS)
+    rid = await _approval(db, status="approved")
+    await _bulk_hold_for(
+        db,
+        prospect_email="Gone Person <gone@example.com>",
+        rid=rid,
+        cell_risk_class="identity",
+        pid="pg",
+    )
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert pipe.calls == []  # not delivered
+    assert (await pes.get_by_id(db, "pg"))["status"] == "rejected"
+
+
+# ── Kill-switch and contact stamp for prospect sends on any cell (owner 2026-11-13) ──
+
+
+async def _prospect_hold(db, *, rid, recipient, risk_class, pid="pp"):
+    await pes.create(
+        db,
+        id=pid,
+        request_id=rid,
+        validated_recipient=recipient,
+        category="notification",
+        message="follow-up",
+        held_at=_TS,
+        cell_domain="email",
+        cell_verb="send",
+        cell_risk_class=risk_class,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("risk_class", ["identity", "standard", "financial"])
+async def test_approved_prospect_hold_on_any_cell_pauses_while_marketing_is_off(db, risk_class):
+    """The marketing stop covers every send to a curated prospect, approved or not,
+    whatever its class: with the lever off (the shipped default here) an approved
+    hold addressed in display form is left held, approval unconsumed, nothing sent."""
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await _prospect_hold(
+        db, rid=rid, recipient="Prospect <prospect@example.com>", risk_class=risk_class
+    )
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 0
+    assert pipe.calls == []
+    assert (await pes.get_by_id(db, "pp"))["status"] == "held"
+    assert (await ac.get_by_id(db, rid))["consumed_at"] is None
+    assert (await mp.get_by_id(db, "prospect"))["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_approved_prospect_hold_sends_when_armed_and_stamps_display_form(db, monkeypatch):
+    """With the lever armed the approved hold goes out, and a prospect addressed as
+    `Name <addr>` is stamped contacted, so the campaign does not pitch it again."""
+    monkeypatch.setattr(egw, "_marketing_mode", lambda: "observe")
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await _prospect_hold(
+        db, rid=rid, recipient="Prospect <prospect@example.com>", risk_class="identity"
+    )
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert pipe.calls == [("pp", "hi")]
+    assert (await mp.get_by_id(db, "prospect"))["status"] == "contacted"
+    assert await mp.list_active(db) == []
+
+
+class _PartlyRefusedPipeline(_FakePipeline):
+    """Delivered, but the server refused some recipients (a partly accepted send)."""
+
+    def __init__(self, refused):
+        super().__init__(OutreachStatus.DELIVERED)
+        self._refused = tuple(refused)
+
+    async def deliver_approved(self, row, *, subject=None):
+        self.calls.append((row["id"], subject))
+        return OutreachResult(
+            outreach_id="o",
+            status=OutreachStatus.DELIVERED,
+            channel="email",
+            message_content="",
+            refused_recipients=self._refused,
+        )
+
+
+@pytest.mark.asyncio
+async def test_partly_refused_delivery_stamps_only_accepted_prospects(db, monkeypatch):
+    """A list send the server partly refused is DELIVERED, but the refused
+    prospect was never emailed: it stays active, and only the accepted one is
+    stamped contacted."""
+    monkeypatch.setattr(egw, "_marketing_mode", lambda: "observe")
+    from genesis.db.crud import marketing_prospects as mp
+
+    for pid, email in (("p1", "one@example.com"), ("p2", "two@example.com")):
+        await mp.create(db, id=pid, email=email, created_at=_TS, updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await _prospect_hold(
+        db, rid=rid, recipient="One <one@example.com>, Two <two@example.com>",
+        risk_class="identity",
+    )
+    pipe = _PartlyRefusedPipeline(["two@example.com"])
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert (await pes.get_by_id(db, "pp"))["status"] == "sent"
+    assert (await mp.get_by_id(db, "p1"))["status"] == "contacted"
+    assert (await mp.get_by_id(db, "p2"))["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_non_prospect_hold_is_untouched_by_the_marketing_stop(db):
+    """Control: an approved IDENTITY send to someone who is not a prospect is
+    delivered with the lever off."""
+    rid = await _approval(db, status="approved")
+    await _prospect_hold(db, rid=rid, recipient="Colleague <colleague@example.com>", risk_class="identity")
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert pipe.calls == [("pp", "hi")]
+
+
+@pytest.mark.asyncio
+async def test_prospect_lookup_failure_pauses_rather_than_sends(db, monkeypatch):
+    """Fail safe: if the prospect lookup errors, the kill-switch treats the row as
+    marketing and pauses it (left held, retried next drain) with the lever off."""
+    from genesis.db.crud import marketing_prospects as mp
+
+    rid = await _approval(db, status="approved")
+    await _prospect_hold(db, rid=rid, recipient="someone@example.com", risk_class="identity")
+    real = mp.find_in_recipient
+    calls = {"n": 0}
+
+    async def _flaky(db_, recipient):
+        calls["n"] += 1
+        # The opt-out re-check above calls it first; fail only the kill-switch lookup.
+        if calls["n"] >= 2:
+            raise RuntimeError("simulated lookup failure")
+        return await real(db_, recipient)
+
+    monkeypatch.setattr(mp, "find_in_recipient", _flaky)
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 0
+    assert pipe.calls == []
+    assert (await pes.get_by_id(db, "pp"))["status"] == "held"

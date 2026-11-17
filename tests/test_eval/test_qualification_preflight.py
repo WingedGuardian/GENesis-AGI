@@ -53,7 +53,7 @@ async def test_mutating_any_original_column_is_detected(tmp_path, monkeypatch, f
     "person_id", "scenario", "tools_used", "context_tags", "failure_count", "failure_modes",
     "last_used", "last_validated", "deprecated_reason", "superseded_by", "invocation_count",
     "attempted_workarounds", "version", "tool_trigger", "promotion_history", "surfaced_count",
-    "extraction_context", "first_mover", "trigger_spec", "lesson",
+    "extraction_context", "first_mover", "trigger_spec", "lesson", "created_session_id",
 ])
 async def test_every_new_row_semantic_column_is_verified(tmp_path, monkeypatch, path, field):
     create = contracts.procedural.create

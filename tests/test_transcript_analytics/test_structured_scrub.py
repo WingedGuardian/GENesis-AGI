@@ -184,3 +184,33 @@ def test_duplicate_identity_and_credential_keys_have_same_preservation_rule():
         + ',"id":"harmless","password":"synthetic-value","password":"other"}'
     )
     assert failed and text is None
+
+
+@pytest.mark.parametrize(
+    "raw, secret",
+    [
+        # A quoted span the scrubber changes, ending in a credential label whose
+        # separator and value follow the span. Hiding the span behind a
+        # placeholder hid the label from the whole-text pass.
+        ('"password=abcd cookie"=SESSIONSECRET9', "SESSIONSECRET9"),
+        ("\"--password 'hunter2x' cookie\"=abcSESSION9", "abcSESSION9"),
+        ('"curl -u bob:pw4567 cookie"=abcSESSION9', "abcSESSION9"),
+        ('"--token \\"api_key"=SECRETVALUE1234', "SECRETVALUE1234"),
+    ],
+)
+def test_label_ending_a_scrubbed_span_still_redacts_the_value_after_it(raw, secret):
+    text, failed = scrub.scrub_text(raw)
+    assert not failed
+    assert secret not in text
+
+
+def test_boundary_probe_runs_after_the_prose_pass_so_it_cannot_eat_a_label():
+    # The protected span (it holds a token) ends in 'cookie"'; the text after it
+    # carries a second label whose value is on the next line. Probing before the
+    # prose pass redacted 'cookie's value, swallowing the second label, and the
+    # next-line value leaked; main's own prose pass redacts it.
+    token = "sk-" + "a" * 24
+    raw = f'"{token} cookie"=--http-password authorization"=\r\nSECRETNEXTLINE9'
+    text, failed = scrub.scrub_text(raw)
+    assert not failed
+    assert token not in text and "SECRETNEXTLINE9" not in text

@@ -53,6 +53,30 @@ def test_queue_alert_writes_valid_v1_json(tmp_path):
     assert e["meta"] == {}
 
 
+def test_queue_alert_try_carries_an_optional_meta_object(tmp_path):
+    root = tmp_path / "queue"
+    r = _run_bash(
+        """queue_alert_try info watchgod:disk "t" "b" "k" '{"answers_pages":["p"],"episode_start":5}'""",
+        {"GENESIS_ALERT_QUEUE_ROOT": str(root)},
+    )
+    assert r.returncode == 0, r.stderr
+    (e,) = _entries(root)
+    assert e["meta"] == {"answers_pages": ["p"], "episode_start": 5}
+
+
+def test_a_meta_that_is_not_an_object_fails_the_enqueue(tmp_path):
+    """A reader may gate on meta, so a bad one fails loudly rather than being
+    written as an empty, ungated meta."""
+    root = tmp_path / "queue"
+    for bad in ("'[1]'", "'not json'"):
+        r = _run_bash(
+            f'if queue_alert_try info s "t" "b" "k" {bad}; then echo QUEUED; else echo FAILED; fi',
+            {"GENESIS_ALERT_QUEUE_ROOT": str(root)},
+        )
+        assert r.stdout.strip() == "FAILED", (bad, r.stdout, r.stderr)
+    assert _entries(root) == []
+
+
 def test_queue_alert_survives_quotes_and_newlines(tmp_path):
     root = tmp_path / "queue"
     body = "has \"double\" and 'single' quotes\nand a newline"

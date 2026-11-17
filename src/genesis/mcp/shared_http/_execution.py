@@ -64,13 +64,16 @@ class SharedMessages(Middleware):
         caller = authenticated_caller(get_http_request().scope)
         tools = await call_next(context)
         enabled = self.enabled() is True
-        return [tool for tool in tools if self.catalog.allowed(tool.name, caller, enabled=enabled)]
+        return [tool for tool in tools
+                if self.catalog.allowed(tool.name, caller, enabled=enabled) and self.catalog.binds(tool.name, tool)]
 
     async def on_call_tool(self, context, call_next):
         # Use validated metadata, never a lost-scope/default CallerContext as
         # evidence of a forwarder role. Discovery/cancel never borrow a token.
         caller = authenticated_caller(get_http_request().scope)
-        if not self.catalog.allowed(context.message.name, caller, enabled=self.enabled() is True):
+        name = context.message.name
+        if (not self.catalog.allowed(name, caller, enabled=self.enabled() is True)
+                or not self.catalog.binds(name, await context.fastmcp_context.fastmcp.get_tool(name))):
             raise ToolError("Tool unavailable in this shared service")
         token = object()
         try:

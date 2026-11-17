@@ -335,8 +335,11 @@ def snapshot_path() -> Path:
     return _snapshot_dir() / name
 
 
-def capture_and_write(target: Path, db_path: Path, context: dict) -> None:
-    """Capture, write ``target`` atomically, prune the directory. Blocking."""
+def capture_and_write(target: Path, db_path: Path, context: dict) -> dict:
+    """Capture, write ``target`` atomically, prune the directory. Blocking.
+
+    Returns the snapshot it wrote, for a caller that wants to quote it (the
+    zero-drop worker puts ``writer_pids`` in its log line)."""
     # Imported here, not at module top: genesis.observability's package init
     # pulls in aiohttp (~250 ms), and genesis.db.connection imports this
     # module, so a top-level import taxed every hook that opens the DB.
@@ -348,6 +351,7 @@ def capture_and_write(target: Path, db_path: Path, context: dict) -> None:
     atomic_write_text(target, json.dumps(snapshot, indent=1), encoding="utf-8")
     # Same retention rule as pid_snapshots (7 days, 20 MB), applied to this directory.
     prune_snapshot_dir(target.parent, time.time())
+    return snapshot
 
 
 def _capture_quietly(target: Path, db_path: Path, context: dict) -> None:

@@ -56,6 +56,11 @@ claim about relevance, distinguish:
 - **Constraint-conflicted** — a stated user boundary (privacy, employer policy,
   budget, time, platform, or explicit preference) materially limits the value.
 
+Read the source on its own terms first: distinctive method, demonstrated versus
+claimed value, limitations and relevant maturity/license facts. Carry the above
+evidence status into the recommendation and any durable finding or observation;
+an inferred connection must not become an established user interest later.
+
 The act of saving an item is evidence of attention, not evidence of agreement,
 priority, relevance strength, or adoption intent. Likewise, absence from the
 user model is not evidence of irrelevance. Keep these two directions separate.
@@ -120,6 +125,13 @@ Rules:
   tags. When invoked standalone, the `**Timeline:** / **Relevance:**` line
   above serves as the human-readable quick-scan version. When invoked from
   the inbox (INBOX_EVALUATE.md template), only the YAML block appears.
+
+### Evidence
+
+{Concise model-reported record: source claim and a short supporting quote from
+acquired text (prefix each quoted line with `> `), or the acquisition limitation;
+specific user evidence, with inferred fit, unknowns and constraints labelled.
+This is not mechanical verification; saving alone supplies no personal fact.}
 
 ### What This Is
 

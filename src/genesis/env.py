@@ -179,14 +179,12 @@ def venv_path() -> Path:
 
 
 def secrets_path() -> Path:
-    value = os.environ.get("SECRETS_PATH")
-    if value:
-        resolved = Path(value).expanduser()
-        logger.debug("secrets_path: SECRETS_PATH override → %s", resolved)
-        return resolved
-    genesis_path = repo_root() / "secrets.env"
-    logger.debug("secrets_path: genesis repo → %s", genesis_path)
-    return genesis_path
+    """The credentials file this process reads (order: ``genesis.secrets_location``)."""
+    from genesis.secrets_location import resolve
+
+    resolved = resolve(environ=os.environ, repo_root=repo_root())
+    logger.debug("secrets_path → %s", resolved)
+    return resolved
 
 
 def genesis_db_path() -> Path:
@@ -505,6 +503,24 @@ def sqlite_slow_ms() -> int:
     decides what is LOGGED — it never changes how a statement runs.
     """
     raw = os.environ.get("GENESIS_SQLITE_SLOW_MS", "").strip()
+    if not raw:
+        return 1000
+    try:
+        return int(raw)
+    except ValueError:
+        return 1000
+
+
+def sqlite_txn_hold_ms() -> int:
+    """Threshold (ms) at which a shared connection's write transaction, held
+    open from its first write to its commit or rollback, is logged
+    (``genesis.db._txn_hold``; default 1000).
+
+    Overridable via ``GENESIS_SQLITE_TXN_HOLD_MS``; ``0`` or a negative value
+    turns it off. Missing or non-integer values fall back to the default. It
+    only decides what is LOGGED — it never changes how a transaction runs.
+    """
+    raw = os.environ.get("GENESIS_SQLITE_TXN_HOLD_MS", "").strip()
     if not raw:
         return 1000
     try:

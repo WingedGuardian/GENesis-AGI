@@ -180,6 +180,17 @@ async def _store_as_is(
     if context:
         tags.append("user-context")
 
+    # #2426: an uploaded file is never stored as a credential reference. The
+    # vector below is written BEFORE the database row, so refuse here, before
+    # anything is written, rather than at the db layer's refusal afterwards.
+    from genesis.db.crud.knowledge import holds_secret
+
+    if holds_secret(project_type, effective_domain):
+        raise ValueError(
+            "refusing to store an upload as a credential reference: use "
+            "reference_store, which holds the value out (#2426)"
+        )
+
     # Store to Qdrant
     # WS-3: curated ingest is external_untrusted (authority tier, not
     # authorship); derived once, mirrored to both stores.
@@ -188,42 +199,45 @@ async def _store_as_is(
     resolved_origin = derive_origin_class(
         source_pipeline="curated", collection="knowledge_base",
     )
-    qdrant_id = await memory_mod._store.store(
-        file_content,
-        f"knowledge:{project_type}/{effective_domain}",
-        memory_type="knowledge",
-        collection="knowledge_base",
-        tags=tags,
-        confidence=0.95,
-        auto_link=False,
-        source_pipeline="curated",
-        origin_class=resolved_origin,
-    )
+    from genesis.knowledge.lifetime import writer
 
-    # Store to SQLite
-    await knowledge_crud.insert(
-        memory_mod._db,
-        id=unit_id,
-        project_type=project_type,
-        domain=effective_domain,
-        source_doc=file_path,
-        concept=concept,
-        body=file_content,
-        relationships=None,
-        caveats=json.dumps([f"User context: {context}"]) if context else None,
-        tags=json.dumps(tags),
-        confidence=0.95,
-        ingested_at=now_iso,
-        qdrant_id=qdrant_id,
-        section_title=None,
-        source_date=None,
-        embedding_model=embedding_model,
-        source_pipeline="curated",
-        purpose=purpose_json,
-        ingestion_source=file_path,
-        origin_class=resolved_origin,
-        _commit=True,
-    )
+    async with writer(memory_mod._db):
+        qdrant_id = await memory_mod._store.store(
+            file_content,
+            f"knowledge:{project_type}/{effective_domain}",
+            memory_type="knowledge",
+            collection="knowledge_base",
+            tags=tags,
+            confidence=0.95,
+            auto_link=False,
+            source_pipeline="curated",
+            origin_class=resolved_origin,
+        )
+
+        # Store to SQLite
+        await knowledge_crud.insert(
+            memory_mod._db,
+            id=unit_id,
+            project_type=project_type,
+            domain=effective_domain,
+            source_doc=file_path,
+            concept=concept,
+            body=file_content,
+            relationships=None,
+            caveats=json.dumps([f"User context: {context}"]) if context else None,
+            tags=json.dumps(tags),
+            confidence=0.95,
+            ingested_at=now_iso,
+            qdrant_id=qdrant_id,
+            section_title=None,
+            source_date=None,
+            embedding_model=embedding_model,
+            source_pipeline="curated",
+            purpose=purpose_json,
+            ingestion_source=file_path,
+            origin_class=resolved_origin,
+            _commit=True,
+        )
 
     logger.info("Stored %s as single unit %s (store-as-is mode)", filename, unit_id)
     return [unit_id]

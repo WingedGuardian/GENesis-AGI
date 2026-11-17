@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -13,6 +14,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from code_intel_cbm_admission import _mount_path, number, resolve_cgroup
+from code_intel_cbm_worker import qualified_release
 from managed_units import stamp
 
 
@@ -455,16 +457,15 @@ def config_path(raw: str) -> Path:
     return absolute(str(path.parent.resolve() / path.name))
 
 
-def cgroup_empty(control: str) -> None:
-    if not control:
-        return
+def resolve_control_group(control: str) -> tuple[Path, Path, int]:
+    """Map an existing manager ControlGroup through the visible v2 namespace."""
     path = absolute(control)
     if ".." in path.parts:
         raise ValueError("invalid managed ControlGroup")
     mountinfo = Path("/proc/self/mountinfo")
     _, root, version = resolve_cgroup(Path("/proc/self/cgroup"), mountinfo)
     if version != 2:
-        raise ValueError("uninstall requires visible cgroup v2 state")
+        raise ValueError("managed observation requires visible cgroup v2 state")
     mappings = []
     for row in mountinfo.read_text().splitlines():
         left, separator, right = row.partition(" - ")
@@ -481,6 +482,13 @@ def cgroup_empty(control: str) -> None:
     mounted = mappings[0]
     relative = path.relative_to(mounted) if path.is_relative_to(mounted) else path.relative_to("/")
     group = root / relative
+    return group, root, version
+
+
+def cgroup_empty(control: str) -> None:
+    if not control:
+        return
+    group, _, _ = resolve_control_group(control)
     try:
         values = dict(line.split() for line in (group / "cgroup.events").read_text().splitlines())
     except FileNotFoundError:
@@ -538,9 +546,10 @@ def validate_provider_paths(config: dict) -> None:
             raise ValueError(f"pinned provider does not support backslash in {key} paths")
 
 
-def native_env(config: dict) -> dict[str, str]:
+def native_env(config: dict, *, environment=None) -> dict[str, str]:
     validate_provider_paths(config)
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CBM_")}
+    selected = os.environ if environment is None else environment
+    env = {k: v for k, v in selected.items() if not k.startswith("CBM_")}
     env.update(
         CBM_CACHE_DIR=config["cache"],
         CBM_RUNTIME_DIR=config["runtime"],
@@ -612,6 +621,38 @@ def verify_binary_access(fd: int, *, execute: bool) -> None:
     if (not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111
             or (execute and not os.access(f"/proc/self/fd/{fd}", os.X_OK, effective_ids=True))):
         raise ValueError("managed binary must be a regular executable")
+
+
+def open_qualified_binary(path: Path, expected_build: str | None = None, *, execute: bool = True):
+    """Retain a verified inode; only nonexecuting staging may discover its build."""
+    if execute and expected_build is None:
+        raise ValueError("executing roles require the configured expected build")
+    if expected_build is not None:
+        qualified_release(expected_build)
+    absolute(str(path))
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        stream = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+    try:
+        verify_binary_access(fd, execute=execute)
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+        build = digest.hexdigest()
+        try:
+            qualified_release(build)
+        except ValueError as error:
+            raise ValueError("unsupported managed executable; repeat acceptance before upgrading") from error
+        if expected_build is not None and build != expected_build:
+            raise ValueError("managed executable differs from the configured build")
+        stream.seek(0)
+        return stream, build
+    except BaseException:
+        stream.close()
+        raise
 
 
 def parse_arguments(argv: list[str] | None, description: str | None) -> argparse.Namespace:

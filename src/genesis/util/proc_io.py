@@ -19,8 +19,11 @@ sandbox on a live container, 263 of 297 processes were readable and 34 denied.
 from __future__ import annotations
 
 import contextlib
+import os
 import time
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 # Module-level so tests can repoint it at a fake tree (the host_boot.py seam).
@@ -81,6 +84,118 @@ def read_stat(pid: int) -> tuple[str, str, int, int, int] | None:
         return comm, after[0], int(after[1]), int(after[17]), int(after[19])
     except (OSError, ValueError, IndexError):
         return None
+
+
+# Tri-state reads for code that ACTS on the answer (the stop tools): a missing
+# entry is positive evidence the process is gone; any other failure is no
+# evidence of anything, and must never read as gone, stopped or empty.
+GONE = "gone"
+UNREADABLE = "unreadable"
+_PF_KTHREAD = 0x00200000  # include/linux/sched.h; ``flags`` is stat field 9
+
+
+@dataclass(frozen=True)
+class Stat:
+    """One read of ``/proc/<pid>/stat`` (fields counted after the LAST ``)``)."""
+
+    comm: str
+    state: str
+    ppid: int
+    pgid: int
+    flags: int
+    threads: int
+    starttime: int
+
+    @property
+    def exited(self) -> bool:
+        """Every thread has exited. A leader that exited while other threads
+        run also reads ``Z``, with more than one thread: that process is alive
+        and still holds its memory (MEASURED: Z, 2 threads, 216 MB resident in
+        its live task)."""
+        return self.state in ("Z", "X") and self.threads <= 1
+
+    @property
+    def kernel_thread(self) -> bool:
+        """From the PF_KTHREAD flag, never from an empty argv: a zombie leader
+        with live threads has an empty cmdline too."""
+        return bool(self.flags & _PF_KTHREAD)
+
+
+def probe_stat(pid: int) -> Stat | str:
+    """``Stat``, ``GONE`` (no such pid) or ``UNREADABLE`` (EACCES, EIO, malformed)."""
+    try:
+        raw = (Path(_PROC) / str(pid) / "stat").read_bytes().decode("utf-8", "replace")
+    except (FileNotFoundError, ProcessLookupError):
+        return GONE
+    except OSError:
+        return UNREADABLE
+    try:
+        comm = raw[raw.index("(") + 1 : raw.rindex(")")]
+        after = raw[raw.rindex(")") + 2 :].split()
+        return Stat(
+            comm=comm,
+            state=after[0],
+            ppid=int(after[1]),
+            pgid=int(after[2]),
+            flags=int(after[6]),
+            threads=int(after[17]),
+            starttime=int(after[19]),
+        )
+    except (ValueError, IndexError):
+        return UNREADABLE
+
+
+def _vm_kb(text: str) -> int | None:
+    """VmRSS + VmSwap in kB, or None when the status carries no VmRSS line."""
+    rss = swap = None
+    for line in text.splitlines():
+        if line.startswith("VmRSS:"):
+            rss = int(line.split()[1])
+        elif line.startswith("VmSwap:"):
+            swap = int(line.split()[1])
+    return None if rss is None else rss + (swap or 0)
+
+
+def held_kb(pid: int) -> int | str:
+    """The process's RAM + swap in kB, ``GONE`` or ``UNREADABLE``.
+
+    A leader that exited while other threads run carries no Vm lines in its own
+    status (MEASURED), so the figure is read from a live task's status, which
+    reports the whole process. A process with no task left that reports memory
+    holds none (0); so does a kernel thread, which has no Vm lines at all.
+    """
+    base = Path(_PROC) / str(pid)
+    try:
+        text = (base / "status").read_bytes().decode("utf-8", "replace")
+    except (FileNotFoundError, ProcessLookupError):
+        return GONE
+    except OSError:
+        return UNREADABLE
+    try:
+        own = _vm_kb(text)
+        if own is not None:
+            return own
+        try:
+            tids = os.listdir(base / "task")
+        except (FileNotFoundError, ProcessLookupError):
+            return GONE
+        except OSError:
+            return UNREADABLE
+        for tid in sorted(tids):
+            if tid == str(pid):
+                continue
+            try:
+                task = (base / "task" / tid / "status").read_bytes().decode("utf-8", "replace")
+            except (FileNotFoundError, ProcessLookupError):
+                continue  # that thread exited meanwhile
+            except OSError:
+                return UNREADABLE
+            figure = _vm_kb(task)
+            if figure is not None:
+                return figure
+        return 0
+    except (ValueError, IndexError):
+        return UNREADABLE
 
 
 def read_starttime(pid: int) -> int | None:
@@ -232,3 +347,99 @@ def claude_ancestor(pid: int, max_depth: int = 16) -> int | None:
             return ppid
         current = ppid
     return None
+
+
+def _read_btime(proc_root: str) -> int | None:
+    """Boot time (epoch seconds) from ``/proc/stat``'s ``btime`` line, or None."""
+    try:
+        with open(f"{proc_root}/stat") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def read_proc_start_iso(pid: int, proc_root: str | None = None) -> str | None:
+    """Wall-clock start time of a pid as an ISO-8601 UTC string, or None.
+
+    Computed as ``btime + starttime_ticks / CLK_TCK`` where ``starttime`` is
+    field 22 of ``/proc/<pid>/stat`` (clock ticks since boot). The ``comm``
+    field (2) is parenthesised and may itself contain spaces or ``)``, so the
+    line is split after the LAST ``)`` — everything after that is whitespace-
+    delimited starting at field 3 (state), making ``starttime`` index 19.
+    Verified to-the-second against ``ps lstart`` on this host. Returns None on
+    any read/parse failure or an implausible clock tick (fail-open: the caller
+    treats an unknown start time as "not stale", never falsely flagging).
+
+    Lives here, not in ``observability.cc_slots`` (which re-exports it),
+    because importing anything under ``genesis.observability`` runs that
+    package's ``__init__`` and its aiohttp chain: about 300 ms, MEASURED
+    2026-11-07, paid by every session-start hook that only needs this.
+    """
+    proc_root = proc_root or _PROC
+    btime = _read_btime(proc_root)
+    if btime is None:
+        return None
+    try:
+        with open(f"{proc_root}/{pid}/stat") as f:
+            after = f.read().rsplit(")", 1)[1].split()
+        starttime_ticks = int(after[19])
+        clk = os.sysconf("SC_CLK_TCK")
+        if clk <= 0:
+            return None
+        wall = btime + starttime_ticks / clk
+        return datetime.fromtimestamp(wall, UTC).isoformat()
+    except (OSError, ValueError, IndexError, OverflowError):
+        return None
+
+
+def claude_pid_dead(
+    pid: int,
+    row: dict,
+    *,
+    proc_root: str | None = None,
+    start_iso: Callable[[int], str | None] | None = None,
+) -> bool:
+    """Death-proof for a terminal-registered cc_sessions row's recorded pid.
+
+    True only on POSITIVE evidence the recorded process is gone: /proc entry
+    absent (ENOENT/ESRCH — a MISSING entry, not merely an unreadable one:
+    EACCES from a hidepid mount or another uid is "cannot see", which must
+    fail open), comm no longer ``claude``, or the process at that pid
+    started after the row's newest liveness stamp (pid recycled). The
+    anchor is max(started_at, last_activity_at), NOT started_at alone: a
+    ``--resume`` reopens the row with a NEW pid in the same write that
+    stamps last_activity_at, so the fresh process always starts BEFORE the
+    anchor — anchoring to the original started_at would read every resumed
+    session as recycled. A genuinely recycled pid began after the session's
+    last sign of life, so detection is preserved; any miss fails open. Unknown
+    start time → False (fail-open, matching ``read_proc_start_iso``'s own
+    contract).
+
+    The foreground reaper and the session-start in-flight block share this one
+    predicate, so they never disagree about which rows are live.
+    """
+    proc = Path(proc_root or _PROC) / str(pid)
+    try:
+        comm = (proc / "comm").read_text().strip()
+    except (FileNotFoundError, ProcessLookupError):
+        return True  # the pid does not exist — positive death evidence
+    except (OSError, UnicodeError):
+        # Unreadable (permissions, /proc hiccup) or undecodable (a reused pid
+        # whose comm has invalid bytes for the locale) — fail open; one bad
+        # candidate must not abort the pass for every other stale row.
+        return False
+    if comm != "claude":
+        return True
+    anchor = max(
+        (t for t in (row.get("started_at"), row.get("last_activity_at")) if t),
+        default=None,
+    )
+    if not anchor:
+        return False
+    started = (start_iso or read_proc_start_iso)(pid)
+    if started is None:
+        return False
+    return started > anchor

@@ -23,16 +23,14 @@
 #
 # mode:
 #   advisory — (default) a session claims a worktree on its first write into it,
-#              and is warned on stderr when it writes into one another live
+#              and receives advisory context before editing one another live
 #              session holds. Claims are released when the claiming process is
-#              gone. Nothing is ever blocked.
-#   off      — claim nothing, release nothing, warn about nothing.
+#              gone, during the daily stale-claim pass. Nothing is ever blocked.
+#   off      — claim nothing and warn about nothing; daily cleanup is independent.
 #
-# SCOPE AT THIS COMMIT: the library only. Nothing here takes a claim — the
-# Edit/Write hook that does, and the reaper-side release, ship separately. Said
-# plainly because a setting that describes a protection it does not yet provide
-# is worse than one that describes less; that exact defect was a round-1 review
-# finding and this is where it would recur.
+# Edit/Write/MultiEdit/NotebookEdit hooks claim after successful edits and
+# advise before edits. The existing lock readers and release rules are reused;
+# arbitrary Bash writes and external-client sessions are outside this hook.
 # enabled: master switch; false is equivalent to off.
 #
 # An invalid mode degrades to `advisory`, not `off`: every surface here is
@@ -42,7 +40,7 @@
 # off. Takes effect immediately, no restart.
 #
 # Note `off` does not release claims already taken. A claim releases when its
-# process exits regardless of this setting, so they drain on their own rather
-# than accumulating.
+# process has exited, during the daily disk-hygiene stale-claim pass regardless
+# of this setting. There is no immediate SessionEnd release.
 enabled: true
 mode: advisory

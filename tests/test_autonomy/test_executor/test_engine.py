@@ -103,13 +103,13 @@ def mock_subprocess(monkeypatch):
     return create
 
 
-async def _seed_task(db, task_id="t-001", plan_path="/tmp/plan.md", phase="pending"):
+async def _seed_task(db, task_id="t-001", plan_path="/tmp/plan.md", phase="pending", description="Test task"):
     """Insert a task row for testing."""
     token = await create_intake_token(db)
     await task_states.create(
         db,
         task_id=task_id,
-        description="Test task",
+        description=description,
         current_phase=phase,
         outputs=plan_path,
         intake_token=token,
@@ -125,6 +125,99 @@ def _make_engine(db, invoker, decomposer, reviewer, **kwargs):
         reviewer=reviewer,
         **kwargs,
     )
+
+
+@pytest.mark.asyncio
+class TestWorkerPromptContext:
+    @pytest.mark.parametrize("route", ["fresh", "resume", "workaround", "diligence", "research", "exit", "fixup"])
+    async def test_context_at_model_boundary_on_every_route(
+        self, route, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        from genesis.autonomy.executor.types import ResearchResult
+
+        goal = 'Task goal 日本語 {"literal": "{{task_description}}"}'
+        await _seed_task(
+            db, plan_path=plan_file, phase="executing" if route == "resume" else "pending",
+            description=goal,
+        )
+        expected_indexes = [0, 1, 2]
+        if route == "resume":
+            for step in mock_decomposer.decompose.return_value:
+                await task_steps.create_step(
+                    db, task_id="t-001", step_idx=step["idx"],
+                    step_type=step["type"], description=step["description"],
+                )
+            await task_steps.update_step(
+                db, "t-001", 0, status="completed",
+                result_json=json.dumps({"result": "Already researched", "artifacts": []}),
+            )
+            expected_indexes = [1, 2]
+        workaround = AsyncMock()
+        workaround.search.return_value = WorkaroundResult(found=False)
+        research = AsyncMock()
+        research.inline_due_diligence.return_value = None
+        research.research.return_value = ResearchResult(found=False)
+        if route == "workaround":
+            workaround.search.return_value = WorkaroundResult(found=True, approach="Procedural retry")
+        elif route == "diligence":
+            research.inline_due_diligence.return_value = "Diligence retry"
+        elif route == "research":
+            research.research.return_value = ResearchResult(found=True, approach="Research retry")
+        engine = _make_engine(
+            db, mock_invoker, mock_decomposer, mock_reviewer,
+            workaround_searcher=workaround, research_searcher=research,
+        )
+        if route in ("workaround", "diligence", "research", "exit"):
+            mock_invoker.run.side_effect = [
+                FakeCCOutput(is_error=True, error_message="Transport failed"),
+                FakeCCOutput(), FakeCCOutput(), FakeCCOutput(),
+            ]
+            expected_indexes = [0, 0, 1, 2]
+        if route == "exit":
+            engine._challenge_failure = AsyncMock(return_value={
+                "verdict": "reject", "suggested_approach": "Exit retry",
+            })
+        if route == "fixup":
+            mock_reviewer.verify_deliverable.side_effect = [
+                VerifyResult(passed=False, fresh_eyes_feedback="Fix the bug"),
+                VerifyResult(passed=True),
+            ]
+            expected_indexes = [0, 1, 2, 3]
+
+        assert await engine.execute("t-001") is True
+        prompts = [c.args[0].prompt for c in mock_invoker.run.call_args_list]
+        assert len(prompts) == len(expected_indexes)
+        for prompt, idx in zip(prompts, expected_indexes, strict=True):
+            assert f"## Task\n{goal}\nPlanned step count: 3" in prompt
+            assert prompt.count(goal) == 1
+            assert f"## Step {idx}:" in prompt
+            assert "{{total_steps}}" not in prompt
+        if route == "resume":
+            mock_decomposer.decompose.assert_not_awaited()
+            assert "Step 0: completed -- Already researched" in prompts[0]
+        if route in ("workaround", "diligence", "research", "exit"):
+            assert "## Workaround Context" in prompts[1]
+            expected = {"workaround": "Procedural retry", "diligence": "Diligence retry",
+                        "research": "Research retry", "exit": "Exit retry"}[route]
+            assert expected in prompts[1]
+
+    async def test_task_context_does_not_leak_between_executions(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        for task_id, goal, count in [("first", "Unique alpha goal", 3), ("second", "Unique beta goal", 1)]:
+            await _seed_task(db, task_id=task_id, plan_path=plan_file, description=goal)
+            mock_decomposer.decompose.return_value = mock_decomposer.decompose.return_value[:count]
+            mock_invoker.run.reset_mock()
+            assert await engine.execute(task_id) is True
+            prompts = [c.args[0].prompt for c in mock_invoker.run.call_args_list]
+            assert len(prompts) == count
+            for prompt in prompts:
+                assert f"## Task\n{goal}\nPlanned step count: {count}" in prompt
+                other_goal = "Unique beta goal" if task_id == "first" else "Unique alpha goal"
+                assert other_goal not in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -1739,3 +1832,38 @@ class TestRunGitPushBounded:
         with pytest.raises(asyncio.CancelledError):
             await task
         assert killpg_calls and killpg_calls[0][0] == 88889
+
+
+@pytest.mark.asyncio
+async def test_review_error_blocks_without_fixup_and_resumes_completed_steps(
+    db, plan_file, mock_invoker, mock_decomposer, mock_reviewer, mock_subprocess,
+):
+    await _seed_task(db, plan_path=plan_file)
+    # A duck-typed result lets the regression reach the engine before the new
+    # optional field exists in VerifyResult.
+    result = MagicMock(passed=False, review_error="Fresh-eyes review remained invalid",
+                       skipped_reason=None, programmatic_issues=[],
+                       fresh_eyes_feedback=None, adversarial_feedback=None)
+    mock_reviewer.verify_deliverable.return_value = result
+    seen = []
+    async def notified(request):
+        task = await task_states.get_by_id(db, "t-001")
+        if task["current_phase"] == "blocked":
+            seen.append(json.loads(task["blockers"]))
+    outreach = AsyncMock()
+    outreach.submit.side_effect = notified
+    engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer,
+                          outreach_pipeline=outreach)
+    with patch("genesis.autonomy.executor.engine._dispatch.create_fixup_step") as fixup:
+        assert await engine.execute("t-001") is False
+        fixup.assert_not_called()
+    mock_reviewer.verify_deliverable.assert_awaited_once()
+    assert seen and seen[-1]["resume_phase"] == "verifying"
+    assert seen[-1]["description"] == result.review_error
+    steps = await task_steps.get_steps_for_task(db, "t-001")
+    assert len(steps) == 3 and all(s["status"] == "completed" for s in steps)
+    before = mock_invoker.run.await_count
+    mock_reviewer.verify_deliverable.return_value = VerifyResult(passed=True)
+    assert await engine.execute("t-001") is True
+    assert mock_invoker.run.await_count == before
+    assert mock_decomposer.decompose.await_count == 1

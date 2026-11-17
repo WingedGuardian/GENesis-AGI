@@ -1,0 +1,1 @@
+- Add a model-validation workflow skill for qualification evidence, exact paid consent, model identity, no-resend recovery and bounded promotion claims.

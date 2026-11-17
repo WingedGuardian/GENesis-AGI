@@ -45,8 +45,8 @@ format (`src/genesis/identity/TASK_INTAKE.md`).
    - `## Constraints`
 
    A plan that names repo files (`src/`, `scripts/`, `tests/`, `.claude/`,
-   `docs/`, `config/`, `.github/`) also needs `## Premise checks`: six numbered
-   answers to the plan-time questions in `.claude/docs/premise-check.md`
+   `docs/`, `config/`, `.github/`) also needs `## Premise checks`: the nine-item
+   premise form in `.claude/docs/premise-check.md`, each answer after its label
    (`n/a — <reason>` counts). Plan mode cannot be left without it.
 6. After user approves the plan:
    a. Call `intake_complete()` MCP tool to generate a one-time intake token

@@ -1,25 +1,24 @@
 """Owned future-capability simulations use the real queue and harmless providers.
 
-Only the private runner copy's readiness response, and its handling of a ready
-answer, change. The shipped source must continue refusing. A separate CLI proxy injects explicit transport faults;
-it delegates normal commands to unchanged copied facade/helper sources.
+An owned harmless runner copy omits its decisive readiness fence before capture;
+shipped readiness stays off. Real typed transitions exercise explicit transport
+faults; owner source/registration/intent, manager/kernel and waits are synthetic.
 """
 
-import hashlib
 import json
 import os
-import shutil
 import sqlite3
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from tests.test_scripts.managed_code_intel_fixture import configured_sentinel, install_manager
+from tests.test_scripts.code_intel_consumer_fixture import build_consumer, install_provider
+from tests.test_scripts.managed_code_intel_fixture import configured_sentinel
+from tests.test_scripts.test_code_intel_source import isolated_modules as isolated_modules
 from tests.test_scripts.test_index_marker_legs import queue as queue  # noqa: F401
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -27,133 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.fixture
 def consumer(queue, tmp_path, monkeypatch):
-    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / ".genesis"))
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".git").mkdir()
-    scripts = tmp_path / "future/scripts"
-    lib = scripts / "lib"
-    lib.mkdir(parents=True)
-    original = (ROOT / "scripts/code_intel_runner.sh").read_text()
-    old = '_marker() { python3 "$MARKER_PY" "$@"; }'
-    new = '_marker() { if [ "${1:-}" = automatic-ready ]; then return 0; fi; python3 "$MARKER_PY" "$@"; }'
-    assert original.count(old) == 1
-    # The shipped binary stops on a ready answer (exit 76); only the strict
-    # cutover gives "ready" a meaning, so the private copy proceeds instead.
-    stop = '    0) _log "readiness helper reported ready, but this protocol has no ready state — stopping tick"; exit 76 ;;'
-    assert original.count(stop) == 1
-    runner = scripts / "code_intel_runner.sh"
-    runner.write_text(original.replace(old, new).replace(stop, "    0) ;;"))
-    hashes = {}
-    for name in (
-        "index_marker.py",
-        "index_marker_cli.py",
-        "index_marker_legacy.py",
-        "index_marker_legs.py",
-        "index_marker_execution.py",
-        "index_marker_recovery.py",
-        "code_intel_execution.py",
-        "code_intel_cbm_admission.py",
-        "proc_pressure.sh",
-    ):
-        source = ROOT / "scripts/lib" / name
-        target = lib / ("real_index_marker.py" if name == "index_marker.py" else name)
-        shutil.copyfile(source, target)
-        assert source.read_bytes() == target.read_bytes()
-        hashes[name] = hashlib.sha256(source.read_bytes()).hexdigest()
-    (lib / "index_marker.py").write_text(
-        "import os,sys\nfrom pathlib import Path\n"
-        "command=sys.argv[1]\n"
-        "if command=='claim':\n"
-        "    if os.environ.get('TEST_WRITE_BEFORE_CLAIM'):\n"
-        "        import subprocess\n"
-        "        subprocess.run([sys.executable,str(Path(__file__).with_name('real_index_marker.py')),'write','--repo',os.environ['TEST_QUEUE_REPO'],'--tools',os.environ['TEST_WRITE_BEFORE_CLAIM'],'--mode','full'],check=True,capture_output=True)\n"
-        "    if os.environ.get('TEST_DISABLE_BEFORE_CLAIM'):\n"
-        "        Path(os.environ['TEST_DISABLE_BEFORE_CLAIM']).touch()\n"
-        "if command==os.environ.get('TEST_FAULT_COMMAND'):\n"
-        "    if os.environ.get('TEST_FAULT_AFTER_REAL')=='1':\n"
-        "        import subprocess\n"
-        "        r=subprocess.run([sys.executable,str(Path(__file__).with_name('real_index_marker.py')),*sys.argv[1:]],capture_output=True)\n"
-        "        sys.stderr.buffer.write(r.stderr)\n"
-        "    sys.stdout.buffer.write(Path(os.environ['TEST_WIRE_PATH']).read_bytes())\n"
-        "    sys.exit(int(os.environ.get('TEST_FAULT_STATUS','0')))\n"
-        "os.execv(sys.executable,[sys.executable,str(Path(__file__).with_name('real_index_marker.py')),*sys.argv[1:]])\n"
-    )
-    provider = tmp_path / "harmless_provider.sh"
-    program = tmp_path / "harmless_provider.sh.py"
-    calls = tmp_path / "provider.jsonl"
-    program.write_text(
-        "import json,os,sys\nfrom pathlib import Path\n"
-        f"with Path(os.environ.get('TEST_PROVIDER_LOG',{str(calls)!r})).open('a') as stream:\n"
-        "    stream.write(json.dumps({'repo':sys.argv[1],'provider':sys.argv[2],'mode':sys.argv[3]})+'\\n')\n"
-        "if os.environ.get('TEST_PROVIDER_READY'):\n"
-        "    import time\n"
-        "    Path(os.environ['TEST_PROVIDER_READY']).write_text('provider reached')\n"
-        "    deadline=time.monotonic()+15\n"
-        "    while not Path(os.environ['TEST_PROVIDER_ALLOW']).exists():\n"
-        "        if time.monotonic()>deadline: raise RuntimeError('owned provider barrier expired')\n"
-        "        time.sleep(.01)\n"
-        "if os.environ.get('TEST_ENQUEUE_AT'):\n"
-        "    import subprocess\n"
-        f"    step=len(Path({str(calls)!r}).read_text().splitlines())\n"
-        "    if str(step)==os.environ['TEST_ENQUEUE_AT']:\n"
-        "        subprocess.run([sys.executable,os.environ['TEST_QUEUE_CLI'],'write','--repo',sys.argv[1],'--tools',sys.argv[2],'--mode','fast'],check=True,capture_output=True)\n"
-        "sys.exit(int(os.environ.get('TEST_'+sys.argv[2].upper()+'_RC','0')))\n"
-    )
-    provider.write_text('#!/usr/bin/env bash\nexec /usr/bin/python3 "$0.py" "$@"\n')
-    provider.chmod(0o700)
-    control_log = tmp_path / "instrument.jsonl"
-    control = subprocess.run(
-        ["bash", str(provider), "fixture", "gitnexus", "fast"],
-        env={**os.environ, "TEST_PROVIDER_LOG": str(control_log), "TEST_GITNEXUS_RC": "0"},
-        capture_output=True,
-        timeout=10,
-    )
-    assert control.returncode == 0 and not calls.exists(), control.stderr
-    assert [json.loads(line) for line in control_log.read_text().splitlines()] == [
-        {"repo": "fixture", "provider": "gitnexus", "mode": "fast"}
-    ]
-    install_manager(scripts / "codebase_managed.py", tmp_path, repo, provider)
-
-    def environment(extra):
-        return {
-            **os.environ,
-            "HOME": str(tmp_path),
-            "GENESIS_HOME": str(tmp_path / ".genesis"),
-            "CODE_INTEL_ENTRYPOINT": str(provider),
-            "CODE_INTEL_FAKE_LOADAVG": "0",
-            "CODE_INTEL_FAKE_IOWAIT": "0",
-            "CODE_INTEL_FAKE_CLAUDE_CPU": "0",
-            "TEST_QUEUE_CLI": str(lib / "real_index_marker.py"),
-            "TEST_QUEUE_REPO": str(repo),
-            **extra,
-        }
-
-    def run(**extra):
-        return subprocess.run(
-            ["bash", str(runner)],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=environment(extra),
-        )
-
-    def events():
-        return (
-            [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
-        )
-
-    return SimpleNamespace(
-        queue=queue,
-        repo=str(repo),
-        hash=queue.marker_hash(str(repo)),
-        run=run,
-        events=events,
-        directory=tmp_path,
-        source_hashes=hashes,
-        runner=runner,
-        environment=environment,
-    )
+    return build_consumer(queue, tmp_path, monkeypatch, install_provider)
 
 
 def _history(consumer):
@@ -173,8 +46,65 @@ def test_two_provider_successes_settle_independent_execution_once(consumer):
         {"repo": consumer.repo, "provider": "gitnexus", "mode": "fast"},
     ]
     assert q.list_markers() == [] and q.get_inflight(consumer.hash) is None
-    assert [row["applied_state"] for row in _history(consumer)] == ["consumed", "consumed"]
+    assert [row["typed_applied_state"] for row in _history(consumer)] == ["consumed", "consumed"]
     assert consumer.run().returncode == 0 and len(consumer.events()) == 2
+
+
+@pytest.mark.parametrize('command', ['reconcile-inflight', 'reconcile-native', 'list-legs',
+                                     'claim', 'claim-native', 'should-escalate'])
+def test_busy_queue_defers_the_tick_instead_of_failing_it(consumer, command):
+    """Retain the parent claim identity; its actual endpoint is now native."""
+    q = consumer.queue
+    q.write_marker(consumer.repo, 'cbm', 'fast')
+    endpoint = 'claim-native' if command == 'claim' else command
+    result = _fault(consumer, endpoint, b'', 75)
+    assert result.returncode == 0 and not consumer.events(), result.stderr
+    log = (consumer.directory/'.genesis/code-intelligence-runner.log').read_text()
+    assert 'queue busy at' in log
+    rows = q.list_markers()
+    assert len(rows) == 1 and rows[0]['attempts'] == 0 and rows[0]['mode'] == 'fast'
+    assert q.get_inflight(consumer.hash) is None
+    history = _history(consumer)
+    assert [row['typed_applied_state'] for row in history] == (
+        ['pending'] if command == 'should-escalate' else [])
+    assert all(row['scalar_action'] is None and row['typed_charged_attempts'] == 0 for row in history)
+
+
+def test_busy_apply_retains_the_decision_and_the_next_tick_replays_it(consumer):
+    """Unacknowledged typed apply stops76; retained facts settle without resend."""
+    q = consumer.queue
+    q.write_marker(consumer.repo, 'gitnexus', 'fast')
+    first = consumer.run(TEST_DEFER_NATIVE_APPLY='1')
+    assert first.returncode == 76 and len(consumer.events()) == 1, first.stderr
+    assert q.get_inflight(consumer.hash) is not None
+    row = _history(consumer)[0]
+    assert all(row[key] is not None for key in ('terminal', 'cleanup_proof', 'control_closure'))
+    assert row['typed_applied_state'] is None and row['scalar_action'] is None
+    second = consumer.run()
+    assert second.returncode == 0 and len(consumer.events()) == 1, second.stderr
+    assert q.list_markers() == [] and q.get_inflight(consumer.hash) is None
+    assert _history(consumer)[0]['typed_applied_state'] == 'consumed'
+
+
+@pytest.mark.parametrize('boundary', ['disablement', 'escalation'])
+def test_busy_native_reconciliation_after_claim_defers_without_launch(consumer, boundary):
+    q = consumer.queue
+    q.write_marker(consumer.repo, 'cbm', 'fast')
+    witness = consumer.directory/'reconcile-busy-observation'
+    env = dict(TEST_BUSY_CLAIM_RECONCILIATION='1', TEST_RECONCILE_WITNESS=str(witness))
+    if boundary == 'disablement':
+        env['TEST_DISABLE_BEFORE_CLAIM'] = str(consumer.directory/'.genesis/codebase-memory-mcp.disabled')
+    else:
+        output = consumer.directory/'escalation-busy.bin'
+        output.write_bytes(b'')
+        env.update(TEST_FAULT_COMMAND='should-escalate', TEST_WIRE_PATH=str(output), TEST_FAULT_STATUS='75')
+    result = consumer.run(**env)
+    assert result.returncode == 0 and witness.read_text() == 'busy after claim', result.stderr
+    assert not consumer.events() and q.get_inflight(consumer.hash)['protocol'] == 3
+    row = _history(consumer)[0]
+    assert row['typed_applied_state'] is None and row['scalar_action'] is None
+    assert row['launch_reservation'] is None and row['typed_charged_attempts'] is None
+    assert row['attempts'] == 0
 
 
 @pytest.mark.parametrize("provider", ["cbm", "gitnexus"])
@@ -189,27 +119,30 @@ def test_single_provider_failure_charges_only_its_leg(consumer, rc, provider):
     assert len(consumer.events()) == 2
     assert len(rows) == 1 and rows[0]["provider"] == provider and rows[0]["attempts"] == 1
     history = _history(consumer)
-    assert [row["charged_attempts"] for row in history] == ([1, 0] if provider == "cbm" else [0, 1])
-    assert [row["scalar_action"] for row in history] == (
-        ["restore_failure", "consume"] if provider == "cbm" else ["consume", "restore_failure"]
+    assert [row["typed_charged_attempts"] for row in history] == (
+        [1, 0] if provider == "cbm" else [0, 1]
+    )
+    assert [row["typed_applied_state"] for row in history] == (
+        ["pending", "consumed"] if provider == "cbm" else ["consumed", "pending"]
     )
 
 
 def test_list_error_stops_tick_before_any_claim_or_provider(consumer):
     q = consumer.queue
     q.write_marker(consumer.repo, "both", "fast")
-
-    def ageless():
-        return [{k: v for k, v in row.items() if k != "age_s"} for row in q.list_markers()]
-
-    before = ageless()
+    before = [
+        {key: value for key, value in row.items() if key != "age_s"} for row in q.list_markers()
+    ]
     output = consumer.directory / "failed-list.bin"
     output.write_bytes(b"complete-looking-but-untrusted\0")
     result = consumer.run(
         TEST_FAULT_COMMAND="list-legs", TEST_WIRE_PATH=str(output), TEST_FAULT_STATUS="2"
     )
     assert result.returncode == 76 and not consumer.events(), result.stderr
-    assert ageless() == before and _history(consumer) == []
+    assert [
+        {key: value for key, value in row.items() if key != "age_s"} for row in q.list_markers()
+    ] == before
+    assert _history(consumer) == []
 
 
 def _wire(*fields):
@@ -221,12 +154,22 @@ def _wire(*fields):
 def _fault(consumer, command, raw, status, *, after=False):
     output = consumer.directory / "wire-fault.bin"
     output.write_bytes(raw)
-    return consumer.run(
+    witness = Path(str(output) + ".injected.json")
+    witness.unlink(missing_ok=True)
+    result = consumer.run(
         TEST_FAULT_COMMAND=command,
         TEST_WIRE_PATH=str(output),
         TEST_FAULT_STATUS=str(status),
         TEST_FAULT_AFTER_REAL="1" if after else "0",
     )
+    assert witness.is_file(), "the requested fault was not injected"
+    assert json.loads(witness.read_text()) == {
+        "command": command,
+        "raw_hex": raw.hex(),
+        "status": status,
+        "real_status": 0 if after else None,
+    }
+    return result
 
 
 def test_empty_list_is_quiet_only_in_the_owned_capability_fixture(consumer):
@@ -326,7 +269,7 @@ def test_predicate_one_requires_complete_matching_unclaimed_ack(consumer, kind):
         raw = raw[:-1]
     if kind == "extra":
         raw += b"\0"
-    result = _fault(consumer, "claim", raw, 1)
+    result = _fault(consumer, "claim-native", raw, 1)
     assert result.returncode == 76 and not consumer.events(), result.stderr
     assert len(q.list_markers()) == 1 and _history(consumer) == []
 
@@ -334,7 +277,7 @@ def test_predicate_one_requires_complete_matching_unclaimed_ack(consumer, kind):
 def test_complete_matching_unclaimed_ack_is_a_predicate(consumer):
     q = consumer.queue
     q.write_marker(consumer.repo, "gitnexus", "fast")
-    result = _fault(consumer, "claim", _wire("1", "unclaimed", consumer.hash, "gitnexus"), 1)
+    result = _fault(consumer, "claim-native", _wire("1", "unclaimed", consumer.hash, "gitnexus"), 1)
     assert result.returncode == 0 and not consumer.events(), result.stderr
     assert len(q.list_markers()) == 1 and _history(consumer) == []
 
@@ -356,10 +299,11 @@ def test_committed_claim_with_invalid_response_never_launches(consumer, kind):
         raw = raw[:-1]
     if kind == "extra":
         raw += b"\0"
-    result = _fault(consumer, "claim", raw, 0, after=True)
+    result = _fault(consumer, "claim-native", raw, 0, after=True)
     assert result.returncode == 76 and not consumer.events(), result.stderr
-    assert q.get_inflight(consumer.hash)["protocol"] == 2
+    assert q.get_inflight(consumer.hash)["protocol"] == 3
     assert len(_history(consumer)) == 1 and _history(consumer)[0]["scalar_action"] is None
+    assert _history(consumer)[0]["typed_applied_state"] is None
 
 
 @pytest.mark.parametrize(
@@ -396,7 +340,7 @@ def test_escalation_error_restores_owned_claim_without_launch(consumer, status, 
     assert len(rows) == 1 and rows[0]["attempts"] == 0 and rows[0]["mode"] == "fast"
     assert (
         q.get_inflight(consumer.hash) is None
-        and _history(consumer)[0]["scalar_action"] == "restore"
+        and _history(consumer)[0]["typed_applied_state"] == "pending"
     )
     assert q.get_repo_state(consumer.hash)["last_full"] is None
 
@@ -419,15 +363,40 @@ def test_provider_mode_result_matrix_preserves_debt_and_provider_clocks(
         assert rows == []
         assert (state["last_full"] != before) == (provider == "cbm" and mode == "full")
     else:
-        assert (
-            len(rows) == 1
-            and rows[0]["provider"] == provider
-            and rows[0]["attempts"] == (1 if rc == "1" else 0)
-        )
+        assert len(rows) == 1 and rows[0]["provider"] == provider and rows[0]["attempts"] == 1
         assert state["last_full"] == before
-    assert (state["full_backoff"] is not None) == (
-        provider == "cbm" and mode == "full" and rc == "3"
-    )
+    assert state["full_backoff"] is None
+
+
+@pytest.mark.parametrize("provider", ["cbm", "gitnexus"])
+@pytest.mark.parametrize("mode", ["fast", "moderate", "full"])
+@pytest.mark.parametrize("scenario", ["unstarted", "resource"])
+def test_native_evidence_distinguishes_neutral_deferral_from_resource_hold(
+    consumer, provider, mode, scenario
+):
+    q = consumer.queue
+    q.write_marker(consumer.repo, provider, mode)
+    q.stamp_full(consumer.hash)
+    before = q.get_repo_state(consumer.hash)["last_full"]
+    result = consumer.run(TEST_NATIVE_SCENARIO=scenario)
+    assert result.returncode == 0, result.stderr
+    row = _history(consumer)[0]
+    resource = scenario == "resource"
+    assert len(consumer.events()) == int(resource)
+    assert row["typed_applied_state"] == "pending"
+    assert row["typed_charged_attempts"] == int(resource)
+    assert row["completion_kind"] == ("failure" if resource else "unstarted")
+    assert row["safety_kind"] == ("resource" if resource else None)
+    assert q.list_markers()[0]["attempts"] == int(resource)
+    assert q.get_repo_state(consumer.hash)["last_full"] == before
+    assert q.get_inflight(consumer.hash) is None
+    if resource:
+        # Neither a later tick nor a fresh generation grants another launch.
+        q.write_marker(consumer.repo, provider, mode)
+        assert consumer.run().returncode == 0 and len(consumer.events()) == 1
+    else:
+        assert consumer.run().returncode == 0 and len(consumer.events()) == 1
+        assert _history(consumer)[1]["typed_applied_state"] == "consumed"
 
 
 @pytest.mark.parametrize("mode", ["fast", "moderate"])
@@ -443,7 +412,7 @@ def test_escalated_full_preserves_original_generation_and_backoff_rules(consumer
     else:
         assert len(rows) == 1 and rows[0]["mode"] == mode and rows[0]["attempts"] == 0
         assert state["last_full"] is None
-    assert (state["full_backoff"] is not None) == (rc in ("1", "3"))
+    assert (state["full_backoff"] is not None) == (rc != "0")
 
 
 @pytest.mark.parametrize(
@@ -508,8 +477,8 @@ def test_disablement_after_idle_before_claim_restores_exact_generation(consumer)
     history = _history(consumer)
     assert (
         len(history) == 1
-        and history[0]["scalar_action"] == "restore"
-        and history[0]["charged_attempts"] == 0
+        and history[0]["typed_applied_state"] == "pending"
+        and history[0]["typed_charged_attempts"] == 0
     )
 
 
@@ -540,7 +509,7 @@ def test_cap_retirement_preserves_a_new_same_provider_generation(consumer, new_g
     if new_generation:
         assert rows[0]["provider"] == "gitnexus" and rows[0]["attempts"] == 0
     assert q.get_failed(consumer.hash, provider="gitnexus")["attempts"] == q.MAX_ATTEMPTS
-    assert [row["charged_attempts"] for row in _history(consumer)] == list(
+    assert [row["typed_charged_attempts"] for row in _history(consumer)] == list(
         range(1, q.MAX_ATTEMPTS + 1)
     )
 
@@ -553,15 +522,29 @@ def test_reconciliation_restores_unstarted_or_settles_retained_success(consumer,
     if remembered:
         q.remember_outcome(context, "consume")
     result = consumer.run()
-    assert result.returncode == 0 and len(consumer.events()) == (0 if remembered else 1), (
-        result.stderr
-    )
+    assert result.returncode == 0 and not consumer.events(), result.stderr
     history = _history(consumer)
-    assert q.list_markers() == [] and q.get_inflight(consumer.hash) is None
-    assert [row["scalar_action"] for row in history] == (
-        ["consume"] if remembered else ["restore", "consume"]
-    )
+    assert q.get_inflight(consumer.hash) is None
+    assert [row["scalar_action"] for row in history] == (["consume"] if remembered else ["restore"])
     assert all(row["charged_attempts"] == 0 for row in history)
+    assert len(q.list_markers()) == int(not remembered)
+    if not remembered:
+        assert consumer.run().returncode == 0 and not consumer.events()
+        assert _history(consumer)[0]["safety_kind"] == "uncertainty"
+
+
+def test_native_unreserved_claim_restores_then_sends_once(consumer):
+    q = consumer.queue
+    q.write_marker(consumer.repo, "gitnexus", "fast")
+    claimed = q.claim_native(consumer.hash, provider="gitnexus")
+    assert claimed["context"]["protocol"] == 3
+    result = consumer.run()
+    assert result.returncode == 0 and len(consumer.events()) == 1, result.stderr
+    assert q.list_markers() == [] and q.get_inflight(consumer.hash) is None
+    history = _history(consumer)
+    assert [row["typed_applied_state"] for row in history] == ["pending", "consumed"]
+    assert [row["typed_charged_attempts"] for row in history] == [0, 0]
+    assert consumer.run().returncode == 0 and len(consumer.events()) == 1
 
 
 def test_legacy_possible_native_claim_is_not_reconciled_or_dispatched(consumer):
@@ -592,11 +575,11 @@ def test_legacy_possible_native_claim_is_not_reconciled_or_dispatched(consumer):
 def test_applied_success_with_lost_or_invalid_answer_is_never_resent(consumer, status, raw):
     q = consumer.queue
     q.write_marker(consumer.repo, "gitnexus", "fast")
-    result = _fault(consumer, "apply-outcome", raw, status, after=True)
+    result = _fault(consumer, "native-outcome", raw, status, after=True)
     assert result.returncode == 76 and len(consumer.events()) == 1, result.stderr
     assert (
         q.get_inflight(consumer.hash) is None
-        and _history(consumer)[0]["applied_state"] == "consumed"
+        and _history(consumer)[0]["typed_applied_state"] == "consumed"
     )
     assert consumer.run().returncode == 0 and len(consumer.events()) == 1
     assert len(_history(consumer)) == 1
@@ -638,7 +621,8 @@ def test_real_busy_completion_spools_then_next_tick_settles_without_resend(consu
     locker = None
     with ThreadPoolExecutor(max_workers=1) as pool:
         tick = pool.submit(
-            consumer.run, TEST_PROVIDER_READY=str(started), TEST_PROVIDER_ALLOW=str(allow)
+            consumer.run, TEST_PROVIDER_READY=str(started), TEST_PROVIDER_ALLOW=str(allow),
+            TEST_SHORT_OUTCOME_WAIT="1",
         )
         try:
             _wait_file(started)
@@ -658,19 +642,17 @@ def test_real_busy_completion_spools_then_next_tick_settles_without_resend(consu
             _wait_file(ready, process=locker)
             allow.write_text("provider may finish after write reservation")
             result = tick.result(timeout=20)
-            # The decision is retained (spooled); a busy apply defers the tick.
-            assert result.returncode == 0 and len(consumer.events()) == 1, result.stderr
-            log = (consumer.directory / ".genesis/code-intelligence-runner.log").read_text()
-            assert "apply deferred" in log
-            spools = list(q.marker_dir().glob(".outcome-spool-*.spool"))
-            assert len(spools) == 1 and locker.poll() is None
-            event = json.loads(spools[0].read_bytes())
-            assert (
-                event["version"] == 2
-                and event["kind"] == "outcome"
-                and event["action"] == "consume"
+            assert result.returncode == 76 and len(consumer.events()) == 1, result.stderr
+            spools = list(q.marker_dir().glob(".execution-spool-*.spool"))
+            assert len(spools) == 3 and locker.poll() is None
+            events = [json.loads(path.read_bytes()) for path in spools]
+            assert {event["kind"] for event in events} == {"terminal", "cleanup", "control-closure"}
+            assert all(
+                event["version"] == 3
+                and event["context"]["hash"] == consumer.hash
+                and event["context"]["provider"] == "gitnexus"
+                for event in events
             )
-            assert event["hash"] == consumer.hash and event["provider"] == "gitnexus"
             release.write_text("ordinary test-owner release")
             assert locker.wait(timeout=10) == 0 and done.read_text() == "normal release"
         finally:
@@ -682,12 +664,12 @@ def test_real_busy_completion_spools_then_next_tick_settles_without_resend(consu
     result = consumer.run()
     assert result.returncode == 0 and len(consumer.events()) == 1, result.stderr
     assert q.list_markers() == [] and q.get_inflight(consumer.hash) is None
-    assert not list(q.marker_dir().glob(".outcome-spool-*"))
+    assert not list(q.marker_dir().glob(".execution-spool-*"))
     history = _history(consumer)
     assert (
         len(history) == 1
-        and history[0]["applied_state"] == "consumed"
-        and history[0]["charged_attempts"] == 0
+        and history[0]["typed_applied_state"] == "consumed"
+        and history[0]["typed_charged_attempts"] == 0
     )
 
 
@@ -709,25 +691,26 @@ def test_committed_claim_error_status_cannot_authorize_valid_looking_output(cons
     q = consumer.queue
     q.write_marker(consumer.repo, "gitnexus", "fast")
     raw = _wire("1", "claim", consumer.hash, consumer.repo, "gitnexus", "fast", "opaque")
-    result = _fault(consumer, "claim", raw, status, after=True)
+    result = _fault(consumer, "claim-native", raw, status, after=True)
     assert result.returncode == 76 and not consumer.events(), result.stderr
-    assert q.get_inflight(consumer.hash)["protocol"] == 2
+    assert q.get_inflight(consumer.hash)["protocol"] == 3
     assert len(_history(consumer)) == 1 and _history(consumer)[0]["scalar_action"] is None
+    assert _history(consumer)[0]["typed_applied_state"] is None
 
 
-@pytest.mark.parametrize("command", ["list-legs", "claim", "should-escalate"])
+@pytest.mark.parametrize("command", ["list-legs", "claim-native", "should-escalate"])
 def test_actual_machine_child_signal_is_an_observation_error(consumer, command):
     q = consumer.queue
     q.write_marker(consumer.repo, "cbm", "fast")
     proxy = consumer.runner.parent / "lib/index_marker.py"
     original = proxy.read_text()
-    needle = "command=sys.argv[1]\n"
+    needle = "    command = args[0]\n"
     assert original.count(needle) == 1
     proxy.write_text(
         original.replace(
             needle,
             needle
-            + f"if command=={command!r}:\n    import signal\n    os.kill(os.getpid(),signal.SIGTERM)\n",
+            + f"    if command=={command!r}:\n        import signal\n        os.kill(os.getpid(),signal.SIGTERM)\n",
         )
     )
     result = consumer.run()
@@ -737,33 +720,6 @@ def test_actual_machine_child_signal_is_an_observation_error(consumer, command):
     history = _history(consumer)
     assert len(history) == (1 if command == "should-escalate" else 0)
     if history:
-        assert history[0]["scalar_action"] == "restore" and q.get_inflight(consumer.hash) is None
-
-
-@pytest.mark.parametrize("command", ["reconcile-inflight", "list-legs", "claim", "should-escalate"])
-def test_busy_queue_defers_the_tick_instead_of_failing_it(consumer, command):
-    """A busy queue (CLI 75) is transient: log, exit 0, no debt, no launch."""
-    q = consumer.queue
-    q.write_marker(consumer.repo, "cbm", "fast")
-    result = _fault(consumer, command, b"", 75)
-    assert result.returncode == 0 and not consumer.events(), result.stderr
-    log = (consumer.directory / ".genesis/code-intelligence-runner.log").read_text()
-    assert "queue busy at" in log
-    rows = q.list_markers()
-    assert len(rows) == 1 and rows[0]["attempts"] == 0 and rows[0]["mode"] == "fast"
-    assert q.get_inflight(consumer.hash) is None
-    expected = ["restore"] if command == "should-escalate" else []
-    assert [row["scalar_action"] for row in _history(consumer)] == expected
-
-
-def test_busy_apply_retains_the_decision_and_the_next_tick_replays_it(consumer):
-    """A busy apply after a launch defers (exit 0); the provider is never rerun."""
-    q = consumer.queue
-    q.write_marker(consumer.repo, "gitnexus", "fast")
-    first = _fault(consumer, "apply-outcome", b"", 75)
-    assert first.returncode == 0 and len(consumer.events()) == 1, first.stderr
-    assert q.get_inflight(consumer.hash) is not None
-    second = consumer.run()
-    assert second.returncode == 0 and len(consumer.events()) == 1, second.stderr
-    assert q.list_markers() == [] and q.get_inflight(consumer.hash) is None
-    assert [row["scalar_action"] for row in _history(consumer)] == ["consume"]
+        assert (
+            history[0]["typed_applied_state"] == "pending" and q.get_inflight(consumer.hash) is None
+        )

@@ -88,6 +88,11 @@ def normalize_url_line(line: str) -> str:
     return _URL_IN_LINE_RE.sub(_repl, line)
 
 
+def is_excluded_parent_dir(name: str, response_dir: str = "_genesis") -> bool:
+    """Whether a recursive scan skips every file below a folder named *name*."""
+    return name.startswith((".", "_")) or name == response_dir
+
+
 def scan_folder(
     watch_path: Path,
     response_dir: str = "_genesis",
@@ -106,7 +111,7 @@ def scan_folder(
             continue
         # In recursive mode, skip files inside excluded directories
         if recursive and any(
-            part.startswith(".") or part.startswith("_") or part == response_dir
+            is_excluded_parent_dir(part, response_dir)
             for part in item.relative_to(watch_path).parts[:-1]
         ):
             continue

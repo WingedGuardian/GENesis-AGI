@@ -113,5 +113,6 @@ async def main():
 
 try:
     asyncio.run(main())
+    record("completed")
 except BaseException as error:
     record(type(error).__name__)

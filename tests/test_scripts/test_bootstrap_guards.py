@@ -1421,8 +1421,8 @@ def test_t4i_a_rollback_killed_midway_back_to_the_tag_is_refused_with_the_guards
 ):
     """T4i (S18): HEAD on `live` at the rebuilt tip, a tag-only file written by
     a rollback checkout killed partway. The guard's message, and nothing else:
-    put the paths back, then finish forward (HEAD is the tip, SF1); never the
-    generic line, and never a bare Dismiss."""
+    the repair, which finishes the rollback toward the tag (SF1, #3492 PR D1f);
+    never the generic line, and never a bare Dismiss."""
     g = _guard_tests()
     d = g.diverged_live(tmp_path / "repo")
     _recovery_git(d["root"], "checkout", "-q", "-B", "live", d["new"])
@@ -1430,9 +1430,9 @@ def test_t4i_a_rollback_killed_midway_back_to_the_tag_is_refused_with_the_guards
     proc, path = _recover_with(tmp_path, d["root"], _live_state(d, "done"))
     out = proc.stdout + proc.stderr
     assert proc.returncode == 1 and "REFUSE:" in out and path.exists(), out
-    assert "  ?? O" in out and "save any you want to keep" in out, out
+    assert "  ?? O" in out and "saves every path it changes" in out, out
     assert "finish forward with" not in out, "the generic remedy was added"
-    g.forward_message_is_true(out)
+    g.live_forward_message_is_true(out)
 
 
 def test_t4j_a_finished_live_move_is_told_to_finish_with_post_merge(tmp_path):

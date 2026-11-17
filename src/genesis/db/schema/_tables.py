@@ -82,7 +82,8 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             principle_embedding BLOB,                      -- qwen3-embedding(1024 float32) of `principle`, little-endian; read by proactive procedure hook
             surfaced_count    INTEGER NOT NULL DEFAULT 0,  -- contextual-hook surfacings (proactive hook / tool advisor); honest funnel signal, NOT read by promoter
             trigger_spec      TEXT,                        -- JSON: {patterns, repeat} for a lesson (learning/procedural/lesson_shape.py)
-            lesson            TEXT                         -- JSON: {authored_via, authored_in, origin, reviewed, authored_at}; NULL = an earned procedure
+            lesson            TEXT,                        -- JSON: {authored_via, authored_in, origin, reviewed, authored_at}; NULL = an earned procedure
+            created_session_id TEXT                        -- source session at insert, never rewritten (the lesson cap counts it; #4717)
         )
     """,
     "attention_events": """
@@ -969,6 +970,9 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             purpose          TEXT,
             ingestion_source TEXT,
             origin_class     TEXT,
+            name_hash        TEXT,
+            name_origin      TEXT,
+            secret_ref       TEXT,
             UNIQUE(project_type, domain, concept)
         )
     """,
@@ -978,13 +982,55 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             unit_id           TEXT NOT NULL,
             accessor_context  TEXT,
             accessed_at       TEXT NOT NULL,
-            query_match_score REAL
+            query_match_score REAL,
+            client            TEXT
         )
     """,
     # NOTE: intentionally NO foreign key to knowledge_units. Audit rows
     # outlive the entries they describe — deleting a reference entry (e.g.
     # password rotation: delete + re-store) must not cascade away the
     # access history.  The unit_id is a soft reference only.
+    #
+    # reference_secrets: the value of a credential reference (#2426), and its
+    # free-text description (``detail``, held out with it), held OUT of every indexed
+    # store: knowledge_units.body carries a placeholder instead, so neither
+    # knowledge_fts, memory_fts, the Qdrant payload nor the embedding sees it.
+    # Its own table rather than a knowledge_units column because recall reads
+    # knowledge_units with SELECT *, so a value column would ride into every
+    # recall row; the unit carries only ``secret_ref``, a random id naming its
+    # row here. Rows are insert-only, never updated: crud/knowledge.upsert
+    # inserts a new row under a fresh random id (never derived from the value),
+    # then ONE statement writes the unit naming it, so a body and the secret it
+    # names are always one writer's pair. The knowledge_units triggers
+    # (crud/knowledge.secret_ref_trigger_ddl, created in _migrations.py) refuse a
+    # credential unit naming no row, and delete the row a unit stops naming;
+    # sweep_orphan_secrets removes rows an interrupted upsert left unnamed.
+    # Read only through memory/reference_ops.resolve_value. Retention: one row
+    # per credential unit, retired with it. Backed up with the rest of
+    # genesis.db. Migration 20261105043443_reference_secrets creates the same
+    # table, column and triggers on an existing database.
+    "reference_secrets": """
+        CREATE TABLE IF NOT EXISTS reference_secrets (
+            id         TEXT PRIMARY KEY,
+            value      TEXT NOT NULL,
+            detail     TEXT,
+            created_at TEXT NOT NULL
+        )
+    """,
+    # Append-only log of the MCP tool calls a labelled client makes (owner-mode
+    # Codex): never the arguments. New-Store justification + retention in
+    # migration 20261108071709_client_tool_calls; DDL byte-identical to it.
+    "client_tool_calls": """
+    CREATE TABLE IF NOT EXISTS client_tool_calls (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        client      TEXT NOT NULL,
+        server      TEXT NOT NULL,
+        tool        TEXT NOT NULL,
+        called_at   TEXT NOT NULL,
+        outcome     TEXT NOT NULL CHECK (outcome IN ('returned', 'raised', 'cancelled')),
+        result_ref  TEXT
+    )
+    """,
     "knowledge_uploads": """
         CREATE TABLE IF NOT EXISTS knowledge_uploads (
             id            TEXT PRIMARY KEY,
@@ -2127,7 +2173,10 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             attempt_count     INTEGER NOT NULL DEFAULT 0,
             last_attempt_at   TEXT,
             last_attempt_note TEXT,
-            rechecks          TEXT
+            rechecks          TEXT,
+            closed_by         TEXT,
+            last_attempt_by   TEXT,
+            recorded_session  TEXT
         )
     """,
     # ── WS-2 sensor fabric (M9/M10) ──────────────────────────────────────
@@ -2619,6 +2668,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_memory_links_target ON memory_links(target_id)",
     # credential access log (audit trail for reference store credential lookups)
     "CREATE INDEX IF NOT EXISTS idx_credential_access_unit ON credential_access_log(unit_id, accessed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_client_tool_calls_client_time ON client_tool_calls(client, called_at)",
     # inbox items
     "CREATE INDEX IF NOT EXISTS idx_inbox_items_status ON inbox_items(status)",
     "CREATE INDEX IF NOT EXISTS idx_inbox_items_file_path ON inbox_items(file_path)",
@@ -2748,6 +2798,17 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_memory_meta_superseded_by ON memory_metadata(superseded_by)",
     # knowledge_units
     "CREATE INDEX IF NOT EXISTS idx_knowledge_units_qdrant_id ON knowledge_units(qdrant_id)",
+    # The secret_ref triggers and the orphan sweep look units up by secret_ref.
+    "CREATE INDEX IF NOT EXISTS idx_knowledge_units_secret_ref ON knowledge_units(secret_ref) "
+    "WHERE secret_ref IS NOT NULL",
+    # A credential's identity is the hash of its full name (#2426): one trusted
+    # entry per name, so two concurrent first saves of a name end as one entry.
+    # A hash that is not 64 hex (a later legacy name differing only in case,
+    # which the backfill keeps) is outside it. Also created by migration
+    # 20261115060803_credential_name_hash.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_units_name_hash "
+    "ON knowledge_units(project_type, domain, name_hash) "
+    "WHERE name_origin = 'trusted' AND length(name_hash) = 64",
     # codebase index
     "CREATE INDEX IF NOT EXISTS idx_code_symbols_module ON code_symbols(module_path)",
     "CREATE INDEX IF NOT EXISTS idx_code_symbols_name ON code_symbols(name)",

@@ -1,4 +1,1 @@
-Added explicit shared MCP startup with frozen operator limits, actual standalone
-service initializers and owned provider cleanup. Registered resource work settles
-before clients/caches close, including partial startup and signal shutdown. The
-rollout remains off; unit readiness and client switching are separate changes.
+- **Shared MCP services can start explicitly with `--shared-service`.** Startup freezes the operator limits, runs the actual standalone service initializers, and owns provider cleanup: registered resource work settles before clients and caches close, including after a partial startup or a signal. A start that never completes exits non-zero. The rollout stays off; unit readiness and client switching are separate changes.

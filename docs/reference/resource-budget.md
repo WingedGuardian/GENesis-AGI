@@ -108,8 +108,15 @@ WAIT build
 2. On GO it launches the command in a transient user scope named
    `genesis-job-<name>-<id>.scope`, with the estimates as hard caps:
    `MemoryMax` = `--ram`, `MemorySwapMax=0`, `CPUQuota` = `--cpu`, plus
-   `IOWeight=50` (effective only where the io controller is delegated) and
-   `OOMPolicy=continue`. The scope runs in `app-capped.slice` (a child of
+   `IOWeight=50` and
+   `OOMPolicy=continue`. The weight can only work where the io controller is
+   delegated to the user manager, and even then only under the BFQ scheduler or
+   the iocost controller (`io.cost.qos`): delegation is necessary, not
+   sufficient. Where io is not delegated, the infrastructure posture check
+   names it: a low-priority note when nothing else is open, otherwise inside
+   the high alert. Changing the user manager's `Delegate=` usually needs a
+   user-manager restart, which restarts every user unit,
+   including the Genesis server and every running session. The scope runs in `app-capped.slice` (a child of
    `app.slice`, so no ancestor limit changes) unless `--slice` names another,
    e.g. `genesis-workload.slice`. That slice outlives its scopes and keeps its own
    `oom_kill` count, which is how the disk guardian can tell a job killed at its

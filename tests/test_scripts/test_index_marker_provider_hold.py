@@ -1,4 +1,4 @@
-"""Read modeled acceptance states on the real queue; no positive recovery API."""
+"""Read modeled acceptance watermarks; the explicit writer is tested separately."""
 
 import json
 import time
@@ -115,7 +115,7 @@ def test_late_control_conflict_at_accepted_trial_revokes_safety_without_reaccoun
     old, claimed, reservation, registration, closure = _accepted(queue, tmp_path)
     before = queue.execution_status(claimed["context"])
     with pytest.raises(RuntimeError, match="conflict"):
-        control._publish(queue, claimed, {**closure, "observed_ns": registration["stop_usec"] + closure["observed_ns"]})
+        control._publish(queue, claimed, {**closure, "observed_ns": time.monotonic_ns()})
     assert _held(queue, claimed)
     after = queue.execution_status(claimed["context"])
     for field in ("terminal", "typed_applied_state", "typed_charged_attempts", "disposition"):
@@ -140,13 +140,32 @@ def test_unrepresented_old_control_conflict_is_not_hidden_by_later_acceptance(qu
     for offset in (1, 2):
         with pytest.raises(RuntimeError, match="conflict"):
             control._publish(queue, historical, {**closure, "observed_ns": time.monotonic_ns() + offset})
-    # The later clean watermark covers represented older incidents. It cannot
-    # authorize ignoring an extra receipt that the bounded conflict slot lacks.
+    # The watermark covers this known retained older context even when its
+    # extra receipt cannot replace the bounded first-conflict slot. Coverage
+    # must preserve that raw evidence and the historical adverse state.
     assert not _held(queue, accepted)
-    assert list(queue.marker_dir().glob(".execution-spool-*.spool"))
+    spools = {path: path.read_bytes() for path in queue.marker_dir().glob(".execution-spool-*.spool")}
+    assert spools
+    before = queue.execution_status(historical["context"])
+    queue.write_marker(accepted["repo_path"], "cbm", "fast")
+    admitted = queue.claim_native(accepted["hash"], provider="cbm")
+    assert admitted and admitted["context"]["execution_seq"] > accepted["context"]["execution_seq"]
+    assert queue.execution_status(historical["context"]) == before
+    assert all(path.read_bytes() == raw for path, raw in spools.items())
+
+
+def test_raw_control_conflict_on_accepted_trial_is_not_covered_by_its_watermark(queue, tmp_path):
+    _, accepted, _, _, closure = _accepted(queue, tmp_path)
+    for offset in (1, 2):
+        with pytest.raises(RuntimeError, match="conflict"):
+            control._publish(queue, accepted, {**closure, "observed_ns": time.monotonic_ns() + offset})
+    assert _held(queue, accepted)
+    spools = {path: path.read_bytes() for path in queue.marker_dir().glob(".execution-spool-*.spool")}
+    assert spools
     queue.write_marker(accepted["repo_path"], "cbm", "fast")
     with pytest.raises(RuntimeError, match="unrepresented"):
         queue.claim_native(accepted["hash"], provider="cbm")
     assert queue.get_inflight(accepted["hash"]) is None
     assert any(row["provider"] == "cbm" for row in queue.list_markers())
     assert queue.claim_native(accepted["hash"], provider="gitnexus") is not None
+    assert all(path.read_bytes() == raw for path, raw in spools.items())

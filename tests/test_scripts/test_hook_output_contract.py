@@ -274,7 +274,7 @@ _STRUCTURALLY_BOUNDED = {
 #: its peer loop was unbounded — so it could reach the cap, which is exactly what
 #: this category admits. It now routes every model-facing write through
 #: BoundedStdout and bounds each contributing surface by meaning (keyword window,
-#: trail-line pivot selection, code-hint clip, peer LIMIT with a named overflow),
+#: trail-line pivot selection, peer LIMIT with a named overflow),
 #: so it needs no waiver of either kind. Kept rather than deleted: the next hook
 #: that genuinely has this shape needs a labelled place to sit with the rule
 #: attached, or the row gets filed under "structurally bounded", where it is a

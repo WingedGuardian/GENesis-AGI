@@ -1,7 +1,7 @@
 """WS-3: essential_knowledge L1 readers exclude external/unknown-origin rows.
 
-The essential_knowledge.md file is the always-loaded L1 context. Its two
-observation readers (_recent_decisions, _active_session_pivots) must never
+The essential_knowledge.md file is the always-loaded L1 context. Its observation
+reader (_recent_decisions) must never
 surface external_untrusted or NULL-origin (unknown) content — that would put
 attacker-controlled text into every session's L1. Own-session content stamps
 `owner`/`first_party` and is kept.
@@ -15,10 +15,7 @@ import aiosqlite
 import pytest
 
 from genesis.db.schema import create_all_tables, seed_data
-from genesis.memory.essential_knowledge import (
-    _active_session_pivots,
-    _recent_decisions,
-)
+from genesis.memory.essential_knowledge import _recent_decisions, generate_deterministic
 
 
 @pytest.fixture
@@ -56,8 +53,10 @@ async def test_recent_decisions_excludes_external_and_null(db):
 
 
 @pytest.mark.asyncio
-async def test_active_session_pivots_excludes_external_and_null(db):
-    # Each pivot source must be distinct (the reader GROUPs BY source).
+async def test_snapshot_carries_no_live_session_fields(db):
+    """Active Work used to be raw pivot trigger text (the user's own prompt),
+    and the session count a bare COUNT of active rows; both now live in the
+    session-start in-flight block. A pivot written here must not reach L1."""
     await _mk(
         db,
         "p_owner",
@@ -66,31 +65,22 @@ async def test_active_session_pivots_excludes_external_and_null(db):
         source="session:owner-sess",
         content="Conversation pivot: topic. Trigger: OWNER_TRIGGER",
     )
-    await _mk(
-        db,
-        "p_ext",
-        "conversation_pivot",
-        "external_untrusted",
-        source="session:ext-sess",
-        content="Conversation pivot: topic. Trigger: EXT_TRIGGER",
+    now = datetime.now(UTC).isoformat()
+    await db.execute(
+        "INSERT INTO cc_sessions (id, session_type, model, status, started_at, "
+        "last_activity_at) VALUES ('live', 'foreground', 'm', 'active', ?, ?)",
+        (now, now),
     )
-    await _mk(
-        db,
-        "p_null",
-        "conversation_pivot",
-        None,
-        source="session:null-sess",
-        content="Conversation pivot: topic. Trigger: NULL_TRIGGER",
-    )
+    await db.commit()
+    out = await generate_deterministic(db)
+    assert "Active Work" not in out
+    assert "Active sessions" not in out
+    assert "OWNER_TRIGGER" not in out
 
-    out = await _active_session_pivots(db)
-    joined = "\n".join(out)
-    assert "OWNER_TRIGGER" in joined
-    assert "EXT_TRIGGER" not in joined
-    assert "NULL_TRIGGER" not in joined
+
 # ── _recent_session_topics: the third L1 reader ────────────────────────────
 #
-# The two readers above filter on observation ORIGIN. Session topics are a
+# The reader above filters on observation ORIGIN. Session topics are a
 # separate path with a separate column (cc_sessions.channel), and it was
 # unfiltered: a gateway-channel session topic could reach L1, which is
 # injected into every session. These pin the channel filter.

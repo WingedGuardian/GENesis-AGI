@@ -20,11 +20,22 @@ import sys
 import tempfile
 from contextlib import ExitStack
 from pathlib import Path
+from types import MappingProxyType
 
 # v0.11.0 Linux x86_64 portable release, independently matched to release digest.
 BUILD = "ce11c141431aeadd788506c3a7e6942db8fd438dec369d0707a39ec9fd8c6510"  # pragma: allowlist secret (public executable digest, not a secret)
+RELEASES = MappingProxyType({
+    BUILD: MappingProxyType(dict(version="0.11.0", worker="v0.11.0-stock-worker")),
+})
 MAX_RESPONSE = 1024 * 1024
 JOB_CAP = 8 * 1024**3
+
+
+def qualified_release(build: str):
+    """Select reviewed code policy by exact digest, never by a version range."""
+    if not isinstance(build, str) or build not in RELEASES:
+        raise ValueError("unsupported managed build; repeat acceptance before upgrading")
+    return RELEASES[build]
 
 
 def verify_scope(env: dict[str, str]) -> int:
@@ -75,23 +86,51 @@ def load_managed() -> dict:
     return runpy.run_path(str(Path(__file__).resolve().parents[1] / "codebase_managed.py"))
 
 
-def _execute_stock_worker(path: Path, args: argparse.Namespace, cap: int) -> int:
+def _execute_stock_worker(path: Path, args: argparse.Namespace, cap: int, *, queued_factory=None,
+                          queued_native_environment=None) -> int:
+    if queued_native_environment is not None and queued_factory is None:
+        raise ValueError("frozen native environment requires the queued factory")
     with ExitStack() as resources:
         spawn_started = False
+        queued = None
+        environment = None
         try:
             if cap != JOB_CAP:
                 raise ValueError("managed worker requires the full 8 GiB job cap")
             managed = load_managed()
             resources.enter_context(managed["lifecycle_lock"](shared=True))
-            config = managed["runtime_config"](managed["config_path"](str(path)))
+            settings_path = managed["config_path"](str(path))
+            if queued_factory is None:
+                config = managed["runtime_config"](settings_path)
+            else:
+                settings = []
+                config = managed["runtime_config"](settings_path, capture=settings.append)
+                if len(settings) != 1 or type(settings[0]) is not bytes:
+                    raise ValueError("queued worker requires one captured settings document")
+                current_environment = managed["native_env"](config)
+                if queued_native_environment is None:
+                    environment = MappingProxyType(current_environment)
+                else:
+                    environment = queued_native_environment.frozen
+                    canonical = managed["native_env"](config, environment=environment)
+                    if dict(environment) != canonical:
+                        raise ValueError("frozen native environment paths differ from current settings")
+                queued = queued_factory(config, args, cap, settings[0], environment)
+                queued.register()
+                if queued_native_environment is not None:
+                    environment = queued_native_environment.resolve(
+                        queued.registration["invocation_id"], dict(os.environ))
             if not Path(args.repo_path).is_absolute() or Path(args.repo_path).resolve(
                 strict=True
             ) != Path(config["main"]):
                 raise ValueError("worker requires the configured physical main checkout")
             managed["verify_worker_writes"](config, args.persistence == "true")
             managed["verify_cache"](config)
-            managed["ready"](config)
-            executable = managed["verified_binary"](Path(config["binary"]))
+            if queued_native_environment is None:
+                managed["ready"](config)
+            else:
+                managed["ready"](config, environment=environment)
+            executable = managed["verified_binary"](Path(config["binary"]), config["build"])
             # Keep the accepted inode through child creation, but close the
             # lifecycle admission lock immediately after Popen, before wait.
             with (
@@ -103,9 +142,12 @@ def _execute_stock_worker(path: Path, args: argparse.Namespace, cap: int) -> int
                 managed["require_enabled"](config)
                 managed["check_backend"](config)
                 spawn_started = True
-                return _spawn_worker(managed, config, binary, args, cap, Path(directory), resources)
+                return _spawn_worker(managed, config, binary, args, cap, Path(directory), resources,
+                                     queued=queued, environment=environment)
         except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError):
-            if not spawn_started:
+            if queued is not None and queued.registration is not None and not spawn_started:
+                queued.refuse_preparation()
+            elif queued_factory is None and not spawn_started:
                 marker = os.environ.get("CODE_INTEL_CHILD_REFUSAL_MARKER")
                 if marker:
                     Path(marker).write_text("refused\n")
@@ -113,7 +155,8 @@ def _execute_stock_worker(path: Path, args: argparse.Namespace, cap: int) -> int
 
 
 def _spawn_worker(
-    managed: dict, config: dict, executable, args, cap: int, directory: Path, admission: ExitStack
+    managed: dict, config: dict, executable, args, cap: int, directory: Path, admission: ExitStack,
+    *, queued=None, environment=None,
 ) -> int:
     response = Path(directory) / "response.json"
     command = [
@@ -121,7 +164,7 @@ def _spawn_worker(
         "cli",
         "--index-worker",
         "--index-worker-build",
-        BUILD,
+        config["build"],
         "index_repository",
         json.dumps(
             {
@@ -135,6 +178,21 @@ def _spawn_worker(
         "--index-worker-memory-budget-bytes",
         str(cap * 3 // 4),
     ]
+    if queued is not None:
+        provider_ok = False
+        try:
+            report = queued.native(command, executable, after_spawn=admission.close,
+                                   pass_fds=(executable.fileno(),), env=environment,
+                                   cwd=config["main"])
+            if report["outcome"] != "complete" or report["payload_returncode"] != 0:
+                return 111
+            result = read_result(response)
+            provider_ok = True
+            print(json.dumps(result))
+            return 0
+        finally:
+            if queued.report is not None:
+                queued.terminal(provider_ok=provider_ok)
     process = subprocess.Popen(
         ["/bin/bash", str(Path(__file__).with_name("code_intel_index.sh")),
          "--exec-indexer-with-oom-adj", *command],
@@ -150,7 +208,7 @@ def _spawn_worker(
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, queued_factory=None, queued_native_environment=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-path", required=True)
     parser.add_argument("--mode", choices=("fast", "moderate", "full"), required=True)
@@ -161,8 +219,18 @@ def main(argv: list[str] | None = None) -> int:
         if not Path(args.repo_path).is_absolute():
             raise ValueError("repository path must be absolute")
         cap = verify_scope(dict(os.environ))
-        return _execute_stock_worker(Path(args.managed_config), args, cap)
+        if queued_native_environment is not None:
+            return _execute_stock_worker(Path(args.managed_config), args, cap,
+                                         queued_factory=queued_factory,
+                                         queued_native_environment=queued_native_environment)
+        if queued_factory is None:
+            return _execute_stock_worker(Path(args.managed_config), args, cap)
+        return _execute_stock_worker(Path(args.managed_config), args, cap,
+                                     queued_factory=queued_factory)
     except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as exc:
+        if queued_native_environment is not None:
+            # The private captured reporter owns class-only error diagnostics.
+            raise
         print(f"code-intel: stock worker refused/failed: {exc}", file=sys.stderr)
         return 111
 

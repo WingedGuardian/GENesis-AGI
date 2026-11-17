@@ -146,6 +146,10 @@ cleanup() {
   local rc=$?
   set +e
   rm -f "$NOCOW_TMP" "$NOCOW_TMP"-wal "$NOCOW_TMP"-shm
+  # The backup is only ever READ (its integrity check), so any -wal/-shm beside
+  # it is an empty side file a killed check left, never data. The backup itself
+  # is kept.
+  rm -f "$BAK"-wal "$BAK"-shm
   if [ "$rc" -ne 0 ]; then
     log "FAILED at stage '$STAGE' (rc=$rc)."
     # Only a failure AT/AFTER the inode swap can leave a bad genesis.db; a

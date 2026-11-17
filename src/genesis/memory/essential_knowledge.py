@@ -20,11 +20,21 @@ from pathlib import Path
 import aiosqlite
 
 from genesis.db.crud.observations import SAFE_ORIGIN_SQL, SAFE_SURFACING_ORIGINS
+from genesis.util.text import ELLIPSIS, clip_words
 
 logger = logging.getLogger(__name__)
 
 _OUTPUT_PATH = Path.home() / ".genesis" / "essential_knowledge.md"
 _MAX_TOKENS = 300  # Target size in approximate tokens
+
+# Display lengths, marker included (genesis.util.text.clip_words). They are
+# the old raw-slice lengths, so no line grows; each now ends on a whole word.
+_TOPIC_CHARS = 200
+_FOCUS_CHARS = 200
+_INSIGHT_CHARS = 250
+# How much of an insight row is read, and deduplicated on, before it is
+# clipped for display. Bounded so a huge row never crosses into Python whole.
+_INSIGHT_READ_CHARS = 1000
 
 
 async def generate_deterministic(db: aiosqlite.Connection) -> str:
@@ -44,24 +54,14 @@ async def generate_deterministic(db: aiosqlite.Connection) -> str:
         f"Store: {memory_count} memories | {obs_count} observations"
     )
 
-    # System state: ego focus + active sessions
+    # System state: ego focus. Live sessions and what they are working on are
+    # NOT here: this file is written at a session's END and read at the next
+    # one's start, so they would describe an earlier moment. The in-flight
+    # block (memory/open_loops.py) computes them at session start.
     ego_focus = await _ego_focus(db)
-    active_sessions = await _active_session_count(db)
-    state_lines: list[str] = []
     if ego_focus:
-        state_lines.append(f"- Ego focus: {ego_focus}")
-    if active_sessions > 0:
-        state_lines.append(f"- Active sessions: {active_sessions}")
-    if state_lines:
         parts.append("\n### System State")
-        parts.extend(state_lines)
-
-    # Active work: most recent pivot per active session (last 4h)
-    active_work = await _active_session_pivots(db)
-    if active_work:
-        parts.append("\n### Active Work (now)")
-        for line in active_work:
-            parts.append(f"- {line}")
+        parts.append(f"- Ego focus: {ego_focus}")
 
     # Active context: recent session topics (last 7 days)
     sessions = await _recent_session_topics(db, days=7)
@@ -159,42 +159,6 @@ async def _count_observations(db: aiosqlite.Connection) -> int:
         return 0
 
 
-async def _active_session_pivots(db: aiosqlite.Connection) -> list[str]:
-    """Get the most recent conversation pivot per session active in last 4h.
-
-    Provides a real-time "what's happening right now" snapshot without LLM.
-    Groups by session, takes most recent pivot per session, returns top 5.
-    """
-    try:
-        cursor = await db.execute(
-            "SELECT source, content, MAX(created_at) as latest "  # noqa: S608 - SAFE_ORIGIN_SQL is a module constant literal, no user input
-            "FROM observations "
-            "WHERE type = 'conversation_pivot' "
-            "AND created_at > datetime('now', '-4 hours') "
-            # WS-3: exclude external/unknown-origin rows from the L1 file
-            # (fail-closed; NULL excluded). Own-session pivots stamp `owner`.
-            f"AND {SAFE_ORIGIN_SQL} "
-            "GROUP BY source "
-            "ORDER BY latest DESC LIMIT 5"
-        )
-        rows = await cursor.fetchall()
-        results = []
-        for row in rows:
-            content = row[1] or ""
-            # Strip the "Conversation pivot: " prefix if present
-            if content.startswith("Conversation pivot:"):
-                content = content[len("Conversation pivot:"):].strip()
-            # Extract trigger text (more useful than the summary slug)
-            if "Trigger:" in content:
-                trigger = content.split("Trigger:", 1)[1].strip()
-                results.append(trigger[:120])
-            else:
-                results.append(content[:120])
-        return results
-    except Exception:
-        return []
-
-
 def _safe_origin_values() -> tuple[str, ...]:
     """Origin classes that may reach L1.
 
@@ -288,7 +252,7 @@ async def _recent_session_topics(db: aiosqlite.Connection, days: int = 7) -> lis
             sql, (*allowed, *safe_origins, f"-{days} days"),
         )
         rows = await cursor.fetchall()
-        return [row[0][:200] for row in rows if row[0]]
+        return [clip_words(row[0], _TOPIC_CHARS) for row in rows if row[0]]
     except Exception:
         return []
 
@@ -363,12 +327,12 @@ async def _recent_decisions(
         # could be all one text. The scan stops once ``limit`` distinct
         # entries are collected, which bounds the work instead.
         results: list[str] = []
-        seen: set[str] = set()
-        # The 250-char display slice is taken in SQL, so a long row never
-        # crosses into Python whole, and the dedup key is computed on exactly
-        # the text that would be shown.
+        seen: set[str | tuple[str, str]] = set()
+        # The read is capped in SQL, so a long row never crosses into Python
+        # whole. Dedup keys on that capped text, not on the shorter display
+        # clip: rows that share their opening and differ later are distinct.
         async with db.execute(
-            "SELECT substr(content, 1, 250) FROM observations "  # noqa: S608 - literal SQL fragments; values bound as parameters
+            "SELECT substr(content, 1, ?) FROM observations "  # noqa: S608 - literal SQL fragments; values bound as parameters
             f"WHERE type NOT IN ({placeholders}) "
             "AND resolved = 0 "
             # WS-3: exclude external/unknown-origin content from the L1 file
@@ -376,16 +340,29 @@ async def _recent_decisions(
             f"AND {SAFE_ORIGIN_SQL} "
             "AND created_at > datetime('now', ?) "
             "ORDER BY created_at DESC",
-            (*_EXCLUDED_TYPES, f"-{days} days"),
+            (_INSIGHT_READ_CHARS, *_EXCLUDED_TYPES, f"-{days} days"),
         ) as cursor:
             async for row in cursor:
-                shown = row[0]
-                if not shown:
+                text = row[0]
+                if not text:
                     continue
-                key = _insight_dedup_key(shown)
-                if key in seen:
+                key = _insight_dedup_key(text)
+                shown = clip_words(text, _INSIGHT_CHARS)
+                # Also dedup on what is SHOWN: two rows that differ only
+                # past the display cut would otherwise print as two lines
+                # that look identical.
+                # Keyed on the 250-char WINDOW, not the clip: a short row shown
+                # whole and a longer one shown with "…" share that window.
+                shown_key = ("shown", _insight_dedup_key(text[:_INSIGHT_CHARS]))
+                # And on the clip itself: the clip drops the word crossing the
+                # cut, so rows differing only inside that word share a clip
+                # while their windows differ.
+                display_key = ("display", _insight_dedup_key(shown.removesuffix(ELLIPSIS)))
+                if key in seen or shown_key in seen or display_key in seen:
                     continue
                 seen.add(key)
+                seen.add(shown_key)
+                seen.add(display_key)
                 results.append(shown)
                 if len(results) >= limit:
                     break
@@ -438,8 +415,11 @@ async def _ego_focus(db: aiosqlite.Connection) -> str | None:
         )
         row = await cursor.fetchone()
         if row and row[0]:
-            focus = row[0][:200]
-            if _BEHAVIORAL_FOCUS_RE.search(focus):
+            focus = clip_words(row[0], _FOCUS_CHARS)
+            # The safety filter reads the OLD 200-char window, not the clip: a
+            # word-boundary clip can drop a phrase ending at character 200
+            # that the raw slice kept.
+            if _BEHAVIORAL_FOCUS_RE.search(row[0][:_FOCUS_CHARS]):
                 logger.warning(
                     "Ego focus contains behavioral self-assignment, "
                     "omitting from essential knowledge: %s",
@@ -450,18 +430,6 @@ async def _ego_focus(db: aiosqlite.Connection) -> str | None:
         return None
     except Exception:
         return None
-
-
-async def _active_session_count(db: aiosqlite.Connection) -> int:
-    """Count currently active CC sessions."""
-    try:
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM cc_sessions WHERE status = 'active'"
-        )
-        row = await cursor.fetchone()
-        return row[0] if row else 0
-    except Exception:
-        return 0
 
 
 async def _wing_stats(db: aiosqlite.Connection) -> dict[str, int]:
@@ -486,7 +454,6 @@ async def _wing_stats(db: aiosqlite.Connection) -> dict[str, int]:
         return {row[0]: row[1] for row in rows if row[0] in WINGS}
     except Exception:
         return {}
-
 
 
 async def _upcoming_events(

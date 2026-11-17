@@ -1,0 +1,2 @@
+- Inbox evaluations preserve literal delimiter punctuation and use source-proven wrappers consistently across prompts, coverage enforcement and the coverage report.
+- Support same-line prose wrappers, quoted Markdown links and matching backtick runs, retaining raw tokens whenever early or ambiguous closure prevents a wrapper proof.

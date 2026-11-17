@@ -28,7 +28,8 @@ def db():
 
 
 @pytest.fixture()
-def store(embedding_provider, qdrant, db):
+def store(embedding_provider, qdrant, db, monkeypatch):
+    monkeypatch.setattr("genesis.memory.entity_resolution.load_aliases", lambda: {})
     return MemoryStore(
         embedding_provider=embedding_provider,
         qdrant_client=qdrant,
@@ -96,3 +97,24 @@ async def test_store_dedup_skips_auto_link(store):
         await store.store("duplicate", "src")
 
     linker.auto_link.assert_not_awaited()
+
+
+@pytest.mark.asyncio()
+async def test_dedup_false_never_returns_an_existing_id(store, embedding_provider):
+    """dedup=False (a credential write, #2426): the id always names a fresh
+    memory this call created, even when identical content is already stored."""
+    with patch("genesis.memory.store.memory_crud") as mock_mem, patch(
+        "genesis.memory.store.upsert_point",
+    ):
+        mock_mem.find_exact_duplicate = AsyncMock(return_value="existing-uuid")
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        memory_id, created = await store.store_reporting_creation(
+            "duplicate content", "src", dedup=False,
+        )
+
+    assert created is True
+    assert memory_id != "existing-uuid"
+    assert len(memory_id) == 36
+    mock_mem.find_exact_duplicate.assert_not_awaited()
+    embedding_provider.embed.assert_awaited_once()

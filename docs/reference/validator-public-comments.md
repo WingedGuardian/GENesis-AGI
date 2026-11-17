@@ -6,8 +6,10 @@ It does not create reviews, inline comments, edits or reactions. Issue creation
 keeps its existing title/area/difficulty arguments; mixing them with comment
 mode refuses. `--dry-run` performs the checks and submits nothing.
 
-The caller owns authorization and privacy judgment. Never publish an unfixed
-security defect or private finding. The scanner detects supported patterns;
+The caller owns authorization and privacy judgment. Never publish a comment
+whose content necessarily reveals protected information or gives an outside
+party a path to exploit an unfixed flaw (CLAUDE.md, "Where deferred work
+goes"); a flaw described at class level is publishable. The scanner detects supported patterns;
 passing it is not a universal privacy guarantee or permission to publish.
 Validators must not use comments to request development reviews or trigger paid
 agents. This Python entry point is not the direct-gh review-budget classifier.

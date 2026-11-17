@@ -42,6 +42,14 @@ limits and gate-surface marked confirmation remain the shared evaluator's rules.
 The adapter does not define another counter or policy. Unrelated read-only shell
 commands perform no cloud budget lookup.
 
+The shared evaluator re-reads the PR head, reviews, comments and commit graph.
+An unrelated comment added, edited or removed between reads does not stop an
+action when both complete policy results are successful and identical. This
+comparison includes findings, reflection keys, marks and reviewer attribution,
+not just the approval decision. Different or unknown results still stop; an
+exhausted budget still requires approval. Existing pagination and bounded
+read-failure recovery remain; this adds no lookup or action retry.
+
 Guarded actions must be standalone, unwrapped commands. Compounds, prior `cd`,
 `pushd`, `env -C`, command-scoped assignments and other wrappers are refused.
 For commits, use exactly `git -C /absolute/canonical/path commit …`: one literal,

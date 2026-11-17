@@ -357,7 +357,7 @@ def test_shipped_capture_resolves_locally_under_hostile_cdpath(script: str, tmp_
     """
     text = (REPO_ROOT / "scripts" / script).read_text(encoding="utf-8")
     hit = next(
-        ((m.group("var"), ln.strip()) for ln in text.splitlines() if (m := _CAPTURE.match(ln))),
+        ((m.group("var"), ln.strip()) for ln in text.splitlines() if (m := _CAPTURE.match(ln.strip()))),
         None,
     )
     assert hit, f"no self-dir capture found in {script} -- has it been renamed or reworked?"

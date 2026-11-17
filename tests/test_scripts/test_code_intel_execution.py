@@ -72,6 +72,26 @@ def test_scope_snapshot_and_actual_finality(scope):
     assert probe.finality(facts)["pids_current"] == 1
 
 
+@pytest.mark.parametrize('state', ['Z', 'X', 'x'])
+def test_default_scope_proof_still_refuses_terminal_reporters(scope, state):
+    probe, _, proc = scope
+    path = proc / 'self/stat'
+    prefix, separator, tail = path.read_text().rpartition(') ')
+    path.write_text(prefix + separator + state + tail[1:])
+    with pytest.raises(ValueError, match='scope subject has already ended'):
+        probe.capture()
+
+
+@pytest.mark.parametrize('state', ['X', 'x'])
+def test_owned_zombie_option_does_not_accept_dead_subjects(scope, evidence, state):
+    _, _, proc = scope
+    path = proc / 'self/stat'
+    prefix, separator, tail = path.read_text().rpartition(') ')
+    path.write_text(prefix + separator + state + tail[1:])
+    with pytest.raises(ValueError, match='scope subject has already ended'):
+        evidence['_process_state'](proc / 'self', os.getpid(), allow_zombie=True)
+
+
 @pytest.mark.parametrize(
     "fault",
     [
