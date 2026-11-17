@@ -364,7 +364,7 @@ async def test_the_secret_lands_on_the_row_that_survives_the_key_conflict(db):
         project_type="reference",
         domain="reference.credentials",
         source_doc="x",
-        concept="Lab router admin",
+        concept=(await kc.get(db, first))["concept"],
         body=(await kc.get(db, first))["body"],
         secret_value="user: example-admin, password: New!Fake-3",
     )
@@ -634,8 +634,10 @@ async def test_a_direct_upsert_stores_the_credential_key_canonically(db):
 async def test_a_failed_body_write_leaves_the_stored_pair_and_one_orphan(db, existing):
     """A unit write that fails leaves the stored value as it was: the new
     secret row is an orphan no unit names, which the sweep removes later."""
+    # A credential is stored under an opaque key: write to the seeded one.
+    key = "Lab router admin"
     if existing:
-        await _ingest(db, _store(), _body())
+        key = (await kc.get(db, await _ingest(db, _store(), _body())))["concept"]
     held = _body().replace(f"Value: {_VALUE}", f"Value: {kc.SECRET_PLACEHOLDER}")
     with pytest.raises(aiosqlite.IntegrityError):
         await kc.upsert(
@@ -643,7 +645,7 @@ async def test_a_failed_body_write_leaves_the_stored_pair_and_one_orphan(db, exi
             project_type="reference",
             domain="reference.credentials",
             source_doc=None,
-            concept="Lab router admin",
+            concept=key,
             body=held,
             secret_value="Rotated!Fake-5",
             _commit=False,
@@ -652,7 +654,7 @@ async def test_a_failed_body_write_leaves_the_stored_pair_and_one_orphan(db, exi
     if existing:
         unit = (await kc.find_by_unique_key(
             db, project_type="reference", domain="reference.credentials",
-            concept="Lab router admin",
+            concept=key,
         ))["id"]
         assert await _secret(db, unit) == _VALUE
     named = await db.execute_fetchall(

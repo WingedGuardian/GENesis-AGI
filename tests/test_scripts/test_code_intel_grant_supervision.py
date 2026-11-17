@@ -122,7 +122,8 @@ def cbm_configuration(supervisor, request, modules, monkeypatch, *, enabled=True
             held.pop()
 
     @contextmanager
-    def verified(path):
+    def verified(path, expected_build):
+        assert expected_build == config["build"]
         assert path == Path(config["binary"]) and held == [True]
         with open("/dev/null", "rb") as stream:
             streams.append(stream)
