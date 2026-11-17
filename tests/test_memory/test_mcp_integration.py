@@ -83,6 +83,35 @@ async def test_memory_store_delegates(mock_deps, tools):
     )
 
 
+@pytest.mark.parametrize("success", [False, True])
+async def test_memory_store_reports_requested_supersession(mock_deps, tools, success):
+    _init_with_mocks(mock_deps)
+    old_id = "abcd1234-0000-4000-8000-000000000001"
+    new_id = "efab5678-0000-4000-8000-000000000002"
+
+    async def store(*args, **kwargs):
+        assert kwargs["supersede_outcome"] == {"superseded": False}
+        kwargs["supersede_outcome"].update(superseded=success, old_id=old_id, new_id=new_id)
+        return new_id
+
+    memory_mcp._store.store = AsyncMock(side_effect=store)
+    result = await tools["memory_store"].fn(content="correction", source="test", supersedes="id:abcd1234")
+    assert result["memory_id"] == new_id
+    assert result["superseded"] is success
+    assert (result["old_id"], result["new_id"]) == (old_id, new_id)
+    if success:
+        assert "repair" not in result
+    else:
+        assert result["repair"] == f"memory_supersede(old_id={old_id!r}, new_id={new_id!r})"
+
+
+async def test_memory_store_whitespace_remains_bare_id(mock_deps, tools):
+    _init_with_mocks(mock_deps)
+    memory_mcp._store.store = AsyncMock(return_value="existing")
+    assert await tools["memory_store"].fn(content="fact", source="test", supersedes=" \n ") == "existing"
+    assert "supersede_outcome" not in memory_mcp._store.store.await_args.kwargs
+
+
 @pytest.mark.asyncio
 async def test_memory_store_forwards_session_origin_env(mock_deps, tools, monkeypatch):
     """WS-3: a dispatched session's GENESIS_SESSION_ORIGIN is forwarded to
