@@ -262,3 +262,62 @@ def test_a_secret_after_many_repeats_of_its_probe_is_masked_whole():
     strict, named = rm.value_masks("Fake123 " * 300 + "Demo@Fake123")
     assert named.mask("Demo@Fake123 router") == "[held] router"
     assert strict.mask("Demo@Fake123") == "[held]"
+
+
+# ─── merging probes from several sources ─────────────────────────────────────
+
+
+def test_a_login_is_exempt_only_when_every_source_has_it_as_a_login():
+    """The current password equals the old entry's login: the identifier still
+    masks it, because one source requires it as a secret."""
+    _strict, named = rm.value_masks("newuser / admin9x", also=(("admin9x / OldPass7!", None),))
+    assert named.mask("router admin9x") == "router [held]"
+    _strict, named = rm.value_masks("admin9x / Pw9fake!x", also=(("admin9x / OldPass7!", None),))
+    assert named.mask("admin9x router") == "admin9x router"
+
+
+def test_a_probe_given_both_unbounded_and_whole_word_stays_unbounded():
+    """A captured "pin: 4821" (whole word) never weakens the value's own
+    unbounded probe of the same digits."""
+    assert rm.value_masks("4821")[0].mask("router4821") == "router[held]"
+    assert rm.value_masks("4821", detail="pin: 4821")[0].mask("router4821") == "router[held]"
+
+
+def _within(seconds: float, call):
+    """``call()`` run in a daemon thread: fails, rather than hangs, when it does
+    not return in ``seconds``."""
+    import threading
+
+    out: list = []
+    worker = threading.Thread(target=lambda: out.append(call()), daemon=True)
+    worker.start()
+    worker.join(seconds)
+    assert not worker.is_alive(), "masking did not terminate"
+    return out[0]
+
+
+def test_an_empty_normalised_probe_is_dropped():
+    """A captured secret of zero-width characters normalises to nothing: it is
+    no probe, and masking terminates."""
+    strict, _named = rm.value_masks("password: " + "​" * 4, prose=True)
+    assert _within(5, lambda: strict.mask("-")) == "-"
+
+
+def test_an_old_value_grows_a_match_over_its_own_runs():
+    """A held old URL's password ``Demo@Fake123`` is masked whole in a name,
+    not only its secret-shaped fragment: runs come from every secret source."""
+    old = "https://admin:Demo@Fake123@example.org"
+    strict, named = rm.value_masks("NewPw9!x", also=((old, None),))
+    assert named.mask("pw Demo@Fake123 y") == "pw [held] y"
+    assert strict.mask("pw Demo@Fake123 y") == "pw [held] y"
+
+
+def test_a_value_spelling_the_mask_text_is_masked():
+    """A value with ``[held]`` literally inside is masked where a tag spells it;
+    text around a REAL mask of a value without it still never joins."""
+    strict, _named = rm.value_masks("orange[held]banana")
+    assert strict.mask("tag orange[held]banana") == "tag [held]"
+    assert rm._mask_tag(strict, "orange[held]banana") is None
+    strict, _named = rm.value_masks("abcd1234")
+    assert not strict.carries("abcd[held]1234")
+    assert strict.mask("abcd[held]1234") == "abcd[held]1234"

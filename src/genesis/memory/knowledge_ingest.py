@@ -48,6 +48,10 @@ _MAX_IDENTIFIER = 512
 #: The pipeline labels a credential unit may carry; anything else reads as the
 #: tool's own. A caller's free text never reaches the unit's source_pipeline.
 _PIPELINES = frozenset({"reference_store", "extraction_job", "curated", "knowledge_ingest"})
+#: Where every credential unit is stored: the collection and memory type the
+#: reference_store tool passes, which reference_lookup searches.
+_REFERENCE_COLLECTION = "episodic_memory"
+_REFERENCE_MEMORY_TYPE = "episodic"
 
 
 class UnknownEntryKey(ValueError):  # noqa: N818 - names the state, not an error
@@ -220,6 +224,12 @@ async def _ingest_once(
     secret_meta: str | None = None
     observed: knowledge_crud.KeyObservation | None = None
     credential = reference_ops.holds_secret(project, domain)
+    # The collection the caller named decides the derived origin class, as it
+    # always has; a credential is STORED where reference_lookup searches, from
+    # every writer (an upload, a distilled unit, the knowledge_ingest tool).
+    origin_collection = collection
+    if credential:
+        collection, memory_type = _REFERENCE_COLLECTION, _REFERENCE_MEMORY_TYPE
     if entry_key is not None and not credential:
         raise ValueError("entry_key addresses a credential entry only (#2426)")
     if credential and memory_class is not None and memory_class not in CLASS_WEIGHTS:
@@ -305,6 +315,7 @@ async def _ingest_once(
         # uploaded file): its value is prose (``ValueMask``). Large content is
         # split off the event loop (an upload can be 2 MB).
         prose = "\n\nValue: " not in content
+        given = content
         split = functools.partial(
             reference_ops.split_secret, content, header=header, value=held_value, detail=held_detail,
         )
@@ -316,6 +327,17 @@ async def _ingest_once(
         target, identity, entries = (None, reference_ops.name_hash(flat), []) if nameless else (
             await _resolve_by_name(db, project, domain, flat, secret_value, carded=carded, insert_only=insert_only)
         )
+        first, sep, _ = given.partition("\n")
+        if sep and first != header and any(
+            first == (entry.body or "").partition("\n")[0] for entry in entries
+        ):
+            # A body read back and saved again starts with the header STORED
+            # for the entry its name resolves to (its name masked): that line
+            # is the header, never description text (comment 4579950912). The
+            # value is the same either way, so the resolution stands.
+            header = first
+            split = functools.partial(split, header=header)
+            content, secret_value, secret_detail = await asyncio.to_thread(split) if large else split()
         if insert_only and secret_value is not None:
             for entry in entries:
                 # An untrusted write of the credential an untrusted entry already
@@ -478,7 +500,7 @@ async def _ingest_once(
         resolved_origin = derive_origin_class(
             origin_class=origin_class,
             source_pipeline=source_pipeline_val,
-            collection=collection,
+            collection=origin_collection,
         )
         # memory_type is passed by name at each call below, not in this dict: the
         # store-subsystem coverage test finds memory writers by their keywords

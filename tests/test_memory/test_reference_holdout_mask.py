@@ -146,6 +146,28 @@ async def test_reference_store_reports_the_name_it_stored_under(db, monkeypatch)
     assert ro.display_name(await kc.get(db, plain)) == "lab wifi" and " " not in plain
 
 
+async def test_knowledge_ingest_returns_a_bare_unit_id_for_a_credential(db, monkeypatch):
+    """Comment 4579951064: ``knowledge_ingest`` promises a unit id; the
+    ``(stored as: ...)`` suffix is ``reference_store``'s reply only."""
+    import genesis.mcp.memory_mcp as memory_mod
+    from genesis.mcp.memory.knowledge import knowledge_ingest
+
+    store = _PointStore()
+    monkeypatch.setattr(memory_mod, "_require_init", lambda: None)
+    monkeypatch.setattr(memory_mod, "_store", store)
+    monkeypatch.setattr(memory_mod, "_db", db)
+    monkeypatch.setattr(memory_mod, "_qdrant", MagicMock())
+    fn = getattr(knowledge_ingest, "fn", knowledge_ingest)
+    result = await fn(
+        content=_body(f"wifi {_SECRET}"),
+        project="reference",
+        domain="reference.credentials",
+        concept=f"wifi {_SECRET}",
+    )
+    assert " " not in result and await kc.get(db, result) is not None
+    assert ro.display_name(await kc.get(db, result)) == "wifi [held]"
+
+
 # ─── item 6: caller fields ───────────────────────────────────────────────────
 
 
@@ -403,6 +425,42 @@ async def test_a_credential_upload_is_stored_held_out(db, memory_mcp, tmp_path):
     )
     row = await _assert_held(db, memory_mcp, ids[0], value=f"lab wifi: {_SECRET}\n", description="")
     assert ro.display_name(row) == "wifi.txt"
+
+
+async def test_uploaded_and_distilled_credentials_are_stored_where_lookup_searches(
+    db, memory_mcp, tmp_path
+):
+    """Comment 4579981604: every credential writer stores in the collection
+    and memory type ``reference_store`` uses (``reference_lookup`` searches
+    episodic_memory), and keeps the origin its own collection derives."""
+    from genesis.knowledge.distillation import KnowledgeUnit
+    from genesis.knowledge.ingest_upload import _store_as_is
+    from genesis.knowledge.manifest import ManifestManager
+    from genesis.knowledge.orchestrator import KnowledgeOrchestrator
+
+    upload = tmp_path / "wifi.txt"
+    upload.write_text(f"lab wifi: {_SECRET}\n")
+    uploaded = await _store_as_is(
+        str(upload), "wifi.txt", project_type="reference",
+        domain="reference.credentials", purpose=None, context="",
+    )
+    orch = KnowledgeOrchestrator(
+        registry=MagicMock(), distillation=MagicMock(),
+        manifest=ManifestManager(root=tmp_path / "knowledge"),
+    )
+    unit = KnowledgeUnit(
+        concept="lab wifi", body=f"The lab wifi password is {_SECRET}",
+        domain="reference.credentials",
+    )
+    distilled = await orch._store_units(
+        [unit], project_type="reference", source="notes.md", content=MagicMock(), purpose=None
+    )
+    assert len(memory_mcp.calls) == 2
+    for call in memory_mcp.calls:
+        assert (call["collection"], call["memory_type"]) == ("episodic_memory", "episodic")
+        assert call["origin_class"] == "external_untrusted"
+    for unit_id in (*uploaded, *distilled):
+        assert (await kc.get(db, unit_id))["origin_class"] == "external_untrusted"
 
 
 # ─── item 2 groundwork: a held value for another reference kind ──────────────
@@ -1946,3 +2004,19 @@ async def test_an_identifier_cap_never_completes_a_whole_word_value(db):
     name = ro.display_name(row)
     assert len(name) <= 512 and not re.search(r"\btiger\b", name)
     assert (await ro.reveal_meta(db, row))["identifier"] == identifier
+
+
+# ─── a stored body saved again ───────────────────────────────────────────────
+
+
+async def test_re_ingesting_a_stored_masked_body_keeps_its_description(db):
+    """Comment 4579950912: a body read back starts with the STORED masked
+    header; saved again under the original name, that header is the header,
+    never description text, so the stored description stays."""
+    store = _PointStore()
+    unit = await _ingest(db, store, _body(f"wifi {_SECRET}"), concept=f"wifi {_SECRET}")
+    stored = (await kc.get(db, unit))["body"]
+    assert stored.startswith("[reference.credentials] wifi [held]\n")
+    again = await _ingest(db, store, stored, concept=f"wifi {_SECRET}")
+    assert again == unit
+    await _assert_held(db, store, again)

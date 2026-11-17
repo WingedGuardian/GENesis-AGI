@@ -312,6 +312,7 @@ async def _ingest_knowledge_unit(
     held_value: str | None = None,
     held_detail: str | None = None,
     entry_key: str | None = None,
+    report_name: bool = False,
 ) -> str:
     """MCP-side wrapper around :func:`ingest_knowledge_unit`.
 
@@ -320,11 +321,12 @@ async def _ingest_knowledge_unit(
     Keeps the MCP dispatch surface thin so the same ingestion pipeline can
     run from non-MCP contexts (e.g. the extraction_job reference extractor).
 
-    Returns the unit id; when a credential's searchable name differs from the
-    identifier asked for (an identifier that carried its value is masked, a
-    long one capped, a missing one named), `` (stored as: <name>)`` follows it,
-    so the caller can find the entry again. That case used to be a refusal, so
-    no caller depends on its shape. The key itself is never in the reply.
+    Returns the unit id. With ``report_name`` (``reference_store`` only: the
+    ``knowledge_ingest`` tool promises a bare unit id), when a credential's
+    searchable name differs from the identifier asked for (an identifier that
+    carried its value is masked, a long one capped, a missing one named),
+    `` (stored as: <name>)`` follows it, so the caller can find the entry
+    again. The key itself is never in the reply.
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
@@ -355,7 +357,12 @@ async def _ingest_knowledge_unit(
         entry_key=entry_key,
     )
     stored_as = getattr(stored, "name", None)
-    if not holds_secret(project, domain) or stored_as is None or stored_as == concept:
+    if (
+        not report_name
+        or not holds_secret(project, domain)
+        or stored_as is None
+        or stored_as == concept
+    ):
         return stored
     return f"{stored} (stored as: {stored_as})"
 
@@ -545,9 +552,10 @@ async def reference_store(
     merely looks like a key, passed as ``identifier``, is a name.
 
     ``value`` is the raw value (password, URL string, IP address, file path,
-    etc.). Stored plaintext (a credential's value and description outside the search index, so a credential is found by its identifier and tags, where any span of the value is masked), so an entry holding
-    a payment card number in any field is refused (the planned card vault
-    is tracked in #3172).
+    etc.). Stored plaintext (a credential's value and description are held
+    outside the search index: it is found by its identifier and tags, where
+    any span of the value is masked), so an entry holding a payment card
+    number in any field is refused (card vault: #3172).
 
     ``description`` is REQUIRED. An IP without "what is this" or a credential
     without "what service" is useless 10 sessions later. Describes the
@@ -560,7 +568,7 @@ async def reference_store(
     ``source`` is optional provenance (``session_id``, ``captured_via``,
     ``captured_at``). Surfaced in the body for audit trails.
 
-    Returns the unit_id of the stored row, followed by
+    Returns the stored row's unit_id, followed by
     `` (stored as: <name>)`` when a credential's searchable name differs from
     the identifier given (it carried its value and was masked, or was capped).
     """
@@ -646,6 +654,7 @@ async def reference_store(
         # multi-line value is never split by how its lines look (#2426).
         **({"held_value": value, "held_detail": description} if kind == "credentials" else {}),
         entry_key=entry_key,
+        report_name=True,
     )
     return unit_id
 
