@@ -184,7 +184,8 @@ No alternate executable or uncapped execution path is provided by the launcher.
 
 Run from the primary Genesis checkout, using the accepted v0.11.0 Linux x86_64
 portable binary from the [upstream release](https://github.com/DeusData/codebase-memory-mcp/releases/tag/v0.11.0).
-Other builds/platforms require new acceptance before changing the build pin.
+Other builds/platforms require native acceptance and a reviewed release record
+before use; currently only that release is qualified.
 The binary must be a regular executable file, rather than a symlink.
 
 ```bash
@@ -196,8 +197,25 @@ The binary must be a regular executable file, rather than a symlink.
 ```
 
 The binary argument names an already obtained executable. This command does
-not download or run an installer. Its digest must match the existing stock
-worker's accepted `BUILD`. It never executes a binary found on PATH.
+not download or run an installer. Its digest must match a record in the captured
+stock worker's immutable `RELEASES` table. It never executes a binary found on PATH.
+Configure discovers the selected build from the retained source descriptor,
+copies that same inode and verifies the copy against the selected digest before
+running native configuration. Schema 2 retains that exact digest as `build`.
+
+Every executing role requires the configured digest, even if a different binary
+at that path is another qualified release. The same identity selects the queue's
+provider label and native worker build argument. Captured runner source includes
+the release table; updating live code does not change an existing capsule's policy
+or authorize reuse of old source-bound retry consent. There is no version-range,
+latest-release or PATH fallback, and no queue/settings migration for this selection.
+
+Future compatible releases add small reviewed records after isolated native
+qualification of configuration, daemon/frontend, worker containment and indexing.
+An upgrade uses fresh state and preserves the old binary/settings/cache bundle.
+Rollback restores that bundle after quiescing the candidate; do not open a cache
+written by a newer format with an older binary. Adding support does not upgrade
+existing settings, activate services or remove the disablement sentinel.
 
 Choose a new, short state path outside the repository and settings directory.
 The provider's native runtime uses Unix sockets and refuses overlong endpoint
@@ -1091,6 +1109,92 @@ cgroup mapping without changing the full worker cap or existing reserves.
 These observations reserve no RAM and do not qualify hidden host limits,
 sustained pressure, deployment peaks or production corpus behavior.
 
+### Explicit supervised retry
+
+The queue endpoint provides `request-retry`, `status-recovery` and `revoke-retry`.
+All take `--repo PATH --provider PROVIDER`.
+`request-retry` additionally requires `--origin pending|failed`, `--mode
+fast|moderate|full`, `--not-after-wall-ns INTEGER` and `--evidence-reference TEXT`.
+Request also accepts `--managed-config PATH`. Revoke requires exactly one of
+`--nonce NONCE` or `--grant-sha256 DIGEST`. Mutating operations require the current captured runner
+and its canonical lock on descriptor8, then take the canonical repository lock
+on descriptor9 internally. A raw queue process cannot substitute for that caller;
+observational `status-recovery` also works without it.
+An explicit schema-5 cutover is a prerequisite, never an implicit side effect.
+
+A retry request names one existing pending or failed provider request, its
+requested mode, a wall-clock deadline and an opaque evidence reference. It does
+not manufacture zero-debt work. The grant binds the actual request snapshot,
+provider evidence and frontier, provider startup and runner/watchdog source,
+policy, original boot and both wall and monotonic deadlines. The explicit
+issue-to-expiry interval must be positive and at most four hours. Evidence
+references must be nonempty, NUL-free valid UTF8, at most4096encoded bytes;
+oversized values are rejected rather than truncated. Issuance checks global
+managed-scope absence and capacity for the full 8 GiB worker plus sibling and
+cache reserves, each at least2GiB; larger explicit reserves remain supported.
+These checks reserve no RAM. Codebase still requires
+enabled managed configuration and its existing lease. No command removes its
+disablement sentinel or changes a service, timer or freeze.
+
+`claim-selected --repo PATH --provider PROVIDER --nonce NONCE` consumes only
+the current unused grant through that same captured runner and both canonical
+locks. It also accepts `--managed-config PATH`. In one admitted transaction it
+freezes the trial, spends the grant and validates the reservation/runtime. The
+original actual-owner identity survives policy, census, preparation and the final
+evidence drain. Only the first successful commit reply reaches the shared
+contained owner in that same process. A spent grant or lost commit reply cannot
+reconstruct a runtime or authorize a resend; status reports the retained trial
+for supervised reconciliation. An older source grant refuses until the operator
+explicitly issues a replacement against the current captured inputs. Ordinary
+admission still rejects selected provenance.
+
+Selected reservation, registration and native intent independently recheck the
+spent binding, source, granted request/debt, deadlines, physical exclusion and
+final evidence. Managed CBM still requires enabled configuration, its lifecycle
+lease during preparation/consumption and its unchanged disablement-sentinel
+checks. The reporter reacquires its native protections before provider work;
+preparation does not hold that lease for the entire physical run.
+Existing selected history remains cancellable, observable and settleable.
+The final drain also rechecks independent physical/control holds from either
+provider. A fresh check of an invalidated historical scope remains usable only
+within that same transaction, for the unchanged scope and covered raw cleanup
+evidence. New cleanup evidence aborts publication and remains retained for the
+next explicit supervised reconciliation; it never becomes a persistent override.
+Failed-origin clean success retires only the exact frozen failure snapshot;
+other outcomes retain the original failed request and independent pending work.
+Missing, corrupt or mismatched spent bindings preserve both work tables, record
+uncertainty unless stronger safety is already retained, and never guess origin
+or reset known debt. Replay does not charge again. Physical and control closure
+remain separate obligations. Grant expiry does not prevent truthful settlement.
+
+Nonce revocation changes only the current unused grant; a healthy spent trial
+remains unchanged. Status returns an invalid-grant descriptor for malformed
+metadata: storage type, byte size and SHA256 of the storage-type ASCII bytes,
+a NUL separator and the raw BLOB bytes. It exposes no corrupt payload and grants
+no launch authority. Exact digest revocation rereads that malformed value under
+the admitted transaction and clears only its grant field. A changed digest or
+healthy grant refuses; a replay after removal reports absent. Accepted receipts,
+hazard revisions, work, execution evidence and independent holds are preserved.
+Database/IO failures remain errors. Storage uses the existing provider-state
+row and transaction-only `scripts/lib/index_marker_retry.py`; the facade remains
+the sole opener.
+
+A zero acceptance watermark with any non-NULL receipt component is malformed;
+recovery admission refuses it just as ordinary admission does. Grant revocation
+does not repair that independent receipt. Invalid positive-watermark receipts
+remain explicit safety evidence for supervised recovery.
+Changes to retained retry code participate in the existing server restart and
+deployment-validation inventory.
+
+Acceptance, strict cutover and native/production qualification remain separate
+gates. Automatic readiness stays negative; issuing or consuming consent does not
+enable automatic retries. Metadata and selected-CLI scratch tests exercise real
+locks, SQL, commit refusal and lost replies with substituted manager/kernel
+observations and an inert owner. Separate sealed GitNexus tests exercise harmless
+provider-child success/failure and late-origin refusal. Retained-row compatibility
+tests construct prior execution facts and prove settlement/replay. These checks
+do not establish native containment or production indexing capacity.
+
 ### Pinned GitNexus typed adapter
 
 Before reservation, selection reads metadata only: the selected Node inode and
@@ -1105,13 +1209,19 @@ needed; the typed adapter does not rewrite npm configuration or install tools.
 
 The source identity binds Node's executable digest, the exact package/ESM-entry
 metadata and bytes, caller resolution directory, environment, resource policy
-and fixed `analyze` arguments. Only the registered invocation fills its reserved
+and exact invocation arguments: ordinary generated work uses `analyze`;
+an explicitly selected recovery uses `analyze --force --no-parse-cache`.
+The adapter compares those arguments with the retained execution origin before
+constructing the physical owner and again during source recapture before native
+intent. Unsupported or changed origins refuse; the argument list cannot grant
+itself recovery authority. Only the registered invocation fills its reserved
 environment slot. The initial Node executable is held through descriptor-based
 spawn; the native working directory is the claimed physical repository. Imported
 vendor files and provider-created respawns remain trusted installed inputs;
 entry/package hashing does not seal the whole dependency tree or pin every
-descendant executable. No new `--force`, `--quiet`, heap setting or mode-specific
-provider argument is added. Full 8 GiB/zero-swap containment and existing reserves,
+descendant executable. Selected recovery's forced rebuild is included in its
+frozen source and resource preflight; no quiet or heap setting is added.
+Full 8 GiB/zero-swap containment and existing reserves,
 watchdog and cleanup obligations remain unchanged. This integration neither
 enables automatic readiness nor establishes production resource capacity.
 

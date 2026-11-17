@@ -70,8 +70,10 @@ async def test_a_stop_between_the_secret_and_the_body_leaves_no_body_without_its
     credential body without its secret."""
     import asyncio
 
+    # A credential is stored under an opaque key: write to the seeded one.
+    key = "Lab router admin"
     if existing:
-        await _ingest(db, _store(), _body())
+        key = (await kc.get(db, await _ingest(db, _store(), _body())))["concept"]
     new_value = "user: example-admin, password: Next!Fake-4"
 
     class _CancelAt:
@@ -98,7 +100,7 @@ async def test_a_stop_between_the_secret_and_the_body_leaves_no_body_without_its
             project_type="reference",
             domain="reference.credentials",
             source_doc="x",
-            concept="Lab router admin",
+            concept=key,
             body=_body().replace(f"Value: {_VALUE}", f"Value: {kc.SECRET_PLACEHOLDER}"),
             secret_value=new_value,
             _commit=False,
@@ -178,7 +180,7 @@ async def test_a_concurrent_delete_never_leaves_a_body_without_its_secret(db):
         project_type="reference",
         domain="reference.credentials",
         source_doc="x",
-        concept="Lab router admin",
+        concept=(await kc.get(db, first))["concept"],
         body=held,
         secret_value="rotated-Fake9!",
     )
@@ -192,7 +194,7 @@ async def test_a_value_free_re_ingest_racing_a_delete_is_undone_and_refused(db):
     re-created row would name a secret the delete retired, so the secret_ref
     trigger refuses the write and nothing is re-created."""
     first = await _ingest(db, _store(), _body())
-    held = (await kc.get(db, first))["body"]
+    held, key = (await kc.get(db, first))["body"], (await kc.get(db, first))["concept"]
 
     async def _delete(conn):
         # As knowledge_crud.delete does it: the unit and its FTS row.
@@ -207,7 +209,7 @@ async def test_a_value_free_re_ingest_racing_a_delete_is_undone_and_refused(db):
             project_type="reference",
             domain="reference.credentials",
             source_doc="x",
-            concept="Lab router admin",
+            concept=key,
             body=held,
         )
     assert await db.execute_fetchall("SELECT 1 FROM knowledge_units") == []

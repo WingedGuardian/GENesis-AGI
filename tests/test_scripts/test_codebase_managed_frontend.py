@@ -78,7 +78,7 @@ def child(frontend, tmp_path, monkeypatch):
     binary = tmp_path / "binary"
     binary.write_bytes(b"test")
     config = dict(main=str(main), binary=str(binary), cache=str(tmp_path),
-                  runtime=str(tmp_path), sentinel=str(tmp_path / "disabled"))
+                  runtime=str(tmp_path), sentinel=str(tmp_path / "disabled"), build=frontend.BUILD)
     events = []
     namespace = frontend.client.__globals__
     monkeypatch.setitem(namespace, "units_dir", lambda: tmp_path / "units")

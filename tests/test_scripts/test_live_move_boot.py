@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 import uuid
@@ -86,12 +87,88 @@ def _lines_ok(stderr: str) -> None:
             assert len(line) <= 400, (len(line), line)
 
 
-def _gone(pid: int) -> bool:
+def _stat(path: str) -> list[str] | None:
+    """The fields after the command name in a /proc stat file; None if unreadable."""
     try:
-        os.killpg(pid, 0)
-    except ProcessLookupError:
-        return True
-    return False
+        with open(path) as fh:
+            return fh.read().rsplit(")", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+
+
+def _running(pid: int) -> bool:
+    """Any thread of ``pid`` is not a zombie (a dead main thread can outlive others)."""
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return False
+    return any((f := _stat(f"/proc/{pid}/task/{tid}/stat")) and f[0] != "Z" for tid in tids)
+
+
+def _live_members(pgid: int) -> list[int] | None:
+    """Pids in process group ``pgid`` with a running thread; None without /proc."""
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    return [
+        int(e)
+        for e in filter(str.isdigit, entries)
+        if (f := _stat(f"/proc/{e}/stat")) and int(f[2]) == pgid and _running(int(e))
+    ]
+
+
+def _describe(pids: list[int]) -> str:
+    """State, parent and group of each pid, for an assertion message."""
+    parts = []
+    for pid in pids:
+        f = _stat(f"/proc/{pid}/stat")
+        parts.append(
+            f"{pid}: gone" if f is None else f"{pid}: state={f[0]} ppid={f[1]} pgrp={f[2]}"
+        )
+    live = {pid: _live_members(pid) for pid in pids}
+    return "; ".join(parts) + f"; live members by group: {live}"
+
+
+def _gone(pid: int, wait_s: float = 5.0) -> bool:
+    """No live member is left in the process group led by ``pid``.
+
+    A SIGKILLed process is a zombie until its parent, or init after an orphaning,
+    reaps it, and ``killpg(pid, 0)`` still succeeds on a zombie. So this asks for
+    members that are still RUNNING, and waits a short bound for reaping lag on a
+    loaded runner rather than checking once.
+    """
+    end = time.monotonic() + wait_s
+    while True:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return True
+        if _live_members(pid) == []:
+            return True
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.05)
+
+
+def test_gone_counts_an_unreaped_zombie_leader_as_gone():
+    """The reap check itself: a killed, not-yet-reaped leader is gone, a live one is not."""
+    proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        assert proc.pid > 1 and not _gone(proc.pid, wait_s=0.2)  # alive: not gone
+        os.killpg(proc.pid, signal.SIGKILL)
+        end = time.monotonic() + 5
+        while time.monotonic() < end:  # wait for the zombie, without reaping it
+            with open(f"/proc/{proc.pid}/stat") as fh:
+                if fh.read().rsplit(")", 1)[1].split()[0] == "Z":
+                    break
+            time.sleep(0.01)
+        os.killpg(proc.pid, 0)  # the zombie keeps its group: killpg alone says alive
+        assert _gone(proc.pid, wait_s=0.2)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
 
 
 # ── T-D31: the boot self-check of the installed kit ──────────────────────────
@@ -743,7 +820,7 @@ def test_td25_a_residue_gone_outside_the_checkout_is_healed_again(tmp_path):
 # ── T-D22 / T-D32: the hooks step is bounded ─────────────────────────────────
 
 # AFTER_S above the guard's own reap reserve (5 s): the healed tree is judged in time.
-_FAST = {"BOOT_DEADLINE_S": 14, "KILL_GRACE_S": 1, "HOOKS_MIN_S": 1, "AFTER_S": 7}
+_FAST = {"BOOT_DEADLINE_S": 14, "KILL_GRACE_S": 1, "HOOKS_MIN_S": 1, "AFTER_S": 7, "END_MARK_S": 2}
 
 
 @pytest.mark.parametrize("fork", [False, True])
@@ -763,7 +840,8 @@ def test_td22_restore_hooks_is_killed_at_the_deadline_and_left_pending(w, tmp_pa
     assert r.returncode == 0, (r.returncode, r.stderr)
     assert took <= 14 + 3 + 1.5, took
     assert w.report()["hooks"] == "pending" and not w.state.exists()
-    assert all(_gone(int(p)) for p in pids.read_text().split()), "a spy process survived"
+    recorded = [int(p) for p in pids.read_text().split()]
+    assert all(_gone(p) for p in recorded), f"a spy process survived: {_describe(recorded)}"
 
 
 def test_td32_the_reinstall_never_starts_its_unlink_without_time_for_it(tmp_path, monkeypatch):
@@ -892,7 +970,8 @@ def test_td24_a_git_that_ignores_term_is_killed_at_the_deadline(w, tmp_path):
     grandchild holding the pipe: killed at the deadline. The tree was judged
     half-written and is not healed, so the server stays down (Q2)."""
     killed_tag_side(w, "Z3")
-    kit = _kit(w, BOOT_DEADLINE_S=9, KILL_GRACE_S=1)  # the guard keeps 5 s for its own reap
+    # The guard keeps 5 s for its reap; the end-mark reserve is cut to 1 s.
+    kit = _kit(w, BOOT_DEADLINE_S=9, KILL_GRACE_S=1, END_MARK_S=1)
     bin_dir, pids = _git_shim(tmp_path)
     path = f"{bin_dir}:{os.environ['PATH']}"
     start = time.monotonic()
@@ -901,7 +980,8 @@ def test_td24_a_git_that_ignores_term_is_killed_at_the_deadline(w, tmp_path):
     assert r.returncode == REFUSE, (r.returncode, r.stderr)
     assert took <= 9 + 3 + 2, took
     assert "deadline" in r.stderr, r.stderr
-    assert all(_gone(int(p)) for p in pids.read_text().split()), "a git process survived"
+    recorded = [int(p) for p in pids.read_text().split()]
+    assert all(_gone(p) for p in recorded), f"a git process survived: {_describe(recorded)}"
     assert w.state.exists()
 
 
@@ -940,7 +1020,7 @@ def test_td34_a_boot_run_past_its_deadline_ends_as_exit_code_not_timeout(w, tmp_
     if subprocess.run(probe, capture_output=True, timeout=60, env=_user_bus()).returncode:
         pytest.skip("no user systemd manager to run a transient unit")
     killed_tag_side(w, "Z3")
-    kit = _kit(w, BOOT_DEADLINE_S=9, KILL_GRACE_S=2)
+    kit = _kit(w, BOOT_DEADLINE_S=9, KILL_GRACE_S=2, END_MARK_S=1)
     (kit / "alert_queue.sh").write_text("queue_alert() { sleep 60; }\n")
     names = [n for n in KIT_FILES if (kit / n).exists()]
     (kit / "KIT.json").write_text(json.dumps(_installer().describe(str(kit), names)))
@@ -1014,3 +1094,141 @@ def test_the_boot_step_reads_the_state_an_older_update_sh_wrote(w):
     again = w.repair(mode="--boot")
     assert again.returncode == 0 and "skipped" not in again.stderr, again.stderr
     assert len(w.alerts()) == 1, w.alerts()
+
+
+# ── #4548: every attempt is counted, and every outside change unlocks ───────
+
+
+def _raise_in(mod, monkeypatch, name: str) -> None:
+    def broken(self, *a, **kw):  # fails before the full report is saved
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(mod.Repair, name, broken)
+
+
+@pytest.mark.parametrize("where", ["_keep_index", "_rows"])
+def test_td38_a_heal_that_crashes_before_its_report_is_counted(w, mod, monkeypatch, where):
+    """#4548 cell 1: a heal that raised before _save left a backup folder and no
+    REPAIR.json, so the next start counted nothing and made one more backup at
+    every start. Its first report is written before anything else, and the crash
+    is recorded in it: one retry, then every start refuses with no new backup."""
+    killed_tag_side(w, "Z3")
+    _raise_in(mod, monkeypatch, where)
+    for _ in range(4):
+        assert _main(w, mod, monkeypatch) == REFUSE
+        _next_start(mod, monkeypatch)
+    assert len(w.backups()) == 2, f"{len(w.backups())} backups in 4 starts"
+    report = w.report()
+    assert report["result"].startswith(mod._boot().CRASHED), report["result"]
+    assert report["paths"] == [] and "integrity" not in report
+
+
+def test_td38_a_crash_after_the_index_was_rebuilt_says_so(w, mod, monkeypatch):
+    """#4548 cell 1: _keep_index rebuilds a torn index from the tag before the
+    rows are read. A crash after it changed the index, so the page never says
+    that nothing in the checkout was changed."""
+    killed_tag_side(w, "Z3")
+    index = w.root / ".git" / "index"
+    index.write_bytes(index.read_bytes()[: len(index.read_bytes()) // 2])
+    _raise_in(mod, monkeypatch, "_rows")
+    assert _main(w, mod, monkeypatch) == REFUSE
+    body = w.alerts()[-1]["body"]
+    assert "nothing in it was changed" not in body, body
+    assert "index was rebuilt" in body and "git/index" in body, body
+    report = w.report()  # review SF-1: the report on disk names the rebuild too
+    assert report["index_rebuilt"] is True and "index was torn" in report["result"], report
+
+
+def test_td38_folders_with_no_report_never_hide_the_crashes_before_them(w, mod, monkeypatch):
+    """#4548 cell 1: the repeat check reads the newest 8 REPORTS, not the
+    newest 8 folders. Report-less folders (a lock retire on a healed tree, a
+    write that failed) newer than two crashes still leave the count at two."""
+    killed_tag_side(w, "Z3")
+    _crash_partway(mod, monkeypatch)
+    for _ in range(2):
+        _main(w, mod, monkeypatch)
+        _next_start(mod, monkeypatch)
+    assert len(w.backups()) == 2
+    later = time.time() + 3600
+    for i in range(9):
+        stamp = time.strftime(mod._TS_FORMAT, time.gmtime(later + i))
+        (w.gen / "deploy-backups" / f"{stamp}-1{mod.SUFFIX}").mkdir()
+    assert _main(w, mod, monkeypatch) == REFUSE
+    assert len(w.backups()) == 11, "report-less folders hid the two crashes"
+
+
+def test_td38_a_crash_past_the_heal_deadline_still_records_a_real_end_mark(w, mod, monkeypatch):
+    """#4548 cell 2: the crash's end mark was taken under the expired boot
+    deadline, so it read "unknown", and no outside change could ever unlock the
+    refusal. The heal's git work ends END_MARK_S early; the marks after it run
+    in that reserve, under the production kill grace."""
+    killed_tag_side(w, "Z3")
+
+    def late(self, *a, **kw):  # the heal used all of its time, then failed
+        mod._changed = True
+        monkeypatch.setattr(mod, "_DEADLINE", mod._BOOT._now() - 0.1)
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(mod.Repair, "_apply", late)
+    assert _main(w, mod, monkeypatch) == REFUSE
+    mark = w.report()["end_mark"]
+    assert isinstance(mark, str) and re.fullmatch(r"[0-9a-f]{64}", mark), mark
+
+
+def test_td38_the_heal_deadline_keeps_the_end_mark_reserve(w, mod, monkeypatch):
+    """B1 (plan review): an allowance AFTER the deadline would never run git
+    (run() starts nothing past until - grace) and would break td34's sum. The
+    reserve sits inside BOOT_DEADLINE_S."""
+    boot = mod._load_kit("live_move_boot.py")
+    assert 0 < boot.MARK_GRACE_S < boot.END_MARK_S < boot.BOOT_DEADLINE_S - boot.AFTER_S
+    seen = {}
+
+    def spy(self, *a, **kw):
+        seen["heal"], seen["mark"] = mod._DEADLINE, mod._MARK_UNTIL
+        return 0
+
+    monkeypatch.setattr(mod.Repair, "run", spy)
+    before = time.monotonic()
+    assert _main(w, mod, monkeypatch) == 0
+    assert seen["mark"] - seen["heal"] == pytest.approx(boot.END_MARK_S)
+    assert before <= seen["mark"] - boot.BOOT_DEADLINE_S <= time.monotonic()
+
+
+@pytest.mark.parametrize("keep_mtime", [False, True])
+def test_td38_a_content_only_edit_after_two_crashes_reopens_the_heal(
+    w, mod, monkeypatch, keep_mtime
+):
+    """#4548 cell 3 (#4501 round 5, Codex): an edit to a file that is already
+    untracked leaves HEAD, porcelain and index.lock as they were, so the mark
+    did not move and the boot refused forever. The mark now holds each listed
+    path's lstat identity, ctime included, so an edit is seen even when the
+    tool puts the old mtime back."""
+    killed_tag_side(w, "Z3")
+    notes = w.root / "notes.txt"
+    notes.write_text("first draft\n")
+    _crash_partway(mod, monkeypatch)
+    for _ in range(3):
+        _main(w, mod, monkeypatch)
+        _next_start(mod, monkeypatch)
+    assert len(w.backups()) == 2
+    st = notes.stat()
+    notes.write_text("second try\n")  # same size, same inode: only the bytes moved
+    if keep_mtime:
+        os.utime(notes, ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert _main(w, mod, monkeypatch) == REFUSE
+    assert len(w.backups()) == 3, "an edit to an untracked file did not reopen the heal"
+
+
+def test_td38_an_ephemeral_path_rewritten_between_starts_is_no_change(w, mod, monkeypatch):
+    """Review S1: files tools rewrite on their own (EPHEMERAL_DIRTY_RE) are left
+    out of the mark, so they never read as an outside change at each start."""
+    killed_tag_side(w, "Z3")
+    agents = w.root / "AGENTS.md"
+    agents.write_text("one\n")
+    _crash_partway(mod, monkeypatch)
+    for _ in range(2):
+        _main(w, mod, monkeypatch)
+        _next_start(mod, monkeypatch)
+    agents.write_text("two, rewritten by a tool\n")
+    _main(w, mod, monkeypatch)
+    assert len(w.backups()) == 2, "an ephemeral rewrite reopened the heal"

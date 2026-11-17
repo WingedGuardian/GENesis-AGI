@@ -58,9 +58,11 @@ async def test_stdio_memory_persists_and_supersedes(tmp_path, collection):
     async with client(fixture, "memory") as mcp:
         assert len(await mcp.list_tools()) == 9
         old = (await mcp.call_tool("memory_store", arguments | {"content": "Synthetic first observation"})).data
-        new = (await mcp.call_tool("memory_store", arguments | {
+        report = (await mcp.call_tool("memory_store", arguments | {
             "content": "Synthetic corrected observation", "supersedes": old,
         })).data
+        assert report["superseded"] is True
+        new = report["memory_id"]
         assert old != new
     with sqlite3.connect(fixture["database"]) as reader:
         assert reader.execute("SELECT collection, COUNT(*) FROM memory_fts GROUP BY collection").fetchall() == [(collection, 2)]

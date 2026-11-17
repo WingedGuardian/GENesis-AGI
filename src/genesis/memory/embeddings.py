@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -197,13 +198,19 @@ class OllamaBackend:
         self._model = model
         # Local cleartext endpoint — warm-reuse limits, but HTTP/2 stays off
         # (h2 with prior knowledge would break HTTP/1.1-only Ollama servers).
-        self._client = client or _build_embed_client(60.0)
+        self._owns_client = client is None
+        self._client = _build_embed_client(60.0) if client is None else client
         self._avail_cache: bool | None = None
         self._avail_cache_at: float = 0.0
 
     @property
     def name(self) -> str:
         return "ollama_embedding"
+
+    async def aclose(self) -> None:
+        """Close this backend's owned client; injected clients remain borrowed."""
+        if self._owns_client:
+            await self._client.aclose()
 
     @property
     def vector_space(self) -> str:
@@ -293,13 +300,19 @@ class DeepInfraBackend:
         """
         self._api_key = api_key
         self._model = model
-        self._client = client or _build_embed_client(30.0, http2=True)
+        self._owns_client = client is None
+        self._client = _build_embed_client(30.0, http2=True) if client is None else client
         self._service_tier = service_tier
         self._tier_echo_checked = False
 
     @property
     def name(self) -> str:
         return "deepinfra_embedding"
+
+    async def aclose(self) -> None:
+        """Close this backend's owned client; injected clients remain borrowed."""
+        if self._owns_client:
+            await self._client.aclose()
 
     @property
     def vector_space(self) -> str:
@@ -365,11 +378,17 @@ class DashScopeBackend:
         self._api_key = api_key
         self._model = model
         self._dimensions = dimensions
-        self._client = client or _build_embed_client(30.0, http2=True)
+        self._owns_client = client is None
+        self._client = _build_embed_client(30.0, http2=True) if client is None else client
 
     @property
     def name(self) -> str:
         return "dashscope_embedding"
+
+    async def aclose(self) -> None:
+        """Close this backend's owned client; injected clients remain borrowed."""
+        if self._owns_client:
+            await self._client.aclose()
 
     @property
     def vector_space(self) -> str:
@@ -507,8 +526,22 @@ class EmbeddingProvider:
                     cache_dir, exc_info=True,
                 )
 
-        backend_names = [b.name for b in self._backends]
-        logger.info("Embedding provider initialized: chain=%s", backend_names)
+        try:
+            backend_names = [b.name for b in self._backends]
+            logger.info("Embedding provider initialized: chain=%s", backend_names)
+        except BaseException:
+            self.close_cache()
+            raise
+
+    def close_cache(self) -> None:
+        """Close only this provider's L2 handle, on its owning thread.
+
+        Call after resource users settle. Backends are borrowed here; their
+        separate owner decides which builtin clients it may close.
+        """
+        if self._disk_cache is not None:
+            self._disk_cache.close()
+            self._disk_cache = None
 
     @staticmethod
     def build_chain(
@@ -516,10 +549,17 @@ class EmbeddingProvider:
         ollama_first: bool | None = None,
         priority_tier: bool = False,
         fresh_collection: bool = False,
+        on_backend_created: Callable[[EmbeddingBackend], None] | None = None,
     ) -> list[EmbeddingBackend]:
         """Build backend chain with configurable priority order.
 
         Args:
+            on_backend_created: Optional synchronous ownership-registration
+                         callback, called immediately for every successfully
+                         constructed builtin, including one later excluded by
+                         vector-space selection. It must register without
+                         raising; the enclosing owner handles partial-startup
+                         cleanup. Omitted callers retain their existing lifetime.
             ollama_first: If True, Ollama leads. If False, cloud leads and
                          Ollama is the fallback rung. If None (the DEFAULT),
                          the install decides via ``env.embed_local_first()``
@@ -598,6 +638,8 @@ class EmbeddingProvider:
                 "OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:0.6b-fp16",
             )
             ollama_backends.append(OllamaBackend(url=ollama_url(), model=model))
+            if on_backend_created is not None:
+                on_backend_created(ollama_backends[-1])
 
         cloud_backends: list[EmbeddingBackend] = []
         excluded_desc: list[str] = []
@@ -609,6 +651,8 @@ class EmbeddingProvider:
                     service_tier="priority" if priority_tier else None,
                 )
             )
+            if on_backend_created is not None:
+                on_backend_created(cloud_backends[-1])
         ds_key = dashscope_api_key()
         ds_space = (
             _dashscope_vector_space(
@@ -647,6 +691,8 @@ class EmbeddingProvider:
         if ds_key:
             if ds_space == anchor:
                 cloud_backends.append(DashScopeBackend(api_key=ds_key))
+                if on_backend_created is not None:
+                    on_backend_created(cloud_backends[-1])
             else:
                 excluded_desc.append(f"dashscope_embedding ({ds_space})")
 
