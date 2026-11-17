@@ -3735,6 +3735,8 @@ async def test_a_drop_before_an_error_result_is_not_a_retryable_error(invoker, m
     assert isinstance(caught.value.__cause__, CCQuotaExhaustedError), (
         "the provider's own classification must survive as the cause"
     )
+    assert caught.value.cc_session_id == "s1"
+    assert caught.value.__cause__.cc_session_id == "s1"
     # The status signal is real evidence about the account and still worth
     # having — suppressing the retry must not also suppress the back-off.
     assert [type(e) for e in statuses] == [CCQuotaExhaustedError]
@@ -5058,12 +5060,15 @@ def test_build_env_refuses_when_an_override_strips_the_confinement(invoker):
         )
 
 
-def test_an_unallowlisted_invocation_is_untouched_by_any_of_this(invoker):
+def test_an_unallowlisted_invocation_is_untouched_by_any_of_this(invoker, monkeypatch):
     """No allowlist, no hardening, no refusal — the collateral-damage arm.
 
     Without it a refusal that fired on every dispatch would look exactly like
     a working confinement.
     """
+    # The test session sets XDG_DATA_HOME (the live closure's private home); the
+    # child would inherit it. This arm is about what the invoker ADDS.
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     env = invoker._build_env(CCInvocation(prompt="hi"))
     assert "GENESIS_BASH_ALLOWLIST" not in env
     assert "XDG_DATA_HOME" not in env

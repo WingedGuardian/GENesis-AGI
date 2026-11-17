@@ -530,6 +530,16 @@ caller (MEASURED 2026-09-25).
   Genesis chain. Every dispatched session is pinned to `0`
   (`src/genesis/cc/child_env.py`). Measured facts it rests on are in
   `.claude/docs/web-tools-guide.md`; re-checked on every pin bump (checklist item 9).
+- Mods: `plugins/genesis-secret-redact` redacts known secrets.env values from what a session reads and
+  stores (`docs/reference/secret-redaction.md`).
+  MEASURED on 2.1.299: one plugin's `hooks.json` can carry `modules` and `hooks` together; a plugin hook's
+  `updatedInput` applies while sibling settings hooks still receive the original input; a mod's
+  `tool.call` result must keep the tool's output shape or the call fails ("does not match its output
+  shape"); a directory-marketplace plugin loads in place from its source folder (the plugin cache is not
+  what runs); a `--plugin-dir` copy wins over an installed plugin of the same name; the mod runs with
+  `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=0`, so that variable no longer keeps mods out of a session; Write and
+  Edit expand a leading `~` in `file_path`; and the Agent tool's result is a launch notice, with the
+  subagent's reply delivered later.
 - Turn limits (`--max-turns`) and strict MCP config (`--strict-mcp-config`) for Guardian diagnosis
 - PreToolUse / PostToolUse / SessionStart / Stop / UserPromptSubmit hooks
 
@@ -1099,10 +1109,11 @@ Mitigated, not eliminated.
 
 ---
 
-### MCP tool descriptions are TRUNCATED at 2,048 characters (measured 2.1.280, 2026-09-22)
+### MCP tool descriptions are TRUNCATED at 2,048 UTF-16 code units (measured 2.1.280, 2026-09-22)
 
 Claude Code cuts every MCP tool description (and server-instruction string) at
-**2,048 characters** before the model sees it. The cut is logged — CC writes
+**2,048 UTF-16 code units** before the model sees it. Its JavaScript length
+predicate counts a non-BMP character as two units. The cut is logged — CC writes
 `Tool "X" description truncated from N to 2048 chars` to its per-server
 `mcp-logs-*` files under `~/.cache/claude-cli-nodejs/` — and the text is marked
 `… [truncated]`, but everything past the cut is absent from the model's contract
@@ -1154,12 +1165,21 @@ cost roughly +1,200 tokens per session. Genesis's OWN tools stay under 2,048
 regardless (`tests/test_mcp/test_tool_description_budget.py`), because a description
 that relies on the lever is still cut on an older CC or wherever the setting is absent.
 
-**Measure it the way CC does:** CC's logged lengths match the NFKC-normalized
-description, not the raw one — the pre-change `follow_up_create` logged 4,735
-where `inspect.getdoc` gives 4,733, because its one `…` normalizes to `...` (+2);
-`memory_recall` matched at 3,525 either way (2 of 2 tools). The test counts NFKC
-length for that reason. Closest to the cap after this change: `follow_up_create`
-2,031 and `direct_session_run` 2,006.
+**Measure the raw client limit independently:** JavaScript `String.length`
+counts UTF-16 units, including two for a non-BMP character. The installed
+2.1.299 truncator receives the tool description directly and checks raw
+`e.length`; it does not normalize that string first. The two historical log
+comparisons above do not establish a general normalization rule.
+
+The repository also retains NFKC normalization as a deliberately conservative
+additional budget, including expansion such as `…` to `...`. The guard uses the
+larger of the raw and normalized UTF-16 lengths: normalization contractions
+must never conceal raw overflow. Valid surrogate pairs are combined before
+normalization, while lone units remain representable. Different Python and Node
+Unicode databases can disagree about normalization, so normalized parity alone
+is not the client predicate. All 159 descriptions at this integration checkpoint
+fit both budgets; the largest guard value is `locate` at 2,046 units (raw 2,040),
+followed by `web_fetch` at 2,037 and `follow_up_create` at 2,031.
 
 ### Hook stdout is silently FILED above 10,000 characters (measured 2.1.246, 2026-08-30)
 

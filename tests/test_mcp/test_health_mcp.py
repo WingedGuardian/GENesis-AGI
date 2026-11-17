@@ -2,6 +2,8 @@
 
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 import genesis.mcp.health_mcp as health_mcp_mod
 from genesis.mcp.health_mcp import (
     _impl_health_alerts,
@@ -463,6 +465,15 @@ async def test_cc_quota_exhausted_is_warning_not_critical():
 # ── session_set_model / session_set_effort tests ─────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _private_session_config(tmp_path, monkeypatch):
+    """A successful set persists the model/effort sidecar the SessionStart hook
+    reads; it must land in this test's tmp_path, never the live one."""
+    monkeypatch.setattr(
+        "genesis.cc.session_cache._SESSION_CONFIG", tmp_path / "session_config.json"
+    )
+
+
 async def test_session_set_model_invalid():
     result = await _impl_session_set_model("sess-1", "gpt4")
     assert "error" in result
@@ -660,6 +671,20 @@ class TestBackupAlertGate:
     async def test_enabled_install_missing_status_still_nags(self, monkeypatch, tmp_path):
         alerts = await self._alerts(monkeypatch, tmp_path, status=None, enabled=True)
         assert [a for a in alerts if a["id"] == "backup:not_configured"]
+
+    @pytest.mark.parametrize(("age_h", "overdue"), [(8.5, False), (9.5, True)])
+    async def test_overdue_allows_the_verify_memory_wait(
+        self, monkeypatch, tmp_path, age_h, overdue
+    ):
+        """A run may wait up to 1 h for verify memory before it starts, so the
+        6 h schedule's grace is 1 h + 2 h: 8.5 h is a run still in progress."""
+        from datetime import UTC, datetime, timedelta
+
+        ts = (datetime.now(UTC) - timedelta(hours=age_h)).isoformat()
+        alerts = await self._alerts(
+            monkeypatch, tmp_path, status={"timestamp": ts, "success": True}, enabled=True,
+        )
+        assert bool([a for a in alerts if a["id"] == "backup:overdue"]) is overdue
 
 
 class TestBackupsEnabledHelper:

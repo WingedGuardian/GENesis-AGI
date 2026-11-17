@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import queue
@@ -13,7 +14,7 @@ import time
 from contextlib import contextmanager, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 
 
 class AppServer:
@@ -21,6 +22,7 @@ class AppServer:
 
     def __init__(self, binary: str, root: Path, env: dict[str, str]):
         self.events: list[dict] = []
+        self.completions: list[dict] = []
         self.pending: queue.Queue = queue.Queue()
         self.stderr = (root / "app-stderr.txt").open("a")
         self.process = subprocess.Popen(  # noqa: S603
@@ -34,7 +36,10 @@ class AppServer:
     def _read(self):
         for line in self.process.stdout:
             try:
-                self.pending.put(json.loads(line))
+                message = json.loads(line)
+                if isinstance(message, dict) and message.get("method") == "turn/completed":
+                    self.completions.append({"at": time.monotonic_ns(), "message": copy.deepcopy(message)})
+                self.pending.put(message)
             except json.JSONDecodeError:
                 self.pending.put({"invalid_json": line})
         self.pending.put({"closed": True})
@@ -94,9 +99,11 @@ class AppServer:
 
 
 @contextmanager
-def fixture_provider(item: dict):
-    """Emit exactly one requested native action, then a final response."""
+def fixture_provider(item: dict, *, action_plan: dict[int, dict] | None = None):
+    """Emit the selected request-index actions; default remains one then final."""
     requests: list[dict] = []
+    actions = {1: item} if action_plan is None else action_plan
+    request_lock = Lock()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -104,8 +111,10 @@ def fixture_provider(item: dict):
 
         def do_POST(self):  # noqa: N802
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            requests.append(body)
-            output = [item] if len(requests) == 1 else [{
+            with request_lock:
+                requests.append(body)
+                selected = actions.get(len(requests))
+            output = [selected] if selected is not None else [{
                 "type": "message", "id": "msg_fixture", "role": "assistant",
                 "content": [{"type": "output_text", "text": "fixture complete", "annotations": []}],
             }]

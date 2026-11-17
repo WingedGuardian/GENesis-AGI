@@ -16,6 +16,8 @@
 #   update-cc <ver> — install a pinned Claude Code version (validated semver)
 #   update-node <N> — install a pinned Node.js major via NodeSource (validated)
 #   test-approval   — E2E test the keyword-reply approval gate (no recovery)
+#   test-alert      — send one test alert through the guardian's channels and
+#                     report one JSON line (no recovery, never queued)
 #   disk-status     — read-only storage-pool + snapshot JSON (Genesis's window
 #                     into host capacity: lvs data%/metadata%, VG free, snapshots)
 #   sent-log --since <epoch> — read-only JSON lines of the alerts the guardian
@@ -939,6 +941,35 @@ PYEOF
         GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
         GUARDIAN_SECRETS="$INSTALL_DIR/secrets.env" \
             timeout 130 "$VENV_PY" -m genesis.guardian --test-approval
+        ;;
+    test-alert)
+        # Send one Telegram test alert through the guardian's own dispatcher and
+        # print one JSON line ({"ok","action","sent","error"}). No recovery, and
+        # never queued for later replay. Timeout above the alert channel's own
+        # send budget so a hung send cannot wedge this SSH session.
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "test-alert", "sent": false, "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        # Skew guard (see sent-log): an old src tree has no --test-alert branch,
+        # and the flag would fall through main()'s if-chain into run_check().
+        if ! grep -q -- '--test-alert' "$INSTALL_DIR/src/genesis/guardian/__main__.py" 2>/dev/null; then
+            echo '{"ok": false, "action": "test-alert", "sent": false, "error": "guardian src predates test-alert — run update to redeploy"}' >&2
+            exit 1
+        fi
+        _TA_RC=0
+        PYTHONPATH="$INSTALL_DIR/src" \
+        GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+        GUARDIAN_SECRETS="$INSTALL_DIR/secrets.env" \
+            timeout 130 "$VENV_PY" -m genesis.guardian --test-alert || _TA_RC=$?
+        # A timeout kills the CLI before it prints, so say so here. The send
+        # may still have happened; it is reported unconfirmed, never retried.
+        if [ "$_TA_RC" -eq 124 ]; then
+            echo '{"ok": false, "action": "test-alert", "sent": false, "error": "timed out; delivery not confirmed"}'
+        fi
+        exit "$_TA_RC"
         ;;
     disk-status)
         # Read-only: print storage-pool + snapshot JSON. Genesis's programmatic

@@ -15,6 +15,15 @@
       <span x-text="$store.genesisDashboard.error"></span>
     </div>
 
+    <!-- The health API withholds error and detail text from a caller with no
+         credential (free_text_hidden), so say why those fields read blank. -->
+    <div x-show="$store.genesisDashboard.health?.free_text_hidden"
+         style="font-size: 0.75rem; color: var(--color-text-secondary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.4rem 0.75rem; margin: 0.5rem 0;">
+      Error and detail text is hidden: shown only to a signed-in dashboard session.
+      Sign in to the dashboard, then reload this page. If no dashboard password is set,
+      set one first (DASHBOARD_PASSWORD: dashboard Configuration, Provider Keys).
+    </div>
+
     <template x-if="$store.genesisDashboard.attentionItems.length > 0">
       <div class="attention-strip">
         <template x-for="(item, idx) in $store.genesisDashboard.attentionItems" :key="idx">

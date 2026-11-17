@@ -44,6 +44,14 @@ class IngestResult:
     tree_index_doc_id: str | None = None
 
 
+class _CommittedBatchCloseError(Exception):
+    """The batch committed; only connection teardown failed."""
+
+    def __init__(self, unit_ids: list[str]) -> None:
+        super().__init__("Connection teardown failed after the knowledge batch committed")
+        self.unit_ids = list(unit_ids)
+
+
 class KnowledgeOrchestrator:
     """Orchestrate the full knowledge ingestion pipeline."""
 
@@ -241,6 +249,7 @@ class KnowledgeOrchestrator:
             )
 
         # 7. Store each unit
+        quality_flags = []
         try:
             async with self._store_lock:
                 unit_ids = await self._store_units(
@@ -250,6 +259,12 @@ class KnowledgeOrchestrator:
                     content=content,
                     purpose=purpose,
                 )
+        except _CommittedBatchCloseError as exc:
+            # Commit is authoritative. Finish provenance with these exact ids;
+            # never retry extraction or compensate a successfully stored batch.
+            unit_ids = exc.unit_ids
+            quality_flags.append("storage_teardown_failed")
+            logger.warning("Committed storage teardown failed for %s: %s", source, exc.__cause__)
         except Exception as exc:
             logger.error("Storage failed for %s: %s", source, exc)
             # Cancel tree task to avoid orphaned upload
@@ -276,7 +291,6 @@ class KnowledgeOrchestrator:
             content_hash=content_hash,
         )
 
-        quality_flags = []
         if scan_result and scan_result.detected_patterns:
             quality_flags.append(
                 f"injection_patterns_detected:{len(scan_result.detected_patterns)}"
@@ -420,6 +434,18 @@ class KnowledgeOrchestrator:
 
         memory_mod._require_init()
         assert memory_mod._store is not None  # noqa: S101 - type-narrowing invariant
+
+        # #2426: a credential reference is never written by distillation. The
+        # vectors below are stored BEFORE the database rows, so the db layer's
+        # refusal would come after the value had already reached the vector
+        # store: refuse the whole batch here, before anything is written.
+        from genesis.db.crud.knowledge import holds_secret
+
+        if any(holds_secret(project_type, unit.domain) for unit in units):
+            raise ValueError(
+                "refusing to distil credential references: write them with "
+                "reference_store, which holds the value out (#2426)"
+            )
 
         unit_ids: list[str] = []
         qdrant_ids: list[str] = []  # Track for compensation on failure
@@ -590,130 +616,142 @@ class KnowledgeOrchestrator:
             # another connection, so the writer slot it holds is uncontended by us.
             stale_ids: list[str] = []
             committed = False
-            async with contextlib.AsyncExitStack() as stack:
-                # ACQUISITION IS ITSELF A PHASE-2 FAILURE POINT, and it sits before
-                # the envelope's own guard. `get_raw_db` connects AND runs setup
-                # PRAGMAs, either of which can raise — by which time phase 1 has
-                # already made every unit's vector visible. Such an exception used
-                # to escape past both the rollback and `_drop_vectors`, so
-                # `ingest_source` reported zero stored units while the vectors
-                # stayed recallable with no `knowledge_units` row or manifest entry
-                # naming them: orphans nothing could find to clean up. Entering
-                # through the stack keeps the guard here without moving the
-                # envelope's body. (Codex P2, PR #1653.)
-                #
-                # Cancellation also owes cleanup for completed phase-1 writes.
-                # Post-commit connection-close reporting remains a separate boundary.
-                try:
-                    own = await stack.enter_async_context(get_raw_db(genesis_db_path()))
-                except BaseException:
-                    logger.error(
-                        "Owned connection unavailable after %d/%d vectors from %s — compensating",
-                        len(qdrant_ids),
-                        len(units),
-                        source,
-                        exc_info=True,
-                    )
-                    await _finish_compensation("phase-2 acquisition failure")
-                    raise
-                try:
-                    await own.execute("BEGIN IMMEDIATE")
-                    for unit, qdrant_id in zip(units, qdrant_ids, strict=True):
-                        # Existing unit? (idempotent re-ingestion). Reads on the owned conn
-                        # see prior COMMITTED units (WAL) and this batch's own uncommitted
-                        # upserts (same connection) — identical to the shared-conn behavior.
-                        # The loop stays ONE pass for that reason: two units in a batch can
-                        # share a unique key, and the second must see the first's
-                        # uncommitted row rather than minting a second id for it.
-                        existing = await memory_mod.knowledge.find_by_unique_key(
-                            own,
-                            project_type=project_type,
-                            domain=unit.domain,
-                            concept=unit.concept,
+            postcommit_interruption: BaseException | None = None
+            try:
+                async with contextlib.AsyncExitStack() as stack:
+                    # ACQUISITION IS ITSELF A PHASE-2 FAILURE POINT, and it sits before
+                    # the envelope's own guard. `get_raw_db` connects AND runs setup
+                    # PRAGMAs, either of which can raise — by which time phase 1 has
+                    # already made every unit's vector visible. Such an exception used
+                    # to escape past both the rollback and `_drop_vectors`, so
+                    # `ingest_source` reported zero stored units while the vectors
+                    # stayed recallable with no `knowledge_units` row or manifest entry
+                    # naming them: orphans nothing could find to clean up. Entering
+                    # through the stack keeps the guard here without moving the
+                    # envelope's body. (Codex P2, PR #1653.)
+                    #
+                    # Cancellation also owes cleanup for completed phase-1 writes.
+                    # Post-commit connection-close errors are translated by the
+                    # outer handler below.
+                    try:
+                        own = await stack.enter_async_context(get_raw_db(genesis_db_path()))
+                    except BaseException:
+                        logger.error(
+                            "Owned connection unavailable after %d/%d vectors from %s — compensating",
+                            len(qdrant_ids),
+                            len(units),
+                            source,
+                            exc_info=True,
                         )
-                        unit_id = existing["id"] if existing else str(uuid.uuid4())
-                        old_qdrant_id = existing.get("qdrant_id") if existing else None
+                        await _finish_compensation("phase-2 acquisition failure")
+                        raise
+                    try:
+                        await own.execute("BEGIN IMMEDIATE")
+                        for unit, qdrant_id in zip(units, qdrant_ids, strict=True):
+                            # Existing unit? (idempotent re-ingestion). Reads on the owned conn
+                            # see prior COMMITTED units (WAL) and this batch's own uncommitted
+                            # upserts (same connection) — identical to the shared-conn behavior.
+                            # The loop stays ONE pass for that reason: two units in a batch can
+                            # share a unique key, and the second must see the first's
+                            # uncommitted row rather than minting a second id for it.
+                            existing = await memory_mod.knowledge.find_by_unique_key(
+                                own,
+                                project_type=project_type,
+                                domain=unit.domain,
+                                concept=unit.concept,
+                            )
+                            unit_id = existing["id"] if existing else str(uuid.uuid4())
+                            old_qdrant_id = existing.get("qdrant_id") if existing else None
 
-                        # DEFERRED, not done here. Deleting the superseded vector inside
-                        # the transaction is irreversible while the row that points at it
-                        # is not: a rollback after this line restores a row whose
-                        # qdrant_id names a vector that no longer exists — the unit
-                        # survives as un-retrievable, which is worse than the orphan the
-                        # compensation path already handles. Collected and dropped only
-                        # once the commit has made the new id the real one.
-                        # `not in qdrant_ids`, not merely `!= qdrant_id`: with
-                        # dedup, the id this row is superseding can be one ANOTHER
-                        # unit in this same batch just stored. Comparing against
-                        # only the current unit's id lets `_drop_vectors` delete it
-                        # as "superseded" while a row this batch committed still
-                        # points at it — the same class as the P1 above, one
-                        # function away (PR #1653 merge audit).
-                        if old_qdrant_id and old_qdrant_id not in qdrant_ids:
-                            stale_ids.append(old_qdrant_id)
+                            # DEFERRED, not done here. Deleting the superseded vector inside
+                            # the transaction is irreversible while the row that points at it
+                            # is not: a rollback after this line restores a row whose
+                            # qdrant_id names a vector that no longer exists — the unit
+                            # survives as un-retrievable, which is worse than the orphan the
+                            # compensation path already handles. Collected and dropped only
+                            # once the commit has made the new id the real one.
+                            # `not in qdrant_ids`, not merely `!= qdrant_id`: with
+                            # dedup, the id this row is superseding can be one ANOTHER
+                            # unit in this same batch just stored. Comparing against
+                            # only the current unit's id lets `_drop_vectors` delete it
+                            # as "superseded" while a row this batch committed still
+                            # points at it — the same class as the P1 above, one
+                            # function away (PR #1653 merge audit).
+                            if old_qdrant_id and old_qdrant_id not in qdrant_ids:
+                                stale_ids.append(old_qdrant_id)
 
-                        # Upsert to SQLite on the OWNED conn (_commit=False — batch txn)
-                        actual_id, _inserted = await memory_mod.knowledge.upsert(
-                            own,
-                            id=unit_id,
-                            project_type=project_type,
-                            domain=unit.domain,
-                            source_doc=source,
-                            concept=unit.concept,
-                            body=unit.body,
-                            relationships=json.dumps(unit.relationships)
-                            if unit.relationships
-                            else None,
-                            caveats=json.dumps(unit.caveats) if unit.caveats else None,
-                            tags=json.dumps(unit.tags) if unit.tags else None,
-                            confidence=unit.confidence,
-                            ingested_at=now_iso,
-                            qdrant_id=qdrant_id,
-                            section_title=unit.section_title,
-                            source_date=unit.source_date,
-                            embedding_model=embedding_model,
-                            source_pipeline="curated",
-                            purpose=purpose_json,
-                            ingestion_source=source,
-                            origin_class=resolved_origin,
-                            _commit=False,
+                            # Upsert to SQLite on the OWNED conn (_commit=False — batch txn)
+                            actual_id, _inserted = await memory_mod.knowledge.upsert(
+                                own,
+                                id=unit_id,
+                                project_type=project_type,
+                                domain=unit.domain,
+                                source_doc=source,
+                                concept=unit.concept,
+                                body=unit.body,
+                                relationships=json.dumps(unit.relationships)
+                                if unit.relationships
+                                else None,
+                                caveats=json.dumps(unit.caveats) if unit.caveats else None,
+                                tags=json.dumps(unit.tags) if unit.tags else None,
+                                confidence=unit.confidence,
+                                ingested_at=now_iso,
+                                qdrant_id=qdrant_id,
+                                section_title=unit.section_title,
+                                source_date=unit.source_date,
+                                embedding_model=embedding_model,
+                                source_pipeline="curated",
+                                purpose=purpose_json,
+                                ingestion_source=source,
+                                origin_class=resolved_origin,
+                                _commit=False,
+                            )
+
+                            unit_ids.append(actual_id)
+
+                        # Single commit for all units in the batch (owned conn)
+                        await own.commit()
+                        committed = True
+
+                        # NOW the superseded vectors are safe to drop: every row that
+                        # pointed at one is durably pointing at its replacement.
+                        await _drop_vectors(stale_ids, "superseded")
+
+                    except BaseException as exc:
+                        if committed:
+                            if not isinstance(exc, Exception):
+                                postcommit_interruption = exc
+                            raise  # Durable success must never enter compensation.
+                        # BaseException, not Exception. `asyncio.CancelledError` is a
+                        # BaseException, so `except Exception` never saw a cancellation —
+                        # and a cancellation is the one failure where compensation matters
+                        # MOST, because `store()` upserts to Qdrant BEFORE its SQLite
+                        # write. Cancelled mid-batch, the vectors exist, the batch rolls
+                        # back, and nothing is left that knows their ids.
+                        logger.error(
+                            "Batch storage failed after %d/%d units (%d qdrant vectors) from %s — rolling back",
+                            len(unit_ids),
+                            len(units),
+                            len(qdrant_ids),
+                            source,
+                            exc_info=True,
                         )
+                        # Release the owned writer slot before MemoryStore.delete writes
+                        # through its separate connection. A cancelled rollback wait is
+                        # not sufficient evidence that the writer slot has been released.
+                        with contextlib.suppress(BaseException):
+                            await _settle(asyncio.ensure_future(own.rollback()))
+                        # Never compensate stale ids restored by rollback, or dedup hits.
+                        await _finish_compensation("batch rollback")
 
-                        unit_ids.append(actual_id)
-
-                    # Single commit for all units in the batch (owned conn)
-                    await own.commit()
-                    committed = True
-
-                    # NOW the superseded vectors are safe to drop: every row that
-                    # pointed at one is durably pointing at its replacement.
-                    await _drop_vectors(stale_ids, "superseded")
-
-                except BaseException:
-                    if committed:
-                        raise  # Postcommit cleanup cannot roll back durable units.
-                    # BaseException, not Exception. `asyncio.CancelledError` is a
-                    # BaseException, so `except Exception` never saw a cancellation —
-                    # and a cancellation is the one failure where compensation matters
-                    # MOST, because `store()` upserts to Qdrant BEFORE its SQLite
-                    # write. Cancelled mid-batch, the vectors exist, the batch rolls
-                    # back, and nothing is left that knows their ids.
-                    logger.error(
-                        "Batch storage failed after %d/%d units (%d qdrant vectors) from %s — rolling back",
-                        len(unit_ids),
-                        len(units),
-                        len(qdrant_ids),
-                        source,
-                        exc_info=True,
-                    )
-                    # Release the owned writer slot before MemoryStore.delete writes
-                    # through its separate connection. A cancelled rollback wait is
-                    # not sufficient evidence that the writer slot has been released.
-                    with contextlib.suppress(BaseException):
-                        await _settle(asyncio.ensure_future(own.rollback()))
-                    # Never compensate stale ids restored by rollback, or dedup hits.
-                    await _finish_compensation("batch rollback")
-
-                    raise
+                        raise
+            except Exception as exc:
+                if postcommit_interruption is not None:
+                    logger.warning("Connection teardown also failed after interruption: %s", exc)
+                    raise postcommit_interruption from exc
+                if committed:
+                    raise _CommittedBatchCloseError(unit_ids) from exc
+                raise
 
             logger.info("Stored %d knowledge units from %s", len(unit_ids), source)
             return unit_ids

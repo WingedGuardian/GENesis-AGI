@@ -11,6 +11,7 @@ from genesis.eval.qualification.evidence import Campaign, canonical
 
 OUTCOMES = ("completed", "noop", "refused", "retry", "blocked", "uncertain")
 COUNTS = (0, 1, 15, 16, 17, 64)
+CALIBRATION_FIELDS = ("cursor", "wake_at", "active", "observations")
 
 
 def check(condition):
@@ -195,7 +196,7 @@ def sweep(root, pin, sources):
     calibration = []
     for cell, row in zip(inventory["outcomes"], rows["outcomes"], strict=True):
         check(qualify_outcome(cell, row))
-        for field in ("cursor", "wake_at", "active", "observations"):
+        for field in CALIBRATION_FIELDS:
             changed = copy.deepcopy(row)
             if field == "observations":
                 changed[field] = 0

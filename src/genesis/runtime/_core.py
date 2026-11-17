@@ -545,6 +545,20 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             except Exception:
                 logger.warning("Failed to expire cognitive state entries", exc_info=True)
 
+        # Reference secrets an interrupted credential upsert left unnamed by any
+        # unit (#2426). Also swept after every knowledge delete; the age bound
+        # keeps a secret whose unit write is still on its way.
+        if self._db is not None:
+            try:
+                from genesis.db.crud import knowledge as knowledge_crud
+
+                swept = await knowledge_crud.sweep_orphan_secrets(self._db)
+                await self._db.commit()
+                if swept:
+                    logger.info("Swept %d orphaned reference secret(s)", swept)
+            except Exception:
+                logger.warning("Failed to sweep orphaned reference secrets", exc_info=True)
+
         # Boot-time stale-session sweep — 'active' rows orphaned by a crashed
         # process shouldn't wait up to ~6h for the session_reaper cron.
         # Deliberately HERE, after ALL init steps: session end-hooks (e.g. the

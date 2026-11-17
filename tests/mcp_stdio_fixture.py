@@ -64,6 +64,12 @@ def install():
                 tools = await call_next(context)
                 assert server._docket is None and server._worker is None
                 report["listed_without_worker"] = True
+                # Sampled once the lifespan has entered and the catalog is
+                # served, i.e. after startup: litellm costs seconds and memory
+                # in every idle child, so startup must not import it (#3558).
+                import sys
+
+                report["litellm_loaded"] = "litellm" in sys.modules
                 save()
                 return tools
 

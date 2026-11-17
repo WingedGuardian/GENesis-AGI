@@ -150,6 +150,8 @@ from genesis.session_awareness.pr_evidence import (  # noqa: E402
     EvidenceError,
     Refusal,
     check_e2e_coverage,
+    check_event_dates,
+    completeness_prompts,
     decide,
     parse_evidence,
     parse_recheck_result,
@@ -364,6 +366,9 @@ async def _write(
             coverage = check_e2e_coverage(doc, actual.body) if closing else None
             if coverage:
                 return _refuse(coverage.message, coverage.code)
+            dated = check_event_dates(doc, closing, _today())
+            if dated:
+                return _refuse(dated.message, dated.code)
             rechecks = rechecks_for(doc) if closing else []
             if rechecks:
                 schema_error = await _close_schema_refusal(db, rechecks)
@@ -401,7 +406,11 @@ async def _write(
 
             from datetime import datetime
 
+            from genesis.caller_context import client_kind, record_session_id
+
             now = datetime.now(UTC).isoformat()
+            kind = client_kind()
+            stamp = {"recorded_by": kind, "recorded_session": record_session_id(kind)}
 
             if closing:
                 changed = await crud.close_verification(
@@ -412,6 +421,7 @@ async def _write(
                     reason=reason,
                     evidence=payload,
                     now=now,
+                    **stamp,
                 )
                 if not changed:
                     print(
@@ -437,6 +447,7 @@ async def _write(
                 now=now,
                 evidence=payload,
                 tracking_pending=not tracking.complete,
+                **stamp,
             )
             if outcome != "recorded":
                 print(
@@ -507,6 +518,13 @@ async def _write(
             file=sys.stderr,
         )
         return 1
+
+
+def _today():
+    """The UTC date a close is judged on; the backlog's "Rechecks due" read uses the same."""
+    from datetime import datetime
+
+    return datetime.now(UTC).date()
 
 
 def _refuse(message: str, code: int) -> int:
@@ -767,6 +785,10 @@ def main(
     result = decide(doc, park=args.park, asserted=args.verdict, note=args.note)
     if isinstance(result, Refusal):
         return _refuse(result.message, result.code)
+    # Questions to answer before a close, which is permanent: printed on every run
+    # (a dry run, an open record, a close), never stored, never a verdict.
+    for prompt in completeness_prompts(doc):
+        print(f"pr_verification: check: {prompt}")
 
     # The cap is enforced on the bytes that get STORED, not the bytes that were read:
     # the canonical re-serialisation can be larger than the file, and checking only

@@ -39,6 +39,14 @@ def health_snapshot():
         else:
             result = loop.run_until_complete(rt.health_data.snapshot())
 
+        # The same reduction the standalone route applies: this URL is open to
+        # every network. On a copy, because snapshot() hands coalesced callers
+        # one shared dict. Inside the try, so a redaction that cannot run
+        # answers the generic 500 below and never the snapshot as computed.
+        from genesis.dashboard.routes.health import redact_for_untrusted
+
+        result = dict(result)
+        redact_for_untrusted(result)
         return jsonify(result)
     except Exception:
         logger.exception("Health snapshot failed")

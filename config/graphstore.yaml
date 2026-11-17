@@ -1,8 +1,16 @@
-# Which backend answers memory-graph reads — NETWORKX by default.
+# Which backend answers memory-graph reads — FALKORDB by default.
 #
-# This is a STAGED CUTOVER, not an optional feature. The FalkorDB engine is part
-# of the memory architecture alongside SQLite/FTS5 and Qdrant; the default below
-# says reads have not been moved onto it YET, not that it is a nice-to-have.
+# The FalkorDB engine is part of the memory architecture alongside SQLite/FTS5
+# and Qdrant. Reads moved onto it after the staged cutover's bar was met on a
+# live install: 14 consecutive days in falkordb mode with zero fallbacks, every
+# traversal on record (memory/graph_cutover.py, scripts/graph_cutover_report.py).
+#
+# WHERE PRESENT ONLY. With this shipped default (no install overlay setting
+# `mode`) and no engine unit rendered on this install, reads stay on networkx
+# QUIETLY: the engine was never provisioned here, which is not a fallback.
+# Bootstrap renders the unit only from an engine it verified, and enables it.
+# An overlay that sets `mode: falkordb` is a deliberate choice and stays loud,
+# and so does a unit that exists but is stopped or failed.
 #
 # Read fresh on every call (this file + ~/.genesis/config/graphstore.local.yaml),
 # so a settings_update("graphstore", {...}) or a hand edit takes effect on the
@@ -12,32 +20,31 @@
 enabled: true
 
 # Mode: networkx | falkordb
-#   networkx — (default) the in-process NetworkX projection. Depends on nothing
-#              but this process. Rebuilds from memory_links whenever a writer
-#              invalidates it, which is the cost this lever exists to remove.
-#   falkordb — a long-lived FalkorDB server over a unix socket. No rebuild, and
-#              the visibility predicate is re-evaluated per query so a memory
-#              whose invalid_at passes becomes invisible with no write event.
-#              REQUIRES: the engine provisioned and running (provisioning ships
-#              separately and is staged during the cutover; where it is already
-#              installed, `systemctl --user start genesis-falkordb`) and a
-#              projection built (`python -m genesis.memory.graphstore_project`).
+#   falkordb — (default) a long-lived FalkorDB server over a unix socket. No
+#              rebuild, and the visibility predicate is re-evaluated per query
+#              so a memory whose invalid_at passes becomes invisible with no
+#              write event.
+#              REQUIRES: the engine provisioned and running (bootstrap installs,
+#              enables and starts `genesis-falkordb`; a running engine is left
+#              running) and
+#              a projection built (`python -m genesis.memory.graphstore_project`).
 #              Once the engine is running, `genesis-graph-project.timer` keeps
 #              that projection current HOURLY on its own, so the first manual
-#              build is the only one you have to remember. The timer does not
-#              wait for this lever to move — it refreshes whenever the engine
-#              exists, so flipping to falkordb lands on a current graph rather
-#              than on whatever was last built by hand. An hour is a BOUND, not
-#              freshness-on-write: a burst of writes inside the hour can still
-#              leave the projection behind (issue #1641).
+#              build is the only one you have to remember. An hour is a BOUND,
+#              not freshness-on-write: a burst of writes inside the hour can
+#              still leave the projection behind (issue #1641).
 #              Missing any of those, the facade falls back to networkx and logs
 #              loudly rather than answering empty — an empty answer would read
 #              as "no neighbours", and an unbuilt projection makes EVERY root
 #              look neighbourless, so the store raises instead.
+#   networkx — the in-process NetworkX projection. Depends on nothing but this
+#              process. Rebuilds from memory_links whenever a writer
+#              invalidates it. Set `mode: networkx` in the overlay to opt out.
 #
-# Anything unreadable, unrecognised, or unset selects networkx. The lever can
-# move reads onto FalkorDB only deliberately, never onto it by accident.
+# Anything unrecognised (a mode not listed above, an `enabled` that is not
+# exactly true) selects networkx. An unreadable overlay is ignored, and an
+# unreadable copy of this file falls back to the code's DEFAULTS, which match it.
 #
 # Hook/env kill switch (separate lever): GENESIS_FALKORDB_STORE_DISABLED=1
 # pins reads to networkx regardless of this file.
-mode: networkx
+mode: falkordb

@@ -117,16 +117,20 @@ async def _db():
 
 
 async def _insert_ref(db, *, qdrant_id="qid-123", project_type=REFERENCE_PROJECT):
-    return await kc.insert(
+    # The shape #2426 writes: the value is held out of the indexed body, in a
+    # secret row the unit names (so a credential is written by upsert).
+    unit_id, _ = await kc.upsert(
         db,
         project_type=project_type,
         domain="reference.credentials",
         source_doc="reference_store:manual",
         concept="Test Cred",
-        body="[reference.credentials] Test Cred\n\nctx\n\nValue: admin / pw",
+        body=f"[reference.credentials] Test Cred\n\nctx\n\nValue: {kc.SECRET_PLACEHOLDER}",
         qdrant_id=qdrant_id,
         source_pipeline="reference_store",
+        secret_value="admin / fake-pw-1" if kc.holds_secret(project_type, "reference.credentials") else None,
     )
+    return unit_id
 
 
 async def test_delete_removes_row_and_qdrant(_db):
