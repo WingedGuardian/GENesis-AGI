@@ -141,7 +141,8 @@ async def test_a_second_change_raises_to_the_caller_and_leaves_nothing(db, monke
     monkeypatch.setattr(kc, "upsert", _always_changed)
     with pytest.raises(kc.CredentialKeyChanged):
         await _ingest(db, store, _body("Example portal login", "password: Twice!Fake3"))
-    assert len(calls) == 2
+    # The first try and five fresh reads (owner ruling: retry until it lands).
+    assert len(calls) == 6
     assert store.points == {}
 
 

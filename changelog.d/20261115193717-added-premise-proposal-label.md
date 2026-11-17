@@ -1,0 +1,1 @@
+- **An issue that answers `Stated: nowhere` is now labelled `proposal`.** Nothing states the behaviour it asks for, so it is a proposal rather than a fix: it cannot go to Devin (`devin-ready` is removed with a note), and the label clears when an edit cites the decision that settles it.

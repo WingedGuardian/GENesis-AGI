@@ -186,10 +186,33 @@ Easy-to-forget mechanisms:
   secret a unit stops naming (repointed or deleted);
   `knowledge_crud.sweep_orphan_secrets` (after every delete, and at boot)
   removes secrets older than an hour that an interrupted upsert left unnamed.
-  `ingest_knowledge_unit(insert_only=True)` and `knowledge_crud.upsert(insert_only=True)`
-  never change an existing credential key (a different value raises
-  `CredentialKeyTaken`); no writer passes it yet: it is the mechanism a later
-  change wires the extraction job's auto-capture to.
+  **A credential's key is opaque and its identity is the hash of its name.**
+  A new credential is stored under `concept = cred-<12 hex>`
+  (`secrets.token_hex(6)`, checked absent), never derived from the name or the
+  value; the name is the body's header line. `knowledge_units.name_hash`
+  (`reference_ops.name_hash`: card-redacted, NFKC, format characters removed,
+  casefolded, whitespace collapsed, sha256) and `name_origin` (`trusted`,
+  `untrusted`, `carded`) are written by the INSERT and never changed by an
+  update. A trusted write by name updates the earliest trusted entry with that
+  hash, else an entry with no hash yet whose recorded name matches (a legacy
+  plain key, or one with a trailing ` #xxxxxx` removed), which that write gives
+  the hash; else it mints a new key. A partial unique index
+  (`idx_knowledge_units_name_hash`, trusted rows with a 64-character hash) makes
+  concurrent first saves of a name one entry. `entry_key=` (trusted callers,
+  credentials only; `reference_store(entry_key=...)`) writes to an existing
+  entry by key and keeps its recorded name; an unknown key is refused with
+  nothing written, and text that reads like a key passed as an identifier is a
+  name. Any update keeps the name the entry records. An insert-only write
+  returns an untrusted entry under that hash with the same value and
+  description, else adds a new entry; it never updates one. A card-redacted name
+  reuses an entry only when it holds the same value. Migration
+  `20261115060803_credential_name_hash` backfills existing credentials; of
+  legacy names differing only in case the earliest keeps the hash, and each
+  later one gets one the index leaves out (still stored, revealable,
+  deletable). The dashboard list and `reference_lookup` show the name
+  (`reference_ops.display_name`); lookup results carry the key as `concept`.
+  `ingest_knowledge_unit(insert_only=True)` has no writer yet: it is the
+  mechanism a later change wires the extraction job's auto-capture to.
   Two `knowledge_units` triggers refuse a
   credential body without exactly one placeholder line, whichever process
   writes it (text on a later line only the Python check sees).
@@ -204,8 +227,8 @@ Easy-to-forget mechanisms:
   (`knowledge_crud.KeyObservation`: absent, or the secret and point it named),
   checked inside the one statement that writes the unit, so a same-key writer
   in another process that commits in between makes it write nothing
-  (`CredentialKeyChanged`); the ingest then re-reads and runs once more, and
-  a second change reaches the caller.
+  (`CredentialKeyChanged`); the ingest then re-reads and runs again, up to five
+  times, so every writer in a race lands, and a sixth change reaches the caller.
   Only `reference_ops` reads the secret row: `compose_body` puts the value and
   the description back for `reference_lookup` (behind its audit log),
   `reveal_reference` returns both for the dashboard's reveal, and
@@ -213,7 +236,7 @@ Easy-to-forget mechanisms:
   read, they re-read the unit's current body, value and description with one
   statement (`knowledge_crud.get_reference_pair`), so a body never comes back
   beside another write's secret. A credential is therefore found by its
-  identifier and tags only; the dashboard list shows the description placeholder. Identifier kinds (url, network,
+  name and tags only; the dashboard list shows the description placeholder. Identifier kinds (url, network,
   account, fact) keep their value in the body, because it is what their lookups
   search for. NOT covered yet: the episodic memory the extraction job stores
   for the same conversation text, which still carries an auto-captured value.
@@ -970,9 +993,13 @@ complete-attempt evidence. See `docs/reference/inbox-attempt-identity.md`.
   decontextualised in yours. `model` comes from the SessionStart cache with
   `GENESIS_ROSTER_MODEL` taking precedence, NOT from `cc_sessions.model` — on a
   live install that column is dominated by the literal string `unknown`.
-  Liveness comes ONLY from `session_heartbeats`: `cc_sessions.pid` is unset for
-  most rows and its `status`/`last_activity_at` go stale on running sessions, so
-  it must never be used to decide who is alive. **Every rendered field is
+  Liveness comes ONLY from `session_heartbeats`. `cc_sessions.pid` is set on
+  foreground rows since #1706 (MEASURED 2026-11-13 over rows started in the last
+  three days: 91 of 91 checkpointed and 4 of 4 active rows carry one, 0 of 7
+  completed rows do), but one process can carry several session rows (one pid
+  on 2 rows after a `/clear`, another on 4), and the row's
+  `status`/`last_activity_at` go stale on running sessions, so it must never be
+  used to decide who is alive. **Every rendered field is
   peer-authored, so all pass through `sanitize_detail`** — a newline in any of
   them forges an extra `[Concurrent | …]` line in the reader's context. The
   writers are partial by design (each knows a different subset), so the upsert
@@ -1004,6 +1031,27 @@ complete-attempt evidence. See `docs/reference/inbox-attempt-identity.md`.
   `python -m genesis session-address <id>` (whose `--check` compares it with
   `claude agents --json`, Claude Code's supported listing) and the
   `session_address` MCP tool.
+  **And the worktrees the peer holds** — the tag's body opens with
+  `in <worktree> on <branch> (+N more claimed)`, from the worktree-ownership
+  claims (`scripts/hooks/worktree_claim.py` `claims_by_session`), taken on a
+  session's first edit in a worktree and owned by its PROCESS. A claim is
+  matched by the peer's live pid, the one the address lookup above verified
+  against the registry and the process start time, and failing that by the
+  session id the claim recorded: `/clear` starts a new id in the same process,
+  so an id-only join loses every claim made before it (MEASURED 2026-11-13: 4
+  of 18 live claims). Locks are read raw from `<common dir>/worktrees/*/locked`
+  (never porcelain), with a byte test for the namespace before any parse, one
+  entry at a time so a malformed lock skips only itself. A claim shows only on
+  positive identity (`claim_is_live`: start time matches, not a zombie); an
+  unknown is not shown. The worktree named is the most recently CLAIMED one
+  (the lock file's mtime: a lock is never overwritten), which is where the peer
+  last first-edited, not proof of where it is now; the rest are counted. Names
+  are allowlisted (`[A-Za-z0-9._/+-]`) and omitted when outside it, so the
+  suffix can neither forge a field nor cost more than one budget unit a
+  character. A peer with no claim shows no suffix. The scan costs 22-38 ms over
+  638 admin dirs (MEASURED 2026-11-13, 5 runs, `claims_by_session` alone), is
+  skipped once the hook's deadline has passed and checks it during the scan;
+  an unfinished scan or any failure renders the line as before.
 
 - **Slot environment pinning + usable temp directories.**
   LIVE. `tmux new-session` builds a new session's environment from the tmux
@@ -1887,7 +1935,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: 6b4f275 2026-11-08
+verified: d70924fb5 2026-11-15
 ```
 
 Scoped verification covers `mcp/shared_http` composition. It receives
@@ -2059,6 +2107,14 @@ the shared banner is not an assertion about all concurrent sessions.
   `docs/reference/serena-shared-main.md`.
   External Codebase has pinned configuration staging/diagnostics and bounded
   native query unit entry points in `scripts/codebase_managed.py`.
+  The captured worker's immutable release records select an exact configured
+  build across staging, managed execution, queue source identity and worker argv.
+  Only v0.11.0 is currently qualified; future releases require their own reviewed
+  record and native acceptance. A different supported binary at the configured
+  path still refuses; policy updates do not update existing settings or consent.
+  Scoped CBM verification uses isolated configuration and captured-owner execution
+  through the stock adapter to harmless children; installed-provider and real
+  kernel containment qualification remain separate.
   Status separately observes conditional queue initialization-lock prerequisites
   without opening the queue or changing current-schema availability.
   Install and bootstrap render disabled query/client-slice templates without
@@ -2085,7 +2141,7 @@ the shared banner is not an assertion about all concurrent sessions.
   Matching terminal leader states alone do not prove controller process end.
   The same-connection final drain observes callback-created evidence before
   commit. The acknowledgement grants no retry or acceptance. The automatic
-  reconciliation caller remains separate (#3728); acceptance, cutover,
+  reconciliation caller remains separate (#3728); cutover,
   native qualification and production capacity remain separate gates.
   Explicit request/revoke/status operations use the existing provider-state
   grant and bind actual work, retained debt, evidence, provider and runner/
@@ -2098,7 +2154,14 @@ the shared banner is not an assertion about all concurrent sessions.
   or lost replies cannot reconstruct runtime authority. Ordinary owner admission
   still refuses selected provenance. GN binds ordinary versus selected recovery
   argv to actual durable origin before owner construction and during source
-  recapture. Acceptance, cutover and automatic readiness remain separate gates.
+  recapture. Captured `accept-retry` publishes explicit metadata for a clean,
+  already-settled selected trial after exact source/policy, debt and physical/
+  control checks. It never settles accounting, retires an inflight pointer or
+  launches a provider. Immutable replay recovers a lost acceptance reply without
+  resend; current drain annotations allow only older known retained provider
+  evidence to use the acceptance watermark. Trial/newer hazards and physical
+  obligations remain independent holds. Cutover and automatic readiness remain
+  separate gates.
   Selected acknowledgements recheck repository-wide physical/control holds after
   their final drain. A transient same-transaction fresh proof binds the original
   lifetime subject and exact-sequence raw cleanup evidence; it grants no durable
@@ -2214,7 +2277,9 @@ the shared banner is not an assertion about all concurrent sessions.
   observations preserve owned OOM kills, including the first sample, before
   duplicate/conflict reduction; clean control cannot erase resource evidence.
   Default initialization stays4; new native authority requires5, with no live
-  cutover, acceptance setter or positive automatic readiness here. Explicit
+  cutover or positive automatic readiness here. The explicit acceptance setter
+  changes only the five existing receipt fields after completed-trial validation.
+  Explicit
   transaction-only retry grants in `index_marker_retry.py` require schema5 and
   captured supervision. Selected consumption shares the existing transaction,
   final drain and physical owner, preserving original identity and first-commit
@@ -2765,8 +2830,13 @@ verified: 0aa0bf9f2 2026-11-10
   (`pool.py`) and **RAM** (`memory_watch.py`, E-rest) — the latter over two
   axes worst-of, container cgroup (via incus-exec, best-effort) + host-VM
   `/proc/meminfo` (the reliable axis). Both use the shared `_tier_for`/
-  `decide_alert` hysteresis. Read-only `disk-status`/`ram-status` verbs expose
-  the same measurement to the container.
+  `decide_alert` hysteresis; RAM adds flap damping on top: a per-axis exit
+  margin (`memory_tiers.exit_margin_pct`, default 5), a blind axis holding its
+  last tier (stale after one re-alert window, and named in the page), and a
+  baseline of the highest tier paged since the last recovery that lasts one
+  re-alert window (state `memory_alert_state.json`: `tier` = that peak,
+  `axes`, `blind_since`). Read-only `disk-status`/`ram-status` verbs expose
+  the same raw measurement to the container.
 - **Pool RELIEF** (`pool_relief.py`) runs every tick, BEFORE `_check_cycle`
   (during an outage's diagnosis that is about hourly, since the tick is a
   oneshot). The tiers above only alert, and a thin pool once filled to 100%
@@ -2864,11 +2934,40 @@ verified: 0aa0bf9f2 2026-11-10
   the Failure Inventory remedy for memory held by a shared Codex app-server
   daemon's MCP servers (#4302). Dry-run by default; `--execute` only inside an
   approved action. Resolves targets when it runs: direct children of a
-  `codex app-server --listen` process that lead their own process group with
-  pipe stdin+stdout, excluding Codex helper binaries, systemd-unit members and
+  `codex app-server --listen` process that lead their own process group and
+  read a pipe the app-server writes and write one it reads, on any descriptor,
+  that no other app-server child also holds
+  (matched by pipe identity and `fdinfo` access mode: the MCP Python SDK moves
+  the protocol off fd 0/1, so a stdin test missed every Genesis server),
+  excluding Codex helper binaries, systemd-unit members and
   anything under a `claude` process. Lever `codex_mcp_stop.mode` in
   `config/sentinel.yaml` (`propose_only` | `off`) +
-  `GENESIS_CODEX_MCP_STOP_DISABLED=1`.
+  `GENESIS_CODEX_MCP_STOP_DISABLED=1`. Proposed early by the health alarm
+  `infra:codex_mcp_held` (WARNING, tier 2 via `_TIER2_PATTERNS`), which fires
+  when that same `scan()` totals `codex_mcp_stop.propose_at_mb` (default 4096)
+  or more; the scan runs off-loop and is cached 60 s in `mcp/health/errors.py`.
+  Because that alarm does not clear by itself, `check_fire_alarms` lets a
+  confirmed alarm that is stronger by the classifier's order (tier, then
+  CRITICAL first) cancel (`resolved_by="superseded"`) a park whose triggering
+  alarms are all WARNING, but only when the alarm dispatch would lead with is
+  that challenger and passes backoff; a park with any CRITICAL trigger is never
+  taken over, and a cancel that fails keeps the park. The cancelled pattern
+  starts the 15-minute resolved cooldown. A declined dispatch or action is
+  quiet for 24 h through `handle_approval_resolution` (every pattern).
+- **sentinel/process_stop.py** (`python -m genesis.sentinel.process_stop`):
+  the Failure Inventory remedy for ONE runaway process. Dry-run by default;
+  `--execute` only inside an approved action. Resolves targets when it runs:
+  this user's processes (not pid 1, not zombies or kernel threads, not the
+  tool's own ancestors) outside any systemd `.service` unit that hold
+  `process_stop.propose_at_mb` (default 6144) MB of RSS+swap, excluding
+  `init.scope`. `--execute` requires `--only PID:STARTTIME,...` copied from the
+  dry-run and stops only those identities still eligible, so an approval never
+  covers a process that crossed the line later. SIGTERM, then SIGKILL, through
+  a pidfd opened before the start-time check, to the process alone. Claude Code
+  sessions (foreground and server-dispatched `run-*.scope`) are eligible. Lever `process_stop.mode` (`propose_only` | `off`) +
+  `GENESIS_PROCESS_STOP_DISABLED=1`. Proposed early by the health alarm
+  `infra:process_memory_high` (WARNING, tier 2), from the same `scan()`,
+  cached 60 s.
 - GROUNDWORK: guardian-cgroup, guardian-bidirectional, sentinel-live-autonomy.
 
 ## 9. Ambient cognition — heartbeat, reflection, attention
@@ -3690,7 +3789,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 5be8573a5 2026-11-07
+verified: 3f70a665b 2026-11-15
 ```
 
 - **eval/ego_runtime**: opt-in canonical proposal-operation probes using fresh
@@ -3858,6 +3957,19 @@ verified: 5be8573a5 2026-11-07
   Critic + a `replay` off|shadow sub-config) + `GENESIS_SKILL_EVOLUTION_GATE_OFF`.
   `tool_discovery.py` static maps are deprecated (GROUNDWORK
   provider-migration) — use ProviderRegistry.
+- **The whole-session lesson builder** (Stream 1 of
+  `memory/extraction_job.run_extraction_cycle`, plus its `procedure_rebuild`
+  drain) adds at most 7 new lessons per source session in any rolling 24 hours,
+  counted by `procedural_memory.created_session_id`. That column is written once,
+  at insert, so a refine that rewrites `source` cannot reopen a slot. Lever: the
+  `lesson_builder` settings domain (`off | shadow | live`, shipped `live`; an
+  unreadable base or overlay reads as `shadow`). In shadow the builder runs its
+  real model call and checks, stores nothing, and appends each would-be lesson
+  to `~/.genesis/output/lesson_builder_shadow.jsonl`. That file is also the
+  shadow cap's count, so it rotates by time (the two files always hold the
+  window) and drops a lesson that repeats one already recorded for the session.
+  Queued rebuilds wait, unspent, until the mode is live; the drain scans past
+  capped sessions, so they never starve an eligible one.
 - **eval/**: J9 = fire-and-forget emit hooks on live cognitive paths (the
   "cannot break production" contract — hooks must never raise) + weekly Sunday
   aggregation (hard 7-day window) + an on-demand batch judge as a surplus
@@ -3967,6 +4079,10 @@ verified: 5be8573a5 2026-11-07
   establish provider spend bounds or owner approval. This verification refresh covers the qualification slice;
   other learning/evaluation entries retain their previous verification scope.
   See `docs/reference/qualification-transport.md`.
+  A gated native first-party DeepSeek profile shares the same bounded controller
+  and guarded HTTP lifecycle. Native tariff calculations remain separate from
+  legacy provider receipts and cannot supply invoice or promotion authority.
+  See `docs/reference/qualification-native.md`.
   Complete offline preflight checks all registered corpus floors, current
   reference policy/approval/source identities and explicit call-site parameters.
   Production rendering determines duplicate questions and selected novelty IDs.
@@ -4629,6 +4745,18 @@ logger or unrelated exceptions with copied text and no provenance.
   `python -m genesis.trash list|restore`. Callers: cognitive rollback, the
   orphan task-worktree reset, and the dashboard's file-browser and memory-file
   deletes (`docs/reference/trash.md`). Stdlib only.
+- **Worktree reaper trash** (`scripts/worktree_lifecycle.py`, outside `src/`;
+  read at 26218b962, 2026-11-10): the daily hygiene run archives stale
+  worktrees into `~/.genesis/worktree-trash`. An entry has two forms: a
+  `<entry>.tar.gz` with a `<entry>.meta.json` sidecar and a locked, directory-less
+  registration (the anchor that keeps its commits reachable), or a compacted
+  `<entry>.compacted.json` stub whose head is pinned under `refs/archived/` and
+  carried in a `<entry>.compacted.bundle`; each compaction run re-pins a lost pin.
+  Nothing deletes or compacts on a schedule yet. `--expire-trash` (merged,
+  content-proven redundant: `worktree_redundancy.py`, #2504) and
+  `--compact-trash` (unmerged, every file equal to its head:
+  `worktree_compaction.py`) are manual, and #4160 tracks scheduling them.
+  `--recover` restores either form; a stub comes back detached at its pin.
 - **hostmetrics/**: stdlib-only resource readings (container cgroup memory and
   CPU, PSI, disks, and the host's headroom through the guardian gateway) and the
   `preflight`/`status` CLI that admits or refuses a heavy job against the

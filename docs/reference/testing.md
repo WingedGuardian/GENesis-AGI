@@ -452,6 +452,19 @@ The list it produces is the to-do list for moving each such test under its own
 enforcement requires a corrected audit and a complete empty CI census, which a
 selected local run cannot establish.
 
+Generated session MCP configs are isolated by the function-scoped autouse fixture
+in `tests/_session_config.py`, registered by the root conftest. It redirects only
+the builder's generated-output directory to each test's `tmp_path`: generation,
+profile filtering, template reads, repository-root substitution and cache reuse
+remain real. Its independent monkeypatch survives a test undoing its own patches.
+Each test starts with a cold output directory, including on separate xdist workers.
+This fixture does not cover generation during collection, broader-scoped fixture
+setup or child processes; those callers must explicitly own their output paths.
+The bounded-output hook tests that exercise recall use a real temporary SQLite
+database and migration marker, rather than pointing SQLite at a test source file.
+These fixture fixes do not enable write-audit enforcement or establish that the
+full-suite census is empty.
+
 ## Shared MCP qualification environments
 
 Ordinary CI keeps its existing runtime dependency ranges. The shared-only

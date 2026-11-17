@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""A plan that specifies repo work answers the six premise questions before it is presented.
+"""A plan that specifies repo work answers the premise form before it is presented.
 
 ``.claude/docs/premise-check.md`` ("At plan and issue time") asks every plan that
-specifies work to answer six questions. Until this hook, nothing read the answers.
+specifies work to answer the premise form (six questions when this hook was
+written; nine items since ``FORM_EPOCH``). Until this hook, nothing read the answers.
 MEASURED 2026-10-27 over one install's 72 plans: 59 name a repo path, and 13 carry a
 premise heading, under four spellings (grep, case-insensitive,
 ``^#{1,6} *premise (check|checks|questions)``).
@@ -12,14 +13,14 @@ every time, on two facts and nothing else:
 
   1. the live plan names a repo path but has no premise section (a heading titled
      "Premise check(s)" or "Premise question(s)", any level);
-  2. one of the six numbered answers is missing or empty (``n/a — <reason>`` is an
+  2. one of the numbered answers is missing or empty (``n/a — <reason>`` is an
      answer; a bare ``n/a``, ``TBD`` or an unfilled ``<placeholder>`` is not).
 
 TWO FORMS. The six questions, and the nine-item form (``FORM``): each answer
 starts with its label, answer 2 carries ``Stated:`` and answer 5 ``Wrong fix:``,
 and ``1. Problem: as #<N>`` stands for items 1 to 5. A section in the nine-item
-form (told from its first answer) is judged by it. Until ``FORM_EPOCH`` is set,
-a complete six still passes; from it, a plan owes the nine.
+form (told from its first answer) is judged by it. ``FORM_EPOCH`` is set, so a
+plan owes the nine; a complete six is blocked with the nine-item template.
 
 Neither judges content, and the fix is one edit. What they do require is the
 documented FORM: answers as a numbered list. Six answers run together on one line
@@ -130,20 +131,36 @@ _SUBLABELS = {2: "Stated", 5: "Wrong fix"}
 #: tracker lookup, as above).
 _AS_LINE = re.compile(r"\s*problem\s*:\s*as\s+#\d+\b", re.IGNORECASE)
 _NEW_FORM_FIRST = re.compile(r"\s*(?:observed\s*:|problem\s*:\s*as\s+#\d)", re.IGNORECASE)
-#: When the nine-item form becomes REQUIRED: issues created on or after it, and
-#: every plan presented after it. None means not yet: a complete section in
-#: either form passes, so nothing that passes today is newly blocked or
-#: labelled. Set in the change that switches the issue forms and the docs, to a
-#: time after that change deploys. ``_TEST_PREMISE_FORM_EPOCH`` overrides it in
-#: tests that run the hook as a subprocess. Write it as GitHub writes
+#: When the nine-item form becomes REQUIRED. Plans and every paid build
+#: (``devin-ready``) owe it from the moment this is set, whatever the date; the
+#: date decides only which ISSUES owe it (created on or after it). None meant
+#: not yet: a complete section in either form passed. Set by the change that
+#: switched the issue forms and the docs, to a time after that change merged,
+#: so an issue filed from the old forms before the merge is never labelled for
+#: it. ``_TEST_PREMISE_FORM_EPOCH`` overrides it in tests that run the hook as a
+#: subprocess, so no test depends on today's date
+#: (``issue_premise_gate`` stamps a new issue with the wall clock). Write it as GitHub writes
 #: ``created_at`` (``YYYY-MM-DDTHH:MM:SSZ``, like ``GATE_EPOCH``): issues compare
 #: it as a string.
-FORM_EPOCH: str | None = None
+FORM_EPOCH: str | None = "2026-11-22T00:00:00Z"
 
 
 def form_epoch() -> str | None:
     override = os.environ.get("_TEST_PREMISE_FORM_EPOCH")
     return override if override else FORM_EPOCH
+
+
+#: Said when a section is owed in the nine-item form and is not written in it.
+#: It does not claim the section IS the six: the form is told from answer 1, so a
+#: nine-item section with a malformed first answer reads as "not nine-item" too.
+NOT_NINE_NOTE = (
+    "This section is not in the nine-item form: its first answer must start "
+    "`Observed:` (or, in a plan or PR, `Problem: as #<N>`), and the other answers "
+    "with their own labels (`Mechanism:` ... `Shape:`). If it is in the "
+    "six-question form, the six map in: outside claims and numbers to 8 (Evidence), "
+    "existing code and scope limits to 7 (Alternatives), the caller to 6 "
+    "(Mechanism), the shape to 9 (Shape); items 1 to 5 state the problem."
+)
 
 
 def is_new_form(answers: dict[int, str] | None) -> bool:
@@ -234,6 +251,28 @@ def _label_only(text: str) -> bool:
     return not _PLACEHOLDER.sub("", rest).replace("\u200b", "").strip()
 
 
+#: A proposal's answer 2: its ``Stated:`` field starts with the word the form
+#: names, "nowhere", quotes and markup allowed (the form writes it ``"nowhere"``).
+#: Owner ruling 2026-11-15: only that word; another wording that admits no
+#: citation ("none — new behaviour") passes as cited, a stated residual. So does
+#: the parser's rule for where a sub-label starts: a capitalized "as Stated:" in
+#: the main answer opens the field early (``_sublabel_at``).
+_NOWHERE = re.compile(r"[\W_]*nowhere\b", re.IGNORECASE)
+
+
+def is_proposal(answers: dict[int, str] | None) -> bool:
+    """Whether a nine-item section's answer 2 admits that nothing states the
+    intended behaviour (``Stated: nowhere``): the issue is then a proposal, not a
+    fix. Read from the ``Stated:`` field alone, so prose in the main answer never
+    counts."""
+    if not is_new_form(answers):
+        return False
+    fields = form_fields(2, answers.get(2, ""))
+    if fields is None or fields[1] is None:
+        return False
+    return bool(_NOWHERE.match(_LEADING_LABELS.sub("", fields[1], count=1)))
+
+
 def field_empty(text: str | None) -> bool:
     """Whether a field says nothing once a leading run of labels is taken off."""
     return text is None or _empty(_LEADING_LABELS.sub("", text, count=1))
@@ -267,7 +306,18 @@ def form_problems(
             continue
         main, subtext = fields
         if field_empty(main):
-            out.append((n, "is missing or empty"))
+            # An answer written inside the template's brackets is told so, not
+            # only that it is empty (the six-question path's `_problem` reads
+            # the whole answer; this reads the field after its label).
+            rest = _LEADING_LABELS.sub("", main, count=1)
+            rest = rest.replace("\u200b", "")
+            only_placeholder = bool(_PLACEHOLDER.search(rest)) and not _PLACEHOLDER.sub("", rest).strip()
+            why = (
+                "is only a `<placeholder>`: replace it, brackets included"
+                if only_placeholder
+                else "is missing or empty"
+            )
+            out.append((n, why))
             continue
         sub = _SUBLABELS.get(n)
         if sub and field_empty(subtext):
@@ -349,10 +399,7 @@ def _check(payload: dict) -> int:
             )
         ]
     elif epoch is not None:
-        problems = [
-            "the section uses the six-question form; plans now answer the nine-item form "
-            "below (`1. Problem: as #<N>` stands for items 1 to 5 when an issue answers them)"
-        ]
+        problems = [NOT_NINE_NOTE]
     else:
         problems = [
             _problem(n, question, answers.get(n, ""))
