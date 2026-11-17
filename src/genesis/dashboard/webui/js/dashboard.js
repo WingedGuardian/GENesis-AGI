@@ -2202,7 +2202,7 @@
           try {
             const resp = await fetchApi("/api/genesis/backup/trigger", { method: "POST" });
             // Type=oneshot backup runs ~5 min; status won't reflect it immediately.
-            if (resp && resp.ok) { alert("Backup started — a full run takes a few minutes."); setTimeout(() => this.fetchBackupStatus(), 8000); }
+            if (resp && resp.ok) { alert("Backup started — a full run takes a few minutes. If memory is short it first waits for it, up to an hour; the log shows progress."); setTimeout(() => this.fetchBackupStatus(), 8000); }
             else { alert("Trigger failed"); }
           } catch (e) { alert("Trigger failed: " + e.message); }
         },

@@ -119,7 +119,10 @@ Attribution is possible but uneven. In rough order of strength:
   so sign with it rather than an invented handle.
 - **Have a session UUID, need its name?** Every `[Concurrent | …]` line already
   carries it after the id — `a1b2c3d4 -> genesis-7f (cc-2:@1.%1)`, the name then
-  the tmux pane. For any other UUID (a charter, a ledger row, a commit trailer) use
+  the tmux pane. When the peer holds worktree claims (its first edit in a
+  worktree takes one), the line's text opens with `in <worktree> on <branch>`,
+  naming the one it claimed most recently, plus a count of the others: those
+  worktrees are theirs, so do not edit in them. For any other UUID (a charter, a ledger row, a commit trailer) use
   the `session_address` MCP tool or `python -m genesis session-address <id-or-prefix>`.
   It answers only when exactly one live process holds that session, so
   `(not reachable)` means the session has ended (or its entry cannot be verified

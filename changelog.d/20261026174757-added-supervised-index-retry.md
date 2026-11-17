@@ -1,0 +1,1 @@
+- Add explicit supervised retry-grant request, observation and revocation, including exact corrupt-metadata revocation and conservative settlement of retained selected trials. New selected execution, acceptance and automatic readiness remain separate.

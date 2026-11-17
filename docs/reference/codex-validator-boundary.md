@@ -16,6 +16,21 @@ neither path establishes OS containment or activates an unattended validator.
 The explicit owner branch-test exception keeps runtime policy and protected
 roots in main, with dual source checks; it performs no deployment itself.
 
+## Native commit-budget qualification
+
+`tests/test_hooks/test_codex_budget_native.py` targets Codex0.166.0 and records
+both executable hashes. In this fixture, CLI/app-server and direct/code calls
+supply execution directory as hook `cwd`. The28-cell matrix keeps shell workdir
+in the alternate repository, including an explicit `git -C` session-repository
+control. It checks exact budget lookup directory/branch and actual scratch
+receipt placement independently of metadata. Implicit, relative and glued
+targets still refuse before lookup. A deliberately wrong-target adapter fault
+selects session budget while an implicit commit executes in alternate; that
+control is not a reproduction of current native metadata or historical code.
+`codex_review_stop.py` still requires explicit absolute canonical `git -C`.
+This synthetic-budget qualification neither activates a profile nor qualifies
+other client releases or the separate full validator adapter.
+
 ## Interactive guard adapter (inactive)
 
 `scripts/hooks/codex-validator-adapter` is a separate adapter for the planned

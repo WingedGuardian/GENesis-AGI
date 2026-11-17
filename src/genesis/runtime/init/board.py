@@ -1,4 +1,4 @@
-"""Bootstrap step ``board``: wire the read-only board reconciler.
+"""Bootstrap step ``board``: wire the board reconciler (it writes only in ``live``).
 
 Its own step (rather than a job added inside ``learning.init``) so the
 bootstrap manifest carries a ``board`` key, which is what lets the health MCP

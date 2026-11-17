@@ -127,6 +127,28 @@ async def test_builder_stores_real_procedure_and_records_grounding(db):
 
 
 @pytest.mark.asyncio
+async def test_shadow_records_the_lesson_and_stores_nothing(db, tmp_path, monkeypatch):
+    monkeypatch.setenv("GENESIS_OUTPUT_DIR", str(tmp_path))
+    router = _router_seq(
+        _Result(content=_builder_json([_proc()])),  # builder
+        _Result(content=_SCOPING_TASK),             # scoping verdict
+    )
+    stored = await judge_multi_procedure(
+        db, _SPINE, '{"command": "echo hi"}', 0.5, router,
+        source_session_id="cc-x", shadow=True,
+    )
+    assert stored == ["shadow"]
+    assert await procedural.find_by_task_type(db, "cut-release") is None
+    lines = (tmp_path / "lesson_builder_shadow.jsonl").read_text().splitlines()
+    assert len(lines) == 1
+    entry = json.loads(lines[0])
+    assert entry["session_id"] == "cc-x"
+    assert entry["task_type"] == "cut-release" and entry["principle"] == "ship the release"
+    # The fail-open limiter is untouched, so a later live store is not rate-limited.
+    assert embedding_mod._fail_open_timestamps == {}
+
+
+@pytest.mark.asyncio
 async def test_builder_retries_on_unparseable_envelope(db):
     router = _router_seq(
         _Result(content="not json — total garbage"),  # attempt 1 → unparseable
