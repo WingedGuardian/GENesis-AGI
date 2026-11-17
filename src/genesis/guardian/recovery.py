@@ -190,12 +190,29 @@ class RecoveryEngine:
                 logger.info("Pre-recovery snapshot: %s", snap_name)
 
         # Execute the action
+        waiting_before = self._sm.state.waiting_on_update_lock
         try:
             success, detail = await self._execute_action(action, diagnosis)
         except Exception as exc:
             logger.error("Recovery action %s failed: %s", action, exc, exc_info=True)
             success = False
             detail = str(exc)
+
+        if not success and not waiting_before and self._sm.state.waiting_on_update_lock:
+            # Held back by update.lock on `live` (#2978): nothing ran, so it is
+            # no attempt and costs no budget or backoff; the episode resumes
+            # once the lock is free. Back to confirmed-dead, where the wait is
+            # probed each tick (set_recovering above left it recovering).
+            self._sm.set_confirmed_dead()
+            await self._dispatcher.send(Alert(
+                severity=AlertSeverity.WARNING,
+                title=f"Recovery deferred: {action.value}",
+                body=f"{detail}\nThe Guardian checks update.lock every tick.",
+            ))
+            return RecoveryResult(
+                action=action, success=False, detail=detail,
+                duration_s=(datetime.now(UTC) - t0).total_seconds(),
+            )
 
         # Record attempt timestamp for backoff tracking
         self._sm.record_recovery_attempt(action.value)
@@ -553,6 +570,14 @@ class RecoveryEngine:
                     "not be read); nothing restarted. The Guardian diagnoses again once the "
                     "lock is free"
                 )
+            # Judged again after the wait: a rebuild that held the lock meanwhile
+            # can have moved the checkout or left it half-written.
+            gone, seen = await self._drop_confirmed(container, branch)
+            if not gone:
+                return False, (
+                    f"dropped {branch} from `live`, but after waiting for update.lock the "
+                    f"engine reports: {seen}; nothing restarted"
+                )
         ok, detail = await self._restart_services(container)
         extra = f" ({' '.join(notes)})" if notes else ""
         return ok, f"dropped {branch} ({head[:12]}) from `live`{extra}; {detail}"
@@ -687,8 +712,9 @@ class RecoveryEngine:
                     f"Cause: {diagnosis.likely_cause}\n"
                     "Nothing was restarted or dropped. The Guardian checks update.lock "
                     "every tick and diagnoses again once it is free, asking your approval "
-                    "for what it then proposes. If the lock never frees, the run holding it "
-                    "is hung: that one needs you."
+                    "for what it then proposes. If the lock is still held after 2 h, the "
+                    "run holding it is likely hung: you will hear again then, and every "
+                    "2 h after."
                 ),
                 likely_cause=diagnosis.likely_cause,
             ))

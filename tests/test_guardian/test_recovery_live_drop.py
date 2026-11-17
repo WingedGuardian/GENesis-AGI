@@ -458,3 +458,55 @@ async def test_execute_hands_the_diagnosis_candidate_to_the_drop(engine):
         result = await engine.execute(diagnosis)
     assert result.success is True, result.detail
     assert len(box.dropped) == 1 and box.restarted
+
+
+@pytest.mark.asyncio
+async def test_the_drop_is_judged_again_after_waiting_for_the_lock(engine):
+    """Review r1 (Devin): a rebuild queued behind the drop can run during the
+    wait and leave the tree half-moved; the restart reads the engine again."""
+    dirty = {**AFTER, "move_refusals": ["uncommitted tracked changes"]}
+    box = Container([_view(), AFTER, dirty], lock=[(75, "", ""), (0, "", "")])
+    ok, detail = await _drop(engine, box)
+    assert ok is False and "after waiting for update.lock" in detail
+    assert "uncommitted tracked changes" in detail
+    assert not box.restarted
+
+
+def _drop_diagnosis():
+    return DiagnosisResult(
+        likely_cause="bad candidate",
+        confidence_pct=80,
+        evidence=[],
+        recommended_action=RecoveryAction.REVERT_CODE,
+        drop_candidate=("feat/b", HEAD_B, TIP),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("drop", "deferred"),
+    [((200, "", "ERROR: still held"), True), ((1, "", "ERROR: refused"), False)],
+    ids=["lock-held", "refused-control"],
+)
+async def test_a_lock_deferral_costs_no_recovery_attempt(engine, drop, deferred):
+    """Review r1 (Devin): an action held back by update.lock ran nothing, so it
+    is no attempt; the episode resumes with its budget once the lock is free.
+    A real failure still counts (the control)."""
+    from genesis.guardian.state_machine import GuardianState
+
+    box = Container([_view()], drop=drop)
+    before = engine._sm.state.recovery_attempts
+    send = AsyncMock()
+    with (
+        _box(box),
+        patch.object(engine._snapshots, "safe_to_snapshot", AsyncMock(return_value=False)),
+        patch.object(engine._dispatcher, "send", send),
+    ):
+        result = await engine.execute(_drop_diagnosis())
+    assert result.success is False
+    assert (engine._sm.state.recovery_attempts == before) is deferred
+    assert engine._sm.state.current_state == GuardianState.CONFIRMED_DEAD
+    assert engine._sm.state.waiting_on_update_lock is deferred
+    last = send.await_args_list[-1].args[0].title
+    assert last.startswith("Recovery deferred") is deferred
+    assert last.startswith("Recovery failed") is (not deferred)

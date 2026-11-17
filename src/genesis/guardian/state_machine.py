@@ -78,6 +78,10 @@ class StateData:
     # On `live`, this episode escalated because update.lock was held: each tick
     # probes the lock and reopens the episode once it is free (#2978).
     waiting_on_update_lock: bool = False
+    # When that wait began, and when the owner was last alerted about it
+    # (ISO8601): a wait past WAIT_REALERT_S alerts again (owner ruling, #2978).
+    waiting_since: str | None = None
+    wait_alerted_at: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -105,6 +109,8 @@ class StateData:
             "snapshot_size_history": self.snapshot_size_history[-5:],
             "boot_id": self.boot_id,
             "waiting_on_update_lock": self.waiting_on_update_lock,
+            "waiting_since": self.waiting_since,
+            "wait_alerted_at": self.wait_alerted_at,
         }
 
     @classmethod
@@ -138,7 +144,25 @@ class StateData:
             snapshot_size_history=data.get("snapshot_size_history", []),
             boot_id=str(data.get("boot_id") or ""),
             waiting_on_update_lock=data.get("waiting_on_update_lock") is True,
+            waiting_since=_iso_or_none(data.get("waiting_since")),
+            wait_alerted_at=_iso_or_none(data.get("wait_alerted_at")),
         )
+
+
+def _iso_or_none(value: object) -> str | None:
+    """A persisted timestamp field: a string, or None (a hand-edited or older
+    state file must never put another type where the parse expects text)."""
+    return value if isinstance(value, str) else None
+
+
+def _aware(text: str | None) -> datetime | None:
+    """An ISO8601 timestamp with a time zone, or None when it is missing,
+    unparseable or naive (comparing a naive one with now raises TypeError)."""
+    try:
+        when = datetime.fromisoformat(text or "")
+    except (ValueError, TypeError):
+        return None
+    return when if when.tzinfo is not None else None
 
 
 @dataclass(frozen=True)
@@ -693,7 +717,7 @@ class ConfirmationStateMachine:
         self._state.signal_history.clear()
         self._clear_dialogue_state()
         self.clear_cc_unavailable()
-        self._state.waiting_on_update_lock = False
+        self._end_wait()
         self._state.boot_id = current_boot_id
         return True
 
@@ -707,7 +731,7 @@ class ConfirmationStateMachine:
         self._state.recovery_attempts = 0
         self._state.io_triage_attempts = 0
         self._state.last_recovery_at = None
-        self._state.waiting_on_update_lock = False
+        self._end_wait()
         self._clear_dialogue_state()
         self.clear_cc_unavailable()
 
@@ -804,18 +828,47 @@ class ConfirmationStateMachine:
         """
         self._state.down_alert_sent = True
         # A new episode starts unmarked; its escalation marks the wait again.
-        self._state.waiting_on_update_lock = False
+        self._end_wait()
 
     def clear_down_alert_sent(self) -> None:
         """Clear the down-alert flag — called by check.py when an episode ends
         (genuine recovery, a denial, a failed prompt) or reopens. The episode's
         wait on update.lock ends with it."""
         self._state.down_alert_sent = False
+        self._end_wait()
+
+    def _end_wait(self) -> None:
         self._state.waiting_on_update_lock = False
+        self._state.waiting_since = None
+        self._state.wait_alerted_at = None
+
+    def wait_realert_due(self, now: datetime, every_s: float) -> bool:
+        """Whether the owner should hear again about a wait on update.lock:
+        ``every_s`` since the last alert (the first is the escalation itself).
+        Records the alert when due. An unreadable timestamp counts as due."""
+        if not self._state.waiting_on_update_lock:
+            return False
+        if self._state.waiting_since is None:
+            # A wait recorded before these timestamps existed: it starts now.
+            self._state.waiting_since = self._state.wait_alerted_at = now.isoformat()
+            return False
+        last = _aware(self._state.wait_alerted_at)
+        if last is not None and 0 <= (now - last).total_seconds() < every_s:
+            return False
+        self._state.wait_alerted_at = now.isoformat()
+        return True
+
+    def waited_s(self, now: datetime) -> float | None:
+        start = _aware(self._state.waiting_since)
+        return None if start is None else (now - start).total_seconds()
 
     def mark_waiting_on_update_lock(self) -> None:
         """This episode escalated because update.lock was held on `live`: the
-        next ticks probe the lock instead of staying quiet (#2978)."""
+        next ticks probe the lock instead of staying quiet (#2978). A wait
+        already running keeps its start: the re-alert counts from there."""
+        if not self._state.waiting_on_update_lock:
+            now = datetime.now(UTC).isoformat()
+            self._state.waiting_since = self._state.wait_alerted_at = now
         self._state.waiting_on_update_lock = True
 
     def should_escalate(self) -> bool:

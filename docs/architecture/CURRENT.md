@@ -2773,7 +2773,9 @@ verified: 9a1994b2b 2026-11-17
   re-reads the lock too, since the approval may be hours old. A lock still
   held marks the same wait; a refusal or an unconfirmed result restarts
   nothing. The confirmed-dead auto-reset (600 s) is suspended while an episode
-  waits, and every episode reset ends the wait. With no approved candidate,
+  waits, and every episode reset ends the wait. A wait past 2 h (the deploy
+  scripts' own lock-wait ceiling) alerts again, and every 2 h after, naming the
+  holder; alert only, it never restarts on elapsed time (owner ruling). With no approved candidate,
   `recovery.py` refuses a REVERT_CODE on `live` as a backstop. The reads, the
   pick and the proposal live in `guardian/live_drop.py`; every container string
   they show is cleaned and cut, and the view is capped at 1 MiB in the

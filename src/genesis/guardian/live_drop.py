@@ -48,6 +48,11 @@ _BRANCH_RE = re.compile(r"[^\x00-\x20\x7f-][^\x00-\x20\x7f]{0,249}")
 _OID_RE = re.compile(r"[0-9a-f]{40}")
 _SHOWN_CAP = 200
 
+#: While an episode waits for update.lock, alert the owner again this often: the
+#: deploy scripts' own lock-wait ceiling (GENESIS_DEPLOY_LOCK_WAIT, 7200 s), past
+#: which the holder is likely hung. Alert only (owner ruling, #2978).
+WAIT_REALERT_S = 7200
+
 #: DiagnosisResult.escalation values: why a proposal became ESCALATE here.
 WAITING_ON_LOCK = "update_lock_held"
 HALF_DONE_DROP = "half_done_drop"

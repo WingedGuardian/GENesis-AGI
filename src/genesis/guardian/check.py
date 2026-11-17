@@ -1749,8 +1749,27 @@ async def _handle_confirmed_dead(
             # This episode escalated because update.lock was held on `live`: one
             # cheap probe per tick, and a fresh diagnosis once it is free. A
             # probe that cannot say reopens too: the proposal step probes again.
-            held, _who = await live_drop.update_lock_holder(config.container_name)
+            held, who = await live_drop.update_lock_holder(config.container_name)
             reopen = held is not True
+            now = datetime.now(UTC)
+            if held is True and sm.wait_realert_due(now, live_drop.WAIT_REALERT_S):
+                # Alert only (owner ruling): past the deploy scripts' own 2 h
+                # lock wait the holder is likely hung, but elapsed time alone
+                # never starts a recovery.
+                waited = sm.waited_s(now)
+                hours = f"{waited / 3600:.1f} h" if waited is not None else "a long time"
+                await dispatcher.send(Alert(
+                    severity=AlertSeverity.EMERGENCY,
+                    title="Genesis still down — the Guardian has waited " + hours + " for update.lock",
+                    body=(
+                        f"The Guardian has waited {hours} for update.lock on `live`, now held"
+                        + (f" ({who})" if who else "")
+                        + ". The deploy scripts give up waiting for it after 2 h, so the "
+                        "run holding it is likely hung. The Guardian keeps waiting and will "
+                        "not restart anything on its own: end that run, and it diagnoses "
+                        "again within 30 s."
+                    ),
+                ))
         if not reopen:
             logger.info(
                 "Down alert already sent this episode — staying quiet until recovery "

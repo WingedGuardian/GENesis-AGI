@@ -340,3 +340,115 @@ def test_every_episode_reset_ends_the_wait(config):
         sm.mark_waiting_on_update_lock()
         reset(sm)
         assert sm.state.waiting_on_update_lock is False
+
+
+# ── a wait that drags on alerts again (owner ruling: 2 h, alert only) ───────
+
+
+def test_the_realert_is_due_every_two_hours_from_the_wait_start(config):
+    from datetime import UTC, datetime, timedelta
+
+    from genesis.guardian.live_drop import WAIT_REALERT_S
+
+    sm = ConfirmationStateMachine(config)
+    assert sm.wait_realert_due(datetime.now(UTC), WAIT_REALERT_S) is False  # not waiting
+    sm.mark_waiting_on_update_lock()
+    start = datetime.fromisoformat(sm.state.waiting_since)
+    sm.mark_waiting_on_update_lock()  # a second mark keeps the start
+    assert datetime.fromisoformat(sm.state.waiting_since) == start
+    assert sm.wait_realert_due(start + timedelta(minutes=119), WAIT_REALERT_S) is False
+    assert sm.wait_realert_due(start + timedelta(minutes=121), WAIT_REALERT_S) is True
+    assert sm.wait_realert_due(start + timedelta(minutes=122), WAIT_REALERT_S) is False
+    assert sm.wait_realert_due(start + timedelta(minutes=242), WAIT_REALERT_S) is True
+    assert 7 * 3600 < sm.waited_s(start + timedelta(hours=7, minutes=1)) < 7.1 * 3600
+    sm.clear_down_alert_sent()
+    assert (sm.state.waiting_since, sm.state.wait_alerted_at) == (None, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("hours", "alerts"), [(1, 0), (3, 1)], ids=["1h", "3h"])
+async def test_a_long_wait_alerts_again_and_restarts_nothing(config, hours, alerts):
+    from datetime import UTC, datetime, timedelta
+
+    from genesis.guardian.check import _handle_confirmed_dead
+
+    sm = ConfirmationStateMachine(config)
+    sm._state.current_state = GuardianState.CONFIRMED_DEAD
+    sm._state.down_alert_sent = True
+    sm.mark_waiting_on_update_lock()
+    past = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+    sm._state.waiting_since = sm._state.wait_alerted_at = past
+    dispatcher = MagicMock(send=AsyncMock())
+    run = AsyncMock()
+    with (
+        patch(
+            "genesis.guardian.live_drop.update_lock_holder",
+            AsyncMock(return_value=(True, "the deploy marker names pid 4242")),
+        ),
+        patch("genesis.guardian.check._execute_recovery_with_approval", run),
+    ):
+        await _handle_confirmed_dead(config, sm, dispatcher, MagicMock(), MagicMock())
+    assert dispatcher.send.await_count == alerts
+    run.assert_not_awaited()  # alert only: nothing is proposed or restarted
+    if alerts:
+        alert = dispatcher.send.await_args.args[0]
+        assert "has waited 3.0 h for update.lock" in alert.title
+        assert "pid 4242" in alert.body and "will not restart anything" in alert.body
+
+
+@pytest.mark.asyncio
+async def test_the_two_hour_limit_survives_a_guardian_restart(config, tmp_path):
+    """Each tick is a fresh process: the alert time must be saved and read back,
+    or a long wait alerts every 30 s (re-alert review SF-2)."""
+    from datetime import UTC, datetime, timedelta
+
+    from genesis.guardian.check import _handle_confirmed_dead
+
+    path = tmp_path / "state.json"
+    sm = ConfirmationStateMachine(config)
+    sm._state.current_state = GuardianState.CONFIRMED_DEAD
+    sm._state.down_alert_sent = True
+    sm.mark_waiting_on_update_lock()
+    past = (datetime.now(UTC) - timedelta(hours=3)).isoformat()
+    sm._state.waiting_since = sm._state.wait_alerted_at = past
+    sm.save_state(path)
+    dispatcher = MagicMock(send=AsyncMock())
+    engine = MagicMock(execute=AsyncMock())
+    with patch("genesis.guardian.live_drop.update_lock_holder", AsyncMock(return_value=(True, ""))):
+        for _tick in range(3):
+            sm = ConfirmationStateMachine(config)
+            sm.load_state(path)
+            await _handle_confirmed_dead(config, sm, dispatcher, MagicMock(), engine)
+            sm.save_state(path)
+    assert dispatcher.send.await_count == 1
+    engine.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [{"waiting_since": 5, "wait_alerted_at": ["x"]}, {"waiting_since": "2026-11-17T10:00:00", "wait_alerted_at": "nope"}],
+    ids=["not-strings", "naive-and-garbage"],
+)
+def test_a_corrupt_wait_record_never_crashes_a_tick(config, stored):
+    from datetime import UTC, datetime
+
+    from genesis.guardian.live_drop import WAIT_REALERT_S
+    from genesis.guardian.state_machine import StateData
+
+    sm = ConfirmationStateMachine(config)
+    sm._state = StateData.from_dict({"waiting_on_update_lock": True, **stored})
+    now = datetime.now(UTC)
+    sm.wait_realert_due(now, WAIT_REALERT_S)  # must not raise
+    sm.waited_s(now)
+
+
+def test_a_wait_from_an_older_guardian_starts_now_instead_of_alerting(config):
+    from datetime import UTC, datetime
+
+    from genesis.guardian.live_drop import WAIT_REALERT_S
+    from genesis.guardian.state_machine import StateData
+
+    sm = ConfirmationStateMachine(config)
+    sm._state = StateData.from_dict({"waiting_on_update_lock": True})
+    assert sm.wait_realert_due(datetime.now(UTC), WAIT_REALERT_S) is False
+    assert sm.state.waiting_since is not None
