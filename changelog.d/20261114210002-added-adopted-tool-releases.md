@@ -1,1 +1,0 @@
-- Monitor releases of adopted code intelligence, browser, web fetching and lint tools through recon's existing release intake.

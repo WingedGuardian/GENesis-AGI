@@ -1,1 +1,0 @@
-- Daily maintenance now runs independently of worktree archiving, so a long archive pass cannot prevent cache and retention cleanup. Both daily jobs allow up to two hours to finish.

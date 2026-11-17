@@ -1,1 +1,0 @@
-- Replacing a knowledge unit preserves vectors referenced by other committed units, and concurrent ingestion paths coordinate reference publication with cleanup.
