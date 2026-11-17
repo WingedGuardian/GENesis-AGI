@@ -134,3 +134,46 @@ async def test_record_invocation_increments_and_stamps(db):
 
 async def test_record_invocation_unknown_id_is_noop(db):
     assert await procedural.record_invocation(db, "nope") is False
+
+
+# ── created_session_id: set once at insert, never by an update (#4717) ──
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ('{"type": "struggle_extraction", "session_id": "s-1"}', "s-1"),
+        ('{"type": "explicit_teach"}', None),
+        ('{"session_id": ""}', None),
+        ('{"session_id": 7}', None),
+        ('["s-1"]', None),
+        ("not json", None),
+        (None, None),
+    ],
+)
+async def test_create_records_the_source_session_once(db, source, expected):
+    await procedural.create(db, id="p_cs", source=source, **_COMMON)
+    assert (await procedural.get_by_id(db, "p_cs"))["created_session_id"] == expected
+
+
+async def test_an_update_never_rewrites_the_creation_session(db):
+    await procedural.create(db, id="p_cs", source='{"session_id": "s-1"}', **_COMMON)
+    await procedural.update(db, "p_cs", source={"type": "explicit_teach", "session_id": "s-2"})
+    assert (await procedural.get_by_id(db, "p_cs"))["created_session_id"] == "s-1"
+
+
+async def test_upsert_sets_it_on_insert_and_keeps_it_on_conflict(db):
+    await procedural.upsert(db, id="p_up", source='{"session_id": "s-1"}', **_COMMON)
+    assert (await procedural.get_by_id(db, "p_up"))["created_session_id"] == "s-1"
+    await procedural.upsert(db, id="p_up", source='{"session_id": "s-2"}', **_COMMON)
+    assert (await procedural.get_by_id(db, "p_up"))["created_session_id"] == "s-1"
+
+
+@pytest.mark.parametrize("column", ["created_session_id", "created_at"])
+async def test_update_refuses_the_creation_columns(db, column):
+    """The lesson cap counts creations by these two; an update must never move them."""
+    await procedural.create(db, id="p_cs", source='{"session_id": "s-1"}', **_COMMON)
+    with pytest.raises(ValueError, match=column):
+        await procedural.update(db, "p_cs", **{column: "x"})
+    row = await procedural.get_by_id(db, "p_cs")
+    assert row["created_session_id"] == "s-1" and row["created_at"] == _COMMON["created_at"]

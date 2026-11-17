@@ -3780,7 +3780,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 6a73d1b75 2026-11-15
+verified: 3f70a665b 2026-11-15
 ```
 
 - **eval/ego_runtime**: opt-in canonical proposal-operation probes using fresh
@@ -3948,6 +3948,19 @@ verified: 6a73d1b75 2026-11-15
   Critic + a `replay` off|shadow sub-config) + `GENESIS_SKILL_EVOLUTION_GATE_OFF`.
   `tool_discovery.py` static maps are deprecated (GROUNDWORK
   provider-migration) — use ProviderRegistry.
+- **The whole-session lesson builder** (Stream 1 of
+  `memory/extraction_job.run_extraction_cycle`, plus its `procedure_rebuild`
+  drain) adds at most 7 new lessons per source session in any rolling 24 hours,
+  counted by `procedural_memory.created_session_id`. That column is written once,
+  at insert, so a refine that rewrites `source` cannot reopen a slot. Lever: the
+  `lesson_builder` settings domain (`off | shadow | live`, shipped `live`; an
+  unreadable base or overlay reads as `shadow`). In shadow the builder runs its
+  real model call and checks, stores nothing, and appends each would-be lesson
+  to `~/.genesis/output/lesson_builder_shadow.jsonl`. That file is also the
+  shadow cap's count, so it rotates by time (the two files always hold the
+  window) and drops a lesson that repeats one already recorded for the session.
+  Queued rebuilds wait, unspent, until the mode is live; the drain scans past
+  capped sessions, so they never starve an eligible one.
 - **eval/**: J9 = fire-and-forget emit hooks on live cognitive paths (the
   "cannot break production" contract — hooks must never raise) + weekly Sunday
   aggregation (hard 7-day window) + an on-demand batch judge as a surplus
