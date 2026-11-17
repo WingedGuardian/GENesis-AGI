@@ -190,7 +190,15 @@ async def record_run_complete(
     error_message: str | None = None,
     only_if_running: bool = False,
 ) -> bool:
-    """Record a run completion; optionally compare-and-set from running."""
+    """Record a run completion; optionally compare-and-set from running.
+
+    The parent job's summary is then recomputed from its runs by
+    :func:`refresh_job_summary`, so overlapping runs cannot overwrite the newest
+    run's status or lose a failure. If a completion saves the run but fails
+    before the parent, boot reconciliation repairs the job (it refreshes every
+    job still marked running); a compare-and-set call that finds the run already
+    finished also refreshes the parent, so any repeat completion repairs it too.
+    """
     now = datetime.now(UTC).isoformat()
     result_json_text = json.dumps(result_json) if result_json else None
     guard = " AND status = 'running'" if only_if_running else ""
@@ -200,30 +208,51 @@ async def record_run_complete(
         (status, now, result_json_text, error_message, run_id),
     )
     updated = cursor.rowcount > 0
-    await db.commit()
-    if only_if_running and not updated:
-        return False
-
-    # Update the parent job
     cursor = await db.execute(
         "SELECT job_id FROM user_job_runs WHERE id = ?", (run_id,),
     )
     row = await cursor.fetchone()
     if row:
-        job_id = row[0] if isinstance(row, tuple) else row["job_id"]
-        update_kwargs: dict = {
-            "last_status": status,
-            "last_result_json": result_json_text,
-        }
-        if status == "failed":
-            # Increment failure count
-            job = await get_job(db, job_id)
-            if job:
-                update_kwargs["failure_count"] = (job.get("failure_count") or 0) + 1
-        else:
-            update_kwargs["failure_count"] = 0
-        await update_job(db, job_id, **update_kwargs)
-    return True
+        await refresh_job_summary(db, row[0])
+    await db.commit()
+    return updated or not only_if_running
+
+
+async def refresh_job_summary(db: aiosqlite.Connection, job_id: str | None = None) -> None:
+    """Recompute a job's latest-run summary and failure count from its runs.
+
+    One statement, idempotent, and correct whatever order runs finished in:
+    ``last_status`` is the latest-started run's status, ``last_result_json`` its
+    result (kept when that run has none yet), and ``failure_count`` the number of
+    failed runs started after the latest passed one. ``job_id=None`` is the boot
+    repair: it refreshes every job still marked running, which is what a
+    completion that saved its run but not its parent leaves behind, and leaves
+    other jobs alone (a dispatch that never started a run marks its job failed
+    with no run row to recompute from). Does not commit.
+    """
+    latest = (
+        "SELECT {col} FROM user_job_runs r WHERE r.job_id = user_jobs.id"
+        " ORDER BY r.started_at DESC, r.id DESC LIMIT 1"
+    )
+    where, params = (
+        ("WHERE id = ?", (job_id,)) if job_id is not None
+        else ("WHERE last_status = 'running'", ())
+    )
+    await db.execute(
+        f"""UPDATE user_jobs SET
+              last_status = COALESCE(({latest.format(col="status")}), last_status),
+              last_result_json = COALESCE(({latest.format(col="result_json")}),
+                                          last_result_json),
+              failure_count = (
+                SELECT COUNT(*) FROM user_job_runs f
+                WHERE f.job_id = user_jobs.id AND f.status = 'failed'
+                  AND f.started_at > COALESCE((
+                    SELECT MAX(p.started_at) FROM user_job_runs p
+                    WHERE p.job_id = user_jobs.id AND p.status = 'passed'), '')),
+              updated_at = datetime('now')
+            {where}""",
+        params,
+    )
 
 
 async def get_run_history(

@@ -413,6 +413,145 @@ async def test_record_run_complete_default_remains_unconditional_and_returns_tru
     assert (await crud.get_job(db, job_id))["failure_count"] == 1
 
 
+async def _two_overlapping_runs(db) -> tuple[str, str, str]:
+    """A job with an older and a newer run, both still running."""
+    job_id = await _create_job(db)
+    older = await crud.record_run_start(db, job_id=job_id)
+    newer = await crud.record_run_start(db, job_id=job_id)
+    for run_id, started in ((older, "2026-01-01T09:00:00+00:00"),
+                            (newer, "2026-01-01T09:01:00+00:00")):
+        await db.execute(
+            "UPDATE user_job_runs SET started_at = ? WHERE id = ?", (started, run_id),
+        )
+    await db.commit()
+    return job_id, older, newer
+
+
+@pytest.mark.asyncio
+async def test_an_older_completion_keeps_the_newer_runs_summary(db):
+    job_id, older, newer = await _two_overlapping_runs(db)
+
+    assert await crud.record_run_complete(
+        db, older, status="passed", result_json={"run": "older"}, only_if_running=True,
+    ) is True
+    job = await crud.get_job(db, job_id)
+    assert job["last_status"] == "running"
+    assert job["last_result_json"] is None
+
+    assert await crud.record_run_complete(
+        db, newer, status="passed", result_json={"run": "newer"}, only_if_running=True,
+    ) is True
+    job = await crud.get_job(db, job_id)
+    assert job["last_status"] == "passed"
+    assert json.loads(job["last_result_json"]) == {"run": "newer"}
+
+
+@pytest.mark.asyncio
+async def test_an_older_success_neither_hides_nor_resets_a_newer_failure(db):
+    job_id, older, newer = await _two_overlapping_runs(db)
+
+    await crud.record_run_complete(db, newer, status="failed", only_if_running=True)
+    await crud.record_run_complete(db, older, status="passed", only_if_running=True)
+
+    job = await crud.get_job(db, job_id)
+    assert job["last_status"] == "failed"
+    assert job["failure_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_an_older_failure_still_counts_without_touching_the_summary(db):
+    job_id, older, newer = await _two_overlapping_runs(db)
+
+    await crud.record_run_complete(db, older, status="failed", only_if_running=True)
+
+    job = await crud.get_job(db, job_id)
+    assert job["failure_count"] == 1
+    assert job["last_status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_overlapping_failures_count_from_the_database_not_a_stale_read(db, monkeypatch):
+    """Two completions that each read the job before either writes must both count."""
+    job_id, older, newer = await _two_overlapping_runs(db)
+    stale = dict(await crud.get_job(db, job_id))  # failure_count 0, as both readers saw it
+
+    real_get_job = crud.get_job
+
+    async def stale_get_job(_db, _job_id):
+        return dict(stale)
+
+    monkeypatch.setattr(crud, "get_job", stale_get_job)
+    await crud.record_run_complete(db, older, status="failed", only_if_running=True)
+    await crud.record_run_complete(db, newer, status="failed", only_if_running=True)
+
+    assert (await real_get_job(db, job_id))["failure_count"] == 2
+
+
+async def _fail_the_parent_update_once(db, monkeypatch) -> None:
+    """Make the next parent-job UPDATE raise, as a failure between the two writes."""
+    # Patch the raw connection under the fixture's serializing wrapper: the
+    # wrapper holds its lock while it calls this, so the fake must not re-enter it.
+    raw = db._conn
+    real_execute = raw.execute
+    calls = {"failed": False}
+
+    async def failing_execute(sql, *args, **kwargs):
+        if not calls["failed"] and sql.lstrip().startswith("UPDATE user_jobs"):
+            calls["failed"] = True
+            raise RuntimeError("parent update failed")
+        return await real_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(raw, "execute", failing_execute)
+
+
+async def _a_run_saved_without_its_parent(db, monkeypatch) -> tuple[str, str]:
+    """A failed run whose completion saved the run row but not the parent."""
+    job_id = await _create_job(db)
+    run_id = await crud.record_run_start(db, job_id=job_id)
+    await _fail_the_parent_update_once(db, monkeypatch)
+    with pytest.raises(RuntimeError):
+        await crud.record_run_complete(db, run_id, status="failed", only_if_running=True)
+    await db.commit()  # any later commit on the shared connection saves the run row
+    assert (await crud.get_run_history(db, job_id))[0]["status"] == "failed"
+    job = await crud.get_job(db, job_id)
+    assert (job["last_status"], job["failure_count"]) == ("running", 0)
+    return job_id, run_id
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_completion_repairs_a_parent_the_first_one_missed(db, monkeypatch):
+    job_id, run_id = await _a_run_saved_without_its_parent(db, monkeypatch)
+
+    assert await crud.record_run_complete(
+        db, run_id, status="failed", only_if_running=True,
+    ) is False  # the run was already finished
+    job = await crud.get_job(db, job_id)
+    assert (job["last_status"], job["failure_count"]) == ("failed", 1)
+
+
+@pytest.mark.asyncio
+async def test_boot_reconciliation_repairs_a_parent_left_marked_running(db, monkeypatch):
+    job_id, _ = await _a_run_saved_without_its_parent(db, monkeypatch)
+
+    await UserJobScheduler(db=db).reconcile_open_runs()
+
+    job = await crud.get_job(db, job_id)
+    assert (job["last_status"], job["failure_count"]) == ("failed", 1)
+
+
+@pytest.mark.asyncio
+async def test_boot_repair_leaves_a_job_failed_without_a_run_alone(db):
+    """A dispatch that never started a run marks its job failed with no run row."""
+    job_id = await _create_job(db)
+    run_id = await crud.record_run_start(db, job_id=job_id)
+    await crud.record_run_complete(db, run_id, status="passed")
+    await crud.update_job(db, job_id, last_status="failed")
+
+    await UserJobScheduler(db=db).reconcile_open_runs()
+
+    assert (await crud.get_job(db, job_id))["last_status"] == "failed"
+
+
 @pytest.mark.asyncio
 async def test_dispatch_finalizes_session_that_ended_before_attachment(db, monkeypatch):
     job_id = await _create_job(db)

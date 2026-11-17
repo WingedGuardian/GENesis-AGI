@@ -227,6 +227,13 @@ class UserJobScheduler:
                     finalized += 1
             except Exception:
                 logger.exception("Failed to reconcile user-job run %s", run.get("id"))
+        try:
+            # A completion that saved its run but failed before its parent left
+            # that job marked running with no running run; recompute it.
+            await crud.refresh_job_summary(self._db)
+            await self._db.commit()
+        except Exception:
+            logger.exception("Failed to refresh user-job summaries during reconciliation")
         if finalized:
             logger.info("Reconciled %d user-job run(s)", finalized)
         return finalized
