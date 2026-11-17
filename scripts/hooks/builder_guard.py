@@ -385,6 +385,21 @@ def reason(cmd: str, cwd: str | None) -> str | None:
     from shell_parse import analyze_checked, fold_continuations, mentions, rewrites_before_running
 
     segs, blind = analyze_checked(cmd)
+    if blind is not None and "\\\n" in cmd and not any(t in cmd for t in ("#", "<<", "\r")):
+        # A line continuation is the usual reason a command cannot be read. The
+        # shell deletes backslash-newline before it splits words, so join it the
+        # same way and read the command again: when that parses, the normal
+        # checks below decide, and the text nets are only for what stays blind
+        # (#4835). The join is the shell's only where it reads no comment, heredoc
+        # or CR: there a backslash-newline is literal or ends a comment, so a
+        # joined parse could hide a command (a merge) that bash runs. Those stay
+        # blind and go to the text nets.
+        from hook_input import _join_continuations
+
+        joined = _join_continuations(cmd)
+        segs2, blind2 = analyze_checked(joined)
+        if blind2 is None:
+            cmd, segs, blind = joined, segs2, None
     if blind is not None or rewrites_before_running(cmd):
         if mentions(cmd, _BLIND):
             return "a command this guard cannot read that names a merge, a review or a review-thread write"

@@ -111,6 +111,15 @@ REFUSED = [
     "gh -R o/r api \\\n  repos/o/r/pulls/5/comments --input reply.json",
     "gh --hostname github.com api \\\n  repos/o/r/pulls/5/comments --input reply.json",
     "gh api graphql \\\n  -F query=@m.graphql",
+    # Round 5 (CodeRabbit): the grouped form, read by the re-parse (#4835).
+    "gh api graphql \\\n  -iF query=@m.graphql",
+    # Round-5 audit: where joining is not the shell's, the text nets still refuse.
+    "# note \\\ngh pr merge 5",
+    "gh pr view 5 \\\n  --json state # done \\\ngh pr merge 5 --squash",
+    "# fetch \\\ngh api -X PUT repos/o/r/pulls/5/merge",
+    "cat <<'EOF' \\\n  >/dev/null\nx\\\nEOF\ngh pr merge 5\nEOF",
+    "echo a \\\n b \\\r\ngh pr merge 5",
+    "bash -c 'true #\\\ngh pr merge 5' \\\n  2>/dev/null",
     "gh api -iF event=APPROVE repos/o/r/pull%73/5/reviews",
     "curl --confi curl.cfg",
     "curl --request-targ /graphql --data-binary @q.json https://api.github.com",
@@ -284,3 +293,23 @@ def test_the_guard_is_wired_for_every_bash_call():
         for h in block["hooks"]
     ]
     assert any(c.endswith("genesis-hook hooks/builder_guard.py") for c in commands)
+
+
+def _wrapped_twin(cmd: str) -> str:
+    return cmd.replace("gh api ", "gh api \\\n  ", 1)
+
+
+@pytest.mark.parametrize("cmd", [c for c in REFUSED if c.startswith("gh api ") and "\n" not in c])
+def test_the_wrapped_twin_of_every_gh_api_refusal_is_refused(tmp_path, cmd):
+    """#4835: a line continuation never turns a refused gh api call into an allowed one."""
+    res = _run(_wrapped_twin(cmd), key="k@1", cwd=tmp_path)
+    assert res.returncode == 2, (cmd, res.stderr)
+    # The parsed checks decide, not the text nets for unreadable commands (#4835).
+    assert "a command this guard cannot read" not in res.stderr, res.stderr
+    assert "a GitHub request this guard cannot read" not in res.stderr, res.stderr
+
+
+@pytest.mark.parametrize("cmd", [c for c in ALLOWED if c.startswith("gh api ") and "\n" not in c])
+def test_the_wrapped_twin_of_every_gh_api_allowance_is_allowed(tmp_path, cmd):
+    res = _run(_wrapped_twin(cmd), key="k@1", cwd=tmp_path)
+    assert res.returncode == 0, (cmd, res.stderr)
