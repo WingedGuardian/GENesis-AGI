@@ -107,6 +107,10 @@ REFUSED = [
     "wget --input-f=urls.txt --method=PUT",
     # Round-3 fix audit: encoded grouped calls and curl long-option prefixes.
     "gh api -iX DELETE repos/o/r/%70ulls/comments/9",
+    # Round 4 (CodeRabbit): a gh global option before api on a wrapped request.
+    "gh -R o/r api \\\n  repos/o/r/pulls/5/comments --input reply.json",
+    "gh --hostname github.com api \\\n  repos/o/r/pulls/5/comments --input reply.json",
+    "gh api graphql \\\n  -F query=@m.graphql",
     "gh api -iF event=APPROVE repos/o/r/pull%73/5/reviews",
     "curl --confi curl.cfg",
     "curl --request-targ /graphql --data-binary @q.json https://api.github.com",
@@ -153,6 +157,7 @@ ALLOWED = [
     "curl -s -H 'X-Ids: [1,2]' https://example.com",
     "curl -s -o out.html https://example.com/docs",
     "curl --request PUT https://example.com/x",
+    'gh pr create \\\n  --title "api: graphql paging" --body-file body.md',
     "gh api \\\n  repos/o/r/pulls/5/comments --paginate --jq '.[].id'",
     "wget -q -O page.html https://example.com/docs",
     "curl -s https://api.github.com/repos/o/r/issues/5/comments",

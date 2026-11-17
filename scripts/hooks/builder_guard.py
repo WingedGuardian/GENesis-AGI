@@ -176,11 +176,16 @@ _PULLS_OR_GRAPHQL = re.compile(r"/pulls\b|(?:^|[/\s'\"])graphql\b|/merges\b", re
 #: from a file: on a line this guard cannot parse, the two together are a write
 #: it cannot read (a wrapped `gh api ... --input reply.json`).
 _BLIND_REQUEST = re.compile(
-    r"\b(?:gh\s+api|curl|wget)\b.*(?:/pulls\b|/merges\b|\bgraphql\b)", re.IGNORECASE
+    # `api` may follow gh option words, each with at most one value
+    # (`gh --hostname h api ...`), never free text such as a quoted title.
+    r"\b(?:gh(?:\s+-\S+(?:\s+[^-\s]\S*)?)*?\s+api|curl|wget)\b.*(?:/pulls\b|/merges\b|\bgraphql\b)",
+    re.IGNORECASE,
 )
 _FILE_BODY = re.compile(
     r"--input\b|(?:^|\s)-[a-zA-Z]*d\s*@|--data[\w-]*[=\s]+@|--json[=\s]+@"
     r"|(?:^|\s)-T\b|--upload-file\b|--post-file\b|--body-file\b"
+    # gh's own file fields: -F key=@file, --field key=@file.
+    r"|(?:^|\s)(?:-F\s*|--field[=\s]+)[^\s=]+=@"
 )
 #: The shortest prefix of each refused long option that curl or wget would take
 #: for it (both accept an unambiguous prefix; MEASURED curl 8.5.0: `--confi` read
