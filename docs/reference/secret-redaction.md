@@ -107,9 +107,12 @@ rewrites such a command to run through `bin/redact_run.sh`, and that runner pass
 - The filter writes everything except the longest tail that could still become a known value, so a value split
   across reads, lines or the command's exit is replaced whole. The held tail is written as it is when the output
   ends, so output that stops partway through a value shows that part (the same exact-match rule as everywhere
-  else in the plugin). It re-reads the
-  values when the secrets file, or any location the resolver would prefer, changes, and keeps a value it has read
-  after that value leaves the file.
+  else in the plugin). The tail is found in the output as written, before anything is replaced, so a shorter
+  value at the start of a longer one waits for the rest. Replacement is one pass with the mod's rules: a value
+  equal to another variable's name is replaced once, and a placeholder already in the output passes unchanged.
+  It re-reads the values when the secrets file, or any location the resolver would prefer, changes; a reload
+  that fails is tried again about once a second until one succeeds. It keeps a value it has read after that
+  value leaves the file, under `[secrets.env:VAR~earlier]` when the new value took its name.
 - Any failure (a shell that is not bash, a filter that cannot start, no temp folder for the pipes, a loader
   error) runs the command with its output passed through, and says so on stderr: the wrap is a privacy measure,
   never a reason to stop work.

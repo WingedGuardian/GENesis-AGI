@@ -387,7 +387,11 @@ def main() -> int:
     # Default permission mode: the wrap must not touch the command, or Claude Code's permission check judges the
     # wrapper (`source ...`) and refuses an allow-listed background command (measured before the bypass gate).
     allow = base / "allow-settings.json"
-    allow.write_text(json.dumps({"permissions": {"allow": ["Bash(echo DEFAULTMODE-RAN)"]}}))
+    allow.write_text(json.dumps({"permissions": {"allow": ["Bash(touch DEFAULTMODE-RAN)"]}}))
+    # The command leaves a file, so "it ran" is observed: no denial and a clean exit also hold when the session
+    # never made the call.
+    ran = proj / "DEFAULTMODE-RAN"
+    ran.unlink(missing_ok=True)
     plain = subprocess.run(
         [
             "claude",
@@ -402,7 +406,7 @@ def main() -> int:
             str(allow),
             "--output-format",
             "json",
-            "Use the Bash tool once with run_in_background set to true and command: echo DEFAULTMODE-RAN"
+            "Use the Bash tool once with run_in_background set to true and command: touch DEFAULTMODE-RAN"
             " . Wait for it to finish, then reply with the word DONE.",
         ],
         cwd=proj,
@@ -418,8 +422,8 @@ def main() -> int:
     checks.append(
         (
             "default mode: an allow-listed background command ran (the wrap left it alone)",
-            plain.returncode == 0 and denials == [],
-            f"exit {plain.returncode}, denials {denials}",
+            plain.returncode == 0 and denials == [] and ran.exists(),
+            f"exit {plain.returncode}, denials {denials}, ran {ran.exists()}",
         )
     )
 

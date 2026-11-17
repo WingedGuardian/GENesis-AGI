@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import private_module
+from tests.test_plugins.test_secret_redact_mod import _run as _run_mod
 
 REPO = Path(__file__).resolve().parents[2]
 BIN = REPO / "plugins" / "genesis-secret-redact" / "bin"
@@ -92,6 +93,157 @@ def test_only_a_tail_that_could_become_a_value_is_held(tmp_path, monkeypatch):
 def test_a_multiline_values_first_line_is_held(tmp_path, monkeypatch):
     values = _values(tmp_path, monkeypatch, 'PRIVATE_KEY="short-line-a\nshort-line-b"\n')
     assert values.held("short-line-a\n") == len("short-line-a\n")
+
+
+def test_a_value_equal_to_another_variables_name_is_replaced_once(tmp_path, monkeypatch):
+    # One pass, as the mod's redactText: a second pass would rewrite the name inside the placeholder it just
+    # produced, and a placeholder already in the output is matched as itself.
+    values = _values(
+        tmp_path,
+        monkeypatch,
+        "NAME_TOKEN=OTHER_SERVICE_TOKEN\nOTHER_SERVICE_TOKEN=made-up-secret-1234567890\n",
+    )
+    placeholder = "[secrets.env:OTHER_SERVICE_TOKEN]"
+    assert values.redact("x made-up-secret-1234567890 y") == f"x {placeholder} y"
+    assert values.redact(f"seen {placeholder}") == f"seen {placeholder}"
+    assert values.redact("OTHER_SERVICE_TOKEN") == "[secrets.env:NAME_TOKEN]"
+
+
+def test_a_shorter_value_inside_a_longer_ones_start_waits_for_it(tmp_path, monkeypatch):
+    # The first line of the key is a value of its own. Replacing it before the rest arrives would leave the rest of
+    # the key unmatched, so the hold is found in the text as read.
+    values = _values(tmp_path, monkeypatch, 'PRIVATE_KEY="abcdefghijklmnopqrst\nshort-tail"\n')
+    assert values.process("abcdefghijklmnopqrst\n") == ("", "abcdefghijklmnopqrst\n")
+    assert values.process("abcdefghijklmnopqrst\nshort-tail\n") == (
+        "[secrets.env:PRIVATE_KEY]\n",
+        "",
+    )
+    # It turned out to be only the shorter value: replaced once settled.
+    assert (
+        values.process("abcdefghijklmnopqrst\nother\n")[0] == "[secrets.env:PRIVATE_KEY#1]\nother\n"
+    )
+
+
+def test_a_failed_reload_is_tried_again_until_it_succeeds(tmp_path, monkeypatch):
+    # A rotation the filter could not read (the file briefly unreadable) must not leave the new value raw until
+    # some later change: a restored permission changes nothing the stamp sees.
+    values = _values(tmp_path, monkeypatch, f"CANARY_API_KEY={KEY}\n")
+    (tmp_path / "secrets.env").write_text(f"CANARY_API_KEY={KEY2}\n")
+    real = values._known.load
+    calls = []
+
+    def failing(*a, **kw):
+        calls.append(1)
+        raise PermissionError("unreadable for a moment")
+
+    monkeypatch.setattr(values._known, "load", failing)
+    values.refresh()
+    assert calls and values.redact(KEY2) == KEY2
+    values.refresh()  # within RETRY_S: not tried again yet
+    assert len(calls) == 1
+    monkeypatch.setattr(values._known, "load", real)
+    monkeypatch.setattr(stream, "RETRY_S", 0.0)
+    values.refresh()
+    assert values.redact(KEY2) == P
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"path": "x"},  # no needles
+        {"path": "x", "needles": [{"text": None, "placeholder": "[secrets.env:A]"}]},
+        {"path": "x", "needles": "not a list"},
+        ["not", "a", "dict"],
+    ],
+)
+def test_a_loader_result_of_the_wrong_shape_is_a_failed_load(tmp_path, monkeypatch, result):
+    # The filter must not die on it (the command would lose its output): the values read earlier stay, and the
+    # load is tried again until one succeeds.
+    values = _values(tmp_path, monkeypatch, f"CANARY_API_KEY={KEY}\n")
+    (tmp_path / "secrets.env").write_text(f"CANARY_API_KEY={KEY2}\n")
+    real = values._known.load
+    monkeypatch.setattr(values._known, "load", lambda *a, **kw: result)
+    values.refresh()
+    assert values.redact(KEY) == P
+    monkeypatch.setattr(values._known, "load", real)
+    monkeypatch.setattr(stream, "RETRY_S", 0.0)
+    values.refresh()
+    assert values.redact(KEY2) == P
+
+
+def test_the_filter_and_the_mod_redact_alike(tmp_path, monkeypatch):
+    # The filter carries its own copy of the mod's rules (one pass, placeholders as themselves, ~earlier names on
+    # rotation), because the mod is JavaScript in Claude Code and the filter runs beside the command. This drives
+    # both through one corpus so a drift in either shows here.
+    key3 = "ck_" + "aa11bb22cc33dd44ee55ff6677889900"
+    first = (
+        "TOKEN_ENV_NAME=CANARY_SERVICE_TOKEN\n"
+        f"CANARY_SERVICE_TOKEN={KEY}\n"
+        'PRIVATE_KEY="abcdefghijklmnopqrst\nshort-tail"\n'
+    )
+    steps = [
+        {"in": f"val {KEY}"},
+        {"in": "CANARY_SERVICE_TOKEN"},
+        {"in": "seen [secrets.env:CANARY_SERVICE_TOKEN] and [secrets.env:TOKEN_ENV_NAME]"},
+        {"in": f"{KEY}{KEY}"},
+        {"in": "[secrets.env:" + KEY + "]"},
+        {"in": "abcdefghijklmnopqrst\nshort-tail and abcdefghijklmnopqrst alone"},
+        {"write": f"TOKEN_ENV_NAME=CANARY_SERVICE_TOKEN\nCANARY_SERVICE_TOKEN={KEY2}\n"},
+        {"in": f"new {KEY2} old {KEY}"},
+        {"in": "[secrets.env:CANARY_SERVICE_TOKEN~earlier]"},
+        {"write": f"CANARY_SERVICE_TOKEN={key3}\n"},
+        {"in": f"{KEY} {KEY2} {key3} CANARY_SERVICE_TOKEN"},
+    ]
+    mod_dir = tmp_path / "mod"
+    mod_dir.mkdir()
+    res = _run_mod(
+        mod_dir,
+        """
+        const out = [];
+        for (const step of t.v.steps) {
+          if (step.write !== undefined) { t.write(step.write); continue; }
+          out.push((await t.emit("tool.call", { tool: "Bash" }, async () => ({ result: step.in }))).result);
+        }
+        return out;
+        """,
+        secrets=first,
+        steps=steps,
+    )
+    filter_dir = tmp_path / "filter"
+    filter_dir.mkdir()
+    path = filter_dir / "secrets.env"
+    path.write_text(first)
+    monkeypatch.setenv("SECRETS_PATH", str(path))
+    values = stream.Values(str(REPO))
+    got, tick = [], time.time()
+    for step in steps:
+        if "write" in step:
+            path.write_text(step["write"])
+            tick += 5  # a later mtime for each write, as the mod's driver does
+            os.utime(path, (tick, tick))
+            continue
+        values.refresh()
+        got.append(values.redact(step["in"]))
+    assert got == res["out"]
+    # Not equal by both doing nothing: every raw value is gone from both.
+    assert not any(raw in text for text in got for raw in (KEY, KEY2, key3, "short-tail"))
+
+
+def test_a_rotated_out_value_gets_a_placeholder_of_its_own(tmp_path, monkeypatch):
+    # One placeholder must stand for one text, or restoring it gives the wrong value (the mod's ~earlier scheme).
+    values = _values(tmp_path, monkeypatch, f"CANARY_API_KEY={KEY}\n")
+    (tmp_path / "secrets.env").write_text(f"CANARY_API_KEY={KEY2}\n")
+    values.refresh()
+    assert values.redact(KEY2) == P
+    assert values.redact(KEY) == "[secrets.env:CANARY_API_KEY~earlier]"
+    (tmp_path / "secrets.env").write_text(
+        "CANARY_API_KEY=ck_" + "99887766554433221100aabbccddeeff\n"
+    )
+    values.refresh()
+    assert values.redact(KEY2) == "[secrets.env:CANARY_API_KEY~earlier2]"
+    assert values.redact(KEY) == "[secrets.env:CANARY_API_KEY~earlier]"
+    placeholders = [placeholder for _, placeholder in values.pairs]
+    assert len(placeholders) == len(set(placeholders))
 
 
 # --- runner -------------------------------------------------------------------------------------------------
@@ -209,7 +361,15 @@ def test_a_key_rotated_while_the_command_runs_is_redacted_and_the_old_one_still_
         f"echo new {KEY2}; echo old {KEY}"
     )
     run = _run(command, tmp_path)
-    assert run.stdout == f"before\nnew {P}\nold {P}\n"
+    assert run.stdout == f"before\nnew {P}\nold [secrets.env:CANARY_API_KEY~earlier]\n"
+
+
+def test_a_multiline_value_whose_first_line_is_a_value_written_in_two_reads(tmp_path, monkeypatch):
+    path = tmp_path / "secrets.env"
+    path.write_text('PRIVATE_KEY="abcdefghijklmnopqrst\nshort-tail"\n')
+    monkeypatch.setenv("SECRETS_PATH", str(path))
+    run = _run("printf 'abcdefghijklmnopqrst\\n'; sleep 0.3; printf 'short-tail\\n'", tmp_path)
+    assert run.stdout == "[secrets.env:PRIVATE_KEY]\n"
 
 
 def test_a_secrets_file_the_command_creates_is_picked_up(tmp_path, monkeypatch):

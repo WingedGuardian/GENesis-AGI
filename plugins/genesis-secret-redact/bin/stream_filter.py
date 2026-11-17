@@ -6,15 +6,22 @@ values come from ``known_values.py`` beside it, in memory: they are never writte
 
 One rule decides what is written: everything except the longest tail that is the start of a known value. That
 tail is held until later bytes settle it (the value completes and is replaced, or the text turns out to be
-something else) or the input ends. So a value split across reads, across lines or across the command's exit is
-replaced whole, and ordinary output still goes out as it arrives: a tail is held only while it could still
-become a value. When the input ends, a held tail is written as it is (output that stops partway through a value
-shows that part, the plugin's exact-match rule). Bytes are decoded incrementally, so a character split between
-two reads is one character when it is matched.
+something else) or the input ends. The tail is found in the text as read, before anything is replaced, so a
+shorter value inside the start of a longer one is not replaced while the longer one could still complete. So a
+value split across reads, across lines or across the command's exit is replaced whole, and ordinary output still
+goes out as it arrives: a tail is held only while it could still become a value. When the input ends, a held tail
+is written as it is (output that stops partway through a value shows that part, the plugin's exact-match rule).
+Bytes are decoded incrementally, so a character split between two reads is one character when it is matched.
 
-The values are re-read whenever the secrets file changes (checked on every read), and a value this filter has
-read stays redacted after it leaves the file: a long-running Monitor outlives a key rotation. (A value replaced
-before the filter has started, in the command's first instant, was never read and is not kept.)
+Replacement is one pass, as the mod's ``redactText`` is: text a replacement produced is never matched again (a
+value may equal another variable's name), and placeholders this filter issued are matched as themselves.
+
+The values are re-read whenever the secrets file changes (checked on every read). A reload that fails is tried
+again, at most once per ``RETRY_S``, until one succeeds: the stamp moves only with a successful load. A value
+this filter has read stays redacted after it leaves the file: a long-running Monitor outlives a key rotation.
+Its placeholder gets a name of its own (``~earlier``) when a current value now has the name, the mod's scheme,
+so one placeholder never stands for two texts. (A value replaced before the filter has started, in the command's
+first instant, was never read and is not kept.)
 
 When the wrapped command has exited (the runner creates ``done-file``) and nothing is waiting in the pipe, or
 when the input ends, this signals ``drained-file`` so the runner can exit with the command's status on time.
@@ -29,12 +36,13 @@ from __future__ import annotations
 import codecs
 import importlib.util
 import os
+import re
 import select
 import sys
 import time
 from pathlib import Path
 
-#: How often a filter whose values never loaded tries again.
+#: How often a filter whose last load failed tries again.
 RETRY_S = 1.0
 
 
@@ -48,6 +56,10 @@ class Values:
 
     def __init__(self, root_arg: str | None) -> None:
         self.pairs: list[tuple[str, str]] = []  # (text, placeholder), longest first
+        self._by_text: dict[
+            str, str
+        ] = {}  # every text and every issued placeholder -> what it is written as
+        self._matcher: re.Pattern[str] | None = None
         self._root_arg = root_arg
         self._known = None
         self._watch: list[
@@ -55,7 +67,8 @@ class Values:
         ] = []  # every path that can change which file the resolver picks, or what it holds
         self._stamp: tuple | None = None
         self._said = False
-        self._tried = 0.0  # when a load that never succeeded was last attempted (monotonic)
+        self._failed = False  # the last load attempt failed
+        self._tried = 0.0  # when a load was last attempted (monotonic)
         self._load()
 
     @staticmethod
@@ -75,19 +88,67 @@ class Values:
         before = self._stamp_of(self._watch) if self._watch else None
         loaded = self._read()
         if loaded is None:
+            self._failed = True  # the stamp stays where it was, so the next check tries again
             return
-        paths = list(loaded.get("watch") or [loaded["path"]])
-        if paths != self._watch:
-            # The resolver's candidates changed (first load, or a new location): stamp those, then read again so
-            # the values match the stamp.
-            self._watch = paths
-            before = self._stamp_of(paths)
-            loaded = self._read() or loaded
+        # Everything is built aside and swapped in at the end: a loader result of an unexpected shape is a failed
+        # load (the values read earlier stay, the next check tries again), never a filter that dies.
+        try:
+            watch = list(loaded.get("watch") or [loaded["path"]])
+            if watch != self._watch:
+                # The resolver's candidates changed (first load, or a new location): stamp those, then read again
+                # so the values match the stamp.
+                before = self._stamp_of(watch)
+                loaded = self._read() or loaded
+            current = [(n["text"], n["placeholder"]) for n in loaded["needles"]]
+            if not all(isinstance(t, str) and isinstance(p, str) for t, p in current):
+                raise TypeError("a needle that is not text")
+            current = [pair for pair in current if pair[0]]  # an empty text would match everywhere
+            texts = {text for text, _ in current}
+            names = {placeholder for _, placeholder in current}
+            gone = [pair for pair in self.pairs if pair[0] not in texts]
+            # A held value keeps the name it was shown under, so a placeholder already in the output still means
+            # the same text; only a name a current value now uses is renamed (register.js load, the same scheme).
+            taken = names | {placeholder for _, placeholder in gone}
+            kept = []
+            for text, placeholder in gone:
+                name = placeholder
+                if placeholder in names:
+                    n = 1
+                    while name in taken:
+                        name = re.sub(
+                            r"\]$", "~earlier]" if n == 1 else f"~earlier{n}]", placeholder
+                        )
+                        n += 1
+                    taken.add(name)
+                kept.append((text, name))
+            pairs = sorted(current + kept, key=lambda pair: -len(pair[0]))
+            by_text = {text: placeholder for text, placeholder in pairs}
+            for _, placeholder in pairs:
+                by_text[placeholder] = placeholder
+            alternatives = sorted(by_text, key=len, reverse=True)
+            matcher = re.compile("|".join(map(re.escape, alternatives))) if alternatives else None
+        except Exception as exc:  # noqa: BLE001 - see the class docstring
+            self._failed = True
+            self._report(exc)
+            return
+        self._watch = watch
         self._stamp = before
-        current = [(n["text"], n["placeholder"]) for n in loaded["needles"]]
-        texts = {text for text, _ in current}
-        kept = [pair for pair in self.pairs if pair[0] not in texts]
-        self.pairs = sorted(current + kept, key=lambda pair: -len(pair[0]))
+        self._failed = False
+        self._said = False  # a later failure is a new event and is reported again
+        self.pairs = pairs
+        self._by_text = by_text
+        self._matcher = matcher
+
+    def _report(self, exc: BaseException) -> None:
+        """Say once per run of failures that the values could not be read, and what that means for the output."""
+        if self._said:
+            return
+        self._said = True
+        state = "keeping the values read earlier" if self.pairs else "this output is NOT redacted"
+        print(
+            f"secret-redact: cannot read the secret values ({type(exc).__name__}); {state}",
+            file=sys.stderr,
+        )
 
     def _read(self) -> dict | None:
         try:
@@ -101,41 +162,55 @@ class Values:
                 spec.loader.exec_module(self._known)
             return self._known.load(self._known.repo_root(self._root_arg))
         except Exception as exc:  # noqa: BLE001 - see the class docstring
-            if not self._said:
-                self._said = True
-                state = (
-                    "keeping the values read earlier"
-                    if self.pairs
-                    else "this output is NOT redacted"
-                )
-                print(
-                    f"secret-redact: cannot read the secret values ({type(exc).__name__}); {state}",
-                    file=sys.stderr,
-                )
+            self._report(exc)
             return None
 
     def refresh(self) -> None:
-        """Reload when any watched path (the secrets file, or a location the resolver would pick) changed."""
-        if not self._watch:
-            # No load has ever succeeded, so there is nothing to compare: try again, at most once a second (a
-            # failure at start, such as the file being replaced mid-read, must not leave a long Monitor raw).
-            if time.monotonic() - self._tried >= RETRY_S:
-                self._load()
+        """Reload when any watched path (the secrets file, or a location the resolver would pick) changed.
+
+        A failed load leaves the stamp unchanged, so it is tried again, at most once per ``RETRY_S``: a secrets
+        file that was briefly unreadable (a rotation's chmod, a replace mid-read) must not leave a long Monitor
+        raw for new values, and a restored permission changes nothing a stamp sees.
+        """
+        if self._failed and time.monotonic() - self._tried < RETRY_S:
             return
-        stamp = self._stamp_of(self._watch)
-        if stamp != self._stamp:
-            self._stamp = stamp  # a failed reload is not retried until a watched path changes again
+        if not self._watch:
+            # No load has ever succeeded, so there is nothing to compare: try again.
+            self._load()
+            return
+        if self._failed or self._stamp_of(self._watch) != self._stamp:
             self._load()
 
     def redact(self, text: str) -> str:
-        for needle, placeholder in self.pairs:
-            text = text.replace(needle, placeholder)
-        return text
+        """Every known value replaced by its placeholder, in one pass."""
+        return self.process(text, final=True)[0]
+
+    def process(self, text: str, *, final: bool = False) -> tuple[str, str]:
+        """``(written, held)``: ``text`` up to its held tail with every value replaced, and the tail unreplaced.
+
+        The tail is found in the text as read. A value that starts before the tail but runs into it is held too,
+        whole: replacing it now would leave the rest of a longer value unmatched. With ``final`` nothing is held.
+        """
+        hold_from = len(text) if final else len(text) - self.held(text)
+        out: list[str] = []
+        i = 0
+        if self._matcher is not None:
+            for m in self._matcher.finditer(text):
+                if m.start() >= hold_from:
+                    break
+                if m.end() > hold_from:
+                    hold_from = m.start()
+                    break
+                out.append(text[i : m.start()])
+                out.append(self._by_text.get(m.group(), m.group()))
+                i = m.end()
+        out.append(text[i:hold_from])
+        return "".join(out), text[hold_from:]
 
     def held(self, text: str) -> int:
-        """Length of the longest tail of ``text`` that is a proper prefix of a known value."""
+        """Length of the longest tail of ``text`` that is a proper prefix of a known value or an issued placeholder."""
         best = 0
-        for needle, _ in self.pairs:
+        for needle in self._by_text:
             limit = min(len(needle) - 1, len(text))
             if limit <= best:
                 continue
@@ -190,15 +265,13 @@ def main() -> int:
             if not chunk:
                 break
             values.refresh()
-            pending = values.redact(pending + decoder.decode(chunk))
-            cut = len(pending) - values.held(pending)
-            emit(pending[:cut])
-            pending = pending[cut:]
+            written, pending = values.process(pending + decoder.decode(chunk))
+            emit(written)
         elif os.path.exists(done):
             # The command has exited and its output is read. A held tail stays held: a child the command left
             # behind may still write the rest of that value.
             signal()
-    emit(values.redact(pending + decoder.decode(b"", final=True)))
+    emit(values.process(pending + decoder.decode(b"", final=True), final=True)[0])
     signal()
     return 0
 
