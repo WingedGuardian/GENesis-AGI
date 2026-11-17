@@ -343,13 +343,16 @@ _POSITIONS = {
     "plain delimited": lambda s: (f"front door {s}", None),
 }
 #: Stated limits: a plain word inside a plain delimited value is matched whole
-#: only, a plain-word URL password stays visible, and a dotted fragment of a
+#: only, a plain-word URL password stays visible, a dotted fragment of a
 #: plain delimited value reads as a host name, which is not probed (owner
-#: ruling 2026-11-17: the fragment rules stay the shape rules).
+#: ruling 2026-11-17: the fragment rules stay the shape rules), and a run of
+#: digits in free text is no probe (owner ruling 2026-11-17: mask only real
+#: secret digits).
 _STATED_LIMITS = {
     ("plain delimited", "plain word"),
     ("url userinfo", "plain word"),
     ("plain delimited", "dotted"),
+    ("plain delimited", "all digits"),
 }
 
 
@@ -472,8 +475,7 @@ def test_a5_a_run_longer_than_the_old_cap_grows_whole():
     [
         ("admin / 48291375", "48291375", "[held]"),
         ("postgres://u:48291375@h.example.org/db", "48291375", "[held]"),
-        ("front door code 4821", "door 4821", "door [held]"),
-        ("front door pin 4821", "door 4821", "door [held]"),
+        ("router pin: 4821", "door 4821", "door [held]"),
         # A whole number: another number holding it is no match.
         ("admin / 48291375", "a482913750", "a482913750"),
     ],
@@ -541,15 +543,48 @@ def test_m1_a_well_formed_userinfo_still_ends_at_its_last_at_sign():
         ("host=db.example.org port=5432 pass=Zx9kq7", "db.example.org staging", "db.example.org staging"),
         ("db.example.org:5432 Zx9kq7", "postgres 5432", "postgres 5432"),
         ("ssh://git@github.com/org/repo.git", "repo.git deploy key", "repo.git deploy key"),
-        # A digit run that is not a port is a whole-word probe.
-        ("front door code 4821", "door 4821", "door [held]"),
-        ("db.example.org:5432 and pin 5432", "postgres 5432", "postgres [held]"),
     ],
 )
 def test_the_narrowed_fragment_rules(value, field, masked):
     strict, named = rm.value_masks(value)
     assert named.mask(field) == masked
     assert strict.mask(field) == masked
+
+
+@pytest.mark.parametrize(
+    ("value", "field"),
+    [
+        ("admin / Wifi Password 2024", "Wifi backup 2024"),
+        ("https://example.com/users/12345/profile", "user 12345"),
+        ("host=db.example.org port=5432 pass=Zx9#kq", "postgres 5432"),
+        ("https://portal.example.org/login?year=2024&x=abc", "Portal 2024 login"),
+    ],
+)
+def test_a_digit_run_in_free_text_is_no_probe(value, field):
+    """Owner ruling 2026-11-17 (mask only real secret digits): a run of digits
+    in a free-text fragment is not probed, so a year, a path id or a port the
+    name repeats stays visible. A digit secret part or captured secret is
+    still masked (``test_a6_an_all_digit_secret_is_masked_as_a_whole_number``)."""
+    strict, named = rm.value_masks(value)
+    assert named.mask(field) == field
+    assert strict.mask(field) == field
+
+
+@pytest.mark.parametrize(
+    ("value", "field"),
+    [
+        ("front door code 4821", "door 4821"),
+        ("front door pin 4821", "door 4821"),
+        ("db.example.org:5432 and pin 5432", "postgres 5432"),
+    ],
+)
+def test_stated_limit_an_unlabelled_digit_code_in_free_text_stays_visible(value, field):
+    """Stated limit (owner ruling 2026-11-17): an unlabelled digit code in free
+    text is no secret part and no capture, so a name repeating it keeps it.
+    Write it as "login / code" or "pin: code" to have it masked."""
+    strict, named = rm.value_masks(value)
+    assert named.mask(field) == field
+    assert strict.mask(field) == field
 
 
 def test_m2_a_large_value_of_shared_probe_runs_masks_in_bounded_time():
@@ -581,8 +616,8 @@ def test_m2_a_probe_past_the_run_cache_masks_its_whole_token(count):
 
 
 def test_many_distinct_host_ports_build_masks_in_linear_time():
-    """Round-2 audit H1: counting each port's whole-word occurrences took a
-    pass over the whole value per distinct port (8,000 ports: ~92 s)."""
+    """A value of many distinct host:port lines builds its masks quickly
+    (round-2 audit H1 measured ~92 s for 8,000 ports on an earlier digit rule)."""
     value = "\n".join(f"db{i}.example.org:{10000 + i}" for i in range(8000)) + "\nadmin / Zq9!fake"
     started = time.monotonic()
     strict, named = rm.value_masks(value)
