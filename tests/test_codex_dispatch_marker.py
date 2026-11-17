@@ -50,6 +50,8 @@ ALLOWED = {
     # Stops MCP children of a running app-server, never starts Codex: the argv[0]
     # match, the ~/.codex helper home, and four lines of user-facing text.
     "sentinel/codex_mcp_stop.py": 6,
+    # The infra:codex_mcp_held alert text names the app-server it measures.
+    "mcp/health/errors.py": 1,
 }
 _LOG_METHODS = frozenset({"debug", "info", "warning", "error", "exception", "critical", "log"})
 

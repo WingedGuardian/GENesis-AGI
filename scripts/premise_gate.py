@@ -2,7 +2,7 @@
 """Issue premise gate: an issue carries its answers, and `devin-ready` does not stay on one without them.
 
 ``.claude/docs/premise-check.md`` ("At plan and issue time") asks every issue that
-specifies work to answer six questions. The ``devin-ready`` label starts a PAID
+specifies work to answer the premise form (six questions before ``FORM_EPOCH``). The ``devin-ready`` label starts a PAID
 Devin session; MEASURED 2026-10-28, of the 7 issues labelled ``devin-ready``
 since the sixth question was added (2026-10-06), 4 carried no premise section.
 
@@ -11,9 +11,10 @@ Run by ``.github/workflows/premise-gate.yml`` on ``issues`` events. Two jobs:
 1. **Label.** On opened, edited and reopened, and when ``bug`` is added or
    removed, an issue without its OWN answers gets ``premises-missing``, and loses
    it once they are complete. That label has one meaning everywhere: this
-   issue's own section is incomplete. A work issue owes
-   the six premise answers (``## Premise checks``). A bug report (labelled
-   ``bug``) owes the five verification answers instead (``## Verification``:
+   issue's own section is incomplete. A work issue owes its premise answers
+   (``## Premise checks``: the nine-item form's Problem block, or the six
+   questions before ``FORM_EPOCH``). A bug report (labelled ``bug``) created
+   before the epoch owes the five verification answers instead (``## Verification``:
    reproduced, evidence, reporter-side causes ruled out, searched, expected vs
    actual), because a bug report's question is whether the bug is real, not how
    to build a change. This applies to ALL issues (owner rulings 2026-10-28;
@@ -23,9 +24,10 @@ Run by ``.github/workflows/premise-gate.yml`` on ``issues`` events. Two jobs:
    grandfathered, and bug reports filed through the bug-report form are exempt
    (owner ruling). For both, the label is never ADDED, though a label an issue
    already carries is still removed once its answers are complete.
-2. **Guard.** When ``devin-ready`` is applied to an issue without the SIX
-   premise answers, it is removed and a comment names the missing ones. Devin
-   builds a change, so it always needs the six, bug report or not (owner ruling
+2. **Guard.** When ``devin-ready`` is applied to an issue without ALL its
+   premise answers (all nine, now that ``FORM_EPOCH`` is set), it is removed and
+   a comment names the missing ones. Devin builds a change, so it always needs
+   them, bug report or not (owner ruling
    2026-10-28); a verified bug report bound for Devin carries both sections. The
    comment's first line is ``(aside)``, because a non-aside comment on a Devin
    issue can start a paid session. Removing ``devin-ready`` ignores
@@ -44,9 +46,10 @@ The answers are read by the plan reader's own parser
 (``scripts/hooks/plan_doc.premise_answers`` with the plan gate's emptiness rule),
 so a plan and an issue are held to one format. Both forms are read
 (``premise_gaps``): the six questions, and the nine-item form, whose Problem
-block (items 1 to 5) an issue owes and whose nine a paid build owes. While
-``plan_premise_gate.FORM_EPOCH`` is unset a complete six still passes
-everywhere, so no issue is newly labelled and no ``devin-ready`` stripped.
+block (items 1 to 5) an issue owes and whose nine a paid build owes. With
+``plan_premise_gate.FORM_EPOCH`` set, a paid build owes the nine at once and an
+issue created on or after the date owes the Problem block; an issue created
+before it keeps the either-form rule, so it changes no state.
 
 Residual, accepted by the owner and stated rather than hidden: Devin's own
 integration watches the label, so removing ``devin-ready`` can come after a
@@ -146,7 +149,8 @@ class Plan:
 def missing_answers(body: str, *, bug: bool = False) -> list[int]:
     """The answer numbers that are missing or empty, all of them without a section.
 
-    A work issue answers the six premise questions (``## Premise checks``); a bug
+    A work issue answers the six premise questions (``## Premise checks``; the
+    old form, kept for issues created before ``FORM_EPOCH``); a bug
     report answers the five verification questions (``## Verification``).
     """
     if bug:
@@ -228,10 +232,22 @@ def _label_names(issue: dict) -> set[str]:
     return names
 
 
+def _owes_verification(issue: dict) -> bool:
+    """Whether the issue's OWN section is the Verification one: labelled ``bug``
+    and created before ``FORM_EPOCH`` (or the epoch unset). From the epoch on the
+    ``bug`` label no longer switches forms: a bug report owes the Problem block,
+    whose items 1, 2 and 4 cover what the five verification answers asked."""
+    if BUG_LABEL not in _label_names(issue):
+        return False
+    epoch = _plan_gate.form_epoch()
+    return epoch is None or (issue.get("created_at") or "") < epoch
+
+
 def _sync_missing_label(plan: Plan, issue: dict, labels: set[str], *, may_add: bool) -> None:
     """Bring ``premises-missing`` in line with the issue's OWN section: the
-    verification answers for a bug report, the six premise answers otherwise."""
-    if BUG_LABEL in labels:
+    verification answers for a bug report filed before ``FORM_EPOCH``, the
+    premise answers otherwise."""
+    if _owes_verification(issue):
         missing = missing_answers(issue.get("body") or "", bug=True)
     else:
         _, missing, _ = premise_gaps(
@@ -270,7 +286,7 @@ def owed_answers(issue: dict) -> tuple[str, list[int]]:
     """
     if not _may_add(issue):
         return "", []
-    bug = BUG_LABEL in _label_names(issue)
+    bug = _owes_verification(issue)
     if bug:
         missing = missing_answers(issue.get("body") or "", bug=True)
     else:
@@ -298,9 +314,16 @@ def owed_message(issue: dict) -> str:
     answers = premise_answers(body, VERIFICATION_TITLE) if bug else premise_answers(body)
     if answers is None:
         why = " (the issue is labelled `bug`)" if bug else ""
+        if not bug and BUG_LABEL in _label_names(issue):
+            why = (
+                " (a `bug` issue created from FORM_EPOCH on owes the Problem block, not "
+                "Verification; its five answers map to items 1, 2 and 4)"
+            )
         problems = [f"the body has no `{heading}` section{why}"]
     elif questions is _QUESTIONS or bug:
         problems = [_problem(n, questions[n - 1], answers.get(n, "")) for n in missing]
+    elif note := conversion_note(issue.get("body") or "", questions):
+        problems = [note]
     else:
         problems = [
             f"answer {n} ({questions[n - 1].split(':', 1)[0]}) "
@@ -339,7 +362,8 @@ def decide(event: dict) -> Plan:
         questions, build_missing, why = premise_gaps(issue.get("body") or "", build=True)
         if build_missing:
             plan.remove.append(DEVIN_LABEL)
-            plan.comment = _comment(build_missing, questions, why)
+            note = conversion_note(issue.get("body") or "", questions)
+            plan.comment = _comment(build_missing, questions, why, note)
         _sync_missing_label(plan, issue, labels, may_add=_may_add(issue))
         return plan
 
@@ -357,10 +381,26 @@ NOT_REMOVED_LINE = (
 )
 
 
+#: Said when a section owed in the nine-item form is not written in it, so an
+#: issue whose six answers are all there is told why, not only that all nine are
+#: missing (``plan_premise_gate.NOT_NINE_NOTE``, shared with the plan gate).
+CONVERSION_NOTE = _plan_gate.NOT_NINE_NOTE
+
+
+def conversion_note(body: str, questions: Sequence[str]) -> str:
+    """``CONVERSION_NOTE`` when ``body`` has a premise section that is not in the
+    nine-item form and the nine-item form is what it owes (``questions``), else ""."""
+    if questions is not _plan_gate.FORM_QUESTIONS:
+        return ""
+    answers = premise_answers(strip_quoted(body or ""))
+    return CONVERSION_NOTE if answers and not _plan_gate.is_new_form(answers) else ""
+
+
 def _comment(
     missing: Sequence[int],
     questions: Sequence[str] = _QUESTIONS,
     why: dict[int, str] | None = None,
+    note: str = "",
 ) -> str:
     why = why or {}
     rows = "".join(
@@ -370,7 +410,8 @@ def _comment(
         "(aside)\n\n"
         f"{REMOVED_LINE}, so it is not "
         "ready for a paid build session.\n\n"
-        f"Missing or empty ({len(missing)} of {len(questions)}):\n\n{rows}\n"
+        + (f"{note}\n\n" if note else "")
+        + f"Missing or empty ({len(missing)} of {len(questions)}):\n\n{rows}\n"
         f"Add a `## Premise checks` section with all {len(questions)} numbered answers "
         "(`n/a — <reason>` counts), then apply the label again. Format: "
         '`.claude/docs/premise-check.md`, "At plan and issue time".\n'
@@ -490,10 +531,14 @@ def check(number: int, view: Viewer = _view) -> int:
         print(f"premise_gate: issue {number}: could not be read", file=sys.stderr)
         return 2
     body = issue.get("body") or ""
+    # gh names the creation time createdAt; the predicates read created_at.
+    issue = {**issue, "created_at": issue.get("created_at") or issue.get("createdAt") or ""}
     questions, missing, _ = premise_gaps(body, build=True)
+    if missing and (note := conversion_note(body, questions)):
+        print(note)
     for n in missing:
         print(f"missing premise answer {n}: {questions[n - 1]}")
-    if BUG_LABEL in _label_names(issue):
+    if _owes_verification(issue):
         for n in missing_answers(body, bug=True):
             print(f"missing verification answer {n}: {VERIFICATION_QUESTIONS[n - 1]}")
     if missing:

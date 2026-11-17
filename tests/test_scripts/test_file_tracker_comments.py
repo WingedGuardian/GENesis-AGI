@@ -157,6 +157,24 @@ def test_privacy_refusal_has_no_network_or_snapshot(fixture, monkeypatch):
     assert not list(fixture.body.parent.glob("tmp/issue-body-*"))
 
 
+@pytest.mark.parametrize("phase", ["draft read", "privacy scan"])
+def test_early_refusal_explains_cause_without_submitting(fixture, monkeypatch, capsys, phase):
+    if phase == "draft read":
+        fixture.body.write_bytes(b"")
+        reason = "Comment body is empty"
+    else:
+        reason = "Synthetic privacy rejection"
+
+        def refuse(*args):
+            raise fixture.filer.Refused(reason)
+
+        monkeypatch.setattr(fixture.filer, "privacy_scan", refuse)
+
+    assert fixture.main("--dry-run") == 2
+    assert f"comment {phase} failed (Refused): {reason}. Nothing submitted." in capsys.readouterr().err
+    assert fixture.calls == [] and fixture.posts == []
+
+
 def test_draft_change_after_scan_does_not_change_posted_snapshot(fixture):
     fixture.mutate_on_lookup = True
     assert fixture.main() == 0
