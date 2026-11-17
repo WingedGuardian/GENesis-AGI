@@ -381,8 +381,9 @@ not checked …` NOTE means some paths could not be read, so silence was not
 earned there; treat those paths as unknown. Weigh it: most overlaps
 merge cleanly (MEASURED over 490 merges, 2026-09-29 to 10-29: a code overlap at
 merge time on 57, one real collision). Read the named commits against this PR's
-change; only if they may interact, update the branch (`gh pr update-branch <N>`)
-so CI runs on the current base. That moves the head, so the review gate then
+change; only if they may interact, and only once the PR's delivery read exists
+(step 1a), update the branch (`gh pr update-branch <N>`) so CI runs on the
+current base. That moves the head, so the review gate then
 needs a review of the new head, and on a gate-fix PR past its rounds that
 request needs the owner's approval. `gh run rerun` does not help: a re-run tests
 the same merge commit.
@@ -399,6 +400,148 @@ their fix, look first; if they are a flake or an infrastructure failure, merging
 an unrelated PR is fine (none of the 14 merges onto a red main measured
 2026-09-28 to 10-28 caused the red). The NOTE shows only in a local
 `--check-pr`: the CI merge-gate's token cannot read Actions runs.
+
+### 1a. Does this PR deliver? Read it before you move it
+
+A review asks whether the code is correct. This asks whether the PR does what
+its issue asked, which no review is required to ask. Nothing is pushed,
+requested, replied to, fixed or merged on a PR before its delivery read exists
+at the current head or carries to it. A read carries only when the PR's own
+contribution is unchanged (step 5 below), and never across a change of the
+PR's base branch, an edit to the basis issue, a basis that now differs from the
+one recorded, or a moved head on a PR that touches the enforcement-hook
+surface: each of those needs a fresh read.
+`python3 scripts/delivery_marker.py read --pr <N>` shows the read already on
+record; a marker it prints as "not the current head" is the last read, and step
+5 decides whether it carries. A carried verdict is not re-recorded: the marker
+stays at the head it names. To see whether the basis issue was edited since,
+compare `gh issue view <N> --json lastEditedAt` with the marker comment's
+`updated_at` (`lastEditedAt` is null when the issue was never edited).
+
+1. **Find the basis.** The PR body's first pointer line, a line that is only
+   the pointer: `Closes|Fixes|Resolves|Refs|Part of #N`, `Ledger:`,
+   `Follow-up:`, `Spec:` or `Plan:`. With no such line, the one issue GitHub
+   links to the PR (`closingIssuesReferences`: closing keywords anywhere in the
+   body). Several linked issues: ask which, or put that one on its own line.
+   With no link either, the first visible line that OPENS with a pointer
+   keyword. A pointer keyword only mid-line is ambiguous: fix the body first.
+   None of these means the basis is the PR's own claim. `compose` derives it
+   this way. **Fast path:** a PR with basis `claim` whose diff only changes
+   dependency pins or lockfiles is read by confirming exactly that, and
+   recorded DELIVERS, CLEAN. Anything else in the diff ends the fast path.
+2. **Read the basis in full**, thread included. From an issue take: what is
+   wrong; where it says the intended behaviour is stated; every sentence that
+   says what a fix must do (its `Acceptance:` answer, or on older issues a Fix,
+   Suggested fix or Required behavior section), split into separate points;
+   any fix it warns against (`Wrong fix:`).
+3. **Open the Intended citation.** If the issue says the intended behaviour is
+   stated in a doc, a test, a ruling or a comment, open that place and check it
+   says so (`intended=read`). If the place does not say so, record
+   `intended=unsupported`; if the issue answers `Stated: nowhere`, record
+   `not-stated`. Either way the issue is a proposal and the merge needs the
+   owner's yes (step 4). An older issue with no `Stated:` line at all is not a
+   proposal: record `intended=n/a`.
+4. **Read the PR body, the commit messages and every human comment since the
+   last delivery read**, on the PR and on the issue: what the PR claims, where
+   it says it departs from the issue, every question the author asks, every
+   claim of "fixed". A question counts as answered when a maintainer replied to
+   it on the issue or the PR. A claim of "fixed", in a comment or a commit
+   message, that the diff does not show is a delivery defect: quote both.
+5. **Read the diff**, and as much unchanged code in the touched files and their
+   direct callers as a point needs. The whole diff on a first read. After that,
+   read only the change in the PR's OWN contribution since the head the last
+   read names, never the raw `old..new` diff (a merge of main puts all of
+   main's commits in that). With `B` = `origin/<the PR's baseRefName>`:
+   `git fetch origin <old-head> <new-head> <baseRefName>` (fetching a commit by
+   SHA works for a force-pushed-out head while GitHub keeps it), then compare
+   the two own contributions with blob ids and line offsets stripped, since a
+   merge of main shifts both without changing the PR's own lines:
+   `diff <(git diff -U0 $(git merge-base <old-head> B) <old-head> | grep -v -e '^index ' -e '^@@') <(git diff -U0 $(git merge-base <new-head> B) <new-head> | grep -v -e '^index ' -e '^@@')`.
+   No output means the PR's own change is unchanged and the verdict carries
+   (`diff` exits 1 when there is output; that is not an error); otherwise read
+   that interdiff. If the fetch fails, do a full re-read. Not
+   `git range-diff`: it skips merge commits, so code added while resolving a
+   merge of main shows as `=`. For each acceptance point decide DONE (with the
+   added line that does it), PARTIAL, NOT DONE, CHANGED (done differently: does
+   the PR say so, and why) or UNVERIFIABLE:
+   - where the issue offers alternatives ("use A, or B"), one of them DONE is
+     enough;
+   - a sentence with a qualifier ("retain X, with a stated reason") is two
+     points;
+   - an UNVERIFIABLE process claim ("written first and seen to fail") is listed
+     and does not change the verdict; an UNVERIFIABLE behaviour point is settled
+     by reading or running it, and if it cannot be, the verdict is UNCLEAR;
+   - CHANGED and "wrong fix taken" can both apply: a stated, reasoned departure
+     can still be the shortcut that makes the acceptance trivially true.
+
+   Then three questions: does the diff take a fix the issue warned against, or
+   a shortcut that makes the acceptance trivially true; does a test added to
+   prove the fix run the changed code path; does the diff add behaviour nobody
+   asked for. For the last, read the issue's own scope and Shape lines, and any
+   invariant the touched code's comments state: drift the fix needs to keep such
+   an invariant is `NEEDED`, any other is `DRIFT`. This is not a code review:
+   what else the new code accepts, and whether it is correct, stays with the
+   reviewers and step 3.
+
+   Then the verdict, from the points. Check these in order; the first that
+   applies is the verdict:
+   1. **DOES-NOT**: the fix the issue names is NOT DONE, or is CHANGED without
+      a maintainer's acceptance, or a warned-against fix or shortcut is taken.
+      An author stating the departure, or asking which approach to use, does
+      not make it accepted: an unanswered question is still open.
+   2. **UNCLEAR**: an UNVERIFIABLE behaviour point decides it.
+   3. **PARTIAL**: the named fix is DONE or accepted, but another point is
+      PARTIAL, NOT DONE, or CHANGED without a maintainer's acceptance.
+   4. **DELIVERS**: every point other than an UNVERIFIABLE process claim is
+      DONE, or CHANGED with the departure stated in the PR and accepted by a
+      maintainer's reply.
+
+   Scope takes the worst piece: any `DRIFT` makes it `DRIFT`.
+
+   A point is DONE only when the added line does what the point says. A line
+   that does something else in the same place is CHANGED, however close.
+6. **If CodeRabbit posted a Linked Issues row, read it** and record it. If it
+   disagrees with you, re-read the point it names before recording anything.
+7. **Record the verdict** with `python3 scripts/delivery_marker.py compose
+   --pr <N> --head <the head you read> --verdict <V> --scope <S> --checker
+   other --body-file <prose>` (plus `--intended`, `--change`, `--coderabbit` as
+   they apply; `--help` lists them), then run the one `gh` command it prints
+   (the script never posts). Answer the
+   author's open questions in the same comment. Record `--checker other`: you
+   are not the builder. The comment opens with one closed-grammar header that
+   code reads, and prose under it that code never parses:
+
+   ```
+   <!-- genesis-delivery-check: head=<40 hex> basis=<B> verdict=<V> scope=<S> [intended=<I>] [change=<C>] [coderabbit=<R>] [checker=<K>] [outcome=<O>] -->
+   ```
+
+   `B`: `issue:<N>` | `ledger:<32 hex>` | `follow-up:<32 hex>` | `spec:<name>` |
+   `plan:<name>` | `claim`. `V`: `DELIVERS` | `PARTIAL` | `DOES-NOT` | `UNCLEAR`.
+   `S`: `CLEAN` | `NEEDED` | `DRIFT`. `I`: `read` | `not-stated` | `unsupported`
+   | `n/a`. `C` (the PR body carries its Change block): `stated` | `absent` |
+   `n/a`. `R`: `passed` | `warning` | `inconclusive` | `absent` (CodeRabbit
+   posted no Linked Issues row). `K`: `other` |
+   `author-review`; a header with no `checker=` is read as `author-review`. `O`
+   (a builder's spec-converge outcome): `converged` |
+   `converged-with-carried` | `open` | `n/a`. Two rules the parser enforces:
+   `intended=` is required on an `issue:` basis and is `n/a` on any other, and
+   `outcome=` goes only with `checker=author-review`, matching the verdict
+   (`converged` and `converged-with-carried` are DELIVERS, `open` is PARTIAL).
+   Under the header, a DELIVERS needs at least one line of the form
+   `- DONE: <point> (`path:line`)` citing a file the PR changes. One owner
+   comment per PR, edited in place when the read is redone; a block by anyone
+   else, or in a review body, does not count. The comment is public: technical
+   content only.
+8. **Then act on the verdict.** DELIVERS: continue the loop. PARTIAL or
+   DOES-NOT: say what is missing, quoting the issue; spend no update-branch,
+   review request or review round on it until that changes. UNCLEAR: ask the
+   author or the owner. DRIFT that adds a mechanism: name it in the merge
+   question.
+
+A builder's own read (`checker=author-review`, build-session) does not stand in
+for this one on a PR that changes code, tests or config: overwrite it with
+yours. On a prose-only PR it may stand, and the merge question says
+"self-attested".
 
 ### 2. Branch on the verdict
 
@@ -632,6 +775,13 @@ it** (owner ruling, 2026-10-19):
   - every soft warning the review bot posted (PII, private text, wording) is
     addressed;
   - the PR body declares its `E2E:` line;
+  - a delivery read (step 1a) at the current head, or carried to it, says
+    DELIVERS, made by someone other than the builder (`checker=other`) unless
+    the PR is self-attestable: every changed file is prose or docs, none a test,
+    fixture or config, in which case the merge question says "self-attested". A
+    DRIFT that adds a mechanism, or `intended=not-stated|unsupported`, is named
+    in the merge question and needs the owner's per-PR yes. This is a rule you
+    keep, not a merge block;
   - its shape is in order: from 500 to 1,000 counted lines the body carries a
     `Shape:` line, and the PR does not itself carry `needs-rework` or
     `needs-architecture-session` (the merge gate checks neither);
@@ -712,6 +862,8 @@ it** (owner ruling, 2026-10-19):
   decision even when its gates are now clean;
 - a PR over 1,000 counted lines (the owner's yes to the shape as well as the
   merge);
+- a PR that builds a proposal: its issue's answer 2 says `Stated: nowhere`, or
+  its delivery read recorded `intended=not-stated|unsupported` (step 1a);
 - a design, premise or user-impact question the review raised.
 
 Authorization never carries over from an earlier session, and a peer session's

@@ -84,6 +84,11 @@ gated on values they can't know.
 PRs without a prior issue or discussion may be closed if the change wasn't
 discussed first. All PRs require a maintainer review before merging.
 
+Before reviewing the code, a maintainer checks that the PR does what its linked
+issue asks: each point of the issue's acceptance, the fix it warned against,
+and any "fixed" claim against the diff. The result is posted as a comment on
+the PR, so if a point is read as missing you will see which one and why.
+
 ## Commit conventions
 
 ```

@@ -271,6 +271,17 @@ its effect can be shown on this install. The review-time check is different: the
 architect's Step 0.5 compares the diff with the plan and stays informational,
 and it does not replace this pass.
 
+**Record that outcome as the PR's first delivery read.** Once the PR is open,
+`python3 scripts/delivery_marker.py compose --pr <N> --checker author-review
+--outcome <converged|converged-with-carried|open> ...` writes the marker, and you
+run the one `gh` command it prints: `converged` records DELIVERS,
+`converged-with-carried` DELIVERS with each carried item as a PARTIAL point,
+`open` PARTIAL. A PR not built from a spec records the verdict your pre-PR
+review's scope check (the architect's Step 0.5) supports. This is the weakest
+form of the read, the builder's own, and it is labelled so: a closing session
+does its own read (closing-session, step 1a) and overwrites it, and on a PR
+that changes code, tests or config only that independent read makes it ready.
+
 **Which copy actually ran is the whole question. Check it; never assume it.**
 - A hook guard run as `python3 <worktree>/scripts/hooks/<guard>.py`, with a real
   payload on stdin, runs the branch's copy of that file. The harness, and the
