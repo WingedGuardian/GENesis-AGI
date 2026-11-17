@@ -393,6 +393,10 @@ class TestLaunchRefuses:
         75 too, never prompt."""
         door.state["sessions"].write_text("".join(f"cc-{i}\n" for i in range(1, 65)))
         (door.checkout / ".venv" / "bin" / "python").unlink()
+        # The fallback's cap is clamped by nproc: one CPU, whatever host runs this.
+        nproc = door.home.parent / "bin" / "nproc"
+        nproc.write_text("#!/bin/sh\necho 1\n")
+        nproc.chmod(0o755)
         proc = door.launch()
         assert proc.returncode == 75, proc.stderr
 
