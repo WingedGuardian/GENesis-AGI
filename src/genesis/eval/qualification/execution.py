@@ -11,7 +11,7 @@ from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from pathlib import Path
 
-from . import pinned, sampling
+from . import native_expense, pinned, sampling
 from .accounting import Journal, _billing, currency, total
 from .evidence import Incomplete, canonical, check_directory, digest, load_json, private_open
 
@@ -22,10 +22,13 @@ STOP = "stop_both_on_unresolved_evidence_no_resend"
 SINGLE_STOP = "stop_campaign_on_unresolved_evidence_no_resend"
 
 
-def selected_aliases(models):
+def selected_aliases(models, *, allow_native=False):
     """Select one explicit population, preserving its serial order."""
     if isinstance(models, dict):
-        for aliases in ((ALIASES[1],), ALIASES, PRO_COMPARISON):
+        populations = ((ALIASES[1],), ALIASES, PRO_COMPARISON)
+        if allow_native:
+            populations += (("deepseek-flash",),)
+        for aliases in populations:
             if set(models) == set(aliases):
                 return aliases
     raise Incomplete("operating_plan_invalid")
@@ -76,6 +79,8 @@ def observed_charge(row):
     Removing ONLY that ceiling permits an above-allocation receipt to remain an
     actual expense in the report. It never settles or releases journal liability.
     """
+    if "cost_basis" in row["spec"]:
+        return None
     receipts = row["receipts"]
     try:
         charges = [currency(r["charge"]) for r in receipts if r.get("charge") is not None]
@@ -274,41 +279,82 @@ def _lookup_failures(states):
     return counts
 
 
+def _expense_interval(row):
+    from . import native_expense
+
+    if row["spec"].get("cost_basis") == native_expense.BASIS:
+        expense = native_expense.interval(row)
+        if expense is None:
+            return None
+        diagnostic = "cost" in load_json(row["observations"][0]["raw_body"])["usage"]
+        return native_expense.BASIS, expense, diagnostic
+    measured = observed_charge(row)
+    return (None, (measured[1], measured[1]), False) if measured is not None else None
+
+
+def _journal_accounting(state):
+    result = {"journal_settled": str(state.settled), "journal_reserved": str(state.reserved)}
+    bases = {row["spec"].get("cost_basis") for row in state.attempts.values()}
+    if "native_tariff_v1" in bases:
+        result["journal_settled_basis"] = ("native_tariff_v1_upper" if len(bases) == 1
+                                            else "mixed_declared_cost_bases")
+    return result
+
+
+def _native_cost_report(states, known, unresolved):
+    if not any(row["spec"].get("cost_basis") == "native_tariff_v1"
+               for state in states.values() for row in state.attempts.values()):
+        return {}
+    resolved = [v for owner, v in known.items() if v[0] == "native_tariff_v1" and owner not in unresolved]
+    return {"calculated_cost_interval": {
+        "basis": "native_tariff_v1", "currency": "USD",
+        "lower": format(total(v[1][0] for v in resolved), "f"),
+        "upper": format(total(v[1][1] for v in resolved), "f"), "resolved_attempts": len(resolved)},
+        "native_invoice_cost_status": "unobserved",
+        "native_uncontracted_usage_cost_attempts": sum(v[2] for v in resolved),
+        "cost_scope": "observed_receipt_cost contains validated legacy provider receipts only; native amounts are tariff calculations"}
+
+
 def cost_report(states):
     """Census every generation claim before deciding which expenses are resolved."""
     known, owners, accounting, unresolved, over = {}, {}, {}, set(), 0
     for alias, state in states.items():
-        accounting[alias] = {"journal_settled": str(state.settled),
-                             "journal_reserved": str(state.reserved)}
+        accounting[alias] = _journal_accounting(state)
         for attempt, row in state.attempts.items():
             if not row["dispatched"]:
                 continue
             owner = alias, attempt
             # Invalid or missing costs still carry ownership claims. Deduplicate
             # repeated GET evidence within this attempt, not across owners.
-            claims = {item[field] for item in row["observations"] + row["receipts"] + row.get("lookups", [])
+            claims = {value for item in row["observations"] + row["receipts"] + row.get("lookups", [])
                       if isinstance(item, dict)
-                      for field in ("generation_id", "body_generation_id", "header_generation_id")
-                      if isinstance(item.get(field), str) and item[field].strip()}
+                      for value in (native_expense.generation_claims(item)
+                                    if row["spec"].get("cost_basis") == native_expense.BASIS
+                                    else [item.get(field) for field in (
+                                        "generation_id", "body_generation_id", "header_generation_id",
+                                        "response_generation_id")])
+                      if isinstance(value, str) and value.strip()}
             for generation in claims:
                 key = row["spec"]["generation_namespace"], generation
                 owners.setdefault(key, set()).add(owner)
-            measured = observed_charge(row)
+            measured = _expense_interval(row)
             if measured is None:
                 unresolved.add(owner)
             else:
-                known[owner] = measured[1]
-                over += measured[1] > currency(row["spec"]["max_charge"])
+                known[owner] = measured
+                over += measured[1][1] > currency(row["spec"]["max_charge"])
     for claimed in owners.values():
         if len(claimed) > 1:
             unresolved.update(claimed)
-    return {"observed_receipt_cost": str(total(charge for owner, charge in known.items()
-                                                if owner not in unresolved)),
+    result = {"observed_receipt_cost": str(total(value[1][1] for owner, value in known.items()
+                                                if value[0] is None and owner not in unresolved)),
             "unresolved_attempts": len(unresolved), "over_allocation_attempts": over,
             "journal_accounting": accounting,
             "receipt_lookup_failures": _lookup_failures(states),
             "limitations": ["Late or undisclosed provider charges can exceed the allowance.",
                             "Observed receipts are not an authenticated final invoice."]}
+    result.update(_native_cost_report(states, known, unresolved))
+    return result
 
 
 class OperatingRouter(pinned.PinnedRouter):

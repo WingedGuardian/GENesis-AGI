@@ -6,11 +6,12 @@ block, owed by plans and by an issue handed to a paid builder (``devin-ready``).
 Answer 2 carries ``Stated:`` and answer 5 ``Wrong fix:``. ``1. Problem: as #N``
 stands for items 1 to 5.
 
-While ``FORM_EPOCH`` is unset, a complete section in EITHER form passes, and an
-incomplete one is reported in the form it was written in, so nothing that passes
-today is newly labelled, stripped or blocked. Setting the epoch (in a later
-change, with the forms) makes issues created on or after it, and every plan,
-owe the new form.
+``FORM_EPOCH`` is set, and the tests run at the shipped value unless they set
+their own. Every plan and paid build owes the nine-item form, whatever the date.
+An issue created on or after the epoch owes it; one created before it keeps the
+either-form rule, under which a complete section in EITHER form passes and an
+incomplete one is reported in the form it was written in. Most issue fixtures
+here are dated before the epoch, so they exercise that rule.
 """
 
 from __future__ import annotations
@@ -30,7 +31,17 @@ gate = private_module("premise_gate_form_under_test", _ROOT / "scripts" / "premi
 _PLAN_HOOK = _ROOT / "scripts" / "hooks" / "plan_premise_gate.py"
 
 _NEW = "2026-11-20T00:00:00Z"
+
 _OLD = "2026-10-01T00:00:00Z"
+
+
+@pytest.fixture(autouse=True)
+def _shipped_epoch(monkeypatch):
+    """Every test runs at the SHIPPED epoch unless it sets its own; no
+    override leaks in from the environment. The default issue date falls before
+    it, so issues here take the either-form rule unless a test says otherwise."""
+    monkeypatch.delenv("_TEST_PREMISE_FORM_EPOCH", raising=False)
+    assert _NEW < gate._plan_gate.FORM_EPOCH
 
 _PROBLEM = """1. Observed: the guard reports a migration as deleted (`pytest tests/x.py`, main at abc123); not a stale tree.
 2. Intended: a migration merged after checkout is not reported. Stated: docs/x.md:40
@@ -81,7 +92,7 @@ def _devin(body, created=_NEW):
     )
 
 
-# -- issues, FORM_EPOCH unset ---------------------------------------------------
+# -- issues created before the epoch (the either-form rule) -----------------------
 
 
 def test_a_new_form_problem_block_alone_completes_an_issue():
@@ -119,11 +130,11 @@ def test_a_change_block_on_an_issue_is_complete_if_present(epoch):
     assert _opened(_issue(_PROBLEM + _CHANGE)).add == []
 
 
-def test_the_old_six_still_complete_an_issue_while_the_epoch_is_unset():
+def test_the_old_six_still_complete_an_issue_created_before_the_epoch():
     assert _opened(_issue(_OLD_SIX)).add == []
 
 
-# -- devin-ready, FORM_EPOCH unset ----------------------------------------------
+# -- devin-ready (owes the nine whatever the date) --------------------------------
 
 
 def test_devin_ready_on_a_complete_nine_stays():
@@ -139,16 +150,6 @@ def test_devin_ready_on_a_problem_block_alone_is_removed_naming_the_change_block
     assert "1. Observed" not in plan.comment
 
 
-def test_devin_ready_on_a_complete_old_six_is_not_stripped():
-    """The guard ignores grandfathering, so requiring nine here before the epoch
-    would strip the label from every old-form issue (spec review S4)."""
-    plan = _devin(_issue(_OLD_SIX), created=_OLD)
-    assert not plan.remove and not plan.comment
-
-
-def test_the_old_form_comment_still_counts_six():
-    plan = _devin(_issue(_OLD_SIX.replace("3. Scope reuses the shared reader.", "3. n/a")))
-    assert "1 of 6" in plan.comment and "3. scope limits" in plan.comment
 
 
 # -- issues and devin-ready, FORM_EPOCH set --------------------------------------
@@ -188,7 +189,7 @@ def _run_plan(tmp_path: Path, plan: str, *, epoch: str | None = None):
     path.write_text(plan, encoding="utf-8")
     env = {k: v for k, v in os.environ.items() if not k.startswith("GENESIS_")}
     env["HOME"] = str(home)
-    if epoch is not None:
+    if epoch:
         env["_TEST_PREMISE_FORM_EPOCH"] = epoch
     payload = {
         "session_id": "s1",
@@ -226,22 +227,12 @@ def test_a_new_form_plan_without_alternatives_is_blocked_naming_it(tmp_path):
     assert "7 (Alternatives" in r.stderr
 
 
-def test_an_old_six_plan_still_passes_while_the_epoch_is_unset(tmp_path):
-    r = _run_plan(tmp_path, _plan(_OLD_SIX))
-    assert r.returncode == 0, r.stderr
-
-
-def test_a_plan_with_no_section_gets_the_old_template_while_unset(tmp_path):
+def test_a_plan_with_no_section_gets_the_nine_item_template(tmp_path):
     r = _run_plan(tmp_path, _plan(None))
     assert r.returncode == 2
-    assert "outside-behaviour claims measured or cited" in r.stderr
-    assert "Observed:" not in r.stderr
+    assert "1. Observed: <" in r.stderr and "9. Shape: <" in r.stderr
+    assert "outside-behaviour claims measured or cited" not in r.stderr
 
-
-def test_after_the_epoch_an_old_six_plan_is_blocked_with_the_new_template(tmp_path):
-    r = _run_plan(tmp_path, _plan(_OLD_SIX), epoch="2026-01-01T00:00:00Z")
-    assert r.returncode == 2
-    assert "1. Observed:" in r.stderr and "9. Shape:" in r.stderr
 
 
 # -- the messages a writer sees ---------------------------------------------------
@@ -275,13 +266,16 @@ _OLD_SIX_AS = _OLD_SIX.replace("1. n/a — no outside behaviour.", "1. Problem: 
 
 
 @pytest.mark.parametrize("body", [_OLD_SIX_OBSERVED, _OLD_SIX_AS])
-def test_a_complete_six_that_starts_like_the_new_form_still_passes_while_unset(body, tmp_path):
-    """Old question 1 is naturally answered 'Observed: ...'; while the epoch is
-    unset a complete six must pass on every path, as it does on main."""
+def test_a_complete_six_that_starts_like_the_new_form_still_passes_for_an_older_issue(
+    body, tmp_path
+):
+    """Old question 1 is naturally answered 'Observed: ...'; an issue created
+    before the epoch keeps the either-form rule, so a complete six passes the
+    label job. A paid build and a plan owe the nine whatever the date."""
     assert _opened(_issue(body)).add == []
     plan = _devin(_issue(body), created=_OLD)
-    assert not plan.remove and not plan.comment
-    assert _run_plan(tmp_path, _plan(body)).returncode == 0
+    assert plan.remove == ["devin-ready"]
+    assert _run_plan(tmp_path, _plan(body)).returncode == 2
 
 
 def test_a_template_left_in_the_change_block_is_not_a_written_change_block():
@@ -312,9 +306,11 @@ def test_wrong_fix_tolerates_spacing():
     assert _opened(body).add == []
 
 
-def test_an_empty_epoch_override_reads_as_unset(monkeypatch):
+def test_an_empty_epoch_override_falls_back_to_the_constant(monkeypatch):
     monkeypatch.setenv("_TEST_PREMISE_FORM_EPOCH", "")
-    assert _opened(_issue(_OLD_SIX)).add == []
+    assert gate._plan_gate.form_epoch() == _SHIPPED  # the constant
+    monkeypatch.setattr(gate._plan_gate, "FORM_EPOCH", "2026-11-15T00:00:00Z")
+    assert gate._plan_gate.form_epoch() == "2026-11-15T00:00:00Z"
 
 
 _TWO_COINCIDENCES = _OLD_SIX.replace(
@@ -322,16 +318,17 @@ _TWO_COINCIDENCES = _OLD_SIX.replace(
 ).replace("4. Caller: the CI job, tracked by #42.", "4. Searched: callers; the CI job, #42.")
 
 
-def test_an_old_six_with_two_label_coincidences_still_passes_while_unset(tmp_path):
+def test_an_old_six_with_two_label_coincidences_still_passes_for_an_older_issue(tmp_path):
     """The re-review's construction: answer 1 opens 'Observed:' and answer 4
-    'Searched:', which the detector reads as the nine-item form."""
+    'Searched:', which the detector reads as the nine-item form. An issue created
+    before the epoch still passes; a paid build and a plan owe the nine."""
     assert _opened(_issue(_TWO_COINCIDENCES)).add == []
     plan = _devin(_issue(_TWO_COINCIDENCES), created=_OLD)
-    assert not plan.remove and not plan.comment
-    assert _run_plan(tmp_path, _plan(_TWO_COINCIDENCES)).returncode == 0
+    assert plan.remove == ["devin-ready"]
+    assert _run_plan(tmp_path, _plan(_TWO_COINCIDENCES)).returncode == 2
 
 
-def test_six_non_empty_answers_pass_in_either_form_while_unset():
+def test_six_non_empty_answers_pass_in_either_form_before_the_epoch():
     """A nine-item section missing a sub-label still passes before the epoch:
     main passes any six non-empty answers today."""
     body = _issue(_PROBLEM.replace(" Stated: docs/x.md:40", "") + _CHANGE)
@@ -409,7 +406,7 @@ def test_a_grandfathered_unfilled_template_still_owes_its_answers(epoch):
     assert _opened(_issue(_TEMPLATE_ISSUE), created="2026-11-01T00:00:00Z").add == ["premises-missing"]
 
 
-def test_a_complete_new_form_and_an_old_six_still_pass(tmp_path):
+def test_a_complete_new_form_and_an_old_six_still_pass_on_an_older_issue(tmp_path):
     # An old six the detector claims (answer 1 opens 'Observed:', answer 4
     # 'Searched:'), with answers that open with a form word and say little:
     # today's rule passes it, so it still passes.
@@ -418,7 +415,7 @@ def test_a_complete_new_form_and_an_old_six_still_pass(tmp_path):
         "4. Caller: the CI job, tracked by #42.", "4. Searched: caller is #12")
     assert gate._plan_gate.is_new_form(gate.premise_answers(gate.strip_quoted(_issue(claimed))))
     assert _opened(_issue(claimed)).add == []
-    assert _run_plan(tmp_path, _plan(claimed)).returncode == 0
+    assert _run_plan(tmp_path, _plan(claimed)).returncode == 2  # a plan owes the nine
     assert _opened(_issue(_PROBLEM)).add == []
     assert _opened(_issue(_PROBLEM + _CHANGE)).add == []
     assert _opened(_issue(_OLD_SIX)).add == []
@@ -443,3 +440,225 @@ def test_items_left_as_the_template_placeholder_are_unanswered(tmp_path, epoch):
 def test_the_label_strip_takes_only_a_leading_run():
     assert not gate._plan_gate.field_empty("TBD Shape: later")
     assert gate._plan_gate.field_empty("Cost: Stated: Wrong fix:")
+
+
+# -- the shipped epoch (PR 2c): what setting FORM_EPOCH changes ----------------------
+
+#: The constant as shipped, read before any fixture pins it.
+_SHIPPED = gate._plan_gate.FORM_EPOCH
+_BEFORE_SHIP = "2026-11-16T00:00:00Z"
+_AFTER_SHIP = "2026-12-01T00:00:00Z"
+_VERIFIED = """## Verification
+1. Reproduced on main at abc123 with `genesis status`.
+2. It printed `KeyError: 'x'`.
+3. Ruled out: config is the default, the install is current.
+4. Searched: no issue for this, no fix on main.
+5. Expected a status table; got a traceback.
+"""
+
+
+@pytest.fixture
+def shipped(monkeypatch):
+    monkeypatch.setattr(gate._plan_gate, "FORM_EPOCH", _SHIPPED)
+
+
+def test_the_shipped_epoch_is_set_and_written_as_github_writes_created_at():
+    import re
+
+    assert _SHIPPED is not None
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", _SHIPPED)
+    assert _BEFORE_SHIP < _SHIPPED < _AFTER_SHIP
+
+
+def test_shipped_devin_ready_on_a_complete_old_six_names_the_conversion(shipped):
+    plan = _devin(_issue(_OLD_SIX), created=_OLD)
+    assert plan.remove == ["devin-ready"]
+    assert plan.comment.startswith("(aside)")
+    assert gate.CONVERSION_NOTE in plan.comment and "9 (Shape)" in plan.comment
+
+
+def test_shipped_devin_ready_on_a_complete_nine_stays(shipped):
+    plan = _devin(_issue(_PROBLEM + _CHANGE), created=_OLD)
+    assert not plan.remove and not plan.comment
+
+
+def test_shipped_issue_owes_the_new_form_by_its_creation_date(shipped):
+    assert _opened(_issue(_OLD_SIX), created=_BEFORE_SHIP).add == []
+    assert _opened(_issue(_OLD_SIX), created=_AFTER_SHIP).add == ["premises-missing"]
+    assert _opened(_issue(_PROBLEM), created=_AFTER_SHIP).add == []
+    msg = gate.owed_message({"body": _issue(_OLD_SIX), "labels": [], "created_at": _AFTER_SHIP})
+    assert gate.CONVERSION_NOTE in msg
+
+
+def test_shipped_bug_label_switches_forms_only_before_the_epoch(shipped):
+    bug = {"labels": ["bug"]}
+    before = gate.decide(_event("opened", _VERIFIED, labels=["bug"], created=_BEFORE_SHIP))
+    after = gate.decide(_event("opened", _VERIFIED, labels=["bug"], created=_AFTER_SHIP))
+    assert before.add == [] and after.add == ["premises-missing"]
+    assert gate.owed_answers({**bug, "body": _VERIFIED, "created_at": _AFTER_SHIP})[0] == "premise"
+    problem = _issue(_PROBLEM)
+    assert gate.decide(_event("opened", problem, labels=["bug"], created=_AFTER_SHIP)).add == []
+    old = gate.decide(_event("opened", problem, labels=["bug"], created=_BEFORE_SHIP))
+    assert old.add == ["premises-missing"]  # before the epoch a bug owes Verification
+
+
+def test_shipped_bug_form_reports_stay_exempt(shipped):
+    form = gate._bug_form_headings()
+    body = "\n\n".join(f"{h}\n\nsome text" for h in form)
+    assert gate.is_bug_form(body)
+    assert gate.decide(_event("opened", body, labels=["bug"], created=_AFTER_SHIP)).add == []
+
+
+def test_shipped_check_reads_ghs_createdAt_for_the_bug_label(shipped, capsys):
+    body = _issue(_PROBLEM + _CHANGE) + "\n" + _VERIFIED.replace(
+        "2. It printed `KeyError: 'x'`.", "2. TBD"
+    )
+    assert "2. TBD" in body
+    after = {"body": body, "labels": [{"name": "bug"}], "createdAt": _AFTER_SHIP}
+    assert gate.check(7, view=lambda n: after) == 0
+    assert "missing verification answer" not in capsys.readouterr().out
+    before = {**after, "createdAt": _BEFORE_SHIP}
+    assert gate.check(7, view=lambda n: before) == 0
+    assert "missing verification answer 2" in capsys.readouterr().out
+
+
+def test_shipped_check_on_an_old_six_names_the_conversion(shipped, capsys):
+    view = {"body": _issue(_OLD_SIX), "labels": [], "createdAt": _OLD}
+    assert gate.check(7, view=lambda n: view) == 1
+    assert gate.CONVERSION_NOTE in capsys.readouterr().out
+
+
+def test_shipped_plan_gate_blocks_an_old_six_and_passes_the_nine(tmp_path):
+    old = _run_plan(tmp_path, _plan(_OLD_SIX), epoch=_SHIPPED)
+    assert old.returncode == 2 and "six-question form" in old.stderr
+    assert _run_plan(tmp_path, _plan(_PROBLEM + _CHANGE), epoch=_SHIPPED).returncode == 0
+
+
+def _feature_form_value() -> str:
+    import yaml
+
+    form = yaml.safe_load((_ROOT / ".github" / "ISSUE_TEMPLATE" / "feature_request.yml").read_text())
+    field = next(b for b in form["body"] if b.get("id") == "premises")
+    assert "render" not in field["attributes"]  # a render: fences the answers as code
+    return field["attributes"]["value"]
+
+
+def _rendered(premises: str) -> str:
+    """The issue body GitHub renders from the feature form: each field under its
+    ``### <label>`` heading."""
+    return f"### Problem or motivation\n\nx\n\n### Premise checks\n\n{premises}"
+
+
+def test_the_feature_form_prefill_parses_as_the_labelled_form(shipped):
+    value = _feature_form_value()
+    answers = gate.premise_answers(_rendered(value))
+    assert [answers[n].split(":", 1)[0] for n in range(1, 10)] == [
+        label for label, _ in gate._plan_gate.FORM
+    ]
+    # Untouched, the prefill is labels only: every Problem answer is still owed,
+    # and the bare Change labels do not make the Change block "written".
+    assert _gaps(_rendered(value), created=_AFTER_SHIP) == [1, 2, 3, 4, 5]
+    filled = (
+        value.replace("Observed:", "Observed: it fails on main abc123, not a stale tree.")
+        .replace("Intended:", "Intended: it passes.")
+        .replace("Stated:", "Stated: docs/x.md:40")
+        .replace("Cost:", "Cost: every PR, counted from CI.")
+        .replace("Searched:", "Searched: issues and main; nothing.")
+        .replace("Acceptance:", "Acceptance: a merged migration passes.")
+    )
+    assert _gaps(_rendered(filled), created=_AFTER_SHIP) == [5]  # Wrong fix: still empty
+    done = filled.replace("Wrong fix:", "Wrong fix: pinning the base to HEAD.")
+    assert _gaps(_rendered(done), created=_AFTER_SHIP) == []
+
+
+# -- the plan gate's mechanics on the path plans take now (shipped epoch) ----------
+# test_plan_premise_gate.py pins these mechanics in the six-question form; the
+# reader is shared, so these cover the nine-item path through the same gate.
+
+_NINE = _PROBLEM + _CHANGE
+
+
+def _nine_plan(answers: str = _NINE) -> str:
+    return _plan(answers)
+
+
+@pytest.mark.parametrize("n", range(1, 10))
+def test_shipped_each_missing_plan_answer_is_named(tmp_path, n):
+    answers = "".join(ln + "\n" for ln in _NINE.splitlines() if not ln.startswith(f"{n}. "))
+    r = _run_plan(tmp_path, _nine_plan(answers), epoch=_SHIPPED)
+    assert r.returncode == 2
+    if n == 1:  # the form is told from answer 1, so without it the note says so
+        assert "its first answer must start `Observed:`" in r.stderr
+    else:
+        assert f"answer {n} (" in r.stderr
+
+
+@pytest.mark.parametrize("empty", ["", "n/a", "TBD", "<the alternatives>", "**N/A**"])
+def test_shipped_an_empty_plan_answer_is_blocked(tmp_path, empty):
+    answers = _NINE.replace(
+        "7. Alternatives: the existing base helper decides this; reused.", f"7. Alternatives: {empty}"
+    )
+    r = _run_plan(tmp_path, _nine_plan(answers), epoch=_SHIPPED)
+    assert r.returncode == 2 and "answer 7 (" in r.stderr
+
+
+@pytest.mark.parametrize("heading", ["## Premise questions", "#### Premise checks", "## **Premise checks**"])
+def test_shipped_heading_spellings_and_paren_numbering_pass(tmp_path, heading):
+    plan = _nine_plan().replace("## Premise checks", heading)
+    for n in range(1, 10):
+        plan = plan.replace(f"\n{n}. ", f"\n{n}) ")
+    assert _run_plan(tmp_path, plan, epoch=_SHIPPED).returncode == 0
+
+
+def test_shipped_a_malformed_first_answer_is_not_called_a_six(tmp_path):
+    answers = _NINE.replace("1. Observed: the guard", "1. Observed — the guard")
+    r = _run_plan(tmp_path, _nine_plan(answers), epoch=_SHIPPED)
+    assert r.returncode == 2 and "not in the nine-item form" in r.stderr
+    assert "must start `Observed:`" in r.stderr
+
+
+# -- the devin-ready guard's mechanics on the shipped path ---------------------------
+
+
+def test_shipped_devin_ready_missing_one_answer_is_removed_naming_it(shipped):
+    body = _issue(_NINE.replace("8. Evidence: the measured CI runs above.", "8. Evidence: TBD"))
+    plan = _devin(body, created=_OLD)
+    assert plan.remove == ["devin-ready"] and plan.comment.startswith("(aside)")
+    assert "1 of 9" in plan.comment and "8. Evidence" in plan.comment
+    assert gate.CONVERSION_NOTE not in plan.comment  # a nine-item section is not told to convert
+
+
+def test_shipped_devin_ready_is_not_commented_twice(shipped):
+    body = _issue(_PROBLEM)
+    event = _event("labeled", body, labels=[], label="devin-ready", created=_OLD)
+    assert gate.decide(event) == gate.Plan()  # already removed: no second comment
+
+
+def test_shipped_a_verified_bug_bound_for_devin_owes_the_nine(shipped):
+    plan = gate.decide(
+        _event("labeled", _VERIFIED, labels=["bug", "devin-ready"], label="devin-ready", created=_OLD)
+    )
+    assert plan.remove == ["devin-ready"] and "of 9" in plan.comment
+
+
+def test_shipped_owed_message_tells_a_bug_filer_why_verification_is_not_enough(shipped):
+    msg = gate.owed_message({"body": _VERIFIED, "labels": ["bug"], "created_at": _AFTER_SHIP})
+    assert "owes the Problem block, not Verification" in msg and "items 1, 2 and 4" in msg
+
+
+def test_setting_the_epoch_back_to_none_restores_the_either_form_rule(monkeypatch, tmp_path):
+    """The rollback lever: with FORM_EPOCH None again, a complete six passes the
+    label job, the devin-ready guard and the plan gate, and so does the nine."""
+    monkeypatch.setattr(gate._plan_gate, "FORM_EPOCH", None)
+    for body in (_OLD_SIX, _PROBLEM + _CHANGE):
+        assert _opened(_issue(body), created=_AFTER_SHIP).add == []
+        plan = _devin(_issue(body), created=_AFTER_SHIP)
+        assert not plan.remove and not plan.comment
+    payload = {"tool_name": "ExitPlanMode", "tool_input": {"plan": _plan(_OLD_SIX)}}
+    assert gate._plan_gate._check(payload) == 0
+
+
+def test_an_as_line_plan_with_unlabelled_change_answers_is_told_to_label_them(tmp_path):
+    answers = "1. Problem: as #42\n6. reused the shared reader.\n7. none simpler.\n8. cited.\n9. 40 lines.\n"
+    r = _run_plan(tmp_path, _plan(answers))
+    assert r.returncode == 2 and "the other answers with their own labels" in r.stderr

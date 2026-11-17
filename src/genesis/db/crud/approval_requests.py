@@ -39,6 +39,7 @@ SYSTEM_RESOLVER_PREFIXES: tuple[str, ...] = (
     "timeout_auto_expire",
     "cleanup:",
     "alarm_cleared",
+    "superseded",  # the Sentinel cancels a warning park a stronger alarm took over
     "genesis:",  # autonomous Genesis-vetted self-approval (NOT human-earned authority)
 )
 

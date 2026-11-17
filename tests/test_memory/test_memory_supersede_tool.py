@@ -648,11 +648,8 @@ async def test_a_link_failure_raises_in_strict_mode(store, db, monkeypatch):
 
 
 @pytest.mark.asyncio()
-async def test_the_store_path_stays_best_effort_on_mirror_failure(store, db, monkeypatch):
-    """Control: `store(supersedes=...)` keeps swallowing mirror failures — the
-    new content's fate dominates that call's outcome. Only the standalone
-    path is strict. Drives `_mark_superseded` at its default, the exact seam
-    `store()` uses."""
+async def test_legacy_non_strict_mark_stays_best_effort_on_mirror_failure(store, db, monkeypatch):
+    """Direct non-strict mark remains compatible; store uses its reporting helper."""
     from genesis.memory import store as store_mod
 
     await db.execute(
