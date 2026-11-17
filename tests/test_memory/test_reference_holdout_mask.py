@@ -2020,3 +2020,24 @@ async def test_re_ingesting_a_stored_masked_body_keeps_its_description(db):
     again = await _ingest(db, store, stored, concept=f"wifi {_SECRET}")
     assert again == unit
     await _assert_held(db, store, again)
+
+
+@pytest.mark.parametrize(
+    ("value", "name", "tag", "secret"),
+    [
+        ("bob / 48291375", "bob 48291375", "bob 48291375", "48291375"),
+        ("bob / hunter", "bob hunter box", "hunter box", "hunter"),
+        # A plain-word URL password is a stated limit (owner ruling 2026-11-17);
+        # a secret-shaped one is a probe.
+        ("postgres://app:Hunter9x@db.example.com/prod", "prod Hunter9x db", "Hunter9x db", "Hunter9x"),
+    ],
+)
+async def test_a_plain_secret_part_is_masked_in_every_indexed_surface(db, value, name, tag, secret):
+    """Round-2 premise check: a plain-word or all-digit secret part of the
+    value is masked in the name and a tag the write indexes."""
+    store = _PointStore()
+    unit = await _ingest(
+        db, store, _body(name, value=value), concept=name,
+        tags_json=json.dumps(["reference", "credentials", tag]),
+    )
+    await _assert_held(db, store, unit, secret=secret, value=value)
