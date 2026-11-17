@@ -969,6 +969,8 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             purpose          TEXT,
             ingestion_source TEXT,
             origin_class     TEXT,
+            name_hash        TEXT,
+            name_origin      TEXT,
             secret_ref       TEXT,
             UNIQUE(project_type, domain, concept)
         )
@@ -2798,6 +2800,14 @@ INDEXES = [
     # The secret_ref triggers and the orphan sweep look units up by secret_ref.
     "CREATE INDEX IF NOT EXISTS idx_knowledge_units_secret_ref ON knowledge_units(secret_ref) "
     "WHERE secret_ref IS NOT NULL",
+    # A credential's identity is the hash of its full name (#2426): one trusted
+    # entry per name, so two concurrent first saves of a name end as one entry.
+    # A hash that is not 64 hex (a later legacy name differing only in case,
+    # which the backfill keeps) is outside it. Also created by migration
+    # 20261115060803_credential_name_hash.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_units_name_hash "
+    "ON knowledge_units(project_type, domain, name_hash) "
+    "WHERE name_origin = 'trusted' AND length(name_hash) = 64",
     # codebase index
     "CREATE INDEX IF NOT EXISTS idx_code_symbols_module ON code_symbols(module_path)",
     "CREATE INDEX IF NOT EXISTS idx_code_symbols_name ON code_symbols(name)",

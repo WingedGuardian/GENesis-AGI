@@ -1766,6 +1766,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE reference_secrets ADD COLUMN detail TEXT",
         "reference_secrets.detail")
+    # A credential's name identity (#2426), indexed by INDEXES; migration
+    # 20261115060803_credential_name_hash adds the same columns and backfills them.
+    await _try_alter(db,
+        "ALTER TABLE knowledge_units ADD COLUMN name_hash TEXT",
+        "knowledge_units.name_hash")
+    await _try_alter(db,
+        "ALTER TABLE knowledge_units ADD COLUMN name_origin TEXT",
+        "knowledge_units.name_origin")
     # The secret_ref triggers: no credential unit without its secret row, and a
     # secret row dies when no unit names it any more, however the unit is
     # deleted or repointed (a raw SQL delete, a cleanup script). Triggers, not a
