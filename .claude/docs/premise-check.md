@@ -10,29 +10,45 @@ and at **pre-push**, before an external reviewer spends a round on it.
 ## At plan and issue time
 
 The plan-time half runs before work starts, on the plan or the issue itself.
-Every plan and every issue that specifies work answers six questions:
-
-1. Is every claim about outside behaviour (GitHub, git, a provider API) measured or cited, not asserted?
-2. Was the repo searched for existing code that already does this, with the result written down?
-3. Do the scope limits block the obvious shared code?
-4. Is the caller named and tracked (an issue), or is there a stated reason there is none?
-5. Does every number say how it was measured (what was counted, by which script)?
-6. Is the PR shape stated: the expected size in counted lines, and either a split into one-concern PRs, a `Shape:` reason when it will reach 500 to 1,000, or the owner's approval of the shape when it will exceed 1,000? (The size rule and its bands: step 6 of "The method" below.)
-
-The answers belong in the plan or issue body, not in a reviewer's first round.
-
-**The format, in a plan:** one section, numbered to match the questions. `n/a — <reason>`
-is an answer; a bare `n/a` is not.
+Every plan and every issue that specifies work answers the premise form: nine
+numbered items, each starting with its label. Items 1 to 5 are the **Problem
+block** (is this a real problem, and what would fixing it look like); 6 to 9 the
+**Change block** (is this the right change).
 
 ```markdown
 ## Premise checks
-1. <outside-behaviour claims: measured or cited>
-2. <what was searched, and what was found>
-3. <scope limits, and the shared code they leave reachable>
-4. <the caller, and its tracker or why there is none>
-5. <how each number was measured>
-6. <expected counted lines, and the split or Shape: reason>
+1. Observed: <what happens, with the command, output and commit (a fresh main), and the local causes ruled out>
+2. Intended: <what should happen>. Stated: <the doc, test, ruling or comment that says so | nowhere>
+3. Cost: <who or what is affected, how often, how that was measured>
+4. Searched: <existing issues, main and prior rulings: what was searched, what was found>
+5. Acceptance: <what must hold afterwards>. Wrong fix: <the tempting fix that must fail | none, because ...>
+6. Mechanism: <why this removes the cause; who calls it and what they do differently>
+7. Alternatives: <for each new mechanism or newly computed fact: what already does or decides this, the simpler mechanism considered, and why not each>
+8. Evidence: <every outside-behaviour claim and number, measured or cited>
+9. Shape: <counted lines (`python3 scripts/pr_shape.py --base origin/main`), and the split or the Shape: reason>
 ```
+
+The answers belong in the plan or issue body, not in a reviewer's first round.
+`n/a — <reason>` is an answer; a bare `n/a` is not, and neither is a label with
+nothing after it. Answer 2 must carry `Stated:` and answer 5 `Wrong fix:`, each
+answered. `Stated: nowhere` is an honest answer: the change is then a proposal,
+not a fix. Item 9's size rule and its bands are step 6 of "The method" below.
+
+**Who owes what.** An issue owes the Problem block, and the Change block too if
+any of it is written. A plan, and an issue handed to Devin (`devin-ready`), owe
+all nine. A plan or a PR body whose issue already answers the Problem block may
+write `1. Problem: as #<N>` in place of items 1 to 5 (the issue is not fetched).
+The six questions this form replaced map in: outside claims and numbers to 8,
+existing code and scope limits to 7, the caller to 6, the shape to 9.
+
+**The switch** (`FORM_EPOCH` in `scripts/hooks/plan_premise_gate.py`, 2026-11-22).
+Plans and `devin-ready` owe the nine-item form now. An issue created on or after
+the epoch owes it; one created before it keeps the old rule, under which a
+complete six-question section still passes, so no older issue changes its label
+state. `devin-ready` is different: it owes the nine on any issue, whatever its
+date, so applying it to a complete six removes it again. A
+six-question section that no longer completes something is answered with the
+mapping above.
 
 `## Premise questions` is accepted as the heading too. A plan that names a
 repo-relative path (`src/`, `scripts/`, `tests/`, `.claude/`, `docs/`, `config/`,
@@ -44,7 +60,9 @@ reviewer's question.
 **On an issue,** the same parser applies, through the premise gate Action
 (`scripts/premise_gate.py`). An issue without its answers carries the
 `premises-missing` label until it has them. Issues opened before the gate, and bug
-reports filed through the bug-report form, are not newly labelled.
+reports filed through the bug-report form, are not newly labelled. The feature
+form prefills the nine labels, so an answer starts with its label; the labels
+alone are not answers.
 
 **Before it is filed,** a foreground session's `gh issue create` is checked against
 that same rule: the PreToolUse hook `scripts/hooks/issue_premise_gate.py` blocks a
@@ -59,9 +77,10 @@ in a command with no `<(`, no `tee` and no `>` anywhere except the whole tokens
 bound for the configured public repo, and passes everything else.
 Dispatched sessions are never blocked.
 
-**A bug report answers different questions.** Its question is whether the bug is
-real, not how to build a change, so an issue labelled `bug` carries a
-`## Verification` section instead, with five numbered answers:
+**A bug report filed before the switch answered different questions.** Its
+question is whether the bug is real, not how to build a change, so an issue
+labelled `bug` and created before `FORM_EPOCH` carries a `## Verification`
+section instead, with five numbered answers:
 
 ```markdown
 ## Verification
@@ -72,14 +91,23 @@ real, not how to build a change, so an issue labelled `bug` carries a
 5. <expected vs actual>
 ```
 
-**`devin-ready` always needs the six premise answers,** bug or not, because Devin
+From the epoch on, the `bug` label no longer switches sections: a bug report owes
+the Problem block like any other issue, whose items 1 (Observed), 2 (Intended)
+and 4 (Searched) ask what these five asked. Reports filed through the bug-report
+form stay exempt from the label; the form still asks the five. One residual,
+stated rather than hidden: a form report later edited so that it no longer opens
+with the form's headings loses that exemption, and then owes a Problem block the
+form never asked for.
+
+**`devin-ready` always needs all nine premise answers,** bug or not, because Devin
 builds a change. Applying it to an issue without them removes it again, with an
 `(aside)` comment naming the missing answers, because that label starts a paid
 Devin session. Devin's own integration watches the label, so a session it has
 already started is not stopped; the label is the visible control. The check runs
 when the label is applied: editing the answers out later leaves `devin-ready` in
 place. `premises-missing` always means the issue's OWN section is incomplete (the
-Verification for a bug report), so a verified bug report that lacks the six loses
+Verification for a bug report filed before the epoch), so a verified bug report
+that lacks the nine loses
 `devin-ready` and gets the comment, but not that label.
 
 **Check before applying the label.** The Action acts only after the label event,
@@ -87,8 +115,9 @@ and on a busy runner queue that can be minutes after Devin has started. So a
 session runs `python3 scripts/premise_gate.py check <issue>` first, and applies
 `devin-ready` only when it exits 0. Exit 1 lists the missing answers: fix the
 issue, never apply the label over them. Exit 2 means the issue could not be read,
-which is not a pass. On a `bug` issue it also lists missing Verification answers;
-those do not change the exit code, because only the six decide the label.
+which is not a pass. On a `bug` issue filed before the epoch it also lists missing Verification answers;
+those do not change the exit code, because only the premise answers decide the
+label.
 
 ## Why it exists
 

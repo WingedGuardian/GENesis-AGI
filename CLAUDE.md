@@ -702,15 +702,23 @@ gate works, its exemption categories, and the unit rules for size bounds:
   One line is enough when building is right (`BUILD — cognitive core, no
   external substitute, searched: <terms>`); the point is that the question gets
   asked BEFORE the effort, which is the only moment it is cheap to answer.
-  **A plan or issue that specifies work answers the six premise questions
-  before work starts** — the plan-time half of the check in
-  `.claude/docs/premise-check.md`:
-  1. Is every claim about outside behaviour (GitHub, git, a provider API) measured or cited, not asserted?
-  2. Was the repo searched for existing code that already does this, with the result written down?
-  3. Do the scope limits block the obvious shared code?
-  4. Is the caller named and tracked (an issue), or is there a stated reason there is none?
-  5. Does every number say how it was measured (what was counted, by which script)?
-  6. Is the PR shape stated: expected size in counted lines (`python3 scripts/pr_shape.py --base origin/main`), and a split, a `Shape:` reason at 500 to 1,000, or the user's approval over 1,000? The rule (`.claude/docs/premise-check.md`, step 6): under 500 is the target, 500-1,000 carries a `Shape:` reason, and over 1,000 needs user approval. It is a guideline the session weighs; from 500 to 1,000 a stated reason is enough. Prefer one concern per PR (one mechanism a reviewer can accept or reject alone).
+  **A plan or issue that specifies work answers the premise form before work
+  starts** — the plan-time half of the check in `.claude/docs/premise-check.md`
+  ("At plan and issue time"). One `## Premise checks` section, nine numbered
+  items, each starting with its label:
+  1. Observed: what happens (command, output, a fresh main), and the local causes ruled out.
+  2. Intended: what should happen. Stated: where that is said, or "nowhere" (then it is a proposal).
+  3. Cost: who or what is affected, how often, how that was measured.
+  4. Searched: existing issues, main and prior rulings: what was searched, what was found.
+  5. Acceptance: what must hold afterwards. Wrong fix: the tempting fix that must fail.
+  6. Mechanism: why this removes the cause; who calls it and what they do differently.
+  7. Alternatives: what already does or decides this, the simpler mechanism, and why not each.
+  8. Evidence: every outside-behaviour claim and number, measured or cited.
+  9. Shape: expected size in counted lines (`python3 scripts/pr_shape.py --base origin/main`), and the split or the `Shape:` reason. The rule (`.claude/docs/premise-check.md`, step 6): under 500 is the target, 500-1,000 carries a `Shape:` reason, and over 1,000 needs user approval. It is a guideline the session weighs; from 500 to 1,000 a stated reason is enough. Prefer one concern per PR (one mechanism a reviewer can accept or reject alone).
+  An issue owes items 1 to 5 (and 6 to 9 if it writes any of them); a plan, and
+  an issue handed to Devin, owe all nine.
+  In a plan or PR body, `1. Problem: as #<N>` stands for items 1 to 5 when that
+  issue answers them; an issue writes its own.
 - **Rework is a contract with two sides.** A send-back's spec is
   decision-complete: what is kept, what is deleted, the shape, the split plan,
   and every question either answered or explicitly delegated. It never ends in
