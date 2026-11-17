@@ -304,10 +304,24 @@ def test_a_near_miss_reflection_is_denied_with_its_exit(
     assert "looks like a round reflection" in res.stderr and why in res.stderr
 
 
+#: A fixed time for ``_past_the_budget``'s reviews, never the wall clock: after
+#: the round rule's and the reflection gate's cutovers (so the rounds count and
+#: are owed) and before the past-round-4 rules' (so they never bind here,
+#: whenever the suite runs). Asserted in the fixture.
+_PAST_ANCHOR = datetime(2026, 10, 25, 12, 0, tzinfo=UTC)
+
+
 def _past_the_budget(monkeypatch, repo: Path) -> str:
     """Four rounds on four REAL commits (so their ancestry is readable whatever the
     clock says relative to the cutover): the ordinary lane's standing budget is
     spent, so every commit would get the round-approval ask."""
+    import review_budget  # noqa: PLC0415
+    import review_past_terminal  # noqa: PLC0415
+
+    for cut in (review_budget.ROUND_RULE_CUTOVER_ISO, rr.REFLECTION_CUTOVER_ISO):
+        assert datetime.fromisoformat(cut) < _PAST_ANCHOR
+    later = review_past_terminal.PAST_TERMINAL_CUTOVER_ISO
+    assert later is None or datetime.fromisoformat(later) > _PAST_ANCHOR
     _open_round(monkeypatch, repo)
     for n in (1, 2, 3):
         (repo / "f.py").write_text(f"value = {10 + n}\n")
@@ -320,7 +334,7 @@ def _past_the_budget(monkeypatch, repo: Path) -> str:
     monkeypatch.setenv("_TEST_REVIEW_BUDGET_COMMITS", "\n".join(json.dumps(r) for r in rows))
     reviews = []
     for i, sha in enumerate(shas[-4:]):
-        when = (datetime.now(UTC) - timedelta(hours=5 - i)).isoformat().replace("+00:00", "Z")
+        when = (_PAST_ANCHOR + timedelta(hours=i)).isoformat().replace("+00:00", "Z")
         reviews.append(
             {
                 "id": 1 + i,
@@ -1449,3 +1463,51 @@ def test_a_reflection_that_fails_its_grammar_does_not_silence_the_advisory(
     assert res.returncode == 0, res.stdout + res.stderr
     context = json.loads(res.stdout)["hookSpecificOutput"]["additionalContext"]
     assert "no reflection" in context and head[:12] in context
+
+
+def test_admission_applies_the_past_round_four_rules(repo, monkeypatch, tmp_path):
+    """The commit gate's admission runs the rules too (rework PR 2 of #4368):
+    with the PR past round 4 under them, a fix-now reflection naming a round-0
+    late key and no Prediction lines is refused, not admitted to credit nothing."""
+    import review_past_terminal as pt
+
+    now = datetime.now(UTC)
+    placed = {
+        f"{i:040x}": pt.RoundRecord(
+            f"{i:040x}", i, now - timedelta(hours=10 - i), ((now - timedelta(hours=10 - i), False, f"c{i}"),)
+        )
+        for i in range(1, 5)
+    }
+    monkeypatch.setattr(pt, "PAST_TERMINAL_CUTOVER_ISO", (now - timedelta(days=1)).isoformat())
+    monkeypatch.setattr(pt, "round_records", lambda budget: placed)
+    problem = _late_reflection_problem(
+        repo, monkeypatch, tmp_path, owed=["c11"], names=["c11"], late_rounds=[0]
+    )
+    assert problem is not None and "past-round-4 rules" in problem and "Prediction" in problem, problem
+    monkeypatch.setattr(pt, "PAST_TERMINAL_CUTOVER_ISO", None)
+    assert _late_reflection_problem(
+        repo, monkeypatch, tmp_path, owed=["c11"], names=["c11"], late_rounds=[0]
+    ) is None
+
+
+def test_key_rounds_names_each_keys_round_head(repo, monkeypatch):
+    """``_key_rounds`` returns ``(number, head)``: the current round and head
+    for an open key, a late key's own context's number and head (round 0:
+    ``(None, None)``). Admission looks the record up by that head."""
+    import time
+
+    import review_late
+
+    head = _head(repo)
+    late = [{"key": "c11", "head": head, "at": datetime.now(UTC)}]
+    monkeypatch.setattr(review_late, "late_findings", lambda *a, **k: late)
+    monkeypatch.setattr(review_late, "fix_time_reader", lambda *a, **k: (lambda h: None))
+    monkeypatch.setattr(review_late, "_ancestry", lambda budget: (set(), lambda sha: ()))
+    contexts = [review_late.RoundContext(5, None, (), "e" * 40), review_late.RoundContext(0, None, ())]
+    monkeypatch.setattr(review_late, "_contexts", lambda *a, **k: contexts)
+    state = {"owed": ["c11", "c12"], "late_keys": ["c11"], "cutover": None, "held_rounds": []}
+    budget = _budget(count=6, current_head=head)
+    got = _gate._key_rounds(
+        str(repo), budget, state, {"c11", "c12"}, rr, deadline=time.monotonic() + 30
+    )
+    assert got == {"c12": [(6, head)], "c11": [(5, "e" * 40), (None, None)]}

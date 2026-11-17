@@ -451,6 +451,7 @@ def _covered(path, head, **kw):
     kw.setdefault("key_rounds", {})
     kw.setdefault("acceptance", None)
     kw.setdefault("round_started", T0 - timedelta(days=3650))
+    kw.setdefault("round_records", None)
     return rr.covered_keys(str(path), head, **kw)
 
 
@@ -735,6 +736,7 @@ def _smuggled_is_a_fix(path: Path, tmp_path: Path, head: str, cwd: Path | None =
         key_rounds={},
         acceptance=None,
         round_started=T0 - timedelta(days=3650),
+        round_records=None,
         reviewed_at={"c1": _at(0), "c2": _at(0)},
     )
     assert got == set()
@@ -2246,6 +2248,7 @@ def test_unreadable_git_is_refused_never_nothing_owed(tmp_path):
             key_rounds={},
             acceptance=None,
             round_started=T0,
+            round_records=None,
         )
 
 
@@ -2428,3 +2431,58 @@ def test_superseded_normal_citation_is_not_fetched(repo, tmp_path, monkeypatch):
     monkeypatch.setattr(rr, "_run", run)
     assert _covered(path, head, repo="o/r", number=8) == {"c1"}
     assert calls == ["repos/o/r/pulls/comments/9"]
+
+
+def test_open_coverage_applies_the_past_round_four_rules_under_the_heads_round(
+    repo, tmp_path, monkeypatch
+):
+    """Open coverage judges the reflection under the round of the head it
+    names (``round_records[head]``): round 5, no floor finding, so a fix-now of
+    its keys credits nothing; with the rules off it credits both."""
+    import review_past_terminal as pt
+
+    path, head = repo
+    # The PR-wide lines are present, so only the head's own round (E) refuses.
+    lines = (
+        "Prediction: merges at round 6 because the class is closed in one place",
+        "Confidence: 97% falsified-by any new finding in that class",
+        "Prediction-held: no the last round drew a minor finding again",
+    )
+    _commit_reflection(path, tmp_path, _reflection(head=head, extra=lines))
+    opened = T0 - timedelta(days=3)
+    record = pt.RoundRecord(head, 5, opened, ((opened, False, "c1"), (opened, False, "c2")))
+    records = {head: record}
+    for i in range(1, 5):
+        records[f"{i:040x}"] = pt.RoundRecord(f"{i:040x}", i, opened - timedelta(hours=i), ())
+    monkeypatch.setattr(pt, "PAST_TERMINAL_CUTOVER_ISO", (opened - timedelta(days=1)).isoformat())
+    assert _covered(path, head, round_records=records) == set()
+    assert _covered(path, head, round_records=None) == {"c1", "c2"}
+
+
+def test_the_production_open_coverage_path_passes_the_round_records(
+    repo, tmp_path, monkeypatch
+):
+    """``_open_covered`` (what ``owed_from_budget`` calls) hands coverage the
+    budget's round records; with the head's round at 5 and no floor finding a
+    fix-now credits nothing, and without records it credits both keys."""
+    import review_past_terminal as pt
+
+    path, head = repo
+    lines = (
+        "Prediction: merges at round 6 because the class is closed in one place",
+        "Confidence: 97% falsified-by any new finding in that class",
+        "Prediction-held: no the last round drew a minor finding again",
+    )
+    _commit_reflection(path, tmp_path, _reflection(head=head, extra=lines))
+    opened = T0 - timedelta(days=3)
+    records = {head: pt.RoundRecord(head, 5, opened, ((opened, False, "c1"), (opened, False, "c2")))}
+    for i in range(1, 5):
+        records[f"{i:040x}"] = pt.RoundRecord(f"{i:040x}", i, opened - timedelta(hours=i), ())
+    monkeypatch.setattr(pt, "PAST_TERMINAL_CUTOVER_ISO", (opened - timedelta(days=1)).isoformat())
+    budget = {"rounds": [], "current_head": head}
+    # Round 1 for the grammar (no evidence owed); the records place it at 5.
+    state = {"head": head, "round": 1, "gate_lane": False, "round_started": T0 - timedelta(days=3650)}
+    monkeypatch.setattr(rr, "_round_records", lambda b: records)
+    assert rr._open_covered(str(path), budget, state, None) == set()
+    monkeypatch.setattr(rr, "_round_records", lambda b: None)
+    assert rr._open_covered(str(path), budget, state, None) == {"c1", "c2"}

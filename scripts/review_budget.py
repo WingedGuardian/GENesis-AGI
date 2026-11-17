@@ -112,6 +112,7 @@ HOOK_SURFACE_FILES = frozenset(
         "scripts/review_findings.py",
         "scripts/review_reflection.py",
         "scripts/review_late.py",
+        "scripts/review_past_terminal.py",
         "scripts/review_deadline.py",
         "scripts/external_review.py",
         # The issue premise gate: an Action script that hooks/issue_premise_gate.py
