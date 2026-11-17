@@ -43,6 +43,13 @@ of the offline continuation design supplies neither. An explicit read-only
 `--study-root` selects an exact relocated copy; it does not rewrite external
 ancestor paths or grant execution there.
 
+For an explicitly marked `deepseek_native_v1` study, also read
+`docs/reference/qualification-native.md`. Native acquisition uses only the
+bounded version-3 singleton path with zero replacements. It records raw native
+usage and explicitly calculated tariff intervals; those amounts are not
+provider-reported charges. Keep native invoice cost unobserved and retain all
+old receipt liabilities under their original authority.
+
 ## Freeze the exact paid decision
 
 Count every planned case, model and repetition. If sampling, freeze case IDs and class strata before observing model results; no automatic resampling or expansion after a close result. An incumbent sample is a baseline, not full requalification.
@@ -51,15 +58,15 @@ Compute conditional input/output costs from the actual rendered messages, curren
 
 Independently recompute each request allocation from the tokenizer artifacts, raw prices, actual wire messages and output caps, stated framing assumptions, margin and currency rounding. Summing the builder's saved allocations is not an independent arithmetic check. Include unresolved liabilities from previous campaigns in the stated total target without treating them as zero or silently clearing them.
 
-Freeze the gateway `model`, selected `backend_model` and generation `receipt_model` separately when the provider uses different namespaces. Use independent endpoint/receipt evidence for exact IDs; state any unobserved receipt expectation and fail closed if it disagrees. Do not strip date suffixes or choose aliases from a candidate's answer. Preserve raw identities when deriving a canonical accounting model.
+For OpenRouter, freeze the gateway `model`, selected `backend_model` and generation `receipt_model` separately when the provider uses different namespaces. Use independent endpoint/receipt evidence for exact IDs; state any unobserved receipt expectation and fail closed if it disagrees. Do not strip date suffixes or choose aliases from a candidate's answer. Preserve raw identities when deriving a canonical accounting model.
 
 When no authorized fingerprint exists, obtain narrow local key-identification permission before selecting/reading/hashing the existing key. This permission includes no HTTP or spending. Then freeze the complete plan and obtain actual paid-use approval bound to its canonical hash and exact request-count scope. Design approval, corpus approval and synthetic fixtures cannot supply that consent. Changes to the bound plan require the corresponding new decision.
 
 ## Acquire once and preserve uncertainty
 
-Use the existing operating controller, actual delegate and exact serialized-request checks. Keep both campaigns in an isolated process with one inference in flight. Preserve dispatches, observations, answers, generation IDs, receipts and incidents before any subsequent request. Stop the selected population on unresolved or contradictory evidence or an above-allocation charge.
+Use the matching existing controller, actual delegate and exact serialized-request checks. Keep the selected population in an isolated process with one inference in flight. Preserve dispatches, observations, answers, generation IDs, receipts and incidents before any subsequent request. Stop the selected population on unresolved or contradictory evidence or an above-allocation charge.
 
-Use a finite replacement only under the exact newly approved bounded plan's
+For OpenRouter, use a finite replacement only under the exact newly approved bounded plan's
 complete upstream-pool rejection predicate, per-coordinate and total caps, and
 cooldown. Every replacement owns a new physical journal and reservation. Client
 retries, fallback, timeout/partial-output recovery and replacements for bad grades

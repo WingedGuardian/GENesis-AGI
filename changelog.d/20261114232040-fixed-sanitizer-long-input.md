@@ -1,0 +1,1 @@
+- Contribution checks reject oversized diffs before scanning and avoid slow email searches on long non-email tokens in diffs and prose.

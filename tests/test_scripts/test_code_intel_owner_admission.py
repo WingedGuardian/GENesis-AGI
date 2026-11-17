@@ -117,7 +117,8 @@ def runtime_case(queue, tmp_path, monkeypatch):
     streams = []
 
     @contextmanager
-    def verified(path):
+    def verified(path, expected_build):
+        assert expected_build == config['build']
         # Pin verification itself has separate tests; this fixture never needs
         # the installed provider and permits no provider/version invocation.
         with open('/dev/null', 'rb') as stream:

@@ -203,7 +203,7 @@ class Controller:
                     answer = lineage.eligible_row(state, identity, self.study.manifests[alias])
                     if answer is None:
                         raise Incomplete("study_answer_unverified")
-                    secret = pinned.credential("shared_existing")
+                    secret = adapter.profile.credential("shared_existing")
                     if hashlib.sha256(secret.encode()).hexdigest() != self.plan["credential_fingerprint"]:
                         raise Incomplete("study_credential_changed")
                     entry["safe"] = True
