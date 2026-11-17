@@ -218,7 +218,9 @@ def test_builder_launch_fails_closed_on_anything_else(config_dirs, section):
 def test_builder_launch_never_arms_on_an_off_or_degraded_mode(config_dirs, monkeypatch):
     _, overlay = config_dirs
     overlay.write_text("mode: 'off'\nbuilder_launch:\n  enabled: true\n")
-    assert bc.builder_launch_armed() == (False, "board mode is off")
+    armed, why = bc.builder_launch_armed()
+    assert armed is False and why.startswith("board mode is off")
+    assert "builder_launch.enabled: false" in why  # the lasting disarm
     overlay.write_text("mode: 'LIVE'\nbuilder_launch:\n  enabled: true\n")
     armed, reason = bc.builder_launch_armed()
     assert armed is False and "invalid" in reason

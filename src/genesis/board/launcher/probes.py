@@ -92,11 +92,17 @@ async def tmux_sessions() -> dict[str, str | None]:
             sessions[name] = line.split("=", 1)[1]
         elif "unknown variable" in line or line == f"-{_KEY_VAR}":
             sessions[name] = None
-        elif "can't find session" in line:
-            continue
+        elif "can't find session" in line or _no_server(line):
+            continue  # it ended (the last one takes the server with it)
         else:
             raise RuntimeError(f"tmux show-environment -t {name} failed (rc={rc}): {line[:200]}")
     return sessions
+
+
+def _no_server(out: str) -> bool:
+    return "no server running" in out or (
+        "error connecting" in out and "No such file or directory" in out
+    )
 
 
 async def session_issues(sessions: dict[str, str | None]) -> dict[str, int | None]:
@@ -116,11 +122,25 @@ async def session_issues(sessions: dict[str, str | None]) -> dict[str, int | Non
             out[name] = int(value) if value.isdigit() else None
         elif "unknown variable" in line or line == f"-{_ISSUE_VAR}":
             out[name] = None
-        elif "can't find session" in line:
+        elif "can't find session" in line or _no_server(line):
             continue
         else:
             raise RuntimeError(f"tmux show-environment -t {name} failed (rc={rc}): {line[:200]}")
     return out
+
+
+async def door_would_refuse(existing: int) -> bool:
+    """Whether the slot door's capacity gate would refuse a new session now, with
+    *existing* cc-N sessions: the door's own decision (``genesis.cc.session_cap``
+    prints ALLOW, RECLAIM or DENY first). A failed read is False, so the door
+    itself decides on the next attempt."""
+    rc, out = await _exec(
+        [sys.executable, "-m", "genesis.cc.session_cap", "--existing", str(existing)],
+        timeout=LOCAL_TIMEOUT_S,
+        cwd=str(_repo_root()),
+    )
+    lines = out.strip().splitlines()
+    return rc == 0 and bool(lines) and lines[0].strip() == "DENY"
 
 
 async def premise_rc(issue: int, repo: str) -> int:

@@ -21,8 +21,9 @@ it on every Claude Code child, and stdio MCP servers inherit it:
 - ``CLAUDECODE``: set by Claude Code in the shells and MCP servers it starts.
 - ``CODEX_THREAD_ID``: set by Codex in the shells it runs commands in (not in
   its MCP servers, which get a filtered environment).
-- ``GENESIS_BUILDER_KEY``: set by ``scripts/cc-slot.sh launch`` in a builder
-  slot the board launcher started (the Build move's key). Read into
+- ``GENESIS_BUILDER_KEY``: set by ``scripts/cc-slot.sh launch`` (its launch
+  mode lands in #4700) in a builder slot the board launcher started (the Build
+  move's key). Read into
   :attr:`CallerContext.builder_key`; the builder guard keys on it.
 
 The last two feed :func:`client_kind`, a label for records, never a permission.

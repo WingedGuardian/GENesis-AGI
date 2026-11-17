@@ -19,8 +19,9 @@ real Status change and nothing else, see the reconciler), the launcher:
    each new reason reaches the owner once): a builder already running, low free
    memory, a login that expires soon or cannot be read, the prompt template,
    slot script or builder guard missing. After the slot door refused (a slot
-   taken, the box at its session cap) it retries only once the set of tmux
-   sessions has changed, so a long wait writes nothing;
+   taken, the box at its session cap) it asks the door's own capacity decision
+   each pass and retries only once that would admit, so a long wait writes
+   nothing;
 5. REFUSES (``launch_refused``, final for the move) on a fact about the issue
    or the move: not an issue in the tracker repo, missing, closed, by an
    author outside OWNER / MEMBER / COLLABORATOR, edited after the move,
@@ -81,6 +82,7 @@ from genesis.board.launcher.probes import (  # noqa: E402
     _exec,  # noqa: F401  (re-exported for other board modules)
     _guard_wired,
     _matcher_covers_bash,  # noqa: F401  (re-exported for other board modules)
+    door_would_refuse,
     login_expiry,
     mem_available_kb,
     premise_rc,
@@ -252,6 +254,13 @@ async def _enabled_at(tick: _Tick, armed: bool) -> datetime | None:
         mark = f"disabled@{tick.iso}"
         await tick.event("launcher_disabled", key=mark, change_key=mark, issue=None)
     return _parse(latest["created_at"]) if armed else None
+
+
+async def _record_disarm(tick: _Tick) -> None:
+    """A disarm seen mid-pass is recorded at once, so a re-arm before the next
+    tick starts a new enable cutoff (a move made while disarmed never launches)."""
+    mark = f"disabled@{tick.iso}"
+    await tick.event("launcher_disabled", key=mark, change_key=mark, issue=None)
 
 
 def _build_cards(items: list[dict]) -> list[dict]:
@@ -485,14 +494,11 @@ async def _settle(tick: _Tick, card: dict, history: list[dict], sessions: dict) 
     return None
 
 
-def _door_refused_unchanged(history: list[dict], key: str, sessions: dict) -> bool:
-    """True while the slot door's last refusal of this move still stands: the
-    tmux session set is the one it refused against."""
+def _door_refused(history: list[dict], key: str) -> bool:
+    """True when this move's last attempt was a slot-door refusal (exit 75)."""
     for e in _of_key(history, key, "launch_failed", "builder_launched"):
         detail = e.get("detail") or {}
-        if detail.get("strike") is False and "sessions" in detail:
-            return sorted(sessions) == detail["sessions"]
-        return False
+        return detail.get("strike") is False and "sessions" in detail
     return False
 
 
@@ -533,7 +539,12 @@ async def _one(tick: _Tick, card: dict, sessions: dict, issues: dict, busy: int)
             builder=live_for_issue[0],
         )
         return False
-    if _door_refused_unchanged(history, key, sessions):
+    # After a door refusal, ask the door's own capacity decision live and wait
+    # quietly (no rows) while it would still refuse: each retry writes a gate
+    # row and events, and a stored snapshot of the sessions goes stale.
+    if _door_refused(history, key) and await door_would_refuse(
+        sum(1 for n in sessions if _SLOT_RE.match(n))
+    ):
         tick.out["held"] += 1
         return False
 
@@ -731,6 +742,7 @@ async def _launch(tick: _Tick, card: dict, facts: dict, sessions: dict, history)
     if not board_config.builder_launch_armed()[0]:
         tick.out["skipped"] += 1
         tick.out["disarmed"] = True
+        await _record_disarm(tick)
         return False
 
     # The gate: one approval row per attempt that runs, resolved as the move's
@@ -803,6 +815,7 @@ async def _launch(tick: _Tick, card: dict, facts: dict, sessions: dict, history)
         # as a failure that is not a strike.
         tick.out["skipped"] += 1
         tick.out["disarmed"] = True
+        await _record_disarm(tick)
         await tick.event(
             "launch_failed",
             key=key,

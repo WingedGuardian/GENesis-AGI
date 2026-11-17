@@ -131,6 +131,13 @@ def builder_launch_armed() -> tuple[bool, str]:
     with the literal boolean, on a board whose configured ``mode`` is valid as
     written (a degraded mode never arms) and is not ``off``. ``propose_only``
     arms too: a launch writes nothing to GitHub. Every other value fails closed.
+
+    Only ``builder_launch.enabled: false`` or the kill switch DISARMS: a session
+    cannot change either (``settings_update`` refuses the ``builder_launch``
+    key). ``mode: off`` is not a disarm a session cannot undo, since a session
+    may set the board mode back to ``propose_only``. While the mode is off each
+    pass records ``launcher_disabled``, so setting it back starts a new enable
+    cutoff: cards already in Build are listed to the owner and never launch.
     """
     if _kill_switch_on():
         return False, "board kill switch set"
@@ -140,7 +147,7 @@ def builder_launch_armed() -> tuple[bool, str]:
         return False, "builder_launch.enabled is not true"
     mode = effective_mode()
     if mode == "off":
-        return False, "board mode is off"
+        return False, "board mode is off (not a lasting disarm: use builder_launch.enabled: false)"
     if cfg.get("mode") != mode:
         return False, f"board mode {cfg.get('mode')!r} is invalid (degraded to {mode})"
     return True, "armed"

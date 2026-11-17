@@ -123,6 +123,8 @@ class World:
         self.stopped: list[str] = []
         self.unit_default = "gone"
         self.units_unreadable = False
+        #: What the slot door's capacity gate would answer now (True: DENY).
+        self.door_full = False
         #: The issue the slot door pinned on each session (GENESIS_BUILDER_ISSUE).
         self.session_issue: dict[str, int] = {}
         self.settings = dict(SETTINGS)
@@ -156,6 +158,9 @@ class World:
     async def stop_unit(self, unit):
         self.stopped.append(unit)
 
+    async def door_would_refuse(self, existing):
+        return self.door_full
+
     async def session_issues(self, sessions):
         return {n: self.session_issue.get(n) for n, k in sessions.items() if k}
 
@@ -182,6 +187,7 @@ def world(tmp_path, monkeypatch):
         "stop_unit",
         "starting_units",
         "session_issues",
+        "door_would_refuse",
     ):
         monkeypatch.setattr(launcher, name, getattr(w, name))
     monkeypatch.setattr(launcher, "mem_available_kb", lambda: w.mem_kb)
@@ -540,21 +546,23 @@ async def test_a_builder_whose_issue_has_an_open_pr_frees_its_place(db, world):
     assert world.launches[1][world.launches[1].index("--slot") + 1] == "10"
 
 
-async def test_a_door_refusal_waits_quietly_until_the_slots_change(db, world):
-    """Exit 75 (a slot taken, the box at its cap) is not a strike, and while
-    the tmux sessions stay as they were it writes nothing and runs no gate."""
+async def test_a_door_refusal_waits_quietly_while_the_door_would_refuse(db, world):
+    """Exit 75 (a slot taken, the box at its cap) is not a strike, and while the
+    door's own capacity decision would still refuse it writes nothing and runs
+    no gate; once it would admit, the move is tried again."""
     await _arm(db)
     world.launch_rc = launcher.RC_REFUSED
     _, out = await _run(db, [_card()])
     assert out["held"] == 1
     [failed] = await _events(db, "launch_failed")
     assert failed["detail"]["strike"] is False
+    world.door_full = True
     for n in range(1, 6):
         _, out = await _run(db, [_card()], now=_later(n))
         assert out["held"] == 1
     assert len(world.launches) == 1 and len(await _approvals(db)) == 1
     assert len(await _events(db)) == 4  # enabled, launching, failed, queued
-    world.sessions["cc-2"] = None  # the owner opened or closed a session
+    world.door_full = False  # a session ended: the door would admit again
     world.launch_rc = 0
     _, out = await _run(db, [_card()], now=_later(7))
     assert out["launched"] == 1 and len(await _approvals(db)) == 2
@@ -685,6 +693,8 @@ async def test_an_unexpected_error_is_reported_not_raised(db, world, monkeypatch
             {"cc-1": None, "cc-9": "k@1"},
         ),
         ([(0, "cc-1\n"), (1, "can't find session: =cc-1")], {}),
+        # The last session ended mid-read and took the server with it.
+        ([(0, "cc-1\n"), (1, "no server running on /tmp/tmux-1000/default")], {}),
     ],
 )
 async def test_tmux_sessions_reads_keys(monkeypatch, replies, expected):
@@ -1105,6 +1115,8 @@ async def test_disarming_during_the_checks_cancels_the_launch(db, world, monkeyp
     monkeypatch.setattr(launcher, "premise_rc", premise_then_disarm)
     _, out = await _run(db, [_card()])
     assert world.launches == [] and await _approvals(db) == [] and out["launched"] == 0
+    # Recorded at once: a re-arm before the next tick starts a new cutoff.
+    assert len(await _events(db, "launcher_disabled")) == 1
 
 
 async def test_disarming_after_the_gate_closes_the_attempt_without_a_strike(db, world, monkeypatch):
@@ -1333,3 +1345,24 @@ async def test_a_repeated_strike_row_neither_counts_nor_tells_the_owner_twice(db
             tick, {**card, "key": _key(card), "number": 7, "item": "I1"}, 3, "rc 1", hist, 9
         )
     assert tick.out["failed"] == 1
+
+
+@pytest.mark.parametrize(
+    ("rc", "out", "expected"),
+    [
+        (0, "DENY\nSession cap reached\ncount\n", True),
+        (0, "ALLOW\n\nok\n", False),
+        (0, "RECLAIM\nreclaim\nidle\n", False),
+        (1, "Traceback", False),  # a failed read lets the door decide
+    ],
+)
+async def test_door_would_refuse_reads_the_doors_own_decision(monkeypatch, rc, out, expected):
+    calls = []
+
+    async def fake_exec(argv, **kw):
+        calls.append(argv)
+        return rc, out
+
+    monkeypatch.setattr(probes, "_exec", fake_exec)
+    assert await probes.door_would_refuse(3) is expected
+    assert calls[0][1:] == ["-m", "genesis.cc.session_cap", "--existing", "3"]

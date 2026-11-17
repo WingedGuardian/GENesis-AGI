@@ -6189,11 +6189,16 @@ dashboard tab are follow-on work. The shipped mode is `off`.
   missing or stopped, so the manifest names that cause instead of the board.
 - **Builder launcher** (`board/launcher/`, spec E ticket E3a). Armed only by
   `builder_launch: {enabled: true}` (the literal) in `board.local.yaml`, on a
-  valid mode other than `off`; `settings_update` refuses the key. The levers
+  valid mode other than `off`; `settings_update` refuses the key. Only
+  `enabled: false`, the board's own `enabled: false` or the kill switch
+  disarms it for good: a session can set `mode: off` back to `propose_only`.
+  Each pass with the mode off records `launcher_disabled`, so setting it back
+  starts a new cutoff (cards already in Build are listed, never launched). The levers
   beside it (`capacity` 1, `min_free_gb` 4, `login_margin_hours` 6,
   `first_slot` 9) are range-checked (`config.builder_launch_settings`).
   - Arming changes are recorded (`launcher_enabled` / `launcher_disabled`); a
-    move not later than the latest enable never launches, and the cards in
+    move not later than the latest enable never launches (a disarm seen
+    mid-pass is recorded at once), and the cards in
     Build at enable are listed to the owner once.
   - For each card in Build in the tick's read, keyed `k = item@<Status
     updatedAt>`: absorbs a move for an issue that already has a live builder;
@@ -6201,7 +6206,8 @@ dashboard tab are follow-on work. The shipped mode is `off`.
     capacity, free memory, a login expiring within the margin or unreadable,
     a missing prompt template, slot script or builder guard
     (`scripts/hooks/builder_guard.py` named in `.claude/settings.json`), or a
-    slot door refusal (retried only once the tmux session set changes);
+    slot door refusal (retried only once the door's own capacity decision,
+    asked live, would admit);
     REFUSES (`launch_refused`, final for k) a card that is not an open issue
     in the tracker repo, an author outside OWNER / MEMBER / COLLABORATOR, an
     edit after the move, incomplete premise checks
@@ -6221,10 +6227,11 @@ dashboard tab are follow-on work. The shipped mode is `off`.
     restart or not; an attempt a restart interrupted is settled from tmux and
     the unit's state.
   - Run state is derived, never read from events: a place is a live tmux
-    session carrying a key whose card (same board read) has no open closing
-    PR, or a running `genesis-builder-*` unit (`systemctl list-units`); a
-    builder whose card left the board holds its place. The host reads live in
-    `board/launcher/probes.py`.
+    session carrying a key whose issue (`GENESIS_BUILDER_ISSUE`, pinned on that
+    session by the slot door) is neither CLOSED nor has an open closing PR, or a
+    running `genesis-builder-*` unit (`systemctl list-units`). A session with
+    no pinned issue holds its place; an issue whose card left the board is read
+    live. The host reads live in `board/launcher/probes.py`.
 - **`board_status`** reads the stored heartbeats only, never GitHub: the newest
   pulse (alive, mode, error) and the newest SUCCESSFUL read with its age,
   including that tick's `writes` block (None on a summary from before #4400).
