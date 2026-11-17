@@ -509,3 +509,15 @@ class _FixedNow(datetime):
     @classmethod
     def now(cls, tz=None):
         return _after(6)
+
+
+def test_the_held_messages_name_an_unreadable_settle_time_and_an_unkeyed_finding():
+    untimed = pt.RoundRecord(f"{5:040x}", 5, T0 + timedelta(hours=8), ((None, False, "c5"),))
+    records = _records(*[_rec(i) for i in range(1, 5)], untimed)
+    yes = _reflection(how="file issue=#12", held="yes")
+    found = _problems(yes, untimed, records, at=_after(5))
+    assert any("settle time is unreadable" in p for p in found) and not any("?" in p for p in found)
+    keyless = pt.RoundRecord(
+        f"{5:040x}", 5, T0 + timedelta(hours=8), ((T0 + timedelta(hours=8), True, None),)
+    )
+    assert keyless.floor(_after(5)) == (True, ["an unkeyed finding"])

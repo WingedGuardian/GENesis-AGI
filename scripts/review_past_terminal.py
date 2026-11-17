@@ -98,7 +98,7 @@ class RoundRecord:
         an untimed one counts at every time. The one floor reading every rule
         shares."""
         seen = [(b, k) for when, b, k in self.findings if when is None or when <= at]
-        hit = sorted(str(k) for b, k in seen if b is True)
+        hit = sorted("an unkeyed finding" if k is None else str(k) for b, k in seen if b is True)
         if hit:
             return True, hit
         return (None if any(b is None for b, _ in seen) else False), []
@@ -345,11 +345,15 @@ def problems(
                 "'Prediction-held: yes' cannot be verified (a finding's level is unreadable); "
                 "write 'no'"
             )
-        elif settle is None or made_at < settle:
-            when = settle.isoformat()[:16] if settle else "?"
+        elif settle is None:
             found.append(
-                f"'Prediction-held: yes' needs the round settled: wait until {when} UTC, "
-                "or write 'no'"
+                "'Prediction-held: yes' cannot be verified (the round's settle time is "
+                "unreadable); write 'no'"
+            )
+        elif made_at < settle:
+            found.append(
+                "'Prediction-held: yes' needs the round settled: wait until "
+                f"{settle.isoformat()[:16]} UTC, or write 'no'"
             )
     if level is False and fix_now & record.keys and not sent_back:
         found.append(
