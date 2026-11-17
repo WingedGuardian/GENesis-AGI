@@ -1,1 +1,0 @@
-- Recon can discover the latest stable release even when a burst of prereleases hides it from the recent release window.

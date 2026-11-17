@@ -13,6 +13,78 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **`scripts/worktree_lifecycle.py --compact-trash` shrinks old unmerged worktree archives without losing anything.** An unmerged archive older than 30 days (`--compact-after-days N`) that held no uncommitted changes, and whose files exactly match its recorded commit, is replaced by three things: a `refs/archived/` pin of that commit, a small git bundle of the commits it adds beyond the default branch, and a `<entry>.compacted.json` stub. Its tarball and locked registration are removed. Anything else keeps its full archive and logs why: extra untracked or ignored files, a tracked file deleted without a commit, staged changes, a reflog commit nothing else reaches, an unexpected registration. Each run re-creates any pin that has gone missing, from the bundle if git has already collected the commit, and exits 2 if one cannot be repaired. `--recover` recreates a compacted worktree detached at the pinned commit, and `--list-trash` shows it as `pinned` or `PIN MISSING`. Manual only for now; `--dry-run` changes nothing, and `GENESIS_WORKTREE_TRASH_COMPACTION=0` disables it.
+
+- Each `[Concurrent]` line a session sees for its peers now says where that peer is working: `in <worktree> on <branch>`, plus how many other worktrees it holds. It comes from the worktree claim a session takes on its first edit in a worktree, so a session can tell which worktrees belong to someone else before it touches one.
+
+- Monitor releases of adopted code intelligence, browser, web fetching and lint tools through recon's existing release intake.
+
+- **Build sessions now read a reuse-first ruleset before writing code.** The
+  `build-session` skill vendors the Ponytail ruleset (MIT): before new code,
+  check whether the change needs to exist, then whether the repo, the standard
+  library or an installed dependency already does it. A house delta keeps the
+  repo's own bars: GROUNDWORK code stays, named seams are not cut, the test
+  rules stay in full, and a new dependency still goes through `evaluate`.
+
+- **The Sentinel proposes the Codex MCP stop before memory runs out.** A new
+  health alarm, `infra:codex_mcp_held`, fires when MCP servers held by a shared
+  Codex app-server reach `codex_mcp_stop.propose_at_mb` (default 4096 MB) by the
+  stop tool's own scan, and wakes the Sentinel to propose `codex_mcp_stop`; the
+  owner still approves every stop. Before this, the proposal waited for the
+  container-memory alarm at 85%, when capped jobs were already refused. A
+  dispatcher rule comes with it: a confirmed, stronger alarm (a higher tier, or
+  a CRITICAL of the same tier) takes over an approval park held only by WARNING
+  alarms, so an unanswered early proposal never blocks an outage. A declined
+  stop is quiet for 24 h, as every declined Sentinel request already is.
+- **`codex_mcp_stop` now finds the Genesis MCP servers it was built to stop.**
+  It identified an MCP server by pipes on stdin and stdout, but the MCP Python
+  SDK moves the protocol stream to private descriptors and points stdin at
+  /dev/null, so every Genesis Python server was skipped (on a live daemon, 5 of
+  22 groups and about 1,200 of 3,800 MB were found). A target must now read a
+  pipe the app-server writes and write one it reads, on any descriptor, and no
+  other child of the app-server may hold either pipe; while a child's
+  descriptors cannot be read, no sibling qualifies. A chat command Codex
+  starts in pipe mode, whose stdin is /dev/null, still never qualifies.
+- **The build-up also comes from terminal Codex sessions.** On Codex 0.169 a
+  terminal `codex` uses the shared app-server, and each subagent it spawns
+  leaves a full set of MCP servers there. The tool's output and the Sentinel
+  prompt no longer name terminal `codex` as a workaround.
+- **A take-over never drops the owner's answer.** If cancelling the parked
+  request fails because it is no longer pending, the park is kept; and a
+  take-over happens only when the alarm the dispatch would lead with is the
+  challenger and its dispatch would really start: clear of backoff, the boot
+  grace, a heavy workload, a running session and the escalation limit.
+- **The alarm's scan cache keeps its last reading when a refresh fails**, so a
+  read error never looks like the groups going away, and overlapping callers
+  share one scan.
+
+- **The Sentinel proposes stopping a single runaway process.** A new health
+  alarm, `infra:process_memory_high` (WARNING, tier 2), fires when one of the
+  user's processes outside a systemd service holds `process_stop.propose_at_mb`
+  (default 6144 MB) of RAM plus swap, and wakes the Sentinel to propose the new
+  `python -m genesis.sentinel.process_stop`. The tool is dry-run by default.
+  With `--execute --only PID:STARTTIME,...`, the exact line its dry-run prints,
+  run only inside an action the owner approves, it stops only those processes
+  that are still over the line (SIGTERM, then SIGKILL, via a pidfd), so an
+  approval never covers a process that crossed the line afterwards. Services, pid 1 and the tool's own ancestors are never targets.
+  The lever is `process_stop.mode` in `config/sentinel.yaml`.
+
+- Explicit captured `accept-retry` validates a clean settled supervised indexing
+  trial and records immutable provider acceptance without launching work or
+  changing attempt debt, pending requests, settlement or physical exclusion.
+  Retained older provider evidence remains recoverable; newer hazards re-hold
+  admission. Automatic readiness and production disablement remain unchanged.
+
+- **An issue that answers `Stated: nowhere` is now labelled `proposal`.** Nothing states the behaviour it asks for, so it is a proposal rather than a fix: it cannot go to Devin (`devin-ready` is removed with a note), and the label clears when an edit cites the decision that settles it.
+
+- **Qualification evidence can retain calculated native token expenses.** Exact
+  frozen-tariff intervals remain separate from provider receipt totals, with
+  unresolved reservations and legacy billing contradictions preserved. Native
+  model execution requires the dependent transport integration.
+
+- Add an explicit first-party DeepSeek qualification profile with exact wire checks,
+  raw native usage, calculated-cost evidence and bounded study integration.
+
 - `scripts/delivery_marker.py compose --second-reader` runs the command an install names as `delivery.second_reader_cmd` in genesis.yaml, which scores whether the PR diff implements the issue's quoted fix. The score goes to `$GENESIS_HOME/delivery/shadow.jsonl` only: it is not printed, not put in the marker and not read by any gate. It runs only for a PR whose basis is a public issue, and nothing runs when the key is unset.
 
 - Genesis now records whether each tool call in a session succeeded or failed, for every tool rather than only file edits, so recurring failures can be counted. Failure text is scrubbed of credentials before it is stored; rows are kept for 180 days and failure text for 90.
@@ -274,6 +346,20 @@ the first verified answer regardless of its grade.
 
 ### Changed
 
+- **Sessions now name a model on every subagent dispatch, chosen by fit.** Recon
+  and mechanical work runs on the fast tier; coding, review and anything whose
+  output drives a decision runs on the workhorse tier. Nothing above the
+  workhorse tier runs as a subagent without the user's approval for that
+  dispatch. The rule is in `CLAUDE.md`, under "Use subagents".
+
+- Select managed Codebase builds through reviewed release records while retaining exact configured-binary checks, captured source binding and immutable settings. The initially supported release remains v0.11.0; this does not upgrade or enable existing installations.
+
+- The lesson builder now adds at most 7 new lessons per source session in any 24 hours, instead of 7 per two-hour extraction cycle, so one long session can no longer flood the lesson store. A new `lesson_builder` setting turns it off, or runs it in shadow: the builder runs as usual but writes the lessons it would have stored to `~/.genesis/output/lesson_builder_shadow.jsonl` instead of storing them.
+
+- A new credential reference is stored under an opaque key (`cred-` and 12 hex characters) and found again by its full name, compared without regard to case or spacing, so its key never spells its name or value. Saving under the same name updates that entry, a rotation keeps the name it was saved under, and `reference_store(entry_key=...)` updates an entry by the key `reference_lookup` returns (an unknown key is refused). Several saves of a new name at once give one entry, and every writer lands. Existing credentials are found by name as before; of two old names that differ only in case, the earlier one is the one a save by name updates, and both stay stored. The dashboard list and `reference_lookup` show the name, and lookup results carry the key separately.
+
+- **Plans and new issues now answer the nine-item premise form.** The feature-request form and the PR template carry it, prefilled with its labels: what is observed, what should happen and where that is stated, the cost, what was searched, the acceptance and the wrong fix to avoid, then the mechanism, alternatives, evidence and shape. A plan, and an issue handed to Devin, owe all nine; an issue owes the first five. Issues filed before 2026-11-22 keep the old six-question rule, and a six-question section that no longer counts is told how its answers map across.
+
 - The graph census (schema 3) covers the other graph-traversal producers it can see, not only memory servers: ambient workers get the same code-source proof, the census host gets a row of its own, other python processes on the main venv are checked for code history and database, replay is listed as excluded, and another stack running beside the host is dirty. A census-level check covers the code history of every commit the checkout held in the last two and a half hours, so processes that started and ended between two censuses are covered for history, though not for code source or kill switch.
 
 - **The commit gate now requires a round reflection before a review round's fixes.**
@@ -496,6 +582,38 @@ the first verified answer regardless of its grade.
 
 
 ### Fixed
+
+- Memory stores requesting supersession now report whether both the saved correction and its supersession completed. Incomplete mirror or link work returns the saved id and a repair call using full memory ids; ordinary stores still return a bare id.
+
+- The MCP description-budget guard independently enforces raw UTF-16 length and retains NFKC as a conservative additional budget, so normalization contractions cannot hide descriptions the client truncates.
+
+- **The provider toggle refuses `{"enabled": null}`.** An explicit null passed the boolean check and reached the registry as "no intent", which runs the state-dependent toggle, so a malformed enable request could disable a healthy provider. A request that names `enabled` must now give a boolean, or it gets a 400 and nothing changes. A request with no `enabled` key keeps the old no-intent behaviour.
+
+- **A scheduled backup now waits for memory before rebuilding its database on disk.** Each backup proves its SQLite copy restores by rebuilding the database from it. That runs in memory when there is room and on disk otherwise, and the on-disk rebuild writes a full copy of the database in a few minutes, enough to stall a shared or spinning disk and every machine on it. The scheduled backup (and Run-Now) now first waits for memory, re-checking every 10 minutes for up to an hour, and logs each check; the backup then runs either way, and if memory never frees it still verifies on disk. The backup unit's start timeout grows from 2 to 3 hours to cover the wait, and the "backup overdue" alert now allows 9 hours instead of 8. The pre-update backup `update.sh` runs does not wait. Tune with `GENESIS_BACKUP_VERIFY_WAIT_INTERVAL_S` and `GENESIS_BACKUP_VERIFY_WAIT_MARGIN_PCT`; the one-hour cap is set in the unit, and `GENESIS_BACKUP_VERIFY_WAIT_MAX_S=0` in secrets.env turns the wait off. Takes effect after `update.sh` re-renders the unit.
+
+- Recon can discover the latest stable release even when a burst of prereleases hides it from the recent release window.
+
+- Contribution checks reject oversized diffs before scanning and avoid slow email searches on long non-email tokens in diffs and prose.
+
+- **The Guardian's RAM alert pages a tier change once instead of on every
+  crossing.** A reading hovering at a tier line, a dip and return to a tier
+  already paged, and a one-tick failed container read each used to send a page
+  (on one live day, 30 of the Guardian's 32 messages). A tier is now left only
+  `memory_tiers.exit_margin_pct` (default 5) points below its line, a blind
+  axis holds its last tier, and a page goes out against the highest tier paged
+  since the last recovery, for one re-alert window. Sustained reminders, rises
+  and recoveries still page; replaying that day's readings gives 8 pages.
+
+- Correct the Codex0.166.0 native budget qualification's execution-directory
+  assertion and deliberate wrong-target control. Check explicit target identity
+  across a different shell workdir and verify both repositories' scratch effects.
+  Runtime target validation and deadlines are unchanged.
+
+- Outreach no longer drops a work-board builder-launch alert because an earlier alert for a different move had the same text: those alerts are told apart by their topic.
+
+- The mutation sweep kills pytest's process group before reaping its exited leader, preventing descendants from acting in the gap.
+
+- **New vault card references no longer contain a 12-digit run.** All-digit tails are retried so a reference cannot put a card-number-shaped run in audit rows or approval messages.
 
 - Holdout runner: a run interrupted while it creates a worktree now stops git with SIGTERM, so git removes its own half-made worktree, and uses SIGKILL only on a git that is still running after 10 seconds. Killing git outright could leave a locked worktree registration that could not be removed. The cleanup also unlocks the half-made worktree before removing it, so no locked registration survives however git was stopped. A Ctrl-C is now handled like SIGTERM and SIGHUP, and a second signal, a Ctrl-C or an error while stopping git no longer skips that cleanup.
 
@@ -970,6 +1088,8 @@ including unselected notes and hardlinks.
 
 
 ### Security
+
+- Update YouTube extraction and TLS impersonation dependencies, and require the fixed Python Brotli decoder for compressed responses.
 
 - Privacy scans preserve added content containing non-LF separators or text resembling patch headers, so those lines cannot disappear during diff parsing.
 
