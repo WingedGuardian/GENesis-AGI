@@ -171,6 +171,7 @@ async def _segment_shadow(
     max_procedures_per_session: int,
     whole_score: float,
     stored: int,
+    path: str = "cycle",
 ) -> None:
     """``segment: shadow`` (#4807): say what judging only the unjudged part would
     do, and move the progress marker as that rule would move it.
@@ -188,7 +189,9 @@ async def _segment_shadow(
 
     ``whole_score`` and ``stored`` (lessons the whole build kept this cycle, 0
     when it did not run) go on the line, so each line can be compared with what
-    the whole build did without joining other lines.
+    the whole build did without joining other lines. ``path`` says which
+    judged it: ``cycle`` (Stream 1) or ``drain`` (a queued rebuild, which builds
+    whatever the trigger, so its would_trigger is not a saved call).
     """
     from genesis.learning.procedural.build_segment import select_part
     from genesis.learning.procedural.lesson_builder_config import segment_mode
@@ -230,11 +233,11 @@ async def _segment_shadow(
         logger.info(
             "Lesson segment [shadow] for %s: entries=%d chars=%d context=%d "
             "context_chars=%d score=%.2f would_trigger=%s whole_score=%.2f "
-            "stored=%d reset=%s pending_tail=%d held_back=%d lever=%s marker=%s",
+            "stored=%d reset=%s pending_tail=%d held_back=%d lever=%s path=%s marker=%s",
             session_id, len(part.new), len(format_spine_for_judge(part.new)),
             len(part.context), len(format_spine_for_judge(part.context)), score,
             would_trigger, whole_score, stored, part.reset, part.pending_tail,
-            part.held_back, lever,
+            part.held_back, lever, path,
             "moved" if moved else f"held:{held}" if held else "unchanged",
         )
     except Exception:
@@ -1080,7 +1083,13 @@ async def _drain_procedure_rebuilds(
 
         processed += 1
         await queue.mark_processing(item_id)  # increments attempts
+        # The cc_sessions row id, for the progress marker; an item queued
+        # without one (none are today) only skips the shadow step.
+        row_id = payload.get("session_id")
         try:
+            marker_before = (
+                await _read_lesson_marker(db, row_id) if row_id else _MARKER_UNREAD
+            )
             # Offload the synchronous transcript read+parse off the event loop
             # (see the run_extraction_cycle call site) — a whole-file JSONL
             # parse must not wedge the loop from this background job.
@@ -1099,6 +1108,19 @@ async def _drain_procedure_rebuilds(
             await queue.mark_completed(item_id)
             summary["procedures_rebuilt"] = (
                 summary.get("procedures_rebuilt", 0) + len(stored_ids)
+            )
+            # The rebuild judged the session, as Stream 1's build does, so the
+            # marker moves as it would there. Without this a session with no new
+            # messages keeps a stale marker, and its next shadow line counts
+            # entries this rebuild already judged. After mark_completed, so the
+            # item's fate never depends on this observation step. The lever is
+            # live: the drain returns early otherwise (see its first check).
+            await _segment_shadow(
+                db, row_id, cc_session_id, spine,
+                marker=marker_before, transcript_path=transcript_path,
+                candidates=False, lever="live", cap_left=cap_left,
+                max_procedures_per_session=max_procedures_per_session,
+                whole_score=score, stored=len(stored_ids), path="drain",
             )
             if stored_ids:
                 logger.info(

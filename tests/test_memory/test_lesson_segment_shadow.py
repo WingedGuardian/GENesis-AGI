@@ -151,6 +151,7 @@ async def test_shadow_logs_one_line_moves_the_marker_and_leaves_the_build_alone(
     lines = _lines(caplog)
     assert len(lines) == 1
     assert "entries=3" in lines[0] and "pending_tail=1" in lines[0] and "marker=moved" in lines[0]
+    assert "path=cycle" in lines[0]
     assert await _marker(db) == "t3"  # the in-flight t4 waits
 
 
@@ -389,6 +390,46 @@ async def test_a_shadow_step_error_never_fails_the_build(db, tmp_path, monkeypat
     messages = [r.getMessage() for r in caplog.records]
     assert any("Lesson segment shadow failed" in m for m in messages)
     assert not any("Procedure builder failed" in m for m in messages)
+
+
+async def _drain(db, tmp_path):
+    await ej._drain_procedure_rebuilds(
+        db=db,
+        router=AsyncMock(),
+        transcript_dir=tmp_path,
+        summary={},
+        max_procedures_per_session=7,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_rebuild_that_succeeds_in_the_drain_moves_the_marker(
+    db, tmp_path, monkeypatch, caplog
+):
+    _setup(monkeypatch, builder=AsyncMock(side_effect=jm.ProcedureBuilderUnavailable("down")))
+    await _seed(db, tmp_path)
+    await _cycle(db, tmp_path)  # the build fails: held, and a rebuild is queued
+    assert await _marker(db) is None
+    builder = _setup(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="genesis.memory.extraction_job"):
+        await _drain(db, tmp_path)
+    assert len(builder.calls) == 1
+    (line,) = _lines(caplog)
+    assert "lever=live" in line and "path=drain" in line and "marker=moved" in line
+    assert await _marker(db) == "t3"
+
+
+@pytest.mark.asyncio
+async def test_a_rebuild_that_fails_in_the_drain_holds_the_marker(
+    db, tmp_path, monkeypatch, caplog
+):
+    _setup(monkeypatch, builder=AsyncMock(side_effect=jm.ProcedureBuilderUnavailable("down")))
+    await _seed(db, tmp_path)
+    await _cycle(db, tmp_path)
+    with caplog.at_level(logging.INFO, logger="genesis.memory.extraction_job"):
+        await _drain(db, tmp_path)
+    assert _lines(caplog) == []
+    assert await _marker(db) is None
 
 
 @pytest.mark.parametrize(

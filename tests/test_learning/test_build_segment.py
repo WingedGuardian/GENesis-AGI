@@ -155,3 +155,19 @@ def test_a_part_with_no_marker_able_entry_keeps_the_old_marker():
 def test_an_empty_spine():
     part = select_part([], None, budget_chars=BIG)
     assert part.new == [] and part.through_id is None and not part.reset
+
+
+def test_user_entries_never_count_as_the_one_entry_taken():
+    """A part of only user entries carries no id and could never move the marker,
+    so the oversized tool entry after them is still taken."""
+    spine = [_tool(1), _user(2), _user(3), _tool(4, args="x" * 500)]
+    part = select_part(spine, "t1", budget_chars=10)
+    assert _turns(part) == [2, 3, 4] and part.through_id == "t4"
+
+
+def test_an_id_less_tool_entry_never_counts_as_the_one_entry_taken():
+    """A tool entry without an id cannot carry the marker either, so the oversized
+    call after it is still taken and the marker advances."""
+    spine = [_tool(1), _user(2), _tool(3, tid=""), _tool(4, args="x" * 500)]
+    part = select_part(spine, "t1", budget_chars=10)
+    assert _turns(part) == [2, 3, 4] and part.through_id == "t4"

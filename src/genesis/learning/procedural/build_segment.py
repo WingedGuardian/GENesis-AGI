@@ -62,9 +62,9 @@ def select_part(
     """Cut ``spine`` after ``marker`` and fit the rest to ``budget_chars``.
 
     The budget covers the rendered context and the new entries together, so the
-    context is never cut to make room. At least one new entry is taken even when
-    it alone exceeds the budget, or one oversized call would hold the marker in
-    place forever.
+    context is never cut to make room. Entries are taken up to and including the
+    first tool entry with an id, even when that exceeds the budget, or one
+    oversized call would hold the marker in place forever.
     """
     start, reset = 0, False
     if marker is not None:
@@ -104,12 +104,16 @@ def select_part(
     left = budget_chars - (sum(_cost(e) for e in context) - 1 if context else 0)
 
     new: list[dict] = []
+    took_id = False
     for entry in spine[start:end]:
         cost = _cost(entry)
-        if new and cost > left:
+        # "At least one" means at least one entry that can carry the marker: a
+        # part of only user entries or id-less tool entries could never move it.
+        if took_id and cost > left:
             break
         new.append(entry)
         left -= cost
+        took_id = took_id or _tool_id(entry) is not None
     held_back = (end - start) - len(new)
 
     through_id = marker if not reset else None
