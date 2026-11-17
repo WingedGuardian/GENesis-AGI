@@ -860,8 +860,8 @@ reader recognizes coverage only from the exact selected trial's clean terminal,
 control and source identities; ordinary success cannot write that acceptance.
 Newer incidents and a changed or conflicted accepted trial hold the provider.
 Older covered incidents remain retained. Original physical/control obligations
-are never discharged by a provider acceptance watermark. Supervised retry and
-acceptance commands remain a separate contribution.
+are never discharged by a provider acceptance watermark. Explicit supervised
+retry and completed-trial acceptance use the captured runner described below.
 
 Retained cleanup/population/OOM bodies keep their existing safety interpretation
 and fresh original-kernel checks. Their presence alone does not hold a healthy
@@ -1186,14 +1186,53 @@ remain explicit safety evidence for supervised recovery.
 Changes to retained retry code participate in the existing server restart and
 deployment-validation inventory.
 
-Acceptance, strict cutover and native/production qualification remain separate
-gates. Automatic readiness stays negative; issuing or consuming consent does not
+Strict cutover and native/production qualification remain separate gates.
+Automatic readiness stays negative; issuing, consuming or accepting consent does not
 enable automatic retries. Metadata and selected-CLI scratch tests exercise real
 locks, SQL, commit refusal and lost replies with substituted manager/kernel
 observations and an inert owner. Separate sealed GitNexus tests exercise harmless
 provider-child success/failure and late-origin refusal. Retained-row compatibility
 tests construct prior execution facts and prove settlement/replay. These checks
 do not establish native containment or production indexing capacity.
+
+### Accept a completed supervised trial
+
+Through the captured runner's existing `queue` entry point, use
+`accept-retry --repo <canonical-main> --provider cbm --nonce <spent-nonce>
+--managed-config <settings> --evidence-reference <verification-reference>`
+after the exact selected trial has completed successfully and its separate
+settlement has retired the inflight pointer. GitNexus uses the same operation
+with `--provider gitnexus`. The reference must be nonempty, NUL-free and at most
+4096 UTF-8 bytes. This is an explicit metadata operation; it runs no provider.
+
+Acceptance rechecks the spent grant, original source, run mode and attempt debt,
+clean terminal/control/cleanup witnesses, current policy and current captured
+source. CBM configuration and executable observations remain inside the shared
+lifecycle lease; the observer becomes unusable when that lease closes. GitNexus
+reobserves its selected bytes and environment without acquiring a CBM lease.
+All original physical/control obligations are checked separately before the
+final evidence cutoff. No live collector runs after that cutoff.
+
+The operation publishes only the existing five acceptance fields. It neither
+settles accounting nor retires owners, edits pending/failed work, refunds debt
+or grants launch authority. Clean but unapplied trials and consumed trials with
+an inflight pointer refuse; run the separate existing reconciliation before
+retrying acceptance. Grant expiry or a boot change alone does not require a
+clean, settled trial to run again.
+
+An identical replay returns `already_accepted`; a first publication returns
+`accepted`. Both return `launch_authority=false`. Equal-watermark receipts are
+immutable, and a later acceptance cannot lower the watermark. A lost reply can
+therefore be recovered through the same metadata operation without resending
+work. Publication failure preserves the previous receipt and retained evidence.
+
+The watermark covers older known same-provider retained non-cleanup evidence.
+It does not erase that history or cover waiting, unknown, foreign, unbound,
+trial or newer evidence. Ordinary claim/reservation/registration/native-intent
+readers use the current drain's context annotations. Changed or conflicted trial
+evidence and later hazards re-hold admission while the receipt remains retained.
+Physical/control exclusion remains independent of provider coverage. This
+operation does not lift disablement or make automatic readiness positive.
 
 ### Pinned GitNexus typed adapter
 

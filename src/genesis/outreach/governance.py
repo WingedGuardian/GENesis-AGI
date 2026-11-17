@@ -133,6 +133,10 @@ _TOPIC_IS_IDENTITY: frozenset[str] = frozenset(
         # _notify): one owner-requested failure, never fuzzy body identity, so
         # two fast failures with the same error body both page at once.
         "direct_session_fail",
+        # topic = "Builder launcher: <kind>:<move key>" (board/launcher/): one line
+        # per board event, which the launcher already dedups by its own rows, so
+        # two moves' alerts with one body (the same refusal) both reach the owner.
+        "builder_launch",
     }
 )
 
