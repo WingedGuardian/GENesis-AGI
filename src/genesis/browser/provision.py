@@ -977,6 +977,27 @@ def unmet_packages(pyproject: Path | None = None) -> list[str]:
                 f"{dist} is installed but {module} does not import ({problem}); "
                 f"reinstall it ({engine.PACKAGE_HINT})"
             )
+    # A requirement's own extras (scrapling[fetchers]) install packages that
+    # BROWSER_DISTS does not name. When they are missing, the web fetcher falls back
+    # to plain httpx, so what it imports must import, and the distribution itself
+    # must be at a version the requirement admits.
+    for req in requirements:
+        module = _EXTRA_MODULES.get(req.name.lower())
+        if not module:
+            continue
+        installed = _dist_version(req.name)
+        if installed is None:
+            unmet.append(f"{req.name} is not installed")
+            continue
+        if installed != packages.UNREADABLE and not req.specifier.contains(
+            installed, prereleases=True
+        ):
+            unmet.append(f"{req.name} {installed} is outside {req.specifier}")
+        if problem := _import_problem(module):
+            unmet.append(
+                f"{req} is not usable: {module} does not import ({problem}); "
+                f"reinstall it ({engine.PACKAGE_HINT})"
+            )
     return unmet
 
 
@@ -987,12 +1008,37 @@ _LAUNCH_MODULES = {
     "patchright": "patchright.async_api",
 }
 
+# What a browser-extra requirement is installed for, by distribution name, as
+# "module:attribute": the import its caller makes. Keyed on the name, not the
+# extras listed: every scrapling extra (fetchers, ai, shell, rag, all) pulls in the
+# fetcher packages, and web/fetch.py needs AsyncFetcher whichever is named.
+# Scrapling 0.5.1 loads AsyncFetcher lazily, so importing scrapling.fetchers alone
+# touches none of the extra's packages.
+_EXTRA_MODULES = {
+    "scrapling": "scrapling.fetchers:AsyncFetcher",
+}
+
+
+def _dist_version(name: str) -> str | None:
+    """The installed version of ``name``, None when absent, UNREADABLE when its
+    metadata cannot be read (a damaged install; the import check then judges it)."""
+    try:
+        return metadata.version(name) or packages.UNREADABLE
+    except metadata.PackageNotFoundError:
+        return None
+    except Exception:  # noqa: BLE001 - a damaged install, reported as one
+        return packages.UNREADABLE
+
 
 def _import_problem(module: str) -> str | None:
-    """Why ``module`` does not import, or None. Run in check-packages' own process,
-    never the server's: importing camoufox imports playwright."""
+    """Why ``module`` does not import, or None; ``module:attribute`` also reads the
+    attribute, for a package that imports it lazily. Run in check-packages' own
+    process, never the server's: importing camoufox imports playwright."""
+    name, _, attribute = module.partition(":")
     try:
-        importlib.import_module(module)
+        loaded = importlib.import_module(name)
+        if attribute:
+            getattr(loaded, attribute)
     except Exception as exc:  # noqa: BLE001 - any failure means the launch fails too
         return f"{type(exc).__name__}: {exc}"
     return None
