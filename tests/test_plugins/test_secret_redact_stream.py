@@ -171,6 +171,163 @@ def test_a_loader_result_of_the_wrong_shape_is_a_failed_load(tmp_path, monkeypat
     assert values.redact(KEY2) == P
 
 
+@pytest.mark.parametrize("bad", ["bad\0path", 7])
+def test_a_watched_path_os_stat_cannot_take_does_not_stop_the_filter(tmp_path, monkeypatch, bad):
+    # The confirming read's watch list is committed with the values. An entry os.stat raises something other than
+    # OSError on (a NUL byte) or one that is not text must not escape refresh(): the filter would die and the
+    # command lose its output. register.js statStamp treats any error as an absent file.
+    values = _values(tmp_path, monkeypatch, f"CANARY_API_KEY={KEY}\n")
+    real = values._known.load
+    calls = []
+
+    def load(*a, **kw):
+        # Only the CONFIRMING read names the bad path, so it is committed without ever being stamped in _load.
+        calls.append(1)
+        got = dict(real(*a, **kw))
+        if len(calls) >= 2:
+            got["watch"] = [*(got.get("watch") or [got["path"]]), bad]
+        return got
+
+    monkeypatch.setattr(values._known, "load", load)
+    values._watch, values._stamp = [], None  # as on a first load, so the watch list is replaced
+    values._load()
+    monkeypatch.setattr(stream, "RETRY_S", 0.0)
+    values.refresh()  # must not raise
+    values.refresh()
+    if isinstance(bad, str):
+        assert values.redact(KEY) == P  # committed; the unstatable path just reads as absent
+    else:
+        assert (
+            values._failed
+        )  # a non-text entry fails the load, which is retried, and the filter lives
+
+
+def test_a_failed_confirming_read_does_not_stand_for_the_newer_stamp(tmp_path, monkeypatch):
+    # A load on a new location reads, stamps, then reads again. The key rotates between the first read and the
+    # stamp, and the second read fails: the first read's values must not be committed under the newer stamp, or the
+    # new key would stay raw until some unrelated change.
+    values = _values(tmp_path, monkeypatch, f"CANARY_API_KEY={KEY}\n")
+    real = values._known.load
+    calls = []
+
+    def load(*a, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            got = real(*a, **kw)
+            (tmp_path / "secrets.env").write_text(
+                f"CANARY_API_KEY={KEY2}\n"
+            )  # rotated before the stamp
+            return got
+        raise PermissionError("unreadable for a moment")
+
+    monkeypatch.setattr(values._known, "load", load)
+    values._watch, values._stamp = [], None  # as on a first load, or a new location
+    values._load()
+    assert len(calls) == 2
+    assert values.redact(KEY) == P  # the first read's values are still used
+    monkeypatch.setattr(values._known, "load", real)
+    monkeypatch.setattr(stream, "RETRY_S", 0.0)
+    values.refresh()
+    assert values.redact(KEY2) == P
+
+
+def test_a_values_module_that_failed_to_run_is_not_kept(tmp_path, monkeypatch):
+    # The module is cached only once its code has run; a failed run is retried at the next read.
+    values = _values(tmp_path, monkeypatch, f"CANARY_API_KEY={KEY}\n")
+    values._known = None
+    real_spec = stream.importlib.util.spec_from_file_location
+    runs = []
+
+    class Loader:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def create_module(self, spec):
+            return self.inner.create_module(spec)
+
+        def exec_module(self, module):
+            runs.append(1)
+            if len(runs) == 1:
+                raise OSError("read failed for a moment")
+            self.inner.exec_module(module)
+
+    def spec_from_file_location(name, location, *a, **kw):
+        spec = real_spec(name, location, *a, **kw)
+        if name == "_redact_known_values":  # the values module only, not what it loads in turn
+            spec.loader = Loader(spec.loader)
+        return spec
+
+    monkeypatch.setattr(stream.importlib.util, "spec_from_file_location", spec_from_file_location)
+    with pytest.raises(OSError):
+        values._read()
+    assert values._known is None
+    assert values._read()["needles"]
+    assert len(runs) == 2
+
+
+def test_output_written_just_before_the_command_exits_is_drained_first(tmp_path, monkeypatch):
+    # The command writes its last line and exits while the filter is waiting for input. The filter must not then
+    # signal drained with that line unread: the runner would return before the task file holds it.
+    done, drained = tmp_path / "done", tmp_path / "drained"
+    monkeypatch.setenv("SECRETS_PATH", str(tmp_path / "absent.env"))
+    r, w = os.pipe()
+    real_select = stream.select.select
+    first = []
+
+    def select(rlist, wlist, xlist, timeout=None):
+        if not first:
+            first.append(1)
+            os.write(w, b"last line\n")  # written, then the command exits and done is made...
+            os.close(w)
+            done.touch()
+            return [], [], []  # ...all after the wait had already come back empty
+        return real_select(rlist, wlist, xlist, timeout)
+
+    class Out:
+        buffer = __import__("io").BytesIO()
+
+    class In:
+        @staticmethod
+        def fileno():
+            return r
+
+    seen_at_signal = []
+    real_open = open
+
+    def opener(path, *a, **kw):
+        if str(path) == str(drained):
+            seen_at_signal.append(Out.buffer.getvalue())
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(stream.select, "select", select)
+    monkeypatch.setattr(stream, "open", opener, raising=False)
+    monkeypatch.setattr(sys, "stdin", In)
+    monkeypatch.setattr(sys, "stdout", Out)
+    monkeypatch.setattr(sys, "argv", ["stream_filter.py", str(done), str(drained)])
+    assert stream.main() == 0
+    os.close(r)
+    assert seen_at_signal and seen_at_signal[0] == b"last line\n"
+
+
+def test_a_failed_fifo_setup_under_errexit_still_runs_the_command(secrets_file, tmp_path):
+    # mkfifo fails after the temp folder exists; the cleanup of FIFOs that were never made must not end the shell
+    # under the caller's `set -e` before the warning and the unwrapped command.
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "mkfifo").write_text("#!/bin/sh\nexit 1\n")
+    (shim / "mkfifo").chmod(0o755)
+    run = subprocess.run(
+        ["bash", "-c", f"set -e\n{_source('echo ran; exit 6')}"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path), "PATH": f"{shim}:{os.environ['PATH']}"},
+        timeout=60,
+    )
+    assert run.returncode == 6 and run.stdout == "ran\n"
+    assert "NOT redacted" in run.stderr
+    assert not list(tmp_path.glob("secret-redact.*"))
+
+
 def test_the_filter_and_the_mod_redact_alike(tmp_path, monkeypatch):
     # The filter carries its own copy of the mod's rules (one pass, placeholders as themselves, ~earlier names on
     # rotation), because the mod is JavaScript in Claude Code and the filter runs beside the command. This drives
@@ -227,6 +384,65 @@ def test_the_filter_and_the_mod_redact_alike(tmp_path, monkeypatch):
     assert got == res["out"]
     # Not equal by both doing nothing: every raw value is gone from both.
     assert not any(raw in text for text in got for raw in (KEY, KEY2, key3, "short-tail"))
+
+
+def test_the_filter_and_the_mod_handle_a_failed_confirming_read_alike(tmp_path, monkeypatch):
+    # The first load reads, stamps, and reads again to confirm. The key rotates right after the first read and the
+    # confirming read fails. register.js load then commits nothing and retries later; the filter must do the same
+    # (no values from the unconfirmed read, no stamp), and both must agree once the retry succeeds.
+    text = f"one {KEY} two {KEY2}"
+    mod_dir = tmp_path / "mod"
+    mod_dir.mkdir()
+    res = _run_mod(
+        mod_dir,
+        """
+        t.afterNextLoader(() => { t.write("CANARY_API_KEY=" + t.v.key2 + "\\n"); t.failNext(1); });
+        const call = async () => (await t.emit("tool.call", { tool: "Bash" }, async () => ({ result: t.v.text }))).result;
+        const first = await call();
+        t.advance(31000);  // past the mod's retry back-off
+        return [first, await call()];
+        """,
+        text=text,
+    )
+    filter_dir = tmp_path / "filter"
+    filter_dir.mkdir()
+    path = filter_dir / "secrets.env"
+    path.write_text(f"CANARY_API_KEY={KEY}\n")
+    monkeypatch.setenv("SECRETS_PATH", str(path))
+    real_read = stream.Values._read
+    reads = []
+
+    def read(self):
+        reads.append(1)
+        if len(reads) == 1:
+            got = real_read(self)
+            path.write_text(f"CANARY_API_KEY={KEY2}\n")
+            later = time.time() + 5
+            os.utime(path, (later, later))
+            return got
+        if len(reads) == 2:
+            # The loader itself fails, inside the filter's own read, as a failed loader run does in the mod.
+            real_load = self._known.load
+
+            def failing(*a, **kw):
+                raise RuntimeError("known_values exited 1")
+
+            self._known.load = failing
+            try:
+                return real_read(self)
+            finally:
+                self._known.load = real_load
+        return real_read(self)
+
+    monkeypatch.setattr(stream.Values, "_read", read)
+    values = stream.Values(str(REPO))
+    first = values.redact(text)
+    monkeypatch.setattr(stream, "RETRY_S", 0.0)
+    values.refresh()
+    got = [first, values.redact(text)]
+    assert got == res["out"]
+    assert got[0] == text  # nothing from the unconfirmed read was committed
+    assert got[1] == f"one {KEY} two {P}"  # the retry read the rotated file
 
 
 def test_a_rotated_out_value_gets_a_placeholder_of_its_own(tmp_path, monkeypatch):

@@ -37,7 +37,10 @@ fi
 _sr_dir=""
 if ! "$_sr_py" -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import stream_filter' "$_sr_here" 2>/dev/null \
     || ! _sr_dir=$(mktemp -d -p "${TMPDIR:-/tmp}" secret-redact.XXXXXX) || ! mkfifo "$_sr_dir/out" "$_sr_dir/err"; then
-    [ -n "$_sr_dir" ] && { unlink "$_sr_dir/out"; unlink "$_sr_dir/err"; rmdir "$_sr_dir"; } 2>/dev/null
+    # Each step may fail (a FIFO that was never made), and a caller's `set -e` must not end the file here.
+    if [ -n "$_sr_dir" ]; then
+        { unlink "$_sr_dir/out" || true; unlink "$_sr_dir/err" || true; rmdir "$_sr_dir" || true; } 2>/dev/null
+    fi
     echo "secret-redact: could not set up the output filter; this command's output is NOT redacted" >&2
     ( set --; eval "$_sr_cmd" )
     exit $?

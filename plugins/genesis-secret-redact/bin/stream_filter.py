@@ -34,6 +34,7 @@ background task's output file).
 from __future__ import annotations
 
 import codecs
+import contextlib
 import importlib.util
 import os
 import re
@@ -78,27 +79,36 @@ class Values:
             try:
                 st = os.stat(path)
                 stamps.append((st.st_mtime_ns, st.st_size))
-            except OSError:
+            except Exception:  # noqa: BLE001 - any unreadable path is "absent", as register.js statStamp treats it
                 stamps.append((0, 0))
         return tuple(stamps)
 
+    @staticmethod
+    def _watch_of(loaded: dict) -> list[str]:
+        return list(loaded.get("watch") or [loaded["path"]])
+
     def _load(self) -> None:
+        """Read the values and commit them all at once, or commit nothing (register.js ``load``, the same shape).
+
+        Every read and every value derived from it is built aside; only when all of it has succeeded are the values,
+        the watched paths and the stamp replaced together. Any failure (a read that fails, the confirming read
+        included, or a loader result of an unexpected shape) leaves everything as it was and marks the load failed,
+        so it is tried again within ``RETRY_S`` and the filter never dies.
+        """
         self._tried = time.monotonic()
-        # Stamped BEFORE the read, so a change made while the file is read is seen at the next check.
-        before = self._stamp_of(self._watch) if self._watch else None
-        loaded = self._read()
-        if loaded is None:
-            self._failed = True  # the stamp stays where it was, so the next check tries again
-            return
-        # Everything is built aside and swapped in at the end: a loader result of an unexpected shape is a failed
-        # load (the values read earlier stay, the next check tries again), never a filter that dies.
         try:
-            watch = list(loaded.get("watch") or [loaded["path"]])
+            # Stamped BEFORE the read, so a change made while the file is read is seen at the next check.
+            before = self._stamp_of(self._watch) if self._watch else None
+            loaded = self._read()
+            watch = self._watch_of(loaded)
             if watch != self._watch:
                 # The resolver's candidates changed (first load, or a new location): stamp those, then read again
-                # so the values match the stamp.
+                # so the stamp is never newer than the values it stands for.
                 before = self._stamp_of(watch)
-                loaded = self._read() or loaded
+                loaded = self._read()
+                watch = self._watch_of(loaded)
+            if not all(isinstance(path, str) for path in watch):
+                raise TypeError("a watched path that is not text")
             current = [(n["text"], n["placeholder"]) for n in loaded["needles"]]
             if not all(isinstance(t, str) and isinstance(p, str) for t, p in current):
                 raise TypeError("a needle that is not text")
@@ -129,15 +139,17 @@ class Values:
             matcher = re.compile("|".join(map(re.escape, alternatives))) if alternatives else None
         except Exception as exc:  # noqa: BLE001 - see the class docstring
             self._failed = True
-            self._report(exc)
+            self._report(
+                exc
+            )  # after the decision: nothing was committed, so the values in use are the old ones
             return
+        self.pairs = pairs
+        self._by_text = by_text
+        self._matcher = matcher
         self._watch = watch
         self._stamp = before
         self._failed = False
         self._said = False  # a later failure is a new event and is reported again
-        self.pairs = pairs
-        self._by_text = by_text
-        self._matcher = matcher
 
     def _report(self, exc: BaseException) -> None:
         """Say once per run of failures that the values could not be read, and what that means for the output."""
@@ -145,25 +157,27 @@ class Values:
             return
         self._said = True
         state = "keeping the values read earlier" if self.pairs else "this output is NOT redacted"
-        print(
-            f"secret-redact: cannot read the secret values ({type(exc).__name__}); {state}",
-            file=sys.stderr,
-        )
+        # A closed stderr must not stop the filter draining the command's output.
+        with contextlib.suppress(OSError):
+            print(
+                f"secret-redact: cannot read the secret values ({type(exc).__name__}); {state}",
+                file=sys.stderr,
+            )
 
-    def _read(self) -> dict | None:
-        try:
-            if self._known is None:
-                spec = importlib.util.spec_from_file_location(
-                    "_redact_known_values", Path(__file__).with_name("known_values.py")
-                )
-                if spec is None or spec.loader is None:
-                    raise ImportError("known_values.py")
-                self._known = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(self._known)
-            return self._known.load(self._known.repo_root(self._root_arg))
-        except Exception as exc:  # noqa: BLE001 - see the class docstring
-            self._report(exc)
-            return None
+    def _read(self) -> dict:
+        """One loader read. Raises on any failure; ``_load`` is the one place that handles it."""
+        if self._known is None:
+            spec = importlib.util.spec_from_file_location(
+                "_redact_known_values", Path(__file__).with_name("known_values.py")
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError("known_values.py")
+            # Kept only once its code has run: a module whose execution failed would otherwise stay cached,
+            # half-built, and every later read would fail.
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self._known = module
+        return self._known.load(self._known.repo_root(self._root_arg))
 
     def refresh(self) -> None:
         """Reload when any watched path (the secrets file, or a location the resolver would pick) changed.
@@ -256,10 +270,14 @@ def main() -> int:
             pass
 
     while True:
+        # Seen BEFORE the wait: the command writes, exits, and only then is `done` made, so whatever it wrote is
+        # already readable when this wait starts. Checked after the wait instead, the command could finish its
+        # last write in between and be signalled drained with that output unread.
+        exited = os.path.exists(done)
         try:
             ready, _, _ = select.select([fd], [], [], 0.1)
         except InterruptedError:
-            ready = []
+            continue  # nothing was observed: look again, never treat an interrupted wait as an empty one
         if ready:
             chunk = os.read(fd, 65536)
             if not chunk:
@@ -267,7 +285,7 @@ def main() -> int:
             values.refresh()
             written, pending = values.process(pending + decoder.decode(chunk))
             emit(written)
-        elif os.path.exists(done):
+        elif exited:
             # The command has exited and its output is read. A held tail stays held: a child the command left
             # behind may still write the rest of that value.
             signal()
