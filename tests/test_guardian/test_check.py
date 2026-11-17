@@ -1198,6 +1198,13 @@ class TestTwoGateApproval:
                 "genesis.guardian.recovery.container_on_live",
                 AsyncMock(return_value=True),
             ),
+            # No candidate list (the engine absent or unreadable), lock free:
+            # the restart, as before the drop existed (#2978).
+            patch("genesis.guardian.live_drop.live_candidates", AsyncMock(return_value=None)),
+            patch(
+                "genesis.guardian.live_drop.update_lock_holder",
+                AsyncMock(return_value=(False, "")),
+            ),
         ):
             await _execute_recovery_with_approval(
                 config,

@@ -27,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from html import escape as html_escape
 from pathlib import Path
 
+from genesis.guardian import live_drop
 from genesis.guardian.alert.base import Alert, AlertSeverity
 from genesis.guardian.alert.dispatcher import AlertDispatcher
 from genesis.guardian.alert.telegram import CONFLICT_SENTINEL, TelegramAlertChannel
@@ -1743,11 +1744,21 @@ async def _handle_confirmed_dead(
     # and sends a single "restored" ping). Recovery detection is unaffected: it
     # happens in state_machine.process() via the cheap signal probes, not here.
     if sm.state.down_alert_sent:
-        logger.info(
-            "Down alert already sent this episode — staying quiet until recovery "
-            "(no re-diagnosis/re-alert)",
-        )
-        return
+        reopen = False
+        if sm.state.waiting_on_update_lock:
+            # This episode escalated because update.lock was held on `live`: one
+            # cheap probe per tick, and a fresh diagnosis once it is free. A
+            # probe that cannot say reopens too: the proposal step probes again.
+            held, _who = await live_drop.update_lock_holder(config.container_name)
+            reopen = held is not True
+        if not reopen:
+            logger.info(
+                "Down alert already sent this episode — staying quiet until recovery "
+                "(no re-diagnosis/re-alert)",
+            )
+            return
+        logger.info("update.lock is free again — reopening this outage episode")
+        sm.clear_down_alert_sent()
     # First handler for this episode (e.g. reached CONFIRMED_DEAD via the
     # self-heal-escalation path that skips _proceed_to_diagnosis): own it now so
     # the next tick skips.
@@ -2071,18 +2082,11 @@ async def _execute_recovery_with_approval(
                 ),
             )
         elif await container_on_live(config.container_name):
-            logger.warning("REVERT_CODE proposed on `live` — proposing RESTART_CONTAINER")
-            diagnosis = replace(
-                diagnosis,
-                recommended_action=RecoveryAction.RESTART_CONTAINER,
-                likely_cause=(
-                    diagnosis.likely_cause
-                    + " — the checkout is on `live` (or could not be shown not to be), where "
-                    "a code revert never runs. Proposing a container restart: it ends lock "
-                    "holders and lets a boot repair run where one is installed. A bad "
-                    "candidate is removed with `scripts/deploy_candidates drop <branch>`"
-                ),
-            )
+            diagnosis = await live_drop.live_revert_proposal(config.container_name, diagnosis)
+    elif diagnosis.recommended_action == RecoveryAction.RESTART_CONTAINER:
+        diagnosis = await live_drop.escalate_if_update_running(
+            config.container_name, diagnosis, check_live=True,
+        )
 
     logger.info(
         "Gate-1 approved; diagnosis: %s (confidence=%d%%, action=%s, source=%s)",
@@ -2099,12 +2103,29 @@ async def _execute_recovery_with_approval(
     write_diagnosis_result(diagnosis, config, outage_duration_s=outage_s)
 
     if diagnosis.recommended_action == RecoveryAction.ESCALATE:
-        # Investigation concluded there is no safe automated action — escalate
-        # (the recovery engine sends a manual-intervention alert).
-        await telegram_channel.send_text(
-            "Investigation complete — no safe automated recovery available. "
-            "Escalating for manual intervention."
-        )
+        if diagnosis.escalation == live_drop.WAITING_ON_LOCK:
+            # Not a failure: a deploy holds update.lock on `live`. Nothing is
+            # touched; each tick probes the lock and reopens the episode once
+            # it is free (#2978).
+            sm.mark_waiting_on_update_lock()
+            await telegram_channel.send_text(
+                "Genesis is down, but update.lock is held on `live` (a deploy, rebuild, drop "
+                "or validation hold is running), so nothing was touched. I will diagnose "
+                "again as soon as the lock is free."
+            )
+        elif diagnosis.escalation == live_drop.HALF_DONE_DROP:
+            await telegram_channel.send_text(
+                "Genesis is down and `live` still runs a candidate a drop removed from the "
+                "manifest. `scripts/deploy_candidates rebuild` finishes the drop; then "
+                "restart genesis-server."
+            )
+        else:
+            # Investigation concluded there is no safe automated action — escalate
+            # (the recovery engine sends a manual-intervention alert).
+            await telegram_channel.send_text(
+                "Investigation complete — no safe automated recovery available. "
+                "Escalating for manual intervention."
+            )
         await recovery_engine.execute(diagnosis)
         return
 

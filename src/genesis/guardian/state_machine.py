@@ -75,6 +75,9 @@ class StateData:
     io_triage_attempts: int = 0  # Separate counter for IO_TRIAGE (low-risk, repeatable)
     snapshot_size_history: list[int] = field(default_factory=list)  # Last N snapshot sizes in bytes
     boot_id: str = ""  # kernel boot UUID when this state was last written; "" = unknown
+    # On `live`, this episode escalated because update.lock was held: each tick
+    # probes the lock and reopens the episode once it is free (#2978).
+    waiting_on_update_lock: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -101,6 +104,7 @@ class StateData:
             "io_triage_attempts": self.io_triage_attempts,
             "snapshot_size_history": self.snapshot_size_history[-5:],
             "boot_id": self.boot_id,
+            "waiting_on_update_lock": self.waiting_on_update_lock,
         }
 
     @classmethod
@@ -133,6 +137,7 @@ class StateData:
             io_triage_attempts=data.get("io_triage_attempts", 0),
             snapshot_size_history=data.get("snapshot_size_history", []),
             boot_id=str(data.get("boot_id") or ""),
+            waiting_on_update_lock=data.get("waiting_on_update_lock") is True,
         )
 
 
@@ -352,9 +357,13 @@ class ConfirmationStateMachine:
             # remains flaky.
             timeout_s = self._config.confirmation.confirmed_dead_timeout_s
             max_resets = self._config.confirmation.max_auto_resets
+            # Not while this episode waits for update.lock on `live`: check.py
+            # probes the lock each tick and reopens the episode itself, and a
+            # reset would re-diagnose and re-prompt while the lock is held (#2978).
             if (
                 self._state.first_failure_at
                 and self._state.auto_reset_count < max_resets
+                and not self._state.waiting_on_update_lock
             ):
                 try:
                     first = datetime.fromisoformat(self._state.first_failure_at)
@@ -684,6 +693,7 @@ class ConfirmationStateMachine:
         self._state.signal_history.clear()
         self._clear_dialogue_state()
         self.clear_cc_unavailable()
+        self._state.waiting_on_update_lock = False
         self._state.boot_id = current_boot_id
         return True
 
@@ -697,6 +707,7 @@ class ConfirmationStateMachine:
         self._state.recovery_attempts = 0
         self._state.io_triage_attempts = 0
         self._state.last_recovery_at = None
+        self._state.waiting_on_update_lock = False
         self._clear_dialogue_state()
         self.clear_cc_unavailable()
 
@@ -792,10 +803,20 @@ class ConfirmationStateMachine:
         recovery — NOT in _reset_to_healthy, which auto-reset also calls.
         """
         self._state.down_alert_sent = True
+        # A new episode starts unmarked; its escalation marks the wait again.
+        self._state.waiting_on_update_lock = False
 
     def clear_down_alert_sent(self) -> None:
-        """Clear the down-alert flag — called by check.py on genuine recovery only."""
+        """Clear the down-alert flag — called by check.py when an episode ends
+        (genuine recovery, a denial, a failed prompt) or reopens. The episode's
+        wait on update.lock ends with it."""
         self._state.down_alert_sent = False
+        self._state.waiting_on_update_lock = False
+
+    def mark_waiting_on_update_lock(self) -> None:
+        """This episode escalated because update.lock was held on `live`: the
+        next ticks probe the lock instead of staying quiet (#2978)."""
+        self._state.waiting_on_update_lock = True
 
     def should_escalate(self) -> bool:
         """Check if we've exceeded max recovery attempts."""

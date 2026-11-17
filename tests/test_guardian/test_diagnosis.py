@@ -109,14 +109,16 @@ class TestCCUnavailableEscalation:
         assert result.evidence == ["Container: Running"]
 
 
-def test_prompt_never_proposes_revert_on_live() -> None:
-    """The brain is told the live rule; check.py enforces it whatever it proposes."""
+def test_prompt_states_what_revert_means_on_live() -> None:
+    """The brain is told the live rules; check.py enforces them whatever it
+    proposes. A bad candidate: REVERT_CODE, which drops it (#2978). A
+    half-written checkout: never REVERT_CODE (the drop refuses a dirty tree)."""
     from genesis.guardian.diagnosis import _build_diagnosis_prompt
 
     prompt = _build_diagnosis_prompt(_snap(live_repair="live-move repair: x"), "", "genesis")
     assert "live-move repair: x" in prompt
-    assert "never REVERT_CODE on `live`" in prompt
-    assert "deploy_candidates drop" in prompt  # the remedy for a bad candidate
+    assert "on `live` it drops the newest candidate from `live`, then restarts" in prompt
+    assert "never REVERT_CODE on `live`" in prompt  # the half-written row
     assert "re-runs the repair" not in prompt  # no heal claimed where none is installed
 
 

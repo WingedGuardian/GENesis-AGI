@@ -28,7 +28,9 @@ Commands:
         approval (drop the branch to revoke one). It RECORDS a claim, it does not verify one:
         any caller can pass the flag, so pass it only after the owner said yes. Refuses unless the install is READY and
         every per-candidate check passes (below). Prints the next step; it
-        does not rebuild.
+        does not rebuild. The manifest lists candidates in pin order: adding a
+        branch again at a new head moves it to the end (the same head keeps
+        its place), so the last listed is the newest code.
   drop <branch> [--no-rebuild]
         Take a candidate out of the manifest. On `live` it then removes the
         candidate from `live`: SUBTRACT-ONLY and OFFLINE, on the base `live` is
@@ -56,7 +58,11 @@ Commands:
         first write or its "unchanged" result; an on-`live` drop writes the
         manifest right after that check, and a manifest-only drop re-checks
         the branch, HEAD and `live` before writing it.
-  list  The manifest as written (checked to be this repository's). No network.
+  list [--json [--move-refusals]]
+        The manifest as written (checked to be this repository's). No network.
+        --json: what the manifest lists and what `live` holds (deploy health).
+        --move-refusals adds the checkout's branch and HEAD and every reason a
+        drop or rebuild would refuse to move it now (the Guardian's drop).
   status
         READINESS, and per candidate: whether it is in `live` now, what the next
         rebuild would do with it (included, excluded and why, retired, or
@@ -557,9 +563,12 @@ class Engine(Repo):
             out(f"  retiring: {b}")
 
     # ── commands ─────────────────────────────────────────────────────────
-    def cmd_list(self, as_json: bool = False) -> int:
+    def cmd_list(self, as_json: bool = False, move_refusals: bool = False) -> int:
         if as_json:
-            out(json.dumps(self.observe(), sort_keys=True))
+            seen = self.observe()
+            if move_refusals:
+                seen.update(self.observe_moves())
+            out(json.dumps(seen, sort_keys=True))
             return 0
         data = self.store.load()
         if data is None:
@@ -624,6 +633,20 @@ class Engine(Repo):
             "listed": listed,
             "live": live,
         }
+
+    def observe_moves(self) -> dict:
+        """`list --json --move-refusals`, for the Guardian's drop (#2978): the
+        checkout drop would judge and every reason it would refuse to move it,
+        from the one function drop refuses with. Lockless and read-only, like
+        observe(). A read that fails is a reason, never an empty list."""
+        try:
+            source = plan.read_source(self)
+            return {
+                "checkout": {"branch_ref": source.branch_ref, "head": source.head},
+                "move_refusals": self._move_refusals(source),
+            }
+        except (Refusal, Unknown) as exc:
+            return {"checkout": None, "move_refusals": [f"could not judge: {exc}"]}
 
     def cmd_add(
         self, branch: str, owner: str, pr: int | None, approve_hooks: str | None = None
@@ -715,9 +738,16 @@ class Engine(Repo):
                 "repo": self.common_dir(),
                 "candidates": [],
             }
-            for c in data["candidates"]:
+            for i, c in enumerate(data["candidates"]):
                 if c["branch"] == branch:
+                    moved = c["verified_head"] != head
                     c.update({k: v for k, v in cand.items() if k != "added_at"})
+                    if moved:
+                        # Manifest order is pin order: a new head goes last, so
+                        # the last listed candidate is the newest code, the one
+                        # the Guardian drops first (#2978). A same-head re-add
+                        # keeps its place.
+                        data["candidates"].append(data["candidates"].pop(i))
                     result["kind"] = "re-verified"
                     return data
             data["candidates"].append(cand)
@@ -1307,6 +1337,8 @@ def _parser() -> argparse.ArgumentParser:
     ls = sub.add_parser("list")
     # Machine-readable, for deploy health (observe()); the text form is unchanged.
     ls.add_argument("--json", action="store_true")
+    # With --json, for the Guardian's drop: the checkout and drop's refusals now.
+    ls.add_argument("--move-refusals", action="store_true")
     sub.add_parser("status")
     # For update.sh on `live`: its rollback's hook restore, and the shape check
     # it runs before anything moves.
@@ -1355,7 +1387,10 @@ def main(
         as_json = args.cmd == "list" and args.json
         engine.place(args.cmd, note=_err if as_json else out)
         if args.cmd == "list":
-            return engine.cmd_list(as_json)
+            if args.move_refusals and not as_json:
+                _err("deploy_candidates: --move-refusals goes with --json")
+                return 2
+            return engine.cmd_list(as_json, args.move_refusals)
         if args.cmd == "status":
             return engine.cmd_status()
         if args.cmd == "add":

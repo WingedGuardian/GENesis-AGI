@@ -2642,7 +2642,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 0aa0bf9f2 2026-11-10
+verified: 9a1994b2b 2026-11-17
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -2747,11 +2747,39 @@ verified: 0aa0bf9f2 2026-11-10
   revert HEAD) never runs where the container checkout is on `live`, judged by
   git's own HEAD (`refs/heads/live` bans, whatever the manifest says) and then
   `scripts/lib/live_checkout.py`, both over `incus exec`; a failed git, or
-  anything but a clean `other`, counts as live. `check.py` turns that proposal into
-  `RESTART_CONTAINER` before Gate 2 (after F.1's git-health redirect), and
-  `recovery.py` refuses it as a backstop. A restart ends lock holders and lets
-  a boot repair run where one is installed; a bad candidate is removed by
-  `deploy_candidates drop`. The diagnosis snapshot carries the boot repair's
+  anything but a clean `other`, counts as live. On `live`, before Gate 2 (after
+  F.1's git-health redirect), `check.py` reads the engine's
+  `scripts/deploy_candidates list --json --move-refusals` and turns the proposal
+  into the DROP of the newest candidate (the last one `live` holds that the
+  manifest lists; manifest order is pin order, since a re-add at a new head moves
+  the entry last) when the checkout is on `live` at its tip and nothing would
+  refuse a move. The approval text names the branch, its head and `live`'s tip.
+  A drop that saved the manifest but did not move the checkout (`live` holds a
+  branch the manifest no longer lists) escalates, naming `deploy_candidates
+  rebuild`, which finishes it. Otherwise (no candidate, an unreadable list, a
+  move refusal) it proposes `RESTART_CONTAINER` and says why. While update.lock
+  is held on `live`, a REVERT_CODE or RESTART_CONTAINER proposal becomes an
+  ESCALATE that waits (owner rulings, #2978; a validation's shared hold
+  counts): its own warning, not the "all recovery failed" alert;
+  `waiting_on_update_lock` in the Guardian state; then each tick runs one lock
+  probe and reopens the episode (fresh diagnosis, both gates) once the lock is
+  free. An approved drop re-reads the engine's view and runs only if it is
+  unchanged, runs the engine's own `drop --expect-branch live --expect-head
+  <tip> --wait 120`, and restarts genesis-server only once the engine shows the
+  branch gone from the manifest and `live`, the checkout on `live`, no move
+  refusal, and update.lock free (a client timeout waits up to 180 s more,
+  first waiting for the lock); after a confirmed drop it waits up to 180 s for
+  the lock to free before the restart. An approved RESTART_CONTAINER on `live`
+  re-reads the lock too, since the approval may be hours old. A lock still
+  held marks the same wait; a refusal or an unconfirmed result restarts
+  nothing. The confirmed-dead auto-reset (600 s) is suspended while an episode
+  waits, and every episode reset ends the wait. With no approved candidate,
+  `recovery.py` refuses a REVERT_CODE on `live` as a backstop. The reads, the
+  pick and the proposal live in `guardian/live_drop.py`; every container string
+  they show is cleaned and cut, and the view is capped at 1 MiB in the
+  container. The diagnosis prompt carries the manifest's candidates in pin
+  order, with added dates and pinned heads, as a fenced untrusted section; it
+  is absent, and the prompt unchanged, when there are none. The diagnosis snapshot carries the boot repair's
   `live-move repair:` journal lines and a summary of the newest
   `deploy-backups/*-live-move-repair/REPAIR.json` that is neither dismissed
   nor superseded and names `~/genesis` (6 h window on the ts in its dir name,
