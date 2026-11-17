@@ -890,6 +890,38 @@ complete-attempt evidence. See `docs/reference/inbox-attempt-identity.md`.
   took the predecessor design through 7 review rounds is retired by
   construction. Forbidden mechanisms are test-pinned (no send-keys /
   respawn-pane / set-environment; exactly one new-session invocation).
+- **The slot door has a builder mode, for code with nobody at the terminal**
+  (`scripts/cc-slot.sh launch --issue N --key K --session-id UUID [--resume]
+  [--slot N] --prompt-file F`; spec E, E3). It creates the slot through the same
+  single create invocation, DETACHED (`-d`, never `-A`), and never prompts.
+  - **Slot:** the caller's `--slot N`, refused (75) when taken and never
+    swapped, so the launcher can record it before launching. Without it, the
+    lowest free slot.
+  - **Capacity:** SSH variables are cleared first, so the gate answers ALLOW or
+    DENY, never an interactive reclaim.
+  - **Exit codes:** 0 when the session is still there a few seconds after the
+    create (a claude that exits at once is reported as a failure); 75 for a taken
+    slot or a capacity refusal (retry later); 64 for bad input, including a pane
+    command past tmux's client limit (MEASURED on tmux 3.4: 16300 bytes accepted,
+    16340 refused); any other non-zero for a failure.
+  - **OAuth:** the fallback token is never injected, because Remote Control
+    cannot run on it.
+  - **Environment:** the pane rebuilds claude's environment with `env -i`, from
+    the variable names a manual slot carries plus `GENESIS_BUILDER_KEY`, so no
+    other pane's identity, `GENESIS_CC_SESSION`, API key or token reaches it. The
+    key is also pinned on the tmux session, so `tmux show-environment -t cc-N`
+    maps a builder to its slot. Values are POSIX single-quoted, not `printf %q`,
+    so the pane command does not depend on bash.
+  - **claude:** starts with Remote Control (`build #N`), a fixed `--session-id`
+    (or `-r` to resume), `--model opus` (Claude Code's alias for the latest Opus,
+    so no version is pinned and a saved `/model` default cannot change it), the
+    interactive slots' permission mode, and `config/builder_settings.json` for
+    its subagent caps. A missing or malformed caps file refuses the launch.
+  - **Attach:** builders share the slot numbers, so an operator's
+    `ssh <host>-N` joins a running builder in `cc-N` (the intended attach path).
+
+  Nothing calls it yet: the board launcher (E3a) will. `config/BUILDER_PROMPT.md`
+  is the builder's first-message template, rendered by that launcher.
 - **Roster peer availability is OBSERVATION, never a gate** (`cc/peer_availability.py`,
   recorded from the failover loop in `cc/conversation.py`). `roster.failover_chain`
   admits a peer on CREDENTIAL PRESENCE — "is `auth_env` set" — so a quota-blocked
