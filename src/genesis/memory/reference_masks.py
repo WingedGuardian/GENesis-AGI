@@ -187,48 +187,6 @@ def _secret_parts(value: str) -> list[tuple[str, bool]]:
     return list(probes.items())
 
 
-#: A fragment (``_FRAGMENT_SPLIT``) that is a run of at least four digits, with
-#: any edge punctuation that is no separator (``.`` and ``!``), right after a
-#: ``:``.
-_DIGIT_AFTER_COLON = re.compile(
-    r"(?<=:)[.!]*(\d{4,})[.!]*(?![^\s:/@?&=#;,|\\<>\"'`(){}\[\]])"
-)
-#: The host a port follows: a host name, ``localhost``, an IPv4 address, an
-#: IPv6 one's closing bracket, or any label right after ``@`` or ``://``.
-_PORT_HOST = re.compile(
-    r"(?:(?:^|(?<=[\s:/@?&=#;,|\\<>\"'`(){}\[\]]))"
-    r"(?:(?:[a-z0-9-]+\.)+[a-z]{2,}|localhost|\d{1,3}(?:\.\d{1,3}){3})"
-    r"|(?:(?<=@)|(?<=://))[a-z0-9-]+|\])$",
-    re.IGNORECASE,
-)
-
-
-def _ports_only(form: str, fragments: set[str]) -> set[str]:
-    """The digit ``fragments`` of ``form`` that occur in it ONLY as a port:
-    directly after a host and ``:`` (``db.example.org:5432``)."""
-    ports: dict[str, int] = {}
-    for match in _DIGIT_AFTER_COLON.finditer(form):
-        if match.group(1) in fragments and _PORT_HOST.search(
-            form, max(0, match.start() - 256), match.start() - 1,
-        ):
-            ports[match.group(1)] = ports.get(match.group(1), 0) + 1
-    if not ports:
-        return set()
-    # Every whole-word occurrence of each digit run, counted in ONE pass (a
-    # pass per run was quadratic in the number of distinct ports).
-    words: dict[str, int] = {}
-    for match in _WHOLE_DIGITS.finditer(form):
-        if match.group(1) in ports:
-            words[match.group(1)] = words.get(match.group(1), 0) + 1
-    return {digits for digits, count in ports.items() if words.get(digits) == count}
-
-
-#: A digit run as a whole word, as ``_ports_only`` counts it.
-_WHOLE_DIGITS = re.compile(
-    r"(?<![^\s:/@?&=#;,|\\<>\"'`(){}\[\]])[.!]*(\d+)[.!]*(?![^\s:/@?&=#;,|\\<>\"'`(){}\[\]])"
-)
-
-
 def _value_probes(value: str, *, login_exempt: bool = False) -> list[tuple[str, bool]]:
     """(probe, whole-word only) for the masks: the whole value, its secret
     parts (``_secret_parts``), and every secret-shaped fragment of it,
@@ -237,10 +195,10 @@ def _value_probes(value: str, *, login_exempt: bool = False) -> list[tuple[str, 
     ``: / @ ? & = # ; , | \\ < > " ' ` ( ) { } [ ]``, so
     the password, token or key inside a connection URL, a DSN or a
     ``key=value`` line is a fragment of its own; a fragment that is a host name
-    or a URL scheme is not probed. A fragment is secret-shaped as written or
-    with its edge punctuation trimmed (both forms are probed then). A run of at
-    least four digits is probed as a whole word, except where it is a port
-    (directly after a host and ``:``). A fragment that reads as a plain word
+    or a URL scheme, or all digits, is not probed: a digit secret is masked
+    only as a secret part or a captured secret (owner ruling 2026-11-17). A
+    fragment is secret-shaped as written or with its edge punctuation trimmed
+    (both forms are probed then). A fragment that reads as a plain word
     (all letters, or under four characters) is not secret-shaped: outside a
     secret part it is matched only as the whole value, and only as a whole
     word: an ordinary word inside another is no match. That is a stated limit.
@@ -266,18 +224,17 @@ def _value_probes(value: str, *, login_exempt: bool = False) -> list[tuple[str, 
         schemes = {m.group(1).casefold() for m in _SCHEME.finditer(form)}
         form = unicodedata.normalize("NFKC", form)
         # Each distinct fragment once (the same output; a long value repeats).
-        fragments = dict.fromkeys(_FRAGMENT_SPLIT.split(form))
-        digits = {f.strip(_TOKEN_EDGE) for f in fragments if f.strip(_TOKEN_EDGE).isdigit()}
-        ports = _ports_only(form, digits) if digits and ":" in form else set()
-        for raw in fragments:
+        for raw in dict.fromkeys(_FRAGMENT_SPLIT.split(form)):
             fragment = raw.strip(_TOKEN_EDGE)
             folded = fragment.casefold()
-            if not fragment or fragment == exempt or folded in schemes or _HOSTNAME.match(folded):
+            if (
+                not fragment
+                or fragment == exempt
+                or fragment.isdigit()
+                or folded in schemes
+                or _HOSTNAME.match(folded)
+            ):
                 continue
-            if fragment.isdigit():
-                if len(fragment) < _MIN_TOKEN or fragment in ports:
-                    continue
-                add(_normalise(fragment), True)
             for shaped in dict.fromkeys((raw, fragment)):
                 if _secret_token(shaped):
                     add(_normalise(shaped), False)
@@ -637,8 +594,7 @@ def _prose_words(
 ) -> frozenset[str]:
     """The probes of a prose value that are words of the prose: not its whole
     text and not taken (by a capture rule, or a secret part of the value), and
-    term-shaped, a run of digits, or a plain word with its sentence
-    punctuation ("4821", "Hello!")."""
+    term-shaped, or a plain word with its sentence punctuation ("Hello!")."""
     return frozenset(
         probe
         for probe, _ in probes
@@ -646,7 +602,6 @@ def _prose_words(
         and probe not in taken
         and (
             (("-" in probe or "_" in probe or "." in probe) and _term_shaped(probe))
-            or probe.isdigit()
             or (probe != probe.strip(_TOKEN_EDGE) and not _secret_token(probe.strip(_TOKEN_EDGE)))
         )
     )

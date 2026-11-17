@@ -377,7 +377,7 @@ async def _ingest_once(
         # name that spells a secret of an entry under another name is not
         # masked with it. The pure-Python work runs off the event loop when any
         # value it reads is large.
-        also = _secrets_of(observed, entries, known_secret)
+        also = _secrets_of(observed, entries, known_secret, value_prose)
         # Every probe of the value and of the secrets the capture rules find in
         # it and in the description, built ONCE for the identifier and the tags.
         large = (
@@ -697,19 +697,23 @@ async def _mint_key(
     raise RuntimeError("no free credential key could be minted (#2426)")
 
 
-def _secrets_of(observed, entries: list, known_secret: str) -> tuple:
+def _secrets_of(observed, entries: list, known_secret: str, known_prose: bool) -> tuple:
     """(value, description, prose) of each secret a write must not repeat: the
     key it observed (its value, and its recorded masked spans), and of
     ``entries`` their VALUE (never a description) with each of their recorded
     masked spans. ``prose``: the value was free prose (``value_is_prose``); a
-    span never is, so it is masked even in an upload's prose."""
+    span never is, so it is masked even in an upload's prose. A copy of the
+    write's own value is left out only when its prose flag is the write's
+    (``known_prose``): a typed copy of a prose value keeps its stricter probes."""
     triples = []
     if observed is not None:
         fields = knowledge_crud._meta_fields(observed.meta)
         triples = [(observed.value, observed.detail, fields[3]), *((span, None, False) for span in fields[2] or ())]
     for entry in entries:
         triples += [(entry.value, None, entry.prose), *((span, None, False) for span in entry.masked_spans or ())]
-    return tuple(dict.fromkeys(t for t in triples if t[0] and t[0] != known_secret))
+    return tuple(dict.fromkeys(
+        t for t in triples if t[0] and (t[0] != known_secret or bool(t[2]) != bool(known_prose))
+    ))
 
 
 def _tags_as_given(tags_json: str | None) -> object:
