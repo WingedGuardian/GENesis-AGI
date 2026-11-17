@@ -53,6 +53,13 @@ def _term_shaped(fragment: str) -> bool:
     return all(p.isalpha() or p.isdigit() or len(p) <= 4 for p in _TERM_JOINER.split(fragment) if p)
 
 
+def _forms(text: str) -> set[str]:
+    """The normalised forms of ``text`` (``_decoded``), without an empty one."""
+    if not text.strip():
+        return set()
+    return {form for form in map(_normalise, _decoded(text.strip())) if form.strip()}
+
+
 class ValueMask:
     """Every probe of one held value (``_value_probes``), built ONCE per write
     and reused for every field it masks, with a matcher whose cost is linear in
@@ -78,7 +85,14 @@ class ValueMask:
 
     ``exempt``: the probes skipped as such prose words, decided by the source of
     each probe (``value_masks``) rather than by ``prose``: a known held value or
-    a recorded masked span is never exempt, whatever the incoming text is."""
+    a recorded masked span is never exempt, whatever the incoming text is.
+
+    ``secrets``: the other held secrets the probes came from (``value_masks``'s
+    ``also`` values): a match grows over runs of their text too, not only of
+    ``value``'s.
+
+    A probe given both unbounded and as a whole word is unbounded (the stronger
+    requirement wins), and an empty or whitespace-only probe is no probe."""
 
     def __init__(
         self,
@@ -89,11 +103,11 @@ class ValueMask:
         probes: list[tuple[str, bool]] | None = None,
         captured: list[tuple[str, bool]] | None = None,
         exempt: frozenset[str] | None = None,
+        secrets: list[str] | None = None,
     ):
-        whole = {_normalise(form) for form in _decoded(value.strip())} if value.strip() else set()
+        whole = _forms(value)
         self.short: dict[int, set[str]] = {}
         self.long: dict[str, list[str]] = {}
-        self.words: set[str] = set()
         if probes is None:
             probes = _value_probes(value, login_exempt=login_exempt)
         captured = captured or []
@@ -103,19 +117,22 @@ class ValueMask:
                 if prose
                 else frozenset()
             )
-        for probe, as_word in [*probes, *captured]:
-            if probe in exempt:
-                continue
-            if as_word:
-                self.words.add(probe)
+        kept = [(p, w) for p, w in [*probes, *captured] if p.strip() and p not in exempt]
+        unbounded = {probe for probe, as_word in kept if not as_word}
+        self.words: set[str] = {probe for probe, as_word in kept if as_word} - unbounded
+        for probe in dict.fromkeys(probe for probe, _ in kept):
             if len(probe) <= _SHORT:
                 self.short.setdefault(len(probe), set()).add(probe)
             else:
                 self.long.setdefault(probe[:_SHORT], []).append(probe)
         self.lengths = sorted(self.short)
-        self._whole = whole
+        # A match grows over runs of every secret source, not only of ``value``.
+        self._whole = whole.union(*(_forms(text) for text in secrets or ()))
         self._runs: dict[str, list[str]] = {}
-        self.window = max((len(p.split()) for p in whole), default=1)
+        self.window = max((len(p.split()) for p in self._whole), default=1)
+        # A value that spells the mask text: the mask is then not only a
+        # separator (``carries``).
+        self._spells_mask = any(HELD_MASK in probe for probe, _ in kept)
 
     def runs(self, probe: str) -> list[str]:
         """The short whitespace-delimited runs of the value that hold ``probe``,
@@ -168,12 +185,20 @@ class ValueMask:
     def carries(self, text: str | None) -> bool:
         """Whether ``text`` (normalised, and percent-decoded) carries a probe.
         The body placeholders and the mask are no leak and are left out (the
-        mask as a separator, so the text around it never joins into a match)."""
+        mask as a separator, so the text around it never joins into a match).
+        A value that itself spells the mask text is matched in the text as it
+        stands too, so a literal copy of it never escapes as "a mask"."""
         if not text:
             return False
         held_out = text.replace(SECRET_PLACEHOLDER, "").replace(DETAIL_PLACEHOLDER, "")
-        held_out = held_out.replace(HELD_MASK, "\x00")
-        return any(next(self._matches(_normalise(form)), None) for form in _decoded(held_out))
+        candidates = [held_out.replace(HELD_MASK, "\x00")]
+        if self._spells_mask and HELD_MASK in held_out:
+            candidates.append(held_out)
+        return any(
+            next(self._matches(_normalise(form)), None)
+            for candidate in candidates
+            for form in _decoded(candidate)
+        )
 
     def mask(self, text: str) -> str:
         """``text`` with every span of the value replaced by ``HELD_MASK``, in
@@ -293,9 +318,14 @@ def _captured_probes(texts: list[str | None]) -> list[tuple[str, bool]]:
 
     probes: list[tuple[str, bool]] = []
     for secret in captured_secrets([t for t in texts if t]):
-        probes += [(_normalise(form), not _secret_token(form)) for form in _decoded(secret.strip())]
-        probes += _value_probes(secret)
-    return probes
+        whole = [(_normalise(form), not _secret_token(form)) for form in _decoded(secret.strip())]
+        # The secret whole is matched as the capture rules decide (a plain word
+        # or digits as a whole word), never as ``_value_probes`` would probe it
+        # as a value of its own; its fragments as that does.
+        probes += whole
+        probes += [(p, w) for p, w in _value_probes(secret) if p not in {q for q, _ in whole}]
+    # A secret of format characters only normalises to nothing: no probe.
+    return [(probe, as_word) for probe, as_word in probes if probe.strip()]
 
 
 def _login_of(value: str) -> str | None:
@@ -345,9 +375,17 @@ def value_masks(
     probes: list[tuple[str, bool]] = []
     words: set[str] = set()
     kept: set[str] = set()
+    # The identifier exempts a probe as a login only when EVERY source that
+    # produced it produced it as its login: one that requires it as a secret
+    # keeps it (a new password that is an old entry's login).
+    as_login: set[str] = set()
+    as_secret: set[str] = set()
     for text, is_prose in sources:
         own = _value_probes(text)
         probes += own
+        login = _login_of(text)
+        as_login |= {probe for probe, _ in own if probe == login}
+        as_secret |= {probe for probe, _ in own if probe != login}
         skip = (
             _prose_words(own, {_normalise(f) for f in _decoded(text.strip())}, taken)
             if is_prose
@@ -356,14 +394,13 @@ def value_masks(
         words |= skip
         kept |= {probe for probe, _ in own if probe not in skip}
     exempt = frozenset(words - kept)
-    logins = {
-        login for login in map(_login_of, [value, *(text for text, _ in sources[1:])]) if login
-    }
+    logins = as_login - as_secret
     whole = {_normalise(form) for form in _decoded(value.strip())}
     named = [(p, w) for p, w in probes if p not in logins or p in whole]
+    secrets = [text for text, _ in sources[1:]]
     return (
-        ValueMask(value, probes=probes, captured=captured, exempt=exempt),
-        ValueMask(value, probes=named, captured=captured, exempt=exempt),
+        ValueMask(value, probes=probes, captured=captured, exempt=exempt, secrets=secrets),
+        ValueMask(value, probes=named, captured=captured, exempt=exempt, secrets=secrets),
     )
 
 
