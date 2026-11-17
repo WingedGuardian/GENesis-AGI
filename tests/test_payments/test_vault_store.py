@@ -19,6 +19,7 @@ import pytest
 from pyrage import decrypt, x25519
 from pyrage import passphrase as age_passphrase
 
+from genesis.payments import approval
 from genesis.payments import vault_migrate as vm
 from genesis.payments import vault_release_store as vrs
 from genesis.payments import vault_store as vs
@@ -106,6 +107,32 @@ def _add(path, number=VISA, **kw):
     kw.setdefault("merchant", "shop.example.com")
     kw.setdefault("single_use", False)
     return vs.add_card(vs.parse_card(number, _future(), "123"), path=path, **kw)
+
+
+def test_a_card_ref_never_holds_twelve_digits(monkeypatch):
+    tails = iter(("123456789012", "12345678901a"))
+    calls = []
+
+    def token_hex(n):
+        calls.append(n)
+        return next(tails)
+
+    monkeypatch.setattr(vs.secrets, "token_hex", token_hex)
+    assert vs._new_card_ref() == "card_12345678901a"
+    assert calls == [6, 6]
+
+
+def test_a_new_card_ref_matches_the_card_ref_shape():
+    for _ in range(200):
+        ref = vs._new_card_ref()
+        assert vs.CARD_REF.fullmatch(ref)
+        assert not approval.holds_long_digit_run(ref)
+
+
+def test_add_card_uses_the_guarded_ref(monkeypatch, vault):
+    tails = iter(("123456789012", "12345678901a"))
+    monkeypatch.setattr(vs.secrets, "token_hex", lambda n: next(tails))
+    assert _add(vault) == "card_12345678901a"
 
 
 class TestInit:
