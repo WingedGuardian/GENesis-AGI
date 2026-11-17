@@ -503,6 +503,77 @@ def test_extra_dirs_archived_encrypted_offsite_only_with_default_excludes(backup
     assert status["extra_dirs"] == 1 and status["extra_dirs_skipped"] == 0, status
 
 
+def test_extra_dirs_stream_into_encryption_without_a_plaintext_archive(backup_env, tmp_path):
+    """The directory is archived to stdout straight into encryption: a plaintext tar
+    on disk doubled the stage's writes (several GB per run on a large directory).
+    A `tar` shim records where each archive is written; the result still lists."""
+    home = backup_env["home"]
+    _seed_extra_dir(home)
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    log = tmp_path / "tar-calls.log"
+    real_tar = shutil.which("tar")
+    _make_stub(
+        backup_env["bind"] / "tar",
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{log}"\n'
+        f'exec {real_tar} "$@"\n',
+    )
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store"})
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    calls = [c for c in log.read_text().splitlines() if "--hard-dereference" in c]
+    assert len(calls) == 1, calls
+    assert " -cf - -- work/store" in calls[0], calls[0]
+    archives = sorted((_repo(backup_env) / "extra").glob("*.tar.gpg"))
+    assert len(archives) == 1, archives
+    assert "work/store/sub/b.txt" in _list_extra_archive(archives[0], home)
+    assert _status(backup_env)["extra_dirs"] == 1
+
+
+@pytest.mark.parametrize(
+    "where,said",
+    [
+        # Early: the stream breaks at once, so the check fails as well.
+        ("40", "restore could not use the archive"),
+        # The last byte: it lies in the integrity code after all the data, so the
+        # check reads every member and passes; only the decrypt's authentication,
+        # at the very end, can stop the archive shipping. (A byte a little earlier
+        # can land in the compressed data, whose size varies with the members'
+        # mtimes, and then the check fails first.)
+        ('$(( $(stat -c %s "$out") - 1 ))', "the encrypted archive did not read back"),
+    ],
+    ids=["early", "at-the-end"],
+)
+def test_extra_archive_that_does_not_read_back_is_not_shipped(backup_env, tmp_path, where, said):
+    """The check decrypts the encrypted archive that would ship. A damaged one (a
+    `gpg` shim flips a byte in the extra archive it encrypts) fails authentication
+    and is skipped, never moved into place or uploaded."""
+    home = backup_env["home"]
+    _seed_extra_dir(home)
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    real_gpg = shutil.which("gpg")
+    _make_stub(
+        backup_env["bind"] / "gpg",
+        "#!/usr/bin/env bash\n"
+        'out=""; prev=""\n'
+        'for a in "$@"; do [ "$prev" = -o ] && out="$a"; prev="$a"; done\n'
+        f'{real_gpg} "$@"; rc=$?\n'
+        'case "$out" in */extra/.* | extra/.*)\n'
+        f'    printf "\\xff" | dd of="$out" bs=1 seek={where} conv=notrunc status=none ;;\n'
+        "esac\n"
+        'exit "$rc"\n',
+    )
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store"})
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    shipped = list((_repo(backup_env) / "extra").iterdir())
+    assert not shipped, shipped
+    assert said in proc.stdout, proc.stdout[-2000:]
+    status = _status(backup_env)
+    assert status["extra_dirs"] == 0 and status["extra_dirs_skipped"] == 1, status
+    assert status["tier2_status"] == "partial", status
+
+
 def test_extra_upload_failure_keeps_complete_but_marks_offsite_unconfirmed(backup_env, tmp_path):
     """Codex P1 on PR #2853: an extra archive that fails to upload must not leave the
     off-site copy reported as confirmed, and must not withhold COMPLETE either
