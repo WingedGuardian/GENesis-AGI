@@ -1935,7 +1935,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: 9eaa6aba0 2026-11-15
+verified: d70924fb5 2026-11-15
 ```
 
 Scoped verification covers `mcp/shared_http` composition. It receives
@@ -2141,7 +2141,7 @@ the shared banner is not an assertion about all concurrent sessions.
   Matching terminal leader states alone do not prove controller process end.
   The same-connection final drain observes callback-created evidence before
   commit. The acknowledgement grants no retry or acceptance. The automatic
-  reconciliation caller remains separate (#3728); acceptance, cutover,
+  reconciliation caller remains separate (#3728); cutover,
   native qualification and production capacity remain separate gates.
   Explicit request/revoke/status operations use the existing provider-state
   grant and bind actual work, retained debt, evidence, provider and runner/
@@ -2154,7 +2154,14 @@ the shared banner is not an assertion about all concurrent sessions.
   or lost replies cannot reconstruct runtime authority. Ordinary owner admission
   still refuses selected provenance. GN binds ordinary versus selected recovery
   argv to actual durable origin before owner construction and during source
-  recapture. Acceptance, cutover and automatic readiness remain separate gates.
+  recapture. Captured `accept-retry` publishes explicit metadata for a clean,
+  already-settled selected trial after exact source/policy, debt and physical/
+  control checks. It never settles accounting, retires an inflight pointer or
+  launches a provider. Immutable replay recovers a lost acceptance reply without
+  resend; current drain annotations allow only older known retained provider
+  evidence to use the acceptance watermark. Trial/newer hazards and physical
+  obligations remain independent holds. Cutover and automatic readiness remain
+  separate gates.
   Selected acknowledgements recheck repository-wide physical/control holds after
   their final drain. A transient same-transaction fresh proof binds the original
   lifetime subject and exact-sequence raw cleanup evidence; it grants no durable
@@ -2270,7 +2277,9 @@ the shared banner is not an assertion about all concurrent sessions.
   observations preserve owned OOM kills, including the first sample, before
   duplicate/conflict reduction; clean control cannot erase resource evidence.
   Default initialization stays4; new native authority requires5, with no live
-  cutover, acceptance setter or positive automatic readiness here. Explicit
+  cutover or positive automatic readiness here. The explicit acceptance setter
+  changes only the five existing receipt fields after completed-trial validation.
+  Explicit
   transaction-only retry grants in `index_marker_retry.py` require schema5 and
   captured supervision. Selected consumption shares the existing transaction,
   final drain and physical owner, preserving original identity and first-commit
