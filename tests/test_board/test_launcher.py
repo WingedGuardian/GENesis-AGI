@@ -102,7 +102,7 @@ class World:
         (self.root / launcher.GUARD_HOOK).write_text("# guard\n")
         (self.root / ".claude" / "settings.json").write_text(
             '{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", '
-            '"command": "x/.claude/hooks/genesis-hook hooks/builder_guard.py"}]}]}}'
+            '"command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/builder_guard.py"}]}]}}'
         )
         self.builders = tmp_path / "builders"
         self.reset()
@@ -1141,9 +1141,9 @@ async def test_disarming_after_the_gate_closes_the_attempt_without_a_strike(db, 
     [
         '{"note": "hooks/builder_guard.py"}',
         '{"hooks": {"PreToolUse": [{"matcher": "Write", "hooks": [{"type": "command", '
-        '"command": "x/genesis-hook hooks/builder_guard.py"}]}]}}',
+        '"command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/builder_guard.py"}]}]}}',
         '{"hooks": {"PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", '
-        '"command": "x/genesis-hook hooks/builder_guard.py"}]}]}}',
+        '"command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/builder_guard.py"}]}]}}',
         "not json",
     ],
 )
@@ -1268,9 +1268,24 @@ def test_matchers_follow_claude_codes_rules(matcher, covers):
 @pytest.mark.parametrize(
     ("command", "wired"),
     [
-        ("x/genesis-hook hooks/builder_guard.py", True),
-        ("[ -d x ] || exit 0; x/genesis-hook hooks/builder_guard.py", True),
+        ("${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/builder_guard.py", True),
+        ("  ${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/builder_guard.py  ", True),
         ("echo hooks/builder_guard.py.bak", False),
+        # Only the exact command runs the repo's guard and blocks (CodeRabbit, audit).
+        ("python3 /tmp/hooks/builder_guard.py", False),
+        ("x/other-runner hooks/builder_guard.py", False),
+        ("x/genesis-hook hooks/builder_guard.py", False),
+        (
+            "[ -d x ] || exit 0; ${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/builder_guard.py",
+            False,
+        ),
+        ("echo ${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/builder_guard.py", False),
+        ("${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/builder_guard.py || true", False),
+        ("${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/builder_guard.py &", False),
+        (
+            "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/builder_guard.py < /dev/null",
+            False,
+        ),
     ],
 )
 def test_the_guard_command_must_run_the_hook(tmp_path, command, wired):
@@ -1366,3 +1381,29 @@ async def test_door_would_refuse_reads_the_doors_own_decision(monkeypatch, rc, o
     monkeypatch.setattr(probes, "_exec", fake_exec)
     assert await probes.door_would_refuse(3) is expected
     assert calls[0][1:] == ["-m", "genesis.cc.session_cap", "--existing", "3"]
+
+
+def test_an_async_guard_hook_does_not_count(tmp_path):
+    """An async hook does not block the command it watches."""
+    f = tmp_path / "s.json"
+    f.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/builder_guard.py",
+                                    "async": True,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        )
+    )
+    assert launcher._guard_wired(f) is False

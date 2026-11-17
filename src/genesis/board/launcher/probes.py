@@ -253,13 +253,17 @@ def _matcher_covers_bash(matcher: str) -> bool:
         return False
 
 
-def _guard_wired(settings: Path) -> bool:
-    """True when the settings run the builder guard as a PreToolUse hook on Bash:
-    a ``command`` hook whose command has a ``hooks/builder_guard.py`` word, in a
-    block whose matcher covers ``Bash`` by Claude Code's rules, with hooks not
-    disabled. A mention anywhere else does not count."""
-    import shlex
+#: The one command that runs this repo's builder guard: the hook dispatcher runs
+#: ``scripts/<arg>``. Every hook in the repo's settings has this shape.
+GUARD_COMMAND = "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/builder_guard.py"
 
+
+def _guard_wired(settings: Path) -> bool:
+    """True when the settings run THIS repo's builder guard as a blocking
+    PreToolUse hook on Bash: a ``command`` hook whose command is exactly
+    :data:`GUARD_COMMAND` (no prefix or suffix that could skip or detach it), not
+    ``async``, in a block whose matcher covers ``Bash`` by Claude Code's rules,
+    with hooks not disabled. Anything else does not count."""
     try:
         data = json.loads(settings.read_text())
         blocks = data["hooks"]["PreToolUse"]
@@ -271,12 +275,11 @@ def _guard_wired(settings: Path) -> bool:
         if not isinstance(block, dict) or not _matcher_covers_bash(block.get("matcher") or ""):
             continue
         for hook in block.get("hooks") or []:
-            if not isinstance(hook, dict) or hook.get("type") != "command":
-                continue
-            try:
-                words = shlex.split(str(hook.get("command", "")))
-            except ValueError:
-                continue
-            if "hooks/builder_guard.py" in words:
+            if (
+                isinstance(hook, dict)
+                and hook.get("type") == "command"
+                and hook.get("async") is not True
+                and str(hook.get("command", "")).strip() == GUARD_COMMAND
+            ):
                 return True
     return False
