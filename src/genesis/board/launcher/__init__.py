@@ -104,7 +104,7 @@ EVENT_READ_LIMIT = 500
 #: cc-slot.sh launch (spec E3c): 75 = slot taken or box at its session cap.
 RC_REFUSED = 75
 #: The builder guard (spec E3e). No launch until it is installed and wired.
-GUARD_HOOK = Path("scripts") / "hooks" / "builder_guard.py"
+GUARD_HOOK = Path("scripts/hooks/builder_guard.py")
 _SLOT_RE = re.compile(r"^cc-([1-9][0-9]{0,3})$")
 _FINAL_FOR_MOVE = ("builder_launched", "launch_refused", "move_absorbed")
 _LATE_AFTER = timedelta(seconds=420)  # one tick interval plus slack
