@@ -17,7 +17,7 @@ Usage:
     delivery_marker.py compose --pr N --head SHA --verdict V --scope S --checker K
                                --body-file PROSE [--intended I] [--change C]
                                [--coderabbit R] [--outcome O] [--basis B]
-                               [--repo OWNER/REPO] [--out FILE] [--second-reader]
+                               [--repo OWNER/REPO] [--out FILE] [--aside] [--second-reader]
     delivery_marker.py read --pr N [--repo OWNER/REPO]
 
 ``compose`` validates the fields, derives the basis from the PR body's first pointer
@@ -57,8 +57,16 @@ import acceptance_declaration  # noqa: E402
 #: would let any comment that mentions the format make a PR read as malformed, and let
 #: compose pick that comment as the one to overwrite. The match is case-insensitive and
 #: spacing-tolerant so a near-miss header is reported, not silently invisible.
-LEAD_RE = re.compile(r"\A\s*<!--\s*genesis-delivery-check\s*:(.*?)-->", re.DOTALL | re.IGNORECASE)
-_EXACT_RE = re.compile(r"\A\s*<!--\s*genesis-delivery-check:")
+#: One line that is exactly ``(aside)`` may come first: on a Devin-built PR every comment
+#: whose first line is not ``(aside)`` starts a paid Devin session (owner ruling,
+#: 2026-11-17 UTC), and the marker must still open the comment for every reader. The
+#: lead match also takes the near-misses of that line (other case, blank lines or
+#: spaces around it) so they are reported as unusable; only the exact form passes.
+LEAD_RE = re.compile(
+    r"\A\s*(?:\(aside\)\s*)?<!--\s*genesis-delivery-check\s*:(.*?)-->",
+    re.DOTALL | re.IGNORECASE,
+)
+_EXACT_RE = re.compile(r"\A(?:\(aside\)[ \t]*\r?\n|\s*)<!--\s*genesis-delivery-check:")
 
 _NAME = r"[A-Za-z0-9._-]+"
 VALUES: dict[str, re.Pattern[str]] = {
@@ -188,7 +196,10 @@ def parse(text: str) -> list[dict]:
         if len(m.group(1).splitlines()) > 1:  # any line separator, U+2028 included
             problem, tokens = "the header must be one line", []
         if not _EXACT_RE.match(text):
-            problem = "the header must open with '<!-- genesis-delivery-check:' exactly"
+            problem = (
+                "the header must open the comment with '<!-- genesis-delivery-check:' exactly,"
+                " after at most one line that is exactly '(aside)'"
+            )
             raw, tokens = m.group(0).strip(), []
         for token in tokens:
             key, sep, value = token.partition("=")
@@ -328,11 +339,12 @@ def _basis_words(basis: str) -> str:
     }.get(kind, "the PR's own claim")
 
 
-def render(fields: dict[str, str], prose: str) -> str:
-    """The comment body: the header, a generated first line, then the prose."""
+def render(fields: dict[str, str], prose: str, *, aside: bool = False) -> str:
+    """The comment body: ``(aside)`` when asked, the header, a generated first line,
+    then the prose."""
     head = " ".join(f"{k}={fields[k]}" for k in VALUES if k in fields)
     return (
-        f"<!-- genesis-delivery-check: {head} -->\n"
+        ("(aside)\n" if aside else "") + f"<!-- genesis-delivery-check: {head} -->\n"
         f"**Delivery check** at `{fields['head'][:12]}` against {_basis_words(fields['basis'])}\n"
         f"{prose.rstrip()}\n"
     )
@@ -407,6 +419,72 @@ def _is_owner(row: dict, owner: str) -> bool:
     return (row.get("login") or "").lower() == owner or (
         row.get("author_association") or ""
     ).upper() == "OWNER"
+
+
+def _order(row: dict) -> tuple[str, int]:
+    """Later edit first when sorted descending; equal stamps fall back to the higher id."""
+    return (str(row.get("stamp") or ""), int(row.get("id") or 0))
+
+
+def select(comments: list[dict], reviews: list[dict], owner: str, head: str) -> dict:
+    """Which marker block governs a PR, the one rule ``read`` and the gate row share.
+
+    Only an owner's PR comment counts (a review body cannot be edited in place, and a
+    marker from anyone else is ignored). Among the usable ones, the latest-edited block
+    at ``head`` governs; with none at ``head``, the latest-edited block. This matches the
+    writer, which re-edits the owner's latest marker comment, and needs no commit list.
+    An owner block that is unusable never governs, but one edited after the governing
+    block is returned in ``later_unusable``: it may be a newer verdict with a typo, so a
+    reader must not print the older one as settled.
+
+    Returns ``{"governing", "later_unusable", "blocks", "notes"}``: ``governing`` is a
+    block row (``id``, ``login``, ``stamp``, ``where``, ``fields``) or None, ``blocks``
+    every marker block found with its ``where`` and ``treatment``, ``notes`` one line per
+    ignored block or row.
+
+    ``governing`` says nothing about the basis: a caller compares its ``basis`` with the
+    PR's current one. Stamps compare as strings, which orders GitHub REST timestamps
+    (fixed-width UTC, ``...Z``); pass stamps in that one format. A row whose id is not a
+    GitHub integer id is skipped with a note, never ordered.
+    """
+    blocks, notes, usable, unusable = [], [], [], []
+    for where, rows in (("comment", comments), ("review", reviews)):
+        for row in rows:
+            cid = row.get("id") if isinstance(row, dict) else None
+            if not isinstance(cid, int) or isinstance(cid, bool):
+                notes.append(
+                    f"{where} row skipped: id {_safe(cid)[:40]} is not a GitHub integer id"
+                )
+                continue
+            for block in parse(row.get("body") or ""):
+                entry = {
+                    **block,
+                    "id": row.get("id"),
+                    "login": row.get("login"),
+                    "stamp": row.get("stamp"),
+                    "where": where,
+                }
+                label = _safe(f"{where} {row.get('id')} by {row.get('login')} ({row.get('stamp')})")
+                if not _is_owner(row, owner):
+                    entry["treatment"] = "ignored, not the repo owner"
+                    notes.append(f"{label}: {entry['treatment']}")
+                elif where == "review":
+                    entry["treatment"] = (
+                        "ignored, a review body cannot be edited in place; use compose"
+                    )
+                    notes.append(f"{label}: {entry['treatment']}")
+                elif block["problem"]:
+                    entry["treatment"] = f"unusable, {_safe(block['problem'])}"
+                    unusable.append(entry)
+                else:
+                    entry["treatment"] = "usable"
+                    usable.append(entry)
+                blocks.append(entry)
+    at_head = [b for b in usable if b["fields"]["head"] == head]
+    pool = at_head or usable
+    governing = max(pool, key=_order) if pool else None
+    later = [b for b in unusable if governing is None or _order(b) > _order(governing)]
+    return {"governing": governing, "later_unusable": later, "blocks": blocks, "notes": notes}
 
 
 # ── commands ─────────────────────────────────────────────────────────────────
@@ -646,11 +724,17 @@ def compose(a: argparse.Namespace) -> int:
     out = (Path(a.out) if a.out else home / "delivery" / f"pr-{a.pr}-{head[:12]}.md").resolve()
     try:
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(render(fields, prose), encoding="utf-8")
+        # A re-read keeps the (aside) line the comment it replaces opens with, so a
+        # forgotten --aside cannot strip it on a Devin-built PR.
+        replaced = max(mine, key=_order) if mine else None
+        aside = a.aside or bool(
+            replaced and (replaced.get("body") or "").lstrip().startswith("(aside)")
+        )
+        out.write_text(render(fields, prose, aside=aside), encoding="utf-8")
     except OSError as exc:
         raise Refused(f"cannot write {out}: {exc}") from exc
     if mine:
-        latest = max(mine, key=lambda c: c.get("stamp") or "")
+        latest = replaced
         cmd = [
             "gh",
             "api",
@@ -686,40 +770,34 @@ def read(a: argparse.Namespace) -> int:
     except Refused as exc:
         current, why = None, str(exc)
     print(f"PR #{a.pr} head {head[:12]} basis {current or 'unreadable: ' + _safe(why)}")
-    seen = 0
-    for where, rows in (
-        ("comment", _comments(repo, a.pr)),
-        ("review", _comments(repo, a.pr, reviews=True)),
-    ):
-        for row in rows:
-            for block in parse(row.get("body") or ""):
-                seen += 1
-                label = _safe(f"{where} {row.get('id')} by {row.get('login')} ({row.get('stamp')})")
-                if not _is_owner(row, owner):
-                    print(f"- {label}: ignored, not the repo owner")
-                elif where == "review":
-                    print(
-                        f"- {label}: ignored, a review body cannot be edited in place; use compose"
-                    )
-                elif block["problem"]:
-                    print(f"- {label}: unusable, {_safe(block['problem'])}")
-                else:
-                    f = block["fields"]
-                    at = (
-                        "at the current head"
-                        if f["head"] == head
-                        else f"at {f['head'][:12]}, not the current head"
-                    )
-                    if current is None:
-                        at += ", the PR's basis cannot be derived now: re-read"
-                    elif f["basis"] != current:
-                        at += f", but the PR's basis is now {current}: re-read"
-                    print(
-                        f"- {label}: {at}: "
-                        + " ".join(f"{k}={v}" for k, v in f.items() if k != "head")
-                    )
-    if not seen:
+    sel = select(_comments(repo, a.pr), _comments(repo, a.pr, reviews=True), owner, head)
+    for b in sel["blocks"]:
+        label = _safe(f"{b['where']} {b['id']} by {b['login']} ({b['stamp']})")
+        if b["treatment"] != "usable":
+            print(f"- {label}: {b['treatment']}")
+            continue
+        f = b["fields"]
+        at = (
+            "at the current head"
+            if f["head"] == head
+            else f"at {f['head'][:12]}, not the current head"
+        )
+        if current is None:
+            at += ", the PR's basis cannot be derived now: re-read"
+        elif f["basis"] != current:
+            at += f", but the PR's basis is now {current}: re-read"
+        mark = " (governs)" if b is sel["governing"] else ""
+        print(
+            f"- {label}{mark}: {at}: " + " ".join(f"{k}={v}" for k, v in f.items() if k != "head")
+        )
+    if not sel["blocks"]:
         print("no delivery check recorded")
+    elif sel["governing"] is None:
+        print("no usable owner delivery check recorded")
+    for b in sel["later_unusable"] if sel["governing"] else []:
+        print(
+            f"note: owner comment {b['id']} is later than the governing read and unusable; it may supersede it"
+        )
     return 0
 
 
@@ -739,6 +817,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     c.add_argument("--out", help="where to write the comment (default $GENESIS_HOME/delivery/)")
     c.add_argument("--repo")
+    c.add_argument(
+        "--aside",
+        action="store_true",
+        help="open the comment with an (aside) line (a Devin-built PR: no Devin session)",
+    )
     c.add_argument(
         "--second-reader",
         action="store_true",
