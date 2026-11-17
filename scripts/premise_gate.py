@@ -36,11 +36,20 @@ Run by ``.github/workflows/premise-gate.yml`` on ``issues`` events. Two jobs:
    included (one shared ``_may_add``), so the two jobs never disagree about it.
    The guard acts only while ``devin-ready`` is still on the issue, so a re-run
    posts no second comment (two runs overlapping in time still can, inside the
-   race accepted below).
+   race accepted below). A PROPOSAL (answer 2 says ``Stated: nowhere``: nothing
+   states the behaviour it asks for) loses ``devin-ready`` too, all nine
+   answered or not, until an edit cites the decision (spec 5.4).
+3. **Proposal label.** The label job keeps ``proposal`` in line with the body,
+   as it does ``premises-missing``. It mirrors the body and nothing reads it
+   back, so a label added or removed by hand decides nothing; the label job does
+   not run on that event, so it stays as set until the next event the gate does
+   run on (an edit, a reopen, a ``bug`` relabel, ``devin-ready`` applied; owner
+   ruling 2026-11-15).
 
 ``python3 scripts/premise_gate.py check <issue>`` is the read-only check a
-session runs BEFORE applying ``devin-ready`` (exit 0 ready, 1 answers missing,
-2 unreadable): the guard acts only after the paid label event.
+session runs BEFORE applying ``devin-ready`` (exit 0 ready, 1 answers missing or
+a proposal, 2 unreadable): the guard acts only after the paid label event. Both
+read ``paid_build_refusal``, so they cannot disagree.
 
 The answers are read by the plan reader's own parser
 (``scripts/hooks/plan_doc.premise_answers`` with the plan gate's emptiness rule),
@@ -77,6 +86,17 @@ from plan_doc import premise_answers, strip_quoted  # noqa: E402
 from plan_premise_gate import _QUESTIONS, _empty, _problem  # noqa: E402
 
 MISSING_LABEL = "premises-missing"
+#: Answer 2 says ``Stated: nowhere``: nothing states the behaviour the issue asks
+#: for, so it is a proposal, not a fix (``plan_premise_gate.is_proposal``).
+PROPOSAL_LABEL = "proposal"
+#: The labels this gate adds, created before each add (``apply``).
+_LABEL_DEFS = {
+    MISSING_LABEL: ("D93F0B", "Premise answers missing; see .claude/docs/premise-check.md"),
+    PROPOSAL_LABEL: (
+        "C5DEF5",
+        "Nothing states the intended behaviour (Stated: nowhere); see .claude/docs/premise-check.md",
+    ),
+}
 DEVIN_LABEL = "devin-ready"
 BUG_LABEL = "bug"
 #: A bug report answers whether the bug is REAL, not how to build a change (owner
@@ -259,6 +279,27 @@ def _sync_missing_label(plan: Plan, issue: dict, labels: set[str], *, may_add: b
         plan.remove.append(MISSING_LABEL)
 
 
+def _sync_proposal_label(plan: Plan, issue: dict, labels: set[str]) -> None:
+    """Bring ``proposal`` in line with the issue's body. The label mirrors the
+    body and nothing reads it back: the guard and ``check`` read the body, so a
+    label added or removed by hand decides nothing (and stays until the next
+    edit; the label job does not run on that event, by owner ruling)."""
+    proposal = _plan_gate.is_proposal(premise_answers(strip_quoted(issue.get("body") or "")))
+    if proposal and PROPOSAL_LABEL not in labels:
+        plan.add.append(PROPOSAL_LABEL)
+    elif not proposal and PROPOSAL_LABEL in labels:
+        plan.remove.append(PROPOSAL_LABEL)
+
+
+def paid_build_refusal(body: str) -> tuple[tuple[str, ...], list[int], dict[int, str], bool]:
+    """``(questions, missing, why, proposal)``: why a paid build (``devin-ready``)
+    is refused on ``body``, if it is. The guard and ``check`` both read this, so
+    they cannot disagree: missing premise answers, or a proposal."""
+    questions, missing, why = premise_gaps(body, build=True)
+    proposal = _plan_gate.is_proposal(premise_answers(strip_quoted(body or "")))
+    return questions, missing, why, proposal
+
+
 def _may_add(issue: dict) -> bool:
     """Whether the gate may newly ADD ``premises-missing`` to this issue: created
     at or after ``GATE_EPOCH``, and not a bug-form report. The ONE rule both jobs
@@ -358,26 +399,37 @@ def decide(event: dict) -> Plan:
         if DEVIN_LABEL not in labels:
             return plan  # already removed (a re-run, or another guard run): no second comment
         # The paid trigger always needs the premise answers that specify a
-        # change, bug or not: the six, or all nine of the nine-item form.
-        questions, build_missing, why = premise_gaps(issue.get("body") or "", build=True)
-        if build_missing:
+        # change, bug or not, and never runs on a proposal (spec 5.4).
+        body = issue.get("body") or ""
+        questions, build_missing, why, proposal = paid_build_refusal(body)
+        if build_missing or proposal:
             plan.remove.append(DEVIN_LABEL)
-            note = conversion_note(issue.get("body") or "", questions)
-            plan.comment = _comment(build_missing, questions, why, note)
+            note = conversion_note(body, questions) if build_missing else ""
+            plan.comment = _comment(build_missing, questions, why, note, proposal=proposal)
         _sync_missing_label(plan, issue, labels, may_add=_may_add(issue))
+        _sync_proposal_label(plan, issue, labels)
         return plan
 
     relabelled_bug = action in ("labeled", "unlabeled") and changed == BUG_LABEL
     if action not in ("opened", "edited", "reopened") and not relabelled_bug:
         return plan
     _sync_missing_label(plan, issue, labels, may_add=_may_add(issue))
+    _sync_proposal_label(plan, issue, labels)
     return plan
 
 
-REMOVED_LINE = f"`{DEVIN_LABEL}` was removed: this issue is missing premise answers"
+#: The comment's lead; ``apply`` swaps it for ``NOT_REMOVED_LINE`` when the
+#: removal failed, whatever the reasons that follow it.
+REMOVED_LINE = f"`{DEVIN_LABEL}` was removed"
 NOT_REMOVED_LINE = (
     f"`{DEVIN_LABEL}` could NOT be removed automatically; remove it by hand before a "
-    "Devin session starts: this issue is missing premise answers"
+    "Devin session starts"
+)
+PROPOSAL_LINE = (
+    "Answer 2 says `Stated: nowhere`, so this is a proposal: nothing states the "
+    "behaviour it asks for. It is cleared by an edit that replaces `nowhere` in "
+    "answer 2 with the citation of the decision (for example `Stated: owner ruling "
+    f"<date>, this issue`); removing the `{PROPOSAL_LABEL}` label does not clear it."
 )
 
 
@@ -401,16 +453,30 @@ def _comment(
     questions: Sequence[str] = _QUESTIONS,
     why: dict[int, str] | None = None,
     note: str = "",
+    *,
+    proposal: bool = False,
 ) -> str:
     why = why or {}
+    reasons = " and ".join(
+        r
+        for r, on in (
+            ("this issue is missing premise answers", bool(missing)),
+            ("this issue is a proposal", proposal),
+        )
+        if on
+    )
+    if not reasons:
+        raise ValueError("a devin-ready comment needs missing answers or a proposal")
+    head = f"(aside)\n\n{REMOVED_LINE}: {reasons}, so it is not ready for a paid build session.\n\n"
+    if not missing:
+        return head + f"{PROPOSAL_LINE} Then apply `{DEVIN_LABEL}` again.\n"
     rows = "".join(
         f"{n}. {questions[n - 1]}" + (f" ({why[n]})" if n in why else "") + "\n" for n in missing
     )
     return (
-        "(aside)\n\n"
-        f"{REMOVED_LINE}, so it is not "
-        "ready for a paid build session.\n\n"
+        head
         + (f"{note}\n\n" if note else "")
+        + (f"{PROPOSAL_LINE}\n\n" if proposal else "")
         + f"Missing or empty ({len(missing)} of {len(questions)}):\n\n{rows}\n"
         f"Add a `## Premise checks` section with all {len(questions)} numbered answers "
         "(`n/a — <reason>` counts), then apply the label again. Format: "
@@ -430,10 +496,11 @@ def apply(plan: Plan, number: int, run: Runner = _gh) -> int:
     largest exit code.
 
     Removing ``devin-ready`` goes FIRST and on its own, so no later or cosmetic
-    step (creating the label, the comment) can stand between a paid trigger and
-    its removal. Creating ``premises-missing`` fails when the label already
-    exists, which is the usual case, so its exit code is ignored: if the label
-    really is missing, the add that follows fails and that failure is reported.
+    step (creating a label, the comment) can stand between a paid trigger and
+    its removal. Each label in ``_LABEL_DEFS`` is created before it is added;
+    creating it fails when it already exists, which is the usual case, so that
+    exit code is ignored: if the label really is missing, the add that follows
+    fails and that failure is reported.
     """
     codes = []
     comment = plan.comment
@@ -442,18 +509,10 @@ def apply(plan: Plan, number: int, run: Runner = _gh) -> int:
         codes.append(removed)
         if removed != 0:
             comment = comment.replace(REMOVED_LINE, NOT_REMOVED_LINE, 1)
-    if MISSING_LABEL in plan.add:
-        run(
-            [
-                "label",
-                "create",
-                MISSING_LABEL,
-                "--color",
-                "D93F0B",
-                "--description",
-                "Premise answers missing; see .claude/docs/premise-check.md",
-            ]
-        )
+    for name in plan.add:
+        if name in _LABEL_DEFS:
+            color, description = _LABEL_DEFS[name]
+            run(["label", "create", name, "--color", color, "--description", description])
     edit: list[str] = []
     for name in plan.add:
         edit += ["--add-label", name]
@@ -522,9 +581,9 @@ def check(number: int, view: Viewer = _view) -> int:
     Run it BEFORE applying the label. Prints the missing premise answers (and,
     for a ``bug`` issue, the missing verification answers). Returns 0 when the
     premise answers a paid build owes are complete (``premise_gaps`` with
-    ``build``), 1 when any is missing, 2 when the issue cannot be read. Only
-    those decide the code, because only they decide whether the guard removes
-    the label.
+    ``build``) and the issue is not a proposal, 1 when any is missing or it is
+    a proposal (``paid_build_refusal``), 2 when the issue cannot be read. Only
+    those decide the code, because they are exactly what the guard reads.
     """
     issue = view(number)
     if not isinstance(issue, dict):
@@ -533,19 +592,20 @@ def check(number: int, view: Viewer = _view) -> int:
     body = issue.get("body") or ""
     # gh names the creation time createdAt; the predicates read created_at.
     issue = {**issue, "created_at": issue.get("created_at") or issue.get("createdAt") or ""}
-    questions, missing, _ = premise_gaps(body, build=True)
+    questions, missing, _, proposal = paid_build_refusal(body)
     if missing and (note := conversion_note(body, questions)):
         print(note)
+    if proposal:
+        print(PROPOSAL_LINE)
     for n in missing:
         print(f"missing premise answer {n}: {questions[n - 1]}")
     if _owes_verification(issue):
         for n in missing_answers(body, bug=True):
             print(f"missing verification answer {n}: {VERIFICATION_QUESTIONS[n - 1]}")
-    if missing:
-        print(
-            f"premise_gate: issue {number}: NOT ready for {DEVIN_LABEL} "
-            f"({len(missing)} of {len(questions)} missing)"
-        )
+    if missing or proposal:
+        why = [f"{len(missing)} of {len(questions)} missing"] if missing else []
+        why += ["a proposal"] if proposal else []
+        print(f"premise_gate: issue {number}: NOT ready for {DEVIN_LABEL} ({'; '.join(why)})")
         return 1
     print(f"premise_gate: issue {number}: ready for {DEVIN_LABEL}")
     return 0

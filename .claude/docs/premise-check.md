@@ -34,6 +34,19 @@ nothing after it. Answer 2 must carry `Stated:` and answer 5 `Wrong fix:`, each
 answered. `Stated: nowhere` is an honest answer: the change is then a proposal,
 not a fix. Item 9's size rule and its bands are step 6 of "The method" below.
 
+**Proposals.** An issue whose answer 2 says `Stated: nowhere` (quotes or bold
+allowed; only that word counts) gets the `proposal` label from the premise gate
+Action, and loses it when an edit gives answer 2 a citation. Clearing a proposal
+is that edit, not a second label: the owner's decision replaces `nowhere` as the
+citation (`Stated: owner ruling 2026-11-20, this issue`), and the issue is then
+an ordinary one. The label mirrors the body and nothing reads it back: removing
+it by hand clears nothing, and it stays as set until the gate next runs on the
+issue (an edit, a reopen, a `bug` relabel, or `devin-ready` applied).
+`devin-ready` on a proposal is removed with the `(aside)` comment, even when all
+nine answers are there. Another wording that admits no citation, such as
+`none — new behaviour`, is not read as one (owner ruling 2026-11-15): only the
+word the form names.
+
 **Who owes what.** An issue owes the Problem block, and the Change block too if
 any of it is written. A plan, and an issue handed to Devin (`devin-ready`), owe
 all nine. A plan or a PR body whose issue already answers the Problem block may
@@ -113,8 +126,9 @@ that lacks the nine loses
 **Check before applying the label.** The Action acts only after the label event,
 and on a busy runner queue that can be minutes after Devin has started. So a
 session runs `python3 scripts/premise_gate.py check <issue>` first, and applies
-`devin-ready` only when it exits 0. Exit 1 lists the missing answers: fix the
-issue, never apply the label over them. Exit 2 means the issue could not be read,
+`devin-ready` only when it exits 0. Exit 1 lists the missing answers, or says
+the issue is a proposal: fix the issue, or for a proposal get the owner's
+decision and cite it in answer 2, never apply the label over them. Exit 2 means the issue could not be read,
 which is not a pass. On a `bug` issue filed before the epoch it also lists missing Verification answers;
 those do not change the exit code, because only the premise answers decide the
 label.
