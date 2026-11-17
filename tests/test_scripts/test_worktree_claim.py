@@ -704,3 +704,190 @@ def test_a_directory_with_no_git_file_is_still_no_lock(tmp_path) -> None:
     plain = tmp_path / "not-a-worktree"
     plain.mkdir()
     assert wc.read_lock(plain) is None
+
+
+# ─── who is working where (the [Concurrent] peer line) ──────────────────────
+
+_SID_A = "aaaaaaaa-1111-2222-3333-444444444444"
+_SID_B = "bbbbbbbb-1111-2222-3333-444444444444"
+
+
+def _add_worktree(repo: Path, tmp_path: Path, name: str, branch: str | None) -> Path:
+    path = tmp_path / name
+    if branch is None:
+        result = _git(repo, "worktree", "add", "--quiet", "--detach", str(path), "main")
+    else:
+        result = _git(repo, "worktree", "add", "--quiet", "-b", branch, str(path), "main")
+    assert result.returncode == 0, result.stderr
+    return path
+
+
+def _claim(repo: Path, path: Path, sid: str | None, pid: int, at: float) -> None:
+    payload = P("claim", pid=pid, start=1000 + pid)
+    if sid is not None:
+        payload["sid"] = sid
+    _lock(repo, path, wc.format_reason(payload))
+    locked = wc.gitdir_for(path) / "locked"
+    os.utime(locked, (at, at))
+
+
+@pytest.fixture
+def live(monkeypatch):
+    """Pids 101-199 are live sessions; anything else is gone."""
+    monkeypatch.setattr(wc, "claim_is_live", lambda pid, start=None: 100 < pid < 200)
+    monkeypatch.setattr(wc, "is_session_process", lambda pid: 100 < pid < 200)
+
+
+def test_the_common_dir_is_the_same_from_the_main_checkout_and_a_worktree(repo, tmp_path) -> None:
+    linked = _add_worktree(repo, tmp_path, "wt-x", "feat/x")
+    assert wc.common_dir_for(repo) == (repo / ".git").resolve()
+    assert wc.common_dir_for(linked) == (repo / ".git").resolve()
+    assert wc.common_dir_for(tmp_path / "nowhere") is None
+
+
+def test_claims_are_grouped_by_session_newest_first(repo, tmp_path, live) -> None:
+    older = _add_worktree(repo, tmp_path, "wt-older", "feat/older")
+    newer = _add_worktree(repo, tmp_path, "wt-newer", "feat/newer")
+    other = _add_worktree(repo, tmp_path, "wt-other", "fix/other")
+    _claim(repo, older, _SID_A, 150, at=1_000_000)
+    _claim(repo, newer, _SID_A, 150, at=2_000_000)
+    _claim(repo, other, _SID_B, 160, at=1_500_000)
+    got = wc.claims_by_session(wc.common_dir_for(repo), {_SID_A, _SID_B})
+    assert [(c["name"], c["branch"]) for c in got[_SID_A]] == [
+        ("wt-newer", "feat/newer"),
+        ("wt-older", "feat/older"),
+    ]
+    assert [(c["name"], c["branch"]) for c in got[_SID_B]] == [("wt-other", "fix/other")]
+
+
+def test_only_the_sessions_asked_about_are_returned(repo, tmp_path, live) -> None:
+    path = _add_worktree(repo, tmp_path, "wt-b", "feat/b")
+    _claim(repo, path, _SID_B, 160, at=1_000_000)
+    assert wc.claims_by_session(wc.common_dir_for(repo), {_SID_A}) == {}
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["dead-pid", "no-sid", "foreign", "unclaimed", "unsafe-sid"],
+)
+def test_a_lock_that_names_no_live_session_is_skipped(repo, tmp_path, live, kind) -> None:
+    path = _add_worktree(repo, tmp_path, "wt-k", "feat/k")
+    if kind == "dead-pid":
+        _claim(repo, path, _SID_A, 999, at=1_000_000)
+    elif kind == "no-sid":
+        _claim(repo, path, None, 150, at=1_000_000)
+    elif kind == "foreign":
+        _lock(repo, path, f"do not touch {_SID_A}")
+    elif kind == "unsafe-sid":
+        _lock(repo, path, wc.format_reason(P("claim", pid=150, start=1150, sid="../" + _SID_A)))
+    got = wc.claims_by_session(wc.common_dir_for(repo), {_SID_A, "../" + _SID_A})
+    assert got == {}
+
+
+def test_a_detached_worktree_has_no_branch(repo, tmp_path, live) -> None:
+    path = _add_worktree(repo, tmp_path, "wt-detached", None)
+    _claim(repo, path, _SID_A, 150, at=1_000_000)
+    (claim,) = wc.claims_by_session(wc.common_dir_for(repo), {_SID_A})[_SID_A]
+    assert claim["name"] == "wt-detached" and claim["branch"] is None
+
+
+def test_no_worktrees_directory_reads_as_no_claims(repo, live) -> None:
+    assert wc.claims_by_session(wc.common_dir_for(repo), {_SID_A}) == {}
+    assert wc.claims_by_session(repo / "missing", {_SID_A}) == {}
+
+
+def test_a_claim_made_before_a_clear_is_found_by_the_live_process(repo, tmp_path, live) -> None:
+    """A claim belongs to its PROCESS, but records the session id current when
+    it was taken; /clear starts a new id in the same process. Matching the
+    peer's verified live pid finds the old claim too."""
+    before = _add_worktree(repo, tmp_path, "wt-before", "feat/before")
+    after = _add_worktree(repo, tmp_path, "wt-after", "feat/after")
+    _claim(repo, before, "cccccccc-1111-2222-3333-444444444444", 150, at=1_000_000)
+    _claim(repo, after, _SID_A, 150, at=2_000_000)
+    common = wc.common_dir_for(repo)
+    assert [c["name"] for c in wc.claims_by_session(common, {_SID_A})[_SID_A]] == ["wt-after"]
+    got = wc.claims_by_session(common, {_SID_A}, pids={_SID_A: 150})
+    assert [c["name"] for c in got[_SID_A]] == ["wt-after", "wt-before"]
+
+
+def test_one_malformed_claim_does_not_hide_the_others(repo, tmp_path, live) -> None:
+    good = _add_worktree(repo, tmp_path, "wt-good", "feat/good")
+    bad = _add_worktree(repo, tmp_path, "wt-bad", "feat/bad")
+    _claim(repo, good, _SID_A, 150, at=1_000_000)
+    _lock(repo, bad, wc.format_reason(P("claim", pid=151, start=1151, sid=[1])))
+    got = wc.claims_by_session(wc.common_dir_for(repo), {_SID_A})
+    assert [c["name"] for c in got[_SID_A]] == ["wt-good"]
+
+
+def test_a_deeply_nested_lock_does_not_hide_the_others(repo, tmp_path, live) -> None:
+    """json.loads raises RecursionError (not ValueError) on deep nesting; one
+    such lock must skip only itself."""
+    good = _add_worktree(repo, tmp_path, "wt-good", "feat/good")
+    bad = _add_worktree(repo, tmp_path, "wt-deep", "feat/deep")
+    _claim(repo, good, _SID_A, 150, at=1_000_000)
+    deep = f'{{"ns":"{wc.PAYLOAD_NAMESPACE}","x":{"[" * 30000}1{"]" * 30000}}}'
+    (wc.gitdir_for(bad) / "locked").write_text(deep)
+    got = wc.claims_by_session(wc.common_dir_for(repo), {_SID_A})
+    assert [c["name"] for c in got[_SID_A]] == ["wt-good"]
+
+
+def test_the_sid_fallback_needs_a_session_process(repo, tmp_path, monkeypatch) -> None:
+    """A lock's self-recorded sid is unverified, so its pid must at least be a
+    session process; a verified pid match needs no such check."""
+    path = _add_worktree(repo, tmp_path, "wt-x", "feat/x")
+    _claim(repo, path, _SID_A, 150, at=1_000_000)
+    monkeypatch.setattr(wc, "claim_is_live", lambda pid, start=None: True)
+    monkeypatch.setattr(wc, "is_session_process", lambda pid: False)
+    common = wc.common_dir_for(repo)
+    assert wc.claims_by_session(common, {_SID_A}) == {}
+    assert list(wc.claims_by_session(common, {_SID_A}, pids={_SID_A: 150})) == [_SID_A]
+
+
+def test_the_name_is_the_worktree_directory_not_gits_admin_name(repo, tmp_path, live) -> None:
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    first = repo.parent / "a" / "same"
+    second = repo.parent / "b" / "same"
+    for path, branch in ((first, "feat/one"), (second, "feat/two")):
+        assert _git(repo, "worktree", "add", "--quiet", "-b", branch, str(path), "main").returncode == 0
+    _claim(repo, second, _SID_A, 150, at=1_000_000)
+    assert wc.gitdir_for(second).name != "same"  # git de-duplicated the admin dir
+    (claim,) = wc.claims_by_session(wc.common_dir_for(repo), {_SID_A})[_SID_A]
+    assert claim["name"] == "same" and claim["branch"] == "feat/two"
+
+
+def test_a_stop_signal_mid_scan_answers_unknown_not_none(repo, tmp_path, live) -> None:
+    path = _add_worktree(repo, tmp_path, "wt-s", "feat/s")
+    _claim(repo, path, _SID_A, 150, at=1_000_000)
+    assert wc.claims_by_session(wc.common_dir_for(repo), {_SID_A}, should_stop=lambda: True) is None
+
+
+def test_claim_liveness_needs_positive_identity(monkeypatch) -> None:
+    """For display, unknown is NOT alive (the reaper's rule is the reverse)."""
+    monkeypatch.setattr(wc, "_proc_fields", lambda pid: None)
+    assert wc.claim_is_live(1234, 99) is False
+    monkeypatch.setattr(wc, "_proc_fields", lambda pid: ["S"] + ["0"] * 18 + ["99"])
+    assert wc.claim_is_live(1234, 99) is True
+    assert wc.claim_is_live(1234, 98) is False
+    monkeypatch.setattr(wc, "_proc_fields", lambda pid: ["Z"] + ["0"] * 18 + ["99"])
+    assert wc.claim_is_live(1234, 99) is False
+
+
+@pytest.mark.parametrize("which", ["locked", "HEAD", "gitdir"])
+def test_a_fifo_or_link_in_an_admin_dir_cannot_hang_the_scan(repo, tmp_path, live, which) -> None:
+    """The scan runs inside a per-prompt hook: a FIFO named like an admin file
+    must be skipped, not opened for a blocking read."""
+    path = _add_worktree(repo, tmp_path, "wt-f", "feat/f")
+    _claim(repo, path, _SID_A, 150, at=1_000_000)
+    other = _add_worktree(repo, tmp_path, "wt-ok", "feat/ok")
+    _claim(repo, other, _SID_A, 150, at=2_000_000)
+    common = wc.common_dir_for(repo)
+    # planted LAST: git itself reads these files and would block on the FIFO
+    target = wc.gitdir_for(path) / which
+    target.unlink()
+    os.mkfifo(target)
+    got = wc.claims_by_session(common, {_SID_A})
+    names = [c["name"] for c in got[_SID_A]]
+    assert "wt-ok" in names
+    if which == "locked":
+        assert names == ["wt-ok"]

@@ -19,6 +19,7 @@ from genesis.memory.reference_ops import (
 from genesis.memory.reference_ops import (
     compose_body,
     delete_reference_entry,
+    display_name,
     holds_secret,
 )
 from genesis.security import immunity_shadow
@@ -307,6 +308,7 @@ async def _ingest_knowledge_unit(
     collection: str = "knowledge_base",
     memory_type: str = "knowledge",
     origin_class: str | None = None,
+    entry_key: str | None = None,
 ) -> str:
     """MCP-side wrapper around :func:`ingest_knowledge_unit`.
 
@@ -339,6 +341,7 @@ async def _ingest_knowledge_unit(
         collection=collection,
         memory_type=memory_type,
         origin_class=origin_class,
+        entry_key=entry_key,
     )
 
 
@@ -507,6 +510,7 @@ async def reference_store(
     description: str,
     tags: list[str] | None = None,
     source: dict | None = None,
+    entry_key: str | None = None,
 ) -> str:
     """Store a persistent reference entry (credential, URL, IP, persona pointer, etc).
 
@@ -520,7 +524,14 @@ async def reference_store(
 
     ``identifier`` is the human-readable name (e.g. "ExampleForum
     login"). It becomes the unique key ``concept`` field — use the same
-    identifier across re-stores to get upsert semantics.
+    identifier across re-stores to get upsert semantics. A credential is
+    stored under an opaque key (``cred-...``) instead and found again by its
+    full name, compared without regard to case or spacing.
+
+    ``entry_key`` (credentials only): the key ``reference_lookup`` returned
+    for an entry. The write updates that entry and keeps the name it records
+    (``identifier`` is not used); a key no entry holds is refused. Text that
+    merely looks like a key, passed as ``identifier``, is a name.
 
     ``value`` is the raw value (password, URL string, IP address, file path,
     etc.). Stored plaintext (a credential's value and description outside the search index, so a credential is found by its identifier and tags, which must not contain the value), so an entry holding
@@ -558,6 +569,8 @@ async def reference_store(
             "reference_store: description is required — every reference "
             "entry needs context for future lookups"
         )
+    if entry_key is not None and kind != "credentials":
+        raise ValueError("reference_store: entry_key is only for credentials")
     if not identifier or not identifier.strip():
         raise ValueError("reference_store: identifier is required")
     if not value or not value.strip():
@@ -616,6 +629,7 @@ async def reference_store(
         collection="episodic_memory",
         memory_type="episodic",
         origin_class=session_origin_from_env(),
+        entry_key=entry_key,
     )
     return unit_id
 
@@ -702,9 +716,11 @@ async def reference_lookup(
     Recorded in ``credential_access_log`` for any credentials-kind entry
     that matches, so we keep an audit trail of sensitive lookups.
 
-    Returns a list of dicts: ``{unit_id, concept, body, domain, tags,
+    Returns a list of dicts: ``{unit_id, concept, name, body, domain, tags,
     confidence, source_doc, ingested_at, origin}`` where ``origin`` is
-    ``"vector"``, ``"fts"``, or ``"both"``. When a credentials-kind entry
+    ``"vector"``, ``"fts"``, or ``"both"``. ``name`` is the entry's name; a
+    credential's ``concept`` is its opaque key, which
+    ``reference_store(entry_key=...)`` takes. When a credentials-kind entry
     surfaces, an audit row is written to ``credential_access_log``.
     """
     memory_mod = _memory_mod()
@@ -808,6 +824,8 @@ async def reference_lookup(
         entry = {
             "unit_id": row["id"],
             "concept": row["concept"],
+            # The entry's name: a credential's concept is its opaque key.
+            "name": display_name(row),
             "body": body,
             "domain": row["domain"],
             "tags": row["tags"],

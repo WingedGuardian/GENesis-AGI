@@ -65,7 +65,7 @@ def ready(config):
     if not Path(config['binary']).exists():
         raise ValueError('backend unavailable')
 validate_loaded_backend = lambda config: None
-verified_binary = lambda path: path.open('rb')
+verified_binary = lambda path,build: path.open('rb')
 check_backend = ready
 """
 

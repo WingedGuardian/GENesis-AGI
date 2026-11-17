@@ -747,3 +747,16 @@ def test_camoufox_pin_stays_on_its_browser_pin_line():
     spec = _browser_requirements()["camoufox"].specifier
     assert Version("0.5.7") in spec and Version("0.5.6") not in spec
     assert Version("0.6.0") not in spec
+
+
+@pytest.mark.parametrize(("decoder", "affected", "fixed"), [
+    ("brotli", "1.2.0", "1.2.1"),
+    ("brotlicffi", "1.2.0.2", "1.2.1.0"),
+])
+def test_brotli_security_floor_covers_both_ytdlp_decoder_choices(decoder, affected, fixed):
+    """yt-dlp prefers brotlicffi; pinning only its Brotli fallback leaves a hole."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    reqs = {req.name: req for req in map(Requirement, data["project"]["dependencies"])}
+    assert decoder in reqs, f"GHSA-9v8h-qqgm-4m35 also affects {decoder}"
+    assert Version(affected) not in reqs[decoder].specifier
+    assert Version(fixed) in reqs[decoder].specifier

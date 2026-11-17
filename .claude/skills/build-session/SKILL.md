@@ -28,6 +28,13 @@ it holds the review-chain, evidence and private-data rules every session uses.
 review_state sequence, the sigils, the Pre-Commit Gate, the depth gate and
 verify-RED. Read it; it is not on-demand reference.
 
+**Mandatory read before your first code edit of an item:**
+`.claude/skills/build-session/references/ponytail-house-delta.md` (where
+Genesis differs from the ruleset below; it wins), then
+`.claude/skills/build-session/references/ponytail.md` (a vendored ruleset for
+the smallest complete change: reuse what exists before writing anything new).
+Read both, in that order; they are not on-demand reference.
+
 ### Where your session ENDS — build sessions and closing sessions
 
 **A session that writes code and a session that drives a PR to merge are
@@ -251,6 +258,25 @@ Put what you ran and what you saw under the PR's `## Testing` section. The `E2E:
 line keeps its meaning: the check to run AFTER the merge. For a hook that is still
 needed, because a pre-PR run tests the worktree copy, not the merged copy the
 harness fires.
+
+**Work built from a spec converges against it before the PR.** Run the pass in
+`.claude/skills/spec-session/references/spec-converge.md`:
+- the spec, its plan and its tickets are the only statement of intent;
+- a checked box, a closed row or a "done" bullet is not evidence that the work
+  was done;
+- each gap is missing, partial, contradicts or unrequested;
+- its only write is appending items to your plan file, each traced to the spec
+  line it comes from;
+- when nothing remains it changes nothing.
+
+Do the items and run it again until it converges. Something the spec asked
+for may be left unbuilt only on the owner's recorded decision (a change to the
+spec, never your own call), and a standing-rule contradiction only under the
+owner's recorded exception; the contract's "carried" rules say how. Put the report's `Outcome:` line in the PR
+body under `## Testing`. This applies to any build from a spec, whether or not
+its effect can be shown on this install. The review-time check is different: the
+architect's Step 0.5 compares the diff with the plan and stays informational,
+and it does not replace this pass.
 
 **Which copy actually ran is the whole question. Check it; never assume it.**
 - A hook guard run as `python3 <worktree>/scripts/hooks/<guard>.py`, with a real

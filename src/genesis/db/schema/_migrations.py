@@ -1705,6 +1705,11 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE procedural_memory ADD COLUMN lesson TEXT",
         "procedural_memory.lesson")
+    # The session that created the row, set once at insert (#4717). Mirrored in
+    # migration 20261116034039_procedural_created_session_id for the runner.
+    await _try_alter(db,
+        "ALTER TABLE procedural_memory ADD COLUMN created_session_id TEXT",
+        "procedural_memory.created_session_id")
 
     # Rebuild cognitive_state table if CHECK constraint lacks resilience_degradation.
     # SQLite can't ALTER CHECK constraints — requires table rebuild.
@@ -1766,6 +1771,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE reference_secrets ADD COLUMN detail TEXT",
         "reference_secrets.detail")
+    # A credential's name identity (#2426), indexed by INDEXES; migration
+    # 20261115060803_credential_name_hash adds the same columns and backfills them.
+    await _try_alter(db,
+        "ALTER TABLE knowledge_units ADD COLUMN name_hash TEXT",
+        "knowledge_units.name_hash")
+    await _try_alter(db,
+        "ALTER TABLE knowledge_units ADD COLUMN name_origin TEXT",
+        "knowledge_units.name_origin")
     # The secret_ref triggers: no credential unit without its secret row, and a
     # secret row dies when no unit names it any more, however the unit is
     # deleted or repointed (a raw SQL delete, a cleanup script). Triggers, not a

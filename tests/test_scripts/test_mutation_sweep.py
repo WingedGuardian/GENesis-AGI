@@ -2224,16 +2224,12 @@ def test_spawns_and_{how}():
     [("hangs", "time.sleep(60)", 15), ("returns", "pass", 120)],
 )
 def test_no_child_process_outlives_its_run(project, tmp_path_factory, how, tail, timeout):
-    """Codex round 2: on a timeout `subprocess.run` killed only pytest, and a
-    test's own subprocess kept running after the sweep reported and removed
-    the copy. Each child now runs in its own session, and its group is killed
-    when it ends, timed out or not.
+    """The process group is killed after a normal exit or a timeout.
 
     The grandchild writes only once its pytest parent has exited, so a mark
-    proves it outlived the run. A fixed `sleep 2` raced a slow CI runner: the
-    mark landed while the run was still alive, and the test failed. The
-    `started` mark proves the grandchild was spawned at all: a timeout that
-    fired before the test body ran would pass whatever the harness did."""
+    proves it outlived the run. The `started` mark proves the grandchild was
+    spawned at all: a timeout that fired before the test body ran would pass
+    whatever the harness did. A separate test widens the exit-to-kill gap."""
     import time
 
     marks = tmp_path_factory.mktemp("mark")
@@ -2248,6 +2244,34 @@ def test_no_child_process_outlives_its_run(project, tmp_path_factory, how, tail,
     time.sleep(3)
     assert started.exists(), "the test body never ran, so this proves nothing"
     assert not mark.exists(), "a child of the test outlived its run"
+
+
+def test_a_descendant_cannot_act_between_the_exit_and_the_group_kill(
+    project, tmp_path_factory, monkeypatch
+):
+    import time
+
+    marks = tmp_path_factory.mktemp("delayed-kill")
+    mark, started = marks / "late", marks / "started"
+    (project / "test_spawner.py").write_text(
+        _SPAWNER.format(how="returns", tail="pass"), encoding="utf-8"
+    )
+    case = _case(
+        project,
+        test="test_spawner.py::test_spawns_and_returns",
+        env={"MARK": str(mark), "STARTED": str(started)},
+    )
+    kill_group = ms._kill_group
+
+    def delayed_kill_group(pgid):
+        time.sleep(0.5)
+        kill_group(pgid)
+
+    monkeypatch.setattr(ms, "_kill_group", delayed_kill_group)
+    ms.sweep([case], repo=project, python=sys.executable, timeout=120, check_baseline=False)
+
+    assert started.exists(), "the test body never ran, so this proves nothing"
+    assert not mark.exists(), "a descendant acted before its process group was killed"
 
 
 # --------------------------------------------------------------------------

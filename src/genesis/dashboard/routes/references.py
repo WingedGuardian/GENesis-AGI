@@ -31,6 +31,7 @@ from genesis.memory.reference_ops import (
     REFERENCE_PROJECT,
     ReferenceStoreUnavailable,
     delete_reference_entry,
+    display_name,
     parse_reference_body,
     reveal_reference,
 )
@@ -92,6 +93,8 @@ def _summary(row: dict) -> dict:
     return {
         "id": row.get("id") or row.get("unit_id"),
         "concept": row.get("concept"),
+        # The name a list shows: a credential's concept is its opaque key.
+        "name": display_name(row),
         "kind": kind,
         "tags": _parse_tags(row.get("tags")),
         "ingested_at": row.get("ingested_at"),
