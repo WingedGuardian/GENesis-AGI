@@ -1,8 +1,10 @@
 """Masking a held-out credential value in the fields that are indexed (#2426).
 
-The probes of a value (``reference_ops._value_probes``) feed ``ValueMask`` and
-its span matcher, the probe sets a write builds (``value_masks``), and the caps
-that cut a masked field never through a mask. Every indexed field of a
+The probes of a value for masking (``_value_probes`` here: the secret parts of
+the value besides its fragments; ``reference_ops._value_probes`` stays the
+refusal check's) feed ``ValueMask`` and its span matcher, the probe sets a
+write builds (``value_masks``), and the caps that cut a masked field never
+through a mask. Every indexed field of a
 credential (its identifier and tags) is masked with these before it is stored;
 the original is held in ``reference_secrets``.
 """
@@ -15,27 +17,219 @@ import unicodedata
 
 from genesis.db.crud.knowledge import DETAIL_PLACEHOLDER, SECRET_PLACEHOLDER
 from genesis.memory.reference_ops import (
+    _FRAGMENT_SPLIT,
+    _HOSTNAME,
+    _MIN_TOKEN,
+    _SCHEME,
     _SPACING,
     _TOKEN_EDGE,
     _decoded,
     _normalise,
     _secret_token,
-    _value_probes,
 )
 
 #: What a masked span of a held-out value reads as in an indexed field. Short,
 #: fixed, and no credential keyword, so it is no secret-scanner hit.
 HELD_MASK = "[held]"
 
+#: A URL scheme, as it ends just before ``://``.
+_SCHEME_BEFORE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]{0,31}$")
+#: A well-formed URL authority (``userinfo@host:port``), up to its path,
+#: query or fragment.
+_AUTHORITY = re.compile(r"[^\s/?#]*")
+#: How far past ``://`` a userinfo with an unencoded ``/ ? #`` or space in its
+#: password is looked for (it ends at the ``@`` before the host).
+_USERINFO_MAX = 256
+#: A host as it follows a userinfo's ``@``, then its port, ending the authority.
+_USERINFO_HOST = re.compile(
+    r"(?:[a-z0-9-]+(?:\.[a-z0-9-]+)*|\[[0-9a-f:.]+\])(?::\d{1,5})?(?=[/?#\s]|$)",
+    re.IGNORECASE,
+)
+#: What a host and port read as when the text before an ``@`` is a path, not
+#: a userinfo (``host:8080/path@other``): a port, then a path, query or space.
+_PORT_LEAD = re.compile(r"\d{1,5}(?:[/?#\s]|$)")
+
+
+def _url_passwords(form: str):
+    """The password of every URL userinfo (the part after the user name and its
+    colon, up to the ``@`` before the host) in
+    ``form``. A well-formed authority (up to the first ``/ ? #`` or space) that
+    holds an ``@`` ends its userinfo at its LAST ``@``. One that holds none may
+    still carry a password with an unencoded ``/ ? #`` or space in it
+    (``_loose_userinfo``). Found from each ``://``, so a text without one
+    costs one scan."""
+    at = form.find("://")
+    while at != -1:
+        start = at + 3
+        if _SCHEME_BEFORE.search(form, max(0, at - 32), at):
+            authority = form[start:_AUTHORITY.match(form, start).end()]
+            userinfo = authority.rpartition("@")[0] if "@" in authority else _loose_userinfo(form, start)
+            _user, colon, password = (userinfo or "").partition(":")
+            if colon and password:
+                yield password
+        at = form.find("://", start)
+
+
+def _loose_userinfo(form: str, start: int) -> str | None:
+    """The userinfo after the ``://`` that ends at ``start``, when its
+    password holds an unencoded ``/ ? #`` or space: it runs to the ``@`` a host
+    follows, the last one before the first space or, when there is none before
+    it, the first one after it, looking no further than ``_USERINFO_MAX``
+    characters and never past a line break or another ``://``. None when the
+    text before that ``@`` is no userinfo: a login (before the first ``:``)
+    holding ``/ ? #``, a space or ``@``, or a port then a path
+    (``host:8080/path@x``), so an ``@`` in a URL's path is never read as one."""
+    end = min(len(form), start + _USERINFO_MAX)
+    for stop_at in ("\n", "://"):
+        cut = form.find(stop_at, start, end)
+        if cut != -1:
+            end = cut
+    window = form[start:end]
+    space = next((i for i, c in enumerate(window) if c.isspace()), len(window))
+    before = [i for i in range(window.rfind("@", 0, space), -1, -1) if window[i] == "@"]
+    after = [i for i in range(space, len(window)) if window[i] == "@"]
+    for i in [*before, *after]:
+        if _USERINFO_HOST.match(window, i + 1):
+            user, colon, password = window[:i].partition(":")
+            if not colon or any(c in user for c in "/?#@") or any(c.isspace() for c in user):
+                return None
+            return None if _PORT_LEAD.match(password) else window[:i]
+    return None
+
+
+def _secret_parts(value: str) -> list[tuple[str, bool]]:
+    """(probe, whole-word only) of the parts of ``value`` that are a secret as
+    written: the secret half of "login / secret" and the password of a URL's
+    userinfo (``_url_passwords``). Each is probed whole, as written (normalised
+    and percent-decoded as every probe is): no edge trimming, and no host-name,
+    scheme or digit skip, which are for the fragments of a value. A plain word
+    or an all-digit one is matched as a whole word, any other unbounded."""
+    whole = value.strip()
+    parts = []
+    _login, sep, secret = whole.partition(" / ")
+    if sep and secret.strip():
+        parts.append(secret.strip())
+    for form in _decoded(whole) if whole else ():
+        for password in _url_passwords(unicodedata.normalize("NFKC", form)):
+            # A plain-word URL password stays a stated limit, matched only
+            # as a fragment (owner ruling 2026-11-17).
+            if not password.isalpha():
+                parts.append(password)
+    probes: dict[str, bool] = {}
+    for part in parts:
+        for form in _decoded(part):
+            probe = _normalise(form)
+            if probe.strip():
+                probes[probe] = probes.get(probe, True) and not _secret_token(form)
+    return list(probes.items())
+
+
+#: A fragment (``_FRAGMENT_SPLIT``) that is a run of at least four digits, with
+#: any edge punctuation that is no separator (``.`` and ``!``), right after a
+#: ``:``.
+_DIGIT_AFTER_COLON = re.compile(
+    r"(?<=:)[.!]*(\d{4,})[.!]*(?![^\s:/@?&=#;,|\\<>\"'`(){}\[\]])"
+)
+#: The host a port follows: a host name, ``localhost``, an IPv4 address, an
+#: IPv6 one's closing bracket, or any label right after ``@`` or ``://``.
+_PORT_HOST = re.compile(
+    r"(?:(?:^|(?<=[\s:/@?&=#;,|\\<>\"'`(){}\[\]]))"
+    r"(?:(?:[a-z0-9-]+\.)+[a-z]{2,}|localhost|\d{1,3}(?:\.\d{1,3}){3})"
+    r"|(?:(?<=@)|(?<=://))[a-z0-9-]+|\])$",
+    re.IGNORECASE,
+)
+
+
+def _ports_only(form: str, fragments: set[str]) -> set[str]:
+    """The digit ``fragments`` of ``form`` that occur in it ONLY as a port:
+    directly after a host and ``:`` (``db.example.org:5432``)."""
+    ports: dict[str, int] = {}
+    for match in _DIGIT_AFTER_COLON.finditer(form):
+        if match.group(1) in fragments and _PORT_HOST.search(
+            form, max(0, match.start() - 256), match.start() - 1,
+        ):
+            ports[match.group(1)] = ports.get(match.group(1), 0) + 1
+    if not ports:
+        return set()
+    # Every whole-word occurrence of each digit run, counted in ONE pass (a
+    # pass per run was quadratic in the number of distinct ports).
+    words: dict[str, int] = {}
+    for match in _WHOLE_DIGITS.finditer(form):
+        if match.group(1) in ports:
+            words[match.group(1)] = words.get(match.group(1), 0) + 1
+    return {digits for digits, count in ports.items() if words.get(digits) == count}
+
+
+#: A digit run as a whole word, as ``_ports_only`` counts it.
+_WHOLE_DIGITS = re.compile(
+    r"(?<![^\s:/@?&=#;,|\\<>\"'`(){}\[\]])[.!]*(\d+)[.!]*(?![^\s:/@?&=#;,|\\<>\"'`(){}\[\]])"
+)
+
+
+def _value_probes(value: str, *, login_exempt: bool = False) -> list[tuple[str, bool]]:
+    """(probe, whole-word only) for the masks: the whole value, its secret
+    parts (``_secret_parts``), and every secret-shaped fragment of it,
+    normalised. The value is percent-decoded (up to three rounds),
+    NFKC-normalised and split on whitespace and
+    ``: / @ ? & = # ; , | \\ < > " ' ` ( ) { } [ ]``, so
+    the password, token or key inside a connection URL, a DSN or a
+    ``key=value`` line is a fragment of its own; a fragment that is a host name
+    or a URL scheme is not probed. A fragment is secret-shaped as written or
+    with its edge punctuation trimmed (both forms are probed then). A run of at
+    least four digits is probed as a whole word, except where it is a port
+    (directly after a host and ``:``). A fragment that reads as a plain word
+    (all letters, or under four characters) is not secret-shaped: outside a
+    secret part it is matched only as the whole value, and only as a whole
+    word: an ordinary word inside another is no match. That is a stated limit.
+    A probe given both unbounded and as a whole word is unbounded."""
+    whole = value.strip()
+    probes: dict[str, bool] = {}
+
+    def add(probe: str, as_word: bool) -> None:
+        probes[probe] = probes.get(probe, True) and as_word
+
+    for form in _decoded(whole) if whole else ():
+        add(_normalise(form), form.isalpha() or len(form) < _MIN_TOKEN)
+    for probe, as_word in _secret_parts(whole):
+        add(probe, as_word)
+    # "login / secret" is the shape the capture writers format: with
+    # ``login_exempt`` (the identifier only, which names the account) the
+    # exact login half is not probed as a fragment. A secret part equal to it
+    # stays a probe (above). Every other field is probed with the tokens of
+    # both halves.
+    login, sep, secret = whole.partition(" / ")
+    exempt = login.strip().strip(_TOKEN_EDGE) if login_exempt and sep and secret.strip() else None
+    for form in _decoded(whole):
+        schemes = {m.group(1).casefold() for m in _SCHEME.finditer(form)}
+        form = unicodedata.normalize("NFKC", form)
+        # Each distinct fragment once (the same output; a long value repeats).
+        fragments = dict.fromkeys(_FRAGMENT_SPLIT.split(form))
+        digits = {f.strip(_TOKEN_EDGE) for f in fragments if f.strip(_TOKEN_EDGE).isdigit()}
+        ports = _ports_only(form, digits) if digits and ":" in form else set()
+        for raw in fragments:
+            fragment = raw.strip(_TOKEN_EDGE)
+            folded = fragment.casefold()
+            if not fragment or fragment == exempt or folded in schemes or _HOSTNAME.match(folded):
+                continue
+            if fragment.isdigit():
+                if len(fragment) < _MIN_TOKEN or fragment in ports:
+                    continue
+                add(_normalise(fragment), True)
+            for shaped in dict.fromkeys((raw, fragment)):
+                if _secret_token(shaped):
+                    add(_normalise(shaped), False)
+    probes.pop("", None)
+    return list(probes.items())
+
 
 #: Probes up to this long are looked up by every substring length present;
 #: longer ones by their first ``_SHORT`` characters, then verified.
 _SHORT = 32
-#: A run of the value a mask may grow over is at most this long, so growing
-#: costs a bounded check however large the value is.
+#: A run of the held secrets a mask may grow over is at most this long, and a
+#: probe keeps at most ``_RUNS_PER_PROBE`` of them (``_RunIndex``): a probe with
+#: more, or a longer one, masks its whole token instead.
 _RUN_MAX = 256
 _RUNS_PER_PROBE = 64
-_RUN_SEPARATORS = (" ", "\n", "\t")
 #: Matches spanning more whitespace tokens than this are masked with the whole
 #: field (only a percent-encoded copy of a long multi-word value can need it).
 _WINDOW_MAX = 16
@@ -88,8 +282,8 @@ class ValueMask:
     a recorded masked span is never exempt, whatever the incoming text is.
 
     ``secrets``: the other held secrets the probes came from (``value_masks``'s
-    ``also`` values): a match grows over runs of their text too, not only of
-    ``value``'s.
+    ``also`` values and the captured secrets): a match grows over runs of
+    their text too, not only of ``value``'s (``_RunIndex``, bounded).
 
     A probe given both unbounded and as a whole word is unbounded (the stronger
     requirement wins), and an empty or whitespace-only probe is no probe."""
@@ -113,7 +307,11 @@ class ValueMask:
         captured = captured or []
         if exempt is None:
             exempt = (
-                _prose_words(probes, whole, {probe for probe, _ in captured})
+                _prose_words(
+                    probes,
+                    whole,
+                    {probe for probe, _ in [*captured, *_secret_parts(value)]},
+                )
                 if prose
                 else frozenset()
             )
@@ -128,37 +326,15 @@ class ValueMask:
         self.lengths = sorted(self.short)
         # A match grows over runs of every secret source, not only of ``value``.
         self._whole = whole.union(*(_forms(text) for text in secrets or ()))
-        self._runs: dict[str, list[str]] = {}
+        self._index = _RunIndex(self._whole)
         self.window = max((len(p.split()) for p in self._whole), default=1)
         # A value that spells the mask text: the mask is then not only a
-        # separator (``carries``).
+        # separator (``carries``). Likewise a body placeholder: it is then not
+        # only a placeholder.
         self._spells_mask = any(HELD_MASK in probe for probe, _ in kept)
-
-    def runs(self, probe: str) -> list[str]:
-        """The short whitespace-delimited runs of the value that hold ``probe``,
-        so a match can grow over a secret that spans a separator
-        ("Demo@Fake123"). Found by ``str.find`` on first use: at most
-        ``_RUNS_PER_PROBE`` of them, each occurrence looking no further than
-        ``_RUN_MAX`` characters either side (a longer run is never kept), so a
-        value of repeated tokens costs a linear pass."""
-        if probe not in self._runs:
-            found: list[str] = []
-            for form in self._whole:
-                at = form.find(probe)
-                while at != -1 and len(found) < _RUNS_PER_PROBE:
-                    end = at + len(probe)
-                    low, high = max(0, at - _RUN_MAX), min(len(form), end + _RUN_MAX + 1)
-                    start = max(form.rfind(sep, low, at) for sep in _RUN_SEPARATORS) + 1
-                    stops = [
-                        i for i in (form.find(sep, end, high) for sep in _RUN_SEPARATORS) if i != -1
-                    ]
-                    stop = min(stops) if stops else (len(form) if high == len(form) else None)
-                    whole_run = stop is not None and (start > 0 or low == 0)
-                    if whole_run and stop - start <= _RUN_MAX and form[start:stop] not in found:
-                        found.append(form[start:stop])
-                    at = form.find(probe, stop if stop is not None else end)
-            self._runs[probe] = found
-        return self._runs[probe]
+        self._spells_placeholder = any(
+            mark in probe for probe, _ in kept for mark in _PLACEHOLDER_PROBES
+        )
 
     def _bounded(self, text: str, start: int, stop: int, probe: str) -> bool:
         if probe not in self.words:
@@ -186,14 +362,19 @@ class ValueMask:
         """Whether ``text`` (normalised, and percent-decoded) carries a probe.
         The body placeholders and the mask are no leak and are left out (the
         mask as a separator, so the text around it never joins into a match).
-        A value that itself spells the mask text is matched in the text as it
-        stands too, so a literal copy of it never escapes as "a mask"."""
+        A value that itself spells the mask text, or a placeholder, is matched
+        in the text as it stands too, so a literal copy of it never escapes as
+        "a mask" or "a placeholder"."""
         if not text:
             return False
         held_out = text.replace(SECRET_PLACEHOLDER, "").replace(DETAIL_PLACEHOLDER, "")
         candidates = [held_out.replace(HELD_MASK, "\x00")]
         if self._spells_mask and HELD_MASK in held_out:
             candidates.append(held_out)
+        if self._spells_placeholder and held_out != text:
+            candidates.append(text.replace(HELD_MASK, "\x00"))
+            if self._spells_mask and HELD_MASK in text:
+                candidates.append(text)
         return any(
             next(self._matches(_normalise(form)), None)
             for candidate in candidates
@@ -222,20 +403,21 @@ class ValueMask:
             return []
         normalised, origins = _normalised_with_origins(text)
         spans = []
+        token = (0, 0)
         for start, stop, probe in self._matches(normalised):
-            runs = self.runs(probe)
-            while (
-                start
-                and not normalised[start - 1].isspace()
-                and any(normalised[start - 1 : stop] in run for run in runs)
-            ):
-                start -= 1
-            while (
-                stop < len(normalised)
-                and not normalised[stop].isspace()
-                and any(normalised[start : stop + 1] in run for run in runs)
-            ):
-                stop += 1
+            # The match grows left, then right, as far as it stays part of a
+            # run of a secret, short of whitespace. Being part of a run is
+            # monotone in the span, so the farthest edge is a binary search.
+            # A probe with too many runs, or too long a one, to keep is masked
+            # with its whole token instead (never a part of a secret left).
+            runs = self._index.runs(probe)
+            if runs is None:
+                if not (token[0] <= start and stop <= token[1]):
+                    token = _token_of(normalised, start, stop)
+                    spans.append((origins[token[0]], origins[token[1] - 1] + 1))
+                continue
+            if runs:
+                start, stop = _grown(normalised, start, stop, runs)
             spans.append((origins[start], origins[stop - 1] + 1))
         # A percent-encoded spelling cannot be mapped back character by
         # character: the whole token that carries it decoded is masked, so no
@@ -293,31 +475,131 @@ class ValueMask:
         return HELD_MASK if self.carries(str(field)) else field
 
 
+#: The body placeholders as a probe spells them (``carries``).
+_PLACEHOLDER_PROBES = (_normalise(SECRET_PLACEHOLDER), _normalise(DETAIL_PLACEHOLDER))
+
+
+class _RunIndex:
+    """The whitespace-delimited runs of the held secrets a match may grow over
+    (``ValueMask.mask_spans``), BOUNDED: for each probe, at most
+    ``_RUNS_PER_PROBE`` distinct runs, each at most ``_RUN_MAX`` long, joined
+    into one text so whether a grown span is part of a run is one ``in`` test.
+    A probe with more runs than that, or one of them longer, has None: the
+    match is then masked with its whole whitespace token, so the cost stays
+    bounded however large the value is and no part of a secret stays visible.
+    A run repeated in the value is kept once, so a value of repeated tokens
+    costs one pass."""
+
+    def __init__(self, whole: set[str]):
+        self._whole = whole
+        self._tokens: str | None = None
+        self._runs: dict[str, str | None] = {}
+
+    def _corpus(self, probe: str):
+        # A probe with a space (a multi-word value) is looked up in the forms
+        # themselves; any other in their distinct tokens.
+        if " " in probe:
+            return self._whole
+        if self._tokens is None:
+            self._tokens = " ".join(
+                dict.fromkeys(t for form in self._whole for t in form.split(" ") if t)
+            )
+        return (self._tokens,)
+
+    def runs(self, probe: str) -> str | None:
+        """Every distinct run holding ``probe`` (other than the probe itself,
+        which grows nothing), joined by a NUL; None when there are more than
+        ``_RUNS_PER_PROBE`` or one is longer than ``_RUN_MAX``."""
+        if probe not in self._runs:
+            self._runs[probe] = self._found(probe)
+        return self._runs[probe]
+
+    def _found(self, probe: str) -> str | None:
+        found: dict[str, None] = {}
+        for form in self._corpus(probe):
+            at = form.find(probe)
+            while at != -1:
+                end = at + len(probe)
+                low = max(0, at - _RUN_MAX - 1)
+                start = form.rfind(" ", low, at) + 1
+                stop = form.find(" ", end, end + _RUN_MAX + 1)
+                if stop == -1 and len(form) <= end + _RUN_MAX:
+                    stop = len(form)
+                if (start, stop) != (at, end):
+                    if (start == 0 and low > 0) or stop == -1 or stop - start > _RUN_MAX:
+                        return None
+                    if form[start:stop] not in found:
+                        if len(found) == _RUNS_PER_PROBE:
+                            return None
+                        found[form[start:stop]] = None
+                at = form.find(probe, max(stop, end))
+        return "\x00".join(found)
+
+
+def _grown(text: str, start: int, stop: int, runs: str) -> tuple[int, int]:
+    """(start, stop) of the match ``text[start:stop]`` grown left, then right,
+    as far as it stays part of a run in ``runs`` (``_RunIndex.runs``), short of
+    whitespace. Being part of a run is monotone in the span (a part of a part
+    is a part), so each edge is a binary search: a few ``in`` tests. A run is
+    at most ``_RUN_MAX`` long, so neither edge is looked for further away."""
+    edge = text.rfind(" ", max(0, stop - _RUN_MAX), start)
+    low, high = edge + 1 if edge != -1 else max(0, stop - _RUN_MAX), start
+    while low < high:
+        mid = (low + high) // 2
+        if text[mid:stop] in runs:
+            high = mid
+        else:
+            low = mid + 1
+    start = high
+    end = text.find(" ", stop, start + _RUN_MAX)
+    low, high = stop, end if end != -1 else min(len(text), start + _RUN_MAX)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if text[start:mid] in runs:
+            low = mid
+        else:
+            high = mid - 1
+    return start, low
+
+
+def _token_of(text: str, start: int, stop: int) -> tuple[int, int]:
+    """(start, stop) of the whitespace-delimited token(s) of ``text`` holding
+    ``text[start:stop]``."""
+    end = text.find(" ", stop)
+    return text.rfind(" ", 0, start) + 1, len(text) if end == -1 else end
+
+
 def _prose_words(
     probes: list[tuple[str, bool]], whole: set[str], taken: set[str]
 ) -> frozenset[str]:
-    """The term-shaped probes of a prose value that are words of the prose: not
-    its whole text and not taken by a capture rule."""
+    """The probes of a prose value that are words of the prose: not its whole
+    text and not taken (by a capture rule, or a secret part of the value), and
+    term-shaped, a run of digits, or a plain word with its sentence
+    punctuation ("4821", "Hello!")."""
     return frozenset(
         probe
         for probe, _ in probes
         if probe not in whole
         and probe not in taken
-        and ("-" in probe or "_" in probe or "." in probe)
-        and _term_shaped(probe)
+        and (
+            (("-" in probe or "_" in probe or "." in probe) and _term_shaped(probe))
+            or probe.isdigit()
+            or (probe != probe.strip(_TOKEN_EDGE) and not _secret_token(probe.strip(_TOKEN_EDGE)))
+        )
     )
 
 
-def _captured_probes(texts: list[str | None]) -> list[tuple[str, bool]]:
-    """(probe, whole-word) of every secret the capture rules recognise in
+def _captured_probes(texts: list[str | None]) -> tuple[list[tuple[str, bool]], list[str]]:
+    """((probe, whole-word) of every secret the capture rules recognise in
     ``texts``: the secret whole (a plain word or digits as a whole word) and
-    its secret-shaped fragments."""
+    its secret-shaped fragments, and the secrets themselves)."""
     # Imported here, not at load: reference_extraction imports knowledge_ingest,
     # whose credential path is where this module is meant to be called from.
     from genesis.memory.reference_extraction import captured_secrets
 
     probes: list[tuple[str, bool]] = []
-    for secret in captured_secrets([t for t in texts if t]):
+    secrets = sorted(captured_secrets([t for t in texts if t]))
+    for secret in secrets:
         whole = [(_normalise(form), not _secret_token(form)) for form in _decoded(secret.strip())]
         # The secret whole is matched as the capture rules decide (a plain word
         # or digits as a whole word), never as ``_value_probes`` would probe it
@@ -325,7 +607,7 @@ def _captured_probes(texts: list[str | None]) -> list[tuple[str, bool]]:
         probes += whole
         probes += [(p, w) for p, w in _value_probes(secret) if p not in {q for q, _ in whole}]
     # A secret of format characters only normalises to nothing: no probe.
-    return [(probe, as_word) for probe, as_word in probes if probe.strip()]
+    return [(probe, as_word) for probe, as_word in probes if probe.strip()], secrets
 
 
 def _login_of(value: str) -> str | None:
@@ -370,24 +652,28 @@ def value_masks(
         for text, p in sources
         if " ".join(text.splitlines()) != text
     ]
-    captured = _captured_probes([value, detail, *(t for item in also for t in item[:2])])
+    captured, captured_texts = _captured_probes(
+        [value, detail, *(t for item in also for t in item[:2])]
+    )
     taken = {probe for probe, _ in captured}
     probes: list[tuple[str, bool]] = []
     words: set[str] = set()
     kept: set[str] = set()
     # The identifier exempts a probe as a login only when EVERY source that
     # produced it produced it as its login: one that requires it as a secret
-    # keeps it (a new password that is an old entry's login).
+    # keeps it (a new password that is an old entry's login), and so does a
+    # secret part of the source itself (a secret half equal to its login).
     as_login: set[str] = set()
     as_secret: set[str] = set()
     for text, is_prose in sources:
         own = _value_probes(text)
         probes += own
         login = _login_of(text)
-        as_login |= {probe for probe, _ in own if probe == login}
-        as_secret |= {probe for probe, _ in own if probe != login}
+        parts = {probe for probe, _ in _secret_parts(text)}
+        as_login |= {probe for probe, _ in own if probe == login and probe not in parts}
+        as_secret |= {probe for probe, _ in own if probe != login or probe in parts}
         skip = (
-            _prose_words(own, {_normalise(f) for f in _decoded(text.strip())}, taken)
+            _prose_words(own, {_normalise(f) for f in _decoded(text.strip())}, taken | parts)
             if is_prose
             else frozenset()
         )
@@ -397,7 +683,7 @@ def value_masks(
     logins = as_login - as_secret
     whole = {_normalise(form) for form in _decoded(value.strip())}
     named = [(p, w) for p, w in probes if p not in logins or p in whole]
-    secrets = [text for text, _ in sources[1:]]
+    secrets = [text for text, _ in sources[1:]] + captured_texts
     return (
         ValueMask(value, probes=probes, captured=captured, exempt=exempt, secrets=secrets),
         ValueMask(value, probes=named, captured=captured, exempt=exempt, secrets=secrets),

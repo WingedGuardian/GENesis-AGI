@@ -321,3 +321,270 @@ def test_a_value_spelling_the_mask_text_is_masked():
     strict, _named = rm.value_masks("abcd1234")
     assert not strict.carries("abcd[held]1234")
     assert strict.mask("abcd[held]1234") == "abcd[held]1234"
+
+
+# ─── a secret part is always a probe (round-2 class audit) ───────────────────
+#
+# The secret half of "login / secret", the password of a URL's userinfo and a
+# captured secret as captured are probes as written, whatever their shape; the
+# skips of a fragment (a host, a scheme, a port) apply only where it sits.
+
+_SECRET_FORMS = {
+    "plain word": "hunter",
+    "all digits": "48291375",
+    "dotted": "Demo.Fakeword",
+    "punctuated": "Fakeword!",
+    "mixed": "Fk9@x!Z2",
+}
+_POSITIONS = {
+    "login / secret": lambda s: (f"bob / {s}", None),
+    "url userinfo": lambda s: (f"postgres://app:{s}@db.example.com/prod", None),
+    "captured label": lambda s: ("see the note", f"password: {s}"),
+    "plain delimited": lambda s: (f"front door {s}", None),
+}
+#: Stated limits: a plain word inside a plain delimited value is matched whole
+#: only, a plain-word URL password stays visible, and a dotted fragment of a
+#: plain delimited value reads as a host name, which is not probed (owner
+#: ruling 2026-11-17: the fragment rules stay the shape rules).
+_STATED_LIMITS = {
+    ("plain delimited", "plain word"),
+    ("url userinfo", "plain word"),
+    ("plain delimited", "dotted"),
+}
+
+
+@pytest.mark.parametrize("form", list(_SECRET_FORMS))
+@pytest.mark.parametrize("position", list(_POSITIONS))
+def test_no_masked_field_carries_a_secret_part(position, form):
+    if (position, form) in _STATED_LIMITS:
+        pytest.skip("stated limit for a plain-word secret in this position")
+    secret = _SECRET_FORMS[form]
+    value, detail = _POSITIONS[position](secret)
+    strict, named = rm.value_masks(value, detail=detail)
+    for mask in (strict, named):
+        for field in (f"box {secret} end", secret, f"{secret}, other"):
+            masked = mask.mask(field)
+            assert secret not in masked and not mask.carries(masked), (field, masked)
+
+
+@pytest.mark.parametrize(
+    ("value", "field", "masked"),
+    [
+        ("bob / hunter", "bob hunter box", "bob [held] box"),
+        ("bob / 4821", "bob 4821", "bob [held]"),
+        ("admin / admin", "admin router", "[held] router"),
+        # A plain-word URL password is the stated limit (owner ruling 2026-11-17).
+        ("postgres://app:hunter@db.example.com/prod", "prod hunter db", "prod hunter db"),
+    ],
+)
+def test_a_plain_secret_part_masks_in_the_identifier_and_a_tag(value, field, masked):
+    strict, named = rm.value_masks(value)
+    assert named.mask(field) == masked
+    assert strict.mask(field) == masked
+
+
+@pytest.mark.parametrize(
+    ("value", "field"),
+    [("admin9x / admin9x", "admin9x"), ("admin9x / admin9x!", "admin9x!")],
+)
+def test_a1_a_secret_half_equal_to_its_login_is_masked(value, field):
+    strict, named = rm.value_masks(value)
+    assert named.mask(field) == "[held]"
+    assert strict.mask(field) == "[held]"
+    assert rm.mask_value_spans(value, field, login_exempt=True) == "[held]"
+    _strict, named = rm.value_masks("NewPw9!x", also=(("other9x / other9x", None),))
+    assert named.mask("other9x") == "[held]"
+
+
+@pytest.mark.parametrize(
+    ("value", "field"),
+    [
+        ("admin / Fakeword!", "Fakeword!"),
+        ("admin / Ab1!", "Ab1!"),
+        ("admin / Ab1?", "Ab1?"),
+        ("admin / Ab1'", "Ab1'"),
+        ("postgres://u:Fakeword!@h.example.org", "Fakeword!"),
+        ("token=Ab1!&x=1", "Ab1!"),
+    ],
+)
+def test_a2_edge_punctuation_never_unprobes_a_secret(value, field):
+    strict, named = rm.value_masks(value)
+    assert named.mask(field) == "[held]"
+    assert strict.mask(field) == "[held]"
+
+
+@pytest.mark.parametrize(
+    ("value", "field", "masked"),
+    [
+        ("admin / Demo.Fakeword", "Demo.Fakeword", "[held]"),
+        ("admin / Fake9.zzz", "Fake9.zzz", "[held]"),
+        ("postgres://svc:Fake9.zzz@db.example.org/x", "Fake9.zzz", "[held]"),
+        ("postgres://svc:Fake9.zzz@db.example.org/x", "prefixFake9.zzz", "prefix[held]"),
+        # A dotted fragment of a plain delimited value reads as a host name
+        # and is not probed: the fragment rules stay the shape rules (owner
+        # ruling 2026-11-17).
+        pytest.param(
+            "token=abc1.defg", "abc1.defg", "[held]",
+            marks=pytest.mark.skip(reason="stated limit: a host-shaped fragment is not probed"),
+        ),
+    ],
+)
+def test_a3_a_dotted_secret_is_no_host_name(value, field, masked):
+    strict, named = rm.value_masks(value)
+    assert named.mask(field) == masked
+    assert strict.mask(field) == masked
+
+
+def test_a3_a_host_and_port_in_their_position_stay_visible():
+    _strict, named = rm.value_masks("redis://:Rz9fakeKey77@cache.example.org:6379/0")
+    assert named.mask("cache.example.org:6379 redis") == "cache.example.org:6379 redis"
+    assert named.mask("Rz9fakeKey77") == "[held]"
+
+
+@pytest.mark.parametrize("edge", [".", ":", ")", '"', "'"])
+def test_a4_a_captured_secret_is_probed_as_captured(edge):
+    secret = "Fakeword" + edge
+    assert {secret, "Fakeword"} <= captured_secrets([f"password: {secret}"])
+    strict, named = rm.value_masks("see note", detail=f"password: {secret}")
+    assert named.mask(f"prefix{secret}") == "prefix[held]"
+    assert strict.mask(f"prefix{secret}") == "prefix[held]"
+    _strict, named = rm.value_masks(f"router (password: {secret}", prose=True)
+    assert named.mask(f"prefix{secret}") == "prefix[held]"
+
+
+@pytest.mark.parametrize("count", [1, 63, 64, 65, 300])
+def test_a5_every_run_grows_whole_in_any_order(count):
+    runs = ["a" * i + "@Fake123" for i in range(1, count + 1)] + ["Demo@Fake123"]
+    sample = {runs[0], runs[len(runs) // 2], runs[-2], runs[-1]}
+    for order in (runs, runs[::-1]):
+        _strict, named = rm.value_masks(" ".join(order))
+        for run in sample:
+            assert named.mask(f"{run} router") == "[held] router", run
+
+
+def test_a5_a_run_longer_than_the_old_cap_grows_whole():
+    strict, _named = rm.value_masks("Pw9" + "x" * 300 + "@Fake123 z")
+    assert strict.mask("x" * 200 + "@Fake123") == "[held]"
+
+
+@pytest.mark.parametrize(
+    ("value", "field", "masked"),
+    [
+        ("admin / 48291375", "48291375", "[held]"),
+        ("postgres://u:48291375@h.example.org/db", "48291375", "[held]"),
+        ("front door code 4821", "door 4821", "door [held]"),
+        ("front door pin 4821", "door 4821", "door [held]"),
+        # A whole number: another number holding it is no match.
+        ("admin / 48291375", "a482913750", "a482913750"),
+    ],
+)
+def test_a6_an_all_digit_secret_is_masked_as_a_whole_number(value, field, masked):
+    strict, named = rm.value_masks(value)
+    assert named.mask(field) == masked
+    assert strict.mask(field) == masked
+
+
+@pytest.mark.parametrize("mark", [rm.SECRET_PLACEHOLDER, rm.DETAIL_PLACEHOLDER])
+def test_a7_a_secret_spelling_a_placeholder_is_masked(mark):
+    value = f"Fake{mark}9x"
+    strict, named = rm.value_masks(value)
+    assert strict.mask(value) == "[held]"
+    assert named.mask(f"x {value} y") == "x [held] y"
+    # The placeholder itself is still no leak of another value.
+    assert not rm.value_masks("Zq8vLm2x")[0].carries(f"x {mark} y")
+
+
+def test_a8_a_described_secret_grows_over_its_own_runs():
+    _strict, named = rm.value_masks("other X9y8z7w6", detail="password: Demo@Fake123!")
+    assert named.mask("Demo@Fake123") == "[held]"
+
+
+# ─── the narrowed fragment rules (owner ruling 2026-11-17) ───────────────────
+
+
+@pytest.mark.parametrize("password", ["Pass?word", "Pass/word", "Pass#word", "Pass word", "Xy#9zQ/w"])
+@pytest.mark.parametrize("host", ["h", "host.example.org"])
+def test_m1_a_password_with_an_unencoded_reserved_character_is_a_probe(password, host):
+    value = f"postgres://bob:{password}@{host}/db"
+    assert (rm._normalise(password), False) in rm._secret_parts(value)
+    strict, named = rm.value_masks(value)
+    for mask in (strict, named):
+        assert mask.mask(f"x {password} y") == "x [held] y"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://h.example.org:8443/path/me@x.example.org",
+        "https://h.example.org/a:b9x/c@x.example.org",
+        "https://h.example.org/x?q=a:b9x c@x.example.org",
+        "https://bob@h.example.org/p:q9x/r@x.example.org",
+    ],
+)
+def test_m1_an_at_sign_in_a_url_path_is_no_password(value):
+    assert rm._secret_parts(value) == []
+
+
+def test_m1_a_well_formed_userinfo_still_ends_at_its_last_at_sign():
+    assert (rm._normalise("p@ss9x"), False) in rm._secret_parts("redis://bob:p@ss9x@h.example.org/0")
+
+
+@pytest.mark.parametrize(
+    ("value", "field", "masked"),
+    [
+        # M3: an IP is probed again, in a URL authority and a host:port.
+        ("http://192.0.2.5:8080/admin", "Admin 192.0.2.5", "Admin [held]"),
+        ("admin / 192.0.2.5:8080", "note 192.0.2.5", "note [held]"),
+        ("ssh://root@192.0.2.5:22/ Zq9vLm2x", "tag 192.0.2.5", "tag [held]"),
+        # M4: a host name, an email domain and a port are not probed.
+        ("bob@example.com / pw9x!", "Gmail example.com work", "Gmail example.com work"),
+        ("host=db.example.org port=5432 pass=Zx9kq7", "db.example.org staging", "db.example.org staging"),
+        ("db.example.org:5432 Zx9kq7", "postgres 5432", "postgres 5432"),
+        ("ssh://git@github.com/org/repo.git", "repo.git deploy key", "repo.git deploy key"),
+        # A digit run that is not a port is a whole-word probe.
+        ("front door code 4821", "door 4821", "door [held]"),
+        ("db.example.org:5432 and pin 5432", "postgres 5432", "postgres [held]"),
+    ],
+)
+def test_the_narrowed_fragment_rules(value, field, masked):
+    strict, named = rm.value_masks(value)
+    assert named.mask(field) == masked
+    assert strict.mask(field) == masked
+
+
+def test_m2_a_large_value_of_shared_probe_runs_masks_in_bounded_time():
+    """Round-2 fix audit M2: a 2.6 MB held value whose 150,000 runs share one
+    short probe, against a 16 KB field with 1,000 matches. The run cache is
+    bounded, so the match masks its whole token instead (the uncapped index
+    took about 6 s here)."""
+    import random
+
+    rng = random.Random(2)
+    value = "Ab12 " + " ".join(f"x{i}Ab12y{i}" for i in range(150_000))
+    assert len(value) > 2_500_000
+    mask = rm.ValueMask(value)
+    field = " ".join(
+        f"Ab12{rng.choice('qwrtpsd')}{rng.randrange(10**6)}" for _ in range(1000)
+    )[:16_000]
+    started = time.perf_counter()
+    out = mask.mask(field)
+    assert time.perf_counter() - started < 3.0
+    assert "ab12" not in out.casefold()
+    assert not mask.carries(out)
+
+
+@pytest.mark.parametrize("count", [64, 65])
+def test_m2_a_probe_past_the_run_cache_masks_its_whole_token(count):
+    runs = [f"{'a' * i}@Fake123" for i in range(1, count + 1)]
+    _strict, named = rm.value_masks(" ".join(runs))
+    assert named.mask("zz@Fake123q router") == ("[held] router" if count > 64 else "zz[held]q router")
+
+
+def test_many_distinct_host_ports_build_masks_in_linear_time():
+    """Round-2 audit H1: counting each port's whole-word occurrences took a
+    pass over the whole value per distinct port (8,000 ports: ~92 s)."""
+    value = "\n".join(f"db{i}.example.org:{10000 + i}" for i in range(8000)) + "\nadmin / Zq9!fake"
+    started = time.monotonic()
+    strict, named = rm.value_masks(value)
+    assert time.monotonic() - started < 5.0
+    assert strict.mask("x Zq9!fake y") == "x [held] y"

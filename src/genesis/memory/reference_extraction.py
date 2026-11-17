@@ -238,16 +238,17 @@ _SECRET_GROUPS = (
 def captured_secrets(texts: list[str]) -> set[str]:
     """Every secret a credential pattern above captures in ``texts``, across
     every match of every pattern: the secrets the capture rules recognise in
-    free prose (the hold-out masking of a prose value probes them, #2426)."""
+    free prose (the hold-out masking of a prose value probes them, #2426). Each
+    secret as captured, and also with its trailing punctuation trimmed when
+    that differs: the captured text may be the secret whole."""
     found: set[str] = set()
     for text in texts:
         if not isinstance(text, str) or not text:
             continue
         for pattern, group in _SECRET_GROUPS:
             for match in pattern.finditer(text):
-                value = (match.group(group) or "").strip().rstrip(".,;:)\"'")
-                if value:
-                    found.add(value)
+                captured = (match.group(group) or "").strip()
+                found.update(v for v in (captured, captured.rstrip(".,;:)\"'")) if v)
     return found
 
 
