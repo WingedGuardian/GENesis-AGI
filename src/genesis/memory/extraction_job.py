@@ -157,6 +157,124 @@ async def _lesson_cap_left(
     return max(0, cap - used)
 
 
+async def _segment_shadow(
+    db: aiosqlite.Connection,
+    session_id: str,
+    cc_session_id: str,
+    spine: list[dict],
+    *,
+    marker: str | None | object,
+    transcript_path: Path,
+    candidates: bool,
+    lever: str,
+    cap_left: int | None,
+    max_procedures_per_session: int,
+    whole_score: float,
+    stored: int,
+) -> None:
+    """``segment: shadow`` (#4807): say what judging only the unjudged part would
+    do, and move the progress marker as that rule would move it.
+
+    Called after the whole-session build succeeded (or decided not to build), so
+    a failed build holds the marker. ``marker`` is the value read before the
+    spine was parsed, and the compare-and-set expects it, so a cycle working
+    from an older parse can never move the marker past a newer cycle's write.
+    The marker holds when the lever is ``off`` (nothing was judged), when the
+    part would trigger a build but the cap is spent, and on a reset whose old id
+    is still in the transcript file (the parse stopped short; a real reset means
+    the file was replaced). Otherwise it moves to the part's last tool entry.
+    Observation only: it changes nothing the builder stores, and an error here
+    is logged and never fails the cycle.
+
+    ``whole_score`` and ``stored`` (lessons the whole build kept this cycle, 0
+    when it did not run) go on the line, so each line can be compared with what
+    the whole build did without joining other lines.
+    """
+    from genesis.learning.procedural.build_segment import select_part
+    from genesis.learning.procedural.lesson_builder_config import segment_mode
+    from genesis.learning.procedural.struggle_detector import (
+        _MAX_SPINE_CHARS,
+        STRUGGLE_THRESHOLD,
+        format_spine_for_judge,
+        score_struggle,
+    )
+
+    try:
+        if segment_mode() != "shadow" or marker is _MARKER_UNREAD:
+            return
+        from genesis.db.crud import cc_sessions as sessions_crud
+
+        part = select_part(spine, marker, budget_chars=_MAX_SPINE_CHARS)
+        score = score_struggle(part.new)
+        would_trigger = score >= STRUGGLE_THRESHOLD or candidates
+        if lever == "off":
+            held = "off"
+        elif part.reset and await asyncio.to_thread(_file_mentions, transcript_path, marker):
+            held = "partial-parse"
+        elif would_trigger and (
+            cap_left if cap_left is not None
+            else await _lesson_cap_left(
+                db, cc_session_id, max_procedures_per_session, shadow=lever == "shadow",
+            )
+        ) == 0:
+            held = "cap"
+        else:
+            held = ""
+        moved = False
+        if not held and part.through_id is not None and part.through_id != marker:
+            moved = await sessions_crud.advance_lesson_built_through(
+                db, session_id, expected=marker, new=part.through_id,
+            )
+            if not moved:
+                held = "changed-elsewhere"
+        logger.info(
+            "Lesson segment [shadow] for %s: entries=%d chars=%d context=%d "
+            "context_chars=%d score=%.2f would_trigger=%s whole_score=%.2f "
+            "stored=%d reset=%s pending_tail=%d held_back=%d lever=%s marker=%s",
+            session_id, len(part.new), len(format_spine_for_judge(part.new)),
+            len(part.context), len(format_spine_for_judge(part.context)), score,
+            would_trigger, whole_score, stored, part.reset, part.pending_tail,
+            part.held_back, lever,
+            "moved" if moved else f"held:{held}" if held else "unchanged",
+        )
+    except Exception:
+        logger.warning("Lesson segment shadow failed for session %s", session_id, exc_info=True)
+
+
+# A marker read that failed: the shadow step then does nothing this cycle.
+_MARKER_UNREAD = object()
+
+
+async def _read_lesson_marker(db: aiosqlite.Connection, session_id: str) -> str | None | object:
+    """The stored progress marker, or :data:`_MARKER_UNREAD` if it cannot be read."""
+    from genesis.db.crud import cc_sessions as sessions_crud
+
+    try:
+        return await sessions_crud.get_lesson_built_through(db, session_id)
+    except Exception:
+        logger.warning("Lesson marker read failed for session %s", session_id, exc_info=True)
+        return _MARKER_UNREAD
+
+
+def _file_mentions(path: Path, needle: object) -> bool:
+    """Whether ``needle`` occurs in the file's bytes. A marker id that the
+    parse did not find but the file still holds means the parse stopped short,
+    not that the file was replaced. Unreadable counts as mentioned (hold)."""
+    if not isinstance(needle, str) or not needle:
+        return False
+    target = needle.encode()
+    try:
+        with open(path, "rb") as f:
+            tail = b""
+            while chunk := f.read(1 << 20):
+                if target in tail + chunk:
+                    return True
+                tail = chunk[-len(target):]
+    except OSError:
+        return True
+    return False
+
+
 async def _check_claim_duplicate(
     db: aiosqlite.Connection,
     content: str,
@@ -663,6 +781,11 @@ async def run_extraction_cycle(
                 # `build_spine_and_haystack` iterates a whole JSONL file
                 # (`for line in f`), which wedged the event loop ~1s at a time
                 # from this background extraction job (recall 503s correlated).
+                # The progress marker as it stood BEFORE this parse: compared with
+                # the spine this cycle parses, and the value its compare-and-set
+                # expects, so a cycle working from an older parse cannot move it
+                # backwards past a newer cycle's write.
+                marker_before = await _read_lesson_marker(db, session_id)
                 spine, haystack = await asyncio.to_thread(
                     build_spine_and_haystack, transcript_path
                 )
@@ -673,11 +796,8 @@ async def run_extraction_cycle(
                 # over a rolling window. A local counter restarted at 0 every
                 # cycle, so one long session reached 811 lessons.
                 # Shadow runs the real builder and records what it would store.
-                builder_mode = (
-                    lesson_builder_mode()
-                    if struggle_triggered or session_candidates
-                    else "off"
-                )
+                lever = lesson_builder_mode()
+                builder_mode = lever if struggle_triggered or session_candidates else "off"
                 shadow = builder_mode == "shadow"
                 cap_left = 0
                 if builder_mode != "off":
@@ -728,6 +848,16 @@ async def run_extraction_cycle(
                         builder_mode, session_id, struggle_score,
                         len(session_candidates), len(stored_ids),
                     )
+                # Reached only when the whole build above did not raise, so a
+                # failed build never moves the progress marker.
+                await _segment_shadow(
+                    db, session_id, cc_session_id, spine,
+                    marker=marker_before, transcript_path=transcript_path,
+                    candidates=bool(session_candidates), lever=lever,
+                    cap_left=cap_left if builder_mode != "off" else None,
+                    max_procedures_per_session=max_procedures_per_session,
+                    whole_score=struggle_score, stored=len(stored_ids) if cap_left else 0,
+                )
             except (ProcedureBuilderUnavailable, TimeoutError) as exc:
                 # Transient: the provider chain was exhausted, or the build was
                 # cancelled mid-flight (timeout). Re-queue the session for a later

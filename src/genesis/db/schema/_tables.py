@@ -567,7 +567,10 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             -- rows older than the column = not judged, never paged.
             outcome          TEXT,
             outcome_reason   TEXT,
-            outcome_paged_at TEXT
+            outcome_paged_at TEXT,
+            -- tool_use_id of the last tool entry the lesson builder has judged
+            -- (#4807); NULL = not judged yet, judge from the start.
+            lesson_built_through TEXT
         )
     """,
     "inbox_items": """
