@@ -479,7 +479,7 @@ comment and label moves it.
    the two own contributions with blob ids and line numbers blanked, since a
    merge of main shifts both without changing the PR's own lines. Keep the
    context lines and binary content: they are what shows a line that moved, or
-   a binary that changed. With `own() { git diff --binary $(git merge-base "$1" "$B") "$1" | grep -v '^index ' | sed -E 's/^@@ -[0-9,]+ \+[0-9,]+ @@.*/@@/'; }`,
+   a binary that changed. With `own() { git diff --binary $(git merge-base "${1}" "$B") "${1}" | grep -v '^index ' | sed -E 's/^@@ -[0-9,]+ \+[0-9,]+ @@.*/@@/'; }`,
    run `diff <(own <old-head>) <(own <new-head>)`, all in one Bash call (shell
    state does not survive between calls, and an empty `B` gives noise). One
    blind spot: an edit that moves between two repeated, identical blocks can
