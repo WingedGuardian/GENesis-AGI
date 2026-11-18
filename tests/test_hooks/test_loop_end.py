@@ -564,7 +564,8 @@ def test_a_merge_check_out_of_time_keeps_the_deny(quiet, monkeypatch, repo):
     monkeypatch.setattr(rr, "owed_from_budget", lambda *a, **k: {"owed": []})
     _merging_main(repo)
     deadline = time.monotonic() + _gate._REFLECTION_RESERVE
-    assert _rule("git commit --no-edit", repo, _fix_rounds(5), deadline=deadline)[0] == "deny"
+    verdict, message = _rule("git commit --no-edit", repo, _fix_rounds(5), deadline=deadline)
+    assert verdict == "deny" and "ran out of time; run it again" in message
 
 
 def test_advisory_mode_says_what_it_would_have_denied(quiet, monkeypatch, repo):

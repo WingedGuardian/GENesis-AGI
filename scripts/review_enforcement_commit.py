@@ -964,8 +964,12 @@ REFLECTION_EXEMPT_REPO = "WingedGuardian/GENesis-AGI"
 #: Rule R's share of the hook budget: at most this, and never so much that the
 #: rest of the gate is left less than the reserve after it.
 _REFLECTION_SLICE = 1.0
-#: The ended branch's own slice: it reads no network, and up to four git calls
-#: only when the loop has ended and the commit concludes a merge.
+#: The ended branch's own slice: it reads no network, and up to nine git calls
+#: (MERGE_HEAD, the staged tree, the default branch's first-parent line, the
+#: merge result) only when the loop has ended and the commit concludes a merge.
+#: MEASURED 2026-11-18: about 0.1 s on a 2,826-commit main; the first-parent
+#: walk grows about 70 ms per 1,000 commits, so it nears this slice past about
+#: 5,000. Running out refuses and says so. The owed read keeps its own slice.
 _ENDED_SLICE = 0.5
 _REFLECTION_RESERVE = 1.5
 _REFLECTION_FILE_LIMIT = 64 * 1024
@@ -1283,21 +1287,24 @@ def _ended_commit_problem(
         if _fixes_now(rr.parse(text, gate_lane=bool(budget.get("gate_surface")))):
             return _ENDED_FIX_NOW
         return None
-    if _concludes_merge_of_main(cwd, rr, segs, deadline):
+    merged = _concludes_merge_of_main(cwd, rr, segs, deadline)
+    if merged:
         return None
+    if merged is None:
+        return "the merge-of-main check ran out of time; run it again"
     if problem and _reflection_message_file(segs[0]) is not None:
         return f"as a reflection: {problem}"
     return "it is neither an empty reflection commit nor a merge of the default branch"
 
 
-def _concludes_merge_of_main(cwd: str | None, rr, segs: list, deadline: float | None) -> bool:
+def _concludes_merge_of_main(cwd: str | None, rr, segs: list, deadline: float | None) -> bool | None:
     """A commit concluding a merge of the default branch that carries nothing
     else: no staging in the same command, exactly one MERGE_HEAD, and the
     staged tree passes ``review_reflection._merge_is_no_fix`` (git's own merge
     result, or a difference only in the files that conflicted), the reading
     the owe side uses. Every git call and the MERGE_HEAD read run under
-    ``deadline``; running out refuses, so the deny stands rather than the hook
-    overrunning (which fails open)."""
+    ``deadline``; running out answers None (refused, and said so), so the deny
+    stands rather than the hook overrunning (which fails open)."""
     if _commit_may_add_content(segs):
         return False
     d = cwd or "."
@@ -1316,6 +1323,8 @@ def _concludes_merge_of_main(cwd: str | None, rr, segs: list, deadline: float | 
             if tree_code != 0:
                 return False
             return rr._merge_is_no_fix(d, tree.strip(), [head, heads[0]], rr._mainline(d), {head})
+    except rr.Refused as exc:
+        return None if "ran out of time" in str(exc) else False
     except Exception:  # noqa: BLE001 — not provably a merge of main
         return False
 
