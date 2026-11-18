@@ -595,21 +595,34 @@ owed, the commit gate denies content commits (Rule R, below). The old local
 cross-model streak, its two stops and its counter are gone. Only the budget's
 rounds are numbered as rounds.
 
-**Past round 4, the reflection is held to a bar** (`scripts/review_past_terminal.py`,
-ordinary lane only; it binds rounds opened from `PAST_TERMINAL_CUTOVER_ISO` on, which
-stays unset until the commit-side end of the review loop ships, so today nothing
-binds). A fix-now past round 3 carries `Prediction: merges at round <next> because
-<why>` and `Confidence: <95-100>% falsified-by <what>`. From round 5 the reflection
-says `Prediction-held: yes|no <why>`, and `yes` is refused while that round drew a
-floor finding (the level the reviewer wrote), a level is unreadable, or the round has
-not settled. Two rounds from 5 on that drew a floor finding leave `send-back` as the
-only decision. A round 5 or later with no floor finding takes no fix-now for its own
-keys: file them or send the PR back. Past round 3 a send-back fixes nothing now. Only
-rounds a fix produced count for these rules: a round reached by a merge of main or an
-empty commit, or one on a head a force-push dropped, never ends fixing and never
-counts as a failed prediction, so an earlier floor finding stays fixable. Sending the
-PR back with every finding filed and `Prediction-held: no` is admissible in every
-state.
+**Past round 4, the reflection is held to a bar, and the loop ends**
+(`scripts/review_past_terminal.py`, ordinary lane only; it binds rounds opened from
+`PAST_TERMINAL_CUTOVER_ISO` on). The round-4 and round-5 thresholds count only rounds a
+fix produced on a head still in the PR: a round reached by a merge of main or an empty
+commit, or one on a head a force-push dropped, never moves a PR toward them, never ends
+fixing and never counts as a failed prediction. The budget's round number still counts
+every round, and the Prediction line names it. A fix-now past round 3 carries
+`Prediction: merges at round <next> because <why>` and `Confidence: <95-100>%
+falsified-by <what>`. From round 5 the reflection says `Prediction-held: yes|no <why>`,
+and `yes` is refused while that round drew a floor finding (the level the reviewer
+wrote), a level is unreadable, or the round has not settled. Two rounds from 5 on that
+drew a floor finding leave `send-back` as the only decision. Past round 3 a send-back
+fixes nothing now.
+
+**The loop's end.** Once the newest round a fix produced is round 5 or later and drew no
+floor finding, with no floor finding on any other round (a late one, or a round a
+merge produced) since that round's head was committed, the review loop is over: the commit gate denies every content
+commit, read from the budget alone and before anything about owed reflections, and
+before the round-approval prompt, so an approval cannot let a fix in. It lets through
+an empty reflection that fixes nothing (each finding `file` or `no-defect`) and a merge
+of the default branch; the owed-reflection rule still judges them. The way on is to merge the PR when
+the merge gate passes (not before that round's settle time, which the deny names), or
+to send it back, or carry a real defect in a new PR. Fixing reopens on a floor finding
+on that round, a newer round a fix produces that draws one, or a floor finding on
+any other round since that round's head was committed.
+When the budget cannot tell whether a fix produced a round 4 or later, the rules are
+off for the PR and the gate says so. Sending the PR back with every finding filed and
+`Prediction-held: no` is admissible in every state.
 
 **Bring a premise check to every escalation.** Before putting any of these to
 the owner, run the premise check (a fresh-context agent following
