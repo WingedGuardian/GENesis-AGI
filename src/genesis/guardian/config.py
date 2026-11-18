@@ -192,6 +192,9 @@ class StoragePoolConfig:
     # Re-alert cadence while a tier is sustained (avoids per-tick spam but keeps
     # a live problem visible). Tier *increases* always alert immediately.
     realert_hours: float = 6.0
+    # A tier is left only once the reading is this many points below its line,
+    # so a pool that hovers at a line pages once, not on every crossing.
+    exit_margin_pct: float = 5.0
 
     # --- Pressure RELIEF (pool_relief.py) -----------------------------------
     # The tiers above only ALERT. A thin pool once filled to 100% while CRITICAL
