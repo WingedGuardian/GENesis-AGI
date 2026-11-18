@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from genesis.channels.telegram.transport.update_dedupe import TelegramUpdateDedupe
     from genesis.channels.voice import VoiceDeliveryHelper
 
+from genesis.cc.model_names import display_name
+
 log = logging.getLogger(__name__)
 
 
@@ -97,6 +99,13 @@ class HandlerContext:
         """Factory for CC event routing callbacks."""
         async def _on_event(event: StreamEvent) -> None:
             if interrupt_event.is_set():
+                return
+            if streamer and event.event_type == "init":
+                # Even on a disabled streamer: a failover peer's init follows the
+                # home run's rate limit, and the final header must name the peer.
+                running = (event.raw or {}).get("model")
+                if isinstance(running, str) and running:
+                    streamer.set_running_model(display_name(running))
                 return
             if streamer and streamer.enabled:
                 if event.event_type in ("rate_limit_event", "error"):

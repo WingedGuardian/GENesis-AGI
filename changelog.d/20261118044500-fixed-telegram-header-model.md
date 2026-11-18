@@ -1,0 +1,1 @@
+- **Telegram's reply header names the model that answered, once.** The `[Model / Effort]` line now comes from the model Claude Code reports it is running (with its version, e.g. `Sonnet 5.5`), not the session record, which could name a different model; and a Telegram reply no longer carries a second header written by the model itself.

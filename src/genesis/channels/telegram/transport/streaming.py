@@ -76,6 +76,7 @@ class DraftStreamer:
         throttle_s: float = _DEFAULT_THROTTLE_S,
         prefix: str = "",
         stopping: Callable[[], bool] | None = None,
+        prefix_effort: str = "",
     ) -> None:
         self.bot = bot
         self.chat_id = chat_id
@@ -83,6 +84,7 @@ class DraftStreamer:
         self.message_thread_id = message_thread_id
         self.throttle_s = throttle_s
         self._prefix = prefix
+        self._prefix_effort = prefix_effort
         # Heal a shutdown-closed send client on draft sends; wired to the
         # adapter's stopping flag by the caller (default: never stopping).
         self._stopping = stopping or (lambda: False)
@@ -107,6 +109,15 @@ class DraftStreamer:
         ephemeral drafts from appearing alongside (or instead of) real messages.
         """
         self._enabled = False
+
+    def set_running_model(self, model_label: str) -> None:
+        """Name the model Claude Code reports it is running in the prefix (#4850).
+
+        The prefix is built from the session row before the turn starts; the row
+        can name a different model than the one that answers.
+        """
+        if self._prefix and model_label and self._prefix_effort:
+            self._prefix = f"[{model_label} / {self._prefix_effort}]"
 
     @property
     def any_draft_sent(self) -> bool:

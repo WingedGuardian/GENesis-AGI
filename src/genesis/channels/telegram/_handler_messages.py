@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -113,6 +114,8 @@ async def _apply_pending_settings(ctx: HandlerContext, user_id: int, tid: str | 
 
 
 _MODEL_PREFIX_GAP_S = 3600  # Show model/effort prefix after 1h of silence
+# A self-written header line: "[Sonnet 5.5 / high]", "[Opus / High]".
+_HEADER_LINE = re.compile(r"\[[^\[\]\n]{1,40} / [A-Za-z]{2,8}\]")
 
 
 def _with_model_prefix(streamer: DraftStreamer | None, response: str) -> str:
@@ -127,6 +130,12 @@ def _with_model_prefix(streamer: DraftStreamer | None, response: str) -> str:
         return response
     if response.startswith(CONTINGENCY_HEADER_PREFIX):
         return response
+    # The model may open with its own header (CONVERSATION.md, Session Start);
+    # the relay's names the model that actually ran, so it replaces that line
+    # rather than stacking a second header on it (#3846).
+    first, sep, rest = response.partition("\n")
+    if _HEADER_LINE.fullmatch(first.strip()):
+        response = rest.lstrip("\n") if sep else ""
     return streamer._prefix + "\n" + response
 
 
@@ -148,6 +157,7 @@ async def _make_streamer(ctx: HandlerContext, msg, user, tid) -> DraftStreamer |
 
     # Determine whether to show model/effort prefix based on message gap
     prefix = ""
+    effort = ""
     if ctx.db:
         try:
             from genesis.db.crud import cc_sessions
@@ -196,6 +206,7 @@ async def _make_streamer(ctx: HandlerContext, msg, user, tid) -> DraftStreamer |
         message_thread_id=msg.message_thread_id,
         prefix=prefix,
         stopping=lambda: getattr(ctx.adapter, "_stopping", False),
+        prefix_effort=effort if prefix else "",
     )
 
     # Flush immediately — user sees prefix before inference starts
