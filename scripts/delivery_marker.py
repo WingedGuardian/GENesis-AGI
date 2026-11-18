@@ -276,7 +276,7 @@ def basis_from_body(body: str | None, *, linked: Callable[[], list[dict]], repo:
     return f"issue:{issue['number']}"
 
 
-def linked_issues(repo: str, pr: int) -> list[dict]:
+def linked_issues(repo: str, pr: int, *, timeout: float | None = None) -> list[dict]:
     """GitHub's ``closingIssuesReferences`` for the PR, as ``[{"number", "repo"}]``."""
     raw = _gh(
         [
@@ -290,7 +290,8 @@ def linked_issues(repo: str, pr: int) -> list[dict]:
             "--jq",
             '.closingIssuesReferences[] | {number, repo: (.repository.owner.login + "/"'
             " + .repository.name)} | @json",
-        ]
+        ],
+        timeout=timeout,
     )
     rows = _jsonl(raw)  # MEASURED: gh prints each @json result as one plain object line
     for row in rows:
@@ -401,12 +402,16 @@ def _pr(repo: str, pr: int, *, timeout: float | None = None) -> dict:
 _ROW = "{id, login: .user.login, author_association, body, stamp: %s}"
 
 
-def _comments(repo: str, pr: int, *, reviews: bool = False) -> list[dict]:
+def _comments(
+    repo: str, pr: int, *, reviews: bool = False, timeout: float | None = None
+) -> list[dict]:
     if reviews:
         path, stamp = f"repos/{repo}/pulls/{pr}/reviews", ".submitted_at"
     else:
         path, stamp = f"repos/{repo}/issues/{pr}/comments", ".updated_at"
-    rows = _jsonl(_gh(["api", path, "--paginate", "--jq", ".[] | " + _ROW % stamp]))
+    rows = _jsonl(
+        _gh(["api", path, "--paginate", "--jq", ".[] | " + _ROW % stamp], timeout=timeout)
+    )
     for row in rows:
         # The id goes into a printed API path: only GitHub's integer ids are accepted.
         cid = row.get("id") if isinstance(row, dict) else None
@@ -485,6 +490,88 @@ def select(comments: list[dict], reviews: list[dict], owner: str, head: str) -> 
     governing = max(pool, key=_order) if pool else None
     later = [b for b in unusable if governing is None or _order(b) > _order(governing)]
     return {"governing": governing, "later_unusable": later, "blocks": blocks, "notes": notes}
+
+
+#: The read's head commit time, the PR's base changes and the basis issue's last edit and
+#: newest comment, in one read. ``filteredCount`` counts the matching events;
+#: ``totalCount`` counts every timeline item (MEASURED on #4611: 27 against 0 matching),
+#: so nodes are compared with it. ``committedDate`` is the committer date (MEASURED: it
+#: equals REST ``commit.committer.date`` on 1430e874).
+_CHANGES_Q = (
+    "query($o:String!,$r:String!,$pr:Int!,$issue:Int!,$has:Boolean!,$head:GitObjectID!)"
+    "{repository(owner:$o,name:$r){object(oid:$head){... on Commit{committedDate}}"
+    " pullRequest(number:$pr){timelineItems(itemTypes:[BASE_REF_CHANGED_EVENT],"
+    "last:100){filteredCount nodes{... on BaseRefChangedEvent{createdAt}}}}"
+    " issueOrPullRequest(number:$issue) @include(if:$has){__typename ... on Issue{"
+    "lastEditedAt comments(last:1){nodes{createdAt}}}}}}"
+)
+
+
+def changes_since(
+    repo: str, pr: int, basis: str, head: str, *, timeout: float | None = None
+) -> list[str]:
+    """What happened after the read's ``head`` was committed that a re-read should see:
+    the PR's base retargeted, and on an issue basis the issue edited or newly commented.
+
+    The head's commit time, not the marker comment's edit time, because any re-edit of
+    the marker (a carry re-recorded) moves that past a change the read never saw (owner
+    ruling, 2026-11-18). A change between the commit and the read is reported too; that
+    costs one re-read, never a hidden change.
+
+    One line per finding, ``[]`` when nothing did. A read that fails or comes back cut
+    short is a line saying so, never silence. GitHub fails the whole query when the
+    issue does not exist (MEASURED: exit 1, "Could not resolve to an issue"), so that
+    case reads as the whole read failing.
+    """
+    owner, name = repo.split("/", 1)
+    issue = int(basis.split(":", 1)[1]) if basis.startswith("issue:") else 0
+    try:
+        data = json.loads(
+            _gh(
+                [
+                    "api",
+                    "graphql",
+                    "-f",
+                    f"query={_CHANGES_Q}",
+                    "-F",
+                    f"o={owner}",
+                    "-F",
+                    f"r={name}",
+                    "-F",
+                    f"pr={pr}",
+                    "-F",
+                    f"issue={issue}",
+                    "-F",
+                    f"has={'true' if issue else 'false'}",
+                    "-f",
+                    f"head={head}",
+                ],
+                timeout=timeout,
+            )
+        )["data"]["repository"]
+        stamp = data["object"]["committedDate"]
+    except (Refused, ValueError, KeyError, TypeError):
+        return ["base and issue changes: could not check"]
+    if not isinstance(stamp, str) or not stamp:
+        return ["base and issue changes: could not check"]
+    out = []
+    events = ((data.get("pullRequest") or {}).get("timelineItems")) or {}
+    nodes = events.get("nodes")
+    if not isinstance(nodes, list) or events.get("filteredCount") != len(nodes):
+        out.append("base changes: could not check")
+    elif any(str((n or {}).get("createdAt") or "") > stamp for n in nodes):
+        out.append("base changed since the check")
+    if issue:
+        got = data.get("issueOrPullRequest")
+        if not isinstance(got, dict) or got.get("__typename") != "Issue":
+            out.append(f"issue #{issue} unreadable")
+        else:
+            if str(got.get("lastEditedAt") or "") > stamp:
+                out.append("the issue was edited since the check")
+            newest = (got.get("comments") or {}).get("nodes") or []
+            if any(str((n or {}).get("createdAt") or "") > stamp for n in newest):
+                out.append("the issue has new comments since the check")
+    return out
 
 
 # ── commands ─────────────────────────────────────────────────────────────────

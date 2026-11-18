@@ -5526,6 +5526,148 @@ def _rounds_row(
     return _format_rounds(result)
 
 
+#: Each of the delivery row's own GitHub reads. The report arms no merge deadline, so
+#: ``_gh_timeout`` gives the cap itself; 20 s is the PR 3 reader's per-read budget
+#: for a paginated comment list, with headroom.
+_DELIVERY_GH_TIMEOUT_S = 20.0
+
+
+def _delivery_self_attestable(files: list[str] | None) -> bool:
+    """Whether a builder's own delivery read may stand on a PR with these files.
+
+    Owner rulings R1 and S8 (2026-11-17): only when every changed file is prose,
+    none lives under ``src/`` or ``.claude/agents/`` (prose there is runtime or agent
+    behaviour), and none is a critical-lane path. An unreadable or empty list is no."""
+    import review_scope  # noqa: PLC0415 - scripts/ is on sys.path (top of file)
+
+    return bool(files) and all(
+        review_scope._is_lane_prose(p)
+        and not p.startswith(("src/", ".claude/agents/"))
+        and not review_scope._is_lane_critical_path(p)
+        for p in files
+    )
+
+
+def _delivery_row(pr_num: str, repo: str | None, head: str | None) -> str:
+    """The ``delivery`` line of ``--check-pr``: ADVISORY, never a failure.
+
+    It says whether the owner recorded a read of whether the PR delivers what its
+    basis asked (closing-session step 1a), at which head, and what since may have
+    voided it. A block would only prove a sentence exists, so this never touches
+    ``failures``, and the merge arm prints nothing (owner ruling, 2026-11-15).
+    ``_TEST_DELIVERY_ROW`` short-circuits it so report tests make no live call.
+    """
+    seam = os.environ.get("_TEST_DELIVERY_ROW")
+    if seam is not None:
+        return seam
+    if not _scheduled_gate_applies(repo):
+        return "n/a (scoped to the public repo only)"
+    try:
+        text = _delivery_row_text(pr_num, repo, head)
+    except Exception:  # noqa: BLE001 - an advisory row never takes the report down.
+        return "could not check (lookup failed)"
+    # ONE report line, whatever a gh error or a comment carried: a line break here
+    # could print a line of its own, such as a forged `merge-with`. Each part above is
+    # already bounded, so this strips without cutting.
+    return "".join(" " if _gate_text_unsafe(ch) else ch for ch in text)
+
+
+def _delivery_row_text(pr_num: str, repo: str | None, head: str | None) -> str:
+    import delivery_marker as dm  # noqa: PLC0415 - scripts/ is on sys.path (top of file)
+
+    target = repo or _derive_repo_from_cwd(os.getcwd())
+    if not target:
+        return "could not check (no repository)"
+    pr, t = int(pr_num), _gh_timeout(_DELIVERY_GH_TIMEOUT_S)
+    try:
+        comments = dm._comments(target, pr, timeout=t)
+    except dm.Refused as exc:
+        return f"could not check ({_sanitize_gate_text(str(exc))[:200]})"
+    # The other reads each lose only what they carry (S5): an unreadable review list
+    # hides only review-body blocks, which never govern, and an unreadable PR leaves
+    # the basis unchecked. Neither is ever silent.
+    unread = []
+    try:
+        meta = dm._pr(target, pr, timeout=t)
+    except dm.Refused:
+        meta = None
+        unread.append("the PR body: could not check")
+    try:
+        reviews = dm._comments(target, pr, reviews=True, timeout=t)
+    except dm.Refused:
+        reviews = []
+        unread.append("review bodies: could not check")
+    head = head or (meta or {}).get("head")
+    if not head:
+        return "could not check (the PR head is unreadable)"
+    sel = dm.select(comments, reviews, target.split("/")[0].lower(), head)
+    ignored = len(sel["notes"])
+    tail = f" ({ignored} ignored: {_sanitize_gate_text(sel['notes'][0])[:160]})" if ignored else ""
+    tail += "".join(f"; {u}" for u in unread)
+    gov = sel["governing"]
+    if gov is None:
+        bad = [b for b in sel["blocks"] if b["treatment"].startswith("unusable")]
+        if bad:
+            return (
+                "advisory — no usable owner delivery check recorded: "
+                + _sanitize_gate_text(f"comment {bad[-1]['id']}: {bad[-1]['problem']}")[:200]
+                + tail
+            )
+        return (
+            "advisory — no delivery check recorded: read it (closing-session step 1a), then"
+            f" `python3 scripts/delivery_marker.py compose --pr {pr_num} ...`" + tail
+        )
+    f = gov["fields"]
+    verdict, ok = f["verdict"], f["verdict"] == "DELIVERS"
+    if f["head"] == head:
+        main = f"{verdict} at head"
+    elif _classify_base_advance_delta(
+        f["head"], head, _pr_base_sha(pr_num, repo=target) or "", target
+    ) == "inline":
+        main = f"{verdict} carried from {f['head'][:12]}: own change unchanged"
+    else:
+        main = f"check recorded at {f['head'][:12]}; carry unconfirmed: re-read ({verdict} there)"
+        ok = False
+    main += f", basis {f['basis']}"
+    extra = []
+    if f["scope"] != "CLEAN":
+        extra.append(f"scope {f['scope']}")
+    if f.get("intended") in ("not-stated", "unsupported"):
+        extra.append(f"intended={f['intended']}")
+        ok = False
+    if ok and f["checker"] == "author-review":
+        if _delivery_self_attestable(_pr_changed_files(pr_num, repo=target)):
+            extra.append("self-attested")
+        else:
+            main = "the builder's own read: a closing read (checker=other) is owed; " + main
+            ok = False
+    if verdict != "DELIVERS":
+        body = next((c.get("body") or "" for c in comments if c.get("id") == gov["id"]), "")
+        if m := dm._ASKED_RE.search(body):
+            extra.append("Asked: " + _sanitize_gate_text(m.group(1))[:160])
+    if meta is not None:
+        try:
+            now = dm.basis_from_body(
+                meta.get("body"),
+                linked=lambda: dm.linked_issues(target, pr, timeout=t),
+                repo=target,
+            )
+        except dm.Refused as exc:
+            now, why = None, _sanitize_gate_text(str(exc))[:160]
+        if now is None:
+            extra.append(f"the PR's basis cannot be derived now ({why}): re-read")
+        elif now != f["basis"]:
+            extra.append(f"basis changed since the check (now {now[:120]})")
+    extra += dm.changes_since(target, pr, f["basis"], f["head"], timeout=t)
+    if sel["later_unusable"]:
+        problem = sel["later_unusable"][-1]["problem"]
+        extra.append(f"a later owner block is unusable: '{_sanitize_gate_text(problem)[:120]}'")
+    if unread or any(e != "self-attested" and not e.startswith("scope ") for e in extra):
+        ok = False
+    text = main + "".join(f"; {e}" for e in extra) + tail
+    return f"ok ({text})" if ok else f"advisory — {text}"
+
+
 #: How far back the no-change note walks over merge commits from the head.
 #: Ten catch-up merges after a review is far past any PR seen here; the walk
 #: stops at the first non-merge commit anyway, so the cap only bounds API calls.
@@ -6417,6 +6559,7 @@ _HOOK_SURFACE_FILES = (
             "scripts/review_deadline.py",  # aggregate hook timeout arithmetic
             "scripts/external_review.py",  # autonomous review-request boundary
             "scripts/premise_gate.py",  # issue premise rule issue_premise_gate imports
+            "scripts/delivery_marker.py",  # marker parser + select the delivery row imports
             ".claude/settings.json",  # hook wiring (inline blob + matchers)
             # scripts/-root hooks wired via .claude/hooks/genesis-hook (which
             # resolves bare names as scripts/<name>); scripts/hooks/* wirings are
@@ -17749,6 +17892,10 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
             _note = None
         if _note:
             print(_note)
+    # Advisory: never touches `failures` (see `_delivery_row`). It judges the head the
+    # rounds row read, so the two rows describe one head.
+    _row_head = _budget_seen[0].get("current_head") if _budget_seen else None
+    print(f"delivery       : {_delivery_row(pr_num, repo, _row_head)}")
     # Scheduled Claude review at HEAD — the SAME always-fail-closed gate the merge arm
     # enforces (shared function). A missing/stale/unreadable scheduled review is a
     # FAILURE line, never a false all-clear — the report must not diverge from enforcement.

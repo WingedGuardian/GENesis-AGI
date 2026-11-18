@@ -1563,6 +1563,19 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   accepting a "fixed" claim on that push: the code does not show one. It steps
   back over a merge only when the merge touches none of the PR's files, and it
   prints nothing when anything it needs is unreadable.
+  The advisory `delivery` row after it reads the owner's delivery marker through
+  `scripts/delivery_marker.py`'s own parser and selection. It is `ok` only for a
+  DELIVERS read at head, or carried to head when the PR's own change is provably
+  unchanged, made by another reader (or by the builder on a prose-only PR, marked
+  `self-attested`), with nothing since that may void it. Otherwise it is
+  `advisory —` and names why: no read recorded, another verdict (with its `Asked:`
+  line), a carry the PR's diff cannot confirm, the builder's own read, a changed or
+  underivable basis, a base retarget, an issue edited or newly commented after the
+  read's head was committed, or a later owner block that does not parse. A failed
+  side read is named (`the PR body: could not check`, `review bodies: could not
+  check`, `base and issue changes: could not check`) and keeps the row advisory;
+  only an unreadable comment list makes the whole row `could not check`. It never
+  moves the verdict.
 
 - **GATE-FIX LANE** (hook-surface PRs): `.claude/skills/genesis-development/references/gate-fix-lane.md`.
 
@@ -1949,12 +1962,12 @@ authority over any summary of them elsewhere in this skill.
 `python3 scripts/hooks/git_push_guard.py --check-pr <N> [--repo OWNER/REPO]`
 BEFORE proposing a merge. It runs the SAME check functions the enforcement gate uses, in this REPORT order
 (mergeable → CI → base-invariant → pin-receipts → e2e-plan *(advisory)* →
-Codex-freshness → rounds *(advisory)* → scheduled-Claude-review → review-body →
-inline findings → main-reverts *(advisory)* → rework),
+Codex-freshness → rounds *(advisory)* → delivery *(advisory)* → scheduled-Claude-review →
+review-body → inline findings → main-reverts *(advisory)* → rework),
 so the two use the same checks. The merge arm checks review-body and inline
 findings before scheduled review, runs `rework` last (waived only by the logged
-`# rework-override`, which needs the owner's yes), blocks on none of the three
-advisory rows, and additionally applies the
+`# rework-override`, which needs the owner's yes), blocks on none of the four
+advisory rows (it prints no delivery row at all), and additionally applies the
 `--match-head-commit` binding, which has no report row —
 this `--check-pr` read IS the mandatory pre-merge step: **always run it and read
 the PR's automated-review comments (Codex, leak/CI, the scheduled Claude review)
