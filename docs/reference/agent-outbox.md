@@ -21,8 +21,9 @@ Pass a stable UUID message_id when retrying the same logical send. Reusing an
 identity with changed content conflicts. Otherwise use a new message_id.
 A refusal carries a `reason` naming the rule that failed (the closed list is in
 the tool's docstring and `peers/outbox.py` `REFUSAL_REASONS`). It never quotes
-the text, and peers never see it: the peer-facing API still answers with the
-code and status only.
+the text, and these outbound reasons never reach a peer: the peer-facing API
+renders only the reasons in `peers/conversation.py` `PEER_REASONS` (see
+agent-conversations.md).
 
 Every `agent_send` caller writes a typed envelope to `pending_outreach`, with a
 stable queue identity, and reports queued_for_governance. The normal scheduler
@@ -92,6 +93,11 @@ not a task cancellation, owner approval, message execution or reply.
    and the same contextId. Later turns omit inReplyTo. A second distinct first
    reply conflicts even if the first task failed or was canceled; this prevents
    a stale retry becoming new execution. A new later turn can discuss failure.
+6. Report delivery on the ACK, never through `message:send`. An in-thread
+   "received" reply is not a receipt: it starts a full Genesis session and
+   uses up the message's one reply. When a 409 refuses a send, its `reason`
+   names the rule and its `error.message` the next step: see "Refusal reasons"
+   in agent-conversations.md.
 
 Recent native prompt/reply heads and outgoing request heads provide bounded
 logical history: newest8 events, heads up to4 KiB, overall64 KiB with omission

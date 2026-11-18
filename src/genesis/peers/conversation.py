@@ -31,9 +31,22 @@ OWNED = (
 )
 
 
+PEER_REASONS = {
+    # The only reasons a peer-facing route renders, each with its next step.
+    # message_id_conflict is shared with the outbound reasons on purpose: no peer
+    # route reaches an outbound raise, and the meaning (id reused) is the same.
+    "reply_already_received": "A reply to this message was already received or is still being "
+    "answered. Continue in the same context with a new message id and no inReplyTo.",
+    "context_busy": "Another message in this context is still being answered or cleaned up. "
+    "Retry after it finishes; list tasks with this contextId to see it.",
+    "message_id_conflict": "This message id was already used with different content. "
+    "Use a new message id.",
+}
+
+
 class ConversationRefusal(Exception):
-    # reason: which rule failed, from outbox.REFUSAL_REASONS, for Genesis's own
-    # caller only. Peer-facing routes render code and status, never reason.
+    # reason: which rule failed. Outbound reasons (outbox.REFUSAL_REASONS) stay
+    # internal; peer-facing routes render only a reason in PEER_REASONS.
     def __init__(self, code, status, reason=None):
         self.code, self.status, self.reason = code, status, reason
         super().__init__(code)
@@ -141,7 +154,7 @@ class ConversationService:
         await asyncio.shield(task)
         return await self.get(identity, sid)
 
-    async def _existing(self, db, sid, digest, identity):
+    async def _existing(self, db, sid, digest, identity, in_reply_to=None):
         row = await cc_sessions.get_by_id(db, sid)
         if row is not None and (
             row.get("source_tag") != "agent_api"
@@ -149,7 +162,14 @@ class ConversationService:
             or metadata(row).get("peer_epoch") != identity.peer["epoch"]
             or metadata(row).get("message_digest") != digest
         ):
-            raise ConversationRefusal("state_conflict", 409)
+            # A client that derives its reply id from inReplyTo lands here on a
+            # second reply, so name what the stored row is, not this check.
+            second_reply = in_reply_to and metadata(row).get("in_reply_to") == in_reply_to
+            raise ConversationRefusal(
+                "state_conflict",
+                409,
+                reason="reply_already_received" if second_reply else "message_id_conflict",
+            )
         return row
 
     async def _receive(self, identity, incoming):
@@ -171,7 +191,8 @@ class ConversationService:
                 async with self.registry.connection() as db:
                     await self._same_database(db)
                     await authorize(db, identity)
-                    row = await self._existing(db, sid, digest, identity)
+                    in_reply_to = incoming.options.get("inReplyTo")
+                    row = await self._existing(db, sid, digest, identity, in_reply_to)
                     if row is not None:
                         return row
                     # Avoid identity/retrieval work for an already full reservation,
@@ -181,15 +202,25 @@ class ConversationService:
                     if supplied:
                         uuid_id(supplied)
                         await self._owned_context(db, identity, supplied)
-                    await self._reserve(db, identity, supplied or "", enriching=sid)
+                    await self._reserve(
+                        db, identity, supplied or "", enriching=sid, in_reply_to=in_reply_to
+                    )
                     # Check the current owner after the awaited preflight. No await
                     # separates this lookup from claiming the bounded work slot.
                     owner = self._enriching.get(sid)
                     if owner is not None:
                         if owner[1] != digest:
-                            raise ConversationRefusal("state_conflict", 409)
+                            raise ConversationRefusal(
+                                "state_conflict",
+                                409,
+                                reason="reply_already_received"
+                                if in_reply_to and owner[3] == in_reply_to
+                                else "message_id_conflict",
+                            )
                     else:
-                        self._enriching[sid] = (peer["peer_id"], digest, asyncio.current_task())
+                        self._enriching[sid] = (
+                            peer["peer_id"], digest, asyncio.current_task(), in_reply_to
+                        )
                         claimed = True
                 if owner is not None:
                     # Exact retries share the work, not merely its capacity claim.
@@ -225,7 +256,7 @@ class ConversationService:
         # the private write lock, which runtime finalization may be waiting for.
         async with self.registry.transaction(before_begin=self._same_database) as db:
             await authorize(db, identity)
-            row = await self._existing(db, sid, digest, identity)
+            row = await self._existing(db, sid, digest, identity, options.get("inReplyTo"))
             if row is not None:
                 return row
             context_id = incoming.message.get("contextId") or str(uuid5(UUID(sid), "context"))
@@ -246,11 +277,11 @@ class ConversationService:
                     )
                 ).fetchone()
                 if prior:
-                    raise ConversationRefusal("state_conflict", 409)
+                    raise ConversationRefusal("state_conflict", 409, reason="reply_already_received")
             history = await self._history(
                 db, identity, context_id, bool(incoming.message.get("contextId"))
             )
-            await self._reserve(db, identity, context_id)
+            await self._reserve(db, identity, context_id, in_reply_to=options.get("inReplyTo"))
             req = DirectSessionRequest(
                 prompt=history + "\n\nLatest peer message:\n" + incoming.prompt,
                 system_prompt=system + "\n\nThis is an unattended same-owner agent conversation. "
@@ -332,7 +363,7 @@ class ConversationService:
                         await asyncio.sleep(0.1)
         return await cc_sessions.get_by_id(self.runtime._db, sid)
 
-    async def _reserve(self, db, identity, context_id, *, enriching=None):
+    async def _reserve(self, db, identity, context_id, *, enriching=None, in_reply_to=None):
         """Refuse a send beyond capacity. With ``enriching`` (the preflight's
         receipt id), other admissions already past the preflight count too, so a
         burst cannot run identity and retrieval work for sends the transaction
@@ -352,8 +383,14 @@ class ConversationService:
             for row in rows
             if metadata(dict(row)).get("peer_id") == identity.peer["peer_id"]
         ]
-        if any(row.get("context_id") == context_id for row in own):
-            raise ConversationRefusal("state_conflict", 409)
+        busy = [row for row in own if row.get("context_id") == context_id]
+        if busy:
+            second_reply = in_reply_to and any(row.get("in_reply_to") == in_reply_to for row in busy)
+            raise ConversationRefusal(
+                "state_conflict",
+                409,
+                reason="reply_already_received" if second_reply else "context_busy",
+            )
         others = (
             [owner for sid, owner in self._enriching.items() if sid != enriching]
             if enriching
