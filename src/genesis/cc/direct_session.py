@@ -358,6 +358,10 @@ _NO_MARKETING_SEND = [
 #     and NOT from read-only `observe`, which writes nothing.
 _NO_OPEN_QUESTION_READS = ["mcp__genesis-health__open_question_list"]
 _NO_OPEN_QUESTION_RAISE = ["mcp__genesis-health__open_question_raise"]
+# Edge transcript text (#4856) is the owner's own recorded speech: denied on every
+# profile that ingests external content or can send outward, where an injected
+# instruction could search it and relay the lines out; read-only `observe` keeps it.
+_NO_EDGE_TRANSCRIPTS = ["mcp__genesis-health__edge_transcripts"]
 
 # WITHDRAWN 2026-09-26: `_VENV_PYTHON` / `ProfileOverlayContext.venv_python`.
 # It existed so a locally-defined Bash profile could allowlist the venv
@@ -394,6 +398,7 @@ PROFILES: dict[str, list[str]] = {
         + _NO_MARKETING_SEND
         + _NO_OUTREACH_QUEUE_CONTROL
         + _NO_OPEN_QUESTION_READS
+        + _NO_EDGE_TRANSCRIPTS
     ),
     "research": (
         _UNIVERSAL_DISALLOW
@@ -402,6 +407,7 @@ PROFILES: dict[str, list[str]] = {
         + _NO_MARKETING_SEND
         + _NO_OUTREACH_QUEUE_CONTROL
         + _NO_OPEN_QUESTION_READS
+        + _NO_EDGE_TRANSCRIPTS
     ),
     # `campaign` is the ONLY profile that may call marketing_send — the intended
     # autonomous cold-marketing caller. Every other profile denies it above/below.
@@ -411,6 +417,7 @@ PROFILES: dict[str, list[str]] = {
         + _NO_BROWSER_INTERACTION
         + _NO_OUTREACH_QUEUE_CONTROL
         + _NO_OPEN_QUESTION_READS
+        + _NO_EDGE_TRANSCRIPTS
     ),
     # NO PROFILE SHIPS WITH Bash. A `steward` profile did until 2026-09-26 — the
     # only one — for upstream-PR stewardship, with `GENESIS_BASH_ALLOWLIST`
@@ -469,6 +476,7 @@ PROFILES: dict[str, list[str]] = {
         + _NO_MARKETING_SEND
         + _NO_OUTREACH_QUEUE_CONTROL
         + _NO_OPEN_QUESTION_READS
+        + _NO_EDGE_TRANSCRIPTS
         + _NO_OPEN_QUESTION_RAISE
     ),
     # ── Perimeter profile ────────────────────────────────────────
@@ -491,6 +499,7 @@ PROFILES: dict[str, list[str]] = {
         + _NO_MARKETING_SEND
         + _NO_OUTREACH_QUEUE_CONTROL
         + _NO_OPEN_QUESTION_READS
+        + _NO_EDGE_TRANSCRIPTS
         + _NO_OPEN_QUESTION_RAISE
     ),
 }

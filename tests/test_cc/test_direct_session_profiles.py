@@ -1390,3 +1390,11 @@ def test_explicit_skills_keep_web_research():
     assert "web-research" in _resolve_skills(
         DirectSessionRequest(prompt="x", profile="research", skills=[])
     )
+
+
+def test_edge_transcripts_is_denied_on_every_profile_but_observe():
+    """Transcript text must not be reachable from a profile that ingests outside
+    content or can send outward (#4856); read-only observe keeps it."""
+    tool = "mcp__genesis-health__edge_transcripts"
+    allowed = {name for name in _SHIPPED_PROFILE_NAMES if tool not in PROFILES[name]}
+    assert allowed <= {"observe"}, sorted(allowed)

@@ -83,6 +83,7 @@ from genesis.mcp.health import contributor_issue as _contributor_issue  # noqa: 
 from genesis.mcp.health import db_schema as _db_schema  # noqa: E402
 from genesis.mcp.health import deliberation_tools as _deliberation_tools  # noqa: E402
 from genesis.mcp.health import direct_session_tools as _direct_session_tools  # noqa: E402
+from genesis.mcp.health import edge_transcripts as _edge_transcripts  # noqa: E402, F401
 from genesis.mcp.health import ego_calibration as _ego_calibration  # noqa: E402, F401
 from genesis.mcp.health import ego_tools as _ego_tools  # noqa: E402
 from genesis.mcp.health import errors as _errors  # noqa: E402
