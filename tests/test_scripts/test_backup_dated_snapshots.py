@@ -560,7 +560,10 @@ def test_extra_archive_that_does_not_read_back_is_not_shipped(backup_env, tmp_pa
         'for a in "$@"; do [ "$prev" = -o ] && out="$a"; prev="$a"; done\n'
         f'{real_gpg} "$@"; rc=$?\n'
         'case "$out" in */extra/.* | extra/.*)\n'
-        f'    printf "\\xff" | dd of="$out" bs=1 seek={where} conv=notrunc status=none ;;\n'
+        # Flip every bit of the chosen byte, so it changes whatever its value.
+        f'    pos={where}; b=$(od -An -tu1 -j "$pos" -N1 "$out" | tr -d " ")\n'
+        '    printf "\\\\x$(printf %02x $(( b ^ 255 )))"'
+        ' | dd of="$out" bs=1 seek="$pos" conv=notrunc status=none ;;\n'
         "esac\n"
         'exit "$rc"\n',
     )
