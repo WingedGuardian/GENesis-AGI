@@ -168,33 +168,16 @@ def _secret_token(token: str) -> bool:
     return (has_digit or has_symbol) and (has_alpha or (has_digit and has_symbol))
 
 
-#: Whitespace ``_normalise`` changes: a character other than a space, or a run.
-_SPACING = re.compile(r"[^\S ]|  ")
-
-
-def _one_space(text: str) -> str:
-    """``text`` with every whitespace run one space (``str.split`` is the fast
-    path: an upload holds out megabytes)."""
-    if not _SPACING.search(text):
-        return text
-    words = text.split()
-    if not words:
-        return " "
-    return (" " if text[0].isspace() else "") + " ".join(words) + (" " if text[-1].isspace() else "")
-
-
 def _normalise(text: str) -> str:
     """``text`` as the refusal check compares it: NFKC (a fullwidth or other
     compatibility variant reads as its plain form), every format character
     (Unicode category Cf: zero-width spaces and joiners, the soft hyphen)
-    removed, then casefolded, and every whitespace run read as one space (a
-    multi-word value spaced another way is the same value)."""
+    removed, then casefolded."""
     if text.isascii():
         # NFKC leaves ASCII as it is, and no ASCII character is a format one.
-        return _one_space(text.casefold())
+        return text.casefold()
     folded = unicodedata.normalize("NFKC", text)
-    plain = "".join(c for c in folded if unicodedata.category(c) != "Cf")
-    return _one_space(plain.casefold())
+    return "".join(c for c in folded if unicodedata.category(c) != "Cf").casefold()
 
 
 def _decoded(text: str) -> set[str]:

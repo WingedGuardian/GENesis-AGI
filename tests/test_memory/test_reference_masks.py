@@ -54,25 +54,63 @@ def test_any_whitespace_run_inside_a_multi_word_value_is_masked(gap):
     assert spans == [original]
 
 
-_ALPHABET = [*"abcXYZ019!@", " ", "  ", "\t", "\n", "\r", " ", " ", "é", "Ｈ", "​"]
+_ALPHABET = [*"abcXYZ019!@", " ", "  ", "\t", "\n", "\r", " ", " ", "é", "Ｈ", "​",
+             "e", "\u0301", "\u0327", "\u00a8", "\ufb01", "\u1100", "\u1161", "\u11a8"]
 
 
 def test_normalised_with_origins_agrees_with_normalise():
-    """The span matcher's per-character form is the form ``_normalise`` gives
-    (whitespace runs read as one space), and every origin points into the
-    text, in order."""
+    """The span matcher's form is the form ``_normalise`` gives (whitespace runs
+    read as one space; a letter and its combining marks compose), and every
+    normalised character points at an original span, in order."""
     import random
 
     rng = random.Random(2426)
-    for _ in range(500):
+    for _ in range(2000):
         text = "".join(rng.choice(_ALPHABET) for _ in range(rng.randint(0, 24)))
-        normalised, origins = rm._normalised_with_origins(text)
+        normalised, starts, stops = rm._normalised_with_origins(text)
         assert normalised == rm._normalise(text), repr(text)
-        assert len(origins) == len(normalised)
-        assert list(origins) == sorted(origins)
-        assert all(0 <= o < len(text) for o in origins)
+        assert len(starts) == len(stops) == len(normalised)
+        assert list(starts) == sorted(starts)
+        assert all(0 <= a < b <= len(text) for a, b in zip(starts, stops, strict=True))
 
 
+@pytest.mark.parametrize(
+    ("value", "field"),
+    [
+        ("password: Ab1!/é", "x Ab1!/é y"),
+        ("password: Ab1!/é", "x Ab1!/é y"),
+        ("password: Garçon-77", "x Garçon-77 y"),
+    ],
+)
+def test_a_composed_secret_masks_a_decomposed_field_whole(value, field):
+    """CodeRabbit round 3: NFKC composes a letter and its combining mark, so a
+    secret written composed and a field written decomposed (or the reverse)
+    match, and the mask covers the mark too: no last character stays visible."""
+    strict, named = rm.value_masks(value)
+    assert strict.mask(field) == "x [held] y"
+    assert named.mask(field) == "x [held] y"
+
+
+def test_a_short_mixed_token_with_punctuation_in_prose_is_masked():
+    """CodeRabbit round 3: only a word of letters keeps its sentence punctuation
+    exempt in prose; a short mixed token such as "Ab1!" stays a probe."""
+    strict, named = rm.value_masks("Use Ab1! daily", prose=True)
+    assert strict.mask("router Ab1!") == "router [held]"
+    assert named.mask("router Ab1!") == "router [held]"
+    _strict, named = rm.value_masks("Say Hello! to the lab", prose=True)
+    assert named.mask("Hello! there") == "Hello! there"
+
+
+def test_the_refusal_check_keeps_mains_spacing():
+    """CodeRabbit round 3: masking reads a whitespace run as one space, but main's
+    refusal check compares as main does, so an identifier spacing a multi-word
+    value another way is still accepted there (this PR changes no refusal)."""
+    from genesis.memory import reference_ops
+
+    value = "correct horse battery staple"
+    reference_ops.refuse_value_in_fields(value, {"identifier": "correct  horse battery staple"})
+    _strict, named = rm.value_masks(value)
+    assert named.mask("correct  horse battery staple") == "[held]"
 def test_a_percent_encoded_value_is_masked_whole():
     strict, _named = rm.value_masks("Demo@Fake123!")
     assert strict.mask("x Demo@Fake123! y") == "x [held] y"
@@ -623,3 +661,58 @@ def test_many_distinct_host_ports_build_masks_in_linear_time():
     strict, named = rm.value_masks(value)
     assert time.monotonic() - started < 5.0
     assert strict.mask("x Zq9!fake y") == "x [held] y"
+
+
+def test_a_format_character_between_a_letter_and_its_accent_is_masked():
+    """Round-3 premise check: a zero-width joiner between a letter and its accent
+    keeps NFKC from composing them, so masking drops format characters before
+    NFKC (main's refusal check keeps its own rule)."""
+    strict, named = rm.value_masks("password: Fake9wordé")
+    assert strict.mask("acct Fake9worde‍́ x") == "acct [held] x"
+    assert named.mask("acct Fake9worde‍́ x") == "acct [held] x"
+
+
+@pytest.mark.parametrize(
+    ("field", "masked"),
+    [
+        ("x c%6Frrect horse battery staple9 y", "x [held] y"),
+        ("a correct ho%72se battery staple9 b", "a [held] b"),
+        ("router %41 staple9", "router %41 [held]"),
+    ],
+)
+def test_a_partly_encoded_multi_word_value_is_masked_whole(field, masked):
+    """Round-3 premise check: one percent-encoded word of a multi-word value is a
+    hit only decoded, across tokens; the smallest run of whole tokens carrying
+    it is masked, so no word of the value stays visible, and an unrelated
+    escape nearby is left alone."""
+    strict, _named = rm.value_masks("correct horse battery staple9")
+    assert strict.mask(field) == masked
+
+
+def test_the_masking_form_is_stable():
+    """Fix audit (round 3): casefolding can produce text NFKC changes again, so
+    the masking form re-normalises; a field spelled through a ligature and a
+    composed Greek letter is masked whole."""
+    value = "password: 5Z1Ａ@ﬀΐ0⑴1"
+    field = "5Z1Ａ@ﬀΪ́0⑴1"
+    strict, _named = rm.value_masks(value)
+    assert rm._normalise(rm._normalise(field)) == rm._normalise(field)
+    assert strict.mask(field) == "[held]"
+
+
+def test_a_partly_encoded_multi_word_secret_part_is_masked_whole():
+    """Fix audit (round 3): the encoded-run rule also looks for multi-word secret
+    parts, not only the whole value."""
+    strict, _named = rm.value_masks("admin / correct horse battery staple9")
+    assert strict.mask("x c%6Frrect horse battery staple9 y") == "x [held] y"
+
+
+def test_a_partly_encoded_value_longer_than_the_window_masks_the_field():
+    """Fix audit (round 3): a value over ``_WINDOW_MAX`` words with one word
+    percent-encoded masks the whole field, as the window's comment says."""
+    words = (
+        "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima"
+        " mike november oscar papa quebec romeo9"
+    )
+    strict, _named = rm.value_masks(words)
+    assert strict.mask("x " + words.replace("charlie", "ch%61rlie") + " y") == "[held]"
