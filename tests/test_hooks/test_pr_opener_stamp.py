@@ -735,3 +735,26 @@ def test_unreadable_remotes_stop_the_stamp_and_say_so(monkeypatch, capsys):
     gh.add(URL, "body")
     note = _run(monkeypatch, capsys, CREATE, gh, git_op=_created())
     assert gh.writes == [] and "git remotes could not be read" in note
+
+
+# -- the correction line (owner ruling): never written, never removed ---------------
+
+CORRECTION = "Opened-by-session-correction: 2bc87284"
+
+
+def test_a_stamp_keeps_a_correction_line_untouched(monkeypatch, capsys):
+    gh = _GitHub()
+    gh.add(URL, f"body\n\n{CORRECTION}\n")
+    _run(monkeypatch, capsys, CREATE, gh, git_op=_created())
+    body = gh.prs[URL]["body"]
+    assert CORRECTION in body and hook._lookup().stamped(body) == ME
+
+
+def test_a_repair_keeps_a_correction_line_and_restores_the_record(monkeypatch, capsys):
+    gh = _GitHub()
+    _stamped_pr(gh)
+    gh._edit(URL, f"rewritten\n\n{CORRECTION}\n", "acme")
+    _run(monkeypatch, capsys, "gh pr edit 900 --body-file b.md", gh, git_op=_edited())
+    body = gh.prs[URL]["body"]
+    assert CORRECTION in body
+    assert hook._lookup().stamped(body) == "11111111"

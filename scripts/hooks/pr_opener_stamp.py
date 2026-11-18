@@ -15,7 +15,9 @@ of this repo's own PRs a later rewrite removed a line another writer had
 appended). The line is put back with the ORIGINAL opener's id, read from the
 PR's edit history (GitHub keeps every body version), never with the id of the
 session that made the edit. A PR whose history has no line (one opened before
-this hook, or by a tool that runs no hooks) is left alone.
+this hook, or by a tool that runs no hooks) is left alone. A wrong attribution is
+fixed by hand with an ``Opened-by-session-correction: <8hex>`` line, which this
+hook never writes, reads as a stamp, or removes.
 
 WHAT TRIGGERS IT
 ================
