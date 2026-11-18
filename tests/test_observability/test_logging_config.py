@@ -160,8 +160,16 @@ class TestUserLocalTimestamp:
         assert _stamp(fmt.format(_record())).utcoffset().total_seconds() == 9 * 3600
 
     def test_falls_back_to_utc_when_the_zone_cannot_be_read(self, monkeypatch):
-        # A None entry in sys.modules makes the import raise ImportError.
-        monkeypatch.setitem(sys.modules, "genesis.util.tz", None)
+        from zoneinfo import ZoneInfo
+
+        from genesis.util import tz
+
+        def _broken():
+            raise RuntimeError("zone lookup failed")
+
+        # A non-UTC cache proves the UTC stamp comes from the fallback.
+        monkeypatch.setattr(tz, "_USER_TZ", ZoneInfo("Asia/Tokyo"))
+        monkeypatch.setattr(tz, "user_zone", _broken)
         ts = _stamp(GenesisFormatter().format(_record()))
         assert ts.utcoffset().total_seconds() == 0
 
@@ -204,7 +212,11 @@ class TestUserLocalTimestamp:
             text=True,
             timeout=120,
             cwd=tmp_path,
-            env={**os.environ, "PYTHONPATH": src},
+            # No USER_TIMEZONE, so an invalid genesis.yaml zone can only fall back to UTC.
+            env={
+                **{k: v for k, v in os.environ.items() if k != "USER_TIMEZONE"},
+                "PYTHONPATH": src,
+            },
         )
         assert out.returncode == 0, out.stderr
         lines = out.stdout.splitlines()
