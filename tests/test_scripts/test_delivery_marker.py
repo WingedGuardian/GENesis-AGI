@@ -1192,3 +1192,148 @@ def test_a_tilde_genesis_home_is_a_home_path(dm, monkeypatch):
 def test_an_unknown_user_genesis_home_never_crashes(dm, monkeypatch):
     monkeypatch.setenv("GENESIS_HOME", "~nosuchuser_zz9/h")
     assert str(dm._genesis_home()) == "~nosuchuser_zz9/h"
+
+
+# ── (aside) and select (spec PR 4; owner ruling 2026-11-17) ──────────────────
+
+
+def test_a_leading_aside_line_still_opens_the_marker(dm):
+    # On a Devin-built PR a comment must start with `(aside)` or it starts a paid
+    # Devin session; the marker may sit on the line after it.
+    [b] = dm.parse("(aside)\n" + _good())
+    assert b["problem"] is None and b["fields"]["verdict"] == "DELIVERS"
+    [b] = dm.parse("(aside)\r\n" + _good())
+    assert b["problem"] is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "(aside) note\n" + _good(),  # more than `(aside)` on the first line
+        "(aside)\n\nprose first\n" + _good(),  # anything between it and the marker
+        "(aside)\n(aside)\n" + _good(),  # only one
+        "Aside\n" + _good(),
+    ],
+)
+def test_only_a_bare_aside_line_may_precede_the_marker(dm, text):
+    assert dm.parse(text) == []
+
+
+def test_compose_aside_writes_the_aside_line_first(dm, monkeypatch, tmp_path, capsys):
+    rc, out, _ = _compose(
+        dm, monkeypatch, tmp_path, capsys, FakeGh(), "--intended", "read", "--aside"
+    )
+    assert rc == 0
+    text = out.read_text()
+    assert text.startswith("(aside)\n<!-- genesis-delivery-check: ")
+    [b] = dm.parse(text)
+    assert b["problem"] is None
+
+
+def _row(cid, body, stamp, login="own", assoc="OWNER"):
+    return {"id": cid, "login": login, "author_association": assoc, "body": body, "stamp": stamp}
+
+
+def _at(head, verdict="DELIVERS"):
+    return _block(
+        f"head={head} basis=issue:4602 verdict={verdict} scope=CLEAN intended=read checker=other"
+    )
+
+
+def test_select_prefers_a_block_at_the_current_head(dm):
+    rows = [_row(1, _at(HEAD), "2026-01-01"), _row(2, _at(OTHER), "2026-01-05")]
+    got = dm.select(rows, [], "own", HEAD)
+    assert got["governing"]["id"] == 1 and got["governing"]["fields"]["head"] == HEAD
+
+
+def test_select_falls_back_to_the_latest_block_and_breaks_ties_by_id(dm):
+    third = "1" * 40
+    rows = [
+        _row(1, _at(OTHER), "2026-01-05"),
+        _row(7, _at(third), "2026-01-05"),
+        _row(3, _at(OTHER), "2026-01-01"),
+    ]
+    assert dm.select(rows, [], "own", HEAD)["governing"]["id"] == 7
+
+
+def test_select_at_one_head_takes_the_latest_stamp(dm):
+    rows = [_row(1, _at(HEAD, "PARTIAL"), "2026-01-01"), _row(2, _at(HEAD), "2026-01-03")]
+    assert dm.select(rows, [], "own", HEAD)["governing"]["fields"]["verdict"] == "DELIVERS"
+
+
+def test_select_ignores_non_owner_and_review_blocks_with_notes(dm):
+    rows = [_row(1, _at(HEAD), "2026-01-01", login="bot", assoc="NONE")]
+    reviews = [_row(2, _at(HEAD), "2026-01-02")]
+    got = dm.select(rows, reviews, "own", HEAD)
+    assert got["governing"] is None
+    assert any("not the repo owner" in n for n in got["notes"])
+    assert any("review body" in n for n in got["notes"])
+
+
+def test_a_later_unusable_owner_block_is_reported_never_hidden(dm):
+    rows = [
+        _row(1, _at(HEAD), "2026-01-01"),
+        _row(2, _block("head=x verdict=DOES-NOT"), "2026-01-02"),
+    ]
+    got = dm.select(rows, [], "own", HEAD)
+    assert got["governing"]["id"] == 1
+    [late] = got["later_unusable"]
+    assert late["id"] == 2 and "head=x" in late["problem"]
+
+
+def test_an_earlier_unusable_owner_block_does_not_shadow_a_valid_one(dm):
+    rows = [_row(1, _block("head=x"), "2026-01-01"), _row(2, _at(HEAD), "2026-01-02")]
+    got = dm.select(rows, [], "own", HEAD)
+    assert got["governing"]["id"] == 2 and got["later_unusable"] == []
+
+
+def test_read_marks_the_block_that_governs(dm, monkeypatch, capsys):
+    gh = FakeGh(comments=[_row(1, _at(OTHER), "2026-01-01"), _row(2, _at(HEAD), "2026-01-02")])
+    monkeypatch.setattr(dm, "_gh", gh)
+    assert dm.main(["read", "--pr", "7"]) == 0
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("- ")]
+    assert [ln for ln in lines if "governs" in ln] == [ln for ln in lines if "comment 2" in ln]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "(aside)\n\n" + _good(),  # a blank line between
+        "  (aside)\n" + _good(),  # not the first thing
+        "  \n(aside)\n" + _good(),  # not on the first line
+        "(Aside)\n" + _good(),  # Devin reads the exact word
+        "(aside)\n " + _good(),  # the marker indented
+    ],
+)
+def test_a_near_miss_aside_is_reported_as_unusable(dm, text):
+    [b] = dm.parse(text)
+    assert b["fields"] is None and "(aside)" in b["problem"]
+
+
+def test_trailing_spaces_after_aside_are_accepted(dm):
+    [b] = dm.parse("(aside) \t\n" + _good())
+    assert b["problem"] is None
+
+
+def test_a_re_read_keeps_the_aside_line_it_replaces(dm, monkeypatch, tmp_path, capsys):
+    gh = FakeGh(comments=[_row(12, "(aside)\n" + _good(), "2026-01-05")])
+    rc, out, cap = _compose(dm, monkeypatch, tmp_path, capsys, gh, "--intended", "read")
+    assert rc == 0 and out.read_text().startswith("(aside)\n")
+    assert "comments/12" in cap.out
+
+
+def test_compose_replaces_the_comment_select_would_pick_on_a_tie(dm, monkeypatch, tmp_path, capsys):
+    gh = FakeGh(comments=[_row(12, _good(), "2026-01-05"), _row(15, _good(), "2026-01-05")])
+    rc, _, cap = _compose(dm, monkeypatch, tmp_path, capsys, gh, "--intended", "read")
+    assert rc == 0 and "comments/15" in cap.out
+
+
+def test_select_skips_a_row_without_an_integer_id(dm):
+    rows = [
+        _row("IC_kwDO", _at(HEAD), "2026-01-09"),
+        _row(True, _at(HEAD), "2026-01-09"),
+        _row(3, _at(HEAD), "2026-01-01"),
+    ]
+    got = dm.select(rows, [], "own", HEAD)
+    assert got["governing"]["id"] == 3
+    assert sum("not a GitHub integer id" in n for n in got["notes"]) == 2
