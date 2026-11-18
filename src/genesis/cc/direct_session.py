@@ -358,7 +358,7 @@ _NO_MARKETING_SEND = [
 #     and NOT from read-only `observe`, which writes nothing.
 _NO_OPEN_QUESTION_READS = ["mcp__genesis-health__open_question_list"]
 _NO_OPEN_QUESTION_RAISE = ["mcp__genesis-health__open_question_raise"]
-# Edge transcript text (#4856) is the owner's own recorded speech: denied on every
+# Edge transcript text (#4856) is private to the owner: denied on every
 # profile that ingests external content or can send outward, where an injected
 # instruction could search it and relay the lines out; read-only `observe` keeps it.
 _NO_EDGE_TRANSCRIPTS = ["mcp__genesis-health__edge_transcripts"]
