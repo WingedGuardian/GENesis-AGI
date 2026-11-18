@@ -1,0 +1,24 @@
+# PR-opener stamp: read by scripts/hooks/pr_opener_stamp.py after a Bash call
+# that created or edited a pull request (its docstring has the full rules).
+#
+# The hook adds `Opened-by-session: <8hex>` to the PR body. Bots that edit a new
+# PR's body within seconds can race that read-modify-write, so the hook can wait
+# for a bot's first edit before writing.
+#
+# Override per install in ${GENESIS_HOME:-~/.genesis}/config/pr_opener_stamp.local.yaml
+# (same keys). Only that overlay is read besides this file.
+
+# Wait before writing until one of these strings is in the body (a bot's first
+# edit has landed), the body changes, or settle_wait_s passes. Empty: no wait.
+# An install whose repos have a body-editing bot names that bot's end marker in
+# its overlay.
+settle_markers: []
+
+# The longest wait, in seconds (0 to 30).
+settle_wait_s: 20
+
+# The line goes before the first line starting with one of these (sections a bot
+# rewrites later), else at the end of the body.
+insert_before:
+  - "<!-- devin-review-badge-begin -->"
+  - "<!-- This is an auto-generated comment"

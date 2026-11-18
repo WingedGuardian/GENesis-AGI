@@ -150,6 +150,10 @@ Attribution is possible but uneven. In rough order of strength:
   the CURRENT body: it overrides the history (source `corrected`, the recorded stamp
   still shown). Past the PR's first two minutes, editing or deleting the
   `Opened-by-session` line itself changes nothing, by design.
+  The line is written by code, not by the session: `scripts/hooks/pr_opener_stamp.py`
+  stamps it right after a PR is opened, and puts it back with the ORIGINAL opener's
+  id when a later body rewrite the hook sees drops it. Keep it in a local body file
+  you rewrite from. The hook never writes or removes a correction line.
 - **The ledger indexes work to sessions.** A PR body citing `Ledger: <32-hex>` resolves
   to a `session_ledger` row whose `session_id` is **the CC transcript session id, which
   matches `cc_sessions.cc_session_id` — NOT `cc_sessions.id`** (the two differ; joining
