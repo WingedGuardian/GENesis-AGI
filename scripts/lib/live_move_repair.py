@@ -1137,8 +1137,12 @@ class Repair:
         remedy = self.guard.message(self.state_path, verdict, reason)
         if not self.boot:
             print(remedy, flush=True)
+        # The save-first warning before any word about restoring (CodeRabbit
+        # c4605013452): the lead-in sits ahead of the guard's own by-hand steps.
         lead = (
-            f"{self.guard._LIVE_RETRY}. Restore the listed paths first. "
+            f"{self.guard._LIVE_RETRY}. The listed paths may also hold another session's "
+            "edits: save any you want to keep (copy them aside) before restoring anything; "
+            "--post-merge refuses until they are back (the steps follow the list). "
             if reason.startswith(self.guard._LIVE_LATER)
             else ""
         )

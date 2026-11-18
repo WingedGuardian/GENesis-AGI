@@ -606,6 +606,20 @@ def test_3722_the_page_leads_with_the_remedy_before_a_long_path_list(w):
     assert body.index("retries the update") < body.index("These paths hold"), body
 
 
+def test_3722_the_page_says_save_before_any_restore(w):
+    """CodeRabbit c4605013452: the lead-in placed ahead of the path list must
+    not tell the reader to restore before the warning to save another
+    session's edits; nothing in the page says restore before it says save."""
+    killed_rollback(w, "P")
+    state = {k: v for k, v in w.row().items() if k != "live_move"}
+    w.write_state({**state, "phase": "bootstrap", "own_head": w.to})
+    w.repair(mode="--boot")
+    body = w.alerts()[0]["body"]
+    save = body.index("save any you want to keep")
+    assert re.search(r"restor", body[:save], re.IGNORECASE) is None, body
+    assert save < body.index("These paths hold"), body
+
+
 def test_td21_a_main_mixed_tree_starts_with_a_critical_page(w):
     (w.root / "F").write_text("f\n")
     w.write_state(
