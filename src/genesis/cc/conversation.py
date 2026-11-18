@@ -598,7 +598,9 @@ class ConversationLoop:
         chat_ref = str(chat_id) if chat_id else user_id.replace("tg-", "")
 
         async with self._get_lock(session["id"]):
-            await self._persist_overrides(session, model, effort)
+            effort = await self._persist_overrides(
+                session, model, effort, effort_explicit=bool(intent.effort_override),
+            )
 
             # First message: full system prompt, no resume
             # Subsequent: resume with cc_session_id, no system prompt
@@ -919,7 +921,9 @@ class ConversationLoop:
             # Capture old values before persisting overrides (for change feedback)
             old_model = session.get("model")
             old_effort = session.get("effort")
-            await self._persist_overrides(session, model, effort)
+            effort = await self._persist_overrides(
+                session, model, effort, effort_explicit=bool(intent.effort_override),
+            )
 
             # Emit immediate feedback on model/effort changes
             if on_event:
@@ -2041,23 +2045,43 @@ class ConversationLoop:
         return self._default_effort
 
     async def _persist_overrides(
-        self, session: dict, model: CCModel, effort: EffortLevel,
-    ) -> None:
-        """If model or effort changed from what the session stores, update DB."""
+        self, session: dict, model: CCModel, effort: EffortLevel, *, effort_explicit: bool,
+    ) -> EffortLevel:
+        """If model or effort changed from what the session stores, update DB.
+
+        Returns the effort the turn should run with. An explicit effort is always
+        written with a model change, so one that equals the stored effort is not
+        replaced by the per-model default (#4854). An inferred effort is never
+        written over a model change: ``session`` is a snapshot taken before the
+        session lock, so its effort may be stale, and the atomic model-only update
+        decides the effort from the row as it is. The turn then runs with the
+        effort that update applied. When the channel configures a default for
+        the new model, a real switch takes that default even over an effort set
+        while the switch waited: that effort was chosen for the old model.
+        """
         new_model = str(model) if str(model) != session.get("model") else None
-        new_effort = str(effort) if str(effort) != session.get("effort") else None
-        if new_model:
-            # Pass the effort with every model change, so an explicit effort that
-            # equals the stored one is not replaced by the per-model default (#4854).
-            new_effort = str(effort)
-        if new_model or new_effort:
-            await cc_sessions.update_model_effort(
-                self._db, session["id"], model=new_model, effort=new_effort,
-            )
-            logger.info(
-                "Session %s updated: model=%s effort=%s",
-                session["id"][:8], model, effort,
-            )
+        if effort_explicit:
+            new_effort = str(effort) if new_model or str(effort) != session.get("effort") else None
+        else:
+            new_effort = None  # an inferred effort is never written; the row keeps its own
+        if not (new_model or new_effort):
+            return effort
+        await cc_sessions.update_model_effort(
+            self._db, session["id"], model=new_model, effort=new_effort,
+        )
+        applied = effort
+        if new_model and not effort_explicit:
+            try:
+                row = await cc_sessions.get_by_id(self._db, session["id"])
+                if row and row.get("effort"):
+                    applied = EffortLevel(row["effort"])
+            except Exception:
+                logger.warning("Applied effort read-back failed", exc_info=True)
+        logger.info(
+            "Session %s updated: model=%s effort=%s",
+            session["id"][:8], model, applied,
+        )
+        return applied
 
     async def _build_topic_context(self, thread_id: str) -> str | None:
         """Build topic-specific context for the conversation system prompt.

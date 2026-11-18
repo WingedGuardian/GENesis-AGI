@@ -1265,3 +1265,67 @@ async def test_a_resumed_turn_reaching_contingency_via_truncation_keeps_identity
         "tool-less router a prompt with no Genesis identity: "
         f"{(system_prompt or '')[:300]!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_queued_model_switch_keeps_an_effort_set_while_it_waited(loop, db):
+    """A model-only switch must not write back the effort from its pre-lock snapshot:
+    an /effort that committed while it waited for the session lock is kept (review
+    finding: inferred effort passed as an explicit override)."""
+    from genesis.cc.types import CCModel, EffortLevel
+
+    await cc_sessions.create(
+        db, id="tg-q-1", session_type="foreground", model="sonnet", effort="high",
+        started_at="2026-11-18T00:00:00+00:00", last_activity_at="2026-11-18T00:00:00+00:00",
+        user_id="tg-q-1", channel=str(ChannelType.TELEGRAM),
+    )
+    snapshot = await cc_sessions.get_by_id(db, "tg-q-1")
+    await cc_sessions.update_model_effort(db, snapshot["id"], effort="max")
+    applied = await loop._persist_overrides(
+        snapshot, CCModel.OPUS, EffortLevel(snapshot["effort"]), effort_explicit=False,
+    )
+    row = await cc_sessions.get_by_id(db, snapshot["id"])
+    assert (row["model"], row["effort"], applied) == ("opus", "max", EffortLevel.MAX)
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_effort_with_a_model_switch_is_written_even_if_unchanged(loop, db):
+    from genesis.cc.types import CCModel, EffortLevel
+
+    await cc_sessions.create(
+        db, id="tg-q-2", session_type="foreground", model="sonnet", effort="high",
+        started_at="2026-11-18T00:00:00+00:00", last_activity_at="2026-11-18T00:00:00+00:00",
+        user_id="tg-q-2", channel=str(ChannelType.TELEGRAM),
+    )
+    snapshot = await cc_sessions.get_by_id(db, "tg-q-2")
+    explicit = EffortLevel(snapshot["effort"])
+    applied = await loop._persist_overrides(
+        snapshot, CCModel.OPUS, explicit, effort_explicit=True,
+    )
+    row = await cc_sessions.get_by_id(db, snapshot["id"])
+    assert (row["model"], row["effort"], applied) == ("opus", str(explicit), explicit)
+
+
+@pytest.mark.asyncio
+async def test_a_switch_takes_the_configured_default_over_an_effort_set_meanwhile(loop, db, monkeypatch):
+    """With a per-model default configured, a real switch applies it even over an
+    /effort that landed while the switch waited (that effort was for the old model)."""
+    from genesis.cc.types import CCModel, EffortLevel
+    from genesis.channels import config as channel_config
+
+    monkeypatch.setattr(
+        channel_config, "_load_yaml_merged",
+        lambda name: {"telegram": {"default_effort_by_model": {"opus": "medium"}}},
+    )
+    await cc_sessions.create(
+        db, id="tg-q-3", session_type="foreground", model="sonnet", effort="high",
+        started_at="2026-11-18T00:00:00+00:00", last_activity_at="2026-11-18T00:00:00+00:00",
+        user_id="tg-q-3", channel=str(ChannelType.TELEGRAM),
+    )
+    snapshot = await cc_sessions.get_by_id(db, "tg-q-3")
+    await cc_sessions.update_model_effort(db, "tg-q-3", effort="max")
+    applied = await loop._persist_overrides(
+        snapshot, CCModel.OPUS, EffortLevel.HIGH, effort_explicit=False,
+    )
+    row = await cc_sessions.get_by_id(db, "tg-q-3")
+    assert (row["model"], row["effort"], applied) == ("opus", "medium", EffortLevel.MEDIUM)
