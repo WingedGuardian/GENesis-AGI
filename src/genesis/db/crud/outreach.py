@@ -165,6 +165,35 @@ async def delivered_topic_exists(
     return await cursor.fetchone() is not None
 
 
+async def delivered_topic_since(
+    db: aiosqlite.Connection,
+    *,
+    signal_type: str,
+    topics: list[str],
+    since_epoch: float,
+) -> bool:
+    """Was any of ``topics`` (under ``signal_type``) DELIVERED at or after
+    ``since_epoch`` (Unix seconds)?
+
+    For a follow-up that is only meaningful if an earlier message reached the
+    owner, such as the disk guardian's all-clear for its page. ``datetime()``
+    wraps both sides for the reason ``OutreachGovernance._is_duplicate`` gives:
+    stored values are ISO-8601 with a 'T' and an offset, so a raw string compare
+    is wrong. Both sides then compare at whole seconds, inclusive.
+    """
+    if not topics:
+        return False
+    marks = ",".join("?" * len(topics))
+    cursor = await db.execute(
+        "SELECT 1 FROM outreach_history "
+        f"WHERE signal_type = ? AND topic IN ({marks}) "  # noqa: S608 - placeholders only
+        "AND delivered_at IS NOT NULL "
+        "AND datetime(delivered_at) >= datetime(?, 'unixepoch') LIMIT 1",
+        (signal_type, *topics, since_epoch),
+    )
+    return await cursor.fetchone() is not None
+
+
 async def find_by_delivery_id(
     db: aiosqlite.Connection, delivery_id: str
 ) -> dict | None:

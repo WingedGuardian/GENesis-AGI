@@ -65,7 +65,13 @@ gated on values they can't know.
 
 1. **Open an issue or Discussion first** — describe what you want to change and why.
    This lets us confirm it fits the project direction before you write code.
-   Skip this for typo fixes or small doc corrections.
+   Skip this for typo fixes or small doc corrections. The feature-request form
+   asks nine premise questions. Items 1 to 5 describe the problem and every
+   issue owes them: what you observed, what should happen and where that is
+   stated, what it costs, what you searched, and what a fix must do and must
+   not do. Items 6 to 9 describe your change; they can wait for the PR, but if
+   you write any of them, write all four. `n/a — <reason>` is an answer; a bare
+   `n/a` is not.
 2. **Fork the repo** and clone your fork
 3. **Create a branch**: `git checkout -b <scope>/<description>` (e.g., `feat/memory-recall-timeout`)
 4. **Make your changes** — target ~600 LOC per file, hard cap 1000
@@ -83,6 +89,11 @@ gated on values they can't know.
 
 PRs without a prior issue or discussion may be closed if the change wasn't
 discussed first. All PRs require a maintainer review before merging.
+
+Before reviewing the code, a maintainer checks that the PR does what its linked
+issue asks: each point of the issue's acceptance, the fix it warned against,
+and any "fixed" claim against the diff. The result is posted as a comment on
+the PR, so if a point is read as missing you will see which one and why.
 
 ## Commit conventions
 

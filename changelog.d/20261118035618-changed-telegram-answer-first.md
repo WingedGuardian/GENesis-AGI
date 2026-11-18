@@ -1,0 +1,1 @@
+- **Telegram answers specific questions first.** When you ask Genesis for a specific fact over Telegram, it now writes the answer from the obvious source before doing any wider digging, and says what it is still checking if it continues.

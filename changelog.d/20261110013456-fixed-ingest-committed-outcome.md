@@ -1,1 +1,0 @@
-- Knowledge ingestion preserves the committed unit count and source manifest after a connection teardown error, and reports a teardown warning without repeating extraction.

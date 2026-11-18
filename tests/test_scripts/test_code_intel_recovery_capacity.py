@@ -1,11 +1,13 @@
 """Prospective capacity observes the existing destination, including its limit."""
 
 import runpy
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
 from tests.test_scripts.test_code_intel_cbm_admission import GIB, _tree, admission
+from tests.test_scripts.test_code_intel_scope_manager import manager, variant
 
 
 def headroom(tmp_path):
@@ -74,16 +76,136 @@ def test_headroom_cannot_silently_skip_an_unmapped_destination(tmp_path):
         )
 
 
+class SliceBus:
+    def __init__(self):
+        self.now, self.calls = 0.0, []
+        self.name = "genesis-workload.slice"
+        self.object = "/org/freedesktop/systemd1/unit/workload"
+        self.unit = dict(
+            Id=variant("s", self.name),
+            LoadState=variant("s", "loaded"),
+            InvocationID=variant("ay", [1] * 16),
+            Following=variant("s", ""),
+            ActiveState=variant("s", "active"),
+            SubState=variant("s", "active"),
+            Job=variant("(uo)", [0, "/"]),
+        )
+        self.group = "/user.slice/" + self.name
+
+    def __call__(self, path, interface, method, *args, timeout):
+        assert 0 < timeout <= 30
+        self.calls.append((method, args))
+        self.now += 0.01
+        if method == "GetUnit":
+            assert args == ("s", self.name)
+            return variant("o", [self.object])
+        # A replaced lookup may leave its former object readable. The production
+        # observer must compare GetUnit again rather than rely on an RPC error.
+        assert method == "GetAll" and path == "/org/freedesktop/systemd1/unit/workload"
+        data = (
+            self.unit
+            if args == ("s", "org.freedesktop.systemd1.Unit")
+            else dict(ControlGroup=variant("s", self.group))
+        )
+        assert args[1] in ("org.freedesktop.systemd1.Unit", "org.freedesktop.systemd1.Slice")
+        return variant("a{sv}", [deepcopy(data)])
 
 
+def slice_gate(bus):
+    operation = manager(bus)
+    method = getattr(operation, "require_slice_capacity", None)
+    assert callable(method), "prospective recovery must observe the existing destination slice"
+    return method
 
 
+def test_existing_slice_is_observed_stably_around_capacity_callback():
+    bus = SliceBus()
+    run = slice_gate(bus)
+    observed = []
+    run(bus.name, observed.append)
+    assert observed == [bus.group]
+    assert [call[0] for call in bus.calls] == [
+        "GetUnit",
+        "GetAll",
+        "GetAll",
+        "GetAll",
+        "GetAll",
+        "GetUnit",
+    ]
 
 
+@pytest.mark.parametrize("fault", ["group", "identity", "state", "job", "object"])
+def test_slice_drift_during_capacity_observation_refuses(fault):
+    bus = SliceBus()
+    run = slice_gate(bus)
+
+    def observe(group):
+        if fault == "group":
+            bus.group = "/other.slice/" + bus.name
+        elif fault == "identity":
+            bus.unit["InvocationID"] = variant("ay", [2] * 16)
+        elif fault == "state":
+            bus.unit["ActiveState"] = variant("s", "deactivating")
+        elif fault == "job":
+            bus.unit["Job"] = variant("(uo)", [1, "/job/1"])
+        else:
+            bus.object += "replacement"
+
+    with pytest.raises(ValueError):
+        run(bus.name, observe)
 
 
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "unloaded",
+        "inactive",
+        "alias",
+        "job-bool",
+        "group-empty",
+        "group-relative",
+        "group-traversal",
+        "group-other",
+        "group-nul",
+    ],
+)
+def test_uncertain_slice_refuses_before_capacity_reader(fault):
+    bus = SliceBus()
+    run = slice_gate(bus)
+    if fault == "unloaded":
+        bus.unit["LoadState"] = variant("s", "not-found")
+    elif fault == "inactive":
+        bus.unit["ActiveState"] = variant("s", "inactive")
+    elif fault == "alias":
+        bus.unit["Following"] = variant("s", "other.slice")
+    elif fault == "job-bool":
+        bus.unit["Job"] = variant("(uo)", [False, "/"])
+    else:
+        bus.group = {
+            "group-empty": "",
+            "group-relative": bus.name,
+            "group-traversal": "/x/../" + bus.name,
+            "group-other": "/other.slice",
+            "group-nul": "/x\0/" + bus.name,
+        }[fault]
+
+    def forbidden(group):
+        raise AssertionError("uncertain destination must not be assessed")
+
+    with pytest.raises(ValueError):
+        run(bus.name, forbidden)
 
 
+def test_capacity_refusal_is_never_swallowed_or_followed_by_manager_action():
+    bus = SliceBus()
+    run = slice_gate(bus)
+
+    def refuse(group):
+        raise admission.AdmissionRefused("synthetic destination pressure")
+
+    with pytest.raises(admission.AdmissionRefused, match="synthetic"):
+        run(bus.name, refuse)
+    assert {call[0] for call in bus.calls} <= {"GetUnit", "GetAll"}
 
 
 @pytest.mark.parametrize(

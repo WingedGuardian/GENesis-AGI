@@ -51,6 +51,22 @@ TERMINAL_QUESTION_STATUSES = ("resolved", "dropped")
 #:   bookkeeping_move   — Genesis moved a card (the one allowed move: In Review)
 #:   comment_write      — Genesis posted a templated, scanned comment
 #:   override           — an owner move past an advisory (admission, blocked-by)
+#: The builder launcher's (board/launcher/), each keyed per move
+#: (``<item>@<Status updatedAt>``, with ``#a<n>`` / ``#ask:<id>`` suffixes):
+#:   launcher_enabled   — an armed tick after a disarmed one (keyed by its own time)
+#:   launcher_disabled  — a disarmed tick after an armed one (keyed by its own time)
+#:   move_absorbed      — a Build move for an issue that already has a builder
+#:   launch_refused     — a Build move refused for a fact about the issue or move
+#:   launch_queued      — a Build move held for install state (capacity, memory, login)
+#:   launch_withdrawn   — a held move whose card left Build
+#:   builder_launching  — slot, session id and worktree chosen; launch about to start
+#:   builder_launched   — the builder's tmux session is up
+#:   launch_failed      — one failed launch attempt (a strike)
+#:   builder_paused     — the builder was stopped because its card left Build
+#:   builder_exited     — the builder's session ended with no linked PR
+#:   builder_closed     — the builder's session was closed after its PR opened
+#:   ask_raised         — a builder was seen waiting on the owner
+#:   ask_answered       — that wait ended
 EVENTS = frozenset(
     {
         "promotion",
@@ -62,8 +78,44 @@ EVENTS = frozenset(
         "bookkeeping_move",
         "comment_write",
         "override",
+        "launcher_enabled",
+        "launcher_disabled",
+        "move_absorbed",
+        "launch_refused",
+        "launch_queued",
+        "launch_withdrawn",
+        "builder_launching",
+        "builder_launched",
+        "launch_failed",
+        "builder_paused",
+        "builder_exited",
+        "builder_closed",
+        "ask_raised",
+        "ask_answered",
     }
 )
+
+#: The builder launcher's events (board/launcher/, board/builder_watch.py).
+LAUNCHER_EVENTS = frozenset(
+    {
+        "launcher_enabled",
+        "launcher_disabled",
+        "move_absorbed",
+        "launch_refused",
+        "launch_queued",
+        "launch_withdrawn",
+        "builder_launching",
+        "builder_launched",
+        "launch_failed",
+        "builder_paused",
+        "builder_exited",
+        "builder_closed",
+        "ask_raised",
+        "ask_answered",
+    }
+)
+#: Never deleted by :func:`prune`.
+_NEVER_PRUNED = LAUNCHER_EVENTS | {"item_added"}
 
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 # owner/repo#123 — GitHub's own owner/name grammar (alnum, '-', '_', '.').
@@ -277,8 +329,7 @@ async def get_link_by_issue(
     return _link_row(await _one(cur))
 
 
-# GROUNDWORK(board-reconciler): the reconciler records the card once it adds the
-# issue to the project (the board PR after promotion).
+# Called by the board reconciler once the linked issue has a card.
 async def set_project_item(
     db: aiosqlite.Connection, *, link_id: str, project_item_id: str, now: str
 ) -> bool:
@@ -782,6 +833,45 @@ async def list_events(
     return {"items": items, "listed": len(items), "total": total}
 
 
+async def count_events_since(
+    db: aiosqlite.Connection, *, events: tuple[str, ...], since: str
+) -> int:
+    """How many *events* were recorded at or after *since* (ISO-8601 UTC, the
+    format every writer stores). The reconciler's hourly write budget."""
+    for name in events:
+        _one_of("event", name, EVENTS)
+    if not events:
+        return 0
+    marks = ",".join("?" for _ in events)
+    cur = await db.execute(
+        f"SELECT COUNT(*) FROM board_events WHERE event IN ({marks}) AND created_at >= ?",
+        (*events, since),
+    )
+    return (await cur.fetchone())[0]
+
+
+async def added_numbers(db: aiosqlite.Connection, *, repo: str) -> set[int]:
+    """Issue and PR numbers in *repo* that Genesis has ever added to the board
+    (an ``item_added`` row). The backfill adds an item once: a card the owner
+    removed afterwards stays removed (:func:`prune` never deletes these rows)."""
+    cur = await db.execute(
+        "SELECT DISTINCT issue_number FROM board_events "
+        "WHERE event = 'item_added' AND repo = ? AND issue_number IS NOT NULL",
+        ((repo or "").lower(),),
+    )
+    return {row[0] for row in await cur.fetchall()}
+
+
+async def links_without_item(db: aiosqlite.Connection, *, repo: str) -> list[dict]:
+    """``{"id", "issue_number"}`` of every link in *repo* whose project item
+    is not recorded yet."""
+    cur = await db.execute(
+        "SELECT id, issue_number FROM board_links WHERE repo = ? AND project_item_id IS NULL",
+        ((repo or "").lower(),),
+    )
+    return await _all(cur)
+
+
 # ─── retention ──────────────────────────────────────────────────────────────
 
 
@@ -794,8 +884,13 @@ async def prune(
 ) -> dict:
     """Delete CLOSED questions (and their edges) older than ``question_days``
     and events older than ``event_days``. Unverified questions and pointers are
-    never pruned — they are open work and durable fact respectively. Returns the
-    real per-table deletion counts."""
+    never pruned — they are open work and durable fact respectively — and
+    neither are ``item_added`` events: they are the backfill's only memory of
+    what it added, so pruning one would re-add a card the owner removed. Nor are
+    the builder launcher's rows (:data:`LAUNCHER_EVENTS`): its cutoff is the
+    latest enable, and a move's final rows (launched, refused, absorbed, strikes)
+    are what stop it being evaluated again. Returns the real per-table deletion
+    counts."""
     for name, days in (("question_days", question_days), ("event_days", event_days)):
         if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
             raise ValueError(f"{name} must be a positive int")
@@ -812,6 +907,10 @@ async def prune(
         blocks = cur.rowcount
         cur = await db.execute(f"DELETE FROM open_questions WHERE id IN ({doomed})", (q_cutoff,))
         questions = cur.rowcount
-        cur = await db.execute("DELETE FROM board_events WHERE created_at < ?", (e_cutoff,))
+        cur = await db.execute(
+            "DELETE FROM board_events WHERE created_at < ? AND event NOT IN "
+            f"({', '.join(repr(e) for e in sorted(_NEVER_PRUNED))})",
+            (e_cutoff,),
+        )
         events = cur.rowcount
     return {"questions": questions, "question_blocks": blocks, "events": events}

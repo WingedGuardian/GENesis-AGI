@@ -126,6 +126,26 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # read live per grading pass by ws2_ledger_config
     ),
+    "lesson_builder": SettingsDomain(
+        name="lesson_builder",
+        description=(
+            "Whole-session lesson builder — `mode` off/shadow/live. Live "
+            "(default) builds and stores new lessons, at most 7 per source "
+            "session in any rolling 24 hours; shadow runs the builder and "
+            "appends each would-be lesson to "
+            "~/.genesis/output/lesson_builder_shadow.jsonl, storing nothing; "
+            "off skips the builder. "
+            "`segment` whole/shadow/incremental: shadow (default) judges the "
+            "whole session and logs what judging only its unjudged part would "
+            "do; whole skips that; incremental is not built yet (reads as "
+            "shadow). "
+            "Invalid values degrade to shadow. Read live each extraction "
+            "cycle by genesis.learning.procedural.lesson_builder_config."
+        ),
+        config_filename="lesson_builder.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per extraction cycle
+    ),
     "repo_pulse": SettingsDomain(
         name="repo_pulse",
         description=(
@@ -1560,6 +1580,21 @@ def _validate_ws2_ledger(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_lesson_builder(changes: dict) -> list[str]:
+    """Validate lesson_builder lever changes (see
+    genesis.learning.procedural.lesson_builder_config)."""
+    from genesis.learning.procedural.lesson_builder_config import MODES, SEGMENTS
+
+    allowed = {"mode": MODES, "segment": SEGMENTS}
+    errors: list[str] = []
+    for key, value in changes.items():
+        if key not in allowed:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(allowed)}")
+        elif value not in allowed[key]:
+            errors.append(f"'{key}' must be one of {', '.join(allowed[key])}; got {value!r}")
+    return errors
+
+
 def _validate_skill_replay_subconfig(value, replay_modes) -> list[str]:
     """Validate the ``replay`` sub-config of the skill-evolution gate."""
     if not isinstance(value, dict):
@@ -2319,6 +2354,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "memory_recall": _validate_memory_recall,
     "session_ledger_shadow": _validate_session_ledger_shadow,
     "ws2_ledger": _validate_ws2_ledger,
+    "lesson_builder": _validate_lesson_builder,
     "repo_pulse": _validate_repo_pulse,
     "zero_drop": _validate_zero_drop,
     "contributor_worklog": _validate_contributor_worklog,

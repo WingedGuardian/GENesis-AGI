@@ -382,8 +382,10 @@ LOCAL ONLY; nothing here reaches GitHub.
 the reconciler alive?" from the reconciler's stored heartbeats. It never calls
 GitHub, so it is cheap to ask often. Its `latest` block is the newest pulse
 (mode, paused, any error); `summary` is the newest SUCCESSFUL read: counts by
-column, Genesis status and kind, coverage against the repo's open total, and
-drags logged, all with its age. `board_item("#N")` (or `owner/repo#N`) answers
+column, Genesis status and kind, coverage against the repo's open total,
+drags logged, and `writes` (what that tick added and filled in `live`, or, in
+`propose_only`, what it would have: `dry_run: true`), all with its age.
+`board_item("#N")` (or `owner/repo#N`) answers
 "where is this one card and what blocks it?" with a live read: its column on
 the configured project, GitHub's blocked-by list (flagged when truncated),
 unverified open questions blocking it, and whether it was promoted from a

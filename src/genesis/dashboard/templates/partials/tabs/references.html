@@ -60,7 +60,7 @@
             <template x-for="ref in $store.genesisDashboard.referenceSearchResults" :key="ref.id">
               <div style="background: var(--color-background); border: 1px solid var(--color-border); border-radius: 6px; padding: .75rem;">
                 <div style="display: flex; justify-content: space-between; align-items: center; gap:.5rem;">
-                  <strong x-text="ref.concept || ref.id" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor:pointer;"
+                  <strong x-text="ref.name || ref.concept || ref.id" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor:pointer;"
                           @click="$store.genesisDashboard.viewReferenceDetail(ref.id)"></strong>
                   <div style="display:flex; gap:.35rem; align-items:center; flex-shrink:0;">
                     <span style="font-size:.6rem; padding:1px 6px; border-radius:3px; background: var(--color-panel);" x-text="ref.kind"></span>
@@ -101,7 +101,7 @@
             <template x-for="ref in entries" :key="ref.id">
               <div style="background: var(--color-background); border: 1px solid var(--color-border); border-radius: 6px; padding: .75rem;">
                 <div style="display: flex; justify-content: space-between; align-items: center; gap:.5rem;">
-                  <strong x-text="ref.concept || ref.id" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor:pointer;"
+                  <strong x-text="ref.name || ref.concept || ref.id" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor:pointer;"
                           @click="$store.genesisDashboard.viewReferenceDetail(ref.id)"></strong>
                   <div style="display:flex; gap:.35rem; align-items:center; flex-shrink:0;">
                     <span :style="`font-size:.6rem; padding:1px 6px; border-radius:3px; background:${$store.genesisDashboard._provenanceColor(ref.source_pipeline)}22; color:${$store.genesisDashboard._provenanceColor(ref.source_pipeline)};`"
@@ -132,8 +132,11 @@
         <div style="position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100; display: flex; align-items: center; justify-content: center;"
              @click.self="$store.genesisDashboard.closeReferenceDetail()">
           <div style="background: var(--color-panel); border: 1px solid var(--color-border); border-radius: 8px; padding: 1.5rem; max-width: 640px; width: 90%; max-height: 80vh; overflow-y: auto;">
-            <h3 x-text="$store.genesisDashboard.referenceDetail.concept"></h3>
+            <h3 x-text="$store.genesisDashboard.referenceDetail.name || $store.genesisDashboard.referenceDetail.concept"></h3>
             <div style="margin: .75rem 0; font-size: .9em; color: var(--color-text-secondary);">
+              <template x-if="$store.genesisDashboard.referenceDetail.name && $store.genesisDashboard.referenceDetail.name !== $store.genesisDashboard.referenceDetail.concept">
+                <span x-text="'Key: ' + $store.genesisDashboard.referenceDetail.concept + ' | '"></span>
+              </template>
               <span x-text="'Kind: ' + $store.genesisDashboard.referenceDetail.kind"></span> |
               <span x-text="'Source: ' + $store.genesisDashboard._provenanceLabel($store.genesisDashboard.referenceDetail.source_pipeline)"></span> |
               <span x-text="'Confidence: ' + ($store.genesisDashboard.referenceDetail.confidence ?? '—')"></span> |

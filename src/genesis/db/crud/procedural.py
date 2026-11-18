@@ -12,6 +12,21 @@ def _json_or_none(value: dict | None) -> str | None:
     return None if value is None else json.dumps(value)
 
 
+def _source_session(source: str | None) -> str | None:
+    """The session ``source`` (JSON) names, for ``created_session_id``.
+
+    Written only by the INSERT statements below, never by an update, so the
+    lesson cap's count of a session's creations survives a refine that rewrites
+    ``source``. None when ``source`` is absent, not JSON, or names no session.
+    """
+    try:
+        parsed = json.loads(source) if source else None
+    except (ValueError, TypeError):
+        return None
+    sid = parsed.get("session_id") if isinstance(parsed, dict) else None
+    return sid if isinstance(sid, str) and sid else None
+
+
 def _live_clause(live_only: bool) -> str:
     """SQL that leaves out held lessons (external origin, not reviewed)."""
     if not live_only:
@@ -68,8 +83,8 @@ async def create(
             activation_tier, tool_trigger, success_count, confidence,
             source, promotion_history, principle_embedding,
             extraction_context, first_mover, trigger_spec, lesson,
-            deprecated, deprecated_reason)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            deprecated, deprecated_reason, created_session_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (id, person_id, task_type, principle, scenario,
          json.dumps(steps), json.dumps(tools_used),
          json.dumps(context_tags), draft,
@@ -79,7 +94,7 @@ async def create(
          success_count, confidence, source, promotion_history,
          principle_embedding, extraction_context, first_mover,
          _json_or_none(trigger_spec), _json_or_none(lesson),
-         1 if deprecated_reason else 0, deprecated_reason),
+         1 if deprecated_reason else 0, deprecated_reason, _source_session(source)),
     )
     await db.commit()
     return id
@@ -125,8 +140,8 @@ async def upsert(
            (id, person_id, task_type, principle, steps, tools_used, context_tags,
             draft, attempted_workarounds, version, created_at,
             activation_tier, tool_trigger, success_count, confidence,
-            source, promotion_history, trigger_spec, lesson)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            source, promotion_history, trigger_spec, lesson, created_session_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              person_id = excluded.person_id,
              task_type = excluded.task_type, principle = excluded.principle,
@@ -148,7 +163,7 @@ async def upsert(
          version, created_at, activation_tier,
          json.dumps(tool_trigger) if tool_trigger else None,
          success_count, confidence, source, promotion_history,
-         _json_or_none(trigger_spec), _json_or_none(lesson)),
+         _json_or_none(trigger_spec), _json_or_none(lesson), _source_session(source)),
     )
     await db.commit()
     return id
@@ -310,9 +325,16 @@ async def list_by_tool_trigger(
     return [dict(r) for r in await cursor.fetchall()]
 
 
+# Written once at insert: the lesson cap counts a session's creations by them.
+_INSERT_ONLY = ("created_session_id", "created_at")
+
+
 async def update(db: aiosqlite.Connection, id: str, **fields) -> bool:
     if not fields:
         return False
+    fixed = [k for k in _INSERT_ONLY if k in fields]
+    if fixed:
+        raise ValueError(f"procedural_memory {', '.join(fixed)} is set at insert only")
     # Serialize JSON fields
     for key in ("steps", "tools_used", "context_tags", "failure_modes",
                  "attempted_workarounds", "tool_trigger", "promotion_history"):

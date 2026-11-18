@@ -1,0 +1,34 @@
+# Whole-session lesson builder lever (read live by
+# genesis.learning.procedural.lesson_builder_config).
+#
+# Overlay per install at ~/.genesis/config/lesson_builder.local.yaml (deep-merged
+# over this base).
+
+# off | shadow | live. An unreadable base or overlay reads as shadow.
+#   live (default): the builder runs and stores new lessons, at most
+#     max_procedures_per_session per source session in any rolling 24 hours.
+#   shadow: the builder makes its real model call and runs its scoping and
+#     novelty checks under the same cap, then appends each lesson it would have
+#     stored to ~/.genesis/output/lesson_builder_shadow.jsonl (moved to .1 once
+#     its oldest record is over 24 hours old, so the two files hold the cap's
+#     whole window). Nothing is stored. Use it to judge lesson quality before
+#     live. A lesson that repeats one already recorded for the session in the
+#     window is dropped, as live's novelty check drops it at the store.
+#     It slightly overstates live: the store step it skips can still drop a
+#     lesson that matches an explicit teach, or refine an existing lesson.
+#     A shadow build that fails on provider exhaustion is not queued.
+#   off: no builder call.
+# Neither shadow nor off changes how the extraction watermark moves. Queued
+# rebuilds (sessions whose build failed on provider exhaustion) stay queued
+# until the mode returns to live.
+mode: live
+
+# whole | shadow | incremental: how much of a session the builder judges.
+#   whole: the whole session each cycle it has new messages, as before.
+#   shadow (default): as whole, plus one log line per built session saying what
+#     judging only the part after its progress marker would do (entries,
+#     characters, struggle score of the new entries, would-trigger). The marker
+#     (cc_sessions.lesson_built_through) moves when the builder ran.
+#   incremental: judge only that part. Not built yet; reads as shadow.
+# An invalid value reads as shadow, which stores what whole stores.
+segment: shadow

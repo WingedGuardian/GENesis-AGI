@@ -1,8 +1,9 @@
-"""Captured explicit recovery operations; no opener, timer or native workload."""
+"""Captured explicit recovery operations using the existing queue and owner."""
 
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -42,8 +43,237 @@ class Supervisor:
             raise RuntimeError("explicit schema5 cutover is required")
         return result["value"]  # Advisory only; the admitted transaction rereads it.
 
+    def _current_grant(self, h, provider):
+        queue = self.modules["queue"]
+        return self._observe_schema5(lambda db: queue._retry.load(db, h, provider, queue._native))
+
+    def request_retry(self, data):
+        self._guard()
+        snapshot, modules = self.snapshot, self.modules
+        queue, admission = modules["queue"], modules["owner_admission"]
+        queue._native._object(
+            data,
+            (
+                "repo_path",
+                "provider",
+                "origin",
+                "run_mode",
+                "not_after_wall_ns",
+                "evidence_reference",
+                "managed_config",
+            ),
+            "supervised retry request",
+        )
+        repo = queue.canonical_repo(data["repo_path"])
+        h = queue.marker_hash(repo)
+        with admission.repository_lock_for(modules, repo, h):
+            prior = self._current_grant(
+                h, data["provider"]
+            )  # Never implicitly converts an older queue.
+            manager = modules["scope"].ScopeManager(
+                modules["unit"].bus_call,
+                modules["unit"].typed_property,
+                deadline=time.monotonic()
+                + admission.wall_seconds(modules, data["run_mode"], os.environ),
+            )
+            policy = admission.policy(
+                modules, data["provider"], data["run_mode"], manager, os.environ
+            )
+            manager.require_no_batch(modules["unit"].cgroup_empty)
+            nonce = queue.secrets.token_hex(16)
+            unit = queue._native.expected_unit(
+                dict(hash=h, provider=data["provider"], claim_id=nonce)
+            )
+
+            def capacity(control):
+                modules["admission"].assess_headroom(
+                    *modules["unit"].resolve_control_group(control),
+                    8 * 1024**3,
+                    policy["sibling_reserve_bytes"],
+                    cache_reserve=policy["cache_reserve_bytes"],
+                )
+
+            manager.require_slice_capacity(policy["slice"], capacity)
+            with admission.prepared_inputs(
+                snapshot,
+                modules,
+                repo,
+                data["provider"],
+                data["run_mode"],
+                data["managed_config"],
+                policy,
+                unit=unit,
+                recovery=True,
+            ) as inputs:
+                if data["provider"] == "cbm":
+                    config = modules["managed"].runtime_config(
+                        modules["unit"].config_path(data["managed_config"])
+                    )
+                    modules["managed"].require_enabled(
+                        config
+                    )  # Never enables service or removes sentinel.
+                prior_source = None
+                if prior and prior["status"] == "spent":
+                    try:
+                        old_policy = admission.policy(
+                            modules, prior["provider"], prior["run_mode"], manager, os.environ
+                        )
+                        old_unit = queue._native.expected_unit(prior["trial"])
+                        with admission.prepared_inputs(
+                            snapshot, modules, repo, prior["provider"], prior["run_mode"],
+                            data["managed_config"], old_policy, unit=old_unit, recovery=True,
+                        ) as old:
+                            prior_source = dict(nonce=prior["nonce"], source=old["source"])
+                    except (OSError, ValueError):
+                        # No changed-source proof. The final transaction may
+                        # supersede only for its independent conclusive state;
+                        # an otherwise eligible clean success still stays current.
+                        prior_source = None
+                candidate = dict(
+                    hash=h,
+                    repo_path=repo,
+                    provider=data["provider"],
+                    origin=data["origin"],
+                    run_mode=data["run_mode"],
+                    nonce=nonce,
+                    source=inputs["source"],
+                    policy_sha256=queue._native.digest(policy),
+                    evidence_reference=data["evidence_reference"],
+                    not_after_wall_ns=data["not_after_wall_ns"],
+                )
+                with queue._decision_gate(native=True) as (db, finalize):
+                    result = queue._retry.issue(
+                        db,
+                        candidate,
+                        queue._native,
+                        queue._legs,
+                        finalize=finalize,
+                        fresh_cleanup=queue._fresh_gate(db),
+                        prior_source=prior_source,
+                    )
+        return result
+
+    def revoke_retry(self, repo, provider, nonce=None, *, grant_sha256=None):
+        self._guard()
+        queue = self.modules["queue"]
+        repo = queue.canonical_repo(repo)
+        h = queue.marker_hash(repo)
+        with self.modules["owner_admission"].repository_lock_for(self.modules, repo, h):
+            if grant_sha256 is None:
+                self._current_grant(h, provider)
+            else:
+                self._observe_schema5(lambda db: None)  # Malformed content is checked after admission.
+            with queue._decision_gate(native=True) as (db, finalize):
+                finalize()
+                result = queue._retry.revoke(db, h, provider, nonce, queue._native,
+                                             grant_sha256=grant_sha256)
+        return result
 
 
+    def claim_selected(self, data):
+        """Only a fresh committed runtime reaches this same physical owner."""
+        self._guard()
+        snapshot, modules = self.snapshot, self.modules
+        queue, admission = modules["queue"], modules["owner_admission"]
+        native = queue._native
+        actual_owner = queue._recovery.owner_identity()
+        native._object(data, ("repo_path", "provider", "nonce", "managed_config"), "selected claim")
+        native._hex(data["nonce"], 32, "selected nonce")
+        repo = queue.canonical_repo(data["repo_path"])
+        h = queue.marker_hash(repo)
+        with admission.repository_lock_for(modules, repo, h):
+            grant = self._current_grant(h, data["provider"])
+            if grant is None or grant["nonce"] != data["nonce"] or grant["repo_path"] != repo:
+                raise ValueError("selected claim does not name the current grant")
+            if grant["status"] == "spent":
+                return dict(state="already_claimed", trial=grant["trial"], launch_authority=False)
+            manager = modules["scope"].ScopeManager(
+                modules["unit"].bus_call, modules["unit"].typed_property,
+                deadline=time.monotonic() + admission.wall_seconds(modules, grant["run_mode"], os.environ))
+            policy = admission.policy(modules, data["provider"], grant["run_mode"], manager, os.environ)
+            if actual_owner != queue._recovery.owner_identity():
+                raise ValueError("actual selected owner changed during policy lookup")
+            manager.require_no_batch(modules["unit"].cgroup_empty)
+            if actual_owner != queue._recovery.owner_identity():
+                raise ValueError("actual selected owner changed during batch census")
+
+            def capacity(control):
+                modules["admission"].assess_headroom(
+                    *modules["unit"].resolve_control_group(control), 8 * 1024**3,
+                    policy["sibling_reserve_bytes"], cache_reserve=policy["cache_reserve_bytes"])
+
+            manager.require_slice_capacity(policy["slice"], capacity)
+            unit = native.expected_unit(dict(hash=h, provider=data["provider"], claim_id=data["nonce"]))
+            with admission.prepared_inputs(snapshot, modules, repo, data["provider"], grant["run_mode"],
+                                           data["managed_config"], policy, unit=unit, recovery=True) as inputs:
+                if data["provider"] == "cbm":
+                    config = modules["managed"].runtime_config(modules["unit"].config_path(data["managed_config"]))
+                    modules["managed"].require_enabled(config)
+                if actual_owner != queue._recovery.owner_identity():
+                    raise ValueError("actual selected owner changed during preparation")
+                reserved = dict(unit=unit, run_mode=grant["run_mode"], source=inputs["source"],
+                    owner=actual_owner, cap_bytes=8 * 1024**3,
+                    **{key:policy[key] for key in ("route", "slice", "wall_seconds")})
+
+                def bind(context, actual):
+                    runtime = dict(context=context, reservation=actual, policy=policy,
+                        provider_options=inputs["provider_options"], environment_recipe=inputs["environment_recipe"])
+                    bound = snapshot.with_runtime(runtime)
+                    modules["queued"].runtime_inputs(bound, modules)
+                    return bound
+
+                request = dict(hash=h, provider=data["provider"], nonce=data["nonce"],
+                               reservation=reserved, policy_sha256=native.digest(policy))
+                with queue._decision_gate(native=True) as (db, finalize):
+                    result = queue._retry.consume(db, request, native, queue._legs, finalize=finalize,
+                        bind_runtime=bind, fresh_cleanup=queue._fresh_gate(db))
+                    if result is None:
+                        current_trial = queue._retry.load(db, h, data["provider"], native)["trial"]
+            if result is None:
+                return dict(state="already_claimed", trial=current_trial, launch_authority=False)
+            claimed, bound = result
+            state = admission.execute_runtime(bound, modules, actual_owner=actual_owner)  # No reserve or repository-lock reacquisition.
+            return dict(state=state or "open", trial=claimed["context"], launch_authority=False)
+
+    def accept_retry(self, data):
+        """Accept retained completion; metadata observation has no launch path."""
+        self._guard()
+        snapshot, modules = self.snapshot, self.modules
+        queue, admission = modules["queue"], modules["owner_admission"]
+        native = queue._native
+        native._object(data, ("repo_path", "provider", "nonce", "evidence_reference", "managed_config"),
+                       "supervised acceptance")
+        native._hex(data["nonce"], 32, "acceptance nonce")
+        repo = queue.canonical_repo(data["repo_path"])
+        h = queue.marker_hash(repo)
+        with admission.repository_lock_for(modules, repo, h):
+            grant = self._current_grant(h, data["provider"])
+            if grant is None or grant["status"] != "spent" or grant["nonce"] != data["nonce"]:
+                raise ValueError("acceptance does not name the current completed trial")
+            row = self._observe_schema5(lambda db: dict(native.execution(db, grant["trial"], queue._legs)))
+            if row["launch_reservation"] is None:
+                raise ValueError("acceptance trial has no retained reservation")
+            reserved = native.reservation(json.loads(row["launch_reservation"]), grant["trial"])
+            manager = modules["scope"].ScopeManager(
+                modules["unit"].bus_call, modules["unit"].typed_property,
+                deadline=time.monotonic() + admission.wall_seconds(modules, grant["run_mode"], os.environ))
+
+            def current_policy():
+                return admission.policy(modules, data["provider"], grant["run_mode"], manager, dict(os.environ))
+
+            with admission.prepared_inputs(snapshot, modules, repo, data["provider"], grant["run_mode"],
+                    data["managed_config"], current_policy(), unit=reserved["unit"], recovery=True,
+                    with_observer=True, observe_policy=current_policy) as inputs:
+                def observe():
+                    value = inputs["observe"]()
+                    return dict(source=value["source"], policy_sha256=value["policy_sha256"])
+
+                request = dict(hash=h, repo_path=repo, provider=data["provider"], nonce=data["nonce"],
+                               evidence_reference=data["evidence_reference"])
+                with queue._decision_gate(native=True) as (db, finalize):
+                    result = queue._retry.accept(db, request, native, queue._legs, finalize=finalize,
+                        observe_inputs=observe, fresh_cleanup=queue._fresh_gate(db))
+        return result  # Commit and receipt durability precede acknowledgement.
 
     def reconcile_context(self, context):
         self._guard()
