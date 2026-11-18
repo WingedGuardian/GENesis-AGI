@@ -4020,9 +4020,16 @@ verified: 3f70a665b 2026-11-15
   `_judge_from_marker` judges up to 4 parts per pass from the marker (the drain
   and the cycle each get a pass, so up to 8 per session per cycle), each with up to 20
   earlier tool turns shown for reference only and the session origin from the
-  whole spine, a timeout per part, and a compare-and-set after each. Entries
-  left over (budget, spent cap, failed build) queue one `procedure_rebuild` item
-  per session that says only "continue from the marker"; the drain reads every
+  whole spine, a timeout per part, and a compare-and-set after each. A
+  `candidates` flag triggers every part of its request. Entries left over
+  (budget, spent cap, failed build, a marker another writer moved) queue one
+  `procedure_rebuild` item per session that says only "continue from the
+  marker". A call left waiting for its result is judged when the result comes:
+  with a message, by the next cycle; alone, the empty-message branch queues the
+  drain when that result made an entry after the marker ready (a hook or
+  system line queues nothing), and the drain never re-queues a call still
+  waiting. A request merged into an
+  item a drain already claimed is queued again. The drain reads every
   such item by the current mode (incremental judges from the marker, whole or
   shadow rebuilds the whole session), claims it atomically, retries a failure up
   to 8 attempts and then raises `procedure_extraction_lost`. Each lesson built

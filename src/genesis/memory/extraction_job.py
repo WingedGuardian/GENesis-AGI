@@ -271,13 +271,14 @@ async def _judge_from_marker(
     Judges up to :data:`_PARTS_PER_RUN` parts from ``marker`` (read before the
     spine was parsed), moving the marker by compare-and-set after each judged
     part or part below the struggle threshold. The timeout wraps each part's
-    builder call, never the loop. ``candidates`` (the chunk path flagged the
-    latest messages) counts for the part that reaches the spine's judgeable end.
+    builder call, never the loop. ``candidates`` (the chunk path flagged messages
+    in this request) triggers every part: the flag does not say which part holds
+    the candidate, and a part the marker passes is never judged again.
 
-    Returns ``done`` (nothing left), ``remaining`` (entries left after the last
-    part), ``held:cap`` (the cap is spent), ``held:partial-parse`` (a reset whose
-    old id is still in the file) or ``refused`` (the marker moved elsewhere, or
-    cannot move). The builder's errors propagate; parts judged before one keep
+    Returns ``done`` (nothing left), ``pending`` (judged to the end, but an
+    unanswered call waits for its result), ``remaining`` (entries left after the last part),
+    ``held:cap`` (the cap is spent), ``held:partial-parse`` (a reset whose old id
+    is still in the file) or ``refused`` (another writer moved the marker). The builder's errors propagate; parts judged before one keep
     their moved marker.
     """
     from genesis.db.crud import cc_sessions as sessions_crud
@@ -296,11 +297,12 @@ async def _judge_from_marker(
         part = select_part(spine, marker, budget_chars=_MAX_SPINE_CHARS)
         if part.reset and await asyncio.to_thread(_file_mentions, transcript_path, marker):
             return "held:partial-parse"
+        end = "pending" if part.pending_tail else "done"
         if not part.new:
-            return "done"
+            return end
         reaches_end = part.held_back == 0
         score = score_struggle(part.new)
-        triggered = score >= STRUGGLE_THRESHOLD or (candidates and reaches_end)
+        triggered = score >= STRUGGLE_THRESHOLD or candidates
         stored = 0
         if triggered:
             cap_left = await _lesson_cap_left(db, cc_session_id, max_procedures_per_session)
@@ -333,10 +335,10 @@ async def _judge_from_marker(
         if not moved:
             # Nothing to move to (an all-user part) is done when it reached the
             # end; otherwise another writer moved the marker, or it cannot move.
-            return "done" if reaches_end and part.through_id in (None, marker) else "refused"
+            return end if reaches_end and part.through_id in (None, marker) else "refused"
         marker = part.through_id
         if reaches_end:
-            return "done"
+            return end
     return "remaining"
 
 
@@ -385,7 +387,11 @@ async def _incremental_build(
         )
         await _enqueue_procedure_rebuild(db, session_id, cc_session_id, trigger=trigger, dedup=True)
         return
-    if outcome in ("remaining", "held:cap"):
+    # Entries left: more than one run's parts, a spent cap, or another writer's
+    # marker (its parse may have been shorter). A ``pending`` call needs nothing
+    # here: its result arrives either with a message (this path again) or alone,
+    # which the empty-message branch queues for the drain.
+    if outcome in ("remaining", "held:cap", "refused"):
         await _enqueue_procedure_rebuild(db, session_id, cc_session_id, trigger=trigger, dedup=True)
     elif outcome == "held:partial-parse":
         await _partial_parse_observation(db, cc_session_id)
@@ -637,7 +643,20 @@ async def run_extraction_cycle(
                 # The appended lines may hold only a tool result (the delta
                 # reader drops those), so record outcomes here too: no later
                 # cycle re-reads this transcript unless new text arrives.
-                await _record_tool_outcomes_from(db, transcript_path, cc_session_id)
+                spine = await _record_tool_outcomes_from(db, transcript_path, cc_session_id)
+                # Under incremental the lines may be the result of a call the
+                # last part left waiting; no message cycle will bring the
+                # session back for it, so the drain judges it from the marker.
+                # Only then: a hook or system line alone queues nothing.
+                if (
+                    spine
+                    and segment_mode() == "incremental"
+                    and lesson_builder_mode() == "live"
+                    and await _released_tail(db, session_id, spine)
+                ):
+                    await _enqueue_procedure_rebuild(
+                        db, session_id, cc_session_id, trigger="score", dedup=True,
+                    )
             continue
 
         chunks = chunk_messages(messages, chunk_size=chunk_size)
@@ -1113,10 +1132,11 @@ async def run_extraction_cycle(
 
 async def _record_tool_outcomes_from(
     db: aiosqlite.Connection, transcript_path: Path, cc_session_id: str
-) -> None:
+) -> list[dict] | None:
     """Parse ``transcript_path`` and record its outcomes; never raises.
 
     For a cycle whose delta has no message, which skips the builder's parse.
+    Returns the spine, or None when the parse failed.
     """
     try:
         from genesis.learning.procedural.struggle_detector import build_spine_and_haystack
@@ -1127,8 +1147,26 @@ async def _record_tool_outcomes_from(
             "Tool-outcome parse failed for session %s — extraction unaffected",
             cc_session_id, exc_info=True,
         )
-        return
+        return None
     await _record_tool_outcomes(db, spine, cc_session_id)
+    return spine
+
+
+async def _released_tail(db: aiosqlite.Connection, session_id: str, spine: list[dict]) -> bool:
+    """Whether a judgeable tool entry now follows the marker: a call the last
+    part left waiting got its result. False when the marker cannot be read."""
+    from genesis.learning.procedural.build_segment import select_part
+    from genesis.learning.procedural.struggle_detector import _MAX_SPINE_CHARS
+
+    marker = await _read_lesson_marker(db, session_id)
+    if marker is _MARKER_UNREAD:
+        return False
+    try:
+        part = select_part(spine, marker, budget_chars=_MAX_SPINE_CHARS)
+    except Exception:
+        logger.warning("Released-tail check failed for session %s", session_id, exc_info=True)
+        return False
+    return any(e.get("type") == "tool" for e in part.new)
 
 
 async def _record_tool_outcomes(
@@ -1176,13 +1214,17 @@ async def _merge_into_pending_rebuild(
                 continue
         except (json.JSONDecodeError, TypeError, AttributeError):
             continue
-        if trigger == "candidates" and payload.get("trigger") != "candidates":
-            await db.execute(
-                "UPDATE deferred_work_queue SET payload_json = ? WHERE id = ? AND status = 'pending'",
-                (json.dumps({**payload, "trigger": "candidates"}), item["id"]),
-            )
-            await db.commit()
-        return True
+        if trigger == "candidates":
+            payload = {**payload, "trigger": "candidates"}
+        # Merged only if the item is still pending when written: a drain that
+        # claimed it after the listing above may already be reading an older
+        # payload, so this request needs an item of its own.
+        cursor = await db.execute(
+            "UPDATE deferred_work_queue SET payload_json = ? WHERE id = ? AND status = 'pending'",
+            (json.dumps(payload), item["id"]),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
     return False
 
 
@@ -1416,11 +1458,18 @@ async def _drain_from_marker(
     ``procedure_extraction_lost`` observation instead of a silent discard.
     """
     from genesis.db.crud import cc_sessions as sessions_crud
+    from genesis.db.crud import deferred_work as dw_crud
     from genesis.learning.procedural.struggle_detector import build_spine_and_haystack
 
     item_id = item["id"]
     session_id = payload.get("session_id") or cc_session_id
     try:
+        # The payload as it stands now that the item is claimed: a request
+        # merged after the drain listed it (a candidates upgrade) is in this
+        # copy only. Read inside the try, so a failed read returns the item.
+        current = await dw_crud.get_payload(db, item_id)
+        with contextlib.suppress(json.JSONDecodeError, TypeError):
+            payload = json.loads(current) if current else payload
         if not await sessions_crud.has_session(db, session_id):
             await queue.mark_discarded(item_id, "session row gone")
             return
@@ -1448,7 +1497,10 @@ async def _drain_from_marker(
         await queue.reset_to_pending(item_id)
         return
     await queue.mark_completed(item_id)
-    if outcome in ("remaining", "held:cap"):
+    # ``pending`` is not re-queued, so a call that never gets its result (a
+    # crashed session) cannot keep a rebuild cycling. Its result, when it comes,
+    # is queued again by the empty-message branch, or judged with a message.
+    if outcome in ("remaining", "held:cap", "refused"):
         await _enqueue_procedure_rebuild(
             db, session_id, cc_session_id, trigger=payload.get("trigger", "score"), dedup=True,
         )

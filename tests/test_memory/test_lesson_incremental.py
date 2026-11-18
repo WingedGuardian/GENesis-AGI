@@ -302,14 +302,104 @@ async def test_incremental_under_shadow_mode_runs_as_shadow(db, tmp_path, monkey
 
 
 @pytest.mark.asyncio
-async def test_a_refused_move_queues_nothing(db, tmp_path, monkeypatch):
+async def test_a_refused_move_queues_a_continue(db, tmp_path, monkeypatch):
+    """Another writer moved the marker, perhaps from a shorter parse: this
+    parse's later entries are left to the drain rather than dropped."""
     _setup(monkeypatch, spine=SPINE)
     await _seed(db, tmp_path)
     monkeypatch.setattr(
         sessions_crud, "advance_lesson_built_through", AsyncMock(return_value=False)
     )
     await _cycle(db, tmp_path)
+    assert len(await _items(db, "pending")) == 1
+
+
+def _append_result(tmp_path, tid="t4"):
+    """A tool result alone: the delta reader drops it, so no message cycle runs."""
+    with (tmp_path / f"{CC}.jsonl").open("a") as f:
+        f.write(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": uuid.uuid4().hex,
+                    "timestamp": "2026-11-01T12:01:00Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "tool_result", "tool_use_id": tid, "content": "ok"}],
+                    },
+                }
+            )
+            + "\n"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_result_that_arrives_alone_is_judged_by_the_drain(db, tmp_path, monkeypatch):
+    """The last part left a call waiting; its result comes with no new message,
+    which no message cycle sees, so the empty-message branch queues the drain."""
+    builder = _setup(monkeypatch, spine=[*SPINE, _tool(4, result=False)])
+    await _seed(db, tmp_path)
+    await _cycle(db, tmp_path)
+    assert await _marker(db) == "t3" and await _items(db, "pending") == []
+    _setup(monkeypatch, spine=[*SPINE, _tool(4)], builder=builder)
+    _append_result(tmp_path)
+    await _cycle(db, tmp_path)
+    assert len(await _items(db, "pending")) == 1
+    await _drain(db, tmp_path)
+    assert builder.calls[-1]["turns"] == [4] and await _marker(db) == "t4"
+    assert await _items(db, "pending") == []
+
+
+@pytest.mark.asyncio
+async def test_a_result_only_append_queues_nothing_outside_incremental(
+    db, tmp_path, monkeypatch
+):
+    _setup(monkeypatch, spine=[*SPINE, _tool(4, result=False)], segment="shadow")
+    await _seed(db, tmp_path)
+    await _cycle(db, tmp_path)
+    assert await _marker(db) == "t3"  # the shadow step moves it; t4 waits
+    _setup(monkeypatch, spine=[*SPINE, _tool(4)], segment="shadow")
+    _append_result(tmp_path)
+    await _cycle(db, tmp_path)
     assert await _items(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_result_only_append_queues_nothing_unless_the_builder_is_live(
+    db, tmp_path, monkeypatch
+):
+    _setup(monkeypatch, spine=[*SPINE, _tool(4, result=False)])
+    await _seed(db, tmp_path)
+    await _cycle(db, tmp_path)
+    _setup(monkeypatch, spine=[*SPINE, _tool(4)], mode="shadow")
+    _append_result(tmp_path)
+    await _cycle(db, tmp_path)
+    assert await _items(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_non_message_line_with_nothing_waiting_queues_nothing(db, tmp_path, monkeypatch):
+    """A hook or system line alone, after every call was judged, leaves nothing
+    for the drain to do, so no item is queued."""
+    _setup(monkeypatch, spine=SPINE)
+    await _seed(db, tmp_path)
+    await _cycle(db, tmp_path)
+    assert await _marker(db) == "t3"
+    _append_result(tmp_path, tid="t3")
+    await _cycle(db, tmp_path)
+    assert await _items(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_tail_that_never_gets_its_result_is_not_requeued(db, tmp_path, monkeypatch):
+    """A drained item that ends on a call still waiting completes without
+    re-queueing, so a crashed session's tail cannot keep a rebuild cycling."""
+    builder = _setup(monkeypatch, spine=[*SPINE, _tool(4, result=False)])
+    await _seed(db, tmp_path)
+    await _queue(db)
+    await _drain(db, tmp_path)
+    assert [c["turns"] for c in builder.calls] == [[1, 2, 3]] and await _marker(db) == "t3"
+    assert await _items(db, "pending") == [] and len(await _items(db, "completed")) == 1
 
 
 # ── the drain ───────────────────────────────────────────────────────────────
@@ -556,7 +646,9 @@ async def test_a_partial_parse_hold_is_observed_once(db, tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_candidates_trigger_only_the_part_that_reaches_the_end(db, tmp_path, monkeypatch):
+async def test_candidates_trigger_every_part_of_the_request(db, tmp_path, monkeypatch):
+    """The flag does not say which part holds the candidate, and a part the
+    marker passes is never judged again, so every part is built."""
     spine = [_tool(i, args="x" * 200) for i in range(1, 7)]
     per = len(sd.judge_line(spine[0])) + 1
     monkeypatch.setattr(sd, "_MAX_SPINE_CHARS", per * 3)
@@ -568,7 +660,8 @@ async def test_candidates_trigger_only_the_part_that_reaches_the_end(db, tmp_pat
         max_procedures_per_session=7, summary={},
     )
     assert out == "done"
-    assert [c["turns"] for c in builder.calls] == [[6]]  # parts 1-3 below threshold, part 4 reaches the end
+    assert [t for c in builder.calls for t in c["turns"]] == [1, 2, 3, 4, 5, 6]
+    assert len(builder.calls) > 1
 
 
 @pytest.mark.asyncio
@@ -593,6 +686,46 @@ async def test_a_candidates_request_upgrades_a_pending_score_item(db):
     await ej._enqueue_procedure_rebuild(db, "s1", CC, trigger="score", dedup=True)
     (item,) = await _items(db)
     assert json.loads(item["payload_json"])["trigger"] == "candidates"
+
+
+@pytest.mark.asyncio
+async def test_a_request_merged_into_a_claimed_item_gets_its_own(db):
+    """A drain that claimed the item after the listing may hold an older
+    payload, so the new request is queued again rather than dropped."""
+    await ej._enqueue_procedure_rebuild(db, "s1", CC, trigger="score", dedup=True)
+    (item,) = await _items(db)
+    real_query = dw_crud.query_pending
+
+    async def list_then_claim(db_, **kw):
+        listed = await real_query(db_, **kw)
+        await dw_crud.claim_pending(db_, item["id"], last_attempt_at="now")
+        return listed
+
+    dw_crud.query_pending, saved = list_then_claim, dw_crud.query_pending
+    try:
+        await ej._enqueue_procedure_rebuild(db, "s1", CC, trigger="candidates", dedup=True)
+    finally:
+        dw_crud.query_pending = saved
+    (fresh,) = await _items(db, "pending")
+    assert json.loads(fresh["payload_json"])["trigger"] == "candidates"
+
+
+@pytest.mark.asyncio
+async def test_the_drain_reads_the_payload_after_claiming(db, tmp_path, monkeypatch):
+    """A candidates upgrade that lands after the drain listed the item is in
+    the claimed copy, so a part with no struggle score is still built."""
+    builder = _setup(monkeypatch, spine=SPINE, score=0.0)
+    await _seed(db, tmp_path)
+    await _queue(db, trigger="score")
+    real_claim = dw_crud.claim_pending
+
+    async def upgrade_then_claim(db_, id_, **kw):
+        await ej._merge_into_pending_rebuild(db_, "s1", "candidates")
+        return await real_claim(db_, id_, **kw)
+
+    monkeypatch.setattr(dw_crud, "claim_pending", upgrade_then_claim)
+    await _drain(db, tmp_path)
+    assert [c["turns"] for c in builder.calls] == [[1, 2, 3]]
 
 
 @pytest.mark.asyncio

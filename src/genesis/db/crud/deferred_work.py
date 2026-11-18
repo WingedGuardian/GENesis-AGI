@@ -137,6 +137,17 @@ async def claim_pending(db: aiosqlite.Connection, id: str, *, last_attempt_at: s
     return cursor.rowcount > 0
 
 
+async def get_payload(db: aiosqlite.Connection, id: str) -> str | None:
+    """The item's current ``payload_json``, or None when there is no such item.
+
+    For a caller that just claimed an item from an earlier listing: the payload
+    may have changed between the listing and the claim.
+    """
+    cursor = await db.execute("SELECT payload_json FROM deferred_work_queue WHERE id = ?", (id,))
+    row = await cursor.fetchone()
+    return row[0] if row else None
+
+
 async def count_pending(
     db: aiosqlite.Connection,
     *,
