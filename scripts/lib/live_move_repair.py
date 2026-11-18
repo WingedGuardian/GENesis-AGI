@@ -1137,19 +1137,23 @@ class Repair:
         remedy = self.guard.message(self.state_path, verdict, reason)
         if not self.boot:
             print(remedy, flush=True)
-        # The save-first warning before any word about restoring (CodeRabbit
-        # c4605013452): the lead-in sits ahead of the guard's own by-hand steps.
-        lead = (
-            f"{self.guard._LIVE_RETRY}. The listed paths may also hold another session's "
-            "edits: save any you want to keep (copy them aside) before restoring anything; "
-            "--post-merge refuses until they are back (the steps follow the list). "
-            if reason.startswith(self.guard._LIVE_LATER)
-            else ""
-        )
-        # The remedy first: a long path list can run past ALERT_BYTES.
+        # The page is cut at ALERT_BYTES and the guard's first line carries the
+        # path list, whose length the guard does not cap (review SF-2): the boot
+        # page puts the steps (the save-first warning, the restore steps, the
+        # retry) ahead of that line, so a long list is what the cut shortens
+        # (CodeRabbit c4605013452 and its follow-up). The command output above
+        # keeps the guard's own order.
+        steps = remedy
+        # The reason is the path list itself (one path per line), so the cut is
+        # right after it, never at the first newline.
+        cut = remedy.find(reason)
+        if reason.startswith(self.guard._LIVE_LATER) and cut >= 0:
+            listed, rest = remedy[: cut + len(reason)], remedy[cut + len(reason) :].strip()
+            if rest:
+                steps = f"{rest}\nThe update record: {listed}"
         body = (
             f"The repair does not handle phase {phase!r} yet (#3722), so it left the checkout "
-            f"half-written and {_UNIT} was started anyway. {lead}{remedy}"
+            f"half-written and {_UNIT} was started anyway. {steps}"
         )
         self._page("mixed", "critical", verdict, reason, raw, body=body)
         return 0 if self.boot else 3

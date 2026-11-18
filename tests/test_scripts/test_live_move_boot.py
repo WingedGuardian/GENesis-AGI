@@ -603,7 +603,12 @@ def test_3722_the_page_leads_with_the_remedy_before_a_long_path_list(w):
     w.write_state({**state, "phase": "bootstrap", "own_head": w.to})
     w.repair(mode="--boot")
     body = w.alerts()[0]["body"]
-    assert body.index("retries the update") < body.index("These paths hold"), body
+    record = body.index("The update record:")
+    # The steps are fixed text (~1.3 KB, under ALERT_BYTES): with the path list
+    # last, the cut can only shorten the list (CodeRabbit follow-up at df874188e).
+    for step in ("save any you want to keep", "git restore --source=HEAD", "retries the update"):
+        assert body.index(step) < record, (step, body)
+    assert "\n  " in body[record:], body  # the indented path list comes last
 
 
 def test_3722_the_page_says_save_before_any_restore(w):
@@ -617,7 +622,7 @@ def test_3722_the_page_says_save_before_any_restore(w):
     body = w.alerts()[0]["body"]
     save = body.index("save any you want to keep")
     assert re.search(r"restor", body[:save], re.IGNORECASE) is None, body
-    assert save < body.index("These paths hold"), body
+    assert save < body.index("The update record:"), body
 
 
 def test_td21_a_main_mixed_tree_starts_with_a_critical_page(w):
