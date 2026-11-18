@@ -16,7 +16,8 @@ that has not ended (a ``builder_launched`` row with no ``builder_paused``,
 - **closes** it an hour after its PR opened, unless a client is attached to its
   session (then it waits, re-checked every tick): ``builder_closed``.
 
-Pause and close need a good board read; exit detection does not. A move that
+Pause, close and exit detection all need a good board read (whether a builder
+finished is read from it). A move that
 was held (``launch_queued``) and whose card left Build is ``launch_withdrawn``,
 once.
 
@@ -240,10 +241,11 @@ def _open_pr_opened(card: dict | None, tracker: str):
 _UNKNOWN = object()
 
 
-async def _pr_opened_live(tick, number: int):
-    """For a card no longer on the board: whether the issue has an open closing
-    PR, read live (a time when it does, None when it does not, _UNKNOWN when the
-    read failed)."""
+async def _live_state(tick, number: int):
+    """For a card no longer on the board, read live: ``(pr_opened, finished)``,
+    where *pr_opened* is a time when the issue has an open closing PR (the read
+    carries no PR creation time) and *finished* is True when the issue is CLOSED,
+    the launcher's own rule; ``_UNKNOWN`` when the read failed."""
     from genesis.board import projects_v2 as pv
 
     owner, _, name = tick.tracker.partition("/")
@@ -252,7 +254,7 @@ async def _pr_opened_live(tick, number: int):
     except pv.ProjectsError:
         logger.warning("builder watch: issue read failed for #%s", number, exc_info=True)
         return _UNKNOWN
-    return tick.now if facts["open_prs"] else None
+    return (tick.now if facts["open_prs"] else None), facts.get("state") == "CLOSED"
 
 
 async def run_watch(tick, items: list[dict] | None) -> dict:
@@ -268,11 +270,15 @@ async def _watch(tick, items: list[dict] | None) -> dict:
     from genesis.board import launcher
     from genesis.db.crud import board as board_crud
 
-    out = {"watched": 0, "exited": 0, "paused": 0, "closed": 0, "withdrawn": 0}
+    out = {"watched": 0, "exited": 0, "paused": 0, "closed": 0, "withdrawn": 0, "settled": 0}
     active = await board_crud.active_builders(tick.db, repo=tick.tracker)
+    if items is not None:
+        await _settle_orphans(tick, items, active, out)
+        if out["settled"]:
+            active = await board_crud.active_builders(tick.db, repo=tick.tracker)
+    sessions = await launcher.tmux_sessions() if active else {}
     out["watched"] = len(active)
     if active:
-        sessions = await launcher.tmux_sessions()
         for row in active:
             try:
                 await _one(tick, row, sessions, items, out)
@@ -283,6 +289,35 @@ async def _watch(tick, items: list[dict] | None) -> dict:
     if items is not None:
         await _withdrawn(tick, items, out)
     return out
+
+
+async def _settle_orphans(tick, items: list[dict], active: list[dict], out: dict) -> None:
+    """Record a builder whose launch outcome was never written: its session
+    carries the key (the post-launch tmux read failed, or a slow attempt came up)
+    but there is no builder_launched row, and its card is no longer in Build, so
+    the launcher's own settle never sees it. Recorded from its attempt row, so
+    the watch can pause or close it. A failed tmux read skips this pass."""
+    from genesis.board import launcher
+    from genesis.db.crud import board as board_crud
+
+    try:
+        sessions = await launcher.tmux_sessions()
+    except Exception:
+        logger.warning("builder watch: tmux read for unrecorded builders failed", exc_info=True)
+        return
+    watched = {(r.get("detail") or {}).get("key") for r in active}
+    in_build = {
+        it.get("id") for it in items if (it.get("status") or {}).get("name") == launcher.BUILD
+    }
+    for key in sorted({k for k in sessions.values() if k} - watched):
+        if key.rsplit("@", 1)[0] in in_build:
+            continue  # the launcher settles a move still in Build
+        attempts = await board_crud.attempts_of(tick.db, repo=tick.tracker, key=key)
+        if attempts:
+            a = attempts[0]
+            card = {"key": key, "number": a["issue_number"], "item": a.get("project_item_id")}
+            await launcher._launched(tick, card, a, settled_by="watch")
+            out["settled"] += 1
 
 
 async def _one(tick, row: dict, sessions: dict, items, out: dict) -> None:
@@ -321,10 +356,10 @@ async def _one(tick, row: dict, sessions: dict, items, out: dict) -> None:
         if session_alive(session_id):
             return  # its claude outlived the session: not an exit, not resumable yet
         if card is None:
-            pr_opened = await _pr_opened_live(tick, number)
-            if pr_opened is _UNKNOWN:
+            live = await _live_state(tick, number)
+            if live is _UNKNOWN:
                 return
-            finished = pr_opened is not None
+            pr_opened, finished = live
         if pr_opened is not None or finished:
             out["closed"] += 1
             await _row(tick, "builder_closed", "c", base, reason="ended after its work finished")
@@ -346,8 +381,15 @@ async def _one(tick, row: dict, sessions: dict, items, out: dict) -> None:
                 f"exited:{key}",
             )
         return
-    if items is None or card is None:
+    if items is None:
         return
+    if card is None:
+        # Off the board: closed only once its issue is CLOSED (read live); the
+        # live read has no PR creation time for the one-hour rule.
+        live = await _live_state(tick, number)
+        if live is _UNKNOWN or not live[1]:
+            return
+        finished = True
 
     if pr_opened is not None or finished:
         if pr_opened is not None and not finished and tick.now - pr_opened < CLOSE_AFTER:
@@ -383,13 +425,13 @@ async def _one(tick, row: dict, sessions: dict, items, out: dict) -> None:
 
 
 def _finished(card: dict | None) -> bool:
-    """The card says the work is done: its issue is closed (a merged ``Closes``
-    PR closes it), or it sits in Done. GitHub lists only OPEN closing PRs on the
-    board read, so a merged one is seen this way, never as an open PR."""
+    """The issue is closed (a merged ``Closes`` PR closes it): the launcher's own
+    finished rule, so the two never disagree. GitHub lists only OPEN closing PRs
+    on the board read, so a merged one is seen this way. A card moved to Done by
+    hand on an open issue is not finished."""
     if card is None:
         return False
-    content = card.get("content") or {}
-    return content.get("state") == "CLOSED" or (card.get("status") or {}).get("name") == "Done"
+    return (card.get("content") or {}).get("state") == "CLOSED"
 
 
 async def _session_for(tick, key: str, number: int, slot: int, recorded: str | None) -> str | None:

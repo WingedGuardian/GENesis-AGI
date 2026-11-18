@@ -782,11 +782,11 @@ async def test_a_gate_that_keeps_failing_reaches_three_strikes_and_tells_the_own
 async def test_a_launch_whose_outcome_cannot_be_read_holds_its_place(db, world, monkeypatch):
     """The tmux read after a launch failed: the next card must not start too."""
     await _arm(db)
-    reads = {"n": 0}
+    reads = {"failed": False}
 
     async def flaky():
-        reads["n"] += 1
-        if reads["n"] == 2:  # the read right after the first launch
+        if world.launches and not reads["failed"]:  # the read right after the first launch
+            reads["failed"] = True
             raise RuntimeError("tmux hiccup")
         return dict(world.sessions)
 
@@ -1013,7 +1013,8 @@ async def test_units_are_read_before_sessions(db, world):
         await _run(db, [_card()])
     finally:
         launcher.starting_units, launcher.tmux_sessions = real_units, real_sessions
-    assert order[:2] == ["units", "sessions"]
+    # The launcher's own pair: its units read comes right before its sessions read.
+    assert order[order.index("units") + 1] == "sessions", order
 
 
 async def test_a_running_launch_unit_holds_a_place(db, world):

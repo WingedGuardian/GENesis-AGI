@@ -45,6 +45,7 @@ def stops(world, monkeypatch, tmp_path):
     monkeypatch.setattr(builder_watch, "send_term", lambda pid: state["signalled"].append(pid))
     monkeypatch.setattr(builder_watch, "alive", lambda pid: False)
     monkeypatch.setattr(builder_watch, "STOP_WAIT_S", 1)
+    monkeypatch.setattr(builder_watch, "session_alive", lambda sid: False)
 
     async def kill_session(slot):
         state["killed"].append(slot)
@@ -247,7 +248,7 @@ async def test_a_builder_closes_an_hour_after_its_pr_unless_attached(
     assert (stops["killed"] == [9]) is closes
 
 
-async def test_a_close_frees_the_place_for_the_next_card_in_the_same_pass(db, world, stops):
+async def test_a_finished_builder_does_not_hold_the_next_cards_place(db, world, stops):
     await _arm(db)
     first = _card("I1", number=5, moved=NOW - timedelta(hours=3))
     await _running(db, world, first)
@@ -462,15 +463,13 @@ async def test_live_builders_and_open_holds_are_one_query_each(db):
 # ── adversarial audit of the watch ──────────────────────────────────────────
 
 
-@pytest.mark.parametrize("how", ["closed", "done"])
-async def test_a_builder_whose_work_finished_is_closed_and_frees_its_place(db, world, stops, how):
+async def test_a_builder_whose_issue_closed_is_closed_and_frees_its_place(db, world, stops):
     """A merged PR closes the issue and drops out of the board's open closers."""
     await _arm(db)
     card = _card(moved=NOW - timedelta(hours=3))
     await _running(db, world, card)
-    moved = _moved(card, "Done" if how == "done" else "In Review")
-    if how == "closed":
-        moved["content"]["state"] = "CLOSED"
+    moved = _moved(card, "In Review")
+    moved["content"]["state"] = "CLOSED"
     rt, out = await _run(db, [moved])
     assert stops["killed"] == [9]
     [row] = await _events(db, "builder_closed")
@@ -541,3 +540,114 @@ def test_session_alive_reads_command_lines(tmp_path):
     assert builder_watch.session_alive("sess-x", proc) is True
     assert builder_watch.session_alive("sess-y", proc) is False
     assert builder_watch.session_alive(None, proc) is False
+
+
+async def test_a_card_moved_to_done_by_hand_on_an_open_issue_is_not_finished(db, world, stops):
+    """The watch and the launcher share one rule: the issue CLOSED, not the column."""
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    await _running(db, world, card)
+    _, out = await _run(db, [_moved(card, "Done")])
+    assert stops["killed"] == [] and await _events(db, "builder_closed") == []
+
+
+async def test_an_off_board_builder_is_closed_once_its_issue_closed(db, world, stops):
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    await _running(db, world, card)
+    world.facts = {**world.facts, "state": "CLOSED"}
+    _, out = await _run(db, [])  # the card left the board
+    assert stops["killed"] == [9]
+    [row] = await _events(db, "builder_closed")
+    assert row["reason"] == "its issue closed"
+
+
+async def test_an_off_board_builder_with_an_open_issue_keeps_running(db, world, stops):
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    await _running(db, world, card)
+    _, out = await _run(db, [])
+    assert stops["killed"] == [] and await _events(db, "builder_closed") == []
+
+
+async def test_an_exit_after_the_issue_closed_off_board_is_closed_not_exited(db, world, stops):
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    await _running(db, world, card)
+    world.sessions.clear()
+    world.facts = {**world.facts, "state": "CLOSED"}
+    _, out = await _run(db, [])
+    assert await _events(db, "builder_exited") == []
+    assert len(await _events(db, "builder_closed")) == 1
+
+
+async def test_a_builder_with_no_launched_row_is_recorded_and_watched(db, world, stops):
+    """The post-launch tmux read failed, then the card went back to Ready: the
+    builder still comes up and must be paused, not left running unseen."""
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    key = _key(card)
+    async with board_crud.owned_connection(db) as own:
+        await board_crud.append_event(
+            own,
+            event="builder_launching",
+            now=(NOW - timedelta(hours=3)).isoformat(),
+            repo=REPO,
+            issue_number=card["content"]["number"],
+            project_item_id=card["id"],
+            attempt=1,
+            worker="board_launcher",
+            observed_change_key=f"{key}#a1",
+            detail={"key": key, "slot": 9, "session_id": "s-1"},
+        )
+    world.sessions["cc-9"] = key
+    _, out = await _run(db, [_moved(card, "Ready")])
+    assert len(await _events(db, "builder_launched")) == 1
+    assert stops["killed"] == [9] and len(await _events(db, "builder_paused")) == 1
+
+
+async def test_attempts_of_reads_one_moves_attempts_only(db):
+    async with board_crud.owned_connection(db) as own:
+        for ck in ("k1#a1", "k1#a2", "k10#a1", "k1"):
+            await board_crud.append_event(
+                own,
+                event="builder_launching",
+                now=NOW.isoformat(),
+                repo=REPO,
+                issue_number=1,
+                worker="board_launcher",
+                observed_change_key=ck,
+                detail={"key": ck.split("#")[0]},
+            )
+    got = await board_crud.attempts_of(db, repo=REPO, key="k1")
+    assert [r["observed_change_key"] for r in got] == ["k1#a2", "k1#a1"]
+
+
+async def test_resume_uses_the_session_id_the_watch_recorded_when_it_stopped(
+    db, world, stops, tmp_path, monkeypatch
+):
+    """The launched row can name another attempt's session; the end row names the
+    session that actually ran, so resume reopens that conversation."""
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    key = await _running(db, world, card, sid="sess-launched")
+    world.sessions.clear()
+    async with board_crud.owned_connection(db) as own:
+        await board_crud.append_event(
+            own,
+            event="builder_paused",
+            now=NOW.isoformat(),
+            repo=REPO,
+            issue_number=card["content"]["number"],
+            project_item_id=card["id"],
+            worker="board_launcher",
+            observed_change_key=f"{key}#p",
+            detail={"key": key, "slot": 9, "session_id": "sess-real"},
+        )
+    (tmp_path / "sess-real.jsonl").write_text("{}\n")
+    monkeypatch.setattr(launcher, "_transcript", lambda root, sid: tmp_path / f"{sid}.jsonl")
+    (world.root / ".claude" / "worktrees" / "build-7").mkdir(parents=True)
+    back = _card(card["id"], moved=NOW + timedelta(minutes=2))
+    _, out = await _run(db, [back], now=_later(1))
+    [argv] = world.launches
+    assert "--resume" in argv and argv[argv.index("--session-id") + 1] == "sess-real"

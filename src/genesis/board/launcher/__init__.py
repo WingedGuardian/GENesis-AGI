@@ -698,7 +698,20 @@ def _resume_target(
     ended = {e["event"] for e in history if (e.get("detail") or {}).get("key") == last_key}
     if not ended & {"builder_paused", "builder_exited"} or "builder_closed" in ended:
         return None, None
-    session_id = (last.get("detail") or {}).get("session_id")
+    # The end row carries the session id of the attempt that actually ran (the
+    # watch maps the slot that carried the key); the launched row may name another.
+    end = next(
+        (
+            e
+            for e in history
+            if e["event"] in ("builder_paused", "builder_exited")
+            and (e.get("detail") or {}).get("key") == last_key
+        ),
+        None,
+    )
+    session_id = ((end or {}).get("detail") or {}).get("session_id") or (
+        last.get("detail") or {}
+    ).get("session_id")
     if not session_id or not _transcript(root, session_id).is_file():
         return None, "its earlier conversation could not be found"
     from genesis.board.builder_watch import session_alive

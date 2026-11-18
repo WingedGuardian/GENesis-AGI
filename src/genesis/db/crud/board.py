@@ -862,6 +862,17 @@ async def added_numbers(db: aiosqlite.Connection, *, repo: str) -> set[int]:
     return {row[0] for row in await cur.fetchall()}
 
 
+async def attempts_of(db: aiosqlite.Connection, *, repo: str, key: str) -> list[dict]:
+    """The ``builder_launching`` rows of the move *key* (change keys ``<key>#a<n>``),
+    newest first. One move's attempts only, never a history scan."""
+    cur = await db.execute(
+        "SELECT * FROM board_events WHERE event = 'builder_launching' AND repo = ? "
+        "AND substr(observed_change_key, 1, length(?) + 2) = ? || '#a' ORDER BY id DESC",
+        ((repo or "").lower(), key, key),
+    )
+    return [_decoded(item) for item in await _all(cur)]
+
+
 async def active_builders(db: aiosqlite.Connection, *, repo: str) -> list[dict]:
     """``builder_launched`` rows in *repo* whose move has no ``builder_paused``,
     ``builder_exited`` or ``builder_closed`` row yet (the builder launcher's
