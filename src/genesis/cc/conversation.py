@@ -2295,6 +2295,9 @@ class ConversationLoop:
                 chat_id,
                 thread_id=int(thread_id) if thread_id else None,
                 limit=self.RECOVERY_CONTEXT_MESSAGES,
+                # Interim progress rows are narration around the turn, not its
+                # answer; leaving them out keeps the budget on the turns (#4849).
+                exclude_senders=("genesis-progress",),
             )
             if not messages:
                 return ""
