@@ -161,6 +161,15 @@ _NO_OPEN_QUESTION_AUTHORITY = [
     "mcp__genesis-health__open_question_block",
 ]
 
+# Edge transcript text (#4856) is private to the owner, so it is reachable only
+# where the owner is the conversation party. Every background profile can
+# read outside content or send outward (read-only `observe` keeps the web
+# tools), so a session holding the text could be steered into relaying it.
+# Same three layers as open-question authority: in _UNIVERSAL_DISALLOW, never
+# re-enabled by a tool_exception, and refused server-side for any dispatched,
+# unsupervised caller by guard_human_gate in the tool itself.
+_NO_EDGE_TRANSCRIPTS = ["mcp__genesis-health__edge_transcripts"]
+
 _UNIVERSAL_DISALLOW = [
     "Bash",
     "Edit",
@@ -204,6 +213,8 @@ _UNIVERSAL_DISALLOW = [
     # owner's call. Universal for the same reason as the gate above: an
     # install-local overlay profile built from universal_disallow inherits it.
     *_NO_OPEN_QUESTION_AUTHORITY,
+    # ── Owner-private edge transcripts ────────────────────────────
+    *_NO_EDGE_TRANSCRIPTS,
     # ── User-scoped MCP servers (defense-in-depth) ────────────────
     # strict_mcp_config (CCInvocation default True) already drops these by making
     # --mcp-config authoritative; deny them by name too so a site that opts out of
@@ -2058,6 +2069,9 @@ class DirectSessionRunner:
             # And for answering the owner's open questions: resolve/unblock is
             # owner authority on every profile, so no exception re-grants it.
             exceptions -= set(_NO_OPEN_QUESTION_AUTHORITY)
+            # And for owner-private edge transcripts (#4856): no profile reaches
+            # them, so no exception may re-grant them either.
+            exceptions -= set(_NO_EDGE_TRANSCRIPTS)
             disallowed = [t for t in disallowed if t not in exceptions]
 
         # Give background sessions access to Genesis MCP servers. Profile

@@ -1390,3 +1390,30 @@ def test_explicit_skills_keep_web_research():
     assert "web-research" in _resolve_skills(
         DirectSessionRequest(prompt="x", profile="research", skills=[])
     )
+
+
+_EDGE_TRANSCRIPTS = "mcp__genesis-health__edge_transcripts"
+
+
+def test_edge_transcripts_is_denied_on_every_profile_including_observe():
+    """Edge transcript text is owner-private (#4856). observe keeps outbound web
+    tools, so read + fetch would carry the text out: no profile may reach it."""
+    allowed = {name for name in _SHIPPED_PROFILE_NAMES if _EDGE_TRANSCRIPTS not in PROFILES[name]}
+    assert not allowed, sorted(allowed)
+
+
+def test_edge_transcripts_is_universal_so_overlay_profiles_inherit_it():
+    from genesis.cc.direct_session import _UNIVERSAL_DISALLOW
+
+    assert _EDGE_TRANSCRIPTS in _UNIVERSAL_DISALLOW
+
+
+@pytest.mark.parametrize("profile", list(PROFILES))
+def test_edge_transcripts_cannot_be_re_enabled_via_tool_exceptions(profile):
+    """A denial that a per-request exception can lift is not a denial."""
+    runner = _make_runner()
+    req = DirectSessionRequest(
+        prompt="t", profile=profile, model=CCModel.SONNET, tool_exceptions=(_EDGE_TRANSCRIPTS,)
+    )
+    inv = runner._build_invocation(req, "test-session")
+    assert _EDGE_TRANSCRIPTS in inv.disallowed_tools
