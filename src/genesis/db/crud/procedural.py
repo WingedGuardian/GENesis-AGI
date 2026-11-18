@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 
 import aiosqlite
@@ -46,6 +47,53 @@ def _kind_clause(lessons: bool | None) -> str:
     return " AND lesson IS NOT NULL" if lessons else " AND lesson IS NULL"
 
 
+_logger = logging.getLogger(__name__)
+# The free-text fields a procedure carries (extracted, so possibly holding what a
+# session typed). Every writer below passes them through _scrub (#4859).
+_SCRUBBED_FIELDS = (
+    "principle", "scenario", "steps", "attempted_workarounds",
+    "extraction_context", "lesson", "failure_modes",
+)
+
+
+# Fields stored as JSON documents; the others are prose and are never parsed.
+_JSON_FIELDS = frozenset({"steps", "attempted_workarounds", "lesson", "failure_modes"})
+_WITHHELD = "[withheld: credential scrub could not run]"
+
+
+def _scrub(id: str, fields: dict) -> dict:
+    """Redact credential spans from the free-text fields, on parsed values (a JSON
+    field is parsed first, so a cut can never break the document). A field the scrub
+    cannot process is withheld and the row is still written: protecting a secret
+    never drops a write."""
+    from genesis.learning.procedural.credential_scrub import scrub_value
+
+    found: list[str] = []
+    out = dict(fields)
+    for key in _SCRUBBED_FIELDS:
+        value = out.get(key)
+        if value is None:
+            continue
+        try:
+            if key in _JSON_FIELDS and isinstance(value, str) and value[:1] in "[{":
+                try:
+                    parsed = json.loads(value)
+                except ValueError:
+                    parsed = None
+                if parsed is not None:
+                    out[key] = json.dumps(scrub_value(parsed, found), ensure_ascii=False)
+                    continue
+            out[key] = scrub_value(value, found)
+        except Exception:
+            _logger.error("Procedure %s: credential scrub failed on %s; withheld", id, key, exc_info=True)
+            out[key] = [_WITHHELD] if isinstance(value, list) else (
+                json.dumps([_WITHHELD]) if key in _JSON_FIELDS and isinstance(value, str) else _WITHHELD
+            )
+    if found:
+        _logger.warning("Procedure %s: redacted credential spans (%s)", id, ", ".join(sorted(set(found))))
+    return out
+
+
 async def create(
     db: aiosqlite.Connection,
     *,
@@ -76,6 +124,14 @@ async def create(
 ) -> str:
     """Insert a row. A ``deprecated_reason`` writes it deprecated in the same
     statement, so no reader ever sees it live in between."""
+    clean = _scrub(id, {
+        "principle": principle, "scenario": scenario, "steps": steps,
+        "attempted_workarounds": attempted_workarounds,
+        "extraction_context": extraction_context, "lesson": lesson,
+    })
+    principle, scenario, steps = clean["principle"], clean["scenario"], clean["steps"]
+    attempted_workarounds = clean["attempted_workarounds"]
+    extraction_context, lesson = clean["extraction_context"], clean["lesson"]
     await db.execute(
         """INSERT INTO procedural_memory
            (id, person_id, task_type, principle, scenario, steps, tools_used,
@@ -135,6 +191,12 @@ async def upsert(
     given, so an upsert that does not carry them cannot turn a lesson back
     into an earned row.
     """
+    clean = _scrub(id, {
+        "principle": principle, "steps": steps,
+        "attempted_workarounds": attempted_workarounds, "lesson": lesson,
+    })
+    principle, steps = clean["principle"], clean["steps"]
+    attempted_workarounds, lesson = clean["attempted_workarounds"], clean["lesson"]
     await db.execute(
         """INSERT INTO procedural_memory
            (id, person_id, task_type, principle, steps, tools_used, context_tags,
@@ -332,6 +394,7 @@ _INSERT_ONLY = ("created_session_id", "created_at")
 async def update(db: aiosqlite.Connection, id: str, **fields) -> bool:
     if not fields:
         return False
+    fields = _scrub(id, fields)
     fixed = [k for k in _INSERT_ONLY if k in fields]
     if fixed:
         raise ValueError(f"procedural_memory {', '.join(fixed)} is set at insert only")
