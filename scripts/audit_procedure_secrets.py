@@ -8,7 +8,10 @@ names that matched, and per span whether it looks like a real value or a
 placeholder (``$VAR``, ``<...>``, ``{{...}}``, ``***``, ``xxx``). A span is judged on
 the characters the scrub removed, so ``value_spans`` is an UPPER bound: a ``$`` or
 ``<`` just outside the removed span is missed. Redacting what it finds is a
-separate, owner-approved step.
+separate, owner-approved step. Fields are scanned exactly as the write path scrubs
+them (a JSON field decoded first). A row with a field the scrub could not process
+is reported, and the run exits 2: the scan is incomplete. ``--out`` naming the
+database or its -wal/-shm sidecar is refused (exit 1).
 
 Usage: audit_procedure_secrets.py [--db PATH] [--out PATH]
 """
@@ -18,6 +21,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -26,17 +30,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from genesis.learning.procedural.credential_scrub import ScrubFailed, scrub_text  # noqa: E402
+from genesis.db.crud import procedural  # noqa: E402 - the write path's own field handling
 
-_FIELDS = (
-    "principle",
-    "scenario",
-    "steps",
-    "attempted_workarounds",
-    "extraction_context",
-    "lesson",
-    "failure_modes",
-)
+_FIELDS = procedural._SCRUBBED_FIELDS
+json_field_document, scrub_field = procedural.json_field_document, procedural.scrub_field
+
 _PLACEHOLDER = re.compile(r"[$<{]|\*{3}|xxx|redacted|example|changeme", re.IGNORECASE)
 
 
@@ -67,15 +65,23 @@ def audit(db_path: Path) -> dict:
             text = row[field]
             if not text:
                 continue
+            # The write path's own handling: a JSON field is decoded and scrubbed
+            # value by value (escaped quotes and keys included), prose as text.
+            found: list[str] = []
             try:
-                cleaned, found = scrub_text(text)
-            except ScrubFailed:
+                cleaned = scrub_field(field, text, found)
+            except Exception:  # noqa: BLE001 - the write path withholds on any failure
                 withheld.add(field)
                 continue
+            if "withheld" in found:  # a string in it could not be processed
+                withheld.add(field)
+                found = [name for name in found if name != "withheld"]
             if found:
                 names.update(found)
-                kinds += _spans(text, cleaned)
-        if names:
+                document = json_field_document(field, text)
+                base = text if document is None else json.dumps(document, ensure_ascii=False)
+                kinds += _spans(base, cleaned)
+        if names or withheld:
             findings.append(
                 {
                     "id": row["id"],
@@ -84,7 +90,7 @@ def audit(db_path: Path) -> dict:
                     "patterns": sorted(names),
                     "value_spans": kinds.count("value"),
                     "placeholder_spans": kinds.count("placeholder"),
-                "withheld_fields": sorted(withheld),
+                    "withheld_fields": sorted(withheld),
                 }
             )
     return {
@@ -105,6 +111,15 @@ def main(argv: list[str] | None = None) -> int:
         "--out", type=Path, default=Path.home() / ".genesis/output/procedure-secrets-audit.json"
     )
     args = parser.parse_args(argv)
+    # The database and its WAL sidecars: overwriting any of them corrupts it.
+    guarded = [args.db, *(args.db.with_name(args.db.name + s) for s in ("-wal", "-shm"))]
+    if any(
+        args.out.resolve() == path.resolve()
+        or (args.out.exists() and path.exists() and os.path.samefile(args.out, path))
+        for path in guarded
+    ):
+        print(f"refusing to write the report over the database or a sidecar: {args.out}", file=sys.stderr)
+        return 1
     report = audit(args.db)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2) + "\n")
@@ -112,6 +127,13 @@ def main(argv: list[str] | None = None) -> int:
         f"{report['with_findings']} of {report['procedures']} procedures would change "
         f"({report['with_value_spans']} with value-like spans); report: {args.out}"
     )
+    if report["with_withheld_fields"]:
+        print(
+            f"INCOMPLETE: {report['with_withheld_fields']} procedures had fields the scrub "
+            "could not process; they were not scanned",
+            file=sys.stderr,
+        )
+        return 2
     return 0
 
 

@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 
 import aiosqlite
 
+from genesis.learning.procedural.credential_scrub import WITHHELD, scrub_value
+
 
 def _json_or_none(value: dict | None) -> str | None:
     return None if value is None else json.dumps(value)
@@ -58,16 +60,40 @@ _SCRUBBED_FIELDS = (
 
 # Fields stored as JSON documents; the others are prose and are never parsed.
 _JSON_FIELDS = frozenset({"steps", "attempted_workarounds", "lesson", "failure_modes"})
-_WITHHELD = "[withheld: credential scrub could not run]"
+_WITHHELD = WITHHELD
+
+
+def json_field_document(key: str, value):
+    """The parsed document of a JSON field given as text (surrounding whitespace
+    allowed), else None: prose, a non-JSON field, or text that does not parse."""
+    if key not in _JSON_FIELDS or not isinstance(value, str) or value.lstrip()[:1] not in ("[", "{"):
+        return None
+    try:
+        return json.loads(value)
+    except ValueError:
+        return None
+
+
+def scrub_field(key: str, value, found: list[str]):
+    """One field's value with credential spans redacted, on parsed values (a JSON
+    field given as text is parsed first, so a cut can never break the document).
+    A string the scrub cannot process is withheld on its own (siblings and shape
+    survive, ``found`` names "withheld"); a field given as one such string is
+    withheld whole, as a JSON document for a JSON field. Raises only when scrubbed
+    keys collide. Shared by the writers below and the audit."""
+    parsed = json_field_document(key, value)
+    if parsed is not None:
+        return json.dumps(scrub_value(parsed, found), ensure_ascii=False)
+    result = scrub_value(value, found)
+    if result == _WITHHELD and key in _JSON_FIELDS and isinstance(value, str):
+        return json.dumps([_WITHHELD])
+    return result
 
 
 def _scrub(id: str, fields: dict) -> dict:
-    """Redact credential spans from the free-text fields, on parsed values (a JSON
-    field is parsed first, so a cut can never break the document). A field the scrub
-    cannot process is withheld and the row is still written: protecting a secret
-    never drops a write."""
-    from genesis.learning.procedural.credential_scrub import scrub_value
-
+    """Redact credential spans from the free-text fields (``scrub_field``). What the
+    scrub cannot process is withheld and the row is still written: protecting a
+    secret never drops a write."""
     found: list[str] = []
     out = dict(fields)
     for key in _SCRUBBED_FIELDS:
@@ -75,15 +101,10 @@ def _scrub(id: str, fields: dict) -> dict:
         if value is None:
             continue
         try:
-            if key in _JSON_FIELDS and isinstance(value, str) and value[:1] in "[{":
-                try:
-                    parsed = json.loads(value)
-                except ValueError:
-                    parsed = None
-                if parsed is not None:
-                    out[key] = json.dumps(scrub_value(parsed, found), ensure_ascii=False)
-                    continue
-            out[key] = scrub_value(value, found)
+            before = found.count("withheld")
+            out[key] = scrub_field(key, value, found)
+            if found.count("withheld") > before:
+                _logger.error("Procedure %s: credential scrub could not run on part of %s; withheld", id, key)
         except Exception:
             _logger.error("Procedure %s: credential scrub failed on %s; withheld", id, key, exc_info=True)
             out[key] = [_WITHHELD] if isinstance(value, list) else (

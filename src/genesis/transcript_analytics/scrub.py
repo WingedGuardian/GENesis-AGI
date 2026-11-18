@@ -58,6 +58,19 @@ def available() -> bool:
     return _scrub is not None
 
 
+def credential_key(key: str) -> bool | None:
+    """Whether the shared policy withholds a member's value by its key alone: the
+    structured label vocabulary, or the quoted-key arm probed with a stand-in value
+    (which also knows ``secret``, ``token``, ``passwd``, ``userPassword``). None when
+    the policy is unavailable; a failing probe answers True."""
+    if _scrub is None or _label_kind is None:
+        return None
+    if _label_kind(key) is not None:
+        return True
+    probe = json.dumps({key: "x"})
+    return _scrub(probe) != probe
+
+
 def _object_pairs():
     duplicates = [False]
 

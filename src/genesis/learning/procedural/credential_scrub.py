@@ -30,26 +30,58 @@ class ScrubFailed(Exception):
 
 
 _NOT_A_VALUE = r"(?![$`(])"  # a shell variable or substitution names a secret
+# sshpass -p takes one argument and it is always the password, so the whole shell
+# word is redacted whatever its length: single- or double-quoted (each body stops
+# only at its own quote; an unclosed quote runs to the line end) or bare. Other
+# options may come first (-e, -v, -P <prompt>, -o <x>; those that take an argument
+# keep it), and any whitespace (a non-breaking space, a newline) or a backslash-
+# newline continuation may separate -p from its value. A word starting with a
+# variable or substitution, bare or double-quoted, names a secret and is kept; a
+# single-quoted one is literal text and is redacted.
+_GAP = r"(?:[^\S\n]|\\\r?\n)"  # within one shell command line
+# One shell word: quoted parts (either quote) and bare characters, joined; an
+# option's argument such as -P "Enter password:" is read whole.
+_WORD_PART = r"'[^'\n]*'|\"(?:[^\"\\\n]|\\.)*\"|\\."
+_WORD = r"(?:" + _WORD_PART + r"|[^\s'\"\\-])(?:" + _WORD_PART + r"|[^\s'\"\\])*"
 _SSHPASS = re.compile(
-    r"(\bsshpass\s+-p\s*)"
-    r"(?:(?P<q>['\"])" + _NOT_A_VALUE + r"[^'\"\n]+(?P=q)"
-    r"|" + _NOT_A_VALUE + r"[^\s'\"]{3,})"
+    r"(\bsshpass(?:"
+    + _GAP
+    + r"+-(?:[Pfdo]"
+    + _GAP
+    + r"*"
+    + _WORD
+    + r"|[^\sp]\S*))*"
+    + _GAP
+    + r"+-p"
+    + _GAP
+    + r"*(?:\n"
+    + _GAP
+    + r"*)?)"  # at most one bare newline; the group keeps the two runs unambiguous
+    r"(?!\"?[$`(])"
+    r"(?:'[^'\n]*'?|\"(?:[^\"\\\n]|\\.)*\"?|[^\s'\"\\]|\\.)+"
 )
 _LABEL = r"\b(?:with\s+)?(?:password|passwd|pwd|passphrase)\b(?:\s+is|\s*[:=])?"
-# Quoted: any 3+ characters between matching quotes.
+# Quoted: any 3+ characters between matching quotes; each body stops only at its
+# own quote, so a value holding the other kind is redacted whole.
 _PASSWORD_QUOTED = re.compile(
-    r"(?i)(" + _LABEL + r"\s*)(?P<q>['\"`])" + _NOT_A_VALUE + r"[^'\"`\n]{3,}(?P=q)"
+    r"(?i)(" + _LABEL + r"\s*)"
+    r"(?:'" + _NOT_A_VALUE + r"[^'\n]{3,}'"
+    r"|\"" + _NOT_A_VALUE + r"[^\"\n]{3,}\""
+    r"|`" + _NOT_A_VALUE + r"[^`\n]{3,}`)"
 )
 # Bare: 6+ characters with a digit or symbol (an identifier like reference_lookup is
-# not one), not a path or flag. "password reset" and "password manager" never match;
+# not one), not a path or flag. A leading $ names a variable and is kept; a later $
+# counts as a symbol. "password reset" and "password manager" never match;
 # "password 2fa-enabled" does, which costs one redacted phrase.
 _PASSWORD_BARE = re.compile(
     r"(?i)("
     + _LABEL
     + r"\s+)"
     + _NOT_A_VALUE
-    + r"(?![-/~<{*])(?=[^\s'\"`,;)]*[\d!@#%^&*+=?~])[^\s'\"`,;)]{6,}"
+    + r"(?![-/~<{*])(?=[^\s'\"`,;)]*[\d!@#$%^&*+=?~])[^\s'\"`,;)]{6,}"
 )
+# What a string the scrub could not process is stored as.
+WITHHELD = "[withheld: credential scrub could not run]"
 
 
 def _shared_scrub(text: str) -> str:
@@ -61,6 +93,26 @@ def _shared_scrub(text: str) -> str:
     if failed or result is None:
         raise ScrubFailed("shared scrubber withheld the text")
     return result
+
+
+def credential_key(key: str) -> bool:
+    """True when the shared policy withholds a member's value by its key alone."""
+    from genesis.transcript_analytics import scrub as shared
+
+    verdict = shared.credential_key(key)
+    if verdict is None:
+        raise ScrubFailed("shared scrubber unavailable")
+    return verdict
+
+
+def _credential_key_or_withhold(key: str, found: list[str]) -> bool:
+    """credential_key; when the policy cannot answer, the value is withheld too
+    (True), so it is never stored unchecked."""
+    try:
+        return credential_key(key)
+    except ScrubFailed:
+        found.append("withheld")
+        return True
 
 
 def scrub_text(text: str) -> tuple[str, list[str]]:
@@ -82,9 +134,19 @@ def scrub_text(text: str) -> tuple[str, list[str]]:
 
 
 def scrub_value(value: Any, found: list[str]) -> Any:
-    """Scrub every string inside ``value`` (str, list, tuple, dict); others pass."""
+    """Scrub every string inside ``value`` (str, list, tuple, dict); others pass.
+
+    A dict member under a credential-named key (``password``, ``token``,
+    ``api_key``: the shared structured policy) is always redacted; keys are
+    scrubbed too. A string the scrub cannot process becomes ``WITHHELD`` on its
+    own, so its siblings and the shape around it survive; ``found`` then names
+    "withheld". Scrubbed keys that collide raise ScrubFailed."""
     if isinstance(value, str):
-        result, names = scrub_text(value)
+        try:
+            result, names = scrub_text(value)
+        except ScrubFailed:
+            found.append("withheld")
+            return WITHHELD
         found += names
         return result
     if isinstance(value, list):
@@ -92,5 +154,15 @@ def scrub_value(value: Any, found: list[str]) -> Any:
     if isinstance(value, tuple):
         return tuple(scrub_value(v, found) for v in value)
     if isinstance(value, dict):
-        return {k: scrub_value(v, found) for k, v in value.items()}
+        out: dict = {}
+        for k, v in value.items():
+            key = scrub_value(k, found)
+            if key in out:
+                raise ScrubFailed("scrubbed keys collide")
+            if isinstance(k, str) and v is not None and _credential_key_or_withhold(k, found):
+                out[key] = "[redacted]"
+                found.append("key")
+            else:
+                out[key] = scrub_value(v, found)
+        return out
     return value
