@@ -539,17 +539,17 @@ comment and label moves it.
    other --body-file <prose>` (plus `--intended`, `--change`, `--coderabbit` as
    they apply; `--help` lists them), then run the one `gh` command it prints
    (the script never posts). Answer the
-   author's open questions in the same comment. Record `--checker other`: you
+   author's open questions in the same comment, except one Devin's bot is waiting
+   on: that answer goes in its own comment without `(aside)`. Record `--checker other`: you
    are not the builder. If this session built the PR, the read is done by a
    fresh-context subagent given this step's text, the basis, the PR body, its
    commit messages and human comments, and the diff, but never your own reading
    of them; record its verdict as `--checker other` and say in the prose that a
-   subagent made it. On a Devin-built PR, post nothing: every comment there
-   whose first line is not `(aside)` can start a paid Devin session, and the
-   marker must come first. Keep the read in your session output until the
-   marker parser accepts a leading `(aside)` line; the merge question cites
-   that read, and a later session redoes it. The comment opens with one closed-grammar header that
-   code reads, and prose under it that code never parses:
+   subagent made it. On a Devin-built PR, compose with `--aside`: every comment
+   there whose first line is not `(aside)` can start a paid Devin session, so
+   `compose` writes that line first, and the parser accepts no other line before
+   the header. After that optional line, the comment is one closed-grammar
+   header that code reads, and prose under it that code never parses:
 
    ```
    <!-- genesis-delivery-check: head=<40 hex> basis=<B> verdict=<V> scope=<S> [intended=<I>] [change=<C>] [coderabbit=<R>] [checker=<K>] [outcome=<O>] -->
