@@ -36,8 +36,8 @@ read ``off_diff``.
 
 The review loop ends (``loop_ended``) once the newest round the rules read is
 round 5 or later and drew no floor finding, with no floor finding on any other
-round (a late one, or a round a merge produced) since that round's head was
-committed. The commit gate then
+round (a late one, or a round a merge produced), on a head still in the PR,
+since that round's head was committed. The commit gate then
 denies content commits, read from the budget alone (``_loop_end`` in
 scripts/review_enforcement_commit.py).
 
@@ -240,20 +240,29 @@ def round_records(budget: Mapping[str, Any]) -> dict[str, RoundRecord] | None:
     return out
 
 
-#: Every keyed budget finding as ``(submitted_at, level, key)``, any round.
+#: Every budget finding on a live head as ``(submitted_at, level, key)``, any round.
 Findings = tuple[tuple[datetime | None, bool | None, str], ...]
 
 
 def late_floor(budget: Mapping[str, Any]) -> Findings | None:
-    """Every keyed finding in the budget, one row per key: its submitted time
-    and its level as written (None when unreadable). None when the findings
-    list cannot be read, so the loop's end is unknown (fails open)."""
+    """Every finding in the budget on a head still in the PR's commit graph,
+    one row per key: its submitted time and its level as written (None when
+    unreadable). A finding on a head a force-push dropped is skipped before it
+    is read, as ``review_late.late_findings`` does, so an obsolete review
+    never reopens the loop. None when the findings list cannot be read, so
+    the loop's end is unknown (fails open)."""
     findings = budget.get("findings")
     if not isinstance(findings, list):
         return None
+    in_graph, _ = review_late._ancestry(budget)
     rows: list[tuple[datetime | None, bool | None, str]] = []
     for item in findings:
-        if not isinstance(item, Mapping) or not isinstance(item.get("keys"), list):
+        if not isinstance(item, Mapping):
+            return None
+        head = item.get("head")
+        if not isinstance(head, str) or head not in in_graph:
+            continue
+        if not isinstance(item.get("keys"), list):
             return None
         keys = item["keys"]
         levels = item.get("blocking")

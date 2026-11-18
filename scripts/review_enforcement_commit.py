@@ -1214,8 +1214,9 @@ class _LoopEnd(NamedTuple):
 def _loop_end(budget: dict) -> _LoopEnd:
     """Whether the PR's review loop is over (``review_past_terminal.loop_ended``),
     read ONCE per commit and handed to admission and the ended branch as a
-    value. Never raises: any failure is "not ended" with an advisory (unknown
-    is never a refusal, owner ruling a34481ca). Also queues the advisory when
+    value. Never raises: an exception is "not ended" with an advisory, and an
+    end the budget cannot tell (``loop_ended`` None) is "not ended" quietly
+    (unknown is never a refusal, owner ruling a34481ca). Also queues the advisory when
     the rules are off for the PR (``rules_off_round``)."""
     try:
         import review_past_terminal as pt  # noqa: PLC0415 — lazy, like review_reflection

@@ -286,12 +286,39 @@ def test_a_floor_finding_older_than_the_newest_head_commit_stays_closed():
 
 def test_an_unkeyed_late_floor_finding_still_reopens_fixing():
     row = {"keys": [None], "blocking": [True], "submitted_at": _iso(T0 + timedelta(hours=5))}
-    assert pt.late_floor({"findings": [row]}) == (
-        (T0 + timedelta(hours=5), True, "an unkeyed finding"),
-    )
     budget = _fix_rounds(5)
     budget["findings"].append({**row, "head": H[1], "round_head": H[1], "late": True})
+    assert (T0 + timedelta(hours=5), True, "an unkeyed finding") in pt.late_floor(budget)
     assert _ended(budget) is False
+
+
+GONE = "e" * 40
+
+
+def test_a_floor_finding_on_a_dropped_head_never_reopens_the_loop():
+    """Round 1 of #4868 (Devin): a force-push dropped head X; a P1 on X after
+    the newest head's commit is an obsolete review, as ``late_findings`` reads
+    it, so the loop stays ended."""
+    late = _rv(GONE, T0 + timedelta(hours=4, minutes=10), 50, badge=P1)
+    budget = _fix_rounds(5, extra_reviews=[late])
+    assert any(item["head"] == GONE for item in budget["findings"])
+    assert all(key != "c500" for _, _, key in pt.late_floor(budget))
+    assert _ended(budget) is True
+
+
+def test_a_dropped_head_finding_with_no_round_is_skipped_too():
+    budget = _fix_rounds(5)
+    row = {"head": GONE, "round_head": None, "keys": ["c600"], "blocking": [True],
+           "submitted_at": _iso(T0 + timedelta(hours=5)), "late": True}
+    budget["findings"].append(row)
+    assert _ended(budget) is True
+
+
+def test_a_malformed_row_on_a_dropped_head_does_not_make_the_end_unknown():
+    budget = _fix_rounds(5)
+    budget["findings"].append({"head": GONE, "keys": "garbled", "submitted_at": None})
+    assert pt.late_floor(budget) is not None
+    assert _ended(budget) is True
 
 
 def test_an_unreadable_head_commit_time_opens_every_late_floor_finding():
