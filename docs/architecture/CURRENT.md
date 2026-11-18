@@ -3013,7 +3013,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: c712f1bde 2026-11-06
+verified: 5acf6b87f 2026-11-15
 ```
 
 - **Peer-handoff surface (2026-09-26)**: a SessionStart hook
@@ -3309,6 +3309,19 @@ verified: c712f1bde 2026-11-06
   idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
   one is age-based and passive. `session_awareness/repo_pulse*.py`.
+- **PR queue worklist (#4519; Part 1 dependency, absent from this stamped
+  `origin/main`)**: Part 1 supplies the read-only hourly sweep
+  (`scripts/pr_queue_sweep.py`,
+  `src/genesis/session_awareness/repo_pulse_gh.py::list_queue_prs`,
+  `scripts/systemd/genesis-pr-queue-sweep.service.template`,
+  `scripts/systemd/genesis-pr-queue-sweep.timer.template`, and the persistent
+  timer inventory in `scripts/uninstall.sh`). The closing-session skill treats
+  its cached list as a lead and reruns the guard
+  (`scripts/hooks/git_push_guard.py`, `--check-pr`) before acting. A parked PR
+  needs a maintainer `## Parked` reason and return condition; the list warns
+  when that comment is missing and shows its age when present. The sweep does
+  not auto-wake parked work or write to GitHub. Live install and timer
+  verification remain pending.
 - **Holdout scenarios** (shipped; per-install data, none in the repo): hidden
   exact checks that builders never see, in `$GENESIS_HOME/holdout/HOLDOUT.md`,
   written only by the `holdout-writer` subagent (regression scenarios from
