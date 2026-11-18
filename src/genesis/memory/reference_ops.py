@@ -59,7 +59,7 @@ from genesis.memory.reference_masks import (
     ValueMask,
     _as_mask,
     _mask_tag,
-    _normalise,
+    _refusal_form,
     _serialised_clean,
     cap_masked,  # noqa: F401 - re-exported
     cap_tag,
@@ -313,7 +313,7 @@ def name_hash(name: str) -> str:
     identity."""
     from genesis.security.card_redaction import redact_text
 
-    return hashlib.sha256(" ".join(_normalise(redact_text(name)).split()).encode()).hexdigest()
+    return hashlib.sha256(" ".join(_refusal_form(redact_text(name)).split()).encode()).hexdigest()
 
 
 def name_origin(name: str, *, insert_only: bool = False) -> str:
