@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS peer_outbox (
     message TEXT NOT NULL,
     created_at TEXT NOT NULL,
     acknowledged_at TEXT,
+    withheld_category TEXT,
     PRIMARY KEY(peer_id,epoch,message_id)
 )
     """,

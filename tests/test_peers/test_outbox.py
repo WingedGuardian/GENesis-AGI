@@ -633,3 +633,130 @@ async def test_dedup_after_retained_delivery_closes_pending_row(bridge, monkeypa
     ).fetchone()
     assert row[0] is not None
     assert len((await Outbox(bridge.registry).poll(bridge.identities["alpha"]))[0]) == 1
+
+
+async def _put(b, text):
+    env, _ = await Outbox(b.registry).prepare("alpha", text)
+    await Outbox(b.registry).put(env)
+    return env
+
+
+async def _notices(b):
+    rows = await (
+        await b.db.execute("SELECT message FROM pending_outreach WHERE channel='telegram'")
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
+async def test_ack_outcome_matrix_records_withheld_and_notifies_once(http_bridge, caplog):
+    b, app, base, owner = http_bridge
+    plain = await _put(b, "A readable message")
+    hidden = await _put(b, "Secret-free text the peer could not read")
+    other = await _put(b, "Another withheld message")
+    async with sdk_client(base) as (client, transport):
+        with caplog.at_level("INFO", logger="genesis.dashboard.routes.agent_api"):
+            page = (await client.get(base + ROOT + "/outbox")).json()
+        assert len(page["messages"]) == 3
+        served = [r.getMessage() for r in caplog.records if "peer_outbox_served" in r.getMessage()]
+        assert len(served) == 3 and all("text_bytes=" in line for line in served)
+        assert any(
+            f"message_id={plain.message_id} text_bytes={len(b'A readable message')}" in line
+            for line in served
+        )
+        assert not any("readable" in line or "Secret-free" in line for line in served)
+
+        def ack(env, body):
+            return client.post(base + ROOT + f"/outbox/{env.message_id}:ack", json=body)
+
+        for bad in (
+            {"outcome": "withheld", "category": "bogus"},
+            {"category": "unknown"},
+            {"outcome": "delivered", "category": "unknown"},
+            {"outcome": None},
+            {"outcome": "withheld", "extra": 1},
+            {"outcome": "withheld", "category": None},
+            {"outcome": "delivered", "category": None},
+            [],
+        ):
+            assert (await ack(hidden, bad)).status_code == 400, bad
+        delivered = await ack(plain, {})
+        assert delivered.status_code == 200
+        assert delivered.json() == {
+            "messageId": plain.message_id, "acknowledged": True, "outcome": "delivered"
+        }
+        withheld = await ack(hidden, {"outcome": "withheld"})
+        assert withheld.json() == {
+            "messageId": hidden.message_id, "acknowledged": True,
+            "outcome": "withheld", "category": "unknown",
+        }
+        # First ACK decides: a repeat is idempotent, a different outcome conflicts.
+        assert (await ack(hidden, {"outcome": "withheld", "category": "unknown"})).status_code == 200
+        assert (await ack(hidden, {})).status_code == 409
+        assert (await ack(plain, {"outcome": "withheld"})).status_code == 409
+        assert (await ack(other, {"outcome": "withheld", "category": "personal_data"})).status_code == 200
+        assert (await ack(other, {"outcome": "withheld", "category": "other"})).status_code == 409
+        assert not (await client.get(base + ROOT + "/outbox")).json()["messages"]
+    rows = dict(
+        await (
+            await b.db.execute("SELECT message_id, withheld_category FROM peer_outbox")
+        ).fetchall()
+    )
+    assert rows == {plain.message_id: None, hidden.message_id: "unknown",
+                    other.message_id: "personal_data"}
+    from uuid import UUID, uuid5
+
+    epoch = b.identities["alpha"].peer["epoch"]
+    routed = await (
+        await b.db.execute("SELECT id, category, channel FROM pending_outreach WHERE channel='telegram'")
+    ).fetchall()
+    # ALERT is the category that skips salience and quiet hours; the id makes a retry a no-op.
+    assert sorted(tuple(r) for r in routed) == sorted(
+        (str(uuid5(UUID(env.message_id), f"alpha:{epoch}:withheld")), "alert", "telegram")
+        for env in (hidden, other)
+    )
+    notices = await _notices(b)
+    assert len(notices) == 2  # one per withheld message, none for the repeat
+    for env in (hidden, other):  # the id leads, so the drain's prefix dedup keeps both
+        assert sum(n.startswith(f"Peer message {env.message_id} withheld") for n in notices) == 1
+    assert not any("Secret-free" in n or "Another withheld" in n for n in notices)  # no content
+
+
+async def test_withheld_shows_in_agent_send_retry_and_history(bridge, monkeypatch):
+    from genesis.mcp import outreach_mcp
+    from tests.test_peers.test_conversation import incoming, settle
+
+    box = Outbox(bridge.registry)
+    env, _ = await box.prepare("alpha", "A message the peer could not read")
+    await box.put(env)
+    await box.ack(bridge.identities["alpha"], env.message_id, outcome="withheld")
+    monkeypatch.setattr(outreach_mcp, "_db", bridge.db)
+    retry = json.loads(await outreach_mcp.agent_send(
+        "alpha", "A message the peer could not read", env.context_id, env.message_id))
+    assert retry["acknowledged"] is True and retry["withheld"] is True
+    row = await bridge.service.send(bridge.identities["alpha"], incoming(message(context=env.context_id)))
+    await settle(bridge, row)
+    prompt = bridge.invoker.run_streaming.call_args.args[0].prompt
+    assert "Genesis asked peer (the peer reported it withheld): A message the peer could not read" in prompt
+
+
+async def test_withheld_column_migration_on_an_existing_table(tmp_path):
+    import importlib
+
+    import aiosqlite
+
+    from genesis.db.schema._tables import TABLES
+
+    migration = importlib.import_module("genesis.db.migrations.20261118060000_peer_outbox_withheld")
+    async with aiosqlite.connect(tmp_path / "old.db") as db:
+        await db.execute(
+            "CREATE TABLE peer_outbox (peer_id TEXT NOT NULL, epoch TEXT NOT NULL, "
+            "message_id TEXT NOT NULL, context_id TEXT NOT NULL, message TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, acknowledged_at TEXT, PRIMARY KEY(peer_id,epoch,message_id))"
+        )
+        await db.execute("INSERT INTO peer_outbox VALUES('a','e','m','c','{}','t','t2')")
+        await migration.up(db)
+        await migration.up(db)  # idempotent
+        columns = [r[1] for r in await (await db.execute("PRAGMA table_info(peer_outbox)")).fetchall()]
+        assert columns[-1] == "withheld_category"
+        assert (await (await db.execute("SELECT withheld_category FROM peer_outbox")).fetchone())[0] is None
+    assert "withheld_category TEXT" in TABLES["peer_outbox"]

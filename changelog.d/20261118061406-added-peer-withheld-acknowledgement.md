@@ -1,0 +1,1 @@
+- A peer that collects one of Genesis's messages but cannot read it can now say so when it acknowledges the message. Genesis then records the message as not delivered and sends you one alert, instead of treating it as delivered.

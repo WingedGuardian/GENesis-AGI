@@ -417,7 +417,12 @@ class ConversationService:
                 (
                     row["created_at"],
                     row["message_id"],
-                    "Genesis asked peer: " + head(msg["parts"][0]["text"]),
+                    (
+                        "Genesis asked peer (the peer reported it withheld): "
+                        if dict(row).get("withheld_category")
+                        else "Genesis asked peer: "
+                    )
+                    + head(msg["parts"][0]["text"]),
                 )
             )
         events.sort(reverse=True)

@@ -122,7 +122,9 @@ async def agent_send(
     peer execution. Pass a
     stable message_id on retries. An omitted context_id starts an owned context;
     a supplied one must belong to this enrollment or match that message_id's
-    server-issued retry context.
+    server-issued retry context. On a retry, withheld=true means the peer
+    collected the message but could not read it: it was not delivered, and
+    resending needs a new message_id.
     """
     from genesis.peers.conversation import ConversationRefusal
     from genesis.peers.outbox import Outbox, registry_for_db
@@ -136,7 +138,8 @@ async def agent_send(
         receipt = {"message_id": envelope.message_id, "context_id": envelope.context_id}
         if existing:
             return json.dumps({"status": "queued_for_collection", **receipt,
-                               "acknowledged": bool(existing["acknowledged_at"])})
+                               "acknowledged": bool(existing["acknowledged_at"]),
+                               "withheld": bool(existing.get("withheld_category"))})
         pending_id, state = await Outbox(await registry_for_db(_db)).enqueue(envelope)
         return json.dumps({"status": state, **receipt,
                            **({"pending_id": pending_id} if pending_id else {})})

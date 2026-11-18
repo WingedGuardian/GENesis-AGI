@@ -4340,7 +4340,7 @@
   "outreach": [
     {
       "name": "agent_send",
-      "description": "Send a conversation message to an explicitly enrolled same-owner peer.\n\nReturns queued_for_governance, queued_for_collection on retained retries,\nor refusal. The existing scheduler applies governance. Collection is not\npeer execution. Pass a\nstable message_id on retries. An omitted context_id starts an owned context;\na supplied one must belong to this enrollment or match that message_id's\nserver-issued retry context.",
+      "description": "Send a conversation message to an explicitly enrolled same-owner peer.\n\nReturns queued_for_governance, queued_for_collection on retained retries,\nor refusal. The existing scheduler applies governance. Collection is not\npeer execution. Pass a\nstable message_id on retries. An omitted context_id starts an owned context;\na supplied one must belong to this enrollment or match that message_id's\nserver-issued retry context. On a retry, withheld=true means the peer\ncollected the message but could not read it: it was not delivered, and\nresending needs a new message_id.",
       "inputSchema": {
         "properties": {
           "peer_id": {

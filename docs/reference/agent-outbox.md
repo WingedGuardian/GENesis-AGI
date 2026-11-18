@@ -55,7 +55,7 @@ Use the existing scoped bearer and A2A-Version: 1.0 on both extension routes:
 | Method | Path below /v1/agent/a2a | Contract |
 | --- | --- | --- |
 | GET | /outbox | messages + nextPageToken; no consumption |
-| POST | /outbox/{messageId}:ack | Empty JSON object; idempotent collection ACK |
+| POST | /outbox/{messageId}:ack | Collection ACK: `{}` (delivered) or a withheld outcome, below |
 
 GET accepts pageSize (default20,1–100) and pageToken. Unknown/repeated options
 are refused. A page item contains message (an A2A Message with ROLE_AGENT,
@@ -64,7 +64,21 @@ current epoch is visible. Stable oldest-first keyset pagination works even if
 an earlier page's anchor was ACKed. Each new poll cycle starts without a token
 at the oldest unacknowledged message. GET never marks a row collected.
 
-ACK returns messageId + acknowledged:true and does not erase the anchor.
+ACK body, one of:
+
+- `{}` or `{"outcome": "delivered"}`: collected and readable.
+- `{"outcome": "withheld", "category": C}`: collected, but the peer could not
+  read it (for example its own inbound screen held the text). C is one of
+  `unknown`, `personal_data`, `prompt_injection`, `content_policy`,
+  `unreadable`, `other`. Leave it out, or send `unknown`, when the peer has no
+  reason code. A withheld message is not delivered: Genesis records it, its
+  owner gets one notice, and `agent_send` retries report `withheld: true`.
+
+Anything else is refused (400). The first ACK decides: repeating the same
+outcome is idempotent, and a different outcome for an already-ACKed message is
+`409 state_conflict`. Treat that 409 as final and do not retry it. ACK returns
+messageId, acknowledged:true, outcome (and category when withheld), and does
+not erase the anchor.
 Unknown/foreign/old-epoch IDs are unavailable. The same server-owned 256 KiB
 body cap and absolute input deadline apply, including chunked bodies. ACK is
 not a task cancellation, owner approval, message execution or reply.
@@ -74,7 +88,9 @@ not a task cancellation, owner approval, message execution or reply.
 1. Poll the outbox with the current enrollment and persist a local dedup row
    keyed by enrollment epoch + messageId before ACK or executing work. Retain
    the complete message/context and progress; ACK alone is insufficient.
-2. Repeat ACK safely. Advance pageToken only within that poll cycle, and
+2. Repeat ACK safely, with the same outcome. If the saved text is empty or your
+   own screen withheld it, ACK with the withheld outcome instead of `{}`.
+   Advance pageToken only within that poll cycle, and
    restart oldest-unacked on the next cycle. A lost GET or ACK causes replay;
    local dedup prevents repeated effects.
 3. Process the saved message under the peer's own permissions. A Genesis

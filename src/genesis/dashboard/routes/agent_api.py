@@ -361,6 +361,14 @@ async def outbox_list():
         size,
         request.args.get("pageToken"),
     )
+    for item in messages:
+        # Ids and a byte length only: proves what this side served, never the text.
+        logger.info(
+            "peer_outbox_served peer=%s message_id=%s text_bytes=%d",
+            g.peer_identity.peer["peer_id"],
+            item["message"]["messageId"],
+            len(item["message"]["parts"][0]["text"].encode("utf-8")),
+        )
     return jsonify(messages=messages, nextPageToken=token)
 
 
@@ -370,14 +378,22 @@ async def outbox_ack(message_id):
     import json
 
     from genesis.peers.conversation import uuid_id
+    from genesis.peers.outbox import WITHHELD_CATEGORIES
     from genesis.peers.protocol import _unique_object
 
     g.peer_task_id = uuid_id(message_id)
     try:
         body = json.loads(g.peer_body or b"{}", object_pairs_hook=_unique_object)
-        if body != {}:
+        # {} or {"outcome": "delivered"}: delivered. {"outcome": "withheld",
+        # "category"?: WITHHELD_CATEGORIES}: collected but unreadable.
+        if not isinstance(body, dict) or set(body) - {"outcome", "category"}:
             raise ValueError
-    except (ValueError, TypeError):
+        outcome, category = body.get("outcome", "delivered"), body.get("category")
+        if outcome not in ("delivered", "withheld") or (
+            "category" in body and (outcome != "withheld" or category not in WITHHELD_CATEGORIES)
+        ):
+            raise ValueError
+    except (ValueError, TypeError, RecursionError):  # deep nesting is malformed, not a 500
         raise InvalidParamsError("Invalid collection acknowledgement") from None
-    await (await _outbox()).ack(g.peer_identity, message_id)
-    return jsonify(messageId=message_id, acknowledged=True)
+    result = await (await _outbox()).ack(g.peer_identity, message_id, outcome, category)
+    return jsonify(messageId=message_id, acknowledged=True, **result)

@@ -17,6 +17,11 @@ from genesis.peers.disclosure_scan import json_strings_safe
 from genesis.peers.protocol import _unique_object
 from genesis.peers.registry import PeerRegistry, identifier
 
+# What a peer may say about a message it collected but could not read.
+WITHHELD_CATEGORIES = frozenset(
+    {"unknown", "personal_data", "prompt_injection", "content_policy", "unreadable", "other"}
+)
+
 
 @dataclass(frozen=True)
 class PeerEnvelope:
@@ -303,20 +308,54 @@ class Outbox:
                 messages.append({"message": envelope.message, "createdAt": row["created_at"]})
             return messages, rows[size - 1]["message_id"] if len(rows) > size else ""
 
-    async def ack(self, identity, message_id):
+    async def ack(self, identity, message_id, outcome="delivered", category=None):
+        """Record collection. The first ACK decides the outcome; a repeat is
+        idempotent and a different outcome is a 409. A withheld outcome means the
+        peer collected the message but could not read it: it is not delivered,
+        and the owner gets one notice, written in the same transaction."""
+        from genesis.db.crud import pending_outreach
+
         uuid_id(message_id)
+        if outcome == "withheld":
+            category = category or "unknown"
+            if category not in WITHHELD_CATEGORIES:
+                raise ConversationRefusal("validation_error", 400)
+        elif outcome != "delivered" or category is not None:
+            raise ConversationRefusal("validation_error", 400)
+        recorded = category if outcome == "withheld" else None
+        peer_id, epoch = identity.peer["peer_id"], identity.peer["epoch"]
         async with self.registry.transaction() as db:
             await enabled(db)
             await authorize(db, identity)
-            result = await db.execute(
-                "UPDATE peer_outbox SET acknowledged_at=coalesce(acknowledged_at,?) "
-                "WHERE peer_id=? AND epoch=? AND message_id=?",
-                (
-                    datetime.now(UTC).isoformat(),
-                    identity.peer["peer_id"],
-                    identity.peer["epoch"],
-                    message_id,
-                ),
-            )
-            if result.rowcount != 1:
+            row = await (
+                await db.execute(
+                    "SELECT * FROM peer_outbox WHERE peer_id=? AND epoch=? AND message_id=?",
+                    (peer_id, epoch, message_id),
+                )
+            ).fetchone()
+            if row is None:
                 raise ConversationRefusal("not_found", 404)
+            if row["acknowledged_at"] is not None:
+                if dict(row).get("withheld_category") != recorded:
+                    raise ConversationRefusal("state_conflict", 409)
+                return {"outcome": outcome, **({"category": category} if recorded else {})}
+            await db.execute(
+                "UPDATE peer_outbox SET acknowledged_at=?, withheld_category=? "
+                "WHERE peer_id=? AND epoch=? AND message_id=?",
+                (datetime.now(UTC).isoformat(), recorded, peer_id, epoch, message_id),
+            )
+            if recorded:
+                # The message id leads: the queue drain dedups on a text prefix.
+                await pending_outreach.enqueue(
+                    db,
+                    message=(
+                        f"Peer message {message_id} withheld ({category}) by {peer_id}; "
+                        f"context {row['context_id']}. Not delivered: the peer collected it "
+                        "but could not read it."
+                    ),
+                    category="alert",
+                    channel="telegram",
+                    pending_id=str(uuid5(UUID(message_id), f"{peer_id}:{epoch}:withheld")),
+                    commit=False,
+                )
+        return {"outcome": outcome, **({"category": category} if recorded else {})}
