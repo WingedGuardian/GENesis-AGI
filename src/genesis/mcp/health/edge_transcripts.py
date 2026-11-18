@@ -52,11 +52,13 @@ logger = logging.getLogger(__name__)
 # One file-name grammar, shared by the listing filter and the search-line parser.
 _NAME_BODY = r"(\d{8}T\d{6})[A-Za-z0-9_.-]*\.md"
 _NAME = re.compile(rf"^{_NAME_BODY}$")
-# The remote command runs find from inside the directory, so every grep -H line
-# starts with exactly ``./<name>:N:`` (a match) or ``./<name>-N-`` (context).
-# Matched at the start of the line only: text later in a line can never name a file.
+# The remote command runs find from inside the directory, and grep -Z ends the
+# file name with a NUL, so every line starts with exactly ``./<name>\0N:`` (a
+# match) or ``./<name>\0N-`` (context). A name cannot hold a NUL, so neither the
+# name's own ``-`` and ``.`` nor text that looks like ``x.md:3:`` can move where the
+# name ends. Matched at the start of the line only.
 _GREP_PREFIX = "./"
-_GREP_LINE = re.compile(re.escape(_GREP_PREFIX) + rf"({_NAME_BODY})[:-]\d+[:-]")
+_GREP_LINE = re.compile(re.escape(_GREP_PREFIX) + rf"({_NAME_BODY})\0\d+[:-]")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 # Output caps. A day's transcripts measured at under 60 KB each on a live edge;
 # a search result past the cap is cut, and the result says so. The full inventory
@@ -80,8 +82,12 @@ _MAX_QUERY_CHARS = 512
 _DIR_MISSING = 3  # the remote guard's exit code: the directory cannot be entered
 # grep's own status is 1 for "no match"; this wrapper turns that into 0 and keeps
 # 2 (an unreadable file), so find's status is nonzero only for a real failure.
+# -a reads every file as text: by default grep prints no lines from a file it takes
+# for binary (a NUL byte), so a match there would be dropped while the read reports
+# complete. -Z ends each file name with a NUL (see _GREP_LINE).
 _GREP_WRAPPER = (
-    'q=$1; shift; grep -F -i -n -H -C 2 -e "$q" -- "$@"; s=$?; [ "$s" -eq 1 ] && s=0; exit "$s"'
+    'q=$1; shift; grep -a -F -i -n -H -Z -C 2 -e "$q" -- "$@"; s=$?;'
+    ' [ "$s" -eq 1 ] && s=0; exit "$s"'
 )
 
 
@@ -401,8 +407,9 @@ async def _impl(action: str, date_: str | None, query: str | None, max_lines: in
         # Read from each line's own prefix, so these are the files the lines really
         # came from; the text inside the block may show anything.
         "files_matched": sorted({_GREP_LINE.match(ln)[1] for ln in kept}),
-        # One block, one boundary: the kept lines, each still ``./<name>:N:text``.
-        "matches": _wrap("\n".join(kept)) if kept else "",
+        # One block, one boundary: the kept lines, shown as ``./<name>:N:text``
+        # (a match) or ``./<name>:N-text`` (context).
+        "matches": _wrap("\n".join(_shown(ln) for ln in kept)) if kept else "",
         "complete": read.complete,
     }
     if len(lines) > cap or not read.complete:
@@ -412,6 +419,12 @@ async def _impl(action: str, date_: str | None, query: str | None, max_lines: in
             f"kept {min(len(lines), cap)} lines ({why}); narrow the query or the day"
         )
     return result
+
+
+def _shown(line: str) -> str:
+    """A grep line for display: grep's NUL after the name becomes ``:``, and any NUL
+    from a file's own text becomes U+FFFD."""
+    return line.replace("\0", ":", 1).replace("\0", "\ufffd")
 
 
 def _match_in_day(line: str, day: date) -> bool:
