@@ -2272,6 +2272,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             f"cc_sessions.{_col}",
         )
 
+    # The last tool entry the lesson builder has judged (#4807). Mirrored in
+    # migration 20261116040450_cc_sessions_lesson_built_through for the runner.
+    await _try_alter(
+        db,
+        "ALTER TABLE cc_sessions ADD COLUMN lesson_built_through TEXT",
+        "cc_sessions.lesson_built_through",
+    )
+
     # Which labelled client a credentials lookup came from. Mirrored in
     # migration 20261108071709 for the standalone runner (schema_both_build_paths).
     await _try_alter(

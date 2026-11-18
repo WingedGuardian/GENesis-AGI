@@ -22,3 +22,13 @@
 # rebuilds (sessions whose build failed on provider exhaustion) stay queued
 # until the mode returns to live.
 mode: live
+
+# whole | shadow | incremental: how much of a session the builder judges.
+#   whole: the whole session each cycle it has new messages, as before.
+#   shadow (default): as whole, plus one log line per built session saying what
+#     judging only the part after its progress marker would do (entries,
+#     characters, struggle score of the new entries, would-trigger). The marker
+#     (cc_sessions.lesson_built_through) moves when the builder ran.
+#   incremental: judge only that part. Not built yet; reads as shadow.
+# An invalid value reads as shadow, which stores what whole stores.
+segment: shadow

@@ -4001,7 +4001,22 @@ verified: 3f70a665b 2026-11-15
   shadow cap's count, so it rotates by time (the two files always hold the
   window) and drops a lesson that repeats one already recorded for the session.
   Queued rebuilds wait, unspent, until the mode is live; the drain scans past
-  capped sessions, so they never starve an eligible one.
+  capped sessions, so they never starve an eligible one. A second key,
+  `segment: whole | shadow | incremental` (shipped `shadow`), is the first half
+  of judging only what is new (#4807): `cc_sessions.lesson_built_through` holds
+  the `tool_use_id` of the last tool entry judged, and
+  `learning/procedural/build_segment.select_part` cuts the spine after it (by
+  position, since result timestamps are not monotonic; the spine parser keeps a
+  replayed call once, so ids are unique), leaving for later everything from an
+  unanswered call after the last user turn (parallel results can arrive out of
+  order) and fitting the rest to the judge's budget. The marker is read before
+  the parse and is the compare-and-set's expected value, and a reset whose old
+  id is still in the file holds, so an older or partial parse never moves it
+  back. In
+  shadow the whole session is still built; one `Lesson segment [shadow]` log
+  line per built session says what the new part would do, and the marker moves
+  by compare-and-set when the builder ran and the cap allowed. `incremental` is
+  not built yet and reads as shadow.
 - **eval/**: J9 = fire-and-forget emit hooks on live cognitive paths (the
   "cannot break production" contract — hooks must never raise) + weekly Sunday
   aggregation (hard 7-day window) + an on-demand batch judge as a surplus
