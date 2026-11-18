@@ -1,0 +1,1 @@
+- Reject an ssh/scp destination from the ambient remote config that starts with `-` or has whitespace or control characters, and put `--` before the destination.

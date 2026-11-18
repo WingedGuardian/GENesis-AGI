@@ -34,13 +34,27 @@ class SnapshotError(Exception):
     """Snapshot pull failed (edge unreachable / remote backup / scp / timeout)."""
 
 
+def _check_target_part(label: str, value: str) -> str:
+    """Reject a config value that ssh/scp could read as an option or that carries
+    whitespace or control characters. The value must only ever be a destination."""
+    if not value or value.startswith("-") or any(c.isspace() or not c.isprintable() for c in value):
+        raise SnapshotError(f"invalid ambient_remote {label}: {value!r}")
+    return value
+
+
+def _destination(cfg: AmbientRemoteConfig) -> str:
+    user = _check_target_part("host_user", cfg.host_user)
+    host = _check_target_part("host_ip", cfg.host_ip)
+    return f"{user}@{host}"
+
+
 def _ssh_base(cfg: AmbientRemoteConfig) -> list[str]:
     return [
         "ssh", "-i", str(Path(cfg.ssh_key).expanduser()),
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", "ConnectTimeout=10",
         "-o", "BatchMode=yes",
-        f"{cfg.host_user}@{cfg.host_ip}",
+        "--", _destination(cfg),
     ]
 
 
@@ -67,7 +81,7 @@ def _scp_cmd(cfg: AmbientRemoteConfig, remote_tmp: str, local: Path) -> list[str
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", "ConnectTimeout=10",
         "-o", "BatchMode=yes",
-        f"{cfg.host_user}@{cfg.host_ip}:{remote_tmp}", str(local),
+        "--", f"{_destination(cfg)}:{remote_tmp}", str(local),
     ]
 
 
