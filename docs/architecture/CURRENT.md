@@ -297,7 +297,10 @@ Easy-to-forget mechanisms:
   not apply); `live` would apply new-pair merges via `merge_entity` unattended,
   but is FENCED (runs as `propose_only`, settings lever refuses it) until
   issue #2742 adds a merge-time check on durable pair state. A cursor-managed reconcile sweep
-  rediscovers historical fuzzy pairs. Settings lever `entity_adjudication`
+  rediscovers historical fuzzy pairs. Both fuzzy scans (the sweep and resolution's
+  `_closest`) run in a thread that keeps the GIL busy, so they go through
+  `entity_registry.fuzzy_ratio_at_least`, which skips pairs whose cheap difflib bounds
+  cannot reach the threshold (same matches, about 8x less CPU). Settings lever `entity_adjudication`
   (off/propose_only/live) + `GENESIS_ENTITY_ADJUDICATION_DISABLED`. Distinct from
   `memory/entity_resolution.py`, which is near-duplicate memory-PAIR dedup.
   **Human-approval apply gate** (`entity_adjudication_approve`/`_apply`/`_reject`
