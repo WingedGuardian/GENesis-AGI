@@ -49,7 +49,7 @@ def _secret_token(token: str) -> bool:
     return (has_digit or has_symbol) and (has_alpha or (has_digit and has_symbol))
 
 
-#: Whitespace ``_normalise`` changes: a character other than a space, or a run.
+#: Whitespace the masking form changes: a character other than a space, or a run.
 _SPACING = re.compile(r"[^\S ]|  ")
 
 
@@ -64,18 +64,34 @@ def _one_space(text: str) -> str:
     return (" " if text[0].isspace() else "") + " ".join(words) + (" " if text[-1].isspace() else "")
 
 
-def _normalise(text: str) -> str:
-    """``text`` as the refusal check compares it: NFKC (a fullwidth or other
-    compatibility variant reads as its plain form), every format character
-    (Unicode category Cf: zero-width spaces and joiners, the soft hyphen)
-    removed, then casefolded, and every whitespace run read as one space (a
-    multi-word value spaced another way is the same value)."""
+def _refusal_form(text: str) -> str:
+    """``text`` as main's refusal check compared it, and as a credential's name
+    hash still reads it: NFKC (a fullwidth or other compatibility variant reads
+    as its plain form), every format character (Unicode category Cf: zero-width
+    spaces and joiners, the soft hyphen) removed, then casefolded."""
     if text.isascii():
         # NFKC leaves ASCII as it is, and no ASCII character is a format one.
-        return _one_space(text.casefold())
+        return text.casefold()
     folded = unicodedata.normalize("NFKC", text)
-    plain = "".join(c for c in folded if unicodedata.category(c) != "Cf")
-    return _one_space(plain.casefold())
+    return "".join(c for c in folded if unicodedata.category(c) != "Cf").casefold()
+
+
+def _plain(text: str) -> str:
+    """The masking form of ``text`` before spacing: format characters dropped
+    (before NFKC too: a zero-width joiner between a letter and its accent would
+    otherwise keep the two from composing), NFKC, casefolded, then NFKC again
+    (casefolding can produce text NFKC changes), so the form is stable."""
+    plain = "".join(c for c in text if unicodedata.category(c) != "Cf")
+    folded = unicodedata.normalize("NFKC", _refusal_form(plain))
+    return "".join(c for c in folded if unicodedata.category(c) != "Cf")
+
+
+def _normalise(text: str) -> str:
+    """``text`` as masking compares it: ``_plain`` with every whitespace run read
+    as one space, so a multi-word value spaced another way is the same value."""
+    if text.isascii():
+        return _one_space(text.casefold())
+    return _one_space(_plain(text))
 
 
 def _decoded(text: str) -> set[str]:
@@ -348,6 +364,11 @@ class ValueMask:
         self._whole = whole.union(*(_forms(text) for text in secrets or ()))
         self._index = _RunIndex(self._whole)
         self.window = max((len(p.split()) for p in self._whole), default=1)
+        #: The multi-word forms a decoded run of tokens may hold: whole values and
+        #: multi-word secret parts or captures.
+        self._multi = {p for p in self._whole if " " in p.strip()} | {
+            p for p, _ in kept if " " in p.strip()
+        }
         # A value that spells the mask text: the mask is then not only a
         # separator (``carries``). Likewise a body placeholder: it is then not
         # only a placeholder.
@@ -421,7 +442,7 @@ class ValueMask:
         the original text's offsets."""
         if not text or not self.carries(text):
             return []
-        normalised, origins = _normalised_with_origins(text)
+        normalised, starts, stops = _normalised_with_origins(text)
         spans = []
         token = (0, 0)
         for start, stop, probe in self._matches(normalised):
@@ -434,11 +455,11 @@ class ValueMask:
             if runs is None:
                 if not (token[0] <= start and stop <= token[1]):
                     token = _token_of(normalised, start, stop)
-                    spans.append((origins[token[0]], origins[token[1] - 1] + 1))
+                    spans.append((starts[token[0]], stops[token[1] - 1]))
                 continue
             if runs:
                 start, stop = _grown(normalised, start, stop, runs)
-            spans.append((origins[start], origins[stop - 1] + 1))
+            spans.append((starts[start], stops[stop - 1]))
         # A percent-encoded spelling cannot be mapped back character by
         # character: the whole token that carries it decoded is masked, so no
         # fragment of the secret around the escapes stays visible.
@@ -447,6 +468,11 @@ class ValueMask:
             for m in re.finditer(r"\S+", text)
             if _ESCAPE.search(m.group()) and self.carries(m.group())
         ]
+        if spans and _ESCAPE.search(text):
+            # A multi-word value with one word percent-encoded is a hit only in
+            # the decoded text, across tokens: the smallest run of whole tokens
+            # that carries it decoded is masked, so no word of it stays visible.
+            spans += self._encoded_run_spans(text)
         spans = _merged(spans)
         for width in range(1, self.window + 1):
             if not self.carries(_mask_spans(text, spans)):
@@ -456,6 +482,34 @@ class ValueMask:
             rendered, ostart, oend = _rendered(text, spans)
             spans = _merged(spans + self._token_run_spans(rendered, ostart, oend, width))
         return spans if not self.carries(_mask_spans(text, spans)) else [(0, len(text))]
+
+    def _encoded_run_spans(self, text: str) -> list[tuple[int, int]]:
+        """The original spans of every smallest run of 2 to ``window``
+        whitespace-delimited tokens of ``text`` that holds a percent escape and,
+        decoded, a multi-word secret or secret part (neither run without its
+        first or its last token does); the whole field when only a run longer
+        than the window holds it."""
+
+        def holds_whole(run: str) -> bool:
+            return any(w in _normalise(form) for form in _decoded(run) for w in self._multi)
+
+        tokens = [m.span() for m in re.finditer(r"\S+", text)]
+        found = []
+        for width in range(2, min(self.window, _WINDOW_MAX) + 1):
+            for i in range(len(tokens) - width + 1):
+                start, stop = tokens[i][0], tokens[i + width - 1][1]
+                run = text[start:stop]
+                if (
+                    _ESCAPE.search(run)
+                    and holds_whole(run)
+                    and not holds_whole(text[tokens[i + 1][0] : stop])
+                    and not holds_whole(text[start : tokens[i + width - 2][1]])
+                ):
+                    found.append((start, stop))
+        if not found and holds_whole(text):
+            # Longer than the window (``_WINDOW_MAX`` tokens): the whole field.
+            found.append((0, len(text)))
+        return found
 
     def _token_run_spans(
         self,
@@ -594,7 +648,8 @@ def _prose_words(
 ) -> frozenset[str]:
     """The probes of a prose value that are words of the prose: not its whole
     text and not taken (by a capture rule, or a secret part of the value), and
-    term-shaped, or a plain word with its sentence punctuation ("Hello!")."""
+    term-shaped, or a word of letters with its sentence punctuation ("Hello!";
+    a mixed token such as "Ab1!" stays a probe)."""
     return frozenset(
         probe
         for probe, _ in probes
@@ -602,7 +657,7 @@ def _prose_words(
         and probe not in taken
         and (
             (("-" in probe or "_" in probe or "." in probe) and _term_shaped(probe))
-            or (probe != probe.strip(_TOKEN_EDGE) and not _secret_token(probe.strip(_TOKEN_EDGE)))
+            or (probe != probe.strip(_TOKEN_EDGE) and probe.strip(_TOKEN_EDGE).isalpha())
         )
     )
 
@@ -708,30 +763,65 @@ def value_masks(
     )
 
 
-def _normalised_with_origins(text: str) -> tuple[str, list[int] | range]:
-    """``text`` normalised character by character as ``_normalise`` does, and
-    for each normalised character the index of the original one it came from.
-    A whitespace run reads as one space, from its first character, so a mask
-    over it covers the whole run in the original."""
+#: Hangul medial and final jamo: they compose with the jamo before them.
+_JAMO_TAIL = re.compile(r"[ᅠ-ᇿힰ-퟿]")
+
+
+def _clusters(text: str) -> list[tuple[int, int]]:
+    """``text`` cut before every character that NFKC cannot compose with the
+    one before it: a letter, its combining marks and any format characters
+    between them (or a run of Hangul jamo) stay one unit, as they normalise
+    together."""
+    units: list[tuple[int, int]] = []
+    for i, char in enumerate(text):
+        if units and (
+            unicodedata.combining(char) or _JAMO_TAIL.match(char) or unicodedata.category(char) == "Cf"
+        ):
+            units[-1] = (units[-1][0], i + 1)
+        else:
+            units.append((i, i + 1))
+    return units
+
+
+def _units_normalised(text: str, units: list[tuple[int, int]]) -> tuple[str, list[int], list[int]]:
+    """``text`` normalised one unit at a time as ``_normalise`` does, and for each
+    normalised character the original (start, stop) of the unit it came from. A
+    whitespace run reads as one space, so a mask over it covers the whole run."""
+    out: list[str] = []
+    starts: list[int] = []
+    stops: list[int] = []
+    for start, stop in units:
+        for folded in _plain(text[start:stop]):
+            if folded.isspace():
+                if out and out[-1] == " ":
+                    stops[-1] = max(stops[-1], stop)
+                    continue
+                folded = " "
+            out.append(folded)
+            starts.append(start)
+            stops.append(stop)
+    return "".join(out), starts, stops
+
+
+def _normalised_with_origins(text: str) -> tuple[str, list[int] | range, list[int] | range]:
+    """``text`` normalised as ``_normalise`` does, and for each normalised
+    character the original (start, stop) it came from, so a mask over a match
+    covers every original character that made it (a letter and its combining
+    marks alike). Normalised by letter clusters; where NFKC still reads the text
+    differently as a whole, by whitespace tokens, and failing that the whole
+    text is one unit (a match then masks the whole field, never a part)."""
     if text.isascii() and not _SPACING.search(text):
         # ASCII normalises to its lower case, character for character.
-        return text.lower(), range(len(text))
-    out: list[str] = []
-    origins: list[int] = []
-    for i, char in enumerate(text):
-        for part in unicodedata.normalize("NFKC", char):
-            if unicodedata.category(part) == "Cf":
-                continue
-            for folded in part.casefold():
-                if folded.isspace():
-                    if out and out[-1] == " ":
-                        continue
-                    folded = " "
-                out.append(folded)
-                origins.append(i)
-    return "".join(out), origins
-
-
+        return text.lower(), range(len(text)), range(1, len(text) + 1)
+    whole = _normalise(text)
+    for units in (
+        lambda: _clusters(text),
+        lambda: [m.span() for m in re.finditer(r"\S+|\s+", text)],
+    ):
+        normalised, starts, stops = _units_normalised(text, units())
+        if normalised == whole:
+            return normalised, starts, stops
+    return whole, [0] * len(whole), [len(text)] * len(whole)
 def _merged(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """``spans`` sorted, with every overlapping or touching pair joined."""
     merged: list[list[int]] = []
