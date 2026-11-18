@@ -171,15 +171,15 @@ async def test_real_http_native_mcp_queue_poll_ack_correlated_reply_restart(
     )
     assert retry == response
     assert (await (await b.db.execute("SELECT count(*) FROM pending_outreach")).fetchone())[0] == 1
-    for peer, text, context in (
-        ("beta", "Genesis asks for an opinion", response["context_id"]),
-        ("alpha", "Changed retry", response["context_id"]),
-        ("alpha", "Genesis asks for an opinion", str(uuid4())),
+    for peer, text, context, reason in (
+        ("beta", "Genesis asks for an opinion", response["context_id"], "unknown_context"),
+        ("alpha", "Changed retry", response["context_id"], "message_id_conflict"),
+        ("alpha", "Genesis asks for an opinion", str(uuid4()), "unknown_context"),
     ):
         refused = json.loads(
             await outreach_mcp.agent_send(peer, text, message_id=mid, context_id=context)
         )
-        assert refused == {"code": "outbound_refused", "status": "refused"}
+        assert refused == {"code": "outbound_refused", "status": "refused", "reason": reason}
     assert (await Outbox(b.registry).poll(b.identities["alpha"]))[0] == []
     scheduler = OutreachScheduler(p, AsyncMock(), AsyncMock(), p._config, b.db)
     scheduler._record_job_result = AsyncMock()
@@ -405,7 +405,9 @@ async def test_live_mcp_and_stale_adapter_respect_pending_anchor(bridge, monkeyp
     changed = json.loads(
         await outreach_mcp.agent_send("alpha", "Changed question", first["context_id"], mid)
     )
-    assert changed == {"code": "outbound_refused", "status": "refused"}
+    assert changed == {
+        "code": "outbound_refused", "status": "refused", "reason": "message_id_conflict"
+    }
     retry = json.loads(
         await outreach_mcp.agent_send("alpha", "Original question", first["context_id"], mid)
     )
@@ -633,3 +635,86 @@ async def test_dedup_after_retained_delivery_closes_pending_row(bridge, monkeypa
     ).fetchone()
     assert row[0] is not None
     assert len((await Outbox(bridge.registry).poll(bridge.identities["alpha"]))[0]) == 1
+
+
+async def test_agent_send_refusal_names_the_rule_that_failed(bridge, monkeypatch):
+    from genesis.mcp import outreach_mcp
+    from genesis.peers.outbox import REFUSAL_REASONS
+
+    monkeypatch.setattr(outreach_mcp, "_db", bridge.db)
+
+    async def send(peer="alpha", text="A question", context_id=None, message_id=None):
+        return json.loads(await outreach_mcp.agent_send(peer, text, context_id, message_id))
+
+    sent = await send(message_id=str(uuid4()))
+    assert sent["status"] == "queued_for_governance"
+    secret = "nvapi-" + "q" * 40  # synthetic shape from the shared scanner table
+    cases = {
+        "invalid_peer_id": dict(peer="Not A Peer"),
+        "unknown_peer": dict(peer="gamma"),
+        "empty_message": dict(text="   "),
+        "invalid_message_id": dict(message_id="not-a-uuid"),
+        "invalid_context_id": dict(context_id="not-a-uuid"),
+        "unknown_context": dict(context_id=str(uuid4())),
+        "message_id_conflict": dict(text="Changed", message_id=sent["message_id"],
+                                    context_id=sent["context_id"]),
+        "disclosure_blocked": dict(text="the key is " + secret),
+        "too_large": dict(text="x" * (256 * 1024)),
+    }
+    for reason, kwargs in cases.items():
+        refused = await send(**kwargs)
+        assert refused == {"code": "outbound_refused", "status": "refused", "reason": reason}, kwargs
+    # The refusal names the rule, never the text that tripped it.
+    assert "q" * 8 not in json.dumps(await send(text="the key is " + secret))
+    await bridge.registry.revoke("beta")
+    assert (await send(peer="beta"))["reason"] == "not_permitted"
+    # A lone surrogate fails message construction: malformed, never invalid_peer_id.
+    assert (await send(text="bad \ud800 text"))["reason"] == "malformed"
+    await bridge.registry.configure("disabled")
+    assert (await send())["reason"] == "not_configured"
+    assert set(cases) | {"not_permitted", "not_configured", "malformed"} <= REFUSAL_REASONS
+
+
+async def test_decode_reason_stays_off_the_peer_facing_code(bridge):
+    box = Outbox(bridge.registry)
+    env, _ = await box.prepare("alpha", "Question")
+    value = json.loads(env.encode())
+    value["message"]["messageId"] = "not-a-uuid"
+    with pytest.raises(ConversationRefusal) as refused:
+        PeerEnvelope.decode(json.dumps(value))
+    # Peers see code and status only; both are unchanged from before reasons existed.
+    assert (refused.value.code, refused.value.status) == ("outbound_refused", 409)
+    assert refused.value.reason == "invalid_message_id"
+    for field, bad, reason in (
+        ("contextId", "not-a-uuid", "invalid_context_id"),
+        ("parts", [{"text": "the key is " + "nvapi-" + "q" * 40}], "disclosure_blocked"),
+    ):
+        value = json.loads(env.encode())
+        value["message"][field] = bad
+        with pytest.raises(ConversationRefusal) as refused:
+            PeerEnvelope.decode(json.dumps(value))
+        assert refused.value.reason == reason, field
+    value = json.loads(env.encode())
+    value["extra"] = 1
+    for text, reason in (
+        (json.dumps(value), "malformed"),
+        ('{"a": "\ud800"}', "malformed"),  # unencodable: not a size problem
+        ("x" * (256 * 1024 + 1), "too_large"),
+    ):
+        with pytest.raises(ConversationRefusal) as refused:
+            PeerEnvelope.decode(text)
+        assert refused.value.reason == reason
+
+
+async def test_agent_send_unavailable_is_not_ready_not_a_refusal(bridge, monkeypatch):
+    from genesis.mcp import outreach_mcp
+    from genesis.peers import outbox
+
+    async def unavailable(db):
+        raise ConversationRefusal("not_ready", 503)
+
+    monkeypatch.setattr(outreach_mcp, "_db", bridge.db)
+    monkeypatch.setattr(outbox, "registry_for_db", unavailable)
+    assert json.loads(await outreach_mcp.agent_send("alpha", "A question")) == {
+        "code": "not_ready", "status": "refused"
+    }

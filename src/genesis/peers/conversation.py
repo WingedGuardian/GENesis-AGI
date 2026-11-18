@@ -32,8 +32,10 @@ OWNED = (
 
 
 class ConversationRefusal(Exception):
-    def __init__(self, code, status):
-        self.code, self.status = code, status
+    # reason: which rule failed, from outbox.REFUSAL_REASONS, for Genesis's own
+    # caller only. Peer-facing routes render code and status, never reason.
+    def __init__(self, code, status, reason=None):
+        self.code, self.status, self.reason = code, status, reason
         super().__init__(code)
 
 
@@ -76,7 +78,7 @@ async def authorize(db, identity):
         )
     ).fetchone()
     if row is None:
-        raise ConversationRefusal("unauthorized", 403)
+        raise ConversationRefusal("unauthorized", 403, reason="not_permitted")
     return dict(row)
 
 

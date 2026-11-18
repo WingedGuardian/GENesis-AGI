@@ -1,0 +1,1 @@
+- When Genesis refuses to send a message to a peer, the refusal now says which rule failed (for example an id that is not a UUID, an unknown conversation, or text the disclosure scan refused), so the session can fix the request instead of guessing. The refused text is never echoed back.

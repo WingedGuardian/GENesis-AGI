@@ -122,10 +122,21 @@ async def agent_send(
     peer execution. Pass a
     stable message_id on retries. An omitted context_id starts an owned context;
     a supplied one must belong to this enrollment or match that message_id's
-    server-issued retry context.
+    server-issued retry context. message_id and context_id, when given, must be
+    canonical lowercase UUID strings (str(uuid4())).
+
+    A refusal is {"code": "outbound_refused", "status": "refused", "reason": R},
+    R naming the rule that failed: invalid_peer_id, unknown_peer, not_permitted,
+    not_configured, empty_message, invalid_message_id, invalid_context_id,
+    unknown_context, message_id_conflict (same id, different text or context:
+    use a new id), too_large (the JSON-encoded message exceeds 256 KiB; escaped
+    non-ASCII text counts several bytes per character), disclosure_blocked (the disclosure scan refused
+    the text or could not finish scanning it), malformed, or refused. The reason
+    never quotes the text. Unavailability is {"code": "not_ready", "status":
+    "refused"}, with no reason.
     """
     from genesis.peers.conversation import ConversationRefusal
-    from genesis.peers.outbox import Outbox, registry_for_db
+    from genesis.peers.outbox import REFUSAL_REASONS, Outbox, registry_for_db
 
     if _db is None:
         return json.dumps({"code": "not_ready", "status": "refused"})
@@ -140,8 +151,13 @@ async def agent_send(
         pending_id, state = await Outbox(await registry_for_db(_db)).enqueue(envelope)
         return json.dumps({"status": state, **receipt,
                            **({"pending_id": pending_id} if pending_id else {})})
-    except (ConversationRefusal, ValueError):
-        return json.dumps({"code": "outbound_refused", "status": "refused"})
+    except ConversationRefusal as exc:
+        if exc.code == "not_ready":
+            return json.dumps({"code": "not_ready", "status": "refused"})
+        reason = exc.reason if exc.reason in REFUSAL_REASONS else "refused"
+        return json.dumps({"code": "outbound_refused", "status": "refused", "reason": reason})
+    except ValueError:
+        return json.dumps({"code": "outbound_refused", "status": "refused", "reason": "refused"})
     except Exception:
         logger.warning("Peer send unavailable")
         return json.dumps({"code": "not_ready", "status": "refused"})
