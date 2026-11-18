@@ -156,10 +156,12 @@ def test_a_prefix_resolves_by_cc_session_id(db: Path):
     assert [r["id"] for r in po.sessions("0d0d0d0d", db)] == ["99999999-row"]
 
 
-def test_no_row_no_db_or_a_bad_prefix_is_an_empty_answer(db: Path, tmp_path: Path):
+def test_no_row_or_a_bad_prefix_is_an_empty_answer_but_no_database_is_not(db: Path, tmp_path: Path):
     assert po.sessions("12121212", db) == []
-    assert po.sessions("2bc87284", tmp_path / "absent.db") == []
     assert po.sessions("2bc8%", db) == []
+    # A database that is not there was never read: that is not "no such session".
+    with pytest.raises(po.DbUnreadable, match="no session database"):
+        po.sessions("2bc87284", tmp_path / "absent.db")
 
 
 def test_the_database_is_opened_read_only(db: Path):
@@ -461,6 +463,23 @@ def test_local_repos_reads_every_github_remote(tmp_path: Path):
 CREATED = "2026-11-18T03:37:28Z"
 
 
+def test_a_bot_writing_the_copied_line_back_inside_the_window_does_not_win():
+    # Premise check: the hook corrects 99999999 -> 11111111, then a bot that read
+    # the body first writes the copied line back, still inside the window.
+    edits = [
+        _edit("2026-11-18T03:37:55Z", "copied\n\nOpened-by-session: 99999999\n<!-- badge -->"),
+        _edit("2026-11-18T03:37:48Z", "copied\n\nOpened-by-session: 11111111\n"),
+        _edit(CREATED, "copied\n\nOpened-by-session: 99999999\n"),
+    ]
+    assert po.opener("", edits, [], CREATED)[0] == "11111111"
+    # A body created with its own (right) line keeps it.
+    same = [
+        _edit("2026-11-18T03:37:40Z", "x\n\nOpened-by-session: 11111111\n<!-- b -->"),
+        _edit(CREATED, "x\n\nOpened-by-session: 11111111\n"),
+    ]
+    assert po.opener("", same, [], CREATED)[0] == "11111111"
+
+
 def test_a_copied_line_corrected_inside_the_creation_window_names_the_corrector():
     # A rework opens with another PR's body (its line 99999999); the stamp hook
     # replaces it 20 s later. That correction is the opener, not the copied id.
@@ -505,3 +524,143 @@ def test_another_projects_pr_never_borrows_a_local_worktree(monkeypatch, db):
     assert po.report(4642, "other/project")["worktree"] is None
     assert called == []
     assert po.report(4642, "Acme/Widgets")["worktree"] == "/x"
+
+
+# --- round 2: the admission fence, the correction line, a cut history --------------
+
+
+def test_a_quarantined_database_is_never_opened(monkeypatch, tmp_path, db):
+    # CI's opener inventory requires the fence; this checks it is consulted first.
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / ".genesis"))
+    src = str(REPO / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from genesis.db import integrity
+
+    integrity.quarantine_database(db, source="test", detail="unit")
+
+    def no_open(*a, **k):
+        raise AssertionError("a fenced database was opened")
+
+    monkeypatch.setattr(po.sqlite3, "connect", no_open)
+    with pytest.raises(po.DbUnreadable, match="fenced"):
+        po.sessions("2bc87284", db)
+
+
+def test_a_correction_line_overrides_the_record_and_says_so(monkeypatch, db, capsys):
+    monkeypatch.setenv("GENESIS_DB_PATH", str(db))
+    monkeypatch.setattr(po, "worktree_for", lambda branch, cwd=None: None)
+    edits = [_edit("t1", "x\n\nOpened-by-session: 0d0d0d0d"), _edit("t0", "x")]
+    body = "x\n\nOpened-by-session: 0d0d0d0d\nOpened-by-session-correction: 2bc87284\n"
+    _fake_gh(monkeypatch, _view(body, []), _edits(edits))
+    r = po.report(4642, "o/r")
+    assert (r["opener"], r["source"], r["authoritative"]) == ("2bc87284", "corrected", True)
+    assert r["recorded_opener"] == "0d0d0d0d"
+    assert [s["id"] for s in r["opener_sessions"]] == ["2bc87284-aaaa"]
+    assert po.main(["4642"]) == 0
+    out = capsys.readouterr().out
+    assert "from the body's Opened-by-session-correction line" in out
+    assert "the recorded stamp named 0d0d0d0d" in out
+
+
+def test_a_correction_inside_a_fence_or_in_history_only_does_not_count():
+    assert po.correction("```\nOpened-by-session-correction: 2bc87284\n```") is None
+    # A correction is read from the CURRENT body only: removing it undoes it.
+    assert po.correction("x") is None
+    # It is not a stamp either way, so the hook never treats it as one.
+    assert po.stamped("Opened-by-session-correction: 2bc87284") is None
+
+
+def test_a_body_fallback_after_a_cut_history_is_not_authoritative(monkeypatch, db):
+    monkeypatch.setenv("GENESIS_DB_PATH", str(db))
+    monkeypatch.setattr(po, "worktree_for", lambda branch, cwd=None: None)
+    body = "x\n\nOpened-by-session: 2bc87284\n"
+    _fake_gh(monkeypatch, _view(body, []), _edits([_edit("t0", "no line")], total=250))
+    r = po.report(4642, "o/r")
+    assert (r["opener"], r["source"], r["authoritative"]) == ("2bc87284", "body", False)
+    # A stamped version among those read keeps its authority, cut or not.
+    _fake_gh(monkeypatch, _view(body, []), _edits([_edit("t0", body)], total=250))
+    assert po.report(4642, "o/r")["authoritative"] is True
+    # A never-edited body (nothing cut) keeps it too.
+    _fake_gh(monkeypatch, _view(body, []), _edits([]))
+    assert po.report(4642, "o/r")["authoritative"] is True
+
+
+# --- round-2 class audit: never claim more than the read proves --------------------
+
+
+def _quiet(monkeypatch, db):
+    monkeypatch.setenv("GENESIS_DB_PATH", str(db))
+    monkeypatch.setattr(po, "worktree_for", lambda branch, cwd=None: None)
+    monkeypatch.setattr(po, "local_repos", lambda cwd=None: {"o/r"})
+
+
+def test_a_correction_copied_with_the_body_is_ignored(monkeypatch, db):
+    # S1: a rework copies another PR's body, correction line included. The body
+    # GitHub first recorded already carried it, so it is not this PR's correction.
+    _quiet(monkeypatch, db)
+    copied = "x\nOpened-by-session-correction: aaaaaaaa\n"
+    stamped_now = copied + "\nOpened-by-session: 2bc87284\n"
+    edits = [_edit("t1", stamped_now), _edit("t0", copied)]
+    _fake_gh(monkeypatch, _view(stamped_now, []), _edits(edits))
+    r = po.report(4642, "o/r")
+    assert (r["opener"], r["source"]) == ("2bc87284", "body")
+    # A never-edited body has no history: a correction there came with it.
+    _fake_gh(monkeypatch, _view(copied, []), _edits([]))
+    assert po.report(4642, "o/r")["source"] != "corrected"
+
+
+def test_a_correction_is_authoritative_even_when_the_record_is_unproven(monkeypatch, db, capsys):
+    # S4: the record is a body fallback after a cut history; the hand correction
+    # stands on its own and the text says why the record is not proven.
+    _quiet(monkeypatch, db)
+    body = "x\nOpened-by-session: 0d0d0d0d\nOpened-by-session-correction: 2bc87284\n"
+    _fake_gh(monkeypatch, _view(body, []), _edits([_edit("t0", "x")], total=250))
+    r = po.report(4642, "o/r")
+    assert (r["source"], r["authoritative"], r["recorded_unproven"]) == ("corrected", True, True)
+    assert po.main(["4642", "--repo", "o/r"]) == 0
+    assert "not proven: the history read was cut" in capsys.readouterr().out
+
+
+def test_an_unread_database_never_prints_no_session_row(monkeypatch, tmp_path, capsys):
+    # S2: a missing database is "not read", never "no cc_sessions row".
+    monkeypatch.setenv("GENESIS_DB_PATH", str(tmp_path / "absent.db"))
+    monkeypatch.setattr(po, "worktree_for", lambda branch, cwd=None: None)
+    view = _view("Opened-by-session: 2bc87284", [_commit("f", "b\n\nGenesis-Session: 0d0d0d0d")])
+    _fake_gh(monkeypatch, view, _edits([]))
+    assert po.main(["4642"]) == 0
+    out = capsys.readouterr().out
+    assert "no cc_sessions row" not in out
+    assert out.count("session database not read") == 2
+    assert "no session database on this install" in out
+
+
+def test_a_capped_commit_list_is_said(monkeypatch, db, capsys):
+    # S3: gh returns at most 100 commits (MEASURED 123 -> 100 on one PR).
+    _quiet(monkeypatch, db)
+    commits = [_commit(f"c{i}") for i in range(100)]
+    _fake_gh(monkeypatch, _view("", commits), _edits([]))
+    assert po.report(4642, "o/r")["commits_capped"] is True
+    assert po.main(["4642", "--repo", "o/r"]) == 0
+    assert "gh returns at most 100 commits" in capsys.readouterr().out
+    _fake_gh(monkeypatch, _view("", commits[:99]), _edits([]))
+    assert po.report(4642, "o/r")["commits_capped"] is False
+
+
+def test_the_worktree_line_says_why_none_was_looked_up(monkeypatch, db):
+    # N2: "none on this install" only when it was looked up.
+    _quiet(monkeypatch, db)
+    _fake_gh(monkeypatch, {**_view("", []), "isCrossRepository": True}, _edits([]))
+    assert po.report(4642, "o/r")["worktree_note"] == "not looked up: a fork's branch"
+    _fake_gh(monkeypatch, _view("", []), _edits([]))
+    assert po.report(4642, "elsewhere/x")["worktree_note"].startswith("not looked up")
+    assert po.report(4642, "o/r")["worktree_note"] == "none on this install"
+
+
+def test_a_charter_under_the_row_id_is_preferred_when_both_ids_carry_one(db: Path):
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO session_charters VALUES ('99999999-row', 'row id mission')")
+    con.execute("INSERT INTO session_charters VALUES ('0d0d0d0d-cc', 'cc id mission')")
+    con.commit()
+    con.close()
+    assert [r["mission"] for r in po.sessions("0d0d0d0d", db)] == ["row id mission"]

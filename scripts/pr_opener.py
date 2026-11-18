@@ -6,13 +6,21 @@
 Read-only. It asks GitHub for the PR and answers from the first source that
 names a session:
 
+0. ``corrected``: an ``Opened-by-session-correction: <8hex>`` line in the CURRENT
+   body, written by hand to fix a wrong attribution. It counts only when the body
+   GitHub first recorded did not carry it (a body copied from another PR copies
+   its correction too). It overrides the record below, which is still reported
+   (``recorded_opener``), because the record by design cannot be changed by
+   editing the line it came from;
 1. the body's ``Opened-by-session: <8hex>`` line as GitHub's edit history first
    recorded it: the newest stamped version written within ``CREATION_WINDOW`` of
    the PR's creation (where the stamp hook corrects a copied line), else the
-   oldest stamped version. GitHub keeps every version, so a later rewrite that
-   drops or replaces the line cannot change the answer. Its source is ``body``
-   when the current body still says the same, else ``history``;
-2. ``body``: the current body's line, when the body was never edited;
+   oldest stamped version. GitHub keeps every version (unless the PR's author
+   deletes one by hand), so a later rewrite that drops or replaces the line cannot
+   change the answer. Its source is ``body`` when the current body still says the
+   same, else ``history``;
+2. ``body``: the current body's line, when no version read carries one (the body
+   was never edited, or the history read was cut: then it is not authoritative);
 3. ``commit``: the ``Genesis-Session: <8hex>`` trailer of the PR's first
    commit, which ``scripts/hooks/prepare-commit-msg`` stamps. That names the
    session that wrote the first commit, which is usually, not always, the one
@@ -38,6 +46,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 LINE = re.compile(r"^Opened-by-session: ([0-9a-f]{8})[ \t]*$")
+#: A deliberate fix of a wrong attribution, written by hand in the CURRENT body.
+#: It overrides the history (which a rewrite must not be able to change); the
+#: stamp hook never writes or removes it.
+CORRECTION = re.compile(r"^Opened-by-session-correction: ([0-9a-f]{8})[ \t]*$")
 #: A CommonMark code fence: up to three spaces, then three or more backticks or
 #: tildes. It closes only on a fence of the SAME character, at least as long, with
 #: nothing after it; a fence never closed runs to the end of the text.
@@ -71,17 +83,22 @@ def trailer_sessions(message: str) -> list[str]:
     return found
 
 
-def stamped(text: str) -> str | None:
+def stamped(text: str, pattern: re.Pattern[str] = LINE) -> str | None:
     """The first ``Opened-by-session`` line in ``text``, outside fences and quotes.
 
     A PR that documents the line shows it in a fence or a quote; that example is
     not a stamp. A quoted line starts with ``>``, so LINE never matches it."""
     lines = (text or "").replace("\r\n", "\n").split("\n")
     for line, fenced in zip(lines, fenced_flags(lines), strict=True):
-        m = None if fenced else LINE.match(line)
+        m = None if fenced else pattern.match(line)
         if m:
             return m.group(1)
     return None
+
+
+def correction(body: str) -> str | None:
+    """The current body's ``Opened-by-session-correction`` line, if any."""
+    return stamped(body, CORRECTION)
 
 
 def fenced_flags(lines: list[str]) -> list[bool]:
@@ -140,7 +157,12 @@ def opener(
                 if (_when(e.get("editedAt")) or created) <= created + CREATION_WINDOW
             ]
             if early:
-                chosen = early[-1]
+                # A bot that read the body before the stamp can write the copied
+                # line back inside the window: the newest stamp that DIFFERS from
+                # the one the body was created with is the correction, else that one.
+                first = stamped(versions[0][0].get("diff") or "") if versions else None
+                changed = [s for s in early if s != first]
+                chosen = changed[-1] if changed else early[-1]
         return chosen, "body" if chosen == now else "history"
     if now:
         return now, "body"
@@ -197,21 +219,38 @@ def _db_path() -> Path:
 
 def sessions(prefix: str, db: Path) -> list[dict]:
     """cc_sessions rows whose id or cc_session_id starts with ``prefix``."""
-    if not re.fullmatch(r"[0-9a-f]{8}", prefix) or not db.is_file():
+    if not re.fullmatch(r"[0-9a-f]{8}", prefix):
         return []
+    if not db.is_file():
+        raise DbUnreadable("no session database on this install")
     queries = (
         # A charter is keyed by whichever id its writer had: MEASURED on this
         # install, of two sessions whose ids differ, one charter is under each.
         "SELECT s.id, s.session_type, s.status, s.started_at, s.last_activity_at, s.topic,"
-        " (SELECT c.mission FROM session_charters c"
-        "  WHERE c.session_id IN (s.id, s.cc_session_id) AND c.mission IS NOT NULL"
-        "  LIMIT 1) AS mission"
+        " COALESCE("
+        "  (SELECT c.mission FROM session_charters c WHERE c.session_id = s.id),"
+        "  (SELECT c.mission FROM session_charters c WHERE c.session_id = s.cc_session_id)"
+        " ) AS mission"
         " FROM cc_sessions s WHERE s.id LIKE ? OR s.cc_session_id LIKE ? ORDER BY s.started_at",
         # An install from before charters has no session_charters table.
         "SELECT s.id, s.session_type, s.status, s.started_at, s.last_activity_at, s.topic,"
         " NULL AS mission"
         " FROM cc_sessions s WHERE s.id LIKE ? OR s.cc_session_id LIKE ? ORDER BY s.started_at",
     )
+    # A quarantined database is never opened, not even read-only (the admission
+    # fence every script-side opener consults; it fails closed).
+    hooks = str(Path(__file__).resolve().parent / "hooks")
+    if hooks not in sys.path:
+        sys.path.insert(0, hooks)
+    try:
+        from db_admission_check import database_is_fenced
+    except Exception:  # noqa: BLE001 - no fence helper: do not open
+        raise DbUnreadable("the database admission check could not be loaded") from None
+    if database_is_fenced(db):
+        raise DbUnreadable(
+            "the database is fenced (quarantined, or its fence state could not be read),"
+            " so it was not opened"
+        )
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
     except sqlite3.Error as exc:
@@ -288,29 +327,50 @@ def report(number: int, repo: str) -> dict:
     prefix, source = opener(
         pr.get("body") or "", history["nodes"], pr.get("commits") or [], pr.get("createdAt")
     )
+    recorded = prefix if source in ("body", "history") else None
+    truncated = history["totalCount"] > len(history["nodes"])
+    # The current body answered only because no version read carried a stamp. With
+    # the history cut, an unread version may hold the real first stamp.
+    unproven = (
+        source == "body"
+        and truncated
+        and not any(stamped(e.get("diff") or "") for e in history["nodes"])
+    )
+    nodes = history["nodes"]
+    # The oldest node is the body as created (`last:` reads the oldest versions).
+    # A never-edited body has no nodes: a correction there came with the body.
+    original = (nodes[-1].get("diff") or "") if nodes else None
+    fixed = correction(pr.get("body") or "")
+    if fixed and original is not None and not correction(original):
+        prefix, source = fixed, "corrected"
     committers: list[str] = []
     for commit in pr.get("commits") or []:
         for s in trailer_sessions(_message(commit)):
             if s not in committers:
                 committers.append(s)
     db_problem = None
-    opener_rows: list[dict] = []
-    commit_rows: dict[str, list[dict]] = {s: [] for s in committers}
+    # None = not looked up (the database was not read), never "no such session".
+    opener_rows: list[dict] | None = None
+    commit_rows: dict[str, list[dict] | None] = {s: None for s in committers}
     try:
         db = _db_path()
-        opener_rows = sessions(prefix, db) if prefix else []
+        opener_rows = sessions(prefix, db) if prefix else None
         commit_rows = {s: sessions(s, db) for s in committers}
     except (DbUnreadable, RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
         db_problem = str(exc)[:300]
     # A branch name says something about this install's worktrees only for a PR
     # whose head lives in a repository this checkout has as a remote: never a
     # fork's, never another project's (--repo).
-    worktree = None
+    worktree, worktree_note = None, "none on this install"
     try:
-        if not pr.get("isCrossRepository") and repo.casefold() in local_repos():
+        if pr.get("isCrossRepository"):
+            worktree_note = "not looked up: a fork's branch"
+        elif repo.casefold() not in local_repos():
+            worktree_note = "not looked up: not one of this checkout's repositories"
+        else:
             worktree = worktree_for(pr["headRefName"])
     except (RuntimeError, OSError, subprocess.TimeoutExpired):
-        worktree = None
+        worktree_note = "not looked up: git could not list this checkout's worktrees"
     return {
         "pr": pr["number"],
         "title": pr["title"],
@@ -322,17 +382,25 @@ def report(number: int, repo: str) -> dict:
         "source": source,
         # Only a stamped line names the opener; a trailer names who wrote the
         # first commit, usually but not always the same session.
-        "authoritative": source in ("body", "history"),
+        "authoritative": source == "corrected" or (source in ("body", "history") and not unproven),
+        "recorded_opener": recorded,
+        "recorded_unproven": unproven,
         "body_line_now": stamped(pr.get("body") or ""),
         "opener_sessions": opener_rows,
         "commit_sessions": commit_rows,
         "db_problem": db_problem,
         "worktree": worktree,
-        "history_truncated": history["totalCount"] > len(history["nodes"]),
+        "worktree_note": worktree_note,
+        "history_truncated": truncated,
+        # gh returns at most 100 commits (MEASURED, gh 2.100: 123 -> 100); the
+        # first commit is always among them, later sessions may not be.
+        "commits_capped": len(pr.get("commits") or []) >= 100,
     }
 
 
-def _describe(rows: list[dict]) -> str:
+def _describe(rows: list[dict] | None) -> str:
+    if rows is None:
+        return "    (session database not read; see the NOTE below)"
     if not rows:
         return "    (no cc_sessions row on this install)"
     return "\n".join(
@@ -365,22 +433,30 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(r, indent=2))
         return 0
     print(f"#{r['pr']} {r['title']} ({r['state']}, opened {r['created_at']})")
-    print(f"  branch {r['branch']}, worktree {r['worktree'] or '(none on this install)'}")
+    print(f"  branch {r['branch']}, worktree {r['worktree'] or '(' + r['worktree_note'] + ')'}")
     if r["opener"]:
         how = {
             "body": "the body's Opened-by-session line",
             "history": "the oldest version of the body that carries the line",
+            "corrected": "the body's Opened-by-session-correction line",
             "commit": "the first commit's Genesis-Session trailer (wrote it; may not have opened it)",
         }
         print(f"  opened by session {r['opener']}, from {how[r['source']]}")
         print(_describe(r["opener_sessions"]))
+        if r["source"] == "corrected" and r["recorded_opener"] != r["opener"]:
+            was = r["recorded_opener"] or "no session"
+            proof = ", not proven: the history read was cut" if r["recorded_unproven"] else ""
+            print(f"  (corrected by hand; the recorded stamp named {was}{proof})")
+        if not r["authoritative"] and r["source"] == "body":
+            print("  not proven: the edit history was cut, and an unread version may differ")
         if r["source"] == "history":
             now = r["body_line_now"]
             print(f"  the body now says {now}" if now else "  the body no longer carries the line")
     else:
         print(
-            "  no session recorded: no Opened-by-session line, none in the edit history,"
-            " no Genesis-Session trailer on the first commit"
+            "  no session recorded: no Opened-by-session line, none in the edit history"
+            + (f" read (the oldest {EDITS_PAGE} versions)" if r["history_truncated"] else "")
+            + ", no Genesis-Session trailer on the first commit"
         )
     others = {s: rows for s, rows in r["commit_sessions"].items() if s != r["opener"]}
     for s, rows in others.items():
@@ -390,6 +466,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  NOTE: the session database could not be read ({r['db_problem']})")
     if r["history_truncated"]:
         print(f"  NOTE: only the oldest {EDITS_PAGE} body edits were read")
+    if r["commits_capped"]:
+        print("  NOTE: gh returns at most 100 commits; later sessions may be missing above")
     return 0
 
 
