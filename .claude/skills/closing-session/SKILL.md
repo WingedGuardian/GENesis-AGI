@@ -549,7 +549,8 @@ comment and label moves it.
    there whose first line is not `(aside)` can start a paid Devin session, so
    `compose` writes that line first, and the parser accepts no other line before
    the header. After that optional line, the comment is one closed-grammar
-   header that code reads, and prose under it that code never parses:
+   header that code reads, and prose under it that no reader judges by
+   (`compose` checks only its `- DONE:` and `Asked:` lines):
 
    ```
    <!-- genesis-delivery-check: head=<40 hex> basis=<B> verdict=<V> scope=<S> [intended=<I>] [change=<C>] [coderabbit=<R>] [checker=<K>] [outcome=<O>] -->
@@ -568,8 +569,17 @@ comment and label moves it.
    `intended=` is required on an `issue:` basis and is `n/a` on any other, and
    `outcome=` goes only with `checker=author-review`, matching the verdict
    (`converged` and `converged-with-carried` are DELIVERS, `open` is PARTIAL).
-   Under the header, a DELIVERS needs at least one line of the form
-   `- DONE: <point> (`path:line`)` citing a file the PR changes. One owner
+   `compose` writes the line under the header ("Delivery check at <head>
+   against <basis>"). The prose file you give it holds, in this layout: an
+   `Asked: "<the basis sentence the verdict turns on>"` line, quoted verbatim
+   on one line (on an issue basis `compose` hands it to a configured second
+   reader);
+   one line per point, `- DONE: <point> (`path:line`)`,
+   `- PARTIAL: <point>: <what is missing>`, and likewise `- NOT DONE:`,
+   `- CHANGED:` and `- UNVERIFIABLE:`; `Wrong fix named by the issue: "<...>":
+   not taken (`path:line`) | taken | none named`; `Scope: <clean, or the
+   unrequested part>`; and `Author questions: <each, answered here>`. A
+   DELIVERS needs at least one `- DONE:` line citing a file the PR changes. One owner
    comment per PR, edited in place when the read is redone; a block by anyone
    else, or in a review body, does not count. The comment is public: technical
    content only.
