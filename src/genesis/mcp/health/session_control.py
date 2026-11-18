@@ -12,6 +12,20 @@ from genesis.mcp.health import mcp  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+async def _applied_effort(db, session_id: str) -> str | None:
+    """The effort the session row holds after an update (#4854), or None when it
+    cannot be read: the switch itself already succeeded."""
+    from genesis.db.crud import cc_sessions
+
+    try:
+        row = await cc_sessions.get_by_id(db, session_id)
+    except Exception:
+        logger.warning("Could not read back the effort for %s", session_id[:8], exc_info=True)
+        return None
+    effort = row.get("effort") if isinstance(row, dict) else None
+    return effort if isinstance(effort, str) else None
+
+
 async def _impl_session_set_model(session_id: str, model: str) -> dict:
     import genesis.mcp.health_mcp as health_mcp_mod
 
@@ -32,8 +46,12 @@ async def _impl_session_set_model(session_id: str, model: str) -> dict:
         )
         if not updated:
             return {"error": f"Session '{session_id}' not found"}
-        _persist_session_config(model=model)
-        return {"success": True, "model": model, "note": "Takes effect on your next response."}
+        effort = await _applied_effort(_service._db, session_id)
+        _persist_session_config(model=model, effort=effort)
+        result = {"success": True, "model": model, "note": "Takes effect on your next response."}
+        if effort:
+            result["effort"] = effort
+        return result
     except Exception as exc:
         logger.error("session_config model failed for %s: %s", session_id[:8], exc, exc_info=True)
         return {"error": f"Failed to update session model: {type(exc).__name__}: {exc}"}
@@ -115,6 +133,9 @@ async def session_config(
         )
         if not updated:
             return {"error": f"Session '{session_id}' not found"}
+        if clean_model is not None and clean_effort is None:
+            # A model-only switch may have taken the channel's per-model effort.
+            clean_effort = await _applied_effort(_service._db, session_id)
     except Exception as exc:
         logger.error("session_config failed for %s: %s", session_id[:8], exc, exc_info=True)
         return {"error": f"Failed to update session: {type(exc).__name__}: {exc}"}

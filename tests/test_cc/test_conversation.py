@@ -97,6 +97,74 @@ async def test_model_override(loop, mock_invoker):
 
 
 @pytest.mark.asyncio
+async def test_model_switch_takes_the_channels_per_model_effort(loop, mock_invoker, monkeypatch):
+    """`/model opus` with no effort takes the channel's opus default (#4854); an
+    explicit effort still wins, and the stored row keeps what was chosen."""
+    from genesis.channels import config as channel_config
+    from genesis.db.crud import cc_sessions
+
+    monkeypatch.setattr(
+        channel_config,
+        "_load_yaml_merged",
+        lambda name: {"telegram": {"default_effort_by_model": {"opus": "low"}}},
+    )
+    await loop.handle_message("/model opus hello", user_id="tg-9", channel=ChannelType.TELEGRAM)
+    assert mock_invoker.run.call_args[0][0].effort == EffortLevel.LOW
+    row = await cc_sessions.get_active_foreground(
+        loop._db, user_id="tg-9", channel=str(ChannelType.TELEGRAM), thread_id=None
+    )
+    assert (row["model"], row["effort"]) == ("opus", "low")
+
+    await loop.handle_message(
+        "/model opus /effort max hi", user_id="tg-9", channel=ChannelType.TELEGRAM
+    )
+    assert mock_invoker.run.call_args[0][0].effort == EffortLevel.MAX
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_effort_equal_to_the_stored_one_survives_a_switch(
+    loop, mock_invoker, monkeypatch
+):
+    """Stored sonnet/high, then `/model opus /effort high`: the explicit high is kept,
+    not replaced by the opus default (the chokepoint must be handed the effort)."""
+    from genesis.channels import config as channel_config
+    from genesis.db.crud import cc_sessions
+
+    monkeypatch.setattr(
+        channel_config,
+        "_load_yaml_merged",
+        lambda name: {"telegram": {"default_effort_by_model": {"opus": "low"}}},
+    )
+    await loop.handle_message(
+        "/model sonnet /effort high hi", user_id="tg-8", channel=ChannelType.TELEGRAM
+    )
+    await loop.handle_message(
+        "/model opus /effort high hi", user_id="tg-8", channel=ChannelType.TELEGRAM
+    )
+    assert mock_invoker.run.call_args[0][0].effort == EffortLevel.HIGH
+    row = await cc_sessions.get_active_foreground(
+        loop._db, user_id="tg-8", channel=str(ChannelType.TELEGRAM), thread_id=None
+    )
+    assert (row["model"], row["effort"]) == ("opus", "high")
+
+
+@pytest.mark.asyncio
+async def test_restating_the_current_model_keeps_a_chosen_effort(loop, mock_invoker, monkeypatch):
+    from genesis.channels import config as channel_config
+
+    monkeypatch.setattr(
+        channel_config,
+        "_load_yaml_merged",
+        lambda name: {"telegram": {"default_effort_by_model": {"opus": "low"}}},
+    )
+    await loop.handle_message(
+        "/model opus /effort max hi", user_id="tg-7", channel=ChannelType.TELEGRAM
+    )
+    await loop.handle_message("/model opus hi", user_id="tg-7", channel=ChannelType.TELEGRAM)
+    assert mock_invoker.run.call_args[0][0].effort == EffortLevel.MAX
+
+
+@pytest.mark.asyncio
 async def test_effort_override(loop, mock_invoker):
     await loop.handle_message("/effort high hello", user_id="u1", channel=ChannelType.TERMINAL)
     call_args = mock_invoker.run.call_args[0][0]

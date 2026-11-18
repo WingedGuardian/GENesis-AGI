@@ -578,9 +578,7 @@ class ConversationLoop:
         model = intent.model_override or (
             CCModel(session["model"]) if session and session.get("model") else self._default_model
         )
-        effort = intent.effort_override or (
-            EffortLevel(session["effort"]) if session and session.get("effort") else self._default_effort
-        )
+        effort = self._resolve_effort(intent, model, session, channel)
 
         # Get or create session, persist any model/effort changes
         session = await self._session_mgr.get_or_create_foreground(
@@ -902,9 +900,7 @@ class ConversationLoop:
         model = intent.model_override or (
             CCModel(session["model"]) if session and session.get("model") else self._default_model
         )
-        effort = intent.effort_override or (
-            EffortLevel(session["effort"]) if session and session.get("effort") else self._default_effort
-        )
+        effort = self._resolve_effort(intent, model, session, channel)
 
         session = await self._session_mgr.get_or_create_foreground(
             user_id=user_id, channel=channel, model=model, effort=effort,
@@ -2022,12 +2018,38 @@ class ConversationLoop:
         )
         return new_session
 
+    def _resolve_effort(self, intent, model: CCModel, session, channel) -> EffortLevel:
+        """Explicit effort > the channel's per-model default on a model switch (#4854)
+        > the session's stored effort > the config default."""
+        if intent.effort_override:
+            return intent.effort_override
+        switching = intent.model_override and (
+            not session or session.get("model") != str(model)
+        )
+        if switching:
+            try:
+                from genesis.channels.config import default_effort_for_model
+
+                per_model = default_effort_for_model(str(channel), str(model))
+            except Exception:
+                logger.warning("Per-model effort lookup failed", exc_info=True)
+                per_model = None
+            if per_model:
+                return per_model
+        if session and session.get("effort"):
+            return EffortLevel(session["effort"])
+        return self._default_effort
+
     async def _persist_overrides(
         self, session: dict, model: CCModel, effort: EffortLevel,
     ) -> None:
         """If model or effort changed from what the session stores, update DB."""
         new_model = str(model) if str(model) != session.get("model") else None
         new_effort = str(effort) if str(effort) != session.get("effort") else None
+        if new_model:
+            # Pass the effort with every model change, so an explicit effort that
+            # equals the stored one is not replaced by the per-model default (#4854).
+            new_effort = str(effort)
         if new_model or new_effort:
             await cc_sessions.update_model_effort(
                 self._db, session["id"], model=new_model, effort=new_effort,

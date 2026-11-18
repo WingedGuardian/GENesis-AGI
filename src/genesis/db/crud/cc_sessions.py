@@ -662,6 +662,28 @@ async def set_turn_totals(
     return cursor.rowcount > 0
 
 
+async def _per_model_effort(db: aiosqlite.Connection, id: str, model: str) -> str | None:
+    """The configured effort for ``model`` on this session's channel, or None.
+
+    Never raises: an unreadable config or row leaves the effort unchanged, and the
+    model switch itself still happens.
+    """
+    try:
+        cursor = await db.execute("SELECT channel, model FROM cc_sessions WHERE id = ?", (id,))
+        row = await cursor.fetchone()
+        # Only a SWITCH takes the default: re-stating the current model keeps
+        # an effort the user set since.
+        if not row or not row[0] or row[1] == model:
+            return None
+        from genesis.channels.config import default_effort_for_model
+
+        effort = default_effort_for_model(row[0], model)
+    except Exception:
+        _logger.warning("Per-model effort lookup failed for session %s", id, exc_info=True)
+        return None
+    return effort.value if effort else None
+
+
 async def update_model_effort(
     db: aiosqlite.Connection,
     id: str,
@@ -669,7 +691,14 @@ async def update_model_effort(
     model: str | None = None,
     effort: str | None = None,
 ) -> bool:
-    """Update model and/or effort on an existing session."""
+    """Update model and/or effort on an existing session.
+
+    A model given without an effort takes the session channel's per-model default
+    when one is configured (``default_effort_for_model``, #4854); every model
+    switch goes through here, so no caller has to remember it.
+    """
+    if model is not None and effort is None:
+        effort = await _per_model_effort(db, id, model)
     updates = []
     params: list = []
     if model is not None:
