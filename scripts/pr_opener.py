@@ -6,10 +6,12 @@
 Read-only. It asks GitHub for the PR and answers from the first source that
 names a session:
 
-1. the OLDEST version of the body that carries an ``Opened-by-session: <8hex>``
-   line: GitHub keeps every version in the PR's edit history, so a later
-   rewrite that drops or replaces the line cannot change the answer. Its source
-   is ``body`` when the current body still says the same, else ``history``;
+1. the body's ``Opened-by-session: <8hex>`` line as GitHub's edit history first
+   recorded it: the newest stamped version written within ``CREATION_WINDOW`` of
+   the PR's creation (where the stamp hook corrects a copied line), else the
+   oldest stamped version. GitHub keeps every version, so a later rewrite that
+   drops or replaces the line cannot change the answer. Its source is ``body``
+   when the current body still says the same, else ``history``;
 2. ``body``: the current body's line, when the body was never edited;
 3. ``commit``: the ``Genesis-Session: <8hex>`` trailer of the PR's first
    commit, which ``scripts/hooks/prepare-commit-msg`` stamps. That names the
@@ -32,14 +34,23 @@ import re
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 LINE = re.compile(r"^Opened-by-session: ([0-9a-f]{8})[ \t]*$")
-#: A Markdown code fence opens or closes on a line starting with ``` or ~~~.
-_FENCE = re.compile(r"^\s{0,3}(```|~~~)")
+#: A CommonMark code fence: up to three spaces, then three or more backticks or
+#: tildes. It closes only on a fence of the SAME character, at least as long, with
+#: nothing after it; a fence never closed runs to the end of the text.
+_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_REMOTE = re.compile(r"github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
 # Same rule as scripts/hooks/gh_merge.py _SESSION_TRAILER (either case).
 TRAILER = re.compile(r"^Genesis-Session: ([0-9a-fA-F]{8})$")
 EDITS_PAGE = 100
+#: How long after a PR's creation the stamp hook's own write can land: its 45 s
+#: budget after a create call that may itself take seconds, with margin. Bots that
+#: edit later (CodeRabbit's first edit came at 98 s or more, MEASURED) keep the
+#: text they find and add no session id.
+CREATION_WINDOW = timedelta(seconds=120)
 # GitHub lists edits newest first, and the original body is the last node, so
 # `last:` reads the OLDEST versions: the ones a later rewrite cannot have touched.
 _EDITS_QUERY = (
@@ -65,27 +76,72 @@ def stamped(text: str) -> str | None:
 
     A PR that documents the line shows it in a fence or a quote; that example is
     not a stamp. A quoted line starts with ``>``, so LINE never matches it."""
-    fenced = False
-    for line in (text or "").replace("\r\n", "\n").split("\n"):
-        if _FENCE.match(line):
-            fenced = not fenced
-            continue
+    lines = (text or "").replace("\r\n", "\n").split("\n")
+    for line, fenced in zip(lines, fenced_flags(lines), strict=True):
         m = None if fenced else LINE.match(line)
         if m:
             return m.group(1)
     return None
 
 
-def opener(body: str, edits: list[dict], commits: list[dict]) -> tuple[str | None, str]:
+def fenced_flags(lines: list[str]) -> list[bool]:
+    """For each line, whether it is a fence line or inside a fenced code block."""
+    flags: list[bool] = []
+    opened: tuple[str, int] | None = None
+    for line in lines:
+        m = _FENCE.match(line)
+        if opened is None:
+            # A backtick fence's info string cannot hold a backtick (CommonMark).
+            if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+                opened = (m.group(1)[0], len(m.group(1)))
+                flags.append(True)
+            else:
+                flags.append(False)
+            continue
+        flags.append(True)
+        if (
+            m
+            and m.group(1)[0] == opened[0]
+            and len(m.group(1)) >= opened[1]
+            and not m.group(2).strip()
+        ):
+            opened = None
+    return flags
+
+
+def _when(value: object) -> datetime | None:
+    try:
+        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo is not None else None
+
+
+def opener(
+    body: str, edits: list[dict], commits: list[dict], created_at: str | None = None
+) -> tuple[str | None, str]:
     """(prefix, source) per the order in the module docstring; (None, "none")."""
     now = stamped(body)
     # MEASURED: GitHub lists edits newest first and the original body last, and two
     # versions can share a timestamp (an original and Devin's edit in the same
     # second on one PR), so the list's own order is used, reversed, never a sort.
-    for edit in reversed(edits):
-        first = stamped(edit.get("diff") or "")
-        if first:
-            return first, "body" if first == now else "history"
+    versions = [(e, stamped(e.get("diff") or "")) for e in reversed(edits)]
+    stamps = [(e, s) for e, s in versions if s]
+    if stamps:
+        chosen = stamps[0][1]
+        # A body opened with a COPIED line (a rework reusing another PR's body) is
+        # corrected by the stamp hook seconds later, so the newest stamp written in
+        # the creation window wins; after it, a rewrite cannot change the answer.
+        created = _when(created_at)
+        if created is not None:
+            early = [
+                s
+                for e, s in stamps
+                if (_when(e.get("editedAt")) or created) <= created + CREATION_WINDOW
+            ]
+            if early:
+                chosen = early[-1]
+        return chosen, "body" if chosen == now else "history"
     if now:
         return now, "body"
     for commit in commits[:1]:
@@ -103,15 +159,25 @@ class DbUnreadable(Exception):
     """The install's database could not be read; the PR-side answer still stands."""
 
 
+#: A read against GitHub's API answers in about a second; this bounds a hung
+#: connection so an interactive lookup returns with a named error, not never.
+_GH_TIMEOUT_S = 60
+#: Local, read-only git plumbing (rev-parse, worktree list): milliseconds normally;
+#: this bounds only a stuck filesystem or a held lock.
+_GIT_TIMEOUT_S = 30
+
+
 def _gh(args: list[str]) -> dict:
-    out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60)
+    out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=_GH_TIMEOUT_S)
     if out.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args[:3])} failed: {out.stderr.strip()[:300]}")
     return json.loads(out.stdout)
 
 
 def _git(args: list[str], cwd: Path) -> str:
-    out = subprocess.run(["git", *args], capture_output=True, text=True, cwd=cwd, timeout=30)
+    out = subprocess.run(
+        ["git", *args], capture_output=True, text=True, cwd=cwd, timeout=_GIT_TIMEOUT_S
+    )
     if out.returncode != 0:
         raise RuntimeError(f"git {args[0]} failed: {out.stderr.strip()[:300]}")
     return out.stdout
@@ -133,13 +199,18 @@ def sessions(prefix: str, db: Path) -> list[dict]:
     """cc_sessions rows whose id or cc_session_id starts with ``prefix``."""
     if not re.fullmatch(r"[0-9a-f]{8}", prefix) or not db.is_file():
         return []
-    cols = "SELECT s.id, s.session_type, s.status, s.started_at, s.last_activity_at, s.topic"
-    where = " WHERE s.id LIKE ? OR s.cc_session_id LIKE ? ORDER BY s.started_at"
     queries = (
-        cols + ", c.mission FROM cc_sessions s"
-        " LEFT JOIN session_charters c ON c.session_id = s.id" + where,
+        # A charter is keyed by whichever id its writer had: MEASURED on this
+        # install, of two sessions whose ids differ, one charter is under each.
+        "SELECT s.id, s.session_type, s.status, s.started_at, s.last_activity_at, s.topic,"
+        " (SELECT c.mission FROM session_charters c"
+        "  WHERE c.session_id IN (s.id, s.cc_session_id) AND c.mission IS NOT NULL"
+        "  LIMIT 1) AS mission"
+        " FROM cc_sessions s WHERE s.id LIKE ? OR s.cc_session_id LIKE ? ORDER BY s.started_at",
         # An install from before charters has no session_charters table.
-        cols + ", NULL AS mission FROM cc_sessions s" + where,
+        "SELECT s.id, s.session_type, s.status, s.started_at, s.last_activity_at, s.topic,"
+        " NULL AS mission"
+        " FROM cc_sessions s WHERE s.id LIKE ? OR s.cc_session_id LIKE ? ORDER BY s.started_at",
     )
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
@@ -158,6 +229,18 @@ def sessions(prefix: str, db: Path) -> list[dict]:
         raise DbUnreadable(str(last))
     finally:
         con.close()
+
+
+def local_repos(cwd: Path | None = None) -> set[str]:
+    """``owner/name`` (casefolded) of every github.com remote of this checkout."""
+    out = _git(["remote", "-v"], cwd or Path(__file__).resolve().parent)
+    found = set()
+    for line in out.splitlines():
+        parts = line.split()
+        m = _REMOTE.search(parts[1]) if len(parts) >= 2 else None
+        if m:
+            found.add(m.group(1).casefold())
+    return found
 
 
 def worktree_for(branch: str, cwd: Path | None = None) -> str | None:
@@ -202,7 +285,9 @@ def report(number: int, repo: str) -> dict:
     if data.get("errors") or not (data.get("data") or {}).get("repository"):
         raise RuntimeError(f"the edit-history query failed: {str(data.get('errors'))[:300]}")
     history = data["data"]["repository"]["pullRequest"]["userContentEdits"]
-    prefix, source = opener(pr.get("body") or "", history["nodes"], pr.get("commits") or [])
+    prefix, source = opener(
+        pr.get("body") or "", history["nodes"], pr.get("commits") or [], pr.get("createdAt")
+    )
     committers: list[str] = []
     for commit in pr.get("commits") or []:
         for s in trailer_sessions(_message(commit)):
@@ -217,8 +302,15 @@ def report(number: int, repo: str) -> dict:
         commit_rows = {s: sessions(s, db) for s in committers}
     except (DbUnreadable, RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
         db_problem = str(exc)[:300]
-    # A fork's branch name says nothing about this install's worktrees.
-    worktree = None if pr.get("isCrossRepository") else worktree_for(pr["headRefName"])
+    # A branch name says something about this install's worktrees only for a PR
+    # whose head lives in a repository this checkout has as a remote: never a
+    # fork's, never another project's (--repo).
+    worktree = None
+    try:
+        if not pr.get("isCrossRepository") and repo.casefold() in local_repos():
+            worktree = worktree_for(pr["headRefName"])
+    except (RuntimeError, OSError, subprocess.TimeoutExpired):
+        worktree = None
     return {
         "pr": pr["number"],
         "title": pr["title"],

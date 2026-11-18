@@ -409,3 +409,99 @@ def test_the_text_report_names_what_the_body_says_now(monkeypatch, db, capsys):
     out = capsys.readouterr().out
     assert "opened by session 2bc87284, from the oldest version of the body" in out
     assert "the body now says 0d0d0d0d" in out
+
+
+# --- round 1 (Devin at 7171eab37): fences, charter keys, other repositories ---------
+
+
+def test_a_shorter_fence_inside_a_longer_one_does_not_close_it():
+    # Devin's case: a four-backtick block quoting a three-backtick example.
+    body = (
+        "````markdown\n```\nOpened-by-session: aaaaaaaa\n```\n````\n\nOpened-by-session: bbbbbbbb\n"
+    )
+    assert po.stamped(body) == "bbbbbbbb"
+
+
+def test_a_tilde_fence_is_not_closed_by_backticks_and_an_unclosed_fence_runs_to_the_end():
+    body = "~~~\n```\nOpened-by-session: aaaaaaaa\n```\n~~~\nOpened-by-session: bbbbbbbb"
+    assert po.stamped(body) == "bbbbbbbb"
+    assert po.stamped("```\nOpened-by-session: aaaaaaaa\n") is None
+    # A closing fence may not carry text; a longer one closes.
+    body = "```\n``` x\nOpened-by-session: aaaaaaaa\n`````\nOpened-by-session: bbbbbbbb"
+    assert po.stamped(body) == "bbbbbbbb"
+
+
+def test_inline_backticks_on_a_line_do_not_open_a_fence():
+    # A backtick fence's info string cannot contain a backtick (CommonMark).
+    assert po.stamped("``` `x` ```\nOpened-by-session: aaaaaaaa") == "aaaaaaaa"
+
+
+def test_a_charter_keyed_by_the_transcript_id_is_found(db: Path):
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO session_charters VALUES ('0d0d0d0d-cc', 'keyed by cc id')")
+    con.commit()
+    con.close()
+    rows = po.sessions("0d0d0d0d", db)
+    assert [(r["id"], r["mission"]) for r in rows] == [("99999999-row", "keyed by cc id")]
+
+
+def test_local_repos_reads_every_github_remote(tmp_path: Path):
+    repo = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    remotes = (
+        ("origin", "https://github.com/Acme/Widgets.git"),
+        ("private", "git@github.com:acme/widgets-private.git"),
+        ("other", "https://example.com/x/y.git"),
+    )
+    for name, url in remotes:
+        subprocess.run(["git", "-C", str(repo), "remote", "add", name, url], check=True)
+    assert po.local_repos(cwd=repo) == {"acme/widgets", "acme/widgets-private"}
+
+
+CREATED = "2026-11-18T03:37:28Z"
+
+
+def test_a_copied_line_corrected_inside_the_creation_window_names_the_corrector():
+    # A rework opens with another PR's body (its line 99999999); the stamp hook
+    # replaces it 20 s later. That correction is the opener, not the copied id.
+    edits = [
+        _edit("2026-11-18T03:37:48Z", "copied\n\nOpened-by-session: 11111111\n"),
+        _edit(CREATED, "copied\n\nOpened-by-session: 99999999\n"),
+    ]
+    assert po.opener("copied", edits, [], CREATED) == ("11111111", "history")
+    # Without a creation time the oldest stamp still wins (unchanged rule).
+    assert po.opener("copied", edits, []) == ("99999999", "history")
+
+
+def test_a_rewrite_after_the_creation_window_cannot_change_the_answer():
+    edits = [
+        _edit("2026-11-18T05:00:00Z", "rework\n\nOpened-by-session: 22222222\n"),
+        _edit("2026-11-18T03:37:40Z", "x\n\nOpened-by-session: 11111111\n"),
+        _edit(CREATED, "original"),
+    ]
+    body = "rework\n\nOpened-by-session: 22222222\n"
+    assert po.opener(body, edits, [], CREATED) == ("11111111", "history")
+
+
+def test_a_bot_edit_in_the_window_that_keeps_the_line_keeps_the_answer():
+    # Devin appends its badge to the stamped body inside the window: same id.
+    edits = [
+        _edit("2026-11-18T03:37:52Z", "x\n\nOpened-by-session: 11111111\n\n<!-- badge -->"),
+        _edit("2026-11-18T03:37:45Z", "x\n\nOpened-by-session: 11111111\n"),
+        _edit(CREATED, "x"),
+    ]
+    assert po.opener("x\n\nOpened-by-session: 11111111\n\n<!-- badge -->", edits, [], CREATED) == (
+        "11111111",
+        "body",
+    )
+
+
+def test_another_projects_pr_never_borrows_a_local_worktree(monkeypatch, db):
+    _fake_gh(monkeypatch, _view("", []), _edits([]))
+    monkeypatch.setenv("GENESIS_DB_PATH", str(db))
+    monkeypatch.setattr(po, "local_repos", lambda cwd=None: {"acme/widgets"})
+    called = []
+    monkeypatch.setattr(po, "worktree_for", lambda branch, cwd=None: called.append(branch) or "/x")
+    assert po.report(4642, "other/project")["worktree"] is None
+    assert called == []
+    assert po.report(4642, "Acme/Widgets")["worktree"] == "/x"
