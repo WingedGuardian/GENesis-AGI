@@ -125,3 +125,22 @@ async def test_session_config_reports_the_effort_a_model_switch_applied(db, per_
     result = await session_control.session_config(session_id="s1", model="opus")
     assert result["success"] and result["effort"] == "medium"
     assert persisted == {"model": "opus", "effort": "medium"}
+
+
+@pytest.mark.asyncio
+async def test_a_concurrent_explicit_switch_is_not_overwritten(db, per_model, monkeypatch):
+    """The switch test runs inside the UPDATE, so a write that lands between the
+    config read and the update wins (review finding: stale check-then-act)."""
+    await _session(db)
+    real = cc_sessions._per_model_effort
+
+    async def racing(db_, id_, model):
+        default = await real(db_, id_, model)
+        await db_.execute("UPDATE cc_sessions SET model = 'opus', effort = 'max' WHERE id = 's1'")
+        await db_.commit()
+        return default
+
+    monkeypatch.setattr(cc_sessions, "_per_model_effort", racing)
+    assert await cc_sessions.update_model_effort(db, "s1", model="opus")
+    row = await cc_sessions.get_by_id(db, "s1")
+    assert (row["model"], row["effort"]) == ("opus", "max")

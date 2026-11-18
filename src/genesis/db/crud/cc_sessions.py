@@ -666,14 +666,14 @@ async def _per_model_effort(db: aiosqlite.Connection, id: str, model: str) -> st
     """The configured effort for ``model`` on this session's channel, or None.
 
     Never raises: an unreadable config or row leaves the effort unchanged, and the
-    model switch itself still happens.
+    model switch itself still happens. Whether this is a SWITCH is not decided
+    here: ``update_model_effort`` checks that inside its UPDATE, against the row
+    as it is when the write lands.
     """
     try:
-        cursor = await db.execute("SELECT channel, model FROM cc_sessions WHERE id = ?", (id,))
+        cursor = await db.execute("SELECT channel FROM cc_sessions WHERE id = ?", (id,))
         row = await cursor.fetchone()
-        # Only a SWITCH takes the default: re-stating the current model keeps
-        # an effort the user set since.
-        if not row or not row[0] or row[1] == model:
+        if not row or not row[0]:
             return None
         from genesis.channels.config import default_effort_for_model
 
@@ -695,12 +695,19 @@ async def update_model_effort(
 
     A model given without an effort takes the session channel's per-model default
     when one is configured (``default_effort_for_model``, #4854); every model
-    switch goes through here, so no caller has to remember it.
+    switch goes through here, so no caller has to remember it. The default applies
+    only to a real switch, and that test runs in the same statement as the write
+    (SQLite evaluates ``SET`` against the old row), so a concurrent explicit
+    choice is never overwritten on a stale read. Re-stating the current model
+    keeps the effort the user set.
     """
-    if model is not None and effort is None:
-        effort = await _per_model_effort(db, id, model)
     updates = []
     params: list = []
+    if model is not None and effort is None:
+        default = await _per_model_effort(db, id, model)
+        if default is not None:
+            updates.append("effort = CASE WHEN model IS NOT ? THEN ? ELSE effort END")
+            params.extend([model, default])
     if model is not None:
         updates.append("model = ?")
         params.append(model)
