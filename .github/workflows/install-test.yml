@@ -138,14 +138,61 @@ jobs:
           done
           systemctl --user show-environment >/dev/null
 
+      # The browser stack step's engine fetch lists releases through
+      # api.github.com, anonymously (60 calls an hour per runner address). Shared
+      # runner addresses run out of that, and the fetch then installs nothing:
+      # 10 of 10 strict failures sampled for #4723 were that 403. A cached engine
+      # is found ready by the provisioner, which then makes no API call. Any older
+      # engine is restored by prefix; a pin bump fetches the new one and saves it
+      # under a new key. Only a save made on main is readable by other PRs (a PR's
+      # own save stays in its scope and serves its reruns), and this workflow runs
+      # on main only by its weekly schedule or a manual dispatch: seed it with a
+      # dispatch on main after changing these steps.
+      - name: Restore the Camoufox engine
+        id: engine-restore
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/camoufox
+          key: camoufox-engine-${{ matrix.os }}-${{ github.sha }}
+          restore-keys: camoufox-engine-${{ matrix.os }}-
+
       - name: Run installer (non-interactive, strict)
         env:
           GENESIS_INSTALL_STRICT: "1"
-          # No GITHUB_TOKEN here, though the browser stack step's engine fetch lists
-          # releases through api.github.com (anonymous: 60 calls an hour per
-          # address): this job runs the pull request's own code, which must not
-          # read the token (see persist-credentials above).
+          # No GITHUB_TOKEN here: this job runs the pull request's own code, which
+          # must not read the token (see persist-credentials above). The engine
+          # cache above is what keeps the anonymous lookup off the hot path.
         run: ./scripts/install.sh --non-interactive
+
+      # Saves only an engine the installed package's own resolver calls READY, so a
+      # half-written fetch (a cancelled job) is never cached; other version
+      # directories are dropped first, so the cache holds one engine. Keyed on that
+      # engine's directory: an unchanged engine is not saved again, a new one is.
+      # Runs on a failed install too (not a cancelled one), so a good fetch is kept
+      # even when a later step fails.
+      - name: Name the Camoufox engine cache
+        id: engine-key
+        if: ${{ !cancelled() }}
+        run: |
+          py="$GITHUB_WORKSPACE/.venv/bin/python"
+          [ -x "$py" ] || exit 0
+          dir="$("$py" -c 'from genesis.browser import engine
+          s = engine.resolve_camoufox_engine()
+          print(s.path.parent if s.ready and s.path else "")')" || exit 0
+          b="$HOME/.cache/camoufox/browsers"
+          case "$dir" in "$b"/*/*) ;; *) exit 0 ;; esac
+          find "$b" -mindepth 2 -maxdepth 2 -type d ! -path "$dir" -exec rm -r {} +
+          sum="$(printf '%s' "${dir#"$b"/}" | sha256sum | cut -c1-16)"
+          echo "key=camoufox-engine-${{ matrix.os }}-$sum" >> "$GITHUB_OUTPUT"
+
+      - name: Save the Camoufox engine
+        if: >-
+          !cancelled() && steps.engine-key.outputs.key != '' &&
+          steps.engine-key.outputs.key != steps.engine-restore.outputs.cache-matched-key
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/camoufox
+          key: ${{ steps.engine-key.outputs.key }}
 
       - name: Verify install outcome
         run: |
