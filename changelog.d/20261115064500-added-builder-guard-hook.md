@@ -1,0 +1,1 @@
+- Add a builder guard hook: a session started by the work board's builder launch can no longer merge a pull request, review one, or reply to or resolve a review thread, by `gh` or by `curl`/`wget`. Every other session is unaffected.
