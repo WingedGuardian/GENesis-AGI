@@ -5631,17 +5631,17 @@ def _delivery_row_text(pr_num: str, repo: str | None, head: str | None) -> str:
     f = gov["fields"]
     verdict, ok = f["verdict"], f["verdict"] == "DELIVERS"
     if f["head"] == head:
-        main = f"{verdict} at head"
+        lead = f"{verdict} at head"
     elif _classify_base_advance_delta(
         f["head"], head, _pr_base_sha(pr_num, repo=target) or "", target
     ) == "inline":
-        main = f"{verdict} carried from {f['head'][:12]}: own change unchanged"
+        lead = f"{verdict} carried from {f['head'][:12]}: own change unchanged"
     else:
-        main = f"check recorded at {f['head'][:12]}; carry unconfirmed: re-read ({verdict} there)"
+        lead = f"check recorded at {f['head'][:12]}; carry unconfirmed: re-read ({verdict} there)"
         ok = False
     # The grammar fixes the basis's shape, not its length, and compose derives it from
     # the PR body: bound it so one pointer line cannot flood the report (GLM, round 1).
-    main += f", basis {f['basis'][:80]}"
+    lead += f", basis {f['basis'][:80]}"
     # Each extra says whether it voids the read (True: the row cannot be ok) or only
     # names something (False), so no rule depends on how its text happens to start.
     extra: list[tuple[str, bool]] = []
@@ -5658,7 +5658,7 @@ def _delivery_row_text(pr_num: str, repo: str | None, head: str | None) -> str:
         if _delivery_self_attestable(_pr_changed_files(pr_num, repo=target)):
             extra.append(("self-attested", False))
         else:
-            main = "the builder's own read: a closing read (checker=other) is owed; " + main
+            lead = "the builder's own read: a closing read (checker=other) is owed; " + lead
             ok = False
     if verdict != "DELIVERS":
         body = next((c.get("body") or "" for c in comments if c.get("id") == gov["id"]), "")
@@ -5685,7 +5685,7 @@ def _delivery_row_text(pr_num: str, repo: str | None, head: str | None) -> str:
         extra.append((f"a later owner block is unusable: '{problem}'", True))
     if unread or any(voids for _text, voids in extra):
         ok = False
-    text = main + "".join(f"; {e}" for e, _voids in extra) + tail
+    text = lead + "".join(f"; {e}" for e, _voids in extra) + tail
     return f"ok ({text})" if ok else f"advisory — {text}"
 
 
