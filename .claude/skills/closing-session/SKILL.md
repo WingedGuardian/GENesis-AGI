@@ -1090,8 +1090,10 @@ happened already. Before requesting or answering any further review:
 1. **Run a premise check and design audit** with a fresh-context
    `genesis-architect`, following `.claude/docs/premise-check.md`: premises with
    evidence, the effect question, the comparative question (an existing chokepoint
-   the change duplicates or bypasses), the six plan-time questions (the sixth is
-   PR shape), then BLOCKER / SHOULD-FIX / NOTE findings and, for a SOUND or
+   the change duplicates or bypasses), the nine premise items (item 9 is PR
+   shape), testing the issue's own item 5 (can its acceptance fail, and does
+   the named wrong fix fail it?) and item 7 (each named alternative confirmed or
+   refuted), then BLOCKER / SHOULD-FIX / NOTE findings and, for a SOUND or
    SOUND-BUT-INFERIOR verdict, a decision-complete rework spec (premise-check.md,
    "Handing a verdict to a builder"). For BROKEN it states the design question
    for the owner instead: the owner decides the mechanism and the split. Hand it the PR
