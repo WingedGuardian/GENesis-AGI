@@ -22,3 +22,13 @@ from genesis.cc.model_names import display_name
 )
 def test_display_name(model_id, expected):
     assert display_name(model_id) == expected
+
+
+@pytest.mark.parametrize(
+    ("effort", "expected"),
+    [("xhigh", "xHigh"), ("high", "High"), ("max", "Max"), ("", "")],
+)
+def test_effort_label(effort, expected):
+    from genesis.cc.model_names import effort_label
+
+    assert effort_label(effort) == expected

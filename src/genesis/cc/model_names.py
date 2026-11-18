@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import re
 
+from genesis.cc.types import VALID_MODEL_NAMES
+
 _CLAUDE_ID = re.compile(
     r"^claude-(?P<family>[a-z]+)-(?P<major>\d+)(?:-(?P<minor>\d{1,2}))?(?:-\d{8})?$"
 )
-_ALIASES = frozenset({"haiku", "sonnet", "opus", "fable"})
 
 
 def display_name(model_id: str) -> str:
@@ -21,6 +22,12 @@ def display_name(model_id: str) -> str:
     if match:
         version = match["major"] + (f".{match['minor']}" if match["minor"] else "")
         return f"{match['family'].title()} {version}"
-    if base.lower() in _ALIASES:
+    if base.lower() in VALID_MODEL_NAMES:
         return base.title()
     return base
+
+
+def effort_label(effort: str) -> str:
+    """Display form of an effort level for a header: ``xhigh`` -> ``xHigh``."""
+    value = (effort or "").strip().lower()
+    return "xHigh" if value == "xhigh" else value.title()

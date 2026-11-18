@@ -119,6 +119,18 @@ class DraftStreamer:
         if self._prefix and model_label and self._prefix_effort:
             self._prefix = f"[{model_label} / {self._prefix_effort}]"
 
+    def show_header(self, model_label: str, effort: str) -> None:
+        """Set the prefix for a run that opens a CC session or hands to a peer.
+
+        It REPLACES any prefix already set (the gap rule's, read from the session
+        row before the turn), taking the effort the run was dispatched with, so a
+        reply still carries one header. ``set_running_model`` then retitles it
+        from the init event.
+        """
+        if model_label and effort:
+            self._prefix = f"[{model_label} / {effort}]"
+            self._prefix_effort = effort
+
     @property
     def any_draft_sent(self) -> bool:
         """True if at least one draft was successfully sent to Telegram."""

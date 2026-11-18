@@ -233,8 +233,14 @@ class TestSessionControlBlock:
         """It rides every turn, so it must not crowd out real context. Bounded on
         EVERY branch: the no-effort (Haiku) wording is the longest one, so a bound
         checked only on the default would not bind the branch most likely to grow."""
+        from genesis.cc.conversation import _REPLY_HEADER_BLOCK
+
+        # The reply-header rule is its own short section, bounded on its own.
+        assert len(_REPLY_HEADER_BLOCK) < 160
         for model in ("sonnet", "opus", "haiku"):
             block = self._block(model=model)
+            assert block.endswith(_REPLY_HEADER_BLOCK)
+            block = block.removesuffix(_REPLY_HEADER_BLOCK)
             assert len(block) < 700, (model, len(block))
 
 
