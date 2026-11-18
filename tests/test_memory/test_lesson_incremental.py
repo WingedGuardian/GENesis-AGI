@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import aiosqlite
 import pytest
 
+import genesis.learning.procedural.incremental as inc
 import genesis.learning.procedural.judge as jm
 import genesis.learning.procedural.lesson_builder_config as lbc
 import genesis.learning.procedural.struggle_detector as sd
@@ -260,7 +261,7 @@ async def test_a_long_backlog_is_judged_four_parts_per_run(db, tmp_path, monkeyp
     builder = _setup(monkeypatch, spine=spine)
     await _seed(db, tmp_path)
     await _cycle(db, tmp_path)
-    assert len(builder.calls) == ej._PARTS_PER_RUN
+    assert len(builder.calls) == inc._PARTS_PER_RUN
     assert builder.calls[0]["turns"] == [1, 2, 3]
     judged = [t for c in builder.calls for t in c["turns"]]
     assert judged == list(range(1, len(judged) + 1))  # contiguous, none twice
@@ -274,7 +275,7 @@ async def test_candidates_count_for_the_part_reaching_the_end(db, tmp_path, monk
     that reaches the end is still built, and the queued item remembers why."""
     builder = _setup(monkeypatch, spine=SPINE, score=0.0)
     await _seed(db, tmp_path)
-    marker_parts = await ej._judge_from_marker(
+    marker_parts = await inc._judge_from_marker(
         db,
         "s1",
         CC,
@@ -654,7 +655,7 @@ async def test_candidates_trigger_every_part_of_the_request(db, tmp_path, monkey
     monkeypatch.setattr(sd, "_MAX_SPINE_CHARS", per * 3)
     builder = _setup(monkeypatch, spine=spine, score=0.0)
     await _seed(db, tmp_path)
-    out = await ej._judge_from_marker(
+    out = await inc._judge_from_marker(
         db, "s1", CC, [dict(e) for e in spine], "hay", MagicMock(), marker=None,
         transcript_path=tmp_path / f"{CC}.jsonl", candidates=True,
         max_procedures_per_session=7, summary={},
@@ -711,6 +712,26 @@ async def test_a_request_merged_into_a_claimed_item_gets_its_own(db):
 
 
 @pytest.mark.asyncio
+async def test_a_stale_score_merge_never_undoes_a_candidates_upgrade(db, monkeypatch):
+    """Two writers list the same pending item; the second upgrades it to
+    candidates first. The stale first writer must not write its score copy back,
+    so it gets an item of its own and the upgrade stands."""
+    await ej._enqueue_procedure_rebuild(db, "s1", CC, trigger="score", dedup=True)
+    real_query = dw_crud.query_pending
+
+    async def list_then_upgrade(db_, **kw):
+        listed = await real_query(db_, **kw)
+        monkeypatch.setattr(dw_crud, "query_pending", real_query)
+        await inc._merge_into_pending_rebuild(db_, "s1", "candidates")
+        return listed
+
+    monkeypatch.setattr(dw_crud, "query_pending", list_then_upgrade)
+    await ej._enqueue_procedure_rebuild(db, "s1", CC, trigger="score", dedup=True)
+    triggers = sorted(json.loads(i["payload_json"])["trigger"] for i in await _items(db, "pending"))
+    assert triggers == ["candidates", "score"]
+
+
+@pytest.mark.asyncio
 async def test_the_drain_reads_the_payload_after_claiming(db, tmp_path, monkeypatch):
     """A candidates upgrade that lands after the drain listed the item is in
     the claimed copy, so a part with no struggle score is still built."""
@@ -720,7 +741,7 @@ async def test_the_drain_reads_the_payload_after_claiming(db, tmp_path, monkeypa
     real_claim = dw_crud.claim_pending
 
     async def upgrade_then_claim(db_, id_, **kw):
-        await ej._merge_into_pending_rebuild(db_, "s1", "candidates")
+        await inc._merge_into_pending_rebuild(db_, "s1", "candidates")
         return await real_claim(db_, id_, **kw)
 
     monkeypatch.setattr(dw_crud, "claim_pending", upgrade_then_claim)
