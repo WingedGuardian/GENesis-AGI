@@ -40,6 +40,7 @@ from genesis.learning.procedural.lesson_builder_config import (
 from genesis.learning.procedural.lesson_builder_config import (
     builder_mode as lesson_builder_mode,
 )
+from genesis.learning.procedural.lesson_builder_config import segment_mode
 from genesis.memory.extraction import (
     RETRY_PROMPT,
     ExtractionResult,
@@ -163,6 +164,7 @@ async def _segment_shadow(
     cc_session_id: str,
     spine: list[dict],
     *,
+    segment: str,
     marker: str | None | object,
     transcript_path: Path,
     candidates: bool,
@@ -194,7 +196,6 @@ async def _segment_shadow(
     whatever the trigger, so its would_trigger is not a saved call).
     """
     from genesis.learning.procedural.build_segment import select_part
-    from genesis.learning.procedural.lesson_builder_config import segment_mode
     from genesis.learning.procedural.struggle_detector import (
         _MAX_SPINE_CHARS,
         STRUGGLE_THRESHOLD,
@@ -203,7 +204,7 @@ async def _segment_shadow(
     )
 
     try:
-        if segment_mode() != "shadow" or marker is _MARKER_UNREAD:
+        if segment != "shadow" or marker is _MARKER_UNREAD:
             return
         from genesis.db.crud import cc_sessions as sessions_crud
 
@@ -242,6 +243,180 @@ async def _segment_shadow(
         )
     except Exception:
         logger.warning("Lesson segment shadow failed for session %s", session_id, exc_info=True)
+
+
+# Parts one incremental run judges per session (each part is at most one builder
+# call): a long backlog catches up over a few cycles, and the per-session cap
+# still bounds the lessons it can add.
+_PARTS_PER_RUN = 4
+
+
+async def _judge_from_marker(
+    db: aiosqlite.Connection,
+    session_id: str,
+    cc_session_id: str,
+    spine: list[dict],
+    haystack: str,
+    router: Router,
+    *,
+    marker: str | None,
+    transcript_path: Path,
+    candidates: bool,
+    max_procedures_per_session: int,
+    summary: dict,
+    counter: str = "struggle_procedures",
+) -> str:
+    """``segment: incremental`` (#4813): judge the session's unjudged entries.
+
+    Judges up to :data:`_PARTS_PER_RUN` parts from ``marker`` (read before the
+    spine was parsed), moving the marker by compare-and-set after each judged
+    part or part below the struggle threshold. The timeout wraps each part's
+    builder call, never the loop. ``candidates`` (the chunk path flagged the
+    latest messages) counts for the part that reaches the spine's judgeable end.
+
+    Returns ``done`` (nothing left), ``remaining`` (entries left after the last
+    part), ``held:cap`` (the cap is spent), ``held:partial-parse`` (a reset whose
+    old id is still in the file) or ``refused`` (the marker moved elsewhere, or
+    cannot move). The builder's errors propagate; parts judged before one keep
+    their moved marker.
+    """
+    from genesis.db.crud import cc_sessions as sessions_crud
+    from genesis.learning.procedural.build_segment import select_part
+    from genesis.learning.procedural.judge import JUDGE_TIMEOUT_SECS, judge_multi_procedure
+    from genesis.learning.procedural.struggle_detector import (
+        _MAX_SPINE_CHARS,
+        STRUGGLE_THRESHOLD,
+        derive_session_origin,
+        format_spine_for_judge,
+        score_struggle,
+    )
+
+    origin = derive_session_origin(spine)  # the whole spine: an early external read marks every part
+    for n in range(1, _PARTS_PER_RUN + 1):
+        part = select_part(spine, marker, budget_chars=_MAX_SPINE_CHARS)
+        if part.reset and await asyncio.to_thread(_file_mentions, transcript_path, marker):
+            return "held:partial-parse"
+        if not part.new:
+            return "done"
+        reaches_end = part.held_back == 0
+        score = score_struggle(part.new)
+        triggered = score >= STRUGGLE_THRESHOLD or (candidates and reaches_end)
+        stored = 0
+        if triggered:
+            cap_left = await _lesson_cap_left(db, cc_session_id, max_procedures_per_session)
+            if cap_left == 0:
+                return "held:cap"
+            ids = await asyncio.wait_for(
+                judge_multi_procedure(
+                    db, part.new, haystack, score, router,
+                    source_session_id=cc_session_id, max_new=cap_left,
+                    context_text=format_spine_for_judge(part.context),
+                    origin_class=origin,
+                ),
+                timeout=JUDGE_TIMEOUT_SECS,
+            )
+            stored = len(ids)
+            if stored:
+                summary[counter] = summary.get(counter, 0) + stored
+        moved = (
+            part.through_id is not None and part.through_id != marker
+            and await sessions_crud.advance_lesson_built_through(
+                db, session_id, expected=marker, new=part.through_id,
+            )
+        )
+        logger.info(
+            "Lesson segment [incremental] for %s: part=%d entries=%d context=%d score=%.2f "
+            "triggered=%s stored=%d held_back=%d pending_tail=%d reset=%s marker=%s",
+            session_id, n, len(part.new), len(part.context), score, triggered, stored,
+            part.held_back, part.pending_tail, part.reset, "moved" if moved else "not moved",
+        )
+        if not moved:
+            # Nothing to move to (an all-user part) is done when it reached the
+            # end; otherwise another writer moved the marker, or it cannot move.
+            return "done" if reaches_end and part.through_id in (None, marker) else "refused"
+        marker = part.through_id
+        if reaches_end:
+            return "done"
+    return "remaining"
+
+
+async def _incremental_build(
+    db: aiosqlite.Connection,
+    session_id: str,
+    cc_session_id: str,
+    spine: list[dict],
+    haystack: str,
+    router: Router,
+    *,
+    marker: str | None | object,
+    transcript_path: Path,
+    candidates: bool,
+    max_procedures_per_session: int,
+    summary: dict,
+) -> None:
+    """Stream 1 under ``segment: incremental``: judge from the marker, and queue
+    one "continue" rebuild when entries are left (held back, cap spent, or the
+    builder failed), so the drain judges them even if the session never gets
+    another message. Never raises: the whole-session build does not run in
+    this mode, so nothing else would handle the error."""
+    trigger = "candidates" if candidates else "score"
+    if marker is _MARKER_UNREAD:
+        # No marker to judge from this cycle: leave it to the drain, so a
+        # session that gets no further messages is still judged.
+        await _enqueue_procedure_rebuild(db, session_id, cc_session_id, trigger=trigger, dedup=True)
+        return
+    try:
+        outcome = await _judge_from_marker(
+            db, session_id, cc_session_id, spine, haystack, router,
+            marker=marker, transcript_path=transcript_path, candidates=candidates,
+            max_procedures_per_session=max_procedures_per_session, summary=summary,
+        )
+    except (ProcedureBuilderUnavailable, TimeoutError) as exc:
+        logger.warning(
+            "Procedure builder [incremental] unavailable for session %s (%s) — "
+            "queued to continue from the marker", session_id, type(exc).__name__,
+        )
+        await _enqueue_procedure_rebuild(db, session_id, cc_session_id, trigger=trigger, dedup=True)
+        return
+    except Exception:
+        logger.warning(
+            "Procedure builder [incremental] failed for session %s — queued to "
+            "continue from the marker", session_id, exc_info=True,
+        )
+        await _enqueue_procedure_rebuild(db, session_id, cc_session_id, trigger=trigger, dedup=True)
+        return
+    if outcome in ("remaining", "held:cap"):
+        await _enqueue_procedure_rebuild(db, session_id, cc_session_id, trigger=trigger, dedup=True)
+    elif outcome == "held:partial-parse":
+        await _partial_parse_observation(db, cc_session_id)
+
+
+async def _partial_parse_observation(db: aiosqlite.Connection, cc_session_id: str) -> None:
+    """A marker the parse did not reach but the transcript holds: the parse stops
+    short of it, so the session is not being judged. Logged and observed (once)."""
+    import uuid
+
+    from genesis.db.crud import observations as obs_crud
+
+    logger.warning(
+        "Lesson builder holds session %s: its progress marker is in the transcript "
+        "but the spine parse did not reach it", cc_session_id,
+    )
+    with contextlib.suppress(Exception):
+        await obs_crud.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="procedure_rebuild",
+            type="lesson_builder_parse_stopped_short",
+            content=(
+                f"The lesson builder is holding session {cc_session_id}: its progress "
+                "marker is in the transcript, but the spine parse stops before reaching "
+                "it, so the entries after it are not being judged."
+            ),
+            priority="medium",
+            created_at=datetime.now(UTC).isoformat(),
+            skip_if_duplicate=True,
+        )
 
 
 # A marker read that failed: the shadow step then does nothing this cycle.
@@ -800,7 +975,25 @@ async def run_extraction_cycle(
                 # cycle, so one long session reached 811 lessons.
                 # Shadow runs the real builder and records what it would store.
                 lever = lesson_builder_mode()
-                builder_mode = lever if struggle_triggered or session_candidates else "off"
+                # Read once per session per cycle, so a flip mid-cycle cannot run
+                # both paths on one session. Incremental needs the builder live;
+                # otherwise it runs as shadow (#4813).
+                segment = segment_mode()
+                if segment == "incremental" and lever != "live":
+                    segment = "shadow"
+                if segment == "incremental":
+                    await _incremental_build(
+                        db, session_id, cc_session_id, spine, haystack, router,
+                        marker=marker_before, transcript_path=transcript_path,
+                        candidates=bool(session_candidates),
+                        max_procedures_per_session=max_procedures_per_session,
+                        summary=summary,
+                    )
+                builder_mode = (
+                    lever
+                    if (struggle_triggered or session_candidates) and segment != "incremental"
+                    else "off"
+                )
                 shadow = builder_mode == "shadow"
                 cap_left = 0
                 if builder_mode != "off":
@@ -855,6 +1048,7 @@ async def run_extraction_cycle(
                 # failed build never moves the progress marker.
                 await _segment_shadow(
                     db, session_id, cc_session_id, spine,
+                    segment=segment,
                     marker=marker_before, transcript_path=transcript_path,
                     candidates=bool(session_candidates), lever=lever,
                     cap_left=cap_left if builder_mode != "off" else None,
@@ -884,7 +1078,10 @@ async def run_extraction_cycle(
                         "Procedure builder unavailable for session %s (%s) — "
                         "re-queuing for rebuild", session_id, type(exc).__name__,
                     )
-                    await _enqueue_procedure_rebuild(db, session_id, cc_session_id)
+                    await _enqueue_procedure_rebuild(
+                        db, session_id, cc_session_id,
+                        trigger="candidates" if session_candidates else "score",
+                    )
             except Exception:
                 # Deterministic failure (parse/logic) — NOT re-queued; retrying
                 # would burn every attempt identically. No rollback (shared
@@ -959,8 +1156,39 @@ async def _record_tool_outcomes(
         )
 
 
+async def _merge_into_pending_rebuild(
+    db: aiosqlite.Connection, session_id: str, trigger: str,
+) -> bool:
+    """Fold a new request into a pending ``procedure_rebuild`` item for the
+    session, if there is one; True when one was found.
+
+    A ``candidates`` trigger upgrades the item's trigger: the drain cannot re-run
+    the chunk path that flags candidates, so keeping the first writer's ``score``
+    would lose a candidates-only build for good.
+    """
+    from genesis.db.crud import deferred_work as dw_crud
+
+    items = await dw_crud.query_pending(db, work_type=_PROCEDURE_REBUILD_WORK, limit=_DRAIN_SCAN_LIMIT)
+    for item in items:
+        try:
+            payload = json.loads(item.get("payload_json") or "{}")
+            if payload.get("session_id") != session_id:
+                continue
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            continue
+        if trigger == "candidates" and payload.get("trigger") != "candidates":
+            await db.execute(
+                "UPDATE deferred_work_queue SET payload_json = ? WHERE id = ? AND status = 'pending'",
+                (json.dumps({**payload, "trigger": "candidates"}), item["id"]),
+            )
+            await db.commit()
+        return True
+    return False
+
+
 async def _enqueue_procedure_rebuild(
     db: aiosqlite.Connection, session_id: str, cc_session_id: str,
+    *, trigger: str = "score", dedup: bool = False,
 ) -> None:
     """Re-queue a session whose procedure build died on provider exhaustion.
 
@@ -968,6 +1196,13 @@ async def _enqueue_procedure_rebuild(
     the procedures from the full transcript. Best-effort — a failure to enqueue
     must not break the extraction cycle. Rebuild idempotency is guaranteed by the
     novelty/dedup gate in ``store_procedure_checked``.
+
+    The drain reads an item by the current ``segment`` (#4813): under
+    incremental it judges from the session's progress marker, otherwise it
+    rebuilds the whole session. ``trigger`` (``score`` or ``candidates``) says
+    what made the build run, since the drain cannot re-run the chunk path that
+    flags candidates. ``dedup`` skips the enqueue when a pending item already
+    names the session (incremental items only say "continue from the marker").
     """
     from genesis.resilience.deferred_work import (
         DRAIN,
@@ -976,13 +1211,15 @@ async def _enqueue_procedure_rebuild(
     )
 
     try:
+        if dedup and await _merge_into_pending_rebuild(db, session_id, trigger):
+            return
         queue = DeferredWorkQueue(db)
         await queue.enqueue(
             work_type=_PROCEDURE_REBUILD_WORK,
             call_site_id="38_procedure_extraction",
             priority=MEMORY_OPS,
             payload=json.dumps(
-                {"session_id": session_id, "cc_session_id": cc_session_id}
+                {"session_id": session_id, "cc_session_id": cc_session_id, "trigger": trigger}
             ),
             reason="provider exhausted — auto-rebuild queued (self-healing; drains next extraction cycle)",
             staleness_policy=DRAIN,
@@ -1042,6 +1279,8 @@ async def _drain_procedure_rebuilds(
         )
     capped: set[str] = set()  # sessions found at their cap during this drain
     processed = 0
+    segment = segment_mode()  # read once per drain
+    incremental = segment == "incremental"  # the drain runs only when live
     for item in items:
         if processed >= _DRAIN_BATCH:
             break
@@ -1074,15 +1313,29 @@ async def _drain_procedure_rebuilds(
             continue
 
         transcript_path = (
-            _find_transcript(transcript_dir, cc_session_id) if cc_session_id else None
+            _find_transcript(transcript_dir, cc_session_id)
+            or _find_transcript(voice_transcript_dir(), cc_session_id)
+            if cc_session_id else None
         )
         if not transcript_path:
             # Transcript rotated/gone — nothing to rebuild from.
             await queue.mark_discarded(item_id, "transcript not found")
             continue
 
+        # Claim atomically: a second process running a cycle (the backfill
+        # script beside the server) may have taken this item already. A lost
+        # claim uses no batch slot.
+        if not await dw_crud.claim_pending(
+            db, item_id, last_attempt_at=datetime.now(UTC).isoformat(),
+        ):
+            continue
         processed += 1
-        await queue.mark_processing(item_id)  # increments attempts
+        if incremental:
+            await _drain_from_marker(
+                db, queue, item, payload, cc_session_id, transcript_path, router,
+                max_procedures_per_session=max_procedures_per_session, summary=summary,
+            )
+            continue
         # The cc_sessions row id, for the progress marker; an item queued
         # without one (none are today) only skips the shadow step.
         row_id = payload.get("session_id")
@@ -1117,7 +1370,7 @@ async def _drain_procedure_rebuilds(
             # live: the drain returns early otherwise (see its first check).
             await _segment_shadow(
                 db, row_id, cc_session_id, spine,
-                marker=marker_before, transcript_path=transcript_path,
+                segment=segment, marker=marker_before, transcript_path=transcript_path,
                 candidates=False, lever="live", cap_left=cap_left,
                 max_procedures_per_session=max_procedures_per_session,
                 whole_score=score, stored=len(stored_ids), path="drain",
@@ -1140,6 +1393,67 @@ async def _drain_procedure_rebuilds(
                 cc_session_id, exc_info=True,
             )
             await queue.mark_discarded(item_id, "rebuild raised non-retryable error")
+
+
+async def _drain_from_marker(
+    db: aiosqlite.Connection,
+    queue,
+    item: dict,
+    payload: dict,
+    cc_session_id: str,
+    transcript_path: Path,
+    router: Router,
+    *,
+    max_procedures_per_session: int,
+    summary: dict,
+) -> None:
+    """One claimed rebuild item under ``segment: incremental`` (#4813): judge the
+    session from its progress marker, whatever the item was queued for.
+
+    Completed when the run ends without error (with a fresh item queued when
+    entries are left). A builder error, timeout or other error returns it to
+    pending with its attempt counted, so 8 failures end in the visible
+    ``procedure_extraction_lost`` observation instead of a silent discard.
+    """
+    from genesis.db.crud import cc_sessions as sessions_crud
+    from genesis.learning.procedural.struggle_detector import build_spine_and_haystack
+
+    item_id = item["id"]
+    session_id = payload.get("session_id") or cc_session_id
+    try:
+        if not await sessions_crud.has_session(db, session_id):
+            await queue.mark_discarded(item_id, "session row gone")
+            return
+        marker = await sessions_crud.get_lesson_built_through(db, session_id)
+        spine, haystack = await asyncio.to_thread(build_spine_and_haystack, transcript_path)
+        outcome = await _judge_from_marker(
+            db, session_id, cc_session_id, spine, haystack, router,
+            marker=marker, transcript_path=transcript_path,
+            candidates=payload.get("trigger") == "candidates",
+            max_procedures_per_session=max_procedures_per_session, summary=summary,
+            counter="procedures_rebuilt",
+        )
+    except (ProcedureBuilderUnavailable, TimeoutError) as exc:
+        logger.info(
+            "Procedure rebuild [incremental] for session %s: %s on attempt %d — kept pending",
+            cc_session_id, type(exc).__name__, item.get("attempts", 0) + 1,
+        )
+        await queue.reset_to_pending(item_id)
+        return
+    except Exception:
+        logger.warning(
+            "Procedure rebuild [incremental] failed for session %s (attempt %d) — "
+            "kept pending", cc_session_id, item.get("attempts", 0) + 1, exc_info=True,
+        )
+        await queue.reset_to_pending(item_id)
+        return
+    await queue.mark_completed(item_id)
+    if outcome in ("remaining", "held:cap"):
+        await _enqueue_procedure_rebuild(
+            db, session_id, cc_session_id, trigger=payload.get("trigger", "score"), dedup=True,
+        )
+    elif outcome == "held:partial-parse":
+        await _partial_parse_observation(db, cc_session_id)
 
 
 async def _exhaust_procedure_rebuild(db: aiosqlite.Connection, queue, item: dict) -> None:
@@ -1167,8 +1481,8 @@ async def _exhaust_procedure_rebuild(db: aiosqlite.Connection, queue, item: dict
             type="procedure_extraction_lost",
             content=(
                 f"Procedure extraction permanently lost for session {cc_session_id}: "
-                f"the builder stayed provider-exhausted across "
-                f"{_MAX_PROCEDURE_REBUILD_ATTEMPTS} rebuild attempts. A reusable "
+                f"the rebuild failed (provider exhaustion, a timeout or an error) on "
+                f"all {_MAX_PROCEDURE_REBUILD_ATTEMPTS} attempts. A reusable "
                 f"playbook that should have been learned was not."
             ),
             priority="medium",

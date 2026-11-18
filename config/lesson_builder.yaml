@@ -29,6 +29,13 @@ mode: live
 #     judging only the part after its progress marker would do (entries,
 #     characters, struggle score of the new entries, would-trigger). The marker
 #     (cc_sessions.lesson_built_through) moves when the builder ran.
-#   incremental: judge only that part. Not built yet; reads as shadow.
+#   incremental: judge only that part, up to 4 parts per pass (the rebuild
+#     drain and the cycle each get a pass, so up to 8 builder calls per session
+#     per cycle),
+#     with up to 20 earlier tool turns shown for reference. Entries left over (a
+#     budget, a spent cap, a failed build) queue one rebuild that continues
+#     from the marker, so a session that has ended is still judged. Needs mode
+#     live; under mode shadow or off it runs as shadow. Switch to it only after
+#     the shadow lines have run with mode live for a few days.
 # An invalid value reads as shadow, which stores what whole stores.
 segment: shadow

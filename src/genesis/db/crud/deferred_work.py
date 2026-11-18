@@ -120,6 +120,23 @@ async def update_status(
     return cursor.rowcount > 0
 
 
+async def claim_pending(db: aiosqlite.Connection, id: str, *, last_attempt_at: str) -> bool:
+    """Move a PENDING item to processing and count the attempt, atomically.
+
+    False when the item was not pending any more: another process (a backfill run
+    beside the server) claimed it first, so the caller must skip it.
+    ``update_status`` has no such check, which is why two processes could both
+    take one item.
+    """
+    cursor = await db.execute(
+        "UPDATE deferred_work_queue SET status = 'processing', last_attempt_at = ?,"
+        " attempts = attempts + 1 WHERE id = ? AND status = 'pending'",
+        (last_attempt_at, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def count_pending(
     db: aiosqlite.Connection,
     *,

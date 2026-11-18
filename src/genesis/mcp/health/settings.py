@@ -137,8 +137,8 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "off skips the builder. "
             "`segment` whole/shadow/incremental: shadow (default) judges the "
             "whole session and logs what judging only its unjudged part would "
-            "do; whole skips that; incremental is not built yet (reads as "
-            "shadow). "
+            "do; whole skips that; incremental judges only the unjudged part "
+            "(needs mode live; runs as shadow otherwise). "
             "Invalid values degrade to shadow. Read live each extraction "
             "cycle by genesis.learning.procedural.lesson_builder_config."
         ),

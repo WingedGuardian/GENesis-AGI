@@ -4015,8 +4015,19 @@ verified: 3f70a665b 2026-11-15
   back. In
   shadow the whole session is still built; one `Lesson segment [shadow]` log
   line per built session says what the new part would do, and the marker moves
-  by compare-and-set when the builder ran and the cap allowed. `incremental` is
-  not built yet and reads as shadow.
+  by compare-and-set when the builder ran and the cap allowed. `incremental`
+  (#4813, needs `mode: live`, else it runs as shadow) replaces the whole build:
+  `_judge_from_marker` judges up to 4 parts per pass from the marker (the drain
+  and the cycle each get a pass, so up to 8 per session per cycle), each with up to 20
+  earlier tool turns shown for reference only and the session origin from the
+  whole spine, a timeout per part, and a compare-and-set after each. Entries
+  left over (budget, spent cap, failed build) queue one `procedure_rebuild` item
+  per session that says only "continue from the marker"; the drain reads every
+  such item by the current mode (incremental judges from the marker, whole or
+  shadow rebuilds the whole session), claims it atomically, retries a failure up
+  to 8 attempts and then raises `procedure_extraction_lost`. Each lesson built
+  from a part also logs its grounding against the part alone, to measure
+  lessons built from the context turns.
 - **eval/**: J9 = fire-and-forget emit hooks on live cognitive paths (the
   "cannot break production" contract — hooks must never raise) + weekly Sunday
   aggregation (hard 7-day window) + an on-demand batch judge as a surplus
