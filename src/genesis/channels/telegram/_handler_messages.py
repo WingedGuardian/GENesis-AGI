@@ -379,7 +379,7 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
             log.error("Failed to send error reply to user %s", user.id, exc_info=True)
     except (TimeoutError, ConnectionError, OSError):
         rescued = _rescue_text(progress, streamer)
-        if rescued or (progress is not None and progress.saw_text):
+        if rescued or (progress is not None and progress.any_delivered):
             rescued = rescued or "(the connection dropped after the messages above)"
             log.warning(
                 "Connection error for user %s after streaming %d chars — delivering accumulated text",
@@ -513,7 +513,7 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
             if response:
                 response = response.lstrip("\n")
                 response = _with_model_prefix(streamer, response)
-            if response or not (progress and progress.delivered):
+            if response or not (progress and progress.any_delivered):
                 sent_msg = await _reply_formatted(msg, response or "(no response)")
 
             # Then send voice if wanted (text already delivered; TTS failure is non-fatal)
@@ -564,7 +564,7 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
             log.error("Failed to send error reply to voice user %s", user.id, exc_info=True)
     except (TimeoutError, ConnectionError, OSError):
         rescued = _rescue_text(progress, streamer)
-        if rescued or (progress is not None and progress.saw_text):
+        if rescued or (progress is not None and progress.any_delivered):
             rescued = rescued or "(the connection dropped after the messages above)"
             log.warning(
                 "Connection error for voice %s after streaming %d chars — delivering accumulated text",
@@ -729,7 +729,7 @@ async def _handle_media_inner(
             log.error("Failed to send error reply to media user %s", user.id, exc_info=True)
     except (TimeoutError, ConnectionError, OSError):
         rescued = _rescue_text(progress, streamer)
-        if rescued or (progress is not None and progress.saw_text):
+        if rescued or (progress is not None and progress.any_delivered):
             rescued = rescued or "(the connection dropped after the messages above)"
             log.warning(
                 "Connection error for media %s after streaming %d chars — delivering accumulated text",

@@ -34,15 +34,21 @@ class ResponseFormatter:
         before the code block started and split there. If the code block
         itself exceeds max_len, force-split it (with balanced fences).
         """
-        if len(text) <= max_len:
-            return [text]
+        return [chunk for chunk, _ in self.split_spans(text, max_len)]
 
-        chunks: list[str] = []
+    def split_spans(self, text: str, max_len: int) -> list[tuple[str, int]]:
+        """``_split_preserving_code`` with, for each chunk, how many characters of
+        ``text`` it carries: a force-split adds fences that are not in ``text``."""
+        if len(text) <= max_len:
+            return [(text, len(text))]
+
+        chunks: list[tuple[str, int]] = []
         remaining = text
+        added = 0  # leading characters of ``remaining`` that are not in ``text``
 
         while remaining:
             if len(remaining) <= max_len:
-                chunks.append(remaining)
+                chunks.append((remaining, len(remaining) - added))
                 break
 
             # Find a safe split point
@@ -63,8 +69,9 @@ class ResponseFormatter:
                         # Code block is too large; force-split and add closing fence
                         chunk = remaining[:max_len - 4]  # leave room for \n```
                         chunk += "\n```"
-                        chunks.append(chunk)
+                        chunks.append((chunk, max_len - 4 - added))
                         remaining = "```\n" + remaining[max_len - 4:]
+                        added = 4
                         continue
                 else:
                     split_at = max_len
@@ -75,7 +82,8 @@ class ResponseFormatter:
             if newline_pos > 0:
                 split_at = newline_pos + 1  # include the newline
 
-            chunks.append(remaining[:split_at])
+            chunks.append((remaining[:split_at], split_at - added))
             remaining = remaining[split_at:]
+            added = 0
 
         return chunks

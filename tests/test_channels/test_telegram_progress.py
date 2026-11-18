@@ -14,6 +14,8 @@ from genesis.channels.telegram.transport.streaming import DraftStreamer
 
 LONG = "I found the record you asked about; reading the rest now."  # >= 40 chars
 SHORT = "Checking."
+# A rate_limit_event that refuses use; Claude Code also emits allowed ones.
+REJECTED = {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}}
 
 
 class Clock:
@@ -152,7 +154,7 @@ async def test_a_rate_limit_event_stops_progress_and_keeps_the_text(monkeypatch)
     """The rate-limit double-send class: once the stream reports a rate limit or an
     error, nothing more goes out mid-turn; held text waits for the final reply."""
     p, sent, _, _ = make()
-    await p.on_event("rate_limit_event", None)
+    await p.on_event("rate_limit_event", None, raw=REJECTED)
     await p.on_event("text", LONG)
     await p.on_event("tool_use", None)
     assert sent == []
@@ -442,3 +444,421 @@ async def test_a_short_aside_then_the_answer_reads_once_through_the_handler(monk
     replies, _ = await _drive_text_handler(monkeypatch, stream)
     assert len(replies) == 1 and replies[0].count("The answer.") == 1
     assert replies[0].startswith(SHORT)
+
+
+# --- The delivery ledger across every path that sends text (PR #4864 review) ---
+
+
+def _formatted(text: str) -> str:
+    """What handle_message_streaming returns for ``text`` on Telegram."""
+    from genesis.cc.formatter import ResponseFormatter
+    from genesis.cc.types import ChannelType
+
+    return "\n".join(ResponseFormatter().format(text, channel=ChannelType.TELEGRAM))
+
+
+def _long_segment(n: int = 5059) -> str:
+    # Numbered words, so any repeated span is a real repeat.
+    return " ".join(f"word{i}" for i in range(n // 5))[:n]
+
+
+@pytest.mark.asyncio
+async def test_a_long_fallback_reply_does_not_repeat_delivered_progress():
+    """The empty-result fallback's reply is every streamed text joined, then split
+    for Telegram and re-joined with newlines: a chunk boundary inside the delivered
+    prefix must not defeat the ledger."""
+    segment = _long_segment()
+    p, sent, _, _ = make()
+    await p.on_event("text", segment)
+    await p.on_event("tool_use", None)
+    await p.on_event("text", "Final answer.")
+    assert "".join(sent) == segment
+    assert p.final_reply(_formatted(segment + "Final answer.")) == "Final answer."
+
+
+@pytest.mark.asyncio
+async def test_a_long_fallback_reply_with_a_split_code_block_does_not_repeat():
+    # One fence longer than a chunk, opened past the first quarter: the splitter
+    # force-splits it and adds fences that were never streamed.
+    code = "Here is the code:\n```\n" + "x = 1\n" * 900 + "```\n"
+    p, sent, _, _ = make()
+    await p.on_event("text", code)
+    await p.on_event("tool_use", None)
+    await p.on_event("text", "Final answer.")
+    assert sent
+    assert p.final_reply(_formatted(code + "Final answer.")) == "Final answer."
+
+
+@pytest.mark.asyncio
+async def test_a_long_fallback_reply_with_held_text_past_a_chunk_keeps_it_once():
+    segment = _long_segment()
+    p, sent, clock, _ = make()
+    await p.on_event("text", LONG)
+    await p.on_event("tool_use", None)
+    await p.on_event("text", segment)
+    await p.on_event("tool_use", None)  # inside the pacing interval: held
+    await p.on_event("text", "Final answer.")
+    assert sent == [LONG]
+    reply = p.final_reply(_formatted(LONG + segment + "Final answer."))
+    assert reply.count(segment[:200]) == 1 and LONG not in reply
+    assert reply.endswith("Final answer.")
+
+
+def _synthetic(text: str):
+    from genesis.cc.types import StreamEvent
+
+    return StreamEvent(
+        event_type="text",
+        text=text,
+        raw={"type": "assistant", "message": {"model": "<synthetic>"}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failover_reply_does_not_inherit_the_home_quota_notice(monkeypatch):
+    """Cap, rate_limit_event, then a peer that narrates, calls a tool and answers.
+    The CLI's own quota notice is not narration, and the peer is a new attempt:
+    its progress is delivered and its reply carries nothing of the home attempt."""
+    from genesis.cc.types import StreamEvent
+
+    notice = "You've hit your weekly limit · resets 5pm (UTC)"
+
+    async def stream(prompt, *, on_event, **kw):
+        await on_event(StreamEvent(event_type="init", raw={}))
+        await on_event(_synthetic(notice))
+        await on_event(StreamEvent(event_type="rate_limit_event", raw=REJECTED))
+        await on_event(StreamEvent(event_type="init", raw={}))  # the peer
+        await on_event(StreamEvent(event_type="text", text=LONG))
+        await on_event(StreamEvent(event_type="tool_use", tool_name="Read", tool_input={}))
+        await on_event(StreamEvent(event_type="text", text="The requested answer."))
+        return "The requested answer."
+
+    replies, _ = await _drive_text_handler(monkeypatch, stream)
+    assert replies[0] == LONG
+    assert replies[-1].endswith("The requested answer.")
+    assert all(notice not in r for r in replies)
+    assert sum(r.count(LONG) for r in replies) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_rate_limit_still_stops_progress_for_its_attempt():
+    p, sent, _, _ = make()
+    await p.on_event("init", None)
+    await p.on_event("text", LONG)
+    await p.on_event("rate_limit_event", None, raw=REJECTED)
+    await p.on_event("tool_use", None)
+    assert sent == []
+    assert p.final_reply("Parked.") == f"{LONG}\n\nParked."
+
+
+@pytest.mark.asyncio
+async def test_a_stale_resume_retry_does_not_deliver_the_first_attempts_text_again():
+    """The first attempt streams text and a tool call (delivered), then fails; the
+    fresh retry streams the same text. The user reads it once."""
+    p, sent, _, _ = make()
+    await p.on_event("init", None)
+    await p.on_event("text", LONG)
+    await p.on_event("tool_use", None)
+    await p.on_event("text", "Half")
+    await p.on_event("error", None)
+    await p.on_event("init", None)  # the retry
+    await p.on_event("text", LONG)
+    await p.on_event("tool_use", None)
+    await p.on_event("text", "Final answer.")
+    assert sent == [LONG]
+    assert p.final_reply("Final answer.") == "Final answer."
+    # The empty-result fallback of the retry is its own text joined.
+    p2, _, _, _ = make()
+    for event, text in (
+        ("init", None), ("text", LONG), ("tool_use", None), ("error", None),
+        ("init", None), ("text", LONG), ("tool_use", None), ("text", "Final answer."),
+    ):
+        await p2.on_event(event, text)
+    assert p2.final_reply(LONG + "Final answer.") == "Final answer."
+
+
+@pytest.mark.asyncio
+async def test_a_retry_drops_what_the_failed_attempt_only_held():
+    p, sent, _, _ = make()
+    await p.on_event("init", None)
+    await p.on_event("text", SHORT)
+    await p.on_event("tool_use", None)
+    await p.on_event("error", None)
+    await p.on_event("init", None)
+    await p.on_event("text", "The answer.")
+    assert p.final_reply("The answer.") == "The answer."
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_contingency_reply_gets_no_held_text_in_front():
+    """Contingency answers the turn again, tool-less: like a retry it is a new
+    attempt, and its header must stay first for the model-prefix check."""
+    from genesis.cc.conversation import CONTINGENCY_HEADER_PREFIX
+
+    p, _, _, _ = make()
+    await p.on_event("text", SHORT)
+    await p.on_event("tool_use", None)
+    await p.on_event("rate_limit_event", None, raw=REJECTED)
+    reply = f"{CONTINGENCY_HEADER_PREFIX} via X]\n\nAnswer."
+    assert p.final_reply(reply) == reply
+
+
+@pytest.mark.asyncio
+async def test_each_accepted_progress_chunk_is_recorded_as_it_is_sent(monkeypatch):
+    """Progress longer than one Telegram message goes out in chunks; when a later
+    chunk fails, the chunks Telegram accepted are delivered and never sent again."""
+    from genesis.channels.telegram import _handler_messages as hm
+
+    segment = _long_segment()
+    calls: list[str] = []
+
+    async def reply_text(text, **kw):
+        calls.append(text)
+        if len(calls) == 2:
+            raise RuntimeError("second chunk failed")
+        return MagicMock(message_id=len(calls))
+
+    msg = MagicMock()
+    msg.chat.type, msg.chat.id = "private", 456
+    msg.reply_text = reply_text
+    ctx = MagicMock()
+    ctx.db = None
+    progress = hm._make_progress(ctx, msg, None, None, asyncio.Event())
+    try:
+        await progress.on_event("text", segment)
+        await progress.on_event("tool_use", None)
+        await progress.on_event("text", "Done.")
+    finally:
+        progress.finish()
+    assert len(calls) == 2
+    first = calls[0]
+    assert segment.startswith(first) and len(first) < len(segment)
+    assert not progress.pending().startswith(first[:100])
+    reply = progress.final_reply("Done.")
+    assert first[:100] not in reply and reply.endswith("Done.")
+    assert segment[len(first):].strip()[:100] in reply
+
+
+@pytest.mark.asyncio
+async def test_a_halt_stops_the_snapshot(monkeypatch):
+    monkeypatch.setattr(_progress, "SNAPSHOT_AFTER_S", 0.01)
+    monkeypatch.setattr(_progress, "KEEPALIVE_S", 3600)
+    streamer, _ = _streamer()
+    await streamer.on_tool_use("Bash", "ls the logs")
+    p, sent, _, _ = make(streamer)
+    p.start()
+    try:
+        await p.on_event("tool_use", None)
+        await p.on_event("rate_limit_event", None, raw=REJECTED)
+        await asyncio.sleep(0.05)
+        assert sent == []
+    finally:
+        p.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_halt_stops_the_keepalive(monkeypatch):
+    monkeypatch.setattr(_progress, "SNAPSHOT_AFTER_S", 3600)
+    monkeypatch.setattr(_progress, "KEEPALIVE_S", 0.01)
+    streamer, bot = _streamer(prefix="")
+    await streamer.on_thinking()
+    bot.send_message_draft.reset_mock()
+    p, _, clock, _ = make(streamer)
+    await p.on_event("error", None)
+    clock.t += 100
+    p.start()
+    try:
+        await asyncio.sleep(0.05)
+    finally:
+        p.stop()
+    assert bot.send_message_draft.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_halted_retry_still_does_not_repeat_what_was_delivered():
+    p, sent, _, _ = make()
+    for event, text in (
+        ("init", None), ("text", LONG), ("tool_use", None), ("error", None),
+        ("init", None), ("error", None), ("text", LONG), ("tool_use", None),
+    ):
+        await p.on_event(event, text)
+    assert sent == [LONG]
+    assert p.final_reply("Parked.") == "Parked."
+
+
+def _limit(status: str) -> dict:
+    return {"type": "rate_limit_event", "rate_limit_info": {"status": status}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["allowed", "allowed_warning"])
+async def test_an_informational_rate_limit_event_changes_nothing(monkeypatch, status):
+    """Claude Code emits rate_limit_event on ordinary turns; only a rejection is a
+    limit. Progress, the snapshot and the keepalive all carry on."""
+    monkeypatch.setattr(_progress, "SNAPSHOT_AFTER_S", 0.01)
+    monkeypatch.setattr(_progress, "KEEPALIVE_S", 0.01)
+    streamer, bot = _streamer(prefix="")
+    await streamer.on_tool_use("Bash", "ls the logs")
+    bot.send_message_draft.reset_mock()
+    p, sent, clock, _ = make(streamer)
+    p.start()
+    try:
+        await p.on_event("tool_use", None)
+        await p.on_event("rate_limit_event", None, raw=_limit(status))
+        clock.t += 100
+        await asyncio.sleep(0.05)
+        assert len(sent) == 1 and sent[0].startswith("Working on it:")  # the snapshot
+        assert bot.send_message_draft.await_count >= 1  # the keepalive
+    finally:
+        p.stop()
+    p2, sent2, _, _ = make()
+    await p2.on_event("text", LONG)
+    await p2.on_event("rate_limit_event", None, raw=_limit(status))
+    await p2.on_event("tool_use", None)
+    await p2.on_event("text", "Final answer.")
+    assert sent2 == [LONG]
+    assert p2.final_reply("Final answer.") == "Final answer."
+
+
+@pytest.mark.asyncio
+async def test_an_overage_rejection_is_not_a_halt():
+    p, sent, _, _ = make()
+    raw = {"type": "rate_limit_event",
+           "rate_limit_info": {"status": "rejected", "isUsingOverage": True}}
+    await p.on_event("text", LONG)
+    await p.on_event("rate_limit_event", None, raw=raw)
+    await p.on_event("tool_use", None)
+    assert sent == [LONG]
+
+
+@pytest.mark.asyncio
+async def test_an_allowed_rate_limit_event_keeps_the_draft_through_the_handler(monkeypatch):
+    from genesis.cc.types import StreamEvent
+    from genesis.channels.telegram._handler_context import HandlerContext
+
+    streamer, _ = _streamer(prefix="")
+    ctx = HandlerContext.__new__(HandlerContext)
+    on_event = HandlerContext.make_on_event(ctx, asyncio.Event(), streamer, None)
+    await on_event(StreamEvent(event_type="rate_limit_event", raw=_limit("allowed")))
+    assert streamer.enabled
+    await on_event(StreamEvent(event_type="rate_limit_event", raw=REJECTED))
+    assert not streamer.enabled
+
+
+@pytest.mark.asyncio
+async def test_subagent_lines_are_not_progress_or_boundaries():
+    """The Agent tool's subagent streams its own assistant lines, marked with a
+    parent_tool_use_id: not this turn's narration, and not its tool calls."""
+    sub = {"type": "assistant", "parent_tool_use_id": "toolu_1"}
+    p, sent, _, _ = make()
+    await p.on_event("text", LONG)
+    await p.on_event("text", "Subagent narration that is long enough to send.", raw=sub)
+    await p.on_event("tool_use", None, raw=sub)
+    assert sent == []  # a subagent tool call is not a boundary of this turn
+    await p.on_event("tool_use", None)
+    assert sent == [LONG]
+    await p.on_event("text", "Final answer.")
+    assert p.final_reply("Final answer.") == "Final answer."
+
+
+@pytest.mark.asyncio
+async def test_a_retry_that_continues_past_the_delivered_text_sends_only_the_rest():
+    """Attempt 1 delivered A; attempt 2 streams A then B before its tool call. The
+    user gets B, not A again."""
+    second = " And then I checked the second record, which also matched."
+    p, sent, clock, _ = make()
+    for event, text in (
+        ("init", None), ("text", LONG), ("tool_use", None), ("error", None),
+        ("init", None), ("text", LONG + second),
+    ):
+        await p.on_event(event, text)
+    clock.t += _progress.MIN_PROGRESS_INTERVAL_S  # past the pacing interval
+    await p.on_event("tool_use", None)
+    assert sent == [LONG, second.strip()]
+    p2, _, _, _ = make()
+    for event, text in (
+        ("init", None), ("text", LONG), ("tool_use", None), ("error", None),
+        ("init", None), ("text", LONG + " Ok."), ("tool_use", None), ("text", "Done."),
+    ):
+        await p2.on_event(event, text)
+    assert p2.final_reply("Done.") == "Ok.\n\nDone."
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_connection_with_nothing_delivered_says_so_plainly(monkeypatch):
+    """Text was seen but nothing reached the user (here: a retry dropped the failed
+    attempt's held aside): no "messages above" to point at."""
+    from genesis.cc.types import StreamEvent
+
+    async def stream(prompt, *, on_event, **kw):
+        await on_event(StreamEvent(event_type="init", raw={}))
+        await on_event(StreamEvent(event_type="text", text=SHORT))
+        await on_event(StreamEvent(event_type="tool_use", tool_name="Read", tool_input={}))
+        await on_event(StreamEvent(event_type="init", raw={}))
+        raise ConnectionError("dropped")
+
+    replies, _ = await _drive_text_handler(monkeypatch, stream)
+    assert replies == []
+
+
+SUB = {"type": "assistant", "parent_tool_use_id": "toolu_1"}
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_reply_with_subagent_text_does_not_repeat_a_held_aside():
+    """The invoker's empty-result fallback joins every text event, a subagent's
+    included; progress leaves subagent text out. The reply must still be recognised,
+    so the held aside appears once."""
+    p, sent, _, _ = make()
+    await p.on_event("init", None)
+    await p.on_event("text", LONG)
+    await p.on_event("tool_use", None)
+    await p.on_event("text", "Subagent internal narration. ", raw=SUB)
+    await p.on_event("tool_use", None, raw=SUB)
+    await p.on_event("text", "Short aside.")
+    await p.on_event("tool_use", None)  # inside the pacing interval: held
+    await p.on_event("text", "Answer.")
+    assert sent == [LONG]
+    fallback = LONG + "Subagent internal narration. " + "Short aside." + "Answer."
+    reply = p.final_reply(_formatted(fallback))
+    assert reply.count("Short aside.") == 1 and "Subagent" not in reply
+    assert reply.endswith("Answer.") and LONG not in reply
+
+
+@pytest.mark.asyncio
+async def test_a_long_fallback_reply_with_two_subagent_bursts_is_recognised():
+    segment = _long_segment()
+    p, sent, clock, _ = make()
+    stream = [
+        ("init", None, None), ("text", LONG, None), ("tool_use", None, None),
+        ("text", "First subagent burst. ", SUB), ("tool_use", None, SUB),
+        ("text", "Short aside.", None), ("tool_use", None, None),
+        ("text", segment, SUB), ("tool_use", None, SUB),
+        ("text", "Second aside.", None), ("tool_use", None, None),
+        ("text", "Answer.", None),
+    ]
+    for event, text, raw in stream:
+        await p.on_event(event, text, raw=raw)
+    assert sent == [LONG]
+    fallback = "".join(text for event, text, _ in stream if event == "text")
+    reply = p.final_reply(_formatted(fallback))
+    # The fallback is the turn's own text as streamed (as in the two-asides case).
+    assert reply == "Short aside.Second aside.Answer."
+
+
+@pytest.mark.asyncio
+async def test_the_draft_leaves_out_subagent_lines():
+    from genesis.cc.types import StreamEvent
+    from genesis.channels.telegram._handler_context import HandlerContext
+
+    streamer, _ = _streamer(prefix="")
+    ctx = HandlerContext.__new__(HandlerContext)
+    on_event = HandlerContext.make_on_event(ctx, asyncio.Event(), streamer, None)
+    await on_event(StreamEvent(event_type="text", text="Main text.", raw={"type": "assistant"}))
+    await on_event(StreamEvent(event_type="text", text="Subagent text.", raw=SUB))
+    await on_event(StreamEvent(event_type="tool_use", tool_name="Grep", tool_input={}, raw=SUB))
+    await on_event(StreamEvent(event_type="tool_use", tool_name="Read", tool_input={}, raw={}))
+    draft = streamer._compose_draft()
+    assert "Main text." in draft and "Subagent" not in draft
+    assert "Read" in draft and "Grep" not in draft

@@ -6,6 +6,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from genesis.channels.telegram._progress import halts
+
 if TYPE_CHECKING:
     import aiosqlite
     from telegram import Update
@@ -119,12 +121,22 @@ class HandlerContext:
             if interrupt_event.is_set():
                 return
             if progress is not None:
-                await progress.on_event(event.event_type, event.text)
+                await progress.on_event(
+                    event.event_type,
+                    event.text,
+                    synthetic=event.is_synthetic,
+                    raw=event.raw,
+                )
+            # A subagent's lines (the Agent tool) are not this turn's narration:
+            # the draft leaves them out, as progress does.
+            subagent = bool((event.raw or {}).get("parent_tool_use_id"))
             if streamer and streamer.enabled:
-                if event.event_type in ("rate_limit_event", "error"):
+                if halts(event.event_type, event.raw):
                     streamer.disable()
                 elif event.event_type == "thinking":
                     await streamer.on_thinking()
+                elif subagent:
+                    pass
                 elif event.event_type == "text" and event.text:
                     await streamer.on_text(event.text)
                 elif event.event_type == "tool_use":
