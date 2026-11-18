@@ -114,8 +114,15 @@ async def _apply_pending_settings(ctx: HandlerContext, user_id: int, tid: str | 
 
 
 _MODEL_PREFIX_GAP_S = 3600  # Show model/effort prefix after 1h of silence
-# A self-written header line: "[Sonnet 5.5 / high]", "[Opus / High]".
-_HEADER_LINE = re.compile(r"\[[^\[\]\n]{1,40} / [A-Za-z]{2,8}\]")
+# A self-written header line: "[Sonnet 5.5 / high]", "[Opus / High]", "[glm-5.3 / max]".
+# The model part must name a Claude family or be a hyphenated versioned id (what
+# display_name passes through for other models), and the effort must be a real
+# effort level, so ordinary labels like "[Input / Output]" or "[Step 2 / max]" survive.
+_HEADER_LINE = re.compile(
+    r"\[(?:(?:opus|sonnet|haiku|fable)\b[^\[\]\n]{0,30}|[a-z][\w.]{0,20}-[\w.-]{0,20}\d[\w.-]{0,20})"
+    r" / (?:low|medium|high|xhigh|max)\]",
+    re.IGNORECASE,
+)
 
 
 def _with_model_prefix(streamer: DraftStreamer | None, response: str) -> str:

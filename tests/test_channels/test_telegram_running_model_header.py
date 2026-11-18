@@ -62,6 +62,16 @@ async def test_a_failover_peers_init_retitles_a_disabled_streamer():
         ("[Opus / High]\n\nThe answer.", "[Sonnet 5.5 / High]\nThe answer."),
         ("The answer.", "[Sonnet 5.5 / High]\nThe answer."),
         ("[see notes] and more\nx", "[Sonnet 5.5 / High]\n[see notes] and more\nx"),
+        ("[glm-5.3 / max]\nok", "[Sonnet 5.5 / High]\nok"),
+        # Ordinary bracketed content is not a header (review finding).
+        ("[Input / Output]\nx", "[Sonnet 5.5 / High]\n[Input / Output]\nx"),
+        ("[Before / After]\nx", "[Sonnet 5.5 / High]\n[Before / After]\nx"),
+        ("[Plan A / high]\nx", "[Sonnet 5.5 / High]\n[Plan A / high]\nx"),
+        ("[Step 2 / max]\nx", "[Sonnet 5.5 / High]\n[Step 2 / max]\nx"),
+        ("[Priority 1 / High]\nx", "[Sonnet 5.5 / High]\n[Priority 1 / High]\nx"),
+        ("[Opus 5.5 / xHigh]\nok", "[Sonnet 5.5 / High]\nok"),
+        ("[haiku 4.5 / low]\nok", "[Sonnet 5.5 / High]\nok"),
+        ("[Fable 5.1 / max]\nok", "[Sonnet 5.5 / High]\nok"),
     ],
 )
 def test_the_relay_header_replaces_a_self_written_one(reply, expected):
