@@ -145,12 +145,23 @@ _MIN_TOKEN = 4
 _TOKEN_EDGE = ".,;:!?()[]{}\"'"  # noqa: S105 - punctuation, not a secret
 
 
+_ASCII_DIGIT = re.compile(r"[0-9]")
+_ASCII_ALPHA = re.compile(r"[A-Za-z]")
+_ASCII_SYMBOL = re.compile(r"[^0-9A-Za-z]")
+
+
 def _secret_token(token: str) -> bool:
     """A whitespace token that reads as a secret rather than a word: at least
     four characters, letters or digits mixed with a digit or a symbol. Plain
     words ("password", "Router") and email addresses never qualify."""
     if len(token) < _MIN_TOKEN or _EMAIL.match(token):
         return False
+    if token.isascii():
+        # The same three tests on ASCII, in C (an upload holds out megabytes).
+        has_digit = _ASCII_DIGIT.search(token) is not None
+        has_symbol = _ASCII_SYMBOL.search(token) is not None
+        has_alpha = _ASCII_ALPHA.search(token) is not None
+        return (has_digit or has_symbol) and (has_alpha or (has_digit and has_symbol))
     has_digit = any(c.isdigit() for c in token)
     has_symbol = any(not c.isalnum() for c in token)
     has_alpha = any(c.isalpha() for c in token)
@@ -162,6 +173,9 @@ def _normalise(text: str) -> str:
     compatibility variant reads as its plain form), every format character
     (Unicode category Cf: zero-width spaces and joiners, the soft hyphen)
     removed, then casefolded."""
+    if text.isascii():
+        # NFKC leaves ASCII as it is, and no ASCII character is a format one.
+        return text.casefold()
     folded = unicodedata.normalize("NFKC", text)
     return "".join(c for c in folded if unicodedata.category(c) != "Cf").casefold()
 
@@ -208,12 +222,16 @@ def _value_probes(value: str, *, login_exempt: bool = False) -> list[tuple[str, 
     exempt = login.strip().strip(_TOKEN_EDGE) if login_exempt and sep and secret.strip() else None
     for form in _decoded(whole):
         schemes = {m.group(1).casefold() for m in _SCHEME.finditer(form)}
-        for fragment in _FRAGMENT_SPLIT.split(unicodedata.normalize("NFKC", form)):
+        # Each distinct fragment once (the same output; a long value repeats).
+        for fragment in dict.fromkeys(_FRAGMENT_SPLIT.split(unicodedata.normalize("NFKC", form))):
             fragment = fragment.strip(_TOKEN_EDGE)
             folded = fragment.casefold()
             if (
-                not fragment or fragment == exempt or fragment.isdigit()
-                or folded in schemes or _HOSTNAME.match(folded)
+                not fragment
+                or fragment == exempt
+                or fragment.isdigit()
+                or folded in schemes
+                or _HOSTNAME.match(folded)
             ):
                 continue
             if _secret_token(fragment):
