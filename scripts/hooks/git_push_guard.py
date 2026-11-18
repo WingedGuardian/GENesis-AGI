@@ -5531,19 +5531,30 @@ def _rounds_row(
 #: for a paginated comment list, with headroom.
 _DELIVERY_GH_TIMEOUT_S = 20.0
 
+#: Basis kinds that carry no points of their own to judge a PR against: a ledger row
+#: or follow-up is one sentence, and a claim is the PR's own description.
+_DELIVERY_WEAK_BASIS = {
+    "ledger": "a ledger row",
+    "follow-up": "a follow-up",
+    "claim": "the PR's own claim",
+}
+
 
 def _delivery_self_attestable(files: list[str] | None) -> bool:
     """Whether a builder's own delivery read may stand on a PR with these files.
 
     Owner rulings R1 and S8 (2026-11-17): only when every changed file is prose,
     none lives under ``src/`` or ``.claude/agents/`` (prose there is runtime or agent
-    behaviour), and none is a critical-lane path. An unreadable or empty list is no."""
+    behaviour), and none is a critical-lane path. The lane counts the enforcement-hook
+    surface as critical too (``classify_lane``'s ``hook_surface``), so prose there is
+    excluded as well. An unreadable or empty list is no."""
     import review_scope  # noqa: PLC0415 - scripts/ is on sys.path (top of file)
 
     return bool(files) and all(
         review_scope._is_lane_prose(p)
         and not p.startswith(("src/", ".claude/agents/"))
         and not review_scope._is_lane_critical_path(p)
+        and not _is_hook_surface_path(p)
         for p in files
     )
 
@@ -5628,23 +5639,31 @@ def _delivery_row_text(pr_num: str, repo: str | None, head: str | None) -> str:
     else:
         main = f"check recorded at {f['head'][:12]}; carry unconfirmed: re-read ({verdict} there)"
         ok = False
-    main += f", basis {f['basis']}"
-    extra = []
+    # The grammar fixes the basis's shape, not its length, and compose derives it from
+    # the PR body: bound it so one pointer line cannot flood the report (GLM, round 1).
+    main += f", basis {f['basis'][:80]}"
+    # Each extra says whether it voids the read (True: the row cannot be ok) or only
+    # names something (False), so no rule depends on how its text happens to start.
+    extra: list[tuple[str, bool]] = []
+    # Named, not demoted (owner ruling, 2026-11-18): a read against one of these was
+    # judged without an issue's or a spec's points, so its DELIVERS is a weaker claim.
+    weak = _DELIVERY_WEAK_BASIS.get(f["basis"].split(":", 1)[0])
+    if weak:
+        extra.append((f"basis is {weak}, not an issue, spec or plan: a weaker check", False))
     if f["scope"] != "CLEAN":
-        extra.append(f"scope {f['scope']}")
+        extra.append((f"scope {f['scope']}", False))
     if f.get("intended") in ("not-stated", "unsupported"):
-        extra.append(f"intended={f['intended']}")
-        ok = False
-    if ok and f["checker"] == "author-review":
+        extra.append((f"intended={f['intended']}", True))
+    if ok and not any(v for _t, v in extra) and f["checker"] == "author-review":
         if _delivery_self_attestable(_pr_changed_files(pr_num, repo=target)):
-            extra.append("self-attested")
+            extra.append(("self-attested", False))
         else:
             main = "the builder's own read: a closing read (checker=other) is owed; " + main
             ok = False
     if verdict != "DELIVERS":
         body = next((c.get("body") or "" for c in comments if c.get("id") == gov["id"]), "")
         if m := dm._ASKED_RE.search(body):
-            extra.append("Asked: " + _sanitize_gate_text(m.group(1))[:160])
+            extra.append(("Asked: " + _sanitize_gate_text(m.group(1))[:160], False))
     if meta is not None:
         try:
             now = dm.basis_from_body(
@@ -5655,16 +5674,18 @@ def _delivery_row_text(pr_num: str, repo: str | None, head: str | None) -> str:
         except dm.Refused as exc:
             now, why = None, _sanitize_gate_text(str(exc))[:160]
         if now is None:
-            extra.append(f"the PR's basis cannot be derived now ({why}): re-read")
+            extra.append((f"the PR's basis cannot be derived now ({why}): re-read", True))
         elif now != f["basis"]:
-            extra.append(f"basis changed since the check (now {now[:120]})")
-    extra += dm.changes_since(target, pr, f["basis"], f["head"], timeout=t)
+            extra.append((f"basis changed since the check (now {now[:120]})", True))
+    extra += dm.changes_since(
+        target, pr, f["basis"], f["head"], str(gov["stamp"] or ""), timeout=t
+    )
     if sel["later_unusable"]:
-        problem = sel["later_unusable"][-1]["problem"]
-        extra.append(f"a later owner block is unusable: '{_sanitize_gate_text(problem)[:120]}'")
-    if unread or any(e != "self-attested" and not e.startswith("scope ") for e in extra):
+        problem = _sanitize_gate_text(sel["later_unusable"][-1]["problem"])[:120]
+        extra.append((f"a later owner block is unusable: '{problem}'", True))
+    if unread or any(voids for _text, voids in extra):
         ok = False
-    text = main + "".join(f"; {e}" for e in extra) + tail
+    text = main + "".join(f"; {e}" for e, _voids in extra) + tail
     return f"ok ({text})" if ok else f"advisory — {text}"
 
 

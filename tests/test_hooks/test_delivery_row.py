@@ -61,6 +61,20 @@ def comment(body, cid=1, stamp=STAMP, login="o", assoc="OWNER"):
     return {"id": cid, "login": login, "author_association": assoc, "body": body, "stamp": stamp}
 
 
+def issue(edited=None, comments=(), events=(), total=None, filtered=None):
+    """The basis issue as the GraphQL read returns it."""
+    comments, events = list(comments), list(events)
+    return {
+        "__typename": "Issue",
+        "lastEditedAt": edited,
+        "comments": {"totalCount": len(comments) if total is None else total, "nodes": comments},
+        "timelineItems": {
+            "filteredCount": len(events) if filtered is None else filtered,
+            "nodes": events,
+        },
+    }
+
+
 class World:
     """What the fake ``gh`` returns, per read. A value of ``"error"`` makes that read fail."""
 
@@ -71,9 +85,11 @@ class World:
         self.linked = []
         self.base_events = []
         self.base_filtered = None
-        self.issue = {"__typename": "Issue", "lastEditedAt": None, "comments": {"nodes": []}}
+        self.issue = issue()
+        self.pr_renames = []  # PR retitle times
         self.graphql = None  # "error" to fail the GraphQL read
         self.head_time = STAMP  # the read's head commit time; None: the commit is unknown
+        self.pr_edited = None  # the PR body's lastEditedAt
         self.calls = []
 
     def gh(self, args, *, timeout=None):
@@ -84,7 +100,10 @@ class World:
         if args[:2] == ["api", "graphql"]:
             if self.graphql == "error":
                 raise dm.Refused("gh api graphql failed: boom")
-            events = self.base_events
+            events = [
+                {"__typename": "BaseRefChangedEvent", "createdAt": t} for t in self.base_events
+            ]
+            events += [{"__typename": "RenamedTitleEvent", "createdAt": t} for t in self.pr_renames]
             filtered = len(events) if self.base_filtered is None else self.base_filtered
             return json.dumps(
                 {
@@ -96,10 +115,11 @@ class World:
                                 else {"committedDate": self.head_time}
                             ),
                             "pullRequest": {
+                                "lastEditedAt": self.pr_edited,
                                 "timelineItems": {
                                     "filteredCount": filtered,
-                                    "nodes": [{"createdAt": t} for t in events],
-                                }
+                                    "nodes": events,
+                                },
                             },
                             "issueOrPullRequest": self.issue,
                         }
@@ -189,6 +209,7 @@ def test_builders_own_read_on_a_prose_only_pr_is_self_attested(guard, world):
         [".claude/agents/genesis-architect.md"],
         ["docs/guide.md", "scripts/thing.py"],
         [".github/README.md"],  # prose, but a critical-lane path
+        ["scripts/hooks/README.md"],  # prose, but on the enforcement-hook surface
         [],
         None,
     ],
@@ -250,7 +271,7 @@ def test_a_base_event_list_cut_short_is_could_not_check(guard, world):
 
 def test_an_issue_edit_after_the_check_is_advisory(guard, world):
     world.comments = [comment(block())]
-    world.issue = {"__typename": "Issue", "lastEditedAt": LATER, "comments": {"nodes": []}}
+    world.issue = issue(edited=LATER)
     got = row(guard)
     assert got.startswith("advisory —"), got
     assert "the issue was edited since the check" in got
@@ -258,11 +279,7 @@ def test_an_issue_edit_after_the_check_is_advisory(guard, world):
 
 def test_a_new_issue_comment_after_the_check_is_advisory(guard, world):
     world.comments = [comment(block())]
-    world.issue = {
-        "__typename": "Issue",
-        "lastEditedAt": EARLIER,
-        "comments": {"nodes": [{"createdAt": LATER}]},
-    }
+    world.issue = issue(edited=EARLIER, comments=[{"createdAt": LATER}])
     got = row(guard)
     assert got.startswith("advisory —"), got
     assert "the issue has new comments since the check" in got
@@ -274,7 +291,7 @@ def test_changes_are_judged_against_the_heads_commit_time_not_the_marker_edit(gu
     world.comments = [comment(block(head=OLD), stamp=LATER)]  # marker last edited late
     world.carry = "inline"
     world.head_time = EARLIER  # the read's head was committed early
-    world.issue = {"__typename": "Issue", "lastEditedAt": STAMP, "comments": {"nodes": []}}
+    world.issue = issue(edited=STAMP)
     got = row(guard)
     assert "the issue was edited since the check" in got, got
     graphql = [args for args, _t in world.calls if args[:2] == ["api", "graphql"]]
@@ -310,7 +327,59 @@ def test_a_claim_basis_reads_no_issue(guard, world):
     world.comments = [comment(block(basis="claim"))]
     got = row(guard)
     assert got.startswith("ok (DELIVERS at head, basis claim"), got
-    assert "issue" not in got
+    assert "the issue" not in got  # no issue read on a claim basis
+    assert "basis is the PR's own claim, not an issue, spec or plan" in got
+
+
+@pytest.mark.parametrize(
+    "basis, named",
+    [
+        ("ledger:" + "7" * 32, "a ledger row"),
+        ("follow-up:" + "8" * 32, "a follow-up"),
+    ],
+)
+def test_a_weak_basis_is_named_and_stays_ok(guard, world, basis, named):
+    """Owner ruling 2026-11-18: name it, do not demote it."""
+    world.pr_body = (
+        f"Ledger: {'7' * 32}\n" if basis.startswith("ledger") else f"Follow-up: {'8' * 32}\n"
+    )
+    world.comments = [comment(block(basis=basis))]
+    got = row(guard)
+    assert got.startswith("ok (DELIVERS at head"), got
+    assert f"basis is {named}, not an issue, spec or plan" in got
+
+
+def test_a_huge_basis_is_bounded_in_the_row(guard, world):
+    """The grammar fixes the basis's shape, not its length (GLM, round 1)."""
+    name = "A" * 50_000
+    world.pr_body = f"Spec: {name}\n"
+    world.comments = [comment(block(basis=f"spec:{name}"))]
+    got = row(guard)
+    assert len(got) < 1_000, len(got)
+
+
+def test_an_edited_claim_is_advisory(guard, world):
+    """On a claim basis the PR body IS the basis: editing it after the read changes
+    what was judged (Devin, round 1)."""
+    world.pr_body = "The change, no pointer."
+    world.comments = [comment(block(basis="claim"))]
+    world.pr_edited = LATER
+    got = row(guard)
+    assert got.startswith("advisory —"), got
+    assert "the PR body (its claim) was edited since the check" in got
+
+
+def test_a_body_edit_on_an_issue_basis_is_not_a_claim_change(guard, world):
+    world.comments = [comment(block())]
+    world.pr_edited = LATER
+    got = row(guard)
+    assert got.startswith("ok (DELIVERS at head"), got
+    assert "its claim" not in got
+
+
+def test_an_issue_basis_is_not_called_weak(guard, world):
+    world.comments = [comment(block())]
+    assert "not an issue, spec or plan" not in row(guard)
 
 
 def test_the_latest_edit_governs_at_one_head(guard, world):
@@ -459,3 +528,128 @@ def test_an_unreadable_pr_body_leaves_the_basis_unchecked_and_says_so(guard, wor
     assert got.startswith("advisory — DELIVERS at head"), got
     assert "the PR body: could not check" in got
     assert "basis changed" not in got
+
+
+# ── round 1: what else may change after a read (owner rulings 2026-11-18) ─────
+
+
+def test_a_claim_body_edit_before_the_read_is_not_flagged(guard, world):
+    """On a claim basis the body is judged against the marker's own edit time, so a
+    bot's body edit between the head commit and the read clears on a re-read."""
+    world.pr_body = "The change, no pointer."
+    world.comments = [comment(block(basis="claim"), stamp=LATER)]
+    world.head_time = EARLIER
+    world.pr_edited = STAMP  # after the commit, before the read
+    got = row(guard)
+    assert got.startswith("ok (DELIVERS at head"), got
+
+
+def test_a_claim_pr_retitled_after_the_read_is_advisory(guard, world):
+    world.pr_body = "The change, no pointer."
+    world.comments = [comment(block(basis="claim"))]
+    world.pr_renames = [LATER]
+    got = row(guard)
+    assert got.startswith("advisory —"), got
+    assert "the PR title (part of its claim) changed since the check" in got
+
+
+def test_a_pr_retitle_on_an_issue_basis_is_not_a_change(guard, world):
+    world.comments = [comment(block())]
+    world.pr_renames = [LATER]
+    assert row(guard).startswith("ok (DELIVERS at head")
+
+
+@pytest.mark.parametrize(
+    "kind, body, shown",
+    [
+        ("spec:delivery-design", "Spec: delivery-design\n", "changes to the spec since the read"),
+        ("plan:delivery-row", "Plan: delivery-row\n", "changes to the plan since the read"),
+        ("ledger:" + "7" * 32, f"Ledger: {'7' * 32}\n", "changes to the ledger row since the read"),
+        (
+            "follow-up:" + "8" * 32,
+            f"Follow-up: {'8' * 32}\n",
+            "changes to the follow-up since the read",
+        ),
+    ],
+)
+def test_a_source_nothing_can_check_is_named_not_demoted(guard, world, kind, body, shown):
+    world.pr_body = body
+    world.comments = [comment(block(basis=kind))]
+    got = row(guard)
+    assert got.startswith("ok (DELIVERS at head"), got
+    assert f"{shown}: not checked" in got
+
+
+def test_an_edited_issue_comment_is_advisory(guard, world):
+    world.comments = [comment(block())]
+    world.issue = issue(comments=[{"createdAt": EARLIER, "lastEditedAt": LATER}])
+    got = row(guard)
+    assert got.startswith("advisory —"), got
+    assert "an issue comment was edited since the check" in got
+
+
+def test_older_issue_comments_beyond_the_page_are_named(guard, world):
+    world.comments = [comment(block())]
+    world.issue = issue(comments=[{"createdAt": EARLIER}], total=150)
+    got = row(guard)
+    assert "older issue comments: edits not checked" in got
+    assert got.startswith("ok (DELIVERS at head"), got  # named, not voiding
+
+
+@pytest.mark.parametrize(
+    "event, shown",
+    [
+        ({"__typename": "RenamedTitleEvent", "createdAt": LATER}, "the issue was retitled"),
+        (
+            {"__typename": "ClosedEvent", "createdAt": LATER, "stateReason": "NOT_PLANNED"},
+            "the issue was closed as not planned",
+        ),
+        ({"__typename": "ReopenedEvent", "createdAt": LATER}, "the issue was reopened"),
+    ],
+)
+def test_an_issue_retitle_or_closure_after_the_read_is_advisory(guard, world, event, shown):
+    world.comments = [comment(block())]
+    world.issue = issue(events=[event])
+    got = row(guard)
+    assert got.startswith("advisory —"), got
+    assert f"{shown} since the check" in got
+
+
+def test_an_issue_closure_before_the_read_is_not_flagged(guard, world):
+    world.comments = [comment(block())]
+    world.issue = issue(events=[{"__typename": "ClosedEvent", "createdAt": EARLIER}])
+    assert row(guard).startswith("ok (DELIVERS at head")
+
+
+def test_a_cut_short_issue_timeline_is_could_not_check(guard, world):
+    world.comments = [comment(block())]
+    world.issue = issue(
+        events=[{"__typename": "RenamedTitleEvent", "createdAt": EARLIER}], filtered=200
+    )
+    got = row(guard)
+    assert "issue retitles and closures: could not check" in got
+    assert not got.startswith("ok")
+
+
+def test_a_huge_issue_number_fails_closed_inside_the_read(guard, world):
+    """The issue number is parsed inside the read's try, so no row turns into a
+    'lookup failed' on a pathological basis."""
+    import delivery_marker as dm
+
+    got = dm.changes_since(REPO, 12, "issue:" + "9" * 5000, HEAD, STAMP, timeout=1)
+    assert got == [("base and issue changes: could not check", True)]
+
+
+def test_a_voided_builder_read_never_claims_self_attest(guard, world, monkeypatch):
+    """An unstated intent already voids the row, so the self-attest branch must not
+    run or print 'self-attested' on it (review of the round-1 fix, L2)."""
+    world.files = ["docs/guide.md"]
+    world.comments = [comment(block(checker="author-review", intended="not-stated"))]
+    called = []
+    monkeypatch.setattr(
+        guard, "_pr_changed_files", lambda pr, repo=None: called.append(pr) or world.files
+    )
+    got = row(guard)
+    assert got.startswith("advisory —"), got
+    assert "self-attested" not in got
+    assert called == []

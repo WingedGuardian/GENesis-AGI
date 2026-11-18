@@ -1570,12 +1570,18 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   `self-attested`), with nothing since that may void it. Otherwise it is
   `advisory —` and names why: no read recorded, another verdict (with its `Asked:`
   line), a carry the PR's diff cannot confirm, the builder's own read, a changed or
-  underivable basis, a base retarget, an issue edited or newly commented after the
-  read's head was committed, or a later owner block that does not parse. A failed
-  side read is named (`the PR body: could not check`, `review bodies: could not
-  check`, `base and issue changes: could not check`) and keeps the row advisory;
-  only an unreadable comment list makes the whole row `could not check`. It never
-  moves the verdict.
+  underivable basis, or a later owner block that does not parse. It also names what
+  changed after the read: a base retarget, or on an issue basis the issue edited,
+  retitled, closed or reopened, or a comment added or edited, judged against the
+  read's head commit time; on a claim basis the PR body or title edited after the
+  marker was last posted or edited (bots rewrite PR bodies after most pushes, so
+  re-recording the read is what clears it; post the composed marker promptly, since
+  an edit between `compose` and the post goes unseen). It names, without demoting, a
+  weak basis (a ledger row, a follow-up or the PR's own claim), a source it cannot
+  check (a spec, plan, ledger row or follow-up), and issue comments past the newest
+  100. A failed or cut-short read is named (`... could not check`) and keeps the row
+  advisory; only an unreadable comment list makes the whole row `could not check`.
+  It never moves the verdict.
 
 - **GATE-FIX LANE** (hook-surface PRs): `.claude/skills/genesis-development/references/gate-fix-lane.md`.
 

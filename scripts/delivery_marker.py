@@ -492,40 +492,68 @@ def select(comments: list[dict], reviews: list[dict], owner: str, head: str) -> 
     return {"governing": governing, "later_unusable": later, "blocks": blocks, "notes": notes}
 
 
-#: The read's head commit time, the PR's base changes and the basis issue's last edit and
-#: newest comment, in one read. ``filteredCount`` counts the matching events;
-#: ``totalCount`` counts every timeline item (MEASURED on #4611: 27 against 0 matching),
-#: so nodes are compared with it. ``committedDate`` is the committer date (MEASURED: it
-#: equals REST ``commit.committer.date`` on 1430e874).
+#: One read for everything that may void a delivery read since it was made: the read's
+#: head commit time; the PR's base retargets and retitles and its body's last edit; and,
+#: on an issue basis, the issue's edit, retitles, closures, reopenings and comments.
+#: ``filteredCount`` counts the matching events; ``totalCount`` on the timeline counts
+#: every item (MEASURED on #4611: 27 against 0 matching), so nodes are compared with
+#: ``filteredCount``. ``committedDate`` is the committer date (MEASURED: it equals REST
+#: ``commit.committer.date`` on 1430e874).
 _CHANGES_Q = (
     "query($o:String!,$r:String!,$pr:Int!,$issue:Int!,$has:Boolean!,$head:GitObjectID!)"
     "{repository(owner:$o,name:$r){object(oid:$head){... on Commit{committedDate}}"
-    " pullRequest(number:$pr){timelineItems(itemTypes:[BASE_REF_CHANGED_EVENT],"
-    "last:100){filteredCount nodes{... on BaseRefChangedEvent{createdAt}}}}"
+    " pullRequest(number:$pr){lastEditedAt timelineItems(itemTypes:[BASE_REF_CHANGED_EVENT,"
+    "RENAMED_TITLE_EVENT],last:100){filteredCount nodes{__typename"
+    " ... on BaseRefChangedEvent{createdAt} ... on RenamedTitleEvent{createdAt}}}}"
     " issueOrPullRequest(number:$issue) @include(if:$has){__typename ... on Issue{"
-    "lastEditedAt comments(last:1){nodes{createdAt}}}}}}"
+    "lastEditedAt comments(last:100){totalCount nodes{createdAt lastEditedAt}}"
+    " timelineItems(itemTypes:[RENAMED_TITLE_EVENT,CLOSED_EVENT,REOPENED_EVENT],last:100)"
+    "{filteredCount nodes{__typename ... on RenamedTitleEvent{createdAt}"
+    " ... on ClosedEvent{createdAt stateReason} ... on ReopenedEvent{createdAt}}}}}}}"
 )
+
+#: A basis whose source is not on GitHub, so nothing here can see it change.
+_UNCHECKED_SOURCE = {
+    "ledger": "the ledger row",
+    "follow-up": "the follow-up",
+    "spec": "the spec",
+    "plan": "the plan",
+}
+
+
+def _after(nodes: list, stamp: str, key: str = "createdAt") -> list:
+    return [n for n in nodes if str((n or {}).get(key) or "") > stamp]
 
 
 def changes_since(
-    repo: str, pr: int, basis: str, head: str, *, timeout: float | None = None
-) -> list[str]:
-    """What happened after the read's ``head`` was committed that a re-read should see:
-    the PR's base retargeted, and on an issue basis the issue edited or newly commented.
+    repo: str, pr: int, basis: str, head: str, read_at: str, *, timeout: float | None = None
+) -> list[tuple[str, bool]]:
+    """What happened since a delivery read that a re-read should see, as
+    ``[(line, voids)]``: ``voids`` is True for a change or a failed read (the read is no
+    longer settled) and False for a note (a source nothing here can check).
 
-    The head's commit time, not the marker comment's edit time, because any re-edit of
-    the marker (a carry re-recorded) moves that past a change the read never saw (owner
-    ruling, 2026-11-18). A change between the commit and the read is reported too; that
-    costs one re-read, never a hidden change.
+    Two clocks, both owner rulings of 2026-11-18. Base and issue changes are judged
+    against the read's head commit time, because a re-edited marker (a carry
+    re-recorded) would move its own time past a change the read never saw; a change
+    between the commit and the read is reported too, which costs one re-read. On a claim
+    basis the PR's body and title ARE the basis, and ``compose`` reads the body when it
+    writes the marker, so those are judged against ``read_at``, the marker comment's
+    edit time; judged by the commit they would flag almost every PR forever, since bots
+    rewrite PR bodies after each push (MEASURED: 34 of the last 40 PRs). That time is
+    when the marker was last posted or edited, not when ``compose`` ran, so a claim edit
+    between the two, or a hand edit of the marker after a claim edit, goes unseen.
 
-    One line per finding, ``[]`` when nothing did. A read that fails or comes back cut
-    short is a line saying so, never silence. GitHub fails the whole query when the
-    issue does not exist (MEASURED: exit 1, "Could not resolve to an issue"), so that
-    case reads as the whole read failing.
+    A read that fails or comes back cut short is a voiding line, never silence. GitHub
+    fails the whole query when the issue does not exist (MEASURED: exit 1, "Could not
+    resolve to an issue"), so that case reads as the whole read failing.
     """
-    owner, name = repo.split("/", 1)
-    issue = int(basis.split(":", 1)[1]) if basis.startswith("issue:") else 0
+    kind = basis.split(":", 1)[0]
+    out: list[tuple[str, bool]] = []
+    if kind in _UNCHECKED_SOURCE:
+        out.append((f"changes to {_UNCHECKED_SOURCE[kind]} since the read: not checked", False))
     try:
+        owner, name = repo.split("/", 1)
+        issue = int(basis.split(":", 1)[1]) if kind == "issue" else 0
         data = json.loads(
             _gh(
                 [
@@ -550,27 +578,63 @@ def changes_since(
             )
         )["data"]["repository"]
         stamp = data["object"]["committedDate"]
+        pull = data["pullRequest"]
     except (Refused, ValueError, KeyError, TypeError):
-        return ["base and issue changes: could not check"]
-    if not isinstance(stamp, str) or not stamp:
-        return ["base and issue changes: could not check"]
-    out = []
-    events = ((data.get("pullRequest") or {}).get("timelineItems")) or {}
+        return out + [("base and issue changes: could not check", True)]
+    if not isinstance(stamp, str) or not stamp or not isinstance(pull, dict):
+        return out + [("base and issue changes: could not check", True)]
+    events = pull.get("timelineItems") or {}
     nodes = events.get("nodes")
     if not isinstance(nodes, list) or events.get("filteredCount") != len(nodes):
-        out.append("base changes: could not check")
-    elif any(str((n or {}).get("createdAt") or "") > stamp for n in nodes):
-        out.append("base changed since the check")
-    if issue:
-        got = data.get("issueOrPullRequest")
-        if not isinstance(got, dict) or got.get("__typename") != "Issue":
-            out.append(f"issue #{issue} unreadable")
-        else:
-            if str(got.get("lastEditedAt") or "") > stamp:
-                out.append("the issue was edited since the check")
-            newest = (got.get("comments") or {}).get("nodes") or []
-            if any(str((n or {}).get("createdAt") or "") > stamp for n in newest):
-                out.append("the issue has new comments since the check")
+        out.append(("base changes: could not check", True))
+    else:
+        if _after(
+            [n for n in nodes if (n or {}).get("__typename") == "BaseRefChangedEvent"], stamp
+        ):
+            out.append(("base changed since the check", True))
+        renamed = [n for n in nodes if (n or {}).get("__typename") == "RenamedTitleEvent"]
+        if kind == "claim" and _after(renamed, read_at):
+            out.append(("the PR title (part of its claim) changed since the check", True))
+    if kind == "claim" and str(pull.get("lastEditedAt") or "") > read_at:
+        out.append(("the PR body (its claim) was edited since the check", True))
+    if kind == "issue":
+        out += _issue_changes(data.get("issueOrPullRequest"), issue, stamp)
+    return out
+
+
+def _issue_changes(got: object, issue: int, stamp: str) -> list[tuple[str, bool]]:
+    if not isinstance(got, dict) or got.get("__typename") != "Issue":
+        return [(f"issue #{str(issue)[:20]} unreadable", True)]
+    out = []
+    if str(got.get("lastEditedAt") or "") > stamp:
+        out.append(("the issue was edited since the check", True))
+    comments = got.get("comments") or {}
+    rows = comments.get("nodes")
+    if not isinstance(rows, list):
+        out.append(("issue comments: could not check", True))
+    else:
+        if _after(rows, stamp):
+            out.append(("the issue has new comments since the check", True))
+        if _after(rows, stamp, "lastEditedAt"):
+            out.append(("an issue comment was edited since the check", True))
+        if comments.get("totalCount") != len(rows):
+            # Named, not voiding: no re-read could ever clear it on a long thread.
+            out.append(("older issue comments: edits not checked", False))
+    timeline = got.get("timelineItems") or {}
+    events = timeline.get("nodes")
+    if not isinstance(events, list) or timeline.get("filteredCount") != len(events):
+        out.append(("issue retitles and closures: could not check", True))
+        return out
+    late = _after(events, stamp)
+    if any((n or {}).get("__typename") == "RenamedTitleEvent" for n in late):
+        out.append(("the issue was retitled since the check", True))
+    for n in late:
+        if (n or {}).get("__typename") == "ClosedEvent":
+            why = str((n or {}).get("stateReason") or "").lower().replace("_", " ")[:20]
+            out.append((f"the issue was closed{' as ' + why if why else ''} since the check", True))
+            break
+    if any((n or {}).get("__typename") == "ReopenedEvent" for n in late):
+        out.append(("the issue was reopened since the check", True))
     return out
 
 
