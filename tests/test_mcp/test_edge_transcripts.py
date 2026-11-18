@@ -9,7 +9,7 @@ import pytest
 
 from genesis.mcp.health import edge_transcripts as et
 
-# Local day 2026-11-14 in New York runs 05:00Z on the 14th to 05:00Z on the 15th.
+# Local day 2026-11-14 in Bogota (UTC-5) runs 05:00Z on the 14th to 05:00Z on the 15th.
 NAMES = [
     "20261114T040000_aaa_1.md",  # 23:00 on the 13th, local
     "20261114T150000_bbb_2.md",  # 10:00 on the 14th
@@ -36,7 +36,7 @@ def edge(monkeypatch):
     state.cfg = cfg
     monkeypatch.setattr(et, "_config", lambda: cfg)
     monkeypatch.setattr(et, "_remote", remote)
-    monkeypatch.setattr("genesis.env.user_timezone", lambda: "America/New_York")
+    monkeypatch.setattr("genesis.env.user_timezone", lambda: "America/Bogota")
     return state
 
 
