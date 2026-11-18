@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -259,6 +260,35 @@ def test_attribution_log_names_who_holds_deleted_files(box, deleted_holder):
     _handle(box, "yellow")
     log = _log(box)
     assert "Deleted but still open" in log and f"pid {deleted_holder.pid} " in log, log
+
+
+def test_holder_names_are_read_now_not_from_an_earlier_scan(box, deleted_holder):
+    """The runaway scan's identity cache can be a poll old; a holder may have
+    exec'd or renamed itself since. The page reads the holder's identity now."""
+    pid = deleted_holder.pid
+    _run(
+        box,
+        f"_RW_IDENT[{pid}]=$'1\\tS\\tstale-name\\t1\\tinit'; ALL_WRITERS=''; "
+        f"handle_fs '{box['home']}' '{_home_dev(box)}' red 1000 100000 - '' btrfs",
+    )
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    assert f"pid {pid} " in page["body"], page["body"]
+    assert "stale-name" not in page["body"], page["body"]
+
+
+def test_an_incomplete_deleted_file_scan_is_reported_even_when_it_found_little(box):
+    """A walk that timed out may have found nothing; silence would read as
+    'nothing held'. The page says the scan did not complete."""
+    real_find = shutil.which("find")
+    _stub(
+        box["bin"] / "find",
+        f'#!/usr/bin/env bash\ncase " $* " in *" -links "*) exit 124;; esac\nexec {real_find} "$@"\n',
+    )
+    _handle(box, "red")
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    assert "Deleted-file scan under" in page["body"] and "did not complete (status 124)" in page["body"], page[
+        "body"
+    ]
 
 
 def test_no_deleted_block_when_nothing_is_held(box):
