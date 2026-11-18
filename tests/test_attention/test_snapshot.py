@@ -2,8 +2,11 @@
 import shlex
 from pathlib import Path
 
+import pytest
+
 from genesis.attention.snapshot import (
     _SNAPSHOT_SSH_TIMEOUT_S,
+    SnapshotError,
     _backup_py,
     _remote_backup_arg,
     _scp_cmd,
@@ -19,6 +22,32 @@ def _cfg() -> AmbientRemoteConfig:
 def test_ssh_base_has_batchmode_and_target():
     b = _ssh_base(_cfg())
     assert b[0] == "ssh" and "BatchMode=yes" in b and "edge@192.0.2.1" in b
+
+
+def test_ssh_base_puts_end_of_options_before_destination():
+    b = _ssh_base(_cfg())
+    assert b[-2:] == ["--", "edge@192.0.2.1"]
+
+
+def test_scp_cmd_puts_end_of_options_before_source():
+    c = _scp_cmd(_cfg(), "~/.ambient_snap.db", Path("/tmp/x.db"))
+    assert c[c.index("--") + 1] == "edge@192.0.2.1:~/.ambient_snap.db"
+
+
+@pytest.mark.parametrize("user,host", [
+    ("-oProxyCommand=touch /tmp/x", "192.0.2.1"),
+    ("edge", "-oProxyCommand=x"),
+    ("ed ge", "192.0.2.1"),
+    ("edge", "192.0.2.1\n"),
+    ("edge\x00", "192.0.2.1"),
+    ("", "192.0.2.1"),
+])
+def test_ssh_base_and_scp_reject_option_like_or_unsafe_target(user, host):
+    cfg = AmbientRemoteConfig(host_ip=host, host_user=user, ssh_key="~/.ssh/id_ed25519")
+    with pytest.raises(SnapshotError):
+        _ssh_base(cfg)
+    with pytest.raises(SnapshotError):
+        _scp_cmd(cfg, "~/.ambient_snap.db", Path("/tmp/x.db"))
 
 
 def test_backup_py_is_readonly_and_expands_home():
