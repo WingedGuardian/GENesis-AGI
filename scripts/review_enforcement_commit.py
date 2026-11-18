@@ -1025,17 +1025,24 @@ def _looks_like_reflection(seg, cwd: str | None, rr) -> bool:
 
 def _key_rounds(
     cwd: str | None, budget: dict, state: dict, keys: set[str], rr, *, deadline: float
-) -> dict[str, list[int | None]]:
+) -> dict[str, list[tuple[int | None, str | None]]]:
     """Every round the debt reader judges each of ``keys`` under, for the owed
-    keys among them: the PR's current round for an open-round key, and a late
-    key's own round contexts (``review_late._contexts``, ALL of which must pass
-    there). None is a late key with no earlier round, which owes the grammar
-    alone. A late key whose round cannot be placed gets no entry: it can never
-    be credited, so it never admits. The late read runs inside ``deadline``."""
+    keys among them, as ``(round number, round head)``: the PR's current round
+    and head for an open-round key, and a late key's own round contexts
+    (``review_late._contexts``, ALL of which must pass there). ``(None, None)``
+    is a late key with no earlier round, which owes the grammar alone. The head
+    is what the past-round-4 rules look the round up by, as coverage does, never
+    the number. A late key whose round cannot be placed gets no entry: it can
+    never be credited, so it never admits. The late read runs inside
+    ``deadline``."""
     owed = set(state.get("owed") or [])
     late_keys = set(state.get("late_keys") or [])
     current = int(budget.get("count") or 0)
-    rounds: dict[str, list[int | None]] = {k: [current] for k in (keys & owed) - late_keys}
+    head = budget.get("current_head")
+    rounds: dict[str, list[tuple[int | None, str | None]]] = {
+        k: [(current, head if isinstance(head, str) else None)]
+        for k in (keys & owed) - late_keys
+    }
     named_late = keys & owed & late_keys
     if named_late:
         import review_late  # noqa: PLC0415 — lazy, like review_reflection
@@ -1055,7 +1062,9 @@ def _key_rounds(
             if key in named_late:
                 contexts = review_late._contexts(budget, item, now, ancestors)
                 if contexts:
-                    rounds[key] = [context.round_number or None for context in contexts]
+                    rounds[key] = [
+                        (context.round_number or None, context.round_head) for context in contexts
+                    ]
     return rounds
 
 
@@ -1101,7 +1110,11 @@ def _reflection_problem(
     if parsed.problems:
         return "the reflection does not pass its grammar: " + "; ".join(parsed.problems[:5])
     if state is None:  # no owed state (direct callers): the current round, as before
-        rounds = {k: [int(budget.get("count") or 0)] for k in parsed.keys}
+        current_head = budget.get("current_head")
+        rounds = {
+            k: [(int(budget.get("count") or 0), current_head if isinstance(current_head, str) else None)]
+            for k in parsed.keys
+        }
     else:
         named = set(parsed.keys)
         owed = set(state.get("owed") or [])
@@ -1119,7 +1132,7 @@ def _reflection_problem(
     for key in sorted(rounds):
         failed = [
             problem
-            for round_n in rounds[key]
+            for round_n, _ in rounds[key]
             for problem in rr.parse(text, round_number=round_n, gate_lane=gate_lane).problems
         ]
         if not failed:
@@ -1129,9 +1142,34 @@ def _reflection_problem(
         if not problems:
             return "the round of the owed keys it names cannot be placed, so it would credit nothing"
         return "the reflection does not pass its grammar: " + "; ".join(problems[:5])
+    # The past-round-4 rules, under the round of EVERY named owed key, looked
+    # up by its head as coverage does: an admitted reflection that coverage
+    # would refuse for one of its keys would only credit nothing.
+    late = _past_terminal_problem(parsed, rounds, budget, gate_lane)
+    if late:
+        return "the past-round-4 rules refuse it: " + "; ".join(late[:5])
     if parsed.head != budget.get("current_head"):
         return f"the reflection names head {str(parsed.head)[:12]}, not the PR head {str(budget.get('current_head'))[:12]}"
     return None
+
+
+def _past_terminal_problem(
+    parsed, rounds: dict[str, list[tuple[int | None, str | None]]], budget: dict, gate_lane: bool
+) -> list[str]:
+    """``review_past_terminal.problems`` for ``parsed`` under every round in
+    ``rounds``, judged now; the distinct problems, in order."""
+    import review_past_terminal as pt  # noqa: PLC0415 — lazy, like review_reflection
+
+    records = pt.round_records(budget)
+    now = datetime.now(UTC)
+    found: list[str] = []
+    for key in sorted(rounds):
+        for _, round_head in rounds[key]:
+            record = None if records is None or round_head is None else records.get(round_head)
+            for problem in pt.problems(parsed, record, records, gate_lane=gate_lane, made_at=now):
+                if problem not in found:
+                    found.append(problem)
+    return found
 
 
 def _owed_message(state: dict, budget: dict, rr) -> str:

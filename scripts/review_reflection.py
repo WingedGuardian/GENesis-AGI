@@ -75,8 +75,15 @@ call, and running out is a refusal, never "nothing owed".
 Late findings (reviews that opened no round, and round-opening reviews that
 arrived after a fix to their head) are owed from ``REFLECTION_CUTOVER_ISO`` on,
 each credited only under its own round's context; ``review_late`` holds that
-reader and is imported only when a cutover is set. The cutover was set when the
+reader (``check`` imports it too, through ``review_past_terminal``). The cutover was set when the
 commit gate started enforcing reflections, so no late debt predates that gate.
+
+Past round 4 on the ordinary lane, ``check`` also applies the past-round-4
+rules (``review_past_terminal``: a Prediction and Confidence on a fix-now,
+Prediction-held from round 5, send-back only after two failed predictions, no
+fix-now for a round 5+ with no floor finding), each read from the budget and
+the one reflection judged. Their optional lines (``Prediction:``,
+``Confidence:``, ``Prediction-held:``) parse in any round.
 
 CLI: ``status`` (what the open round owes, whether it has settled; ``--cutover``
 reports what late findings from that time on would owe, enforcing nothing) and
@@ -156,6 +163,14 @@ FIELDS: dict[str, tuple[re.Pattern[str], int, int | None]] = {
         0,
         None,
     ),
+    # The past-round-4 lines (``review_past_terminal``); accepted in any round.
+    "Prediction": (
+        re.compile(rf"^Prediction: merges at round ([1-9][0-9]?) because ({_TEXT})$"), 0, 1
+    ),
+    "Confidence": (
+        re.compile(rf"^Confidence: ([0-9]{{1,2}}|100)% falsified-by ({_TEXT})$"), 0, 1
+    ),
+    "Prediction-held": (re.compile(rf"^Prediction-held: (yes|no) ({_TEXT})$"), 0, 1),
     "Escalate": (re.compile(r"^Escalate: (yes|no)$"), 1, 1),
 }
 _FIELD_NAME_RE = re.compile(r"^([A-Za-z-]{1,20}): ")
@@ -198,6 +213,10 @@ class Reflection:
     #: ``Premise-check`` claims by number: what the reflection says the cited
     #: premise check concluded, bound to that file by ``evidence_problem``.
     premise_claims: dict[str, str] = field(default_factory=dict)
+    #: The past-round-4 lines (``review_past_terminal``).
+    prediction_round: int | None = None
+    confidence: int | None = None
+    held: str | None = None
     problems: list[str] = field(default_factory=list)
 
     @property
@@ -299,6 +318,12 @@ def parse(
         result.verdict = seen["Premise"][0].group(1)
     if seen["Decision"]:
         result.decision = seen["Decision"][0].group(1)
+    if seen["Prediction"]:
+        result.prediction_round = int(seen["Prediction"][0].group(1))
+    if seen["Confidence"]:
+        result.confidence = int(seen["Confidence"][0].group(1))
+    if seen["Prediction-held"]:
+        result.held = seen["Prediction-held"][0].group(1)
     if seen["Audit-evidence"]:
         result.audit_evidence = seen["Audit-evidence"][0].group(1)
     if seen["Premise-evidence"]:
@@ -999,15 +1024,32 @@ def check(
     round_started: object,
     made_at: object,
     cwd: str,
+    round_record: Any,
+    round_records: Mapping[str, Any] | None,
 ) -> Reflection:
     """Every local rule a reflection must meet for this round, in one place.
-    ``cwd`` is the repository: a relative evidence path is read from there."""
+    ``cwd`` is the repository: a relative evidence path is read from there.
+    ``round_record`` is the round the keys belong to (None for a late key with
+    no round) and ``round_records`` every round
+    (``review_past_terminal.round_records``, None when unplaceable): they feed
+    the past-round-4 rules."""
+    import review_past_terminal as pt  # noqa: PLC0415 - it imports this module
+
     parsed = parse(
         body,
         round_number=round_number,
         gate_lane=gate_lane,
         acceptance=acceptance,
         previous_classes=previous_classes,
+    )
+    parsed.problems.extend(
+        pt.problems(
+            parsed,
+            round_record,
+            round_records,
+            gate_lane=gate_lane,
+            made_at=made_at if isinstance(made_at, datetime) else _parse_when(made_at),
+        )
     )
     if parsed.head != head:
         parsed.problems.append(
@@ -1341,6 +1383,7 @@ def coverage_details(
     key_rounds: Mapping[str, frozenset[str]],
     acceptance: Sequence[str] | None,
     round_started: object,
+    round_records: Mapping[str, Any] | None,
     reviewed_at: Mapping[str, datetime | None] | None = None,
     deadline: float | None = None,
     repo: str | None = None,
@@ -1361,8 +1404,10 @@ def coverage_details(
     belongs to the rounds of its keys, ``key_rounds``, and only one that is a
     strict git ancestor of the reflection judged counts), readable evidence files
     (an adversarial audit, a premise check) written between ``round_started``
-    and the reflection's commit where cited or owed, no escalation, and the
-    acceptance points (None only when the PR declares none). Every argument is
+    and the reflection's commit where cited or owed, no escalation, the
+    acceptance points (None only when the PR declares none), and the
+    past-round-4 rules under the round of ``head`` (``round_records``,
+    ``review_past_terminal.round_records``; None turns them off). Every argument is
     required, so no caller gets a weaker check by leaving one out. A
     reflection committed by hand is held to exactly this; there is no weaker
     path. Raises ``Refused`` when git cannot be read: a caller must treat that
@@ -1389,6 +1434,7 @@ def coverage_details(
             key_rounds=key_rounds,
             acceptance=acceptance,
             round_started=round_started,
+            round_records=round_records,
             reviewed_at=reviewed_at or {},
             repo=repo, number=number, wanted_keys=wanted_keys,
         )
@@ -1404,6 +1450,7 @@ def _coverage_details(
     key_rounds: Mapping[str, frozenset[str]],
     acceptance: Sequence[str] | None,
     round_started: object,
+    round_records: Mapping[str, Any] | None,
     reviewed_at: Mapping[str, datetime | None],
     repo: str | None,
     number: int | None,
@@ -1445,6 +1492,8 @@ def _coverage_details(
             round_started=round_started,
             made_at=committed_at,
             cwd=cwd,
+            round_record=None if round_records is None else round_records.get(head),
+            round_records=round_records,
         )
         if result.ok:
             valid = validated_dispositions(
@@ -1676,10 +1725,17 @@ def _open_covered(
         key_rounds=key_rounds(budget),
         acceptance=acceptance,
         round_started=state["round_started"],
+        round_records=_round_records(budget),
         reviewed_at=_open_review_times(budget),
         deadline=deadline,
         repo=repo, number=number,
     )
+
+
+def _round_records(budget: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    import review_past_terminal as pt  # noqa: PLC0415 - it imports this module
+
+    return pt.round_records(budget)
 
 
 def owed_from_budget(

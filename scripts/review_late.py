@@ -42,6 +42,9 @@ class RoundContext:
     round_number: int
     round_started: str | None
     prior_heads: tuple[str, ...]
+    #: The round's own head; None for round 0. The past-round-4 rules judge a
+    #: late key under the record of this head (``review_past_terminal``).
+    round_head: str | None = None
 
 
 def _ancestry(budget: Mapping[str, Any]) -> tuple[set[str], Ancestors]:
@@ -153,7 +156,7 @@ def round_context(budget: Mapping[str, Any], round_head: str, at: datetime) -> R
             return None
         if before:
             prior.append(head)
-    return RoundContext(len(prior) + 1, own.isoformat(), tuple(sorted(prior)))
+    return RoundContext(len(prior) + 1, own.isoformat(), tuple(sorted(prior)), round_head)
 
 
 def _contexts(
@@ -485,6 +488,7 @@ def _coverage_details(
     in_graph, ancestors = _ancestry(budget)
     log = rr._log_reflections(cwd)
     owners = rr.key_rounds(budget)
+    records = rr._round_records(budget)
     labels: dict[tuple[tuple[str, ...], str], list[str]] = {}
     checked: dict[tuple[str, RoundContext], bool] = {}
     fix_times: dict[tuple[str, str], datetime | None] = {}
@@ -545,7 +549,17 @@ def _coverage_details(
             passed = True
             for context in contexts:
                 if (sha, context) not in checked and context.round_number == 0:
-                    checked[(sha, context)] = parsed.ok and not parsed.escalate
+                    # Round 0 owes the grammar only, plus the past-round-4
+                    # rules about the whole PR (no round of its own to judge).
+                    import review_past_terminal as pt  # noqa: PLC0415
+
+                    checked[(sha, context)] = (
+                        parsed.ok
+                        and not parsed.escalate
+                        and not pt.problems(
+                            parsed, None, records, gate_lane=gate_lane, made_at=made_at
+                        )
+                    )
                 if (sha, context) not in checked:
                     if (context.prior_heads, sha) not in labels:
                         # Only a fix-instances decision with classes can recur.
@@ -571,6 +585,10 @@ def _coverage_details(
                         round_started=context.round_started,
                         made_at=made_at,
                         cwd=cwd,
+                        round_record=(
+                            None if records is None else records.get(str(context.round_head))
+                        ),
+                        round_records=records,
                     ).ok
                 passed = passed and checked[(sha, context)]
             if passed:
