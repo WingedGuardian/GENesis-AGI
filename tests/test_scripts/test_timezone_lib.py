@@ -40,6 +40,11 @@ def _bash(script: str, *args: str, env: dict | None = None) -> subprocess.Comple
         ("# timezone: Asia/Tokyo\ntimezone: Pacific/Auckland\n", "Pacific/Auckland"),
         ("timezone: \"Europe/Paris\"\r\n", "Europe/Paris"),  # CRLF line ending
         ("timezone:Asia/Tokyo\n", "Asia/Tokyo"),  # no space after the colon
+        ("timezone: null\n", ""),  # YAML null: fall through to the next source
+        ("timezone: true\n", ""),  # YAML boolean
+        ("timezone: Amrica/Chicago\n", ""),  # a typo the system cannot load
+        ("timezone: ../../etc/passwd\n", ""),  # never a path outside the zone database
+        ("timezone: /etc/localtime\n", ""),
     ],
 )
 def test_genesis_config_timezone(tmp_path, content, expected):

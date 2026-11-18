@@ -21,7 +21,11 @@ genesis_config_timezone() {
     value="$(printf '%s' "$value" | tr -d "\"'[:space:]")"
     case "$value" in
         ""|UTC|Etc/UTC) return 0 ;;
+        /*|*..*) return 0 ;;                # never a path outside the zone database
     esac
+    # Only a zone this system can load. YAML null/booleans and typos fall through to
+    # the next source, as genesis.env.user_timezone() rejects them at runtime too.
+    [ -f "/usr/share/zoneinfo/$value" ] || return 0
     printf '%s\n' "$value"
 }
 
