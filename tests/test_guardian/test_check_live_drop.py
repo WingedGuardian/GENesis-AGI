@@ -293,6 +293,39 @@ async def test_the_candidate_list_reaches_the_prompt_fenced_and_cleaned():
 
 
 @pytest.mark.asyncio
+async def test_the_evidence_keeps_the_newest_candidates_and_names_the_rest():
+    """CodeRabbit c4605811665: pin order puts the newest (the drop target) last,
+    so the bounds keep the end and say how many older rows they left out."""
+    from genesis.guardian import live_drop
+
+    rows = [f"{i}. feat/c{i}  no PR  owner s  added 2026-11-{i:02d}  pinned at {i:012d}" for i in range(1, 26)]
+    seen: list[str] = []
+
+    async def box(*args, **kwargs):
+        seen.append(args[-1])
+        return (0, "\n".join(rows[-20:]) + "\n", "")
+
+    with patch("genesis.guardian.live_drop._run_subprocess", box):
+        text = await live_drop.candidates_evidence("genesis")
+    lines = text.splitlines()
+    assert lines[0] == "(5 older candidate(s) not shown; pin order, newest last)"
+    assert lines[1].startswith("6. feat/c6") and lines[-1].startswith("25. feat/c25")
+    # The container keeps whole last lines (a byte tail could start mid-line).
+    assert "tail -n" in seen[0] and "head -c" not in seen[0] and "pipefail" in seen[0]
+
+
+def test_the_fallback_evidence_keeps_whole_newest_rows():
+    from genesis.guardian.diagnosis import _candidates_fallback
+
+    text = "\n".join(f"{i}. feat/branch-{i:03d}  no PR  owner s  pinned at {i:012d}" for i in range(1, 40))
+    out = _candidates_fallback(text)
+    assert len(out) <= 500 and out.splitlines()[-1].startswith("39. ")
+    first, rest = out.splitlines()[0], out.splitlines()[1:]
+    assert first.startswith("(") and "older" in first
+    assert all(text.splitlines().count(r) == 1 for r in rest), "a row was cut mid-line"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "answer",
     [(0, "No deploy manifest (x): nothing is meant to be live.", ""), (1, "", "boom"), (-1, "", "timeout")],

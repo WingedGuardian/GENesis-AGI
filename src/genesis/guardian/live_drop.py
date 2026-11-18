@@ -35,8 +35,15 @@ _LIST_CMD = (
 )
 _LIST_TIMEOUT_S = 60.0
 #: The text form, for the diagnosis evidence: one line per candidate, in pin
-#: order, with its added date and pinned head.
-_TEXT_CMD = "cd ~/genesis && scripts/deploy_candidates list 2>/dev/null | head -c 16384"
+#: order (newest last), with its added date and pinned head. Bounded by line,
+#: keeping the newest end (CodeRabbit c4605811665): each line cut at 600 bytes,
+#: then the last 40 lines, so a cut never removes the drop target and never
+#: leaves a partial first line that could read as a row.
+_EVIDENCE_ROWS = 20
+_TEXT_CMD = (
+    "set -o pipefail; cd ~/genesis && scripts/deploy_candidates list 2>/dev/null"
+    " | cut -b 1-600 | tail -n 40"
+)
 #: The lock every deploy, rebuild, drop and validation hold takes; 75 = held.
 _LOCK_PROBE = 'flock -n -E 75 "${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock" true'
 _LOCK_HELD = 75
@@ -195,7 +202,12 @@ async def candidates_evidence(container: str) -> str:
     rc, lines = await _in_container(container, _TEXT_CMD, timeout=_LIST_TIMEOUT_S)
     if rc != 0:
         return ""
-    rows = [shown(ln, 300) for ln in lines if re.match(r"\s*\d+\. ", ln)][:20]
+    rows = [shown(ln, 300) for ln in lines if re.match(r"\s*\d+\. ", ln)][-_EVIDENCE_ROWS:]
+    if not rows:
+        return ""
+    first = int(re.match(r"\s*(\d+)\. ", rows[0]).group(1))
+    if first > 1:
+        rows.insert(0, f"({first - 1} older candidate(s) not shown; pin order, newest last)")
     return "\n".join(rows)
 
 

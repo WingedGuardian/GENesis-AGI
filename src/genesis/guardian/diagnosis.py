@@ -184,6 +184,20 @@ Known failure mode inventory (from real incidents):
 """
 
 
+def _candidates_fallback(text: str, budget: int = 500) -> str:
+    """The newest whole rows of the candidate evidence within ``budget`` chars
+    (pin order puts the drop target last), with a count of the rows left out."""
+    rows = text.splitlines()
+    kept: list[str] = []
+    for row in reversed(rows):
+        if sum(len(r) + 1 for r in kept) + len(row) + 60 > budget:
+            break
+        kept.insert(0, row)
+    if len(kept) < len(rows):
+        kept.insert(0, f"({len(rows) - len(kept)} older row(s) not shown)")
+    return "\n".join(kept)
+
+
 def _build_diagnosis_prompt(
     diagnostic: DiagnosticSnapshot,
     signal_summary: str,
@@ -859,8 +873,9 @@ class DiagnosisEngine:
             evidence.append(f"Boot repair of the live checkout:\n{diagnostic.live_repair[:500]}")
         if diagnostic.live_candidates:
             # Bounded like the repair: the fallback evidence reaches Telegram.
-            # The tail: the newest candidate, the one a drop takes, is listed last.
-            evidence.append(f"Live candidates (pin order):\n{diagnostic.live_candidates[-500:]}")
+            evidence.append(
+                f"Live candidates (pin order):\n{_candidates_fallback(diagnostic.live_candidates)}"
+            )
 
         return DiagnosisResult(
             likely_cause="CC diagnosis unavailable — cannot determine root cause safely",

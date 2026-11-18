@@ -525,7 +525,9 @@ class RecoveryEngine:
             "incus", "exec", container, "--", "su", "-", "ubuntu", "-c", cmd,
             timeout=_DROP_TIMEOUT_S,
         )
-        notes = [_shown(ln, 300) for ln in stdout.splitlines() if "NOTE:" in ln][:3]
+        notes = [_shown(ln, 300) for ln in stdout.splitlines() if "NOTE:" in ln]
+        if len(notes) > 3:
+            notes = [*notes[:3], f"and {len(notes) - 3} more NOTE line(s)"]
         if rc == -1 and stderr == "timeout":
             # The command may still be running in the container (incus exec does
             # not stop it): wait for update.lock, then judge the engine's view.

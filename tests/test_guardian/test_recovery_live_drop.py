@@ -243,6 +243,17 @@ async def test_a_confirmed_drop_restarts(engine):
 
 
 @pytest.mark.asyncio
+async def test_notes_past_the_third_are_counted_not_dropped(engine):
+    """Class audit (round 2): the engine's NOTE lines name candidates that left
+    `live` with the drop; past three, the detail says how many it left out."""
+    notes = "\n".join(f"  NOTE: feat/n{i} left `live` with it" for i in range(5))
+    box = Container([_view(), AFTER], drop=(0, notes, ""))
+    ok, detail = await _drop(engine, box)
+    assert ok is True and "feat/n2" in detail and "feat/n3" not in detail, detail
+    assert "2 more NOTE line(s)" in detail, detail
+
+
+@pytest.mark.asyncio
 async def test_the_branch_is_quoted_for_the_shell(engine):
     view = _view(listed=("feat/a", "feat/b;$x"), holds=(("feat/a", HEAD_A), ("feat/b;$x", HEAD_B)))
     after = _view(listed=("feat/a",), holds=(("feat/a", HEAD_A),))
