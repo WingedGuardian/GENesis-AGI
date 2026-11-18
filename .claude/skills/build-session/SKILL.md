@@ -2044,7 +2044,9 @@ A blocked call, `secrets.env` and ask keys:
 `cc-pin-receipts` are **Advisory BY DESIGN** (they always exit 0); a red result
 from another job blocks the local gate. `dependency-audit` has a narrower
 exception: the audit command reports vulnerability findings without making the
-job red, while setup or installation failures can still fail the job. (An
+job red, while setup or installation failures, and its last step (the real
+Scrapling fetch cases, which run only where `[browser]` is installed), still
+fail the job. (An
 earlier version said "ten of eleven … only `review-depth-check`", wrong on both
 halves; count the `jobs:` keys and inspect the steps rather than trusting any
 prose figure, including this one.) Only THREE checks — `test`, `leak-detector`,
