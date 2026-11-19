@@ -112,6 +112,31 @@ def _run(argv: list[str], *, timeout: float, limit: int, data: bytes | None = No
         raise SourceError(f"source command unavailable: {type(exc).__name__}") from None
 
 
+def _check_mode_pairs(raw: bytes) -> None:
+    """Refuse a file header holding one half of an ``old mode``/``new mode`` pair.
+
+    Git's numstat reports the path with either half missing (measured, git 2.43),
+    so the census cannot see a lost half. Orphan rename halves Git refuses itself.
+    A pair lost WHOLE from a block that also carries content stays invisible to
+    the census and to this check (GitHub's file API has no mode field); modes
+    then need tree evidence. Only header lines are read: hunk lines start with a
+    space, ``+`` or ``-``.
+    """
+    halves: set[bytes] = set()
+    in_header = False
+    for line in raw.split(b"\n"):
+        if line.startswith(b"diff --git "):
+            if len(halves) == 1:
+                raise ValueError("unpaired file mode header")
+            halves, in_header = set(), True
+        elif line.startswith((b"@@", b"GIT binary patch", b"Binary files ")):
+            in_header = False
+        elif in_header and line.startswith((b"old mode ", b"new mode ")):
+            halves.add(line[:8])
+    if len(halves) == 1:
+        raise ValueError("unpaired file mode header")
+
+
 def reconcile_diff(raw: bytes, files: list[dict], *, timeout: float) -> None:
     """Use Git's parser, reconciling every destination and textual line count."""
     output = _run(
@@ -124,6 +149,7 @@ def reconcile_diff(raw: bytes, files: list[dict], *, timeout: float) -> None:
     try:
         if output and not output.endswith(b"\0"):
             raise ValueError("unfinished numstat")
+        _check_mode_pairs(raw)
         for record in output.split(b"\0")[:-1]:
             added, removed, path = record.split(b"\t", 2)
             name = path.decode("utf-8")

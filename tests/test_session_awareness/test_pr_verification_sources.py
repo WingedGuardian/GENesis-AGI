@@ -272,6 +272,56 @@ def test_real_git_binary_mode_and_rename_paths(tmp_path):
     )
 
 
+def mode_patch(tmp_path, *, content: bool):
+    patch(tmp_path)
+    subprocess.run(["git", "-C", str(tmp_path), "checkout", "-q", "--", "."], check=True)
+    (tmp_path / "ordinary.txt").chmod(0o755)
+    if content:
+        (tmp_path / "ordinary.txt").write_text("after\n")
+    return subprocess.check_output(["git", "-C", str(tmp_path), "diff"])
+
+
+@pytest.mark.parametrize("content", [False, True])
+@pytest.mark.parametrize("dropped", [b"old mode 100644\n", b"new mode 100755\n"])
+def test_unpaired_mode_header_is_an_incomplete_diff(tmp_path, content, dropped):
+    # Git's numstat still reports the path with either half missing (git 2.43),
+    # so the census alone cannot see that the new or old mode was lost.
+    raw = mode_patch(tmp_path, content=content)
+    assert dropped in raw
+    counts = (1, 1) if content else (0, 0)
+    files = [dict(filename="ordinary.txt", additions=counts[0], deletions=counts[1])]
+    reconcile_diff(raw, files, timeout=5)  # the complete pair is accepted
+    with pytest.raises(SourceError, match="mode"):
+        reconcile_diff(raw.replace(dropped, b"", 1), files, timeout=5)
+
+
+def test_mode_halves_from_different_files_do_not_pair(tmp_path):
+    # Two mode-only files: drop "new mode" from the first block and "old mode"
+    # from the second. Each block is then an orphan, though one of each remains.
+    patch(tmp_path)
+    (tmp_path / "ordinary.txt").write_text("before\n")
+    (tmp_path / "second.txt").write_text("fixture\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    for name in ("ordinary.txt", "second.txt"):
+        (tmp_path / name).chmod(0o755)
+    raw = subprocess.check_output(["git", "-C", str(tmp_path), "diff"])
+    first, second = raw.split(b"diff --git ")[1:]
+    assert b"ordinary.txt" in first and b"second.txt" in second
+    split = (
+        b"diff --git "
+        + first.replace(b"new mode 100755\n", b"")
+        + b"diff --git "
+        + second.replace(b"old mode 100644\n", b"")
+    )
+    files = [
+        dict(filename="ordinary.txt", additions=0, deletions=0),
+        dict(filename="second.txt", additions=0, deletions=0),
+    ]
+    reconcile_diff(raw, files, timeout=5)  # both complete pairs are accepted
+    with pytest.raises(SourceError, match="mode"):
+        reconcile_diff(split, files, timeout=5)
+
+
 def test_patch_parser_ignores_caller_subdirectory_and_git_overrides(tmp_path, monkeypatch):
     raw = patch(tmp_path)
     nested = tmp_path / "scripts"

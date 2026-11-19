@@ -17,7 +17,10 @@ all file destinations and rename sources, and SHA-256 digests of body, diff and
 canonical file metadata. Metadata reads before and after acquisition must agree.
 The file census is paginated and reconciled with GitHub's reported denominator;
 Git's patch parser checks every destination and textual addition/deletion count.
-Binary entries retain their blob identity; binary content still needs independent
+A file header holding only one of `old mode`/`new mode` is refused, because
+Git's count still reports that path. A mode pair lost whole from a block that
+also changes content cannot be detected from the diff, so a mode claim needs
+tree evidence or a stated evidence gap. Binary entries retain their blob identity; binary content still needs independent
 inspection or a stated evidence gap.
 
 Acquisition refuses incomplete, changing, unavailable, invalid UTF-8 or oversized
