@@ -57,9 +57,9 @@ class ConfirmationConfig:
     bootstrap_grace_s: int = 300
     # A failure episode that starts within this long after a detected host
     # reboot gets this grace instead: a cold boot of the container stack is
-    # slow. MEASURED on a live install: first failed probe 05:14:52Z, Genesis
-    # healthy again by itself at 05:28Z (~13.5 min); the 300 s grace expired at
-    # 05:20 and paged "Genesis down — all automated recovery failed".
+    # slow. MEASURED on a live install: Genesis was healthy again by itself
+    # about 13.5 min after the first failed probe, while the 300 s grace had
+    # already expired and paged "Genesis down — all automated recovery failed".
     post_reboot_grace_s: int = 1200
     pause_reminder_hours: int = 24
     confirmed_dead_timeout_s: int = 600  # Auto-reset after 10min stuck

@@ -89,9 +89,7 @@ async def _run_once(config: GuardianConfig, engine: DiagnosisEngine) -> tuple[bo
     cmd = [cc_path, "-p", "--model", config.cc.model, "--output-format", "json", "--max-turns", "1"]
     # The diagnosis's own empty MCP config, created here when no diagnosis has
     # run yet, so the canary never starts the host's configured MCP servers.
-    no_mcp = _ensure_no_mcp_config(work_dir)
-    if no_mcp is not None:
-        cmd += ["--mcp-config", str(no_mcp), "--strict-mcp-config"]
+    cmd += ["--mcp-config", _ensure_no_mcp_config(work_dir), "--strict-mcp-config"]
     cmd.append(_PROMPT)
     env = await engine._resolve_cc_env(cc_path)
     proc = await asyncio.create_subprocess_exec(

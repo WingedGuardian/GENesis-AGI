@@ -126,21 +126,27 @@ def _ensure_work_dir(configured: Path, fallback: Path | None = None) -> Path:
     return fallback
 
 
-def _ensure_no_mcp_config(work_dir: Path) -> Path | None:
-    """The empty MCP config for a ``claude -p`` run in ``work_dir``, written if missing.
+_NO_MCP_JSON = '{"mcpServers": {}}'
+
+
+def _ensure_no_mcp_config(work_dir: Path) -> str:
+    """The ``--mcp-config`` value for a ``claude -p`` run in ``work_dir``.
 
     The recovery brain needs only built-in tools. An install whose work dir never
-    got this file let CC load every configured MCP server (seen on a live host).
-    Returns None when the file is absent and cannot be written.
+    got this file let CC load every configured MCP server (seen on a live host),
+    so it is written when missing. When it cannot be written, the same empty
+    config is returned inline: ``--mcp-config`` takes a JSON string as well as a
+    file (MEASURED, Claude Code 2.1.299), so ``--strict-mcp-config`` always
+    applies.
     """
     path = work_dir / "config" / "no_mcp.json"
     if not path.exists():
         try:
-            atomic_write_text(path, '{"mcpServers": {}}\n')
+            atomic_write_text(path, _NO_MCP_JSON + "\n")
         except OSError as exc:
-            logger.warning("could not write %s: %s", path, exc)
-            return None
-    return path
+            logger.warning("could not write %s, passing it inline: %s", path, exc)
+            return _NO_MCP_JSON
+    return str(path)
 
 
 def _cc_error_reason(stdout_text: str, stderr_text: str) -> str:
@@ -598,13 +604,7 @@ class DiagnosisEngine:
             "--max-turns", str(self._config.cc.max_turns),
             "--dangerously-skip-permissions",
         ]
-        if no_mcp_config is not None:
-            cmd.extend(["--mcp-config", str(no_mcp_config), "--strict-mcp-config"])
-        else:
-            logger.warning(
-                "config/no_mcp.json missing under %s — CC may load MCP servers",
-                work_dir,
-            )
+        cmd.extend(["--mcp-config", no_mcp_config, "--strict-mcp-config"])
 
         logger.info(
             "Starting CC diagnosis: model=%s, max_turns=%d, timeout=%ds, "

@@ -181,6 +181,20 @@ async def test_a_fresh_work_dir_still_runs_without_mcp_servers(tmp_path, monkeyp
     assert f"--mcp-config {no_mcp} --strict-mcp-config" in calls.read_text()
 
 
+@pytest.mark.asyncio
+async def test_an_unwritable_config_still_runs_without_mcp_servers(tmp_path, monkeypatch):
+    # The empty config cannot be written: the canary passes it inline instead of
+    # dropping --strict-mcp-config and starting the host's MCP servers.
+    config, engine, dispatcher, calls = _setup(tmp_path, monkeypatch, _OK, 0)
+
+    def refuse(*a, **k):
+        raise OSError("read-only work dir")
+
+    monkeypatch.setattr("genesis.guardian.diagnosis.atomic_write_text", refuse)
+    await maybe_run_cc_canary(config, engine, dispatcher)
+    assert '--mcp-config {"mcpServers": {}} --strict-mcp-config' in calls.read_text()
+
+
 class _DeadChannel:
     def __init__(self) -> None:
         self.titles: list[str] = []

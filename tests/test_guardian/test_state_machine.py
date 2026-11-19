@@ -697,8 +697,8 @@ class TestPostRebootGrace:
         assert sm._is_within_bootstrap_grace() is False
 
     def test_rebooted_at_survives_a_state_round_trip(self, sm: ConfirmationStateMachine, tmp_path) -> None:
-        sm._state.rebooted_at = "2026-11-16T05:14:37+00:00"
+        sm._state.rebooted_at = "2026-01-01T00:00:00+00:00"
         sm.save_state(tmp_path / "state.json")
         other = ConfirmationStateMachine(GuardianConfig())
         other.load_state(tmp_path / "state.json")
-        assert other.state.rebooted_at == "2026-11-16T05:14:37+00:00"
+        assert other.state.rebooted_at == "2026-01-01T00:00:00+00:00"
