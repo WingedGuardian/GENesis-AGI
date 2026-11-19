@@ -30,11 +30,15 @@ checked against the census:
 - a rename must name the census's previous path;
 - a symlink replaced by a file (a delete block plus a create block for one
   path) counts as one census entry;
-- a nonempty response with no patch block is refused.
+- a nonempty response with no patch block, even whitespace only, is refused.
 
 A block with no `index` line (a pure rename, a mode-only change) has no id to
-compare, so a mode pair stripped from a pure rename stays undetectable from the
-diff. The type-change census mapping (status, blob, summed counts) is
+compare, and a binary block has no line counts to compare. `prepare` names each
+such path ("Blob identity not comparable", "Line counts (binary) not
+comparable"); the packet format is unchanged and its raw diff shows both cases.
+A census `status` outside GitHub's documented set (added, removed, modified,
+renamed, copied, changed, unchanged) is refused. A mode pair
+stripped from a pure rename stays undetectable from the diff. The type-change census mapping (status, blob, summed counts) is
 inferred from Git's output rather than measured against GitHub; a mismatch there
 refuses rather than accepts. A copy's `copy from` source is not compared. Binary
 content still needs independent inspection or a stated evidence gap.

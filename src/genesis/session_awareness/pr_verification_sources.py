@@ -112,7 +112,11 @@ def _run(argv: list[str], *, timeout: float, limit: int, data: bytes | None = No
         raise SourceError(f"source command unavailable: {type(exc).__name__}") from None
 
 
-_EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+_EMPTY_BLOB = hashlib.sha1(b"blob 0\0", usedforsecurity=False).hexdigest()  # Git empty-file id
+# GitHub REST "List pull requests files", the status enum (docs.github.com, read 2026-11-19).
+_FILE_STATUSES = frozenset(
+    ("added", "removed", "modified", "renamed", "copied", "changed", "unchanged")
+)
 _ABBREV = re.compile(r"[0-9a-f]{7,40}\Z")
 _C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
 
@@ -212,12 +216,14 @@ def _check_identity(name: str, block: _Block, entry: dict) -> None:
         raise ValueError(f"census rename source for {name!r} differs from the raw diff")
 
 
-def reconcile_diff(raw: bytes, files: list[dict], *, timeout: float) -> None:
+def reconcile_diff(raw: bytes, files: list[dict], *, timeout: float) -> dict[str, list[str]]:
     """Use Git's parser, then bind every block's header to the file census.
 
     Git reconciles destinations and textual line counts; each block's header is
     then checked for what those counts cannot see: mode pairs, a change payload,
-    blob identities and rename sources.
+    blob identities and rename sources. Returns, sorted, the census paths each
+    check could not cover, so the caller can name those evidence gaps: ``blob``
+    (no index line: a pure rename, a mode-only change) and ``counts`` (binary).
     """
     output = _run(
         ["git", "-C", os.path.abspath(os.sep), "apply", "--numstat", "-z", "--allow-empty"],
@@ -230,7 +236,7 @@ def reconcile_diff(raw: bytes, files: list[dict], *, timeout: float) -> None:
             raise ValueError("unfinished numstat")
         records = output.split(b"\0")[:-1]
         blocks = _blocks(raw)
-        if raw.strip() and not blocks:
+        if raw and not blocks:
             raise ValueError("response is not a recognised patch")
         if len(records) != len(blocks):
             raise ValueError("Git patch records do not match the diff's file blocks")
@@ -238,6 +244,7 @@ def reconcile_diff(raw: bytes, files: list[dict], *, timeout: float) -> None:
         if len(expected) != len(files):
             raise ValueError("changed-file census repeats a path")
         actual: dict[str, list] = {}
+        gaps: dict[str, list[str]] = {"blob": [], "counts": []}
         for record, block in zip(records, blocks, strict=True):
             added, removed, path = record.split(b"\t", 2)
             _check_block(block)
@@ -258,8 +265,13 @@ def reconcile_diff(raw: bytes, files: list[dict], *, timeout: float) -> None:
             if counts is not None and counts != (entry["additions"], entry["deletions"]):
                 raise ValueError("text change counts do not match raw diff")
             _check_identity(name, block, entry)
+            if block.index is None:
+                gaps["blob"].append(name)
+            if counts is None:
+                gaps["counts"].append(name)
     except (ValueError, KeyError, TypeError, UnicodeError, IndexError) as exc:
         raise SourceError(f"incomplete PR diff: {exc}") from None
+    return {kind: sorted(paths) for kind, paths in gaps.items()}
 
 
 def _no_constant(name: str):
@@ -316,6 +328,8 @@ def _file(data: object) -> dict:
             if not isinstance(previous, str) or not previous:
                 raise ValueError("invalid previous filename")
             result["previous_filename"] = previous
+        if result["status"] not in _FILE_STATUSES:
+            raise ValueError("unknown file status")
         if result["status"] == "renamed" and previous is None:
             raise ValueError("rename lacks previous filename")
         # Every retained string must encode before save_packet reserves a destination.

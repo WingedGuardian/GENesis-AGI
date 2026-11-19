@@ -670,3 +670,65 @@ def test_malformed_index_ids_are_refused(tmp_path, index):
     ]
     with pytest.raises(SourceError):
         reconcile_diff(b"\n".join(lines), files, timeout=5)
+
+
+def test_whitespace_only_response_is_not_an_empty_diff():
+    with pytest.raises(SourceError, match="not a recognised patch"):
+        reconcile_diff(b" \n", [], timeout=5)
+
+
+def test_uncovered_paths_are_reported_by_kind(tmp_path):
+    # A pure rename has no index line, so its census blob cannot be compared;
+    # a binary block has no line counts to compare.
+    raw = rename_diff(tmp_path / "rename")
+    files = [
+        dict(filename="current", additions=0, deletions=0, sha=blob(b"same\n"))
+        | dict(status="renamed", previous_filename="legacy-a")
+    ]
+    assert reconcile_diff(raw, files, timeout=5) == {"blob": ["current"], "counts": []}
+    committed(tmp_path / "bin", {"b.dat": b"\x00old\xff"})
+    (tmp_path / "bin" / "b.dat").write_bytes(b"\x00new\xff")
+    raw = subprocess.check_output(["git", "-C", str(tmp_path / "bin"), "diff"])
+    files = [
+        dict(filename="b.dat", additions=0, deletions=0, status="modified")
+        | dict(sha=blob(b"\x00new\xff"))
+    ]
+    assert reconcile_diff(raw, files, timeout=5) == {"blob": [], "counts": ["b.dat"]}
+    plain = [
+        dict(filename="ordinary.txt", additions=1, deletions=1, status="modified", sha=AFTER_BLOB)
+    ]
+    assert reconcile_diff(patch(tmp_path / "plain"), plain, timeout=5) == {
+        "blob": [],
+        "counts": [],
+    }
+
+
+def test_packet_keys_are_exactly_the_snapshot_fields_and_digests(tmp_path):
+    # A reader (the completeness check) rebuilds the snapshot from these keys.
+    from dataclasses import fields
+
+    from genesis.session_awareness.pr_verification_sources import PrSourceSnapshot
+
+    snapshot = PrSourceSnapshot(
+        repo="owner/repo",
+        pr=1,
+        merge_commit="a" * 40,
+        head="b" * 40,
+        base="c" * 40,
+        body="",
+        diff="",
+        files=[],
+        acquired_at="2026-01-01T00:00:00+00:00",
+    )
+    digests = {"body_sha256", "diff_sha256", "files_sha256"}
+    assert set(snapshot.packet()) == {f.name for f in fields(PrSourceSnapshot)} | digests
+
+
+def test_unknown_file_status_is_refused():
+    from genesis.session_awareness.pr_verification_sources import _file
+
+    entry = dict(filename="f", status="modified", sha="a" * 40, additions=0, deletions=0)
+    for status in ("added", "removed", "modified", "copied", "changed", "unchanged"):
+        assert _file(entry | {"status": status})["status"] == status
+    with pytest.raises(SourceError):
+        _file(entry | {"status": "deleted"})
