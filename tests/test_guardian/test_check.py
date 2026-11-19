@@ -1918,3 +1918,29 @@ class TestCCCanaryWiring:
         ):
             await run_check(config)
         assert canary.await_count == (1 if healthy else 0)
+
+    @pytest.mark.asyncio
+    async def test_canary_runs_after_the_snapshot_and_every_check(self, config: GuardianConfig) -> None:
+        # Its call can take minutes: it must not delay a check, nor widen the gap
+        # between the probe and the healthy snapshot that probe authorises.
+        config.cc.enabled = False
+        _seed_state(config, current_state="confirmed_dead", first_failure_at="2020-01-01T00:00:00+00:00")
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.send = AsyncMock()
+        order: list[str] = []
+
+        def _rec(name):
+            return AsyncMock(side_effect=lambda *a, **k: order.append(name))
+
+        with (
+            patch("genesis.guardian.check.collect_all_signals", AsyncMock(return_value=_dead_snapshot())),
+            patch("genesis.guardian.check._build_dispatcher", return_value=mock_dispatcher),
+            patch("genesis.guardian.check._write_guardian_heartbeat", AsyncMock()),
+            patch("genesis.guardian.check.load_secrets", return_value={}),
+            patch("genesis.guardian.check._probe_confirmed_healthy", return_value=True),
+            patch("genesis.guardian.check._maintain_snapshots", _rec("snapshots")),
+            patch("genesis.guardian.check._check_repo_bundle_and_alert", _rec("last_check")),
+            patch("genesis.guardian.cc_canary.maybe_run_cc_canary", _rec("canary")),
+        ):
+            await run_check(config)
+        assert order == ["snapshots", "last_check", "canary"]

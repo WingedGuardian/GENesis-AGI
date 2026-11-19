@@ -2691,9 +2691,11 @@ verified: 0aa0bf9f2 2026-11-10
 - **Recovery-brain auth canary** (`guardian/cc_canary.py`): once per
   `cc.canary_interval_h` (24), on a tick whose probe found Genesis healthy, one
   minimal real `claude -p` call through the diagnosis's own credential path
-  (`DiagnosisEngine._resolve_cc_env`). A failure pages once per episode with
-  Claude Code's own reason, and recovery pages an all-clear; state in
-  `<state_dir>/cc_canary.json`. A failure episode that starts within
+  (`DiagnosisEngine._resolve_cc_env`) and its empty MCP config, as the last step
+  of the tick. A failure pages once per episode with Claude Code's own reason,
+  and recovery pages an all-clear; a page queued for the host queue drain counts
+  as sent (`AlertDispatcher.send_or_queue`). State in
+  `<state_dir>/cc_canary.json`; at most one attempt an hour. A failure episode that starts within
   `confirmation.post_reboot_grace_s` (1200) of a detected host reboot gets that
   longer bootstrap grace, because a cold boot of the container stack is slow.
 - **Delivered-alert history (development candidate)**: host `alert/sent_log.py`

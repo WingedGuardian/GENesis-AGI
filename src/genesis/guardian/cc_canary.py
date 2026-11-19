@@ -11,9 +11,11 @@ credential path (``DiagnosisEngine._resolve_cc_env``) and error reader
 (``diagnosis._cc_error_reason``). A failure pages once per episode with Claude
 Code's own reason; the first success after that pages an all-clear.
 
-State lives in ``<state_dir>/cc_canary.json``. It is written only after a run
-finishes, so a tick killed mid-run simply runs again on a later tick. Never
-raises into the tick.
+State lives in ``<state_dir>/cc_canary.json``. Before a run it records the
+attempt, and after the run its result. A run that never finishes (the tick was
+killed) or whose result could not be saved is retried, at most once per
+``_ATTEMPT_SPACING``. A page counts as delivered when it was sent or queued for
+the host queue drain to replay. Never raises into the tick.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from genesis.guardian.config import GuardianConfig
 from genesis.guardian.diagnosis import (
     DiagnosisEngine,
     _cc_error_reason,
+    _ensure_no_mcp_config,
     _ensure_work_dir,
 )
 from genesis.util.atomic import atomic_write_text
@@ -43,6 +46,10 @@ _STATE_FILE = "cc_canary.json"
 # host, far below the tick's own timer, and bounded so a wedged CLI is reaped.
 _CANARY_TIMEOUT_S = 180
 _PROMPT = "Reply with the single word ok."
+# Least time between two attempts whatever the interval, so a run that keeps
+# being killed, or a result that keeps failing to save, cannot start a real
+# call on every 30 s tick.
+_ATTEMPT_SPACING = timedelta(hours=1)
 
 
 def _load(path: Path) -> dict:
@@ -53,17 +60,24 @@ def _load(path: Path) -> dict:
         return {}
 
 
-def _due(state: dict, interval_h: int, now: datetime) -> bool:
-    last = state.get("last_run_at")
-    if not isinstance(last, str):
-        return True
+def _age(state: dict, key: str, now: datetime) -> timedelta | None:
+    value = state.get(key)
+    if not isinstance(value, str):
+        return None
     try:
-        age = now - datetime.fromisoformat(last)
+        return now - datetime.fromisoformat(value)
     except (ValueError, TypeError):
-        return True
-    # A last run "in the future" means the clock went backwards: run now rather
-    # than stay silent until the clock catches up.
-    return age < timedelta(0) or age >= timedelta(hours=max(1, interval_h))
+        return None
+
+
+def _due(state: dict, interval_h: int, now: datetime) -> bool:
+    # A time "in the future" means the clock went backwards: treat it as old
+    # rather than stay silent until the clock catches up.
+    attempt = _age(state, "attempt_at", now)
+    if attempt is not None and timedelta(0) <= attempt < _ATTEMPT_SPACING:
+        return False
+    age = _age(state, "last_run_at", now)
+    return age is None or age < timedelta(0) or age >= timedelta(hours=max(1, interval_h))
 
 
 async def _run_once(config: GuardianConfig, engine: DiagnosisEngine) -> tuple[bool, str]:
@@ -73,8 +87,10 @@ async def _run_once(config: GuardianConfig, engine: DiagnosisEngine) -> tuple[bo
     # The configured model, as the diagnosis runs: an entitlement that covers the
     # default model but not this one must fail here, not mid-outage.
     cmd = [cc_path, "-p", "--model", config.cc.model, "--output-format", "json", "--max-turns", "1"]
-    no_mcp = work_dir / "config" / "no_mcp.json"
-    if no_mcp.exists():
+    # The diagnosis's own empty MCP config, created here when no diagnosis has
+    # run yet, so the canary never starts the host's configured MCP servers.
+    no_mcp = _ensure_no_mcp_config(work_dir)
+    if no_mcp is not None:
         cmd += ["--mcp-config", str(no_mcp), "--strict-mcp-config"]
     cmd.append(_PROMPT)
     env = await engine._resolve_cc_env(cc_path)
@@ -129,7 +145,7 @@ async def maybe_run_cc_canary(
     # The state file is what rate-limits the canary. If it cannot be written,
     # every 30 s tick would be "due" and run (and page) again, so do not run.
     try:
-        atomic_write_text(path, json.dumps(state, indent=2))
+        atomic_write_text(path, json.dumps({**state, "attempt_at": now.isoformat()}, indent=2))
     except OSError:
         logger.warning("cannot write %s; skipping the auth canary this tick", path, exc_info=True)
         return
@@ -150,7 +166,7 @@ async def maybe_run_cc_canary(
     if ok:
         logger.info("Guardian recovery-brain auth canary: ok")
         if was_alerted:
-            sent = await dispatcher.send(
+            sent = await dispatcher.send_or_queue(
                 Alert(
                     severity=AlertSeverity.INFO,
                     title="Guardian recovery brain can authenticate again",
@@ -161,7 +177,7 @@ async def maybe_run_cc_canary(
     else:
         logger.error("Guardian recovery-brain auth canary FAILED: %s", reason)
         if not was_alerted:
-            sent = await dispatcher.send(
+            sent = await dispatcher.send_or_queue(
                 Alert(
                     severity=AlertSeverity.WARNING,
                     title="Guardian recovery brain cannot authenticate",

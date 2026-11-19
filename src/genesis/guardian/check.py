@@ -526,16 +526,6 @@ async def run_check(config: GuardianConfig | None = None) -> None:
         # below can block on an APPROVE for up to approval_timeout_s):
         # liveness must not hinge on either completing.
         await _write_guardian_heartbeat(config)
-        # Daily auth canary for the recovery brain: only on a tick whose probe
-        # found Genesis healthy (during an outage the diagnosis itself takes
-        # this path), and after the heartbeat so liveness never waits on it.
-        if probe_healthy:
-            try:
-                from genesis.guardian.cc_canary import maybe_run_cc_canary
-
-                await maybe_run_cc_canary(config, diagnosis_engine, dispatcher)
-            except Exception:
-                logger.warning("recovery-brain auth canary failed to run", exc_info=True)
         # Snapshot lifecycle maintenance runs regardless of resulting state —
         # a guardian stuck in confirmed_dead/recovering for weeks must still
         # enforce expiry + prune stale snapshots (the incident: prune only ran
@@ -590,6 +580,18 @@ async def run_check(config: GuardianConfig | None = None) -> None:
         # published bundle to a host-only dir + WARN if the archived bundle goes
         # stale. Host-side file ops only, independent of the container verdict.
         await _check_repo_bundle_and_alert(config, dispatcher)
+        # Daily auth canary for the recovery brain: only on a tick whose probe
+        # found Genesis healthy (during an outage the diagnosis itself takes
+        # this path). It runs LAST, so its call (up to a few minutes) never
+        # delays the heartbeat or a check, and never widens the gap between the
+        # probe and the healthy snapshot that probe_healthy authorises.
+        if probe_healthy:
+            try:
+                from genesis.guardian.cc_canary import maybe_run_cc_canary
+
+                await maybe_run_cc_canary(config, diagnosis_engine, dispatcher)
+            except Exception:
+                logger.warning("recovery-brain auth canary failed to run", exc_info=True)
     finally:
         # Always save state, even on error
         sm.save_state(state_path)

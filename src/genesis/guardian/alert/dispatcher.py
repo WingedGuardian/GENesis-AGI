@@ -84,13 +84,28 @@ class AlertDispatcher:
 
         return True
 
-    def _enqueue_fallback(self, alert: Alert) -> None:
-        """Persist a failed-delivery alert to the durable queue (best-effort)."""
+    async def send_or_queue(self, alert: Alert) -> bool:
+        """Send now, or queue for replay; True when either one succeeded.
+
+        For a caller that pages once per episode and must know whether the page
+        will reach the user: a queued alert is delivered when the host queue
+        drain replays it, so it counts. ``send`` alone returns False for both a
+        queued and a dropped alert.
+        """
+        if await self.send(alert, allow_queue_fallback=False):
+            return True
+        return self._enqueue_fallback(alert)
+
+    def _enqueue_fallback(self, alert: Alert) -> bool:
+        """Persist a failed-delivery alert to the durable queue (best-effort).
+
+        True when it was queued; False with no queue, or when the write failed.
+        """
         if not self._fallback_queue_root:
-            return
+            return False
         from genesis.guardian.alert.queue import enqueue_alert
 
-        enqueue_alert(
+        return enqueue_alert(
             self._fallback_queue_root,
             severity=str(alert.severity.value),
             source="guardian",

@@ -53,7 +53,7 @@ def _setup(tmp_path, monkeypatch, body: str, code: int, **cc):
         AsyncMock(return_value=None),
     )
     dispatcher = AsyncMock()
-    dispatcher.send = AsyncMock(return_value=True)
+    dispatcher.send_or_queue = AsyncMock(return_value=True)
     return config, DiagnosisEngine(config), dispatcher, calls
 
 
@@ -66,7 +66,7 @@ async def test_success_records_ok_and_pages_nothing(tmp_path, monkeypatch):
     config, engine, dispatcher, calls = _setup(tmp_path, monkeypatch, _OK, 0)
     await maybe_run_cc_canary(config, engine, dispatcher)
     assert _state(config)["ok"] is True
-    dispatcher.send.assert_not_awaited()
+    dispatcher.send_or_queue.assert_not_awaited()
     assert "-p" in calls.read_text()
 
 
@@ -75,14 +75,14 @@ async def test_failure_pages_once_with_claude_codes_own_reason(tmp_path, monkeyp
     config, engine, dispatcher, _ = _setup(tmp_path, monkeypatch, _FAIL, 1)
     now = datetime(2026, 11, 18, 12, tzinfo=UTC)
     await maybe_run_cc_canary(config, engine, dispatcher, now=now)
-    (alert,) = [c.args[0] for c in dispatcher.send.await_args_list]
+    (alert,) = [c.args[0] for c in dispatcher.send_or_queue.await_args_list]
     assert alert.severity == "warning"
     assert "cannot authenticate" in alert.title
     assert "Failed to authenticate" in alert.body and "api_error_status 401" in alert.body
     assert _state(config)["alerted"] is True
     # The next due run that still fails does not page again.
     await maybe_run_cc_canary(config, engine, dispatcher, now=now + timedelta(hours=25))
-    assert dispatcher.send.await_count == 1
+    assert dispatcher.send_or_queue.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -92,7 +92,7 @@ async def test_recovery_after_a_failure_pages_an_all_clear(tmp_path, monkeypatch
     await maybe_run_cc_canary(config, engine, dispatcher, now=now)
     _stub(tmp_path, _OK, 0)  # the brain can authenticate again
     await maybe_run_cc_canary(config, engine, dispatcher, now=now + timedelta(hours=25))
-    severities = [c.args[0].severity for c in dispatcher.send.await_args_list]
+    severities = [c.args[0].severity for c in dispatcher.send_or_queue.await_args_list]
     assert severities == ["warning", "info"]
     assert _state(config)["alerted"] is False
 
@@ -119,13 +119,13 @@ async def test_disabled_canary_never_runs(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_a_page_that_could_not_be_sent_is_tried_again_next_run(tmp_path, monkeypatch):
     config, engine, dispatcher, _ = _setup(tmp_path, monkeypatch, _FAIL, 1)
-    dispatcher.send = AsyncMock(return_value=False)
+    dispatcher.send_or_queue = AsyncMock(return_value=False)
     now = datetime(2026, 11, 18, 12, tzinfo=UTC)
     await maybe_run_cc_canary(config, engine, dispatcher, now=now)
     assert _state(config)["alerted"] is False
-    dispatcher.send = AsyncMock(return_value=True)
+    dispatcher.send_or_queue = AsyncMock(return_value=True)
     await maybe_run_cc_canary(config, engine, dispatcher, now=now + timedelta(hours=25))
-    assert dispatcher.send.await_count == 1
+    assert dispatcher.send_or_queue.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -157,7 +157,7 @@ async def test_an_unwritable_state_file_skips_the_run(tmp_path, monkeypatch):
     monkeypatch.setattr("genesis.guardian.cc_canary.atomic_write_text", _refuse)
     await maybe_run_cc_canary(config, engine, dispatcher)
     assert not calls.exists()  # never ran, so it cannot run (and page) every tick
-    dispatcher.send.assert_not_awaited()
+    dispatcher.send_or_queue.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -169,3 +169,90 @@ async def test_a_clock_that_went_backwards_does_not_silence_the_canary(tmp_path,
     )
     await maybe_run_cc_canary(config, engine, dispatcher, now=now)
     assert calls.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_work_dir_still_runs_without_mcp_servers(tmp_path, monkeypatch):
+    # No diagnosis has ever run, so nothing else has written the empty config.
+    config, engine, dispatcher, calls = _setup(tmp_path, monkeypatch, _OK, 0)
+    await maybe_run_cc_canary(config, engine, dispatcher)
+    no_mcp = tmp_path / "work" / "config" / "no_mcp.json"
+    assert json.loads(no_mcp.read_text()) == {"mcpServers": {}}
+    assert f"--mcp-config {no_mcp} --strict-mcp-config" in calls.read_text()
+
+
+class _DeadChannel:
+    def __init__(self) -> None:
+        self.titles: list[str] = []
+
+    async def send(self, alert) -> bool:
+        self.titles.append(alert.title)
+        return False
+
+
+@pytest.mark.asyncio
+async def test_a_queued_page_counts_as_delivered(tmp_path, monkeypatch):
+    # Telegram is down: the real dispatcher queues the page for the host queue
+    # drain to replay. The episode is paged, so no repeat warning, and recovery
+    # still sends its all-clear.
+    from genesis.guardian.alert.dispatcher import AlertDispatcher
+    from genesis.guardian.alert.queue import list_queued
+
+    config, engine, _, calls = _setup(tmp_path, monkeypatch, _FAIL, 1)
+    queue = tmp_path / "queue"
+    channel = _DeadChannel()
+    dispatcher = AlertDispatcher([channel], fallback_queue_root=queue)
+    now = datetime(2026, 11, 18, 12, tzinfo=UTC)
+    await maybe_run_cc_canary(config, engine, dispatcher, now=now)
+    assert _state(config)["alerted"] is True
+    assert [e["title"] for _, e in list_queued(queue)] == [
+        "Guardian recovery brain cannot authenticate"
+    ]
+    await maybe_run_cc_canary(config, engine, dispatcher, now=now + timedelta(hours=24))
+    # The same episode is not paged twice: no second attempt, not just a deduped one.
+    assert channel.titles == ["Guardian recovery brain cannot authenticate"]
+    assert _state(config)["alerted"] is True
+
+    stub, _ = _stub(tmp_path, _OK, 0)
+    config.cc.path = str(stub)
+    await maybe_run_cc_canary(config, engine, dispatcher, now=now + timedelta(hours=48))
+    assert _state(config)["alerted"] is False
+    assert "Guardian recovery brain can authenticate again" in [
+        e["title"] for _, e in list_queued(queue)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_page_with_no_queue_and_no_channel_is_not_counted(tmp_path, monkeypatch):
+    from genesis.guardian.alert.dispatcher import AlertDispatcher
+
+    config, engine, _, _ = _setup(tmp_path, monkeypatch, _FAIL, 1)
+    dispatcher = AlertDispatcher([_DeadChannel()])
+    await maybe_run_cc_canary(config, engine, dispatcher)
+    assert _state(config)["alerted"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_result_that_could_not_be_saved_is_retried_hourly_not_every_tick(
+    tmp_path, monkeypatch
+):
+    from genesis.guardian import cc_canary
+
+    config, engine, dispatcher, calls = _setup(tmp_path, monkeypatch, _FAIL, 1)
+    real_write = cc_canary.atomic_write_text
+    writes = []
+
+    def _second_write_fails(path, text):
+        writes.append(text)
+        if len(writes) == 2:
+            raise OSError("disk went read-only")
+        real_write(path, text)
+
+    monkeypatch.setattr(cc_canary, "atomic_write_text", _second_write_fails)
+    now = datetime(2026, 11, 18, 12, tzinfo=UTC)
+    await maybe_run_cc_canary(config, engine, dispatcher, now=now)
+    for later in (timedelta(seconds=30), timedelta(minutes=59)):
+        await maybe_run_cc_canary(config, engine, dispatcher, now=now + later)
+    assert len(calls.read_text().splitlines()) == 1
+    await maybe_run_cc_canary(config, engine, dispatcher, now=now + timedelta(minutes=61))
+    assert len(calls.read_text().splitlines()) == 2
