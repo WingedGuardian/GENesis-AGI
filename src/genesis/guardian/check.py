@@ -526,6 +526,16 @@ async def run_check(config: GuardianConfig | None = None) -> None:
         # below can block on an APPROVE for up to approval_timeout_s):
         # liveness must not hinge on either completing.
         await _write_guardian_heartbeat(config)
+        # Daily auth canary for the recovery brain: only on a tick whose probe
+        # found Genesis healthy (during an outage the diagnosis itself takes
+        # this path), and after the heartbeat so liveness never waits on it.
+        if probe_healthy:
+            try:
+                from genesis.guardian.cc_canary import maybe_run_cc_canary
+
+                await maybe_run_cc_canary(config, diagnosis_engine, dispatcher)
+            except Exception:
+                logger.warning("recovery-brain auth canary failed to run", exc_info=True)
         # Snapshot lifecycle maintenance runs regardless of resulting state —
         # a guardian stuck in confirmed_dead/recovering for weeks must still
         # enforce expiry + prune stale snapshots (the incident: prune only ran
