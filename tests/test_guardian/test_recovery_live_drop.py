@@ -1,0 +1,822 @@
+"""The Guardian's drop of the newest `live` candidate (#2978).
+
+On `live` an approved REVERT_CODE drops the candidate check.py named before
+Gate 2, through the engine's own `drop`, confirms through the engine that it is
+gone, and only then restarts genesis-server. Every way the drop can end short
+of that restarts nothing. The container is a fake that answers each command the
+Guardian sends by what it contains."""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from genesis.guardian.alert.dispatcher import AlertDispatcher
+from genesis.guardian.config import GuardianConfig
+from genesis.guardian.diagnosis import DiagnosisResult, RecoveryAction
+from genesis.guardian.health_signals import HealthSnapshot, PauseState, SignalResult
+from genesis.guardian.recovery import (
+    RecoveryEngine,
+    drop_target,
+    live_candidates,
+    update_lock_holder,
+)
+from genesis.guardian.snapshots import SnapshotManager
+from genesis.guardian.state_machine import ConfirmationStateMachine
+
+TIP = "a" * 40
+HEAD_A = "1" * 40
+HEAD_B = "2" * 40
+
+
+def _view(
+    listed=("feat/a", "feat/b"),
+    holds=(("feat/a", HEAD_A), ("feat/b", HEAD_B)),
+    tip=TIP,
+    refusals=(),
+    checkout=("refs/heads/live", TIP),
+) -> dict:
+    return {
+        "version": 1,
+        "manifest": {"state": "ok", "reason": None},
+        "base": "b" * 40,
+        "listed": [{"branch": b, "head": "0" * 40, "in_checkout": True} for b in listed],
+        "live": {
+            "tip": tip,
+            "holds": None if holds is None else [{"branch": b, "head": h} for b, h in holds],
+            "reason": None,
+        },
+        "checkout": None if checkout is None else {"branch_ref": checkout[0], "head": checkout[1]},
+        "move_refusals": list(refusals),
+    }
+
+
+AFTER = _view(
+    listed=("feat/a",),
+    holds=(("feat/a", HEAD_A),),
+    tip="c" * 40,
+    checkout=("refs/heads/live", "c" * 40),
+)
+
+
+class Container:
+    """Answers the Guardian's commands; ``views`` are the successive answers to
+    `list --json --move-refusals` (the last one repeats)."""
+
+    def __init__(self, views, drop=(0, "", ""), lock=(0, "", ""), marker=(1, "", ""), head=None):
+        self.views = list(views)
+        # ``lock``: one answer, or a list of successive answers (the last repeats).
+        self.locks = list(lock) if isinstance(lock, list) else [lock]
+        self.drop, self.marker, self.head = drop, marker, head
+        self.calls: list[str] = []
+        self.queued = 0  # server restarts that ran (under update.lock or not)
+
+    async def __call__(self, *args, timeout=10.0, **kwargs):
+        # An exec's shell command, or the whole argv of a host-side incus call.
+        cmd = args[-1] if args[1:2] == ("exec",) else " ".join(args)
+        self.calls.append(cmd)
+        if "list --json --move-refusals" in cmd:
+            view = self.views.pop(0) if len(self.views) > 1 else self.views[0]
+            return (0, "a login banner\n" + json.dumps(view), "")
+        if "deploy_candidates drop" in cmd:
+            return self.drop
+        restart = "systemctl --user" in cmd and " show " not in cmd
+        if "flock -n" in cmd:
+            answer = self.locks.pop(0) if len(self.locks) > 1 else self.locks[0]
+            self.queued += restart and answer[0] == 0
+            return answer
+        self.queued += restart
+        if self.head is not None and "symbolic-ref" in cmd:
+            return self.head
+        if self.head is not None and "live_checkout.py" in cmd:
+            return (1, "other\n", "")
+        if "update_in_progress.pid" in cmd:
+            return self.marker
+        return (0, "", "")  # systemctl, journalctl
+
+    @property
+    def restarted(self) -> bool:
+        return self.queued > 0
+
+    @property
+    def dropped(self) -> list[str]:
+        return [c for c in self.calls if "deploy_candidates drop" in c]
+
+
+@pytest.fixture
+def engine() -> RecoveryEngine:
+    config = GuardianConfig()
+    d = AlertDispatcher()
+    ch = AsyncMock()
+    ch.send.return_value = True
+    d.add_channel(ch)
+    return RecoveryEngine(config, ConfirmationStateMachine(config), SnapshotManager(config), d)
+
+
+@pytest.fixture(autouse=True)
+def unit_comes_up():
+    seen = []
+
+    async def fake(container):
+        seen.append(container)
+        return {"ActiveState": "active", "SubState": "running", "InvocationID": str(len(seen))}
+
+    with (
+        patch("genesis.guardian.recovery._server_unit", fake),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+    ):
+        yield
+
+
+def _box(box):
+    """Both hops into the container: recovery's own and live_drop's reads."""
+    from contextlib import ExitStack
+
+    stack = ExitStack()
+    stack.enter_context(patch("genesis.guardian.recovery._run_subprocess", box))
+    stack.enter_context(patch("genesis.guardian.live_drop._run_subprocess", box))
+    return stack
+
+
+async def _drop(engine, box, target=("feat/b", HEAD_B, TIP)):
+    with _box(box):
+        return await engine._revert_code("genesis", target)
+
+
+# ── choosing the candidate ───────────────────────────────────────────────────
+
+
+def test_the_newest_is_the_last_held_candidate_still_listed():
+    assert drop_target(_view()) == (("feat/b", HEAD_B, TIP), "")
+
+
+def test_a_half_done_drop_is_finished_by_a_rebuild_never_by_the_next_drop():
+    """A drop that saved the manifest and could not move leaves `live` holding a
+    branch the manifest no longer lists (architect S1)."""
+    target, why = drop_target(_view(listed=("feat/a",)))
+    assert target is None
+    assert "feat/b" in why and "rebuild" in why
+
+
+@pytest.mark.parametrize(
+    ("view", "said"),
+    [
+        (_view(refusals=("tree is dirty",)), "would refuse: tree is dirty"),
+        (_view(checkout=("refs/heads/main", TIP)), "not on `live`"),
+        (_view(checkout=("refs/heads/live", "d" * 40)), "not on `live` at its tip"),
+        (_view(checkout=None), "not on `live`"),
+        (_view(holds=None), "could not be read"),
+        (_view(holds=()), "holds no candidate"),
+        (_view(tip=None), "could not be read"),
+        (
+            _view(listed=("feat/a", "-x y"), holds=(("feat/a", HEAD_A), ("-x y", HEAD_B))),
+            "does not accept",
+        ),
+        (_view(holds=(("feat/a", HEAD_A), ("feat/b", "not-a-commit"))), "does not accept"),
+    ],
+    ids=[
+        "refusal",
+        "off-live",
+        "not-at-tip",
+        "no-checkout",
+        "holds-unread",
+        "none-held",
+        "no-tip",
+        "bad-name",
+        "bad-head",
+    ],
+)
+def test_no_drop_is_proposed_when_the_engine_says_it_cannot_run(view, said):
+    target, why = drop_target(view)
+    assert target is None and said in why
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer",
+    [
+        (1, "", "boom"),
+        (0, "", ""),
+        (0, "not json", ""),
+        (0, json.dumps({"version": 2}), ""),
+        (0, json.dumps({**_view(), "move_refusals": "x"}), ""),
+    ],
+    ids=["exit-1", "empty", "not-json", "version", "refusals-not-a-list"],
+)
+async def test_an_unreadable_list_is_none(answer):
+    async def box(*args, **kwargs):
+        return answer
+
+    with _box(box):
+        assert await live_candidates("genesis") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lock", "marker", "want"),
+    [
+        ((0, "", ""), (0, "4242", ""), (False, "")),
+        ((75, "", ""), (0, "4242\n", ""), (True, "the deploy marker names pid 4242")),
+        ((75, "", ""), (1, "", "No such file"), (True, "")),
+        ((66, "", "cannot open lock file"), (0, "4242", ""), (None, "")),
+        ((-1, "", "timeout"), (0, "4242", ""), (None, "")),
+    ],
+    ids=["free", "held-named", "held-unnamed", "no-lock-dir", "timeout"],
+)
+async def test_the_lock_probe(lock, marker, want):
+    box = Container([_view()], lock=lock, marker=marker)
+    with _box(box):
+        assert await update_lock_holder("genesis") == want
+
+
+# ── running it ───────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_confirmed_drop_restarts(engine):
+    box = Container([_view(), AFTER], drop=(0, "  NOTE: feat/c left `live` with it", ""))
+    ok, detail = await _drop(engine, box)
+    assert ok is True, detail
+    assert box.dropped == [
+        "cd ~/genesis && scripts/deploy_candidates drop feat/b --expect-branch live "
+        f"--expect-head {TIP} --wait 120"
+    ]
+    assert box.restarted
+    assert "dropped feat/b" in detail and "feat/c left `live`" in detail
+
+
+@pytest.mark.asyncio
+async def test_notes_past_the_third_are_counted_not_dropped(engine):
+    """Class audit (round 2): the engine's NOTE lines name candidates that left
+    `live` with the drop; past three, the detail says how many it left out."""
+    notes = "\n".join(f"  NOTE: feat/n{i} left `live` with it" for i in range(5))
+    box = Container([_view(), AFTER], drop=(0, notes, ""))
+    ok, detail = await _drop(engine, box)
+    assert ok is True and "feat/n2" in detail and "feat/n3" not in detail, detail
+    assert "2 more NOTE line(s)" in detail, detail
+
+
+@pytest.mark.asyncio
+async def test_the_branch_is_quoted_for_the_shell(engine):
+    view = _view(listed=("feat/a", "feat/b;$x"), holds=(("feat/a", HEAD_A), ("feat/b;$x", HEAD_B)))
+    after = _view(listed=("feat/a",), holds=(("feat/a", HEAD_A),))
+    box = Container([view, after])
+    ok, _ = await _drop(engine, box, ("feat/b;$x", HEAD_B, TIP))
+    assert ok is True
+    assert "drop 'feat/b;$x' --expect-branch" in box.dropped[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("drop", "said"),
+    [
+        ((200, "", "ERROR: update.lock still held"), "update.lock was held for 120 s"),
+        (
+            (1, "", "ERROR: first line\nmiddle\nThe manifest change WAS saved"),
+            "first line … The manifest change WAS saved",
+        ),
+        ((-1, "", "No such file or directory: incus"), "No such file or directory: incus"),
+    ],
+    ids=["lock-held", "refused", "exec-error"],
+)
+async def test_a_drop_that_did_not_finish_restarts_nothing(engine, drop, said):
+    box = Container([_view()], drop=drop)
+    ok, detail = await _drop(engine, box)
+    assert ok is False
+    assert said in detail and "nothing restarted" in detail
+    assert not box.restarted
+
+
+@pytest.mark.asyncio
+async def test_a_drop_reporting_success_that_the_engine_does_not_confirm_restarts_nothing(engine):
+    box = Container([_view(), _view()])  # still listed and held after "rc 0"
+    ok, detail = await _drop(engine, box)
+    assert ok is False and "does not show it gone" in detail
+    assert not box.restarted
+
+
+@pytest.mark.asyncio
+async def test_a_dirty_tree_after_the_drop_restarts_nothing(engine):
+    """A half-moved tree reads dirty: the engine's move refusal says so."""
+    dirty = {**AFTER, "move_refusals": ["uncommitted tracked changes"]}
+    box = Container([_view(), dirty])
+    ok, detail = await _drop(engine, box)
+    assert ok is False and "uncommitted tracked changes" in detail
+    assert not box.restarted
+
+
+@pytest.mark.asyncio
+async def test_a_client_timeout_waits_for_the_drop_then_restarts(engine):
+    """incus exec keeps running the drop after the client is killed (MEASURED
+    2026-10-07): the Guardian waits for the engine to show it gone."""
+    box = Container(
+        [_view(), AFTER],
+        drop=(-1, "", "timeout"),
+        lock=[(75, "", ""), (75, "", ""), (0, "", "")],
+    )
+    ok, detail = await _drop(engine, box)
+    assert ok is True, detail
+    assert box.restarted
+
+
+@pytest.mark.asyncio
+async def test_a_drop_still_running_at_the_end_restarts_nothing(engine):
+    box = Container([_view()], drop=(-1, "", "timeout"), lock=(75, "", ""))
+    ok, detail = await _drop(engine, box)
+    assert ok is False and "had not finished" in detail
+    assert not box.restarted
+
+
+@pytest.mark.asyncio
+async def test_a_timeout_whose_lock_is_free_without_the_drop_restarts_nothing(engine):
+    box = Container([_view()], drop=(-1, "", "timeout"), lock=(0, "", ""))
+    ok, detail = await _drop(engine, box)
+    assert ok is False and "lock is free" in detail
+    assert not box.restarted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "now",
+    [
+        _view(
+            listed=("feat/a", "feat/b", "feat/c"),
+            holds=(("feat/a", HEAD_A), ("feat/b", HEAD_B), ("feat/c", "3" * 40)),
+        ),
+        _view(holds=(("feat/a", HEAD_A), ("feat/b", "4" * 40))),
+        _view(tip="e" * 40, checkout=("refs/heads/live", "e" * 40)),
+        _view(refusals=("an update is in progress",)),
+    ],
+    ids=["newer-candidate", "re-pinned", "tip-moved", "refusal"],
+)
+async def test_a_changed_candidate_set_runs_no_drop(engine, now):
+    box = Container([now])
+    ok, detail = await _drop(engine, box)
+    assert ok is False and "changed since approval" in detail
+    assert box.dropped == [] and not box.restarted
+
+
+@pytest.mark.asyncio
+async def test_an_approved_drop_never_falls_through_to_a_revert(engine):
+    """The checkout left `live` after approval: the drop refuses; no stash, no
+    revert. Both probes say `main`, so only the approved drop's own refusal can
+    stop the revert here (architect review: an empty probe read as `live`)."""
+    box = Container([_view(checkout=("refs/heads/main", TIP))], head=(0, "refs/heads/main\n", ""))
+    ok, detail = await _drop(engine, box)
+    assert ok is False and "changed since approval" in detail
+    assert not any("git stash" in c or "git revert" in c for c in box.calls)
+
+
+@pytest.mark.asyncio
+async def test_a_lock_taken_after_the_drop_restarts_nothing(engine):
+    """A rebuild queued behind the drop takes update.lock as soon as it exits."""
+    box = Container([_view(), AFTER], lock=(75, "", ""))
+    ok, detail = await _drop(engine, box)
+    assert ok is False and "update.lock is held on `live`" in detail
+    assert not box.restarted
+    assert engine._sm.state.waiting_on_update_lock is True  # it resumes, not goes quiet
+
+
+@pytest.mark.asyncio
+async def test_a_lock_taken_after_the_drop_and_released_restarts(engine):
+    box = Container([_view(), AFTER], lock=[(75, "", ""), (75, "", ""), (0, "", "")])
+    ok, detail = await _drop(engine, box)
+    assert ok is True, detail
+    assert box.restarted
+
+
+@pytest.mark.asyncio
+async def test_a_drop_that_finishes_right_after_the_timeout_is_seen(engine):
+    """The poll reads the lock first and the engine's view after it: a drop that
+    ends between the two reads is not reported "not gone" (rework review C)."""
+    box = Container([_view(), AFTER], drop=(-1, "", "timeout"), lock=(0, "", ""))
+    ok, detail = await _drop(engine, box)
+    assert ok is True, detail
+    assert box.restarted
+
+
+@pytest.mark.asyncio
+async def test_a_drop_kept_out_by_the_lock_marks_the_wait(engine):
+    box = Container([_view()], drop=(200, "", "ERROR: still held"))
+    ok, _ = await _drop(engine, box)
+    assert ok is False and not box.restarted
+    assert engine._sm.state.waiting_on_update_lock is True
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_drop_that_is_gone_but_still_holds_the_lock_restarts_nothing(engine):
+    """The drop's tail (hook sync) still runs under the lock after `live` moved."""
+    box = Container([_view(), AFTER], drop=(-1, "", "timeout"), lock=(75, "", ""))
+    ok, detail = await _drop(engine, box)
+    assert ok is False and "had not finished" in detail
+    assert not box.restarted
+
+
+def test_container_strings_are_cleaned_and_cut():
+    from genesis.guardian.live_drop import shown
+
+    assert shown("a\nProposed: <b>X</b>\u2028b") == "a Proposed: <b>X</b> b"
+    assert shown("x" * 500).endswith(" (cut)") and len(shown("x" * 500)) == 206
+
+
+@pytest.mark.asyncio
+async def test_deeply_nested_json_is_unreadable_not_a_crash():
+    async def box(*args, **kwargs):
+        return (0, "[" * 100_000, "")
+
+    with _box(box):
+        assert await live_candidates("genesis") is None
+
+
+@pytest.mark.asyncio
+async def test_execute_hands_the_diagnosis_candidate_to_the_drop(engine):
+    diagnosis = DiagnosisResult(
+        likely_cause="bad candidate",
+        confidence_pct=80,
+        evidence=[],
+        recommended_action=RecoveryAction.REVERT_CODE,
+        drop_candidate=("feat/b", HEAD_B, TIP),
+    )
+    healthy = HealthSnapshot(
+        signals={n: SignalResult(n, True, 1.0, "ok", "t") for n in ["health_api"]},
+        pause_state=PauseState(paused=False),
+    )
+    box = Container([_view(), AFTER])
+    with (
+        _box(box),
+        patch("genesis.guardian.recovery.collect_all_signals", return_value=healthy),
+        patch.object(engine._snapshots, "take", return_value="pre"),
+        patch.object(engine._snapshots, "safe_to_snapshot", AsyncMock(return_value=False)),
+    ):
+        result = await engine.execute(diagnosis)
+    assert result.success is True, result.detail
+    assert len(box.dropped) == 1 and box.restarted
+
+
+@pytest.mark.asyncio
+async def test_the_drop_is_judged_again_after_waiting_for_the_lock(engine):
+    """Review r1 (Devin): a rebuild queued behind the drop can run during the
+    wait and leave the tree half-moved; the restart reads the engine again."""
+    dirty = {**AFTER, "move_refusals": ["uncommitted tracked changes"]}
+    box = Container([_view(), dirty], lock=[(75, "", ""), (0, "", "")])
+    ok, detail = await _drop(engine, box)
+    assert ok is False and "after waiting for update.lock" in detail
+    assert "uncommitted tracked changes" in detail
+    assert not box.restarted
+
+
+def _drop_diagnosis():
+    return DiagnosisResult(
+        likely_cause="bad candidate",
+        confidence_pct=80,
+        evidence=[],
+        recommended_action=RecoveryAction.REVERT_CODE,
+        drop_candidate=("feat/b", HEAD_B, TIP),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("drop", "deferred"),
+    [((200, "", "ERROR: still held"), True), ((1, "", "ERROR: refused"), False)],
+    ids=["lock-held", "refused-control"],
+)
+async def test_a_lock_deferral_costs_no_recovery_attempt(engine, drop, deferred):
+    """Review r1 (Devin): an action held back by update.lock ran nothing, so it
+    is no attempt; the episode resumes with its budget once the lock is free.
+    A real failure still counts (the control)."""
+    from genesis.guardian.state_machine import GuardianState
+
+    box = Container([_view()], drop=drop)
+    before = engine._sm.state.recovery_attempts
+    send = AsyncMock()
+    with (
+        _box(box),
+        patch.object(engine._snapshots, "safe_to_snapshot", AsyncMock(return_value=False)),
+        patch.object(engine._dispatcher, "send", send),
+    ):
+        result = await engine.execute(_drop_diagnosis())
+    assert result.success is False
+    assert (engine._sm.state.recovery_attempts == before) is deferred
+    assert engine._sm.state.current_state == GuardianState.CONFIRMED_DEAD
+    assert engine._sm.state.waiting_on_update_lock is deferred
+    last = send.await_args_list[-1].args[0].title
+    assert last.startswith("Recovery deferred") is deferred
+    assert last.startswith("Recovery failed") is (not deferred)
+
+
+# ── round 4: one lock rule for every action (owner ruling, ego 3d02c11f) ─────
+
+ACTIONS = [a for a in RecoveryAction if a != RecoveryAction.ESCALATE]
+
+
+def _diag(action):
+    drop = ("feat/b", HEAD_B, TIP) if action == RecoveryAction.REVERT_CODE else None
+    return DiagnosisResult(
+        likely_cause="x",
+        confidence_pct=80,
+        evidence=[],
+        recommended_action=action,
+        drop_candidate=drop,
+    )
+
+
+async def _execute_with_lock(
+    engine, action, locks, on_live=True, stopped=False, seen=None, unread_holds=True
+):
+    """execute() with the lock probe answering ``locks`` in turn; returns the
+    action mock, the snapshot gate mock and the alert titles. ``stopped``: what
+    incus reports (read only for an undecided probe); ``seen`` collects those reads."""
+    from unittest.mock import AsyncMock
+
+    run = AsyncMock(return_value=(True, "ran"))
+    safe = AsyncMock(return_value=True)
+    take = AsyncMock(return_value="pre")
+    send = AsyncMock()
+    healthy = HealthSnapshot(
+        signals={"health_api": SignalResult("health_api", True, 1.0, "ok", "t")},
+        pause_state=PauseState(paused=False),
+    )
+    with (
+        patch("genesis.guardian.recovery.update_lock_holder", AsyncMock(side_effect=locks)),
+        patch(
+            "genesis.guardian.recovery.container_stopped",
+            seen if seen is not None else AsyncMock(return_value=stopped),
+        ),
+        patch("genesis.guardian.recovery.container_on_live", AsyncMock(return_value=on_live)),
+        patch("genesis.guardian.recovery.collect_all_signals", AsyncMock(return_value=healthy)),
+        patch.object(engine, "_execute_action", run),
+        patch.object(engine._snapshots, "safe_to_snapshot", safe),
+        patch.object(engine._snapshots, "take", take),
+        patch.object(engine._dispatcher, "send", send),
+    ):
+        result = await engine.execute(_diag(action), unread_holds=unread_holds)
+    return result, run, take, [c.args[0].title for c in send.await_args_list]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ACTIONS, ids=[a.value for a in ACTIONS])
+async def test_no_action_runs_on_live_while_the_lock_is_held(engine, action):
+    """CodeRabbit c4619151366 and its class: every action, not only the restart
+    and the drop. Nothing runs, nothing is announced or snapshotted, the wait is
+    marked and no attempt is recorded."""
+    before = (engine._sm.state.recovery_attempts, engine._sm.state.io_triage_attempts)
+    result, run, take, titles = await _execute_with_lock(engine, action, [(True, "pid 7")] * 2)
+    assert result.success is False and "update.lock is held on `live` (pid 7)" in result.detail
+    run.assert_not_awaited()
+    take.assert_not_awaited()
+    assert not any(t.startswith("Attempting recovery") for t in titles), titles
+    assert titles == [f"Recovery deferred: {action.value}"]
+    assert engine._sm.state.waiting_on_update_lock is True
+    assert (engine._sm.state.recovery_attempts, engine._sm.state.io_triage_attempts) == before
+    assert engine._sm.state.last_recovery_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ACTIONS, ids=[a.value for a in ACTIONS])
+@pytest.mark.parametrize(
+    ("locks", "on_live"),
+    [([(True, "")] * 2, False), ([(None, "")] * 2, True), ([(False, "")] * 2, True)],
+    ids=["held-off-live", "unknown-on-live-stopped", "free-on-live"],
+)
+async def test_off_live_or_without_a_held_lock_the_action_runs(engine, action, locks, on_live):
+    """Off `live`, with the lock free, or undecided on a container incus
+    reports STOPPED (owner ruling, ego 9cbdc406: it still gets its restart)."""
+    stopped = AsyncMock(return_value=True)
+    result, run, _take, titles = await _execute_with_lock(
+        engine, action, locks, on_live=on_live, seen=stopped
+    )
+    run.assert_awaited_once()
+    # incus info is read only for an undecided probe, once per execute() (both
+    # reads share it: architect LOW 5)
+    assert stopped.await_count == (1 if locks[0][0] is None else 0)
+    assert titles[0] == f"Attempting recovery: {action.value}"
+    assert engine._sm.state.waiting_on_update_lock is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action",
+    [RecoveryAction.RESTART_CONTAINER, RecoveryAction.SNAPSHOT_ROLLBACK],
+)
+async def test_the_lock_is_read_again_just_before_the_action(engine, action):
+    """A lock taken during the pre-recovery snapshot (or the alert) still holds
+    the action back, with no attempt recorded."""
+    result, run, _take, titles = await _execute_with_lock(
+        engine,
+        action,
+        [(False, ""), (True, "")],
+    )
+    run.assert_not_awaited()
+    assert titles[-1] == f"Recovery deferred: {action.value}"
+    assert engine._sm.state.waiting_on_update_lock is True
+    assert engine._sm.state.recovery_attempts == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lock", "head", "queued", "waits"),
+    [
+        ((75, "", ""), (0, "refs/heads/live\n", ""), False, True),
+        ((0, "", ""), (0, "refs/heads/live\n", ""), True, False),
+        ((75, "", ""), (0, "refs/heads/main\n", ""), True, False),
+    ],
+    ids=["held-on-live", "free-on-live", "held-off-live"],
+)
+async def test_the_server_restart_is_queued_under_the_lock(engine, lock, head, queued, waits):
+    """CodeRabbit c4619151393: the restart is queued by `flock -n` on the
+    lock itself, so a deploy cannot take the lock between a probe and the
+    restart. The lock is held only while systemctl --no-block queues the job,
+    never across the start (the boot repair takes it there)."""
+    box = Container([_view()], lock=lock, head=head)
+    with _box(box):
+        ok, detail = await engine._restart_services("genesis")
+    wrapped = [c for c in box.calls if "systemctl --user restart --no-block" in c]
+    assert (
+        'exec flock -n -o -E 75 "$d/update.lock" systemctl --user restart --no-block' in wrapped[0]
+    )
+    assert box.restarted is queued, (detail, box.calls)
+    assert engine._sm.state.waiting_on_update_lock is waits
+    if waits:
+        assert ok is False and "update.lock is held on `live`" in detail
+
+
+class MovingTree(Container):
+    """After the drop, a rebuild queued behind it holds update.lock for two
+    probes; while it holds the lock its tree reads dirty, then clean."""
+
+    async def __call__(self, *args, **kwargs):
+        cmd = args[-1]
+        if "list --json --move-refusals" in cmd and self.dropped:
+            held = sum("flock -n" in c for c in self.calls) < 2
+            self.calls.append(cmd)
+            view = {**AFTER, "move_refusals": ["uncommitted tracked changes"]} if held else AFTER
+            return (0, json.dumps(view), "")
+        return await super().__call__(*args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_drop_waits_for_the_lock_before_it_is_confirmed(engine):
+    """CodeRabbit c4619151383: a waiter queued behind the drop can take the
+    lock as it exits, and a tree it is moving reads dirty. Waiting first, then
+    reading the view once, sees the finished tree and restarts."""
+    box = MovingTree([_view()], lock=[(75, "", ""), (75, "", ""), (0, "", "")])
+    ok, detail = await _drop(engine, box)
+    assert ok is True, detail
+    assert box.restarted
+    after = box.calls[box.calls.index(box.dropped[0]) + 1 :]
+    assert sum("list --json" in c for c in after) == 1, after
+
+
+@pytest.mark.asyncio
+async def test_a_drop_held_by_the_lock_when_it_exits_waits_not_fails(engine):
+    dirty = {**AFTER, "move_refusals": ["uncommitted tracked changes"]}
+    box = Container([_view(), dirty], lock=(75, "", ""))
+    ok, detail = await _drop(engine, box)
+    assert ok is False and "update.lock is held on `live`" in detail
+    assert engine._sm.state.waiting_on_update_lock is True and not box.restarted
+
+
+HALF = _view(listed=("feat/a",))  # `live` still holds feat/b; the manifest dropped it
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("drop", "lock"),
+    [((1, "", "ERROR: git failed"), (0, "", "")), ((-1, "", "timeout"), (0, "", ""))],
+    ids=["nonzero-exit", "timeout-lock-free"],
+)
+async def test_a_half_done_drop_names_rebuild_and_restarts_nothing(engine, drop, lock):
+    """CodeRabbit c4619151373: both failure branches name the finish. The
+    episode is not reopened (that would re-prompt Gate 1 every tick)."""
+    engine._sm.mark_down_alert_sent()
+    box = Container([_view(), HALF], drop=drop, lock=lock)
+    ok, detail = await _drop(engine, box)
+    assert ok is False and not box.restarted
+    assert "`scripts/deploy_candidates rebuild` finishes it" in detail, detail
+    assert engine._sm.state.down_alert_sent is True
+
+
+@pytest.mark.parametrize(
+    ("lock", "rc", "ran"),
+    [(None, 0, True), ("EX", 75, False), ("SH", 75, False), ("no-dir", 0, True)],
+    ids=["free", "held", "validation-hold", "no-lock-dir"],
+)
+def test_the_queued_restart_in_a_real_shell(tmp_path, lock, rc, ran):
+    """The command as bash runs it (util-linux flock): a held lock, shared or
+    exclusive, queues nothing and exits 75; with no lock dir nothing can hold it."""
+    import fcntl
+    import os
+    import subprocess
+
+    from genesis.guardian.recovery import _UNDER_LOCK
+
+    (tmp_path / "bin").mkdir()
+    stub = tmp_path / "bin" / "systemctl"
+    stub.write_text('#!/bin/sh\necho "$*" > "$HOME/ran"\n')
+    stub.chmod(0o755)
+    locks = tmp_path / ".genesis" / "locks"
+    if lock != "no-dir":
+        locks.mkdir(parents=True)
+    fd = os.open(locks / "update.lock", os.O_RDWR | os.O_CREAT) if lock in ("EX", "SH") else None
+    if fd is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX if lock == "EX" else fcntl.LOCK_SH)
+    try:
+        cmd = _UNDER_LOCK.format(cmd="systemctl --user restart --no-block genesis-server")
+        env = {"HOME": str(tmp_path), "PATH": f"{tmp_path / 'bin'}:/usr/bin:/bin"}
+        p = subprocess.run(["/bin/bash", "-c", cmd], env=env, capture_output=True, text=True)
+    finally:
+        if fd is not None:
+            os.close(fd)
+    assert (p.returncode, (tmp_path / "ran").exists()) == (rc, ran), p.stderr
+    if ran:  # the arguments reach systemctl intact
+        assert (tmp_path / "ran").read_text() == "--user restart --no-block genesis-server\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ACTIONS, ids=[a.value for a in ACTIONS])
+async def test_an_unreadable_lock_on_a_running_container_holds_every_action(engine, action):
+    """Owner ruling (ego 9cbdc406): an undecided probe counts as held on `live`
+    unless incus reports the container STOPPED. Nothing runs, the wait is
+    marked, no attempt is recorded."""
+    result, run, take, titles = await _execute_with_lock(engine, action, [(None, "")] * 2)
+    run.assert_not_awaited()
+    take.assert_not_awaited()
+    assert titles == [f"Recovery deferred: {action.value}"]
+    assert "update.lock cannot be read on `live`" in result.detail
+    assert engine._sm.state.waiting_on_update_lock is True
+    assert engine._sm.state.recovery_attempts == 0 and engine._sm.state.last_recovery_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "info", [(1, "", "Error: not found"), (-1, "", "timeout")], ids=["incus-error", "timeout"]
+)
+async def test_an_unknown_container_status_holds_the_action(engine, info):
+    """A container whose status cannot be read is not shown stopped: it waits."""
+    from genesis.guardian.live_drop import container_stopped
+
+    async def box(*args, **kwargs):
+        return info
+
+    with patch("genesis.guardian.live_drop._run_subprocess", box):
+        result, run, _take, _titles = await _execute_with_lock(
+            engine,
+            RecoveryAction.RESTART_CONTAINER,
+            [(None, "")] * 2,
+            seen=AsyncMock(side_effect=container_stopped),
+        )
+    run.assert_not_awaited()
+    assert engine._sm.state.waiting_on_update_lock is True
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_container_with_an_unreadable_lock_is_restarted(engine):
+    """The case the exception exists for: incus exec cannot answer a stopped
+    instance, and its RESTART_CONTAINER (incus start) must still run."""
+    calls: list[tuple] = []
+
+    async def host(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("incus", "info"):
+            return (0, "Name: genesis\nStatus: STOPPED\n", "")
+        if args[:2] == ("incus", "exec"):
+            return (1, "", "Error: Instance is not running")
+        if args[:2] == ("incus", "restart"):
+            return (1, "", "Error: The instance is already stopped")
+        return (0, "", "")  # incus start
+
+    healthy = HealthSnapshot(
+        signals={"health_api": SignalResult("health_api", True, 1.0, "ok", "t")},
+        pause_state=PauseState(paused=False),
+    )
+    with (
+        _box(host),
+        patch("genesis.guardian.recovery.collect_all_signals", AsyncMock(return_value=healthy)),
+        patch.object(engine._snapshots, "safe_to_snapshot", AsyncMock(return_value=False)),
+    ):
+        result = await engine.execute(_diag(RecoveryAction.RESTART_CONTAINER))
+    assert result.success is True, result.detail
+    assert ("incus", "start", "genesis") in [c[:3] for c in calls]
+    assert engine._sm.state.waiting_on_update_lock is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("locks", "runs"),
+    [([(None, "")] * 2, True), ([(True, "")] * 2, False)],
+    ids=["unreadable", "held"],
+)
+async def test_execute_without_unread_holds(engine, locks, runs):
+    """The episode reopened after 2 h of unreadable probes, approved at Gate 2:
+    an undecided read no longer holds the action (and incus info is not read);
+    a lock read held still does."""
+    stopped = AsyncMock(return_value=False)
+    result, run, _take, _titles = await _execute_with_lock(
+        engine, RecoveryAction.RESTART_CONTAINER, locks, seen=stopped, unread_holds=False
+    )
+    assert run.await_count == (1 if runs else 0)
+    stopped.assert_not_awaited()
+    assert engine._sm.state.waiting_on_update_lock is (not runs)

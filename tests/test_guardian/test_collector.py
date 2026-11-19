@@ -112,6 +112,7 @@ class TestCollectDiagnostics:
             patch("genesis.guardian.collector._collect_git", return_value=("abc123 fix", "")),
             patch("genesis.guardian.collector._collect_status_files", return_value=('{"ok": true}', '{"idle": true}')),
             patch("genesis.guardian.collector._collect_live_repair", return_value="live-move repair: x"),
+            patch("genesis.guardian.collector._collect_live_candidates", return_value="1. feat/a"),
         ):
             snap = await collect_diagnostics(config)
 
@@ -122,6 +123,7 @@ class TestCollectDiagnostics:
         assert snap.error_count_1h == 5
         assert snap.git_last_commit == "abc123 fix"
         assert snap.live_repair == "live-move repair: x"
+        assert snap.live_candidates == "1. feat/a"  # #2978: its own slot in the gather
 
     @pytest.mark.asyncio
     async def test_collector_exception_handled(self, config: GuardianConfig) -> None:
@@ -141,6 +143,7 @@ class TestCollectDiagnostics:
             patch("genesis.guardian.collector._collect_git", return_value=("", "")),
             patch("genesis.guardian.collector._collect_status_files", return_value=("", "")),
             patch("genesis.guardian.collector._collect_live_repair", return_value=""),
+            patch("genesis.guardian.collector._collect_live_candidates", return_value=""),
         ):
             snap = await collect_diagnostics(config)
 

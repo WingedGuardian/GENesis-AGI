@@ -27,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from html import escape as html_escape
 from pathlib import Path
 
+from genesis.guardian import live_drop
 from genesis.guardian.alert.base import Alert, AlertSeverity
 from genesis.guardian.alert.dispatcher import AlertDispatcher
 from genesis.guardian.alert.telegram import CONFLICT_SENTINEL, TelegramAlertChannel
@@ -1742,12 +1743,69 @@ async def _handle_confirmed_dead(
     # recovery retry, no re-alert — until genuine recovery (which clears the flag
     # and sends a single "restored" ping). Recovery detection is unaffected: it
     # happens in state_machine.process() via the cheap signal probes, not here.
+    unread_holds = True  # False only for the 2 h unreadable-only reopen below
     if sm.state.down_alert_sent:
-        logger.info(
-            "Down alert already sent this episode — staying quiet until recovery "
-            "(no re-diagnosis/re-alert)",
-        )
-        return
+        reopen = False
+        if sm.state.waiting_on_update_lock:
+            # This episode escalated because update.lock was held on `live`: one
+            # cheap probe per tick, and a fresh diagnosis once it is free. A
+            # probe that cannot say never ends the wait (CodeRabbit c4619151359),
+            # unless incus reports the container STOPPED: nothing in it can hold
+            # the lock then, and its start must not wait.
+            held, who = await live_drop.update_lock_holder(config.container_name)
+            if held is True:
+                sm.state.wait_lock_seen_held = True
+            undecided_only = not sm.state.wait_lock_seen_held
+            reopen = held is False or (
+                held is None and await live_drop.container_stopped(config.container_name)
+            )
+            now = datetime.now(UTC)
+            if not reopen and sm.wait_realert_due(now, live_drop.WAIT_REALERT_S):
+                # Past the deploy scripts' own 2 h lock wait. A lock READ held
+                # in that interval: alert only, since elapsed time alone never
+                # starts a recovery (owner ruling). Only unreadable probes in it:
+                # nothing shows a run holding the lock, so the episode reopens
+                # into Gate 1, where the owner decides (#2978).
+                waited = sm.waited_s(now)
+                hours = f"{waited / 3600:.1f} h" if waited is not None else "a long time"
+                if undecided_only:
+                    body = (
+                        f"The Guardian has waited {hours} on `live`, and update.lock cannot be "
+                        "read: no probe since the last alert could say whether it is held. "
+                        "Instead of waiting on, it diagnoses again and asks your approval "
+                        "for what it proposes."
+                    )
+                    reopen = True
+                    unread_holds = False  # else this reopen waits again at once
+                elif held:
+                    body = (
+                        f"The Guardian has waited {hours} for update.lock on `live`, now held"
+                        + (f" ({who})" if who else "")
+                        + ". The deploy scripts give up waiting for it after 2 h, so the "
+                        "run holding it is likely hung. The Guardian keeps waiting and will "
+                        "not restart anything on its own: end that run, and it diagnoses "
+                        "again within 30 s."
+                    )
+                else:
+                    body = (
+                        f"The Guardian has waited {hours} for update.lock on `live`. It was "
+                        "held earlier in this wait and cannot be read now. The Guardian keeps "
+                        "waiting and restarts nothing on its own; if it still cannot read the "
+                        "lock at the next alert, it asks your approval instead."
+                    )
+                await dispatcher.send(Alert(
+                    severity=AlertSeverity.EMERGENCY,
+                    title="Genesis still down — the Guardian has waited " + hours + " for update.lock",
+                    body=body,
+                ))
+        if not reopen:
+            logger.info(
+                "Down alert already sent this episode — staying quiet until recovery "
+                "(no re-diagnosis/re-alert)",
+            )
+            return
+        logger.info("update.lock is free, or cannot be read for 2 h — reopening this episode")
+        sm.clear_down_alert_sent()
     # First handler for this episode (e.g. reached CONFIRMED_DEAD via the
     # self-heal-escalation path that skips _proceed_to_diagnosis): own it now so
     # the next tick skips.
@@ -1809,7 +1867,7 @@ async def _handle_confirmed_dead(
         )
 
     await _execute_recovery_with_approval(
-        config, sm, dispatcher, recovery_engine, diagnosis,
+        config, sm, dispatcher, recovery_engine, diagnosis, unread_holds=unread_holds,
     )
 
 
@@ -1922,8 +1980,14 @@ async def _execute_recovery_with_approval(
     dispatcher: AlertDispatcher,
     recovery_engine: RecoveryEngine,
     diagnosis: object,
+    *,
+    unread_holds: bool = True,
 ) -> None:
     """Two-gate, blocking, keyword-reply Telegram approval, then recover.
+
+    ``unread_holds=False`` only for the episode reopened after 2 h of
+    only-unreadable lock probes: there an undecided probe no longer counts as
+    held (the owner decides at the gates); a lock read held still waits.
 
     Gate everything: nothing recovers before approval. No fixed timeout —
     the wait self-cancels only when health returns on its own.
@@ -1936,6 +2000,12 @@ async def _execute_recovery_with_approval(
     """
     from genesis.guardian.diagnosis import RecoveryAction
 
+    # On `live`, while update.lock is held, every proposal (ESCALATE included)
+    # becomes the escalation that waits for it: no prompt, and the episode
+    # reopens once the lock is free (owner rulings, #2978).
+    diagnosis = await live_drop.hold_for_lock(
+        config.container_name, diagnosis, unread_holds=unread_holds
+    )
     if diagnosis.recommended_action == RecoveryAction.ESCALATE:
         # ESCALATE is not an automated action — it means "all automated
         # recovery options exhausted, alert the user." No approval gate
@@ -2035,6 +2105,10 @@ async def _execute_recovery_with_approval(
     diagnostic = await collect_diagnostics(config)
     signal_summary = json.dumps(sm.state.signal_history[-5:], indent=2)
     diagnosis = await diagnosis_engine.diagnose(diagnostic, signal_summary)
+    # The lock again, for the new proposal: Gate 1 can wait for hours.
+    diagnosis = await live_drop.hold_for_lock(
+        config.container_name, diagnosis, unread_holds=unread_holds
+    )
 
     # F.1: REVERT_CODE runs `git stash`/`git revert`, which need healthy, WRITABLE
     # local git. If the container's git is unhealthy (the F.1 outage class — incl. a
@@ -2071,18 +2145,7 @@ async def _execute_recovery_with_approval(
                 ),
             )
         elif await container_on_live(config.container_name):
-            logger.warning("REVERT_CODE proposed on `live` — proposing RESTART_CONTAINER")
-            diagnosis = replace(
-                diagnosis,
-                recommended_action=RecoveryAction.RESTART_CONTAINER,
-                likely_cause=(
-                    diagnosis.likely_cause
-                    + " — the checkout is on `live` (or could not be shown not to be), where "
-                    "a code revert never runs. Proposing a container restart: it ends lock "
-                    "holders and lets a boot repair run where one is installed. A bad "
-                    "candidate is removed with `scripts/deploy_candidates drop <branch>`"
-                ),
-            )
+            diagnosis = await live_drop.live_revert_proposal(config.container_name, diagnosis)
 
     logger.info(
         "Gate-1 approved; diagnosis: %s (confidence=%d%%, action=%s, source=%s)",
@@ -2099,12 +2162,28 @@ async def _execute_recovery_with_approval(
     write_diagnosis_result(diagnosis, config, outage_duration_s=outage_s)
 
     if diagnosis.recommended_action == RecoveryAction.ESCALATE:
-        # Investigation concluded there is no safe automated action — escalate
-        # (the recovery engine sends a manual-intervention alert).
-        await telegram_channel.send_text(
-            "Investigation complete — no safe automated recovery available. "
-            "Escalating for manual intervention."
-        )
+        if diagnosis.escalation in live_drop.WAITS:
+            # Not a failure: a deploy holds update.lock on `live`. Nothing is
+            # touched; the escalation marks the wait, and each tick probes the
+            # lock and reopens the episode once it is free (#2978).
+            await telegram_channel.send_text(
+                "Genesis is down, but update.lock is held on `live` (a deploy, rebuild, drop "
+                "or validation hold is running), so nothing was touched. I will diagnose "
+                "again as soon as the lock is free."
+            )
+        elif diagnosis.escalation == live_drop.HALF_DONE_DROP:
+            await telegram_channel.send_text(
+                "Genesis is down and `live` still runs a candidate a drop removed from the "
+                "manifest. `scripts/deploy_candidates rebuild` finishes the drop; then "
+                "restart genesis-server."
+            )
+        else:
+            # Investigation concluded there is no safe automated action — escalate
+            # (the recovery engine sends a manual-intervention alert).
+            await telegram_channel.send_text(
+                "Investigation complete — no safe automated recovery available. "
+                "Escalating for manual intervention."
+            )
         await recovery_engine.execute(diagnosis)
         return
 
@@ -2166,4 +2245,4 @@ async def _execute_recovery_with_approval(
         "Gate-2 approved — executing recovery action %s",
         diagnosis.recommended_action.value,
     )
-    await recovery_engine.execute(diagnosis)
+    await recovery_engine.execute(diagnosis, unread_holds=unread_holds)

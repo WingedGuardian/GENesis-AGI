@@ -5,7 +5,7 @@
 # Usage: scripts/deploy_candidates add <branch> --owner <who> [--pr N] [--wait N]
 #        scripts/deploy_candidates drop <branch> [--no-rebuild] [--wait N]
 #        scripts/deploy_candidates rebuild [--wait N]
-#        scripts/deploy_candidates list | status
+#        scripts/deploy_candidates list [--json [--move-refusals]] | status
 #        scripts/deploy_candidates repair-move [--wait N] [--dismiss TS | --restore TS [--check]] [--explain]
 #
 # This shell is thin on purpose. For every command that writes the manifest or

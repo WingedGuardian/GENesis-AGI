@@ -15,6 +15,16 @@ from genesis.guardian.snapshots import SnapshotManager
 from genesis.guardian.state_machine import ConfirmationStateMachine
 
 
+@pytest.fixture(autouse=True)
+def _update_lock_free(monkeypatch):
+    """These tests are not about update.lock: it reads free (an undecided read
+    counts as held on `live`; tests/test_guardian/test_recovery_live_drop.py
+    covers the lock)."""
+    monkeypatch.setattr(
+        "genesis.guardian.recovery.update_lock_holder", AsyncMock(return_value=(False, ""))
+    )
+
+
 @pytest.fixture
 def config() -> GuardianConfig:
     return GuardianConfig()
@@ -159,7 +169,12 @@ def _systemd(shows: list[str], cmd_rc: tuple[int, str, str] = (0, "", "")):
 
 
 def _acts(calls: list[str]) -> list[str]:
-    return [c for c in calls if c.startswith("systemctl --user") and " show " not in c]
+    """The systemctl commands queued, as run under update.lock (_UNDER_LOCK)."""
+    return [
+        c.rsplit('"$d/update.lock" ', 1)[-1]
+        for c in calls
+        if "systemctl --user" in c and " show " not in c and not c.startswith("journalctl")
+    ]
 
 
 class TestRestartWaitsForSystemdStart:

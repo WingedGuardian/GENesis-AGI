@@ -4,18 +4,23 @@ Recovery actions in escalation order:
 1. RESTART_SERVICES  — start or restart genesis-server, judged by its new start
 2. IO_TRIAGE         — kill top I/O consumer (one per cycle)
 3. RESOURCE_CLEAR    — clear /tmp, reclaim page cache, restart
-4. REVERT_CODE       — git stash && git revert HEAD, restart (never on `live`)
+4. REVERT_CODE       — git stash && git revert HEAD, restart; on `live`, drop the
+                       newest candidate with the engine's own drop, confirm it,
+                       then restart (never a revert there)
 5. RESTART_CONTAINER — incus restart genesis
 6. SNAPSHOT_ROLLBACK — incus snapshot restore genesis {last_healthy}
 7. ESCALATE          — alert user, stop automated recovery
 
 Each step: pre-alert → pre-snapshot → execute → wait → verify → post-alert.
+On `live`, no action runs while update.lock is held: execute() reads it before
+the pre-alert and again just before the action, and defers (#2978).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import shlex
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -25,6 +30,18 @@ from genesis.guardian.alert.dispatcher import AlertDispatcher
 from genesis.guardian.config import GuardianConfig
 from genesis.guardian.diagnosis import DiagnosisResult, RecoveryAction
 from genesis.guardian.health_signals import collect_all_signals
+from genesis.guardian.live_drop import (
+    _LOCK_HELD,
+    HALF_DONE_DROP,
+    WAITING_ON_UNREADABLE_LOCK,
+    WAITS,
+    container_stopped,
+    drop_target,
+    half_done,
+    live_candidates,
+    update_lock_holder,
+)
+from genesis.guardian.live_drop import shown as _shown
 from genesis.guardian.snapshots import PRE_RECOVERY_LABEL, SnapshotManager
 from genesis.guardian.state_machine import ConfirmationStateMachine
 
@@ -50,6 +67,15 @@ _REPAIR_LINE = (
     "journalctl --user -u genesis-server --since -15min -n 200 --no-pager -o cat"
     " | grep -F 'live-move repair:' | tail -n 1"
 )
+#: The server restart is QUEUED under update.lock, atomically with "the lock is
+#: free": flock holds it only for the milliseconds a --no-block systemctl takes,
+#: never across the start, whose boot repair takes the lock itself (#3492 D2,
+#: live_move_repair BOOT_BUDGET_S). Exit 75: held. No lock dir: nothing holds it.
+#: -o: systemctl, and anything it ever starts, does not inherit the lock's fd.
+_UNDER_LOCK = (
+    'd="${{GENESIS_HOME:-$HOME/.genesis}}/locks"; [ -d "$d" ] || exec {cmd}; '
+    'exec flock -n -o -E 75 "$d/update.lock" {cmd}'
+)
 
 
 async def _server_unit(container: str) -> dict[str, str] | None:
@@ -62,11 +88,23 @@ async def _server_unit(container: str) -> dict[str, str] | None:
     return vals if "ActiveState" in vals else None
 
 
-async def _in_container(container: str, cmd: str) -> tuple[int, list[str]]:
+async def _in_container(
+    container: str, cmd: str, timeout: float = 30.0,
+) -> tuple[int, list[str]]:
     rc, stdout, _ = await _run_subprocess(
-        "incus", "exec", container, "--", "su", "-", "ubuntu", "-c", cmd, timeout=30.0,
+        "incus", "exec", container, "--", "su", "-", "ubuntu", "-c", cmd, timeout=timeout,
     )
     return rc, stdout.strip().splitlines()  # a login shell may print first
+
+
+#: drop waits up to _DROP_WAIT_S for update.lock; the client gives up later.
+_DROP_WAIT_S = 120
+_DROP_TIMEOUT_S = 240.0
+#: After a client timeout the drop may still run in the container (incus exec
+#: does not stop it): poll until the engine shows it gone AND update.lock is
+#: free, or give up.
+_DROP_POLL_S = 10
+_DROP_POLL_MAX_S = 180
 
 
 async def container_on_live(container: str) -> bool:
@@ -112,13 +150,28 @@ class RecoveryEngine:
         self._snapshots = snapshots
         self._dispatcher = dispatcher
 
-    async def execute(self, diagnosis: DiagnosisResult) -> RecoveryResult:
-        """Execute the recommended recovery action."""
+    async def execute(
+        self, diagnosis: DiagnosisResult, *, unread_holds: bool = True,
+    ) -> RecoveryResult:
+        """Execute the recommended recovery action. ``unread_holds=False``: the
+        episode reopened after 2 h of only-unreadable probes (check.py), where
+        only a lock read held holds the action back."""
         action = diagnosis.recommended_action
         t0 = datetime.now(UTC)
 
         if action == RecoveryAction.ESCALATE:
             return await self._escalate(diagnosis)
+
+        # On `live`, nothing runs while update.lock is held (owner rulings,
+        # #2978): read before the alert, the state change and the snapshot, so
+        # a deferral touches nothing. The approval may be hours old.
+        # One `incus info` per call at most: both reads below share it.
+        stopped: dict[str, bool] = {}
+        blocked = await self._held_on_live(
+            self._config.container_name, unread_holds=unread_holds, stopped=stopped,
+        )
+        if blocked:
+            return await self._deferred(action, blocked, t0)
 
         # Check exponential backoff before proceeding
         backoff_s = self._sm.recovery_backoff_remaining_s(action.value)
@@ -166,13 +219,30 @@ class RecoveryEngine:
             if snap_name:
                 logger.info("Pre-recovery snapshot: %s", snap_name)
 
+        # Read again just before the action: the snapshot can take minutes. A
+        # container-level action (incus restart or start, snapshot restore)
+        # still has one round trip between this read and its incus call; a
+        # deploy that takes the lock inside it is killed mid-move, which the
+        # boot repair heals (#3492 D2).
+        blocked = await self._held_on_live(
+            self._config.container_name, unread_holds=unread_holds, stopped=stopped,
+        )
+        if blocked:
+            return await self._deferred(action, blocked, t0)
+
         # Execute the action
+        waiting_before = self._sm.state.waiting_on_update_lock
         try:
-            success, detail = await self._execute_action(action)
+            success, detail = await self._execute_action(action, diagnosis)
         except Exception as exc:
             logger.error("Recovery action %s failed: %s", action, exc, exc_info=True)
             success = False
             detail = str(exc)
+
+        if not success and not waiting_before and self._sm.state.waiting_on_update_lock:
+            # Held back by update.lock inside the action (the drop's own wait,
+            # the restart queued under the lock).
+            return await self._deferred(action, detail, t0)
 
         # Record attempt timestamp for backoff tracking
         self._sm.record_recovery_attempt(action.value)
@@ -217,8 +287,26 @@ class RecoveryEngine:
             duration_s=duration,
         )
 
+    async def _deferred(
+        self, action: RecoveryAction, detail: str, t0: datetime,
+    ) -> RecoveryResult:
+        """Held back by update.lock on `live` (#2978): it is no attempt and
+        costs no budget or backoff; the episode waits, back in confirmed-dead
+        (where the lock is probed each tick), and resumes once the lock is free."""
+        self._sm.mark_waiting_on_update_lock()
+        self._sm.set_confirmed_dead()
+        await self._dispatcher.send(Alert(
+            severity=AlertSeverity.WARNING,
+            title=f"Recovery deferred: {action.value}",
+            body=f"{detail}\nThe Guardian checks update.lock every tick.",
+        ))
+        return RecoveryResult(
+            action=action, success=False, detail=detail,
+            duration_s=(datetime.now(UTC) - t0).total_seconds(),
+        )
+
     async def _execute_action(
-        self, action: RecoveryAction,
+        self, action: RecoveryAction, diagnosis: DiagnosisResult | None = None,
     ) -> tuple[bool, str]:
         """Execute a single recovery action. Returns (success, detail)."""
         container = self._config.container_name
@@ -230,7 +318,9 @@ class RecoveryEngine:
         elif action == RecoveryAction.RESOURCE_CLEAR:
             return await self._resource_clear(container)
         elif action == RecoveryAction.REVERT_CODE:
-            return await self._revert_code(container)
+            return await self._revert_code(
+                container, diagnosis.drop_candidate if diagnosis else None,
+            )
         elif action == RecoveryAction.RESTART_CONTAINER:
             return await self._restart_container(container)
         elif action == RecoveryAction.SNAPSHOT_ROLLBACK:
@@ -247,7 +337,10 @@ class RecoveryEngine:
         restarted, both without blocking; then the unit is polled until a NEW
         invocation is active (the old process can still read active just after
         a --no-block restart), or it failed, or _START_WAIT_S passed. The bound
-        covers a stop (90 s), a start step (90 s) and RestartSec (10 s)."""
+        covers a stop (90 s), a start step (90 s) and RestartSec (10 s). The
+        start or restart is queued under update.lock (_UNDER_LOCK): held on
+        `live`, nothing is queued and the episode waits (#2978); held off
+        `live`, it is queued as before."""
         before = await _server_unit(container)
         state = (before or {}).get("ActiveState")
         if state == "activating":
@@ -257,8 +350,20 @@ class RecoveryEngine:
             cmd, old = f"systemctl --user {verb} --no-block genesis-server", before
         if cmd:
             rc, _out, stderr = await _run_subprocess(
-                "incus", "exec", container, "--", "su", "-", "ubuntu", "-c", cmd, timeout=30.0,
+                "incus", "exec", container, "--", "su", "-", "ubuntu", "-c",
+                _UNDER_LOCK.format(cmd=cmd), timeout=30.0,
             )
+            if rc == _LOCK_HELD and await container_on_live(container):
+                self._sm.mark_waiting_on_update_lock()
+                return False, (
+                    "genesis-server was not restarted: update.lock is held on `live`. The "
+                    "Guardian diagnoses again once the lock is free"
+                )
+            if rc == _LOCK_HELD:  # off `live` the lock never holds a restart back
+                rc, _out, stderr = await _run_subprocess(
+                    "incus", "exec", container, "--", "su", "-", "ubuntu", "-c", cmd,
+                    timeout=30.0,
+                )
             # A client timeout is not the result: the unit's own state decides.
             if rc != 0 and not (rc == -1 and stderr == "timeout"):
                 return False, f"systemctl {cmd.split()[2]} failed: {stderr}"
@@ -395,24 +500,32 @@ class RecoveryEngine:
         # Restart services
         return await self._restart_services(container)
 
-    async def _revert_code(self, container: str) -> tuple[bool, str]:
-        """Stash uncommitted changes and revert last commit, then restart."""
-        # Never on `live` (#3492 D3). The stash would push a half-written tree, or
-        # a candidate's working files, onto the stash stack every session shares,
-        # where any session's later `stash pop` lays it over another tree; the
-        # revert would commit onto the integration branch the deploy engine
-        # rebuilds. check.py already proposes RESTART_CONTAINER there before the
-        # approval; this refusal is the backstop for a branch that moved since.
-        # It fires after execute() has taken its snapshot, sent its alert and
-        # recorded the attempt; acceptable, since it only fires in the window
+    async def _revert_code(
+        self, container: str, drop: tuple[str, str, str] | None = None,
+    ) -> tuple[bool, str]:
+        """Off `live`: stash uncommitted changes and revert the last commit, then
+        restart. On `live`, with the candidate the approval named: drop it."""
+        # What was approved on `live` is the drop of that candidate (check.py
+        # sets it before Gate 2), so it never falls through to a revert, even if
+        # the checkout has left `live` since: the drop re-checks and refuses.
+        if drop is not None:
+            return await self._drop_candidate(container, *drop)
+        # Never a revert on `live` (#3492 D3). The stash would push a half-written
+        # tree, or a candidate's working files, onto the stash stack every session
+        # shares, where any session's later `stash pop` lays it over another tree;
+        # the revert would commit onto the integration branch the deploy engine
+        # rebuilds. check.py proposes a drop or RESTART_CONTAINER there before
+        # the approval; this refusal is the backstop for a branch that moved
+        # since. It fires after execute() has taken its snapshot, sent its alert
+        # and recorded the attempt; acceptable, since it only fires in the window
         # between the two probes.
         if await container_on_live(container):
             return False, (
                 "REVERT_CODE refused: the container checkout is on `live` (or could "
-                "not be shown not to be), where a code revert never runs. A container "
-                "restart (RESTART_CONTAINER) ends lock holders and lets a boot repair "
-                "run where one is installed; a bad candidate is removed with "
-                "`scripts/deploy_candidates drop <branch>`"
+                "not be shown not to be), where a code revert never runs, and no "
+                "candidate drop was approved. A container restart (RESTART_CONTAINER) "
+                "lets a boot repair run where one is installed; a bad candidate is "
+                "removed with `scripts/deploy_candidates drop <branch>`"
             )
         # Stash any uncommitted work. git revert itself refuses to overwrite
         # dirty files, so this guard is not about data loss: a failed stash
@@ -451,6 +564,151 @@ class RecoveryEngine:
         svc_ok, svc_detail = await self._restart_services(container)
         return svc_ok, f"Code reverted, {svc_detail}"
 
+    async def _drop_candidate(
+        self, container: str, branch: str, head: str, tip: str,
+    ) -> tuple[bool, str]:
+        """Take the approved candidate out of `live` with the engine's own drop,
+        confirm through the engine that it is gone, then restart genesis-server.
+        Nothing restarts unless the drop is confirmed and update.lock is free:
+        a restart while a drop, or a rebuild queued behind it, still runs would
+        start the server on a tree that is moving (owner rulings, #2978)."""
+        data = await live_candidates(container)
+        now, why = drop_target(data) if data is not None else (None, "the engine's list could not be read")
+        if now != (branch, head, tip):
+            return False, (
+                f"drop of {branch} refused before it ran: the candidate set changed since "
+                f"approval ({why or 'the newest candidate or `live` moved'}). Nothing was "
+                "changed and nothing restarted"
+            )
+        cmd = (
+            f"cd ~/genesis && scripts/deploy_candidates drop {shlex.quote(branch)} "
+            f"--expect-branch live --expect-head {tip} --wait {_DROP_WAIT_S}"
+        )
+        rc, stdout, stderr = await _run_subprocess(
+            "incus", "exec", container, "--", "su", "-", "ubuntu", "-c", cmd,
+            timeout=_DROP_TIMEOUT_S,
+        )
+        notes = [_shown(ln, 300) for ln in stdout.splitlines() if "NOTE:" in ln]
+        if len(notes) > 3:
+            notes = [*notes[:3], f"and {len(notes) - 3} more NOTE line(s)"]
+        if rc == -1 and stderr == "timeout":
+            # The command may still be running in the container (incus exec does
+            # not stop it): wait for update.lock, then judge the engine's view.
+            free = await self._wait_for_lock(container)
+            gone, seen = await self._drop_confirmed(container, branch)
+            if free is not True:
+                self._sm.mark_waiting_on_update_lock()
+                return False, (
+                    f"drop of {branch} had not finished after {_DROP_TIMEOUT_S + _DROP_POLL_MAX_S:.0f} s "
+                    "(update.lock is held, or could not be read); nothing restarted. The "
+                    "Guardian diagnoses again once the lock is free"
+                )
+            if not gone:
+                return False, (
+                    f"drop of {branch} did not report in {_DROP_TIMEOUT_S:.0f} s and the lock "
+                    f"is free, but the engine does not show it gone ({seen}); nothing restarted"
+                )
+        elif rc == 200:
+            self._sm.mark_waiting_on_update_lock()
+            return False, (
+                f"drop of {branch} did not run: update.lock was held for {_DROP_WAIT_S} s "
+                "(a deploy, rebuild or validation hold). Nothing was dropped and nothing "
+                "restarted; the Guardian diagnoses again once the lock is free"
+            )
+        elif rc != 0:
+            err = [ln for ln in stderr.splitlines() if ln.strip()]
+            text = " … ".join(_shown(ln, 300) for ln in dict.fromkeys(err[:1] + err[-1:]))
+            # Past the manifest save the engine's view names the finish (rebuild).
+            unfinished = half_done(await live_candidates(container))
+            return False, (
+                f"drop of {branch} failed ({text or f'exit {rc}'})"
+                + (f"; {unfinished}" if unfinished else "") + "; nothing restarted"
+            )
+        else:
+            # A waiter queued behind the drop (a rebuild, a deploy) can take
+            # update.lock as it exits, and a tree it is moving reads dirty: wait
+            # for the lock first, then judge the engine's view once.
+            if await self._wait_for_lock(container) is not True:
+                self._sm.mark_waiting_on_update_lock()
+                return False, (
+                    f"drop of {branch} exited 0, but update.lock is held on `live` (or could "
+                    "not be read); nothing restarted. The Guardian diagnoses again once the "
+                    "lock is free"
+                )
+            gone, seen = await self._drop_confirmed(container, branch)
+            if not gone:
+                return False, (
+                    f"drop of {branch} exited 0, but after waiting for update.lock the engine "
+                    f"does not show it gone ({seen}); nothing restarted"
+                )
+        ok, detail = await self._restart_services(container)
+        extra = f" ({' '.join(notes)})" if notes else ""
+        return ok, f"dropped {branch} ({head[:12]}) from `live`{extra}; {detail}"
+
+    async def _drop_confirmed(self, container: str, branch: str) -> tuple[bool, str]:
+        """Whether the engine shows ``branch`` gone from the manifest and from
+        `live`, with the checkout on `live` and nothing that would refuse a move
+        (a half-moved tree reads dirty there), and what it saw otherwise."""
+        data = await live_candidates(container)
+        if data is None:
+            return False, "the engine's list could not be read"
+        if half_done(data):
+            return False, half_done(data)
+        holds = data["live"].get("holds") or []
+        if any(r["branch"] == branch for r in data["listed"]):
+            return False, f"the manifest still lists {branch}"
+        if any(h["branch"] == branch for h in holds) or data["live"].get("holds") is None:
+            return False, f"`live` still holds {branch}, or what it holds could not be read"
+        if (data.get("checkout") or {}).get("branch_ref") != "refs/heads/live":
+            return False, "the checkout is not on `live`"
+        if data["move_refusals"]:
+            return False, _shown(data["move_refusals"][0])
+        return True, ""
+
+    async def _wait_for_lock(self, container: str) -> bool | None:
+        """Poll update.lock until it is free (True), for up to _DROP_POLL_MAX_S:
+        False when still held at the end, None when the last probe could not
+        say. A clock bound and a poll bound, as in _restart_services."""
+        deadline = asyncio.get_running_loop().time() + _DROP_POLL_MAX_S
+        held: bool | None = None
+        for n in range(_DROP_POLL_MAX_S // _DROP_POLL_S + 1):
+            if n:
+                if asyncio.get_running_loop().time() >= deadline:
+                    break
+                await asyncio.sleep(_DROP_POLL_S)
+            held, _who = await update_lock_holder(container)
+            if held is False:
+                return True
+        return None if held is None else False
+
+    async def _held_on_live(
+        self, container: str, *, unread_holds: bool = True, stopped: dict | None = None,
+    ) -> str:
+        """Why no action may run now, or "": update.lock is held on `live` (a
+        deploy, rebuild, drop or validation hold that took it after Gate 2).
+        The lock is read first and the branch only when it is held. A probe
+        that cannot say counts as held unless incus reports the container
+        STOPPED (owner ruling, ego 9cbdc406; live_drop.hold_for_lock says why).
+        Inside a drop that has run, an unreadable lock holds the restart back
+        too (_drop_candidate): the tree may still be moving. ``unread_holds``
+        False: only a lock read held blocks (see execute). ``stopped`` caches
+        the container's stopped status for one execute()."""
+        held, who = await update_lock_holder(container)
+        unread = held is None
+        if unread and unread_holds:  # only then: one `incus info`, cached per execute()
+            cache = stopped if stopped is not None else {}
+            if "stopped" not in cache:
+                cache["stopped"] = await container_stopped(container)
+            held = not cache["stopped"]
+        if not held or not await container_on_live(container):
+            return ""
+        how = (
+            "cannot be read on `live` (the container is not reported stopped)"
+            if unread
+            else "is held on `live`" + (f" ({who})" if who else "")
+        )
+        return f"nothing was run: update.lock {how}. The Guardian diagnoses again once the lock is free"
+
     async def _restart_container(self, container: str) -> tuple[bool, str]:
         """Restart the entire container (or start it, if stopped).
 
@@ -460,6 +718,7 @@ class RecoveryEngine:
         failure, fall back to `incus start`: if the container was merely
         stopped, start brings it back; if it was running (restart failed for
         another reason), start fails too and the original error is reported.
+        On `live`, execute() has read update.lock just before this (#2978).
         """
         rc, stdout, stderr = await _run_subprocess(
             "incus", "restart", container, "--timeout", "30",
@@ -517,6 +776,57 @@ class RecoveryEngine:
         if diagnosis.cc_failure_reason:
             cc_note = f"CC failure: {diagnosis.cc_failure_reason}\n"
         cname = self._config.container_name
+
+        if diagnosis.escalation in WAITS:
+            unread = diagnosis.escalation == WAITING_ON_UNREADABLE_LOCK
+            # Not a failed recovery: a run holds update.lock on `live`, and any
+            # recovery now would cut into it (owner ruling, #2978). Marked here,
+            # where every route to this escalation arrives; each tick then
+            # probes the lock and reopens the episode once it is free.
+            self._sm.mark_waiting_on_update_lock()
+            await self._dispatcher.send(Alert(
+                severity=AlertSeverity.WARNING,
+                title=(
+                    "Genesis down — update.lock cannot be read; waiting"
+                    if unread
+                    else "Genesis down — waiting for a deploy to finish"
+                ),
+                body=(
+                    f"Cause: {diagnosis.likely_cause}\n"
+                    "Nothing was restarted or dropped. The Guardian checks update.lock "
+                    "every tick and diagnoses again once it is free, asking your approval "
+                    "for what it then proposes. "
+                    + (
+                        "If it still cannot read the lock after 2 h, it asks your approval "
+                        "instead of waiting on."
+                        if unread
+                        else "If the lock is still held after 2 h, the run holding it is "
+                        "likely hung: you will hear again then, and every 2 h after."
+                    )
+                ),
+                likely_cause=diagnosis.likely_cause,
+            ))
+            return RecoveryResult(
+                action=RecoveryAction.ESCALATE, success=True,
+                detail="Waiting for update.lock", duration_s=0.0,
+            )
+        if diagnosis.escalation == HALF_DONE_DROP:
+            await self._dispatcher.send(Alert(
+                severity=AlertSeverity.EMERGENCY,
+                title="Genesis down — a drop did not finish",
+                body=(
+                    f"Cause: {diagnosis.likely_cause}\n"
+                    f"Finish it: incus exec {cname} -- su - ubuntu -c "
+                    "'cd ~/genesis && scripts/deploy_candidates rebuild', then restart "
+                    "genesis-server. A container restart alone starts the same code."
+                ),
+                likely_cause=diagnosis.likely_cause,
+                failed_probes=diagnosis.evidence,
+            ))
+            return RecoveryResult(
+                action=RecoveryAction.ESCALATE, success=True,
+                detail="Escalated: a drop did not finish", duration_s=0.0,
+            )
 
         await self._dispatcher.send(Alert(
             severity=AlertSeverity.EMERGENCY,

@@ -180,6 +180,12 @@ class DiagnosisResult:
     reasoning: str = ""
     source: str = "cc"  # "cc" or "cc_unavailable"
     cc_failure_reason: str = ""  # Why CC was unavailable (empty = CC succeeded)
+    # On `live`: (branch, head `live` holds for it, `live` tip) of the candidate
+    # an approved REVERT_CODE drops; set by check.py before Gate 2 (#2978).
+    drop_candidate: tuple[str, str, str] | None = None
+    # Why check.py made this an ESCALATE on `live` (live_drop.WAITING_ON_LOCK,
+    # HALF_DONE_DROP), so the alert says what happened; "" otherwise.
+    escalation: str = ""
 
 
 _FAILURE_INVENTORY = """
@@ -190,8 +196,8 @@ Known failure mode inventory (from real incidents):
 | OOM kill | Container running, services dead, journal "Killed process" | Memory exhaustion | RESTART_SERVICES or RESTART_CONTAINER |
 | /tmp full | Services degraded, /tmp >95% | Temp dir overflow (CC uses ~/.genesis/cc-tmp via TMPDIR, watchgod protects both zones) | RESOURCE_CLEAR |
 | Server crash loop | Health API down, NRestarts high | Code bug or dependency | RESTART_SERVICES, then REVERT_CODE |
-| Bad deploy | Failure correlates with recent git commit | Code regression | REVERT_CODE; never on `live`, where a bad candidate is removed by `scripts/deploy_candidates drop <branch>` |
-| Half-written `live` checkout | LIVE-MOVE REPAIR section | A killed deploy switch; the boot repair waited out a lock or could not finish | RESTART_CONTAINER (ends lock holders; a boot repair runs where one is installed); never REVERT_CODE on `live` |
+| Bad deploy | Failure correlates with recent git commit, or on `live` with a recently added candidate | Code regression | REVERT_CODE (on `live` it drops the newest candidate from `live`, then restarts) |
+| Half-written `live` checkout | LIVE-MOVE REPAIR section | A killed deploy switch; the boot repair waited out a lock or could not finish | RESTART_CONTAINER (a boot repair runs where one is installed; on `live` the Guardian waits while update.lock is held); never REVERT_CODE on `live` |
 | Container freeze | Ping OK, all APIs timeout, D-state processes | I/O deadlock | RESTART_CONTAINER |
 | Qdrant down | Memory retrieval fails, Qdrant service inactive | Qdrant crash | RESTART_SERVICES |
 | Full disk | Multiple services fail, disk >95% | Disk exhaustion | RESOURCE_CLEAR |
@@ -202,6 +208,20 @@ Known failure mode inventory (from real incidents):
 | Page cache I/O storm | D-state processes, high io.pressure | Memory pressure cascade | RESTART_CONTAINER |
 | I/O saturation | io.pressure full avg10 high, system partially responsive | CC sessions saturating I/O bandwidth | IO_TRIAGE (kill top I/O consumer, one per cycle) |
 """
+
+
+def _candidates_fallback(text: str, budget: int = 500) -> str:
+    """The newest whole rows of the candidate evidence within ``budget`` chars
+    (pin order puts the drop target last), with a count of the rows left out."""
+    rows = text.splitlines()
+    kept: list[str] = []
+    for row in reversed(rows):
+        if sum(len(r) + 1 for r in kept) + len(row) + 60 > budget:
+            break
+        kept.insert(0, row)
+    if len(kept) < len(rows):
+        kept.insert(0, f"({len(rows) - len(kept)} older row(s) not shown)")
+    return "\n".join(kept)
 
 
 def _build_diagnosis_prompt(
@@ -896,6 +916,11 @@ class DiagnosisEngine:
         if diagnostic.live_repair:
             # Bounded: this evidence reaches Telegram, whose 4,096-char cap drops the alert.
             evidence.append(f"Boot repair of the live checkout:\n{diagnostic.live_repair[:500]}")
+        if diagnostic.live_candidates:
+            # Bounded like the repair: the fallback evidence reaches Telegram.
+            evidence.append(
+                f"Live candidates (pin order):\n{_candidates_fallback(diagnostic.live_candidates)}"
+            )
 
         return DiagnosisResult(
             likely_cause="CC diagnosis unavailable — cannot determine root cause safely",

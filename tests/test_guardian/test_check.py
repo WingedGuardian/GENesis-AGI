@@ -35,6 +35,17 @@ def _no_container_cgroup_access(monkeypatch):
     monkeypatch.setattr("genesis.guardian.check._check_container_swap_and_alert", AsyncMock())
 
 
+@pytest.fixture(autouse=True)
+def _update_lock_free(monkeypatch):
+    """These tests are not about update.lock: it reads free. Unpatched, the
+    probe would reach `incus`, and on `live` an undecided read counts as held
+    (owner ruling, #2978; tests/test_guardian/test_check_live_drop.py covers
+    it). A test that patches the probe itself overrides this."""
+    monkeypatch.setattr(
+        "genesis.guardian.live_drop.update_lock_holder", AsyncMock(return_value=(False, ""))
+    )
+
+
 @pytest.fixture
 def config(tmp_path: Path) -> GuardianConfig:
     cfg = GuardianConfig()
@@ -1197,6 +1208,13 @@ class TestTwoGateApproval:
             patch(
                 "genesis.guardian.recovery.container_on_live",
                 AsyncMock(return_value=True),
+            ),
+            # No candidate list (the engine absent or unreadable), lock free:
+            # the restart, as before the drop existed (#2978).
+            patch("genesis.guardian.live_drop.live_candidates", AsyncMock(return_value=None)),
+            patch(
+                "genesis.guardian.live_drop.update_lock_holder",
+                AsyncMock(return_value=(False, "")),
             ),
         ):
             await _execute_recovery_with_approval(
