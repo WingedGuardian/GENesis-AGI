@@ -82,7 +82,8 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             principle_embedding BLOB,                      -- qwen3-embedding(1024 float32) of `principle`, little-endian; read by proactive procedure hook
             surfaced_count    INTEGER NOT NULL DEFAULT 0,  -- contextual-hook surfacings (proactive hook / tool advisor); honest funnel signal, NOT read by promoter
             trigger_spec      TEXT,                        -- JSON: {patterns, repeat} for a lesson (learning/procedural/lesson_shape.py)
-            lesson            TEXT                         -- JSON: {authored_via, authored_in, origin, reviewed, authored_at}; NULL = an earned procedure
+            lesson            TEXT,                        -- JSON: {authored_via, authored_in, origin, reviewed, authored_at}; NULL = an earned procedure
+            created_session_id TEXT                        -- source session at insert, never rewritten (the lesson cap counts it; #4717)
         )
     """,
     "attention_events": """
@@ -566,7 +567,10 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             -- rows older than the column = not judged, never paged.
             outcome          TEXT,
             outcome_reason   TEXT,
-            outcome_paged_at TEXT
+            outcome_paged_at TEXT,
+            -- tool_use_id of the last tool entry the lesson builder has judged
+            -- (#4807); NULL = not judged yet, judge from the start.
+            lesson_built_through TEXT
         )
     """,
     "inbox_items": """
@@ -969,6 +973,8 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             purpose          TEXT,
             ingestion_source TEXT,
             origin_class     TEXT,
+            name_hash        TEXT,
+            name_origin      TEXT,
             secret_ref       TEXT,
             UNIQUE(project_type, domain, concept)
         )
@@ -1011,7 +1017,8 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             id         TEXT PRIMARY KEY,
             value      TEXT NOT NULL,
             detail     TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            meta       TEXT
         )
     """,
     # Append-only log of the MCP tool calls a labelled client makes (owner-mode
@@ -2808,6 +2815,14 @@ INDEXES = [
     # The secret_ref triggers and the orphan sweep look units up by secret_ref.
     "CREATE INDEX IF NOT EXISTS idx_knowledge_units_secret_ref ON knowledge_units(secret_ref) "
     "WHERE secret_ref IS NOT NULL",
+    # A credential's identity is the hash of its full name (#2426): one trusted
+    # entry per name, so two concurrent first saves of a name end as one entry.
+    # A hash that is not 64 hex (a later legacy name differing only in case,
+    # which the backfill keeps) is outside it. Also created by migration
+    # 20261115060803_credential_name_hash.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_units_name_hash "
+    "ON knowledge_units(project_type, domain, name_hash) "
+    "WHERE name_origin = 'trusted' AND length(name_hash) = 64",
     # codebase index
     "CREATE INDEX IF NOT EXISTS idx_code_symbols_module ON code_symbols(module_path)",
     "CREATE INDEX IF NOT EXISTS idx_code_symbols_name ON code_symbols(name)",

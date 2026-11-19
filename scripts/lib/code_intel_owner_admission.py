@@ -109,12 +109,16 @@ def policy(modules, provider, mode, manager, environment):
 
 
 @contextmanager
-def prepared_inputs(snapshot, modules, repo_path, provider, run_mode, settings_path, selected, *, unit, recovery=False):
+def prepared_inputs(snapshot, modules, repo_path, provider, run_mode, settings_path, selected, *, unit, recovery=False,
+                    with_observer=False, observe_policy=None):
     """Hold prospective inputs, not an execution identity or launch permission.
 
     The concrete unit can be derived from an issued nonce before an execution
     sequence exists. The consumer retains the CBM lifecycle lease through CAS.
     """
+    if (type(with_observer) is not bool or (with_observer and not callable(observe_policy))
+            or (not with_observer and observe_policy is not None)):
+        raise ValueError('invalid lease-held input observer')
     native, managed = modules['queue']._native, modules['managed']
     selected = modules['queued'].effective_policy(selected, native, full=True)
     repo = Path(native._text(repo_path, 'prospective repository')).resolve(strict=True)
@@ -128,33 +132,57 @@ def prepared_inputs(snapshot, modules, repo_path, provider, run_mode, settings_p
     inputs = dict(unit=unit, run_mode=run_mode, cap_bytes=8 * 1024**3,
         **{key: selected[key] for key in ('route', 'slice', 'wall_seconds')})
     with managed.lifecycle_lock(shared=True) if provider == 'cbm' else nullcontext():
-        control = modules['owner'].control_environment(inputs, selected, modules['unit'])
-        if provider == 'gitnexus':
-            options, recipe, source = modules['gitnexus'].freeze(snapshot, modules,
-                dict(repo_path=repo_path, provider=provider), inputs, selected, control, recovery=recovery)
-        else:
-            persistence = os.environ.get('CODE_INTEL_INDEX_PERSISTENCE') or 'true'
-            if persistence not in ('true', 'false'):
-                raise ValueError('invalid persistence policy')
-            documents = []
-            path = modules['unit'].config_path(settings_path)
-            config = managed.runtime_config(path, capture=documents.append)
-            if (len(documents) != 1 or type(documents[0]) is not bytes
-                    or Path(config['main']) != snapshot.root or config['main'] != repo_path):
-                raise ValueError('initial runtime requires its one immutable primary configuration')
-            with managed.verified_binary(Path(config['binary'])):
-                pass  # Read/hash/access only; no provider process before reservation.
-            environment = managed.native_env(config, environment=control)
-            environment.pop('INVOCATION_ID', None)
-            recipe = dict(frozen=environment, registration_slots={'INVOCATION_ID': 'scope.invocation_id'})
-            accepted = modules['queued'].NativeEnvironment(recipe, native)
-            args = SimpleNamespace(repo_path=repo_path, mode=run_mode, persistence=persistence)
-            source = modules['queued'].cbm_source(snapshot=snapshot, worker=modules['worker'],
-                config=config, args=args, cap=inputs['cap_bytes'], settings=documents[0],
-                environment=accepted.frozen, policy=selected, registration_slots=recipe['registration_slots'])
-            options = dict(managed_config=str(path), persistence=persistence)
-        native.source_identity(source)
-        yield dict(source=source, provider_options=options, environment_recipe=recipe)
+        active = True
+        def observe():
+            if not active:
+                raise RuntimeError('input observation lease is closed')
+            current_policy = modules['queued'].effective_policy(
+                observe_policy() if with_observer else selected, native, full=True)
+            if with_observer and not snapshot.current_matches():
+                raise ValueError('captured acceptance source changed')
+            current_inputs = dict(inputs, **{key: current_policy[key]
+                                  for key in ('route', 'slice', 'wall_seconds')})
+            control = modules['owner'].control_environment(current_inputs, current_policy, modules['unit'])
+            if provider == 'gitnexus':
+                options, recipe, source = modules['gitnexus'].freeze(snapshot, modules,
+                    dict(repo_path=repo_path, provider=provider), current_inputs, current_policy, control, recovery=recovery)
+            else:
+                persistence = os.environ.get('CODE_INTEL_INDEX_PERSISTENCE') or 'true'
+                if persistence not in ('true', 'false'):
+                    raise ValueError('invalid persistence policy')
+                documents = []
+                path = modules['unit'].config_path(settings_path)
+                config = managed.runtime_config(path, capture=documents.append)
+                if with_observer:
+                    managed.require_enabled(config)
+                if (len(documents) != 1 or type(documents[0]) is not bytes
+                        or Path(config['main']) != snapshot.root or config['main'] != repo_path):
+                    raise ValueError('initial runtime requires its one immutable primary configuration')
+                with managed.verified_binary(Path(config['binary']), config['build']):
+                    pass  # Read/hash/access only; no provider process before reservation.
+                environment = managed.native_env(config, environment=control)
+                environment.pop('INVOCATION_ID', None)
+                recipe = dict(frozen=environment, registration_slots={'INVOCATION_ID': 'scope.invocation_id'})
+                accepted = modules['queued'].NativeEnvironment(recipe, native)
+                args = SimpleNamespace(repo_path=repo_path, mode=run_mode, persistence=persistence)
+                source = modules['queued'].cbm_source(snapshot=snapshot, worker=modules['worker'],
+                    config=config, args=args, cap=current_inputs['cap_bytes'], settings=documents[0],
+                    environment=accepted.frozen, policy=current_policy, registration_slots=recipe['registration_slots'])
+                options = dict(managed_config=str(path), persistence=persistence)
+            native.source_identity(source)
+
+            value = dict(source=source, provider_options=options, environment_recipe=recipe)
+            if with_observer:
+                value['policy_sha256'] = native.digest(current_policy)
+            return value
+        try:
+            value = observe()
+            if with_observer:
+                value.pop('policy_sha256')
+                value['observe'] = observe
+            yield value
+        finally:
+            active = False
 
 
 def reserve_runtime(snapshot, modules, context, run_mode, settings_path, selected, *, actual_owner):

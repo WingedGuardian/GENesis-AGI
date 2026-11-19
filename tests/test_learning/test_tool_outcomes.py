@@ -504,3 +504,35 @@ async def test_a_result_appended_without_new_text_is_recorded(db, tmp_path, monk
         f.write(json.dumps(_result("toolu_late", "done", ts=f"{_day()}T10:00:05Z")) + "\n")
     await cycle()
     assert await recorded() == ["toolu_late"]
+def test_a_replayed_call_is_not_a_second_call(tmp_path):
+    """api-request-blob records replay earlier calls with the same ids (#4812).
+    Kept twice, a replayed call had no result, scored as a crash, and gave
+    readers that cut the spine by tool_use_id the same id at two positions."""
+    replay = {
+        "type": "api-request-blob",
+        "sessionId": SID,
+        "timestamp": "2026-11-01T10:00:09Z",
+        "message": {
+            "content": [
+                {"type": "tool_use", "id": "toolu_a", "name": "Bash", "input": {"command": "ls"}},
+                {"type": "tool_use", "id": "toolu_b", "name": "Bash", "input": {"command": "pwd"}},
+            ]
+        },
+    }
+    records = [
+        _use("toolu_a", "Bash", {"command": "ls"}, ts="2026-11-01T10:00:00Z"),
+        _result("toolu_a", "ok", ts="2026-11-01T10:00:01Z"),
+        _use("toolu_b", "Bash", {"command": "pwd"}, ts="2026-11-01T10:00:02Z"),
+        _result("toolu_b", "ok", ts="2026-11-01T10:00:03Z"),
+        replay,
+        _use("toolu_c", "Bash", {"command": "id"}, ts="2026-11-01T10:00:10Z"),
+        _result("toolu_c", "ok", ts="2026-11-01T10:00:11Z"),
+    ]
+    path = tmp_path / "replay.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    spine, haystack = build_spine_and_haystack(path)
+    tools = [e for e in spine if e["type"] == "tool"]
+    assert [e["tool_use_id"] for e in tools] == ["toolu_a", "toolu_b", "toolu_c"]
+    assert all(e["has_result"] and e["outcome"] == "ok" for e in tools)
+    assert [e["turn"] for e in tools] == [1, 2, 3]
+    assert haystack.count('"command": "ls"') == 1

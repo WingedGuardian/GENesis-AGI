@@ -4,10 +4,24 @@ Native execution authority is tested separately against the real adapter; these
 doubles retain the real managed CLI parser and schema/sentinel validation.
 """
 
+import hashlib
 import json
 from pathlib import Path
+from types import MappingProxyType
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def qualify_bytes(monkeypatch, lookup, *payloads):
+    """Add harmless fixture images to this captured lookup's immutable policy."""
+    records = dict(lookup.__globals__["RELEASES"])
+    digests = []
+    for payload in payloads:
+        digest = hashlib.sha256(payload).hexdigest()
+        records[digest] = MappingProxyType(dict(version="fixture", worker="fixture-stock-worker"))
+        digests.append(digest)
+    monkeypatch.setitem(lookup.__globals__, "RELEASES", MappingProxyType(records))
+    return digests
 
 
 def install_manager(
@@ -41,7 +55,7 @@ def install_manager(
         "    if not Path(config['binary']).exists(): raise ValueError('backend unavailable')\n"
         "g['ready']=ready\n"
         "g['validate_loaded_backend']=lambda config: None\n"
-        "g['verified_binary']=lambda path: path.open('rb')\n"
+        "g['verified_binary']=lambda path,build: path.open('rb')\n"
         "g['check_backend']=ready\n"
         "raise SystemExit(ns['main']())\n"
     )

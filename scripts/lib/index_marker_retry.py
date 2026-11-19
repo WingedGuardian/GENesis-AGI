@@ -508,8 +508,8 @@ def physical_guard(db, h, native, legs, finalize, *, exclude, fresh_cleanup):
         proven[row["execution_seq"]] = _physical_subject(native.execution(db, context, legs))
         return True
 
-    def check():
-        annotations = {}
+    def check(*, residual_context=None):
+        annotations = {} if residual_context is None else residual_context
         residual = finalize(residual_context=annotations)
         current = _cleanup_residuals(db, residual, annotations, native, legs)
 
@@ -704,7 +704,9 @@ def launch_transition(api, context, data, operation):
         row = native.execution(db, context, legs)
         selected = row["nonce_origin"] == "selected-recovery"
         if not selected:
-            recovery.refuse_unrepresented(db, finalize(), (context["hash"], context["provider"]))
+            annotations = {}
+            recovery.refuse_unrepresented(db, finalize(residual_context=annotations),
+                (context["hash"], context["provider"]), residual_context=annotations)
         fresh = api["_fresh_gate"](db)
         if selected:
             fresh, final_physical = physical_guard(db, context["hash"], native, legs, finalize,
@@ -721,6 +723,108 @@ def launch_transition(api, context, data, operation):
             else:
                 finalize()  # Non-permit outcomes retain their ordinary drain semantics.
     return state  # Duplicate/conflict/resource statuses never become fresh permits.
+
+
+def _accept_trial(db, data, native, legs):
+    native._object(data, ("hash", "repo_path", "provider", "nonce", "evidence_reference"), "acceptance request")
+    native._hex(data["nonce"], 32, "acceptance nonce")
+    native._text(data["evidence_reference"], "acceptance evidence reference")
+    if len(data["evidence_reference"].encode("utf-8")) > MAX_REFERENCE_BYTES:
+        raise ValueError("acceptance evidence reference exceeds its UTF8 byte limit")
+    grant = load(db, data["hash"], data["provider"], native)
+    if (grant is None or grant["status"] != "spent" or grant["nonce"] != data["nonce"]
+            or grant["repo_path"] != data["repo_path"]):
+        raise ValueError("acceptance requires the exact current spent grant")
+    row = native.execution(db, grant["trial"], legs)
+    if row["nonce_origin"] != "selected-recovery" or row["launch_reservation"] is None:
+        raise ValueError("acceptance requires a selected reserved trial")
+    if row["typed_applied_state"] != "consumed" or row["completion_kind"] != "success":
+        raise ValueError("acceptance requires an already settled successful trial")
+    reserved = native.reservation(json.loads(row["launch_reservation"]), grant["trial"])
+    if (reserved["source"] != grant["source"] or reserved["run_mode"] != grant["run_mode"]
+            or row["mode"] != grant["request"]["mode"]
+            or any(row[key] != grant["request"][key] for key in (
+                "attempts", "requested_at", "legacy_unqualified", "legacy_shared_attempts"))):
+        raise ValueError("completed trial differs from its selected source or debt")
+    return grant, row
+
+
+def _accept_residuals(db, residual, annotations, grant, native, legs):
+    for key in residual:
+        if key[:2] != (grant["hash"], grant["provider"]) or key[2] in ("cleanup", "cleanup-disproof"):
+            continue
+        context, disposition = annotations.get(key, ({}, "unknown"))
+        native._object(context, legs.CONTEXT, "acceptance residual context")
+        if (disposition != "retained" or type(context["protocol"]) is not int or context["protocol"] != 3
+                or type(context["execution_seq"]) is not int
+                or not 0 < context["execution_seq"] < grant["trial"]["execution_seq"]
+                or (context["hash"], context["provider"]) != key[:2]):
+            raise ValueError("uncovered raw evidence prevents acceptance")
+        native.execution(db, context, legs)  # Unknown/foreign ownership is never covered.
+
+
+def accept(db, data, native, legs, *, finalize, observe_inputs, fresh_cleanup=None):
+    """Commit coverage of one clean completed trial; never authorize a launch."""
+    if not db.in_transaction:
+        raise RuntimeError("acceptance requires an admitted transaction")
+    grant, row = _accept_trial(db, data, native, legs)
+    context = grant["trial"]
+    if row["cleanup_invalidated"]:
+        raise ValueError("disproved trial cleanup cannot be accepted")
+    fresh, final_physical = physical_guard(db, grant["hash"], native, legs, finalize,
+        exclude=0, fresh_cleanup=fresh_cleanup)
+    if native.physical_blocked(db, grant["hash"], fresh_cleanup=fresh):
+        raise RuntimeError("original physical or control ownership prevents acceptance")
+    current_inputs = observe_inputs()  # Last callback, under the existing config lease.
+    native._object(current_inputs, ("source", "policy_sha256"), "acceptance current inputs")
+    native.source_identity(current_inputs["source"])
+    annotations = {}
+    residual = final_physical(residual_context=annotations)
+    # Only pure readers follow the final authoritative physical/evidence cutoff.
+    grant, row = _accept_trial(db, data, native, legs)
+    if (current_inputs["source"] != grant["source"]
+            or current_inputs["policy_sha256"] != grant["policy_sha256"]):
+        raise ValueError("current source or policy differs from the completed trial")
+    current = view(db, grant["hash"], grant["provider"], native, legs, residual,
+                   exclude=context["execution_seq"])
+    if legs.MODES.index(current["required_mode"]) > legs.MODES.index(grant["run_mode"]):
+        raise ValueError("completed trial cannot cover the current workload envelope")
+    if db.execute("SELECT 1 FROM inflight WHERE hash=?", (grant["hash"],)).fetchone():
+        raise RuntimeError("original inflight ownership prevents acceptance")
+    if db.execute(
+        "SELECT 1 FROM executions WHERE hash=? AND execution_seq>=? AND "
+        "(provider=? OR (provider IS NULL AND original_tools IN (?,'both'))) AND "
+        "(safety_kind IS NOT NULL OR first_typed_conflict IS NOT NULL OR conflict_reason IS NOT NULL) LIMIT 1",
+        (grant["hash"], context["execution_seq"], grant["provider"], grant["provider"]),
+    ).fetchone():
+        raise ValueError("trial or newer hazard prevents acceptance")
+    _accept_residuals(db, residual, annotations, grant, native, legs)
+    if row["control_closure"] is None:
+        raise ValueError("completed trial has no clean control witness")
+    control = json.loads(row["control_closure"])
+    native._object(control, ("version", "kind", "context", "data", "recorded_at"), "acceptance control witness")
+    state = dict(db.execute("SELECT * FROM provider_state WHERE hash=? AND provider=?",
+                           (grant["hash"], grant["provider"])).fetchone())
+    recovery.provider_blocked(db, grant["hash"], grant["provider"], native)  # Validate existing receipt structure.
+    fields = dict(accepted_sequence=context["execution_seq"], accepted_terminal_sha256=row["terminal_sha256"],
+                  accepted_control_sha256=native.digest({key: control[key] for key in ("version", "kind", "context", "data")}),
+                  accepted_source_identity=native.encode(current_inputs["source"]),
+                  accepted_evidence_reference=data["evidence_reference"])
+    if not recovery._accepted_clean(db, {**state, **fields}, native):
+        raise ValueError("trial lacks exact clean terminal, control or cleanup proof")
+    if state["accepted_sequence"] > context["execution_seq"]:
+        raise ValueError("acceptance cannot lower the current watermark")
+    duplicate = state["accepted_sequence"] == context["execution_seq"]
+    if duplicate and any(state[key] != value for key, value in fields.items()):
+        raise ValueError("accepted receipt is immutable")
+    if not duplicate:
+        db.execute("UPDATE provider_state SET accepted_sequence=?,accepted_terminal_sha256=?,"
+                   "accepted_control_sha256=?,accepted_source_identity=?,accepted_evidence_reference=? "
+                   "WHERE hash=? AND provider=?", (*fields.values(), grant["hash"], grant["provider"]))
+    receipt = {key: value for key, value in fields.items() if key != "accepted_source_identity"}
+    receipt["accepted_source_identity"] = current_inputs["source"]
+    return dict(state="already_accepted" if duplicate else "accepted", trial=context,
+                receipt=receipt, launch_authority=False)
 
 
 def revoke(db, h, provider, nonce, native, *, grant_sha256=None):
@@ -757,7 +861,7 @@ def revoke(db, h, provider, nonce, native, *, grant_sha256=None):
     return value
 
 
-COMMANDS = {"status-recovery", "request-retry", "revoke-retry", "claim-selected"}
+COMMANDS = {"status-recovery", "request-retry", "revoke-retry", "claim-selected", "accept-retry"}
 
 
 def add_commands(sub, legs):
@@ -778,10 +882,12 @@ def add_commands(sub, legs):
             selected = parser.add_mutually_exclusive_group(required=True)
             selected.add_argument("--nonce")
             selected.add_argument("--grant-sha256")
-        elif name == "claim-selected":
+        elif name in ("claim-selected", "accept-retry"):
             parser.add_argument("--nonce", required=True)
             parser.add_argument("--managed-config",
                 default=str(Path.home() / ".genesis/config/codebase-managed.json"))
+            if name == "accept-retry":
+                parser.add_argument("--evidence-reference", required=True)
 
 
 def dispatch(args, api, supervisor):
@@ -835,6 +941,9 @@ def dispatch(args, api, supervisor):
         elif args.cmd == "claim-selected":
             result = supervisor.claim_selected(dict(repo_path=repo, provider=args.provider,
                 nonce=args.nonce, managed_config=args.managed_config))
+        elif args.cmd == "accept-retry":
+            result = supervisor.accept_retry(dict(repo_path=repo, provider=args.provider, nonce=args.nonce,
+                evidence_reference=args.evidence_reference, managed_config=args.managed_config))
         else:
             result = supervisor.revoke_retry(repo, args.provider, args.nonce,
                                              grant_sha256=args.grant_sha256)

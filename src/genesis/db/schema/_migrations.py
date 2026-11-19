@@ -1705,6 +1705,11 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE procedural_memory ADD COLUMN lesson TEXT",
         "procedural_memory.lesson")
+    # The session that created the row, set once at insert (#4717). Mirrored in
+    # migration 20261116034039_procedural_created_session_id for the runner.
+    await _try_alter(db,
+        "ALTER TABLE procedural_memory ADD COLUMN created_session_id TEXT",
+        "procedural_memory.created_session_id")
 
     # Rebuild cognitive_state table if CHECK constraint lacks resilience_degradation.
     # SQLite can't ALTER CHECK constraints — requires table rebuild.
@@ -1766,6 +1771,19 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE reference_secrets ADD COLUMN detail TEXT",
         "reference_secrets.detail")
+    # And before a credential's caller metadata was held with it (#2426;
+    # migration 20261111230000_reference_secrets_meta adds the same column).
+    await _try_alter(db,
+        "ALTER TABLE reference_secrets ADD COLUMN meta TEXT",
+        "reference_secrets.meta")
+    # A credential's name identity (#2426), indexed by INDEXES; migration
+    # 20261115060803_credential_name_hash adds the same columns and backfills them.
+    await _try_alter(db,
+        "ALTER TABLE knowledge_units ADD COLUMN name_hash TEXT",
+        "knowledge_units.name_hash")
+    await _try_alter(db,
+        "ALTER TABLE knowledge_units ADD COLUMN name_origin TEXT",
+        "knowledge_units.name_origin")
     # The secret_ref triggers: no credential unit without its secret row, and a
     # secret row dies when no unit names it any more, however the unit is
     # deleted or repointed (a raw SQL delete, a cleanup script). Triggers, not a
@@ -2266,6 +2284,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             f"ALTER TABLE cc_sessions ADD COLUMN {_col} TEXT",
             f"cc_sessions.{_col}",
         )
+
+    # The last tool entry the lesson builder has judged (#4807). Mirrored in
+    # migration 20261116040450_cc_sessions_lesson_built_through for the runner.
+    await _try_alter(
+        db,
+        "ALTER TABLE cc_sessions ADD COLUMN lesson_built_through TEXT",
+        "cc_sessions.lesson_built_through",
+    )
 
     # Which labelled client a credentials lookup came from. Mirrored in
     # migration 20261108071709 for the standalone runner (schema_both_build_paths).

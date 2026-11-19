@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -376,14 +377,39 @@ def _child_env(**extra: str) -> dict[str, str]:
     return {**os.environ, "TMPDIR": str(_temp_dir()), **extra}
 
 
-def _fetch(run: Runner) -> None:
-    run(
-        [sys.executable, "-m", "camoufox", "fetch"],
-        env=_child_env(),
-        stdin=subprocess.DEVNULL,
-        timeout=_timeout(),
-        check=False,
-    )
+# camoufox's release lookup goes through requests, which words a GitHub API rate
+# limit as "403 Client Error: rate limit exceeded for url: https://api.github.com/…"
+# (MEASURED in 10 of 10 failing fresh-install jobs, #4723).
+_RATE_LIMIT_RE = re.compile(r"\b403\b[^\n]*rate limit", re.IGNORECASE)
+
+
+def _fetch(run: Runner) -> bool:
+    """Run ``camoufox fetch``; True when its output shows a GitHub API rate limit.
+
+    Its output is captured to be read, then printed unchanged so the log keeps it;
+    on a timeout the partial output is printed before the timeout propagates.
+    """
+    try:
+        proc = run(
+            [sys.executable, "-m", "camoufox", "fetch"],
+            env=_child_env(),
+            stdin=subprocess.DEVNULL,
+            timeout=_timeout(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        _print_output(exc.stdout, exc.stderr)  # partial output may be bytes here
+        raise
+    return bool(_RATE_LIMIT_RE.search(_print_output(proc.stdout, proc.stderr)))
+
+
+def _print_output(*parts: str | bytes | None) -> str:
+    text = "".join(p.decode(errors="replace") if isinstance(p, bytes) else (p or "") for p in parts)
+    if text:
+        print(text, end="" if text.endswith("\n") else "\n", flush=True)
+    return text
 
 
 def _under_browsers(path: Path | None) -> bool:
@@ -438,7 +464,7 @@ def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.Engin
         return "user-selected", False, status
     # A directory the operator named is theirs to fix; it is never removed here.
     override = bool(os.environ.get("CAMOUFOX_EXECUTABLE_PATH", "").strip())
-    fetched = chmodded = False
+    fetched = chmodded = rate_limited = False
     for _ in range(4):  # chmod, remove+fetch, and their re-resolves; never spins
         if status.kind == engine.INVALID and _under_browsers(status.path) and not override:
             directory = status.path.parent
@@ -474,7 +500,7 @@ def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.Engin
                 if short := _room_to_fetch():  # checked before anything is removed
                     return f"skipped ({short})", False, status
                 _remove_version(directory)
-                _fetch(run)
+                rate_limited = _fetch(run)
                 fetched = True
         elif status.kind == engine.NOT_INSTALLED and not fetched:
             if blocked := _unwritable([engine.camoufox_install_dir(), _temp_root()]):
@@ -482,7 +508,7 @@ def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.Engin
                 return "not writable", False, status
             if short := _room_to_fetch():
                 return f"skipped ({short})", False, status
-            _fetch(run)
+            rate_limited = _fetch(run)
             fetched = True
         else:
             break
@@ -504,8 +530,13 @@ def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.Engin
             "cache; not changed here"
         )
     notes.append(status.detail)
+    if rate_limited:
+        notes.append(
+            "the engine lookup hit GitHub's API rate limit (60 anonymous calls an hour per "
+            "address); run this again after the hour resets"
+        )
     if status.kind == engine.NOT_INSTALLED:
-        return "missing", False, status
+        return ("missing (GitHub API rate limit)" if rate_limited else "missing"), False, status
     if fetched and status.kind == engine.INVALID and _under_browsers(status.path):
         _record_failed_fetch(status.path.parent)
     return ("invalid (after fetch)" if fetched else "invalid"), False, status
@@ -977,6 +1008,27 @@ def unmet_packages(pyproject: Path | None = None) -> list[str]:
                 f"{dist} is installed but {module} does not import ({problem}); "
                 f"reinstall it ({engine.PACKAGE_HINT})"
             )
+    # A requirement's own extras (scrapling[fetchers]) install packages that
+    # BROWSER_DISTS does not name. When they are missing, the web fetcher falls back
+    # to plain httpx, so what it imports must import, and the distribution itself
+    # must be at a version the requirement admits.
+    for req in requirements:
+        module = _EXTRA_MODULES.get(req.name.lower())
+        if not module:
+            continue
+        installed = _dist_version(req.name)
+        if installed is None:
+            unmet.append(f"{req.name} is not installed")
+            continue
+        if installed != packages.UNREADABLE and not req.specifier.contains(
+            installed, prereleases=True
+        ):
+            unmet.append(f"{req.name} {installed} is outside {req.specifier}")
+        if problem := _import_problem(module):
+            unmet.append(
+                f"{req} is not usable: {module} does not import ({problem}); "
+                f"reinstall it ({engine.PACKAGE_HINT})"
+            )
     return unmet
 
 
@@ -987,12 +1039,37 @@ _LAUNCH_MODULES = {
     "patchright": "patchright.async_api",
 }
 
+# What a browser-extra requirement is installed for, by distribution name, as
+# "module:attribute": the import its caller makes. Keyed on the name, not the
+# extras listed: every scrapling extra (fetchers, ai, shell, rag, all) pulls in the
+# fetcher packages, and web/fetch.py needs AsyncFetcher whichever is named.
+# Scrapling 0.5.1 loads AsyncFetcher lazily, so importing scrapling.fetchers alone
+# touches none of the extra's packages.
+_EXTRA_MODULES = {
+    "scrapling": "scrapling.fetchers:AsyncFetcher",
+}
+
+
+def _dist_version(name: str) -> str | None:
+    """The installed version of ``name``, None when absent, UNREADABLE when its
+    metadata cannot be read (a damaged install; the import check then judges it)."""
+    try:
+        return metadata.version(name) or packages.UNREADABLE
+    except metadata.PackageNotFoundError:
+        return None
+    except Exception:  # noqa: BLE001 - a damaged install, reported as one
+        return packages.UNREADABLE
+
 
 def _import_problem(module: str) -> str | None:
-    """Why ``module`` does not import, or None. Run in check-packages' own process,
-    never the server's: importing camoufox imports playwright."""
+    """Why ``module`` does not import, or None; ``module:attribute`` also reads the
+    attribute, for a package that imports it lazily. Run in check-packages' own
+    process, never the server's: importing camoufox imports playwright."""
+    name, _, attribute = module.partition(":")
     try:
-        importlib.import_module(module)
+        loaded = importlib.import_module(name)
+        if attribute:
+            getattr(loaded, attribute)
     except Exception as exc:  # noqa: BLE001 - any failure means the launch fails too
         return f"{type(exc).__name__}: {exc}"
     return None

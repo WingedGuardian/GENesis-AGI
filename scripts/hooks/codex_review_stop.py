@@ -110,7 +110,11 @@ def _non_mutating(seg) -> bool:
 
 
 def _commit_cwd(seg) -> str | None:
-    """Require one absolute, canonical literal -C: native hook cwd omits workdir overrides.
+    """Require one absolute, canonical literal -C, independent of native hook cwd.
+
+    Native0.166.0 supplies execution cwd in the qualified fixture; older client
+    observations omitted overrides. Explicit targeting binds the budget lookup
+    to the command's repository without relying on either metadata behavior.
 
     Canonical means the spelling already equals its realpath: no symlink, no `..`,
     and no process-relative procfs link such as /proc/self/cwd, which the hook and

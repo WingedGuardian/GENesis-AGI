@@ -21,6 +21,10 @@ it on every Claude Code child, and stdio MCP servers inherit it:
 - ``CLAUDECODE``: set by Claude Code in the shells and MCP servers it starts.
 - ``CODEX_THREAD_ID``: set by Codex in the shells it runs commands in (not in
   its MCP servers, which get a filtered environment).
+- ``GENESIS_BUILDER_KEY``: set by ``scripts/cc-slot.sh launch`` (its launch
+  mode lands in #4700) in a builder slot the board launcher started (the Build
+  move's key). Read into
+  :attr:`CallerContext.builder_key`; the builder guard keys on it.
 
 The last two feed :func:`client_kind`, a label for records, never a permission.
 
@@ -86,6 +90,7 @@ LEGACY_SESSION_ID_ENV = "CLAUDE_SESSION_ID"
 PROFILE_ENV = "GENESIS_CALLER_PROFILE"
 CLAUDE_CODE_ENV = "CLAUDECODE"
 CODEX_THREAD_ENV = "CODEX_THREAD_ID"
+BUILDER_KEY_ENV = "GENESIS_BUILDER_KEY"
 
 IDENTITY_ENV_VARS = frozenset(
     {
@@ -98,6 +103,7 @@ IDENTITY_ENV_VARS = frozenset(
         PROFILE_ENV,
         CLAUDE_CODE_ENV,
         CODEX_THREAD_ENV,
+        BUILDER_KEY_ENV,
     }
 )
 
@@ -132,6 +138,7 @@ class CallerContext:
     profile: str | None = None
     claude_code: str | None = None
     codex_thread: str | None = None
+    builder_key: str | None = None
 
     @property
     def unsupervised_dispatched(self) -> bool:
@@ -187,6 +194,7 @@ def caller_context_from_env() -> CallerContext:
         profile=env.get(PROFILE_ENV) or None,
         claude_code=env.get(CLAUDE_CODE_ENV),
         codex_thread=env.get(CODEX_THREAD_ENV),
+        builder_key=env.get(BUILDER_KEY_ENV),
     )
 
 
@@ -283,12 +291,19 @@ def dispatched_child_env(base: Mapping[str, str] | None = None) -> dict[str, str
     what an unmarked session means everywhere else. The supervised marker is
     dropped: nobody watches this child, even when its parent was an
     owner-attended conversation. So are the parent's session and transcript
-    ids and its client label, which the child is not. The origin class is kept, so a child of an
+    ids and its client label, which the child is not, and a builder slot's key: the
+    child is not that builder. The origin class is kept, so a child of an
     external-influenced session stays classified as one.
     """
     env = dict(os.environ if base is None else base)
     env[CC_SESSION_ENV] = "1"
-    for name in (SUPERVISED_ENV, SESSION_ID_ENV, TRANSCRIPT_ID_ENV, LEGACY_SESSION_ID_ENV):
+    for name in (
+        SUPERVISED_ENV,
+        SESSION_ID_ENV,
+        TRANSCRIPT_ID_ENV,
+        LEGACY_SESSION_ID_ENV,
+        BUILDER_KEY_ENV,
+    ):
         env.pop(name, None)
     drop_client_label(env)
     return env
