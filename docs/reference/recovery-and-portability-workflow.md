@@ -424,10 +424,12 @@ Two mechanisms make this observable and survivable without host access:
    syncs it to the host shared mount
    (`~/.local/state/genesis-guardian/shared/guardian/cc_oauth_token.env`). It is
    a **shared fallback** read by several consumers, each of which injects it via
-   `CLAUDE_CODE_OAUTH_TOKEN` **only** when its own login is confirmed dead: the
-   **host** Guardian recovery brain (`diagnosis.py`, gated on a pre-flight
-   `claude auth status`), the **container's own** CC sessions
-   (`cc/login_health.py`, wired at `cc/invoker.py`), and **interactive slots**
+   `CLAUDE_CODE_OAUTH_TOKEN` **only** when its own login is confirmed dead, with
+   one exception: the **host** Guardian recovery brain (`diagnosis.py`) injects it
+   unless a pre-flight `claude auth status` CONFIRMS its login works, so a probe
+   that times out or answers unclearly (as after a host reboot) still gets a
+   usable credential. The other consumers are the **container's own** CC sessions
+   (`cc/login_health.py`, wired at `cc/invoker.py`) and **interactive slots**
    (`cc/login_gate.py`, wired at `scripts/cc-slot.sh`). A healthy login is never
    overridden — except the interactive-slot `GENESIS_CC_SLOT_OAUTH=always` lever,
    which deliberately injects over a live login (losing Remote Control / claude.ai

@@ -162,9 +162,11 @@ async def test_every_leak_is_refused_or_its_tag_dropped(db, name, value, leak, w
             await _write(db, store, value, f"pg {leak}", [])
         return
     if where == "header":
-        # A header that is not the one for the concept is checked strictly.
-        with pytest.raises(ValueError, match="body"):
-            await _write(db, store, value, "pg", [], header=f"pg {leak}")
+        # A first line that is not the standard header gains it above, and the
+        # caller's own line is held with the description: indexed nowhere.
+        unit = await _write(db, store, value, "pg", [], header=f"pg {leak}")
+        for text in await _indexed(db, store, unit):
+            assert leak not in text, (name, text)
         return
     unit = await _write(db, store, value, "svc", [leak, "keep-me"])
     for text in await _indexed(db, store, unit):
@@ -193,18 +195,22 @@ async def test_no_realistic_write_is_refused(db, name, value, identifier, kept, 
     assert json.loads(row["tags"]) == ["reference", "credentials", *kept], name
     for tag in dropped:
         assert all(tag not in text for text in await _indexed(db, store, unit)), tag
-    assert row["concept"] == identifier
+    assert ro.display_name(row) == identifier
 
 
-async def test_a_mismatched_header_is_checked_strictly(db):
-    """The login is allowed in the header only when the header is exactly the
-    one for the concept; any other first line is checked strictly."""
+async def test_a_mismatched_header_is_held_never_indexed(db):
+    """Any first line that is not the standard header stays below the built
+    header, held with the description: revealed, and indexed nowhere."""
     value = "ForumUser42 / Fk9!pass77"
     store = _PointStore()
-    with pytest.raises(ValueError, match="body"):
-        await _write(db, store, value, "forum ForumUser42", [], header="other ForumUser42")
-    unit = await _write(db, store, value, "forum ForumUser42", [])
-    assert unit
+    unit = await _write(db, store, value, "forum ForumUser42", [], header="other ForumUser42 Fk9!pass77")
+    for text in await _indexed(db, store, unit):
+        assert "Fk9!pass77" not in text, text
+    row = await kc.get(db, unit)
+    assert row["body"].split("\n", 1)[0] == "[reference.credentials] forum ForumUser42"
+    composed, missing = await ro.compose_body(db, row)
+    assert not missing and "other ForumUser42 Fk9!pass77" in composed
+    assert await _write(db, store, value, "forum ForumUser42", []) == unit
 
 
 async def test_a_login_in_the_tags_trailer_is_dropped_not_refused(db):
@@ -245,3 +251,27 @@ def test_xml_pipe_backslash_and_fullwidth_separators_split_the_value(value):
     set, so a tag holding the bare secret passed."""
     with pytest.raises(ValueError):
         ro.refuse_value_in_fields(value, {"tags": "Zq8vLm2x"})
+
+
+@pytest.mark.parametrize(
+    ("value", "name"),
+    [
+        ("bob@example.com / pw9x!", "Gmail example.com"),
+        ("bob@example.com / pw9x!", "Gmail account example.com"),
+        ("admin / Wifi Password 2024", "Wifi backup 2024"),
+        ("https://portal.example.org/login?year=2024&x=abc", "Portal 2024 login"),
+        ("host=db.example.org port=5432 pass=Zx9#kq", "postgres 5432"),
+        ("host=db.example.org port=5432 pass=Zx9#kq", "db.example.org staging"),
+        ("ssh://git@github.com/org/repo.git", "repo.git deploy key"),
+        ("https://example.com/users/12345/profile", "user 12345"),
+        ("login: bob@example.com pass: Abc12345", "example.com mail"),
+        ("my pin is 4821 and port 8080", "Server port 8080"),
+    ],
+)
+def test_the_refusal_check_is_unchanged_for_ordinary_writes(value, name):
+    """Round-2 fix audit H2: the masks' wider probes (secret parts, digit runs)
+    never reach the refusal check, so this PR alone refuses no ordinary write
+    the committed head accepted: an identifier naming a domain, a year or a
+    port is no refusal."""
+    ro.refuse_value_in_fields(value, {"identifier": name}, login_exempt=True)
+    ro.refuse_value_in_fields(value, {"identifier": name, "header": f"[reference.credentials] {name}"}, login_exempt=True)

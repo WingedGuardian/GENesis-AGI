@@ -33,6 +33,7 @@ leaking an unparsed secret into a non-reveal payload.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -144,12 +145,23 @@ _MIN_TOKEN = 4
 _TOKEN_EDGE = ".,;:!?()[]{}\"'"  # noqa: S105 - punctuation, not a secret
 
 
+_ASCII_DIGIT = re.compile(r"[0-9]")
+_ASCII_ALPHA = re.compile(r"[A-Za-z]")
+_ASCII_SYMBOL = re.compile(r"[^0-9A-Za-z]")
+
+
 def _secret_token(token: str) -> bool:
     """A whitespace token that reads as a secret rather than a word: at least
     four characters, letters or digits mixed with a digit or a symbol. Plain
     words ("password", "Router") and email addresses never qualify."""
     if len(token) < _MIN_TOKEN or _EMAIL.match(token):
         return False
+    if token.isascii():
+        # The same three tests on ASCII, in C (an upload holds out megabytes).
+        has_digit = _ASCII_DIGIT.search(token) is not None
+        has_symbol = _ASCII_SYMBOL.search(token) is not None
+        has_alpha = _ASCII_ALPHA.search(token) is not None
+        return (has_digit or has_symbol) and (has_alpha or (has_digit and has_symbol))
     has_digit = any(c.isdigit() for c in token)
     has_symbol = any(not c.isalnum() for c in token)
     has_alpha = any(c.isalpha() for c in token)
@@ -161,6 +173,9 @@ def _normalise(text: str) -> str:
     compatibility variant reads as its plain form), every format character
     (Unicode category Cf: zero-width spaces and joiners, the soft hyphen)
     removed, then casefolded."""
+    if text.isascii():
+        # NFKC leaves ASCII as it is, and no ASCII character is a format one.
+        return text.casefold()
     folded = unicodedata.normalize("NFKC", text)
     return "".join(c for c in folded if unicodedata.category(c) != "Cf").casefold()
 
@@ -207,12 +222,16 @@ def _value_probes(value: str, *, login_exempt: bool = False) -> list[tuple[str, 
     exempt = login.strip().strip(_TOKEN_EDGE) if login_exempt and sep and secret.strip() else None
     for form in _decoded(whole):
         schemes = {m.group(1).casefold() for m in _SCHEME.finditer(form)}
-        for fragment in _FRAGMENT_SPLIT.split(unicodedata.normalize("NFKC", form)):
+        # Each distinct fragment once (the same output; a long value repeats).
+        for fragment in dict.fromkeys(_FRAGMENT_SPLIT.split(unicodedata.normalize("NFKC", form))):
             fragment = fragment.strip(_TOKEN_EDGE)
             folded = fragment.casefold()
             if (
-                not fragment or fragment == exempt or fragment.isdigit()
-                or folded in schemes or _HOSTNAME.match(folded)
+                not fragment
+                or fragment == exempt
+                or fragment.isdigit()
+                or folded in schemes
+                or _HOSTNAME.match(folded)
             ):
                 continue
             if _secret_token(fragment):
@@ -398,6 +417,72 @@ def _put_detail_back(head: str, detail: str | None) -> str:
     if detail is None or rest.strip() != DETAIL_PLACEHOLDER:
         return head
     return header + sep + detail
+
+
+# ─── A credential's identity: an opaque key and the hash of its name (#2426) ──
+#
+# A credential is stored under an opaque key (``cred-`` and 12 hex, minted once
+# by the chokepoint) and found again by ``name_hash`` of its full name, never
+# by a string a later change could mask or cap. Only the hash is stored
+# (``knowledge_units.name_hash``); the name itself is the body's header line.
+
+#: The opaque key a credential is stored under.
+OPAQUE_KEY = re.compile(r"cred-[0-9a-f]{12}")
+_HEADER = f"[{_CREDENTIAL_DOMAIN}] "
+#: ``knowledge_units.name_origin``: a name written by a trusted writer (one
+#: entry per name, the partial unique index), by an insert-only one, or a name
+#: that had a card number redacted (its hash no longer tells two names apart,
+#: so it is out of the index and names an entry only with the same value).
+TRUSTED, UNTRUSTED, CARDED = "trusted", "untrusted", "carded"
+
+
+def name_hash(name: str) -> str:
+    """The identity of a credential name: the sha256 hex of the name
+    card-redacted, NFKC-normalised, format characters removed, casefolded, and
+    every whitespace run one space. The one place a name is normalised for
+    identity."""
+    from genesis.security.card_redaction import redact_text
+
+    return hashlib.sha256(" ".join(_normalise(redact_text(name)).split()).encode()).hexdigest()
+
+
+def name_origin(name: str, *, insert_only: bool = False) -> str:
+    """The ``name_origin`` a write of ``name`` records."""
+    from genesis.security.card_redaction import redact_text
+
+    if insert_only:
+        return UNTRUSTED
+    return CARDED if redact_text(name) != name else TRUSTED
+
+
+def display_name(row: dict) -> str | None:
+    """The name a reference row is shown under: for a credential, the name its
+    body header carries (its concept is an opaque key, or a legacy name); for
+    any other kind, its concept. Decided by the domain alone: the dashboard
+    list's rows carry no project_type, and every row it lists is a reference."""
+    if (row.get("domain") or "").strip().lower() != _CREDENTIAL_DOMAIN:
+        return row.get("concept")
+    head = (row.get("body") or "").split("\n", 1)[0]
+    return head[len(_HEADER):] if head.startswith(_HEADER) else row.get("concept")
+
+
+def recorded_name(concept: str, body: str | None) -> str:
+    """The full name a stored credential records: for an opaque key, its body
+    header; for a key stored before opaque keys, the key itself (a credential
+    was keyed by its identifier). The backfill migration and the chokepoint's
+    lookup of a row with no hash yet both use it."""
+    if OPAQUE_KEY.fullmatch(concept or ""):
+        head = (body or "").split("\n", 1)[0]
+        return head[len(_HEADER):] if head.startswith(_HEADER) else ""
+    return concept or ""
+
+
+def legacy_identity(concept: str, body: str | None) -> tuple[str, str]:
+    """(name_hash, name_origin) of a credential stored with no hash recorded
+    (before the name columns, or by a process on older code), from its
+    ``recorded_name``. Every such entry was written by a trusted writer."""
+    name = recorded_name(concept, body)
+    return name_hash(name), name_origin(name)
 
 
 async def _held_pair(

@@ -5,12 +5,29 @@ import sys
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 
+import pytest
+
 from genesis.observability.logging_config import (
     GenesisFormatter,
     _install_werkzeug_poll_filter,
     _WerkzeugPollFilter,
     configure_logging,
 )
+
+
+@pytest.fixture
+def isolated_logging(monkeypatch):
+    genesis = logging.getLogger("genesis")
+    werkzeug = logging.getLogger("werkzeug")
+    original_level = genesis.level
+    monkeypatch.setattr(genesis, "handlers", [])
+    monkeypatch.setattr(genesis, "propagate", True)
+    monkeypatch.setattr(werkzeug, "filters", werkzeug.filters.copy())
+    try:
+        yield
+    finally:
+        # setLevel also clears the cached effective level of child loggers.
+        genesis.setLevel(original_level)
 
 
 def _werkzeug_record(msg: str) -> logging.LogRecord:
@@ -99,6 +116,7 @@ class TestGenesisFormatter:
         assert "Traceback" not in output
 
 
+@pytest.mark.usefixtures("isolated_logging")
 class TestConfigureLogging:
     def test_sets_up_genesis_hierarchy(self):
         configure_logging(level=logging.DEBUG)
@@ -122,7 +140,6 @@ class TestConfigureLogging:
         """File handler should be skipped when pytest is in sys.modules."""
         assert "pytest" in sys.modules
         genesis_logger = logging.getLogger("genesis")
-        genesis_logger.handlers.clear()
         configure_logging(log_dir=str(tmp_path))
         file_handlers = [h for h in genesis_logger.handlers if isinstance(h, RotatingFileHandler)]
         assert len(file_handlers) == 0
@@ -177,6 +194,7 @@ class TestWerkzeugPollFilter:
         # A non-dashboard GET stays.
         assert f.filter(_werkzeug_record('- - - [..] "GET /static/app.js HTTP/1.1" 200 -')) is True
 
+    @pytest.mark.usefixtures("isolated_logging")
     def test_install_is_idempotent(self):
         wz = logging.getLogger("werkzeug")
         wz.filters = [x for x in wz.filters if not isinstance(x, _WerkzeugPollFilter)]
@@ -184,6 +202,7 @@ class TestWerkzeugPollFilter:
         _install_werkzeug_poll_filter()
         assert sum(isinstance(x, _WerkzeugPollFilter) for x in wz.filters) == 1
 
+    @pytest.mark.usefixtures("isolated_logging")
     def test_configure_logging_installs_filter(self):
         wz = logging.getLogger("werkzeug")
         wz.filters = [x for x in wz.filters if not isinstance(x, _WerkzeugPollFilter)]

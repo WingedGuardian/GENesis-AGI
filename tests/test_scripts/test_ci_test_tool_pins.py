@@ -95,7 +95,8 @@ def test_collected_floor_installs_both_trees_under_the_pins():
 
 
 #: Jobs that install the test extra unpinned ON PURPOSE: the audit reports on
-#: the tree a fresh user install resolves, and the dispatch-only benchmark
+#: the tree a fresh user install resolves (its Scrapling test step pins the test
+#: tools afterwards, before it runs pytest), and the dispatch-only benchmark
 #: measures the floating tree (runner-benchmark.yml records what it resolved).
 FLOATING_BY_DESIGN = {("ci.yml", "dependency-audit"), ("runner-benchmark.yml", "bench")}
 

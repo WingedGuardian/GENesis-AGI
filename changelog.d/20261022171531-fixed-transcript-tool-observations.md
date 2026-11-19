@@ -1,1 +1,0 @@
-- Preserve every tool call and result in multi-tool transcript records, retain result scrub failures, and leave unrelated or ambiguous delegation matches unresolved.

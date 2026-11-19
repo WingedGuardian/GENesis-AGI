@@ -15,12 +15,14 @@ Fake credentials and example.org hosts only, never real secrets.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import aiosqlite
 import pytest
 
 from genesis.db.crud import knowledge as kc
 from genesis.db.schema import create_all_tables
+from genesis.memory import knowledge_ingest as ki
 from genesis.memory import reference_ops as ro
 from tests.test_memory.test_reference_secret_class_fixes import (
     _KEY,
@@ -41,19 +43,27 @@ async def db():
 
 
 class _PausingStore(_PointStore):
-    """Pauses the first store call made while ``armed`` until ``resume`` is
-    set; ``entered`` is set when it pauses. (Bodies of one key are now alike:
-    the description is held out, so the call is picked by order, not content.)"""
+    """Pauses the first ingest made while ``armed`` just before it takes the
+    knowledge writer lock, after its read of the key and before its store and
+    commit; ``entered`` is set when it pauses. The lock serializes the
+    store-to-cleanup window (#4161), so the race the compare-and-swap guards is
+    the one between the read and the lock. (Bodies of one key are alike: the
+    description is held out, so the call is picked by order, not content.)"""
 
-    def __init__(self, armed: bool = True):
+    def __init__(self, monkeypatch, armed: bool = True):
         super().__init__()
         self.armed, self.entered, self.resume = armed, asyncio.Event(), asyncio.Event()
+        real = ki.writer
 
-    async def store_reporting_creation(self, content, source, **kwargs):
-        if self.armed and not self.entered.is_set():
-            self.entered.set()
-            await self.resume.wait()
-        return await super().store_reporting_creation(content, source, **kwargs)
+        @contextlib.asynccontextmanager
+        async def _writer(*args, **kwargs):
+            if self.armed and not self.entered.is_set():
+                self.entered.set()
+                await self.resume.wait()
+            async with real(*args, **kwargs):
+                yield
+
+        monkeypatch.setattr(ki, "writer", _writer)
 
 
 async def _indexed_texts(db, store, unit: str) -> list[str]:
@@ -74,10 +84,12 @@ async def _assert_one_named_point(db, store) -> None:
 # ─── 1. compare-and-swap ────────────────────────────────────────────────────
 
 
-async def test_a_placeholder_re_ingest_racing_a_rotation_pairs_with_the_retained_secret(db):
-    """4527738739: A reads Old, pauses in store.store; B rotates the key to New;
+async def test_a_placeholder_re_ingest_racing_a_rotation_pairs_with_the_retained_secret(
+    db, monkeypatch,
+):
+    """4527738739: A reads Old, pauses before its store; B rotates the key to New;
     A resumes. A placeholder body whose note repeats New must not index it."""
-    store = _PausingStore(armed=False)
+    store = _PausingStore(monkeypatch, armed=False)
     unit = await _ingest(db, store, _body("Example portal login", "password: Old!Fake123"))
     store.armed = True
     writer_a = asyncio.create_task(
@@ -98,10 +110,12 @@ async def test_a_placeholder_re_ingest_racing_a_rotation_pairs_with_the_retained
     await _assert_one_named_point(db, store)
 
 
-async def test_a_writer_that_read_an_absent_key_never_orphans_the_winners_point(db):
-    """4527738743: B reads an absent key and pauses in store.store; A inserts the
+async def test_a_writer_that_read_an_absent_key_never_orphans_the_winners_point(
+    db, monkeypatch,
+):
+    """4527738743: B reads an absent key and pauses before its store; A inserts the
     key; B resumes. B must displace A's point, not leave it recallable."""
-    store = _PausingStore()
+    store = _PausingStore(monkeypatch)
     writer_b = asyncio.create_task(
         _ingest(db, store, _body("Example portal login from B", "password: B!Fake789")),
     )
@@ -127,7 +141,8 @@ async def test_a_second_change_raises_to_the_caller_and_leaves_nothing(db, monke
     monkeypatch.setattr(kc, "upsert", _always_changed)
     with pytest.raises(kc.CredentialKeyChanged):
         await _ingest(db, store, _body("Example portal login", "password: Twice!Fake3"))
-    assert len(calls) == 2
+    # The first try and five fresh reads (owner ruling: retry until it lands).
+    assert len(calls) == 6
     assert store.points == {}
 
 

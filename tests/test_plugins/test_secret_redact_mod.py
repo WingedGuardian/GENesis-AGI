@@ -71,6 +71,7 @@ const { execFile } = require("child_process");
     write: text => { fs.writeFileSync(spec.secrets, text); tick += 1; const d = new Date(now + tick * 5000); fs.utimesSync(spec.secrets, d, d); },
     read: p => fs.readFileSync(p ?? spec.secrets, "utf8"),
     put: (p, text) => { fs.mkdirSync(require("path").dirname(p), { recursive: true }); fs.writeFileSync(p, text); },
+    remove: p => fs.unlinkSync(p),
     advance: ms => { now += ms; },
     failNext: n => { failLoads = n; },
     afterNextLoader: fn => { afterLoader = fn; },
@@ -659,6 +660,102 @@ def test_a_secrets_file_the_resolver_would_now_prefer_is_loaded_on_the_next_even
         override=False,
     )
     assert res["out"] == {"before": {"result": P}, "after": {"result": P}, "idle": True}
+
+
+def test_a_write_with_placeholder_text_is_refused_while_a_failed_reload_leaves_the_file_unconfirmed(
+    tmp_path,
+):
+    # The resolver moves to a file created mid-session and the reload that would learn it fails: the mod still
+    # knows only the old path, so a write to the new one carrying placeholder text must be refused anyway.
+    repo = tmp_path / "repo"
+    shutil.copytree(PLUGIN, repo / "plugins" / "genesis-secret-redact")
+    resolver = repo / "src" / "genesis" / "secrets_location.py"
+    resolver.parent.mkdir(parents=True)
+    shutil.copy(PLUGIN.parents[1] / "src" / "genesis" / "secrets_location.py", resolver)
+    (tmp_path / "genesis").mkdir()
+    (tmp_path / "genesis" / "secrets.env").write_text(f"CANARY_API_KEY={KEY}\n")
+    res = _run(
+        tmp_path,
+        """
+        await t.emit("tool.call", { tool: "Bash" }, async () => ({ result: "loaded" }));
+        const moved = t.dir + "/.config/genesis/secrets.env";
+        t.put(moved, "CANARY_API_KEY=" + t.v.key2 + "\\n");
+        t.failNext(1);
+        let ran = 0;
+        const run = async () => { ran += 1; return { result: "ok" }; };
+        const write = file_path => ({ tool: "Write", file_path, content: "CANARY_API_KEY=[secrets.env:CANARY_API_KEY]\\n" });
+        const failed = await t.emit("tool.call", write(moved), run);
+        const plain = await t.emit("tool.call", { tool: "Write", file_path: moved, content: "x" }, run);
+        // Still inside the back-off: no reload runs, and the target is still unconfirmed.
+        t.advance(5000);
+        const again = await t.emit("tool.call", write(moved), run);
+        const ranWhileUnconfirmed = ran;
+        t.advance(31000);
+        await t.emit("tool.call", { tool: "Bash" }, async () => ({ result: "reloaded" }));
+        const elsewhere = await t.emit("tool.call", write(t.dir + "/notes.md"), run);
+        const target = await t.emit("tool.call", write(moved), run);
+        return { failed: failed.deny.includes("failed at the last reload"), again: "deny" in again, plain: plain.result, ranWhileUnconfirmed, elsewhere: elsewhere.result, target: "deny" in target, ran };
+        """,
+        secrets=None,
+        plugin=repo / "plugins" / "genesis-secret-redact",
+        override=False,
+    )
+    # Refused while unconfirmed; a write without placeholders still runs; once a load succeeds the ordinary
+    # rule applies: placeholders elsewhere stay literal, the secrets file (now the moved one) still refuses.
+    assert res["out"] == {
+        "failed": True,
+        "again": True,
+        "plain": "ok",
+        "ranWhileUnconfirmed": 1,
+        "elsewhere": "ok",
+        "target": True,
+        "ran": 2,
+    }
+
+
+def test_an_unconfirmed_file_is_retried_after_the_back_off_even_when_every_stamp_is_back(tmp_path):
+    # A newly preferred secrets file appears, the reload it causes fails, and the file is removed during the
+    # back-off: every watched path is back to the stamp of the last successful load. The reload must still be
+    # retried once the back-off passes, or placeholder text in a write to any file stays refused all session.
+    repo = tmp_path / "repo"
+    shutil.copytree(PLUGIN, repo / "plugins" / "genesis-secret-redact")
+    resolver = repo / "src" / "genesis" / "secrets_location.py"
+    resolver.parent.mkdir(parents=True)
+    shutil.copy(PLUGIN.parents[1] / "src" / "genesis" / "secrets_location.py", resolver)
+    (tmp_path / "genesis").mkdir()
+    (tmp_path / "genesis" / "secrets.env").write_text(f"CANARY_API_KEY={KEY}\n")
+    res = _run(
+        tmp_path,
+        """
+        await t.emit("tool.call", { tool: "Bash" }, async () => ({ result: "loaded" }));
+        const moved = t.dir + "/.config/genesis/secrets.env";
+        t.put(moved, "CANARY_API_KEY=" + t.v.key2 + "\\n");
+        t.failNext(1);
+        let ran = 0;
+        const run = async () => { ran += 1; return { result: "ok" }; };
+        const notes = { tool: "Write", file_path: t.dir + "/notes.md", content: "see [secrets.env:CANARY_API_KEY]\\n" };
+        const failed = await t.emit("tool.call", notes, run);
+        t.remove(moved);
+        t.advance(31000);
+        const runs = t.runs();
+        const recovered = await t.emit("tool.call", notes, run);
+        const retried = t.runs() > runs;
+        // Confirmed again, so nothing changes and the next event runs no loader.
+        const idleRuns = t.runs();
+        await t.emit("tool.call", { tool: "Bash" }, async () => ({ result: "x" }));
+        return { failed: "deny" in failed, recovered: recovered.result, retried, idle: t.runs() === idleRuns, ran };
+        """,
+        secrets=None,
+        plugin=repo / "plugins" / "genesis-secret-redact",
+        override=False,
+    )
+    assert res["out"] == {
+        "failed": True,
+        "recovered": "ok",
+        "retried": True,
+        "idle": True,
+        "ran": 1,
+    }
 
 
 def test_each_load_attempt_leaves_a_state_file_with_names_and_counts_only(tmp_path):
