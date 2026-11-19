@@ -129,13 +129,31 @@ _MULTI_SCHEMA_EXAMPLE = """\
 ```"""
 
 
-def _build_multi_struggle_prompt(spine_text: str, score: float) -> str:
+_CONTEXT_HEADING = "## Earlier turns (for reference only; build nothing from them)\n"
+_CONTEXT_RULE = (
+    "The earlier turns above come before the part of the session you are judging. "
+    "Use them only to understand the Action Spine below. Every procedure you return "
+    "must be shown by the Action Spine's own turns; return none that only the earlier "
+    "turns show.\n\n"
+)
+
+
+def _build_multi_struggle_prompt(
+    spine_text: str, score: float, context_text: str | None = None,
+) -> str:
     """Build the multi-procedure builder prompt. Uses concatenation (NOT
-    str.format) so { } in transcript content can't raise KeyError."""
+    str.format) so { } in transcript content can't raise KeyError.
+
+    ``context_text`` (#4813): tool turns just before the part being judged, shown
+    for reference with the rule that nothing is built from them."""
+    context = (
+        _CONTEXT_HEADING + context_text + "\n\n" + _CONTEXT_RULE if context_text else ""
+    )
     return (
         _MULTI_PROCEDURE_INTRO
         + _PROCEDURE_DEF
         + _MULTI_SEGMENTATION
+        + context
         + "## Action Spine\n"
         + spine_text
         + "\n\n"
@@ -515,12 +533,21 @@ async def judge_multi_procedure(
     source_session_id: str | None = None,
     max_new: int | None = None,
     shadow: bool = False,
+    context_text: str | None = None,
+    origin_class: str | None = None,
 ) -> list[str]:
     """Build 0..N topic-segmented procedures from a struggle-detected session.
 
     ``shadow`` records each would-be procedure instead of storing it (see
     ``_store_judged_procedure``); the returned list then holds ``SHADOW_ID``
     once per would-be procedure.
+
+    For a part of a session (#4813) the caller passes ``context_text`` (earlier
+    turns, shown for reference only) and ``origin_class`` computed on the WHOLE
+    spine, since ``spine`` is then only the part and an external read earlier in
+    the session must still mark it. Each lesson is then also grounded against the
+    part's own turns, logged beside the full score, to measure lessons built
+    from the context.
 
     ``spine`` is rendered USER-BLIND (tool actions only); ``haystack`` is the
     uncapped execution record used for grounding. Each built procedure is grounded
@@ -539,12 +566,17 @@ async def judge_multi_procedure(
     )
 
     spine_text = format_spine_for_judge(spine)
-    prompt = _build_multi_struggle_prompt(spine_text, score)
+    prompt = _build_multi_struggle_prompt(spine_text, score, context_text)
 
     # WS-3 gate-1: one origin for the whole session — every procedure this call
     # promotes shares it (covers BOTH the struggle and rebuild callers, since
-    # both route their spine through here).
-    origin_class = derive_session_origin(spine)
+    # both route their spine through here). A part's caller passes it in.
+    if origin_class is None:
+        origin_class = derive_session_origin(spine)
+    part_haystack = (
+        "\n".join(e.get("args_summary", "") for e in spine if e.get("type") == "tool")
+        if context_text is not None else None
+    )
 
     procedures = await _call_and_parse_list(router, prompt)
     if not procedures:
@@ -597,5 +629,18 @@ async def judge_multi_procedure(
         )
         if proc_id:
             stored.append(proc_id)
+            if part_haystack is not None:
+                # Measurement only (after the switch to incremental): a stored
+                # lesson grounded in the full record but not in the part's own
+                # turns was likely built from the reference turns.
+                try:
+                    part_score = grounding_score(steps, part_haystack)
+                except Exception:
+                    part_score = None
+                logger.info(
+                    "Procedure %s grounding [part] session=%s: full=%.2f part=%s",
+                    proc_id, source_session_id, gscore,
+                    "n/a" if part_score is None else f"{part_score:.2f}",
+                )
 
     return stored

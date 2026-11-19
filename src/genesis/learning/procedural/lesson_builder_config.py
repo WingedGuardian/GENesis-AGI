@@ -50,7 +50,10 @@ DEFAULTS: dict[str, Any] = {"mode": "live", "segment": "shadow"}
 #   shadow: the whole session, plus one log line per built session saying what
 #     judging only the unjudged part would do, and the progress marker
 #     (cc_sessions.lesson_built_through) moved as that rule would move it.
-#   incremental: judge only the unjudged part. Not built yet: reads as shadow.
+#   incremental: judge only the unjudged part (up to 4 parts per pass in the
+#     cycle; the rebuild drain, which runs before memory extraction, makes at
+#     most one builder call per queued item; leftovers and failures queue a
+#     rebuild that continues from the marker). Needs mode live; under shadow or off it runs as shadow.
 SEGMENTS = ("whole", "shadow", "incremental")
 
 
@@ -96,18 +99,16 @@ def builder_mode() -> str:
 def segment_mode() -> str:
     """How much of a session the builder judges (see :data:`SEGMENTS`).
 
-    An invalid value, and ``incremental`` (not built yet), read as ``shadow``,
-    which changes nothing the builder stores.
+    An invalid value reads as ``shadow``, which changes nothing the builder
+    stores. ``incremental`` takes effect only while the builder ``mode`` is
+    ``live``; the extraction job runs it as ``shadow`` otherwise.
     """
     segment = load_config().get("segment")
-    if segment == "incremental" or segment not in SEGMENTS:
+    if segment not in SEGMENTS:
         key = repr(segment)
         if key not in _SEGMENT_WARNED:  # once per value per process, not per session
             _SEGMENT_WARNED.add(key)
-            logger.warning(
-                "lesson_builder segment %s %s — reading as shadow", key,
-                "is not built yet" if segment == "incremental" else "is invalid",
-            )
+            logger.warning("lesson_builder segment %s is invalid — reading as shadow", key)
         return "shadow"
     return segment
 

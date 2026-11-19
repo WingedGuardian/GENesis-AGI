@@ -21,7 +21,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
 
@@ -1103,6 +1103,12 @@ def _reflection_problem(
     parsed = rr.parse(text, gate_lane=gate_lane)  # the grammar alone, and its keys
     if ended and _fixes_now(parsed):
         return _ENDED_FIX_NOW
+    # Judged as committed a little after now, for every key and round alike
+    # (round 0 included): git stamps the commit after this hook's git and network
+    # reads, so near the cutover the gate stays stricter than coverage, never laxer.
+    missing = rr.alternative_problem(parsed, datetime.now(UTC) + _ADMISSION_LEAD)
+    if missing:
+        return "the reflection does not pass its grammar: " + missing
     if state is None:  # no owed state (direct callers): the current round, as before
         current_head = budget.get("current_head")
         rounds = {
@@ -1189,6 +1195,10 @@ def _reflection_form_problem(
     if parsed.problems:
         return "the reflection does not pass its grammar: " + "; ".join(parsed.problems[:5]), None
     return None, text
+
+
+#: How far ahead of now admission judges the ``Alternative:`` line (see above).
+_ADMISSION_LEAD = timedelta(minutes=5)
 
 
 def _fixes_now(parsed) -> bool:
@@ -1420,10 +1430,18 @@ def _owed_message(state: dict, budget: dict, rr) -> str:
         needs.append("an Audit-evidence: line citing a fresh-context class audit of this round")
     if premise:
         needs.append("a Premise-evidence: line citing an independent premise check")
+    cutover = getattr(rr, "ALTERNATIVE_CUTOVER_ISO", None)
+    alternative = (
+        f"From {cutover[:10]}, a fix-now disposition also needs an `Alternative:` line: "
+        "what already does or decides this, or `none found: searched <what>`."
+        if isinstance(cutover, str)
+        else None
+    )
     lines += [
         f"This round ({'gate' if gate_lane else 'ordinary'} lane) needs "
         + ("; ".join(needs) if needs else "the reflection alone")
         + ".",
+        *([alternative] if alternative else []),
         "1. `python3 scripts/review_reflection.py status` shows what is owed.",
         f"2. Write the reflection and check it: `python3 scripts/review_reflection.py "
         f"validate --round {round_n}{' --gate' if gate_lane else ''} <file>`.",
