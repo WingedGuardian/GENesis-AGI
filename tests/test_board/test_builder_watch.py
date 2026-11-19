@@ -37,26 +37,52 @@ def stops(world, monkeypatch, tmp_path):
     logs.mkdir()
     monkeypatch.setattr(builder_watch, "_logs_dir", lambda: logs)
 
-    async def pane_pids(slot):
-        return [5000 + slot]
+    # Each session's tmux identity follows its name unless a test gives it a
+    # new one (a reused slot name is a different session).
+    state["ids"] = {}
+    state["convo"] = {}
 
+    def ids_now():
+        return {n: state["ids"].get(n, f"1:${n}") for n in world.sessions}
+
+    def slot_of(ident):
+        name = next((n for n, i in ids_now().items() if i == ident), "")
+        return int(name[3:]) if name.startswith("cc-") and name[3:].isdigit() else None
+
+    async def session_ids():
+        return ids_now()
+
+    async def key_of(ident):
+        return next((world.sessions[n] for n, i in ids_now().items() if i == ident), None)
+
+    async def pane_pids(ident):
+        slot = slot_of(ident)
+        return [5000 + slot] if slot is not None else []
+
+    monkeypatch.setattr(builder_watch, "session_ids", session_ids)
+    monkeypatch.setattr(builder_watch, "key_of", key_of)
     monkeypatch.setattr(builder_watch, "pane_pids", pane_pids)
     monkeypatch.setattr(builder_watch, "claude_pids_under", lambda panes: [p + 1 for p in panes])
+    monkeypatch.setattr(
+        builder_watch, "conversations_of", lambda pid: state["convo"].get(pid, set())
+    )
     monkeypatch.setattr(builder_watch, "send_term", lambda pid: state["signalled"].append(pid))
     monkeypatch.setattr(builder_watch, "alive", lambda pid: False)
     monkeypatch.setattr(builder_watch, "STOP_WAIT_S", 1)
     monkeypatch.setattr(builder_watch, "session_alive", lambda sid: False)
 
-    async def kill_session(slot):
+    async def kill_session(ident):
+        slot = slot_of(ident)
         state["killed"].append(slot)
-        if state["kill_works"]:
+        if state["kill_works"] and slot is not None:
             world.sessions.pop(f"cc-{slot}", None)
 
     monkeypatch.setattr(builder_watch, "kill_session", kill_session)
     state["clients"] = False
 
-    async def clients(slot):
-        return state["clients"]
+    async def clients(ident):
+        value = state["clients"]
+        return value(slot_of(ident)) if callable(value) else value
 
     monkeypatch.setattr(builder_watch, "clients_attached", clients)
     state["logs"] = logs
@@ -505,18 +531,18 @@ async def test_one_bad_row_does_not_stop_the_others(db, world, stops, monkeypatc
     b = _card("I2", number=6, moved=NOW - timedelta(hours=3))
     await _running(db, world, a, slot=9, sid="sa")
     await _running(db, world, b, slot=10, sid="sb")
-    real = builder_watch._session_for
-    calls = {"n": 0}
+    real = builder_watch._open_pr_opened
 
-    async def flaky(tick, key, number, slot, recorded):
-        calls["n"] += 1
-        if number == 5:
+    def flaky(card, tracker):
+        if card["content"]["number"] == 5:
             raise RuntimeError("bad row")
-        return await real(tick, key, number, slot, recorded)
+        return real(card, tracker)
 
-    monkeypatch.setattr(builder_watch, "_session_for", flaky)
+    monkeypatch.setattr(builder_watch, "_open_pr_opened", flaky)
     _, out = await _run(db, [_moved(a, "Ready"), _moved(b, "Ready")])
     assert out["watch"]["row_errors"] == 1 and out["watch"]["paused"] == 1
+    # A failed row is a failed pass for the job, not a quiet count.
+    assert "1 builder watch row(s) failed" in out["error"]
 
 
 async def test_a_failed_resume_starts_fresh_next_time(db, world, stops, tmp_path, monkeypatch):
@@ -533,11 +559,19 @@ async def test_a_failed_resume_starts_fresh_next_time(db, world, stops, tmp_path
     assert "--resume" in world.launches[0] and "--resume" not in world.launches[1]
 
 
-def test_session_alive_reads_command_lines(tmp_path):
+def test_session_alive_matches_a_claude_holding_the_conversation(tmp_path):
     proc = tmp_path / "proc"
-    (proc / "42").mkdir(parents=True)
-    (proc / "42" / "cmdline").write_bytes(b"claude\0-r\0sess-x\0")
+    for pid, comm, cmd in (
+        (42, "claude", b"claude\0-r\0sess-x\0"),
+        (43, "claude", b"claude\0--session-id\0sess-z\0"),
+        (44, "tail", b"tail\0-f\0/x/sess-y.jsonl\0"),
+    ):
+        (proc / str(pid)).mkdir(parents=True)
+        (proc / str(pid) / "comm").write_text(comm + "\n")
+        (proc / str(pid) / "cmdline").write_bytes(cmd)
     assert builder_watch.session_alive("sess-x", proc) is True
+    assert builder_watch.session_alive("sess-z", proc) is True
+    # A program that only names the id (a tail of its transcript) holds nothing.
     assert builder_watch.session_alive("sess-y", proc) is False
     assert builder_watch.session_alive(None, proc) is False
 
@@ -651,3 +685,392 @@ async def test_resume_uses_the_session_id_the_watch_recorded_when_it_stopped(
     _, out = await _run(db, [back], now=_later(1))
     [argv] = world.launches
     assert "--resume" in argv and argv[argv.index("--session-id") + 1] == "sess-real"
+
+
+# ── identity: the verified session, never the slot name ────────────────────
+
+
+async def test_a_replacement_session_in_the_slot_is_never_killed(db, world, stops, monkeypatch):
+    """SIGTERM ends the builder, and the owner opens a new cc-9 before the stop
+    goes on: the new session is a different tmux session and is left alone."""
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    await _running(db, world, card)
+
+    def term(pid):
+        stops["signalled"].append(pid)
+        world.sessions["cc-9"] = None  # the owner's own session, same name
+        stops["ids"]["cc-9"] = "1:$99"
+
+    monkeypatch.setattr(builder_watch, "send_term", term)
+    await _run(db, [_moved(card, "Ready")])
+    assert stops["killed"] == [] and world.sessions["cc-9"] is None
+    assert len(await _events(db, "builder_paused")) == 1
+
+
+async def test_a_session_whose_key_changed_is_not_stopped(db, world, stops, monkeypatch):
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    await _running(db, world, card)
+
+    async def other(ident):
+        return "someone-else"
+
+    monkeypatch.setattr(builder_watch, "key_of", other)
+    await _run(db, [_moved(card, "Ready")])
+    assert stops["signalled"] == [] and stops["killed"] == []
+    assert await _events(db, "builder_paused") == []
+
+
+async def test_a_claude_that_survives_sigkill_keeps_its_session_for_a_retry(
+    db, world, stops, monkeypatch
+):
+    state = {"alive": True}
+    monkeypatch.setattr(builder_watch, "alive", lambda pid: state["alive"])
+    monkeypatch.setattr(builder_watch, "send_kill", lambda pid: None)
+    monkeypatch.setattr(builder_watch, "KILL_WAIT_S", 1)
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    await _running(db, world, card)
+    pulled = _moved(card, "Ready")
+    await _run(db, [pulled])
+    # The session stays, so the next pass still sees the builder and retries.
+    assert stops["killed"] == [] and "cc-9" in world.sessions
+    state["alive"] = False
+    await _run(db, [pulled], now=_later(1))
+    assert stops["signalled"] == [5010, 5010] and stops["killed"] == [9]
+    assert len(await _events(db, "builder_paused")) == 1
+
+
+async def test_attachment_is_checked_just_before_each_sessions_stop(db, world, stops, monkeypatch):
+    """Two sessions carry the key; the owner attaches to the second while the
+    first is stopping. The second is left running and nothing is closed."""
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    key = await _running(db, world, card)
+    world.sessions["cc-10"] = key
+    attached = set()
+    stops["clients"] = lambda slot: slot in attached
+
+    def term(pid):
+        stops["signalled"].append(pid)
+        attached.add(10)
+
+    monkeypatch.setattr(builder_watch, "send_term", term)
+    closed = _moved(card, "In Review", closers=[_pr(NOW - timedelta(hours=2))])
+    await _run(db, [closed])
+    assert stops["killed"] == [9] and "cc-10" in world.sessions
+    assert await _events(db, "builder_closed") == []
+
+
+async def test_a_pause_records_the_conversation_its_claude_was_running(db, world, stops):
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    await _running(db, world, card, sid="s-reserved")
+    stops["convo"][5010] = {"s-ran"}
+    await _run(db, [_moved(card, "Ready")])
+    (paused,) = await _events(db, "builder_paused")
+    assert paused["detail"]["session_id"] == "s-ran"
+
+
+async def test_an_exit_records_the_attempt_that_started_a_conversation(
+    db, world, stops, tmp_path, monkeypatch
+):
+    """Attempt 2 reserved cc-9 after attempt 1 came up there, then lost the slot
+    at the door: only attempt 1 has a conversation file."""
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    key = await _running(db, world, card, sid="s-a1")
+    async with board_crud.owned_connection(db) as own:
+        await board_crud.append_event(
+            own,
+            event="builder_launching",
+            now=(NOW - timedelta(hours=2)).isoformat(),
+            repo=REPO,
+            issue_number=card["content"]["number"],
+            project_item_id=card["id"],
+            attempt=2,
+            worker="board_launcher",
+            observed_change_key=f"{key}#a2",
+            detail={"key": key, "slot": 9, "session_id": "s-a2"},
+        )
+    (tmp_path / "s-a1.jsonl").write_text("{}\n")
+    monkeypatch.setattr(launcher, "_transcript", lambda root, sid: tmp_path / f"{sid}.jsonl")
+    del world.sessions["cc-9"]
+    await _run(db, [card])
+    (exited,) = await _events(db, "builder_exited")
+    assert exited["detail"]["session_id"] == "s-a1"
+
+
+async def test_two_exits_in_the_slot_since_the_launch_read_as_unknown(db, world, stops):
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    await _running(db, world, card)
+    (stops["logs"] / "cc_exit_9.log").write_text(
+        f"=== {(NOW - timedelta(hours=1)).isoformat()} cc-9 claude exited status=137 ===\n"
+        f"=== {(NOW - timedelta(minutes=5)).isoformat()} cc-9 claude exited status=0 ===\n"
+    )
+    del world.sessions["cc-9"]
+    await _run(db, [card])
+    (exited,) = await _events(db, "builder_exited")
+    assert exited["detail"]["status"] is None
+
+
+def _fork_pr(n):
+    return {**_pr(NOW - timedelta(hours=2)), "number": n, "isCrossRepository": True}
+
+
+async def test_a_partial_closing_pr_list_never_pauses(db, world, stops):
+    """Ten fork PRs were listed and an eleventh, this repo's, was not."""
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    await _running(db, world, card)
+    pulled = _moved(card, "Ready", closers=[_fork_pr(n) for n in range(10)])
+    pulled["content"]["closedByPullRequestsReferences"]["totalCount"] = 11
+    await _run(db, [pulled])
+    assert stops["killed"] == [] and await _events(db, "builder_paused") == []
+
+
+async def test_a_late_session_of_an_earlier_move_is_settled_by_the_watch(db, world, stops):
+    """The card is back in Build under a new move: the launcher settles only the
+    new move, so the watch records the earlier one's unrecorded session."""
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    key = _key(card)
+    async with board_crud.owned_connection(db) as own:
+        await board_crud.append_event(
+            own,
+            event="builder_launching",
+            now=(NOW - timedelta(hours=3)).isoformat(),
+            repo=REPO,
+            issue_number=card["content"]["number"],
+            project_item_id=card["id"],
+            attempt=1,
+            worker="board_launcher",
+            observed_change_key=f"{key}#a1",
+            detail={"key": key, "slot": 9, "session_id": "s-1"},
+        )
+    world.sessions["cc-9"] = key
+    again = _moved(card, "Build")
+    assert _key(again) != key
+    _, out = await _run(db, [again])
+    launched = await _events(db, "builder_launched")
+    assert key in [e["detail"]["key"] for e in launched] and out["watch"]["settled"] == 1
+
+
+async def test_an_unrecorded_builder_in_build_is_settled_while_disarmed(db, world, stops):
+    card = _card(moved=NOW - timedelta(hours=3))
+    key = _key(card)
+    async with board_crud.owned_connection(db) as own:
+        await board_crud.append_event(
+            own,
+            event="builder_launching",
+            now=(NOW - timedelta(hours=3)).isoformat(),
+            repo=REPO,
+            issue_number=card["content"]["number"],
+            project_item_id=card["id"],
+            attempt=1,
+            worker="board_launcher",
+            observed_change_key=f"{key}#a1",
+            detail={"key": key, "slot": 9, "session_id": "s-1"},
+        )
+    world.sessions["cc-9"] = key
+    world.armed = (False, "test: disarmed")
+    _, out = await _run(db, [card])
+    assert out["watch"]["settled"] == 1
+
+
+async def test_a_late_session_of_an_ended_move_is_stopped(db, world, stops):
+    """Attempt 1 was paused; a slow attempt 2 of the same move came up later.
+    Nothing else would watch it, so it is stopped and the owner told."""
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    key = await _running(db, world, card)
+    pulled = _moved(card, "Ready")
+    await _run(db, [pulled])
+    assert len(await _events(db, "builder_paused")) == 1
+    world.sessions["cc-11"] = key
+    rt, out = await _run(db, [pulled], now=_later(1))
+    assert out["watch"]["strays"] == 1 and "cc-11" not in world.sessions
+    assert any("late session" in text for text, _ in rt._outreach_pipeline.sent)
+
+
+async def test_a_failed_resume_gets_one_more_try_on_a_later_move(
+    db, world, stops, tmp_path, monkeypatch
+):
+    await _paused(
+        db, world, stops, transcript=True, worktree=True, tmp_path=tmp_path, monkeypatch=monkeypatch
+    )
+    world.launches.clear()
+    world.launch_rc = 1
+    del world.sessions["cc-9"]
+    # Move B's resume strikes; the owner moves the card out and back (move C)
+    # before B retries: C tries the resume once more, and it strikes too; the
+    # move after that (D) starts fresh rather than repeating it.
+    await _run(db, [_card("I1", moved=NOW + timedelta(minutes=9))], now=_later(3))
+    await _run(db, [_card("I1", moved=NOW + timedelta(minutes=30))], now=_later(4))
+    await _run(db, [_card("I1", moved=NOW + timedelta(minutes=50))], now=_later(5))
+    resumed = ["--resume" in argv for argv in world.launches]
+    assert resumed == [True, True, False]
+
+
+async def test_a_late_session_of_an_exited_move_still_in_build_is_stopped(db, world, stops):
+    """The move is fresh and still in Build, so the launcher is left that key;
+    it already has its builder_launched row, so the launcher skips it and the
+    watch must stop the late session itself."""
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(minutes=30))
+    key = await _running(db, world, card)
+    del world.sessions["cc-9"]
+    await _run(db, [card])
+    assert len(await _events(db, "builder_exited")) == 1
+    world.sessions["cc-11"] = key
+    _, out = await _run(db, [card], now=_later(1))
+    assert out["watch"]["strays"] == 1 and "cc-11" not in world.sessions
+
+
+async def test_an_exit_in_another_slot_records_that_slot_and_its_status(
+    db, world, stops, tmp_path, monkeypatch
+):
+    """The record names cc-10 (attempt 2, which never started a conversation);
+    attempt 1 ran in cc-9 and crashed there."""
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    key = await _running(db, world, card, slot=10, sid="s-a2")
+    async with board_crud.owned_connection(db) as own:
+        await board_crud.append_event(
+            own,
+            event="builder_launching",
+            now=(NOW - timedelta(hours=4)).isoformat(),
+            repo=REPO,
+            issue_number=card["content"]["number"],
+            project_item_id=card["id"],
+            attempt=9,
+            worker="board_launcher",
+            observed_change_key=f"{key}#a9",
+            detail={"key": key, "slot": 9, "session_id": "s-a1"},
+        )
+    (tmp_path / "s-a1.jsonl").write_text("{}\n")
+    monkeypatch.setattr(launcher, "_transcript", lambda root, sid: tmp_path / f"{sid}.jsonl")
+    at = (NOW - timedelta(minutes=5)).isoformat()
+    (stops["logs"] / "cc_exit_9.log").write_text(f"=== {at} cc-9 claude exited status=137 ===\n")
+    (stops["logs"] / "cc_exit_10.log").write_text(f"=== {at} cc-10 claude exited status=0 ===\n")
+    del world.sessions["cc-10"]
+    await _run(db, [card])
+    (exited,) = await _events(db, "builder_exited")
+    d = exited["detail"]
+    assert (d["session_id"], d["slot"], d["status"]) == ("s-a1", 9, "137")
+
+
+async def test_a_failed_pane_read_never_kills_the_session(db, world, stops, monkeypatch):
+    async def failed(ident):
+        return None
+
+    monkeypatch.setattr(builder_watch, "pane_pids", failed)
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    await _running(db, world, card)
+    await _run(db, [_moved(card, "Ready")])
+    assert stops["killed"] == [] and await _events(db, "builder_paused") == []
+
+
+def test_claude_pids_under_lists_the_nearest_claude_first(tmp_path):
+    proc = tmp_path / "proc"
+
+    def mk(pid, ppid, comm, cmd):
+        d = proc / str(pid)
+        d.mkdir(parents=True)
+        (d / "stat").write_text(f"{pid} ({comm}) S {ppid} 0 0\n")
+        (d / "comm").write_text(comm + "\n")
+        (d / "cmdline").write_bytes(cmd)
+
+    mk(100, 1, "bash", b"bash\0")
+    mk(103, 102, "claude", b"claude\0--resume\0s-child\0")
+    mk(102, 100, "claude", b"claude\0-r\0s-builder\0")
+    assert builder_watch.claude_pids_under([100], proc) == [102, 103]
+    assert builder_watch.conversations_of(102, proc) == {"s-builder"}
+
+
+def _exec_replies(monkeypatch, replies):
+    calls = []
+
+    async def fake_exec(argv, **_):
+        calls.append(argv)
+        return replies.pop(0)
+
+    monkeypatch.setattr(launcher, "_exec", fake_exec)
+    return calls
+
+
+async def test_session_ids_read_the_server_pid_and_session_id(monkeypatch):
+    _exec_replies(monkeypatch, [(0, "cc-9\t4242\t$3\nmain\t4242\t$0\nbad line\n")])
+    assert await builder_watch.session_ids() == {"cc-9": "4242:$3", "main": "4242:$0"}
+    _exec_replies(monkeypatch, [(1, "no server running on /tmp/tmux-1000/default")])
+    assert await builder_watch.session_ids() == {}
+    _exec_replies(monkeypatch, [(1, "server exploded")])
+    with pytest.raises(RuntimeError):
+        await builder_watch.session_ids()
+
+
+async def test_key_of_reads_the_session_by_its_id_only_on_the_same_server(monkeypatch):
+    calls = _exec_replies(monkeypatch, [(0, "cc-9\t4242\t$3\n"), (0, "GENESIS_BUILDER_KEY=K1\n")])
+    assert await builder_watch.key_of("4242:$3") == "K1"
+    assert calls[1][-3:] == ["-t", "$3", "GENESIS_BUILDER_KEY"]
+    # A new server reuses $3: the old identity is gone, and nothing is read.
+    calls = _exec_replies(monkeypatch, [(0, "cc-9\t5151\t$3\n")])
+    assert await builder_watch.key_of("4242:$3") is None and len(calls) == 1
+
+
+async def test_a_pause_of_two_sessions_records_the_recorded_slots_conversation(db, world, stops):
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    key = await _running(db, world, card, slot=9)
+    world.sessions["cc-10"] = key
+    stops["convo"][5010] = {"s-z"}  # cc-9, the recorded slot
+    stops["convo"][5011] = {"s-a"}  # cc-10, which sorts first
+    await _run(db, [_moved(card, "Ready")])
+    (paused,) = await _events(db, "builder_paused")
+    assert paused["detail"]["session_id"] == "s-z"
+
+
+async def test_a_session_that_ended_during_a_two_session_pause_still_pauses(
+    db, world, stops, monkeypatch
+):
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    key = await _running(db, world, card, slot=9)
+    world.sessions["cc-10"] = key
+
+    def term(pid):
+        stops["signalled"].append(pid)
+        world.sessions.pop("cc-10", None)  # it ends by itself meanwhile
+
+    monkeypatch.setattr(builder_watch, "send_term", term)
+    await _run(db, [_moved(card, "Ready")])
+    assert len(await _events(db, "builder_paused")) == 1
+    await _run(db, [_moved(card, "Ready")], now=_later(1))
+    assert await _events(db, "builder_exited") == []
+
+
+async def test_a_lone_session_that_ended_before_its_stop_is_an_exit_not_a_pause(
+    db, world, stops, monkeypatch
+):
+    await _arm(db)
+    card = _card(moved=NOW - timedelta(hours=3))
+    await _running(db, world, card)
+    real = builder_watch.session_ids
+    calls = {"n": 0}
+
+    async def ending():
+        calls["n"] += 1
+        ids = await real()
+        if calls["n"] > 2:  # the pass's own reads saw it; the stop's does not
+            ids.pop("cc-9", None)
+        return ids
+
+    monkeypatch.setattr(builder_watch, "session_ids", ending)
+    await _run(db, [_moved(card, "Ready")])
+    assert stops["signalled"] == [] and await _events(db, "builder_paused") == []
+    del world.sessions["cc-9"]
+    await _run(db, [_moved(card, "Ready")], now=_later(1))
+    assert len(await _events(db, "builder_exited")) == 1

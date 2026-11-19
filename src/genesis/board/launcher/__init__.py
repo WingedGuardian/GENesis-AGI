@@ -97,6 +97,8 @@ from genesis.board.launcher.probes import (  # noqa: E402
 WORKER = "board_launcher"
 BUILD = "Build"
 MAX_STRIKES = 3
+#: Struck resumes of one conversation, across moves, before later moves start fresh.
+RESUME_TRIES = 2
 RESOLVED_BY = "board:move:unattributed"
 ALLOWED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 #: One issue's whole event history is read; a longer one fails closed.
@@ -462,9 +464,10 @@ async def _refuse(tick: _Tick, card: dict, reason: str) -> None:
         )
 
 
-async def _launched(tick: _Tick, card: dict, attempt_row: dict | None, **detail) -> None:
+async def _launched(tick: _Tick, card: dict, attempt_row: dict | None, **detail) -> int | None:
+    """Record the move's builder; None when it was already recorded."""
     info = (attempt_row or {}).get("detail") or {}
-    await tick.event(
+    return await tick.event(
         "builder_launched",
         key=card["key"],
         change_key=card["key"],
@@ -718,20 +721,25 @@ def _resume_target(
 
     if session_alive(session_id):
         return None, "its earlier conversation is still running in another process"
+    # Resumes of this conversation that struck, under any move. A retry within
+    # one move starts fresh after its first; across moves the conversation gets
+    # RESUME_TRIES (owner ruling, ego 50fb0f7d), so a one-off failure keeps the
+    # context and a resume that keeps failing is not repeated.
     resumed_attempts = {
-        e.get("attempt")
+        ((e.get("detail") or {}).get("key"), e.get("attempt"))
         for e in history
         if e["event"] == "builder_launching"
-        and (e.get("detail") or {}).get("key") == key
+        and (e.get("detail") or {}).get("resume")
         and (e.get("detail") or {}).get("session_id") == session_id
     }
-    if any(
-        e["event"] == "launch_failed"
-        and (e.get("detail") or {}).get("key") == key
-        and (e.get("detail") or {}).get("strike") is not False
-        and e.get("attempt") in resumed_attempts
+    struck = {
+        ((e.get("detail") or {}).get("key"), e.get("attempt"))
         for e in history
-    ):
+        if e["event"] == "launch_failed"
+        and (e.get("detail") or {}).get("strike") is not False
+        and ((e.get("detail") or {}).get("key"), e.get("attempt")) in resumed_attempts
+    }
+    if len(struck) >= RESUME_TRIES or any(k == key for k, _ in struck):
         return None, "resuming its earlier conversation failed"
     if not worktree.is_dir():
         return None, f"its earlier worktree {worktree.name} is gone"
@@ -857,6 +865,7 @@ async def _launch(tick: _Tick, card: dict, facts: dict, sessions: dict, history)
         attempt=attempt,
         slot=slot,
         session_id=session_id,
+        resume=resuming,
         unit=unit,
         worktree=str(worktree),
         approval_id=request_id,
