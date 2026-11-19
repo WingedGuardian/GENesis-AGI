@@ -16,7 +16,7 @@ import selectors
 import signal
 import subprocess
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -112,64 +112,167 @@ def _run(argv: list[str], *, timeout: float, limit: int, data: bytes | None = No
         raise SourceError(f"source command unavailable: {type(exc).__name__}") from None
 
 
-def _check_mode_pairs(raw: bytes) -> None:
-    """Refuse a file header holding one half of an ``old mode``/``new mode`` pair.
+_EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+_ABBREV = re.compile(r"[0-9a-f]{7,40}\Z")
+_C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
 
-    Git's numstat reports the path with either half missing (measured, git 2.43),
-    so the census cannot see a lost half. Orphan rename halves Git refuses itself.
-    A pair lost WHOLE from a block that also carries content stays invisible to
-    the census and to this check (GitHub's file API has no mode field); modes
-    then need tree evidence. Only header lines are read: hunk lines start with a
-    space, ``+`` or ``-``.
-    """
-    halves: set[bytes] = set()
-    in_header = False
-    for line in raw.split(b"\n"):
-        if line.startswith(b"diff --git "):
-            if len(halves) == 1:
-                raise ValueError("unpaired file mode header")
-            halves, in_header = set(), True
-        elif line.startswith((b"@@", b"GIT binary patch", b"Binary files ")):
-            in_header = False
-        elif in_header and line.startswith((b"old mode ", b"new mode ")):
-            halves.add(line[:8])
-    if len(halves) == 1:
+
+def _unquote(path: str) -> str:
+    """Undo Git's C-style path quoting (``"renamed\\ttab.txt"``, ``\\351``)."""
+    if not (len(path) >= 2 and path[0] == path[-1] == '"'):
+        return path
+    out, body, i = bytearray(), path[1:-1], 0
+    while i < len(body):
+        if body[i] != "\\":
+            out += body[i].encode("utf-8")
+            i += 1
+        elif body[i + 1 : i + 4].isdigit():
+            out.append(int(body[i + 1 : i + 4], 8))
+            i += 4
+        else:
+            out.append(_C_ESCAPES[body[i + 1]])
+            i += 2
+    return out.decode("utf-8")
+
+
+@dataclass
+class _Block:
+    """What one ``diff --git`` file header says, beyond Git's counts."""
+
+    modes: set[str] = field(default_factory=set)  # which of old/new mode appeared
+    index: tuple[str, str] | None = None
+    index_mode: bool = False  # the index line ends with the (unchanged) mode
+    payload: bool = False  # a hunk or a binary marker follows
+    created: bool = False
+    deleted: bool = False
+    renamed_from: str | None = None
+
+
+def _blocks(raw: bytes) -> list[_Block]:
+    """Read each block's header lines. Hunk lines start with a space, + or -."""
+    blocks: list[_Block] = []
+    for line in raw.decode("utf-8").split("\n"):
+        if line.startswith("diff --git "):
+            blocks.append(_Block())
+        elif not blocks or blocks[-1].payload:
+            continue
+        elif line.startswith(("@@", "GIT binary patch", "Binary files ")):
+            blocks[-1].payload = True
+        elif line.startswith(("old mode ", "new mode ")):
+            blocks[-1].modes.add(line[:3])
+        elif line.startswith("new file mode "):
+            blocks[-1].created = True
+        elif line.startswith("deleted file mode "):
+            blocks[-1].deleted = True
+        elif line.startswith("rename from "):
+            blocks[-1].renamed_from = _unquote(line[len("rename from ") :])
+        elif line.startswith("index "):
+            parts = line.split(" ")
+            pre, _, post = parts[1].partition("..")
+            if not (_ABBREV.fullmatch(pre) and _ABBREV.fullmatch(post)) or len(parts) > 3:
+                raise ValueError("malformed index line")
+            blocks[-1].index, blocks[-1].index_mode = (pre, post), len(parts) == 3
+    return blocks
+
+
+def _empty(oid: str) -> bool:
+    return set(oid) == {"0"} or _EMPTY_BLOB.startswith(oid)
+
+
+def _check_block(block: _Block) -> None:
+    # Git's numstat reports a path with half a mode pair, or with its change
+    # payload cut off after the index line, as if whole (measured, git 2.43).
+    if len(block.modes) == 1:
         raise ValueError("unpaired file mode header")
+    # Git leaves the mode off the index line only when a mode pair, a create or a
+    # delete explains it, so a bare index line betrays a mode pair stripped whole.
+    if block.index and not block.index_mode and not (block.modes or block.created or block.deleted):
+        raise ValueError("index line omits the mode with no mode header")
+    index = block.index
+    if index and index[0] != index[1] and not block.payload and not all(map(_empty, index)):
+        raise ValueError("content change has no hunk or binary marker")
+
+
+def _check_identity(name: str, block: _Block, entry: dict) -> None:
+    """Bind the census blob and rename source to what the diff header says.
+
+    Measured on six merged PRs (111 files): the census ``sha`` is the diff's
+    post-image id for added, modified and renamed files, and the pre-image for
+    removed ones. A block with no index line (pure rename, mode-only) has no id
+    to compare.
+    """
+    sha, status = entry.get("sha"), entry.get("status")
+    if block.index and sha:
+        oid = block.index[0] if status == "removed" else block.index[1]
+        if not sha.startswith(oid):
+            raise ValueError(f"census blob for {name!r} differs from the raw diff")
+    if status is not None and (status == "renamed") != (block.renamed_from is not None):
+        raise ValueError(f"census rename status for {name!r} differs from the raw diff")
+    if block.renamed_from is not None and block.renamed_from != entry.get("previous_filename"):
+        raise ValueError(f"census rename source for {name!r} differs from the raw diff")
 
 
 def reconcile_diff(raw: bytes, files: list[dict], *, timeout: float) -> None:
-    """Use Git's parser, reconciling every destination and textual line count."""
+    """Use Git's parser, then bind every block's header to the file census.
+
+    Git reconciles destinations and textual line counts; each block's header is
+    then checked for what those counts cannot see: mode pairs, a change payload,
+    blob identities and rename sources.
+    """
     output = _run(
         ["git", "-C", os.path.abspath(os.sep), "apply", "--numstat", "-z", "--allow-empty"],
         timeout=timeout,
         limit=MAX_METADATA,
         data=raw,
     )
-    actual = {}
     try:
         if output and not output.endswith(b"\0"):
             raise ValueError("unfinished numstat")
-        _check_mode_pairs(raw)
-        for record in output.split(b"\0")[:-1]:
+        records = output.split(b"\0")[:-1]
+        blocks = _blocks(raw)
+        if raw.strip() and not blocks:
+            raise ValueError("response is not a recognised patch")
+        if len(records) != len(blocks):
+            raise ValueError("Git patch records do not match the diff's file blocks")
+        expected = {item["filename"]: item for item in files}
+        if len(expected) != len(files):
+            raise ValueError("changed-file census repeats a path")
+        actual: dict[str, list] = {}
+        for record, block in zip(records, blocks, strict=True):
             added, removed, path = record.split(b"\t", 2)
-            name = path.decode("utf-8")
-            if name in actual:
-                raise ValueError("duplicate patch destination")
-            actual[name] = None if (added, removed) == (b"-", b"-") else (int(added), int(removed))
-        expected = {item["filename"]: (item["additions"], item["deletions"]) for item in files}
-        if len(expected) != len(files) or set(actual) != set(expected):
+            _check_block(block)
+            counts = None if (added, removed) == (b"-", b"-") else (int(added), int(removed))
+            actual.setdefault(path.decode("utf-8"), []).append((counts, block))
+        if set(actual) != set(expected):
             raise ValueError("changed-file census does not match raw diff")
-        if any(counts is not None and counts != expected[name] for name, counts in actual.items()):
-            raise ValueError("text change counts do not match raw diff")
-    except (ValueError, KeyError, TypeError, UnicodeError) as exc:
+        for name, pairs in actual.items():
+            entry = expected[name]
+            if len(pairs) == 2 and pairs[0][1].deleted and pairs[1][1].created:
+                # A type change (symlink to file) is a delete and a create of one path.
+                (old, _), (new, block) = pairs
+                counts = None if old is None or new is None else (old[0] + new[0], old[1] + new[1])
+            elif len(pairs) == 1:
+                counts, block = pairs[0]
+            else:
+                raise ValueError("duplicate patch destination")
+            if counts is not None and counts != (entry["additions"], entry["deletions"]):
+                raise ValueError("text change counts do not match raw diff")
+            _check_identity(name, block, entry)
+    except (ValueError, KeyError, TypeError, UnicodeError, IndexError) as exc:
         raise SourceError(f"incomplete PR diff: {exc}") from None
+
+
+def _no_constant(name: str):
+    raise ValueError(f"non-JSON constant {name}")  # Python accepts NaN/Infinity by default
 
 
 def _json(raw: bytes):
     from genesis.session_awareness.pr_recording import _no_duplicates
 
     try:
-        return json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicates)
+        return json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_no_duplicates, parse_constant=_no_constant
+        )
     except (ValueError, UnicodeError, RecursionError):
         raise SourceError("source metadata is not strict UTF-8 JSON") from None
 
@@ -215,7 +318,9 @@ def _file(data: object) -> dict:
             result["previous_filename"] = previous
         if result["status"] == "renamed" and previous is None:
             raise ValueError("rename lacks previous filename")
+        # Every retained string must encode before save_packet reserves a destination.
         result["filename"].encode("utf-8")
+        result["status"].encode("utf-8")
         if previous is not None:
             previous.encode("utf-8")
         return result

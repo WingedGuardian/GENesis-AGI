@@ -17,11 +17,27 @@ all file destinations and rename sources, and SHA-256 digests of body, diff and
 canonical file metadata. Metadata reads before and after acquisition must agree.
 The file census is paginated and reconciled with GitHub's reported denominator;
 Git's patch parser checks every destination and textual addition/deletion count.
-A file header holding only one of `old mode`/`new mode` is refused, because
-Git's count still reports that path. A mode pair lost whole from a block that
-also changes content cannot be detected from the diff, so a mode claim needs
-tree evidence or a stated evidence gap. Binary entries retain their blob identity; binary content still needs independent
-inspection or a stated evidence gap.
+Its counts cannot see a block's header, so each `diff --git` block is also
+checked against the census:
+- a header holding only one of `old mode`/`new mode` is refused, and so is an
+  `index` line without its mode suffix when no mode pair, create or delete
+  explains it (Git omits the suffix only then, so this betrays a stripped pair);
+- malformed `index` ids are refused;
+- a content change (differing `index` ids) with neither a hunk nor a binary
+  marker is refused, because Git counts a cut-off binary change as 0/0;
+- the census blob id must match the post-image id (the pre-image for a removed
+  file). This mapping was measured on 111 files across six merged PRs;
+- a rename must name the census's previous path;
+- a symlink replaced by a file (a delete block plus a create block for one
+  path) counts as one census entry;
+- a nonempty response with no patch block is refused.
+
+A block with no `index` line (a pure rename, a mode-only change) has no id to
+compare, so a mode pair stripped from a pure rename stays undetectable from the
+diff. The type-change census mapping (status, blob, summed counts) is
+inferred from Git's output rather than measured against GitHub; a mismatch there
+refuses rather than accepts. A copy's `copy from` source is not compared. Binary
+content still needs independent inspection or a stated evidence gap.
 
 Acquisition refuses incomplete, changing, unavailable, invalid UTF-8 or oversized
 sources. It has a 120-second overall deadline, an 8 MiB raw diff bound, a 4 MiB

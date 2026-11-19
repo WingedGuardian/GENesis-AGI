@@ -1,11 +1,15 @@
 """Source packets must account for every PR path before they can be reviewed."""
 
+import hashlib
 import subprocess
 
 import httpx
 import pytest
 
 from genesis.session_awareness.pr_verification_sources import SourceError, reconcile_diff
+
+# The blob id of "after\n", which patch() writes as the post-image.
+AFTER_BLOB = hashlib.sha1(b"blob 6\0after\n").hexdigest()
 
 
 def patch(tmp_path):
@@ -23,6 +27,8 @@ def patch(tmp_path):
             "user.email=fixture@example.test",
             "-c",
             "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "-qm",
             "fixture",
@@ -84,7 +90,7 @@ def source_fixture(tmp_path):
         base=dict(sha="c" * 40),
     )
     entries = [
-        dict(filename="ordinary.txt", additions=1, deletions=1, status="modified", sha="d" * 40)
+        dict(filename="ordinary.txt", additions=1, deletions=1, status="modified", sha=AFTER_BLOB)
     ]
     replies = [
         json.dumps(metadata).encode(),
@@ -248,6 +254,8 @@ def test_real_git_binary_mode_and_rename_paths(tmp_path):
             "user.email=fixture@example.test",
             "-c",
             "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "-qm",
             "binary fixture",
@@ -266,7 +274,12 @@ def test_real_git_binary_mode_and_rename_paths(tmp_path):
         [
             dict(filename="binary.dat", additions=0, deletions=0),
             dict(filename="mode.sh", additions=0, deletions=0),
-            dict(filename="renamed\tline\n雪.txt", additions=0, deletions=0),
+            dict(
+                filename="renamed\tline\n雪.txt",
+                additions=0,
+                deletions=0,
+                previous_filename="ordinary.txt",
+            ),
         ],
         timeout=5,
     )
@@ -515,3 +528,145 @@ def test_json_rejects_non_utf8(raw):
 
     with pytest.raises(SourceError, match="UTF-8"):
         _json(raw)
+
+
+def committed(tmp_path, files):
+    """A repo whose one commit holds *files* (name -> bytes, or a symlink target)."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    for name, value in files.items():
+        if isinstance(value, tuple):
+            (tmp_path / name).symlink_to(value[0])
+        else:
+            (tmp_path / name).write_bytes(value)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "-c", "user.name=F", "-c", "user.email=f@example.test"]
+        + ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
+        + ["commit", "-qm", "base"],
+        check=True,
+    )
+
+
+def blob(data: bytes) -> str:
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def test_binary_change_cut_after_its_index_line_is_refused(tmp_path):
+    # Git counts such a block 0/0, the same as GitHub's census for a binary file.
+    committed(tmp_path, {"b.dat": b"\x00old\xff"})
+    (tmp_path / "b.dat").write_bytes(b"\x00new\xff")
+    raw = subprocess.check_output(["git", "-C", str(tmp_path), "diff"])
+    files = [
+        dict(
+            filename="b.dat", additions=0, deletions=0, status="modified", sha=blob(b"\x00new\xff")
+        )
+    ]
+    reconcile_diff(raw, files, timeout=5)
+    cut = b"\n".join(raw.split(b"\n")[:2]) + b"\n"
+    with pytest.raises(SourceError, match="no hunk or binary marker"):
+        reconcile_diff(cut, files, timeout=5)
+
+
+def test_symlink_replaced_by_a_file_is_one_census_entry(tmp_path):
+    committed(tmp_path, {"link": ("target",)})
+    (tmp_path / "link").unlink()
+    (tmp_path / "link").write_bytes(b"text\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    raw = subprocess.check_output(["git", "-C", str(tmp_path), "diff", "--cached"])
+    assert raw.count(b"diff --git a/link b/link") == 2
+    files = [
+        dict(filename="link", additions=1, deletions=1, status="modified", sha=blob(b"text\n"))
+    ]
+    reconcile_diff(raw, files, timeout=5)
+
+
+def rename_diff(tmp_path):
+    committed(tmp_path, {"legacy-a": b"same\n"})
+    subprocess.run(["git", "-C", str(tmp_path), "mv", "legacy-a", "current"], check=True)
+    return subprocess.check_output(["git", "-C", str(tmp_path), "diff", "--cached", "-M"])
+
+
+@pytest.mark.parametrize(
+    "entry, accepted",
+    [
+        (dict(status="renamed", previous_filename="legacy-a"), True),
+        (dict(status="renamed", previous_filename="legacy-b"), False),
+        (dict(status="added"), False),
+    ],
+)
+def test_rename_source_must_match_the_census(tmp_path, entry, accepted):
+    raw = rename_diff(tmp_path)
+    files = [dict(filename="current", additions=0, deletions=0, sha=blob(b"same\n"), **entry)]
+    if accepted:
+        reconcile_diff(raw, files, timeout=5)
+    else:
+        with pytest.raises(SourceError, match="rename"):
+            reconcile_diff(raw, files, timeout=5)
+
+
+@pytest.mark.parametrize("status", ["modified", "removed"])
+def test_census_blob_must_match_the_diff_index_line(tmp_path, status):
+    # Measured on six merged PRs: the census sha is the post-image blob, and the
+    # pre-image for a removed file.
+    committed(tmp_path, {"f.txt": b"before\n"})
+    if status == "removed":
+        (tmp_path / "f.txt").unlink()
+        counts, right = (0, 1), blob(b"before\n")
+    else:
+        (tmp_path / "f.txt").write_bytes(b"after\n")
+        counts, right = (1, 1), blob(b"after\n")
+    raw = subprocess.check_output(["git", "-C", str(tmp_path), "diff"])
+    entry = dict(filename="f.txt", additions=counts[0], deletions=counts[1], status=status)
+    reconcile_diff(raw, [entry | {"sha": right}], timeout=5)
+    with pytest.raises(SourceError, match="census blob"):
+        reconcile_diff(raw, [entry | {"sha": "f" * 40}], timeout=5)
+
+
+def test_nonempty_response_that_is_not_a_patch_is_refused():
+    reconcile_diff(b"", [], timeout=5)
+    with pytest.raises(SourceError, match="not a recognised patch"):
+        reconcile_diff(b"<html>an error page</html>\n", [], timeout=5)
+
+
+def test_json_refuses_non_json_constants():
+    from genesis.session_awareness.pr_verification_sources import _json
+
+    assert _json(b'{"extra": 1}') == {"extra": 1}
+    for constant in (b"NaN", b"Infinity", b"-Infinity"):
+        with pytest.raises(SourceError):
+            _json(b'{"extra": ' + constant + b"}")
+
+
+def test_unencodable_status_is_refused_before_any_destination(tmp_path):
+    from genesis.session_awareness.pr_verification_sources import _file
+
+    entry = dict(filename="f", status="modified", sha="a" * 40, additions=0, deletions=0)
+    assert _file(entry)["status"] == "modified"
+    with pytest.raises(SourceError):
+        _file(entry | {"status": "\ud800"})
+
+
+def test_mode_pair_stripped_whole_from_a_content_change_is_refused(tmp_path):
+    # Git leaves the mode off the index line only when a mode header (or a
+    # create or delete) explains it, so its absence betrays a stripped pair.
+    raw = mode_patch(tmp_path, content=True)
+    assert b"old mode 100644\n" in raw and b"new mode 100755\n" in raw
+    files = [
+        dict(filename="ordinary.txt", additions=1, deletions=1, status="modified", sha=AFTER_BLOB)
+    ]
+    reconcile_diff(raw, files, timeout=5)
+    stripped = raw.replace(b"old mode 100644\n", b"").replace(b"new mode 100755\n", b"")
+    with pytest.raises(SourceError, match="mode"):
+        reconcile_diff(stripped, files, timeout=5)
+
+
+@pytest.mark.parametrize("index", [b"index ..", b"index ..zz", b"index abc..def"])
+def test_malformed_index_ids_are_refused(tmp_path, index):
+    raw = patch(tmp_path)
+    lines = raw.split(b"\n")
+    lines[1] = index + b" 100644"
+    files = [
+        dict(filename="ordinary.txt", additions=1, deletions=1, status="modified", sha=AFTER_BLOB)
+    ]
+    with pytest.raises(SourceError):
+        reconcile_diff(b"\n".join(lines), files, timeout=5)
