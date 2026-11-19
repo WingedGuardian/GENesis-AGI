@@ -54,7 +54,7 @@ def edge(monkeypatch):
         if state.rc:
             return state.rc, "", "boom"
         body = (
-            state.grep_out if " -exec sh -c " in command else "".join(n + "\0" for n in state.names)
+            state.grep_out if " sh -c " in command else "".join(n + "\0" for n in state.names)
         )
         if not state.cut:
             body += f"\n{_MARKER.search(command)[1]} {state.status}\n"
@@ -224,16 +224,59 @@ async def test_a_directory_that_is_not_a_path_is_refused(edge, bad_dir):
     "query", ["budget", "a; rm -rf ~", "$(reboot)", "-e evil", "it's", '"$q" `id`', "a\x1cb"]
 )
 async def test_the_query_reaches_grep_as_one_fixed_string(edge, query):
+    """The query travels in the environment, never as an argument find or the
+    wrapper could parse; grep gets only the day's own names, after --."""
     await et._impl("search", "2026-11-14", query, 200)
+    assert len(edge.calls) == 2  # the day's listing, then grep over its names
     command = edge.calls[-1]
-    find_part = command.split("; ", 1)[1].split("; printf ")[0].lstrip("{ ")
-    argv = shlex.split(find_part)
-    i = argv.index("-exec")
-    assert argv[i + 1 : i + 4] == ["sh", "-c", et._GREP_WRAPPER]
-    assert argv[i + 4] == "sh" and argv[i + 5] == query and argv[i + 6 :] == ["{}", "+"]
-    assert argv[:2] == ["find", "."] and "-type" in argv  # regular files only
-    # Inside the wrapper the query is only ever the quoted "$q" after -e, then --.
-    assert 'grep -a -F -i -n -H -Z -C 2 -e "$q" -- "$@"' in et._GREP_WRAPPER
+    producer = command.split("; ", 1)[1].split("; printf ")[0].lstrip("{ ")
+    argv = shlex.split(producer)
+    assert argv[0] == "Q=" + query
+    assert argv[1:4] == ["sh", "-c", et._GREP_WRAPPER] and argv[4] == "sh"
+    assert argv[5:] == ["./20261114T150000_bbb_2.md", "./20261115T030000_ccc_3.md"]
+    assert 'grep -a -F -i -n -H -Z -C 2 -e "$Q" -- "$@"' in et._GREP_WRAPPER
+
+
+@pytest.mark.asyncio
+async def test_a_day_with_no_files_makes_no_grep_call(edge):
+    edge.names = ["20261114T040000_aaa_1.md", "notes.md"]
+    out = await et._impl("search", "2026-11-14", "x", 200)
+    assert len(edge.calls) == 1 and out["match_lines"] == 0 and out["complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_cut_listing_makes_the_search_incomplete(edge, monkeypatch):
+    real = edge.cfg
+    calls = []
+
+    async def remote(cfg, command, limit):
+        calls.append(command)
+        marker = re.compile(r"printf '\\n%s %s\\n' (\S+)").search(command)[1]
+        if " sh -c " in command:
+            return 0, f"./20261114T150000_bbb_2.md\x001:hit\n\n{marker} 0\n", ""
+        return 0, "20261114T150000_bbb_2.md\0", ""  # no marker: the listing was cut
+
+    monkeypatch.setattr(et, "_remote", remote)
+    out = await et._impl("search", "2026-11-14", "hit", 200)
+    assert real is edge.cfg and out["match_lines"] == 1
+    assert out["complete"] is False and "not searched" in out["incomplete"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("date", ["9999-12-31", "0001-01-01"])
+async def test_a_day_whose_bounds_cannot_be_represented_is_a_date_error(edge, date):
+    monkeypatch_tz = "Pacific/Kiritimati" if date.startswith("9999") else "Pacific/Pago_Pago"
+    import genesis.env
+
+    original = genesis.env.user_timezone
+    genesis.env.user_timezone = lambda: monkeypatch_tz
+    try:
+        for action in ("status", "list", "search"):
+            out = await et._impl(action, date, "x", 200)
+            assert out == {"error": "date is out of range"}
+    finally:
+        genesis.env.user_timezone = original
+    assert edge.calls == []
 
 
 @pytest.mark.asyncio
@@ -360,11 +403,24 @@ async def test_status_reads_the_inventory_under_its_own_cap(edge):
     assert f"| head -c {et._INVENTORY_CAP_BYTES}" in edge.calls[-1]
 
 
-def test_a_forged_marker_in_the_output_is_not_the_end_marker():
-    """The marker is random per call, so file text cannot end a read early."""
-    a = et._script("~/t", "true", 10, "__edge_transcripts_end_aa__")
-    assert "__edge_transcripts_end_aa__" in a
-    assert len({et._script("~/t", "true", 10, f"m{i}") for i in range(3)}) == 3
+@pytest.mark.asyncio
+async def test_a_forged_marker_in_the_output_is_not_the_end_marker(monkeypatch):
+    """The marker is random per call: output ending in another call's marker (or
+    one file text could carry) is an incomplete read, and only this call's own
+    marker completes it."""
+    seen = []
+
+    async def remote(cfg, command, limit):
+        seen.append(re.compile(r"printf '\\n%s %s\\n' (\S+)").search(command)[1])
+        forged = "__edge_transcripts_end_0000000000000000__"
+        mine = seen[-1] if len(seen) > 1 else forged
+        return 0, f"a\0b\0\n{mine} 0\n", ""
+
+    monkeypatch.setattr(et, "_remote", remote)
+    first = await et._run(None, "~/t", "true", sep="\0")
+    second = await et._run(None, "~/t", "true", sep="\0")
+    assert first.complete is False and second.complete is True
+    assert second.records == ["a", "b"] and seen[0] != seen[1]
 
 
 # --- the real remote script, run through a local shell ----------------------------
@@ -559,8 +615,11 @@ async def test_a_cancelled_call_leaves_no_child_process(monkeypatch):
 
     monkeypatch.setattr(et.asyncio, "create_subprocess_exec", spy)
     call = et.asyncio.ensure_future(et._remote(None, "exec sleep 30", 1000))
-    while not spawned:
-        await et.asyncio.sleep(0.01)
+    async with et.asyncio.timeout(10):  # a spawn failure ends the call, not the test
+        while not spawned and not call.done():
+            await et.asyncio.sleep(0.01)
+    if call.done():
+        await call  # surfaces the startup error instead of hanging
     await et.asyncio.sleep(0.1)
     call.cancel()
     with pytest.raises(et.asyncio.CancelledError):
@@ -569,3 +628,75 @@ async def test_a_cancelled_call_leaves_no_child_process(monkeypatch):
     assert proc.returncode is not None and proc.pid > 1  # a real child, never pid 1
     with pytest.raises(ProcessLookupError):  # the pid is gone, not just detached
         os.kill(proc.pid, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_cancellation_during_the_reap_still_waits_for_it(monkeypatch):
+    """A second cancellation that lands while the reap runs must not let the call
+    return with cleanup still going (review finding)."""
+    monkeypatch.setattr(et, "_ssh", lambda cfg: ["sh", "-c"])
+    real_reap = et._reap
+    reaping = et.asyncio.Event()
+    finished = []
+
+    async def slow_reap(proc, readers):
+        reaping.set()
+        await et.asyncio.sleep(0.3)
+        await real_reap(proc, readers)
+        finished.append(proc.returncode)
+
+    monkeypatch.setattr(et, "_reap", slow_reap)
+    call = et.asyncio.ensure_future(et._remote(None, "exec sleep 30", 1000))
+    await et.asyncio.sleep(0.2)
+    call.cancel()
+    async with et.asyncio.timeout(10):
+        await reaping.wait()
+    call.cancel()  # lands during the reap
+    with pytest.raises(et.asyncio.CancelledError):
+        await call
+    assert finished and finished[0] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query", [";", "{}", "{} +", "budget"])
+async def test_real_shell_find_syntax_in_a_query_is_just_text(local_edge, query):
+    (local_edge / "20261114T150000_bbb_2.md").write_text("x ; {} + budget\n")
+    out = await et._impl("search", "2026-11-14", query, 200)
+    assert out["complete"] is True and out["match_lines"] == 1, out
+
+
+@pytest.mark.asyncio
+async def test_real_shell_another_days_file_never_fills_the_cap(local_edge):
+    """A file outside the local day is never grepped, so however much it matches it
+    cannot push an in-day hit past the output cap (review finding)."""
+    big = "budget line\n" * (et._REMOTE_CAP_BYTES // 10)
+    (local_edge / "20261114T040000_aaa_1.md").write_text(big)  # 23:00 on the 13th
+    (local_edge / "20261114T150000_bbb_2.md").write_text("the budget\n")
+    out = await et._impl("search", "2026-11-14", "budget", 200)
+    assert out["complete"] is True and out["match_lines"] == 1
+    assert out["files_matched"] == ["20261114T150000_bbb_2.md"]
+
+
+@pytest.mark.asyncio
+async def test_real_shell_a_name_ending_in_a_newline_is_not_searched(local_edge):
+    (local_edge / "20261114T150000_bad.md\n").write_text("budget\n")
+    (local_edge / "20261114T160000_ok.md").write_text("budget\n")
+    out = await et._impl("search", "2026-11-14", "budget", 200)
+    assert out["files_matched"] == ["20261114T160000_ok.md"] and out["complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_real_shell_a_busy_day_is_searched_in_batches(local_edge, monkeypatch):
+    """One ssh argument is capped by the kernel, so many names go in several grep
+    calls, and every batch's hits come back (review finding: argument limit)."""
+    monkeypatch.setattr(et, "_ARG_BUDGET_BYTES", 40)  # about one name per batch
+    for minute in range(3):
+        (local_edge / f"20261114T15{minute:02d}00_f_{minute}.md").write_text("budget\n")
+    assert len(et._batches([f"20261114T15{m:02d}00_f_{m}.md" for m in range(3)])) == 3
+    out = await et._impl("search", "2026-11-14", "budget", 200)
+    assert out["complete"] is True and out["match_lines"] == 3 and len(out["files_matched"]) == 3
+
+
+def test_a_name_with_non_ascii_digits_is_not_a_transcript():
+    assert et._started("20261114T150000_ok.md") is not None
+    assert et._started("2026111٣T150000_x.md") is None

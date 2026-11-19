@@ -50,8 +50,8 @@ from genesis.mcp.health import mcp
 logger = logging.getLogger(__name__)
 
 # One file-name grammar, shared by the listing filter and the search-line parser.
-_NAME_BODY = r"(\d{8}T\d{6})[A-Za-z0-9_.-]*\.md"
-_NAME = re.compile(rf"^{_NAME_BODY}$")
+_NAME_BODY = r"([0-9]{8}T[0-9]{6})[A-Za-z0-9_.-]*\.md"  # ASCII digits: \d takes others
+_NAME = re.compile(rf"^{_NAME_BODY}\Z")  # \Z: "$" would also pass a trailing newline
 # The remote command runs find from inside the directory, and grep -Z ends the
 # file name with a NUL, so every line starts with exactly ``./<name>\0N:`` (a
 # match) or ``./<name>\0N-`` (context). A name cannot hold a NUL, so neither the
@@ -79,15 +79,19 @@ _RC_STDERR_OVER = -1003
 _LOCAL_SLACK_BYTES = 4096
 _STDERR_CAP_BYTES = 4096
 _MAX_QUERY_CHARS = 512
+# The names one grep call carries. The whole remote command is one ssh argument,
+# and Linux caps a single argument at 128 KiB, so a busy day is searched in batches.
+_ARG_BUDGET_BYTES = 65_536
 _DIR_MISSING = 3  # the remote guard's exit code: the directory cannot be entered
 # grep's own status is 1 for "no match"; this wrapper turns that into 0 and keeps
-# 2 (an unreadable file), so find's status is nonzero only for a real failure.
+# 2 (an unreadable file), so the status is nonzero only for a real failure.
 # -a reads every file as text: by default grep prints no lines from a file it takes
 # for binary (a NUL byte), so a match there would be dropped while the read reports
-# complete. -Z ends each file name with a NUL (see _GREP_LINE).
+# complete. -Z ends each file name with a NUL (see _GREP_LINE). The query comes in
+# the environment (``Q``), never as an argument another program could parse, and
+# the file names are the day's names, already checked against _NAME.
 _GREP_WRAPPER = (
-    'q=$1; shift; grep -a -F -i -n -H -Z -C 2 -e "$q" -- "$@"; s=$?;'
-    ' [ "$s" -eq 1 ] && s=0; exit "$s"'
+    'grep -a -F -i -n -H -Z -C 2 -e "$Q" -- "$@"; s=$?; [ "$s" -eq 1 ] && s=0; exit "$s"'
 )
 
 
@@ -149,8 +153,18 @@ async def _remote(cfg, command: str, limit: int) -> tuple[int, str, str]:
         return _RC_TIMEOUT, "", ""
     finally:
         if proc.returncode is None or pending:
-            # Shielded, so a cancellation of this call still finishes the reap.
-            await asyncio.shield(_reap(proc, pending))
+            # Shielded, so a cancellation of this call still finishes the reap, and
+            # waited for even when the cancellation lands during it (the reap is
+            # bounded), so the call never returns with the process still running.
+            reap = asyncio.ensure_future(_reap(proc, pending))
+            cancelled = False
+            while not reap.done():
+                try:
+                    await asyncio.shield(reap)
+                except asyncio.CancelledError:
+                    cancelled = True
+            if cancelled:
+                raise asyncio.CancelledError
 
     def text(name: str) -> str:
         task = readers[name]
@@ -196,12 +210,26 @@ def _tz() -> ZoneInfo:
     return ZoneInfo(user_timezone())
 
 
-def _local_day(day: str | None) -> date:
+def _local_day(day: str | None, tz: ZoneInfo) -> date:
     if day is None:
-        return datetime.now(_tz()).date()
-    if not _DATE.fullmatch(day):
+        found = datetime.now(tz).date()
+    elif not _DATE.fullmatch(day):
         raise ValueError("date must be YYYY-MM-DD")
-    return date.fromisoformat(day)  # rejects month 13, day 32 and the like
+    else:
+        found = date.fromisoformat(day)  # rejects month 13, day 32 and the like
+    _day_window(found, tz)  # a day whose bounds cannot be represented is refused here
+    return found
+
+
+def _day_window(day: date, tz: ZoneInfo) -> tuple[datetime, datetime]:
+    """The local day as an aware [start, end) pair."""
+    try:
+        start = datetime.combine(day, time.min, tzinfo=tz)
+        end = start + timedelta(days=1)
+        start.astimezone(UTC), end.astimezone(UTC)
+    except OverflowError:
+        raise ValueError("date is out of range") from None
+    return start, end
 
 
 def _started(name: str) -> datetime | None:
@@ -216,13 +244,12 @@ def _started(name: str) -> datetime | None:
         return None
 
 
-def _in_day(name: str, day: date) -> bool:
+def _in_day(name: str, day: date, tz: ZoneInfo | None = None) -> bool:
     started = _started(name)
     if started is None:
         return False
-    tz = _tz()
-    start = datetime.combine(day, time.min, tzinfo=tz)
-    return start <= started.astimezone(tz) < start + timedelta(days=1)
+    start, end = _day_window(day, tz or _tz())
+    return start <= started < end
 
 
 def _remote_path(directory: str) -> str:
@@ -240,11 +267,9 @@ def _remote_path(directory: str) -> str:
     raise ValueError("transcripts_dir must be an absolute or ~/ path")
 
 
-def _utc_prefixes(day: date) -> list[str]:
+def _utc_prefixes(day: date, tz: ZoneInfo | None = None) -> list[str]:
     """The UTC dates a local day touches, as file-name prefixes (one or two)."""
-    tz = _tz()
-    start = datetime.combine(day, time.min, tzinfo=tz).astimezone(UTC)
-    end = (datetime.combine(day, time.min, tzinfo=tz) + timedelta(days=1)).astimezone(UTC)
+    start, end = (t.astimezone(UTC) for t in _day_window(day, tz or _tz()))
     last = (end - timedelta(seconds=1)).date()
     days = {start.date(), last}
     return sorted(d.strftime("%Y%m%d") for d in days)
@@ -343,8 +368,9 @@ async def _impl(action: str, date_: str | None, query: str | None, max_lines: in
     directory = getattr(cfg, "transcripts_dir", None) if cfg else None
     if not cfg or not directory:
         return {"status": "not configured", "detail": "no transcripts_dir in ambient_remote.yaml"}
+    tz = _tz()  # read once, so selection and filtering use the same zone
     try:
-        day = _local_day(date_)
+        day = _local_day(date_, tz)
         _remote_path(directory)
         cap = max(1, min(int(max_lines), _MAX_LINES_CEILING))
     except (TypeError, ValueError) as exc:
@@ -358,7 +384,7 @@ async def _impl(action: str, date_: str | None, query: str | None, max_lines: in
         names = sorted(n for n in read.records if _started(n))
         result = {
             "day": day.isoformat(),
-            "files_that_day": sum(_in_day(n, day) for n in names),
+            "files_that_day": sum(_in_day(n, day, tz) for n in names),
             "latest": names[-1] if names else None,
             "total_files": len(names),
             "complete": read.complete,
@@ -373,33 +399,68 @@ async def _impl(action: str, date_: str | None, query: str | None, max_lines: in
         return result
     if action not in ("list", "search"):
         return {"error": "action must be status, list or search"}
-    prefixes = _utc_prefixes(day)
+    if action == "search":
+        refused = _query_problem(query)
+        if refused:
+            return {"error": refused}
+    listing = await _run(
+        cfg, directory, _find(_utc_prefixes(day, tz)) + " -printf '%f\\0'", sep="\0"
+    )
+    if listing.error:
+        return {"error": listing.error}
+    # Only names in the transcript grammar, inside the day: a malformed name (a
+    # newline in it, say) or another day's file never reaches grep or its cap.
+    names = sorted(n for n in listing.records if _in_day(n, day, tz))
+    cut = f"listing cut at {_REMOTE_CAP_BYTES} bytes: some files are missing"
     if action == "list":
-        read = await _run(cfg, directory, _find(prefixes) + " -printf '%f\\0'", sep="\0")
-        if read.error:
-            return {"error": read.error}
-        result = {
-            "day": day.isoformat(),
-            "complete": read.complete,
-            "files": sorted(n for n in read.records if _in_day(n, day)),
-        }
-        if not read.complete:
-            result["incomplete"] = (
-                f"listing cut at {_REMOTE_CAP_BYTES} bytes: some files are missing"
-            )
+        result = {"day": day.isoformat(), "complete": listing.complete, "files": names}
+        if not listing.complete:
+            result["incomplete"] = cut
         return result
+    return await _search(cfg, directory, day, tz, query, names, listing.complete, cap)
+
+
+def _query_problem(query: str | None) -> str | None:
     if not query or not query.strip():
-        return {"error": "search needs a query"}
+        return "search needs a query"
     if len(query) > _MAX_QUERY_CHARS:
-        return {"error": f"query is longer than {_MAX_QUERY_CHARS} characters"}
+        return f"query is longer than {_MAX_QUERY_CHARS} characters"
     if any(c in query for c in "\0\n\r"):
-        # grep reads a newline in -e as a second pattern; NUL cannot reach argv.
-        return {"error": "query must be one line with no NUL byte"}
-    grep = f"sh -c {shlex.quote(_GREP_WRAPPER)} sh {shlex.quote(query)}"
-    read = await _run(cfg, directory, _find(prefixes) + f" -exec {grep} {{}} +")
-    if read.error:
-        return {"error": read.error}
-    lines = [ln for ln in read.records if _match_in_day(ln, day)]
+        # grep reads a newline in -e as a second pattern; NUL cannot reach the env.
+        return "query must be one line with no NUL byte"
+    return None
+
+
+def _batches(names: list[str]) -> list[list[str]]:
+    """The quoted ``./<name>`` arguments, in batches under the argument budget."""
+    batches: list[list[str]] = []
+    size = 0
+    for name in names:
+        arg = shlex.quote(_GREP_PREFIX + name)
+        if not batches or size + len(arg) + 1 > _ARG_BUDGET_BYTES:
+            batches.append([])
+            size = 0
+        batches[-1].append(arg)
+        size += len(arg) + 1
+    return batches
+
+
+async def _search(cfg, directory, day, tz, query, names, listed_all, cap) -> dict:
+    """grep the day's own files only, named one by one after ``--``."""
+    head = f"Q={shlex.quote(query)} sh -c {shlex.quote(_GREP_WRAPPER)} sh "
+    lines: list[str] = []
+    complete = True
+    for batch in _batches(names):
+        part = await _run(cfg, directory, head + " ".join(batch))
+        if part.error:
+            return {"error": part.error}
+        lines += [ln for ln in part.records if _match_in_day(ln, day, tz)]
+        if not part.complete:
+            complete = False  # the output cap cut this batch: the result is incomplete
+            break
+        if len(lines) > cap:
+            break  # past the line cap already, which the result reports
+    read = _Read(None, [], complete)
     kept = lines[:cap]
     result = {
         "day": day.isoformat(),
@@ -410,8 +471,12 @@ async def _impl(action: str, date_: str | None, query: str | None, max_lines: in
         # One block, one boundary: the kept lines, shown as ``./<name>:N:text``
         # (a match) or ``./<name>:N-text`` (context).
         "matches": _wrap("\n".join(_shown(ln) for ln in kept)) if kept else "",
-        "complete": read.complete,
+        "complete": read.complete and listed_all,
     }
+    if not listed_all:
+        result["incomplete"] = (
+            f"listing cut at {_REMOTE_CAP_BYTES} bytes: some files were not searched"
+        )
     if len(lines) > cap or not read.complete:
         result["complete"] = False
         why = "remote output hit the size cap" if not read.complete else "line cap reached"
@@ -427,11 +492,11 @@ def _shown(line: str) -> str:
     return line.replace("\0", ":", 1).replace("\0", "\ufffd")
 
 
-def _match_in_day(line: str, day: date) -> bool:
+def _match_in_day(line: str, day: date, tz: ZoneInfo | None = None) -> bool:
     """A grep -H line from a file in the day: the name is read from the line's
     fixed prefix only, never from its text."""
     match = _GREP_LINE.match(line)
-    return bool(match) and _in_day(match[1], day)
+    return bool(match) and _in_day(match[1], day, tz)
 
 
 def _wrap(text: str) -> str:
@@ -454,7 +519,11 @@ async def edge_transcripts(
     query: str | None = None,
     max_lines: int = 200,
 ) -> dict:
-    """Date + text lookup over transcripts on the edge device, in one call; nothing is stored.
+    """Date + text lookup over transcripts on the edge device, in one call.
+
+    The edge store is read in place: nothing is synced or copied off the device.
+    The lines a search returns are an ordinary tool result, so they enter this
+    session's history (and anything that keeps it) like any other.
 
     Refused to Genesis-dispatched sessions with no owner attending (background and
     gateway sessions) and to builder-slot sessions. Search text comes back as one

@@ -1417,3 +1417,18 @@ def test_edge_transcripts_cannot_be_re_enabled_via_tool_exceptions(profile):
     )
     inv = runner._build_invocation(req, "test-session")
     assert _EDGE_TRANSCRIPTS in inv.disallowed_tools
+
+
+def test_an_overlay_profile_without_the_universal_list_still_denies_edge_transcripts(
+    monkeypatch,
+):
+    """An overlay profile can be registered without _UNIVERSAL_DISALLOW; the deny is
+    added whatever the profile lists (review finding)."""
+    from genesis.cc import direct_session as ds
+
+    monkeypatch.setitem(PROFILES, "overlay-bare", ["Bash"])
+    monkeypatch.setattr(ds, "VALID_PROFILES", frozenset(PROFILES))
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="t", profile="overlay-bare", model=CCModel.SONNET)
+    inv = runner._build_invocation(req, "test-session")
+    assert _EDGE_TRANSCRIPTS in inv.disallowed_tools and "Bash" in inv.disallowed_tools

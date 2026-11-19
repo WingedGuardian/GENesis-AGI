@@ -2073,6 +2073,10 @@ class DirectSessionRunner:
             # them, so no exception may re-grant them either.
             exceptions -= set(_NO_EDGE_TRANSCRIPTS)
             disallowed = [t for t in disallowed if t not in exceptions]
+        # An install-local overlay profile may be registered without
+        # _UNIVERSAL_DISALLOW, so the edge transcript deny is added here whatever
+        # the profile lists; the tool's own server-side refusal still backs it.
+        disallowed += [t for t in _NO_EDGE_TRANSCRIPTS if t not in disallowed]
 
         # Give background sessions access to Genesis MCP servers. Profile
         # determines which servers (see module-level _PROFILE_TO_MCP, which
