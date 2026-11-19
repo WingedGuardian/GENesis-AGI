@@ -4,12 +4,12 @@
    its fragments: percent-decoded, split on whitespace and ``: / @ ? & = # ; ,``,
    with host names, URL schemes and ports left out. Its password, token or key
    is a probe of its own.
-2. The body header ``[reference.credentials] {identifier}`` is checked by the
-   identifier rule only when it is exactly the header for the concept;
-   anything else is checked strictly.
-3. A caller tag that carries the value is dropped whole (from the tags and the
-   body's Tags line); the write goes on (owner ruling 1817a5c4). The
-   identifier, header and metadata still refuse.
+2. The body header is rebuilt from the (masked) identifier; any other first
+   line is part of the held-out description.
+3. A caller tag keeps its text with the value's spans masked (strictly); a
+   tag that was nothing but the value is dropped. The identifier is masked
+   too, and the caller's metadata is held with the value; nothing refuses the
+   write (#2426 PR A).
 
 Corpus: the round-3 premise check's 12 fake leaks and 11 realistic accepts.
 Fake credentials and example.org hosts only, never real secrets.
@@ -95,7 +95,8 @@ _ACCEPTS = [
         [],
     ),
     ("identifier names the login", "ForumUser42 / Fk9!pass77", "github ForumUser42", [], []),
-    ("tag names the login", "ForumUser42 / Fk9!pass77", "github", ["forum"], ["ForumUser42"]),
+    # A username is never masked, in any field (owner ruling 2026-11-18).
+    ("tag names the login", "ForumUser42 / Fk9!pass77", "github", ["forum", "ForumUser42"], []),
     (
         "tag query flag",
         "https://api.example.org/v1?api_key=Qk8fakeKEY99&region=us-east-1",
@@ -141,6 +142,7 @@ async def _write(db, store, value, identifier, tags, *, header=None):
         body,
         concept=identifier,
         tags_json=json.dumps(["reference", "credentials", *tags]),
+        held_value=value,  # as reference_store passes it
     )
 
 
@@ -155,23 +157,22 @@ async def _indexed(db, store, unit) -> list[str]:
 
 
 @pytest.mark.parametrize(("name", "value", "leak", "where"), _LEAKS, ids=[c[0] for c in _LEAKS])
-async def test_every_leak_is_refused_or_its_tag_dropped(db, name, value, leak, where):
+async def test_every_leak_is_masked_or_its_tag_dropped(db, name, value, leak, where):
     store = _PointStore()
     if where == "identifier":
-        with pytest.raises(ValueError, match="identifier"):
-            await _write(db, store, value, f"pg {leak}", [])
-        return
-    if where == "header":
-        # A first line that is not the standard header gains it above, and the
-        # caller's own line is held with the description: indexed nowhere.
+        unit = await _write(db, store, value, f"pg {leak}", [])
+        assert ro.display_name(await kc.get(db, unit)) == "pg [held]"
+    elif where == "header":
+        # A header that is not the one for the concept is held with the description.
         unit = await _write(db, store, value, "pg", [], header=f"pg {leak}")
-        for text in await _indexed(db, store, unit):
-            assert leak not in text, (name, text)
-        return
-    unit = await _write(db, store, value, "svc", [leak, "keep-me"])
+        assert (await ro.reveal_reference(db, await kc.get(db, unit)))[1].startswith(
+            f"[reference.credentials] pg {leak}"
+        )
+    else:
+        unit = await _write(db, store, value, "svc", [leak, "keep-me"])
+        assert json.loads((await kc.get(db, unit))["tags"]) == ["reference", "credentials", "keep-me"]
     for text in await _indexed(db, store, unit):
         assert leak not in text, (name, text)
-    assert json.loads((await kc.get(db, unit))["tags"]) == ["reference", "credentials", "keep-me"]
 
 
 async def test_a_secret_that_reads_as_a_word_is_matched_only_whole(db):
@@ -208,19 +209,23 @@ async def test_a_mismatched_header_is_held_never_indexed(db):
         assert "Fk9!pass77" not in text, text
     row = await kc.get(db, unit)
     assert row["body"].split("\n", 1)[0] == "[reference.credentials] forum ForumUser42"
+    assert "other" not in row["body"]
     composed, missing = await ro.compose_body(db, row)
     assert not missing and "other ForumUser42 Fk9!pass77" in composed
     assert await _write(db, store, value, "forum ForumUser42", []) == unit
 
 
-async def test_a_login_in_the_tags_trailer_is_dropped_not_refused(db):
+async def test_a_login_in_the_tags_trailer_is_kept(db):
+    """Round-3 M-2, superseded by the owner ruling 2026-11-18: a username is
+    never masked, in any field, so a tag that is the login stays; the password
+    never reaches the body."""
     store = _PointStore()
     body = _body("forum", "ForumUser42 / Fk9!pass77", ["ForumUser42", "forum"])
-    unit = await _ingest(db, store, body, concept="forum")
+    # Round 3: the Tags line is built from tags_json, never from the body.
+    unit = await _ingest(db, store, body, concept="forum", tags_json=json.dumps(["ForumUser42", "forum"]))
     stored = (await kc.get(db, unit))["body"]
-    assert stored.endswith("\nTags: forum")
-    assert "ForumUser42" not in stored
-    assert ro.DETAIL_PLACEHOLDER in stored
+    assert stored.endswith("\nTags: ForumUser42, forum")
+    assert "Fk9!pass77" not in stored
 
 
 @pytest.mark.parametrize(
@@ -230,11 +235,11 @@ async def test_a_login_in_the_tags_trailer_is_dropped_not_refused(db):
         ("provenance", {"provenance": {"source_doc": "notes Demo%40Fake123"}}),
     ],
 )
-async def test_metadata_still_refuses(db, field, kwargs):
+async def test_metadata_is_masked(db, field, kwargs):
     store = _PointStore()
-    with pytest.raises(ValueError, match=field):
-        await _ingest(db, store, _body("pg", _PG, []), concept="pg", **kwargs)
-    assert store.calls == []
+    unit = await _ingest(db, store, _body("pg", _PG, []), concept="pg", **kwargs)
+    assert all("Demo@Fake123" not in str(call) and "Demo%40Fake123" not in str(call) for call in store.calls)
+    assert "Fake123" not in str((await kc.get(db, unit)).values())
 
 
 @pytest.mark.parametrize(
@@ -249,29 +254,4 @@ async def test_metadata_still_refuses(db, field, kwargs):
 def test_xml_pipe_backslash_and_fullwidth_separators_split_the_value(value):
     """Security review MEDIUM (round 3): these separators were not in the split
     set, so a tag holding the bare secret passed."""
-    with pytest.raises(ValueError):
-        ro.refuse_value_in_fields(value, {"tags": "Zq8vLm2x"})
-
-
-@pytest.mark.parametrize(
-    ("value", "name"),
-    [
-        ("bob@example.com / pw9x!", "Gmail example.com"),
-        ("bob@example.com / pw9x!", "Gmail account example.com"),
-        ("admin / Wifi Password 2024", "Wifi backup 2024"),
-        ("https://portal.example.org/login?year=2024&x=abc", "Portal 2024 login"),
-        ("host=db.example.org port=5432 pass=Zx9#kq", "postgres 5432"),
-        ("host=db.example.org port=5432 pass=Zx9#kq", "db.example.org staging"),
-        ("ssh://git@github.com/org/repo.git", "repo.git deploy key"),
-        ("https://example.com/users/12345/profile", "user 12345"),
-        ("login: bob@example.com pass: Abc12345", "example.com mail"),
-        ("my pin is 4821 and port 8080", "Server port 8080"),
-    ],
-)
-def test_the_refusal_check_is_unchanged_for_ordinary_writes(value, name):
-    """Round-2 fix audit H2: the masks' wider probes (secret parts, digit runs)
-    never reach the refusal check, so this PR alone refuses no ordinary write
-    the committed head accepted: an identifier naming a domain, a year or a
-    port is no refusal."""
-    ro.refuse_value_in_fields(value, {"identifier": name}, login_exempt=True)
-    ro.refuse_value_in_fields(value, {"identifier": name, "header": f"[reference.credentials] {name}"}, login_exempt=True)
+    assert ro.mask_value_spans(value, "tag Zq8vLm2x") == "tag [held]"

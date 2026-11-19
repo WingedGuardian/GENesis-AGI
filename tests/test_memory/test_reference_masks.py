@@ -101,16 +101,21 @@ def test_a_short_mixed_token_with_punctuation_in_prose_is_masked():
     assert named.mask("Hello! there") == "Hello! there"
 
 
-def test_the_refusal_check_keeps_mains_spacing():
-    """CodeRabbit round 3: masking reads a whitespace run as one space, but main's
-    refusal check compares as main does, so an identifier spacing a multi-word
-    value another way is still accepted there (this PR changes no refusal)."""
+def test_the_name_hash_keeps_mains_form():
+    """CodeRabbit round 3: masking drops format characters before NFKC and reads
+    a whitespace run as one space, but the name hash of a credential keeps the
+    form the stored hashes were written with (#4749), so an existing entry is
+    still found by its name."""
     from genesis.memory import reference_ops
 
-    value = "correct horse battery staple"
-    reference_ops.refuse_value_in_fields(value, {"identifier": "correct  horse battery staple"})
-    _strict, named = rm.value_masks(value)
+    name = "acct Fake9worde\u200d\u0301"
+    # The hash main computes for this name, taken from main, not from the code under test.
+    assert reference_ops.name_hash(name) == "34bd0ad8afe3aadc89423690ceee1184ca0bcd78ef9304a0919dc0c717b9e028"
+    assert rm._refusal_form(name) != rm._normalise(name).strip()
+    _strict, named = rm.value_masks("correct horse battery staple")
     assert named.mask("correct  horse battery staple") == "[held]"
+
+
 def test_a_percent_encoded_value_is_masked_whole():
     strict, _named = rm.value_masks("Demo@Fake123!")
     assert strict.mask("x Demo@Fake123! y") == "x [held] y"
@@ -182,11 +187,12 @@ def test_the_prose_exemption_is_decided_by_each_probes_source():
     assert named.mask("router Sunny-2024") == "router Sunny-2024"
 
 
-def test_only_the_identifier_exempts_the_login_of_a_login_value():
+def test_no_field_masks_the_login_of_a_login_value():
+    """The identifier and the tags alike (owner ruling 2026-11-18: a username is never masked, in any field, whatever the password contains)."""
     strict, named = rm.value_masks("admin9x / Pw9fake!x")
     assert named.mask("admin9x router") == "admin9x router"
     assert named.mask("Pw9fake!x") == "[held]"
-    assert strict.mask("admin9x") == "[held]"
+    assert strict.mask("admin9x") == "admin9x"
 
 
 # ─── caps ────────────────────────────────────────────────────────────────────
@@ -413,7 +419,8 @@ def test_no_masked_field_carries_a_secret_part(position, form):
     [
         ("bob / hunter", "bob hunter box", "bob [held] box"),
         ("bob / 4821", "bob 4821", "bob [held]"),
-        ("admin / admin", "admin router", "[held] router"),
+        # A secret half equal to its login: the username wins (owner ruling 2026-11-18).
+        ("admin / admin", "admin router", "admin router"),
         # A plain-word URL password is the stated limit (owner ruling 2026-11-17).
         ("postgres://app:hunter@db.example.com/prod", "prod hunter db", "prod hunter db"),
     ],
@@ -428,13 +435,45 @@ def test_a_plain_secret_part_masks_in_the_identifier_and_a_tag(value, field, mas
     ("value", "field"),
     [("admin9x / admin9x", "admin9x"), ("admin9x / admin9x!", "admin9x!")],
 )
-def test_a1_a_secret_half_equal_to_its_login_is_masked(value, field):
+def test_a1_a_secret_half_equal_to_its_login_stays_visible(value, field):
+    """Superseded by the owner ruling 2026-11-18: a username is never masked, in any field, whatever the password contains: where the password IS the username, the
+    username wins; a password that only contains it is still masked whole."""
     strict, named = rm.value_masks(value)
-    assert named.mask(field) == "[held]"
-    assert strict.mask(field) == "[held]"
-    assert rm.mask_value_spans(value, field, login_exempt=True) == "[held]"
+    expected = field if field == value.partition(" / ")[0] else "[held]"
+    assert named.mask(field) == expected
+    assert strict.mask(field) == expected
     _strict, named = rm.value_masks("NewPw9!x", also=(("other9x / other9x", None),))
-    assert named.mask("other9x") == "[held]"
+    assert named.mask("other9x") == "other9x"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "admin9x / Fake9!pw",
+        "login: admin9x / Fake9!pw",
+        "username: admin9x password: Fake9!pw",
+        "user admin9x pass Fake9!pw",
+        "https://admin9x:Fake9!pw@db.example.org/x",
+        "email admin9x@example.org password: Fake9!pw",
+    ],
+)
+def test_a_username_is_never_masked_in_any_format(value):
+    """The owner ruling 2026-11-18: a username is never masked, in any field, whatever the password contains: every form that names a username (the login half, a label,
+    a credential-pair email, a URL userinfo user) leaves it visible in every
+    field, and the password is masked."""
+    strict, named = rm.value_masks(value)
+    for mask in (strict, named):
+        assert mask.mask("acct admin9x x") == "acct admin9x x"
+        assert mask.mask("t Fake9!pw y") == "t [held] y"
+
+
+def test_a_password_holding_the_username_is_masked_whole():
+    """And the other way round: the password is masked whatever the username
+    contains, so a password that holds the username is masked whole."""
+    strict, named = rm.value_masks("admin9x / admin9x@Blue")
+    for mask in (strict, named):
+        assert mask.mask("acct admin9x x") == "acct admin9x x"
+        assert mask.mask("x admin9x@Blue y") == "x [held] y"
 
 
 @pytest.mark.parametrize(
@@ -716,3 +755,62 @@ def test_a_partly_encoded_value_longer_than_the_window_masks_the_field():
     )
     strict, _named = rm.value_masks(words)
     assert strict.mask("x " + words.replace("charlie", "ch%61rlie") + " y") == "[held]"
+
+
+
+# ─── CodeRabbit round 3 on #4769 (and #4770 round 4, fixed here) ─────────────
+
+
+def test_a_fullwidth_percent_escape_is_decoded():
+    """CodeRabbit 4620924900: a fullwidth escape is an escape once normalised."""
+    mask = rm.ValueMask("Ab1!fake")
+    assert mask.mask("lab Ab1\uff0521fake") == "lab [held]"
+    assert mask.mask("lab Ab1%21fake") == "lab [held]"
+
+
+def test_a_shorter_held_value_never_keeps_a_longer_encoded_one_visible():
+    """CodeRabbit 4620881413: encoded-run minimality is decided per secret, so
+    an overlapping shorter held value and a second encoded secret leave no
+    encoded word of the longer one visible."""
+    strict, _named = rm.value_masks(
+        "red fox token9", also=(("fox token9", "", False), ("blue sky Q9x", "", False))
+    )
+    masked = strict.mask("r%65d fox token9 and bl%75e sky Q9x")
+    assert "r%65d" not in masked and "bl%75e" not in masked and "token9" not in masked
+
+
+def test_a_value_spelling_the_tags_label_keeps_the_callers_tags():
+    """CodeRabbit 4620924929: a span inside the rendered "Tags: " frame is the
+    frame, so a value "tags" drops no tag but itself."""
+    strict, _named = rm.value_masks("tags")
+    assert rm.clean_tag_runs(strict, ["portal"], str, "Tags: ", "") == ["portal"]
+
+
+
+# ─── fix audit of the username rule (round 3 on #4769) ───────────────────────
+
+
+@pytest.mark.parametrize(
+    ("value", "field"),
+    [
+        ("https://user:Fake9pw@db.example.com/app", "prod db pw Fake9pw"),
+        ("db-user: Fake9pw x", "tag Fake9pw"),
+        ("login: admin:Fake9!pw", "acct Fake9!pw"),
+        ("user admin:Fake9!pw", "acct Fake9!pw"),
+        ("login Fake9!pw", "acct Fake9!pw"),
+    ],
+)
+def test_a_username_label_never_exempts_a_password(value, field):
+    """Fix audit C1/H1/M2: a label inside a URL or a word is no username label,
+    a username ends before ":" or "@", and a bare-space label is a username
+    only before a password label; a secret part is never exempted unless it IS
+    the username whole."""
+    strict, named = rm.value_masks(value)
+    for mask in (strict, named):
+        assert "[held]" in mask.mask(field) and "Fake9" not in mask.mask(field)
+
+
+def test_a_password_equal_to_its_username_stays_visible():
+    """Owner ruling 2026-11-18: where the password IS the username, the username wins."""
+    strict, named = rm.value_masks("alice / alice")
+    assert strict.mask("alice router") == named.mask("alice router") == "alice router"
