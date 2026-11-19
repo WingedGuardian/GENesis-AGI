@@ -420,6 +420,17 @@ def parse_evidence(obj: object) -> EvidenceDocument:
     return _validate(EvidenceDocument, obj, "evidence")
 
 
+def stored_evidence_json(doc: EvidenceDocument) -> str:
+    """The exact text both close writers store, and the bytes their size cap measures.
+
+    ensure_ascii=False: the escaped form spends up to 12 bytes on one non-ASCII
+    character, which would refuse an honest document for its alphabet.
+    """
+    import json
+
+    return json.dumps(doc.model_dump(mode="json"), indent=2, sort_keys=True, ensure_ascii=False)
+
+
 class RecheckResult(BaseModel):
     """One re-measurement of a closed row's event-gated gap, as ``recheck`` reads it.
 

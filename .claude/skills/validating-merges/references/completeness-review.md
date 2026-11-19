@@ -135,8 +135,12 @@ The operator attaches the actual completed report at candidate top-level
 
 The check writes nothing. Missing, failed, stale or inconsistent reports refuse
 with exit `2`; a changed inventory, source, policy or semantic evidence field
-requires a current review. All raw/canonical evidence, including the report,
-must fit the existing 256 KiB cap; nothing is truncated. Short report text is
+requires a current review. All raw evidence, and the indented form both close
+writers store, including the report, must fit the existing 256 KiB cap; nothing
+is truncated. When the derived verdict closes, the check also applies the
+writers' E2E coverage rule, even for a document you will record with `--park`
+or whose tracking is incomplete. There the check is stricter than the writers;
+map each declared step to a claim or a gap index. Short report text is
 bounded to 4,096 characters, item/reference collections to 3,000. Large sources
 stay in the private packet; the packet reader accounts for JSON escaping before
 rechecking the original source limits and complete Git census.

@@ -486,7 +486,7 @@ def test_canonical_defaults_also_count_toward_the_evidence_cap(tmp_path, monkeyp
     assert len(canonical) > len(raw)
     path.write_bytes(raw)
     monkeypatch.setattr(review, "MAX_REVIEW_BYTES", len(raw))
-    with pytest.raises(SourceError, match="canonical evidence"):
+    with pytest.raises(SourceError, match="stored evidence"):
         review.load_evidence(path)
 
 
@@ -576,3 +576,51 @@ def test_report_metadata_is_excluded_only_at_the_top_level(tmp_path):
     raw["completeness"]["review_id"] = "other-synthetic-review"
     raw["completeness"]["review_execution_ref"] = "fixture-only:still-no-model"
     assert evidence_sha256(parse_evidence(raw)) == original
+
+
+def test_closing_evidence_missing_an_e2e_mapping_is_inconsistent(tmp_path):
+    # Both close writers run check_e2e_coverage on a closing verdict; the
+    # offline check must refuse what they would refuse.
+    from genesis.session_awareness.pr_completeness import assess_completeness
+
+    raw, source = reviewed(tmp_path)
+    raw["e2e"] = []
+    refresh(raw)
+    assessment = assess_completeness(parse_evidence(raw), source)
+    assert not assessment.valid and assessment.status == "inconsistent"
+    assert "E2E coverage" in assessment.reason
+
+
+def test_non_closing_evidence_needs_no_e2e_mapping(tmp_path):
+    # The writers skip the E2E check when nothing closes; so does the checker.
+    from genesis.session_awareness.pr_completeness import assess_completeness
+    from genesis.session_awareness.pr_evidence import decide
+
+    raw, source = reviewed(tmp_path)
+    raw["claims"][0]["verdict"] = "fail"
+    raw["e2e"] = []
+    refresh(raw)
+    decision = decide(parse_evidence(raw))
+    assert not getattr(decision, "closing", False)
+    assessment = assess_completeness(parse_evidence(raw), source)
+    assert assessment.valid and assessment.status == "verified"
+
+
+def test_evidence_cap_uses_the_writers_stored_serialization(tmp_path, monkeypatch):
+    # A document whose compact form fits but whose stored (indented) form does
+    # not would pass the check and then be refused by both writers.
+    from genesis.session_awareness import pr_completeness as review
+    from genesis.session_awareness.pr_evidence import stored_evidence_json
+    from genesis.session_awareness.pr_verification_sources import canonical_json
+
+    doc = parse_evidence(candidate())
+    compact = len(canonical_json(doc.model_dump(mode="json")).encode())
+    stored = len(stored_evidence_json(doc).encode("utf-8"))
+    assert compact < stored
+    path = tmp_path / "candidate.json"
+    path.write_text(json.dumps(candidate(), separators=(",", ":")))
+    monkeypatch.setattr(review, "MAX_REVIEW_BYTES", stored - 1)
+    with pytest.raises(SourceError, match="stored evidence"):
+        review.load_evidence(path)
+    monkeypatch.setattr(review, "MAX_REVIEW_BYTES", stored)
+    assert review.load_evidence(path).repo == "owner/repo"

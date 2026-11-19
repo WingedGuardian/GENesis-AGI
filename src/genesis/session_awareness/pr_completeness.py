@@ -300,6 +300,26 @@ def _check_reviews(review, doc):
         raise SourceError("every declared control needs a linked independent audit")
 
 
+def _closing_e2e_refusal(doc: EvidenceDocument, snapshot: PrSourceSnapshot) -> str | None:
+    """The close writers' E2E coverage rule, applied where they apply it.
+
+    Both writers run ``check_e2e_coverage`` only on a closing decision
+    (``validator_writes.py``, ``scripts/pr_verification.py``). Offline, the
+    decision is the document's derived verdict with no caller inputs, so this
+    is stricter than the writers in two cases, never looser: a validator who
+    records with ``park`` (a derived pass-with-measured-gaps becomes
+    cannot-verify), and incomplete tracking, which needs the database and makes
+    the writers record the row open (tracking-pending) without this rule.
+    """
+    from genesis.session_awareness.pr_evidence import Decision, check_e2e_coverage, decide
+
+    decision = decide(doc)
+    if not isinstance(decision, Decision) or not decision.closing:
+        return None
+    refusal = check_e2e_coverage(doc, snapshot.body)
+    return refusal.message if refusal is not None else None
+
+
 def assess_completeness(
     doc: EvidenceDocument, snapshot: PrSourceSnapshot
 ) -> CompletenessAssessment:
@@ -343,6 +363,9 @@ def assess_completeness(
             ):
                 raise SourceError(f"every evidence {name} entry needs a source inventory mapping")
         _check_reviews(review, doc)
+        refusal = _closing_e2e_refusal(doc, snapshot)
+        if refusal is not None:
+            return CompletenessAssessment(False, refusal, "inconsistent")
     except SourceError as exc:
         return CompletenessAssessment(False, str(exc), "inconsistent")
     except (ValueError, TypeError, KeyError, UnicodeError):
@@ -373,11 +396,13 @@ def load_inventory(path: Path) -> ReviewInventory:
 
 
 def load_evidence(path: Path) -> EvidenceDocument:
-    from genesis.session_awareness.pr_evidence import parse_evidence
+    from genesis.session_awareness.pr_evidence import parse_evidence, stored_evidence_json
 
     doc = parse_evidence(_load(path, MAX_REVIEW_BYTES))
-    if len(canonical_json(doc.model_dump(mode="json")).encode()) > MAX_REVIEW_BYTES:
-        raise SourceError("canonical evidence including review exceeds the byte limit")
+    # Measure what the close writers store, not the compact form: a document
+    # that fits only compact would pass here and then be refused at recording.
+    if len(stored_evidence_json(doc).encode("utf-8")) > MAX_REVIEW_BYTES:
+        raise SourceError("stored evidence including review exceeds the byte limit")
     return doc
 
 

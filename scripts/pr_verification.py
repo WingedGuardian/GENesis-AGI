@@ -155,6 +155,7 @@ from genesis.session_awareness.pr_evidence import (  # noqa: E402
     parse_recheck_result,
     reason_for,
     rechecks_for,
+    stored_evidence_json,
 )
 from genesis.session_awareness.pr_recording import (  # noqa: E402
     PrMetadata,
@@ -778,9 +779,9 @@ def main(
     # the canonical re-serialisation can be larger than the file, and checking only
     # the file would let an over-cap record into the column the cap exists to bound.
     # The CRUD enforces the same cap again, because it owns the column.
-    # ensure_ascii=False: the escaped form spends up to 12 bytes on one non-ASCII
-    # character, which would refuse an honest document for its alphabet.
-    payload = json.dumps(doc.model_dump(mode="json"), indent=2, sort_keys=True, ensure_ascii=False)
+    # stored_evidence_json is the one serialization the cap, the writers and the
+    # offline completeness check all measure.
+    payload = stored_evidence_json(doc)
     size = len(payload.encode("utf-8"))
     if size > MAX_EVIDENCE_BYTES:
         return _refuse(
