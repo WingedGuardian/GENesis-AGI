@@ -39,6 +39,12 @@ _RUNTIME_RELOAD_SCRIPTS=(
 # Read or run afresh on every use, so a new copy is live at once, no restart:
 _RUNTIME_FRESH_SCRIPTS=(
     scripts/disk_reclaim.py               # run by autonomy/remediation.py
+    scripts/cc-slot.sh                    # run by board/launcher (a systemd-run unit per launch)
+    scripts/premise_gate.py               # run by board/launcher/probes.py per Build move
+    scripts/cc_exit_capture.sh            # run in every cc-slot.sh pane when claude exits
+    scripts/slot_exec.sh                  # run by cc-slot.sh to give each claude its own scope
+    scripts/hooks/plan_doc.py             # imported by premise_gate.py
+    scripts/hooks/plan_premise_gate.py    # imported by premise_gate.py
     scripts/lib/live_checkout.py          # run by dashboard/routes/updates.py before an update
     scripts/lib/managed_units.py          # run by dashboard/routes/updates.py for the update status card
     scripts/lib/update_state_guard.py     # loaded by dashboard/routes/updates.py for /apply and the progress poll, and by observability/snapshots/deploy_health.py

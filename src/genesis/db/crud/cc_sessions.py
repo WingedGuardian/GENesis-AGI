@@ -1069,6 +1069,35 @@ async def update_extraction_watermark(
     return cursor.rowcount > 0
 
 
+async def get_lesson_built_through(db: aiosqlite.Connection, id: str) -> str | None:
+    """The ``tool_use_id`` of the last tool entry the lesson builder judged (#4807)."""
+    cursor = await db.execute("SELECT lesson_built_through FROM cc_sessions WHERE id = ?", (id,))
+    row = await cursor.fetchone()
+    return row[0] if row else None
+
+
+async def advance_lesson_built_through(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    expected: str | None,
+    new: str,
+) -> bool:
+    """Move the lesson builder's progress marker from ``expected`` to ``new``.
+
+    Compare-and-set: the update applies only while the stored value is still
+    ``expected``, so a second process running a cycle (a history-mining run
+    beside the server) cannot move the marker backwards. False when it did not
+    apply.
+    """
+    cursor = await db.execute(
+        "UPDATE cc_sessions SET lesson_built_through = ? WHERE id = ? AND lesson_built_through IS ?",
+        (new, id, expected),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def get_keywords(db: aiosqlite.Connection, id: str) -> str | None:
     """Get the keywords string for a session."""
     cursor = await db.execute(

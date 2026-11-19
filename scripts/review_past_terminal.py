@@ -23,8 +23,10 @@ the PR's commit graph (``live``) and a fix produced it (``advanced_by_fix``):
 some commit between the previous live round head and this head changes its
 tree and is not a merge with a parent outside the PR (a merge of main). A round
 a merge or an empty commit produced, or one on a head a force-push dropped,
-never ends fixing and never counts as a failed prediction; its numbering still
-counts every round. When the budget cannot tell whether a fix produced the
+never ends fixing, never counts as a failed prediction and never moves the PR
+toward the round-4 and round-5 thresholds, which count fix rounds only
+(``RoundRecord.rules_round``, owner ruling 2796375a). The budget's round number
+still counts every round, and the Prediction line names it. When the budget cannot tell whether a fix produced the
 newest such round, the rules are off for the PR (they fail toward main's
 behaviour); the newest round is never taken from an older one instead.
 
@@ -32,9 +34,15 @@ behaviour); the newest round is never taken from an older one instead.
 blocking``), for every rule (owner rulings 2922a1fd, 2fd36db6). It does not
 read ``off_diff``.
 
-The rules bind only rounds opened at or after ``PAST_TERMINAL_CUTOVER_ISO``.
-While it is None nothing binds: it is set once the review loop's commit-side end
-has deployed, so the reflection rules never run ahead of it.
+The review loop ends (``loop_ended``) once the newest round the rules read is
+round 5 or later and drew no floor finding, with no floor finding on any other
+round (a late one, or a round a merge produced), on a head still in the PR,
+since that round's head was committed. The commit gate then
+denies content commits, read from the budget alone (``_loop_end`` in
+scripts/review_enforcement_commit.py).
+
+The rules bind only rounds opened at or after ``PAST_TERMINAL_CUTOVER_ISO``;
+None binds nothing.
 """
 
 from __future__ import annotations
@@ -49,8 +57,9 @@ import review_reflection as rr
 
 #: The rules bind rounds opened from here on; None binds nothing. A round
 #: opened earlier keeps the rules it was answered under, so reflections already
-#: committed stay valid. It must lie after the deploy of the code that reads it.
-PAST_TERMINAL_CUTOVER_ISO: str | None = None
+#: committed stay valid. It lies about a day after the deploy of the code that
+#: reads it (owner 2fd36db6), so the installed copy is checked unbound first.
+PAST_TERMINAL_CUTOVER_ISO: str | None = "2026-11-19T16:00:00+00:00"
 #: The ordinary lane's terminal round is 4: the Prediction is owed from round 4
 #: on, the held judgement and the end of fixing from round 5.
 PREDICT_FROM = 4
@@ -72,6 +81,20 @@ class RoundRecord:
     findings: tuple[tuple[datetime | None, bool | None, str | None], ...]
     live: bool = True
     advanced_by_fix: bool | None = True
+    #: When its head commit was made (``commits[].committed_at``); None when
+    #: unreadable. The loop's end reads late floor findings from here on.
+    head_committed_at: datetime | None = None
+    #: How many rounds a fix provably produced on a live head, up to and
+    #: including this one (an unknown one is not counted, so an unreadable
+    #: tree never moves a PR toward a deny). The thresholds read this,
+    #: never ``number``: merge-of-main, empty-commit and dropped-head rounds do
+    #: not move a PR toward them (owner ruling 2796375a). None: ``number``.
+    fix_number: int | None = None
+
+    @property
+    def rules_round(self) -> int:
+        """The round number the round-4 and round-5 thresholds compare."""
+        return self.number if self.fix_number is None else self.fix_number
 
     @property
     def keys(self) -> set[str]:
@@ -182,7 +205,13 @@ def round_records(budget: Mapping[str, Any]) -> dict[str, RoundRecord] | None:
     numbered.sort(key=lambda pair: pair[1])
     graph, ancestors = review_late._ancestry(budget)
     advanced = _advanced(budget, numbered, graph, ancestors)
+    committed = {
+        row["sha"]: rr._parse_when(row.get("committed_at"))
+        for row in budget.get("commits") or []
+        if isinstance(row, Mapping) and isinstance(row.get("sha"), str)
+    }
     out: dict[str, RoundRecord] = {}
+    fixes = 0
     for head, number in numbered:
         found: list[tuple[datetime | None, bool | None, str | None]] = []
         for item in budget.get("findings") or []:
@@ -196,6 +225,8 @@ def round_records(budget: Mapping[str, Any]) -> dict[str, RoundRecord] | None:
             for key, level in zip(keys, levels, strict=True):
                 found.append((when, level if isinstance(level, bool) else None, key))
         live = head in graph
+        if live and advanced.get(head) is True:
+            fixes += 1  # an unknown fix never moves a PR toward a threshold
         out[head] = RoundRecord(
             head,
             number,
@@ -203,8 +234,45 @@ def round_records(budget: Mapping[str, Any]) -> dict[str, RoundRecord] | None:
             tuple(found),
             live=live,
             advanced_by_fix=advanced.get(head) if live else False,
+            head_committed_at=committed.get(head),
+            fix_number=fixes,
         )
     return out
+
+
+#: Every budget finding on a live head as ``(submitted_at, level, key)``, any round.
+Findings = tuple[tuple[datetime | None, bool | None, str], ...]
+
+
+def late_floor(budget: Mapping[str, Any]) -> Findings | None:
+    """Every finding in the budget on a head still in the PR's commit graph,
+    one row per key: its submitted time and its level as written (None when
+    unreadable). A finding on a head a force-push dropped is skipped before it
+    is read, as ``review_late.late_findings`` does, so an obsolete review
+    never reopens the loop. None when the findings list cannot be read, so
+    the loop's end is unknown (fails open)."""
+    findings = budget.get("findings")
+    if not isinstance(findings, list):
+        return None
+    in_graph, _ = review_late._ancestry(budget)
+    rows: list[tuple[datetime | None, bool | None, str]] = []
+    for item in findings:
+        if not isinstance(item, Mapping):
+            return None
+        head = item.get("head")
+        if not isinstance(head, str) or head not in in_graph:
+            continue
+        if not isinstance(item.get("keys"), list):
+            return None
+        keys = item["keys"]
+        levels = item.get("blocking")
+        if not isinstance(levels, list) or len(levels) != len(keys):
+            levels = [None] * len(keys)
+        when = rr._parse_when(item.get("submitted_at"))
+        for key, level in zip(keys, levels, strict=True):
+            name = "an unkeyed finding" if key is None else str(key)
+            rows.append((when, level if isinstance(level, bool) else None, name))
+    return tuple(rows)
 
 
 def _bound(record: RoundRecord, cutover: str | None) -> bool:
@@ -217,6 +285,11 @@ def next_round(records: Records, at: datetime) -> int:
     then, every round counted (a round with no opening time opened before)."""
     return 1 + sum(1 for r in records.values() if r.opened_at is None or r.opened_at <= at)
 
+
+#: The default cutover of ``problems``, ``loop_ended`` and ``rules_off_round``:
+#: the module constant at call time, so a test can pass ``None`` to mean "no
+#: cutover" whatever the constant says.
+_MODULE_CUTOVER: Any = object()
 
 #: ``newest_under_rules`` when the newest round's fix cannot be told.
 UNKNOWN = object()
@@ -248,9 +321,84 @@ def _past_terminal_pr(
     newest = newest_under_rules(records, at)
     if not isinstance(newest, RoundRecord):
         return None
-    if newest.number < PREDICT_FROM or not _bound(newest, cutover):
+    if newest.rules_round < PREDICT_FROM or not _bound(newest, cutover):
         return None
     return newest
+
+
+def _late_floor_open(newest: RoundRecord, late: Findings, at: datetime) -> list[str]:
+    """The keys of the open late floor findings: at the floor or unreadable,
+    not one of the newest round's keys, submitted from the newest round's head
+    commit up to ``at``. An unreadable submitted time, or an unreadable head
+    commit time, counts (fails open). Read from the budget alone."""
+    start = newest.head_committed_at
+    return sorted(
+        {
+            key
+            for when, level, key in late
+            if level is not False
+            and key not in newest.keys
+            and (when is None or start is None or start <= when <= at)
+        }
+    )
+
+
+def loop_ended(
+    records: Records | None,
+    late: Findings | None,
+    *,
+    gate_lane: bool,
+    now: datetime,
+    cutover: str | None | object = _MODULE_CUTOVER,
+) -> bool | None:
+    """Whether the review loop is over at ``now``, from the budget alone: the
+    PR is past round 4 under the rules, the newest round the rules read is
+    round 5 or later and drew no floor finding, and no late floor finding is
+    open. Round 4 never ends it. None when it cannot be told (a level or the
+    findings unreadable, the newest round's fix unknown): fails open. No
+    reflection is read."""
+    if cutover is _MODULE_CUTOVER:
+        cutover = PAST_TERMINAL_CUTOVER_ISO
+    if records is None or late is None:
+        return None
+    if not gate_lane and newest_under_rules(records, now) is UNKNOWN:
+        return None
+    newest = _past_terminal_pr(records, now, gate_lane, cutover)  # type: ignore[arg-type]
+    if newest is None or newest.rules_round < JUDGE_FROM:
+        return False
+    level, _ = newest.floor(now)
+    if level is not False:
+        return None if level is None else False
+    return not _late_floor_open(newest, late, now)
+
+
+def rules_off_round(
+    records: Records | None,
+    *,
+    gate_lane: bool,
+    now: datetime,
+    cutover: str | None | object = _MODULE_CUTOVER,
+) -> RoundRecord | None:
+    """The round where the rules switch off for the PR: the newest live round
+    whose fix is unknown, with no newer round the rules read before it, when it
+    is round 4 or later and opened at or after the cutover. None otherwise, so
+    nothing the rules would have read is lost."""
+    if cutover is _MODULE_CUTOVER:
+        cutover = PAST_TERMINAL_CUTOVER_ISO
+    if records is None or gate_lane:
+        return None
+    opened = [r for r in records.values() if r.opened_at is None or r.opened_at <= now]
+    for record in sorted(opened, key=lambda r: r.number, reverse=True):
+        if not record.live or record.advanced_by_fix is False:
+            continue
+        if (
+            record.advanced_by_fix is None
+            and record.rules_round + 1 >= PREDICT_FROM  # as if a fix produced it
+            and _bound(record, cutover)  # type: ignore[arg-type]
+        ):
+            return record
+        return None
+    return None
 
 
 def prediction_failures(records: Records, at: datetime, cutover: str | None) -> int:
@@ -260,18 +408,13 @@ def prediction_failures(records: Records, at: datetime, cutover: str | None) -> 
     level is not counted."""
     count = 0
     for record in records.values():
-        if record.number < JUDGE_FROM or not record.counts or not _bound(record, cutover):
+        if record.rules_round < JUDGE_FROM or not record.counts or not _bound(record, cutover):
             continue
         if record.opened_at is None or record.opened_at > at:
             continue
         if record.floor(at)[0] is True:
             count += 1
     return count
-
-
-#: ``problems``' default cutover: the module constant at call time, so a test
-#: can pass ``None`` to mean "no cutover" whatever the constant says.
-_MODULE_CUTOVER: Any = object()
 
 
 def problems(
@@ -323,7 +466,7 @@ def problems(
         found.append("two predictions past round 4 failed: the only decision left is 'send-back'")
     if (
         record is None
-        or record.number < JUDGE_FROM
+        or record.rules_round < JUDGE_FROM
         or not record.counts
         or not _bound(record, cutover)
     ):

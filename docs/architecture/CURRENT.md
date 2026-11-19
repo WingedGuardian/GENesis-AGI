@@ -297,7 +297,10 @@ Easy-to-forget mechanisms:
   not apply); `live` would apply new-pair merges via `merge_entity` unattended,
   but is FENCED (runs as `propose_only`, settings lever refuses it) until
   issue #2742 adds a merge-time check on durable pair state. A cursor-managed reconcile sweep
-  rediscovers historical fuzzy pairs. Settings lever `entity_adjudication`
+  rediscovers historical fuzzy pairs. Both fuzzy scans (the sweep and resolution's
+  `_closest`) run in a thread that keeps the GIL busy, so they go through
+  `entity_registry.fuzzy_ratio_at_least`, which skips pairs whose cheap difflib bounds
+  cannot reach the threshold (same matches, about 8x less CPU). Settings lever `entity_adjudication`
   (off/propose_only/live) + `GENESIS_ENTITY_ADJUDICATION_DISABLED`. Distinct from
   `memory/entity_resolution.py`, which is near-duplicate memory-PAIR dedup.
   **Human-approval apply gate** (`entity_adjudication_approve`/`_apply`/`_reject`
@@ -4005,7 +4008,22 @@ verified: 3f70a665b 2026-11-15
   shadow cap's count, so it rotates by time (the two files always hold the
   window) and drops a lesson that repeats one already recorded for the session.
   Queued rebuilds wait, unspent, until the mode is live; the drain scans past
-  capped sessions, so they never starve an eligible one.
+  capped sessions, so they never starve an eligible one. A second key,
+  `segment: whole | shadow | incremental` (shipped `shadow`), is the first half
+  of judging only what is new (#4807): `cc_sessions.lesson_built_through` holds
+  the `tool_use_id` of the last tool entry judged, and
+  `learning/procedural/build_segment.select_part` cuts the spine after it (by
+  position, since result timestamps are not monotonic; the spine parser keeps a
+  replayed call once, so ids are unique), leaving for later everything from an
+  unanswered call after the last user turn (parallel results can arrive out of
+  order) and fitting the rest to the judge's budget. The marker is read before
+  the parse and is the compare-and-set's expected value, and a reset whose old
+  id is still in the file holds, so an older or partial parse never moves it
+  back. In
+  shadow the whole session is still built; one `Lesson segment [shadow]` log
+  line per built session says what the new part would do, and the marker moves
+  by compare-and-set when the builder ran and the cap allowed. `incremental` is
+  not built yet and reads as shadow.
 - **eval/**: J9 = fire-and-forget emit hooks on live cognitive paths (the
   "cannot break production" contract — hooks must never raise) + weekly Sunday
   aggregation (hard 7-day window) + an on-demand batch judge as a surplus
@@ -6346,7 +6364,9 @@ around them. **What exists today:**
 - promotion of a private record onto the board;
 - the reconciler, which reads the board every tick and in `live` fills empty
   Status columns, adds missing open items and records promoted cards' ids,
-  and its two read tools.
+  and its two read tools;
+- the builder launcher, which starts one builder in a tmux slot for a card
+  moved to Build, once a hand edit has armed it (off by default).
 
 The bookkeeping move to In Review (#4400 Part 2), the Genesis status and the
 dashboard tab are follow-on work. The shipped mode is `off`.
@@ -6359,8 +6379,8 @@ dashboard tab are follow-on work. The shipped mode is `off`.
     own open totals, and counts cards by Status, Genesis field and kind, plus
     coverage: open tracker issues and PRs on the board against the repo's open
     total;
-  - logs one `drag` event per In Progress card per Status change, keyed
-    `item@<Status updatedAt>`. That value moves on a real Status change and on
+  - logs one `drag` event per In Progress or Build card per Status change
+    (detail `status` names the column), keyed `item@<Status updatedAt>`. That value moves on a real Status change and on
     nothing else (MEASURED 2026-10-04 on a private sandbox, with a control);
   - flags `observed_late` from the clock alone (older than one interval plus
     slack), never from stored state;
@@ -6384,6 +6404,9 @@ dashboard tab are follow-on work. The shipped mode is `off`.
     limit) stops the tick's writes; an error about one item skips that item.
     Outside `live` the summary carries would-write counts (`dry_run`) and
     nothing is written;
+  - then runs the builder launcher (below) on every tick except a failed pause
+    check, with the cards only from a good read; its summary is the
+    `launcher` block, and its error is a job failure;
   - ALWAYS emits a `board` heartbeat (DEBUG) carrying the summary, in every mode
     and while paused. So the pulse is not pause-gated and has no enable check,
     and in mode `off` it is effectively a learning-scheduler canary.
@@ -6392,6 +6415,51 @@ dashboard tab are follow-on work. The shipped mode is `off`.
   write failure records a failure too, with the read's counts and the writes
   already made kept. The step raises if the learning scheduler is
   missing or stopped, so the manifest names that cause instead of the board.
+- **Builder launcher** (`board/launcher/`, spec E ticket E3a). Armed only by
+  `builder_launch: {enabled: true}` (the literal) in `board.local.yaml`, on a
+  valid mode other than `off`; `settings_update` refuses the key. Only
+  `enabled: false`, the board's own `enabled: false` or the kill switch
+  disarms it for good: a session can set `mode: off` back to `propose_only`.
+  Each pass with the mode off records `launcher_disabled`, so setting it back
+  starts a new cutoff (cards already in Build are listed, never launched). The levers
+  beside it (`capacity` 1, `min_free_gb` 4, `login_margin_hours` 6,
+  `first_slot` 9) are range-checked (`config.builder_launch_settings`).
+  - Arming changes are recorded (`launcher_enabled` / `launcher_disabled`); a
+    move not later than the latest enable never launches (a disarm seen
+    mid-pass is recorded at once), and the cards in
+    Build at enable are listed to the owner once.
+  - For each card in Build in the tick's read, keyed `k = item@<Status
+    updatedAt>`: absorbs a move for an issue that already has a live builder;
+    HOLDS (`launch_queued`, keyed `k#q:<kind>`, one owner line per reason) on
+    capacity, free memory, a login expiring within the margin or unreadable,
+    a missing prompt template, slot script or builder guard
+    (`scripts/hooks/builder_guard.py` named in `.claude/settings.json`), or a
+    slot door refusal (retried only once the door's own capacity decision,
+    asked live, would admit);
+    REFUSES (`launch_refused`, final for k) a card that is not an open issue
+    in the tracker repo, an author outside OWNER / MEMBER / COLLABORATOR, an
+    edit after the move, incomplete premise checks
+    (`scripts/premise_gate.py check`, run with `GH_REPO`), or an open closing
+    PR. A failed read is retried next tick, never refused.
+  - Then: writes the body snapshot and the rendered `config/BUILDER_PROMPT.md`
+    under `~/.genesis/builders/<N>/`; records an approval row
+    (`builder_launch`, `costly_reversible`) resolved
+    `board:move:unattributed` (classified `unknown` on purpose) and consumed
+    BEFORE anything starts; writes `builder_launching` (slot, session id,
+    worktree, systemd unit); runs `scripts/cc-slot.sh launch` through
+    `systemd-run --user --wait`, which passes the door's exit code through
+    (MEASURED: 0, 64, 75). Up = a tmux session carrying the key:
+    `builder_launched`. Exit 75 is not a strike; other failures are
+    `launch_failed` strikes, and the third stops the move and tells the owner.
+    systemd stops the unit itself at `RuntimeMaxSec` (the launch timeout),
+    restart or not; an attempt a restart interrupted is settled from tmux and
+    the unit's state.
+  - Run state is derived, never read from events: a place is a live tmux
+    session carrying a key whose issue (`GENESIS_BUILDER_ISSUE`, pinned on that
+    session by the slot door) is neither CLOSED nor has an open closing PR, or a
+    running `genesis-builder-*` unit (`systemctl list-units`). A session with
+    no pinned issue holds its place; an issue whose card left the board is read
+    live. The host reads live in `board/launcher/probes.py`.
 - **`board_status`** reads the stored heartbeats only, never GitHub: the newest
   pulse (alive, mode, error) and the newest SUCCESSFUL read with its age,
   including that tick's `writes` block (None on a summary from before #4400).
@@ -6578,6 +6646,22 @@ verified: b67423bd 2026-10-03
 - **Do not:** write any card, column or status into a local table (the spec
   allows exactly these three stores), or make Genesis move a card into
   In Progress (only a human starts work).
+- **Builder guard** (`scripts/hooks/builder_guard.py`, PreToolUse on Bash;
+  spec E ticket E3e). A no-op unless `GENESIS_BUILDER_KEY` is set, which only
+  the slot door's builder launch sets. With it set it BLOCKS `gh pr merge`,
+  `gh pr review`, every API merge `gh_merge.api_merge_reason` refuses for any
+  session, review-thread replies (REST `.../comments/<id>/replies` or
+  `in_reply_to`) and the GraphQL `resolveReviewThread` /
+  `unresolveReviewThread` / `addPullRequestReviewThreadReply` mutations,
+  through `gh` or `curl` / `wget`. An unreadable command that names one of them
+  is refused. `curl` / `wget` fail closed: any word naming a merge, review,
+  review-comment or GitHub GraphQL endpoint is refused whatever the method, so
+  a builder reads those through `gh api`. Why a block: a reply under the owner's login clears a Codex P1
+  from the merge gate, and a builder carries no dispatched marker, so the
+  merge arm would let it merge once every machine gate is green. `gh pr
+  create`, `gh pr comment`, reads and `git push` are left to the other guards.
+  A broken `hook_input` blocks every session (the shared degraded contract);
+  any other failure blocks a builder only.
 - **Measured facts the follow-on PRs depend on** (2026-10-03, private sandbox
   project):
   - on this account, issue timelines carry NO `ProjectV2ItemStatusChangedEvent`,

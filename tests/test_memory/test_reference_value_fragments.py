@@ -251,3 +251,27 @@ def test_xml_pipe_backslash_and_fullwidth_separators_split_the_value(value):
     set, so a tag holding the bare secret passed."""
     with pytest.raises(ValueError):
         ro.refuse_value_in_fields(value, {"tags": "Zq8vLm2x"})
+
+
+@pytest.mark.parametrize(
+    ("value", "name"),
+    [
+        ("bob@example.com / pw9x!", "Gmail example.com"),
+        ("bob@example.com / pw9x!", "Gmail account example.com"),
+        ("admin / Wifi Password 2024", "Wifi backup 2024"),
+        ("https://portal.example.org/login?year=2024&x=abc", "Portal 2024 login"),
+        ("host=db.example.org port=5432 pass=Zx9#kq", "postgres 5432"),
+        ("host=db.example.org port=5432 pass=Zx9#kq", "db.example.org staging"),
+        ("ssh://git@github.com/org/repo.git", "repo.git deploy key"),
+        ("https://example.com/users/12345/profile", "user 12345"),
+        ("login: bob@example.com pass: Abc12345", "example.com mail"),
+        ("my pin is 4821 and port 8080", "Server port 8080"),
+    ],
+)
+def test_the_refusal_check_is_unchanged_for_ordinary_writes(value, name):
+    """Round-2 fix audit H2: the masks' wider probes (secret parts, digit runs)
+    never reach the refusal check, so this PR alone refuses no ordinary write
+    the committed head accepted: an identifier naming a domain, a year or a
+    port is no refusal."""
+    ro.refuse_value_in_fields(value, {"identifier": name}, login_exempt=True)
+    ro.refuse_value_in_fields(value, {"identifier": name, "header": f"[reference.credentials] {name}"}, login_exempt=True)
