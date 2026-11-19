@@ -1606,8 +1606,12 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   `git commit --allow-empty --cleanup=verbatim -F <file>`. A valid reflection commit
   is admitted without the round-approval ask. Then commit the fix. Rule R runs before
   the docs/config skip and before Rule 2, so a docs-only fix or `# review-override`
-  does not dodge it. What the reflection must cite comes from
-  `review_reflection.obligations()`:
+  does not dodge it. A reflection with any `fix-now` disposition also carries
+  `Alternative: <what already does or decides this>` (or `Alternative: none found:
+  searched <what>`), owed for reflections committed from
+  `review_reflection.ALTERNATIVE_CUTOVER_ISO` on; the next round's premise check
+  confirms or refutes that line (premise-check.md, step 5). What the reflection must
+  cite comes from `review_reflection.obligations()`:
 
   A finding that is not a defect uses `Disposition: c<ID> no-defect reply=<ID>`
   (a maintainer reply to that inline finding), or `Disposition: r<reviewID>:<count>
