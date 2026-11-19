@@ -29,6 +29,7 @@ from genesis.cc.types import model_name_supports_effort
 from genesis.guardian.briefing import read_guardian_briefing
 from genesis.guardian.collector import DiagnosticSnapshot
 from genesis.guardian.config import GuardianConfig
+from genesis.util.atomic import atomic_write_text
 from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 logger = logging.getLogger(__name__)
@@ -123,6 +124,31 @@ def _ensure_work_dir(configured: Path, fallback: Path | None = None) -> Path:
             "no usable CC work dir (alert-only degradation)"
         )
     return fallback
+
+
+def _cc_error_reason(stdout_text: str, stderr_text: str) -> str:
+    """Why a ``claude -p --output-format json`` run failed, from its own report.
+
+    Claude Code reports a failed run on STDOUT, in its JSON envelope
+    (``is_error``, ``result``, ``api_error_status``), and may leave stderr empty
+    (MEASURED 2026-11-18: an auth failure exits 1 with ``result`` "Failed to
+    authenticate. API Error: 401 ..." on stdout). Prefer that; fall back to
+    stderr. Bounded, so a page stays readable.
+    """
+    try:
+        env = json.loads(stdout_text)
+    except (json.JSONDecodeError, ValueError):
+        env = None
+    if isinstance(env, dict) and (env.get("is_error") or env.get("api_error_status")):
+        parts = [str(env.get("result") or "").strip()]
+        if env.get("api_error_status"):
+            parts.append(f"(api_error_status {env['api_error_status']})")
+        if env.get("terminal_reason"):
+            parts.append(f"[{env['terminal_reason']}]")
+        reason = " ".join(p for p in parts if p)
+        if reason:
+            return reason[:300]
+    return stderr_text.strip()[:300] or "no error reported on stdout or stderr"
 
 
 class CCDiagnosisError(Exception):
@@ -543,6 +569,14 @@ class DiagnosisEngine:
         # preventing unnecessary memory consumption from heavy MCP server
         # processes (codebase-memory-mcp, serena, gitnexus, etc.).
         no_mcp_config = work_dir / "config" / "no_mcp.json"
+        if not no_mcp_config.exists():
+            # The recovery brain needs only built-in tools. An install whose
+            # work dir never got this file let CC load every configured MCP
+            # server (seen on a live host), so write the empty config here.
+            try:
+                atomic_write_text(no_mcp_config, '{"mcpServers": {}}\n')
+            except OSError as exc:
+                logger.warning("could not write %s: %s", no_mcp_config, exc)
         # Emit --effort unless the model doesn't use one (Haiku). Unknown model
         # strings fall through to including it (best-effort; guardian defaults to
         # opus, which supports the full range).
@@ -607,17 +641,26 @@ class DiagnosisEngine:
             await reap_bounded(proc)
             raise
 
+        stdout_text = stdout.decode("utf-8", errors="replace")
         if proc.returncode != 0:
-            stderr_text = stderr.decode("utf-8", errors="replace")[:300]
+            reason = _cc_error_reason(
+                stdout_text, stderr.decode("utf-8", errors="replace"),
+            )
             logger.error(
-                "CC diagnosis exited with code %d: %s",
-                proc.returncode, stderr_text,
+                "CC diagnosis exited with code %d: %s", proc.returncode, reason,
             )
-            raise CCDiagnosisError(
-                f"CC exited with code {proc.returncode}: {stderr_text}"
-            )
+            raise CCDiagnosisError(f"CC exited with code {proc.returncode}: {reason}")
+        try:
+            envelope = json.loads(stdout_text)
+        except (json.JSONDecodeError, ValueError):
+            envelope = None
+        if isinstance(envelope, dict) and envelope.get("is_error"):
+            # A failed run can exit 0 and still report the error in its envelope.
+            reason = _cc_error_reason(stdout_text, "")
+            logger.error("CC diagnosis reported an error: %s", reason)
+            raise CCDiagnosisError(f"CC reported an error: {reason}")
 
-        result = self._parse_cc_response(stdout.decode("utf-8", errors="replace"))
+        result = self._parse_cc_response(stdout_text)
         if result is None:
             raise CCDiagnosisError(
                 "No valid JSON diagnosis found in CC response"
@@ -627,32 +670,26 @@ class DiagnosisEngine:
     async def _resolve_cc_env(self, cc_path: str) -> dict[str, str] | None:
         """Resolve the environment for the CC recovery-brain subprocess.
 
-        FALLBACK-ONLY setup-token injection. Returns ``None`` (inherit
-        ``os.environ`` — the ``create_subprocess_exec`` default, identical to
-        today's behavior) UNLESS a pre-flight ``claude auth status`` confirms the
-        host's own ``claude login`` is DEAD, in which case it injects the synced
-        ``CLAUDE_CODE_OAUTH_TOKEN`` so the brain can still authenticate.
+        Returns ``None`` (inherit ``os.environ``, the host's own ``claude
+        login``) only when a pre-flight ``claude auth status --json`` CONFIRMS
+        that login works (``loggedIn: true``). In every other case (logged
+        out, unknown, unparseable, timed out, or the probe failed) it injects
+        the synced ``CLAUDE_CODE_OAUTH_TOKEN`` when one exists.
 
-        The pre-flight runs with the SAME inherited env the real brain gets in
-        the no-token case, so ``loggedIn: true`` faithfully predicts the real
-        invocation. ``{**os.environ, ...}`` preserves every inherited key (the
-        brain relies on inherited provider keys — no env scrub), adding only the
-        token.
+        Why the default leans to the token (owner ruling 2026-11-18): the old
+        rule injected only on an explicit ``loggedIn: false`` and inherited on
+        any ambiguity. On a live host with no working login, a diagnosis run
+        right after a reboot did not inject and the brain failed to
+        authenticate, so the Guardian could only page "recovery failed". A
+        token that has gone stale is caught by the daily auth canary instead
+        of being discovered during an outage.
 
-        ⚠ Honest boundary: ``CLAUDE_CODE_OAUTH_TOKEN`` *overrides* a stored
-        login, so "never degrade a working login" rests on the pre-flight
-        reporting ``loggedIn`` correctly. On a FALSE ``loggedIn: false`` (login
-        actually fine) coinciding with a STALE synced token, we would inject and
-        the brain would fail onto the bad token — but that lands as the existing
-        ``CCDiagnosisError`` → ``cc_unavailable`` escalation (a clean fail-safe,
-        NOT silent brain death), only in that rare double-coincidence. We never
-        inject on ambiguity (unparseable / timeout / ``loggedIn`` unknown) nor
-        when no token exists. Never raises; never logs the token value.
-
-        Cost: one ~1-3s ``auth status`` call per diagnosis. Diagnosis fires only
-        when Genesis is DOWN (rare), so it is deliberately NOT cached — caching
-        would reintroduce the auth-staleness class this whole feature kills.
+        ``CLAUDE_CODE_OAUTH_TOKEN`` overrides a stored login, so a working
+        login is never overridden only because the probe confirmed it.
+        ``{**os.environ, ...}`` preserves every inherited key. Never raises;
+        never logs the token value.
         """
+        logged_in: bool | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 cc_path, "auth", "status", "--json",
@@ -671,38 +708,46 @@ class DiagnosisEngine:
             except TimeoutError:
                 kill_process_group(proc)
                 await reap_bounded(proc)
-                return None  # ambiguous → inherit; fail-safe covers a real outage
+                stdout = b""
             except asyncio.CancelledError:
                 kill_process_group(proc)
                 await reap_bounded(proc)
                 raise
             try:
-                logged_in = json.loads(
-                    stdout.decode("utf-8", errors="replace"),
-                ).get("loggedIn")
-            except (json.JSONDecodeError, ValueError, AttributeError, TypeError):
-                # Unparseable, or valid-but-non-object JSON (null/true/[] → no
-                # .get) → treat as ambiguity, never inject.
-                return None
-            if logged_in is not False:
-                # True (login works) or None (unknown) → inherit, never inject.
-                return None
-            # Host login is dead → inject the synced fallback token if present.
+                parsed = json.loads(stdout.decode("utf-8", errors="replace"))
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict) and isinstance(parsed.get("loggedIn"), bool):
+                logged_in = parsed["loggedIn"]
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("CC auth pre-flight failed; treating login as unconfirmed", exc_info=True)
+
+        if logged_in is True:
+            return None  # confirmed working login: never override it
+        try:
             from genesis.guardian.credential_bridge import load_cc_oauth_token
 
             token = load_cc_oauth_token(self._config.state_dir).get(
                 "CLAUDE_CODE_OAUTH_TOKEN",
             )
-            if not token:
-                return None  # no fallback → inherit; cc_unavailable fail-safe fires
-            logger.warning(
-                "Host `claude login` reports logged-out — injecting the synced "
-                "setup-token as this diagnosis's fallback (token value not logged).",
-            )
-            return {**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": token}
         except Exception:
-            logger.debug("CC auth pre-flight failed; inheriting env", exc_info=True)
+            logger.warning("could not read the synced setup-token", exc_info=True)
+            token = None
+        if not token:
+            logger.warning(
+                "Host `claude login` is %s and no synced setup-token exists; the "
+                "diagnosis runs with the inherited environment.",
+                "logged out" if logged_in is False else "unconfirmed",
+            )
             return None
+        logger.warning(
+            "Host `claude login` is %s — injecting the synced setup-token for this "
+            "diagnosis (token value not logged).",
+            "logged out" if logged_in is False else "unconfirmed",
+        )
+        return {**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": token}
 
     def _parse_cc_response(self, raw: str) -> DiagnosisResult | None:
         """Parse the CC response into a DiagnosisResult.

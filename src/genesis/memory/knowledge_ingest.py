@@ -66,6 +66,10 @@ class StoredId(str):
 
     concept: str
     name: str | None
+    #: The keys of the entries a value-less write's name matched when it could
+    #: not tell them apart (a card-redacted name): it was stored as a new entry,
+    #: and the caller passes ``entry_key`` to update one of these instead.
+    candidates: tuple[str, ...] = ()
 
 
 async def ingest_knowledge_unit(
@@ -223,6 +227,7 @@ async def _ingest_once(
     if (project or "").strip().lower() == reference_ops.REFERENCE_PROJECT:
         project = reference_ops.REFERENCE_PROJECT
     secret_value: str | None = None
+    candidates: tuple[str, ...] = ()
     secret_detail: str | None = None
     secret_meta: str | None = None
     observed: knowledge_crud.KeyObservation | None = None
@@ -346,7 +351,8 @@ async def _ingest_once(
             write_identity, tags_json,
         ) = plan.fields()
         # The unit's own metadata is neutral: the caller's is in the secret row.
-        provenance = {"source_pipeline": pipeline if pipeline in _PIPELINES else "knowledge_ingest"}
+        known = isinstance(pipeline, str) and pipeline in _PIPELINES
+        provenance = {"source_pipeline": pipeline if known else "knowledge_ingest"}
         authority = "credential"
         purpose = ingestion_source = relationships = caveats = None
     elif held_value is not None:
@@ -417,6 +423,9 @@ async def _ingest_once(
                 # An untrusted write of the credential an untrusted entry
                 # already holds, decided under the lock.
                 return plan.same
+            # The entries a value-less carded write could have meant, from the
+            # read the plan stands on (it was stored as a new entry).
+            candidates = _ambiguous(list(plan.seen), name_read[1], carded=carded, insert_only=insert_only)
         # Decided under the lock too, against the observation the
         # compare-and-swap commits against.
         held_by = await knowledge_crud.check_credential_write(
@@ -427,7 +436,7 @@ async def _ingest_once(
         if insert_only and held_by is not None:
             # The key already holds this very value: nothing to write, and no
             # vector to store beside the one the unit already names.
-            return _stored(held_by, resolved_concept, name)
+            return _stored(held_by, resolved_concept, name, candidates)
         if observed is not None:
             # The observation is the predecessor the compare-and-swap commits
             # against, so its point is the one this write really displaces.
@@ -532,7 +541,7 @@ async def _ingest_once(
             if insert_only and not inserted:
                 # The key was taken, with this value, between the check and the
                 # write: the unit is unchanged, and so is the point it names.
-                return _stored(actual_id, resolved_concept, name)
+                return _stored(actual_id, resolved_concept, name, candidates)
         finally:
             # After EVERY attempt (success, CredentialKeyTaken, a trigger's refusal,
             # a cancellation, any error): a point this write created that no unit
@@ -583,13 +592,14 @@ async def _ingest_once(
             "ingested" if inserted else "updated",
             project, domain,
         )
-        return _stored(actual_id, resolved_concept, name)
+        return _stored(actual_id, resolved_concept, name, candidates)
 
 
-def _stored(unit_id: str, concept: str, name: str | None = None) -> StoredId:
+def _stored(unit_id: str, concept: str, name: str | None = None, candidates: tuple[str, ...] = ()) -> StoredId:
     stored = StoredId(unit_id)
     stored.concept = concept
     stored.name = name
+    stored.candidates = candidates
     return stored
 
 
@@ -625,6 +635,10 @@ async def _resolve_by_name(
     trusted = [e for e in entries if e.name_origin == origin]
     if carded:
         trusted = [e for e in trusted if value is None or e.value == value]
+    if carded and value is None and len(trusted) > 1:
+        # A value-less write cannot tell carded entries of one name apart: it is
+        # a new entry, never an update of the wrong one (owner 2026-11-18).
+        return None, identity, entries
     target = next((e for e in trusted if e.name_hash), None) or next(iter(trusted), None)
     return target, identity, entries
 
@@ -794,6 +808,21 @@ async def _credential_plan(
         None, tuple(entries), observed, content, secret_value, secret_detail, secret_meta,
         concept, name, write_identity, tags_json,
     )
+
+
+def _ambiguous(
+    entries: list[knowledge_crud.CredentialEntry], value: str | None, *, carded: bool, insert_only: bool,
+) -> tuple[str, ...]:
+    """The keys a value-less carded write could have meant (``_resolve_by_name``
+    then stores it as a new entry), or ()."""
+    from genesis.memory import reference_ops
+
+    if insert_only or not carded or value is not None:
+        return ()
+    carded = [e.concept for e in entries if e.name_origin == reference_ops.CARDED]
+    # Only opaque keys are named: a key stored before them is a raw name.
+    keys = tuple(k for k in carded if reference_ops.OPAQUE_KEY.fullmatch(k or ""))
+    return keys if len(carded) > 1 else ()
 
 
 async def _mint_key(

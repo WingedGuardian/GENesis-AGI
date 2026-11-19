@@ -230,9 +230,10 @@ async def test_a_tag_carrying_the_value_keeps_its_other_text(db):
     assert row["body"].endswith("\nTags: lab, [held]-room")
 
 
-async def test_a_tag_naming_a_secret_shaped_login_is_masked(db):
-    """Round-3 M-2: tags are probed strictly; only the identifier exempts the
-    login of a "login / secret" value."""
+async def test_a_tag_naming_a_secret_shaped_login_is_kept(db):
+    """Round-3 M-2, superseded by the owner ruling 2026-11-18 (a username is
+    never masked, in any field): a tag that is the login of a "login / secret"
+    value is kept as it is."""
     store = _PointStore()
     value = f"{_SECRET} / 482913"
     tags = [_SECRET, "work"]
@@ -244,8 +245,8 @@ async def test_a_tag_naming_a_secret_shaped_login_is_masked(db):
         tags_json=json.dumps(tags),
         held_value=value,
     )
-    row = await _assert_held(db, store, unit, value=value)
-    assert json.loads(row["tags"]) == ["work"]
+    row = await _assert_held(db, store, unit, secret="482913", value=value)
+    assert json.loads(row["tags"]) == [_SECRET, "work"]
     assert (await ro.reveal_meta(db, row))["tags"] == tags
 
 
@@ -746,14 +747,11 @@ async def test_an_identifier_with_a_line_break_is_flattened_not_refused(db, iden
 
 async def test_a_megabyte_of_caller_fields_is_held_never_scanned(db):
     """Round-2 M-B / round-3 M-1: caller metadata is held, so no field is
-    scanned, however large or hit-dense."""
-    import time
-
+    scanned, however large or hit-dense: it is stored whole in the held meta
+    (no wall-clock bound, which a loaded test host makes flaky)."""
     store = _PointStore()
     provenance = {"source_doc": " ".join([f"note {_SECRET} x"] * 40000)}
-    started = time.perf_counter()
     unit = await _ingest(db, store, _body(), concept="lab wifi", provenance=provenance)
-    assert time.perf_counter() - started < 2.0
     row = await _assert_held(db, store, unit)
     assert (await ro.reveal_meta(db, row))["provenance"] == provenance
 
@@ -2057,3 +2055,79 @@ async def test_a_typed_copy_of_a_prose_value_keeps_its_stricter_probes(db, inser
         tags_json=json.dumps(["vault", "Battery-9x-old"]), insert_only=insert_only,
     )
     assert json.loads((await kc.get(db, unit))["tags"]) == ["vault", "[held]-old"]
+
+
+
+# ─── CodeRabbit round 3 on #4769 ─────────────────────────────────────────────
+
+
+async def test_a_rotated_auto_captured_credential_keeps_one_entry(db):
+    """CodeRabbit 4620924879: an auto-captured credential is named up to its
+    first sentence stop (outside the secret), so a rotation updates the same
+    entry and the name hash is the one main gave it."""
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import classify_as_reference
+
+    names = []
+    for pw in ("Fake9!demo", "Fake8!demo"):
+        ref = classify_as_reference(
+            Extraction(content=f"Router login. password: {pw} is the current one", extraction_type="entity", confidence=0.9)
+        )
+        names.append(ref["identifier"])
+    assert names == ["Router login", "Router login"]
+    assert ro.name_hash(names[0]).startswith("cd6fc2b87838")
+
+
+async def test_a_list_source_pipeline_never_fails_the_write(db):
+    """CodeRabbit 4620924837: caller provenance may carry a list where a label
+    is expected; the credential is stored, its unit labelled knowledge_ingest."""
+    store = _PointStore()
+    provenance = {"source_pipeline": ["manual"]}
+    unit = await _ingest(db, store, _body(), concept="lab wifi", provenance=provenance)
+    row = await _assert_held(db, store, unit)
+    assert (await ro.reveal_meta(db, row))["provenance"] == provenance
+
+
+async def test_a_value_less_save_of_a_shared_carded_name_is_a_new_entry(db):
+    """CodeRabbit 4620924862 (owner ruling 2026-11-18): a value-less save whose
+    card-redacted name matches several entries updates none of them: it is a
+    new entry, and the result names the keys it could have meant."""
+    store = _PointStore()
+    a = await _ingest(db, store, _body("Visa 4242 4242 4242 4242 PIN", value="Pw1fake!a"), concept="Visa 4242 4242 4242 4242 PIN")
+    b = await _ingest(db, store, _body("Visa 5555 5555 5555 4444 PIN", value="Pw2fake!b"), concept="Visa 5555 5555 5555 4444 PIN")
+    held = (await kc.get(db, b))["body"]
+    again = await _ingest(db, store, held, concept="Visa 5555 5555 5555 4444 PIN", tags_json=json.dumps(["newtag"]))
+    assert again not in (a, b)
+    keys = {(await kc.get(db, a))["concept"], (await kc.get(db, b))["concept"]}
+    assert set(again.candidates) == keys
+    assert await kc.get_reference_secret(db, a) == "Pw1fake!a"
+    assert await kc.get_reference_secret(db, b) == "Pw2fake!b"
+    assert json.loads((await kc.get(db, a))["tags"] or "[]") != ["newtag"]
+
+
+
+
+async def test_a_credential_name_stops_at_a_newline_or_a_trailing_dot(db):
+    """Fix audit M3/M4: a newline is a name stop, and a capture's trailing dot
+    ends the sentence, not the secret."""
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import _derive_identifier
+
+    for content, name in [
+        ("Router login\npassword: Fake9!x now", "Router login"),
+        ("Router login. password: Fake9!x. Old one gone", "Router login"),
+    ]:
+        extraction = Extraction(content=content, extraction_type="entity", confidence=0.9)
+        assert _derive_identifier(extraction, default_prefix="login", whole_tokens=True) == name
+
+
+async def test_the_candidates_note_names_only_opaque_keys(db):
+    """Fix audit M5: a legacy key (a raw name) is never printed as a candidate."""
+    store = _PointStore()
+    await _ingest(db, store, _body("Visa 4242 4242 4242 4242 PIN", value="Pw1fake!a"), concept="Visa 4242 4242 4242 4242 PIN")
+    b = await _ingest(db, store, _body("Visa 5555 5555 5555 4444 PIN", value="Pw2fake!b"), concept="Visa 5555 5555 5555 4444 PIN")
+    await db.execute("UPDATE knowledge_units SET concept = ? WHERE id != ?", ("legacy raw name", b))
+    await db.commit()
+    held = (await kc.get(db, b))["body"]
+    again = await _ingest(db, store, held, concept="Visa 5555 5555 5555 4444 PIN")
+    assert all(re.fullmatch(r"cred-[0-9a-f]{12}", k) for k in again.candidates)

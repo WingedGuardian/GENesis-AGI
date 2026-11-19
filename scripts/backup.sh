@@ -264,7 +264,7 @@ _on_exit() {
     # N2: the SQL section's temps (the dump's count file and the encrypted
     # candidate) must not outlive the script if it died mid-section.
     rm -f "${_SQL_COUNT:-}" "${_SQL_ARTIFACT_TMP:-}" 2>/dev/null || true
-    rm -f "${_EXTRA_TAR_TMP:-}" "${_EXTRA_TAR_ERR:-}" 2>/dev/null || true  # §6f plaintext tar + its file-name diagnostics
+    rm -f "${_EXTRA_GPG_TMP:-}" "${_EXTRA_TAR_ERR:-}" 2>/dev/null || true  # §6f encrypted archive in flight + its diagnostics
     rm -f "${_ENCRYPT_PARTIAL:-}" "${_ENCRYPT_ERR_TMP:-}" 2>/dev/null || true  # encrypt_file's in-flight partial + gpg stderr
     if [ -n "${_VERIFY_DB:-}" ]; then
         rm -f "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm" 2>/dev/null || true
@@ -1063,7 +1063,7 @@ fi
 # older snapshots keep it until retention drops them. It never fails the backup.
 _EXTRA_COUNT=0
 _EXTRA_SKIPPED=0       # listed directories NOT archived this run, for any reason
-_EXTRA_TAR_TMP=""
+_EXTRA_GPG_TMP=""     # the encrypted archive being written (absolute), for the exit handler
 _EXTRA_TAR_ERR=""
 _EXTRA_UPLOAD_FAILED=0
 _EXTRA_UPLOADED=()     # names that reached the off-site snapshot (recorded in COMPLETE)
@@ -1223,19 +1223,13 @@ else
         _name="$(printf '%s' "$_rel" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)-$(printf '%s' "$_rel" | sha1sum | cut -c1-8).tar.gpg"
         # Temp creation can fail (a full or inode-exhausted temp filesystem): skip this
         # directory, never abort the whole backup over an optional payload.
-        if ! _tar_tmp="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.tar 2>/dev/null)"; then
-            _extra_skip "cannot create a temp file in $GENESIS_BIG_TMP" "$_d"
-            continue
-        fi
-        _EXTRA_TAR_TMP="$_tar_tmp"
         if ! _tar_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
-            rm -f "$_tar_tmp"
-            _EXTRA_TAR_TMP=""
             _extra_skip "cannot create a temp file in $GENESIS_BIG_TMP" "$_d"
             continue
         fi
         _EXTRA_TAR_ERR="$_tar_err"
         _gpg_tmp="extra/.${_name}.partial.$$"
+        _EXTRA_GPG_TMP="$PWD/$_gpg_tmp"
         # A Python virtualenv under the directory, whatever it is named (the default
         # excludes catch only `.venv` and `venv`): any directory holding pyvenv.cfg.
         # Its interpreter links in bin/ are absolute, so a restore refuses them and the
@@ -1263,22 +1257,44 @@ else
             done < <(find "$_venv/bin" -maxdepth 1 -type l -lname '/*' -print0 2>/dev/null)
         done < <(find "$_abs" -mindepth 1 -type d \( "${_venv_prune[@]}" -false \) -prune \
             -o -type f -name pyvenv.cfg -printf '%h\0' 2>/dev/null)
-        _tar_rc=0
+        # The archive streams straight into encryption, and the check below reads it
+        # back by decrypting what was encrypted: no plaintext copy of the directory
+        # is ever written. The plaintext tar this replaced doubled the stage's disk
+        # writes (several GB per run for a large directory), and on a busy disk
+        # that burst stalled the whole filesystem.
         # --hard-dereference: a hard link is stored as file content, so restore never
         # meets a hard-link member. Symlinks are kept as links; restore accepts the
         # ones that stay inside the restored directory.
-        tar -C "$_home_real" --hard-dereference "${_extra_ex_args[@]}" \
+        if tar -C "$_home_real" --hard-dereference "${_extra_ex_args[@]}" \
             --anchored "${_venv_ex[@]+"${_venv_ex[@]}"}" --no-anchored \
-            -cf "$_tar_tmp" -- "$_rel" 2>"$_tar_err" || _tar_rc=$?
+            -cf - -- "$_rel" 2>"$_tar_err" | encrypt_stream "$_gpg_tmp"; then
+            _xst=("${PIPESTATUS[@]}")
+        else
+            _xst=("${PIPESTATUS[@]}")
+        fi
+        _tar_rc="${_xst[0]}" _enc_rc="${_xst[1]}"
         # GNU tar exit 1 = some files changed while being read: the archive is written,
-        # but a file that was changing may be torn. 2+ = fatal.
+        # but a file that was changing may be torn. 2+ = fatal; 128+ is a signal,
+        # usually SIGPIPE after encryption stopped reading.
         _tar_head="$(head -3 "$_tar_err" | tr '\n' ' ')"
         rm -f "$_tar_err"
         _EXTRA_TAR_ERR=""
-        if [ "$_tar_rc" -ge 2 ]; then
-            rm -f "$_tar_tmp"
-            _EXTRA_TAR_TMP=""
+        if [ "$_tar_rc" -ge 2 ] && [ "$_tar_rc" -lt 128 ]; then
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
             _extra_skip "tar failed rc=$_tar_rc: $_tar_head" "$_d"
+            continue
+        fi
+        if [ "$_enc_rc" -eq 0 ] && [ "$_tar_rc" -ge 2 ]; then
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
+            _extra_skip "tar was stopped by signal $((_tar_rc - 128))" "$_d"
+            continue
+        fi
+        if [ "$_enc_rc" -ne 0 ]; then
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
+            _extra_skip "encryption failed (encrypt exit $_enc_rc, tar exit $_tar_rc)" "$_d"
             continue
         fi
         [ "$_tar_rc" -eq 1 ] && log "NOTE: ~/$_rel changed while archiving; a file that was changing may be torn: $_tar_head"
@@ -1286,20 +1302,47 @@ else
         # and yield an archive without it, with rc 0. Check with the reader and the
         # member filter restore uses (never by parsing `tar -t`, which escapes
         # backslashes and, under a C locale, non-ASCII names), so backup keeps exactly
-        # what restore will accept.
-        _tar_root="" _tar_root_why="" _tar_summary="" _tar_verify_rc=0
+        # what restore will accept. The archive checked is the encrypted one that
+        # ships, decrypted into the checker as the SQL round-trip does it; the
+        # decrypted bytes count only once the decrypt tool exits 0 (GPG has then
+        # authenticated the whole message). Its stderr is fixed text naming the
+        # cause (authentication failed, or the checker closed the pipe), so it is
+        # kept with the checker's.
+        _tar_root="" _tar_root_why="" _tar_summary="" _tar_verify_rc=0 _dec_rc=""
         if _tar_root_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
             _EXTRA_TAR_ERR="$_tar_root_err"
-            _tar_root="$(python3 "$_SCRIPT_DIR/lib/extra_restore.py" verify "$_tar_tmp" "$GENESIS_BIG_TMP" 2>"$_tar_root_err")" || _tar_verify_rc=$?
+            _tar_root="$( {
+                {
+                    printf '%s' "$_BACKUP_PASSPHRASE" | python3 \
+                        "$_SCRIPT_DIR/../src/genesis/guardian/cred_integrity.py" decrypt-backup-stream "$_gpg_tmp"
+                    exit "${PIPESTATUS[1]}"
+                } | python3 "$_SCRIPT_DIR/lib/extra_restore.py" verify-stream "$GENESIS_BIG_TMP"
+                _vst="${PIPESTATUS[0]} ${PIPESTATUS[1]}"  # before any other command resets it
+                echo "VERIFY-STATUS $_vst" >&2
+            } 2>"$_tar_root_err" )" || true
+            _vst="$(sed -n 's/^VERIFY-STATUS //p' "$_tar_root_err" | tail -n 1)" || _vst=""
+            _dec_rc="${_vst%% *}"
+            _tar_verify_rc="${_vst##* }"
+            case "$_dec_rc$_tar_verify_rc" in '' | *[!0-9]*) _dec_rc="?" _tar_verify_rc=5 ;; esac
             # verify's last line counts the refusals by class (exit 4 only): kept for
             # the status file, and left out of the WARNING, which stays prose.
             _tar_summary="$(grep -m1 '^REFUSED-SUMMARY ' "$_tar_root_err" | cut -d' ' -f2-)" || _tar_summary=""
-            _tar_root_why="$(grep -v '^REFUSED-SUMMARY ' "$_tar_root_err")" || true
+            _tar_root_why="$(grep -v -e '^REFUSED-SUMMARY ' -e '^VERIFY-STATUS ' "$_tar_root_err")" || true
             rm -f "$_tar_root_err"
             _EXTRA_TAR_ERR=""
         else
             _tar_verify_rc=5
             _tar_root_why="cannot create a temp file in $GENESIS_BIG_TMP"
+        fi
+        # A check that failed by itself (exit 5) closes the pipe, which makes the
+        # decrypt fail too: the check's branch below reports that case. Only a check
+        # that read the whole archive (0 or 4) pins a failure on the archive itself.
+        if [ -n "$_dec_rc" ] && [ "$_dec_rc" != 0 ] \
+            && { [ "$_tar_verify_rc" = 0 ] || [ "$_tar_verify_rc" = 4 ]; }; then
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
+            _extra_skip "the encrypted archive did not read back (decrypt exit $_dec_rc, check exit $_tar_verify_rc)" "$_d"
+            continue
         fi
         _tar_partial=false
         if [ "$_tar_verify_rc" -eq 4 ] && [ "$_tar_root" = "$_rel" ]; then
@@ -1307,17 +1350,17 @@ else
             # partial, so the off-site copy is not reported complete and the alert fires.
             _tar_partial=true
         elif [ "$_tar_verify_rc" -eq 0 ] && [ -n "$_tar_root" ] && [ "$_tar_root" != "$_rel" ]; then
-            rm -f "$_tar_tmp"
-            _EXTRA_TAR_TMP=""
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
             _extra_skip "the archive holds ${_tar_root} instead; does an exclude pattern match the directory itself?" "$_d"
             continue
         elif [ "$_tar_verify_rc" -ne 0 ] || [ "$_tar_root" != "$_rel" ]; then
-            rm -f "$_tar_tmp"
-            _EXTRA_TAR_TMP=""
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
             _extra_skip "restore could not use the archive (rc=$_tar_verify_rc: ${_tar_root_why:-no directory member}); does an exclude pattern match the directory itself?" "$_d"
             continue
         fi
-        if encrypt_file "$_tar_tmp" "$_gpg_tmp" && mv -f "$_gpg_tmp" "extra/$_name"; then
+        if mv -f -T "$_gpg_tmp" "extra/$_name"; then
             _EXTRA_COUNT=$((_EXTRA_COUNT + 1))
             _EXTRA_BUILT+=("$_name")
             if $_tar_partial; then
@@ -1328,10 +1371,9 @@ else
             fi
         else
             rm -f "$_gpg_tmp"
-            _extra_skip "encryption failed" "$_d"
+            _extra_skip "could not move the encrypted archive into place" "$_d"
         fi
-        rm -f "$_tar_tmp"
-        _EXTRA_TAR_TMP=""
+        _EXTRA_GPG_TMP=""
     done
     if [ "$_extra_listed" -eq 0 ]; then
         _extra_skip "the list has no entries" "GENESIS_BACKUP_EXTRA_DIRS=$GENESIS_BACKUP_EXTRA_DIRS"

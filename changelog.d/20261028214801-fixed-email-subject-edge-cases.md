@@ -1,1 +1,0 @@
-- Email subjects are scanned in full before truncation, invisible-only subjects are refused, and replies preserve the full original thread title.

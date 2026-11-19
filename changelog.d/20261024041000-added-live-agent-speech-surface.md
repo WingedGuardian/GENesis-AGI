@@ -1,1 +1,0 @@
-- Live-agent hosts can declare speech output so session identity instructions omit the terminal model/effort header, including after resume and compaction.

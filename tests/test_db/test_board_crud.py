@@ -885,3 +885,13 @@ async def test_a_cancel_while_begin_is_still_queued_is_rolled_back_behind_it(db)
     finally:
         db.execute = real_execute
     assert not db.in_transaction, "the queued BEGIN was rolled back behind it"
+
+
+async def test_prune_keeps_the_builder_launchers_arming_record(db):
+    """The launcher's cutoff is the latest enable; pruning it would re-arm."""
+    old = "2026-01-01T00:00:00+00:00"
+    for event in ("launcher_enabled", "launcher_disabled", "drag"):
+        await board.append_event(db, event=event, now=old, observed_change_key=f"{event}@x")
+    await board.prune(db, now="2026-11-15T00:00:00+00:00")
+    kept = {e["event"] for e in (await board.list_events(db, limit=10))["items"]}
+    assert kept == {"launcher_enabled", "launcher_disabled"}

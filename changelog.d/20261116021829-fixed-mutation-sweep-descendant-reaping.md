@@ -1,1 +1,0 @@
-- The mutation sweep kills pytest's process group before reaping its exited leader, preventing descendants from acting in the gap.

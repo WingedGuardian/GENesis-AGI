@@ -95,7 +95,8 @@ _ACCEPTS = [
         [],
     ),
     ("identifier names the login", "ForumUser42 / Fk9!pass77", "github ForumUser42", [], []),
-    ("tag names the login", "ForumUser42 / Fk9!pass77", "github", ["forum"], ["ForumUser42"]),
+    # A username is never masked, in any field (owner ruling 2026-11-18).
+    ("tag names the login", "ForumUser42 / Fk9!pass77", "github", ["forum", "ForumUser42"], []),
     (
         "tag query flag",
         "https://api.example.org/v1?api_key=Qk8fakeKEY99&region=us-east-1",
@@ -214,15 +215,17 @@ async def test_a_mismatched_header_is_held_never_indexed(db):
     assert await _write(db, store, value, "forum ForumUser42", []) == unit
 
 
-async def test_a_login_in_the_tags_trailer_is_dropped(db):
-    """Round-3 M-2: tags are probed strictly, the login included."""
+async def test_a_login_in_the_tags_trailer_is_kept(db):
+    """Round-3 M-2, superseded by the owner ruling 2026-11-18: a username is
+    never masked, in any field, so a tag that is the login stays; the password
+    never reaches the body."""
     store = _PointStore()
     body = _body("forum", "ForumUser42 / Fk9!pass77", ["ForumUser42", "forum"])
     # Round 3: the Tags line is built from tags_json, never from the body.
     unit = await _ingest(db, store, body, concept="forum", tags_json=json.dumps(["ForumUser42", "forum"]))
     stored = (await kc.get(db, unit))["body"]
-    assert stored.endswith("\nTags: forum")
-    assert "ForumUser42" not in stored and "Fk9!pass77" not in stored
+    assert stored.endswith("\nTags: ForumUser42, forum")
+    assert "Fk9!pass77" not in stored
 
 
 @pytest.mark.parametrize(

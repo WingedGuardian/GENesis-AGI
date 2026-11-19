@@ -1,1 +1,0 @@
-- **New vault card references no longer contain a 12-digit run.** All-digit tails are retried so a reference cannot put a card-number-shaped run in audit rows or approval messages.

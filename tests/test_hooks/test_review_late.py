@@ -319,8 +319,8 @@ def test_rounds_are_numbered_by_when_they_opened_not_by_list_order():
     budget = _produce(commits, [_rv(right, _at(0), 2), _rv(left, _at(10), 1)], current=left)
     assert [r["head"] for r in budget["rounds"]] == [left, right]  # list order: commits
     later = T0 + timedelta(hours=1)
-    assert rl.round_context(budget, right, later) == rl.RoundContext(1, _at(0), ())
-    assert rl.round_context(budget, left, later) == rl.RoundContext(2, _at(10), (right,))
+    assert rl.round_context(budget, right, later) == rl.RoundContext(1, _at(0), (), right)
+    assert rl.round_context(budget, left, later) == rl.RoundContext(2, _at(10), (right,), left)
     # As of a time before it opened, a round has no context yet.
     assert rl.round_context(budget, left, T0 + timedelta(minutes=5)) is None
     assert rl.round_context(budget, H5, later) is None
@@ -338,8 +338,8 @@ def test_a_non_primary_pre_cutover_review_is_no_legacy_opening():
     ]
     budget = _produce(_dag(H1, H2), reviews, current=H2)
     later = T0 + timedelta(hours=1)
-    assert rl.round_context(budget, H1, later) == rl.RoundContext(1, old.isoformat(), ())
-    assert rl.round_context(budget, H2, later) == rl.RoundContext(2, _at(0), (H1,))
+    assert rl.round_context(budget, H1, later) == rl.RoundContext(1, old.isoformat(), (), H1)
+    assert rl.round_context(budget, H2, later) == rl.RoundContext(2, _at(0), (H1,), H2)
 
 
 def test_an_untimed_legacy_round_sorts_before_every_post_cutover_round():
@@ -357,7 +357,7 @@ def test_an_untimed_legacy_round_sorts_before_every_post_cutover_round():
     budget = _produce(_dag(H1, H2, H3), reviews, current=H3)
     assert budget["rounds"][0]["opened_at"] is None
     later = T0 + timedelta(hours=1)
-    assert rl.round_context(budget, H2, later) == rl.RoundContext(2, _at(0), (H1,))
+    assert rl.round_context(budget, H2, later) == rl.RoundContext(2, _at(0), (H1,), H2)
     assert rl.round_context(budget, H1, later) is None
     assert _owed(budget, fix=None)["owed"] == ["c9"]
     # A late key of the untimed round itself cannot be placed: unknown.
@@ -587,6 +587,58 @@ def test_round_zero_still_refuses_an_escalating_reflection(pr, tmp_path):
     escalating = _block(["c9"], fix).replace("Escalate: no", "Escalate: yes")
     _reflect(path, tmp_path, escalating, T0 + timedelta(minutes=120))
     assert _credit(path, budget) == set()
+
+
+def test_round_zero_applies_the_past_round_four_rules_about_the_whole_pr(
+    pr, tmp_path, monkeypatch
+):
+    """Spec item 7 (#4396's open row): a round-0 answer on a PR past round 4
+    under the rules owes the Prediction lines like any fix-now."""
+    import review_past_terminal as pt
+
+    path, base, head, fix = pr
+    budget = _round_zero(path, base, head, fix)
+    placed = {
+        f"{i:040x}": pt.RoundRecord(
+            f"{i:040x}", i, T0 - timedelta(hours=10 - i), ((T0, False, f"c{i}"),)
+        )
+        for i in range(1, 5)
+    }
+    monkeypatch.setattr(pt, "PAST_TERMINAL_CUTOVER_ISO", (T0 - timedelta(days=1)).isoformat())
+    monkeypatch.setattr(rr, "_round_records", lambda b: placed)
+    _reflect(path, tmp_path, _block(["c9"], fix), T0 + timedelta(minutes=120))
+    assert _credit(path, budget) == set()
+    lines = [
+        "Prediction: merges at round 5 because the class is closed in one place",
+        "Confidence: 97% falsified-by any new finding in that class",
+    ]
+    _reflect(path, tmp_path, _block(["c9"], fix, extra=lines), T0 + timedelta(minutes=130))
+    assert _credit(path, budget) == {"c9"}
+
+
+def test_a_late_key_is_judged_under_its_own_rounds_record(pr, tmp_path, monkeypatch):
+    """A late finding on round head H is judged under H's record, found by H
+    (``RoundContext.round_head``): H is round 5 with no floor finding, so a
+    fix-now of c9 credits nothing, even with the Prediction lines."""
+    import review_past_terminal as pt
+
+    path, base, head, fix = pr
+    budget = _late_budget(path, base, fix, [_rv(head, _at(0), 1), _rv(head, _at(90), 9)])
+    opened = T0 - timedelta(hours=1)
+    placed = {head: pt.RoundRecord(head, 5, opened, ((opened, False, "c1"), (T0 + timedelta(minutes=90), False, "c9")))}
+    for i in range(1, 5):
+        placed[f"{i:040x}"] = pt.RoundRecord(f"{i:040x}", i, opened - timedelta(hours=i), ())
+    monkeypatch.setattr(pt, "PAST_TERMINAL_CUTOVER_ISO", (T0 - timedelta(days=1)).isoformat())
+    monkeypatch.setattr(rr, "_round_records", lambda b: placed)
+    lines = [
+        "Prediction: merges at round 6 because the class is closed in one place",
+        "Confidence: 97% falsified-by any new finding in that class",
+        "Prediction-held: no the last round drew a minor finding again",
+    ]
+    _reflect(path, tmp_path, _block(["c9"], fix, extra=lines), T0 + timedelta(minutes=120))
+    assert _credit(path, budget) == set()
+    monkeypatch.setattr(rr, "_round_records", lambda b: None)
+    assert _credit(path, budget) == {"c9"}
 
 
 def test_unknown_ancestry_credits_nothing(pr, tmp_path):

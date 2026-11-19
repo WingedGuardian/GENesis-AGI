@@ -67,16 +67,23 @@ Run it BEFORE the code review, on the change's own claims. Full method, output
 block, and the calibration controls: `.claude/docs/premise-check.md`. In short:
 
 1. **Extract the premises** the change depends on (PR body, plan file, commit
-   messages) — usually 2-4. Record what you EXPECT before checking.
+   messages) — usually 2-4. Record what you EXPECT before checking. Name each
+   one's layer, problem (premise items 1 to 5) or change (6 to 9); open and read
+   the citation item 2 gives as one of the problem-layer claims.
 2. **Verdict each one independently** — TRUE / FALSE / UNPROVEN, each with its
    evidence (a measurement with a denominator, or a `file:line` read — not an
-   inference), a confidence number, and a falsifier.
+   inference), a confidence number, and a falsifier. Test item 5 among them: can
+   the acceptance fail, and does the named wrong fix fail it? An acceptance
+   nothing could fail is a finding.
 3. **Ask the effect question explicitly:** *what does the caller do differently
    because of this output?* Verifying that a value ARRIVES is not verifying
    that anything CHANGES — that gap is what this step catches and a code review
    does not.
 4. **Then the comparative question:** given the premises that hold, is this the
-   BEST available shape? Look for an existing chokepoint the change
+   BEST available shape? Start from the author's item 7: confirm or refute each
+   alternative it names, and search from scratch only when it says "none found"
+   (or there is no item 7),
+   saying what you searched. Look for an existing chokepoint the change
    re-implements, a simpler mechanism, or a place the problem disappears. A
    sound-but-inferior approach is a FINDING.
 5. **Then the PR-shape question, every time:** should this arrive as ONE PR?
@@ -98,7 +105,9 @@ Emit the `Design-premise:` block from the reference doc before the main review,
 including its `PR-shape:` line. Write it EXACTLY as the reference doc's "The
 output" specifies: code reads it. That means the verdict line at column 0, the `Expected before checking:` line
 directly under it (required), each claim as
-`P<n> <TRUE|FALSE|UNPROVEN> — <claim>` with the verdict first, each trailer line
+`P<n> <TRUE|FALSE|UNPROVEN> (<problem|change>[, <qualifier>]) — <claim>` with the verdict first
+and the layer in its parentheses (a verdict short of SOUND names the failed layer
+in its qualifier, `SOUND-BUT-INFERIOR — change layer`), each trailer line
 (`Effect:`, `Better shape:`, `PR-shape:`) on ONE line, plain lines with no bullets,
 bold or tables, a blank line after the block before any other text, and one block
 per output. When the check feeds a send-back, also write the

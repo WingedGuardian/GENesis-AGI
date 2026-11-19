@@ -254,10 +254,10 @@ def test_a_value_line_shaped_like_a_trailer_is_held_out_whole():
 
 
 @pytest.mark.parametrize("value", ["hunter2xyz / Fk3a9!Zq", "Fk3a9Zq / w0rd!x99"])
-async def test_tags_probe_both_halves_of_a_pair(db, value):
-    """Security review MEDIUM-2, and round-3 M-2: tags are probed with the
-    fragments of both halves (only the identifier exempts the login); a tag
-    that is wholly one half is dropped, one carrying it keeps its other text."""
+async def test_tags_probe_the_secret_half_of_a_pair(db, value):
+    """Security review MEDIUM-2, and round-3 M-2, as the owner ruling 2026-11-18: a username is never masked, in any field, whatever the password contains: a tag is
+    probed with the secret half, never the login; a tag carrying the secret
+    keeps its other text, and a tag that is the login stays."""
     store = _PointStore()
     login, secret = value.split(" / ")
     tags = [login, f"{secret}-old", "portal"]
@@ -266,5 +266,5 @@ async def test_tags_probe_both_halves_of_a_pair(db, value):
         concept="acct portal", tags_json=json.dumps(tags), held_value=value,
     )
     row = await kc.get(db, unit)
-    assert json.loads(row["tags"]) == ["[held]-old", "portal"]
-    assert row["body"].endswith("\nTags: [held]-old, portal")
+    assert json.loads(row["tags"]) == [login, "[held]-old", "portal"]
+    assert row["body"].endswith(f"\nTags: {login}, [held]-old, portal")

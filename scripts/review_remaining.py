@@ -60,6 +60,7 @@ def _remaining_report(cwd: str, repo: str, number: int, budget: dict, deadline: 
     late_keys = {item["key"] for item in found_late}
     rows = []
     attributed = set()
+    records = rr._round_records(budget)
     for entry in rounds:
         head, raw = entry["head"], entry["findings"]
         if type(raw) is not int:
@@ -97,6 +98,7 @@ def _remaining_report(cwd: str, repo: str, number: int, budget: dict, deadline: 
             prior_heads=[r["head"] for r in rounds if r["head"] != head] if is_open else context.prior_heads,
             key_rounds=rr.key_rounds(budget),
             acceptance=acceptance, round_started=started,
+            round_records=records,
             reviewed_at=rr._open_review_times(projected), deadline=deadline,
             repo=repo, number=number, wanted_keys=keys - late_keys,
         ) if keys - late_keys else {}
