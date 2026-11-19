@@ -361,6 +361,14 @@ async def outbox_list():
         size,
         request.args.get("pageToken"),
     )
+    for item in messages:
+        # Ids and a byte length only: proves what this side served, never the text.
+        logger.info(
+            "peer_outbox_served peer=%s message_id=%s text_bytes=%d",
+            g.peer_identity.peer["peer_id"],
+            item["message"]["messageId"],
+            len(item["message"]["parts"][0]["text"].encode("utf-8")),
+        )
     return jsonify(messages=messages, nextPageToken=token)
 
 
