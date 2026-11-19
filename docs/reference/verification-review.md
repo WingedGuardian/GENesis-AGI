@@ -27,7 +27,8 @@ checked against the census:
   marker is refused, because Git counts a cut-off binary change as 0/0;
 - the census blob id must match the post-image id (the pre-image for a removed
   file). This mapping was measured on 111 files across six merged PRs;
-- a rename must name the census's previous path;
+- a rename must name the census's previous path, and a created or deleted block
+  must be `added` or `removed` in the census (exact on 115 blocks of seven PRs);
 - a symlink replaced by a file (a delete block plus a create block for one
   path) counts as one census entry;
 - a nonempty response with no patch block, even whitespace only, is refused.

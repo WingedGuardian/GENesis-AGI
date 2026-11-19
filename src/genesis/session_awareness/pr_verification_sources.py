@@ -197,15 +197,20 @@ def _check_block(block: _Block) -> None:
         raise ValueError("content change has no hunk or binary marker")
 
 
-def _check_identity(name: str, block: _Block, entry: dict) -> None:
+def _check_identity(name: str, block: _Block, entry: dict, *, type_change: bool = False) -> None:
     """Bind the census blob and rename source to what the diff header says.
 
     Measured on six merged PRs (111 files): the census ``sha`` is the diff's
     post-image id for added, modified and renamed files, and the pre-image for
-    removed ones. A block with no index line (pure rename, mode-only) has no id
-    to compare.
+    removed ones; a created block is "added" and a deleted one "removed" (115 of
+    115 blocks, seven PRs). A block with no index line (pure rename, mode-only)
+    has no id to compare. A type change is a delete plus a create of one path,
+    so its census status is not bound to either half.
     """
     sha, status = entry.get("sha"), entry.get("status")
+    kind = (block.created, block.deleted) != (status == "added", status == "removed")
+    if status is not None and not type_change and kind:
+        raise ValueError(f"census change type for {name!r} differs from the raw diff")
     if block.index and sha:
         oid = block.index[0] if status == "removed" else block.index[1]
         if not sha.startswith(oid):
@@ -254,7 +259,8 @@ def reconcile_diff(raw: bytes, files: list[dict], *, timeout: float) -> dict[str
             raise ValueError("changed-file census does not match raw diff")
         for name, pairs in actual.items():
             entry = expected[name]
-            if len(pairs) == 2 and pairs[0][1].deleted and pairs[1][1].created:
+            type_change = len(pairs) == 2 and pairs[0][1].deleted and pairs[1][1].created
+            if type_change:
                 # A type change (symlink to file) is a delete and a create of one path.
                 (old, _), (new, block) = pairs
                 counts = None if old is None or new is None else (old[0] + new[0], old[1] + new[1])
@@ -264,7 +270,7 @@ def reconcile_diff(raw: bytes, files: list[dict], *, timeout: float) -> dict[str
                 raise ValueError("duplicate patch destination")
             if counts is not None and counts != (entry["additions"], entry["deletions"]):
                 raise ValueError("text change counts do not match raw diff")
-            _check_identity(name, block, entry)
+            _check_identity(name, block, entry, type_change=type_change)
             if block.index is None:
                 gaps["blob"].append(name)
             if counts is None:

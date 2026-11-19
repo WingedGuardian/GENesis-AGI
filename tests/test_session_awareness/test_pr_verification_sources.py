@@ -600,7 +600,7 @@ def test_rename_source_must_match_the_census(tmp_path, entry, accepted):
     if accepted:
         reconcile_diff(raw, files, timeout=5)
     else:
-        with pytest.raises(SourceError, match="rename"):
+        with pytest.raises(SourceError, match="rename|change type"):
             reconcile_diff(raw, files, timeout=5)
 
 
@@ -732,3 +732,24 @@ def test_unknown_file_status_is_refused():
         assert _file(entry | {"status": status})["status"] == status
     with pytest.raises(SourceError):
         _file(entry | {"status": "deleted"})
+
+
+@pytest.mark.parametrize("kind", ["created", "deleted"])
+def test_census_change_type_must_match_the_block(tmp_path, kind):
+    # Measured on 115 blocks of seven merged PRs: a created block is always
+    # "added" and a deleted block always "removed" in GitHub's census.
+    committed(tmp_path, {"keep.txt": b"keep\n"})
+    if kind == "created":
+        (tmp_path / "new.txt").write_bytes(b"")
+        subprocess.run(["git", "-C", str(tmp_path), "add", "new.txt"], check=True)
+        raw = subprocess.check_output(["git", "-C", str(tmp_path), "diff", "--cached"])
+        entry = dict(filename="new.txt", additions=0, deletions=0, sha=blob(b""))
+        right, wrong = "added", "modified"
+    else:
+        (tmp_path / "keep.txt").unlink()
+        raw = subprocess.check_output(["git", "-C", str(tmp_path), "diff"])
+        entry = dict(filename="keep.txt", additions=0, deletions=1, sha=blob(b"keep\n"))
+        right, wrong = "removed", "modified"
+    reconcile_diff(raw, [entry | {"status": right}], timeout=5)
+    with pytest.raises(SourceError, match="change type"):
+        reconcile_diff(raw, [entry | {"status": wrong}], timeout=5)
