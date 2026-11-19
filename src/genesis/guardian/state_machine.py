@@ -82,6 +82,10 @@ class StateData:
     # (ISO8601): a wait past WAIT_REALERT_S alerts again (owner ruling, #2978).
     waiting_since: str | None = None
     wait_alerted_at: str | None = None
+    # Whether a tick's probe read the lock HELD since that last alert (or since
+    # the wait began). Due with none held, only unreadable probes keep the wait,
+    # and it reopens into the gates instead (#2978).
+    wait_lock_seen_held: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -111,6 +115,7 @@ class StateData:
             "waiting_on_update_lock": self.waiting_on_update_lock,
             "waiting_since": self.waiting_since,
             "wait_alerted_at": self.wait_alerted_at,
+            "wait_lock_seen_held": self.wait_lock_seen_held,
         }
 
     @classmethod
@@ -146,6 +151,8 @@ class StateData:
             waiting_on_update_lock=data.get("waiting_on_update_lock") is True,
             waiting_since=_iso_or_none(data.get("waiting_since")),
             wait_alerted_at=_iso_or_none(data.get("wait_alerted_at")),
+            # Missing (an older file) or corrupt reads as held: alert only.
+            wait_lock_seen_held=data.get("wait_lock_seen_held") is not False,
         )
 
 
@@ -841,11 +848,13 @@ class ConfirmationStateMachine:
         self._state.waiting_on_update_lock = False
         self._state.waiting_since = None
         self._state.wait_alerted_at = None
+        self._state.wait_lock_seen_held = False
 
     def wait_realert_due(self, now: datetime, every_s: float) -> bool:
         """Whether the owner should hear again about a wait on update.lock:
         ``every_s`` since the last alert (the first is the escalation itself).
-        Records the alert when due. An unreadable timestamp counts as due."""
+        Records the alert when due, which starts a new interval for
+        ``wait_lock_seen_held``. An unreadable timestamp counts as due."""
         if not self._state.waiting_on_update_lock:
             return False
         if self._state.waiting_since is None:
@@ -856,6 +865,7 @@ class ConfirmationStateMachine:
         if last is not None and 0 <= (now - last).total_seconds() < every_s:
             return False
         self._state.wait_alerted_at = now.isoformat()
+        self._state.wait_lock_seen_held = False
         return True
 
     def waited_s(self, now: datetime) -> float | None:
@@ -869,6 +879,7 @@ class ConfirmationStateMachine:
         if not self._state.waiting_on_update_lock:
             now = datetime.now(UTC).isoformat()
             self._state.waiting_since = self._state.wait_alerted_at = now
+            self._state.wait_lock_seen_held = False
         self._state.waiting_on_update_lock = True
 
     def should_escalate(self) -> bool:

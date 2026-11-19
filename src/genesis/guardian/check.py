@@ -1748,27 +1748,53 @@ async def _handle_confirmed_dead(
         if sm.state.waiting_on_update_lock:
             # This episode escalated because update.lock was held on `live`: one
             # cheap probe per tick, and a fresh diagnosis once it is free. A
-            # probe that cannot say reopens too: the proposal step probes again.
+            # probe that cannot say never ends the wait (CodeRabbit c4619151359),
+            # unless incus reports the container STOPPED: nothing in it can hold
+            # the lock then, and its start must not wait.
             held, who = await live_drop.update_lock_holder(config.container_name)
-            reopen = held is not True
+            if held is True:
+                sm.state.wait_lock_seen_held = True
+            undecided_only = not sm.state.wait_lock_seen_held
+            reopen = held is False or (
+                held is None and await live_drop.container_stopped(config.container_name)
+            )
             now = datetime.now(UTC)
-            if held is True and sm.wait_realert_due(now, live_drop.WAIT_REALERT_S):
-                # Alert only (owner ruling): past the deploy scripts' own 2 h
-                # lock wait the holder is likely hung, but elapsed time alone
-                # never starts a recovery.
+            if not reopen and sm.wait_realert_due(now, live_drop.WAIT_REALERT_S):
+                # Past the deploy scripts' own 2 h lock wait. A lock READ held
+                # in that interval: alert only, since elapsed time alone never
+                # starts a recovery (owner ruling). Only unreadable probes in it:
+                # nothing shows a run holding the lock, so the episode reopens
+                # into Gate 1, where the owner decides (#2978).
                 waited = sm.waited_s(now)
                 hours = f"{waited / 3600:.1f} h" if waited is not None else "a long time"
-                await dispatcher.send(Alert(
-                    severity=AlertSeverity.EMERGENCY,
-                    title="Genesis still down — the Guardian has waited " + hours + " for update.lock",
-                    body=(
+                if undecided_only:
+                    body = (
+                        f"The Guardian has waited {hours} on `live`, and update.lock cannot be "
+                        "read: no probe since the last alert could say whether it is held. "
+                        "Instead of waiting on, it diagnoses again and asks your approval "
+                        "for what it proposes."
+                    )
+                    reopen = True
+                elif held:
+                    body = (
                         f"The Guardian has waited {hours} for update.lock on `live`, now held"
                         + (f" ({who})" if who else "")
                         + ". The deploy scripts give up waiting for it after 2 h, so the "
                         "run holding it is likely hung. The Guardian keeps waiting and will "
                         "not restart anything on its own: end that run, and it diagnoses "
                         "again within 30 s."
-                    ),
+                    )
+                else:
+                    body = (
+                        f"The Guardian has waited {hours} for update.lock on `live`. It was "
+                        "held earlier in this wait and cannot be read now. The Guardian keeps "
+                        "waiting and restarts nothing on its own; if it still cannot read the "
+                        "lock at the next alert, it asks your approval instead."
+                    )
+                await dispatcher.send(Alert(
+                    severity=AlertSeverity.EMERGENCY,
+                    title="Genesis still down — the Guardian has waited " + hours + " for update.lock",
+                    body=body,
                 ))
         if not reopen:
             logger.info(
@@ -1776,7 +1802,7 @@ async def _handle_confirmed_dead(
                 "(no re-diagnosis/re-alert)",
             )
             return
-        logger.info("update.lock is free again — reopening this outage episode")
+        logger.info("update.lock is free, or cannot be read for 2 h — reopening this episode")
         sm.clear_down_alert_sent()
     # First handler for this episode (e.g. reached CONFIRMED_DEAD via the
     # self-heal-escalation path that skips _proceed_to_diagnosis): own it now so
@@ -1966,6 +1992,10 @@ async def _execute_recovery_with_approval(
     """
     from genesis.guardian.diagnosis import RecoveryAction
 
+    # On `live`, while update.lock is held, every proposal (ESCALATE included)
+    # becomes the escalation that waits for it: no prompt, and the episode
+    # reopens once the lock is free (owner rulings, #2978).
+    diagnosis = await live_drop.hold_for_lock(config.container_name, diagnosis)
     if diagnosis.recommended_action == RecoveryAction.ESCALATE:
         # ESCALATE is not an automated action — it means "all automated
         # recovery options exhausted, alert the user." No approval gate
@@ -2065,6 +2095,8 @@ async def _execute_recovery_with_approval(
     diagnostic = await collect_diagnostics(config)
     signal_summary = json.dumps(sm.state.signal_history[-5:], indent=2)
     diagnosis = await diagnosis_engine.diagnose(diagnostic, signal_summary)
+    # The lock again, for the new proposal: Gate 1 can wait for hours.
+    diagnosis = await live_drop.hold_for_lock(config.container_name, diagnosis)
 
     # F.1: REVERT_CODE runs `git stash`/`git revert`, which need healthy, WRITABLE
     # local git. If the container's git is unhealthy (the F.1 outage class — incl. a
@@ -2102,10 +2134,6 @@ async def _execute_recovery_with_approval(
             )
         elif await container_on_live(config.container_name):
             diagnosis = await live_drop.live_revert_proposal(config.container_name, diagnosis)
-    elif diagnosis.recommended_action == RecoveryAction.RESTART_CONTAINER:
-        diagnosis = await live_drop.escalate_if_update_running(
-            config.container_name, diagnosis, check_live=True,
-        )
 
     logger.info(
         "Gate-1 approved; diagnosis: %s (confidence=%d%%, action=%s, source=%s)",
@@ -2124,9 +2152,8 @@ async def _execute_recovery_with_approval(
     if diagnosis.recommended_action == RecoveryAction.ESCALATE:
         if diagnosis.escalation == live_drop.WAITING_ON_LOCK:
             # Not a failure: a deploy holds update.lock on `live`. Nothing is
-            # touched; each tick probes the lock and reopens the episode once
-            # it is free (#2978).
-            sm.mark_waiting_on_update_lock()
+            # touched; the escalation marks the wait, and each tick probes the
+            # lock and reopens the episode once it is free (#2978).
             await telegram_channel.send_text(
                 "Genesis is down, but update.lock is held on `live` (a deploy, rebuild, drop "
                 "or validation hold is running), so nothing was touched. I will diagnose "

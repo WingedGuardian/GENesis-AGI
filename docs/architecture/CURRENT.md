@@ -2758,21 +2758,30 @@ verified: 9a1994b2b 2026-11-17
   branch the manifest no longer lists) escalates, naming `deploy_candidates
   rebuild`, which finishes it. Otherwise (no candidate, an unreadable list, a
   move refusal) it proposes `RESTART_CONTAINER` and says why. While update.lock
-  is held on `live`, a REVERT_CODE or RESTART_CONTAINER proposal becomes an
-  ESCALATE that waits (owner rulings, #2978; a validation's shared hold
-  counts): its own warning, not the "all recovery failed" alert;
+  is held on `live`, EVERY proposal, ESCALATE included, becomes an ESCALATE
+  that waits (owner rulings, #2978; a validation's shared hold counts),
+  checked by `live_drop.hold_for_lock` at the proposal entry and again after
+  Gate 1's re-diagnosis: its own warning, not the "all recovery failed" alert;
   `waiting_on_update_lock` in the Guardian state; then each tick runs one lock
   probe and reopens the episode (fresh diagnosis, both gates) once the lock is
-  free. An approved drop re-reads the engine's view and runs only if it is
-  unchanged, runs the engine's own `drop --expect-branch live --expect-head
-  <tip> --wait 120`, and restarts genesis-server only once the engine shows the
-  branch gone from the manifest and `live`, the checkout on `live`, no move
-  refusal, and update.lock free (a client timeout waits up to 180 s more,
-  first waiting for the lock); after a confirmed drop it waits up to 180 s for
-  the lock to free before the restart. An approved RESTART_CONTAINER on `live`
-  re-reads the lock too, since the approval may be hours old. A lock still
-  held marks the same wait; a refusal or an unconfirmed result restarts
-  nothing. The confirmed-dead auto-reset (600 s) is suspended while an episode
+  free. A probe that cannot say never ends a wait (only a lock read free, or
+  incus reporting the container STOPPED, does) and never starts one at a
+  proposal, so a stopped container is still started; after a drop has run, the
+  restart does wait on it. When the 2 h alert is due and no probe since the last
+  one read the lock held, the alert says it cannot be read and the episode
+  reopens into Gate 1 instead of waiting on. `RecoveryEngine.execute`
+  reads the lock again for every action, before its alert, state change and
+  snapshot and again just before the action, and defers a held one: no attempt,
+  no budget. The server restart is queued under the lock itself (`flock -n`
+  around a `--no-block` systemctl, held for milliseconds, never across the
+  start the boot repair runs in). An approved drop re-reads the engine's view
+  and runs only if it is unchanged, runs the engine's own `drop --expect-branch
+  live --expect-head <tip> --wait 120`, waits up to 180 s for update.lock, then
+  restarts genesis-server only once the engine shows the branch gone from the
+  manifest and `live`, the checkout on `live` and no move refusal (a client
+  timeout waits the same way). A lock still held marks the same wait; a
+  refusal or an unconfirmed result restarts nothing, and a drop that failed
+  past the manifest save names `deploy_candidates rebuild`. The confirmed-dead auto-reset (600 s) is suspended while an episode
   waits, and every episode reset ends the wait. A wait past 2 h (the deploy
   scripts' own lock-wait ceiling) alerts again, and every 2 h after, naming the
   holder; alert only, it never restarts on elapsed time (owner ruling). With no approved candidate,

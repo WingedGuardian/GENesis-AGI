@@ -8,9 +8,10 @@ owner approves at Gate 2. recovery.py runs the approved drop.
 
 Everything read from the container is untrusted: the view is size-capped,
 validated, and every string from it that reaches a message is cleaned and cut.
-While update.lock is held on `live`, the proposal is an ESCALATE that waits for
-the lock (owner rulings, #2978); recovery.py re-reads the lock before it runs a
-restart, since an approval can be hours old.
+While update.lock is held on `live`, every proposal is an ESCALATE that waits
+for the lock (owner rulings, #2978): ``hold_for_lock`` is the one proposal-side
+check, and RecoveryEngine.execute re-reads the lock before any action runs,
+since an approval can be hours old.
 """
 
 from __future__ import annotations
@@ -171,13 +172,15 @@ def half_done_reason(unlisted: list[str]) -> str:
     )
 
 
-def is_half_done(data: dict | None) -> bool:
-    """A drop saved the manifest and could not move: `live` holds a branch the
-    manifest no longer lists. Finishing it is a rebuild, never the next drop."""
+def half_done(data: dict | None) -> str:
+    """Why `live` is half-done, or "": a drop saved the manifest and could not
+    move, so `live` holds a branch the manifest no longer lists. Finishing it
+    is a rebuild, never the next drop."""
     if data is None or data["live"].get("holds") is None:
-        return False
+        return ""
     listed = {r["branch"] for r in data["listed"]}
-    return any(h["branch"] not in listed for h in data["live"]["holds"])
+    unlisted = [h["branch"] for h in data["live"]["holds"] if h["branch"] not in listed]
+    return half_done_reason(unlisted) if unlisted else ""
 
 
 async def update_lock_holder(container: str) -> tuple[bool | None, str]:
@@ -193,6 +196,14 @@ async def update_lock_holder(container: str) -> tuple[bool | None, str]:
     pid = lines[-1].strip() if mrc == 0 and lines else ""
     named = pid.isascii() and pid.isdigit()
     return True, (f"the deploy marker names pid {pid}" if named else "")
+
+
+async def container_stopped(container: str) -> bool:
+    """Whether incus reports the container STOPPED (not frozen, not unknown).
+    Only then can nothing in it hold update.lock: a frozen guest's processes
+    keep their locks, and an `incus info` that fails or times out says nothing."""
+    rc, stdout, _ = await _run_subprocess("incus", "info", container, timeout=30.0)
+    return rc == 0 and re.search(r"(?mi)^status:\s*stopped\s*$", stdout) is not None
 
 
 async def candidates_evidence(container: str) -> str:
@@ -224,54 +235,46 @@ def _escalation(diagnosis: DiagnosisResult, kind: str, why: str) -> DiagnosisRes
     )
 
 
-async def escalate_if_update_running(
-    container: str,
-    diagnosis: DiagnosisResult,
-    *,
-    check_live: bool = False,
-) -> DiagnosisResult:
-    """On `live`, while update.lock is held, a drop or a restart would cut into
-    the run holding it (a deploy, a rebuild, a drop, a validation hold): the
-    proposal becomes ESCALATE, naming the holder, and the Guardian waits for the
-    lock (owner rulings, #2978). A probe that cannot say leaves the proposal as
-    it was. With ``check_live`` the branch is read only once the lock is held:
-    a frozen container (a restart's usual case) then costs one probe, not three."""
+async def hold_for_lock(container: str, diagnosis: DiagnosisResult) -> DiagnosisResult:
+    """The one proposal-side lock rule: on `live`, while update.lock is held,
+    ANY proposal (ESCALATE included) becomes the ESCALATE that waits for the
+    lock, naming the holder; recovery.py's escalation marks the wait (owner
+    rulings, #2978). The lock is read first and the branch only when it is held,
+    so a frozen container costs one probe. A probe that cannot say leaves the
+    proposal: a stopped container answers no probe, and its start must not wait
+    on a lock nothing can hold (execute() and each action's own guard still apply).
+    The one place an unreadable lock DOES wait is after a drop has run
+    (recovery._drop_candidate): its tree may still be moving, so its restart
+    waits for a lock read free."""
     from genesis.guardian.recovery import container_on_live
 
     held, who = await update_lock_holder(container)
-    if not held or (check_live and not await container_on_live(container)):
+    if held is not True or not await container_on_live(container):
         return diagnosis
     logger.warning(
         "update.lock held on `live` — proposing ESCALATE instead of %s",
-        diagnosis.recommended_action.value,
+        diagnosis.recommended_action,  # a plain str on the should_escalate path
     )
     return _escalation(
         diagnosis,
         WAITING_ON_LOCK,
         "the checkout is on `live` and update.lock is held"
         + (f" ({who})" if who else "")
-        + ": a deploy, rebuild, drop or validation hold is running, and a drop or a "
-        "restart now would cut into it. Nothing was touched; the Guardian resumes "
+        + ": a deploy, rebuild, drop or validation hold is running, and any recovery "
+        "now would cut into it. Nothing was touched; the Guardian resumes "
         "once the lock is free",
     )
 
 
 async def live_revert_proposal(container: str, diagnosis: DiagnosisResult) -> DiagnosisResult:
     """REVERT_CODE on `live`: the drop of the newest candidate when the engine
-    says a drop can run; ESCALATE while update.lock is held or after a drop that
-    did not finish; else the container restart. Decided BEFORE Gate 2, so the
-    owner approves exactly what runs."""
-    waiting = await escalate_if_update_running(container, diagnosis)
-    if waiting.recommended_action == RecoveryAction.ESCALATE:
-        return waiting
+    says a drop can run; ESCALATE after a drop that did not finish; else the
+    container restart. Decided BEFORE Gate 2, so the owner approves exactly what
+    runs; check.py has already run ``hold_for_lock``."""
     data = await live_candidates(container)
-    if is_half_done(data):
-        unlisted = [
-            h["branch"]
-            for h in data["live"]["holds"]
-            if h["branch"] not in {r["branch"] for r in data["listed"]}
-        ]
-        return _escalation(diagnosis, HALF_DONE_DROP, half_done_reason(unlisted))
+    unfinished = half_done(data)
+    if unfinished:
+        return _escalation(diagnosis, HALF_DONE_DROP, unfinished)
     target, why = (
         drop_target(data)
         if data is not None
