@@ -1,0 +1,1 @@
+- Cancelled knowledge ingestion cleans up completed new writes during vector preparation and database acquisition while preserving preexisting deduplicated memories.
