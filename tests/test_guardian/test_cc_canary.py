@@ -205,6 +205,25 @@ class _DeadChannel:
 
 
 @pytest.mark.asyncio
+async def test_an_alert_already_queued_counts_as_delivered(tmp_path):
+    # The warning is already queued (an earlier run queued it, then could not
+    # save its state). Queueing it again dedupes, and that still counts as
+    # delivered, so the episode stays paged and recovery sends its all-clear.
+    from genesis.guardian.alert.base import Alert, AlertSeverity
+    from genesis.guardian.alert.dispatcher import AlertDispatcher
+    from genesis.guardian.alert.queue import list_queued
+
+    queue = tmp_path / "queue"
+    dispatcher = AlertDispatcher([_DeadChannel()], fallback_queue_root=queue)
+    alert = Alert(severity=AlertSeverity.WARNING, title="same episode", body="b")
+    assert await dispatcher.send_or_queue(alert) is True
+    assert await dispatcher.send_or_queue(alert) is True
+    assert len(list_queued(queue)) == 1
+    # Control: with no queue at all, nothing is delivered.
+    assert await AlertDispatcher([_DeadChannel()]).send_or_queue(alert) is False
+
+
+@pytest.mark.asyncio
 async def test_a_queued_page_counts_as_delivered(tmp_path, monkeypatch):
     # Telegram is down: the real dispatcher queues the page for the host queue
     # drain to replay. The episode is paged, so no repeat warning, and recovery

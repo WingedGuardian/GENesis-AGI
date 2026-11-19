@@ -99,13 +99,15 @@ class AlertDispatcher:
     def _enqueue_fallback(self, alert: Alert) -> bool:
         """Persist a failed-delivery alert to the durable queue (best-effort).
 
-        True when it was queued; False with no queue, or when the write failed.
+        True when it is queued, including when a live entry with the same title
+        was already waiting (enqueue_alert skips that write and returns False,
+        but the alert is durable); False with no queue, or when the write failed.
         """
         if not self._fallback_queue_root:
             return False
-        from genesis.guardian.alert.queue import enqueue_alert
+        from genesis.guardian.alert.queue import enqueue_alert, list_queued
 
-        return enqueue_alert(
+        queued = enqueue_alert(
             self._fallback_queue_root,
             severity=str(alert.severity.value),
             source="guardian",
@@ -119,6 +121,15 @@ class AlertDispatcher:
                 "proposed_action": alert.proposed_action,
             },
         )
+        if queued:
+            return True
+        try:
+            return any(
+                e.get("dedupe_key") == alert.title
+                for _p, e in list_queued(self._fallback_queue_root)
+            )
+        except Exception:
+            return False
 
     async def test_all(self) -> dict[str, bool]:
         """Test connectivity for all channels. Returns {channel_class: success}."""
