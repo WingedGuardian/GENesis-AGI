@@ -8,7 +8,7 @@ import logging
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from genesis.observability.session_context import get_session_id as _get_context_session_id
 from genesis.observability.types import GenesisEvent, Severity, Subsystem
@@ -187,15 +187,27 @@ class GenesisEventBus:
         severity: Severity,
         event_type: str,
         message: str,
+        *,
+        occurred_seconds_ago: float | None = None,
         **details,
     ) -> GenesisEvent:
-        """Emit an event: log it and dispatch to all matching listeners."""
+        """Emit an event: log it and dispatch to all matching listeners.
+
+        ``occurred_seconds_ago`` back-dates the event's timestamp for an event that
+        reports something which happened earlier (e.g. a coalesced failure count
+        declared after its window closed), so recency consumers ("still active",
+        "last seen") see when it happened, not when it was reported. Negative
+        values are treated as 0. It is not stored in ``details``.
+        """
+        timestamp = self._clock()
+        if occurred_seconds_ago is not None and occurred_seconds_ago > 0:
+            timestamp -= timedelta(seconds=occurred_seconds_ago)
         event = GenesisEvent(
             subsystem=subsystem,
             severity=severity,
             event_type=event_type,
             message=message,
-            timestamp=self._clock().isoformat(),
+            timestamp=timestamp.isoformat(),
             details=details,
         )
 
