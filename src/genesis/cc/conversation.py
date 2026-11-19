@@ -598,6 +598,7 @@ class ConversationLoop:
         chat_ref = str(chat_id) if chat_id else user_id.replace("tg-", "")
 
         async with self._get_lock(session["id"]):
+            session, model, effort = await self._resolve_under_lock(session, intent, channel)
             effort = await self._persist_overrides(
                 session, model, effort, effort_explicit=bool(intent.effort_override),
             )
@@ -918,6 +919,7 @@ class ConversationLoop:
         chat_ref = str(chat_id) if chat_id else user_id.replace("tg-", "")
 
         async with self._get_lock(session["id"]):
+            session, model, effort = await self._resolve_under_lock(session, intent, channel)
             # Capture old values before persisting overrides (for change feedback)
             old_model = session.get("model")
             old_effort = session.get("effort")
@@ -2044,6 +2046,26 @@ class ConversationLoop:
             return EffortLevel(session["effort"])
         return self._default_effort
 
+    async def _resolve_under_lock(
+        self, session: dict, intent, channel,
+    ) -> tuple[dict, CCModel, EffortLevel]:
+        """Re-read the session row once the session lock is held, and resolve the
+        turn's model and effort from that one read.
+
+        ``session`` was read before the lock, and ``/model``, ``/effort`` and
+        ``session_config`` write the row without it, so the snapshot may be stale.
+        Resolving both fields from the same fresh row keeps the turn's model and
+        effort a matching pair. A failed read keeps the snapshot."""
+        try:
+            fresh = await cc_sessions.get_by_id(self._db, session["id"]) or session
+        except Exception:
+            logger.warning("Session re-read under the lock failed", exc_info=True)
+            fresh = session
+        model = intent.model_override or (
+            CCModel(fresh["model"]) if fresh.get("model") else self._default_model
+        )
+        return fresh, model, self._resolve_effort(intent, model, fresh, channel)
+
     async def _persist_overrides(
         self, session: dict, model: CCModel, effort: EffortLevel, *, effort_explicit: bool,
     ) -> EffortLevel:
@@ -2055,9 +2077,12 @@ class ConversationLoop:
         written over a model change: ``session`` is a snapshot taken before the
         session lock, so its effort may be stale, and the atomic model-only update
         decides the effort from the row as it is. The turn then runs with the
-        effort that update applied. When the channel configures a default for
-        the new model, a real switch takes that default even over an effort set
-        while the switch waited: that effort was chosen for the old model.
+        effort that update stored, returned by the write itself. ``session`` is
+        the row read under the lock (``_resolve_under_lock``), so with nothing to
+        write the resolved effort is already the row's own. When the channel
+        configures a default for the new model, a real switch takes that default
+        even over an effort set while the switch waited: that effort was chosen
+        for the old model.
         """
         new_model = str(model) if str(model) != session.get("model") else None
         if effort_explicit:
@@ -2066,17 +2091,10 @@ class ConversationLoop:
             new_effort = None  # an inferred effort is never written; the row keeps its own
         if not (new_model or new_effort):
             return effort
-        await cc_sessions.update_model_effort(
+        stored = await cc_sessions.apply_model_effort(
             self._db, session["id"], model=new_model, effort=new_effort,
         )
-        applied = effort
-        if new_model and not effort_explicit:
-            try:
-                row = await cc_sessions.get_by_id(self._db, session["id"])
-                if row and row.get("effort"):
-                    applied = EffortLevel(row["effort"])
-            except Exception:
-                logger.warning("Applied effort read-back failed", exc_info=True)
+        applied = EffortLevel(stored) if stored else effort
         logger.info(
             "Session %s updated: model=%s effort=%s",
             session["id"][:8], model, applied,

@@ -1329,3 +1329,33 @@ async def test_a_switch_takes_the_configured_default_over_an_effort_set_meanwhil
     )
     row = await cc_sessions.get_by_id(db, "tg-q-3")
     assert (row["model"], row["effort"], applied) == ("opus", "medium", EffortLevel.MEDIUM)
+
+
+@pytest.mark.asyncio
+async def test_the_turn_resolves_model_and_effort_from_the_row_under_the_lock(loop, db):
+    """The snapshot is read before the lock and /model, /effort write without it, so
+    the turn resolves both from one re-read: an /effort set while it waited is used,
+    and a /model that landed meanwhile never runs with the old model (review findings)."""
+    from genesis.cc.types import CCModel, EffortLevel
+
+    await cc_sessions.create(
+        db, id="tg-q-4", session_type="foreground", model="sonnet", effort="high",
+        started_at="2026-11-18T00:00:00+00:00", last_activity_at="2026-11-18T00:00:00+00:00",
+        user_id="tg-q-4", channel=str(ChannelType.TELEGRAM),
+    )
+    snapshot = await cc_sessions.get_by_id(db, "tg-q-4")
+    plain = SimpleNamespace(model_override=None, effort_override=None)
+    tg = ChannelType.TELEGRAM
+
+    await cc_sessions.update_model_effort(db, "tg-q-4", effort="max")
+    fresh, model, effort = await loop._resolve_under_lock(snapshot, plain, tg)
+    assert (model, effort, fresh["effort"]) == (CCModel.SONNET, EffortLevel.MAX, "max")
+    assert await loop._persist_overrides(fresh, model, effort, effort_explicit=False) == "max"
+
+    await cc_sessions.update_model_effort(db, "tg-q-4", model="opus", effort="low")
+    _, model, effort = await loop._resolve_under_lock(snapshot, plain, tg)
+    assert (model, effort) == (CCModel.OPUS, EffortLevel.LOW)
+
+    explicit = SimpleNamespace(model_override=None, effort_override=EffortLevel.MEDIUM)
+    _, model, effort = await loop._resolve_under_lock(snapshot, explicit, tg)
+    assert (model, effort) == (CCModel.OPUS, EffortLevel.MEDIUM)

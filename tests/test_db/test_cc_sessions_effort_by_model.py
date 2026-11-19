@@ -144,3 +144,15 @@ async def test_a_concurrent_explicit_switch_is_not_overwritten(db, per_model, mo
     assert await cc_sessions.update_model_effort(db, "s1", model="opus")
     row = await cc_sessions.get_by_id(db, "s1")
     assert (row["model"], row["effort"]) == ("opus", "max")
+
+
+@pytest.mark.asyncio
+async def test_apply_returns_the_effort_the_write_stored(db, per_model):
+    """The effort comes back from the UPDATE itself, so a caller never needs a
+    later read that another writer could change (review finding: read-back race)."""
+    await _session(db)
+    assert await cc_sessions.apply_model_effort(db, "s1", model="opus") == "medium"
+    assert await cc_sessions.apply_model_effort(db, "s1", effort="max") == "max"
+    assert await cc_sessions.apply_model_effort(db, "missing", model="opus") is None
+    assert await cc_sessions.apply_model_effort(db, "s1") is None
+    assert not await cc_sessions.update_model_effort(db, "missing", model="opus")

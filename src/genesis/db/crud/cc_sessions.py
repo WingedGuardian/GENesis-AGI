@@ -691,7 +691,24 @@ async def update_model_effort(
     model: str | None = None,
     effort: str | None = None,
 ) -> bool:
-    """Update model and/or effort on an existing session.
+    """Update model and/or effort on an existing session; True when a row changed.
+
+    See ``apply_model_effort``, which also returns the effort the row now holds."""
+    return await apply_model_effort(db, id, model=model, effort=effort) is not None
+
+
+async def apply_model_effort(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    model: str | None = None,
+    effort: str | None = None,
+) -> str | None:
+    """Update model and/or effort on an existing session; return the stored effort.
+
+    The effort comes back from the write itself (``RETURNING``), so it is the
+    effort this update left in the row, never a later read that another writer
+    could have changed. None when nothing was updated (no such row, or nothing to set).
 
     A model given without an effort takes the session channel's per-model default
     when one is configured (``default_effort_for_model``, #4854); every model
@@ -715,14 +732,15 @@ async def update_model_effort(
         updates.append("effort = ?")
         params.append(effort)
     if not updates:
-        return False
+        return None
     params.append(id)
     cursor = await db.execute(
-        f"UPDATE cc_sessions SET {', '.join(updates)} WHERE id = ?",
+        f"UPDATE cc_sessions SET {', '.join(updates)} WHERE id = ? RETURNING effort",
         tuple(params),
     )
+    row = await cursor.fetchone()
     await db.commit()
-    return cursor.rowcount > 0
+    return row[0] if row else None
 
 
 async def query_by_skill_tag(
