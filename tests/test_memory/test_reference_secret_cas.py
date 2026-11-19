@@ -296,6 +296,7 @@ async def test_a_placeholder_re_ingest_whose_identifier_carries_the_stored_value
     moved = await _ingest(
         db, _PointStore(), _body("Example router", ro.SECRET_PLACEHOLDER), concept=legacy,
     )
-    assert moved == unit and (await kc.get(db, moved))["concept"].startswith("router [held] #")
+    assert moved == unit and re.fullmatch(r"cred-[0-9a-f]{12}", (await kc.get(db, moved))["concept"])
+    assert ro.display_name(await kc.get(db, moved)) == "router [held]"
     assert await kc.get_reference_secret(db, moved) == "password: Kept!Fake5"
     assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 1

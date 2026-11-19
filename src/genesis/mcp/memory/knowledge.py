@@ -357,14 +357,16 @@ async def _ingest_knowledge_unit(
         entry_key=entry_key,
     )
     stored_as = getattr(stored, "name", None)
+    candidates = getattr(stored, "candidates", ())
+    note = f" (new entry; the name also matches {', '.join(candidates)}: pass entry_key to update one)" if candidates else ""
     if (
         not report_name
         or not holds_secret(project, domain)
         or stored_as is None
         or stored_as == concept
     ):
-        return stored
-    return f"{stored} (stored as: {stored_as})"
+        return f"{stored}{note}" if note and report_name else stored
+    return f"{stored} (stored as: {stored_as}){note}"
 
 
 @mcp.tool()
@@ -566,7 +568,7 @@ async def reference_store(
     added automatically.
 
     ``source`` is optional provenance (``session_id``, ``captured_via``,
-    ``captured_at``). Surfaced in the body for audit trails.
+    ``captured_at``). Shown in the body; held for credentials.
 
     Returns the stored row's unit_id, followed by
     `` (stored as: <name>)`` when a credential's searchable name differs from
