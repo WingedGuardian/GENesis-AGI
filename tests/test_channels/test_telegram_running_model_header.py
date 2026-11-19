@@ -153,6 +153,26 @@ def test_a_reply_the_loop_wrote_gets_no_header(reply):
     assert _with_model_prefix(_streamer(prefix="[Opus 5.5 / High]"), reply) == reply
 
 
+def test_every_settings_confirmation_is_recognised():
+    from genesis.cc.conversation import _settings_confirmation, is_non_model_reply
+    from genesis.cc.types import CCModel, EffortLevel
+
+    for model in (None, *CCModel):
+        for effort in (None, *EffortLevel):
+            assert is_non_model_reply(_settings_confirmation(model, effort))
+
+
+@pytest.mark.parametrize(
+    "reply",
+    ["Model: logistic regression fits best here.", "Effort: matters more than talent.",
+     "Model: Opus | Effort: high, and here is why", "Settings unchanged. Also, about X"],
+)
+def test_an_answer_that_starts_like_a_confirmation_keeps_its_header(reply):
+    """Only the exact confirmation is the loop's own reply (review finding)."""
+    s = _streamer(prefix="[Opus 5.5 / High]")
+    assert _with_model_prefix(s, reply) == "[Opus 5.5 / High]\n" + reply
+
+
 def _ctx_for_gap(prev_ts, *, drafts=True):
     cursor = MagicMock()
     cursor.fetchone = AsyncMock(return_value=None if prev_ts is None else (prev_ts,))

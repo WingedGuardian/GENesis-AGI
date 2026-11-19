@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 #: Imported rather than re-spelled: comparing against a copied string is
 #: how the rescue below silently stops firing when the notice is reworded.
-from genesis.cc.conversation import _TRUNCATION_NOTICE, NON_MODEL_REPLY_PREFIXES
+from genesis.cc.conversation import _TRUNCATION_NOTICE, is_non_model_reply
 
 log = logging.getLogger(__name__)
 
@@ -127,7 +127,7 @@ def _with_model_prefix(streamer: DraftStreamer | None, response: str) -> str:
     """
     if not (streamer and streamer._prefix):
         return response
-    if response.startswith(NON_MODEL_REPLY_PREFIXES):
+    if is_non_model_reply(response):
         return response
     return streamer._prefix + "\n" + response
 

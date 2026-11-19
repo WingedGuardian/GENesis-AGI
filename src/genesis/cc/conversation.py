@@ -156,6 +156,7 @@ CONTINGENCY_HEADER_PREFIX = "[Contingency mode"
 
 #: Replies the loop writes itself rather than a model: the Telegram relay header
 #: names a model, so these carry none. Prefixes, because some interpolate an error.
+#: The settings confirmation is matched whole instead (``is_non_model_reply``).
 NON_MODEL_REPLY_PREFIXES = (
     CONTINGENCY_HEADER_PREFIX,  # carries its own [Contingency mode via ...] label
     "[Genesis ",  # timeout and error replies
@@ -163,10 +164,32 @@ NON_MODEL_REPLY_PREFIXES = (
     "[Rate limit reached",  # rate_limit_park.resume_copy
     "\u26a0\ufe0f Genesis ",  # _TRUNCATION_NOTICE, _CAPPED_AFTER_TOOLS_NOTICE
     "\u26a0\ufe0f This attempt ",  # _replay_notice, incl. the memory-pressure kill
-    "Model: ",  # an intent-only settings confirmation (no CC run)
-    "Effort: ",
-    "Settings unchanged.",
 )
+_MODEL_WORDS = "|".join(re.escape(m.value.title()) for m in CCModel)
+_EFFORT_WORDS = "|".join(re.escape(e.value) for e in EffortLevel)
+#: Exactly what ``_settings_confirmation`` writes, so a model answer that only
+#: starts with "Model: " or "Effort: " keeps its header.
+_SETTINGS_CONFIRMATION = re.compile(
+    rf"Model: (?:{_MODEL_WORDS})(?: \| Effort: (?:{_EFFORT_WORDS}))?"
+    rf"|Effort: (?:{_EFFORT_WORDS})|Settings unchanged\."
+)
+
+
+def _settings_confirmation(model: CCModel | None, effort: EffortLevel | None) -> str:
+    """The reply to an intent-only message (no CC run): what changed."""
+    parts = []
+    if model is not None:
+        parts.append(f"Model: {model.value.title()}")
+    if effort is not None:
+        parts.append(f"Effort: {effort.value}")
+    return " | ".join(parts) if parts else "Settings unchanged."
+
+
+def is_non_model_reply(text: str) -> bool:
+    """True for a reply the loop wrote itself, which carries no model header."""
+    return text.startswith(NON_MODEL_REPLY_PREFIXES) or bool(
+        _SETTINGS_CONFIRMATION.fullmatch(text)
+    )
 
 # Delimiters of the recap a FRESH turn carries in its system prompt. The home
 # CC session reads it there; `_try_contingency` lifts it OUT, because for the
@@ -983,12 +1006,10 @@ class ConversationLoop:
             # no remaining text) — persist overrides and return confirmation
             # without invoking CC subprocess.
             if intent.intent_only:
-                parts = []
-                if str(model) != old_model:
-                    parts.append(f"Model: {model.value.title()}")
-                if str(effort) != old_effort:
-                    parts.append(f"Effort: {effort.value}")
-                return " | ".join(parts) if parts else "Settings unchanged."
+                return _settings_confirmation(
+                    model if str(model) != old_model else None,
+                    effort if str(effort) != old_effort else None,
+                )
 
             # Session recovery detection: if session was reset or this is
             # a fresh session (no cc_session_id) with recent message history,
