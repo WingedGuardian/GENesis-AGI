@@ -1,0 +1,1 @@
+- **Procedure writes redact credential-shaped text.** Every procedure write redacts credential-shaped values (API keys, `NAME=secret` assignments, and passwords given on a command line or in prose) before it is saved, and keeps the text around them. `scripts/audit_procedure_secrets.py` reports existing procedures that hold such text, by id and kind only, without changing them.

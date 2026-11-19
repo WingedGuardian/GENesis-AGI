@@ -1,18 +1,17 @@
 """Credential scrub for procedure text, applied where every procedure is written (#4859).
 
-Procedures are recalled into any session whose work matches them, so a credential
-in one is quoted onward. Struggle extraction tells the model never to embed secrets
-(``judge.py``), and nothing in code enforced it: 642d8142-class rows held a login in
-plaintext.
+Procedures are recalled into any session whose work matches them, so procedure
+text is kept free of credential values. Struggle extraction also asks the model
+not to embed secrets (``judge.py``); this is the code-level layer under that.
 
 Two layers:
 * The repo's recall-first scrubber (``scripts/hooks/secret_scrub.py``, reached
   through the transcript-analytics adapter): key shapes and ``NAME=value`` /
   ``label: value`` forms. It redacts the VALUE only, so the rest of a command
   survives.
-* Two forms it misses, which procedures actually used (MEASURED 2026-11-17: 25 and
-  31 of 7,529 procedures): ``sshpass -p <value>``, and ``password <value>`` in prose,
-  bare or quoted. A ``$VAR``, ``${...}`` or ``$(...)`` names a secret and is kept.
+* Procedure-specific forms: a password given to ``sshpass -p``, and ``password
+  <value>`` in prose, bare or quoted. A ``$VAR``, ``${...}`` or ``$(...)`` names a
+  secret and is kept.
 
 The scrub runs on parsed values (strings inside lists and dicts), never on JSON
 text. When the shared scrubber cannot run, ``ScrubFailed`` tells the caller to
