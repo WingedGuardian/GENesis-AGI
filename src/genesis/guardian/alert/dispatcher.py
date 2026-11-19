@@ -100,8 +100,11 @@ class AlertDispatcher:
         """Persist a failed-delivery alert to the durable queue (best-effort).
 
         True when it is queued, including when a live entry with the same title
-        was already waiting (enqueue_alert skips that write and returns False,
-        but the alert is durable); False with no queue, or when the write failed.
+        is the newest entry waiting (enqueue_alert skips that write and returns
+        False, but the alert is durable). An older copy with entries queued after
+        it, such as an all-clear, belongs to an earlier episode and will not page
+        this one, so it does not count. False with no queue, or when the write
+        failed.
         """
         if not self._fallback_queue_root:
             return False
@@ -124,12 +127,10 @@ class AlertDispatcher:
         if queued:
             return True
         try:
-            return any(
-                e.get("dedupe_key") == alert.title
-                for _p, e in list_queued(self._fallback_queue_root)
-            )
+            entries = list_queued(self._fallback_queue_root)
         except Exception:
             return False
+        return bool(entries) and entries[-1][1].get("dedupe_key") == alert.title
 
     async def test_all(self) -> dict[str, bool]:
         """Test connectivity for all channels. Returns {channel_class: success}."""

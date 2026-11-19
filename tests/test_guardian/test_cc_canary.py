@@ -224,6 +224,29 @@ async def test_an_alert_already_queued_counts_as_delivered(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_queued_copy_from_an_earlier_episode_does_not_count(tmp_path):
+    # Channels stay down through fail, recover, fail. The first warning and its
+    # all-clear are both still queued, so the drain would replay them in that
+    # order and end on "recovered". The new failure must not count as delivered
+    # off the old warning, or it is never paged.
+    from genesis.guardian.alert.base import Alert, AlertSeverity
+    from genesis.guardian.alert.dispatcher import AlertDispatcher
+    from genesis.guardian.alert.queue import list_queued
+
+    queue = tmp_path / "queue"
+    dispatcher = AlertDispatcher([_DeadChannel()], fallback_queue_root=queue)
+    warning = Alert(severity=AlertSeverity.WARNING, title="cannot authenticate", body="b")
+    all_clear = Alert(severity=AlertSeverity.INFO, title="can authenticate again", body="b")
+    assert await dispatcher.send_or_queue(warning) is True
+    assert await dispatcher.send_or_queue(all_clear) is True
+    assert await dispatcher.send_or_queue(warning) is False
+    assert [e["title"] for _, e in list_queued(queue)] == [
+        "cannot authenticate",
+        "can authenticate again",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_a_queued_page_counts_as_delivered(tmp_path, monkeypatch):
     # Telegram is down: the real dispatcher queues the page for the host queue
     # drain to replay. The episode is paged, so no repeat warning, and recovery
