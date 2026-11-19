@@ -1771,6 +1771,11 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE reference_secrets ADD COLUMN detail TEXT",
         "reference_secrets.detail")
+    # And before a credential's caller metadata was held with it (#2426;
+    # migration 20261111230000_reference_secrets_meta adds the same column).
+    await _try_alter(db,
+        "ALTER TABLE reference_secrets ADD COLUMN meta TEXT",
+        "reference_secrets.meta")
     # A credential's name identity (#2426), indexed by INDEXES; migration
     # 20261115060803_credential_name_hash adds the same columns and backfills them.
     await _try_alter(db,
@@ -2261,6 +2266,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE tool_call_outcomes ADD COLUMN tool_use_id TEXT",
         "tool_call_outcomes.tool_use_id",
     )
+    # Class of each failed call and the writer's insert time (#4722). Mirrored
+    # in migration 20261115161928_tco_error_class_recorded_at for the runner.
+    for _col in ("error_class", "recorded_at"):
+        await _try_alter(
+            db,
+            f"ALTER TABLE tool_call_outcomes ADD COLUMN {_col} TEXT",
+            f"tool_call_outcomes.{_col}",
+        )
 
     # How a session ENDED (crud.cc_sessions.update_status). Mirrored in
     # migration 20261104144136 for the standalone runner; here so an existing DB

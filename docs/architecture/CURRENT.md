@@ -154,29 +154,33 @@ Easy-to-forget mechanisms:
   one chokepoint every reference writer passes) indexes only the header (the
   identifier), `[description held in the reference secret store]`,
   `Value: [held in the reference secret store; read it with reference_lookup]`
-  and the Tags/Captured trailer (`reference_ops.split_secret`), so the unit's
+  and one Tags line (`reference_ops.split_secret`), so the unit's
   knowledge_units and knowledge_fts rows, its memory_fts row, the Qdrant payload
   and the embedding never see the value or the free-text description (no
   scrub of free text: owner ruling, every spelling was another way through).
-  The identifier, tags, authority and provenance are not scrubbed. The value is
+  The value is
   probed whole and by its fragments: percent-decoded, NFKC-normalised, split on
   whitespace and `: / @ ? & = # ; , | \ < > " ' ( ) { } [ ]` (so a URL, DSN,
   key=value, XML or pipe-separated password is a fragment of its own), leaving out host names, URL schemes and ports, and keeping each
   secret-shaped fragment; matching is normalised (NFKC, format characters
-  removed, casefolded) and percent-decoded. An identifier, body header, or
-  ANY other caller field that can reach a store (authority, memory class,
-  purpose, ingestion source, and every provenance value, nested or not, each
-  read as text by `knowledge_ingest.field_text` and leaf by leaf) that carries
-  a probe refuses the write (`reference_ops.refuse_value_in_fields`; the
-  identifier with its own message, and the `[reference.credentials] {identifier}`
-  header by the identifier rule only when it is exactly that header). A caller
-  tag that carries a probe is dropped whole, from the tags and the body's Tags
-  line, and the write goes on (`reference_ops.drop_value_tags`), so a heuristic
-  match on an ordinary tag costs that tag, never the capture. Stated limits: a
+  removed, casefolded) and percent-decoded. Nothing is refused to keep a
+  secret out of the index. The caller's other fields (authority, provenance,
+  purpose, ingestion source, relationships, caveats, and the identifier and tags
+  as given) are held with the value in `reference_secrets.meta`, never indexed,
+  and returned by a reveal (`reference_ops.reveal_meta`). The chokepoint BUILDS
+  the indexed body (header, placeholders, one Tags line); no caller text after
+  the header is indexed. The identifier and the tags, the only indexed fields,
+  have every span of the value masked as `[held]` before they are capped
+  (`reference_masks.ValueMask`), with probes from the value, the value it
+  replaces, and every value and recorded masked span of the entries the name
+  resolves to. A term-shaped probe is skipped only when every source it comes
+  from was free prose (an upload's or a distilled unit's text, recorded as
+  `value_is_prose`); a known held value or a recorded span is always masked. A
+  missing identifier is named `credential` and always makes a new entry. Stated limits: a
   secret that reads as a plain word (all letters, or under four characters) is
   matched only as the whole value, and so is a fragment that is all digits or
   shaped like a host name (dotted labels ending in letters). A credential's memory class becomes an
-  indexed tag, so it must be None or a known class (`classification.CLASS_WEIGHTS`).
+  indexed tag, so one that is not a known class (`classification.CLASS_WEIGHTS`) is stored as `fact`.
   The value and the description (`detail`)
   go to one insert-only `reference_secrets` row under a fresh random id, and ONE statement
   then writes the unit naming it in `knowledge_units.secret_ref`, so a body and
@@ -189,30 +193,33 @@ Easy-to-forget mechanisms:
   **A credential's key is opaque and its identity is the hash of its name.**
   A new credential is stored under `concept = cred-<12 hex>`
   (`secrets.token_hex(6)`, checked absent), never derived from the name or the
-  value; the name is the body's header line. `knowledge_units.name_hash`
+  value. The full name is held in `reference_secrets.meta` (`identifier`);
+  the body's header line carries it masked and capped (512 characters), and a
+  name that differs from the identifier given is returned as
+  ` (stored as: <name>)`. `knowledge_units.name_hash`
   (`reference_ops.name_hash`: card-redacted, NFKC, format characters removed,
   casefolded, whitespace collapsed, sha256) and `name_origin` (`trusted`,
   `untrusted`, `carded`) are written by the INSERT and never changed by an
   update. A trusted write by name updates the earliest trusted entry with that
-  hash, else an entry with no hash yet whose recorded name matches (a legacy
-  plain key, or one with a trailing ` #xxxxxx` removed), which that write gives
+  hash, else an entry with no hash yet whose recorded name matches (the
+  identifier its meta records, else a legacy plain key by its exact text), which that write gives
   the hash; else it mints a new key. A partial unique index
   (`idx_knowledge_units_name_hash`, trusted rows with a 64-character hash) makes
   concurrent first saves of a name one entry. `entry_key=` (trusted callers,
   credentials only; `reference_store(entry_key=...)`) writes to an existing
   entry by key and keeps its recorded name; an unknown key is refused with
   nothing written, and text that reads like a key passed as an identifier is a
-  name. Any update keeps the name the entry records. An insert-only write
-  returns an untrusted entry under that hash with the same value and
-  description, else adds a new entry; it never updates one. A card-redacted name
+  name. Any update keeps the full name the entry records in its meta. An
+  insert-only write (uploads and distillation, through
+  `ingest_untrusted_credential`) returns an untrusted entry under that hash with
+  the same name, value and description (`knowledge_crud.same_untrusted`), else
+  adds a new entry; it never updates one, and a trusted write never adopts one. A card-redacted name
   reuses an entry only when it holds the same value. Migration
   `20261115060803_credential_name_hash` backfills existing credentials; of
   legacy names differing only in case the earliest keeps the hash, and each
   later one gets one the index leaves out (still stored, revealable,
   deletable). The dashboard list and `reference_lookup` show the name
   (`reference_ops.display_name`); lookup results carry the key as `concept`.
-  `ingest_knowledge_unit(insert_only=True)` has no writer yet: it is the
-  mechanism a later change wires the extraction job's auto-capture to.
   Two `knowledge_units` triggers refuse a
   credential body without exactly one placeholder line, whichever process
   writes it (text on a later line only the Python check sees).
@@ -4022,8 +4029,28 @@ verified: 3f70a665b 2026-11-15
   back. In
   shadow the whole session is still built; one `Lesson segment [shadow]` log
   line per built session says what the new part would do, and the marker moves
-  by compare-and-set when the builder ran and the cap allowed. `incremental` is
-  not built yet and reads as shadow.
+  by compare-and-set when the builder ran and the cap allowed. `incremental`
+  (#4813, needs `mode: live`, else it runs as shadow) replaces the whole build:
+  `_judge_from_marker` (in `learning/procedural/incremental.py`, which the
+  extraction cycle and the drain call into) judges up to 4 parts per pass from the marker in the cycle, and in the drain
+  up to 4 parts but at most 1 builder call per queued item (the drain runs before memory extraction, so its worst case
+  stays a batch of 20 single builder calls), each with up to 20
+  earlier tool turns shown for reference only and the session origin from the
+  whole spine, a timeout per part, and a compare-and-set after each. A
+  `candidates` flag triggers every part of its request. Entries left over
+  (budget, spent cap, failed build, a marker another writer moved) queue one
+  `procedure_rebuild` item per session that says only "continue from the
+  marker". A call left waiting for its result is judged when the result comes:
+  with a message, by the next cycle; alone, the empty-message branch queues the
+  drain when that result made an entry after the marker ready (a hook or
+  system line queues nothing), and the drain never re-queues a call still
+  waiting. A request merged into an
+  item a drain already claimed is queued again. The drain reads every
+  such item by the current mode (incremental judges from the marker, whole or
+  shadow rebuilds the whole session), claims it atomically, retries a failure up
+  to 8 attempts and then raises `procedure_extraction_lost`. Each lesson built
+  from a part also logs its grounding against the part alone, to measure
+  lessons built from the context turns.
 - **eval/**: J9 = fire-and-forget emit hooks on live cognitive paths (the
   "cannot break production" contract — hooks must never raise) + weekly Sunday
   aggregation (hard 7-day window) + an on-demand batch judge as a surplus

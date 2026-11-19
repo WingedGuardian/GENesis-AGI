@@ -1,12 +1,11 @@
 """Masking a held-out credential value in the fields that are indexed (#2426).
 
-The probes of a value for masking (``_value_probes`` here: the secret parts of
-the value besides its fragments; ``reference_ops._value_probes`` stays the
-refusal check's) feed ``ValueMask`` and its span matcher, the probe sets a
-write builds (``value_masks``), and the caps that cut a masked field never
-through a mask. Every indexed field of a
-credential (its identifier and tags) is masked with these before it is stored;
-the original is held in ``reference_secrets``.
+Split out of ``reference_ops`` (which re-exports the public names): the probes
+of a value (``_value_probes``), ``ValueMask`` and its span matcher, the probe
+sets a write builds (``value_masks``), and the caps that cut a masked field
+never through a mask. Every indexed field of a credential (its identifier and
+tags) is masked with these before it is stored; the original is held in
+``reference_secrets``.
 """
 
 from __future__ import annotations
@@ -14,18 +13,41 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from urllib.parse import unquote
 
 from genesis.db.crud.knowledge import DETAIL_PLACEHOLDER, SECRET_PLACEHOLDER
-from genesis.memory.reference_ops import (
-    _FRAGMENT_SPLIT,
-    _HOSTNAME,
-    _MIN_TOKEN,
-    _SCHEME,
-    _TOKEN_EDGE,
-    _decoded,
-    _secret_token,
-)
-from genesis.memory.reference_ops import _normalise as _refusal_form
+
+#: What a masked span of a held-out value reads as in an indexed field. Short,
+#: fixed, and no credential keyword, so it is no secret-scanner hit.
+HELD_MASK = "[held]"
+
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_MIN_TOKEN = 4
+_TOKEN_EDGE = ".,;:!?()[]{}\"'"  # noqa: S105 - punctuation, not a secret
+
+
+_ASCII_DIGIT = re.compile(r"[0-9]")
+_ASCII_ALPHA = re.compile(r"[A-Za-z]")
+_ASCII_SYMBOL = re.compile(r"[^0-9A-Za-z]")
+
+
+def _secret_token(token: str) -> bool:
+    """A whitespace token that reads as a secret rather than a word: at least
+    four characters, letters or digits mixed with a digit or a symbol. Plain
+    words ("password", "Router") and email addresses never qualify."""
+    if len(token) < _MIN_TOKEN or _EMAIL.match(token):
+        return False
+    if token.isascii():
+        # The same three tests on ASCII, in C (an upload holds out megabytes).
+        has_digit = _ASCII_DIGIT.search(token) is not None
+        has_symbol = _ASCII_SYMBOL.search(token) is not None
+        has_alpha = _ASCII_ALPHA.search(token) is not None
+        return (has_digit or has_symbol) and (has_alpha or (has_digit and has_symbol))
+    has_digit = any(c.isdigit() for c in token)
+    has_symbol = any(not c.isalnum() for c in token)
+    has_alpha = any(c.isalpha() for c in token)
+    return (has_digit or has_symbol) and (has_alpha or (has_digit and has_symbol))
+
 
 #: Whitespace the masking form changes: a character other than a space, or a run.
 _SPACING = re.compile(r"[^\S ]|  ")
@@ -42,6 +64,18 @@ def _one_space(text: str) -> str:
     return (" " if text[0].isspace() else "") + " ".join(words) + (" " if text[-1].isspace() else "")
 
 
+def _refusal_form(text: str) -> str:
+    """``text`` as main's refusal check compared it, and as a credential's name
+    hash still reads it: NFKC (a fullwidth or other compatibility variant reads
+    as its plain form), every format character (Unicode category Cf: zero-width
+    spaces and joiners, the soft hyphen) removed, then casefolded."""
+    if text.isascii():
+        # NFKC leaves ASCII as it is, and no ASCII character is a format one.
+        return text.casefold()
+    folded = unicodedata.normalize("NFKC", text)
+    return "".join(c for c in folded if unicodedata.category(c) != "Cf").casefold()
+
+
 def _plain(text: str) -> str:
     """The masking form of ``text`` before spacing: format characters dropped
     (before NFKC too: a zero-width joiner between a letter and its accent would
@@ -54,17 +88,37 @@ def _plain(text: str) -> str:
 
 def _normalise(text: str) -> str:
     """``text`` as masking compares it: ``_plain`` with every whitespace run read
-    as one space, so a multi-word value spaced another way is the same value.
-    The refusal check itself keeps main's rules."""
+    as one space, so a multi-word value spaced another way is the same value."""
     if text.isascii():
         return _one_space(text.casefold())
     return _one_space(_plain(text))
 
 
-#: What a masked span of a held-out value reads as in an indexed field. Short,
-#: fixed, and no credential keyword, so it is no secret-scanner hit.
-HELD_MASK = "[held]"
+def _decoded(text: str) -> set[str]:
+    """``text`` and its percent-decoded forms, up to three rounds, decoding the
+    NFKC form too: a fullwidth escape (``％21``) is an escape once normalised."""
+    forms = {text}
+    for _ in range(3):
+        text = unquote(unicodedata.normalize("NFKC", text)) if not text.isascii() else unquote(text)
+        forms.add(text)
+    return forms
 
+
+def _escaped(text: str) -> bool:
+    """Whether ``text`` holds a percent escape, fullwidth ones included."""
+    return bool(_ESCAPE.search(text)) or (
+        not text.isascii() and bool(_ESCAPE.search(unicodedata.normalize("NFKC", text)))
+    )
+
+
+#: Where a structured value (a URL, a DSN, a key=value line, a header, XML,
+#: a pipe- or backslash-separated record) splits into its parts, applied to the
+#: NFKC form so fullwidth punctuation splits too. One generic fragmentation, no
+#: per-format parser.
+_FRAGMENT_SPLIT = re.compile(r"[\s:/@?&=#;,|\\<>\"'`(){}\[\]]+")
+#: A host name: dotted labels ending in an alphabetic top-level label.
+_HOSTNAME = re.compile(r"^(?:[a-z0-9-]+\.)+[a-z]{2,}$")
+_SCHEME = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]{0,31})://")
 #: A URL scheme, as it ends just before ``://``.
 _SCHEME_BEFORE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]{0,31}$")
 #: A well-formed URL authority (``userinfo@host:port``), up to its path,
@@ -420,9 +474,9 @@ class ValueMask:
         spans += [
             m.span()
             for m in re.finditer(r"\S+", text)
-            if _ESCAPE.search(m.group()) and self.carries(m.group())
+            if _escaped(m.group()) and self.carries(m.group())
         ]
-        if spans and _ESCAPE.search(text):
+        if spans and _escaped(text):
             # A multi-word value with one word percent-encoded is a hit only in
             # the decoded text, across tokens: the smallest run of whole tokens
             # that carries it decoded is masked, so no word of it stays visible.
@@ -440,28 +494,31 @@ class ValueMask:
     def _encoded_run_spans(self, text: str) -> list[tuple[int, int]]:
         """The original spans of every smallest run of 2 to ``window``
         whitespace-delimited tokens of ``text`` that holds a percent escape and,
-        decoded, a multi-word secret or secret part (neither run without its
-        first or its last token does); the whole field when only a run longer
-        than the window holds it."""
+        decoded, a multi-word secret or secret part, smallest for THAT form
+        (neither run without its first or its last token holds it, so a shorter
+        held value never disqualifies a longer one); the whole field when the
+        decoded text holds a form no such run covers (only a run longer than the
+        window holds it)."""
 
-        def holds_whole(run: str) -> bool:
-            return any(w in _normalise(form) for form in _decoded(run) for w in self._multi)
+        def holds(run: str) -> set[str]:
+            forms = [_normalise(form) for form in _decoded(run)]
+            return {w for w in self._multi if any(w in form for form in forms)}
 
         tokens = [m.span() for m in re.finditer(r"\S+", text)]
         found = []
+        covered: set[str] = set()
         for width in range(2, min(self.window, _WINDOW_MAX) + 1):
             for i in range(len(tokens) - width + 1):
                 start, stop = tokens[i][0], tokens[i + width - 1][1]
                 run = text[start:stop]
-                if (
-                    _ESCAPE.search(run)
-                    and holds_whole(run)
-                    and not holds_whole(text[tokens[i + 1][0] : stop])
-                    and not holds_whole(text[start : tokens[i + width - 2][1]])
-                ):
+                if not _escaped(run):
+                    continue
+                inner = holds(text[tokens[i + 1][0] : stop]) | holds(text[start : tokens[i + width - 2][1]])
+                own = holds(run) - inner
+                if own:
                     found.append((start, stop))
-        if not found and holds_whole(text):
-            # Longer than the window (``_WINDOW_MAX`` tokens): the whole field.
+                    covered |= own
+        if holds(text) - covered:
             found.append((0, len(text)))
         return found
 
@@ -637,6 +694,35 @@ def _captured_probes(texts: list[str | None]) -> tuple[list[tuple[str, bool]], l
     return [(probe, as_word) for probe, as_word in probes if probe.strip()], secrets
 
 
+def _usernames(text: str) -> set[str]:
+    """Every probe form of every username ``text`` names (the login half of a
+    "login / secret" value, a labelled username, an email of a credential pair,
+    the user of a URL's userinfo), each whole and its fragments: a username is
+    never masked, whatever the password contains (owner ruling 2026-11-18).
+    A secret part of ``text`` (a secret half, a URL password, a captured
+    secret) is never one of them unless it IS a username whole: the password
+    is masked whatever the username contains, and where the two are the same
+    text the username wins."""
+    from genesis.memory.reference_extraction import captured_secrets, captured_usernames
+
+    names = set(captured_usernames([text]))
+    login, sep, secret = text.strip().partition(" / ")
+    if sep and secret.strip():
+        names.add(login.strip().strip(_TOKEN_EDGE))
+    if not names:
+        return set()
+    wholes: set[str] = set()
+    forms: set[str] = set()
+    for name in names:
+        whole = {_normalise(form) for form in _decoded(name)}
+        wholes |= whole
+        forms |= whole | {probe for probe, _ in _value_probes(name)}
+    secrets = {probe for probe, _ in _secret_parts(text)} | {
+        _normalise(form) for found in captured_secrets([text]) for form in _decoded(found.strip())
+    }
+    return {form for form in forms if form.strip() and (form not in secrets or form in wholes)}
+
+
 def _login_of(value: str) -> str | None:
     """The login half of a "login / secret" value, normalised, or None."""
     login, sep, secret = value.strip().partition(" / ")
@@ -686,19 +772,26 @@ def value_masks(
     probes: list[tuple[str, bool]] = []
     words: set[str] = set()
     kept: set[str] = set()
-    # The identifier exempts a probe as a login only when EVERY source that
-    # produced it produced it as its login: one that requires it as a secret
-    # keeps it (a new password that is an old entry's login), and so does a
-    # secret part of the source itself (a secret half equal to its login).
+    # A login is never masked, in any field (owner ruling 2026-11-18: the
+    # username is the username, whatever the password contains, and the
+    # password is masked whatever the username contains): a source's own login
+    # is no probe even where its secret half equals or holds it. A probe stays
+    # when another source requires it as a secret (a new password that is an
+    # old entry's login).
     as_login: set[str] = set()
     as_secret: set[str] = set()
+    user_cache: dict[str, set[str]] = {}
     for text, is_prose in sources:
         own = _value_probes(text)
         probes += own
-        login = _login_of(text)
+        # A line-joined copy names the same usernames as its source text.
+        flat = " ".join(text.splitlines())
+        users = user_cache.get(flat)
+        if users is None:
+            users = user_cache[flat] = _usernames(text)
         parts = {probe for probe, _ in _secret_parts(text)}
-        as_login |= {probe for probe, _ in own if probe == login and probe not in parts}
-        as_secret |= {probe for probe, _ in own if probe != login or probe in parts}
+        as_login |= {probe for probe, _ in own if probe in users}
+        as_secret |= {probe for probe, _ in own if probe not in users}
         skip = (
             _prose_words(own, {_normalise(f) for f in _decoded(text.strip())}, taken | parts)
             if is_prose
@@ -712,7 +805,7 @@ def value_masks(
     named = [(p, w) for p, w in probes if p not in logins or p in whole]
     secrets = [text for text, _ in sources[1:]] + captured_texts
     return (
-        ValueMask(value, probes=probes, captured=captured, exempt=exempt, secrets=secrets),
+        ValueMask(value, probes=named, captured=captured, exempt=exempt, secrets=secrets),
         ValueMask(value, probes=named, captured=captured, exempt=exempt, secrets=secrets),
     )
 
@@ -906,7 +999,15 @@ def clean_tag_runs(mask: ValueMask, tags: list, render, prefix: str, suffix: str
     tags = list(tags)
     for _ in range(_SERIALISED_PASSES):
         parts = [render(t) for t in tags]
-        spans = mask.mask_spans(prefix + ", ".join(parts) + suffix)
+        rendered = prefix + ", ".join(parts) + suffix
+        tail = len(rendered) - len(suffix)
+        # A span wholly inside the fixed frame (a value spelling "Tags") is the
+        # frame, not a tag: it is never stored, so it masks nothing.
+        spans = [
+            (start, stop)
+            for start, stop in mask.mask_spans(rendered)
+            if not stop <= len(prefix) and not (suffix and start >= tail)
+        ]
         if not spans:
             return tags
         bounds, at = [], len(prefix)

@@ -97,6 +97,7 @@ def _block(keys, head, *, extra=()):
         "Premise: LEAD",
         "Premise-why: the change routes around an existing helper that already exists",
         "Impossible: route every call through one checked helper and delete the rest",
+        "Alternative: none found: searched scripts/ for an existing checked helper",
         "Scope: covered: the key round-trips (tests/test_x.py)",
         "Decision: close-class",
         "Decision-why: the same mistake appears twice in two different files",
@@ -587,6 +588,42 @@ def test_round_zero_still_refuses_an_escalating_reflection(pr, tmp_path):
     escalating = _block(["c9"], fix).replace("Escalate: no", "Escalate: yes")
     _reflect(path, tmp_path, escalating, T0 + timedelta(minutes=120))
     assert _credit(path, budget) == set()
+
+
+_NO_ALTERNATIVE = "Alternative: none found: searched scripts/ for an existing checked helper\n"
+
+
+@pytest.mark.parametrize("round_zero", [True, False])
+@pytest.mark.parametrize("committed_after_cutover", [True, False])
+def test_a_fix_now_answer_owes_its_alternative_line_from_the_cutover(
+    pr, tmp_path, monkeypatch, round_zero, committed_after_cutover
+):
+    """Spec 5.8 and acceptance 8: a fix-now reflection committed at or after
+    ``ALTERNATIVE_CUTOVER_ISO`` without an ``Alternative:`` line answers nothing,
+    in round 0 as in a round of its own; one committed before it still does,
+    judged by its commit time, never by the time coverage runs."""
+    path, base, head, fix = pr
+    if round_zero:
+        budget = _round_zero(path, base, head, fix)
+    else:
+        budget = _late_budget(path, base, fix, [_rv(head, _at(0), 1), _rv(head, _at(90), 9)])
+    made = T0 + timedelta(minutes=120)
+    cut = made - timedelta(minutes=1) if committed_after_cutover else made + timedelta(minutes=1)
+    monkeypatch.setattr(rr, "ALTERNATIVE_CUTOVER_ISO", cut.isoformat())
+    text = _block(["c9"], fix).replace(_NO_ALTERNATIVE, "")
+    assert "Alternative:" not in text
+    _reflect(path, tmp_path, text, made)
+    assert _credit(path, budget) == (set() if committed_after_cutover else {"c9"})
+
+
+def test_a_fix_now_answer_with_its_alternative_line_is_credited_after_the_cutover(
+    pr, tmp_path, monkeypatch
+):
+    path, base, head, fix = pr
+    budget = _round_zero(path, base, head, fix)
+    monkeypatch.setattr(rr, "ALTERNATIVE_CUTOVER_ISO", T0.isoformat())
+    _reflect(path, tmp_path, _block(["c9"], fix), T0 + timedelta(minutes=120))
+    assert _credit(path, budget) == {"c9"}
 
 
 def test_round_zero_applies_the_past_round_four_rules_about_the_whole_pr(

@@ -673,3 +673,37 @@ class TestScanEventsAreWired:
             f"{sorted(registered)}. Accepted-but-unregistered events never reach the "
             f"sensor; registered-but-unaccepted events spawn a process that does nothing."
         )
+def test_sensor_rows_leave_the_writer_only_columns_null(monkeypatch, tmp_path):
+    """On the canonical schema, the sensor's rows carry no recorded_at and no
+    error_class: MIN(recorded_at) marks the transcript writer's start, and a
+    sensor value there would pull it back to the sensor's history (#4722)."""
+    import asyncio
+
+    import aiosqlite
+
+    from genesis.db.schema import create_all_tables
+
+    db_path = tmp_path / "canonical.db"
+
+    async def _make():
+        async with aiosqlite.connect(db_path) as db:
+            await create_all_tables(db)
+            await db.commit()
+
+    asyncio.run(_make())
+    tp = _write_transcript(
+        tmp_path,
+        [
+            _tool_use("toolu_canon", file_path="/tmp/y.py"),
+            _tool_result("toolu_canon", is_error=True),
+        ],
+    )
+    _run_process(monkeypatch, db_path, _stop_payload(tp))
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT tool_use_id, recorded_at, error_class FROM tool_call_outcomes"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows == [("toolu_canon", None, None)]
