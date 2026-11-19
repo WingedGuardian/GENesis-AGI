@@ -523,9 +523,12 @@ def _diag(action):
     )
 
 
-async def _execute_with_lock(engine, action, locks, on_live=True):
+async def _execute_with_lock(
+    engine, action, locks, on_live=True, stopped=False, seen=None, unread_holds=True
+):
     """execute() with the lock probe answering ``locks`` in turn; returns the
-    action mock, the snapshot gate mock and the alert titles."""
+    action mock, the snapshot gate mock and the alert titles. ``stopped``: what
+    incus reports (read only for an undecided probe); ``seen`` collects those reads."""
     from unittest.mock import AsyncMock
 
     run = AsyncMock(return_value=(True, "ran"))
@@ -538,6 +541,10 @@ async def _execute_with_lock(engine, action, locks, on_live=True):
     )
     with (
         patch("genesis.guardian.recovery.update_lock_holder", AsyncMock(side_effect=locks)),
+        patch(
+            "genesis.guardian.recovery.container_stopped",
+            seen if seen is not None else AsyncMock(return_value=stopped),
+        ),
         patch("genesis.guardian.recovery.container_on_live", AsyncMock(return_value=on_live)),
         patch("genesis.guardian.recovery.collect_all_signals", AsyncMock(return_value=healthy)),
         patch.object(engine, "_execute_action", run),
@@ -545,7 +552,7 @@ async def _execute_with_lock(engine, action, locks, on_live=True):
         patch.object(engine._snapshots, "take", take),
         patch.object(engine._dispatcher, "send", send),
     ):
-        result = await engine.execute(_diag(action))
+        result = await engine.execute(_diag(action), unread_holds=unread_holds)
     return result, run, take, [c.args[0].title for c in send.await_args_list]
 
 
@@ -572,11 +579,19 @@ async def test_no_action_runs_on_live_while_the_lock_is_held(engine, action):
 @pytest.mark.parametrize(
     ("locks", "on_live"),
     [([(True, "")] * 2, False), ([(None, "")] * 2, True), ([(False, "")] * 2, True)],
-    ids=["held-off-live", "unknown-on-live", "free-on-live"],
+    ids=["held-off-live", "unknown-on-live-stopped", "free-on-live"],
 )
 async def test_off_live_or_without_a_held_lock_the_action_runs(engine, action, locks, on_live):
-    result, run, _take, titles = await _execute_with_lock(engine, action, locks, on_live=on_live)
+    """Off `live`, with the lock free, or undecided on a container incus
+    reports STOPPED (owner ruling, ego 9cbdc406: it still gets its restart)."""
+    stopped = AsyncMock(return_value=True)
+    result, run, _take, titles = await _execute_with_lock(
+        engine, action, locks, on_live=on_live, seen=stopped
+    )
     run.assert_awaited_once()
+    # incus info is read only for an undecided probe, once per execute() (both
+    # reads share it: architect LOW 5)
+    assert stopped.await_count == (1 if locks[0][0] is None else 0)
     assert titles[0] == f"Attempting recovery: {action.value}"
     assert engine._sm.state.waiting_on_update_lock is False
 
@@ -718,3 +733,90 @@ def test_the_queued_restart_in_a_real_shell(tmp_path, lock, rc, ran):
     assert (p.returncode, (tmp_path / "ran").exists()) == (rc, ran), p.stderr
     if ran:  # the arguments reach systemctl intact
         assert (tmp_path / "ran").read_text() == "--user restart --no-block genesis-server\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ACTIONS, ids=[a.value for a in ACTIONS])
+async def test_an_unreadable_lock_on_a_running_container_holds_every_action(engine, action):
+    """Owner ruling (ego 9cbdc406): an undecided probe counts as held on `live`
+    unless incus reports the container STOPPED. Nothing runs, the wait is
+    marked, no attempt is recorded."""
+    result, run, take, titles = await _execute_with_lock(engine, action, [(None, "")] * 2)
+    run.assert_not_awaited()
+    take.assert_not_awaited()
+    assert titles == [f"Recovery deferred: {action.value}"]
+    assert "update.lock cannot be read on `live`" in result.detail
+    assert engine._sm.state.waiting_on_update_lock is True
+    assert engine._sm.state.recovery_attempts == 0 and engine._sm.state.last_recovery_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "info", [(1, "", "Error: not found"), (-1, "", "timeout")], ids=["incus-error", "timeout"]
+)
+async def test_an_unknown_container_status_holds_the_action(engine, info):
+    """A container whose status cannot be read is not shown stopped: it waits."""
+    from genesis.guardian.live_drop import container_stopped
+
+    async def box(*args, **kwargs):
+        return info
+
+    with patch("genesis.guardian.live_drop._run_subprocess", box):
+        result, run, _take, _titles = await _execute_with_lock(
+            engine,
+            RecoveryAction.RESTART_CONTAINER,
+            [(None, "")] * 2,
+            seen=AsyncMock(side_effect=container_stopped),
+        )
+    run.assert_not_awaited()
+    assert engine._sm.state.waiting_on_update_lock is True
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_container_with_an_unreadable_lock_is_restarted(engine):
+    """The case the exception exists for: incus exec cannot answer a stopped
+    instance, and its RESTART_CONTAINER (incus start) must still run."""
+    calls: list[tuple] = []
+
+    async def host(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("incus", "info"):
+            return (0, "Name: genesis\nStatus: STOPPED\n", "")
+        if args[:2] == ("incus", "exec"):
+            return (1, "", "Error: Instance is not running")
+        if args[:2] == ("incus", "restart"):
+            return (1, "", "Error: The instance is already stopped")
+        return (0, "", "")  # incus start
+
+    healthy = HealthSnapshot(
+        signals={"health_api": SignalResult("health_api", True, 1.0, "ok", "t")},
+        pause_state=PauseState(paused=False),
+    )
+    with (
+        _box(host),
+        patch("genesis.guardian.recovery.collect_all_signals", AsyncMock(return_value=healthy)),
+        patch.object(engine._snapshots, "safe_to_snapshot", AsyncMock(return_value=False)),
+    ):
+        result = await engine.execute(_diag(RecoveryAction.RESTART_CONTAINER))
+    assert result.success is True, result.detail
+    assert ("incus", "start", "genesis") in [c[:3] for c in calls]
+    assert engine._sm.state.waiting_on_update_lock is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("locks", "runs"),
+    [([(None, "")] * 2, True), ([(True, "")] * 2, False)],
+    ids=["unreadable", "held"],
+)
+async def test_execute_without_unread_holds(engine, locks, runs):
+    """The episode reopened after 2 h of unreadable probes, approved at Gate 2:
+    an undecided read no longer holds the action (and incus info is not read);
+    a lock read held still does."""
+    stopped = AsyncMock(return_value=False)
+    result, run, _take, _titles = await _execute_with_lock(
+        engine, RecoveryAction.RESTART_CONTAINER, locks, seen=stopped, unread_holds=False
+    )
+    assert run.await_count == (1 if runs else 0)
+    stopped.assert_not_awaited()
+    assert engine._sm.state.waiting_on_update_lock is (not runs)

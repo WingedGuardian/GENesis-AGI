@@ -2764,12 +2764,15 @@ verified: 9a1994b2b 2026-11-17
   Gate 1's re-diagnosis: its own warning, not the "all recovery failed" alert;
   `waiting_on_update_lock` in the Guardian state; then each tick runs one lock
   probe and reopens the episode (fresh diagnosis, both gates) once the lock is
-  free. A probe that cannot say never ends a wait (only a lock read free, or
-  incus reporting the container STOPPED, does) and never starts one at a
-  proposal, so a stopped container is still started; after a drop has run, the
-  restart does wait on it. When the 2 h alert is due and no probe since the last
-  one read the lock held, the alert says it cannot be read and the episode
-  reopens into Gate 1 instead of waiting on. `RecoveryEngine.execute`
+  free. A probe that cannot say counts as held, at the proposal, in
+  `execute()` and after a drop, unless incus reports the container STOPPED
+  (owner ruling, #2978): a stopped container answers no probe and still gets
+  its `RESTART_CONTAINER`, while a running, frozen or unknown one waits. So it
+  never ends a wait either (only a lock read free, or STOPPED, does). When the
+  2 h alert is due and no probe since the last one read the lock held, the alert
+  says it cannot be read and the episode reopens into Gate 1 instead of waiting
+  on; in that one episode an undecided probe no longer holds the proposal or the
+  approved action, while a lock read held still does. `RecoveryEngine.execute`
   reads the lock again for every action, before its alert, state change and
   snapshot and again just before the action, and defers a held one: no attempt,
   no budget. The server restart is queued under the lock itself (`flock -n`

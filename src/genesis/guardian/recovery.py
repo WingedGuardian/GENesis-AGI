@@ -33,7 +33,9 @@ from genesis.guardian.health_signals import collect_all_signals
 from genesis.guardian.live_drop import (
     _LOCK_HELD,
     HALF_DONE_DROP,
-    WAITING_ON_LOCK,
+    WAITING_ON_UNREADABLE_LOCK,
+    WAITS,
+    container_stopped,
     drop_target,
     half_done,
     live_candidates,
@@ -148,8 +150,12 @@ class RecoveryEngine:
         self._snapshots = snapshots
         self._dispatcher = dispatcher
 
-    async def execute(self, diagnosis: DiagnosisResult) -> RecoveryResult:
-        """Execute the recommended recovery action."""
+    async def execute(
+        self, diagnosis: DiagnosisResult, *, unread_holds: bool = True,
+    ) -> RecoveryResult:
+        """Execute the recommended recovery action. ``unread_holds=False``: the
+        episode reopened after 2 h of only-unreadable probes (check.py), where
+        only a lock read held holds the action back."""
         action = diagnosis.recommended_action
         t0 = datetime.now(UTC)
 
@@ -159,7 +165,11 @@ class RecoveryEngine:
         # On `live`, nothing runs while update.lock is held (owner rulings,
         # #2978): read before the alert, the state change and the snapshot, so
         # a deferral touches nothing. The approval may be hours old.
-        blocked = await self._held_on_live(self._config.container_name)
+        # One `incus info` per call at most: both reads below share it.
+        stopped: dict[str, bool] = {}
+        blocked = await self._held_on_live(
+            self._config.container_name, unread_holds=unread_holds, stopped=stopped,
+        )
         if blocked:
             return await self._deferred(action, blocked, t0)
 
@@ -214,7 +224,9 @@ class RecoveryEngine:
         # still has one round trip between this read and its incus call; a
         # deploy that takes the lock inside it is killed mid-move, which the
         # boot repair heals (#3492 D2).
-        blocked = await self._held_on_live(self._config.container_name)
+        blocked = await self._held_on_live(
+            self._config.container_name, unread_holds=unread_holds, stopped=stopped,
+        )
         if blocked:
             return await self._deferred(action, blocked, t0)
 
@@ -669,21 +681,33 @@ class RecoveryEngine:
                 return True
         return None if held is None else False
 
-    async def _held_on_live(self, container: str) -> str:
+    async def _held_on_live(
+        self, container: str, *, unread_holds: bool = True, stopped: dict | None = None,
+    ) -> str:
         """Why no action may run now, or "": update.lock is held on `live` (a
         deploy, rebuild, drop or validation hold that took it after Gate 2).
         The lock is read first and the branch only when it is held. A probe
-        that cannot say does not block, as at the proposal: a stopped container
-        answers no probe (live_drop.hold_for_lock says why). Inside a drop that
-        has run, an unreadable lock does hold the restart back and marks the
-        wait (_drop_candidate): the tree may still be moving."""
+        that cannot say counts as held unless incus reports the container
+        STOPPED (owner ruling, ego 9cbdc406; live_drop.hold_for_lock says why).
+        Inside a drop that has run, an unreadable lock holds the restart back
+        too (_drop_candidate): the tree may still be moving. ``unread_holds``
+        False: only a lock read held blocks (see execute). ``stopped`` caches
+        the container's stopped status for one execute()."""
         held, who = await update_lock_holder(container)
-        if held is not True or not await container_on_live(container):
+        unread = held is None
+        if unread and unread_holds:  # only then: one `incus info`, cached per execute()
+            cache = stopped if stopped is not None else {}
+            if "stopped" not in cache:
+                cache["stopped"] = await container_stopped(container)
+            held = not cache["stopped"]
+        if not held or not await container_on_live(container):
             return ""
-        return (
-            "nothing was run: update.lock is held on `live`" + (f" ({who})" if who else "")
-            + ". The Guardian diagnoses again once the lock is free"
+        how = (
+            "cannot be read on `live` (the container is not reported stopped)"
+            if unread
+            else "is held on `live`" + (f" ({who})" if who else "")
         )
+        return f"nothing was run: update.lock {how}. The Guardian diagnoses again once the lock is free"
 
     async def _restart_container(self, container: str) -> tuple[bool, str]:
         """Restart the entire container (or start it, if stopped).
@@ -753,7 +777,8 @@ class RecoveryEngine:
             cc_note = f"CC failure: {diagnosis.cc_failure_reason}\n"
         cname = self._config.container_name
 
-        if diagnosis.escalation == WAITING_ON_LOCK:
+        if diagnosis.escalation in WAITS:
+            unread = diagnosis.escalation == WAITING_ON_UNREADABLE_LOCK
             # Not a failed recovery: a run holds update.lock on `live`, and any
             # recovery now would cut into it (owner ruling, #2978). Marked here,
             # where every route to this escalation arrives; each tick then
@@ -761,14 +786,23 @@ class RecoveryEngine:
             self._sm.mark_waiting_on_update_lock()
             await self._dispatcher.send(Alert(
                 severity=AlertSeverity.WARNING,
-                title="Genesis down — waiting for a deploy to finish",
+                title=(
+                    "Genesis down — update.lock cannot be read; waiting"
+                    if unread
+                    else "Genesis down — waiting for a deploy to finish"
+                ),
                 body=(
                     f"Cause: {diagnosis.likely_cause}\n"
                     "Nothing was restarted or dropped. The Guardian checks update.lock "
                     "every tick and diagnoses again once it is free, asking your approval "
-                    "for what it then proposes. If the lock is still held after 2 h, the "
-                    "run holding it is likely hung: you will hear again then, and every "
-                    "2 h after."
+                    "for what it then proposes. "
+                    + (
+                        "If it still cannot read the lock after 2 h, it asks your approval "
+                        "instead of waiting on."
+                        if unread
+                        else "If the lock is still held after 2 h, the run holding it is "
+                        "likely hung: you will hear again then, and every 2 h after."
+                    )
                 ),
                 likely_cause=diagnosis.likely_cause,
             ))

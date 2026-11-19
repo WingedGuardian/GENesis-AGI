@@ -63,6 +63,10 @@ WAIT_REALERT_S = 7200
 
 #: DiagnosisResult.escalation values: why a proposal became ESCALATE here.
 WAITING_ON_LOCK = "update_lock_held"
+#: The same wait when the probe could not read the lock (and the container is
+#: not reported stopped): nothing shows a holder, so its alert says so.
+WAITING_ON_UNREADABLE_LOCK = "update_lock_unreadable"
+WAITS = (WAITING_ON_LOCK, WAITING_ON_UNREADABLE_LOCK)
 HALF_DONE_DROP = "half_done_drop"
 
 
@@ -235,21 +239,28 @@ def _escalation(diagnosis: DiagnosisResult, kind: str, why: str) -> DiagnosisRes
     )
 
 
-async def hold_for_lock(container: str, diagnosis: DiagnosisResult) -> DiagnosisResult:
+async def hold_for_lock(
+    container: str, diagnosis: DiagnosisResult, *, unread_holds: bool = True
+) -> DiagnosisResult:
     """The one proposal-side lock rule: on `live`, while update.lock is held,
     ANY proposal (ESCALATE included) becomes the ESCALATE that waits for the
     lock, naming the holder; recovery.py's escalation marks the wait (owner
     rulings, #2978). The lock is read first and the branch only when it is held,
-    so a frozen container costs one probe. A probe that cannot say leaves the
-    proposal: a stopped container answers no probe, and its start must not wait
-    on a lock nothing can hold (execute() and each action's own guard still apply).
-    The one place an unreadable lock DOES wait is after a drop has run
-    (recovery._drop_candidate): its tree may still be moving, so its restart
-    waits for a lock read free."""
+    so a frozen container costs one probe. A probe that cannot say counts as
+    held (owner ruling, ego 9cbdc406) unless incus reports the container
+    STOPPED: nothing in a stopped container can hold the lock, and its start
+    must not wait. RecoveryEngine._held_on_live applies the same rule, and
+    after a drop has run an unreadable lock holds the restart back too.
+    ``unread_holds=False`` is the one exception: the episode check.py reopens
+    after 2 h of only-unreadable probes, where the owner decides at the gates;
+    only a lock read held waits there (and container_stopped is not read)."""
     from genesis.guardian.recovery import container_on_live
 
     held, who = await update_lock_holder(container)
-    if held is not True or not await container_on_live(container):
+    unread = held is None
+    if unread:  # only then: one `incus info`
+        held = unread_holds and not await container_stopped(container)
+    if not held or not await container_on_live(container):
         return diagnosis
     logger.warning(
         "update.lock held on `live` — proposing ESCALATE instead of %s",
@@ -257,12 +268,17 @@ async def hold_for_lock(container: str, diagnosis: DiagnosisResult) -> Diagnosis
     )
     return _escalation(
         diagnosis,
-        WAITING_ON_LOCK,
-        "the checkout is on `live` and update.lock is held"
-        + (f" ({who})" if who else "")
-        + ": a deploy, rebuild, drop or validation hold is running, and any recovery "
-        "now would cut into it. Nothing was touched; the Guardian resumes "
-        "once the lock is free",
+        WAITING_ON_UNREADABLE_LOCK if unread else WAITING_ON_LOCK,
+        "the checkout is on `live` and update.lock "
+        + (
+            "cannot be read (the container is not reported stopped): a deploy, rebuild, "
+            "drop or validation hold may be running"
+            if unread
+            else "is held" + (f" ({who})" if who else "")
+            + ": a deploy, rebuild, drop or validation hold is running"
+        )
+        + ", and any recovery now would cut into it. Nothing was touched; the Guardian "
+        "resumes once the lock is free",
     )
 
 

@@ -1743,6 +1743,7 @@ async def _handle_confirmed_dead(
     # recovery retry, no re-alert — until genuine recovery (which clears the flag
     # and sends a single "restored" ping). Recovery detection is unaffected: it
     # happens in state_machine.process() via the cheap signal probes, not here.
+    unread_holds = True  # False only for the 2 h unreadable-only reopen below
     if sm.state.down_alert_sent:
         reopen = False
         if sm.state.waiting_on_update_lock:
@@ -1775,6 +1776,7 @@ async def _handle_confirmed_dead(
                         "for what it proposes."
                     )
                     reopen = True
+                    unread_holds = False  # else this reopen waits again at once
                 elif held:
                     body = (
                         f"The Guardian has waited {hours} for update.lock on `live`, now held"
@@ -1865,7 +1867,7 @@ async def _handle_confirmed_dead(
         )
 
     await _execute_recovery_with_approval(
-        config, sm, dispatcher, recovery_engine, diagnosis,
+        config, sm, dispatcher, recovery_engine, diagnosis, unread_holds=unread_holds,
     )
 
 
@@ -1978,8 +1980,14 @@ async def _execute_recovery_with_approval(
     dispatcher: AlertDispatcher,
     recovery_engine: RecoveryEngine,
     diagnosis: object,
+    *,
+    unread_holds: bool = True,
 ) -> None:
     """Two-gate, blocking, keyword-reply Telegram approval, then recover.
+
+    ``unread_holds=False`` only for the episode reopened after 2 h of
+    only-unreadable lock probes: there an undecided probe no longer counts as
+    held (the owner decides at the gates); a lock read held still waits.
 
     Gate everything: nothing recovers before approval. No fixed timeout —
     the wait self-cancels only when health returns on its own.
@@ -1995,7 +2003,9 @@ async def _execute_recovery_with_approval(
     # On `live`, while update.lock is held, every proposal (ESCALATE included)
     # becomes the escalation that waits for it: no prompt, and the episode
     # reopens once the lock is free (owner rulings, #2978).
-    diagnosis = await live_drop.hold_for_lock(config.container_name, diagnosis)
+    diagnosis = await live_drop.hold_for_lock(
+        config.container_name, diagnosis, unread_holds=unread_holds
+    )
     if diagnosis.recommended_action == RecoveryAction.ESCALATE:
         # ESCALATE is not an automated action — it means "all automated
         # recovery options exhausted, alert the user." No approval gate
@@ -2096,7 +2106,9 @@ async def _execute_recovery_with_approval(
     signal_summary = json.dumps(sm.state.signal_history[-5:], indent=2)
     diagnosis = await diagnosis_engine.diagnose(diagnostic, signal_summary)
     # The lock again, for the new proposal: Gate 1 can wait for hours.
-    diagnosis = await live_drop.hold_for_lock(config.container_name, diagnosis)
+    diagnosis = await live_drop.hold_for_lock(
+        config.container_name, diagnosis, unread_holds=unread_holds
+    )
 
     # F.1: REVERT_CODE runs `git stash`/`git revert`, which need healthy, WRITABLE
     # local git. If the container's git is unhealthy (the F.1 outage class — incl. a
@@ -2150,7 +2162,7 @@ async def _execute_recovery_with_approval(
     write_diagnosis_result(diagnosis, config, outage_duration_s=outage_s)
 
     if diagnosis.recommended_action == RecoveryAction.ESCALATE:
-        if diagnosis.escalation == live_drop.WAITING_ON_LOCK:
+        if diagnosis.escalation in live_drop.WAITS:
             # Not a failure: a deploy holds update.lock on `live`. Nothing is
             # touched; the escalation marks the wait, and each tick probes the
             # lock and reopens the episode once it is free (#2978).
@@ -2233,4 +2245,4 @@ async def _execute_recovery_with_approval(
         "Gate-2 approved — executing recovery action %s",
         diagnosis.recommended_action.value,
     )
-    await recovery_engine.execute(diagnosis)
+    await recovery_engine.execute(diagnosis, unread_holds=unread_holds)

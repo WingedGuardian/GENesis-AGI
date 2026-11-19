@@ -15,7 +15,11 @@ import pytest
 from genesis.guardian.check import _execute_recovery_with_approval
 from genesis.guardian.config import GuardianConfig
 from genesis.guardian.diagnosis import DiagnosisEngine, RecoveryAction
-from genesis.guardian.live_drop import HALF_DONE_DROP, WAITING_ON_LOCK
+from genesis.guardian.live_drop import (
+    HALF_DONE_DROP,
+    WAITING_ON_LOCK,
+    WAITING_ON_UNREADABLE_LOCK,
+)
 from genesis.guardian.state_machine import ConfirmationStateMachine, GuardianState
 from tests.test_guardian.test_check import (
     _dead_snapshot,
@@ -43,6 +47,7 @@ async def _propose(
     git_ok: bool = True,
     proposed: RecoveryAction | None = None,
     git: AsyncMock | None = None,
+    stopped: bool = False,
 ):
     """Run both gates with APPROVE; return (what was executed, Gate 2's text,
     the lock probe mock). ``lock``: one answer, or successive answers;
@@ -74,6 +79,7 @@ async def _propose(
         patch("genesis.guardian.recovery.container_on_live", AsyncMock(return_value=on_live)),
         patch("genesis.guardian.live_drop.live_candidates", AsyncMock(return_value=view)),
         patch("genesis.guardian.live_drop.update_lock_holder", probe),
+        patch("genesis.guardian.live_drop.container_stopped", AsyncMock(return_value=stopped)),
     ):
         await _execute_recovery_with_approval(
             config, sm, dispatcher, recovery_engine, _proposed_diagnosis(proposed or action)
@@ -138,11 +144,23 @@ async def test_a_drop_that_did_not_finish_escalates_naming_rebuild(config):
 
 
 @pytest.mark.asyncio
-async def test_an_unreadable_lock_probe_leaves_the_proposal(config):
+@pytest.mark.parametrize(
+    ("stopped", "waits"), [(True, False), (False, True)], ids=["stopped", "running"]
+)
+async def test_an_unreadable_lock_probe_waits_unless_the_container_is_stopped(
+    config, stopped, waits
+):
+    """Owner ruling (ego 9cbdc406): an undecided probe counts as held, except
+    on a container incus reports STOPPED, which still gets its restart."""
     executed, _, _ = await _propose(
-        config, RecoveryAction.RESTART_CONTAINER, view=_view(), lock=(None, "")
+        config, RecoveryAction.RESTART_CONTAINER, view=_view(), lock=(None, ""), stopped=stopped
     )
-    assert executed.recommended_action == RecoveryAction.RESTART_CONTAINER
+    if waits:
+        assert executed.recommended_action == RecoveryAction.ESCALATE
+        assert executed.escalation == WAITING_ON_UNREADABLE_LOCK
+        assert "update.lock cannot be read" in executed.likely_cause
+    else:
+        assert executed.recommended_action == RecoveryAction.RESTART_CONTAINER
 
 
 @pytest.mark.asyncio
@@ -273,10 +291,11 @@ def test_the_wait_survives_a_restart_of_the_guardian_and_ends_with_the_episode(c
     ("kind", "title", "absent"),
     [
         (WAITING_ON_LOCK, "waiting for a deploy to finish", "Manual restart"),
+        (WAITING_ON_UNREADABLE_LOCK, "update.lock cannot be read", "likely hung"),
         (HALF_DONE_DROP, "a drop did not finish", "Manual restart"),
         ("", "all automated recovery failed", None),
     ],
-    ids=["lock", "half-done", "plain"],
+    ids=["lock", "unreadable-lock", "half-done", "plain"],
 )
 async def test_each_escalation_sends_its_own_alert(config, kind, title, absent):
     from dataclasses import replace
@@ -540,7 +559,8 @@ ALL = list(RecoveryAction)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action", ALL, ids=[a.value for a in ALL])
-async def test_every_proposal_waits_while_the_lock_is_held_on_live(config, action):
+@pytest.mark.parametrize("lock", [(True, ""), (None, "")], ids=["held", "unreadable-running"])
+async def test_every_proposal_waits_while_the_lock_is_held_on_live(config, action, lock):
     """Owner ruling (ego 3d02c11f): on `live`, while update.lock is held, every
     proposal, ESCALATE included (a fresh episode's cc_unavailable fallback), is
     the escalation that waits: no Gate 1 prompt, its own warning, the wait marked."""
@@ -555,12 +575,17 @@ async def test_every_proposal_waits_while_the_lock_is_held_on_live(config, actio
     with (
         patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
         patch("genesis.guardian.recovery.container_on_live", AsyncMock(return_value=True)),
-        patch("genesis.guardian.live_drop.update_lock_holder", AsyncMock(return_value=(True, ""))),
+        patch("genesis.guardian.live_drop.update_lock_holder", AsyncMock(return_value=lock)),
+        patch("genesis.guardian.live_drop.container_stopped", AsyncMock(return_value=False)),
     ):
         await _execute_recovery_with_approval(config, sm, MagicMock(), engine, diagnosis)
     channel.send_text.assert_not_awaited()  # no Gate 1 prompt
     alert = engine._dispatcher.send.await_args.args[0]
-    assert alert.title == "Genesis down — waiting for a deploy to finish"
+    if lock[0] is None:  # architect LOW 4: nothing shows a deploy
+        assert alert.title == "Genesis down — update.lock cannot be read; waiting"
+        assert "likely hung" not in alert.body and "asks your approval" in alert.body
+    else:
+        assert alert.title == "Genesis down — waiting for a deploy to finish"
     assert sm.state.waiting_on_update_lock is True and sm.state.down_alert_sent is True
 
 
@@ -585,14 +610,19 @@ async def test_a_lock_taken_during_gate_1_holds_the_new_proposal(config, action)
 
 
 @pytest.mark.asyncio
-async def test_an_unreadable_probe_after_gate_1_leaves_the_redirect(config):
+@pytest.mark.parametrize(
+    ("stopped", "waits"), [(True, False), (False, True)], ids=["stopped", "running"]
+)
+async def test_an_unreadable_probe_after_gate_1(config, stopped, waits):
     executed, _, _ = await _propose(
         config,
         RecoveryAction.REVERT_CODE,
         lock=(None, ""),
         git_ok=False,
+        stopped=stopped,
     )
-    assert executed.recommended_action == RecoveryAction.SNAPSHOT_ROLLBACK
+    want = RecoveryAction.ESCALATE if waits else RecoveryAction.SNAPSHOT_ROLLBACK
+    assert executed.recommended_action == want
 
 
 def _long_wait(config, *, seen_held: bool, hours: float = 3):
@@ -713,3 +743,157 @@ async def test_only_a_reported_stop_counts_as_stopped(answer, stopped):
 
     with patch("genesis.guardian.live_drop._run_subprocess", box):
         assert await container_stopped("genesis") is stopped
+
+
+# ── the 2 h unreadable-only reopen, composed end to end (architect delta review) ──
+
+
+async def _reopen_episode(config, lock_answers):
+    """A 3 h wait whose probes all read undecided, ticked through the REAL
+    _handle_confirmed_dead, _execute_recovery_with_approval and RecoveryEngine.
+    ``lock_answers(n)`` answers the n-th probe. Returns (Gate 1 prompted, the
+    action run or None, the state machine)."""
+    from genesis.guardian.check import _handle_confirmed_dead
+
+    sm = _long_wait(config, seen_held=False)
+    engine = _real_engine(config, sm)
+    channel = _mock_gate_channel(["APPROVE", "APPROVE"])
+    calls = {"n": 0}
+
+    async def probe(container):
+        calls["n"] += 1
+        return lock_answers(calls["n"])
+
+    ran = AsyncMock(return_value=(True, "Container restarted"))
+    healthy = _dead_snapshot().__class__(
+        signals={"health_api": _dead_snapshot().signals["heartbeat_canary"]},
+        pause_state=_dead_snapshot().pause_state,
+    )
+    proposal = AsyncMock(return_value=_proposed_diagnosis(RecoveryAction.RESTART_CONTAINER))
+    with (
+        patch("genesis.guardian.live_drop.update_lock_holder", probe),
+        patch("genesis.guardian.recovery.update_lock_holder", probe),
+        patch("genesis.guardian.live_drop.container_stopped", AsyncMock(return_value=False)),
+        patch("genesis.guardian.recovery.container_stopped", AsyncMock(return_value=False)),
+        patch("genesis.guardian.recovery.container_on_live", AsyncMock(return_value=True)),
+        patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
+        patch(
+            "genesis.guardian.check.collect_all_signals", AsyncMock(return_value=_dead_snapshot())
+        ),
+        patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
+        patch("genesis.guardian.check.write_diagnosis_result"),
+        patch.object(DiagnosisEngine, "diagnose", proposal),
+        patch("genesis.guardian.recovery.collect_all_signals", AsyncMock(return_value=healthy)),
+        patch.object(engine, "_execute_action", ran),
+        patch.object(engine._snapshots, "safe_to_snapshot", AsyncMock(return_value=False)),
+    ):
+        await _handle_confirmed_dead(
+            config, sm, engine._dispatcher, MagicMock(diagnose=proposal), engine
+        )
+    texts = [str(c.args[0]) for c in channel.send_text.await_args_list]
+    prompted = any("Genesis down" in t and "APPROVE" in t for t in texts)
+    action = ran.await_args.args[0] if ran.await_args else None
+    gate2 = any("Proposed:" in t for t in texts)
+    return prompted, action, sm, gate2
+
+
+@pytest.mark.asyncio
+async def test_the_unreadable_reopen_reaches_the_gates_and_restarts(config):
+    """BLOCKER (delta review): after 2 h of only-unreadable probes the episode
+    must reach Gate 1, and once approved the restart runs with the probe still
+    unreadable. Before the fix the reopen went straight back into the wait."""
+    prompted, action, sm, gate2 = await _reopen_episode(config, lambda n: (None, ""))
+    assert prompted, "Gate 1 was never prompted"
+    assert action == RecoveryAction.RESTART_CONTAINER
+    assert sm.state.waiting_on_update_lock is False
+
+
+@pytest.mark.asyncio
+async def test_a_held_read_after_the_unreadable_reopen_still_waits(config):
+    """The reopen relaxes only the undecided read: a lock read HELD anywhere
+    in that chain (here after Gate 1) is still the wait."""
+    prompted, action, sm, gate2 = await _reopen_episode(
+        config, lambda n: (None, "") if n <= 2 else (True, "")
+    )
+    assert prompted  # the tick and the entry read undecided: Gate 1 asked
+    assert not gate2  # held at the proposal, not only at execute(): no Gate 2 prompt
+    assert action is None
+    assert sm.state.waiting_on_update_lock is True
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_instance_reaches_gate_1_through_the_real_probe(config):
+    """Architect LOW 6, the 2026-07-04 class through check.py: incus exec cannot
+    answer a stopped instance and info reports STOPPED; the real probe and the
+    real stopped check let the RESTART_CONTAINER proposal reach the gates."""
+
+    async def host(*args, **kwargs):
+        if args[:2] == ("incus", "info"):
+            return (0, "Name: genesis\nStatus: STOPPED\n", "")
+        if args[:2] == ("incus", "exec"):
+            return (1, "", "Error: Instance is not running")
+        return (0, "", "")
+
+    sm = ConfirmationStateMachine(config)
+    sm._state.current_state = GuardianState.CONFIRMED_DEAD
+    sm.mark_down_alert_sent()
+    channel = _mock_gate_channel(["APPROVE", "APPROVE"])
+    recovery_engine = MagicMock(execute=AsyncMock())
+    with (
+        patch("genesis.guardian.live_drop._run_subprocess", host),
+        patch("genesis.guardian.recovery._run_subprocess", host),
+        patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
+        patch(
+            "genesis.guardian.check.collect_all_signals", AsyncMock(return_value=_dead_snapshot())
+        ),
+        patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
+        patch("genesis.guardian.check.write_diagnosis_result"),
+        patch.object(
+            DiagnosisEngine,
+            "diagnose",
+            AsyncMock(return_value=_proposed_diagnosis(RecoveryAction.RESTART_CONTAINER)),
+        ),
+    ):
+        await _execute_recovery_with_approval(
+            config,
+            sm,
+            MagicMock(send=AsyncMock()),
+            recovery_engine,
+            _proposed_diagnosis(RecoveryAction.RESTART_CONTAINER),
+        )
+    texts = [str(c.args[0]) for c in channel.send_text.await_args_list]
+    assert any("Genesis down" in t and "APPROVE" in t for t in texts), texts
+    executed = recovery_engine.execute.await_args.args[0]
+    assert executed.recommended_action == RecoveryAction.RESTART_CONTAINER
+
+
+@pytest.mark.asyncio
+async def test_a_free_reopen_keeps_the_ruling(config):
+    """The relaxed read is scoped to the unreadable-only reopen: an episode
+    reopened because the lock read FREE, whose next probe is undecided on a
+    running container, waits again (owner ruling ego 9cbdc406)."""
+    prompted, action, sm, gate2 = await _reopen_episode(
+        config, lambda n: (False, "") if n == 1 else (None, "")
+    )
+    assert not prompted and action is None
+    assert sm.state.waiting_on_update_lock is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lock", "waits"), [((None, ""), False), ((True, ""), True)], ids=["unreadable", "held"]
+)
+async def test_hold_for_lock_without_unread_holds(lock, waits):
+    from genesis.guardian.live_drop import hold_for_lock
+
+    stopped = AsyncMock(return_value=False)
+    with (
+        patch("genesis.guardian.live_drop.update_lock_holder", AsyncMock(return_value=lock)),
+        patch("genesis.guardian.live_drop.container_stopped", stopped),
+        patch("genesis.guardian.recovery.container_on_live", AsyncMock(return_value=True)),
+    ):
+        out = await hold_for_lock(
+            "genesis", _proposed_diagnosis(RecoveryAction.RESTART_CONTAINER), unread_holds=False
+        )
+    assert (out.recommended_action == RecoveryAction.ESCALATE) is waits
+    stopped.assert_not_awaited()  # no `incus info` when undecided no longer holds

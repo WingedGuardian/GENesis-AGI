@@ -15,6 +15,16 @@ from genesis.guardian.snapshots import SnapshotManager
 from genesis.guardian.state_machine import ConfirmationStateMachine
 
 
+@pytest.fixture(autouse=True)
+def _update_lock_free(monkeypatch):
+    """These tests are not about update.lock: it reads free (an undecided read
+    counts as held on `live`; tests/test_guardian/test_recovery_live_drop.py
+    covers the lock)."""
+    monkeypatch.setattr(
+        "genesis.guardian.recovery.update_lock_holder", AsyncMock(return_value=(False, ""))
+    )
+
+
 @pytest.fixture
 def config() -> GuardianConfig:
     return GuardianConfig()
