@@ -29,9 +29,9 @@ mode: live
 #     judging only the part after its progress marker would do (entries,
 #     characters, struggle score of the new entries, would-trigger). The marker
 #     (cc_sessions.lesson_built_through) moves when the builder ran.
-#   incremental: judge only that part, up to 4 parts per pass (the rebuild
-#     drain and the cycle each get a pass, so up to 8 builder calls per session
-#     per cycle),
+#   incremental: judge only that part, up to 4 parts per pass in the cycle;
+#     the rebuild drain, which runs before memory extraction, makes at most 1
+#     builder call per queued item, so its worst case stays a batch of 20 calls,
 #     with up to 20 earlier tool turns shown for reference. Entries left over (a
 #     budget, a spent cap, a failed build) queue one rebuild that continues
 #     from the marker, so a session that has ended is still judged. Needs mode

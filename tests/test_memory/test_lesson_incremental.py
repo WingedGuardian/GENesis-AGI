@@ -464,6 +464,37 @@ async def test_a_drain_with_entries_left_queues_a_fresh_item(db, tmp_path, monke
 
 
 @pytest.mark.asyncio
+async def test_the_drain_judges_one_part_per_item(db, tmp_path, monkeypatch):
+    """The drain runs before the cycle's memory extraction, so a long backlog
+    costs it one builder call per item per cycle; the rest is re-queued."""
+    spine = [_tool(i, args="x" * 200) for i in range(1, 21)]
+    per = len(sd.judge_line(spine[0])) + 1
+    monkeypatch.setattr(sd, "_MAX_SPINE_CHARS", per * 3)
+    builder = _setup(monkeypatch, spine=spine)
+    await _seed(db, tmp_path)
+    await _queue(db, trigger="candidates")
+    await _drain(db, tmp_path)
+    assert len(builder.calls) == 1 and await _marker(db) == f"t{builder.calls[0]['turns'][-1]}"
+    (left,) = await _items(db, "pending")
+    assert json.loads(left["payload_json"])["trigger"] == "candidates"
+
+
+@pytest.mark.asyncio
+async def test_calm_parts_cost_the_drain_no_builder_call(db, tmp_path, monkeypatch):
+    """Parts below the threshold make no builder call, so the drain keeps
+    judging them in the same pass instead of one part per cycle."""
+    spine = [_tool(i, args="x" * 200) for i in range(1, 7)]
+    per = len(sd.judge_line(spine[0])) + 1
+    monkeypatch.setattr(sd, "_MAX_SPINE_CHARS", per * 3)
+    builder = _setup(monkeypatch, spine=spine, score=0.0)
+    await _seed(db, tmp_path)
+    await _queue(db)
+    await _drain(db, tmp_path)
+    assert builder.calls == [] and await _marker(db) == "t6"
+    assert await _items(db, "pending") == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error",
     [jm.ProcedureBuilderUnavailable("down"), TimeoutError(), RuntimeError("bug")],

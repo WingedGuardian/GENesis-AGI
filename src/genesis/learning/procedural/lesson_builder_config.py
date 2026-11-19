@@ -50,10 +50,10 @@ DEFAULTS: dict[str, Any] = {"mode": "live", "segment": "shadow"}
 #   shadow: the whole session, plus one log line per built session saying what
 #     judging only the unjudged part would do, and the progress marker
 #     (cc_sessions.lesson_built_through) moved as that rule would move it.
-#   incremental: judge only the unjudged part (up to 4 parts per pass; the
-#     rebuild drain and the cycle each get a pass; leftovers and failures queue
-#     a rebuild that continues from the
-#     marker). Needs mode live; under shadow or off it runs as shadow.
+#   incremental: judge only the unjudged part (up to 4 parts per pass in the
+#     cycle; the rebuild drain, which runs before memory extraction, makes at
+#     most one builder call per queued item; leftovers and failures queue a
+#     rebuild that continues from the marker). Needs mode live; under shadow or off it runs as shadow.
 SEGMENTS = ("whole", "shadow", "incremental")
 
 

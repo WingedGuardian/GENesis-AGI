@@ -4018,8 +4018,9 @@ verified: 3f70a665b 2026-11-15
   by compare-and-set when the builder ran and the cap allowed. `incremental`
   (#4813, needs `mode: live`, else it runs as shadow) replaces the whole build:
   `_judge_from_marker` (in `learning/procedural/incremental.py`, which the
-  extraction cycle and the drain call into) judges up to 4 parts per pass from the marker (the drain
-  and the cycle each get a pass, so up to 8 per session per cycle), each with up to 20
+  extraction cycle and the drain call into) judges up to 4 parts per pass from the marker in the cycle, and in the drain
+  up to 4 parts but at most 1 builder call per queued item (the drain runs before memory extraction, so its worst case
+  stays a batch of 20 single builder calls), each with up to 20
   earlier tool turns shown for reference only and the session origin from the
   whole spine, a timeout per part, and a compare-and-set after each. A
   `candidates` flag triggers every part of its request. Entries left over

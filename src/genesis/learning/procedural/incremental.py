@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 # call): a long backlog catches up over a few cycles, and the per-session cap
 # still bounds the lessons it can add.
 _PARTS_PER_RUN = 4
+# Builder calls the drain makes per queued item per cycle (see _drain_from_marker);
+# parts below the struggle threshold cost none and still count only as parts.
+_DRAIN_BUILDS_PER_ITEM = 1
 
 
 async def _judge_from_marker(
@@ -49,6 +52,7 @@ async def _judge_from_marker(
     max_procedures_per_session: int,
     summary: dict,
     counter: str = "struggle_procedures",
+    max_builds: int = _PARTS_PER_RUN,
 ) -> str:
     """``segment: incremental`` (#4813): judge the session's unjudged entries.
 
@@ -77,6 +81,7 @@ async def _judge_from_marker(
     )
 
     origin = derive_session_origin(spine)  # the whole spine: an early external read marks every part
+    builds = 0
     for n in range(1, _PARTS_PER_RUN + 1):
         part = select_part(spine, marker, budget_chars=_MAX_SPINE_CHARS)
         if part.reset and await asyncio.to_thread(ej._file_mentions, transcript_path, marker):
@@ -101,6 +106,7 @@ async def _judge_from_marker(
                 ),
                 timeout=JUDGE_TIMEOUT_SECS,
             )
+            builds += 1
             stored = len(ids)
             if stored:
                 summary[counter] = summary.get(counter, 0) + stored
@@ -123,6 +129,8 @@ async def _judge_from_marker(
         marker = part.through_id
         if reaches_end:
             return end
+        if builds >= max_builds:
+            return "remaining"
     return "remaining"
 
 
@@ -308,6 +316,12 @@ async def _drain_from_marker(
             candidates=payload.get("trigger") == "candidates",
             max_procedures_per_session=max_procedures_per_session, summary=summary,
             counter="procedures_rebuilt",
+            # One builder call per item per drain (parts below the threshold
+            # cost none and continue): the drain runs before the cycle's
+            # memory extraction, so its worst case (a full batch of items,
+            # each one builder call under the builder timeout) stays what the
+            # whole-session rebuild's was. Entries left are re-queued.
+            max_builds=_DRAIN_BUILDS_PER_ITEM,
         )
     except (ProcedureBuilderUnavailable, TimeoutError) as exc:
         logger.info(
