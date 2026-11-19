@@ -23,6 +23,9 @@
 #   sent-log --since <epoch> — read-only JSON lines of the alerts the guardian
 #                     delivered to Telegram since <epoch>, for the container to
 #                     record in its message history
+#   set-timezone <IANA> — set the host clock's zone, then the container's, to
+#                     the install's zone (JSON result; host jobs then follow
+#                     local time, as on a fresh install)
 #   host-profile    — read-only host body-schema JSON (meminfo/nproc/kernel,
 #                     storage pool, incus version + container limits.*) for the
 #                     container's infra_profile host plane
@@ -1066,6 +1069,83 @@ PYEOF
         fi
         printf '{"ok": true, "action": "cc-tmp-apply", "result": "%s", "claude_procs": %s, "applied": %s}\n' \
             "$_cctmp_res" "$_cctmp_procs_json" "$_cctmp_applied"
+        ;;
+    set-timezone\ *)
+        # Set the host clock's zone, then the container's through incus, with the
+        # calls the installers make (scripts/lib/timezone.sh, host-setup.sh). The
+        # arg reaches sudo, so it is shape-checked whole, then must be a zone
+        # timedatectl itself lists. stdout: one JSON line whose "ok" means the
+        # host leg succeeded; a failed container leg is reported there with exit
+        # 0. Refusals and host failures go to stderr with exit 1.
+        _TZ="${SSH_ORIGINAL_COMMAND#set-timezone }"
+        # LISTED, not ranged: a range follows the locale's collation, and SSH
+        # forwards the caller's LC_* by default.
+        _TZ_C='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_+-'  # pragma: allowlist secret (a character list)
+        if [ "${#_TZ}" -gt 64 ] || ! [[ "$_TZ" =~ ^[ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz][${_TZ_C}]*(/[${_TZ_C}]+){0,2}$ ]]; then
+            echo '{"ok": false, "action": "set-timezone", "error": "invalid zone (want an IANA name such as Europe/Paris)"}' >&2
+            exit 1
+        fi
+        # Captured, then matched without a pipeline: under pipefail an early
+        # `grep -q` exit would SIGPIPE the lister and fail a listed zone.
+        _tz_known="$(timedatectl list-timezones 2>/dev/null)" || _tz_known=""
+        if [ -z "$_tz_known" ]; then
+            echo '{"ok": false, "action": "set-timezone", "error": "could not list the zones this host knows"}' >&2
+            exit 1
+        fi
+        if [[ $'\n'"$_tz_known"$'\n' != *$'\n'"$_TZ"$'\n'* ]]; then
+            printf '{"ok": false, "action": "set-timezone", "error": "zone not known to this host: %s"}\n' "$_TZ" >&2
+            exit 1
+        fi
+        if ! sudo -n true 2>/dev/null; then
+            echo '{"ok": false, "action": "set-timezone", "error": "passwordless sudo unavailable"}' >&2
+            exit 1
+        fi
+        _TZ_FROM="$(timedatectl show -p Timezone --value 2>/dev/null)" || _TZ_FROM=""
+        if [ -z "$_TZ_FROM" ]; then
+            echo '{"ok": false, "action": "set-timezone", "error": "could not read the current host zone"}' >&2
+            exit 1
+        fi
+        if [ "$_TZ_FROM" != "$_TZ" ]; then
+            if ! sudo -n timedatectl set-timezone -- "$_TZ" >/dev/null 2>&1 \
+                || [ "$(timedatectl show -p Timezone --value 2>/dev/null)" != "$_TZ" ]; then
+                printf '{"ok": false, "action": "set-timezone", "error": "host timedatectl set-timezone failed", "zone": "%s", "from": "%s"}\n' \
+                    "$_TZ" "$_TZ_FROM" >&2
+                exit 1
+            fi
+        fi
+        # Container: guardian.yaml container_name, else "genesis" (as
+        # scripts/lib/cc_tmp_volume.sh resolves it), read back after any set.
+        # Each incus call gets </dev/null so the caller's SSH channel cannot hold it.
+        _TZ_CT=""
+        _tz_yaml="${HOME}/.local/share/genesis-guardian/config/guardian.yaml"
+        if [ -f "$_tz_yaml" ]; then
+            _TZ_CT="$(awk -F':' '/^container_name:/ {sub(/^[^:]*:/,""); gsub(/[" '"'"']/,""); print; exit}' "$_tz_yaml" 2>/dev/null)" || _TZ_CT=""
+        fi
+        _TZ_CT="${_TZ_CT:-genesis}"
+        _tz_ct_zone() {
+            local link
+            incus exec "$_TZ_CT" -- timedatectl show -p Timezone --value </dev/null 2>/dev/null && return 0
+            link="$(incus exec "$_TZ_CT" -- readlink /etc/localtime </dev/null 2>/dev/null)" || return 1
+            [[ "$link" == *zoneinfo/* ]] && printf '%s\n' "${link#*zoneinfo/}"
+        }
+        if ! command -v incus >/dev/null 2>&1; then
+            _TZ_CT_RES="no-incus"
+        elif ! [[ "$_TZ_CT" =~ ^[abcdefghijklmnopqrstuvwxyz0123456789][abcdefghijklmnopqrstuvwxyz0123456789-]{0,62}$ ]]; then
+            _TZ_CT_RES="failed"
+        elif [ "$(_tz_ct_zone)" = "$_TZ" ]; then
+            _TZ_CT_RES="unchanged"
+        else
+            # The ln fallback counts only when the zone file exists (host-setup.sh).
+            # shellcheck disable=SC2016  # $1 expands in the container's sh, on purpose
+            incus exec "$_TZ_CT" -- timedatectl set-timezone -- "$_TZ" </dev/null >/dev/null 2>&1 \
+                || incus exec "$_TZ_CT" -- sh -c \
+                    'test -f "/usr/share/zoneinfo/$1" && ln -sf "/usr/share/zoneinfo/$1" /etc/localtime' \
+                    sh "$_TZ" </dev/null >/dev/null 2>&1 \
+                || true
+            if [ "$(_tz_ct_zone)" = "$_TZ" ]; then _TZ_CT_RES="set"; else _TZ_CT_RES="failed"; fi
+        fi
+        printf '{"ok": true, "action": "set-timezone", "zone": "%s", "from": "%s", "changed": %s, "container": "%s"}\n' \
+            "$_TZ" "$_TZ_FROM" "$([ "$_TZ_FROM" != "$_TZ" ] && echo true || echo false)" "$_TZ_CT_RES"
         ;;
     host-profile)
         # Read-only: print the host body-schema JSON (system identity, storage

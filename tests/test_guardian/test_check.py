@@ -1894,3 +1894,21 @@ class TestProbeConfirmedHealthy:
         assert _probe_confirmed_healthy(sm, now) is False
         sm.state.signal_history = []
         assert _probe_confirmed_healthy(sm, now) is False
+
+
+def test_guardian_log_stamps_carry_their_utc_offset():
+    import logging
+    import re
+    import time
+
+    from genesis.guardian.check import _setup_logging
+
+    # The datefmt _setup_logging actually configures (the file handler uses the
+    # same value), not the constant, so a reverted call site fails here.
+    with patch("logging.basicConfig") as basic:
+        _setup_logging()
+    datefmt = basic.call_args.kwargs["datefmt"]
+    record = logging.LogRecord("guardian", logging.INFO, __file__, 1, "x", None, None)
+    stamp = logging.Formatter("%(asctime)s", datefmt=datefmt).format(record)
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4}", stamp)
+    assert stamp.endswith(time.strftime("%z", time.localtime(record.created)))

@@ -150,6 +150,8 @@ def test_env_override_wins(tmp_path, monkeypatch) -> None:
 
 def test_timezone_resolution(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("USER_TIMEZONE", raising=False)
+    # No host clock zone either, so the user/fallback order is what is tested.
+    monkeypatch.setattr("genesis.guardian.deletion_window._system_zone_name", lambda: None)
     assert resolve_window(_cfg(tmp_path, tz="Asia/Tokyo")).tz_name == "Asia/Tokyo"
     with patch("genesis.env.user_timezone", return_value="Europe/Berlin"):
         assert resolve_window(_cfg(tmp_path, tz="")).tz_name == "Europe/Berlin"
@@ -173,6 +175,78 @@ def test_timezone_resolution(tmp_path, monkeypatch) -> None:
         patch("genesis.env._local_config", return_value={"timezone": "Amrica/Chicago"}),
     ):
         assert resolve_window(_cfg(tmp_path, tz="")).tz_source == "fallback"
+
+
+def _localtime(tmp_path, monkeypatch, target: str | None):
+    link = tmp_path / "localtime"
+    if target is not None:
+        link.symlink_to(target)
+    monkeypatch.setattr("genesis.guardian.deletion_window._LOCALTIME", str(link))
+
+
+def test_host_clock_zone_comes_before_utc(tmp_path, monkeypatch) -> None:
+    # A host Guardian with no genesis.yaml: user_timezone() is only its UTC
+    # default, and the zone set-timezone gave the host clock wins (#3794).
+    _localtime(tmp_path, monkeypatch, "../usr/share/zoneinfo/Europe/Paris")
+    with (
+        patch("genesis.env.user_timezone", return_value="UTC"),
+        patch("genesis.env._local_config", return_value={}),
+    ):
+        w = resolve_window(_cfg(tmp_path, tz=""))
+    assert (w.tz_name, w.tz_source) == ("Europe/Paris", "system")
+    assert w.tz == ZoneInfo("Europe/Paris")
+
+
+def test_configured_sources_outrank_the_host_clock(tmp_path, monkeypatch) -> None:
+    _localtime(tmp_path, monkeypatch, "/usr/share/zoneinfo/Europe/Paris")
+    assert resolve_window(_cfg(tmp_path, tz="Asia/Tokyo")).tz_source == "config"
+    with (
+        patch("genesis.env.user_timezone", return_value="Europe/Berlin"),
+        patch("genesis.env._local_config", return_value={"timezone": "Europe/Berlin"}),
+    ):
+        assert resolve_window(_cfg(tmp_path, tz="")).tz_name == "Europe/Berlin"
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        None,
+        "/somewhere/else",
+        "/usr/share/zoneinfo/Mars/Base",
+        "/usr/share/zoneinfo/Etc/UTC",
+        "/usr/share/zoneinfo/UTC",
+    ],
+)
+def test_unusable_host_clock_zone_is_not_a_source(tmp_path, monkeypatch, target) -> None:
+    # Missing link, a link outside a zoneinfo tree, an unloadable zone name, and
+    # UTC: an image default, so the no-user-timezone fallback stays visible.
+    _localtime(tmp_path, monkeypatch, target)
+    with (
+        patch("genesis.env.user_timezone", return_value="UTC"),
+        patch("genesis.env._local_config", return_value={}),
+    ):
+        w = resolve_window(_cfg(tmp_path, tz=""))
+    assert (w.tz_name, w.tz_source) == ("UTC", "fallback")
+
+
+@pytest.mark.parametrize("utc", ["UTC", "Etc/UTC", "Zulu"])
+def test_a_utc_genesis_yaml_is_not_a_choice_over_the_host_clock(tmp_path, monkeypatch, utc) -> None:
+    # The shipped genesis.yaml placeholder is "UTC" (scripts/lib/timezone.sh
+    # reads it as never chosen); it must not hide the aligned host clock.
+    _localtime(tmp_path, monkeypatch, "/usr/share/zoneinfo/Europe/Paris")
+    with (
+        patch("genesis.env.user_timezone", return_value=utc),
+        patch("genesis.env._local_config", return_value={"timezone": utc}),
+    ):
+        w = resolve_window(_cfg(tmp_path, tz=""))
+    assert (w.tz_name, w.tz_source) == ("Europe/Paris", "system")
+
+
+def test_failed_user_lookup_still_reads_the_host_clock(tmp_path, monkeypatch) -> None:
+    _localtime(tmp_path, monkeypatch, "/usr/share/zoneinfo/Europe/Paris")
+    with patch("genesis.env.user_timezone", side_effect=RuntimeError("no config")):
+        w = resolve_window(_cfg(tmp_path, tz=""))
+    assert (w.tz_name, w.tz_source) == ("Europe/Paris", "system")
 
 
 # --- SnapshotManager ----------------------------------------------------------------
