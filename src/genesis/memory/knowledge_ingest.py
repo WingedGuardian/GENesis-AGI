@@ -723,11 +723,14 @@ async def _credential_plan(
         header = first
         split = functools.partial(split, header=header)
         content, secret_value, secret_detail = await asyncio.to_thread(split) if split_large else split()
-    if insert_only and secret_value is not None:
+    if insert_only:
+        # The value this write would store: an upload whose whole text is the
+        # placeholder holds an empty value (below), and is compared as that.
+        stored_value = secret_value if secret_value is not None else ""
         for entry in entries:
             # An untrusted write of the credential an untrusted entry already
             # holds (a re-upload) is that entry: the one sameness rule.
-            if knowledge_crud.same_untrusted(entry, secret_value, secret_detail, json.dumps({"identifier": flat})):
+            if knowledge_crud.same_untrusted(entry, stored_value, secret_detail, json.dumps({"identifier": flat})):
                 return _CredentialPlan(_stored(entry.id, entry.concept), tuple(entries))
     if keyed is not None:
         concept, observed = entry_key, keyed
