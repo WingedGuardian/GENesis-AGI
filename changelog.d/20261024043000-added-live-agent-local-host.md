@@ -1,1 +1,0 @@
-- Add an opt-in persistent live-agent user service with private local owner controls, a terminal attach client, reconnectable approval visibility, and explicit interruption. Installing updates renders the unit without enabling it.

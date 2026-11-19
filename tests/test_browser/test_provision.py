@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -17,6 +18,9 @@ from pathlib import Path
 import pytest
 
 from genesis.browser import engine, provision
+
+# Taken before any fixture replaces it, for the test that needs the real import.
+_REAL_IMPORT_PROBLEM = provision._import_problem
 
 READY = engine.EngineStatus(
     engine.READY, "Camoufox official 156.0.1-beta.36", Path("/e/camoufox-bin")
@@ -254,6 +258,47 @@ def test_fetch_is_judged_by_re_resolving_not_its_exit_code(env, monkeypatch):
     _resolves(monkeypatch, MISSING, MISSING)
     out = provision.provision(Runner())
     assert not out.ok and "engine=missing" in out.line()
+
+
+_RATE_LIMITED = (
+    "Official... Error: 403 Client Error: rate limit exceeded for url: "
+    "https://api.github.com/repos/camoufox/camoufox/releases\n"
+    "Synced 0 versions from 0 repos.\n"
+)
+
+
+def test_a_rate_limited_fetch_names_the_rate_limit(env, monkeypatch, capsys):
+    """An anonymous GitHub rate limit (403) on the release lookup installs nothing;
+    the outcome line names it, and the fetch's own output still reaches the log (#4723)."""
+    _resolves(monkeypatch, MISSING, MISSING)
+    run = Runner({"camoufox fetch": (0, _RATE_LIMITED)})
+    out = provision.provision(run)
+    assert not out.ok
+    assert "engine=missing (GitHub API rate limit)" in out.line()
+    assert "403 Client Error: rate limit exceeded" in capsys.readouterr().out
+    ((_, kw),) = run.ran("camoufox fetch")
+    assert kw["capture_output"] is True and kw["text"] is True  # a real run returns output
+
+
+def test_a_timed_out_fetch_prints_its_partial_output(env, monkeypatch, capsys):
+    """A hung fetch must not take its output with it: the partial bytes are printed
+    before the timeout reaches the outcome."""
+    _resolves(monkeypatch, MISSING, MISSING)
+
+    def run(argv, **kw):
+        if "fetch" in argv:
+            raise subprocess.TimeoutExpired(argv, 1, output=b"Downloading 40%\n", stderr=None)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    out = provision.provision(run)
+    assert not out.ok and "TimeoutExpired" in out.line()
+    assert "Downloading 40%" in capsys.readouterr().out
+
+
+def test_an_unrated_fetch_failure_keeps_the_plain_missing(env, monkeypatch):
+    _resolves(monkeypatch, MISSING, MISSING)
+    out = provision.provision(Runner({"camoufox fetch": (1, "some other error\n")}))
+    assert "engine=missing " in out.line() + " " and "rate limit" not in out.line()
 
 
 def test_corrupt_pinned_dir_is_removed_then_fetched(env, monkeypatch):
@@ -1053,6 +1098,135 @@ def test_check_packages_names_a_package_whose_module_does_not_import(env, monkey
     assert provision.main(["check-packages"]) == 1
     out = capsys.readouterr().out
     assert "patchright" in out and "does not import" in out and "reinstall" in out
+
+
+_PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
+
+
+def _browser_reqs() -> dict:
+    """This checkout's browser-extra requirements by name, so a pin bump moves the
+    tests below with it."""
+    return {r.name.lower(): r for r in provision._browser_requirements(_PYPROJECT)}
+
+
+def _inside(req) -> str:
+    """A version the requirement admits: its exact pin or its lower bound."""
+    version = next(s.version for s in req.specifier if s.operator in ("==", ">="))
+    assert req.specifier.contains(version, prereleases=True), (req, version)
+    return version
+
+
+def _browser_layers_in_range(monkeypatch) -> None:
+    reqs = _browser_reqs()
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {d: _inside(reqs[d]) for d in provision.packages.BROWSER_DISTS},
+    )
+
+
+@pytest.mark.parametrize("state", ["healthy", "import fails", "not installed", "outside"])
+def test_check_packages_requires_the_scrapling_fetcher_dependencies(
+    env, monkeypatch, capsys, state
+):
+    """scrapling[fetchers] installs packages the three browser dists do not name; a
+    failed or stale install of it passed this check while web fetches fell back to
+    plain httpx. The browser extra in this checkout's pyproject.toml is judged."""
+    req = _browser_reqs()["scrapling"]
+    stale = "0.0.1"
+    assert not req.specifier.contains(stale, prereleases=True)
+    installed = {"not installed": None, "outside": stale}.get(state, _inside(req))
+    problem = "ModuleNotFoundError: No module named 'browserforge'"
+    _browser_layers_in_range(monkeypatch)
+    monkeypatch.setattr(
+        provision, "_dist_version", lambda name: installed if name == "scrapling" else None
+    )
+    monkeypatch.setattr(
+        provision,
+        "_import_problem",
+        lambda module: (
+            problem if state == "import fails" and module.startswith("scrapling.") else None
+        ),
+    )
+    expected = {
+        "healthy": None,
+        "import fails": [
+            str(req),
+            "scrapling.fetchers:AsyncFetcher does not import",
+            "browserforge",
+        ],
+        "not installed": ["scrapling is not installed"],
+        "outside": [f"scrapling {stale} is outside {req.specifier}"],
+    }[state]
+    code = provision.main(["check-packages", "--pyproject", str(_PYPROJECT)])
+    out = capsys.readouterr().out
+    if expected is None:
+        assert (code, out) == (0, "")
+    else:
+        assert code == 1 and out.startswith("browser-stack:")
+        assert all(part in out for part in expected), out
+
+
+@pytest.mark.parametrize("extras", ["fetchers,ai", "all", "shell"])
+def test_check_packages_judges_scrapling_whatever_extras_it_names(
+    env, monkeypatch, capsys, tmp_path, extras
+):
+    """Every scrapling extra pulls in the fetcher packages, so a browser extra that
+    names scrapling[fetchers,ai] or scrapling[all] is judged the same way; an
+    exact match on [fetchers] would skip the check for those silently."""
+    req = _browser_reqs()["scrapling"]
+    text = _PYPROJECT.read_text()
+    pattern = re.compile(r'"scrapling\[[^\]]*\]')
+    assert len(pattern.findall(text)) == 1, "expected one scrapling[...] requirement"
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(pattern.sub(f'"scrapling[{extras}]', text))
+    _browser_layers_in_range(monkeypatch)
+    monkeypatch.setattr(
+        provision, "_dist_version", lambda name: _inside(req) if name == "scrapling" else None
+    )
+    monkeypatch.setattr(
+        provision,
+        "_import_problem",
+        lambda module: (
+            "ModuleNotFoundError: No module named 'browserforge'"
+            if module.startswith("scrapling.")
+            else None
+        ),
+    )
+    assert provision.main(["check-packages", "--pyproject", str(pyproject)]) == 1
+    assert "scrapling.fetchers:AsyncFetcher does not import" in capsys.readouterr().out
+
+
+def test_check_packages_imports_the_fetcher_the_way_web_fetch_does(env, monkeypatch, capsys):
+    """Scrapling 0.5.1 loads AsyncFetcher lazily: importing scrapling.fetchers alone
+    succeeds with browserforge missing, and only `from scrapling.fetchers import
+    AsyncFetcher` (what web/fetch.py does) reaches it. The real import is run here,
+    with browserforge blocked, so a check that imports too little cannot pass."""
+    pytest.importorskip("scrapling")
+    req = _browser_reqs()["scrapling"]
+    _browser_layers_in_range(monkeypatch)
+    monkeypatch.setattr(
+        provision, "_dist_version", lambda name: _inside(req) if name == "scrapling" else None
+    )
+    # Only the scrapling target imports for real; the browser layers' launch modules
+    # are not this test's subject.
+    monkeypatch.setattr(
+        provision,
+        "_import_problem",
+        lambda module: _REAL_IMPORT_PROBLEM(module) if module.startswith("scrapling.") else None,
+    )
+    # An already-imported submodule (browserforge.headers) would still answer from
+    # sys.modules with its parent blocked, so both packages are cleared whole.
+    for name in [m for m in sys.modules if m.split(".")[0] in ("scrapling", "browserforge")]:
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setitem(sys.modules, "browserforge", None)
+    assert provision.main(["check-packages", "--pyproject", str(_PYPROJECT)]) == 1
+    out = capsys.readouterr().out
+    # Which missing package is named first depends on the venv: where patchright and
+    # playwright are absent too (the CI test job installs no [browser]), the import
+    # fails on them before browserforge. The check reporting it is what is asserted.
+    assert "scrapling.fetchers:AsyncFetcher does not import" in out
+
 
 @pytest.mark.parametrize(
     ("versions", "pin_capable", "expected"),

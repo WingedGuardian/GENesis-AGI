@@ -43,7 +43,18 @@ SHADOW_FILE = "lesson_builder_shadow.jsonl"
 # The shadow record rotates on it too (see record_shadow_lesson).
 CAP_WINDOW = timedelta(hours=24)
 
-DEFAULTS: dict[str, Any] = {"mode": "live"}
+DEFAULTS: dict[str, Any] = {"mode": "live", "segment": "shadow"}
+
+# How much of a session the builder judges (#4807):
+#   whole: the whole session, as before; no progress marker, no shadow line.
+#   shadow: the whole session, plus one log line per built session saying what
+#     judging only the unjudged part would do, and the progress marker
+#     (cc_sessions.lesson_built_through) moved as that rule would move it.
+#   incremental: judge only the unjudged part (up to 4 parts per pass in the
+#     cycle; the rebuild drain, which runs before memory extraction, makes at
+#     most one builder call per queued item; leftovers and failures queue a
+#     rebuild that continues from the marker). Needs mode live; under shadow or off it runs as shadow.
+SEGMENTS = ("whole", "shadow", "incremental")
 
 
 def _base_path() -> Path:
@@ -69,7 +80,7 @@ def load_config() -> dict[str, Any]:
             "lesson_builder config or its overlay unreadable (base %s) — reading as shadow",
             base_path, exc_info=True,
         )
-        return {"mode": "shadow"}
+        return {"mode": "shadow", "segment": "shadow"}
     return merged
 
 
@@ -83,6 +94,26 @@ def builder_mode() -> str:
         logger.warning("lesson_builder has invalid mode %r — degrading to shadow", mode)
         return "shadow"
     return mode
+
+
+def segment_mode() -> str:
+    """How much of a session the builder judges (see :data:`SEGMENTS`).
+
+    An invalid value reads as ``shadow``, which changes nothing the builder
+    stores. ``incremental`` takes effect only while the builder ``mode`` is
+    ``live``; the extraction job runs it as ``shadow`` otherwise.
+    """
+    segment = load_config().get("segment")
+    if segment not in SEGMENTS:
+        key = repr(segment)
+        if key not in _SEGMENT_WARNED:  # once per value per process, not per session
+            _SEGMENT_WARNED.add(key)
+            logger.warning("lesson_builder segment %s is invalid — reading as shadow", key)
+        return "shadow"
+    return segment
+
+
+_SEGMENT_WARNED: set[str] = set()
 
 
 def _records(path: Path) -> list[dict[str, Any]]:

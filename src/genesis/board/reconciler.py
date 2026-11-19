@@ -8,14 +8,15 @@ Every five minutes (``CronTrigger``, ``max_instances=1``) one tick:
    the tracker repo's own open totals, and counts cards by Status, by the
    Genesis field and by kind, plus coverage (open repo issues and PRs on the
    board, against the repo's open total);
-3. logs a ``drag`` event for every card in In Progress, keyed
+3. logs a ``drag`` event for every card in In Progress or Build, keyed
    ``item_id@<Status updatedAt>`` so a repeat is absorbed by the unique index.
    MEASURED 2026-10-04 on a private sandbox: that ``updatedAt`` moves on a real
    Status change and on nothing else (a Genesis-field write, a reorder within
    a column, a re-sent option list). ``observed_late`` is derived from the
    clock alone (the change predates this tick by more than one interval plus
    slack), so the enable-time backlog, a re-log after a prune and downtime all
-   read as late without consulting any stored state;
+   read as late without consulting any stored state. The drag's detail names
+   the column (``status``);
 4. after a good read, the write phase (#4400 Part 1), in this order:
 
    * records the card id on every ``board_links`` row whose issue now has a
@@ -43,7 +44,9 @@ Every five minutes (``CronTrigger``, ``max_instances=1``) one tick:
    timeout, a rate limit) stops the tick's writes; an error about one item
    skips that item. Outside ``live`` nothing is written and the summary
    carries would-write counts instead (``dry_run``);
-5. ALWAYS emits a ``board`` heartbeat whose details carry the summary, in
+5. after the write phase, the builder launcher (``board/launcher/``) takes
+   the cards in Build; it does nothing unless it is armed;
+6. ALWAYS emits a ``board`` heartbeat whose details carry the summary, in
    every mode and while paused. A pulse that stopped when the board was off
    would read "overdue" forever: the health MCP runs in another process and
    cannot see the server's ``GENESIS_BOARD_DISABLED``, and the morning report
@@ -86,6 +89,9 @@ _UNRESOLVED = "unresolved"
 # that should have seen it (a missed tick, downtime, enable-time backlog).
 _LATE_SLACK_S = 120
 IN_PROGRESS = "In Progress"
+BUILD = "Build"
+#: Columns whose cards get a ``drag`` row: work the owner started by hand.
+_DRAG_COLUMNS = (IN_PROGRESS, BUILD)
 NO_STATUS = "No Status"
 # The heartbeat row repeats every five minutes, so a runaway error message is
 # bounded here; the full text always goes to the log with its traceback.
@@ -141,7 +147,7 @@ async def _read_board(db, ref: tuple[str, int], tick_started: datetime) -> tuple
                 other_repo += 1
             elif content.get("state") == "OPEN" and not it.get("isArchived"):
                 on_board += 1
-        if status == IN_PROGRESS:
+        if status in _DRAG_COLUMNS:
             in_progress.append(it)
 
     if tracker:
@@ -162,7 +168,7 @@ async def _read_board(db, ref: tuple[str, int], tick_started: datetime) -> tuple
     except Exception as exc:
         logger.error("board reconciler: drag log failed", exc_info=True)
         drags = {
-            "in_progress": len(in_progress),
+            **_column_counts(in_progress),
             "error": _bounded(f"{type(exc).__name__}: {exc}"),
         }
     return {
@@ -423,13 +429,20 @@ async def _write_phase(db, project, items: list[dict], summary: dict, now: datet
     return out
 
 
+def _column_counts(cards: list[dict]) -> dict:
+    """``{"in_progress", "build"}``: how many of *cards* sit in each column."""
+    names = Counter((it.get("status") or {}).get("name") for it in cards)
+    return {"in_progress": names[IN_PROGRESS], "build": names[BUILD]}
+
+
 async def _log_drags(db, board_crud, in_progress: list[dict], tick_started: datetime) -> dict:
-    """One ``drag`` event per In Progress card per Status change; returns
-    ``{"in_progress", "newly_logged"}`` (or ``unavailable`` before migration)."""
+    """One ``drag`` event per In Progress or Build card per Status change;
+    returns ``{"in_progress", "build", "newly_logged"}`` (or ``unavailable``
+    before migration). *in_progress* holds the cards of both columns."""
     if not in_progress:
-        return {"in_progress": 0, "newly_logged": 0}
+        return {**_column_counts([]), "newly_logged": 0}
     if not await board_crud.tables_available(db):
-        return {"in_progress": len(in_progress), "unavailable": "board tables not migrated"}
+        return {**_column_counts(in_progress), "unavailable": "board tables not migrated"}
     late_before = tick_started - timedelta(seconds=INTERVAL_S + _LATE_SLACK_S)
     logged = 0
     async with board_crud.owned_connection(db) as own:
@@ -448,6 +461,7 @@ async def _log_drags(db, board_crud, in_progress: list[dict], tick_started: date
                 worker="board_reconciler",
                 observed_change_key=f"{it['id']}@{updated}",
                 detail={
+                    "status": (it.get("status") or {}).get("name"),
                     "status_updated_at": updated,
                     "observed_late": changed is None or changed < late_before,
                     "kind": content.get("__typename"),
@@ -455,7 +469,7 @@ async def _log_drags(db, board_crud, in_progress: list[dict], tick_started: date
             )
             if row_id is not None:
                 logged += 1
-    return {"in_progress": len(in_progress), "newly_logged": logged}
+    return {**_column_counts(in_progress), "newly_logged": logged}
 
 
 async def run_tick(rt, *, now: datetime | None = None) -> dict:
@@ -464,6 +478,7 @@ async def run_tick(rt, *, now: datetime | None = None) -> dict:
     summary: dict = {"tick_at": tick_started.isoformat()}
     error: BaseException | None = None
     write_error: str | None = None
+    board: tuple | None = None
     try:
         paused = bool(rt.paused)
     except Exception as exc:
@@ -508,6 +523,17 @@ async def run_tick(rt, *, now: datetime | None = None) -> dict:
             if write_error or rate_limited:
                 summary["last_error"] = write_error or rate_limited
 
+    if summary.get("board_state") != "pause_check_failed":
+        from genesis.board import launcher
+
+        # Every tick, so a disarm is recorded whatever the board read did; it
+        # launches only from a good read. Never raises: its failure rides in
+        # its block and counts as a job failure below.
+        good = summary.get("board_state") == "ok" and board is not None
+        summary["launcher"] = await launcher.run_launcher(
+            rt, board[1] if good else None, tick_started
+        )
+
     await _pulse(rt, summary)
     drag_error = (summary.get("drags") or {}).get("error")
     if error is not None:
@@ -516,6 +542,8 @@ async def run_tick(rt, *, now: datetime | None = None) -> dict:
         rt.record_job_failure(JOB_ID, error=f"drag log failed: {drag_error}")
     elif write_error:
         rt.record_job_failure(JOB_ID, error=f"board write failed: {write_error}")
+    elif launcher_error := (summary.get("launcher") or {}).get("error"):
+        rt.record_job_failure(JOB_ID, error=f"builder launcher failed: {launcher_error}")
     else:
         rt.record_job_success(JOB_ID)
     return summary

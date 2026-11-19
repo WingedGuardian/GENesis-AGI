@@ -1,1 +1,0 @@
-- The MCP description-budget guard independently enforces raw UTF-16 length and retains NFKC as a conservative additional budget, so normalization contractions cannot hide descriptions the client truncates.

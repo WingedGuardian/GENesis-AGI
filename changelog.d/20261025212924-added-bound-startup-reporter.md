@@ -1,1 +1,0 @@
-- The private Codebase reporter now validates its captured runtime, original owner and scope before worker entry, preserves startup OOM evidence and the original counter baseline, and binds the full control policy without enabling automatic indexing.
