@@ -72,9 +72,11 @@ class DeletionWindow:
     tz: tzinfo
     tz_name: str
     # Where the zone came from: "config" (deletion_window_timezone), "user"
-    # (genesis.env.user_timezone()), or "fallback" — no source on this host,
-    # so UTC. A host Guardian usually has no genesis.yaml; disk-status shows
-    # this so a fallback is visible rather than silently 05:00 UTC.
+    # (genesis.env.user_timezone()), "system" (the host clock's zone, which the
+    # gateway's set-timezone verb aligns with the install's), or "fallback" —
+    # no source on this host, so UTC. A host Guardian usually has no
+    # genesis.yaml; disk-status shows this so a fallback is visible rather
+    # than silently 05:00 UTC.
     tz_source: str = "config"
 
     @property
@@ -155,42 +157,83 @@ def _zone(name: str) -> tzinfo | None:
         return None
 
 
+# UTC under any of its names reads as "no zone chosen": a host image default or
+# the shipped genesis.yaml placeholder (scripts/lib/timezone.sh reads it so too).
+_UNCHOSEN_ZONES = frozenset(
+    {"UTC", "Etc/UTC", "UCT", "Etc/UCT", "Universal", "Etc/Universal", "Zulu", "Etc/Zulu"}
+)
+
+
 def _user_tz_configured() -> bool:
     """Whether this host names a user timezone at all (genesis.yaml
-    ``timezone`` or ``USER_TIMEZONE``) — else user_timezone()'s UTC is a
-    fallback, not a choice."""
+    ``timezone`` or ``USER_TIMEZONE``, other than UTC) — else user_timezone()'s
+    zone is a fallback, not a choice, and the host clock's zone comes first."""
     try:
         from genesis.env import _local_config
 
         named = (_local_config().get("timezone"), os.environ.get("USER_TIMEZONE"))
-        return any(isinstance(v, str) and v.strip() and _zone(v.strip()) for v in named)
+        return any(
+            isinstance(v, str)
+            and v.strip()
+            and v.strip() not in _UNCHOSEN_ZONES
+            and _zone(v.strip())
+            for v in named
+        )
     except Exception:
         return False
 
 
+_LOCALTIME = "/etc/localtime"
+
+
+def _system_zone_name() -> str | None:
+    """The host clock's IANA zone, read from the ``/etc/localtime`` symlink
+    that ``timedatectl set-timezone`` writes; None when it is not a link into a
+    zoneinfo tree, names a zone this host cannot load, or is UTC — a host
+    image's default, not a choice (as ``scripts/lib/timezone.sh`` reads it), so
+    the fallback stays visible."""
+    try:
+        target = os.readlink(_LOCALTIME)
+    except OSError:
+        return None
+    _, sep, name = target.partition("zoneinfo/")
+    if not sep or not name or name in _UNCHOSEN_ZONES or _zone(name) is None:
+        return None
+    return name
+
+
 def _resolve_tz(configured: object) -> tuple[tzinfo, str, str]:
     """The window's zone ``(tz, name, source)``: the configured IANA name,
-    else the user timezone, else UTC."""
+    else a configured user timezone, else the host clock's zone, else UTC."""
     if isinstance(configured, str) and configured.strip():
         zone = _zone(configured.strip())
         if zone is not None:
             return zone, configured.strip(), "config"
         logger.warning(
-            "snapshots.deletion_window_timezone=%r is not a valid zone — using the user timezone",
+            "snapshots.deletion_window_timezone=%r is not a valid zone — using the next timezone source",
             configured,
         )
+    name = zone = None
     try:
         from genesis.env import user_timezone
 
         name = user_timezone()
+        zone = _zone(name)
+        if zone is None:
+            logger.warning("timezone %r unavailable on this host", name)
     except Exception:
-        logger.warning("could not resolve the user timezone — using UTC", exc_info=True)
-        return UTC, "UTC", "fallback"
-    zone = _zone(name)
-    if zone is None:
-        logger.warning("timezone %r unavailable on this host — using UTC", name)
-        return UTC, "UTC", "fallback"
-    return zone, name, "user" if _user_tz_configured() else "fallback"
+        logger.warning("could not resolve the user timezone", exc_info=True)
+    if zone is not None and _user_tz_configured():
+        return zone, name, "user"
+    # A host Guardian usually has no genesis.yaml, so user_timezone() is only
+    # its UTC default here; the host clock is what set-timezone aligns (#3794).
+    system = _system_zone_name()
+    if system is not None:
+        return _zone(system), system, "system"
+    if zone is not None:
+        return zone, name, "fallback"
+    logger.warning("no timezone source on this host — using UTC")
+    return UTC, "UTC", "fallback"
 
 
 def resolve_window(config) -> DeletionWindow:
