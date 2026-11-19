@@ -16,7 +16,8 @@
 // failed (see tool.call).
 //
 // Not covered here: Monitor and background Bash output also reach records Claude Code keeps itself and this mod
-// cannot rewrite (queued notifications, task output files). The `.catch` handling follows the pattern of the
+// cannot rewrite (queued notifications, task output files); bin/stream_wrap.py redacts those at the source. The
+// `.catch` handling follows the pattern of the
 // secret-shield mod (Singh-AP/awesome-claude-mods, MIT); no code is copied from it.
 //
 // Plain JavaScript, so tests/test_plugins/test_secret_redact_mod.py can run it under node against a fake engine.
