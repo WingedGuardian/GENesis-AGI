@@ -437,7 +437,7 @@ async def test_a_rebuild_that_fails_in_the_drain_holds_the_marker(
     [
         ("whole", "whole"),
         ("shadow", "shadow"),
-        ("incremental", "shadow"),
+        ("incremental", "incremental"),
         ("bad", "shadow"),
         (None, "shadow"),
     ],

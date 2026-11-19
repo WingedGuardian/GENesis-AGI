@@ -4018,8 +4018,28 @@ verified: 3f70a665b 2026-11-15
   back. In
   shadow the whole session is still built; one `Lesson segment [shadow]` log
   line per built session says what the new part would do, and the marker moves
-  by compare-and-set when the builder ran and the cap allowed. `incremental` is
-  not built yet and reads as shadow.
+  by compare-and-set when the builder ran and the cap allowed. `incremental`
+  (#4813, needs `mode: live`, else it runs as shadow) replaces the whole build:
+  `_judge_from_marker` (in `learning/procedural/incremental.py`, which the
+  extraction cycle and the drain call into) judges up to 4 parts per pass from the marker in the cycle, and in the drain
+  up to 4 parts but at most 1 builder call per queued item (the drain runs before memory extraction, so its worst case
+  stays a batch of 20 single builder calls), each with up to 20
+  earlier tool turns shown for reference only and the session origin from the
+  whole spine, a timeout per part, and a compare-and-set after each. A
+  `candidates` flag triggers every part of its request. Entries left over
+  (budget, spent cap, failed build, a marker another writer moved) queue one
+  `procedure_rebuild` item per session that says only "continue from the
+  marker". A call left waiting for its result is judged when the result comes:
+  with a message, by the next cycle; alone, the empty-message branch queues the
+  drain when that result made an entry after the marker ready (a hook or
+  system line queues nothing), and the drain never re-queues a call still
+  waiting. A request merged into an
+  item a drain already claimed is queued again. The drain reads every
+  such item by the current mode (incremental judges from the marker, whole or
+  shadow rebuilds the whole session), claims it atomically, retries a failure up
+  to 8 attempts and then raises `procedure_extraction_lost`. Each lesson built
+  from a part also logs its grounding against the part alone, to measure
+  lessons built from the context turns.
 - **eval/**: J9 = fire-and-forget emit hooks on live cognitive paths (the
   "cannot break production" contract — hooks must never raise) + weekly Sunday
   aggregation (hard 7-day window) + an on-demand batch judge as a surplus
