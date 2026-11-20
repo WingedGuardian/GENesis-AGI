@@ -110,6 +110,8 @@ storage_pool:
   pool_used_high_pct: 85
   pool_used_crit_pct: 92
   realert_hours: 6
+  # A tier is left only this many points below its line (no page per crossing).
+  exit_margin_pct: 5
   # Pressure RELIEF — the tiers above only alert. When free data or metadata
   # space drops to its reserve, relief deletes ONE guardian-owned snapshot per
   # pass (pre-recovery first, the rollback lifeline last), never anything

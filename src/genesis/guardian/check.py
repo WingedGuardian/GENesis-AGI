@@ -38,10 +38,17 @@ from genesis.guardian.diagnosis_writer import write_diagnosis_result
 from genesis.guardian.dialogue import DialogueStatus, build_request, send_dialogue
 from genesis.guardian.health_signals import collect_all_signals
 from genesis.guardian.pool import (
+    _TIER_RANK as _POOL_TIER_RANK,
+)
+from genesis.guardian.pool import (
     TIER_CRIT,
     TIER_OK,
+    AlertDecision,
     decide_alert,
+    exit_margin_points,
     measure_storage_pool,
+    pool_axis_tiers,
+    worst_of,
     worst_tier,
 )
 from genesis.guardian.recovery import RecoveryEngine
@@ -1386,30 +1393,68 @@ async def _check_storage_pool_and_alert(
     if not status.detected:
         logger.debug("storage-pool not measurable: %s", status.detail)
         return
-
-    tier = worst_tier(status, cfg)
+    # A report with no readable percentage carries no reading: tiering it would
+    # read every axis as ``ok``, clear the held tier, and re-page the next tick.
+    if status.data_pct is None and status.metadata_pct is None and status.pool_used_pct is None:
+        logger.debug("storage-pool has no readable percentage: %s", status.detail)
+        return
 
     state_file = config.state_path / "pool_alert_state.json"
     last_tier = TIER_OK
     last_alert_at: datetime | None = None
+    # ``stored_axes``: the per-axis tiers this file actually holds. The margin
+    # reads ``prior_axes``, which falls back to the recorded tier when none are
+    # stored; the rise check and the write use only what was stored.
+    stored_axes: dict[str, str] = {}
     if state_file.exists():
         try:
             data = json.loads(state_file.read_text())
             last_tier = data.get("tier", TIER_OK)
             raw_at = data.get("last_alert_at")
             last_alert_at = datetime.fromisoformat(raw_at) if raw_at else None
-        except (ValueError, OSError):
+            raw_axes = data.get("axes")
+            if isinstance(raw_axes, dict):
+                stored_axes = {
+                    k: v for k, v in raw_axes.items() if isinstance(v, str) and v in _POOL_TIER_RANK
+                }
+        except (ValueError, OSError, AttributeError, TypeError):
             pass
+    if not isinstance(last_tier, str) or last_tier not in _POOL_TIER_RANK:
+        last_tier = TIER_OK
+    # A state file from before per-axis tiers: every axis starts at the
+    # recorded tier, so an upgrade neither pages nor clears by itself.
+    prior_axes = stored_axes or {"data": last_tier, "metadata": last_tier, "pool_used": last_tier}
+
+    # ``tier`` is held by the exit margin (a reading at a line pages once);
+    # ``measured`` is the reading alone, and sets severity, the exhaustion
+    # warning and the provisioning rung: a pool held at a tier by the margin
+    # is not that full.
+    axes = pool_axis_tiers(status, cfg, prior_axes)
+    tier = worst_of(axes)
+    measured = worst_tier(status, cfg)
 
     now = datetime.now(UTC)
     decision = decide_alert(tier, last_tier, last_alert_at, now, cfg.realert_hours)
+    if not decision.should_alert:
+        # One axis held at a tier must not hide another axis rising to it: a
+        # rise on any axis is news even when the worst held tier is unchanged.
+        # Only an axis that had a tier counts: when ``lvs`` fails, an LVM pool
+        # reads as ``pool_used`` alone for a tick, and the data and metadata
+        # axes coming back are not a rise.
+        for axis, new in axes.items():
+            old_tier = stored_axes.get(axis)
+            if old_tier is None:
+                continue
+            if _POOL_TIER_RANK[new] > _POOL_TIER_RANK.get(old_tier, 0):
+                decision = AlertDecision(True, tier, f"{axis} rose {old_tier}→{new}")
+                break
 
     if decision.should_alert:
         if decision.is_resolution:
             severity = AlertSeverity.INFO
             title = "Storage pool recovered"
         else:
-            severity = _POOL_TIER_SEVERITY.get(tier, AlertSeverity.WARNING)
+            severity = _POOL_TIER_SEVERITY.get(measured, AlertSeverity.WARNING)
             title = f"Storage pool {tier.upper()}"
         parts = []
         if status.data_pct is not None:
@@ -1421,7 +1466,13 @@ async def _check_storage_pool_and_alert(
         if status.pool_used_pct is not None:
             parts.append(f"pool used {status.pool_used_pct:.0f}%")
         body = f"{decision.reason}. " + ", ".join(parts)
-        if tier == TIER_CRIT:
+        if measured != tier and not decision.is_resolution:
+            margin = exit_margin_points(cfg.exit_margin_pct, "storage_pool.exit_margin_pct")
+            body += (
+                f" (measured {measured}; held at {tier} until the reading falls "
+                f"{margin:g} points below the {tier} line)"
+            )
+        if measured == TIER_CRIT:
             pool_kind = "Thin pool" if status.data_pct is not None else "Storage pool"
             body += (
                 f"\n{pool_kind} near exhaustion — add space or free allocation "
@@ -1440,6 +1491,9 @@ async def _check_storage_pool_and_alert(
         state_file.parent.mkdir(parents=True, exist_ok=True)
         state_file.write_text(json.dumps({
             "tier": tier,
+            # The axes not read this tick keep their tier, so a tick on the
+            # other axis set (a failed ``lvs``) does not erase the margin.
+            "axes": {**stored_axes, **axes},
             "last_alert_at": new_alert_at.isoformat() if new_alert_at else None,
         }))
     except OSError:
@@ -1450,7 +1504,7 @@ async def _check_storage_pool_and_alert(
     # uncontended — the outage-recovery path). When Genesis is up, the container
     # owns any grow; here we only alerted. The min_repropose_hours damper inside
     # maybe_propose_pool_grow prevents re-offering every tick.
-    if tier == TIER_CRIT and genesis_down:
+    if measured == TIER_CRIT and genesis_down:
         await _maybe_propose_provisioning(config, dispatcher)
 
 

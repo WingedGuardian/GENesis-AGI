@@ -2882,8 +2882,12 @@ verified: 0aa0bf9f2 2026-11-10
   (`pool.py`) and **RAM** (`memory_watch.py`, E-rest) — the latter over two
   axes worst-of, container cgroup (via incus-exec, best-effort) + host-VM
   `/proc/meminfo` (the reliable axis). Both use the shared `_tier_for`/
-  `decide_alert` hysteresis; RAM adds flap damping on top: a per-axis exit
-  margin (`memory_tiers.exit_margin_pct`, default 5), a blind axis holding its
+  `decide_alert` hysteresis and the shared per-axis exit margin
+  (`pool.held_tier`: a tier is left only that many points below its line;
+  `storage_pool.exit_margin_pct` and `memory_tiers.exit_margin_pct`, default
+  5; the pool's state `pool_alert_state.json` keeps `axes`, and its severity,
+  exhaustion warning and provisioning rung follow the measured tier, not the
+  held one). RAM adds more flap damping on top: a blind axis holding its
   last tier (stale after one re-alert window, and named in the page), and a
   baseline of the highest tier paged since the last recovery that lasts one
   re-alert window (state `memory_alert_state.json`: `tier` = that peak,
