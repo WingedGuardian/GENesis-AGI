@@ -404,7 +404,7 @@ brain"), authenticated at install by a one-time `claude login`. That login has
 no refresh, so if it dies the brain silently goes dark — discovered only
 mid-incident.
 
-Two mechanisms make this observable and survivable without host access:
+Three mechanisms make this observable and survivable without host access:
 
 1. **Auth-health signal.** The gateway `version` verb reports `cc_logged_in`
    (a 1h-cached `claude auth status` probe), `cc_token_present`, and
@@ -414,7 +414,13 @@ Two mechanisms make this observable and survivable without host access:
    token expires. No token material or account identity ever crosses the wire —
    only booleans and an age.
 
-2. **Fallback setup-token (optional, lazy).** Mint a 1-year token from ANY
+2. **Daily auth canary.** Once a day, on a healthy tick, the host Guardian makes
+   one minimal real `claude -p` call through the same credential path its
+   diagnosis uses (`guardian/cc_canary.py`), and pages once with Claude Code's own
+   reason if it fails. The `version` fields above say only that a token exists and
+   how old it is; this says whether the brain can actually authenticate.
+
+3. **Fallback setup-token (optional, lazy).** Mint a 1-year token from ANY
    machine with `claude setup-token` and give it to `scripts/store_cc_token.sh`
    in the container — pipe it on stdin, or (the interactive `setup-token` makes
    piping awkward) write it to a file and pass `--file /path/to/token`, never a

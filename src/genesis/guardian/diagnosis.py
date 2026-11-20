@@ -126,6 +126,29 @@ def _ensure_work_dir(configured: Path, fallback: Path | None = None) -> Path:
     return fallback
 
 
+_NO_MCP_JSON = '{"mcpServers": {}}'
+
+
+def _ensure_no_mcp_config(work_dir: Path) -> str:
+    """The ``--mcp-config`` value for a ``claude -p`` run in ``work_dir``.
+
+    The recovery brain needs only built-in tools. An install whose work dir never
+    got this file let CC load every configured MCP server (seen on a live host),
+    so it is written when missing. When it cannot be written, the same empty
+    config is returned inline: ``--mcp-config`` takes a JSON string as well as a
+    file (MEASURED, Claude Code 2.1.299), so ``--strict-mcp-config`` always
+    applies.
+    """
+    path = work_dir / "config" / "no_mcp.json"
+    if not path.exists():
+        try:
+            atomic_write_text(path, _NO_MCP_JSON + "\n")
+        except OSError as exc:
+            logger.warning("could not write %s, passing it inline: %s", path, exc)
+            return _NO_MCP_JSON
+    return str(path)
+
+
 def _cc_error_reason(stdout_text: str, stderr_text: str) -> str:
     """Why a ``claude -p --output-format json`` run failed, from its own report.
 
@@ -568,15 +591,7 @@ class DiagnosisEngine:
         # --strict-mcp-config ensures no global/project MCP configs are loaded,
         # preventing unnecessary memory consumption from heavy MCP server
         # processes (codebase-memory-mcp, serena, gitnexus, etc.).
-        no_mcp_config = work_dir / "config" / "no_mcp.json"
-        if not no_mcp_config.exists():
-            # The recovery brain needs only built-in tools. An install whose
-            # work dir never got this file let CC load every configured MCP
-            # server (seen on a live host), so write the empty config here.
-            try:
-                atomic_write_text(no_mcp_config, '{"mcpServers": {}}\n')
-            except OSError as exc:
-                logger.warning("could not write %s: %s", no_mcp_config, exc)
+        no_mcp_config = _ensure_no_mcp_config(work_dir)
         # Emit --effort unless the model doesn't use one (Haiku). Unknown model
         # strings fall through to including it (best-effort; guardian defaults to
         # opus, which supports the full range).
@@ -589,13 +604,7 @@ class DiagnosisEngine:
             "--max-turns", str(self._config.cc.max_turns),
             "--dangerously-skip-permissions",
         ]
-        if no_mcp_config.exists():
-            cmd.extend(["--mcp-config", str(no_mcp_config), "--strict-mcp-config"])
-        else:
-            logger.warning(
-                "config/no_mcp.json not found at %s — CC may load MCP servers",
-                no_mcp_config,
-            )
+        cmd.extend(["--mcp-config", no_mcp_config, "--strict-mcp-config"])
 
         logger.info(
             "Starting CC diagnosis: model=%s, max_turns=%d, timeout=%ds, "
