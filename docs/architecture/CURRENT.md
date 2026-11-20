@@ -1735,7 +1735,22 @@ other intake evidence retains its dated basis.
   `remove_unit` tombstones a source when its last unit is deleted (invariant:
   only that method may tombstone). The conversational path
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
-  contrast the intake bypass in entry 4.
+  contrast the intake bypass in entry 4. A distilled batch's credential units
+  go through the credential chokepoint, never refused; its other units are
+  masked first, contextually (`orchestrator._SiblingMasks`, owner ruling
+  2026-11-19): each is masked only for the strings it uses as secrets (the ones
+  the distiller names for it, `KnowledgeUnit.secrets`, never stored, and the
+  ones the capture rules read in its own text), and only when a credential
+  unit of the batch holds them (in any of its fields, in any spelling the
+  masks read; a match grows over the holding text, so a secret named in part
+  is masked whole); every other word, usernames included, stays. Card numbers
+  in those units are redacted as the chokepoint redacts a caller's fields.
+  A concept masking changed, or one over 200 characters, is cut to fit and
+  ends in ` #<8 hex>` from its whole masked text and where its secrets are
+  held (credential ids and offsets), so its key never depends on the batch's
+  other units. Stated limits: a secret the distiller does not name and no
+  label marks stays in a sibling; a secret repeated in another upload, or in a
+  batch with no credential unit, is not masked (#4916).
 - **inbox/**: file-drop monitor with approval-gated dispatch.
   Explicit owner-requested disposition review uses the manual-only Tier-1
   `inbox-review` skill, reached by the attended-request pointer in `CLAUDE.md`.

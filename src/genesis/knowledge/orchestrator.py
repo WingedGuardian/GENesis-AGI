@@ -34,6 +34,125 @@ _SANITIZER = ContentSanitizer()
 _MAX_CONCEPT = 200
 #: The quality flag of a credential unit that could not be stored (by reason).
 CREDENTIAL_NOT_STORED = "credential_unit_not_stored:"
+#: A concept the batch changed or cut ends with this many characters of key.
+_KEY_SUFFIX = len(" #") + 8
+
+
+class _SiblingMasks:
+    """What a distilled batch's credential units hold, for masking its other
+    units (#2426; live code refused such a batch). Masking is contextual (owner
+    ruling 2026-11-19): an ordinary unit is masked only for the strings IT uses
+    as secrets, the ones the distiller names for it (``KnowledgeUnit.secrets``)
+    and the ones the capture rules read in its own text ("password: X"), and
+    only when a credential unit of the batch holds one (it occurs, in any
+    spelling the masks read, in one of the fields of that unit, which the
+    chokepoint holds). Every other word stays: usernames, ordinary words, and
+    the rest of a copied credential. A credential unit that could not be
+    stored still masks its siblings (fail closed; the batch carries the quality
+    flag)."""
+
+    def __init__(self, units: list, keys: list[str]):
+        from genesis.memory.reference_masks import _decoded, _normalise
+
+        self.held = []
+        for unit, key in zip(units, keys, strict=True):
+            raw = "\n".join(_strings([unit.concept, unit.body, unit.section_title, unit.tags, unit.relationships, unit.caveats]))
+            primary = _normalise(raw)
+            forms = [primary, *sorted({_normalise(f) for f in _decoded(raw)} - {primary})]
+            self.held.append((key, raw, forms))
+
+    def secrets_in(self, unit) -> dict[str, tuple[list[str], list[str]]]:
+        """The secrets ``unit`` uses that the batch holds: each with where it is
+        held (``<credential key>@<offset in its text>``, no secret in it) and
+        the credential texts that hold it, over which a match grows, so a
+        secret named only in part is masked whole."""
+        from genesis.memory.reference_extraction import captured_secrets
+        from genesis.memory.reference_masks import _decoded, _normalise
+
+        texts = list(_strings([unit.concept, unit.body, unit.section_title, unit.tags, unit.relationships, unit.caveats]))
+        found: dict[str, tuple[list[str], list[str]]] = {}
+        for secret in dict.fromkeys(s.strip() for s in [*sorted(captured_secrets(texts)), *unit.secrets]):
+            wanted = [f for f in sorted({_normalise(d) for d in _decoded(secret)}) if f.strip()]
+            refs, holders = [], []
+            for key, raw, forms in self.held:
+                at = next((form.find(w) for form in forms for w in wanted if w in form), -1)
+                if at >= 0:
+                    refs.append(f"{key}@{at}")
+                    holders.append(raw)
+            if refs:
+                found[secret] = (refs, holders)
+        return found
+
+
+def _strings(value):
+    """Every string in ``value`` (nested lists, tuples and dict keys and values)."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            yield from _strings(k)
+            yield from _strings(v)
+    elif isinstance(value, (list, tuple, set)):
+        for v in value:
+            yield from _strings(v)
+
+
+def _keyed_unit(unit, siblings: _SiblingMasks | None):
+    """``unit`` with the held secrets it uses masked in every indexed field,
+    and its concept as its stored key: as given when that is unchanged and fits
+    the cap; otherwise cut to fit and ending in a key from its whole (masked)
+    text and where the secrets it names are held (stored credential ids, random,
+    and offsets, so the key reveals nothing). The key never depends on the
+    batch's other units: two concepts that differ only past the cap, or only by
+    two different secrets, keep two rows, and the same credential's sibling
+    keeps its row across uploads (#4843 review)."""
+    from genesis.memory import reference_masks as rm
+
+    if siblings is not None:
+        # Card numbers are redacted as the chokepoint redacts them in the fields
+        # of a caller (owner ruling 1dedc18a): live code refused a batch holding
+        # a credential unit, so a card in its other units was never stored.
+        from genesis.memory.knowledge_ingest import _redacted_like
+        from genesis.security.card_redaction import redact_text
+
+        unit = dataclasses.replace(
+            unit,
+            concept=redact_text(unit.concept),
+            body=redact_text(unit.body),
+            section_title=redact_text(unit.section_title) if unit.section_title else unit.section_title,
+            tags=_redacted_like(unit.tags),
+            relationships=_redacted_like(unit.relationships),
+            caveats=_redacted_like(unit.caveats),
+        )
+    held = siblings.secrets_in(unit) if siblings is not None else {}
+    mask = None
+    if held:
+        secrets = sorted(held)
+        runs = list(dict.fromkeys(raw for _, holders in held.values() for raw in holders))
+        mask = rm.ValueMask(secrets[0], probes=rm.secret_probes(secrets), exempt=frozenset(), secrets=secrets + runs)
+        unit = dataclasses.replace(
+            unit,
+            body=mask.mask(unit.body),
+            tags=mask.mask_field(unit.tags),
+            relationships=mask.mask_field(unit.relationships),
+            caveats=mask.mask_field(unit.caveats),
+            section_title=mask.mask(unit.section_title) if unit.section_title else unit.section_title,
+        )
+    concept = mask.mask(unit.concept) if mask is not None else unit.concept
+    if concept == unit.concept and len(concept) <= _MAX_CONCEPT:
+        return dataclasses.replace(unit, secrets=[])
+    named = [
+        ref
+        for secret, (refs, _) in held.items()
+        if rm.ValueMask(secret, probes=rm.secret_probes([secret]), exempt=frozenset()).carries(unit.concept)
+        for ref in refs
+    ]
+    digest = hashlib.sha256(
+        b"genesis/knowledge-concept\0" + concept.encode() + b"\0" + ",".join(sorted(named)).encode()
+    ).hexdigest()[:8]
+    return dataclasses.replace(
+        unit, concept=f"{rm.cap_masked(concept, _MAX_CONCEPT - _KEY_SUFFIX, mask)} #{digest}", secrets=[],
+    )
 
 
 @dataclass
@@ -456,11 +575,9 @@ class KnowledgeOrchestrator:
 
         credential_units = [u for u in units if holds_secret(project_type, u.domain)]
         # A credential unit's concept reaches the chokepoint whole (it masks a
-        # secret in it before its own cap); every other one is capped here.
-        units = [
-            dataclasses.replace(u, concept=u.concept[:_MAX_CONCEPT])
-            for u in units if not holds_secret(project_type, u.domain)
-        ]
+        # secret in it before its own cap); every other one is keyed and capped
+        # below, after its batch's credential secrets are masked in it.
+        units = [u for u in units if not holds_secret(project_type, u.domain)]
 
         unit_ids: list[str] = []
         qdrant_ids: list[str] = []  # Track for compensation on failure
@@ -578,13 +695,19 @@ class KnowledgeOrchestrator:
         # the rest of the document proceeds. A payment card number (#3172) is
         # the one intended refusal: not retried, and recorded the same way.
         credential_ids: list[str] = []
+        # One key per credential unit, for its siblings' concept keys: its stored
+        # id, or a fresh one when it was not stored (a sibling then never
+        # shares a key with another row).
+        credential_keys: list[str] = []
         for unit in credential_units:
             for attempt in (1, 2):
                 try:
-                    credential_ids.append(await self._store_credential_unit(
+                    stored = await self._store_credential_unit(
                         memory_mod, unit, project_type=project_type, source=source,
                         purpose=purpose, origin_class=resolved_origin,
-                    ))
+                    )
+                    credential_ids.append(stored)
+                    credential_keys.append(str(stored))
                     break
                 except Exception as exc:
                     card = isinstance(exc, ValueError) and "payment card number" in str(exc)
@@ -593,7 +716,13 @@ class KnowledgeOrchestrator:
                         logger.warning("A distilled credential unit was not stored (%s)", reason)
                         if flags is not None:
                             flags.append(f"{CREDENTIAL_NOT_STORED}{reason}")
+                        credential_keys.append(f"unstored-{uuid.uuid4().hex}")
                         break
+
+        # Its credential units' secrets are masked in every other unit of the
+        # batch before anything of it is written (live code refused the batch).
+        siblings = _SiblingMasks(credential_units, credential_keys) if credential_units else None
+        units = [_keyed_unit(u, siblings) for u in units]
 
         if not units:
             return credential_ids
