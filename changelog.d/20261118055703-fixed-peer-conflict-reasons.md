@@ -1,0 +1,1 @@
+- When Genesis refuses a peer's message because it conflicts with an earlier one, the refusal now says which rule applied (a reply already received, another turn still running in that conversation, or a reused message id) and what the peer should do next, instead of a bare conflict.
