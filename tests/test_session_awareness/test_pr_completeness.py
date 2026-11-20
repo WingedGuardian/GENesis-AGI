@@ -640,3 +640,44 @@ def test_prepare_keeps_one_deadline_across_both_passes(tmp_path, monkeypatch):
     argv = ["prepare", "--repo", "owner/repo", "--pr", "7", "--output", str(target)]
     assert cli.main(argv) == 2
     assert not target.exists()
+
+
+def test_e2e_refusal_names_positions_not_declaration_text(tmp_path):
+    from genesis.session_awareness.pr_completeness import assess_completeness
+
+    raw, source = reviewed(tmp_path)
+    raw["e2e"] = []
+    refresh(raw)
+    assessment = assess_completeness(parse_evidence(raw), source)
+    assert assessment.status == "inconsistent" and "E2E" in assessment.reason
+    assert "verify the changed text" not in assessment.reason
+    assert "1" in assessment.reason
+
+
+def test_prepare_refuses_a_second_pass_that_ends_after_the_deadline(tmp_path, monkeypatch):
+    # The pass starts in time; the clock moves past the bound only once it returns.
+    source = snapshot(tmp_path)
+    cli = review_cli()
+    now = [0.0]
+    monkeypatch.setattr(cli.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(cli, "acquire_sources", lambda *args: source)
+    real = cli.reconcile_diff
+
+    def late(*args, **kwargs):
+        result = real(*args, **kwargs)
+        now[0] = cli.ACQUISITION_SECONDS + 1.0
+        return result
+
+    monkeypatch.setattr(cli, "reconcile_diff", late)
+    target = tmp_path / "packet"
+    argv = ["prepare", "--repo", "owner/repo", "--pr", "7", "--output", str(target)]
+    assert cli.main(argv) == 2
+    assert not target.exists()
+
+
+def test_inventory_accepts_an_e2e_plan_longer_than_ordinary_text(tmp_path):
+    from genesis.session_awareness.pr_completeness import ReviewInventory
+
+    raw, _ = reviewed(tmp_path)
+    inventory = dict(raw["completeness"]["inventory"], e2e_steps=["x" * 5000])
+    assert ReviewInventory.model_validate(inventory).e2e_steps == ["x" * 5000]

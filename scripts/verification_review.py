@@ -95,6 +95,9 @@ def main(argv: list[str] | None = None) -> int:
         if remaining <= 0:
             raise SourceError("source acquisition deadline expired")
         gaps = reconcile_diff(snapshot.diff.encode(), snapshot.files, timeout=remaining)
+        # Git honours its timeout, but parsing runs after it: check the bound again.
+        if time.monotonic() - started > ACQUISITION_SECONDS:
+            raise SourceError("source acquisition deadline expired")
         packet = save_packet(snapshot, args.output)
     except (SourceError, EvidenceError, OSError) as exc:
         # Do not dump subprocess stderr, PR bodies or raw source on failure.

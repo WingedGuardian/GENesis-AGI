@@ -104,7 +104,7 @@ fresh-context reviewer ran. The stored evidence cap remains 256 KiB including
 the report, measured on the same indented serialization both close writers
 store (`stored_evidence_json`). When the document's derived verdict closes, the
 check also applies the writers' E2E coverage rule, so a mapping they would
-refuse cannot verify here. That includes documents the validator will record
+refuse cannot verify here (the refusal names unmapped steps by position, never by text). That includes documents the validator will record
 with `--park`, and rows whose tracking is incomplete (the writers then record
 the row open and skip the rule; tracking needs the database and is not read
 offline). In both cases the check is stricter than the writers, never looser. Both close writers retain their earlier behavior in this P2

@@ -44,6 +44,8 @@ if TYPE_CHECKING:
     from genesis.session_awareness.pr_evidence import EvidenceDocument
 
 Text = Annotated[StrictStr, StringConstraints(min_length=1, max_length=4096, pattern=r"\S")]
+# E2E plan identities come from the PR body, which is read up to 65,536 characters.
+E2EStep = Annotated[StrictStr, StringConstraints(min_length=1, max_length=65536, pattern=r"\S")]
 Quote = Annotated[StrictStr, StringConstraints(min_length=1, max_length=4096)]
 PathText = Annotated[StrictStr, StringConstraints(min_length=1, max_length=MAX_METADATA)]
 Identifier = Annotated[StrictStr, StringConstraints(pattern=r"^[A-Za-z0-9._:-]{1,128}$")]
@@ -121,7 +123,7 @@ class ReviewInventory(_Model):
     source: SourceBinding
     items: list[InventoryItem] = Field(max_length=MAX_FILES)
     files: list[FileDisposition] = Field(max_length=MAX_FILES)
-    e2e_steps: list[Text] = Field(default_factory=list, max_length=MAX_FILES)
+    e2e_steps: list[E2EStep] = Field(default_factory=list, max_length=MAX_FILES)
 
 
 class ItemCoverage(_Model):
@@ -316,8 +318,18 @@ def _closing_e2e_refusal(doc: EvidenceDocument, snapshot: PrSourceSnapshot) -> s
     decision = decide(doc)
     if not isinstance(decision, Decision) or not decision.closing:
         return None
-    refusal = check_e2e_coverage(doc, snapshot.body)
-    return refusal.message if refusal is not None else None
+    if check_e2e_coverage(doc, snapshot.body) is None:
+        return None
+    # The same rule, reported by position: the writers' message quotes the
+    # declarations, and the offline check never prints raw PR source.
+    steps = e2e_steps(snapshot.body)
+    mapped = {item.step.strip() for item in doc.e2e}
+    missing = [str(i + 1) for i, step in enumerate(steps) if step not in mapped]
+    stale = len(mapped - set(steps))
+    return (
+        f"E2E coverage is incomplete: declared step(s) {', '.join(missing) or 'none'} "
+        f"unmapped, {stale} mapping(s) name no declared step"
+    )
 
 
 def assess_completeness(
