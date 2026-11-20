@@ -2261,9 +2261,10 @@ async def test_a_password_holding_the_username_is_masked_whole(batch):
 
 
 async def test_concepts_differing_only_by_secrets_of_two_credentials_stay_two_rows(batch, db):
-    """CodeRabbit 4633597935: the key of a masked concept comes from where its
-    secrets are held, so two uploads never share one; the same credential gives
-    the same key, so its sibling is updated, not duplicated."""
+    """CodeRabbit 4633597935: two uploads never share a masked concept's key.
+    A masked concept takes a fresh identity (owner ruling 2026-11-20), so a
+    changed document's re-ingest adds a row beside the old one, never
+    overwriting another."""
 
     def pair(body, secret, cred_concept):
         return [_plain(body, concept=f"wifi {secret}", secrets=[secret]), _cred(f"password: {secret}", concept=cred_concept)]
@@ -2273,9 +2274,61 @@ async def test_concepts_differing_only_by_secrets_of_two_credentials_stay_two_ro
     assert one[0]["concept"] != two[0]["concept"]
     assert one[0]["concept"].startswith("wifi [held] #") and "fake" not in one[0]["concept"]
     again = await batch(pair("first, updated", "Aa1!fakeOne", "wifi one"))
-    assert again[0]["concept"] == one[0]["concept"]
+    assert again[0]["concept"] not in {one[0]["concept"], two[0]["concept"]}
     rows = await db.execute_fetchall("SELECT body FROM knowledge_units WHERE domain = 'reference.fact'")
-    assert sorted(r[0] for r in rows) == ["first, updated", "second"]
+    assert sorted(r[0] for r in rows) == ["first", "first, updated", "second"]
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        # CodeRabbit 4638485418: a percent-escaped token is masked whole,
+        # prefix included.
+        ("Set p=Hh3!fake%21", "Set q=Hh3!fake%21"),
+        # A literal mask in the text on either side of the secret.
+        ("a [held] Hh3!fake!", "a Hh3!fake! [held]"),
+        # A case variant of the held secret.
+        ("key HH3!FAKE!", "key hh3!FAKE!"),
+    ],
+)
+async def test_concepts_masked_alike_from_different_originals_stay_two_rows(batch, db, first, second):
+    """Round 2 of #4924: two different concepts that masking makes one text
+    keep two rows; none overwrites the other."""
+    cred = _cred("password: Hh3!fake!")
+    await batch([
+        _plain("one", concept=first, secrets=["Hh3!fake!"]),
+        _plain("two", concept=second, secrets=["Hh3!fake!"]),
+        cred,
+    ])
+    rows = await db.execute_fetchall("SELECT concept, body FROM knowledge_units WHERE domain = 'reference.fact'")
+    assert sorted(r[1] for r in rows) == ["one", "two"]
+    assert len({r[0] for r in rows}) == 2 and all("fake" not in r[0].lower() for r in rows)
+
+
+async def test_a_secret_in_the_domain_or_source_date_is_masked(batch, memory_mcp):
+    """CodeRabbit 4638485412: every model-written field that is stored is
+    masked: the domain (the vector's source and tags, the DB key, FTS) and the
+    source date; a masked domain gives the concept a fresh identity."""
+    from genesis.knowledge.distillation import KnowledgeUnit
+
+    unit = KnowledgeUnit(
+        concept="Router notes", body="notes", domain="ops.Qq9!fake7", source_date="Qq9!fake7", secrets=["Qq9!fake7"],
+    )
+    (row,) = await batch([unit, _cred("password: Qq9!fake7")])
+    assert row["domain"] == "ops.[held]" and row["source_date"] == "[held]"
+    assert row["concept"].startswith("Router notes #")
+    assert "fake" not in _indexed(row, memory_mcp)
+
+
+async def test_a_card_number_in_the_domain_is_redacted(batch):
+    """Round 2 of #4924: card redaction covers the domain and source date, as
+    it does the other fields, and a redacted domain gives a fresh identity."""
+    from genesis.knowledge.distillation import KnowledgeUnit
+
+    unit = KnowledgeUnit(concept="Billing", body="notes", domain="billing 4111 1111 1111 1111", source_date="4111 1111 1111 1111")
+    (row,) = await batch([unit, _cred("password: Qq9!fake7")])
+    assert "4111" not in row["domain"] and "4111" not in row["source_date"]
+    assert row["concept"].startswith("Billing #")
 
 
 async def test_two_secrets_of_one_credential_keep_two_sibling_rows(batch, db):
@@ -2337,14 +2390,53 @@ async def test_concepts_differing_only_by_card_numbers_stay_two_rows(batch, db):
 
 
 async def test_two_concepts_sharing_the_cap_prefix_stay_two_rows_alone_or_together(batch, db):
-    """CodeRabbit 4633597946: a concept over the cap keeps a key of its own whole
-    text, the same alone as beside any neighbour."""
+    """CodeRabbit 4633597946: two concepts over the cap that share its prefix
+    keep two rows, alone or beside each other; a cut concept takes a random key
+    (owner ruling 2026-11-20), so no stored key lets anyone check a guess at
+    the text cut off, and a later upload adds its own row."""
     base = "Q" * 200
-    together = await batch([_plain("one", concept=base + " east"), _plain("two", concept=base + " west")])
+    cred = _cred("password: Qq9!fake7")
+    together = await batch([_plain("one", concept=base + " east"), _plain("two", concept=base + " west"), cred])
     assert len({r["concept"] for r in together}) == 2 and all(len(r["concept"]) <= 200 for r in together)
-    (alone,) = await batch([_plain("two again", concept=base + " west")], source="b.md")
-    assert alone["concept"] == together[1]["concept"]
-    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 2
+    (alone,) = await batch([_plain("two again", concept=base + " west"), cred], source="b.md")
+    assert alone["concept"] not in {r["concept"] for r in together}
+    rows = await db.execute_fetchall("SELECT 1 FROM knowledge_units WHERE domain = 'reference.fact'")
+    assert len(rows) == 3
+
+
+async def test_a_long_concept_without_a_credential_unit_is_cut_as_on_main(batch, db):
+    """Owner ruling 2026-11-20: a batch with no credential unit keys a long
+    concept as main does, cut plainly at the cap, so a re-ingest updates it."""
+    concept = "Q" * 205
+    (first,) = await batch([_plain("one", concept=concept)])
+    (again,) = await batch([_plain("one, updated", concept=concept)])
+    assert first["concept"] == again["concept"] == "Q" * 200
+    rows = await db.execute_fetchall("SELECT body FROM knowledge_units")
+    assert [r[0] for r in rows] == ["one, updated"]
+
+
+async def test_a_concept_cut_at_the_cap_keys_nothing_of_its_cut_tail(batch):
+    """Security review, round 2: the key of a cut concept is random, so it says
+    nothing of the text past the cap (a hash of the whole concept let a guess
+    at that text be checked against the stored key)."""
+    concept = "A" * 195 + " tail Zz8!unheld"
+    cred = _cred("password: Qq9!fake7")
+    (row,) = await batch([_plain("x", concept=concept), cred])
+    (again,) = await batch([_plain("x", concept=concept), cred], source="b.md")
+    assert "Zz8" not in row["concept"]
+    # Nothing derived from the text: the same concept never keys the same.
+    assert row["concept"].rsplit(" #", 1)[1] != again["concept"].rsplit(" #", 1)[1]
+
+
+async def test_a_concept_written_like_a_minted_key_gets_a_key_of_its_own(batch, db):
+    """Security review, round 2: a concept arriving as ``<text> #<8 hex>``
+    is keyed anew, so it can never equal a key minted for another unit."""
+    cred = _cred("password: Qq9!fake7")
+    (first,) = await batch([_plain("one", concept="Q" * 205), cred])
+    (second,) = await batch([_plain("two", concept=first["concept"]), cred], source="b.md")
+    assert second["concept"] != first["concept"]
+    rows = await db.execute_fetchall("SELECT body FROM knowledge_units WHERE domain = 'reference.fact'")
+    assert sorted(r[0] for r in rows) == ["one", "two"]
 
 
 async def test_a_batch_without_a_credential_unit_is_stored_as_given(batch):

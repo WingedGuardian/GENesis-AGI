@@ -12,6 +12,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import re
 import typing
 import uuid
 from dataclasses import dataclass, field
@@ -37,6 +38,8 @@ _MAX_CONCEPT = 200
 CREDENTIAL_NOT_STORED = "credential_unit_not_stored:"
 #: A concept the batch changed or cut ends with this many characters of key.
 _KEY_SUFFIX = len(" #") + 8
+#: The shape of a key this module mints; a concept arriving in it is keyed anew.
+_MINTED = re.compile(r" #[0-9a-f]{8}\Z")
 
 
 class _SiblingMasks:
@@ -57,7 +60,7 @@ class _SiblingMasks:
 
         self.held = []
         for unit, key in zip(units, keys, strict=True):
-            raw = "\n".join(_strings([unit.concept, unit.body, unit.section_title, unit.tags, unit.relationships, unit.caveats]))
+            raw = "\n".join(_strings(_written(unit)))
             primary = _normalise(raw)
             forms = [primary, *sorted({_normalise(f) for f in _decoded(raw)} - {primary})]
             self.held.append((key, raw, forms))
@@ -70,7 +73,7 @@ class _SiblingMasks:
         from genesis.memory.reference_extraction import captured_secrets
         from genesis.memory.reference_masks import _decoded, _normalise
 
-        texts = list(_strings([unit.concept, unit.body, unit.section_title, unit.tags, unit.relationships, unit.caveats]))
+        texts = list(_strings(_written(unit)))
         found: dict[str, list[tuple[str, str]]] = {}
         for secret in dict.fromkeys(s.strip() for s in [*sorted(captured_secrets(texts)), *unit.secrets]):
             wanted = [f for f in sorted({_normalise(d) for d in _decoded(secret)}) if f.strip()]
@@ -79,21 +82,13 @@ class _SiblingMasks:
                 found[secret] = holders
         return found
 
-    def place(self, raw: str, secret: str) -> str:
-        """Where ``secret`` sits in a credential text, as ``<offset>:<length>``
-        of the spelling found: its exact one, else its first decoded and
-        normalised spelling in any decoded form of the text."""
-        from genesis.memory.reference_masks import _decoded, _normalise
 
-        at = raw.find(secret)
-        if at >= 0:
-            return f"{at}:{len(secret)}"
-        forms = [_normalise(f) for f in sorted(_decoded(raw))]
-        for want in sorted({_normalise(d) for d in _decoded(secret)}):
-            for form in forms:
-                if want.strip() and want in form:
-                    return f"{form.find(want)}:{len(want)}"
-        return "-1:0"
+def _written(unit) -> list:
+    """Every model-written field of ``unit`` that is stored: each is masked
+    and card-redacted alike (round 2 of #4924 found ``domain`` and
+    ``source_date`` left out)."""
+    return [unit.concept, unit.body, unit.domain, unit.section_title, unit.source_date,
+            unit.tags, unit.relationships, unit.caveats]
 
 
 def _strings(value):
@@ -110,17 +105,23 @@ def _strings(value):
 
 
 def _keyed_unit(unit, siblings: _SiblingMasks | None):
-    """``unit`` with the held secrets it uses masked in every indexed field,
-    and its concept as its stored key: as given when that is unchanged and fits
-    the cap; otherwise cut to fit and ending in a key from its whole (masked)
-    text and where the secrets it names are held (stored credential ids, random,
-    and offsets, so the key reveals nothing). The key never depends on the
-    batch's other units: two concepts that differ only past the cap, or only by
-    two different secrets, keep two rows, and the same credential's sibling
-    keeps its row across uploads (#4843 review)."""
+    """``unit`` with the held secrets it uses masked, and card numbers
+    redacted, in every stored field, and its concept as its stored key: as
+    given when masking changed neither the concept nor the domain, the concept
+    fits the cap and it does not already end like a minted key; otherwise cut
+    to fit and ending in a random ``#<8 hex>`` (owner rulings 2026-11-20). No
+    key is built from the text, so two units never share a minted key and no
+    key lets anyone check a guess at text that was masked or cut off; a
+    re-ingest of a changed document adds a row beside the old one. A unit
+    whose concept and domain are unchanged keeps the plain upsert key, as on
+    main, even when its body was masked. The key never depends on the batch's
+    other units (#4843 review). A batch with no credential unit is stored as
+    on main: its concept cut plainly at the cap (owner ruling 2026-11-20)."""
     from genesis.memory import reference_masks as rm
 
-    original = unit.concept
+    if siblings is None:
+        return dataclasses.replace(unit, concept=unit.concept[:_MAX_CONCEPT], secrets=[])
+    original = (unit.concept, unit.domain)
     if siblings is not None:
         # Card numbers are redacted as the chokepoint redacts them in the fields
         # of a caller (owner ruling 1dedc18a): live code refused a batch holding
@@ -132,7 +133,9 @@ def _keyed_unit(unit, siblings: _SiblingMasks | None):
             unit,
             concept=redact_text(unit.concept),
             body=redact_text(unit.body),
+            domain=redact_text(unit.domain),
             section_title=redact_text(unit.section_title) if unit.section_title else unit.section_title,
+            source_date=redact_text(unit.source_date) if unit.source_date else unit.source_date,
             tags=_redacted_like(unit.tags),
             relationships=_redacted_like(unit.relationships),
             caveats=_redacted_like(unit.caveats),
@@ -145,43 +148,25 @@ def _keyed_unit(unit, siblings: _SiblingMasks | None):
         mask = rm.ValueMask(secrets[0], probes=rm.secret_probes(secrets), exempt=frozenset(), secrets=secrets + runs)
         unit = dataclasses.replace(
             unit,
+            concept=mask.mask(unit.concept),
             body=mask.mask(unit.body),
+            domain=mask.mask(unit.domain),
             tags=mask.mask_field(unit.tags),
             relationships=mask.mask_field(unit.relationships),
             caveats=mask.mask_field(unit.caveats),
             section_title=mask.mask(unit.section_title) if unit.section_title else unit.section_title,
+            source_date=mask.mask(unit.source_date) if unit.source_date else unit.source_date,
         )
-    concept = mask.mask(unit.concept) if mask is not None else unit.concept
-    if concept == original and len(concept) <= _MAX_CONCEPT:
+    changed = (unit.concept, unit.domain) != original
+    if not changed and len(unit.concept) <= _MAX_CONCEPT and not _MINTED.search(unit.concept):
         return dataclasses.replace(unit, secrets=[])
-    # Each held span of the concept, in order of position, with where the
-    # secret it masks is held (credential key, offset and length of its spelling
-    # there): two
-    # concepts that differ only by which secret stands where, or by one secret
-    # that is a prefix of another, keep two keys (two spellings of one secret,
-    # in case or width, are the same secret). The length and offset are not the
-    # secret; reading them needs the index and the credential's stored id.
-    spans = []
-    for secret, holders in held.items():
-        found = rm.ValueMask(
-            secret, probes=rm.secret_probes([secret]), exempt=frozenset(), secrets=[secret, *(r for _, r in holders)],
-        ).mask_spans(unit.concept)
-        for start, stop in found:
-            text = unit.concept[start:stop]
-            # Its exact spelling when the credential holds it (two spellings of
-            # different secrets stay apart), else the secret it masks.
-            where = ",".join(sorted(f"{k}@{siblings.place(r, text if text in r else secret)}" for k, r in holders))
-            spans.append((start, start - stop, where))
-    named = [where for _, _, where in sorted(spans)]
-    # A card is never held, so nothing identifies it without an oracle: a
-    # concept that card redaction changed takes a fresh identity (a re-ingest
-    # adds a row, it never overwrites another).
-    fresh = uuid.uuid4().hex if unit.concept != original else ""
-    digest = hashlib.sha256(
-        b"genesis/knowledge-concept\0" + concept.encode() + b"\0" + "|".join(named).encode() + b"\0" + fresh.encode()
-    ).hexdigest()[:8]
+    # Masked or cut text says nothing of what it replaced, and a key derived
+    # from the whole text would let anyone check a guess at it: a fresh
+    # identity instead, which never overwrites another unit.
     return dataclasses.replace(
-        unit, concept=f"{rm.cap_masked(concept, _MAX_CONCEPT - _KEY_SUFFIX, mask)} #{digest}", secrets=[],
+        unit,
+        concept=f"{rm.cap_masked(unit.concept, _MAX_CONCEPT - _KEY_SUFFIX, mask)} #{uuid.uuid4().hex[:8]}",
+        secrets=[],
     )
 
 

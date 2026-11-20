@@ -1,1 +1,0 @@
-- Distilling a document that holds a credential no longer stores that credential's password in the document's other knowledge units where they state it as a password: it is masked there, while the credential itself stays revealable. Two long auto-captured account names now stay two entries instead of one overwriting the other.

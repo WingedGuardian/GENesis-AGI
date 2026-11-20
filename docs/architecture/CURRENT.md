@@ -1745,12 +1745,19 @@ other intake evidence retains its dated basis.
   masks read; a match grows over the holding text, so a secret named in part
   is masked whole); every other word, usernames included, stays. Card numbers
   in those units are redacted as the chokepoint redacts a caller's fields.
-  A concept masking changed, or one over 200 characters, is cut to fit and
-  ends in ` #<8 hex>` from its whole masked text and where its secrets are
-  held (credential ids and offsets), so its key never depends on the batch's
-  other units. Stated limits: a secret the distiller does not name and no
-  label marks stays in a sibling; a secret repeated in another upload, or in a
-  batch with no credential unit, is not masked (#4916).
+  Every stored model-written field is masked and redacted alike (concept,
+  body, domain, section title, source date, tags, relationships, caveats). In
+  such a batch a unit whose concept or domain masking or redaction changed, or
+  whose concept is over 200 characters or already ends like a minted key, is
+  keyed on its concept cut to fit plus a random ` #<8 hex>` (owner rulings
+  2026-11-20): no key is derived from the text, so two units never share one
+  and none lets a guess at masked or cut-off text be checked; a changed
+  document's re-ingest adds a row beside the old one. A batch with no
+  credential unit cuts a long concept plainly at 200, as before (two concepts
+  sharing that prefix collide, #4931). Stated limits: a secret the
+  distiller does not name and no label marks stays in a sibling; a secret
+  repeated in another upload, or in a batch with no credential unit, is not
+  masked (#4916).
 - **inbox/**: file-drop monitor with approval-gated dispatch.
   Explicit owner-requested disposition review uses the manual-only Tier-1
   `inbox-review` skill, reached by the attended-request pointer in `CLAUDE.md`.
