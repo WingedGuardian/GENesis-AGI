@@ -1381,6 +1381,11 @@ async def _check_storage_pool_and_alert(
     if not status.detected:
         logger.debug("storage-pool not measurable: %s", status.detail)
         return
+    # A report with no readable percentage carries no reading: tiering it would
+    # read every axis as ``ok``, clear the held tier, and re-page the next tick.
+    if status.data_pct is None and status.metadata_pct is None and status.pool_used_pct is None:
+        logger.debug("storage-pool has no readable percentage: %s", status.detail)
+        return
 
     state_file = config.state_path / "pool_alert_state.json"
     last_tier = TIER_OK

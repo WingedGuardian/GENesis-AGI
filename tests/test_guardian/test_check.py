@@ -245,6 +245,22 @@ class TestStoragePoolExitMargin:
         assert titles == ["Storage pool WARN"], titles
 
     @pytest.mark.asyncio
+    async def test_a_tick_with_no_readable_percentage_is_no_signal(
+        self, config: GuardianConfig
+    ) -> None:
+        """A detected pool whose report has no readable percentage neither clears
+        nor re-arms the held tier: it is skipped like an undetected one."""
+        dispatcher = self._dispatcher()
+        state = config.state_path / "pool_alert_state.json"
+        await self._tick(config, dispatcher, _lvm(76.0, 10.0))  # data warn: pages
+        before = state.read_text()
+        await self._tick(config, dispatcher, _lvm(None, None))  # nothing readable
+        assert state.read_text() == before
+        await self._tick(config, dispatcher, _lvm(73.0, 10.0))  # held at warn
+        titles = [c.args[0].title for c in dispatcher.send.call_args_list]
+        assert titles == ["Storage pool WARN"], titles
+
+    @pytest.mark.asyncio
     async def test_recovers_once_below_the_margin(self, config: GuardianConfig) -> None:
         dispatcher = self._dispatcher()
         for pct in (76.0, 71.0, 69.9):
