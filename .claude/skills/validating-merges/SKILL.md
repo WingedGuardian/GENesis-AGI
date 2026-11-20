@@ -273,6 +273,11 @@ from the main checkout, or pass `--db-path` and the main checkout's interpreter 
 absolute path. The message says so, but the diagnosis is not the one you would
 guess.
 
+Both CLI `close --dry-run` and `recheck --dry-run` open an admitted read-only
+connection that reads committed WAL data without checkpointing the database.
+SQLite may still coordinate shared-memory sidecars and locks. Ordinary recording
+retains the admitted writer connection.
+
 The backlog is PER INSTALL — each box's worker fills its own ledger against its
 own deploy state, so two installs hold different open sets and neither one's
 count says anything about the other.

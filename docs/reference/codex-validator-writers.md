@@ -54,6 +54,13 @@ CLI and MCP share one note formatter: absent notes never become literal `None`,
 and an empty parked note has no trailing separator. Public evidence/note policy
 still applies before formatting.
 
+The CLI's `close --dry-run` and `recheck --dry-run` use an admitted read-only
+SQLite connection, including committed WAL data, without checkpointing it.
+Paths are URI-encoded, so filename characters such as `?`, `#` and `%` remain
+literal. Read-only SQLite may still coordinate shared-memory sidecars and locks.
+The MCP preview retains its existing shared-handle SELECT path; ordinary CLI
+recording retains the admitted writer connection.
+
 Every call reloads `config/codex_validator.yaml` and the strict local overlay.
 The tracked base must be exactly `dry_run_only: true`. Missing/malformed/base
 false/nonboolean/unknown keys force preview. The user overlay at

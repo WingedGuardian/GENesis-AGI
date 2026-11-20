@@ -132,6 +132,7 @@ import json
 import sqlite3
 import sys
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from datetime import UTC
 from pathlib import Path
 
@@ -182,6 +183,25 @@ __all__ = [
     "resolve_repo",
     "validate_evidence",
 ]
+
+
+@asynccontextmanager
+async def _ledger_connection(path: Path, *, dry_run: bool):
+    """Read committed WAL data in previews without opening a writer."""
+    import aiosqlite
+
+    from genesis.db.admission import assert_admitted
+    from genesis.db.connection import connect_aiosqlite_rw
+
+    if not dry_run:
+        async with connect_aiosqlite_rw(path, timeout=10) as db:
+            yield db
+        return
+
+    assert_admitted(path)
+    async with aiosqlite.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10) as db:
+        assert_admitted(path)
+        yield db
 
 
 def validate_evidence(doc: object) -> EvidenceDocument:
@@ -312,14 +332,6 @@ async def _write(
         )
         return 1
 
-    # The admission seam every real connection path in this repo uses, NOT the
-    # advisory predicate: admission.py says that one is for callers where
-    # continuing would not open the database, and this one opens it read-write to
-    # mutate a permanent ledger. It raises in TWO places — synchronously at
-    # construction and again inside the post-open re-check — so the try must cover
-    # the context manager, not just the call.
-    from genesis.db.connection import connect_aiosqlite_rw
-
     pr_number = doc.pr
     rechecks = []
     # Set the moment a writer COMMITS. Anything that fails after that (the success
@@ -328,7 +340,7 @@ async def _write(
     committed: str | None = None
     committed_code = 0
     try:
-        async with connect_aiosqlite_rw(resolved, timeout=10) as db:
+        async with _ledger_connection(resolved, dry_run=dry_run) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             db.row_factory = aiosqlite.Row
 
@@ -578,7 +590,6 @@ async def _recheck(
 
     import aiosqlite
 
-    from genesis.db.connection import connect_aiosqlite_rw
     from genesis.db.crud import pr_verifications as crud
     from genesis.db.integrity import DatabaseIntegrityError
 
@@ -593,7 +604,7 @@ async def _recheck(
     key = f"{repo}#{pr_number}"
     state = None
     try:
-        async with connect_aiosqlite_rw(resolved, timeout=10) as db:
+        async with _ledger_connection(resolved, dry_run=dry_run) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             db.row_factory = aiosqlite.Row
             if dry_run:
