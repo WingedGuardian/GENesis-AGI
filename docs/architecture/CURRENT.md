@@ -5584,6 +5584,48 @@ logger or unrelated exceptions with copied text and no provenance.
   the exit code agree. Otherwise the run exits 1 and leaves no
   `update_refused.json`.
   The rebuilt tip is recorded in the "merging" row as soon as it is adopted.
+  **The Guardian's drop** (#4911): `drop <branch> --expect-branch live
+  --expect-head <tip> --expect-candidate <pinned head> [--restart-server]`, run
+  with the entry's `--wait 0`, does everything in the entry's ONE update.lock
+  hold. It refuses by name, nothing changed, when the manifest no longer pins
+  the branch at that head (a re-pin since), when the manifest it writes is gone
+  or differs in any way from the one it planned `live` from (checked as it is
+  written, before the checkout moves; every engine writer of the manifest holds
+  update.lock, so only an out-of-band edit trips it), when the expect checks
+  fail, or when a move refusal applies. After
+  the subtract-only drop it confirms from its own view (`observe()` and
+  `observe_moves()`): the branch neither listed nor in `live`'s holds, the
+  checkout on `live` at the move's result (`Move.at`), no move refusal; a
+  failure (an unreadable view included) exits 1 naming what it saw and that
+  the manifest was saved, and restarts nothing. It names `deploy_candidates
+  rebuild` only when the branch may still be listed or held; otherwise the drop
+  is done and only the restart is missing (rebuild would re-fetch origin/main).
+  The confirmation does not cover the git hook restore and sync after the move:
+  a failure there is a WARNING and still exit 0. Only after a passing
+  confirmation does `--restart-server`
+  read `ActiveState` and queue `systemctl --user restart --no-block
+  genesis-server` from python (no `pass_fds`, so no child holds the lock fd;
+  never from the bash entry, whose fd is inheritable); `activating` queues
+  nothing and exits 0 ("a start is already in progress"); a failed read, or an
+  enqueue that fails with an answer, exits 4 with the drop done; an enqueue that
+  gets no answer in 10 s exits 5 (the restart may have been queued: check
+  `scripts/deploy_code_only.sh status` before restarting). The engine exits milliseconds later, so
+  the start's boot repair finds the lock free. "Confirmed" holds when the
+  restart is queued, not when the server has loaded the tree: the stop can take
+  up to 90 s with the lock free, a lock-taking writer in that gap owns its own
+  restart, and a lockless one was never covered. Exit codes, in the engine's
+  header: 0, 1 (also the entry's refusal whose text carries "holds the deploy
+  marker", a wait; "cannot write the deploy marker" is a fault), 2, 4, 5, 97,
+  130/143 (which can follow a finished drop and a queued restart: bash runs the
+  trap after python returns; the engine view then says whether the drop
+  happened, nothing records the restart, and `scripts/deploy_code_only.sh
+  status` says what the server runs), 200. Without `--expect-candidate`, `drop` is unchanged; `--restart-server`
+  alone is a usage error. The Guardian reads the engine's view through `list
+  --json --move-refusals` (adds `checkout: {branch_ref, head}` and
+  `move_refusals`). Manifest order is pin order: re-adding a candidate at a new
+  head moves it to the end (the same head keeps its place), so the last listed
+  is the newest code. A re-pinned candidate therefore also merges last, so on
+  a conflict it is the one the next rebuild excludes.
   **The live-move repair** (`scripts/lib/live_move_repair.py`, #3492 PR D1;
   `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS | --restore TS
   [--check]] [--explain]`; `--restore`, below
