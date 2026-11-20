@@ -34,6 +34,7 @@ d='@D@'
 } >> "$d/log"
 case " $* " in
     *" show "*)
+        [ -f "$d/show_sleep" ] && sleep "$(cat "$d/show_sleep")"
         [ -f "$d/show_fails" ] && { echo "Failed to connect to bus: No medium found" >&2; exit 1; }
         echo "ActiveState=$(cat "$d/state" 2>/dev/null || echo active)" ;;
     *" restart "*)
@@ -476,6 +477,30 @@ def test_a_restart_that_cannot_be_queued_is_exit_4_with_the_drop_done(
     assert "restart could not be" in err
     assert ("boom" if fails == "restart" else "No medium found") in err, err
     assert _calls(stub) == ([SHOW, RESTART] if fails == "restart" else [SHOW])
+    assert _dropped(w)
+
+
+# ── exit 5: the restart call got no answer, so it may have been queued ─────
+
+
+@pytest.mark.parametrize("hangs", ["restart", "show"])
+def test_a_restart_call_with_no_answer_is_exit_5_and_a_silent_show_stays_4(
+    dc, dc_ready, stub, capsys, monkeypatch, hangs
+):
+    w = dc_ready
+    _two_live(w, dc)
+    monkeypatch.setattr(dc, "SYSTEMCTL_TIMEOUT_S", 1)
+    (stub / ("sleep" if hangs == "restart" else "show_sleep")).write_text("5\n")
+    capsys.readouterr()
+    rc = w.run(dc, *_guarded(w, None, "--restart-server"))
+    err = capsys.readouterr().err
+    if hangs == "restart":  # sent, no answer: systemd may have queued it
+        assert rc == 5, err
+        assert "may have been queued" in err and "deploy_code_only.sh status" in err, err
+    else:  # the show never answered, so no restart was ever sent
+        assert rc == 4, err
+        assert "restart could not be" in err, err
+    assert _calls(stub) == ([SHOW, RESTART] if hangs == "restart" else [SHOW])
     assert _dropped(w)
 
 

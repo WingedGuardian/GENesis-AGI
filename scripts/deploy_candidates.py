@@ -82,8 +82,12 @@ Commands:
                the deploy marker" is a fault)
           2    usage: --restart-server needs --expect-candidate, which needs
                --expect-branch live and --expect-head, never --no-rebuild
-          4    dropped and confirmed, but the restart could not be queued
-               (the text names the systemctl error)
+          4    dropped and confirmed, but the restart was not queued (the
+               state read failed, or the enqueue failed with an answer; the
+               text names the systemctl error)
+          5    dropped and confirmed, but the restart enqueue got no answer:
+               it may have been queued (`scripts/deploy_code_only.sh status`
+               says what the server runs)
           97   the test fence refused (entry)
           130/143  interrupted: the drop may be half-done; `list --json
                --move-refusals` shows where it got to
@@ -162,7 +166,8 @@ git 2.43).
 
 Exit codes: 0 done, 1 refused or failed (the message says which; a refusal
 changes nothing), 2 usage, 4 the Guardian's drop is done but its restart was
-not queued (above). The entry adds 200: update.lock still held after the wait.
+not queued, 5 done but the restart enqueue got no answer, so it may have been
+queued (above). The entry adds 200: update.lock still held after the wait.
 """
 
 import os  # noqa: E402  (os and sys are preloaded by the interpreter; see below)
@@ -300,19 +305,27 @@ def _restart_advice(moved: plan.Move) -> None:
     out("  validation holds the lock: scripts/deploy_code_only.sh restart (launch it detached).")
 
 
+SYSTEMCTL_TIMEOUT_S = 10
+SYSTEMCTL_NO_ANSWER = 124
+
+
 def _systemctl(env: Mapping[str, str], *args: str) -> subprocess.CompletedProcess:
     """`systemctl --user <args>`. No pass_fds and close_fds left at its default
     (True): update.lock's fd never reaches the child (the restart, #4911). Both
     calls (a property read, a --no-block enqueue) answer in milliseconds; 10 s
-    bounds a hung user manager while update.lock is held, and a timeout reads
-    as a failure (exit 4), never as queued."""
+    bounds a hung user manager while update.lock is held. A timeout returns
+    SYSTEMCTL_NO_ANSWER: the request may have reached the manager, so for the
+    enqueue it means "maybe queued" (exit 5), never "not queued"."""
     cmd = ["systemctl", "--user", *args]
     try:
         return subprocess.run(
-            cmd, env=gate.user_bus_env(env), capture_output=True, text=True, timeout=10
+            cmd, env=gate.user_bus_env(env), capture_output=True, text=True,
+            timeout=SYSTEMCTL_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(cmd, 124, "", "no answer within 10 s")
+        return subprocess.CompletedProcess(
+            cmd, SYSTEMCTL_NO_ANSWER, "", f"no answer within {SYSTEMCTL_TIMEOUT_S} s"
+        )
     except OSError as exc:
         return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
@@ -1068,7 +1081,9 @@ class Engine(Repo):
         progress is left alone: a restart would SIGTERM its boot repair
         (#3492 D2). From python, never the entry: subprocess.run closes every
         fd but 0-2 in the child (close_fds), and the entry's lock fd is
-        inheritable. Exit 4 when it cannot be queued: the drop stays done."""
+        inheritable. Exit 4 when it was not queued (the read failed, or the
+        enqueue failed with an answer), exit 5 when the enqueue got no answer
+        and may have been queued: the drop stays done either way."""
         show = _systemctl(self.env, "show", "-p", "ActiveState", gate.SERVER_UNIT)
         state = show.stdout.strip().removeprefix("ActiveState=") if show.returncode == 0 else None
         if state == "activating":
@@ -1079,6 +1094,14 @@ class Engine(Repo):
             if res.returncode == 0:
                 out("  genesis-server: restart queued.")
                 return 0
+            if res.returncode == SYSTEMCTL_NO_ANSWER:
+                _err(
+                    f"ERROR: the drop is done and confirmed, but {' '.join(res.args)} got no "
+                    f"answer within {SYSTEMCTL_TIMEOUT_S} s: the restart may have been queued. "
+                    "scripts/deploy_code_only.sh status says whether the server runs the tree "
+                    "`live` now holds; restart only if it does not."
+                )
+                return 5
             show = res
         _err(
             f"ERROR: the drop is done and confirmed, but the genesis-server restart could not be "

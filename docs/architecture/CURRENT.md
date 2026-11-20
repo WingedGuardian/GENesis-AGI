@@ -5566,14 +5566,16 @@ logger or unrelated exceptions with copied text and no provenance.
   read `ActiveState` and queue `systemctl --user restart --no-block
   genesis-server` from python (no `pass_fds`, so no child holds the lock fd;
   never from the bash entry, whose fd is inheritable); `activating` queues
-  nothing and exits 0 ("a start is already in progress"); a failed read or
-  enqueue exits 4 with the drop done. The engine exits milliseconds later, so
+  nothing and exits 0 ("a start is already in progress"); a failed read, or an
+  enqueue that fails with an answer, exits 4 with the drop done; an enqueue that
+  gets no answer in 10 s exits 5 (the restart may have been queued: check
+  `scripts/deploy_code_only.sh status` before restarting). The engine exits milliseconds later, so
   the start's boot repair finds the lock free. "Confirmed" holds when the
   restart is queued, not when the server has loaded the tree: the stop can take
   up to 90 s with the lock free, a lock-taking writer in that gap owns its own
   restart, and a lockless one was never covered. Exit codes, in the engine's
   header: 0, 1 (also the entry's refusal whose text carries "holds the deploy
-  marker", a wait; "cannot write the deploy marker" is a fault), 2, 4, 97,
+  marker", a wait; "cannot write the deploy marker" is a fault), 2, 4, 5, 97,
   130/143 (which can follow a finished drop and a queued restart: bash runs the
   trap after python returns; the engine view then says whether the drop
   happened, nothing records the restart, and `scripts/deploy_code_only.sh
