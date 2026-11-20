@@ -46,6 +46,46 @@ on the next request; no new admission or disclosure is allowed. Accepted work is
 Genesis-owned and can be canceled explicitly; revocation does not replay it or
 introduce new per-tool leases. See restore/epoch cautions in the registry guide.
 
+### Owner relay (optional, per peer)
+
+A same-owner agent that the owner talks to directly can relay the owner's own
+requests. Grant it explicitly:
+
+```bash
+python -m genesis peers grant muse owner_relay allow
+```
+
+Without this grant, every peer session is told that peer content is external
+input, not owner approval or authority. With `owner_relay` set to `allow`
+(`ask` and `deny` count as no grant), the session is told instead that a request
+the peer relays from the owner is the owner's request. Three things still need
+the owner directly: spending money (the owner's own card-prompt tap is the only
+approval, and a relayed "yes" never is), destructive actions, and approving an
+autonomous session. These limits are what the session is told; code enforces only
+some of them (peer sessions have no shell, dispatched sessions cannot resolve ego
+proposals, and payments stop at the card tap), so a destructive edit such as a
+file write or a reference deletion is held back by the prompt alone. The grant
+does not change the profile: the peer still picks it per message. An `observe`
+session that receives a relayed request needing action replies that it must be
+resent with `profile: "interact"`, or, when the autonomy level does not allow
+`interact`, that it cannot be done at this level. Neither is a refusal.
+
+When a relayed session used any tool outside a short read-only set, finalization
+queues one Telegram alert to the owner:
+`[<session>] Acted on your behalf via <peer>: used <tools>; ended <outcome>.`
+followed by the session's own summary, quoted and cut to 200 characters. A tool
+not on the read-only set counts as acting, so a newly added tool alerts by
+default. The alert reads the full tool record, not the stored summary (which
+keeps only the first 100 calls). A session whose record may be incomplete (a
+partial stream, or one cut off by a restart and finished by boot reconciliation)
+alerts that it may have acted. Alerts are exempt from the daily notification
+budget and quiet hours but not from duplicate suppression, so the session id
+leads the text. A retried finalization never queues a second alert.
+
+Every peer session, granted or not, is also told to look a name, address,
+account or fact up (`memory_recall`, `reference_lookup`) before refusing or
+doubting a request because it does not match what the session knows.
+
 ## Connect a same-owner agent (generic client)
 
 `scripts/genesis_peer_mcp.py` is a single-file stdio MCP server that speaks this

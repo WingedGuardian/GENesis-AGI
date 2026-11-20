@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import html
 import json
 import logging
 import shutil
@@ -22,6 +23,56 @@ logger = logging.getLogger(__name__)
 # Terminal native states, written only by _finalize, mapped to the row status
 # its complete()/fail() call would have set.
 _COMMITTED_STATUS = {"succeeded": "completed", "failed": "failed", "cancelled": "failed"}
+
+
+async def _notify_owner_relay(db, sid: str, tool_names=None, *, uncertain=False) -> bool:
+    """Queue one owner alert for a relayed peer session that acted or may have.
+
+    ``tool_names`` is the full, uncapped tool record when the caller has it; the
+    stored ``tools_summary`` is capped, so it is only the fallback. ``uncertain``
+    marks a record that may be missing calls (a partial stream, a restart): the
+    owner is then told the session may have acted even if no acting tool is seen.
+    Idempotent per session: a retried finalization finds the alert already queued.
+    """
+    from genesis.db.crud import pending_outreach
+    from genesis.peers import relay
+
+    row = await cc_sessions.get_by_id(db, sid)
+    meta = metadata(row) if row else {}
+    if not meta.get("owner_relay"):
+        return False
+    if tool_names is None:
+        summary = meta.get("tools_summary")
+        tool_names = list(summary) if isinstance(summary, dict) else []
+        uncertain = uncertain or not isinstance(summary, dict)
+    tools = relay.acting(tool_names)
+    if not tools and not uncertain:
+        return False
+    pending_id = relay.notice_id(sid)
+    if await (
+        await db.execute("SELECT 1 FROM pending_outreach WHERE id=?", (pending_id,))
+    ).fetchone():
+        return False
+    peer = meta.get("peer_id", "a peer")
+    ended = row.get("outcome") or row.get("status") or "unknown"
+    if tools:
+        head = f"[{sid[:8]}] Acted on your behalf via {peer}: used {', '.join(tools)}; ended {ended}."
+        if uncertain:
+            head += " Its tool record may be incomplete."
+    else:
+        head = (
+            f"[{sid[:8]}] A relayed session via {peer} may have acted: its tool record "
+            f"is incomplete; ended {ended}."
+        )
+    await pending_outreach.enqueue(
+        db,
+        # Telegram renders HTML: the summary is model-written, so escape it all.
+        message=html.escape(f"{head} {relay.quoted(row.get('outcome_reason'))}", quote=False),
+        category="alert",
+        channel="telegram",
+        pending_id=pending_id,
+    )
+    return True
 
 
 def _failure_outcome(partial, error) -> tuple[str, str | None]:
@@ -154,6 +205,16 @@ async def reconcile_orphans(db) -> int:
         await cc_sessions.update_status(
             db, row["id"], status="failed", outcome_reason="outcome_unknown"
         )
+    for row in orphaned:
+        # A relayed session cut off by a restart may have acted unseen.
+        try:
+            await _notify_owner_relay(db, row["id"], uncertain=True)
+        except Exception as exc:
+            logger.warning(
+                "Owner-relay notice not queued for orphan %s (exception=%s)",
+                row["id"][:8],
+                type(exc).__name__,
+            )
     return len(orphaned)
 
 
@@ -343,6 +404,21 @@ async def _finalize(runner, request, result, state):
             from genesis.cc.managed_fallback import record_managed_outcome
 
             await record_managed_outcome(runner, result.session_id, result)
+            try:
+                await _notify_owner_relay(
+                    runner._session_manager.db,
+                    result.session_id,
+                    [t.get("name") for t in result.tools_called or () if isinstance(t, dict)],
+                    uncertain=bool(result.partial or result.stream_lines_dropped),
+                )
+            except Exception as exc:
+                # Outside the retry loop on purpose: a notice failure must never
+                # hold the receipt or its capacity.
+                logger.warning(
+                    "Owner-relay notice not queued for %s (exception=%s)",
+                    result.session_id[:8],
+                    type(exc).__name__,
+                )
             return
         except Exception as exc:
             logger.warning(
