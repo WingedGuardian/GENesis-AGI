@@ -1,0 +1,1 @@
+- When a peer asks about one of Genesis's earlier messages by its full id, even from a new conversation, the session answering now sees that message, so it can explain or resend it instead of answering that it doesn't know. Only that peer's own messages are shown.
