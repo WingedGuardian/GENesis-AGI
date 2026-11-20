@@ -1736,7 +1736,33 @@ other intake evidence retains its dated basis.
   `remove_unit` tombstones a source when its last unit is deleted (invariant:
   only that method may tombstone). The conversational path
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
-  contrast the intake bypass in entry 4.
+  contrast the intake bypass in entry 4. A distilled batch's credential units
+  go through the credential chokepoint, never refused; its other units are
+  masked first, contextually (`orchestrator._SiblingMasks`, owner ruling
+  2026-11-19): each is masked only for the strings it uses as secrets (the ones
+  the distiller names for it, `KnowledgeUnit.secrets`, never stored, and the
+  ones the capture rules read in its own text, read before card redaction),
+  and only when a credential unit of the batch holds them (inside one of its
+  fields, in any spelling the masks read; a match grows over the holding text,
+  and a name that is part of a value the credential holds, or holds one, masks
+  that whole value). A held value shaped like a secret (letters mixed with
+  digits or symbols) is masked wherever a sibling repeats it; a plain-word one
+  only where the unit uses it as a secret (owner ruling 2026-11-20). Every
+  other word, usernames included, stays. Card numbers in those units are
+  redacted as the chokepoint redacts a caller's fields.
+  Every stored model-written field is masked and redacted alike (concept,
+  body, domain, section title, source date, tags, relationships, caveats). In
+  such a batch a unit whose concept or domain masking or redaction changed, or
+  whose concept is over 200 characters or already ends like a minted key, is
+  keyed on its concept cut to fit plus a random ` #<12 hex>` (owner rulings
+  2026-11-20): no key is derived from the text, so two units never share one
+  and none lets a guess at masked or cut-off text be checked; a changed
+  document's re-ingest adds a row beside the old one. A batch with no
+  credential unit cuts a long concept plainly at 200, as before (two concepts
+  sharing that prefix collide, #4931). Stated limits: a secret the
+  distiller does not name and no label marks stays in a sibling; a secret
+  repeated in another upload, or in a batch with no credential unit, is not
+  masked (#4916).
 - **inbox/**: file-drop monitor with approval-gated dispatch.
   Explicit owner-requested disposition review uses the manual-only Tier-1
   `inbox-review` skill, reached by the attended-request pointer in `CLAUDE.md`.

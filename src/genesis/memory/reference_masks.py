@@ -681,8 +681,15 @@ def _captured_probes(texts: list[str | None]) -> tuple[list[tuple[str, bool]], l
     # whose credential path is where this module is meant to be called from.
     from genesis.memory.reference_extraction import captured_secrets
 
-    probes: list[tuple[str, bool]] = []
     secrets = sorted(captured_secrets([t for t in texts if t]))
+    return secret_probes(secrets), secrets
+
+
+def secret_probes(secrets: list[str]) -> list[tuple[str, bool]]:
+    """(probe, whole-word) of each of ``secrets`` as a capture is probed: the
+    secret whole (a plain word or digits as a whole word) and its secret-shaped
+    fragments."""
+    probes: list[tuple[str, bool]] = []
     for secret in secrets:
         whole = [(_normalise(form), not _secret_token(form)) for form in _decoded(secret.strip())]
         # The secret whole is matched as the capture rules decide (a plain word
@@ -691,7 +698,7 @@ def _captured_probes(texts: list[str | None]) -> tuple[list[tuple[str, bool]], l
         probes += whole
         probes += [(p, w) for p, w in _value_probes(secret) if p not in {q for q, _ in whole}]
     # A secret of format characters only normalises to nothing: no probe.
-    return [(probe, as_word) for probe, as_word in probes if probe.strip()], secrets
+    return [(probe, as_word) for probe, as_word in probes if probe.strip()]
 
 
 def _usernames(text: str) -> set[str]:
