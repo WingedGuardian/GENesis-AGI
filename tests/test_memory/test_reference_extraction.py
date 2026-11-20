@@ -44,6 +44,323 @@ class TestClassifyCredentialPair:
         assert ref is not None
         assert ref["kind"] == "credentials"
 
+    @pytest.mark.parametrize("copula", ["is", "was", "are", "were"])
+    def test_repeated_label_with_copula_names_real_login(self, copula):
+        # "login is username: admin" must capture admin, not the copula.
+        ext = Extraction(
+            content=f"login {copula} username: admin, password: fakepw123",
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == "admin / fakepw123"
+
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            # Single pattern: a label word after "is" is not the password;
+            # the real value is reached through the repeated label.
+            ("the password is pass: secret123", "password: secret123"),
+            # Lifecycle pattern: "is" is not the account; no login is
+            # fabricated and the password is still captured.
+            (
+                "created account is admin with password: secret123",
+                "password: secret123",
+            ),
+            # Email pattern: same self-heal through the repeated label.
+            (
+                "email bob@example.com and password is pass: secret123",
+                "bob@example.com / secret123",
+            ),
+            # Lifecycle pass: same self-heal through the repeated label.
+            (
+                "created account admin with password is pass: secret123",
+                "admin / secret123",
+            ),
+        ],
+    )
+    def test_sibling_patterns_reject_label_or_copula_as_value(
+        self, content, expected
+    ):
+        ext = Extraction(
+            content=content,
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == expected
+
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            # Codex P2-1 (round 2): a value that merely STARTS with a copula
+            # or label word plus punctuation is a real credential, not the
+            # bare word — the lookahead rejects whole tokens only.
+            (
+                "The admin password: Is!Secure987 for the staging server",
+                "password: Is!Secure987",
+            ),
+            (
+                "The staging password: Password!Secure987 is ready now",
+                "password: Password!Secure987",
+            ),
+            (
+                "The admin password: Are!Secure987 for the staging server",
+                "password: Are!Secure987",
+            ),
+        ],
+    )
+    def test_copula_prefix_inside_value_is_captured(
+        self, content, expected
+    ):
+        ext = Extraction(
+            content=content,
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == expected
+
+    def test_bare_copula_value_still_rejected(self):
+        # The whole-token rule above must not re-admit a value that IS the
+        # bare copula word.
+        ext = Extraction(
+            content="the password is is, please note it down for me",
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        assert classify_as_reference(ext) is None
+
+    @pytest.mark.parametrize("introducer", ["named", "called", "for"])
+    def test_lifecycle_introducer_not_fabricated_as_account(
+        self, introducer
+    ):
+        # Codex P2-2 (round 2): "created account named handle ..." must NOT
+        # return "named / secret123"; the rejected account falls through to
+        # the single-password capture instead of fabricating a login.
+        ext = Extraction(
+            content=(
+                f"created account {introducer} handle "
+                "with password: secret123"
+            ),
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == "password: secret123"
+
+    def test_lifecycle_introducer_with_real_account(self):
+        # Guard against over-rejection: with a real account after the
+        # introducer, the lifecycle pair is still captured.
+        ext = Extraction(
+            content="created account named admin with password: secret123",
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == "admin / secret123"
+
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            # CodeRabbit (round 3): a compact repeated label — a label
+            # word followed directly by ":" or "=" — is not a login. The
+            # pair branch retries from the second label and captures the
+            # real login ("login is username:admin, password:secret123"
+            # → "admin / secret123").
+            (
+                "login is username:admin, password:secret123",
+                "admin / secret123",
+            ),
+            (
+                "login is username=admin, password:secret123",
+                "admin / secret123",
+            ),
+            (
+                "login is user:admin, password:secret123",
+                "admin / secret123",
+            ),
+        ],
+    )
+    def test_compact_repeated_label_pair_captures_real_login(
+        self, content, expected
+    ):
+        ext = Extraction(
+            content=content,
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == expected
+
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            # Same compact-label rule on the other patterns sharing
+            # _EXCLUDED_VALUE: the repeated label is skipped and the real
+            # value is captured.
+            (
+                "the password is password:secret123",
+                "password: secret123",
+            ),
+            (
+                "email bob@example.com and password is pass:secret123",
+                "bob@example.com / secret123",
+            ),
+            (
+                "created account admin with password is pass:secret123",
+                "admin / secret123",
+            ),
+        ],
+    )
+    def test_compact_repeated_label_other_patterns(
+        self, content, expected
+    ):
+        ext = Extraction(
+            content=content,
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == expected
+
+    @pytest.mark.parametrize(
+        "label", ["handle", "account", "email", "pass", "pwd", "password"]
+    )
+    def test_compact_repeated_label_lifecycle_account_falls_through(
+        self, label
+    ):
+        # A compact label in the lifecycle ACCOUNT slot ("handle:admin")
+        # is rejected by the same rule on _EXCLUDED_ACCOUNT; the pattern
+        # fails and falls through to the single-password capture.
+        # For "pass"/"pwd"/"password" the fallthrough must NOT re-capture
+        # the rejected token itself as the password ("password: admin"):
+        # single matches overlapping the rejected account span are skipped
+        # (CodeRabbit round 4 on PR #4473).
+        ext = Extraction(
+            content=(
+                f"created account {label}:admin "
+                "with password: secret123"
+            ),
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == "password: secret123"
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            # No real password anywhere: the rejected account token is not
+            # a password, so nothing is captured (it is not re-read as
+            # "password: admin").
+            "created account pass:admin, no password mentioned here",
+            # The real password is too short for the module's length floor,
+            # so the fallthrough still captures nothing.
+            "created account pass:admin with password: x",
+        ],
+    )
+    def test_rejected_account_without_password_captures_nothing(
+        self, content
+    ):
+        ext = Extraction(
+            content=content,
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        assert classify_as_reference(ext) is None
+
+    def test_two_rejected_accounts_both_excluded(self):
+        # Both rejected account spans are excluded, so the single branch
+        # finds the first real password.
+        ext = Extraction(
+            content=(
+                "created account pass:admin with password: secret123 and "
+                "created account pwd:bob123 with password: hunter2"
+            ),
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == "password: secret123"
+
+    @pytest.mark.parametrize(
+        "label", ["password", "pass", "pwd"]
+    )
+    def test_label_only_overlap_captures_password(self, label):
+        # A rejected lifecycle account token that is ONLY a label
+        # ("password:" after "created account") must not swallow the
+        # password that follows it: the overlap check compares the
+        # credential VALUE span, not the whole single-pattern match,
+        # so the label overlap does not exclude "secret123"
+        # (CodeRabbit round 5 on PR #4473).
+        ext = Extraction(
+            content=f"created account {label}: secret123",
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
+        assert ref["value"] == "password: secret123"
+
+    def test_copula_separator_value_rejected(self):
+        # A value that IS a copula word followed by ":" ("is:secret123")
+        # is a repeated label with nothing left to retry from, so nothing
+        # is captured — the same rejection class as a bare "is".
+        ext = Extraction(
+            content="the password is is:secret123 for the vault",
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        assert classify_as_reference(ext) is None
+
+    def test_label_separator_password_is_rejected_tradeoff(self):
+        # Accepted trade-off (CodeRabbit on PR #4473): a credential that
+        # literally starts with a label word followed by ":" or "=" —
+        # here a password that really is "user:abc123" — is rejected on
+        # these paths, because the separator shape is indistinguishable
+        # from a repeated label. Locked in so a future round re-admitting
+        # it has to decide consciously.
+        ext = Extraction(
+            content="the password is user:abc123 for the vault",
+            extraction_type="entity",
+            confidence=0.9,
+            entities=[],
+        )
+        assert classify_as_reference(ext) is None
+
     def test_rejects_ephemeral_example(self):
         ext = Extraction(
             content="For example, the username: test password: secret would work",
