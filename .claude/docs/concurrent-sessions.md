@@ -147,9 +147,16 @@ Attribution is possible but uneven. In rough order of strength:
   session that committed to the PR, and the worktree holding the head branch. A PR
   with none of the three says "no session recorded".
   **To correct a wrong attribution**, add `Opened-by-session-correction: <8hex>` to
-  the CURRENT body: it overrides the history (source `corrected`, the recorded stamp
-  still shown). Past the PR's first two minutes, editing or deleting the
+  the body: it overrides the history (source `corrected`, the recorded stamp still
+  shown). It stands until a newer correction line replaces it, even after a rewrite
+  drops it, because the lookup reads it from the edit history too. A correction
+  the PR was opened with (copied from another body) never counts. Past the PR's
+  first two minutes, editing or deleting the
   `Opened-by-session` line itself changes nothing, by design.
+  The line is written by code, not by the session: `scripts/hooks/pr_opener_stamp.py`
+  stamps it right after a PR is opened, and puts it back with the ORIGINAL opener's
+  id when a later body rewrite the hook sees drops it. Keep it in a local body file
+  you rewrite from. The hook never writes or removes a correction line.
 - **The ledger indexes work to sessions.** A PR body citing `Ledger: <32-hex>` resolves
   to a `session_ledger` row whose `session_id` is **the CC transcript session id, which
   matches `cc_sessions.cc_session_id` — NOT `cc_sessions.id`** (the two differ; joining

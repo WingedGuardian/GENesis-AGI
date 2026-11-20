@@ -6,12 +6,14 @@
 Read-only. It asks GitHub for the PR and answers from the first source that
 names a session:
 
-0. ``corrected``: an ``Opened-by-session-correction: <8hex>`` line in the CURRENT
-   body, written by hand to fix a wrong attribution. It counts only when the body
-   GitHub first recorded did not carry it (a body copied from another PR copies
-   its correction too). It overrides the record below, which is still reported
-   (``recorded_opener``), because the record by design cannot be changed by
-   editing the line it came from;
+0. ``corrected``: an ``Opened-by-session-correction: <8hex>`` line, written by hand
+   to fix a wrong attribution: the current body's, else the newest edit version's,
+   so a later rewrite that drops the line does not undo it (a newer correction
+   does). A correction the body GitHub first recorded already carried never counts
+   (a body copied from another PR copies its correction too), nor does one in a
+   body that was never edited. It overrides the record below, which is still
+   reported (``recorded_opener``), because the record by design cannot be changed
+   by editing the line it came from;
 1. the body's ``Opened-by-session: <8hex>`` line as GitHub's edit history first
    recorded it: the newest stamped version written within ``CREATION_WINDOW`` of
    the PR's creation (where the stamp hook corrects a copied line), else the
@@ -88,17 +90,41 @@ def stamped(text: str, pattern: re.Pattern[str] = LINE) -> str | None:
 
     A PR that documents the line shows it in a fence or a quote; that example is
     not a stamp. A quoted line starts with ``>``, so LINE never matches it."""
+    found = _matches(text, pattern)
+    return found[0] if found else None
+
+
+def _matches(text: str, pattern: re.Pattern[str]) -> list[str]:
+    """Every id ``pattern`` matches in ``text``, in order, outside fences."""
     lines = (text or "").replace("\r\n", "\n").split("\n")
-    for line, fenced in zip(lines, fenced_flags(lines), strict=True):
-        m = None if fenced else pattern.match(line)
-        if m:
-            return m.group(1)
-    return None
+    return [
+        m.group(1)
+        for line, fenced in zip(lines, fenced_flags(lines), strict=True)
+        if not fenced and (m := pattern.match(line))
+    ]
 
 
 def correction(body: str) -> str | None:
-    """The current body's ``Opened-by-session-correction`` line, if any."""
+    """The body's ``Opened-by-session-correction`` line, if any."""
     return stamped(body, CORRECTION)
+
+
+def corrected(body: str, edits: list[dict]) -> str | None:
+    """The newest hand correction: the current body's, else the newest edit version's.
+
+    ``edits`` are GitHub's versions, newest first, the last being the body as
+    created. A correction that body already carried came with it, and a body with
+    no history (or whose as-created version was deleted) has nothing to tell the
+    two apart, so neither counts. A copied id written again later still does not.
+    """
+    if not edits or edits[-1].get("diff") is None:
+        return None  # no as-created body to tell a copied correction from a new one
+    copied = set(_matches(edits[-1]["diff"], CORRECTION))
+    for text in [body, *((e.get("diff") or "") for e in edits[:-1])]:
+        own = [c for c in _matches(text, CORRECTION) if c not in copied]
+        if own:
+            return own[-1]  # within one version, the last line written
+    return None
 
 
 def fenced_flags(lines: list[str]) -> list[bool]:
@@ -336,12 +362,9 @@ def report(number: int, repo: str) -> dict:
         and truncated
         and not any(stamped(e.get("diff") or "") for e in history["nodes"])
     )
-    nodes = history["nodes"]
     # The oldest node is the body as created (`last:` reads the oldest versions).
-    # A never-edited body has no nodes: a correction there came with the body.
-    original = (nodes[-1].get("diff") or "") if nodes else None
-    fixed = correction(pr.get("body") or "")
-    if fixed and original is not None and not correction(original):
+    fixed = corrected(pr.get("body") or "", history["nodes"])
+    if fixed:
         prefix, source = fixed, "corrected"
     committers: list[str] = []
     for commit in pr.get("commits") or []:
@@ -438,7 +461,7 @@ def main(argv: list[str] | None = None) -> int:
         how = {
             "body": "the body's Opened-by-session line",
             "history": "the oldest version of the body that carries the line",
-            "corrected": "the body's Opened-by-session-correction line",
+            "corrected": "an Opened-by-session-correction line (the body or its edit history)",
             "commit": "the first commit's Genesis-Session trailer (wrote it; may not have opened it)",
         }
         print(f"  opened by session {r['opener']}, from {how[r['source']]}")
