@@ -300,10 +300,21 @@ def _after_move(w: World, what: str):
         (w.root / "x.txt").write_text("edited after the move\n")
     elif what == "committed":
         w.git(w.root, "commit", "-q", "--allow-empty", "-m", "a session commit")
+    elif what == "manifest unreadable":
+        w.manifest_path.write_text("{ not json\n")
 
 
 @pytest.mark.parametrize(
-    "what", ["switched", "dirty", "committed", "still held", "still listed", "view unreadable"]
+    "what",
+    [
+        "switched",
+        "dirty",
+        "committed",
+        "still held",
+        "still listed",
+        "view unreadable",
+        "manifest unreadable",
+    ],
 )
 def test_an_unconfirmed_drop_restarts_nothing_and_names_the_right_remedy(
     dc, dc_ready, stub, capsys, monkeypatch, what
@@ -338,7 +349,7 @@ def test_an_unconfirmed_drop_restarts_nothing_and_names_the_right_remedy(
     err = cap.err
     assert "could not be confirmed" in err and "WAS saved" in err, err
     assert "nothing changed" not in err
-    if what in ("still held", "still listed", "view unreadable"):
+    if what in ("still held", "still listed", "view unreadable", "manifest unreadable"):
         assert "scripts/deploy_candidates rebuild" in err, err
     else:
         assert "deploy_candidates rebuild" not in err, err
@@ -347,6 +358,9 @@ def test_an_unconfirmed_drop_restarts_nothing_and_names_the_right_remedy(
     if what == "view unreadable":
         assert "the engine's own view could not be read (git rev-parse failed" in err, err
     assert _calls(stub) == []
+    if what == "manifest unreadable":
+        assert "the manifest could not be read" in err, err
+        return
     assert [c["branch"] for c in w.manifest()["candidates"]] == ["feat/a"]
 
 

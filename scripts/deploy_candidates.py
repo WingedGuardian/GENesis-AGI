@@ -1027,6 +1027,11 @@ class Engine(Repo):
         live = seen["live"]
         problems = []
         still_in: bool | None = False
+        if seen["manifest"]["state"] != "ok":  # an unread manifest lists nothing
+            problems.append(
+                f"the manifest could not be read ({seen['manifest']['reason'] or 'it is gone'})"
+            )
+            still_in = None
         if any(c["branch"] == branch for c in seen["listed"]):
             problems.append(f"the manifest still lists {branch}")
             still_in = True
