@@ -60,6 +60,10 @@ logger = logging.getLogger(__name__)
 
 _STARTED_AT = datetime.now(UTC)
 
+# Host-local stamps carry their UTC offset, so a line stays unambiguous when
+# the gateway's set-timezone verb moves the host clock off UTC.
+_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
+
 
 def _setup_logging() -> None:
     """Configure logging for Guardian — journald + persistent file.
@@ -72,7 +76,7 @@ def _setup_logging() -> None:
     from pathlib import Path
 
     log_format = "%(asctime)s [guardian] %(levelname)s %(name)s: %(message)s"
-    datefmt = "%Y-%m-%dT%H:%M:%S"
+    datefmt = _LOG_DATEFMT
 
     logging.basicConfig(
         level=logging.INFO,

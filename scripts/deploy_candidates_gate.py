@@ -93,12 +93,15 @@ CC_PIN_FILE = "scripts/lib/cc_version.sh"
 # What drives the HOST from this checkout on a timer: genesis-cc-align.timer
 # runs scripts/cc_align_host.sh (the host's Claude Code and Node, through the
 # guardian gateway) and genesis-cc-tmp-align.timer runs scripts/cc_tmp_align_host.sh
-# (the host's cc-tmp volume). A test classifies every systemd ExecStart target.
+# (the host's cc-tmp volume), and genesis-tz-align.timer runs scripts/tz_align.sh
+# (the host clock's zone). A test classifies every systemd ExecStart target.
 HOST_DRIVER_PREFIXES = (
     "scripts/cc_align_host.sh",
     "scripts/systemd/genesis-cc-align.",
     "scripts/cc_tmp_align_host.sh",
     "scripts/systemd/genesis-cc-tmp-align.",
+    "scripts/tz_align.sh",
+    "scripts/systemd/genesis-tz-align.",
 )
 # The git and Claude Code hooks (owner, 2026-10-01): the guards that protect the
 # repository never run code that is neither reviewed nor owner-approved for that

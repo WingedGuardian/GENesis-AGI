@@ -14,6 +14,7 @@ resolver). The tz singleton is reset in teardown to avoid cross-test leakage.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,12 @@ from genesis.dashboard.api import blueprint
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("USER_TIMEZONE", raising=False)
+    # Never start the real clock-alignment unit from a test.
+    starts: list[str] = []
+    monkeypatch.setattr(
+        "genesis.dashboard.routes.state._start_clock_alignment",
+        lambda: starts.append("start") or "started",
+    )
     from genesis.env import _invalidate_local_config
 
     _invalidate_local_config()
@@ -101,10 +108,7 @@ def _write_malformed(tmp_path: Path) -> Path:
     cfg = tmp_path / ".genesis" / "config" / "genesis.yaml"
     cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text(
-        "- network:\n"
-        "    ollama_url: http://inference.invalid:11434\n"
-        "- github:\n"
-        "    user: someone\n"
+        "- network:\n    ollama_url: http://inference.invalid:11434\n- github:\n    user: someone\n"
     )
     return cfg
 
@@ -125,7 +129,7 @@ def test_malformed_root_is_backed_up_not_deleted(client, tmp_path):
     assert resp.status_code == 200, resp.get_data(as_text=True)
 
     # The rewritten file carries the timezone...
-    assert yaml.safe_load(cfg.read_text()) == {"timezone": "Europe/Paris"}
+    assert yaml.safe_load(cfg.read_text()) == {"timezone": "Europe/Paris", "timezone_chosen": True}
 
     # ...and the original content still exists, byte-identical, beside it.
     backups = sorted(cfg.parent.glob("genesis.malformed-*.yaml"))
@@ -186,16 +190,97 @@ def test_a_second_malformed_write_does_not_overwrite_the_first_backup(client, tm
     """
     cfg = _write_malformed(tmp_path)
     first_content = cfg.read_text()
-    assert client.post("/api/genesis/settings/timezone",
-                       json={"timezone": "Europe/Paris"}).status_code == 200
+    assert (
+        client.post("/api/genesis/settings/timezone", json={"timezone": "Europe/Paris"}).status_code
+        == 200
+    )
 
     # Break it again and repeat immediately — same second in practice.
     cfg.write_text("- second: malformed\n")
     second_content = cfg.read_text()
-    assert client.post("/api/genesis/settings/timezone",
-                       json={"timezone": "Europe/Lisbon"}).status_code == 200
+    assert (
+        client.post(
+            "/api/genesis/settings/timezone", json={"timezone": "Europe/Lisbon"}
+        ).status_code
+        == 200
+    )
 
     backups = sorted(cfg.parent.glob("genesis.malformed-*.yaml"))
     assert len(backups) == 2, f"a backup was overwritten: {[b.name for b in backups]}"
     saved = {b.read_text() for b in backups}
     assert first_content in saved and second_content in saved
+
+
+# ── The system clocks follow a zone change ─────────────────────────────────────
+
+
+def test_post_starts_clock_alignment_and_marks_the_zone_chosen(client, tmp_path):
+    resp = client.post("/api/genesis/settings/timezone", json={"timezone": "UTC"})
+    assert resp.status_code == 200
+    assert resp.get_json()["clock_alignment"] == "started"
+    cfg = yaml.safe_load((tmp_path / ".genesis" / "config" / "genesis.yaml").read_text())
+    # A chosen UTC must be told apart from the shipped placeholder.
+    assert cfg == {"timezone": "UTC", "timezone_chosen": True}
+
+
+def test_a_rejected_zone_starts_nothing(client, monkeypatch):
+    called = []
+    monkeypatch.setattr(
+        "genesis.dashboard.routes.state._start_clock_alignment",
+        lambda: called.append(1) or "started",
+    )
+    assert (
+        client.post("/api/genesis/settings/timezone", json={"timezone": "Not/AZone"}).status_code
+        == 400
+    )
+    assert called == []
+
+
+@pytest.mark.parametrize(
+    "outcome,expected",
+    [
+        (subprocess.CompletedProcess([], 0, "", ""), "started"),
+        (
+            subprocess.CompletedProcess([], 5, "", "Unit genesis-tz-align.service not found."),
+            "unavailable",
+        ),
+        (subprocess.TimeoutExpired("systemctl", 10), "unavailable"),
+        (OSError("no systemctl"), "unavailable"),
+    ],
+)
+def test_start_clock_alignment(monkeypatch, outcome, expected):
+    from genesis.dashboard.routes import state
+
+    seen = {}
+
+    def _run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    assert state._start_clock_alignment() == expected
+    assert seen["cmd"] == ["systemctl", "--user", "start", "--no-block", "genesis-tz-align.service"]
+
+
+def test_re_picking_the_chosen_zone_does_not_move_the_clocks(client, monkeypatch):
+    starts = []
+    monkeypatch.setattr(
+        "genesis.dashboard.routes.state._start_clock_alignment",
+        lambda: starts.append(1) or "started",
+    )
+    first = client.post("/api/genesis/settings/timezone", json={"timezone": "Europe/Paris"})
+    again = client.post("/api/genesis/settings/timezone", json={"timezone": "Europe/Paris"})
+    assert first.get_json()["clock_alignment"] == "started"
+    assert again.get_json()["clock_alignment"] == "unchanged"
+    assert starts == [1]
+
+
+def test_choosing_the_utc_placeholder_explicitly_moves_the_clocks(client, tmp_path, monkeypatch):
+    cfg = tmp_path / ".genesis" / "config" / "genesis.yaml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('timezone: "UTC"\n')  # the shipped placeholder, never chosen
+    monkeypatch.setattr("genesis.dashboard.routes.state._start_clock_alignment", lambda: "started")
+    resp = client.post("/api/genesis/settings/timezone", json={"timezone": "UTC"})
+    assert resp.get_json()["clock_alignment"] == "started"

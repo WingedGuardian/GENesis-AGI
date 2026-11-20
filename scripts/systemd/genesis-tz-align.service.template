@@ -1,0 +1,24 @@
+[Unit]
+Description=Genesis clock alignment — host and container clocks to the install's zone
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_DIR__
+ExecStart=/bin/bash __REPO_DIR__/scripts/tz_align.sh
+# The script bounds its one SSH call itself (ConnectTimeout=10 + timeout 120);
+# this is a backstop well above that, so a slow host is never cut short.
+TimeoutStartSec=900
+Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+StandardOutput=journal
+StandardError=journal
+# Home-scoped: the only file it writes is the single-flight lock under ~/.genesis.
+# No NoNewPrivileges: without a guardian the script sets the container clock
+# through `sudo -n timedatectl`, and sudo cannot run under NoNewPrivileges=yes
+# (measured: `sudo -n true` works under exactly these two directives, and fails
+# once NoNewPrivileges=yes is added). So, like genesis-tmp-watchgod and
+# genesis-code-intel-freeze, this unit is a way out of genesis-server's
+# NoNewPrivileges: a process that can rewrite this checkout and start the unit
+# reaches sudo. A polkit grant for timedated's set-timezone would let this unit
+# keep NoNewPrivileges; it needs a root-written rule at install time.
+ProtectSystem=strict
+ReadWritePaths=%h

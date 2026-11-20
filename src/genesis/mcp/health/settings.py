@@ -403,6 +403,21 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # read live per call
     ),
+    "tz_align": SettingsDomain(
+        name="tz_align",
+        description=(
+            "Clock alignment — master `enabled` + `mode` off/live (default live). "
+            "live: scripts/tz_align.sh sets the host clock (guardian gateway "
+            "set-timezone) and the container clock to genesis.yaml's zone, at "
+            "12:20 local daily and after a dashboard zone change; host jobs then "
+            "follow local time. off: leaves both clocks alone. An invalid mode "
+            "reads as off. Read fresh per run, no restart. Env kill switch "
+            "GENESIS_TZ_ALIGN_DISABLED=1 forces off."
+        ),
+        config_filename="tz_align.yaml",
+        readonly=False,
+        needs_restart=False,  # read fresh by every run of the script
+    ),
     "main_checkout_guard": SettingsDomain(
         name="main_checkout_guard",
         description=(
@@ -1545,6 +1560,22 @@ def _validate_worktree_ownership(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_tz_align(changes: dict) -> list[str]:
+    """Validate clock-alignment lever changes (see genesis.tz_align_config)."""
+    from genesis.tz_align_config import MODES
+
+    errors: list[str] = []
+    for key, value in changes.items():
+        if key not in ("enabled", "mode"):
+            errors.append(f"Unknown key '{key}'. Valid: enabled, mode")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
 def _validate_main_checkout_guard(changes: dict) -> list[str]:
     """Validate main-checkout guard lever changes (read by
     scripts/hooks/main_checkout_guard.py, which keeps the guard ON for any value
@@ -2346,6 +2377,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "youtube_fetch": _validate_youtube_fetch,
     "mcp_staleness_guard": _validate_mcp_staleness_guard,
     "worktree_ownership": _validate_worktree_ownership,
+    "tz_align": _validate_tz_align,
     "main_checkout_guard": _validate_main_checkout_guard,
     "voice_act": _validate_voice_act,
     "voice_recency_resume": _validate_voice_recency_resume,

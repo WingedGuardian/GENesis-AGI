@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import logging
 from datetime import UTC, datetime
@@ -309,6 +310,30 @@ def essential_knowledge_endpoint():
 
 
 
+def _start_clock_alignment() -> str:
+    """Start genesis-tz-align.service: ``started``, or ``unavailable`` when the
+    unit is absent or systemd cannot be reached. ``--no-block``: the oneshot
+    would otherwise hold the request for the whole SSH round trip."""
+    import subprocess
+
+    from genesis.util.systemd import systemctl_env
+
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "start", "--no-block", "genesis-tz-align.service"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=systemctl_env(),
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return "unavailable"
+    if r.returncode != 0:
+        logger.warning("could not start genesis-tz-align.service: %s", r.stderr.strip())
+        return "unavailable"
+    return "started"
+
+
 @blueprint.route("/api/genesis/settings/timezone", methods=["GET", "POST"])
 @_async_route
 async def settings_timezone():
@@ -322,7 +347,10 @@ async def settings_timezone():
          the current value plus the full zone list for the dropdown.
     POST: {"timezone": <IANA tz name>} → validates, writes to genesis.yaml,
           invalidates caches + reloads. Takes effect immediately for display;
-          scheduler CronTrigger timezones re-bind on the next restart.
+          scheduler CronTrigger timezones re-bind on the next restart. Also starts
+          genesis-tz-align.service, which moves the host and container clocks
+          (``clock_alignment``: started|unavailable, or unchanged when the zone was
+          already the chosen one).
     """
     from genesis.env import user_timezone
 
@@ -346,6 +374,7 @@ async def settings_timezone():
 
     cfg_path = Path.home() / ".genesis" / "config" / "genesis.yaml"
     malformed_backup: str | None = None
+    clock_change = True
     try:
         import yaml
         existing = {}
@@ -384,7 +413,15 @@ async def settings_timezone():
                     backup,
                 )
             existing = loaded if isinstance(loaded, dict) else {}
+        # Clock alignment moves the HOST clock too, so it starts only for a real
+        # change: a new zone, or a zone not yet marked chosen (a UTC placeholder).
+        clock_change = (
+            existing.get("timezone") != new_tz or existing.get("timezone_chosen") is not True
+        )
         existing["timezone"] = new_tz
+        # A chosen UTC is otherwise indistinguishable from the shipped
+        # placeholder, which clock alignment never applies (tz_align_config).
+        existing["timezone_chosen"] = True
         # Ensure the config dir exists — on an install that never ran
         # setup-local-config, ~/.genesis/config/ may be absent and the dropdown
         # is the first thing to create genesis.yaml. 0o700 matches the personal
@@ -417,6 +454,11 @@ async def settings_timezone():
     payload = {
         "timezone": effective,
         "note": "Scheduler timezone updates on next restart",
+        # The system clocks follow through scripts/tz_align.sh, which reads the
+        # zone and the tz_align lever itself.
+        "clock_alignment": (
+            await asyncio.to_thread(_start_clock_alignment) if clock_change else "unchanged"
+        ),
     }
     if malformed_backup:
         # Surfaced, never silent: the operator's other settings were NOT carried
