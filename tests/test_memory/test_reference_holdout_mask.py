@@ -2130,4 +2130,162 @@ async def test_the_candidates_note_names_only_opaque_keys(db):
     await db.commit()
     held = (await kc.get(db, b))["body"]
     again = await _ingest(db, store, held, concept="Visa 5555 5555 5555 4444 PIN")
-    assert all(re.fullmatch(r"cred-[0-9a-f]{12}", k) for k in again.candidates)
+    # Exactly the opaque key: the legacy raw-name key is never named.
+    assert again.candidates == ((await kc.get(db, b))["concept"],)
+    assert re.fullmatch(r"cred-[0-9a-f]{12}", again.candidates[0])
+
+
+
+async def test_an_ordinary_unit_repeating_a_credential_value_is_masked(db, memory_mcp, tmp_path, monkeypatch):
+    """CodeRabbit round 3 on #4843 (Critical, owner ruling: mask it): an ordinary
+    unit of a distilled batch that repeats a credential unit's value is stored,
+    with the value masked in its concept, body and tags; nothing is refused."""
+    import contextlib
+
+    from genesis.knowledge.distillation import KnowledgeUnit
+    from genesis.knowledge.manifest import ManifestManager
+    from genesis.knowledge.orchestrator import KnowledgeOrchestrator
+
+    @contextlib.asynccontextmanager
+    async def _own(_path):
+        yield db
+
+    monkeypatch.setattr("genesis.db.connection.get_raw_db", _own)
+    monkeypatch.setattr("genesis.mcp.memory_mcp.knowledge", kc)
+    orch = KnowledgeOrchestrator(
+        registry=MagicMock(),
+        distillation=MagicMock(),
+        manifest=ManifestManager(root=tmp_path / "knowledge"),
+    )
+    plain = KnowledgeUnit(
+        concept=f"lab notes {_SECRET}",
+        body=f"The lab notes repeat password: {_SECRET} for the router",
+        domain="reference.fact",
+        tags=["lab", _SECRET],
+    )
+    cred = KnowledgeUnit(concept="lab wifi", body=f"password: {_SECRET}", domain="reference.credentials")
+    await db.commit()  # the batch opens its own BEGIN on the connection it is given
+    ids = await orch._store_units(
+        [plain, cred], project_type="reference", source="notes.md", content=MagicMock(), purpose=None,
+    )
+    assert len(ids) == 2
+    rows = [await kc.get(db, i) for i in ids]
+    (stored,) = [r for r in rows if r["domain"] == "reference.fact"]
+    assert stored["body"] == "The lab notes repeat password: [held] for the router"
+    for text in (stored["concept"], stored["body"], stored["tags"] or ""):
+        assert _SECRET not in text
+    for call in memory_mcp.calls:
+        assert _SECRET not in json.dumps(call, default=str)
+
+
+
+def test_a_sibling_unit_keeps_ordinary_words_of_the_credential_text():
+    """Owner ruling 2026-11-19: only the secrets the capture rules recognise in
+    a credential unit are masked in the batch's other units, so its ordinary
+    words (a Wi-Fi standard, a band, a model number) stay."""
+    from genesis.knowledge.distillation import KnowledgeUnit
+    from genesis.knowledge.orchestrator import _masked_unit, _sibling_mask
+
+    cred = KnowledgeUnit(
+        concept="office wifi",
+        body="Office router RT-AX88U on the 5GHz WPA2 band, admin login, password: Zq7!fake9",
+        domain="reference.credentials",
+    )
+    mask = _sibling_mask([cred])
+    plain = KnowledgeUnit(
+        concept="office network",
+        body="Our office uses WPA2 on the 5GHz band with an RT-AX88U router; rotate Zq7!fake9 monthly",
+        domain="reference.fact",
+    )
+    assert _masked_unit(plain, mask).body == (
+        "Our office uses WPA2 on the 5GHz band with an RT-AX88U router; rotate [held] monthly"
+    )
+    assert _sibling_mask([]) is None
+
+
+def test_sibling_concepts_that_differ_only_by_a_secret_stay_two_units():
+    """Round-3 premise check P4: two concepts that mask to one key get distinct
+    keys, so the batch upsert keeps both units; a repeated unit keeps its own."""
+    from genesis.knowledge.distillation import KnowledgeUnit
+    from genesis.knowledge.orchestrator import _distinct_concepts, _masked_unit, _sibling_mask
+
+    mask = _sibling_mask([
+        KnowledgeUnit(concept="a", body="password: Zq7!fake9", domain="reference.credentials"),
+        KnowledgeUnit(concept="b", body="pin: Old9!pwx", domain="reference.credentials"),
+    ])
+    one = KnowledgeUnit(concept="notes Zq7!fake9", body="x", domain="reference.fact")
+    two = KnowledgeUnit(concept="notes Old9!pwx", body="y", domain="reference.fact")
+    units = _distinct_concepts([(u, _masked_unit(u, mask)) for u in (one, two, one)])
+    assert len({u.concept for u in units}) == 2 and units[0].concept == units[2].concept
+    assert all(u.concept.startswith("notes [held] #") for u in units)
+
+
+async def test_two_long_account_names_stay_two_identities(db):
+    """CodeRabbit round 3 on #4843 (Critical): a credential name is never cut
+    before its identity is taken, so two names that differ only past a long
+    token stay two entries."""
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import _derive_identifier
+
+    names = {
+        _derive_identifier(
+            Extraction(content="x", extraction_type="entity", confidence=0.9, entities=["Portal " + "a" * 110 + tail]),
+            default_prefix="account",
+            whole_tokens=True,
+        )
+        for tail in ("-east", "-west")
+    }
+    assert len(names) == 2
+
+
+async def test_a_placeholder_only_upload_uploaded_again_is_one_entry(db):
+    """CodeRabbit round 3 on #4843: an upload whose whole text is the value
+    placeholder holds an empty value, and its re-upload is compared as that, so
+    it is the same entry, not a second row and vector."""
+    store = _PointStore()
+    first = await _untrusted(db, store, "notes.txt", ro.SECRET_PLACEHOLDER)
+    again = await _untrusted(db, store, "notes.txt", ro.SECRET_PLACEHOLDER)
+    assert again == first
+    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 1
+
+
+def test_a_credential_name_ends_before_its_captured_secret():
+    """Fix audit M1: with no sentence stop before it, an auto-captured name ends
+    before the first captured secret, so a rotation keeps one name; a name of
+    credential labels alone keeps its text (one bare label would name all)."""
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import classify_as_reference
+
+    def name(content):
+        return classify_as_reference(Extraction(content=content, extraction_type="entity", confidence=0.9))["identifier"]
+
+    first = name("Router admin login password: Fake9!xA for the lab gear today ok")
+    assert first == name("Router admin login password: Fake8!xB for the lab gear today ok")
+    assert "Fake9" not in first
+    assert name("password: Zz9!x. For the lab router") != "password"
+
+
+def test_mask_text_captured_as_a_secret_masks_nothing_else():
+    """Fix audit M2: a credential unit whose captured secret is only the mask
+    text (a re-ingested masked body) never masks the other units' text."""
+    from genesis.knowledge.distillation import KnowledgeUnit
+    from genesis.knowledge.orchestrator import _masked_unit, _sibling_mask
+
+    mask = _sibling_mask([KnowledgeUnit(concept="c", body="password: [held]", domain="reference.credentials")])
+    plain = KnowledgeUnit(concept="notes [held] here", body="keep [held] text", domain="reference.fact")
+    assert _masked_unit(plain, mask).body == "keep [held] text"
+
+
+def test_masked_sibling_concepts_keep_distinct_keys_across_batches():
+    """Fix audit M3: a concept that masking changed takes a suffix from its masked
+    concept and body, so two units differing only by a secret keep two keys
+    across uploads, and the same unit keeps its key."""
+    from genesis.knowledge.distillation import KnowledgeUnit
+    from genesis.knowledge.orchestrator import _distinct_concepts, _masked_unit, _sibling_mask
+
+    mask = _sibling_mask([KnowledgeUnit(concept="a", body="password: Zq7!fake9", domain="reference.credentials")])
+    one = KnowledgeUnit(concept="pw Zq7!fake9", body="alpha", domain="reference.fact")
+    two = KnowledgeUnit(concept="pw Zq7!fake9", body="beta", domain="reference.fact")
+    key = lambda unit: _distinct_concepts([(unit, _masked_unit(unit, mask))])[0].concept  # noqa: E731
+    assert key(one) != key(two) and key(one) == key(one)
+    assert "Zq7" not in key(one)

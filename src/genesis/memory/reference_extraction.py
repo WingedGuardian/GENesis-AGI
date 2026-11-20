@@ -331,11 +331,13 @@ def _derive_identifier(
     2. First 80 chars of content trimmed to a sentence
     3. Default prefix with a short hash of the content
 
-    ``whole_tokens`` (a credential): a cut never splits a whitespace token, so
-    no part of a secret survives it; the ingest chokepoint masks every whole
-    one it sees (#2426).
+    ``whole_tokens`` (a credential): the name is never cut here, since its
+    full text is the entry's identity (two names that differ only past a cut
+    would be one entry, and the second would replace the first) and a cut
+    could split a secret; the ingest chokepoint masks it and caps only the
+    name it displays (#2426).
     """
-    cut = _cut_whole if whole_tokens else _cut_plain
+    cut = _uncut if whole_tokens else _cut_plain
     if extraction.entities:
         first = extraction.entities[0].strip()
         if first:
@@ -367,24 +369,34 @@ def _derive_identifier(
         if 0 < idx < 80:
             content = content[:idx]
             break
+    # A credential name never holds a captured secret: it ends before the first
+    # one, so a rotation keeps the same name ("Router admin password X" is
+    # "Router admin password").
+    # Only when a word other than a credential label is left: a bare
+    # "password" would name every such capture alike, one overwriting another.
+    inside = [start for start, end in held if start < len(content)]
+    if inside:
+        before = content[: min(inside)].rstrip(" \t:=,;")
+        if any(not _NAME_LABEL.fullmatch(word) for word in re.findall(r"[^\s:=,;]+", before)):
+            content = before
     return cut(content, 80).strip() or default_prefix
+
+
+#: A word that only labels a credential ("password", "pin", "is"): a name made
+#: of these alone names nothing.
+_NAME_LABEL = re.compile(
+    r"(?:user(?:name)?|login|pass(?:word|phrase|code)?|pwd|pin|key|token|secret|api|is|my|the|a|an)",
+    re.IGNORECASE,
+)
 
 
 def _cut_plain(text: str, limit: int) -> str:
     return text[:limit]
 
 
-def _cut_whole(text: str, limit: int) -> str:
-    """``text`` cut to at most ``limit`` characters at a whitespace boundary.
-    A first token longer than the limit is kept whole: the chokepoint masks it
-    and then caps it."""
-    if len(text) <= limit or text[limit].isspace():
-        return text[:limit]
-    at = max(text.rfind(sep, 0, limit) for sep in (" ", "\n", "\t"))
-    if at > 0 and text[:at].strip():
-        return text[:at]
-    end = min((i for i in (text.find(sep, limit) for sep in (" ", "\n", "\t")) if i != -1), default=len(text))
-    return text[:end]
+def _uncut(text: str, limit: int) -> str:
+    """A credential name as it is (``_derive_identifier``)."""
+    return text
 
 
 def _user_shared(token: str | None, user_text: str | None) -> bool:

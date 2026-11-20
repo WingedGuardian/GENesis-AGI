@@ -456,11 +456,15 @@ class KnowledgeOrchestrator:
 
         credential_units = [u for u in units if holds_secret(project_type, u.domain)]
         # A credential unit's concept reaches the chokepoint whole (it masks a
-        # secret in it before its own cap); every other one is capped here.
-        units = [
-            dataclasses.replace(u, concept=u.concept[:_MAX_CONCEPT])
+        # secret in it before its own cap); every other one is capped here,
+        # after its text is masked against the batch's credential units: an
+        # ordinary unit repeating a credential's value would otherwise put it in
+        # the ordinary index (never refused, never dropped: masked).
+        sibling_mask = _sibling_mask(credential_units)
+        units = _distinct_concepts([
+            (u, _masked_unit(u, sibling_mask))
             for u in units if not holds_secret(project_type, u.domain)
-        ]
+        ])
 
         unit_ids: list[str] = []
         qdrant_ids: list[str] = []  # Track for compensation on failure
@@ -831,3 +835,75 @@ class KnowledgeOrchestrator:
             relationships=unit.relationships or None,
             caveats=unit.caveats or None,
         )
+
+
+def _sibling_mask(credential_units: list):
+    """The masks for the batch's other units, or None for a batch with no
+    credential unit: the secrets its credential units name in a form the
+    capture rules recognise (a labelled password, a known key prefix, a
+    "login / secret" half, a URL password), and each credential unit's whole
+    text as one phrase. Only those (owner ruling 2026-11-19): ordinary words of
+    a credential unit's text ("WPA2", "5GHz", a model number) are not masked in
+    the batch's other units, so an unlabelled password repeated there apart
+    from its unit's whole text stays visible (the stated prose limit)."""
+    from genesis.memory.reference_extraction import captured_secrets
+    from genesis.memory.reference_masks import ValueMask, _forms, _secret_parts, value_masks
+
+    bodies = [u.body for u in credential_units if u.body and u.body.strip()]
+    if not bodies:
+        return None
+    secrets = set(captured_secrets(bodies))
+    for body in bodies:
+        secrets |= {part for part, _ in _secret_parts(body)}
+    # A "secret" that is only mask or placeholder text (a re-ingested masked
+    # body) would mask every masked span of the other units: never a probe.
+    from genesis.memory.reference_masks import HELD_MASK
+
+    secrets = sorted(s for s in secrets if s.replace(HELD_MASK, "").strip(" \t:=,;.[]"))
+    masks = [value_masks(secrets[0], also=tuple((v, "") for v in secrets[1:]))[0]] if secrets else []
+    # The whole text only, never its words: a verbatim repeat of a unit.
+    masks += [ValueMask(body, probes=[(form, False) for form in _forms(body)]) for body in bodies]
+    return masks
+
+
+def _distinct_concepts(pairs: list) -> list:
+    """The masked units of ``pairs`` ((original, masked) each). A concept that
+    masking changed is suffixed " #<8 hex>" of the sha256 of the unit's masked
+    concept and body, so two units whose concepts differed only by a secret
+    keep two keys, in this batch and across uploads (the upsert key is the
+    concept), the same unit keeps the same key, and the suffix covers no
+    secret; a collision left within the batch is suffixed " #2", " #3", ..."""
+    import hashlib
+
+    taken: dict[str, str] = {}
+    out = []
+    for original, unit in pairs:
+        concept = unit.concept
+        if concept != original.concept[:_MAX_CONCEPT]:
+            tag = hashlib.sha256(f"{unit.concept}\n{unit.body}".encode()).hexdigest()[:8]
+            concept = f"{concept[: _MAX_CONCEPT - 10]} #{tag}"
+        n = 1
+        base = concept
+        while concept in taken and taken[concept] != original.concept:
+            n += 1
+            concept = f"{base[: _MAX_CONCEPT - len(f' #{n}')]} #{n}"
+        taken.setdefault(concept, original.concept)
+        out.append(unit if concept == unit.concept else dataclasses.replace(unit, concept=concept))
+    return out
+
+
+def _masked_unit(unit, mask):
+    """``unit`` with every text field masked by each of ``mask``
+    (``_sibling_mask``), and its concept then capped."""
+    for one in mask or ():
+        unit = dataclasses.replace(
+            unit,
+            concept=one.mask(unit.concept),
+            body=one.mask(unit.body),
+            tags=[t for t in one.mask_field(list(unit.tags)) if t is not None],
+            relationships=one.mask_field(list(unit.relationships)),
+            caveats=one.mask_field(list(unit.caveats)),
+            section_title=one.mask(unit.section_title) if unit.section_title else unit.section_title,
+        )
+    return dataclasses.replace(unit, concept=unit.concept[:_MAX_CONCEPT])
+
