@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -85,10 +86,15 @@ def main(argv: list[str] | None = None) -> int:
         # Validate/hash the candidate before publication; a bad candidate leaves
         # no packet and never contaminates the source-only Stage-A input.
         evidence_hash = evidence_sha256(load_evidence(args.evidence)) if args.evidence else None
+        started = time.monotonic()
         snapshot = acquire_sources(args.repo, args.pr)
         # Each path a check could not cover, named so the reviewer treats it as a
         # gap; derived from the packet's own diff and census, so not stored.
-        gaps = reconcile_diff(snapshot.diff.encode(), snapshot.files, timeout=ACQUISITION_SECONDS)
+        # One overall bound: the second pass gets only what acquisition left.
+        remaining = ACQUISITION_SECONDS - (time.monotonic() - started)
+        if remaining <= 0:
+            raise SourceError("source acquisition deadline expired")
+        gaps = reconcile_diff(snapshot.diff.encode(), snapshot.files, timeout=remaining)
         packet = save_packet(snapshot, args.output)
     except (SourceError, EvidenceError, OSError) as exc:
         # Do not dump subprocess stderr, PR bodies or raw source on failure.

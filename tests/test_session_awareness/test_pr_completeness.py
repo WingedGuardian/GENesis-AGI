@@ -7,7 +7,7 @@ import pytest
 
 from genesis.session_awareness.pr_evidence import EvidenceError, parse_evidence
 from genesis.session_awareness.pr_verification_sources import PrSourceSnapshot, SourceError
-from tests.test_session_awareness.test_pr_verification_sources import patch
+from tests.test_session_awareness.test_pr_verification_sources import AFTER_BLOB, patch
 
 
 def candidate():
@@ -41,7 +41,9 @@ def snapshot(tmp_path):
         body="Changes ordinary text.\nE2E: verify the changed text",
         diff=patch(tmp_path).decode(),
         files=[
-            dict(filename="ordinary.txt", additions=1, deletions=1, status="modified", sha="d" * 40)
+            dict(
+                filename="ordinary.txt", additions=1, deletions=1, status="modified", sha=AFTER_BLOB
+            )
         ],
         acquired_at="2026-01-01T00:00:00+00:00",
     )
@@ -624,3 +626,17 @@ def test_evidence_cap_uses_the_writers_stored_serialization(tmp_path, monkeypatc
         review.load_evidence(path)
     monkeypatch.setattr(review, "MAX_REVIEW_BYTES", stored)
     assert review.load_evidence(path).repo == "owner/repo"
+
+
+def test_prepare_keeps_one_deadline_across_both_passes(tmp_path, monkeypatch):
+    # The second reconciliation pass gets only what is left of the overall
+    # bound, so prepare never runs past it and publishes nothing when it is spent.
+    source = snapshot(tmp_path)
+    cli = review_cli()
+    clock = iter([0.0, cli.ACQUISITION_SECONDS + 1.0])
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(cli, "acquire_sources", lambda *args: source)
+    target = tmp_path / "packet"
+    argv = ["prepare", "--repo", "owner/repo", "--pr", "7", "--output", str(target)]
+    assert cli.main(argv) == 2
+    assert not target.exists()
