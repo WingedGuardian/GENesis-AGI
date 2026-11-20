@@ -1740,16 +1740,20 @@ other intake evidence retains its dated basis.
   masked first, contextually (`orchestrator._SiblingMasks`, owner ruling
   2026-11-19): each is masked only for the strings it uses as secrets (the ones
   the distiller names for it, `KnowledgeUnit.secrets`, never stored, and the
-  ones the capture rules read in its own text), and only when a credential
-  unit of the batch holds them (in any of its fields, in any spelling the
-  masks read; a match grows over the holding text, so a secret named in part
-  is masked whole); every other word, usernames included, stays. Card numbers
-  in those units are redacted as the chokepoint redacts a caller's fields.
+  ones the capture rules read in its own text, read before card redaction),
+  and only when a credential unit of the batch holds them (inside one of its
+  fields, in any spelling the masks read; a match grows over the holding text,
+  and a name that is part of a value the credential holds, or holds one, masks
+  that whole value). A held value shaped like a secret (letters mixed with
+  digits or symbols) is masked wherever a sibling repeats it; a plain-word one
+  only where the unit uses it as a secret (owner ruling 2026-11-20). Every
+  other word, usernames included, stays. Card numbers in those units are
+  redacted as the chokepoint redacts a caller's fields.
   Every stored model-written field is masked and redacted alike (concept,
   body, domain, section title, source date, tags, relationships, caveats). In
   such a batch a unit whose concept or domain masking or redaction changed, or
   whose concept is over 200 characters or already ends like a minted key, is
-  keyed on its concept cut to fit plus a random ` #<8 hex>` (owner rulings
+  keyed on its concept cut to fit plus a random ` #<12 hex>` (owner rulings
   2026-11-20): no key is derived from the text, so two units never share one
   and none lets a guess at masked or cut-off text be checked; a changed
   document's re-ingest adds a row beside the old one. A batch with no

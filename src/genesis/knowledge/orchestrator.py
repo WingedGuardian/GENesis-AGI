@@ -37,9 +37,9 @@ _MAX_CONCEPT = 200
 #: The quality flag of a credential unit that could not be stored (by reason).
 CREDENTIAL_NOT_STORED = "credential_unit_not_stored:"
 #: A concept the batch changed or cut ends with this many characters of key.
-_KEY_SUFFIX = len(" #") + 8
+_KEY_SUFFIX = len(" #") + 12
 #: The shape of a key this module mints; a concept arriving in it is keyed anew.
-_MINTED = re.compile(r" #[0-9a-f]{8}\Z")
+_MINTED = re.compile(r" #[0-9a-f]{12}\Z")
 
 
 class _SiblingMasks:
@@ -49,21 +49,44 @@ class _SiblingMasks:
     as secrets, the ones the distiller names for it (``KnowledgeUnit.secrets``)
     and the ones the capture rules read in its own text ("password: X"), and
     only when a credential unit of the batch holds one (it occurs, in any
-    spelling the masks read, in one of the fields of that unit, which the
-    chokepoint holds). Every other word stays: usernames, ordinary words, and
-    the rest of a copied credential. A credential unit that could not be
-    stored still masks its siblings (fail closed; the batch carries the quality
-    flag)."""
+    spelling the masks read, inside one field of that unit, which the
+    chokepoint holds). A name that is part of a credential's held value, or
+    holds one, masks that whole value. A held value shaped like a secret
+    (letters mixed with digits or symbols) is masked wherever a unit repeats
+    it (owner ruling 2026-11-20). Every other word stays: usernames, ordinary
+    words, plain-word passwords not used as one, and the rest of a copied
+    credential. A credential unit that could not be stored still masks its
+    siblings (fail closed; the batch carries the quality flag)."""
 
     def __init__(self, units: list, keys: list[str]):
-        from genesis.memory.reference_masks import _decoded, _normalise
+        from genesis.memory import reference_masks as rm
+        from genesis.memory.reference_extraction import captured_secrets
 
         self.held = []
+        self.values = []
+        self.shaped = []
+        self.users: set[str] = set()
         for unit, key in zip(units, keys, strict=True):
-            raw = "\n".join(_strings(_written(unit)))
-            primary = _normalise(raw)
-            forms = [primary, *sorted({_normalise(f) for f in _decoded(raw)} - {primary})]
-            self.held.append((key, raw, forms))
+            fields = list(_strings(_written(unit)))
+            raw = "\n".join(fields)
+            # Held inside one field: text spanning two fields is no value.
+            self.held.append((key, raw, [form for text in fields for form in _forms(text)]))
+            # The values the credential holds whole: the ones the capture
+            # rules read in its fields, and the ones the distiller names for it
+            # unless the rules read that name as a username (a username is
+            # never masked; one the rules also read as the password is).
+            users = _username_forms(fields)
+            captured = sorted(captured_secrets(fields))
+            self.users |= users - {form for value in captured for form in _forms(value)}
+            for value in dict.fromkeys(v.strip() for v in [*captured, *unit.secrets]):
+                forms = _forms(value) if value else set()
+                if not forms or (forms & self.users and value not in captured):
+                    continue
+                self.values.append((key, raw, value, forms))
+                if any(rm._secret_token(t) for t in value.split()):
+                    # Read as the masks read it: every spelling and fragment.
+                    mask = rm.ValueMask(value, probes=rm.secret_probes([value]), exempt=frozenset(), secrets=[value])
+                    self.shaped.append((key, raw, value, mask))
 
     def secrets_in(self, unit) -> dict[str, list[tuple[str, str]]]:
         """The secrets ``unit`` uses that the batch holds: each with the
@@ -71,16 +94,59 @@ class _SiblingMasks:
         A match grows over those texts, so a secret named only in part is
         masked whole."""
         from genesis.memory.reference_extraction import captured_secrets
-        from genesis.memory.reference_masks import _decoded, _normalise
 
         texts = list(_strings(_written(unit)))
+        captured = sorted(captured_secrets(texts))
+        users = (_username_forms(texts) - {f for value in captured for f in _forms(value)}) | self.users
         found: dict[str, list[tuple[str, str]]] = {}
-        for secret in dict.fromkeys(s.strip() for s in [*sorted(captured_secrets(texts)), *unit.secrets]):
-            wanted = [f for f in sorted({_normalise(d) for d in _decoded(secret)}) if f.strip()]
-            holders = [(key, raw) for key, raw, forms in self.held if any(w in form for form in forms for w in wanted)]
-            if holders:
-                found[secret] = holders
+
+        def add(secret, key, raw):
+            if (key, raw) not in found.setdefault(secret, []):
+                found[secret].append((key, raw))
+
+        for name in dict.fromkeys(s.strip() for s in [*captured, *unit.secrets]):
+            wanted = _forms(name)
+            # A name the distiller gave that is a username is not a secret.
+            if not wanted or (wanted & users and name not in captured):
+                continue
+            for key, raw, forms in self.held:
+                if any(w in form for form in forms for w in wanted):
+                    add(name, key, raw)
+            for key, raw, value, held in self.values:
+                # A name that is a word-bounded part of a held value, or holds
+                # one, stands for that whole value.
+                if _within(wanted, held) or _within(held, wanted):
+                    add(value, key, raw)
+        # A held value shaped like a secret is masked wherever the unit
+        # repeats it or a fragment of it (owner ruling 2026-11-20).
+        for key, raw, value, mask in self.shaped:
+            if any(mask.carries(text) for text in texts):
+                add(value, key, raw)
         return found
+
+
+def _forms(text: str) -> set[str]:
+    """The normalised spellings of ``text`` the masks read (decoded forms
+    included), none of them blank."""
+    from genesis.memory.reference_masks import _decoded, _normalise
+
+    return {f for f in (_normalise(d) for d in _decoded(text.strip())) if f.strip()}
+
+
+def _within(parts: set[str], wholes: set[str]) -> bool:
+    """Whether a spelling in ``parts`` occurs in one in ``wholes`` with no
+    letter or digit just outside it (a plain substring test first: the regex
+    runs only on a hit)."""
+    return any(
+        p in w and re.search(rf"(?<![^\W_]){re.escape(p)}(?![^\W_])", w) for p in parts for w in wholes
+    )
+
+
+def _username_forms(texts: list[str]) -> set[str]:
+    """The spellings of every username the capture rules read in ``texts``."""
+    from genesis.memory.reference_extraction import captured_usernames
+
+    return {form for name in captured_usernames(texts) for form in _forms(name)}
 
 
 def _written(unit) -> list:
@@ -109,7 +175,7 @@ def _keyed_unit(unit, siblings: _SiblingMasks | None):
     redacted, in every stored field, and its concept as its stored key: as
     given when masking changed neither the concept nor the domain, the concept
     fits the cap and it does not already end like a minted key; otherwise cut
-    to fit and ending in a random ``#<8 hex>`` (owner rulings 2026-11-20). No
+    to fit and ending in a random ``#<12 hex>`` (owner rulings 2026-11-20). No
     key is built from the text, so two units never share a minted key and no
     key lets anyone check a guess at text that was masked or cut off; a
     re-ingest of a changed document adds a row beside the old one. A unit
@@ -122,6 +188,9 @@ def _keyed_unit(unit, siblings: _SiblingMasks | None):
     if siblings is None:
         return dataclasses.replace(unit, concept=unit.concept[:_MAX_CONCEPT], secrets=[])
     original = (unit.concept, unit.domain)
+    # Discovery reads the unit as the distiller wrote it: card redaction can
+    # take a label with the card (#4924 round 3).
+    held = siblings.secrets_in(unit)
     if siblings is not None:
         # Card numbers are redacted as the chokepoint redacts them in the fields
         # of a caller (owner ruling 1dedc18a): live code refused a batch holding
@@ -140,7 +209,6 @@ def _keyed_unit(unit, siblings: _SiblingMasks | None):
             relationships=_redacted_like(unit.relationships),
             caveats=_redacted_like(unit.caveats),
         )
-    held = siblings.secrets_in(unit) if siblings is not None else {}
     mask = None
     if held:
         secrets = sorted(held)
@@ -165,7 +233,7 @@ def _keyed_unit(unit, siblings: _SiblingMasks | None):
     # identity instead, which never overwrites another unit.
     return dataclasses.replace(
         unit,
-        concept=f"{rm.cap_masked(unit.concept, _MAX_CONCEPT - _KEY_SUFFIX, mask)} #{uuid.uuid4().hex[:8]}",
+        concept=f"{rm.cap_masked(unit.concept, _MAX_CONCEPT - _KEY_SUFFIX, mask)} #{uuid.uuid4().hex[:12]}",
         secrets=[],
     )
 
