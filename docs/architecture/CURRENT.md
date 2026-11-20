@@ -1986,8 +1986,12 @@ authority/authentication, per-message caller/profile binding, shared/local
 ancestry admission, nonblocking tool capacity and authenticated version/catalog
 status. The gated explicit `--shared-service` path constructs the actual
 standalone services with a bounded facade, frozen limits and outer resource
-owner. Ordinary session selection remains unchanged. Unit readiness, native
-clients and rollout remain separate. See `docs/reference/shared-mcp-http.md`. That scoped check
+owner. Its readiness helper sends a local `READY=1` datagram after completed
+bind, skipping a stopping startup; notification failure uses the existing
+listener/SDK/registry cleanup path. Both installers render four inert
+`Type=notify` templates without enabling them. Actual manager readiness, measured
+start/stop settings, native clients and rollout remain separate. Ordinary session
+selection remains unchanged. See `docs/reference/shared-mcp-http.md`. That scoped check
 (5a3de4eee, 2026-11-08) does not requalify the other channels/interfaces subsystems.
 
 The neural monitor includes the non-routing **Fallback** observation, and the
