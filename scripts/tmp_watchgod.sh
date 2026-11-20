@@ -296,22 +296,21 @@ attribution_paths() {
 }
 
 log_attribution() {
-    # $1 path, $2 device, $3 tier, $4 top-writers text. The writer list is
-    # computed by the caller (cheap); the du is backgrounded, niced and bounded,
-    # because du across a large tree inside the poll loop would stop the very
-    # measurements that matter while the disk fills.
-    local path="$1" dev="$2" tier="$3" writers="$4"
+    # $1 path, $2 device, $3 tier, $4 top-writers text, $5 deleted-holder list
+    # (handle_fs scans once per poll, after the relief actions, and shares it
+    # with the page). The writer list is computed by the caller (cheap); the du
+    # is backgrounded, niced and bounded, because du across a large tree inside
+    # the poll loop would stop the very measurements that matter while the disk
+    # fills.
+    local path="$1" dev="$2" tier="$3" writers="$4" held="${5:-}"
     log WARN "disk ${tier^^} [${path}] top writers by bytes written since the last poll (own uid only; blind to tmpfs):"
     if [[ -n "$writers" ]]; then
         while IFS= read -r line; do log WARN "  writer: $line"; done <<< "$writers"
     else
         log WARN "  writer: (none measurable)"
     fi
-    # Deleted-but-open files: the space du (below) cannot see. One filtered
-    # /proc walk, bounded by DG_RUNAWAY_SCAN_TIMEOUT_S; synchronous, so the
-    # holders are named while they still exist.
-    local held line
-    held="$(wg_deleted_holders "$dev" "$path")" || held=""
+    # Deleted-but-open files: the space du (below) cannot see.
+    local line
     if [[ -n "$held" ]]; then
         while IFS= read -r line; do log WARN "  $line"; done <<< "$held"
     fi
@@ -676,11 +675,9 @@ _WG_WRITERS_LABEL="Top writers among this user's processes this poll (block-devi
 _WG_WRITERS_TMPFS="Writer attribution unavailable: tmpfs writes are not counted per process. The watchgod log lists what is using the space (du)."
 
 _wg_held_block() {
-    # $1 domain key $2 path. The deleted-but-open block for a page, led by a
-    # blank line, or nothing. Computed only when a page is about to be sent.
-    local held
-    held="$(wg_deleted_holders "$1" "$2")" || held=""
-    [[ -n "$held" ]] && printf '\n\n%s' "$held"
+    # $1 the deleted-holder list handle_fs read this poll. The block for a page,
+    # led by a blank line, or nothing.
+    [[ -n "$1" ]] && printf '\n\n%s' "$1"
     return 0
 }
 
@@ -722,26 +719,19 @@ handle_fs() {
 
     local summary="${path}: ${free} MB free of ${total} MB (${fstype}); time to full: ${eta} min"
 
+    # Relief first, attribution second: the deleted-file scan below can take
+    # up to DG_RUNAWAY_SCAN_TIMEOUT_S, and the reserve release and pressure
+    # units must not wait on it while the disk fills (review finding).
+    local first=0
     if ! episode_seen "$dev" yellow; then
         episode_mark "$dev" yellow
-        log_attribution "$path" "$dev" "$tier" "$writers"
+        first=1
     fi
 
     if [[ "$tier" == orange || "$tier" == red ]]; then
         _WG_LEVER_START=""; _WG_LEVER_SWEEP=""
         (( is_home )) && start_pressure_unit standard
         (( is_cc )) && maybe_sweep_cc_tmp pressure
-        if [[ "$tier" == orange ]] && ! episode_seen "$dev" "orange$pg"; then
-            lever="none on this filesystem"
-            if [[ -n "$_WG_LEVER_START" && -n "$_WG_LEVER_SWEEP" ]]; then
-                lever="${_WG_LEVER_START}; ${_WG_LEVER_SWEEP}"
-            elif [[ -n "${_WG_LEVER_START}${_WG_LEVER_SWEEP}" ]]; then
-                lever="${_WG_LEVER_START}${_WG_LEVER_SWEEP}"
-            fi
-            body="${summary}. Reclaim: ${lever}. ${writers_block}$(_wg_held_block "$dev" "$path")"
-            _wg_page warning "Disk filling: ${path} ORANGE" "$body" "watchgod:disk:${dev}:orange" "WARNING — ${summary}" \
-                && episode_mark "$dev" "orange$pg"
-        fi
     fi
 
     if [[ "$tier" == red ]]; then
@@ -761,11 +751,33 @@ handle_fs() {
                 rel="cc-tmp reserve $(cc_reserve_release)" || true
             fi
         fi
-        if ! episode_seen "$dev" "red$pg"; then
-            body="${summary}. Reserve: ${rel}."$'\n'"${writers_block}$(_wg_held_block "$dev" "$path")"
-            _wg_page emergency "Disk nearly full: ${path} RED" "$body" "watchgod:disk:${dev}:red" "EMERGENCY — ${summary}" \
-                && episode_mark "$dev" "red$pg"
+    fi
+
+    # One deleted-file scan per poll, and only when its list is about to be
+    # used: the first-episode log, or a page not yet delivered.
+    local page_orange=0 page_red=0 held=""
+    [[ "$tier" == orange ]] && ! episode_seen "$dev" "orange$pg" && page_orange=1
+    [[ "$tier" == red ]] && ! episode_seen "$dev" "red$pg" && page_red=1
+    if (( first || page_orange || page_red )); then
+        held="$(wg_deleted_holders "$dev" "$path")" || held=""
+    fi
+    (( first )) && log_attribution "$path" "$dev" "$tier" "$writers" "$held"
+
+    if (( page_orange )); then
+        lever="none on this filesystem"
+        if [[ -n "$_WG_LEVER_START" && -n "$_WG_LEVER_SWEEP" ]]; then
+            lever="${_WG_LEVER_START}; ${_WG_LEVER_SWEEP}"
+        elif [[ -n "${_WG_LEVER_START}${_WG_LEVER_SWEEP}" ]]; then
+            lever="${_WG_LEVER_START}${_WG_LEVER_SWEEP}"
         fi
+        body="${summary}. Reclaim: ${lever}. ${writers_block}$(_wg_held_block "$held")"
+        _wg_page warning "Disk filling: ${path} ORANGE" "$body" "watchgod:disk:${dev}:orange" "WARNING — ${summary}" \
+            && episode_mark "$dev" "orange$pg"
+    fi
+    if (( page_red )); then
+        body="${summary}. Reserve: ${rel}."$'\n'"${writers_block}$(_wg_held_block "$held")"
+        _wg_page emergency "Disk nearly full: ${path} RED" "$body" "watchgod:disk:${dev}:red" "EMERGENCY — ${summary}" \
+            && episode_mark "$dev" "red$pg"
     fi
     return 0
 }

@@ -343,6 +343,48 @@ def test_a_file_held_twice_is_counted_once(box, deleted_holder):
     assert ": 5 MB in 2 file(s), invisible to du" in page["body"], page["body"]
 
 
+def test_a_read_only_holder_is_named(box):
+    """A deleted file held only for READING still occupies its space; the page
+    names that holder instead of printing '?' for it."""
+    d = box["home"] / ".genesis" / "cc-tmp"
+    d.mkdir(parents=True, exist_ok=True)
+    code = (
+        "import os, time\n"
+        f"p = os.path.join({str(d)!r}, 'etilqs_ro')\n"
+        "w = open(p, 'wb'); w.write(os.urandom(3 * 1024 * 1024)); w.flush(); os.fsync(w.fileno()); w.close()\n"
+        "f = open(p, 'rb'); os.unlink(p); print('ready', flush=True); time.sleep(60)\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-I", "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "ready"
+        comm = Path(f"/proc/{proc.pid}/comm").read_text().strip()
+        _handle(box, "red")
+    finally:
+        proc.kill()
+        proc.wait()
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    assert f"pid {proc.pid} {comm} (parent " in page["body"], page["body"]
+
+
+def test_red_relieves_before_it_scans_and_scans_once(box):
+    """The deleted-file scan can take seconds on a busy /proc. On a first RED
+    poll the reserve release and the pressure units run before it, and the
+    attribution log and the page share one scan."""
+    trace = box["tmp"] / "order"
+    _run(
+        box,
+        f"wg_deleted_holders() {{ echo scan >> '{trace}'; echo '  held-list-marker'; }}\n"
+        f"reserve_release() {{ echo release >> '{trace}'; echo released; }}\n"
+        f"start_pressure_unit() {{ echo \"pressure $1\" >> '{trace}'; }}\n"
+        f"ALL_WRITERS=''; handle_fs '{box['home']}' '{_home_dev(box)}' red 1000 100000 - '' btrfs",
+    )
+    order = trace.read_text().split("\n")[:-1]
+    assert order == ["pressure standard", "release", "pressure last-resort", "scan"], order
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    assert "held-list-marker" in page["body"], page["body"]
+    assert "held-list-marker" in _log(box), _log(box)
+
+
 def _clears(box) -> list[dict]:
     return [p for p in _pages(box) if ":clear-" in p["dedupe_key"]]
 

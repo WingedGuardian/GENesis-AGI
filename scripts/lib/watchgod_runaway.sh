@@ -333,12 +333,14 @@ wg_deleted_holders() {
     # that still leads to the deleted file), never the runaway scan's cache from
     # an earlier poll: a holder may have exec'd or renamed itself since (review
     # finding). Without python3, or if the read fails, _rw_holders reads /proc
-    # directly, which is current too.
+    # directly, which is current too. "openers", not "holders": a reader keeps a
+    # deleted file's space too, and the runaway scan's writer filter would leave
+    # it out of the strict map and print it as "?" (review finding).
     local -A fresh_ident=()
     local strict=0
     if [[ -n "$cand" ]] && command -v python3 >/dev/null 2>&1; then
         local idout fk fp fst fstate fcomm fppid fpcomm
-        if idout="$(timeout -k 2 "$DG_RUNAWAY_SCAN_TIMEOUT_S" python3 -I -S "$_RW_PROC_PY" "$proc" holders \
+        if idout="$(timeout -k 2 "$DG_RUNAWAY_SCAN_TIMEOUT_S" python3 -I -S "$_RW_PROC_PY" "$proc" openers \
                         <<< "$cand" 2>/dev/null)"; then
             while IFS=$'\t' read -r fk fp fst fstate fcomm fppid fpcomm; do
                 [[ -n "$fk" && "$fp" =~ ^[0-9]+$ ]] || continue
