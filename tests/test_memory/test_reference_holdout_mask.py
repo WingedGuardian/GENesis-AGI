@@ -2291,6 +2291,51 @@ async def test_two_secrets_of_one_credential_keep_two_sibling_rows(batch, db):
     assert len({r[0] for r in rows}) == 2 and all("fake" not in r[0] and "old77" not in r[0] for r in rows)
 
 
+@pytest.mark.parametrize(
+    ("body", "first", "second"),
+    [
+        # Devin 4637434261: the same two secrets in swapped positions.
+        ("Old password: Aa1!old7, new password: Bb2!new8", "Rotate from Aa1!old7 to Bb2!new8", "Rotate from Bb2!new8 to Aa1!old7"),
+        # One secret a prefix of the other.
+        ("Old password: Pp4!fake, new password: Pp4!fakeX", "Reset to Pp4!fake", "Reset to Pp4!fakeX"),
+        # Secrets differing only in case, each spelled as held.
+        ("Old password: Cc5!Fake, new password: cC5!fAKE", "Reset to Cc5!Fake", "Reset to cC5!fAKE"),
+        # Two secrets each written percent-encoded in a token of one length.
+        ("Old password: Hunter2Zq!, new password: Zebra77Qq!", "Set p=Hunter2Zq%21", "Set p=Zebra77Qq%21"),
+    ],
+)
+async def test_concepts_naming_held_secrets_differently_stay_two_rows(batch, db, body, first, second):
+    secrets = [w.rstrip(",") for w in body.split() if "!" in w]
+    await batch([_plain("one", concept=first, secrets=secrets), _plain("two", concept=second, secrets=secrets), _cred(body)])
+    rows = await db.execute_fetchall("SELECT concept, body FROM knowledge_units WHERE domain = 'reference.fact'")
+    assert sorted(r[1] for r in rows) == ["one", "two"]
+    assert all("!" not in r[0] for r in rows)
+
+
+async def test_secrets_named_only_encoded_are_placed_by_their_decoded_spelling(batch, db):
+    """The distiller names the encoded spellings, the credential holds the
+    literal ones: each is still placed, so the two concepts keep two keys."""
+    await batch([
+        _plain("one", concept="Set p=Hunter2Zq%21", secrets=["Hunter2Zq%21"]),
+        _plain("two", concept="Set p=Zebra77Qq%21", secrets=["Zebra77Qq%21"]),
+        _cred("Old password: Hunter2Zq!, new password: Zebra77Qq!"),
+    ])
+    rows = await db.execute_fetchall("SELECT concept, body FROM knowledge_units WHERE domain = 'reference.fact'")
+    assert sorted(r[1] for r in rows) == ["one", "two"]
+
+
+async def test_concepts_differing_only_by_card_numbers_stay_two_rows(batch, db):
+    """Devin 4637434411: card redaction makes the two concepts one text."""
+    await batch([
+        _plain("visa steps", concept="Account 4111 1111 1111 1111"),
+        _plain("mastercard steps", concept="Account 5555 5555 5555 4444"),
+        _cred("Visa card 4111 1111 1111 1111"),
+    ])
+    rows = await db.execute_fetchall("SELECT concept, body FROM knowledge_units WHERE domain = 'reference.fact'")
+    assert sorted(r[1] for r in rows) == ["mastercard steps", "visa steps"]
+    assert all("4111" not in r[0] and "5555" not in r[0] for r in rows)
+
+
 async def test_two_concepts_sharing_the_cap_prefix_stay_two_rows_alone_or_together(batch, db):
     """CodeRabbit 4633597946: a concept over the cap keeps a key of its own whole
     text, the same alone as beside any neighbour."""

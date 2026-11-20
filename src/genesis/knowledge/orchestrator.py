@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import typing
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -61,27 +62,38 @@ class _SiblingMasks:
             forms = [primary, *sorted({_normalise(f) for f in _decoded(raw)} - {primary})]
             self.held.append((key, raw, forms))
 
-    def secrets_in(self, unit) -> dict[str, tuple[list[str], list[str]]]:
-        """The secrets ``unit`` uses that the batch holds: each with where it is
-        held (``<credential key>@<offset in its text>``, no secret in it) and
-        the credential texts that hold it, over which a match grows, so a
-        secret named only in part is masked whole."""
+    def secrets_in(self, unit) -> dict[str, list[tuple[str, str]]]:
+        """The secrets ``unit`` uses that the batch holds: each with the
+        (credential key, credential text) of every credential unit holding it.
+        A match grows over those texts, so a secret named only in part is
+        masked whole."""
         from genesis.memory.reference_extraction import captured_secrets
         from genesis.memory.reference_masks import _decoded, _normalise
 
         texts = list(_strings([unit.concept, unit.body, unit.section_title, unit.tags, unit.relationships, unit.caveats]))
-        found: dict[str, tuple[list[str], list[str]]] = {}
+        found: dict[str, list[tuple[str, str]]] = {}
         for secret in dict.fromkeys(s.strip() for s in [*sorted(captured_secrets(texts)), *unit.secrets]):
             wanted = [f for f in sorted({_normalise(d) for d in _decoded(secret)}) if f.strip()]
-            refs, holders = [], []
-            for key, raw, forms in self.held:
-                at = next((form.find(w) for form in forms for w in wanted if w in form), -1)
-                if at >= 0:
-                    refs.append(f"{key}@{at}")
-                    holders.append(raw)
-            if refs:
-                found[secret] = (refs, holders)
+            holders = [(key, raw) for key, raw, forms in self.held if any(w in form for form in forms for w in wanted)]
+            if holders:
+                found[secret] = holders
         return found
+
+    def place(self, raw: str, secret: str) -> str:
+        """Where ``secret`` sits in a credential text, as ``<offset>:<length>``
+        of the spelling found: its exact one, else its first decoded and
+        normalised spelling in any decoded form of the text."""
+        from genesis.memory.reference_masks import _decoded, _normalise
+
+        at = raw.find(secret)
+        if at >= 0:
+            return f"{at}:{len(secret)}"
+        forms = [_normalise(f) for f in sorted(_decoded(raw))]
+        for want in sorted({_normalise(d) for d in _decoded(secret)}):
+            for form in forms:
+                if want.strip() and want in form:
+                    return f"{form.find(want)}:{len(want)}"
+        return "-1:0"
 
 
 def _strings(value):
@@ -108,6 +120,7 @@ def _keyed_unit(unit, siblings: _SiblingMasks | None):
     keeps its row across uploads (#4843 review)."""
     from genesis.memory import reference_masks as rm
 
+    original = unit.concept
     if siblings is not None:
         # Card numbers are redacted as the chokepoint redacts them in the fields
         # of a caller (owner ruling 1dedc18a): live code refused a batch holding
@@ -128,7 +141,7 @@ def _keyed_unit(unit, siblings: _SiblingMasks | None):
     mask = None
     if held:
         secrets = sorted(held)
-        runs = list(dict.fromkeys(raw for _, holders in held.values() for raw in holders))
+        runs = list(dict.fromkeys(raw for holders in held.values() for _, raw in holders))
         mask = rm.ValueMask(secrets[0], probes=rm.secret_probes(secrets), exempt=frozenset(), secrets=secrets + runs)
         unit = dataclasses.replace(
             unit,
@@ -139,16 +152,33 @@ def _keyed_unit(unit, siblings: _SiblingMasks | None):
             section_title=mask.mask(unit.section_title) if unit.section_title else unit.section_title,
         )
     concept = mask.mask(unit.concept) if mask is not None else unit.concept
-    if concept == unit.concept and len(concept) <= _MAX_CONCEPT:
+    if concept == original and len(concept) <= _MAX_CONCEPT:
         return dataclasses.replace(unit, secrets=[])
-    named = [
-        ref
-        for secret, (refs, _) in held.items()
-        if rm.ValueMask(secret, probes=rm.secret_probes([secret]), exempt=frozenset()).carries(unit.concept)
-        for ref in refs
-    ]
+    # Each held span of the concept, in order of position, with where the
+    # secret it masks is held (credential key, offset and length of its spelling
+    # there): two
+    # concepts that differ only by which secret stands where, or by one secret
+    # that is a prefix of another, keep two keys (two spellings of one secret,
+    # in case or width, are the same secret). The length and offset are not the
+    # secret; reading them needs the index and the credential's stored id.
+    spans = []
+    for secret, holders in held.items():
+        found = rm.ValueMask(
+            secret, probes=rm.secret_probes([secret]), exempt=frozenset(), secrets=[secret, *(r for _, r in holders)],
+        ).mask_spans(unit.concept)
+        for start, stop in found:
+            text = unit.concept[start:stop]
+            # Its exact spelling when the credential holds it (two spellings of
+            # different secrets stay apart), else the secret it masks.
+            where = ",".join(sorted(f"{k}@{siblings.place(r, text if text in r else secret)}" for k, r in holders))
+            spans.append((start, start - stop, where))
+    named = [where for _, _, where in sorted(spans)]
+    # A card is never held, so nothing identifies it without an oracle: a
+    # concept that card redaction changed takes a fresh identity (a re-ingest
+    # adds a row, it never overwrites another).
+    fresh = uuid.uuid4().hex if unit.concept != original else ""
     digest = hashlib.sha256(
-        b"genesis/knowledge-concept\0" + concept.encode() + b"\0" + ",".join(sorted(named)).encode()
+        b"genesis/knowledge-concept\0" + concept.encode() + b"\0" + "|".join(named).encode() + b"\0" + fresh.encode()
     ).hexdigest()[:8]
     return dataclasses.replace(
         unit, concept=f"{rm.cap_masked(concept, _MAX_CONCEPT - _KEY_SUFFIX, mask)} #{digest}", secrets=[],
