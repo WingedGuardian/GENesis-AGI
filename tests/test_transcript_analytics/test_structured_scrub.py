@@ -214,3 +214,97 @@ def test_boundary_probe_runs_after_the_prose_pass_so_it_cannot_eat_a_label():
     text, failed = scrub.scrub_text(raw)
     assert not failed
     assert token not in text and "SECRETNEXTLINE9" not in text
+
+
+@pytest.mark.parametrize(
+    "raw, secret",
+    [
+        # A JSON string only the credential-flag arms change ('-u user:pass'),
+        # followed by a label whose value the base arms redact. Protecting that
+        # string hid the label's edge from the prose pass; the base arms decide
+        # protection now, so the string stays visible to them.
+        (' authorization"=-uSECRETUSER1:,"', "SECRETUSER1"),
+        (
+            ' authorization"=SECRETVAL22://u:\';--api-key is sudocookie"\\"{"command": "mysql  @h',
+            "SECRETVAL22",
+        ),
+    ],
+)
+def test_flag_arms_never_widen_what_is_protected_from_the_prose_pass(raw, secret):
+    text, failed = scrub.scrub_text(raw)
+    assert not failed
+    assert secret not in text
+
+
+def test_base_arms_decide_protection_and_full_arms_redact(monkeypatch):
+    # A span only the full arms change is NOT protected: the base arms decide,
+    # so the prose pass sees it raw and the full arms still redact it there.
+    seen = []
+    monkeypatch.setattr(scrub, "_scrub_base", lambda text: seen.append(text) or text)
+    monkeypatch.setattr(scrub, "_scrub", lambda text: text.replace("FLAGSECRET", "[REDACTED]"))
+    text, failed = scrub.scrub_text('pre "x FLAGSECRET" post')
+    assert not failed and text == 'pre "x [REDACTED]" post'
+    assert '"x FLAGSECRET"' in seen  # the protection decision ran on the base arms
+
+
+def _base_only(text):
+    """Main's adapter, in-tree: with both scrubbers the base arms, the adapter
+    runs the base pipeline once and adds no full-arm pass."""
+    return scrub._scrub_text(text, 0, [64], scrub._scrub_base, scrub._scrub_base)
+
+
+_TOKEN = "sk-" + "a" * 28
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # A full arm that consumed a protected marker made the boundary probe
+        # skip the value after it; the probe runs on the base arms' output now.
+        f'echo "{_TOKEN}" ok --password "{_TOKEN} session_cookie" = SECRETAFTER1',
+        f'{{"a":"{_TOKEN}"}} --token "{_TOKEN} authorization" = SECRETAFTER1',
+        f'; mysql --password "{_TOKEN} cookie" =SECRETAFTER1',
+        # The prose pass damaged a marker: main withholds, and a full arm that
+        # turned the damage into [REDACTED] made the text pass the check.
+        '--passwd is ["password: hunter token"]=SEC1Xmysql --user=al: '
+        '{"a":"password: hunter"}\\"echo -pass:""ghp_' + "B" * 36 + ' cookie"\nnext SECRETAFTER1',
+        # Every marker consumed: the whole text was withheld, not stored redacted.
+        'gh auth login --token "ghp_' + "A" * 36 + '"',
+        f"mysql --password \"{_TOKEN}\" -e 'select 1'",
+    ],
+)
+def test_full_arms_only_add_to_the_base_adapter_output(raw):
+    base, base_failed = _base_only(raw)
+    text, failed = scrub.scrub_text(raw)
+    if base_failed:  # main withholds it, so must the full adapter
+        assert failed and text is None
+        return
+    assert not failed
+    assert "SECRETAFTER1" not in text and _TOKEN not in text
+
+
+def test_full_arms_never_show_a_value_the_base_adapter_hides():
+    # Seeded differential: whatever the base-only adapter hides, the full one
+    # hides too, and it never withholds text the base-only one stored.
+    import random
+
+    rng = random.Random(4619)
+    words = [
+        "--password", "--token", "-u", "bob:", "password=", "Cookie=", " cookie\"",
+        " authorization\"=", '"', "'", '\\"', " ", "=", ":", "\n", "{", "}", ",",
+        '{"cmd": "', '"}', _TOKEN, "curl", "mysql", ";", "x",
+    ]  # fmt: skip
+    for _ in range(1500):
+        secrets, parts = [], []
+        for _ in range(rng.randint(2, 12)):
+            if rng.random() < 0.25:
+                secrets.append(f"PLANT{len(secrets)}Q{rng.randint(0, 999)}")
+                parts.append(secrets[-1])
+            else:
+                parts.append(rng.choice(words))
+        raw = "".join(parts)
+        base, _ = _base_only(raw)
+        text, _ = scrub.scrub_text(raw)
+        assert (base is None) == (text is None), raw
+        for secret in secrets:
+            assert not (secret not in (base or "") and secret in (text or "")), raw
