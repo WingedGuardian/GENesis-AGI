@@ -866,11 +866,11 @@ class Engine(Repo):
         self.require_update_lock()
         source = self._expected_source(expect)
         # No manifest: nothing to drop, and the manifest is not created.
-        if not self.store.exists():
+        data = self.store.load()
+        if data is None:
             raise Refusal(
                 f"{branch} is not a candidate: there is no deploy manifest ({self.store.path})."
             )
-        data = self.store.load()
         if not any(c["branch"] == branch for c in data["candidates"]):
             raise Refusal(f"{branch} is not a candidate in {self.store.path}.")
         pinned = None if candidate is None else (self.resolve(candidate) or candidate)
@@ -878,8 +878,18 @@ class Engine(Repo):
 
         def remove(d: dict | None) -> dict | None:
             if d is None:
+                if pinned is not None:  # the guarded drop moves only with its pin read
+                    raise Refusal(
+                        f"the deploy manifest is gone ({self.store.path}): {branch}'s pin "
+                        "cannot be checked; nothing changed."
+                    )
                 return None
             self._refuse_repin(branch, pinned, d)  # the manifest as it is written
+            if pinned is not None and d != data:  # `live` is planned from `data`
+                raise Refusal(
+                    f"the deploy manifest changed since the drop read it ({self.store.path}): "
+                    "`live` would not match it; nothing changed."
+                )
             keep = [c for c in d["candidates"] if c["branch"] != branch]
             return None if len(keep) == len(d["candidates"]) else {**d, "candidates": keep}
 
@@ -948,7 +958,7 @@ class Engine(Repo):
         except Refusal as exc:
             if not saved:
                 raise Refusal(
-                    f"{exc}\nThe manifest is unchanged: {branch} is still a candidate."
+                    f"{exc}\nThe manifest is unchanged: this drop wrote nothing and `live` did not move."
                 ) from exc
             raise Refusal(
                 f"{exc}\nThe manifest change WAS saved ({branch} is no longer a candidate), but `live` still "

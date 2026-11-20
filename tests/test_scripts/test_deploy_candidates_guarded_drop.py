@@ -255,6 +255,66 @@ def test_the_pin_is_checked_again_as_the_manifest_is_written(
     assert _calls(stub) == []
 
 
+def test_a_manifest_gone_before_the_write_is_refused_and_nothing_moves(
+    dc, dc_ready, stub, capsys, monkeypatch
+):
+    """CodeRabbit c4637258291: the write's read of a removed manifest gives
+    None; the guarded drop refuses there, before the checkout moves, rather
+    than report a drop it never saved."""
+    w = dc_ready
+    _two_live(w, dc)
+    real = dc.plan.move_checkout
+
+    def remove_then_move(repo, p, source, save):
+        w.manifest_path.unlink()
+        return real(repo, p, source, save)
+
+    monkeypatch.setattr(dc.plan, "move_checkout", remove_then_move)
+    live = w.rev("refs/heads/live")
+    capsys.readouterr()
+    assert w.run(dc, *_guarded(w, None, "--restart-server")) == 1
+    out, err = capsys.readouterr()
+    assert "the deploy manifest is gone" in err and "The manifest is unchanged" in err, err
+    assert "dropped from" not in out, out
+    assert w.rev("refs/heads/live") == live
+    assert _calls(stub) == []
+
+
+def test_another_candidate_changed_before_the_write_is_refused(
+    dc, dc_ready, stub, capsys, monkeypatch
+):
+    """Round-2 premise check: an edit that keeps the dropped pin but changes
+    another candidate would save a manifest `live` was not built from."""
+    w = dc_ready
+    _two_live(w, dc)
+    real = dc.plan.move_checkout
+
+    def edit_then_move(repo, p, source, save):
+        w.write_manifest([c for c in w.manifest()["candidates"] if c["branch"] != "feat/a"])
+        return real(repo, p, source, save)
+
+    monkeypatch.setattr(dc.plan, "move_checkout", edit_then_move)
+    live = w.rev("refs/heads/live")
+    capsys.readouterr()
+    assert w.run(dc, *_guarded(w, None, "--restart-server")) == 1
+    err = capsys.readouterr().err
+    assert "changed since the drop read it" in err and "The manifest is unchanged" in err, err
+    assert [c["branch"] for c in w.manifest()["candidates"]] == ["feat/b"]
+    assert w.rev("refs/heads/live") == live
+    assert _calls(stub) == []
+
+
+def test_the_header_names_a_restart_check_that_exists():
+    """CodeRabbit c4637258286: the engine view records no restart; the header
+    names the status command, which prints what the server runs."""
+    root = Path(__file__).resolve().parents[2]
+    header = (root / "scripts/deploy_candidates").read_text()
+    assert "nothing records whether\n# the restart was queued" in header
+    assert "scripts/deploy_code_only.sh status says whether the\n# server runs" in header
+    status = (root / "scripts/lib/deploy_status.sh").read_text()
+    assert 'echo "serving: ' in status and 'echo "head: ' in status
+
+
 @pytest.mark.parametrize("why", ["head", "dirty"])
 def test_an_expect_or_move_refusal_changes_nothing(dc, dc_ready, stub, capsys, why):
     w = dc_ready

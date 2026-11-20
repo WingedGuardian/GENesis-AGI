@@ -5548,8 +5548,11 @@ logger or unrelated exceptions with copied text and no provenance.
   --expect-head <tip> --expect-candidate <pinned head> [--restart-server]`, run
   with the entry's `--wait 0`, does everything in the entry's ONE update.lock
   hold. It refuses by name, nothing changed, when the manifest no longer pins
-  the branch at that head (a re-pin since; checked again as the manifest is
-  written), when the expect checks fail, or when a move refusal applies. After
+  the branch at that head (a re-pin since), when the manifest it writes is gone
+  or differs in any way from the one it planned `live` from (checked as it is
+  written, before the checkout moves; every engine writer of the manifest holds
+  update.lock, so only an out-of-band edit trips it), when the expect checks
+  fail, or when a move refusal applies. After
   the subtract-only drop it confirms from its own view (`observe()` and
   `observe_moves()`): the branch neither listed nor in `live`'s holds, the
   checkout on `live` at the move's result (`Move.at`), no move refusal; a
@@ -5572,7 +5575,9 @@ logger or unrelated exceptions with copied text and no provenance.
   header: 0, 1 (also the entry's refusal whose text carries "holds the deploy
   marker", a wait; "cannot write the deploy marker" is a fault), 2, 4, 97,
   130/143 (which can follow a finished drop and a queued restart: bash runs the
-  trap after python returns), 200. Without `--expect-candidate`, `drop` is unchanged; `--restart-server`
+  trap after python returns; the engine view then says whether the drop
+  happened, nothing records the restart, and `scripts/deploy_code_only.sh
+  status` says what the server runs), 200. Without `--expect-candidate`, `drop` is unchanged; `--restart-server`
   alone is a usage error. The Guardian reads the engine's view through `list
   --json --move-refusals` (adds `checkout: {branch_ref, head}` and
   `move_refusals`). Manifest order is pin order: re-adding a candidate at a new
