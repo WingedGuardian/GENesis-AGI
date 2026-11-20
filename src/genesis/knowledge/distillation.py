@@ -62,6 +62,11 @@ Output a JSON array of objects with these fields:
 - caveats: JSON array of limitations or qualifications
 - tags: JSON array of topical tags
 - confidence: Float 0.0-1.0 — how well-structured and clear the source was
+- secrets: JSON array of the exact secret strings the unit states (passwords,
+  passphrases, PINs, API keys, tokens, card numbers and security codes), each
+  copied exactly and whole as written; never
+  a username, email address, host, network name, or product or model name.
+  An empty array when it states none.
 
 Rules:
 - Extract UNDERSTANDING, not quotes. Paraphrase and synthesize.
@@ -103,6 +108,10 @@ class KnowledgeUnit:
     confidence: float = 0.85
     section_title: str | None = None
     source_date: str | None = None
+    #: The secret strings (passwords, keys, tokens, PINs) the model names in this
+    #: unit. Never stored: the orchestrator masks them in this unit when a
+    #: credential unit of its batch holds them (#2426).
+    secrets: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -329,6 +338,8 @@ class DistillationPipeline:
                         relationships=_normalize_str_list(raw.get("relationships")),
                         caveats=caveats,
                         tags=_normalize_tags(raw.get("tags")),
+                        # Comma-split like tags: a model can join the list into one string.
+                        secrets=_normalize_tags(raw.get("secrets")),
                         confidence=confidence,
                         section_title=f"Section {i + 1}" if len(chunks) > 1 else None,
                         source_date=content.metadata.get("source_date")

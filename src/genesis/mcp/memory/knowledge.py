@@ -556,7 +556,7 @@ async def reference_store(
     ``value`` is the raw value (password, URL string, IP address, file path,
     etc.). Stored plaintext (a credential's value and description are held
     outside the search index: it is found by its identifier and tags, where
-    any span of the value is masked), so an entry holding a payment card
+    its value is masked), so an entry holding a payment card
     number in any field is refused (card vault: #3172).
 
     ``description`` is REQUIRED. An IP without "what is this" or a credential

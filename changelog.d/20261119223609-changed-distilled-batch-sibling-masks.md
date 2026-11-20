@@ -1,0 +1,1 @@
+- A distilled document's knowledge units are masked contextually beside the credential they mention: a unit keeps its own words and shows a placeholder only where it uses that credential's secret, and the credential itself stays revealable. Long auto-captured account names keep one entry each.

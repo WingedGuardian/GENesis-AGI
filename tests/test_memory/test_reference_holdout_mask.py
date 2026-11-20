@@ -15,6 +15,7 @@ Fake credentials, example.org hosts and TEST-NET addresses only.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 from types import SimpleNamespace
@@ -1109,7 +1110,9 @@ async def test_a_distilled_concept_straddling_the_old_cut_is_masked_whole(
     db, memory_mcp, tmp_path, monkeypatch
 ):
     """P1 (the same class in distillation): a credential unit's concept reaches
-    the chokepoint whole; any other unit's is still capped at 200."""
+    the chokepoint whole; any other unit's is still capped at 200, and one cut
+    to fit ends in a key from its whole text (#4843 review: two concepts that
+    share the first 200 characters are two rows)."""
     import contextlib
 
     from genesis.knowledge.distillation import DistillationPipeline
@@ -1157,7 +1160,8 @@ async def test_a_distilled_concept_straddling_the_old_cut_is_masked_whole(
     for text in await _indexed_texts(db, memory_mcp):
         assert secret[:8] not in text, text
     concepts = {r[0] for r in await db.execute_fetchall("SELECT concept FROM knowledge_units")}
-    assert "y" * 200 in concepts
+    (cut,) = [c for c in concepts if c.startswith("y")]
+    assert re.fullmatch("y" * 186 + r" #[0-9a-f]{12}", cut)
 
 
 # ─── audit of the round-1 fix (B1, B2, SF3, the serialised-tag cost) ─────────
@@ -2131,3 +2135,607 @@ async def test_the_candidates_note_names_only_opaque_keys(db):
     held = (await kc.get(db, b))["body"]
     again = await _ingest(db, store, held, concept="Visa 5555 5555 5555 4444 PIN")
     assert all(re.fullmatch(r"cred-[0-9a-f]{12}", k) for k in again.candidates)
+
+
+# ─── a distilled batch masks its credential units' secrets in its other units ─
+#
+# Live code refused any batch holding a credential unit; the chokepoint (#4769)
+# stores the batch instead, so its ordinary units must not carry the secrets
+# (#4843 review, owner rulings 2026-11-19: the distiller names each credential
+# unit's secrets; a username is never masked).
+
+
+def _cred(body, *, concept="lab wifi", secrets=()):
+    from genesis.knowledge.distillation import KnowledgeUnit
+
+    return KnowledgeUnit(concept=concept, body=body, domain="reference.credentials", secrets=list(secrets))
+
+
+def _plain(body, *, concept="lab notes", **fields):
+    from genesis.knowledge.distillation import KnowledgeUnit
+
+    return KnowledgeUnit(concept=concept, body=body, domain="reference.fact", **fields)
+
+
+@pytest.fixture
+def batch(db, memory_mcp, tmp_path, monkeypatch):
+    """Store units as one distilled batch; returns the stored ordinary rows."""
+    import contextlib
+
+    from genesis.knowledge.manifest import ManifestManager
+    from genesis.knowledge.orchestrator import KnowledgeOrchestrator
+
+    @contextlib.asynccontextmanager
+    async def _own(_path):
+        yield db
+
+    monkeypatch.setattr("genesis.db.connection.get_raw_db", _own)
+    monkeypatch.setattr("genesis.mcp.memory_mcp.knowledge", kc)
+    orch = KnowledgeOrchestrator(
+        registry=MagicMock(), distillation=MagicMock(), manifest=ManifestManager(root=tmp_path / "knowledge"),
+    )
+
+    async def run(units, *, source="notes.md"):
+        await db.commit()  # the batch opens its own BEGIN on the connection it is given
+        ids = await orch._store_units(units, project_type="reference", source=source, content=MagicMock(), purpose=None)
+        rows = [await kc.get(db, i) for i in ids]
+        return [r for r in rows if r["domain"] != "reference.credentials"]
+
+    run.orch = orch
+    return run
+
+
+def _indexed(row, store) -> str:
+    """Every indexed text of an ordinary row, and every vector write's content and tags."""
+    fields = [row[k] or "" for k in ("concept", "body", "tags", "relationships", "caveats", "section_title")]
+    return "\n".join(fields + [json.dumps(c, default=str) for c in store.calls])
+
+
+async def test_a_sibling_repeating_a_labelled_password_is_masked_everywhere(batch, memory_mcp):
+    secret = "Pq8!fakeLab1"
+    plain = _plain(
+        f"Reset the router, then type password: {secret} again",
+        concept=f"router reset {secret}",
+        tags=["lab", secret],
+        relationships=[f"see {secret}"],
+        caveats=[f"rotate {secret}"],
+        section_title=f"Section {secret}",
+    )
+    (row,) = await batch([plain, _cred(f"Lab router admin, password: {secret}")])
+    assert row["body"] == "Reset the router, then type password: [held] again"
+    assert secret not in _indexed(row, memory_mcp)
+
+
+async def test_a_verbatim_copy_masks_its_secret_and_keeps_the_rest(batch, memory_mcp):
+    """CodeRabbit 4633597962, under the owner's contextual ruling: a copy of a
+    credential is masked where it states the secret, found on the original
+    text; its other words and the username stay."""
+    body = "Router login: jdoe77 / Rr5!fake71x then hold the latch"
+    (row,) = await batch([_plain(f"Copy: {body}", secrets=["Rr5!fake71x"]), _cred(body)])
+    assert row["body"] == "Copy: Router login: jdoe77 / [held] then hold the latch"
+    assert "Rr5!fake71x" not in _indexed(row, memory_mcp)
+
+
+async def test_a_sibling_keeps_the_ordinary_words_of_the_credential_text(batch):
+    cred = _cred("Office router RT-AX88U on 5GHz WPA2-PSK, password: Zq7!fake9a")
+    plain = _plain("Our office uses WPA2-PSK on 5GHz with an RT-AX88U; rotate Zq7!fake9a monthly", secrets=["Zq7!fake9a"])
+    (row,) = await batch([plain, cred])
+    assert row["body"] == "Our office uses WPA2-PSK on 5GHz with an RT-AX88U; rotate [held] monthly"
+
+
+async def test_a_password_the_distiller_names_is_masked_without_a_label(batch, memory_mcp):
+    """The capture rules do not read "uses password X" (no colon); the
+    distiller's own list of the unit's secrets does (owner ruling 2026-11-19)."""
+    cred = _cred("The wifi homenet uses password Mm3fake7Qx on the lab router")
+    (row,) = await batch([_plain("Set the lab router to Mm3fake7Qx first", secrets=["Mm3fake7Qx"]), cred])
+    assert row["body"] == "Set the lab router to [held] first"
+    assert "Mm3fake7Qx" not in _indexed(row, memory_mcp)
+
+
+async def test_a_credential_secret_is_masked_only_where_a_sibling_uses_it_as_one(batch):
+    """Contextual masking (owner ruling 2026-11-19): a credential's password
+    that a sibling mentions without using it as a secret stays; one it names
+    as a secret is masked. One device's username can be another's password."""
+    router = _cred("Router login: admin / Rr5!fake71x", concept="router")
+    nas = _cred("NAS password: admin", concept="nas")
+    rows = await batch([
+        _plain("Log in to the router as admin", concept="router notes"),
+        _plain("The NAS password is admin", concept="nas notes", secrets=["admin"]),
+        router, nas,
+    ])
+    assert sorted(r["body"] for r in rows) == ["Log in to the router as admin", "The NAS password is [held]"]
+
+
+async def test_a_secret_nothing_in_the_batch_holds_is_left_as_it_is(batch):
+    """Masking a secret no credential unit holds would drop it (owner rule
+    6f73fe4d): it stays (#4916 tracks holding it)."""
+    cred = _cred("Router login: jdoe77 / Rr5!fake71x")
+    (row,) = await batch([_plain("jdoe77 uses Kk2!fake99 on the switch", secrets=["Kk2!fake99"]), cred])
+    assert row["body"] == "jdoe77 uses Kk2!fake99 on the switch"
+
+
+async def test_a_password_holding_the_username_is_masked_whole(batch):
+    """Owner ruling 2026-11-19: a username stays only as its own word."""
+    cred = _cred("Login: jdoe77 / jdoe77!2024x")
+    (row,) = await batch([_plain("Sign in as jdoe77, then type jdoe77!2024x", secrets=["jdoe77!2024x"]), cred])
+    assert row["body"] == "Sign in as jdoe77, then type [held]"
+
+
+async def test_concepts_differing_only_by_secrets_of_two_credentials_stay_two_rows(batch, db):
+    """CodeRabbit 4633597935: two uploads never share a masked concept's key.
+    A masked concept takes a fresh identity (owner ruling 2026-11-20), so a
+    changed document's re-ingest adds a row beside the old one, never
+    overwriting another."""
+
+    def pair(body, secret, cred_concept):
+        return [_plain(body, concept=f"wifi {secret}", secrets=[secret]), _cred(f"password: {secret}", concept=cred_concept)]
+
+    one = await batch(pair("first", "Aa1!fakeOne", "wifi one"))
+    two = await batch(pair("second", "Bb2!fakeTwo", "wifi two"), source="b.md")
+    assert one[0]["concept"] != two[0]["concept"]
+    assert one[0]["concept"].startswith("wifi [held] #") and "fake" not in one[0]["concept"]
+    again = await batch(pair("first, updated", "Aa1!fakeOne", "wifi one"))
+    assert again[0]["concept"] not in {one[0]["concept"], two[0]["concept"]}
+    rows = await db.execute_fetchall("SELECT body FROM knowledge_units WHERE domain = 'reference.fact'")
+    assert sorted(r[0] for r in rows) == ["first", "first, updated", "second"]
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        # CodeRabbit 4638485418: a percent-escaped token is masked whole,
+        # prefix included.
+        ("Set p=Hh3!fake%21", "Set q=Hh3!fake%21"),
+        # A literal mask in the text on either side of the secret.
+        ("a [held] Hh3!fake!", "a Hh3!fake! [held]"),
+        # A case variant of the held secret.
+        ("key HH3!FAKE!", "key hh3!FAKE!"),
+    ],
+)
+async def test_concepts_masked_alike_from_different_originals_stay_two_rows(batch, db, first, second):
+    """Round 2 of #4924: two different concepts that masking makes one text
+    keep two rows; none overwrites the other."""
+    cred = _cred("password: Hh3!fake!")
+    await batch([
+        _plain("one", concept=first, secrets=["Hh3!fake!"]),
+        _plain("two", concept=second, secrets=["Hh3!fake!"]),
+        cred,
+    ])
+    rows = await db.execute_fetchall("SELECT concept, body FROM knowledge_units WHERE domain = 'reference.fact'")
+    assert sorted(r[1] for r in rows) == ["one", "two"]
+    assert len({r[0] for r in rows}) == 2 and all("fake" not in r[0].lower() for r in rows)
+
+
+async def test_a_secret_in_the_domain_or_source_date_is_masked(batch, memory_mcp):
+    """CodeRabbit 4638485412: every model-written field that is stored is
+    masked: the domain (the vector's source and tags, the DB key, FTS) and the
+    source date; a masked domain gives the concept a fresh identity."""
+    from genesis.knowledge.distillation import KnowledgeUnit
+
+    unit = KnowledgeUnit(
+        concept="Router notes", body="notes", domain="ops.Qq9!fake7", source_date="Qq9!fake7", secrets=["Qq9!fake7"],
+    )
+    (row,) = await batch([unit, _cred("password: Qq9!fake7")])
+    assert row["domain"] == "ops.[held]" and row["source_date"] == "[held]"
+    assert row["concept"].startswith("Router notes #")
+    assert "fake" not in _indexed(row, memory_mcp)
+
+
+
+async def test_a_secret_labelled_beside_a_card_is_found_before_the_card_is_redacted(batch, memory_mcp):
+    """CodeRabbit 4639471465: card redaction can take a password label with the
+    card, so held secrets are found in the unit as written. A plain-word
+    password pins the order (a secret-shaped one is masked wherever repeated)."""
+    unit = _plain(
+        "Card 4111 password: sunshine 1111 1111 1111 on file. Later type sunshine at the prompt", concept="Notes",
+    )
+    (row,) = await batch([unit, _cred("Front desk password: sunshine")])
+    assert "sunshine" not in _indexed(row, memory_mcp)
+
+
+async def test_a_name_that_is_part_of_a_held_passphrase_masks_the_whole_passphrase(batch, memory_mcp):
+    """CodeRabbit 4639471471: the sibling names only part of a multi-word value
+    a credential holds; the whole value is masked."""
+    unit = _plain("The wifi uses Amber Orchard as passphrase", concept="Wifi", secrets=["Amber"])
+    (row,) = await batch([unit, _cred("Wifi passphrase: Amber Orchard", secrets=["Amber Orchard"])])
+    assert "Orchard" not in _indexed(row, memory_mcp) and "Amber" not in row["body"]
+
+
+async def test_text_spanning_two_credential_fields_is_not_held(batch):
+    """CodeRabbit 4639471460: holding is decided inside one credential field, so
+    a phrase made by joining two fields masks nothing in a sibling."""
+    from genesis.knowledge.distillation import KnowledgeUnit
+
+    cred = KnowledgeUnit(concept="Gate code Amber", body="Orchard road gate; pin: 7731", domain="reference.credentials")
+    (row,) = await batch([_plain("We sell Amber Orchard apples", concept="Shop", secrets=["Amber Orchard"]), cred])
+    assert row["body"] == "We sell Amber Orchard apples"
+
+
+async def test_a_secret_shaped_held_value_is_masked_wherever_a_sibling_repeats_it(batch, memory_mcp):
+    """Owner ruling 2026-11-20: a held value shaped like a secret is masked in a
+    sibling that repeats it bare; a plain-word one stays where it is not used
+    as a secret."""
+    (row,) = await batch([_plain("Type Zq7!fake9pw at the prompt", concept="Login"), _cred("password: Zq7!fake9pw")])
+    assert "fake9pw" not in _indexed(row, memory_mcp)
+    (plain,) = await batch([_plain("Sunshine outside today", concept="Weather"), _cred("password: sunshine")], source="b.md")
+    assert plain["body"] == "Sunshine outside today"
+
+
+async def test_a_sibling_repeating_one_token_of_a_held_passphrase_masks_it(batch, memory_mcp):
+    """Security review, round 3: a secret-shaped token of a multi-word held
+    value, repeated alone, is masked."""
+    unit = _plain("Enter Horse9 at the gate", concept="Gate")
+    (row,) = await batch([unit, _cred("passphrase: Blue7 Horse9 Gate", secrets=["Blue7 Horse9 Gate"])])
+    assert "Horse9" not in _indexed(row, memory_mcp)
+
+
+async def test_a_username_the_distiller_lists_as_a_secret_stays(batch):
+    """Security review, round 3: a username stays visible in a sibling even when
+    a distiller lists it among the credential's or the sibling's secrets; one
+    that is also the password is masked (owner ruling 493f9f14)."""
+    cred = _cred("username: jdoe42 password: Zq7!fake9pw", secrets=["jdoe42", "Zq7!fake9pw"])
+    (row,) = await batch([_plain("Ask jdoe42 for help", concept="Help", secrets=["jdoe42"]), cred])
+    assert row["body"] == "Ask jdoe42 for help"
+    same = _cred("username: admin password: admin")
+    (both,) = await batch([_plain("username: admin; password: admin", concept="Box"), same], source="b.md")
+    assert "admin" not in both["body"]
+
+
+async def test_one_credentials_username_never_hides_another_credentials_password(batch, memory_mcp):
+    """CodeRabbit 4644696479: usernames and passwords are decided across the
+    batch, so a plain word that is one credential's username and another's
+    password is masked where a sibling uses it as a secret; one that is only a
+    username stays."""
+    a = _cred("username: sunshine password: Other7!x", concept="desk")
+    b = _cred("password: sunshine", concept="door")
+    (row,) = await batch([_plain("Type sunshine at the prompt", concept="Prompt", secrets=["sunshine"]), a, b])
+    assert "sunshine" not in _indexed(row, memory_mcp)
+    (only,) = await batch(
+        [_plain("Ask sunshine for help", concept="Help", secrets=["sunshine"]), a], source="b.md",
+    )
+    assert only["body"] == "Ask sunshine for help"
+
+
+async def test_a_named_credential_secret_no_field_holds_masks_nothing(batch):
+    """CodeRabbit 4644874187: a value the distiller names for a credential is
+    one of its values only when a credential field holds it."""
+    cred = _cred("password: Aa1!other", secrets=["Kk2!fake99"])
+    (row,) = await batch([_plain("code Kk2!fake99 here", concept="Code"), cred])
+    assert row["body"] == "code Kk2!fake99 here"
+
+
+async def test_a_username_inside_a_secret_shaped_password_stays_in_a_sibling(batch):
+    """CodeRabbit 4644874196: a secret-shaped password holding the username
+    masks the password, never the username alone."""
+    cred = _cred("username: jdoe42 password: jdoe42/Other9!")
+    (row,) = await batch([_plain("Log in as jdoe42, then type jdoe42/Other9!", concept="Login"), cred])
+    assert row["body"].startswith("Log in as jdoe42,") and "Other9" not in row["body"]
+
+
+@pytest.mark.parametrize("order", ["ab", "ba"])
+async def test_a_password_anywhere_in_the_batch_beats_a_username_anywhere(batch, memory_mcp, order):
+    """Round-4 premise check: one role map for the batch, the same in any
+    order. A distiller-named password of one credential that is another's
+    username is masked where a sibling uses it as a secret; a sibling that
+    labels the same word as a username keeps it (usernames stay)."""
+    a = _cred("username: Vv5!fake88 password: Aa1!other", concept="desk")
+    b = _cred("vault code below", concept="vault", secrets=["Vv5!fake88"])
+    b = dataclasses.replace(b, body="vault code Vv5!fake88")
+    creds = [a, b] if order == "ab" else [b, a]
+    (row,) = await batch([_plain("user Vv5!fake88 opens it", concept="Vault", secrets=["Vv5!fake88"]), *creds])
+    assert "fake88" not in _indexed(row, memory_mcp)
+    (lab,) = await batch(
+        [_plain("username: sunshine works", concept="Lab"), _cred("password: sunshine", concept="door")],
+        source="b.md",
+    )
+    assert lab["body"] == "username: sunshine works"
+
+
+async def test_a_bare_username_inside_a_secret_shaped_password_stays(batch):
+    """CodeRabbit 4644874196: with no part of the password in the sibling, its
+    username is never matched as a fragment of the password."""
+    (row,) = await batch([_plain("Log in as jdoe42", concept="Login"), _cred("username: jdoe42 password: jdoe42/Other9!")])
+    assert row["body"] == "Log in as jdoe42"
+
+
+@pytest.mark.parametrize("password", ["Sun5hine!", "jdoe42/Other9!"])
+async def test_a_word_a_sibling_labels_as_a_username_stays_in_every_mask(batch, password):
+    """Pre-PR review: discovery, the secret-shaped masks and the unit's mask
+    read one username set, so a username the sibling labels stays, whole or
+    as a fragment of a batch password, while the password itself is masked."""
+    user = password.split("/")[0]
+    body = f"username: {user}, then type {password}"
+    (row,) = await batch([_plain(body, concept="Portal"), _cred(f"password: {password}")])
+    assert row["body"].startswith(f"username: {user},")
+
+
+async def test_a_name_held_only_inside_a_longer_word_masks_nothing(batch):
+    """Pre-PR review: a credential holds a name only as a whole word, so
+    naming `sun` masks nothing when the batch holds `sunshine`."""
+    (row,) = await batch([_plain("The sun rises", concept="Sky", secrets=["sun"]), _cred("password: sunshine")])
+    assert row["body"] == "The sun rises"
+
+
+def test_a_large_credential_batch_is_masked_in_seconds():
+    """Pre-PR review: 400 credentials and 200 siblings mask in seconds (it was
+    about 50 s), with every repeated secret masked."""
+    import time
+
+    from genesis.knowledge.distillation import KnowledgeUnit
+    from genesis.knowledge.orchestrator import _keyed_unit, _SiblingMasks
+
+    creds = [_cred(f"site{i} password: Pw{i}x!fake{i:04d}") for i in range(400)]
+    units = [
+        KnowledgeUnit(concept="note", body=f"note {j} uses Pw{j}x!fake{j:04d} " * 20, domain="ops")
+        for j in range(200)
+    ]
+    started = time.monotonic()
+    siblings = _SiblingMasks(creds, [f"cred-{i:012x}" for i in range(400)])
+    out = [_keyed_unit(u, siblings) for u in units]
+    assert time.monotonic() - started < 30
+    assert not any("fake" in u.body for u in out)
+
+async def test_a_card_number_in_the_domain_is_redacted(batch):
+    """Round 2 of #4924: card redaction covers the domain and source date, as
+    it does the other fields, and a redacted domain gives a fresh identity."""
+    from genesis.knowledge.distillation import KnowledgeUnit
+
+    unit = KnowledgeUnit(concept="Billing", body="notes", domain="billing 4111 1111 1111 1111", source_date="4111 1111 1111 1111")
+    (row,) = await batch([unit, _cred("password: Qq9!fake7")])
+    assert "4111" not in row["domain"] and "4111" not in row["source_date"]
+    assert row["concept"].startswith("Billing #")
+
+
+async def test_two_secrets_of_one_credential_keep_two_sibling_rows(batch, db):
+    """Architect review: one credential holding two passwords, and two siblings
+    whose concepts differ only by them, keep two rows."""
+    cred = _cred("Old password: Bb8!old77x, new password: Zq7!fake9pw")
+    await batch([
+        _plain("one", concept="Rotation to Zq7!fake9pw", secrets=["Zq7!fake9pw"]),
+        _plain("two", concept="Rotation to Bb8!old77x", secrets=["Bb8!old77x"]),
+        cred,
+    ])
+    rows = await db.execute_fetchall("SELECT concept FROM knowledge_units WHERE domain = 'reference.fact'")
+    assert len({r[0] for r in rows}) == 2 and all("fake" not in r[0] and "old77" not in r[0] for r in rows)
+
+
+@pytest.mark.parametrize(
+    ("body", "first", "second"),
+    [
+        # Devin 4637434261: the same two secrets in swapped positions.
+        ("Old password: Aa1!old7, new password: Bb2!new8", "Rotate from Aa1!old7 to Bb2!new8", "Rotate from Bb2!new8 to Aa1!old7"),
+        # One secret a prefix of the other.
+        ("Old password: Pp4!fake, new password: Pp4!fakeX", "Reset to Pp4!fake", "Reset to Pp4!fakeX"),
+        # Secrets differing only in case, each spelled as held.
+        ("Old password: Cc5!Fake, new password: cC5!fAKE", "Reset to Cc5!Fake", "Reset to cC5!fAKE"),
+        # Two secrets each written percent-encoded in a token of one length.
+        ("Old password: Hunter2Zq!, new password: Zebra77Qq!", "Set p=Hunter2Zq%21", "Set p=Zebra77Qq%21"),
+    ],
+)
+async def test_concepts_naming_held_secrets_differently_stay_two_rows(batch, db, body, first, second):
+    secrets = [w.rstrip(",") for w in body.split() if "!" in w]
+    await batch([_plain("one", concept=first, secrets=secrets), _plain("two", concept=second, secrets=secrets), _cred(body)])
+    rows = await db.execute_fetchall("SELECT concept, body FROM knowledge_units WHERE domain = 'reference.fact'")
+    assert sorted(r[1] for r in rows) == ["one", "two"]
+    assert all("!" not in r[0] for r in rows)
+
+
+async def test_secrets_named_only_encoded_are_placed_by_their_decoded_spelling(batch, db):
+    """The distiller names the encoded spellings, the credential holds the
+    literal ones: each is still placed, so the two concepts keep two keys."""
+    await batch([
+        _plain("one", concept="Set p=Hunter2Zq%21", secrets=["Hunter2Zq%21"]),
+        _plain("two", concept="Set p=Zebra77Qq%21", secrets=["Zebra77Qq%21"]),
+        _cred("Old password: Hunter2Zq!, new password: Zebra77Qq!"),
+    ])
+    rows = await db.execute_fetchall("SELECT concept, body FROM knowledge_units WHERE domain = 'reference.fact'")
+    assert sorted(r[1] for r in rows) == ["one", "two"]
+
+
+async def test_concepts_differing_only_by_card_numbers_stay_two_rows(batch, db):
+    """Devin 4637434411: card redaction makes the two concepts one text."""
+    await batch([
+        _plain("visa steps", concept="Account 4111 1111 1111 1111"),
+        _plain("mastercard steps", concept="Account 5555 5555 5555 4444"),
+        _cred("Visa card 4111 1111 1111 1111"),
+    ])
+    rows = await db.execute_fetchall("SELECT concept, body FROM knowledge_units WHERE domain = 'reference.fact'")
+    assert sorted(r[1] for r in rows) == ["mastercard steps", "visa steps"]
+    assert all("4111" not in r[0] and "5555" not in r[0] for r in rows)
+
+
+async def test_two_concepts_sharing_the_cap_prefix_stay_two_rows_alone_or_together(batch, db):
+    """CodeRabbit 4633597946: two concepts over the cap that share its prefix
+    keep two rows, alone or beside each other; a cut concept takes a random key
+    (owner ruling 2026-11-20), so no stored key lets anyone check a guess at
+    the text cut off, and a later upload adds its own row."""
+    base = "Q" * 200
+    cred = _cred("password: Qq9!fake7")
+    together = await batch([_plain("one", concept=base + " east"), _plain("two", concept=base + " west"), cred])
+    assert len({r["concept"] for r in together}) == 2 and all(len(r["concept"]) <= 200 for r in together)
+    (alone,) = await batch([_plain("two again", concept=base + " west"), cred], source="b.md")
+    assert alone["concept"] not in {r["concept"] for r in together}
+    rows = await db.execute_fetchall("SELECT 1 FROM knowledge_units WHERE domain = 'reference.fact'")
+    assert len(rows) == 3
+
+
+async def test_a_long_concept_without_a_credential_unit_is_cut_as_on_main(batch, db):
+    """Owner ruling 2026-11-20: a batch with no credential unit keys a long
+    concept as main does, cut plainly at the cap, so a re-ingest updates it."""
+    concept = "Q" * 205
+    (first,) = await batch([_plain("one", concept=concept)])
+    (again,) = await batch([_plain("one, updated", concept=concept)])
+    assert first["concept"] == again["concept"] == "Q" * 200
+    rows = await db.execute_fetchall("SELECT body FROM knowledge_units")
+    assert [r[0] for r in rows] == ["one, updated"]
+
+
+async def test_a_concept_cut_at_the_cap_keys_nothing_of_its_cut_tail(batch):
+    """Security review, round 2: the key of a cut concept is random, so it says
+    nothing of the text past the cap (a hash of the whole concept let a guess
+    at that text be checked against the stored key)."""
+    concept = "A" * 195 + " tail Zz8!unheld"
+    cred = _cred("password: Qq9!fake7")
+    (row,) = await batch([_plain("x", concept=concept), cred])
+    (again,) = await batch([_plain("x", concept=concept), cred], source="b.md")
+    assert "Zz8" not in row["concept"]
+    # Nothing derived from the text: the same concept never keys the same.
+    assert row["concept"].rsplit(" #", 1)[1] != again["concept"].rsplit(" #", 1)[1]
+
+
+async def test_a_concept_written_like_a_minted_key_gets_a_key_of_its_own(batch, db):
+    """Security review, round 2: a concept arriving as ``<text> #<8 hex>``
+    is keyed anew, so it can never equal a key minted for another unit."""
+    cred = _cred("password: Qq9!fake7")
+    (first,) = await batch([_plain("one", concept="Q" * 205), cred])
+    (second,) = await batch([_plain("two", concept=first["concept"]), cred], source="b.md")
+    assert second["concept"] != first["concept"]
+    # CodeRabbit 4639471475: a minted suffix is 12 hex digits.
+    assert re.fullmatch(r".* #[0-9a-f]{12}", first["concept"]) and re.fullmatch(r".* #[0-9a-f]{12}", second["concept"])
+    rows = await db.execute_fetchall("SELECT body FROM knowledge_units WHERE domain = 'reference.fact'")
+    assert sorted(r[0] for r in rows) == ["one", "two"]
+
+
+async def test_a_batch_without_a_credential_unit_is_stored_as_given(batch):
+    (row,) = await batch([_plain("The lab SSID is example-lab", concept="lab ssid", tags=["lab"], secrets=["example-lab"])])
+    assert (row["concept"], row["body"], row["tags"]) == ("lab ssid", "The lab SSID is example-lab", '["lab"]')
+
+
+async def test_a_credential_unit_that_failed_never_lets_its_sibling_overwrite(batch, db, monkeypatch):
+    """No stored id to key on: the sibling takes a fresh key, so it can be
+    duplicated on re-ingest but never written over another row; the secret is
+    still masked (the unit's text was not stored, and the flag says so)."""
+    from genesis.knowledge.orchestrator import KnowledgeOrchestrator
+
+    async def _fail(*_a, **_k):
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(KnowledgeOrchestrator, "_store_credential_unit", staticmethod(_fail))
+    units = lambda body: [_plain(body, concept="pin Cc3!fakeC", secrets=["Cc3!fakeC"]), _cred("password: Cc3!fakeC")]  # noqa: E731
+    first = await batch(units("a"))
+    second = await batch(units("b"))
+    assert first[0]["concept"] != second[0]["concept"]
+    assert all("fake" not in r["concept"] for r in first + second)
+
+
+async def test_a_secret_named_in_part_is_masked_whole(batch):
+    """Security review W1: a match grows over the credential text holding it."""
+    cred = _cred("router admin password Hunter2Zq!x9")
+    (row,) = await batch([_plain("log in with Hunter2Zq!x9 today", secrets=["Hunter2"]), cred])
+    assert row["body"] == "log in with [held] today"
+
+
+async def test_a_percent_encoded_spelling_is_held_either_way(batch):
+    """Security review W2: the held check reads the spellings the masks read."""
+    one = await batch([_plain("pw is Hunter2Zq! ok", secrets=["Hunter2Zq!"]), _cred("db postgres://admin:Hunter2Zq%21@db.example.org/x")])
+    two = await batch([_plain("url has Hunter2Zq%21 here", secrets=["Hunter2Zq%21"]), _cred("pw Hunter2Zq!")], source="b.md")
+    assert (one[0]["body"], two[0]["body"]) == ("pw is [held] ok", "url has [held] here")
+
+
+async def test_a_secret_held_only_in_a_credential_units_tags_is_held(batch):
+    """Security review N3: the chokepoint holds every field of the credential unit."""
+    cred = _cred("router login", )
+    cred.tags = ["Tt5!fakeTag"]
+    (row,) = await batch([_plain("use Tt5!fakeTag here", secrets=["Tt5!fakeTag"]), cred])
+    assert row["body"] == "use [held] here"
+
+
+async def test_a_card_number_in_a_sibling_is_redacted(batch, memory_mcp):
+    """Security review W4: live code refused this batch; the card is redacted as
+    the chokepoint redacts a caller's fields (#3172, owner ruling 1dedc18a)."""
+    card = "4111 1111 1111 1111"
+    plain = _plain(f"Pay with card {card} now", tags=[card])
+    await batch([plain, _cred(f"Visa card {card} exp 12/30")])
+    for call in memory_mcp.calls:
+        assert card not in json.dumps(call, default=str)
+
+
+def test_a_secrets_list_given_as_one_string_is_split():
+    """Security review W5: a model can join the list into one string."""
+    import asyncio
+
+    from genesis.knowledge import distillation as d
+    from genesis.knowledge.processors.base import ProcessedContent
+
+    router = MagicMock()
+    router.route_call = AsyncMock(return_value=SimpleNamespace(success=True, content=json.dumps(
+        [{"concept": "c", "body": "b", "domain": "x", "confidence": 0.9, "secrets": "Aa1!fake, Bb2!fake"}]
+    )))
+    units = asyncio.run(d.DistillationPipeline(router=router).distill(ProcessedContent(text="t", source_type="text"), project_type="p", domain="auto"))
+    assert units[0].secrets == ["Aa1!fake", "Bb2!fake"]
+
+
+def test_two_long_account_names_stay_two_identities():
+    """CodeRabbit round 3 on #4843 (Critical): a credential name is never cut
+    before its identity is taken."""
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import _derive_identifier
+
+    def name(**kw):
+        return _derive_identifier(Extraction(extraction_type="entity", confidence=0.9, **kw), default_prefix="account", whole_tokens=True)
+
+    assert len({name(content="x", entities=["Portal " + "a" * 130 + t]) for t in ("-east", "-west")}) == 2
+
+
+def test_two_api_key_captures_keep_two_names():
+    """CodeRabbit 4633597973 (Critical): a bare label never becomes the name."""
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import _derive_identifier
+
+    names = {
+        _derive_identifier(Extraction(content=f"API-key: {t}", extraction_type="entity", confidence=0.9), default_prefix="api_key", whole_tokens=True)
+        for t in ("sk-fakeAAAA1111", "sk-fakeBBBB2222")
+    }
+    assert len(names) == 2
+
+
+async def test_a_placeholder_only_upload_uploaded_again_is_one_entry(db):
+    """CodeRabbit round 3 on #4843: an upload whose whole text is the value
+    placeholder holds an empty value and is compared as that on re-upload."""
+    store = _PointStore()
+    first = await _untrusted(db, store, "notes.txt", ro.SECRET_PLACEHOLDER)
+    again = await _untrusted(db, store, "notes.txt", ro.SECRET_PLACEHOLDER)
+    assert again == first
+    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 1
+
+
+async def test_the_incomplete_upload_notice_says_when_nothing_was_stored(monkeypatch):
+    import importlib
+    from types import SimpleNamespace as NS
+
+    from genesis.knowledge import ingest_upload
+    from genesis.knowledge.orchestrator import CREDENTIAL_NOT_STORED
+
+    mcp_knowledge = importlib.import_module("genesis.mcp.memory.knowledge")
+
+    for ids, tail in (([], "no unit was stored."), (["u1"], "the other units were stored.")):
+        orch = NS(ingest_source=AsyncMock(return_value=NS(error=None, unit_ids=ids, quality_flags=[f"{CREDENTIAL_NOT_STORED}RuntimeError"])))
+        monkeypatch.setattr(mcp_knowledge, "_get_orchestrator", lambda o=orch: o)
+        monkeypatch.setattr("genesis.runtime.GenesisRuntime.instance", lambda: NS(db=None))
+        _, notice = await ingest_upload._extract_with_pipeline("up1", "f.txt", project_type="reference", domain="auto", purpose=None, context="")
+        assert notice.endswith(tail)
+
+
+async def test_the_reference_migration_keeps_the_source_file_in_held_provenance(monkeypatch):
+    from pathlib import Path
+
+    from tests.conftest import private_module
+
+    mod = private_module("_migrate_ref", Path(__file__).parents[2] / "scripts" / "migrate_reference_data.py")
+    seen = {}
+
+    async def _capture(**kw):
+        seen.update(kw)
+        return "u1"
+
+    monkeypatch.setattr("genesis.memory.knowledge_ingest.ingest_knowledge_unit", _capture)
+    entry = mod.ReferenceEntry(kind="credentials", identifier="lab", value="Zz1!fake", description="d", source_file="notes/lab.md")
+    await mod._ingest_entry(entry, store=None, db=None)
+    assert seen["provenance"]["source_file"] == "notes/lab.md"
+
+
+def test_the_distiller_returns_each_units_secrets():
+    from genesis.knowledge import distillation
+
+    assert "secrets" in distillation._DISTILLATION_SYSTEM_PROMPT
+    assert distillation.KnowledgeUnit(concept="c", body="b", domain="d").secrets == []
