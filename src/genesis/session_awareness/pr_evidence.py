@@ -69,6 +69,8 @@ __all__ = [
     "Refusal",
     "decide",
     "check_e2e_coverage",
+    "check_event_dates",
+    "completeness_prompts",
     "derive",
     "parse_evidence",
     "parse_recheck_result",
@@ -610,6 +612,92 @@ def check_e2e_coverage(doc: EvidenceDocument, body: str) -> Refusal | None:
             + _listing("not a declared E2E step", tuple(stale)),
         )
     return None
+
+
+def check_event_dates(doc: EvidenceDocument, closing: bool, today: date) -> Refusal | None:
+    """Refuse a close that would store a recheck already due.
+
+    An ``event_gated`` gap dated on or before ``today`` (UTC, the date the backlog's
+    "Rechecks due" read uses) is reachable work now: closing would make the record
+    permanent with the measurement still owed, and a failed recheck never reopens
+    the row. ``closing`` is the writer's effective decision (a closing verdict AND
+    complete tracking), the same gate as :func:`check_e2e_coverage`. A named-event
+    trigger is never refused, and an attempt that keeps the row open is not refused
+    either: the gap is judged again when the row closes.
+    """
+    if not closing:
+        return None
+    due = [
+        (i, gap.trigger)
+        for i, gap in enumerate(doc.gaps)
+        if isinstance(gap, EventGatedGap)
+        and TRIGGER_DATE.fullmatch(gap.trigger)
+        and gap.trigger <= today.isoformat()
+    ]
+    if not due:
+        return None
+    return Refusal(
+        2,
+        "an event-gated gap's date has already come, so its measurement is owed now, "
+        "not as a recheck after the close. Run its recheck and record the result as a "
+        "claim (or as a not_yet_done gap if it cannot run here); or, if the event has "
+        "not happened yet, set the trigger to the first date on which it will have."
+        + _listing("due", tuple(f"gaps/{i} (trigger {t})" for i, t in due)),
+    )
+
+
+#: Advisory prompts for the validator, measured on 2026-11-14 against verifier
+#: critiques of 17 evidence documents (#4180): each matched a defect class the
+#: verifiers named. They are questions, never verdicts: none changes what is
+#: recorded, and none replaces the independent verifier.
+_COMPARATIVE = re.compile(
+    r"\b(?:unchanged|as before|no longer|otherwise|same as|not changed)\b|\bstill\s", re.I
+)
+_BEFORE_ARM = re.compile(
+    r"pre-|before|parent|\^|\bold\b|pre-merge|prior|merge-base|both (?:trees|arms|versions)",
+    re.I,
+)
+_PASS_COUNT = re.compile(r"\b(\d+)\s*(?:/|of)\s*\1\b")
+#: A pytest node id's module, directory included: two same-named modules in
+#: different directories are two modules (``tests/a/test_x.py`` != ``tests/b/test_x.py``).
+#: The lookbehind lets a match start only at a token boundary. Without it the
+#: repeated path segment is retried from every character of a long path-like run,
+#: which is quadratic: 48 s on 64,000 characters, against 7 ms anchored (measured
+#: 2026-11-14), and evidence reaches the MCP writer at up to 256 KiB.
+_TEST_MODULE = re.compile(r"(?<![\w./-])((?:[\w.-]+/)*test_\w+?)(?:\.py)?::")
+
+
+def completeness_prompts(doc: EvidenceDocument) -> list[str]:
+    """Questions a document raises about its own completeness, each naming its target.
+
+    Pure and deterministic. Printed on every run of both writers so a validator
+    answers them BEFORE a close, which is permanent.
+    """
+    prompts: list[str] = []
+    for i, gap in enumerate(doc.gaps):
+        if isinstance(gap, MethodGap):
+            prompts.append(
+                f"gaps/{i} is a method gap: if its step can be run here, it is "
+                f"not_yet_done, not a limit of the method."
+            )
+    for i, claim in enumerate(doc.claims):
+        if _COMPARATIVE.search(claim.claim) and not _BEFORE_ARM.search(claim.measurement):
+            prompts.append(
+                f"claims/{i} says something is unchanged or still true, but its "
+                f"measurement names no before arm (the parent tree or the old behaviour)."
+            )
+        if len(set(_TEST_MODULE.findall(claim.measurement))) >= 2:
+            prompts.append(
+                f"claims/{i} cites tests from two or more test modules: check that it "
+                f"is one claim, not two folded together."
+            )
+    for i, entry in enumerate(doc.tracking):
+        if isinstance(entry, AcceptedLimit) and _PASS_COUNT.search(entry.rationale):
+            prompts.append(
+                f"tracking/{i} accepts a limit on a pass count: k of k passes do not "
+                f"show the failure rate is low."
+            )
+    return prompts
 
 
 def _listing(label: str, items: tuple[str, ...]) -> str:

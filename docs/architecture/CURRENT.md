@@ -85,8 +85,10 @@ physical completion through their RequestDatabase unit. Legacy connections keep
 ordinary thread cancellation. The retriever forwards the facade to tag expansion;
 tag scans run in independently admitted background units, with accepted-task
 completion as the single-flight release. Pressure or draining serves the stale
-query. Other maintenance threads and shared provider closers still need factory
-qualification; this is not a shared-service activation.
+query. The explicit shared factory additionally owns the builtin embedding
+clients and cache handles while retaining separate storage/recall providers.
+Other maintenance threads retain their existing lifetime. This is not a
+shared-service activation; factory qualification is scoped separately.
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
 `memory_fts`) and Qdrant share no transaction, so drift (orphaned "ghost"
@@ -152,29 +154,33 @@ Easy-to-forget mechanisms:
   one chokepoint every reference writer passes) indexes only the header (the
   identifier), `[description held in the reference secret store]`,
   `Value: [held in the reference secret store; read it with reference_lookup]`
-  and the Tags/Captured trailer (`reference_ops.split_secret`), so the unit's
+  and one Tags line (`reference_ops.split_secret`), so the unit's
   knowledge_units and knowledge_fts rows, its memory_fts row, the Qdrant payload
   and the embedding never see the value or the free-text description (no
   scrub of free text: owner ruling, every spelling was another way through).
-  The identifier, tags, authority and provenance are not scrubbed. The value is
+  The value is
   probed whole and by its fragments: percent-decoded, NFKC-normalised, split on
   whitespace and `: / @ ? & = # ; , | \ < > " ' ( ) { } [ ]` (so a URL, DSN,
   key=value, XML or pipe-separated password is a fragment of its own), leaving out host names, URL schemes and ports, and keeping each
   secret-shaped fragment; matching is normalised (NFKC, format characters
-  removed, casefolded) and percent-decoded. An identifier, body header, or
-  ANY other caller field that can reach a store (authority, memory class,
-  purpose, ingestion source, and every provenance value, nested or not, each
-  read as text by `knowledge_ingest.field_text` and leaf by leaf) that carries
-  a probe refuses the write (`reference_ops.refuse_value_in_fields`; the
-  identifier with its own message, and the `[reference.credentials] {identifier}`
-  header by the identifier rule only when it is exactly that header). A caller
-  tag that carries a probe is dropped whole, from the tags and the body's Tags
-  line, and the write goes on (`reference_ops.drop_value_tags`), so a heuristic
-  match on an ordinary tag costs that tag, never the capture. Stated limits: a
+  removed, casefolded) and percent-decoded. Nothing is refused to keep a
+  secret out of the index. The caller's other fields (authority, provenance,
+  purpose, ingestion source, relationships, caveats, and the identifier and tags
+  as given) are held with the value in `reference_secrets.meta`, never indexed,
+  and returned by a reveal (`reference_ops.reveal_meta`). The chokepoint BUILDS
+  the indexed body (header, placeholders, one Tags line); no caller text after
+  the header is indexed. The identifier and the tags, the only indexed fields,
+  have every span of the value masked as `[held]` before they are capped
+  (`reference_masks.ValueMask`), with probes from the value, the value it
+  replaces, and every value and recorded masked span of the entries the name
+  resolves to. A term-shaped probe is skipped only when every source it comes
+  from was free prose (an upload's or a distilled unit's text, recorded as
+  `value_is_prose`); a known held value or a recorded span is always masked. A
+  missing identifier is named `credential` and always makes a new entry. Stated limits: a
   secret that reads as a plain word (all letters, or under four characters) is
   matched only as the whole value, and so is a fragment that is all digits or
   shaped like a host name (dotted labels ending in letters). A credential's memory class becomes an
-  indexed tag, so it must be None or a known class (`classification.CLASS_WEIGHTS`).
+  indexed tag, so one that is not a known class (`classification.CLASS_WEIGHTS`) is stored as `fact`.
   The value and the description (`detail`)
   go to one insert-only `reference_secrets` row under a fresh random id, and ONE statement
   then writes the unit naming it in `knowledge_units.secret_ref`, so a body and
@@ -184,10 +190,36 @@ Easy-to-forget mechanisms:
   secret a unit stops naming (repointed or deleted);
   `knowledge_crud.sweep_orphan_secrets` (after every delete, and at boot)
   removes secrets older than an hour that an interrupted upsert left unnamed.
-  `ingest_knowledge_unit(insert_only=True)` and `knowledge_crud.upsert(insert_only=True)`
-  never change an existing credential key (a different value raises
-  `CredentialKeyTaken`); no writer passes it yet: it is the mechanism a later
-  change wires the extraction job's auto-capture to.
+  **A credential's key is opaque and its identity is the hash of its name.**
+  A new credential is stored under `concept = cred-<12 hex>`
+  (`secrets.token_hex(6)`, checked absent), never derived from the name or the
+  value. The full name is held in `reference_secrets.meta` (`identifier`);
+  the body's header line carries it masked and capped (512 characters), and a
+  name that differs from the identifier given is returned as
+  ` (stored as: <name>)`. `knowledge_units.name_hash`
+  (`reference_ops.name_hash`: card-redacted, NFKC, format characters removed,
+  casefolded, whitespace collapsed, sha256) and `name_origin` (`trusted`,
+  `untrusted`, `carded`) are written by the INSERT and never changed by an
+  update. A trusted write by name updates the earliest trusted entry with that
+  hash, else an entry with no hash yet whose recorded name matches (the
+  identifier its meta records, else a legacy plain key by its exact text), which that write gives
+  the hash; else it mints a new key. A partial unique index
+  (`idx_knowledge_units_name_hash`, trusted rows with a 64-character hash) makes
+  concurrent first saves of a name one entry. `entry_key=` (trusted callers,
+  credentials only; `reference_store(entry_key=...)`) writes to an existing
+  entry by key and keeps its recorded name; an unknown key is refused with
+  nothing written, and text that reads like a key passed as an identifier is a
+  name. Any update keeps the full name the entry records in its meta. An
+  insert-only write (uploads and distillation, through
+  `ingest_untrusted_credential`) returns an untrusted entry under that hash with
+  the same name, value and description (`knowledge_crud.same_untrusted`), else
+  adds a new entry; it never updates one, and a trusted write never adopts one. A card-redacted name
+  reuses an entry only when it holds the same value. Migration
+  `20261115060803_credential_name_hash` backfills existing credentials; of
+  legacy names differing only in case the earliest keeps the hash, and each
+  later one gets one the index leaves out (still stored, revealable,
+  deletable). The dashboard list and `reference_lookup` show the name
+  (`reference_ops.display_name`); lookup results carry the key as `concept`.
   Two `knowledge_units` triggers refuse a
   credential body without exactly one placeholder line, whichever process
   writes it (text on a later line only the Python check sees).
@@ -202,8 +234,8 @@ Easy-to-forget mechanisms:
   (`knowledge_crud.KeyObservation`: absent, or the secret and point it named),
   checked inside the one statement that writes the unit, so a same-key writer
   in another process that commits in between makes it write nothing
-  (`CredentialKeyChanged`); the ingest then re-reads and runs once more, and
-  a second change reaches the caller.
+  (`CredentialKeyChanged`); the ingest then re-reads and runs again, up to five
+  times, so every writer in a race lands, and a sixth change reaches the caller.
   Only `reference_ops` reads the secret row: `compose_body` puts the value and
   the description back for `reference_lookup` (behind its audit log),
   `reveal_reference` returns both for the dashboard's reveal, and
@@ -211,7 +243,7 @@ Easy-to-forget mechanisms:
   read, they re-read the unit's current body, value and description with one
   statement (`knowledge_crud.get_reference_pair`), so a body never comes back
   beside another write's secret. A credential is therefore found by its
-  identifier and tags only; the dashboard list shows the description placeholder. Identifier kinds (url, network,
+  name and tags only; the dashboard list shows the description placeholder. Identifier kinds (url, network,
   account, fact) keep their value in the body, because it is what their lookups
   search for. NOT covered yet: the episodic memory the extraction job stores
   for the same conversation text, which still carries an auto-captured value.
@@ -272,7 +304,10 @@ Easy-to-forget mechanisms:
   not apply); `live` would apply new-pair merges via `merge_entity` unattended,
   but is FENCED (runs as `propose_only`, settings lever refuses it) until
   issue #2742 adds a merge-time check on durable pair state. A cursor-managed reconcile sweep
-  rediscovers historical fuzzy pairs. Settings lever `entity_adjudication`
+  rediscovers historical fuzzy pairs. Both fuzzy scans (the sweep and resolution's
+  `_closest`) run in a thread that keeps the GIL busy, so they go through
+  `entity_registry.fuzzy_ratio_at_least`, which skips pairs whose cheap difflib bounds
+  cannot reach the threshold (same matches, about 8x less CPU). Settings lever `entity_adjudication`
   (off/propose_only/live) + `GENESIS_ENTITY_ADJUDICATION_DISABLED`. Distinct from
   `memory/entity_resolution.py`, which is near-duplicate memory-PAIR dedup.
   **Human-approval apply gate** (`entity_adjudication_approve`/`_apply`/`_reject`
@@ -865,6 +900,38 @@ complete-attempt evidence. See `docs/reference/inbox-attempt-identity.md`.
   took the predecessor design through 7 review rounds is retired by
   construction. Forbidden mechanisms are test-pinned (no send-keys /
   respawn-pane / set-environment; exactly one new-session invocation).
+- **The slot door has a builder mode, for code with nobody at the terminal**
+  (`scripts/cc-slot.sh launch --issue N --key K --session-id UUID [--resume]
+  [--slot N] --prompt-file F`; spec E, E3). It creates the slot through the same
+  single create invocation, DETACHED (`-d`, never `-A`), and never prompts.
+  - **Slot:** the caller's `--slot N`, refused (75) when taken and never
+    swapped, so the launcher can record it before launching. Without it, the
+    lowest free slot.
+  - **Capacity:** SSH variables are cleared first, so the gate answers ALLOW or
+    DENY, never an interactive reclaim.
+  - **Exit codes:** 0 when the session is still there a few seconds after the
+    create (a claude that exits at once is reported as a failure); 75 for a taken
+    slot or a capacity refusal (retry later); 64 for bad input, including a pane
+    command past tmux's client limit (MEASURED on tmux 3.4: 16300 bytes accepted,
+    16340 refused); any other non-zero for a failure.
+  - **OAuth:** the fallback token is never injected, because Remote Control
+    cannot run on it.
+  - **Environment:** the pane rebuilds claude's environment with `env -i`, from
+    the variable names a manual slot carries plus `GENESIS_BUILDER_KEY`, so no
+    other pane's identity, `GENESIS_CC_SESSION`, API key or token reaches it. The
+    key is also pinned on the tmux session, so `tmux show-environment -t cc-N`
+    maps a builder to its slot. Values are POSIX single-quoted, not `printf %q`,
+    so the pane command does not depend on bash.
+  - **claude:** starts with Remote Control (`build #N`), a fixed `--session-id`
+    (or `-r` to resume), `--model opus` (Claude Code's alias for the latest Opus,
+    so no version is pinned and a saved `/model` default cannot change it), the
+    interactive slots' permission mode, and `config/builder_settings.json` for
+    its subagent caps. A missing or malformed caps file refuses the launch.
+  - **Attach:** builders share the slot numbers, so an operator's
+    `ssh <host>-N` joins a running builder in `cc-N` (the intended attach path).
+
+  Nothing calls it yet: the board launcher (E3a) will. `config/BUILDER_PROMPT.md`
+  is the builder's first-message template, rendered by that launcher.
 - **Roster peer availability is OBSERVATION, never a gate** (`cc/peer_availability.py`,
   recorded from the failover loop in `cc/conversation.py`). `roster.failover_chain`
   admits a peer on CREDENTIAL PRESENCE — "is `auth_env` set" — so a quota-blocked
@@ -968,9 +1035,13 @@ complete-attempt evidence. See `docs/reference/inbox-attempt-identity.md`.
   decontextualised in yours. `model` comes from the SessionStart cache with
   `GENESIS_ROSTER_MODEL` taking precedence, NOT from `cc_sessions.model` — on a
   live install that column is dominated by the literal string `unknown`.
-  Liveness comes ONLY from `session_heartbeats`: `cc_sessions.pid` is unset for
-  most rows and its `status`/`last_activity_at` go stale on running sessions, so
-  it must never be used to decide who is alive. **Every rendered field is
+  Liveness comes ONLY from `session_heartbeats`. `cc_sessions.pid` is set on
+  foreground rows since #1706 (MEASURED 2026-11-13 over rows started in the last
+  three days: 91 of 91 checkpointed and 4 of 4 active rows carry one, 0 of 7
+  completed rows do), but one process can carry several session rows (one pid
+  on 2 rows after a `/clear`, another on 4), and the row's
+  `status`/`last_activity_at` go stale on running sessions, so it must never be
+  used to decide who is alive. **Every rendered field is
   peer-authored, so all pass through `sanitize_detail`** — a newline in any of
   them forges an extra `[Concurrent | …]` line in the reader's context. The
   writers are partial by design (each knows a different subset), so the upsert
@@ -1002,6 +1073,27 @@ complete-attempt evidence. See `docs/reference/inbox-attempt-identity.md`.
   `python -m genesis session-address <id>` (whose `--check` compares it with
   `claude agents --json`, Claude Code's supported listing) and the
   `session_address` MCP tool.
+  **And the worktrees the peer holds** — the tag's body opens with
+  `in <worktree> on <branch> (+N more claimed)`, from the worktree-ownership
+  claims (`scripts/hooks/worktree_claim.py` `claims_by_session`), taken on a
+  session's first edit in a worktree and owned by its PROCESS. A claim is
+  matched by the peer's live pid, the one the address lookup above verified
+  against the registry and the process start time, and failing that by the
+  session id the claim recorded: `/clear` starts a new id in the same process,
+  so an id-only join loses every claim made before it (MEASURED 2026-11-13: 4
+  of 18 live claims). Locks are read raw from `<common dir>/worktrees/*/locked`
+  (never porcelain), with a byte test for the namespace before any parse, one
+  entry at a time so a malformed lock skips only itself. A claim shows only on
+  positive identity (`claim_is_live`: start time matches, not a zombie); an
+  unknown is not shown. The worktree named is the most recently CLAIMED one
+  (the lock file's mtime: a lock is never overwritten), which is where the peer
+  last first-edited, not proof of where it is now; the rest are counted. Names
+  are allowlisted (`[A-Za-z0-9._/+-]`) and omitted when outside it, so the
+  suffix can neither forge a field nor cost more than one budget unit a
+  character. A peer with no claim shows no suffix. The scan costs 22-38 ms over
+  638 admin dirs (MEASURED 2026-11-13, 5 runs, `claims_by_session` alone), is
+  skipped once the hook's deadline has passed and checks it during the scan;
+  an unfinished scan or any failure renders the line as before.
 
 - **Slot environment pinning + usable temp directories.**
   LIVE. `tmux new-session` builds a new session's environment from the tmux
@@ -1885,15 +1977,17 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: 6b4f275 2026-11-08
+verified: d70924fb5 2026-11-15
 ```
 
-Scoped verification: internal `mcp/shared_http` composition only. It receives
+Scoped verification covers `mcp/shared_http` composition. It receives
 initialized request-owned resources and supplies SDK transport limits, app-wide
 authority/authentication, per-message caller/profile binding, shared/local
 ancestry admission, nonblocking tool capacity and authenticated version/catalog
-status. No launcher selects it; owned bootstrap, native clients and rollout
-remain separate. See `docs/reference/shared-mcp-http.md`. That scoped check
+status. The gated explicit `--shared-service` path constructs the actual
+standalone services with a bounded facade, frozen limits and outer resource
+owner. Ordinary session selection remains unchanged. Unit readiness, native
+clients and rollout remain separate. See `docs/reference/shared-mcp-http.md`. That scoped check
 (5a3de4eee, 2026-11-08) does not requalify the other channels/interfaces subsystems.
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -2055,6 +2149,14 @@ the shared banner is not an assertion about all concurrent sessions.
   `docs/reference/serena-shared-main.md`.
   External Codebase has pinned configuration staging/diagnostics and bounded
   native query unit entry points in `scripts/codebase_managed.py`.
+  The captured worker's immutable release records select an exact configured
+  build across staging, managed execution, queue source identity and worker argv.
+  Only v0.11.0 is currently qualified; future releases require their own reviewed
+  record and native acceptance. A different supported binary at the configured
+  path still refuses; policy updates do not update existing settings or consent.
+  Scoped CBM verification uses isolated configuration and captured-owner execution
+  through the stock adapter to harmless children; installed-provider and real
+  kernel containment qualification remain separate.
   Status separately observes conditional queue initialization-lock prerequisites
   without opening the queue or changing current-schema availability.
   Install and bootstrap render disabled query/client-slice templates without
@@ -2081,7 +2183,7 @@ the shared banner is not an assertion about all concurrent sessions.
   Matching terminal leader states alone do not prove controller process end.
   The same-connection final drain observes callback-created evidence before
   commit. The acknowledgement grants no retry or acceptance. The automatic
-  reconciliation caller remains separate (#3728); acceptance, cutover,
+  reconciliation caller remains separate (#3728); cutover,
   native qualification and production capacity remain separate gates.
   Explicit request/revoke/status operations use the existing provider-state
   grant and bind actual work, retained debt, evidence, provider and runner/
@@ -2094,7 +2196,14 @@ the shared banner is not an assertion about all concurrent sessions.
   or lost replies cannot reconstruct runtime authority. Ordinary owner admission
   still refuses selected provenance. GN binds ordinary versus selected recovery
   argv to actual durable origin before owner construction and during source
-  recapture. Acceptance, cutover and automatic readiness remain separate gates.
+  recapture. Captured `accept-retry` publishes explicit metadata for a clean,
+  already-settled selected trial after exact source/policy, debt and physical/
+  control checks. It never settles accounting, retires an inflight pointer or
+  launches a provider. Immutable replay recovers a lost acceptance reply without
+  resend; current drain annotations allow only older known retained provider
+  evidence to use the acceptance watermark. Trial/newer hazards and physical
+  obligations remain independent holds. Cutover and automatic readiness remain
+  separate gates.
   Selected acknowledgements recheck repository-wide physical/control holds after
   their final drain. A transient same-transaction fresh proof binds the original
   lifetime subject and exact-sequence raw cleanup evidence; it grants no durable
@@ -2210,7 +2319,9 @@ the shared banner is not an assertion about all concurrent sessions.
   observations preserve owned OOM kills, including the first sample, before
   duplicate/conflict reduction; clean control cannot erase resource evidence.
   Default initialization stays4; new native authority requires5, with no live
-  cutover, acceptance setter or positive automatic readiness here. Explicit
+  cutover or positive automatic readiness here. The explicit acceptance setter
+  changes only the five existing receipt fields after completed-trial validation.
+  Explicit
   transaction-only retry grants in `index_marker_retry.py` require schema5 and
   captured supervision. Selected consumption shares the existing transaction,
   final drain and physical owner, preserving original identity and first-commit
@@ -2761,8 +2872,13 @@ verified: 0aa0bf9f2 2026-11-10
   (`pool.py`) and **RAM** (`memory_watch.py`, E-rest) — the latter over two
   axes worst-of, container cgroup (via incus-exec, best-effort) + host-VM
   `/proc/meminfo` (the reliable axis). Both use the shared `_tier_for`/
-  `decide_alert` hysteresis. Read-only `disk-status`/`ram-status` verbs expose
-  the same measurement to the container.
+  `decide_alert` hysteresis; RAM adds flap damping on top: a per-axis exit
+  margin (`memory_tiers.exit_margin_pct`, default 5), a blind axis holding its
+  last tier (stale after one re-alert window, and named in the page), and a
+  baseline of the highest tier paged since the last recovery that lasts one
+  re-alert window (state `memory_alert_state.json`: `tier` = that peak,
+  `axes`, `blind_since`). Read-only `disk-status`/`ram-status` verbs expose
+  the same raw measurement to the container.
 - **Pool RELIEF** (`pool_relief.py`) runs every tick, BEFORE `_check_cycle`
   (during an outage's diagnosis that is about hourly, since the tick is a
   oneshot). The tiers above only alert, and a thin pool once filled to 100%
@@ -2860,11 +2976,40 @@ verified: 0aa0bf9f2 2026-11-10
   the Failure Inventory remedy for memory held by a shared Codex app-server
   daemon's MCP servers (#4302). Dry-run by default; `--execute` only inside an
   approved action. Resolves targets when it runs: direct children of a
-  `codex app-server --listen` process that lead their own process group with
-  pipe stdin+stdout, excluding Codex helper binaries, systemd-unit members and
+  `codex app-server --listen` process that lead their own process group and
+  read a pipe the app-server writes and write one it reads, on any descriptor,
+  that no other app-server child also holds
+  (matched by pipe identity and `fdinfo` access mode: the MCP Python SDK moves
+  the protocol off fd 0/1, so a stdin test missed every Genesis server),
+  excluding Codex helper binaries, systemd-unit members and
   anything under a `claude` process. Lever `codex_mcp_stop.mode` in
   `config/sentinel.yaml` (`propose_only` | `off`) +
-  `GENESIS_CODEX_MCP_STOP_DISABLED=1`.
+  `GENESIS_CODEX_MCP_STOP_DISABLED=1`. Proposed early by the health alarm
+  `infra:codex_mcp_held` (WARNING, tier 2 via `_TIER2_PATTERNS`), which fires
+  when that same `scan()` totals `codex_mcp_stop.propose_at_mb` (default 4096)
+  or more; the scan runs off-loop and is cached 60 s in `mcp/health/errors.py`.
+  Because that alarm does not clear by itself, `check_fire_alarms` lets a
+  confirmed alarm that is stronger by the classifier's order (tier, then
+  CRITICAL first) cancel (`resolved_by="superseded"`) a park whose triggering
+  alarms are all WARNING, but only when the alarm dispatch would lead with is
+  that challenger and passes backoff; a park with any CRITICAL trigger is never
+  taken over, and a cancel that fails keeps the park. The cancelled pattern
+  starts the 15-minute resolved cooldown. A declined dispatch or action is
+  quiet for 24 h through `handle_approval_resolution` (every pattern).
+- **sentinel/process_stop.py** (`python -m genesis.sentinel.process_stop`):
+  the Failure Inventory remedy for ONE runaway process. Dry-run by default;
+  `--execute` only inside an approved action. Resolves targets when it runs:
+  this user's processes (not pid 1, not zombies or kernel threads, not the
+  tool's own ancestors) outside any systemd `.service` unit that hold
+  `process_stop.propose_at_mb` (default 6144) MB of RSS+swap, excluding
+  `init.scope`. `--execute` requires `--only PID:STARTTIME,...` copied from the
+  dry-run and stops only those identities still eligible, so an approval never
+  covers a process that crossed the line later. SIGTERM, then SIGKILL, through
+  a pidfd opened before the start-time check, to the process alone. Claude Code
+  sessions (foreground and server-dispatched `run-*.scope`) are eligible. Lever `process_stop.mode` (`propose_only` | `off`) +
+  `GENESIS_PROCESS_STOP_DISABLED=1`. Proposed early by the health alarm
+  `infra:process_memory_high` (WARNING, tier 2), from the same `scan()`,
+  cached 60 s.
 - GROUNDWORK: guardian-cgroup, guardian-bidirectional, sentinel-live-autonomy.
 
 ## 9. Ambient cognition — heartbeat, reflection, attention
@@ -3224,6 +3369,10 @@ verified: 41c7343b3 2026-11-15
   uncovered or stale declarations, including previews; old evidence still parses
   and reasoned `E2E: none` declarations need no mapping. The shared source parser
   also supplies the existing script facade (verified: 2026-11-06).
+  Both writers also refuse a closing verdict while an event-gated gap's date has
+  come, and print or return advisory completeness prompts (`completeness_prompts`)
+  on every run; the prompts change no verdict and are not stored. They do not
+  replace the independent verifier (#4180; verified: 2026-11-14).
   `scripts/verification_review.py prepare` acquires private source packets through
   `session_awareness/pr_verification_sources.py`: bracketed PR identities, complete
   file pagination, Git-parsed diff reconciliation and content digests. It acquires
@@ -3691,7 +3840,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 5be8573a5 2026-11-07
+verified: 3f70a665b 2026-11-15
 ```
 
 - **eval/ego_runtime**: opt-in canonical proposal-operation probes using fresh
@@ -3859,6 +4008,54 @@ verified: 5be8573a5 2026-11-07
   Critic + a `replay` off|shadow sub-config) + `GENESIS_SKILL_EVOLUTION_GATE_OFF`.
   `tool_discovery.py` static maps are deprecated (GROUNDWORK
   provider-migration) — use ProviderRegistry.
+- **The whole-session lesson builder** (Stream 1 of
+  `memory/extraction_job.run_extraction_cycle`, plus its `procedure_rebuild`
+  drain) adds at most 7 new lessons per source session in any rolling 24 hours,
+  counted by `procedural_memory.created_session_id`. That column is written once,
+  at insert, so a refine that rewrites `source` cannot reopen a slot. Lever: the
+  `lesson_builder` settings domain (`off | shadow | live`, shipped `live`; an
+  unreadable base or overlay reads as `shadow`). In shadow the builder runs its
+  real model call and checks, stores nothing, and appends each would-be lesson
+  to `~/.genesis/output/lesson_builder_shadow.jsonl`. That file is also the
+  shadow cap's count, so it rotates by time (the two files always hold the
+  window) and drops a lesson that repeats one already recorded for the session.
+  Queued rebuilds wait, unspent, until the mode is live; the drain scans past
+  capped sessions, so they never starve an eligible one. A second key,
+  `segment: whole | shadow | incremental` (shipped `shadow`), is the first half
+  of judging only what is new (#4807): `cc_sessions.lesson_built_through` holds
+  the `tool_use_id` of the last tool entry judged, and
+  `learning/procedural/build_segment.select_part` cuts the spine after it (by
+  position, since result timestamps are not monotonic; the spine parser keeps a
+  replayed call once, so ids are unique), leaving for later everything from an
+  unanswered call after the last user turn (parallel results can arrive out of
+  order) and fitting the rest to the judge's budget. The marker is read before
+  the parse and is the compare-and-set's expected value, and a reset whose old
+  id is still in the file holds, so an older or partial parse never moves it
+  back. In
+  shadow the whole session is still built; one `Lesson segment [shadow]` log
+  line per built session says what the new part would do, and the marker moves
+  by compare-and-set when the builder ran and the cap allowed. `incremental`
+  (#4813, needs `mode: live`, else it runs as shadow) replaces the whole build:
+  `_judge_from_marker` (in `learning/procedural/incremental.py`, which the
+  extraction cycle and the drain call into) judges up to 4 parts per pass from the marker in the cycle, and in the drain
+  up to 4 parts but at most 1 builder call per queued item (the drain runs before memory extraction, so its worst case
+  stays a batch of 20 single builder calls), each with up to 20
+  earlier tool turns shown for reference only and the session origin from the
+  whole spine, a timeout per part, and a compare-and-set after each. A
+  `candidates` flag triggers every part of its request. Entries left over
+  (budget, spent cap, failed build, a marker another writer moved) queue one
+  `procedure_rebuild` item per session that says only "continue from the
+  marker". A call left waiting for its result is judged when the result comes:
+  with a message, by the next cycle; alone, the empty-message branch queues the
+  drain when that result made an entry after the marker ready (a hook or
+  system line queues nothing), and the drain never re-queues a call still
+  waiting. A request merged into an
+  item a drain already claimed is queued again. The drain reads every
+  such item by the current mode (incremental judges from the marker, whole or
+  shadow rebuilds the whole session), claims it atomically, retries a failure up
+  to 8 attempts and then raises `procedure_extraction_lost`. Each lesson built
+  from a part also logs its grounding against the part alone, to measure
+  lessons built from the context turns.
 - **eval/**: J9 = fire-and-forget emit hooks on live cognitive paths (the
   "cannot break production" contract — hooks must never raise) + weekly Sunday
   aggregation (hard 7-day window) + an on-demand batch judge as a surplus
@@ -3968,6 +4165,10 @@ verified: 5be8573a5 2026-11-07
   establish provider spend bounds or owner approval. This verification refresh covers the qualification slice;
   other learning/evaluation entries retain their previous verification scope.
   See `docs/reference/qualification-transport.md`.
+  A gated native first-party DeepSeek profile shares the same bounded controller
+  and guarded HTTP lifecycle. Native tariff calculations remain separate from
+  legacy provider receipts and cannot supply invoice or promotion authority.
+  See `docs/reference/qualification-native.md`.
   Complete offline preflight checks all registered corpus floors, current
   reference policy/approval/source identities and explicit call-site parameters.
   Production rendering determines duplicate questions and selected novelty IDs.
@@ -4630,6 +4831,18 @@ logger or unrelated exceptions with copied text and no provenance.
   `python -m genesis.trash list|restore`. Callers: cognitive rollback, the
   orphan task-worktree reset, and the dashboard's file-browser and memory-file
   deletes (`docs/reference/trash.md`). Stdlib only.
+- **Worktree reaper trash** (`scripts/worktree_lifecycle.py`, outside `src/`;
+  read at 26218b962, 2026-11-10): the daily hygiene run archives stale
+  worktrees into `~/.genesis/worktree-trash`. An entry has two forms: a
+  `<entry>.tar.gz` with a `<entry>.meta.json` sidecar and a locked, directory-less
+  registration (the anchor that keeps its commits reachable), or a compacted
+  `<entry>.compacted.json` stub whose head is pinned under `refs/archived/` and
+  carried in a `<entry>.compacted.bundle`; each compaction run re-pins a lost pin.
+  Nothing deletes or compacts on a schedule yet. `--expire-trash` (merged,
+  content-proven redundant: `worktree_redundancy.py`, #2504) and
+  `--compact-trash` (unmerged, every file equal to its head:
+  `worktree_compaction.py`) are manual, and #4160 tracks scheduling them.
+  `--recover` restores either form; a stub comes back detached at its pin.
 - **hostmetrics/**: stdlib-only resource readings (container cgroup memory and
   CPU, PSI, disks, and the host's headroom through the guardian gateway) and the
   `preflight`/`status` CLI that admits or refuses a heavy job against the
@@ -4717,8 +4930,9 @@ logger or unrelated exceptions with copied text and no provenance.
   `RequestDatabase` supplies a stable facade with one fresh physical connection
   per independent unit, bounded admission, retained cancellation cleanup and
   cursor closure. It preserves explicit CRUD commits and refuses expired scopes;
-  it does not provide whole-tool atomicity. Existing MCP initialization still
-  uses its legacy connection. `spawn_database_task` gives scoped detached
+  it does not provide whole-tool atomicity. Ordinary stdio and in-process MCP
+  initialization retain legacy connections; explicit shared startup uses the
+  facade. `spawn_database_task` gives scoped detached
   writers their own unit, preserves other caller context, and tracks jobs from
   scheduling through shutdown, including cancellation before start.
   Detached work requires explicit background connection and job-count budgets;
@@ -4733,7 +4947,8 @@ logger or unrelated exceptions with copied text and no provenance.
   fails shutdown; dependent provider closure requires positive settlement.
   `run_resource_thread` preserves ordinary legacy thread cancellation. These are
   internal prerequisites; the nine memory-consumer thread boundaries use them,
-  while shared factory wiring remains separate. Lease budgets bound database
+  and the explicit shared factory drains them before dependent provider closure.
+  Lease budgets bound database
   connections, not executor items.
   Activity, embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
   legacy connections keep ordinary task scheduling. Internal
@@ -4745,9 +4960,11 @@ logger or unrelated exceptions with copied text and no provenance.
   warmed once by the owning bootstrap; registration cannot rebind pending flushes
   or duplicate history. Scoped health supports the standalone status-file service,
   rejecting runtime snapshot sharing before changing registration. Reinitialization
-  replaces obsolete instrumentation in either DB mode. No CLI or transport
-  selects it yet; caller identity, bookmark policy and shared activation remain
-  separate work. See
+  replaces obsolete instrumentation in either DB mode. The explicit shared HTTP
+  launcher selects it with authenticated request callers and leaves pending
+  memory bookmark files for the per-session path. Ordinary stdio and in-process
+  initialization retain their existing paths; local bookmark consumption and
+  routing activation remain separate work. See
   `docs/reference/request-database.md` for lifecycle and failure semantics.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Every
@@ -5369,6 +5586,10 @@ logger or unrelated exceptions with copied text and no provenance.
   every child by one deadline 75 s after its start (`live_move_boot.py`: git,
   the guard's git through its `_DEADLINE`, restore-hooks, which ends 10 s early
   so the healed tree is judged in time; a call with no time left never starts;
+  the heal's own git ends 5 s early, `END_MARK_S`, and every end mark may run
+  into that reserve with a 1 s kill grace, so a crash's mark taken after the
+  heal's deadline is still real (#4548; a hung mark early in the run can use the
+  heal's time and the reserve, still inside the 90 s pin);
   the pin 5 + 75 + 3 + 1 + 4 <= 90 is tested, and a run past its deadline
   ended `exit-code`, not `timeout`, in a transient unit: measured 2026-11-11
   with a 20 s deadline; T-D34 repeats it only where a user manager exists). A `live` row judged
@@ -5380,10 +5601,14 @@ logger or unrelated exceptions with copied text and no provenance.
   `live` rollback stopped after `merging`, #3722's wording) with a `mixed`
   critical page, a failure before judging with `skipped`. Each page's key is
   its class, the state's bytes as the run leaves them and an end mark of the
-  checkout (HEAD, `status -z`, index.lock), so a heal that keeps a HOLD and the
+  checkout (HEAD, `status -z`, index.lock, and the lstat identity, ctime
+  included, of up to 20,000 listed paths other than the ephemeral ones, so an
+  edit to a file that is already modified or untracked moves it; #4548), so a heal that keeps a HOLD and the
   next boot's HOLD page once; a repeat of an unresolved heal (a heal that crashed
   partway, or was killed before it recorded a result, is retried once at the next start: owner
-  ruling, its attempts counted from the reports on disk; an end mark the deadline left unreadable
+  ruling, its attempts counted from the newest 8 reports among the newest 32 folders on disk; a heal
+  writes its first REPAIR.json as it starts, before anything is saved, so one that fails or is
+  killed before its backup is complete is counted too (#4548); an end mark the deadline left unreadable
   never counts as a change) with nothing
   changed refuses at once with no new backup, unless another kit is installed
   (its `kit_id` is part of the match). Every run, by command too, holds the kit's
@@ -6171,7 +6396,9 @@ around them. **What exists today:**
 - promotion of a private record onto the board;
 - the reconciler, which reads the board every tick and in `live` fills empty
   Status columns, adds missing open items and records promoted cards' ids,
-  and its two read tools.
+  and its two read tools;
+- the builder launcher, which starts one builder in a tmux slot for a card
+  moved to Build, once a hand edit has armed it (off by default).
 
 The bookkeeping move to In Review (#4400 Part 2), the Genesis status and the
 dashboard tab are follow-on work. The shipped mode is `off`.
@@ -6184,8 +6411,8 @@ dashboard tab are follow-on work. The shipped mode is `off`.
     own open totals, and counts cards by Status, Genesis field and kind, plus
     coverage: open tracker issues and PRs on the board against the repo's open
     total;
-  - logs one `drag` event per In Progress card per Status change, keyed
-    `item@<Status updatedAt>`. That value moves on a real Status change and on
+  - logs one `drag` event per In Progress or Build card per Status change
+    (detail `status` names the column), keyed `item@<Status updatedAt>`. That value moves on a real Status change and on
     nothing else (MEASURED 2026-10-04 on a private sandbox, with a control);
   - flags `observed_late` from the clock alone (older than one interval plus
     slack), never from stored state;
@@ -6209,6 +6436,9 @@ dashboard tab are follow-on work. The shipped mode is `off`.
     limit) stops the tick's writes; an error about one item skips that item.
     Outside `live` the summary carries would-write counts (`dry_run`) and
     nothing is written;
+  - then runs the builder launcher (below) on every tick except a failed pause
+    check, with the cards only from a good read; its summary is the
+    `launcher` block, and its error is a job failure;
   - ALWAYS emits a `board` heartbeat (DEBUG) carrying the summary, in every mode
     and while paused. So the pulse is not pause-gated and has no enable check,
     and in mode `off` it is effectively a learning-scheduler canary.
@@ -6217,6 +6447,51 @@ dashboard tab are follow-on work. The shipped mode is `off`.
   write failure records a failure too, with the read's counts and the writes
   already made kept. The step raises if the learning scheduler is
   missing or stopped, so the manifest names that cause instead of the board.
+- **Builder launcher** (`board/launcher/`, spec E ticket E3a). Armed only by
+  `builder_launch: {enabled: true}` (the literal) in `board.local.yaml`, on a
+  valid mode other than `off`; `settings_update` refuses the key. Only
+  `enabled: false`, the board's own `enabled: false` or the kill switch
+  disarms it for good: a session can set `mode: off` back to `propose_only`.
+  Each pass with the mode off records `launcher_disabled`, so setting it back
+  starts a new cutoff (cards already in Build are listed, never launched). The levers
+  beside it (`capacity` 1, `min_free_gb` 4, `login_margin_hours` 6,
+  `first_slot` 9) are range-checked (`config.builder_launch_settings`).
+  - Arming changes are recorded (`launcher_enabled` / `launcher_disabled`); a
+    move not later than the latest enable never launches (a disarm seen
+    mid-pass is recorded at once), and the cards in
+    Build at enable are listed to the owner once.
+  - For each card in Build in the tick's read, keyed `k = item@<Status
+    updatedAt>`: absorbs a move for an issue that already has a live builder;
+    HOLDS (`launch_queued`, keyed `k#q:<kind>`, one owner line per reason) on
+    capacity, free memory, a login expiring within the margin or unreadable,
+    a missing prompt template, slot script or builder guard
+    (`scripts/hooks/builder_guard.py` named in `.claude/settings.json`), or a
+    slot door refusal (retried only once the door's own capacity decision,
+    asked live, would admit);
+    REFUSES (`launch_refused`, final for k) a card that is not an open issue
+    in the tracker repo, an author outside OWNER / MEMBER / COLLABORATOR, an
+    edit after the move, incomplete premise checks
+    (`scripts/premise_gate.py check`, run with `GH_REPO`), or an open closing
+    PR. A failed read is retried next tick, never refused.
+  - Then: writes the body snapshot and the rendered `config/BUILDER_PROMPT.md`
+    under `~/.genesis/builders/<N>/`; records an approval row
+    (`builder_launch`, `costly_reversible`) resolved
+    `board:move:unattributed` (classified `unknown` on purpose) and consumed
+    BEFORE anything starts; writes `builder_launching` (slot, session id,
+    worktree, systemd unit); runs `scripts/cc-slot.sh launch` through
+    `systemd-run --user --wait`, which passes the door's exit code through
+    (MEASURED: 0, 64, 75). Up = a tmux session carrying the key:
+    `builder_launched`. Exit 75 is not a strike; other failures are
+    `launch_failed` strikes, and the third stops the move and tells the owner.
+    systemd stops the unit itself at `RuntimeMaxSec` (the launch timeout),
+    restart or not; an attempt a restart interrupted is settled from tmux and
+    the unit's state.
+  - Run state is derived, never read from events: a place is a live tmux
+    session carrying a key whose issue (`GENESIS_BUILDER_ISSUE`, pinned on that
+    session by the slot door) is neither CLOSED nor has an open closing PR, or a
+    running `genesis-builder-*` unit (`systemctl list-units`). A session with
+    no pinned issue holds its place; an issue whose card left the board is read
+    live. The host reads live in `board/launcher/probes.py`.
 - **`board_status`** reads the stored heartbeats only, never GitHub: the newest
   pulse (alive, mode, error) and the newest SUCCESSFUL read with its age,
   including that tick's `writes` block (None on a summary from before #4400).
@@ -6403,6 +6678,22 @@ verified: b67423bd 2026-10-03
 - **Do not:** write any card, column or status into a local table (the spec
   allows exactly these three stores), or make Genesis move a card into
   In Progress (only a human starts work).
+- **Builder guard** (`scripts/hooks/builder_guard.py`, PreToolUse on Bash;
+  spec E ticket E3e). A no-op unless `GENESIS_BUILDER_KEY` is set, which only
+  the slot door's builder launch sets. With it set it BLOCKS `gh pr merge`,
+  `gh pr review`, every API merge `gh_merge.api_merge_reason` refuses for any
+  session, review-thread replies (REST `.../comments/<id>/replies` or
+  `in_reply_to`) and the GraphQL `resolveReviewThread` /
+  `unresolveReviewThread` / `addPullRequestReviewThreadReply` mutations,
+  through `gh` or `curl` / `wget`. An unreadable command that names one of them
+  is refused. `curl` / `wget` fail closed: any word naming a merge, review,
+  review-comment or GitHub GraphQL endpoint is refused whatever the method, so
+  a builder reads those through `gh api`. Why a block: a reply under the owner's login clears a Codex P1
+  from the merge gate, and a builder carries no dispatched marker, so the
+  merge arm would let it merge once every machine gate is green. `gh pr
+  create`, `gh pr comment`, reads and `git push` are left to the other guards.
+  A broken `hook_input` blocks every session (the shared degraded contract);
+  any other failure blocks a builder only.
 - **Measured facts the follow-on PRs depend on** (2026-10-03, private sandbox
   project):
   - on this account, issue timelines carry NO `ProjectV2ItemStatusChangedEvent`,

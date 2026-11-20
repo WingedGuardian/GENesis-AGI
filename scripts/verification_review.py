@@ -20,8 +20,10 @@ from genesis.session_awareness.pr_completeness import (  # noqa: E402
 )
 from genesis.session_awareness.pr_evidence import EvidenceError  # noqa: E402
 from genesis.session_awareness.pr_verification_sources import (  # noqa: E402
+    ACQUISITION_SECONDS,
     SourceError,
     acquire_sources,
+    reconcile_diff,
     save_packet,
 )
 
@@ -84,6 +86,9 @@ def main(argv: list[str] | None = None) -> int:
         # no packet and never contaminates the source-only Stage-A input.
         evidence_hash = evidence_sha256(load_evidence(args.evidence)) if args.evidence else None
         snapshot = acquire_sources(args.repo, args.pr)
+        # Each path a check could not cover, named so the reviewer treats it as a
+        # gap; derived from the packet's own diff and census, so not stored.
+        gaps = reconcile_diff(snapshot.diff.encode(), snapshot.files, timeout=ACQUISITION_SECONDS)
         packet = save_packet(snapshot, args.output)
     except (SourceError, EvidenceError, OSError) as exc:
         # Do not dump subprocess stderr, PR bodies or raw source on failure.
@@ -93,6 +98,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     print(f"Prepared {args.repo}#{args.pr}: {len(snapshot.files)} files; {packet}")
+    for kind, label in (("blob", "Blob identity"), ("counts", "Line counts (binary)")):
+        if gaps[kind]:
+            print(f"{label} not comparable for {len(gaps[kind])} path(s):")
+            for path in gaps[kind]:
+                print(f"  {path!r}")
     print("Independent completeness review is still required; no ledger write occurred.")
     if evidence_hash is not None:
         print(f"Candidate evidence SHA-256: {evidence_hash}")

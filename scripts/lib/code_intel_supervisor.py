@@ -235,6 +235,46 @@ class Supervisor:
             state = admission.execute_runtime(bound, modules, actual_owner=actual_owner)  # No reserve or repository-lock reacquisition.
             return dict(state=state or "open", trial=claimed["context"], launch_authority=False)
 
+    def accept_retry(self, data):
+        """Accept retained completion; metadata observation has no launch path."""
+        self._guard()
+        snapshot, modules = self.snapshot, self.modules
+        queue, admission = modules["queue"], modules["owner_admission"]
+        native = queue._native
+        native._object(data, ("repo_path", "provider", "nonce", "evidence_reference", "managed_config"),
+                       "supervised acceptance")
+        native._hex(data["nonce"], 32, "acceptance nonce")
+        repo = queue.canonical_repo(data["repo_path"])
+        h = queue.marker_hash(repo)
+        with admission.repository_lock_for(modules, repo, h):
+            grant = self._current_grant(h, data["provider"])
+            if grant is None or grant["status"] != "spent" or grant["nonce"] != data["nonce"]:
+                raise ValueError("acceptance does not name the current completed trial")
+            row = self._observe_schema5(lambda db: dict(native.execution(db, grant["trial"], queue._legs)))
+            if row["launch_reservation"] is None:
+                raise ValueError("acceptance trial has no retained reservation")
+            reserved = native.reservation(json.loads(row["launch_reservation"]), grant["trial"])
+            manager = modules["scope"].ScopeManager(
+                modules["unit"].bus_call, modules["unit"].typed_property,
+                deadline=time.monotonic() + admission.wall_seconds(modules, grant["run_mode"], os.environ))
+
+            def current_policy():
+                return admission.policy(modules, data["provider"], grant["run_mode"], manager, dict(os.environ))
+
+            with admission.prepared_inputs(snapshot, modules, repo, data["provider"], grant["run_mode"],
+                    data["managed_config"], current_policy(), unit=reserved["unit"], recovery=True,
+                    with_observer=True, observe_policy=current_policy) as inputs:
+                def observe():
+                    value = inputs["observe"]()
+                    return dict(source=value["source"], policy_sha256=value["policy_sha256"])
+
+                request = dict(hash=h, repo_path=repo, provider=data["provider"], nonce=data["nonce"],
+                               evidence_reference=data["evidence_reference"])
+                with queue._decision_gate(native=True) as (db, finalize):
+                    result = queue._retry.accept(db, request, native, queue._legs, finalize=finalize,
+                        observe_inputs=observe, fresh_cleanup=queue._fresh_gate(db))
+        return result  # Commit and receipt durability precede acknowledgement.
+
     def reconcile_context(self, context):
         self._guard()
         modules = self.modules

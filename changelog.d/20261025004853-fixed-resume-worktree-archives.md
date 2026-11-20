@@ -1,1 +1,0 @@
-- Interrupted worktree archives are retried automatically, with their original directories and Git history preserved until verification succeeds. Completed archive records and the worktree dashboard recover after interrupted runs.

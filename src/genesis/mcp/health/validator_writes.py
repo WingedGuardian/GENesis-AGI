@@ -120,6 +120,11 @@ async def private_list(db, *, status_filter, limit, include_tabled):
     }
 
 
+def _today():
+    """The UTC date a close is judged on; the backlog's "Rechecks due" read uses the same."""
+    return datetime.now(UTC).date()
+
+
 async def record_verification(
     evidence_json: str,
     pr: StrictInt,
@@ -144,6 +149,8 @@ async def record_verification(
         MAX_EVIDENCE_BYTES,
         Refusal,
         check_e2e_coverage,
+        check_event_dates,
+        completeness_prompts,
         decide,
         parse_evidence,
         reason_for,
@@ -165,6 +172,7 @@ async def record_verification(
     decision = decide(doc, park=park, asserted=verdict, note=note)
     if isinstance(decision, Refusal):
         raise ToolError(decision.message)
+    prompts = completeness_prompts(doc)
     payload = stored_evidence_json(doc)
     if len(payload.encode("utf-8")) > MAX_EVIDENCE_BYTES:
         raise ToolError("Canonical evidence exceeds the byte cap")
@@ -192,6 +200,9 @@ async def record_verification(
         coverage = check_e2e_coverage(doc, actual.body) if closing else None
         if coverage:
             raise ToolError(coverage.message)
+        dated = check_event_dates(doc, closing, _today())
+        if dated:
+            raise ToolError(dated.message)
         rechecks = rechecks_for(doc) if closing else []
         if rechecks and not await crud._rechecks_column_available(db):
             raise ToolError("Rechecks are owed but their column is unavailable; run the migration first")
@@ -210,6 +221,8 @@ async def record_verification(
             # The document's own declaration. On a recorded not-yet-done whose
             # tracking is complete, the picker waits the re-attempt window after it.
             "no_progress": doc.no_progress,
+            # Questions to answer before a close; never stored, never a verdict.
+            "prompts": prompts,
         }
         if preview:
             return result

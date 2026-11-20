@@ -22,6 +22,7 @@ hole; a closed grammar has none of those to handle::
     Premise: LEAD
     Premise-why: the change routes around an existing helper
     Impossible: route every call through one checked helper
+    Alternative: none found: searched scripts/ for a checked subprocess helper
     Scope: covered: the key round-trips (tests/test_x.py)
     Decision: close-class
     Decision-why: the same mistake appears twice
@@ -37,6 +38,13 @@ rationale. A review-body key covers its entire counted group, not one ordinal.
 Citations must predate the reflection (including edits). ``Decision: acknowledge``
 is allowed only for nonempty all-no-defect reflections. Offline validation checks
 syntax only; coverage validates citations online and retains every other gate.
+
+A reflection with a ``fix-now`` disposition also names what already does or
+decides the thing the fix builds: ``Alternative: <it>``, or ``Alternative: none
+found: searched <what>`` (``alternative_problem``). The next round's premise check
+confirms or refutes that line (``.claude/docs/premise-check.md``, step 5). It is
+owed from ``ALTERNATIVE_CUTOVER_ISO`` on, judged by the reflection's commit time,
+so a reflection committed before it never needs the line.
 
 Rounds that owe more add ``Audit-evidence: <path> <label>``, or two
 ``Premise-check: P1 TRUE <text>`` lines plus ``Premise-evidence: <path>
@@ -75,8 +83,15 @@ call, and running out is a refusal, never "nothing owed".
 Late findings (reviews that opened no round, and round-opening reviews that
 arrived after a fix to their head) are owed from ``REFLECTION_CUTOVER_ISO`` on,
 each credited only under its own round's context; ``review_late`` holds that
-reader and is imported only when a cutover is set. The cutover was set when the
+reader (``check`` imports it too, through ``review_past_terminal``). The cutover was set when the
 commit gate started enforcing reflections, so no late debt predates that gate.
+
+Past round 4 on the ordinary lane, ``check`` also applies the past-round-4
+rules (``review_past_terminal``: a Prediction and Confidence on a fix-now,
+Prediction-held from round 5, send-back only after two failed predictions, no
+fix-now for a round 5+ with no floor finding), each read from the budget and
+the one reflection judged. Their optional lines (``Prediction:``,
+``Confidence:``, ``Prediction-held:``) parse in any round.
 
 CLI: ``status`` (what the open round owes, whether it has settled; ``--cutover``
 reports what late findings from that time on would owe, enforcing nothing) and
@@ -114,6 +129,11 @@ SETTLE = timedelta(minutes=30)
 #: debt predates the gate (owner ruling 50cc9dec). None would owe exactly the
 #: open round's keys and never import ``review_late``.
 REFLECTION_CUTOVER_ISO: str | None = "2026-10-22T04:04:01+00:00"
+#: From when a ``fix-now`` reflection owes its ``Alternative:`` line, judged by the
+#: reflection's commit time (``alternative_problem``). Set after the change that
+#: added the line was expected to merge, so no reflection committed on an open
+#: round before the rule shipped is held to it. None owes it never.
+ALTERNATIVE_CUTOVER_ISO: str | None = "2026-11-23T00:00:00+00:00"
 MIN_BLOCK_CHARS = 300
 LOG_DEPTH = 1000
 #: A template placeholder; it can never match a field, so it is refused anyway,
@@ -136,6 +156,17 @@ FIELDS: dict[str, tuple[re.Pattern[str], int, int | None]] = {
     "Premise-why": (re.compile(rf"^Premise-why: ({_TEXT})$"), 1, 1),
     "Impossible": (re.compile(rf"^Impossible: ({_TEXT})$"), 1, 1),
     "Scope": (re.compile(rf"^Scope: ({_TEXT})$"), 1, None),
+    # Owed on a fix-now from ALTERNATIVE_CUTOVER_ISO (``alternative_problem``).
+    # A named alternative may not open with a "none"/"nothing"/"n/a" spelling in
+    # any case: finding nothing is said one way, with what was searched.
+    "Alternative": (
+        re.compile(
+            r"^Alternative: ((?!(?i:none\b|nothing\b|n/?a\b))[!-~][ -~]{9,299}"
+            r"|none found: searched [!-~][ -~]{9,278})$"
+        ),
+        0,
+        1,
+    ),
     "Decision": (re.compile(r"^Decision: (fix-instances|close-class|rework|send-back|acknowledge)$"), 1, 1),
     "Decision-why": (re.compile(rf"^Decision-why: ({_TEXT})$"), 1, 1),
     "Disposition": (
@@ -156,6 +187,14 @@ FIELDS: dict[str, tuple[re.Pattern[str], int, int | None]] = {
         0,
         None,
     ),
+    # The past-round-4 lines (``review_past_terminal``); accepted in any round.
+    "Prediction": (
+        re.compile(rf"^Prediction: merges at round ([1-9][0-9]?) because ({_TEXT})$"), 0, 1
+    ),
+    "Confidence": (
+        re.compile(rf"^Confidence: ([0-9]{{1,2}}|100)% falsified-by ({_TEXT})$"), 0, 1
+    ),
+    "Prediction-held": (re.compile(rf"^Prediction-held: (yes|no) ({_TEXT})$"), 0, 1),
     "Escalate": (re.compile(r"^Escalate: (yes|no)$"), 1, 1),
 }
 _FIELD_NAME_RE = re.compile(r"^([A-Za-z-]{1,20}): ")
@@ -194,10 +233,15 @@ class Reflection:
     premise_evidence: str | None = None
     premise_evidence_verdict: str | None = None
     scopes: list[str] = field(default_factory=list)
+    alternative: str | None = None
     premise_checks: int = 0
     #: ``Premise-check`` claims by number: what the reflection says the cited
     #: premise check concluded, bound to that file by ``evidence_problem``.
     premise_claims: dict[str, str] = field(default_factory=dict)
+    #: The past-round-4 lines (``review_past_terminal``).
+    prediction_round: int | None = None
+    confidence: int | None = None
+    held: str | None = None
     problems: list[str] = field(default_factory=list)
 
     @property
@@ -275,9 +319,15 @@ def parse(
         spec = FIELDS.get(name.group(1)) if name else None
         match = spec[0].match(line) if spec else None
         if match is None:
+            hint = (
+                ": name what already does or decides this, or write exactly "
+                "'none found: searched <what>'"
+                if name and name.group(1) == "Alternative"
+                else ""
+            )
             result.problems.append(
                 f"line {number}: not a recognised field, or its value does not match "
-                f"({line[:60]!r})"
+                f"({line[:60]!r}){hint}"
             )
             continue
         seen[name.group(1)].append(match)
@@ -290,6 +340,8 @@ def parse(
 
     result.classes = [_normalize(m.group(1)) for m in seen["Class"]]
     result.scopes = [m.group(1) for m in seen["Scope"]]
+    if seen["Alternative"]:
+        result.alternative = seen["Alternative"][0].group(1)
     # Distinct premise numbers: one check written twice is still one check.
     result.premise_checks = len({m.group(1) for m in seen["Premise-check"]})
     for m in seen["Premise-check"]:
@@ -299,6 +351,12 @@ def parse(
         result.verdict = seen["Premise"][0].group(1)
     if seen["Decision"]:
         result.decision = seen["Decision"][0].group(1)
+    if seen["Prediction"]:
+        result.prediction_round = int(seen["Prediction"][0].group(1))
+    if seen["Confidence"]:
+        result.confidence = int(seen["Confidence"][0].group(1))
+    if seen["Prediction-held"]:
+        result.held = seen["Prediction-held"][0].group(1)
     if seen["Audit-evidence"]:
         result.audit_evidence = seen["Audit-evidence"][0].group(1)
     if seen["Premise-evidence"]:
@@ -378,6 +436,37 @@ def parse(
             + "): the decision is close-class, rework or send-back, never fix-instances"
         )
     return result
+
+
+#: The default cutover of ``alternative_problem``: the module constant at call
+#: time, so a test can pass ``None`` to mean "no cutover" whatever it says.
+_ALTERNATIVE_DEFAULT: Any = object()
+
+ALTERNATIVE_MISSING = (
+    "a fix-now reflection names what already does or decides this: "
+    "'Alternative: <it>' or 'Alternative: none found: searched <what>'"
+)
+
+
+def alternative_problem(
+    parsed: Reflection, made_at: object = None, *, cutover: str | None | object = _ALTERNATIVE_DEFAULT
+) -> str | None:
+    """Why a ``fix-now`` reflection made at ``made_at`` lacks its ``Alternative:``
+    line, or None. ``made_at`` is the commit time (None, or unreadable, means
+    now: a reflection being committed). Before ``cutover`` nothing is owed."""
+    if cutover is _ALTERNATIVE_DEFAULT:
+        cutover = ALTERNATIVE_CUTOVER_ISO
+    if (
+        cutover is None
+        or parsed.alternative
+        or not any(d.kind == "fix-now" for d in parsed.dispositions.values())
+    ):
+        return None
+    cut = _parse_when(cutover)
+    when = _parse_when(made_at) or datetime.now(UTC)
+    if cut is not None and when < cut:
+        return None
+    return ALTERNATIVE_MISSING
 
 
 # -- git and the network -----------------------------------------------------
@@ -999,15 +1088,35 @@ def check(
     round_started: object,
     made_at: object,
     cwd: str,
+    round_record: Any,
+    round_records: Mapping[str, Any] | None,
 ) -> Reflection:
     """Every local rule a reflection must meet for this round, in one place.
-    ``cwd`` is the repository: a relative evidence path is read from there."""
+    ``cwd`` is the repository: a relative evidence path is read from there.
+    ``round_record`` is the round the keys belong to (None for a late key with
+    no round) and ``round_records`` every round
+    (``review_past_terminal.round_records``, None when unplaceable): they feed
+    the past-round-4 rules."""
+    import review_past_terminal as pt  # noqa: PLC0415 - it imports this module
+
     parsed = parse(
         body,
         round_number=round_number,
         gate_lane=gate_lane,
         acceptance=acceptance,
         previous_classes=previous_classes,
+    )
+    missing = alternative_problem(parsed, made_at)
+    if missing:
+        parsed.problems.insert(0, missing)
+    parsed.problems.extend(
+        pt.problems(
+            parsed,
+            round_record,
+            round_records,
+            gate_lane=gate_lane,
+            made_at=made_at if isinstance(made_at, datetime) else _parse_when(made_at),
+        )
     )
     if parsed.head != head:
         parsed.problems.append(
@@ -1341,6 +1450,7 @@ def coverage_details(
     key_rounds: Mapping[str, frozenset[str]],
     acceptance: Sequence[str] | None,
     round_started: object,
+    round_records: Mapping[str, Any] | None,
     reviewed_at: Mapping[str, datetime | None] | None = None,
     deadline: float | None = None,
     repo: str | None = None,
@@ -1361,8 +1471,10 @@ def coverage_details(
     belongs to the rounds of its keys, ``key_rounds``, and only one that is a
     strict git ancestor of the reflection judged counts), readable evidence files
     (an adversarial audit, a premise check) written between ``round_started``
-    and the reflection's commit where cited or owed, no escalation, and the
-    acceptance points (None only when the PR declares none). Every argument is
+    and the reflection's commit where cited or owed, no escalation, the
+    acceptance points (None only when the PR declares none), and the
+    past-round-4 rules under the round of ``head`` (``round_records``,
+    ``review_past_terminal.round_records``; None turns them off). Every argument is
     required, so no caller gets a weaker check by leaving one out. A
     reflection committed by hand is held to exactly this; there is no weaker
     path. Raises ``Refused`` when git cannot be read: a caller must treat that
@@ -1389,6 +1501,7 @@ def coverage_details(
             key_rounds=key_rounds,
             acceptance=acceptance,
             round_started=round_started,
+            round_records=round_records,
             reviewed_at=reviewed_at or {},
             repo=repo, number=number, wanted_keys=wanted_keys,
         )
@@ -1404,6 +1517,7 @@ def _coverage_details(
     key_rounds: Mapping[str, frozenset[str]],
     acceptance: Sequence[str] | None,
     round_started: object,
+    round_records: Mapping[str, Any] | None,
     reviewed_at: Mapping[str, datetime | None],
     repo: str | None,
     number: int | None,
@@ -1445,6 +1559,8 @@ def _coverage_details(
             round_started=round_started,
             made_at=committed_at,
             cwd=cwd,
+            round_record=None if round_records is None else round_records.get(head),
+            round_records=round_records,
         )
         if result.ok:
             valid = validated_dispositions(
@@ -1676,10 +1792,17 @@ def _open_covered(
         key_rounds=key_rounds(budget),
         acceptance=acceptance,
         round_started=state["round_started"],
+        round_records=_round_records(budget),
         reviewed_at=_open_review_times(budget),
         deadline=deadline,
         repo=repo, number=number,
     )
+
+
+def _round_records(budget: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    import review_past_terminal as pt  # noqa: PLC0415 - it imports this module
+
+    return pt.round_records(budget)
 
 
 def owed_from_budget(
@@ -1753,6 +1876,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     validate.add_argument("file", type=Path)
     validate.add_argument("--round", type=int, default=None)
     validate.add_argument("--gate", action="store_true", help="the gate lane's obligations")
+    validate.add_argument(
+        "--at",
+        default=None,
+        help="judge the file as committed at this ISO time (default: now)",
+    )
     args = parser.parse_args(argv)
     try:
         if args.command == "status":
@@ -1763,6 +1891,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         text = args.file.read_bytes().decode("utf-8")
         parsed = parse(text, round_number=args.round, gate_lane=args.gate)
+        if args.at is not None and _parse_when(args.at) is None:
+            raise ValueError(f"--at {args.at!r} is not an ISO time with a zone")
+        missing = alternative_problem(parsed, args.at)
+        if missing:
+            parsed.problems.insert(0, missing)
         for problem in parsed.problems:
             print(f"- {problem}")
         if parsed.ok and any(d.kind == "no-defect" for d in parsed.dispositions.values()):

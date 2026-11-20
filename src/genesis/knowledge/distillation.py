@@ -307,9 +307,10 @@ class DistillationPipeline:
                 for raw in raw_units:
                     confidence = _coerce_confidence(raw.get("confidence"))
                     if confidence < 0.3:
+                        # No concept text: a credential unit's can carry its secret.
                         logger.info(
-                            "Skipping low-confidence unit: %s (%.2f)",
-                            raw.get("concept", "?")[:60],
+                            "Skipping a low-confidence unit (concept of %d chars, %.2f)",
+                            len(str(raw.get("concept", ""))),
                             confidence,
                         )
                         continue
@@ -320,7 +321,9 @@ class DistillationPipeline:
                         caveats.append(f"User context: {user_context[:200]}")
 
                     unit = KnowledgeUnit(
-                        concept=str(raw.get("concept", ""))[:200],
+                        # Uncapped here: the orchestrator caps it, after a
+                        # credential unit's chokepoint has masked it whole.
+                        concept=str(raw.get("concept", "")),
                         body=str(raw.get("body", "")),
                         domain=str(raw.get("domain", domain)),
                         relationships=_normalize_str_list(raw.get("relationships")),

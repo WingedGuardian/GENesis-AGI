@@ -184,7 +184,8 @@ No alternate executable or uncapped execution path is provided by the launcher.
 
 Run from the primary Genesis checkout, using the accepted v0.11.0 Linux x86_64
 portable binary from the [upstream release](https://github.com/DeusData/codebase-memory-mcp/releases/tag/v0.11.0).
-Other builds/platforms require new acceptance before changing the build pin.
+Other builds/platforms require native acceptance and a reviewed release record
+before use; currently only that release is qualified.
 The binary must be a regular executable file, rather than a symlink.
 
 ```bash
@@ -196,8 +197,25 @@ The binary must be a regular executable file, rather than a symlink.
 ```
 
 The binary argument names an already obtained executable. This command does
-not download or run an installer. Its digest must match the existing stock
-worker's accepted `BUILD`. It never executes a binary found on PATH.
+not download or run an installer. Its digest must match a record in the captured
+stock worker's immutable `RELEASES` table. It never executes a binary found on PATH.
+Configure discovers the selected build from the retained source descriptor,
+copies that same inode and verifies the copy against the selected digest before
+running native configuration. Schema 2 retains that exact digest as `build`.
+
+Every executing role requires the configured digest, even if a different binary
+at that path is another qualified release. The same identity selects the queue's
+provider label and native worker build argument. Captured runner source includes
+the release table; updating live code does not change an existing capsule's policy
+or authorize reuse of old source-bound retry consent. There is no version-range,
+latest-release or PATH fallback, and no queue/settings migration for this selection.
+
+Future compatible releases add small reviewed records after isolated native
+qualification of configuration, daemon/frontend, worker containment and indexing.
+An upgrade uses fresh state and preserves the old binary/settings/cache bundle.
+Rollback restores that bundle after quiescing the candidate; do not open a cache
+written by a newer format with an older binary. Adding support does not upgrade
+existing settings, activate services or remove the disablement sentinel.
 
 Choose a new, short state path outside the repository and settings directory.
 The provider's native runtime uses Unix sockets and refuses overlong endpoint
@@ -842,8 +860,8 @@ reader recognizes coverage only from the exact selected trial's clean terminal,
 control and source identities; ordinary success cannot write that acceptance.
 Newer incidents and a changed or conflicted accepted trial hold the provider.
 Older covered incidents remain retained. Original physical/control obligations
-are never discharged by a provider acceptance watermark. Supervised retry and
-acceptance commands remain a separate contribution.
+are never discharged by a provider acceptance watermark. Explicit supervised
+retry and completed-trial acceptance use the captured runner described below.
 
 Retained cleanup/population/OOM bodies keep their existing safety interpretation
 and fresh original-kernel checks. Their presence alone does not hold a healthy
@@ -1168,14 +1186,53 @@ remain explicit safety evidence for supervised recovery.
 Changes to retained retry code participate in the existing server restart and
 deployment-validation inventory.
 
-Acceptance, strict cutover and native/production qualification remain separate
-gates. Automatic readiness stays negative; issuing or consuming consent does not
+Strict cutover and native/production qualification remain separate gates.
+Automatic readiness stays negative; issuing, consuming or accepting consent does not
 enable automatic retries. Metadata and selected-CLI scratch tests exercise real
 locks, SQL, commit refusal and lost replies with substituted manager/kernel
 observations and an inert owner. Separate sealed GitNexus tests exercise harmless
 provider-child success/failure and late-origin refusal. Retained-row compatibility
 tests construct prior execution facts and prove settlement/replay. These checks
 do not establish native containment or production indexing capacity.
+
+### Accept a completed supervised trial
+
+Through the captured runner's existing `queue` entry point, use
+`accept-retry --repo <canonical-main> --provider cbm --nonce <spent-nonce>
+--managed-config <settings> --evidence-reference <verification-reference>`
+after the exact selected trial has completed successfully and its separate
+settlement has retired the inflight pointer. GitNexus uses the same operation
+with `--provider gitnexus`. The reference must be nonempty, NUL-free and at most
+4096 UTF-8 bytes. This is an explicit metadata operation; it runs no provider.
+
+Acceptance rechecks the spent grant, original source, run mode and attempt debt,
+clean terminal/control/cleanup witnesses, current policy and current captured
+source. CBM configuration and executable observations remain inside the shared
+lifecycle lease; the observer becomes unusable when that lease closes. GitNexus
+reobserves its selected bytes and environment without acquiring a CBM lease.
+All original physical/control obligations are checked separately before the
+final evidence cutoff. No live collector runs after that cutoff.
+
+The operation publishes only the existing five acceptance fields. It neither
+settles accounting nor retires owners, edits pending/failed work, refunds debt
+or grants launch authority. Clean but unapplied trials and consumed trials with
+an inflight pointer refuse; run the separate existing reconciliation before
+retrying acceptance. Grant expiry or a boot change alone does not require a
+clean, settled trial to run again.
+
+An identical replay returns `already_accepted`; a first publication returns
+`accepted`. Both return `launch_authority=false`. Equal-watermark receipts are
+immutable, and a later acceptance cannot lower the watermark. A lost reply can
+therefore be recovered through the same metadata operation without resending
+work. Publication failure preserves the previous receipt and retained evidence.
+
+The watermark covers older known same-provider retained non-cleanup evidence.
+It does not erase that history or cover waiting, unknown, foreign, unbound,
+trial or newer evidence. Ordinary claim/reservation/registration/native-intent
+readers use the current drain's context annotations. Changed or conflicted trial
+evidence and later hazards re-hold admission while the receipt remains retained.
+Physical/control exclusion remains independent of provider coverage. This
+operation does not lift disablement or make automatic readiness positive.
 
 ### Pinned GitNexus typed adapter
 

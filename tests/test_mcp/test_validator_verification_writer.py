@@ -16,6 +16,18 @@ from genesis.session_awareness.pr_recording import PrMetadata
 from tests.test_scripts.test_pr_verification_closer import MERGE_SHA, _doc, _doc_for, _with_tracking
 
 
+@pytest.fixture(autouse=True)
+def _close_before_the_fixture_dates(monkeypatch):
+    """Every close here is judged on a day before the fixtures' event-gate dates
+    (2026-11-02, 2030-01-02), so a close may still store them as rechecks. The
+    refusal of a due trigger is tested with its own date below."""
+    from datetime import date
+
+    from genesis.mcp.health import validator_writes
+
+    monkeypatch.setattr(validator_writes, "_today", lambda: date(2026, 11, 1))
+
+
 @pytest.fixture
 async def recording(tmp_path, monkeypatch):
     from genesis import _config_overlay
@@ -281,6 +293,34 @@ async def test_independent_pr_type_is_checked_before_framework_coercion(recordin
         with sqlite3.connect(path) as fresh:
             actual = fresh.execute("SELECT status FROM pr_verifications WHERE pr_number=1").fetchone()[0]
         pytest.fail(f"Noninteger {type(bad_pr).__name__} reached recording; physical row is {actual}")
+
+
+async def test_a_preview_returns_the_completeness_prompts(recording):
+    doc = _doc(gaps=[{"kind": "method", "detail": "only CI ran it"}])
+    result = await call(doc, dry_run=True)
+    assert result["recorded"] is False
+    assert result["prompts"] and result["prompts"][0].startswith("gaps/0 is a method gap")
+
+
+async def test_a_clean_document_returns_no_prompts(recording):
+    result = await call(_doc(), dry_run=True)
+    assert result["prompts"] == []
+
+
+async def test_a_close_with_a_date_gate_already_come_is_refused(recording, monkeypatch):
+    from datetime import date
+
+    from genesis.mcp.health import validator_writes
+
+    monkeypatch.setattr(validator_writes, "_today", lambda: date(2026, 11, 14))
+    gate = {
+        "kind": "event_gated",
+        "detail": "weekly run",
+        "trigger": "2026-11-14",
+        "recheck": "gh run list",
+    }
+    with pytest.raises(ToolError, match=r"gaps/0 \(trigger 2026-11-14\)"):
+        await call(_doc(gaps=[gate]), dry_run=True)
 
 
 @pytest.mark.parametrize("review_complete", [False, True])

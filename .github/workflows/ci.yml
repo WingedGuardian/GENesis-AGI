@@ -39,9 +39,11 @@ jobs:
         run: ruff check src/ tests/ scripts/
 
   dependency-audit:
-    # REPORTS known-vulnerable dependencies in the resolved runtime tree. It no
-    # longer FAILS — see the step-level continue-on-error below, which is the whole
-    # point of this job's current shape.
+    # REPORTS known-vulnerable dependencies in the resolved runtime tree. The audit
+    # no longer FAILS — see the step-level continue-on-error below, which is the
+    # whole point of that step's shape. The job's last step, the real Scrapling
+    # fetch cases, DOES block: it is here because this is the only job that
+    # installs [browser].
     #
     # It used to be a blocking check whose red run was "a SIGNAL to bump the dep
     # or add a triaged ignore". In practice the signal arrived as a repo-wide
@@ -64,6 +66,12 @@ jobs:
     # alerts — enabled on this repo — remain the mechanism that actually raises a
     # vulnerability to a human. This job is the convenience view of the same
     # data, and a convenience view must not hold the merge queue.
+    #
+    # That holds for the AUDIT, which still never blocks. The job's final step,
+    # the real Scrapling fetch cases, blocks on purpose (owner decision
+    # 2026-11-17): it tests behaviour, not advisory timing, and it can run only
+    # here, the one job that installs [browser]. A red there is a broken fetcher
+    # install, which is worth holding the queue for.
     #
     # NOTE the triaged --ignore-vuln list below is deliberately KEPT rather than
     # deleted. It is the written record of which advisories were examined and why
@@ -124,6 +132,29 @@ jobs:
             --ignore-vuln CVE-2025-69872 \
             --ignore-vuln PYSEC-2026-2475 \
             --ignore-vuln PYSEC-2026-2476
+      - name: Run the real Scrapling fetch cases
+        # Blocking, unlike the audit above: no continue-on-error. This is the only
+        # job that installs [browser], so it is the only one where
+        # test_installed_scrapling_fetches_real_http runs instead of skipping (the
+        # test job installs [test,transcript-analytics]). --ceiling 0 fails the
+        # step if any of the five cases skips, and --min-collected 5 if fewer are
+        # collected, so a selection that matches nothing cannot pass.
+        #
+        # The job's install floats on purpose (the audit reports what a fresh user
+        # install resolves), so the test tools are pinned HERE, after the audit,
+        # to the versions every other test-running job uses; pip moves an
+        # installed newer version down to the pin. The packages under test stay
+        # floating, and blocking on them is intended: a red step here means a
+        # fresh user install of Scrapling's fetchers cannot fetch, not CI noise.
+        run: |
+          pip install -c .github/test-tools/requirements.txt pytest pytest-asyncio pytest-timeout
+          rm -f scrapling-junit.xml
+          pytest -rfEs tests/test_web/test_scrapling_contract.py \
+            -k test_installed_scrapling_fetches_real_http \
+            --junit-xml=scrapling-junit.xml
+          python scripts/check_skip_ceiling.py scrapling-junit.xml --ceiling 0 --min-collected 5
+        env:
+          GENESIS_TESTING: "1"
 
   leak-detector:
     # Verify no user-specific content (IPs, timezones, personal paths, secrets)
@@ -386,7 +417,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-11-12: 90 sites, 31 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-11-14: 91 sites, 31 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 32
     # cannot arrive silently FROM A NEW FUNCTION while the existing 31 are fixed
@@ -801,6 +832,11 @@ jobs:
         # test_a_secret_bearing_file_with_a_line_break_in_its_name_is_skipped
         # [\n] and [\r], "rg not on PATH"), measured in run 43313729694's JUnit,
         # 605 -> 607.
+        # Scrapling 0.5.1 (#4683): five [browser]-gated skips here,
+        # test_scrapling_contract.py::test_installed_scrapling_fetches_real_http
+        # [plain|html|private_redirect|brotli|error] ("requires the browser extra";
+        # this job installs none). They run in dependency-audit. Within the
+        # ceiling, no raise: main measured 591 at run 44079105066, + 5 = 596.
         run: python scripts/check_skip_ceiling.py junit.xml --ceiling 607
 
   test-ubuntu-2404:

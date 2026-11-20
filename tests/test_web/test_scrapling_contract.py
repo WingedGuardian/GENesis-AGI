@@ -11,9 +11,79 @@ from __future__ import annotations
 
 import importlib
 import logging
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
+
+import pytest
 
 # `genesis.web` re-exports a function named `fetch`, so import the module by path.
 fetch = importlib.import_module("genesis.web.fetch")
+
+
+@pytest.fixture
+def real_fetch_server():
+    """Exercise the installed HTTP stack without external sites or browser profiles."""
+    if not fetch._HAS_SCRAPLING:
+        pytest.skip("real Scrapling integration requires the browser extra")
+    import brotli
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = "café — 日本語".encode()
+            status, content_type = 200, "text/plain; charset=utf-8"
+            if self.path == "/html":
+                body = b"<html><title>Fixture</title><body><p>Readable text</p></body></html>"
+                content_type = "text/html; charset=utf-8"
+            elif self.path == "/error":
+                status = 503
+            elif self.path == "/private_redirect":
+                status = 302
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            if self.path == "/brotli":
+                body = brotli.compress(body)
+                self.send_header("Content-Encoding", "br")
+            if self.path == "/private_redirect":
+                self.send_header("Location", "/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("path", ["plain", "html", "private_redirect", "brotli", "error"])
+async def test_installed_scrapling_fetches_real_http(real_fetch_server, path):
+    result = await fetch.WebFetcher(timeout_s=5).fetch(f"{real_fetch_server}/{path}")
+    assert result.client == "scrapling", "fallback must not hide an import failure"
+    if path == "private_redirect":
+        # Scrapling 0.5.1 defaults to safe redirects; never disable that for a fixture.
+        assert result.status_code == 0
+        assert "Redirect to internal IP" in result.error
+        assert not result.text
+    elif path == "error":
+        assert result.status_code == 503
+        assert result.error == "HTTP 503"
+        assert not result.text
+    else:
+        assert result.status_code == 200
+        assert result.error is None
+        if path == "html":
+            assert result.title == "Fixture"
+            assert "Readable text" in result.text
+        else:
+            assert "café — 日本語" in result.text
 
 
 def test_missing_scrapling_is_logged_once(monkeypatch, caplog):
