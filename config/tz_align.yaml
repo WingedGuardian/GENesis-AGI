@@ -1,0 +1,27 @@
+# Clock alignment — scripts/tz_align.sh sets the host clock (through the
+# guardian gateway's set-timezone verb) and the container clock to the zone in
+# ~/.genesis/config/genesis.yaml, at 12:20 local daily (genesis-tz-align.timer)
+# and right after a dashboard zone change.
+#
+# Host jobs (package updates, log rotation, fstrim, cron lines) have no zone of
+# their own, so after a move they run at their usual times in local time, as on
+# a fresh install. The first move runs, once and at the move, each daily or
+# weekly host job whose new local time falls between its last run and the move.
+#
+# A host move to a DIFFERENT zone waits 60 min after the last one
+# (~/.genesis/state/tz_align_last_move): each move can re-run daily host jobs.
+#
+# mode:
+#   live — (default) align the clocks.
+#   off  — leave both clocks alone.
+# enabled: master switch; false is equivalent to off.
+#
+# An invalid mode, or a file here or in the .local.yaml overlay that cannot be
+# read, reads as off. Read fresh on every run, no restart needed. The env kill
+# switch GENESIS_TZ_ALIGN_DISABLED=1 forces off. mode: off is the switch that
+# stops both paths (the timer and the dashboard). To stop only the timer:
+# `systemctl --user disable --now genesis-tz-align.timer`, plus a
+# genesis-tz-align.timer line in ~/.genesis/config/disabled_timers so the next
+# update does not enable it again.
+enabled: true
+mode: live

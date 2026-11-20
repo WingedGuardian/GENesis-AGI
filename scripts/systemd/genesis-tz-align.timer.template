@@ -1,0 +1,19 @@
+[Unit]
+Description=Genesis clock alignment — daily
+
+[Timer]
+# Midday in the container's zone. Moving the host clock runs, once and at the
+# move, each daily or weekly host job whose new local time falls between its
+# last run and the move; midday keeps that burst out of the 05:00-07:00
+# snapshot deletion window when the container already reads the install's zone
+# (installs set it at install time). A container still in another zone fires
+# its first run at 12:20 THERE, which can be another hour in the install's zone.
+# Steady state is a no-op (the gateway reports changed=false).
+# Persistent catches a missed run after downtime; RandomizedDelaySec
+# de-correlates from other timers.
+OnCalendar=*-*-* 12:20:00
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

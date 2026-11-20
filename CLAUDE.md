@@ -84,6 +84,10 @@ gateway, so the host recovery brain never lags a pin bump between updates; see
 `genesis-cc-settings-align.timer` (daily CONTAINER-side re-assert of CC's
 auto-updater suppression in `~/.claude/settings.json`, because the align path
 only helps a box that actually runs an align; see `scripts/cc_settings_align.sh`),
+`genesis-tz-align.timer` (12:20 local daily, and started by a dashboard zone
+change: sets the host clock through the gateway's `set-timezone` verb, and the
+container's, to `genesis.yaml`'s zone; host jobs then follow local time; settings
+lever `tz_align`; see `scripts/tz_align.sh`),
 `genesis-graph-project.timer` (hourly rebuild of the memory-graph projection
 that the FalkorDB store reads — the staleness BOUND, since that store's
 `invalidate()` is a no-op and nothing else refreshes it; a clean no-op on

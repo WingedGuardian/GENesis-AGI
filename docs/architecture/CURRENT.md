@@ -2717,7 +2717,22 @@ verified: 0aa0bf9f2 2026-11-10
   reports which (`config|user|system|fallback`). Guardian log stamps carry
   their UTC offset. The gateway `set-timezone <zone>` verb sets the host
   clock's zone, then the container's, with the installers' calls; host jobs
-  then follow local time, as on a fresh install.
+  then follow local time, as on a fresh install. `scripts/tz_align.sh` calls it
+  with genesis.yaml's zone, from `genesis-tz-align.timer` (12:20 local daily)
+  and from the dashboard's Timezone control (which starts the service and
+  writes `timezone_chosen: true`, so a chosen UTC is told apart from the shipped
+  placeholder); without a guardian it sets the container clock through
+  `sudo -n timedatectl`. Settings lever `tz_align` (off/live, default live; an
+  invalid mode reads as off) + `GENESIS_TZ_ALIGN_DISABLED`. A move runs each
+  daily or weekly host job whose new local time falls between its last run and
+  the move once, at the move (systemd recomputes calendar timers from their last
+  trigger); midday keeps that burst out of the deletion window when the
+  container already reads the install's zone. A zone changed again while a run
+  is applying is re-read and applied (up to 3 passes); a host that does not
+  answer within 120 s fails the unit. The dashboard starts it only for a real change (a new or
+  newly chosen zone), and a host move to a different zone waits 60 min after the
+  last one (`~/.genesis/state/tz_align_last_move`), since each move can re-run
+  daily host jobs.
   The healthy snapshot is still created on its cadence. Reserve relief and
   delete-first never wait; early relief waits only while the pool stays above
   its reserve until the window opens. `any` restores immediate scheduling.
