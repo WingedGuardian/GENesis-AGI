@@ -84,7 +84,9 @@ _TOKEN_FILE_MAX_BYTES = 128  # one token plus slack for a trailing newline
 # present is passed through unchanged once it validates. 256 characters is a
 # resource bound, not a measured length: the ids are UUIDs or short hex today.
 _REQUIRED_FLAGS = ("dispatched", "supervised")
-_OPTIONAL_IDS = ("session_id", "transcript_id", "legacy_session_id")
+# ``builder_key`` marks a builder-slot session, so a tool refused to builders can
+# refuse one behind the shared service too, not only over stdio.
+_OPTIONAL_IDS = ("session_id", "transcript_id", "legacy_session_id", "builder_key")
 _ORIGIN = "origin"
 _FORWARDED_FIELDS = frozenset((*_REQUIRED_FLAGS, *_OPTIONAL_IDS, _ORIGIN))
 # Ids are a closed character set (no whitespace, no path separator, no leading
@@ -305,6 +307,7 @@ def _validated_identity(fields: object) -> CallerContext | None:
         origin=origin,
         transcript_id=fields.get("transcript_id"),
         legacy_session_id=fields.get("legacy_session_id"),
+        builder_key=fields.get("builder_key"),
     )
 
 
