@@ -553,10 +553,17 @@ def test_an_interrupted_drop_is_143(dc, dc_ready, stub):
         stderr=subprocess.PIPE,
         text=True,
     )
-    deadline = time.monotonic() + 60
-    while not (stub / "started").exists():
-        assert p.poll() is None and time.monotonic() < deadline, p.communicate()
-        time.sleep(0.05)
-    p.send_signal(signal.SIGTERM)
-    out, err = p.communicate(timeout=60)
-    assert p.returncode == 143, out + err
+    try:
+        deadline = time.monotonic() + 60
+        while not (stub / "started").exists():
+            if p.poll() is not None or time.monotonic() >= deadline:
+                p.kill()  # the message must not wait on a child that never ends
+                pytest.fail(f"the restart stub never started: {p.communicate(timeout=10)}")
+            time.sleep(0.05)
+        p.send_signal(signal.SIGTERM)
+        out, err = p.communicate(timeout=60)
+        assert p.returncode == 143, out + err
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait(timeout=10)
