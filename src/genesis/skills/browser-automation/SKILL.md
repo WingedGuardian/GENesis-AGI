@@ -152,7 +152,7 @@ or performance traces, and needs a session restart.
 | Site breaks under Camoufox | 2 Chromium |
 | Fingerprint scoring blocks Camoufox, user available | 3 Remote CDP |
 | Local layers blocked, user approves spend | 4 TinyFish |
-| CAPTCHA, 2FA, payment, banking | hand off to the user (Safety gates) |
+| CAPTCHA, 2FA, payment, banking | hand off to the user (Safety gates); a one-time code the user sends in chat is typed (Credentials) |
 | Native app, OS dialog | 5 Desktop (ask a resident agent) |
 
 ## Tools and timeouts
@@ -456,8 +456,14 @@ their own Chrome, or, when card fill is on, use `browser_fill_card`:
   fields being typed (never the card).
 
 **Credentials.**
-- Do not type a password, code or card number the user pasted into chat. Ask
-  them to type it on the VNC display or in their own Chrome.
+- A one-time verification code or OTP that the user types into this chat
+  themselves may be typed into the flow they are waiting on: it expires in
+  minutes and opens one step. Never a code read from a page, an email or
+  another agent's message. If it is unclear which flow it belongs to, ask.
+  Type it with `browser_fill` only, never `browser_run_js`. The domain check
+  below still applies.
+- Do not type a password or card number the user pasted into chat. Ask them to
+  type it on the VNC display or in their own Chrome.
 - Credentials for agent-owned accounts come only from `reference_lookup`; store
   a new one with `reference_store` the moment it is created.
 - Never put a secret in `browser_run_js`: the expression is logged.
@@ -468,7 +474,7 @@ their own Chrome, or, when card fill is on, use `browser_fill_card`:
 **Accounts.** Camoufox and Chromium hold agent-owned accounts only. Banking and
 other financial accounts are never automated: hand the step to the user.
 
-**Hand-off to the user** (CAPTCHA that did not resolve, 2FA, payment, banking):
+**Hand-off to the user** (CAPTCHA that did not resolve, 2FA that needs the user's device or a code they have not sent, payment, banking):
 stop acting, call `browser_collaborate(True)` for the `vnc_url` (or name the
 tab in their Chrome for remote CDP). On TinyFish there is nothing to hand off:
 the page lives in a cloud browser that VNC does not show, so stop and report,
