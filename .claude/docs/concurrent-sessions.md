@@ -136,6 +136,20 @@ Attribution is possible but uneven. In rough order of strength:
   own session without any forensics. Check the trailer first; it is the purpose-built
   link and it costs one `git log` read. Author identity is a much weaker signal —
   it separates session CLASSES at best, never two sessions of the same class.
+- **Which session opened a PR: `scripts/pr_opener.py <N>`.** One read-only command
+  answers from the `Opened-by-session: <8hex>` line as GitHub's edit history first
+  recorded it (the newest stamped version within 120 s of the PR's creation, else the
+  oldest; GitHub keeps every version, so a later rewrite cannot change the answer; an
+  example inside a code fence or a quote does not count), else the first commit's
+  `Genesis-Session` trailer (the session that WROTE the first commit, said as such,
+  and `"authoritative": false` in `--json`). It names the source, the `cc_sessions`
+  row (matched on `id` or `cc_session_id`) with its charter mission, every other
+  session that committed to the PR, and the worktree holding the head branch. A PR
+  with none of the three says "no session recorded".
+  **To correct a wrong attribution**, add `Opened-by-session-correction: <8hex>` to
+  the CURRENT body: it overrides the history (source `corrected`, the recorded stamp
+  still shown). Past the PR's first two minutes, editing or deleting the
+  `Opened-by-session` line itself changes nothing, by design.
 - **The ledger indexes work to sessions.** A PR body citing `Ledger: <32-hex>` resolves
   to a `session_ledger` row whose `session_id` is **the CC transcript session id, which
   matches `cc_sessions.cc_session_id` — NOT `cc_sessions.id`** (the two differ; joining
