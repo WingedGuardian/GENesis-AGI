@@ -1057,6 +1057,12 @@ def test_shared_header_fills_the_hash_window():
             "Career outreach: 3 staged draft(s) 2026-10-01 aaaa1111",
             "Career outreach: 3 staged draft(s) 2026-10-01 bbbb2222",
         ),
+        (
+            "builder_launch",
+            "alert",
+            "Builder launcher: refused:PVTI_a@2026-11-15T10:00:00Z",
+            "Builder launcher: refused:PVTI_b@2026-11-15T10:05:00Z",
+        ),
     ],
 )
 async def test_identity_types_distinct_topic_not_duplicate(
@@ -1084,6 +1090,7 @@ async def test_identity_types_distinct_topic_not_duplicate(
         ("queued_alert", "blocker", "alert:backup:aaaaaaaaaaaa"),
         ("morning_report", "digest", "Morning Report — 2026-09-29"),
         ("career_outreach_nudged", "notification", "Career outreach: 3 staged draft(s) 2026-10-01 aaaa1111"),
+        ("builder_launch", "alert", "Builder launcher: refused:PVTI_a@2026-11-15T10:00:00Z"),
     ],
 )
 async def test_identity_types_same_topic_still_duplicate(db, signal_type, category, topic):

@@ -75,7 +75,7 @@ fi
 # restore. The skip deliberately does NOT touch backup_status.json: writing
 # success:false would page a false CRITICAL (health `backup:last_failed`)
 # during a legitimate restore, so the prior run's status stays put and the
-# existing `backup:overdue` staleness alert (>8h) detects a wedged holder
+# existing `backup:overdue` staleness alert (>9h) detects a wedged holder
 # honestly. That is why this block sits BEFORE the EXIT trap below — a skip
 # must write nothing (log() isn't defined yet either; the echo is inline).
 # The lock fd is held for the script's lifetime and released at exit; the
@@ -264,7 +264,7 @@ _on_exit() {
     # N2: the SQL section's temps (the dump's count file and the encrypted
     # candidate) must not outlive the script if it died mid-section.
     rm -f "${_SQL_COUNT:-}" "${_SQL_ARTIFACT_TMP:-}" 2>/dev/null || true
-    rm -f "${_EXTRA_TAR_TMP:-}" "${_EXTRA_TAR_ERR:-}" 2>/dev/null || true  # §6f plaintext tar + its file-name diagnostics
+    rm -f "${_EXTRA_GPG_TMP:-}" "${_EXTRA_TAR_ERR:-}" 2>/dev/null || true  # §6f encrypted archive in flight + its diagnostics
     rm -f "${_ENCRYPT_PARTIAL:-}" "${_ENCRYPT_ERR_TMP:-}" 2>/dev/null || true  # encrypt_file's in-flight partial + gpg stderr
     if [ -n "${_VERIFY_DB:-}" ]; then
         rm -f "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm" 2>/dev/null || true
@@ -343,97 +343,25 @@ log "big-temp dir: $GENESIS_BIG_TMP"
 # write-a-plaintext-dump-and-a-DB-then-free-them every 6h was MEASURED to
 # coincide with 18-58 s filesystem commit stalls.
 _VERIFY_MODE=""  # memory | disk, set by _pick_verify_mode
-_CGROUP_FS="${GENESIS_BACKUP_CGROUP_FS:-/sys/fs/cgroup}"   # overridable for tests
-_PROC_CGROUP="${GENESIS_BACKUP_PROC_CGROUP:-/proc/self/cgroup}"
+# _num, _cgroup_headroom_kb and the fits-in-memory predicate are shared with
+# the backup unit's ExecStartPre (scripts/backup_wait_for_ram.sh), which waits
+# for this same predicate before backup.sh starts.
+# shellcheck source=scripts/lib/backup_verify_memory.sh
+source "$_SCRIPT_DIR/lib/backup_verify_memory.sh"
 
-# _num <value> <default> — a decimal integer of at most 6 digits, else the
-# default. 10# stops "08" aborting the run as a bad octal under set -e, and the
-# length cap keeps the arithmetic below from overflowing.
-_num() {
-    case "$1" in ''|*[!0-9]*) echo "$2" ;; *) [ "${#1}" -le 6 ] && echo $((10#$1)) || echo "$2" ;; esac
-}
-
-# _cgroup_headroom_kb — the smallest (limit - usage + inactive_file) over this
-# process's cgroup and its ancestors, in KB; empty when no level is capped.
-# Usage includes page cache, which fills toward the cap on any long-running
-# box, so the cold part of it (inactive_file) counts as available, the way
-# MemAvailable counts it. /proc/meminfo reports the host's memory under a capped
-# Docker/systemd cgroup without lxcfs, so it alone could approve memory a cap
-# does not have. A v1 memory-controller line wins over "0::": a hybrid host has
-# both, and its cap lives on the v1 side. Each level is read on its own (its own
-# limit against its own usage), so a cap on an ancestor counts everything under
-# it. A level with a cap but unreadable usage counts as no headroom.
-_cgroup_headroom_kb() {
-    local _p _d _root _m _c _i _h _best="" _v1=false
-    _p=$(awk -F: '$2 ~ /(^|,)memory(,|$)/ {print $3; exit}' "$_PROC_CGROUP" 2>/dev/null) || _p=""
-    if [ -n "$_p" ]; then
-        _v1=true
-        _root="$_CGROUP_FS/memory"
-    else
-        _p=$(awk -F: '$1 == "0" {print $3; exit}' "$_PROC_CGROUP" 2>/dev/null) || _p=""
-        [ -n "$_p" ] || return 0
-        _root="$_CGROUP_FS"
-    fi
-    _d="$_root${_p%/}"
-    while :; do
-        if $_v1; then
-            _m=$(cat "$_d/memory.limit_in_bytes" 2>/dev/null) || _m=""
-            _c=$(cat "$_d/memory.usage_in_bytes" 2>/dev/null) || _c=""
-            _i=$(awk '$1 == "total_inactive_file" {print $2}' "$_d/memory.stat" 2>/dev/null) || _i=""
-        else
-            _m=$(cat "$_d/memory.max" 2>/dev/null) || _m=""
-            _c=$(cat "$_d/memory.current" 2>/dev/null) || _c=""
-            _i=$(awk '$1 == "inactive_file" {print $2}' "$_d/memory.stat" 2>/dev/null) || _i=""
-        fi
-        case "$_i" in ''|*[!0-9]*) _i=0 ;; esac
-        # A cap is a decimal below 2^60: v2 writes "max" for none, and v1 a
-        # value near 2^63 (19 digits), which is also kept out of the arithmetic.
-        case "$_m" in ''|*[!0-9]*) _m="" ;; esac
-        if [ -n "$_m" ] && [ "${#_m}" -le 18 ] && [ "$_m" -lt 1152921504606846976 ]; then
-            case "$_c" in
-                ''|*[!0-9]*) _h=0 ;;
-                *) [ "${#_c}" -le 18 ] && _h=$(( (_m - _c + _i) / 1024 )) || _h=0 ;;
-            esac
-            [ "$_h" -ge 0 ] || _h=0
-            if [ -z "$_best" ] || [ "$_h" -lt "$_best" ]; then _best=$_h; fi
-        fi
-        [ "$_d" = "$_root" ] && break
-        _d="${_d%/*}"
-        case "$_d" in "$_root"*) ;; *) break ;; esac
-    done
-    echo "$_best"
-}
-
-# _pick_verify_mode — set _VERIFY_MODE. Memory needs available memory of
-# VERIFY_RAM_FACTOR x the live DB size (the rebuilt DB plus sqlite's working
-# set) PLUS a floor of VERIFY_RAM_FLOOR_PCT of MemTotal. Available is the lower
-# of MemAvailable and the cgroup headroom. The floor is there because
-# systemd-oomd kills sessions on sustained reclaim pressure: the check only
-# takes memory when it would stay well clear of that afterwards. It is a
-# start-time snapshot; a check that then fails in memory is re-run on disk.
+# _pick_verify_mode — set _VERIFY_MODE: memory when _verify_memory_check
+# (scripts/lib/backup_verify_memory.sh) says the rebuilt DB fits with the floor
+# to spare, disk otherwise. It is a snapshot taken here, minutes after the unit
+# started; a check that then fails in memory is re-run on disk.
 # GENESIS_BACKUP_VERIFY_MEMORY=off forces disk.
 _pick_verify_mode() {
-    local _factor _floor_pct _db_bytes _wal_bytes _need_kb _avail_kb _total_kb _floor_kb _cg
+    local _need_kb _avail_kb _total_kb _floor_kb
     _VERIFY_MODE=disk
     if [ "${GENESIS_BACKUP_VERIFY_MEMORY:-on}" = off ]; then
         log "SQLite: round-trip verify on disk: GENESIS_BACKUP_VERIFY_MEMORY=off"
         return 0
     fi
-    _factor=$(_num "${GENESIS_BACKUP_VERIFY_RAM_FACTOR:-}" 2)
-    [ "$_factor" -ge 2 ] || _factor=2  # the rebuilt DB plus its index sorts
-    _floor_pct=$(_num "${GENESIS_BACKUP_VERIFY_RAM_FLOOR_PCT:-}" 20)
-    _db_bytes=$(stat -c %s "$DB_FILE" 2>/dev/null) || _db_bytes=0
-    # Committed data still in the WAL is part of the dump, and so of the
-    # rebuilt DB, but not of the main file's size.
-    _wal_bytes=$(stat -c %s "$DB_FILE-wal" 2>/dev/null) || _wal_bytes=0
-    _db_bytes=$(( _db_bytes + _wal_bytes ))
-    _need_kb=$(( (_db_bytes / 1024 + 1) * _factor ))
-    _avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null) || _avail_kb=0
-    _total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null) || _total_kb=0
-    _cg=$(_cgroup_headroom_kb) || _cg=""
-    if [ -n "$_cg" ] && [ "$_cg" -lt "${_avail_kb:-0}" ]; then _avail_kb=$_cg; fi
-    _floor_kb=$(( ${_total_kb:-0} * _floor_pct / 100 ))
-    if [ "${_avail_kb:-0}" -lt $(( _need_kb + _floor_kb )) ]; then
+    if ! _verify_memory_check "$DB_FILE"; then
         log "SQLite: round-trip verify on disk: memory short (need ${_need_kb} KB + floor ${_floor_kb} KB, available ${_avail_kb:-0} KB)"
         return 0
     fi
@@ -1135,7 +1063,7 @@ fi
 # older snapshots keep it until retention drops them. It never fails the backup.
 _EXTRA_COUNT=0
 _EXTRA_SKIPPED=0       # listed directories NOT archived this run, for any reason
-_EXTRA_TAR_TMP=""
+_EXTRA_GPG_TMP=""     # the encrypted archive being written (absolute), for the exit handler
 _EXTRA_TAR_ERR=""
 _EXTRA_UPLOAD_FAILED=0
 _EXTRA_UPLOADED=()     # names that reached the off-site snapshot (recorded in COMPLETE)
@@ -1295,19 +1223,13 @@ else
         _name="$(printf '%s' "$_rel" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)-$(printf '%s' "$_rel" | sha1sum | cut -c1-8).tar.gpg"
         # Temp creation can fail (a full or inode-exhausted temp filesystem): skip this
         # directory, never abort the whole backup over an optional payload.
-        if ! _tar_tmp="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.tar 2>/dev/null)"; then
-            _extra_skip "cannot create a temp file in $GENESIS_BIG_TMP" "$_d"
-            continue
-        fi
-        _EXTRA_TAR_TMP="$_tar_tmp"
         if ! _tar_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
-            rm -f "$_tar_tmp"
-            _EXTRA_TAR_TMP=""
             _extra_skip "cannot create a temp file in $GENESIS_BIG_TMP" "$_d"
             continue
         fi
         _EXTRA_TAR_ERR="$_tar_err"
         _gpg_tmp="extra/.${_name}.partial.$$"
+        _EXTRA_GPG_TMP="$PWD/$_gpg_tmp"
         # A Python virtualenv under the directory, whatever it is named (the default
         # excludes catch only `.venv` and `venv`): any directory holding pyvenv.cfg.
         # Its interpreter links in bin/ are absolute, so a restore refuses them and the
@@ -1335,22 +1257,44 @@ else
             done < <(find "$_venv/bin" -maxdepth 1 -type l -lname '/*' -print0 2>/dev/null)
         done < <(find "$_abs" -mindepth 1 -type d \( "${_venv_prune[@]}" -false \) -prune \
             -o -type f -name pyvenv.cfg -printf '%h\0' 2>/dev/null)
-        _tar_rc=0
+        # The archive streams straight into encryption, and the check below reads it
+        # back by decrypting what was encrypted: no plaintext copy of the directory
+        # is ever written. The plaintext tar this replaced doubled the stage's disk
+        # writes (several GB per run for a large directory), and on a busy disk
+        # that burst stalled the whole filesystem.
         # --hard-dereference: a hard link is stored as file content, so restore never
         # meets a hard-link member. Symlinks are kept as links; restore accepts the
         # ones that stay inside the restored directory.
-        tar -C "$_home_real" --hard-dereference "${_extra_ex_args[@]}" \
+        if tar -C "$_home_real" --hard-dereference "${_extra_ex_args[@]}" \
             --anchored "${_venv_ex[@]+"${_venv_ex[@]}"}" --no-anchored \
-            -cf "$_tar_tmp" -- "$_rel" 2>"$_tar_err" || _tar_rc=$?
+            -cf - -- "$_rel" 2>"$_tar_err" | encrypt_stream "$_gpg_tmp"; then
+            _xst=("${PIPESTATUS[@]}")
+        else
+            _xst=("${PIPESTATUS[@]}")
+        fi
+        _tar_rc="${_xst[0]}" _enc_rc="${_xst[1]}"
         # GNU tar exit 1 = some files changed while being read: the archive is written,
-        # but a file that was changing may be torn. 2+ = fatal.
+        # but a file that was changing may be torn. 2+ = fatal; 128+ is a signal,
+        # usually SIGPIPE after encryption stopped reading.
         _tar_head="$(head -3 "$_tar_err" | tr '\n' ' ')"
         rm -f "$_tar_err"
         _EXTRA_TAR_ERR=""
-        if [ "$_tar_rc" -ge 2 ]; then
-            rm -f "$_tar_tmp"
-            _EXTRA_TAR_TMP=""
+        if [ "$_tar_rc" -ge 2 ] && [ "$_tar_rc" -lt 128 ]; then
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
             _extra_skip "tar failed rc=$_tar_rc: $_tar_head" "$_d"
+            continue
+        fi
+        if [ "$_enc_rc" -eq 0 ] && [ "$_tar_rc" -ge 2 ]; then
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
+            _extra_skip "tar was stopped by signal $((_tar_rc - 128))" "$_d"
+            continue
+        fi
+        if [ "$_enc_rc" -ne 0 ]; then
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
+            _extra_skip "encryption failed (encrypt exit $_enc_rc, tar exit $_tar_rc)" "$_d"
             continue
         fi
         [ "$_tar_rc" -eq 1 ] && log "NOTE: ~/$_rel changed while archiving; a file that was changing may be torn: $_tar_head"
@@ -1358,20 +1302,47 @@ else
         # and yield an archive without it, with rc 0. Check with the reader and the
         # member filter restore uses (never by parsing `tar -t`, which escapes
         # backslashes and, under a C locale, non-ASCII names), so backup keeps exactly
-        # what restore will accept.
-        _tar_root="" _tar_root_why="" _tar_summary="" _tar_verify_rc=0
+        # what restore will accept. The archive checked is the encrypted one that
+        # ships, decrypted into the checker as the SQL round-trip does it; the
+        # decrypted bytes count only once the decrypt tool exits 0 (GPG has then
+        # authenticated the whole message). Its stderr is fixed text naming the
+        # cause (authentication failed, or the checker closed the pipe), so it is
+        # kept with the checker's.
+        _tar_root="" _tar_root_why="" _tar_summary="" _tar_verify_rc=0 _dec_rc=""
         if _tar_root_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
             _EXTRA_TAR_ERR="$_tar_root_err"
-            _tar_root="$(python3 "$_SCRIPT_DIR/lib/extra_restore.py" verify "$_tar_tmp" "$GENESIS_BIG_TMP" 2>"$_tar_root_err")" || _tar_verify_rc=$?
+            _tar_root="$( {
+                {
+                    printf '%s' "$_BACKUP_PASSPHRASE" | python3 \
+                        "$_SCRIPT_DIR/../src/genesis/guardian/cred_integrity.py" decrypt-backup-stream "$_gpg_tmp"
+                    exit "${PIPESTATUS[1]}"
+                } | python3 "$_SCRIPT_DIR/lib/extra_restore.py" verify-stream "$GENESIS_BIG_TMP"
+                _vst="${PIPESTATUS[0]} ${PIPESTATUS[1]}"  # before any other command resets it
+                echo "VERIFY-STATUS $_vst" >&2
+            } 2>"$_tar_root_err" )" || true
+            _vst="$(sed -n 's/^VERIFY-STATUS //p' "$_tar_root_err" | tail -n 1)" || _vst=""
+            _dec_rc="${_vst%% *}"
+            _tar_verify_rc="${_vst##* }"
+            case "$_dec_rc$_tar_verify_rc" in '' | *[!0-9]*) _dec_rc="?" _tar_verify_rc=5 ;; esac
             # verify's last line counts the refusals by class (exit 4 only): kept for
             # the status file, and left out of the WARNING, which stays prose.
             _tar_summary="$(grep -m1 '^REFUSED-SUMMARY ' "$_tar_root_err" | cut -d' ' -f2-)" || _tar_summary=""
-            _tar_root_why="$(grep -v '^REFUSED-SUMMARY ' "$_tar_root_err")" || true
+            _tar_root_why="$(grep -v -e '^REFUSED-SUMMARY ' -e '^VERIFY-STATUS ' "$_tar_root_err")" || true
             rm -f "$_tar_root_err"
             _EXTRA_TAR_ERR=""
         else
             _tar_verify_rc=5
             _tar_root_why="cannot create a temp file in $GENESIS_BIG_TMP"
+        fi
+        # A check that failed by itself (exit 5) closes the pipe, which makes the
+        # decrypt fail too: the check's branch below reports that case. Only a check
+        # that read the whole archive (0 or 4) pins a failure on the archive itself.
+        if [ -n "$_dec_rc" ] && [ "$_dec_rc" != 0 ] \
+            && { [ "$_tar_verify_rc" = 0 ] || [ "$_tar_verify_rc" = 4 ]; }; then
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
+            _extra_skip "the encrypted archive did not read back (decrypt exit $_dec_rc, check exit $_tar_verify_rc)" "$_d"
+            continue
         fi
         _tar_partial=false
         if [ "$_tar_verify_rc" -eq 4 ] && [ "$_tar_root" = "$_rel" ]; then
@@ -1379,17 +1350,17 @@ else
             # partial, so the off-site copy is not reported complete and the alert fires.
             _tar_partial=true
         elif [ "$_tar_verify_rc" -eq 0 ] && [ -n "$_tar_root" ] && [ "$_tar_root" != "$_rel" ]; then
-            rm -f "$_tar_tmp"
-            _EXTRA_TAR_TMP=""
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
             _extra_skip "the archive holds ${_tar_root} instead; does an exclude pattern match the directory itself?" "$_d"
             continue
         elif [ "$_tar_verify_rc" -ne 0 ] || [ "$_tar_root" != "$_rel" ]; then
-            rm -f "$_tar_tmp"
-            _EXTRA_TAR_TMP=""
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
             _extra_skip "restore could not use the archive (rc=$_tar_verify_rc: ${_tar_root_why:-no directory member}); does an exclude pattern match the directory itself?" "$_d"
             continue
         fi
-        if encrypt_file "$_tar_tmp" "$_gpg_tmp" && mv -f "$_gpg_tmp" "extra/$_name"; then
+        if mv -f -T "$_gpg_tmp" "extra/$_name"; then
             _EXTRA_COUNT=$((_EXTRA_COUNT + 1))
             _EXTRA_BUILT+=("$_name")
             if $_tar_partial; then
@@ -1400,10 +1371,9 @@ else
             fi
         else
             rm -f "$_gpg_tmp"
-            _extra_skip "encryption failed" "$_d"
+            _extra_skip "could not move the encrypted archive into place" "$_d"
         fi
-        rm -f "$_tar_tmp"
-        _EXTRA_TAR_TMP=""
+        _EXTRA_GPG_TMP=""
     done
     if [ "$_extra_listed" -eq 0 ]; then
         _extra_skip "the list has no entries" "GENESIS_BACKUP_EXTRA_DIRS=$GENESIS_BACKUP_EXTRA_DIRS"

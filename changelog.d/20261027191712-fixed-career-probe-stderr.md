@@ -1,1 +1,0 @@
-- A failed career-outreach bridge probe or auto-run dispatch now records the remote's exit code and the end of its error output (credentials scrubbed) in job health, instead of only "Remote claude exited 1".

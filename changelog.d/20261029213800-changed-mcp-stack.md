@@ -1,1 +1,0 @@
-- Upgrade the MCP servers to FastMCP 4 and MCP SDK 2 while preserving their stdio tool catalogs, external-client restrictions, and progress reporting. Dependency changes require the full update path.

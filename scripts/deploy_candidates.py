@@ -28,7 +28,9 @@ Commands:
         approval (drop the branch to revoke one). It RECORDS a claim, it does not verify one:
         any caller can pass the flag, so pass it only after the owner said yes. Refuses unless the install is READY and
         every per-candidate check passes (below). Prints the next step; it
-        does not rebuild.
+        does not rebuild. The manifest lists candidates in pin order: adding a
+        branch again at a new head moves it to the end (the same head keeps
+        its place), so the last listed is the newest code.
   drop <branch> [--no-rebuild]
         Take a candidate out of the manifest. On `live` it then removes the
         candidate from `live`: SUBTRACT-ONLY and OFFLINE, on the base `live` is
@@ -56,7 +58,45 @@ Commands:
         first write or its "unchanged" result; an on-`live` drop writes the
         manifest right after that check, and a manifest-only drop re-checks
         the branch, HEAD and `live` before writing it.
-  list  The manifest as written (checked to be this repository's). No network.
+  drop <branch> --expect-branch live --expect-head T --expect-candidate H [--restart-server]
+        The Guardian's drop (#4911), run with the entry's --wait 0, so all of
+        it happens in ONE update.lock hold. It refuses, nothing changed,
+        unless the manifest still pins <branch> at H (a re-pin since refuses),
+        the checkout is on `live` at T, and no move refusal applies. After the
+        drop it confirms from its own view: <branch> neither listed nor held
+        by `live`, the checkout on `live` at the commit the move left, no move
+        refusal. Only then, with --restart-server, it QUEUES the restart
+        (`systemctl --user restart --no-block genesis-server`, from python, so
+        no child gets the lock fd), or queues nothing while the unit is
+        activating ("a start is already in progress"). The start runs after
+        the engine exits, so the boot repair's lock wait is never starved.
+        The confirmation does not cover the git hook restore and sync after
+        the move: a failure there is a WARNING in the output and still exit 0.
+          0    dropped and confirmed; restart queued, a start already in
+               progress, or no restart asked for
+          1    refused, nothing changed; or the confirmation failed (the
+               manifest WAS saved; the text names what it saw, `rebuild` only
+               when the branch may still be listed or held, and nothing
+               restarts); or, from the entry, a live deploy "holds the deploy
+               marker" (that phrase: a wait, nothing changed; "cannot write
+               the deploy marker" is a fault)
+          2    usage: --restart-server needs --expect-candidate, which needs
+               --expect-branch live and --expect-head, never --no-rebuild
+          4    dropped and confirmed, but the restart was not queued (the
+               state read failed, or the enqueue failed with an answer; the
+               text names the systemctl error)
+          5    dropped and confirmed, but the restart enqueue got no answer:
+               it may have been queued (`scripts/deploy_code_only.sh status`
+               says what the server runs)
+          97   the test fence refused (entry)
+          130/143  interrupted: the drop may be half-done; `list --json
+               --move-refusals` shows where it got to
+          200  update.lock held: nothing was done (entry)
+  list [--json [--move-refusals]]
+        The manifest as written (checked to be this repository's). No network.
+        --json: what the manifest lists and what `live` holds (deploy health).
+        --move-refusals adds the checkout's branch and HEAD and every reason a
+        drop or rebuild would refuse to move it now (the Guardian's drop).
   status
         READINESS, and per candidate: whether it is in `live` now, what the next
         rebuild would do with it (included, excluded and why, retired, or
@@ -125,8 +165,9 @@ that pattern, so HEAD needs the default). Neither is kept through an explicit
 git 2.43).
 
 Exit codes: 0 done, 1 refused or failed (the message says which; a refusal
-changes nothing), 2 usage. The entry adds 200: update.lock still held after the
-wait.
+changes nothing), 2 usage, 4 the Guardian's drop is done but its restart was
+not queued, 5 done but the restart enqueue got no answer, so it may have been
+queued (above). The entry adds 200: update.lock still held after the wait.
 """
 
 import os  # noqa: E402  (os and sys are preloaded by the interpreter; see below)
@@ -188,6 +229,7 @@ import contextlib  # noqa: E402
 import datetime  # noqa: E402
 import fcntl  # noqa: E402
 import json  # noqa: E402
+import subprocess  # noqa: E402
 from collections.abc import Callable, Mapping  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -261,6 +303,31 @@ def _restart_advice(moved: plan.Move) -> None:
         )
         return
     out("  validation holds the lock: scripts/deploy_code_only.sh restart (launch it detached).")
+
+
+SYSTEMCTL_TIMEOUT_S = 10
+SYSTEMCTL_NO_ANSWER = 124
+
+
+def _systemctl(env: Mapping[str, str], *args: str) -> subprocess.CompletedProcess:
+    """`systemctl --user <args>`. No pass_fds and close_fds left at its default
+    (True): update.lock's fd never reaches the child (the restart, #4911). Both
+    calls (a property read, a --no-block enqueue) answer in milliseconds; 10 s
+    bounds a hung user manager while update.lock is held. A timeout returns
+    SYSTEMCTL_NO_ANSWER: the request may have reached the manager, so for the
+    enqueue it means "maybe queued" (exit 5), never "not queued"."""
+    cmd = ["systemctl", "--user", *args]
+    try:
+        return subprocess.run(
+            cmd, env=gate.user_bus_env(env), capture_output=True, text=True,
+            timeout=SYSTEMCTL_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            cmd, SYSTEMCTL_NO_ANSWER, "", f"no answer within {SYSTEMCTL_TIMEOUT_S} s"
+        )
+    except OSError as exc:
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
 
 class Engine(Repo):
@@ -557,9 +624,12 @@ class Engine(Repo):
             out(f"  retiring: {b}")
 
     # ── commands ─────────────────────────────────────────────────────────
-    def cmd_list(self, as_json: bool = False) -> int:
+    def cmd_list(self, as_json: bool = False, move_refusals: bool = False) -> int:
         if as_json:
-            out(json.dumps(self.observe(), sort_keys=True))
+            seen = self.observe()
+            if move_refusals:
+                seen.update(self.observe_moves())
+            out(json.dumps(seen, sort_keys=True))
             return 0
         data = self.store.load()
         if data is None:
@@ -624,6 +694,20 @@ class Engine(Repo):
             "listed": listed,
             "live": live,
         }
+
+    def observe_moves(self) -> dict:
+        """`list --json --move-refusals`, for the Guardian's drop (#2978): the
+        checkout drop would judge and every reason it would refuse to move it,
+        from the one function drop refuses with. Lockless and read-only, like
+        observe(). A read that fails is a reason, never an empty list."""
+        try:
+            source = plan.read_source(self)
+            return {
+                "checkout": {"branch_ref": source.branch_ref, "head": source.head},
+                "move_refusals": self._move_refusals(source),
+            }
+        except (Refusal, Unknown) as exc:
+            return {"checkout": None, "move_refusals": [f"could not judge: {exc}"]}
 
     def cmd_add(
         self, branch: str, owner: str, pr: int | None, approve_hooks: str | None = None
@@ -715,9 +799,16 @@ class Engine(Repo):
                 "repo": self.common_dir(),
                 "candidates": [],
             }
-            for c in data["candidates"]:
+            for i, c in enumerate(data["candidates"]):
                 if c["branch"] == branch:
+                    moved = c["verified_head"] != head
                     c.update({k: v for k, v in cand.items() if k != "added_at"})
+                    if moved:
+                        # Manifest order is pin order: a new head goes last, so
+                        # the last listed candidate is the newest code, the one
+                        # the Guardian drops first (#2978). A same-head re-add
+                        # keeps its place.
+                        data["candidates"].append(data["candidates"].pop(i))
                     result["kind"] = "re-verified"
                     return data
             data["candidates"].append(cand)
@@ -774,21 +865,44 @@ class Engine(Repo):
             "fetch origin first if origin/main does not resolve). Nothing changed."
         )
 
-    def cmd_drop(self, branch: str, no_rebuild: bool, expect: tuple[str, str] | None = None) -> int:
+    def cmd_drop(
+        self,
+        branch: str,
+        no_rebuild: bool,
+        expect: tuple[str, str] | None = None,
+        candidate: str | None = None,
+        restart: bool = False,
+    ) -> int:
+        """``candidate`` (--expect-candidate) and ``restart`` (--restart-server):
+        the Guardian's drop (#4911); main() lets them through only on `live`
+        with ``expect`` set."""
         self.require_update_lock()
         source = self._expected_source(expect)
         # No manifest: nothing to drop, and the manifest is not created.
-        if not self.store.exists():
+        data = self.store.load()
+        if data is None:
             raise Refusal(
                 f"{branch} is not a candidate: there is no deploy manifest ({self.store.path})."
             )
-        data = self.store.load()
         if not any(c["branch"] == branch for c in data["candidates"]):
             raise Refusal(f"{branch} is not a candidate in {self.store.path}.")
+        pinned = None if candidate is None else (self.resolve(candidate) or candidate)
+        self._refuse_repin(branch, pinned, data)
 
         def remove(d: dict | None) -> dict | None:
             if d is None:
+                if pinned is not None:  # the guarded drop moves only with its pin read
+                    raise Refusal(
+                        f"the deploy manifest is gone ({self.store.path}): {branch}'s pin "
+                        "cannot be checked; nothing changed."
+                    )
                 return None
+            self._refuse_repin(branch, pinned, d)  # the manifest as it is written
+            if pinned is not None and d != data:  # `live` is planned from `data`
+                raise Refusal(
+                    f"the deploy manifest changed since the drop read it ({self.store.path}): "
+                    "`live` would not match it; nothing changed."
+                )
             keep = [c for c in d["candidates"] if c["branch"] != branch]
             return None if len(keep) == len(d["candidates"]) else {**d, "candidates": keep}
 
@@ -857,7 +971,7 @@ class Engine(Repo):
         except Refusal as exc:
             if not saved:
                 raise Refusal(
-                    f"{exc}\nThe manifest is unchanged: {branch} is still a candidate."
+                    f"{exc}\nThe manifest is unchanged: this drop wrote nothing and `live` did not move."
                 ) from exc
             raise Refusal(
                 f"{exc}\nThe manifest change WAS saved ({branch} is no longer a candidate), but `live` still "
@@ -883,8 +997,118 @@ class Engine(Repo):
                 + " left `live` with it and come back at the next rebuild "
                 "unless their own reason still holds: drop them too to keep that code out."
             )
-        _restart_advice(moved)
-        return 0
+        if pinned is None:
+            _restart_advice(moved)
+            return 0
+        try:
+            seen, still_in = self._unconfirmed_drop(branch, moved)
+        except (Refusal, Unknown) as exc:  # past the save: never "nothing changed"
+            seen, still_in = [f"the engine's own view could not be read ({exc})"], None
+        if seen:
+            if still_in is False:  # rebuild re-fetches origin/main: not the remedy here
+                _restart_advice(moved)
+            raise Refusal(
+                f"the drop of {branch} could not be confirmed: " + "; ".join(seen) + ". The "
+                f"manifest change WAS saved ({branch} is no longer a candidate) and the restart "
+                "was not queued: "
+                + {
+                    True: "fix the above, then run scripts/deploy_candidates rebuild.",
+                    None: "if `scripts/deploy_candidates list --json --move-refusals` still "
+                    f"shows {branch} listed or held, run scripts/deploy_candidates rebuild; "
+                    "otherwise only the restart is missing.",
+                    False: f"the drop itself is done ({branch} is out of `live`); fix the above, "
+                    "then take the restart step printed above.",
+                }[still_in]
+            )
+        out(f"  confirmed: {branch} is out of the manifest and `live`, at {moved.at[:12]}.")
+        if not restart:
+            _restart_advice(moved)
+            return 0
+        return self._queue_server_restart()
+
+    def _refuse_repin(self, branch: str, pinned: str | None, data: dict) -> None:
+        """The Guardian drops the head the owner approved, never a later pin."""
+        if pinned is None:
+            return
+        entry = next((c for c in data["candidates"] if c["branch"] == branch), None)
+        if entry is None or entry["verified_head"] != pinned:
+            now = entry["verified_head"][:12] if entry else "nothing (it is no longer listed)"
+            raise Refusal(
+                f"the manifest pins {branch} at {now}, not {pinned[:12]} (--expect-candidate): "
+                "it changed since that was read; nothing changed."
+            )
+
+    def _unconfirmed_drop(self, branch: str, moved: plan.Move) -> tuple[list[str], bool | None]:
+        """What the engine's own view shows that contradicts a finished drop:
+        empty when ``branch`` is neither listed nor held by `live`, the
+        checkout is on `live` at the commit the move left (``moved.at``), and
+        nothing would refuse a move. Second: whether ``branch`` may still be
+        listed or held (None: what `live` holds could not be read). The hook
+        restore and sync are not covered: their failure stays a WARNING."""
+        seen = self.observe()
+        seen.update(self.observe_moves())
+        live = seen["live"]
+        problems = []
+        still_in: bool | None = False
+        if seen["manifest"]["state"] != "ok":  # an unread manifest lists nothing
+            problems.append(
+                f"the manifest could not be read ({seen['manifest']['reason'] or 'it is gone'})"
+            )
+            still_in = None
+        if any(c["branch"] == branch for c in seen["listed"]):
+            problems.append(f"the manifest still lists {branch}")
+            still_in = True
+        if live["holds"] is None:
+            problems.append(f"what `live` holds could not be read ({live['reason']})")
+            still_in = still_in or None
+        elif any(h["branch"] == branch for h in live["holds"]):
+            problems.append(f"`live` still holds {branch}")
+            still_in = True
+        want = {"branch_ref": LIVE_REF, "head": moved.at}
+        if moved.head_left or moved.head_unknown or seen["checkout"] != want:
+            got = seen["checkout"] or {}
+            problems.append(
+                f"the checkout is on {got.get('branch_ref') or 'an unknown or detached HEAD'} at "
+                f"{(got.get('head') or 'nothing')[:12]}, not `live` at {moved.at[:12]}"
+            )
+        problems += seen["move_refusals"]
+        return problems, still_in
+
+    def _queue_server_restart(self) -> int:
+        """Queue genesis-server's restart while update.lock is still held; the
+        engine exits right after, so the start (and its boot repair, which may
+        wait for the lock) runs with the lock free. A start already in
+        progress is left alone: a restart would SIGTERM its boot repair
+        (#3492 D2). From python, never the entry: subprocess.run closes every
+        fd but 0-2 in the child (close_fds), and the entry's lock fd is
+        inheritable. Exit 4 when it was not queued (the read failed, or the
+        enqueue failed with an answer), exit 5 when the enqueue got no answer
+        and may have been queued: the drop stays done either way."""
+        show = _systemctl(self.env, "show", "-p", "ActiveState", gate.SERVER_UNIT)
+        state = show.stdout.strip().removeprefix("ActiveState=") if show.returncode == 0 else None
+        if state == "activating":
+            out("  genesis-server: a start is already in progress; nothing queued.")
+            return 0
+        if state is not None:
+            res = _systemctl(self.env, "restart", "--no-block", gate.SERVER_UNIT)
+            if res.returncode == 0:
+                out("  genesis-server: restart queued.")
+                return 0
+            if res.returncode == SYSTEMCTL_NO_ANSWER:
+                _err(
+                    f"ERROR: the drop is done and confirmed, but {' '.join(res.args)} got no "
+                    f"answer within {SYSTEMCTL_TIMEOUT_S} s: the restart may have been queued. "
+                    "scripts/deploy_code_only.sh status says whether the server runs the tree "
+                    "`live` now holds; restart only if it does not."
+                )
+                return 5
+            show = res
+        _err(
+            f"ERROR: the drop is done and confirmed, but the genesis-server restart could not be "
+            f"queued: {' '.join(show.args)} exited {show.returncode}: "
+            f"{(show.stderr or show.stdout).strip() or 'no output'}"
+        )
+        return 4
 
     def _warn_shared(self, branch: str, before: dict, after: dict | None) -> None:
         """Name the candidates that share the dropped one's unmerged commits: they
@@ -1304,9 +1528,14 @@ def _parser() -> argparse.ArgumentParser:
     for moving in (d, rb):
         moving.add_argument("--expect-branch", metavar="BRANCH")
         moving.add_argument("--expect-head", metavar="COMMIT")
+    # The Guardian's drop (#4911): the head it approved, and the restart.
+    d.add_argument("--expect-candidate", metavar="COMMIT")
+    d.add_argument("--restart-server", action="store_true")
     ls = sub.add_parser("list")
     # Machine-readable, for deploy health (observe()); the text form is unchanged.
     ls.add_argument("--json", action="store_true")
+    # With --json, for the Guardian's drop: the checkout and drop's refusals now.
+    ls.add_argument("--move-refusals", action="store_true")
     sub.add_parser("status")
     # For update.sh on `live`: its rollback's hook restore, and the shape check
     # it runs before anything moves.
@@ -1346,6 +1575,18 @@ def main(
         _err("deploy_candidates: --expect-branch and --expect-head cannot be empty")
         return 2
     expect = None if expect[0] is None else expect
+    candidate = getattr(args, "expect_candidate", None)
+    if getattr(args, "restart_server", False) and candidate is None:
+        _err("deploy_candidates: --restart-server goes with --expect-candidate")
+        return 2
+    if candidate is not None and (
+        not candidate or args.no_rebuild or expect is None or expect[0] != LIVE_BRANCH
+    ):
+        _err(
+            "deploy_candidates: --expect-candidate needs --expect-branch live and --expect-head, "
+            "and no --no-rebuild"
+        )
+        return 2
     # The checkout this script lives in. `root` is for tests (scratch
     # repositories); nothing in the environment can point the engine elsewhere.
     engine = Engine(
@@ -1355,13 +1596,18 @@ def main(
         as_json = args.cmd == "list" and args.json
         engine.place(args.cmd, note=_err if as_json else out)
         if args.cmd == "list":
-            return engine.cmd_list(as_json)
+            if args.move_refusals and not as_json:
+                _err("deploy_candidates: --move-refusals goes with --json")
+                return 2
+            return engine.cmd_list(as_json, args.move_refusals)
         if args.cmd == "status":
             return engine.cmd_status()
         if args.cmd == "add":
             return engine.cmd_add(args.branch, args.owner, args.pr, args.approve_hooks)
         if args.cmd == "drop":
-            return engine.cmd_drop(args.branch, args.no_rebuild, expect)
+            return engine.cmd_drop(
+                args.branch, args.no_rebuild, expect, candidate, args.restart_server
+            )
         if args.cmd == "rebuild":
             return engine.cmd_rebuild(expect)
         if args.cmd == "restore-hooks":

@@ -1,0 +1,907 @@
+{
+ "approval_required": true,
+ "body_changed": false,
+ "commit_approval_required": true,
+ "commits": [
+  {
+   "committed_at": "2026-10-07T00:19:55+00:00",
+   "parents": [
+    "0d4d27ce06387db379f4f61060b5440a0a1cca5a"
+   ],
+   "sha": "e5f1ef68905e9cdebe2d0985ea36cfe6e0e88be1",
+   "tree": "705a0fdc5c0da1590622134f6a4f4fa59081ede6"
+  },
+  {
+   "committed_at": "2026-10-07T00:20:54+00:00",
+   "parents": [
+    "e5f1ef68905e9cdebe2d0985ea36cfe6e0e88be1"
+   ],
+   "sha": "27a1513ba4badcdb1e9dda3523f9214f83f8afe3",
+   "tree": "528e10f8bc1715b59448005f0ae1fad8943505eb"
+  },
+  {
+   "committed_at": "2026-10-07T00:21:24+00:00",
+   "parents": [
+    "27a1513ba4badcdb1e9dda3523f9214f83f8afe3"
+   ],
+   "sha": "1caf0639e3422c8bcf604a4702533a16278ca8fd",
+   "tree": "df26df910acba5fd70836dff5932b9a127ae0ede"
+  },
+  {
+   "committed_at": "2026-10-07T00:21:41+00:00",
+   "parents": [
+    "1caf0639e3422c8bcf604a4702533a16278ca8fd"
+   ],
+   "sha": "1b8b60ae8f9aaf7733fff80eb5c8a7e6007dd601",
+   "tree": "70424fb39450b3d4b5503ec8f0ca0920020a02e7"
+  },
+  {
+   "committed_at": "2026-10-07T03:28:29+00:00",
+   "parents": [
+    "e5f1ef68905e9cdebe2d0985ea36cfe6e0e88be1",
+    "ccf833ae219775f3696e23b925f9fee2691b295e"
+   ],
+   "sha": "51069b0bedafc09a54e8ed12384401b5c2420168",
+   "tree": "6e51c9e5ec78986c43fa829c5fd86fcc18d390ac"
+  },
+  {
+   "committed_at": "2026-10-07T03:28:56+00:00",
+   "parents": [
+    "27a1513ba4badcdb1e9dda3523f9214f83f8afe3",
+    "51069b0bedafc09a54e8ed12384401b5c2420168"
+   ],
+   "sha": "6a3df32cb646acb5a839dbdc4067fb3885e739be",
+   "tree": "04d763105cfeb00577d444b522cb061a73869447"
+  },
+  {
+   "committed_at": "2026-10-07T03:29:08+00:00",
+   "parents": [
+    "1caf0639e3422c8bcf604a4702533a16278ca8fd",
+    "6a3df32cb646acb5a839dbdc4067fb3885e739be"
+   ],
+   "sha": "641521a9baf6ea48c9c44303c9136139a21cfd9b",
+   "tree": "e48b886799edb5893add79816d4ce02b38c52a32"
+  },
+  {
+   "committed_at": "2026-10-07T03:29:53+00:00",
+   "parents": [
+    "1b8b60ae8f9aaf7733fff80eb5c8a7e6007dd601",
+    "641521a9baf6ea48c9c44303c9136139a21cfd9b"
+   ],
+   "sha": "7dd63b576a1c6d9abfc9872c699578d856549e9d",
+   "tree": "75c5fc757604555dbe423e41bf67b29df78b0859"
+  },
+  {
+   "committed_at": "2026-10-07T03:35:08+00:00",
+   "parents": [
+    "7dd63b576a1c6d9abfc9872c699578d856549e9d"
+   ],
+   "sha": "7694db354d188d98cd2f34090e2ddd95c39a60e0",
+   "tree": "d354fc1e4a5a2fee5bf5f2bb70f194f8e1cfe6df"
+  },
+  {
+   "committed_at": "2026-10-07T05:33:54+00:00",
+   "parents": [
+    "51069b0bedafc09a54e8ed12384401b5c2420168",
+    "e71bf5c32486f41846e3c6a487b4bb330c15e5f1"
+   ],
+   "sha": "983b8a86498ac2531f7818a82b6cabd08655f1dc",
+   "tree": "535012a45725d10d6e7f711441806122cc789e54"
+  },
+  {
+   "committed_at": "2026-10-07T05:34:50+00:00",
+   "parents": [
+    "6a3df32cb646acb5a839dbdc4067fb3885e739be",
+    "983b8a86498ac2531f7818a82b6cabd08655f1dc"
+   ],
+   "sha": "cdd33c2b907165923711da33f05df3841192cdb0",
+   "tree": "39c4942758970a2082ab64b5b3327ab2d8d240a3"
+  },
+  {
+   "committed_at": "2026-10-07T05:35:21+00:00",
+   "parents": [
+    "641521a9baf6ea48c9c44303c9136139a21cfd9b",
+    "cdd33c2b907165923711da33f05df3841192cdb0"
+   ],
+   "sha": "2fa2f3259c7634742d28488fabdb6b854d03ef32",
+   "tree": "3b0fbcb1e3374ffbfaf922b67296b1f84519ed30"
+  },
+  {
+   "committed_at": "2026-10-07T05:35:58+00:00",
+   "parents": [
+    "7694db354d188d98cd2f34090e2ddd95c39a60e0",
+    "2fa2f3259c7634742d28488fabdb6b854d03ef32"
+   ],
+   "sha": "668add2e6e3b11fd9de61839d1d5a1c9e32935c8",
+   "tree": "cd41fbea250b588e7ef1b0d277b8614203fcdaa6"
+  },
+  {
+   "committed_at": "2026-10-08T01:40:38+00:00",
+   "parents": [
+    "ba6e357a799885709a508a57f7e46c1d92100935"
+   ],
+   "sha": "2b3b0710fbf98ec8e473467e423acc7872ae4d34",
+   "tree": "70cb496f5be2e256431831056835df07e645c3c9"
+  },
+  {
+   "committed_at": "2026-10-08T01:56:40+00:00",
+   "parents": [
+    "2b3b0710fbf98ec8e473467e423acc7872ae4d34"
+   ],
+   "sha": "59a1119e9d20bc6838a746f494107ae23d199c2d",
+   "tree": "045b5870a57224cde71f056fbf86da6d27b04aee"
+  },
+  {
+   "committed_at": "2026-10-08T02:06:32+00:00",
+   "parents": [
+    "59a1119e9d20bc6838a746f494107ae23d199c2d"
+   ],
+   "sha": "e548cb6f5d9f4046abc7c0cb593591d4a11719ed",
+   "tree": "673e2966593cf83f86e68415f27fdbebb5e6e20b"
+  },
+  {
+   "committed_at": "2026-10-08T06:26:57+00:00",
+   "parents": [
+    "e548cb6f5d9f4046abc7c0cb593591d4a11719ed",
+    "83fa87e9c57cccf07b32138f15e3140a766ce3be"
+   ],
+   "sha": "97121cdc815a7eb518b3a04841b3201c5ec64238",
+   "tree": "aa0eceb027981d0d1751d7321d556d691c52b88d"
+  },
+  {
+   "committed_at": "2026-10-09T15:52:57+00:00",
+   "parents": [
+    "7ec594c72e5e309278ce7b915070bb1b7e2ee636",
+    "97121cdc815a7eb518b3a04841b3201c5ec64238"
+   ],
+   "sha": "15afaf9c91af4bcde26c794543d945a18809e894",
+   "tree": "7c45972bb0bde6c1144dc96521ef99af7f689578"
+  },
+  {
+   "committed_at": "2026-10-09T15:53:33+00:00",
+   "parents": [
+    "15afaf9c91af4bcde26c794543d945a18809e894",
+    "9a95483a8e7fdb9df16ec1360a11531113627459"
+   ],
+   "sha": "710eac38d3189ea8d1d4e1fa038abe66562a045f",
+   "tree": "0ecde02516d7e4adf0fc001f732748934e5e7cf2"
+  },
+  {
+   "committed_at": "2026-10-09T15:59:58+00:00",
+   "parents": [
+    "7ec594c72e5e309278ce7b915070bb1b7e2ee636",
+    "983b8a86498ac2531f7818a82b6cabd08655f1dc"
+   ],
+   "sha": "eccb75ec68b15a1cd448ce7cd75ef4589df222db",
+   "tree": "f5479d30b326853cd0a65f46f8994b41367a2f23"
+  },
+  {
+   "committed_at": "2026-10-09T16:00:57+00:00",
+   "parents": [
+    "eccb75ec68b15a1cd448ce7cd75ef4589df222db",
+    "710eac38d3189ea8d1d4e1fa038abe66562a045f"
+   ],
+   "sha": "f3da1ea27413b47a86a64467ac46a425347b1732",
+   "tree": "2ac4d7f9486788fa0b41405b450a165c0ea7e0f8"
+  },
+  {
+   "committed_at": "2026-10-09T16:02:21+00:00",
+   "parents": [
+    "7ec594c72e5e309278ce7b915070bb1b7e2ee636",
+    "cdd33c2b907165923711da33f05df3841192cdb0"
+   ],
+   "sha": "1a9c9c22b978b41b607863faa4cae8606333f5b1",
+   "tree": "11b5b47d973a8c0ce02ff1990b86d2590dd5d939"
+  },
+  {
+   "committed_at": "2026-10-09T16:03:24+00:00",
+   "parents": [
+    "1a9c9c22b978b41b607863faa4cae8606333f5b1",
+    "f3da1ea27413b47a86a64467ac46a425347b1732"
+   ],
+   "sha": "654508399d4715525cdddeb94be6634d257934e8",
+   "tree": "f0723fee6617ef96069fb6ee4beb898bcbea2f39"
+  },
+  {
+   "committed_at": "2026-10-09T16:05:21+00:00",
+   "parents": [
+    "7ec594c72e5e309278ce7b915070bb1b7e2ee636"
+   ],
+   "sha": "6a9fc94aae6a9b0393671f59ae5060b1afb97dc5",
+   "tree": "a330b165ae2147360934199344cf0add0ba88a5d"
+  },
+  {
+   "committed_at": "2026-10-09T16:06:41+00:00",
+   "parents": [
+    "6a9fc94aae6a9b0393671f59ae5060b1afb97dc5",
+    "654508399d4715525cdddeb94be6634d257934e8"
+   ],
+   "sha": "041a013608441ea614f1373a7a841d54cb8e3e10",
+   "tree": "f6573738ef0f4123a7fbb9f431d9903103d7cc98"
+  },
+  {
+   "committed_at": "2026-10-09T16:38:09+00:00",
+   "parents": [
+    "7ec594c72e5e309278ce7b915070bb1b7e2ee636",
+    "668add2e6e3b11fd9de61839d1d5a1c9e32935c8"
+   ],
+   "sha": "fc9c31b8c666a3191083eb5a01e61f0b8cd105d1",
+   "tree": "1085d18d9a8c644f7ecacbe63299e0ad30a8e4b7"
+  },
+  {
+   "committed_at": "2026-10-09T16:41:43+00:00",
+   "parents": [
+    "fc9c31b8c666a3191083eb5a01e61f0b8cd105d1",
+    "041a013608441ea614f1373a7a841d54cb8e3e10"
+   ],
+   "sha": "9f6cafc02c6272a11c2ed93a03e478977a86c98e",
+   "tree": "4e1fe7da1419de78a2a9d4cdccb15991bd0888b8"
+  },
+  {
+   "committed_at": "2026-10-09T18:20:34+00:00",
+   "parents": [
+    "041a013608441ea614f1373a7a841d54cb8e3e10"
+   ],
+   "sha": "2269a11b4c68c09fedc489fa8d95920910f4a3ef",
+   "tree": "2b0893f6c8418af700b99fbb30fefae07d9120f7"
+  },
+  {
+   "committed_at": "2026-10-09T18:33:15+00:00",
+   "parents": [
+    "9f6cafc02c6272a11c2ed93a03e478977a86c98e",
+    "2269a11b4c68c09fedc489fa8d95920910f4a3ef"
+   ],
+   "sha": "185b6d55387fc3a56f451d836d40dc3db9742935",
+   "tree": "b0603f7baac541931ed925f6c117ae4afc87dafe"
+  },
+  {
+   "committed_at": "2026-10-09T23:09:49+00:00",
+   "parents": [
+    "2269a11b4c68c09fedc489fa8d95920910f4a3ef",
+    "85652265ca1ac06a84d7b09fd4f437a26f8caf42"
+   ],
+   "sha": "ae69f63bce0155043959b7ae7be816319ea48024",
+   "tree": "ca67cecdb4cc392e7e597980650e13a4cf335bf6"
+  },
+  {
+   "committed_at": "2026-10-09T23:45:36+00:00",
+   "parents": [
+    "ae69f63bce0155043959b7ae7be816319ea48024"
+   ],
+   "sha": "59b96ce739a7b457e786e007a06c9dd6d45f903d",
+   "tree": "ee63f6ab9a4a5cae755e3366f71b119036ae8a63"
+  },
+  {
+   "committed_at": "2026-10-10T00:52:45+00:00",
+   "parents": [
+    "59b96ce739a7b457e786e007a06c9dd6d45f903d"
+   ],
+   "sha": "ef2f179523fb67be76e205e5df1debcb8a918b6c",
+   "tree": "23b3202eca500ff71dc22fbdecab2b08f93b1b87"
+  },
+  {
+   "committed_at": "2026-10-26T05:29:57+00:00",
+   "parents": [
+    "185b6d55387fc3a56f451d836d40dc3db9742935",
+    "ef2f179523fb67be76e205e5df1debcb8a918b6c"
+   ],
+   "sha": "71bd62403525f33efcba48b9972ff825469516fe",
+   "tree": "ef6cb6b10481a1804f573745928d2a6041357d16"
+  },
+  {
+   "committed_at": "2026-11-07T07:53:51+00:00",
+   "parents": [
+    "71bd62403525f33efcba48b9972ff825469516fe",
+    "4eb00f4161286dfd6fd310b5423d380e59e6ce42"
+   ],
+   "sha": "51b62195cd111ae13674cb36b5ee01ea9b18e113",
+   "tree": "fa375af008b32b898ca06bda7e88c28b7cd4391e"
+  },
+  {
+   "committed_at": "2026-11-07T19:01:07+00:00",
+   "parents": [
+    "51b62195cd111ae13674cb36b5ee01ea9b18e113",
+    "477a5c165d9366915305cc55b844e6255a5f8b05"
+   ],
+   "sha": "4bb4188a91b025daf9cb92bf050f3513fe74c35b",
+   "tree": "1081df748bd32cca7318e76af131a556ae76cb00"
+  },
+  {
+   "committed_at": "2026-11-07T22:33:38+00:00",
+   "parents": [
+    "4bb4188a91b025daf9cb92bf050f3513fe74c35b"
+   ],
+   "sha": "3485795b4d90910605b6d02347fa15a8146290f3",
+   "tree": "cd997e28767ac3eb439bc303d9a1b203939a7449"
+  },
+  {
+   "committed_at": "2026-11-08T00:10:17+00:00",
+   "parents": [
+    "3485795b4d90910605b6d02347fa15a8146290f3"
+   ],
+   "sha": "e9d9e4c320418236d61856b2b0c47583e1bc6983",
+   "tree": "cd997e28767ac3eb439bc303d9a1b203939a7449"
+  },
+  {
+   "committed_at": "2026-11-08T00:15:45+00:00",
+   "parents": [
+    "e9d9e4c320418236d61856b2b0c47583e1bc6983"
+   ],
+   "sha": "d0a2a5b32fa310980c3f1a9e49cf4410a4858627",
+   "tree": "58de365e7ec2fdaa2f60927d370eb8a5bc24ee1e"
+  },
+  {
+   "committed_at": "2026-11-08T03:44:20+00:00",
+   "parents": [
+    "d0a2a5b32fa310980c3f1a9e49cf4410a4858627"
+   ],
+   "sha": "ece2be4010afbff35a10186bf42dc2b106b4a80b",
+   "tree": "58de365e7ec2fdaa2f60927d370eb8a5bc24ee1e"
+  },
+  {
+   "committed_at": "2026-11-08T03:45:52+00:00",
+   "parents": [
+    "ece2be4010afbff35a10186bf42dc2b106b4a80b"
+   ],
+   "sha": "1bafcdae2587ebae1748271cf9ec7f91da042402",
+   "tree": "c497a9ea712d448970aebda23a424c7a424cbd7e"
+  },
+  {
+   "committed_at": "2026-11-08T04:05:55+00:00",
+   "parents": [
+    "1bafcdae2587ebae1748271cf9ec7f91da042402"
+   ],
+   "sha": "b89bff13867117d9b2c4e558a127113480f92adc",
+   "tree": "18bf766c6b222f3c14a3a481280a2e02719092e0"
+  },
+  {
+   "committed_at": "2026-11-08T04:12:47+00:00",
+   "parents": [
+    "b89bff13867117d9b2c4e558a127113480f92adc"
+   ],
+   "sha": "e978ecc7ba44449e8f021da2c404d07160c97e62",
+   "tree": "2a6461dc44ca51d6751df6093f0a277e8f091072"
+  }
+ ],
+ "confirmation_exempt": false,
+ "confirmation_requested": false,
+ "count": 9,
+ "current_head": "e978ecc7ba44449e8f021da2c404d07160c97e62",
+ "current_head_reviewed": true,
+ "errors": [],
+ "expected_reviewers": [
+  "chatgpt-codex-connector[bot]",
+  "coderabbitai[bot]",
+  "devin-ai-integration[bot]"
+ ],
+ "findings": [
+  {
+   "blocking": [
+    true,
+    false
+   ],
+   "head": "1b8b60ae8f9aaf7733fff80eb5c8a7e6007dd601",
+   "keys": [
+    "c4201742436",
+    "c4201742551"
+   ],
+   "late": false,
+   "login": "devin-ai-integration[bot]",
+   "off_diff": [
+    false,
+    false
+   ],
+   "round_head": "1b8b60ae8f9aaf7733fff80eb5c8a7e6007dd601",
+   "submitted_at": "2026-10-07T00:25:31+00:00"
+  },
+  {
+   "blocking": [
+    false,
+    false,
+    false,
+    true
+   ],
+   "head": "1b8b60ae8f9aaf7733fff80eb5c8a7e6007dd601",
+   "keys": [
+    "c4201767139",
+    "c4201767154",
+    "c4201767164",
+    "c4201767173"
+   ],
+   "late": false,
+   "login": "chatgpt-codex-connector[bot]",
+   "off_diff": [
+    false,
+    false,
+    false,
+    false
+   ],
+   "round_head": "1b8b60ae8f9aaf7733fff80eb5c8a7e6007dd601",
+   "submitted_at": "2026-10-07T00:28:43+00:00"
+  },
+  {
+   "blocking": [
+    false
+   ],
+   "head": "7694db354d188d98cd2f34090e2ddd95c39a60e0",
+   "keys": [
+    "c4202829924"
+   ],
+   "late": false,
+   "login": "chatgpt-codex-connector[bot]",
+   "off_diff": [
+    false
+   ],
+   "round_head": "7694db354d188d98cd2f34090e2ddd95c39a60e0",
+   "submitted_at": "2026-10-07T03:41:47+00:00"
+  },
+  {
+   "blocking": [
+    false
+   ],
+   "head": "668add2e6e3b11fd9de61839d1d5a1c9e32935c8",
+   "keys": [
+    "c4203533605"
+   ],
+   "late": false,
+   "login": "chatgpt-codex-connector[bot]",
+   "off_diff": [
+    false
+   ],
+   "round_head": "668add2e6e3b11fd9de61839d1d5a1c9e32935c8",
+   "submitted_at": "2026-10-07T05:50:35+00:00"
+  },
+  {
+   "blocking": [
+    false
+   ],
+   "head": "185b6d55387fc3a56f451d836d40dc3db9742935",
+   "keys": [
+    "c4233526291"
+   ],
+   "late": false,
+   "login": "chatgpt-codex-connector[bot]",
+   "off_diff": [
+    false
+   ],
+   "round_head": "185b6d55387fc3a56f451d836d40dc3db9742935",
+   "submitted_at": "2026-10-09T18:53:29+00:00"
+  },
+  {
+   "blocking": [
+    false,
+    false
+   ],
+   "head": "51b62195cd111ae13674cb36b5ee01ea9b18e113",
+   "keys": [
+    "c4502567332",
+    "c4502567337"
+   ],
+   "late": false,
+   "login": "coderabbitai[bot]",
+   "off_diff": [
+    false,
+    false
+   ],
+   "round_head": "51b62195cd111ae13674cb36b5ee01ea9b18e113",
+   "submitted_at": "2026-11-07T15:49:28+00:00"
+  },
+  {
+   "blocking": [
+    false
+   ],
+   "head": "3485795b4d90910605b6d02347fa15a8146290f3",
+   "keys": [
+    "c4504033816"
+   ],
+   "late": false,
+   "login": "chatgpt-codex-connector[bot]",
+   "off_diff": [
+    false
+   ],
+   "round_head": "3485795b4d90910605b6d02347fa15a8146290f3",
+   "submitted_at": "2026-11-07T22:46:16+00:00"
+  },
+  {
+   "blocking": [
+    false,
+    false,
+    true
+   ],
+   "head": "d0a2a5b32fa310980c3f1a9e49cf4410a4858627",
+   "keys": [
+    "c4504308590",
+    "c4504308602",
+    "c4504308604"
+   ],
+   "late": false,
+   "login": "coderabbitai[bot]",
+   "off_diff": [
+    false,
+    false,
+    false
+   ],
+   "round_head": "d0a2a5b32fa310980c3f1a9e49cf4410a4858627",
+   "submitted_at": "2026-11-08T00:24:11+00:00"
+  },
+  {
+   "blocking": [
+    false
+   ],
+   "head": "b89bff13867117d9b2c4e558a127113480f92adc",
+   "keys": [
+    "c4504990315"
+   ],
+   "late": false,
+   "login": "coderabbitai[bot]",
+   "off_diff": [
+    false
+   ],
+   "round_head": "b89bff13867117d9b2c4e558a127113480f92adc",
+   "submitted_at": "2026-11-08T04:14:00+00:00"
+  },
+  {
+   "blocking": [
+    false
+   ],
+   "head": "e978ecc7ba44449e8f021da2c404d07160c97e62",
+   "keys": [
+    "c4505010904"
+   ],
+   "late": false,
+   "login": "coderabbitai[bot]",
+   "off_diff": [
+    false
+   ],
+   "round_head": "e978ecc7ba44449e8f021da2c404d07160c97e62",
+   "submitted_at": "2026-11-08T04:23:43+00:00"
+  }
+ ],
+ "gate_surface": false,
+ "late_state": "ok",
+ "legacy_heads": 0,
+ "marks": [
+  {
+   "at": "2026-10-07T00:25:31+00:00",
+   "head": "1b8b60ae8f9aaf7733fff80eb5c8a7e6007dd601"
+  },
+  {
+   "at": "2026-10-07T00:28:43+00:00",
+   "head": "1b8b60ae8f9aaf7733fff80eb5c8a7e6007dd601"
+  },
+  {
+   "at": "2026-10-07T03:41:47+00:00",
+   "head": "7694db354d188d98cd2f34090e2ddd95c39a60e0"
+  },
+  {
+   "at": "2026-10-07T05:50:35+00:00",
+   "head": "668add2e6e3b11fd9de61839d1d5a1c9e32935c8"
+  },
+  {
+   "at": "2026-10-09T18:53:29+00:00",
+   "head": "185b6d55387fc3a56f451d836d40dc3db9742935"
+  },
+  {
+   "at": "2026-11-07T15:49:28+00:00",
+   "head": "51b62195cd111ae13674cb36b5ee01ea9b18e113"
+  },
+  {
+   "at": "2026-11-07T22:46:16+00:00",
+   "head": "3485795b4d90910605b6d02347fa15a8146290f3"
+  },
+  {
+   "at": "2026-11-08T00:24:11+00:00",
+   "head": "d0a2a5b32fa310980c3f1a9e49cf4410a4858627"
+  },
+  {
+   "at": "2026-11-08T04:14:00+00:00",
+   "head": "b89bff13867117d9b2c4e558a127113480f92adc"
+  },
+  {
+   "at": "2026-11-08T04:23:43+00:00",
+   "head": "e978ecc7ba44449e8f021da2c404d07160c97e62"
+  },
+  {
+   "at": "2026-11-07T19:11:54+00:00",
+   "head": "4bb4188a91b025daf9cb92bf050f3513fe74c35b"
+  },
+  {
+   "at": "2026-11-08T00:31:59+00:00",
+   "head": "d0a2a5b32fa310980c3f1a9e49cf4410a4858627"
+  },
+  {
+   "at": "2026-11-08T04:20:40+00:00",
+   "head": "e978ecc7ba44449e8f021da2c404d07160c97e62"
+  }
+ ],
+ "next_round": 10,
+ "open_keys": [
+  "c4505010904"
+ ],
+ "reason": "ordinary_limit",
+ "reflection_keys": "ok",
+ "reviewed_heads": [
+  "185b6d55387fc3a56f451d836d40dc3db9742935",
+  "1b8b60ae8f9aaf7733fff80eb5c8a7e6007dd601",
+  "3485795b4d90910605b6d02347fa15a8146290f3",
+  "51b62195cd111ae13674cb36b5ee01ea9b18e113",
+  "668add2e6e3b11fd9de61839d1d5a1c9e32935c8",
+  "7694db354d188d98cd2f34090e2ddd95c39a60e0",
+  "b89bff13867117d9b2c4e558a127113480f92adc",
+  "d0a2a5b32fa310980c3f1a9e49cf4410a4858627",
+  "e978ecc7ba44449e8f021da2c404d07160c97e62"
+ ],
+ "reviewers_reported": [
+  "chatgpt-codex-connector[bot]",
+  "coderabbitai[bot]"
+ ],
+ "round_state": "open",
+ "rounds": [
+  {
+   "findings": 6,
+   "head": "1b8b60ae8f9aaf7733fff80eb5c8a7e6007dd601",
+   "legacy": false,
+   "opened_at": "2026-10-07T00:25:31+00:00",
+   "reviewers": [
+    "devin-ai-integration[bot]",
+    "chatgpt-codex-connector[bot]"
+   ],
+   "reviews": [
+    {
+     "blocking": [
+      true,
+      false
+     ],
+     "finding_keys": [
+      "c4201742436",
+      "c4201742551"
+     ],
+     "id": 5436040110,
+     "login": "devin-ai-integration[bot]",
+     "off_diff": [
+      false,
+      false
+     ],
+     "submitted_at": "2026-10-07T00:25:31Z"
+    },
+    {
+     "blocking": [
+      false,
+      false,
+      false,
+      true
+     ],
+     "finding_keys": [
+      "c4201767139",
+      "c4201767154",
+      "c4201767164",
+      "c4201767173"
+     ],
+     "id": 5436069724,
+     "login": "chatgpt-codex-connector[bot]",
+     "off_diff": [
+      false,
+      false,
+      false,
+      false
+     ],
+     "submitted_at": "2026-10-07T00:28:43Z"
+    }
+   ]
+  },
+  {
+   "findings": 1,
+   "head": "7694db354d188d98cd2f34090e2ddd95c39a60e0",
+   "legacy": false,
+   "opened_at": "2026-10-07T03:41:47+00:00",
+   "reviewers": [
+    "chatgpt-codex-connector[bot]"
+   ],
+   "reviews": [
+    {
+     "blocking": [
+      false
+     ],
+     "finding_keys": [
+      "c4202829924"
+     ],
+     "id": 5437373596,
+     "login": "chatgpt-codex-connector[bot]",
+     "off_diff": [
+      false
+     ],
+     "submitted_at": "2026-10-07T03:41:47Z"
+    }
+   ]
+  },
+  {
+   "findings": 1,
+   "head": "668add2e6e3b11fd9de61839d1d5a1c9e32935c8",
+   "legacy": false,
+   "opened_at": "2026-10-07T05:50:35+00:00",
+   "reviewers": [
+    "chatgpt-codex-connector[bot]"
+   ],
+   "reviews": [
+    {
+     "blocking": [
+      false
+     ],
+     "finding_keys": [
+      "c4203533605"
+     ],
+     "id": 5438188077,
+     "login": "chatgpt-codex-connector[bot]",
+     "off_diff": [
+      false
+     ],
+     "submitted_at": "2026-10-07T05:50:35Z"
+    }
+   ]
+  },
+  {
+   "findings": 1,
+   "head": "185b6d55387fc3a56f451d836d40dc3db9742935",
+   "legacy": false,
+   "opened_at": "2026-10-09T18:53:29+00:00",
+   "reviewers": [
+    "chatgpt-codex-connector[bot]"
+   ],
+   "reviews": [
+    {
+     "blocking": [
+      false
+     ],
+     "finding_keys": [
+      "c4233526291"
+     ],
+     "id": 5474134503,
+     "login": "chatgpt-codex-connector[bot]",
+     "off_diff": [
+      false
+     ],
+     "submitted_at": "2026-10-09T18:53:29Z"
+    }
+   ]
+  },
+  {
+   "findings": 2,
+   "head": "51b62195cd111ae13674cb36b5ee01ea9b18e113",
+   "legacy": false,
+   "opened_at": "2026-11-07T15:49:28+00:00",
+   "reviewers": [
+    "coderabbitai[bot]"
+   ],
+   "reviews": [
+    {
+     "blocking": [
+      false,
+      false
+     ],
+     "finding_keys": [
+      "c4502567332",
+      "c4502567337"
+     ],
+     "id": 5813379856,
+     "login": "coderabbitai[bot]",
+     "off_diff": [
+      false,
+      false
+     ],
+     "submitted_at": "2026-11-07T15:49:28Z"
+    }
+   ]
+  },
+  {
+   "findings": 1,
+   "head": "3485795b4d90910605b6d02347fa15a8146290f3",
+   "legacy": false,
+   "opened_at": "2026-11-07T22:46:16+00:00",
+   "reviewers": [
+    "chatgpt-codex-connector[bot]"
+   ],
+   "reviews": [
+    {
+     "blocking": [
+      false
+     ],
+     "finding_keys": [
+      "c4504033816"
+     ],
+     "id": 5815423569,
+     "login": "chatgpt-codex-connector[bot]",
+     "off_diff": [
+      false
+     ],
+     "submitted_at": "2026-11-07T22:46:16Z"
+    }
+   ]
+  },
+  {
+   "findings": 3,
+   "head": "d0a2a5b32fa310980c3f1a9e49cf4410a4858627",
+   "legacy": false,
+   "opened_at": "2026-11-08T00:24:11+00:00",
+   "reviewers": [
+    "coderabbitai[bot]"
+   ],
+   "reviews": [
+    {
+     "blocking": [
+      false,
+      false,
+      true
+     ],
+     "finding_keys": [
+      "c4504308590",
+      "c4504308602",
+      "c4504308604"
+     ],
+     "id": 5815732661,
+     "login": "coderabbitai[bot]",
+     "off_diff": [
+      false,
+      false,
+      false
+     ],
+     "submitted_at": "2026-11-08T00:24:11Z"
+    }
+   ]
+  },
+  {
+   "findings": 1,
+   "head": "b89bff13867117d9b2c4e558a127113480f92adc",
+   "legacy": false,
+   "opened_at": "2026-11-08T04:14:00+00:00",
+   "reviewers": [
+    "coderabbitai[bot]"
+   ],
+   "reviews": [
+    {
+     "blocking": [
+      false
+     ],
+     "finding_keys": [
+      "c4504990315"
+     ],
+     "id": 5816572435,
+     "login": "coderabbitai[bot]",
+     "off_diff": [
+      false
+     ],
+     "submitted_at": "2026-11-08T04:14:00Z"
+    }
+   ]
+  },
+  {
+   "findings": 1,
+   "head": "e978ecc7ba44449e8f021da2c404d07160c97e62",
+   "legacy": false,
+   "opened_at": "2026-11-08T04:23:43+00:00",
+   "reviewers": [
+    "coderabbitai[bot]"
+   ],
+   "reviews": [
+    {
+     "blocking": [
+      false
+     ],
+     "finding_keys": [
+      "c4505010904"
+     ],
+     "id": 5816594557,
+     "login": "coderabbitai[bot]",
+     "off_diff": [
+      false
+     ],
+     "submitted_at": "2026-11-08T04:23:43Z"
+    }
+   ]
+  }
+ ],
+ "schema_version": 1,
+ "status": "ok",
+ "strongly_discouraged": true,
+ "trend": "flat",
+ "unresolved_clean_heads": []
+}

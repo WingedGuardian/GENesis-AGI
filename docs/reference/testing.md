@@ -460,9 +460,11 @@ It also reports reads of the real credential files (the deployed `secrets.env`,
 - The run summary counts tests per class under "writes outside the test's temp
   dirs"; `GENESIS_LIVE_WRITES_REPORT=<file>` writes one tab-separated line per
   (test, class, operation, path), on every run.
-- A hit is a write that happens: an attempt the kernel refuses or that changes
-  nothing (`mkdir(exist_ok=True)` on an existing directory, `unlink` of a missing
-  file, reopening an existing file without writing) is not recorded. A relative
+- Hits are pre-operation classifications of audit events, not proof that a
+  syscall completed. Simple known no-ops (`mkdir(exist_ok=True)` on an existing
+  directory, `unlink` of a missing file, reopening an existing file without
+  writing) are filtered, but an operation the kernel refuses can still be
+  reported, and some aliases can be missed (tracked in #4193). A relative
   `os.open` is judged against the cwd and labelled so (its audit event carries no
   `dir_fd`). Writes during collection count as "outside any test".
 - Not covered: writes made by child processes, writes without an audit event,
@@ -472,14 +474,29 @@ It also reports reads of the real credential files (the deployed `secrets.env`,
   boundary there.
 
 The list it produces is the to-do list for moving each such test under its own
-`tmp_path`; once it is empty, the audit can refuse instead of report.
+`tmp_path`. Keep it report-only while the #4193 accuracy gaps are corrected:
+enforcement requires a corrected audit and a complete empty CI census, which a
+selected local run cannot establish.
+
+Generated session MCP configs are isolated by the function-scoped autouse fixture
+in `tests/_session_config.py`, registered by the root conftest. It redirects only
+the builder's generated-output directory to each test's `tmp_path`: generation,
+profile filtering, template reads, repository-root substitution and cache reuse
+remain real. Its independent monkeypatch survives a test undoing its own patches.
+Each test starts with a cold output directory, including on separate xdist workers.
+This fixture does not cover generation during collection, broader-scoped fixture
+setup or child processes; those callers must explicitly own their output paths.
+The bounded-output hook tests that exercise recall use a real temporary SQLite
+database and migration marker, rather than pointing SQLite at a test source file.
+These fixture fixes do not enable write-audit enforcement or establish that the
+full-suite census is empty.
 
 ## Shared MCP qualification environments
 
 Ordinary CI keeps its existing runtime dependency ranges. The shared-only
-protocol suites require the exact versions admitted by
+protocol and shared CLI suites require the exact versions admitted by
 `genesis.mcp.shared_http._settings.require_qualified_stack`; an unsupported
-ordinary environment explicitly skips those three modules before SDK imports.
+ordinary environment explicitly skips those four modules before SDK imports.
 Pure configuration and missing/later-version refusal tests remain ordinary
 tests in `tests/test_mcp/test_shared_http_settings.py`.
 
@@ -490,9 +507,15 @@ read-only permissions. `GENESIS_REQUIRE_SHARED_MCP_QUALIFICATION=1` is test-only
 qualification refusal becomes a collection error in this job. No production
 version, feature, credential or rollout gate changes.
 
-The protocol step names the admission, policy and actual HTTP modules explicitly.
+The protocol step names the admission, policy, actual HTTP and shared CLI modules
+explicitly. The CLI checks start all four real factories with disposable local
+dependencies, exercise catalog/authentication/read calls over TCP, and observe
+SDK shutdown and registered-owner drainage before resource closure on SIGTERM.
+They also exercise path/abstract readiness datagrams after bind and cleanup on
+failed notification, bind failure and shutdown requested during startup. The
+memory notification-failure case checks its actual provider/cache closers.
 Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
-and a floor of 91 cases. Installation, collection, test or report-check failure
+and a floor of 104 cases. Installation, collection, test or report-check failure
 fails the job; missing or filtered workflow runs do not qualify a PR. Closing
 checks its actual head/base result. Ordinary skip-budget changes require observed
 skip identities; this workflow does not raise that budget automatically.
@@ -500,6 +523,16 @@ skip identities; this workflow does not raise that budget automatically.
 For a local run, use an already qualified isolated interpreter and the same
 strict test flag, then run the workflow's report check. Changing installed
 packages or enabling shared services is not part of that test command.
+
+`test_shared_notify.py` exercises owned local datagrams and error propagation
+without SDK qualification. `test_shared_mcp_templates.py` reuses both actual
+renderer loops and executes their activation sections with nondelegating command
+shims, checking literal paths, stamps and keep/take behavior without starting a
+unit. Successful per-test payload/event files require both an explicit scratch
+`--basetemp` and `-o tmp_path_retention_policy=all`; the normal policy removes
+successful test directories. Read-only `systemd-analyze verify` can validate
+rendered syntax with generators disabled; it does not execute or qualify a live
+service.
 
 ## Integration Tests
 
@@ -540,3 +573,13 @@ database lease. `tests/test_memory/test_tag_index_ownership.py` covers independe
 background admission, physical scan drain, refusal/creation failure, prestart
 cancellation, retriever propagation and the body-completed/done-callback gap.
 `tests/test_memory/test_tag_index_swr.py` retains legacy stale-query behavior.
+
+Owned shared bootstrap coverage lives in `tests/test_mcp/test_shared_service_settings.py`,
+`test_shared_resource_factories.py`, `test_shared_launch_selection.py` and
+`test_shared_runner.py`, plus `tests/test_memory/test_embedding_resource_lifecycle.py`.
+Factory argument tests use real canonical SQLite/facades with captured initializer
+arguments and provider doubles; they are not real-provider or native-client E2E.
+`test_shared_runner_lifecycle.py` runs disposable child processes with real Uvicorn
+and inert ASGI/resource dependencies to verify signal replay, cancelled startup,
+bind errors, failed lifespan and cancelled/forced shutdown ordering. These tests
+do not send signals to another session or start a deployed service.

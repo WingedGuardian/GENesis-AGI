@@ -15,12 +15,15 @@ Fake credentials and example.org hosts only, never real secrets.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import re
 
 import aiosqlite
 import pytest
 
 from genesis.db.crud import knowledge as kc
 from genesis.db.schema import create_all_tables
+from genesis.memory import knowledge_ingest as ki
 from genesis.memory import reference_ops as ro
 from tests.test_memory.test_reference_secret_class_fixes import (
     _KEY,
@@ -41,19 +44,27 @@ async def db():
 
 
 class _PausingStore(_PointStore):
-    """Pauses the first store call made while ``armed`` until ``resume`` is
-    set; ``entered`` is set when it pauses. (Bodies of one key are now alike:
-    the description is held out, so the call is picked by order, not content.)"""
+    """Pauses the first ingest made while ``armed`` just before it takes the
+    knowledge writer lock, after its read of the key and before its store and
+    commit; ``entered`` is set when it pauses. The lock serializes the
+    store-to-cleanup window (#4161), so the race the compare-and-swap guards is
+    the one between the read and the lock. (Bodies of one key are alike: the
+    description is held out, so the call is picked by order, not content.)"""
 
-    def __init__(self, armed: bool = True):
+    def __init__(self, monkeypatch, armed: bool = True):
         super().__init__()
         self.armed, self.entered, self.resume = armed, asyncio.Event(), asyncio.Event()
+        real = ki.writer
 
-    async def store_reporting_creation(self, content, source, **kwargs):
-        if self.armed and not self.entered.is_set():
-            self.entered.set()
-            await self.resume.wait()
-        return await super().store_reporting_creation(content, source, **kwargs)
+        @contextlib.asynccontextmanager
+        async def _writer(*args, **kwargs):
+            if self.armed and not self.entered.is_set():
+                self.entered.set()
+                await self.resume.wait()
+            async with real(*args, **kwargs):
+                yield
+
+        monkeypatch.setattr(ki, "writer", _writer)
 
 
 async def _indexed_texts(db, store, unit: str) -> list[str]:
@@ -74,10 +85,12 @@ async def _assert_one_named_point(db, store) -> None:
 # ─── 1. compare-and-swap ────────────────────────────────────────────────────
 
 
-async def test_a_placeholder_re_ingest_racing_a_rotation_pairs_with_the_retained_secret(db):
-    """4527738739: A reads Old, pauses in store.store; B rotates the key to New;
+async def test_a_placeholder_re_ingest_racing_a_rotation_pairs_with_the_retained_secret(
+    db, monkeypatch,
+):
+    """4527738739: A reads Old, pauses before its store; B rotates the key to New;
     A resumes. A placeholder body whose note repeats New must not index it."""
-    store = _PausingStore(armed=False)
+    store = _PausingStore(monkeypatch, armed=False)
     unit = await _ingest(db, store, _body("Example portal login", "password: Old!Fake123"))
     store.armed = True
     writer_a = asyncio.create_task(
@@ -98,10 +111,12 @@ async def test_a_placeholder_re_ingest_racing_a_rotation_pairs_with_the_retained
     await _assert_one_named_point(db, store)
 
 
-async def test_a_writer_that_read_an_absent_key_never_orphans_the_winners_point(db):
-    """4527738743: B reads an absent key and pauses in store.store; A inserts the
+async def test_a_writer_that_read_an_absent_key_never_orphans_the_winners_point(
+    db, monkeypatch,
+):
+    """4527738743: B reads an absent key and pauses before its store; A inserts the
     key; B resumes. B must displace A's point, not leave it recallable."""
-    store = _PausingStore()
+    store = _PausingStore(monkeypatch)
     writer_b = asyncio.create_task(
         _ingest(db, store, _body("Example portal login from B", "password: B!Fake789")),
     )
@@ -127,7 +142,8 @@ async def test_a_second_change_raises_to_the_caller_and_leaves_nothing(db, monke
     monkeypatch.setattr(kc, "upsert", _always_changed)
     with pytest.raises(kc.CredentialKeyChanged):
         await _ingest(db, store, _body("Example portal login", "password: Twice!Fake3"))
-    assert len(calls) == 2
+    # The first try and five fresh reads (owner ruling: retry until it lands).
+    assert len(calls) == 6
     assert store.points == {}
 
 
@@ -228,53 +244,59 @@ async def test_the_statement_itself_refuses_a_change_after_the_read(db, monkeypa
 
 
 async def test_identifiers_carrying_their_values_never_collide(db):
-    """4527738751: identifiers each containing their own value would both read
-    "router [redacted]" and the second would overwrite the first. Both are
-    refused, and an entry already filed under the redacted key stays intact."""
+    """4527738751: identifiers each containing their own value both read
+    "router [held]" once masked. Identity is the full name (#2426), so the two
+    are two entries, and an entry filed under the bare masked text stays
+    intact; no key spells a value."""
     store = _PointStore()
     seeded = await _ingest(
         db,
         store,
         _body("Example router", "password: Seed!Fake0"),
-        concept="router [redacted]",
+        concept="router [held]",
     )
-    for concept, value in (
-        ("router Alpha!Fake1", "Alpha!Fake1"),
-        ("router Beta!Fake2", "Beta!Fake2"),
-    ):
-        with pytest.raises(ValueError, match="identifier must not contain its value") as refused:
-            await _ingest(db, store, _body("Example router", f"password: {value}"), concept=concept)
-        assert value not in str(refused.value)
-    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 1
+    units = [
+        await _ingest(db, store, _body("Example router", f"password: {value}"), concept=f"router {value}")
+        for value in ("Alpha!Fake1", "Beta!Fake2")
+    ]
+    assert len({seeded, *units}) == 3
     assert await kc.get_reference_secret(db, seeded) == "password: Seed!Fake0"
-    await _assert_one_named_point(db, store)
+    assert await kc.get_reference_secret(db, units[1]) == "password: Beta!Fake2"
+    for unit in units:
+        row = await kc.get(db, unit)
+        assert "Fake" not in row["concept"] and ro.display_name(row) == "router [held]"
 
 
-async def test_a_credential_without_an_identifier_is_refused(db):
-    """With no concept the key would be derived from the SCRUBBED body, so two
+async def test_a_credential_without_an_identifier_gets_a_minted_key(db):
+    """With no concept the key would be derived from the HELD body, so two
     credentials differing only in their values would share it (security review
-    of 4527738751's fix). Such a write is refused before any store write."""
+    of 4527738751's fix). Each gets a minted key of its own (#2426 PR A)."""
     store = _PointStore()
-    for value in ("Alpha!Fake1", "Beta!Fake2"):
-        with pytest.raises(ValueError, match="needs an explicit identifier") as refused:
-            await _ingest(db, store, _body("router", f"password: {value}"), concept=None)
-        assert value not in str(refused.value)
-    assert await db.execute_fetchall("SELECT 1 FROM knowledge_units") == []
-    assert store.points == {}
+    units = [
+        await _ingest(db, store, _body("router", f"password: {value}"), concept=None)
+        for value in ("Alpha!Fake1", "Beta!Fake2")
+    ]
+    concepts = {(await kc.get(db, u))["concept"] for u in units}
+    assert len(concepts) == 2 and all(re.fullmatch(r"cred-[0-9a-f]{12}", c) for c in concepts)
+    assert await kc.get_reference_secret(db, units[1]) == "password: Beta!Fake2"
 
 
-async def test_a_placeholder_re_ingest_whose_identifier_carries_the_stored_value_is_refused(db):
+@pytest.mark.xfail(strict=True, reason="fixed by the credential move PR")
+async def test_a_placeholder_re_ingest_whose_identifier_carries_the_stored_value_moves_to_a_masked_key(db):
     """A key written before this rule (directly, so its identifier carries the
-    value): a placeholder re-ingest pairing with it would keep that identifier as a
-    key, so it is refused, and the old entry keeps its secret."""
+    value): a placeholder re-ingest moves that SAME row to the masked
+    identifier (audit 2: an untagged entry whose key spells a current secret is
+    re-keyed, never left beside a second entry), its stored value kept."""
     legacy = "router Kept!Fake5"
     unit, _ = await kc.upsert(
         db, project_type="reference", domain="reference.credentials", source_doc="x",
         concept=legacy, body=_body("Example router", ro.SECRET_PLACEHOLDER),
         qdrant_id="p-legacy", secret_value="password: Kept!Fake5",
     )
-    with pytest.raises(ValueError, match="identifier must not contain its value"):
-        await _ingest(
-            db, _PointStore(), _body("Example router", ro.SECRET_PLACEHOLDER), concept=legacy,
-        )
-    assert await kc.get_reference_secret(db, unit) == "password: Kept!Fake5"
+    moved = await _ingest(
+        db, _PointStore(), _body("Example router", ro.SECRET_PLACEHOLDER), concept=legacy,
+    )
+    assert moved == unit and re.fullmatch(r"cred-[0-9a-f]{12}", (await kc.get(db, moved))["concept"])
+    assert ro.display_name(await kc.get(db, moved)) == "router [held]"
+    assert await kc.get_reference_secret(db, moved) == "password: Kept!Fake5"
+    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 1

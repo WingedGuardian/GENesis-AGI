@@ -1047,8 +1047,8 @@ async def memory_store(
     room: str | None = None,
     collection: str | None = None,
     supersedes: str | None = None,
-) -> str:
-    """Store memory with source metadata and type tag. Returns memory_id.
+) -> str | dict:
+    """Store memory; return an id, or a supersession report when requested.
 
     Args:
         memory_class: Optional classification — "rule", "fact", or "reference".
@@ -1058,8 +1058,9 @@ async def memory_store(
         collection: Explicit Qdrant collection override. Bypasses the default
             collection routing when provided (e.g. "knowledge_base").
         supersedes: Memory ID that this new memory replaces. The old memory
-            will be marked as deprecated with a ``succeeded_by`` link to the
-            new one. Use when correcting stale facts.
+            is deprecated and linked to the correction. Returns memory_id,
+            superseded, and full old_id/new_id; incomplete supersession includes
+            the exact memory_supersede repair call. Blank input is no request.
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
@@ -1071,7 +1072,8 @@ async def memory_store(
     # "conversation" pipeline. None (foreground/unset) → pipeline-derived.
     from genesis.memory.provenance import session_origin_from_env
 
-    return await memory_mod._store.store(
+    outcome = {"superseded": False} if supersedes and supersedes.strip() else None
+    memory_id = await memory_mod._store.store(
         content,
         source,
         memory_type=memory_type,
@@ -1084,7 +1086,16 @@ async def memory_store(
         room=room,
         collection=collection,
         supersedes=supersedes,
+        **({"supersede_outcome": outcome} if outcome is not None else {}),
     )
+    if outcome is None:
+        return memory_id
+    report = {"memory_id": memory_id, **outcome}
+    if not outcome["superseded"]:
+        report["repair"] = (
+            f"memory_supersede(old_id={outcome['old_id']!r}, new_id={outcome['new_id']!r})"
+        )
+    return report
 
 
 @mcp.tool()
@@ -1096,11 +1107,9 @@ async def memory_supersede(old_id: str, new_id: str) -> dict:
     know both ids up front — it is the direct way to say "this one replaces
     that one".
 
-    It does NOT say "use this when ``memory_store(supersedes=...)`` told you the
-    deprecation failed", because that tool cannot tell you: ``store()`` catches
-    a failed deprecation and still returns only the new memory's id, so no such
-    report reaches this boundary. Saying otherwise described a recovery the
-    caller can never be prompted to make.
+    Also use the full ids reported when ``memory_store(supersedes=...)`` saves
+    the correction but reports superseded=False. This repairs the remaining
+    supersession work without storing another memory.
 
     Both arguments accept the same short ``id:<8-char>`` handles the proactive
     hook prints and ``memory_expand`` accepts; an ambiguous handle is never

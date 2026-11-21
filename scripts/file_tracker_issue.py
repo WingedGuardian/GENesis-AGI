@@ -976,9 +976,14 @@ def _comment_main(args, run: Runner) -> int:
                     "INDETERMINATE: comment may exist. Read the target before retrying; no second POST attempted."
                 )
             return _finish(4)
-        # Includes reused lookup exceptions: neither their stderr nor paths are safe.
+        # Later lookup refusals can contain unsafe stderr or paths.
         with contextlib.suppress(BaseException):
-            _warn(f"REFUSED: comment {phase} failed ({type(exc).__name__}). Nothing submitted.")
+            detail = (
+                f": {exc}"
+                if isinstance(exc, Refused) and phase in ("draft read", "privacy scan")
+                else ""
+            )
+            _warn(f"REFUSED: comment {phase} failed ({type(exc).__name__}){detail}. Nothing submitted.")
         known = isinstance(
             exc, (Refused, OSError, ValueError, KeyboardInterrupt, subprocess.SubprocessError)
         )
