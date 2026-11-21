@@ -662,6 +662,28 @@ async def set_turn_totals(
     return cursor.rowcount > 0
 
 
+async def _per_model_effort(db: aiosqlite.Connection, id: str, model: str) -> str | None:
+    """The configured effort for ``model`` on this session's channel, or None.
+
+    Never raises: an unreadable config or row leaves the effort unchanged, and the
+    model switch itself still happens. Whether this is a SWITCH is not decided
+    here: ``update_model_effort`` checks that inside its UPDATE, against the row
+    as it is when the write lands.
+    """
+    try:
+        cursor = await db.execute("SELECT channel FROM cc_sessions WHERE id = ?", (id,))
+        row = await cursor.fetchone()
+        if not row or not row[0]:
+            return None
+        from genesis.channels.config import default_effort_for_model
+
+        effort = default_effort_for_model(row[0], model)
+    except Exception:
+        _logger.warning("Per-model effort lookup failed for session %s", id, exc_info=True)
+        return None
+    return effort.value if effort else None
+
+
 async def update_model_effort(
     db: aiosqlite.Connection,
     id: str,
@@ -669,9 +691,40 @@ async def update_model_effort(
     model: str | None = None,
     effort: str | None = None,
 ) -> bool:
-    """Update model and/or effort on an existing session."""
+    """Update model and/or effort on an existing session; True when a row changed.
+
+    See ``apply_model_effort``, which also returns the effort the row now holds."""
+    return await apply_model_effort(db, id, model=model, effort=effort) is not None
+
+
+async def apply_model_effort(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    model: str | None = None,
+    effort: str | None = None,
+) -> str | None:
+    """Update model and/or effort on an existing session; return the stored effort.
+
+    The effort comes back from the write itself (``RETURNING``), so it is the
+    effort this update left in the row, never a later read that another writer
+    could have changed. None when nothing was updated (no such row, or nothing to set).
+
+    A model given without an effort takes the session channel's per-model default
+    when one is configured (``default_effort_for_model``, #4854); every model
+    switch goes through here, so no caller has to remember it. The default applies
+    only to a real switch, and that test runs in the same statement as the write
+    (SQLite evaluates ``SET`` against the old row), so a concurrent explicit
+    choice is never overwritten on a stale read. Re-stating the current model
+    keeps the effort the user set.
+    """
     updates = []
     params: list = []
+    if model is not None and effort is None:
+        default = await _per_model_effort(db, id, model)
+        if default is not None:
+            updates.append("effort = CASE WHEN model IS NOT ? THEN ? ELSE effort END")
+            params.extend([model, default])
     if model is not None:
         updates.append("model = ?")
         params.append(model)
@@ -679,14 +732,15 @@ async def update_model_effort(
         updates.append("effort = ?")
         params.append(effort)
     if not updates:
-        return False
+        return None
     params.append(id)
     cursor = await db.execute(
-        f"UPDATE cc_sessions SET {', '.join(updates)} WHERE id = ?",
+        f"UPDATE cc_sessions SET {', '.join(updates)} WHERE id = ? RETURNING effort",
         tuple(params),
     )
+    row = await cursor.fetchone()
     await db.commit()
-    return cursor.rowcount > 0
+    return row[0] if row else None
 
 
 async def query_by_skill_tag(
