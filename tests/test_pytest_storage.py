@@ -137,7 +137,10 @@ def test_native_default_storage_is_owned_and_persistent(tmp_path, ci, workers):
 def test_explicit_storage_overrides_are_preserved(tmp_path, relative):
     project, temporary, env = _project(tmp_path)
     hypothesis = temporary / "chosen hypothesis"
-    cache = temporary / "chosen pytest"
+    # Pytest 9.2.0 fails during startup when cache_dir includes '..' (#15295).
+    # Use a relative option within this owned checkout and keep the absolute
+    # case outside it. The separate Hypothesis override still uses '../'.
+    cache = (project / ".pytest_cache" if relative else temporary) / "chosen pytest"
     env["HYPOTHESIS_STORAGE_DIRECTORY"] = os.path.relpath(hypothesis, project) if relative else str(hypothesis)
     env["STORAGE_EXPECTED"] = env["HYPOTHESIS_STORAGE_DIRECTORY"]
     cache_option = os.path.relpath(cache, project) if relative else str(cache)
@@ -146,7 +149,8 @@ def test_explicit_storage_overrides_are_preserved(tmp_path, relative):
         state, output = _run(project, temporary, env, "-o", f"cache_dir={cache_option}")
         assert "3 passed" in output
         assert [row[2:] for row in state["rows"]] == [["write", str(project / "sentinel")]]
-    assert not (project / ".pytest_cache").exists()
+    assert not (project / ".pytest_cache/pytest").exists()
+    assert not (project / ".pytest_cache/hypothesis").exists()
     assert (hypothesis / "constants/probe").is_file()
     assert (cache / "v/storage/present").is_file()
 
