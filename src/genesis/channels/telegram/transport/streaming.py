@@ -31,7 +31,10 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_MAX_LENGTH = 4096
 _MAX_TOOL_LINES = 10
-_DEFAULT_THROTTLE_S = 0.5
+# Drafts share messages.setTyping's per-chat limit (20 calls / 5 s, 40 / 30 s;
+# Telegram "AI features for bots") with the 4 s typing keepalive: 1.5 s keeps
+# drafts at 20 / 30 s plus typing's 7.5, under 40.
+_DEFAULT_THROTTLE_S = 1.5
 
 
 def generate_draft_id() -> int:
@@ -95,6 +98,8 @@ class DraftStreamer:
         self._any_draft_sent = False
         self._last_draft_text = ""
         self._consecutive_failures = 0
+        self._waiting_s: float | None = None
+        self._failure_logged = False
 
     @property
     def enabled(self) -> bool:
@@ -121,6 +126,7 @@ class DraftStreamer:
         """Handle CC thinking event — show thinking indicator."""
         if not self._enabled:
             return
+        self._waiting_s = None
         if not self._thinking:
             self._thinking = True
             await self._maybe_send_draft()
@@ -130,6 +136,7 @@ class DraftStreamer:
         if not self._enabled or not text:
             return
         self._thinking = False
+        self._waiting_s = None
         self._text += text
         await self._maybe_send_draft()
 
@@ -144,7 +151,30 @@ class DraftStreamer:
             preview = tool_input[:60].replace("\n", " ")
             line += f"  {preview}"
         self._tool_lines.append(line)
+        self._waiting_s = None
         await self._maybe_send_draft()
+
+    async def keepalive(self, quiet_s: float) -> None:
+        """Re-send the draft after a quiet stretch, with how long it has been quiet.
+
+        Telegram drops a live draft about 30 s after its last update, so a long
+        thinking stretch otherwise leaves nothing on screen. It also carries any
+        update the throttle dropped.
+        """
+        if not self._enabled:
+            return
+        self._waiting_s = quiet_s
+        await self._send_draft()
+
+    def status_body(self) -> str:
+        """The tool activity so far, for a status message: empty when there is
+        none. Text is left out, because the final reply carries it."""
+        if not self._tool_lines:
+            return ""
+        visible = self._tool_lines[-_MAX_TOOL_LINES:]
+        overflow = len(self._tool_lines) - len(visible)
+        lines = [f"... +{overflow} more"] if overflow else []
+        return "Working on it:\n" + "\n".join(lines + visible)
 
     async def flush(self) -> None:
         """Force-send current accumulated content as a draft."""
@@ -172,6 +202,9 @@ class DraftStreamer:
             if parts:
                 parts.append("")  # blank separator
             parts.append(self._text)
+
+        if self._waiting_s is not None:
+            parts.append(f"\n\u23f3 still working ({int(self._waiting_s)} s)")
 
         return "\n".join(parts)
 
@@ -220,6 +253,16 @@ class DraftStreamer:
                     self._consecutive_failures, self.chat_id, exc_info=True,
                 )
                 self._enabled = False
+            elif not self._failure_logged:
+                # The first failure of a turn is logged with its cause: a flood
+                # wait here was invisible while every failure logged at debug.
+                self._failure_logged = True
+                logger.info(
+                    "Draft send failed (attempt %d/3) for chat %s",
+                    self._consecutive_failures,
+                    self.chat_id,
+                    exc_info=True,
+                )
             else:
                 logger.debug(
                     "Draft send failed (attempt %d/3) for chat %s",
