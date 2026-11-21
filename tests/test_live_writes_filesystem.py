@@ -163,16 +163,33 @@ def test_named_destination_with_dir_fd_still_records(home, operation):
 
 
 @pytest.mark.parametrize("follow", [False, True])
-def test_link_symlink_source_has_explicit_conservative_exposure(home, follow):
+@pytest.mark.parametrize("metadata_failure", [None, "source-once", "destination"])
+def test_link_symlink_source_has_explicit_conservative_exposure(home, monkeypatch, follow, metadata_failure):
     source = home / ".genesis" / "source"
     source.write_bytes(b"owned")
     allowed = home.parent / "allowed"
     symlink = allowed / "link"
     symlink.symlink_to(source)
+    alias = allowed / "alias"
+    if metadata_failure is not None:
+        unavailable = symlink if metadata_failure == "source-once" else alias
+        original = audit.os.lstat
+        failed = False
+
+        def lstat(path, *args, **kwargs):
+            nonlocal failed
+            # The later followed lookup must be able to read the source link.
+            if os.fspath(path) == str(unavailable) and (not failed or metadata_failure == "destination"):
+                failed = True
+                raise OSError(errno.EIO, "owned metadata fault")
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(audit.os, "lstat", lstat)
     audit._S.hits.clear()
-    os.link(symlink, allowed / "alias", follow_symlinks=follow)
+    os.link(symlink, alias, follow_symlinks=follow)
+    assert alias.exists()
     assert ("~/.genesis", "os.link source", "source") in _hits()
-    assert audit._S.faults == 0
+    assert audit._S.faults == int(metadata_failure is not None)
 
 
 @pytest.mark.parametrize("event", ["open", "rename", "link"])

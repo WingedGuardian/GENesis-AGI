@@ -75,4 +75,13 @@ def uncertain_name_effects(resolve, event, args):
             continue
         operation = "os.link source" if event == "os.link" and index == 0 else event
         effects.append((target, operation))
+    if event == "os.link":
+        # The followed source can still be resolved when other metadata fails.
+        try:
+            target = resolve(args[0], args[2])
+        except (OSError, ValueError):
+            return effects
+        observation = (target, "os.link source")
+        if target is not None and observation not in effects:
+            effects.append(observation)
     return effects
