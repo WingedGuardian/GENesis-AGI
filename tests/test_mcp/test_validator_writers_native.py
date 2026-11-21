@@ -11,13 +11,17 @@ from pathlib import Path
 
 import pytest
 
-from genesis.mcp.external_profiles import profile_tools
 from tests.conftest import private_module
 from tests.test_hooks.native_codex import (
     configure,
     fixture_provider,
     run_native,
     trust_fixture_hook,
+)
+from tests.test_mcp.test_validator_writer_profiles import (
+    HEALTH_READS,
+    MEMORY_READS,
+    VALIDATOR_ONLY_TOOLS,
 )
 from tests.test_mcp.validator_stdio_fixture import prepare
 from tests.test_scripts.test_pr_verification_closer import _doc
@@ -134,7 +138,9 @@ async def test_native_validator_writer_dispatch(tmp_path, monkeypatch, client, c
     definition = private_module("native_writer_adapter", runtime / "scripts/hooks/codex_validator_adapter.py")
     sources = {"writer/" + str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
                for p in [ROOT / "scripts/genesis_mcp_server.py", Path(__file__),
+                         ROOT / "tests/test_mcp/test_validator_writer_profiles.py",
                          ROOT / "tests/test_mcp/validator_stdio_fixture.py", ROOT / "tests/test_hooks/native_codex.py",
+                         ROOT / "tests/test_scripts/test_pr_verification_closer.py",
                          *sorted((ROOT / "src/genesis").rglob("*.py"))]}
     sources.update({"adapter/" + str(p.relative_to(runtime)): hashlib.sha256(p.read_bytes()).hexdigest()
                     for p in runtime.rglob("*") if p.is_file() and ".venv" not in p.parts})
@@ -170,8 +176,11 @@ async def test_native_validator_writer_dispatch(tmp_path, monkeypatch, client, c
                    for line in output.splitlines() if line.startswith("VALIDATOR_WRITER:")]
         assert len(records) == 1, outputs
         record = records[0]
+        expected = {"health": HEALTH_READS, "memory": MEMORY_READS}
+        if profile == "validator":
+            expected = {scope: reads | VALIDATOR_ONLY_TOOLS[scope] for scope, reads in expected.items()}
         expected_tools = {f"mcp__genesis_validator_{scope}__{name}"
-                          for scope in ("health", "memory") for name in profile_tools(scope, profile)}
+                          for scope, names in expected.items() for name in names}
         assert len(record["catalog"]) == len(expected_tools)
         assert set(record["catalog"]) == expected_tools
         hooks = [json.loads(line) for line in (tmp_path / "hooks.jsonl").read_text().splitlines()] if (tmp_path / "hooks.jsonl").exists() else []

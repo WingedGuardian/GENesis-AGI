@@ -15,15 +15,19 @@ MEMORY_READS = frozenset({
     "memory_recall", "memory_expand", "memory_core_facts", "memory_stats", "knowledge_recall",
     "knowledge_status", "procedure_recall", "observation_query",
 })
+VALIDATOR_ONLY_TOOLS = {
+    "health": {"pr_verification_close", "follow_up_create", "follow_up_list", "follow_up_update"},
+    "memory": {"memory_store"},
+}
 
 
-@pytest.mark.parametrize("server,reads,writes", [
-    ("health", HEALTH_READS, {"pr_verification_close", "follow_up_create", "follow_up_list", "follow_up_update"}),
-    ("memory", MEMORY_READS, {"memory_store"}),
+@pytest.mark.parametrize("server,reads", [
+    ("health", HEALTH_READS),
+    ("memory", MEMORY_READS),
 ])
-def test_closed_profile_sets_keep_external_unchanged(server, reads, writes):
+def test_closed_profile_sets_keep_external_unchanged(server, reads):
     assert profiles.profile_tools(server, "external") == reads
-    assert profiles.profile_tools(server, "validator") == reads | writes
+    assert profiles.profile_tools(server, "validator") == reads | VALIDATOR_ONLY_TOOLS[server]
 
 
 @pytest.mark.parametrize("fails", [False, True])

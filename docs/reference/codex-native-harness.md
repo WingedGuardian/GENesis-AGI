@@ -260,7 +260,7 @@ submit its measured exit status and output to the writer. The database
 readback compares the recorded measurement and verdict and distinguishes a
 closed pass, an open failed or inconclusive obligation, and a preview with no
 stored change. External-profile controls compare the full exposed tool list
-against the capability floor.
+with the capability floor declared independently in the profile tests.
 This result covers the writer suite. The launcher, shell boundary, and
 operator calibration have separate qualification requirements.
 
