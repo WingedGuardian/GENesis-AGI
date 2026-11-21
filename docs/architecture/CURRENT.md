@@ -3410,7 +3410,10 @@ verified: 41c7343b3 2026-11-15
   Fixture lookup injection stays outside the public MCP schema. Its
   server-side calibration gate forces preview until operator opt-in, including
   attempt notes. Real writes use a separate admitted existing-only connection;
-  preview uses SELECTs on the shared handle. Event-gated gaps are captured by
+  MCP preview uses SELECTs on the shared handle. CLI close and recheck previews
+  use an admitted, URI-encoded read-only connection, preserving committed WAL
+  data without checkpointing; SQLite sidecar/lock coordination remains possible.
+  Event-gated gaps are captured by
   the shared close CRUD as structured rechecks on the closed row. The backlog
   lists due dates and named events, with result commands bound to its database;
   the recheck CLI appends failed/done measurements without reopening the row.
