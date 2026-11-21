@@ -106,6 +106,27 @@ def test_re_adding_moves_the_pin_to_the_new_head_and_keeps_added_at(dc, dc_ready
     assert "re-verified" in capsys.readouterr().out
 
 
+def test_re_adding_at_a_new_head_moves_the_entry_last(dc, dc_ready, capsys):
+    """Manifest order is pin order (#2978): the Guardian drops the last listed
+    candidate as the newest code, so a re-pin goes to the end."""
+    w = dc_ready
+    w.candidate("feat/a", {"pa.txt": "a\n"})
+    w.candidate("feat/b", {"pb.txt": "b\n"})
+    assert w.add(dc, "feat/a") == 0 and w.add(dc, "feat/b") == 0
+    w.candidate("feat/a", {"pa.txt": "a2\n"})
+    assert w.add(dc, "feat/a") == 0, capsys.readouterr()
+    assert [c["branch"] for c in w.manifest()["candidates"]] == ["feat/b", "feat/a"]
+
+
+def test_re_adding_at_the_same_head_keeps_the_entry_in_place(dc, dc_ready, capsys):
+    w = dc_ready
+    w.candidate("feat/a", {"pa.txt": "a\n"})
+    w.candidate("feat/b", {"pb.txt": "b\n"})
+    assert w.add(dc, "feat/a") == 0 and w.add(dc, "feat/b") == 0
+    assert w.add(dc, "feat/a") == 0, capsys.readouterr()
+    assert [c["branch"] for c in w.manifest()["candidates"]] == ["feat/a", "feat/b"]
+
+
 def test_add_refuses_a_branch_sharing_an_unmerged_commit_with_a_listed_one(dc, dc_ready, capsys):
     """One candidate per commit: a stack goes in as its top branch."""
     w = dc_ready

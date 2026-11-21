@@ -130,6 +130,77 @@ class TestGatherResult:
 
 class TestGatherReleases:
     @pytest.mark.asyncio
+    async def test_stable_release_behind_prerelease_pages(self, db):
+        """A stable release beyond the first API page is still found once."""
+        project = {"name": "Sample", "repo": "example/sample", "track": ["releases"]}
+        stable = {**_fake_releases("example/sample")[0], "prerelease": False}
+        history = [
+            {"tag_name": f"v3.0.0-rc.{i}", "prerelease": True}
+            for i in range(60)
+        ] + [stable]
+
+        async def github(*args):
+            endpoint = args[2]
+            if endpoint.endswith("/releases/latest"):
+                return json.dumps(stable)
+            assert endpoint == "repos/example/sample/releases"
+            # GitHub defaults to a 30-item page; the existing jq takes six.
+            return json.dumps(history[:30][:6])
+
+        with (
+            patch.object(ReconGatherer, "_load_watchlist", return_value=[project]),
+            patch.object(ReconGatherer, "_run_gh", side_effect=github),
+            patch("genesis.surplus.intake.run_intake", side_effect=RuntimeError("offline")),
+        ):
+            first = await ReconGatherer(db).gather_releases()
+            second = await ReconGatherer(db).gather_releases()
+
+        assert first.new_findings == 1
+        assert second.new_findings == 0
+        rows = await observations.query(db, source="recon", category="github_releases")
+        assert len(rows) == 1
+        assert rows[0]["content_hash"] == _release_hash(project["repo"], stable["tag_name"])
+
+    @pytest.mark.asyncio
+    async def test_latest_stable_routes_through_intake(self, db):
+        project = {"name": "Sample", "repo": "example/sample"}
+        stable = _fake_releases("example/sample")[0]
+        with (
+            patch.object(ReconGatherer, "_run_gh", side_effect=["[]", json.dumps(stable)]),
+            patch("genesis.surplus.intake.run_intake", new_callable=AsyncMock) as intake,
+        ):
+            count = await ReconGatherer(db)._check_releases(project)
+        assert count == 1
+        intake.assert_awaited_once()
+        assert intake.call_args.kwargs["source_task_type"] == "github_releases"
+        assert intake.call_args.kwargs["source"].value == "github_landscape"
+        assert "Sample v2.1.80" in intake.call_args.kwargs["content"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("latest", [
+        "", "invalid-json", "[]", "null", "{}",
+        '{"tag_name":"v3-rc","prerelease":true}',
+        '{"tag_name":"v3-draft","draft":true}',
+    ])
+    async def test_latest_unavailable_or_not_published_stable(self, db, latest):
+        with patch.object(ReconGatherer, "_run_gh", side_effect=["[]", latest]) as github:
+            count = await ReconGatherer(db)._check_releases({"name": "Sample", "repo": "example/sample"})
+        assert count == 0
+        assert github.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_recent_stable_window_keeps_two_release_limit(self, db):
+        releases = [*_fake_releases(), {"tag_name": "v2.1.78"}]
+        with (
+            patch.object(ReconGatherer, "_run_gh", return_value=json.dumps(releases)) as github,
+            patch("genesis.surplus.intake.run_intake", new_callable=AsyncMock) as intake,
+        ):
+            count = await ReconGatherer(db)._check_releases({"name": "Sample", "repo": "example/sample"})
+        assert count == 2
+        assert intake.await_count == 2
+        assert github.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_stores_new_findings(self, db):
         gatherer = ReconGatherer(db)
         releases_json = json.dumps(_fake_releases())

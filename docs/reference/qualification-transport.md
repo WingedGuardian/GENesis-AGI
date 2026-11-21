@@ -202,3 +202,12 @@ mapping occurs. Raw response and receipt identities remain in the journal; only
 verified identities map to the canonical gateway model for accounting. Changing
 pins changes the consent-bound plan. Old stopped campaigns are not migrated,
 acknowledged or resent by this feature.
+
+
+## Explicit native profile
+
+The optional `deepseek_native_v1` profile reuses the guarded HTTP lifecycle and
+bounded study controller, with first-party identity and separately labelled
+native tariff evidence. Its credentials, wire controls and no-replacement policy
+are described in [native qualification](qualification-native.md). The gateway
+receipt, provider metadata and GET-recovery rules above remain OpenRouter rules.

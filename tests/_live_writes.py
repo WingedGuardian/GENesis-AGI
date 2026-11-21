@@ -40,7 +40,8 @@ worker that never reported is named in the summary.
 Hits classify pre-operation events, not syscall completion. Known no-ops such
 as an existing ``mkdir``, missing ``unlink``, non-empty ``rmdir``, or an
 unchanged reopen are filtered. Other refused operations and readonly SQLite
-queries outside the recognized literal forms can still be reported.
+queries outside the recognized literal forms can still be reported, and some
+aliases can be missed (tracked in #4193).
 ``os.open`` of a relative name is judged against the cwd and labelled so (its
 audit event omits ``dir_fd``).
 Attribution is by ``PYTEST_CURRENT_TEST``: a write during collection or a

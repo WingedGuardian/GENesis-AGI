@@ -38,6 +38,7 @@ body:
         3. Ruled out on your side: a typo or misuse, local configuration, an out-of-date install, expired credentials.
         4. Searched: no existing issue for this, and no newer version that already fixes it.
         5. Expected vs actual.
+        These are items 1 (Observed), 2 (Intended) and 4 (Searched) of the premise form that a work issue answers; a fix for this bug will answer the rest.
       placeholder: |
         1. ...
         2. ...
