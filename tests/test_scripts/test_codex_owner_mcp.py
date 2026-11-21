@@ -173,19 +173,31 @@ def test_the_unattended_floor_is_exactly_the_reviewed_set():
     }
 
 
-def test_project_config_routes_every_genesis_server_through_the_owner_launcher(tmp_path):
+def test_project_config_routes_every_genesis_server_through_the_owner_launcher(
+    tmp_path, monkeypatch
+):
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    checkout_hook = hooks / "post-checkout"
+    checkout_hook.write_text("#!/bin/sh\ntouch hook-ran\n", encoding="utf-8")
+    checkout_hook.chmod(0o755)
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(hooks))
+
     primary = tmp_path / "primary"
     primary.mkdir()
-    git = ["git", "-C", str(primary)]
+    git = ["git", "-C", str(primary), "-c", "core.hooksPath=/dev/null"]
     subprocess.run([*git, "init", "-q"], check=True)
     subprocess.run(
         [*git, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
-         "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+         "-c", "commit.gpgsign=false",
          "commit", "--allow-empty", "-qm", "Create launcher fixture"],
         check=True,
     )
     linked = tmp_path / "linked checkout"
     subprocess.run([*git, "worktree", "add", "-q", "--detach", str(linked)], check=True)
+    assert not (linked / "hook-ran").exists()
     launcher = linked / "scripts/codex_owner_mcp.py"
     launcher.parent.mkdir()
     launcher.write_text(
