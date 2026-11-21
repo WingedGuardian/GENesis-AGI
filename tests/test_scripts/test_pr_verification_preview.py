@@ -22,28 +22,35 @@ def _bytes(path):
     }
 
 
-@pytest.mark.parametrize("verdict", ["pass-mechanical", "cannot-verify"])
-def test_actual_cli_preview_preserves_committed_wal(tmp_path, verdict):
-    path = tmp_path / "ledger.db"
-    _seed(path)
+def _commit_only_to_wal(path, statement, params=()):
     producer = subprocess.run(
         [
             sys.executable,
             "-c",
-            "import os,sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
+            "import json,os,sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
             "c.execute('PRAGMA journal_mode=WAL'); "
             "c.execute('PRAGMA wal_autocheckpoint=0'); "
-            "c.execute(\"UPDATE pr_verifications SET pr_title='WAL fixture'\"); "
+            "c.execute(sys.argv[2], json.loads(sys.argv[3])); "
             "c.commit(); os._exit(0)",
             str(path),
+            statement,
+            json.dumps(params),
         ],
         capture_output=True,
         timeout=20,
     )
     assert producer.returncode == 0, producer.stderr
+
+
+@pytest.mark.parametrize("verdict", ["pass-mechanical", "cannot-verify"])
+def test_actual_cli_preview_preserves_committed_wal(tmp_path, verdict):
+    path = tmp_path / "ledger.db"
+    _seed(path)
+    # Only the WAL contains the requested PR identity, so the preview must read it.
+    _commit_only_to_wal(path, "UPDATE pr_verifications SET pr_number=8")
     before = _bytes(path)
     evidence = tmp_path / "evidence.json"
-    evidence.write_text(json.dumps(_doc_for(verdict)))
+    evidence.write_text(json.dumps(_doc_for(verdict, pr=8)))
     binary = tmp_path / "bin"
     binary.mkdir()
     gh = binary / "gh"
@@ -66,7 +73,7 @@ def test_actual_cli_preview_preserves_committed_wal(tmp_path, verdict):
         str(_prv.__file__),
         "close",
         "--pr",
-        "7",
+        "8",
         "--db-path",
         str(path),
         "--evidence-file",
@@ -83,8 +90,8 @@ def test_actual_cli_preview_preserves_committed_wal(tmp_path, verdict):
     assert "DRY RUN" in result.stdout and verdict in result.stdout
     assert _bytes(path) == before
     with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as reader:
-        row = reader.execute("SELECT pr_title,status FROM pr_verifications").fetchone()
-        assert row == ("WAL fixture", "open")
+        row = reader.execute("SELECT pr_number,status FROM pr_verifications").fetchone()
+        assert row == (8, "open")
     assert _bytes(path) == before
 
 
@@ -202,9 +209,6 @@ def test_preview_closes_on_recheck_body_error_and_cancellation(tmp_path, monkeyp
 @pytest.mark.parametrize("preview", [True, False])
 @pytest.mark.parametrize("result_kind", ["done", "failed"])
 def test_recheck_preview_preserves_wal_and_recording_still_appends(tmp_path, preview, result_kind):
-    from tests.test_scripts.test_pr_verification_rechecks import _recheck
-
-    # Use direct stored fixture data, so this test never needs GitHub.
     path = tmp_path / "genesis.db"
     _seed(path)
     rechecks = [
@@ -216,33 +220,43 @@ def test_recheck_preview_preserves_wal_and_recording_still_appends(tmp_path, pre
             done_at=None,
         )
     ]
-    with sqlite3.connect(path) as db:
-        db.execute(
-            "UPDATE pr_verifications SET status='closed', rechecks=?", (json.dumps(rechecks),)
-        )
-    producer = subprocess.run(
+    _commit_only_to_wal(
+        path,
+        "UPDATE pr_verifications SET pr_number=8, status='closed', rechecks=?",
+        (json.dumps(rechecks),),
+    )
+    before = _bytes(path)
+    result_file = tmp_path / "result.json"
+    result_file.write_text(json.dumps(dict(repo="owner/repo", result=result_kind, note="owned fixture observation")))
+    result = subprocess.run(
         [
             sys.executable,
-            "-c",
-            "import os,sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
-            "c.execute('PRAGMA journal_mode=WAL'); c.execute('PRAGMA wal_autocheckpoint=0'); "
-            "c.execute(\"UPDATE pr_verifications SET pr_title='WAL fixture'\"); c.commit(); os._exit(0)",
+            "-I",
+            str(_prv.__file__),
+            "recheck",
+            "--pr",
+            "8",
+            "--index",
+            "0",
+            "--result-file",
+            str(result_file),
+            "--db-path",
             str(path),
+            *(["--dry-run"] if preview else []),
         ],
+        env=dict(os.environ, GENESIS_HOME=str(tmp_path / "private-home")),
         capture_output=True,
-        timeout=20,
+        text=True,
+        timeout=30,
     )
-    assert producer.returncode == 0, producer.stderr
-    before = _bytes(path)
-    result = dict(repo="owner/repo", result=result_kind, note="owned fixture observation")
-    assert _recheck(tmp_path, result, *(["--dry-run"] if preview else [])) == 0
+    assert result.returncode == 0, (result.stdout, result.stderr)
     if preview:
         assert _bytes(path) == before
     with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
-        title, status, raw = db.execute(
-            "SELECT pr_title,status,rechecks FROM pr_verifications"
+        pr, status, raw = db.execute(
+            "SELECT pr_number,status,rechecks FROM pr_verifications"
         ).fetchone()
-    assert (title, status) == ("WAL fixture", "closed")
+    assert (pr, status) == (8, "closed")
     assert len(json.loads(raw)[0]["results"]) == (0 if preview else 1)
 
 

@@ -189,19 +189,10 @@ __all__ = [
 @asynccontextmanager
 async def _ledger_connection(path: Path, *, dry_run: bool):
     """Read committed WAL data in previews without opening a writer."""
-    import aiosqlite
+    from genesis.db.connection import connect_aiosqlite_ro, connect_aiosqlite_rw
 
-    from genesis.db.admission import assert_admitted
-    from genesis.db.connection import connect_aiosqlite_rw
-
-    if not dry_run:
-        async with connect_aiosqlite_rw(path, timeout=10) as db:
-            yield db
-        return
-
-    assert_admitted(path)
-    async with aiosqlite.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10) as db:
-        assert_admitted(path)
+    connect = connect_aiosqlite_ro if dry_run else connect_aiosqlite_rw
+    async with connect(path, timeout=10) as db:
         yield db
 
 
