@@ -16,6 +16,7 @@ def test_owner_retirement_precedes_signal_replay_and_loop_teardown(tmp_path, cas
     helper = Path(__file__).with_name("shared_runner_lifecycle_child.py")
     source = Path(__file__).resolve().parents[2] / "src"
     env = dict(os.environ, PYTHONPATH=str(source))
+    env.pop("NOTIFY_SOCKET", None)
     run = subprocess.run([sys.executable, str(helper), case, str(receipt)], capture_output=True,
                          text=True, timeout=15, env=env)
     assert run.returncode in {0, -15}, run.stderr
