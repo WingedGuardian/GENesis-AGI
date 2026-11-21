@@ -12,7 +12,7 @@ from tests.test_live_writes import home as home
 
 @pytest.mark.parametrize("raw", [False, True])
 @pytest.mark.parametrize("entry", ["file", "dangling"])
-def test_refused_exclusive_open_has_no_access(home, raw, entry):
+def test_refused_exclusive_open_keeps_high_level_attempt(home, raw, entry):
     target = home / ".genesis" / "existing"
     if entry == "file":
         target.write_bytes(b"owned")
@@ -24,7 +24,8 @@ def test_refused_exclusive_open_has_no_access(home, raw, entry):
             os.close(os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
         else:
             target.open("x").close()
-    assert not audit._S.hits
+    expected = set() if raw else {("~/.genesis", "write")}
+    assert {(label, operation) for label, operation, _ in _hits()} == expected
     assert audit._S.faults == 0
 
 
@@ -207,8 +208,11 @@ def test_metadata_uncertainty_preserves_known_destination(home, monkeypatch, eve
     monkeypatch.setattr(audit.os, "lstat", unknown)
     audit._S.hits.clear()
     if event == "open":
-        with target.open("x") as handle:
-            handle.write("owned")
+        descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(descriptor, b"owned")
+        finally:
+            os.close(descriptor)
     else:
         getattr(os, event)(source, target)
     assert target.read_bytes() == b"owned"
