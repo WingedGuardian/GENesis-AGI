@@ -491,6 +491,19 @@ async def record_success(db: aiosqlite.Connection, procedure_id: str) -> bool:
     return result
 
 
+def _scrubbed_or_raw(text):
+    """``text`` as the credential scrub stores it; as given when the scrub cannot
+    run (the write then withholds the field, so the comparison is moot)."""
+    from genesis.learning.procedural.credential_scrub import ScrubFailed, scrub_text
+
+    if not isinstance(text, str):
+        return text
+    try:
+        return scrub_text(text)[0]
+    except ScrubFailed:
+        return text
+
+
 async def record_failure(
     db: aiosqlite.Connection,
     procedure_id: str,
@@ -507,8 +520,15 @@ async def record_failure(
     confidence = (s + 1) / (s + f + 2)
 
     modes = json.loads(row["failure_modes"]) if row["failure_modes"] else []
-    # Check if this condition already exists
-    existing = next((m for m in modes if m.get("description") == condition), None)
+    # Check if this condition already exists. Stored descriptions went through the
+    # credential scrub, so both sides are compared scrubbed (#4859); a withheld
+    # field stores bare strings, which match nothing.
+    key = _scrubbed_or_raw(condition)
+    existing = next(
+        (m for m in modes
+         if isinstance(m, dict) and _scrubbed_or_raw(m.get("description")) == key),
+        None,
+    )
     if existing:
         existing["times_hit"] = existing.get("times_hit", 1) + 1
     else:
