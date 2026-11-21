@@ -252,10 +252,16 @@ On 0.166.0, an owned copy of the reference executable also needs the bundled
 layout from the same verified package and record both hashes. A lone executable
 can pass version and discovery checks while failing to start its tool host.
 
-The inherited `tests/test_mcp/test_validator_writers_native.py` also binds this
-reference version and digest. Its fourteen cells exercise real tool dispatch
-against owned SQLite/vector fixtures, including external-profile exclusion,
-preview-only close and explicitly enabled fixture recording. No live store runs.
+The validator writer suite binds the Linux x86-64 executable to its exact
+digest for 0.166.0 or 0.171.0. Its eighteen cells exercise real tool dispatch
+on exec and app-server against owned SQLite/vector fixtures. The close cases
+run the private-pattern scanner against a disposable release candidate and
+submit its measured exit status and output to the writer. The database
+readback distinguishes a recorded pass, an open failed or inconclusive
+obligation, and a preview with no stored change. External-profile controls
+check that the writers are absent. The 0.171.0 run passed all eighteen cells.
+This result covers the writer suite. The launcher, shell boundary, and
+operator calibration have separate qualification requirements.
 
 `tests/test_scripts/test_codex_validator_constructor_native.py` adds composed
 adapter checks using actual Git in owned directories. Separate-value template
