@@ -170,13 +170,13 @@ def test_report_checks_all_and_only_associated_occurrences(content, citation, ex
         decoded[0],
         decoded[1],
     )
-    result = _rep._classify_url(URL, [row], False, lambda _: f"**Source:** <{citation}>")
+    result = _rep._classify_url(URL, [row], lambda _: f"**Source:** <{citation}>")
     assert result["covered"] == expected
 
 
 def test_report_missing_occurrence_context_is_unknown():
     row = _rep.RowInput("completed", None, "fixture.genesis.md", "2026-01-01", 1, [URL])
-    result = _rep._classify_url(URL, [row], False, lambda _: f"**Source:** <{URL}>")
+    result = _rep._classify_url(URL, [row], lambda _: f"**Source:** <{URL}>")
     assert result["covered"] == "unknown"
 
 
@@ -188,9 +188,9 @@ def test_report_rejects_terminal_code_trim_after_an_internal_matching_run(width)
     decoded = _rep._row_item_urls(_v2(run + raw))
     assert decoded is not None and decoded[0] == [raw]
     row = _rep.RowInput("completed", None, "fixture.genesis.md", "2026-01-01", 1, *decoded)
-    result = _rep._classify_url(raw, [row], False, lambda _: f"**Source:** <{shortened}>")
+    result = _rep._classify_url(raw, [row], lambda _: f"**Source:** <{shortened}>")
     assert result["covered"] == "no"
-    result = _rep._classify_url(raw, [row], False, lambda _: f"**Source:** <{raw}>")
+    result = _rep._classify_url(raw, [row], lambda _: f"**Source:** <{raw}>")
     assert result["covered"] == "yes"
 
 
