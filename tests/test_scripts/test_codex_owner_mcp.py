@@ -11,6 +11,8 @@ anything else asks), and every name it lists must be a registered tool.
 from __future__ import annotations
 
 import importlib.util
+import json
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -171,18 +173,44 @@ def test_the_unattended_floor_is_exactly_the_reviewed_set():
     }
 
 
-def test_project_config_routes_every_genesis_server_through_the_owner_launcher():
+def test_project_config_routes_every_genesis_server_through_the_owner_launcher(tmp_path):
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    git = ["git", "-C", str(primary)]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run(
+        [*git, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+         "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+         "commit", "--allow-empty", "-qm", "Create launcher fixture"],
+        check=True,
+    )
+    linked = tmp_path / "linked checkout"
+    subprocess.run([*git, "worktree", "add", "-q", "--detach", str(linked)], check=True)
+    launcher = linked / "scripts/codex_owner_mcp.py"
+    launcher.parent.mkdir()
+    launcher.write_text(
+        "import json, sys\n"
+        "print(json.dumps(sys.argv))\n",
+        encoding="utf-8",
+    )
+    nested = linked / "docs/reference"
+    nested.mkdir(parents=True)
+
     servers = _servers()
     genesis = {name for name in servers if name.startswith("genesis-")}
     assert genesis == {"genesis-health", "genesis-memory", "genesis-outreach", "genesis-recon"}
     for name in genesis:
         server = servers[name]
-        assert server["args"] == [
-            "scripts/codex_owner_mcp.py",
-            "--server",
-            name.removeprefix("genesis-"),
-        ]
-        assert server["command"] == "python3" and server["cwd"] == "."
+        launched = subprocess.run(
+            [server["command"], *server["args"]],
+            cwd=nested / server["cwd"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        script, *argv = json.loads(launched.stdout)
+        assert Path(script).resolve() == launcher.resolve()
+        assert argv == ["--server", name.removeprefix("genesis-")]
         assert server["startup_timeout_sec"] == 30
         # Without forwarding, the launcher could not tell an unattended run apart.
         assert set(server["env_vars"]) == {"GENESIS_CC_SESSION", "GENESIS_SESSION_ORIGIN"}

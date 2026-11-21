@@ -6306,12 +6306,13 @@ verified: 81bbdb0a9 2026-11-08
   lifecycle enrollment. See `docs/reference/codex-validator-launcher.md` for
   operator commands, source inventory, permitted MCP startup effects and races.
   Codex's project config (`.codex/config.toml`) starts all four Genesis MCP
-  servers through `scripts/codex_owner_mcp.py`, which reuses the external
+  servers by resolving `scripts/codex_owner_mcp.py` relative to the Git checkout
+  root. The launcher reuses the external
   launcher's environment scrub and main-checkout resolution. An unmarked Codex
   run is the owner's: the ordinary bootstrap, every tool, labelled
   `GENESIS_CALLER_PROFILE=codex` (calls logged to `client_tool_calls`); read
-  tools are pre-approved in the config and every other tool prompts, new ones
-  included. A run Genesis starts unattended (`util/codex_cli.py` sets
+  tools are pre-approved in the config and all other tools use its prompt tier,
+  including new tools. A run Genesis starts unattended (`util/codex_cli.py` sets
   `GENESIS_CC_SESSION=1`, forwarded through `env_vars`) gets
   `--external-client` and the health/recall floor, and no outreach or recon
   server. Memory initialization skips Claude's pending plan-bookmark file for
