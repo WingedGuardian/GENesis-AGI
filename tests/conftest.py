@@ -398,6 +398,7 @@ pytest_plugins = [
     "tests._live_closure",
     "tests._live_outbound",
     "tests._live_writes",
+    "tests._session_config",
 ]
 
 
@@ -455,8 +456,8 @@ def pytest_configure(config):
     # In-process connects to live services on this machine, refused as on CI
     # (reads the real home the live fence resolved). See tests/_live_outbound.py.
     _live_outbound.install(config)
-    # Writes into the real home outside the test's temp dirs, reported (not
-    # failed). See tests/_live_writes.py.
+    # Report direct in-process writes after the existing boundaries are armed.
+    # Remains observational until #4193's accuracy and complete-census gates pass.
     _live_writes.install(config)
 
 
@@ -777,6 +778,23 @@ def _reset_memory_alarm_breakdown():
         return
     mp = pytest.MonkeyPatch()
     mp.setattr(errors, "_memory_culprits", None)
+    # The codex_mcp_held alarm's scan reads the real /proc; tests that exercise
+    # it install their own scan. Its 60 s cache and blind-log stamp reset too.
+    # An empty Scan, as the real scan returns on a box with no app-server: a
+    # complete reading that nothing is held (None is not a value scan returns).
+    from genesis.sentinel.codex_mcp_stop import Scan as _EmptyScan
+
+    mp.setattr(errors, "_codex_mcp_scan", _EmptyScan)
+    mp.setattr(errors, "_codex_mcp_cache", None)
+    mp.setattr(errors, "_codex_mcp_blind_logged_at", None)
+    mp.setattr(errors, "_codex_mcp_refresh_lock", None)
+    # Same for the process_memory_high alarm: no real /proc scan by default.
+    from genesis.sentinel.process_stop import Scan as _EmptyProcessScan
+
+    mp.setattr(errors, "_process_scan", lambda threshold: _EmptyProcessScan(threshold_mb=threshold))
+    mp.setattr(errors, "_process_cache", None)
+    mp.setattr(errors, "_process_blind_logged_at", None)
+    mp.setattr(errors, "_process_refresh_lock", None)
     yield
     mp.undo()
 

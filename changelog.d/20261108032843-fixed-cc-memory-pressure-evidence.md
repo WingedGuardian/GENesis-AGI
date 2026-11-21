@@ -1,1 +1,0 @@
-- Claude Code failures with external SIGKILL and comparable cgroup OOM-kill counters now report possible memory pressure and stop automatic retry, provider failover and contingency. Shared counters are explicitly correlation, not victim proof. Inbox batches retain their manual-release replay hold; owned timeout, cancellation and result cleanup keep their existing outcomes.

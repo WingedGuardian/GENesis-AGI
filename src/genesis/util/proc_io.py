@@ -22,6 +22,7 @@ import contextlib
 import os
 import time
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -83,6 +84,118 @@ def read_stat(pid: int) -> tuple[str, str, int, int, int] | None:
         return comm, after[0], int(after[1]), int(after[17]), int(after[19])
     except (OSError, ValueError, IndexError):
         return None
+
+
+# Tri-state reads for code that ACTS on the answer (the stop tools): a missing
+# entry is positive evidence the process is gone; any other failure is no
+# evidence of anything, and must never read as gone, stopped or empty.
+GONE = "gone"
+UNREADABLE = "unreadable"
+_PF_KTHREAD = 0x00200000  # include/linux/sched.h; ``flags`` is stat field 9
+
+
+@dataclass(frozen=True)
+class Stat:
+    """One read of ``/proc/<pid>/stat`` (fields counted after the LAST ``)``)."""
+
+    comm: str
+    state: str
+    ppid: int
+    pgid: int
+    flags: int
+    threads: int
+    starttime: int
+
+    @property
+    def exited(self) -> bool:
+        """Every thread has exited. A leader that exited while other threads
+        run also reads ``Z``, with more than one thread: that process is alive
+        and still holds its memory (MEASURED: Z, 2 threads, 216 MB resident in
+        its live task)."""
+        return self.state in ("Z", "X") and self.threads <= 1
+
+    @property
+    def kernel_thread(self) -> bool:
+        """From the PF_KTHREAD flag, never from an empty argv: a zombie leader
+        with live threads has an empty cmdline too."""
+        return bool(self.flags & _PF_KTHREAD)
+
+
+def probe_stat(pid: int) -> Stat | str:
+    """``Stat``, ``GONE`` (no such pid) or ``UNREADABLE`` (EACCES, EIO, malformed)."""
+    try:
+        raw = (Path(_PROC) / str(pid) / "stat").read_bytes().decode("utf-8", "replace")
+    except (FileNotFoundError, ProcessLookupError):
+        return GONE
+    except OSError:
+        return UNREADABLE
+    try:
+        comm = raw[raw.index("(") + 1 : raw.rindex(")")]
+        after = raw[raw.rindex(")") + 2 :].split()
+        return Stat(
+            comm=comm,
+            state=after[0],
+            ppid=int(after[1]),
+            pgid=int(after[2]),
+            flags=int(after[6]),
+            threads=int(after[17]),
+            starttime=int(after[19]),
+        )
+    except (ValueError, IndexError):
+        return UNREADABLE
+
+
+def _vm_kb(text: str) -> int | None:
+    """VmRSS + VmSwap in kB, or None when the status carries no VmRSS line."""
+    rss = swap = None
+    for line in text.splitlines():
+        if line.startswith("VmRSS:"):
+            rss = int(line.split()[1])
+        elif line.startswith("VmSwap:"):
+            swap = int(line.split()[1])
+    return None if rss is None else rss + (swap or 0)
+
+
+def held_kb(pid: int) -> int | str:
+    """The process's RAM + swap in kB, ``GONE`` or ``UNREADABLE``.
+
+    A leader that exited while other threads run carries no Vm lines in its own
+    status (MEASURED), so the figure is read from a live task's status, which
+    reports the whole process. A process with no task left that reports memory
+    holds none (0); so does a kernel thread, which has no Vm lines at all.
+    """
+    base = Path(_PROC) / str(pid)
+    try:
+        text = (base / "status").read_bytes().decode("utf-8", "replace")
+    except (FileNotFoundError, ProcessLookupError):
+        return GONE
+    except OSError:
+        return UNREADABLE
+    try:
+        own = _vm_kb(text)
+        if own is not None:
+            return own
+        try:
+            tids = os.listdir(base / "task")
+        except (FileNotFoundError, ProcessLookupError):
+            return GONE
+        except OSError:
+            return UNREADABLE
+        for tid in sorted(tids):
+            if tid == str(pid):
+                continue
+            try:
+                task = (base / "task" / tid / "status").read_bytes().decode("utf-8", "replace")
+            except (FileNotFoundError, ProcessLookupError):
+                continue  # that thread exited meanwhile
+            except OSError:
+                return UNREADABLE
+            figure = _vm_kb(task)
+            if figure is not None:
+                return figure
+        return 0
+    except (ValueError, IndexError):
+        return UNREADABLE
 
 
 def read_starttime(pid: int) -> int | None:

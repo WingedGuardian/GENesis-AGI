@@ -76,6 +76,13 @@
       "type": "Hex High Entropy String",
       "sha1": "f3daf256059ffcbf76fccbf602060a7a11e67c90",
       "reason": "Public Git commit ID in a main-integration merge message (git merge by commit id); verified: sha1 of the referenced main commit id equals the hashed value."
+    },
+    {
+      "commit": "3ffd4f086201c43badba749639767ff62869ffee",
+      "path": "scripts/ci/install_ripgrep.sh",
+      "type": "Hex High Entropy String",
+      "sha1": "4c2bb49836e5cf75c03c792604b91fea15109010",
+      "reason": "the published SHA-256 checksum of a pinned ripgrep release archive (SHA256 pin), public and not sensitive; verified: sha1 of the pinned checksum equals the hashed value; the branch's later commit adds the inline pragma"
     }
   ]
 }

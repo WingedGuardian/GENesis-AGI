@@ -75,6 +75,7 @@ class StateData:
     io_triage_attempts: int = 0  # Separate counter for IO_TRIAGE (low-risk, repeatable)
     snapshot_size_history: list[int] = field(default_factory=list)  # Last N snapshot sizes in bytes
     boot_id: str = ""  # kernel boot UUID when this state was last written; "" = unknown
+    rebooted_at: str | None = None  # when this process last saw a host reboot (post-reboot grace)
 
     def to_dict(self) -> dict:
         return {
@@ -101,6 +102,7 @@ class StateData:
             "io_triage_attempts": self.io_triage_attempts,
             "snapshot_size_history": self.snapshot_size_history[-5:],
             "boot_id": self.boot_id,
+            "rebooted_at": self.rebooted_at,
         }
 
     @classmethod
@@ -133,6 +135,7 @@ class StateData:
             io_triage_attempts=data.get("io_triage_attempts", 0),
             snapshot_size_history=data.get("snapshot_size_history", []),
             boot_id=str(data.get("boot_id") or ""),
+            rebooted_at=data.get("rebooted_at") or None,
         )
 
 
@@ -606,15 +609,29 @@ class ConfirmationStateMachine:
         )
 
     def _is_within_bootstrap_grace(self) -> bool:
-        """Check if we're within the bootstrap grace period (F4)."""
+        """Check if we're within the bootstrap grace period (F4).
+
+        An episode whose first failure falls within ``post_reboot_grace_s`` of
+        a detected host reboot gets that longer grace: a cold boot of the
+        container stack takes far longer than a service restart.
+        """
         if not self._state.first_failure_at:
             return False
         try:
             first = datetime.fromisoformat(self._state.first_failure_at)
             elapsed = (datetime.now(UTC) - first).total_seconds()
-            return elapsed < self._config.confirmation.bootstrap_grace_s
         except (ValueError, TypeError):
             return False
+        grace = self._config.confirmation.bootstrap_grace_s
+        post = self._config.confirmation.post_reboot_grace_s
+        if self._state.rebooted_at and post > grace:
+            try:
+                since_boot = (first - datetime.fromisoformat(self._state.rebooted_at)).total_seconds()
+            except (ValueError, TypeError):
+                since_boot = None
+            if since_boot is not None and -60 <= since_boot < post:
+                grace = post
+        return elapsed < grace
 
     def reset_if_rebooted(self, current_boot_id: str | None) -> bool:
         """Drop a stale episode when the host has rebooted since it was written.
@@ -685,6 +702,7 @@ class ConfirmationStateMachine:
         self._clear_dialogue_state()
         self.clear_cc_unavailable()
         self._state.boot_id = current_boot_id
+        self._state.rebooted_at = datetime.now(UTC).isoformat()
         return True
 
     def _reset_to_healthy(self, now: str) -> None:

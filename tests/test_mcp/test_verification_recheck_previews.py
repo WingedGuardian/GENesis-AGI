@@ -5,6 +5,9 @@ import json
 import pytest
 from fastmcp.exceptions import ToolError
 
+from tests.test_mcp.test_validator_verification_writer import (
+    _close_before_the_fixture_dates as _close_before_the_fixture_dates,
+)
 from tests.test_mcp.test_validator_verification_writer import call, row
 from tests.test_mcp.test_validator_verification_writer import recording as recording
 from tests.test_scripts.test_pr_verification_closer import EVENT_GAP, _doc
