@@ -216,19 +216,11 @@ class ReconGatherer:
             logger.debug("Could not parse previous star count for %s", name, exc_info=True)
         return None
 
-    async def _check_releases(self, project: dict) -> int:
-        """Check a single project for new releases. Returns count of new findings.
+    async def _release_candidates(self, repo: str) -> list:
+        """Recent release window, with a latest-stable fallback.
 
-        Noise reduction:
-        - Pre-releases are skipped (filter on GitHub API prerelease field)
-        - Only the last _RELEASES_PER_PROJECT releases are checked
-        - Timestamp gate: only releases published after the last gather are processed
+        This is a bounded watch, not a complete release-history backfill.
         """
-        repo = project.get("repo", "")
-        if not repo:
-            logger.warning("Watchlist project %s has no repo", project.get("name"))
-            return 0
-
         raw = await self._run_gh(
             "gh", "api",
             f"repos/{repo}/releases",
@@ -236,17 +228,43 @@ class ReconGatherer:
         )
         if not raw:
             logger.warning("No release data from gh for %s", repo)
-            return 0
+            return []
 
         try:
             releases = json.loads(raw)
         except (json.JSONDecodeError, ValueError):
             logger.warning("Invalid JSON from gh for %s: %s", repo, raw[:200])
-            return 0
+            return []
 
         if not isinstance(releases, list):
             logger.warning("Unexpected release format for %s: %s", repo, type(releases))
+            return []
+
+        if not any(
+            isinstance(r, dict) and r.get("tag_name")
+            and not r.get("prerelease") and not r.get("draft")
+            for r in releases
+        ):
+            # Prerelease bursts can span arbitrarily many API pages. The stable
+            # endpoint is independent of that window; do not paginate history.
+            latest_raw = await self._run_gh("gh", "api", f"repos/{repo}/releases/latest")
+            if not latest_raw:
+                return []  # Includes repositories with no published stable release.
+            try:
+                latest = json.loads(latest_raw)
+            except (json.JSONDecodeError, ValueError):
+                logger.warning("Invalid latest release JSON for %s", repo)
+                return []
+            releases = [latest]
+        return releases
+
+    async def _check_releases(self, project: dict) -> int:
+        """Check at most two stable candidates, preserving identity/time dedup."""
+        repo = project.get("repo", "")
+        if not repo:
+            logger.warning("Watchlist project %s has no repo", project.get("name"))
             return 0
+        releases = await self._release_candidates(repo)
 
         # Get timestamp gate: last recorded release for this project
         last_published = await self._get_last_release_timestamp(project.get("name", repo))
@@ -257,8 +275,8 @@ class ReconGatherer:
             if not isinstance(release, dict):
                 continue
 
-            # Skip pre-releases
-            if release.get("prerelease", False):
+            # Skip pre-releases and unpublished drafts (also validate fallback).
+            if release.get("prerelease", False) or release.get("draft", False):
                 continue
 
             # Limit to _RELEASES_PER_PROJECT stable releases

@@ -88,11 +88,19 @@ _CGROUP_IO_LABEL = (
 
 EXEMPT: dict[tuple[str, str], str] = {
     ("dashboard/routes/updates.py", "scripts/update.sh"): _UPDATER,
+    ("board/launcher/__init__.py", "scripts/hooks/builder_guard.py"): (
+        "only its presence and its wiring in .claude/settings.json are checked; "
+        "the hook runs inside builder sessions, never in the server"
+    ),
     ("dashboard/routes/backup.py", "scripts/backup.sh"): (
         "only its existence is checked; the backup runs from its own systemd unit"
     ),
     ("restore/cli.py", "scripts/restore.sh"): (
         "the `genesis restore` command line, a separate process from the server"
+    ),
+    ("mcp/shared_settings.py", "scripts/lib/mcp_rollout.py"): (
+        "loaded afresh by the shared MCP service (genesis_mcp_server.py "
+        "--shared-service), a separate process; genesis-server never imports it"
     ),
     ("cc/invoker.py", "scripts/hooks/cc_span_hook.py"): (
         "registered as a PostToolUse hook for the Claude Code sessions the server "
@@ -672,6 +680,12 @@ _RELOAD = (
 )
 _FRESH = (
     "scripts/disk_reclaim.py",
+    "scripts/cc-slot.sh",
+    "scripts/premise_gate.py",
+    "scripts/cc_exit_capture.sh",
+    "scripts/slot_exec.sh",
+    "scripts/hooks/plan_doc.py",
+    "scripts/hooks/plan_premise_gate.py",
     "scripts/lib/live_checkout.py",
     "scripts/lib/managed_units.py",
     "scripts/lib/update_state_guard.py",

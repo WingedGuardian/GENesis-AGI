@@ -2428,6 +2428,13 @@ while IFS= read -r _line; do
     echo "  (backed up and cleared local edits to $_eph before the rebuild: $EPHEMERAL_BACKUP_ROOT/live/$_eph)"
 done <<< "$_live_status"
 genesis_checkout_unlock
+# BEGIN live-kit-install (#3492 D2c; extracted by tests/test_scripts/test_deploy_candidates_boot_repair.py)
+# The boot repair kit from HEAD, before the rebuild's readiness reads it: that
+# refusal rolls back before bootstrap could reinstall it. HEAD's kit sources are
+# reviewed main's (admission refuses them). Never fatal: readiness names a bad kit.
+python3 -I -S "$SCRIPT_DIR/lib/live_repair_kit.py" install "$GENESIS_ROOT" "$HOME" {_UPDATE_LOCK_FD}>&- \
+    || echo "  NOTE: the live-move repair kit was not installed from HEAD; the installed one is kept."
+# END live-kit-install
 echo "--- Rebuilding live ---"
 # The engine records how far its move got as "live_move" in this run's own
 # "merging" row (live-helpers reads it on a rollback; update_state_guard.py and

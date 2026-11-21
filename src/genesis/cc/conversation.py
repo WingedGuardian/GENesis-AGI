@@ -290,6 +290,12 @@ _BG_RESEARCH_ROUTING = (
     "That background session runs to completion and delivers the finished outcome — "
     "success or failure — back to this exact conversation. Keep quick answers and short "
     "tool use inline as usual."
+    "\n\n## Answer first\n"
+    "The user is often waiting on the answer. When they ask for a specific fact (what "
+    "was said, what a value is, what happened when), read the obvious source and write "
+    "the direct answer before any further tool call. Then stop, or say what you are "
+    "still checking and continue briefly; anything long goes to the background lane "
+    "above. Do not hold the answer back to search wider or to polish it first."
 )
 
 

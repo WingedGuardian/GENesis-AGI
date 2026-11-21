@@ -413,7 +413,9 @@ def _engine_with_token(tmp_path, *, token: bool) -> DiagnosisEngine:
 
 
 class TestResolveCCEnv:
-    """FALLBACK-ONLY setup-token injection for the CC recovery brain."""
+    """The recovery brain inherits the host login only when it is CONFIRMED
+    working; otherwise it gets the synced setup-token (owner ruling 2026-11-18).
+    """
 
     @pytest.mark.asyncio
     async def test_logged_in_true_never_injects(self, tmp_path):
@@ -441,24 +443,47 @@ class TestResolveCCEnv:
         assert await engine._resolve_cc_env(cc) is None
 
     @pytest.mark.asyncio
-    async def test_unparseable_status_never_injects(self, tmp_path):
-        # Ambiguous auth status + token present → still inherit (never inject).
+    @pytest.mark.parametrize(
+        "status_body",
+        [
+            "not json at all",  # unparseable
+            "null",  # valid JSON, not an object
+            "[]",
+            '{"loggedIn": "yes"}',  # not a boolean
+            "{}",  # no answer
+        ],
+    )
+    async def test_unconfirmed_login_injects_the_token(self, tmp_path, status_body):
+        # Anything short of a confirmed login, with a token present, uses the token:
+        # inheriting a dead login is how the brain failed after a reboot.
+        cc = _stub_claude(tmp_path, status_body)
+        engine = _engine_with_token(tmp_path, token=True)
+        env = await engine._resolve_cc_env(cc)
+        assert isinstance(env, dict), status_body
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-SYNTHETIC"
+
+    @pytest.mark.asyncio
+    async def test_unconfirmed_login_without_a_token_inherits(self, tmp_path):
         cc = _stub_claude(tmp_path, "not json at all")
-        engine = _engine_with_token(tmp_path, token=True)
+        engine = _engine_with_token(tmp_path, token=False)
         assert await engine._resolve_cc_env(cc) is None
 
     @pytest.mark.asyncio
-    async def test_missing_binary_never_raises(self, tmp_path):
+    async def test_missing_binary_never_raises_and_still_offers_the_token(self, tmp_path):
         engine = _engine_with_token(tmp_path, token=True)
-        assert await engine._resolve_cc_env(str(tmp_path / "nonexistent")) is None
+        env = await engine._resolve_cc_env(str(tmp_path / "nonexistent"))
+        assert env is not None and env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-SYNTHETIC"
 
     @pytest.mark.asyncio
-    async def test_non_object_json_never_injects(self, tmp_path):
-        # Valid JSON but not an object (null) → .get would raise; must be caught
-        # as ambiguity → inherit env, even with a token present.
-        cc = _stub_claude(tmp_path, "null")
+    async def test_probe_timeout_with_a_token_injects(self, tmp_path, monkeypatch):
+        # The post-reboot case: the pre-flight does not answer in time.
+        monkeypatch.setattr("genesis.guardian.diagnosis._AUTH_PROBE_TIMEOUT_S", 0.2, raising=True)
+        stub = tmp_path / "claude"
+        stub.write_text("#!/bin/sh\nsleep 5\n")
+        stub.chmod(0o755)
         engine = _engine_with_token(tmp_path, token=True)
-        assert await engine._resolve_cc_env(cc) is None
+        env = await engine._resolve_cc_env(str(stub))
+        assert env is not None and env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-SYNTHETIC"
 
 
 # ── Infrastructure body-schema integration ─────────────────────────────
@@ -630,7 +655,7 @@ class TestCCSubprocessTreeKill:
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", fake_exec)
         env = await engine._resolve_cc_env("claude")
-        assert env is None  # ambiguous probe → inherit (unchanged contract)
+        assert env is None  # timed out and no synced token here → inherit
         assert len(killpg_calls) == 1
         assert killpg_calls[0][0] == 55556
         assert captured.get("start_new_session") is True
@@ -669,3 +694,76 @@ class TestCCSubprocessTreeKill:
         with pytest.raises(_asyncio.CancelledError):
             await task
         assert killpg_calls and killpg_calls[0][0] == 55557
+
+
+class TestCCErrorReason:
+    """A failed recovery-brain run reports WHY. Claude Code puts the reason in
+    its stdout JSON envelope and may leave stderr empty (measured: an auth
+    failure exits 1 with result "Failed to authenticate. API Error: 401 ...")."""
+
+    def _engine(self, tmp_path, monkeypatch, stdout_json: str, exit_code: int):
+        from unittest.mock import AsyncMock
+
+        stub = tmp_path / "claude"
+        stub.write_text(
+            "#!/bin/sh\ncat > /dev/null\n"
+            f"cat <<'STUBEOF'\n{stdout_json}\nSTUBEOF\nexit {exit_code}\n"
+        )
+        stub.chmod(0o755)
+        config = GuardianConfig()
+        config.cc.path = str(stub)
+        config.cc.work_dir = str(tmp_path / "work")
+        monkeypatch.setattr(
+            "genesis.guardian.snapshots.SnapshotManager.check_pool_space",
+            AsyncMock(return_value=10.0),
+        )
+        monkeypatch.setattr(
+            "genesis.guardian.diagnosis.DiagnosisEngine._resolve_cc_env",
+            AsyncMock(return_value=None),
+        )
+        return DiagnosisEngine(config)
+
+    @pytest.mark.asyncio
+    async def test_exit_1_names_the_reason_from_stdout(self, tmp_path, monkeypatch):
+        from genesis.guardian.diagnosis import CCDiagnosisError
+
+        body = json.dumps({
+            "type": "result", "is_error": True, "terminal_reason": "api_error",
+            "result": "Failed to authenticate. API Error: 401 Invalid bearer token",
+            "api_error_status": 401,
+        })
+        engine = self._engine(tmp_path, monkeypatch, body, 1)
+        with pytest.raises(CCDiagnosisError) as exc:
+            await engine._diagnose_with_cc(_snap(container_status="Running"), "s")
+        msg = str(exc.value)
+        assert "CC exited with code 1" in msg
+        assert "Failed to authenticate" in msg and "api_error_status 401" in msg, msg
+
+    @pytest.mark.asyncio
+    async def test_exit_0_with_is_error_is_a_failure_with_its_reason(self, tmp_path, monkeypatch):
+        from genesis.guardian.diagnosis import CCDiagnosisError
+
+        body = json.dumps({"type": "result", "is_error": True, "result": "Overloaded"})
+        engine = self._engine(tmp_path, monkeypatch, body, 0)
+        with pytest.raises(CCDiagnosisError, match="CC reported an error: Overloaded"):
+            await engine._diagnose_with_cc(_snap(container_status="Running"), "s")
+
+    @pytest.mark.asyncio
+    async def test_no_mcp_config_is_written_when_missing(self, tmp_path, monkeypatch):
+        from genesis.guardian.diagnosis import CCDiagnosisError
+
+        engine = self._engine(tmp_path, monkeypatch, json.dumps({"is_error": True, "result": "x"}), 1)
+        cfg = tmp_path / "work" / "config" / "no_mcp.json"
+        assert not cfg.exists()
+        with pytest.raises(CCDiagnosisError):
+            await engine._diagnose_with_cc(_snap(container_status="Running"), "s")
+        assert json.loads(cfg.read_text()) == {"mcpServers": {}}
+
+
+def test_cc_error_reason_falls_back_to_stderr_then_says_nothing_was_reported():
+    from genesis.guardian.diagnosis import _cc_error_reason
+
+    assert _cc_error_reason("not json", "boom on stderr") == "boom on stderr"
+    assert _cc_error_reason("", "") == "no error reported on stdout or stderr"
+    long = json.dumps({"is_error": True, "result": "x" * 1000})
+    assert len(_cc_error_reason(long, "")) == 300

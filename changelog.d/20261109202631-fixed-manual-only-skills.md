@@ -1,1 +1,0 @@
-- Manual-only skills no longer appear in Genesis automatic nudges or executor skill loading; explicit owner loading remains available.

@@ -58,6 +58,14 @@ JUDGE_TIMEOUT_SECS = 300.0
 # score — but ALWAYS store. Grounding is never a drop gate. See grounding.py.
 _GROUNDING_WARN_THRESHOLD = 0.25
 
+# Returned in place of a procedure id for a lesson recorded in shadow mode.
+SHADOW_ID = "shadow"
+
+# task_type -> monotonic time of shadow mode's last fail-open record, kept apart
+# from the live limiter (embedding._fail_open_timestamps) so shadow allows what
+# live allows when the embedder is down, without rate-limiting a later live store.
+_shadow_fail_open_timestamps: dict[str, float] = {}
+
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
@@ -121,13 +129,31 @@ _MULTI_SCHEMA_EXAMPLE = """\
 ```"""
 
 
-def _build_multi_struggle_prompt(spine_text: str, score: float) -> str:
+_CONTEXT_HEADING = "## Earlier turns (for reference only; build nothing from them)\n"
+_CONTEXT_RULE = (
+    "The earlier turns above come before the part of the session you are judging. "
+    "Use them only to understand the Action Spine below. Every procedure you return "
+    "must be shown by the Action Spine's own turns; return none that only the earlier "
+    "turns show.\n\n"
+)
+
+
+def _build_multi_struggle_prompt(
+    spine_text: str, score: float, context_text: str | None = None,
+) -> str:
     """Build the multi-procedure builder prompt. Uses concatenation (NOT
-    str.format) so { } in transcript content can't raise KeyError."""
+    str.format) so { } in transcript content can't raise KeyError.
+
+    ``context_text`` (#4813): tool turns just before the part being judged, shown
+    for reference with the rule that nothing is built from them."""
+    context = (
+        _CONTEXT_HEADING + context_text + "\n\n" + _CONTEXT_RULE if context_text else ""
+    )
     return (
         _MULTI_PROCEDURE_INTRO
         + _PROCEDURE_DEF
         + _MULTI_SEGMENTATION
+        + context
         + "## Action Spine\n"
         + spine_text
         + "\n\n"
@@ -207,6 +233,58 @@ def _parse_judge_response_list(text: str) -> list[dict] | None:
 # ── Storage ──────────────────────────────────────────────────────────────────
 
 
+def _b64_embedding(vec: list[float] | None) -> str | None:
+    """``vec`` packed as the store packs it, base64 for the JSON shadow record."""
+    if vec is None:
+        return None
+    import base64
+
+    from genesis.learning.procedural.embedding import pack_embedding
+
+    try:
+        return base64.b64encode(pack_embedding(vec)).decode("ascii")
+    except ValueError:  # wrong dimension: record the lesson without it
+        return None
+
+
+def _shadow_repeat(session_id: str | None, vec: list[float] | None) -> float | None:
+    """Similarity to the closest lesson already shadow-recorded for the session
+    in the cap window, when at or above the novelty threshold; else None.
+
+    Shadow records are not in the store, so the novelty gate cannot see them,
+    and each cycle re-judges the whole session: without this, a repeated
+    proposal of one lesson uses up the session's shadow cap where live mode would
+    reject it as a duplicate. Approximates live: one cosine test across task
+    types, where live tests cosine within a type and asks the model across types.
+    No vector (the embedder is down) means no check, as live fails open.
+    """
+    if vec is None or not session_id:
+        return None
+    import base64
+    import binascii
+    from datetime import UTC, datetime
+
+    from genesis.learning.procedural.embedding import cosine_similarity, unpack_embedding
+    from genesis.learning.procedural.extractor import NOVELTY_THRESHOLD
+    from genesis.learning.procedural.lesson_builder_config import CAP_WINDOW, shadow_records
+
+    best: float | None = None
+    for entry in shadow_records(session_id, datetime.now(UTC) - CAP_WINDOW):
+        raw = entry.get("principle_embedding_b64")
+        if not isinstance(raw, str):
+            continue
+        try:
+            prior = unpack_embedding(base64.b64decode(raw, validate=True))
+        except (binascii.Error, ValueError):
+            continue
+        if prior is None:
+            continue
+        sim = cosine_similarity(vec, prior)
+        if sim >= NOVELTY_THRESHOLD and (best is None or sim > best):
+            best = sim
+    return best
+
+
 async def _store_judged_procedure(
     db: aiosqlite.Connection,
     data: dict,
@@ -216,10 +294,15 @@ async def _store_judged_procedure(
     source_session_id: str | None = None,
     grounding_score: float | None = None,
     origin_class: str | None = None,
+    shadow: bool = False,
 ) -> str | None:
     """Run the scoping + (same-type + cross-type) novelty checks, then store via
     store_procedure_checked. Returns procedure ID on success, None on
     skip/duplicate/directive.
+
+    ``shadow``: run every check, then append the lesson to the lesson-builder
+    shadow record instead of storing it, and return ``SHADOW_ID``. Nothing is
+    written to the store, and the fail-open rate limiter is not advanced.
 
     ``origin_class`` is the WS-3 gate-1 session provenance (from the caller's
     tool-name scan); the shadow gate emits it after a successful store. Defaults
@@ -278,14 +361,17 @@ async def _store_judged_procedure(
         # time.monotonic() (uptime-based on Linux) < cooldown — i.e. on a freshly
         # booted host (the failure mode CI's fresh runners hit). Matches the
         # membership-guarded check in extractor._fail_open.
-        last = _fail_open_timestamps.get(task_type)
+        # Shadow keeps its own limiter, so it records what live would store
+        # without ever rate-limiting a later live store.
+        stamps = _shadow_fail_open_timestamps if shadow else _fail_open_timestamps
+        last = stamps.get(task_type)
         if last is not None and time.monotonic() - last < FAIL_OPEN_COOLDOWN_SECS:
             logger.info(
                 "Judge: rate-limited fail-open store for %s (cooldown active)",
                 task_type,
             )
             return None
-        _fail_open_timestamps[task_type] = time.monotonic()
+        stamps[task_type] = time.monotonic()
 
     if not is_novel:
         logger.info(
@@ -294,6 +380,33 @@ async def _store_judged_procedure(
             max_sim,
         )
         return None
+
+    if shadow:
+        import asyncio
+
+        from genesis.learning.procedural.lesson_builder_config import record_shadow_lesson
+
+        # Both read or write the shadow files; keep that file I/O off the loop.
+        repeat_sim = await asyncio.to_thread(_shadow_repeat, source_session_id, principle_vec)
+        if repeat_sim is not None:
+            logger.info(
+                "Judge [shadow]: procedure for %s repeats a lesson already recorded "
+                "for session %s (sim=%.3f)", task_type, source_session_id, repeat_sim,
+            )
+            return None
+        await asyncio.to_thread(record_shadow_lesson, {
+            "principle_embedding_b64": _b64_embedding(principle_vec),
+            "session_id": source_session_id,
+            "task_type": task_type,
+            "principle": principle,
+            "scenario": scenario,
+            "steps": steps,
+            "tools_used": tools_used,
+            "max_similarity": round(max_sim, 3) if max_sim is not None else None,
+            "novelty_fell_open": fell_open,
+            "grounding_score": round(grounding_score, 3) if grounding_score is not None else None,
+        })
+        return SHADOW_ID
 
     # Pack embedding if available
     principle_blob = None
@@ -419,8 +532,22 @@ async def judge_multi_procedure(
     *,
     source_session_id: str | None = None,
     max_new: int | None = None,
+    shadow: bool = False,
+    context_text: str | None = None,
+    origin_class: str | None = None,
 ) -> list[str]:
     """Build 0..N topic-segmented procedures from a struggle-detected session.
+
+    ``shadow`` records each would-be procedure instead of storing it (see
+    ``_store_judged_procedure``); the returned list then holds ``SHADOW_ID``
+    once per would-be procedure.
+
+    For a part of a session (#4813) the caller passes ``context_text`` (earlier
+    turns, shown for reference only) and ``origin_class`` computed on the WHOLE
+    spine, since ``spine`` is then only the part and an external read earlier in
+    the session must still mark it. Each lesson is then also grounded against the
+    part's own turns, logged beside the full score, to measure lessons built
+    from the context.
 
     ``spine`` is rendered USER-BLIND (tool actions only); ``haystack`` is the
     uncapped execution record used for grounding. Each built procedure is grounded
@@ -439,12 +566,17 @@ async def judge_multi_procedure(
     )
 
     spine_text = format_spine_for_judge(spine)
-    prompt = _build_multi_struggle_prompt(spine_text, score)
+    prompt = _build_multi_struggle_prompt(spine_text, score, context_text)
 
     # WS-3 gate-1: one origin for the whole session — every procedure this call
     # promotes shares it (covers BOTH the struggle and rebuild callers, since
-    # both route their spine through here).
-    origin_class = derive_session_origin(spine)
+    # both route their spine through here). A part's caller passes it in.
+    if origin_class is None:
+        origin_class = derive_session_origin(spine)
+    part_haystack = (
+        "\n".join(e.get("args_summary", "") for e in spine if e.get("type") == "tool")
+        if context_text is not None else None
+    )
 
     procedures = await _call_and_parse_list(router, prompt)
     if not procedures:
@@ -493,8 +625,22 @@ async def judge_multi_procedure(
             source_session_id=source_session_id,
             grounding_score=gscore,
             origin_class=origin_class,
+            shadow=shadow,
         )
         if proc_id:
             stored.append(proc_id)
+            if part_haystack is not None:
+                # Measurement only (after the switch to incremental): a stored
+                # lesson grounded in the full record but not in the part's own
+                # turns was likely built from the reference turns.
+                try:
+                    part_score = grounding_score(steps, part_haystack)
+                except Exception:
+                    part_score = None
+                logger.info(
+                    "Procedure %s grounding [part] session=%s: full=%.2f part=%s",
+                    proc_id, source_session_id, gscore,
+                    "n/a" if part_score is None else f"{part_score:.2f}",
+                )
 
     return stored

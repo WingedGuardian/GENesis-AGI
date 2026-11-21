@@ -1,1 +1,0 @@
-- Retain provider safety and original-owner control completion in an explicitly converted queue schema, preserving legacy evidence, startup OOM facts and accounting while keeping automatic indexing and supervised recovery commands fenced.

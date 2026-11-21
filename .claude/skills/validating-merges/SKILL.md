@@ -63,7 +63,8 @@ harm and why redaction/public-task/private-evidence cannot avoid it.
 Both writers retain the measurement verdict when routing is pending and leave the
 row OPEN. CLI exit **4 means measurement recorded or previewed, tracking pending**;
 re-read before retrying. MCP exposes `recorded`, `tracking_complete`, `tracking`
-and `would_close` separately. A preview stores nothing. Never call the batch
+and `would_close` separately, and `prompts` (see "Completeness checks" under
+Evidence). A preview stores nothing. Never call the batch
 handled until the selected-row checkpoint reports complete tracking.
 
 Checkpoint after each row, before moving batches, and before a completion report.
@@ -75,6 +76,51 @@ The historical audit reads OPEN and CLOSED rows, including gap-carrying legacy
 records. It reports debt for manual classification and never rewrites closed
 evidence. Search existing issues first; historical missing structured links are
 not proof that no issue exists.
+
+## Rules for every validator, Claude or Codex
+
+These bind every validator session: Claude Code or Codex, standing or one-off.
+
+**Only the owner starts a validator.** A validator session starts only when the
+owner types its start command in a terminal. No session starts one for the
+owner: not by typing into another slot (`tmux send-keys`), not through
+`direct_session_run`, not through a workflow tool. A post-merge test of a
+validator feature asks the owner to start the validator. No keepalive, boot
+restore or schedule starts or re-arms one. A resumed session whose first message
+is a validator's `/loop` does not continue that loop without a fresh
+instruction from the owner. And any session that launches any other session
+names, in its approval question, the slot it will create and leave behind
+(`.claude/docs/background-sessions.md` carries this for the sessions that
+launch).
+
+**Hold every closing verdict.** A closed record is permanent, and the tool
+checks a document's form, not whether it covers every claim the PR made:
+MEASURED 2026-11-08, 9 of 9 documents it accepted were incomplete. Until an
+independent completeness check exists (#4180), a validator never records a
+closing verdict (`pass-mechanical`, `pass-with-measured-gaps`, a dry run that
+says it "CLOSES the row") on its own judgment. It records open verdicts as
+usual, and saves a closing document as
+`~/.genesis/output/pr-verifications/awaiting-review/<owner>-<repo>-<N>.json`
+instead. The sealed Codex validator cannot write there (its writable roots are
+`~/tmp/validator`, `~/.genesis/output/validator-runs` and `prv-*` outputs), so
+it saves the document as
+`~/.genesis/output/validator-runs/awaiting-review-<owner>-<repo>-<N>.json` and
+names it in the run log. The owner, or a validating session after the owner has
+reviewed the saved document and said to, closes the row with it and deletes the
+file.
+
+**Write commands that no guard refuses or asks about.** The credentials guard
+expands a `*` it cannot prove is literal, quoted or not, so a raw `sqlite3` or
+`python -c` query with `count(*)` run from the checkout reads as touching the
+credentials file. Prefer `python -m genesis db query "<sql>"`, which is exempt;
+otherwise write `count(1)`, name columns and use explicit paths. A command whose
+prose names the credentials file trips the same guard. The box-wide pytest lock
+is a refusal, not a guard denial: another session holds it. Wait on it with
+`python3 scripts/pytest_lock_wait.py` (in the background if other rows can be
+worked), and never stop the run or kill the holder because of it. In an
+unattended slot, a hook that asks for approval waits forever: rephrase so it
+does not ask, and if it asks anyway, end the run and report the command rather
+than leaving it waiting.
 
 ## Running under Codex
 
@@ -148,16 +194,9 @@ native one in the 2026-11-06 calibration. Do not write stores under test or run
 migrations on live data. Discovery of this skill does not qualify or activate the
 launcher, and it does not authorize PR6.
 
-Write commands so that the most common false denials never fire; once a command
-is denied, the paragraph above governs. The credentials guard expands a `*` it
-cannot prove is literal, quoted or not, so a raw `sqlite3` or `python -c` query
-with `count(*)` run from the checkout is read as touching the credentials file.
-Prefer `python -m genesis db query "<sql>"`, which is exempt; otherwise write
-`count(1)`, name columns and use explicit paths. A command whose prose names the
-credentials file trips the same guard. Separately, the box-wide pytest lock is a
-refusal, not a guard denial: another session holds it. Wait on it with
-`python3 scripts/pytest_lock_wait.py` (run in the background if you have other
-rows to work), and never stop the run or kill the holder because of it.
+Write commands so that the most common false denials never fire ("Rules for
+every validator" lists them); once a command is denied, the paragraph above
+governs.
 
 ## Load Gate
 
@@ -196,6 +235,10 @@ and record what you concluded with
     --evidence-file ~/.genesis/output/prv-<N>.json [--note "..."] [--dry-run] \
     [--verdict <what you expect>] [--park]
 ```
+
+A closing verdict is held, not recorded ("Hold every closing verdict", in "Rules
+for every validator"): run with `--dry-run` first to learn which verdict the
+document derives.
 
 Read back what was decided, and on what evidence, with
 
@@ -244,9 +287,11 @@ count says anything about the other.
 ## Standing mode (Claude Code only)
 
 **Only the owner starts one.** A session never starts or restarts a standing
-loop on its own: not from an earlier yes, a plan step or a ledger row, and not
-after the loop stops. Each start needs the owner's explicit instruction at that
-moment. Once started, the loop paces itself until a stop rule below ends it.
+loop on its own: not from an earlier yes, a plan step or a ledger row, not after
+the loop stops, and not because a resumed session's first message is the loop's
+`/loop`. Each start needs the owner's explicit instruction at that moment ("Rules
+for every validator" has the rest). Once started, the loop paces itself until a
+stop rule below ends it.
 
 A standing validator is a session the owner starts, in a tmux slot, to work the
 backlog one PR at a time. The owner starts it with `/loop` (no interval) so it can pace
@@ -294,6 +339,8 @@ loop's end.
    A pick can take minutes: the picker has no scan budget yet (#3839).
 2. **Check it is not already waiting for the owner.** If
    `~/.genesis/output/pr-verifications/awaiting-review/<owner>-<repo>-<N>.json`
+   or the Codex validator's
+   `~/.genesis/output/validator-runs/awaiting-review-<owner>-<repo>-<N>.json`
    exists, read the row's `"status"` in `--verification-log --pr <N>` (the
    scoped log lists the PR's rows open and closed alike). `closed`: the file is
    stale; delete it and carry on. `open`: the row is still waiting; do not verify
@@ -313,11 +360,7 @@ loop's end.
    - **A closing verdict** (`pass-mechanical`, `pass-with-measured-gaps`, the dry
      run saying it "CLOSES the row"): do NOT record it. Save the document as
      `~/.genesis/output/pr-verifications/awaiting-review/<owner>-<repo>-<N>.json`
-     now. A closed record is permanent, and the tool checks a record's form, not
-     whether it covers every claim the PR made: MEASURED 2026-11-08, 9 of 9
-     documents it accepted were incomplete. Until an independent completeness
-     check exists (#4180), the owner or a validating session reviews the
-     document, closes the row with it, and deletes the file.
+     now, as "Hold every closing verdict" (in "Rules for every validator") says.
 5. **Route.** For each concern, file or reuse its issue through
    `scripts/file_tracker_issue.py` (its own exit 4 means indeterminate: reconcile
    before retrying) and add the receipt to the document's `tracking`. Then, for
@@ -330,7 +373,9 @@ loop's end.
      `fail-intent` whose tracking is pending:** the picker never offers a
      fail-intent row again, so nothing would bring it back.
    - a saved closing document: end the loop and tell the owner (one
-     `outreach_send` if they are not attached).
+     `outreach_send` if they are not attached), quoting the dry run's
+     `check:` lines (MCP: its `prompts`) so the owner sees its open questions
+     before closing it.
 7. **Pace:** ScheduleWakeup for the next pass.
 
 **A pick whose change is truly absent from the serving tree** (rare, since the
@@ -685,6 +730,45 @@ scenario checks beyond its printed `Protects` line: reading it spoils it.
 ---
 
 ## Evidence: what the record has to carry
+
+### Completeness checks
+
+Both writers run two checks on every document (#4180). Neither replaces the
+independent verifier: on 128 defects verifiers named in first-round documents, a
+deterministic rule could catch only a few (measured 2026-11-14).
+
+- **A refusal.** A close (a closing verdict with complete tracking) is refused
+  while an `event_gated` gap's trigger is a date on or before today (UTC); an
+  attempt that keeps the row open is not. The measurement is owed now: closing
+  would store a recheck already due, and a failed recheck never reopens the row.
+  Run the recheck and record its result as a claim (or as `not_yet_done` if it
+  cannot run here). If the event has not happened yet, set the trigger to the first
+  date on which it will have.
+- **Prompts.** Questions about the document's own completeness, each naming its
+  target: every `method` gap (is its step reachable here? then it is
+  `not_yet_done`); a claim saying something is unchanged or still true with no
+  before arm in its measurement; a claim citing tests from two or more test
+  modules (two claims folded into one?); an `accepted_limit` resting on a pass
+  count. Once the verdict is derived, the CLI prints them as `pr_verification:
+  check:` lines (dry run, open record or close), and MCP returns them as `prompts`. They change no verdict and are not stored, so
+  **answer each one on the dry run, before the real close**: fix the document, or
+  judge that it does not apply. A close is permanent.
+
+### Independent completeness receipt
+
+For the two-stage source/evidence review and its typed receipt, read
+`references/completeness-review.md`. Stage A inventories the full source packet
+before the reviewer sees the candidate. Stage B audits that retained inventory,
+every claim/gap/control, and every file disposition against the evidence. Retain
+the actual fresh-context execution; JSON alone does not prove independence.
+
+The current P2 release can parse and check this optional receipt. It does not
+yet enforce completeness in either close writer, authorize a validator launch,
+or release HOLD. A successful offline `check` establishes binding to the supplied
+packet, not fresh GitHub state or a complete semantic judgment. The shared close
+gate and its installed qualification are separate work. Historical documents
+without the field still parse; omit malformed/incomplete output when recording
+a legitimate open attempt and retain the raw review separately.
 
 The evidence document is validated by a strict model
 (`genesis.session_awareness.pr_evidence`): every prose field must be a non-blank

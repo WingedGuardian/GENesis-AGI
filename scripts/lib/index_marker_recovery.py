@@ -51,12 +51,40 @@ def admission_schema(db, default, native, *, require_native):
         raise RuntimeError("native authority requires explicit schema5 cutover")
 
 
-def refuse_unrepresented(db, residual, selected):
+def _accepted_residual(db, key, annotations):
+    """Only the authoritative current drain supplies older retained context."""
+    import _genesis_index_marker_execution as native
+    import _genesis_index_marker_legs as legs
+
+    if annotations is None or key not in annotations:
+        return False
+    try:
+        context, disposition = annotations[key]
+        native._object(context, legs.CONTEXT, "residual context")
+        native._integer(context["execution_seq"], "residual sequence", positive=True)
+        if (disposition != "retained" or type(context["protocol"]) is not int
+                or context["protocol"] != 3 or (context["hash"], context["provider"]) != key[:2]):
+            return False
+        row = native.execution(db, context, legs)
+        state = db.execute("SELECT * FROM provider_state WHERE hash=? AND provider=?", key[:2]).fetchone()
+        if (state is None or state["repo_path"] != row["repo_path"]
+                or context["execution_seq"] >= state["accepted_sequence"]
+                or db.execute("SELECT 1 FROM executions WHERE hash=? AND completion_kind='unbound' LIMIT 1",
+                              (key[0],)).fetchone()):
+            return False
+        return _accepted_clean(db, state, native)
+    except (KeyError, TypeError, ValueError, legs.UnownedExecution):
+        return False
+
+
+def refuse_unrepresented(db, residual, selected, *, residual_context=None):
     """Extra conflicts fence their provider; retained cleanup keeps its interpretation."""
     if db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
         return
-    for h, provider, kind, _identity in residual:
-        if (h, provider) == selected and kind not in ("cleanup", "cleanup-disproof"):
+    for key in residual:
+        h, provider, kind, _identity = key
+        if ((h, provider) == selected and kind not in ("cleanup", "cleanup-disproof")
+                and not _accepted_residual(db, key, residual_context)):
             raise RuntimeError("unrepresented native conflict prevents provider admission")
 
 
@@ -76,17 +104,21 @@ def decision_gate(db, api, *, native=False, admission=None):
                 native_imported = []
                 active = True
 
-                def finalize():
+                def finalize(*, residual_context=None):
                     if not active or not db.in_transaction:
                         raise RuntimeError('recovery decision is closed')
                     residual = []
+                    options = {} if residual_context is None else {'residual_context': residual_context}
+                    if residual_context is not None:
+                        residual_context.clear()
                     native_imported.extend(api['_native'].drain(api['marker_dir'](), db, api['_legs'], api['_proof'],
-                                                         api['marker_hash'], residual=residual))
+                                                         api['marker_hash'], residual=residual, **options))
                     return tuple(sorted(set(residual)))
 
-                residual = finalize()
+                annotations = {} if admission is not None else None
+                residual = finalize(residual_context=annotations)
                 if admission is not None:
-                    refuse_unrepresented(db, residual, admission)
+                    refuse_unrepresented(db, residual, admission, residual_context=annotations)
                 yield db, finalize
             api['_legacy'].retire(api['marker_dir'](), imported, api['_fsync_dir'])
             api['_legacy'].retire(api['marker_dir'](), list(dict.fromkeys(native_imported)), api['_fsync_dir'])
@@ -374,7 +406,7 @@ def _accepted_clean(db, state, native):
     if (row["protocol"] != 3 or row["entry_kind"] != "claim"
             or any(row[key] != state[key] for key in ("hash", "repo_path", "provider"))
             or row["typed_applied_state"] != "consumed" or row["completion_kind"] != "success"
-            or row["safety_kind"] is not None or row["first_typed_conflict"] is not None
+            or row["safety_kind"] is not None or row["first_typed_conflict"] is not None or row["conflict_reason"] is not None
             or row["native_intent"] is None or row["scope_registration"] is None
             or row["terminal"] is None or row["control_closure"] is None
             or not isinstance(state["accepted_evidence_reference"], str)

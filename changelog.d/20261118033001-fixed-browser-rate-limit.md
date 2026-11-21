@@ -1,0 +1,1 @@
+- **Browser setup names a GitHub rate limit.** When the Camoufox engine download fails because GitHub's anonymous API limit (60 calls an hour per address) ran out, the browser stack's status line now says `engine=missing (GitHub API rate limit)` and tells you to retry after the hour, instead of a bare `missing`.

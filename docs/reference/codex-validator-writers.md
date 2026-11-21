@@ -37,7 +37,9 @@ UTF-8 and canonical evidence are capped at256KiB. The verdict is derived;
 passing measurements close an OPEN obligation only after shared structured
 tracking checks complete. Pending routing stores the measurement and actual
 verdict on an OPEN row, even when it passed; `tracking_complete` and `would_close`
-expose the distinction. Other decisions record a nonclosing attempt with the
+expose the distinction. `prompts` lists the completeness questions to answer before
+a close; a close (closing verdict, complete tracking) with an event-gated date already come is refused
+(validating-merges, "Completeness checks"). Other decisions record a nonclosing attempt with the
 same note prefixes as the CLI. See `validator-tracking.md` for preflight,
 checkpoints, public/private receipts, pause and historical audit. Closed obligations
 cannot be rewritten. A real attempt increments a counter and is not idempotent:

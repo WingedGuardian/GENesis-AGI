@@ -146,3 +146,63 @@ def test_plain_list_is_unchanged(dc, dc_ready, capsys):
     capsys.readouterr()
     assert dc_ready.run(dc, "list") == 0
     assert capsys.readouterr().out.startswith("No deploy manifest")
+
+
+# ── --move-refusals: the Guardian's drop (#2978) ─────────────────────────────
+
+
+def _moves(w: World, dc, capsys) -> dict:
+    capsys.readouterr()
+    assert w.run(dc, "list", "--json", "--move-refusals") == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_without_the_flag_there_is_no_move_key(dc, dc_ready, capsys):
+    """deploy_health reads plain `list --json`; it pays for no git status."""
+    got = _observe(dc_ready, dc, capsys)
+    assert "move_refusals" not in got and "checkout" not in got
+
+
+def test_a_clean_live_checkout_has_no_move_refusal(dc, dc_ready, capsys):
+    w = dc_ready
+    _two_live(w, dc)
+    got = _moves(w, dc, capsys)
+    assert got["move_refusals"] == []
+    assert got["checkout"] == {"branch_ref": "refs/heads/live", "head": w.rev("refs/heads/live")}
+    assert _branches(got["live"]["holds"]) == ["feat/a", "feat/b"]  # observe() is all there
+
+
+def test_a_dirty_tracked_tree_is_a_move_refusal(dc, dc_ready, capsys):
+    w = dc_ready
+    _two_live(w, dc)
+    (w.root / "x.txt").write_text("edited\n")
+    [why] = _moves(w, dc, capsys)["move_refusals"]
+    assert "uncommitted tracked changes" in why and "x.txt" in why
+
+
+def test_a_guarding_update_state_is_a_move_refusal(dc, dc_ready, capsys):
+    w = dc_ready
+    _two_live(w, dc)
+    (w.home / ".genesis" / "update_state.json").write_text("{not json")
+    [why] = _moves(w, dc, capsys)["move_refusals"]
+    assert "update_state.json" in why
+
+
+def test_a_checkout_that_cannot_be_read_is_a_reason_not_none(dc, dc_ready, capsys, monkeypatch):
+    """A read failure never reads as "nothing refuses"."""
+    w = dc_ready
+    _two_live(w, dc)
+
+    def boom(_repo):
+        raise dc.Unknown("git status failed")
+
+    monkeypatch.setattr(dc.plan, "read_source", boom)
+    got = _moves(w, dc, capsys)
+    assert got["checkout"] is None
+    assert got["move_refusals"] == ["could not judge: git status failed"]
+
+
+def test_move_refusals_needs_json(dc, dc_ready, capsys):
+    capsys.readouterr()
+    assert dc_ready.run(dc, "list", "--move-refusals") == 2
+    assert "--move-refusals goes with --json" in capsys.readouterr().err
