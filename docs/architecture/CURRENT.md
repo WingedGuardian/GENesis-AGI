@@ -4849,9 +4849,9 @@ logger or unrelated exceptions with copied text and no provenance.
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
   item into the Genesis trash (`~/.genesis/trash`) with a tombstone, never
   copying, and refuses an item on another volume;
-  `python -m genesis.trash list|restore`. Callers: cognitive rollback, the
-  orphan task-worktree reset, and the dashboard's file-browser and memory-file
-  deletes (`docs/reference/trash.md`). Stdlib only.
+  `python -m genesis.trash list|restore`. Callers: cognitive rollback and the
+  dashboard's file-browser and memory-file deletes (`docs/reference/trash.md`).
+  Task-worktree creation now refuses retained or occupied state. Stdlib only.
 - **Worktree reaper trash** (`scripts/worktree_lifecycle.py`, outside `src/`;
   read at 26218b962, 2026-11-10): the daily hygiene run archives stale
   worktrees into `~/.genesis/worktree-trash`. An entry has two forms: a
