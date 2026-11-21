@@ -633,3 +633,23 @@ async def test_dedup_after_retained_delivery_closes_pending_row(bridge, monkeypa
     ).fetchone()
     assert row[0] is not None
     assert len((await Outbox(bridge.registry).poll(bridge.identities["alpha"]))[0]) == 1
+
+
+async def test_outbox_poll_logs_served_ids_and_byte_length_never_text(http_bridge, caplog):
+    b, app, base, owner = http_bridge
+    texts = ("A readable message", "Second note, ünïcode")
+    envs = []
+    for text in texts:
+        env, _ = await Outbox(b.registry).prepare("alpha", text)
+        await Outbox(b.registry).put(env)
+        envs.append(env)
+    async with sdk_client(base) as (client, transport):
+        with caplog.at_level("INFO", logger="genesis.dashboard.routes.agent_api"):
+            page = (await client.get(base + ROOT + "/outbox")).json()
+    assert len(page["messages"]) == 2
+    served = [r.getMessage() for r in caplog.records if "peer_outbox_served" in r.getMessage()]
+    assert len(served) == 2
+    for env, text in zip(envs, texts, strict=True):
+        expected = f"peer=alpha message_id={env.message_id} text_bytes={len(text.encode('utf-8'))}"
+        assert any(line.endswith(expected) for line in served)
+    assert not any(text in line for text in texts for line in served)
