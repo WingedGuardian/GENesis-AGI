@@ -84,6 +84,7 @@
 /config/external_review.yaml            @WingedGuardian
 /scripts/external_review.py             @WingedGuardian
 /scripts/premise_gate.py                @WingedGuardian
+/scripts/delivery_marker.py             @WingedGuardian
 /scripts/review_budget.py               @WingedGuardian
 /scripts/review_findings.py             @WingedGuardian
 /scripts/review_reflection.py           @WingedGuardian
