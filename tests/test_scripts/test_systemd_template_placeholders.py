@@ -378,6 +378,16 @@ def test_the_shared_inventory_lists_every_persistent_timer():
     )
 
 
+def test_queue_sweep_units_are_stopped_during_uninstall():
+    uninstall = (REPO / "scripts" / "uninstall.sh").read_text(encoding="utf-8")
+    start = uninstall.rindex("for unit in genesis-watchdog.timer genesis-watchdog.service")
+    end = uninstall.index("; do", start)
+    unit_loop = uninstall[start:end]
+
+    assert "genesis-pr-queue-sweep.timer" in unit_loop
+    assert "genesis-pr-queue-sweep.service" in unit_loop
+
+
 # NOT CHECKED HERE, deliberately: whether each persistent timer is also
 # DISABLED. An earlier draft asserted "the name appears at least twice in
 # uninstall.sh" as a proxy for disable-plus-clean. It was wrong twice over — the

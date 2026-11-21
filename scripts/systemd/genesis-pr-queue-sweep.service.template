@@ -1,0 +1,18 @@
+[Unit]
+Description=Genesis PR queue sweep — read-only open pull request worklist
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_DIR__
+ExecStart=__VENV__/bin/python __REPO_DIR__/scripts/pr_queue_sweep.py
+# The two-hour project floor allows long gate reports and network reads to
+# finish. If the unit is killed, the sweep's generation pointer keeps the last
+# complete worklist readable.
+TimeoutStartSec=7200
+Environment=PATH=__HOME__/.local/bin:__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
+ProtectSystem=full
+
+# Deliberately driven only by the paired timer.
