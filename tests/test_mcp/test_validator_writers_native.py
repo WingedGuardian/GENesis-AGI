@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from genesis.mcp.external_profiles import profile_tools
 from tests.conftest import private_module
 from tests.test_hooks.native_codex import (
     configure,
@@ -27,6 +28,16 @@ pytestmark = pytest.mark.skipif(os.environ.get("GENESIS_CODEX_NATIVE_TESTS") != 
 VERDICTS = {"preview": "pass-mechanical", "record": "pass-mechanical",
             "inconclusive": "cannot-verify", "failed": "fail-intent"}
 CASES = ["private", *VERDICTS, "episodic_memory", "knowledge_base", "external_health", "external_memory"]
+PACKAGE_DIGESTS = {
+    "codex-cli 0.166.0": {
+        "codex": "b8a11fedf24b2dfb59a70c9e52b030f9a508dcd49cd2dd0d41956f4c785156b8",
+        "codex-code-mode-host": "657f4e902726e05867c937b583049d5997e057f8cd0ab40450633c9c9ef8d630",
+    },
+    "codex-cli 0.171.0": {
+        "codex": "b76a027d6b210f9a8da7aaf321dd235c700f0ef7a794d4a5314b9af6c134f0f0",
+        "codex-code-mode-host": "f49bd4f0c0cc73cf1ec3a719009e07ce5b6e100520d023c760cc203fb37e5c6f",
+    },
+}
 
 
 def measured_evidence(root, case):
@@ -41,8 +52,15 @@ def measured_evidence(root, case):
         input=marker if case == "failed" else "ordinary fixture content",
         text=True, capture_output=True, check=False,
     )
-    verdict, tier = {0: ("pass", "MEASURED"), 1: ("fail", "MEASURED"),
-                     3: ("unverified", "NOT_VERIFIABLE_HERE")}[run.returncode]
+    exit_code, expected_banner, verdict, tier = {
+        "preview": (0, "Private-pattern exact scan: CLEAN", "pass", "MEASURED"),
+        "record": (0, "Private-pattern exact scan: CLEAN", "pass", "MEASURED"),
+        "failed": (1, "match count: 1", "fail", "MEASURED"),
+        "inconclusive": (3, "::error::cannot read pattern file (FileNotFoundError)",
+                         "unverified", "NOT_VERIFIABLE_HERE"),
+    }[case]
+    assert run.returncode == exit_code
+    assert expected_banner in (run.stdout + run.stderr).splitlines()
     return _doc(
         deploy={"method": "content", "established": True,
                 "detail": "Executed private_pattern_scan.py at sha256 " + hashlib.sha256(scanner.read_bytes()).hexdigest()},
@@ -72,13 +90,13 @@ async def test_native_validator_writer_dispatch(tmp_path, monkeypatch, client, c
     binary = os.environ["GENESIS_CODEX_CLI_BIN" if client == "cli" else "GENESIS_CODEX_APP_SERVER_BIN"]
     app = os.environ["GENESIS_CODEX_APP_SERVER_BIN"]
     version = subprocess.check_output([binary, "--version"], text=True).strip()
-    expected_binary = {
-        "codex-cli 0.166.0": "b8a11fedf24b2dfb59a70c9e52b030f9a508dcd49cd2dd0d41956f4c785156b8",
-        "codex-cli 0.171.0": "b76a027d6b210f9a8da7aaf321dd235c700f0ef7a794d4a5314b9af6c134f0f0",
-    }[version]
+    expected_binary = PACKAGE_DIGESTS[version]
     for executable in {binary, app}:
-        with Path(executable).open("rb") as stream:
-            assert hashlib.file_digest(stream, "sha256").hexdigest() == expected_binary
+        codex = Path(executable).resolve()
+        for artifact, digest in expected_binary.items():
+            path = codex if artifact == "codex" else codex.with_name(artifact)
+            with path.open("rb") as stream:
+                assert hashlib.file_digest(stream, "sha256").hexdigest() == digest
     profile = "external" if case.startswith("external_") else "validator"
     recording = case in {"record", "inconclusive", "failed"}
     fixture = await prepare(tmp_path, profile=profile, recording=recording)
@@ -120,7 +138,8 @@ async def test_native_validator_writer_dispatch(tmp_path, monkeypatch, client, c
                          *sorted((ROOT / "src/genesis").rglob("*.py"))]}
     sources.update({"adapter/" + str(p.relative_to(runtime)): hashlib.sha256(p.read_bytes()).hexdigest()
                     for p in runtime.rglob("*") if p.is_file() and ".venv" not in p.parts})
-    evidence = {"binary_version": version, "binary_sha256": expected_binary,
+    evidence = {"binary_version": version, "binary_sha256": expected_binary["codex"],
+                "code_mode_host_sha256": expected_binary["codex-code-mode-host"],
                 "client": client, "case": case, "profile": profile, "source_root": str(ROOT),
                 "adapter_source": str(adapter), "adapter_runtime": str(runtime), "hashes": sources,
                 "database": str(fixture["database"]), "integration_preview": True,
@@ -151,9 +170,10 @@ async def test_native_validator_writer_dispatch(tmp_path, monkeypatch, client, c
                    for line in output.splitlines() if line.startswith("VALIDATOR_WRITER:")]
         assert len(records) == 1, outputs
         record = records[0]
-        health = [name for name in record["catalog"] if name.startswith("mcp__genesis_validator_health__")]
-        memories = [name for name in record["catalog"] if name.startswith("mcp__genesis_validator_memory__")]
-        assert (len(health), len(memories)) == ((5, 8) if profile == "external" else (9, 9))
+        expected_tools = {f"mcp__genesis_validator_{scope}__{name}"
+                          for scope in ("health", "memory") for name in profile_tools(scope, profile)}
+        assert len(record["catalog"]) == len(expected_tools)
+        assert set(record["catalog"]) == expected_tools
         hooks = [json.loads(line) for line in (tmp_path / "hooks.jsonl").read_text().splitlines()] if (tmp_path / "hooks.jsonl").exists() else []
         if profile == "external":
             assert key not in record["catalog"] and "not a function" in record["result"]["error"]
@@ -173,6 +193,12 @@ async def test_native_validator_writer_dispatch(tmp_path, monkeypatch, client, c
             assert reader.execute("SELECT COUNT(*) FROM follow_ups").fetchone()[0] == int(case == "private")
             assert reader.execute("SELECT status,attempt_count,verdict FROM pr_verifications").fetchall() == [
                 ("closed" if case == "record" else "open", int(recording), VERDICTS[case] if recording else None)]
+            stored = reader.execute("SELECT evidence FROM pr_verifications").fetchone()[0]
+            if recording:
+                submitted = json.loads(arguments["evidence_json"])
+                assert json.loads(stored)["claims"] == submitted["claims"]
+            else:
+                assert stored is None
             assert reader.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0] == int(memory and profile == "validator")
             if memory and profile == "validator":
                 assert reader.execute("SELECT collection FROM memory_fts").fetchall() == [(case,)]

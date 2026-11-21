@@ -252,14 +252,15 @@ On 0.166.0, an owned copy of the reference executable also needs the bundled
 layout from the same verified package and record both hashes. A lone executable
 can pass version and discovery checks while failing to start its tool host.
 
-The validator writer suite binds the Linux x86-64 executable to its exact
-digest for 0.166.0 or 0.171.0. Its eighteen cells exercise real tool dispatch
+The validator writer suite binds the Linux x86-64 executable and its code-mode
+host to their exact digests for 0.166.0 or 0.171.0. Its eighteen cells exercise real tool dispatch
 on exec and app-server against owned SQLite/vector fixtures. The close cases
 run the private-pattern scanner against a disposable release candidate and
 submit its measured exit status and output to the writer. The database
-readback distinguishes a recorded pass, an open failed or inconclusive
-obligation, and a preview with no stored change. External-profile controls
-check that the writers are absent. The 0.171.0 run passed all eighteen cells.
+readback compares the recorded measurement and verdict and distinguishes a
+closed pass, an open failed or inconclusive obligation, and a preview with no
+stored change. External-profile controls compare the full exposed tool list
+against the capability floor.
 This result covers the writer suite. The launcher, shell boundary, and
 operator calibration have separate qualification requirements.
 
