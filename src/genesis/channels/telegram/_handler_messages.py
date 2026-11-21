@@ -13,6 +13,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from genesis.cc.exceptions import CCError
+from genesis.cc.model_names import effort_label
 from genesis.cc.types import ChannelType
 from genesis.channels import stt
 from genesis.channels.telegram._handler_helpers import (
@@ -29,7 +30,7 @@ if TYPE_CHECKING:
 
 #: Imported rather than re-spelled: comparing against a copied string is
 #: how the rescue below silently stops firing when the notice is reworded.
-from genesis.cc.conversation import _TRUNCATION_NOTICE, CONTINGENCY_HEADER_PREFIX
+from genesis.cc.conversation import _TRUNCATION_NOTICE, is_non_model_reply
 
 log = logging.getLogger(__name__)
 
@@ -118,37 +119,39 @@ _MODEL_PREFIX_GAP_S = 3600  # Show model/effort prefix after 1h of silence
 def _with_model_prefix(streamer: DraftStreamer | None, response: str) -> str:
     """Prepend the streamer's ``[Model / Effort]`` prefix to the final reply.
 
-    The prefix names the HOME session's model, read before the turn ran. A
-    contingency reply was not written by that model and carries its own
-    ``[Contingency mode via <provider> ...]`` label, so it gets no prefix:
-    stacking both told the reader two different models answered.
+    The relay owns this header: a Telegram session is told not to write its own
+    (``_session_control_block``), so the reply body is never edited here. A
+    reply the loop wrote itself (contingency, an error, a timeout, a parked
+    turn) was not written by the named model, so it gets no prefix: a header
+    above it would name a model that did not answer.
     """
     if not (streamer and streamer._prefix):
         return response
-    if response.startswith(CONTINGENCY_HEADER_PREFIX):
+    if is_non_model_reply(response):
         return response
     return streamer._prefix + "\n" + response
 
 
-async def _make_streamer(ctx: HandlerContext, msg, user, tid) -> DraftStreamer | None:
-    """Create a draft streamer if conditions are met.
+async def _make_streamer(ctx: HandlerContext, msg, user, tid) -> DraftStreamer:
+    """Create the reply's streamer: it carries the header state on every chat.
 
     Seeds the streamer with a model/effort prefix and flushes immediately
     so the user sees what model they're talking to before inference starts.
-    Only shows the prefix when >1h has elapsed since the user's last message
-    in this private chat (i.e. when coming back cold).
+    Shows the prefix when >1h has elapsed since the user's last message in
+    this private chat (coming back cold). A reply that opens a CC session gets
+    it too, from the ``session_opened`` event (``HandlerContext.make_on_event``).
+
+    Where drafts cannot be sent (a group or topic chat, drafts turned off, no
+    bot) the streamer is built DISABLED rather than skipped: it sends nothing,
+    but it still records the header, and the session was told not to write one.
     """
-    if not (
-        ctx.draft_streaming_enabled
-        and ctx.adapter
-        and ctx.adapter._app
-        and msg.chat.type == "private"
-    ):
-        return None
+    app = ctx.adapter._app if ctx.adapter else None
+    drafts = bool(ctx.draft_streaming_enabled and app and msg.chat.type == "private")
 
     # Determine whether to show model/effort prefix based on message gap
     prefix = ""
-    if ctx.db:
+    effort = ""
+    if ctx.db and msg.chat.type == "private":
         try:
             from genesis.db.crud import cc_sessions
 
@@ -183,22 +186,25 @@ async def _make_streamer(ctx: HandlerContext, msg, user, tid) -> DraftStreamer |
                 )
                 if session:
                     model = (session.get("model") or "sonnet").title()
-                    effort_raw = session.get("effort") or "medium"
-                    effort = "xHigh" if effort_raw == "xhigh" else effort_raw.title()
+                    effort = effort_label(session.get("effort") or "medium")
                     prefix = f"[{model} / {effort}]"
         except Exception:
             log.debug("Could not resolve model/effort prefix", exc_info=True)
 
     streamer = DraftStreamer(
-        bot=ctx.adapter._app.bot,
+        bot=app.bot if app else None,
         chat_id=msg.chat.id,
         draft_id=generate_draft_id(),
         message_thread_id=msg.message_thread_id,
         prefix=prefix,
         stopping=lambda: getattr(ctx.adapter, "_stopping", False),
+        prefix_effort=effort if prefix else "",
     )
 
-    # Flush immediately — user sees prefix before inference starts
+    if not drafts:
+        streamer.disable()
+    # Flush immediately — user sees prefix before inference starts (a no-op
+    # on a disabled streamer)
     if prefix:
         await streamer.flush()
 
