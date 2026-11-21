@@ -2802,6 +2802,26 @@ verified: 0aa0bf9f2 2026-11-10
   can see (the host, a process owned by another user, or I/O byte counters
   miss, such as fsync storms and swap). Unreadable processes are counted, and
   command lines are never logged.
+- **`live` is armed** (#2978): `scripts/lib/deploy_live.sh` is the readiness
+  marker. `deploy_candidates add` and `rebuild` refuse until it is in the
+  server's base (merge-base of the commit the server booted from and
+  origin/main). Where a host guardian is configured (`~/.genesis/guardian_remote.yaml`),
+  the deployed commit its last probe recorded (`~/.genesis/host_gateway_state.json`,
+  written by update.sh and the nightly align timer) must also resolve to one
+  commit in this clone, from the object store only, that has the host guardian's
+  `live` ban (#3546, `HOST_REQUIRED`) as an ancestor. It is required by commit,
+  not by the marker, because update.sh redeploys the host only when a guardian
+  path changed. A missing, unreadable, non-regular, oversized or unresolvable
+  probe is a named refusal whose remedy is a re-probe
+  (`systemctl --user start genesis-cc-align.service`) or a detached
+  `scripts/update.sh` from main. `drop` runs no readiness check. Nothing
+  sources the marker. Admission refuses a candidate that changes it, and
+  deleting it disarms every install. Accepted gap (owner, 2026-11-20), until
+  the Guardian's own drop lands (the #4841 rework, PRs B1 and B2): no automatic
+  path removes a candidate that keeps the server down. The Guardian proposes a
+  container restart (next bullet), which keeps the candidate's code; remove it
+  with `scripts/deploy_candidates drop <branch> --wait 0`, then a detached
+  `scripts/deploy_code_only.sh restart`.
 - **Recovery on a `live` checkout** (#3492 D3): `REVERT_CODE` (stash, then
   revert HEAD) never runs where the container checkout is on `live`, judged by
   git's own HEAD (`refs/heads/live` bans, whatever the manifest says) and then
