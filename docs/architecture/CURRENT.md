@@ -6565,6 +6565,21 @@ dashboard tab are follow-on work. The shipped mode is `off`.
     running `genesis-builder-*` unit (`systemctl list-units`). A session with
     no pinned issue holds its place; an issue whose card left the board is read
     live. The host reads live in `board/launcher/probes.py`.
+  - **Watch** (`board/builder_watch.py`, ticket E3b), every pass, armed or not,
+    before any launch: a builder whose tmux session is gone is `builder_exited`
+    (status from `~/.genesis/logs/cc_exit_<slot>.log`, one owner line, never
+    relaunched), or `builder_closed` when its issue has an open closing PR. With
+    a good board read, a builder whose card is back in Ready or Proposed (no
+    open closing PR) is stopped with SIGTERM to its claude and its session
+    closed (`builder_paused`), and one an hour past its PR's creation with no
+    client attached is closed (`builder_closed`). A stop writes its row only
+    once the session is confirmed gone. A held move whose card left Build is
+    `launch_withdrawn`.
+  - **Resume:** a Build move for an issue whose newest earlier builder was
+    paused or exited (not closed) relaunches it with `--resume` and the same
+    session id, when its conversation file
+    (`~/.claude/projects/<checkout path>/<id>.jsonl`) and its worktree both
+    exist; otherwise it starts fresh and the owner's line says why.
 - **`board_status`** reads the stored heartbeats only, never GitHub: the newest
   pulse (alive, mode, error) and the newest SUCCESSFUL read with its age,
   including that tick's `writes` block (None on a summary from before #4400).

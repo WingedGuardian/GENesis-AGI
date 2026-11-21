@@ -1,0 +1,1 @@
+- Add a watch over running builders: one whose card goes back to Ready or Proposed is paused and resumes the same conversation when the card returns to Build; one is closed an hour after its pull request opens unless someone is attached; an exit with no pull request is recorded and reported once.
