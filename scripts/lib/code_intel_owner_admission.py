@@ -17,6 +17,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
+class RepositoryMissing(FileNotFoundError):
+    """The checkout for a retained execution no longer exists."""
+
+
+class RepositoryBusy(BlockingIOError):
+    """The canonical repository lock is held by another writer."""
+
+
 @contextmanager
 def repository_lock(modules, context):
     """Take the existing freeze namespace on fd9; never replace or fall back."""
@@ -30,7 +38,10 @@ def repository_lock(modules, context):
 def repository_lock_for(modules, repo_path, h):
     """The same namespace before a trial exists; no fabricated context."""
     queue = modules['queue']
-    repo = Path(repo_path).resolve(strict=True)
+    try:
+        repo = Path(repo_path).resolve(strict=True)
+    except FileNotFoundError as error:
+        raise RepositoryMissing("original repository is missing") from error
     if str(repo) != repo_path or h != queue.marker_hash(repo_path) or not (repo / '.git').is_dir():
         raise ValueError('typed owner requires a physical repository checkout')
     base = Path(os.environ.get('GENESIS_HOME') or str(Path.home() / '.genesis'))
@@ -53,7 +64,10 @@ def repository_lock_for(modules, repo_path, h):
         if (not stat.S_ISREG(held.st_mode) or not stat.S_ISREG(named.st_mode)
                 or (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino)):
             raise ValueError('canonical repository lock identity differs')
-        fcntl.flock(raw, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(raw, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RepositoryBusy("canonical repository lock is busy") from error
         if raw != 9:
             os.dup2(raw, 9, inheritable=False)
             os.close(raw)
