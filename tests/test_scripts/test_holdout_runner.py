@@ -7,6 +7,7 @@ the two read-only ``gh`` queries are replaced. The scenarios are synthetic.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import importlib.util
 import json
@@ -2040,6 +2041,33 @@ def test_an_interrupt_while_stopping_kills_the_group_before_it_returns(tmp_path,
         hr._stop_git_group(proc)
     time.sleep(2)  # past the moment the member would have written
     assert not late.exists(), "a group member outlived the interrupted stop"
+
+
+def test_an_interrupted_stop_returns_only_once_the_whole_group_is_gone(tmp_path, monkeypatch):
+    """The leader exits at once while a member that ignores SIGTERM keeps running.
+    Interrupted during the grace wait, the stop sends SIGKILL and must not
+    re-raise until that member is gone too, not only the leader."""
+    ready = tmp_path / "ready"
+    member = f"trap '' TERM; touch {ready}; sleep 30"
+    proc = subprocess.Popen(["sh", "-c", f'sh -c "{member}" &'], start_new_session=True)
+    _wait_for(ready)
+    real_alive = hr._group_alive
+    calls = []
+
+    def interrupted_once(pgid):
+        calls.append(pgid)
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+        return real_alive(pgid)
+
+    monkeypatch.setattr(hr, "_group_alive", interrupted_once)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            hr._stop_git_group(proc)
+        assert not real_alive(proc.pid), "the stop re-raised while a group member was still running"
+    finally:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
 
 
 def test_a_git_that_ignores_sigterm_is_killed_after_the_grace(tmp_path, monkeypatch):
