@@ -64,7 +64,8 @@ def test_existing_freeze_flock_is_never_bypassed(tmp_path):
         fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
         original = path.stat().st_ino
         child = subprocess.run(command, env=env, input=b'x', capture_output=True, timeout=30)
-        assert child.returncode == 75 and not child.stdout and b'LOCK_REFUSED:BlockingIOError' in child.stderr
+        # RepositoryBusy is the typed BlockingIOError the sweep classifies as contention.
+        assert child.returncode == 75 and not child.stdout and b'LOCK_REFUSED:RepositoryBusy' in child.stderr
         assert path.stat().st_ino == original
 
 

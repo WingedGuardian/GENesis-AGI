@@ -21,6 +21,12 @@ class RepositoryMissing(FileNotFoundError):
     """The checkout for a retained execution no longer exists."""
 
 
+class RepositoryRelocated(ValueError):
+    """The recorded path no longer names its physical checkout: it resolves
+    elsewhere (a moved checkout left a symlink) or has no ``.git`` directory.
+    A ``ValueError`` as before, so explicit callers see no change."""
+
+
 class RepositoryBusy(BlockingIOError):
     """The canonical repository lock is held by another writer."""
 
@@ -42,7 +48,11 @@ def repository_lock_for(modules, repo_path, h):
         repo = Path(repo_path).resolve(strict=True)
     except FileNotFoundError as error:
         raise RepositoryMissing("original repository is missing") from error
-    if str(repo) != repo_path or h != queue.marker_hash(repo_path) or not (repo / '.git').is_dir():
+    # Relocation first: the hash is of the resolved path, so a moved checkout
+    # behind a symlink would otherwise read as a wrong hash.
+    if str(repo) != repo_path or not (repo / '.git').is_dir():
+        raise RepositoryRelocated('typed owner requires a physical repository checkout')
+    if h != queue.marker_hash(repo_path):
         raise ValueError('typed owner requires a physical repository checkout')
     base = Path(os.environ.get('GENESIS_HOME') or str(Path.home() / '.genesis'))
     if not base.is_absolute():

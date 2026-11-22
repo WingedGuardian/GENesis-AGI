@@ -304,7 +304,12 @@ class Supervisor:
         for context in contexts:
             try:
                 self.reconcile_context(context, automatic_boot=boot)
-            except (OrphanHeld, scope.OwnerObservationUnavailable, modules["owner_admission"].RepositoryMissing):
+            except (
+                OrphanHeld,
+                scope.OwnerObservationUnavailable,
+                modules["owner_admission"].RepositoryMissing,
+                modules["owner_admission"].RepositoryRelocated,
+            ):
                 held += 1
             except (queue._legacy.QueueBusy, modules["owner_admission"].RepositoryBusy):
                 busy = True
@@ -363,7 +368,16 @@ def reconcile_orphan(modules, context, db, *, proc=Path("/proc"), automatic_boot
         return native.status(db, context, legs)
 
     def fresh(current):
-        return queue._fresh_cleanup(db, current, proc=proc)
+        try:
+            return queue._fresh_cleanup(db, current, proc=proc)
+        except (FileNotFoundError, ValueError) as error:
+            # Lifetime evidence this execution cannot use (a re-read observation
+            # or retained fact that fails its checks, a spool that vanished) holds
+            # it in the sweep. Permission and other OS errors still stop the tick,
+            # and a malformed spool is refused earlier by the gate's drain.
+            if automatic_boot is None or isinstance(error, OrphanHeld):
+                raise
+            raise OrphanHeld("retained lifetime evidence unavailable") from error
 
     if row["typed_applied_state"] is None:
         native._owns(db, row)

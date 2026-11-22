@@ -47,7 +47,9 @@ def reserve_dead_owner(queue, proof, claimed):
     assert child.returncode == 0
 
 
-@pytest.mark.parametrize("held_reason", ["live", "missing-checkout"])
+@pytest.mark.parametrize(
+    "held_reason", ["live", "missing-checkout", "symlinked-checkout", "no-git-directory"]
+)
 def test_captured_sweep_reconciles_once_without_resending(tmp_path, monkeypatch, held_reason):
     _, _, snapshot, modules, claimed = setup(tmp_path, monkeypatch, "runner")
     queue = modules["queue"]
@@ -59,7 +61,13 @@ def test_captured_sweep_reconciles_once_without_resending(tmp_path, monkeypatch,
         assert queue.reserve_launch(live["context"], _reservation(live)) == "reserved"
     else:
         reserve_dead_owner(queue, modules["proof"], live)
-        live_repo.rename(tmp_path / "preserved-checkout")
+        moved = tmp_path / "preserved-checkout"
+        if held_reason == "no-git-directory":
+            (live_repo / ".git").rmdir()
+        else:
+            live_repo.rename(moved)
+        if held_reason == "symlinked-checkout":
+            live_repo.symlink_to(moved)  # the old path now resolves elsewhere
     live_before = queue.execution_status(live["context"])
     later_repo = tmp_path / "later-orphan-repo"
     (later_repo / ".git").mkdir(parents=True)

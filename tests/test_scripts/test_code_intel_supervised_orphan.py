@@ -510,3 +510,48 @@ def test_existing_valid_original_wait_is_reused_truthfully_with_fresh_population
     assert status["cleanup_proof"]["data"] == waited
     assert status["control_closure"]["data"]["state"] == "orphaned"
     assert queue.get_inflight(claimed["hash"]) is None
+
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("retained resource evidence lacks its original binding"),
+        FileNotFoundError("retained spool vanished"),
+        PermissionError("retained spool unreadable"),
+    ],
+    ids=["unbound-evidence", "vanished-spool", "permission"],
+)
+def test_unusable_retained_evidence_holds_only_in_the_automatic_sweep(
+    orphan_case, automatic_mode, monkeypatch, error
+):
+    """Retained evidence the lifetime re-read cannot use holds that one execution
+    in the automatic sweep, as unavailable proof does, so unrelated work still
+    reconciles. The explicit path raises as before, and a permission error still
+    stops the sweep (#4979 review)."""
+    modules, claimed, _, registered, leaf, proc = orphan_case
+    queue = modules["queue"]
+    register(orphan_case, intent=True)
+    (leaf / "cgroup.events").write_text("populated 0\n")
+    waited = modules["scope"].cleanup_observation(
+        registered, queue._native.digest(registered), modules["proof"], owned_wait=True, proc=proc
+    )
+    queue.remember_native_event(claimed["context"], "cleanup", waited)
+    reads = []
+
+    def unusable(*_args, **_kwargs):
+        reads.append(True)
+        raise error
+
+    monkeypatch.setattr(queue, "_fresh_cleanup", unusable)
+    supervisor = runpy.run_path(str(ROOT / "scripts/lib/code_intel_supervisor.py"))
+    held = automatic_mode and not isinstance(error, PermissionError)
+    with queue._queue_gate(native=True) as db:
+        boot = modules["scope"]._boot(proc) if automatic_mode else None
+        with pytest.raises(supervisor["OrphanHeld"] if held else type(error)) as raised:
+            supervisor["reconcile_orphan"](
+                modules, claimed["context"], db, proc=proc, automatic_boot=boot
+            )
+    assert reads == [True]
+    assert ("retained lifetime evidence" in str(raised.value)) is held
+    assert queue.execution_status(claimed["context"])["control_closure"] is None
