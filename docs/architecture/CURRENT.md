@@ -2699,7 +2699,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 0aa0bf9f2 2026-11-10
+verified: 204c69c1f 2026-11-22
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -3045,6 +3045,12 @@ verified: 0aa0bf9f2 2026-11-10
   taken over, and a cancel that fails keeps the park. The cancelled pattern
   starts the 15-minute resolved cooldown. A declined dispatch or action is
   quiet for 24 h through `handle_approval_resolution` (every pattern).
+- **sentinel/codex_mcp_inventory.py** reads the managed daemon's loaded thread
+  inventory and MCP groups once per minute while the learning scheduler runs.
+  Daily pruning applies a 72-hour cutoff to aggregate `codex.mcp_inventory`
+  events. Thread and process group identifiers used for comparisons stay in
+  memory. See the [MCP process report](../reference/mcp-process-report.md) for
+  limitations and the collection switch.
 - **sentinel/process_stop.py** (`python -m genesis.sentinel.process_stop`):
   the Failure Inventory remedy for ONE runaway process. Dry-run by default;
   `--execute` only inside an approved action. Resolves targets when it runs:

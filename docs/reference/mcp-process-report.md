@@ -40,6 +40,36 @@ last cursor and any unavailable/truncated result. Keep that evidence private;
 do not publish thread titles or transcripts in a PR. Neither age nor low CPU
 establishes a leak or authorizes process cleanup.
 
+## Managed Codex lifecycle inventory
+
+`python -m genesis.sentinel.codex_mcp_inventory` reads the current local
+managed daemon through its standard Unix control socket under Codex home.
+The collector opens the socket directly and reads the version from the
+initialization response, so polling cannot start the CLI's update wrapper. It checks
+the peer PID and UID against the process scan, enumerates loaded threads
+with pagination, and aggregates metadata by source and activity. It refreshes
+the loaded set before accepting the sample. The command prints only the
+aggregate and never subscribes to threads or opens a conversation.
+
+The learning scheduler takes one sample per minute. Daily event pruning applies a
+72-hour cutoff to `codex.mcp_inventory` events. The evidence
+contains only daemon identity and version, counts, held memory (RSS plus
+swap), and proportional memory when readable. Missing or unstable evidence
+is labeled unavailable or partial. A process scan and a thread report are
+separate observations, so a process group cannot be attributed to a
+conversation. For a controlled before/after comparison, ensure the client
+actually unsubscribes and measure again after its configured unload delay.
+Check the terminal and editor clients separately because their transport
+can change with Codex versions and startup configuration.
+The opt-in native test
+`test_unsubscribe_unloads_the_thread_and_reaps_its_stdio_child` exercises a
+disposable backend with a one-second unload delay. It verifies that the thread
+leaves the loaded inventory and the exact responding MCP child exits while the
+backend stays open. It covers the protocol release path for the fixture.
+
+Set `GENESIS_CODEX_MCP_INVENTORY_DISABLED=1` to disable periodic collection.
+The supervisor collects no samples while `codex_mcp_stop.mode` is off.
+
 ## Stopping a shared Codex daemon's MCP servers
 
 The report observes; it never stops anything. The remedy is a separate tool
@@ -61,9 +91,10 @@ python -m genesis.sentinel.codex_mcp_stop --execute  # only inside an approved S
 - **How it stops them:** each group gets SIGTERM, then SIGKILL after a 5 s grace.
   Codex does not respawn a killed stdio server, so threads on that daemon lose
   those tools until they are reopened.
-- **Where the build-up happens:** the daemon path, which editor clients such as
-  the VS Code extension use. A terminal `codex` runs its servers in-process
-  with the TUI, and its subagents share one set.
+- **Where the build-up happens:** the shared daemon, which editor clients such
+  as the VS Code extension use. Terminal Codex can run embedded or use the
+  daemon depending on its version and launch path. Check observed ancestry
+  before attributing held memory to a particular client.
 - **Turning it off:** `codex_mcp_stop.mode: off` in `config/sentinel.local.yaml`,
   or `GENESIS_CODEX_MCP_STOP_DISABLED=1`, makes the tool refuse before scanning
   (exit 4), in the dry-run and with `--execute` alike.
