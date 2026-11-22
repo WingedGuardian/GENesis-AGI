@@ -324,6 +324,13 @@ def readiness_failures(repo: Repo, base: str) -> list[str]:
                     f"PR C (the wipers rebuild `live`) is not in {judged} {mb[:12]}: "
                     f"{PR_C_MARKER} does not exist there (it has not merged, or is not deployed)"
                 )
+    # The rebuild builds on `base` (fetched origin/main), not on the serving
+    # merge-base: a main that has since deleted the marker has disarmed `live`.
+    if base and repo.blob_at(base, PR_C_MARKER) is None:
+        fails.append(
+            f"origin/main {base[:12]} no longer has {PR_C_MARKER}: `live` is disarmed there, "
+            "so no candidate goes live on it"
+        )
     return (
         fails
         + host_guardian_failures(repo)
@@ -344,13 +351,19 @@ def host_guardian_failures(repo: Repo) -> list[str]:
     refusal that names it: a missing or unreadable probe never reads as ready.
     `drop` runs no readiness check, so a hand drop works whatever this says."""
     genesis = repo.home / ".genesis"
-    if not (genesis / GUARDIAN_REMOTE).exists():
-        return []
+    config = genesis / GUARDIAN_REMOTE
     remedy = (
-        "re-probe the host with `systemctl --user start genesis-cc-align.service`, or run "
-        "scripts/update.sh (detached) from main, which redeploys the host guardian when its "
-        "code changed"
+        "run scripts/update.sh (detached) from main, which re-probes the host and redeploys "
+        "its guardian when that code changed; or re-probe with "
+        "`systemctl --user start genesis-cc-align.service` (it uses the default SSH key only)"
     )
+    try:
+        config_mtime = os.stat(config).st_mtime
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        # Absent is the only "no host guardian": an unreadable config is not one.
+        return [f"{config} could not be checked ({exc.strerror}); {remedy}"]
     state = genesis / HOST_GATEWAY_STATE
     try:
         # O_NONBLOCK: a FIFO at this path must not hang readiness, which update.sh
@@ -362,8 +375,16 @@ def host_guardian_failures(repo: Repo) -> list[str]:
             f"the host guardian's deployed version is unknown ({state}: {exc.strerror}); {remedy}"
         ]
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
             return [f"{state} is not a regular file, so it was not read; {remedy}"]
+        # The probe names no host, so it is only about the configured guardian if
+        # it was taken after the config last changed (a new host, a new key).
+        if st.st_mtime < config_mtime:
+            return [
+                f"{state} predates {config}: the guardian config changed after the last "
+                f"probe, so it may describe another host; {remedy}"
+            ]
         raw = os.read(fd, _HOST_STATE_MAX_BYTES + 1)
     except OSError as exc:
         return [f"{state} could not be read ({exc.strerror}); {remedy}"]

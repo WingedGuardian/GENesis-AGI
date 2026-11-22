@@ -85,6 +85,49 @@ def test_a_host_guardian_before_the_live_ban_is_not_ready(dc, armed, capsys, mon
     _refused(w, dc, capsys, "predates the live ban")
 
 
+def test_a_probe_older_than_the_guardian_config_is_not_ready(dc, armed, capsys):
+    """The probe names no host: a config changed after it (a new host or key) may
+    make it describe another guardian, so it must be re-taken first."""
+    w = armed
+    _guardian(w, w.rev("refs/remotes/origin/main")[:9])
+    genesis = w.home / ".genesis"
+    state = genesis / "host_gateway_state.json"
+    t = state.stat().st_mtime
+    os.utime(state, (t - 60, t - 60))
+    os.utime(genesis / "guardian_remote.yaml", (t, t))
+    _refused(w, dc, capsys, "predates")
+
+
+def test_a_guardian_config_that_cannot_be_checked_is_not_ready(dc, armed, capsys, monkeypatch):
+    """Only an ABSENT config means "no host guardian"; any other stat error refuses."""
+    w = armed
+    _guardian(w, w.rev("refs/remotes/origin/main")[:9])
+    real = dc.gate.os.stat
+    target = str(w.home / ".genesis" / "guardian_remote.yaml")
+
+    def stat(path, *a, **kw):
+        if str(path) == target:
+            raise PermissionError(13, "Permission denied")
+        return real(path, *a, **kw)
+
+    monkeypatch.setattr(dc.gate.os, "stat", stat)
+    _refused(w, dc, capsys, "could not be checked")
+
+
+def test_a_main_that_deleted_the_marker_disarms_rebuild(dc, armed, capsys):
+    """The serving merge-base still has the marker, but the rebuild builds on the
+    fetched origin/main, which deleted it: no candidate goes live on it."""
+    w = armed
+    w.candidate("feat/a", {"x.txt": "x\n"})
+    w.write_manifest([w.entry("feat/a")])
+    w.advance_main({"scripts/lib/deploy_live.sh": None}, "disarm live")
+    capsys.readouterr()
+    assert w.run(dc, "rebuild") == 1
+    err = capsys.readouterr().err
+    assert "no longer has scripts/lib/deploy_live.sh" in err, err
+    assert w.live_merges() == []
+
+
 def test_rebuild_refuses_on_the_host_check_as_add_does(dc, armed, capsys):
     w = armed
     w.candidate("feat/a", {"x.txt": "x\n"})
