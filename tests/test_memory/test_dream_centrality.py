@@ -106,6 +106,24 @@ async def test_worker_scores_every_visible_node(tmp_path):
     assert len(scores) == 600
 
 
+async def test_worker_quota_respects_a_lower_configured_cpu_budget(tmp_path, monkeypatch):
+    from genesis.hostmetrics.readings import Memory
+    from genesis.memory import dream_centrality
+    from genesis.memory.graphstore import GraphUnavailableError
+
+    monkeypatch.setenv("GENESIS_RB_THRESHOLD_PCT", "40")
+    monkeypatch.setattr(
+        dream_centrality.readings, "read_memory", lambda: Memory(20 * 2**30, 16 * 2**30, "test"),
+    )
+    monkeypatch.setattr(dream_centrality.readings, "cpu_capacity", lambda: 2)
+    launch = AsyncMock(return_value=MagicMock(wait=AsyncMock(return_value=4)))
+    monkeypatch.setattr(dream_centrality.asyncio, "create_subprocess_exec", launch)
+    with pytest.raises(GraphUnavailableError, match="exited 4"):
+        await dream_centrality._run_worker(tmp_path / "graph.db", "quota", io.BytesIO())
+    args = launch.call_args.args
+    assert args[args.index("--cpu") + 1] == args[-1] == "64"
+
+
 async def test_centrality_caches_scores(phase_kwargs):
     """Centrality scores are written to centrality_cache table."""
     mock_scores = [("mem-1", 0.45), ("mem-2", 0.32), ("mem-3", 0.18)]

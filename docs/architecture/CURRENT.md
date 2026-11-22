@@ -341,7 +341,8 @@ additive layer, not a leak. Weekly betweenness scoring also runs in dry runs.
 `dream_centrality_worker.py` snapshots the primary database in one admitted
 read-only transaction, closes it, then builds and scores the NetworkX graph
 in a separate user scope. The worker budget is 5% of effective memory and
-half the effective CPU capacity, up to one core, with a 15-minute deadline.
+half the effective CPU capacity, up to one core and 80% of the configured
+resource-budget CPU allowance. A two-hour deadline bounds a hung worker.
 The worker verifies its own kernel limits before reading the database. The
 parent publishes the full nonzero ranking in an owned transaction after
 validating the complete result. Failure before commit leaves the last good

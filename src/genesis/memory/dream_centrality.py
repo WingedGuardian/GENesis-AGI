@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from genesis.db.connection import connect_aiosqlite_rw
 from genesis.hostmetrics import readings
+from genesis.hostmetrics.preflight import load_levers
 from genesis.memory.dream_centrality_worker import MAX_RECORD_BYTES, PROTOCOL_VERSION
 from genesis.memory.graphstore import GraphUnavailableError
 from genesis.util.tmp import big_tmp_dir
@@ -34,7 +35,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_WORKER_TIMEOUT_S = 15 * 60
+# A hung worker owns the single-run guard. Use the project deadline so
+# a lower admitted CPU quota can still complete legitimate scoring.
+_WORKER_TIMEOUT_S = 2 * 60 * 60
 _RECOMPUTE_LOCK = asyncio.Lock()
 
 
@@ -138,14 +141,18 @@ async def _stop_launched_worker(launch: asyncio.Task[asyncio.subprocess.Process]
 async def _run_worker(path: Path, run_id: str, output: BinaryIO) -> CentralityResult:
     if os.environ.get("GENESIS_DREAM_CENTRALITY_DISABLED") == "1":
         raise GraphUnavailableError("centrality worker is disabled")
-    memory, cpus = await asyncio.gather(
-        asyncio.to_thread(readings.read_memory), asyncio.to_thread(readings.cpu_capacity)
+    memory, cpus, levers = await asyncio.gather(
+        asyncio.to_thread(readings.read_memory),
+        asyncio.to_thread(readings.cpu_capacity),
+        asyncio.to_thread(load_levers),
     )
     if memory is None:
         raise GraphUnavailableError("could not read worker memory capacity")
 
     ram = memory.total // 20
-    cpu_percent = min(100, int(50 * cpus))
+    # Reserve one fifth of the configured CPU budget for other work.
+    # hostmetrics still makes the final decision using live CPU usage.
+    cpu_percent = int(min(100, 50 * cpus, 0.8 * levers.threshold_pct * cpus))
     if cpu_percent < 1:
         raise GraphUnavailableError("CPU capacity is below the minimum enforceable worker quota")
     launch = asyncio.create_task(asyncio.create_subprocess_exec(
