@@ -275,10 +275,12 @@ async def test_keepalive_refreshes_a_quiet_draft(monkeypatch):
     monkeypatch.setattr(_progress, "SNAPSHOT_AFTER_S", 3600)
     monkeypatch.setattr(_progress, "KEEPALIVE_S", 0.01)
     streamer, bot = _streamer(prefix="")
+    clock = Clock()
+    streamer._now = clock
     await streamer.on_thinking()
     bot.send_message_draft.reset_mock()
     p, _, _, _ = make(streamer)
-    streamer._last_send_time -= 100  # the draft has been quiet 100 s
+    clock.t += 100  # the draft has been quiet 100 s, however late the loop wakes
     p.start()
     try:
         await asyncio.sleep(0.05)
@@ -293,7 +295,7 @@ async def test_keepalive_refreshes_a_quiet_draft(monkeypatch):
 @pytest.mark.asyncio
 async def test_any_event_clears_the_waiting_line():
     streamer, bot = _streamer(prefix="")
-    await streamer.keepalive(40)
+    await streamer.keepalive()
     await streamer.on_text("Now writing.")
     assert "still working" not in streamer._compose_draft()
 
@@ -883,3 +885,181 @@ async def test_events_the_draft_does_not_show_do_not_hold_off_its_keepalive(monk
     finally:
         p.finish()
     assert bot.send_message_draft.await_count > 0
+
+
+@pytest.mark.asyncio
+async def test_back_to_back_keepalives_both_reach_telegram():
+    """A quiet stretch gets one refresh per interval, each sent: the waiting line
+    counts from the last content change, so it grows, and the send is forced past
+    the content dedup. A refresh the dedup swallowed left the draft to expire at
+    its ~30 s lifetime (#4864 review)."""
+    streamer, bot = _streamer(prefix="")
+    clock = Clock()
+    streamer._now = clock
+    await streamer.on_thinking()
+    for _ in range(2):
+        clock.t += _progress.KEEPALIVE_S
+        await streamer.keepalive()
+    texts = [c.kwargs["text"] for c in bot.send_message_draft.await_args_list]
+    assert len(texts) == 3
+    assert "still working (15 s)" in texts[1] and "still working (30 s)" in texts[2]
+
+
+class _Done(Exception):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_the_keepalive_refreshes_within_one_interval_of_the_last_send(monkeypatch):
+    """The keepalive sleeps to the refresh deadline, not a fixed tick: a text sent
+    just after a tick no longer stretches the gap toward the draft's lifetime."""
+    streamer, bot = _streamer(prefix="")
+    clock = Clock()
+    streamer._now = clock
+    p, _, _, _ = make(streamer)
+    real_sleep = asyncio.sleep
+    sends: list[float] = []
+    bot.send_message_draft.side_effect = lambda **_: sends.append(clock.t)
+
+    async def fake_sleep(seconds):
+        start = clock.t
+        clock.t += seconds
+        if start < 1022 <= clock.t:  # a text lands 7 s into the second interval
+            clock.t, rest = 1022.0, clock.t - 1022
+            await streamer.on_text("New text.")
+            clock.t += rest
+        if clock.t > 1100:
+            raise _Done
+        await real_sleep(0)
+
+    await streamer.on_thinking()  # the first draft, at t=1000
+    monkeypatch.setattr(_progress.asyncio, "sleep", fake_sleep)
+    with pytest.raises(_Done):
+        await p._keepalive()
+    gaps = [b - a for a, b in zip(sends, sends[1:], strict=False)]
+    assert 1022.0 in sends
+    assert max(gaps) <= _progress.KEEPALIVE_S
+
+
+@pytest.mark.asyncio
+async def test_the_draft_is_redrawn_right_after_a_progress_message():
+    """A real message ends the live draft. The tool call that sent progress must
+    put the draft back at once, not wait out the throttle and leave it blank."""
+    streamer, bot = _streamer(prefix="")
+    p, sent, _, _ = make(streamer)
+    await streamer.on_text(LONG)
+    await p.on_event("text", LONG)
+    bot.send_message_draft.reset_mock()
+    await p.on_event("tool_use", None)  # the handler feeds progress first
+    await streamer.on_tool_use("Read", "notes.md")
+    assert sent == [LONG]
+    assert bot.send_message_draft.await_count == 1
+    assert "Read" in bot.send_message_draft.await_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_stop_between_parts_sends_no_more_progress():
+    """/stop during a long progress message: no later part goes out."""
+    sent: list[str] = []
+    interrupt = asyncio.Event()
+
+    async def deliver(text: str) -> None:
+        sent.append(text)
+        interrupt.set()  # the user stops the turn while the first part is out
+
+    p = TurnProgress(deliver, None, interrupt, clock=Clock())
+    await p.on_event("text", _long_segment())
+    await p.on_event("tool_use", None)
+    assert len(sent) == 1
+    assert p.delivered == ""
+
+
+@pytest.mark.asyncio
+async def test_a_keepalive_is_sent_even_when_its_text_is_unchanged():
+    """The refresh exists to reach Telegram, so the content dedup never swallows
+    it, even when nothing on the draft changed since the last send."""
+    streamer, bot = _streamer(prefix="")
+    clock = Clock()
+    streamer._now = clock
+    await streamer.on_thinking()
+    clock.t += _progress.KEEPALIVE_S
+    await streamer.keepalive()
+    await streamer.keepalive()  # same clock, same text
+    texts = [c.kwargs["text"] for c in bot.send_message_draft.await_args_list]
+    assert len(texts) == 3 and texts[1] == texts[2]
+
+
+@pytest.mark.asyncio
+async def test_draft_sends_go_one_at_a_time_and_none_after_a_disable():
+    """A keepalive and a text update in flight together could land out of order;
+    one waits for the other. A send still waiting when the streamer is disabled
+    (a halt) does not go out."""
+    streamer, bot = _streamer(prefix="")
+    release = asyncio.Event()
+    started: list[str] = []
+
+    async def slow_send(**kwargs):
+        started.append(kwargs["text"])
+        await release.wait()
+
+    bot.send_message_draft.side_effect = slow_send
+    first = asyncio.create_task(streamer.on_text("First."))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(streamer.keepalive())
+    await asyncio.sleep(0)
+    assert started == ["First."]  # the keepalive waits for the first send
+    streamer.disable()
+    release.set()
+    await asyncio.gather(first, second)
+    assert started == ["First."]
+
+
+@pytest.mark.asyncio
+async def test_a_keepalive_that_waited_on_a_send_does_not_follow_it():
+    """A keepalive that woke while a text update was in flight decides under the
+    lock: once that send lands the draft is fresh, so no stale "still working"
+    line follows the new text."""
+    streamer, bot = _streamer(prefix="")
+    clock = Clock()
+    streamer._now = clock
+    await streamer.on_thinking()  # the draft, sent at t=1000
+    clock.t += 20  # quiet long enough for a refresh
+    release = asyncio.Event()
+    texts: list[str] = []
+
+    async def slow_send(**kwargs):
+        texts.append(kwargs["text"])
+        await release.wait()
+
+    bot.send_message_draft.side_effect = slow_send
+    update = asyncio.create_task(streamer.on_text("Fresh answer text."))
+    await asyncio.sleep(0)
+    refresh = asyncio.create_task(streamer.keepalive(after_s=_progress.KEEPALIVE_S))
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(update, refresh)
+    assert texts == ["Fresh answer text."]
+
+
+@pytest.mark.asyncio
+async def test_the_draft_is_redrawn_right_after_a_status_snapshot(monkeypatch):
+    """The snapshot is a real message, which ends the live draft: the next update
+    goes out at once rather than waiting out the throttle."""
+    monkeypatch.setattr(_progress, "SNAPSHOT_AFTER_S", 0.01)
+    monkeypatch.setattr(_progress, "KEEPALIVE_S", 3600)
+    streamer, bot = _streamer(prefix="")
+    p, sent, _, _ = make(streamer)
+    await streamer.on_tool_use("Read", "notes.md")
+    p.start()
+    try:
+        await p.on_event("init", None)
+        for _ in range(100):
+            if sent:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        p.finish()
+    assert sent and "Read" in sent[0]
+    bot.send_message_draft.reset_mock()
+    await streamer.on_text("Now writing.")
+    assert bot.send_message_draft.await_count == 1

@@ -245,11 +245,15 @@ class TurnProgress:
         # parts already sent; that rare repeat is accepted (owner, 2026-11-22) over
         # tracking how much of a split text was delivered.
         for part in parts:
+            if self._interrupt.is_set():
+                return  # /stop: nothing more goes out, and what is held stays held
             try:
                 await self._deliver(part)
             except Exception:
                 log.warning("Progress message failed to send", exc_info=True)
                 return
+            finally:
+                self._message_sent()
             self._any_delivered = True  # on screen, so no status snapshot after it
         self._held = []
         self._upto = len(self._seen)  # a tool call just ended the segment
@@ -271,10 +275,20 @@ class TurnProgress:
                 await self._deliver(body)
             except Exception:
                 log.debug("Status snapshot send failed", exc_info=True)
+            finally:
+                self._message_sent()
+
+    def _message_sent(self) -> None:
+        # A real message (even one whose send raised: it may have arrived) ends
+        # the live draft, so the streamer's next update redraws it at once.
+        if self._streamer is not None:
+            self._streamer.message_sent()
 
     async def _keepalive(self) -> None:
+        wait = KEEPALIVE_S
         while True:
-            await asyncio.sleep(KEEPALIVE_S)
+            await asyncio.sleep(wait)
+            wait = KEEPALIVE_S
             streamer = self._streamer
             if streamer is None or not streamer.enabled:
                 continue
@@ -282,7 +296,11 @@ class TurnProgress:
                 continue
             # Quiet is measured on the draft itself, not on the stream: events the
             # draft does not show (a subagent's, a tool result, a throttled update)
-            # leave it to expire all the same.
+            # leave it to expire all the same. Sleep to the refresh deadline rather
+            # than a fixed tick, so a send just after a tick cannot stretch the gap
+            # toward the draft's lifetime.
             quiet = streamer.quiet_s()
             if quiet >= KEEPALIVE_S:
-                await streamer.keepalive(quiet)
+                await streamer.keepalive(after_s=KEEPALIVE_S)
+            elif quiet > 0:
+                wait = KEEPALIVE_S - quiet
