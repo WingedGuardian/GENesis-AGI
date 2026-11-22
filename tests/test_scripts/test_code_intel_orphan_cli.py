@@ -227,6 +227,12 @@ def test_explicit_orphan_reconciliation_is_captured_and_never_an_automatic_retry
         assert readback.pop("evidence_pending") is False  # Read-only wrapper adds this advisory.
         if not sweep:
             assert readback == observed
+    elif route == "stale-source" and sweep:
+        # The automatic sweep defers on changed source so the tick goes on;
+        # the explicit path still refuses (below).
+        assert result.returncode == 0, result.stderr.decode()
+        assert b"owner-loss reconciliation deferred" in result.stderr
+        assert queue.database_path().read_bytes() == before
     else:
         assert result.returncode != 0
         assert (
@@ -297,3 +303,25 @@ def test_orphan_cli_refusal_never_initializes_an_unsupported_schema(tmp_path, mo
         p.name: (p.stat().st_dev, p.stat().st_ino, p.stat().st_mode, p.stat().st_mtime_ns, p.read_bytes())
         for p in queue.marker_dir().iterdir()
     } == files_before
+
+
+def test_source_change_during_the_sweep_defers_the_rest(tmp_path, monkeypatch, capsys):
+    """A pull that lands while the sweep runs: what already reconciled stays
+    reconciled, the rest waits for the next tick, and the sweep exits as a
+    deferral rather than stopping the tick (#4979 review)."""
+    _, _, snapshot, modules, claimed = setup(tmp_path, monkeypatch, "runner")
+    queue = modules["queue"]
+    second_repo = tmp_path / "second-orphan-repo"
+    (second_repo / ".git").mkdir(parents=True)
+    queue.write_marker(str(second_repo), "gitnexus", "fast")
+    second = queue.claim_native(queue.marker_hash(str(second_repo)), provider="gitnexus")
+    reserve_dead_owner(queue, modules["proof"], second)
+    supervisor = modules["supervisor"].Supervisor(snapshot, modules, lambda: None)
+    # The subprocess tests exercise fd9; here pytest may already own it.
+    monkeypatch.setattr(modules["owner_admission"], "repository_lock", lambda *_: nullcontext())
+    answers = iter([True, True])  # the sweep's own check, then the first execution's
+    monkeypatch.setattr(type(snapshot), "current_matches", lambda _self: next(answers, False))
+    assert supervisor.reconcile_orphans() is False
+    assert "owner-loss reconciliation deferred" in capsys.readouterr().err
+    assert queue.execution_status(claimed["context"])["control_closure"]["data"]["state"] == "orphaned"
+    assert queue.execution_status(second["context"])["control_closure"] is None

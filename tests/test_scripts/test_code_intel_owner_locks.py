@@ -84,3 +84,27 @@ def test_nonregular_lock_leaf_is_refused_without_fallback(tmp_path, kind):
     assert child.returncode == 75 and not child.stdout and b'LOCK_REFUSED:' in child.stderr
     if kind == 'symlink':
         assert target.read_text() == 'retained' and path.is_symlink()
+
+
+@pytest.mark.parametrize("case", ["missing", "file", "unsearchable"])
+def test_git_lookup_tells_relocation_from_a_permission_fault(tmp_path, case):
+    """Only a missing .git or a non-directory is a relocation, which the sweep
+    holds. A permission fault on the lookup still stops it. The child emulates
+    Python 3.14, where Path.is_dir() returns False for any OSError (#4979 review)."""
+    command, env, _ = prepared(tmp_path)
+    repo = tmp_path / "repo with 'quotes' 雪"
+    program = command.index(CHILD)
+    command[program] = "import os.path,pathlib;pathlib.Path.is_dir=lambda self:os.path.isdir(self)\n" + CHILD
+    if case == "missing":
+        (repo / '.git').rmdir()
+    elif case == "file":
+        (repo / '.git').rmdir()
+        (repo / '.git').write_text('gitdir: elsewhere\n')
+    else:
+        repo.chmod(0o600)  # no search permission: stat on repo/.git fails with EACCES
+    try:
+        child = subprocess.run(command, env=env, input=b'x', capture_output=True, timeout=30)
+    finally:
+        repo.chmod(0o700)
+    expected = b'PermissionError' if case == "unsearchable" else b'RepositoryRelocated'
+    assert child.returncode == 75 and b'LOCK_REFUSED:' + expected in child.stderr, child.stderr

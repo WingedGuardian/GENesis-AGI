@@ -14,6 +14,13 @@ class OrphanHeld(ValueError):
     """The original lifetime cannot yet be closed."""
 
 
+class SourceChanged(ValueError):
+    """The runner source changed on disk since this run captured it."""
+
+
+_SOURCE_DEFERRED = "owner-loss reconciliation deferred: runner source changed since capture"
+
+
 class Supervisor:
     """Explicit queue operations bound to the actual captured runner source."""
 
@@ -22,13 +29,11 @@ class Supervisor:
 
     def _guard(self):
         snapshot = self.snapshot
-        if (
-            snapshot.profile != "runner"
-            or snapshot.runtime_value is not None
-            or not snapshot.current_matches()
-        ):
+        if snapshot.profile != "runner" or snapshot.runtime_value is not None:
             raise ValueError("captured supervised reconciliation requires current runner source")
         self.lock_check()  # Existing canonical fd8 identity and actual lock.
+        if not snapshot.current_matches():
+            raise SourceChanged("captured supervised reconciliation requires current runner source")
 
     def _observe_schema5(self, observe):
         queue = self.modules["queue"]
@@ -282,7 +287,15 @@ class Supervisor:
         return result  # Commit and receipt durability precede acknowledgement.
 
     def reconcile_orphans(self):
-        self._guard()
+        # Source that changed on disk since this tick captured it (a pull or an
+        # update), before or during the sweep, defers the sweep with nothing
+        # further changed and lets the tick go on; the next tick captures fresh
+        # source and sweeps. Explicit reconciliation still refuses, through _guard.
+        try:
+            self._guard()
+        except SourceChanged:
+            print(_SOURCE_DEFERRED, file=sys.stderr)
+            return False
         modules = self.modules
         queue, scope = modules["queue"], modules["scope"]
         contexts = self._observe_schema5(lambda db: [
@@ -304,6 +317,9 @@ class Supervisor:
         for context in contexts:
             try:
                 self.reconcile_context(context, automatic_boot=boot)
+            except SourceChanged:
+                print(_SOURCE_DEFERRED, file=sys.stderr)
+                break
             except (
                 OrphanHeld,
                 scope.OwnerObservationUnavailable,

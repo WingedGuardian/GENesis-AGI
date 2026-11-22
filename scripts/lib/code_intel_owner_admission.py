@@ -50,7 +50,17 @@ def repository_lock_for(modules, repo_path, h):
         raise RepositoryMissing("original repository is missing") from error
     # Relocation first: the hash is of the resolved path, so a moved checkout
     # behind a symlink would otherwise read as a wrong hash.
-    if str(repo) != repo_path or not (repo / '.git').is_dir():
+    if str(repo) != repo_path:
+        raise RepositoryRelocated('typed owner requires a physical repository checkout')
+    # An explicit stat, not Path.is_dir(): on Python 3.14 is_dir() returns False
+    # for any OSError, which would read a permission fault as a relocation.
+    try:
+        git = (repo / '.git').stat()
+    except OSError as error:
+        if error.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+            raise
+        git = None
+    if git is None or not stat.S_ISDIR(git.st_mode):
         raise RepositoryRelocated('typed owner requires a physical repository checkout')
     if h != queue.marker_hash(repo_path):
         raise ValueError('typed owner requires a physical repository checkout')
