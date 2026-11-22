@@ -349,7 +349,8 @@ async def test_saved_verdict_replays_both_storage_paths(tmp_path, target):
         mapping = contracts.candidate_mapping(case, messages, rendered["candidate_ids"])
         content = json.dumps({"redundant_with": mapping.index(target) + 1 if target else None})
         result = await replay(
-            case, messages, mapping, content, sandbox, "openrouter-mimo", "xiaomi/mimo-v2.6-pro"
+            case, messages, mapping, content, sandbox, "openrouter-mimo", "xiaomi/mimo-v2.6-pro",
+            served_model="xiaomi/mimo-v2.6-pro",
         )
     assert set(result) == {
         "current_judge",
@@ -388,6 +389,7 @@ async def test_independent_storage_gates_are_reported_without_model_error(tmp_pa
             sandbox,
             "openrouter-mimo",
             "xiaomi/mimo-v2.6-pro",
+            served_model="xiaomi/mimo-v2.6-pro",
         )
     assert result["current_judge"]["stored"]
     if "principle" in extra:
