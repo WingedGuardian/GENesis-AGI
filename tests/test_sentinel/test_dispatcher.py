@@ -1507,6 +1507,83 @@ class TestAlarmClearedHysteresis:
         assert ready is False and "cooldown" in reason
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("error", [None, OSError("approval database unavailable")])
+    async def test_cancel_refusal_leaves_the_original_park(self, error):
+        d, gate = self._parked()
+        gate.resolve_request.return_value = False
+        gate.resolve_request.side_effect = error
+
+        await self._ticks(d, [False, False])
+
+        assert d._state.state == SentinelState.AWAITING_DISPATCH_APPROVAL
+        assert d._state.pending_request_id == "req-park-1"
+        assert self._ALARM not in d._resolved_cooldowns
+
+    @pytest.mark.asyncio
+    async def test_alarm_clear_does_not_overwrite_a_replacement_park(self):
+        d, gate = self._parked()
+
+        async def cancel_original(*args, **kwargs):
+            async with d._lock:
+                d._state.pending_request_id = "new-action"
+                d._state.transition(SentinelState.AWAITING_ACTION_APPROVAL, reason="concurrent resume")
+            return True
+
+        gate.resolve_request.side_effect = cancel_original
+        await self._ticks(d, [False, False])
+
+        assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+        assert d._state.pending_request_id == "new-action"
+        assert self._ALARM not in d._resolved_cooldowns
+
+    @pytest.mark.asyncio
+    async def test_gate_unavailable_preserves_request_row(self):
+        d, _ = self._parked()
+        d._approval_gate = None
+
+        await self._ticks(d, [False, False])
+
+        assert d._state.pending_request_id == "req-park-1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owner_approved", [False, True])
+    async def test_alarm_clear_through_real_approval_store(self, db, owner_approved):
+        from genesis.autonomy.approval import ApprovalManager
+        from genesis.autonomy.approval_gate import AutonomousCliApprovalGate
+
+        manager = ApprovalManager(db=db)
+        request_id = await manager.request_approval(
+            action_type="sentinel_dispatch", action_class="costly_reversible",
+            description="approval fixture",
+        )
+        d, _ = self._parked(request_id=request_id)
+        d._approval_gate = AutonomousCliApprovalGate(runtime=MagicMock(_db=db), approval_manager=manager)
+        if owner_approved:
+            assert await manager.resolve(request_id, status="approved")
+
+        await self._ticks(d, [False, False])
+
+        row = await d._approval_gate.get_request(request_id)
+        if owner_approved:
+            assert row["status"] == "approved"
+            assert d._state.pending_request_id == request_id
+            assert self._ALARM not in d._resolved_cooldowns
+        else:
+            assert row["status"] == "cancelled"
+            assert row["resolved_by"] == "alarm_cleared"
+            assert d._state.state == SentinelState.HEALTHY
+            assert self._ALARM in d._resolved_cooldowns
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("resolver", ["alarm_cleared", "superseded"])
+    async def test_convergence_preserves_alarm_cancellation_cooldown(self, resolver):
+        d, gate = self._parked()
+        gate.get_request = AsyncMock(return_value={"status": "cancelled", "resolved_by": resolver})
+        await d.converge_pending_approval()
+        assert d._state.state == SentinelState.HEALTHY
+        assert self._ALARM in d._resolved_cooldowns
+
+    @pytest.mark.asyncio
     async def test_absent_ticks_must_be_consecutive(self):
         """absent, present, absent: the reappearance resets the count."""
         d, gate = self._parked()

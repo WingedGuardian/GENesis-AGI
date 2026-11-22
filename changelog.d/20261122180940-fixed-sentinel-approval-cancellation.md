@@ -1,0 +1,1 @@
+- Preserve pending Sentinel requests when an alarm clears at the same time as an approval decision. A cancellation applies only to the request it matched.

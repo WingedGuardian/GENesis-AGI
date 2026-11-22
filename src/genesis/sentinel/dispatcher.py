@@ -1453,16 +1453,18 @@ class SentinelDispatcher:
         await self.handle_approval_resolution(
             pending_id,
             status if status in ("rejected", "cancelled", "expired") else "missing",
+            resolved_by=row.get("resolved_by") if row else None,
         )
 
     async def handle_approval_resolution(
-        self, request_id: str, status: str,
+        self, request_id: str, status: str, *, resolved_by: str | None = None,
     ) -> SentinelResult | None:
         """Converge a parked dispatch on its approval row's observed status.
 
         Called by the awareness loop (state-keyed convergence) or the
         alarm-clearing cancellation. ``rejected`` suppresses the pattern for
-        24h; ``cancelled``/``expired``/``missing`` just clear the park. All
+        24h. Cancelled, expired and missing rows clear the park. A cancellation
+        caused by alarm clearance or supersession also applies its cooldown. All
         paths return to HEALTHY — a resolved (or vanished) approval must
         never leave the Sentinel parked: a rejected-but-still-active alarm
         wedged it for 26 days (2026-06-08 → 2026-07-04) because rejections
@@ -1492,6 +1494,13 @@ class SentinelDispatcher:
                 return SentinelResult(dispatched=False, reason=f"{policy_id} rejected")
 
             if status in ("cancelled", "expired", "missing"):
+                if (
+                    status == "cancelled"
+                    and resolved_by in ("alarm_cleared", "superseded")
+                    and pattern
+                    and not pattern.startswith("direct:")
+                ):
+                    self._resolved_cooldowns[pattern] = time.monotonic()
                 self._state.clear_pending()
                 self._state.transition(
                     SentinelState.HEALTHY,
@@ -2188,6 +2197,8 @@ class SentinelDispatcher:
             # existing behaviour unchanged (cancel on the first tick, no cooldown).
             alarm_backed = bool(pending_ids) and not pattern.startswith("direct:")
 
+            parked_state = self._state.state
+            parked_at = self._state.entered_at
             request_id = self._state.pending_request_id
             # An unknown reading is not an absence: it must reach the branch
             # below, where a stronger alarm can still take the park over.
@@ -2212,26 +2223,42 @@ class SentinelDispatcher:
                     pending_ids, _ALARM_CLEAR_TICKS, request_id,
                 )
             elif absent:
-                if request_id and self._approval_gate is not None:
+                if request_id:
+                    if self._approval_gate is None:
+                        return None
                     try:
-                        await self._approval_gate.resolve_request(
+                        cancelled = await self._approval_gate.resolve_request(
                             request_id, decision="cancelled", resolved_by="alarm_cleared",
                         )
                     except Exception:
                         logger.warning("Failed to cancel sentinel approval %s", request_id, exc_info=True)
-                logger.info("Pending alarms %s cleared — cancelling sentinel approval %s", pending_ids, request_id)
+                        return None
+                    if not cancelled:
+                        # The decision may already be recorded. Let approval
+                        # convergence act on the row's actual disposition.
+                        return None
+                if self._lock.locked():
+                    return None
                 # Same re-dispatch cooldown as a resolved dispatch (_backoff_ready
                 # reads it), counted from the CANCEL. The per-pattern backoff is
                 # counted from the attempt, so a park that waited longer than the
                 # next backoff step had no spacing left at all: the alarm's next
                 # rise re-requested approval as soon as the 2-of-3 debounce
                 # confirmed it.
-                if alarm_backed and pattern:
-                    self._resolved_cooldowns[pattern] = time.monotonic()
                 async with self._lock:
+                    if (
+                        self._state.pending_request_id != request_id
+                        or self._state.state != parked_state
+                        or self._state.pending_pattern != pattern
+                        or self._state.entered_at != parked_at
+                    ):
+                        return None
+                    if alarm_backed and pattern:
+                        self._resolved_cooldowns[pattern] = time.monotonic()
                     self._state.clear_pending()
                     self._state.transition(SentinelState.HEALTHY, reason="pending alarms cleared while awaiting approval")
                     save_state(self._state)
+                logger.info("Pending alarms %s cleared — cancelled sentinel approval %s", pending_ids, request_id)
                 await self._emit_event(
                     "INFO", "sentinel.approval_cleared",
                     f"Pending alarms {sorted(pending_ids)} cleared while "
@@ -2303,22 +2330,30 @@ class SentinelDispatcher:
                     # The warning-level pattern waits the resolved-dispatch
                     # cooldown before it may ask again, so a take-over cannot
                     # turn into a cancel-and-re-ask loop.
-                    if alarm_backed and pattern:
-                        self._resolved_cooldowns[pattern] = time.monotonic()
-                    logger.info(
-                        "Alarms %s supersede the warning-only park %s (%s) — cancelling it",
-                        sorted(challengers), request_id, sorted(pending_ids),
-                    )
+                    if self._lock.locked():
+                        return None
                     async with self._lock:
                         # Clear only the park that was cancelled: another path
                         # may have resolved it while the cancel was awaited.
-                        if self._state.pending_request_id == request_id:
-                            self._state.clear_pending()
-                            self._state.transition(
-                                SentinelState.HEALTHY,
-                                reason=f"warning-only park superseded by {sorted(challengers)}",
-                            )
-                            save_state(self._state)
+                        if (
+                            self._state.pending_request_id != request_id
+                            or self._state.state != parked_state
+                            or self._state.pending_pattern != pattern
+                            or self._state.entered_at != parked_at
+                        ):
+                            return None
+                        if alarm_backed and pattern:
+                            self._resolved_cooldowns[pattern] = time.monotonic()
+                        self._state.clear_pending()
+                        self._state.transition(
+                            SentinelState.HEALTHY,
+                            reason=f"warning-only park superseded by {sorted(challengers)}",
+                        )
+                        save_state(self._state)
+                    logger.info(
+                        "Alarms %s supersede the warning-only park %s (%s) — cancelled",
+                        sorted(challengers), request_id, sorted(pending_ids),
+                    )
                     await self._emit_event(
                         "INFO", "sentinel.approval_superseded",
                         f"Pending warning-only approval for {sorted(pending_ids)} cancelled: "

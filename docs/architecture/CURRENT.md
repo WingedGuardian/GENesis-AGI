@@ -2699,7 +2699,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 0aa0bf9f2 2026-11-10
+verified: 273642a5e 2026-11-22
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -3043,7 +3043,10 @@ verified: 0aa0bf9f2 2026-11-10
   alarms are all WARNING, but only when the alarm dispatch would lead with is
   that challenger and passes backoff; a park with any CRITICAL trigger is never
   taken over, and a cancel that fails keeps the park. The cancelled pattern
-  starts the 15-minute resolved cooldown. A declined dispatch or action is
+  starts the 15-minute resolved cooldown. Alarm clearance likewise preserves
+  the park when cancellation refuses or fails. Both paths verify the same
+  park under the state lock before clearing state or starting its cooldown,
+  so a late cancellation cannot overwrite a newer approval. A declined dispatch or action is
   quiet for 24 h through `handle_approval_resolution` (every pattern).
 - **sentinel/process_stop.py** (`python -m genesis.sentinel.process_stop`):
   the Failure Inventory remedy for ONE runaway process. Dry-run by default;
