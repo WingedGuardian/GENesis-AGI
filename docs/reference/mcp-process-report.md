@@ -79,7 +79,8 @@ The supervisor collects no samples while `codex_mcp_stop.mode` is off.
 The threshold alert and activation rule continue to run while inventory
 events record both a legacy threshold comparison and a shadow evidence verdict.
 The threshold comparison uses all managed processes in the sample. The shadow
-verdict uses the daemon verified through the control socket. An unavailable
+verdict uses the daemon verified through the control socket. Each event
+records the configured threshold used for both comparisons. An unavailable
 sample is recorded even when its daemon identity cannot be verified.
 Observe at least 48 hours of shadow results before considering an enforcement change.
 Include normal editor and terminal release, a threshold crossing, incomplete
@@ -92,7 +93,10 @@ process groups seen during expansion. Genesis waits at least 60 seconds after
 that return and confirms the surviving groups in two observations. Held
 memory must still meet the threshold after unloading. This
 comparison detects persistent growth associated with observed release cycles.
-An incomplete sample or a gap of more than two minutes breaks the comparison.
+An incomplete sample, an interrupted return, or a gap of more than two minutes
+breaks the streak. Groups already seen before expansion do not count as
+growth. A later baseline reading below the threshold takes precedence over
+an earlier higher confirmation.
 The sample can associate growth with a daemon's thread inventory. It cannot
 assign a process group to an individual conversation.
 

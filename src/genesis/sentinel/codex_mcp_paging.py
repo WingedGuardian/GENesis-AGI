@@ -25,6 +25,7 @@ class RetentionTracker:
     daemon: tuple[str, int, int] | None = None
     baseline_threads: frozenset[str] = frozenset()
     baseline_groups: frozenset[tuple[int, int]] = frozenset()
+    last_baseline_groups: frozenset[tuple[int, int]] = frozenset()
     confirmed_groups: frozenset[tuple[int, int]] = frozenset()
     expanded_groups: frozenset[tuple[int, int]] = frozenset()
     pending_groups: frozenset[tuple[int, int]] = frozenset()
@@ -48,7 +49,7 @@ class RetentionTracker:
         if sample.status != "complete" or sample.daemon is None:
             self.daemon = None
             self.baseline_threads = frozenset()
-            self.baseline_groups = self.confirmed_groups = frozenset()
+            self.baseline_groups = self.last_baseline_groups = self.confirmed_groups = frozenset()
             self.excursions = 0
             self._clear_excursion()
             self.complete = sample.status == "absent"
@@ -64,7 +65,7 @@ class RetentionTracker:
         ):
             self.daemon = sample.daemon
             self.baseline_threads = sample.threads
-            self.baseline_groups = self.confirmed_groups = sample.groups
+            self.baseline_groups = self.last_baseline_groups = self.confirmed_groups = sample.groups
             self.baseline_held_kib = sample.held_kib
             self.confirmed_held_kib = 0
             self.excursions = 0
@@ -75,12 +76,18 @@ class RetentionTracker:
 
         if sample.threads > self.baseline_threads:
             if self.returned_at is not None:
-                self.expanded_groups = frozenset()
-            self.expanded_groups |= sample.groups - self.confirmed_groups
+                # The previous return did not last long enough to qualify
+                # or establish a clean release. Start a new streak.
+                self._clear_excursion()
+                self.excursions = 0
+                self.confirmed_held_kib = 0
+            self.expanded_groups |= sample.groups - self.last_baseline_groups
             self.expanded = True
             self.returned_at = None
             self.pending_groups = frozenset()
             return
+        self.last_baseline_groups = sample.groups
+        self.confirmed_held_kib = min(self.confirmed_held_kib, sample.held_kib)
         if not self.expanded:
             return
         if self.returned_at is None:
@@ -124,6 +131,7 @@ def observe(sample: Inventory, threshold_mb: int | None) -> dict:
             threshold_crossed = None
     return {
         "eligibility": _tracker.eligibility(now, threshold_mb).value,
+        "threshold_mb": threshold_mb,
         "legacy_threshold_crossed": threshold_crossed,
         "completed_growth_cycles": _tracker.excursions,
         "baseline_groups": len(_tracker.baseline_groups),

@@ -52,6 +52,25 @@ def test_group_first_seen_after_release_is_not_retention_evidence():
     assert tracker.eligibility(240, THRESHOLD) == Eligibility.INELIGIBLE
 
 
+def test_group_already_visible_before_expansion_is_not_new_growth():
+    tracker = RetentionTracker()
+    tracker.observe(sample("a", (1,)), 0)
+    tracker.observe(sample("a", (1, 2)), 60)
+    perform_cycle(tracker, 120, (1, 2))
+    assert tracker.excursions == 0
+
+
+def test_interrupted_return_cannot_join_two_separate_growth_cycles():
+    tracker = RetentionTracker()
+    tracker.observe(sample("a", (1,)), 0)
+    perform_cycle(tracker, 60, (1, 2))
+    tracker.observe(sample("ab", (1, 2, 98)), 300)
+    tracker.observe(sample("a", (1, 2)), 360)
+    perform_cycle(tracker, 390, (1, 2, 3))
+    assert tracker.excursions == 1
+    assert tracker.eligibility(570, THRESHOLD) == Eligibility.INELIGIBLE
+
+
 def test_active_growth_cannot_raise_the_post_unload_reading():
     tracker = RetentionTracker()
     tracker.observe(sample("a", (1,), ram=2000), 0)
@@ -60,6 +79,17 @@ def test_active_growth_cannot_raise_the_post_unload_reading():
     tracker.observe(sample("ab", (1, 2, 3, 5), ram=5000), 540)
     assert tracker.excursions == 2
     assert tracker.eligibility(540, THRESHOLD) == Eligibility.INELIGIBLE
+
+
+def test_latest_baseline_low_memory_invalidates_an_older_high_reading():
+    tracker = RetentionTracker()
+    tracker.observe(sample("a", (1,)), 0)
+    perform_cycle(tracker, 60, (1, 2))
+    perform_cycle(tracker, 300, (1, 2, 3))
+    assert tracker.eligibility(480, THRESHOLD) == Eligibility.ELIGIBLE
+    tracker.observe(sample("a", (1, 2, 3), ram=2000), 540)
+    tracker.observe(sample("ab", (1, 2, 3, 4), ram=5000), 600)
+    assert tracker.eligibility(600, THRESHOLD) == Eligibility.INELIGIBLE
 
 
 def test_partial_observation_and_daemon_replacement():
@@ -92,6 +122,7 @@ async def test_inventory_emits_shadow_decision_from_real_tracker(monkeypatch):
     bus.emit.assert_awaited_once()
     assert bus.emit.call_args.kwargs["paging"] == {
         "eligibility": "ineligible",
+        "threshold_mb": THRESHOLD,
         "legacy_threshold_crossed": True,
         "completed_growth_cycles": 0,
         "baseline_groups": 1,
