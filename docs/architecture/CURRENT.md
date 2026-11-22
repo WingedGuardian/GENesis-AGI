@@ -338,6 +338,12 @@ change (#892). `_CapacityBreaker` aborts on consecutive provider exhaustion.
 `_cross_wing_scan` writes `memory_links` even under dry_run — intentional
 additive layer, not a leak.
 
+The scheduled weekly report distinguishes complete, partial and aborted runs.
+Only a complete run advances job health's last success. A failed phase or
+preflight records a bounded problem summary. A discovery exception continues
+through the scheduler's typed failure and reflex path. Worklist replacement
+still follows the existing weekly scan policy.
+
 **Importance shield (Phase 2c)** — `memory/dream_shield.py` +
 `memory/dream_shield_config.py` (config: `config/dream_shield.yaml` + local
 overlay; env kill-switch `GENESIS_DREAM_SHIELD_DISABLED`). Before enqueue, the

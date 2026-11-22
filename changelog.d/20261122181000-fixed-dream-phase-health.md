@@ -1,0 +1,1 @@
+- Show partial and aborted weekly dream-cycle runs in job health. The last successful run now reflects a cycle that completed every phase.

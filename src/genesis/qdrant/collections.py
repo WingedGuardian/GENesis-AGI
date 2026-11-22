@@ -11,9 +11,13 @@ Distance metric: Cosine
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
+
+if TYPE_CHECKING:
+    from collections import Counter
 
 logger = logging.getLogger(__name__)
 
@@ -304,11 +308,13 @@ def batch_retrieve_vectors(
     *,
     collection: str = "episodic_memory",
     batch_size: int = 100,
+    failures: Counter[str] | None = None,
 ) -> dict[str, list[float]]:
     """Batch-retrieve vectors for multiple points.
 
     Returns ``{point_id: vector}``. Missing points are silently omitted.
-    Batches in chunks of *batch_size* to avoid oversized requests.
+    Batches in chunks of *batch_size* to avoid oversized requests. The optional
+    counter distinguishes failed batches from successful reads with missing points.
     """
     vector_map: dict[str, list[float]] = {}
     for i in range(0, len(point_ids), batch_size):
@@ -321,7 +327,9 @@ def batch_retrieve_vectors(
             )
             for r in results:
                 vector_map[str(r.id)] = r.vector
-        except Exception:
+        except Exception as exc:
+            if failures is not None:
+                failures[f"retrieve/{type(exc).__name__}"] += 1
             logger.warning(
                 "Failed to retrieve vectors for batch %d-%d",
                 i,

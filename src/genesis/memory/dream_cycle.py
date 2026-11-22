@@ -37,9 +37,10 @@ import asyncio
 import json
 import logging
 import random
+import sqlite3
 import statistics
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -51,6 +52,7 @@ if TYPE_CHECKING:
     from genesis.routing.router import Router
 
 from genesis.memory.adversarial_review import SynthesisBlockedError
+from genesis.observability.failure_details import error_summary
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +227,7 @@ async def run(
 
     # Phase 2 — Cluster within each bucket (chunked for safety)
     all_clusters: list[list[dict]] = []
+    clustering_failures: Counter[str] = Counter()
     bucket_sizes: dict[str, int] = {}
     for (wing, room), points in buckets.items():
         bucket_sizes[f"{wing}/{room}"] = len(points)
@@ -249,11 +252,12 @@ async def run(
                 continue
             clusters = await _cluster_bucket(
                 qdrant, chunk, wing, room,
-                threshold=similarity_threshold,
+                threshold=similarity_threshold, failures=clustering_failures,
             )
             all_clusters.extend(clusters)
 
     report["bucket_sizes"] = bucket_sizes
+    report["clustering"] = {"failure_counts": dict(clustering_failures)}
 
     report["clusters_found"] = len(all_clusters)
     logger.info("Dream cycle %s: found %d clusters", run_id[:8], len(all_clusters))
@@ -267,18 +271,20 @@ async def run(
     # Finds memories that are similar across different wings. Creates links
     # but never merges or deprecates cross-wing. Runs in both dry_run and live.
     try:
-        cross_wing = await _cross_wing_scan(
+        cross_wing, errors = await _cross_wing_scan(
             qdrant=qdrant, db=db, buckets=buckets, run_id=run_id,
         )
         report["cross_wing_findings"] = cross_wing
+        report["cross_wing"] = {"failure_counts": errors}
         if cross_wing:
             logger.info(
                 "Dream cycle %s: %d cross-wing finding(s)",
                 run_id[:8], len(cross_wing),
             )
-    except Exception:
+    except Exception as exc:
         logger.warning("Cross-wing scan failed", exc_info=True)
         report["cross_wing_findings"] = []
+        report["errors"].append({"phase": "cross_wing", "error": error_summary(exc)})
 
     # Phase 2c — Importance shield. Remove high-salience members (percentile
     # activation / centrality, or a confidence floor) from clusters BEFORE they
@@ -373,7 +379,7 @@ async def run(
             **phase_kwargs, buckets=buckets,
         )
     except Exception as exc:
-        report["errors"].append({"phase": "entity_resolution", "error": str(exc)})
+        report["errors"].append({"phase": "entity_resolution", "error": error_summary(exc)})
         logger.warning("Dream phase entity_resolution failed: %s", exc, exc_info=True)
 
     # Phase 7 — Orphan detection
@@ -813,14 +819,14 @@ async def _cross_wing_scan(
     run_id: str,
     top_n_per_wing: int = 20,
     similarity_threshold: float = 0.90,
-) -> list[dict]:
+) -> tuple[list[dict], dict[str, int]]:
     """Scan for similar memories across different wings.
 
     Takes the top-N highest-confidence memories from each wing and searches
     for cross-wing matches via Qdrant similarity search. Creates links for
     findings but never merges or deprecates.
 
-    Returns a list of finding dicts for the report.
+    Returns the findings and item failure counts for the report.
     """
     from genesis.qdrant.collections import search as qdrant_search
 
@@ -831,7 +837,7 @@ async def _cross_wing_scan(
 
     wings = list(wing_points.keys())
     if len(wings) < 2:
-        return []
+        return [], {}
 
     # Take top-N per wing by confidence
     wing_top: dict[str, list[dict]] = {}
@@ -845,8 +851,9 @@ async def _cross_wing_scan(
 
     # Get vectors for top points
     all_top_ids = [p["id"] for pts in wing_top.values() for p in pts]
+    errors: Counter[str] = Counter()
     vectors = await asyncio.to_thread(
-        _batch_get_vectors, qdrant, all_top_ids,
+        _batch_get_vectors, qdrant, all_top_ids, failures=errors,
     )
 
     findings: list[dict] = []
@@ -869,7 +876,8 @@ async def _cross_wing_scan(
                         limit=5,
                         wing=wing_b,
                     )
-                except Exception:
+                except Exception as exc:
+                    errors[f"search/{type(exc).__name__}"] += 1
                     continue
 
                 for hit in hits:
@@ -906,11 +914,9 @@ async def _cross_wing_scan(
                                 created_at=datetime.now(UTC).isoformat(),
                             )
                             link_count += 1
-                    except Exception:
-                        logger.debug(
-                            "Cross-wing link creation failed",
-                            exc_info=True,
-                        )
+                    except Exception as exc:
+                        if getattr(exc, "sqlite_errorcode", None) != sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
+                            errors[f"link/{type(exc).__name__}"] += 1
 
                     findings.append({
                         "wing_a": wing_a,
@@ -930,7 +936,7 @@ async def _cross_wing_scan(
         except Exception:
             pass
 
-    return findings
+    return findings, dict(errors)
 
 
 
@@ -944,6 +950,7 @@ def _cluster_bucket_sync(
     room: str,
     *,
     threshold: float,
+    failures: Counter[str] | None = None,
 ) -> list[list[dict]]:
     """Find connected components of similar memories within a (wing, room) bucket.
 
@@ -960,7 +967,7 @@ def _cluster_bucket_sync(
 
     # Batch-retrieve all vectors for this bucket in one call
     # (avoids N sync blocking calls to Qdrant)
-    vector_map = _batch_get_vectors(qdrant, [p["id"] for p in points])
+    vector_map = _batch_get_vectors(qdrant, [p["id"] for p in points], failures=failures)
 
     # Build similarity graph
     n_points = len(points)
@@ -978,7 +985,9 @@ def _cluster_bucket_sync(
                 wing=wing,
                 room=room,
             )
-        except Exception:
+        except Exception as exc:
+            if failures is not None:
+                failures[f"search/{type(exc).__name__}"] += 1
             logger.debug("Could not search neighbors for %s", pid)
             continue
 
@@ -1020,20 +1029,21 @@ async def _cluster_bucket(
     room: str,
     *,
     threshold: float,
+    failures: Counter[str] | None = None,
 ) -> list[list[dict]]:
     """Async wrapper — offloads blocking Qdrant search I/O to thread pool."""
     return await asyncio.to_thread(
-        _cluster_bucket_sync, qdrant, points, wing, room, threshold=threshold,
+        _cluster_bucket_sync, qdrant, points, wing, room, threshold=threshold, failures=failures,
     )
 
 
 def _batch_get_vectors(
-    qdrant: QdrantClient, point_ids: list[str],
+    qdrant: QdrantClient, point_ids: list[str], *, failures: Counter[str] | None = None,
 ) -> dict[str, list[float]]:
     """Batch-retrieve vectors — delegates to shared Qdrant utility."""
     from genesis.qdrant.collections import batch_retrieve_vectors
 
-    return batch_retrieve_vectors(qdrant, point_ids, collection=COLLECTION)
+    return batch_retrieve_vectors(qdrant, point_ids, collection=COLLECTION, failures=failures)
 
 
 def _get_vector(qdrant: QdrantClient, point_id: str) -> list[float]:

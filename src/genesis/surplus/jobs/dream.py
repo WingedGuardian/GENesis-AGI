@@ -14,8 +14,28 @@ from __future__ import annotations
 import contextlib
 import logging
 from datetime import UTC, datetime
+from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _weekly_outcome(report: dict[str, Any]) -> tuple[str, str]:
+    """Summarize phase errors without repeating item IDs or report payloads."""
+    if "aborted" in report:
+        return "aborted", str(report["aborted"])[:500]
+    failures = {entry["phase"]: "failed" for entry in report.get("errors", ())}
+    for phase in ("clustering", "cross_wing", "link_repair", "entity_resolution", "orphan_detection", "centrality"):
+        detail = report.get(phase, {})
+        if "error" in detail:
+            failures[phase] = "failed"
+        else:
+            item_failures = len(detail.get("errors", ())) + sum(detail.get("failure_counts", {}).values())
+            if item_failures:
+                failures[phase] = f"{item_failures} item error(s)"
+    if failures:
+        summary = ", ".join(f"{phase} ({reason})" for phase, reason in failures.items())
+        return "partial", summary[:500]
+    return "complete", ""
 
 
 async def run_dream_cycle() -> None:
@@ -55,13 +75,15 @@ async def run_dream_cycle() -> None:
         rt = GenesisRuntime.instance()
         store = rt.memory_store
         if rt.db is None or store is None or rt.router is None:
-            logger.warning("Dream cycle skipped — missing runtime dependencies")
+            logger.warning("Dream cycle aborted — missing runtime dependencies")
+            rt.record_job_failure("dream_cycle", error="aborted: missing runtime dependencies")
             return
 
         # MemoryStore always holds the QdrantClient it was constructed with.
         qdrant = store.qdrant_client
         if qdrant is None:
-            logger.warning("Dream cycle skipped — MemoryStore has no Qdrant client")
+            logger.warning("Dream cycle aborted — MemoryStore has no Qdrant client")
+            rt.record_job_failure("dream_cycle", error="aborted: missing Qdrant client")
             return
 
         # Signal heavy workload so Sentinel and watchdog defer restarts.
@@ -81,6 +103,8 @@ async def run_dream_cycle() -> None:
             store=store,
             dry_run=dry_run,
         )
+        outcome, detail = _weekly_outcome(report)
+        report["outcome"] = outcome
 
         # Write observation with the report
         try:
@@ -95,14 +119,14 @@ async def run_dream_cycle() -> None:
                 type="dream_cycle_report",
                 content=(
                     f"Dream cycle {'DRY RUN' if dry_run else 'LIVE'} "
-                    f"(weekly clustering): "
+                    f"(weekly clustering, {outcome}): "
                     f"{report.get('clusters_found', 0)} clusters found, "
                     f"{report.get('worklist_enqueued', 0)} enqueued for "
                     f"daily drain, "
                     f"{report.get('oversize_flagged', 0)} oversize flagged, "
                     f"{report.get('shield', {}).get('members_shielded', 0)} "
                     f"members shielded, "
-                    f"{len(report.get('errors', []))} errors"
+                    f"{detail or 'no phase failures'}"
                 ),
                 priority="low",
                 created_at=datetime.now(UTC).isoformat(),
@@ -110,9 +134,12 @@ async def run_dream_cycle() -> None:
         except Exception:
             pass
 
-        logger.info("Dream cycle complete: %s", report)
+        logger.info("Dream cycle %s: %s", outcome, report)
         with contextlib.suppress(Exception):
-            GenesisRuntime.instance().record_job_success("dream_cycle")
+            if outcome == "complete":
+                rt.record_job_success("dream_cycle")
+            else:
+                rt.record_job_failure("dream_cycle", error=f"{outcome}: {detail}")
     except Exception as exc:
         logger.exception("Dream cycle failed: %s", exc)
         try:

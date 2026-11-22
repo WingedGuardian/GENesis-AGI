@@ -102,6 +102,29 @@ async def test_strong_pair_still_auto_merges(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_unavailable_challenge_keeps_both_memories_and_records_audit(db, monkeypatch):
+    from genesis.qdrant import collections as qdrant_collections
+
+    a = _point("a", confidence=0.9, retrieved_count=0, created_at=NOW)
+    b = _point("b", confidence=0.9, retrieved_count=0, created_at=NOW)
+    monkeypatch.setattr("genesis.memory.entity_resolution.check_semantic_overlap", AsyncMock(
+        return_value={"relationship": "duplicate", "reasoning": "primary duplicate"},
+    ))
+    monkeypatch.setattr("genesis.memory.adversarial_review.check_entity_duplicate", AsyncMock(
+        return_value={"relationship": "distinct", "reasoning": "upstream unavailable", "error": "provider"},
+    ))
+
+    report = await _run(db, a, b, 0.94, monkeypatch)
+
+    assert report["errors"] == [{"error": "challenge/provider"}]
+    assert report.get("challenge_overrides", 0) == 0
+    qdrant_collections.update_payload.assert_not_called()
+    assert await _audit_rows(db) == [{
+        "action": "flagged", "llm_verdict": "challenge_unavailable", "survivor_id": None,
+    }]
+
+
+@pytest.mark.asyncio
 async def test_survivor_is_the_load_bearing_memory(db, monkeypatch):
     """On a strong merge, the more-retrieved memory survives even if older
     (the survivor fix) — instead of the prior newest-wins behavior."""

@@ -357,20 +357,20 @@ async def check_semantic_overlap(
         )
         if not result.success:
             logger.warning("Entity check LLM call failed: %s", result.error)
-            return {"relationship": "distinct", "reasoning": f"LLM error: {result.error}"}
+            return {"relationship": "distinct", "reasoning": f"LLM error: {result.error}", "error": "provider"}
 
         text = (result.content or "").strip()
         # Strip markdown fence if present
         if text.startswith("```"):
             text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         data = json.loads(text)
-        rel = data.get("relationship", "distinct")
+        rel = data.get("relationship")
         if rel not in ("duplicate", "contradicts", "distinct"):
-            rel = "distinct"
+            return {"relationship": "distinct", "reasoning": "invalid relationship", "error": "response"}
         return {"relationship": rel, "reasoning": data.get("reasoning", "")}
-    except (json.JSONDecodeError, Exception):
+    except Exception:
         logger.debug("Entity check parse/call error", exc_info=True)
-        return {"relationship": "distinct", "reasoning": "parse error — defaulting to distinct"}
+        return {"relationship": "distinct", "reasoning": "parse error — defaulting to distinct", "error": "check"}
 
 
 # ── Audit Logger ─────────────────────────────────────────────────────────
