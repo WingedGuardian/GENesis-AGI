@@ -117,3 +117,17 @@ def test_out_naming_the_database_is_refused(tmp_path, kind):
     before = db.read_bytes()
     assert _load().main(["--db", str(db), "--out", str(_alias(kind, db))]) == 1
     assert db.read_bytes() == before
+
+
+@pytest.mark.parametrize("sidecar", ["-wal", "-shm"])
+def test_a_sidecar_named_through_a_symlinked_database_is_refused(tmp_path, sidecar):
+    """SQLite puts the sidecars beside the file a symlinked --db points to, so
+    those are guarded too (#4872 review)."""
+    db = tmp_path / "real.db"
+    _fixture_db(db)
+    alias = tmp_path / "alias.db"
+    alias.symlink_to(db)
+    target = db.with_name(db.name + sidecar)
+    target.write_bytes(b"sidecar")
+    assert _load().main(["--db", str(alias), "--out", str(target)]) == 1
+    assert target.read_bytes() == b"sidecar"

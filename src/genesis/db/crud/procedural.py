@@ -79,8 +79,9 @@ def scrub_field(key: str, value, found: list[str]):
     field given as text is parsed first, so a cut can never break the document).
     A string the scrub cannot process is withheld on its own (siblings and shape
     survive, ``found`` names "withheld"); a field given as one such string is
-    withheld whole, as a JSON document for a JSON field. Raises only when scrubbed
-    keys collide. Shared by the writers below and the audit."""
+    withheld whole, as a JSON document for a JSON field. A procedure document's own
+    field names are kept, so a failure-mode list stays a list of dicts the promoter
+    can read when the scrub cannot run. Shared by the writers below and the audit."""
     parsed = json_field_document(key, value)
     if parsed is not None:
         return json.dumps(scrub_value(parsed, found), ensure_ascii=False)

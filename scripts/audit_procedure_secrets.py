@@ -111,8 +111,11 @@ def main(argv: list[str] | None = None) -> int:
         "--out", type=Path, default=Path.home() / ".genesis/output/procedure-secrets-audit.json"
     )
     args = parser.parse_args(argv)
-    # The database and its WAL sidecars: overwriting any of them corrupts it.
-    guarded = [args.db, *(args.db.with_name(args.db.name + s) for s in ("-wal", "-shm"))]
+    # The database and its WAL sidecars: overwriting any of them corrupts it. SQLite
+    # opens the sidecars beside the file a symlink points to, so they are derived
+    # from the resolved path as well as the name given.
+    names = {args.db, args.db.resolve()}
+    guarded = [*names, *(n.with_name(n.name + s) for n in names for s in ("-wal", "-shm"))]
     if any(
         args.out.resolve() == path.resolve()
         or (args.out.exists() and path.exists() and os.path.samefile(args.out, path))

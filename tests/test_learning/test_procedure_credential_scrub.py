@@ -275,3 +275,90 @@ async def test_one_oversized_failure_mode_is_withheld_alone(db):
     modes = json.loads((await procedural.get_by_id(db, "p1"))["failure_modes"])
     assert modes[0]["description"] == "timeout" and modes[0]["times_hit"] == 2
     assert modes[1]["description"] == procedural._WITHHELD and modes[1]["times_hit"] == 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'password "abc\\"remaining" then go',
+        "pwd `abc\\`remaining` then go",
+    ],
+)
+def test_an_escaped_quote_does_not_end_the_value(text):
+    """A backslash-escaped quote is part of the value, so the rest of it is
+    redacted too (#4872 review)."""
+    cleaned, _ = scrub_text(text)
+    assert "remaining" not in cleaned
+
+
+def test_many_options_before_a_missing_dash_p_stay_linear():
+    """The generic sshpass option arm is disjoint from -P/-f/-d/-o, so a long
+    run of options with no -p does not backtrack exponentially (#4872 review)."""
+    import time
+
+    # 21 options: seconds with overlapping arms (it doubles per option), about a
+    # millisecond without; small enough that a regression fails rather than hangs.
+    start = time.perf_counter()
+    scrub_text("sshpass " + "-Pabc " * 21 + "ssh host")
+    assert time.perf_counter() - start < 0.5
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'password "C:\\keys\\abc123xyz\\" then go',
+        'password "abc123xyz\\" then go',
+        "password 'abc123xyz\\' then go",
+    ],
+)
+def test_a_quoted_value_ending_in_a_backslash_is_still_redacted(text):
+    cleaned, _ = scrub_text(text)
+    assert "abc123xyz" not in cleaned and "then go" in cleaned
+
+
+def _shared_down(monkeypatch):
+    """A full outage: neither the text scrub nor the key policy can answer."""
+    from genesis.learning.procedural import credential_scrub
+
+    def boom(*_args):
+        raise credential_scrub.ScrubFailed("unavailable")
+
+    monkeypatch.setattr(credential_scrub, "_shared_scrub", boom)
+    monkeypatch.setattr(credential_scrub, "credential_key", boom)
+
+
+def test_a_failure_mode_keeps_its_shape_when_the_scrub_cannot_run(monkeypatch):
+    """A procedure document's own field names survive a full outage, and so do its
+    numbers, so failure_modes stays a list the promoter can read (#4872 review)."""
+    from genesis.learning.procedural.credential_scrub import WITHHELD
+    from genesis.learning.procedural.promoter import _check_demotion
+
+    _shared_down(monkeypatch)
+    found: list[str] = []
+    modes = scrub_value(
+        [{"description": "timeout", "conditions": "timeout", "times_hit": 2, "transient": False}],
+        found,
+    )
+    assert modes == [
+        {"description": WITHHELD, "conditions": WITHHELD, "times_hit": 2, "transient": False}
+    ]
+    assert "withheld" in found
+    row = {"failure_modes": json.dumps(modes), "failure_count": 5, "success_count": 0}
+    assert _check_demotion(row) is False  # reads the document; 2 hits is under the bar
+
+
+def test_an_unknown_key_is_withheld_when_the_scrub_cannot_run(monkeypatch):
+    """Only the documents' own field names are kept as they are: a token-shaped key
+    is not, and a value under an unknown key is redacted."""
+    _shared_down(monkeypatch)
+    token = "ghp_" + "abc123xyz" * 4
+    out = scrub_value({token: "value", "times_hit": 1}, [])
+    assert token not in json.dumps(out)
+    assert out == {"[withheld key 1]": "[redacted]", "times_hit": 1}
+
+
+def test_the_kept_field_names_include_every_lesson_key():
+    from genesis.learning.procedural.credential_scrub import _SCHEMA_KEYS
+    from genesis.learning.procedural.lesson_shape import _LESSON_KEYS
+
+    assert _LESSON_KEYS <= _SCHEMA_KEYS

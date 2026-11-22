@@ -49,7 +49,7 @@ _SSHPASS = re.compile(
     + _GAP
     + r"*"
     + _WORD
-    + r"|[^\sp]\S*))*"
+    + r"|[^\spPfdo]\S*))*"  # disjoint from [Pfdo], so no backtracking blow-up
     + _GAP
     + r"+-p"
     + _GAP
@@ -60,13 +60,27 @@ _SSHPASS = re.compile(
     r"(?:'[^'\n]*'?|\"(?:[^\"\\\n]|\\.)*\"?|[^\s'\"\\]|\\.)+"
 )
 _LABEL = r"\b(?:with\s+)?(?:password|passwd|pwd|passphrase)\b(?:\s+is|\s*[:=])?"
-# Quoted: any 3+ characters between matching quotes; each body stops only at its
-# own quote, so a value holding the other kind is redacted whole.
+# Quoted: any 3+ characters between matching quotes. Each body stops only at its
+# own quote (in double quotes and backticks, not one escaped with a backslash), so
+# a value holding the other kind or an escaped quote is redacted whole. The closing
+# quote is required: a prompt such as -P "Enter password:" ends in a quote that
+# opens nothing.
+
+
+def _quoted(quote: str) -> str:
+    """One quoted value. A backslash escapes the quote inside double quotes and
+    backticks, so that arm is tried first; the plain body follows, so a value
+    ending in a backslash (C:\\keys\\) is still caught. Single quotes have no
+    escapes in the shell, so their body is plain."""
+    plain = r"[^" + quote + r"\n]{3,}" + quote
+    if quote == "'":
+        return quote + _NOT_A_VALUE + plain
+    escaped = r"(?:[^" + quote + r"\\\n]|\\.){3,}" + quote
+    return quote + _NOT_A_VALUE + r"(?:" + escaped + "|" + plain + ")"
+
+
 _PASSWORD_QUOTED = re.compile(
-    r"(?i)(" + _LABEL + r"\s*)"
-    r"(?:'" + _NOT_A_VALUE + r"[^'\n]{3,}'"
-    r"|\"" + _NOT_A_VALUE + r"[^\"\n]{3,}\""
-    r"|`" + _NOT_A_VALUE + r"[^`\n]{3,}`)"
+    r"(?i)(" + _LABEL + r"\s*)(?:" + _quoted("'") + "|" + _quoted('"') + "|" + _quoted("`") + ")"
 )
 # Bare: 6+ characters with a digit or symbol (an identifier like reference_lookup is
 # not one), not a path or flag. A leading $ names a variable and is kept; a later $
@@ -132,14 +146,42 @@ def scrub_text(text: str) -> tuple[str, list[str]]:
     return shared, found
 
 
+# The field names procedure documents are written with: a failure mode
+# (operations.record_failure) and a lesson (lesson_shape._LESSON_KEYS, pinned by a
+# test). They name fields, never carry a value, so they are kept as they are and a
+# value under one is scrubbed as a value; that keeps a document's shape when the
+# shared scrubber cannot run (times_hit stays an int).
+_SCHEMA_KEYS = frozenset({
+    "description", "conditions", "times_hit", "transient",
+    "authored_via", "authored_in", "origin", "reviewed", "authored_at",
+})
+
+
+def _scrub_key(key: Any, found: list[str], index: int) -> Any:
+    """A dict key, scrubbed. A known field name (``_SCHEMA_KEYS``) is kept; when
+    the scrub cannot run, any other key is withheld by position."""
+    if not isinstance(key, str):
+        return scrub_value(key, found)
+    if key in _SCHEMA_KEYS:
+        return key
+    try:
+        result, names = scrub_text(key)
+    except ScrubFailed:
+        found.append("withheld")
+        return f"[withheld key {index + 1}]"
+    found += names
+    return result
+
+
 def scrub_value(value: Any, found: list[str]) -> Any:
     """Scrub every string inside ``value`` (str, list, tuple, dict); others pass.
 
     A dict member under a credential-named key (``password``, ``token``,
     ``api_key``: the shared structured policy) is always redacted; keys are
-    scrubbed too. A string the scrub cannot process becomes ``WITHHELD`` on its
-    own, so its siblings and the shape around it survive; ``found`` then names
-    "withheld". Scrubbed keys that collide raise ScrubFailed."""
+    scrubbed too (``_scrub_key``). A string the scrub cannot process becomes
+    ``WITHHELD`` on its own, so its siblings and the shape around it survive;
+    ``found`` then names "withheld". Keys that scrub to the same text are both kept,
+    the later one numbered."""
     if isinstance(value, str):
         try:
             result, names = scrub_text(value)
@@ -155,10 +197,15 @@ def scrub_value(value: Any, found: list[str]) -> Any:
     if isinstance(value, dict):
         out: dict = {}
         for k, v in value.items():
-            key = scrub_value(k, found)
-            if key in out:
-                raise ScrubFailed("scrubbed keys collide")
-            if isinstance(k, str) and v is not None and _credential_key_or_withhold(k, found):
+            key = _scrub_key(k, found, len(out))
+            while key in out:  # two keys scrubbed to the same text: keep both
+                key = f"{key} ({len(out) + 1})"
+            if (
+                isinstance(k, str)
+                and v is not None
+                and k not in _SCHEMA_KEYS
+                and _credential_key_or_withhold(k, found)
+            ):
                 out[key] = "[redacted]"
                 found.append("key")
             else:
