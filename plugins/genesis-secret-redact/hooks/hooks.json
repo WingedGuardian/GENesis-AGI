@@ -1,5 +1,5 @@
 {
-  "description": "genesis-secret-redact: the in-process mod that keeps secrets.env values out of a session, and the PreToolUse guard that refuses a gh command publishing one",
+  "description": "genesis-secret-redact: the in-process mod that keeps secrets.env values out of a session, the PreToolUse guard that refuses a gh command publishing one, and the PreToolUse stream wrap for Monitor and background Bash",
   "modules": [
     "./register.js"
   ],
@@ -11,6 +11,11 @@
           {
             "type": "command",
             "command": "python3 -I \"${CLAUDE_PLUGIN_ROOT}/bin/publish_guard.py\"",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "python3 -I \"${CLAUDE_PLUGIN_ROOT}/bin/stream_wrap.py\"",
             "timeout": 15
           }
         ]
