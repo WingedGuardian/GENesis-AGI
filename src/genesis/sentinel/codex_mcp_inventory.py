@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 import aiohttp
 
 from genesis.observability.types import Severity, Subsystem
-from genesis.sentinel import codex_mcp_stop
+from genesis.sentinel import codex_mcp_paging, codex_mcp_stop
 
 if TYPE_CHECKING:
     from genesis.observability.events import GenesisEventBus
@@ -44,6 +44,8 @@ class Inventory:
     group_counts: tuple[tuple[str, int], ...] = ()
     held_kib: int = 0
     pss_kib: int | None = None
+    scan_held_kib: int | None = None
+    scan_complete: bool = False
 
     def summary(self) -> dict:
         """Return the aggregate evidence safe to persist, with no thread IDs or argv."""
@@ -60,6 +62,8 @@ class Inventory:
             "group_counts": dict(self.group_counts),
             "held_kib": self.held_kib if self.daemon is not None else None,
             "pss_kib": self.pss_kib,
+            "scan_held_kib": self.scan_held_kib,
+            "scan_complete": self.scan_complete,
         }
 
 
@@ -217,8 +221,12 @@ async def collect() -> Inventory:
     try:
         async with asyncio.timeout(_DEADLINE_S - _CLOSE_GRACE_S):
             scan = await _read_process_data(codex_mcp_stop.scan)
+            observed.update(
+                scan_held_kib=sum(group.rss_kb for group in scan.groups),
+                scan_complete=not scan.uncertain,
+            )
             if not scan.app_servers and not scan.uncertain:
-                return Inventory(sampled_at, "absent")
+                return Inventory(sampled_at, "absent", **observed)
             async with _inventory_socket(_control_socket()) as ws:
                 peer = ws.get_extra_info("socket")
                 pid, uid, _gid = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
@@ -226,12 +234,12 @@ async def collect() -> Inventory:
                 if uid != os.geteuid() or scan.app_server_starttimes.get(pid) != identity[2]:
                     raise ValueError("inventory socket does not belong to the scanned daemon")
                 groups = [group for group in scan.groups if group.app_server_pid == pid]
-                observed = {
+                observed.update({
                     "daemon": identity,
                     "groups": frozenset((group.pgid, group.starttime) for group in groups),
                     "group_counts": tuple(sorted(Counter(_family(group) for group in groups).items())),
                     "held_kib": sum(group.rss_kb for group in groups),
-                }
+                })
                 if scan.uncertain:
                     return Inventory(sampled_at, "partial", "process scan incomplete", **observed)
                 rpc = _ThreadInventory(ws)
@@ -252,7 +260,8 @@ async def collect() -> Inventory:
                 pss_kib=pss, **observed,
             )
     except (aiohttp.ClientError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
-        return Inventory(sampled_at, "partial" if observed else "unavailable", type(exc).__name__, **observed)
+        status = "partial" if observed.get("daemon") else "unavailable"
+        return Inventory(sampled_at, status, type(exc).__name__, **observed)
 
 
 async def sample(bus: GenesisEventBus) -> None:
@@ -264,9 +273,12 @@ async def sample(bus: GenesisEventBus) -> None:
         _latest = None
         return
     _latest = await collect()
+    threshold = await asyncio.to_thread(codex_mcp_stop.load_propose_at_mb)
+    comparison = codex_mcp_paging.observe(_latest, threshold)
     await bus.emit(
         Subsystem.HEALTH, Severity.DEBUG, EVENT_TYPE, "Sampled Codex MCP inventory",
         **_latest.summary(),
+        paging=comparison,
     )
 
 

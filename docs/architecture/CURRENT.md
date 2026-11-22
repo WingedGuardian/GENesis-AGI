@@ -3050,7 +3050,9 @@ verified: 204c69c1f 2026-11-22
   Daily pruning applies a 72-hour cutoff to aggregate `codex.mcp_inventory`
   events. Thread and process group identifiers used for comparisons stay in
   memory. See the [MCP process report](../reference/mcp-process-report.md) for
-  limitations and the collection switch.
+  limitations and the collection switch. Shadow evidence compares the
+  scan-wide threshold with repeated post-unload growth on the verified
+  daemon. Sentinel's activation rule continues to use the raw threshold.
 - **sentinel/process_stop.py** (`python -m genesis.sentinel.process_stop`):
   the Failure Inventory remedy for ONE runaway process. Dry-run by default;
   `--execute` only inside an approved action. Resolves targets when it runs:

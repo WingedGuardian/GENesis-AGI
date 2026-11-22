@@ -74,6 +74,28 @@ backend stays open. It covers the protocol release path for the fixture.
 Set `GENESIS_CODEX_MCP_INVENTORY_DISABLED=1` to disable periodic collection.
 The supervisor collects no samples while `codex_mcp_stop.mode` is off.
 
+### Shadow paging evidence
+
+The threshold alert and activation rule continue to run while inventory
+events record both a legacy threshold comparison and a shadow evidence verdict.
+The threshold comparison uses all managed processes in the sample. The shadow
+verdict uses the daemon verified through the control socket. An unavailable
+sample is recorded even when its daemon identity cannot be verified.
+Observe at least 48 hours of shadow results before considering an enforcement change.
+Include normal editor and terminal release, a threshold crossing, incomplete
+samples, and an independently firing container-pressure alarm in the assessment.
+
+The shadow verdict requires the sampled daemon's held-memory threshold and
+two consecutive growth cycles on the same daemon. Each cycle expands
+beyond the earlier loaded-thread set, returns to that set, and retains new
+process groups seen during expansion. Genesis waits at least 60 seconds after
+that return and confirms the surviving groups in two observations. Held
+memory must still meet the threshold after unloading. This
+comparison detects persistent growth associated with observed release cycles.
+An incomplete sample or a gap of more than two minutes breaks the comparison.
+The sample can associate growth with a daemon's thread inventory. It cannot
+assign a process group to an individual conversation.
+
 ## Stopping a shared Codex daemon's MCP servers
 
 The report observes; it never stops anything. The remedy is a separate tool
