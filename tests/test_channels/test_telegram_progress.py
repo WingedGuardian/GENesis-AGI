@@ -277,15 +277,17 @@ async def test_keepalive_refreshes_a_quiet_draft(monkeypatch):
     streamer, bot = _streamer(prefix="")
     await streamer.on_thinking()
     bot.send_message_draft.reset_mock()
-    p, _, clock, _ = make(streamer)
-    clock.t += 100  # quiet since the last event
+    p, _, _, _ = make(streamer)
+    streamer._last_send_time -= 100  # the draft has been quiet 100 s
     p.start()
     try:
         await asyncio.sleep(0.05)
     finally:
         p.stop()
     assert bot.send_message_draft.await_count >= 1
-    assert "still working (100 s)" in bot.send_message_draft.await_args.kwargs["text"]
+    # The first refresh reports the quiet stretch; it restarts the draft's clock.
+    first = bot.send_message_draft.await_args_list[0].kwargs["text"]
+    assert "still working (100 s)" in first
 
 
 @pytest.mark.asyncio
@@ -463,29 +465,58 @@ def _long_segment(n: int = 5059) -> str:
 
 
 @pytest.mark.asyncio
-async def test_a_long_fallback_reply_does_not_repeat_delivered_progress():
-    """The empty-result fallback's reply is every streamed text joined, then split
-    for Telegram and re-joined with newlines: a chunk boundary inside the delivered
-    prefix must not defeat the ledger."""
+async def test_progress_longer_than_one_message_goes_out_in_parts():
+    """Held text longer than one Telegram message is sent as several, as one unit:
+    once every part is accepted all of it is delivered, so neither the final reply
+    nor the empty-result fallback (every text joined, split, re-joined) repeats it,
+    and later progress keeps flowing."""
     segment = _long_segment()
-    p, sent, _, _ = make()
+    p, sent, clock, _ = make()
     await p.on_event("text", segment)
     await p.on_event("tool_use", None)
+    assert len(sent) > 1 and "".join(sent) == segment and p.delivered == segment
+    clock.t += _progress.MIN_PROGRESS_INTERVAL_S
+    await p.on_event("text", LONG)
+    await p.on_event("tool_use", None)
     await p.on_event("text", "Final answer.")
-    assert "".join(sent) == segment
-    assert p.final_reply(_formatted(segment + "Final answer.")) == "Final answer."
+    assert sent[-1] == LONG
+    assert p.final_reply("Final answer.") == "Final answer."
+    assert p.final_reply(_formatted(segment + LONG + "Final answer.")) == "Final answer."
 
 
 @pytest.mark.asyncio
-async def test_a_long_fallback_reply_with_a_split_code_block_does_not_repeat():
-    # One fence longer than a chunk, opened past the first quarter: the splitter
-    # force-splits it and adds fences that were never streamed.
+async def test_a_part_that_fails_keeps_all_of_the_held_text_for_the_final_reply():
+    """The held text is delivered only when every part is accepted. When a later
+    part fails, all of it stays held, so the final reply carries it whole: the
+    parts already sent appear twice, the accepted cost of not tracking how much of
+    a split text got through. No snapshot follows what is already on screen."""
+    segment = _long_segment()
+    sent: list[str] = []
+
+    async def deliver(text: str) -> None:
+        if sent:
+            raise RuntimeError("second part failed")
+        sent.append(text)
+
+    p = TurnProgress(deliver, None, asyncio.Event(), clock=Clock())
+    await p.on_event("text", segment)
+    await p.on_event("tool_use", None)
+    await p.on_event("text", "Done.")
+    assert len(sent) == 1 and segment.startswith(sent[0])
+    assert p.delivered == "" and p.any_delivered
+    assert p.final_reply("Done.") == f"{segment}\n\nDone."
+
+
+@pytest.mark.asyncio
+async def test_a_long_code_block_reaches_the_user_with_balanced_fences():
+    """A fence longer than one message is force-split with balanced fences; once
+    all of it is delivered, the final reply and fallback do not repeat it."""
     code = "Here is the code:\n```\n" + "x = 1\n" * 900 + "```\n"
     p, sent, _, _ = make()
     await p.on_event("text", code)
     await p.on_event("tool_use", None)
     await p.on_event("text", "Final answer.")
-    assert sent
+    assert len(sent) > 1 and all(part.count("```") % 2 == 0 for part in sent)
     assert p.final_reply(_formatted(code + "Final answer.")) == "Final answer."
 
 
@@ -552,29 +583,34 @@ async def test_a_rate_limit_still_stops_progress_for_its_attempt():
 
 
 @pytest.mark.asyncio
-async def test_a_stale_resume_retry_does_not_deliver_the_first_attempts_text_again():
-    """The first attempt streams text and a tool call (delivered), then fails; the
-    fresh retry streams the same text. The user reads it once."""
-    p, sent, _, _ = make()
-    await p.on_event("init", None)
-    await p.on_event("text", LONG)
-    await p.on_event("tool_use", None)
-    await p.on_event("text", "Half")
-    await p.on_event("error", None)
-    await p.on_event("init", None)  # the retry
-    await p.on_event("text", LONG)
+async def test_a_retry_keeps_a_ledger_of_its_own():
+    """A stale-resume retry is a new Claude Code run: it starts a new ledger, so
+    what it delivers is never repeated in its own final reply or fallback. Text an
+    EARLIER attempt delivered is not this ledger's to suppress: repeats across
+    attempts belong to the streaming retry (#4888)."""
+    other = "Starting over: the record is in the second table, reading it."
+    p, sent, clock, _ = make()
+    for event, text in (
+        ("init", None), ("text", LONG), ("tool_use", None), ("text", "Half"),
+        ("error", None), ("init", None), ("text", other),
+    ):
+        await p.on_event(event, text)
+    clock.t += _progress.MIN_PROGRESS_INTERVAL_S  # past the pacing interval
     await p.on_event("tool_use", None)
     await p.on_event("text", "Final answer.")
-    assert sent == [LONG]
+    assert sent == [LONG, other] and p.delivered == other
     assert p.final_reply("Final answer.") == "Final answer."
-    # The empty-result fallback of the retry is its own text joined.
-    p2, _, _, _ = make()
+    assert p.final_reply(other + "Final answer.") == "Final answer."
+    # A retry that re-streams what the failed attempt delivered sends it again.
+    p2, sent2, clock2, _ = make()
     for event, text in (
         ("init", None), ("text", LONG), ("tool_use", None), ("error", None),
-        ("init", None), ("text", LONG), ("tool_use", None), ("text", "Final answer."),
+        ("init", None), ("text", LONG),
     ):
         await p2.on_event(event, text)
-    assert p2.final_reply(LONG + "Final answer.") == "Final answer."
+    clock2.t += _progress.MIN_PROGRESS_INTERVAL_S
+    await p2.on_event("tool_use", None)
+    assert sent2 == [LONG, LONG]
 
 
 @pytest.mark.asyncio
@@ -605,19 +641,17 @@ async def test_a_contingency_reply_gets_no_held_text_in_front():
 
 
 @pytest.mark.asyncio
-async def test_each_accepted_progress_chunk_is_recorded_as_it_is_sent(monkeypatch):
-    """Progress longer than one Telegram message goes out in chunks; when a later
-    chunk fails, the chunks Telegram accepted are delivered and never sent again."""
+async def test_a_failed_progress_send_is_held_whole_for_the_final_reply(monkeypatch):
+    """A progress send is one message, accepted or not: when Telegram refuses it,
+    none of it counts as delivered, and the final reply carries all of it once."""
     from genesis.channels.telegram import _handler_messages as hm
 
-    segment = _long_segment()
+    segment = _long_segment(3000)
     calls: list[str] = []
 
     async def reply_text(text, **kw):
         calls.append(text)
-        if len(calls) == 2:
-            raise RuntimeError("second chunk failed")
-        return MagicMock(message_id=len(calls))
+        raise RuntimeError("send failed")
 
     msg = MagicMock()
     msg.chat.type, msg.chat.id = "private", 456
@@ -631,13 +665,10 @@ async def test_each_accepted_progress_chunk_is_recorded_as_it_is_sent(monkeypatc
         await progress.on_event("text", "Done.")
     finally:
         progress.finish()
-    assert len(calls) == 2
-    first = calls[0]
-    assert segment.startswith(first) and len(first) < len(segment)
-    assert not progress.pending().startswith(first[:100])
+    assert calls == [segment]  # one message, the whole held text
+    assert progress.delivered == "" and progress.pending().startswith(segment)
     reply = progress.final_reply("Done.")
-    assert first[:100] not in reply and reply.endswith("Done.")
-    assert segment[len(first):].strip()[:100] in reply
+    assert reply == f"{segment}\n\nDone." and reply.count(segment[:100]) == 1
 
 
 @pytest.mark.asyncio
@@ -676,17 +707,6 @@ async def test_a_halt_stops_the_keepalive(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_halted_retry_still_does_not_repeat_what_was_delivered():
-    p, sent, _, _ = make()
-    for event, text in (
-        ("init", None), ("text", LONG), ("tool_use", None), ("error", None),
-        ("init", None), ("error", None), ("text", LONG), ("tool_use", None),
-    ):
-        await p.on_event(event, text)
-    assert sent == [LONG]
-    assert p.final_reply("Parked.") == "Parked."
-
-
 def _limit(status: str) -> dict:
     return {"type": "rate_limit_event", "rate_limit_info": {"status": status}}
 
@@ -763,28 +783,6 @@ async def test_subagent_lines_are_not_progress_or_boundaries():
 
 
 @pytest.mark.asyncio
-async def test_a_retry_that_continues_past_the_delivered_text_sends_only_the_rest():
-    """Attempt 1 delivered A; attempt 2 streams A then B before its tool call. The
-    user gets B, not A again."""
-    second = " And then I checked the second record, which also matched."
-    p, sent, clock, _ = make()
-    for event, text in (
-        ("init", None), ("text", LONG), ("tool_use", None), ("error", None),
-        ("init", None), ("text", LONG + second),
-    ):
-        await p.on_event(event, text)
-    clock.t += _progress.MIN_PROGRESS_INTERVAL_S  # past the pacing interval
-    await p.on_event("tool_use", None)
-    assert sent == [LONG, second.strip()]
-    p2, _, _, _ = make()
-    for event, text in (
-        ("init", None), ("text", LONG), ("tool_use", None), ("error", None),
-        ("init", None), ("text", LONG + " Ok."), ("tool_use", None), ("text", "Done."),
-    ):
-        await p2.on_event(event, text)
-    assert p2.final_reply("Done.") == "Ok.\n\nDone."
-
-
 @pytest.mark.asyncio
 async def test_a_dropped_connection_with_nothing_delivered_says_so_plainly(monkeypatch):
     """Text was seen but nothing reached the user (here: a retry dropped the failed
@@ -862,3 +860,26 @@ async def test_the_draft_leaves_out_subagent_lines():
     draft = streamer._compose_draft()
     assert "Main text." in draft and "Subagent" not in draft
     assert "Read" in draft and "Grep" not in draft
+
+
+@pytest.mark.asyncio
+async def test_events_the_draft_does_not_show_do_not_hold_off_its_keepalive(monkeypatch):
+    """Quiet is measured on the draft, not the stream. A subagent's events and the
+    turn's own tool results arrive more often than the keepalive interval and
+    change nothing on screen, so the keepalive must still refresh the draft, or
+    it expires mid-task (#4864 review)."""
+    monkeypatch.setattr(_progress, "SNAPSHOT_AFTER_S", 3600)
+    monkeypatch.setattr(_progress, "KEEPALIVE_S", 0.05)
+    streamer, bot = _streamer(prefix="")
+    await streamer.on_tool_use("Agent", "delegate the search")
+    bot.send_message_draft.reset_mock()
+    p, _, _, _ = make(streamer)
+    p.start()
+    try:
+        for _ in range(40):  # an event every 10 ms for 0.4 s
+            await p.on_event("text", "child narration", raw=SUB)
+            await p.on_event("tool_result", None, raw={"type": "user"})
+            await asyncio.sleep(0.01)
+    finally:
+        p.finish()
+    assert bot.send_message_draft.await_count > 0

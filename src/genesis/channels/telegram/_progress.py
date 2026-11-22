@@ -15,14 +15,16 @@ The text after the last tool call is the reply itself, and is never held.
 
 ``seen`` is every text event of the current ATTEMPT in order, and ``seen[:upto]``
 is what has been delivered, so a rescue or a fallback sends only ``seen[upto:]``
-whether or not the draft streamer was still running. ``upto`` advances per
-Telegram chunk accepted, not per message.
+whether or not the draft streamer was still running. Held text goes out as one
+unit, delivered only when Telegram accepts all of it (one message, or several
+when it is longer than one), so ``upto`` only ever moves to a tool boundary.
 
 One turn can run several attempts: a stale-resume retry or a failover peer starts
 a new Claude Code run, which begins with its own ``init`` event, and contingency
-answers the turn again without streaming. A new attempt keeps what was delivered
-(it is on the user's screen: a retry that streams it again sends it no second
-time) and drops what the failed attempt only held, its halt, and its text.
+answers the turn again without streaming. A new attempt starts a new ledger and
+drops what the failed attempt only held, its halt, and its text. A retry that
+streams text an earlier attempt delivered sends it again: repeats across
+attempts are #4888's, at the streaming retry, not this ledger's.
 """
 
 from __future__ import annotations
@@ -68,14 +70,6 @@ def halts(event_type: str, raw: dict | None) -> bool:
     return event_type == "rate_limit_event" and rate_limit_rejected(raw)
 
 
-def _common_prefix(a: str, b: str) -> int:
-    n = min(len(a), len(b))
-    i = 0
-    while i < n and a[i] == b[i]:
-        i += 1
-    return i
-
-
 class TurnProgress:
     """One turn's interim delivery, snapshot and draft keepalive."""
 
@@ -97,11 +91,9 @@ class TurnProgress:
         self._held_end = 0  # where the last tool call ended a segment, in _seen
         self._segment_start = 0
         self._held: list[tuple[int, int]] = []  # stripped segment spans in _seen
-        self._replay = ""  # what earlier attempts delivered
         self._any_delivered = False
         self._saw_text = False
         self._last_sent = float("-inf")
-        self._last_event = clock()
         self._halted = False
         self._started = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
@@ -148,7 +140,6 @@ class TurnProgress:
         ``parent_tool_use_id`` comes from a subagent the Agent tool started: it
         is activity, but its text and tool calls are not this turn's narration.
         """
-        self._last_event = self._clock()
         self._started.set()
         if event_type == "text" and text and not synthetic:
             # What the invoker collects, subagent text included, in stream order:
@@ -228,83 +219,38 @@ class TurnProgress:
         return _JOIN.join(self._seen[s:e] for s, e in self._held)
 
     def _new_attempt(self) -> None:
-        delivered = self.delivered
-        if len(delivered) > len(self._replay):
-            self._replay = delivered
         self._seen = self._collected = ""
         self._upto = self._held_end = self._segment_start = 0
         self._held = []
         self._halted = False
 
-    def _skip_replayed(self) -> None:
-        """A retry that streams what an earlier attempt delivered: that text is
-        delivered already, so it is not sent or held again."""
-        if not self._replay or not self._held:
-            return
-        common = _common_prefix(self._seen, self._replay)
-        # A span that runs past everything delivered (A+B after A) keeps only its
-        # new part. Past a divergence mid-way it stays whole: that is new text.
-        whole = common == len(self._replay)
-        kept = []
-        for s, e in self._held:
-            if e <= common:
-                continue
-            if whole and s < common:
-                rest = self._seen[common:e]
-                s = common + len(rest) - len(rest.lstrip())
-            if s < e:
-                kept.append((s, e))
-        if kept == self._held:
-            return
-        self._held = kept
-        self._upto = kept[0][0] if kept else len(self._seen)
-
-    def _ack(self, spans: list[tuple[int, int]], done: int) -> None:
-        """``done`` characters of the joined held text are delivered."""
-        pos = 0
-        for i, (s, e) in enumerate(spans):
-            if done < pos + e - s:
-                cut = s + done - pos
-                rest = self._seen[cut:e]
-                start = cut + len(rest) - len(rest.lstrip())
-                self._upto = cut
-                self._held = ([(start, e)] if start < e else []) + spans[i + 1 :]
-                return
-            pos += e - s
-            if i + 1 < len(spans) and done < pos + len(_JOIN):
-                break
-            pos += len(_JOIN)
-        else:
-            i = len(spans) - 1
-        self._upto = spans[i][1]
-        self._held = spans[i + 1 :]
-
     async def _flush(self) -> None:
-        self._skip_replayed()  # sends nothing, so it holds through a halt
         if self._halted or self._interrupt.is_set():
             return
+        from genesis.channels.telegram.transport.streaming import TELEGRAM_MAX_LENGTH
+
         text = self._held_text()
         now = self._clock()
         if len(text) < MIN_PROGRESS_CHARS or now - self._last_sent < MIN_PROGRESS_INTERVAL_S:
             return
-        from genesis.cc.formatter import ResponseFormatter
-        from genesis.channels.telegram.transport.streaming import TELEGRAM_MAX_LENGTH
-
         self._last_sent = now
-        spans = list(self._held)
-        done = 0
-        # One chunk per send, each recorded as Telegram accepts it: a later chunk
-        # that fails leaves only the unsent rest held, never a repeat.
-        for chunk, size in ResponseFormatter().split_spans(text, TELEGRAM_MAX_LENGTH):
+        if len(text) <= TELEGRAM_MAX_LENGTH:
+            parts = [text]
+        else:
+            from genesis.cc.formatter import ResponseFormatter
+
+            parts = ResponseFormatter()._split_preserving_code(text, TELEGRAM_MAX_LENGTH)
+        # The held text is one unit: delivered only when every part is accepted.
+        # A part that fails leaves all of it held, so the final reply repeats the
+        # parts already sent; that rare repeat is accepted (owner, 2026-11-22) over
+        # tracking how much of a split text was delivered.
+        for part in parts:
             try:
-                await self._deliver(chunk)
+                await self._deliver(part)
             except Exception:
-                # Held, not lost: the next boundary or the final reply carries it.
                 log.warning("Progress message failed to send", exc_info=True)
                 return
-            done += size
-            self._any_delivered = True
-            self._ack(spans, done)
+            self._any_delivered = True  # on screen, so no status snapshot after it
         self._held = []
         self._upto = len(self._seen)  # a tool call just ended the segment
 
@@ -334,6 +280,9 @@ class TurnProgress:
                 continue
             if self._interrupt.is_set() or self._halted:
                 continue
-            quiet = self._clock() - self._last_event
+            # Quiet is measured on the draft itself, not on the stream: events the
+            # draft does not show (a subagent's, a tool result, a throttled update)
+            # leave it to expire all the same.
+            quiet = streamer.quiet_s()
             if quiet >= KEEPALIVE_S:
                 await streamer.keepalive(quiet)

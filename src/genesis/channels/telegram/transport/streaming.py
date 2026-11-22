@@ -105,6 +105,14 @@ class DraftStreamer:
     def enabled(self) -> bool:
         return self._enabled
 
+    def quiet_s(self) -> float:
+        """Seconds since the draft was last sent: how long it has gone without an
+        update, which is what Telegram's ~30 s draft lifetime counts. Zero before
+        the first draft, when there is nothing on screen to keep."""
+        if not self._any_draft_sent:
+            return 0.0
+        return time.monotonic() - self._last_send_time
+
     def disable(self) -> None:
         """Permanently disable this streamer.
 
