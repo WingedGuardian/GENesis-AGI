@@ -1,0 +1,1 @@
+- Prepare complete, identity-bound PR source packets for independent verification review, with explicit refusals for incomplete or changing sources.

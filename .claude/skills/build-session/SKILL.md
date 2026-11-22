@@ -278,6 +278,28 @@ its effect can be shown on this install. The review-time check is different: the
 architect's Step 0.5 compares the diff with the plan and stays informational,
 and it does not replace this pass.
 
+**Record that outcome as the PR's first delivery read.** Once the PR is open,
+`python3 scripts/delivery_marker.py compose --pr <N> --checker author-review
+--outcome <converged|converged-with-carried|open> ...` writes the marker, and you
+run the one `gh` command it prints: `converged` records DELIVERS,
+`converged-with-carried` DELIVERS (each carried item is listed as a point the
+owner's recorded decision accepted, which closing-session's verdict rule also
+counts as accepted), `open` PARTIAL. A PR not built from a spec records the verdict your pre-PR
+review's scope check (the architect's Step 0.5) supports. This is the weakest
+form of the read, the builder's own, and it is labelled so: a closing session
+does its own read (closing-session, step 1a) and overwrites it, and on a PR
+that changes code, tests or config only that independent read makes it ready.
+
+**Copy the plan's Change block into the PR body.** The PR template's premise
+section takes the Problem block as a pointer (`1. Problem: as #<issue>`) when
+the linked issue answers items 1 to 5; otherwise write 1 to 5 out too. Items 6
+to 9 (Mechanism, Alternatives, Evidence, Shape) go in full, copied from the
+plan's premise answers and scrubbed like any public text: a plan's Evidence
+often cites local paths and private measurements. Item 9 is not the PR-shape
+`Shape:` reason line; when one is owed it goes on its own line. Nothing blocks
+on the Change block, but the delivery read records whether it is there
+(`change=stated|absent`).
+
 **Which copy actually ran is the whole question. Check it; never assume it.**
 - A hook guard run as `python3 <worktree>/scripts/hooks/<guard>.py`, with a real
   payload on stdin, runs the branch's copy of that file. The harness, and the

@@ -33,6 +33,7 @@ confirmation:
   max_recheck_attempts: 3
   required_failed_signals: 2
   bootstrap_grace_s: 300
+  post_reboot_grace_s: 1200   # a failure starting soon after a host reboot: cold boot is slow (~14 min measured)
   pause_reminder_hours: 24
 
 cc:
@@ -42,6 +43,8 @@ cc:
   max_turns: 50      # runaway guard — legitimate investigation is ~15-30 turns
   path: "claude"
   work_dir: "/var/lib/guardian-snapshots/cc-sessions"
+  canary_enabled: true      # daily minimal real call: is the recovery brain able to authenticate?
+  canary_interval_h: 24
 
 briefing:
   enabled: true
@@ -107,6 +110,8 @@ storage_pool:
   pool_used_high_pct: 85
   pool_used_crit_pct: 92
   realert_hours: 6
+  # A tier is left only this many points below its line (no page per crossing).
+  exit_margin_pct: 5
   # Pressure RELIEF — the tiers above only alert. When free data or metadata
   # space drops to its reserve, relief deletes ONE guardian-owned snapshot per
   # pass (pre-recovery first, the rollback lifeline last), never anything

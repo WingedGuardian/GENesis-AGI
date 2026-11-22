@@ -31,19 +31,45 @@ All tests run from the genesis project root using pytest:
 source ~/genesis/.venv/bin/activate
 cd genesis
 
-# Full suite
-pytest -v
+# Full suite: run the hosted CI test job, not a local full-suite invocation.
 
-# Specific subsystem
-pytest -v tests/test_memory/
-pytest -v tests/test_resilience/
+# Local checks: name the relevant test files.
+pytest -v tests/test_pytest_storage.py tests/test_pytest_retention_policy.py
 
 # Linting (run before committing)
 ruff check .
 
-# Both (standard pre-commit check)
-ruff check . && pytest -v
 ```
+
+## Persistent test caches
+
+Default pytest cache data lives in `.pytest_cache/pytest` within the selected
+checkout. Pytest creates a fresh cache through a temporary sibling directory;
+the nested placement keeps that bootstrap inside `.pytest_cache` too.
+The root test conftest defaults Hypothesis storage to the same checkout's
+`.pytest_cache/hypothesis` before child conftests load. Constants and local
+example databases remain persistent between runs. Hypothesis profiles are
+unchanged, including the installed library's CI profile and its disabled
+default example database.
+
+These defaults start cold: existing `.hypothesis` and legacy `.pytest_cache/v`
+contents are neither migrated nor deleted. `--cache-clear` clears pytest's
+cache data while leaving the Hypothesis sibling in place.
+
+An explicit `HYPOTHESIS_STORAGE_DIRECTORY` wins, including relative or empty
+values; an empty value retains Hypothesis's native `.hypothesis` fallback.
+CI can supply its run-owned storage through that same variable. Pytest's
+`-o cache_dir=<path>` override and `-p no:cacheprovider` retain their usual
+behavior. Explicit paths outside test-owned storage remain subject to the
+write audit; these settings do not widen its exemptions. The libraries retain
+their own permission-error handling. A plugin that resolves Hypothesis storage
+before the root conftest loads must supply the environment variable before
+starting pytest; the conftest does not reset previously resolved global state.
+
+`tests/test_pytest_storage.py` exercises real fresh/repeated runs, early
+child-conftest resolution, serial and two-worker execution, persistence,
+overrides, `--lf`, and cache clearing. Its deliberate outside-cache write
+checks that the observer remains effective.
 
 ## Test Suite Overview
 
@@ -485,8 +511,11 @@ The protocol step names the admission, policy, actual HTTP and shared CLI module
 explicitly. The CLI checks start all four real factories with disposable local
 dependencies, exercise catalog/authentication/read calls over TCP, and observe
 SDK shutdown and registered-owner drainage before resource closure on SIGTERM.
+They also exercise path/abstract readiness datagrams after bind and cleanup on
+failed notification, bind failure and shutdown requested during startup. The
+memory notification-failure case checks its actual provider/cache closers.
 Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
-and a floor of 99 cases. Installation, collection, test or report-check failure
+and a floor of 104 cases. Installation, collection, test or report-check failure
 fails the job; missing or filtered workflow runs do not qualify a PR. Closing
 checks its actual head/base result. Ordinary skip-budget changes require observed
 skip identities; this workflow does not raise that budget automatically.
@@ -494,6 +523,16 @@ skip identities; this workflow does not raise that budget automatically.
 For a local run, use an already qualified isolated interpreter and the same
 strict test flag, then run the workflow's report check. Changing installed
 packages or enabling shared services is not part of that test command.
+
+`test_shared_notify.py` exercises owned local datagrams and error propagation
+without SDK qualification. `test_shared_mcp_templates.py` reuses both actual
+renderer loops and executes their activation sections with nondelegating command
+shims, checking literal paths, stamps and keep/take behavior without starting a
+unit. Successful per-test payload/event files require both an explicit scratch
+`--basetemp` and `-o tmp_path_retention_policy=all`; the normal policy removes
+successful test directories. Read-only `systemd-analyze verify` can validate
+rendered syntax with generators disabled; it does not execute or qualify a live
+service.
 
 ## Integration Tests
 

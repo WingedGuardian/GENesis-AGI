@@ -189,6 +189,19 @@ def connect_aiosqlite_rw(
     )
 
 
+@asynccontextmanager
+async def connect_aiosqlite_ro(
+    path: Path, *, timeout: float,
+) -> AsyncIterator[aiosqlite.Connection]:
+    """Read committed WAL data with admission checked on both sides of open."""
+    from genesis.db.admission import assert_admitted
+
+    assert_admitted(path)
+    async with aiosqlite.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=timeout) as db:
+        assert_admitted(path)
+        yield db
+
+
 # Per-connection page cache. Negative = KiB (SQLite convention), so -262144 is
 # 256 MiB. SQLite's default is ~2 MiB, which forces hot read paths to keep
 # re-fetching pages instead of holding Genesis's working set resident. This is

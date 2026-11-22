@@ -49,6 +49,16 @@ def reload() -> str:
     return tz_name
 
 
+def user_zone() -> ZoneInfo:
+    """The cached user timezone (UTC when the configured zone is invalid).
+
+    Reads the module cache that :func:`reload` refreshes, so a dashboard change
+    takes effect in this process without a restart. It never calls
+    ``user_timezone()``, which can log, so the log formatter can use it safely.
+    """
+    return _USER_TZ
+
+
 def fmt(iso_str: str, fmt_str: str = "%a %Y-%m-%d %H:%M %Z") -> str:
     """Convert a UTC ISO string to user-local formatted string.
 

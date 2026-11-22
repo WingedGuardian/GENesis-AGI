@@ -25,13 +25,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import difflib
 import hashlib
 import json
 import logging
+import multiprocessing
 import re
 import sqlite3
 import uuid
+from concurrent.futures import ProcessPoolExecutor
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -42,6 +43,7 @@ from genesis.db.crud import entity_adjudications as adj_crud
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import observations
 from genesis.memory.adversarial_review import _JSON_BLOCK_RE
+from genesis.memory.entity_registry import fuzzy_ratio_at_least
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -927,7 +929,7 @@ def _compute_sweep_pairs(
     seen_pair_keys: set[str],
     cap: int,
 ) -> list[tuple[str, str]]:
-    """Pure-CPU pair discovery (runs off the event loop via ``to_thread``).
+    """Pure-CPU pair discovery (runs in a spawn child, ``_sweep_pairs_in_child``).
 
     For each entity in the slice, nominate same-group neighbours from three
     blocking sources, unioned: (1) difflib >= threshold (cosmetic variants),
@@ -936,6 +938,11 @@ def _compute_sweep_pairs(
     Pairs that are digit-only differences or already recorded/pending are
     dropped. Returns up to ``cap`` ``(entity_id, similar_entity_id)`` pairs.
     Emission is sorted per slice-entity for determinism.
+
+    Source (1) skips pairs whose cheap upper bounds cannot reach the threshold
+    (``fuzzy_ratio_at_least``), which also shortens the child's run:
+    same matches, about 8x less CPU (a 200-entity slice against ~41k names: 356 s
+    -> 43 s on one core).
     """
     # Per-group blocking structures (built once per call; cheap — entity counts
     # are small enough to scan, mirroring list_norm_names).
@@ -966,7 +973,8 @@ def _compute_sweep_pairs(
         for cand_norm, cand_id, _ct in candidates:
             if cand_id == eid:
                 continue
-            if difflib.SequenceMatcher(None, norm, cand_norm).ratio() >= _FUZZY_THRESHOLD:
+            # Bounds first (same match set as ratio() alone; see the helper).
+            if fuzzy_ratio_at_least(norm, cand_norm, _FUZZY_THRESHOLD) is not None:
                 matched.add(cand_id)
 
         # (2) containment — a candidate sharing a rare token whose token set is a
@@ -1080,6 +1088,67 @@ async def maybe_run_sweep(
     return result
 
 
+# Bounds a sweep child that never returns: the job runs with max_instances=1, so
+# a hung child would stop the hourly drain for good with neither a success nor a
+# failure recorded. No hang has been observed; this is the project's 2-hour
+# floor, far above the measured ~43 s slice (#4877).
+_SWEEP_TIMEOUT_S = 7200.0
+
+
+def _kill_pool_workers(pool: ProcessPoolExecutor) -> None:
+    """SIGKILL the pool's worker processes (never pid 0/1), as pdf_extract does:
+    ``shutdown`` alone waits on a worker that is still computing."""
+    for proc in list(getattr(pool, "_processes", {}).values()):
+        if (getattr(proc, "pid", None) or 0) > 1:
+            with contextlib.suppress(Exception):
+                proc.kill()
+
+
+async def _sweep_pairs_in_child(
+    slice_entities: list[tuple[str, str, str]],
+    group_candidates: dict[str, list[tuple[str, str, str]]],
+    seen_pair_keys: set[str],
+    cap: int,
+) -> list[tuple[str, str]]:
+    """``_compute_sweep_pairs`` in a fresh single-worker spawn process.
+
+    In a thread the pure-Python comparison loop holds the GIL, and every row
+    step of the server's other sqlite queries waits to win it back (#4877:
+    measured, a 54k-row fetch went from 183 ms alone to 21 s beside the loop,
+    and 198 ms with the loop in another process). A crash raises
+    ``BrokenProcessPool`` and a hang raises ``TimeoutError``; either way the
+    caller records a job failure and leaves the cursor, so the slice retries.
+    The child gets a copy of ``seen_pair_keys``; the caller does not read it
+    afterwards. A fresh pool per sweep holds no process between runs; starting
+    it costs about 0.2 s under the server and about 4 s under the legacy
+    bridge, whose child re-imports the runtime.
+
+    The child imports this module from disk, so after a pull without a restart
+    it runs the pulled ``_compute_sweep_pairs`` against the loaded caller; a
+    signature change then fails each sweep, loudly, until the restart.
+    """
+    loop = asyncio.get_running_loop()
+    pool = ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+    finished = False
+    try:
+        pairs = await asyncio.wait_for(
+            loop.run_in_executor(
+                pool, _compute_sweep_pairs, slice_entities, group_candidates, seen_pair_keys, cap
+            ),
+            timeout=_SWEEP_TIMEOUT_S,
+        )
+        finished = True
+        return pairs
+    finally:
+        if finished:
+            await asyncio.to_thread(pool.shutdown, wait=True)
+        else:
+            # Timeout, crash or cancellation (server shutdown): do not wait on
+            # a worker that may still be computing.
+            _kill_pool_workers(pool)
+            pool.shutdown(wait=False, cancel_futures=True)
+
+
 async def run_reconcile_sweep(
     db: aiosqlite.Connection,
     *,
@@ -1091,7 +1160,7 @@ async def run_reconcile_sweep(
 
     The producer only enqueues newly-created near-duplicates; this recovers the
     historical backlog and heals any install. Slice bounds per-run CPU; the caller
-    advances/persists ``cursor_offset``. Pair discovery runs off-thread and unions
+    advances/persists ``cursor_offset``. Pair discovery runs in a spawn child and unions
     three blocking sources (difflib cosmetic-match + token-set containment + a
     dotted-numeric suffix rule — see ``_compute_sweep_pairs``), so qualifier
     variants and short-vs-fully-qualified forms that difflib cannot reach are
@@ -1100,7 +1169,7 @@ async def run_reconcile_sweep(
     Returns ``{"enqueued": int, "next_offset": int, "completed": bool,
     "total": int}``.
     """
-    # Snapshot candidate lists on the loop; compute pairs off-thread.
+    # Snapshot candidate lists on the loop; compute pairs in a child process.
     cluster_types = list(_CONCEPT_CLUSTER)
     cluster = await entities_crud.list_norm_names(db, entity_types=cluster_types)
     persons = await entities_crud.list_norm_names(db, entity_types=["person"])
@@ -1118,9 +1187,7 @@ async def run_reconcile_sweep(
     seen = await adj_crud.settled_pair_keys(db)
     seen |= await _pending_pair_keys(db)
 
-    pairs = await asyncio.to_thread(
-        _compute_sweep_pairs, slice_entities, group_candidates, seen, enqueue_cap
-    )
+    pairs = await _sweep_pairs_in_child(slice_entities, group_candidates, seen, enqueue_cap)
 
     enqueued = 0
     for eid, cand_id in pairs:

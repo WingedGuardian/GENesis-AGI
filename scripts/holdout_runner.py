@@ -451,11 +451,16 @@ def _stop_git_group(proc: subprocess.Popen) -> None:
     except BaseException:
         # Interrupted before the group is known to be gone: kill what is left
         # and give the kill a moment to land, so the caller does not discard a
-        # tree a member is still writing.
+        # tree a member is still writing. The leader may already be gone, so
+        # wait for the whole group, not only for it.
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(proc.pid, signal.SIGKILL)
+        deadline = time.monotonic() + 1
         with contextlib.suppress(Exception):
             proc.wait(timeout=1)
+        with contextlib.suppress(Exception):
+            while time.monotonic() < deadline and _group_alive(proc.pid):
+                time.sleep(0.02)
         raise
     proc.wait()
 

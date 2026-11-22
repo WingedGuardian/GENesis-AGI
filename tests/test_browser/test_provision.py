@@ -260,6 +260,47 @@ def test_fetch_is_judged_by_re_resolving_not_its_exit_code(env, monkeypatch):
     assert not out.ok and "engine=missing" in out.line()
 
 
+_RATE_LIMITED = (
+    "Official... Error: 403 Client Error: rate limit exceeded for url: "
+    "https://api.github.com/repos/camoufox/camoufox/releases\n"
+    "Synced 0 versions from 0 repos.\n"
+)
+
+
+def test_a_rate_limited_fetch_names_the_rate_limit(env, monkeypatch, capsys):
+    """An anonymous GitHub rate limit (403) on the release lookup installs nothing;
+    the outcome line names it, and the fetch's own output still reaches the log (#4723)."""
+    _resolves(monkeypatch, MISSING, MISSING)
+    run = Runner({"camoufox fetch": (0, _RATE_LIMITED)})
+    out = provision.provision(run)
+    assert not out.ok
+    assert "engine=missing (GitHub API rate limit)" in out.line()
+    assert "403 Client Error: rate limit exceeded" in capsys.readouterr().out
+    ((_, kw),) = run.ran("camoufox fetch")
+    assert kw["capture_output"] is True and kw["text"] is True  # a real run returns output
+
+
+def test_a_timed_out_fetch_prints_its_partial_output(env, monkeypatch, capsys):
+    """A hung fetch must not take its output with it: the partial bytes are printed
+    before the timeout reaches the outcome."""
+    _resolves(monkeypatch, MISSING, MISSING)
+
+    def run(argv, **kw):
+        if "fetch" in argv:
+            raise subprocess.TimeoutExpired(argv, 1, output=b"Downloading 40%\n", stderr=None)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    out = provision.provision(run)
+    assert not out.ok and "TimeoutExpired" in out.line()
+    assert "Downloading 40%" in capsys.readouterr().out
+
+
+def test_an_unrated_fetch_failure_keeps_the_plain_missing(env, monkeypatch):
+    _resolves(monkeypatch, MISSING, MISSING)
+    out = provision.provision(Runner({"camoufox fetch": (1, "some other error\n")}))
+    assert "engine=missing " in out.line() + " " and "rate limit" not in out.line()
+
+
 def test_corrupt_pinned_dir_is_removed_then_fetched(env, monkeypatch):
     bad = env / "xdg" / "camoufox" / "browsers" / "official" / "156.0.1-beta.36-abc"
     invalid = engine.EngineStatus(engine.INVALID, "corrupt", bad / "camoufox-bin")
