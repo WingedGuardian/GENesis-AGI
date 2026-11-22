@@ -55,6 +55,7 @@ def main(argv: list[str] | None, api: dict, *, supervisor=None) -> int:
         if name == "should-escalate":
             p.add_argument("--nul", action="store_true")
     sub.add_parser("reconcile-inflight")
+    sub.add_parser("reconcile-orphans")
     p = sub.add_parser("reconcile-native")
     p.add_argument('--context')
     api['_native'].add_commands(sub)
@@ -154,6 +155,18 @@ def main(argv: list[str] | None, api: dict, *, supervisor=None) -> int:
         if rows:
             print(f"re-pended {len(rows)} protocol2 claims without native intent")
         return 0
+    if args.cmd == "reconcile-orphans":
+        if supervisor is None:
+            raise RuntimeError("captured supervised reconciliation is required")
+        try:
+            busy = supervisor.reconcile_orphans()
+        except api['_legacy'].QueueBusy:
+            busy = True
+        except sqlite3.OperationalError as error:
+            if not api['_is_busy'](error):
+                raise
+            busy = True
+        return api['BUSY_STATUS'] if busy else 0
     if args.cmd == "reconcile-native":
         if args.context is not None:
             if supervisor is None:
