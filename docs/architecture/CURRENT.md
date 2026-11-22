@@ -73,11 +73,11 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 5b5340381 2026-11-22
+verified: 273642a5e 2026-11-22
 ```
 
-The 2026-11-22 verification covers weekly worklist publication. The 2026-11-07
-verification covers the request-owned memory thread boundaries below.
+The 2026-11-07 verification covers the request-owned memory thread boundaries
+below; other memory descriptions retain their individually cited verification dates.
 
 **Shared-owner prerequisite (not activated):** nine thread boundaries in
 `memory/store.py`, `retrieval.py`, `intent.py` and `proactive.py` retain actual
