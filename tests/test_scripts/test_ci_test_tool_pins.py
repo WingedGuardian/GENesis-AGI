@@ -121,7 +121,7 @@ def test_no_ci_test_install_floats():
     assert floating == FLOATING_BY_DESIGN
 
 
-def test_no_bot_opens_version_bump_prs():
+def test_dependabot_version_updates_stay_off():
     """Dependabot version updates are off (owner decision, 2026-11-22): a bump
     PR arrived for these pins that nobody had evaluated. Restoring the config
     is a decision to make in a PR of its own, not a side effect."""
