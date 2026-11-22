@@ -655,6 +655,10 @@ def test_install_without_a_known_real_home_stays_disarmed(monkeypatch):
     from tests import _live_fence
 
     hooks = []
+    monkeypatch.setattr(audit._S, "hits", {})
+    monkeypatch.setattr(audit._S, "faults", 0)
+    monkeypatch.setattr(audit._S, "unreported", [])
+    monkeypatch.delenv("GENESIS_LIVE_WRITES_REPORT", raising=False)
     monkeypatch.setattr(audit._S, "installed", False)
     monkeypatch.setattr(audit._S, "disarmed", "")
     monkeypatch.setattr(audit.sys, "addaudithook", hooks.append)
