@@ -14,6 +14,9 @@ import json
 import logging
 from pathlib import Path
 
+# Stdlib-only, so the "zero LLM cost, purely programmatic" contract above holds.
+from genesis.transcript_analytics.classify import classify
+
 logger = logging.getLogger(__name__)
 
 # Struggle score threshold for triggering the Judge.
@@ -81,6 +84,72 @@ def _summarize_args(tool_name: str, tool_input: object) -> str:
     return args_text[:cap]
 
 
+# A failed result's text is kept on its spine entry for the outcome writer, which
+# scrubs it and stores 400 characters. Text over this bound is withheld (None),
+# never cut: the scrubber decodes JSON strings to find escaped credentials, and a
+# cut string no longer decodes, so a cut could leave a credential readable. The
+# bound stops one huge failed result (an error echoing a whole file) from being
+# held in memory for the rest of the parse; the failure itself is still recorded.
+_FAILURE_TEXT_CAP = 65_536
+
+
+def _outcome_fields(tool_id: object, tool_input: object, rec: dict) -> dict:
+    """Per-call fields the tool-outcome writer reads; ignored by scoring and the judge."""
+    file_path = tool_input.get("file_path") if isinstance(tool_input, dict) else None
+    return {
+        "tool_use_id": tool_id if isinstance(tool_id, str) and tool_id else None,
+        "file_path": file_path if isinstance(file_path, str) else None,
+        "is_sidechain": rec.get("isSidechain") is True,
+        "has_result": False,
+        "session_id": None,
+        "timestamp": None,
+        "failure_class": None,
+        "failure_text": None,
+    }
+
+
+def _content_text(content: object) -> str:
+    """The text the model saw, as ``transcript_analytics`` reads it: text blocks only."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            b["text"]
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+        )
+    return ""
+
+
+def _record_result(entry: dict, block: dict, content: object, rec: dict) -> None:
+    """Classify a paired result with the shared transcript classifier.
+
+    ``failure_class`` is ``transcript_analytics.classify``'s class (``hook_block``,
+    ``user_rejected``, ``exit_nonzero``, ...) or None for a success. The raw
+    ``is_error`` value is passed through, because an absent flag is not a success
+    there: it applies only its strong unflagged rules.
+    """
+    flag = block.get("is_error")
+    denial = rec.get("toolDenialKind")
+    text = _content_text(content)
+    try:
+        cls, _source = classify(
+            text,
+            is_error=flag if isinstance(flag, bool) else None,
+            denial_kind=denial if isinstance(denial, str) else None,
+        )
+    except Exception:  # noqa: BLE001 - never let the writer's fields cut the spine short
+        logger.warning("tool-result classification failed; call left unrecorded", exc_info=True)
+        return
+    sid = rec.get("sessionId")
+    ts = rec.get("timestamp")
+    entry["has_result"] = True
+    entry["session_id"] = sid if isinstance(sid, str) and sid else None
+    entry["timestamp"] = ts if isinstance(ts, str) and ts else None
+    entry["failure_class"] = cls
+    entry["failure_text"] = text if cls and len(text) <= _FAILURE_TEXT_CAP else None
+
+
 def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
     """Parse JSONL into a compact action spine AND a grounding haystack.
 
@@ -101,12 +170,18 @@ def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
         "error_text": str,      # error content (if any)
     }
 
+    Tool entries also carry the fields ``_outcome_fields`` lists, read only by
+    the tool-outcome writer: ``tool_use_id``, ``file_path``, ``is_sidechain``,
+    ``has_result``, ``session_id`` and ``timestamp`` (of the result record),
+    ``failure_class`` and ``failure_text``.
+
     Reads raw JSONL line-by-line to capture tool_use + tool_result blocks
     that read_transcript_messages() intentionally strips.
     """
     spine: list[dict] = []
     haystack_parts: list[str] = []  # uncapped tool inputs → grounding record
     pending_tools: dict[str, dict] = {}  # tool_use_id → spine entry (awaiting result)
+    seen_tool_ids: set[str] = set()  # every tool_use_id already in the spine
     turn = 0
 
     try:
@@ -149,6 +224,16 @@ def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
                     block_type = block.get("type", "")
 
                     if block_type == "tool_use":
+                        # A transcript can replay earlier calls (api-request-blob
+                        # records carry the request's whole conversation): a call
+                        # already in the spine is the same call, not a new one.
+                        # Kept once, it is not a phantom crash in the score, and
+                        # tool_use_id stays unique for readers that cut by it (#4812).
+                        replay_id = block.get("id")
+                        if isinstance(replay_id, str) and replay_id in seen_tool_ids:
+                            continue
+                        if isinstance(replay_id, str) and replay_id:
+                            seen_tool_ids.add(replay_id)
                         turn += 1
                         tool_name = block.get("name", "unknown")
                         tool_input = block.get("input", {})
@@ -163,6 +248,7 @@ def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
 
                         args_summary = _summarize_args(tool_name, tool_input)
 
+                        tool_id = block.get("id", "")
                         spine_entry = {
                             "turn": turn,
                             "type": "tool",
@@ -170,17 +256,18 @@ def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
                             "args_summary": args_summary,
                             "outcome": "ok",  # default, updated by tool_result
                             "error_text": "",
+                            **_outcome_fields(tool_id, tool_input, entry),
                         }
                         spine.append(spine_entry)
 
-                        tool_id = block.get("id", "")
                         if tool_id:
                             pending_tools[tool_id] = spine_entry
 
                     elif block_type == "tool_result":
                         tool_id = block.get("tool_use_id", "")
                         is_error = block.get("is_error", False)
-                        result_content = block.get("content", "")
+                        raw_content = block.get("content", "")
+                        result_content = raw_content
                         if isinstance(result_content, list):
                             result_content = " ".join(
                                 str(b.get("text", ""))
@@ -193,6 +280,7 @@ def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
                             if is_error:
                                 entry_ref["outcome"] = "error"
                                 entry_ref["error_text"] = str(result_content)[:400]
+                            _record_result(entry_ref, block, raw_content, entry)
 
                     elif block_type == "text" and msg_type == "user":
                         text = block.get("text", "")
@@ -215,7 +303,10 @@ def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
         logger.warning("Failed to parse transcript for action spine", exc_info=True)
 
     # Mark orphaned tool_use entries (no matching tool_result) as errors.
-    # This happens when sessions crash mid-execution.
+    # This happens when sessions crash mid-execution — and also when the call is
+    # simply still running at read time, which is why ``has_result`` stays False
+    # here: the struggle score treats both as errors, but the outcome writer
+    # (``learning/tool_outcomes.py``) must not record either as a failure.
     for entry in pending_tools.values():
         entry["outcome"] = "error"
         entry["error_text"] = "no result received (session may have crashed)"
@@ -335,6 +426,12 @@ def score_struggle(spine: list[dict]) -> float:
     return min(1.0, score)
 
 
+def judge_line(entry: dict) -> str:
+    """One tool entry as the judge sees it (see :func:`format_spine_for_judge`)."""
+    outcome = "OK" if entry["outcome"] == "ok" else f"ERR: {entry['error_text'][:300]}"
+    return f"[T={entry['turn']}] TOOL: {entry['tool']} {entry['args_summary']} -> {outcome}"
+
+
 def format_spine_for_judge(spine: list[dict]) -> str:
     """Format the action spine as compact text for the Judge LLM — TOOL ACTIONS
     ONLY (user turns are dropped).
@@ -349,14 +446,7 @@ def format_spine_for_judge(spine: list[dict]) -> str:
     [T=1] TOOL: Bash {"command": "ssh root@..."} -> OK
     [T=2] TOOL: Read {"file_path": "/home..."} -> ERR: not found
     """
-    lines: list[str] = []
-    for entry in spine:
-        if entry["type"] != "tool":
-            continue
-        turn = entry["turn"]
-        outcome = "OK" if entry["outcome"] == "ok" else f"ERR: {entry['error_text'][:300]}"
-        lines.append(f"[T={turn}] TOOL: {entry['tool']} {entry['args_summary']} -> {outcome}")
-    text = "\n".join(lines)
+    text = "\n".join(judge_line(entry) for entry in spine if entry["type"] == "tool")
     if len(text) > _MAX_SPINE_CHARS:
         text = "...[earlier turns truncated]...\n" + text[-_MAX_SPINE_CHARS:]
     return text

@@ -27,6 +27,9 @@ import aiosqlite
 #           mcp/health/contributor_issue.py when require_approval is off)
 #   blank/None → system: bulk expiry (expire_timed_out below) never writes
 #           resolved_by — no human acted on those rows.
+#   unknown, deliberately: "board:move:unattributed" (board/launcher/) — a
+#           work-board Build move approves one builder launch by owner ruling,
+#           but nothing attests who moved the card.
 HUMAN_RESOLVER_PREFIXES: tuple[str, ...] = (
     "telegram:",
     "dashboard",
@@ -39,6 +42,7 @@ SYSTEM_RESOLVER_PREFIXES: tuple[str, ...] = (
     "timeout_auto_expire",
     "cleanup:",
     "alarm_cleared",
+    "superseded",  # the Sentinel cancels a warning park a stronger alarm took over
     "genesis:",  # autonomous Genesis-vetted self-approval (NOT human-earned authority)
 )
 

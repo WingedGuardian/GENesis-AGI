@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -72,7 +74,7 @@ class TestEgoInitWiring:
     """Ego init should create session, cadence, and wire dependencies."""
 
     @pytest.mark.asyncio
-    async def test_creates_session_and_cadence(self):
+    async def test_creates_session_and_cadence(self, tmp_path):
         rt = _make_runtime()
         with (
             patch("genesis.ego.config.load_ego_config") as mock_load,
@@ -100,6 +102,9 @@ class TestEgoInitWiring:
 
             # Session created
             mock_session_cls.assert_called_once()
+            mcp_path = Path(mock_session_cls.call_args.kwargs["mcp_config_path"])
+            assert mcp_path.is_relative_to(tmp_path)
+            assert set(json.loads(mcp_path.read_text())["mcpServers"]) == {"genesis-memory"}
 
             # Cadence created and started
             mock_cadence_cls.assert_called_once()

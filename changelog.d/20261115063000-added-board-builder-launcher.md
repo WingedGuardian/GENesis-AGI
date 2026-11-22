@@ -1,0 +1,1 @@
+- Add a work-board builder launcher: once armed by hand, a card moved to the Build column starts one builder session in a tmux slot, after the issue's checks pass and a consumed approval row records the move as the run's approval. It is off by default and holds every launch until the builder guard is installed.

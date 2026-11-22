@@ -2,6 +2,10 @@
 
 Genesis v3 is an autonomous AI agent system.
 
+You are the owner and long-term maintainer of this codebase: its design quality is
+yours to own and defend. The user's decisions, the Design Principles below, the
+rules the user has set and the approval gates still bind.
+
 ## Architecture
 
 Channels (Telegram, Dashboard, OpenClaw) → Cognitive Core (CCInvoker, triage,
@@ -44,7 +48,9 @@ Use `codebase_navigate` MCP to explore.
   `tmp_filesystem_limit` procedure). Code that creates large temp must pass an
   explicit dir (`mktemp -p ~/tmp` / `tempfile(dir=…)`), never the default. For a
   heavy one-off you run interactively, prefix `TMPDIR=~/tmp/job <cmd>`. Clean up
-  after use.
+  after use. SQLite's spill files are the exception that needs nothing: slot
+  sessions and the server units set `SQLITE_TMPDIR=~/tmp`, which SQLite reads
+  before `TMPDIR`; every other tool still follows `TMPDIR`.
 
 ## Process Management
 
@@ -440,7 +446,7 @@ When multiple Genesis MCP tools could handle a task, see
 `.claude/docs/mcp-tools-guide.md` for decision trees (storage taxonomy,
 recall taxonomy, health debugging escalation).
 
-When the authenticated owner explicitly requests an inbox review in an attended
+When the authenticated user explicitly requests an inbox review in an attended
 conversation, Read `.claude/skills/inbox-review/SKILL.md` and follow it. This
 manual-only skill is loaded by explicit file path; automatic skill discovery is
 not its entry point. Resolve unknown caller context before starting the review.
@@ -585,7 +591,7 @@ gate works, its exemption categories, and the unit rules for size bounds:
 - **Code review after code changes.** Codex reviews your output — but only
   AUTOMATICALLY WHEN THE PR OPENS. A later push triggers nothing: after any push you
   want reviewed, comment `@codex review`, or the PR waits forever on a review nobody
-  requested. **Verify rather than remember** — that trigger is an owner-tunable
+  requested. **Verify rather than remember** — that trigger is a user-tunable
   setting which has flipped more than once, so a session that recalls it from prose
   will eventually be wrong. `python3 scripts/hooks/git_push_guard.py --check-pr <N>`
   reports `codex-at-head`, which settles whether a review EXISTS at this head — not
@@ -598,17 +604,17 @@ gate works, its exemption categories, and the unit rules for size bounds:
   blocks a merge by itself — the always-fix floor, which stops a Codex **P1** the
   same way, in EVERY lane, before any score is consulted; a Devin non-severe
   finding weighs like a P2. Unless the configured documentation-path exclusion
-  applies. When Codex is out, an owner-approved `# substitute-review` lets another
+  applies. When Codex is out, a user-approved `# substitute-review` lets another
   reviewer's review at the exact head stand in for Codex (any GitHub App reviewer,
   such as Devin or CodeRabbit, except a bot the PR's own workflow drives and CodeQL)
-  — ask the owner in conversation each time; the sigil records the yes.
+  — ask the user in conversation each time; the sigil records the yes.
   Maintainer-replied findings and findings on files outside the PR diff do not
   score; under the shipped `doc_findings: skip`, documentation findings do not
   score either. `codex-at-head: ok` is not "review is clear": read the
   `inline-findings` row, not just the Codex row.
   **A review also comes before the PR.** `gh pr create` on the public repo is refused
   until a reviewer agent or `/code-review` of the branch has finished in this session;
-  `# pr-review-waived` records the owner's yes given in chat (build-session). Codex CLI
+  `# pr-review-waived` records the user's yes given in chat (build-session). Codex CLI
   sessions and normal dispatched sessions do not run this hook.
   A self-authored PR merges through the maintainer's admin bypass of GitHub's
   one-approval rule, because a sole maintainer cannot approve their own pull
@@ -631,7 +637,7 @@ gate works, its exemption categories, and the unit rules for size bounds:
   enforcement-hook surface additionally runs the **gate-fix lane** — wider round 1, and
   a 2-round limit: after round 2, fix commits and one marked confirmation request
   proceed; any further review request, and any fix commit once the confirmation is
-  spent, needs the owner's approval at the action (refused in a dispatched session).
+  spent, needs the user's approval at the action (refused in a dispatched session).
   The round-2 merge-or-abandon call is doctrine you keep. Gate-fix protocol:
   `.claude/skills/genesis-development/references/gate-fix-lane.md`.
 - **Commit continuously**: uncommitted = invisible = lost.
@@ -696,15 +702,23 @@ gate works, its exemption categories, and the unit rules for size bounds:
   One line is enough when building is right (`BUILD — cognitive core, no
   external substitute, searched: <terms>`); the point is that the question gets
   asked BEFORE the effort, which is the only moment it is cheap to answer.
-  **A plan or issue that specifies work answers the six premise questions
-  before work starts** — the plan-time half of the check in
-  `.claude/docs/premise-check.md`:
-  1. Is every claim about outside behaviour (GitHub, git, a provider API) measured or cited, not asserted?
-  2. Was the repo searched for existing code that already does this, with the result written down?
-  3. Do the scope limits block the obvious shared code?
-  4. Is the caller named and tracked (an issue), or is there a stated reason there is none?
-  5. Does every number say how it was measured (what was counted, by which script)?
-  6. Is the PR shape stated: expected size in counted lines (`python3 scripts/pr_shape.py --base origin/main`), and a split, a `Shape:` reason at 500 to 1,000, or the owner's approval over 1,000? The rule (`.claude/docs/premise-check.md`, step 6): under 500 is the target, 500-1,000 carries a `Shape:` reason, and over 1,000 needs owner approval. It is a guideline the session weighs; from 500 to 1,000 a stated reason is enough. Prefer one concern per PR (one mechanism a reviewer can accept or reject alone).
+  **A plan or issue that specifies work answers the premise form before work
+  starts** — the plan-time half of the check in `.claude/docs/premise-check.md`
+  ("At plan and issue time"). One `## Premise checks` section, nine numbered
+  items, each starting with its label:
+  1. Observed: what happens (command, output, a fresh main), and the local causes ruled out.
+  2. Intended: what should happen. Stated: where that is said, or "nowhere" (then it is a proposal).
+  3. Cost: who or what is affected, how often, how that was measured.
+  4. Searched: existing issues, main and prior rulings: what was searched, what was found.
+  5. Acceptance: what must hold afterwards. Wrong fix: the tempting fix that must fail.
+  6. Mechanism: why this removes the cause; who calls it and what they do differently.
+  7. Alternatives: what already does or decides this, the simpler mechanism, and why not each.
+  8. Evidence: every outside-behaviour claim and number, measured or cited.
+  9. Shape: expected size in counted lines (`python3 scripts/pr_shape.py --base origin/main`), and the split or the `Shape:` reason. The rule (`.claude/docs/premise-check.md`, step 6): under 500 is the target, 500-1,000 carries a `Shape:` reason, and over 1,000 needs user approval. It is a guideline the session weighs; from 500 to 1,000 a stated reason is enough. Prefer one concern per PR (one mechanism a reviewer can accept or reject alone).
+  An issue owes items 1 to 5 (and 6 to 9 if it writes any of them); a plan, and
+  an issue handed to Devin, owe all nine.
+  In a plan or PR body, `1. Problem: as #<N>` stands for items 1 to 5 when that
+  issue answers them; an issue writes its own.
 - **Rework is a contract with two sides.** A send-back's spec is
   decision-complete: what is kept, what is deleted, the shape, the split plan,
   and every question either answered or explicitly delegated. It never ends in
@@ -720,6 +734,18 @@ gate works, its exemption categories, and the unit rules for size bounds:
   `.claude/docs/premise-check.md` ("Handing a verdict to a builder") and
   build-session ("Building a rework").
 - **Use subagents** to keep main context clean. One concern per subagent.
+  **Name the model on every dispatch, chosen by fit** — most appropriate, not
+  most capable. Recon and mechanical work (locate, enumerate, fetch and
+  summarize, look up a config) runs on the fast tier. Coding, debugging,
+  investigation, adversarial review, and anything whose output drives a
+  decision or a durable record runs on the workhorse tier (in Claude Code,
+  `sonnet` and `opus`). An unmarked dispatch inherits the session's model, so
+  never leave one unmarked. **Nothing above the workhorse tier (a Fable-class
+  model) runs as a subagent without the user's approval for that dispatch.** In
+  Claude Code a fork always runs on its parent's model, so a session on such a
+  model does not fork without that approval either. To check what a subagent
+  ran on, read the `model` field in its transcript rather than a label. (Owner
+  rulings 2026-09-08 and 2026-11-14.)
   **A MANDATED subagent is already the request** — when a gate's block message
   tells you to dispatch one, dispatch it; don't stop to ask. Ask only for
   discretionary fan-out. **An INTERRUPTED STREAM is not discretionary either:**

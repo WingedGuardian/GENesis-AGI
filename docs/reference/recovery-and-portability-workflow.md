@@ -404,7 +404,7 @@ brain"), authenticated at install by a one-time `claude login`. That login has
 no refresh, so if it dies the brain silently goes dark — discovered only
 mid-incident.
 
-Two mechanisms make this observable and survivable without host access:
+Three mechanisms make this observable and survivable without host access:
 
 1. **Auth-health signal.** The gateway `version` verb reports `cc_logged_in`
    (a 1h-cached `claude auth status` probe), `cc_token_present`, and
@@ -414,7 +414,13 @@ Two mechanisms make this observable and survivable without host access:
    token expires. No token material or account identity ever crosses the wire —
    only booleans and an age.
 
-2. **Fallback setup-token (optional, lazy).** Mint a 1-year token from ANY
+2. **Daily auth canary.** Once a day, on a healthy tick, the host Guardian makes
+   one minimal real `claude -p` call through the same credential path its
+   diagnosis uses (`guardian/cc_canary.py`), and pages once with Claude Code's own
+   reason if it fails. The `version` fields above say only that a token exists and
+   how old it is; this says whether the brain can actually authenticate.
+
+3. **Fallback setup-token (optional, lazy).** Mint a 1-year token from ANY
    machine with `claude setup-token` and give it to `scripts/store_cc_token.sh`
    in the container — pipe it on stdin, or (the interactive `setup-token` makes
    piping awkward) write it to a file and pass `--file /path/to/token`, never a
@@ -424,10 +430,12 @@ Two mechanisms make this observable and survivable without host access:
    syncs it to the host shared mount
    (`~/.local/state/genesis-guardian/shared/guardian/cc_oauth_token.env`). It is
    a **shared fallback** read by several consumers, each of which injects it via
-   `CLAUDE_CODE_OAUTH_TOKEN` **only** when its own login is confirmed dead: the
-   **host** Guardian recovery brain (`diagnosis.py`, gated on a pre-flight
-   `claude auth status`), the **container's own** CC sessions
-   (`cc/login_health.py`, wired at `cc/invoker.py`), and **interactive slots**
+   `CLAUDE_CODE_OAUTH_TOKEN` **only** when its own login is confirmed dead, with
+   one exception: the **host** Guardian recovery brain (`diagnosis.py`) injects it
+   unless a pre-flight `claude auth status` CONFIRMS its login works, so a probe
+   that times out or answers unclearly (as after a host reboot) still gets a
+   usable credential. The other consumers are the **container's own** CC sessions
+   (`cc/login_health.py`, wired at `cc/invoker.py`) and **interactive slots**
    (`cc/login_gate.py`, wired at `scripts/cc-slot.sh`). A healthy login is never
    overridden — except the interactive-slot `GENESIS_CC_SLOT_OAUTH=always` lever,
    which deliberately injects over a live login (losing Remote Control / claude.ai

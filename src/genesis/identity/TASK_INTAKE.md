@@ -111,14 +111,18 @@ Any credentials, accounts, or permissions the executor may need.
 
 ## Premise checks
 Only when the plan names repo files (src/, scripts/, tests/, .claude/, docs/,
-config/, .github/): six numbered answers to the plan-time questions in
-.claude/docs/premise-check.md. `n/a — <reason>` counts as an answer.
-1. <outside-behaviour claims: measured or cited>
-2. <what was searched, and what was found>
-3. <scope limits, and the shared code they leave reachable>
-4. <the caller, and its tracker or why there is none>
-5. <how each number was measured>
-6. <expected counted lines, and the split or Shape: reason>
+config/, .github/): the nine-item premise form in
+.claude/docs/premise-check.md, each answer after its label. `n/a — <reason>`
+counts as an answer. `1. Problem: as #<N>` may stand for items 1 to 5.
+1. Observed: <what happens, with the command, output and commit, and the local causes ruled out>
+2. Intended: <what should happen>. Stated: <where that is said | nowhere>
+3. Cost: <who or what is affected, how often, how that was measured>
+4. Searched: <existing issues, main and prior rulings: what was searched, what was found>
+5. Acceptance: <what must hold afterwards>. Wrong fix: <the tempting fix that must fail | none, because ...>
+6. Mechanism: <why this removes the cause; who calls it and what they do differently>
+7. Alternatives: <what already does or decides this, the simpler mechanism, and why not each>
+8. Evidence: <every outside-behaviour claim and number, measured or cited>
+9. Shape: <expected counted lines, and the split or Shape: reason>
 ```
 
 ## Handoff

@@ -25,7 +25,7 @@ What it ensures, in order (every step is a no-op when already true):
    ``github.public_repo`` — the repo promotions post to, never this checkout's
    own remote, which on a fork clone is the operator's fork), read from
    ``ProjectV2.repositories``; linked with ``linkProjectV2ToRepository`` if not.
-3. Status options = Proposed / Ready / In Progress / In Review / Done, with every
+3. Status options = Proposed / Ready / Build / In Progress / In Review / Done, with every
    existing option re-sent with its id. An option outside that list is ALWAYS
    kept: deleting one clears it from every card that holds it, and no read
    made before the write can prove no card holds it AT the write.
@@ -227,7 +227,13 @@ async def run(title: str, apply: bool, write_config: bool, allow_public: bool = 
         say("PROBLEM: no single-select Status field")
         problems += 1
     else:
-        wanted = pv.merge_options(status.raw_options, pv.STATUS_OPTIONS, keep_unlisted=True)
+        wanted = pv.merge_options(
+            status.raw_options,
+            pv.STATUS_OPTIONS,
+            keep_unlisted=True,
+            colors=pv.STATUS_COLORS,
+            descriptions=pv.STATUS_DESCRIPTIONS,
+        )
         current = [o["name"] for o in status.raw_options]
         target = [o["name"] for o in wanted]
         if current != target:

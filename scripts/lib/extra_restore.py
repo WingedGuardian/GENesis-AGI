@@ -20,6 +20,10 @@ steps that need a real tar reader:
         member, 5 when a restore would fail outright. With exit 4, the last
         stderr line is ``REFUSED-SUMMARY {"count": N, "classes": {...}}``: the
         refused members counted by reason class, for backup's status file.
+    extra_restore.py verify-stream <scratch-parent>
+        ``verify`` for an archive on stdin, read once and never stored whole:
+        backup.sh pipes the decrypted archive in, so no plaintext copy of the
+        directory is written. Same output and exit codes as ``verify``.
     extra_restore.py swap <tar> <stage> <root> <target> <aside>
         Extract into <stage> (created by the caller next to <target>, so the
         final step is a rename on one filesystem), fsync what was written, move
@@ -245,6 +249,50 @@ def cmd_verify(tar: str, scratch_parent: str) -> int:
     return 4 if keep.refused else 0
 
 
+def _write_hollow(stream, out) -> None:
+    """Copy every member header of the tar read from ``stream`` into ``out``, each
+    regular file's content left out, then read ``stream`` to its end. A function of
+    its own so the stream reader, which keeps every member it has read, is freed
+    before ``verify`` loads its own copy of the list."""
+    with (
+        tarfile.open(fileobj=stream, mode="r|") as src,
+        tarfile.open(fileobj=out, mode="w", format=tarfile.PAX_FORMAT) as dst,
+    ):
+        for member in src:
+            head = copy.copy(member)
+            # Keys that describe the content would contradict size 0.
+            head.pax_headers = {
+                k: v
+                for k, v in member.pax_headers.items()
+                if k != "size" and not k.startswith("GNU.sparse")
+            }
+            if head.isreg():
+                head.size = 0
+                head.sparse = None
+            dst.addfile(head)
+    while stream.read(1 << 20):
+        pass
+
+
+def cmd_verify_stream(stream, scratch_parent: str) -> int:
+    """``verify`` for an archive read once from ``stream``, never stored whole.
+
+    ``verify`` reads the member list before it extracts, which a stream cannot
+    replay, so this copies every member header into a hollow archive under
+    ``scratch_parent`` (each file's content left out, as ``verify`` already
+    ignores it) and runs ``verify`` on that copy. The copy takes 512 bytes per
+    member, plus about 1 KiB for a long or non-ASCII name, instead of the directory
+    again. ``stream`` is read to its end, so the process writing it never dies on a
+    broken pipe."""
+    fd, hollow = tempfile.mkstemp(prefix=".extra-hollow.", suffix=".tar", dir=scratch_parent)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            _write_hollow(stream, out)
+        return cmd_verify(hollow, scratch_parent)
+    finally:
+        os.unlink(hollow)
+
+
 def cmd_swap(tar: str, stage: str, root: str, target: str, aside: str) -> int:
     if aside == "auto":
         aside = aside_path(target)
@@ -342,6 +390,11 @@ def main(argv: list[str]) -> int:
             _err("this Python's tarfile lacks the 2025 extraction-filter fixes")
             return 3
         return cmd_verify(argv[2], argv[3])
+    if len(argv) == 3 and argv[1] == "verify-stream":
+        if not _python_is_safe():
+            _err("this Python's tarfile lacks the 2025 extraction-filter fixes")
+            return 3
+        return cmd_verify_stream(sys.stdin.buffer, argv[2])
     if len(argv) == 7 and argv[1] == "swap":
         if not _python_is_safe():
             _err(
@@ -350,7 +403,7 @@ def main(argv: list[str]) -> int:
             return 3
         return cmd_swap(*argv[2:7])
     _err(
-        "usage: extra_restore.py check | root <tar> | verify <tar> <scratch-parent> | swap <tar> <stage> <root> <target> <aside>"
+        "usage: extra_restore.py check | root <tar> | verify <tar> <scratch-parent> | verify-stream <scratch-parent> | swap <tar> <stage> <root> <target> <aside>"
     )
     return 5
 

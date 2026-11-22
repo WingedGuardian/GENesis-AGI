@@ -24,6 +24,8 @@ from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
 
+MIN_RESERVE_BYTES = 2 * 1024**3
+
 # This child changes only its own selection score, then preserves its PID across
 # exec. No mutable project source is reopened after durable native intent.
 _NATIVE_EXEC = """import os,sys
@@ -237,8 +239,9 @@ def cbm_source(*, snapshot, worker, config, args, cap, settings, environment, po
     if registration_slots is not None:
         value["registration_slots"] = dict(registration_slots)
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-    return dict(commit=snapshot.commit, files=dict(snapshot.files), provider_digest=worker.BUILD,
-                provider_version="v0.11.0-stock-worker",
+    release = worker.qualified_release(config["build"])
+    return dict(commit=snapshot.commit, files=dict(snapshot.files), provider_digest=config["build"],
+                provider_version=release["worker"],
                 configuration_sha256=hashlib.sha256(encoded).hexdigest())
 
 
@@ -250,6 +253,8 @@ def effective_policy(value, native, *, full=False):
         raise ValueError("invalid effective worker policy fields")
     for key in ("wall_seconds", "sibling_reserve_bytes", "cache_reserve_bytes"):
         native._integer(value[key], key, positive=key == "wall_seconds")
+    if min(value["sibling_reserve_bytes"], value["cache_reserve_bytes"]) < MIN_RESERVE_BYTES:
+        raise ValueError("typed worker reserves cannot be below two GiB each")
     if (value["route"] not in ("workload", "capped", "inherit")
             or not isinstance(value["slice"], str)
             or re.fullmatch(r"[A-Za-z0-9_.\\-]+\.slice", value["slice"]) is None):
@@ -298,9 +303,9 @@ def runtime_inputs(snapshot, modules):
     else:
         options = native._object(value['provider_options'], ('managed_config', 'persistence'), 'CBM runtime options')
         modules['unit'].absolute(options['managed_config'])
+        release = modules['worker'].qualified_release(reserved['source']['provider_digest'])
         if (options['persistence'] not in ('true', 'false')
-                or reserved['source']['provider_digest'] != modules['worker'].BUILD
-                or reserved['source']['provider_version'] != 'v0.11.0-stock-worker'):
+                or reserved['source']['provider_version'] != release['worker']):
             raise ValueError('runtime provider inputs differ from the accepted worker')
     return value, NativeEnvironment(value['environment_recipe'], native)
 

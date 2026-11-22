@@ -49,6 +49,8 @@ _CASES = [
     ("timeout_auto_expire", "system"),
     # system: sentinel alarm clear (sentinel/dispatcher.py ~:1767)
     ("alarm_cleared", "system"),
+    # system: a stronger alarm took over a warning park (sentinel/dispatcher.py)
+    ("superseded", "system"),
     # system: autonomous Genesis self-approval (mcp/health/contributor_issue.py,
     # require_approval off) — NOT human-earned authority.
     ("genesis:contributor-worklog", "system"),
@@ -64,6 +66,10 @@ _CASES = [
     ("manual_stale_cleanup", "unknown"),
     # unknown: a hypothetical future channel nobody registered
     ("app:button:99", "unknown"),
+    # unknown ON PURPOSE (board/launcher/): a Build move on the work board is
+    # the owner's approval by ruling, but nothing attests WHO moved the card, so
+    # it is neither human-attested nor a system self-approval.
+    ("board:move:unattributed", "unknown"),
 ]
 
 

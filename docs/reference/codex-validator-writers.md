@@ -37,7 +37,9 @@ UTF-8 and canonical evidence are capped at256KiB. The verdict is derived;
 passing measurements close an OPEN obligation only after shared structured
 tracking checks complete. Pending routing stores the measurement and actual
 verdict on an OPEN row, even when it passed; `tracking_complete` and `would_close`
-expose the distinction. Other decisions record a nonclosing attempt with the
+expose the distinction. `prompts` lists the completeness questions to answer before
+a close; a close (closing verdict, complete tracking) with an event-gated date already come is refused
+(validating-merges, "Completeness checks"). Other decisions record a nonclosing attempt with the
 same note prefixes as the CLI. See `validator-tracking.md` for preflight,
 checkpoints, public/private receipts, pause and historical audit. Closed obligations
 cannot be rewritten. A real attempt increments a counter and is not idempotent:
@@ -51,6 +53,15 @@ inside its actual stdio child instead. This internal seam is not an MCP argument
 CLI and MCP share one note formatter: absent notes never become literal `None`,
 and an empty parked note has no trailing separator. Public evidence/note policy
 still applies before formatting.
+
+The CLI's `close --dry-run` and `recheck --dry-run` use the database layer's
+`connect_aiosqlite_ro` factory. It checks admission before and after opening
+the read-only SQLite connection, which reads committed WAL data without
+checkpointing it.
+Paths are URI-encoded, so filename characters such as `?`, `#` and `%` remain
+literal. Read-only SQLite may still coordinate shared-memory sidecars and locks.
+The MCP preview retains its existing shared-handle SELECT path; ordinary CLI
+recording retains the admitted writer connection.
 
 Every call reloads `config/codex_validator.yaml` and the strict local overlay.
 The tracked base must be exactly `dry_run_only: true`. Missing/malformed/base
