@@ -25,7 +25,7 @@ def _weekly_outcome(report: dict[str, Any]) -> tuple[str, str]:
         return "aborted", str(report["aborted"])[:500]
     failures = {entry["phase"]: "failed" for entry in report.get("errors", ())}
     for phase in (
-        "clustering", "cross_wing", "worklist_persist", "link_repair",
+        "clustering", "cross_wing", "link_repair",
         "entity_resolution", "orphan_detection", "centrality",
     ):
         detail = report.get(phase, {})
@@ -108,6 +108,11 @@ async def run_dream_cycle() -> None:
         )
         outcome, detail = _weekly_outcome(report)
         report["outcome"] = outcome
+        enqueued = report.get("worklist_enqueued", 0)
+        worklist = (
+            "worklist publication error, " if enqueued is None
+            else f"{enqueued} enqueued for daily drain, "
+        )
 
         # Write observation with the report
         try:
@@ -124,8 +129,8 @@ async def run_dream_cycle() -> None:
                     f"Dream cycle {'DRY RUN' if dry_run else 'LIVE'} "
                     f"(weekly clustering, {outcome}): "
                     f"{report.get('clusters_found', 0)} clusters found, "
-                    f"{report.get('worklist_enqueued', 0)} enqueued for "
-                    f"daily drain, "
+                    f"{worklist}"
+                    f"{'prior worklist kept, ' if report.get('worklist_preserved') else ''}"
                     f"{report.get('oversize_flagged', 0)} oversize flagged, "
                     f"{report.get('shield', {}).get('members_shielded', 0)} "
                     f"members shielded, "

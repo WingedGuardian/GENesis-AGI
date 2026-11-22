@@ -309,12 +309,14 @@ def batch_retrieve_vectors(
     collection: str = "episodic_memory",
     batch_size: int = 100,
     failures: Counter[str] | None = None,
+    count_missing: bool = False,
 ) -> dict[str, list[float]]:
     """Batch-retrieve vectors for multiple points.
 
     Returns ``{point_id: vector}``. Missing points are silently omitted.
     Batches in chunks of *batch_size* to avoid oversized requests. The optional
-    counter distinguishes failed batches from successful reads with missing points.
+    counter records failed batches and, with ``count_missing``, missing vectors
+    in successful responses.
     """
     vector_map: dict[str, list[float]] = {}
     for i in range(0, len(point_ids), batch_size):
@@ -336,6 +338,11 @@ def batch_retrieve_vectors(
                 i + len(batch),
                 exc_info=True,
             )
+        else:
+            if count_missing and failures is not None:
+                missing = sum(not vector_map.get(point_id) for point_id in batch)
+                if missing:
+                    failures["retrieve/missing_vector"] += missing
     return vector_map
 
 

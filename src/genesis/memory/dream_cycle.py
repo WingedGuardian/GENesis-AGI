@@ -86,7 +86,7 @@ DAILY_SYNTHESIS_BUDGET: int = 100
 WORKLIST_CAP: int = 500
 # Max times a capacity-failed drain slice is reset to pending before it is
 # completed with a WARNING instead (no infinite retry). Bounds queue CLAIMS
-# (deferred_work_queue.attempts, ++ on each mark_processing), so ~3 daily drains
+# (deferred_work_queue.attempts, ++ on each claim_pending), so ~3 daily drains
 # will re-attempt an outage-blocked slice before it is let go; the weekly
 # re-cluster re-surfaces its members regardless (staleness_policy=DRAIN).
 _SLICE_ATTEMPT_CAP: int = 3
@@ -258,6 +258,7 @@ async def run(
 
     report["bucket_sizes"] = bucket_sizes
     report["clustering"] = {"failure_counts": dict(clustering_failures)}
+    incomplete_worklist = bool(clustering_failures)
 
     report["clusters_found"] = len(all_clusters)
     logger.info("Dream cycle %s: found %d clusters", run_id[:8], len(all_clusters))
@@ -276,12 +277,15 @@ async def run(
         )
         report["cross_wing_findings"] = cross_wing
         report["cross_wing"] = {"failure_counts": errors}
+        # Cross-wing links contribute to the activation scores used by the shield.
+        incomplete_worklist |= bool(errors)
         if cross_wing:
             logger.info(
                 "Dream cycle %s: %d cross-wing finding(s)",
                 run_id[:8], len(cross_wing),
             )
     except Exception as exc:
+        incomplete_worklist = True
         logger.warning("Cross-wing scan failed", exc_info=True)
         report["cross_wing_findings"] = []
         report["errors"].append({"phase": "cross_wing", "error": error_summary(exc)})
@@ -290,11 +294,8 @@ async def run(
     # activation / centrality, or a confidence floor) from clusters BEFORE they
     # are enqueued, so the merge path never consolidates them away. Thresholds
     # are computed over the true (non-deprecated) population in `buckets` here
-    # and frozen into each slice for the drain's live re-check. A shield failure
-    # must degrade toward LESS write authority — but pre-live (drain is SHADOW)
-    # the safe degradation is to enqueue UNSHIELDED and flag loudly: the drain's
-    # `shield_missing_thresholds` counter then stays non-zero, which is the
-    # explicit precondition gate on the future live-merge flip.
+    # and frozen into each slice for the drain's live re-check. If the shield
+    # fails, the prior worklist remains available with its original thresholds.
     shield_thresholds: dict[str, Any] | None = None
     try:
         from genesis.memory import dream_shield
@@ -321,12 +322,11 @@ async def run(
             **shield_stats,
         }
     except Exception as exc:
+        incomplete_worklist = True
         report["errors"].append({"phase": "shield", "error": str(exc)})
         report["shield"] = {"enabled": False, "error": str(exc)}
         logger.warning(
-            "Dream cycle %s: importance shield failed — enqueuing UNSHIELDED "
-            "(shadow-safe; the drain's shield_missing_thresholds gate blocks the "
-            "live flip): %s",
+            "Dream cycle %s: importance shield failed: %s",
             run_id[:8], exc, exc_info=True,
         )
 
@@ -334,23 +334,28 @@ async def run(
     # Destructive synthesis/deprecate moved OUT of this weekly pass into
     # run_synthesis_drain (bounded daily slices). This enqueue runs in ALL modes:
     # clustering + worklist maintenance IS the weekly job; the merge decision is
-    # gated on the drain side. Supersedes last week's worklist (a fresh full
-    # re-cluster is authoritative).
-    try:
-        worklist = await _persist_worklist(
-            db, all_clusters, weekly_run_id=run_id, cap=WORKLIST_CAP,
-            shield_thresholds=shield_thresholds,
-        )
-        report["worklist_enqueued"] = worklist["enqueued"]
-        report["oversize_flagged"] = worklist["oversize_flagged"]
-        if worklist["enqueue_failed"]:
-            report["worklist_persist"] = {"failure_counts": {"enqueue": worklist["enqueue_failed"]}}
-    except Exception as exc:
-        report["errors"].append({"phase": "worklist_persist", "error": str(exc)})
+    # gated on the drain side. A complete candidate list is authoritative,
+    # even if it is empty. Later diagnostic phases do not change the list.
+    if incomplete_worklist:
+        report["worklist_preserved"] = True
         logger.warning(
-            "Dream cycle %s: worklist persist failed: %s",
-            run_id[:8], exc, exc_info=True,
+            "Dream cycle %s: incomplete candidate scan — keeping prior worklist", run_id[:8],
         )
+    else:
+        try:
+            worklist = await _persist_worklist(
+                db, all_clusters, weekly_run_id=run_id, cap=WORKLIST_CAP,
+                shield_thresholds=shield_thresholds,
+            )
+            report["worklist_enqueued"] = worklist["enqueued"]
+            report["oversize_flagged"] = worklist["oversize_flagged"]
+        except Exception as exc:
+            report["worklist_enqueued"] = None
+            report["errors"].append({"phase": "worklist_persist", "error": str(exc)})
+            logger.warning(
+                "Dream cycle %s: worklist persist failed: %s",
+                run_id[:8], exc, exc_info=True,
+            )
 
     # ── Sprint 2 phases (each handles dry_run internally) ──────────────
 
@@ -439,7 +444,7 @@ async def _persist_worklist(
 ) -> dict[str, int]:
     """Persist the top-value clusters as the daily-drain worklist.
 
-    Returns enqueued, enqueue-failed, oversize-flagged, and superseded counts.
+    Returns enqueued, oversize-flagged, and superseded counts on success.
 
     ``shield_thresholds`` (when set) is frozen into each slice payload as a
     ``shield`` block, so the daily drain re-checks live members against the same
@@ -447,19 +452,16 @@ async def _persist_worklist(
     during the drain week). Absent it, slices carry no block — backward
     compatible with pre-shield rows.
 
-    Supersedes any prior ``dream_synthesis_slice`` rows (a fresh full re-cluster
-    is authoritative) via an explicit synchronous supersede — NOT a staleness
-    policy, so it never races the recovery expiry cadence. Enqueues in value order
-    under a single priority so the FIFO-within-priority drain order == value order.
+    Replaces the prior non-processing ``dream_synthesis_slice`` rows in one
+    transaction. Enqueues in value order under one priority so the drain
+    processes higher-value slices first.
     Stores only member ids + (wing, room) + weekly_run_id; the drain re-fetches
     live payloads (rehydrate), so a stale snapshot can't merge deprecated members.
     Oversize clusters (> MAX_CLUSTER_SIZE) are never enqueued — flagged for
     manual review here instead (FM-1).
     """
-    from genesis.resilience.deferred_work import DRAIN, MEMORY_OPS, DeferredWorkQueue
+    from genesis.resilience.deferred_work import MEMORY_OPS, DeferredWorkQueue
 
-    queue = DeferredWorkQueue(db)
-    superseded = await queue.supersede(WORKLIST_WORK_TYPE)
     oversize = [c for c in clusters if len(c) > MAX_CLUSTER_SIZE]
     for cluster in oversize:
         logger.info(
@@ -470,7 +472,7 @@ async def _persist_worklist(
         )
     ranked = _rank_and_cap_clusters(clusters, cap=cap)
 
-    enqueued = 0
+    payloads: list[str] = []
     for cluster in ranked:
         payload_dict: dict[str, Any] = {
             "member_ids": [item["id"] for item in cluster],
@@ -481,23 +483,21 @@ async def _persist_worklist(
         }
         if shield_thresholds is not None:
             payload_dict["shield"] = shield_thresholds
-        payload = json.dumps(payload_dict)
-        item_id = await queue.enqueue(
-            WORKLIST_WORK_TYPE, None, MEMORY_OPS, payload,
-            "dream_cycle weekly synthesis worklist",
-            staleness_policy=DRAIN,
-        )
-        if item_id is not None:
-            enqueued += 1
+        payloads.append(json.dumps(payload_dict))
+
+    superseded = await DeferredWorkQueue(db).replace_worklist(
+        WORKLIST_WORK_TYPE, priority=MEMORY_OPS, payloads=payloads,
+        reason="dream_cycle weekly synthesis worklist",
+    )
+    enqueued = len(payloads)
 
     logger.info(
-        "Dream cycle %s: worklist superseded %d prior, enqueued %d/%d clusters, "
+        "Dream cycle %s: worklist superseded %d prior, enqueued %d clusters, "
         "%d oversize flagged",
-        weekly_run_id[:8], superseded, enqueued, len(ranked), len(oversize),
+        weekly_run_id[:8], superseded, enqueued, len(oversize),
     )
     return {
         "enqueued": enqueued,
-        "enqueue_failed": len(ranked) - enqueued,
         "oversize_flagged": len(oversize),
         "superseded": superseded,
     }
@@ -590,8 +590,8 @@ async def run_synthesis_drain(
         #  - shield_skipped: clusters completed as no-op because shielding left
         #    <2 mergeable members (distinct from stale_skipped)
         #  - shield_missing_thresholds: slices with no frozen shield block while
-        #    the shield is enabled (pre-upgrade rows / enqueue-time shield
-        #    failure) — must reach 0 before the PR2 live-merge flip
+        #    the shield is enabled (older slices or slices enqueued while
+        #    the shield was disabled) — must reach 0 before the live-merge flip
         "shield_members_skipped": 0, "shield_skipped": 0,
         "shield_missing_thresholds": 0,
         # Capacity-recovery lifecycle (see the per-slice completion loop below):
@@ -622,9 +622,8 @@ async def run_synthesis_drain(
         item = await queue.next_pending(work_type=WORKLIST_WORK_TYPE)
         if item is None:
             break
-        if not await queue.mark_processing(item["id"]):
-            # Row deleted between fetch and claim (weekly supersede racing this
-            # drain — near-impossible by schedule, cheap to guard: FM-10).
+        if not await queue.claim_pending(item["id"]):
+            # A replacement or another drain won after this row was selected.
             continue
         try:
             payload = json.loads(item["payload_json"])
@@ -657,9 +656,9 @@ async def run_synthesis_drain(
         # A member whose salience rose during the drain week (e.g. retrieved
         # more) is removed here even though it passed at enqueue. Enable state
         # is read LIVE inside shield_filter_live, so an operator can disable the
-        # shield mid-week. A slice with no shield block predates the shield (or
-        # its enqueue-time computation failed) — do NOT filter (no bar to filter
-        # against), but count it: this counter must be 0 before the live flip.
+        # shield mid-week. Older slices and slices made with the shield
+        # disabled can lack thresholds. Count these when the shield is enabled:
+        # this counter must be 0 before the live flip.
         from genesis.memory import dream_shield, dream_shield_config
 
         shield_block = payload.get("shield")
@@ -735,7 +734,7 @@ async def run_synthesis_drain(
             if outcome not in ("exhausted", "unattempted"):
                 await queue.mark_completed(item["id"])
                 continue
-            # attempts was bumped by the mark_processing claim above, so
+            # attempts was bumped by the claim_pending call above, so
             # item["attempts"] (pre-claim) + 1 is this drain's claim number.
             attempt_no = item["attempts"] + 1
             charge_cap = outcome == "exhausted" and not capacity_abort
@@ -977,7 +976,7 @@ def _cluster_bucket_sync(
     for idx, point in enumerate(points):
         pid = point["id"]
         vec = vector_map.get(pid)
-        if vec is None:
+        if not vec:
             continue
         try:
             neighbors = search(
@@ -1046,7 +1045,9 @@ def _batch_get_vectors(
     """Batch-retrieve vectors — delegates to shared Qdrant utility."""
     from genesis.qdrant.collections import batch_retrieve_vectors
 
-    return batch_retrieve_vectors(qdrant, point_ids, collection=COLLECTION, failures=failures)
+    return batch_retrieve_vectors(
+        qdrant, point_ids, collection=COLLECTION, failures=failures, count_missing=True,
+    )
 
 
 def _get_vector(qdrant: QdrantClient, point_id: str) -> list[float]:

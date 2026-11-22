@@ -80,8 +80,8 @@ def _safe_confidence(payload: dict) -> float:
     A present-but-null ``confidence`` makes ``payload.get("confidence", 0.5)``
     return ``None`` (the default applies only to ABSENT keys), and ``None >=
     float`` raises ``TypeError``. One such payload must not crash the floor
-    comparison (weekly: disables the shield for the worklist; drain: propagates
-    after mark_processing and stalls the shadow drain).
+    comparison (weekly: holds the prior worklist; drain: could stall after
+    claiming a slice).
     """
     v = payload.get("confidence", 0.5)
     if isinstance(v, bool) or not isinstance(v, (int, float)):

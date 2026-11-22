@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import sqlite3
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -28,6 +31,11 @@ from genesis.memory.dream_cycle import (
     run_synthesis_drain,
 )
 from genesis.resilience.deferred_work import DeferredWorkQueue
+
+
+@pytest.fixture
+def db(file_db):
+    return file_db
 
 
 def _fake_cluster(n: int = 2, wing: str = "memory", room: str = "store"):
@@ -269,7 +277,7 @@ class TestDryRun:
              patch(
                  "genesis.memory.dream_cycle._persist_worklist",
                  new_callable=AsyncMock,
-                 return_value={"enqueued": 1, "enqueue_failed": 0, "oversize_flagged": 0, "superseded": 0},
+                 return_value={"enqueued": 1, "oversize_flagged": 0, "superseded": 0},
              ) as mock_persist:
             mock_scroll.return_value = (
                 [
@@ -335,13 +343,144 @@ def _clusters_of_sizes(*sizes: int):
 
 class TestWorklist:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["ABORT", "IGNORE"])
+    async def test_failed_second_insert_preserves_the_previous_batch(self, db, action):
+        async def pending():
+            return await db.execute_fetchall(
+                "SELECT id, payload_json FROM deferred_work_queue ORDER BY id",
+            )
+
+        await _persist_worklist(db, _clusters_of_sizes(2), weekly_run_id="previous")
+        prior = await pending()
+        fail = "RAISE(ABORT, 'fixture rejection')" if action == "ABORT" else "RAISE(IGNORE)"
+        await db.execute(
+            f"""CREATE TRIGGER reject_second_worklist_slice BEFORE INSERT ON deferred_work_queue
+                WHEN json_extract(NEW.payload_json, '$.room') = 'r1'
+                BEGIN SELECT {fail}; END""",
+        )
+        await db.commit()
+        with pytest.raises((sqlite3.IntegrityError, RuntimeError)):
+            await _persist_worklist(db, _clusters_of_sizes(3, 2), weekly_run_id="replacement")
+
+        assert await pending() == prior
+
+    @pytest.mark.asyncio
+    async def test_cancellation_before_commit_keeps_the_visible_batch(self, db, monkeypatch):
+        from genesis.db.connection import SerializedConnection
+
+        queue = DeferredWorkQueue(db)
+        await _persist_worklist(db, _clusters_of_sizes(2), weekly_run_id="previous")
+        previous = await queue.next_pending(work_type=WORKLIST_WORK_TYPE)
+        ready = asyncio.Event()
+        resume = asyncio.Event()
+        commit = SerializedConnection.commit
+
+        async def pause_commit(connection):
+            if connection is not db:
+                ready.set()
+                await resume.wait()
+            await commit(connection)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(SerializedConnection, "commit", pause_commit)
+            replacement = asyncio.create_task(
+                _persist_worklist(db, _clusters_of_sizes(4, 3), weekly_run_id="new"),
+            )
+            try:
+                await asyncio.wait_for(ready.wait(), timeout=5)
+                visible = await queue.next_pending(work_type=WORKLIST_WORK_TYPE)
+                assert visible["id"] == previous["id"]
+                assert await queue.count_pending(work_type=WORKLIST_WORK_TYPE) == 1
+            finally:
+                replacement.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await replacement
+
+        after_cancel = await queue.next_pending(work_type=WORKLIST_WORK_TYPE)
+        assert after_cancel["id"] == previous["id"]
+        result = await _persist_worklist(db, _clusters_of_sizes(4, 3), weekly_run_id="retry")
+        assert result["superseded"] == 1
+        assert await queue.count_pending(work_type=WORKLIST_WORK_TYPE) == 2
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_sqlite_commit_publishes_the_complete_batch(self, db, monkeypatch):
+        from genesis.db import connection
+
+        await _persist_worklist(db, _clusters_of_sizes(2), weekly_run_id="previous")
+        loop = asyncio.get_running_loop()
+        committing = asyncio.Event()
+        resume = threading.Event()
+        open_db = connection.get_db
+
+        def trace(sql):
+            if sql == "COMMIT":
+                loop.call_soon_threadsafe(committing.set)
+                resume.wait(timeout=10)
+
+        async def traced_writer(*args, **kwargs):
+            writer = await open_db(*args, **kwargs)
+            await writer.set_trace_callback(trace)
+            return writer
+
+        monkeypatch.setattr(connection, "get_db", traced_writer)
+        replacement = asyncio.create_task(
+            _persist_worklist(db, _clusters_of_sizes(4, 3), weekly_run_id="replacement"),
+        )
+        try:
+            await asyncio.wait_for(committing.wait(), timeout=5)
+            replacement.cancel()
+        finally:
+            resume.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await replacement
+        rows = await db.execute_fetchall(
+            "SELECT json_extract(payload_json, '$.weekly_run_id') FROM deferred_work_queue",
+        )
+        assert [row[0] for row in rows] == ["replacement", "replacement"]
+
+    @pytest.mark.asyncio
+    async def test_empty_complete_batch_preserves_claimed_and_unrelated_rows(self, db):
+        queue = DeferredWorkQueue(db)
+        await _persist_worklist(db, _clusters_of_sizes(4, 2), weekly_run_id="previous")
+        claimed = await queue.next_pending(work_type=WORKLIST_WORK_TYPE)
+        assert await queue.claim_pending(claimed["id"])
+        stale = await queue.next_pending(work_type=WORKLIST_WORK_TYPE)
+        other = await queue.enqueue("other", None, 50, "{}", "fixture")
+
+        result = await _persist_worklist(db, [], weekly_run_id="empty")
+
+        assert result["superseded"] == 1
+        assert result["enqueued"] == 0
+        assert not await queue.claim_pending(stale["id"])
+        rows = await db.execute_fetchall("SELECT id, status FROM deferred_work_queue")
+        assert {tuple(row) for row in rows} == {(claimed["id"], "processing"), (other, "pending")}
+
+    @pytest.mark.asyncio
+    async def test_daily_drain_does_not_rehydrate_an_already_claimed_slice(self, db, monkeypatch):
+        queue = DeferredWorkQueue(db)
+        await _persist_worklist(db, _clusters_of_sizes(2), weekly_run_id="previous")
+        stale = await queue.next_pending(work_type=WORKLIST_WORK_TYPE)
+        assert await queue.claim_pending(stale["id"])
+        monkeypatch.setattr(DeferredWorkQueue, "next_pending", AsyncMock(return_value=stale))
+        rehydrate = MagicMock(return_value=[])
+        monkeypatch.setattr("genesis.memory.dream_cycle._rehydrate_cluster", rehydrate)
+
+        await run_synthesis_drain(
+            qdrant=MagicMock(), db=db, router=AsyncMock(), store=AsyncMock(),
+            budget=1, dry_run=True,
+        )
+
+        rehydrate.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_enqueues_value_ordered_and_supersedes(self, db):
         """Slices drain biggest-first; a fresh weekly run replaces the old list."""
         queue = DeferredWorkQueue(db)
         result = await _persist_worklist(
             db, _clusters_of_sizes(2, 5, 3), weekly_run_id="week-1",
         )
-        assert result == {"enqueued": 3, "enqueue_failed": 0, "oversize_flagged": 0, "superseded": 0}
+        assert result == {"enqueued": 3, "oversize_flagged": 0, "superseded": 0}
         assert await queue.count_pending(work_type=WORKLIST_WORK_TYPE) == 3
 
         # FIFO-within-priority == enqueue order == size desc
@@ -521,13 +660,13 @@ class TestSynthesisDrain:
 
     @pytest.mark.asyncio
     async def test_superseded_item_skipped(self, db):
-        """mark_processing returning False (row deleted by a racing weekly
+        """claim_pending returning False (row deleted by a racing weekly
         supersede) skips the item instead of processing a ghost (FM-10)."""
         cluster = _fake_cluster(2)
         await _persist_worklist(db, [cluster], weekly_run_id="w")
 
         with patch.object(
-            DeferredWorkQueue, "mark_processing",
+            DeferredWorkQueue, "claim_pending",
             new_callable=AsyncMock, return_value=False,
         ):
             report = await run_synthesis_drain(
@@ -786,7 +925,7 @@ class TestSynthesisDrainCapacityRecovery:
         assert report["clusters_merged"] == 0
         rows = await self._rows(db)
         assert [r["status"] for r in rows] == ["pending"]
-        # Claimed once this drain (mark_processing), then reset — attempts stays 1.
+        # Claimed once this drain (claim_pending), then reset — attempts stays 1.
         assert [r["attempts"] for r in rows] == [1]
 
     @pytest.mark.asyncio
@@ -1388,7 +1527,7 @@ class TestShieldRunWiring:
              patch(_BATCH_VEC) as mock_vec, patch(
                  "genesis.memory.dream_cycle._persist_worklist",
                  new_callable=AsyncMock,
-                 return_value={"enqueued": 0, "enqueue_failed": 0, "oversize_flagged": 0, "superseded": 0},
+                 return_value={"enqueued": 0, "oversize_flagged": 0, "superseded": 0},
              ) as mock_persist:
             mock_scroll.return_value = (
                 [

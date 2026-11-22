@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Callable
-from datetime import UTC, datetime
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
@@ -131,6 +131,10 @@ class DeferredWorkQueue:
             limit=1,
         )
         return items[0] if items else None
+
+    async def claim_pending(self, id: str) -> bool:
+        """Claim a still-pending item and count one attempt."""
+        return await crud.claim_pending(self._db, id, last_attempt_at=self._clock().isoformat())
 
     async def mark_processing(self, id: str) -> bool:
         """Mark an item as being processed."""
@@ -262,6 +266,25 @@ class DeferredWorkQueue:
             self._db,
             work_type=work_type,
             exclude_status="processing",
+        )
+
+    async def replace_worklist(
+        self,
+        work_type: str,
+        *,
+        priority: int,
+        payloads: Sequence[str],
+        reason: str,
+    ) -> int:
+        """Replace a complete worklist while preserving its claims and order."""
+        now = self._clock()
+        entries = [
+            (str(uuid.uuid4()), payload, (now + timedelta(microseconds=rank)).isoformat())
+            for rank, payload in enumerate(payloads)
+        ]
+        return await crud.replace_worklist(
+            self._db, work_type=work_type, priority=priority, entries=entries,
+            reason=reason, staleness_policy=DRAIN,
         )
 
     async def drain_by_priority(self, limit: int = 10) -> list[dict]:

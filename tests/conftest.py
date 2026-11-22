@@ -1039,6 +1039,22 @@ async def db():
     await wrapped.close()
 
 
+@pytest.fixture
+async def file_db(tmp_path):
+    """Seed an isolated SQLite file for tests that open a second connection."""
+    from genesis.db.connection import get_db
+    from genesis.db.schema import create_all_tables, seed_data
+
+    conn = await get_db(tmp_path / "genesis.db")
+    try:
+        await create_all_tables(conn)
+        await seed_data(conn)
+        await conn.commit()
+        yield conn
+    finally:
+        await conn.close()
+
+
 @pytest.fixture(autouse=True)
 def _guard_db_crud_not_mocked():
     """Pin the test that leaks a Mock onto a real ``genesis.db.crud`` function.
