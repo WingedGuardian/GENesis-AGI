@@ -6413,6 +6413,7 @@ _HOOK_SURFACE_FILES = (
             "scripts/review_findings.py",  # reviewer list + severity parsers
             "scripts/review_reflection.py",  # round reflection tool + validator
             "scripts/review_late.py",  # late findings the round reflection owes
+            "scripts/review_past_terminal.py",  # the past-round-4 reflection rules
             "scripts/review_deadline.py",  # aggregate hook timeout arithmetic
             "scripts/external_review.py",  # autonomous review-request boundary
             "scripts/premise_gate.py",  # issue premise rule issue_premise_gate imports

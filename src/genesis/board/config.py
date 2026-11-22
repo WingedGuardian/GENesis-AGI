@@ -124,6 +124,65 @@ def writes_allowed() -> bool:
     return effective_mode() == "live"
 
 
+def builder_launch_armed() -> tuple[bool, str]:
+    """Whether the builder launcher may start builders, and why not if it may not.
+
+    Armed only by a hand edit of the overlay, ``builder_launch: {enabled: true}``
+    with the literal boolean, on a board whose configured ``mode`` is valid as
+    written (a degraded mode never arms) and is not ``off``. ``propose_only``
+    arms too: a launch writes nothing to GitHub. Every other value fails closed.
+
+    Only ``builder_launch.enabled: false`` or the kill switch DISARMS: a session
+    cannot change either (``settings_update`` refuses the ``builder_launch``
+    key). ``mode: off`` is not a disarm a session cannot undo, since a session
+    may set the board mode back to ``propose_only``. While the mode is off each
+    pass records ``launcher_disabled``, so setting it back starts a new enable
+    cutoff: cards already in Build are listed to the owner and never launch.
+    """
+    if _kill_switch_on():
+        return False, "board kill switch set"
+    cfg = load_config()
+    section = cfg.get("builder_launch")
+    if not isinstance(section, dict) or section.get("enabled") is not True:
+        return False, "builder_launch.enabled is not true"
+    mode = effective_mode()
+    if mode == "off":
+        return False, "board mode is off (not a lasting disarm: use builder_launch.enabled: false)"
+    if cfg.get("mode") != mode:
+        return False, f"board mode {cfg.get('mode')!r} is invalid (degraded to {mode})"
+    return True, "armed"
+
+
+#: The launcher's levers (``builder_launch:`` in the overlay), each with its
+#: default and the range a hand edit may set. Out of range or malformed reads
+#: as the default (logged), never as a looser value.
+BUILDER_LAUNCH_DEFAULTS: dict[str, tuple[int, int, int]] = {
+    # Live builders without an open closing PR at once (spec E rev 5).
+    "capacity": (1, 1, 4),
+    # Owner ruling 2026-11-14 (ego 9627ed63): a launch waits under this free memory.
+    "min_free_gb": (4, 1, 64),
+    # A build runs for hours and Remote Control dies with the login.
+    "login_margin_hours": (6, 1, 48),
+    # Builders take the lowest free slot from here, so the owner's usual
+    # low-numbered slots never open onto a builder's pane.
+    "first_slot": (9, 1, 9999),
+}
+
+
+def builder_launch_settings() -> dict[str, int]:
+    """The launcher's levers, defaulted and range-checked."""
+    section = load_config().get("builder_launch")
+    section = section if isinstance(section, dict) else {}
+    out = {}
+    for name, (default, low, high) in BUILDER_LAUNCH_DEFAULTS.items():
+        value = section.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            logger.warning("builder_launch.%s=%r is invalid; using %s", name, value, default)
+            value = default
+        out[name] = value
+    return out
+
+
 def valid_login(value: object) -> bool:
     return isinstance(value, str) and bool(_LOGIN.match(value))
 

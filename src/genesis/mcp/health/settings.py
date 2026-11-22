@@ -135,6 +135,10 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "appends each would-be lesson to "
             "~/.genesis/output/lesson_builder_shadow.jsonl, storing nothing; "
             "off skips the builder. "
+            "`segment` whole/shadow/incremental: shadow (default) judges the "
+            "whole session and logs what judging only its unjudged part would "
+            "do; whole skips that; incremental judges only the unjudged part "
+            "(needs mode live; runs as shadow otherwise). "
             "Invalid values degrade to shadow. Read live each extraction "
             "cycle by genesis.learning.procedural.lesson_builder_config."
         ),
@@ -1579,14 +1583,15 @@ def _validate_ws2_ledger(changes: dict) -> list[str]:
 def _validate_lesson_builder(changes: dict) -> list[str]:
     """Validate lesson_builder lever changes (see
     genesis.learning.procedural.lesson_builder_config)."""
-    from genesis.learning.procedural.lesson_builder_config import MODES
+    from genesis.learning.procedural.lesson_builder_config import MODES, SEGMENTS
 
+    allowed = {"mode": MODES, "segment": SEGMENTS}
     errors: list[str] = []
     for key, value in changes.items():
-        if key != "mode":
-            errors.append(f"Unknown key '{key}'. Valid: mode")
-        elif value not in MODES:
-            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        if key not in allowed:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(allowed)}")
+        elif value not in allowed[key]:
+            errors.append(f"'{key}' must be one of {', '.join(allowed[key])}; got {value!r}")
     return errors
 
 

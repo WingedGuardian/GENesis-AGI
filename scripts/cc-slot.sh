@@ -13,6 +13,23 @@
 #                                            slot map, takes the LOWEST free
 #                                            slot, forwards extra args to
 #                                            claude inside the session
+#        cc-slot.sh launch --issue N --key K --session-id UUID [--resume]
+#                          [--slot N] --prompt-file F
+#                                            builder launch (spec E, E3): takes
+#                                            slot N (or the LOWEST free one),
+#                                            starts it DETACHED, never prompts,
+#                                            never attaches. Prints `launched
+#                                            cc-N N` on stdout once claude is
+#                                            still running a few seconds after
+#                                            the create. Exit 0 launched, 64 bad
+#                                            arguments, 75 refused for now (slot
+#                                            taken or over capacity: retry later);
+#                                            any other non-zero exit is a failure.
+#                                            The builder runs in the same
+#                                            permission mode as the interactive
+#                                            slots (GENESIS_CC_PERMISSION_MODE)
+#                                            and on the `opus` alias (the latest
+#                                            Opus, never a pinned version).
 
 set -euo pipefail
 
@@ -137,6 +154,7 @@ SESSION_PREFIX="cc"
 if [[ $# -lt 1 ]]; then
     echo "Usage: cc-slot.sh <hostname>            (e.g., genesis-3-4)" >&2
     echo "       cc-slot.sh manual [claude-args]  (lowest free slot)" >&2
+    echo "       cc-slot.sh launch --issue N --key K --session-id UUID [--resume] [--slot N] --prompt-file F" >&2
     exit 1
 fi
 
@@ -145,6 +163,64 @@ shift
 
 # Extra claude args exist only in manual mode (SSH RemoteCommand passes %n only).
 CLAUDE_EXTRA_ARGS=("$@")
+
+# Non-zero exit for "refused by capacity" — 1 on the interactive doors, 75
+# (EX_TEMPFAIL) in launch mode so the launcher re-queues without a strike.
+_CC_REFUSE_RC=1
+
+# --- LAUNCH mode: a builder started by code, with nobody at the terminal ------
+# Parsed here, before anything else reads CLAUDE_EXTRA_ARGS, so no caller can
+# smuggle claude arguments through it: launch mode builds claude's argv itself.
+# Every value is validated against a closed grammar because each one ends up in
+# the pane's command string.
+if [[ "$MODE_ARG" == "launch" ]]; then
+    _CC_REFUSE_RC=75
+    _L_ISSUE="" _L_KEY="" _L_SID="" _L_RESUME=0 _L_PROMPT_FILE="" _L_SLOT=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --issue)       _L_ISSUE="${2-}"; shift 2 || { echo "cc-slot launch: --issue needs a value" >&2; exit 64; } ;;
+            --key)         _L_KEY="${2-}"; shift 2 || { echo "cc-slot launch: --key needs a value" >&2; exit 64; } ;;
+            --session-id)  _L_SID="${2-}"; shift 2 || { echo "cc-slot launch: --session-id needs a value" >&2; exit 64; } ;;
+            --prompt-file) _L_PROMPT_FILE="${2-}"; shift 2 || { echo "cc-slot launch: --prompt-file needs a value" >&2; exit 64; } ;;
+            --slot)        _L_SLOT="${2-}"; shift 2 || { echo "cc-slot launch: --slot needs a value" >&2; exit 64; } ;;
+            --resume)      _L_RESUME=1; shift ;;
+            *) echo "cc-slot launch: unknown argument '$1'" >&2; exit 64 ;;
+        esac
+    done
+    [[ "$_L_ISSUE" =~ ^[1-9][0-9]{0,6}$ ]] || { echo "cc-slot launch: --issue must be a positive integer" >&2; exit 64; }
+    [[ "$_L_KEY" =~ ^[A-Za-z0-9_.:@-]{1,200}$ ]] || { echo "cc-slot launch: --key must match [A-Za-z0-9_.:@-]{1,200}" >&2; exit 64; }
+    [[ "$_L_SID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+        || { echo "cc-slot launch: --session-id must be a lowercase UUID" >&2; exit 64; }
+    if [[ -n "$_L_SLOT" && ! "$_L_SLOT" =~ ^[1-9][0-9]{0,3}$ ]]; then
+        echo "cc-slot launch: --slot must be a positive integer" >&2; exit 64
+    fi
+    if [[ -z "$_L_PROMPT_FILE" || ! -f "$_L_PROMPT_FILE" || ! -r "$_L_PROMPT_FILE" ]]; then
+        echo "cc-slot launch: --prompt-file must name a readable file" >&2; exit 64
+    fi
+    # An early, coarse bound. The real limit is on tmux's whole client command
+    # (MEASURED on tmux 3.4: 16300 bytes accepted, 16340 refused), checked once
+    # the command is built, below.
+    _L_PROMPT_BYTES=$(wc -c < "$_L_PROMPT_FILE")
+    if [[ "$_L_PROMPT_BYTES" -gt 16384 ]]; then
+        echo "cc-slot launch: the prompt file holds ${_L_PROMPT_BYTES} bytes; at most 16384" >&2; exit 64
+    fi
+    _L_PROMPT="$(cat "$_L_PROMPT_FILE")"
+    if [[ ! "$_L_PROMPT" =~ [^[:space:]] ]]; then
+        echo "cc-slot launch: the prompt file is empty" >&2; exit 64
+    fi
+    # claude would read a leading `-` as a flag. The template starts with prose,
+    # so refuse rather than guess.
+    if [[ "$_L_PROMPT" == -* ]]; then
+        echo "cc-slot launch: the prompt must not start with '-'" >&2; exit 64
+    fi
+    CLAUDE_EXTRA_ARGS=()
+    # Nobody is at this terminal, whoever invoked the script: an SSH variable
+    # would make the capacity gate treat the launch as an operator login and
+    # offer an INTERACTIVE reclaim. Without them it answers ALLOW or DENY only
+    # (genesis.cc.session_cap.decide), and DENY exits 75 below.
+    unset SSH_CONNECTION SSH_CLIENT SSH_TTY
+    unset _L_PROMPT_BYTES
+fi
 
 # --- EPHEMERAL subcommands never get a slot ----------------------------------
 # An ephemeral `claude <subcommand>` prints something and exits. A slot is wrong
@@ -393,6 +469,20 @@ if [[ "$MODE_ARG" == "manual" ]]; then
     while _session_exists "${SESSION_PREFIX}-${SLOT}"; do
         SLOT=$((SLOT + 1))
     done
+elif [[ "$MODE_ARG" == "launch" ]]; then
+    # The launcher passes --slot so it can record the slot BEFORE the launch and
+    # find the pane again after its own restart. Without it, the same lowest-free
+    # search as manual mode, minus the slot map. A slot that is taken now, or
+    # between here and the create, is refused below (exit 75), never attached
+    # and never swapped for another number.
+    if [[ -n "$_L_SLOT" ]]; then
+        SLOT="$_L_SLOT"
+    else
+        SLOT=1
+        while _session_exists "${SESSION_PREFIX}-${SLOT}"; do
+            SLOT=$((SLOT + 1))
+        done
+    fi
 else
     SLOT="${MODE_ARG##*-}"
 
@@ -690,7 +780,7 @@ _cap_fail_open() {
         echo "ERROR: Session cap reached (${existing}/${safe}) [capacity gate unavailable]." >&2
     fi
     _cap_list_slots
-    exit 1
+    exit "$_CC_REFUSE_RC"
 }
 
 
@@ -790,7 +880,7 @@ _s2_liveness() {
 # and an affirmative answer KILLS a session someone just created. Gate on the mode
 # explicitly rather than on a stale probe; manual mode falls through to `-A`, which
 # simply attaches to whatever is there.
-if [[ "$MODE_ARG" != "manual" ]] && _session_exists "${SESSION_NAME}"; then
+if [[ "$MODE_ARG" != "manual" && "$MODE_ARG" != "launch" ]] && _session_exists "${SESSION_NAME}"; then
     _s2_snap1=$(_s2_snapshot)
     _s2_verdict=$(_s2_liveness "$_s2_snap1")
     _s2_srv1=$(printf '%s\n' "$_s2_snap1" | sed -n '1p' | cut -d'|' -f1)
@@ -985,6 +1075,13 @@ fi
 existing=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
            | grep -cE "^${SESSION_PREFIX}-[0-9]+$" || true)
 
+# Launch mode never attaches: a session that appeared since the free-slot search
+# belongs to someone else (a concurrent door). Refuse for now; the launcher retries.
+if [[ "$MODE_ARG" == "launch" ]] && _session_exists "$SESSION_NAME"; then
+    echo "cc-slot launch: ${SESSION_NAME} was taken before it could be created — retry" >&2
+    exit 75
+fi
+
 # Reattaching to existing session — always allow ('=' = exact-name match)
 _SESSION_EXISTS=0
 if _session_exists "$SESSION_NAME"; then
@@ -1024,8 +1121,14 @@ else
     _cap_reason=$(printf '%s\n' "$_cap_out" | sed -n '3p')
     case "$_cap_action" in
         ALLOW)   [ -n "$_cap_msg" ] && echo "cc-slot: ${_cap_msg}" >&2 || true ;;
-        DENY)    echo "ERROR: ${_cap_msg}" >&2; _cap_list_slots; exit 1 ;;
-        RECLAIM) _cap_reclaim "$_cap_msg" "$_cap_reason" ;;
+        DENY)    echo "ERROR: ${_cap_msg}" >&2; _cap_list_slots; exit "$_CC_REFUSE_RC" ;;
+        RECLAIM)
+            # Unreachable in launch mode (no SSH origin), and refused if it ever
+            # is: reclaim is an interactive prompt, and nobody is there.
+            if [[ "$MODE_ARG" == "launch" ]]; then
+                echo "ERROR: ${_cap_msg}" >&2; exit "$_CC_REFUSE_RC"
+            fi
+            _cap_reclaim "$_cap_msg" "$_cap_reason" ;;
         *)       _cap_fail_open ;;   # empty/unexpected → Python gate unavailable
     esac
 fi
@@ -1149,6 +1252,10 @@ fi
 _OAUTH_SRC=""
 _slot_oauth_mode="${GENESIS_CC_SLOT_OAUTH:-conditional}"
 _slot_oauth_mode="${_slot_oauth_mode,,}"   # normalize; the gate is the value authority
+# A builder answers its owner through Remote Control, which a setup-token cannot
+# carry ("can only make model requests", Claude Code authentication docs). The
+# launcher holds a launch while /login is dead instead, so never inject one here.
+[[ "$MODE_ARG" == "launch" ]] && _slot_oauth_mode="off"
 if [ "$_SESSION_EXISTS" = "0" ] && [ "$_slot_oauth_mode" != "off" ] && [ "$_HAS_BARE" = "0" ]; then
     # The gate both DECIDES and AUTHORS the notice: on inject it exits 0 and
     # prints the mode-appropriate human notice to stdout — captured here so the
@@ -1290,12 +1397,127 @@ _TMUX_SERVER_SCOPE=()
 if [ -x "$GENESIS_ROOT/scripts/slot_exec.sh" ] && ! tmux -u list-sessions >/dev/null 2>&1; then
     _TMUX_SERVER_SCOPE=("$GENESIS_ROOT/scripts/slot_exec.sh" --unit-prefix genesis-tmux --slice app.slice --omit server --)
 fi
-exec "${_TMUX_SERVER_SCOPE[@]}" tmux -u new-session -A -s "$SESSION_NAME" \
-    -e "GENESIS_SLOT=${SLOT}" \
-    -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
-    "${_TMPDIR_PIN[@]}" \
-    "${_SQLITE_TMPDIR_PIN[@]}" \
-    -e "GENESIS_CC_SLOT_OAUTH=${_slot_oauth_mode}" \
-    "${_FUNCTION_HOOKS_PIN[@]}" \
-    -e "LANG=$LANG" \
-    "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}${_FUNCTION_HOOKS_UNSET:-}${_SLOT_EXEC_PREFIX:-}claude ${_WEB_OVERRIDE_ARGS:-}${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${_CC_EXIT_CAPTURE_Q} ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
+if [[ "$MODE_ARG" == "launch" ]]; then
+    # The builder's caps on subagents (#3618 gates 1-2). It is a FILE, not inline
+    # JSON, because the file form is what was measured: a --settings value
+    # overrides the install-wide env block, fresh and after a resume (E3-0 (e)).
+    # Missing caps are a missing safety gate, so refuse rather than launch.
+    _L_SETTINGS="$GENESIS_ROOT/config/builder_settings.json"
+    if [[ ! -r "$_L_SETTINGS" ]]; then
+        echo "cc-slot launch: $_L_SETTINGS is missing — not launching a builder without its caps" >&2
+        exit 1
+    fi
+    # A malformed file would make claude exit at once, after the create reported
+    # success, so check it parses before anything starts.
+    # Standard library only, so the system python3 (not the venv) is enough.
+    if ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$_L_SETTINGS" 2>/dev/null; then
+        echo "cc-slot launch: $_L_SETTINGS is not valid JSON — not launching" >&2
+        exit 1
+    fi
+    # POSIX single quotes, not printf %q: %q writes a multi-line value as $'...',
+    # which only bash and zsh read, and the pane runs tmux's default-shell.
+    _sq() { local s=$1; printf " '%s'" "${s//\'/\'\\\'\'}"; }
+    if [[ "$_L_RESUME" == "1" ]]; then
+        _L_CLAUDE_ARGS=(-r "$_L_SID")
+    else
+        _L_CLAUDE_ARGS=(-n "build-#${_L_ISSUE}" --session-id "$_L_SID")
+    fi
+    # `opus` is Claude Code's alias for the latest Opus model (it moves with new
+    # releases; a full id would pin a version). Passed explicitly so a session
+    # that saves a different /model default cannot change what builders run.
+    _L_CLAUDE_ARGS+=(--model opus --remote-control "build #${_L_ISSUE}" --settings "$_L_SETTINGS" "$_L_PROMPT")
+    _L_CLAUDE_Q=""
+    for _a in "${_L_CLAUDE_ARGS[@]}"; do _L_CLAUDE_Q+=$(_sq "$_a"); done
+
+    # The ENVIRONMENT is rebuilt inside the pane. A new session inherits the tmux
+    # SERVER's environment (measured above), and a server that genesis-server's
+    # dashboard terminal started carries every secret that unit loads. So claude
+    # starts from `env -i` plus the variables a manual slot's claude carries
+    # (MEASURED name set, E3-0 (b)) and the builder key, nothing else: no
+    # CLAUDE_PID or other pane's identity, no GENESIS_CC_SESSION, no API key, no
+    # OAuth token. Static values are fixed here and single-quoted; the five tmux sets
+    # per pane are read by the pane shell, and dropped when unset rather than
+    # passed empty (`${X+X="$X"}`).
+    _L_UID=$(id -u)
+    _L_SHELL=$(getent passwd "$_L_UID" 2>/dev/null | cut -d: -f7) || _L_SHELL=""
+    [[ -n "$_L_SHELL" ]] || _L_SHELL=/bin/bash
+    _L_ENV=(
+        "HOME=$HOME" "USER=$(id -un)" "SHELL=$_L_SHELL" "LANG=$LANG" "PATH=$PATH"
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${_L_UID}/bus"
+        "XDG_RUNTIME_DIR=/run/user/${_L_UID}"
+        "GENESIS_SLOT=${SLOT}" "GENESIS_BUILDER_KEY=${_L_KEY}"
+        "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}"
+        "GENESIS_CC_SLOT_OAUTH=off"
+    )
+    [[ -n "${TMPDIR:-}" ]] && _L_ENV+=("TMPDIR=$TMPDIR" "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR")
+    [[ -n "${SQLITE_TMPDIR:-}" ]] && _L_ENV+=("SQLITE_TMPDIR=$SQLITE_TMPDIR")
+    [[ "${#_FUNCTION_HOOKS_PIN[@]}" -gt 0 ]] && _L_ENV+=("CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1")
+    _L_ENV_Q=""
+    for _a in "${_L_ENV[@]}"; do _L_ENV_Q+=$(_sq "$_a"); done
+    unset _a
+    _L_PANE_ENV='${TERM+TERM="$TERM"} ${TMUX+TMUX="$TMUX"} ${TMUX_PANE+TMUX_PANE="$TMUX_PANE"} ${TERM_PROGRAM+TERM_PROGRAM="$TERM_PROGRAM"} ${TERM_PROGRAM_VERSION+TERM_PROGRAM_VERSION="$TERM_PROGRAM_VERSION"}'
+
+    _NS_FLAG=-d
+    # Also on the SESSION (not only claude's env), so the launcher can map a
+    # builder key to its slot with `tmux show-environment -t cc-N`.
+    # The issue too: the launcher maps a builder to its issue from here, live.
+    _L_KEY_PIN=(-e "GENESIS_BUILDER_KEY=${_L_KEY}" -e "GENESIS_BUILDER_ISSUE=${_L_ISSUE}")
+    _NS_CMD="cd ${_GENESIS_ROOT_Q} && env -i${_L_ENV_Q} ${_L_PANE_ENV} ${_SLOT_EXEC_PREFIX:-}claude ${_WEB_OVERRIDE_ARGS:-}${CC_PERM_FLAG}${_L_CLAUDE_Q}; __ec=\$?; ${_CC_EXIT_CAPTURE_Q} ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
+else
+    _NS_FLAG=-A
+    _L_KEY_PIN=()
+    # The pane command stays on a line of its own: the oauth tests extract and
+    # run exactly this string (tests/test_scripts/test_cc_slot_oauth.py).
+    _NS_CMD=\
+"${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}${_FUNCTION_HOOKS_UNSET:-}${_SLOT_EXEC_PREFIX:-}claude ${_WEB_OVERRIDE_ARGS:-}${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${_CC_EXIT_CAPTURE_Q} ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
+fi
+
+# ONE create invocation for every door (the create path is the heal path). Launch
+# mode differs only in -d (detached: a launch creates or fails, never attaches)
+# and in its pane command; the pins are the same.
+_NS=("${_TMUX_SERVER_SCOPE[@]}" tmux -u new-session "$_NS_FLAG" -s "$SESSION_NAME"
+    -e "GENESIS_SLOT=${SLOT}"
+    -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}"
+    "${_TMPDIR_PIN[@]}"
+    "${_SQLITE_TMPDIR_PIN[@]}"
+    -e "GENESIS_CC_SLOT_OAUTH=${_slot_oauth_mode}"
+    "${_FUNCTION_HOOKS_PIN[@]}"
+    "${_L_KEY_PIN[@]}"
+    -e "LANG=$LANG"
+    "$_NS_CMD")
+if [[ "$MODE_ARG" == "launch" ]]; then
+    # tmux refuses a client command past ~16.3 KB (MEASURED on tmux 3.4: 16300
+    # bytes accepted, 16340 refused). Refuse it here as bad input (64), not later
+    # as a tmux failure the launcher would count as a strike.
+    # In BYTES: under this script's UTF-8 locale ${#} counts characters, and a
+    # multibyte prompt would pass a character count (MEASURED: 3 CJK chars read
+    # as 3 under UTF-8 and 9 under LC_ALL=C). The subshell keeps the locale local.
+    _L_ARGV_BYTES=$(LC_ALL=C; n=0; for _a in "${_NS[@]}"; do n=$(( n + ${#_a} + 1 )); done; echo "$n")
+    if [[ "$_L_ARGV_BYTES" -gt 16000 ]]; then
+        echo "cc-slot launch: the pane command is ${_L_ARGV_BYTES} bytes; tmux refuses past about 16300 — shorten the prompt" >&2
+        exit 64
+    fi
+    # The tmux SERVER gets its own scope when none is running (above), which is
+    # what keeps the pane alive after the launcher's own unit ends (E3-0 (a)).
+    if ! "${_NS[@]}"; then
+        # The create itself failed. If the name now exists, a concurrent door
+        # won the race (retry); otherwise it is a real failure.
+        if _session_exists "$SESSION_NAME"; then
+            echo "cc-slot launch: ${SESSION_NAME} was taken while it was being created — retry" >&2
+            exit 75
+        fi
+        echo "cc-slot launch: tmux could not create ${SESSION_NAME}" >&2
+        exit 1
+    fi
+    # A create that succeeds can still start a claude that exits at once (a
+    # resume with no transcript, a refused flag). The session closes with it, so
+    # "created" is only reported once the session is still there a moment later.
+    sleep "${GENESIS_CC_LAUNCH_SETTLE_S:-3}"
+    if ! _session_exists "$SESSION_NAME"; then
+        echo "cc-slot launch: ${SESSION_NAME} exited right after starting — see ~/.genesis/logs/cc_exit_${SLOT}.log" >&2
+        exit 1
+    fi
+    echo "launched ${SESSION_NAME} ${SLOT}"
+    exit 0
+fi
+exec "${_NS[@]}"

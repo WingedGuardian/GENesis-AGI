@@ -1,1 +1,0 @@
-- Post-merge verification records: `scripts/pr_verification.py close` and the `pr_verification_close` MCP tool now refuse to close a record whose event-gated gap has a date that has already come (run its recheck now instead), and show advisory completeness questions on every run (`check:` lines, or a `prompts` field) to answer before a close.

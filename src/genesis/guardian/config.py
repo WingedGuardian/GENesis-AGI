@@ -55,6 +55,12 @@ class ConfirmationConfig:
     max_recheck_attempts: int = 3
     required_failed_signals: int = 2
     bootstrap_grace_s: int = 300
+    # A failure episode that starts within this long after a detected host
+    # reboot gets this grace instead: a cold boot of the container stack is
+    # slow. MEASURED on a live install: Genesis was healthy again by itself
+    # about 13.5 min after the first failed probe, while the 300 s grace had
+    # already expired and paged "Genesis down — all automated recovery failed".
+    post_reboot_grace_s: int = 1200
     pause_reminder_hours: int = 24
     confirmed_dead_timeout_s: int = 600  # Auto-reset after 10min stuck
     max_auto_resets: int = 3  # Prevent infinite reset oscillation
@@ -87,6 +93,11 @@ class CCConfig:
     max_turns: int = 50    # Runaway guard — legitimate work is ~15-30 turns
     path: str = "claude"
     work_dir: str = "/var/lib/guardian-snapshots/cc-sessions"
+    # Daily auth canary: one minimal real call through the diagnosis's own
+    # credential path, so a recovery brain that cannot authenticate is found on
+    # a quiet day instead of during an outage.
+    canary_enabled: bool = True
+    canary_interval_h: int = 24
 
 
 @dataclass
@@ -192,6 +203,9 @@ class StoragePoolConfig:
     # Re-alert cadence while a tier is sustained (avoids per-tick spam but keeps
     # a live problem visible). Tier *increases* always alert immediately.
     realert_hours: float = 6.0
+    # A tier is left only once the reading is this many points below its line,
+    # so a pool that hovers at a line pages once, not on every crossing.
+    exit_margin_pct: float = 5.0
 
     # --- Pressure RELIEF (pool_relief.py) -----------------------------------
     # The tiers above only ALERT. A thin pool once filled to 100% while CRITICAL

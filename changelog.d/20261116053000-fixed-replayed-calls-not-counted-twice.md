@@ -1,0 +1,1 @@
+- A transcript that replays earlier tool calls (Claude Code's request-blob records) no longer makes the lesson builder count each replayed call a second time as a crashed call, which inflated that session's struggle score.

@@ -120,6 +120,7 @@ def _reflection(head: str, keys=("c11",), *, premise_round: bool = False) -> str
                 *premise,
                 "Premise-why: the bound is checked in one place and trusted in another",
                 "Impossible: route every reader through the one checked helper",
+                "Alternative: none found: searched scripts/ for an existing checked helper",
                 "Scope: covered: the bound holds at the edge (tests/test_x.py)",
                 "Decision: close-class",
                 "Decision-why: the same unchecked read appears at both call sites",
@@ -203,6 +204,8 @@ def test_a_content_commit_is_denied_while_the_round_owes_a_reflection(
     assert "Owed: c11." in res.stderr
     assert "review_reflection.py status" in res.stderr
     assert "--allow-empty --cleanup=verbatim -F" in res.stderr
+    # #4676: a field the writer must fill is named in the text the gate prints.
+    assert f"From {rr.ALTERNATIVE_CUTOVER_ISO[:10]}, a fix-now disposition also needs an `Alternative:` line" in res.stderr
 
 
 def test_the_deny_names_the_second_reflection_route_before_a_push(repo, home, monkeypatch):
@@ -304,10 +307,24 @@ def test_a_near_miss_reflection_is_denied_with_its_exit(
     assert "looks like a round reflection" in res.stderr and why in res.stderr
 
 
+#: A fixed time for ``_past_the_budget``'s reviews, never the wall clock: after
+#: the round rule's and the reflection gate's cutovers (so the rounds count and
+#: are owed) and before the past-round-4 rules' (so they never bind here,
+#: whenever the suite runs). Asserted in the fixture.
+_PAST_ANCHOR = datetime(2026, 10, 25, 12, 0, tzinfo=UTC)
+
+
 def _past_the_budget(monkeypatch, repo: Path) -> str:
     """Four rounds on four REAL commits (so their ancestry is readable whatever the
     clock says relative to the cutover): the ordinary lane's standing budget is
     spent, so every commit would get the round-approval ask."""
+    import review_budget  # noqa: PLC0415
+    import review_past_terminal  # noqa: PLC0415
+
+    for cut in (review_budget.ROUND_RULE_CUTOVER_ISO, rr.REFLECTION_CUTOVER_ISO):
+        assert datetime.fromisoformat(cut) < _PAST_ANCHOR
+    later = review_past_terminal.PAST_TERMINAL_CUTOVER_ISO
+    assert later is None or datetime.fromisoformat(later) > _PAST_ANCHOR
     _open_round(monkeypatch, repo)
     for n in (1, 2, 3):
         (repo / "f.py").write_text(f"value = {10 + n}\n")
@@ -320,7 +337,7 @@ def _past_the_budget(monkeypatch, repo: Path) -> str:
     monkeypatch.setenv("_TEST_REVIEW_BUDGET_COMMITS", "\n".join(json.dumps(r) for r in rows))
     reviews = []
     for i, sha in enumerate(shas[-4:]):
-        when = (datetime.now(UTC) - timedelta(hours=5 - i)).isoformat().replace("+00:00", "Z")
+        when = (_PAST_ANCHOR + timedelta(hours=i)).isoformat().replace("+00:00", "Z")
         reviews.append(
             {
                 "id": 1 + i,
@@ -559,7 +576,9 @@ def test_snapshot_exemption_keeps_real_reader_late_debt(repo, quiet, monkeypatch
     assert quiet == []
 
 
-def _late_reflection_problem(repo, monkeypatch, tmp_path, *, owed, names, late_rounds):
+def _late_reflection_problem(
+    repo, monkeypatch, tmp_path, *, owed, names, late_rounds, edit=lambda text: text
+):
     """Admission at round 2 with ``owed`` owed (c11 a late key whose round
     contexts, as review_late would place them, are ``late_rounds``) for a
     round-1-style reflection (Premise: LEAD) naming ``names``."""
@@ -577,7 +596,7 @@ def _late_reflection_problem(repo, monkeypatch, tmp_path, *, owed, names, late_r
         "_contexts",
         lambda *a, **k: [review_late.RoundContext(n, None, ()) for n in late_rounds],
     )
-    msg = _write_reflection(tmp_path, _reflection(head, keys=tuple(names)))
+    msg = _write_reflection(tmp_path, edit(_reflection(head, keys=tuple(names))))
     command = f"git commit --allow-empty --cleanup=verbatim -F {msg}"
     segs, _ = _gate.analyze_checked(command)
     state = {
@@ -622,6 +641,37 @@ def test_admission_follows_what_the_debt_reader_would_credit(
         repo, monkeypatch, tmp_path, owed=owed, names=names, late_rounds=late_rounds
     )
     assert problem is not None and why in problem, problem
+
+
+_ALTERNATIVE = "Alternative: none found: searched scripts/ for an existing checked helper\n"
+
+
+@pytest.mark.parametrize("late_round", [0, 1])
+def test_after_the_cutover_a_fix_now_without_its_alternative_is_refused(
+    repo, monkeypatch, tmp_path, late_round
+):
+    """Spec 5.8: admission judges the line as committed now, in every round
+    (round 0 included), and the refusal names the line (#4676: the writer
+    learns a field from the gate's own text)."""
+    monkeypatch.setattr(rr, "ALTERNATIVE_CUTOVER_ISO", "2026-01-01T00:00:00+00:00")
+    problem = _late_reflection_problem(
+        repo, monkeypatch, tmp_path, owed=["c11"], names=["c11"], late_rounds=[late_round],
+        edit=lambda text: text.replace(_ALTERNATIVE, ""),
+    )
+    assert problem is not None and "'Alternative: <it>'" in problem, problem
+    assert _late_reflection_problem(
+        repo, monkeypatch, tmp_path, owed=["c11"], names=["c11"], late_rounds=[late_round]
+    ) is None
+
+
+def test_before_the_cutover_a_fix_now_without_its_alternative_is_admitted(
+    repo, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(rr, "ALTERNATIVE_CUTOVER_ISO", "2099-01-01T00:00:00+00:00")
+    assert _late_reflection_problem(
+        repo, monkeypatch, tmp_path, owed=["c11"], names=["c11"], late_rounds=[1],
+        edit=lambda text: text.replace(_ALTERNATIVE, ""),
+    ) is None
 
 
 def test_a_late_round_one_key_is_admitted_through_the_real_reader(repo, monkeypatch, tmp_path):
@@ -1449,3 +1499,51 @@ def test_a_reflection_that_fails_its_grammar_does_not_silence_the_advisory(
     assert res.returncode == 0, res.stdout + res.stderr
     context = json.loads(res.stdout)["hookSpecificOutput"]["additionalContext"]
     assert "no reflection" in context and head[:12] in context
+
+
+def test_admission_applies_the_past_round_four_rules(repo, monkeypatch, tmp_path):
+    """The commit gate's admission runs the rules too (rework PR 2 of #4368):
+    with the PR past round 4 under them, a fix-now reflection naming a round-0
+    late key and no Prediction lines is refused, not admitted to credit nothing."""
+    import review_past_terminal as pt
+
+    now = datetime.now(UTC)
+    placed = {
+        f"{i:040x}": pt.RoundRecord(
+            f"{i:040x}", i, now - timedelta(hours=10 - i), ((now - timedelta(hours=10 - i), False, f"c{i}"),)
+        )
+        for i in range(1, 5)
+    }
+    monkeypatch.setattr(pt, "PAST_TERMINAL_CUTOVER_ISO", (now - timedelta(days=1)).isoformat())
+    monkeypatch.setattr(pt, "round_records", lambda budget: placed)
+    problem = _late_reflection_problem(
+        repo, monkeypatch, tmp_path, owed=["c11"], names=["c11"], late_rounds=[0]
+    )
+    assert problem is not None and "past-round-4 rules" in problem and "Prediction" in problem, problem
+    monkeypatch.setattr(pt, "PAST_TERMINAL_CUTOVER_ISO", None)
+    assert _late_reflection_problem(
+        repo, monkeypatch, tmp_path, owed=["c11"], names=["c11"], late_rounds=[0]
+    ) is None
+
+
+def test_key_rounds_names_each_keys_round_head(repo, monkeypatch):
+    """``_key_rounds`` returns ``(number, head)``: the current round and head
+    for an open key, a late key's own context's number and head (round 0:
+    ``(None, None)``). Admission looks the record up by that head."""
+    import time
+
+    import review_late
+
+    head = _head(repo)
+    late = [{"key": "c11", "head": head, "at": datetime.now(UTC)}]
+    monkeypatch.setattr(review_late, "late_findings", lambda *a, **k: late)
+    monkeypatch.setattr(review_late, "fix_time_reader", lambda *a, **k: (lambda h: None))
+    monkeypatch.setattr(review_late, "_ancestry", lambda budget: (set(), lambda sha: ()))
+    contexts = [review_late.RoundContext(5, None, (), "e" * 40), review_late.RoundContext(0, None, ())]
+    monkeypatch.setattr(review_late, "_contexts", lambda *a, **k: contexts)
+    state = {"owed": ["c11", "c12"], "late_keys": ["c11"], "cutover": None, "held_rounds": []}
+    budget = _budget(count=6, current_head=head)
+    got = _gate._key_rounds(
+        str(repo), budget, state, {"c11", "c12"}, rr, deadline=time.monotonic() + 30
+    )
+    assert got == {"c12": [(6, head)], "c11": [(5, "e" * 40), (None, None)]}

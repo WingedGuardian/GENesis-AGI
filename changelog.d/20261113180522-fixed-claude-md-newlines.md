@@ -1,1 +1,0 @@
-- Preserve Personal Notes and original newline bytes outside the managed container block when refreshing CLAUDE.md; malformed markers leave the file unchanged.

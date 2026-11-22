@@ -17,8 +17,10 @@ Flat sibling of deploy_candidates.py (see that file for the commands).
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import re
+import stat
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
@@ -50,13 +52,30 @@ REQUIRED_MERGED: tuple[tuple[str, str], ...] = (
         "8fa53412c9f1ffb93e8831d126be962afd90106c",  # pragma: allowlist secret
     ),
 )
-# PR C (the wipers: host REVERT_CODE, bootstrap crash recovery, the dashboard's
-# update routes) has not merged. It creates this file, which holds bootstrap's
-# crash-recovery branch guard; until it exists in the serving base, `add` and
-# `rebuild` refuse on every install and the engine ships INERT. PR C also adds
-# the check that the host guardian's deployed commit contains it, because
-# REVERT_CODE runs on the host.
+# The readiness marker (#2978): until this file exists in the serving base, `add`
+# and `rebuild` refuse on every install. The wipers it stands for have landed
+# (update.sh and deploy_code_only.sh rebuild `live` through the engine, bootstrap
+# never rolls `live` back, the host guardian never reverts on `live`), so the
+# file arms the engine. Where a host guardian is configured, its deployed commit
+# must contain HOST_REQUIRED (host_guardian_failures): REVERT_CODE runs on the
+# host, from whatever commit was last deployed there.
 PR_C_MARKER = "scripts/lib/deploy_live.sh"
+# The host guardian's `live` ban (#3546): check.py turns REVERT_CODE into a
+# container restart on `live` and recovery.py refuses it. Required by commit, not
+# by the marker: update.sh redeploys the host only when a guardian path changed
+# (GUARDIAN_PATHS), and the marker is not one, so a marker requirement would hold
+# an up-to-date host as not ready forever.
+HOST_REQUIRED: tuple[str, str] = (
+    "#3546, the host guardian never reverts code on `live`",
+    "8c3dad8ba08483b9197e21aad824a01a71d267b0",  # pragma: allowlist secret
+)
+# The host guardian's config (written by install_guardian.sh) and the probe of its
+# deployed version that update.sh and the nightly align timer persist
+# (scripts/lib/cc_version.sh, "Persist the probe"), both under $HOME/.genesis.
+GUARDIAN_REMOTE = "guardian_remote.yaml"
+HOST_GATEWAY_STATE = "host_gateway_state.json"
+_HOST_STATE_MAX_BYTES = 64 * 1024
+_ABBREV_SHA = re.compile(r"[0-9a-f]{7,40}")
 SYNC_HOOKS = "scripts/hooks/sync-hooks.sh"
 _SYNC_ARRAYS = ("HOOKS_TO_SYNC", "HELPERS_TO_SYNC")
 # The helpers: sync-hooks.sh overwrites these whatever their bytes.
@@ -164,8 +183,7 @@ REFUSAL_FILES = (
     "scripts/lib/live_move_restore_write.py",
     "scripts/systemd/genesis-server.service.template",
     "scripts/systemd/genesis-bridge.service.template",
-    # PR C's file: readiness reads it from the server's base, and it will hold
-    # bootstrap's crash-recovery branch guard.
+    # The readiness marker: readiness reads it from the server's base.
     PR_C_MARKER,
 )
 # The boot repair readiness checks (#3492 D2c): the kit's installer, loaded by
@@ -306,7 +324,104 @@ def readiness_failures(repo: Repo, base: str) -> list[str]:
                     f"PR C (the wipers rebuild `live`) is not in {judged} {mb[:12]}: "
                     f"{PR_C_MARKER} does not exist there (it has not merged, or is not deployed)"
                 )
-    return fails + hook_install_failures(repo) + boot_repair_failures(repo)
+    # The rebuild builds on `base` (fetched origin/main), not on the serving
+    # merge-base: a main that has since deleted the marker has disarmed `live`.
+    if base and repo.blob_at(base, PR_C_MARKER) is None:
+        fails.append(
+            f"origin/main {base[:12]} no longer has {PR_C_MARKER}: `live` is disarmed there, "
+            "so no candidate goes live on it"
+        )
+    return (
+        fails
+        + host_guardian_failures(repo)
+        + hook_install_failures(repo)
+        + boot_repair_failures(repo)
+    )
+
+
+def host_guardian_failures(repo: Repo) -> list[str]:
+    """Why the host guardian may still run code without its `live` ban ([] when
+    it does not, or when no host guardian is configured here).
+
+    The guardian runs on the host from the commit update.sh last deployed there,
+    which can lag the server's. Its deployed commit, as the last probe recorded
+    it, must name exactly one COMMIT in this clone (resolved in the object store
+    only, never against refs, as deploy_health.resolve_commit does), and
+    HOST_REQUIRED must be its ancestor. Every way that cannot be shown is a
+    refusal that names it: a missing or unreadable probe never reads as ready.
+    `drop` runs no readiness check, so a hand drop works whatever this says."""
+    genesis = repo.home / ".genesis"
+    config = genesis / GUARDIAN_REMOTE
+    remedy = (
+        "run scripts/update.sh (detached) from main, which re-probes the host and redeploys "
+        "its guardian when that code changed; or re-probe with "
+        "`systemctl --user start genesis-cc-align.service` (it uses the default SSH key only)"
+    )
+    try:
+        config_mtime = os.stat(config).st_mtime
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        # Absent is the only "no host guardian": an unreadable config is not one.
+        return [f"{config} could not be checked ({exc.strerror}); {remedy}"]
+    state = genesis / HOST_GATEWAY_STATE
+    try:
+        # O_NONBLOCK: a FIFO at this path must not hang readiness, which update.sh
+        # runs with update.lock held; O_NOFOLLOW and the regular-file check refuse
+        # anything but the file the probe writes.
+        fd = os.open(state, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as exc:
+        return [
+            f"the host guardian's deployed version is unknown ({state}: {exc.strerror}); {remedy}"
+        ]
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return [f"{state} is not a regular file, so it was not read; {remedy}"]
+        # The probe names no host, so it is only about the configured guardian if
+        # it was taken after the config last changed (a new host, a new key).
+        if st.st_mtime < config_mtime:
+            return [
+                f"{state} predates {config}: the guardian config changed after the last "
+                f"probe, so it may describe another host; {remedy}"
+            ]
+        raw = os.read(fd, _HOST_STATE_MAX_BYTES + 1)
+    except OSError as exc:
+        return [f"{state} could not be read ({exc.strerror}); {remedy}"]
+    finally:
+        os.close(fd)
+    if len(raw) > _HOST_STATE_MAX_BYTES:
+        return [f"{state} is over {_HOST_STATE_MAX_BYTES} bytes, so it was not read; {remedy}"]
+    try:
+        name = json.loads(raw)["version"]["deployed_commit"]
+    except (ValueError, TypeError, KeyError, RecursionError):
+        return [f"{state} names no version.deployed_commit; {remedy}"]
+    if not isinstance(name, str) or not _ABBREV_SHA.fullmatch(name):
+        return [f"{state} names no commit as the host guardian's ({name!r}); {remedy}"]
+    p = repo.git("rev-parse", f"--disambiguate={name}", check=False)
+    found = p.stdout.split() if p.returncode == 0 else []
+    commits = [
+        c for c in found if repo.git("cat-file", "-t", c, check=False).stdout.strip() == "commit"
+    ]
+    if len(commits) != 1:
+        if len(commits) > 1:
+            why = "is ambiguous"
+        elif found:
+            why = "names no commit (only other objects)"
+        else:
+            why = "names no object in this clone (fetch origin)"
+        return [f"the host guardian's deployed commit {name} {why}; {remedy}"]
+    label, sha = HOST_REQUIRED
+    have = repo.resolve(sha) if HEX40.match(sha) else None
+    if not have:
+        return [f"{label}: {sha[:12]} is not in this repository (fetch origin)"]
+    if not repo.is_ancestor(have, commits[0]):
+        return [
+            f"the host guardian runs {name}, which predates {label} ({sha[:12]}); {remedy}. "
+            "On a `live` checkout update.sh refuses before it redeploys the host: drop every "
+            "candidate first (`deploy_candidates drop <branch>`), then update from main"
+        ]
+    return []
 
 
 def kit_status(repo: Repo) -> dict:
@@ -322,16 +437,23 @@ def kit_status(repo: Repo) -> dict:
 
 def unit_show(repo: Repo) -> subprocess.CompletedProcess:
     """The LOADED server unit's boot-step properties, asked the way the watchdog
-    asks (util/systemd.py): with no user-bus variables systemctl --user fails
-    ("No medium found", MEASURED), and the engine cannot import genesis."""
-    env = dict(repo.env)
-    run = f"/run/user/{os.getuid()}"
-    env["XDG_RUNTIME_DIR"] = env.get("XDG_RUNTIME_DIR") or run
-    env["DBUS_SESSION_BUS_ADDRESS"] = env.get("DBUS_SESSION_BUS_ADDRESS") or f"unix:path={run}/bus"
+    asks (util/systemd.py), and the engine cannot import genesis."""
     cmd = ["systemctl", "--user", "show", SERVER_UNIT, *UNIT_PROPS]
     # A local property read answers in milliseconds; 10 s bounds a hung user
     # manager, and the caller reads the timeout as "cannot confirm" (a refusal).
-    return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=10)
+    return subprocess.run(
+        cmd, env=user_bus_env(repo.env), capture_output=True, text=True, timeout=10
+    )
+
+
+def user_bus_env(env: Mapping[str, str]) -> dict[str, str]:
+    """``env`` with the user-bus variables systemctl --user needs: without them
+    it fails ("No medium found", MEASURED)."""
+    env = dict(env)
+    run = f"/run/user/{os.getuid()}"
+    env["XDG_RUNTIME_DIR"] = env.get("XDG_RUNTIME_DIR") or run
+    env["DBUS_SESSION_BUS_ADDRESS"] = env.get("DBUS_SESSION_BUS_ADDRESS") or f"unix:path={run}/bus"
+    return env
 
 
 def timespan_s(text: str) -> float | None:

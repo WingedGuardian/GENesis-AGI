@@ -321,3 +321,31 @@ async def test_a_close_with_a_date_gate_already_come_is_refused(recording, monke
     }
     with pytest.raises(ToolError, match=r"gaps/0 \(trigger 2026-11-14\)"):
         await call(_doc(gaps=[gate]), dry_run=True)
+
+
+@pytest.mark.parametrize("review_complete", [False, True])
+async def test_p2_receipt_is_stored_without_claiming_close_enforcement(recording, tmp_path, monkeypatch, review_complete):
+    from dataclasses import replace
+
+    from genesis.mcp.health import validator_writes
+    from genesis.session_awareness.pr_completeness import source_binding
+    from tests.test_session_awareness.test_pr_completeness import refresh, reviewed
+
+    path, _, config = recording
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    doc, source = reviewed(source_dir)
+    source = replace(source, merge_commit=MERGE_SHA)
+    doc["merge_commit"] = MERGE_SHA
+    doc["completeness"]["inventory"]["source"] = source_binding(source).model_dump(mode="json")
+    doc["completeness"]["complete"] = review_complete
+    refresh(doc)
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    monkeypatch.setattr(validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, source.body))
+    assert (await call(doc, route=False))["recorded"] is True
+    stored = row(path)
+    assert stored["status"] == "closed"
+    receipt = json.loads(stored["evidence"])["completeness"]
+    assert receipt["complete"] is review_complete
+    assert receipt["evidence_sha256"] == doc["completeness"]["evidence_sha256"]
+    assert receipt["review_execution_ref"] == "fixture-only:no-model-ran"

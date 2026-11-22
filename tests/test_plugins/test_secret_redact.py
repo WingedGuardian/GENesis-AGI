@@ -570,7 +570,8 @@ def test_plugin_manifest_wires_the_mod_and_the_publish_guard():
     assert hooks["modules"] == ["./register.js"]
     (entry,) = hooks["hooks"]["PreToolUse"]
     assert entry["matcher"] == "^(Monitor|Bash)$"
-    assert "bin/publish_guard.py" in entry["hooks"][0]["command"]
+    commands = [h["command"] for h in entry["hooks"]]
+    assert "bin/publish_guard.py" in commands[0] and "bin/stream_wrap.py" in commands[1]
 
 
 def test_a_name_holding_a_bracket_gets_a_placeholder_that_holds_none():
