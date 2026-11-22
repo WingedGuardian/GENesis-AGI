@@ -65,7 +65,9 @@ async def test_a_failover_peers_init_retitles_a_disabled_streamer():
     s = _streamer()
     on_event = _on_event(s)
     await on_event(StreamEvent(event_type="init", raw={"model": "claude-opus-5-5"}))
-    await on_event(StreamEvent(event_type="rate_limit_event", raw={}))
+    # A limit that refuses use; an allowed rate_limit_event no longer halts (#4864).
+    rejected = {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}}
+    await on_event(StreamEvent(event_type="rate_limit_event", raw=rejected))
     assert not s.enabled
     await on_event(StreamEvent(event_type="init", raw={"model": "glm-5.3[1m]"}))
     assert s._prefix == "[glm-5.3 / High]"
@@ -291,3 +293,25 @@ def test_the_header_line_survives_the_failover_strip():
     stripped = _strip_session_control_block("base" + block)
     assert "Changing your own model" not in stripped
     assert "do not begin a reply with a [model / effort] line" in stripped
+
+
+@pytest.mark.asyncio
+async def test_one_init_names_the_model_and_starts_a_new_progress_attempt():
+    """The header handlers return on init, so the progress ledger must see the
+    event first: a retry's init both renames the header and starts a fresh
+    attempt, or the retry is judged against the failed attempt's ledger."""
+    from genesis.channels.telegram._progress import TurnProgress
+
+    s = _streamer()
+    sent: list[str] = []
+
+    async def deliver(text: str) -> None:
+        sent.append(text)
+
+    progress = TurnProgress(deliver, s, asyncio.Event())
+    ctx = HandlerContext.__new__(HandlerContext)
+    on_event = HandlerContext.make_on_event(ctx, asyncio.Event(), s, progress)
+    await on_event(StreamEvent(event_type="text", text="Text from the failed attempt."))
+    await on_event(StreamEvent(event_type="init", raw={"model": "claude-sonnet-5-5"}))
+    assert s._prefix == "[Sonnet 5.5 / High]"
+    assert progress.pending() == ""  # the new attempt starts with an empty ledger

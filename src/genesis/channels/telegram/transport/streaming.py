@@ -15,6 +15,7 @@ Key behaviors:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 import time
@@ -31,7 +32,10 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_MAX_LENGTH = 4096
 _MAX_TOOL_LINES = 10
-_DEFAULT_THROTTLE_S = 0.5
+# Drafts share messages.setTyping's per-chat limit (20 calls / 5 s, 40 / 30 s;
+# Telegram "AI features for bots") with the 4 s typing keepalive: 1.5 s keeps
+# drafts at 20 / 30 s plus typing's 7.5, under 40.
+_DEFAULT_THROTTLE_S = 1.5
 
 
 def generate_draft_id() -> int:
@@ -92,15 +96,35 @@ class DraftStreamer:
         self._tool_lines: list[str] = []
         self._text = ""
         self._thinking = False
+        self._now = time.monotonic  # a seam for tests that control the clock
         self._last_send_time = 0.0
+        self._content_at = self._now()  # when the draft's content last changed
+        self._send_lock = asyncio.Lock()  # one draft request in flight at a time
         self._enabled = True
         self._any_draft_sent = False
         self._last_draft_text = ""
         self._consecutive_failures = 0
+        self._waiting_s: float | None = None
+        self._failure_logged = False
 
     @property
     def enabled(self) -> bool:
         return self._enabled
+
+    def quiet_s(self) -> float:
+        """Seconds since the draft was last sent: how long it has gone without an
+        update, which is what Telegram's ~30 s draft lifetime counts. Zero before
+        the first draft, when there is nothing on screen to keep."""
+        if not self._any_draft_sent:
+            return 0.0
+        return self._now() - self._last_send_time
+
+    def message_sent(self) -> None:
+        """A real message just reached the chat. Telegram removes the live draft
+        when one arrives ("AI features for bots"), so the next update is sent at
+        once, unthrottled and undeduplicated."""
+        self._last_send_time = 0.0
+        self._last_draft_text = ""
 
     def disable(self) -> None:
         """Permanently disable this streamer.
@@ -144,8 +168,10 @@ class DraftStreamer:
         """Handle CC thinking event — show thinking indicator."""
         if not self._enabled:
             return
+        self._waiting_s = None
         if not self._thinking:
             self._thinking = True
+            self._content_at = self._now()
             await self._maybe_send_draft()
 
     async def on_text(self, text: str) -> None:
@@ -153,7 +179,9 @@ class DraftStreamer:
         if not self._enabled or not text:
             return
         self._thinking = False
+        self._waiting_s = None
         self._text += text
+        self._content_at = self._now()
         await self._maybe_send_draft()
 
     async def on_tool_use(self, tool_name: str, tool_input: str = "") -> None:
@@ -167,7 +195,36 @@ class DraftStreamer:
             preview = tool_input[:60].replace("\n", " ")
             line += f"  {preview}"
         self._tool_lines.append(line)
+        self._waiting_s = None
+        self._content_at = self._now()
         await self._maybe_send_draft()
+
+    async def keepalive(self, *, after_s: float = 0.0) -> None:
+        """Re-send the draft once it has gone ``after_s`` without a send, with how
+        long its content has gone unchanged.
+
+        Telegram drops a live draft about 30 s after its last update, so a long
+        thinking stretch otherwise leaves nothing on screen. It also carries any
+        update the throttle dropped. The send is forced: a refresh exists to
+        reach Telegram, so the content dedup must not swallow it. The decision is
+        made under the send lock, so a send that finished while this one waited
+        cancels it.
+        """
+        async with self._send_lock:
+            if not self._enabled or self.quiet_s() < after_s:
+                return
+            self._waiting_s = self._now() - self._content_at
+            await self._send_draft_now(force=True)
+
+    def status_body(self) -> str:
+        """The tool activity so far, for a status message: empty when there is
+        none. Text is left out, because the final reply carries it."""
+        if not self._tool_lines:
+            return ""
+        visible = self._tool_lines[-_MAX_TOOL_LINES:]
+        overflow = len(self._tool_lines) - len(visible)
+        lines = [f"... +{overflow} more"] if overflow else []
+        return "Working on it:\n" + "\n".join(lines + visible)
 
     async def flush(self) -> None:
         """Force-send current accumulated content as a draft."""
@@ -196,22 +253,33 @@ class DraftStreamer:
                 parts.append("")  # blank separator
             parts.append(self._text)
 
+        if self._waiting_s is not None:
+            parts.append(f"\n\u23f3 still working ({int(self._waiting_s)} s)")
+
         return "\n".join(parts)
 
     async def _maybe_send_draft(self) -> None:
         """Send draft if throttle interval has elapsed."""
-        now = time.monotonic()
+        now = self._now()
         if (now - self._last_send_time) >= self.throttle_s:
             await self._send_draft()
 
-    async def _send_draft(self) -> None:
-        """Send the composed draft via send_message_draft."""
+    async def _send_draft(self, *, force: bool = False) -> None:
+        """Send the composed draft via send_message_draft, one request at a time:
+        a keepalive and a text update in flight together can land out of order
+        and leave the older draft on screen."""
+        async with self._send_lock:
+            await self._send_draft_now(force=force)
+
+    async def _send_draft_now(self, *, force: bool) -> None:
+        if not self._enabled:
+            return  # disabled (a halt, the final reply) while this send waited
         draft_text = self._compose_draft()
         if not draft_text.strip():
             return
 
         # Content dedup — skip if identical to last draft
-        if draft_text == self._last_draft_text:
+        if draft_text == self._last_draft_text and not force:
             return
 
         # Tail-truncation for Telegram limit
@@ -231,7 +299,7 @@ class DraftStreamer:
                 lambda: self.bot.send_message_draft(**kwargs),
                 stopping=self._stopping,
             )
-            self._last_send_time = time.monotonic()
+            self._last_send_time = self._now()
             self._last_draft_text = draft_text
             self._any_draft_sent = True
             self._consecutive_failures = 0
@@ -243,6 +311,16 @@ class DraftStreamer:
                     self._consecutive_failures, self.chat_id, exc_info=True,
                 )
                 self._enabled = False
+            elif not self._failure_logged:
+                # The first failure of a turn is logged with its cause: a flood
+                # wait here was invisible while every failure logged at debug.
+                self._failure_logged = True
+                logger.info(
+                    "Draft send failed (attempt %d/3) for chat %s",
+                    self._consecutive_failures,
+                    self.chat_id,
+                    exc_info=True,
+                )
             else:
                 logger.debug(
                     "Draft send failed (attempt %d/3) for chat %s",

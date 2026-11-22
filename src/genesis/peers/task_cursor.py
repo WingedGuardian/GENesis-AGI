@@ -21,22 +21,31 @@ def valid_stamp(stamp):
 
 
 def encode(row, peer, context):
-    value = {"v": 1, "at": row["a2a_status_at"], "id": row["id"],
-             "peer": peer["peer_id"], "epoch": peer["epoch"], "context": context}
+    from genesis.peers.conversation import conversation_trust
+
+    value = {"v": 2, "at": row["a2a_status_at"], "id": row["id"],
+             "peer": peer["peer_id"], "epoch": peer["epoch"], "context": context,
+             "trust": conversation_trust(peer)}
     return base64.urlsafe_b64encode(json.dumps(value, separators=(",", ":")).encode()).decode().rstrip("=")
 
 
 def decode(token, peer, context):
-    from genesis.peers.conversation import ConversationRefusal
+    from genesis.peers.conversation import ConversationRefusal, conversation_trust
 
     try:
         if not isinstance(token, str) or not 1 <= len(token) <= 1024 or re.fullmatch(r"[A-Za-z0-9_-]+", token) is None:
             raise ValueError
         raw = base64.b64decode(token + "=" * (-len(token) % 4), altchars=b"-_", validate=True)
         value = json.loads(raw, object_pairs_hook=_unique_object)
-        if not isinstance(value, dict) or set(value) != {"v", "at", "id", "peer", "epoch", "context"}:
+        if not isinstance(value, dict) or type(value.get("v")) is not int or value["v"] not in (1, 2):
             raise ValueError
-        if type(value["v"]) is not int or value["v"] != 1 or not valid_stamp(value["at"]):
+        fields = {"v", "at", "id", "peer", "epoch", "context"}
+        if value["v"] == 2:
+            fields.add("trust")
+        if set(value) != fields or not valid_stamp(value["at"]):
+            raise ValueError
+        # The closed v1 schema has implicit same-owner trust; v2 requires it.
+        if value.get("trust", "same_owner") != conversation_trust(peer):
             raise ValueError
         if not isinstance(value["id"], str) or str(UUID(value["id"])) != value["id"]:
             raise ValueError

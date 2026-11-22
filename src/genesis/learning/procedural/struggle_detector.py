@@ -181,6 +181,7 @@ def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
     spine: list[dict] = []
     haystack_parts: list[str] = []  # uncapped tool inputs → grounding record
     pending_tools: dict[str, dict] = {}  # tool_use_id → spine entry (awaiting result)
+    seen_tool_ids: set[str] = set()  # every tool_use_id already in the spine
     turn = 0
 
     try:
@@ -223,6 +224,16 @@ def build_spine_and_haystack(transcript_path: Path) -> tuple[list[dict], str]:
                     block_type = block.get("type", "")
 
                     if block_type == "tool_use":
+                        # A transcript can replay earlier calls (api-request-blob
+                        # records carry the request's whole conversation): a call
+                        # already in the spine is the same call, not a new one.
+                        # Kept once, it is not a phantom crash in the score, and
+                        # tool_use_id stays unique for readers that cut by it (#4812).
+                        replay_id = block.get("id")
+                        if isinstance(replay_id, str) and replay_id in seen_tool_ids:
+                            continue
+                        if isinstance(replay_id, str) and replay_id:
+                            seen_tool_ids.add(replay_id)
                         turn += 1
                         tool_name = block.get("name", "unknown")
                         tool_input = block.get("input", {})
@@ -415,6 +426,12 @@ def score_struggle(spine: list[dict]) -> float:
     return min(1.0, score)
 
 
+def judge_line(entry: dict) -> str:
+    """One tool entry as the judge sees it (see :func:`format_spine_for_judge`)."""
+    outcome = "OK" if entry["outcome"] == "ok" else f"ERR: {entry['error_text'][:300]}"
+    return f"[T={entry['turn']}] TOOL: {entry['tool']} {entry['args_summary']} -> {outcome}"
+
+
 def format_spine_for_judge(spine: list[dict]) -> str:
     """Format the action spine as compact text for the Judge LLM — TOOL ACTIONS
     ONLY (user turns are dropped).
@@ -429,14 +446,7 @@ def format_spine_for_judge(spine: list[dict]) -> str:
     [T=1] TOOL: Bash {"command": "ssh root@..."} -> OK
     [T=2] TOOL: Read {"file_path": "/home..."} -> ERR: not found
     """
-    lines: list[str] = []
-    for entry in spine:
-        if entry["type"] != "tool":
-            continue
-        turn = entry["turn"]
-        outcome = "OK" if entry["outcome"] == "ok" else f"ERR: {entry['error_text'][:300]}"
-        lines.append(f"[T={turn}] TOOL: {entry['tool']} {entry['args_summary']} -> {outcome}")
-    text = "\n".join(lines)
+    text = "\n".join(judge_line(entry) for entry in spine if entry["type"] == "tool")
     if len(text) > _MAX_SPINE_CHARS:
         text = "...[earlier turns truncated]...\n" + text[-_MAX_SPINE_CHARS:]
     return text

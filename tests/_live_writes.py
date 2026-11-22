@@ -16,7 +16,8 @@ A PEP 578 audit hook judges, in this interpreter:
   ``shutil.rmtree``, ``os.truncate``, ``os.symlink``, ``os.link``;
 - ``sqlite3.connect`` to a file, except recognized literal URI query forms
   ``mode=ro``, ``mode=memory``, or ``immutable=1`` for an existing target;
-- reads of the real credential files (the deployed ``secrets.env``,
+- reads of the real credential files (``~/.config/genesis/secrets.env``,
+  the deployed ``secrets.env``,
   ``~/.claude/.credentials.json``, ``~/.config/gh/hosts.yml``,
   ``~/.genesis/cc_oauth_token.env``).
 
@@ -32,14 +33,24 @@ and attributed to the running test.
 
 Output: a terminal-summary section, and, with ``GENESIS_LIVE_WRITES_REPORT=<file>``,
 one tab-separated line per (test, class, operation, path), written on every run.
+Each field escapes backslash/tab/LF/CR; tests._live_writes_report.decode reads
+the reversible bytes. Empty/parseable TSV alone never establishes completeness.
 Under xdist each worker hands its hits to the controller at session end
 (``workeroutput``, as the live fence does), and only the controller reports; a
-worker that never reported is named in the summary.
+worker that never reported is named in the summary. The ordinary trylast worker
+snapshot includes default/tryfirst sessionfinish hooks, but not later same-priority
+hooks, wrapper teardown, unconfigure or writes after the snapshot.
 
-Hits classify pre-operation audit events, not syscall completion. Simple known
-no-ops are filtered, but refused operations and readonly SQLite queries outside
-the recognized literal forms can still be reported, and some aliases can be
-missed (tracked in #4193).
+Hits classify pre-operation events, not syscall completion. Known no-ops such
+as an existing ``mkdir``, missing ``unlink``, non-empty ``rmdir``, or an
+unchanged reopen are filtered. Other refused operations and readonly SQLite
+queries outside the recognized literal forms can still be reported, and some
+aliases can be missed (tracked in #4193).
+Known raw exclusive/nofollow refusals, metadata-only O_PATH, missing rename/link
+sources, occupied link destinations and same-inode renames are also filtered.
+Protected hardlink sources are observed as ``os.link source`` exposure, even
+without a later content write. Source symlink targets are checked conservatively
+because the link event omits follow_symlinks. No alias history is maintained.
 ``os.open`` of a relative name is judged against the cwd and labelled so (its
 audit event omits ``dir_fd``).
 Attribution is by ``PYTEST_CURRENT_TEST``: a write during collection or a
@@ -52,6 +63,8 @@ writes done in C without an audit event, metadata changes (``os.chmod``,
 ``os.mkfifo``/``os.mknod``, SQLite writes through a connection opened earlier,
 and ``file://localhost`` or percent-encoded SQLite URIs. The OS-level sandbox
 is the boundary for those.
+Without stdlib ``ALLOW_MISSING`` (unless backported), missing credential
+targets produce explicit unknown events; existing identities still work.
 """
 
 from __future__ import annotations
@@ -68,6 +81,9 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+
+from genesis.secrets_location import home_config_location
+from tests import _live_writes_fs, _live_writes_report
 
 
 def _observer_os():
@@ -96,6 +112,9 @@ def _observer_os():
 
 os = _observer_os()
 
+# Older Python lacks missing-aware resolution: strict=True leaves uncertainty
+# visible through the hook rather than silently accepting a guessed target.
+_MISSING_STRICT = getattr(os.path, "ALLOW_MISSING", True)
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 _EVENTS = frozenset(
     {
@@ -121,7 +140,7 @@ class _State:
     allowed_files: frozenset[str] = frozenset()
     classes: tuple[tuple[str, str], ...] = ()  # (root, label), most specific first
     credential_files: frozenset[str] = frozenset()
-    credential_inodes: frozenset[tuple[int, int]] = frozenset()
+    credential_inodes: frozenset[tuple[int, int]] = frozenset()  # initial identities
     hits: dict[tuple[str, str, str, str], None] = {}  # insertion-ordered set
     merged_workers: set[str] = set()  # xdist workers whose hits were merged
     unreported: list[str] = []  # xdist workers whose hits never arrived
@@ -254,32 +273,33 @@ def _judge(event: str, args: tuple) -> None:
         writes = (isinstance(mode, str) and any(c in mode for c in "wax+")) or (
             mode is None and isinstance(flags, int) and flags & _WRITE_FLAGS
         )
+        reads = (isinstance(mode, str) and ("r" in mode or "+" in mode)) or (
+            mode is None and isinstance(flags, int)
+            and flags & os.O_ACCMODE in (os.O_RDONLY, os.O_RDWR)
+            and not flags & getattr(os, "O_PATH", 0)
+        )
         name = _fspath(path)
-        if mode is None and name and not os.path.isabs(name):
-            # os.open's audit event omits dir_fd, so a relative name may be
-            # relative to a directory descriptor rather than the cwd. Judge it
-            # against the cwd, but label it so a reader knows it is a guess.
-            guess = _absolute(name)
-            if not guess:
-                return
-            if writes:
-                if _label(guess) and not _reopens_unchanged(flags, guess):
-                    _record("relative os.open (dir_fd unknown; judged against cwd)", "write", guess)
-            elif guess in _S.credential_files or _is_credential_file(guess):
-                _record("credential file read (relative os.open; judged against cwd)", "read", guess)
-            return
+        # The event omits dir_fd. Preserve the existing cwd-guess labels.
+        relative = mode is None and name and not os.path.isabs(name)
         target = _absolute(path)
         if target is None:
             return
-        if not writes:
-            if target in _S.credential_files or _is_credential_file(target):
-                _record("credential file read", "read", target)
+        mutates = writes and not (mode is None and _reopens_unchanged(flags, target))
+        write_label = _label(target) if mutates else None
+        if relative and write_label:
+            write_label = "relative os.open (dir_fd unknown; judged against cwd)"
+        if write_label:
+            _record(write_label, "write", target)
+        # Keep an established write even if credential metadata is unavailable.
+        if not reads and (write_label or not mutates):
             return
-        if mode is None and _reopens_unchanged(flags, target):
-            return  # O_CREAT|O_RDONLY on an existing file: nothing changes
-        label = _label(target)
-        if label:
-            _record(label, "write", target)
+        credential = target in _S.credential_files or _is_credential_file(target)
+        if reads and credential:
+            label = ("credential file read (relative os.open; judged against cwd)"
+                     if relative else "credential file read")
+            _record(label, "read", target)
+        if mutates and not write_label and credential:
+            _record("credential file write", "write", target)
         return
     if event == "sqlite3.connect":
         target = _sqlite_target(args[0])
@@ -287,11 +307,10 @@ def _judge(event: str, args: tuple) -> None:
         if label:
             _record(label, "sqlite connect", target)
         return
-    if event == "os.rename":
-        pairs = ((args[0], args[2]), (args[1], args[3]))
-    elif event == "os.link":
-        pairs = ((args[1], args[3]),)
-    elif event == "os.symlink":
+    if event in ("os.rename", "os.link"):
+        _judge_names(event, args)
+        return
+    if event == "os.symlink":
         pairs = ((args[1], args[2]),)
     elif event == "os.truncate":
         pairs = ((args[0], None),)
@@ -305,6 +324,24 @@ def _judge(event: str, args: tuple) -> None:
             _record(label, event, target)
 
 
+def _unknown():
+    with _fault_lock:
+        _S.faults += 1
+
+
+def _judge_names(event, args):
+    try:
+        effects = _live_writes_fs.name_effects(os, _absolute, event, args)
+    except (OSError, ValueError):
+        _unknown()
+        # Metadata uncertainty must not erase an established destination hit.
+        effects = _live_writes_fs.uncertain_name_effects(_absolute, event, args)
+    for target, operation in effects:
+        label = target and _label(target)
+        if label:
+            _record(label, operation, target)
+
+
 def _no_op(event: str, index: int, target: str) -> bool:
     """True when the call cannot change anything: the audit event fires before
     the system call, so an attempt the kernel refuses (or that is a no-op, such
@@ -312,9 +349,7 @@ def _no_op(event: str, index: int, target: str) -> bool:
     if event == "os.mkdir":
         # Any existing name, directory or not (a file, a dangling symlink): EEXIST.
         return os.path.lexists(target)
-    if event in ("os.remove", "os.rmdir", "shutil.rmtree") or (
-        event == "os.rename" and index == 0
-    ):
+    if event in ("os.remove", "os.rmdir", "shutil.rmtree"):
         if not os.path.lexists(target):
             return True
         is_dir = os.path.isdir(target) and not os.path.islink(target)
@@ -330,16 +365,56 @@ def _no_op(event: str, index: int, target: str) -> bool:
     return False
 
 
+def _is_missing_credential_target(name: str) -> bool:
+    """Resolve missing named targets while preserving nonabsence errors."""
+    target = os.path.realpath(name, strict=_MISSING_STRICT)
+    unavailable = None
+    for credential in _S.credential_files:
+        try:
+            current = os.path.realpath(credential, strict=_MISSING_STRICT)
+        except NotADirectoryError:
+            continue
+        except (OSError, ValueError) as error:
+            unavailable = error
+            continue
+        if current == target:
+            return True
+    if unavailable is not None:
+        raise unavailable
+    return False
+
+
 def _is_credential_file(name: str) -> bool:
-    """Whether ``name`` is one of the credential files under another name (a
-    symlink or hard link): one ``stat``, compared by device and inode."""
-    if not _S.credential_inodes:
-        return False
+    """Match initial identities or the current logical credential names.
+
+    Fresh metadata handles replacement/late creation without a stale cache or
+    an accumulating inode history. No credential contents are read.
+    """
     try:
         st = os.stat(name)
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        # A dangling logical credential symlink can create this named target.
+        # Unlike permissive _absolute, this cannot silently absorb EACCES/EIO.
+        return _is_missing_credential_target(name)
+    except NotADirectoryError:
         return False
-    return (st.st_dev, st.st_ino) in _S.credential_inodes
+    identity = (st.st_dev, st.st_ino)
+    if identity in _S.credential_inodes:
+        return True
+    unavailable = None
+    for credential in _S.credential_files:
+        try:
+            current = os.stat(credential)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except (OSError, ValueError) as error:
+            unavailable = error
+            continue
+        if identity == (current.st_dev, current.st_ino):
+            return True
+    if unavailable is not None:
+        raise unavailable  # an unestablished negative judgment is unknown
+    return False
 
 
 def _ordinary_read(args: tuple) -> bool:
@@ -356,7 +431,7 @@ def _ordinary_read(args: tuple) -> bool:
         return False
     name = _fspath(args[0])
     if not name:
-        return True
+        return False  # integer descriptors need the existing proc-fd lookup
     return not name.endswith((
         "secrets.env", ".credentials.json", "hosts.yml", "cc_oauth_token.env",
     )) and not _is_credential_file(name)  # fmt: skip
@@ -370,14 +445,19 @@ def _hook(event: str, args: tuple) -> None:
     # (a test that patches it) and is itself an audited open.
     _busy.on = True
     try:
+        if event == "open":
+            try:
+                if _live_writes_fs.open_no_effect(os, _absolute, args):
+                    return
+            except (OSError, ValueError):
+                _unknown()  # retain conservative observations as well
         if event == "open" and _ordinary_read(args):
             return
         _judge(event, args)
     except (KeyboardInterrupt, SystemExit, GeneratorExit):
         raise
     except BaseException:  # pytest outcomes also must not escape an observer
-        with _fault_lock:
-            _S.faults += 1
+        _unknown()
     finally:
         _busy.on = False
 
@@ -433,8 +513,8 @@ def install(config) -> None:
         classes.append((repo, "this checkout"))
     # Most specific root first, so a checkout inside another path wins.
     _S.classes = tuple(sorted(classes, key=lambda c: -len(c[0])))
-    _S.credential_files = frozenset(
-        os.path.realpath(os.path.join(home, rel))
+    _S.credential_files = frozenset({os.fspath(home_config_location(Path(home)))}) | frozenset(
+        os.path.join(home, rel)
         for rel in (
             "genesis/secrets.env",
             ".claude/.credentials.json",
@@ -454,6 +534,7 @@ def install(config) -> None:
     _S.installed = True
 
 
+@pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus):
     # An xdist worker's terminal summary never reaches the run, so it hands its
     # hits to the controller (pytest_testnodedown), as the live fence does.
@@ -497,7 +578,8 @@ def pytest_terminal_summary(terminalreporter):
     if not _S.installed:
         if _S.disarmed:
             terminalreporter.write_line(f"live writes: disarmed ({_S.disarmed})", yellow=True)
-        return
+        else:
+            terminalreporter.write_line("live writes: not installed (unknown, not clean)", yellow=True)
     tr = terminalreporter
     if _S.faults:
         tr.write_line(f"live writes: {_S.faults} events could not be classified (unknown, not clean)", yellow=True)
@@ -521,7 +603,6 @@ def pytest_terminal_summary(terminalreporter):
         try:
             # surrogateescape: a path os.fsdecode() could not decode is written back
             # as its original bytes instead of failing the run.
-            text = "".join("\t".join(key) + "\n" for key in hits)
-            Path(report).write_bytes(text.encode("utf-8", "surrogateescape"))
+            Path(report).write_bytes(_live_writes_report.encode(hits))
         except (OSError, UnicodeError) as exc:  # report-only: never fails a run
             tr.write_line(f"live writes: could not write the report {report}: {exc}", yellow=True)
