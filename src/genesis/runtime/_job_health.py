@@ -19,7 +19,7 @@ import asyncio
 import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from genesis.runtime._core import GenesisRuntime
@@ -177,15 +177,20 @@ def clear_stale_job_failures(rt: GenesisRuntime) -> int:
         entry.pop("last_failure", None)
         entry.pop("last_error", None)
         entry.pop("error_type", None)
+        getattr(rt, "_last_job_reflex", {}).pop(job_name, None)
         persist_job_health(rt, job_name, entry, now_iso)
         cleared += 1
 
     return cleared
 
 
-def persist_job_health(rt: GenesisRuntime, job_name: str, entry: dict, now: str) -> None:
+def persist_job_health(
+    rt: GenesisRuntime, job_name: str, entry: dict, now: str,
+    *, run_status: Literal["success", "failed"] | None = None,
+) -> None:
     """Schedule a background write of the current job_health entry to the DB.
 
+    Only an explicit run status contributes to the run counters.
     Checks for a running event loop BEFORE creating the coroutine.
     Creating the coroutine eagerly and then catching ``RuntimeError``
     leaks an unawaited coroutine and emits ``RuntimeWarning`` every 60s.
@@ -220,7 +225,7 @@ def persist_job_health(rt: GenesisRuntime, job_name: str, entry: dict, now: str)
                    (job_name, last_run, last_success, last_failure, last_error,
                     error_type, consecutive_failures, total_runs, total_successes,
                     total_failures, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(job_name) DO UPDATE SET
                        last_run = excluded.last_run,
                        last_success = COALESCE(excluded.last_success, last_success),
@@ -233,9 +238,9 @@ def persist_job_health(rt: GenesisRuntime, job_name: str, entry: dict, now: str)
                        -- error_type would mislabel a recovered job.
                        error_type = excluded.error_type,
                        consecutive_failures = excluded.consecutive_failures,
-                       total_runs = total_runs + 1,
-                       total_successes = total_successes + CASE WHEN excluded.last_success IS NOT NULL THEN 1 ELSE 0 END,
-                       total_failures = total_failures + CASE WHEN excluded.last_failure IS NOT NULL THEN 1 ELSE 0 END,
+                       total_runs = total_runs + excluded.total_runs,
+                       total_successes = total_successes + excluded.total_successes,
+                       total_failures = total_failures + excluded.total_failures,
                        updated_at = excluded.updated_at
                 """,
                 (
@@ -246,8 +251,9 @@ def persist_job_health(rt: GenesisRuntime, job_name: str, entry: dict, now: str)
                     snapshot.get("last_error"),
                     snapshot.get("error_type"),
                     snapshot.get("consecutive_failures", 0),
-                    1 if snapshot.get("last_success") else 0,
-                    1 if snapshot.get("last_failure") else 0,
+                    int(run_status is not None),
+                    int(run_status == "success"),
+                    int(run_status == "failed"),
                     now,
                 ),
             )
@@ -331,12 +337,12 @@ def record_job_success(rt: GenesisRuntime, job_name: str) -> None:
     entry["last_run"] = now
     entry["last_success"] = now
     entry["consecutive_failures"] = 0
-    # Clear stale failure data so _persist_job_health doesn't re-count old
-    # failures in the SQL CASE WHEN excluded.last_failure IS NOT NULL check.
+    # Clear the recorded failure and its reflex history on recovery.
     entry.pop("last_failure", None)
     entry.pop("last_error", None)
     entry.pop("error_type", None)
-    rt._persist_job_health(job_name, entry, now)
+    getattr(rt, "_last_job_reflex", {}).pop(job_name, None)
+    rt._persist_job_health(job_name, entry, now, run_status="success")
 
     # WS-2 M9: debounced success run-event — first success ever, or >= 1h since
     # the last one. Anchored on the just-captured prev_success (persisted +
@@ -415,7 +421,7 @@ def record_job_failure(
     # mislabel an external blocker as an internal defect.
     entry["error_type"] = error_type
     entry["consecutive_failures"] = prev_consecutive + 1
-    rt._persist_job_health(job_name, entry, now)
+    rt._persist_job_health(job_name, entry, now, run_status="failed")
 
     # WS-2 M9: failure run-event on streak ONSET (prev consecutive == 0) OR an
     # hourly heartbeat during a sustained outage — bounds a stuck 60s poll to
@@ -436,34 +442,35 @@ def record_job_failure(
             error=error,
             now=now,
         )
-        # Reflex funnel: surface exception-driven job failures onto the event
-        # bus so the reflex arc (and health/ego consumers) can see them. Shares
-        # the run-event throttle above → bounded ~24/day/job. Gated on an actual
-        # exception (semantic/external failures stay off the bus) and on a live
-        # bus. Fully fire-and-forget: a broken emit must NEVER stop the
-        # job_health record above from being written. getattr (not rt._event_bus
-        # directly) so a bare test runtime built via __new__ — with no
-        # _event_bus attribute set — degrades to no-emit instead of raising.
-        bus = getattr(rt, "_event_bus", None)
-        if exc is not None and emit_event and bus is not None:
-            try:
-                from genesis.observability.failure_details import failure_details
-                from genesis.util.tasks import emit_sync
 
-                emit_sync(
-                    bus,
-                    severity_str="ERROR",
-                    event_type="job.failed",
-                    message=f"Scheduled job {job_name!r} failed: {error}",
-                    task_name=job_name,
-                    **failure_details(exc=exc),
-                )
-            except Exception:
-                logger.warning(
-                    "job.failed emit failed for %r (job_health still recorded)",
-                    job_name,
-                    exc_info=True,
-                )
+    # Semantic failures update run history without emitting a typed reflex.
+    # The next exception must still get its own first event.
+    bus = getattr(rt, "_event_bus", None)
+    reflex_times = getattr(rt, "_last_job_reflex", None)
+    prev_reflex_dt = _parse_iso(reflex_times.get(job_name)) if reflex_times is not None else None
+    reflex_due = prev_reflex_dt is None or now_dt is None or (now_dt - prev_reflex_dt) >= _RUN_EVENT_MIN_INTERVAL
+    if exc is not None and emit_event and bus is not None and reflex_due:
+        try:
+            from genesis.observability.failure_details import failure_details
+            from genesis.util.tasks import emit_sync
+
+            emit_sync(
+                bus,
+                severity_str="ERROR",
+                event_type="job.failed",
+                message=f"Scheduled job {job_name!r} failed: {error}",
+                task_name=job_name,
+                **failure_details(exc=exc),
+            )
+            if reflex_times is None:
+                reflex_times = rt._last_job_reflex = {}
+            reflex_times[job_name] = now
+        except Exception:
+            logger.warning(
+                "job.failed emit failed for %r (job_health still recorded)",
+                job_name,
+                exc_info=True,
+            )
 
     consecutive = entry["consecutive_failures"]
     if consecutive >= 3 and rt._job_retry_registry is not None:

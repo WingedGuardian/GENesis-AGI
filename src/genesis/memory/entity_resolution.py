@@ -389,10 +389,10 @@ async def log_resolution(
     llm_verdict: str | None = None,
     llm_reasoning: str | None = None,
     survivor_id: str | None = None,
-) -> None:
+) -> bool:
     """Write an entity resolution action to the audit trail.
 
-    Fire-and-forget — errors are logged but never propagate.
+    Return whether the audit was persisted. Failures leave the decision intact.
     """
     try:
         await db.execute(
@@ -415,5 +415,7 @@ async def log_resolution(
             ),
         )
         await db.commit()
+        return True
     except Exception:
         logger.debug("Failed to log entity resolution action", exc_info=True)
+        return False

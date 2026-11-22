@@ -95,6 +95,7 @@ async def test_failure_path_unbroken_and_success_preserved():
         assert last_error == "kaboom"
         assert last_success is not None, "prior success must be preserved across a failure"
         assert consec == 1
+        assert row[4:] == (2, 1, 1)
 
 
 async def test_clear_stale_failures_clears_persisted_failure():
@@ -123,3 +124,4 @@ async def test_clear_stale_failures_clears_persisted_failure():
         assert last_failure is None, "clear_stale must NULL persisted last_failure (WS-3b)"
         assert last_error is None
         assert consec == 0
+        assert row[4:] == (1, 0, 1)

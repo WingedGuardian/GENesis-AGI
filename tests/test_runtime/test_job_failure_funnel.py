@@ -112,6 +112,22 @@ async def test_throttle_suppresses_repeat_within_the_hour():
 
 
 @pytest.mark.asyncio
+async def test_semantic_failure_does_not_suppress_the_first_typed_reflex():
+    bus = GenesisEventBus()
+    seen = await _collect(bus)
+    rt = _make_rt(bus)
+
+    record_job_failure(rt, "dream_cycle", "partial: clustering")
+    record_job_failure(rt, "dream_cycle", exc=_boom())
+    record_job_failure(rt, "dream_cycle", "partial: centrality")
+    record_job_failure(rt, "dream_cycle", exc=_boom())
+    await asyncio.sleep(0.05)
+
+    assert len(seen) == 1
+    assert seen[0].details["error_type"] == "ValueError"
+
+
+@pytest.mark.asyncio
 async def test_bare_runtime_without_event_bus_never_raises():
     """A runtime built via __new__ has no _event_bus attribute — must not raise."""
     rt = types.SimpleNamespace(

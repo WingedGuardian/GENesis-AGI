@@ -88,8 +88,12 @@ async def run_entity_resolution(
         "errors": [],
     }
 
-    retrieve_failures: Counter[str] = Counter()
-    report["failure_counts"] = retrieve_failures
+    failures: Counter[str] = Counter()
+    report["failure_counts"] = failures
+
+    async def record_audit(**fields: Any) -> None:
+        if not await log_resolution(db, run_id=run_id, **fields):
+            failures["audit/write"] += 1
 
     # 1. Use pre-scrolled buckets if available, otherwise scroll independently
     if buckets is None:
@@ -145,7 +149,7 @@ async def run_entity_resolution(
             # 2. Fetch vectors for this chunk
             point_ids = [p["id"] for p in active_chunk]
             vectors = qdrant_ops.batch_retrieve_vectors(
-                qdrant, point_ids, collection=COLLECTION, failures=retrieve_failures,
+                qdrant, point_ids, collection=COLLECTION, failures=failures,
             )
 
             # 3. Find dedup candidates (cosine ≥ 0.92)
@@ -214,9 +218,7 @@ async def run_entity_resolution(
                         payload_a, payload_b, score,
                     )
                     if strength < EVIDENCE_THRESHOLD:
-                        await log_resolution(
-                            db,
-                            run_id=run_id,
+                        await record_audit(
                             action="flagged",
                             memory_id_a=point_a["id"],
                             memory_id_b=point_b["id"],
@@ -251,9 +253,7 @@ async def run_entity_resolution(
                             report["already_retired"] += 1
                             deprecated_this_run.add(retired)
                             continue
-                        await log_resolution(
-                            db,
-                            run_id=run_id,
+                        await record_audit(
                             action="auto_merge",
                             memory_id_a=point_a["id"],
                             memory_id_b=point_b["id"],
@@ -315,9 +315,7 @@ async def run_entity_resolution(
                                         point_a["id"][:8], point_b["id"][:8], challenge_reason,
                                     )
                                     report["challenge_overrides"] = report.get("challenge_overrides", 0) + 1
-                                await log_resolution(
-                                    db,
-                                    run_id=run_id,
+                                await record_audit(
                                     action="flagged",
                                     memory_id_a=point_a["id"],
                                     memory_id_b=point_b["id"],
@@ -353,9 +351,7 @@ async def run_entity_resolution(
                                 report["already_retired"] += 1
                                 deprecated_this_run.add(retired)
                                 continue
-                            await log_resolution(
-                                db,
-                                run_id=run_id,
+                            await record_audit(
                                 action="llm_merge",
                                 memory_id_a=point_a["id"],
                                 memory_id_b=point_b["id"],
@@ -410,9 +406,7 @@ async def run_entity_resolution(
                                     src[:8], tgt[:8], link_exc,
                                 )
 
-                        await log_resolution(
-                            db,
-                            run_id=run_id,
+                        await record_audit(
                             action="contradiction" if link_type == "contradicts" else "succeeded_by",
                             memory_id_a=point_a["id"],
                             memory_id_b=point_b["id"],
@@ -426,9 +420,7 @@ async def run_entity_resolution(
 
                     else:
                         # distinct — log and skip
-                        await log_resolution(
-                            db,
-                            run_id=run_id,
+                        await record_audit(
                             action="skipped",
                             memory_id_a=point_a["id"],
                             memory_id_b=point_b["id"],

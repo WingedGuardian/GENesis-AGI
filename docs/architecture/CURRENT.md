@@ -341,8 +341,9 @@ additive layer, not a leak.
 The scheduled weekly report distinguishes complete, partial and aborted runs.
 Only a complete run advances job health's last success. A failed phase or
 preflight records a bounded problem summary. A discovery exception continues
-through the scheduler's typed failure and reflex path. Worklist replacement
-still follows the existing weekly scan policy.
+through the scheduler's typed failure and reflex path, even after a semantic
+partial result. Job-health counters count the current disposition. Worklist
+replacement still follows the existing weekly scan policy.
 
 **Importance shield (Phase 2c)** — `memory/dream_shield.py` +
 `memory/dream_shield_config.py` (config: `config/dream_shield.yaml` + local
@@ -3254,7 +3255,9 @@ verified: 41c7343b3 2026-11-15
   own `tick_overdue`.
 - **scheduled-job telemetry (WS-2 M9)**: `runtime/_job_health.py` keeps the
   cumulative `job_health` row AND now appends per-run `job_run_events` (era
-  attribution the cumulative row can't give). Writes are debounced off the
+  attribution the cumulative row can't give). Each terminal outcome updates
+  its own cumulative counter. Startup cleanup preserves the totals.
+  Run-event writes are debounced off the
   persisted `job_health` anchors — a success only when ≥1h since the last, a
   failure on streak onset + hourly heartbeat — so a stuck sub-hourly poll costs
   ~24 rows/day. `duration_ms` is honest-or-NULL (only from an explicit
@@ -3274,9 +3277,11 @@ verified: 41c7343b3 2026-11-15
   `util/tasks.normalized_frames` — a second normalizer would split one bug
   into two fingerprints. **The funnel (2026-07-23):** `record_job_failure`
   gained an `exc=` param and, when an exception caused the failure, ALSO emits
-  a throttled `job.failed` event (via `util/tasks.emit_sync`, sharing the
-  run-event throttle -> ~24/day/job). This bridges the ~50 background-job loops
-  that wrote only to `job_health` onto the event bus, where the reflex arc (a
+  a throttled `job.failed` event (via `util/tasks.emit_sync`). Its hour
+  window starts at the previous typed signal within a failure episode, so a
+  semantic failure cannot suppress the first exception signal. This bridges
+  the ~50 background-job loops that wrote only to `job_health` onto the event
+  bus, where the reflex arc (a
   bus subscriber) can reach the largest class of internal defects - previously
   invisible. Semantic/no-exception failures stay off the bus; callers that emit
   their own domain `.failed` pass `emit_event=False` to avoid double-counting.
