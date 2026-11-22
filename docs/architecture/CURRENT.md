@@ -342,8 +342,9 @@ The scheduled weekly report distinguishes complete, partial and aborted runs.
 Only a complete run advances job health's last success. A failed phase or
 preflight records a bounded problem summary. A discovery exception continues
 through the scheduler's typed failure and reflex path, even after a semantic
-partial result. Job-health counters count the current disposition. Worklist
-replacement still follows the existing weekly scan policy.
+partial result. Job-health counters count the current disposition. Failed
+worklist inserts are counted as a partial result. Worklist replacement still
+follows the existing weekly scan policy.
 
 **Importance shield (Phase 2c)** — `memory/dream_shield.py` +
 `memory/dream_shield_config.py` (config: `config/dream_shield.yaml` + local

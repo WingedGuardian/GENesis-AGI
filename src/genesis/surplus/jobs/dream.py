@@ -24,7 +24,10 @@ def _weekly_outcome(report: dict[str, Any]) -> tuple[str, str]:
     if "aborted" in report:
         return "aborted", str(report["aborted"])[:500]
     failures = {entry["phase"]: "failed" for entry in report.get("errors", ())}
-    for phase in ("clustering", "cross_wing", "link_repair", "entity_resolution", "orphan_detection", "centrality"):
+    for phase in (
+        "clustering", "cross_wing", "worklist_persist", "link_repair",
+        "entity_resolution", "orphan_detection", "centrality",
+    ):
         detail = report.get(phase, {})
         if "error" in detail:
             failures[phase] = "failed"

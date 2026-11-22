@@ -343,6 +343,8 @@ async def run(
         )
         report["worklist_enqueued"] = worklist["enqueued"]
         report["oversize_flagged"] = worklist["oversize_flagged"]
+        if worklist["enqueue_failed"]:
+            report["worklist_persist"] = {"failure_counts": {"enqueue": worklist["enqueue_failed"]}}
     except Exception as exc:
         report["errors"].append({"phase": "worklist_persist", "error": str(exc)})
         logger.warning(
@@ -437,7 +439,7 @@ async def _persist_worklist(
 ) -> dict[str, int]:
     """Persist the top-value clusters as the daily-drain worklist.
 
-    Returns ``{"enqueued": n, "oversize_flagged": n, "superseded": n}``.
+    Returns enqueued, enqueue-failed, oversize-flagged, and superseded counts.
 
     ``shield_thresholds`` (when set) is frozen into each slice payload as a
     ``shield`` block, so the daily drain re-checks live members against the same
@@ -495,6 +497,7 @@ async def _persist_worklist(
     )
     return {
         "enqueued": enqueued,
+        "enqueue_failed": len(ranked) - enqueued,
         "oversize_flagged": len(oversize),
         "superseded": superseded,
     }

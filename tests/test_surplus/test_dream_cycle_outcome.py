@@ -41,7 +41,8 @@ async def test_dream_cycle_job_health(monkeypatch, report, expected_marker):
     assert runtime._heavy_workload is None
 
 
-async def test_qdrant_retrieval_failure_reaches_weekly_health_and_report(db, monkeypatch):
+@pytest.mark.parametrize("phase", ["clustering", "worklist_persist"])
+async def test_item_failure_reaches_weekly_health_and_report(db, monkeypatch, phase):
     points = [
         SimpleNamespace(id=point_id, payload={"wing": "memory", "room": "store"})
         for point_id in ("a", "b")
@@ -56,22 +57,32 @@ async def test_qdrant_retrieval_failure_reaches_weekly_health_and_report(db, mon
     monkeypatch.setattr(GenesisRuntime, "instance", lambda: runtime)
     monkeypatch.setattr(runtime, "_persist_job_health", MagicMock())
     monkeypatch.setattr(dream_cycle, "_read_mem_available_mb", lambda: None)
-    for phase in (
+    for phase_path in (
         "dream_link_repair.run_link_repair",
         "dream_entity_scan.run_entity_resolution",
         "dream_orphan_detection.run_orphan_detection",
         "dream_centrality.run_centrality_recompute",
     ):
-        monkeypatch.setattr(f"genesis.memory.{phase}", AsyncMock(return_value={}))
+        monkeypatch.setattr(f"genesis.memory.{phase_path}", AsyncMock(return_value={}))
 
     await run_dream_cycle()
     first_success = runtime.job_health["dream_cycle"]["last_success"]
-    qdrant.retrieve.side_effect = TimeoutError
+    if phase == "clustering":
+        qdrant.retrieve.side_effect = TimeoutError
+    else:
+        # The tiny fixture ties at the activation percentile; retain it for the insert test.
+        monkeypatch.setenv("GENESIS_DREAM_SHIELD_DISABLED", "1")
+        candidates = [{"id": p.id, "wing": "memory", "room": "store", "payload": p.payload} for p in points]
+        monkeypatch.setattr(dream_cycle, "_cluster_bucket", AsyncMock(return_value=[candidates]))
+        await db.execute(
+            """CREATE TRIGGER fail_fixture_enqueue BEFORE INSERT ON deferred_work_queue
+               BEGIN SELECT RAISE(ABORT, 'fixture enqueue failure'); END""",
+        )
     await run_dream_cycle()
 
     health = runtime.job_health["dream_cycle"]
     assert health["last_success"] == first_success
-    assert health["last_error"] == "partial: clustering (1 item error(s))"
+    assert health["last_error"] == f"partial: {phase} (1 item error(s))"
     assert health["consecutive_failures"] == 1
     rows = await db.execute_fetchall(
         "SELECT content FROM observations WHERE type = 'dream_cycle_report' ORDER BY created_at",
