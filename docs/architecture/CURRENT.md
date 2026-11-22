@@ -305,9 +305,13 @@ Easy-to-forget mechanisms:
   but is FENCED (runs as `propose_only`, settings lever refuses it) until
   issue #2742 adds a merge-time check on durable pair state. A cursor-managed reconcile sweep
   rediscovers historical fuzzy pairs. Both fuzzy scans (the sweep and resolution's
-  `_closest`) run in a thread that keeps the GIL busy, so they go through
-  `entity_registry.fuzzy_ratio_at_least`, which skips pairs whose cheap difflib bounds
-  cannot reach the threshold (same matches, about 8x less CPU). Settings lever `entity_adjudication`
+  `_closest`) go through `entity_registry.fuzzy_ratio_at_least`, which skips pairs
+  whose cheap difflib bounds cannot reach the threshold (same matches, about 8x less
+  CPU). The sweep's scan runs in a fresh single-worker spawn process per run (a
+  thread held the GIL and slowed the server's other sqlite queries about 100x, #4877);
+  a crash or a 2-hour timeout fails the job and leaves the cursor, so the slice
+  retries next hour. The child imports the module from disk, so it runs pulled code
+  before the server restarts. `_closest` still runs in a thread. Settings lever `entity_adjudication`
   (off/propose_only/live) + `GENESIS_ENTITY_ADJUDICATION_DISABLED`. Distinct from
   `memory/entity_resolution.py`, which is near-duplicate memory-PAIR dedup.
   **Human-approval apply gate** (`entity_adjudication_approve`/`_apply`/`_reject`
