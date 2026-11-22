@@ -42,6 +42,9 @@ class RoundContext:
     round_number: int
     round_started: str | None
     prior_heads: tuple[str, ...]
+    #: The round's own head; None for round 0. The past-round-4 rules judge a
+    #: late key under the record of this head (``review_past_terminal``).
+    round_head: str | None = None
 
 
 def _ancestry(budget: Mapping[str, Any]) -> tuple[set[str], Ancestors]:
@@ -153,7 +156,7 @@ def round_context(budget: Mapping[str, Any], round_head: str, at: datetime) -> R
             return None
         if before:
             prior.append(head)
-    return RoundContext(len(prior) + 1, own.isoformat(), tuple(sorted(prior)))
+    return RoundContext(len(prior) + 1, own.isoformat(), tuple(sorted(prior)), round_head)
 
 
 def _contexts(
@@ -385,7 +388,12 @@ def _descendants(cwd: str, sha: str, current: str) -> set[str]:
     return set(out.split())
 
 
-def covered_late_keys(
+def covered_late_keys(cwd: str, budget: Mapping[str, Any], late: Sequence[Mapping[str, Any]], **context) -> set[str]:
+    """Compatibility set view of the same fully validated late coverage."""
+    return set(coverage_details(cwd, budget, late, **context))
+
+
+def coverage_details(
     cwd: str,
     budget: Mapping[str, Any],
     late: Sequence[Mapping[str, Any]],
@@ -395,7 +403,7 @@ def covered_late_keys(
     deadline: float | None = None,
     repo: str | None = None,
     number: int | None = None,
-) -> set[str]:
+) -> dict[str, rr.Disposition]:
     """Late keys answered by committed reflections. A reflection R naming head
     N, committed at T, credits late key k (reviewed on head H at time S) only
     when ALL hold:
@@ -440,7 +448,7 @@ def covered_late_keys(
     refuses. Raises ``Refused`` when git cannot be read: unknown, never
     nothing owed."""
     with rr.deadline_scope(deadline):
-        return _covered_late_keys(
+        return _coverage_details(
             cwd, budget, late, gate_lane=gate_lane, acceptance=acceptance, deadline=deadline,
             repo=repo, number=number,
         )
@@ -465,7 +473,7 @@ def _before_every_fix(
     return True
 
 
-def _covered_late_keys(
+def _coverage_details(
     cwd: str,
     budget: Mapping[str, Any],
     late: Sequence[Mapping[str, Any]],
@@ -475,16 +483,17 @@ def _covered_late_keys(
     deadline: float | None,
     repo: str | None,
     number: int | None,
-) -> set[str]:
+) -> dict[str, rr.Disposition]:
     current = budget.get("current_head")
     in_graph, ancestors = _ancestry(budget)
     log = rr._log_reflections(cwd)
     owners = rr.key_rounds(budget)
+    records = rr._round_records(budget)
     labels: dict[tuple[tuple[str, ...], str], list[str]] = {}
     checked: dict[tuple[str, RoundContext], bool] = {}
     fix_times: dict[tuple[str, str], datetime | None] = {}
     tip_rows: dict[str, list[rr.Fix]] = {}
-    covered: set[str] = set()
+    covered: dict[str, rr.Disposition] = {}
     citation_cache: dict[str, dict] = {}
     for sha, kind, body, made_at in log:
         if deadline is not None and time.monotonic() > deadline:
@@ -540,7 +549,19 @@ def _covered_late_keys(
             passed = True
             for context in contexts:
                 if (sha, context) not in checked and context.round_number == 0:
-                    checked[(sha, context)] = parsed.ok and not parsed.escalate
+                    # Round 0 owes the grammar only, a fix-now's Alternative
+                    # line, and the past-round-4 rules about the whole PR (no
+                    # round of its own to judge).
+                    import review_past_terminal as pt  # noqa: PLC0415
+
+                    checked[(sha, context)] = (
+                        parsed.ok
+                        and not parsed.escalate
+                        and rr.alternative_problem(parsed, made_at) is None
+                        and not pt.problems(
+                            parsed, None, records, gate_lane=gate_lane, made_at=made_at
+                        )
+                    )
                 if (sha, context) not in checked:
                     if (context.prior_heads, sha) not in labels:
                         # Only a fix-instances decision with classes can recur.
@@ -566,6 +587,10 @@ def _covered_late_keys(
                         round_started=context.round_started,
                         made_at=made_at,
                         cwd=cwd,
+                        round_record=(
+                            None if records is None else records.get(str(context.round_head))
+                        ),
+                        round_records=records,
                     ).ok
                 passed = passed and checked[(sha, context)]
             if passed:

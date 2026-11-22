@@ -44,8 +44,9 @@ hooks, wrapper teardown, unconfigure or writes after the snapshot.
 Hits classify pre-operation events, not syscall completion. Known no-ops such
 as an existing ``mkdir``, missing ``unlink``, non-empty ``rmdir``, or an
 unchanged reopen are filtered. Other refused operations and readonly SQLite
-queries outside the recognized literal forms can still be reported.
-Known exclusive/nofollow refusals, metadata-only O_PATH, missing rename/link
+queries outside the recognized literal forms can still be reported, and some
+aliases can be missed (tracked in #4193).
+Known raw exclusive/nofollow refusals, metadata-only O_PATH, missing rename/link
 sources, occupied link destinations and same-inode renames are also filtered.
 Protected hardlink sources are observed as ``os.link source`` exposure, even
 without a later content write. Source symlink targets are checked conservatively

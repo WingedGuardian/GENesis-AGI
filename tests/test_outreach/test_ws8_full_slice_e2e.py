@@ -245,7 +245,7 @@ async def test_granted_bulk_send_survives_stamp_failure(config, db, monkeypatch)
     async def _boom(*a, **k):
         raise RuntimeError("simulated DB error stamping the prospect post-send")
 
-    monkeypatch.setattr(mp, "mark_contacted_by_email", _boom)
+    monkeypatch.setattr(mp, "mark_contacted_in_recipient", _boom)
 
     adapter = AsyncMock()
     adapter.send_message.return_value = "<m@x>"
@@ -265,3 +265,99 @@ async def test_granted_bulk_send_survives_stamp_failure(config, db, monkeypatch)
     r = await pipe.submit_raw("cold pitch", req)
     assert r.status == OutreachStatus.DELIVERED  # completed send NOT broken by the stamp failure
     adapter.send_message.assert_called_once()  # sent exactly once — no re-attempt
+
+
+@pytest.mark.asyncio
+async def test_granted_partly_refused_send_stamps_only_accepted_prospect(config, db, monkeypatch):
+    """The GRANTED-cell path stamps inline in pipeline._deliver, so it must pass the
+    adapter's refused set too: a prospect the server refused stays active. RED if
+    `refused=` is dropped from the granted-path stamp call.
+
+    The BULK scope guard admits only a single curated prospect on a granted cell
+    (email_gate.py, `recipient_not_curated`), and smtplib raises when its only
+    recipient is refused, so a real partial refusal cannot reach this path today.
+    The fake delivery id below pins the hand-off itself, so a later path that does
+    send to several recipients inherits it."""
+    from genesis.channels.email_adapter import EmailDeliveryId
+    from genesis.db.crud import capability_grants as cg
+    from genesis.db.crud import marketing_prospects as mp
+
+    _ts = "2026-06-21T00:00:00"
+    monkeypatch.setattr("genesis.outreach.marketing_config.effective_mode", lambda: "live")
+    await cg.ensure_cell(db, domain="email", verb="send", risk_class="bulk", updated_at=_ts)
+    await db.execute(
+        "UPDATE capability_grants SET state = 'granted', granted_at = ? WHERE id = ?",
+        (_ts, cg.cell_id("email", "send", "bulk")),
+    )
+    await db.commit()
+    await mp.create(db, id="p1", email="prospect@example.com", created_at=_ts, updated_at=_ts)
+
+    adapter = AsyncMock()
+    adapter.send_message.return_value = EmailDeliveryId(
+        "<m@example.com>", {"prospect@example.com": (450, b"mailbox busy")}
+    )
+    pipe = _pipeline(config, db, adapter)
+
+    req = OutreachRequest(
+        category=OutreachCategory.NOTIFICATION,
+        topic="cold pitch",
+        context="body",
+        salience_score=0.5,
+        signal_type="marketing_cold",
+        channel="email",
+        validated_recipient="prospect@example.com",
+        labeled_surplus=True,  # → classifies BULK at the gate
+        verbatim=True,
+    )
+    r = await pipe.submit_raw("cold pitch", req)
+    assert r.status == OutreachStatus.DELIVERED  # granted: no hold
+    adapter.send_message.assert_called_once()
+    assert r.refused_recipients == ("prospect@example.com",)
+    assert (await mp.get_by_id(db, "p1"))["status"] == "active"  # refused: not stamped
+
+
+@pytest.mark.asyncio
+async def test_partly_refused_approved_send_stamps_only_accepted_prospect(config, db, monkeypatch):
+    """Through the real pipeline and drain: the adapter's delivery id names a
+    recipient the server refused, the pipeline result carries it, and the drain
+    stamps only the prospect the server accepted."""
+    from genesis.autonomy import email_gate_watcher as egw
+    from genesis.channels.email_adapter import EmailDeliveryId
+    from genesis.db.crud import marketing_prospects as mp
+
+    _ts = "2026-06-21T00:00:00"
+    monkeypatch.setattr(egw, "_marketing_mode", lambda: "observe")
+    for pid, email in (("p1", "one@example.com"), ("p2", "two@example.com")):
+        await mp.create(db, id=pid, email=email, created_at=_ts, updated_at=_ts)
+    mgr = ApprovalManager(db=db)
+    rid = await mgr.request_approval(
+        action_type="email_capability_gate",
+        action_class="costly_reversible",
+        description="d",
+        context=json.dumps({"subject": "hi"}),
+    )
+    await mgr.resolve(rid, status="approved")
+    await pes.create(
+        db,
+        id="h1",
+        request_id=rid,
+        validated_recipient="One <one@example.com>, Two <two@example.com>",
+        category="notification",
+        message="follow-up",
+        held_at=_ts,
+        cell_domain="email",
+        cell_verb="send",
+        cell_risk_class="identity",
+    )
+
+    adapter = AsyncMock()
+    adapter.send_message.return_value = EmailDeliveryId(
+        "<m@example.com>", {"two@example.com": (450, b"mailbox busy")}
+    )
+    pipe = _pipeline(config, db, adapter)
+
+    assert await drain_pending_email_sends(_Rt(db, pipe)) == 1
+    adapter.send_message.assert_called_once()
+    assert (await pes.get_by_id(db, "h1"))["status"] == "sent"
+    assert (await mp.get_by_id(db, "p1"))["status"] == "contacted"
+    assert (await mp.get_by_id(db, "p2"))["status"] == "active"

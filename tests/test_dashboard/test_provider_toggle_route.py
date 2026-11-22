@@ -54,14 +54,33 @@ def test_boolean_intent_reaches_the_registry(enabled):
     breakers.toggle.assert_called_once_with("qdrant", enable=enabled)
 
 
-@pytest.mark.parametrize("kwargs", [{}, {"json": {}}, {"data": "not json"}])
+@pytest.mark.parametrize(
+    "kwargs",
+    [{}, {"json": {}}, {"data": "not json"}, {"data": "null", "content_type": "application/json"}],
+)
 def test_absent_intent_is_none(kwargs):
     breakers, _, status = _call(**kwargs)
     assert status == 200
     breakers.toggle.assert_called_once_with("qdrant", enable=None)
 
 
-@pytest.mark.parametrize("body", [{"enabled": "yes"}, {"enabled": 1}, True, [True], "x"])
+# An explicit null is not an absent key: forwarded as enable=None it ran the
+# state-dependent toggle, so a bad enable request could disable a provider.
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"enabled": "yes"},
+        {"enabled": 1},
+        {"enabled": 0},
+        {"enabled": ""},
+        {"enabled": None},
+        True,
+        [True],
+        [],
+        0,
+        "x",
+    ],
+)
 def test_malformed_intent_is_refused_without_toggling(body):
     breakers, resp, status = _call(json=body)
     assert status == 400

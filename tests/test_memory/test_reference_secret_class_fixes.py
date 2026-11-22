@@ -124,9 +124,16 @@ async def test_two_interleaved_same_key_writes_never_delete_the_live_point(db):
         _ingest(db, store, _body("Example portal login, rotated", "password: Second!Fake2"))
     )
     await entered.wait()  # A sits between its check and its delete of P
-    await _ingest(db, store, _body("Example portal login", "password: Third!Fake3"))
+    # A holds the knowledge writer lock from its read through its cleanup
+    # (#4161), so B cannot run inside that window: it waits, then runs after A.
+    writer_b = asyncio.create_task(
+        _ingest(db, store, _body("Example portal login", "password: Third!Fake3"))
+    )
+    await asyncio.sleep(0.05)
+    assert not writer_b.done(), "B ran between A's reference check and its delete"
     resume.set()
     await writer_a
+    await writer_b
 
     row = await kc.get(db, unit)
     assert row["qdrant_id"] in store.points, "the unit names a deleted point"
@@ -271,5 +278,3 @@ _IDENTIFIER_POSITION_SHAPES = [
     ("url: https://portal.example.org/?api_key=QueryFake21", "QueryFake21"),
     (f"{_LEAK} / forumuser", _LEAK),  # "secret / login"
 ]
-
-

@@ -16,6 +16,18 @@ from genesis.session_awareness.pr_recording import PrMetadata
 from tests.test_scripts.test_pr_verification_closer import MERGE_SHA, _doc, _doc_for, _with_tracking
 
 
+@pytest.fixture(autouse=True)
+def _close_before_the_fixture_dates(monkeypatch):
+    """Every close here is judged on a day before the fixtures' event-gate dates
+    (2026-11-02, 2030-01-02), so a close may still store them as rechecks. The
+    refusal of a due trigger is tested with its own date below."""
+    from datetime import date
+
+    from genesis.mcp.health import validator_writes
+
+    monkeypatch.setattr(validator_writes, "_today", lambda: date(2026, 11, 1))
+
+
 @pytest.fixture
 async def recording(tmp_path, monkeypatch):
     from genesis import _config_overlay
@@ -234,6 +246,23 @@ async def test_local_opt_in_records_derived_result_and_closed_rows_are_immutable
     assert not shared.in_transaction
 
 
+@pytest.mark.parametrize("verdict", ["pass-mechanical", "cannot-verify"])
+async def test_the_sealed_validator_is_stamped_on_what_it_writes(recording, monkeypatch, verdict):
+    # Even if the server inherited a Claude Code shell's markers and transcript id,
+    # the external-client profile in force for the call decides the label, and a
+    # Codex label never carries the parent transcript as its session.
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "parent-transcript")
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    path, _shared, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    args = {"note": "Synthetic result"} if verdict != "pass-mechanical" else {}
+    assert (await call(_doc_for(verdict), **args))["recorded"] is True
+    stored = row(path)
+    by = "closed_by" if verdict == "pass-mechanical" else "last_attempt_by"
+    assert stored[by] == "codex-sealed" and stored["recorded_session"] is None
+
+
 @pytest.mark.parametrize("over", [
     {"pr": 8}, {"verdict": "fail-intent"}, {"park": True}, {"note": "Discarded note"},
     {"dry_run_only": False}, {"evidence_json": '{"pr":7,"pr":8}'},
@@ -264,3 +293,59 @@ async def test_independent_pr_type_is_checked_before_framework_coercion(recordin
         with sqlite3.connect(path) as fresh:
             actual = fresh.execute("SELECT status FROM pr_verifications WHERE pr_number=1").fetchone()[0]
         pytest.fail(f"Noninteger {type(bad_pr).__name__} reached recording; physical row is {actual}")
+
+
+async def test_a_preview_returns_the_completeness_prompts(recording):
+    doc = _doc(gaps=[{"kind": "method", "detail": "only CI ran it"}])
+    result = await call(doc, dry_run=True)
+    assert result["recorded"] is False
+    assert result["prompts"] and result["prompts"][0].startswith("gaps/0 is a method gap")
+
+
+async def test_a_clean_document_returns_no_prompts(recording):
+    result = await call(_doc(), dry_run=True)
+    assert result["prompts"] == []
+
+
+async def test_a_close_with_a_date_gate_already_come_is_refused(recording, monkeypatch):
+    from datetime import date
+
+    from genesis.mcp.health import validator_writes
+
+    monkeypatch.setattr(validator_writes, "_today", lambda: date(2026, 11, 14))
+    gate = {
+        "kind": "event_gated",
+        "detail": "weekly run",
+        "trigger": "2026-11-14",
+        "recheck": "gh run list",
+    }
+    with pytest.raises(ToolError, match=r"gaps/0 \(trigger 2026-11-14\)"):
+        await call(_doc(gaps=[gate]), dry_run=True)
+
+
+@pytest.mark.parametrize("review_complete", [False, True])
+async def test_p2_receipt_is_stored_without_claiming_close_enforcement(recording, tmp_path, monkeypatch, review_complete):
+    from dataclasses import replace
+
+    from genesis.mcp.health import validator_writes
+    from genesis.session_awareness.pr_completeness import source_binding
+    from tests.test_session_awareness.test_pr_completeness import refresh, reviewed
+
+    path, _, config = recording
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    doc, source = reviewed(source_dir)
+    source = replace(source, merge_commit=MERGE_SHA)
+    doc["merge_commit"] = MERGE_SHA
+    doc["completeness"]["inventory"]["source"] = source_binding(source).model_dump(mode="json")
+    doc["completeness"]["complete"] = review_complete
+    refresh(doc)
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    monkeypatch.setattr(validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, source.body))
+    assert (await call(doc, route=False))["recorded"] is True
+    stored = row(path)
+    assert stored["status"] == "closed"
+    receipt = json.loads(stored["evidence"])["completeness"]
+    assert receipt["complete"] is review_complete
+    assert receipt["evidence_sha256"] == doc["completeness"]["evidence_sha256"]
+    assert receipt["review_execution_ref"] == "fixture-only:no-model-ran"

@@ -22,7 +22,7 @@ def pending_record(row: dict, machine_hash, legs) -> tuple[str, ...]:
     return "1", "pending", h, repo, provider, str(age)
 
 
-def main(argv: list[str] | None, api: dict) -> int:
+def main(argv: list[str] | None, api: dict, *, supervisor=None) -> int:
     parser = argparse.ArgumentParser(description="Code-intel provider-leg queue")
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("write")
@@ -55,9 +55,13 @@ def main(argv: list[str] | None, api: dict) -> int:
         if name == "should-escalate":
             p.add_argument("--nul", action="store_true")
     sub.add_parser("reconcile-inflight")
-    sub.add_parser("reconcile-native")
+    p = sub.add_parser("reconcile-native")
+    p.add_argument('--context')
     api['_native'].add_commands(sub)
+    api['_retry'].add_commands(sub, api['_legs'])
     args = parser.parse_args(argv)
+    if args.cmd in api['_retry'].COMMANDS:
+        return api['_retry'].dispatch(args, api, supervisor)
     if args.cmd in api['_native'].COMMANDS:
         return api['_native'].dispatch(args, api, api['_proof'])
     machine = getattr(args, "nul", False)
@@ -151,6 +155,13 @@ def main(argv: list[str] | None, api: dict) -> int:
             print(f"re-pended {len(rows)} protocol2 claims without native intent")
         return 0
     if args.cmd == "reconcile-native":
-        print(json.dumps(api['reconcile_native']()))
+        if args.context is not None:
+            if supervisor is None:
+                raise RuntimeError('captured supervised reconciliation is required')
+            value = json.loads(args.context, object_pairs_hook=api['_proof']._unique)
+            print(json.dumps(supervisor.reconcile_context(
+                api['_native'].context(value, api['_legs'], api['marker_hash']))))
+        else:
+            print(json.dumps(api['reconcile_native']()))
         return 0
     return 2

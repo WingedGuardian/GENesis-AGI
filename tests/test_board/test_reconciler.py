@@ -1,7 +1,7 @@
-"""The read-only board reconciler tick: every gate state pulses without
-touching GitHub, a read publishes counts with their denominators, drags are
-logged once, an error publishes no partial counts, and the module never calls
-a GitHub write."""
+"""The board reconciler's read: every gate state pulses without touching
+GitHub, a read publishes counts with their denominators, drags are logged once,
+an error publishes no partial counts, and the module's only GitHub writes are
+add_item and set_status (the writes themselves: test_reconciler_writes.py)."""
 
 from __future__ import annotations
 
@@ -271,8 +271,10 @@ async def test_without_a_tracker_coverage_is_unavailable_not_zero(db, monkeypatc
     assert cov.get("on_board") is None and "unavailable" in cov
 
 
-def test_the_reconciler_module_calls_no_github_write():
-    """PR3a is read-only: no projects_v2 mutation is referenced anywhere in it."""
+def test_the_reconciler_writes_github_only_through_add_item_and_set_status():
+    """The reconciler's only GitHub writes are adding a card and the Status
+    chokepoint (which refuses In Progress). That it sends none outside ``live``
+    is behavioural: test_reconciler_writes.py runs the tick in every mode."""
     import inspect
 
     # Derived, so a mutation helper added later is covered without a list edit.
@@ -285,5 +287,69 @@ def test_the_reconciler_module_calls_no_github_write():
     src = Path(reconciler.__file__).read_text()
     names = {n.attr for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Attribute)}
     names |= {n.id for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Name)}
-    assert not (names & writes)
+    assert names & writes == {"add_item"}
+    assert "set_status" in names
     assert "gh issue" not in src and "mutation" not in src
+
+
+def test_no_board_module_writes_a_field_around_the_status_chokepoint():
+    """set_single_select writes ANY single-select field, Status included; only
+    the adapter itself (set_status) may call it."""
+    board_dir = Path(pv.__file__).parent
+    offenders = [
+        p.name
+        for p in sorted(board_dir.glob("*.py"))
+        if p.name != "projects_v2.py" and "set_single_select" in p.read_text()
+    ]
+    assert offenders == []
+
+
+# ── the Build column and the builder launcher (spec E, E3a) ─────────────────
+
+
+async def test_a_build_card_is_logged_as_a_drag_naming_its_column(db, monkeypatch):
+    fresh = (NOW - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    FakeBoard([_item("I1", "Build", updated=fresh, number=7),
+               _item("I2", "In Progress", updated=fresh, number=8)]).install(monkeypatch)
+    out = await reconciler.run_tick(FakeRT(db), now=NOW)
+    assert out["drags"] == {"in_progress": 1, "build": 1, "newly_logged": 2}
+    statuses = {e["issue_number"]: e["detail"]["status"]
+                for e in (await board_crud.list_events(db, event="drag"))["items"]}
+    assert statuses == {7: "Build", 8: "In Progress"}
+
+
+@pytest.mark.parametrize("setup", ["ok", "off", "paused", "error"])
+async def test_the_launcher_runs_every_tick_with_cards_only_from_a_good_read(
+    db, monkeypatch, setup
+):
+    from genesis.board import launcher
+
+    seen = []
+
+    async def fake_launcher(rt, items, now):
+        seen.append(items)
+        return {"armed": False}
+
+    monkeypatch.setattr(launcher, "run_launcher", fake_launcher)
+    item = _item("I1", "Build", number=7)
+    FakeBoard([item], fail=pv.ProjectsError("boom") if setup == "error" else None).install(
+        monkeypatch)
+    if setup == "off":
+        monkeypatch.setattr(board_config, "effective_mode", lambda: "off")
+    out = await reconciler.run_tick(FakeRT(db, paused=(setup == "paused")), now=NOW)
+    assert out["launcher"] == {"armed": False}
+    assert seen == ([[item]] if setup == "ok" else [None])
+
+
+async def test_a_launcher_failure_is_a_job_failure_beside_a_good_read(db, monkeypatch):
+    from genesis.board import launcher
+
+    async def broken(rt, items, now):
+        return {"error": "RuntimeError: tmux exploded"}
+
+    monkeypatch.setattr(launcher, "run_launcher", broken)
+    FakeBoard([_item("I1", "Proposed", number=1)]).install(monkeypatch)
+    rt = FakeRT(db)
+    out = await reconciler.run_tick(rt, now=NOW)
+    assert out["board_state"] == "ok" and rt.successes == []
+    assert "builder launcher failed: RuntimeError: tmux exploded" in str(rt.failures[0][1])

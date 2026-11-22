@@ -25,6 +25,7 @@ _EXPECTED = (
     "graph_traverse_prune",
     "events_prune",
     "voice_hygiene",
+    "tool_call_outcomes_prune",
 )
 
 

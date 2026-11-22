@@ -346,12 +346,16 @@ async def test_stream_close_cannot_discard_complete_durable_answer(tmp_path, can
             transport=httpx.MockTransport(transport),
         )
         try:
-            failure = httpx.ReadError if partial else (asyncio.CancelledError if cancelled else RuntimeError)
+            # Cleanup cancellation remains cancellation even after a partial read.
+            failure = asyncio.CancelledError if cancelled else (httpx.ReadError if partial else RuntimeError)
             with pytest.raises(failure):
                 await handler.client.post(
                     ENDPOINT + "/chat/completions", json=expected,
                     headers={"Authorization": "Bearer synthetic-key"},
                 )
+            assert handler.error == "response_stream_cleanup_failed:" + (
+                "CancelledError" if cancelled else "RuntimeError"
+            )
             observations = campaign.attempt("case-0")["observations"]
             assert bool(observations) is not partial
             if not partial:

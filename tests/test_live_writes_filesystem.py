@@ -12,7 +12,7 @@ from tests.test_live_writes import home as home
 
 @pytest.mark.parametrize("raw", [False, True])
 @pytest.mark.parametrize("entry", ["file", "dangling"])
-def test_refused_exclusive_open_has_no_access(home, raw, entry):
+def test_refused_exclusive_open_keeps_high_level_attempt(home, raw, entry):
     target = home / ".genesis" / "existing"
     if entry == "file":
         target.write_bytes(b"owned")
@@ -24,7 +24,8 @@ def test_refused_exclusive_open_has_no_access(home, raw, entry):
             os.close(os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
         else:
             target.open("x").close()
-    assert not audit._S.hits
+    expected = set() if raw else {("~/.genesis", "write")}
+    assert {(label, operation) for label, operation, _ in _hits()} == expected
     assert audit._S.faults == 0
 
 
@@ -163,16 +164,33 @@ def test_named_destination_with_dir_fd_still_records(home, operation):
 
 
 @pytest.mark.parametrize("follow", [False, True])
-def test_link_symlink_source_has_explicit_conservative_exposure(home, follow):
+@pytest.mark.parametrize("metadata_failure", [None, "source-once", "destination"])
+def test_link_symlink_source_has_explicit_conservative_exposure(home, monkeypatch, follow, metadata_failure):
     source = home / ".genesis" / "source"
     source.write_bytes(b"owned")
     allowed = home.parent / "allowed"
     symlink = allowed / "link"
     symlink.symlink_to(source)
+    alias = allowed / "alias"
+    if metadata_failure is not None:
+        unavailable = symlink if metadata_failure == "source-once" else alias
+        original = audit.os.lstat
+        failed = False
+
+        def lstat(path, *args, **kwargs):
+            nonlocal failed
+            # The later followed lookup must be able to read the source link.
+            if os.fspath(path) == str(unavailable) and (not failed or metadata_failure == "destination"):
+                failed = True
+                raise OSError(errno.EIO, "owned metadata fault")
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(audit.os, "lstat", lstat)
     audit._S.hits.clear()
-    os.link(symlink, allowed / "alias", follow_symlinks=follow)
+    os.link(symlink, alias, follow_symlinks=follow)
+    assert alias.exists()
     assert ("~/.genesis", "os.link source", "source") in _hits()
-    assert audit._S.faults == 0
+    assert audit._S.faults == int(metadata_failure is not None)
 
 
 @pytest.mark.parametrize("event", ["open", "rename", "link"])
@@ -190,8 +208,11 @@ def test_metadata_uncertainty_preserves_known_destination(home, monkeypatch, eve
     monkeypatch.setattr(audit.os, "lstat", unknown)
     audit._S.hits.clear()
     if event == "open":
-        with target.open("x") as handle:
-            handle.write("owned")
+        descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(descriptor, b"owned")
+        finally:
+            os.close(descriptor)
     else:
         getattr(os, event)(source, target)
     assert target.read_bytes() == b"owned"

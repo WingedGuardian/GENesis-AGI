@@ -14,9 +14,19 @@ from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 
-from genesis.eval.qualification import contracts, corpus, references, sources, storage
+from genesis.eval.qualification import (
+    contracts,
+    corpus,
+    native,
+    native_expense,
+    pinned,
+    references,
+    sources,
+    storage,
+    transports,
+)
 from genesis.eval.qualification.evidence import Incomplete, canonical, digest, load_json
-from genesis.eval.qualification.pinned import ROUTE_KEYS, resolve, routing, validate_params
+from genesis.eval.qualification.pinned import routing
 from genesis.eval.rubrics import list_rubrics
 from genesis.eval.scorers import LLMJudgeScorer
 
@@ -83,8 +93,9 @@ async def prepare(cases, temp_root, *, reference_policy=None):
 
 def parameters(alias, configured, plan, *, config=None):
     """Freeze explicit params, refusing implicit or contradictory transformations."""
-    configured = load_json(canonical(validate_params(configured)))
-    provider = resolve(alias, config)
+    profile = transports.select(alias, config=config)
+    configured = load_json(canonical(profile.validate_params(configured)))
+    provider = profile.resolve(alias, config)
     if provider.params:
         raise Incomplete("alias has implicit routing parameters forbidden in qualification")
     for name, rows in plan.items():
@@ -93,7 +104,7 @@ def parameters(alias, configured, plan, *, config=None):
             for key, value in row["call_parameters"].items():
                 if key == "chain_offset" and type(value) is int and value == 0:
                     continue
-                if key not in ROUTE_KEYS or key not in body or canonical(body[key]) != canonical(value):
+                if key not in profile.ROUTE_KEYS or key not in body or canonical(body[key]) != canonical(value):
                     raise Incomplete(f"{name}: call-site parameter {key!r} contradicts params")
     return configured
 
@@ -191,7 +202,7 @@ def production_modules():
     return [contracts, corpus, references, sources, storage, extractor, judge, operations, scoping,
             validation_gate, inspect.getmodule(LLMJudgeScorer),
             inspect.getmodule(contracts.J9EvalBatchExecutor), inspect.getmodule(check),
-            inspect.getmodule(resolve), inspect.getmodule(contracts.pack_embedding),
+            pinned, native, transports, native_expense, inspect.getmodule(contracts.pack_embedding),
             inspect.getmodule(contracts.connect_aiosqlite_rw), contracts.procedural, storage.tool_names,
             inspect.getmodule(operations.validate_trigger_spec), inspect.getmodule(create_all_tables), _tables,
             session_config, cc_types]
@@ -219,7 +230,7 @@ async def check(cases, temp_root, *, reference_policy, current_policy,
         raise Incomplete("explicit qualification candidates are required")
     models = {}
     for alias, configured in candidates.items():
-        provider = resolve(alias, config)
+        provider = transports.select(alias, config=config).resolve(alias, config)
         model = references.identity(provider.model_id)
         if model in {references.identity(m) for m in policy["approved_models"]}:
             raise Incomplete("qualification candidate cannot grade its own references")

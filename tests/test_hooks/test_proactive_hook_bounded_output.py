@@ -29,6 +29,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,7 @@ import proactive_memory_hook as pmh  # noqa: E402
 from hook_output import HOOK_STDOUT_CAP, emit_cost  # noqa: E402
 
 _SID = "aaaabbbb-cccc-dddd-eeee-ffff00002222"
+_REAL_PEER_WORKTREES = pmh._peer_worktrees
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +50,35 @@ def _no_live_registry(monkeypatch):
     """Keep the peer renderer off the machine's real session registry (a dev box
     has one and CI does not); the widest-block test sets its own suffix."""
     monkeypatch.setattr(pmh, "_peer_addresses", lambda *a, **k: {})
+    monkeypatch.setattr(pmh, "_peer_worktrees", lambda *a, **k: {})
+
+
+@pytest.fixture
+def recall_db(tmp_path, monkeypatch):
+    """Keep the real hook migration and all its connects on an owned database."""
+    db_path = tmp_path / "hook.db"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("CREATE TABLE knowledge_units (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    home = tmp_path / "hook-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(pmh, "_DB_PATH", db_path)
+    connect = pmh._sqlite_connect
+    targets = []
+
+    def owned_connect(target, *args, **kwargs):
+        assert Path(target) == db_path
+        targets.append(Path(target))
+        return connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(pmh, "_sqlite_connect", owned_connect)
+    yield db_path
+    assert targets, "fixture never exercised a real SQLite connection"
+    assert (home / ".genesis/.knowledge_retrieved_count_migrated").exists()
+    with closing(sqlite3.connect(db_path)) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(knowledge_units)")}
+    assert "retrieved_count" in columns
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +447,25 @@ def _widest_address() -> str:
     return text
 
 
+def _widest_worktree() -> str:
+    """The longest worktree text the real _peer_worktrees can produce: both
+    names over their limits, plus a three-digit count of further claims. Built
+    by the real function over a stubbed claim reader, so a wider bound widens
+    this test with it."""
+    import worktree_claim
+
+    claims = [{"name": "n" * 500, "branch": "b" * 500, "claimed_at": 1.0}] * 1000
+    orig_common, orig_claims = worktree_claim.common_dir_for, worktree_claim.claims_by_session
+    worktree_claim.common_dir_for = lambda root: Path("/nonexistent")
+    worktree_claim.claims_by_session = lambda common, sids, **kw: {s: claims for s in sids}
+    try:
+        text = _REAL_PEER_WORKTREES(["x"], None)["x"]
+    finally:
+        worktree_claim.common_dir_for, worktree_claim.claims_by_session = orig_common, orig_claims
+    assert "(+999 more claimed)" in text and text.count("…") == 2, text  # nothing was dropped
+    return text
+
+
 def test_the_widest_possible_peer_block_leaves_room_for_the_directive() -> None:
     """The arithmetic behind the claim above, MEASURED not derived.
 
@@ -447,16 +497,17 @@ def test_the_widest_possible_peer_block_leaves_room_for_the_directive() -> None:
         }
         collected = _Collect()
         orig_get, orig_count = hb.get_active_sync, hb.count_active_sync
-        orig_addr = pmh._peer_addresses
+        orig_addr, orig_wt = pmh._peer_addresses, pmh._peer_worktrees
         hb.get_active_sync = lambda *a, _r=row, **k: [dict(_r) for _ in range(pmh._MAX_PEERS_SHOWN)]
         hb.count_active_sync = lambda *a, **k: 500
         pmh._peer_addresses = lambda ids, *a, **k: {i: _widest_address() for i in ids}
+        pmh._peer_worktrees = lambda ids, *a, **k: {i: _widest_worktree() for i in ids}
         pmh._OUT = collected
         try:
             pmh._heartbeat_read_and_inject(Path(__file__), _SID)
         finally:
             hb.get_active_sync, hb.count_active_sync = orig_get, orig_count
-            pmh._peer_addresses = orig_addr
+            pmh._peer_addresses, pmh._peer_worktrees = orig_addr, orig_wt
             pmh._OUT = None
 
         peers = [ln for ln in collected.lines if ln.startswith("[Concurrent |")]
@@ -781,7 +832,7 @@ def test_the_call_that_trips_the_cut_still_counts_as_delivered() -> None:
     assert out.cut is not None, "fixture did not actually trip a cut"
 
 
-def test_a_cut_during_recall_does_not_mark_unseen_rows_surfaced(monkeypatch) -> None:
+def test_a_cut_during_recall_does_not_mark_unseen_rows_surfaced(monkeypatch, recall_db) -> None:
     """The server path, end to end through `_run`.
 
     `lines` and `results` are parallel views of the same hits but nothing
@@ -829,7 +880,6 @@ def test_a_cut_during_recall_does_not_mark_unseen_rows_surfaced(monkeypatch) -> 
         monkeypatch.setattr(pmh, name, lambda *a, **k: None)
     monkeypatch.setattr(pmh, "_load_recent_files", lambda *a, **k: [])
     monkeypatch.setattr(pmh, "_compute_suppress_ids", lambda *a, **k: [])
-    monkeypatch.setattr(pmh, "_DB_PATH", Path(__file__))  # only existence is checked
 
     import asyncio
 
@@ -843,7 +893,7 @@ def test_a_cut_during_recall_does_not_mark_unseen_rows_surfaced(monkeypatch) -> 
     )
 
 
-def test_the_degraded_path_records_nothing_when_its_blob_is_dropped(monkeypatch) -> None:
+def test_the_degraded_path_records_nothing_when_its_blob_is_dropped(monkeypatch, recall_db) -> None:
     """The second bookkeeping site, and the unambiguous one.
 
     `_format_degraded` renders the whole result set as ONE blob, so if that
@@ -891,7 +941,6 @@ def test_the_degraded_path_records_nothing_when_its_blob_is_dropped(monkeypatch)
         monkeypatch.setattr(pmh, name, lambda *a, **k: None)
     monkeypatch.setattr(pmh, "_load_recent_files", lambda *a, **k: [])
     monkeypatch.setattr(pmh, "_compute_suppress_ids", lambda *a, **k: [])
-    monkeypatch.setattr(pmh, "_DB_PATH", Path(__file__))
 
     # Close the writer BEFORE _run reaches the degraded emit.
     pmh._writer().emit("x" * (pmh.DEFAULT_BUDGET * 2), block="server-recall")

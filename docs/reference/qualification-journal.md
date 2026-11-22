@@ -70,3 +70,24 @@ using the production database or credentials. Retention is operator-controlled:
 there is no automatic deletion. Back up campaigns privately before removing
 them; never publish real manifests, references or responses. Only synthetic
 fixtures belong in the repository.
+
+## Native tariff calculations
+
+An attempt explicitly marked `cost_basis: native_tariff_v1` embeds its frozen
+DeepSeek Flash tariff and pricing provenance. The native expense helpers validate
+the original HTTP response, origin, generation identity and five integer usage
+counters, then calculate an exact off-peak/peak USD interval. A durable billing
+event binds that calculation to the attempt, request, observation and tariff.
+The interval describes published token tariffs, not the provider's final invoice.
+
+Only a complete matching calculation releases a reservation. Its upper amount
+enters the journal's budget-accounted settled counter; missing or contradictory
+evidence retains the allocation, and an upper exceeding the allocation remains
+visible as an overrun. Reports keep `calculated_cost_interval` separate from
+`observed_receipt_cost`, label the native invoice unobserved, and preserve
+generation-ownership checks. Native evidence cannot settle a legacy receipt row
+or resolve a disagreement between an old usage amount and its provider receipt.
+
+This ledger extension does not enable native CLI execution or native answer
+eligibility. The dependent native transport must establish those contracts before
+any qualification run. Existing OpenRouter receipt validation remains unchanged.
