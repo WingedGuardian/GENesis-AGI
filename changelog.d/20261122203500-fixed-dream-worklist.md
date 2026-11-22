@@ -1,0 +1,1 @@
+- Keep pending dream-cycle slices available after an incomplete weekly scan or failed replacement. Publish complete worklists in one transaction and preserve slices already claimed by the daily drain.

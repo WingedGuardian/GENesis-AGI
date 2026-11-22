@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Sequence
+
 import aiosqlite
+
+_INSERT = """INSERT INTO deferred_work_queue
+    (id, work_type, call_site_id, priority, payload_json, deferred_at,
+     deferred_reason, staleness_policy, staleness_ttl_s, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+_DELETE_EXCEPT_STATUS = "DELETE FROM deferred_work_queue WHERE work_type = ? AND status != ?"
 
 
 async def create(
@@ -21,10 +30,7 @@ async def create(
     status: str = "pending",
 ) -> str:
     await db.execute(
-        """INSERT INTO deferred_work_queue
-           (id, work_type, call_site_id, priority, payload_json, deferred_at,
-            deferred_reason, staleness_policy, staleness_ttl_s, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        _INSERT,
         (
             id,
             work_type,
@@ -41,6 +47,61 @@ async def create(
     )
     await db.commit()
     return id
+
+
+async def replace_worklist(
+    db: aiosqlite.Connection,
+    *,
+    work_type: str,
+    priority: int,
+    entries: Sequence[tuple[str, str, str]],
+    reason: str,
+    staleness_policy: str,
+) -> int:
+    """Replace non-processing rows in one transaction on an owned writer.
+
+    Each entry is an ID, a prepared JSON payload, and its queue timestamp.
+    An empty replacement still supersedes the old unclaimed batch.
+    """
+    from genesis.db.connection import get_db
+    from genesis.db.request_database import _settle
+
+    rows = [
+        (item_id, work_type, None, priority, payload, timestamp, reason,
+         staleness_policy, None, "pending", timestamp)
+        for item_id, payload, timestamp in entries
+    ]
+    databases = await db.execute_fetchall("PRAGMA database_list")
+    path = next((row[2] for row in databases if row[1] == "main"), "")
+    if not path:
+        raise ValueError("Worklist replacement requires a file-backed database")
+
+    # The shared runtime connection locks individual statements only.
+    # Close queues behind all submitted statements, including a COMMIT whose
+    # waiter was cancelled. It rolls back any transaction still open.
+    writer = await get_db(path, existing_only=True, reconnect=False)
+    write_error = None
+    try:
+        async with writer.execute("BEGIN IMMEDIATE"):
+            pass
+        async with writer.execute(_DELETE_EXCEPT_STATUS, (work_type, "processing")) as deleted:
+            superseded = deleted.rowcount
+        if rows:
+            async with writer.executemany(_INSERT, rows) as inserted:
+                if inserted.rowcount != len(rows):
+                    raise RuntimeError("SQLite did not insert every worklist row")
+        await writer.commit()
+        return superseded
+    except BaseException as exc:
+        write_error = exc
+        raise
+    finally:
+        try:
+            await _settle(asyncio.create_task(writer.close()))
+        except Exception as close_error:
+            if write_error is None:
+                raise
+            write_error.add_note(f"Worklist writer close failed: {close_error!r}")
 
 
 async def delete_by_work_type(
@@ -60,7 +121,7 @@ async def delete_by_work_type(
     """
     if exclude_status is not None:
         cursor = await db.execute(
-            "DELETE FROM deferred_work_queue WHERE work_type = ? AND status != ?",
+            _DELETE_EXCEPT_STATUS,
             (work_type, exclude_status),
         )
     else:

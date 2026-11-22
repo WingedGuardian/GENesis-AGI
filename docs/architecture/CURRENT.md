@@ -73,11 +73,11 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 5a3de4eee 2026-11-07
+verified: 5b5340381 2026-11-22
 ```
 
-The 2026-11-07 verification covers the request-owned memory thread boundaries
-below; other memory descriptions retain their individually cited verification dates.
+The 2026-11-22 verification covers weekly worklist publication. The 2026-11-07
+verification covers the request-owned memory thread boundaries below.
 
 **Shared-owner prerequisite (not activated):** nine thread boundaries in
 `memory/store.py`, `retrieval.py`, `intent.py` and `proactive.py` retain actual
@@ -342,9 +342,16 @@ The scheduled weekly report distinguishes complete, partial and aborted runs.
 Only a complete run advances job health's last success. A failed phase or
 preflight records a bounded problem summary. A discovery exception continues
 through the scheduler's typed failure and reflex path, even after a semantic
-partial result. Job-health counters count the current disposition. Failed
-worklist inserts are counted as a partial result. Worklist replacement still
-follows the existing weekly scan policy.
+partial result. A discovery, clustering, cross-wing, or shield failure keeps
+the previous worklist available for the daily drain. That includes a missing
+vector in a candidate lookup. A complete candidate scan
+replaces prior unclaimed slices in one SQLite transaction, including when it
+finds zero eligible slices. The commit publishes the entire batch even if the
+caller is cancelled while SQLite is processing it. Pre-commit write failures
+roll back the replacement. Publication errors mark the run partial. The daily
+drain claims still-pending slices before rehydrating them. Already-claimed
+slices can finish or retry. Failures in the later
+maintenance phases affect weekly job health independently of publication.
 
 **Importance shield (Phase 2c)** — `memory/dream_shield.py` +
 `memory/dream_shield_config.py` (config: `config/dream_shield.yaml` + local
