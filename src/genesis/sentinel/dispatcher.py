@@ -31,6 +31,7 @@ from genesis.sentinel.state import (
     load_state,
     save_state,
 )
+from genesis.util.tz import parse_utc_iso
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -1454,17 +1455,19 @@ class SentinelDispatcher:
             pending_id,
             status if status in ("rejected", "cancelled", "expired") else "missing",
             resolved_by=row.get("resolved_by") if row else None,
+            resolved_at=row.get("resolved_at") if row else None,
         )
 
     async def handle_approval_resolution(
         self, request_id: str, status: str, *, resolved_by: str | None = None,
+        resolved_at: str | None = None,
     ) -> SentinelResult | None:
         """Converge a parked dispatch on its approval row's observed status.
 
         Called by the awareness loop (state-keyed convergence) or the
         alarm-clearing cancellation. ``rejected`` suppresses the pattern for
         24h. Cancelled, expired and missing rows clear the park. A cancellation
-        caused by alarm clearance or supersession also applies its cooldown. All
+        caused by alarm clearance or supersession restores any remaining cooldown. All
         paths return to HEALTHY — a resolved (or vanished) approval must
         never leave the Sentinel parked: a rejected-but-still-active alarm
         wedged it for 26 days (2026-06-08 → 2026-07-04) because rejections
@@ -1500,7 +1503,14 @@ class SentinelDispatcher:
                     and pattern
                     and not pattern.startswith("direct:")
                 ):
-                    self._resolved_cooldowns[pattern] = time.monotonic()
+                    cancelled_at = parse_utc_iso(resolved_at)
+                    if cancelled_at is not None:
+                        age = max(0.0, (datetime.now(UTC) - cancelled_at).total_seconds())
+                        if age < _RESOLVED_COOLDOWN_S:
+                            cooldown_start = time.monotonic() - age
+                            self._resolved_cooldowns[pattern] = max(
+                                cooldown_start, self._resolved_cooldowns.get(pattern, cooldown_start),
+                            )
                 self._state.clear_pending()
                 self._state.transition(
                     SentinelState.HEALTHY,

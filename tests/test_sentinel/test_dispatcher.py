@@ -1548,16 +1548,23 @@ class TestAlarmClearedHysteresis:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("owner_approved", [False, True])
     async def test_alarm_clear_through_real_approval_store(self, db, owner_approved):
-        from genesis.autonomy.approval import ApprovalManager
-        from genesis.autonomy.approval_gate import AutonomousCliApprovalGate
+        from genesis.runtime import GenesisRuntime
 
-        manager = ApprovalManager(db=db)
+        runtime = GenesisRuntime()
+        runtime._db = db
+        await runtime._init_autonomy()
+        manager = runtime._approval_manager
         request_id = await manager.request_approval(
             action_type="sentinel_dispatch", action_class="costly_reversible",
             description="approval fixture",
         )
-        d, _ = self._parked(request_id=request_id)
-        d._approval_gate = AutonomousCliApprovalGate(runtime=MagicMock(_db=db), approval_manager=manager)
+        parked, _ = self._parked(request_id=request_id)
+        runtime._health_data = parked._health_data
+        with patch("genesis.sentinel.dispatcher.load_state", return_value=parked.state):
+            await runtime._init_sentinel()
+        d = runtime._sentinel
+        assert runtime.router is None
+        assert d._approval_gate is runtime.autonomous_cli_approval_gate
         if owner_approved:
             assert await manager.resolve(request_id, status="approved")
 
@@ -1576,12 +1583,20 @@ class TestAlarmClearedHysteresis:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("resolver", ["alarm_cleared", "superseded"])
-    async def test_convergence_preserves_alarm_cancellation_cooldown(self, resolver):
+    @pytest.mark.parametrize("age", [300, 1000, None])
+    async def test_convergence_preserves_alarm_cancellation_cooldown(self, resolver, age):
         d, gate = self._parked()
-        gate.get_request = AsyncMock(return_value={"status": "cancelled", "resolved_by": resolver})
-        await d.converge_pending_approval()
+        resolved_at = (datetime.now(UTC) - timedelta(seconds=age)).isoformat() if age is not None else "invalid"
+        gate.get_request = AsyncMock(return_value={
+            "status": "cancelled", "resolved_by": resolver, "resolved_at": resolved_at,
+        })
+        with patch("genesis.sentinel.dispatcher.append_log"):
+            await d.converge_pending_approval()
         assert d._state.state == SentinelState.HEALTHY
-        assert self._ALARM in d._resolved_cooldowns
+        if age == 300:
+            assert time.monotonic() - d._resolved_cooldowns[self._ALARM] == pytest.approx(age, abs=2)
+        else:
+            assert self._ALARM not in d._resolved_cooldowns
 
     @pytest.mark.asyncio
     async def test_absent_ticks_must_be_consecutive(self):

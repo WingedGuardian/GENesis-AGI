@@ -3046,8 +3046,11 @@ verified: 273642a5e 2026-11-22
   starts the 15-minute resolved cooldown. Alarm clearance likewise preserves
   the park when cancellation refuses or fails. Both paths verify the same
   park under the state lock before clearing state or starting its cooldown,
-  so a late cancellation cannot overwrite a newer approval. A declined dispatch or action is
-  quiet for 24 h through `handle_approval_resolution` (every pattern).
+  so a late cancellation cannot overwrite a newer approval. Recovery uses the
+  time recorded on the cancellation row to restore only the remaining cooldown.
+  The shared approval gate can reconcile persisted requests while the model
+  router is down if the approval database is available. A declined dispatch or
+  action is quiet for 24 h through `handle_approval_resolution` (every pattern).
 - **sentinel/process_stop.py** (`python -m genesis.sentinel.process_stop`):
   the Failure Inventory remedy for ONE runaway process. Dry-run by default;
   `--execute` only inside an approved action. Resolves targets when it runs:
