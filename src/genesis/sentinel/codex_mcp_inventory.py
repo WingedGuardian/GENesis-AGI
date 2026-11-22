@@ -55,6 +55,7 @@ class Inventory:
             "version": self.version,
             "threads": len(self.threads) if self.status == "complete" else None,
             "thread_counts": dict(self.thread_counts) if self.status == "complete" else None,
+            "group_scope": "stop_eligible_mcp",
             "groups": len(self.groups) if self.daemon is not None else None,
             "group_counts": dict(self.group_counts),
             "held_kib": self.held_kib if self.daemon is not None else None,
@@ -235,7 +236,8 @@ async def collect() -> Inventory:
                     return Inventory(sampled_at, "partial", "process scan incomplete", **observed)
                 rpc = _ThreadInventory(ws)
                 initialized = await rpc.call("initialize", {
-                    "clientInfo": {"name": "genesis-inventory", "version": "1"},
+                    # Codex treats this backend client as non-originating.
+                    "clientInfo": {"name": "codex-backend", "version": "1"},
                     "capabilities": {"experimentalApi": True},
                 })
                 observed["version"] = _protocol_version(initialized.get("userAgent"))
@@ -262,11 +264,10 @@ async def sample(bus: GenesisEventBus) -> None:
         _latest = None
         return
     _latest = await collect()
-    if _latest.daemon is not None:
-        await bus.emit(
-            Subsystem.HEALTH, Severity.DEBUG, EVENT_TYPE, "Sampled Codex MCP inventory",
-            **_latest.summary(),
-        )
+    await bus.emit(
+        Subsystem.HEALTH, Severity.DEBUG, EVENT_TYPE, "Sampled Codex MCP inventory",
+        **_latest.summary(),
+    )
 
 
 if __name__ == "__main__":

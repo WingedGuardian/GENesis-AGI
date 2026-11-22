@@ -1,5 +1,6 @@
 """Opt-in caller separation and subscription lifecycle using two native clients."""
 
+import asyncio
 import json
 import os
 import time
@@ -11,7 +12,7 @@ import pytest
 
 from scripts.mcp_process_report import memory
 from tests.test_hooks.native_codex import configure, fixture_provider
-from tests.test_hooks.native_mcp_connections import ConnectedServer
+from tests.test_hooks.native_mcp_connections import ConnectedServer, Connection
 from tests.test_hooks.test_codex_mcp_transport_native import Service, rpc
 
 pytestmark = pytest.mark.skipif(
@@ -30,6 +31,41 @@ def loaded(client, first_id):
             return result
         assert cursor not in seen, "loaded thread inventory pagination repeated a cursor"
         seen.add(cursor)
+
+
+def test_inventory_preserves_the_daemon_client_identity(tmp_path, monkeypatch):
+    from genesis.sentinel import codex_mcp_inventory, codex_mcp_stop
+
+    binary = os.environ.get("GENESIS_CODEX_APP_SERVER_BIN")
+    assert binary and Path(binary).is_absolute() and Path(binary).is_file()
+    with fixture_provider({}) as (url, requests), ExitStack() as cleanup:
+        server = ConnectedServer(binary, tmp_path, configure(tmp_path, url, "allow"))
+        cleanup.callback(server.close)
+        server.connect()  # Establish an ordinary originating client identity.
+
+        def user_agent():
+            observer = Connection(server.socket_path)
+            try:
+                result = observer.request(
+                    "initialize", {"clientInfo": {"name": "codex-backend", "version": "observer"}}, 1,
+                )
+                return result["userAgent"]
+            finally:
+                observer.close()
+
+        before = user_agent()
+        assert "genesis_native_fixture" in before
+        pid = server.process.pid
+        _, _, start = codex_mcp_inventory._current_identity(pid)
+        scan = codex_mcp_stop.Scan(app_servers=[pid], app_server_starttimes={pid: start})
+        monkeypatch.setattr(codex_mcp_stop, "scan", lambda: scan)
+        monkeypatch.setattr(codex_mcp_inventory, "_control_socket", lambda: server.socket_path)
+
+        inventory = asyncio.run(codex_mcp_inventory.collect())
+
+        assert inventory.status == "complete", inventory.detail
+        assert user_agent() == before
+        assert not requests
 
 
 @pytest.mark.parametrize("stateful", [False, True], ids=["stateless", "stateful"])

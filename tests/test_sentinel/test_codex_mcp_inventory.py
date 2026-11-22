@@ -55,6 +55,22 @@ def test_public_summary_omits_thread_and_group_identifiers():
     assert '"groups": 1' in encoded
     assert "private-thread" not in encoded
     assert "1234567" not in encoded
+    assert inventory.summary()["group_scope"] == "stop_eligible_mcp"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["unavailable", "absent"])
+async def test_sample_records_failed_or_absent_inventory(monkeypatch, status):
+    monkeypatch.delenv("GENESIS_CODEX_MCP_INVENTORY_DISABLED", raising=False)
+    monkeypatch.setattr(codex_mcp_inventory, "_latest", None)
+    monkeypatch.setattr(codex_mcp_stop, "load_mode", lambda: "propose_only")
+    monkeypatch.setattr(codex_mcp_inventory, "collect", AsyncMock(return_value=Inventory("fixture", status)))
+    bus = AsyncMock()
+
+    await codex_mcp_inventory.sample(bus)
+
+    assert bus.emit.call_args.kwargs["status"] == status
+    assert bus.emit.call_args.kwargs["daemon"] is None
 
 
 @pytest.mark.asyncio

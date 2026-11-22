@@ -45,7 +45,9 @@ establishes a leak or authorizes process cleanup.
 `python -m genesis.sentinel.codex_mcp_inventory` reads the current local
 managed daemon through its standard Unix control socket under Codex home.
 The collector opens the socket directly and reads the version from the
-initialization response, so polling cannot start the CLI's update wrapper. It checks
+initialization response, so polling cannot start the CLI's update wrapper.
+It initializes as Codex's non-originating backend client to preserve the
+active client's process-wide identity. It checks
 the peer PID and UID against the process scan, enumerates loaded threads
 with pagination, and aggregates metadata by source and activity. It refreshes
 the loaded set before accepting the sample. The command prints only the
@@ -54,8 +56,10 @@ aggregate and never subscribes to threads or opens a conversation.
 The learning scheduler takes one sample per minute. Daily event pruning applies a
 72-hour cutoff to `codex.mcp_inventory` events. The evidence
 contains only daemon identity and version, counts, held memory (RSS plus
-swap), and proportional memory when readable. Missing or unstable evidence
-is labeled unavailable or partial. A process scan and a thread report are
+swap), and proportional memory when readable. Group counts and memory cover
+the stop-eligible MCP groups. A complete sample reflects a complete read of
+that scope. Unavailable, absent and partial outcomes are recorded to make
+sample coverage visible. A process scan and a thread report are
 separate observations, so a process group cannot be attributed to a
 conversation. For a controlled before/after comparison, ensure the client
 actually unsubscribes and measure again after its configured unload delay.
