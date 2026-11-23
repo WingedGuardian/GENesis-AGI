@@ -264,18 +264,34 @@ def test_snapshot_barrier_covers_new_and_metadata_in_flight_calls(home, monkeypa
     monkeypatch.setattr(witness, "_publish_pending", publish)
     sys.addaudithook(block)
     _clear()
-    if metadata_in_flight:
-        thread.start()
-        assert metadata.wait(10)
     try:
+        if metadata_in_flight:
+            thread.start()
+            assert metadata.wait(10)
         hits, state = witness.capture(audit._live_writes_report.census_state)
         assert state["faults"] or any(row[1].startswith("relative os.open") for row in hits)
     finally:
         enabled = False
         proceed.set()
         finish.set()
-        thread.join(10)
-    assert not thread.is_alive() and not errors
+        if thread.ident is not None:  # join only a worker that started
+            thread.join(10)
+    assert thread.ident is not None and not thread.is_alive() and not errors
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or sys.implementation.name != "cpython",
+    reason="the witness installs only on Linux/CPython",
+)
+def test_a_declined_install_on_a_supported_platform_is_a_fault(home, monkeypatch):
+    """Another wrapper owning os.open leaves relative opens unrefined, so the
+    census must not read as complete (#4811 review)."""
+    witness = type(audit._W)(audit)
+    witness.native = native = audit._W.native  # the builtin, as at configure
+    monkeypatch.setattr(audit.os, "open", lambda *args, **kwargs: native(*args, **kwargs))
+    _clear()
+    witness.install()
+    assert not witness.installed and audit._S.faults == 1
 
 
 def test_snapshot_exception_releases_barrier_and_later_calls_refine(home, monkeypatch):

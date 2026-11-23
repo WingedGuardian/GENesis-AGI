@@ -247,9 +247,13 @@ class Witness:
     def _install(self):
         if self.installed:
             return
-        if (sys.platform != "linux" or sys.implementation.name != "cpython"
-                or os.open is not self.native or not inspect.isbuiltin(self.native)
+        if sys.platform != "linux" or sys.implementation.name != "cpython":
+            return  # the documented limit: relative opens keep the cwd guess
+        if (os.open is not self.native or not inspect.isbuiltin(self.native)
                 or type(os.supports_dir_fd) is not set):
+            # Supported here, but another wrapper owns os.open: refinement is
+            # unavailable, so the census must not read as complete.
+            self._fault()
             return
         self.signature = inspect.signature(self.native)
 

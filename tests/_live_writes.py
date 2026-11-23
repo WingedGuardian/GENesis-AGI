@@ -651,8 +651,10 @@ def pytest_terminal_summary(terminalreporter):
         else:
             terminalreporter.write_line("live writes: not installed (unknown, not clean)", yellow=True)
     tr = terminalreporter
-    if _S.faults:
-        tr.write_line(f"live writes: {_S.faults} events could not be classified (unknown, not clean)", yellow=True)
+    # The captured census, not the live count: a thread the run left behind can
+    # still record a fault after the capture, and the receipt cannot hold it.
+    if state["faults"]:
+        tr.write_line(f"live writes: {state['faults']} events could not be classified (unknown, not clean)", yellow=True)
     # One snapshot: a thread the run left behind can still record while this runs,
     # and iterating the live dict would raise and fail a run this only reports on.
     # dict.copy() takes it in one step under the GIL, without iterating the dict.
