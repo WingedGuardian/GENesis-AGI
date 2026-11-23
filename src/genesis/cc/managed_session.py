@@ -25,13 +25,19 @@ logger = logging.getLogger(__name__)
 _COMMITTED_STATUS = {"succeeded": "completed", "failed": "failed", "cancelled": "failed"}
 
 
-async def _notify_owner_relay(db, sid: str, tool_names=None, *, uncertain=False) -> bool:
+async def _notify_owner_relay(
+    db, sid: str, tool_names=None, *, uncertain=False, ended=None, reason=None
+) -> bool:
     """Queue one owner alert for a relayed peer session that acted or may have.
 
     ``tool_names`` is the full, uncapped tool record when the caller has it; the
     stored ``tools_summary`` is capped, so it is only the fallback. ``uncertain``
     marks a record that may be missing calls (a partial stream, a restart): the
     owner is then told the session may have acted even if no acting tool is seen.
+    ``ended`` and ``reason`` are the outcome about to be committed; callers queue
+    the alert BEFORE committing the terminal status, so a restart between the two
+    cannot lose it (``reconcile_orphans`` reads only active sessions). Without
+    them the row's committed outcome is used.
     Idempotent per session: a retried finalization finds the alert already queued.
     """
     from genesis.db.crud import pending_outreach
@@ -54,9 +60,13 @@ async def _notify_owner_relay(db, sid: str, tool_names=None, *, uncertain=False)
     ).fetchone():
         return False
     peer = meta.get("peer_id", "a peer")
-    ended = row.get("outcome") or row.get("status") or "unknown"
+    if ended is None:
+        ended = row.get("outcome") or row.get("status") or "unknown"
+        reason = row.get("outcome_reason")
     if tools:
-        head = f"[{sid[:8]}] Acted on your behalf via {peer}: used {', '.join(tools)}; ended {ended}."
+        head = (
+            f"[{sid[:8]}] Acted on your behalf via {peer}: used {', '.join(tools)}; ended {ended}."
+        )
         if uncertain:
             head += " Its tool record may be incomplete."
     else:
@@ -67,7 +77,7 @@ async def _notify_owner_relay(db, sid: str, tool_names=None, *, uncertain=False)
     await pending_outreach.enqueue(
         db,
         # Telegram renders HTML: the summary is model-written, so escape it all.
-        message=html.escape(f"{head} {relay.quoted(row.get('outcome_reason'))}", quote=False),
+        message=html.escape(f"{head} {relay.quoted(reason)}", quote=False),
         category="alert",
         channel="telegram",
         pending_id=pending_id,
@@ -179,9 +189,38 @@ async def reconcile_orphans(db) -> int:
         for row in await cc_sessions.query_active(db)
         if row.get("source_tag") == "agent_api" and "managed_fingerprint" in metadata(row)
     ]
+    skipped = 0
     for row in orphaned:
         meta = metadata(row)
         finished = _COMMITTED_STATUS.get(meta.get("native_state"))
+        outcome = reason = None
+        if finished == "failed":
+            outcome, reason = _failure_outcome(meta.get("result_partial"), meta.get("error"))
+        elif finished is None:
+            reason = "outcome_unknown"
+        # A relayed session cut off by a restart may have acted unseen. The alert
+        # is queued before the status leaves active: if it cannot be queued, the
+        # row stays active and the next boot tries again, rather than losing it.
+        try:
+            if meta.get("owner_relay"):
+                # The outcome update_status is about to store, its default included.
+                status = finished or "failed"
+                await _notify_owner_relay(
+                    db,
+                    row["id"],
+                    uncertain=True,
+                    ended=outcome or cc_sessions._DEFAULT_OUTCOME.get(status, status),
+                    reason=reason,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Owner-relay notice not queued for orphan %s; left for the next boot "
+                "(exception=%s)",
+                row["id"][:8],
+                type(exc).__name__,
+            )
+            skipped += 1
+            continue
         if finished is not None:
             usage = meta.get("usage")
             if isinstance(usage, dict):
@@ -194,9 +233,6 @@ async def reconcile_orphans(db) -> int:
                         output_tokens=int(usage.get("output_tokens") or 0),
                     )
             # The outcome _finalize would have recorded, from what it committed.
-            outcome = reason = None
-            if finished == "failed":
-                outcome, reason = _failure_outcome(meta.get("result_partial"), meta.get("error"))
             await cc_sessions.update_status(
                 db, row["id"], status=finished, outcome=outcome, outcome_reason=reason
             )
@@ -205,17 +241,7 @@ async def reconcile_orphans(db) -> int:
         await cc_sessions.update_status(
             db, row["id"], status="failed", outcome_reason="outcome_unknown"
         )
-    for row in orphaned:
-        # A relayed session cut off by a restart may have acted unseen.
-        try:
-            await _notify_owner_relay(db, row["id"], uncertain=True)
-        except Exception as exc:
-            logger.warning(
-                "Owner-relay notice not queued for orphan %s (exception=%s)",
-                row["id"][:8],
-                type(exc).__name__,
-            )
-    return len(orphaned)
+    return len(orphaned) - skipped  # the rows reconciled; skipped ones stay active
 
 
 async def run_managed(runner, request, sid: str, cancel: asyncio.Event):
@@ -231,7 +257,9 @@ async def run_managed(runner, request, sid: str, cancel: asyncio.Event):
     worker = None
     state, error = "failed", "execution_failed"
     result = DirectSessionResult(session_id=sid)
-    isolation = isolated_provider(contained=True) if request.contained_peer else contextlib.nullcontext()
+    isolation = (
+        isolated_provider(contained=True) if request.contained_peer else contextlib.nullcontext()
+    )
     with isolation, private_execution():
         try:
             row = await cc_sessions.get_by_id(db, sid)
@@ -387,6 +415,24 @@ async def _finalize(runner, request, result, state):
                 output_tokens=result.output_tokens,
             )
             if result.success:
+                outcome, reason = None, result.outcome_reason
+                ended = result.outcome or "unreported"  # what complete() would store
+            else:
+                outcome, reason = _failure_outcome(result.partial, result.error)
+                ended = outcome or "failed"
+            # Queued before the terminal status: a restart after that commit would
+            # otherwise lose the alert, since boot reconciliation reads only active
+            # sessions. Inside the retry loop, so a failed insert is retried, not
+            # dropped; the notice id makes a retry queue nothing twice.
+            await _notify_owner_relay(
+                runner._session_manager.db,
+                result.session_id,
+                [t.get("name") for t in result.tools_called or () if isinstance(t, dict)],
+                uncertain=bool(result.partial or result.stream_lines_dropped),
+                ended=ended,
+                reason=reason,
+            )
+            if result.success:
                 await runner._session_manager.complete(
                     result.session_id,
                     cost_usd=result.cost_usd,
@@ -397,28 +443,12 @@ async def _finalize(runner, request, result, state):
                     outcome_reason=result.outcome_reason,
                 )
             else:
-                outcome, reason = _failure_outcome(result.partial, result.error)
                 await runner._session_manager.fail(
                     result.session_id, reason=reason, outcome=outcome
                 )
             from genesis.cc.managed_fallback import record_managed_outcome
 
             await record_managed_outcome(runner, result.session_id, result)
-            try:
-                await _notify_owner_relay(
-                    runner._session_manager.db,
-                    result.session_id,
-                    [t.get("name") for t in result.tools_called or () if isinstance(t, dict)],
-                    uncertain=bool(result.partial or result.stream_lines_dropped),
-                )
-            except Exception as exc:
-                # Outside the retry loop on purpose: a notice failure must never
-                # hold the receipt or its capacity.
-                logger.warning(
-                    "Owner-relay notice not queued for %s (exception=%s)",
-                    result.session_id[:8],
-                    type(exc).__name__,
-                )
             return
         except Exception as exc:
             logger.warning(

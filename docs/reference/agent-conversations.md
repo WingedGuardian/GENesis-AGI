@@ -81,6 +81,10 @@ partial stream, or one cut off by a restart and finished by boot reconciliation)
 alerts that it may have acted. Alerts are exempt from the daily notification
 budget and quiet hours but not from duplicate suppression, so the session id
 leads the text. A retried finalization never queues a second alert.
+The alert is queued before the session's terminal status commits, at
+finalization and at boot alike, so a restart between the two cannot lose it.
+A failed insert is retried with the other finalization writes; at boot, an
+orphan whose alert cannot be queued stays active until the next boot.
 
 Every peer session, granted or not, is also told to look a name, address,
 account or fact up (`memory_recall`, `reference_lookup`) before refusing or
