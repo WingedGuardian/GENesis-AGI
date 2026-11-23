@@ -2700,7 +2700,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 0aa0bf9f2 2026-11-10
+verified: 204c69c1f 2026-11-22
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -3046,6 +3046,12 @@ verified: 0aa0bf9f2 2026-11-10
   taken over, and a cancel that fails keeps the park. The cancelled pattern
   starts the 15-minute resolved cooldown. A declined dispatch or action is
   quiet for 24 h through `handle_approval_resolution` (every pattern).
+- **sentinel/codex_mcp_inventory.py** reads the managed daemon's loaded thread
+  inventory and MCP groups once per minute while the learning scheduler runs.
+  Daily pruning applies a 72-hour cutoff to aggregate `codex.mcp_inventory`
+  events. Thread and process group identifiers used for comparisons stay in
+  memory. See the [MCP process report](../reference/mcp-process-report.md) for
+  limitations and the collection switch.
 - **sentinel/process_stop.py** (`python -m genesis.sentinel.process_stop`):
   the Failure Inventory remedy for ONE runaway process. Dry-run by default;
   `--execute` only inside an approved action. Resolves targets when it runs:
@@ -4785,7 +4791,9 @@ CLI. Its `codex_exec_argv`/`codex_child_env` give every Codex run Genesis
 starts unattended (the executor's adversarial verifier, the contribution
 reviewer) a child environment from `caller_context.dispatched_child_env`:
 `GENESIS_CC_SESSION=1`, supervised marker dropped, origin kept.
-`tests/test_codex_dispatch_marker.py` fails on a `codex` literal anywhere else.
+`tests/test_codex_dispatch_marker.py` checks other `codex` literals and allows
+known read-only references, including the inventory socket path and event
+metadata. The inventory event's keyword details still go through the scan.
 The marker is inert until the Codex project config forwards it to the Genesis
 MCP launcher; it exists so an unmarked Codex run can mean the owner's own
 client, as an unmarked Claude Code session does.
