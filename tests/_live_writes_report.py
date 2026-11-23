@@ -4,6 +4,10 @@ Backslash, tab, LF and CR are escaped. Other Unicode and surrogateescaped OS
 bytes remain intact. Readers split only literal LF/tab, never splitlines().
 """
 
+import hashlib
+import json
+from pathlib import Path
+
 _ESCAPES = str.maketrans({"\\": "\\\\", "\t": "\\t", "\n": "\\n", "\r": "\\r"})
 _UNESCAPES = {"\\": "\\", "t": "\t", "n": "\n", "r": "\r"}
 
@@ -40,3 +44,32 @@ def decode(payload):
             raise ValueError("audit report row must have four fields")
         rows.append(tuple(_unescape(field) for field in fields))
     return rows
+
+
+def observation_state(state):
+    return {"run_id": state.census_id, "installed": state.installed,
+            "disarmed": state.disarmed, "faults": state.faults, "exitstatus": state.exitstatus}
+
+
+def census_state(state):
+    return {**observation_state(state), "unreported": list(state.unreported),
+            "expected_workers": sorted(state.expected_workers),
+            "merged_workers": sorted(state.merged_workers), "workers": dict.copy(state.worker_status)}
+
+
+def publish(report, hits, metadata):
+    """Publish data then an opted-in proof. Failed/partial pairs are not clean.
+
+    Fresh CI directories and unique run IDs are required: this is not an atomic
+    transaction for an arbitrarily reused same-ID directory.
+    """
+    report = Path(report)
+    status = Path(str(report) + ".status.json")
+    payload = encode(hits)
+    if metadata["run_id"]:
+        status.unlink(missing_ok=True)
+    report.write_bytes(payload)
+    if metadata["run_id"]:
+        receipt = {**metadata, "schema": 1, "format": "escaped-tsv-v1", "row_count": len(hits),
+                   "sha256": hashlib.sha256(payload).hexdigest()}
+        status.write_text(json.dumps(receipt, ensure_ascii=True, sort_keys=True) + "\n", encoding="utf-8")

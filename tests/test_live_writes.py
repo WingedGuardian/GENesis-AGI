@@ -192,6 +192,7 @@ def test_hook_preserves_operator_interrupts(home, monkeypatch, signal):
 def test_fault_count_reaches_controller_and_summary(home, monkeypatch):
     monkeypatch.setattr(audit._S, "faults", 3, raising=False)
     monkeypatch.setattr(audit._S, "merged_workers", set())
+    monkeypatch.setattr(audit._S, "worker_status", {})
     monkeypatch.setattr(audit._S, "unreported", [])
     config = type("C", (), {"workeroutput": {}})()
     audit.pytest_sessionfinish(type("S", (), {"config": config})(), 0)
@@ -884,6 +885,7 @@ def test_a_worker_hands_over_an_undecodable_path_intact(monkeypatch):
     sent = gateway_base.loads(gateway_base.dumps(config.workeroutput))  # the channel
     monkeypatch.setattr(audit._S, "hits", {})
     monkeypatch.setattr(audit._S, "merged_workers", set())
+    monkeypatch.setattr(audit._S, "worker_status", {})
     monkeypatch.setattr(audit._S, "unreported", [])
     gateway = type("G", (), {"id": "gw0"})()
     audit.pytest_testnodedown(type("N", (), {"gateway": gateway, "workeroutput": sent})(), None)
@@ -892,6 +894,7 @@ def test_a_worker_hands_over_an_undecodable_path_intact(monkeypatch):
 
 def test_a_worker_that_never_reported_is_named(monkeypatch):
     monkeypatch.setattr(audit._S, "merged_workers", set())
+    monkeypatch.setattr(audit._S, "worker_status", {})
     monkeypatch.setattr(audit._S, "unreported", [])
     monkeypatch.setattr(audit._S, "hits", {})
     gateway = type("G", (), {"id": "gw3"})()
