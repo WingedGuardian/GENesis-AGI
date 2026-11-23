@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from tests import _live_writes as audit
+from tests.conftest import require_access_denied
 from tests.test_live_writes import home as home
 
 
@@ -98,6 +99,7 @@ def test_successful_read_with_missing_credential_metadata_keeps_fault(home):
     os.link(secret, alias)
     secret.parent.chmod(0)
     try:
+        require_access_denied(secret.parent)  # root or CAP_DAC_OVERRIDE skips
         _clear()
         assert alias.read_bytes() == b"owned synthetic bytes"
         assert audit._S.faults == 1
