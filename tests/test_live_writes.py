@@ -124,7 +124,9 @@ def test_valid_descriptor_without_proc_visibility_counts_uncertainty(home, monke
         audit._S.hits.clear()
         os.ftruncate(descriptor, 1)
     assert target.read_bytes() == b"o"
-    assert not audit._S.hits
+    assert [row[1:] for row in audit._S.hits] == [
+        ("observer fault", "os.truncate/judge/FileNotFoundError", "<not captured>")
+    ]
     assert audit._S.faults == 1
 
 
@@ -869,7 +871,7 @@ def test_an_xdist_run_reports_the_workers_writes(tmp_path):
         "test_one.py",
         "test_two.py",
     ], text
-    assert "live writes: writes outside the test's temp dirs" in text
+    assert "live writes: audit observations" in text
     assert "no report from xdist worker" not in text
 
 
@@ -962,6 +964,6 @@ def test_a_run_reports_writes_without_failing_the_test(tmp_path):
     )
     text = out.stdout + out.stderr
     assert out.returncode == 0, text
-    assert "writes outside the test's temp dirs (reported, not failed)" in text, text
+    assert "audit observations (reported, not failed)" in text, text
     lines = report.read_text().splitlines()
     assert any(line.endswith("/f") and "\twrite\t" in line for line in lines), lines
