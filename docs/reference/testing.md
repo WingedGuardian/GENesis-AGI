@@ -464,9 +464,25 @@ It also reports reads of the real credential files (the deployed `secrets.env`,
   Established no-effect cases (`mkdir(exist_ok=True)` on an existing directory,
   `unlink` of a missing file, reopening an existing file without writing) are
   filtered; other refused operations can still be reported, and some aliases can
-  be missed (tracked in #4193). A relative
-  `os.open` is judged against the cwd and labelled so (its audit event carries no
-  `dir_fd`). Writes during collection count as "outside any test".
+  be missed (tracked in #4193). Relative `os.open`
+  events omit `dir_fd`. On Linux/CPython, `tests/_live_writes_fd.py` corrects a
+  supported successful call using its returned descriptor, one observed native
+  event and matching unchanged parent/target metadata. This applies to exact
+  string/bytes leaf names, explicit nonnegative integer directory descriptors
+  and write flags with `O_NOFOLLOW` or `O_CREAT|O_EXCL`, excluding `O_PATH`.
+  Failed, unsupported, saved-native-alias and ambiguous calls retain the primary
+  observer's explicitly labelled cwd guess. Existing credential observations
+  and every fault count remain; published evidence is never subtracted.
+  Writes during collection count as "outside any test".
+- The test-process wrapper changes `os.open` identity and builtin status;
+  signatures, pickling and directory-FD feature membership are preserved. It
+  restores only its own callable/member at unconfigure. Fork children bypass
+  refinement. This does not extend the child-process coverage below.
+- Report capture temporarily disables new refinement while sealing pending
+  calls and copying both observations and status. A pending call makes the
+  census incomplete even if it later succeeds. Calls entering during capture
+  use primary observation; later independent calls can refine again. Ordinary
+  writes after the snapshot retain the existing documented coverage limit.
 - An `observer fault` row identifies the test and the audit event/stage/fixed
   builtin error category. Its path field is the literal `<not captured>`;
   exception messages, filenames, custom type names and tracebacks are not
@@ -485,8 +501,10 @@ The observations identify tests to investigate and move under their own
 main, with an empty report, zero faults, an installed observer and no missing
 or disarmed workers. An empty TSV alone does not establish this: CI also checks
 the fresh run identity, test outcome, report digest/count and worker coverage.
+Both reliable write detection and credential-read coverage are prerequisites.
 The audit remains report-only while ambiguous observations and unknown faults
-remain unresolved.
+remain unresolved; correcting successful destinations does not exempt denied
+reads or qualify enforcement by itself.
 
 Generated session MCP configs are isolated by the function-scoped autouse fixture
 in `tests/_session_config.py`, registered by the root conftest. It redirects only
