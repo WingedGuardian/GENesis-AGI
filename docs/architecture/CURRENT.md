@@ -2197,9 +2197,10 @@ the shared banner is not an assertion about all concurrent sessions.
   orphaned uncertainty, original physical obligations and one-time accounting.
   Matching terminal leader states alone do not prove controller process end.
   The same-connection final drain observes callback-created evidence before
-  commit. The acknowledgement grants no retry or acceptance. The automatic
-  reconciliation caller remains separate (#3728); cutover,
-  native qualification and production capacity remain separate gates.
+  commit. The acknowledgement grants no retry or acceptance. The captured runner
+  sweeps unresolved original owners before claiming after strict readiness.
+  Unproved ownership stays held. Cutover, native qualification and production
+  capacity remain separate gates.
   Explicit request/revoke/status operations use the existing provider-state
   grant and bind actual work, retained debt, evidence, provider and runner/
   watchdog source, policy, boot and bounded dual-clock deadlines. Invalid grant

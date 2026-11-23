@@ -34,7 +34,7 @@ jobs:
         # touched nothing and blocks every merge in the repository — recoverable
         # only by disabling the ruleset in the UI. See .github/rulesets/README.md.
         # Pinned to the version this repo is developed against locally.
-        run: pip install 'ruff==0.15.10'
+        run: pip install 'ruff==0.17.5'
       - name: Lint
         run: ruff check src/ tests/ scripts/
 

@@ -17,6 +17,20 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
+class RepositoryMissing(FileNotFoundError):
+    """The checkout for a retained execution no longer exists."""
+
+
+class RepositoryRelocated(ValueError):
+    """The recorded path no longer names its physical checkout: it resolves
+    elsewhere (a moved checkout left a symlink) or has no ``.git`` directory.
+    A ``ValueError`` as before, so explicit callers see no change."""
+
+
+class RepositoryBusy(BlockingIOError):
+    """The canonical repository lock is held by another writer."""
+
+
 @contextmanager
 def repository_lock(modules, context):
     """Take the existing freeze namespace on fd9; never replace or fall back."""
@@ -30,8 +44,25 @@ def repository_lock(modules, context):
 def repository_lock_for(modules, repo_path, h):
     """The same namespace before a trial exists; no fabricated context."""
     queue = modules['queue']
-    repo = Path(repo_path).resolve(strict=True)
-    if str(repo) != repo_path or h != queue.marker_hash(repo_path) or not (repo / '.git').is_dir():
+    try:
+        repo = Path(repo_path).resolve(strict=True)
+    except FileNotFoundError as error:
+        raise RepositoryMissing("original repository is missing") from error
+    # Relocation first: the hash is of the resolved path, so a moved checkout
+    # behind a symlink would otherwise read as a wrong hash.
+    if str(repo) != repo_path:
+        raise RepositoryRelocated('typed owner requires a physical repository checkout')
+    # An explicit stat, not Path.is_dir(): on Python 3.14 is_dir() returns False
+    # for any OSError, which would read a permission fault as a relocation.
+    try:
+        git = (repo / '.git').stat()
+    except OSError as error:
+        if error.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+            raise
+        git = None
+    if git is None or not stat.S_ISDIR(git.st_mode):
+        raise RepositoryRelocated('typed owner requires a physical repository checkout')
+    if h != queue.marker_hash(repo_path):
         raise ValueError('typed owner requires a physical repository checkout')
     base = Path(os.environ.get('GENESIS_HOME') or str(Path.home() / '.genesis'))
     if not base.is_absolute():
@@ -53,7 +84,10 @@ def repository_lock_for(modules, repo_path, h):
         if (not stat.S_ISREG(held.st_mode) or not stat.S_ISREG(named.st_mode)
                 or (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino)):
             raise ValueError('canonical repository lock identity differs')
-        fcntl.flock(raw, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(raw, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RepositoryBusy("canonical repository lock is busy") from error
         if raw != 9:
             os.dup2(raw, 9, inheritable=False)
             os.close(raw)
