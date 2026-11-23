@@ -252,10 +252,18 @@ _rw_holders() {
     # (_RW_IDENT); without one, from comm with everything but printable
     # ASCII replaced (any locale: a multibyte line separator or bidi control
     # must not reach the page either).
+    # _RW_HOLDERS_MAP names the identity map to read (default _RW_IDENT, the
+    # runaway scan's); a caller with identities of its own passes its map. With
+    # _RW_HOLDERS_STRICT=1 the map is complete: a pid it lacks was dropped by
+    # the handle-based read (exited, or its descriptor moved), so it is shown
+    # unknown rather than read by path, where a reused pid would lend its name.
     local proc="${DG_PROC:-/proc}" pid comm ppid pcomm
+    local -n _rw_idmap="${_RW_HOLDERS_MAP:-_RW_IDENT}"
     for pid in "$@"; do
-        if [[ -n "${_RW_IDENT[$pid]:-}" ]]; then
-            IFS=$'\t' read -r _ _ comm ppid pcomm <<< "${_RW_IDENT[$pid]}"
+        if [[ -n "${_rw_idmap[$pid]:-}" ]]; then
+            IFS=$'\t' read -r _ _ comm ppid pcomm <<< "${_rw_idmap[$pid]}"
+        elif [[ "${_RW_HOLDERS_STRICT:-0}" == 1 ]]; then
+            comm="?"; ppid="?"; pcomm="?"
         else
             comm="$(cat "$proc/$pid/comm" 2>/dev/null)" || comm="?"
             ppid="$(awk '/^PPid:/ { print $2; exit }' "$proc/$pid/status" 2>/dev/null)" || ppid=""
@@ -266,6 +274,100 @@ _rw_holders() {
         fi
         printf '  pid %s %s (parent %s: %s)\n' "$pid" "${comm:-?}" "${ppid:-?}" "${pcomm:-?}"
     done
+}
+
+wg_deleted_holders() {
+    # $1 device number, $2 watched path. Prints a block naming the processes
+    # that hold DELETED files under that path on that device, largest first,
+    # or nothing when they hold under 1 MB. Space held this way is invisible
+    # to du: SQLite unlinks its spill files the moment it creates them, so a
+    # spill filling a volume looks, by du, like a volume with nothing in it
+    # (MEASURED on a live install: 40 MB free while du of the tree summed to
+    # about 1.4 GB of a 2 GB quota). Link count 0 is the filter, so no
+    # descriptor's target is read unless it is already deleted. Own-uid
+    # processes only, like every other attribution here. Names come from
+    # _rw_holders, never a command line.
+    # $1 is the domain key (or a bare device number). A mount key ("<dev>m…")
+    # is the whole filesystem, so nothing is narrowed by path: its path is only
+    # the FIRST watched path on that device, and the file filling it may sit
+    # under another (as _rw_domain_for treats it). A quota key ("<dev>q…") or
+    # a bare number bounds its own tree, so only files under $2 count.
+    local key="$1" fdev root proc="${DG_PROC:-/proc}" listing rc=0 d ino b link pid tgt filter=1
+    fdev="${key%%[qm]*}"
+    [[ "$key" == "${fdev}m"* ]] && filter=0
+    root="$(wg_canon "$2")"
+    listing="$(timeout -k 2 "$DG_RUNAWAY_SCAN_TIMEOUT_S" find -L "$proc"/[0-9]*/fd -mindepth 1 -maxdepth 1 \
+                   -type f -links 0 -printf '%D %i %b %p\n' 2>/dev/null)" || rc=$?
+    # Bytes per holder count every descriptor it holds the file through; the
+    # headline total counts each deleted file (device, inode) once, so a file a
+    # parent and child both inherited is not reported twice (review finding).
+    local -A bytes_of=() files_of=() seen=()
+    local cand=""
+    local total=0 n=0
+    while read -r d ino b link; do
+        [[ "$d" == "$fdev" && "$b" =~ ^[0-9]+$ && "$ino" =~ ^[0-9]+$ ]] || continue
+        [[ "$link" =~ /([0-9]+)/fd/([0-9]+)$ ]] || continue
+        pid="${BASH_REMATCH[1]}"
+        local cfd="${BASH_REMATCH[2]}"
+        if (( filter )) && [[ "$root" != / ]]; then
+            tgt="$(readlink -- "$link" 2>/dev/null)" || continue
+            tgt="${tgt% (deleted)}"
+            [[ "$tgt" == "$root"/* ]] || continue
+        fi
+        cand+="${d}:${ino} ${pid} ${cfd}"$'\n'
+        bytes_of[$pid]=$(( ${bytes_of[$pid]:-0} + b * 512 ))
+        files_of[$pid]=$(( ${files_of[$pid]:-0} + 1 ))
+        if [[ -z "${seen[$ino]:-}" ]]; then
+            seen[$ino]=1; total=$(( total + b * 512 )); n=$(( n + 1 ))
+        fi
+    done <<< "$listing"
+    # A walk that did not complete is reported whatever it found: a killed find
+    # loses output it had not flushed, so a small or empty total proves nothing
+    # (review finding).
+    if (( total < 1048576 )); then
+        (( rc <= 1 )) || printf 'Deleted-file scan under %s did not complete (status %s): a holder of deleted files may be missing from this page.\n' \
+            "$(_rw_show "$root")" "$rc"
+        return 0
+    fi
+    # Identities read now, through each holder's own /proc handle (the descriptor
+    # that still leads to the deleted file), never the runaway scan's cache from
+    # an earlier poll: a holder may have exec'd or renamed itself since (review
+    # finding). Without python3, or if the read fails, _rw_holders reads /proc
+    # directly, which is current too. "openers", not "holders": a reader keeps a
+    # deleted file's space too, and the runaway scan's writer filter would leave
+    # it out of the strict map and print it as "?" (review finding).
+    local -A fresh_ident=()
+    local strict=0
+    if [[ -n "$cand" ]] && command -v python3 >/dev/null 2>&1; then
+        local idout fk fp fst fstate fcomm fppid fpcomm
+        if idout="$(timeout -k 2 "$DG_RUNAWAY_SCAN_TIMEOUT_S" python3 -I -S "$_RW_PROC_PY" "$proc" openers \
+                        <<< "$cand" 2>/dev/null)"; then
+            while IFS=$'\t' read -r fk fp fst fstate fcomm fppid fpcomm; do
+                [[ -n "$fk" && "$fp" =~ ^[0-9]+$ ]] || continue
+                # shellcheck disable=SC2034  # read by name through _RW_HOLDERS_MAP below
+                fresh_ident[$fp]="${fst}"$'\t'"${fstate}"$'\t'"${fcomm}"$'\t'"${fppid}"$'\t'"${fpcomm}"
+            done <<< "$idout"
+            strict=1
+        fi
+    fi
+    printf 'Deleted but still open under %s: %s MB in %s file(s), invisible to du. Held by:\n' \
+        "$(_rw_show "$root")" "$(( total / 1048576 ))" "$n"
+    # The five largest holders of at least 1 MB each, then one line for the
+    # rest, so small holders (a runtime's own scratch files) do not bury the
+    # one filling the disk.
+    local shown=0 rest=0 rest_b=0 line
+    while read -r b pid; do
+        [[ -n "$pid" ]] || continue
+        if (( shown == 5 || b < 1048576 )); then
+            rest=$(( rest + 1 )); rest_b=$(( rest_b + b )); continue
+        fi
+        line="$(_RW_HOLDERS_MAP=fresh_ident _RW_HOLDERS_STRICT=$strict _rw_holders "$pid")"
+        printf '%s: %s MB in %s file(s)\n' "$line" "$(( b / 1048576 ))" "${files_of[$pid]}"
+        shown=$(( shown + 1 ))
+    done < <(for pid in "${!bytes_of[@]}"; do printf '%s %s\n' "${bytes_of[$pid]}" "$pid"; done | sort -rn)
+    (( rest == 0 )) || printf '  and %s more process(es) holding %s MB between them\n' "$rest" "$(( rest_b / 1048576 ))"
+    (( rc <= 1 )) || printf '  (the /proc walk did not complete: status %s, so this list may be short)\n' "$rc"
+    return 0
 }
 
 _rw_episode_open() {

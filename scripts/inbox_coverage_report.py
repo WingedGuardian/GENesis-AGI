@@ -173,7 +173,6 @@ def _completed_entry(
 def _classify_url(
     url: str,
     rows: list[RowInput],
-    has_legacy_completed: bool,
     read_response: Callable[[str], str | None],
 ) -> dict:
     """First-match classification for one URL, in spec order."""
@@ -188,7 +187,7 @@ def _classify_url(
     if failed:
         return _entry(url, "failed", reason=(_newest(failed).error_message or "").split(":", 1)[0])
 
-    if has_legacy_completed or any(
+    if any(
         row.item_urls is None or url in row.item_urls or url in row.baseline_urls for row in rows
     ):
         return _entry(url, "unattributable")
@@ -280,13 +279,7 @@ def build_report(
         if not note.urls:
             report.no_url_notes.append(note.rel)
         rows = rows_by_file.get(note.path, [])
-        has_legacy_completed = any(
-            r.status == "completed" and (r.item_urls is None or r.input_format != "v2")
-            for r in rows
-        )
-        entries = [
-            _classify_url(url, rows, has_legacy_completed, read_response) for url in note.urls
-        ]
+        entries = [_classify_url(url, rows, read_response) for url in note.urls]
         counts = {cls: 0 for cls in CLASSES}
         for entry in entries:
             counts[entry["class"]] += 1

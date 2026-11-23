@@ -27,8 +27,11 @@ def test_native_write_keeps_fault_attribution_and_known_destination(home, monkey
         return original(path, *args, **kwargs)
 
     monkeypatch.setattr(audit.os, "lstat", unavailable)
-    with target.open("x") as output:
-        output.write("actual native write")
+    # A raw absolute exclusive create: the open is judged by its target, so the
+    # unavailable lstat faults (a high-level open is observed without that check).
+    descriptor = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    os.write(descriptor, b"actual native write")
+    os.close(descriptor)
     assert target.read_text() == "actual native write"
     assert audit._S.faults == 1
     assert any(row[2:] == ("write", str(target)) for row in audit._S.hits)
@@ -176,6 +179,8 @@ def test_native_fault_report_and_census_stay_incomplete(tmp_path, monkeypatch, w
     run_id = "owned-fault-census"
     monkeypatch.setenv("GENESIS_LIVE_WRITES_RUN_ID", run_id)
     payload, text = _subrun(tmp_path, _SUBRUN_CONFTEST, '''
+import os
+
 import pytest
 from tests import _live_writes as audit
 
@@ -191,8 +196,9 @@ def test_owned_fault(tmp_path, monkeypatch, case):
             raise PermissionError("PRIVATE_MESSAGE_SENTINEL")
         return original(path, *args, **kwargs)
     monkeypatch.setattr(audit.os, "lstat", unavailable)
-    with target.open("x") as output:
-        output.write("actual native write")
+    descriptor = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    os.write(descriptor, b"actual native write")
+    os.close(descriptor)
     assert target.read_text() == "actual native write"
     assert audit._S.faults == before + 1
 ''', workers)

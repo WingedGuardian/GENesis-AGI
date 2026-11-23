@@ -1,4 +1,5 @@
 """Actual held resolver uses harmless fixture Node only after caller admission."""
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +19,17 @@ def operation(namespace, name):
 
 def test_fresh_source_recapture_keeps_one_node_prefix_and_spawns_nothing(selection):
     snapshot, modules, value, namespace = frozen(selection)
+    # Origin checks belong to an actual execution, not the shared pure
+    # capsule fixture used by the independent queue-free decoder tests.
+    queue = modules['queue']
+    queue._prepare()
+    with closing(queue._connect()) as db, queue._transaction(db):
+        queue._recovery.upgrade(db, queue._legs, queue._native)
+    queue.write_marker(str(snapshot.root), 'gitnexus', value['reservation']['run_mode'])
+    claimed = queue.claim_native(queue.marker_hash(str(snapshot.root)), provider='gitnexus')
+    value['context'] = claimed['context']
+    value['reservation']['unit'] = queue._native.expected_unit(value['context'])
+    assert queue.reserve_launch(value['context'], value['reservation']) == 'reserved'
     source = operation(namespace, 'current_source')(snapshot, modules, value)
     assert source == value['reservation']['source'] and not selection[4].exists()
     entry = Path(value['provider_options']['entry']['path'])

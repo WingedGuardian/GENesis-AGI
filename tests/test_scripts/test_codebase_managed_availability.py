@@ -53,7 +53,8 @@ def test_available_observes_completed_startup_without_native_initialization(
             raise ValueError("incompatible startup contract")
 
     @contextmanager
-    def accepted(path):
+    def accepted(path, expected_build):
+        assert expected_build == value["build"]
         events.append("binary")
         if fault == "binary":
             raise ValueError("unsupported managed executable")
@@ -108,7 +109,7 @@ def test_readonly_availability_refuses_incomplete_authority(availability, tmp_pa
     # Keep real enablement checks; isolate loaded-contract, digest and cgroup
     # readers here. Dedicated cases below enforce the observer boundary.
     monkeypatch.setitem(namespace, "validate_loaded_backend", Mock())
-    monkeypatch.setitem(namespace, "verified_binary", lambda path: nullcontext())
+    monkeypatch.setitem(namespace, "verified_binary", lambda path, build: nullcontext())
     monkeypatch.setitem(namespace, "check_backend", Mock(return_value="123"))
     path = tmp_path / "settings.json"
     if fault == "schema":

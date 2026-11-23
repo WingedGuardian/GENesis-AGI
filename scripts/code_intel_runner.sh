@@ -223,6 +223,14 @@ case "$reconcile_rc" in 0) ;;
     *) _log "native reconciliation failed — stopping tick without claiming new work"; exit 76 ;;
 esac
 
+reconcile_rc=0
+_marker reconcile-orphans >> "$LOG_FILE" 2>&1 || reconcile_rc=$?
+case "$reconcile_rc" in
+    0) ;;
+    75) _log "queue busy at owner-loss reconciliation — deferring"; exit 0 ;;
+    *) _log "owner-loss reconciliation failed — stopping tick without claiming new work"; exit 76 ;;
+esac
+
 list_rc=0
 _queue_capture list-legs --nul || list_rc=$?
 if [ "$list_rc" -eq 75 ]; then

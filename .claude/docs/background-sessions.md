@@ -16,6 +16,13 @@ Read this guide any time you're considering a background session or sub-agent.
 outlive this conversation → background session. If you just need an answer in
 the next few minutes → sub-agent.
 
+**Name what you leave behind.** Any session that launches another session (a
+background session, a new tmux slot, a workflow run) names the slot or session
+it will create and leave behind, in its approval question or, where the approval
+comes from the autonomous-CLI gate instead, in its dispatch report. A
+validator is never launched this way: only the owner starts one
+(validating-merges, "Rules for every validator").
+
 Server-side machine connectors use an opt-in prepared native receipt rather than
 the MCP queue. This mode has explicit cancellation, a receipt-to-execution
 deadline, private full results and no automatic parking/replay. It does not
@@ -187,6 +194,14 @@ bypassed — MEASURED, `GH_TOKEN="" GITHUB_TOKEN=<value> gh auth token` returns 
 fallback, and gh documents the two on the same line. If a gh release adds a
 credential variable, add it there and cite the release; a name recalled without a
 citation is how this broke.
+
+The dashboard's update sessions (`dashboard/routes/updates.py`) start outside
+`CCInvoker` and import this set rather than keeping their own: Tier 3 pins it and
+passes `_assert_no_gh_credentials`, and Tiers 1/2 get it substituted into the
+generated orchestrator script, so a name added to `_GH_CREDENTIAL_ENV` reaches
+both. They pass no `--settings`, so the second copy of these pins that the
+invoker writes into its `--settings` file does not cover them
+(`docs/architecture/CURRENT.md`, section 2).
 
 **Read this before assuming a non-allowlisted session is unauthenticated — it is
 not.** MEASURED: with no `GH_CONFIG_DIR` pin, a session with `GH_TOKEN=""` is

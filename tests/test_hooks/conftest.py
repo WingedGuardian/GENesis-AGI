@@ -241,6 +241,15 @@ def _hermetic_rounds_row(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_delivery_row(monkeypatch):
+    """Pin the ``--check-pr`` ``delivery`` row for EVERY hook test, for the reason
+    above: the row reads the PR's comments and a GraphQL timeline, and report tests
+    run as subprocesses too. tests/test_hooks/test_delivery_row.py clears it per case."""
+    monkeypatch.setenv("_TEST_DELIVERY_ROW", "hermetic (test pin)")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_squash_body_file(monkeypatch):
     """Keep ``--check-pr`` from writing its squash body file for EVERY hook test.
 

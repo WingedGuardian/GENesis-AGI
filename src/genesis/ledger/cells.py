@@ -38,7 +38,11 @@ Tool-call lane (design §4.4, strict): per-tool success base rates from
 ``tool_call_outcomes`` land as ``provenance='policy_prior'``,
 ``action_class='tool_call'``, ``metric='success_rate'``, domain
 ``tool.<tool_name>`` — n and base_rate ONLY (no brier family, no shrinkage:
-nothing was predicted).
+nothing was predicted). A tool with fewer than ``_OK_N`` calls in a window
+gets no cell for that window: since the table records every tool (#4712), not
+only Edit and Write, most of its ~50 tool names are rare, and a ``thin`` or
+``unknown`` cell for each would bury the prediction cells on every calibration
+surface with "treat as unverified" lines for base rates nothing predicted.
 """
 
 from __future__ import annotations
@@ -252,6 +256,8 @@ async def _build_tool_cells(db: Any, *, now: datetime) -> list[dict]:
         rows = await tco_crud.aggregate_success_rates(db, since=since)
         for row in rows:
             n = int(row["n"])
+            if n < _OK_N:
+                continue  # module docstring: no cell for a rarely-called tool
             cells.append(
                 {
                     "domain": f"tool.{row['tool_name']}",

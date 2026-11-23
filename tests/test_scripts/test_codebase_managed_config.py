@@ -18,6 +18,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from tests.test_scripts.managed_code_intel_fixture import qualify_bytes
+
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/codebase_managed.py"
 
@@ -194,6 +196,7 @@ def staged_configuration(managed, tmp_path, monkeypatch):
     binary.write_bytes(b"accepted")
     binary.chmod(0o500)
     expected = hashlib.sha256(binary.read_bytes()).hexdigest()
+    assert qualify_bytes(monkeypatch, managed.qualified_release, binary.read_bytes()) == [expected]
     monkeypatch.setitem(managed.configure.__globals__, "BUILD", expected)
     monkeypatch.setattr(managed, "BUILD", expected)
     state = tmp_path / "new ancestor" / "nested" / "staged $% Unicode \u00e9 "
@@ -360,7 +363,9 @@ def test_source_refusal_does_not_claim_retained_staging(
     if kind == "unexecutable":
         source.chmod(0o400)
     elif kind == "wrong-pin":
-        monkeypatch.setitem(managed.configure.__globals__, "BUILD", "0" * 64)
+        source.chmod(0o700)
+        source.write_bytes(b"unqualified replacement")
+        source.chmod(0o500)
     else:
         source.unlink()
         if kind == "link":
@@ -387,10 +392,8 @@ def test_verified_executable_is_same_inode_and_foreign_path_survives(
     binary = tmp_path / "bin"
     binary.write_bytes(b"accepted")
     binary.chmod(0o500)
-    monkeypatch.setitem(
-        managed.verified_binary.__globals__, "BUILD", hashlib.sha256(binary.read_bytes()).hexdigest()
-    )
-    with managed.verified_binary(binary) as stream:
+    digest, = qualify_bytes(monkeypatch, managed.qualified_release, binary.read_bytes())
+    with managed.verified_binary(binary, digest) as stream:
         replacement = tmp_path / "replacement"
         replacement.write_bytes(b"foreign")
         replacement.replace(binary)
@@ -607,7 +610,7 @@ def test_binary_invalid_kind_or_build_refuses(managed, tmp_path, kind):
         path.write_bytes(b"unsupported")
         path.chmod(0o500 if kind == "wrong-pin" else 0o400)
     with pytest.raises((OSError, ValueError)):
-        managed.verified_binary(path)
+        managed.verified_binary(path, managed.BUILD)
 
 
 def test_publication_failure_keeps_settings_and_removes_only_temporary(

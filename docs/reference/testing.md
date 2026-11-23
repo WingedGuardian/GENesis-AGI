@@ -31,19 +31,45 @@ All tests run from the genesis project root using pytest:
 source ~/genesis/.venv/bin/activate
 cd genesis
 
-# Full suite
-pytest -v
+# Full suite: run the hosted CI test job, not a local full-suite invocation.
 
-# Specific subsystem
-pytest -v tests/test_memory/
-pytest -v tests/test_resilience/
+# Local checks: name the relevant test files.
+pytest -v tests/test_pytest_storage.py tests/test_pytest_retention_policy.py
 
 # Linting (run before committing)
 ruff check .
 
-# Both (standard pre-commit check)
-ruff check . && pytest -v
 ```
+
+## Persistent test caches
+
+Default pytest cache data lives in `.pytest_cache/pytest` within the selected
+checkout. Pytest creates a fresh cache through a temporary sibling directory;
+the nested placement keeps that bootstrap inside `.pytest_cache` too.
+The root test conftest defaults Hypothesis storage to the same checkout's
+`.pytest_cache/hypothesis` before child conftests load. Constants and local
+example databases remain persistent between runs. Hypothesis profiles are
+unchanged, including the installed library's CI profile and its disabled
+default example database.
+
+These defaults start cold: existing `.hypothesis` and legacy `.pytest_cache/v`
+contents are neither migrated nor deleted. `--cache-clear` clears pytest's
+cache data while leaving the Hypothesis sibling in place.
+
+An explicit `HYPOTHESIS_STORAGE_DIRECTORY` wins, including relative or empty
+values; an empty value retains Hypothesis's native `.hypothesis` fallback.
+CI can supply its run-owned storage through that same variable. Pytest's
+`-o cache_dir=<path>` override and `-p no:cacheprovider` retain their usual
+behavior. Explicit paths outside test-owned storage remain subject to the
+write audit; these settings do not widen its exemptions. The libraries retain
+their own permission-error handling. A plugin that resolves Hypothesis storage
+before the root conftest loads must supply the environment variable before
+starting pytest; the conftest does not reset previously resolved global state.
+
+`tests/test_pytest_storage.py` exercises real fresh/repeated runs, early
+child-conftest resolution, serial and two-worker execution, persistence,
+overrides, `--lf`, and cache clearing. Its deliberate outside-cache write
+checks that the observer remains effective.
 
 ## Test Suite Overview
 
@@ -437,7 +463,8 @@ It also reports reads of the real credential files (the deployed `secrets.env`,
 - An observation records a pre-operation event, not successful completion.
   Established no-effect cases (`mkdir(exist_ok=True)` on an existing directory,
   `unlink` of a missing file, reopening an existing file without writing) are
-  filtered; other refused operations can still be reported. A relative
+  filtered; other refused operations can still be reported, and some aliases can
+  be missed (tracked in #4193). A relative
   `os.open` is judged against the cwd and labelled so (its audit event carries no
   `dir_fd`). Writes during collection count as "outside any test".
 - An `observer fault` row identifies the test and the audit event/stage/fixed
@@ -461,12 +488,25 @@ the fresh run identity, test outcome, report digest/count and worker coverage.
 The audit remains report-only while ambiguous observations and unknown faults
 remain unresolved.
 
+Generated session MCP configs are isolated by the function-scoped autouse fixture
+in `tests/_session_config.py`, registered by the root conftest. It redirects only
+the builder's generated-output directory to each test's `tmp_path`: generation,
+profile filtering, template reads, repository-root substitution and cache reuse
+remain real. Its independent monkeypatch survives a test undoing its own patches.
+Each test starts with a cold output directory, including on separate xdist workers.
+This fixture does not cover generation during collection, broader-scoped fixture
+setup or child processes; those callers must explicitly own their output paths.
+The bounded-output hook tests that exercise recall use a real temporary SQLite
+database and migration marker, rather than pointing SQLite at a test source file.
+These fixture fixes do not enable write-audit enforcement or establish that the
+full-suite census is empty.
+
 ## Shared MCP qualification environments
 
 Ordinary CI keeps its existing runtime dependency ranges. The shared-only
-protocol suites require the exact versions admitted by
+protocol and shared CLI suites require the exact versions admitted by
 `genesis.mcp.shared_http._settings.require_qualified_stack`; an unsupported
-ordinary environment explicitly skips those three modules before SDK imports.
+ordinary environment explicitly skips those four modules before SDK imports.
 Pure configuration and missing/later-version refusal tests remain ordinary
 tests in `tests/test_mcp/test_shared_http_settings.py`.
 
@@ -477,9 +517,15 @@ read-only permissions. `GENESIS_REQUIRE_SHARED_MCP_QUALIFICATION=1` is test-only
 qualification refusal becomes a collection error in this job. No production
 version, feature, credential or rollout gate changes.
 
-The protocol step names the admission, policy and actual HTTP modules explicitly.
+The protocol step names the admission, policy, actual HTTP and shared CLI modules
+explicitly. The CLI checks start all four real factories with disposable local
+dependencies, exercise catalog/authentication/read calls over TCP, and observe
+SDK shutdown and registered-owner drainage before resource closure on SIGTERM.
+They also exercise path/abstract readiness datagrams after bind and cleanup on
+failed notification, bind failure and shutdown requested during startup. The
+memory notification-failure case checks its actual provider/cache closers.
 Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
-and a floor of 91 cases. Installation, collection, test or report-check failure
+and a floor of 104 cases. Installation, collection, test or report-check failure
 fails the job; missing or filtered workflow runs do not qualify a PR. Closing
 checks its actual head/base result. Ordinary skip-budget changes require observed
 skip identities; this workflow does not raise that budget automatically.
@@ -487,6 +533,16 @@ skip identities; this workflow does not raise that budget automatically.
 For a local run, use an already qualified isolated interpreter and the same
 strict test flag, then run the workflow's report check. Changing installed
 packages or enabling shared services is not part of that test command.
+
+`test_shared_notify.py` exercises owned local datagrams and error propagation
+without SDK qualification. `test_shared_mcp_templates.py` reuses both actual
+renderer loops and executes their activation sections with nondelegating command
+shims, checking literal paths, stamps and keep/take behavior without starting a
+unit. Successful per-test payload/event files require both an explicit scratch
+`--basetemp` and `-o tmp_path_retention_policy=all`; the normal policy removes
+successful test directories. Read-only `systemd-analyze verify` can validate
+rendered syntax with generators disabled; it does not execute or qualify a live
+service.
 
 ## Integration Tests
 
@@ -527,3 +583,13 @@ database lease. `tests/test_memory/test_tag_index_ownership.py` covers independe
 background admission, physical scan drain, refusal/creation failure, prestart
 cancellation, retriever propagation and the body-completed/done-callback gap.
 `tests/test_memory/test_tag_index_swr.py` retains legacy stale-query behavior.
+
+Owned shared bootstrap coverage lives in `tests/test_mcp/test_shared_service_settings.py`,
+`test_shared_resource_factories.py`, `test_shared_launch_selection.py` and
+`test_shared_runner.py`, plus `tests/test_memory/test_embedding_resource_lifecycle.py`.
+Factory argument tests use real canonical SQLite/facades with captured initializer
+arguments and provider doubles; they are not real-provider or native-client E2E.
+`test_shared_runner_lifecycle.py` runs disposable child processes with real Uvicorn
+and inert ASGI/resource dependencies to verify signal replay, cancelled startup,
+bind errors, failed lifespan and cancelled/forced shutdown ordering. These tests
+do not send signals to another session or start a deployed service.

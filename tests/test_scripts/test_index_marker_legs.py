@@ -15,7 +15,7 @@ def queue(tmp_path, monkeypatch):
     monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "owned-state"))
     for name in ("_genesis_index_marker_legacy", "_genesis_index_marker_legs",
                  "_genesis_index_marker_execution", "_genesis_code_intel_execution",
-                 "_genesis_index_marker_recovery"):
+                 "_genesis_index_marker_recovery", "_genesis_index_marker_retry"):
         monkeypatch.delitem(sys.modules, name, raising=False)
     module = SimpleNamespace(**runpy.run_path(str(SCRIPT)))
     assert module.database_path().is_relative_to(tmp_path)

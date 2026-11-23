@@ -178,3 +178,18 @@ async def test_store_defaults_timestamp(db):
     rows = await telegram_messages.query_recent(db, chat_id=100)
     assert len(rows) == 1
     assert rows[0]["timestamp"]  # not empty
+
+
+async def test_query_recent_can_leave_a_sender_out(db):
+    """Recovery context drops interim progress rows; the limit counts the rest (#4849)."""
+    for i, sender in enumerate(["user", "genesis-progress", "genesis-progress", "genesis"]):
+        await telegram_messages.store(
+            db, chat_id=100, message_id=i + 1, sender=sender, content=f"m{i}",
+            timestamp=f"2026-03-21T10:00:0{i}", direction="outbound" if i else "inbound",
+        )
+    rows = await telegram_messages.query_recent(
+        db, chat_id=100, limit=2, exclude_senders=("genesis-progress",)
+    )
+    assert [r["sender"] for r in rows] == ["user", "genesis"]
+    everything = await telegram_messages.query_recent(db, chat_id=100)
+    assert len(everything) == 4

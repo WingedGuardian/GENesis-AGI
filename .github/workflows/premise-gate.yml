@@ -1,7 +1,7 @@
 # Issue premise gate: scripts/premise_gate.py (its docstring has the rules).
-# Labels an issue `premises-missing` until it carries the six plan-time premise
-# answers, and removes `devin-ready` (which starts a paid Devin session) from an
-# issue without them.
+# Labels an issue `premises-missing` until it carries its premise answers (the
+# form's Problem block), and removes `devin-ready` (which starts a paid Devin
+# session) from an issue without all nine.
 name: Premise gate
 
 on:
@@ -52,8 +52,8 @@ jobs:
         run: python3 scripts/premise_gate.py "$GITHUB_EVENT_PATH"
 
   label:
-    # Opened, edited or reopened, or the `bug` label added or removed: that label
-    # switches which section the issue owes. Never the devin-ready event, which
+    # Opened, edited or reopened, or the `bug` label added or removed: on an
+    # issue created before FORM_EPOCH that label switches which section it owes. Never the devin-ready event, which
     # is the guard's.
     if: >-
       contains(fromJSON('["opened", "edited", "reopened"]'), github.event.action)

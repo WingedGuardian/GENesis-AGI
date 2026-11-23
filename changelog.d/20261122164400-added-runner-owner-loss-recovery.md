@@ -1,0 +1,1 @@
+- The indexing runner can reconcile provably ended owners before claiming queued work once strict cutover enables automatic consumption. Uncertain executions and provider holds remain protected.
