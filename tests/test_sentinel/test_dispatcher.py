@@ -1575,6 +1575,12 @@ class TestAlarmClearedHysteresis:
             assert row["status"] == "approved"
             assert d._state.pending_request_id == request_id
             assert self._ALARM not in d._resolved_cooldowns
+            # The kept park is then resumed by convergence (#3689 test A): the
+            # approval is consumed once and dispatch resumes from it.
+            with patch.object(d, "resume_from_approval", AsyncMock()) as resume:
+                await d.converge_pending_approval()
+                await d.converge_pending_approval()  # consumed once: no second resume
+            resume.assert_awaited_once_with(request_id, "approved")
         else:
             assert row["status"] == "cancelled"
             assert row["resolved_by"] == "alarm_cleared"
