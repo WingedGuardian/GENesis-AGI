@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.test_scripts.managed_code_intel_fixture import qualify_bytes
 from tests.test_scripts.test_code_intel_cbm_worker import _args, _fake_worker, worker
 from tests.test_scripts.test_code_intel_effective_policy import policy as full_policy_value
 from tests.test_scripts.test_code_intel_execution import evidence as evidence
@@ -21,8 +22,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.fixture
 def bound(queue, scope, evidence, tmp_path, monkeypatch):
-    def prepare(*, error=False, frozen_environment=False, path_fault=None, full_policy=False):
-        _fake_worker(tmp_path, monkeypatch, error=error)
+    def prepare(*, error=False, frozen_environment=False, path_fault=None, full_policy=False, variant=""):
+        _fake_worker(tmp_path, monkeypatch, error=error, variant=variant)
         managed = worker.load_managed()
         config = managed["runtime_config"](tmp_path / "settings")
         observation = tmp_path / "native-environment-observation.json"
@@ -33,7 +34,9 @@ def bound(queue, scope, evidence, tmp_path, monkeypatch):
                       "['INVOCATION_ID','SYNTHETIC_VALUE','CBM_CACHE_DIR','CONTROL_ONLY']}))\n")
             binary.write_text(binary.read_text().replace("sys.exit(", record + "sys.exit(", 1))
             monkeypatch.setattr(worker, "BUILD", hashlib.sha256(binary.read_bytes()).hexdigest())
-            monkeypatch.setitem(managed["verified_binary"].__globals__, "BUILD", worker.BUILD)
+            qualify_bytes(monkeypatch, worker.qualified_release, binary.read_bytes())
+            qualify_bytes(monkeypatch, managed["qualified_release"], binary.read_bytes())
+            config["build"] = worker.BUILD
         raw = json.dumps(config).encode()
         args = _args(tmp_path)
         queued = runpy.run_path(str(ROOT / "scripts/lib/code_intel_queued_worker.py"))
@@ -157,8 +160,9 @@ def test_accepted_open_inode_executes_after_named_binary_replacement(bound, queu
     replacement.chmod(0o700)
     accepted = []
 
-    def replace_after_verified_open(path):
-        stream = original(path)
+    def replace_after_verified_open(path, expected_build):
+        assert expected_build == case.config["build"]
+        stream = original(path, expected_build)
         metadata = os.fstat(stream.fileno())
         accepted.append(dict(device=metadata.st_dev, inode=metadata.st_ino, sha256=worker.BUILD))
         replacement.replace(path)

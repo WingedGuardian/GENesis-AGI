@@ -13,6 +13,78 @@
 
 projects:
 
+  - name: Ripwire
+    repo: redhat-et/ripwire
+    track: [releases]
+    priority: medium
+    notes: Optional code intelligence CLI, MCP server, agent skills and hooks.
+
+  - name: GitNexus
+    repo: abhigyanpatwari/GitNexus
+    track: [releases]
+    priority: medium
+    notes: Code graph indexing; qualify storage format and Node compatibility before updating.
+
+  - name: Serena
+    repo: oraios/serena
+    track: [releases]
+    priority: medium
+    notes: Live symbol navigation and editing through the managed MCP launcher.
+
+  - name: codebase-memory-mcp
+    repo: DeusData/codebase-memory-mcp
+    track: [releases]
+    priority: medium
+    notes: Code knowledge graph; monitoring does not enable a disabled local installation.
+
+  - name: yt-dlp
+    repo: yt-dlp/yt-dlp
+    track: [releases]
+    priority: medium
+    notes: YouTube metadata and captions; qualify curl_cffi and the bundled JavaScript solver together.
+
+  - name: curl_cffi
+    repo: lexiforest/curl_cffi
+    track: [releases]
+    priority: medium
+    notes: TLS impersonation for Scrapling and yt-dlp; includes native curl and compression libraries.
+
+  - name: Scrapling
+    repo: D4Vinci/Scrapling
+    track: [releases]
+    priority: medium
+    notes: Async web fetching; qualify fetcher extras against the compatible browser stack.
+
+  - name: Ruff
+    repo: astral-sh/ruff
+    track: [releases]
+    priority: medium
+    notes: Lint tooling; keep CI and the test extra on the same qualified version.
+
+  - name: Brotli
+    repo: google/brotli
+    track: [releases]
+    priority: medium
+    notes: Python response decompression used by yt-dlp; separate from curl_cffi's bundled decoder.
+
+  - name: Camoufox
+    repo: daijro/camoufox
+    track: [releases]
+    priority: medium
+    notes: Firefox engine and Python wrapper; qualify addon provisioning and Playwright compatibility.
+
+  - name: Playwright Python
+    repo: microsoft/playwright-python
+    track: [releases]
+    priority: medium
+    notes: Browser driver; coordinate with Camoufox and Patchright before moving the minor version.
+
+  - name: Patchright Python
+    repo: Kaliiiiiiiiii-Vinyzu/patchright-python
+    track: [releases]
+    priority: medium
+    notes: Chromium fallback; keep browser build and persistent profiles compatible with Playwright.
+
   - name: Claude Code
     repo: anthropics/claude-code
     track: [releases, commits, discussions]

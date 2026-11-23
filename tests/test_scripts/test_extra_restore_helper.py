@@ -4,6 +4,8 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -237,7 +239,6 @@ def test_a_long_multibyte_name_gets_a_valid_short_aside(tmp_path, capsysbinary):
 def test_root_prints_a_non_utf8_name_under_a_strict_locale(tmp_path):
     """Class audit: `root` writes raw bytes, so a non-UTF-8 directory name works under
     en_US.UTF-8 (a strict stdout) as well as under C.UTF-8."""
-    import subprocess
 
     t = tmp_path / "a.tar"
     with tarfile.open(t, "w", encoding="utf-8", errors="surrogateescape") as tf:
@@ -356,3 +357,111 @@ def test_verify_judges_members_against_what_earlier_members_left(tmp_path, capsy
     assert er.cmd_swap(str(t), str(stage), "w/s", str(tmp_path / "w" / "s"), "") == 4
     assert (tmp_path / "w" / "s" / "data.txt").read_bytes() == b"x"
     assert not (tmp_path / "w" / "s" / "zlink").is_symlink()
+
+
+# ── verify-stream: the same verdict, read from a stream (backup.sh §6f) ───────
+
+
+def _gnu_tree(tmp_path, *, refused=True):
+    """A directory archived the way backup.sh archives one: real GNU tar, with a long
+    name, a non-UTF-8 name, an in-tree link, a setgid directory and, when
+    ``refused``, members a restore refuses (an absolute link, a link leaving the
+    tree, a FIFO)."""
+    base = tmp_path / "home"
+    d = base / "w" / "s"
+    deep = d / ("long-" * 30) / ("deeper-" * 20)
+    deep.mkdir(parents=True)
+    (deep / "f.txt").write_bytes(b"x" * 5000)
+    (d / "data.bin").write_bytes(os.urandom(70000))
+    os.symlink("data.bin", d / "cur")
+    (d / "sub").mkdir()
+    os.chmod(d / "sub", 0o2775)
+    with open(os.path.join(os.fsencode(d), b"name-\xff"), "wb") as fh:
+        fh.write(b"y")
+    if refused:
+        os.symlink("/etc/passwd", d / "abs")
+        os.symlink("../../x", d / "up")
+        os.mkfifo(d / "pipe")
+    tar = tmp_path / "a.tar"
+    subprocess.run(
+        ["tar", "-C", str(base), "--hard-dereference", "-cf", str(tar), "--", "w/s"], check=True
+    )
+    return tar
+
+
+def _cli(args, stdin=None):
+    return subprocess.run(
+        [sys.executable, str(_HELPER), *args], stdin=stdin, capture_output=True, check=False
+    )
+
+
+@pytest.mark.parametrize("refused", [False, True])
+def test_verify_stream_gives_the_file_verdict_byte_for_byte(tmp_path, refused):
+    """The stream verdict must be the one restore reaches on the file: same exit
+    code, same root, same refused lines and summary."""
+    tar = _gnu_tree(tmp_path, refused=refused)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    on_file = _cli(["verify", str(tar), str(scratch)])
+    with open(tar, "rb") as fh:
+        on_stream = _cli(["verify-stream", str(scratch)], stdin=fh)
+    assert on_file.returncode == (4 if refused else 0), on_file.stderr
+    assert (on_stream.returncode, on_stream.stdout, on_stream.stderr) == (
+        on_file.returncode,
+        on_file.stdout,
+        on_file.stderr,
+    )
+    assert on_stream.stdout == b"w/s\n"
+    assert not list(scratch.iterdir())  # neither the hollow copy nor a verify stage stays
+
+
+def test_verify_stream_reads_its_input_to_the_end(tmp_path):
+    """tar pads past the end-of-archive blocks; a reader that stops there leaves the
+    writer (gpg in backup.sh) to die on a broken pipe, which reads as a failure."""
+    tar = _gnu_tree(tmp_path, refused=False)
+    padded = tmp_path / "padded.tar"
+    padded.write_bytes(tar.read_bytes() + b"\0" * (4 << 20))
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    script = 'cat -- "$1" | "$2" "$3" verify-stream "$4"'
+    proc = subprocess.run(
+        ["bash", "-o", "pipefail", "-c", script, "_"]
+        + [str(padded), sys.executable, str(_HELPER), str(scratch)],
+        capture_output=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.parametrize("cut", ["garbage", "truncated"])
+def test_verify_stream_fails_closed_on_a_damaged_stream(tmp_path, cut):
+    tar = _gnu_tree(tmp_path, refused=False)
+    data = tar.read_bytes()
+    bad = tmp_path / "bad"
+    bad.write_bytes(b"not a tar archive" * 64 if cut == "garbage" else data[: len(data) // 3])
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    with open(bad, "rb") as fh:
+        proc = _cli(["verify-stream", str(scratch)], stdin=fh)
+    assert proc.returncode == 5, proc.stderr
+    assert proc.stdout == b""
+    assert not list(scratch.iterdir())
+
+
+def test_verify_stream_judges_a_copy_without_file_content(tmp_path, monkeypatch):
+    """The copy it judges holds headers only, so verifying a large directory writes
+    kilobytes, not the directory again."""
+    tar = _gnu_tree(tmp_path, refused=False)
+    seen = []
+    real = er.cmd_verify
+
+    def spy(path, scratch_parent):
+        seen.append(os.path.getsize(path))
+        with tarfile.open(path) as tf:
+            assert all(m.size == 0 for m in tf.getmembers() if m.isreg())
+        return real(path, scratch_parent)
+
+    monkeypatch.setattr(er, "cmd_verify", spy)
+    with open(tar, "rb") as fh:
+        assert er.cmd_verify_stream(fh, str(tmp_path)) == 0
+    assert seen and seen[0] < tar.stat().st_size // 4, (seen, tar.stat().st_size)

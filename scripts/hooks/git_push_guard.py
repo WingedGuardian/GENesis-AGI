@@ -204,7 +204,16 @@ try:
         INLINE_P3_RE as _INLINE_P3_RE,
     )
     from review_findings import (
+        cr_findings as _cr_findings,
+    )
+    from review_findings import (
         cr_header_fields as _cr_header_fields,
+    )
+    from review_findings import (
+        cr_markup_mask as _cr_markup_mask,
+    )
+    from review_findings import (
+        cr_masks as _cr_masks,
     )
     from review_findings import (
         cr_severity as _cr_severity,
@@ -254,6 +263,15 @@ except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate on
         raise RuntimeError(_REVIEW_FINDINGS_ERROR)
 
     def _is_cr_marker_line(line):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
+    def _cr_findings(body):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
+    def _cr_markup_mask(body):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
+    def _cr_masks(body, bq_depths=None):  # type: ignore[no-redef]
         raise RuntimeError(_REVIEW_FINDINGS_ERROR)
 
 # This module imports nothing from `review_state`. It once imported the escalation
@@ -359,6 +377,7 @@ try:
         git_subcommand,
         git_subcommand_index,
         has_trailing_override,
+        locale_candidates,
         mentions,
         push_arg_stream,
         split_segments,
@@ -1879,13 +1898,6 @@ def _review_bots(sets: dict[str, frozenset[str]]) -> frozenset[str]:
 # above matches and the if/elif has no else. Read, not recognised; a PR carrying
 # a Major reported `inline-findings: ok`, indistinguishable from a clean one.
 _CR_BLOCKING_SEVERITIES = frozenset({"critical", "major"})
-# CodeRabbit bundles SEVERAL findings into ONE inline comment, separated by a
-# markdown rule, when they land near each other in the diff. Each segment is
-# its own finding with its own severity.
-# At most THREE leading spaces: CommonMark reads a 4+-space-indented rule as
-# CODE, and CodeRabbit quotes markdown as indented code blocks — an indented
-# `---` inside quoted code must not become a finding boundary (Codex P2, #1677).
-_CR_FINDING_SPLIT_RE = re.compile(r"^ {0,3}-{3,}\s*$", re.M)
 # Scoring policy (2026-09-03, issue #1642): Critical and Major each score a full
 # 1.0; every other level scores 0 and is surfaced only. Deliberately fed through
 # the SAME weighted machinery as the Codex findings rather than a second blocking
@@ -2354,190 +2366,6 @@ def _safe_title(raw: str) -> str:
     # bounding it is a selection rather than an amputation — but say that a cut
     # happened, so a clipped title is never read as the whole finding.
     return safe[: _INLINE_TITLE_MAX_CHARS - 1].rstrip() + "…"
-
-
-#: An opening or closing code fence: three-or-more backticks/tildes, then an
-#: optional info string. Captured separately because CommonMark's CLOSING rule
-#: depends on both — same character, at least as long, and no info string.
-_CR_FENCE_RE = re.compile(r"^(`{3,}|~{3,})(.*)$")
-
-
-def _cr_markup_mask(body: str) -> list[bool]:
-    """Per line: True when it sits inside a fenced block OR a ``<details>`` section.
-
-    The union, for callers that treat both as quoted content. A caller that must
-    keep ``<details>`` VISIBLE — the outside-diff parser, whose findings are
-    nested two levels deep inside them by construction — takes the fence half
-    alone from ``_cr_masks``. Both halves come from one implementation on
-    purpose: fence tracking is subtle (CommonMark close rules, the four-backtick
-    suggestion case, the unclosed-fence recovery), and a second copy of it is
-    how #1677 would come back on a surface nobody re-reads.
-    """
-    fence_mask, details_mask = _cr_masks(body)
-    return [f or d for f, d in zip(fence_mask, details_mask, strict=True)]
-
-
-def _cr_masks(
-    body: str, bq_depths: list[int] | None = None
-) -> tuple[list[bool], list[bool]]:
-    """``(fence_mask, details_mask)`` per line — the two kept SEPARATE.
-
-    Per line: True when it sits inside a fenced block or a ``<details>`` section.
-
-    Shared by the splitter and the title extractor because they MUST agree about
-    what is quoted content. They did not: the title extractor skipped fences while
-    the splitter cut across them, so a horizontal rule inside a ```suggestion```
-    manufactured a finding out of quoted markdown — which the title extractor then
-    could only name by its severity header.
-
-    MEASURED before the fix, on a body CodeRabbit plausibly emits (a Minor whose
-    suggestion edits a markdown file containing a rule and an italic two-field
-    line): one Minor finding split into two, the second reading as a MAJOR, and a
-    non-blocking review blocking the merge on the strength of quoted code.
-
-    Fence lines and the ``<details>`` tags themselves count as markup — they are
-    never finding content. ``<details>`` is tracked only OUTSIDE a fence, matching
-    how a markdown renderer reads it.
-    """
-    lines = body.split("\n")
-    # Fence and <details> contributions are tracked as SEPARATE masks and OR'd
-    # at the end, because each has an unclosed-construct recovery that clears
-    # its own contribution — and clearing a single combined mask would also
-    # unmask the OTHER construct's quoted content, silently re-opening the
-    # fence bug whenever a fence sits inside an unclosed <details>.
-    fence_mask = [False] * len(lines)
-    details_mask = [False] * len(lines)
-    fence_char: str | None = None
-    fence_len = 0
-    fence_opened_at: int | None = None
-    # The blockquote depth the OPEN fence was opened at. A renderer scopes a
-    # fence to its container, so only a delimiter in the SAME container can
-    # close it; `bq_depths` is None for callers reading text that never had a
-    # quote prefix stripped, and every depth is then 0, which is exactly the
-    # previous behaviour.
-    fence_bq = 0
-    details_depth = 0
-    details_opened_at: int | None = None
-    for idx, line in enumerate(lines):
-        depth = bq_depths[idx] if bq_depths is not None and idx < len(bq_depths) else 0
-        stripped = line.strip()
-        # CommonMark gives fence DELIMITERS at most three leading spaces; a
-        # 4+-space-indented backtick run is code CONTENT. Stripping first and
-        # matching meant an indented ```` line inside a four-backtick
-        # suggestion closed the outer fence (Codex P2, #1677).
-        indent = len(line) - len(line.lstrip(" \t"))
-        fence = _CR_FENCE_RE.match(stripped) if indent <= 3 else None
-        if fence:
-            run, info = fence.group(1), fence.group(2).strip()
-            if fence_char is None:
-                fence_char, fence_len, fence_opened_at = run[0], len(run), idx
-                fence_bq = depth
-            elif (
-                depth == fence_bq
-                and run[0] == fence_char
-                and len(run) >= fence_len
-                and not info
-            ):
-                # CommonMark: a closing fence uses the SAME character, is at
-                # least as long as the opener, and carries NO info string.
-                # Toggling on any fence line broke on CodeRabbit's own output:
-                # it wraps a suggestion in FOUR backticks precisely when the
-                # suggested markdown contains a three-backtick fence, so the
-                # inner ```md closed the outer block and everything after it —
-                # a quoted `---` and a Major-shaped header — was read as real
-                # findings, blocking a merge on the strength of quoted content
-                # (Codex P2, PR #1677).
-                fence_char, fence_len, fence_opened_at = None, 0, None
-            fence_mask[idx] = True
-            continue
-        if fence_char is not None:
-            fence_mask[idx] = True
-            continue
-        low = stripped.casefold()
-        if low.startswith("<details"):
-            # Nesting is a DEPTH, not a boolean: valid nested <details> meant
-            # the INNER close unmasked the rest of the outer collapsed section,
-            # so a quoted rule + severity header there manufactured a blocking
-            # finding out of collapsed content (Codex P2, PR #1677).
-            if details_depth == 0:
-                details_opened_at = idx
-            details_depth += 1
-            details_mask[idx] = True
-            continue
-        if low.startswith("</details"):
-            details_depth = max(0, details_depth - 1)
-            if details_depth == 0:
-                details_opened_at = None
-            details_mask[idx] = True
-            continue
-        details_mask[idx] = details_depth > 0
-    if fence_opened_at is not None:
-        # An UNCLOSED fence. CommonMark says it runs to the end of the document,
-        # and masking to the end is therefore "correct" — but this mask decides
-        # what the merge gate is allowed to SEE, and hiding every finding after a
-        # stray backtick run is the fail-OPEN direction: a real Critical goes
-        # unreported and the merge proceeds. A phantom finding, the other error,
-        # blocks loudly and gets looked at. So a fence that never closes is
-        # treated as ordinary content from the line it opened on.
-        for i in range(fence_opened_at, len(lines)):
-            fence_mask[i] = False
-    if details_opened_at is not None:
-        # An UNCLOSED <details> gets the same recovery for the same reason: a
-        # stray tag must not hide a later genuine Major from the gate. Only the
-        # details CONTRIBUTION is cleared — quoted fenced content inside the
-        # section stays masked via fence_mask. A complete inner section between
-        # the unclosed opener and end-of-body is unmasked too; that is the
-        # phantom-finding direction, which blocks loudly, and is accepted for
-        # the same reason the fence recovery accepts it (Codex P2, PR #1677).
-        for i in range(details_opened_at, len(lines)):
-            details_mask[i] = False
-    return fence_mask, details_mask
-
-
-def _cr_findings(body: str) -> list[str]:
-    """Split one CodeRabbit comment into its individual findings.
-
-    ONE GitHub comment is not one finding. CodeRabbit bundles several into a
-    single inline comment, separated by a markdown rule, when they land near
-    each other in the diff. Reading only the first is the ORIGINAL BUG of this
-    feature reincarnated one level down — read, then silently dropped.
-
-    MEASURED on live PR #1647, comment id 3925021846: one comment carrying two
-    distinct Major findings. Before this split, `_cr_severity` returned the
-    first and the second existed nowhere in the gate's output. The dangerous
-    ordering is Minor-then-Major: the comment scored as `minor`, landed in the
-    advisory list, and printed "below Major, NOT counted" — a false claim about
-    a Major that was never seen at all.
-
-    A segment carrying no header is folded into the previous one rather than
-    treated as a finding: a rule inside prose is not a finding boundary, and
-    splitting on it would invent findings that do not exist. That fold is not
-    sufficient on its own — it only catches a rule whose following segment has no
-    header, and quoted markdown routinely supplies one. Rules inside fenced or
-    ``<details>`` content are therefore not boundaries at all (see
-    ``_cr_markup_mask``).
-    """
-    lines = body.split("\n")
-    markup = _cr_markup_mask(body)
-    parts: list[str] = []
-    current: list[str] = []
-    for line, is_markup in zip(lines, markup, strict=True):
-        if not is_markup and _CR_FINDING_SPLIT_RE.match(line):
-            parts.append("\n".join(current))
-            current = []
-            continue
-        current.append(line)
-    parts.append("\n".join(current))
-    out: list[str] = []
-    for part in parts:
-        if not part.strip():
-            continue
-        _, header_seen = _cr_severity(part)
-        if header_seen or not out:
-            out.append(part)
-        else:
-            out[-1] = out[-1] + "\n---\n" + part
-    return out or [body]
 
 
 def _coderabbit_title(body: str) -> str:
@@ -5632,7 +5460,16 @@ def _format_rounds(result: dict) -> str:
     if counts:
         trend = result.get("trend")
         mark = {"rising": " (RISING)", "falling": " (falling)", "flat": " (flat)"}.get(trend, "")
-        parts.append("findings per round " + "→".join(str(c) for c in counts) + mark)
+        parts.append("raw findings per round " + "→".join(str(c) for c in counts) + mark)
+    remaining = result.get("remaining_report") or {}
+    if remaining.get("status") == "ok":
+        rows = remaining["rounds"]
+        parts.append("no-defect per round " + "→".join(str(r["no_defect"]) for r in rows))
+        trend = remaining.get("trend")
+        suffix = f" ({trend})" if trend else ""
+        parts.append("remaining findings per round " + "→".join(str(r["remaining_findings"]) for r in rows) + suffix)
+    else:
+        parts.append("remaining findings UNKNOWN (local coverage not validated)")
     legacy = int(result.get("legacy_heads") or 0)
     if legacy:
         parts.append(f"{legacy} head(s) counted by the pre-cutover rule")
@@ -5651,8 +5488,13 @@ def _format_rounds(result: dict) -> str:
     return line
 
 
-def _rounds_row(pr_num: str, repo: str | None = None) -> str:
+def _rounds_row(
+    pr_num: str, repo: str | None = None, budget_out: list[dict] | None = None
+) -> str:
     """The ``rounds`` line of ``--check-pr``: ADVISORY, never a failure.
+
+    ``budget_out``, when given, receives the evaluator's result if it is ``ok``, so
+    the no-change note reads the same budget instead of fetching it a second time.
 
     The round budget is enforced where it acts (the review-request ask above and
     the commit gate); counting it here too would be a second enforcer of one rule.
@@ -5672,7 +5514,462 @@ def _rounds_row(pr_num: str, repo: str | None = None) -> str:
         result = _review_budget.evaluate_pr(target, pr_num, timeout_for=_gh_timeout)
     except Exception:  # noqa: BLE001 - an advisory row never takes the report down.
         return "unreadable (lookup failed)"
+    if result.get("status") == "ok":
+        import review_remaining  # noqa: PLC0415
+
+        result["remaining_report"] = review_remaining.remaining_report(
+            os.getcwd(), target, int(pr_num), result,
+            deadline=time.monotonic() + _gh_timeout(8.0),
+        )
+        if budget_out is not None:
+            budget_out.append(result)
     return _format_rounds(result)
+
+
+#: Each of the delivery row's own GitHub reads. The report arms no merge deadline, so
+#: ``_gh_timeout`` gives the cap itself; 20 s is the PR 3 reader's per-read budget
+#: for a paginated comment list, with headroom.
+_DELIVERY_GH_TIMEOUT_S = 20.0
+
+#: Basis kinds that carry no points of their own to judge a PR against: a ledger row
+#: or follow-up is one sentence, and a claim is the PR's own description.
+_DELIVERY_WEAK_BASIS = {
+    "ledger": "a ledger row",
+    "follow-up": "a follow-up",
+    "claim": "the PR's own claim",
+}
+
+
+def _delivery_self_attestable(files: list[str] | None) -> bool:
+    """Whether a builder's own delivery read may stand on a PR with these files.
+
+    Owner rulings R1 and S8 (2026-11-17): only when every changed file is prose,
+    none lives under ``src/`` or ``.claude/agents/`` (prose there is runtime or agent
+    behaviour), and none is a critical-lane path. The lane counts the enforcement-hook
+    surface as critical too (``classify_lane``'s ``hook_surface``), so prose there is
+    excluded as well. An unreadable or empty list is no."""
+    import review_scope  # noqa: PLC0415 - scripts/ is on sys.path (top of file)
+
+    return bool(files) and all(
+        review_scope._is_lane_prose(p)
+        and not p.startswith(("src/", ".claude/agents/"))
+        and not review_scope._is_lane_critical_path(p)
+        and not _is_hook_surface_path(p)
+        for p in files
+    )
+
+
+def _delivery_row(pr_num: str, repo: str | None, head: str | None) -> str:
+    """The ``delivery`` line of ``--check-pr``: ADVISORY, never a failure.
+
+    It says whether the owner recorded a read of whether the PR delivers what its
+    basis asked (closing-session step 1a), at which head, and what since may have
+    voided it. A block would only prove a sentence exists, so this never touches
+    ``failures``, and the merge arm prints nothing (owner ruling, 2026-11-15).
+    ``_TEST_DELIVERY_ROW`` short-circuits it so report tests make no live call.
+    """
+    seam = os.environ.get("_TEST_DELIVERY_ROW")
+    if seam is not None:
+        return seam
+    if not _scheduled_gate_applies(repo):
+        return "n/a (scoped to the public repo only)"
+    try:
+        text = _delivery_row_text(pr_num, repo, head)
+    except Exception:  # noqa: BLE001 - an advisory row never takes the report down.
+        return "could not check (lookup failed)"
+    # ONE report line, whatever a gh error or a comment carried: a line break here
+    # could print a line of its own, such as a forged `merge-with`. Each part above is
+    # already bounded, so this strips without cutting.
+    return "".join(" " if _gate_text_unsafe(ch) else ch for ch in text)
+
+
+def _delivery_row_text(pr_num: str, repo: str | None, head: str | None) -> str:
+    import delivery_marker as dm  # noqa: PLC0415 - scripts/ is on sys.path (top of file)
+
+    target = repo or _derive_repo_from_cwd(os.getcwd())
+    if not target:
+        return "could not check (no repository)"
+    pr, t = int(pr_num), _gh_timeout(_DELIVERY_GH_TIMEOUT_S)
+    try:
+        comments = dm._comments(target, pr, timeout=t)
+    except dm.Refused as exc:
+        return f"could not check ({_sanitize_gate_text(str(exc))[:200]})"
+    # The other reads each lose only what they carry (S5): an unreadable review list
+    # hides only review-body blocks, which never govern, and an unreadable PR leaves
+    # the basis unchecked. Neither is ever silent.
+    unread = []
+    try:
+        meta = dm._pr(target, pr, timeout=t)
+    except dm.Refused:
+        meta = None
+        unread.append("the PR body: could not check")
+    try:
+        reviews = dm._comments(target, pr, reviews=True, timeout=t)
+    except dm.Refused:
+        reviews = []
+        unread.append("review bodies: could not check")
+    head = head or (meta or {}).get("head")
+    if not head:
+        return "could not check (the PR head is unreadable)"
+    sel = dm.select(comments, reviews, target.split("/")[0].lower(), head)
+    ignored = len(sel["notes"])
+    tail = f" ({ignored} ignored: {_sanitize_gate_text(sel['notes'][0])[:160]})" if ignored else ""
+    tail += "".join(f"; {u}" for u in unread)
+    gov = sel["governing"]
+    if gov is None:
+        bad = [b for b in sel["blocks"] if b["treatment"].startswith("unusable")]
+        if bad:
+            return (
+                "advisory — no usable owner delivery check recorded: "
+                + _sanitize_gate_text(f"comment {bad[-1]['id']}: {bad[-1]['problem']}")[:200]
+                + tail
+            )
+        return (
+            "advisory — no delivery check recorded: read it (closing-session step 1a), then"
+            f" `python3 scripts/delivery_marker.py compose --pr {pr_num} ...`" + tail
+        )
+    f = gov["fields"]
+    verdict, ok = f["verdict"], f["verdict"] == "DELIVERS"
+    if f["head"] == head:
+        lead = f"{verdict} at head"
+    elif _classify_base_advance_delta(
+        f["head"], head, _pr_base_sha(pr_num, repo=target) or "", target
+    ) == "inline":
+        lead = f"{verdict} carried from {f['head'][:12]}: own change unchanged"
+    else:
+        lead = f"check recorded at {f['head'][:12]}; carry unconfirmed: re-read ({verdict} there)"
+        ok = False
+    # The grammar fixes the basis's shape, not its length, and compose derives it from
+    # the PR body: bound it so one pointer line cannot flood the report (GLM, round 1).
+    lead += f", basis {f['basis'][:80]}"
+    # Each extra says whether it voids the read (True: the row cannot be ok) or only
+    # names something (False), so no rule depends on how its text happens to start.
+    extra: list[tuple[str, bool]] = []
+    # Named, not demoted (owner ruling, 2026-11-18): a read against one of these was
+    # judged without an issue's or a spec's points, so its DELIVERS is a weaker claim.
+    weak = _DELIVERY_WEAK_BASIS.get(f["basis"].split(":", 1)[0])
+    if weak:
+        extra.append((f"basis is {weak}, not an issue, spec or plan: a weaker check", False))
+    if f["scope"] != "CLEAN":
+        extra.append((f"scope {f['scope']}", False))
+    if f.get("intended") in ("not-stated", "unsupported"):
+        extra.append((f"intended={f['intended']}", True))
+    if ok and not any(v for _t, v in extra) and f["checker"] == "author-review":
+        if _delivery_self_attestable(_pr_changed_files(pr_num, repo=target)):
+            extra.append(("self-attested", False))
+        else:
+            lead = "the builder's own read: a closing read (checker=other) is owed; " + lead
+            ok = False
+    if verdict != "DELIVERS":
+        body = next((c.get("body") or "" for c in comments if c.get("id") == gov["id"]), "")
+        if m := dm._ASKED_RE.search(body):
+            extra.append(("Asked: " + _sanitize_gate_text(m.group(1))[:160], False))
+    if meta is not None:
+        try:
+            now = dm.basis_from_body(
+                meta.get("body"),
+                linked=lambda: dm.linked_issues(target, pr, timeout=t),
+                repo=target,
+            )
+        except dm.Refused as exc:
+            now, why = None, _sanitize_gate_text(str(exc))[:160]
+        if now is None:
+            extra.append((f"the PR's basis cannot be derived now ({why}): re-read", True))
+        elif now != f["basis"]:
+            extra.append((f"basis changed since the check (now {now[:120]})", True))
+    extra += dm.changes_since(
+        target, pr, f["basis"], f["head"], str(gov["stamp"] or ""), timeout=t
+    )
+    if sel["later_unusable"]:
+        problem = _sanitize_gate_text(sel["later_unusable"][-1]["problem"])[:120]
+        extra.append((f"a later owner block is unusable: '{problem}'", True))
+    if unread or any(voids for _text, voids in extra):
+        ok = False
+    text = lead + "".join(f"; {e}" for e, _voids in extra) + tail
+    return f"ok ({text})" if ok else f"advisory — {text}"
+
+
+#: How far back the no-change note walks over merge commits from the head.
+#: Ten catch-up merges after a review is far past any PR seen here; the walk
+#: stops at the first non-merge commit anyway, so the cap only bounds API calls.
+_NO_CHANGE_MAX_STEPS = 10
+
+#: GitHub's compare endpoint lists at most 300 files. At the cap, files beyond it
+#: are invisible, so a merge cannot be shown to leave the PR's files alone.
+_COMPARE_FILE_CAP = 300
+
+#: Wall-clock bound on the note's own API calls. The report path arms no merge
+#: deadline, so each call gets the full 8s of ``_gh_timeout(8)``; without a bound,
+#: a PR with many pushed-out reviewed heads and a long merge chain could add
+#: minutes to ``--check-pr`` for an advisory line. 30s is about one whole report
+#: (MEASURED: ``--check-pr 4611`` took 29s). No call STARTS after it, and a note is
+#: not returned after it, but the last call may run to its own 8s timeout. Past it
+#: the note gives up silently, which can only drop a note, never print a false one.
+_NO_CHANGE_BUDGET_S = 30.0
+
+
+def _commit_info(sha: str, repo: str | None) -> tuple[str, str, list[str]] | None:
+    """``(full sha, tree, parents)`` of a commit from the commits API, or None.
+
+    The commits API resolves a short sha and a commit force-pushed out of the PR,
+    which the PR's own commit list no longer holds. An id under 7 hex, an
+    ambiguous one or an unknown one is None, as for ``_commit_at_prefix``, whose
+    input rule this shares. Tests inject via ``_TEST_GH_COMMIT_INFO``: a JSON
+    object keyed by the sha as asked, whose value is ``{sha, tree, parents}``; a
+    missing key reads as an API error."""
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{7,40}", sha):
+        return None
+    raw = os.environ.get("_TEST_GH_COMMIT_INFO")
+    if raw is not None:
+        try:
+            got = json.loads(raw).get(sha)
+        except Exception:
+            return None
+    else:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/commits/{sha}",
+                    "--jq",
+                    "{sha: .sha, tree: .commit.tree.sha, parents: [.parents[].sha]}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(8),
+            )
+            if result.returncode != 0:
+                return None
+            got = json.loads(result.stdout)
+        except Exception:
+            return None
+    if not isinstance(got, dict):
+        return None
+    full, tree, parents = got.get("sha"), got.get("tree"), got.get("parents")
+    if not (isinstance(full, str) and re.fullmatch(r"[0-9a-f]{40}", full.lower())):
+        return None
+    if not (isinstance(tree, str) and tree) or not isinstance(parents, list):
+        return None
+    if not all(isinstance(p, str) and p for p in parents):
+        return None
+    return full.lower(), tree, [p.lower() for p in parents]
+
+
+def _compare_row_paths(rows: object) -> set[str] | None:
+    """The paths a compare file list names, or None when it cannot be read whole.
+
+    None for an empty list (``_pr_contribution``'s jq reads a missing ``files``
+    as none, and a merge or reviewed head whose tree changed names at least one
+    file), for a row that is not an object, for a ``filename`` that is not a
+    non-empty string, and for a ``previous_filename`` that is present and not
+    one. The same rule as ``_pr_changed_files_uncached``. The note treats None as
+    unreadable, so a missing field can never read as "this merge touched
+    nothing"."""
+    if not isinstance(rows, list) or not rows:
+        return None
+    out: set[str] = set()
+    for f in rows:
+        if not isinstance(f, dict):
+            return None
+        name, prev = f.get("filename"), f.get("previous_filename")
+        if not (isinstance(name, str) and name):
+            return None
+        if prev is not None and not (isinstance(prev, str) and prev):
+            return None
+        out.add(name)
+        if prev:
+            out.add(prev)
+    return out
+
+
+def _stepped_merges_spare_review(
+    pr_num: str,
+    repo: str | None,
+    reviewed_sha: str,
+    stepped: set[str],
+    clock: Callable[[], float],
+    stop_at: float,
+) -> bool:
+    """Whether the merges ``_no_change_note`` stepped over touched none of the
+    files the reviewed head itself changed. False whenever that cannot be
+    shown: the base tip or the contribution unreadable (an empty or malformed
+    file list included, ``_compare_row_paths``), GitHub's 300-file cap, or the
+    note's time bound spent."""
+    if clock() > stop_at:
+        return False
+    base = _pr_base_sha(pr_num, repo)
+    if not base or clock() > stop_at:
+        return False
+    reviewed = _pr_contribution(base, reviewed_sha, repo)
+    if reviewed is None or len(reviewed[2]) >= _COMPARE_FILE_CAP:
+        return False
+    names = _compare_row_paths(reviewed[2])
+    if names is None:
+        return False
+    return not (stepped & names)
+
+
+def _no_change_note(
+    pr_num: str, repo: str | None, budget: dict, *, clock: Callable[[], float] = time.monotonic
+) -> str | None:
+    """A NOTE when the PR's own commits since a review changed no file.
+
+    ADVISORY, and independent of any delivery marker: it exists for the case
+    where nobody has read the PR yet. A contributor can rewrite a reviewed commit
+    with a new message only (or push an empty commit) and then say a finding is
+    fixed; the tree says otherwise.
+
+    Reviewed heads are the budget's marks plus the Codex clean comments on heads
+    no longer in the PR (``unresolved_clean_heads``). The note fires when a
+    commit has the tree of a reviewed head OTHER than itself, reached from the
+    head by stepping back over merge commits along first parents:
+
+    - Every earlier reviewed head counts, not only the newest. With only the
+      newest, one more catch-up merge after a re-review of the rewritten head
+      made that head the reference, the walk reached it, and the note went
+      silent; a late re-review of an older head hid a rewrite the same way.
+    - A reviewed head matching its OWN tree does not count. Stepping back over a
+      routine merge of main reaches the reviewed head after every catch-up, and
+      a merge on top of a reviewed head is not a rewrite.
+    - A merge is stepped over only when it touches none of the PR's current
+      files AND none of the files the reviewed head itself changed. Code added
+      while resolving a merge would otherwise hide behind it, and so would a
+      merge that put a reviewed file back to the base (that file leaves the
+      PR's current list, though the merge changed reviewed code). The reviewed
+      head's contribution is read against the LIVE base tip, so a base
+      retargeted or rewritten after the review is measured against a base the
+      reviewer never saw: an accepted gap.
+    - A review of the current head does not silence it: a clean re-review of an
+      unchanged tree does not make the push claimed as a fix change anything.
+
+    Anything unreadable (the PR's files, a merge's files, a compare at GitHub's
+    300-file cap, a commit on the walk) or the time bound prints nothing. A
+    reviewed head whose tree cannot be read is skipped. Both can only drop a
+    note, never print a false one: a missed note costs nothing a review would
+    not catch, and a false one teaches the reader to skip it."""
+    if not isinstance(budget, dict) or budget.get("status") != "ok":
+        return None
+    head = budget.get("current_head")
+    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+        return None
+    stop_at = clock() + _NO_CHANGE_BUDGET_S
+
+    known: dict[str, tuple[str, list[str]]] = {}
+    for c in budget.get("commits") or []:
+        if not isinstance(c, dict):
+            return None
+        sha, tree, parents = c.get("sha"), c.get("tree"), c.get("parents")
+        if isinstance(sha, str) and isinstance(tree, str) and tree and isinstance(parents, list):
+            known[sha.lower()] = (tree, [str(p).lower() for p in parents])
+
+    def lookup(sha: str) -> tuple[str, str, list[str]] | None:
+        if sha in known:
+            return sha, *known[sha]
+        if clock() > stop_at:
+            return None
+        return _commit_info(sha, repo)
+
+    # tree -> {reviewed full sha: newest review time of that sha}
+    reviewed_trees: dict[str, dict[str, tuple[_dt.datetime, str]]] = {}
+    for row in [*(budget.get("marks") or []), *(budget.get("unresolved_clean_heads") or [])]:
+        if not isinstance(row, dict):
+            return None
+        sha, at = row.get("head"), row.get("at")
+        if not (isinstance(sha, str) and sha and isinstance(at, str) and at):
+            continue  # an untimed (pending) review is not a review of a tree yet
+        sha = sha.lower()
+        if head.startswith(sha):
+            continue  # the head itself: the walk starts there
+        try:
+            when = _dt.datetime.fromisoformat(at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if when.tzinfo is None:
+            return None
+        info = lookup(sha)
+        if info is None:
+            continue
+        full, tree, _ = info
+        prior = reviewed_trees.setdefault(tree, {}).get(full)
+        if prior is None or when > prior[0]:
+            reviewed_trees[tree][full] = (when, at)
+    if not reviewed_trees:
+        return None
+
+    own_files: set[str] | None = None
+    stepped: set[str] = set()  # every file a stepped-over merge touched
+    current = head
+    for _ in range(_NO_CHANGE_MAX_STEPS + 1):
+        info = lookup(current)
+        if info is None:
+            return None
+        _, tree, parents = info
+        others = {s: v for s, v in reviewed_trees.get(tree, {}).items() if s != current}
+        if others:
+            # A merge was stepped over on the strength of ``own_files``, read after
+            # the budget. Only if the head has not moved since does that list
+            # describe the head this note judges; otherwise a push during the
+            # report could add a file the walk never saw.
+            if own_files is not None and (
+                clock() > stop_at or (_pr_head_sha(pr_num, repo) or "").lower() != head
+            ):
+                return None
+            reviewed_sha, (_, reviewed_at) = max(others.items(), key=lambda kv: kv[1][0])
+            if stepped and not _stepped_merges_spare_review(
+                pr_num, repo, reviewed_sha, stepped, clock, stop_at
+            ):
+                return None
+            if clock() > stop_at:
+                return None
+            same = "has" if current == head else f"steps back over merges to {current[:12]}, which has"
+            # After a force-push back to an older reviewed tree, a review made LATER
+            # saw a different tree, and its finding may be answered by dropping that
+            # tree's change. Name it, so the reader does not take the note as the
+            # whole story.
+            matched_when = others[reviewed_sha][0]
+            later = [
+                (when, sha, at)
+                for other_tree, heads in reviewed_trees.items()
+                if other_tree != tree
+                for sha, (when, at) in heads.items()
+                if when > matched_when
+            ]
+            caveat = ""
+            if later:
+                _, later_sha, later_at = max(later)
+                caveat = (
+                    f" A later review, of {later_sha[:12]} at {later_at}, saw a different "
+                    "tree; this push may answer that one."
+                )
+            return (
+                f"NOTE: PR #{pr_num} — head {head[:12]} {same} the same tree as "
+                f"{reviewed_sha[:12]}, reviewed at {reviewed_at}: the PR's own commits "
+                "since that review changed no file. Advisory: a claim that this push "
+                f"fixed a finding is not shown by the code.{caveat}"
+            )
+        if len(parents) < 2:
+            return None  # a non-merge commit with another tree is a real change
+        if own_files is None:
+            # Uncached on purpose: the memo may hold a read made earlier in the
+            # report, against an older head than the budget's.
+            if clock() > stop_at:
+                return None
+            files = _pr_changed_files_uncached(pr_num, repo)
+            if not files:
+                return None  # a PR with a head changes a file: an empty list is unreadable
+            own_files = set(files)
+        if clock() > stop_at:
+            return None
+        merged = _pr_contribution(parents[0], current, repo)
+        if merged is None or len(merged[2]) >= _COMPARE_FILE_CAP:
+            return None
+        paths = _compare_row_paths(merged[2])
+        if paths is None or paths & own_files:
+            return None
+        stepped |= paths
+        current = parents[0]
+    return None
 
 
 def _comment_body(argv: list[str]) -> tuple[str | None, bool]:
@@ -6279,9 +6576,11 @@ _HOOK_SURFACE_FILES = (
             "scripts/review_findings.py",  # reviewer list + severity parsers
             "scripts/review_reflection.py",  # round reflection tool + validator
             "scripts/review_late.py",  # late findings the round reflection owes
+            "scripts/review_past_terminal.py",  # the past-round-4 reflection rules
             "scripts/review_deadline.py",  # aggregate hook timeout arithmetic
             "scripts/external_review.py",  # autonomous review-request boundary
             "scripts/premise_gate.py",  # issue premise rule issue_premise_gate imports
+            "scripts/delivery_marker.py",  # marker parser + select the delivery row imports
             ".claude/settings.json",  # hook wiring (inline blob + matchers)
             # scripts/-root hooks wired via .claude/hooks/genesis-hook (which
             # resolves bare names as scripts/<name>); scripts/hooks/* wirings are
@@ -11401,11 +11700,10 @@ def _rework_blocks(body: str) -> list[tuple[str, object, str]]:
             inline = tokens[i + 1]
             blocks.append(("para", tuple(items), _rework_inline_text(inline)))
             i += 2
-        elif t in ("fence", "code_block", "hr"):
+        elif t in ("fence", "code_block", "hr") or (
+            t == "html_block" and re.sub(r"<!--.*?-->", "", tok.content, flags=re.DOTALL).strip()
+        ):
             blocks.append(("other", tuple(items), ""))
-        elif t == "html_block":
-            if re.sub(r"<!--.*?-->", "", tok.content, flags=re.DOTALL).strip():
-                blocks.append(("other", tuple(items), ""))
         i += 1
     return blocks
 
@@ -15492,7 +15790,20 @@ def _run_merge_and_push_gates() -> int:
         # `_mentions_gated_op` whenever the operation is spelled, which is the
         # honest split: an unreadable program naming a publish is worth
         # refusing, an unreadable program naming nothing is a Tuesday.
-        hidden_gated_verb = any(s.verb_unresolved and s.exe in _GATED_EXES for s in segs)
+        #
+        # A segment whose program word is in `$"..."` locale quoting is the same
+        # fact one word to the left: the parser reports it and names the program
+        # the untranslated reading runs, and when that is git or gh the operation
+        # is as unestablished as a built verb leaves it. A shell handed its script
+        # (or its `-c`) in that quoting is the same fact one level down: the
+        # parser keeps the untranslated script as a candidate and
+        # `locale_candidates` names the dispatchers it mentions. Read per segment
+        # too, so neither can ride a visible push in the same command.
+        hidden_gated_verb = any(
+            (s.verb_unresolved and s.exe in _GATED_EXES)
+            or bool(locale_candidates(s) & _GATED_EXES)
+            for s in segs
+        )
         # A bounds-type blind spot withholds the segments, and this fact with them:
         # MEASURED, a continuation elsewhere in the command changed this guard's
         # verdict on an unresolved verb. Recover the fact from the command itself.
@@ -17590,7 +17901,21 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         _print_gate_detail(msg)
     failures += 1 if blocked else 0
     # Advisory: never touches `failures` (see `_rounds_row`).
-    print(f"rounds         : {_rounds_row(pr_num, repo)}")
+    _budget_seen: list[dict] = []
+    print(f"rounds         : {_rounds_row(pr_num, repo, budget_out=_budget_seen)}")
+    # Advisory too, and printed only when it fires: a push since the last review
+    # that changed no file (see `_no_change_note`). It reuses the budget above.
+    if _budget_seen:
+        try:
+            _note = _no_change_note(pr_num, repo, _budget_seen[0])
+        except Exception:  # noqa: BLE001 - an advisory never takes the report down.
+            _note = None
+        if _note:
+            print(_note)
+    # Advisory: never touches `failures` (see `_delivery_row`). It judges the head the
+    # rounds row read, so the two rows describe one head.
+    _row_head = _budget_seen[0].get("current_head") if _budget_seen else None
+    print(f"delivery       : {_delivery_row(pr_num, repo, _row_head)}")
     # Scheduled Claude review at HEAD — the SAME always-fail-closed gate the merge arm
     # enforces (shared function). A missing/stale/unreadable scheduled review is a
     # FAILURE line, never a false all-clear — the report must not diverge from enforcement.

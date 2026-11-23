@@ -267,6 +267,9 @@ class SentinelResult:
     actions_taken: list[str] = field(default_factory=list)
     proposed_actions: list[dict] = field(default_factory=list)
     resolved: bool = False
+    # Per executed action: command, success, and the head of its stdout/stderr,
+    # so the observation and log say what each action actually did.
+    action_outputs: list[dict] = field(default_factory=list)
     observation_id: str = ""
     reason: str = ""  # Why dispatched or skipped
     duration_s: float = 0.0
@@ -275,6 +278,38 @@ class SentinelResult:
     # trust its self-reported resolution — including the no-action-phrase
     # heuristic in _finalize_dispatch.
     degraded: bool = False
+
+
+def _record_execution(
+    result: SentinelResult, proposed: list[dict], executed: list[dict],
+) -> None:
+    """Record what the approved actions did, and resolve only if ALL succeeded.
+
+    A dispatch used to count as resolved whenever any action ran, whatever its
+    exit code, so a failed or partial fix read as "Sentinel resolved" (#4302).
+    An action that could not even start (OSError) is missing from ``executed``,
+    which also leaves the dispatch unresolved. Every call site runs this
+    whatever ``executed`` holds, so an empty one (nothing started, or the
+    owner rejected) clears any ``resolved`` the result carried in; the
+    session's own ``actions_taken`` is kept when no approved action ran.
+    """
+    if executed:
+        result.actions_taken = [a["command"] for a in executed]
+        result.action_outputs = [
+            {
+                "command": a["command"],
+                "success": bool(a.get("success")),
+                "stdout": a.get("stdout", ""),
+                "stderr": a.get("stderr", ""),
+            }
+            for a in executed
+        ]
+    wanted = [a for a in proposed if a.get("command")]
+    result.resolved = (
+        bool(wanted)
+        and len(executed) == len(wanted)
+        and all(a.get("success") for a in executed)
+    )
 
 
 def _extract_pattern(request: SentinelRequest) -> str:
@@ -316,6 +351,60 @@ def _triggering_alarm_ids(alarms: Sequence[Mapping[str, Any]], tier: int | None)
         return all_ids
     triggering = {a["alert_id"] for a in entries if a["tier"] <= tier}
     return triggering or all_ids
+
+
+def _alarm_strength(tier: int, severity: str) -> tuple[int, int]:
+    """The classifier's own ordering key (lower is stronger): tier, then
+    CRITICAL before anything else. Dispatch takes the strongest alarm first."""
+    return (tier, 0 if str(severity).upper() == "CRITICAL" else 1)
+
+
+def _warning_park_strength(alarms: Sequence[Mapping[str, Any]], ids: set[str]) -> tuple[int, int] | None:
+    """Strength of the strongest triggering alarm of a park held ONLY by
+    WARNING alarms; None when any trigger is not WARNING or its tier or
+    severity cannot be read (such a park is never taken over). Pure."""
+    best: tuple[int, int] | None = None
+    for a in alarms if isinstance(alarms, (list, tuple)) else ():
+        if not isinstance(a, dict) or a.get("alert_id") not in ids:
+            continue
+        sev, tier = a.get("severity"), a.get("tier")
+        if not isinstance(sev, str) or sev.upper() != "WARNING":
+            return None
+        if isinstance(tier, bool) or not isinstance(tier, int):
+            return None
+        s = _alarm_strength(tier, sev)
+        best = s if best is None or s < best else best
+    return best
+
+
+def _heavy_workload() -> str | None:
+    """The runtime's heavy-workload label (e.g. a dream cycle), or None when
+    there is none or the runtime cannot be read."""
+    try:
+        from genesis.runtime import GenesisRuntime
+        return GenesisRuntime.instance().heavy_workload or None
+    except Exception:
+        return None
+
+
+def _superseding_alarm_ids(
+    park_strength: tuple[int, int] | None,
+    pending_ids: set[str],
+    alarms: Sequence[FireAlarm],
+    recent_sets: Sequence[set[str]],
+) -> set[str]:
+    """Confirmed alarms strictly stronger, by the classifier's ordering, than a
+    WARNING-only park: a CRITICAL of the same tier, or any alarm of a
+    stronger tier. Empty for any other park. Pure; never raises."""
+    if park_strength is None:
+        return set()
+    return {
+        a.alert_id
+        for a in alarms
+        if a.alert_id not in pending_ids
+        and _alarm_strength(a.tier, a.severity) < park_strength
+        and sum(1 for ids in recent_sets if a.alert_id in ids) >= _ALARM_CONFIRMATION_COUNT
+    }
 
 
 class SentinelDispatcher:
@@ -373,6 +462,10 @@ class SentinelDispatcher:
         # of the last _ALARM_RING_SIZE ticks before we even consider
         # dispatching. Prevents single-tick flaps from waking the Sentinel.
         self._recent_alarm_sets: deque[set[str]] = deque(maxlen=_ALARM_RING_SIZE)
+        # Same ticks, the ids whose reading was unknown (health's unknown-id
+        # channel). Never a dispatch trigger; for a pending approval they count
+        # as present, so a blind tick cannot read as "cleared".
+        self._recent_unknown_sets: deque[set[str]] = deque(maxlen=_ALARM_RING_SIZE)
 
         # Load dispatch approval policy — sentinel inherits from the global
         # manual_approval_required setting (no separate sentinel toggle).
@@ -466,14 +559,16 @@ class SentinelDispatcher:
 
         try:
             from genesis.mcp.health_mcp import _impl_health_alerts
-            alerts = await _impl_health_alerts(active_only=True)
+            unknown_ids: set[str] = set()
+            alerts = await _impl_health_alerts(active_only=True, unknown_ids=unknown_ids)
         except Exception:
             logger.warning("Re-verification failed — proceeding with dispatch", exc_info=True)
             return True  # Fail-open
 
         current_alarms = classify_alerts(alerts or [], available_tools())
         current_ids = {a.alert_id for a in current_alarms}
-        overlap = original_ids & current_ids
+        # An alarm whose reading is unknown this tick has not cleared.
+        overlap = original_ids & (current_ids | unknown_ids)
 
         if overlap:
             logger.info(
@@ -570,40 +665,10 @@ class SentinelDispatcher:
                 reason=f"Sentinel awaiting approval ({self._state.pending_policy_id})",
             )
 
-        # Gate 2.5: Heavy workload — defer restart-type remediation while
-        # a long-running batch job (e.g. dream cycle) is in progress.
-        try:
-            from genesis.runtime import GenesisRuntime
-            wl = GenesisRuntime.instance().heavy_workload
-            if wl:
-                return SentinelResult(
-                    dispatched=False,
-                    reason=f"Heavy workload active ({wl}) — deferring dispatch",
-                )
-        except Exception:
-            pass
-
-        # Gate 3: Concurrent limit
-        if self._active_session_id is not None:
-            return SentinelResult(
-                dispatched=False,
-                reason=f"Sentinel session already active: {self._active_session_id}",
-            )
-
-        # Gate 3: Per-pattern backoff (replaces both global cooldown and
-        # daily budget). If the pattern has burned through its attempts,
-        # escalate to the user and suppress further auto-dispatch.
         pattern = _extract_pattern(request)
-        ready, reason = self._backoff_ready(pattern)
-        if not ready:
-            return SentinelResult(dispatched=False, reason=reason)
-
-        # Gate 4: CC infrastructure
-        if self._invoker is None or self._session_manager is None:
-            return SentinelResult(
-                dispatched=False,
-                reason="CC invoker or session manager not available",
-            )
+        blocked = self._post_park_gate(pattern)
+        if blocked is not None:
+            return SentinelResult(dispatched=False, reason=blocked)
 
         # Passed all gates — check if this attempt crosses the escalation
         # threshold. If so, post an escalation message instead of dispatching
@@ -616,6 +681,43 @@ class SentinelDispatcher:
         self._pattern_attempts.setdefault(pattern, []).append(time.monotonic())
 
         return await self._execute_dispatch(request, pattern=pattern)
+
+    def _post_park_gate(self, pattern: str) -> str | None:
+        """Why a dispatch for ``pattern`` would be refused after the park gate,
+        or None when it would pass. One home for these gates, so the take-over
+        in check_fire_alarms predicts exactly what _gated_dispatch does."""
+        # Gate 2.5: Heavy workload — defer restart-type remediation while
+        # a long-running batch job (e.g. dream cycle) is in progress.
+        wl = _heavy_workload()
+        if wl:
+            return f"Heavy workload active ({wl}) — deferring dispatch"
+        # Gate 3: Concurrent limit
+        if self._active_session_id is not None:
+            return f"Sentinel session already active: {self._active_session_id}"
+        # Gate 3: Per-pattern backoff (replaces both global cooldown and
+        # daily budget). If the pattern has burned through its attempts,
+        # escalate to the user and suppress further auto-dispatch.
+        ready, reason = self._backoff_ready(pattern)
+        if not ready:
+            return reason
+        # Gate 4: CC infrastructure
+        if self._invoker is None or self._session_manager is None:
+            return "CC invoker or session manager not available"
+        return None
+
+    def _dispatch_order(self, alarms: list[FireAlarm]) -> list[FireAlarm]:
+        """Confirmed alarms in the order dispatch reads them: strongest first,
+        and among equally strong ones, those whose pattern may dispatch before
+        those in backoff or declined. dispatch() keys every gate on the first
+        alarm, so a declined warning listed first would otherwise hide an
+        eligible one of the same strength behind it. Stable otherwise."""
+        return sorted(
+            alarms,
+            key=lambda a: (_alarm_strength(a.tier, a.severity), not self._backoff_ready(a.alert_id)[0]),
+        )
+
+    def _would_escalate(self, pattern: str) -> bool:
+        return len(self._pattern_attempts.get(pattern, [])) + 1 >= _ESCALATE_AT_ATTEMPT
 
     async def _execute_dispatch(
         self, request: SentinelRequest, *, pattern: str = "",
@@ -864,9 +966,7 @@ class SentinelDispatcher:
                 # Legacy blocking path
                 try:
                     executed = await self._approve_and_execute_actions(result)
-                    if executed:
-                        result.resolved = True
-                        result.actions_taken = [a["command"] for a in executed]
+                    _record_execution(result, result.proposed_actions, executed)
                 except Exception:
                     logger.error("Sentinel action approval/execution failed", exc_info=True)
 
@@ -874,9 +974,7 @@ class SentinelDispatcher:
             if self._approval_gate is not None and result.proposed_actions and not result.resolved:
                 try:
                     executed = await self._execute_approved_actions(result.proposed_actions)
-                    if executed:
-                        result.resolved = True
-                        result.actions_taken = [a["command"] for a in executed]
+                    _record_execution(result, result.proposed_actions, executed)
                 except Exception:
                     logger.error("Sentinel action execution failed", exc_info=True)
 
@@ -1099,6 +1197,7 @@ class SentinelDispatcher:
             "resolved": result.resolved,
             "diagnosis": result.diagnosis[:200] if result.diagnosis else "",
             "actions_taken": result.actions_taken,
+            "action_outputs": result.action_outputs,
             "duration_s": round(duration, 1),
             "session_id": result.session_id,
         })
@@ -1110,12 +1209,19 @@ class SentinelDispatcher:
             except Exception:
                 logger.error("Failed to create sentinel observation", exc_info=True)
 
-        # Emit completion event
+        # Emit completion event. When actions ran, say how many succeeded:
+        # a failed fix must not read like a clean one.
+        failed = [a for a in result.action_outputs if not a["success"]]
+        outcome = (
+            f" — actions: {len(result.action_outputs) - len(failed)} of "
+            f"{len(result.action_outputs)} succeeded"
+            if result.action_outputs else ""
+        )
         await self._emit_event(
             "INFO" if result.resolved else "WARNING",
             "sentinel.completed",
             f"Sentinel {'resolved' if result.resolved else 'escalated'}: "
-            f"{result.diagnosis[:100] if result.diagnosis else 'no diagnosis'}",
+            f"{result.diagnosis[:100] if result.diagnosis else 'no diagnosis'}{outcome}",
         )
 
         return result
@@ -1257,9 +1363,7 @@ class SentinelDispatcher:
                 # Execute the approved actions
                 try:
                     executed = await self._execute_approved_actions(cc_result.proposed_actions)
-                    if executed:
-                        cc_result.resolved = True
-                        cc_result.actions_taken = [a["command"] for a in executed]
+                    _record_execution(cc_result, cc_result.proposed_actions, executed)
                 except Exception:
                     logger.error("Sentinel action execution failed on resume", exc_info=True)
                 return await self._finalize_dispatch(request, cc_result, pattern=pattern)
@@ -1674,6 +1778,13 @@ class SentinelDispatcher:
             resolved = False
             actions_taken = []
 
+        # SENTINEL.md: resolved=true means no action is needed. A session that
+        # also proposes actions is not trusted on that half: whether the
+        # dispatch resolved comes only from the approved actions' outcome
+        # (_record_execution), so the gated path runs them too.
+        if proposed_actions:
+            resolved = False
+
         # Fallback: use the full text as diagnosis
         if not diagnosis and text:
             diagnosis = text[:500]
@@ -1820,6 +1931,7 @@ class SentinelDispatcher:
             "tier": request.tier,
             "diagnosis": result.diagnosis[:500] if result.diagnosis else "",
             "actions_taken": result.actions_taken,
+            "action_outputs": result.action_outputs,
             "resolved": result.resolved,
             "duration_s": round(result.duration_s, 1),
             "session_id": result.session_id,
@@ -2003,7 +2115,8 @@ class SentinelDispatcher:
 
         try:
             from genesis.mcp.health_mcp import _impl_health_alerts
-            alerts = await _impl_health_alerts(active_only=True)
+            unknown_ids: set[str] = set()
+            alerts = await _impl_health_alerts(active_only=True, unknown_ids=unknown_ids)
         except Exception:
             logger.debug("Failed to query health alerts for fire alarm check", exc_info=True)
             return None
@@ -2020,6 +2133,7 @@ class SentinelDispatcher:
         # Update the ring buffer with this tick's alarm ids (always — even
         # if empty, an empty set is data that confirms absence).
         self._recent_alarm_sets.append(current_ids)
+        self._recent_unknown_sets.append(set(unknown_ids))
 
         # Lock-starvation guard. dispatch() and resume_from_approval() hold
         # self._lock for the whole of an ACTIVE CC remediation (up to timeout_s,
@@ -2054,11 +2168,13 @@ class SentinelDispatcher:
             SentinelState.AWAITING_ACTION_APPROVAL,
         ):
             pending_ids = set()
+            park_strength: tuple[int, int] | None = None
             if self._state.pending_request_json:
                 try:
                     import json
                     req = json.loads(self._state.pending_request_json)
                     pending_ids = _triggering_alarm_ids(req.get("alarms", []) or [], req.get("tier"))
+                    park_strength = _warning_park_strength(req.get("alarms", []) or [], pending_ids)
                 except (json.JSONDecodeError, TypeError, AttributeError):
                     pass
             # Fall back to pending_pattern (single alarm ID) if no list
@@ -2073,16 +2189,21 @@ class SentinelDispatcher:
             alarm_backed = bool(pending_ids) and not pattern.startswith("direct:")
 
             request_id = self._state.pending_request_id
-            absent = bool(pending_ids) and not (pending_ids & current_ids)
+            # An unknown reading is not an absence: it must reach the branch
+            # below, where a stronger alarm can still take the park over.
+            absent = bool(pending_ids) and not (pending_ids & (current_ids | unknown_ids))
             # Clear-side hysteresis, derived rather than counted: the ring buffer
             # already holds this and the previous ticks' alarm ids (appended above,
             # including on lock-busy ticks). An empty or short ring (e.g. just
             # after a restart) keeps the park, so a restart can only delay a
             # cancel, never cause an early one.
             recent = list(self._recent_alarm_sets)[-_ALARM_CLEAR_TICKS:]
+            recent_unknown = list(self._recent_unknown_sets)[-len(recent):] if recent else []
+            # Both rings grow on the same ticks; aligned from the newest end.
+            recent_unknown = [set()] * (len(recent) - len(recent_unknown)) + recent_unknown
             cleared = (
                 len(recent) == _ALARM_CLEAR_TICKS
-                and all(not (pending_ids & ids) for ids in recent)
+                and all(not (pending_ids & (ids | unknown)) for ids, unknown in zip(recent, recent_unknown, strict=True))
             )
             if absent and alarm_backed and not cleared:
                 logger.info(
@@ -2117,6 +2238,92 @@ class SentinelDispatcher:
                     f"awaiting approval — park cancelled, back to HEALTHY",
                 )
                 return None
+            else:
+                # A park held only by WARNING alarms must not stand in front of a
+                # CRITICAL or tier-1 one: Gate 2 refuses every dispatch while
+                # parked and Sentinel approvals never expire, so an unanswered
+                # warning-level proposal (infra:codex_mcp_held, which does not
+                # clear by itself) would leave a later outage unanswered. Owner
+                # ruling 2026-11-14: the stronger alarm takes over. "Stronger" is
+                # the classifier's own order (tier, then CRITICAL first). A park
+                # with any CRITICAL trigger, or whose tiers or severities cannot
+                # be read, is never taken over.
+                challengers = _superseding_alarm_ids(
+                    park_strength, pending_ids, alarms, self._recent_alarm_sets,
+                )
+                # Cancel only when the dispatch that follows would go through:
+                # dispatch() keys its backoff on the FIRST confirmed alarm, so
+                # that alarm must be a challenger, must not be the pattern being
+                # cancelled (it gets a cooldown below), and must pass backoff
+                # itself. Otherwise the owner's request is cancelled for nothing.
+                confirmed_now = self._dispatch_order([
+                    a for a in alarms
+                    if sum(1 for s in self._recent_alarm_sets if a.alert_id in s)
+                    >= _ALARM_CONFIRMATION_COUNT
+                ])
+                head = confirmed_now[0].alert_id if confirmed_now else None
+                # It must also clear every gate _gated_dispatch applies (the boot
+                # grace, then the post-park gates) and reach a real dispatch, not
+                # an escalation: otherwise the owner's request is cancelled and
+                # nothing dispatched in its place. Accepted residual: this is a
+                # prediction made before the awaits below, so a gate that flips
+                # during them (a heavy workload starting) can still defer the
+                # dispatch; the stronger alarm then dispatches on a later tick,
+                # and the warning pattern may ask again after its cooldown.
+                if (
+                    head not in challengers
+                    or head == pattern
+                    or self._state.in_bootstrap_grace()
+                    or self._post_park_gate(head) is not None
+                    or self._would_escalate(head)
+                ):
+                    challengers = set()
+                # Without a row to cancel, clearing the park would forget an
+                # approval the owner can still answer: never take over then.
+                if not request_id or self._approval_gate is None:
+                    challengers = set()
+                cancelled = True
+                if challengers and request_id and self._approval_gate is not None:
+                    try:
+                        cancelled = await self._approval_gate.resolve_request(
+                            request_id, decision="cancelled", resolved_by="superseded",
+                        )
+                    except Exception:
+                        cancelled = False
+                        logger.warning("Failed to cancel sentinel approval %s", request_id, exc_info=True)
+                if challengers and not cancelled:
+                    # The row is no longer pending (most likely the owner just
+                    # answered it): keep the park so the approval-resolution
+                    # path converges on the real answer instead of dropping it.
+                    logger.info(
+                        "Could not cancel sentinel approval %s for %s; keeping the park",
+                        request_id, sorted(challengers),
+                    )
+                elif challengers:
+                    # The warning-level pattern waits the resolved-dispatch
+                    # cooldown before it may ask again, so a take-over cannot
+                    # turn into a cancel-and-re-ask loop.
+                    if alarm_backed and pattern:
+                        self._resolved_cooldowns[pattern] = time.monotonic()
+                    logger.info(
+                        "Alarms %s supersede the warning-only park %s (%s) — cancelling it",
+                        sorted(challengers), request_id, sorted(pending_ids),
+                    )
+                    async with self._lock:
+                        # Clear only the park that was cancelled: another path
+                        # may have resolved it while the cancel was awaited.
+                        if self._state.pending_request_id == request_id:
+                            self._state.clear_pending()
+                            self._state.transition(
+                                SentinelState.HEALTHY,
+                                reason=f"warning-only park superseded by {sorted(challengers)}",
+                            )
+                            save_state(self._state)
+                    await self._emit_event(
+                        "INFO", "sentinel.approval_superseded",
+                        f"Pending warning-only approval for {sorted(pending_ids)} cancelled: "
+                        f"{sorted(challengers)} takes over",
+                    )
 
         if not alarms:
             return None
@@ -2135,7 +2342,7 @@ class SentinelDispatcher:
             )
             return None
 
-        confirmed_alarms = [a for a in alarms if a.alert_id in confirmed_ids]
+        confirmed_alarms = self._dispatch_order([a for a in alarms if a.alert_id in confirmed_ids])
         tier = worst_tier(confirmed_alarms)
 
         # Tier 3 alarms are handled by reflexes only — don't wake the Sentinel

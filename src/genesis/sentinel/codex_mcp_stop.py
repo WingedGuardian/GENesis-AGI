@@ -1,0 +1,654 @@
+"""Stop the MCP servers a shared Codex app-server daemon is holding (#4302).
+
+Codex threads that run on the shared app-server daemon (the path editor
+clients such as the VS Code extension use) each start a full set of stdio
+MCP servers, and finished subagent threads can keep those sets alive for
+hours (upstream openai/codex#38247, #56937, #25015). On Codex 0.166 a
+terminal ``codex`` TUI ran embedded, with its own MCP children. On 0.169 it
+uses the daemon too, and its subagents leave a set each: 44 of 45 new
+threads in one day were subagents of long-running TUI sessions (measured on a
+live install, 2026-11-15). This tool is the Sentinel's deterministic remedy
+for that build-up under ``infra:codex_mcp_held`` and
+``infra:container_memory_high``.
+
+DRY-RUN BY DEFAULT. It signals only with ``--execute``, which only the action
+the owner approves is meant to carry, so a session that drops a flag kills
+nothing. That boundary is the Sentinel prompt's rule, NOT an enforcement: the
+dispatched session runs with full Bash as the same user and could run
+``--execute`` (or ``kill``) itself. The tool adds no capability that session
+lacks; it makes the approved remedy deterministic and current.
+
+Targets are resolved when the tool RUNS, never frozen into the approval, so a
+proposal approved hours later cannot signal a reused pid. A target is a
+process that is ALL of:
+
+- a direct child of a ``codex app-server --listen ...`` process (the shared
+  daemon; a plugin broker's stdio ``codex app-server`` has no ``--listen``);
+- the leader of its own process group (Codex spawns every stdio MCP server
+  with ``ProcessMode::NewGroup``, rmcp-client ``stdio_server_launcher.rs``);
+- talking to that app-server over the MCP stdio transport: it reads a pipe the
+  app-server writes and writes a pipe the app-server reads, on any descriptor,
+  and no other child of the app-server holds either pipe (the MCP Python SDK
+  moves the stream off fd 0 and 1, so stdin alone is no test; a chat command
+  Codex starts in pipe mode, stdin /dev/null, has no request pipe);
+- not a Codex binary (``~/.codex/`` helpers such as code-mode);
+- not under a ``claude`` process and not in a systemd ``.service`` unit.
+
+Anything the tool cannot read is SKIPPED and counted, never signalled. Each
+group gets SIGTERM, then SIGKILL if any member is left after the grace period
+(Codex's own unload uses the same order). Live Codex threads on that daemon
+lose those servers until they are reopened: Codex does not respawn a killed
+stdio server.
+
+Exit codes: 0 everything targeted is gone (or nothing to do), 3 partial: a
+signal was refused, a candidate could not be read, or ``/proc`` could not be
+listed, 4 the lever is ``off`` (dry-run and ``--execute`` alike, so a session
+that only runs the dry-run sees it). Nothing the tool cannot read ever counts
+as done.
+
+Lever: ``codex_mcp_stop.mode`` in ``config/sentinel.yaml`` (+ the
+``sentinel.local.yaml`` overlay): ``propose_only`` (default) or ``off``. An
+unknown value reads as ``off``. ``GENESIS_CODEX_MCP_STOP_DISABLED=1`` is the
+env kill switch. A present section with no valid ``mode`` reads as ``off``; an
+absent section is the shipped default, ``propose_only``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import signal
+import sys
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from genesis.util import proc_io
+
+logger = logging.getLogger(__name__)
+
+MODE_PROPOSE_ONLY = "propose_only"
+MODE_OFF = "off"
+_ENV_KILL_SWITCH = "GENESIS_CODEX_MCP_STOP_DISABLED"
+_CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "sentinel.yaml"
+
+#: SIGTERM -> SIGKILL grace. Codex's own unload waits 2 s; 5 s leaves margin
+#: for a Python server's shutdown hooks.
+TERM_GRACE_S = 5.0
+
+#: `codex app-server <sub>` subcommands that are NOT the server itself.
+_NON_SERVER_SUBCOMMANDS = frozenset(
+    {
+        "daemon",
+        "proxy",
+        "generate-ts",
+        "generate-json-schema",
+        "help",
+    }
+)
+
+EXIT_OK = 0
+EXIT_PARTIAL = 3
+EXIT_DISABLED = 4
+
+
+@dataclass
+class Group:
+    """One MCP-server process group under the app-server."""
+
+    pgid: int
+    starttime: int
+    cmd: str
+    members: list[int] = field(default_factory=list)
+    rss_kb: int = 0
+
+
+@dataclass
+class Scan:
+    app_servers: list[int] = field(default_factory=list)
+    groups: list[Group] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)  # unreadable or excluded, with why
+    # Candidates that could not be classified: a structured list, never a
+    # substring of the free-text reasons (a process could be named "unreadable").
+    uncertain: list[str] = field(default_factory=list)
+
+    def unreadable(self, entry: str) -> None:
+        self.skipped.append(entry)
+        self.uncertain.append(entry)
+
+
+def load_mode(path: Path | None = None) -> str:
+    """The lever, re-read on every call. Unknown or unreadable reads as ``off``."""
+    if os.environ.get(_ENV_KILL_SWITCH) == "1":
+        return MODE_OFF
+    cfg_path = path or _CONFIG_PATH
+    try:
+        import yaml
+
+        from genesis._config_overlay import merge_local_overlay
+
+        raw = yaml.safe_load(cfg_path.read_text()) if cfg_path.exists() else {}
+        # strict: a broken owner overlay raises into the handler below (off),
+        # instead of falling back to the shipped propose_only.
+        raw = merge_local_overlay(raw or {}, cfg_path, strict=True)
+    except Exception as exc:
+        # The health alarm reads this on every computation (several per tick):
+        # warn once per distinct failure, not on every read.
+        key = f"mode:{cfg_path}:{type(exc).__name__}:{exc}"
+        if key not in _WARNED_ONCE:
+            _WARNED_ONCE.add(key)
+            logger.warning("Failed to load %s; codex_mcp_stop is off", cfg_path, exc_info=True)
+        return MODE_OFF
+    if not isinstance(raw, dict):
+        return MODE_OFF
+    if "codex_mcp_stop" not in raw:
+        return MODE_PROPOSE_ONLY  # shipped default when the key is absent
+    # Present but null (an overlay that left `codex_mcp_stop:` with its mode
+    # commented out) is a present section with no valid mode: off.
+    section = raw["codex_mcp_stop"]
+    mode = section.get("mode") if isinstance(section, dict) else None
+    return mode if mode in (MODE_PROPOSE_ONLY, MODE_OFF) else MODE_OFF
+
+
+DEFAULT_PROPOSE_AT_MB = 4096
+
+
+def load_propose_at_mb(path: Path | None = None) -> int | None:
+    """MB of held MCP groups at which the health alarm ``infra:codex_mcp_held``
+    fires so the Sentinel proposes this tool early; None turns the alarm off.
+
+    Absent key: the shipped default. A value that is not a positive integer, or
+    a config that cannot be read, logs and reads as None: no early alarm, which
+    leaves the container-memory alarm as the only route, as before.
+    """
+    cfg_path = path or _CONFIG_PATH
+    try:
+        import yaml
+
+        from genesis._config_overlay import merge_local_overlay
+
+        raw = yaml.safe_load(cfg_path.read_text()) if cfg_path.exists() else {}
+        raw = merge_local_overlay(raw or {}, cfg_path, strict=True)
+    except Exception as exc:
+        key = f"load:{cfg_path}:{type(exc).__name__}:{exc}"
+        if key not in _WARNED_ONCE:
+            _WARNED_ONCE.add(key)
+            logger.warning("Failed to load %s; the codex_mcp_held alarm is off", cfg_path, exc_info=True)
+        return None
+    section = raw.get("codex_mcp_stop") if isinstance(raw, dict) else None
+    if not isinstance(section, dict) or "propose_at_mb" not in section:
+        return DEFAULT_PROPOSE_AT_MB
+    value = section["propose_at_mb"]
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        # Read on every health computation (several per tick): warn once per value.
+        if repr(value) not in _WARNED_ONCE:
+            _WARNED_ONCE.add(repr(value))
+            logger.warning("codex_mcp_stop.propose_at_mb=%r is not a positive integer; the alarm is off", value)
+        return None
+    return value
+
+
+_WARNED_ONCE: set[str] = set()
+
+
+def _proc() -> Path:
+    return Path(proc_io._PROC)
+
+
+def _argv(pid: int) -> list[str] | None:
+    try:
+        raw = (_proc() / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return None
+    return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+
+
+def _pgid(pid: int) -> int | None:
+    try:
+        stat = (_proc() / str(pid) / "stat").read_bytes().decode("utf-8", "replace")
+        return int(stat[stat.rindex(")") + 2 :].split()[2])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _pipe_ends(pid: int) -> tuple[set[str], set[str]] | None:
+    """(pipes the process reads, pipes it writes), by pipe identity
+    (``pipe:[inode]``) on ANY descriptor; None when they cannot be read.
+
+    Any descriptor, not just 0 and 1: the MCP Python SDK (mcp>=2.3) moves the
+    protocol stream to private duplicates at startup and points fd 0 at
+    /dev/null and fd 1 at stderr, so a Genesis server's stdin is never the pipe
+    it reads (MEASURED on a live install, 2026-11-14). A descriptor that closes
+    while it is read is skipped; one whose mode cannot be read makes the whole
+    answer None, so a permission problem reads as uncertain, never as "no pipes".
+    """
+    fd_dir = _proc() / str(pid) / "fd"
+    try:
+        names = os.listdir(fd_dir)
+    except FileNotFoundError:
+        return set(), set()  # it exited mid-scan: a gone process holds no pipe
+    except OSError:
+        return None
+    reads: set[str] = set()
+    writes: set[str] = set()
+    for name in names:
+        try:
+            target = os.readlink(fd_dir / name)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        if not target.startswith("pipe:"):
+            continue
+        try:
+            info = (_proc() / str(pid) / "fdinfo" / name).read_text()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        try:
+            flags = next(ln.split()[1] for ln in info.splitlines() if ln.startswith("flags:"))
+            mode = int(flags, 8) & os.O_ACCMODE
+        except (StopIteration, ValueError, IndexError):
+            return None  # no flags line, or one that does not parse: uncertain
+        if mode in (os.O_RDONLY, os.O_RDWR):
+            reads.add(target)
+        if mode in (os.O_WRONLY, os.O_RDWR):
+            writes.add(target)
+    return reads, writes
+
+
+_SAFE_LABEL = __import__("re").compile(r"[^A-Za-z0-9._+-]")
+_INTERPRETER = __import__("re").compile(r"(?:node|nodejs|bun|deno|python(?:\d+(?:\.\d+)?)?)")
+_SCRIPT_EXTENSIONS = (".js", ".mjs", ".cjs", ".ts", ".mts", ".py")
+
+
+def _safe_label(argv: list[str]) -> str:
+    """Program basename, plus the script basename after a known interpreter.
+
+    The dry-run output is read by the Sentinel LLM and lands in its transcript,
+    so raw argv (attacker-influenced text from third-party MCP configs, and
+    often --token/--api-key values) is never printed. No other argument is
+    judged by its shape: an option value or a bare positional argument can be
+    a credential whatever it looks like, so a script name prints only when
+    argv[0] is an interpreter and the argument ends in a script extension.
+    """
+    if not argv:
+        return "?"
+    program = os.path.basename(argv[0])
+    parts = [program]
+    if _INTERPRETER.fullmatch(program):
+        script = next(
+            (a for a in argv[1:4] if not a.startswith("-") and a.endswith(_SCRIPT_EXTENSIONS)),
+            None,
+        )
+        if script:
+            parts.append(os.path.basename(script))
+    return " ".join(_SAFE_LABEL.sub("_", x)[:40] for x in parts)
+
+
+def _same_uid(pid: int) -> bool | None:
+    try:
+        return (_proc() / str(pid)).stat().st_uid == os.geteuid()
+    except OSError:
+        return None
+
+
+def _all_pids() -> list[int]:
+    """Every pid in ``/proc``. Raises ``OSError`` when it cannot be listed: an
+    empty list would read as "no app-server" in the scan and as "every group
+    gone" after a stop."""
+    return [int(p.name) for p in _proc().iterdir() if p.name.isdigit()]
+
+
+def _is_daemon_app_server(argv: list[str]) -> bool:
+    if len(argv) < 2 or os.path.basename(argv[0]) != "codex" or argv[1] != "app-server":
+        return False
+    if len(argv) > 2 and argv[2] in _NON_SERVER_SUBCOMMANDS:
+        return False
+    # The live daemon runs as `codex app-server --listen unix` (MEASURED on a
+    # live install, 0.167.0). Accept `--listen=<v>` too; stdio and off are not
+    # a shared daemon.
+    rest = argv[2:]
+    for i, a in enumerate(rest):
+        if a == "--listen":
+            value = rest[i + 1] if i + 1 < len(rest) else ""
+        elif a.startswith("--listen="):
+            value = a.split("=", 1)[1]
+        else:
+            continue
+        return value not in ("", "off") and not value.startswith("stdio")
+    return False
+
+
+def _exited(stat) -> bool:
+    """A zombie whose only thread has exited (state Z, one thread)."""
+    return stat[1] == "Z" and stat[3] <= 1
+
+
+def scan() -> Scan:
+    """Read ``/proc`` and classify every child of a shared Codex app-server."""
+    result = Scan()
+    stats = {}
+    for pid in _all_pids():
+        st = proc_io.probe_stat(pid)
+        if st == proc_io.GONE:
+            continue  # exited mid-scan: holds nothing
+        if st == proc_io.UNREADABLE:
+            # Its parent cannot be read, so it may be an app-server child (or
+            # one itself): the scan cannot call itself complete.
+            result.unreadable(f"{pid} (stat unreadable)")
+            continue
+        stats[pid] = (st.comm, st.state, st.ppid, st.threads, st.starttime)
+    for pid in sorted(stats):
+        argv = _argv(pid)
+        if argv and _is_daemon_app_server(argv):
+            result.app_servers.append(pid)
+    homes = {Path.home() / ".codex"}
+    if os.environ.get("CODEX_HOME"):
+        homes.add(Path(os.environ["CODEX_HOME"]))
+    codex_homes = tuple(os.path.realpath(h) + os.sep for h in homes)
+    by_pgid: dict[int, list[int]] = {}
+    for pid in stats:
+        pg = _pgid(pid)
+        if pg is not None:
+            by_pgid.setdefault(pg, []).append(pid)
+
+    for app in result.app_servers:
+        app_pgid = _pgid(app)
+        if app_pgid is None:
+            # Without it the same-group exclusion below cannot be applied.
+            result.unreadable(f"app-server {app} (process group unreadable)")
+            continue
+        app_ends = _pipe_ends(app)
+        if app_ends is None:
+            # Without its pipe ends no child can be shown to talk to it.
+            result.unreadable(f"app-server {app} (descriptors unreadable)")
+            continue
+        app_reads, app_writes = app_ends
+        children = sorted(pid for pid, s in stats.items() if s[2] == app)
+        # A zombie with one thread has exited: it holds no descriptors, and
+        # /proc refuses its fd directory even to its own user (EACCES,
+        # MEASURED), which would otherwise read as an unreadable sibling and
+        # blind the whole daemon. A killed MCP server stays one until Codex
+        # reaps it. A Z with more threads is a process whose main thread exited
+        # while others still run (and may hold pipes): that one stays unreadable.
+        child_ends = {
+            pid: (set(), set()) if _exited(stats[pid]) else _pipe_ends(pid) for pid in children
+        }
+        # How many direct children hold each pipe the app-server also holds. A
+        # server's own request and reply pipes are held by it alone; a pipe
+        # end that leaked into another child (an inherited descriptor) is
+        # shared, and sharing one proves nothing about the child holding it.
+        # A child whose descriptors cannot be read might share any pipe, so
+        # while one exists no sibling's pipes can be shown exclusive: every
+        # candidate under this app-server is then uncertain, never a target.
+        blind_siblings = sorted(pid for pid, ends in child_ends.items() if ends is None)
+        holders: dict[str, int] = {}
+        for ends in child_ends.values():
+            for p in (ends[0] | ends[1]) if ends else ():
+                holders[p] = holders.get(p, 0) + 1
+        for pid, (_comm, _state, ppid, _threads, starttime) in sorted(stats.items()):
+            if ppid != app:
+                continue
+            argv = _argv(pid) or []
+            label = f"{pid} {_safe_label(argv)}"
+            if _exited(stats[pid]):
+                result.skipped.append(f"{label} (exited, not yet reaped)")
+                continue
+            pg = _pgid(pid)
+            if pg is None:
+                result.unreadable(f"{label} (process group unreadable)")
+                continue
+            if pg != pid:
+                result.skipped.append(f"{label} (not its own process group)")
+                continue
+            if pg <= 1 or pg == app_pgid:
+                result.skipped.append(f"{label} (unsafe process group {pg})")
+                continue
+            owner = _same_uid(pid)
+            if owner is None:
+                result.unreadable(f"{label} (owner unreadable)")
+                continue
+            if not owner:
+                result.skipped.append(f"{label} (another user's process)")
+                continue
+            try:
+                exe = os.readlink(_proc() / str(pid) / "exe")
+            except OSError:
+                result.unreadable(f"{label} (executable unreadable)")
+                continue
+            if os.path.realpath(exe.removesuffix(" (deleted)")).startswith(codex_homes) or exe.startswith(codex_homes):
+                result.skipped.append(f"{label} (Codex helper)")
+                continue
+            ends = child_ends.get(pid)
+            if ends is None:
+                result.unreadable(f"{label} (descriptors unreadable)")
+                continue
+            if blind_siblings:
+                result.unreadable(
+                    f"{label} (pipe exclusivity unproven: sibling {blind_siblings[0]} descriptors unreadable)"
+                )
+                continue
+            reads, writes = ends
+            # The MCP stdio transport: a request pipe the app-server writes and
+            # this process alone reads, and a reply pipe the other way. A chat
+            # command Codex starts in pipe mode has stdin /dev/null and only
+            # output pipes, so it fails. (A command started with BOTH stdin and
+            # stdout piped would pass, as it did under the old fd 0/1 test.)
+            request = {p for p in reads & app_writes if holders.get(p) == 1}
+            reply = {p for p in writes & app_reads if holders.get(p) == 1}
+            if not (request and reply):
+                result.skipped.append(f"{label} (no request and reply pipes with the app-server: not an MCP server)")
+                continue
+            if proc_io.claude_ancestor(pid) is not None:
+                result.skipped.append(f"{label} (under a Claude Code session)")
+                continue
+            unit = proc_io.systemd_unit(pid)
+            if unit is None:
+                result.unreadable(f"{label} (cgroup unreadable)")
+                continue
+            if unit.endswith(".service"):
+                # A same-user process can name a transient unit anything, and this
+                # text reaches the Sentinel's transcript: print it sanitised.
+                result.skipped.append(f"{label} (systemd unit {_SAFE_LABEL.sub('_', unit)[:60]})")
+                continue
+            members = sorted(by_pgid.get(pg, [pid]))
+            rss_kb = 0
+            for m in members:
+                held = proc_io.held_kb(m)
+                if held == proc_io.UNREADABLE:
+                    # The group is still classified, but its figure is now a
+                    # lower bound: the alarm reads unknown below the threshold.
+                    result.unreadable(f"{label} (member {m} memory unreadable)")
+                elif held != proc_io.GONE:
+                    rss_kb += held
+            result.groups.append(
+                Group(
+                    pgid=pg,
+                    starttime=starttime,
+                    cmd=_safe_label(argv),
+                    members=members,
+                    rss_kb=rss_kb,
+                )
+            )
+    return result
+
+
+def _group_exists(pgid: int) -> bool | None:
+    """False when the kernel has no process at all in the group (signal 0
+    finds none, not even a zombie); True when it has one; None when it cannot
+    say (another user's group). A seam: the fake-/proc tests replace it."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    return True
+
+
+def _group_alive(pgid: int) -> bool:
+    """True while any member of the group is still running, or might be.
+
+    A zombie whose every thread has exited holds no memory; it stays listed
+    only until its parent reaps it, so it does not count as alive (MEASURED: a
+    killed child whose parent had not reaped it read as "still alive after
+    SIGKILL"). A zombie LEADER whose other threads run is alive. A pid whose
+    stat cannot be read may be a member that has not stopped, so it counts as
+    alive: the stop then reports the group as not stopped, never as done. A
+    group with no process left at all (not even a zombie) is gone without
+    reading anyone's stat.
+    """
+    if _group_exists(pgid) is False:
+        return False
+    for pid in _all_pids():
+        st = proc_io.probe_stat(pid)
+        if st == proc_io.GONE:
+            continue
+        if st == proc_io.UNREADABLE:
+            return True
+        if st.pgid == pgid and not st.exited:
+            return True
+    return False
+
+
+def stop(
+    groups: list[Group],
+    *,
+    killpg: Callable[[int, int], None] = os.killpg,
+    alive: Callable[[int], bool] = _group_alive,
+    sleep: Callable[[float], None] = time.sleep,
+    grace_s: float = TERM_GRACE_S,
+) -> tuple[list[Group], list[str]]:
+    """SIGTERM each group, then SIGKILL what survives. Returns (stopped, failures)."""
+    failures: list[str] = []
+    signalled: list[Group] = []
+    gone_already: list[Group] = []
+    for g in groups:
+        # Identity check right before signalling: the leader must still be the
+        # process the scan saw (pid + start time), or the pid was reused.
+        if g.pgid <= 1:
+            failures.append(f"{g.pgid}: unsafe process group; skipped")
+            continue
+        now = proc_io.read_starttime(g.pgid)
+        if now is None and not alive(g.pgid):
+            gone_already.append(g)  # exited on its own since the scan: done
+            continue
+        if now != g.starttime:
+            failures.append(f"{g.pgid}: leader changed since the scan; skipped")
+            continue
+        try:
+            killpg(g.pgid, signal.SIGTERM)
+            signalled.append(g)
+        except ProcessLookupError:
+            signalled.append(g)  # already gone
+        except PermissionError as exc:
+            failures.append(f"{g.pgid}: SIGTERM refused ({exc})")
+    deadline = time.monotonic() + grace_s
+    while any(alive(g.pgid) for g in signalled) and time.monotonic() < deadline:
+        sleep(0.2)
+    stopped: list[Group] = []
+    for g in signalled:
+        if alive(g.pgid):
+            now = proc_io.read_starttime(g.pgid)
+            if now is not None and now != g.starttime:
+                failures.append(f"{g.pgid}: leader changed during the grace period; not killed")
+                continue
+            try:
+                killpg(g.pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                failures.append(f"{g.pgid}: SIGKILL refused ({exc})")
+                continue
+            sleep(0.2)
+        if alive(g.pgid):
+            failures.append(f"{g.pgid}: still alive after SIGKILL")
+        else:
+            stopped.append(g)
+    return gone_already + stopped, failures
+
+
+def _app_age(pid: int) -> str:
+    return proc_io.read_proc_start_iso(pid) or "unknown start"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m genesis.sentinel.codex_mcp_stop",
+        description="List (default) or stop the MCP servers held by a shared Codex app-server.",
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Actually signal the listed groups (default: dry-run).",
+    )
+    args = parser.parse_args(argv)
+
+    mode = load_mode()
+    if mode == MODE_OFF:
+        # Dry-run reports it too, so a Sentinel session that only ever runs the
+        # dry-run learns not to propose --execute (exit 4 either way).
+        print("codex_mcp_stop: disabled (codex_mcp_stop.mode is off); nothing signalled")
+        return EXIT_DISABLED
+
+    try:
+        found = scan()
+    except OSError as exc:
+        print(f"codex_mcp_stop: FAILED: /proc could not be listed ({exc}); nothing signalled")
+        return EXIT_PARTIAL
+    total_mb = sum(g.rss_kb for g in found.groups) / 1024
+    if not found.app_servers:
+        print("codex_mcp_stop: no shared Codex app-server running; nothing to stop")
+        return EXIT_OK
+    # The summary comes FIRST: the Sentinel's executor keeps only the head of
+    # an action's stdout, so the listing must never push the answer out.
+    verb = "stopping" if args.execute else "would stop"
+    print(
+        f"codex_mcp_stop: {verb} {len(found.groups)} MCP group(s), "
+        f"{total_mb:.0f} MB RSS; {len(found.skipped)} skipped"
+    )
+    if not args.execute:
+        for app in found.app_servers:
+            print(f"app-server pid {app} (started {_app_age(app)})")
+        for g in found.groups:
+            print(
+                f"  MCP group {g.pgid}: {len(g.members)} process(es), "
+                f"{g.rss_kb / 1024:.0f} MB — {g.cmd}"
+            )
+        for s in found.skipped:
+            print(f"  skipped {s}")
+        return EXIT_OK
+
+    uncertain = found.uncertain
+    if not found.groups and uncertain:
+        # Nothing stopped AND some candidates could not be classified: never
+        # report this as done (the dispatch would read as resolved).
+        print(f"  FAILED: {len(uncertain)} candidate(s) could not be read; nothing stopped")
+        return EXIT_PARTIAL
+    try:
+        stopped, failures = stop(found.groups)
+    except OSError as exc:
+        # The liveness check could not list /proc: what was signalled is unknown.
+        print(f"  FAILED: /proc could not be listed during the stop ({exc}); outcome unknown")
+        return EXIT_PARTIAL
+    freed_mb = sum(g.rss_kb for g in stopped) / 1024
+    print(
+        f"codex_mcp_stop: stopped {len(stopped)} of {len(found.groups)} group(s), "
+        f"~{freed_mb:.0f} MB freed, {len(failures)} failed. Codex threads on this "
+        f"daemon lose these servers until reopened."
+    )
+    for f in failures:
+        print(f"  FAILED {f}")
+    if uncertain:
+        # Readable groups stopped, but these were never classified: they may
+        # still hold the memory, so the dispatch must not read as resolved.
+        print(f"  FAILED: {len(uncertain)} candidate(s) could not be read and were not stopped")
+    return EXIT_OK if not (failures or uncertain) else EXIT_PARTIAL
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -32,6 +32,7 @@ _CONNECTION_PY = Path(__file__).resolve().parents[2] / "src" / "genesis" / "db" 
 _EXPECTED_OPEN_TIME_SITES = {
     "connect_sqlite_rw",
     "_GuardedAiosqliteConnector._open",
+    "connect_aiosqlite_ro",
     "get_db",
     "get_db._reconnect",
     "get_raw_db",

@@ -16,8 +16,12 @@ meaningful tick outreach is up; until then entries are kept and retried.
 from __future__ import annotations
 
 import logging
+import math
 
 logger = logging.getLogger(__name__)
+
+# Every queued alert is delivered under this signal_type (see _send).
+_SIGNAL_TYPE = "queued_alert"
 
 
 def wire(rt) -> None:
@@ -33,6 +37,47 @@ def _make_drainer(rt):
     """Build the async, no-arg drainer bound to ``rt`` (lazy pipeline resolve)."""
     from genesis.guardian.alert import queue as alert_queue
 
+    async def _answered_page_delivered(entry: dict) -> bool | None:
+        """For an entry that answers earlier pages (``meta.answers_pages``, the
+        disk guardian's all-clear): True when one of them was DELIVERED since
+        ``meta.episode_start``, False when none was (or the meta is malformed),
+        None when the database is not up yet.
+
+        Enqueueing a page is not delivering it: delivery can drop it (IGNORED)
+        or deduplicate it against a page from an earlier episode. A clear for a
+        page the owner never got this episode would be the first they heard of
+        it. The pages sit ahead of the clear in this oldest-first queue, and a
+        drain stops at the first entry it keeps, so by the time the clear is
+        reached each page has reached its final status.
+        """
+        meta = entry.get("meta") or {}
+        pages = meta.get("answers_pages")
+        start = meta.get("episode_start")
+        if (
+            not isinstance(pages, list)
+            or not pages
+            or not all(isinstance(p, str) and p for p in pages)
+            or isinstance(start, bool)
+            or not isinstance(start, (int, float))
+            or not math.isfinite(start)
+        ):
+            logger.warning(
+                "alert-queue entry %s has malformed answers meta; dropped unsent",
+                entry.get("dedupe_key"),
+            )
+            return False
+        db = getattr(rt, "_db", None)
+        if db is None:
+            return None
+        from genesis.db.crud import outreach as outreach_crud
+
+        return await outreach_crud.delivered_topic_since(
+            db,
+            signal_type=_SIGNAL_TYPE,
+            topics=[f"alert:{p}" for p in pages],
+            since_epoch=float(start),
+        )
+
     async def _send(entry: dict) -> bool:
         """Deliver one queued entry via outreach. Returns True=terminal (unlink),
         False=transient (keep + stop the drain).
@@ -41,6 +86,18 @@ def _make_drainer(rt):
         if pipeline is None:
             # Outreach not up yet (startup-transient) — keep and retry next tick.
             return False
+
+        if "answers_pages" in (entry.get("meta") or {}):
+            answered = await _answered_page_delivered(entry)
+            if answered is None:
+                return False  # database not up yet: keep and retry next tick
+            if not answered:
+                logger.info(
+                    "all-clear not sent (%s): no page it answers has a delivery "
+                    "recorded since its episode began",
+                    entry.get("dedupe_key"),
+                )
+                return True
 
         from genesis.outreach.types import (
             OutreachCategory,
@@ -67,7 +124,7 @@ def _make_drainer(rt):
                 salience_score=1.0,
                 # Constant signal_type keeps queued replays in their own dedup
                 # namespace (never cross-suppressing a live guardian_alert).
-                signal_type="queued_alert",
+                signal_type=_SIGNAL_TYPE,
                 source_id=identity,
                 # This drain IS the durable retry (14-day file queue, retried
                 # every awareness tick). The pipeline must not ALSO defer a

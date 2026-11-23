@@ -83,6 +83,41 @@ def _mock_autonomous_dispatcher(
 class TestApprovalGatePreCheck:
     """Test the pre-check logic that gates step dispatch on approval state."""
 
+    @pytest.mark.parametrize("mode", ["cli_approved", "api", "pending", "approved", "blocked"])
+    async def test_context_reaches_cli_and_api_without_changing_approval(self, mode, monkeypatch):
+        monkeypatch.setattr("genesis.db.crud.task_steps.update_step", AsyncMock())
+        output = MagicMock(
+            is_error=False, text='{"status":"completed","result":"done"}',
+            cost_usd=0.01, session_id="sess", model_used="sonnet",
+        )
+        pending = {"id": "req-1"} if mode in ("pending", "approved") else None
+        ad = _mock_autonomous_dispatcher(
+            pending=pending, approved={"id": "req-1"} if mode == "approved" else None,
+            route_decision=AutonomousDispatchDecision(
+                mode="cli_approved" if mode in ("pending", "approved") else mode,
+                reason="route decision", output=output if mode == "api" else None,
+            ),
+        )
+        sd = _make_dispatcher(autonomous_dispatcher=ad)
+        sd._invoker.run.return_value = output
+        result = await sd.execute_step(
+            "t-1", _make_step(step_type="research"), [],
+            task_description="Real goal", planned_step_count=3,
+        )
+        if mode == "pending":
+            assert result.status == "blocked"
+            ad.route.assert_not_awaited()
+            sd._invoker.run.assert_not_awaited()
+            return
+        request = ad.route.call_args.args[0]
+        assert request.messages[0]["content"] == request.cli_invocation.prompt
+        assert "## Task\nReal goal\nPlanned step count: 3" in request.messages[0]["content"]
+        if mode in ("api", "blocked"):
+            sd._invoker.run.assert_not_awaited()
+        else:
+            assert sd._invoker.run.call_args.args[0].prompt == request.messages[0]["content"]
+        assert result.status == ("blocked" if mode == "blocked" else "completed")
+
     async def test_pending_no_approval_blocks(self) -> None:
         """When there is a pending request and no approval, step is blocked."""
         pending_row = {"id": "req-1", "status": "pending"}

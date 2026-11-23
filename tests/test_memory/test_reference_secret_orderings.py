@@ -8,6 +8,8 @@ Fake credentials only, never real secrets.
 
 from __future__ import annotations
 
+import json
+
 import aiosqlite
 import pytest
 
@@ -70,8 +72,10 @@ async def test_a_stop_between_the_secret_and_the_body_leaves_no_body_without_its
     credential body without its secret."""
     import asyncio
 
+    # A credential is stored under an opaque key: write to the seeded one.
+    key = "Lab router admin"
     if existing:
-        await _ingest(db, _store(), _body())
+        key = (await kc.get(db, await _ingest(db, _store(), _body())))["concept"]
     new_value = "user: example-admin, password: Next!Fake-4"
 
     class _CancelAt:
@@ -98,7 +102,7 @@ async def test_a_stop_between_the_secret_and_the_body_leaves_no_body_without_its
             project_type="reference",
             domain="reference.credentials",
             source_doc="x",
-            concept="Lab router admin",
+            concept=key,
             body=_body().replace(f"Value: {_VALUE}", f"Value: {kc.SECRET_PLACEHOLDER}"),
             secret_value=new_value,
             _commit=False,
@@ -116,11 +120,11 @@ async def test_a_stop_between_the_secret_and_the_body_leaves_no_body_without_its
         if conn.writes < n:
             break  # this run had fewer writes than n: every stop point was covered
         # Start each stop point from the same state.
-        await db.execute("DELETE FROM knowledge_units WHERE concept = 'Lab router admin'")
+        await db.execute("DELETE FROM knowledge_units WHERE concept = ?", (key,))
         await db.execute("DELETE FROM reference_secrets")
         await db.execute("DELETE FROM knowledge_fts")
         if existing:
-            await _ingest(db, _store(), _body())
+            key = (await _ingest(db, _store(), _body())).concept
         await db.commit()
     assert stopped >= 3  # the secret, the body and its FTS row were each a stop point
 
@@ -178,7 +182,7 @@ async def test_a_concurrent_delete_never_leaves_a_body_without_its_secret(db):
         project_type="reference",
         domain="reference.credentials",
         source_doc="x",
-        concept="Lab router admin",
+        concept=(await kc.get(db, first))["concept"],
         body=held,
         secret_value="rotated-Fake9!",
     )
@@ -192,7 +196,7 @@ async def test_a_value_free_re_ingest_racing_a_delete_is_undone_and_refused(db):
     re-created row would name a secret the delete retired, so the secret_ref
     trigger refuses the write and nothing is re-created."""
     first = await _ingest(db, _store(), _body())
-    held = (await kc.get(db, first))["body"]
+    held, key = (await kc.get(db, first))["body"], (await kc.get(db, first))["concept"]
 
     async def _delete(conn):
         # As knowledge_crud.delete does it: the unit and its FTS row.
@@ -207,7 +211,7 @@ async def test_a_value_free_re_ingest_racing_a_delete_is_undone_and_refused(db):
             project_type="reference",
             domain="reference.credentials",
             source_doc="x",
-            concept="Lab router admin",
+            concept=key,
             body=held,
         )
     assert await db.execute_fetchall("SELECT 1 FROM knowledge_units") == []
@@ -303,7 +307,7 @@ def _value_of(writer: str) -> str:
     return f"password: {writer}-Fake9x"
 
 
-async def _write(conn, writer: str, *, insert_only: bool = False):
+async def _write(conn, writer: str, *, insert_only: bool = False, meta: str | None = None):
     """One credential upsert of the key; ``source_doc`` names the body's writer."""
     return await kc.upsert(
         conn,
@@ -313,6 +317,7 @@ async def _write(conn, writer: str, *, insert_only: bool = False):
         concept=_KEY,
         body=_HELD,
         secret_value=_value_of(writer),
+        secret_meta=meta,
         insert_only=insert_only,
     )
 
@@ -640,8 +645,17 @@ async def test_an_insert_only_write_never_changes_an_existing_key(db):
     with pytest.raises(kc.CredentialKeyTaken):
         await _write(db, "B", insert_only=True)
     assert await _new_shape_pairs(db) == [("A", _value_of("A"))]
-    # The same value is a no-op success.
-    unit, inserted = await _write(db, "A", insert_only=True)
+    # Round 3 (one sameness rule): the same value under a trusted entry is
+    # another credential, so the key is taken too.
+    with pytest.raises(kc.CredentialKeyTaken):
+        await _write(db, "A", insert_only=True)
+    assert await _secret_rows(db) == 1
+
+
+async def test_an_insert_only_write_of_the_same_untrusted_credential_is_a_no_op(db):
+    meta = json.dumps({"identifier": _KEY, "_identity": {"origin": kc.UNTRUSTED, "masked_spans": []}})
+    await _write(db, "A", insert_only=True, meta=meta)
+    unit, inserted = await _write(db, "A", insert_only=True, meta=meta)
     assert inserted is False
     assert await _secret(db, unit) == _value_of("A")
     assert await _secret_rows(db) == 1

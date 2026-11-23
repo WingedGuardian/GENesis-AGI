@@ -112,11 +112,15 @@ HOOK_SURFACE_FILES = frozenset(
         "scripts/review_findings.py",
         "scripts/review_reflection.py",
         "scripts/review_late.py",
+        "scripts/review_past_terminal.py",
         "scripts/review_deadline.py",
         "scripts/external_review.py",
         # The issue premise gate: an Action script that hooks/issue_premise_gate.py
         # imports, so its rule decides a block.
         "scripts/premise_gate.py",
+        # The delivery marker's parser and selection: the --check-pr delivery row
+        # imports them, so a change to either changes what that row reports.
+        "scripts/delivery_marker.py",
         ".claude/settings.json",
         "scripts/behavioral_linter.py",
         "scripts/check_stale_pending.py",
@@ -626,6 +630,12 @@ def evaluate_evidence(
     def mark(sha: str, when: datetime | None, raw: object) -> None:
         marks.append((sha, when, raw))
 
+    # Codex clean comments on a head that is no longer one of the PR's commits
+    # (force-pushed out). They are not marks, so round counting is unchanged, but
+    # ``--check-pr``'s no-change note needs them: on a Codex-only PR they are the
+    # only record that the pushed-out head was reviewed at all.
+    unresolved_clean: list[tuple[str, datetime | None, object]] = []
+
     # Every post-cutover finding review, in arrival order of the input. Which of
     # them open a round is decided below, once every mark is known.
     events: list[dict[str, Any]] = []
@@ -779,6 +789,7 @@ def evaluate_evidence(
             if error == "unresolved_review_head" and not before:
                 # After cutover a clean comment only confirms a head, and a commit
                 # no longer in the PR can never be the current one.
+                unresolved_clean.append((match.group(1).lower(), marked, marked_raw))
                 continue
             if error:
                 return _unknown(error, current_head=head)
@@ -1095,6 +1106,11 @@ def evaluate_evidence(
             for sha in commits
         ],
         "marks": [{"head": sha, "at": _iso(when, raw)} for sha, when, raw in marks],
+        # A SHORT sha as the comment wrote it: it no longer resolves against the
+        # PR's commits, so only the commits API can expand it.
+        "unresolved_clean_heads": [
+            {"head": sha, "at": _iso(when, raw)} for sha, when, raw in unresolved_clean
+        ],
         "findings": findings_out,
         "late_state": "ok" if late_known else "unknown",
         "errors": [],
@@ -1464,6 +1480,17 @@ def _review_digest(rows: Sequence[Mapping[str, object]], rf: Any) -> list[tuple[
     return digest
 
 
+#: Result keys that are advisory output for readers, not budget policy. The
+#: double-read stability check ignores them, so a change that touches only them
+#: (a Codex clean comment on a force-pushed-out head landing between the reads)
+#: cannot turn an ok budget into unknown.
+_ADVISORY_RESULT_KEYS = frozenset({"unresolved_clean_heads"})
+
+
+def _policy_view(result: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in result.items() if k not in _ADVISORY_RESULT_KEYS}
+
+
 def _evaluate_pr_inner(
     repo: str,
     pr: int | str,
@@ -1802,7 +1829,11 @@ def _evaluate_pr_inner(
         # marks and reviewer attribution -- not only count or approval. Unknown
         # projections cannot establish stability, even when they match.
         again_result = evaluate((second or {}).get("comments") or [])
-        if result["status"] != "ok" or again_result["status"] != "ok" or result != again_result:
+        if (
+            result["status"] != "ok"
+            or again_result["status"] != "ok"
+            or _policy_view(result) != _policy_view(again_result)
+        ):
             return _unknown("evidence_changed_during_evaluation", current_head=final_head)
     # The PR body, for the reflection's acceptance points. It is not evidence
     # the count rests on, so a body edited between the two reads leaves the

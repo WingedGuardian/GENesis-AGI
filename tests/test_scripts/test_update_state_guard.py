@@ -1430,3 +1430,140 @@ def test_the_guards_git_runs_no_fsmonitor_the_repository_names(guard, repo, tmp_
     mark.unlink()
     subprocess.run(status, capture_output=True, env=guard._env())
     assert not mark.exists(), "the guard's git environment still runs fsmonitor"
+
+
+# ── T-D35: the boot repair's absolute deadline (#3492 D2a-2) ─────────────────
+
+# SPY_*, not GIT_*: the guard's _env() drops every GIT_* variable (#4501 review).
+_SLOW_GIT = """#!/bin/sh
+echo "$@" >> "$SPY_GIT_CALLS"
+[ -n "$SPY_GIT_SLEEP" ] && exec sleep "$SPY_GIT_SLEEP"
+exec {git} "$@"
+"""
+
+
+def _spy_git(tmp_path: Path, monkeypatch, sleep: str = "") -> Path:
+    bin_dir = tmp_path / "spybin"
+    bin_dir.mkdir()
+    (bin_dir / "git").write_text(_SLOW_GIT.format(git=shutil.which("git")))
+    (bin_dir / "git").chmod(0o755)
+    calls = tmp_path / "git_calls"
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("SPY_GIT_CALLS", str(calls))
+    monkeypatch.setenv("SPY_GIT_SLEEP", sleep)
+    return calls
+
+
+def test_td35_a_deadline_already_past_starts_no_git(guard, live, tmp_path, monkeypatch):
+    """Past the boot deadline no call is started: TimeoutExpired, which every
+    caller already reads as "keep the state"."""
+    calls = _spy_git(tmp_path, monkeypatch)
+    guard._DEADLINE = time.monotonic() - 1
+    with pytest.raises(subprocess.TimeoutExpired):
+        guard.state_verdict(live_row(live), str(live["root"]))
+    assert not calls.exists(), calls.read_text()
+
+
+def test_td35_every_git_call_shares_one_deadline(guard, live, tmp_path, monkeypatch):
+    """Seven call sites each with _TIMEOUT_S would wait their sum; with the
+    deadline set they share what is left of it."""
+    calls = _spy_git(tmp_path, monkeypatch, sleep="30")
+    guard._DEADLINE = time.monotonic() + 2
+    start = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        guard.state_verdict(live_row(live), str(live["root"]))
+    assert time.monotonic() - start < 2.5
+    assert calls.exists(), "the spy git never ran: the deadline was not what stopped it"
+
+
+def test_td35_no_deadline_is_the_plain_timeout(guard):
+    assert guard._DEADLINE is None
+    assert guard._t(1) == guard._TIMEOUT_S
+
+
+# ── #3722: a `live` update stopped after `merging` (advice only) ─────────────
+
+_LATER = ("bootstrap", "migrations", "health_check")
+
+
+def later_row(d: dict, phase: str, **over) -> dict:
+    """update.sh's row after adoption on `live` (U:401-419): rebuilt from fixed
+    keys, own_head the rebuilt tip, no live_move."""
+    return {
+        "phase": phase,
+        "rollback_tag": "pre",
+        "original_branch": "live",
+        "own_head": d["new"],
+        "deploy_head": d["main0"],
+        "post_merge": False,
+        "pid": 2_147_483_647,
+        **over,
+    }
+
+
+def retry_advice_is_honest(text: str) -> None:
+    """Names `live` and #3722, says no tool finishes the rollback, and offers
+    --post-merge only as a retry with the database caveat (never main's bare
+    "Finish it with ... --post-merge", never "bootstrap never ran on")."""
+    assert "`live`" in text and "#3722" in text, text
+    assert "Finish it with scripts/update.sh --post-merge" not in text, text
+    assert "bootstrap never ran on" not in text, text
+    for s in post_merge_advice(text):
+        assert "retries" in s or "re-runs" in s, s
+    assert "migrated database" in text, text
+
+
+@pytest.mark.parametrize("phase", _LATER)
+def test_3722_cell_a_whole_at_the_tip_names_the_retry_and_its_risk(guard, live, phase):
+    """Cell A: HEAD on `live` at the tip, the tree whole. The record cannot tell
+    a kill in that phase from a rollback stopped before its checkout (review
+    S2), so both are named. The verdict and exit code are unchanged (0)."""
+    _git(live["root"], "checkout", "-q", "-B", "live", live["new"])
+    r = _cli(live, _state(live, later_row(live, phase)))
+    assert r.returncode == 0, r.stdout + r.stderr
+    retry_advice_is_honest(r.stdout)
+    assert f"phase '{phase}'" in r.stdout and "its rollback to" in r.stdout, r.stdout
+    assert "had its checkout refused" in r.stdout, r.stdout  # review S2: all three states
+
+
+@pytest.mark.parametrize("phase", _LATER)
+def test_3722_cell_b_part_rolled_back_restores_then_names_the_retry(guard, live, phase):
+    """Cell B: HEAD at the tip, a tag-side file written (a rollback checkout
+    killed partway). Exit 4 as before; the paths are listed, and the remedy
+    is the honest retry, not main's forward finish."""
+    _git(live["root"], "checkout", "-q", "-B", "live", live["new"])
+    (live["root"] / "O").write_text("o\n")
+    r = _cli(live, _state(live, later_row(live, phase)))
+    assert r.returncode == 4, r.stdout + r.stderr
+    retry_advice_is_honest(r.stdout)
+    assert "  ?? O" in r.stdout and "git restore --source=HEAD" in r.stdout, r.stdout
+    assert "rolling back" in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize("phase", _LATER)
+def test_3722_cell_c_back_at_the_tag_names_what_the_rollback_may_owe(guard, live, phase):
+    """Cell C: HEAD on `live` at the rollback tag. Exit 6 as before; the text no
+    longer says to put the checkout where you want it (the rollback put it
+    there), and names what may still be owed."""
+    r = _cli(live, _state(live, later_row(live, phase)))
+    assert r.returncode == 6, r.stdout + r.stderr
+    out = r.stdout
+    assert "`live`" in out and "#3722" in out and "may not have finished" in out, out
+    assert "put the checkout where you want it" not in out, out
+    assert "hooks" in out and "database" in out and "Dismiss" in out, out
+
+
+@pytest.mark.parametrize("phase", _LATER)
+def test_3722_a_main_row_in_a_later_phase_keeps_mains_wording(guard, repo, phase):
+    """Main rows (no original_branch live) keep main's text and exit code."""
+    state = {"phase": phase, "rollback_tag": "pre", "deploy_head": repo["incoming"]}
+    r = _cli(repo, _state(repo, state))
+    assert "Finish it with scripts/update.sh --post-merge" in r.stdout, r.stdout
+    assert "#3722" not in r.stdout, r.stdout
+
+
+def test_3722_a_live_row_off_live_keeps_the_moved_away_hold(guard, live):
+    """HEAD detached at the tag is not the rollback's doing: _MOVED_AWAY stays."""
+    _git(live["root"], "checkout", "-q", "--detach", live["old"])
+    r = _cli(live, _state(live, later_row(live, "bootstrap")))
+    assert r.returncode == 6 and "put the checkout where you want it" in r.stdout, r.stdout

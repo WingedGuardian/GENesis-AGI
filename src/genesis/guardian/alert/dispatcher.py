@@ -84,13 +84,33 @@ class AlertDispatcher:
 
         return True
 
-    def _enqueue_fallback(self, alert: Alert) -> None:
-        """Persist a failed-delivery alert to the durable queue (best-effort)."""
-        if not self._fallback_queue_root:
-            return
-        from genesis.guardian.alert.queue import enqueue_alert
+    async def send_or_queue(self, alert: Alert) -> bool:
+        """Send now, or queue for replay; True when either one succeeded.
 
-        enqueue_alert(
+        For a caller that pages once per episode and must know whether the page
+        will reach the user: a queued alert is delivered when the host queue
+        drain replays it, so it counts. ``send`` alone returns False for both a
+        queued and a dropped alert.
+        """
+        if await self.send(alert, allow_queue_fallback=False):
+            return True
+        return self._enqueue_fallback(alert)
+
+    def _enqueue_fallback(self, alert: Alert) -> bool:
+        """Persist a failed-delivery alert to the durable queue (best-effort).
+
+        True when it is queued, including when a live entry with the same title
+        is the newest entry waiting (enqueue_alert skips that write and returns
+        False, but the alert is durable). An older copy with entries queued after
+        it, such as an all-clear, belongs to an earlier episode and will not page
+        this one, so it does not count. False with no queue, or when the write
+        failed.
+        """
+        if not self._fallback_queue_root:
+            return False
+        from genesis.guardian.alert.queue import enqueue_alert, list_queued
+
+        queued = enqueue_alert(
             self._fallback_queue_root,
             severity=str(alert.severity.value),
             source="guardian",
@@ -104,6 +124,13 @@ class AlertDispatcher:
                 "proposed_action": alert.proposed_action,
             },
         )
+        if queued:
+            return True
+        try:
+            entries = list_queued(self._fallback_queue_root)
+        except Exception:
+            return False
+        return bool(entries) and entries[-1][1].get("dedupe_key") == alert.title
 
     async def test_all(self) -> dict[str, bool]:
         """Test connectivity for all channels. Returns {channel_class: success}."""

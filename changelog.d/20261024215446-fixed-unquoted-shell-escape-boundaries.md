@@ -1,1 +1,0 @@
-- Keep commands after ordinary backslash-escaped quotes visible to shell guards for hash-free scanner inputs, including nested shell scripts. Hash-containing calls retain their earlier behavior; broader hash/escape gaps remain open. Existing continuation and incomplete-syntax limits remain in force.

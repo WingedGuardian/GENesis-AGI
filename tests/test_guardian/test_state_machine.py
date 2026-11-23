@@ -651,3 +651,54 @@ class TestRebootResetsTheEpisode:
         sm.process(_dead_snapshot(["health_api"]))   # -> CONFIRMING, fresh onset
         assert sm.state.current_state is GuardianState.CONFIRMING
         assert sm._is_within_bootstrap_grace() is True
+
+
+class TestPostRebootGrace:
+    """A failure episode starting soon after a host reboot gets the longer
+    post-reboot grace: a cold boot of the container stack is slow (measured
+    ~13.5 min to healthy on a live install, against the 300 s default)."""
+
+    BOOT_A = "1a2b3c4d-0000-4111-8000-000000000001"
+    BOOT_B = "9f1c2d3e-0000-4444-8888-aaaabbbbcccc"
+
+    @staticmethod
+    def _ago(seconds: float) -> str:
+        from datetime import UTC, datetime, timedelta
+
+        return (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+
+    def test_reboot_records_when_it_was_seen(self, sm: ConfirmationStateMachine) -> None:
+        sm._state.boot_id = self.BOOT_A
+        assert sm.reset_if_rebooted(self.BOOT_B) is True
+        assert sm.state.rebooted_at is not None
+
+    def test_failure_soon_after_a_reboot_stays_in_grace_past_the_default(
+        self, sm: ConfirmationStateMachine,
+    ) -> None:
+        sm._state.rebooted_at = self._ago(600)
+        sm._state.first_failure_at = self._ago(590)  # failing for ~10 min, past 300 s
+        assert sm._is_within_bootstrap_grace() is True
+
+    def test_post_reboot_grace_still_ends(self, sm: ConfirmationStateMachine) -> None:
+        sm._state.rebooted_at = self._ago(1300)
+        sm._state.first_failure_at = self._ago(1290)  # past the 1200 s post-reboot grace
+        assert sm._is_within_bootstrap_grace() is False
+
+    def test_without_a_reboot_the_default_grace_applies(self, sm: ConfirmationStateMachine) -> None:
+        sm._state.rebooted_at = None
+        sm._state.first_failure_at = self._ago(600)
+        assert sm._is_within_bootstrap_grace() is False
+
+    def test_a_failure_long_after_a_reboot_gets_the_default_grace(
+        self, sm: ConfirmationStateMachine,
+    ) -> None:
+        sm._state.rebooted_at = self._ago(3 * 86400)
+        sm._state.first_failure_at = self._ago(600)
+        assert sm._is_within_bootstrap_grace() is False
+
+    def test_rebooted_at_survives_a_state_round_trip(self, sm: ConfirmationStateMachine, tmp_path) -> None:
+        sm._state.rebooted_at = "2026-01-01T00:00:00+00:00"
+        sm.save_state(tmp_path / "state.json")
+        other = ConfirmationStateMachine(GuardianConfig())
+        other.load_state(tmp_path / "state.json")
+        assert other.state.rebooted_at == "2026-01-01T00:00:00+00:00"

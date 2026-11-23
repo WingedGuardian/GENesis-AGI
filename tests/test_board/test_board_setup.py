@@ -256,6 +256,55 @@ async def test_an_unlisted_status_option_is_never_deleted(fake_pv, recorded, mon
     assert by_name["Todo"]["id"] == "t", "kept, WITH its id, so no card loses its value"
 
 
+async def test_a_board_set_up_before_build_gains_it_in_place(
+    fake_pv, recorded, monkeypatch, capsys
+):
+    """The live transition: a board with the five original columns plus GitHub's
+    Todo gains Build between Ready and In Progress. Every existing option keeps
+    its id AND its colour; only Build is new, with its own colour and meaning."""
+    old = ["Proposed", "Ready", "In Progress", "In Review", "Done", "Todo"]
+    raw = [{"id": f"id-{n}", "name": n, "color": "BLUE", "description": "kept"} for n in old]
+
+    async def project(owner, number, **_k):
+        return pv.Project(
+            "P1",
+            number,
+            "Genesis Work Board",
+            False,
+            {"Status": pv.Field("F1", "Status", "single_select", {n: f"id-{n}" for n in old}, raw)},
+        )
+
+    sent = {}
+
+    async def capture(field_id, options, **_k):
+        sent["options"] = options
+
+    monkeypatch.setattr(pv, "get_project", project)
+    monkeypatch.setattr(pv, "update_single_select_options", capture)
+    await setup.run(setup.DEFAULT_TITLE, apply=False, write_config=False)
+    assert "would set Status options" in capsys.readouterr().out
+    assert sent == {}, "a dry run sends nothing"
+
+    await setup.run(setup.DEFAULT_TITLE, apply=True, write_config=False)
+    names = [o["name"] for o in sent["options"]]
+    assert names == [*pv.STATUS_OPTIONS, "Todo"]
+    by_name = {o["name"]: o for o in sent["options"]}
+    build = by_name["Build"]
+    assert "id" not in build and build["color"] == "PURPLE"
+    assert build["description"] == pv.STATUS_DESCRIPTIONS["Build"]
+    for n in old:
+        assert by_name[n]["id"] == f"id-{n}", "no card loses its value"
+        assert (by_name[n]["color"], by_name[n]["description"]) == ("BLUE", "kept")
+
+
+def test_new_status_options_get_explicit_colours_not_positional():
+    """A fresh board: inserting a column must not recolour the ones after it."""
+    fresh = pv.merge_options([], pv.STATUS_OPTIONS, keep_unlisted=False, colors=pv.STATUS_COLORS)
+    assert {o["name"]: o["color"] for o in fresh} == pv.STATUS_COLORS
+    assert set(pv.STATUS_COLORS) == set(pv.STATUS_OPTIONS)
+    assert pv.STATUS_COLORS["Done"] == "GREEN", "a finished card never reads as a failure"
+
+
 @pytest.mark.parametrize("count", [1, 2])
 async def test_a_same_titled_project_that_is_not_recorded_is_refused(
     fake_pv, monkeypatch, capsys, count
