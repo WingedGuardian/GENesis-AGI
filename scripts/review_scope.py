@@ -1053,6 +1053,13 @@ def _is_lane_light(path: str) -> bool:
         return True
     if _category(path) in ("test", "fixture"):
         return True
+    return _is_lane_prose(path)
+
+
+def _is_lane_prose(path: str) -> bool:
+    """Prose alone, by extension or a CAPS stem: the part of the light lane that is
+    neither a test nor a fixture. The ``--check-pr`` delivery row asks this to decide
+    whether a builder's own read may stand on a PR."""
     base = os.path.basename(path)
     stem, dot, ext = base.rpartition(".")
     ext = f".{ext.lower()}" if dot else ""

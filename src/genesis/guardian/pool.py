@@ -10,7 +10,9 @@ Design:
 - Measurement (:func:`measure_storage_pool`) is defensive: any failure yields
   ``detected=False`` so we never raise a false alarm on a probe error.
 - Tier + alert-decision logic is pure and fully unit-tested (:func:`worst_tier`,
-  :func:`decide_alert`) — the subprocess glue is kept thin around it.
+  :func:`pool_axis_tiers`, :func:`decide_alert`) — the subprocess glue is kept
+  thin around it. :func:`held_tier` is the exit margin both this watch and the
+  RAM watch (memory_watch.py) use, so a reading at a line pages once.
 """
 
 from __future__ import annotations
@@ -92,6 +94,38 @@ def _tier_for(pct: float | None, warn: float, high: float, crit: float) -> str:
     return TIER_OK
 
 
+def _worse(a: str, b: str) -> str:
+    return a if _TIER_RANK[a] >= _TIER_RANK[b] else b
+
+
+def held_tier(
+    pct: float | None, lines: tuple[float, float, float], prior: str, margin: float
+) -> str:
+    """One axis's tier with an exit margin.
+
+    A rise takes effect at the line. A fall leaves a tier only once the reading
+    is ``margin`` points below that tier's line, so a reading hovering at a
+    line holds one tier instead of crossing it every tick. A blind axis (None)
+    holds its prior tier: a failed read is no evidence that pressure eased.
+    """
+    if pct is None:
+        return prior
+    raw = _tier_for(pct, *lines)
+    with_margin = _tier_for(pct + margin, *lines)
+    held = prior if _TIER_RANK[prior] <= _TIER_RANK[with_margin] else with_margin
+    return _worse(raw, held)
+
+
+def exit_margin_points(raw: object, setting: str) -> float:
+    """A configured exit margin in points, or 5 when it is not a number.
+    A bad value must not take a watch down every tick."""
+    try:
+        return max(0.0, float(raw))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is not a number; using 5", setting, raw)
+        return 5.0
+
+
 def worst_tier(status: StoragePoolStatus, cfg: StoragePoolConfig) -> str:
     """Highest tier across data%, metadata% and backend-agnostic pool-used%.
 
@@ -116,6 +150,54 @@ def worst_tier(status: StoragePoolStatus, cfg: StoragePoolConfig) -> str:
         cfg.metadata_warn_pct, cfg.metadata_high_pct, cfg.metadata_crit_pct,
     )
     return data if _TIER_RANK[data] >= _TIER_RANK[meta] else meta
+
+
+def pool_axis_tiers(
+    status: StoragePoolStatus,
+    cfg: StoragePoolConfig,
+    prior: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Per-axis tiers, each held by the exit margin against its prior tier.
+
+    The axes are the ones :func:`worst_tier` reads: ``data`` and ``metadata``
+    on an LVM-thin pool, ``pool_used`` otherwise, so with no prior the worst
+    of these equals :func:`worst_tier`. A prior tier for an axis this pool
+    does not tier (a backend change) is ignored. An axis with no reading is
+    ``ok``, as in :func:`worst_tier`: the margin damps readings, and the pool
+    watch has no bound on how long a blind axis could otherwise hold a tier.
+    """
+    prior = prior or {}
+    margin = exit_margin_points(cfg.exit_margin_pct, "storage_pool.exit_margin_pct")
+    if status.data_pct is None and status.metadata_pct is None:
+        axes = {
+            "pool_used": (
+                status.pool_used_pct,
+                (cfg.pool_used_warn_pct, cfg.pool_used_high_pct, cfg.pool_used_crit_pct),
+            ),
+        }
+    else:
+        axes = {
+            "data": (status.data_pct, (cfg.data_warn_pct, cfg.data_high_pct, cfg.data_crit_pct)),
+            "metadata": (
+                status.metadata_pct,
+                (cfg.metadata_warn_pct, cfg.metadata_high_pct, cfg.metadata_crit_pct),
+            ),
+        }
+    out = {}
+    for axis, (pct, lines) in axes.items():
+        last = prior.get(axis, TIER_OK)
+        if pct is None or last not in _TIER_RANK:
+            last = TIER_OK
+        out[axis] = held_tier(pct, lines, last, margin)
+    return out
+
+
+def worst_of(tiers: dict[str, str]) -> str:
+    """Highest tier among ``tiers`` (``ok`` when empty)."""
+    worst = TIER_OK
+    for tier in tiers.values():
+        worst = _worse(worst, tier)
+    return worst
 
 
 @dataclass(frozen=True)
@@ -308,7 +390,7 @@ def decide_alert(
         return AlertDecision(True, current_tier, f"tier rose {last_tier}→{current_tier}")
     if cur == 0 and last > 0:
         return AlertDecision(
-            True, current_tier, f"pool recovered ({last_tier}→ok)", is_resolution=True,
+            True, current_tier, f"recovered ({last_tier}→ok)", is_resolution=True,
         )
     if cur > 0 and cur == last:
         if last_alert_at is None:

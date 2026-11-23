@@ -72,6 +72,7 @@ def _reflection(
         "Premise: LEAD",
         "Premise-why: the change routes around an existing helper that already exists",
         "Impossible: route every call through one checked helper and delete the rest",
+        "Alternative: none found: searched scripts/ for an existing checked helper",
         "Scope: covered: the key round-trips (tests/test_x.py)",
         f"Decision: {decision}",
         "Decision-why: the same mistake appears twice in two different files",

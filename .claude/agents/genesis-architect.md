@@ -83,7 +83,8 @@ block, and the calibration controls: `.claude/docs/premise-check.md`. In short:
    BEST available shape? Start from the author's item 7: confirm or refute each
    alternative it names, and search from scratch only when it says "none found"
    (or there is no item 7),
-   saying what you searched. Look for an existing chokepoint the change
+   saying what you searched. In a review round after a `fix-now` round, do the
+   same with the previous reflection's `Alternative:` line for the fix it made. Look for an existing chokepoint the change
    re-implements, a simpler mechanism, or a place the problem disappears. A
    sound-but-inferior approach is a FINDING.
 5. **Then the PR-shape question, every time:** should this arrive as ONE PR?

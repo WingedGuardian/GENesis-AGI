@@ -273,6 +273,11 @@ from the main checkout, or pass `--db-path` and the main checkout's interpreter 
 absolute path. The message says so, but the diagnosis is not the one you would
 guess.
 
+Both CLI `close --dry-run` and `recheck --dry-run` open an admitted read-only
+connection that reads committed WAL data without checkpointing the database.
+SQLite may still coordinate shared-memory sidecars and locks. Ordinary recording
+retains the admitted writer connection.
+
 The backlog is PER INSTALL — each box's worker fills its own ledger against its
 own deploy state, so two installs hold different open sets and neither one's
 count says anything about the other.
@@ -748,6 +753,22 @@ deterministic rule could catch only a few (measured 2026-11-14).
   check:` lines (dry run, open record or close), and MCP returns them as `prompts`. They change no verdict and are not stored, so
   **answer each one on the dry run, before the real close**: fix the document, or
   judge that it does not apply. A close is permanent.
+
+### Independent completeness receipt
+
+For the two-stage source/evidence review and its typed receipt, read
+`references/completeness-review.md`. Stage A inventories the full source packet
+before the reviewer sees the candidate. Stage B audits that retained inventory,
+every claim/gap/control, and every file disposition against the evidence. Retain
+the actual fresh-context execution; JSON alone does not prove independence.
+
+The current P2 release can parse and check this optional receipt. It does not
+yet enforce completeness in either close writer, authorize a validator launch,
+or release HOLD. A successful offline `check` establishes binding to the supplied
+packet, not fresh GitHub state or a complete semantic judgment. The shared close
+gate and its installed qualification are separate work. Historical documents
+without the field still parse; omit malformed/incomplete output when recording
+a legitimate open attempt and retain the raw review separately.
 
 The evidence document is validated by a strict model
 (`genesis.session_awareness.pr_evidence`): every prose field must be a non-blank

@@ -34,7 +34,7 @@ jobs:
         # touched nothing and blocks every merge in the repository — recoverable
         # only by disabling the ruleset in the UI. See .github/rulesets/README.md.
         # Pinned to the version this repo is developed against locally.
-        run: pip install 'ruff==0.15.10'
+        run: pip install 'ruff==0.17.5'
       - name: Lint
         run: ruff check src/ tests/ scripts/
 
@@ -637,13 +637,31 @@ jobs:
         # backend, the branch leak-scan workflow, the portability checks) run
         # here instead of skipping.
         run: bash scripts/ci/install_ripgrep.sh
+      - name: Prepare isolated test storage
+        id: census_prepare
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import os
+          import tempfile
+          from pathlib import Path
+          parent = Path(tempfile.mkdtemp(prefix="genesis-live-writes-"))
+          directory, runtime = parent / "audit", parent / "runtime"
+          directory.mkdir()
+          runtime.mkdir()
+          run_id = "-".join(os.environ[key] for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA"))
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as destination:
+              destination.write(f"GENESIS_LIVE_WRITES_REPORT={directory}/rows.tsv\nGENESIS_LIVE_WRITES_RUN_ID={run_id}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as destination:
+              destination.write(f"directory={directory}\nhypothesis_directory={runtime}/hypothesis\njunit_report={runtime}/junit.xml\nactive_file={runtime}/active-test.txt\n")
+          PY
       - name: Run tests
         # The narrator below fires on THIS step's failure, not on the job's.
         id: tests
         run: |
           # Never measure a stale report: if pytest dies before writing
           # one, the checker must find nothing rather than yesterday's.
-          rm -f junit.xml
+          rm -f "$GENESIS_JUNIT_REPORT"
           # Ignore preserved AZ-era test files that import removed modules
           #
           # --durations: this suite's per-test cost has NEVER been measured.
@@ -693,13 +711,42 @@ jobs:
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
             --ignore=tests/test_ui/ \
-            --junit-xml=junit.xml
+            --junit-xml="$GENESIS_JUNIT_REPORT"
         env:
           GENESIS_TESTING: "1"
+          # Select before collection, when Hypothesis first binds its cache.
+          # Failed preparation can expose partial outputs: only raw success
+          # selects them. Every report consumer uses the same legacy fallback.
+          HYPOTHESIS_STORAGE_DIRECTORY: ${{ steps.census_prepare.outcome == 'success' && steps.census_prepare.outputs.hypothesis_directory || '' }}
+          GENESIS_JUNIT_REPORT: ${{ steps.census_prepare.outcome == 'success' && steps.census_prepare.outputs.junit_report || 'junit.xml' }}
           # The breadcrumb the conftest rewrites before every test and fsyncs.
           # It is the ONLY channel that survives a hard crash inside a test --
           # no report is written and, without -v, the log names nothing either.
-          GENESIS_ACTIVE_TEST_FILE: active-test.txt
+          GENESIS_ACTIVE_TEST_FILE: ${{ steps.census_prepare.outcome == 'success' && steps.census_prepare.outputs.active_file || 'active-test.txt' }}
+      - name: Read the write census (measurement only)
+        id: census_readback
+        continue-on-error: true
+        if: >-
+          ${{ !cancelled() && steps.census_prepare.outcome == 'success' &&
+              (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') }}
+        env:
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          python scripts/ci/live_writes_census.py "$GENESIS_LIVE_WRITES_REPORT" \
+            --run-id "$GENESIS_LIVE_WRITES_RUN_ID" --workers 4 --tests-outcome "$TESTS_OUTCOME"
+      - name: Preserve the write census
+        id: census_upload
+        continue-on-error: true
+        if: >-
+          ${{ !cancelled() && steps.census_prepare.outcome == 'success' &&
+              (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: live-writes-census-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.census_readback.outcome }}
+          # Audit evidence only; runtime caches stay in the sibling directory.
+          path: ${{ steps.census_prepare.outputs.directory }}/
+          if-no-files-found: ignore
+          retention-days: 14
       # The step log's tail is where pytest names the failures, and the tail
       # is what GitHub's log cap drops (measurement above). The step summary
       # is rendered by the Actions UI OUTSIDE the log, so it survives however
@@ -730,9 +777,10 @@ jobs:
       # result before continue-on-error rewrites it.
       - name: Name the failures where truncation cannot reach
         if: ${{ !cancelled() && steps.tests.outcome == 'failure' }}
-        run: python scripts/ci/failure_summary.py junit.xml >> "$GITHUB_STEP_SUMMARY"
+        run: python scripts/ci/failure_summary.py "$GENESIS_JUNIT_REPORT" >> "$GITHUB_STEP_SUMMARY"
         env:
-          GENESIS_ACTIVE_TEST_FILE: active-test.txt
+          GENESIS_JUNIT_REPORT: ${{ steps.census_prepare.outcome == 'success' && steps.census_prepare.outputs.junit_report || 'junit.xml' }}
+          GENESIS_ACTIVE_TEST_FILE: ${{ steps.census_prepare.outcome == 'success' && steps.census_prepare.outputs.active_file || 'active-test.txt' }}
       # The junit report holds every traceback in full and was previously
       # DISCARDED with the runner — the dormancy guard parsed it, then it
       # died with the VM while the truncated log held ~44% of the run.
@@ -744,7 +792,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: junit-test-report
-          path: junit.xml
+          path: ${{ steps.census_prepare.outcome == 'success' && steps.census_prepare.outputs.junit_report || 'junit.xml' }}
           # pytest can die before writing any report (collection crash); the
           # failure-summary step already names that case in the summary, so a
           # missing file here is information, not an upload error.
@@ -837,7 +885,9 @@ jobs:
         # [plain|html|private_redirect|brotli|error] ("requires the browser extra";
         # this job installs none). They run in dependency-audit. Within the
         # ceiling, no raise: main measured 591 at run 44079105066, + 5 = 596.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 607
+        env:
+          GENESIS_JUNIT_REPORT: ${{ steps.census_prepare.outcome == 'success' && steps.census_prepare.outputs.junit_report || 'junit.xml' }}
+        run: python scripts/check_skip_ceiling.py "$GENESIS_JUNIT_REPORT" --ceiling 607
 
   test-ubuntu-2404:
     # ubuntu-latest is moving to 26.04, so `test` alone stops showing a break on

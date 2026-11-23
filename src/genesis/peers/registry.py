@@ -16,6 +16,7 @@ from genesis.env import db_busy_timeout_ms, genesis_db_path
 CAPABILITIES = frozenset(
     {
         "conversation",
+        "conversation_shared",
         "research",
         "knowledge_offer",
         "knowledge_promote",

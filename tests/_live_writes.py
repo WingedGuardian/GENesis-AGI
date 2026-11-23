@@ -16,7 +16,8 @@ A PEP 578 audit hook judges, in this interpreter:
   ``shutil.rmtree``, ``os.truncate``, ``os.symlink``, ``os.link``;
 - ``sqlite3.connect`` to a file, except recognized literal URI query forms
   ``mode=ro``, ``mode=memory``, or ``immutable=1`` for an existing target;
-- reads of the real credential files (the deployed ``secrets.env``,
+- reads of the real credential files (``~/.config/genesis/secrets.env``,
+  the deployed ``secrets.env``,
   ``~/.claude/.credentials.json``, ``~/.config/gh/hosts.yml``,
   ``~/.genesis/cc_oauth_token.env``).
 
@@ -32,16 +33,35 @@ and attributed to the running test.
 
 Output: a terminal-summary section, and, with ``GENESIS_LIVE_WRITES_REPORT=<file>``,
 one tab-separated line per (test, class, operation, path), written on every run.
+Each field escapes backslash/tab/LF/CR; tests._live_writes_report.decode reads
+the reversible bytes. Empty/parseable TSV alone never establishes completeness.
+Judging failures increment the fault count and add ``observer fault`` rows:
+operation is event/stage/fixed-builtin-error-category, path is ``<not captured>``.
+No exception message, filename or traceback is retained. Identical rows deduplicate;
+fault counts do not. Failed attribution uses ``<attribution unavailable>``; failed
+diagnostic retention still leaves a nonzero fault count (unknown, not clean).
 Under xdist each worker hands its hits to the controller at session end
 (``workeroutput``, as the live fence does), and only the controller reports; a
-worker that never reported is named in the summary.
+worker that never reported is named in the summary. The ordinary trylast worker
+snapshot includes default/tryfirst sessionfinish hooks, but not later same-priority
+hooks, wrapper teardown, unconfigure or writes after the snapshot.
 
-Hits classify pre-operation audit events, not syscall completion. Simple known
-no-ops are filtered, but refused operations and readonly SQLite queries outside
-the recognized literal forms can still be reported, and some aliases can be
-missed (tracked in #4193).
-``os.open`` of a relative name is judged against the cwd and labelled so (its
-audit event omits ``dir_fd``).
+Hits classify pre-operation events, not syscall completion. Known no-ops such
+as an existing ``mkdir``, missing ``unlink``, non-empty ``rmdir``, or an
+unchanged reopen are filtered. Other refused operations and readonly SQLite
+queries outside the recognized literal forms can still be reported, and some
+aliases can be missed (tracked in #4193).
+Known raw exclusive/nofollow refusals, metadata-only O_PATH, missing rename/link
+sources, occupied link destinations and same-inode renames are also filtered.
+Protected hardlink sources are observed as ``os.link source`` exposure, even
+without a later content write. Source symlink targets are checked conservatively
+because the link event omits follow_symlinks. No alias history is maintained.
+Relative ``os.open`` events omit ``dir_fd``. On Linux/CPython the FD witness
+corrects supported successful calls using the returned descriptor; other calls
+retain the explicitly labelled cwd guess. Failed/ambiguous calls and every
+credential-read fault remain conservative; no published evidence is removed.
+Pending calls are sealed across report capture. Callable identity/builtin type
+change under instrumentation; signature/pickle/dir_fd metadata are preserved.
 Attribution is by ``PYTEST_CURRENT_TEST``: a write during collection or a
 session fixture's teardown counts as "outside any test", and a background
 thread an earlier test left running is charged to the test running now.
@@ -52,6 +72,8 @@ writes done in C without an audit event, metadata changes (``os.chmod``,
 ``os.mkfifo``/``os.mknod``, SQLite writes through a connection opened earlier,
 and ``file://localhost`` or percent-encoded SQLite URIs. The OS-level sandbox
 is the boundary for those.
+Without stdlib ``ALLOW_MISSING`` (unless backported), missing credential
+targets produce explicit unknown events; existing identities still work.
 """
 
 from __future__ import annotations
@@ -68,6 +90,9 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+
+from genesis.secrets_location import home_config_location
+from tests import _live_writes_fd, _live_writes_fs, _live_writes_report
 
 
 def _observer_os():
@@ -96,6 +121,9 @@ def _observer_os():
 
 os = _observer_os()
 
+# Older Python lacks missing-aware resolution: strict=True leaves uncertainty
+# visible through the hook rather than silently accepting a guessed target.
+_MISSING_STRICT = getattr(os.path, "ALLOW_MISSING", True)
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 _EVENTS = frozenset(
     {
@@ -121,16 +149,21 @@ class _State:
     allowed_files: frozenset[str] = frozenset()
     classes: tuple[tuple[str, str], ...] = ()  # (root, label), most specific first
     credential_files: frozenset[str] = frozenset()
-    credential_inodes: frozenset[tuple[int, int]] = frozenset()
+    credential_inodes: frozenset[tuple[int, int]] = frozenset()  # initial identities
     hits: dict[tuple[str, str, str, str], None] = {}  # insertion-ordered set
     merged_workers: set[str] = set()  # xdist workers whose hits were merged
     unreported: list[str] = []  # xdist workers whose hits never arrived
     faults = 0  # unknown classifications must not look like a clean census
+    census_id: str | None = None
+    exitstatus: int | None = None
+    expected_workers: set[str] = set()
+    worker_status: dict[str, dict | None] = {}
 
 
 _S = _State()
 _busy = threading.local()
 _fault_lock = threading.Lock()
+_W = _live_writes_fd.Witness(sys.modules[__name__])
 
 
 def _under(path: str, root: str) -> bool:
@@ -210,7 +243,16 @@ def _node() -> str:
 
 
 def _record(label: str, op: str, path: str) -> None:
-    _S.hits[(_node(), label, op, path)] = None
+    key = (_node(), label, op, path)
+    try:
+        if _W.defer(key):
+            return
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        raise
+    except BaseException as error:
+        _W.invalidate()
+        _unknown("open", "fd-witness", error)
+    _S.hits[key] = None
 
 
 def _sqlite_target(database) -> str | None:
@@ -254,32 +296,33 @@ def _judge(event: str, args: tuple) -> None:
         writes = (isinstance(mode, str) and any(c in mode for c in "wax+")) or (
             mode is None and isinstance(flags, int) and flags & _WRITE_FLAGS
         )
+        reads = (isinstance(mode, str) and ("r" in mode or "+" in mode)) or (
+            mode is None and isinstance(flags, int)
+            and flags & os.O_ACCMODE in (os.O_RDONLY, os.O_RDWR)
+            and not flags & getattr(os, "O_PATH", 0)
+        )
         name = _fspath(path)
-        if mode is None and name and not os.path.isabs(name):
-            # os.open's audit event omits dir_fd, so a relative name may be
-            # relative to a directory descriptor rather than the cwd. Judge it
-            # against the cwd, but label it so a reader knows it is a guess.
-            guess = _absolute(name)
-            if not guess:
-                return
-            if writes:
-                if _label(guess) and not _reopens_unchanged(flags, guess):
-                    _record("relative os.open (dir_fd unknown; judged against cwd)", "write", guess)
-            elif guess in _S.credential_files or _is_credential_file(guess):
-                _record("credential file read (relative os.open; judged against cwd)", "read", guess)
-            return
+        # The event omits dir_fd. Preserve the existing cwd-guess labels.
+        relative = mode is None and name and not os.path.isabs(name)
         target = _absolute(path)
         if target is None:
             return
-        if not writes:
-            if target in _S.credential_files or _is_credential_file(target):
-                _record("credential file read", "read", target)
+        mutates = writes and not (mode is None and _reopens_unchanged(flags, target))
+        write_label = _label(target) if mutates else None
+        if relative and write_label:
+            write_label = "relative os.open (dir_fd unknown; judged against cwd)"
+        if write_label:
+            _record(write_label, "write", target)
+        # Keep an established write even if credential metadata is unavailable.
+        if not reads and (write_label or not mutates):
             return
-        if mode is None and _reopens_unchanged(flags, target):
-            return  # O_CREAT|O_RDONLY on an existing file: nothing changes
-        label = _label(target)
-        if label:
-            _record(label, "write", target)
+        credential = target in _S.credential_files or _is_credential_file(target)
+        if reads and credential:
+            label = ("credential file read (relative os.open; judged against cwd)"
+                     if relative else "credential file read")
+            _record(label, "read", target)
+        if mutates and not write_label and credential:
+            _record("credential file write", "write", target)
         return
     if event == "sqlite3.connect":
         target = _sqlite_target(args[0])
@@ -287,11 +330,10 @@ def _judge(event: str, args: tuple) -> None:
         if label:
             _record(label, "sqlite connect", target)
         return
-    if event == "os.rename":
-        pairs = ((args[0], args[2]), (args[1], args[3]))
-    elif event == "os.link":
-        pairs = ((args[1], args[3]),)
-    elif event == "os.symlink":
+    if event in ("os.rename", "os.link"):
+        _judge_names(event, args)
+        return
+    if event == "os.symlink":
         pairs = ((args[1], args[2]),)
     elif event == "os.truncate":
         pairs = ((args[0], None),)
@@ -305,6 +347,44 @@ def _judge(event: str, args: tuple) -> None:
             _record(label, event, target)
 
 
+def _unknown(event, stage, error):
+    with _fault_lock:
+        _S.faults += 1
+    try:
+        try:
+            node = _node()
+        except (KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise
+        except BaseException:
+            node = "<attribution unavailable>"
+        # Only names of these builtin classes, never the exception's own type
+        # name or values. Keep this best-effort evidence behind the count above.
+        reason = next(kind.__name__ for kind in (
+            FileNotFoundError, NotADirectoryError, PermissionError, OSError,
+            ValueError, TypeError, RuntimeError, AssertionError, Exception, BaseException,
+        ) if isinstance(error, kind))
+        _S.hits[(node, "observer fault", f"{event}/{stage}/{reason}", "<not captured>")] = None
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        raise
+    except BaseException:
+        # Diagnostic failure must neither escape into the observed operation
+        # nor recursively count itself. The existing count invalidates the census.
+        pass
+
+
+def _judge_names(event, args):
+    try:
+        effects = _live_writes_fs.name_effects(os, _absolute, event, args)
+    except (OSError, ValueError) as error:
+        _unknown(event, "name-effects", error)
+        # Metadata uncertainty must not erase an established destination hit.
+        effects = _live_writes_fs.uncertain_name_effects(_absolute, event, args)
+    for target, operation in effects:
+        label = target and _label(target)
+        if label:
+            _record(label, operation, target)
+
+
 def _no_op(event: str, index: int, target: str) -> bool:
     """True when the call cannot change anything: the audit event fires before
     the system call, so an attempt the kernel refuses (or that is a no-op, such
@@ -312,9 +392,7 @@ def _no_op(event: str, index: int, target: str) -> bool:
     if event == "os.mkdir":
         # Any existing name, directory or not (a file, a dangling symlink): EEXIST.
         return os.path.lexists(target)
-    if event in ("os.remove", "os.rmdir", "shutil.rmtree") or (
-        event == "os.rename" and index == 0
-    ):
+    if event in ("os.remove", "os.rmdir", "shutil.rmtree"):
         if not os.path.lexists(target):
             return True
         is_dir = os.path.isdir(target) and not os.path.islink(target)
@@ -330,16 +408,56 @@ def _no_op(event: str, index: int, target: str) -> bool:
     return False
 
 
+def _is_missing_credential_target(name: str) -> bool:
+    """Resolve missing named targets while preserving nonabsence errors."""
+    target = os.path.realpath(name, strict=_MISSING_STRICT)
+    unavailable = None
+    for credential in _S.credential_files:
+        try:
+            current = os.path.realpath(credential, strict=_MISSING_STRICT)
+        except NotADirectoryError:
+            continue
+        except (OSError, ValueError) as error:
+            unavailable = error
+            continue
+        if current == target:
+            return True
+    if unavailable is not None:
+        raise unavailable
+    return False
+
+
 def _is_credential_file(name: str) -> bool:
-    """Whether ``name`` is one of the credential files under another name (a
-    symlink or hard link): one ``stat``, compared by device and inode."""
-    if not _S.credential_inodes:
-        return False
+    """Match initial identities or the current logical credential names.
+
+    Fresh metadata handles replacement/late creation without a stale cache or
+    an accumulating inode history. No credential contents are read.
+    """
     try:
         st = os.stat(name)
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        # A dangling logical credential symlink can create this named target.
+        # Unlike permissive _absolute, this cannot silently absorb EACCES/EIO.
+        return _is_missing_credential_target(name)
+    except NotADirectoryError:
         return False
-    return (st.st_dev, st.st_ino) in _S.credential_inodes
+    identity = (st.st_dev, st.st_ino)
+    if identity in _S.credential_inodes:
+        return True
+    unavailable = None
+    for credential in _S.credential_files:
+        try:
+            current = os.stat(credential)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except (OSError, ValueError) as error:
+            unavailable = error
+            continue
+        if identity == (current.st_dev, current.st_ino):
+            return True
+    if unavailable is not None:
+        raise unavailable  # an unestablished negative judgment is unknown
+    return False
 
 
 def _ordinary_read(args: tuple) -> bool:
@@ -356,36 +474,50 @@ def _ordinary_read(args: tuple) -> bool:
         return False
     name = _fspath(args[0])
     if not name:
-        return True
+        return False  # integer descriptors need the existing proc-fd lookup
     return not name.endswith((
         "secrets.env", ".credentials.json", "hosts.yml", "cc_oauth_token.env",
     )) and not _is_credential_file(name)  # fmt: skip
 
 
 def _hook(event: str, args: tuple) -> None:
-    if event not in _EVENTS or getattr(_busy, "on", False):
+    if event not in _EVENTS:
         return
     # Everything past the event check runs under the guard and the exception
     # boundary, the read-side credential lookup included: its os.stat can raise
     # (a test that patches it) and is itself an audited open.
+    was_busy = getattr(_busy, "on", False)
     _busy.on = True
+    stage = "fd-witness"
     try:
-        if event == "open" and _ordinary_read(args):
+        _W.note(event, args)
+        if was_busy:
             return
+        if event == "open":
+            stage = "open-no-effect"
+            try:
+                if _live_writes_fs.open_no_effect(os, _absolute, args):
+                    return
+            except (OSError, ValueError) as error:
+                _unknown(event, stage, error)  # retain conservative observations as well
+            stage = "ordinary-read"
+            if _ordinary_read(args):
+                return
+        stage = "judge"
         _judge(event, args)
     except (KeyboardInterrupt, SystemExit, GeneratorExit):
         raise
-    except BaseException:  # pytest outcomes also must not escape an observer
-        with _fault_lock:
-            _S.faults += 1
+    except BaseException as error:  # pytest outcomes also must not escape an observer
+        _unknown(event, stage, error)
     finally:
-        _busy.on = False
+        _busy.on = was_busy
 
 
 def install(config) -> None:
     """Arm the write audit. Idempotent: an audit hook cannot be removed."""
     if _S.installed:
         return
+    _S.census_id = os.environ.get("GENESIS_LIVE_WRITES_RUN_ID")
     from tests import _live_closure, _live_fence
 
     # The fence (installed first in the suite) owns the real home. Without it
@@ -433,8 +565,8 @@ def install(config) -> None:
         classes.append((repo, "this checkout"))
     # Most specific root first, so a checkout inside another path wins.
     _S.classes = tuple(sorted(classes, key=lambda c: -len(c[0])))
-    _S.credential_files = frozenset(
-        os.path.realpath(os.path.join(home, rel))
+    _S.credential_files = frozenset({os.fspath(home_config_location(Path(home)))}) | frozenset(
+        os.path.join(home, rel)
         for rel in (
             "genesis/secrets.env",
             ".claude/.credentials.json",
@@ -452,22 +584,38 @@ def install(config) -> None:
     _S.credential_inodes = frozenset(inodes)
     sys.addaudithook(_hook)
     _S.installed = True
+    _W.install()
 
 
+@pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus):
     # An xdist worker's terminal summary never reaches the run, so it hands its
     # hits to the controller (pytest_testnodedown), as the live fence does.
+    # Earlier ordinary hooks may update Session after the argument was copied.
+    _S.exitstatus = int(getattr(session, "exitstatus", exitstatus))
     if hasattr(session.config, "workeroutput"):
+        hits, state = _W.capture(_live_writes_report.observation_state)
         session.config.workeroutput["genesis_live_writes"] = {
             # As bytes: xdist's channel refuses a str it cannot encode as UTF-8
             # (MEASURED: execnet DumpError), which an undecodable path is.
             "hits": [
                 [field.encode("utf-8", "surrogateescape") for field in key]
-                for key in dict.copy(_S.hits)
+                for key in hits
             ],
-            "disarmed": _S.disarmed,
-            "faults": _S.faults,
+            "disarmed": state["disarmed"],
+            "faults": state["faults"],
         }
+        if _S.census_id:
+            session.config.workeroutput["genesis_live_writes"]["census"] = state
+
+
+def _worker_id(node):
+    return (getattr(node, "gateway", None) and getattr(node.gateway, "id", None)) or "a worker"
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node):
+    _S.expected_workers.add(_worker_id(node))
 
 
 @pytest.hookimpl(optionalhook=True)
@@ -475,7 +623,7 @@ def pytest_testnodedown(node, error):
     """The controller merges each worker's hits, so an xdist run reports what a
     serial one would. A worker that went down without reporting is named in the
     summary: its writes are unknown, not absent."""
-    worker = (getattr(node, "gateway", None) and getattr(node.gateway, "id", None)) or "a worker"
+    worker = _worker_id(node)
     if worker in _S.merged_workers:
         return  # xdist can report one worker down twice (an interrupted run)
     _S.merged_workers.add(worker)
@@ -483,6 +631,8 @@ def pytest_testnodedown(node, error):
     if got is None:
         _S.unreported.append(f"{worker} ({error})" if error else worker)
         return
+    census = got.get("census")
+    _S.worker_status[worker] = dict.copy(census) if isinstance(census, dict) else None
     for key in got["hits"]:
         _S.hits[tuple(field.decode("utf-8", "surrogateescape") for field in key)] = None
     if got["disarmed"]:
@@ -494,22 +644,25 @@ def pytest_testnodedown(node, error):
 def pytest_terminal_summary(terminalreporter):
     if hasattr(terminalreporter.config, "workeroutput"):
         return  # a worker: its hits go to the controller, which reports once
+    hits, state = _W.capture(_live_writes_report.census_state)
     if not _S.installed:
         if _S.disarmed:
             terminalreporter.write_line(f"live writes: disarmed ({_S.disarmed})", yellow=True)
-        return
+        else:
+            terminalreporter.write_line("live writes: not installed (unknown, not clean)", yellow=True)
     tr = terminalreporter
-    if _S.faults:
-        tr.write_line(f"live writes: {_S.faults} events could not be classified (unknown, not clean)", yellow=True)
+    # The captured census, not the live count: a thread the run left behind can
+    # still record a fault after the capture, and the receipt cannot hold it.
+    if state["faults"]:
+        tr.write_line(f"live writes: {state['faults']} events could not be classified (unknown, not clean)", yellow=True)
     # One snapshot: a thread the run left behind can still record while this runs,
     # and iterating the live dict would raise and fail a run this only reports on.
     # dict.copy() takes it in one step under the GIL, without iterating the dict.
-    hits = list(dict.copy(_S.hits))
     if hits:
         by_class: dict[str, set[str]] = {}
         for node, label, _op, _path in hits:
             by_class.setdefault(label, set()).add(node)
-        tr.section("live writes: writes outside the test's temp dirs (reported, not failed)")
+        tr.section("live writes: audit observations (reported, not failed)")
         for label, nodes in sorted(by_class.items()):
             outside = "<outside a test>" in nodes
             count = len(nodes) - outside
@@ -521,7 +674,10 @@ def pytest_terminal_summary(terminalreporter):
         try:
             # surrogateescape: a path os.fsdecode() could not decode is written back
             # as its original bytes instead of failing the run.
-            text = "".join("\t".join(key) + "\n" for key in hits)
-            Path(report).write_bytes(text.encode("utf-8", "surrogateescape"))
+            _live_writes_report.publish(report, hits, state)
         except (OSError, UnicodeError) as exc:  # report-only: never fails a run
             tr.write_line(f"live writes: could not write the report {report}: {exc}", yellow=True)
+
+
+def pytest_unconfigure(config):
+    _W.close()

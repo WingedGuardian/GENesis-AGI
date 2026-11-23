@@ -235,6 +235,65 @@ _SECRET_GROUPS = (
 )
 
 
+#: A labelled username ("username: X", "user X", "login is X"), and the user
+#: part of a URL userinfo (the text before ":" and "@" after the scheme).
+#: The label starts a word after whitespace, a quote or a bracket (never
+#: inside a URL's userinfo or "db-user:"), takes an explicit separator, and the
+#: username ends before ":" or "@" (what follows a "user:" is its password).
+_USERNAME_LABEL_PATTERN = re.compile(
+    r"(?:^|(?<=[\s(\"']))(?:username|user|login)\s*(?:is\s+|[:=]\s*)"
+    rf"(?P<user>(?!{_LABEL_WORDS}\b)[^\s,;/:@]+)",
+    re.IGNORECASE,
+)
+#: "user X pass Y": a bare-space label is a username only when a password
+#: label follows the one word after it.
+_USERNAME_BEFORE_PASSWORD = re.compile(
+    r"(?:^|(?<=[\s(\"']))(?:username|user|login)\s+"
+    rf"(?P<user>(?!{_LABEL_WORDS}\b)[^\s,;/:@]+)\s+(?:password|pass|pwd)\b",
+    re.IGNORECASE,
+)
+#: At most this many distinct usernames are taken from one text: past it the
+#: rest stay masked (the safe side), so a crafted upload costs a bounded scan.
+MAX_USERNAMES = 1000
+_URL_USER_PATTERN = re.compile(r"://(?P<user>[^\s/?#:@]+):[^\s@]*@")
+_USERNAME_HINT = re.compile(r"user|login|mail|://", re.IGNORECASE)
+
+
+def captured_usernames(texts: list[str]) -> set[str]:
+    """Every username the credential patterns recognise in ``texts``: a
+    labelled one, the email of an "email X ... password Y" pair, and the user
+    of a URL's userinfo. A username is never masked (owner ruling 2026-11-18),
+    so the hold-out masking leaves these out of its probes."""
+    found: dict[str, None] = {}
+    for text in texts:
+        # Every pattern needs one of these words (or "://"): a cheap scan first,
+        # so a megabyte upload without them costs one pass.
+        if not text or not _USERNAME_HINT.search(text):
+            continue
+        for pattern, group in (
+            (_USERNAME_LABEL_PATTERN, "user"),
+            (_USERNAME_BEFORE_PASSWORD, "user"),
+            (_CREDENTIAL_PAIR_PATTERN, "user"),
+            (_EMAIL_PASSWORD_PATTERN, "email"),
+            (_URL_USER_PATTERN, "user"),
+        ):
+            for match in pattern.finditer(text):
+                start = match.start()
+                if pattern is not _URL_USER_PATTERN and start and not (
+                    text[start - 1].isspace() or text[start - 1] in "(\"'"
+                ):
+                    continue  # a label inside a word or a URL
+                user = (match.group(group) or "").strip()
+                if group == "user":
+                    user = re.split(r"[:@]", user, maxsplit=1)[0]
+                user = user.rstrip(".,;:)\"'")
+                if user:
+                    found[user] = None
+                if len(found) >= MAX_USERNAMES:
+                    return set(found)
+    return set(found)
+
+
 def captured_secrets(texts: list[str]) -> set[str]:
     """Every secret a credential pattern above captures in ``texts``, across
     every match of every pattern: the secrets the capture rules recognise in
@@ -262,28 +321,70 @@ def _looks_ephemeral(content: str) -> bool:
     return bool(_EPHEMERAL_PATTERN.search(content))
 
 
-def _derive_identifier(extraction: Extraction, *, default_prefix: str) -> str:
+def _derive_identifier(
+    extraction: Extraction, *, default_prefix: str, whole_tokens: bool = False,
+) -> str:
     """Build a human-readable identifier for the entry.
 
     Preference order:
     1. First named entity from the extraction
     2. First 80 chars of content trimmed to a sentence
     3. Default prefix with a short hash of the content
+
+    ``whole_tokens`` (a credential): a cut never splits a whitespace token, so
+    no part of a secret survives it; the ingest chokepoint masks every whole
+    one it sees (#2426).
     """
+    cut = _cut_whole if whole_tokens else _cut_plain
     if extraction.entities:
         first = extraction.entities[0].strip()
         if first:
-            return first[:120]
+            return cut(first, 120)
     content = extraction.content.strip()
     if not content:
         return f"{default_prefix} (empty)"
-    # Take up to the first period or newline
+    # Take up to the first period or newline. For a credential the stop must end
+    # its token and lie outside every captured secret, so the name is the same
+    # across a password rotation and never cuts through a secret (#2426).
+    held = (
+        [
+            # A capture's trailing punctuation ends a sentence, not the secret.
+            (m.start(g), m.start(g) + len(m.group(g).rstrip(".,;:)\"'")))
+            for pattern, g in _SECRET_GROUPS
+            for m in pattern.finditer(content)
+            if m.group(g)
+        ]
+        if whole_tokens
+        else []
+    )
     for stop in (".", "\n", ";"):
         idx = content.find(stop)
+        while idx != -1 and whole_tokens and (
+            (stop != "\n" and idx + 1 < len(content) and not content[idx + 1].isspace())
+            or any(start <= idx < end for start, end in held)
+        ):
+            idx = content.find(stop, idx + 1)
         if 0 < idx < 80:
             content = content[:idx]
             break
-    return content[:80].strip() or default_prefix
+    return cut(content, 80).strip() or default_prefix
+
+
+def _cut_plain(text: str, limit: int) -> str:
+    return text[:limit]
+
+
+def _cut_whole(text: str, limit: int) -> str:
+    """``text`` cut to at most ``limit`` characters at a whitespace boundary.
+    A first token longer than the limit is kept whole: the chokepoint masks it
+    and then caps it."""
+    if len(text) <= limit or text[limit].isspace():
+        return text[:limit]
+    at = max(text.rfind(sep, 0, limit) for sep in (" ", "\n", "\t"))
+    if at > 0 and text[:at].strip():
+        return text[:at]
+    end = min((i for i in (text.find(sep, limit) for sep in (" ", "\n", "\t")) if i != -1), default=len(text))
+    return text[:end]
 
 
 def _user_shared(token: str | None, user_text: str | None) -> bool:
@@ -341,7 +442,7 @@ def classify_as_reference(
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
-                    extraction, default_prefix="login",
+                    extraction, whole_tokens=True, default_prefix="login",
                 ),
                 "value": f"{user} / {password}",
                 "description": content,
@@ -360,7 +461,7 @@ def classify_as_reference(
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
-                    extraction, default_prefix="login",
+                    extraction, whole_tokens=True, default_prefix="login",
                 ),
                 "value": f"{email} / {password}",
                 "description": content,
@@ -379,7 +480,7 @@ def classify_as_reference(
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
-                    extraction, default_prefix="account",
+                    extraction, whole_tokens=True, default_prefix="account",
                 ),
                 "value": f"{account} / {password}",
                 "description": content,
@@ -397,7 +498,7 @@ def classify_as_reference(
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
-                    extraction, default_prefix="credential",
+                    extraction, whole_tokens=True, default_prefix="credential",
                 ),
                 "value": f"password: {password}",
                 "description": content,
@@ -412,7 +513,7 @@ def classify_as_reference(
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
-                    extraction, default_prefix="api_key",
+                    extraction, whole_tokens=True, default_prefix="api_key",
                 ),
                 "value": f"token: {tok_value}",
                 "description": content,
@@ -427,7 +528,7 @@ def classify_as_reference(
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
-                    extraction, default_prefix="token",
+                    extraction, whole_tokens=True, default_prefix="token",
                 ),
                 "value": f"token: {tok_value}",
                 "description": content,
@@ -447,7 +548,7 @@ def classify_as_reference(
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
-                    extraction, default_prefix=key,
+                    extraction, whole_tokens=True, default_prefix=key,
                 ),
                 "value": f"{key}={val}",
                 "description": content,
@@ -546,10 +647,6 @@ def _format_reference_body(
     formatter so content extracted automatically has the same shape as
     content stored manually.
     """
-    if kind == "credentials":
-        from genesis.memory.reference_ops import refuse_trailer_shaped_value
-
-        refuse_trailer_shaped_value(value)
     lines = [
         f"[reference.{kind}] {identifier}",
         "",
@@ -643,6 +740,9 @@ async def ingest_reference_from_extraction(
             collection="episodic_memory",
             memory_type="episodic",
             confidence=0.60,  # auto-captured: lower than reference_store (0.85)
+            # A credential's value and description, as captured: held out whole,
+            # so a multi-line value is never split by how its lines look (#2426).
+            **({"held_value": value, "held_detail": description} if kind == "credentials" else {}),
         )
     except Exception:
         logger.warning(

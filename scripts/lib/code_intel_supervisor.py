@@ -4,8 +4,21 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+import sys
 import time
 from pathlib import Path
+
+
+class OrphanHeld(ValueError):
+    """The original lifetime cannot yet be closed."""
+
+
+class SourceChanged(ValueError):
+    """The runner source changed on disk since this run captured it."""
+
+
+_SOURCE_DEFERRED = "owner-loss reconciliation deferred: runner source changed since capture"
 
 
 class Supervisor:
@@ -16,13 +29,11 @@ class Supervisor:
 
     def _guard(self):
         snapshot = self.snapshot
-        if (
-            snapshot.profile != "runner"
-            or snapshot.runtime_value is not None
-            or not snapshot.current_matches()
-        ):
+        if snapshot.profile != "runner" or snapshot.runtime_value is not None:
             raise ValueError("captured supervised reconciliation requires current runner source")
         self.lock_check()  # Existing canonical fd8 identity and actual lock.
+        if not snapshot.current_matches():
+            raise SourceChanged("captured supervised reconciliation requires current runner source")
 
     def _observe_schema5(self, observe):
         queue = self.modules["queue"]
@@ -275,15 +286,80 @@ class Supervisor:
                         observe_inputs=observe, fresh_cleanup=queue._fresh_gate(db))
         return result  # Commit and receipt durability precede acknowledgement.
 
-    def reconcile_context(self, context):
+    def reconcile_orphans(self):
+        # Source that changed on disk since this tick captured it (a pull or an
+        # update), before or during the sweep, defers the sweep with nothing
+        # further changed and lets the tick go on; the next tick captures fresh
+        # source and sweeps. Explicit reconciliation still refuses, through _guard.
+        try:
+            self._guard()
+        except SourceChanged:
+            print(_SOURCE_DEFERRED, file=sys.stderr)
+            return False
+        modules = self.modules
+        queue, scope = modules["queue"], modules["scope"]
+        contexts = self._observe_schema5(lambda db: [
+            {key: row[key] for key in queue._legs.CONTEXT}
+            for row in db.execute(
+                "SELECT hash, repo_path, provider, protocol, execution_seq, claim_id FROM executions "
+                "WHERE protocol=3 AND launch_reservation IS NOT NULL "
+                "AND control_closure IS NULL ORDER BY execution_seq"
+            )
+        ])
+        if not contexts:
+            return False
+        try:
+            boot = scope.automatic_owner_boot(Path("/proc"))
+        except scope.OwnerObservationUnavailable:
+            print("owner-loss reconciliation retained unresolved work: proc view unavailable", file=sys.stderr)
+            return False
+        busy, held = False, 0
+        for context in contexts:
+            try:
+                self.reconcile_context(context, automatic_boot=boot)
+            except SourceChanged:
+                print(_SOURCE_DEFERRED, file=sys.stderr)
+                break
+            except (
+                OrphanHeld,
+                scope.OwnerObservationUnavailable,
+                modules["owner_admission"].RepositoryMissing,
+                modules["owner_admission"].RepositoryRelocated,
+            ):
+                held += 1
+            except (queue._legacy.QueueBusy, modules["owner_admission"].RepositoryBusy):
+                busy = True
+            except sqlite3.OperationalError as error:
+                if not queue._is_busy(error):
+                    raise
+                busy = True
+        if held:
+            print(f"owner-loss reconciliation retained {held} unresolved execution(s)", file=sys.stderr)
+        return busy
+
+    def reconcile_context(self, context, *, automatic_boot=None):
         self._guard()
         modules = self.modules
         queue = modules["queue"]
         context = queue._native.context(context, queue._legs, queue.marker_hash)
+        if automatic_boot is not None:
+            # Advisory proof avoids touching decision storage for a live owner.
+            def ended(db):
+                row = queue._native.execution(db, context, queue._legs)
+                if not queue._recovery.control_pending(row):
+                    return False
+                reservation = queue._native.reservation(json.loads(row["launch_reservation"]), context)
+                return modules["scope"].owner_ended(
+                    reservation["owner"], modules["proof"].__dict__, automatic_boot=automatic_boot
+                )
+
+            if not self._observe_schema5(ended):
+                return None
         with modules["owner_admission"].repository_lock(modules, context):
-            self._observe_schema5(lambda db: None)
-            with queue._decision_gate(native=True) as (db, finalize):
-                reconcile_orphan(modules, context, db)
+            if automatic_boot is None:
+                self._observe_schema5(lambda db: None)
+            with queue._decision_gate(native=True, existing=automatic_boot is not None) as (db, finalize):
+                reconcile_orphan(modules, context, db, automatic_boot=automatic_boot)
                 # Drain callback evidence, but do not interpret the residual set
                 # as grant/acceptance authority. This reply acknowledges only
                 # the exact row; retained conflicts still fence later admission.
@@ -292,7 +368,7 @@ class Supervisor:
         return result  # Acknowledgement only after the existing durable commit.
 
 
-def reconcile_orphan(modules, context, db, *, proc=Path("/proc")):
+def reconcile_orphan(modules, context, db, *, proc=Path("/proc"), automatic_boot=None):
     """Collect a fresh exact-owner witness on the admitted supervisor connection.
 
     This is an internal captured-supervisor seam, not generic event publication.
@@ -304,9 +380,20 @@ def reconcile_orphan(modules, context, db, *, proc=Path("/proc")):
         raise RuntimeError("supervised reconciliation requires an admitted transaction")
     context = native.context(context, legs, queue.marker_hash)
     row = native.execution(db, context, legs)
+    if automatic_boot is not None and not queue._recovery.control_pending(row):
+        return native.status(db, context, legs)
 
     def fresh(current):
-        return queue._fresh_cleanup(db, current, proc=proc)
+        try:
+            return queue._fresh_cleanup(db, current, proc=proc)
+        except (FileNotFoundError, ValueError) as error:
+            # Lifetime evidence this execution cannot use (a re-read observation
+            # or retained fact that fails its checks, a spool that vanished) holds
+            # it in the sweep. Permission and other OS errors still stop the tick,
+            # and a malformed spool is refused earlier by the gate's drain.
+            if automatic_boot is None or isinstance(error, OrphanHeld):
+                raise
+            raise OrphanHeld("retained lifetime evidence unavailable") from error
 
     if row["typed_applied_state"] is None:
         native._owns(db, row)
@@ -314,16 +401,24 @@ def reconcile_orphan(modules, context, db, *, proc=Path("/proc")):
         native.reconcile_execution(db, context, legs, fresh_cleanup=fresh)
         return native.status(db, context, legs)
     reserved = native.reservation(json.loads(row["launch_reservation"]), context)
-    if not scope.owner_ended(reserved["owner"], proof.__dict__, proc=proc):
-        raise ValueError("original owner still lives")
+    owner_view = {} if automatic_boot is None else {"automatic_boot": automatic_boot}
+    if not scope.owner_ended(reserved["owner"], proof.__dict__, proc=proc, **owner_view):
+        raise OrphanHeld("original owner still lives")
     cleanup = None
     if row["scope_registration"] is not None:
         registered = json.loads(row["scope_registration"])
-        if not scope.owner_ended(registered["facts"]["reporter"], proof.__dict__, proc=proc):
-            raise ValueError("original reporter still lives")
-        cleanup = scope.cleanup_observation(
-            registered, native.digest(registered), proof, owned_wait=False, proc=proc
-        )
+        if automatic_boot is not None:
+            native.registration_data(registered, proof)
+        if not scope.owner_ended(registered["facts"]["reporter"], proof.__dict__, proc=proc, **owner_view):
+            raise OrphanHeld("original reporter still lives")
+        try:
+            cleanup = scope.cleanup_observation(
+                registered, native.digest(registered), proof, owned_wait=False, proc=proc
+            )
+        except (OSError, ValueError) as error:
+            if automatic_boot is None:
+                raise
+            raise OrphanHeld("original kernel lifetime observation unavailable") from error
         if cleanup["state"] not in ("removed", "rebooted"):
             previous = json.loads(row["cleanup_proof"])["data"] if row["cleanup_proof"] else None
             if (
@@ -331,15 +426,21 @@ def reconcile_orphan(modules, context, db, *, proc=Path("/proc")):
                 or previous.get("owned_wait") is not True
                 or not fresh(row)
             ):
-                raise ValueError("original kernel lifetime is not proved ended")
+                raise OrphanHeld("original kernel lifetime is not proved ended")
             # A retained actual original wait plus a fresh qualified observation
             # already supplies physical proof; never relabel the new no-wait body.
             cleanup = None
     elif row["native_intent"] is not None:
         raise ValueError("intent without original registration cannot close structurally")
-    observer = queue._recovery.owner_identity()
-    if observer["boot_id"] != scope._boot(proc):
-        raise ValueError("supervisor observer belongs to another boot")
+    try:
+        observer = queue._recovery.owner_identity()
+        boot = scope._boot(proc) if automatic_boot is None else scope.automatic_owner_boot(proc)
+        if observer["boot_id"] != boot or (automatic_boot is not None and boot != automatic_boot):
+            raise ValueError("supervisor observer belongs to another boot")
+    except (OSError, ValueError) as error:
+        if automatic_boot is None:
+            raise
+        raise OrphanHeld("final automatic owner observation unavailable") from error
     data = dict(
         state="orphaned",
         reason="owner_died",

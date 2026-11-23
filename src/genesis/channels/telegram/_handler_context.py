@@ -6,12 +6,15 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from genesis.channels.telegram._progress import halts
+
 if TYPE_CHECKING:
     import aiosqlite
     from telegram import Update
 
     from genesis.cc.conversation import ConversationLoop
     from genesis.cc.types import StreamEvent
+    from genesis.channels.telegram._progress import TurnProgress
     from genesis.channels.telegram.adapter_v2 import TelegramAdapterV2
     from genesis.channels.telegram.transport.streaming import DraftStreamer
     from genesis.channels.telegram.transport.typing_breaker import TypingCircuitBreaker
@@ -19,6 +22,20 @@ if TYPE_CHECKING:
     from genesis.channels.voice import VoiceDeliveryHelper
 
 log = logging.getLogger(__name__)
+
+# The argument that says what a tool call is doing, in the order tools use them.
+_PREVIEW_KEYS = ("description", "command", "file_path", "path", "pattern", "query", "url")
+
+
+def _tool_preview(tool_input: object) -> str:
+    """One line naming what a tool call works on; the streamer shortens it."""
+    if not isinstance(tool_input, dict):
+        return ""
+    for key in _PREVIEW_KEYS:
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
 @dataclass
@@ -93,19 +110,36 @@ class HandlerContext:
             return str(msg.message_thread_id)
         return None
 
-    def make_on_event(self, interrupt_event: asyncio.Event, streamer: DraftStreamer | None):
+    def make_on_event(
+        self,
+        interrupt_event: asyncio.Event,
+        streamer: DraftStreamer | None,
+        progress: TurnProgress | None = None,
+    ):
         """Factory for CC event routing callbacks."""
         async def _on_event(event: StreamEvent) -> None:
             if interrupt_event.is_set():
                 return
+            if progress is not None:
+                await progress.on_event(
+                    event.event_type,
+                    event.text,
+                    synthetic=event.is_synthetic,
+                    raw=event.raw,
+                )
+            # A subagent's lines (the Agent tool) are not this turn's narration:
+            # the draft leaves them out, as progress does.
+            subagent = bool((event.raw or {}).get("parent_tool_use_id"))
             if streamer and streamer.enabled:
-                if event.event_type in ("rate_limit_event", "error"):
+                if halts(event.event_type, event.raw):
                     streamer.disable()
                 elif event.event_type == "thinking":
                     await streamer.on_thinking()
+                elif subagent:
+                    pass
                 elif event.event_type == "text" and event.text:
                     await streamer.on_text(event.text)
                 elif event.event_type == "tool_use":
                     tool_name = event.tool_name or "tool"
-                    await streamer.on_tool_use(tool_name)
+                    await streamer.on_tool_use(tool_name, _tool_preview(event.tool_input))
         return _on_event
