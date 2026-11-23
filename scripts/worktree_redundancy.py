@@ -44,6 +44,11 @@ _CACHE_PARTS = frozenset(
     }
 )
 _CACHE_SUFFIXES = (".pyc", ".pyo")
+# Compaction deletes the archive's ONLY copy of anything no commit holds, so
+# its allowlist is narrower than expiry's: only tool caches rebuilt from the
+# sources the commit holds. A directory a project merely ignores
+# (node_modules/, .venv/, config/.generated/) can hold files a user made.
+_REBUILT_PARTS = frozenset({"__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache"})
 
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _CHUNK = 1 << 20
@@ -222,14 +227,16 @@ def _relative(name: str, entry: str) -> str | None:
     return rel
 
 
-def _allowlisted(rel: str, member: tarfile.TarInfo) -> bool:
+def _allowlisted(rel: str, member: tarfile.TarInfo, *, strict: bool = False) -> bool:
     parts = rel.split("/")
-    if any(p in _CACHE_PARTS for p in parts) or rel.endswith(_CACHE_SUFFIXES):
-        return True
     if rel in (".git", ".trash_meta.json"):
         return member.isreg()  # the pointer file and the reaper's own metadata
     if rel == ".abide":
         return member.issym()
+    if strict:
+        return any(p in _REBUILT_PARTS for p in parts[:-1]) or rel.endswith(_CACHE_SUFFIXES)
+    if any(p in _CACHE_PARTS for p in parts) or rel.endswith(_CACHE_SUFFIXES):
+        return True
     if parts[:2] == ["config", ".generated"] and len(parts) > 2:
         return True
     return any(p.endswith(".egg-info") for p in parts[:-1])
@@ -258,7 +265,14 @@ def _unmatched_members(
     stored: Path,
     entry: str,
     tree: dict[str, tuple[str, str]],
+    *,
+    seen: set[str] | None = None,
+    strict: bool = False,
 ) -> list[str]:
+    """Members that do not match ``tree``. ``seen``, when given, collects the
+    path of every file and symlink member, so a caller can also ask which of
+    ``tree``'s paths the archive lacks. ``strict`` is compaction's allowlist,
+    which accepts only rebuilt tool caches (`_REBUILT_PARTS`)."""
     unmatched: list[str] = []
     with tarfile.open(stored, "r:gz") as tf:
         for member in tf:
@@ -269,10 +283,12 @@ def _unmatched_members(
                 raise _Unsafe("archive root is not a directory")
             if not (member.isreg() or member.issym()):
                 raise _Unsafe(f"special member: {member.name!r}")
+            if seen is not None:
+                seen.add(rel)
             want = tree.get(rel)
             # The allowlist is for paths the head does not track: a tracked
             # file under `node_modules/` is compared like any other.
-            if want is None and _allowlisted(rel, member):
+            if want is None and _allowlisted(rel, member, strict=strict):
                 continue
             if member.isreg():
                 # Git records the owner's execute bit, and a mode-only change is

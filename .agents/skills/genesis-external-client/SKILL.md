@@ -12,8 +12,9 @@ ordinary server and labels it `codex`, so every tool call is recorded in
 `client_tool_calls` and credential lookups are stamped `client=codex`, once the
 database has that table and column (migration `20261108071709`; until it runs,
 calls are served and a warning is logged instead). The label
-is a record of which client acted, never a permission. In a Git worktree the
-launcher resolves Genesis's live runtime state through the main checkout.
+is a record of which client acted, never a permission. Codex can start from
+a nested directory in a Git worktree. The project config finds that worktree's
+launcher, which resolves Genesis's live runtime state through the main checkout.
 
 Approvals: read tools are pre-approved; anything that writes, sends, spends or
 spawns asks before it runs, and so does any tool not yet classified in

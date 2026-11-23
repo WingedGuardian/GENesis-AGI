@@ -122,6 +122,16 @@ isolation is still load-bearing for you — it is:
   route returns each key with an empty value and `values_withheld: true`,
   `/api/genesis/backup/status` omits `destinations.tier2.target`, and
   `/api/genesis/backup/config` omits `local_path`, `nas` and `nas_user`.
+  The health route (`/api/genesis/health`), which answers every network for
+  the host-side supervisor, does the same for the fields listed below, and
+  goes further: it serves no free text at all. Every number, boolean and
+  null stays, and a string stays only where an allow-list names it as a
+  status, name, id, commit or timestamp and its value still has that shape
+  (a few code-written descriptions of call sites are the exception). Each
+  withheld string is marked `<field>_hidden: true` and the response
+  `free_text_hidden: true`, so a field a producer adds later is withheld
+  until someone lists it. That route also serves everything to a caller
+  presenting the internal API token.
 
   **This is not the whole class, and it should not be read as one.** The
   carve-out is a list of FIELDS — not a property of a route, a helper, or the
@@ -132,7 +142,14 @@ isolation is still load-bearing for you — it is:
     parsed from `secrets.env.example`), which is the whole file rather than a
     sensitive subset;
   - the backup tier-2 target;
-  - the backup local path, share and username.
+  - the backup local path, share and username;
+  - on the health route: each call site's `last_response` (the text its last
+    model call returned), the deploy checkout's edited file names and its
+    probe error text, the live-repair reports (their counts stay), and every
+    other string the allow-list does not name: exception and provider error
+    text, queue items' reasons and errors, MCP server errors, probe messages
+    and details, the sentinel's trigger reason, the bridge's summary, and
+    memory tags.
 
   Two properties of that list are easy to get wrong. It **nests rather than
   partitions**: the backup path, share and username are themselves registry
@@ -366,7 +383,9 @@ source — there is no `requirements.txt`). Known-CVE scanning runs automaticall
   from failing the job. Dependency installation failures still fail the job.
   Existing ignored advisories are listed with rationale in that job.
 - **Dependabot** — GitHub's dependency-graph security alerts are enabled for
-  the repo, and `.github/dependabot.yml` keeps the GitHub Actions current.
+  the repo. Dependabot opens no pull requests: version updates and automated
+  security fixes are both off, so every dependency or GitHub Actions bump is a
+  deliberate change that checks the new release before it lands.
 
 To scan locally:
 

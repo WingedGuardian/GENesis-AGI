@@ -23,7 +23,8 @@ Sources:
      Genesis has configured".
 
 Idempotent: relies on the UNIQUE(project_type, domain, concept) constraint
-on ``knowledge_units`` plus ``knowledge.upsert`` semantics. Re-running
+on ``knowledge_units`` plus ``knowledge.upsert`` semantics (a credential is
+found again by the hash of its full name, its key being opaque). Re-running
 updates existing entries in place; the first ingestion's stable unit_id is
 preserved.
 
@@ -395,6 +396,8 @@ async def _ingest_entry(
         memory_class="fact",  # bypass 0.7x auto-reference penalty
         concept=entry.identifier,
         tags_json=tags_json,
+        # A credential's value and description, as given, so its Tags line is not held as part of the value.
+        **({"held_value": entry.value, "held_detail": entry.description} if entry.kind == "credentials" else {}),
         # References live in episodic_memory alongside other personal data —
         # match reference_store's invariant (mcp/memory/knowledge.py). Without
         # this, ingest defaults to collection="knowledge_base", stranding

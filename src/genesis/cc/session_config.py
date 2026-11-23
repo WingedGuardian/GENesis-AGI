@@ -179,6 +179,11 @@ _MCP_PROFILES: dict[str, list[str]] = {
 }
 
 
+def _generated_mcp_dir(config_dir: Path) -> Path:
+    """Resolve generated output separately from the source template and root."""
+    return config_dir / ".generated"
+
+
 class SessionConfigBuilder:
     """Builds CC session configurations per type."""
 
@@ -337,7 +342,7 @@ class SessionConfigBuilder:
             logger.warning("Unknown MCP profile %r, using full", profile)
             return None
 
-        generated_dir = config_dir / ".generated"
+        generated_dir = _generated_mcp_dir(config_dir)
         generated_path = generated_dir / f"{profile}_mcp.json"
         template_path = config_dir / "mcp.json.template"
 

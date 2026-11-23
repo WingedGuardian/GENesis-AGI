@@ -14,7 +14,8 @@ On one install it was pasted into 164 of 593 Claude Code sessions over four
 months (2026-05-28 to 2026-10-03). That was counted only among user-typed
 messages; a raw text search over the transcripts double-counts, because
 injected memory snippets quote the prompt. The rules behind most of it already
-existed: CLAUDE.md's Confidence Framework, the five premise questions, and
+existed: CLAUDE.md's Confidence Framework, the premise questions (five then; the
+nine-item premise form now), and
 `.claude/docs/confidence-framework.md`. They were not applied unprompted. The
 advisory plan reminder (`scripts/hooks/plan_confidence_reminder.py`, merged
 2026-09-16) coincided with a fall in how often the prompt was needed. The fall

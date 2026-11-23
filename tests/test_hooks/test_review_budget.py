@@ -861,6 +861,38 @@ def test_graphql_comment_landing_between_reads_is_unknown(monkeypatch, author, r
     assert "evidence_changed_during_evaluation" in got["errors"], got
 
 
+def test_a_clean_comment_on_a_pushed_out_head_between_reads_stays_ok(monkeypatch):
+    """``unresolved_clean_heads`` is advisory output for ``--check-pr``'s no-change
+    note, not budget policy. Before it existed, such a comment changed nothing in
+    the result; it must not now make the double read disagree and turn an ok
+    budget into unknown."""
+    _no_seams(monkeypatch)
+    pushed_out = "9" * 40
+    late = {
+        "fullDatabaseId": "11",
+        "body": "Codex Review: Didn't find any major issues.\nReviewed commit: `"
+        + pushed_out[:10]
+        + "`",
+        "createdAt": "2026-11-01T00:00:00Z",
+        "updatedAt": "2026-11-01T00:00:00Z",
+        "author": {"login": "chatgpt-codex-connector", "__typename": "Bot"},
+    }
+    base = _graphql_server(files=_FILES, commits=_COMMITS)
+    grown = _graphql_server(comments=[late], files=_FILES, commits=_COMMITS)
+    calls = []
+
+    def serve(argv, *, timeout):
+        calls.append(argv)
+        return (base if len(calls) == 1 else grown)(argv, timeout=timeout)
+
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "ok", got
+    # Control: the comment IS recognised, so the two reads really disagree on the
+    # advisory field. Without this the test would pass if it were ignored.
+    alone = rb.evaluate_pr("owner/repo", 7, runner=grown, external_identity_templates=())
+    assert [h["head"] for h in alone["unresolved_clean_heads"]] == [pushed_out[:10]], alone
+
+
 @pytest.mark.parametrize("login,kind", [
     ("someone", "User"), ("coderabbitai", "Bot"), ("github-actions", "Bot"),
 ])

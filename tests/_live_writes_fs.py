@@ -18,19 +18,18 @@ def _entry(fs, path):
 
 def open_no_effect(fs, resolve, args):
     path, mode, flags = args
-    if isinstance(path, int):
-        return False  # fdopen(..., 'x') can write through an existing descriptor
-    if mode is None and isinstance(flags, int) and flags & getattr(fs, "O_PATH", 0):
+    # High-level open events do not identify the opener.
+    if mode is not None or isinstance(path, int) or not isinstance(flags, int):
+        return False
+    if flags & getattr(fs, "O_PATH", 0):
         return True  # Linux ignores data-access/creation flags with O_PATH
-    exclusive = (isinstance(mode, str) and "x" in mode) or (
-        isinstance(flags, int) and flags & fs.O_CREAT and flags & fs.O_EXCL
-    )
-    nofollow = isinstance(flags, int) and flags & getattr(fs, "O_NOFOLLOW", 0)
+    exclusive = flags & fs.O_CREAT and flags & fs.O_EXCL
+    nofollow = flags & getattr(fs, "O_NOFOLLOW", 0)
     if not exclusive and not nofollow:
         return False
     # A raw relative open can use an omitted dir_fd. Cwd metadata cannot prove
     # it refuses: keep the core's conservative, explicitly labelled cwd guess.
-    if mode is None and not fs.path.isabs(fs.fspath(path)):
+    if not fs.path.isabs(fs.fspath(path)):
         return False
     entry = _entry(fs, resolve(path, follow=False))
     return entry is not None and (bool(exclusive) or stat.S_ISLNK(entry.st_mode))
@@ -75,4 +74,13 @@ def uncertain_name_effects(resolve, event, args):
             continue
         operation = "os.link source" if event == "os.link" and index == 0 else event
         effects.append((target, operation))
+    if event == "os.link":
+        # The followed source can still be resolved when other metadata fails.
+        try:
+            target = resolve(args[0], args[2])
+        except (OSError, ValueError):
+            return effects
+        observation = (target, "os.link source")
+        if target is not None and observation not in effects:
+            effects.append(observation)
     return effects

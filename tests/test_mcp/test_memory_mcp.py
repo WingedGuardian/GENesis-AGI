@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from genesis.mcp.memory_mcp import mcp
+from genesis.memory.reference_ops import display_name
 
 
 async def _get_tools():
@@ -478,7 +479,9 @@ async def test_reference_store_full_roundtrip():
             row = await mod.knowledge.get(real_db, unit_id)
             assert row["project_type"] == "reference"
             assert row["domain"] == "reference.credentials"
-            assert row["concept"] == "HobbyForum forum login"
+            # The key is opaque; the entry is shown and found by its name.
+            assert row["concept"].startswith("cred-")
+            assert display_name(row) == "HobbyForum forum login"
             # #2426: the value is held out of the indexed body, in its own table.
             assert "hunter2" not in row["body"]
             assert "Value: [held in the reference secret store; read it with reference_lookup]" in row["body"]

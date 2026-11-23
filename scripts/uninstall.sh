@@ -563,6 +563,8 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-browser-stack.timer genesis-browser-stack.service \
                     genesis-inbox-sync.timer genesis-inbox-sync.service \
                     genesis-serena-claude-code.service genesis-serena-codex.service \
+                    genesis-mcp-health.service genesis-mcp-memory.service \
+                    genesis-mcp-outreach.service genesis-mcp-recon.service \
                     genesis-backup.timer genesis-backup.service \
                     genesis-server.service genesis-bridge.service \
                     genesis-live-agent.service \

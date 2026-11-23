@@ -10,10 +10,11 @@ pre-deploy and not call a guarded tool until after a deploy lands. Capturing
 ``spawn_at`` lazily on that first call would record a POST-deploy timestamp and
 the guard would never recognise the process as stale.
 
-``spawn_commit`` is read from ``env.repo_root()`` (the main tree — MCP servers
-always launch from there), so a worktree session still reports main's HEAD, the
-same line the deploy advances. On any git failure it is ``None`` → the guard
-fails open (never blocks a process whose code identity is unknowable).
+Legacy ``spawn_commit`` is read from ``env.repo_root()`` (the main tree), so a
+worktree session still reports the ordinary server checkout's HEAD. Explicit
+shared launchers pass their actual source root and decline slot persistence;
+they are not attributed to a caller's session. On git failure the commit is
+``None``: legacy guards remain fail-open, while shared READY requires identity.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import UTC, datetime
+from pathlib import Path
 
 from genesis.env import repo_root
 from genesis.observability.git_health import _CHEAP_TIMEOUT_S, _run_git
@@ -31,18 +33,24 @@ _spawn_commit: str | None = None
 _spawn_at: str | None = None
 
 
-def capture_spawn_identity() -> None:
+def capture_spawn_identity(*, source_root: Path | None = None, persist_session: bool = True) -> None:
     """Record this subprocess's code commit + start time ONCE, at process start.
 
     Idempotent: subsequent calls are no-ops so a re-entrant bootstrap can't
     overwrite the true (earliest) start time. ``_run_git`` never raises.
+    Shared launchers supply their actual source checkout and decline session
+    persistence; legacy callers retain the main-root, slot-keyed defaults.
     """
     global _spawn_commit, _spawn_at
     if _spawn_at is not None:
         return
     _spawn_at = datetime.now(UTC).isoformat()
-    rc, out, _ = _run_git(repo_root(), "rev-parse", "HEAD", timeout=_CHEAP_TIMEOUT_S)
+    root = repo_root() if source_root is None else source_root
+    rc, out, _ = _run_git(root, "rev-parse", "HEAD", timeout=_CHEAP_TIMEOUT_S)
     _spawn_commit = out.strip() if rc == 0 and out.strip() else None
+
+    if not persist_session:
+        return
 
     # Part B: also PERSIST the spawn commit (keyed by GENESIS_SLOT, validated by
     # the claude session pid on read) so the dashboard — a DIFFERENT process —

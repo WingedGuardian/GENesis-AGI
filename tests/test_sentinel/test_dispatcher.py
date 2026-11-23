@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -130,7 +132,7 @@ class TestGates:
 
 class TestDispatch:
     @pytest.mark.asyncio
-    async def test_successful_dispatch(self):
+    async def test_successful_dispatch(self, tmp_path):
         d = _make_dispatcher()
         d._state.started_at = "2020-01-01T00:00:00+00:00"
 
@@ -148,6 +150,11 @@ class TestDispatch:
         assert result.resolved
         assert result.diagnosis == "test diagnosis"
         assert result.session_id == "test-session-123"
+        mcp_path = Path(d._invoker.run.await_args.args[0].mcp_config)
+        assert mcp_path.is_relative_to(tmp_path)
+        assert set(json.loads(mcp_path.read_text())["mcpServers"]) == {
+            "genesis-health", "genesis-memory", "genesis-outreach",
+        }
         assert d._state.state == SentinelState.HEALTHY
 
     @pytest.mark.asyncio
@@ -1453,11 +1460,18 @@ class TestAlarmClearedHysteresis:
         return d, gate
 
     async def _ticks(self, d, sequence):
+        """Each tick: True (firing), False (absent) or "unknown" (absent, but in
+        the read path's unknown-id channel)."""
         on = [{"id": self._ALARM, "severity": "CRITICAL", "message": "mem"}]
-        calls = [on if present else [] for present in sequence]
+        calls = list(sequence)
 
         async def _alerts(*args, **kwargs):
-            return calls.pop(0)
+            tick = calls.pop(0)
+            if tick == "unknown":
+                if kwargs.get("unknown_ids") is not None:
+                    kwargs["unknown_ids"].add(self._ALARM)
+                return []
+            return on if tick else []
 
         with patch("genesis.mcp.health_mcp._impl_health_alerts", new=_alerts), \
              patch("genesis.sentinel.dispatcher.write_last_run"), \
@@ -1526,6 +1540,29 @@ class TestAlarmClearedHysteresis:
         gate.resolve_request.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_unknown_ticks_never_cancel_the_park(self):
+        """A blind reading (an unreadable scan, a restart) is not a clearance."""
+        d, gate = self._parked()
+        await self._ticks(d, ["unknown", "unknown", "unknown"])
+        assert d._state.state == SentinelState.AWAITING_DISPATCH_APPROVAL
+        gate.resolve_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_tick_breaks_the_absent_streak(self):
+        d, gate = self._parked()
+        await self._ticks(d, [False, "unknown", False])
+        assert d._state.state == SentinelState.AWAITING_DISPATCH_APPROVAL
+        gate.resolve_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_two_absent_ticks_after_an_unknown_one_still_cancel(self):
+        """Control: once readings are definite again, the hysteresis applies."""
+        d, gate = self._parked()
+        await self._ticks(d, ["unknown", False, False])
+        assert d._state.state == SentinelState.HEALTHY
+        gate.resolve_request.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_direct_park_keeps_its_old_behaviour_and_gets_no_cooldown(self):
         """An alarm-less park (escalate_direct, a Guardian concern) has pattern
         "direct:<source>". Its cancel path is unchanged — first tick, no
@@ -1539,6 +1576,205 @@ class TestAlarmClearedHysteresis:
         gate.resolve_request.assert_awaited_once()
         ready, _reason = d._backoff_ready("direct:guardian_dialogue")
         assert ready is True
+
+
+class TestHonestActionResults:
+    """A dispatch is resolved only when EVERY approved action succeeded, and the
+    per-action outcome is recorded (#4302). It used to resolve whenever any
+    action ran, whatever its exit code."""
+
+    @staticmethod
+    def _ran(*outcomes):
+        return [
+            {"command": f"cmd{i}", "success": ok, "stdout": f"out{i}", "stderr": ""}
+            for i, ok in enumerate(outcomes)
+        ]
+
+    def test_all_succeeded_resolves(self):
+        from genesis.sentinel.dispatcher import _record_execution
+
+        r = SentinelResult(dispatched=True)
+        proposed = [{"command": "cmd0"}, {"command": "cmd1"}]
+        _record_execution(r, proposed, self._ran(True, True))
+        assert r.resolved is True
+        assert r.actions_taken == ["cmd0", "cmd1"]
+        assert [o["success"] for o in r.action_outputs] == [True, True]
+        assert r.action_outputs[0]["stdout"] == "out0"
+
+    def test_one_failure_does_not_resolve(self):
+        from genesis.sentinel.dispatcher import _record_execution
+
+        r = SentinelResult(dispatched=True)
+        _record_execution(r, [{"command": "cmd0"}, {"command": "cmd1"}], self._ran(True, False))
+        assert r.resolved is False
+        assert r.actions_taken == ["cmd0", "cmd1"]
+
+    def test_an_action_that_never_started_does_not_resolve(self):
+        """OSError leaves the action out of `executed` entirely."""
+        from genesis.sentinel.dispatcher import _record_execution
+
+        r = SentinelResult(dispatched=True)
+        _record_execution(r, [{"command": "cmd0"}, {"command": "cmd1"}], self._ran(True))
+        assert r.resolved is False
+
+    def test_empty_proposal_does_not_resolve(self):
+        from genesis.sentinel.dispatcher import _record_execution
+
+        r = SentinelResult(dispatched=True)
+        _record_execution(r, [{"command": ""}], [])
+        assert r.resolved is False
+
+    def test_nothing_started_clears_a_preset_resolved_and_keeps_session_actions(self):
+        """No approved action started (every one hit OSError, or the owner
+        rejected): the dispatch is unresolved whatever the result said before,
+        and the session's own actions_taken is not wiped."""
+        from genesis.sentinel.dispatcher import _record_execution
+
+        r = SentinelResult(dispatched=True, resolved=True, actions_taken=["checked logs"])
+        _record_execution(r, [{"command": "cmd0"}], [])
+        assert r.resolved is False
+        assert r.actions_taken == ["checked logs"]
+
+    def test_parse_ignores_self_reported_resolved_beside_proposed_actions(self):
+        """SENTINEL.md: resolved=true means no action is needed. A session that
+        says resolved AND proposes actions is not trusted on the first half."""
+        import json
+
+        d = _make_dispatcher()
+        out = MagicMock()
+        out.text = json.dumps({
+            "diagnosis": "d", "resolved": True,
+            "proposed_actions": [{"command": "cmd0", "description": "x"}],
+        })
+        assert d._parse_output(out, "s1").resolved is False
+        out.text = json.dumps({"diagnosis": "d", "resolved": True, "proposed_actions": []})
+        assert d._parse_output(out, "s1").resolved is True
+
+    @staticmethod
+    def _resolved_and_proposing_output():
+        import json
+
+        out = MagicMock()
+        out.text = json.dumps({
+            "diagnosis": "d", "resolved": True,
+            "proposed_actions": [{"command": "cmd0", "description": "x", "safe": True}],
+        })
+        return out
+
+    @pytest.mark.asyncio
+    async def test_gated_path_runs_actions_and_stays_unresolved_when_none_start(self):
+        """A session that said resolved=true still gets its approved actions
+        run, and when none can start the dispatch escalates, never resolves."""
+        gate = _policy_gate("approved", "req-ok")
+        d = _make_dispatcher(approval_gate=gate)
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        d._invoker.run = AsyncMock(return_value=self._resolved_and_proposing_output())
+        mock_execute = AsyncMock(return_value=[])
+
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"), \
+             patch.object(d, "_execute_approved_actions", mock_execute):
+            result = await d.dispatch(SentinelRequest(
+                trigger_source="test", trigger_reason="test alarm", tier=2,
+            ))
+
+        mock_execute.assert_awaited_once()
+        assert result.resolved is False
+        assert d._state.state == SentinelState.ESCALATED
+
+    @pytest.mark.asyncio
+    async def test_legacy_path_stays_unresolved_when_nothing_runs(self):
+        d = _make_dispatcher(outreach_pipeline=AsyncMock())
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        d._invoker.run = AsyncMock(return_value=self._resolved_and_proposing_output())
+        approve_and_execute = AsyncMock(return_value=[])
+
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"), \
+             patch.object(d, "_request_dispatch_approval", AsyncMock(return_value=True)), \
+             patch.object(d, "_approve_and_execute_actions", approve_and_execute):
+            result = await d.dispatch(SentinelRequest(
+                trigger_source="test", trigger_reason="test alarm", tier=2,
+            ))
+
+        approve_and_execute.assert_awaited_once()
+        assert result.dispatched is True
+        assert result.resolved is False
+        assert d._state.state == SentinelState.ESCALATED
+
+    @pytest.mark.asyncio
+    async def test_resume_stays_unresolved_when_no_action_starts(self):
+        """A parked result that says resolved (written before the parse rule,
+        or by any other path) cannot survive a resume where nothing started."""
+        import json
+
+        from genesis.sentinel.dispatcher import _serialize_request
+
+        d = _make_dispatcher()
+        request = SentinelRequest(
+            trigger_source="fire_alarm", trigger_reason="t", tier=2, alarms=[_alarm(2)],
+        )
+        d._state.pending_policy_id = "sentinel_action"
+        d._state.pending_request_id = "req-r1"
+        d._state.pending_pattern = "test:tier2"
+        d._state.pending_request_json = _serialize_request(request)
+        d._state.pending_cc_result_json = json.dumps({
+            "dispatched": True, "resolved": True, "proposed_actions": [{"command": "cmd0"}],
+        })
+        d._state.transition(SentinelState.AWAITING_ACTION_APPROVAL, reason="test setup")
+        mock_execute = AsyncMock(return_value=[])
+
+        async def _alerts(*args, **kwargs):
+            return [{"id": "test:tier2", "severity": "WARNING", "message": "t2"}]
+
+        with patch("genesis.mcp.health_mcp._impl_health_alerts", new=_alerts), \
+             patch("genesis.sentinel.dispatcher.classify_alerts", return_value=[_alarm(2)]), \
+             patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"), \
+             patch.object(d, "_execute_approved_actions", mock_execute):
+            result = await d.resume_from_approval("req-r1", "approved")
+
+        mock_execute.assert_awaited_once()
+        assert result is not None and result.resolved is False
+        assert d._state.state == SentinelState.ESCALATED
+
+    @pytest.mark.asyncio
+    async def test_failed_action_escalates_and_says_so(self):
+        """End to end through dispatch(): an approved action that exits non-zero
+        ends ESCALATED, and the completion event counts the failure."""
+        gate = _policy_gate("approved", "req-ok")
+        d = _make_dispatcher(approval_gate=gate)
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        d._invoker.run = AsyncMock(return_value=_proposed_actions_output())
+
+        async def _execute(actions):
+            return [
+                {**a, "success": i == 0, "stdout": "", "stderr": "boom" if i else ""}
+                for i, a in enumerate(actions)
+            ]
+
+        events = []
+
+        async def _emit(severity, event_type, message):
+            events.append((severity, event_type, message))
+
+        with patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"), \
+             patch.object(d, "_execute_approved_actions", side_effect=_execute), \
+             patch.object(d, "_emit_event", side_effect=_emit):
+            result = await d.dispatch(SentinelRequest(
+                trigger_source="test", trigger_reason="test alarm", tier=2,
+            ))
+
+        assert result.resolved is False
+        assert d._state.state == SentinelState.ESCALATED
+        completed = [e for e in events if e[1] == "sentinel.completed"]
+        assert completed and completed[0][0] == "WARNING"
+        assert "1 of 2 succeeded" in completed[0][2]
 
 
 def _alarm(tier: int) -> FireAlarm:
@@ -1760,8 +1996,10 @@ class TestTriggeringTierPark:
             alarms=[_alarm(2), _alarm(3)],
         )
 
-    async def _re_verify(self, d, req, classified):
+    async def _re_verify(self, d, req, classified, unknown=()):
         async def _alerts(*args, **kwargs):
+            if kwargs.get("unknown_ids") is not None:
+                kwargs["unknown_ids"].update(unknown)
             return []
 
         with patch("genesis.mcp.health_mcp._impl_health_alerts", new=_alerts), \
@@ -1776,6 +2014,14 @@ class TestTriggeringTierPark:
     @pytest.mark.asyncio
     async def test_re_verify_triggering_active_returns_true(self):
         assert await self._re_verify(_make_dispatcher(), self._request(), [2]) is True
+
+    @pytest.mark.asyncio
+    async def test_re_verify_counts_an_unknown_triggering_alarm_as_active(self):
+        """A reading the health layer could not take is not a clearance: the
+        approved action must not be dropped as stale on a blind tick."""
+        req = self._request()
+        assert await self._re_verify(_make_dispatcher(), req, [], unknown={"test:tier2"}) is True
+        assert await self._re_verify(_make_dispatcher(), req, []) is False  # control
 
     @pytest.mark.asyncio
     async def test_re_verify_request_tier_none_uses_all_ids(self):
@@ -2033,3 +2279,289 @@ class TestApprovalIsConsumedOnUse:
         gate.mark_consumed.assert_not_awaited()
         d._invoker.run.assert_awaited()
         mock_execute.assert_awaited_once()
+
+
+class TestCodexMcpHeldPark:
+    """``infra:codex_mcp_held`` (#4302) is a WARNING that wakes the Sentinel, and
+    its park must never stand in front of a real outage. Owner rulings
+    2026-11-14: a confirmed CRITICAL or tier-1 alarm takes over a park held only
+    by WARNINGs, and a declined stop for this pattern is quiet for 24 h.
+    """
+
+    _HELD = {"id": "infra:codex_mcp_held", "severity": "WARNING", "message": "held"}
+    _DOWN = {"id": "service:genesis_down", "severity": "CRITICAL", "message": "down"}
+
+    def _parked(self, park_alerts, state=SentinelState.AWAITING_ACTION_APPROVAL):
+        import json
+
+        from genesis.sentinel.classifier import classify_alerts
+        from genesis.sentinel.remediation_map import available_tools
+
+        parked = classify_alerts(park_alerts, available_tools())
+        gate = MagicMock()
+        gate.resolve_request = AsyncMock()
+        d = _make_dispatcher(approval_gate=gate)
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        d._state.pending_request_id = "req-held"
+        d._state.pending_policy_id = (
+            "sentinel_dispatch" if state == SentinelState.AWAITING_DISPATCH_APPROVAL else "sentinel_action"
+        )
+        d._state.pending_pattern = parked[0].alert_id
+        d._state.pending_request_json = json.dumps({
+            "tier": min(a.tier for a in parked),
+            "alarms": [
+                {"tier": a.tier, "alert_id": a.alert_id, "severity": a.severity, "message": a.message}
+                for a in parked
+            ],
+        })
+        d._state.transition(state, reason="test setup")
+        # check_fire_alarms calls dispatch() on every confirmed tick; it is
+        # Gate 2 inside dispatch() that refuses while parked. So what matters
+        # is the state each call SEES: still parked means Gate 2 refuses it.
+        d.seen_states = []
+
+        async def _dispatch(request):
+            d.seen_states.append(d._state.state)
+
+        d.dispatch = AsyncMock(side_effect=_dispatch)
+        return d, gate
+
+    @staticmethod
+    def _parked_states():
+        return {SentinelState.AWAITING_ACTION_APPROVAL, SentinelState.AWAITING_DISPATCH_APPROVAL}
+
+    async def _ticks(self, d, per_tick, unknown=()):
+        """``unknown``: ids the read path reports as unknown on every tick."""
+        calls = [list(t) for t in per_tick]
+
+        async def _alerts(*args, **kwargs):
+            if kwargs.get("unknown_ids") is not None:
+                kwargs["unknown_ids"].update(unknown)
+            return calls.pop(0)
+
+        with patch("genesis.mcp.health_mcp._impl_health_alerts", new=_alerts), \
+             patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"):
+            for _ in per_tick:
+                await d.check_fire_alarms()
+        assert calls == []
+
+    def test_held_alarm_is_tier_2_and_scoped(self):
+        from genesis.sentinel.classifier import classify_alerts
+        from genesis.sentinel.remediation_map import REMEDIATION_MAP, available_tools
+
+        assert REMEDIATION_MAP["infra:codex_mcp_held"] == frozenset({"container.process_control"})
+        alarms = classify_alerts([self._HELD], available_tools())
+        assert [(a.alert_id, a.tier, a.severity) for a in alarms] == [
+            ("infra:codex_mcp_held", 2, "WARNING"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_confirmed_outage_takes_over_a_warning_park(self):
+        d, gate = self._parked([self._HELD])
+        both = [self._HELD, self._DOWN]
+        await self._ticks(d, [both])
+        # One sighting is not confirmed: the park stands.
+        gate.resolve_request.assert_not_awaited()
+        assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+        await self._ticks(d, [both])
+        gate.resolve_request.assert_awaited_once_with(
+            "req-held", decision="cancelled", resolved_by="superseded",
+        )
+        assert d.seen_states[-1] == SentinelState.HEALTHY  # Gate 2 lets it through
+        request = d.dispatch.await_args.args[0]
+        assert request.tier == 1
+        assert "service:genesis_down" in {a.alert_id for a in request.alarms}
+
+    @pytest.mark.asyncio
+    async def test_confirmed_outage_takes_over_a_park_whose_alarm_reads_unknown(self):
+        """Audit: an unknown reading of the parked alarm is not an absence. It
+        must still reach the take-over, or a blind scan would hold an outage
+        behind a warning park for as long as the scan stays blind."""
+        d, gate = self._parked([self._HELD])
+        await self._ticks(d, [[self._DOWN], [self._DOWN]], unknown={"infra:codex_mcp_held"})
+        gate.resolve_request.assert_awaited_once_with(
+            "req-held", decision="cancelled", resolved_by="superseded",
+        )
+        assert d.seen_states[-1] == SentinelState.HEALTHY
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "blocker", ["heavy_workload", "active_session", "no_invoker", "boot_grace", "would_escalate"],
+    )
+    async def test_no_take_over_when_the_replacement_dispatch_would_be_deferred(self, blocker):
+        """Cancelling the owner's request is only worth it if the outage's
+        dispatch then goes through; a later gate refusing it would lose both."""
+        d, gate = self._parked([self._HELD])
+        if blocker == "active_session":
+            d._active_session_id = "sess-1"
+        elif blocker == "no_invoker":
+            d._invoker = None
+        elif blocker == "boot_grace":
+            d._state.started_at = datetime.now(UTC).isoformat()
+        elif blocker == "would_escalate":
+            # Four old attempts: backoff is ready, but the fifth escalates.
+            d._pattern_attempts["service:genesis_down"] = [time.monotonic() - 10**6] * 4
+        both = [self._HELD, self._DOWN]
+        workload = "dream_cycle" if blocker == "heavy_workload" else None
+        with patch("genesis.sentinel.dispatcher._heavy_workload", return_value=workload):
+            await self._ticks(d, [both, both, both])
+        gate.resolve_request.assert_not_awaited()
+        assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+        assert d._state.pending_request_id == "req-held"
+
+    def test_a_held_back_alarm_does_not_hide_an_equally_strong_eligible_one(self):
+        """Codex review: dispatch() keys every gate on the first alarm, so a
+        declined or backed-off warning listed first would block another one."""
+        d, _gate = self._parked([self._HELD])
+        held = FireAlarm(tier=2, alert_id="infra:codex_mcp_held", severity="WARNING", message="a")
+        other = FireAlarm(tier=2, alert_id="infra:other_warning", severity="WARNING", message="b")
+        down = FireAlarm(tier=1, alert_id="service:genesis_down", severity="CRITICAL", message="c")
+        assert [a.alert_id for a in d._dispatch_order([held, other])] == [held.alert_id, other.alert_id]
+        d._resolved_cooldowns[held.alert_id] = time.monotonic()
+        assert [a.alert_id for a in d._dispatch_order([held, other])] == [other.alert_id, held.alert_id]
+        # Readiness never outranks strength.
+        d._resolved_cooldowns[down.alert_id] = time.monotonic()
+        assert d._dispatch_order([other, down])[0].alert_id == down.alert_id
+
+    @pytest.mark.asyncio
+    async def test_take_over_starts_the_cooldown_for_the_cancelled_pattern(self):
+        d, gate = self._parked([self._HELD])
+        both = [self._HELD, self._DOWN]
+        await self._ticks(d, [both, both])
+        ready, reason = d._backoff_ready("infra:codex_mcp_held")
+        assert ready is False and "cooldown" in reason
+
+    @pytest.mark.asyncio
+    async def test_a_failed_cancel_keeps_the_park(self):
+        """The row is no longer pending (the owner just answered it): never drop
+        that answer by clearing the park anyway."""
+        d, gate = self._parked([self._HELD])
+        gate.resolve_request = AsyncMock(return_value=False)
+        both = [self._HELD, self._DOWN]
+        await self._ticks(d, [both, both])
+        gate.resolve_request.assert_awaited_once()
+        assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+        assert d._state.pending_request_id == "req-held"
+        assert set(d.seen_states) <= self._parked_states()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("missing", ["gate", "request_id"])
+    async def test_no_row_to_cancel_means_no_take_over(self, missing):
+        d, _gate = self._parked([self._HELD])
+        if missing == "gate":
+            d._approval_gate = None
+        else:
+            d._state.pending_request_id = ""
+        both = [self._HELD, self._DOWN]
+        await self._ticks(d, [both, both, both])
+        assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+
+    @pytest.mark.asyncio
+    async def test_a_challenger_that_cannot_dispatch_takes_nothing_over(self):
+        import time as _time
+
+        d, gate = self._parked([self._HELD])
+        d._resolved_cooldowns["service:genesis_down"] = _time.monotonic()
+        both = [self._HELD, self._DOWN]
+        await self._ticks(d, [both, both, both])
+        gate.resolve_request.assert_not_awaited()
+        assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+
+    @pytest.mark.asyncio
+    async def test_dispatch_park_is_taken_over_too(self):
+        d, gate = self._parked([self._HELD], state=SentinelState.AWAITING_DISPATCH_APPROVAL)
+        both = [self._HELD, self._DOWN]
+        await self._ticks(d, [both, both])
+        gate.resolve_request.assert_awaited_once()
+        assert d.seen_states[-1] == SentinelState.HEALTHY
+
+    @pytest.mark.asyncio
+    async def test_a_critical_park_is_never_taken_over(self):
+        mem = {"id": "infra:container_memory_high", "severity": "CRITICAL", "message": "mem"}
+        d, gate = self._parked([mem])
+        both = [mem, self._DOWN]
+        await self._ticks(d, [both, both, both])
+        gate.resolve_request.assert_not_awaited()
+        assert d.seen_states and set(d.seen_states) <= self._parked_states()
+        assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+
+    @pytest.mark.asyncio
+    async def test_another_warning_does_not_take_over(self):
+        other = {"id": "service:watchdog_failing", "severity": "WARNING", "message": "w"}
+        d, gate = self._parked([self._HELD])
+        both = [self._HELD, other]
+        await self._ticks(d, [both, both, both])
+        gate.resolve_request.assert_not_awaited()
+        assert set(d.seen_states) <= self._parked_states()
+
+    @pytest.mark.asyncio
+    async def test_unreadable_park_severity_is_never_taken_over(self):
+        import json
+
+        d, gate = self._parked([self._HELD])
+        req = json.loads(d._state.pending_request_json)
+        del req["alarms"][0]["severity"]
+        d._state.pending_request_json = json.dumps(req)
+        both = [self._HELD, self._DOWN]
+        await self._ticks(d, [both, both])
+        gate.resolve_request.assert_not_awaited()
+        assert d.seen_states and set(d.seen_states) <= self._parked_states()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("policy", ["sentinel_action", "sentinel_dispatch"])
+    async def test_a_declined_stop_is_quiet_for_24h(self, policy):
+        """Owner ruling 2026-11-14 (a declined stop is quiet for 24 h) rests on
+        the path real declines take: the owner's answer lands on the parked row
+        and handle_approval_resolution converges on it, for either policy. The
+        container-memory alarm stays free to dispatch."""
+        d, _gate = self._parked(
+            [self._HELD],
+            state=(
+                SentinelState.AWAITING_ACTION_APPROVAL if policy == "sentinel_action"
+                else SentinelState.AWAITING_DISPATCH_APPROVAL
+            ),
+        )
+        with patch("genesis.sentinel.dispatcher.append_log"):
+            await d.handle_approval_resolution("req-held", "rejected")
+        expiry = datetime.fromisoformat(d._state.rejected_patterns["infra:codex_mcp_held"])
+        assert timedelta(hours=23) < expiry - datetime.now(UTC) < timedelta(hours=25)
+        ready, reason = d._backoff_ready("infra:codex_mcp_held")
+        assert ready is False and "rejected" in reason.lower()
+        assert d._backoff_ready("infra:container_memory_high")[0] is True
+
+    @pytest.mark.asyncio
+    async def test_a_tier1_warning_park_is_not_taken_over_by_a_tier2_critical(self):
+        """service:watchdog_blind is tier 1 at WARNING. A tier-2 CRITICAL is weaker
+        by the classifier's order, and dispatch would lead with the parked tier-1
+        alarm anyway, so cancelling would only drop the owner's request."""
+        blind = {"id": "service:watchdog_blind", "severity": "WARNING", "message": "blind"}
+        mem = {"id": "infra:container_memory_high", "severity": "CRITICAL", "message": "mem"}
+        d, gate = self._parked([blind])
+        both = [blind, mem]
+        await self._ticks(d, [both, both, both])
+        gate.resolve_request.assert_not_awaited()
+        assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+
+    @pytest.mark.asyncio
+    async def test_a_tier1_warning_park_is_taken_over_by_a_tier1_critical(self):
+        blind = {"id": "service:watchdog_blind", "severity": "WARNING", "message": "blind"}
+        d, gate = self._parked([blind])
+        both = [blind, self._DOWN]
+        await self._ticks(d, [both, both])
+        gate.resolve_request.assert_awaited_once()
+        assert d.dispatch.await_args.args[0].alarms[0].alert_id == "service:genesis_down"
+
+    @pytest.mark.asyncio
+    async def test_take_over_reaches_the_real_dispatch_gates(self):
+        """No dispatch mock: the real dispatch() must pass every gate after a
+        take-over and hand the outage to _execute_dispatch."""
+        d, gate = self._parked([self._HELD])
+        del d.dispatch  # back to the real method
+        d._execute_dispatch = AsyncMock(return_value=SentinelResult(dispatched=True))
+        both = [self._HELD, self._DOWN]
+        await self._ticks(d, [both, both])
+        gate.resolve_request.assert_awaited_once()
+        d._execute_dispatch.assert_awaited_once()
+        assert d._execute_dispatch.await_args.kwargs["pattern"] == "service:genesis_down"

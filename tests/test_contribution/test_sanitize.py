@@ -133,6 +133,7 @@ def test_binary_file_blocks():
     assert any(f.kind == FindingKind.BINARY for f in r.blocking())
 
 
+@pytest.mark.timeout(10, method="signal")
 def test_size_cap_blocks():
     huge = "+" + ("x" * (sanitize.MAX_DIFF_BYTES + 100)) + "\n"
     diff = (
@@ -142,6 +143,53 @@ def test_size_cap_blocks():
     r = sanitize.scan_diff(diff)
     assert r.ok is False
     assert any(f.kind == FindingKind.SIZE for f in r.blocking())
+
+
+@pytest.mark.parametrize("text", ["x" * (sanitize.MAX_DIFF_BYTES + 1), "é" * sanitize.MAX_DIFF_BYTES], ids=["ascii", "utf8"])
+def test_oversized_diff_stops_before_parsing(text, monkeypatch):
+    def unexpected_parse(*args, **kwargs):
+        pytest.fail("oversized diff reached parsing and downstream scanners")
+
+    monkeypatch.setattr(sanitize, "parse_diff", unexpected_parse)
+    result = sanitize.scan_diff(text)
+    assert not result.ok
+    assert result.scanners_run == ["size_cap"]
+    assert [f.kind for f in result.blocking()] == [FindingKind.SIZE]
+
+
+@pytest.mark.timeout(5, method="signal")
+@pytest.mark.parametrize("prose", [False, True])
+@pytest.mark.parametrize("token", ["x" * 120_000, "x" * 120_000 + "@invalid", "." * 120_000], ids=["plain", "invalid-domain", "dots"])
+def test_long_non_email_tokens_complete(token, prose, tmp_path):
+    fingerprints = tmp_path / "fingerprints.txt"
+    fingerprints.write_text("not-present-private-fingerprint\n")
+    if prose:
+        result = sanitize.scan_prose(token, fingerprint_file=fingerprints)
+    else:
+        diff = "--- a/sample.txt\n+++ b/sample.txt\n@@ -0,0 +1 @@\n+" + token + "\n"
+        result = sanitize.scan_diff(diff, fingerprint_file=fingerprints)
+    assert result.ok
+    assert "email_allowlist" in result.scanners_run
+    assert "detect-secrets" in result.scanners_run
+
+
+@pytest.mark.parametrize("prose", [False, True])
+def test_email_boundaries_and_allowlist_preserved(prose, tmp_path):
+    text = "éa.b+tag%suffix@personal.org; 'second@personal.org' user@example.com noreply@service.org+private@personal.org"
+    fingerprints = tmp_path / "fingerprints.txt"
+    fingerprints.write_text("not-present-private-fingerprint\n")
+    if prose:
+        result = sanitize.scan_prose(text, fingerprint_file=fingerprints)
+    else:
+        result = sanitize.scan_diff(
+            "--- a/sample.txt\n+++ b/sample.txt\n@@ -0,0 +1 @@\n+" + text + "\n",
+            fingerprint_file=fingerprints,
+        )
+    emails = [f for f in result.blocking() if f.kind == FindingKind.EMAIL]
+    assert len(emails) == 3
+    assert emails[0].message.endswith("a.b+tag%suffix@personal.org")
+    assert emails[1].message.endswith("second@personal.org")
+    assert emails[2].message.endswith("+private@personal.org")
 
 
 def test_portability_ip_blocks():

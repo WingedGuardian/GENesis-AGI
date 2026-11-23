@@ -41,6 +41,7 @@ MODULES = (
     ("legacy", "_genesis_index_marker_legacy", "scripts/lib/index_marker_legacy.py"),
     ("recovery", "_genesis_index_marker_recovery", "scripts/lib/index_marker_recovery.py"),
     ("legs", "_genesis_index_marker_legs", "scripts/lib/index_marker_legs.py"),
+    ("retry", "_genesis_index_marker_retry", "scripts/lib/index_marker_retry.py"),
     ("native", "_genesis_index_marker_execution", "scripts/lib/index_marker_execution.py"),
     ("cli", "_genesis_index_marker_cli", "scripts/lib/index_marker_cli.py"),
     ("queue", "_genesis_index_marker", "scripts/lib/index_marker.py"),
@@ -48,6 +49,7 @@ MODULES = (
     ("gitnexus", "_genesis_code_intel_gitnexus", "scripts/lib/code_intel_gitnexus.py"),
     ("owner", "_genesis_code_intel_owner", "scripts/lib/code_intel_owner.py"),
     ("owner_admission", "_genesis_code_intel_owner_admission", "scripts/lib/code_intel_owner_admission.py"),
+    ("supervisor", "_genesis_code_intel_supervisor", "scripts/lib/code_intel_supervisor.py"),
     ("managed", "_genesis_codebase_managed", "scripts/codebase_managed.py"),
 )
 SHELL = (
@@ -436,6 +438,10 @@ def restore(fd, entry_bytes, expected_sha256):
         raise ValueError("invalid source capsule") from error
 
 
+class RunnerLockBusy(BlockingIOError):
+    """The canonical runner lock is held by a different open description."""
+
+
 def _runner_lock_fds():
     """Keep only the canonical inherited runner lock in its entry handoff."""
     base = Path(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis"))
@@ -448,7 +454,10 @@ def _runner_lock_fds():
         raise ValueError("captured runner lock identity differs")
     # Same inherited open-file description preserves the existing lock; an
     # unlocked legitimate descriptor may acquire it, but a competitor refuses.
-    fcntl.flock(8, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        fcntl.flock(8, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        raise RunnerLockBusy("canonical runner lock is busy") from error
     return (8,)
 
 
@@ -504,8 +513,11 @@ def main(argv=None):
     modules = captured.assemble()
     if args.action == "queue":
         try:
-            return modules["queue"].main(args.arguments)
-        except Exception:
+            supervisor = modules['supervisor'].Supervisor(captured, modules, _runner_lock_fds)
+            return modules["queue"].main(args.arguments, supervisor=supervisor)
+        except Exception as error:
+            if isinstance(error, RunnerLockBusy) and args.arguments == ["reconcile-orphans"]:
+                return modules["queue"].BUSY_STATUS
             import traceback
 
             traceback.print_exc()
