@@ -76,13 +76,31 @@ async def _notify_owner_relay(
         )
     await pending_outreach.enqueue(
         db,
-        # Telegram renders HTML: the summary is model-written, so escape it all.
+        # Escaped for HTML-rendering channels: the summary is model-written.
         message=html.escape(f"{head} {relay.quoted(reason)}", quote=False),
         category="alert",
-        channel="telegram",
+        channel=_owner_alert_channel(),
         pending_id=pending_id,
     )
     return True
+
+
+def _owner_alert_channel() -> str:
+    """The owner's alert channel, as the outreach pipeline chooses one: the queue
+    stores a channel, so a literal would bypass the install's preference."""
+    from genesis.outreach.config import load_outreach_config
+
+    try:
+        prefs = load_outreach_config().channel_preferences
+    except Exception as exc:
+        logger.warning(
+            "Outreach config unreadable; owner alert on telegram (exception=%s)", type(exc).__name__
+        )
+        return "telegram"
+    channel = prefs.get("alert", prefs.get("default", "telegram"))
+    # The queue's channel column is NOT NULL: a blank or null preference would
+    # otherwise fail every finalization retry.
+    return channel if isinstance(channel, str) and channel.strip() else "telegram"
 
 
 def _failure_outcome(partial, error) -> tuple[str, str | None]:
@@ -380,8 +398,15 @@ async def _finalize(runner, request, result, state):
         committed = True
     except Exception:
         state, result.success, result.error = "failed", False, "result_unavailable"
+    launched = None
     while True:
         try:
+            if launched is None:
+                # Read before _store_result overwrites it: _execute marks the receipt
+                # running just before invoking the child, so only a run that got that
+                # far can have stopped with part of its stream unread.
+                row = await cc_sessions.get_by_id(runner._session_manager.db, result.session_id)
+                launched = bool(row) and metadata(row).get("native_state") == "running"
             await runner._store_result(
                 result.session_id,
                 request,
@@ -428,7 +453,13 @@ async def _finalize(runner, request, result, state):
                 runner._session_manager.db,
                 result.session_id,
                 [t.get("name") for t in result.tools_called or () if isinstance(t, dict)],
-                uncertain=bool(result.partial or result.stream_lines_dropped),
+                # A launched run that did not succeed may have stopped before its
+                # stream was read to the end, so its tool record may be missing calls.
+                uncertain=bool(
+                    result.partial
+                    or result.stream_lines_dropped
+                    or (launched and state != "succeeded")
+                ),
                 ended=ended,
                 reason=reason,
             )

@@ -1411,6 +1411,104 @@ async def test_an_orphan_whose_alert_fails_stays_for_the_next_boot(db, monkeypat
     assert len(rows) == 1 and "may have acted" in rows[0]["message"]
 
 
+@pytest.mark.parametrize(
+    ("name", "acts"),
+    [
+        ("Read", False),
+        ("mcp__genesis-memory__memory_recall", False),
+        ("mcp__genesis-health__browser_snapshot", False),
+        ("write__Read", True),
+        ("mcp__server__write__Read", True),
+        ("mcp__othersrv__Read", True),
+        ("mcp__othersrv__memory_recall", True),
+        ("mcp__genesis-memory__memory__recall", True),
+    ],
+)
+def test_read_only_tools_match_by_full_identity(name, acts):
+    """Only an exactly named read-only tool skips the alert (#4905 review)."""
+    from genesis.peers.relay import acting
+
+    assert bool(acting([name])) is acts
+
+
+async def test_the_owner_alert_uses_the_configured_alert_channel(db, native, monkeypatch):
+    """The queue stores a channel, so the alert follows the install's alert
+    preference rather than assuming Telegram (#4905 review)."""
+    from genesis.outreach import config as outreach_config
+
+    real = outreach_config.load_outreach_config()
+    prefs = {**real.channel_preferences, "alert": "email"}
+    monkeypatch.setattr(
+        outreach_config,
+        "load_outreach_config",
+        lambda *a, **k: type(real)(**{**real.__dict__, "channel_preferences": prefs}),
+    )
+    _, rows = await _relay_run(
+        db, native, ["mcp__genesis-outreach__outreach_send"], owner_relay=True
+    )
+    assert len(rows) == 1 and rows[0]["channel"] == "email"
+
+
+async def test_a_failed_run_with_only_reads_still_warns_it_may_have_acted(db, native):
+    """A run that did not succeed may have stopped before its stream was read to
+    the end, so its tool record counts as possibly incomplete (#4905 review)."""
+    from genesis.cc.types import StreamEvent
+
+    runner, _, invoker = native
+    raw = {
+        "type": "assistant",
+        "message": {"content": [{"type": "tool_use", "name": "Read", "input": {}}]},
+    }
+
+    async def execute(invocation, on_event=None):
+        await on_event(StreamEvent.from_raw(raw))
+        raise RuntimeError("synthetic invocation failure")
+
+    invoker.run_streaming.side_effect = execute
+    req = request()
+    sid = await prepare(db, req, peer_id="alpha", owner_relay=True)
+    await runner.adopt(sid, req)
+    await settled(runner, sid)
+    assert (await cc_sessions.get_by_id(db, sid))["status"] == "failed"
+    rows = await (await db.execute("SELECT message FROM pending_outreach")).fetchall()
+    assert len(rows) == 1 and "may have acted" in rows[0]["message"]
+
+
+async def test_a_run_refused_before_launch_sends_no_owner_alert(db, native, monkeypatch):
+    """Nothing ran, so nothing could have acted: no alert, which would otherwise
+    bypass quiet hours (#4905 review)."""
+    runner, _, _ = native
+
+    async def refuse(*args, **kwargs):
+        raise RuntimeError("synthetic background refusal")
+
+    monkeypatch.setattr(runner, "_check_background", refuse)
+    req = request()
+    sid = await prepare(db, req, peer_id="alpha", owner_relay=True)
+    await runner.adopt(sid, req)
+    await settled(runner, sid)
+    assert (await cc_sessions.get_by_id(db, sid))["status"] == "failed"
+    rows = await (await db.execute("SELECT message FROM pending_outreach")).fetchall()
+    assert rows == []
+
+
+@pytest.mark.parametrize("value", [None, "", "  "])
+def test_a_blank_alert_channel_preference_falls_back_to_telegram(monkeypatch, value):
+    """The queue's channel column is NOT NULL: a blank preference must not make
+    every finalization retry fail."""
+    from genesis.cc.managed_session import _owner_alert_channel
+    from genesis.outreach import config as outreach_config
+
+    real = outreach_config.load_outreach_config()
+    prefs = {**real.channel_preferences, "alert": value}
+    monkeypatch.setattr(
+        outreach_config,
+        "load_outreach_config",
+        lambda *a, **k: type(real)(**{**real.__dict__, "channel_preferences": prefs}),
+    )
+    assert _owner_alert_channel() == "telegram"
+
+
 async def test_unlisted_tool_counts_as_acting(db, native):
     _, rows = await _relay_run(
         db, native, ["Read", "mcp__genesis-memory__reference_delete"], owner_relay=True
