@@ -79,6 +79,21 @@ def test_json_fields_are_decoded_before_the_scan(tmp_path):
     assert "Zq7" not in text and "x7!Secret" not in text
 
 
+def test_text_already_scrubbed_is_not_a_finding(tmp_path):
+    """After a cleanup, the audit reports clean (#4872 review)."""
+    db = tmp_path / "g.db"
+    _db_with(
+        db,
+        [
+            ("s", "DORMANT", 0, "p", json.dumps(["sshpass -p [redacted] ssh h"]), None),
+            ("w", "DORMANT", 0, "p with password [redacted] then", "[]", None),
+        ],
+    )
+    out = tmp_path / "r.json"
+    assert _load().main(["--db", str(db), "--out", str(out)]) == 0
+    assert json.loads(out.read_text())["with_findings"] == 0
+
+
 def test_a_row_whose_every_field_was_withheld_is_reported_and_exits_2(tmp_path, monkeypatch):
     from genesis.learning.procedural import credential_scrub
 

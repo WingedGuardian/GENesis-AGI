@@ -47,6 +47,34 @@ def test_credential_values_are_redacted_and_the_rest_survives(text, kept):
         ('password "Zq7\'fake!9" then go', "Zq7"),
         # A $ after the first character is a symbol, not a variable.
         ("password abcde$ then go", "abcde"),
+        # Single quotes: a $ is literal text, not a variable (#4872 review).
+        ("password '$uperman99' then go", "uperman99"),
+        # sshpass reads its options as getopt does (#4872 review): a value
+        # continued or quoted across lines, a prompt argument that starts with a
+        # hyphen, -p in a cluster, a quoted option, a literal after a variable.
+        ("sshpass -p abc\\\nremaining ssh h", "remaining"),
+        ("sshpass -p 'abc\nremaining' ssh h", "remaining"),
+        ('sshpass -p "abc\nremaining" ssh h', "remaining"),
+        ("sshpass -P -prompt -p ab ssh h", "ab"),
+        ("sshpass -vp ab ssh h", "ab"),
+        ("sshpass -vpabc123xyz ssh h", "abc123xyz"),
+        ("sshpass -ep Zq7k ssh h", "Zq7k"),
+        ('sshpass "-p" Zq7k ssh h', "Zq7k"),
+        ('sshpass -p "$SSHPASS" -p Zq7k ssh h', "Zq7k"),
+        # Quote removal comes first: a quoted option letter, an empty attachment,
+        # a literal $ in single quotes, a capital S.
+        ('sshpass -"p" Zq7kfake9 ssh h', "Zq7kfake9"),
+        ("sshpass -'p' Zq7kfake9 ssh h", "Zq7kfake9"),
+        ("sshpass -\\p Zq7kfake9 ssh h", "Zq7kfake9"),
+        ('sshpass -v"p" Zq7kfake9 ssh h', "Zq7kfake9"),
+        ('sshpass -p"" Zq7kfake9 ssh h', "Zq7kfake9"),
+        ("sshpass '-p''$ecret99' ssh h", "ecret99"),
+        ("Sshpass -p Zq7kfake9 ssh h", "Zq7kfake9"),
+        # $ forms bash reads as literal text.
+        ("sshpass -p $'Zq7k fake9' ssh h", "fake9"),
+        ("sshpass -p$'Zq7kfake9' ssh h", "Zq7kfake9"),
+        ('sshpass -p $"Zq7kfake9" ssh h', "Zq7kfake9"),
+        ("sshpass -p $%Zq7kfake9 ssh h", "Zq7kfake9"),
         # Options before -p; -P keeps its prompt argument.
         ("sshpass -e -p Zq7k ssh h", "Zq7k"),
         ("sshpass -v -p Zq7k ssh h", "Zq7k"),
@@ -73,6 +101,60 @@ def test_a_quoted_prompt_with_a_space_does_not_hide_the_password(prompt):
     opt = prompt if prompt.startswith("-P") else f"-P {prompt}"
     cleaned, _ = scrub_text(f"sshpass {opt} -p Zq7wXvk ssh h")
     assert cleaned == f"sshpass {opt} -p [redacted] ssh h"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "sshpass -e ssh -p 2222 host",
+        "sshpass -f pw.txt ssh -p 22 host",
+        "sshpass -P assword: -e ssh -p 22 host",
+        'sshpass -p "$SSHPASS" ssh -p 2222 host',
+        "sshpass -d 3 scp -P 2222 a host:b",
+    ],
+)
+def test_options_after_the_command_are_not_sshpass_options(text):
+    """sshpass stops reading options at the command it runs, as getopt does, so
+    ssh's own -p port is kept (#4872 review)."""
+    assert scrub_text(text) == (text, [])
+
+
+def test_each_sshpass_command_is_judged_alone():
+    text = "sshpass -p abc123xyz ssh h1 && sshpass -p Zq7kdef2 ssh h2 'reboot'"
+    cleaned, _ = scrub_text(text)
+    assert cleaned == "sshpass -p [redacted] ssh h1 && sshpass -p [redacted] ssh h2 'reboot'"
+
+
+@pytest.mark.parametrize(
+    "rest",
+    [
+        "Step 2: run the tests",
+        "Step 2: don't forget the tests\nStep 3: it's done",
+        'Step 2: say "hi" to the team',
+    ],
+)
+def test_an_unclosed_quote_stops_at_the_line_end(rest):
+    """A later quote mid-word does not close it (#4872 review)."""
+    cleaned, _ = scrub_text(f"sshpass -p 'abc123xyz then\n{rest}")
+    assert cleaned == f"sshpass -p [redacted]\n{rest}"
+
+
+def test_a_prompt_and_shell_operators_bound_the_value():
+    assert scrub_text('sshpass -P "sshpass -p Enter" ssh h') == (
+        'sshpass -P "sshpass -p Enter" ssh h',
+        [],
+    )
+    cleaned, _ = scrub_text("sshpass -p Zq7k;echo ok")
+    assert cleaned == "sshpass -p [redacted];echo ok"
+
+
+def test_many_sshpass_words_stay_linear():
+    import time
+
+    start = time.perf_counter()
+    scrub_text("sshpass " * 5000 + "-e ssh h")
+    scrub_text("sshpass " + "-v " * 5000 + "-p x ssh h")
+    assert time.perf_counter() - start < 0.5
 
 
 def test_a_blank_line_after_dash_p_is_not_read_as_its_value():

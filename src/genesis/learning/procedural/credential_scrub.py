@@ -9,9 +9,10 @@ Two layers:
   through the transcript-analytics adapter): key shapes and ``NAME=value`` /
   ``label: value`` forms. It redacts the VALUE only, so the rest of a command
   survives.
-* Procedure-specific forms: a password given to ``sshpass -p``, and ``password
-  <value>`` in prose, bare or quoted. A ``$VAR``, ``${...}`` or ``$(...)`` names a
-  secret and is kept.
+* Procedure-specific forms: the literal value an ``sshpass`` command gives its
+  ``-p`` option (read as the shell and getopt read it), and ``password <value>`` in
+  prose, bare or quoted. A ``$VAR``, ``${...}`` or ``$(...)`` names a secret and is kept,
+  except inside single quotes, where the shell reads it as literal text.
 
 The scrub runs on parsed values (strings inside lists and dicts), never on JSON
 text. When the shared scrubber cannot run, ``ScrubFailed`` tells the caller to
@@ -29,36 +30,128 @@ class ScrubFailed(Exception):
 
 
 _NOT_A_VALUE = r"(?![$`(])"  # a shell variable or substitution names a secret
-# sshpass -p takes one argument and it is always the password, so the whole shell
-# word is redacted whatever its length: single- or double-quoted (each body stops
-# only at its own quote; an unclosed quote runs to the line end) or bare. Other
-# options may come first (-e, -v, -P <prompt>, -o <x>; those that take an argument
-# keep it), and any whitespace (a non-breaking space, a newline) or a backslash-
-# newline continuation may separate -p from its value. A word starting with a
-# variable or substitution, bare or double-quoted, names a secret and is kept; a
-# single-quoted one is literal text and is redacted.
-_GAP = r"(?:[^\S\n]|\\\r?\n)"  # within one shell command line
-# One shell word: quoted parts (either quote) and bare characters, joined; an
-# option's argument such as -P "Enter password:" is read whole.
-_WORD_PART = r"'[^'\n]*'|\"(?:[^\"\\\n]|\\.)*\"|\\."
-_WORD = r"(?:" + _WORD_PART + r"|[^\s'\"\\-])(?:" + _WORD_PART + r"|[^\s'\"\\])*"
-_SSHPASS = re.compile(
-    r"(\bsshpass(?:"
-    + _GAP
-    + r"+-(?:[Pfdo]"
-    + _GAP
-    + r"*"
-    + _WORD
-    + r"|[^\spPfdo]\S*))*"  # disjoint from [Pfdo], so no backtracking blow-up
-    + _GAP
-    + r"+-p"
-    + _GAP
-    + r"*(?:\n"
-    + _GAP
-    + r"*)?)"  # at most one bare newline; the group keeps the two runs unambiguous
-    r"(?!\"?[$`(])"
-    r"(?:'[^'\n]*'?|\"(?:[^\"\\\n]|\\.)*\"?|[^\s'\"\\]|\\.)+"
+# sshpass -p takes one argument and it is always the password. The scrub reads
+# sshpass's own options the way the shell and getopt do (option string
+# +f:d:p:P:heVv): words are split and their quotes removed first, so a clustered
+# -vp, a quoted option letter, an option argument that starts with a hyphen and a
+# value on the next line are all found. Options end at the first word that is not
+# one, the command sshpass runs, so a later -p (ssh's port) is not sshpass's. Each
+# -p value is redacted as one shell word: a backslash continues it, and a quote
+# may span lines when it closes at the end of a word; an unclosed quote stops at
+# the line end. An option letter not known to be a flag is read as taking an
+# argument, so an unknown option can only over-redact. A value starting with a
+# variable or substitution ($NAME, ${...}, $(...), `...`), unquoted or double-quoted,
+# names a secret and is kept; single quotes, a backslash, $'...' and $"..." make
+# it literal text, which is redacted.
+_WORD_END = r"(?=[\s;|&<>()]|\Z)"
+_SHELL_WORD = re.compile(
+    r"(?:'[^'\n]*+'|'[^']*+'" + _WORD_END + r"|'[^'\n]*+"
+    r"|\"(?:[^\"\\\n]|\\.)*+\"|\"(?:[^\"\\]|\\.)*+\"" + _WORD_END + r"|\"(?:[^\"\\\n]|\\.)*+"
+    r"|\\.|[^\s'\"\\;|&<>()])++",
+    re.DOTALL,
 )
+_SSHPASS = re.compile(r"(?i)\bsshpass\b")
+_GAP_RUN = re.compile(r"(?:[^\S\n]|\\\r?\n)*+")
+# An option that ends its line takes its argument from the next line when that
+# line is not blank (wrapped prose); a blank line means it was given none here.
+_NEXT_LINE = re.compile(r"\r?\n[^\S\n]*+(?=\S)")
+_SSHPASS_FLAGS = frozenset("heVv")
+_DOUBLE_QUOTE_ESCAPES = frozenset('$`"\\\n')
+
+
+def _unquoted(word: str, base: int) -> list[tuple[str, int, bool]]:
+    """A shell word's characters after quote removal, each with its offset in the
+    text and whether quoting made it literal (single quotes or a backslash)."""
+    chars: list[tuple[str, int, bool]] = []
+    i, n = 0, len(word)
+    while i < n:
+        c = word[i]
+        if c == "'":
+            close = word.find("'", i + 1)
+            close = n if close < 0 else close
+            chars += [(word[k], base + k, True) for k in range(i + 1, close)]
+            i = close + 1
+        elif c == '"':
+            i += 1
+            while i < n and word[i] != '"':
+                if word[i] == "\\" and i + 1 < n and word[i + 1] in _DOUBLE_QUOTE_ESCAPES:
+                    if word[i + 1] != "\n":
+                        chars.append((word[i + 1], base + i + 1, True))
+                    i += 2
+                else:
+                    chars.append((word[i], base + i, False))
+                    i += 1
+            i += 1
+        elif c == "\\":
+            if i + 1 < n and word[i + 1] not in "\r\n":
+                chars.append((word[i + 1], base + i + 1, True))
+            i += 2
+        else:
+            chars.append((c, base + i, False))
+            i += 1
+    return chars
+
+
+_EXPANDS = re.compile(r"\$[A-Za-z_0-9{(@*#?$!-]|`")
+
+
+def _names_a_secret(text: str, chars: list[tuple[str, int, bool]]) -> bool:
+    """A value that starts with an expanding $ or ` is a variable or substitution.
+    $'...', $"..." and a $ before any other character are literal text in bash."""
+    return bool(chars) and not chars[0][2] and _EXPANDS.match(text, chars[0][1]) is not None
+
+
+def _password_spans(text: str, pos: int) -> tuple[list[tuple[int, int]], int]:
+    """The spans of the literal values sshpass's own options (from pos) give -p, and
+    where its options end: the start of the command it runs."""
+    spans: list[tuple[int, int]] = []
+    wanted = ""  # the option letter waiting for its argument
+    while True:
+        pos = _GAP_RUN.match(text, pos).end()
+        if wanted and text.startswith(("\n", "\r\n"), pos):
+            following = _NEXT_LINE.match(text, pos)
+            pos = following.end() if following else pos
+        word = _SHELL_WORD.match(text, pos)
+        if word is None:
+            return spans, pos
+        chars = _unquoted(word.group(), word.start())
+        if wanted:
+            # An empty argument ("") is the password itself: nothing to redact.
+            if wanted == "p" and chars and not _names_a_secret(text, chars):
+                spans.append(word.span())
+            wanted = ""
+            pos = word.end()
+            continue
+        option = "".join(c for c, _, _ in chars)
+        if not option.startswith("-") or option in ("-", "--"):
+            return spans, word.start() if option != "--" else word.end()
+        pos = word.end()
+        for index in range(1, len(chars)):
+            letter = chars[index][0]
+            if letter in _SSHPASS_FLAGS:
+                continue
+            rest = chars[index + 1 :]
+            if not rest:
+                wanted = letter
+            elif letter == "p" and not _names_a_secret(text, rest):
+                spans.append((chars[index][1] + 1, word.end()))
+            break
+
+
+def _redact_sshpass(text: str) -> tuple[str, int]:
+    """Redact every literal value an sshpass command gives its -p option."""
+    out: list[str] = []
+    pos = search = count = 0
+    while (word := _SSHPASS.search(text, search)) is not None:
+        spans, search = _password_spans(text, word.end())
+        for start, end in spans:
+            out.append(text[pos:start] + "[redacted]")
+            count += 1
+            pos = end
+    out.append(text[pos:])
+    return "".join(out), count
+
+
 _LABEL = r"\b(?:with\s+)?(?:password|passwd|pwd|passphrase)\b(?:\s+is|\s*[:=])?"
 # Quoted: any 3+ characters between matching quotes. Each body stops only at its
 # own quote (in double quotes and backticks, not one escaped with a backslash), so
@@ -71,10 +164,11 @@ def _quoted(quote: str) -> str:
     """One quoted value. A backslash escapes the quote inside double quotes and
     backticks, so that arm is tried first; the plain body follows, so a value
     ending in a backslash (C:\\keys\\) is still caught. Single quotes have no
-    escapes in the shell, so their body is plain."""
+    escapes and no expansion in the shell, so their body is plain and a $ in it is
+    literal text, not a variable."""
     plain = r"[^" + quote + r"\n]{3,}" + quote
     if quote == "'":
-        return quote + _NOT_A_VALUE + plain
+        return quote + plain
     escaped = r"(?:[^" + quote + r"\\\n]|\\.){3,}" + quote
     return quote + _NOT_A_VALUE + r"(?:" + escaped + "|" + plain + ")"
 
@@ -132,8 +226,10 @@ def scrub_text(text: str) -> tuple[str, list[str]]:
     """Redact credential spans; return the text and the names of what matched.
     Raises ScrubFailed when the shared scrubber cannot run."""
     found: list[str] = []
+    text, count = _redact_sshpass(text)
+    if count:
+        found.append("sshpass")
     for name, pattern in (
-        ("sshpass", _SSHPASS),
         ("password", _PASSWORD_QUOTED),
         ("password", _PASSWORD_BARE),
     ):
@@ -151,10 +247,19 @@ def scrub_text(text: str) -> tuple[str, list[str]]:
 # test). They name fields, never carry a value, so they are kept as they are and a
 # value under one is scrubbed as a value; that keeps a document's shape when the
 # shared scrubber cannot run (times_hit stays an int).
-_SCHEMA_KEYS = frozenset({
-    "description", "conditions", "times_hit", "transient",
-    "authored_via", "authored_in", "origin", "reviewed", "authored_at",
-})
+_SCHEMA_KEYS = frozenset(
+    {
+        "description",
+        "conditions",
+        "times_hit",
+        "transient",
+        "authored_via",
+        "authored_in",
+        "origin",
+        "reviewed",
+        "authored_at",
+    }
+)
 
 
 def _scrub_key(key: Any, found: list[str], index: int) -> Any:

@@ -76,10 +76,12 @@ def audit(db_path: Path) -> dict:
             if "withheld" in found:  # a string in it could not be processed
                 withheld.add(field)
                 found = [name for name in found if name != "withheld"]
-            if found:
+            document = json_field_document(field, text)
+            base = text if document is None else json.dumps(document, ensure_ascii=False)
+            # A finding is a change: text scrubbed before matches a pattern again
+            # (its [redacted] is a value to the scrub) but has nothing left to remove.
+            if found and cleaned != base:
                 names.update(found)
-                document = json_field_document(field, text)
-                base = text if document is None else json.dumps(document, ensure_ascii=False)
                 kinds += _spans(base, cleaned)
         if names or withheld:
             findings.append(
@@ -121,7 +123,10 @@ def main(argv: list[str] | None = None) -> int:
         or (args.out.exists() and path.exists() and os.path.samefile(args.out, path))
         for path in guarded
     ):
-        print(f"refusing to write the report over the database or a sidecar: {args.out}", file=sys.stderr)
+        print(
+            f"refusing to write the report over the database or a sidecar: {args.out}",
+            file=sys.stderr,
+        )
         return 1
     report = audit(args.db)
     args.out.parent.mkdir(parents=True, exist_ok=True)
