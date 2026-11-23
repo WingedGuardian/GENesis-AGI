@@ -1998,7 +1998,16 @@ fi
 # ══════════════════════════════════════════════════════════════
 echo "  Configuring timezone..."
 
+# shellcheck source=lib/timezone.sh
+. "$SCRIPT_DIR/lib/timezone.sh"
+
 GENESIS_TIMEZONE="${GENESIS_TIMEZONE:-}"
+# genesis.yaml is the authoritative setting (the dashboard writes it). On a re-run
+# after first boot it wins over the deprecated secrets.env value, so the clock is
+# set to the zone Genesis actually uses rather than a stale one.
+if [ -z "$GENESIS_TIMEZONE" ]; then
+    GENESIS_TIMEZONE="$(genesis_config_timezone "$HOME/.genesis/config/genesis.yaml")"
+fi
 if [ -z "$GENESIS_TIMEZONE" ] && [ -f "$SECRETS_FILE" ]; then
     GENESIS_TIMEZONE=$(grep -oP '^USER_TIMEZONE=\K.*' "$SECRETS_FILE" 2>/dev/null || true)
     [ -z "$GENESIS_TIMEZONE" ] && GENESIS_TIMEZONE=$(grep -oP '^GENESIS_TIMEZONE=\K.*' "$SECRETS_FILE" 2>/dev/null || true)
@@ -2015,9 +2024,9 @@ if [ -z "$GENESIS_TIMEZONE" ]; then
     fi
 fi
 if command -v timedatectl &>/dev/null; then
-    sudo timedatectl set-timezone "$GENESIS_TIMEZONE" 2>/dev/null && \
-        echo "    + System timezone set to $GENESIS_TIMEZONE" || \
-        echo "    WARNING: Could not set timezone. Set manually: sudo timedatectl set-timezone $GENESIS_TIMEZONE"
+    apply_system_timezone "$GENESIS_TIMEZONE" "System" sudo || true
+else
+    echo "    WARNING: timedatectl not found; the system timezone was not set to $GENESIS_TIMEZONE."
 fi
 if [ -f "$SECRETS_FILE" ]; then
     # Always update — template ships with USER_TIMEZONE=UTC

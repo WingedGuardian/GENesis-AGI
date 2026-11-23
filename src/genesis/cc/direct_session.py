@@ -1022,7 +1022,7 @@ class DirectSessionRunner:
         # and drains them before cancelling sessions, while the DB is open.
         self._admissions: set[asyncio.Task] = set()
         # Peer identity work shares this runner-wide budget across HTTP services.
-        # receipt id -> (peer_id, digest, admission task, inReplyTo or None)
+        # receipt id -> (peer_id, trust mode:digest, admission task, inReplyTo or None)
         self._peer_admissions: dict[str, tuple[str, str, asyncio.Task, str | None]] = {}
         self._closing = False
         # Managed sessions whose runner slot is held through finalization.

@@ -18,12 +18,15 @@ from genesis.guardian.pool import (
     StoragePoolStatus,
     ThinPoolReport,
     decide_alert,
+    held_tier,
     incus_container_lv_name,
     incus_snapshot_lv_name,
     measure_storage_pool,
     parse_lvs_report,
     parse_pool_backend,
+    pool_axis_tiers,
     snapshot_only_bytes,
+    worst_of,
     worst_tier,
 )
 
@@ -505,3 +508,55 @@ async def test_reserved_blocks_count_as_unavailable(monkeypatch):
     monkeypatch.setattr(pool_mod, "_run_subprocess", _run)
     pct = await pool_mod._pool_used_pct_via_df("/mnt/pool")
     assert pct == pytest.approx(100.0)
+
+
+class TestPoolAxisTiers:
+    cfg = StoragePoolConfig()
+
+    def test_no_prior_matches_worst_tier(self) -> None:
+        for status in (_status(76, 0), _status(0, 72), _status(76, 81), _status(50, 40)):
+            assert worst_of(pool_axis_tiers(status, self.cfg)) == worst_tier(status, self.cfg)
+        for pct in (50.0, 76.0, 86.0, 93.0):
+            s = StoragePoolStatus(detected=True, pool_used_pct=pct)
+            assert worst_of(pool_axis_tiers(s, self.cfg)) == worst_tier(s, self.cfg)
+
+    def test_axes_follow_the_backend(self) -> None:
+        assert set(pool_axis_tiers(_status(50, 40), self.cfg)) == {"data", "metadata"}
+        btrfs = StoragePoolStatus(detected=True, pool_used_pct=50.0)
+        assert set(pool_axis_tiers(btrfs, self.cfg)) == {"pool_used"}
+
+    def test_each_axis_holds_against_its_own_prior(self) -> None:
+        # data 72 is within 5 of its 75 warn line; metadata 56 is within 5 of 60.
+        status = _status(72, 56)
+        held = pool_axis_tiers(status, self.cfg, {"data": TIER_WARN, "metadata": TIER_OK})
+        assert held == {"data": TIER_WARN, "metadata": TIER_OK}
+
+    def test_unknown_prior_value_reads_as_ok(self) -> None:
+        s = StoragePoolStatus(detected=True, pool_used_pct=73.0)
+        assert pool_axis_tiers(s, self.cfg, {"pool_used": "bogus"}) == {"pool_used": TIER_OK}
+
+    def test_blind_axis_reads_ok_whatever_its_prior(self) -> None:
+        held = pool_axis_tiers(_status(50, None), self.cfg, {"metadata": TIER_CRIT})
+        assert held == {"data": TIER_OK, "metadata": TIER_OK}
+
+    def test_bad_margin_falls_back_to_five(self) -> None:
+        cfg = StoragePoolConfig(exit_margin_pct="lots")  # type: ignore[arg-type]
+        s = StoragePoolStatus(detected=True, pool_used_pct=71.0)
+        assert pool_axis_tiers(s, cfg, {"pool_used": TIER_WARN}) == {"pool_used": TIER_WARN}
+
+
+class TestHeldTier:
+    lines = (75.0, 85.0, 92.0)
+
+    def test_rise_takes_effect_at_the_line(self) -> None:
+        assert held_tier(75.0, self.lines, TIER_OK, 5.0) == TIER_WARN
+
+    def test_fall_needs_the_margin(self) -> None:
+        assert held_tier(70.1, self.lines, TIER_WARN, 5.0) == TIER_WARN
+        assert held_tier(69.9, self.lines, TIER_WARN, 5.0) == TIER_OK
+
+    def test_fall_steps_down_one_held_tier(self) -> None:
+        assert held_tier(83.0, self.lines, TIER_CRIT, 5.0) == TIER_HIGH
+
+    def test_blind_axis_holds(self) -> None:
+        assert held_tier(None, self.lines, TIER_HIGH, 5.0) == TIER_HIGH

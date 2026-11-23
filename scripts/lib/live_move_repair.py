@@ -1131,10 +1131,29 @@ class Repair:
         self._say(
             f"a `live` rollback stopped in phase {phase!r}; the repair does not handle that phase yet (#3722)"
         )
+        # The guard's remedy for that shape (#3722 advice), the one text every
+        # reader prints: by command on stdout, at boot in the page (the journal
+        # keeps the short line above, under the guardian's line cut).
+        remedy = self.guard.message(self.state_path, verdict, reason)
+        if not self.boot:
+            print(remedy, flush=True)
+        # The page is cut at ALERT_BYTES and the guard's first line carries the
+        # path list, whose length the guard does not cap (review SF-2): the boot
+        # page puts the steps (the save-first warning, the restore steps, the
+        # retry) ahead of that line, so a long list is what the cut shortens
+        # (CodeRabbit c4605013452 and its follow-up). The command output above
+        # keeps the guard's own order.
+        steps = remedy
+        # The reason is the path list itself (one path per line), so the cut is
+        # right after it, never at the first newline.
+        cut = remedy.find(reason)
+        if reason.startswith(self.guard._LIVE_LATER) and cut >= 0:
+            listed, rest = remedy[: cut + len(reason)], remedy[cut + len(reason) :].strip()
+            if rest:
+                steps = f"{rest}\nThe update record: {listed}"
         body = (
-            f"{self.state_path} records a `live` rollback that stopped in phase {phase!r}; the "
-            "repair does not handle that phase yet (#3722), so it left the checkout half-written "
-            f"and {_UNIT} was started anyway: {reason}"
+            f"The repair does not handle phase {phase!r} yet (#3722), so it left the checkout "
+            f"half-written and {_UNIT} was started anyway. {steps}"
         )
         self._page("mixed", "critical", verdict, reason, raw, body=body)
         return 0 if self.boot else 3
@@ -1326,7 +1345,11 @@ class Repair:
             self._clear(raw)
             return 0
         if verdict != self.guard.MIXED_TREE:
-            self._say(f"nothing to repair: the checkout is not half-written ({verdict}: {reason})")
+            # At boot only the reason's first sentence: a HOLD reason carries its
+            # remedy, and the guardian cuts journal lines at 400 characters; the
+            # `kept` page below carries the whole text.
+            shown = reason.split(". ", 1)[0] if self.boot else reason
+            self._say(f"nothing to repair: the checkout is not half-written ({verdict}: {shown})")
             if verdict != self.guard.SAFE:
                 self._page("kept", "warning", verdict, reason, raw)
             return 0

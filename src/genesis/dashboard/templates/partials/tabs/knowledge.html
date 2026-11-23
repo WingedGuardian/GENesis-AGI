@@ -196,7 +196,7 @@
                         x-text="upload.chunks_total ? 'processing ' + (upload.chunks_done || 0) + '/' + upload.chunks_total : 'processing'"></span>
                 </template>
                 <template x-if="upload.status === 'completed'">
-                  <span class="badge" style="background: var(--color-primary); color: #fff;" x-text="'completed (' + (JSON.parse(upload.unit_ids || '[]')).length + ' units)'"></span>
+                  <span class="badge" style="background: var(--color-primary); color: #fff;" :title="upload.error_message || ''" x-text="'completed (' + (JSON.parse(upload.unit_ids || '[]')).length + ' units)' + (upload.error_message ? ', incomplete' : '')"></span>
                 </template>
                 <template x-if="upload.status === 'failed'">
                   <span class="badge" style="background: var(--color-error-text); color: #fff;" :title="upload.error_message">failed</span>

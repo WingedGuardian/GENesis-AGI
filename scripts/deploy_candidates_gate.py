@@ -322,16 +322,23 @@ def kit_status(repo: Repo) -> dict:
 
 def unit_show(repo: Repo) -> subprocess.CompletedProcess:
     """The LOADED server unit's boot-step properties, asked the way the watchdog
-    asks (util/systemd.py): with no user-bus variables systemctl --user fails
-    ("No medium found", MEASURED), and the engine cannot import genesis."""
-    env = dict(repo.env)
-    run = f"/run/user/{os.getuid()}"
-    env["XDG_RUNTIME_DIR"] = env.get("XDG_RUNTIME_DIR") or run
-    env["DBUS_SESSION_BUS_ADDRESS"] = env.get("DBUS_SESSION_BUS_ADDRESS") or f"unix:path={run}/bus"
+    asks (util/systemd.py), and the engine cannot import genesis."""
     cmd = ["systemctl", "--user", "show", SERVER_UNIT, *UNIT_PROPS]
     # A local property read answers in milliseconds; 10 s bounds a hung user
     # manager, and the caller reads the timeout as "cannot confirm" (a refusal).
-    return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=10)
+    return subprocess.run(
+        cmd, env=user_bus_env(repo.env), capture_output=True, text=True, timeout=10
+    )
+
+
+def user_bus_env(env: Mapping[str, str]) -> dict[str, str]:
+    """``env`` with the user-bus variables systemctl --user needs: without them
+    it fails ("No medium found", MEASURED)."""
+    env = dict(env)
+    run = f"/run/user/{os.getuid()}"
+    env["XDG_RUNTIME_DIR"] = env.get("XDG_RUNTIME_DIR") or run
+    env["DBUS_SESSION_BUS_ADDRESS"] = env.get("DBUS_SESSION_BUS_ADDRESS") or f"unix:path={run}/bus"
+    return env
 
 
 def timespan_s(text: str) -> float | None:

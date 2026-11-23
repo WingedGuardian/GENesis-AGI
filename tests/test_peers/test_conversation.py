@@ -884,11 +884,13 @@ async def test_a_rewritten_result_file_is_not_served(bridge):
 
 @pytest.mark.parametrize("second_service", [False, True])
 async def test_a_retry_in_admission_shares_its_claim(bridge, monkeypatch, second_service):
-    entered, release = [], asyncio.Event()
+    entered, release, prepared = [], asyncio.Event(), asyncio.Event()
 
     class SlowAssembler:
         async def assemble(self, **kwargs):
             entered.append(True)
+            if len(entered) == 2:
+                prepared.set()
             await release.wait()
             return "Synthetic identity"
 
@@ -901,14 +903,13 @@ async def test_a_retry_in_admission_shares_its_claim(bridge, monkeypatch, second
         asyncio.create_task((other if index % 2 else bridge.service).send(identity, incoming(p)))
         for index, p in enumerate((*([payload] * 12), message()))
     ]
-    for _ in range(100):
-        if len(entered) >= 2:
-            break
-        await asyncio.sleep(0.01)
-    await asyncio.sleep(0.1)
-    assert len(entered) == 2 and not any(send.done() for send in sends)
-    release.set()
-    rows = [await send for send in sends]
+    try:
+        await asyncio.wait_for(prepared.wait(), 5)
+        assert len(entered) == 2 and not any(send.done() for send in sends)
+    finally:
+        release.set()
+        await asyncio.gather(*sends, return_exceptions=True)
+    rows = [send.result() for send in sends]
     assert len({row["id"] for row in rows[:12]}) == 1
     assert rows[0]["id"] != rows[-1]["id"]
     for row in (rows[0], rows[-1]):
@@ -1515,6 +1516,19 @@ async def _refused(bridge, payload):
     with pytest.raises(ConversationRefusal) as refused:
         await bridge.service.send(bridge.identities["alpha"], incoming(payload))
     return refused.value.code, refused.value.reason
+
+
+async def test_identical_retry_after_a_trust_change_is_not_a_content_conflict(bridge):
+    from genesis.db.crud import cc_sessions
+
+    payload = message()
+    done = await settle(
+        bridge, await bridge.service.send(bridge.identities["alpha"], incoming(payload))
+    )
+    await cc_sessions.merge_metadata(
+        bridge.db, done["id"], {"conversation_trust": "conversation_shared"}
+    )
+    assert await _refused(bridge, payload) == ("state_conflict", None)
 
 
 async def test_inbound_409_reason_follows_the_state_it_found(bridge):
