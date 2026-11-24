@@ -109,6 +109,8 @@ GH_CALLERS = {
     "_classify_post_review_delta": "api compare/<a>...<b>",
     "_pr_contribution": "api compare/<a>...<b>",
     "_sha_is_ancestor": "api compare/<a>...<b>",
+    "_compare_rows": "api compare/<finding head>...<head> (a floor fix is still there)",
+    "_blob_oids": "api graphql, object(expression) blob oids (a capped or renamed floor fix)",
     "_base_commits_to_path": "api commits?sha=&path=&since=",
     "_path_in_base_history": "api commits -X GET path= sha=",
     "_pin_file_at_ref": "api contents/<pin file>?ref=",
@@ -557,6 +559,11 @@ def test_a_maintainer_answered_p1_passes(tmp_path):
     ]
     state["api"][f"commits/{HEAD}"] = {
         "sha": HEAD,
+        "files": [{"filename": "src/example/module.py", "status": "modified", "changes": 2}],
+    }
+    # #5000: the fix is still in the head being merged.
+    state["api"][f"compare/{finding_head}...{HEAD}"] = {
+        "status": "ahead",
         "files": [{"filename": "src/example/module.py", "status": "modified", "changes": 2}],
     }
     reply = {

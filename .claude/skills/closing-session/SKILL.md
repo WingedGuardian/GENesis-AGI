@@ -2402,7 +2402,11 @@ The review-findings gate specifically:
      `at`/`by`), where the sha is one of the PR's own single-parent commits, descending
      from the head the finding was posted on (if a force-push removed that head, order
      cannot be proven and only the sigil clears it), and touching the finding's file or
-     the name a rename in the PR gave it. Quoted, coded, struck or hedged text ("will be
+     the name a rename in the PR gave it. The fix must still be in the head being merged
+     (#5000): the cited commit is that head or its ancestor, and the finding's file
+     differs there from the head the finding was posted on, so a fully reverted fix clears
+     nothing (a revert hidden by another change to the same file, such as another fix or
+     a merge of main, still clears). Quoted, coded, struck or hedged text ("will be
      fixed in", "Fixed in X, pending CI"), and a claim in the middle of a line, claim
      nothing. Write the claim as its own line: `Fixed in <sha>.` then any explanation. Cite the commit that made the fix,
      never a merge of main. A reply that defers, accepts, disputes or says "partly

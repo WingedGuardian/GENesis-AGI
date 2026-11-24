@@ -3536,6 +3536,114 @@ _PR_COMMITS_API_CAP = 250
 #: on the merge path, which the merge deadline bounds too; the cap matches the cited
 #: ids one finding may name, so a large round of real fixes is not refused.
 _FIX_CHECK_MAX_COMMITS = 64
+#: Compares (one per finding head) and blob reads one scan may make to check that a
+#: fix is still in the head being merged (#5000). MEASURED: at most 4 finding heads
+#: in one PR, over 264 past cleared findings.
+_FIX_CHECK_MAX_COMPARES = 16
+_FIX_CHECK_MAX_BLOB_READS = 16
+#: GitHub lists at most this many files in a compare; a file past it has no row.
+_COMPARE_FILES_CAP = 300
+#: A listed compare row with one of these statuses differs between the two commits.
+#: GitHub drops line counts and patches on a big compare (MEASURED, #5000: 14 real
+#: fixes listed ``modified`` with 0 changes), so the counts prove nothing; only a
+#: rename can leave the content as it was.
+_COMPARE_CHANGED = frozenset({"modified", "added", "removed", "changed"})
+_FIX_UNCHANGED = "the finding's file is unchanged since the finding was posted (fix reverted?)"
+
+
+def _compare_rows(orig: str, head: str, repo: str | None) -> tuple[str, list[dict]] | None:
+    """``compare/<orig>...<head>``: its status and file rows, or None when unreadable."""
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                f"repos/{repo or ':owner/:repo'}/compare/{orig}...{head}",
+                "--jq",
+                "{status: .status, files: [.files[]? | "
+                "{f: .filename, p: .previous_filename, s: .status, c: .changes}]}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(8),
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout or "{}")
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("status"), str):
+        return None
+    files = data.get("files")
+    if not isinstance(files, list):
+        return None
+    return data["status"], [r for r in files if isinstance(r, dict)]
+
+
+def _blob_oids(
+    repo: str | None, at_orig: tuple[str, str], at_head: tuple[str, str]
+) -> tuple[str | None, str | None] | None:
+    """The blob oid of each ``(commit, path)``, None for a path absent there, or None
+    for the pair when the read fails or either path is not a plain file.
+
+    GraphQL, because it answers "absent" as ``null`` apart from an error, where a
+    REST 404 through gh looks the same as a failed read.
+    """
+    if repo is not None and not isinstance(repo, str):
+        return None
+    try:
+        slug = _normalize_repo(repo) if repo else _derive_repo_from_cwd(os.getcwd())
+    except Exception:
+        return None
+    if not slug or "/" not in slug:
+        return None
+    owner, name = slug.split("/", 1)
+    query = (
+        "query($owner:String!,$name:String!,$a:String!,$b:String!){"
+        "repository(owner:$owner,name:$name){"
+        "a:object(expression:$a){__typename ... on Blob{oid}} "
+        "b:object(expression:$b){__typename ... on Blob{oid}}}}"
+    )
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"query={query}",
+                "-f",
+                f"owner={owner}",
+                "-f",
+                f"name={name}",
+                "-f",
+                f"a={at_orig[0]}:{at_orig[1]}",
+                "-f",
+                f"b={at_head[0]}:{at_head[1]}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(8),
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout or "{}")
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("errors"):
+        return None
+    got = ((data.get("data") or {}).get("repository")) if isinstance(data.get("data"), dict) else None
+    if not isinstance(got, dict) or "a" not in got or "b" not in got:
+        return None
+    oids: list[str | None] = []
+    for obj in (got["a"], got["b"]):
+        if obj is None:
+            oids.append(None)
+        elif isinstance(obj, dict) and obj.get("__typename") == "Blob" and isinstance(obj.get("oid"), str):
+            oids.append(obj["oid"])
+        else:
+            return None
+    return oids[0], oids[1]
 
 
 class _FixEvidence:
@@ -3544,18 +3652,93 @@ class _FixEvidence:
     Evidence is a single-parent commit of THIS PR that descends from the head the
     finding was posted on and touches the finding's file, or the name a rename in
     this PR gave it. "Descends" is read from parent links: GitHub lists a PR's
-    commits by date, not ancestry (``review_budget``). It proves provenance, not
-    that the change is correct. Every read failure means "not verified": the finding
-    stays blocked and the reason says why, so ``# floor-accept`` is the way through.
+    commits by date, not ancestry (``review_budget``). The fix must also still be in
+    the head being merged (#5000): the cited commit is that head or one of its
+    ancestors, and the finding's file differs there from every head the finding was
+    posted on, so a fully reverted fix does not clear. A partial revert, or a revert
+    hidden by another change to the same file (another fix, a merge of main), still
+    clears. It proves provenance, not that the change is correct. Every read failure means "not verified": the finding stays
+    blocked and the reason says why, so ``# floor-accept`` is the way through.
+
+    ``head`` is the head the merge is bound to; when the caller has none, the PR's
+    current head is read once, on first need.
     """
 
-    def __init__(self, pr_num: str, repo: str | None) -> None:
+    def __init__(self, pr_num: str, repo: str | None, head: str | None = None) -> None:
         self._pr_num = pr_num
         self._repo = repo
+        self._head_arg = head
+        self._head: str | None = None
+        self._head_read = False
         self._commits: tuple[list[dict] | None, bool] | None = None
         self._files: dict[str, set[str] | None] = {}
         self._ancestors: dict[str, set[str]] = {}
         self._claims: dict[str, list[str]] = {}
+        self._compares: dict[str, tuple[str, list[dict]] | None] = {}
+        self._kept_why: dict[tuple[str, str], str | None] = {}
+        self._blob_reads = 0
+
+    def _bound_head(self) -> str:
+        if not self._head_read:
+            self._head_read = True
+            raw = self._head_arg or _pr_head_sha(self._pr_num, repo=self._repo) or ""
+            self._head = raw.strip().lower() if isinstance(raw, str) else ""
+        return self._head or ""
+
+    def _kept(self, path: str, orig: str) -> str | None:
+        """None when ``path`` differs between ``orig`` and the head, otherwise why not."""
+        key = (orig, path)
+        if key not in self._kept_why:
+            self._kept_why[key] = self._kept_read(path, orig)
+        return self._kept_why[key]
+
+    def _kept_read(self, path: str, orig: str) -> str | None:
+        head = self._bound_head()
+        if orig not in self._compares:
+            if len(self._compares) >= _FIX_CHECK_MAX_COMPARES:
+                return f"compare cap reached ({_FIX_CHECK_MAX_COMPARES} finding heads)"
+            if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+                return "fix could not be verified (merge deadline reached)"
+            self._compares[orig] = _compare_rows(orig, head, self._repo)
+        got = self._compares[orig]
+        if got is None:
+            return "fix could not be verified (compare with the head being merged unreadable)"
+        status, rows = got
+        if status == "identical":
+            return _FIX_UNCHANGED
+        if status != "ahead":
+            return f"fix could not be verified (compare status {status!r})"
+        # A rename's old name first, so a new file reusing that name cannot stand in; a
+        # copy of the file is not the file.
+        row = next((r for r in rows if r.get("p") == path and r.get("s") == "renamed"), None) or next(
+            (r for r in rows if r.get("f") == path and r.get("s") != "renamed"), None
+        )
+        if row is not None:
+            if row.get("s") in _COMPARE_CHANGED:
+                return None
+            if row.get("s") != "renamed":
+                return f"fix could not be verified (compare lists {path} as {row.get('s')!r})"
+            if isinstance(row.get("c"), int) and row["c"] > 0:
+                return None
+            at_head = row.get("f")
+        elif len(rows) < _COMPARE_FILES_CAP:
+            return _FIX_UNCHANGED
+        else:
+            at_head = path
+        if not isinstance(at_head, str) or not at_head:
+            return "fix could not be verified (compare row unreadable)"
+        if self._blob_reads >= _FIX_CHECK_MAX_BLOB_READS:
+            return f"blob-read cap reached ({_FIX_CHECK_MAX_BLOB_READS} reads)"
+        if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+            return "fix could not be verified (merge deadline reached)"
+        self._blob_reads += 1
+        oids = _blob_oids(self._repo, (orig, path), (head, at_head))
+        if oids is None or oids[0] is None or oids[1] is None:
+            return (
+                f"fix could not be verified ({path} at the finding's head, or {at_head} at "
+                "the head being merged, unreadable or absent)"
+            )
+        return _FIX_UNCHANGED if oids[0] == oids[1] else None
 
     def _commit_list(self) -> tuple[list[dict] | None, bool]:
         if self._commits is None:
@@ -3648,6 +3831,13 @@ class _FixEvidence:
                 "the head this finding was posted on is gone (rebased or force-pushed), "
                 "so a later fix cannot be proven; only the sigil clears it"
             )
+        head = self._bound_head()
+        if not re.fullmatch(r"[0-9a-f]{40}", head) or head not in parents:
+            return (
+                "the head being merged is unknown or not a full sha of this PR, so a fix "
+                "in it cannot be proven"
+            )
+        head_line = self._ancestry(head, parents) | {head}
         why = ""
         for token in cited:
             if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
@@ -3669,6 +3859,9 @@ class _FixEvidence:
             if not all(o in self._ancestry(sha, parents) for o in origs):
                 why = f"cited commit {token} does not come after the head the finding was posted on"
                 continue
+            if sha not in head_line:
+                why = f"cited commit {token} is not in the head being merged"
+                continue
             if sha not in self._files and len(self._files) >= _FIX_CHECK_MAX_COMMITS:
                 why = f"fix-check cap reached ({_FIX_CHECK_MAX_COMMITS} commits read)"
                 continue
@@ -3677,7 +3870,8 @@ class _FixEvidence:
                 why = f"fix could not be verified (file list of {token} unreadable)"
                 continue
             if touched & self._names(path):
-                return None
+                # Whether the file still differs is the same for every cited commit.
+                return next((w for o in dict.fromkeys(origs) if (w := self._kept(path, o))), None)
             why = f"cited commit {token} does not touch {path}"
         return why
 
@@ -3690,6 +3884,7 @@ def _check_inline_review_findings(
     floor_accept_used: set[int] | None = None,
     repo: str | None = None,
     uncounted_out: list[dict[str, int]] | None = None,
+    head: str | None = None,
 ) -> tuple[bool, str]:
     """Scan review findings from BOTH delivery channels and apply a weighted score.
 
@@ -3844,7 +4039,7 @@ def _check_inline_review_findings(
     devin_self_withdrawn: list[str] = []  # cleared by Devin's own reply only — surfaced
     devin_doc_skipped: list[str] = []  # scoring Devin findings on a doc path
     devin_off_diff: list[tuple[str, str]] = []  # scoring Devin findings outside the diff
-    evidence = _FixEvidence(pr_num, repo)
+    evidence = _FixEvidence(pr_num, repo, head)
     floor_verdicts: dict[tuple, bool] = {}
     floor_unmet: list[tuple[int, str, str | None]] = []  # (finding id, why open, its file)
     floor_fixed: set[int] = set()
@@ -17661,6 +17856,9 @@ def _run_merge_and_push_gates() -> int:
                     pr_num,
                     force=force_override,
                     repo=merge_repo,
+                    # The head the merge is bound to; under a stale-review-override
+                    # with no binding, the fix check reads the current head itself.
+                    head=verified_head or merge_head or None,
                     **floor_kwargs,
                 )
                 if floor_accept_used:
@@ -18405,7 +18603,7 @@ def check_pr_report(
         {"floor_accept": floor_accept, "floor_accept_used": floor_used} if floor_accept else {}
     )
     blocked, msg = _check_inline_review_findings(
-        pr_num, repo=repo, uncounted_out=uncounted, **floor_kwargs
+        pr_num, repo=repo, uncounted_out=uncounted, head=verified_head or None, **floor_kwargs
     )
     inline_state = (
         "BLOCK — " + msg.splitlines()[0]
