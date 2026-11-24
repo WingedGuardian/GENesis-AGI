@@ -27,9 +27,15 @@ from datetime import UTC, datetime, timedelta
 from html import escape as html_escape
 from pathlib import Path
 
+from genesis.guardian import live_drop
 from genesis.guardian.alert.base import Alert, AlertSeverity
 from genesis.guardian.alert.dispatcher import AlertDispatcher
-from genesis.guardian.alert.telegram import CONFLICT_SENTINEL, TelegramAlertChannel
+from genesis.guardian.alert.telegram import (
+    CONFLICT_SENTINEL,
+    TelegramAlertChannel,
+    _cut,
+    _utf16_units,
+)
 from genesis.guardian.collector import collect_diagnostics
 from genesis.guardian.config import GuardianConfig, load_config, load_secrets
 from genesis.guardian.deletion_window import resolve_window
@@ -1677,6 +1683,12 @@ async def _handle_awaiting_self_heal(
     )
 
 
+def _drop_attempt(config: GuardianConfig, sm: ConfirmationStateMachine) -> dict | None:
+    """The state's record of the last drop on `live`, read only with
+    recovery.live_engine on (#2978)."""
+    return sm.state.live_drop_attempt if config.recovery.live_engine else None
+
+
 async def _proceed_to_diagnosis(
     config: GuardianConfig,
     sm: ConfirmationStateMachine,
@@ -1695,7 +1707,7 @@ async def _proceed_to_diagnosis(
     # CONFIRMED_DEAD ticks must NOT re-diagnose/re-alert (no 30s storm).
     sm.mark_down_alert_sent()
 
-    diagnostic = await collect_diagnostics(config)
+    diagnostic = await collect_diagnostics(config, _drop_attempt(config, sm))
     signal_summary = json.dumps(sm.state.signal_history[-5:], indent=2)
     diagnosis = await diagnosis_engine.diagnose(diagnostic, signal_summary)
 
@@ -1820,7 +1832,7 @@ async def _handle_confirmed_dead(
     sm.mark_down_alert_sent()
 
     try:
-        diagnostic = await collect_diagnostics(config)
+        diagnostic = await collect_diagnostics(config, _drop_attempt(config, sm))
         signal_summary = json.dumps(sm.state.signal_history[-5:], indent=2)
         diagnosis = await diagnosis_engine.diagnose(diagnostic, signal_summary)
     except Exception:
@@ -1982,6 +1994,24 @@ async def _wait_for_gate_keyword(
             last_liveness_log = waited_s
 
 
+_GATE2_CAUSE_HALF = 1500
+
+
+def _gate2_cause(cause: str) -> str:
+    """The cause, bounded so Gate 2 can be delivered: Telegram refuses a message
+    over 4,096 UTF-16 units, and an undelivered prompt runs no recovery. Keeps
+    both ends, because what the approval will run is stated at the end."""
+    if _utf16_units(cause) <= _GATE2_CAUSE_HALF * 2:
+        return cause
+    tail, used = [], 0
+    for ch in reversed(cause):
+        used += _utf16_units(ch)
+        if used > _GATE2_CAUSE_HALF:
+            break
+        tail.append(ch)
+    return f"{_cut(cause, _GATE2_CAUSE_HALF)} {''.join(reversed(tail))}"
+
+
 async def _execute_recovery_with_approval(
     config: GuardianConfig,
     sm: ConfirmationStateMachine,
@@ -2098,7 +2128,7 @@ async def _execute_recovery_with_approval(
     await telegram_channel.send_text("\U0001f50d Diagnosing…")
 
     diagnosis_engine = DiagnosisEngine(config)
-    diagnostic = await collect_diagnostics(config)
+    diagnostic = await collect_diagnostics(config, _drop_attempt(config, sm))
     signal_summary = json.dumps(sm.state.signal_history[-5:], indent=2)
     diagnosis = await diagnosis_engine.diagnose(diagnostic, signal_summary)
 
@@ -2137,18 +2167,24 @@ async def _execute_recovery_with_approval(
                 ),
             )
         elif await container_on_live(config.container_name):
-            logger.warning("REVERT_CODE proposed on `live` — proposing RESTART_CONTAINER")
-            diagnosis = replace(
-                diagnosis,
-                recommended_action=RecoveryAction.RESTART_CONTAINER,
-                likely_cause=(
-                    diagnosis.likely_cause
-                    + " — the checkout is on `live` (or could not be shown not to be), where "
-                    "a code revert never runs. Proposing a container restart: it ends lock "
-                    "holders and lets a boot repair run where one is installed. A bad "
-                    "candidate is removed with `scripts/deploy_candidates drop <branch>`"
-                ),
-            )
+            if config.recovery.live_engine:
+                # The drop of the newest candidate, named before Gate 2 (#2978).
+                diagnosis = await live_drop.live_revert_proposal(
+                    config.container_name, diagnosis, sm.state.live_drop_attempt,
+                )
+            else:
+                logger.warning("REVERT_CODE proposed on `live` — proposing RESTART_CONTAINER")
+                diagnosis = replace(
+                    diagnosis,
+                    recommended_action=RecoveryAction.RESTART_CONTAINER,
+                    likely_cause=(
+                        diagnosis.likely_cause
+                        + " — the checkout is on `live` (or could not be shown not to be), where "
+                        "a code revert never runs. Proposing a container restart: it ends lock "
+                        "holders and lets a boot repair run where one is installed. A bad "
+                        "candidate is removed with `scripts/deploy_candidates drop <branch>`"
+                    ),
+                )
 
     logger.info(
         "Gate-1 approved; diagnosis: %s (confidence=%d%%, action=%s, source=%s)",
@@ -2165,12 +2201,19 @@ async def _execute_recovery_with_approval(
     write_diagnosis_result(diagnosis, config, outage_duration_s=outage_s)
 
     if diagnosis.recommended_action == RecoveryAction.ESCALATE:
-        # Investigation concluded there is no safe automated action — escalate
-        # (the recovery engine sends a manual-intervention alert).
-        await telegram_channel.send_text(
-            "Investigation complete — no safe automated recovery available. "
-            "Escalating for manual intervention."
-        )
+        if diagnosis.escalation == live_drop.HALF_DONE_DROP:  # (#2978)
+            await telegram_channel.send_text(
+                "Genesis is down and `live` still runs a candidate a drop removed from the "
+                "manifest. `scripts/deploy_candidates rebuild` finishes the drop; then "
+                "restart genesis-server."
+            )
+        else:
+            # Investigation concluded there is no safe automated action — escalate
+            # (the recovery engine sends a manual-intervention alert).
+            await telegram_channel.send_text(
+                "Investigation complete — no safe automated recovery available. "
+                "Escalating for manual intervention."
+            )
         await recovery_engine.execute(diagnosis)
         return
 
@@ -2181,7 +2224,7 @@ async def _execute_recovery_with_approval(
         if diagnosis.recommended_action == RecoveryAction.SNAPSHOT_ROLLBACK else ""
     )
     gate2_text = (
-        f"Diagnosed: {html_escape(diagnosis.likely_cause)} "
+        f"Diagnosed: {html_escape(_gate2_cause(diagnosis.likely_cause))} "
         f"({diagnosis.confidence_pct}%).\n"
         f"Proposed: <b>{html_escape(diagnosis.recommended_action.value)}</b>.\n\n"
         f"{snapshot_warning}"

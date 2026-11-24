@@ -48,6 +48,21 @@ class GuardianState(StrEnum):
     PAUSED = "paused"
 
 
+_DROP_ATTEMPT_KEYS = frozenset({"branch", "pinned_head", "tip", "at"})
+
+
+def _drop_attempt(raw: object) -> dict | None:
+    """A persisted drop attempt, or None when it is not one (a hand-edited or
+    older state file)."""
+    if (
+        isinstance(raw, dict)
+        and set(raw) == _DROP_ATTEMPT_KEYS
+        and all(isinstance(v, str) for v in raw.values())
+    ):
+        return dict(raw)
+    return None
+
+
 @dataclass
 class StateData:
     """Persistent state between timer invocations."""
@@ -76,6 +91,11 @@ class StateData:
     snapshot_size_history: list[int] = field(default_factory=list)  # Last N snapshot sizes in bytes
     boot_id: str = ""  # kernel boot UUID when this state was last written; "" = unknown
     rebooted_at: str | None = None  # when this process last saw a host reboot (post-reboot grace)
+    # The Guardian's last drop on `live` this episode (#2978): branch,
+    # pinned_head, tip (`live` before it) and at. Read only with
+    # recovery.live_engine on; kept through the auto-reset, a DENY and a failed
+    # send; cleared when the episode ends (a healthy snapshot).
+    live_drop_attempt: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -103,6 +123,7 @@ class StateData:
             "snapshot_size_history": self.snapshot_size_history[-5:],
             "boot_id": self.boot_id,
             "rebooted_at": self.rebooted_at,
+            "live_drop_attempt": self.live_drop_attempt,
         }
 
     @classmethod
@@ -136,6 +157,7 @@ class StateData:
             snapshot_size_history=data.get("snapshot_size_history", []),
             boot_id=str(data.get("boot_id") or ""),
             rebooted_at=data.get("rebooted_at") or None,
+            live_drop_attempt=_drop_attempt(data.get("live_drop_attempt")),
         )
 
 
@@ -261,6 +283,8 @@ class ConfirmationStateMachine:
         })
         # Keep last 20
         self._state.signal_history = self._state.signal_history[-20:]
+        if snapshot.all_alive:  # the episode is over: its drop needs no naming
+            self._state.live_drop_attempt = None
 
         old_state = self._state.current_state
 
