@@ -771,6 +771,7 @@ async def test_drain_does_not_send_a_row_cancelled_after_the_snapshot(config, db
     ("configured", "subject", "channel", "text"),
     [
         ({"email"}, "relay", "email", "a & b"),
+        ({"email"}, "relay-summary", "email", "[s] Acted via m: used x; ended done."),
         ({"telegram", "email"}, "relay", "telegram", "a &amp; b"),
         ({"email"}, "Weekly", "telegram", "a &amp; b"),
         (set(), "relay", "telegram", "a &amp; b"),
@@ -782,9 +783,12 @@ async def test_drain_sends_a_relay_alert_by_email_where_telegram_is_absent(
     from genesis.db.crud import pending_outreach
     from genesis.outreach.types import OWNER_RELAY_ALERT_SUBJECT
 
+    message = "a &amp; b"
+    if subject == "relay-summary":
+        message = '[s] Acted via m: used x; ended done. Session said: &quot;/home/x/secret&quot;'
     await pending_outreach.enqueue(
-        db, message="a &amp; b", category="alert", channel="telegram",
-        email_subject=OWNER_RELAY_ALERT_SUBJECT if subject == "relay" else subject,
+        db, message=message, category="alert", channel="telegram",
+        email_subject=OWNER_RELAY_ALERT_SUBJECT if subject.startswith("relay") else subject,
     )
     pipeline = _drain_pipeline(OutreachStatus.DELIVERED)
     pipeline.channel_configured = lambda name: name in configured

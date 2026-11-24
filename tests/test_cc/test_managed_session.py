@@ -1679,3 +1679,15 @@ async def test_a_relayed_run_that_failed_before_its_child_spawned_sends_no_alert
     rows = await (await db.execute("SELECT message FROM pending_outreach")).fetchall()
     assert rows == []
 
+
+async def test_the_idle_reaper_queues_an_owed_relay_alert_before_expiring(db, native):
+    """A relayed session the reaper expires never reaches boot reconciliation
+    again, so its "may have acted" alert is queued first (#5014 review)."""
+    _, manager, _ = native
+    req = request()
+    sid = await prepare(db, req, peer_id="alpha", owner_relay=True)
+    assert await manager.cleanup_stale(max_idle_minutes=-5) == 1
+    assert (await cc_sessions.get_by_id(db, sid))["status"] == "expired"
+    rows = await (await db.execute("SELECT message FROM pending_outreach")).fetchall()
+    assert len(rows) == 1 and "may have acted" in rows[0]["message"]
+

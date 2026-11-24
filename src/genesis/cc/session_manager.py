@@ -277,6 +277,25 @@ class SessionManager:
     # sessions are preserved (handled by the session_type check below).
     _PRESERVE_SOURCE_TAGS: frozenset[str] = frozenset()
 
+    async def _relay_alert_before_expiry(self, row) -> bool:
+        """Queue the owner alert a relayed session owes; False when it could not be."""
+        from genesis.cc.managed_session import _notify_owner_relay, metadata
+
+        if row.get("source_tag") != "agent_api" or not metadata(row).get("owner_relay"):
+            return True
+        try:
+            await _notify_owner_relay(
+                self._db, row["id"], uncertain=True, ended="expired", reason="expired_idle"
+            )
+        except Exception as exc:
+            logger.warning(
+                "Owner-relay alert not queued for idle %s; not expired yet (exception=%s)",
+                row["id"][:8],
+                type(exc).__name__,
+            )
+            return False
+        return True
+
     async def cleanup_stale(self, *, max_idle_minutes: int = 60) -> int:
         """Expire stale background sessions per type-specific policy.
 
@@ -308,6 +327,11 @@ class SessionManager:
                 or session_type == "background_task"
                 or session_type != "foreground"
             ):
+                # A relayed managed session that never finished may have acted:
+                # its owner alert is queued before it leaves active, or it stays
+                # for the next pass (boot reconciliation reads only active rows).
+                if not await self._relay_alert_before_expiry(row):
+                    continue
                 # Conditional on the row still being active: a session that
                 # finished between the read above and this write keeps its
                 # real outcome instead of being stamped expired.

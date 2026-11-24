@@ -795,8 +795,12 @@ class OutreachScheduler:
                     ):
                         # A relay alert must reach the owner: on an install with
                         # email and no Telegram it goes by email, as plain text
-                        # (it was queued escaped for Telegram's HTML).
-                        raw_channel, message = "email", html.unescape(message)
+                        # (it was queued escaped for Telegram's HTML), and without
+                        # the session's own summary, which the outbound content
+                        # scan could quarantine (as managed_session does by email).
+                        head = message.split(" Session said: ", 1)[0]
+                        head = head.split(" No summary recorded.", 1)[0]
+                        raw_channel, message = "email", html.unescape(head)
                     is_discord_subchannel = raw_channel in _DISCORD_CHANNELS
                     channel = "discord" if is_discord_subchannel else raw_channel
 

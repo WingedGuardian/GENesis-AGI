@@ -87,15 +87,15 @@ async def test_outside_a_relay_nothing_is_read_or_refused():
 
 
 @pytest.mark.asyncio
-async def test_a_relayed_click_on_nothing_keeps_the_normal_error_and_an_unreadable_one_is_refused():
+async def test_best_effort_a_missing_or_unreadable_control_is_allowed():
+    """Functionality first: the check refuses only on a positive match."""
     with request_caller(RELAYED):
-        missing = await browser._relay_purchase_refusal(_Page(_Target(count=0)), "#x")
-        unread = await browser._relay_purchase_refusal(
+        assert await browser._relay_purchase_refusal(_Page(_Target(count=0)), "#x") is None
+        assert await browser._relay_purchase_refusal(
             _Page(_Target(error=RuntimeError("detached"))), "#x"
-        )
-    assert unread["error"] == browser._REFUSE_UNREADABLE
-    # A control that never attached is not clicked: a later one would go unread.
-    assert "No element matched" in missing["error"] and "code" not in missing
+        ) is None
+        assert await browser._relay_purchase_refusal(_Page(_Target(None)), "iframe") is None
+        assert await browser._relay_key_refusal(_Page(focused=RuntimeError("gone")), "Enter") is None
 
 
 @pytest.mark.asyncio
@@ -122,13 +122,14 @@ async def test_a_relayed_submitting_key_press_on_a_purchase_form_is_refused(key,
 @pytest.mark.parametrize(
     ("value", "submits", "refused"),
     [
-        ("line one\nline two", True, True),
-        ("line one\nline two", False, False),
-        ("line one\nline two", RuntimeError("detached"), True),
-        ("one line", True, False),
+        ("line one\nline two", "Place order", True),
+        ("line one\nline two", "Search", False),
+        ("line one\nline two", "", False),
+        ("line one\nline two", RuntimeError("detached"), False),
+        ("one line", "Place order", False),
     ],
 )
-async def test_a_relayed_line_break_is_refused_only_where_it_submits(value, submits, refused):
+async def test_a_relayed_line_break_is_refused_only_where_it_submits_a_purchase(value, submits, refused):
     target = _Target(submits) if not isinstance(submits, Exception) else _Target(error=submits)
     with request_caller(RELAYED):
         result = await browser._relay_fill_refusal(_Page(target), "#f", value)
@@ -188,16 +189,16 @@ def test_the_health_mcp_entry_has_no_env_block_to_replace_the_inherited_flag():
 # --- the tools themselves, so removing a call site fails a test ---
 
 
-def _tool_page(label="Place order", focused="Place order", multiline=False):
+def _tool_page(label="Place order", focused="Place order", submit=""):
     from unittest.mock import AsyncMock, MagicMock
 
     page = MagicMock()
     page.url = "https://shop.example/checkout"
     page.is_closed = MagicMock(return_value=False)
     target = MagicMock()
-    target.wait_for = AsyncMock()
+    target.count = AsyncMock(return_value=1)
     target.evaluate = AsyncMock(
-        side_effect=lambda script: (not multiline) if script == browser._NEWLINE_SUBMITS_JS else label
+        side_effect=lambda script: submit if script == browser._NEWLINE_SUBMIT_LABEL_JS else label
     )
     page.locator = MagicMock(return_value=MagicMock(first=target))
     page.evaluate = AsyncMock(return_value=focused)
@@ -254,17 +255,17 @@ async def test_browser_press_key_checks_before_every_press(tool_page):
 
 
 @pytest.mark.asyncio
-async def test_browser_fill_refuses_a_line_break_in_a_single_line_field(tool_page, monkeypatch):
+async def test_browser_fill_refuses_a_line_break_that_submits_a_purchase(tool_page, monkeypatch):
     from unittest.mock import AsyncMock
 
     fill = AsyncMock(return_value={"filled": "#f"})
     monkeypatch.setattr(browser, "_fill", fill)
-    tool_page(_tool_page(label="About you"))
+    tool_page(_tool_page(label="About you", submit="Place order"))
     with request_caller(RELAYED):
         result = await browser._impl_browser_fill("#f", "a\nb")
     assert result["code"] == "relay_purchase_refused"
     fill.assert_not_awaited()
-    tool_page(_tool_page(label="About you", multiline=True))
+    tool_page(_tool_page(label="About you", submit="Send message"))
     with request_caller(RELAYED):
         await browser._impl_browser_fill("#f", "a\nb")
     fill.assert_awaited_once()
@@ -317,16 +318,23 @@ def test_the_focus_script_reads_the_form_submit_shadow_roots_and_frames(real_pag
         " r.innerHTML = '<button>Pay now</button>'; r.querySelector('button').focus(); }"
     )
     assert browser._PURCHASE_WORDS.search(real_page.evaluate(browser._FOCUSED_LABEL_JS))
-    real_page.set_content("<iframe srcdoc='<button>Pay</button>'></iframe>")
-    real_page.focus("iframe")
-    assert real_page.evaluate(browser._FOCUSED_LABEL_JS) is None
+    real_page.set_content(
+        "<form><textarea id=t></textarea><input id=i><button>Place order</button></form>"
+    )
+    textarea = real_page.locator("#t").first.evaluate(browser._NEWLINE_SUBMIT_LABEL_JS)
+    field = real_page.locator("#i").first.evaluate(browser._NEWLINE_SUBMIT_LABEL_JS)
+    assert textarea == "" and browser._PURCHASE_WORDS.search(field)
 
 
-def test_the_shadow_dom_fallback_never_clicks_in_a_relayed_session():
+def test_the_click_fallbacks_stay_on_and_the_key_fallback_is_checked():
+    """Functionality first: both fallbacks run for a relayed session too; the
+    keyboard one is checked like a key press before it presses."""
     import inspect
 
     source = inspect.getsource(browser._stealth_click)
-    assert "if not _relayed() and await _click_in_shadow_dom(page, selector):" in source
+    assert "if _relayed():" not in source
+    assert "if await _relay_key_refusal(page, key):" in source
+    assert "if await _click_in_shadow_dom(page, selector):" in source
 
 
 def test_place_a_bid_and_image_submits_are_covered(real_page):
@@ -341,20 +349,6 @@ def test_place_a_bid_and_image_submits_are_covered(real_page):
 
 
 @pytest.mark.asyncio
-async def test_a_relayed_click_on_a_frame_is_refused_as_unreadable():
-    with request_caller(RELAYED):
-        result = await browser._relay_purchase_refusal(_Page(_Target(None)), "iframe")
-    assert result["error"] == browser._REFUSE_UNREADABLE
-
-
-def test_no_fallback_click_runs_in_a_relayed_session():
-    import inspect
-
-    source = inspect.getsource(browser._stealth_click)
-    assert source.index("if _relayed():") < source.index("# --- Keyboard fallback")
-
-
-@pytest.mark.asyncio
 async def test_browser_fill_refuses_typing_into_a_purchase_control(tool_page, monkeypatch):
     from unittest.mock import AsyncMock
 
@@ -365,4 +359,51 @@ async def test_browser_fill_refuses_typing_into_a_purchase_control(tool_page, mo
         result = await browser._impl_browser_fill("#f", "anything")
     assert result["code"] == "relay_purchase_refused"
     fill.assert_not_awaited()
+
+
+def test_the_form_submit_follows_tree_order_and_dropdowns_are_free(real_page):
+    real_page.set_content(
+        "<form><input id=q><input type=image alt='Pay now' src='data:,'>"
+        "<button>Save for later</button></form>"
+    )
+    real_page.focus("#q")
+    assert browser._PURCHASE_WORDS.search(real_page.evaluate(browser._FOCUSED_LABEL_JS))
+    real_page.set_content(
+        "<form><select id=s><option>Small</option></select><button>Place order</button></form>"
+    )
+    real_page.focus("#s")
+    assert not browser._PURCHASE_WORDS.search(real_page.evaluate(browser._FOCUSED_LABEL_JS))
+
+
+def test_the_enclosing_buttons_own_labels_are_read(real_page):
+    real_page.set_content(
+        "<span id=l>Place order</span><button aria-labelledby=l><span id=i>&rarr;</span></button>"
+    )
+    text = real_page.locator("#i").first.evaluate(browser._CONTROL_LABEL_JS)
+    assert browser._PURCHASE_WORDS.search(text)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_keyboard_fallback_stops_the_click(monkeypatch):
+    """The fallback's refusal ends the click: neither the press nor the shadow-DOM
+    click runs, and the caller gets the refusal (#5014 review)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    page = MagicMock()
+    stealth = MagicMock(wait_for=AsyncMock(side_effect=RuntimeError("stealth click failed")))
+    page.locator = MagicMock(return_value=MagicMock(first=stealth))
+    el = MagicMock(focus=AsyncMock(), evaluate=AsyncMock(side_effect=["button", ""]))
+    page.wait_for_selector = AsyncMock(return_value=el)
+    page.click = AsyncMock(side_effect=RuntimeError("Timeout 10000ms exceeded"))
+    page.keyboard = MagicMock(press=AsyncMock())
+    page.evaluate = AsyncMock(return_value="Place order")
+    shadow = AsyncMock(return_value=True)
+    monkeypatch.setattr(browser, "_click_in_shadow_dom", shadow)
+    monkeypatch.setattr(browser, "_is_camoufox_active", lambda: True)
+    monkeypatch.setattr(browser, "_blocked_click", AsyncMock(return_value=None))
+    monkeypatch.setattr(browser, "_click_was_sent", lambda err, selector: False)
+    with request_caller(RELAYED), pytest.raises(browser.RelayPurchaseRefused):
+        await browser._stealth_click(page, "#go", timeout=10)
+    page.keyboard.press.assert_not_awaited()
+    shadow.assert_not_awaited()
 
