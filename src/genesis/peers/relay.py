@@ -88,13 +88,9 @@ SUMMARY_CHARS = 200
 
 async def granted(db, peer: dict) -> bool:
     """Whether this peer holds ``owner_relay`` = allow. Ask and deny are not grants."""
-    row = await (
-        await db.execute(
-            "SELECT decision FROM peer_grants WHERE peer_id=? AND capability='owner_relay'",
-            (peer["peer_id"],),
-        )
-    ).fetchone()
-    return row is not None and row[0] == "allow"
+    from genesis.db.crud import peer_grants
+
+    return await peer_grants.decision(db, peer["peer_id"], "owner_relay") == "allow"
 
 
 def framing(relay: bool, profile: str, can_interact: bool) -> str:

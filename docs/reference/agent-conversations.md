@@ -62,20 +62,17 @@ python -m genesis peers grant muse owner_relay allow
 Without this grant, every peer session is told that peer content is external
 input, not owner approval or authority. With `owner_relay` set to `allow`
 (`ask` and `deny` count as no grant), the session is told instead that a request
-the peer relays from the owner is the owner's request. Three things still need
-the owner directly: spending money (the owner's own card-prompt tap is the only
+the peer relays from the owner is the owner's request. The session is told that
+three things still need the owner directly: spending money (the owner's own card-prompt tap is the only
 approval, and a relayed "yes" never is), destructive actions, and approving an
-autonomous session. These limits are what the session is told; code enforces only
-some of them (peer sessions have no shell, dispatched sessions cannot resolve ego
-proposals, and payments stop at the card tap), so a destructive edit such as a
-file write or a reference deletion is held back by the prompt alone. The grant
+autonomous session. Card payments are also stopped in code at the card tap. The grant
 does not change the profile: the peer still picks it per message. An `observe`
 session that receives a relayed request needing action replies that it must be
 resent with `profile: "interact"`, or, when the autonomy level does not allow
 `interact`, that it cannot be done at this level. Neither is a refusal.
 
 When a relayed session used any tool outside a short read-only set, finalization
-queues one Telegram alert to the owner:
+queues one alert to the owner, on the install's alert channel:
 `[<session>] Acted on your behalf via <peer>: used <tools>; ended <outcome>.`
 followed by the session's own summary, quoted and cut to 200 characters. A tool
 not on the read-only set counts as acting, so a newly added tool alerts by

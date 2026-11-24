@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from genesis.db.crud import cc_sessions
+from genesis.outreach.types import OWNER_RELAY_ALERT_SUBJECT
 from genesis.util.atomic import atomic_write_text
 from genesis.util.execution_privacy import private_execution
 
@@ -55,9 +56,7 @@ async def _notify_owner_relay(
     if not tools and not uncertain:
         return False
     pending_id = relay.notice_id(sid)
-    if await (
-        await db.execute("SELECT 1 FROM pending_outreach WHERE id=?", (pending_id,))
-    ).fetchone():
+    if await pending_outreach.exists(db, pending_id):
         return False
     peer = meta.get("peer_id", "a peer")
     if ended is None:
@@ -74,12 +73,15 @@ async def _notify_owner_relay(
             f"[{sid[:8]}] A relayed session via {peer} may have acted: its tool record "
             f"is incomplete; ended {ended}."
         )
+    channel = _owner_alert_channel()
+    text = f"{head} {relay.quoted(reason)}"
     await pending_outreach.enqueue(
         db,
-        # Escaped for HTML-rendering channels: the summary is model-written.
-        message=html.escape(f"{head} {relay.quoted(reason)}", quote=False),
+        # Escaped where the channel renders HTML: the summary is model-written.
+        message=text if channel == "email" else html.escape(text, quote=False),
         category="alert",
-        channel=_owner_alert_channel(),
+        channel=channel,
+        email_subject=OWNER_RELAY_ALERT_SUBJECT,
         pending_id=pending_id,
     )
     return True
@@ -362,7 +364,9 @@ async def _execute(runner, request, sid):
     _set_obs_session(sid)
     await runner._check_background(request)
     await runner._session_manager.start_prepared(sid)
-    await update_state(runner._session_manager.db, sid, "running")
+    # ``launched`` outlives the state: a cancel or deadline later rewrites
+    # native_state, and _finalize must still know the child ran.
+    await update_state(runner._session_manager.db, sid, "running", launched=True)
     start = time.monotonic()
     telemetry = []
 
@@ -406,7 +410,8 @@ async def _finalize(runner, request, result, state):
                 # running just before invoking the child, so only a run that got that
                 # far can have stopped with part of its stream unread.
                 row = await cc_sessions.get_by_id(runner._session_manager.db, result.session_id)
-                launched = bool(row) and metadata(row).get("native_state") == "running"
+                meta = metadata(row) if row else {}
+                launched = bool(meta.get("launched")) or meta.get("native_state") == "running"
             await runner._store_result(
                 result.session_id,
                 request,

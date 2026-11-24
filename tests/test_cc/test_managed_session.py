@@ -1592,3 +1592,61 @@ async def test_owner_alert_escapes_model_written_html(db, native):
     (row,) = await (await db.execute("SELECT message FROM pending_outreach")).fetchall()
     assert "<a " not in row["message"] and "<b>" not in row["message"]
     assert "&lt;a href=" in row["message"] and "&amp;" in row["message"]
+
+
+async def test_a_cancelled_launched_run_with_only_reads_warns_it_may_have_acted(db, native):
+    """A cancel rewrites native_state before finalization; the child still ran,
+    so its unread events may hold acting tools (#4905 review)."""
+    from genesis.cc.types import StreamEvent
+
+    runner, _, invoker = native
+    entered = asyncio.Event()
+    raw = {
+        "type": "assistant",
+        "message": {"content": [{"type": "tool_use", "name": "Read", "input": {}}]},
+    }
+
+    async def execute(invocation, on_event=None):
+        await on_event(StreamEvent.from_raw(raw))
+        entered.set()
+        await asyncio.Event().wait()
+
+    invoker.run_streaming.side_effect = execute
+    req = request()
+    sid = await prepare(db, req, peer_id="alpha", owner_relay=True)
+    await runner.adopt(sid, req)
+    await reached(entered)
+    assert runner.cancel(sid)
+    await settled(runner, sid)
+    rows = await (await db.execute("SELECT message FROM pending_outreach")).fetchall()
+    assert len(rows) == 1 and "may have acted" in rows[0]["message"]
+
+
+async def test_an_email_owner_alert_carries_the_relay_subject(db, native, monkeypatch):
+    from genesis.outreach import config as outreach_config
+    from genesis.outreach.types import OWNER_RELAY_ALERT_SUBJECT
+
+    real = outreach_config.load_outreach_config()
+    prefs = {**real.channel_preferences, "alert": "email"}
+    monkeypatch.setattr(
+        outreach_config,
+        "load_outreach_config",
+        lambda *a, **k: type(real)(**{**real.__dict__, "channel_preferences": prefs}),
+    )
+    await _relay_run(db, native, ["mcp__genesis-outreach__outreach_send"], owner_relay=True)
+    row = await (
+        await db.execute("SELECT channel, email_subject, message FROM pending_outreach")
+    ).fetchone()
+    assert row["channel"] == "email" and row["email_subject"] == OWNER_RELAY_ALERT_SUBJECT
+
+
+async def test_a_relayed_session_cancelled_before_launch_sends_no_owner_alert(db, native):
+    runner, _, invoker = native
+    req = request()
+    sid = await prepare(db, req, peer_id="alpha", owner_relay=True)
+    await runner.adopt(sid, req)
+    assert runner.cancel(sid)
+    await settled(runner, sid)
+    invoker.run_streaming.assert_not_awaited()
+    rows = await (await db.execute("SELECT message FROM pending_outreach")).fetchall()
+    assert rows == []

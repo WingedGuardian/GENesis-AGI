@@ -99,6 +99,12 @@ async def drain(
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def exists(db: aiosqlite.Connection, pending_id: str) -> bool:
+    """Whether a row with this id was ever queued, delivered or not."""
+    cursor = await db.execute("SELECT 1 FROM pending_outreach WHERE id = ?", (pending_id,))
+    return await cursor.fetchone() is not None
+
+
 async def cancel(db: aiosqlite.Connection, pending_id: str) -> tuple[bool, str]:
     """Cancel a still-queued message. Returns (cancelled, reason).
 
