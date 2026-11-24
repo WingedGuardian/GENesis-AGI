@@ -164,25 +164,6 @@ _UNCHOSEN_ZONES = frozenset(
 )
 
 
-def _user_tz_configured() -> bool:
-    """Whether this host names a user timezone at all (genesis.yaml
-    ``timezone`` or ``USER_TIMEZONE``, other than UTC) — else user_timezone()'s
-    zone is a fallback, not a choice, and the host clock's zone comes first."""
-    try:
-        from genesis.env import _local_config
-
-        named = (_local_config().get("timezone"), os.environ.get("USER_TIMEZONE"))
-        return any(
-            isinstance(v, str)
-            and v.strip()
-            and v.strip() not in _UNCHOSEN_ZONES
-            and _zone(v.strip())
-            for v in named
-        )
-    except Exception:
-        return False
-
-
 _LOCALTIME = "/etc/localtime"
 
 
@@ -223,7 +204,10 @@ def _resolve_tz(configured: object) -> tuple[tzinfo, str, str]:
             logger.warning("timezone %r unavailable on this host", name)
     except Exception:
         logger.warning("could not resolve the user timezone", exc_info=True)
-    if zone is not None and _user_tz_configured():
+    # Judge the zone user_timezone() SELECTED, never a source it passed over: a
+    # UTC placeholder in genesis.yaml outranks USER_TIMEZONE there, so UTC is
+    # what this host runs on and it is no user choice.
+    if zone is not None and name not in _UNCHOSEN_ZONES:
         return zone, name, "user"
     # A host Guardian usually has no genesis.yaml, so user_timezone() is only
     # its UTC default here; the host clock is what set-timezone aligns (#3794).

@@ -242,6 +242,17 @@ def test_a_utc_genesis_yaml_is_not_a_choice_over_the_host_clock(tmp_path, monkey
     assert (w.tz_name, w.tz_source) == ("Europe/Paris", "system")
 
 
+def test_a_passed_over_environment_zone_is_not_a_user_choice(tmp_path, monkeypatch) -> None:
+    # genesis.yaml's UTC placeholder outranks USER_TIMEZONE in user_timezone(),
+    # so UTC is the zone selected; the environment value it passed over must
+    # not make that UTC a user choice, and the host clock comes next.
+    _localtime(tmp_path, monkeypatch, "/usr/share/zoneinfo/Europe/Paris")
+    monkeypatch.setenv("USER_TIMEZONE", "Europe/Berlin")
+    with patch("genesis.env._local_config", return_value={"timezone": "UTC"}):
+        w = resolve_window(_cfg(tmp_path, tz=""))
+    assert (w.tz_name, w.tz_source) == ("Europe/Paris", "system")
+
+
 def test_failed_user_lookup_still_reads_the_host_clock(tmp_path, monkeypatch) -> None:
     _localtime(tmp_path, monkeypatch, "/usr/share/zoneinfo/Europe/Paris")
     with patch("genesis.env.user_timezone", side_effect=RuntimeError("no config")):

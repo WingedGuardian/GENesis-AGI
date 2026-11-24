@@ -1119,7 +1119,8 @@ PYEOF
         _TZ_CT=""
         _tz_yaml="${HOME}/.local/share/genesis-guardian/config/guardian.yaml"
         if [ -f "$_tz_yaml" ]; then
-            _TZ_CT="$(awk -F':' '/^container_name:/ {sub(/^[^:]*:/,""); gsub(/[" '"'"']/,""); print; exit}' "$_tz_yaml" 2>/dev/null)" || _TZ_CT=""
+            # A trailing "# comment" is YAML, not part of the name: drop it first.
+            _TZ_CT="$(awk -F':' '/^container_name:/ {sub(/^[^:]*:/,""); sub(/[ \t]+#.*$/,""); gsub(/[" '"'"']/,""); print; exit}' "$_tz_yaml" 2>/dev/null)" || _TZ_CT=""
         fi
         _TZ_CT="${_TZ_CT:-genesis}"
         _tz_ct_zone() {

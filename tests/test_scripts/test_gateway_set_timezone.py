@@ -275,10 +275,34 @@ def test_container_without_timedated_already_in_zone_is_unchanged(tmp_path):
     assert _ok(host.run("Europe/Paris", TZT_CT_NO_TIMEDATED="1"))["container"] == "unchanged"
 
 
+def _system_path_without(tmp_path: Path, name: str) -> str:
+    """A PATH of the system tools minus ``name``, so a test of its absence can
+    never reach a client installed on the host running the suite."""
+    sysbin = tmp_path / "sysbin"
+    sysbin.mkdir()
+    for src in (Path("/usr/bin"), Path("/bin")):
+        if not src.is_dir():
+            continue
+        for tool in src.iterdir():
+            link = sysbin / tool.name
+            if tool.name != name and not link.exists() and not link.is_symlink():
+                link.symlink_to(tool)
+    return str(sysbin)
+
+
 def test_no_incus_is_reported(tmp_path):
     host = Host(tmp_path)
     (host.bin / "incus").unlink()
-    assert _ok(host.run("Europe/Paris"))["container"] == "no-incus"
+    path = f"{host.bin}:{_system_path_without(tmp_path, 'incus')}"
+    assert _ok(host.run("Europe/Paris", PATH=path))["container"] == "no-incus"
+
+
+def test_container_name_ignores_a_trailing_yaml_comment(tmp_path):
+    host = Host(tmp_path)
+    host.guardian_yaml('container_name: "other-box"  # production container\n')
+    _ok(host.run("Europe/Paris"))
+    incus = [c for c in host.calls() if c.startswith("incus")]
+    assert incus and all(c.startswith("incus exec other-box -- ") for c in incus)
 
 
 def test_container_name_comes_from_guardian_yaml(tmp_path):
