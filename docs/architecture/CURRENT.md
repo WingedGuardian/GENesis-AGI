@@ -2860,7 +2860,42 @@ verified: 204c69c1f 2026-11-22
   `RESTART_CONTAINER` before Gate 2 (after F.1's git-health redirect), and
   `recovery.py` refuses it as a backstop. A restart ends lock holders and lets
   a boot repair run where one is installed; a bad candidate is removed by
-  `deploy_candidates drop`. The diagnosis snapshot carries the boot repair's
+  `deploy_candidates drop`. With `recovery.live_engine: true` in the host's
+  guardian.yaml (default false, and only a real bool arms it; #2978) the
+  Guardian runs that drop itself (`guardian/live_drop.py`): before Gate 2,
+  `check.py` reads the engine's `list --json --move-refusals` and proposes the
+  drop of the newest candidate (the last one `live` holds that the manifest
+  lists), an ESCALATE to `rebuild` when a drop is half-done, or
+  `RESTART_CONTAINER` when no drop can run. A drop is proposed only when the
+  view's `drop_preview` (that drop's own plan, computed lockless; it writes
+  only unreachable git objects) names the same branch and every other
+  candidate it takes out, and Gate 2's identity section, never cut and at
+  most 3,000 UTF-16 units, lists them all; otherwise the proposal is
+  `RESTART_CONTAINER`, naming why. The approved drop is ONE call to
+  the engine's guarded form (`--expect-branch live --expect-head
+  --expect-candidate --expect-leaving <the list Gate 2 showed>
+  --restart-server --wait 0`, 120 s client timeout; a plan that takes out a
+  different set refuses, nothing changed), which
+  drops, confirms and queues the restart under one update.lock hold; the
+  Guardian then judges only whether genesis-server booted from `live`'s new
+  tip (`scripts/lib/serving_commit.py`, as `deploy_code_only.sh status` reads
+  it), with no 30 s probe: the next check judges health. It restarts once
+  itself on exit 4, on exit 1 after the manifest save when the engine's view
+  shows the drop done, and on exit 5 only while the pre-drop server still
+  runs. An outcome it did not see (timeout, 130/143, an unknown code) records
+  the attempt in the Guardian state, which names it in the next diagnosis:
+  while the checkout has not settled since, nothing is proposed; once the
+  drop finished, a server not booted from `live`'s tip is offered a restart
+  before any further drop. The record lasts until a healthy snapshot. While
+  it is set, any action that ran ends in RECOVERED, which waits out the
+  backoff and then moves once to CONFIRMED_DEAD; that one transition passes
+  the episode's alert latch, so the next diagnosis always comes (the
+  escalation, at max_escalations). A container restart or rollback proposed
+  while that drop may still be running says at Gate 2 that it would interrupt
+  it, and an approved action held back by the backoff says it did not run.
+  Off, the
+  behaviour above is unchanged and no candidate is read. The diagnosis
+  snapshot carries the boot repair's
   `live-move repair:` journal lines and a summary of the newest
   `deploy-backups/*-live-move-repair/REPAIR.json` that is neither dismissed
   nor superseded and names `~/genesis` (6 h window on the ts in its dir name,

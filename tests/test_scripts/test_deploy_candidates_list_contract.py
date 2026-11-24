@@ -157,6 +157,30 @@ def _moves(w: World, dc, capsys) -> dict:
     return json.loads(capsys.readouterr().out)
 
 
+def test_move_view_previews_what_the_newest_drop_takes_out(dc, dc_ready, capsys):
+    """A drop takes the candidates sharing its commits out of `live` too, so
+    the approval must name them: from the drop's own plan."""
+    w = dc_ready
+    w.candidate("feat/a", {"x.txt": "x\n"})
+    w.candidate("feat/b", {"y.txt": "y\n"}, base="feat/a")
+    w.write_manifest([w.entry("feat/b")])
+    assert w.run(dc, "rebuild") == 0
+    w.write_manifest([w.entry("feat/a"), w.entry("feat/b")])  # both now held
+    assert _moves(w, dc, capsys)["drop_preview"] == {"branch": "feat/b", "leaving": ["feat/a"]}
+
+
+def test_move_view_with_nothing_else_leaving_says_so(dc, dc_ready, capsys):
+    _two_live(dc_ready, dc)
+    assert _moves(dc_ready, dc, capsys)["drop_preview"] == {"branch": "feat/b", "leaving": []}
+
+
+def test_move_view_with_no_live_previews_null(dc, dc_ready, capsys):
+    w = dc_ready
+    w.candidate("feat/a", {"x.txt": "x\n"})
+    w.write_manifest([w.entry("feat/a")])
+    assert _moves(w, dc, capsys)["drop_preview"] is None
+
+
 def test_without_the_flag_there_is_no_move_key(dc, dc_ready, capsys):
     """deploy_health reads plain `list --json`; it pays for no git status."""
     got = _observe(dc_ready, dc, capsys)
@@ -186,6 +210,29 @@ def test_a_guarding_update_state_is_a_move_refusal(dc, dc_ready, capsys):
     (w.home / ".genesis" / "update_state.json").write_text("{not json")
     [why] = _moves(w, dc, capsys)["move_refusals"]
     assert "update_state.json" in why
+
+
+def test_a_hand_commit_on_live_is_a_move_refusal(dc, dc_ready, capsys):
+    """drop refuses a `live` holding a commit that is neither a rebuild merge
+    nor a candidate's (refuse_foreign), so the list says so, as status does."""
+    w = dc_ready
+    _two_live(w, dc)
+    w.commit(w.root, {"hand.txt": "made on live\n"}, "a commit made by hand on live")
+    hand = w.rev("refs/heads/live")
+    [why] = _moves(w, dc, capsys)["move_refusals"]
+    assert "neither a rebuild merge nor a candidate's" in why and hand[:12] in why
+    # Control: the drop the list describes does refuse.
+    capsys.readouterr()
+    assert w.run(dc, "drop", "feat/b") == 1
+    assert "neither a rebuild merge nor a candidate's" in capsys.readouterr().err
+
+
+def test_an_unresolvable_main_is_a_move_refusal(dc, dc_ready, capsys):
+    w = dc_ready
+    _two_live(w, dc)
+    w.git(w.root, "update-ref", "-d", "refs/remotes/origin/main")
+    got = _moves(w, dc, capsys)["move_refusals"]
+    assert any("origin/main" in why and "does not resolve" in why for why in got), got
 
 
 def test_a_checkout_that_cannot_be_read_is_a_reason_not_none(dc, dc_ready, capsys, monkeypatch):

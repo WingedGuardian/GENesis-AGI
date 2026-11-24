@@ -174,6 +174,20 @@ class RecoveryConfig:
     verification_delay_s: int = 30
     max_escalations: int = 3
     max_io_triage_attempts: int = 5  # Separate budget for IO_TRIAGE (low-risk)
+    # On a `live` checkout, an approved REVERT_CODE drops the newest candidate
+    # through the deploy engine (#2978). Off, `live` behaves as it did before:
+    # the proposal becomes RESTART_CONTAINER and no candidate is read.
+    live_engine: bool = False
+
+    def __post_init__(self) -> None:
+        # _build_sub passes raw YAML, where a quoted "false" is truthy: only a
+        # real bool arms the engine.
+        if not isinstance(self.live_engine, bool):
+            logger.warning(
+                "recovery.live_engine is %r, not true or false: reading it as false",
+                self.live_engine,
+            )
+            self.live_engine = False
 
 
 @dataclass
