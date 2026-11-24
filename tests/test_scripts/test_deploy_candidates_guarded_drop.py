@@ -18,6 +18,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -180,7 +181,17 @@ def test_the_wait_comes_before_the_confirmation(dc, dc_ready, stub, monkeypatch)
     w = dc_ready
     _two_live(w, dc)
     order: list[str] = []
-    monkeypatch.setattr(dc.time, "sleep", lambda _s: order.append("wait"))
+    real_sleep = dc.time.sleep
+
+    def sleep(seconds: float) -> None:
+        # dc.time is the time module: subprocess's own wait(timeout) polls with
+        # time.sleep, which a slow runner reaches, so count only the engine's.
+        if sys._getframe(1).f_globals is vars(dc):
+            order.append("wait")
+        else:
+            real_sleep(seconds)
+
+    monkeypatch.setattr(dc.time, "sleep", sleep)
     real = dc.Engine._unconfirmed_drop
 
     def confirm(self, *args):
