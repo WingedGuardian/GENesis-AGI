@@ -487,6 +487,30 @@ def test_a_live_deploy_marker_is_exit_1_and_says_so(dc, dc_ready, stub):
 # ── exit 1: dropped, but not confirmed ─────────────────────────────────────
 
 
+def test_a_refused_leaving_set_keeps_a_harmless_update_record(dc, dc_ready, stub, capsys):
+    """Round 3: the drop retired a harmless update_state.json before its
+    --expect-leaving check, so the refusal said "nothing changed" after a delete.
+    It retires the record only once every refusal of its own has passed."""
+    w = dc_ready
+    _two_live(w, dc)
+    w.git(w.root, "tag", "-f", "pre")
+    state = w.home / ".genesis" / "update_state.json"
+    record = {
+        "phase": "fetching",
+        "rollback_tag": "pre",
+        "deploy_head": w.rev("HEAD", w.root),
+        "post_merge": False,
+    }
+    state.write_text(json.dumps(record))
+    capsys.readouterr()
+    assert w.run(dc, *_guarded(w), "--expect-leaving", '["feat/a"]') == 1
+    assert "nothing changed" in capsys.readouterr().err
+    assert json.loads(state.read_text()) == record and _calls(stub) == []
+    # Control: the approved set passes, and the record is retired before the move.
+    assert w.run(dc, *_guarded(w), "--expect-leaving", "[]") == 0, capsys.readouterr()
+    assert not state.exists() and _dropped(w)
+
+
 def _after_move(w: World, what: str):
     if what == "switched":
         w.git(w.root, "switch", "-q", "-c", "elsewhere")

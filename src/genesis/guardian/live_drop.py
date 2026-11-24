@@ -63,7 +63,8 @@ _BOOT_PROBE = (
     "c=$($g config --type=expiry-date gc.reflogExpireUnreachable); r=$?; "
     'if [ "$r" = 1 ]; then c=$(( $(date +%s) - 2592000 )); elif [ "$r" != 0 ]; then c=; fi; '
     'echo "boot=$(python3 -I -S scripts/lib/serving_commit.py '
-    '"$($g rev-parse --absolute-git-dir)/logs/HEAD" "${b#@}" "$($g rev-parse HEAD)" "$c")"'
+    '"$($g rev-parse --absolute-git-dir)/logs/HEAD" "${b#@}" "$($g rev-parse HEAD)" "$c")"; '
+    'echo "after=$(systemctl --user show genesis-server -p InvocationID --value)"'
 )
 #: A branch name goes to the shell through shlex.quote; this only refuses what
 #: git's own rules never let the engine list (control characters, spaces) and a
@@ -234,7 +235,14 @@ async def server_boot(container: str) -> dict[str, str] | None:
     if rc != 0:
         return None
     vals = dict(ln.split("=", 1) for ln in lines if "=" in ln)
-    return vals if "ActiveState" in vals else None
+    if "ActiveState" not in vals:
+        return None
+    after = vals.pop("after", None)
+    if _OID_RE.fullmatch(vals.get("boot", "")) and after != vals.get("InvocationID"):
+        # A restart between the reads would pair one run's state with the
+        # next run's boot commit.
+        vals["boot"] = "unknown: genesis-server restarted during the probe"
+    return vals
 
 
 def booted_from(unit: dict[str, str] | None) -> str:

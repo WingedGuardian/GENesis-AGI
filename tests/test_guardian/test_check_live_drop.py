@@ -82,7 +82,7 @@ AFTER = _view(
 def _boot(boot: str, live: str, state: str = "active") -> str:
     return (
         f"a login banner\nActiveState={state}\nSubState=running\nInvocationID=9\nResult=success\n"
-        f"live={live}\nboot={boot}\n"
+        f"live={live}\nboot={boot}\nafter=9\n"
     )
 
 
@@ -635,6 +635,7 @@ class Episode:
         self.approved: list[str] = []
         self.ran = 0
         self.approve = self._approve
+        self.outcome: str | None = None
 
     async def _approve(self, config, sm, dispatcher, engine, diagnosis):
         self.approved.append(str(diagnosis.recommended_action))
@@ -661,6 +662,8 @@ class Episode:
                 setattr(st, key, (when - timedelta(seconds=30)).isoformat())
             self.sm._state = StateData.from_dict(json.loads(json.dumps(st.to_dict())))
             found = replace(_diagnosis(), drop_candidate=("feat/b", PIN_B, HEAD_B, TIP, ()))
+            if self.outcome:
+                found = replace(found, outcome=self.outcome)
             with (
                 patch(
                     "genesis.guardian.check.collect_all_signals",
@@ -707,9 +710,13 @@ async def test_s4_a_failed_drop_waits_out_its_backoff_then_is_diagnosed_not_auto
     assert ep.approved == ["REVERT_CODE", "REVERT_CODE"]
 
 
-async def test_s5_an_exception_after_an_action_alerts_once_and_keeps_the_latch():
+@pytest.mark.parametrize("outcome", [None, "resolved"])
+async def test_s5_an_exception_after_an_action_alerts_once_and_keeps_the_latch(outcome):
+    """Both approval routes: a diagnosis that claims "resolved" still goes
+    through the gates (_handle_cc_resolved), so it raises under the same alert."""
     ep = Episode()
     await ep.tick(1)
+    ep.outcome = outcome
 
     async def broken(*_a):
         raise RuntimeError("the approval flow broke")
@@ -738,10 +745,14 @@ async def test_s6_at_max_escalations_the_drop_outcome_reaches_the_escalation():
     assert ep.approved == ["ESCALATE"] and len(ep.alerts(AlertSeverity.EMERGENCY)) == 1
 
 
-@pytest.mark.parametrize("stamp", [None, "not a time", "2999-01-01T00:00:00+00:00"])
-async def test_an_unreadable_or_future_recovery_stamp_never_holds_recovered(stamp):
-    """RECOVERED has no auto-reset: a hold keyed on a stamp that is missing,
-    unparsable or in the future would last forever with no alert."""
+@pytest.mark.parametrize(
+    "stamp", [None, "not a time", "2026-01-01T00:00:00", "2999-01-01T00:00:00+00:00"]
+)
+async def test_an_unusable_recovery_stamp_restarts_the_backoff_and_the_drop_runs(stamp):
+    """A missing, unparsable, naive or future stamp froze the backoff at its full
+    length: RECOVERED would hold forever, or the next approved drop was deferred
+    forever with the latch spent. It now counts down once, from the tick that
+    found it."""
     ep = Episode()
     st = ep.sm.state
     st.current_state = GuardianState.RECOVERED
@@ -750,7 +761,9 @@ async def test_an_unreadable_or_future_recovery_stamp_never_holds_recovered(stam
     st.live_drop_attempt = _attempt()
     st.down_alert_sent = True
     await ep.tick(1)
-    assert ep.approved, "held in RECOVERED: the next decision never came"
+    assert ep.sm.current_state == GuardianState.RECOVERED and not ep.approved
+    await ep.tick(5)  # the 100 s backoff, counted from the first tick
+    assert ep.approved == ["REVERT_CODE"] and ep.ran == 1
 
 
 async def test_a_failure_with_no_drop_attempt_keeps_the_latch_as_before():

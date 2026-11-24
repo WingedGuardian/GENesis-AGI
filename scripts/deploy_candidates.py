@@ -370,8 +370,12 @@ class Engine(Repo):
             raise Refusal(f"update.lock is held by another process; {hint}.") from exc
         self._update_lock_held = True
 
-    def _move_preflight(self, need_manifest: bool, source: plan.Source) -> dict | None:
+    def _move_preflight(
+        self, need_manifest: bool, source: plan.Source, retire: bool = True
+    ) -> dict | None:
         """Every refusal before a checkout move, in order. Returns the manifest.
+        ``retire=False``: the caller has refusals of its own still to run, and
+        retires the harmless update record itself once they have passed.
         ``source`` is the command's one baseline (#3492), read once at its start:
         the branch, worktree and tracked-change refusals judge THAT read, so what
         was judged safe is exactly what every later re-check compares to, and
@@ -395,7 +399,8 @@ class Engine(Repo):
         if reasons:
             raise Refusal(reasons[0])
         plan.refuse_moved_source(self, source, "nothing changed")
-        self._retire_harmless_update_state()
+        if retire:
+            self._retire_harmless_update_state()
         return data
 
     def _expected_source(self, expect: tuple[str, str] | None) -> plan.Source:
@@ -1001,7 +1006,7 @@ class Engine(Repo):
             return 0
         # On `live`: subtract-only, offline. Every refusal comes before the manifest
         # changes, so a drop that cannot take the code out never reports it gone.
-        self._move_preflight(need_manifest=True, source=source)
+        self._move_preflight(need_manifest=True, source=source, retire=False)
         live_base, p = self._drop_plan(branch, data)
         out(
             f"deploy_candidates drop {branch} (on the base `live` is on, {live_base[:12]}; nothing fetched)"
@@ -1015,6 +1020,7 @@ class Engine(Repo):
                 "(--expect-leaving); nothing changed."
             )
         self._refuse_blockers(p.tip, "the manifest still lists " + branch)
+        self._retire_harmless_update_state()  # every refusal above changed nothing
         saved: list[dict | None] = []
 
         def save() -> None:  # under the checkout lock, after the move's last re-check

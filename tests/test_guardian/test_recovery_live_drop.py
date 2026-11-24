@@ -55,10 +55,10 @@ AFTER = _view((("feat/a", PIN_A),), (("feat/a", HEAD_A),), NEW_TIP)
 HALF = _view((("feat/a", PIN_A),), (("feat/a", HEAD_A), ("feat/b", HEAD_B)), TIP)
 
 
-def _boot(boot: str, live: str = NEW_TIP, state: str = "active") -> str:
+def _boot(boot: str, live: str = NEW_TIP, state: str = "active", after: str = "x") -> str:
     return (
         f"a login banner\nActiveState={state}\nSubState=running\nInvocationID=x\nResult=success\n"
-        f"live={live}\nboot={boot}"
+        f"live={live}\nboot={boot}\nafter={after}"
     )
 
 
@@ -197,6 +197,15 @@ async def test_exit_0_without_a_boot_from_the_new_tip_fails_and_records_the_atte
     ok, detail, engine = await _drop(box)
     assert not ok and "has not booted from `live`'s new tip" in detail
     assert box.restarts == 0 and _attempt_set(engine)
+
+
+async def test_a_restart_during_the_boot_probe_is_not_a_boot_from_the_new_tip():
+    """Round 3: a restart between the probe reads pairs the state of one run
+    with the boot of the next, so a changed InvocationID reads as unknown."""
+    box = Box(boots=(OLD, _boot(NEW_TIP, after="y")))
+    ok, detail, engine = await _drop(box)
+    assert not ok and "restarted during the probe" in detail
+    assert _attempt_set(engine)
 
 
 async def test_exit_0_with_an_unknown_boot_commit_is_not_success():

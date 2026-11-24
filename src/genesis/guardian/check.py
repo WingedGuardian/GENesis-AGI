@@ -1852,52 +1852,53 @@ async def _handle_confirmed_dead(
         sm.clear_down_alert_sent()
         raise
 
-    # Persist re-diagnosis to shared mount
-    first_failure = sm.state.first_failure_at or datetime.now(UTC).isoformat()
+    # Everything after the diagnosis runs under the after-action alert below.
     try:
-        outage_s = (datetime.now(UTC) - datetime.fromisoformat(first_failure)).total_seconds()
-    except (ValueError, TypeError):
-        outage_s = 0.0
-    write_diagnosis_result(diagnosis, config, outage_duration_s=outage_s)
+        # Persist re-diagnosis to shared mount
+        first_failure = sm.state.first_failure_at or datetime.now(UTC).isoformat()
+        try:
+            outage_s = (datetime.now(UTC) - datetime.fromisoformat(first_failure)).total_seconds()
+        except (ValueError, TypeError):
+            outage_s = 0.0
+        write_diagnosis_result(diagnosis, config, outage_duration_s=outage_s)
 
-    # Track CC availability transitions
-    if diagnosis.source == "cc_unavailable":
-        sm.set_cc_unavailable()
-        sm.record_cc_unavailable_alert()
-        logger.warning(
-            "CC unavailable — routing through approval gate with fallback diagnosis",
-        )
-        # Don't return early — fall through to approval gate. The approval
-        # server blocks for token_expiry_s (default 86400s = 24h), and the
-        # Guardian is a oneshot service so the timer won't overlap. This
-        # effectively throttles to one approval cycle per token_expiry_s.
-        # NOTE: if token_expiry_s is changed, this implicit throttle changes too.
-    elif diagnosis.source == "cc":
-        if sm.state.cc_unavailable_since:
-            logger.info("CC recovered — proceeding with CC diagnosis")
-        sm.clear_cc_unavailable()
+        # Track CC availability transitions
+        if diagnosis.source == "cc_unavailable":
+            sm.set_cc_unavailable()
+            sm.record_cc_unavailable_alert()
+            logger.warning(
+                "CC unavailable — routing through approval gate with fallback diagnosis",
+            )
+            # Don't return early — fall through to approval gate. The approval
+            # server blocks for token_expiry_s (default 86400s = 24h), and the
+            # Guardian is a oneshot service so the timer won't overlap. This
+            # effectively throttles to one approval cycle per token_expiry_s.
+            # NOTE: if token_expiry_s is changed, this implicit throttle changes too.
+        elif diagnosis.source == "cc":
+            if sm.state.cc_unavailable_since:
+                logger.info("CC recovered — proceeding with CC diagnosis")
+            sm.clear_cc_unavailable()
 
-    # CC-driven recovery: if CC already resolved, verify and report
-    if diagnosis.outcome == "resolved":
-        logger.info("CC resolved the issue on re-diagnosis — verifying")
-        await _handle_cc_resolved(config, sm, dispatcher, diagnosis, recovery_engine)
-        return
+        # CC-driven recovery: if CC already resolved, verify and report
+        if diagnosis.outcome == "resolved":
+            logger.info("CC resolved the issue on re-diagnosis — verifying")
+            await _handle_cc_resolved(config, sm, dispatcher, diagnosis, recovery_engine)
+            return
 
-    if sm.should_escalate():
-        diagnosis = diagnosis.__class__(
-            likely_cause=diagnosis.likely_cause,
-            confidence_pct=diagnosis.confidence_pct,
-            evidence=diagnosis.evidence,
-            recommended_action="ESCALATE",
-            actions_taken=diagnosis.actions_taken,
-            outcome=diagnosis.outcome,
-            reasoning=f"Max recovery attempts ({sm.state.recovery_attempts}) exceeded. "
-                      + diagnosis.reasoning,
-            source=diagnosis.source,
-            cc_failure_reason=diagnosis.cc_failure_reason,
-        )
+        if sm.should_escalate():
+            diagnosis = diagnosis.__class__(
+                likely_cause=diagnosis.likely_cause,
+                confidence_pct=diagnosis.confidence_pct,
+                evidence=diagnosis.evidence,
+                recommended_action="ESCALATE",
+                actions_taken=diagnosis.actions_taken,
+                outcome=diagnosis.outcome,
+                reasoning=f"Max recovery attempts ({sm.state.recovery_attempts}) exceeded. "
+                          + diagnosis.reasoning,
+                source=diagnosis.source,
+                cc_failure_reason=diagnosis.cc_failure_reason,
+            )
 
-    try:
         await _execute_recovery_with_approval(
             config, sm, dispatcher, recovery_engine, diagnosis,
         )

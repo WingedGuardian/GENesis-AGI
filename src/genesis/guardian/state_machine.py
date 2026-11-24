@@ -246,22 +246,25 @@ class ConfirmationStateMachine:
                 return float("inf")
             backoff_s = 100.0 * (3.0 ** (attempts - 1))
 
-        if not self._state.last_recovery_at:
-            return backoff_s
-        try:
-            last = datetime.fromisoformat(self._state.last_recovery_at)
-            elapsed = (datetime.now(UTC) - last).total_seconds()
-            return max(0.0, backoff_s - elapsed)
-        except (ValueError, TypeError):
-            return backoff_s
+        elapsed = (datetime.now(UTC) - self._recovery_stamp()).total_seconds()
+        return max(0.0, backoff_s - elapsed)
 
-    def _recovery_stamp_is_past(self) -> bool:
-        """Whether last_recovery_at parses and is not in the future."""
+    def _recovery_stamp(self) -> datetime:
+        """last_recovery_at, readable. A missing, unparseable, naive or future
+        stamp would freeze the backoff at its full length on every tick (a held
+        or deferred action that never runs), so it is reset to now and the
+        backoff counts down once from there; the state is saved every cycle."""
+        now = datetime.now(UTC)
+        raw = self._state.last_recovery_at
         try:
-            last = datetime.fromisoformat(self._state.last_recovery_at or "")
-            return last.tzinfo is not None and last <= datetime.now(UTC)
+            last = datetime.fromisoformat(raw or "")
+            if last.tzinfo is not None and last <= now:
+                return last
         except (ValueError, TypeError):
-            return False
+            pass
+        logger.warning("last_recovery_at %r is unusable; counting the backoff from now", raw)
+        self._state.last_recovery_at = now.isoformat()
+        return now
 
     def record_recovery_attempt(self, action: str = "") -> None:
         """Record that a recovery attempt was made (for backoff tracking).
@@ -630,11 +633,11 @@ class ConfirmationStateMachine:
         # After a `live` drop attempt (#2978) the next decision waits out the
         # backoff here: CONFIRMED_DEAD would auto-reset, or stay latched. At
         # max_escalations the backoff never ends, so it goes on to the escalation.
-        # The hold needs a readable, past last_recovery_at: RECOVERED has no
-        # auto-reset, so a missing or future stamp would hold it forever.
+        # RECOVERED has no auto-reset; the hold ends because the backoff always
+        # counts down (an unusable stamp restarts it from now, _recovery_stamp).
         backoff = self.recovery_backoff_remaining_s()
         drop = self._config.recovery.live_engine and self._state.live_drop_attempt
-        if drop and 0 < backoff < float("inf") and self._recovery_stamp_is_past():
+        if drop and 0 < backoff < float("inf"):
             return Transition(
                 old_state=GuardianState.RECOVERED,
                 new_state=GuardianState.RECOVERED,
