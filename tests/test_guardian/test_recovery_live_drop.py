@@ -13,6 +13,7 @@ fake that answers each command the Guardian sends by what it contains."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import shlex
@@ -138,6 +139,7 @@ def _patched(box):
 
 async def _drop(box, engine=None, target=TARGET):
     engine = engine or _engine()
+    engine._mark_drop_attempt(target)  # execute() records it before the call (#5007)
     with _patched(box):
         ok, detail = await engine._drop_candidate("genesis", *target)
     return ok, detail, engine
@@ -511,3 +513,92 @@ async def test_a_half_done_drop_escalation_names_the_rebuild():
     alert = sent.await_args.args[0]
     assert result.success and "a drop did not finish" in alert.title
     assert "deploy_candidates rebuild" in alert.body
+
+
+# ── #5007: the outcome-unknown end state is on disk before the engine call ───
+
+
+def _on_disk(path) -> dict:
+    return json.loads(path.read_text())
+
+
+def _loaded_engine(tmp_path, prior=None) -> tuple[RecoveryEngine, object]:
+    engine = _engine()
+    path = tmp_path / "state.json"
+    engine._sm.load_state(path)
+    engine._sm.state.current_state = GuardianState.CONFIRMED_DEAD
+    engine._sm.state.live_drop_attempt = prior
+    return engine, path
+
+
+class _Cancelled(Box):
+    """The tick is cancelled (a SIGTERM) while the engine call runs."""
+
+    async def __call__(self, *args, timeout=10.0, **kwargs):
+        if "deploy_candidates drop" in (args[-1] if args else ""):
+            raise asyncio.CancelledError
+        return await super().__call__(*args, timeout=timeout, **kwargs)
+
+
+async def test_a_drop_cancelled_mid_call_leaves_the_attempt_on_disk(tmp_path):
+    engine, path = _loaded_engine(tmp_path)
+    with _patched(_Cancelled()), pytest.raises(asyncio.CancelledError):
+        await engine.execute(_drop_diagnosis())
+    saved = _on_disk(path)
+    assert saved["current_state"] == "recovered" and saved["recovery_attempts"] == 1
+    assert saved["live_drop_attempt"]["branch"] == "feat/b"
+    assert saved["live_drop_attempt"]["pinned_head"] == PIN_B
+    # The next tick (a fresh process) holds through the backoff, then decides.
+    sm = ConfirmationStateMachine(engine._config)
+    sm.load_state(path)
+    dead = MagicMock(all_alive=False, failed_signals=[], pause_state=MagicMock(paused=False))
+    assert sm.process(dead).new_state == GuardianState.RECOVERED  # 100 s of backoff
+    sm.state.last_recovery_at = "2000-01-01T00:00:00+00:00"
+    t = sm.process(dead)
+    assert t.new_state == GuardianState.CONFIRMED_DEAD and t.action_needed
+
+
+async def test_any_action_cancelled_mid_call_leaves_a_counted_recovered_on_disk(tmp_path):
+    engine, path = _loaded_engine(tmp_path)
+
+    async def cancelled(*_a):
+        raise asyncio.CancelledError
+
+    with patch.object(engine, "_execute_action", cancelled), pytest.raises(asyncio.CancelledError):
+        await engine.execute(_drop_diagnosis(RecoveryAction.RESTART_SERVICES))
+    saved = _on_disk(path)
+    assert saved["current_state"] == "recovered" and saved["recovery_attempts"] == 1
+    assert saved["live_drop_attempt"] is None
+
+
+_PRIOR = {"branch": "feat/c", "pinned_head": "9" * 40, "tip": "8" * 40, "at": "2026-11-20T09:00:00+00:00"}
+
+
+@pytest.mark.parametrize("prior", [None, _PRIOR])
+@pytest.mark.parametrize(
+    "drop", [(200, "", ""), (1, "", "ERROR: x; nothing changed."), (1, "", "Error: websocket")]
+)
+async def test_a_clean_refusal_restores_the_prior_attempt_on_disk(tmp_path, prior, drop):
+    """The third row is refused by the engine's view (unchanged), not its words."""
+    engine, path = _loaded_engine(tmp_path, prior)
+    with _patched(Box(drop=drop, views=(BEFORE,))):
+        result = await engine.execute(_drop_diagnosis())
+    assert not result.success and "nothing" in result.detail
+    assert engine._sm.state.live_drop_attempt == prior
+    assert _on_disk(path)["live_drop_attempt"] == prior
+    # Today's latch rule: a prior attempt still holds RECOVERED, none does not.
+    want = GuardianState.RECOVERED if prior else GuardianState.CONFIRMED_DEAD
+    assert engine._sm.current_state == want
+
+
+async def test_the_backoff_runs_from_the_actions_end_counted_once():
+    engine = _engine()
+
+    async def slow(*_a):  # the attempt was counted long before the action ended
+        engine._sm.state.last_recovery_at = "2000-01-01T00:00:00+00:00"
+        return False, "x"
+
+    with patch.object(engine, "_execute_action", slow):
+        await engine.execute(_drop_diagnosis(RecoveryAction.RESTART_SERVICES))
+    assert engine._sm.state.recovery_attempts == 1
+    assert engine._sm.recovery_backoff_remaining_s("RESTART_SERVICES") > 95

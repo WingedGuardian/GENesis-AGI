@@ -188,6 +188,7 @@ class ConfirmationStateMachine:
     def __init__(self, config: GuardianConfig) -> None:
         self._config = config
         self._state = StateData()
+        self._path: Path | None = None  # what load_state read: persist() writes there
 
     @property
     def state(self) -> StateData:
@@ -199,6 +200,7 @@ class ConfirmationStateMachine:
 
     def load_state(self, path: Path) -> None:
         """Load state from disk. Starts fresh on any error (F3)."""
+        self._path = path
         try:
             if path.exists():
                 data = json.loads(path.read_text())
@@ -219,6 +221,12 @@ class ConfirmationStateMachine:
             tmp.replace(path)
         except OSError as exc:
             logger.error("Failed to save state: %s", exc, exc_info=True)
+
+    def persist(self) -> None:
+        """Save to the path load_state read, mid-tick (#5007): a tick killed
+        later still leaves this on disk. No path read (tests): nothing."""
+        if self._path is not None:
+            self.save_state(self._path)
 
     def recovery_backoff_remaining_s(self, action: str = "") -> float:
         """Seconds remaining before next recovery attempt is allowed.
@@ -423,13 +431,9 @@ class ConfirmationStateMachine:
                 reason="awaiting recovery",
                 action_needed=True,
             )
-        elif old_state == GuardianState.RECOVERING:
-            return Transition(
-                old_state=old_state,
-                new_state=GuardianState.RECOVERING,
-                reason="recovery in progress",
-            )
-        elif old_state == GuardianState.RECOVERED:
+        elif old_state in (GuardianState.RECOVERING, GuardianState.RECOVERED):
+            # Each tick is a fresh process, so RECOVERING on disk is a killed
+            # tick's: an action whose outcome was not seen (#5007).
             return self._from_recovered(snapshot, now)
         else:
             # Unknown state — reset to healthy
@@ -865,6 +869,10 @@ class ConfirmationStateMachine:
         """Clear the down-alert flag — called by check.py on genuine recovery only."""
         self._state.down_alert_sent = False
 
-    def should_escalate(self) -> bool:
-        """Check if we've exceeded max recovery attempts."""
-        return self._state.recovery_attempts >= self._config.recovery.max_escalations
+    def should_escalate(self, action: str = "") -> bool:
+        """Max recovery attempts exceeded: the main budget, or IO_TRIAGE's own
+        when that is the proposed action (#5007), the counter execute() reads."""
+        if self._state.recovery_attempts >= self._config.recovery.max_escalations:
+            return True
+        max_io = getattr(self._config.recovery, "max_io_triage_attempts", 5)
+        return action == "IO_TRIAGE" and self._state.io_triage_attempts >= max_io

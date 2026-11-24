@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 from datetime import UTC, datetime, timedelta
 from html import escape as html_escape
 from pathlib import Path
@@ -516,6 +517,10 @@ async def run_check(config: GuardianConfig | None = None) -> None:
         config, dispatcher, snapshots, healthy_confirmed=False, alert_when_deferred=False,
     )
 
+    # SIGTERM (systemd's stop, TimeoutStartSec) cancels this task, so the
+    # `finally` below still saves the state (#5007); without it the kill skips it.
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
     try:
         await _check_cycle(config, sm, dispatcher, snapshots, diagnosis_engine, recovery_engine)
         # Post-probe relief: rollback snapshots may go only if THIS tick's
@@ -606,6 +611,7 @@ async def run_check(config: GuardianConfig | None = None) -> None:
             except Exception:
                 logger.warning("recovery-brain auth canary failed to run", exc_info=True)
     finally:
+        loop.remove_signal_handler(signal.SIGTERM)
         # Always save state, even on error
         sm.save_state(state_path)
 
@@ -1885,19 +1891,7 @@ async def _handle_confirmed_dead(
             await _handle_cc_resolved(config, sm, dispatcher, diagnosis, recovery_engine)
             return
 
-        if sm.should_escalate():
-            diagnosis = diagnosis.__class__(
-                likely_cause=diagnosis.likely_cause,
-                confidence_pct=diagnosis.confidence_pct,
-                evidence=diagnosis.evidence,
-                recommended_action="ESCALATE",
-                actions_taken=diagnosis.actions_taken,
-                outcome=diagnosis.outcome,
-                reasoning=f"Max recovery attempts ({sm.state.recovery_attempts}) exceeded. "
-                          + diagnosis.reasoning,
-                source=diagnosis.source,
-                cc_failure_reason=diagnosis.cc_failure_reason,
-            )
+        diagnosis = _escalated_if_spent(sm, diagnosis)
 
         await _execute_recovery_with_approval(
             config, sm, dispatcher, recovery_engine, diagnosis,
@@ -1916,6 +1910,31 @@ async def _handle_confirmed_dead(
                 ),
             ))
         raise
+
+
+def _escalated_if_spent(sm: ConfirmationStateMachine, diagnosis: object) -> object:
+    """The proposal as ESCALATE when its action's own budget is spent (#5007),
+    before a gate asks the owner to approve an action that cannot run."""
+    from dataclasses import replace
+
+    from genesis.guardian.diagnosis import RecoveryAction
+
+    action = getattr(diagnosis.recommended_action, "value", diagnosis.recommended_action)
+    if action == "ESCALATE" or not sm.should_escalate(str(action)):
+        return diagnosis
+    return replace(
+        diagnosis,
+        recommended_action=RecoveryAction.ESCALATE,
+        reasoning=f"Max recovery attempts for {action} (main {sm.state.recovery_attempts}, "
+                  f"IO_TRIAGE {sm.state.io_triage_attempts}) exceeded. " + diagnosis.reasoning,
+    )
+
+
+#: The longest backoff a deferred approved action is waited out for inside the
+#: tick (#5007). With the default budgets the waits that occur are 100 s and
+#: 300 s (main ladder) and 30-240 s (IO_TRIAGE); the cap keeps a raised
+#: max_escalations inside the unit's TimeoutStartSec. Longer is reported as not run.
+_DEFERRED_WAIT_MAX_S = 900.0
 
 
 def _find_telegram_channel(
@@ -2242,6 +2261,7 @@ async def _execute_recovery_with_approval(
     diagnosis = await live_drop.interrupt_warning(
         config.container_name, diagnosis, _drop_attempt(config, sm),
     )
+    diagnosis = _escalated_if_spent(sm, diagnosis)  # this proposal's own budget (#5007)
 
     if diagnosis.recommended_action == RecoveryAction.ESCALATE:
         if diagnosis.escalation == live_drop.HALF_DONE_DROP:  # (#2978)
@@ -2310,7 +2330,24 @@ async def _execute_recovery_with_approval(
         diagnosis.recommended_action.value,
     )
     result = await recovery_engine.execute(diagnosis)
-    if getattr(result, "deferred", False) is True:  # both gates approved, nothing ran
+    action = diagnosis.recommended_action.value
+    wait_s = sm.recovery_backoff_remaining_s(action)
+    if getattr(result, "deferred", False) is True and 0 < wait_s <= _DEFERRED_WAIT_MAX_S:
+        # Both gates approved, held by its own backoff (#5007): wait it out here,
+        # then run it unless Genesis came back; no second diagnosis or prompt.
         await telegram_channel.send_text(
-            f"Approved {diagnosis.recommended_action.value} did not run: {result.detail}"
+            f"Approved {action} did not run yet: {result.detail}. The Guardian waits it "
+            "out, then runs it unless Genesis is back by then."
         )
+        await asyncio.sleep(wait_s + 1)
+        snapshot = await collect_all_signals(config)
+        if snapshot.all_alive:
+            await telegram_channel.send_text(
+                "✅ Genesis recovered on its own — standing down, no action taken"
+            )
+            sm.process(snapshot)
+            sm.clear_down_alert_sent()
+            return
+        result = await recovery_engine.execute(diagnosis)
+    if getattr(result, "deferred", False) is True:  # both gates approved, nothing ran
+        await telegram_channel.send_text(f"Approved {action} did not run: {result.detail}")

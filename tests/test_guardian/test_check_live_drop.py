@@ -388,7 +388,7 @@ def _dead_sm(config: GuardianConfig) -> ConfirmationStateMachine:
     return sm
 
 
-async def _run_gates(config, box, sm=None, diagnosis=None, engine=None):
+async def _run_gates(config, box, sm=None, diagnosis=None, engine=None, signals=None):
     channel = _gate_channel()
     if engine is None:
         engine = MagicMock()
@@ -400,7 +400,7 @@ async def _run_gates(config, box, sm=None, diagnosis=None, engine=None):
         patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
         patch(
             "genesis.guardian.check.collect_all_signals",
-            AsyncMock(return_value=_snapshot(alive=False)),
+            signals or AsyncMock(return_value=_snapshot(alive=False)),
         ),
         patch("genesis.guardian.check.collect_diagnostics", collect),
         patch("genesis.guardian.check.write_diagnosis_result"),
@@ -590,18 +590,21 @@ async def test_a_container_restart_after_a_settled_drop_has_no_warning():
 
 
 async def test_s3_an_approved_action_that_is_deferred_says_so():
-    """Both gates approved, and the action does not run: the owner is told."""
+    """Both gates approved, and the action does not run: the owner is told. Still
+    held after the in-tick wait (#5007; here no time passes), it says so again."""
     config = _armed()
     sm = _dead_sm(config)
     sm.record_recovery_attempt("RESTART_SERVICES")  # 100 s of backoff from now
     engine = RecoveryEngine(config, sm, MagicMock(), MagicMock(send=AsyncMock()))
-    _, texts, _ = await _run_gates(
-        config,
-        Container(_view(), on_live=False),
-        sm=sm,
-        diagnosis=_diagnosis(RecoveryAction.RESTART_SERVICES),
-        engine=engine,
-    )
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        _, texts, _ = await _run_gates(
+            config,
+            Container(_view(), on_live=False),
+            sm=sm,
+            diagnosis=_diagnosis(RecoveryAction.RESTART_SERVICES),
+            engine=engine,
+        )
+    assert any(t.startswith("Approved RESTART_SERVICES did not run yet") for t in texts), texts
     assert any(
         t.startswith("Approved RESTART_SERVICES did not run: backoff") and "s remaining" in t
         for t in texts
@@ -643,8 +646,9 @@ class Episode:
 
     async def _action(self, action, diagnosis=None):
         self.ran += 1
-        if self.records:
-            self.sm.state.live_drop_attempt = _attempt()
+        if not self.records:  # a clean refusal: the record before the call is back
+            return self.engine._refused("the drop of feat/b was refused, nothing changed")
+        self.sm.state.live_drop_attempt = _attempt()
         return False, "the drop of feat/b: outcome was not seen"
 
     def alerts(self, severity=None) -> list:
@@ -772,3 +776,182 @@ async def test_a_failure_with_no_drop_attempt_keeps_the_latch_as_before():
     ep = Episode(records=False)
     await ep.tick(60)
     assert ep.approved == ["REVERT_CODE"] and ep.sm.current_state == GuardianState.CONFIRMED_DEAD
+
+
+# ── #5007 item 2: a deferred approved action waits out its own backoff ───────
+
+
+def _io_deferred(config: GuardianConfig) -> tuple[ConfirmationStateMachine, RecoveryEngine, list, list]:
+    """io=4 of 5, main=1: IO_TRIAGE's own 240 s backoff has 130 s left."""
+    sm = _dead_sm(config)
+    sm.state.recovery_attempts = 1
+    sm.state.io_triage_attempts = 4
+    sm.state.last_recovery_at = _ago(110)
+    snaps = MagicMock(safe_to_snapshot=AsyncMock(return_value=False))
+    engine = RecoveryEngine(config, sm, snaps, MagicMock(send=AsyncMock()))
+    ran: list = []
+    slept: list = []
+
+    async def action(a, d=None):
+        ran.append(a)
+        return False, "no I/O consumer found"
+
+    async def sleep(s):  # the wait passes: the stamp moves back by it
+        slept.append(s)
+        when = datetime.fromisoformat(sm.state.last_recovery_at) - timedelta(seconds=s)
+        sm.state.last_recovery_at = when.isoformat()
+
+    engine._execute_action = action
+    return sm, engine, ran, (slept, sleep)
+
+
+async def test_a_deferred_io_triage_waits_out_its_own_backoff_then_runs_once():
+    config = GuardianConfig()  # every install, not only `live`
+    sm, engine, ran, (slept, sleep) = _io_deferred(config)
+    with patch("asyncio.sleep", sleep):
+        _, texts, _ = await _run_gates(
+            config, Container(_view(), on_live=False), sm=sm,
+            diagnosis=_diagnosis(RecoveryAction.IO_TRIAGE), engine=engine,
+        )
+    assert ran == [RecoveryAction.IO_TRIAGE] and sm.state.io_triage_attempts == 5
+    assert len(slept) == 1 and 125 < slept[0] < 140
+    assert any(t.startswith("Approved IO_TRIAGE did not run yet") and "waits" in t for t in texts)
+    assert not any("did not run:" in t for t in texts), texts
+
+
+async def test_a_deferred_action_does_not_run_when_genesis_is_back_after_the_wait():
+    config = GuardianConfig()
+    sm, engine, ran, (slept, sleep) = _io_deferred(config)
+
+    async def signals(_config):
+        return _snapshot(alive=bool(slept))
+
+    with patch("asyncio.sleep", sleep):
+        _, texts, _ = await _run_gates(
+            config, Container(_view(), on_live=False), sm=sm,
+            diagnosis=_diagnosis(RecoveryAction.IO_TRIAGE), engine=engine, signals=signals,
+        )
+    assert ran == [] and slept and sm.state.down_alert_sent is False
+    assert any("recovered on its own" in t for t in texts), texts
+
+
+async def test_an_exhausted_io_budget_escalates_before_gate_1():
+    """The owner is never asked to approve an action that cannot run."""
+    from genesis.guardian.check import _handle_confirmed_dead
+
+    config = GuardianConfig()
+    sm = _dead_sm(config)
+    sm.state.down_alert_sent = False
+    sm.state.io_triage_attempts = config.recovery.max_io_triage_attempts
+    approve = AsyncMock()
+    with (
+        patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
+        patch("genesis.guardian.check.write_diagnosis_result"),
+        patch("genesis.guardian.check._execute_recovery_with_approval", approve),
+    ):
+        await _handle_confirmed_dead(
+            config, sm, MagicMock(send=AsyncMock()),
+            MagicMock(diagnose=AsyncMock(return_value=_diagnosis(RecoveryAction.IO_TRIAGE))),
+            MagicMock(),
+        )
+    assert approve.await_args.args[4].recommended_action == RecoveryAction.ESCALATE
+
+
+async def test_an_exhausted_io_budget_proposed_after_gate_1_escalates_before_gate_2():
+    config = GuardianConfig()
+    sm = _dead_sm(config)
+    sm.state.io_triage_attempts = config.recovery.max_io_triage_attempts
+    executed, texts, _ = await _run_gates(
+        config, Container(_view(), on_live=False), sm=sm,
+        diagnosis=_diagnosis(RecoveryAction.IO_TRIAGE),
+    )
+    assert executed.recommended_action == RecoveryAction.ESCALATE
+    assert not any("Proposed:" in t for t in texts)
+
+
+# ── #5007 item 1: a SIGTERM'd tick still saves its state ─────────────────────
+
+
+_CHILD = r"""
+import asyncio, sys
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+sys.path.insert(0, sys.argv[2])
+from genesis.guardian import check
+from genesis.guardian.config import GuardianConfig
+from genesis.guardian.state_machine import GuardianState
+
+state_dir = Path(sys.argv[1])
+config = GuardianConfig()
+config.state_dir = str(state_dir)
+config.maintenance_file = str(state_dir / "no-maintenance")
+
+async def cycle(config, sm, *_a):
+    # A gate wait with no reply: the episode's latch is set, then it blocks.
+    sm.set_confirmed_dead()
+    sm.mark_down_alert_sent()
+    (state_dir / "ready").write_text("1")
+    await asyncio.Event().wait()
+
+with (
+    patch.object(check, "_check_cycle", cycle),
+    patch.object(check, "_build_dispatcher", MagicMock()),
+    patch.object(check, "SnapshotManager", MagicMock()),
+    patch.object(check, "DiagnosisEngine", MagicMock()),
+    patch.object(check, "_drain_host_alert_queue", AsyncMock()),
+    patch.object(check, "_check_guard_layer_and_alert", AsyncMock()),
+    patch.object(check, "_check_pool_relief", AsyncMock()),
+    patch.object(check, "_gateway_pause_active", MagicMock(return_value=False)),
+    patch.object(check, "read_boot_id", MagicMock(return_value=None)),
+):
+    asyncio.run(check.run_check(config))
+"""
+
+
+def _sigtermed_tick(tmp_path):
+    import signal
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    src = str(Path(__file__).resolve().parents[2] / "src")
+    child = subprocess.Popen(
+        [sys.executable, "-c", _CHILD, str(tmp_path), src],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not (tmp_path / "ready").exists():
+            assert child.poll() is None, child.communicate()
+            assert time.monotonic() < deadline, "the child never reached the cycle"
+            time.sleep(0.05)
+        child.send_signal(signal.SIGTERM)
+        child.wait(timeout=30)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+    return child
+
+
+def test_a_sigtermed_tick_still_writes_its_state_file(tmp_path):
+    child = _sigtermed_tick(tmp_path)
+    state = tmp_path / "state.json"
+    assert child.returncode != 0 and state.exists(), child.stderr.read()
+    assert json.loads(state.read_text())["current_state"] == "confirmed_dead"
+
+
+def test_a_gate_wait_killed_at_the_timeout_keeps_its_latch_until_the_auto_reset(tmp_path):
+    """Behaviour change, named for the owner (S7): the latch set before the wait
+    is saved, so the episode stays quiet; the 600 s auto-reset still re-opens it."""
+    _sigtermed_tick(tmp_path)
+    config = GuardianConfig()
+    sm = ConfirmationStateMachine(config)
+    sm.load_state(tmp_path / "state.json")
+    assert sm.state.down_alert_sent is True
+    assert sm.process(_snapshot(alive=False)).new_state == GuardianState.CONFIRMED_DEAD
+    sm.state.first_failure_at = _ago(config.confirmation.confirmed_dead_timeout_s + 1)
+    t = sm.process(_snapshot(alive=False))
+    assert t.new_state == GuardianState.HEALTHY and "auto-reset" in t.reason
+    assert sm.state.down_alert_sent is True  # unchanged: only a genuine recovery clears it
