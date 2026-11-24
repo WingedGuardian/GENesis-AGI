@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import re
 from unittest.mock import AsyncMock, MagicMock
 
@@ -20,7 +21,7 @@ from genesis.db.crud import knowledge as kc
 from genesis.db.schema import create_all_tables
 from genesis.mcp.memory.knowledge import _format_reference_body as fmt
 from genesis.memory import reference_ops as ro
-from genesis.memory.knowledge_ingest import UnknownEntryKey
+from genesis.memory.knowledge_ingest import UnknownEntryKey, ingest_untrusted_credential
 from tests.test_memory.test_reference_secret_class_fixes import _ingest, _PointStore
 
 MIG = importlib.import_module("genesis.db.migrations.20261115060803_credential_name_hash")
@@ -115,7 +116,10 @@ async def test_a_long_name_rotated_by_key_then_saved_by_name_is_one_entry(db):
     await _save(db, store, None, "Other8Pass7!", entry_key=key)
     assert await _save(db, store, name, "Third9Pass6!") == first
     assert await _units(db) == 1
-    assert ro.display_name(await kc.get(db, first)) == name
+    # The searchable name is capped; the full name stays recorded in meta.
+    row = await kc.get(db, first)
+    assert name.startswith(ro.display_name(row)) and len(ro.display_name(row)) <= 512
+    assert (await ro.reveal_meta(db, row))["identifier"] == name
     assert await kc.get_reference_secret(db, first) == "Third9Pass6!"
 
 
@@ -220,7 +224,9 @@ async def test_the_views_show_the_name(db, monkeypatch):
         description="lab",
         entry_key=row["concept"],
     )
-    assert again == unit and ro.display_name(await kc.get(db, unit)) == "lab wifi"
+    # The identifier given with a key is not used: the reply names the entry's.
+    assert again == f"{unit} (stored as: lab wifi)"
+    assert ro.display_name(await kc.get(db, unit)) == "lab wifi"
     with pytest.raises(ValueError, match="entry_key"):
         await fn(
             kind="url",
@@ -272,13 +278,15 @@ async def test_a_name_ending_like_a_tag_names_only_itself(db):
     assert await _units(db) == 2
 
 
-async def test_an_identifier_with_a_line_break_carrying_its_value_is_refused(db):
-    """As on main: the identifier is checked as given, not only flattened."""
+async def test_an_identifier_with_a_line_break_carrying_its_value_is_masked(db):
+    """The identifier is masked as given, not only flattened: a line-broken
+    value in it is held, and the write lands."""
     store = _PointStore()
     secret = "correct horse\nbattery staple"
-    with pytest.raises(ValueError, match="must not contain its value"):
-        await _save(db, store, secret, secret)
-    assert await _units(db) == 0
+    unit = await _save(db, store, secret, secret)
+    assert await _units(db) == 1 and await kc.get_reference_secret(db, unit) == secret
+    for text in await _indexed(db, store):
+        assert "correct horse" not in text and "battery staple" not in text, text
 
 
 async def test_a_body_without_the_standard_header_still_names_its_entry(db):
@@ -299,3 +307,139 @@ async def test_a_body_without_the_standard_header_still_names_its_entry(db):
     composed, missing = await ro.compose_body(db, row)
     assert not missing and "VPN account" in composed and "Rr77Ss88!t" in composed
     assert await _save(db, store, "lab vpn LOGIN", "Uu99Vv00!w") == unit
+
+
+# ─── Masking on opaque identity (#4416's mechanism) ─────────────────────────
+
+
+async def _held_save(db, store, name: str, value: str, **kw):
+    return await _ingest(
+        db, store, _body(name, value), concept=name, held_value=value, held_detail="lab login", **kw
+    )
+
+
+async def _untrusted(db, store, name: str, content: str, **kw):
+    return await ingest_untrusted_credential(
+        store=store,
+        db=db,
+        content=content,
+        project="reference",
+        domain="reference.credentials",
+        concept=name,
+        collection="episodic_memory",
+        memory_type="episodic",
+        **kw,
+    )
+
+
+async def _indexed(db, store) -> list[str]:
+    texts = [
+        str(v)
+        for table in ("knowledge_units", "knowledge_fts")
+        for r in await db.execute_fetchall(f"SELECT concept, body, tags FROM {table}")  # noqa: S608
+        for v in r
+    ]
+    return texts + list(store.points.values())
+
+
+@pytest.mark.parametrize("hashed", [True, False], ids=["hash", "no-columns"])
+async def test_a_capped_name_rotated_by_key_is_found_again_by_its_name(db, hashed):
+    """Codex 4576838397 on masked keys: a name over the cap that also holds its
+    value, rotated through its returned key, then saved under the original
+    name: one entry, its full name kept in meta, and no value is indexed. With
+    no hash column the entry is found by the full name its meta records, never
+    by its masked, capped header."""
+    if not hashed:
+        await db.execute("DROP INDEX idx_knowledge_units_name_hash")
+        await db.execute("ALTER TABLE knowledge_units DROP COLUMN name_hash")
+        await db.execute("ALTER TABLE knowledge_units DROP COLUMN name_origin")
+    store = _PointStore()
+    name = "db-Hunter2Pass9! " + "x" * 600
+    first = await _held_save(db, store, name, "Hunter2Pass9!")
+    assert first.name.startswith("db-[held] ") and len(first.name) <= 512
+    await _held_save(db, store, "unused", "Other8Pass7!", entry_key=first.concept)
+    assert (await ro.reveal_meta(db, await kc.get(db, first)))["identifier"] == name
+    third = await _held_save(db, store, name, "Third9Pass6!")
+    assert third == first and await _units(db) == 1
+    assert await kc.get_reference_secret(db, first) == "Third9Pass6!"
+    assert (await ro.reveal_meta(db, await kc.get(db, first)))["identifier"] == name
+    for text in await _indexed(db, store):
+        for value in ("Hunter2Pass9!", "Other8Pass7!", "Third9Pass6!"):
+            assert value not in text
+
+
+async def test_a_prose_upload_under_a_saved_name_masks_the_saved_value(db):
+    """Codex 4576838396: a known held value is a probe even when the incoming
+    text is prose, so an upload under ``router Sunny-2024`` masks it."""
+    store = _PointStore()
+    await _held_save(db, store, "router Sunny-2024", "Sunny-2024")
+    upload = await _untrusted(db, store, "router Sunny-2024", "password: New2Pass!y")
+    assert upload.name == "router [held]"
+    for text in await _indexed(db, store):
+        assert "Sunny-2024" not in text and "New2Pass!y" not in text
+    meta = json.loads(await kc.get_secret_meta(db, (await kc.get(db, upload))["secret_ref"]))
+    assert meta[kc.IDENTITY_META]["value_is_prose"] is True
+
+
+async def test_a_delimited_save_never_masks_an_uploads_prose_words(db):
+    """The reviewer's over-masking case: words of another entry's PROSE value
+    are not probes for a delimited write's name."""
+    store = _PointStore()
+    name = "router WPA2-PSK e-mail"
+    await _untrusted(
+        db, store, name, "The router uses WPA2-PSK; the e-mail goes to the admin. password: Uu77Vv88Ww",
+    )
+    saved = await _held_save(db, store, name, "Kk55Ll66Mm")
+    assert saved.name == name
+
+
+async def test_a_name_holding_its_own_secret_stays_one_entry_by_name_and_by_key(db):
+    store = _PointStore()
+    values = ["Aa11Bb22!x", "Cc33Dd44!y", "Ee55Ff66!z", "Gg77Hh88!w"]
+    name = f"vpn {values[0]} login"
+    first = await _held_save(db, store, name, values[0])
+    await _held_save(db, store, name, values[1])
+    await _held_save(db, store, "ignored", values[2], entry_key=first.concept)
+    last = await _held_save(db, store, name, values[3])
+    assert last == first and await _units(db) == 1
+    row = await kc.get(db, first)
+    assert _OPAQUE.fullmatch(row["concept"]) and ro.display_name(row) == "vpn [held] login"
+    # The rotation by key kept the recorded name, in meta and in the header.
+    assert (await ro.reveal_meta(db, row))["identifier"] == name
+    for text in await _indexed(db, store):
+        assert not any(value in text for value in values), text
+
+
+async def test_an_insert_only_re_upload_returns_its_entry_unless_the_description_differs(db):
+    """Uploads are insert-only: the same name, value and description is the
+    entry already stored; another description is an entry of its own."""
+    store = _PointStore()
+    value = "Nn11Aa22Ss"
+
+    async def upload(detail):
+        return await _untrusted(db, store, "lab nas", value, held_value=value, held_detail=detail)
+
+    first = await upload("the nas")
+    assert await upload("the nas") == first and await _units(db) == 1
+    other = await upload("the backup nas")
+    assert other != first and await _units(db) == 2
+    assert await kc.get_reference_secret(db, first) == value
+
+
+async def test_a_reply_names_the_masked_name_never_the_key(db, monkeypatch):
+    import genesis.mcp.memory_mcp as memory_mod
+    from genesis.mcp.memory.knowledge import reference_store
+
+    monkeypatch.setattr(memory_mod, "_require_init", lambda: None)
+    monkeypatch.setattr(memory_mod, "_store", _PointStore())
+    monkeypatch.setattr(memory_mod, "_db", db)
+    monkeypatch.setattr(memory_mod, "_qdrant", MagicMock())
+    fn = getattr(reference_store, "fn", reference_store)
+    reply = await fn(
+        kind="credentials", identifier="wifi Hunter2024x!fake", value="Hunter2024x!fake", description="lab",
+    )
+    unit, _, stored_as = reply.partition(" (stored as: ")
+    row = await kc.get(db, unit)
+    assert stored_as == "wifi [held])" and row["concept"] not in reply
+    meta = await ro.reveal_meta(db, row)
+    assert meta["identifier"] == "wifi Hunter2024x!fake" and kc.IDENTITY_META not in meta

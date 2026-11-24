@@ -792,3 +792,43 @@ async def card_for_issue(
         "blocked_by_total": blocked["totalCount"],
         "blockers_truncated": blocked["totalCount"] > len(blockers),
     }
+
+
+_LAUNCH_QUERY = """
+query($o: String!, $n: String!, $i: Int!) { repository(owner: $o, name: $n) {
+  issue(number: $i) { number state authorAssociation lastEditedAt createdAt body
+    closedByPullRequestsReferences(first: 10) { totalCount nodes { number state isCrossRepository repository { nameWithOwner } } } }
+} }
+"""
+
+
+async def launch_facts(owner: str, name: str, number: int, *, runner: Runner | None = None) -> dict:
+    """What the builder launcher checks before it starts a builder for issue
+    *number*, read live: ``state``, ``author_association``, ``last_edited_at``
+    (``None`` for an issue never edited; MEASURED 2026-11-15), ``created_at``,
+    ``body``, and ``open_prs``: the open closing PRs from a branch of this repo.
+    ``open_prs_unresolved`` is True when GitHub reports more closing PRs than the
+    page holds, so the caller can refuse rather than miss one."""
+    data = await graphql(_LAUNCH_QUERY, {"o": owner, "n": name, "i": number}, runner=runner)
+    node = (data.get("repository") or {}).get("issue")
+    if not node:
+        raise ProjectsError(f"no issue #{number} in {owner}/{name}")
+    refs = node.get("closedByPullRequestsReferences") or {"totalCount": 0, "nodes": []}
+    nodes = [n for n in refs.get("nodes") or [] if n]
+    repo = f"{owner}/{name}".lower()
+    return {
+        "number": node["number"],
+        "state": node["state"],
+        "author_association": node.get("authorAssociation"),
+        "last_edited_at": node.get("lastEditedAt"),
+        "created_at": node.get("createdAt"),
+        "body": node.get("body") or "",
+        "open_prs": [
+            n["number"]
+            for n in nodes
+            if n.get("state") == "OPEN"
+            and n.get("isCrossRepository") is False
+            and ((n.get("repository") or {}).get("nameWithOwner") or "").lower() == repo
+        ],
+        "open_prs_unresolved": (refs.get("totalCount") or 0) > len(nodes),
+    }

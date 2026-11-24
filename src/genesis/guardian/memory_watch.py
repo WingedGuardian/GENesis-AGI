@@ -41,7 +41,10 @@ from genesis.guardian.pool import (
     TIER_WARN,
     AlertDecision,
     _tier_for,
+    _worse,
     decide_alert,
+    exit_margin_points,
+    held_tier,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,10 +77,6 @@ def measure_host_mem_pct() -> tuple[float | None, str]:
     return used_pct, f"{used_pct:.1f}% used ({used_mb}M / {total_mb}M)"
 
 
-def _worse(a: str, b: str) -> str:
-    return a if _TIER_RANK[a] >= _TIER_RANK[b] else b
-
-
 def _aware(ts: datetime) -> datetime:
     """A naive timestamp (a state file this code did not write) reads as UTC."""
     return ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
@@ -91,34 +90,9 @@ def _hours_since(iso: str, now: datetime) -> float:
         return 0.0
 
 
-def _held_tier(
-    pct: float | None, lines: tuple[float, float, float], prior: str, margin: float
-) -> str:
-    """One axis's tier with an exit margin.
-
-    A rise takes effect at the line. A fall leaves a tier only once the reading
-    is ``margin`` points below that tier's line, so a reading hovering at a
-    line holds one tier instead of crossing it every tick. A blind axis (None)
-    holds its prior tier: a failed read is no evidence that pressure eased.
-    """
-    if pct is None:
-        return prior
-    raw = _tier_for(pct, *lines)
-    with_margin = _tier_for(pct + margin, *lines)
-    held = prior if _TIER_RANK[prior] <= _TIER_RANK[with_margin] else with_margin
-    return _worse(raw, held)
-
-
 def _exit_margin(cfg: MemoryTiersConfig) -> float:
-    """The configured exit margin in points, or 5 when it is not a number.
-    A bad value must not take the RAM watch down every tick."""
-    try:
-        return max(0.0, float(cfg.exit_margin_pct))
-    except (TypeError, ValueError):
-        logger.warning(
-            "memory_tiers.exit_margin_pct=%r is not a number; using 5", cfg.exit_margin_pct
-        )
-        return 5.0
+    """The configured exit margin in points (see pool.exit_margin_points)."""
+    return exit_margin_points(cfg.exit_margin_pct, "memory_tiers.exit_margin_pct")
 
 
 def memory_axis_tiers(
@@ -131,13 +105,13 @@ def memory_axis_tiers(
     prior = prior or {}
     margin = _exit_margin(cfg)
     return {
-        "container": _held_tier(
+        "container": held_tier(
             container_pct,
             (cfg.container_warn_pct, cfg.container_high_pct, cfg.container_crit_pct),
             prior.get("container", TIER_OK),
             margin,
         ),
-        "host": _held_tier(
+        "host": held_tier(
             host_pct,
             (cfg.host_warn_pct, cfg.host_high_pct, cfg.host_crit_pct),
             prior.get("host", TIER_OK),

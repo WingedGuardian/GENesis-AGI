@@ -72,6 +72,7 @@ def _reflection(
         "Premise: LEAD",
         "Premise-why: the change routes around an existing helper that already exists",
         "Impossible: route every call through one checked helper and delete the rest",
+        "Alternative: none found: searched scripts/ for an existing checked helper",
         "Scope: covered: the key round-trips (tests/test_x.py)",
         f"Decision: {decision}",
         "Decision-why: the same mistake appears twice in two different files",
@@ -120,13 +121,13 @@ def test_nothing_binds_before_round_four_on_the_gate_lane_or_before_the_cutover(
     assert _problems(_reflection(["c6"]), recs[-1], _records(*recs), at=_after(6)) == []
 
 
-def test_the_shipped_cutover_binds_nothing():
-    """PR 2 ships the rules off; PR 3 sets the date (owner 2fd36db6)."""
-    assert pt.PAST_TERMINAL_CUTOVER_ISO is None
+def test_no_cutover_binds_nothing():
+    """With the cutover None the rules are off, whatever the module constant."""
     record, records = _ladder(6)
-    assert (
-        pt.problems(_reflection(["c6"]), record, records, gate_lane=False, made_at=_after(6)) == []
+    got = pt.problems(
+        _reflection(["c6"]), record, records, gate_lane=False, made_at=_after(6), cutover=None
     )
+    assert got == []
 
 
 def test_unplaceable_rounds_or_an_unreadable_time_bind_nothing():

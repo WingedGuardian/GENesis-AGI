@@ -776,15 +776,20 @@ else
     fi
 fi
 
-# Set on host VM
-if [ "$_final_tz" != "UTC" ] && [ "$_final_tz" != "Etc/UTC" ]; then
-    sudo timedatectl set-timezone "$_final_tz" 2>/dev/null || true
+# Set on host VM, whenever it differs from the choice (a UTC choice included), and
+# report only what actually happened. NOTE: host timers and cron lines with no zone
+# follow the system zone, so changing it moves them; see issue #4879.
+# shellcheck source=lib/timezone.sh
+. "$(unset CDPATH; cd "$(dirname "$0")" && pwd)/lib/timezone.sh"
+_host_now_tz="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
+if [ "$_host_now_tz" = "$_final_tz" ]; then
+    echo "  + Timezone: $_final_tz (host, already set)"
+else
+    apply_system_timezone "$_final_tz" "Host" sudo || true
 fi
 
 # Container timezone is set later (right before install.sh) because
 # apt-get with DEBIAN_FRONTEND=noninteractive reconfigures tzdata→UTC.
-
-echo "  + Timezone: $_final_tz (host)"
 
 
 # ── Set up user inside container ─────────────────────────────
@@ -1040,9 +1045,19 @@ if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -
 
     # Set container timezone now (after apt-get which resets tzdata to UTC)
     if [ -n "$_final_tz" ] && [ "$_final_tz" != "UTC" ]; then
-        incus exec "$CONTAINER_NAME" -- timedatectl set-timezone "$_final_tz" 2>/dev/null || \
-            incus exec "$CONTAINER_NAME" -- ln -sf "/usr/share/zoneinfo/$_final_tz" /etc/localtime 2>/dev/null || true
-        echo "  + Container timezone: $_final_tz"
+        # shellcheck disable=SC2016  # $1 expands in the container's sh, on purpose
+        if incus exec "$CONTAINER_NAME" -- timedatectl set-timezone "$_final_tz" 2>/dev/null; then
+            echo "  + Container timezone: $_final_tz"
+        # The fallback counts only when the zone file exists: `ln -sf` to a missing
+        # file "succeeds" and leaves a dangling /etc/localtime.
+        elif incus exec "$CONTAINER_NAME" -- sh -c \
+                'test -f "/usr/share/zoneinfo/$1" && ln -sf "/usr/share/zoneinfo/$1" /etc/localtime' \
+                sh "$_final_tz" 2>/dev/null; then
+            echo "  + Container timezone: $_final_tz (via /etc/localtime)"
+        else
+            echo "  WARNING: could not set the container timezone to $_final_tz;" \
+                "install.sh will try again inside the container."
+        fi
     fi
 
     # shellcheck disable=SC2086  # Intentional: empty string should vanish

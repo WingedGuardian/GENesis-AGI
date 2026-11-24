@@ -1,0 +1,1 @@
+- Validators can check whether a retained independent review still matches its PR sources and evidence, while historical evidence remains readable. The offline check refuses whatever the close writers would refuse, and reports unmapped E2E steps by position rather than quoting the PR. This prepares review receipts; close enforcement remains a separate change.

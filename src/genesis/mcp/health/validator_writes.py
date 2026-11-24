@@ -155,6 +155,7 @@ async def record_verification(
         parse_evidence,
         reason_for,
         rechecks_for,
+        stored_evidence_json,
     )
     from genesis.session_awareness.pr_recording import _no_duplicates, attempt_note, resolve_repo
 
@@ -172,7 +173,7 @@ async def record_verification(
     if isinstance(decision, Refusal):
         raise ToolError(decision.message)
     prompts = completeness_prompts(doc)
-    payload = json.dumps(doc.model_dump(mode="json"), indent=2, sort_keys=True, ensure_ascii=False)
+    payload = stored_evidence_json(doc)
     if len(payload.encode("utf-8")) > MAX_EVIDENCE_BYTES:
         raise ToolError("Canonical evidence exceeds the byte cap")
     forced = dry_run_only()
